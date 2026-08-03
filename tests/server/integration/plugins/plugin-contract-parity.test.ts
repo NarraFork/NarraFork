@@ -24,6 +24,9 @@ const expectedSharedMethods = [
 	"storage.delete",
 	"storage.list",
 	"config.get",
+	"secrets.get",
+	"secrets.set",
+	"secrets.delete",
 	"secrets.list",
 	"diagnostics.getOwn",
 ] as const;
@@ -53,6 +56,9 @@ const methodCapabilityExamples = {
 	"storage.delete": ["storage.write_self"],
 	"storage.list": ["storage.read_self"],
 	"config.get": ["config.read_self"],
+	"secrets.get": ["secret.use_self"],
+	"secrets.set": ["secret.use_self"],
+	"secrets.delete": ["secret.use_self"],
 	"secrets.list": ["secret.use_self"],
 	"diagnostics.getOwn": ["diagnostics.readOwnLogs"],
 } as const satisfies Record<(typeof expectedSharedMethods)[number], readonly string[]>;
@@ -107,6 +113,9 @@ describe("C1/C2 cross-end plugin contract parity", () => {
 			"reference-tool-rpc",
 			"reference-host-call-rpc",
 			"reference-ui-hostile",
+			// The provider fixture now ships a `provider-settings` view, so its asset paths
+			// need the same existence check as every other reference manifest.
+			"reference-provider-rpc",
 		] as const) {
 			const root = join(import.meta.dir, `../../../fixtures/plugins/e2e/${fixtureName}`);
 			const manifest = parseManifest(JSON.parse(readFileSync(join(root, "manifest.json"), "utf8")));

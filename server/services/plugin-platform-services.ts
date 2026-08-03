@@ -7,6 +7,8 @@ import {
 	capabilityBroker as defaultCapabilityBroker,
 	type PluginPrincipal,
 } from "./plugin-capability-broker";
+import { PluginCommandRegistry } from "./plugin-command-registry";
+import { applyCommandSecretWrites } from "./plugin-command-secret-writes";
 import { PluginContributionCoordinator } from "./plugin-contribution-coordinator";
 import { PluginContributionRegistry } from "./plugin-contribution-registry";
 import { type PluginEventGateway, pluginEventGateway } from "./plugin-event-gateway";
@@ -22,6 +24,7 @@ import { createPluginProviderAdapterFactory } from "./plugin-provider-adapter-fa
 import { PluginProviderCatalogRefresher } from "./plugin-provider-catalog-refresh";
 import { PluginProviderClientPool, type ProviderRuntimeLike } from "./plugin-provider-client";
 import { PluginProviderConfigService } from "./plugin-provider-config-service";
+import { PluginProviderCredentialResolver } from "./plugin-provider-credential-resolver";
 import {
 	findPluginProviderForModel,
 	listPluginProviderModelValues,
@@ -47,7 +50,7 @@ import {
 	type PluginStorageFactoryLike,
 } from "./plugin-storage";
 import { PluginToolRegistry } from "./plugin-tool-registry";
-import { PluginUiHost } from "./plugin-ui-host";
+import { type PluginCommandDispatcher, PluginUiHost } from "./plugin-ui-host";
 import {
 	pluginUiSessionService as defaultPluginUiSessionService,
 	type PluginUiSessionService,
@@ -69,6 +72,8 @@ export interface PluginPlatformServices {
 	scheduler: PluginScheduler;
 	secretBroker: PluginSecretBroker;
 	toolRegistry: PluginToolRegistry;
+	/** Plugin-declared `handler: "server"` commands. */
+	pluginCommandRegistry: PluginCommandRegistry;
 	mcpAdapter: PluginMcpAdapter;
 	providerRegistry: PluginProviderRegistry;
 	providerClientPool: PluginProviderClientPool;
@@ -101,6 +106,8 @@ export interface PluginPlatformServicesOptions {
 	secretBroker?: PluginSecretBroker;
 	secretVault?: PluginSecretVault;
 	toolRegistry?: PluginToolRegistry;
+	/** Dispatch for plugin-declared `handler: "server"` commands. */
+	pluginCommandRegistry?: PluginCommandRegistry;
 	mcpAdapter?: PluginMcpAdapter;
 	providerRegistry?: PluginProviderRegistry;
 	providerClientPool?: PluginProviderClientPool;
@@ -365,6 +372,7 @@ export function createPluginPlatformServices(
 			commandRegistry,
 			adapters: options.publicApiAdapters,
 		});
+	const secretVault = options.secretVault ?? pluginSecretVault;
 	const hostServices =
 		options.hostServices ??
 		createPluginHostServices({
@@ -373,8 +381,11 @@ export function createPluginPlatformServices(
 			publicApi,
 			eventGateway,
 			storageFactory,
+			secretKeyLister: (pluginId) => secretVault.listKeys(pluginId),
+			secretReader: (pluginId, key) => secretVault.getSecret({ pluginId, key }),
+			secretWriter: (pluginId, key, value) => secretVault.setSecret({ pluginId, key, value }),
+			secretDeleter: (pluginId, key) => secretVault.deleteSecret({ pluginId, key }),
 		});
-	const secretVault = options.secretVault ?? pluginSecretVault;
 	/**
 	 * Config handed to plugin code, with secret-valued fields removed.
 	 *
@@ -395,6 +406,53 @@ export function createPluginPlatformServices(
 		return byContribution as JsonValue;
 	};
 	const listPluginSecretKeys = (pluginId: string) => secretVault.listKeys(pluginId);
+	// Secret read/write for `secrets.get|set|delete`. Each closure takes `pluginId` from the
+	// host-validated principal, so the vault namespace is never caller-selectable. Same
+	// functions for backend and UI: a view has no less right to its own plugin's secrets.
+	const readPluginSecret = (pluginId: string, key: string) =>
+		secretVault.getSecret({ pluginId, key });
+	const writePluginSecret = (pluginId: string, key: string, value: string) =>
+		secretVault.setSecret({ pluginId, key, value });
+	const deletePluginSecret = (pluginId: string, key: string) =>
+		secretVault.deleteSecret({ pluginId, key });
+
+	// Dispatch for commands a plugin declares with `handler: "server"`. Before this existed,
+	// `commands.execute` only resolved host-registered handlers (`commandRegistry` above), so
+	// a plugin-declared command was unreachable dead code.
+	const pluginCommandRegistry =
+		options.pluginCommandRegistry ??
+		new PluginCommandRegistry({
+			resolveRuntime: (pluginId) => {
+				const runtime = runtimeSupervisor.get(pluginId);
+				return runtime && ["active", "degraded"].includes(runtime.state) ? runtime : undefined;
+			},
+		});
+
+	/**
+	 * Adapts the registry to the UI host's narrower dispatcher shape.
+	 *
+	 * `secretWrites` are validated and applied *here* rather than in the UI host, so
+	 * credential material never enters a class whose job is talking to an iframe.
+	 *
+	 * `providerRegistry` is read lazily inside `invoke` because it is constructed further
+	 * down; a direct reference here would capture it before it exists.
+	 */
+	const commandDispatcher: PluginCommandDispatcher = {
+		has: (commandId, pluginId) => pluginCommandRegistry.has(commandId, pluginId),
+		invoke: async (commandId, pluginId, input, context) => {
+			const result = await pluginCommandRegistry.invoke(commandId, pluginId, input, context);
+			if (result.secretWrites.length > 0) {
+				await applyCommandSecretWrites({
+					pluginId,
+					writes: result.secretWrites,
+					registry: providerRegistry,
+					sink: secretVault,
+				});
+			}
+			// Only `output` crosses back; the writes were consumed above.
+			return { output: result.output };
+		},
+	};
 
 	const uiHost =
 		options.uiHost ??
@@ -405,6 +463,10 @@ export function createPluginPlatformServices(
 			storageFactory,
 			providerConfigReader: readPluginConfigForPlugin,
 			secretKeyLister: listPluginSecretKeys,
+			secretReader: readPluginSecret,
+			secretWriter: writePluginSecret,
+			secretDeleter: deletePluginSecret,
+			pluginCommands: commandDispatcher,
 		});
 	uiSession.onRemoved((session, reason) => {
 		uiHost.revokeSession(session.sessionId, reason);
@@ -457,17 +519,30 @@ export function createPluginPlatformServices(
 			logger.debug("plugin runtime activated for provider use", { pluginId, reason });
 			return started as unknown as ProviderRuntimeLike;
 		});
+	// Merges vault-held credentials into the config sent to a plugin. Shared by the
+	// adapter factory and the catalog refresher so chat and model enumeration authenticate
+	// identically; without it a provider can have a key stored yet never receive it.
+	const providerCredentialResolver = new PluginProviderCredentialResolver({
+		registry: providerRegistry,
+		secretSource: secretVault,
+	});
+	const resolveProviderConfig = (providerInstanceId: string) =>
+		providerCredentialResolver.resolve(providerInstanceId);
 	// Give registered providers a working `createAdapter()`. The runtime is resolved
 	// (and started if needed) on first chat/generate rather than at registration, so
 	// a catalog refresh never spawns plugin processes.
 	providerRegistry.setRemoteProviderAdapterFactory(
-		createPluginProviderAdapterFactory({ clientPool: providerClientPool }),
+		createPluginProviderAdapterFactory({
+			clientPool: providerClientPool,
+			resolveConfig: resolveProviderConfig,
+		}),
 	);
 	const providerCatalogRefresher =
 		options.providerCatalogRefresher ??
 		new PluginProviderCatalogRefresher({
 			registry: providerRegistry,
 			clientPool: providerClientPool,
+			resolveConfig: resolveProviderConfig,
 		});
 	const providerConfigService = new PluginProviderConfigService({
 		registry: providerRegistry,
@@ -486,6 +561,7 @@ export function createPluginPlatformServices(
 		new PluginContributionCoordinator({
 			contributionRegistry,
 			toolRegistry,
+			pluginCommandRegistry,
 			providerRegistry,
 			agentToolBridge: toolBridge,
 			lifecycleStates: () => stateStore.listStates(),
@@ -544,6 +620,7 @@ export function createPluginPlatformServices(
 		scheduler,
 		secretBroker,
 		toolRegistry,
+		pluginCommandRegistry,
 		mcpAdapter,
 		providerRegistry,
 		providerClientPool,

@@ -1,6 +1,6 @@
+import { createSharedContext } from "@frontend/lib/shared-context";
 import { Box } from "@mantine/core";
 import {
-	createContext,
 	useCallback,
 	useContext,
 	useEffect,
@@ -65,7 +65,16 @@ interface RuntimeContextValue extends PluginUiRuntimeApi {
 	getSlots: (panelInstanceId: string) => SlotRecord[];
 }
 
-const RuntimeContext = createContext<RuntimeContextValue | null>(null);
+/**
+ * Registry-keyed: the provider is mounted once by `main.tsx` while consumers live
+ * in lazily-loaded dock panels, so a Fast Refresh re-evaluation (or a duplicated
+ * production chunk) would otherwise split them across two context objects and
+ * surface as "PluginUiRuntimeProvider is required". See `lib/shared-context.ts`.
+ */
+const RuntimeContext = createSharedContext<RuntimeContextValue | null>(
+	"plugins/PluginUiRuntimeProvider",
+	null,
+);
 
 function readRect(element: HTMLElement): SlotRecord["rect"] {
 	const rect = element.getBoundingClientRect();

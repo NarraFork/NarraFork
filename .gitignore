@@ -35,6 +35,9 @@ scripts/lib/*
 scripts/lib/__tests__/*
 !scripts/lib/__tests__/latest-yml.test.ts
 !scripts/validate-plugin-release.ts
+# Imported by tests/scripts/build-plugin.test.ts, so it has to be in the repo or
+# `bun test` fails on a missing module in a fresh clone.
+!scripts/build-plugin.ts
 .tmp-narrafork-home.*
 .release.local.json
 mitm-dump/

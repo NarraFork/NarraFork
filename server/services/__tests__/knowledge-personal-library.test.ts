@@ -53,7 +53,13 @@ describe("standalone personal entries", () => {
 		expect(created.title).toBe(`Standalone ${TAG}`);
 
 		const mine = await knowledgeBranchService.listMine(author);
-		expect(mine.some((d) => d.id === created.id)).toBe(true);
+		const row = mine.find((d) => d.id === created.id);
+		expect(row).toBeTruthy();
+
+		// The LIST view must not carry bodies: it reports size only, so a large personal
+		// library can't pull N full documents onto the main thread. Bodies come from getMine.
+		expect("content" in (row ?? {})).toBe(false);
+		expect(row?.contentLength).toBe("my private note\n".length);
 
 		const got = await knowledgeBranchService.getMine(author, created.id);
 		expect(got.content).toBe("my private note\n");

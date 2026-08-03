@@ -20,6 +20,25 @@ if (typeof Object.hasOwn !== "function") {
  * rather than an actual server restart.
  */
 
+/**
+ * Report a React render error that an error boundary already handled.
+ *
+ * A boundary-caught error never reaches `window.onerror`, so the listeners below
+ * cannot see it. TanStack Router gives EVERY route a `CatchBoundary`, which means
+ * a stale-module-graph failure inside a route (the "useXxx must be used within
+ * XxxProvider" class) is swallowed into a route-level error card and the one-time
+ * reload that would repair the module graph never fires — the user is stuck until
+ * they reload by hand.
+ *
+ * `main.tsx` wires this to `createRoot`'s `onCaughtError` / `onUncaughtError` so
+ * those errors get the same treatment. It is a no-op outside the dev server.
+ */
+export function reportReactRenderError(_error: unknown): void {
+	reportReactRenderErrorImpl?.(_error);
+}
+
+let reportReactRenderErrorImpl: ((error: unknown) => void) | null = null;
+
 if (import.meta.hot) {
 	const staleReactReloadKey = "narrafork:stale-react-dev-reload-at";
 	const staleReactReloadCooldownMs = 30_000;
@@ -72,13 +91,21 @@ if (import.meta.hot) {
 		// module-graph split — recover with a one-time reload.
 		/must be used within [A-Za-z]+Provider/.test(message);
 
-	const onRuntimeError = (error: ErrorEvent | PromiseRejectionEvent) => {
-		const reason = "reason" in error ? error.reason : error.error;
-		const message = String(reason?.message ?? ("message" in error ? error.message : ""));
+	const recoverIfStale = (message: string) => {
 		if (!isStaleReactHookError(message)) return;
 
 		console.warn("[hmr-guard] Detected a stale React module graph; reloading once.");
 		reloadOnceForStaleReactGraph();
+	};
+
+	const onRuntimeError = (error: ErrorEvent | PromiseRejectionEvent) => {
+		const reason = "reason" in error ? error.reason : error.error;
+		recoverIfStale(String(reason?.message ?? ("message" in error ? error.message : "")));
+	};
+
+	// Errors an error boundary already handled never reach the listeners below.
+	reportReactRenderErrorImpl = (error: unknown) => {
+		recoverIfStale(String((error as { message?: unknown } | null)?.message ?? error ?? ""));
 	};
 
 	const onVisibilityChange = () => {
@@ -95,6 +122,7 @@ if (import.meta.hot) {
 		document.removeEventListener("visibilitychange", onVisibilityChange);
 		window.removeEventListener("error", onRuntimeError);
 		window.removeEventListener("unhandledrejection", onRuntimeError);
+		reportReactRenderErrorImpl = null;
 	});
 
 	import.meta.hot.on("vite:ws:disconnect", () => {

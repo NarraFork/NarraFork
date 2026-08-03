@@ -275,6 +275,7 @@
 	"noFavorites": "No favorites yet",
 	"pathBarPlaceholder": "Enter path...",
 	"pathInputMoreResults": "+ {{count}} more — keep typing to narrow results",
+	"remotePathListingFailed": "Could not list this directory",
 	"directoryPickerMoreEntries": "Showing the first 1,000 entries. {{count}} more hidden — edit the path directly or choose a narrower folder.",
 
 	"updateAvailable": "Update available: v{{version}}",

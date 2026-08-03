@@ -43,6 +43,7 @@ import {
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { fastModeOverrideFromLegacyInput, legacyFastModeMirror } from "../lib/fast-mode";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -253,7 +254,10 @@ export interface CreateNarratorInput {
 	permissionMode?: string;
 	cwd?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+	/** @deprecated Legacy boolean; coerced into `fastModeOverride` ("on"/"off"). */
 	fastMode?: boolean;
+	/** Tri-state priority-tier override. "inherit" follows the user's fastModeDefault. */
+	fastModeOverride?: BooleanOverride;
 	relaxedPlan?: boolean;
 	pruneEnabled?: boolean;
 	planReflectionAutoApproveOverride?: BooleanOverride;
@@ -1110,6 +1114,13 @@ export async function prepareNarratorCreation(
 	// passed. A null reasoningEffort means "follow the global default", which
 	// is resolved (and clamped per-model) at request time.
 	const resolvedReasoningEffort = input.reasoningEffort ?? null;
+	// Same reasoning for fast mode: default to "inherit" so a later change to the
+	// user's fastModeDefault preference applies to this narrator too. Only an
+	// explicit caller choice pins it.
+	const resolvedFastModeOverride = fastModeOverrideFromLegacyInput(
+		input.fastModeOverride,
+		input.fastMode,
+	);
 
 	const chapterId = input.chapterId ?? null;
 	const traits: string[] = chapterId === null ? ["standalone"] : [];
@@ -1174,7 +1185,8 @@ export async function prepareNarratorCreation(
 			planFileId,
 			planMode: startInPlanMode,
 			reasoningEffort: resolvedReasoningEffort,
-			fastMode: input.fastMode ?? false,
+			fastModeOverride: resolvedFastModeOverride,
+			fastMode: legacyFastModeMirror(resolvedFastModeOverride),
 			relaxedPlan: resolveInitialRelaxedPlan({
 				permissionMode: resolvedPermMode,
 				explicit: input.relaxedPlan,
@@ -1294,7 +1306,8 @@ export const narratorService = {
 				systemPrompt: input.systemPrompt ?? null,
 				permissionMode: resolvedPermMode,
 				reasoningEffort: resolvedReasoningEffort,
-				fastMode: parent.fastMode ?? false,
+				fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+				fastMode: legacyFastModeMirror(parent.fastModeOverride),
 				relaxedPlan: resolvedRelaxedPlan,
 				pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 				planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
@@ -1719,7 +1732,8 @@ export const narratorService = {
 					systemPrompt: parent.systemPrompt,
 					permissionMode: resolvedPermMode,
 					reasoningEffort: parent.reasoningEffort ?? null,
-					fastMode: parent.fastMode ?? false,
+					fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+					fastMode: legacyFastModeMirror(parent.fastModeOverride),
 					relaxedPlan: resolveInitialRelaxedPlan({
 						permissionMode: resolvedPermMode,
 						explicit: parent.relaxedPlan ?? undefined,
@@ -1905,7 +1919,8 @@ export const narratorService = {
 					systemPrompt,
 					permissionMode: resolvedPermMode,
 					reasoningEffort: resolvedReasoningEffort,
-					fastMode: parent.fastMode ?? false,
+					fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+					fastMode: legacyFastModeMirror(parent.fastModeOverride),
 					relaxedPlan: resolveInitialRelaxedPlan({
 						permissionMode: resolvedPermMode,
 						explicit: parent.relaxedPlan ?? undefined,
@@ -2385,7 +2400,7 @@ export const narratorService = {
 					| "xhigh"
 					| null
 					| undefined,
-				fastMode: parent.fastMode ?? undefined,
+				fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
 				relaxedPlan: parent.relaxedPlan ?? undefined,
 				planReflectionAutoApproveOverride: normalizeBooleanOverride(
 					parent.planReflectionAutoApproveOverride,
@@ -2500,7 +2515,7 @@ export const narratorService = {
 	updateModel: narratorPersistence.updateModel.bind(narratorPersistence),
 	updatePermissionMode: narratorPersistence.updatePermissionMode.bind(narratorPersistence),
 	updateReasoningEffort: narratorPersistence.updateReasoningEffort.bind(narratorPersistence),
-	updateFastMode: narratorPersistence.updateFastMode.bind(narratorPersistence),
+	updateFastModeOverride: narratorPersistence.updateFastModeOverride.bind(narratorPersistence),
 	updateRelaxedPlan: narratorPersistence.updateRelaxedPlan.bind(narratorPersistence),
 	updateReflectionOverrides:
 		narratorPersistence.updateReflectionOverrides.bind(narratorPersistence),

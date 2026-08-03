@@ -191,6 +191,11 @@ export {
 // re-export does not bind the names in this module's scope).
 import { extractField, extractNumericField, isTruncated } from "@shared/pretext-layout/tool-detail";
 import { readLeafText } from "@shared/pretext-layout/tool-io-projection";
+import {
+	hasSubagentToolInputSummary,
+	type SubagentToolInputSummary,
+	subagentSummaryToPartialInput,
+} from "@shared/subagent-tool-summary";
 
 function extractStringArrayField(val: unknown, key: string): string[] {
 	if (!val || isTruncated(val) || typeof val !== "object") return [];
@@ -445,4 +450,49 @@ export function getSummary(
 		default:
 			return toolName;
 	}
+}
+
+/** Row titles are capped so one long summary cannot dominate a fold. */
+export const TRACE_ROW_TITLE_MAX_CHARS = 80;
+
+/** `Tool · summary` for a compact row, truncated to {@link TRACE_ROW_TITLE_MAX_CHARS}. */
+export function traceRowTitle(toolName: string, summary: string | null | undefined): string {
+	// `Task` is the wire name; every surface shows the friendlier "Agent".
+	const name = toolName === "Task" ? "Agent" : toolName;
+	const text = summary ? `${name} · ${summary}` : name;
+	return text.length > TRACE_ROW_TITLE_MAX_CHARS
+		? `${text.slice(0, TRACE_ROW_TITLE_MAX_CHARS - 3)}…`
+		: text;
+}
+
+/**
+ * Row label detail for ONE subagent recent-call header: `Bash` → its
+ * `description`, `Read` → the file's basename, `Await` → `type: id`.
+ *
+ * Formatting is delegated to {@link getSummary}, the SAME formatter the expanded
+ * tool card uses, so a row and its card cannot word one call differently. It is
+ * fed a PARTIAL input rebuilt from the whitelisted keys the server projected
+ * (`input_json` itself never reaches the client for these rows — see
+ * shared/subagent-tool-summary.ts); verified to degrade cleanly, e.g. a `Read`
+ * carrying only `file_path` yields `component.tsx` with no phantom line range.
+ *
+ * Returns null when there is nothing extra to say, which keeps a row from reading
+ * `Bash · Bash`: `getSummary` answers with a placeholder rather than an empty
+ * string for an input it cannot label (`Bash` → "Bash", `Await` →
+ * "task: unknown"), so a summary equal to the tool name — or to that Await
+ * placeholder — counts as "no detail".
+ *
+ * Lives here, beside `getSummary`, because BOTH render paths need it: the chunked
+ * `SubagentActivityRow` and the vlist adapter (through a resolver the shell
+ * injects). A copy in either would let the two rows drift.
+ */
+export function subagentRecentCallSummary(
+	toolName: string,
+	inputSummary: SubagentToolInputSummary | null | undefined,
+): string | null {
+	if (!hasSubagentToolInputSummary(inputSummary)) return null;
+	const text = getSummary(toolName, subagentSummaryToPartialInput(inputSummary)).trim();
+	if (!text || text === toolName) return null;
+	if (text === "task: unknown") return null;
+	return text;
 }

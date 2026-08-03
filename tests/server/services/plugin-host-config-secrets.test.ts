@@ -4,15 +4,17 @@ import { PluginHostServices } from "@server/services/plugin-host-services";
 import type { StoredPermissionGrant } from "@server/services/plugin-permission-store";
 
 /**
- * `config.get` and `secrets.list` are the two host methods a provider plugin needs to
- * know how it was configured. Both sit on a security boundary the sandbox contract
- * spells out (`docs/plugin-system/07-security-and-sandbox.md`):
+ * `config.get` and the four `secrets.*` methods are how a provider plugin learns how it was
+ * configured.
  *
- * - config may be read, but must not carry secret values;
- * - secrets may be *enumerated by name and status only* — never by value.
+ * Secrets are readable by value now (`docs/plugin-system/11-capability-policy.md`),
+ * matching VS Code's `secrets` API. The earlier name-and-status-only rule prevented
+ * nothing — a plugin's own backend could return the value regardless — while stopping a
+ * settings view from showing which credential was configured.
  *
- * The plugin id is always taken from the host-bound principal, so these tests also pin
- * that a plugin cannot reach another plugin's data by passing parameters.
+ * The isolation that remains is structural and is what these tests pin: the plugin id
+ * always comes from the host-bound principal, so no parameter lets one plugin address
+ * another's namespace.
  */
 
 const pluginId = "com.example.host-config";
@@ -116,7 +118,7 @@ describe("plugin host config and secret status", () => {
 		expect(response.error).toBeDefined();
 	});
 
-	test("lists secret keys and status but never values", async () => {
+	test("lists secret keys and status without values", async () => {
 		const hostServices = new PluginHostServices({
 			capabilityBroker: new CapabilityBroker(),
 			secretKeyLister: () => ["provider.demo.apiKey"],
@@ -130,11 +132,148 @@ describe("plugin host config and secret status", () => {
 			params: {},
 		});
 
+		// `list` stays an inventory: values come from `secrets.get`, so a plugin that only
+		// wants to know whether setup is needed does not have to read credentials.
 		expect(response).toMatchObject({
 			result: { secrets: [{ key: "provider.demo.apiKey", configured: true }] },
 		});
-		// No field anywhere in the payload may carry a value.
 		expect(JSON.stringify(response)).not.toContain("value");
+	});
+
+	test("reads, writes, and deletes the calling plugin's own secrets", async () => {
+		const store = new Map<string, string>([["provider.demo.apiKey", "sk-existing"]]);
+		const hostServices = new PluginHostServices({
+			capabilityBroker: new CapabilityBroker(),
+			secretReader: (id, key) => (id === pluginId ? store.get(key) : "WRONG-PLUGIN"),
+			secretWriter: (id, key, value) => {
+				expect(id).toBe(pluginId);
+				store.set(key, value);
+			},
+			secretDeleter: (id, key) => (id === pluginId ? store.delete(key) : false),
+		});
+		const runtime = bind(hostServices, ["secret.use_self"]);
+
+		expect(
+			await runtime.dispatcher.dispatch({
+				jsonrpc: "2.0",
+				id: "secret-get",
+				method: "secrets.get",
+				params: { key: "provider.demo.apiKey" },
+			}),
+		).toMatchObject({ result: { key: "provider.demo.apiKey", value: "sk-existing" } });
+
+		expect(
+			await runtime.dispatcher.dispatch({
+				jsonrpc: "2.0",
+				id: "secret-set",
+				method: "secrets.set",
+				params: { key: "provider.demo.token", value: "tok-new" },
+			}),
+		).toMatchObject({ result: { key: "provider.demo.token", stored: true } });
+		expect(store.get("provider.demo.token")).toBe("tok-new");
+
+		expect(
+			await runtime.dispatcher.dispatch({
+				jsonrpc: "2.0",
+				id: "secret-delete",
+				method: "secrets.delete",
+				params: { key: "provider.demo.apiKey" },
+			}),
+		).toMatchObject({ result: { key: "provider.demo.apiKey", deleted: true } });
+		expect(store.has("provider.demo.apiKey")).toBe(false);
+	});
+
+	test("reports an unset secret as null rather than failing", async () => {
+		const hostServices = new PluginHostServices({
+			capabilityBroker: new CapabilityBroker(),
+			secretReader: () => undefined,
+		});
+		const runtime = bind(hostServices, ["secret.use_self"]);
+
+		// Mirrors `secrets.get` returning `undefined` in VS Code: "not configured" is an
+		// ordinary answer, not an error a plugin has to catch.
+		expect(
+			await runtime.dispatcher.dispatch({
+				jsonrpc: "2.0",
+				id: "secret-missing",
+				method: "secrets.get",
+				params: { key: "provider.demo.absent" },
+			}),
+		).toMatchObject({ result: { key: "provider.demo.absent", value: null } });
+	});
+
+	test("gives a plugin no parameter for naming another plugin's secret", async () => {
+		const seen: string[] = [];
+		const hostServices = new PluginHostServices({
+			capabilityBroker: new CapabilityBroker(),
+			secretReader: (id, key) => {
+				seen.push(id);
+				return `value-for-${key}`;
+			},
+		});
+		const runtime = bind(hostServices, ["secret.use_self"]);
+
+		// The strict params schema refuses the extra field outright; even if it did not, the
+		// owner is read from the bound principal and never from the request.
+		const spoofed = (await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "secret-spoof",
+			method: "secrets.get",
+			params: { key: "provider.demo.apiKey", pluginId: otherPluginId },
+		})) as { error?: unknown };
+
+		expect(spoofed.error).toBeDefined();
+		expect(seen).not.toContain(otherPluginId);
+	});
+
+	test("rejects a secret value beyond the vault's 64KB ceiling", async () => {
+		let written = false;
+		const hostServices = new PluginHostServices({
+			capabilityBroker: new CapabilityBroker(),
+			secretWriter: () => {
+				written = true;
+			},
+		});
+		const runtime = bind(hostServices, ["secret.use_self"]);
+
+		// Retained on purpose. Not a trust limit: the vault is a synchronous JSON
+		// read/modify/write on the main thread, so an unbounded value stalls every request.
+		const response = (await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "secret-oversize",
+			method: "secrets.set",
+			params: { key: "provider.demo.blob", value: "x".repeat(64 * 1024 + 1) },
+		})) as { error?: unknown; result?: unknown };
+
+		expect(response.result).toBeUndefined();
+		expect(response.error).toBeDefined();
+		expect(written).toBe(false);
+	});
+
+	test("denies every secret method without the secret.use_self capability", async () => {
+		const hostServices = new PluginHostServices({
+			capabilityBroker: new CapabilityBroker(),
+			secretReader: () => "sk-should-not-be-reachable",
+			secretWriter: () => undefined,
+			secretDeleter: () => true,
+		});
+		const runtime = bind(hostServices, ["config.read_self"]);
+
+		for (const [method, params] of [
+			["secrets.get", { key: "provider.demo.apiKey" }],
+			["secrets.set", { key: "provider.demo.apiKey", value: "sk-new" }],
+			["secrets.delete", { key: "provider.demo.apiKey" }],
+		] as const) {
+			const response = (await runtime.dispatcher.dispatch({
+				jsonrpc: "2.0",
+				id: `denied-${method}`,
+				method,
+				params,
+			})) as { error?: unknown; result?: unknown };
+
+			expect(response.result).toBeUndefined();
+			expect(response.error).toBeDefined();
+		}
 	});
 
 	test("denies secrets.list without the secret.use_self capability", async () => {

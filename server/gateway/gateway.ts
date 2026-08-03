@@ -653,6 +653,8 @@ class Gateway {
 			messageCount: 0,
 			totalCostUsd: 0,
 			pruneEnabled: settings.agent.defaultPruneEnabled,
+			// 无人值守 IM 不跟随用户的 fastModeDefault，显式关闭以免意外走 priority 计费。
+			fastModeOverride: "off",
 			fastMode: false,
 			// 全部允许时强制宽松，忽略用户默认设置，避免无人值守 IM 被计划模式卡住。
 			relaxedPlan: resolveInitialRelaxedPlan({

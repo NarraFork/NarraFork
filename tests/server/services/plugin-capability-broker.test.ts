@@ -148,20 +148,46 @@ describe("CapabilityBroker principal and context contracts", () => {
 });
 
 describe("CapabilityBroker authorization", () => {
-	test("computes the seven-way intersection and fails closed when a source is missing", async () => {
+	test("allows a granted capability even when a policy source omits it", async () => {
 		const allowed = await broker().authorize(context(), capability);
 		expect(allowed.allowed).toBe(true);
 
-		const denied = await broker(makeBinding({ hostPolicy: [] })).authorize(context(), capability);
-		expect(denied.allowed).toBe(false);
-		if (!denied.allowed) expect(denied.error.code).toBe("PERMISSION_DENIED");
+		// A silent policy source no longer denies. `hostPolicy`, `currentUserAuthority`,
+		// `contributionPolicy` and `runnerEnforcement` are all populated from the same grant
+		// list in production, so gating on them only restated the grant check — while giving
+		// four separate ways to deny a capability the user had already granted by installing.
+		for (const source of [
+			"hostPolicy",
+			"currentUserAuthority",
+			"contributionPolicy",
+			"runnerEnforcement",
+		] as const) {
+			const result = await broker(makeBinding({ [source]: [] })).authorize(context(), capability);
+			expect(result.allowed).toBe(true);
+		}
+	});
 
+	test("still fails closed when a source cannot be resolved at all", async () => {
+		// Distinct from a source that merely omits the capability: an unresolvable source
+		// means the runtime is not ready, so we cannot say what is being asked on whose
+		// behalf. That is a state failure and still denies.
 		const missing = await broker(makeBinding(), {
 			resolveRunnerEnforcement: () => undefined,
 		});
 		const result = await missing.authorize(context(), capability);
 		expect(result.allowed).toBe(false);
 		if (!result.allowed) expect(result.error.reason).toBe("MISSING_SOURCE");
+	});
+
+	test("still denies a capability with no grant on record", async () => {
+		// The grant list is how revocation is expressed, so an absent grant keeps denying.
+		// Default-allow happens at install (see `seedGrantsFromManifest`), not here.
+		const result = await broker(makeBinding({ installationGrants: [] })).authorize(
+			context(),
+			capability,
+		);
+		expect(result.allowed).toBe(false);
+		if (!result.allowed) expect(result.error.reason).toBe("CAPABILITY_NOT_GRANTED");
 	});
 
 	test("allows only narrowed scope and uses an injectable ownership resolver", async () => {
@@ -336,8 +362,10 @@ describe("CapabilityBroker audit and invalidation", () => {
 	});
 
 	test("require throws the structured broker error", async () => {
+		// Uses a denial that still exists: an absent grant. `runnerEnforcement: []` no longer
+		// denies, so it would not exercise the throwing path.
 		await expect(
-			broker(makeBinding({ runnerEnforcement: [] })).require(context(), capability),
+			broker(makeBinding({ installationGrants: [] })).require(context(), capability),
 		).rejects.toMatchObject({
 			name: "CapabilityBrokerError",
 			code: "PERMISSION_DENIED",

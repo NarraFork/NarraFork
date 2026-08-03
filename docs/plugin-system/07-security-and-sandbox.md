@@ -430,8 +430,40 @@ iframe 永远不能直接读取 NarraFork API 的 Authorization header、refresh
 - secret 不进入进程命令行、普通环境、Manifest、UI bootstrap、日志、错误详情、审计正文、请求 dump 或插件 storage 导出。
 - secret 使用按 pluginId、secretId、user/workspace scope、provider instance、requestId 和目的绑定；调用完成或权限撤销后短期句柄失效。
 - 只记录 secret ID、是否命中、耗时、结果码和 hash/指纹（如确有诊断需要），不记录值、长度推断或原始 provider response。
-- provider 插件只能收到本次请求所需的 secret 引用/临时值，不能列举宿主 secret、读取其他 provider 的配置或自行持久化凭据。
-- UI 插件默认永远拿不到 secret；需要设置/输入 secret 时由宿主设置页面处理，iframe 只获得“已配置/未配置”和脱敏状态。
+- **[已撤销]** 原条款写「provider 插件不能读取任何已存储的 secret 明文」「不能列举宿主 secret」。
+  该限制已按"安装即信任"原则撤销，理由与完整清单见
+  **[11 号文档](./11-capability-policy.md)**。
+  - 插件现在可以对**自己命名空间内**的 secret 执行 `secrets.get`/`set`/`delete`/`list`，
+    对照 VS Code 的 `secrets` API（get/store/delete/keys 全开、无声明要求、无门禁）。
+  - **唯一保留的隔离是结构性的**：key 由宿主按调用方 pluginId 派生，插件 API 里没有 pluginId
+    参数，跨插件访问在结构上不可表达。这与 VS Code 的
+    `mainThreadSecretState` 用宿主注入的 `extensionId` 派生 key 是同一机制。
+  - 宿主单向注入仍然保留并且是 provider 请求的**首选路径**：宿主在每次
+    `provider.chat`/`generate`/`listModels` 前解析该 provider 声明的 secret 字段，随 `config`
+    一起下发（见 04 号文档 D-04 与
+    `server/services/plugin-provider-credential-resolver.ts`）。值不缓存，撤销或轮换在下一次
+    请求即生效。插件因此通常不需要自己读取。
+- **[已修订]** provider 插件的 command 返回值可携带 `secretWrites`，请求宿主把凭据写入自身命名空间。
+  - **为什么需要**：`provider-settings` iframe 的 CSP 是 `connect-src 'none'`，无法调用宿主
+    admin 配置端点，因此插件自带的凭据管理页原本无法保存任何修改。
+  - **保留的限制**，见 `server/services/plugin-command-secret-writes.ts`：
+    - key 必须是 `provider.<该插件自己的 contributionId>.<field>`；跨插件、跨 contribution
+      一律拒绝，且两类越界的错误信息完全相同，避免插件借错误差异探测其他插件的 contribution
+      是否存在
+    - 单值 ≤ 64 KB；超限报错而非静默截断。**这不是信任限制**：vault 是主线程上的同步 JSON
+      读改写，无上限值会阻塞所有请求（见 CLAUDE.md 主线程铁律）
+  - **[已撤销]** field 必须在 `configSchema` 声明、单批总量 ≤ 256 KB、条目数 ≤ 50、重复 key
+    拒绝、批量原子性。理由见 11 号文档。
+    - **代价需明确记录**：批量写入不再原子。写入按顺序应用，中途 I/O 失败会留下已写入的前序
+      条目。轮换凭据的插件必须容忍部分应用的批次。
+  - 覆盖测试见 `tests/server/services/plugin-command-secret-writes.test.ts`（19 项）。
+- **[已撤销]** 原条款写「UI 插件默认永远拿不到 secret」。iframe 现在与插件后端拥有同等的
+  secret 读写能力（`secrets.get`/`set`/`delete`/`list` 同时进入
+  `PLUGIN_TO_HOST_REQUEST_METHODS` 与 `PLUGIN_UI_BACKEND_METHODS`，两个清单同步添加，
+  contract parity 断言保持严格相等未作削弱）。
+  - **为什么这不真正扩大攻击面**：一个恶意 UI 插件本来就能通过自己的后端 command 拿到同样的
+    值。原限制阻止的只是"设置页显示用户已配置过什么"这一正当功能。
+  - key 同样由宿主按 `session.pluginId` 派生，视图无法命名其他插件的 secret。
 - **[待决策]** 是否引入系统 keychain/OS credential vault；在未决定前，至少保证插件 data 与核心 settings 分离，且 secret 通过 broker 而不是 JSON 明文复制。
 
 ## 14. 审计、诊断与告警

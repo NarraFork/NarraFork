@@ -1,4 +1,9 @@
 import { Box, Divider, Text } from "@mantine/core";
+import {
+	formatTurnUsageCost,
+	formatTurnUsageParts,
+	getPromptTokenFootprint,
+} from "@shared/pretext-layout/turn-usage";
 import type { SideCarRecord } from "../../lib/api";
 import { formatLocaleNumber } from "../../lib/intl-format";
 import { ActivityTrace } from "./ActivityTrace";
@@ -31,7 +36,6 @@ import type { TraceRowHandlers, TraceRowSubagentHandlers } from "./trace-row-men
 // ---------------------------------------------------------------------------
 
 export interface RenderToolRunOptions {
-	expandedToolUseId?: string | null;
 	highlightedId?: string | null;
 	onForkFromMessage?: (messageId: string) => void;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
@@ -82,56 +86,11 @@ const HIGHLIGHT_STYLE: React.CSSProperties = {
 	borderRadius: "var(--mantine-radius-sm)",
 };
 
-function usageNumber(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-function usageNumberOrNull(value: unknown): number | null {
-	return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function getPromptTokenFootprint(turnUsageJson: NarratorMsg["turnUsageJson"]): number | null {
-	const tu = turnUsageJson as Record<string, unknown> | null | undefined;
-	if (!tu) return null;
-	const promptTokens = usageNumberOrNull(tu.prompt_tokens);
-	if (promptTokens != null) return promptTokens;
-	const inputTokens = usageNumberOrNull(tu.input_tokens);
-	if (inputTokens == null) return null;
-	return (
-		inputTokens + usageNumber(tu.cached_input_tokens) + usageNumber(tu.cache_creation_input_tokens)
-	);
-}
-
-function formatTurnUsageParts(turnUsageJson: NarratorMsg["turnUsageJson"]): string[] | null {
-	const tu = turnUsageJson as Record<string, unknown> | null | undefined;
-	if (!tu) return null;
-	const inputTokens = usageNumber(tu.input_tokens);
-	const outputTokens = usageNumber(tu.output_tokens);
-	const promptTokens = getPromptTokenFootprint(turnUsageJson) ?? inputTokens;
-	const cachedTokens = usageNumber(tu.cached_input_tokens);
-	const cacheCreationTokens = usageNumber(tu.cache_creation_input_tokens);
-	const cache5mTokens = usageNumber(tu.cache_creation_5m_tokens);
-	const cache1hTokens = usageNumber(tu.cache_creation_1h_tokens);
-	const reasoningTokens = usageNumber(tu.reasoning_tokens);
-
-	const parts = [
-		`Σ ${formatLocaleNumber(promptTokens)} ctx`,
-		`${formatLocaleNumber(inputTokens)} in`,
-		`${formatLocaleNumber(outputTokens)} out`,
-	];
-	if (cachedTokens > 0) parts.push(`${formatLocaleNumber(cachedTokens)} cache hit`);
-	if (cacheCreationTokens > 0) {
-		const detail =
-			cache5mTokens > 0 || cache1hTokens > 0
-				? ` (${formatLocaleNumber(cache5mTokens)} 5m / ${formatLocaleNumber(cache1hTokens)} 1h)`
-				: "";
-		parts.push(`${formatLocaleNumber(cacheCreationTokens)} cache write${detail}`);
-	}
-	if (reasoningTokens > 0) {
-		parts.push(`${formatLocaleNumber(reasoningTokens)} reasoning`);
-	}
-	return parts;
-}
+/**
+ * Locale-aware number formatter handed to the shared usage helpers, which stay
+ * pure (and therefore unit-testable) by taking the formatter as an argument.
+ */
+const formatUsageNumber = (value: number) => formatLocaleNumber(value);
 
 export function renderToolRun(
 	items: ToolRunItem[],
@@ -141,7 +100,6 @@ export function renderToolRun(
 	opts: RenderToolRunOptions = {},
 ) {
 	const {
-		expandedToolUseId,
 		highlightedId,
 		onForkFromMessage,
 		onAskInPassing,
@@ -254,7 +212,6 @@ export function renderToolRun(
 							onQuestionDeny={permCb.onQuestionDeny}
 							onViewSubagentSession={onViewSubagentSession}
 							onOpenFilePanel={onOpenFilePanel}
-							forceExpand={expandedToolUseId === item.tc.toolUseId}
 							blockIndex={item.blockIndex}
 							isRecent={recentMessageIds == null || recentMessageIds.has(item.msg.id)}
 						/>
@@ -484,13 +441,19 @@ function ToolRunLodGate({
 // renderTreeMessages — renders a flat message list using pre-computed segments
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolve a pending permission for a tool call. Exported as a NAMED type so
+ * callers stop addressing it by positional index into `renderTreeMessages`'s
+ * 27-argument signature (see ChunkedMessageList's ResolvePermFn).
+ */
+export type RenderTreeResolvePermFn = (tc: ToolCallData) => ReturnType<typeof resolvePendingPerm>;
+
 export function renderTreeMessages(
 	messages: NarratorMsg[],
 	narratorId: string,
 	onForkFromMessage: ((messageId: string) => void) | undefined,
 	highlightedId: string | null,
 	permCb: PermissionCallbacks,
-	expandedToolUseId?: string | null,
 	showTokenUsage?: boolean,
 	pruneBoundaryMessageId?: string | null,
 	pruneDividerLabel?: string,
@@ -572,12 +535,9 @@ export function renderTreeMessages(
 				: targetMsg;
 		const promptTokenFootprint =
 			getPromptTokenFootprint(targetMsg.turnUsageJson) ?? targetMsg.tokensIn ?? null;
-		const turnUsageParts = formatTurnUsageParts(targetMsg.turnUsageJson);
+		const turnUsageParts = formatTurnUsageParts(targetMsg.turnUsageJson, formatUsageNumber);
 		const turnUsageSummary = turnUsageParts?.join(" · ") ?? null;
-		const turnUsageCost =
-			targetMsg.costUsd != null && (targetMsg.costUsd as number) > 0
-				? `$${(targetMsg.costUsd as number).toFixed(4)}`
-				: null;
+		const turnUsageCost = formatTurnUsageCost(targetMsg.costUsd);
 		const mobileTurnUsageLine1 = turnUsageParts?.slice(0, 3).join(" · ") ?? null;
 		const mobileTurnUsageLine2Parts = [...(turnUsageParts?.slice(3) ?? [])];
 		if (turnUsageCost != null) mobileTurnUsageLine2Parts.push(turnUsageCost);
@@ -766,7 +726,6 @@ export function renderTreeMessages(
 
 		const runKey = seg.sourceMessages[0]?.id ?? "unknown";
 		const el = renderToolRun(seg.items, runKey, narratorId, permCb, {
-			expandedToolUseId,
 			highlightedId,
 			onForkFromMessage,
 			onAskInPassing,

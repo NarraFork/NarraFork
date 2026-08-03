@@ -4,7 +4,13 @@ import { memo } from "react";
 import { useTranslation } from "react-i18next";
 import { CollapsibleTrace, type CollapsibleTraceRowContext } from "./CollapsibleTrace";
 import type { ToolRunItem } from "./message-segments";
-import { getCategory, getCategoryColor, getCategoryIcon, getSummary } from "./ToolCallCard";
+import {
+	getCategory,
+	getCategoryColor,
+	getCategoryIcon,
+	getSummary,
+	ToolTimingArea,
+} from "./ToolCallCard";
 import { isSelectionSubagentTool, toolTraceRowIdentity } from "./trace-row-identity";
 import {
 	buildTraceRowActions,
@@ -95,6 +101,10 @@ export const ToolRunSummary = memo(function ToolRunSummary({
 					title: displaySummary(item),
 					body: null,
 					shimmer: i === lastActiveIdx,
+					// Outcome + duration, matching the activity fold and the subagent card's
+					// recent-call rows. Height-neutral (see CollapsibleTrace's row).
+					status: item.tc.status,
+					trailing: <ToolTimingArea toolCall={item.tc} isActive={isToolActive(item)} />,
 					identity,
 					actions,
 				};

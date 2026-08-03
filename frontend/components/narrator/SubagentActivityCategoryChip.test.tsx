@@ -1,32 +1,34 @@
 /**
  * SubagentActivityCategoryChip.test.tsx — pins that a subagent "recent calls" row
- * shows the SAME category mark as the tool card that owns the call.
+ * shows the SAME category mark as the low-LOD trace row for the same call.
  *
  * THE BUG THIS CLOSES
  * The activity row rendered a bare `<Icon>` inside a `c="dimmed"` box: right glyph,
- * wrong everything else. The tool card's header wraps the identical glyph in a
- * 16×16 tinted tile whose background and foreground come from the category colour
- * (`lime` for Read, `orange` for Bash, `violet` for Write…). So the same tool read
- * as a grey outline in one place and a coloured chip in the other — and the colour
- * is the whole point of the mark, since it is what lets a reader tell a file edit
- * from a shell run at a glance.
+ * wrong everything else, so a file edit and a shell run were indistinguishable at a
+ * glance. It was then given the tool card header's 16px tinted tile; the row has
+ * since become a TRACE row, so its mark is the trace lane's 14px tinted `ThemeIcon`
+ * instead. The invariant is unchanged in substance — the chip must be tinted by
+ * category and must match the other rendering of the same call — only its parity
+ * TARGET moved from the card header to the trace row, which is the shape this row
+ * now shares.
  *
  * WHY PARITY AND NOT A HARD-CODED EXPECTATION
- * Asserting `lime` for Read here would pass while the tool card moved to a
+ * Asserting `lime` for Read here would pass while the trace row moved to a
  * different palette, which is precisely the drift that produced the bug. So the
- * assertions compare the activity chip against a REAL `ToolCallCard` header
+ * assertions compare the activity chip against a REAL `CollapsibleTrace` row
  * rendered from the same tool call, plus against `getCategoryColor` — the shared
  * source both consult. A future palette change moves all three together or fails.
  *
  * WHAT IS NOT ASSERTED
- * No Mantine internal class names: the chip is a plain `<span>` + CSS module, and
- * the meaningful output is the two custom properties the module's `background` /
- * `color` read from. Those are what these tests read.
+ * No Mantine-generated class names: they are build artefacts. What is compared is
+ * the ThemeIcon's declared size + colour + the glyph identity, which is what a
+ * reader actually sees.
  *
- * linkedom has no cascade, so `getComputedStyle` cannot resolve the CSS variables
- * to pixels or colours. The variables themselves ARE the contract — they are what
- * the component writes and what the stylesheet consumes — so the assertions read
- * them off the inline style, exactly as the row's other structural tests do.
+ * linkedom has no cascade, so `getComputedStyle` cannot resolve Mantine's CSS
+ * variables to colours. The declared `--ti-color`/`data-variant` pair IS the
+ * contract — it is what the component writes and what the stylesheet consumes — so
+ * the assertions read it off the element, exactly as the row's other structural
+ * tests do.
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
@@ -73,14 +75,9 @@ mock.module("@tanstack/react-router", () => ({
 	useSearch: () => ({}),
 }));
 
-const { SUBAGENT_CATEGORY_SLOT_SIZE, SubagentActivityRow } = await import("./SubagentCard");
-const {
-	getCategory,
-	getCategoryColor,
-	TOOL_CATEGORY_CHIP_GLYPH_SIZE,
-	ToolCallCard,
-	ToolCategoryChip,
-} = await import("./ToolCallCard");
+const { SubagentActivityRow } = await import("./SubagentCard");
+const { CollapsibleTrace, TRACE_ICON_SLOT_SIZE } = await import("./CollapsibleTrace");
+const { getCategory, getCategoryColor, getCategoryIcon } = await import("./ToolCallCard");
 type ToolCallData = import("./ToolCallCard").ToolCallData;
 
 let root: Root | undefined;
@@ -197,36 +194,54 @@ async function renderNode(node: React.ReactNode) {
 	});
 }
 
-/** The chip inside a subagent activity row. */
-function activityChip(): HTMLElement {
-	const chips =
-		container?.querySelectorAll('[data-testid="subagent-activity-category-chip"]') ?? [];
+/**
+ * The one chip of whichever row was rendered.
+ *
+ * Both the activity row and a trace row put their chip in the trace ICON LANE
+ * (`data-trace-icon-slot`), which is precisely the point: one selector finds both,
+ * so the comparisons below cannot accidentally read two different marks.
+ */
+function rowChip(): HTMLElement {
+	const slots = container?.querySelectorAll("[data-trace-icon-slot]") ?? [];
 	// Exactly one per row: a second mark would be a duplicate affordance.
-	expect(chips.length).toBe(1);
-	return chips[0] as unknown as HTMLElement;
+	expect(slots.length).toBe(1);
+	const chip = (slots[0] as unknown as HTMLElement).firstElementChild;
+	if (!chip) throw new Error("category chip not rendered inside the icon slot");
+	return chip as HTMLElement;
 }
 
 /**
- * The chip inside a rendered tool card header. Found by the chip's own marker
- * attribute rather than a Mantine or CSS-module class name, which are build
- * artefacts and were deliberately removed from this suite's assertions.
+ * The declarations that decide what the chip LOOKS like.
+ *
+ * Read generically (every attribute except React/Mantine-generated class names)
+ * rather than from a hard-coded list of custom properties: the chip is a Mantine
+ * `ThemeIcon` now, and pinning its internal variable names here would make this
+ * suite fail on a Mantine version bump for a reason that has nothing to do with the
+ * invariant. Whatever it writes, the two rows must write the SAME thing.
  */
-function cardChip(): HTMLElement {
-	const chips = container?.querySelectorAll("[data-tool-category-chip]") ?? [];
-	expect(chips.length).toBe(1);
-	return chips[0] as unknown as HTMLElement;
+function chipAppearance(el: HTMLElement) {
+	const attributes: Record<string, string> = {};
+	for (const name of el.getAttributeNames()) {
+		// `class` carries Mantine's generated module hashes — a build artefact. Test ids
+		// differ by call site by design.
+		if (name === "class" || name.startsWith("data-testid")) continue;
+		attributes[name] = el.getAttribute(name) ?? "";
+	}
+	const glyph = el.querySelector("svg");
+	return {
+		attributes,
+		// Tabler stamps `tabler-icon-<name>` on the svg, which identifies the GLYPH
+		// without depending on Mantine's class names.
+		glyph: /tabler-icon-([a-z0-9-]+)/.exec(glyph?.getAttribute("class") ?? "")?.[1] ?? null,
+		size: glyph?.getAttribute("width") ?? null,
+	};
 }
 
-/** The declarations that decide what the chip LOOKS like. */
-function chipAppearance(el: HTMLElement) {
-	return {
-		category: el.getAttribute("data-tool-category-chip"),
-		bg: el.style.getPropertyValue("--tool-header-icon-bg"),
-		fg: el.style.getPropertyValue("--tool-header-icon-color"),
-		className: el.getAttribute("class"),
-		glyph: el.querySelector("svg")?.getAttribute("class") ?? null,
-		size: el.querySelector("svg")?.getAttribute("width") ?? null,
-	};
+/** The declared Mantine colour of a chip, whichever attribute carries it. */
+function chipColorSignature(el: HTMLElement): string {
+	const style = el.getAttribute("style") ?? "";
+	const color = el.getAttribute("data-color") ?? "";
+	return `${color}|${style}`;
 }
 
 beforeEach(() => {
@@ -262,15 +277,14 @@ afterAll(() => {
 });
 
 describe("activity row category chip carries the category colour", () => {
-	test("writes the colour variables the chip's background and text read from", async () => {
+	test("declares the category's own colour rather than inheriting the row's", async () => {
 		// The bug was a chip with NO colour of its own, inheriting the row's dimmed
-		// text. Both variables present and pointing at the category's palette entry is
-		// what distinguishes the fix from that state.
+		// text. A declared per-category colour is what distinguishes the fix from that
+		// state; which attribute Mantine writes it into is its business, so the
+		// assertion reads whatever the element declares.
 		for (const { toolName, color } of CASES) {
 			await render(toolName);
-			const { bg, fg } = chipAppearance(activityChip());
-			expect(bg).toBe(`var(--mantine-color-${color}-light, var(--mantine-color-${color}-1))`);
-			expect(fg).toBe(`var(--mantine-color-${color}-light-color, var(--mantine-color-${color}-6))`);
+			expect(chipColorSignature(rowChip())).toContain(color);
 		}
 	});
 
@@ -280,7 +294,7 @@ describe("activity row category chip carries the category colour", () => {
 		for (const { toolName } of CASES) {
 			await render(toolName);
 			const expected = getCategoryColor(getCategory(toolName));
-			expect(chipAppearance(activityChip()).bg).toContain(`--mantine-color-${expected}-light`);
+			expect(chipColorSignature(rowChip())).toContain(expected);
 		}
 	});
 
@@ -291,7 +305,7 @@ describe("activity row category chip carries the category colour", () => {
 		const seen = new Set<string>();
 		for (const { toolName } of CASES) {
 			await render(toolName);
-			seen.add(chipAppearance(activityChip()).bg);
+			seen.add(chipColorSignature(rowChip()));
 		}
 		expect(seen.size).toBe(CASES.length);
 	});
@@ -302,58 +316,93 @@ describe("activity row category chip carries the category colour", () => {
 		// a real category tint, not an absence of one.
 		await render("TotallyUnknownTool");
 		const generic = getCategoryColor(getCategory("TotallyUnknownTool"));
-		expect(chipAppearance(activityChip()).bg).toContain(`--mantine-color-${generic}-light`);
+		expect(chipColorSignature(rowChip())).toContain(generic);
+	});
+
+	test("the glyph is inset inside the chip, not drawn to its edge", async () => {
+		// A 9px glyph in the 14px trace lane is what makes the tint read as a chip.
+		// Equal numbers would render a tinted box tight around the icon — technically
+		// coloured, visually a different mark from the trace row's.
+		await render("Read");
+		const size = Number(chipAppearance(rowChip()).size);
+		expect(size).toBeGreaterThan(0);
+		expect(size).toBeLessThan(TRACE_ICON_SLOT_SIZE);
 	});
 });
 
-describe("activity row chip matches the tool card header chip", () => {
+describe("activity row chip matches the folded TRACE row chip", () => {
 	test("identical appearance for the same tool call", async () => {
 		// The point of the whole change: not "the row has A colour" but "the row has the
-		// SAME mark as the card". Compared against a real ToolCallCard render, so glyph,
-		// size, tint and the CSS-module class are all held together — a change to the
-		// header that missed the row fails here.
+		// SAME mark as the trace row it is now shaped like". Compared against a real
+		// CollapsibleTrace render fed the same tool call, so glyph, size and tint are
+		// held together — a change to the trace row that missed this one fails here.
 		for (const { toolName } of CASES) {
 			const call = toolCall(toolName);
 
 			await renderNode(<SubagentActivityRow call={call} />);
-			const rowAppearance = chipAppearance(activityChip());
+			const rowAppearance = chipAppearance(rowChip());
 
-			await renderNode(<ToolCallCard toolCall={call} />);
-			const headerAppearance = chipAppearance(cardChip());
+			await renderNode(traceRowFor(call));
+			const traceAppearance = chipAppearance(rowChip());
 
-			expect(rowAppearance).toEqual(headerAppearance);
+			expect(rowAppearance).toEqual(traceAppearance);
 		}
 	});
 
-	test("both render the shared chip component", async () => {
-		// A copy that happens to agree today is the state this change removed. Rendering
-		// ToolCategoryChip directly and matching it proves both call sites go through
-		// the one definition rather than two that currently coincide.
+	test("the chip sits in the SAME lane, at the same reserved size", async () => {
+		// Two chips can look identical while sitting in differently-sized lanes, which
+		// would make the rows different heights — the other half of "same shape".
 		for (const { toolName } of CASES) {
-			await renderNode(<SubagentActivityRow call={toolCall(toolName)} />);
-			const rowAppearance = chipAppearance(activityChip());
+			const call = toolCall(toolName);
 
-			await renderNode(<ToolCategoryChip category={getCategory(toolName)} toolName={toolName} />);
-			const direct = chipAppearance(cardChip());
+			await renderNode(<SubagentActivityRow call={call} />);
+			const rowLane = laneGeometry();
 
-			// The row passes a test id the bare chip does not, so compare everything else.
-			expect({ ...rowAppearance, className: undefined }).toEqual({
-				...direct,
-				className: undefined,
-			});
-			expect(rowAppearance.className).toContain(direct.className ?? "");
+			await renderNode(traceRowFor(call));
+			expect(laneGeometry()).toEqual(rowLane);
+			expect(rowLane.width).toBe(`${TRACE_ICON_SLOT_SIZE}px`);
 		}
-	});
-
-	test("the glyph is inset inside the chip, not drawn to its edge", async () => {
-		// A 10px glyph in a 16px slot is what makes the tint read as a chip. Equal
-		// numbers would render a tinted box tight around the icon — technically
-		// coloured, visually a different mark from the card's.
-		await render("Read");
-		expect(chipAppearance(activityChip()).size).toBe(String(TOOL_CATEGORY_CHIP_GLYPH_SIZE));
-		expect(TOOL_CATEGORY_CHIP_GLYPH_SIZE).toBeLessThan(SUBAGENT_CATEGORY_SLOT_SIZE);
 	});
 });
+
+/** The trace icon lane's reserved geometry (what pins the row's height). */
+function laneGeometry() {
+	const slots = container?.querySelectorAll("[data-trace-icon-slot]") ?? [];
+	expect(slots.length).toBe(1);
+	const lane = slots[0] as unknown as HTMLElement;
+	return { width: lane.style.width, height: lane.style.height, minWidth: lane.style.minWidth };
+}
+
+/**
+ * A real `CollapsibleTrace` row for one tool call, built exactly the way
+ * `ActivityTrace` builds its rows (category → glyph + colour). Rendering the real
+ * component — rather than restating the expected markup — is what makes this a
+ * parity test instead of a snapshot of today's implementation.
+ */
+function traceRowFor(call: ToolCallData) {
+	const category = getCategory(call.toolName);
+	const Icon = getCategoryIcon(category, call.toolName);
+	return (
+		<CollapsibleTrace
+			items={[
+				{
+					key: call.toolUseId ?? "row",
+					icon: <Icon size={9} />,
+					iconColor: getCategoryColor(category),
+					title: call.toolName,
+					body: null,
+					status: call.status,
+				},
+			]}
+			headerIcon={null}
+			headerColor="gray"
+			headerLabel="tools"
+			headerCount="1"
+			showEarlierLabel={() => "earlier"}
+			hideEarlierLabel="hide"
+		/>
+	);
+}
 
 async function render(toolName: string) {
 	await renderNode(<SubagentActivityRow call={toolCall(toolName)} />);

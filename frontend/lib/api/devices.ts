@@ -40,6 +40,15 @@ export interface RemoteStatEntry {
 	isDirectory: boolean;
 }
 
+/** One level of a remote device's directory tree, in that device's path syntax. */
+export interface RemoteDirectoryListing {
+	path: string;
+	entries: Array<{ name: string; path: string; isDirectory: boolean }>;
+	parent: string | null;
+	sep: string;
+	truncated: boolean;
+}
+
 export interface RemoteStatResult {
 	exists: boolean;
 	isDirectory: boolean;
@@ -132,6 +141,17 @@ export const devicesApi = {
 	statDevicePath: (id: string, path: string, recursive = false) => {
 		const params = new URLSearchParams({ path, recursive: String(recursive) });
 		return request<RemoteStatResult>(`/devices/${id}/fs?${params}`);
+	},
+	/**
+	 * List one level of a device's directories for interactive path pickers.
+	 * Omit `path` to start at the device's default working directory.
+	 */
+	browseDevicePath: (id: string, path?: string, opts?: { showHidden?: boolean }) => {
+		const params = new URLSearchParams();
+		if (path) params.set("path", path);
+		if (opts?.showHidden) params.set("showHidden", "1");
+		const qs = params.toString();
+		return request<RemoteDirectoryListing>(`/devices/${id}/browse${qs ? `?${qs}` : ""}`);
 	},
 	startTransferTask: (
 		id: string,

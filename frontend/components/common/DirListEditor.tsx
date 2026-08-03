@@ -13,6 +13,7 @@ import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { IconFolderOpen, IconTrash } from "@tabler/icons-react";
 import { lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
+import { DIRECTORY_BROWSER_MODAL_STYLES } from "./directory-browser-modal";
 import { PathInput } from "./PathInput";
 
 const DirectoryBrowser = lazy(() =>
@@ -195,15 +196,7 @@ export function DirListEditor(props: DirListEditorProps) {
 				onClose={close}
 				title={t("selectDirectory")}
 				size={isWide ? 880 : "md"}
-				styles={{
-					body: {
-						padding: 0,
-						maxHeight: "85vh",
-						display: "flex",
-						flexDirection: "column",
-						overflow: "hidden",
-					},
-				}}
+				styles={DIRECTORY_BROWSER_MODAL_STYLES}
 			>
 				{opened && (
 					<Suspense fallback={null}>

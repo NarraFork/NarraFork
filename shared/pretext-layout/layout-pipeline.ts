@@ -78,6 +78,13 @@ export interface ComputeLayoutOptions {
 	/** Authoritative header summary (tool-display.getSummary), injected by the shell
 	 * so the vlist header matches the chunked card even for truncated inputs. */
 	resolveToolSummary?: (tc: unknown) => string;
+	/**
+	 * Label detail for ONE subagent recent-call row, from the tool name plus the
+	 * whitelisted short input keys the server projected. Separate from
+	 * `resolveToolSummary` because these rows carry no tool call at all — only that
+	 * projection (the activity query never selects `input_json`).
+	 */
+	resolveSubagentRecentSummary?: (toolName: string, inputSummary: unknown) => string | null;
 	/** True when a tool/subagent item has a live pending permission request; forces
 	 * its card expanded and folds into the measure cache key. */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
@@ -96,6 +103,12 @@ export interface ComputeLayoutOptions {
 	resolveFullToolOutput?: (toolUseId: string | undefined) => unknown;
 	/** A live pending permission's suggestions (reflection-gate precedence). */
 	resolvePendingPermissionSuggestions?: (toolUseId: string | undefined) => unknown[] | undefined;
+	/** Reader enabled per-turn token usage rows (absent → no usage specs at all). */
+	showTokenUsage?: boolean;
+	/** Phone-sized viewport → the trailing usage summary splits across two lines. */
+	compactUsageLines?: boolean;
+	/** Locale-aware number grouping for the usage rows. */
+	formatUsageNumber?: (value: number) => string;
 	/**
 	 * Document version (narrator messageVersion) folded into the measurement
 	 * cache key. Any in-place message edit bumps this, so a cached height/blocks
@@ -145,11 +158,15 @@ export function computePretextVListLayout(
 		resolveToolColor: opts.resolveToolColor,
 		resolveToolTitle: opts.resolveToolTitle as AdapterContext["resolveToolTitle"],
 		resolveToolSummary: opts.resolveToolSummary as AdapterContext["resolveToolSummary"],
+		resolveSubagentRecentSummary: opts.resolveSubagentRecentSummary,
 		resolveHasPendingPermission: opts.resolveHasPendingPermission,
 		resolvePendingPlan: opts.resolvePendingPlan,
 		resolveFullToolInput: opts.resolveFullToolInput,
 		resolveFullToolOutput: opts.resolveFullToolOutput,
 		resolvePendingPermissionSuggestions: opts.resolvePendingPermissionSuggestions,
+		showTokenUsage: opts.showTokenUsage,
+		compactUsageLines: opts.compactUsageLines,
+		formatUsageNumber: opts.formatUsageNumber,
 	};
 	const first = segmentsOrUnits[0];
 	const specs =

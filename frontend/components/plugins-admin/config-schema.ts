@@ -236,7 +236,11 @@ function fieldFor(
 		const minLength = asNumber(node.minLength);
 		const maxLength = asNumber(node.maxLength);
 		const pattern = asString(node.pattern);
-		const isSecret = node.format === "password";
+		// Kept in step with `isSecretSchemaNode` in plugin-provider-config-service.ts. The
+		// backend decides which fields are routed to the vault; if the form recognized
+		// fewer markers it would render a credential as a plain visible text input.
+		const isSecret =
+			node.format === "password" || node.writeOnly === true || node["x-narrafork-secret"] === true;
 		const kind: ConfigFieldKind = isSecret
 			? "password"
 			: (maxLength ?? 0) >= TEXTAREA_MIN_LENGTH

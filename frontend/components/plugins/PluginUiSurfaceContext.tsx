@@ -9,7 +9,12 @@ import {
 } from "react";
 import type { PluginDockPanelParams } from "./protocol";
 
-export type PluginUiHostSurface = "focus" | "workspace" | "director" | "settings";
+export type PluginUiHostSurface =
+	| "focus"
+	| "workspace"
+	| "director"
+	| "settings"
+	| "provider-settings";
 
 /** Runtime-only host context. IDs never need to be copied into arbitrary view state. */
 export interface PluginUiSessionContext {

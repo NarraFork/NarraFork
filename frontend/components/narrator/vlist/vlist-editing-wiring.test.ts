@@ -62,8 +62,26 @@ describe("vlist inline editing wiring", () => {
 	});
 
 	it("replaces the row body while editing (no context menu / selection surface)", () => {
-		expect(SHELL).toContain("const body = editorSlot ?? renderElement(kind, item.measured, extra)");
+		// `editorBody` is the editor slot after the right-alignment wrapper below; it
+		// stays nullish when no editor is mounted, so a read-only row still renders
+		// its measured element.
+		expect(SHELL).toContain("const body = editorBody ?? renderElement(kind, item.measured, extra)");
 		expect(SHELL).toMatch(/interaction && editorSlot === undefined \?/);
+	});
+
+	it("keeps a user bubble's editor on the right at the bubble's width", () => {
+		// The bubble is drawn right-aligned and shrink-wrapped. A full-column editor
+		// threw the caret / attach / submit controls to the far left of the row the
+		// moment editing started, so the slot is wrapped in the same flex-end column
+		// at the width resolveVListEditorWidth decides (null → unchanged full width,
+		// which is what assistant rows get).
+		expect(SHELL).toContain(
+			"resolveVListEditorWidth(kind, extra.role, item.measured.usedWidth, contentWidth)",
+		);
+		expect(SHELL).toMatch(
+			/editorSlot != null && editorWidth != null \?[\s\S]{0,200}?justifyContent: "flex-end"/,
+		);
+		expect(SHELL).toMatch(/width: editorWidth, maxWidth: "100%"/);
 	});
 
 	it("routes the row menu's edit item through the shell's own editor state", () => {

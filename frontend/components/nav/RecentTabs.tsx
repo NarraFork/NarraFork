@@ -66,16 +66,19 @@ import {
 	applyRecentTabMove,
 	applyRecentTabsDelta,
 	applyRecentTabsRuntimePatches,
+	bumpRecentTabRuntimeVersions,
 	clampRecentTabText,
 	collectRecentTabsDeltaFrame,
 	normalizeRecentTabViewers,
-	pruneRecentTabsTerminalCountVersions,
+	pruneRecentTabsRuntimeVersions,
 	type RecentTab,
+	type RecentTabRuntimeVersions,
 	type RecentTabViewer,
 	reconcileRecentTabsRuntimePatches,
 	refreshRecentTabsLoadedWindow,
 	selectRecentTabsLiveWindow,
 	shouldApplyRecentTabsRuntimeResponse,
+	snapshotRecentTabRuntimeVersions,
 	useRecentTabs,
 } from "../../hooks/useRecentTabs";
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
@@ -206,7 +209,10 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		[runtimeTargets],
 	);
 	const runtimeRefreshGenerationRef = useRef(0);
-	const terminalCountVersionsRef = useRef(new Map<string, number>());
+	// Per-narrator, per-field counters of runtime values already delivered over WS.
+	// The runtime endpoint returns a full snapshot of every field, so any field whose
+	// counter moved while the request was in flight must not be overwritten by it.
+	const runtimeVersionsRef = useRef<RecentTabRuntimeVersions>(new Map());
 	const runtimeNarratorIds = useMemo(
 		() => new Set(runtimeNarratorIdsByKey.values()),
 		[runtimeNarratorIdsByKey],
@@ -219,11 +225,9 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		const requestGeneration = ++runtimeRefreshGenerationRef.current;
 		if (runtimeKeys.length === 0) return;
 		const requestNarratorIds = new Set(runtimeNarratorIdsByKey.values());
-		const terminalCountVersionsAtRequest = new Map(
-			[...requestNarratorIds].map((narratorId) => [
-				narratorId,
-				terminalCountVersionsRef.current.get(narratorId) ?? 0,
-			]),
+		const versionsAtRequest = snapshotRecentTabRuntimeVersions(
+			runtimeVersionsRef.current,
+			requestNarratorIds,
 		);
 		inFlightRuntimeNarratorIdsRef.current.set(requestGeneration, requestNarratorIds);
 		try {
@@ -241,14 +245,14 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				reconcileRecentTabsRuntimePatches(
 					result.patches,
 					runtimeNarratorIdsByKey,
-					terminalCountVersionsAtRequest,
-					terminalCountVersionsRef.current,
+					versionsAtRequest,
+					runtimeVersionsRef.current,
 				),
 			);
 		} finally {
 			inFlightRuntimeNarratorIdsRef.current.delete(requestGeneration);
-			pruneRecentTabsTerminalCountVersions(
-				terminalCountVersionsRef.current,
+			pruneRecentTabsRuntimeVersions(
+				runtimeVersionsRef.current,
 				runtimeNarratorIdsRef.current,
 				inFlightRuntimeNarratorIdsRef.current.values(),
 			);
@@ -256,8 +260,8 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	}, [qc, runtimeKeys, runtimeNarratorIdsByKey]);
 
 	useEffect(() => {
-		pruneRecentTabsTerminalCountVersions(
-			terminalCountVersionsRef.current,
+		pruneRecentTabsRuntimeVersions(
+			runtimeVersionsRef.current,
 			runtimeNarratorIds,
 			inFlightRuntimeNarratorIdsRef.current.values(),
 		);
@@ -305,12 +309,6 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const handleWSUpdate = useCallback(
 		(narratorId: string, event: NarratorListWSEvent) => {
 			const patch: Partial<RecentTab> = {};
-			if (event.type === "terminalCount" && event.activeTerminalCount !== undefined) {
-				terminalCountVersionsRef.current.set(
-					narratorId,
-					(terminalCountVersionsRef.current.get(narratorId) ?? 0) + 1,
-				);
-			}
 			if (event.type === "title" && event.title) patch.title = clampRecentTabText(event.title);
 			else if (event.type === "status") {
 				if (event.status) patch.status = event.status;
@@ -325,6 +323,10 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			} else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
 			else if (event.type === "draft") patch.hasDraft = !!event.hasDraft;
 			else return;
+
+			// This WS event is now the freshest source for these fields. An older runtime
+			// response must not roll them back (icon colour / filled state lag).
+			bumpRecentTabRuntimeVersions(runtimeVersionsRef.current, narratorId, Object.keys(patch));
 
 			if (event.type === "status") {
 				const isReflecting = event.substatus?.includes("reflecting");

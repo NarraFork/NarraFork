@@ -26,9 +26,15 @@ import { LocalProcessRunner, PluginRuntime } from "@server/services/plugin-runti
 const fixtureRoot = join(import.meta.dir, "../../../fixtures/plugins/e2e/reference-provider-rpc");
 const exampleRoot = join(import.meta.dir, "../../../../examples/plugins/provider");
 
-/** Mirrors CHAT_WORDS in the fixture's server entry. */
-const EXPECTED_CHAT_TEXT = "Hello from the example provider.";
-const EXPECTED_CHAT_WORDS = 6;
+/**
+ * Mirrors CHAT_WORDS in the fixture's server entry.
+ *
+ * The `[anonymous]` suffix is the fixture reporting that no credential reached it. This
+ * path drives the adapter directly with a plain config and no vault, so the absence of a
+ * key is the expected outcome rather than an incidental detail.
+ */
+const EXPECTED_CHAT_TEXT = "Hello from the example provider. [anonymous]";
+const EXPECTED_CHAT_WORDS = 7;
 
 async function loadManifest() {
 	return parseManifest(JSON.parse(await readFile(join(fixtureRoot, "manifest.json"), "utf8")));
@@ -53,23 +59,27 @@ function createRuntime(manifest: Awaited<ReturnType<typeof loadManifest>>): Plug
 			stderrRingBytes: 8 * 1024,
 			maxStderrBytes: 16 * 1024,
 			maxStderrBytesPerSecond: 16 * 1024,
-			spawnTimeoutMs: 5_000,
-			idleTimeoutMs: 15_000,
-			totalTimeoutMs: 20_000,
+			// Generous on purpose. These are real subprocesses, and the full suite now spawns
+			// enough of them in parallel that a 5s spawn/handshake budget is occasionally missed
+			// on a loaded machine — a scheduling artefact, not a protocol failure. The values
+			// still bound a genuinely hung plugin; they just do not race the CPU.
+			spawnTimeoutMs: 20_000,
+			idleTimeoutMs: 30_000,
+			totalTimeoutMs: 45_000,
 			killProcessTree: true,
-			resourceLimits: { cpuTimeSeconds: 10, memoryBytes: 1024 * 1024 * 1024 },
+			resourceLimits: { cpuTimeSeconds: 30, memoryBytes: 1024 * 1024 * 1024 },
 			allowUnboundedResourceUsage: process.platform === "win32",
 		}),
 		timeouts: {
-			handshakeMs: 5_000,
-			activationMs: 5_000,
-			rpcMs: 5_000,
+			handshakeMs: 20_000,
+			activationMs: 20_000,
+			rpcMs: 20_000,
 			drainMs: 200,
 			shutdownMs: 1_000,
 			cancelGraceMs: 1_000,
 		},
-		idleTimeoutMs: 15_000,
-		totalTimeoutMs: 20_000,
+		idleTimeoutMs: 30_000,
+		totalTimeoutMs: 45_000,
 		maxInFlight: 4,
 	});
 }

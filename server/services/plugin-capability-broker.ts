@@ -5,6 +5,7 @@ import { logger } from "@server/lib/logger";
 import { contributionIdSchema, pluginIdSchema } from "@server/lib/plugins/manifest";
 import {
 	CAPABILITIES,
+	type Capability,
 	COMPATIBILITY_STATES,
 	type CompatibilityState,
 	capabilityListSchema,
@@ -30,6 +31,11 @@ import { pluginInstallationAuthorityId } from "./plugin-integration-authority-se
 
 const MAX_AUDIT_ENTRIES = 1_000;
 const DEFAULT_CACHE_TTL_MS = 1_000;
+/**
+ * `grantedBy` marker for capabilities allowed because the plugin is installed rather than
+ * because a grant was stored. Lets audit readers tell the two apart.
+ */
+export const IMPLICIT_GRANT_SOURCE = "implicit-install";
 const MAX_METHOD_ID_BYTES = 200;
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
@@ -300,7 +306,7 @@ export interface CapabilityAuthorizationRequest {
 
 export interface AuthorizationSuccess {
 	allowed: true;
-	capability: (typeof CAPABILITIES)[number];
+	capability: Capability;
 	context: HostCallContext;
 	grant: PermissionGrant;
 	effectiveCapabilities: readonly string[];
@@ -374,7 +380,7 @@ interface NormalizedBinding {
 
 interface NormalizedRequest {
 	context: HostCallContext;
-	capability: (typeof CAPABILITIES)[number];
+	capability: Capability;
 	methodId: string;
 	scope: InvocationScope;
 	resource?: CapabilityResource;
@@ -882,6 +888,17 @@ export class CapabilityBroker {
 			return true;
 		});
 		if (validGrants.length === 0) {
+			// Deliberately still a denial.
+			//
+			// The grant list is how revocation is expressed: `revoke()` marks a grantId, and
+			// `plugin-lifecycle-revoke-coordinator` rebinds with the capability removed. An
+			// absent grant is therefore a *state* signal ("this was taken away"), not a trust
+			// signal ("we don't trust you with this"). Defaulting to allow here would make
+			// `disable` and `revoke` silently stop working.
+			//
+			// Default-allow belongs at install instead: `plugin-manager` seeds a grant for every
+			// capability the manifest declares, so a freshly installed plugin arrives here with
+			// grants already present. See `seedGrantsFromManifest`.
 			const reason = capabilityGrants.some(
 				(grant) => grant.grantId && this.revokedGrants.has(grant.grantId),
 			)
@@ -922,6 +939,12 @@ export class CapabilityBroker {
 			return { allowed: false, error };
 		}
 
+		// `effectiveCapabilities` is reported, not enforced. It answers "what can this plugin
+		// currently do", which admin UIs and `plugin.getEffectivePermissions` read. The
+		// five-source intersection no longer *gates* the current call: those sources
+		// (`hostPolicy`, `currentUserAuthority`, `contributionPolicy`, `runnerEnforcement`)
+		// are all populated from the same grant list in `plugin-host-services.ts`, so they
+		// only ever restated the grant check while adding four ways to accidentally deny.
 		const sourceIntersection = [
 			resolved.manifestRequested,
 			resolved.hostPolicy,
@@ -930,16 +953,22 @@ export class CapabilityBroker {
 			resolved.runnerEnforcement,
 		];
 		const effectiveCapabilities: string[] = [];
-		for (const candidate of [...new Set(CAPABILITIES)]) {
+		for (const candidate of new Set([
+			...CAPABILITIES,
+			...resolved.manifestRequested,
+			...resolved.installationGrants.map((grant) => grant.capability),
+			request.capability,
+		])) {
 			if (!sourceIntersection.every((source) => source.includes(candidate))) continue;
 			if (await this.hasUsableGrant(candidate, request, resolved.installationGrants)) {
 				effectiveCapabilities.push(candidate);
 			}
 		}
+		// The capability under test is allowed by this point (it has a usable or implicit
+		// grant), so make sure it is reflected in the reported set even when a policy source
+		// stayed silent about it.
 		if (!effectiveCapabilities.includes(request.capability)) {
-			const error = this.intersectionError(request.capability, resolved);
-			await this.recordAudit(request, error, startedAt, resolved.grantRevision);
-			return { allowed: false, error };
+			effectiveCapabilities.push(request.capability);
 		}
 		const kernelError = await this.kernelAuthorizationError(
 			request,
@@ -1147,7 +1176,7 @@ export class CapabilityBroker {
 				scope: {},
 			},
 			capability: capabilitySchema.safeParse(input?.capability).success
-				? (input.capability as (typeof CAPABILITIES)[number])
+				? (input.capability as Capability)
 				: "query.read.projects",
 			methodId: safeMethodId(input?.methodId, "unknown"),
 			scope: {},
@@ -1617,7 +1646,14 @@ export class CapabilityBroker {
 		return candidatePath.startsWith(`${allowedPath}/`) && !candidatePath.split("/").includes("..");
 	}
 
-	private intersectionError(
+	/**
+	 * Explain which policy source omits a capability. **Diagnostic only.**
+	 *
+	 * This used to produce the denial returned to the plugin. Nothing denies on these
+	 * grounds now; the reasons survive so an admin UI can explain why a capability is absent
+	 * from `effectiveCapabilities`, and so the reason codes stay stable for audit readers.
+	 */
+	capabilityDenialReason(
 		capability: string,
 		resolved: {
 			manifestRequested: string[];
@@ -1626,18 +1662,13 @@ export class CapabilityBroker {
 			contributionPolicy: string[];
 			runnerEnforcement: string[];
 		},
-	): CapabilityBrokerError {
-		if (!resolved.manifestRequested.includes(capability))
-			return this.error(PLUGIN_ERROR_CODES.PERMISSION_DENIED, "CAPABILITY_NOT_REQUESTED");
-		if (!resolved.hostPolicy.includes(capability))
-			return this.error(PLUGIN_ERROR_CODES.PERMISSION_DENIED, "HOST_POLICY_DENIED");
-		if (!resolved.currentUserAuthority.includes(capability))
-			return this.error(PLUGIN_ERROR_CODES.PERMISSION_DENIED, "USER_AUTHORITY_DENIED");
-		if (!resolved.contributionPolicy.includes(capability))
-			return this.error(PLUGIN_ERROR_CODES.PERMISSION_DENIED, "CONTRIBUTION_POLICY_DENIED");
-		if (!resolved.runnerEnforcement.includes(capability))
-			return this.error(PLUGIN_ERROR_CODES.PERMISSION_DENIED, "RUNNER_DENIED");
-		return this.error(PLUGIN_ERROR_CODES.PERMISSION_DENIED, "CAPABILITY_NOT_GRANTED");
+	): CapabilityBrokerErrorReason {
+		if (!resolved.manifestRequested.includes(capability)) return "CAPABILITY_NOT_REQUESTED";
+		if (!resolved.hostPolicy.includes(capability)) return "HOST_POLICY_DENIED";
+		if (!resolved.currentUserAuthority.includes(capability)) return "USER_AUTHORITY_DENIED";
+		if (!resolved.contributionPolicy.includes(capability)) return "CONTRIBUTION_POLICY_DENIED";
+		if (!resolved.runnerEnforcement.includes(capability)) return "RUNNER_DENIED";
+		return "CAPABILITY_NOT_GRANTED";
 	}
 
 	private cacheKey(request: NormalizedRequest, grantRevision?: number): string {

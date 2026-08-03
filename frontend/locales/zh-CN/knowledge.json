@@ -98,11 +98,6 @@
 	"draftSaved": "草稿已保存",
 	"submitForReview": "提交审核",
 	"submitted": "已提交审核",
-	"draftStatus_draft": "草稿",
-	"draftStatus_pending_review": "待审核",
-	"draftStatus_changes_requested": "需修改",
-	"draftStatus_merged": "已合并",
-	"draftStatus_abandoned": "已放弃",
 
 	"driftBanner": "主线已更新",
 	"driftDesc": "你的草稿基于该条目的旧版本，此后主线已更新 {{count}} 个版本。这里显示的是当前主线版本，你的草稿以与主线对比的差异形式展示。",

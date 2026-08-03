@@ -210,9 +210,6 @@ export interface UseNarratorPanelWSReturn {
 	setPaymentRequired: React.Dispatch<React.SetStateAction<PaymentRequiredInfo | null>>;
 	leakedToolEvent: LeakedToolEvent | null;
 	setLeakedToolEvent: React.Dispatch<React.SetStateAction<LeakedToolEvent | null>>;
-	// Tool expand
-	expandedToolUseId: string | null;
-	setExpandedToolUseId: React.Dispatch<React.SetStateAction<string | null>>;
 	// Unread
 	unreadCount: number;
 	setUnreadCount: React.Dispatch<React.SetStateAction<number>>;
@@ -543,15 +540,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	// --- Viewers ---
 	const [viewers, setViewers] = useState<ViewerInfo[]>([]);
-
-	// --- Tool expand ---
-	const [expandedToolUseId, setExpandedToolUseId] = useState<string | null>(null);
-
-	useEffect(() => {
-		if (!expandedToolUseId) return;
-		const timer = setTimeout(() => setExpandedToolUseId(null), 500);
-		return () => clearTimeout(timer);
-	}, [expandedToolUseId]);
 
 	// --- Initialize context/prune state from initial message data ---
 	// (handled below after WS section)
@@ -1483,8 +1471,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			setPaymentRequired,
 			leakedToolEvent,
 			setLeakedToolEvent,
-			expandedToolUseId,
-			setExpandedToolUseId,
 			unreadCount,
 			setUnreadCount,
 			viewers,
@@ -1520,7 +1506,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			retryInfo,
 			paymentRequired,
 			leakedToolEvent,
-			expandedToolUseId,
 			unreadCount,
 			viewers,
 		],

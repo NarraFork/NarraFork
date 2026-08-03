@@ -145,6 +145,58 @@ describe("live-patch audit: fields that DO change height are in the cache key", 
 			extractDataRevision({ isActive: false, isTerminal: true }),
 		);
 	});
+
+	/**
+	 * A recent-call row's LABEL arriving with no height change.
+	 *
+	 * The exhaustive audit below can only catch a stale key when the height MOVED, so
+	 * it is blind to this one by construction: `tool_use_chunk` fills in a child call's
+	 * `inputSummary` while the row count, the tool names and the status all stay put,
+	 * and the row is a fixed-height trace row either way. The summary is nonetheless
+	 * PAINTED from the cached measured payload, so without these fields in the revision
+	 * the row keeps its bare tool name until something unrelated re-keys the card.
+	 *
+	 * Same reasoning as the `timeoutMs` entry in `subagentRevision`: height-neutral
+	 * fields may normally be omitted, EXCEPT when they arrive alone.
+	 */
+	it("recent-call summaries are in the revision (they can be the only delta)", async () => {
+		const { extractDataRevision } = await cacheMod();
+		const base = {
+			agentType: "explore",
+			recentCallCount: 2,
+			recentCallNames: ["Read", "Bash"],
+		};
+		const bare = extractDataRevision(base);
+		const labelled = extractDataRevision({
+			...base,
+			recentCallSummaries: ["loop.ts", "bun test"],
+		});
+		expect(labelled).not.toBe(bare);
+		// And a CHANGED summary re-keys too — a mid-stream `Bash` whose description
+		// lands after its command would otherwise keep the first label forever.
+		expect(
+			extractDataRevision({ ...base, recentCallSummaries: ["loop.ts", "run the suite"] }),
+		).not.toBe(labelled);
+	});
+
+	it("recent-call categories are in the revision (chip tint is painted from cache)", async () => {
+		const { extractDataRevision } = await cacheMod();
+		const base = { agentType: "explore", recentCallCount: 1, recentCallNames: ["Read"] };
+		expect(extractDataRevision({ ...base, recentCallCategories: ["read"] })).not.toBe(
+			extractDataRevision({ ...base, recentCallCategories: ["bash"] }),
+		);
+	});
+
+	it("a folded trace row's duration is in the revision", async () => {
+		const { extractDataRevision } = await cacheMod();
+		// Same class of bug one layer up: the row's duration is height-neutral but
+		// painted from the cached trace payload. `status` usually moves with it, so this
+		// keys the value directly rather than relying on that coincidence.
+		const row = { key: "t-0", title: "Read · loop.ts", status: "success" };
+		expect(extractDataRevision({ items: [{ ...row, timing: { durationMs: 1_000 } }] })).not.toBe(
+			extractDataRevision({ items: [{ ...row, timing: { durationMs: 9_000 } }] }),
+		);
+	});
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

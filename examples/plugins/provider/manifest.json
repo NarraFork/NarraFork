@@ -59,6 +59,13 @@
 						"description": "Chooses which deterministic reply the provider streams.",
 						"enum": ["offline", "verbose"],
 						"default": "offline"
+					},
+					"apiKey": {
+						"type": "string",
+						"title": "API key",
+						"description": "Optional credential; demonstrates host-side secret injection.",
+						"writeOnly": true,
+						"x-narrafork-secret": true
 					}
 				}
 			}
@@ -66,10 +73,24 @@
 		"tools": [],
 		"commands": [],
 		"events": [],
-		"views": []
+		"views": [
+			{
+				"id": "example-provider-settings",
+				"title": "Example provider settings",
+				"entry": "ui/provider-settings.iife.js",
+				"style": "ui/provider-settings.css",
+				"surfaces": ["provider-settings"],
+				"scope": "global",
+				"instance": "singleton",
+				"providerId": "example-provider"
+			}
+		]
+	},
+	"ui": {
+		"entry": "ui/provider-settings.iife.js"
 	},
 	"permissions": {
-		"host": ["provider.register", "provider.use"],
+		"host": ["provider.register", "provider.use", "ui.panel", "config.read_self"],
 		"network": {
 			"mode": "none",
 			"allow": []

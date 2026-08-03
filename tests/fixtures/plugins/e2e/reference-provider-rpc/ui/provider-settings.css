@@ -1,0 +1,8 @@
+/* Minimal styling for the example provider-settings view. The iframe is a separate
+   document, so nothing is inherited from the host theme. */
+body {
+	margin: 0;
+	padding: 16px;
+	background: #1a1b1e;
+	font-family: system-ui, sans-serif;
+}

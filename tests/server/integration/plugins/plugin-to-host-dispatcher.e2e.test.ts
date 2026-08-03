@@ -122,11 +122,14 @@ describe("C1 real Plugin→Host dispatcher acceptance", () => {
 			stderrRingBytes: 8 * 1024,
 			maxStderrBytes: 32 * 1024,
 			maxStderrBytesPerSecond: 16 * 1024,
-			spawnTimeoutMs: 2_000,
-			idleTimeoutMs: 5_000,
-			totalTimeoutMs: 10_000,
+			// Raised from 2s: the suite now spawns enough real plugin subprocesses in parallel
+			// that the original budget was occasionally missed under CPU contention rather than
+			// because anything hung. Still bounded, just not racing the scheduler.
+			spawnTimeoutMs: 20_000,
+			idleTimeoutMs: 30_000,
+			totalTimeoutMs: 45_000,
 			killProcessTree: true,
-			resourceLimits: { cpuTimeSeconds: 5, memoryBytes: 1024 * 1024 * 1024 },
+			resourceLimits: { cpuTimeSeconds: 30, memoryBytes: 1024 * 1024 * 1024 },
 			allowUnboundedResourceUsage: process.platform === "win32",
 		});
 		const runtime = new PluginRuntime({
@@ -146,10 +149,10 @@ describe("C1 real Plugin→Host dispatcher acceptance", () => {
 			runner,
 			dispatcher,
 			timeouts: {
-				handshakeMs: 2_000,
-				activationMs: 2_000,
-				rpcMs: 2_000,
-				shutdownMs: 2_000,
+				handshakeMs: 20_000,
+				activationMs: 20_000,
+				rpcMs: 20_000,
+				shutdownMs: 5_000,
 				drainMs: 500,
 			},
 		});

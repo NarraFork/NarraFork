@@ -155,7 +155,12 @@ export interface VListRenderLabels {
 		};
 	};
 	toolCallGroup: { label: string; statusLabel: string };
-	trace: { hideEarlier: string; showEarlier: (hiddenCount: number) => string };
+	trace: {
+		hideEarlier: string;
+		showEarlier: (hiddenCount: number) => string;
+		/** Per-row timing popover (a folded row shows its own duration). */
+		timing: VListTimingLabels;
+	};
 	subagent: {
 		recentCalls: string;
 		openSession: string;
@@ -437,6 +442,9 @@ export function useVListLabels(): VListLabels {
 			trace: {
 				hideEarlier: t("reasoningHideEarlier"),
 				showEarlier: (hiddenCount: number) => t("reasoningShowEarlier", { count: hiddenCount }),
+				// Same bundle the tool card and the subagent card use: a folded row now
+				// carries its own duration + lifecycle popover.
+				timing,
 			},
 			subagent: {
 				recentCalls: t("subagentRecentCalls"),

@@ -41,10 +41,9 @@ import {
 	IconChevronRight,
 	IconCircleCheck,
 	IconCircleX,
-	IconLoader2,
 	IconRobot,
 } from "@tabler/icons-react";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import {
 	BADGE_ROW_HEIGHT,
 	BLOCK_PADDING_X,
@@ -66,6 +65,10 @@ import {
 	THEME_ICON_SIZE,
 	XS_LINE_HEIGHT,
 } from "../measure/measure-subagent";
+import type { ToolCategory } from "../measure/measure-tool-call";
+// The recent-call rows ARE trace rows, so their lane geometry comes from the trace
+// height model rather than a second set of numbers.
+import { TRACE_CHEVRON, TRACE_ROW_GAP, TRACE_ROW_ICON } from "../measure/measure-tool-run";
 import { VListContentViewHost, type VListViewControls } from "../VListContentViewHost";
 import {
 	findViewTarget,
@@ -73,9 +76,16 @@ import {
 	RESULT_SLOT,
 	type VListViewTarget,
 } from "../vlist-content-view-target";
+import { categoryIcon } from "./category-icons";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { RenderInlinePermission } from "./RenderPermission";
-import { ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
+import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
+import {
+	hasToolRowStatusMark,
+	isTerminalToolRowStatus,
+	TRACE_ROW_STATUS_SLOT_STYLE,
+	TraceRowStatusGlyph,
+} from "./trace-row-status";
 
 /** i18n-facing labels, injected by the dispatch/registry layer. English defaults
  * keep this self-contained (no i18n import across the vlist edge). */
@@ -187,59 +197,80 @@ function SubagentStatusGlyph({ status }: { status?: string }) {
 	return <IconCircleCheck size={STATUS_ICON_SIZE} style={{ color: cssColor("green", 6) }} />;
 }
 
-/** Statuses a recent-call row treats as finished (parity with SubagentCard). */
-const TERMINAL_ROW_STATUSES = new Set(["success", "fail", "cancelled", "error", "completed"]);
+/**
+ * The chevron/dot lane of a trace row. Restated here (rather than imported from
+ * `RenderToolRun`) only because that module's copy is module-private; both derive
+ * from the same `TRACE_CHEVRON` width, so they cannot disagree on geometry.
+ */
+const TRACE_CHEVRON_SLOT_STYLE = {
+	display: "flex",
+	alignItems: "center",
+	justifyContent: "center",
+	width: TRACE_CHEVRON,
+	minWidth: TRACE_CHEVRON,
+	flexShrink: 0,
+} as const satisfies CSSProperties;
+
+/** The "•" marker's own metrics (parity with RenderToolRun / CollapsibleTrace). */
+const DOT_STYLE = { opacity: 0.5, lineHeight: 1, fontSize: 10 } as const satisfies CSSProperties;
+
+/** Glyph inset inside the 14px category chip (parity with the trace row). */
+const TRACE_ROW_GLYPH_SIZE = 9;
+
+/** Row titles are capped so one long summary cannot dominate the card. */
+const RECENT_TITLE_MAX_CHARS = 80;
 
 /**
- * One recent-call row's 12px status glyph — parity with `ToolCallCard.StatusIcon`,
- * which is what the chunk-mode card paints in the same slot.
+ * `Tool · summary` for one recent-call row — the same wording a folded trace row
+ * uses (`truncateTitle` + `Task → Agent` in the adapter).
  *
- * This used to be a hard-coded grey `IconCircleCheck`, so a call still streaming
- * its arguments and a call that had failed both read as "done". The row's status
- * arrives on the paired `recentCallTimings` entry (the measure layer slices it to
- * the drawn rows), so the glyph can follow it for free.
+ * Restated inside vlist/ rather than imported from `tool-display`: the isolation
+ * guard forbids vlist from statically importing the chunk render path, which is
+ * what keeps the flag-off bundle free of vlist and vice versa. The rule is small
+ * enough that a copy is safe; the SUMMARY itself still comes from the one shared
+ * formatter, through the resolver the shell injects.
  *
- * In-flight — `streaming` (the first status a call has, from `tool_use_chunk`),
- * `running`, `pending`, `initializing` — spins. Terminal states get their own
- * mark. An absent status keeps the neutral grey check the row showed before, since
- * a header can legitimately arrive with no timing payload at all.
- *
- * Height-neutral: every branch is one `STATUS_ICON_SIZE` glyph inside the row's
- * fixed `RECENT_ROW_HEIGHT` box, so `measure-subagent.ts` needs no change.
+ * Height-neutral: the result is painted on a single truncating line.
  */
-function RecentCallStatusGlyph({ status }: { status?: string | null }) {
-	if (status == null) {
-		return (
-			<IconCircleCheck
-				size={STATUS_ICON_SIZE}
-				style={{ color: cssColor("gray", 6), flexShrink: 0 }}
-			/>
-		);
-	}
-	if (!TERMINAL_ROW_STATUSES.has(status)) {
-		return (
-			<IconLoader2
-				size={STATUS_ICON_SIZE}
-				className="vlist-spin"
-				style={{ color: cssColor("blue", 6), flexShrink: 0 }}
-			/>
-		);
-	}
-	if (status === "fail" || status === "error") {
-		return (
-			<IconCircleX size={STATUS_ICON_SIZE} style={{ color: cssColor("red", 6), flexShrink: 0 }} />
-		);
-	}
-	if (status === "cancelled") {
-		return (
-			<IconBan size={STATUS_ICON_SIZE} style={{ color: cssColor("orange", 6), flexShrink: 0 }} />
-		);
-	}
+function recentCallTitle(toolName: string, summary: string | null): string {
+	const name = toolName === "Task" ? "Agent" : toolName;
+	const text = summary ? `${name} · ${summary}` : name;
+	return text.length > RECENT_TITLE_MAX_CHARS
+		? `${text.slice(0, RECENT_TITLE_MAX_CHARS - 3)}…`
+		: text;
+}
+
+/**
+ * A recent-call row's category chip — the SAME 14px tinted tile a folded trace row
+ * shows, so one child tool call reads identically in both places.
+ *
+ * `category` is resolved by the adapter (the row carries no full tool input, so it
+ * comes from the tool NAME alone, exactly as the chunked row does). Absent →
+ * `categoryIcon`'s generic fallback, which keeps the slot occupied rather than
+ * collapsing it and shortening the row.
+ */
+function RecentCallCategoryChip({
+	category,
+	toolName,
+}: {
+	category: string | null;
+	toolName: string;
+}) {
+	const resolved = (category ?? "generic") as ToolCategory;
+	const Icon = categoryIcon(resolved, toolName);
 	return (
-		<IconCircleCheck
-			size={STATUS_ICON_SIZE}
-			style={{ color: cssColor("green", 6), flexShrink: 0 }}
-		/>
+		// Same `data-trace-row-chip` marker a folded trace row's chip carries — the two
+		// rows are one shape, so a parity test must be able to find both the same way.
+		<ThemeIcon
+			data-trace-row-chip
+			size={TRACE_ROW_ICON}
+			variant="light"
+			color={CATEGORY_COLOR[resolved] ?? "gray"}
+			radius="sm"
+			data-testid="subagent-activity-category-chip"
+		>
+			<Icon size={TRACE_ROW_GLYPH_SIZE} />
+		</ThemeIcon>
 	);
 }
 
@@ -258,10 +289,9 @@ function RecentCallTiming({
 	labels?: ToolTimingLabels;
 }) {
 	if (!timing) return null;
-	const running = timing.status == null || !TERMINAL_ROW_STATUSES.has(timing.status);
 	return (
 		<ToolTimingArea
-			running={running}
+			running={!isTerminalToolRowStatus(timing.status)}
 			startedAt={timing.startedAt ?? timing.createdAt}
 			durationMs={timing.durationMs}
 			timing={timing}
@@ -482,10 +512,12 @@ function SubagentInner({
 				</Group>
 				<div style={{ display: "flex", flexDirection: "column", gap: RECENT_STACK_GAP }}>
 					{rows.map((name, i) => (
-						// Parity with SubagentCard's activity rows: each row is a button that
-						// opens the child session. Disabled (plain surface) when no child is
-						// known, so the affordance never no-ops. Fixed height either way, so
-						// the measured geometry is unaffected.
+						// A TRACE ROW, not a tinted button: dot + category chip + one
+						// `Tool · summary` line + status + timing, at the trace row's own height
+						// (RECENT_ROW_HEIGHT === TRACE_ROW_HEIGHT). Still a button, because
+						// clicking opens the child session — disabled (plain surface) when no
+						// child is known, so the affordance never no-ops. Fixed height either
+						// way, so the measured geometry is unaffected.
 						<UnstyledButton
 							// biome-ignore lint/suspicious/noArrayIndexKey: recent rows are a stable ordered slice
 							key={i}
@@ -503,24 +535,47 @@ function SubagentInner({
 								display: "block",
 								width: "100%",
 								height: RECENT_ROW_HEIGHT,
-								padding: "5px 7px",
-								borderRadius: "var(--mantine-radius-sm)",
-								background: "var(--mantine-color-default-hover)",
 								boxSizing: "border-box",
 								cursor: onOpenSession ? "pointer" : "default",
 							}}
 						>
-							<Group gap={6} wrap="nowrap" h="100%" align="center">
-								{/* Follows this row's own status (spinner while in flight), so a
-								    streaming or failed call no longer reads as a finished one. */}
-								<RecentCallStatusGlyph status={measured.recentCallTimings[i]?.status} />
-								<Text size="xs" truncate style={{ flex: 1 }}>
-									{name}
+							<Group gap={TRACE_ROW_GAP} wrap="nowrap" h="100%" align="center">
+								{/* Dot, not a chevron: an activity row has nothing to expand. */}
+								<Box style={TRACE_CHEVRON_SLOT_STYLE}>
+									<Text span size="xs" c="dimmed" style={DOT_STYLE}>
+										•
+									</Text>
+								</Box>
+								<RecentCallCategoryChip
+									category={measured.recentCallCategories[i]}
+									toolName={name}
+								/>
+								{/* `flex: 0 1 auto` (not `flex: 1`) keeps the status + duration HUGGING
+								    this label rather than pinned to the row's right edge — see the
+								    trace row, whose layout this mirrors. */}
+								<Text
+									data-testid="subagent-activity-label"
+									size="xs"
+									c="dimmed"
+									truncate
+									style={{ flex: "0 1 auto", minWidth: 0 }}
+								>
+									{recentCallTitle(name, measured.recentCallSummaries[i] ?? null)}
 								</Text>
+								{/* Only DEVIATION is marked (in flight / failed / cancelled); a
+								    successful call draws nothing, so the slot is absent rather than
+								    blank — see @shared/tool-row-status. */}
+								{hasToolRowStatusMark(measured.recentCallTimings[i]?.status) ? (
+									<Box data-testid="trace-row-status-slot" style={TRACE_ROW_STATUS_SLOT_STYLE}>
+										<TraceRowStatusGlyph status={measured.recentCallTimings[i]?.status} />
+									</Box>
+								) : null}
 								{/* Per-row timing (SubagentCard.tsx:684 parity). `recentCallTimings`
 								    is sliced to the drawn rows by the measure layer, so index i
 								    pairs with this row's name. */}
 								<RecentCallTiming timing={measured.recentCallTimings[i]} labels={labels.timing} />
+								{/* Absorbs the slack so the cells above stay left-packed. */}
+								<Box style={{ flex: 1, minWidth: 0 }} />
 							</Group>
 						</UnstyledButton>
 					))}

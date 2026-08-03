@@ -29,7 +29,12 @@ export interface PluginDiagnostic {
 }
 
 /** Host surfaces a plugin view may be mounted on. */
-export type PluginViewSurface = "workspace" | "director" | "focus" | "settings";
+export type PluginViewSurface =
+	| "workspace"
+	| "director"
+	| "focus"
+	| "settings"
+	| "provider-settings";
 
 export interface PluginContributionSummary {
 	pluginId: string;

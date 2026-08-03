@@ -4,7 +4,9 @@ import { describe, expect, it } from "bun:test";
 import {
 	hasEditableTextBlock,
 	resolveVListEditedMeta,
+	resolveVListEditorWidth,
 	resolveVListEditTarget,
+	VLIST_USER_EDITOR_MIN_WIDTH,
 	type VListEditCapabilities,
 } from "./vlist-edit-target";
 
@@ -106,6 +108,55 @@ describe("resolveVListEditedMeta", () => {
 			editedAt: "2026-01-01T00:00:00Z",
 			originalContentJson: null,
 		});
+	});
+});
+
+/**
+ * The editor's width while it replaces a row.
+ *
+ * A user bubble is right-aligned and shrink-wrapped, so its editor has to stay on
+ * that side — expanding to the full column moved every control (caret, attach,
+ * submit) a whole column away from the bubble the reader was hovering. Assistant
+ * rows are already full-width, so they opt out with null.
+ */
+describe("resolveVListEditorWidth", () => {
+	const COLUMN = 860;
+
+	it("keeps a wide user bubble at its own width", () => {
+		expect(resolveVListEditorWidth("message-bubble", "user", 600, COLUMN)).toBe(600);
+	});
+
+	it("floors a shrink-wrapped short bubble at a usable editing width", () => {
+		// "ok" measures ~140px (the header floor). Editing it in a 140px box is not
+		// usable, so the floor wins.
+		expect(resolveVListEditorWidth("message-bubble", "user", 140, COLUMN)).toBe(
+			VLIST_USER_EDITOR_MIN_WIDTH,
+		);
+	});
+
+	it("never exceeds the row's column width", () => {
+		// Narrow viewport: the floor must not push the editor past the column and
+		// cause horizontal overflow.
+		expect(resolveVListEditorWidth("message-bubble", "user", 140, 320)).toBe(320);
+		expect(resolveVListEditorWidth("message-bubble", "user", 900, COLUMN)).toBe(COLUMN);
+	});
+
+	it("leaves non-user rows at full width", () => {
+		expect(resolveVListEditorWidth("message-bubble", "assistant", 600, COLUMN)).toBeNull();
+		expect(resolveVListEditorWidth("markdown", undefined, 600, COLUMN)).toBeNull();
+	});
+
+	it("declines to constrain against an unmeasured column", () => {
+		expect(resolveVListEditorWidth("message-bubble", "user", 600, 0)).toBeNull();
+		expect(resolveVListEditorWidth("message-bubble", "user", 600, Number.NaN)).toBeNull();
+	});
+
+	it("tolerates a missing bubble width", () => {
+		// A row whose measured usedWidth is unavailable still gets the floor rather
+		// than a zero-width editor.
+		expect(resolveVListEditorWidth("message-bubble", "user", Number.NaN, COLUMN)).toBe(
+			VLIST_USER_EDITOR_MIN_WIDTH,
+		);
 	});
 });
 

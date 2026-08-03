@@ -236,8 +236,9 @@ async function syncNarrator(narratorId: string): Promise<void> {
 		 prune_boundary_message_id, pruned_percent, created_at, substatus, variant, traits,
 		 is_background, background_status, background_result, background_completed_at,
 		 is_ask_in_passing, turn_started_at, message_version, prune_enabled, fast_mode,
-		 relaxed_plan, reasoning_effort, previous_permission_mode, plan_file_id, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 fast_mode_override, relaxed_plan, reasoning_effort, previous_permission_mode, plan_file_id,
+		 updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			narrator.id,
 			narrator.chapterId,
@@ -274,6 +275,7 @@ async function syncNarrator(narratorId: string): Promise<void> {
 			narrator.messageVersion,
 			narrator.pruneEnabled ? 1 : 0,
 			narrator.fastMode ? 1 : 0,
+			narrator.fastModeOverride,
 			narrator.relaxedPlan ? 1 : 0,
 			narrator.reasoningEffort,
 			narrator.previousPermissionMode,

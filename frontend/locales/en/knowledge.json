@@ -97,11 +97,6 @@
 	"draftSaved": "Draft saved",
 	"submitForReview": "Submit for review",
 	"submitted": "Submitted for review",
-	"draftStatus_draft": "Draft",
-	"draftStatus_pending_review": "Pending review",
-	"draftStatus_changes_requested": "Changes requested",
-	"draftStatus_merged": "Merged",
-	"draftStatus_abandoned": "Abandoned",
 
 	"driftBanner": "Main has moved on",
 	"driftDesc": "Your draft is based on an older version of this entry. The main version has advanced {{count}} revision(s) since. The current main version is shown here; your draft is shown as a diff against it.",

@@ -276,7 +276,19 @@ export const narrators = sqliteTable(
 		reasoningEffort: text("reasoning_effort", {
 			enum: ["none", "low", "medium", "high", "xhigh", "max"],
 		}),
+		/**
+		 * @deprecated Legacy resolved boolean. Kept only so older rows/readers keep
+		 * working; the runtime source of truth is `fastModeOverride`. Written on
+		 * every override change to mirror the value that was in effect at that time.
+		 */
 		fastMode: integer("fast_mode", { mode: "boolean" }).notNull().default(false),
+		/**
+		 * Priority-tier (fast mode)三态：inherit = 跟随用户偏好 fastModeDefault，
+		 * on/off = 本会话显式覆盖。inherit 让默认值的变更对已有叙述者立即生效。
+		 */
+		fastModeOverride: text("fast_mode_override", { enum: ["inherit", "on", "off"] })
+			.notNull()
+			.default("inherit"),
 		relaxedPlan: integer("relaxed_plan", { mode: "boolean" }).notNull().default(false),
 		planReflectionAutoApproveOverride: text("plan_reflection_auto_approve_override", {
 			enum: ["inherit", "on", "off"],

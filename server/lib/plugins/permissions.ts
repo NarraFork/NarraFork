@@ -194,15 +194,51 @@ export const CAPABILITIES = [
 	...CAPABILITY_TAXONOMY.schedule,
 	...CAPABILITY_TAXONOMY.diagnostics,
 ] as const;
-export type Capability = (typeof CAPABILITIES)[number];
-export const capabilitySchema = z.enum(CAPABILITIES);
+/**
+ * Capability names are open strings, not a closed enum.
+ *
+ * This deliberately reverses the original design. A fixed 66-entry enum meant every new
+ * integration point required editing the host before a plugin could even declare it, and
+ * the taxonomy itself was speculative — `HIGH_RISK_CAPABILITIES` and
+ * `DEFAULT_DENIED_CAPABILITIES` never acquired a single runtime consumer. VS Code, the most
+ * widely used extension host, ships no permission system at all: an installed extension has
+ * the full capability of its host process, with no manifest declaration and no gate.
+ *
+ * So `Capability` is now `string`. `CAPABILITY_TAXONOMY` and `CAPABILITIES` survive as
+ * documentation of the *known* names (and for editor completion), not as an admission test.
+ *
+ * The format rule that remains is not a trust boundary: it keeps names loggable and
+ * comparable, and rejects empty or control-character values that would corrupt audit
+ * records. Wildcards and formerly "wide" tokens (`*`, `admin`, `network.any`,
+ * `process.shell`) are accepted.
+ */
+export type Capability = string;
+/**
+ * Dot-separated segments, or a bare `*`.
+ *
+ * Segments start with a letter and may be camelCase, because the host's own taxonomy
+ * already uses it (`diagnostics.readOwnLogs`, `ui.openExternal`). This rejects empty
+ * strings, whitespace, and control characters so names stay loggable and comparable — it is
+ * not a trust check.
+ */
+const CAPABILITY_NAME_PATTERN = /^(?:\*|[a-zA-Z][a-zA-Z0-9_]*(?:\.(?:\*|[a-zA-Z][a-zA-Z0-9_]*))*)$/;
+export const capabilitySchema = z
+	.string()
+	.trim()
+	.min(1)
+	.max(128)
+	.regex(CAPABILITY_NAME_PATTERN, "Capability must be dot-separated alphanumeric segments");
 export const capabilityIdSchema = capabilitySchema;
 export const capabilityListSchema = z
 	.array(capabilitySchema)
-	.max(CAPABILITIES.length)
+	// Bounded only to keep a manifest from carrying an unbounded list into audit records.
+	.max(512)
 	.refine((capabilities) => new Set(capabilities).size === capabilities.length, {
 		message: "Capabilities must be unique",
 	});
+
+/** The names the host itself knows about. Not a gate — see `capabilitySchema`. */
+export const KNOWN_CAPABILITIES: readonly string[] = CAPABILITIES;
 
 /**
  * Manifest-v1 compatibility aliases found in the original examples and design
@@ -236,17 +272,28 @@ const legacyCapabilityNames = Object.keys(LEGACY_CAPABILITY_ALIASES) as [
 ];
 export const legacyCapabilityNameSchema = z.enum(legacyCapabilityNames);
 
-/** Resolve a canonical or explicitly supported legacy name without widening unknown input. */
+/**
+ * Rewrite a Manifest-v1 alias to its modern name, else pass the value through.
+ *
+ * The alias table is consulted *first* now. When capability names were a closed enum,
+ * checking canonical-first was equivalent — an alias could never also be canonical. With
+ * open strings every well-formed alias would parse as-is, so canonical-first would silently
+ * stop rewriting them and `query.chapters.read` would survive into grants alongside
+ * `query.read.chapters` as two distinct capabilities.
+ *
+ * Returns `undefined` only for malformed names (empty, spaces, uppercase), never for
+ * merely-unknown ones.
+ */
 export function normalizeCapabilityName(value: unknown): Capability | undefined {
-	const canonical = capabilitySchema.safeParse(value);
-	if (canonical.success) return canonical.data;
 	const legacy = legacyCapabilityNameSchema.safeParse(value);
-	return legacy.success ? LEGACY_CAPABILITY_ALIASES[legacy.data] : undefined;
+	if (legacy.success) return LEGACY_CAPABILITY_ALIASES[legacy.data];
+	const canonical = capabilitySchema.safeParse(value);
+	return canonical.success ? canonical.data : undefined;
 }
 
 /**
- * Deprecated Manifest-v1 adapter. Its JSON/output contract is still the
- * authoritative canonical enum; preprocessing only preserves known old names.
+ * Manifest-facing capability schema: normalizes known v1 aliases, accepts anything else
+ * that is well-formed. Unknown names are no longer an error — see `capabilitySchema`.
  */
 export const manifestCapabilitySchema = z.preprocess(
 	(value) => normalizeCapabilityName(value) ?? value,
@@ -254,11 +301,19 @@ export const manifestCapabilitySchema = z.preprocess(
 );
 export const manifestCapabilityListSchema = z
 	.array(manifestCapabilitySchema)
-	.max(CAPABILITIES.length)
+	.max(512)
 	.refine((capabilities) => new Set(capabilities).size === capabilities.length, {
 		message: "Capabilities must be unique after legacy alias normalization",
 	});
 
+/**
+ * Formerly-rejected "wide" tokens, kept for documentation and diagnostics only.
+ *
+ * These used to fail Manifest validation outright. They no longer do: a plugin may declare
+ * any capability it likes, because the host does not gate on declarations. The list remains
+ * so an admin UI can still *highlight* a broad request, which is information rather than
+ * enforcement.
+ */
 export const WIDE_PERMISSION_TOKENS = [
 	"*",
 	"all",
@@ -269,6 +324,12 @@ export const WIDE_PERMISSION_TOKENS = [
 	"process.shell",
 ] as const;
 
+/**
+ * Whether a capability name is broad.
+ *
+ * **No longer a rejection test.** Callers use it to annotate or sort; nothing refuses a
+ * plugin because of it.
+ */
 export function isWidePermission(permission: string): boolean {
 	return (
 		(WIDE_PERMISSION_TOKENS as readonly string[]).includes(permission) || permission.endsWith(".*")
@@ -288,7 +349,17 @@ export const HIGH_RISK_CAPABILITIES = [
 	"process.spawn.allowlist",
 ] as const satisfies readonly Capability[];
 
-export const DEFAULT_DENIED_CAPABILITIES = HIGH_RISK_CAPABILITIES;
+/**
+ * Nothing is denied by default.
+ *
+ * This was `HIGH_RISK_CAPABILITIES`, which would have made ten capabilities — including
+ * `secret.use_self` and `network.egress.allowlist` — unusable unless separately granted. It
+ * never had a runtime consumer, so the practical effect of keeping it was to leave a
+ * deny-by-default seed for whoever wired it up next.
+ *
+ * `HIGH_RISK_CAPABILITIES` is retained above as a *labelling* aid for admin UIs.
+ */
+export const DEFAULT_DENIED_CAPABILITIES: readonly Capability[] = [];
 
 export const permissionConstraintsSchema = z
 	.object({
@@ -320,9 +391,7 @@ export const permissionGrantSchema = z
 		grantedBy: scopeIdSchema.optional(),
 	})
 	.strict();
-export const permissionGrantListSchema = z
-	.array(permissionGrantSchema)
-	.max(CAPABILITIES.length * 4);
+export const permissionGrantListSchema = z.array(permissionGrantSchema).max(2_048);
 export type PermissionGrant = z.infer<typeof permissionGrantSchema>;
 
 export const PERMISSION_SOURCES = [

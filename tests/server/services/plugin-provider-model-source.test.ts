@@ -133,6 +133,10 @@ describe("plugin provider model source", () => {
 		expect(group.prefix).toBe("demo");
 		expect(group.name).toBe("Demo Provider");
 		expect(group.pluginId).toBe(pluginId);
+		// The prefix is user-overridable, so a settings UI that wants to load this
+		// provider's config or its `provider-settings` view must address it by the stable
+		// contribution id instead.
+		expect(group.contributionId).toBe("demo");
 		expect(group.models).toHaveLength(1);
 		expect(group.models[0]).toMatchObject({
 			value: "demo:demo/base",

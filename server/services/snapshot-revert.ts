@@ -26,6 +26,7 @@ import {
 	ReplayDivergedError,
 	rebuildDeviceFileStatesExcluding,
 } from "./file-state-rebuild";
+import { invalidateWorkspaceTreeCache } from "./narrator-session-state";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 export type RevertFailureCode =
@@ -465,6 +466,8 @@ async function undoRevert(result: RevertResult): Promise<RevertFailure[]> {
 		} catch (error) {
 			failures.push(treeFailure(tree.worktreePath, "COMPENSATION_FAILED", error));
 		}
+		// Compensation is itself a write outside the tool path.
+		invalidateWorkspaceTreeCache(tree.worktreePath);
 	}
 	return failures;
 }
@@ -484,6 +487,11 @@ export async function applyDeviceFileStates(
 		return { ...EMPTY_RESULT, failures: prepared.failures };
 	}
 
+	// Replay writes bypass the tool path, so any live session's cached tree hash
+	// stops describing the disk the moment the first file lands. Resolved before
+	// writing so the invalidation cannot be skipped by an early failure exit.
+	const sessionWorktree = prepared.plan.length > 0 ? await resolveNarratorCwd(narratorId) : null;
+
 	const attempted: RevertPlanItem[] = [];
 	for (const item of prepared.plan) {
 		attempted.push(item);
@@ -498,6 +506,9 @@ export async function applyDeviceFileStates(
 			const code = item.state.content === null ? "DELETE_FAILED" : "WRITE_FAILED";
 			const applyFailure = failure(item.state, code, error);
 			const compensationFailures = await compensateAttempted(attempted);
+			// Compensation restores content but not necessarily byte-identically to
+			// what the cached hash described, so the cache is dropped either way.
+			if (sessionWorktree) invalidateWorkspaceTreeCache(sessionWorktree);
 			logger.warn("Snapshot rollback failed and was compensated", {
 				deviceId: item.state.deviceId,
 				filePath: item.state.filePath,
@@ -509,6 +520,7 @@ export async function applyDeviceFileStates(
 			};
 		}
 	}
+	if (sessionWorktree) invalidateWorkspaceTreeCache(sessionWorktree);
 
 	const files = prepared.plan.map((item) => displayFile(item.state));
 	const result = { reverted: files.length > 0, fileCount: files.length, files, failures: [] };
@@ -785,8 +797,12 @@ export async function revertWorkspaceToTree(
 	try {
 		changedFiles = await worktreeTreeSnapshot.restore(worktreePath, treeHash, LOCAL_DEVICE_ID);
 	} catch (error) {
+		// A restore can fail after touching some files, so the cache is suspect even
+		// on the error path.
+		invalidateWorkspaceTreeCache(worktreePath);
 		return { ...EMPTY_RESULT, failures: [treeFailure(worktreePath, "TREE_RESTORE_FAILED", error)] };
 	}
+	invalidateWorkspaceTreeCache(worktreePath);
 
 	const warnings = windowStartedAt
 		? await buildImpreciseRevertWarnings(worktreePath, narratorId, windowStartedAt)

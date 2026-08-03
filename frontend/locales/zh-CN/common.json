@@ -275,6 +275,7 @@
 	"noFavorites": "暂无收藏",
 	"pathBarPlaceholder": "输入路径...",
 	"pathInputMoreResults": "还有 {{count}} 项 — 继续输入以缩小范围",
+	"remotePathListingFailed": "无法列出该目录",
 	"directoryPickerMoreEntries": "仅显示前 1,000 项。另有 {{count}} 项已隐藏 — 可直接编辑路径或选择更小的目录。",
 
 	"updateAvailable": "有新版本可用: v{{version}}",

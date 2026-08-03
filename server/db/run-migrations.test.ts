@@ -1,6 +1,14 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { repairMissingSpecTables, runMigrations, SpecSchemaDriftError } from "./run-migrations";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	applyPendingMigrationsByHash,
+	repairMissingSpecTables,
+	runMigrations,
+	SpecSchemaDriftError,
+} from "./run-migrations";
 
 let sqlite: Database | undefined;
 
@@ -727,5 +735,196 @@ describe("hash-based migration self-heal", () => {
 			}>
 		).find((fk) => fk.from === "user_id");
 		expect(cascade?.on_delete).toBe("CASCADE");
+	});
+});
+
+/**
+ * Statement-level scoping of the "no such table" tolerance. A destructive migration used to
+ * have that error forgiven for every one of its statements, so a failed
+ * `INSERT INTO __new_x SELECT ... FROM <missing>` was skipped while the following
+ * `DROP TABLE x` + RENAME still ran — the migration reported success and the rows were gone.
+ */
+describe("destructive migration statement-level error tolerance", () => {
+	const tempFolders: string[] = [];
+
+	afterEach(() => {
+		for (const folder of tempFolders.splice(0)) rmSync(folder, { recursive: true, force: true });
+	});
+
+	/** A throwaway migrations folder holding one migration, in the layout Drizzle expects. */
+	function migrationsFolderWith(tag: string, sql: string): string {
+		const root = mkdtempSync(join(tmpdir(), "narrafork-migration-scope-"));
+		tempFolders.push(root);
+		const folder = join(root, "drizzle");
+		mkdirSync(join(folder, "meta"), { recursive: true });
+		writeFileSync(
+			join(folder, "meta", "_journal.json"),
+			JSON.stringify({
+				version: "7",
+				dialect: "sqlite",
+				entries: [{ idx: 0, version: "6", when: 1_700_000_000_000, tag, breakpoints: true }],
+			}),
+		);
+		writeFileSync(join(folder, `${tag}.sql`), sql);
+		return folder;
+	}
+
+	function rowCount(database: Database, table: string): number {
+		return (database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number })
+			.count;
+	}
+
+	function stampedHashes(database: Database): number {
+		return rowCount(database, "__drizzle_migrations");
+	}
+
+	test("aborts a table rebuild when a non-DROP statement hits a missing table", () => {
+		sqlite = new Database(":memory:");
+		sqlite.run("CREATE TABLE x (id text PRIMARY KEY NOT NULL, payload text)");
+		sqlite.run("INSERT INTO x (id, payload) VALUES ('row-1', 'keep-me')");
+
+		// Drizzle's rebuild shape, but the INSERT reads from a view/table that does not exist
+		// on this database. Everything after it must not run.
+		const folder = migrationsFolderWith(
+			"0000_broken_rebuild",
+			[
+				"CREATE TABLE `__new_x` (`id` text PRIMARY KEY NOT NULL, `payload` text);",
+				"INSERT INTO `__new_x`(`id`, `payload`) SELECT `id`, `payload` FROM `missing_view`;",
+				"DROP TABLE `x`;",
+				"ALTER TABLE `__new_x` RENAME TO `x`;",
+			].join("\n--> statement-breakpoint\n"),
+		);
+
+		expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow(
+			/no such table/i,
+		);
+
+		// The original table and its row survive, and the migration is not stamped as applied.
+		expect(rowCount(sqlite, "x")).toBe(1);
+		expect(
+			(sqlite.prepare("SELECT payload FROM x WHERE id = 'row-1'").get() as { payload: string })
+				.payload,
+		).toBe("keep-me");
+		expect(stampedHashes(sqlite)).toBe(0);
+	});
+
+	test("still tolerates dropping a table this database never created", () => {
+		sqlite = new Database(":memory:");
+		const folder = migrationsFolderWith(
+			"0000_drop_absent_table",
+			["DROP TABLE `never_created`;", "CREATE TABLE `kept` (`id` text PRIMARY KEY NOT NULL);"].join(
+				"\n--> statement-breakpoint\n",
+			),
+		);
+
+		applyPendingMigrationsByHash(sqlite, folder);
+
+		expect(
+			sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kept'").get(),
+		).toBeTruthy();
+		expect(stampedHashes(sqlite)).toBe(1);
+	});
+
+	test("recognizes a schema-qualified drop target as the reported missing table", () => {
+		sqlite = new Database(":memory:");
+		const folder = migrationsFolderWith(
+			"0000_drop_qualified",
+			[
+				'DROP TABLE main."never_created";',
+				"CREATE TABLE `kept` (`id` text PRIMARY KEY NOT NULL);",
+			].join("\n--> statement-breakpoint\n"),
+		);
+
+		applyPendingMigrationsByHash(sqlite, folder);
+
+		expect(stampedHashes(sqlite)).toBe(1);
+	});
+
+	test("does not forgive a missing table for a DROP of a different table", () => {
+		sqlite = new Database(":memory:");
+		sqlite.run("CREATE TABLE x (id text PRIMARY KEY NOT NULL)");
+		// An index creation against an absent table must not be swallowed just because this
+		// migration also drops `x`: the migration's assumptions about the schema are wrong.
+		const folder = migrationsFolderWith(
+			"0000_unrelated_missing",
+			["CREATE INDEX `idx_absent` ON `absent_table` (`id`);", "DROP TABLE `x`;"].join(
+				"\n--> statement-breakpoint\n",
+			),
+		);
+
+		expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow();
+		expect(
+			sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='x'").get(),
+		).toBeTruthy();
+		expect(stampedHashes(sqlite)).toBe(0);
+	});
+});
+
+describe("fast_mode_override backfill (real migration replay)", () => {
+	// folderMillis of 0104_lame_alice, the migration that adds narrators.fast_mode_override.
+	const FAST_MODE_OVERRIDE_WHEN = 1785722772073;
+
+	function overrideOf(database: Database, narratorId: string): string {
+		return (
+			database
+				.prepare("SELECT fast_mode_override AS v FROM narrators WHERE id = ?")
+				.get(narratorId) as {
+				v: string;
+			}
+		).v;
+	}
+
+	/**
+	 * A database migrated to just before 0104: every earlier migration applied, the
+	 * new column absent, and legacy narrator rows carrying only the old boolean.
+	 */
+	async function databaseBeforeFastModeOverride(): Promise<Database> {
+		const database = new Database(":memory:");
+		await runMigrations(database);
+		database.run("ALTER TABLE narrators DROP COLUMN fast_mode_override");
+		database.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [
+			FAST_MODE_OVERRIDE_WHEN,
+		]);
+		for (const [id, fastMode] of [
+			["narrator-fast", 1],
+			["narrator-slow", 0],
+		] as const) {
+			database.run(
+				"INSERT INTO narrators (id, fast_mode, created_at, updated_at) VALUES (?, ?, ?, ?)",
+				[id, fastMode, "now", "now"],
+			);
+		}
+		return database;
+	}
+
+	test("pins narrators that had fast mode ON so the new default cannot silently disable them", async () => {
+		sqlite = await databaseBeforeFastModeOverride();
+
+		await runMigrations(sqlite);
+
+		expect(overrideOf(sqlite, "narrator-fast")).toBe("on");
+	});
+
+	test("leaves narrators that had fast mode OFF on inherit so they follow the user default", async () => {
+		sqlite = await databaseBeforeFastModeOverride();
+
+		await runMigrations(sqlite);
+
+		expect(overrideOf(sqlite, "narrator-slow")).toBe("inherit");
+	});
+
+	test("does not re-pin a narrator that later chose inherit while its legacy mirror stayed on", async () => {
+		// The deprecated fast_mode column is only a mirror; once the column exists the
+		// backfill must never run again, or a user's explicit "follow default" choice
+		// would be reverted on every startup.
+		sqlite = await databaseBeforeFastModeOverride();
+		await runMigrations(sqlite);
+		sqlite.run("UPDATE narrators SET fast_mode_override = 'inherit', fast_mode = 1 WHERE id = ?", [
+			"narrator-fast",
+		]);
+
+		await runMigrations(sqlite);
+
+		expect(overrideOf(sqlite, "narrator-fast")).toBe("inherit");
 	});
 });

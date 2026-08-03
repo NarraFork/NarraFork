@@ -17,7 +17,7 @@
  */
 import { createHash } from "node:crypto";
 import { constants as fsConstants, mkdirSync } from "node:fs";
-import { open, readdir, rename, stat } from "node:fs/promises";
+import { open, readdir, rename, rm, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
 import { db } from "../db";
 import {
@@ -51,6 +51,26 @@ import {
 
 const ACK_FLUSH_INTERVAL_MS = 200;
 const ACK_FLUSH_THRESHOLD = 16;
+
+/**
+ * Abort reason that distinguishes cancel from pause.
+ *
+ * Both stop a transfer through the same AbortSignal, but they have opposite
+ * durability semantics: pause must keep the local `.nfpart`/`.nfmeta` checkpoint
+ * and the remote partial so `resume` can continue, while cancel is terminal and
+ * must leave nothing behind. The intent lives on the signal (rather than in an
+ * extra parameter) because the abort travels through `downloadFile`/`uploadFile`
+ * signatures that several callers share, including per-file calls inside a
+ * directory transfer.
+ *
+ * Only `cancel` passes it; pause keeps the platform's default AbortError reason.
+ */
+export const TRANSFER_CANCELLED_ABORT_REASON = "narrafork:transfer-cancelled";
+
+/** Whether this abort came from `cancel` rather than `pause` or a plain failure. */
+export function isTransferCancelAbort(signal?: AbortSignal | null): boolean {
+	return signal?.aborted === true && signal.reason === TRANSFER_CANCELLED_ABORT_REASON;
+}
 /** Pause sending when the device WS send buffer exceeds this (backpressure). */
 const BACKPRESSURE_HIGH_WATER = 8 * 1024 * 1024;
 const BACKPRESSURE_POLL_MS = 25;
@@ -243,6 +263,133 @@ export interface TransferProgressMeta {
 	onProgress?: (progress: TransferProgressUpdate) => void;
 }
 
+export interface RemoteBrowseEntry {
+	name: string;
+	path: string;
+	isDirectory: boolean;
+}
+
+export interface RemoteBrowseResult {
+	/** Absolute directory that was listed, in the device's own path syntax. */
+	path: string;
+	entries: RemoteBrowseEntry[];
+	/** Parent directory, or null at the filesystem root. */
+	parent: string | null;
+	/** Path separator for this device, so callers can build paths correctly. */
+	sep: string;
+	/** True when the listing was capped. */
+	truncated: boolean;
+}
+
+export interface RemoteBrowseTarget {
+	/** Absolute directory that would be listed, in the device's own path syntax. */
+	path: string;
+	/**
+	 * The workspace root the device itself declared in its handshake, or null when
+	 * it reported none. Callers that must bound a listing (see the narrator device
+	 * browse route) use this rather than inventing a root of their own.
+	 */
+	defaultCwd: string | null;
+	pathFlavor: RemotePathSemantics;
+	sep: string;
+}
+
+/**
+ * Resolve which absolute remote directory a browse request refers to, without
+ * contacting the device beyond its cached handshake.
+ *
+ * Split out of {@link browseRemoteDirectory} so an authorization boundary can
+ * decide whether a caller may see that directory *before* the `fs.list` RPC is
+ * issued, using exactly the same path resolution the listing will use.
+ */
+export function resolveRemoteBrowseTarget(
+	deviceId: string,
+	path: string | undefined,
+): RemoteBrowseTarget {
+	if (!isDeviceOnline(deviceId)) throw new Error(`Device ${deviceId} is offline`);
+	const hello = getConnectedDeviceHello(deviceId);
+	const platformOs = getRemotePlatformOs(deviceId);
+	const pathFlavor = remotePathSemantics(platformOs);
+	const pathApi = pathFlavor === "windows" ? win32 : posix;
+
+	const defaultCwd = hello?.defaultCwd?.trim() || null;
+	const requested = path?.trim() || defaultCwd;
+	if (!requested) {
+		throw new Error(
+			`Device ${deviceId} did not report a default working directory; specify a path to browse`,
+		);
+	}
+	// normalize() preserves a trailing separator ("/work/src/"), which would
+	// produce doubled separators when joining child names below. Strip it, but
+	// never past the root itself ("/" or "C:\").
+	const normalized = validateRemoteAbsolutePath(requested, platformOs, "Remote directory");
+	const root = pathApi.parse(normalized).root;
+	return {
+		path:
+			normalized.length > root.length && normalized.endsWith(pathApi.sep)
+				? normalized.slice(0, -pathApi.sep.length)
+				: normalized,
+		defaultCwd,
+		pathFlavor,
+		sep: pathApi.sep,
+	};
+}
+
+/**
+ * List one level of a remote directory for interactive browsing.
+ *
+ * Deliberately uses the `fs.list` RPC rather than `transfer.stat`'s recursive
+ * mode: the latter walks the whole subtree to build a transfer manifest, which
+ * would be pathological when a user is just drilling down a directory at a
+ * time. Only directories are returned — callers pick directories, not files.
+ *
+ * When `path` is omitted, the device's reported default working directory is
+ * used, matching how the local browser opens at the server's home directory.
+ */
+export async function browseRemoteDirectory(
+	deviceId: string,
+	path: string | undefined,
+	opts: { showHidden?: boolean; maxEntries?: number; signal?: AbortSignal } = {},
+): Promise<RemoteBrowseResult> {
+	const target = resolveRemoteBrowseTarget(deviceId, path);
+	const pathApi = target.pathFlavor === "windows" ? win32 : posix;
+	const remotePath = target.path;
+
+	const res = (await sendRpc(
+		deviceId,
+		"fs.list",
+		{ path: remotePath },
+		{ signal: opts.signal },
+	)) as { entries?: { name?: unknown; isDirectory?: unknown }[] };
+
+	const maxEntries = opts.maxEntries ?? 2000;
+	const dirs: RemoteBrowseEntry[] = [];
+	let truncated = false;
+	for (const entry of res.entries ?? []) {
+		if (typeof entry?.name !== "string" || entry.isDirectory !== true) continue;
+		if (!opts.showHidden && entry.name.startsWith(".")) continue;
+		if (dirs.length >= maxEntries) {
+			truncated = true;
+			break;
+		}
+		dirs.push({
+			name: entry.name,
+			path: pathApi.join(remotePath, entry.name),
+			isDirectory: true,
+		});
+	}
+	dirs.sort((a, b) => a.name.localeCompare(b.name));
+
+	const parentPath = pathApi.dirname(remotePath);
+	return {
+		path: remotePath,
+		entries: dirs,
+		parent: parentPath === remotePath ? null : parentPath,
+		sep: pathApi.sep,
+		truncated,
+	};
+}
+
 /** Remote file/dir metadata for planning transfers (uses transfer.stat RPC). */
 export async function statRemote(
 	deviceId: string,
@@ -320,10 +467,18 @@ async function downloadFileInner(args: {
 	// order or in parallel. O_RDWR|O_CREAT preserves existing bytes (for resume),
 	// creates the file when absent, and honours the positional writes in writeChunk.
 	const fileHandle = await open(partPath, fsConstants.O_RDWR | fsConstants.O_CREAT);
-	if (args.signal?.aborted) {
-		await fileHandle.close();
-		throw new Error("transfer cancelled");
-	}
+	// Aborts between opening the .nfpart and registering the receive state bypass
+	// stopReceive, so they must apply the same cancel-vs-pause cleanup themselves —
+	// the open above creates the file even when the transfer never sends a byte.
+	const abandonBeforeStart = async (): Promise<never> => {
+		await fileHandle.close().catch(() => {});
+		if (isTransferCancelAbort(args.signal)) {
+			await removeLocalPartial(partPath, finalPath);
+			throw new Error("transfer cancelled");
+		}
+		throw new Error("transfer paused");
+	};
+	if (args.signal?.aborted) await abandonBeforeStart();
 
 	// Resume: which chunks do we already have durably?
 	const existing = await loadLocalManifest(finalPath, {
@@ -341,10 +496,7 @@ async function downloadFileInner(args: {
 	}
 
 	const verify = settings.devices?.transferVerify ?? "crc32c";
-	if (args.signal?.aborted) {
-		await fileHandle.close();
-		throw new Error("transfer cancelled");
-	}
+	if (args.signal?.aborted) await abandonBeforeStart();
 
 	return await new Promise((resolvePromise, reject) => {
 		const state: ReceiveState = {
@@ -376,8 +528,16 @@ async function downloadFileInner(args: {
 		};
 		receives.set(transferId, state);
 		if (args.signal) {
-			state.abortHandler = () => void pauseReceive(state, "transfer cancelled");
-			args.signal.addEventListener("abort", state.abortHandler, { once: true });
+			const signal = args.signal;
+			state.abortHandler = () => {
+				// Cancel is terminal, so drop both sides of the checkpoint. Pause keeps
+				// them: `resume` reopens the same .nfpart and replays only the missing chunks.
+				const cancelled = isTransferCancelAbort(signal);
+				void stopReceive(state, cancelled ? "transfer cancelled" : "transfer paused", {
+					preservePartial: !cancelled,
+				});
+			};
+			signal.addEventListener("abort", state.abortHandler, { once: true });
 			if (args.signal.aborted) {
 				state.abortHandler();
 				return;
@@ -574,9 +734,11 @@ async function uploadFileInner(args: {
 	} finally {
 		await fileHandle.close();
 		if (!completed) {
+			// A cancelled upload is terminal, so the executor must drop its partial and
+			// manifest too; anything else (pause, disconnect, error) stays resumable.
 			void sendRpc(deviceId, "transfer.abort", {
 				transferId,
-				preservePartial: true,
+				preservePartial: !isTransferCancelAbort(args.signal),
 			}).catch(() => {});
 		}
 	}
@@ -871,18 +1033,41 @@ async function finalizeReceive(state: ReceiveState): Promise<void> {
 	}
 }
 
-async function pauseReceive(state: ReceiveState, error: string): Promise<void> {
+/**
+ * Stop an in-flight receive without treating it as a failure.
+ *
+ * `preservePartial` mirrors both sides of the checkpoint: on pause the local
+ * `.nfpart` plus its `.nfmeta` manifest and the executor's partial are all kept
+ * so a later `resume` continues from the same chunk set. On cancel nothing is
+ * resumable, so the local checkpoint is deleted and the executor is told to drop
+ * its own — otherwise a cancelled download leaks a `.nfpart`/`.nfmeta` pair on the
+ * server and a partial file on the device that no code path ever cleans up.
+ */
+async function stopReceive(
+	state: ReceiveState,
+	error: string,
+	opts: { preservePartial: boolean },
+): Promise<void> {
 	if (!cleanupReceiveState(state)) return;
-	try {
-		await state.fileHandle.sync();
-		await saveLocalManifest(state, state.mtimeMs);
-		await state.fileHandle.close();
-	} catch {
-		// Best effort: any previously persisted manifest remains resumable.
+	if (opts.preservePartial) {
+		try {
+			await state.fileHandle.sync();
+			await saveLocalManifest(state, state.mtimeMs);
+			await state.fileHandle.close();
+		} catch {
+			// Best effort: any previously persisted manifest remains resumable.
+		}
+	} else {
+		try {
+			await state.fileHandle.close();
+		} catch {
+			// Closing can only fail on an already-broken handle; removal below still runs.
+		}
+		await removeLocalPartial(state.partPath, state.finalPath);
 	}
 	void sendRpc(state.deviceId, "transfer.abort", {
 		transferId: state.transferId,
-		preservePartial: true,
+		preservePartial: opts.preservePartial,
 	}).catch(() => {});
 	settleReceive(state, false, error);
 }
@@ -1023,6 +1208,25 @@ async function removeLocalManifest(finalPath: string): Promise<void> {
 	} catch {
 		// ignore
 	}
+}
+
+/**
+ * Delete a download's resume checkpoint (`.nfpart` + `.nfmeta`).
+ *
+ * Used when a transfer is cancelled rather than paused: without this the partial
+ * data stays on disk forever, and a stale `.nfmeta` could later be matched by
+ * `loadLocalManifest` for a same-fingerprint download and resumed into.
+ */
+async function removeLocalPartial(partPath: string, finalPath: string): Promise<void> {
+	try {
+		await rm(partPath, { force: true });
+	} catch (err) {
+		logger.warn("Failed to remove cancelled transfer partial", {
+			partPath,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+	await removeLocalManifest(finalPath);
 }
 
 // ── Persistent transfer task lifecycle ───────────────────────────────────────
@@ -1253,7 +1457,9 @@ export function createDeviceTransferTaskManager(
 			const run = activeRuns.get(taskId);
 			if (run?.generation === task.runGeneration) {
 				run.stopIntent = "cancelled";
-				run.controller.abort();
+				// The reason is what tells the transfer layer to discard the resume
+				// checkpoint instead of preserving it the way pause does.
+				run.controller.abort(TRANSFER_CANCELLED_ABORT_REASON);
 			}
 			return task;
 		},

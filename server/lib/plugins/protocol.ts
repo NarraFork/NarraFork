@@ -46,6 +46,13 @@ export const PLUGIN_TO_HOST_REQUEST_METHODS = [
 	"storage.delete",
 	"storage.list",
 	"config.get",
+	// Secrets are read/write for the owning plugin, mirroring VS Code's `secrets` API
+	// (get/store/delete/keys, no declaration required). The `key` is namespaced by the host
+	// using the calling plugin's identity, so there is no parameter through which one plugin
+	// could name another's secret. `secrets.list` reports which keys exist without values.
+	"secrets.get",
+	"secrets.set",
+	"secrets.delete",
 	"secrets.list",
 	"diagnostics.getOwn",
 ] as const;
@@ -385,6 +392,9 @@ export const PLUGIN_TO_HOST_METHOD_REQUIRED_FEATURES = {
 	"storage.delete": ["host_api.requests"],
 	"storage.list": ["host_api.requests"],
 	"config.get": ["host_api.requests"],
+	"secrets.get": ["host_api.requests"],
+	"secrets.set": ["host_api.requests"],
+	"secrets.delete": ["host_api.requests"],
 	"secrets.list": ["host_api.requests"],
 	"diagnostics.getOwn": ["host_api.requests"],
 } as const satisfies Record<PluginToHostRequestMethod, readonly PluginToHostFeature[]>;
@@ -733,6 +743,84 @@ export const pluginToHostEnvelopeSchema = z.union([
 ]);
 export type PluginToHostNotification = z.infer<typeof pluginToHostNotificationSchema>;
 export type PluginToHostEnvelope = z.infer<typeof pluginToHostEnvelopeSchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Host → Plugin: commands.invoke                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `commands.invoke` dispatches a manifest command contribution to the plugin backend.
+ *
+ * A manifest may declare `commands[].handler: "server"`, but nothing consumed that:
+ * `commands.execute` resolves against the *host's* `CommandRegistry`, whose handlers are
+ * host functions, so a plugin-declared command was unreachable. This method is the missing
+ * half, and is shaped exactly like `tools.invoke` — the established Host→Plugin dispatch
+ * pattern — so timeouts, byte caps and cancellation behave identically.
+ *
+ * Note this is a *Host→Plugin* method. It does not appear in
+ * `PLUGIN_TO_HOST_REQUEST_METHODS` or in the iframe's method inventory, and the parity
+ * assertion that freezes those two lists is unaffected.
+ */
+export const COMMANDS_INVOKE_METHOD = "commands.invoke" as const;
+
+/**
+ * Max bytes for a single secret value. Matches the vault's own per-value ceiling.
+ *
+ * Retained where the entry-count and batch-total ceilings were removed, because this one is
+ * not about trust: `plugin-secret-vault` is a synchronous JSON read/modify/write on the
+ * main thread, so one unbounded value stalls every request. See CLAUDE.md.
+ */
+export const MAX_COMMAND_SECRET_VALUE_BYTES = 64 * 1024;
+
+/**
+ * One requested secret mutation returned by a plugin command.
+ *
+ * `value: null` deletes the key, matching the config form's clear-a-secret semantics.
+ *
+ * The host still derives the legal namespace from what the plugin contributed, so a command
+ * cannot write another plugin's credentials. It no longer requires the field to be declared
+ * in a `configSchema`: a plugin that manages its own credential set (rotating tokens,
+ * multiple accounts) cannot enumerate those keys in a static manifest.
+ */
+export const commandSecretWriteSchema = z
+	.object({
+		key: z.string().trim().min(1).max(256),
+		value: z.string().max(MAX_COMMAND_SECRET_VALUE_BYTES).nullable(),
+	})
+	.strict();
+
+export const commandsInvokeParamsSchema = z
+	.object({
+		contributionId: z.string().trim().min(1).max(128),
+		input: jsonValueSchema.optional(),
+		context: z
+			.object({
+				requestId: z.string().trim().min(1).max(128),
+				correlationId: z.string().trim().min(1).max(128).optional(),
+				deadlineAt: z.string().trim().min(1).max(64).optional(),
+				idempotencyKey: z.string().trim().min(1).max(128).optional(),
+			})
+			.strict(),
+	})
+	.strict();
+
+export const commandsInvokeResultSchema = z
+	.object({
+		/** Payload returned to the caller. Never includes secret values. */
+		output: jsonValueSchema.optional(),
+		/**
+		 * Secret mutations the host should apply. Consumed by the host, never echoed to the UI.
+		 *
+		 * Bounded only so one response cannot carry an unbounded array into JSON parsing;
+		 * this is an event-loop guard, not a policy on how many credentials a plugin may own.
+		 */
+		secretWrites: z.array(commandSecretWriteSchema).max(1_000).optional(),
+	})
+	.strict();
+
+export type CommandSecretWrite = z.infer<typeof commandSecretWriteSchema>;
+export type CommandsInvokeParams = z.infer<typeof commandsInvokeParamsSchema>;
+export type CommandsInvokeResult = z.infer<typeof commandsInvokeResultSchema>;
 
 export const providerDoneSchema = providerEventSchema.refine(
 	(message) => message.params.event.type === "done",

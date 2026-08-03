@@ -52,6 +52,8 @@ export interface BuildPretextDocumentLayoutOptions {
 	/** Authoritative header summary (tool-display.getSummary). Without it a tool
 	 * whose input was truncated server-side renders a header with no target. */
 	resolveToolSummary?: (tc: unknown) => string;
+	/** Label detail for a subagent recent-call row (tool name + projected input keys). */
+	resolveSubagentRecentSummary?: (toolName: string, inputSummary: unknown) => string | null;
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
 	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
 	/** Full (un-truncated) tool payloads once the shell has fetched them. */
@@ -59,6 +61,12 @@ export interface BuildPretextDocumentLayoutOptions {
 	resolveFullToolOutput?: (toolUseId: string | undefined) => unknown;
 	/** A live pending permission's suggestions (reflection-gate precedence). */
 	resolvePendingPermissionSuggestions?: (toolUseId: string | undefined) => unknown[] | undefined;
+	/** Reader enabled per-turn token usage rows (absent → no usage specs at all). */
+	showTokenUsage?: boolean;
+	/** Phone-sized viewport → the trailing usage summary splits across two lines. */
+	compactUsageLines?: boolean;
+	/** Locale-aware number grouping for the usage rows. */
+	formatUsageNumber?: (value: number) => string;
 }
 
 export interface BuiltPretextDocumentLayout {

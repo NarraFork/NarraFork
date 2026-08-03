@@ -377,8 +377,6 @@ interface ToolCallCardProps {
 	onQuestionReflect?: (requestId: string) => Promise<void> | void;
 	/** Callback when user skips/denies AskUserQuestion */
 	onQuestionDeny?: (requestId: string) => void;
-	/** Force expand this card from outside (e.g. when navigating to it) */
-	forceExpand?: boolean;
 	/** Open an awaited child-agent session in the host's side panel. */
 	onViewSubagentSession?: (narratorId: string) => void;
 	/**
@@ -5364,7 +5362,6 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		prev.narratorId !== next.narratorId ||
 		prev.inRun !== next.inRun ||
 		prev.isLast !== next.isLast ||
-		prev.forceExpand !== next.forceExpand ||
 		prev.isRecent !== next.isRecent ||
 		prev.blockIndex !== next.blockIndex ||
 		prev.pendingPermission !== next.pendingPermission ||
@@ -5390,7 +5387,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 	onQuestionSubmit,
 	onQuestionReflect,
 	onQuestionDeny,
-	forceExpand,
 	onViewSubagentSession,
 	onOpenFilePanel,
 	blockIndex,
@@ -5543,11 +5539,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 		isFailed,
 		isDeniedPlan,
 	]);
-
-	// Force expand from outside (e.g. navigating to this card)
-	useEffect(() => {
-		if (forceExpand) setOpened(true);
-	}, [forceExpand]);
 
 	const isRunning =
 		toolCall.status === "running" ||

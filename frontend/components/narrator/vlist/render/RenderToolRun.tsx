@@ -35,6 +35,7 @@ import {
 	TRACE_CHEVRON,
 	TRACE_HEADER_ICON,
 	TRACE_HEADER_PADDING_Y,
+	TRACE_ROW_GAP,
 	TRACE_ROW_HEIGHT,
 	TRACE_ROW_ICON,
 	TRACE_ROW_PADDING_Y,
@@ -43,11 +44,24 @@ import {
 } from "../measure/measure-tool-run";
 import { categoryIcon } from "./category-icons";
 import { RenderMarkdown } from "./RenderMarkdown";
+import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
+import {
+	hasToolRowStatusMark,
+	isTerminalToolRowStatus,
+	TRACE_ROW_STATUS_SLOT_STYLE,
+	TraceRowStatusGlyph,
+} from "./trace-row-status";
 
 const CHEVRON_SLOT_WIDTH = 12;
 const HEADER_INNER_ICON = 10;
 const ROW_INNER_ICON = 9;
 const DIMMED = "var(--mantine-color-dimmed)";
+
+/** A row's chip tint from its category, via the vlist render layer's own table. */
+function categoryColor(category: string | undefined): string {
+	if (!category) return "gray";
+	return CATEGORY_COLOR[category as ToolCategory] ?? "gray";
+}
 
 /** Header visual per variant (icon + tint). Tool traces gray, reasoning grape. */
 function variantHeaderColor(variant: TraceVariant): string {
@@ -70,18 +84,29 @@ export interface TraceRenderLabels {
 	showEarlier?: (hiddenCount: number) => string;
 	/** "Hide earlier" text. */
 	hideEarlier?: string;
+	/**
+	 * Timing popover strings for the per-row duration slot. Absent → the render
+	 * layer's English fallbacks. Height-neutral (portaled popover, fixed rows).
+	 */
+	timing?: ToolTimingLabels;
 }
 
 /**
  * Per-row interaction surface supplied by the integration layer. Returning a
- * node wraps the row's title line so it joins the selection / context-menu
- * system; returning null leaves the row plain. Injected (rather than imported)
- * so this render module stays free of hooks and panel wiring — same pattern as
- * `rowIcon`.
+ * node wraps the row so it joins the selection / context-menu system; returning
+ * null leaves the row plain. Injected (rather than imported) so this render
+ * module stays free of hooks and panel wiring — same pattern as `rowIcon`.
+ *
+ * ⚠️ It receives the row's WHOLE body — the title line plus whatever the row
+ * revealed (an expanded markdown body, or a drilled-in tool card) — not just the
+ * title line. A drilled-in card is the same tool call the row summarizes, so the
+ * two must be ONE interactive block: wrapping only the title line left the
+ * revealed card with no right-click menu and no left-swipe, i.e. strictly fewer
+ * affordances than the folded row it came from.
  */
 export type TraceRowInteractionSlot = (
 	row: MeasuredTraceRow,
-	titleRow: React.ReactNode,
+	rowBody: React.ReactNode,
 ) => React.ReactNode | null;
 
 /**
@@ -138,7 +163,7 @@ export function RenderToolRun({
 		<div style={{ position: "relative", width: measured.contentWidth, height: measured.height }}>
 			{/* ── Header band ── */}
 			<Group
-				gap={6}
+				gap={TRACE_ROW_GAP}
 				wrap="nowrap"
 				align="center"
 				py={TRACE_HEADER_PADDING_Y}
@@ -174,7 +199,7 @@ export function RenderToolRun({
 			{/* ── "Show earlier" toggle ── */}
 			{toggle ? (
 				<Group
-					gap={6}
+					gap={TRACE_ROW_GAP}
 					wrap="nowrap"
 					align="center"
 					py={TRACE_ROW_PADDING_Y}
@@ -209,6 +234,7 @@ export function RenderToolRun({
 					onToggleRow={onToggleRow}
 					rowInteraction={rowInteraction}
 					rowCard={rowCard}
+					timingLabels={labels.timing}
 				/>
 			))}
 		</div>
@@ -229,12 +255,14 @@ function TraceRowView({
 	onToggleRow,
 	rowInteraction,
 	rowCard,
+	timingLabels,
 }: {
 	row: MeasuredTraceRow;
 	rowIcon?: (row: MeasuredTraceRow) => React.ReactNode;
 	onToggleRow?: (itemIndex: number) => void;
 	rowInteraction?: TraceRowInteractionSlot;
 	rowCard?: TraceRowCardSlot;
+	timingLabels?: ToolTimingLabels;
 }) {
 	const icon = row.hasIcon ? (rowIcon?.(row) ?? <DefaultRowIcon row={row} />) : null;
 	const interactive = !!row.identity && !!rowInteraction;
@@ -248,7 +276,7 @@ function TraceRowView({
 		: undefined;
 	const titleRow = (
 		<Group
-			gap={6}
+			gap={TRACE_ROW_GAP}
 			wrap="nowrap"
 			align="center"
 			py={TRACE_ROW_PADDING_Y}
@@ -273,43 +301,81 @@ function TraceRowView({
 				)}
 			</Box>
 			{icon ? (
+				// `data-trace-row-chip`: the marker every compact row's category chip
+				// carries, so a parity test can find the SAME lane in a trace row and in a
+				// subagent card's recent-call row instead of guessing at each one's markup.
 				<ThemeIcon
+					data-trace-row-chip
 					size={TRACE_ROW_ICON}
 					variant="light"
-					color={row.iconColor ?? "gray"}
+					// `iconColor` is the caller's explicit override (reasoning rows use grape).
+					// Absent → derive the tint from the row's own CATEGORY, the same table the
+					// tool header and a subagent card's recent-call rows read. Falling back to
+					// grey here meant a row whose adapter supplied `category` but not
+					// `iconColor` rendered a colourless chip — the one thing the chip exists
+					// to avoid.
+					color={row.iconColor ?? categoryColor(row.category)}
 					radius="sm"
 				>
 					{icon}
 				</ThemeIcon>
 			) : null}
+			{/* `flex: 0 1 auto` (not `flex: 1`) is what lets the status + duration HUG the
+			    title instead of being flung to the row's right edge. A short title keeps
+			    them adjacent; a long one truncates and they follow the ellipsis. The
+			    trailing spacer below absorbs whatever is left. */}
 			<Text
 				size="xs"
 				c="dimmed"
 				truncate
 				className={row.shimmer ? "reasoning-step-shimmer" : undefined}
-				style={{ flex: 1, minWidth: 0 }}
+				style={{ flex: "0 1 auto", minWidth: 0 }}
 			>
 				{row.title || "…"}
 			</Text>
+			{/* Status + duration, adjacent to the label rather than right-aligned: in a
+			    column of rows a far-right number has to be traced back across the gap to
+			    find its own row, which is exactly the misreading this avoids.
+
+			    Both live inside the row's fixed 18.8px line — the glyph in a 12px slot,
+			    the duration as one nowrap span, popover portaled — so `measure-tool-run`
+			    needs no height change (asserted in its tests). */}
+			{hasToolRowStatusMark(row.status) ? (
+				<Box data-testid="trace-row-status-slot" style={TRACE_ROW_STATUS_SLOT_STYLE}>
+					<TraceRowStatusGlyph status={row.status} />
+				</Box>
+			) : null}
+			{row.timing ? (
+				<ToolTimingArea
+					running={!isTerminalToolRowStatus(row.status)}
+					startedAt={row.timing.startedAt ?? row.timing.createdAt}
+					durationMs={row.timing.durationMs}
+					timing={row.timing}
+					labels={timingLabels}
+				/>
+			) : null}
+			{/* Eats the remaining width so the cells above stay left-packed. Zero-height,
+			    so it cannot affect the measured row. */}
+			<Box style={{ flex: 1, minWidth: 0 }} />
 		</Group>
 	);
 
-	return (
-		<Box
-			// LOD-independent identity of this row's content: the same value the full
-			// card carries at L3+, so the two renderings of one tool call can be paired
-			// across a level change. Height-neutral (a data attribute).
-			data-nf-unit={row.unitId}
-			style={{
-				position: "absolute",
-				top: row.top,
-				left: 0,
-				right: 0,
-				height: row.blockHeight,
-			}}
-		>
-			{/* Title row (fixed 18.8px), optionally wrapped in the interaction surface. */}
-			{(interactive ? rowInteraction?.(row, titleRow) : null) ?? titleRow}
+	/**
+	 * The row's WHOLE painted block: the fixed title line plus whatever it
+	 * revealed. Handed to the interaction slot as one unit, so a drilled-in card
+	 * shares the folded row's menu / swipe / selection outline instead of being an
+	 * un-interactive sibling next to it.
+	 *
+	 * `position: relative` (with the measured block height) is what keeps that
+	 * regrouping height-neutral: the revealed bodies stay absolutely positioned at
+	 * `TRACE_ROW_HEIGHT`, and they now resolve against a box that starts at exactly
+	 * the same place and is exactly as tall as the outer row box. It also makes the
+	 * geometry independent of the interaction wrapper, which grows a `transform`
+	 * (and thus a containing block of its own) the moment a swipe starts.
+	 */
+	const rowBody = (
+		<div style={{ position: "relative", height: row.blockHeight }}>
+			{titleRow}
 
 			{/* Expanded markdown body (left-bordered, indented). */}
 			{row.expanded && row.body ? (
@@ -348,6 +414,24 @@ function TraceRowView({
 					{rowCard?.(row) ?? null}
 				</Box>
 			) : null}
+		</div>
+	);
+
+	return (
+		<Box
+			// LOD-independent identity of this row's content: the same value the full
+			// card carries at L3+, so the two renderings of one tool call can be paired
+			// across a level change. Height-neutral (a data attribute).
+			data-nf-unit={row.unitId}
+			style={{
+				position: "absolute",
+				top: row.top,
+				left: 0,
+				right: 0,
+				height: row.blockHeight,
+			}}
+		>
+			{(interactive ? rowInteraction?.(row, rowBody) : null) ?? rowBody}
 		</Box>
 	);
 }
@@ -407,7 +491,7 @@ export function RenderTraceCountLine({
 	const { kind } = measured;
 	return (
 		<Group
-			gap={6}
+			gap={TRACE_ROW_GAP}
 			wrap="nowrap"
 			align="center"
 			py={TRACE_HEADER_PADDING_Y}

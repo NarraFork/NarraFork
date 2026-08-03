@@ -20,12 +20,19 @@ const configCalls: Array<{ instanceId: string; config: Record<string, unknown> }
 const prefixCalls: Array<{ instanceId: string; prefix: string }> = [];
 let listResponse: unknown = { pluginId: "com.example.demo", providers: [] };
 
+// Capture the real modules BEFORE mocking. `bun test` shares one module registry across
+// files, so a mock left installed here would leak into every later test file that imports
+// the same module — restoring them in afterAll is what keeps this file self-contained.
 const realReactI18nextModule = { ...(await import("react-i18next")) };
+const realApiPluginsModule = { ...(await import("../../lib/api/plugins")) };
+
 mock.module("react-i18next", () => ({
 	useTranslation: () => ({ t: (key: string) => key }),
 }));
 mock.module("../../lib/api/plugins", () => ({
+	...realApiPluginsModule,
 	pluginsApi: {
+		...realApiPluginsModule.pluginsApi,
 		listProviderConfig: (pluginId: string) => {
 			listCalls.push(pluginId);
 			return Promise.resolve(listResponse);
@@ -47,7 +54,6 @@ mock.module("../../lib/api/plugins", () => ({
 			return Promise.resolve({ pluginId: _pluginId, provider: null });
 		},
 	},
-	normalizePluginList: (value: unknown) => value,
 }));
 
 const { PluginProviderConfigPanel } = await import("./PluginProviderConfigPanel");
@@ -150,7 +156,9 @@ afterEach(async () => {
 });
 
 afterAll(() => {
+	// Put every mocked module back, or later test files inherit these stubs.
 	mock.module("react-i18next", () => realReactI18nextModule);
+	mock.module("../../lib/api/plugins", () => realApiPluginsModule);
 	mock.restore();
 });
 

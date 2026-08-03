@@ -177,8 +177,44 @@ export function shouldApplyRecentTabsRuntimeResponse(
 	return requestGeneration === currentGeneration;
 }
 
-export function pruneRecentTabsTerminalCountVersions(
-	versions: Map<string, number>,
+/**
+ * Per-narrator, per-field counters of runtime updates delivered over the narrator WS.
+ *
+ * The runtime endpoint is a full snapshot of every runtime field, so a response that
+ * left the server before a WS event landed would otherwise roll the tab back to the
+ * pre-event value (a stale status colour / filled icon until the next poll).
+ */
+export type RecentTabRuntimeVersions = Map<string, Map<string, number>>;
+export type ReadonlyRecentTabRuntimeVersions = ReadonlyMap<string, ReadonlyMap<string, number>>;
+
+/** Record that a WS event just delivered newer values for these runtime fields. */
+export function bumpRecentTabRuntimeVersions(
+	versions: RecentTabRuntimeVersions,
+	narratorId: string,
+	fields: Iterable<string>,
+): void {
+	let byField = versions.get(narratorId);
+	if (!byField) {
+		byField = new Map();
+		versions.set(narratorId, byField);
+	}
+	for (const field of fields) byField.set(field, (byField.get(field) ?? 0) + 1);
+}
+
+/** Freeze the counters a runtime request is allowed to overwrite when it returns. */
+export function snapshotRecentTabRuntimeVersions(
+	versions: ReadonlyRecentTabRuntimeVersions,
+	narratorIds: Iterable<string>,
+): RecentTabRuntimeVersions {
+	const snapshot: RecentTabRuntimeVersions = new Map();
+	for (const narratorId of narratorIds) {
+		snapshot.set(narratorId, new Map(versions.get(narratorId) ?? []));
+	}
+	return snapshot;
+}
+
+export function pruneRecentTabsRuntimeVersions(
+	versions: RecentTabRuntimeVersions,
 	liveNarratorIds: ReadonlySet<string>,
 	inFlightNarratorIdSnapshots: Iterable<ReadonlySet<string>>,
 ): void {
@@ -192,24 +228,32 @@ export function pruneRecentTabsTerminalCountVersions(
 }
 
 /**
- * Preserve terminal-count WS updates that arrived after a runtime request began.
- * Other runtime fields remain authoritative and are still applied.
+ * Drop every runtime field whose WS counter advanced after the request began, so a
+ * slow poll can still refresh untouched fields without reverting fresher ones.
  */
 export function reconcileRecentTabsRuntimePatches(
 	patches: RecentTabRuntimePatch[],
 	narratorIdsByKey: ReadonlyMap<string, string>,
-	terminalCountVersionsAtRequest: ReadonlyMap<string, number>,
-	currentTerminalCountVersions: ReadonlyMap<string, number>,
+	versionsAtRequest: ReadonlyRecentTabRuntimeVersions,
+	currentVersions: ReadonlyRecentTabRuntimeVersions,
 ): RecentTabRuntimePatch[] {
 	return patches.flatMap(({ key, patch }) => {
-		if (!("activeTerminalCount" in patch)) return [{ key, patch }];
 		const narratorId = narratorIdsByKey.get(key);
 		if (!narratorId) return [{ key, patch }];
-		const requestVersion = terminalCountVersionsAtRequest.get(narratorId) ?? 0;
-		const currentVersion = currentTerminalCountVersions.get(narratorId) ?? 0;
-		if (requestVersion === currentVersion) return [{ key, patch }];
-		const { activeTerminalCount: _staleTerminalCount, ...remainingPatch } = patch;
-		return Object.keys(remainingPatch).length > 0 ? [{ key, patch: remainingPatch }] : [];
+		const current = currentVersions.get(narratorId);
+		if (!current || current.size === 0) return [{ key, patch }];
+		const requested = versionsAtRequest.get(narratorId);
+		const fresh: Record<string, unknown> = {};
+		let stale = false;
+		for (const [field, value] of Object.entries(patch)) {
+			if ((current.get(field) ?? 0) !== (requested?.get(field) ?? 0)) {
+				stale = true;
+				continue;
+			}
+			fresh[field] = value;
+		}
+		if (!stale) return [{ key, patch }];
+		return Object.keys(fresh).length > 0 ? [{ key, patch: fresh }] : [];
 	});
 }
 

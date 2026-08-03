@@ -18,7 +18,16 @@
  *     fitting inside it.
  *
  * Measured in headless Chromium before the fix: 26.797 / 28.594 / 34.797px
- * across the status × timing matrix (8px spread). After: a single 28.594px.
+ * across the status × timing matrix (8px spread).
+ *
+ * THE ROW IS NOW A TRACE ROW
+ * It used to be a tinted `5px 7px` button, so the same child tool call looked like
+ * a chunky card row inside a subagent card and like a slim trace line once the
+ * reader dropped to a low LOD. The row is now assembled from `CollapsibleTrace`'s
+ * exported slots and its `TRACE_ROW_MIN_HEIGHT`, which is what the assertions
+ * below compare against: the height contract did not weaken, it moved onto the
+ * shared definition. Cross-render parity itself is owned by
+ * SubagentActivityTraceParity.test.tsx.
  *
  * WHAT IS ASSERTED HERE, AND WHY IT IS NOT A TAUTOLOGY
  * linkedom has no layout engine — `getBoundingClientRect()` returns all zeros —
@@ -27,12 +36,12 @@
  * invariants that are the *cause* of the uniform height, each of which fails if
  * the corresponding fix is reverted:
  *
- *   - the glyph slot is always present, one per row, whatever the status;
- *   - it reserves an explicit 12×12 box and cannot shrink;
+ *   - the glyph slot reserves an explicit 12×12 box and cannot shrink;
  *   - it lays its child out as flex, so no root-font-size line box (the 24.8px
  *     inflation) can form inside it;
  *   - the row reserves a min-height, so the timing area appearing/disappearing
- *     (line-height 1.55 vs the label's 1.4) cannot move it either.
+ *     (line-height 1.55 vs the label's 1.4) cannot move it either;
+ *   - the title is ONE truncating line, so summary length cannot wrap it.
  *
  * The real pixel heights are verified out-of-band with a Chromium probe; this
  * file is the cheap guard that keeps the structure from regressing.
@@ -84,12 +93,14 @@ mock.module("@tanstack/react-router", () => ({
 	useSearch: () => ({}),
 }));
 
+const { SUBAGENT_STATUS_ROW_MIN_HEIGHT, SUBAGENT_STATUS_SLOT_STYLE, SubagentActivityRow } =
+	await import("./SubagentCard");
 const {
-	SUBAGENT_CATEGORY_SLOT_SIZE,
-	SUBAGENT_STATUS_ROW_MIN_HEIGHT,
-	SUBAGENT_STATUS_SLOT_STYLE,
-	SubagentActivityRow,
-} = await import("./SubagentCard");
+	TRACE_ICON_SLOT_SIZE,
+	TRACE_ROW_MIN_HEIGHT,
+	TRACE_STATUS_SLOT_SIZE,
+	TRACE_STATUS_SLOT_STYLE,
+} = await import("./CollapsibleTrace");
 type ToolCallData = import("./ToolCallCard").ToolCallData;
 
 let root: Root | undefined;
@@ -169,21 +180,28 @@ function restoreGlobals() {
 }
 
 /**
- * Statuses that render a glyph, and statuses that do not. `streaming` is the
- * first status a live call has (and now spins — SubagentActivityStatusGlyph.test.tsx
- * owns that); `""` is a real value a row can carry, and `unknown` stands in for
- * whatever a future provider sends. Both groups must produce the same row height.
+ * Statuses that render a glyph, and statuses that do not.
+ *
+ * `streaming` is the first status a live call has (and spins —
+ * SubagentActivityStatusGlyph.test.tsx owns that). `unknown` stands in for whatever
+ * a future provider sends, and `""` is a real value a row can carry: neither is
+ * guessed at.
+ *
+ * SUCCESS is in the second group DELIBERATELY. Success is the default expectation,
+ * so a column of green checks is noise rather than information; only deviation is
+ * marked (see `@shared/tool-row-status`). This is the group's whole point — an
+ * unmarked row must reserve NO width, or the blank gap replaces the check with an
+ * equally useless column.
  */
 const STATUSES_WITH_GLYPH = [
 	"streaming",
 	"running",
 	"pending",
 	"initializing",
-	"success",
 	"fail",
 	"cancelled",
 ];
-const STATUSES_WITHOUT_GLYPH = ["", "unknown"];
+const STATUSES_WITHOUT_GLYPH = ["", "unknown", "success", "completed"];
 
 /** Timing shapes: live ElapsedTimer / static duration / no timing at all. */
 type TimingShape = "running" | "completed" | "none";
@@ -227,17 +245,26 @@ async function render(call: ToolCallData) {
 	});
 }
 
+/**
+ * The row's status slot. Queried by the SHARED trace testid, because the row is a
+ * trace row now — a subagent-specific selector here would pass while the row and a
+ * folded trace row drifted apart, which is the drift this change removed.
+ */
 function statusSlot(): HTMLElement {
-	const slots = container?.querySelectorAll('[data-testid="subagent-activity-status-slot"]') ?? [];
-	// Exactly one slot per row: a second one would add width, a zeroth would let
-	// the row collapse — both are height/layout regressions.
+	const slots = container?.querySelectorAll('[data-testid="trace-row-status-slot"]') ?? [];
+	// Exactly one slot on a row that HAS a mark: a second would add width.
 	expect(slots.length).toBe(1);
 	return slots[0] as unknown as HTMLElement;
 }
 
+/** True when the row drew no status slot at all (an unmarked status). */
+function noStatusSlot(): boolean {
+	return (container?.querySelectorAll('[data-testid="trace-row-status-slot"]') ?? []).length === 0;
+}
+
+/** The 14px trace icon lane holding the category chip. */
 function categorySlot(): HTMLElement {
-	const slots =
-		container?.querySelectorAll('[data-testid="subagent-activity-category-slot"]') ?? [];
+	const slots = container?.querySelectorAll("[data-trace-icon-slot]") ?? [];
 	// Same one-per-row rule as the status slot, for the same reason.
 	expect(slots.length).toBe(1);
 	return slots[0] as unknown as HTMLElement;
@@ -274,15 +301,15 @@ afterAll(() => {
 });
 
 describe("SubagentActivityRow status slot", () => {
-	test("reserves the same fixed 12x12 slot for every status, glyph or not", async () => {
+	test("reserves the same fixed 12x12 slot for every MARKED status", async () => {
 		const observed: string[] = [];
-		for (const status of [...STATUSES_WITH_GLYPH, ...STATUSES_WITHOUT_GLYPH]) {
+		for (const status of STATUSES_WITH_GLYPH) {
 			await render(toolCall(status, "running"));
 			const slot = statusSlot();
-			// A reserved box that cannot shrink: this is what makes a missing glyph
-			// height-neutral instead of collapsing the slot to 0x0.
-			expect(slot.style.width).toBe("12px");
-			expect(slot.style.height).toBe("12px");
+			// A reserved box that cannot shrink: this is what keeps a 12px glyph from
+			// setting the row's height from its own line box.
+			expect(slot.style.width).toBe(`${TRACE_STATUS_SLOT_SIZE}px`);
+			expect(slot.style.height).toBe(`${TRACE_STATUS_SLOT_SIZE}px`);
 			expect(slot.style.flexShrink).toBe("0");
 			// Flex layout means the inline <svg> never establishes a line box sized by
 			// the ROOT font (16 x 1.55 = 24.8px), which is what INFLATED the row.
@@ -298,55 +325,81 @@ describe("SubagentActivityRow status slot", () => {
 					.join(";"),
 			);
 		}
-		// Every status yields identical slot geometry — the invariant, stated once
-		// over the whole matrix rather than per-case.
+		// Every marked status yields identical slot geometry — the invariant, stated
+		// once over the whole set rather than per-case.
 		expect(new Set(observed).size).toBe(1);
 	});
 
-	test("the slot holds a glyph for known statuses and is empty for the rest", async () => {
-		// Both directions of the same invariant, because each alone is satisfiable by a
-		// broken row: an always-empty slot passes the second half, and a slot that
-		// swallows the icon passes the first.
+	test("an UNMARKED status reserves no width at all", async () => {
+		// The point of dropping the success check: a blank 12px gap on every successful
+		// row would be the same useless column the check was. So the slot must be
+		// ABSENT, not empty — asserted for success as well as for the statuses this
+		// frontend cannot interpret.
+		for (const status of STATUSES_WITHOUT_GLYPH) {
+			await render(toolCall(status, "running"));
+			expect(noStatusSlot()).toBe(true);
+		}
+	});
+
+	test("marked statuses really do draw their glyph", async () => {
+		// The other direction of the same invariant: an always-absent slot would pass
+		// the test above while telling the reader nothing about a failure.
 		for (const status of STATUSES_WITH_GLYPH) {
 			await render(toolCall(status, "running"));
 			expect(statusSlot().querySelector("svg")).not.toBeNull();
 		}
-		for (const status of STATUSES_WITHOUT_GLYPH) {
-			await render(toolCall(status, "running"));
-			// Genuinely empty: no stray placeholder text a screen reader would announce.
-			expect(statusSlot().textContent).toBe("");
-		}
+	});
+
+	test("the slot style is the shared trace definition, not a local copy", async () => {
+		// The whole point of routing this row through CollapsibleTrace's slot: one
+		// definition, so a change to the trace row's reservation cannot leave the
+		// subagent row behind (which is how the two drifted before).
+		expect(TRACE_STATUS_SLOT_STYLE).toMatchObject({
+			width: TRACE_STATUS_SLOT_SIZE,
+			height: TRACE_STATUS_SLOT_SIZE,
+			flexShrink: 0,
+			display: "flex",
+		});
 	});
 });
 
 describe("SubagentActivityRow height reservation", () => {
-	test("reserves a min-height so the timing area cannot move the row", async () => {
+	test("reserves the TRACE row min-height so the timing area cannot move the row", async () => {
 		// The timing text is line-height 1.55 while the sibling label is 1.4, so a
-		// row without a reservation grows ~1.8px the moment a timer appears.
+		// row without a reservation grows ~1.8px the moment a timer appears. The
+		// reservation is now the trace row's, which is what makes this row and a folded
+		// trace row the same height by construction rather than by coincidence.
 		for (const status of [...STATUSES_WITH_GLYPH, ...STATUSES_WITHOUT_GLYPH]) {
 			for (const timing of TIMING_SHAPES) {
 				await render(toolCall(status, timing));
-				expect(rowGroup().style.minHeight).toBe(SUBAGENT_STATUS_ROW_MIN_HEIGHT);
+				expect(rowGroup().style.minHeight).toBe(`${TRACE_ROW_MIN_HEIGHT}px`);
 			}
 		}
 	});
 
-	test("row structure is identical across the status x timing matrix", async () => {
-		// Same element shape everywhere: slot + label + timing container, so no
-		// combination can introduce or drop a box that changes the row's height.
-		const shapes = new Set<string>();
-		for (const status of [...STATUSES_WITH_GLYPH, ...STATUSES_WITHOUT_GLYPH]) {
-			for (const timing of TIMING_SHAPES) {
-				await render(toolCall(status, timing));
-				const group = rowGroup();
-				shapes.add(
-					`${group.children.length}|${Array.from(group.children)
-						.map((child) => child.tagName.toLowerCase())
-						.join(",")}`,
-				);
+	test("row structure is identical across the timing shapes, per status group", async () => {
+		// Same element shape within a group, so a timer appearing or a status advancing
+		// WITHIN that group cannot introduce or drop a box that changes the height.
+		//
+		// The two groups differ by exactly one cell — the status slot, which an unmarked
+		// status omits by design — so they are asserted separately rather than folded
+		// together. Height is unaffected either way: the row's `minHeight` above is what
+		// sets it, and the omitted cell was never the tallest.
+		for (const statuses of [STATUSES_WITH_GLYPH, STATUSES_WITHOUT_GLYPH]) {
+			const shapes = new Set<string>();
+			for (const status of statuses) {
+				for (const timing of TIMING_SHAPES) {
+					await render(toolCall(status, timing));
+					const group = rowGroup();
+					shapes.add(
+						`${group.children.length}|${Array.from(group.children)
+							.map((child) => child.tagName.toLowerCase())
+							.join(",")}`,
+					);
+				}
 			}
+			expect(shapes.size).toBe(1);
 		}
-		expect(shapes.size).toBe(1);
 	});
 });
 
@@ -382,7 +435,7 @@ function summaryEl(): HTMLElement | null {
 describe("SubagentActivityRow summary", () => {
 	test("row shape and height reservation survive any summary length", async () => {
 		// One case, two facts, because they fail together: the summary lives INSIDE the
-		// label box, so it can neither add a box to the row's flex line nor release the
+		// title line, so it can neither add a box to the row's flex line nor release the
 		// row's min-height. Asserted over the same set of inputs rather than twice over
 		// two near-identical sets.
 		const shapes = new Set<string>();
@@ -394,7 +447,7 @@ describe("SubagentActivityRow summary", () => {
 		]) {
 			await render(call);
 			const group = rowGroup();
-			expect(group.style.minHeight).toBe(SUBAGENT_STATUS_ROW_MIN_HEIGHT);
+			expect(group.style.minHeight).toBe(`${TRACE_ROW_MIN_HEIGHT}px`);
 			shapes.add(
 				`${group.children.length}|${Array.from(group.children)
 					.map((child) => child.tagName.toLowerCase())
@@ -404,33 +457,37 @@ describe("SubagentActivityRow summary", () => {
 		expect(shapes.size).toBe(1);
 	});
 
-	test("label lane stays a single non-shrinking flex line", async () => {
+	test("the title is ONE truncating flex line whatever the summary length", async () => {
 		// `minWidth: 0` is what allows truncation; without it the text sets the box's
-		// min-content width and pushes the row wider (then taller once it wraps).
+		// min-content width and pushes the row wider (then taller once it wraps). Both
+		// the name and the summary live in this single <Text truncate>, so there is one
+		// line box to keep — not two cells that could wrap independently.
 		const observed: string[] = [];
 		for (const call of [summaryRow(), summaryRow({ description: LONG_SUMMARY })]) {
 			await render(call);
 			const box = labelBox();
-			expect(box.style.display).toBe("flex");
 			// linkedom serializes the unitless zero as "0" (a browser reports "0px").
 			expect(box.style.minWidth).toBe("0");
-			expect(box.style.alignItems).toBe("center");
-			observed.push(`${box.style.display}|${box.style.minWidth}|${box.style.alignItems}`);
+			// `0 1 auto`, NOT `1`: the title must not grow into the row's free width, or
+			// the status + duration that follow it get flung to the far right edge — the
+			// layout that made a reader trace a number back across the gap to find its
+			// row. It may still SHRINK (the `1`), which is what lets it truncate.
+			expect(box.style.flex).toBe("0 1 auto");
+			// Mantine's `truncate` prop, which is what actually clips the overflow.
+			expect(box.getAttribute("data-truncate")).toBe("end");
+			observed.push(`${box.style.minWidth}|${box.style.flex}|${box.getAttribute("data-truncate")}`);
 		}
 		expect(new Set(observed).size).toBe(1);
 	});
 
-	test("a long summary truncates instead of wrapping", async () => {
+	test("a long summary is capped before it ever reaches the DOM", async () => {
 		await render(summaryRow({ description: LONG_SUMMARY }));
 		const summary = summaryEl();
 		expect(summary).not.toBeNull();
-		// `minWidth: 0` is what lets the flex item shrink below its content width, which
-		// is the precondition for truncating rather than wrapping to a second line box.
-		expect(summary?.style.minWidth).toBe("0");
-		// Two independent caps apply before CSS ever clips: the SQL projection caps the
-		// stored value at 200 chars, then `getSummary` truncates a bash description to
-		// 80. So a 360-char input reaches the DOM already bounded — CSS truncation is
-		// the last line of defence, not the only one.
+		// Three independent caps apply before CSS ever clips: the SQL projection caps
+		// the stored value at 200 chars, `getSummary` truncates a bash description to
+		// 80, and the row title itself caps at 80. So a 360-char input reaches the DOM
+		// already bounded — CSS truncation is the last line of defence, not the only one.
 		const text = summary?.textContent ?? "";
 		expect(text.length).toBeLessThanOrEqual(80);
 		expect(text.length).toBeGreaterThan(0);
@@ -440,6 +497,14 @@ describe("SubagentActivityRow summary", () => {
 		await render(summaryRow());
 		expect(summaryEl()).toBeNull();
 		expect(labelBox().textContent).toBe("Bash");
+	});
+
+	test("renders the trace row's `Tool · summary` wording", async () => {
+		// The row used to print the name and the summary as two adjacent cells with no
+		// separator; a folded trace row printed `Tool · summary`. Same shape now means
+		// the same wording, or the two still read differently at different LODs.
+		await render(summaryRow({ description: "List files" }));
+		expect(labelBox().textContent).toBe("Bash · List files");
 	});
 
 	test("does not echo the tool name as its own summary", async () => {
@@ -465,9 +530,10 @@ describe("SubagentActivityRow summary", () => {
 });
 
 describe("exported slot style", () => {
-	test("is the single source of truth for the reserved glyph box", async () => {
-		// The card header reuses this object, so drift between the two call sites
-		// cannot happen silently.
+	test("the card HEADER keeps its own reserved glyph box", async () => {
+		// The header still has a status lane of its own (the card's overall state, plus a
+		// live Loader), so its 12x12 reservation survives the rows moving onto the
+		// shared trace slot. Same contract, same size — pinned so the two cannot drift.
 		expect(SUBAGENT_STATUS_SLOT_STYLE).toMatchObject({
 			width: 12,
 			height: 12,
@@ -476,30 +542,27 @@ describe("exported slot style", () => {
 		});
 	});
 
-	test("every row carries a category chip in its own fixed slot", async () => {
+	test("every row carries a category chip in the trace icon lane", async () => {
 		// The chip tells file edits from shell runs from searches at a glance. It gets a
-		// reserved box for the same reason the status glyph does — an unknown tool, which
+		// reserved box for the same reason the status glyph does: an unknown tool, which
 		// still resolves to a fallback icon, must not collapse the slot and shorten the
-		// row — but sized for the 16px chip rather than the 12px status glyph, so the
-		// chip's tinted tile is not clipped. Row height is unaffected either way: the
-		// reservation below is 24.8px, taller than both.
-		const expected = `${SUBAGENT_CATEGORY_SLOT_SIZE}px`;
+		// row. The lane is the TRACE lane (14px), not the tool header's 16px tile —
+		// which is what makes this row and a folded trace row the same mark.
+		const expected = `${TRACE_ICON_SLOT_SIZE}px`;
 		for (const toolName of ["Bash", "Read", "Write", "Grep", "Await", "TotallyUnknownTool"]) {
 			await render({ ...toolCall("success", "completed"), toolName });
 			const slot = categorySlot();
 			expect(slot.querySelector("svg")).not.toBeNull();
 			expect(slot.style.width).toBe(expected);
 			expect(slot.style.height).toBe(expected);
-			expect(slot.style.flexShrink).toBe("0");
 		}
 	});
 
-	test("the row reserves the root-font line box, not the smaller xs one", async () => {
-		// The other height tests compare against the exported constant, so they pin
-		// consistency but would follow the constant anywhere. This pins the value:
-		// rows used to be ~6px shorter after the glyph slots removed the inline-svg
-		// line box, which read as cramped. `1rem` restores the original 24.8px
-		// reservation and must not silently drift back to `--mantine-font-size-xs`.
+	test("the header lane reserves the root-font line box, not the smaller xs one", async () => {
+		// Pins the VALUE rather than just consistency: the header's lane used to move by
+		// ~8px depending on whether a glyph rendered, and `1rem` is the 24.8px
+		// reservation that keeps it still. Must not silently drift to
+		// `--mantine-font-size-xs`, which would shorten the header by ~6px.
 		expect(SUBAGENT_STATUS_ROW_MIN_HEIGHT).toBe("calc(1rem * var(--mantine-line-height))");
 	});
 });

@@ -4,6 +4,7 @@ import { IconFolderOpen } from "@tabler/icons-react";
 import { lazy, Suspense, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { Z } from "../../lib/z-index";
+import { DIRECTORY_BROWSER_MODAL_STYLES } from "./directory-browser-modal";
 import { PathInput } from "./PathInput";
 
 const DirectoryBrowser = lazy(() =>
@@ -46,15 +47,7 @@ export function PathInputWithBrowse({ placeholder, onConfirm }: PathInputWithBro
 				title={t("selectDirectory")}
 				size={isWide ? 880 : "md"}
 				zIndex={Z.modal}
-				styles={{
-					body: {
-						padding: 0,
-						maxHeight: "85vh",
-						display: "flex",
-						flexDirection: "column",
-						overflow: "hidden",
-					},
-				}}
+				styles={DIRECTORY_BROWSER_MODAL_STYLES}
 			>
 				{opened && (
 					<Suspense fallback={null}>

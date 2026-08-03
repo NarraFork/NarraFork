@@ -9,7 +9,13 @@ import {
 import { filterChildrenByToolUse, type ToolRunItem } from "./message-segments";
 import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
 import { parseReasoningSegments } from "./reasoning-segments";
-import { getCategory, getCategoryColor, getCategoryIcon, getSummary } from "./ToolCallCard";
+import {
+	getCategory,
+	getCategoryColor,
+	getCategoryIcon,
+	getSummary,
+	ToolTimingArea,
+} from "./ToolCallCard";
 import {
 	isSelectionSubagentTool,
 	reasoningTraceRowIdentity,
@@ -260,6 +266,7 @@ export const ActivityTrace = memo(function ActivityTrace({
 		const cat = getCategory(item.tc.toolName, item.tc.inputJson);
 		const Icon = getCategoryIcon(cat, item.tc.toolName);
 		const key = activityToolRowKey(item);
+		const active = toolIsActive(item.tc);
 		return {
 			key,
 			icon: <Icon size={9} />,
@@ -267,6 +274,10 @@ export const ActivityTrace = memo(function ActivityTrace({
 			title: toolTitle(item.tc),
 			body: null,
 			shimmer: key === shimmerKey,
+			// Outcome + duration, so folding to a low LOD no longer costs the reader
+			// "did it fail" and "how long did it take". Height-neutral (see the row).
+			status: item.tc.status,
+			trailing: <ToolTimingArea toolCall={item.tc} isActive={active} />,
 			identity,
 			actions,
 		};

@@ -3,6 +3,7 @@ import type {
 	PluginContributionAvailability,
 	PluginContributionRecord,
 	PluginContributionSnapshot,
+	PluginViewSurface,
 } from "./types";
 
 export type {
@@ -42,13 +43,18 @@ function readString(value: unknown): string | undefined {
  * empty list is reported as `undefined` so callers can distinguish "server said nothing"
  * from "server said no surfaces".
  */
-function readSurfaces(
-	value: unknown,
-): Array<"workspace" | "director" | "focus" | "settings"> | undefined {
+const KNOWN_VIEW_SURFACES: readonly PluginViewSurface[] = [
+	"workspace",
+	"director",
+	"focus",
+	"settings",
+	"provider-settings",
+];
+
+function readSurfaces(value: unknown): PluginViewSurface[] | undefined {
 	if (!Array.isArray(value)) return undefined;
-	const surfaces = value.filter(
-		(item): item is "workspace" | "director" | "focus" | "settings" =>
-			item === "workspace" || item === "director" || item === "focus" || item === "settings",
+	const surfaces = value.filter((item): item is PluginViewSurface =>
+		(KNOWN_VIEW_SURFACES as readonly unknown[]).includes(item),
 	);
 	return surfaces.length > 0 ? surfaces : undefined;
 }

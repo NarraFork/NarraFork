@@ -35,6 +35,7 @@ import {
 	type TraceRowCardSlot,
 	type TraceRowInteractionSlot,
 } from "./render/RenderToolRun";
+import { RenderTurnUsage } from "./render/RenderTurnUsage";
 import { RenderWebSearch } from "./render/RenderWebSearch";
 
 /**
@@ -132,6 +133,10 @@ export function resolveRenderExtra(spec: {
 			// RenderSubagent reads the prompt body via `promptText` (not `prompt`).
 			if ("prompt" in data) extra.promptText = data.prompt;
 			if ("recentCallNames" in data) extra.recentCallNames = data.recentCallNames;
+			// The recent-call summaries / categories live on the MEASURED payload (sliced
+			// to the drawn rows), so the renderer reads them there rather than through
+			// `extra` — nothing to forward here. `recentCallNames` remains an extra
+			// because the measure layer only needs the row COUNT.
 			if ("isActive" in data) extra.isActive = data.isActive;
 			if ("status" in data) extra.status = data.status;
 			break;
@@ -344,5 +349,10 @@ export function renderElement(
 			);
 		case "prune-divider":
 			return <RenderPruneDivider measured={m} data={(extra.data as never) ?? { label: "" }} />;
+		case "turn-usage":
+			// Fully self-describing: the measured payload carries the exact lines to
+			// paint (composed by the adapter from the shared usage formatter), so this
+			// kind needs no `extra` at all.
+			return <RenderTurnUsage measured={m} />;
 	}
 }

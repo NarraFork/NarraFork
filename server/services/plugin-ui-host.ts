@@ -58,6 +58,16 @@ const commandInputSchema = z
 const subscriptionInputSchema = z
 	.object({ subscriptionId: z.string().trim().min(1).max(128) })
 	.strict();
+/**
+ * Secret params from a UI surface. No `pluginId` field: the owner comes from the session.
+ *
+ * The 64KB value ceiling is a main-thread protection, not a trust boundary — the vault is a
+ * synchronous JSON read/modify/write, so an unbounded value would stall the event loop.
+ */
+const secretKeyInputSchema = z.object({ key: z.string().trim().min(1).max(256) }).strict();
+const secretEntryInputSchema = z
+	.object({ key: z.string().trim().min(1).max(256), value: z.string().max(64 * 1024) })
+	.strict();
 
 export interface PluginUiHostRequest {
 	session: PluginUiSession;
@@ -76,10 +86,58 @@ export interface PluginUiHostOptions {
 	storageFactory?: PluginStorageFactoryLike;
 	/** Own non-secret config for `config.get`; secret fields must already be stripped. */
 	providerConfigReader?: (pluginId: string) => Promise<JsonValue> | JsonValue;
-	/** Secret key names for `secrets.list`. Values are never exposed to a UI surface. */
+	/** Secret key names for `secrets.list`, without values. */
 	secretKeyLister?: (pluginId: string) => Promise<readonly string[]> | readonly string[];
+	/**
+	 * Read/write/delete for the calling plugin's own secrets, from a UI surface.
+	 *
+	 * `pluginId` is taken from the session, never from the request. Writes and deletes are
+	 * open to any authenticated session (they never echo a value back); reading plaintext
+	 * via `secrets.get` additionally requires an admin session, because a UI session is not
+	 * an admin session and the host's own credential paths never disclose plaintext to a
+	 * non-admin. See `secretsGet`.
+	 */
+	secretReader?: (
+		pluginId: string,
+		key: string,
+	) => Promise<string | undefined> | string | undefined;
+	secretWriter?: (pluginId: string, key: string, value: string) => Promise<void> | void;
+	secretDeleter?: (pluginId: string, key: string) => Promise<boolean> | boolean;
+	/**
+	 * Dispatch for commands a plugin declared with `handler: "server"`.
+	 *
+	 * Consulted only when the host's own `CommandRegistry` has no entry for the id, so a
+	 * plugin cannot shadow a host command. Omitting it disables plugin-backed commands
+	 * entirely, which is the pre-`commands.invoke` behaviour.
+	 */
+	pluginCommands?: PluginCommandDispatcher;
 	now?: () => Date;
 	timeoutMs?: number;
+}
+
+/**
+ * The command-dispatch surface the UI host needs.
+ *
+ * Narrower than `PluginCommandRegistry` on purpose: this host must not be able to register
+ * or remove commands, only ask whether one exists and invoke it.
+ *
+ * Note `invoke` returns *only* `output`. Any `secretWrites` a command requested are
+ * validated and applied by the dispatcher before it returns, so secret material never
+ * reaches this class and therefore cannot be forwarded to an iframe even by mistake.
+ */
+export interface PluginCommandDispatcher {
+	has(commandId: string, pluginId: string): boolean;
+	invoke(
+		commandId: string,
+		pluginId: string,
+		input: JsonValue | undefined,
+		context: {
+			requestId: string;
+			correlationId?: string;
+			idempotencyKey?: string;
+			signal?: AbortSignal;
+		},
+	): Promise<{ output: JsonValue | undefined }>;
 }
 
 export class PluginUiHostError extends Error {
@@ -114,6 +172,18 @@ export class PluginUiHostError extends Error {
 		this.code = code;
 		this.retryable = options.retryable;
 	}
+}
+
+function secretKeyFromParams(params: unknown): string {
+	const parsed = secretKeyInputSchema.safeParse(params);
+	if (!parsed.success) throw new PluginUiHostError("INVALID_PARAMS", "Invalid secret parameters");
+	return parsed.data.key;
+}
+
+function secretEntryFromParams(params: unknown): { key: string; value: string } {
+	const parsed = secretEntryInputSchema.safeParse(params);
+	if (!parsed.success) throw new PluginUiHostError("INVALID_PARAMS", "Invalid secret parameters");
+	return parsed.data;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -240,6 +310,10 @@ export class PluginUiHost {
 	private readonly publicApi?: PluginPublicApi;
 	private readonly providerConfigReader?: PluginUiHostOptions["providerConfigReader"];
 	private readonly secretKeyLister?: PluginUiHostOptions["secretKeyLister"];
+	private readonly secretReader?: PluginUiHostOptions["secretReader"];
+	private readonly secretWriter?: PluginUiHostOptions["secretWriter"];
+	private readonly secretDeleter?: PluginUiHostOptions["secretDeleter"];
+	private readonly pluginCommands?: PluginCommandDispatcher;
 	private readonly capabilityBroker: Pick<CapabilityBroker, "authorize"> &
 		Partial<Pick<CapabilityBroker, "withCallContext">>;
 	private readonly eventGateway: Pick<PluginEventGateway, "subscribe" | "unsubscribe" | "poll"> &
@@ -255,6 +329,10 @@ export class PluginUiHost {
 		this.capabilityBroker = options.capabilityBroker ?? defaultCapabilityBroker;
 		this.providerConfigReader = options.providerConfigReader;
 		this.secretKeyLister = options.secretKeyLister;
+		this.secretReader = options.secretReader;
+		this.secretWriter = options.secretWriter;
+		this.secretDeleter = options.secretDeleter;
+		this.pluginCommands = options.pluginCommands;
 		this.eventGateway = options.eventGateway ?? pluginEventGateway;
 		this.storageFactory = options.storageFactory ?? pluginStorageFactory;
 		this.now = options.now ?? (() => new Date());
@@ -340,7 +418,7 @@ export class PluginUiHost {
 			case "queries.execute":
 				return this.query(context, input.request.params, input.signal, fence);
 			case "commands.execute":
-				return this.command(context, input.request.params, input.signal, fence);
+				return this.command(context, input.request.params, input.signal, fence, input.session);
 			case "events.subscribe":
 				return this.subscribeEvents(context, input, fence);
 			case "events.unsubscribe":
@@ -359,6 +437,12 @@ export class PluginUiHost {
 				return this.configGet(context, input);
 			case "secrets.list":
 				return this.secretsList(context, input);
+			case "secrets.get":
+				return this.secretsGet(context, input);
+			case "secrets.set":
+				return this.secretsSet(context, input);
+			case "secrets.delete":
+				return this.secretsDelete(context, input);
 			case "diagnostics.getOwn":
 				return this.diagnostics(context, input);
 			case "context.get":
@@ -500,12 +584,26 @@ export class PluginUiHost {
 		raw: unknown,
 		signal: AbortSignal | undefined,
 		fence: PluginUiSessionRequestFence,
+		session?: PluginUiHostRequest["session"],
 	): Promise<JsonValue> {
-		if (!this.publicApi)
-			throw new PluginUiHostError("HOST_UNAVAILABLE", "Plugin command API is unavailable");
 		const parsed = commandInputSchema.safeParse(raw);
 		if (!parsed.success)
 			throw new PluginUiHostError("INVALID_PARAMS", "Invalid command parameters");
+
+		// A command the *host* registered always wins. Plugin-declared commands are a
+		// fallback so a plugin cannot shadow host behaviour by choosing a colliding id.
+		const hostHandles = this.publicApi?.commands?.has?.(parsed.data.commandId) === true;
+		if (
+			!hostHandles &&
+			session &&
+			this.pluginCommands?.has(parsed.data.commandId, session.pluginId)
+		) {
+			this.beginUncancellableCommit(fence);
+			return this.invokePluginCommand(parsed.data, session, signal ?? fence.controller.signal);
+		}
+
+		if (!this.publicApi)
+			throw new PluginUiHostError("HOST_UNAVAILABLE", "Plugin command API is unavailable");
 		this.beginUncancellableCommit(fence);
 		const command = this.publicApi.command as unknown as (
 			context: HostCallContext,
@@ -528,6 +626,57 @@ export class PluginUiHost {
 		} catch (error) {
 			if (fence.controller.signal.aborted) this.assertSessionRequestActive(fence);
 			throw error;
+		}
+	}
+
+	/**
+	 * Run a plugin-declared command.
+	 *
+	 * The result is deliberately reduced to `{ output }`: the dispatcher has already applied
+	 * any `secretWrites`, and passing them further would put credential material on a path
+	 * that ends at an iframe.
+	 */
+	private async invokePluginCommand(
+		request: { commandId: string; input?: JsonValue; idempotencyKey?: string },
+		session: PluginUiHostRequest["session"],
+		signal: AbortSignal,
+	): Promise<JsonValue> {
+		if (!this.pluginCommands)
+			throw new PluginUiHostError("HOST_UNAVAILABLE", "Plugin command dispatch is unavailable");
+		try {
+			const result = await this.pluginCommands.invoke(
+				request.commandId,
+				session.pluginId,
+				request.input,
+				{
+					requestId: session.sessionId,
+					...(request.idempotencyKey ? { idempotencyKey: request.idempotencyKey } : {}),
+					signal,
+				},
+			);
+			return { status: "succeeded", output: result.output ?? null } as JsonValue;
+		} catch (error) {
+			const code = (error as { code?: string }).code;
+			const message = error instanceof Error ? error.message : "Plugin command failed";
+			// Map the registry's vocabulary onto the UI host's, so an iframe sees the same
+			// error shape regardless of which side handled the command.
+			switch (code) {
+				case "METHOD_NOT_FOUND":
+					throw new PluginUiHostError("METHOD_NOT_FOUND", message);
+				case "PERMISSION_DENIED":
+					throw new PluginUiHostError("PERMISSION_DENIED", message);
+				case "OUTPUT_LIMIT":
+					throw new PluginUiHostError("PAYLOAD_TOO_LARGE", message);
+				case "INVALID_PARAMS":
+				case "INVALID_RESPONSE":
+					throw new PluginUiHostError("INVALID_PARAMS", message);
+				case "HOST_UNAVAILABLE":
+					throw new PluginUiHostError("HOST_UNAVAILABLE", message);
+				default:
+					// Includes the registry's `INVALID_STATE` (a `handler: "ui"` command has no
+					// backend), which is a caller mistake rather than a host fault.
+					throw new PluginUiHostError("INVALID_PARAMS", message);
+			}
 		}
 	}
 
@@ -740,6 +889,89 @@ export class PluginUiHost {
 		if (!this.secretKeyLister) return { secrets: [] };
 		const keys = await this.secretKeyLister(context.plugin.pluginId);
 		return { secrets: keys.map((key) => ({ key, configured: true })) };
+	}
+
+	/**
+	 * Authorize a secret operation for the calling view.
+	 *
+	 * Shared by get/set/delete so all three fail the same way, and so the plugin identity
+	 * used for storage is unambiguously the one the broker just validated.
+	 */
+	private async authorizeSecret(
+		context: HostCallContext,
+		input: PluginUiHostRequest,
+		methodId: string,
+	): Promise<void> {
+		const decision = await this.capabilityBroker.authorize({
+			context,
+			capability: "secret.use_self",
+			methodId,
+			requestBytes: jsonBytes(input.request),
+			responseBytes: 0,
+		});
+		if (!decision.allowed) {
+			throw new PluginUiHostError(
+				decision.error?.code === "PLUGIN_DISABLED" ? "PLUGIN_DISABLED" : "PERMISSION_DENIED",
+				"Plugin secret access denied",
+			);
+		}
+	}
+
+	/**
+	 * Return a secret value in the clear — **admin sessions only**.
+	 *
+	 * `secret.use_self` establishes that the *plugin* may touch its own vault; it says
+	 * nothing about which *user* is driving the iframe. UI sessions are created behind
+	 * `requireSessionAuth` (`routes/plugin-ui.ts`), which admits ordinary users, so
+	 * authorizing on the capability alone let a non-admin read credential plaintext that
+	 * the host's own provider-config path never echoes back (it substitutes
+	 * `SECRET_PLACEHOLDER` and is admin-gated). That made the plugin surface a way around
+	 * the user/admin boundary for the same credentials.
+	 *
+	 * The role check is therefore about the caller, not the plugin, and is applied only to
+	 * the one method that discloses plaintext. `secrets.list` (names and a configured flag)
+	 * and `set`/`delete` (which never echo a value) keep their existing access, so a
+	 * non-admin settings view can still see what is configured and replace it.
+	 */
+	private async secretsGet(
+		context: HostCallContext,
+		input: PluginUiHostRequest,
+	): Promise<JsonValue> {
+		await this.authorizeSecret(context, input, "secrets.get");
+		if (context.invocation.userRole !== "admin") {
+			throw new PluginUiHostError(
+				"PERMISSION_DENIED",
+				"Reading a secret value requires an administrator session",
+			);
+		}
+		const key = secretKeyFromParams(input.request.params);
+		if (!this.secretReader) return { key, value: null };
+		const value = await this.secretReader(context.plugin.pluginId, key);
+		return { key, value: value ?? null };
+	}
+
+	private async secretsSet(
+		context: HostCallContext,
+		input: PluginUiHostRequest,
+	): Promise<JsonValue> {
+		await this.authorizeSecret(context, input, "secrets.set");
+		const { key, value } = secretEntryFromParams(input.request.params);
+		if (!this.secretWriter) {
+			throw new PluginUiHostError("HOST_UNAVAILABLE", "Secret storage is unavailable");
+		}
+		await this.secretWriter(context.plugin.pluginId, key, value);
+		return { key, stored: true };
+	}
+
+	private async secretsDelete(
+		context: HostCallContext,
+		input: PluginUiHostRequest,
+	): Promise<JsonValue> {
+		await this.authorizeSecret(context, input, "secrets.delete");
+		const key = secretKeyFromParams(input.request.params);
+		if (!this.secretDeleter) return { key, deleted: false };
+		const deleted = await this.secretDeleter(context.plugin.pluginId, key);
+		return { key, deleted };
 	}
 
 	private async diagnostics(

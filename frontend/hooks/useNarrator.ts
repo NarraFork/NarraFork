@@ -134,6 +134,21 @@ export function useRollbackPreview(
 	});
 }
 
+/** What deleting one tool_use block would roll back, for its confirm dialog. */
+export function useBlockDeletePreview(
+	narratorId: string,
+	messageId: string | null,
+	blockIndex: number | null,
+	enabled = false,
+) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "block-delete-preview", messageId, blockIndex],
+		queryFn: () => api.blockDeletePreview(narratorId, messageId as string, blockIndex as number),
+		enabled: enabled && !!messageId && blockIndex != null,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
+	});
+}
+
 export function usePermissionFilePreview(
 	narratorId: string,
 	toolUseId: string | null,
@@ -320,7 +335,7 @@ export function useCreateNarrator() {
 			systemPrompt?: string;
 			permissionMode?: string;
 			reasoningEffort?: string | null;
-			fastMode?: boolean;
+			fastModeOverride?: "inherit" | "on" | "off";
 			relaxedPlan?: boolean;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
@@ -328,21 +343,12 @@ export function useCreateNarrator() {
 			makeNamed?: boolean;
 			handle?: string;
 			kind?: "knowledge";
-		}) => {
-			let shouldUseLegacyFastModeDefault = false;
-			try {
-				shouldUseLegacyFastModeDefault =
-					localStorage.getItem("narrafork_fast_mode_default") === "true";
-			} catch {
-				// Ignore localStorage access failures.
-			}
-
-			return api.createNarrator(
-				data.fastMode === undefined && shouldUseLegacyFastModeDefault
-					? { ...data, fastMode: true }
-					: data,
-			);
-		},
+		}) =>
+			// No fast-mode default is injected here: new narrators keep the "inherit"
+			// override and the server resolves it against the user's fastModeDefault
+			// on every turn. AppRootLayout migrates the legacy localStorage flag into
+			// that preference.
+			api.createNarrator(data),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},
@@ -679,8 +685,13 @@ export function useUpdateReasoningEffort() {
 export function useUpdateFastMode() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({ id, fastMode }: { id: string; fastMode: boolean }) =>
-			api.updateNarratorFastMode(id, fastMode),
+		mutationFn: ({
+			id,
+			fastModeOverride,
+		}: {
+			id: string;
+			fastModeOverride: "inherit" | "on" | "off";
+		}) => api.updateNarratorFastMode(id, fastModeOverride),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},

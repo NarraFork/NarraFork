@@ -75,6 +75,9 @@ export interface UsePretextDocumentOptions {
 	/** Authoritative header summary (tool-display.getSummary), so truncated inputs
 	 * still show their target path / command in the collapsed header. */
 	resolveToolSummary?: (tc: unknown) => string;
+	/** Label detail for a subagent recent-call row (tool name + projected input keys),
+	 * so the vlist row says the same thing the chunked one does. */
+	resolveSubagentRecentSummary?: (toolName: string, inputSummary: unknown) => string | null;
 	/** Resolve a tool item's pending-permission presence (live WS list). Its
 	 * reference changes when the pending set changes, so folding it into
 	 * buildOptions triggers a document rebuild (cards expand / collapse). */
@@ -89,6 +92,16 @@ export interface UsePretextDocumentOptions {
 	 * so folding it into buildOptions rebuilds the document as a gate progresses.
 	 */
 	resolvePendingPermissionSuggestions?: (toolUseId: string | undefined) => unknown[] | undefined;
+	/**
+	 * Reader enabled per-turn token usage rows. Toggling it changes the item COUNT
+	 * (the adapter emits no usage spec when disabled), so it needs no cache-key
+	 * revision of its own — the rebuild it triggers is already structural.
+	 */
+	showTokenUsage?: boolean;
+	/** Phone-sized viewport → the trailing usage summary splits across two lines. */
+	compactUsageLines?: boolean;
+	/** Locale-aware number grouping for the usage rows. */
+	formatUsageNumber?: (value: number) => string;
 	scrollTop: number;
 	pinnedToBottom: boolean;
 	/** Synchronous live view used when a layout rebuild captures its scroll anchor. */
@@ -237,14 +250,24 @@ export function usePretextDocument(
 			resolveToolCategory: options.resolveToolCategory,
 			resolveToolColor: options.resolveToolColor,
 			resolveToolSummary: options.resolveToolSummary,
+			resolveSubagentRecentSummary: options.resolveSubagentRecentSummary,
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
 			resolvePendingPlan: options.resolvePendingPlan,
 			resolveFullToolInput: options.resolveFullToolInput,
 			resolveFullToolOutput: options.resolveFullToolOutput,
 			resolvePendingPermissionSuggestions: options.resolvePendingPermissionSuggestions,
+			showTokenUsage: options.showTokenUsage,
+			compactUsageLines: options.compactUsageLines,
+			formatUsageNumber: options.formatUsageNumber,
 		}),
 		[
 			options.bottomPadding,
+			// Both usage inputs change the emitted item list, so a rebuild is required
+			// (not merely a re-measure) when the reader flips the preference or rotates
+			// a phone across the breakpoint.
+			options.showTokenUsage,
+			options.compactUsageLines,
+			options.formatUsageNumber,
 			options.contentWidth,
 			options.expandedRows,
 			options.gap,
@@ -260,6 +283,7 @@ export function usePretextDocument(
 			options.resolveToolCategory,
 			options.resolveToolColor,
 			options.resolveToolSummary,
+			options.resolveSubagentRecentSummary,
 			// Rebuild when the pending-permission set changes (its reference changes
 			// with the set), so cards expand/collapse as permissions come and go.
 			options.resolveHasPendingPermission,

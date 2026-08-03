@@ -45,6 +45,7 @@ import {
 	measureToolRunCountLine,
 	measureToolRunSummary,
 } from "./measure/measure-tool-run";
+import { measureTurnUsage } from "./measure/measure-turn-usage";
 import { measureWebSearch } from "./measure/measure-web-search";
 import { buildCacheKey, extractDataRevision, isStreamingKey, measureCache } from "./measure-cache";
 import type { MeasuredElement, RenderLod } from "./prepared-block";
@@ -242,6 +243,12 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		label: "Prune divider",
 		lodSensitive: false,
 		measure: (_d, w) => measurePruneDivider(w),
+	},
+	"turn-usage": {
+		kind: "turn-usage",
+		label: "Turn token/cost usage line",
+		lodSensitive: false,
+		measure: (d, w, l) => measureTurnUsage(d as AnyData, w, l),
 	},
 };
 

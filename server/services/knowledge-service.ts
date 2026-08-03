@@ -362,6 +362,28 @@ async function transferCollectionOwner(
 const LIST_MAX_LIMIT = 200;
 const LIST_DEFAULT_LIMIT = 100;
 
+/** The only entry columns the dual-axis read gate needs (see `toAclEntry`). Narrower than
+ *  ENTRY_LIST_COLUMNS: ACL filtering never renders a row, it only decides visibility, so it
+ *  must not pull title/slug — let alone the currentContent blob — off disk for every
+ *  candidate. Used by `filterReadable`, which every list and search response passes through. */
+const ENTRY_ACL_COLUMNS = {
+	id: true,
+	collectionId: true,
+	ownerUserId: true,
+	classificationLevel: true,
+	controlledTagsJson: true,
+	reviewTagsJson: true,
+} as const;
+
+/** The only collection columns the collection gate needs (see `toAclCollection`). */
+const COLLECTION_ACL_COLUMNS = {
+	id: true,
+	defaultLevel: true,
+	classificationLevel: true,
+	controlledTagsJson: true,
+	ownerUserId: true,
+} as const;
+
 /** Columns safe to return in list views — explicitly EXCLUDES the large
  *  currentContent / metadataJson blobs so they're never read off disk in bulk. */
 const ENTRY_LIST_COLUMNS = {
@@ -1241,11 +1263,15 @@ async function filterReadable<T extends { id: string; collectionId?: string }>(
 	if (ids.length === 0) return rows;
 	const entries = await db.query.knowledgeEntries.findMany({
 		where: (e, { inArray }) => inArray(e.id, ids),
+		// ACL-only projection: this runs on every list/search response, so it must not read
+		// the currentContent blob (or any render field) just to decide visibility.
+		columns: ENTRY_ACL_COLUMNS,
 	});
 	const entryById = new Map(entries.map((e) => [e.id, e]));
 	const colIds = [...new Set(entries.map((e) => e.collectionId))];
 	const cols = await db.query.knowledgeCollections.findMany({
 		where: (c, { inArray }) => inArray(c.id, colIds),
+		columns: COLLECTION_ACL_COLUMNS,
 	});
 	// Cache the FULL collection row (not just defaultLevel) so the collection gate
 	// in canRead has classificationLevel / controlledTags / owner — otherwise the

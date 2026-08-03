@@ -39,7 +39,7 @@ import {
 } from "./cross-chunk-activity";
 import { DetachFromBottomProvider } from "./DetachFromBottomCtx";
 import { ManualOlderHistoryLoad } from "./ManualOlderHistoryLoad";
-import { renderTreeMessages } from "./MessageRenderer";
+import { type RenderTreeResolvePermFn, renderTreeMessages } from "./MessageRenderer";
 import {
 	type BlockMeta,
 	type CollectedSelectedText,
@@ -104,7 +104,12 @@ const ITEM_GAP = 12;
 const CONTENT_PADDING_X = "var(--mantine-spacing-md)";
 const CONTENT_PADDING = `var(--mantine-spacing-md) ${CONTENT_PADDING_X} 0`;
 
-type ResolvePermFn = NonNullable<Parameters<typeof renderTreeMessages>[21]>;
+/**
+ * Named import rather than a positional `Parameters<...>[n]` lookup: that index
+ * silently re-points at a different parameter whenever the (28-argument) render
+ * signature changes, which is how it once started describing `onAskInPassing`.
+ */
+type ResolvePermFn = RenderTreeResolvePermFn;
 type ExternalScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) => void);
 interface FollowTailOptions {
 	force?: boolean;
@@ -574,7 +579,6 @@ interface MountedChunkProps {
 	hasChapter?: boolean;
 	onForkFromMessage?: (messageId: string) => void;
 	highlightedId?: string | null;
-	expandedToolUseId?: string | null;
 	showTokenUsage?: boolean;
 	pruneBoundaryMessageId?: string | null;
 	pruneDividerLabel?: string;
@@ -624,7 +628,6 @@ const MountedChunk = memo(function MountedChunk({
 	hasChapter,
 	onForkFromMessage,
 	highlightedId,
-	expandedToolUseId,
 	showTokenUsage,
 	pruneBoundaryMessageId,
 	pruneDividerLabel,
@@ -670,7 +673,6 @@ const MountedChunk = memo(function MountedChunk({
 				onForkFromMessage,
 				highlightedId ?? null,
 				permCbRef.current,
-				expandedToolUseId,
 				showTokenUsage,
 				pruneBoundaryMessageId,
 				pruneDividerLabel,
@@ -704,7 +706,6 @@ const MountedChunk = memo(function MountedChunk({
 			onForkFromMessage,
 			highlightedId,
 			permKey,
-			expandedToolUseId,
 			showTokenUsage,
 			pruneBoundaryMessageId,
 			pruneDividerLabel,
@@ -775,7 +776,6 @@ interface ChunkedMessageListProps {
 	highlightedId?: string | null;
 	highlightMessageId?: string;
 	onHighlightTarget?: (id: string, delayMs: number) => void;
-	expandedToolUseId?: string | null;
 	showTokenUsage?: boolean;
 	pruneBoundaryMessageId?: string | null;
 	pruneDividerLabel?: string;
@@ -848,7 +848,6 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			highlightedId,
 			highlightMessageId,
 			onHighlightTarget,
-			expandedToolUseId,
 			showTokenUsage,
 			pruneBoundaryMessageId,
 			pruneDividerLabel,
@@ -2285,7 +2284,6 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 											hasChapter={hasChapter}
 											onForkFromMessage={onForkFromMessage}
 											highlightedId={highlightedId}
-											expandedToolUseId={expandedToolUseId}
 											showTokenUsage={showTokenUsage}
 											pruneBoundaryMessageId={pruneBoundaryMessageId}
 											pruneDividerLabel={pruneDividerLabel}
@@ -2328,7 +2326,6 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 										hasChapter={hasChapter}
 										onForkFromMessage={onForkFromMessage}
 										highlightedId={highlightedId}
-										expandedToolUseId={expandedToolUseId}
 										showTokenUsage={showTokenUsage}
 										pruneBoundaryMessageId={pruneBoundaryMessageId}
 										pruneDividerLabel={pruneDividerLabel}

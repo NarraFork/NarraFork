@@ -19,10 +19,7 @@ import {
 	readLeafText,
 	stringifyForDisplay,
 } from "@shared/pretext-layout/tool-io-projection";
-import {
-	hasSubagentToolInputSummary,
-	subagentSummaryToPartialInput,
-} from "@shared/subagent-tool-summary";
+import { isTerminalToolRowStatus } from "@shared/tool-row-status";
 import {
 	IconArrowBackUp,
 	IconChevronDown,
@@ -46,6 +43,15 @@ import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { api, type SubagentToolCallHeader, type SubagentToolInputSummary } from "../../lib/api";
 import { Z } from "../../lib/z-index";
 import type { PendingPermission } from "../../types/narrator";
+import {
+	TRACE_ROW_GAP,
+	TRACE_ROW_LINE_HEIGHT,
+	TRACE_ROW_MIN_HEIGHT,
+	TraceChevronSlot,
+	TraceIconSlot,
+	TraceRowDot,
+	TraceStatusSlot,
+} from "./CollapsibleTrace";
 import { CompactMenuSub } from "./CompactMenuSub";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
@@ -66,14 +72,15 @@ import { useRenderLod } from "./RenderLodCtx";
 import type { ToolCallData as BaseToolCallData } from "./ToolCallCard";
 import {
 	getCategory,
+	getCategoryColor,
+	getCategoryIcon,
 	InlinePermission,
 	STATUS_COLORS,
 	StatusIcon,
 	ToolCallCard,
-	ToolCategoryChip,
 	ToolTimingArea,
 } from "./ToolCallCard";
-import { getSummary } from "./tool-display";
+import { subagentRecentCallSummary, traceRowTitle } from "./tool-display";
 
 /**
  * `ToolCallData` plus the activity-row-only summary projection.
@@ -90,24 +97,27 @@ type ToolCallData = BaseToolCallData & {
 };
 
 /**
- * Fixed slot for the decorative status glyph (12×12 — `StatusIcon` and `Loader`
+ * Fixed slot for the card HEADER's status glyph (12×12 — `StatusIcon` and `Loader`
  * both render at size={12}).
  *
- * Two independent effects used to make every glyph-bearing row change height:
+ * Two independent effects used to make every glyph-bearing lane change height:
  *
  *  1. `StatusIcon` returns `null` for any status outside its known set (`""` and
  *     whatever a provider sends next), so an auto-sized wrapper collapsed to 0×0.
- *     `streaming` used to land here too — the row's very FIRST status rendering as
- *     an empty slot, fixed by folding it into the spinner branch — so the slot has
- *     to stay height-neutral for the unknown-status case that remains.
+ *     `streaming` used to land here too — the very FIRST status rendering as an
+ *     empty slot, fixed by folding it into the spinner branch — so the slot has to
+ *     stay height-neutral for the unknown-status case that remains.
  *  2. When it DID render, the wrapper was a block box holding an inline `<svg>`,
  *     so its line box came from the ROOT font size (16 × 1.55 = 24.8px), not
- *     from the 12px glyph — inflating the row by ~8px rather than fitting it.
+ *     from the 12px glyph — inflating the lane by ~8px rather than fitting it.
  *
  * A tool call walks `streaming → running → success` during its lifetime, so the
- * row visibly jumped between heights on every transition. Sizing the slot
+ * header visibly jumped between heights on every transition. Sizing the slot
  * explicitly and laying it out as flex makes the glyph height-neutral in both
  * directions; `flexShrink: 0` keeps the label from eating the reservation.
+ *
+ * The activity ROWS use `CollapsibleTrace`'s {@link TraceStatusSlot}, which is the
+ * same contract at the same size — one definition per render path.
  */
 const STATUS_SLOT_SIZE = 12;
 export const SUBAGENT_STATUS_SLOT_STYLE = {
@@ -120,67 +130,49 @@ export const SUBAGENT_STATUS_SLOT_STYLE = {
 } as const satisfies CSSProperties;
 
 /**
- * Fixed slot for the CATEGORY chip. Same reservation contract as the status slot
- * above, at the chip's own size: {@link ToolCategoryChip} is a 16×16 tinted tile
- * (the tool card's header lane), not a 12px glyph, so reusing the status slot's
- * 12×12 box would clip the tile's tinted edge.
+ * Glyph size inside a trace row's 14px category chip.
+ *
+ * Matches what `ActivityTrace` / `ToolRunSummary` pass (`<Icon size={9} />`): the
+ * inset is what makes the tint read as a chip rather than a box drawn tight around
+ * the icon.
  */
-export const SUBAGENT_CATEGORY_SLOT_SIZE = 16;
-export const SUBAGENT_CATEGORY_SLOT_STYLE = {
-	width: SUBAGENT_CATEGORY_SLOT_SIZE,
-	height: SUBAGENT_CATEGORY_SLOT_SIZE,
-	flexShrink: 0,
-	display: "flex",
-	alignItems: "center",
-	justifyContent: "center",
-} as const satisfies CSSProperties;
+const TRACE_ROW_GLYPH_SIZE = 9;
 
 /**
- * Category chip for an activity row — the SAME mark the tool card's header shows.
+ * Category chip for an activity row — the SAME mark a folded trace row shows.
  *
- * This used to be a bare `<Icon>` that inherited the row's dimmed text colour, so
- * the identical tool rendered as a grey outline here and as a category-tinted
- * tile on its own card. It now renders {@link ToolCategoryChip}, the shared
- * definition, so glyph, size, tint, and radius cannot drift between the two.
+ * The row is now assembled from {@link TraceIconSlot}, so the chip is the trace
+ * lane's 14px tinted `ThemeIcon` around a 9px glyph rather than the tool card
+ * header's 16px tile. That is deliberate: the activity row and the low-LOD trace
+ * row are one shape, and the chip has to come from the same definition or the two
+ * drift the way this row's earlier bare grey `<Icon>` did.
  *
  * `getCategory` takes an optional input so it can reclassify spec-task file writes;
  * the activity row carries no full input, so the category comes from the tool name
  * alone. Only spec-tasks reclassifies on input, so every other tool is unaffected.
  */
-function CategoryGlyph({ toolName }: { toolName: string }) {
-	return (
-		<ToolCategoryChip
-			category={getCategory(toolName)}
-			toolName={toolName}
-			data-testid="subagent-activity-category-chip"
-		/>
-	);
+function categoryGlyph(toolName: string) {
+	const Icon = getCategoryIcon(getCategory(toolName), toolName);
+	return <Icon size={TRACE_ROW_GLYPH_SIZE} data-testid="subagent-activity-category-chip" />;
 }
 
 /**
- * Height reservation for rows that combine status/category glyphs, a label and
- * `ToolTimingArea`.
+ * Height reservation for the card HEADER's status / timing lane.
  *
- * Three different line boxes meet in this row: the timing text at line-height
- * 1.55 (18.6px at `xs`), the label at Mantine's 1.4 (16.8px), and — before the
- * glyphs were moved into fixed-size flex slots — an inline `<svg>` whose line
- * box came from the *root* font size, 16 × 1.55 = 24.8px. The row moved by
- * ~1.8px when the timer appeared and by ~8px depending on whether a glyph
- * rendered at all.
- *
- * The slots pinned the glyph contribution, but pinning it to the *smallest* of
- * the three also made every row ~6px shorter than it used to be, which read as
- * cramped. This reserves the original 24.8px line box instead: rows keep their
- * familiar height and still cannot move, because every cell inside is either a
- * fixed-size slot or a single truncating line.
+ * Three different line boxes meet there: the timing text at line-height 1.55
+ * (18.6px at `xs`), the badges at Mantine's 1.4 (16.8px), and — for a status glyph
+ * outside a fixed-size slot — an inline `<svg>` whose line box comes from the
+ * *root* font size, 16 × 1.55 = 24.8px. Reserving that largest box keeps the
+ * header from moving by ~1.8px when the timer appears or by ~8px depending on
+ * whether a glyph renders at all.
  *
  * Derived from the root font size rather than hard-coded so it tracks the user's
  * font scale, and expressed as `min-height` so content that legitimately grows
  * (a wrapped badge row) still grows instead of being clipped.
  *
- * The 16px category chip still fits inside the 24.8px reservation, so adopting
- * the tool card's chip did not change the row's height — the reservation, not
- * the tallest cell, is what sets it.
+ * The activity ROWS no longer use this: they are trace rows now and follow
+ * {@link TRACE_ROW_MIN_HEIGHT} (18px), which is what makes them the same shape as
+ * a folded trace row.
  */
 export const SUBAGENT_STATUS_ROW_MIN_HEIGHT = "calc(1rem * var(--mantine-line-height))";
 
@@ -240,10 +232,17 @@ function stripSubagentId(text: string): string {
 	return text.replace(SUBAGENT_ID_RE, "").trim();
 }
 
+/**
+ * Whether a tool status means "no longer running".
+ *
+ * Delegates to `@shared/tool-row-status`, which the folded trace rows and the vlist
+ * copies also read — this used to be a local regex listing the same spellings, i.e.
+ * a third definition of one rule. NOTE the deliberate difference from the empty
+ * string: the shared helper treats `""`/absent as terminal (a historical row must
+ * not spin forever), which is what the old regex did too.
+ */
 function isTerminalToolStatus(status: string | undefined): boolean {
-	return /^(success|completed|denied|error|fail|failed|cancelled|canceled|aborted|timeout)$/.test(
-		status ?? "",
-	);
+	return isTerminalToolRowStatus(status);
 }
 
 function parseOutputJson(output: unknown): string {
@@ -276,46 +275,47 @@ function parseOutputJson(output: unknown): string {
 }
 
 /**
- * Row label detail for one recent call: `Bash` → its `description`, `Read` →
- * the file's basename, `Await` → `type: id`.
+ * Row label detail for one recent call.
  *
- * Formatting is delegated to `getSummary`, the SAME formatter the expanded tool
- * card uses, so a row and its card cannot word the same call differently. It is
- * fed a PARTIAL input rebuilt from the whitelisted keys the server projected;
- * verified to degrade cleanly (a `Read` carrying only `file_path` yields
- * `component.tsx`, with no phantom line range).
- *
- * Returns null when there is nothing extra to say, which is what keeps the row
- * from reading `Bash · Bash`. `getSummary` answers with a placeholder rather than
- * an empty string for an input it cannot label (`Bash` → "Bash", `Await` →
- * "task: unknown"), so a summary equal to the tool name — or to that Await
- * placeholder — is treated as "no detail".
+ * Thin wrapper over the shared {@link subagentRecentCallSummary} (which lives
+ * beside `getSummary` so the vlist path can reach the same formatter). Kept as an
+ * export because it is the row's own vocabulary and several tests drive it
+ * directly.
  */
 export function subagentActivitySummaryText(call: ToolCallData): string | null {
-	const summary = call._inputSummary;
-	if (!hasSubagentToolInputSummary(summary)) return null;
-	const text = getSummary(call.toolName, subagentSummaryToPartialInput(summary)).trim();
-	if (!text || text === call.toolName) return null;
-	// `Await` with no usable id degrades to this literal; it carries no information
-	// beyond the tool name already shown.
-	if (text === "task: unknown") return null;
-	return text;
+	return subagentRecentCallSummary(call.toolName, call._inputSummary);
+}
+
+/** `Tool · summary` for one recent call — the SAME title a folded trace row shows. */
+export function subagentActivityRowTitle(call: ToolCallData): string {
+	return traceRowTitle(call.toolName, subagentActivitySummaryText(call));
 }
 
 /**
- * One "recent calls" row: status glyph + tool name + optional summary + timing.
+ * One "recent calls" row, drawn as a TRACE ROW: dot + category chip + a single
+ * `Tool · summary` line + status glyph + timing.
+ *
+ * WHY IT IS A TRACE ROW
+ * This used to be a tinted 28px button, so the same tool call looked like two
+ * different things depending on the render level — a chunky card row inside a
+ * subagent card, a slim trace line once the reader dropped to a low LOD. The row
+ * is now assembled from `CollapsibleTrace`'s exported slots
+ * ({@link TraceChevronSlot} / {@link TraceIconSlot} / {@link TraceStatusSlot}) and
+ * its 18px reservation, so "same shape" is enforced by shared definitions rather
+ * than by two layouts that happen to agree.
+ *
+ * The dot (not a chevron) is correct here: an activity row has nothing to expand —
+ * clicking it opens the child session.
  *
  * The label is available on a call's FIRST appearance, whether it arrived by REST
  * fetch, reconnect catch-up, or a live `tool_started` / `tool_use_chunk` frame —
- * all three now carry the same projected summary, so a row no longer starts as a
- * bare tool name and acquires its detail only on the next page load.
+ * all three carry the same projected summary, so a row no longer starts as a bare
+ * tool name and acquires its detail only on the next page load.
  *
- * Extracted so the row has a single definition that tests and the layout probe
- * can render directly. Its height must not depend on the tool-call status — see
- * {@link SUBAGENT_STATUS_SLOT_STYLE} and {@link SUBAGENT_STATUS_ROW_MIN_HEIGHT} —
- * nor on whether a summary is present or how long it is: the tool name and the
- * summary share one fixed-height flex line, each `truncate`, so a 200-char
- * summary clips instead of wrapping.
+ * Its height must not depend on the tool-call status (which walks
+ * `streaming → running → success` while the call executes) nor on whether a
+ * summary is present or how long it is: every cell is either a fixed-size slot or
+ * a single truncating line inside {@link TRACE_ROW_MIN_HEIGHT}.
  */
 export function SubagentActivityRow({
 	call,
@@ -327,70 +327,78 @@ export function SubagentActivityRow({
 	onActivate?: () => void;
 }) {
 	const summaryText = subagentActivitySummaryText(call);
+	const activate = (event: React.SyntheticEvent) => {
+		if (disabled) return;
+		event.stopPropagation();
+		onActivate?.();
+	};
 	return (
-		<UnstyledButton
+		// `role="button"` on a Box rather than an UnstyledButton: the row CONTAINS the
+		// timing area, which is itself a button (its popover trigger), and a nested
+		// <button> is invalid HTML — React warns and browsers reparent the markup. The
+		// card header solves the same problem the same way.
+		<Box
 			data-testid="subagent-activity"
-			disabled={disabled}
-			onClick={(event) => {
-				event.stopPropagation();
-				onActivate?.();
+			role="button"
+			tabIndex={disabled ? -1 : 0}
+			aria-disabled={disabled || undefined}
+			onClick={activate}
+			onKeyDown={(event) => {
+				if (event.key !== "Enter" && event.key !== " ") return;
+				event.preventDefault();
+				activate(event);
 			}}
-			style={{
-				width: "100%",
-				padding: "5px 7px",
-				borderRadius: "var(--mantine-radius-sm)",
-				background: "var(--mantine-color-default-hover)",
-			}}
+			style={{ display: "block", width: "100%", cursor: disabled ? "default" : "pointer" }}
 		>
 			<Group
-				gap={6}
+				gap={TRACE_ROW_GAP}
 				wrap="nowrap"
+				align="center"
+				py={1}
 				data-testid="subagent-activity-row"
-				style={{ minHeight: SUBAGENT_STATUS_ROW_MIN_HEIGHT }}
+				style={{ minHeight: TRACE_ROW_MIN_HEIGHT }}
 			>
-				<Box
-					data-testid="subagent-activity-status-slot"
-					c={STATUS_COLORS[call.status] ?? "gray"}
-					style={SUBAGENT_STATUS_SLOT_STYLE}
-				>
-					<StatusIcon status={call.status} />
-				</Box>
-				{/* Category chip, derived from the tool *name* alone — which is all this row
-				    has, since the activity summary carries no full input. Its own fixed slot,
-				    sized for the 16px chip rather than the 12px status glyph, so it is
-				    height-neutral: an unknown tool still occupies the slot rather than
-				    collapsing it and shortening the row. No `c` here — the chip carries the
-				    category colour itself, and a dimmed inherit is exactly the bug this
-				    replaced. */}
-				<Box data-testid="subagent-activity-category-slot" style={SUBAGENT_CATEGORY_SLOT_STYLE}>
-					<CategoryGlyph toolName={call.toolName} />
-				</Box>
-				{/* One flex LINE holding name + summary. `minWidth: 0` on both the line and
-				    the summary is what lets `truncate` engage instead of the text forcing
-				    the row wider (or taller, once it wraps). The tool name never shrinks
-				    below its content so a long summary cannot squeeze it away. */}
-				<Box
+				{/* No chevron: nothing to expand in place. */}
+				<TraceChevronSlot>
+					<TraceRowDot />
+				</TraceChevronSlot>
+				{/* Category chip, derived from the tool *name* alone — all this row has,
+				    since the activity summary carries no full input. The slot is fixed-size,
+				    so an unknown tool still occupies it rather than collapsing it and
+				    shortening the row. */}
+				<TraceIconSlot
+					icon={categoryGlyph(call.toolName)}
+					color={getCategoryColor(getCategory(call.toolName))}
+				/>
+				{/* ONE truncating line. The tool name and summary are separate spans purely
+				    so each remains addressable; they share a single line box, so a 200-char
+				    summary clips instead of wrapping the row taller.
+
+				    `flex: 0 1 auto` (not `flex: 1`) keeps the status + duration HUGGING this
+				    label instead of pinned to the row's right edge — same layout as a folded
+				    trace row, whose definition this row shares. */}
+				<Text
+					data-trace-title
 					data-testid="subagent-activity-label"
-					style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 4 }}
+					size="xs"
+					c="dimmed"
+					truncate
+					style={{ flex: "0 1 auto", minWidth: 0, lineHeight: TRACE_ROW_LINE_HEIGHT }}
 				>
-					<Text size="xs" truncate style={{ flexShrink: 0 }}>
-						{call.toolName}
-					</Text>
+					<span>{call.toolName === "Task" ? "Agent" : call.toolName}</span>
 					{summaryText && (
-						<Text
-							data-testid="subagent-activity-summary"
-							size="xs"
-							c="dimmed"
-							truncate
-							style={{ flex: 1, minWidth: 0 }}
-						>
-							{summaryText}
-						</Text>
+						<>
+							{" · "}
+							<span data-testid="subagent-activity-summary">{summaryText}</span>
+						</>
 					)}
-				</Box>
+				</Text>
+				<TraceStatusSlot status={call.status} />
 				<ToolTimingArea toolCall={call} isActive={!isTerminalToolStatus(call.status)} />
+				{/* Absorbs the slack so the cells above stay left-packed. */}
+				<Box style={{ flex: 1, minWidth: 0 }} />
 			</Group>
-		</UnstyledButton>
+		</Box>
 	);
 }
 
@@ -910,7 +918,9 @@ export const SubagentCard = memo(function SubagentCard({
 									</Button>
 								)}
 							</Group>
-							<Stack gap={4}>
+							{/* No gap: trace rows sit flush against each other, and these ARE trace
+							    rows now — a 4px seam was part of the old tinted-button look. */}
+							<Stack gap={0}>
 								{activityCalls.map((call) => (
 									<SubagentActivityRow
 										key={call.id ?? call.toolUseId}

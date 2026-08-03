@@ -1,10 +1,11 @@
 import { ActionIcon, Menu, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconCopy, IconDownload, IconRotate2, IconRotateClockwise2 } from "@tabler/icons-react";
-import { createContext, useCallback, useContext, useMemo, useState } from "react";
+import { useCallback, useContext, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { copyImageSourceToClipboard, downloadImageSource } from "../../lib/image-actions";
+import { createSharedContext } from "../../lib/shared-context";
 import { Z } from "../../lib/z-index";
 import { PANZOOM_TOOLTIP_Z, PanZoomStage } from "./PanZoomStage";
 
@@ -30,7 +31,18 @@ interface ImageViewerContextValue {
 	open: (options: ImageViewerOptions) => void;
 }
 
-const ImageViewerContext = createContext<ImageViewerContextValue | null>(null);
+/**
+ * Registry-keyed so a Fast Refresh re-evaluation (or a duplicated production
+ * chunk) cannot split provider and consumer across two context objects. The
+ * viewer is opened from lazily-mounted subtrees — vlist rows, Dockview workspace
+ * panels — that load long after `main.tsx` mounted the provider, which is exactly
+ * where a fresh context object used to surface as "must be used within
+ * ImageViewerProvider". See `lib/shared-context.ts`.
+ */
+const ImageViewerContext = createSharedContext<ImageViewerContextValue | null>(
+	"common/ImageViewerProvider",
+	null,
+);
 
 function deriveFilename(options: ImageViewerOptions): string {
 	const fromName = options.filename?.split(/[\\/]/).pop()?.trim();

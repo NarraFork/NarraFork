@@ -36,6 +36,14 @@ export interface ProviderGroup {
 	models: ModelOption[];
 	disabled: boolean;
 	isPlatform: boolean;
+	/**
+	 * Owning plugin, when this provider comes from an executable plugin rather than a
+	 * builtin adapter. Present together with `contributionId` so the detail area can
+	 * resolve which plugin view (or generated config form) to render.
+	 */
+	pluginId?: string;
+	/** Provider contribution id within the owning plugin. */
+	contributionId?: string;
 }
 
 export interface ModelOverviewTabProps {

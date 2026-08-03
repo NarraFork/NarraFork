@@ -202,6 +202,7 @@
 				"prefixWarning": "修改前缀会使沿用旧前缀的已保存模型引用失效。",
 				"prefixError": "更新前缀失败。",
 				"secretsConfigured": "已设置 {{count}} 个密钥",
+				"secretsConfigured_plural": "已设置 {{count}} 个密钥",
 				"loading": "正在加载配置……",
 				"loadError": "加载提供商配置失败。",
 				"saveError": "保存配置失败。",

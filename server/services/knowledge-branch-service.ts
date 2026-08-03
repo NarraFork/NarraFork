@@ -282,22 +282,89 @@ async function createStandalone(
 	return draft;
 }
 
-/** List the caller's own personal entries (both linked and standalone). Bounded. */
+/**
+ * List the caller's own personal entries (both linked and standalone). Bounded.
+ *
+ * Deliberately does NOT select the `content` blob: this is a list view, and none of its
+ * consumers render bodies (the personal-library tab shows title/link/target/status, and the
+ * KnowledgeLibrary `list_mine` tool drops content by design). Selecting it would read up to
+ * `limit` full document bodies off disk on the main thread per request. `contentLength` is
+ * derived instead, which is all a summary needs. Bodies come from `getMine`/`getDraft`.
+ */
 async function listMine(
 	principal: Principal,
 	opts: { status?: PersonalEntryStatus; limit?: number } = {},
 ) {
 	if (!principal.userId) return [];
 	const limit = Math.min(opts.limit ?? 100, 200);
-	return db.query.knowledgeDrafts.findMany({
+	const rows = await db.query.knowledgeDrafts.findMany({
 		where: (d, { and: a, eq: e }) => {
 			const conds = [e(d.authorUserId, principal.userId)];
 			if (opts.status) conds.push(e(d.status, opts.status));
 			return a(...conds);
 		},
+		// SQL-layer projection: everything a summary needs, minus the body.
+		columns: {
+			id: true,
+			entryId: true,
+			authorUserId: true,
+			name: true,
+			title: true,
+			targetCollectionId: true,
+			baseRevisionId: true,
+			contentHash: true,
+			format: true,
+			keywordsJson: true,
+			status: true,
+			createdAt: true,
+			updatedAt: true,
+		},
+		extras: (d, { sql }) => ({
+			contentLength: sql<number>`length(${d.content})`.as("content_length"),
+		}),
 		orderBy: (d, { desc: dd }) => [dd(d.updatedAt)],
 		limit,
 	});
+	return rows;
+}
+
+/**
+ * Batch drift check for a set of LINKED personal entries: which of them are based on a main
+ * revision that is no longer current.
+ *
+ * Exists because the per-entry `getDraftDrift` is far too heavy to call in a loop — it runs
+ * an ACL check plus a draft lookup plus a version count, and returns THREE full document
+ * bodies (base / current / draft) for the diff view. Calling it once per row to derive a
+ * single boolean read `3 × N` bodies off the main thread. Drift itself is just
+ * `draft.baseRevisionId !== entry.currentRevisionId`, so one bounded id→revision lookup
+ * answers it for the whole page.
+ *
+ * Returns the subset of `drafts` that are drifted, as a Set of draft ids. Rows with no
+ * `entryId` (standalone) or no `baseRevisionId` can never be drifted and are skipped.
+ *
+ * No ACL check: callers pass their OWN drafts (authorship is already established by
+ * `listMine`), and the result exposes nothing beyond "your copy is behind".
+ */
+async function findDriftedDraftIds(
+	drafts: ReadonlyArray<{ id: string; entryId: string | null; baseRevisionId: string | null }>,
+): Promise<Set<string>> {
+	const linked = drafts.filter((d) => d.entryId && d.baseRevisionId);
+	if (linked.length === 0) return new Set();
+	const entryIds = [...new Set(linked.map((d) => d.entryId as string))];
+	const entries = await db.query.knowledgeEntries.findMany({
+		where: (e, { inArray }) => inArray(e.id, entryIds),
+		// Only the pointer that defines drift — never currentContent.
+		columns: { id: true, currentRevisionId: true },
+	});
+	const currentByEntry = new Map(entries.map((e) => [e.id, e.currentRevisionId ?? null]));
+	const drifted = new Set<string>();
+	for (const d of linked) {
+		// A missing entry (deleted underneath us) is not reported as drift; the row will fail
+		// its own read path instead of being mislabelled here.
+		if (!currentByEntry.has(d.entryId as string)) continue;
+		if (d.baseRevisionId !== currentByEntry.get(d.entryId as string)) drifted.add(d.id);
+	}
+	return drifted;
 }
 
 /** Read one of the caller's own personal entries by id. */
@@ -340,9 +407,17 @@ async function updateStandaloneMeta(
  * Authorization is the author-or-admin check in loadOwnDraft (an unauthorized caller gets
  * NotFound so entry existence isn't leaked).
  *
- * Any OPEN (pending/conflict) publish request for this entry is rejected in the SAME
+ * Any OPEN (pending/conflict) publish request for this entry is closed in the SAME
  * transaction: the author is retiring the entry, so a queued proposal must not stay
- * reviewable. Already-archived entries are a no-op (idempotent delete).
+ * reviewable. Unlike `updateDraft`, this closes `conflict` too — the entry itself is
+ * going away, so there is nothing left to resolve the conflict against.
+ *
+ * The closing status is `withdrawn`, NOT `rejected`: no reviewer passed judgement here,
+ * the author retired their own entry. Writing `rejected` (+ a `request_changes` verdict)
+ * would render as "a reviewer rejected you" in the author's own submission history.
+ * No `verdict` is written for the same reason.
+ *
+ * Already-archived entries are a no-op (idempotent delete).
  */
 async function deletePersonalEntry(principal: Principal, draftId: string) {
 	const draft = await loadOwnDraft(principal, draftId);
@@ -373,7 +448,7 @@ async function deletePersonalEntry(principal: Principal, draftId: string) {
 			.where(eq(knowledgeDrafts.id, draftId))
 			.run();
 		tx.update(knowledgeSubmissions)
-			.set({ status: "rejected", verdict: "request_changes", reviewedAt: now })
+			.set({ status: "withdrawn", reviewedAt: now })
 			.where(
 				and(
 					eq(knowledgeSubmissions.draftId, draftId),
@@ -711,7 +786,7 @@ async function submitForReview(
 		// has an open (pending/conflict) submission awaiting review. Checked inside the
 		// transaction so two concurrent submits can't both pass.
 		const open = tx
-			.select({ id: knowledgeSubmissions.id })
+			.select({ id: knowledgeSubmissions.id, status: knowledgeSubmissions.status })
 			.from(knowledgeSubmissions)
 			.where(
 				and(
@@ -722,8 +797,15 @@ async function submitForReview(
 			.limit(1)
 			.get();
 		if (open) {
+			// Name the way out, or the author is stuck. A `conflict` request in particular is
+			// NOT auto-closed by editing (unlike `pending`), so without this hint the author
+			// sees "awaiting review" with no visible next step.
 			throw new ValidationError(
-				"This personal entry already has a publish request awaiting review",
+				open.status === "conflict"
+					? `This personal entry has a publish request in conflict (${open.id}). ` +
+							"Withdraw it and publish again, or ask a reviewer to resolve the conflict."
+					: `This personal entry already has a publish request awaiting review (${open.id}). ` +
+							"Withdraw it first if you want to replace it.",
 			);
 		}
 		[submission] = tx
@@ -1213,6 +1295,13 @@ async function commitMergedRevision(
 /** Hard cap on submission rows returned by the reviewer list. */
 const SUBMISSION_LIST_MAX = 200;
 
+/**
+ * Reviewer-facing list. Returns only submissions the principal can actually act on, which
+ * means the caller's OWN submissions are excluded: self-review is refused downstream (see
+ * `review`), so listing them would surface rows whose every review action fails, and would
+ * disagree with the `countReviewInbox` badge (which already excludes them). Authors read
+ * their own publish history through `listSubmissionsForDraft` instead.
+ */
 async function listSubmissions(
 	principal: Principal,
 	opts: { entryId?: string; status?: string; limit?: number },
@@ -1261,13 +1350,22 @@ async function listSubmissions(
 	});
 	// Filter to entries the principal can review (or admin).
 	const caps = await resolvePrincipalCaps(principal);
-	if (caps.isAdmin) return rows;
-	if (rows.length === 0) return rows;
+	// Drop the caller's own submissions: `review` refuses self-review for non-admins, so
+	// listing them would fill the worklist with rows whose every action fails, and would
+	// disagree with the `countReviewInbox` badge. Admins keep theirs — the self-review guard
+	// exempts them (see `review`), so for an admin those rows are genuinely actionable.
+	const own = principal.userId;
+	const reviewable = own && !caps.isAdmin ? rows.filter((s) => s.submitterUserId !== own) : rows;
+
+	if (caps.isAdmin) return reviewable;
+	if (reviewable.length === 0) return reviewable;
 
 	// Batch-load the referenced entries (ACL fields only) in ONE query to avoid
 	// the previous per-row N+1 lookup, then decide reviewability in memory. Standalone
 	// submissions (entryId null) are gated on their TARGET collection instead.
-	const entryIds = [...new Set(rows.map((s) => s.entryId).filter((id): id is string => !!id))];
+	const entryIds = [
+		...new Set(reviewable.map((s) => s.entryId).filter((id): id is string => !!id)),
+	];
 	const entries =
 		entryIds.length > 0
 			? await db.query.knowledgeEntries.findMany({
@@ -1288,7 +1386,7 @@ async function listSubmissions(
 	const colIds = [
 		...new Set([
 			...entries.map((e) => e.collectionId),
-			...rows.map((s) => s.collectionId).filter((id): id is string => !!id),
+			...reviewable.map((s) => s.collectionId).filter((id): id is string => !!id),
 		]),
 	];
 	const cols =
@@ -1305,8 +1403,8 @@ async function listSubmissions(
 				})
 			: [];
 	const colById = new Map(cols.map((c) => [c.id, c]));
-	const out: typeof rows = [];
-	for (const s of rows) {
+	const out: typeof reviewable = [];
+	for (const s of reviewable) {
 		if (s.entryId) {
 			// Linked: collection-gate + canReview on the target entry.
 			const entry = entryById.get(s.entryId);
@@ -1729,6 +1827,7 @@ export const knowledgeBranchService = {
 	createDraft,
 	createStandalone,
 	listMine,
+	findDriftedDraftIds,
 	getMine,
 	updateStandaloneMeta,
 	deletePersonalEntry,

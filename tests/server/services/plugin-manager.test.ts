@@ -406,6 +406,142 @@ describe("PluginManager", () => {
 		expect(await permissionStore.listSets(pluginId)).toEqual([]);
 	});
 
+	test("grants the capabilities a Manifest declares when an installation first binds", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.seeded-grants";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const source = await makePackage(root, pluginId, (manifest) => {
+			const permissions = manifest.permissions as Record<string, unknown>;
+			permissions.host = ["diagnostics.readOwnLogs", "query.read.projects"];
+		});
+		await manager.install(source);
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+
+		// Installing is the trust decision, so the declared capabilities arrive granted
+		// instead of waiting for a separate approval step.
+		const permissions = await manager.getPermissions(pluginId);
+		expect(permissions.grants.map((grant) => grant.capability).sort()).toEqual([
+			"diagnostics.readOwnLogs",
+			"query.read.projects",
+		]);
+	});
+
+	/**
+	 * Declaring a wide capability must not break installation.
+	 *
+	 * `capabilitySchema` accepts open tokens (`admin`, `*`, `network.any`, vendor names), but
+	 * a grant has to be expressible in the authority kernel, which is keyed by
+	 * `PLUGIN_CAPABILITY_ADAPTER`. Seeding an unmappable token used to reach
+	 * `toAuthorityGrants()`, which threw `IntegrationAuthorityConflictError`, so the *install*
+	 * failed with a 409 worded in internal terms — the parse-layer relaxation never reached the
+	 * path that matters. Seeding now filters, so the declaration parses, produces no grant, and
+	 * leaves the broker fail-closed at call time.
+	 */
+	test("installs a plugin declaring wide capabilities without granting the unmappable ones", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.wide-permission";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const source = await makePackage(root, pluginId, (manifest) => {
+			const permissions = manifest.permissions as Record<string, unknown>;
+			permissions.host = [
+				"admin",
+				"*",
+				"network.any",
+				"com.acme.custom.thing",
+				"diagnostics.readOwnLogs",
+				"query.read.projects",
+			];
+		});
+
+		// The install itself is the regression: this threw before the seed filter existed.
+		const installed = await manager.install(source);
+		if (!installed.current) throw new Error("Installed plugin has no current package");
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+
+		// Mappable declarations still arrive granted; the wide tokens produce nothing at all,
+		// so there is no grant for the broker to match and no phantom authority row.
+		const permissions = await manager.getPermissions(pluginId);
+		const granted = permissions.grants.map((grant) => grant.capability).sort();
+		expect(granted).toEqual(["diagnostics.readOwnLogs", "query.read.projects"]);
+		for (const wide of ["admin", "*", "network.any", "com.acme.custom.thing"]) {
+			expect(granted).not.toContain(wide);
+		}
+		expect(
+			(await manager.getStatus(pluginId))?.grants?.capabilities?.includes("admin") ?? false,
+		).toBe(false);
+	});
+
+	test("installs a plugin whose every declared capability is unmappable", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.only-wide";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const source = await makePackage(root, pluginId, (manifest) => {
+			const permissions = manifest.permissions as Record<string, unknown>;
+			permissions.host = ["admin", "*"];
+		});
+
+		// The all-ignored case is the one that would leave `capabilities: []` with a non-zero
+		// count if the filter forgot to bail out, so it gets its own assertion.
+		await manager.install(source);
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+		expect((await manager.getPermissions(pluginId)).grants).toEqual([]);
+	});
+
+	test("does not re-seed grants once an installation has a grant list", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.no-reseed";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const source = await makePackage(root, pluginId, (manifest) => {
+			const permissions = manifest.permissions as Record<string, unknown>;
+			permissions.host = ["diagnostics.readOwnLogs", "query.read.projects"];
+		});
+		await manager.install(source);
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+
+		// Narrow the grants, the way an admin revoking one capability would.
+		const seeded = await manager.getPermissions(pluginId);
+		await manager.replacePermissions(pluginId, {
+			expectedRevision: seeded.revision,
+			grantedBy: "admin-user-1",
+			grants: [
+				{
+					grantId: "grant-kept",
+					capability: "diagnostics.readOwnLogs",
+					scope: { type: "global" },
+					grantedBy: "admin-user-1",
+				},
+			],
+		});
+
+		// Re-activating must not restore the removed capability. Seeding is a first-install
+		// convenience; once a grant list exists it owns the answer, otherwise revocation
+		// would be undone on every restart.
+		await manager.deactivate(pluginId);
+		await manager.activate(pluginId);
+		const after = await manager.getPermissions(pluginId);
+		expect(after.grants.map((grant) => grant.capability)).toEqual(["diagnostics.readOwnLogs"]);
+	});
+
 	test("copies complete grants to a new package without widening scope during upgrade", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.permission-upgrade";

@@ -28,7 +28,36 @@ export type LinkType =
 
 export type LinkDirection = "out" | "in" | "both";
 
-type EntryRow = typeof knowledgeEntries.$inferSelect;
+/**
+ * The only entry fields this service needs: 4 display fields for a graph node/endpoint plus
+ * the dual-axis ACL gate fields. Deliberately NOT the full row — graph traversal loads up to
+ * MAX_LINKS_PER_HOP endpoints per hop, and pulling `currentContent` for each would read that
+ * many full document bodies on the main thread to render titles.
+ */
+type EntryRow = Pick<
+	typeof knowledgeEntries.$inferSelect,
+	| "id"
+	| "title"
+	| "slug"
+	| "collectionId"
+	| "ownerUserId"
+	| "classificationLevel"
+	| "controlledTagsJson"
+	| "reviewTagsJson"
+>;
+
+/** SQL projection matching {@link EntryRow}. */
+const ENTRY_GRAPH_COLUMNS = {
+	id: true,
+	title: true,
+	slug: true,
+	collectionId: true,
+	ownerUserId: true,
+	classificationLevel: true,
+	controlledTagsJson: true,
+	reviewTagsJson: true,
+} as const;
+
 type LinkRow = typeof knowledgeEntryLinks.$inferSelect;
 
 /** Lightweight endpoint shape returned alongside links (no body). */
@@ -133,6 +162,7 @@ class ReadResolver {
 		if (missing.length === 0) return;
 		const rows = await db.query.knowledgeEntries.findMany({
 			where: inArray(knowledgeEntries.id, missing),
+			columns: ENTRY_GRAPH_COLUMNS,
 		});
 		for (const r of rows) this.entryCache.set(r.id, r);
 		// Mark not-found ids so we don't re-query them.
@@ -410,6 +440,7 @@ async function loadEndpoint(entryId: string): Promise<EntryRow | null> {
 	return (
 		(await db.query.knowledgeEntries.findFirst({
 			where: eq(knowledgeEntries.id, entryId),
+			columns: ENTRY_GRAPH_COLUMNS,
 		})) ?? null
 	);
 }

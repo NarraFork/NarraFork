@@ -17,6 +17,7 @@ import type {
 	KnowledgeLinkType,
 	KnowledgeOpenSubmission,
 	KnowledgePersonalEntry,
+	KnowledgePersonalEntrySummary,
 	KnowledgeRebaseResult,
 	KnowledgeRebaseStrategy,
 	KnowledgeReviewInboxCount,
@@ -197,7 +198,8 @@ export const knowledgeApi = {
 
 	// ─── Personal library (standalone personal entries) ───
 	listMyPersonalEntries: (opts: { status?: "active" | "archived"; limit?: number } = {}) =>
-		request<KnowledgePersonalEntry[]>(
+		// Summary shape: the server projects the body away and reports contentLength.
+		request<KnowledgePersonalEntrySummary[]>(
 			`/knowledge/personal-entries${qs({
 				status: opts.status,
 				limit: opts.limit !== undefined ? String(opts.limit) : undefined,

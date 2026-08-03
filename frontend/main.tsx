@@ -1,4 +1,4 @@
-import "@frontend/lib/hmr-guard";
+import { reportReactRenderError } from "@frontend/lib/hmr-guard";
 import "@frontend/lib/dom-mutation-guard";
 import {
 	Center,
@@ -30,6 +30,7 @@ import {
 import { usePluginContributions } from "@frontend/hooks/usePluginContributions";
 import { readActivePluginThemeKey } from "@frontend/hooks/usePluginThemes";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
+import { installPinchZoomGuard } from "@frontend/lib/pinch-zoom-guard";
 import "@frontend/styles/oled.css";
 import "@frontend/styles/blur-anim.css";
 import "@frontend/styles/nav-collapsed.css";
@@ -249,6 +250,10 @@ function applyInitialPluginTheme() {
 
 async function bootstrap() {
 	applyInitialPluginTheme();
+	// Before React mounts, so the first gesture on the first paint is already
+	// covered. Safari in a browser tab ignores index.html's `user-scalable=no`, and
+	// a component-level handler is structurally too late (see pinch-zoom-guard.ts).
+	installPinchZoomGuard();
 	const router = createAppRouter(createBrowserHistory());
 
 	// Sweep focus-dock layouts unopened for >30 days (best-effort, never throws).
@@ -258,7 +263,27 @@ async function bootstrap() {
 	void syncPluginUiContributions().catch(() => {});
 
 	// biome-ignore lint/style/noNonNullAssertion: root element always exists
-	ReactDOM.createRoot(document.getElementById("root")!).render(
+	ReactDOM.createRoot(document.getElementById("root")!, {
+		/*
+		 * Let the dev-only HMR guard see render errors an error boundary handled.
+		 *
+		 * Every route has a CatchBoundary (see `defaultErrorComponent` above), so a
+		 * stale-module-graph failure inside a route becomes an error card and never
+		 * reaches `window.onerror` — the guard's one-time reload would never fire.
+		 *
+		 * Supplying these options REPLACES React's default handlers, which are the
+		 * ones that log to the console, so each handler logs explicitly to keep the
+		 * error (and its component stack) visible in devtools.
+		 */
+		onCaughtError: (error, errorInfo) => {
+			console.error(error, errorInfo?.componentStack ?? "");
+			reportReactRenderError(error);
+		},
+		onUncaughtError: (error, errorInfo) => {
+			console.error(error, errorInfo?.componentStack ?? "");
+			reportReactRenderError(error);
+		},
+	}).render(
 		<React.StrictMode>
 			<MantineProvider
 				theme={theme}

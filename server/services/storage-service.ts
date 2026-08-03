@@ -1,5 +1,6 @@
+import type { Dirent } from "node:fs";
 import { existsSync } from "node:fs";
-import { readdir, rm, stat } from "node:fs/promises";
+import { lstat, readdir, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { db } from "../db";
@@ -17,12 +18,20 @@ import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 export interface StorageCategoryResult {
 	key: string;
 	sizeBytes: number;
+	/**
+	 * True when a directory-walk limit stopped the measurement, making `sizeBytes`
+	 * a lower bound. Reported rather than swallowed: an understated figure would
+	 * mislead an operator judging whether a category is worth cleaning up.
+	 */
+	truncated?: boolean;
 	details?: Record<string, unknown>;
 }
 
 export interface StorageScanResult {
 	categories: StorageCategoryResult[];
 	totalBytes: number;
+	/** True when any category was truncated, so `totalBytes` is a lower bound. */
+	truncated?: boolean;
 	scannedAt: number; // epoch ms
 }
 
@@ -52,28 +61,112 @@ export function invalidateStorageCache(): void {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/** Recursively sum file sizes in a directory (async to avoid blocking the event loop). */
-async function dirSize(dirPath: string): Promise<number> {
-	if (!existsSync(dirPath)) return 0;
-	let total = 0;
-	try {
-		const entries = await readdir(dirPath, { withFileTypes: true });
+/**
+ * Entry budget for one {@link measureDirSize} call.
+ *
+ * Derived from the largest thing this scan realistically walks: a checked-out
+ * worktree of a big monorepo with `node_modules` present is on the order of a few
+ * hundred thousand files. 2,000,000 leaves an order of magnitude of headroom above
+ * that while still bounding a pathological or hostile tree — at ~2 syscalls per
+ * entry this is seconds of async I/O, not an unbounded walk. Every category shares
+ * the constant because they are all measured by the same function.
+ */
+const DIR_SCAN_MAX_ENTRIES = 2_000_000;
+
+/**
+ * Depth budget for one {@link measureDirSize} call.
+ *
+ * Real trees measured here (uploads/<narrator>/, shares/<id>/, bare snapshot repos,
+ * git worktrees) are well under 30 levels; 64 is generous for deliberately nested
+ * source trees while keeping recursion far from any stack limit. Symlinks are not
+ * followed, so this is a guard against genuinely deep directories rather than
+ * against link cycles.
+ */
+const DIR_SCAN_MAX_DEPTH = 64;
+
+export interface DirSizeResult {
+	sizeBytes: number;
+	/** Entries actually visited (files + directories), for observability. */
+	entriesScanned: number;
+	/**
+	 * True when a limit stopped the walk, so `sizeBytes` is a lower bound.
+	 *
+	 * Surfaced all the way to the storage UI: a silently truncated total would
+	 * understate disk usage and mislead the operator deciding whether to clean up.
+	 */
+	truncated: boolean;
+}
+
+/**
+ * Recursively sum file sizes in a directory (async to avoid blocking the event loop).
+ *
+ * Bounded on three axes and never follows symlinks:
+ *  - `lstat` is used instead of `stat`, and only real directories are recursed into,
+ *    so a self-referential or mutually-referential directory link (which `readdir`'s
+ *    Dirent reports as a directory when it resolves to one) cannot spin forever;
+ *  - symlinked files are skipped rather than counted, because their bytes belong to
+ *    the target and would otherwise be double counted;
+ *  - entry count and depth are capped, and hitting either sets `truncated` instead of
+ *    quietly returning a smaller number.
+ */
+async function measureDirSize(dirPath: string): Promise<DirSizeResult> {
+	if (!existsSync(dirPath)) return { sizeBytes: 0, entriesScanned: 0, truncated: false };
+	let sizeBytes = 0;
+	let entriesScanned = 0;
+	let truncated = false;
+
+	const walk = async (current: string, depth: number): Promise<void> => {
+		if (truncated) return;
+		if (depth > DIR_SCAN_MAX_DEPTH) {
+			truncated = true;
+			return;
+		}
+		let entries: Dirent[];
+		try {
+			entries = await readdir(current, { withFileTypes: true });
+		} catch {
+			// directory not readable
+			return;
+		}
 		for (const entry of entries) {
-			const full = resolve(dirPath, entry.name);
+			if (truncated) return;
+			if (entriesScanned >= DIR_SCAN_MAX_ENTRIES) {
+				truncated = true;
+				return;
+			}
+			entriesScanned++;
+			const full = resolve(current, entry.name);
 			try {
-				if (entry.isDirectory()) {
-					total += await dirSize(full);
-				} else if (entry.isFile()) {
-					total += (await stat(full)).size;
-				}
+				// lstat, not stat: a symlink must be identified as a link even when it
+				// points at a directory, otherwise a link cycle recurses without end.
+				const info = await lstat(full);
+				if (info.isSymbolicLink()) continue;
+				if (info.isDirectory()) await walk(full, depth + 1);
+				else if (info.isFile()) sizeBytes += info.size;
 			} catch {
-				// skip inaccessible files
+				// skip inaccessible entries
 			}
 		}
-	} catch {
-		// directory not readable
+	};
+
+	await walk(dirPath, 0);
+	return { sizeBytes, entriesScanned, truncated };
+}
+
+/**
+ * Bytes-only wrapper for callers that report reclaimed space rather than a scan
+ * total. Truncation is logged rather than returned because these callers delete the
+ * directory immediately afterwards, so the number is a report, not a decision input.
+ */
+async function dirSize(dirPath: string): Promise<number> {
+	const result = await measureDirSize(dirPath);
+	if (result.truncated) {
+		logger.warn("Directory size measurement hit a scan limit; reported size is a lower bound", {
+			path: dirPath,
+			entriesScanned: result.entriesScanned,
+		});
 	}
-	return total;
+	return result.sizeBytes;
 }
 
 export function buildReferencedUploadOwnerIds(
@@ -105,19 +198,44 @@ async function scanDatabase(
 	};
 }
 
-async function scanUploads(): Promise<StorageCategoryResult> {
+/**
+ * Uploads (`~/.narrafork/uploads`).
+ *
+ * Reports only the per-narrator image directories. Avatars live under
+ * `uploads/avatars`, are keyed to user accounts rather than sessions, and are
+ * deliberately skipped by {@link cleanupOrphanedUploads} — counting them here
+ * would inflate a figure whose cleanup button can never reclaim them. Their
+ * size still ships in `details` so the omission stays visible instead of silent.
+ */
+export async function scanUploads(): Promise<StorageCategoryResult> {
 	const uploadsDir = getUploadsDir();
-	const totalSize = await dirSize(uploadsDir);
+	let narratorBytes = 0;
 	let narratorCount = 0;
-	let avatarSize = 0;
+	let avatarBytes = 0;
+	let truncated = false;
 	try {
 		const entries = await readdir(uploadsDir, { withFileTypes: true });
 		for (const entry of entries) {
-			if (!entry.isDirectory()) continue;
-			if (entry.name === "avatars") {
-				avatarSize = await dirSize(resolve(uploadsDir, "avatars"));
-			} else {
+			const fullPath = resolve(uploadsDir, entry.name);
+			if (entry.isDirectory()) {
+				const measured = await measureDirSize(fullPath);
+				truncated ||= measured.truncated;
+				if (entry.name === "avatars") {
+					avatarBytes = measured.sizeBytes;
+					continue;
+				}
+				narratorBytes += measured.sizeBytes;
 				narratorCount++;
+				continue;
+			}
+			// Stray files directly under the uploads root belong to no narrator. Count them
+			// here so the reported size never understates what the directory holds.
+			if (entry.isFile()) {
+				try {
+					narratorBytes += (await stat(fullPath)).size;
+				} catch {
+					// skip inaccessible files
+				}
 			}
 		}
 	} catch {
@@ -125,17 +243,17 @@ async function scanUploads(): Promise<StorageCategoryResult> {
 	}
 	return {
 		key: "uploads",
-		sizeBytes: totalSize,
+		sizeBytes: narratorBytes,
+		...(truncated ? { truncated } : {}),
 		details: {
 			narratorDirs: narratorCount,
-			avatarBytes: avatarSize,
-			narratorBytes: totalSize - avatarSize,
+			avatarBytes,
 		},
 	};
 }
 
 async function scanShares(): Promise<StorageCategoryResult> {
-	const totalSize = await dirSize(SHARES_DIR);
+	const measured = await measureDirSize(SHARES_DIR);
 	let fileCount = 0;
 	try {
 		const entries = await readdir(SHARES_DIR, { withFileTypes: true });
@@ -145,7 +263,8 @@ async function scanShares(): Promise<StorageCategoryResult> {
 	}
 	return {
 		key: "shares",
-		sizeBytes: totalSize,
+		sizeBytes: measured.sizeBytes,
+		...(measured.truncated ? { truncated: true } : {}),
 		details: { shareCount: fileCount },
 	};
 }
@@ -157,7 +276,7 @@ async function scanShares(): Promise<StorageCategoryResult> {
  * storage breakdown rather than accumulating unaccounted for.
  */
 async function scanTreeSnapshots(): Promise<StorageCategoryResult> {
-	const totalSize = await dirSize(TREE_SNAPSHOTS_DIR);
+	const measured = await measureDirSize(TREE_SNAPSHOTS_DIR);
 	let repoCount = 0;
 	try {
 		const entries = await readdir(TREE_SNAPSHOTS_DIR, { withFileTypes: true });
@@ -167,7 +286,8 @@ async function scanTreeSnapshots(): Promise<StorageCategoryResult> {
 	}
 	return {
 		key: "treeSnapshots",
-		sizeBytes: totalSize,
+		sizeBytes: measured.sizeBytes,
+		...(measured.truncated ? { truncated: true } : {}),
 		details: { repoCount },
 	};
 }
@@ -175,6 +295,7 @@ async function scanTreeSnapshots(): Promise<StorageCategoryResult> {
 async function scanWorktrees(): Promise<StorageCategoryResult> {
 	let totalSize = 0;
 	let worktreeCount = 0;
+	let truncated = false;
 	const projectList: Array<{ name: string; sizeBytes: number; worktreeCount: number }> = [];
 
 	try {
@@ -187,7 +308,9 @@ async function scanWorktrees(): Promise<StorageCategoryResult> {
 			if (!proj.gitPath) continue;
 			const wtDir = resolve(proj.gitPath, ".worktrees");
 			if (!existsSync(wtDir)) continue;
-			const projSize = await dirSize(wtDir);
+			const measured = await measureDirSize(wtDir);
+			truncated ||= measured.truncated;
+			const projSize = measured.sizeBytes;
 			let projWtCount = 0;
 			try {
 				const entries = await readdir(wtDir, { withFileTypes: true });
@@ -212,6 +335,7 @@ async function scanWorktrees(): Promise<StorageCategoryResult> {
 	return {
 		key: "worktrees",
 		sizeBytes: totalSize,
+		...(truncated ? { truncated } : {}),
 		details: { worktreeCount, projects: projectList },
 	};
 }
@@ -414,9 +538,11 @@ export async function* scanStorage(
 
 	throwIfAborted(signal);
 
+	const truncated = categories.some((c) => c.truncated === true);
 	const result: StorageScanResult = {
 		categories,
 		totalBytes: categories.reduce((sum, c) => sum + c.sizeBytes, 0),
+		...(truncated ? { truncated } : {}),
 		scannedAt: Date.now(),
 	};
 	cachedResult = result;

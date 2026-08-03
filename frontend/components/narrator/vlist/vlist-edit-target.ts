@@ -60,6 +60,38 @@ export function resolveVListEditTarget(
 	return null;
 }
 
+/**
+ * Narrowest comfortable width (px) for an inline editor that replaced a user
+ * bubble. The bubble SHRINK-WRAPS its text, so a two-character message ("ok")
+ * would otherwise turn into a ~140px editing box; this floor keeps the textarea,
+ * the attach button and the submit/cancel pair usable. Bounded by the row's own
+ * column width, so a narrow viewport still gets a full-width editor.
+ */
+export const VLIST_USER_EDITOR_MIN_WIDTH = 420;
+
+/**
+ * Width (px) of the inline editor when it must hug the RIGHT edge of the row,
+ * or null when the editor keeps the row's full width.
+ *
+ * A user bubble is drawn right-aligned and shrink-wrapped, so an editor that
+ * expands to the full column throws the caret, the attach button and the submit
+ * pair back to the left side of the screen the moment the reader picks "edit" —
+ * the mouse has to travel the whole column width to keep editing the message it
+ * was just hovering. Assistant rows are left-aligned full-width bodies, so their
+ * editor is left alone (null).
+ */
+export function resolveVListEditorWidth(
+	kind: VListElementKind,
+	role: unknown,
+	bubbleWidth: number,
+	contentWidth: number,
+): number | null {
+	if (kind !== "message-bubble" || role !== "user") return null;
+	if (!Number.isFinite(contentWidth) || contentWidth <= 0) return null;
+	const base = Number.isFinite(bubbleWidth) ? Math.round(bubbleWidth) : 0;
+	return Math.max(1, Math.min(contentWidth, Math.max(VLIST_USER_EDITOR_MIN_WIDTH, base)));
+}
+
 export interface VListEditedMeta {
 	editedAt: string;
 	originalContentJson?: unknown[] | null;

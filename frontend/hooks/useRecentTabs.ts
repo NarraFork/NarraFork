@@ -35,7 +35,9 @@ import {
 
 export type {
 	AddRecentTabInput,
+	ReadonlyRecentTabRuntimeVersions,
 	RecentTab,
+	RecentTabRuntimeVersions,
 	RecentTabViewer,
 	SubagentRecentTabInput,
 	SubagentRecentTabPreferenceState,
@@ -43,18 +45,20 @@ export type {
 export {
 	buildRecentTabUpsert,
 	buildSubagentRecentTab,
+	bumpRecentTabRuntimeVersions,
 	clampRecentTabText,
 	isSameRecentTab,
 	mergeRecentTabPatch,
 	mergeRecentTabRuntime,
 	normalizeRecentTab,
 	normalizeRecentTabViewers,
-	pruneRecentTabsTerminalCountVersions,
+	pruneRecentTabsRuntimeVersions,
 	RECENT_TAB_TEXT_MAX_CHARS,
 	reconcileRecentTabsRuntimePatches,
 	selectRecentTabsLiveWindow,
 	shouldAddSubagentRecentTab,
 	shouldApplyRecentTabsRuntimeResponse,
+	snapshotRecentTabRuntimeVersions,
 } from "./recent-tabs-utils";
 
 export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"] as const;
@@ -574,7 +578,6 @@ async function fetchLoadedWindows(
 	plans: Array<{
 		section: RecentTabsSection;
 		pageCount: number;
-		previousTabs: Map<string, RecentTab>;
 	}>,
 	minimumRevision: number,
 ): Promise<Map<RecentTabsSection, RecentTabsInfiniteData>> {
@@ -610,21 +613,41 @@ async function fetchLoadedWindows(
 				pages.push(page);
 				cursor = page.nextCursor;
 			}
-			return [
-				plan.section,
-				{
-					pages: pages.map((page) => ({
-						...page,
-						items: page.items.map((tab) =>
-							mergeRecentTabRuntime(tab, plan.previousTabs.get(tabKey(tab))),
-						),
-					})),
-					pageParams,
-				} satisfies RecentTabsInfiniteData,
-			] as const;
+			return [plan.section, { pages, pageParams } satisfies RecentTabsInfiniteData] as const;
 		}),
 	);
 	return new Map(entries);
+}
+
+/**
+ * Carry live runtime fields onto a freshly fetched window using the CURRENT cache.
+ *
+ * Page responses only contain persisted columns, so they must inherit status colour,
+ * terminal count, viewers and container badge from what is already rendered. Reading
+ * the cache at write time (rather than snapshotting before the request) is what keeps
+ * WS events that arrived mid-flight from being reverted.
+ */
+function withCachedRuntimeFields(
+	qc: QueryClient,
+	section: RecentTabsSection,
+	data: RecentTabsInfiniteData,
+	fallbackTabs: ReadonlyMap<string, RecentTab>,
+): RecentTabsInfiniteData {
+	const current = new Map(
+		flattenPages(qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section))).map(
+			(tab) => [tabKey(tab), tab],
+		),
+	);
+	return {
+		...data,
+		pages: data.pages.map((page) => ({
+			...page,
+			items: page.items.map((tab) => {
+				const key = tabKey(tab);
+				return mergeRecentTabRuntime(tab, current.get(key) ?? fallbackTabs.get(key));
+			}),
+		})),
+	};
 }
 
 export function refreshRecentTabsLoadedWindow(
@@ -651,7 +674,9 @@ export function refreshRecentTabsLoadedWindow(
 			{
 				section,
 				pageCount: Math.max(1, data.pages.length),
-				previousTabs: new Map(flattenPages(data).map((tab) => [tabKey(tab), tab])),
+				// Only a fallback for rows that `reset` truncates out of the cache before the
+				// fetch. Live runtime fields are re-read from the cache at write time.
+				truncatedTabs: new Map(flattenPages(data).map((tab) => [tabKey(tab), tab])),
 			},
 		];
 	});
@@ -684,9 +709,16 @@ export function refreshRecentTabsLoadedWindow(
 		}
 		if (!windows) throw lastError;
 		if (loadedWindowRefreshGenerations.get(qc) !== generation) return;
-		for (const { section } of plans) {
+		for (const { section, truncatedTabs } of plans) {
 			const data = windows.get(section);
-			if (data) qc.setQueryData(recentTabsSectionQueryKey(section), data);
+			if (!data) continue;
+			// Re-read the cache HERE, not before the fetch: WS runtime events that landed
+			// while the pages were in flight are already in the cache, and a pre-fetch
+			// snapshot would roll status/substatus icons back to their pre-event values.
+			qc.setQueryData(
+				recentTabsSectionQueryKey(section),
+				withCachedRuntimeFields(qc, section, data, truncatedTabs),
+			);
 		}
 		syncCompatibilityCache(qc);
 	})().catch((error) => {

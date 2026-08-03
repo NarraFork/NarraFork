@@ -16,7 +16,7 @@
  *   │  collapsed header ≈ 56 (no preview) .. 75 (with preview) px                 │
  *   └────────────────────────────────────────────────────────────────────────────┘
  *   ┌ Recent Calls  (Box px="xs" pb="xs", ALWAYS shown when activityCalls>0) ─────┐
- *   │  title row (mb4) + Stack gap4 × ≤3 rows (each 5px×2 padding + xs line = 27) │
+ *   │  title row (mb4) + ≤3 flush TRACE rows (18.8 each — see RECENT_ROW_HEIGHT)   │
  *   └────────────────────────────────────────────────────────────────────────────┘
  *   ┌ LazyCollapse body  (only when effectiveExpanded) ──────────────────────────┐
  *   │  [selfPermission]  Box mx/mb="xs" + InlinePermission (P11 measure-permission)│
@@ -78,6 +78,10 @@ import {
 	measureInlinePermission,
 } from "./measure-permission";
 import { resolveToolTimingStamps, type ToolTimingStamps } from "./measure-tool-call";
+// The recent-call rows ARE trace rows, so their height comes from the trace model
+// rather than a second copy of it. One-way: measure-tool-run imports
+// measure-markdown + measure-tool-call and never this module, so no cycle.
+import { TRACE_ROW_HEIGHT } from "./measure-tool-run";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,13 +124,18 @@ export const RESULT_PREVIEW_MARGIN_TOP = 2;
 export const BUTTON_COMPACT_XS = 18;
 /** Title Group mb={4}. */
 export const RECENT_TITLE_MARGIN_BOTTOM = 4;
-/** Each activity row UnstyledButton padding "5px 7px" (top + bottom). */
-export const RECENT_ROW_PADDING_Y = 5;
-/** Activity row = 5×2 + max(status12, xs line17) = 27. */
-export const RECENT_ROW_HEIGHT =
-	RECENT_ROW_PADDING_Y * 2 + Math.max(STATUS_ICON_SIZE, XS_LINE_HEIGHT); // 27
-/** Stack gap={4} between activity rows. */
-export const RECENT_STACK_GAP = 4;
+/**
+ * Activity row height — the TRACE row height, not a bespoke one.
+ *
+ * These rows used to be tinted `5px 7px` buttons (27px), so the same child tool
+ * call looked like a chunky card row inside a subagent card and like a slim trace
+ * line once the reader dropped to a low LOD. They are now the same row, which is
+ * expressed by taking the height from `measure-tool-run` rather than restating it.
+ * One-way import: `measure-tool-run` never imports this module.
+ */
+export const RECENT_ROW_HEIGHT = TRACE_ROW_HEIGHT; // 18.8
+/** Trace rows sit flush; the old 4px seam belonged to the tinted-button look. */
+export const RECENT_STACK_GAP = 0;
 /** At most 3 recent calls are shown (slice(-3)). */
 export const RECENT_MAX_ROWS = 3;
 
@@ -227,6 +236,20 @@ export interface SubagentCardData {
 	isTerminal?: boolean;
 	/** Number of recent activity calls (≤3 shown). */
 	recentCallCount?: number;
+	/**
+	 * Per-recent-call label detail (`Bash` → its description, `Read` → the file's
+	 * basename), POSITIONALLY aligned with the row names.
+	 *
+	 * Render-only: a row's title is one truncating line, so its length cannot change
+	 * the row's fixed height. Present so the vlist row says the same thing the
+	 * chunked one does — it previously showed only the bare tool name.
+	 */
+	recentCallSummaries?: Array<string | null | undefined>;
+	/**
+	 * Per-recent-call tool category for the row's chip, positionally aligned with
+	 * the names. Render-only (fixed 14px chip slot).
+	 */
+	recentCallCategories?: Array<string | null | undefined>;
 	/** Whether the recent-calls title row shows the "open session" button. */
 	hasRecentCallsButton?: boolean;
 	/** Self-permission detail (P11). Presence forces expansion + the perm block. */
@@ -343,6 +366,10 @@ export interface MeasuredSubagent extends MeasuredElement {
 	timing: ToolTimingStamps;
 	/** One stamp record per DRAWN recent-call row (length == recentRowCount). */
 	recentCallTimings: Array<ToolTimingStamps & { status: string | null }>;
+	/** Label detail per DRAWN recent-call row (length == recentRowCount). */
+	recentCallSummaries: Array<string | null>;
+	/** Tool category per DRAWN recent-call row (length == recentRowCount). */
+	recentCallCategories: Array<string | null>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -625,7 +652,30 @@ export function measureSubagentCard(
 			...resolveToolTimingStamps(entry ?? {}),
 			status: typeof entry?.status === "string" ? entry.status : null,
 		})),
+		// Sliced and length-normalized the same way, so the renderer can index all
+		// three arrays in lockstep with the names it paints.
+		recentCallSummaries: sliceRowStrings(data.recentCallSummaries, recentRowCount),
+		recentCallCategories: sliceRowStrings(data.recentCallCategories, recentRowCount),
 	};
+}
+
+/**
+ * Normalize a per-row string array to exactly `count` entries.
+ *
+ * Padding with nulls (rather than returning a short array) is what lets the
+ * renderer index it positionally without a bounds check — a header that arrived
+ * with no summary is `null`, not `undefined` from a missing slot.
+ */
+function sliceRowStrings(
+	values: Array<string | null | undefined> | undefined,
+	count: number,
+): Array<string | null> {
+	const out: Array<string | null> = [];
+	for (let i = 0; i < count; i++) {
+		const value = values?.[i];
+		out.push(typeof value === "string" && value.length > 0 ? value : null);
+	}
+	return out;
 }
 
 /** Parse once, measure many (e.g. on resize / LOD change). Reusable closure. */
@@ -649,7 +699,6 @@ export const MEASURE_SUBAGENT_CONSTANTS = {
 	RESULT_PREVIEW_MARGIN_TOP,
 	BUTTON_COMPACT_XS,
 	RECENT_TITLE_MARGIN_BOTTOM,
-	RECENT_ROW_PADDING_Y,
 	RECENT_ROW_HEIGHT,
 	RECENT_STACK_GAP,
 	RECENT_MAX_ROWS,

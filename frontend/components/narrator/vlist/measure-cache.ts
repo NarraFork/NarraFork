@@ -205,6 +205,14 @@ function traceRevision(d: Record<string, unknown>): string {
 		if (typeof r.key === "string") rev += `|tk:${r.key}`;
 		if (typeof r.title === "string") rev += `|tt:${textSignature(r.title)}`;
 		if (typeof r.status === "string") rev += `|ts:${r.status}`;
+		// The row's duration is height-neutral but PAINTED from the cached payload, so
+		// it needs the same treatment `timeoutMs` gets above. `status` normally moves
+		// with it (running → success arrives together with `durationMs`); this keys the
+		// value directly so a duration-only correction cannot serve a stale row.
+		if (r.timing != null && typeof r.timing === "object") {
+			const duration = (r.timing as Record<string, unknown>).durationMs;
+			if (typeof duration === "number") rev += `|tm:${duration}`;
+		}
 		// An expandable body is measured as markdown when its row is expanded.
 		const body = typeof r.bodyText === "string" ? r.bodyText : r.body;
 		if (typeof body === "string") rev += `|tb:${textSignature(body)}`;
@@ -264,6 +272,22 @@ function subagentRevision(d: Record<string, unknown>): string {
 		rev += `|gk:${d.recentCallNames.length}`;
 		for (const name of d.recentCallNames) {
 			if (typeof name === "string") rev += `|gm:${name}`;
+		}
+	}
+	// Row label detail + category chip. Height-neutral, but PAINTED from the cached
+	// payload (the measure layer slices both to the drawn rows), so they need the
+	// same treatment `timeoutMs` gets. They are also the ONLY delta in a real case:
+	// a live `tool_use_chunk` fills in a call's `inputSummary` while the row count,
+	// names and status all stay put — without this the row keeps its bare tool name
+	// until the next full rebuild. Bounded: at most 3 short strings each.
+	if (Array.isArray(d.recentCallSummaries)) {
+		for (const summary of d.recentCallSummaries) {
+			if (typeof summary === "string") rev += `|gs:${textSignature(summary)}`;
+		}
+	}
+	if (Array.isArray(d.recentCallCategories)) {
+		for (const category of d.recentCallCategories) {
+			if (typeof category === "string") rev += `|gc:${category}`;
 		}
 	}
 	if (d.hasRecentCallsButton === true) rev += "|gb:1";

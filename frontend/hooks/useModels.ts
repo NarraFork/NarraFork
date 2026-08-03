@@ -465,9 +465,17 @@ export function useAllModels() {
 			prefix: string;
 			name: string;
 			models: ModelOption[];
+			pluginId?: string;
+			contributionId?: string;
 		}> = (settingsData?.pluginProviderModelsGrouped ?? [])
 			.map(
-				(group: { prefix?: unknown; name?: unknown; models?: Array<Record<string, unknown>> }) => {
+				(group: {
+					prefix?: unknown;
+					name?: unknown;
+					pluginId?: unknown;
+					contributionId?: unknown;
+					models?: Array<Record<string, unknown>>;
+				}) => {
 					const prefix = typeof group.prefix === "string" ? group.prefix : "";
 					const name = typeof group.name === "string" && group.name ? group.name : prefix;
 					const models: ModelOption[] = (group.models ?? []).flatMap((entry) => {
@@ -494,7 +502,17 @@ export function useAllModels() {
 							},
 						];
 					});
-					return { prefix, name, models };
+					return {
+						prefix,
+						name,
+						models,
+						// Carried through so the provider settings page can address the owning
+						// plugin; the prefix alone is user-overridable and not a stable key.
+						...(typeof group.pluginId === "string" ? { pluginId: group.pluginId } : {}),
+						...(typeof group.contributionId === "string"
+							? { contributionId: group.contributionId }
+							: {}),
+					};
 				},
 			)
 			.filter((group: { prefix: string }) => group.prefix.length > 0);
@@ -696,6 +714,12 @@ export function useAllModels() {
 			settingsData,
 			/** Per-provider model groups BEFORE disabled filtering (for overview). */
 			allProviderModels: providerModelArrays,
+			/**
+			 * Executable-plugin providers, with their owning plugin identity. Kept separate
+			 * from `allProviderModels` because the provider settings page needs to know which
+			 * prefixes came from plugins in order to route the detail area.
+			 */
+			pluginProviderGroups,
 			/** Provider capability keys that are configured but unavailable for agent mode. */
 			agentModeUnsupportedProviders,
 			/** Set of disabled provider prefixes (for overview). */

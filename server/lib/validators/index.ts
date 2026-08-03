@@ -61,6 +61,7 @@ export {
 } from "./containers";
 export {
 	createRemoteDeviceSchema,
+	deviceBrowseQuerySchema,
 	deviceSlugSchema,
 	deviceStatQuerySchema,
 	deviceTransferSchema,
@@ -141,6 +142,7 @@ export {
 	forkFromMessagesSchema,
 	forkNarratorSchema,
 	migrateBrokenModelNarratorsSchema,
+	narratorExportQuerySchema,
 	narratorHandleSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,

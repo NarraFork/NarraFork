@@ -9,6 +9,7 @@ import type {
 	PluginCatalogSnapshot,
 	PluginPackageSummary,
 } from "./plugin-catalog";
+import type { PluginCommandRegistry } from "./plugin-command-registry";
 import type { PluginContributionRegistry } from "./plugin-contribution-registry";
 import { providerRegistrationsFromManifest } from "./plugin-provider-manifest";
 import type { PluginProviderRegistry } from "./plugin-provider-registry";
@@ -67,6 +68,12 @@ export interface PluginContributionCoordinatorOptions {
 	 * absent no provider registration happens at all.
 	 */
 	providerRegistry?: PluginProviderRegistry;
+	/**
+	 * Registry for plugin-declared commands, kept in sync with `contributes.commands`.
+	 * Optional for the same reason as `providerRegistry`: callers that only exercise tools
+	 * should not have to construct one.
+	 */
+	pluginCommandRegistry?: PluginCommandRegistry;
 	/** Persisted provider config, so a restart re-registers with the user's settings. */
 	providerConfigSource?: PluginProviderConfigSource;
 	/** Persisted prefix overrides, so a restart keeps the admin's chosen namespace. */
@@ -254,6 +261,7 @@ function sameManifestGeneration(
 export class PluginContributionCoordinator {
 	readonly contributionRegistry: PluginContributionRegistry;
 	readonly toolRegistry: PluginToolRegistry;
+	private readonly pluginCommandRegistry?: PluginCommandRegistry;
 	readonly providerRegistry?: PluginProviderRegistry;
 	private readonly providerConfigSource?: PluginProviderConfigSource;
 	private readonly providerPrefixSource?: PluginProviderPrefixSource;
@@ -274,6 +282,7 @@ export class PluginContributionCoordinator {
 	constructor(options: PluginContributionCoordinatorOptions) {
 		this.contributionRegistry = options.contributionRegistry;
 		this.toolRegistry = options.toolRegistry;
+		this.pluginCommandRegistry = options.pluginCommandRegistry;
 		this.providerRegistry = options.providerRegistry;
 		this.providerConfigSource = options.providerConfigSource;
 		this.providerPrefixSource = options.providerPrefixSource;
@@ -436,6 +445,7 @@ export class PluginContributionCoordinator {
 				if (!item) {
 					this.toolRegistry.removePlugin(pluginId);
 					this.providerRegistry?.removePlugin(pluginId);
+					this.pluginCommandRegistry?.removePlugin(pluginId);
 					continue;
 				}
 				if (!manifest || !sameManifestGeneration(manifest, packageSummary)) {
@@ -456,6 +466,9 @@ export class PluginContributionCoordinator {
 					JSON.stringify(previousManifest) !== JSON.stringify(manifest);
 				if (shouldReplace) {
 					this.toolRegistry.replaceManifest(manifest);
+					// `registerManifest` replaces this plugin's commands wholesale, so a
+					// contribution the new generation dropped cannot linger as a dispatchable id.
+					this.pluginCommandRegistry?.registerManifest(manifest);
 					this.replaceProviderManifest(pluginId, manifest, generation, diagnostics);
 				}
 				const state = stateMap(states).get(pluginId);
@@ -619,9 +632,11 @@ export class PluginContributionCoordinator {
 		for (const pluginId of touchedPluginIds) {
 			this.toolRegistry.removePlugin(pluginId);
 			this.providerRegistry?.removePlugin(pluginId);
+			this.pluginCommandRegistry?.removePlugin(pluginId);
 		}
 		for (const [pluginId, manifest] of previousManifests) {
 			this.toolRegistry.replaceManifest(manifest);
+			this.pluginCommandRegistry?.registerManifest(manifest);
 			// Diagnostics collected during a rollback are discarded: the caller reports the
 			// original failure, which is the one worth surfacing.
 			this.replaceProviderManifest(pluginId, manifest, previousGenerations.get(pluginId), []);

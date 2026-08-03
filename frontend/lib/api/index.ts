@@ -110,6 +110,7 @@ export type {
 	KnowledgeLinkType,
 	KnowledgeOpenSubmission,
 	KnowledgePersonalEntry,
+	KnowledgePersonalEntrySummary,
 	KnowledgeRebaseStrategy,
 	KnowledgeReviewInboxCount,
 	KnowledgeReviewResult,

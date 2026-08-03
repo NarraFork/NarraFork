@@ -65,6 +65,9 @@ const NO_LABELS_KINDS: Record<string, string> = {
 	// count), mapped onto render labels by resolveRenderExtra.
 	"tool-run-count": "header text arrives as adapter data",
 	"reasoning-count": "header text arrives as adapter data",
+	// Usage rows are composed entirely by the shared formatter (numbers + fixed
+	// ASCII units), so there is no translatable chrome to inject.
+	"turn-usage": "lines composed by the shared turn-usage formatter",
 	// RenderSubagentRecovery declares no `labels` prop: its card text is composed by
 	// the adapter (ctx.labels) and its two buttons read the measured block data.
 	"subagent-recovery": "card text composed by the adapter (ctx.labels)",

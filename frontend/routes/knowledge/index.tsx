@@ -65,7 +65,6 @@ import {
 import type {
 	KnowledgeCollection,
 	KnowledgeOpenSubmission,
-	KnowledgePersonalEntry,
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
 } from "../../lib/api";
@@ -801,7 +800,7 @@ function MyLibraryTab() {
 						</Paper>
 					) : (
 						<Stack gap="xs">
-							{(entries.data as KnowledgePersonalEntry[]).map((p) => {
+							{(entries.data ?? []).map((p) => {
 								// Both kinds are now openable: a linked entry goes to its global entry's
 								// Draft tab; a standalone entry (no global counterpart yet) has its own page.
 								const openEntry = () =>

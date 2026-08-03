@@ -5,6 +5,7 @@ import { AsyncMutex } from "@server/lib/async-mutex";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
 import { generateShortId } from "@server/lib/id";
+import { adaptPluginCapability } from "@server/lib/integrations/capability-adapters";
 import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { type Manifest, pluginIdSchema, safeParseManifest } from "@server/lib/plugins/manifest";
@@ -281,6 +282,57 @@ function isVolatileRuntimeState(state: PluginStateRecord["runtimeState"]): boole
 		"deactivating",
 		"backoff",
 	].includes(state);
+}
+
+/**
+ * Grant the capabilities a Manifest declares, at first bind of an installation.
+ *
+ * Installing a plugin *is* the trust decision — it puts arbitrary code on the server — so
+ * the capabilities it declared are granted rather than withheld pending a second approval.
+ * This is the "default allow" half of the open-capability model.
+ *
+ * It is applied here, at install/first-bind, and deliberately **not** as a fallback inside
+ * `CapabilityBroker.authorize()`. The broker reads the grant list as live state: `revoke()`
+ * and the lifecycle coordinator express revocation by removing capabilities from it, so a
+ * fallback there would make `disable`/`revoke` silently ineffective.
+ *
+ * **Only capabilities with a canonical adapter are seeded.** Declarations are open — the
+ * manifest schema accepts `admin`, `*`, `network.any` or a vendor-specific token — but a
+ * grant has to be expressible in the authority kernel, which is keyed by
+ * `PLUGIN_CAPABILITY_ADAPTER`. Seeding an unmappable token made `toAuthorityGrants()` throw
+ * `IntegrationAuthorityConflictError`, so *installation itself* failed with a 409 worded in
+ * internal terms. Dropping it here keeps the two halves consistent: the declaration parses,
+ * it simply produces no grant, and the broker (which also requires an adapter) stays
+ * fail-closed at call time. Ignored tokens are logged rather than silently swallowed so an
+ * author can see why a declared capability never took effect.
+ *
+ * An existing summary is returned untouched: once an installation has a grant list, later
+ * edits (including revocation) own it.
+ */
+export function seedGrantsFromManifest(
+	summary: PluginGrantSummary,
+	manifestRequested: readonly string[],
+	context?: { pluginId?: string },
+): PluginGrantSummary {
+	if (summary.count > 0 || summary.capabilities.length > 0) return summary;
+	const declared = [...new Set(manifestRequested)];
+	if (declared.length === 0) return summary;
+	const capabilities = declared.filter((capability) => adaptPluginCapability(capability));
+	const ignored = declared.filter((capability) => !adaptPluginCapability(capability));
+	if (ignored.length > 0) {
+		logger.warn("Ignoring plugin capabilities with no canonical adapter while seeding grants", {
+			pluginId: context?.pluginId,
+			ignored,
+			seeded: capabilities.length,
+		});
+	}
+	if (capabilities.length === 0) return summary;
+	return {
+		...summary,
+		count: capabilities.length,
+		capabilities,
+		revision: Math.max(1, summary.revision),
+	};
 }
 
 function currentPackage(plugin: PluginCatalogPlugin | undefined): PluginPackageSummary | undefined {
@@ -1251,8 +1303,12 @@ export class PluginManager {
 			const permissions = await this.integrationAuthorityService.ensureInstallation(
 				installed.pluginId,
 				installed.hash,
-				previousState?.grants ??
-					createPluginStateRecord(installed.pluginId, this.timestamp()).grants,
+				seedGrantsFromManifest(
+					previousState?.grants ??
+						createPluginStateRecord(installed.pluginId, this.timestamp()).grants,
+					installed.manifest.permissions.host,
+					{ pluginId: installed.pluginId },
+				),
 				previousState?.current?.hash,
 			);
 			await this.syncPermissionSummary(installed.pluginId, permissions);

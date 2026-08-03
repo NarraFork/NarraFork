@@ -428,45 +428,23 @@ function isAdminActor(c: Context): boolean {
 }
 
 /**
- * Determine a plugin's risk tier from a manager status object. Mirrors
- * `pluginTier` in manifest.ts but reads the bounded status shape: `manifest.server`
- * presence + whether any contribution is a view. theme-only ⟺ no server, no view.
+ * Plugin lifecycle operations require an administrator.
+ *
+ * This replaces a three-tier scheme (`theme-only` / `frontend` / `backend`) that let any
+ * logged-in user install and enable a plugin with no server entry and no views. The tiering
+ * did not survive scrutiny: a "frontend" plugin runs arbitrary JavaScript in the user's
+ * browser against their own session, so calling it lower-risk than a backend plugin drew a
+ * line in the wrong place, and classifying by *shape* meant a plugin changed risk class by
+ * adding a view.
+ *
+ * The admin requirement itself stays, and is the one install-time gate this whole
+ * open-capability change deliberately keeps: installing a plugin puts third-party code on
+ * the server, which is a different decision from what an installed plugin may then do.
  */
-function statusPluginTier(status: unknown): "theme-only" | "frontend" | "backend" {
-	if (!status || typeof status !== "object") return "backend";
-	const record = status as Record<string, unknown>;
-	const manifest =
-		record.manifest && typeof record.manifest === "object" && !Array.isArray(record.manifest)
-			? (record.manifest as Record<string, unknown>)
-			: undefined;
-	// Fail safe: if we cannot read the manifest, we cannot confirm the plugin is
-	// genuinely serverless, so treat it as backend (admin-required) rather than
-	// optimistically classifying an unknown plugin as low-risk theme-only.
-	if (!manifest) return "backend";
-	if (manifest.server) return "backend";
-	const contributions = Array.isArray(record.contributions) ? record.contributions : [];
-	const hasView = contributions.some(
-		(entry) =>
-			entry &&
-			typeof entry === "object" &&
-			!Array.isArray(entry) &&
-			(entry as Record<string, unknown>).kind === "view",
-	);
-	if (hasView) return "frontend";
-	return "theme-only";
-}
-
-/**
- * Enforce that a lifecycle operation is permitted for the current actor. Only
- * theme-only plugins (zero-JS, whitelisted CSS-variable themes) are open to any
- * logged-in user; frontend/backend plugins still require an admin. Throws 403
- * when a non-admin targets a non-theme-only plugin.
- */
-function assertTierAllowed(c: Context, status: unknown): void {
+function assertPluginAdmin(c: Context): void {
 	if (isAdminActor(c)) return;
-	if (statusPluginTier(status) === "theme-only") return;
 	throw new AppError(
-		"This plugin requires an administrator; only theme-only plugins are open to all users",
+		"Plugin lifecycle operations require an administrator",
 		403,
 		"PLUGIN_REQUIRES_ADMIN",
 	);
@@ -758,34 +736,15 @@ export function createPluginRoutes(
 		}
 	});
 
-	// Install is login-only (not admin-gated) so any user can add a theme-only
-	// plugin. The tier is only known AFTER static parsing, so we install first
-	// (install never executes plugin code) and then, if the result is not
-	// theme-only and the actor is not an admin, roll the install back and 403.
-	// Enforce the tier gate after a (code-free) install: a non-admin may only end
-	// up with a theme-only plugin. Otherwise roll the install back and refuse.
-	// Shared by the JSON-path and multipart-upload install flows.
-	const enforceInstallTier = async (c: Context, status: unknown): Promise<void> => {
-		if (isAdminActor(c) || statusPluginTier(status) === "theme-only") return;
-		const rec = status as Record<string, unknown>;
-		const installedId = typeof rec.pluginId === "string" ? rec.pluginId : undefined;
-		if (installedId && manager.uninstall) {
-			try {
-				await manager.uninstall(installedId);
-			} catch {
-				// Best-effort rollback; still refuse below.
-			}
-		}
-		throw new AppError(
-			"Only theme-only plugins can be installed without administrator privileges",
-			403,
-			"PLUGIN_REQUIRES_ADMIN",
-		);
-	};
-
 	app.post("/install", auth, async (c) => {
 		try {
 			requirePluginsEnabled();
+			// Checked before installing, not after. The old flow had to install first because
+			// the risk tier was only knowable from a parsed manifest, then roll back and 403 a
+			// non-admin — which meant an unauthorized request still wrote to disk. A flat admin
+			// rule is decidable from the request alone, so nothing is staged for a caller who
+			// was never allowed to install.
+			assertPluginAdmin(c);
 			const contentType = c.req.header("content-type") ?? "";
 
 			// Multipart upload: install directly from the uploaded bytes (no
@@ -810,7 +769,6 @@ export function createPluginRoutes(
 					);
 				}
 				const status = await manager.install(archive);
-				await enforceInstallTier(c, status);
 				return c.json(sanitizeSummary(status), 201);
 			}
 
@@ -825,7 +783,6 @@ export function createPluginRoutes(
 			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
 			const source = resolveInstallPath(parsed.data.path, installRoots);
 			const status = await manager.install(source);
-			await enforceInstallTier(c, status);
 			return c.json(sanitizeSummary(status), 201);
 		} catch (error) {
 			return errorResponse(c, error);
@@ -840,17 +797,16 @@ export function createPluginRoutes(
 		["retry", "retry"],
 	] as const;
 	for (const [path, method] of lifecycle) {
-		// Login-only routes; the tier gate inside decides whether admin is required.
-		// theme-only plugins are manageable by any user, everything else needs admin.
+		// Every lifecycle transition requires an admin, regardless of what the plugin
+		// contributes. Previously a non-admin could enable/disable/uninstall a plugin the
+		// host classified as theme-only.
 		app.post(`/:pluginId/${path}`, auth, async (c) => {
 			try {
 				requirePluginsEnabled();
+				assertPluginAdmin(c);
 				const pluginId = parsePluginId(c);
-				// Look up the current tier before mutating so a non-admin cannot
-				// enable/disable/uninstall a frontend/backend plugin.
 				const current = await manager.getStatus(pluginId);
 				if (current == null) throw new NotFoundError("Plugin", pluginId);
-				assertTierAllowed(c, current);
 				return c.json(statusEnvelope(await invokeLifecycle(manager, method, pluginId), pluginId));
 			} catch (error) {
 				return errorResponse(c, error);

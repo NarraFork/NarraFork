@@ -50,6 +50,14 @@ export interface PluginProviderCatalogRefresherOptions {
 	registry: PluginProviderRegistry;
 	clientPool: PluginProviderClientPool;
 	maxPages?: number;
+	/**
+	 * Resolve the config sent with `listModels`, including stored credentials.
+	 *
+	 * Model enumeration usually needs the same authentication as a chat call, so without
+	 * this a credentialed provider reports an empty catalog. Falls back to the registry's
+	 * plain config when omitted.
+	 */
+	resolveConfig?: (providerInstanceId: string) => Promise<Record<string, JsonValue>>;
 }
 
 /**
@@ -98,12 +106,16 @@ export class PluginProviderCatalogRefresher {
 	private readonly registry: PluginProviderRegistry;
 	private readonly clientPool: PluginProviderClientPool;
 	private readonly maxPages: number;
+	private readonly resolveConfig?: (
+		providerInstanceId: string,
+	) => Promise<Record<string, JsonValue>>;
 	private readonly inFlight = new Map<string, Promise<ProviderCatalogRefreshResult>>();
 
 	constructor(options: PluginProviderCatalogRefresherOptions) {
 		this.registry = options.registry;
 		this.clientPool = options.clientPool;
 		this.maxPages = Math.max(1, options.maxPages ?? MAX_CATALOG_PAGES);
+		if (options.resolveConfig) this.resolveConfig = options.resolveConfig;
 	}
 
 	/**
@@ -196,13 +208,19 @@ export class PluginProviderCatalogRefresher {
 			let stale = false;
 			let pagesFetched = 0;
 
+			// The plugin may need credentials from config to enumerate models. Resolved once
+			// for the whole pagination run: the pages form a single logical operation, and
+			// re-resolving per page would multiply vault reads for no benefit.
+			const config = this.resolveConfig
+				? await this.resolveConfig(entry.providerInstanceId)
+				: this.registry.getConfig(entry.providerInstanceId);
+
 			for (let page = 0; page < this.maxPages; page += 1) {
 				const catalog = await client.listModels(
 					{
 						providerTypeId: entry.providerTypeId,
 						providerInstanceId: entry.providerInstanceId,
-						// The plugin may need credentials from config to enumerate models.
-						config: this.registry.getConfig(entry.providerInstanceId),
+						config,
 						...(cursor ? { cursor } : {}),
 						...(options.force ? { refresh: true } : {}),
 					},

@@ -119,7 +119,24 @@ const CATEGORY_COLORS: Record<string, string> = {
 	treeSnapshots: "violet",
 	containers: "cyan",
 };
+/**
+ * Categories rendered as cards, in display order. Must cover every category the
+ * scan reports, otherwise a category's bytes land in the total with no card to
+ * explain them.
+ */
+const DISPLAYED_CATEGORY_KEYS = [
+	"database",
+	"uploads",
+	"shares",
+	"worktrees",
+	"treeSnapshots",
+	"containers",
+] as const;
+
 const STORAGE_SETTINGS_QUERY_GC_TIME_MS = 60_000;
+
+// Nested rows need a subtle tint that differs from the card body in both color schemes.
+const NESTED_ROW_BG = "light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-6))";
 
 const DATABASE_TARGET_DEFAULT_DAYS: Record<
 	Exclude<DatabaseCleanupTarget, "archivedSessions">,
@@ -570,8 +587,16 @@ export function StorageSection() {
 					shm: formatBytes(details.shmBytes),
 				});
 			}
-			case "uploads":
-				return t("storageNarratorDirs", { count: Number(d.narratorDirs ?? 0) });
+			case "uploads": {
+				const dirs = t("storageNarratorDirs", { count: Number(d.narratorDirs ?? 0) });
+				// Avatars are excluded from this category's size and from its cleanup, so name
+				// them explicitly rather than leaving the gap unexplained.
+				const avatarBytes = Number(d.avatarBytes ?? 0);
+				if (avatarBytes <= 0) return dirs;
+				return `${dirs} · ${t("storageUploadsAvatarsExcluded", {
+					size: formatBytes(avatarBytes),
+				})}`;
+			}
 			case "shares":
 				return t("storageShareCount", { count: Number(d.shareCount ?? 0) });
 			case "worktrees":
@@ -769,7 +794,7 @@ export function StorageSection() {
 
 				{scanResult && (
 					<Stack gap="xs">
-						{["database", "uploads", "shares", "worktrees", "containers"].map((key) => {
+						{DISPLAYED_CATEGORY_KEYS.map((key) => {
 							const cat = getCategory(key);
 							if (!cat) return null;
 							const color = CATEGORY_COLORS[key] ?? "gray";
@@ -910,7 +935,13 @@ export function StorageSection() {
 														)}
 														<Stack gap={6}>
 															{databaseUsageCategories.map((category) => (
-																<Paper key={category.key} p="xs" radius="sm" bg="dark.6" withBorder>
+																<Paper
+																	key={category.key}
+																	p="xs"
+																	radius="sm"
+																	bg={NESTED_ROW_BG}
+																	withBorder
+																>
 																	<Group
 																		justify="space-between"
 																		align="flex-start"
@@ -955,7 +986,13 @@ export function StorageSection() {
 												{databaseUsageCategories.length > 0 && <Divider />}
 												<Stack gap="xs">
 													{databaseRows.map((row) => (
-														<Paper key={row.target} p="xs" radius="sm" bg="dark.6" withBorder>
+														<Paper
+															key={row.target}
+															p="xs"
+															radius="sm"
+															bg={NESTED_ROW_BG}
+															withBorder
+														>
 															<Group
 																justify="space-between"
 																align="flex-start"

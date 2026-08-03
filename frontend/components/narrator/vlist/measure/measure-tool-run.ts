@@ -24,9 +24,15 @@
  *
  *   TraceRow:
  *     <Box>
- *       <Group py={1}>chevron|dot 12 + <ThemeIcon 14>? + <Text xs truncate>title</Group>
+ *       <Group py={1}>chevron|dot 12 + <ThemeIcon 14>? + <Text xs truncate>title
+ *                     + status glyph 12? + timing?</Group>
  *       {expanded && <Box pl="lg" py={2} borderLeft:2px><MarkdownContent/></Box>}
  *     </Box>
+ *
+ * The trailing status glyph (12px fixed slot) and timing text (one nowrap xs span,
+ * 16.8px line) both fit INSIDE the row's existing 16.8px content lane, so a row
+ * carrying them measures exactly the same 18.8px as one that does not — see
+ * `TRACE_ROW_CONTENT`. Only reasoning rows omit them, and they are unaffected.
  *
  * ── Line box convention ──────────────────────────────────────────────────────
  * The header / rows / count line are all `<Text size="xs">`, whose line box is
@@ -70,7 +76,13 @@ import { measureMarkdown } from "./measure-markdown";
 // The drill-down card. NOT a cycle: measure-tool-call depends on markdown /
 // media / permission / reflection / pretext-metrics and never on this module
 // (measure-subagent's dependency on it is one-way for the same reason).
-import { type MeasuredToolCall, measureToolCall, type ToolCallData } from "./measure-tool-call";
+import {
+	type MeasuredToolCall,
+	measureToolCall,
+	resolveToolTimingStamps,
+	type ToolCallData,
+	type ToolTimingStamps,
+} from "./measure-tool-call";
 
 // ── Chrome constants (px) — CONTRACT §3/§4 + CollapsibleTrace.tsx ─────────────
 
@@ -101,8 +113,29 @@ export const TRACE_HEADER_GROUP_HEIGHT = TRACE_HEADER_PADDING_Y * 2 + TRACE_HEAD
 /** Collapsed (header-only) band height: outer py*2 + header group = 4 + 20.8 = 24.8. */
 export const TRACE_HEADER_BAND_HEIGHT = TRACE_OUTER_PADDING_Y * 2 + TRACE_HEADER_GROUP_HEIGHT;
 
-/** Row content lane: max(row icon 14, chevron 12, xs line 16.8) = 16.8. */
-export const TRACE_ROW_CONTENT = Math.max(TRACE_ROW_ICON, TRACE_CHEVRON, TRACE_XS_LINE);
+/** Trailing status glyph size (12) — same slot the chunk path reserves. */
+export const TRACE_ROW_STATUS = 12;
+/**
+ * Gap between a trace row's cells (`<Group gap={6}>`).
+ *
+ * Horizontal only, so it never enters a height computation; it lives here so the
+ * trace rows and the subagent card's recent-call rows — which are the same row —
+ * read it from one place instead of both hard-coding `6`.
+ */
+export const TRACE_ROW_GAP = 6;
+/**
+ * Row content lane: max(row icon 14, chevron 12, status 12, xs line 16.8) = 16.8.
+ *
+ * The xs text line dominates every glyph in the row, which is precisely why the
+ * trailing status + timing slots are height-neutral: adding them cannot raise this
+ * max, so `TRACE_ROW_HEIGHT` is unchanged.
+ */
+export const TRACE_ROW_CONTENT = Math.max(
+	TRACE_ROW_ICON,
+	TRACE_CHEVRON,
+	TRACE_ROW_STATUS,
+	TRACE_XS_LINE,
+);
 /** Trace row height: py*2 + content = 2 + 16.8 = 18.8. Shared by rows + toggle. */
 export const TRACE_ROW_HEIGHT = TRACE_ROW_PADDING_Y * 2 + TRACE_ROW_CONTENT;
 
@@ -158,6 +191,23 @@ export interface TraceItemData {
 	shimmer?: boolean;
 	/** Stable row key (renderer only); falls back to the row index. */
 	key?: string;
+	/**
+	 * Raw tool status for the row's trailing glyph (renderer only).
+	 *
+	 * HEIGHT-NEUTRAL: the glyph is a fixed 12px flex slot, well inside the row's
+	 * 16.8px content lane (`TRACE_ROW_CONTENT`), so a row with a status is exactly
+	 * as tall as one without. A row that carries none draws no slot at all, which is
+	 * what keeps reasoning rows byte-identical.
+	 */
+	status?: string | null;
+	/**
+	 * Lifecycle stamps for the row's trailing timing text (renderer only).
+	 *
+	 * HEIGHT-NEUTRAL for the same reason the tool card's header timing is: an
+	 * elapsed counter / final duration is one nowrap span sharing the row's fixed
+	 * line, and the breakdown popover is portaled.
+	 */
+	timing?: Partial<ToolTimingStamps> | null;
 	/**
 	 * Selection / context-menu coordinates for this row (renderer only).
 	 *
@@ -267,6 +317,13 @@ export interface MeasuredTraceRow {
 	hasIcon: boolean;
 	/** Row icon colour (renderer). */
 	iconColor?: string;
+	/** Raw tool status for the trailing glyph (renderer only; height-neutral). */
+	status: string | null;
+	/**
+	 * Lifecycle stamps for the trailing timing text (renderer only; height-neutral).
+	 * Null when the row carried none, so the slot is skipped entirely.
+	 */
+	timing: ToolTimingStamps | null;
 	/** Tool name for picking the real category glyph (renderer only). */
 	toolName?: string;
 	/** Resolved tool category for the glyph (renderer only). */
@@ -539,6 +596,12 @@ export function measureCollapsibleTrace(
 			iconColor: item.iconColor,
 			toolName: item.toolName,
 			category: item.category,
+			// Status / timing are pure PASSTHROUGH: neither appears in any height
+			// computation above. `timing` is normalized here (not in the renderer) so
+			// the render layer never re-parses wire shapes, mirroring measure-subagent's
+			// `recentCallTimings`.
+			status: item.status ?? null,
+			timing: item.timing ? resolveToolTimingStamps(item.timing) : null,
 			shimmer: !!item.shimmer,
 			expandable,
 			expanded,
@@ -588,6 +651,10 @@ export interface ToolRunSummaryItem {
 	iconColor?: string;
 	shimmer?: boolean;
 	key?: string;
+	/** Trailing status glyph (renderer only; height-neutral). */
+	status?: string | null;
+	/** Trailing timing text (renderer only; height-neutral). */
+	timing?: Partial<ToolTimingStamps> | null;
 	/** Row offers a drill-down chevron (height-neutral while collapsed). */
 	canDrillDown?: boolean;
 	/** Nested tool card, present only on a drilled-in row. */
@@ -632,6 +699,10 @@ export interface ActivityTraceItem {
 	iconColor?: string;
 	shimmer?: boolean;
 	key?: string;
+	/** Trailing status glyph (renderer only; height-neutral). */
+	status?: string | null;
+	/** Trailing timing text (renderer only; height-neutral). */
+	timing?: Partial<ToolTimingStamps> | null;
 	/** Row offers a drill-down chevron (height-neutral while collapsed). */
 	canDrillDown?: boolean;
 	/** Nested tool card, present only on a drilled-in row. */
@@ -769,6 +840,8 @@ export const MEASURE_TOOL_RUN_CONSTANTS = {
 	TRACE_HEADER_ICON,
 	TRACE_ROW_ICON,
 	TRACE_CHEVRON,
+	TRACE_ROW_STATUS,
+	TRACE_ROW_GAP,
 	TRACE_XS_LINE,
 	TRACE_HEADER_CONTENT,
 	TRACE_HEADER_GROUP_HEIGHT,

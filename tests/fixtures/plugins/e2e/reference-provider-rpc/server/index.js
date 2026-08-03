@@ -101,6 +101,17 @@ function describeProvider(id, params) {
 							enum: ["offline", "verbose"],
 							default: "offline",
 						},
+						// Declared with the spelling `04-server-rpc-and-provider.md` specifies.
+						// The host routes such a field to its secret vault and merges the stored
+						// value back into `config` for each call, so it must never carry a
+						// `default` and is never echoed back to any UI.
+						apiKey: {
+							type: "string",
+							title: "API key",
+							description: "Optional credential; demonstrates host-side secret injection.",
+							writeOnly: true,
+							"x-narrafork-secret": true,
+						},
 					},
 					additionalProperties: false,
 				},
@@ -192,10 +203,28 @@ const CHAT_WORDS_BY_MODE = {
 	verbose: ["Hello", " from", " the", " example", " provider", " in", " verbose", " mode", "."],
 };
 
+/**
+ * Appended so credential injection is observable end to end.
+ *
+ * The plugin reports only whether a key arrived, never any part of its value: a real
+ * provider would send it upstream, and echoing it into the stream would write the
+ * credential into stored narrator messages.
+ */
+const AUTH_WORDS = {
+	authenticated: [" [authenticated]"],
+	anonymous: [" [anonymous]"],
+};
+
 /** Fall back to `offline` for an absent or unknown mode, matching the schema default. */
 function chatWordsFor(config) {
-	const mode = object(config)?.apiMode;
-	return CHAT_WORDS_BY_MODE[mode] ?? CHAT_WORDS_BY_MODE.offline;
+	const record = object(config);
+	const mode = record?.apiMode;
+	const words = CHAT_WORDS_BY_MODE[mode] ?? CHAT_WORDS_BY_MODE.offline;
+	// An unset secret is absent from `config` rather than empty, which is what lets a
+	// real provider distinguish "not configured" from "configured as empty".
+	const apiKey = record?.apiKey;
+	const authenticated = typeof apiKey === "string" && apiKey.length > 0;
+	return [...words, ...(authenticated ? AUTH_WORDS.authenticated : AUTH_WORDS.anonymous)];
 }
 
 function streamChat(operationId) {

@@ -1,7 +1,6 @@
 import { z } from "zod";
 import {
 	capabilitySchema,
-	isWidePermission,
 	manifestCapabilityListSchema,
 	manifestCapabilitySchema,
 } from "./permissions";
@@ -309,10 +308,17 @@ const viewContributionSchema = contributionBaseSchema
 		entry: manifestPathSchema,
 		style: manifestPathSchema.optional(),
 		surfaces: z
-			.array(z.enum(["workspace", "director", "focus", "settings"]))
+			.array(z.enum(["workspace", "director", "focus", "settings", "provider-settings"]))
 			.min(1)
-			.max(4),
+			.max(5),
 		scope: z.enum(["workspace", "narrator", "project", "global"]),
+		/**
+		 * Provider this view configures. Required for (and only meaningful on) the
+		 * `provider-settings` surface, where the view replaces the host's generated
+		 * config form for one specific provider. Binding it here means the host knows at
+		 * install time which provider a view belongs to instead of guessing at runtime.
+		 */
+		providerId: contributionIdSchema.optional(),
 		instance: z.enum([
 			"singleton",
 			"singleton-per-workspace",
@@ -523,57 +529,50 @@ const emptyContributes = () => ({
 	themes: [],
 });
 
-const networkPermissionSchema = z
-	.object({
-		mode: z.enum(["none", "allowlist"]),
-		allow: z.array(textSchema(512)).max(100).default([]),
-		domains: z.array(z.string().min(1).max(253)).max(100).optional(),
-		ports: z.array(z.number().int().min(1).max(65_535)).max(100).optional(),
-		protocols: z
-			.array(z.enum(["http", "https"]))
-			.max(2)
-			.optional(),
-		followRedirects: z.boolean().optional(),
-		maxConnections: z.number().int().min(1).max(256).optional(),
-	})
-	.strict()
-	.superRefine((value, ctx) => {
-		if (
-			value.mode === "none" &&
-			(value.allow.length > 0 || value.domains?.length || value.ports?.length)
-		) {
-			ctx.addIssue({ code: "custom", message: "network allowlist fields require mode=allowlist" });
-		}
-	});
+/**
+ * Serialized-size ceiling for one uninspected `permissions` sub-object, in JSON characters.
+ *
+ * Size rather than a key count: a key count bounds nothing, because a single key can hold a
+ * megabyte-long string or a deeply nested array. 8K characters is far above any honest
+ * and far below a size that matters on the main thread.
+ *
+ * This is a **B-class survival limit, not a trust limit** (see
+ * `docs/plugin-system/11-capability-policy.md` §2). A parsed manifest is retained in memory
+ * and copied into the plugin state file, which is a synchronous JSON read/modify/write; an
+ * unvalidated `looseObject` therefore let a manifest smuggle up to the whole
+ * `MAX_MANIFEST_BYTES` budget into every state write, for a field nothing reads.
+ */
+const MAX_UNINSPECTED_PERMISSION_JSON_CHARS = 8 * 1024;
 
-const filesystemPermissionSchema = z
-	.object({
-		package: z.enum(["none", "readOnly"]),
-		pluginData: z.enum(["none", "readOnly", "readWrite"]),
-		pluginTemp: z.enum(["none", "readWrite"]).optional(),
-		workspace: z.enum(["none", "readOnly", "readWrite"]),
-		device: z.enum(["none", "readOnly", "readWrite"]).optional(),
-	})
-	.strict();
+/**
+ * `network` / `filesystem` / `process` declarations: optional, uninspected, size-capped.
+ *
+ * These are **documentation, not enforcement**. A search of the host finds no reader of
+ * `permissions.network`, `permissions.filesystem` or `permissions.process` — a plugin
+ * process gets its network access from the OS and its filesystem access from the runner,
+ * neither of which consults these fields. Validating their contents therefore only rejected
+ * manifests; it never restricted a running plugin.
+ *
+ * So the shape is kept loose enough to describe intent (and to keep old manifests parsing)
+ * without pretending to be a sandbox. Cross-field consistency rules are gone: refusing
+ * `mode: "none"` alongside a populated `allow` list was enforcing tidiness in a field nobody
+ * reads. Real network and process containment, when wanted, belongs to the Podman runner.
+ *
+ * The one check that remains is the size ceiling above, which constrains cost rather than
+ * shape: any keys are still accepted, there just cannot be 500 KB of them.
+ */
+const uninspectedPermissionSchema = (field: string) =>
+	z
+		.looseObject({})
+		.refine(
+			(value) => JSON.stringify(value).length <= MAX_UNINSPECTED_PERMISSION_JSON_CHARS,
+			`permissions.${field} must serialize to at most ${MAX_UNINSPECTED_PERMISSION_JSON_CHARS} JSON characters`,
+		)
+		.optional();
 
-const processPermissionSchema = z
-	.object({
-		spawn: z.enum(["none", "allowlist"]),
-		executables: z.array(contributionIdSchema).max(50).optional(),
-	})
-	.strict()
-	.superRefine((value, ctx) => {
-		if (value.spawn === "none" && value.executables?.length) {
-			ctx.addIssue({ code: "custom", message: "executables require process.spawn=allowlist" });
-		}
-		if (value.spawn === "allowlist" && !value.executables?.length) {
-			ctx.addIssue({
-				code: "custom",
-				path: ["executables"],
-				message: "allowlist requires executables",
-			});
-		}
-	});
+const networkPermissionSchema = uninspectedPermissionSchema("network");
+const filesystemPermissionSchema = uninspectedPermissionSchema("filesystem");
+const processPermissionSchema = uninspectedPermissionSchema("process");
 
 const permissionsSchema = z
 	.object({
@@ -582,28 +581,11 @@ const permissionsSchema = z
 		filesystem: filesystemPermissionSchema,
 		process: processPermissionSchema,
 	})
-	.strict()
-	.superRefine((value, ctx) => {
-		for (const [index, permission] of value.host.entries()) {
-			if (isWidePermission(permission)) {
-				ctx.addIssue({
-					code: "custom",
-					path: ["host", index],
-					message: `wide permission is not allowed: ${permission}`,
-				});
-			}
-		}
-		if (value.network.mode === "allowlist" && value.network.allow.some(isWidePermission)) {
-			ctx.addIssue({
-				code: "custom",
-				path: ["network", "allow"],
-				message: "wide network permission is not allowed",
-			});
-		}
-		if (value.filesystem.workspace === "none" && value.filesystem.pluginData === "none") {
-			// Explicitly denying both scopes is valid; this branch documents the deny-by-default shape.
-		}
-	});
+	.strict();
+// No wide-permission rejection. A plugin may declare any capability, including `*`,
+// `admin` or `network.any`: the host does not gate on declarations, so refusing them at
+// parse time only blocked honest plugins from describing what they do. Broad requests are
+// still identifiable via `isWidePermission`, which admin UIs use to label them.
 
 const secretSchema = z
 	.object({
@@ -763,7 +745,7 @@ function validateContributionReferences(
 			tools: Array<{ id: string }>;
 			commands: Array<{ id: string; inputSchema?: unknown }>;
 			events: Array<{ id: string; topic: string }>;
-			views: Array<{ id: string; commandId?: string }>;
+			views: Array<{ id: string; commandId?: string; providerId?: string; surfaces: string[] }>;
 			themes: Array<{ id: string }>;
 		};
 	},
@@ -803,6 +785,35 @@ function validateContributionReferences(
 				ctx,
 				["contributes", "views", index, "commandId"],
 				"view references an undeclared command",
+			);
+		}
+		const isProviderSettings = view.surfaces.includes("provider-settings");
+		if (isProviderSettings && !view.providerId) {
+			// Without this the host would have no way to tell which provider's settings the
+			// view replaces, and a plugin contributing two providers would be ambiguous.
+			addContributionReferenceIssue(
+				ctx,
+				["contributes", "views", index, "providerId"],
+				"provider-settings view requires providerId",
+			);
+		}
+		if (
+			view.providerId &&
+			!manifest.contributes.providers.some((provider) => provider.id === view.providerId)
+		) {
+			addContributionReferenceIssue(
+				ctx,
+				["contributes", "views", index, "providerId"],
+				"view references an undeclared provider",
+			);
+		}
+		if (view.providerId && !isProviderSettings) {
+			// A providerId on any other surface would silently do nothing, which reads as a
+			// working declaration to the plugin author.
+			addContributionReferenceIssue(
+				ctx,
+				["contributes", "views", index, "providerId"],
+				"providerId is only valid on the provider-settings surface",
 			);
 		}
 	}
@@ -923,7 +934,10 @@ const manifestV1BaseSchema = z
 		activationEvents: activationEventsSchema,
 		contributes: contributesSchema.default(emptyContributes),
 		configuration: configurationSchema.optional(),
-		permissions: permissionsSchema,
+		// Optional now: a plugin that declares nothing gets the same treatment as one that
+		// declares everything, so requiring the block was pure ceremony. Defaults keep
+		// `manifest.permissions.host` safe to read without a null check.
+		permissions: permissionsSchema.default({ host: [] }),
 		secrets: z.array(secretSchema).max(100).default([]),
 		dependencies: dependenciesSchema.default(emptyDependencies),
 	})
@@ -1006,19 +1020,22 @@ export function getContributionFullId(pluginId: string, contributionId: string):
 }
 
 /**
- * Plugin risk tier, derived purely from the manifest shape.
+ * What kind of plugin this manifest describes, from its shape alone.
  *
- * - `backend`  — declares a `server` (runs a backend process; full risk surface).
+ * - `backend`  — declares a `server` (runs a backend process).
  * - `frontend` — no server but contributes `views` (ships IIFE JS that executes
  *   in a sandboxed iframe on every client).
- * - `theme-only` — no server, no views: only `themes` (whitelisted design
- *   tokens compiled to scoped CSS variables). Zero code execution.
+ * - `theme-only` — no server, no views: only `themes` (design tokens compiled to
+ *   scoped CSS variables).
  *
- * This is the single authority for install/enable gating. It intentionally
- * relies ONLY on `manifest.server` and `contributes.views`, both enforced by the
- * schema's cross-field invariants, and NEVER on `permissions` — a manifest may
- * declare backend capabilities it cannot actually exercise, so using
- * permissions to classify would be spoofable.
+ * **Descriptive only — no longer a gate.** This used to decide who could install and enable
+ * a plugin: `theme-only` was open to any logged-in user, everything else needed an admin.
+ * That line was in the wrong place, because a `frontend` plugin runs arbitrary JavaScript
+ * against the user's own session, and a plugin changed risk class just by adding a view.
+ * Install and lifecycle now uniformly require an administrator (`server/routes/plugins.ts`).
+ *
+ * Retained because "does this ship a server / a view / only a theme" is genuinely useful for
+ * listing and filtering in an admin UI.
  */
 export type PluginTier = "theme-only" | "frontend" | "backend";
 
@@ -1031,7 +1048,7 @@ export function pluginTier(manifest: {
 	return "theme-only";
 }
 
-/** Whether a manifest is a low-risk, zero-code-execution theme-only plugin. */
+/** Whether a manifest ships only themes: no server process, no view JavaScript. */
 export function isThemeOnlyPlugin(manifest: {
 	server?: unknown;
 	contributes: { views: unknown[] };

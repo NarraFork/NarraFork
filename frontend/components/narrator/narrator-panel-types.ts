@@ -96,6 +96,7 @@ export interface NarratorPanelSnapshot {
 	substatus?: string[] | string | null;
 	reasoningEffort?: string | null;
 	fastMode?: boolean;
+	fastModeOverride?: "inherit" | "on" | "off";
 	turnStartedAt?: string | null;
 }
 

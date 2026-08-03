@@ -27,8 +27,9 @@ describe("plugin GA release validation", () => {
 		const summary = await validatePluginRelease(examplesRoot);
 		expect(summary.valid).toBe(true);
 		expect(summary.mode).toBe("static");
-		expect(summary.packageCount).toBe(6);
-		expect(summary.matrixCombinationCount).toBe(36);
+		expect(summary.packageCount).toBe(7);
+		// 7 packages across the 6 os/arch combinations the release matrix supports.
+		expect(summary.matrixCombinationCount).toBe(42);
 		expect(summary.errors).toEqual([]);
 		expect(summary.packages.map((item) => item.kind)).toEqual([
 			"provider",

@@ -141,6 +141,15 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
       delete: (input) => request("storage.delete", input),
       list: (input) => request("storage.list", input),
     }),
+    config: Object.freeze({ get: () => request("config.get") }),
+    // Own secrets, read and write. The host namespaces by the session's plugin id, so there
+    // is no parameter for naming another plugin's store.
+    secrets: Object.freeze({
+      get: (key) => request("secrets.get", { key }),
+      set: (key, value) => request("secrets.set", { key, value }),
+      delete: (key) => request("secrets.delete", { key }),
+      list: () => request("secrets.list"),
+    }),
     notifications: Object.freeze({ show: (input) => request("notifications.show", input) }),
     ui: Object.freeze({ openExternal: (input) => request("ui.openExternal", input) }),
   });

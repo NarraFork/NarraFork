@@ -1,3 +1,4 @@
+import type { PluginViewSurface } from "../../components/plugins/types";
 import {
 	ApiError,
 	absorbRenewedToken,
@@ -49,7 +50,7 @@ export interface PluginContributionSummary {
 	kind?: string;
 	title?: string;
 	/** Surfaces a view contribution may mount on; absent for other kinds. */
-	surfaces?: Array<"workspace" | "director" | "focus" | "settings">;
+	surfaces?: PluginViewSurface[];
 	topic?: string;
 	entryPath?: string;
 	stylePath?: string;
@@ -138,7 +139,7 @@ export interface PluginUiContributionItem {
 	stylePath?: string;
 	scope?: "workspace" | "narrator" | "project" | "global";
 	/** Surfaces this view may mount on. Absent means the server did not report any. */
-	surfaces?: Array<"workspace" | "director" | "focus" | "settings">;
+	surfaces?: PluginViewSurface[];
 	/** Legacy aliases accepted from older plugin backends. */
 	entry?: string;
 	style?: string;

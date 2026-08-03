@@ -45,16 +45,23 @@ import {
 	ensureRefsCoverSeq,
 	hasUnmaterializedRefsBelow,
 } from "./narrator-refs-backfill";
-import { revertNarratorScopedForMessages } from "./narrator-scoped-revert";
 import {
+	revertNarratorScopedForMessages,
+	revertNarratorScopedForToolUses,
+} from "./narrator-scoped-revert";
+import {
+	assertSnapshotRevertComplete,
 	commitSnapshotRevert,
 	DEFAULT_REVERT_SCOPE,
+	discardSnapshotRevert,
+	finalizeSnapshotRevert,
 	type RevertResult,
 	type RevertScope,
 	type RevertWarning,
 	revertForMessagesTree,
 	revertPatchesForMessages,
 	revertPatchForToolUse,
+	revertPatchForToolUses,
 } from "./snapshot-revert";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -86,6 +93,144 @@ async function revertForDeletedMessages(
 	return (
 		(await revertForMessagesTree(narratorId, messageIds)) ??
 		(await revertPatchesForMessages(narratorId, messageIds))
+	);
+}
+
+/**
+ * Roll back the files a single deleted tool_use block changed.
+ *
+ * Strategy order, narrowest first, mirroring `revertForDeletedMessages`:
+ *   1. narrator scope — reverse just this call's recorded boundary, so later work
+ *      and other actors' work in the same worktree survive
+ *   2. per-file replay — for calls recorded before tree snapshots existed
+ *
+ * Step 1 returning null means it cannot express this window (no boundary, a remote
+ * workspace, git too old), which is what makes this a fallback chain. A *conflict*
+ * is not a fallback: it comes back as failures so the caller reports them, because
+ * replaying instead would rebuild the file from tool inputs and quietly drop
+ * whatever another actor wrote in the same region.
+ */
+async function revertForDeletedBlock(
+	narratorId: string,
+	removedBlock: { type: string; id?: string },
+	messageId: string,
+	opts?: { skipRevert?: boolean; scope?: RevertScope; revertHandledByCaller?: boolean },
+): Promise<RevertResult | null> {
+	if (opts?.skipRevert || opts?.revertHandledByCaller) return null;
+	if (removedBlock.type !== "tool_use" || !removedBlock.id) return null;
+
+	if ((opts?.scope ?? DEFAULT_REVERT_SCOPE) === "narrator") {
+		const scoped = await revertNarratorScopedForToolUses(narratorId, [
+			{ messageId, toolUseId: removedBlock.id },
+		]);
+		if (scoped) return scoped;
+	}
+	return revertPatchForToolUse(narratorId, removedBlock.id);
+}
+
+/**
+ * Resolve which tool calls a set of pending block deletions targets.
+ *
+ * Read before any deletion happens: `blockIndex` addresses a position in the
+ * message's current content array, and removing one block shifts the rest.
+ */
+async function resolveBlockToolUses(
+	grouped: Map<string, number[]>,
+): Promise<Array<{ messageId: string; toolUseId: string }>> {
+	const targets: Array<{ messageId: string; toolUseId: string }> = [];
+	for (const [messageId, indices] of grouped) {
+		const message = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { contentJson: true },
+		});
+		const blocks = Array.isArray(message?.contentJson)
+			? (message.contentJson as Array<{ type: string; id?: string }>)
+			: [];
+		for (const blockIndex of indices) {
+			const block = blocks[blockIndex];
+			if (block?.type === "tool_use" && block.id) {
+				targets.push({ messageId, toolUseId: block.id });
+			}
+		}
+	}
+	return targets;
+}
+
+/**
+ * Reject a batch whose blocks are not all deletable, before anything is written.
+ *
+ * `deleteMessageBlocks` calls `deleteMessageBlock` per block and each of those commits
+ * its own transaction, so there is no enclosing transaction to abandon: by the time the
+ * fifth block fails, the first four are already gone from the database. Since the batch
+ * also rolls the workspace back as a single window, a mid-batch failure would leave
+ * files reverted with the history that described them deleted — unrecoverable in both
+ * directions.
+ *
+ * The fix is therefore to make mid-batch failure not happen, by checking here every
+ * precondition `deleteMessageBlock` would raise on before it mutates: the ref exists,
+ * the message exists, and every index is in range. Indices are validated against the
+ * message's current content array with the shifting accounted for — the caller sorts
+ * each message's indices descending, so removing them in that order never moves an
+ * index that has not been handled yet, and each one only has to be in range originally.
+ *
+ * A running compact is deliberately NOT checked here: it is enforced inside each
+ * transaction by `assertNoRunningCompactRefsTx`, and a compact that starts between this
+ * check and the write would slip past anything checked out here anyway. Callers already
+ * gate on `assertIdleForBlockDeletion` before reaching this path.
+ */
+function assertBlocksDeletable(narratorId: string, grouped: Map<string, number[]>): void {
+	// Kept synchronous-per-message rather than one big query: the batch is small (it comes
+	// from a user selection) and per-message errors need to name the message that failed.
+	for (const [messageId, indices] of grouped) {
+		const ref = db.query.narratorMessageRefs
+			.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+				columns: { id: true },
+			})
+			.sync();
+		if (!ref) throw new NotFoundError("Message", messageId);
+
+		const message = db.query.narratorMessages
+			.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: { contentJson: true },
+			})
+			.sync();
+		if (!message) throw new NotFoundError("Message", messageId);
+
+		const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+		for (const blockIndex of indices) {
+			if (blockIndex < 0 || blockIndex >= blocks.length) {
+				throw new ValidationError(
+					`Block index ${blockIndex} out of range (0..${blocks.length - 1}) for message ${messageId}`,
+				);
+			}
+		}
+	}
+}
+
+/**
+ * Roll back the files a batch of deleted tool_use blocks changed, in one pass.
+ *
+ * Same narrowest-first chain as the single-block path: the narrator scope reverses
+ * only these calls' recorded boundaries, and replay covers calls with no boundary.
+ * Returns null when neither applies (nothing to undo).
+ */
+async function revertForDeletedBlocks(
+	narratorId: string,
+	toolUses: Array<{ messageId: string; toolUseId: string }>,
+	scope: RevertScope | undefined,
+): Promise<RevertResult | null> {
+	if ((scope ?? DEFAULT_REVERT_SCOPE) === "narrator") {
+		const scoped = await revertNarratorScopedForToolUses(narratorId, toolUses);
+		if (scoped) return scoped;
+	}
+	return revertPatchForToolUses(
+		narratorId,
+		toolUses.map((target) => target.toolUseId),
 	);
 }
 
@@ -262,6 +407,27 @@ type FileHistoryCheckpointGroup = {
 };
 
 /**
+ * Which tool calls are worth preserving as a checkpoint.
+ *
+ * Write/Edit qualify because replay can reconstruct them from their recorded
+ * input. Any call carrying a tree boundary that moved the workspace also
+ * qualifies, regardless of tool: that boundary is what a later rollback needs, and
+ * for Bash (or anything else whose input does not describe its writes) it is the
+ * *only* record of the change. Dropping those rows on a `skipRevert` deletion
+ * would discard the change's only description while the files stay on disk.
+ */
+function checkpointWorthyToolCall() {
+	return or(
+		sql`${narratorToolCalls.toolName} IN ('Write', 'Edit')`,
+		and(
+			isNotNull(narratorToolCalls.treeHashBefore),
+			isNotNull(narratorToolCalls.treeHashAfter),
+			ne(narratorToolCalls.treeHashBefore, narratorToolCalls.treeHashAfter),
+		),
+	);
+}
+
+/**
  * Preserve successful file mutations when a user deletes history without asking
  * us to revert the filesystem. The checkpoint ref is hidden by the existing
  * segment-compact visibility mechanism, while its tool calls remain available
@@ -279,7 +445,7 @@ async function collectFileHistoryCheckpointGroups(
 			and(
 				inArray(narratorToolCalls.messageId, [...seqByMessageId.keys()]),
 				eq(narratorToolCalls.status, "success"),
-				sql`${narratorToolCalls.toolName} IN ('Write', 'Edit')`,
+				checkpointWorthyToolCall(),
 			),
 		)
 		.orderBy(narratorToolCalls.createdAt);
@@ -3329,6 +3495,12 @@ export const narratorMessageQueries = {
 			skipNarratorUpdate?: boolean;
 			preserveConversationId?: boolean;
 			scope?: RevertScope;
+			/**
+			 * Set by `deleteMessageBlocks`, which reverts the whole batch in one pass.
+			 * Without it each block would reverse its own boundary again, applying the
+			 * same rollback twice.
+			 */
+			revertHandledByCaller?: boolean;
 		},
 	) {
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
@@ -3359,13 +3531,15 @@ export const narratorMessageQueries = {
 			.from(narratorMessageRefs)
 			.where(eq(narratorMessageRefs.messageId, messageId));
 		const isShared = (refCount[0]?.count ?? 0) > 1;
-		// Deliberately per-file replay, not a tree restore: this removes one block from
-		// the middle of the timeline while keeping everything after it. Restoring a
-		// whole-workspace snapshot would also discard those later changes.
-		const snapshotRevert =
-			!opts?.skipRevert && removedBlock.type === "tool_use" && removedBlock.id
-				? await revertPatchForToolUse(narratorId, removedBlock.id)
-				: null;
+		// A tool_use block is exactly one recorded boundary pair, so the tree path can
+		// reverse it on its own: each segment merges against the accumulated result, so
+		// removing one block from the middle keeps everything that came after it.
+		//
+		// It is preferred over replay because replay can only reproduce changes some
+		// tool input describes — it cannot see what Bash, a build script or an external
+		// editor wrote. Replay stays as the fallback for history with no recorded
+		// boundary, which is most pre-snapshot history.
+		const snapshotRevert = await revertForDeletedBlock(narratorId, removedBlock, messageId, opts);
 		const fileHistoryCheckpointToolCalls =
 			opts?.skipRevert && removedBlock.type === "tool_use" && removedBlock.id
 				? await db
@@ -3376,7 +3550,7 @@ export const narratorMessageQueries = {
 								eq(narratorToolCalls.messageId, messageId),
 								eq(narratorToolCalls.toolUseId, removedBlock.id),
 								eq(narratorToolCalls.status, "success"),
-								sql`${narratorToolCalls.toolName} IN ('Write', 'Edit')`,
+								checkpointWorthyToolCall(),
 							),
 						)
 				: [];
@@ -3395,16 +3569,31 @@ export const narratorMessageQueries = {
 						},
 					]);
 				}
-				const cleanToolUseBlock = (block: { type: string; id?: string }, msgId: string) => {
+				/**
+				 * Detach a removed tool_use block: drop its tool call row and its subagent subtree.
+				 *
+				 * `dropToolCallRow` is false when the message is still referenced by another
+				 * narrator. That row holds the `treeHashBefore/After` boundary those narrators
+				 * revert against, so deleting it would leave their history describing changes it
+				 * can no longer undo. The child subtree is separate — it is already reference
+				 * counted below and only removed once nobody else points at it.
+				 */
+				const cleanToolUseBlock = (
+					block: { type: string; id?: string },
+					msgId: string,
+					dropToolCallRow = true,
+				) => {
 					if (block.type !== "tool_use" || !block.id) return;
-					tx.delete(narratorToolCalls)
-						.where(
-							and(
-								eq(narratorToolCalls.messageId, msgId),
-								eq(narratorToolCalls.toolUseId, block.id),
-							),
-						)
-						.run();
+					if (dropToolCallRow) {
+						tx.delete(narratorToolCalls)
+							.where(
+								and(
+									eq(narratorToolCalls.messageId, msgId),
+									eq(narratorToolCalls.toolUseId, block.id),
+								),
+							)
+							.run();
+					}
 					const children = tx
 						.select({ id: narratorMessages.id })
 						.from(narratorMessages)
@@ -3446,7 +3635,12 @@ export const narratorMessageQueries = {
 
 				if (remaining.length === 0) {
 					messageDeleted = true;
-					cleanToolUseBlock(removedBlock, messageId);
+					// Keep the tool call row while another narrator still references this message: it
+					// carries that narrator's `treeHashBefore/After` boundary, and dropping it would
+					// silently make their history unrevertable. Same reasoning as the shared branch
+					// below, which clones the message rather than editing it in place. The subagent
+					// subtree is still cleaned either way — it has its own reference counting.
+					cleanToolUseBlock(removedBlock, messageId, !isShared);
 					tx.delete(narratorMessageRefs)
 						.where(
 							and(
@@ -3560,7 +3754,7 @@ export const narratorMessageQueries = {
 	async deleteMessageBlocks(
 		narratorId: string,
 		blocks: Array<{ messageId: string; blockIndex: number }>,
-		opts?: { preserveConversationId?: boolean; skipRevert?: boolean },
+		opts?: { preserveConversationId?: boolean; skipRevert?: boolean; scope?: RevertScope },
 	) {
 		const grouped = new Map<string, number[]>();
 		for (const b of blocks) {
@@ -3572,6 +3766,27 @@ export const narratorMessageQueries = {
 			arr.sort((a, b) => b - a);
 		}
 
+		// Every block the batch will touch must be addressable and deletable BEFORE the
+		// rollback runs. Each `deleteMessageBlock` below commits its own transaction, so
+		// a failure halfway through cannot be rolled back as one unit — the only real
+		// protection is to reject the batch while nothing has been written yet.
+		assertBlocksDeletable(narratorId, grouped);
+
+		// One rollback for the whole batch rather than one per block. Reverting block
+		// by block would treat each call as an isolated window, so a run of adjacent
+		// calls could not be collapsed into a single segment and each pass would merge
+		// against the previous pass's output. Resolved before anything is deleted,
+		// because removing a block rewrites the content array these indices address.
+		const targetedToolUses = opts?.skipRevert ? [] : await resolveBlockToolUses(grouped);
+		const snapshotRevert =
+			targetedToolUses.length > 0
+				? await revertForDeletedBlocks(narratorId, targetedToolUses, opts?.scope)
+				: null;
+		// A conflict (or any rollback failure) refuses the whole batch: the files were
+		// left untouched, so deleting the history would strand changes with nothing
+		// left to describe them. Per-block tolerance below is for history errors.
+		if (snapshotRevert) assertSnapshotRevertComplete(snapshotRevert);
+
 		const results: Array<{ messageId: string; blockIndex: number; messageDeleted: boolean }> = [];
 		const failed: Array<{ messageId: string; blockIndex: number; error: string }> = [];
 		for (const [msgId, indices] of grouped) {
@@ -3581,6 +3796,9 @@ export const narratorMessageQueries = {
 						skipNarratorUpdate: true,
 						preserveConversationId: opts?.preserveConversationId,
 						skipRevert: opts?.skipRevert,
+						// The batch already reverted these files; per-block rollback would
+						// reverse the same boundary a second time.
+						revertHandledByCaller: !opts?.skipRevert,
 					});
 					results.push({ messageId: msgId, blockIndex, messageDeleted: r.messageDeleted });
 					if (r.messageDeleted) break;
@@ -3589,6 +3807,36 @@ export const narratorMessageQueries = {
 						messageId: msgId,
 						blockIndex,
 						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			}
+		}
+
+		if (snapshotRevert) {
+			// Which way to close the rollback depends on whether any history was actually
+			// removed, NOT on whether every block succeeded.
+			//
+			// Each `deleteMessageBlock` above commits its own transaction, so once one has
+			// returned its history is gone for good. Undoing the rollback at that point
+			// would put the reverted bytes back on disk while the tool calls that describe
+			// them no longer exist — changes with nothing left to explain them, and no way
+			// to roll them back again. Keeping the rollback is the only outcome that leaves
+			// history and workspace describing the same thing.
+			//
+			// `assertBlocksDeletable` already rejected the batch before the rollback ran for
+			// every failure this layer can foresee, so reaching here with partial failures
+			// means something unforeseeable happened mid-batch; the surviving blocks are
+			// reported in `failed` so the caller can retry them.
+			if (results.length === 0) {
+				await discardSnapshotRevert(snapshotRevert);
+			} else {
+				finalizeSnapshotRevert(snapshotRevert);
+				if (failed.length > 0) {
+					logger.error("Batch block deletion partially failed after its rollback ran", {
+						narratorId,
+						deleted: results.length,
+						failed: failed.length,
+						failures: failed.slice(0, 10),
 					});
 				}
 			}
@@ -3607,7 +3855,12 @@ export const narratorMessageQueries = {
 				.where(eq(narrators.id, narratorId));
 		}
 
-		return { deleted: results.length, failed: failed.length, results };
+		return {
+			deleted: results.length,
+			failed: failed.length,
+			results,
+			...(snapshotRevert?.warnings?.length ? { revertWarnings: snapshotRevert.warnings } : {}),
+		};
 	},
 
 	async removeCompactingMessage(narratorId: string, messageId: string) {

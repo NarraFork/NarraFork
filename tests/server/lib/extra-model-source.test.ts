@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { getVisibleModels, registerExtraModelSource, resolveProvider } from "@server/lib/settings";
+import {
+	getVisibleModels,
+	registerExtraModelSource,
+	resolveProvider,
+	settings,
+} from "@server/lib/settings";
 
 /**
  * `getVisibleModels()` feeds the Agent's model pools (task / fork-narrator subagent
@@ -106,5 +111,29 @@ describe("extra model sources", () => {
 		});
 
 		expect(resolveProvider("openai:gpt-4o")).toBe("openai");
+	});
+
+	test("a disabled prefix hides plugin models just like a builtin's", () => {
+		// The provider settings page shows the same on/off switch for plugin providers as
+		// for builtins. That switch writes `agent.disabledProviders`, a plain prefix list —
+		// this pins that the list governs plugin models too, so the toggle needs no
+		// plugin-specific backend path.
+		register("test-disable", { listModels: () => ["tdis:alpha", "tdis:beta"] });
+		expect(getVisibleModels()).toContain("tdis:alpha");
+
+		const previous = settings.agent.disabledProviders;
+		settings.agent.disabledProviders = [...(previous ?? []), "tdis"];
+		try {
+			const visible = getVisibleModels();
+			expect(visible).not.toContain("tdis:alpha");
+			expect(visible).not.toContain("tdis:beta");
+			// Turning a provider off must not affect anything else the plugin contributes;
+			// this list carries model values only, never plugin lifecycle state.
+			expect(settings.plugins?.enabled).not.toBe(false);
+		} finally {
+			settings.agent.disabledProviders = previous;
+		}
+
+		expect(getVisibleModels()).toContain("tdis:alpha");
 	});
 });

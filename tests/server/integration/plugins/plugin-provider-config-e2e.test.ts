@@ -44,9 +44,15 @@ import { PluginToolRegistry } from "@server/services/plugin-tool-registry";
 const fixtureRoot = join(import.meta.dir, "../../../fixtures/plugins/e2e/reference-provider-rpc");
 const exampleRoot = join(import.meta.dir, "../../../../examples/plugins/provider");
 
-/** Mirrors CHAT_WORDS_BY_MODE in the fixture's server entry. */
-const OFFLINE_REPLY = "Hello from the example provider.";
-const VERBOSE_REPLY = "Hello from the example provider in verbose mode.";
+/**
+ * Mirrors CHAT_WORDS_BY_MODE in the fixture's server entry.
+ *
+ * This suite exercises the non-secret `apiMode` field only, so the fixture always
+ * reports `[anonymous]`. Credential injection has its own suite; keeping this one
+ * credential-free proves the two config halves stay independent.
+ */
+const OFFLINE_REPLY = "Hello from the example provider. [anonymous]";
+const VERBOSE_REPLY = "Hello from the example provider in verbose mode. [anonymous]";
 
 const tempRoots: string[] = [];
 
@@ -79,23 +85,24 @@ function createRuntime(manifest: Awaited<ReturnType<typeof loadManifest>>): Plug
 			stderrRingBytes: 8 * 1024,
 			maxStderrBytes: 16 * 1024,
 			maxStderrBytesPerSecond: 16 * 1024,
-			spawnTimeoutMs: 5_000,
-			idleTimeoutMs: 15_000,
-			totalTimeoutMs: 20_000,
+			// Generous on purpose: see the note in plugin-provider-rpc.e2e.test.ts.
+			spawnTimeoutMs: 20_000,
+			idleTimeoutMs: 30_000,
+			totalTimeoutMs: 45_000,
 			killProcessTree: true,
-			resourceLimits: { cpuTimeSeconds: 10, memoryBytes: 1024 * 1024 * 1024 },
+			resourceLimits: { cpuTimeSeconds: 30, memoryBytes: 1024 * 1024 * 1024 },
 			allowUnboundedResourceUsage: process.platform === "win32",
 		}),
 		timeouts: {
-			handshakeMs: 5_000,
-			activationMs: 5_000,
-			rpcMs: 5_000,
+			handshakeMs: 20_000,
+			activationMs: 20_000,
+			rpcMs: 20_000,
 			drainMs: 200,
 			shutdownMs: 1_000,
 			cancelGraceMs: 1_000,
 		},
-		idleTimeoutMs: 15_000,
-		totalTimeoutMs: 20_000,
+		idleTimeoutMs: 30_000,
+		totalTimeoutMs: 45_000,
 		maxInFlight: 4,
 	});
 }

@@ -72,10 +72,21 @@ describe("Manifest fixtures", () => {
 		}
 	});
 
+	it("accepts valid-wide-permission.json now that declarations are not gated", async () => {
+		// This fixture declares `host: ["admin"]`. It used to be rejected at parse time.
+		// Under the install-is-trust model the declaration is descriptive, so it parses and
+		// the broad token survives into the manifest for an admin UI to surface.
+		const result = safeParseManifest(await loadManifestFixture("valid-wide-permission.json"));
+
+		expect(result.success).toBe(true);
+		if (result.success) {
+			expect(result.data.permissions?.host).toEqual(["admin"]);
+		}
+	});
+
 	for (const fixture of [
 		"invalid-illegal-id.json",
 		"invalid-remote-entry.json",
-		"invalid-wide-permission.json",
 		"invalid-path-traversal.json",
 		"invalid-duplicate-contribution.json",
 		"invalid-activation-event.json",
@@ -122,14 +133,31 @@ describe("Manifest primitive contracts", () => {
 		expect(parseActivationEvent("onUnknown:thing")).toBeUndefined();
 	});
 
-	it("rejects wide permissions while allowing scoped host capabilities", () => {
+	it("labels wide permissions without rejecting them", () => {
+		// `isWidePermission` survives as a labelling aid for admin UIs. It no longer gates
+		// anything: an installed plugin may declare any capability, so these all parse.
 		expect(isManifestWidePermission("*")).toBe(true);
 		expect(isManifestWidePermission("admin")).toBe(true);
 		expect(isManifestWidePermission("network.any")).toBe(true);
 		expect(isManifestWidePermission("query.*")).toBe(true);
 		expect(isManifestWidePermission("query.chapters.read")).toBe(false);
+
+		// Capability names are open strings now, so previously-refused tokens are accepted.
 		expect(isPermissionName("query.chapters.read")).toBe(true);
-		expect(isPermissionName("admin")).toBe(false);
+		expect(isPermissionName("admin")).toBe(true);
+		expect(isPermissionName("*")).toBe(true);
+		expect(isPermissionName("com.acme.custom.capability")).toBe(true);
+
+		// camelCase segments are valid: the host's own taxonomy uses them.
+		expect(isPermissionName("diagnostics.readOwnLogs")).toBe(true);
+		expect(isPermissionName("ui.openExternal")).toBe(true);
+
+		// The remaining rule is formatting, not trust: names must stay loggable.
+		expect(isPermissionName("")).toBe(false);
+		expect(isPermissionName("Has Spaces")).toBe(false);
+		expect(isPermissionName("trailing.")).toBe(false);
+		expect(isPermissionName("has..empty")).toBe(false);
+		expect(isPermissionName("1leading.digit")).toBe(false);
 	});
 });
 

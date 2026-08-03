@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { isThemeOnlyPlugin, pluginTier } from "@server/lib/plugins/manifest";
 
+/**
+ * `pluginTier` is a descriptive classifier, not an authorization gate.
+ *
+ * It no longer decides who may install or enable a plugin — that is uniformly admin-only
+ * now (see `plugin admin gating` in `tests/server/routes/plugins.test.ts`). These tests keep
+ * the classification honest for admin-UI listing and filtering.
+ */
+
 /** Minimal manifest-shaped fixtures for the pure tier classifier. */
 function fixture(overrides: { server?: unknown; views?: unknown[] }): {
 	server?: unknown;

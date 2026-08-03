@@ -40,7 +40,6 @@ import {
 	narratorWhitelistDirs,
 	projects,
 	terminals,
-	userPreferences,
 	users,
 } from "../db/schema";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
@@ -76,6 +75,7 @@ import {
 } from "../lib/browser/session";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
+import { resolveFastModeForUser } from "../lib/fast-mode";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { hasMention } from "../lib/mentions";
@@ -126,9 +126,11 @@ import {
 	createNarratorSchema,
 	createWhitelistCmdSchema,
 	createWhitelistDirSchema,
+	deviceBrowseQuerySchema,
 	editAssistantMessageSchema,
 	forkNarratorSchema,
 	migrateBrokenModelNarratorsSchema,
+	narratorExportQuerySchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
 	retryFailedCompactSchema,
@@ -176,6 +178,11 @@ import type {
 } from "../services/command-service";
 import { getSlashMenuItems, resolveCommand } from "../services/command-service";
 import {
+	browseRemoteDirectory,
+	resolveRemoteBrowseTarget,
+} from "../services/device-transfer-service";
+import { normalizePathKey, type PathFlavor, pathKeyContains } from "../services/execution-policy";
+import {
 	applyToolCall,
 	canonicalizeDeviceFileIdentity,
 	type DeviceFileIdentity,
@@ -196,6 +203,7 @@ import {
 	narratorHasDraft,
 	updateNarratorDraft,
 } from "../services/narrator-draft-service";
+import { buildExportFileName, streamNarratorExport } from "../services/narrator-export";
 import {
 	disarmQuestionReflection,
 	getQuestionReflectionDeadline,
@@ -206,6 +214,7 @@ import {
 import { enterNarratorPlanMode, exitNarratorPlanMode } from "../services/narrator-plan-mode";
 import { resolveLazyLineage } from "../services/narrator-refs-backfill";
 import {
+	previewNarratorScopedForToolUses,
 	previewNarratorScopedFromSeq,
 	revertNarratorScopedFromSeq,
 } from "../services/narrator-scoped-revert";
@@ -271,6 +280,7 @@ import {
 import {
 	activeNarrators,
 	getNarratorRuntimeModel,
+	isWorkspaceBeingWritten,
 	planModeAskedOnce,
 	resetActiveUpstreamSession,
 } from "../services/narrator-session-state";
@@ -658,15 +668,11 @@ narratorRoutes.post("/", async (c) => {
 	const parsed = createNarratorSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	let input = parsed.data;
-	if (input.fastMode === undefined) {
-		const userId = c.get("user").sub;
-		const pref = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { fastModeDefault: true },
-		});
-		if (pref?.fastModeDefault) input = { ...input, fastMode: true };
-	}
+	// fastMode is intentionally NOT resolved here: the narrator stores the
+	// tri-state override and "inherit" is resolved against the user's
+	// fastModeDefault on every turn, so changing that default also affects
+	// narrators created before the change.
+	const input = parsed.data;
 
 	// For specialized kinds (e.g. knowledge steward), the service preinstalls tools and a
 	// system prompt. Pass the creator's admin status (server-trusted, never from the body)
@@ -1240,7 +1246,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			systemPrompt: narrator.systemPrompt ?? undefined,
 			permissionMode: narrator.permissionMode ?? undefined,
 			reasoningEffort: narrator.reasoningEffort ?? undefined,
-			fastMode: narrator.fastMode ?? undefined,
+			fastModeOverride: normalizeBooleanOverride(narrator.fastModeOverride),
 			relaxedPlan: narrator.relaxedPlan ?? undefined,
 			planReflectionAutoApproveOverride: normalizeBooleanOverride(
 				narrator.planReflectionAutoApproveOverride,
@@ -2070,6 +2076,74 @@ narratorRoutes.get("/:id/search", async (c) => {
 	return c.json({ results });
 });
 
+/**
+ * Download this narrator's transcript as Markdown or JSON.
+ *
+ * Streamed rather than buffered: a long history is tens of MB, and serializing it
+ * whole would hold it all in memory and block the loop while doing so. The
+ * generator pages with the event loop yielded in between, so the response starts
+ * flowing immediately and other requests keep being served.
+ */
+narratorRoutes.get("/:id/export", async (c) => {
+	const id = c.req.param("id");
+	const parsed = narratorExportQuerySchema.safeParse(c.req.query());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const options = parsed.data;
+
+	// Resolve the narrator up front so a bad id is a clean 404 rather than an
+	// attachment whose body happens to contain an error.
+	const narrator = await narratorService.getById(id);
+
+	const fileName = buildExportFileName(narrator.title, options.format);
+	// One controller shared by start() and cancel(): a client that closes the tab
+	// mid-download must stop the paging loop, not leave it querying into a void.
+	const abort = new AbortController();
+	const stream = new ReadableStream<Uint8Array>({
+		async start(controller) {
+			const encoder = new TextEncoder();
+			try {
+				for await (const chunk of streamNarratorExport(id, options, abort.signal)) {
+					if (abort.signal.aborted) break;
+					controller.enqueue(encoder.encode(chunk));
+				}
+			} catch (error) {
+				// streamNarratorExport already converts mid-stream failures into an
+				// explicit "incomplete" tail; reaching here means the consumer went
+				// away, so there is nothing left to report to.
+				logger.warn("Narrator export stream ended early", {
+					narratorId: id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			} finally {
+				try {
+					controller.close();
+				} catch {
+					// Already closed by cancel().
+				}
+			}
+		},
+		cancel() {
+			abort.abort();
+		},
+	});
+
+	return new Response(stream, {
+		headers: {
+			"Content-Type":
+				options.format === "json"
+					? "application/json; charset=utf-8"
+					: "text/markdown; charset=utf-8",
+			// Both spellings: the ASCII name is the safe fallback, `filename*` carries
+			// the real (possibly CJK) title per RFC 5987.
+			"Content-Disposition": `attachment; filename="${fileName.ascii}"; filename*=UTF-8''${encodeURIComponent(
+				fileName.utf8,
+			)}`,
+			"Cache-Control": "no-store",
+			"X-Content-Type-Options": "nosniff",
+		},
+	});
+});
+
 // Get full tool call detail (untruncated inputJson/outputJson)
 narratorRoutes.get("/:id/tool-calls/:toolUseId", async (c) => {
 	const id = c.req.param("id");
@@ -2154,13 +2228,46 @@ narratorRoutes.delete("/:id/compact/:messageId", async (c) => {
 	return c.json({ ok: true, ...result });
 });
 
+/**
+ * Reject a block deletion while the narrator is writing to its own workspace.
+ *
+ * Deleting a block rolls its file changes back, so it competes with the tools of a
+ * running loop over the same worktree. The rollback path and the tool write path
+ * hold different locks, so nothing else serializes them: without this check the
+ * rollback either loses to a concurrent write or aborts on the state-drift guard,
+ * surfacing as a rollback that fails at random.
+ *
+ * `skipRevert` deletions touch history only, but they still remove the tool-call
+ * rows a running loop may be writing to, so they are gated the same way.
+ */
+async function assertIdleForBlockDeletion(narratorId: string): Promise<void> {
+	const narrator = await narratorService.getById(narratorId);
+	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(narratorId)) {
+		// Repair a stale idle status so the user keeps the interrupt button.
+		await reconcileRunningStatus(narratorId);
+		throw new ValidationError("Cannot delete blocks while narrator is running");
+	}
+	// The narrator itself can be idle while a background subagent keeps writing to the
+	// same worktree, so admission also has to consider the workspace. The rollback
+	// re-checks this immediately before writing; this check exists to reject early
+	// with a clear message instead of failing deep in the rollback.
+	const worktreePath = await resolveNarratorCwd(narratorId);
+	if (worktreePath && isWorkspaceBeingWritten(worktreePath)) {
+		throw new ValidationError("Cannot delete blocks while something is writing to this workspace");
+	}
+}
+
 // Batch-delete multiple content blocks across messages
 narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
 	const narratorId = c.req.param("id");
 	const body = await c.req.json();
 	const { batchDeleteBlocksSchema } = await import("../lib/validators");
-	const { blocks, skipRevert } = batchDeleteBlocksSchema.parse(body);
-	const result = await narratorService.deleteMessageBlocks(narratorId, blocks, { skipRevert });
+	const { blocks, skipRevert, scope } = batchDeleteBlocksSchema.parse(body);
+	await assertIdleForBlockDeletion(narratorId);
+	const result = await narratorService.deleteMessageBlocks(narratorId, blocks, {
+		skipRevert,
+		...(scope ? { scope } : {}),
+	});
 	return c.json({ ok: true, ...result });
 });
 
@@ -2173,8 +2280,13 @@ narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) =
 		throw new ValidationError("Invalid block index");
 	}
 	const skipRevert = c.req.query("skipRevert") === "1";
+	// The narrator scope is the default and refuses on conflict, so the caller needs
+	// a way to ask for the wider one its error suggests.
+	const scope = revertScopeSchema.parse(c.req.query("scope"));
+	await assertIdleForBlockDeletion(narratorId);
 	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex, {
 		skipRevert,
+		...(scope ? { scope } : {}),
 	});
 	return c.json({ ok: true, ...result });
 });
@@ -2187,6 +2299,9 @@ narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	// The narrator scope is the default and can refuse on conflict; the caller needs a
 	// way to act on that refusal, so the widening choice must be expressible here too.
 	const scope = revertScopeSchema.parse(c.req.query("scope"));
+	// This rolls the workspace back like a block deletion does, so it needs the same
+	// admission check against a loop writing to the same worktree.
+	await assertIdleForBlockDeletion(narratorId);
 	const result = await narratorService.deleteMessage(narratorId, messageId, {
 		skipRevert,
 		...(scope ? { scope } : {}),
@@ -2805,6 +2920,122 @@ narratorRoutes.get("/:id/execution-devices", async (c) => {
 	return c.json(await getNarratorExecutionDeviceState(c.req.param("id")));
 });
 
+/**
+ * Browse one level of a device's filesystem, for the permission-rule path picker.
+ *
+ * /api/devices is admin-only because remote executors grant file and command
+ * execution on other machines, and `allowRoots` defaults to empty (unrestricted),
+ * so a raw `fs.list` can walk a device's whole filesystem. Device visibility to a
+ * narrator is NOT a substitute for that gate: any logged-in user can name any
+ * narratorId here, and narrator visibility is per-project, not per-caller. So the
+ * previous "the narrator could already execute there anyway" argument does not
+ * transfer to the *caller* of this endpoint.
+ *
+ * The authorization actually enforced below:
+ *  - admins get the same reach as /api/devices/:id/browse (no extra restriction);
+ *  - every other session is confined to directories that are already reachable
+ *    without this endpoint — the device's own declared workspace root (defaultCwd,
+ *    which the picker opens at and which the narrator's tools use as their cwd) and
+ *    any directory covered by an enabled directory rule scoped to this device. Rule
+ *    paths are readable through /:id/whitelist-dirs and /:id/blacklist-dirs, and the
+ *    workspace root is readable through /:id/execution-devices, so listing inside
+ *    them reveals no path a non-admin caller could not already reach.
+ * Anything outside that set is refused with one normalized message, so a non-admin
+ * cannot use hit/miss responses to probe for directories.
+ */
+export const DEVICE_BROWSE_FORBIDDEN_MESSAGE =
+	"Path is outside this narrator's device rules; only administrators may browse arbitrary device paths";
+
+/**
+ * Whether a non-admin caller may list `requestedPath` on `deviceId`.
+ *
+ * Containment (not equality) is intentional: the picker drills down from a root,
+ * and every descendant of an allowed root is already within the narrator's own
+ * declared scope. Blacklist rules count as anchors too — they are user-authored
+ * paths on this device that the caller can already read back, and denying browse
+ * inside them would make blacklists impossible to edit through the picker.
+ */
+export function isDeviceBrowsePathWithinNarratorScope(input: {
+	requestedPath: string;
+	pathFlavor: PathFlavor;
+	defaultCwd: string | null;
+	rules: readonly { path: string; pathFlavor: PathFlavor; enabled: boolean }[];
+}): boolean {
+	// normalizePathKey (not identityKey) because pathKeyContains compares
+	// "/"-separated keys, which is exactly the form rule.pathKey is stored in.
+	const toKey = (path: string) => normalizePathKey(path, input.pathFlavor);
+	const requestedKey = toKey(input.requestedPath);
+	const anchors: string[] = [];
+	if (input.defaultCwd?.trim()) anchors.push(input.defaultCwd.trim());
+	for (const rule of input.rules) {
+		if (!rule.enabled || rule.pathFlavor !== input.pathFlavor) continue;
+		anchors.push(rule.path);
+	}
+	return anchors.some((anchor) => {
+		try {
+			return pathKeyContains(toKey(anchor), requestedKey, input.pathFlavor);
+		} catch {
+			// A malformed stored rule must never widen or crash the check.
+			return false;
+		}
+	});
+}
+
+narratorRoutes.get("/:id/device-browse", async (c) => {
+	const narratorId = c.req.param("id");
+	const deviceId = c.req.query("deviceId");
+	if (!deviceId) throw new ValidationError("deviceId is required");
+	const parsed = deviceBrowseQuerySchema.safeParse({
+		path: c.req.query("path") || undefined,
+		showHidden: c.req.query("showHidden") === "1",
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const state = await getNarratorExecutionDeviceState(narratorId);
+	if (!state.devices.some((device) => device.id === deviceId)) {
+		throw new ValidationError(`Device ${deviceId} is not available to this narrator`);
+	}
+
+	// Admins already hold the unrestricted /api/devices browse capability, so
+	// re-deriving a narrower scope for them would only break the admin picker.
+	const isAdmin = c.get("user").role === "admin";
+	if (!isAdmin) {
+		// Resolve the target the way the listing itself will, then decide. Doing this
+		// before the fs.list RPC means a refused path never reaches the device.
+		let target: ReturnType<typeof resolveRemoteBrowseTarget>;
+		try {
+			target = resolveRemoteBrowseTarget(deviceId, parsed.data.path);
+		} catch (err) {
+			throw new ValidationError(err instanceof Error ? err.message : String(err));
+		}
+		const rules = await permissionRuleService.listNarratorRules(narratorId);
+		const deviceRules = [...rules.directoryWhitelist, ...rules.directoryBlacklist].filter(
+			(rule) => rule.selector.kind === "device" && rule.selector.deviceId === deviceId,
+		);
+		const allowed = isDeviceBrowsePathWithinNarratorScope({
+			requestedPath: target.path,
+			pathFlavor: target.pathFlavor,
+			defaultCwd: target.defaultCwd,
+			rules: deviceRules,
+		});
+		if (!allowed) throw new AppError(DEVICE_BROWSE_FORBIDDEN_MESSAGE, 403, "FORBIDDEN");
+	}
+
+	try {
+		return c.json(
+			await browseRemoteDirectory(deviceId, parsed.data.path, {
+				showHidden: parsed.data.showHidden,
+			}),
+		);
+	} catch (err) {
+		// Offline devices, missing dirs and remote permission errors are all
+		// user-correctable input problems, not server faults. The message names the
+		// remote absolute path and device id, which is why it is only safe to return
+		// after the authorization check above.
+		throw new ValidationError(err instanceof Error ? err.message : String(err));
+	}
+});
+
 // Change the session default execution target. null/"local" selects the server.
 narratorRoutes.patch("/:id/default-device", async (c) => {
 	const body = (await c.req.json()) as unknown;
@@ -2993,16 +3224,27 @@ narratorRoutes.patch("/:id/reasoning-effort", async (c) => {
 	return c.json({ ok: true });
 });
 
-// Update fast mode
+// Update fast mode (tri-state override; a legacy boolean is still accepted)
 narratorRoutes.patch("/:id/fast-mode", async (c) => {
 	const id = c.req.param("id");
-	const { fastMode } = await c.req.json();
-	if (typeof fastMode !== "boolean") {
-		throw new ValidationError("fastMode must be a boolean");
+	const body = (await c.req.json()) as unknown;
+	if (!body || typeof body !== "object" || Array.isArray(body)) {
+		throw new ValidationError("Request body must be an object");
+	}
+	const input = body as { fastModeOverride?: unknown; fastMode?: unknown };
+	let override: BooleanOverride;
+	if (Object.hasOwn(input, "fastModeOverride")) {
+		override = parseBooleanOverride(input.fastModeOverride, "fastModeOverride");
+	} else if (typeof input.fastMode === "boolean") {
+		override = input.fastMode ? "on" : "off";
+	} else {
+		throw new ValidationError("fastModeOverride must be one of: inherit, on, off");
 	}
 	await narratorService.getById(id); // ensure exists
-	await narratorService.updateFastMode(id, fastMode);
-	return c.json({ ok: true });
+	await narratorService.updateFastModeOverride(id, override);
+	const userId = c.get("user").sub;
+	const effectiveFastMode = await resolveFastModeForUser(override, userId);
+	return c.json({ ok: true, fastModeOverride: override, fastMode: effectiveFastMode });
 });
 
 // Update relaxed plan toggle
@@ -4405,6 +4647,67 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 		toolCallCount: allToolCalls.length,
 		deletedBlockCount,
 		deletedMessageCount,
+	});
+});
+
+/**
+ * Preview the files that deleting a single tool_use block would roll back.
+ *
+ * Separate from `/delete-preview`, which describes "this message and everything
+ * after it". A block deletion reverses exactly one recorded call, so its preview
+ * has to come from the tool-use scope or it would overstate what is removed.
+ *
+ * Contents are attached because this response also backs the diff view; without
+ * them every file renders as an empty change.
+ */
+narratorRoutes.get("/:id/block-delete-preview", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.query("messageId");
+	const blockIndexStr = c.req.query("blockIndex");
+	if (!messageId) return c.json({ error: "messageId query param is required" }, 400);
+	if (!blockIndexStr) return c.json({ error: "blockIndex query param is required" }, 400);
+	const blockIndex = Number.parseInt(blockIndexStr, 10);
+	if (Number.isNaN(blockIndex) || blockIndex < 0) {
+		return c.json({ error: "blockIndex must be a non-negative integer" }, 400);
+	}
+
+	const targetRef = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, messageId),
+		),
+		columns: { seq: true },
+	});
+	if (!targetRef) return c.json({ error: "Message not found for this narrator" }, 404);
+
+	const message = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, messageId),
+		columns: { contentJson: true },
+	});
+	if (!message) return c.json({ error: "Message not found" }, 404);
+
+	const blocks = Array.isArray(message.contentJson)
+		? (message.contentJson as Array<{ type: string; id?: string }>)
+		: [];
+	const block = blocks[blockIndex];
+	if (!block) return c.json({ error: `Block index ${blockIndex} out of range` }, 400);
+
+	// A non-tool block changes no files, so there is nothing to roll back.
+	if (block.type !== "tool_use" || !block.id) {
+		return c.json({ available: false, reason: "not_a_tool_use", files: [], conflicts: [] });
+	}
+
+	const preview = await previewNarratorScopedForToolUses(
+		narratorId,
+		[{ messageId, toolUseId: block.id }],
+		{ withContents: true },
+	);
+	return c.json({
+		available: preview.available,
+		...(preview.reason ? { reason: preview.reason } : {}),
+		files: preview.files.map(({ relPath: _relPath, ...file }) => file),
+		conflicts: preview.conflicts,
+		...(preview.subagentWarning ? { subagentWarning: preview.subagentWarning } : {}),
 	});
 });
 

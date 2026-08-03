@@ -120,6 +120,7 @@ import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
 	useBlacklistDirs,
+	useBlockDeletePreview,
 	useCmdBlacklist,
 	useCmdWhitelist,
 	useCreateBlacklistDir,
@@ -333,7 +334,6 @@ interface WorkspaceChunkPreviewProps {
 	narratorId: string;
 	isSubagent?: boolean;
 	permCb: PermissionCallbacks;
-	expandedToolUseId?: string | null;
 	showTokenUsage?: boolean;
 	pruneBoundaryMessageId?: string | null;
 	pruneDividerLabel?: string;
@@ -347,7 +347,6 @@ function WorkspaceChunkPreview({
 	narratorId,
 	isSubagent,
 	permCb,
-	expandedToolUseId,
 	showTokenUsage,
 	pruneBoundaryMessageId,
 	pruneDividerLabel,
@@ -367,7 +366,6 @@ function WorkspaceChunkPreview({
 			undefined,
 			null,
 			permCb,
-			expandedToolUseId,
 			showTokenUsage,
 			pruneBoundaryMessageId,
 			pruneDividerLabel,
@@ -389,7 +387,6 @@ function WorkspaceChunkPreview({
 		);
 	}, [
 		chunks,
-		expandedToolUseId,
 		hasChapter,
 		lastUserMessageId,
 		narratorId,
@@ -1487,21 +1484,30 @@ function PathRulesPopover({
 	);
 	const badgeCount = wlDirs.length + blDirs.length + cmdWl.length + cmdBl.length;
 
+	// Popover has no built-in outside-click handling here (closeOnClickOutside is
+	// off so nested overlays can't dismiss it), so it is emulated below. The Modal
+	// branch has its own overlay dismissal and must not run this.
+	const usesPopover = !isMobile && triggerMode !== "menu";
+
 	useEffect(() => {
-		if (!opened) return;
+		if (!opened || !usesPopover) return;
 		const handler = (event: MouseEvent) => {
 			const target = event.target as HTMLElement | null;
 			if (!target || dropdownRef.current?.contains(target)) return;
-			if (
-				target.closest(".mantine-Modal-root, .mantine-Modal-overlay, .mantine-Combobox-dropdown")
-			) {
-				return;
-			}
+			// Any nested overlay opened from inside this popover (Select/Combobox
+			// dropdowns, the directory-browser Modal, nested Popovers) is rendered
+			// into Mantine's portal layer, not into our dropdown's DOM subtree.
+			// Matching on portal containers instead of per-component class names
+			// keeps this correct when a child switches widget type: enumerating
+			// `.mantine-Combobox-dropdown` used to miss `.mantine-Select-dropdown`,
+			// so picking a rule target counted as an outside click and tore down
+			// the whole popover (losing the in-progress draft rule with it).
+			if (target.closest("[data-portal], [data-mantine-shared-portal-node]")) return;
 			close();
 		};
 		document.addEventListener("mousedown", handler);
 		return () => document.removeEventListener("mousedown", handler);
-	}, [opened, close]);
+	}, [opened, usesPopover, close]);
 
 	const trigger =
 		triggerMode === "menu" ? (
@@ -1549,6 +1555,8 @@ function PathRulesPopover({
 					devices={permissionDevices}
 					showOauthGroups={false}
 					serverPathFlavor={serverPathFlavor}
+					narratorId={narratorId}
+					defaultDeviceId={execDevices?.defaultDeviceId ?? null}
 					emptyLabel={t("whitelist_dirs_empty")}
 					placeholder={t("whitelist_dirs_placeholder")}
 					onCreate={(rule) =>
@@ -1584,6 +1592,8 @@ function PathRulesPopover({
 					devices={permissionDevices}
 					showOauthGroups={false}
 					serverPathFlavor={serverPathFlavor}
+					narratorId={narratorId}
+					defaultDeviceId={execDevices?.defaultDeviceId ?? null}
 					emptyLabel={t("blacklist_dirs_empty")}
 					placeholder={t("blacklist_dirs_placeholder")}
 					onCreate={(rule) =>
@@ -1619,6 +1629,8 @@ function PathRulesPopover({
 					devices={permissionDevices}
 					showOauthGroups={false}
 					serverPathFlavor={serverPathFlavor}
+					narratorId={narratorId}
+					defaultDeviceId={execDevices?.defaultDeviceId ?? null}
 					emptyLabel={t("cmd_whitelist_empty")}
 					placeholder={t("cmd_whitelist_placeholder")}
 					onCreate={(rule) =>
@@ -1650,6 +1662,8 @@ function PathRulesPopover({
 					devices={permissionDevices}
 					showOauthGroups={false}
 					serverPathFlavor={serverPathFlavor}
+					narratorId={narratorId}
+					defaultDeviceId={execDevices?.defaultDeviceId ?? null}
 					emptyLabel={t("cmd_blacklist_empty")}
 					placeholder={t("cmd_blacklist_placeholder")}
 					onCreate={(rule) =>
@@ -2248,6 +2262,149 @@ function RollbackConfirmModal({
 	);
 }
 
+/**
+ * Confirmation modal for deleting a single tool_use block.
+ *
+ * Deleting a block rolls back exactly the files that one call changed, which now
+ * includes changes no tool input describes (Bash, build scripts, editors). That
+ * makes it a destructive action worth confirming: previously it fired straight from
+ * the context menu with no indication of what would be undone.
+ *
+ * There is no scope picker here — a block IS one recorded call, so the narrow scope
+ * is the only meaningful one. A conflict means another actor changed the same
+ * regions, so the file rollback is refused and only history-only deletion is left.
+ */
+function BlockDeleteConfirmModal({
+	narratorId,
+	pending,
+	onConfirm,
+	onCancel,
+}: {
+	narratorId: string;
+	pending: { messageId: string; blockIndex: number } | null;
+	onConfirm: (opts: { skipRevert: boolean }) => void;
+	onCancel: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
+	const { data, isLoading, isError } = useBlockDeletePreview(
+		narratorId,
+		pending?.messageId ?? null,
+		pending?.blockIndex ?? null,
+		!!pending,
+	);
+
+	const files = data?.files ?? [];
+	const conflicts = data?.conflicts ?? [];
+	// A failed preview must not read as "nothing would change": both lists are empty
+	// in that case, which would otherwise render as a reassuring "no files affected"
+	// next to an enabled rollback button.
+	const previewFailed = !isLoading && (isError || !data);
+	// A conflict is the one case where the file rollback cannot run at all.
+	const revertBlocked = conflicts.length > 0 || previewFailed;
+	const subagentWarningText = data?.subagentWarning
+		? formatRevertWarning(t, {
+				code: "SUBAGENT_CHANGES_REVERTED",
+				changeCount: data.subagentWarning.changeCount,
+				sampleFilePaths: data.subagentWarning.sampleFiles,
+			})
+		: null;
+
+	return (
+		<Modal
+			opened={!!pending}
+			onClose={onCancel}
+			title={t("blockDeleteConfirmTitle")}
+			centered
+			size="md"
+		>
+			<Stack gap="md">
+				{isLoading ? (
+					<Center py="md">
+						<Loader size="sm" />
+					</Center>
+				) : (
+					<>
+						<Text size="sm">{t("blockDeleteConfirmDesc")}</Text>
+
+						{previewFailed && (
+							<Alert color="red" variant="light" title={t("blockDeletePreviewFailedTitle")}>
+								<Text size="xs">{t("blockDeletePreviewFailedDesc")}</Text>
+							</Alert>
+						)}
+
+						{conflicts.length > 0 && (
+							<Alert color="red" variant="light" title={t("revertScopeConflictTitle")}>
+								<Text size="xs">
+									{t("revertScopeConflictDesc", { files: conflicts.slice(0, 5).join(", ") })}
+								</Text>
+							</Alert>
+						)}
+
+						{subagentWarningText && (
+							<Alert color="yellow" variant="light" title={t("revertScopeSubagentTitle")}>
+								<Text size="xs">{subagentWarningText}</Text>
+							</Alert>
+						)}
+
+						{files.length > 0 ? (
+							<>
+								<Text size="sm" fw={500}>
+									{t("rollbackConfirmFiles")}
+								</Text>
+								<Stack gap={4} mah={260} style={{ overflowY: "auto" }}>
+									{files.map((file) => (
+										<Group key={file.filePath} gap="xs" wrap="nowrap">
+											<TruncatedPath path={file.filePath} />
+											<Badge
+												size="xs"
+												variant="light"
+												color={file.willBeDeleted ? "red" : "orange"}
+											>
+												{file.willBeDeleted
+													? t("fileMod_willBeDeleted")
+													: t("fileMod_willBeReverted")}
+											</Badge>
+										</Group>
+									))}
+								</Stack>
+							</>
+						) : (
+							!previewFailed && (
+								<Text size="sm" c="dimmed">
+									{conflicts.length > 0 ? t("revertScopeBlocked") : t("blockDeleteConfirmNoFiles")}
+								</Text>
+							)
+						)}
+					</>
+				)}
+				<Group gap="xs" justify="flex-end">
+					<Button size="xs" variant="subtle" onClick={onCancel}>
+						{tc("cancel")}
+					</Button>
+					<Button
+						size="xs"
+						variant="default"
+						onClick={() => onConfirm({ skipRevert: true })}
+						loading={isLoading}
+					>
+						{t("blockDeleteHistoryOnly")}
+					</Button>
+					<Button
+						size="xs"
+						color="red"
+						disabled={revertBlocked}
+						onClick={() => onConfirm({ skipRevert: false })}
+						loading={isLoading}
+					>
+						{files.length > 0 ? t("blockDeleteWithRevert") : t("contextMenu_delete")}
+					</Button>
+				</Group>
+			</Stack>
+		</Modal>
+	);
+}
+
 function TurnElapsedTime({
 	text,
 	startedAtLabel,
@@ -2448,6 +2605,11 @@ export function NarratorPanel({
 	const { data: userPrefs } = useUserPreferences();
 	const updateUserPrefs = useUpdateUserPreferences();
 	const fastModeDefault = userPrefs?.fastModeDefault ?? false;
+	// "inherit" follows the default, so the default switch below also changes what
+	// this session actually does — matching the server-side per-turn resolution.
+	const fastModeOverride = narrator?.fastModeOverride ?? "inherit";
+	const fastModeEnabled =
+		fastModeOverride === "inherit" ? fastModeDefault : fastModeOverride === "on";
 	const isMobileViewport = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const isCoarsePointer = useMediaQuery("(hover: none), (pointer: coarse)") ?? false;
 	const fastModeUsesTapSettings = isMobileViewport || isCoarsePointer;
@@ -2883,21 +3045,40 @@ export function NarratorPanel({
 
 	// --- Message operations ---
 	const setUnreadCountRef = useRef<React.Dispatch<React.SetStateAction<number>>>(undefined);
-	const handleDeleteBlock = useCallback(
-		async (messageId: string, blockIndex: number) => {
+	// Deleting a block rolls its file changes back, so it asks first rather than
+	// firing straight from the context menu.
+	const [pendingBlockDelete, setPendingBlockDelete] = useState<{
+		messageId: string;
+		blockIndex: number;
+	} | null>(null);
+
+	const handleDeleteBlock = useCallback((messageId: string, blockIndex: number) => {
+		setPendingBlockDelete({ messageId, blockIndex });
+	}, []);
+
+	const confirmBlockDelete = useCallback(
+		async ({ skipRevert }: { skipRevert: boolean }) => {
+			if (!pendingBlockDelete) return;
+			const { messageId, blockIndex } = pendingBlockDelete;
+			setPendingBlockDelete(null);
 			try {
-				await api.deleteMessageBlock(narratorId, messageId, blockIndex);
+				await api.deleteMessageBlock(narratorId, messageId, blockIndex, { skipRevert });
 				chunkListRef.current?.refreshStructure("full");
-			} catch {
+			} catch (error) {
+				// A rollback refusal (another actor changed the same regions) is not a
+				// generic failure: the server explains what happened and the user still has
+				// a way forward. Surfacing "please retry" instead would send them into a
+				// loop that cannot succeed.
+				const isConflict = error instanceof ApiError && error.status === 409;
 				notifications.show({
-					title: t("deleteMessageFailed"),
-					message: t("deleteMessageFailedDesc"),
-					color: "red",
-					autoClose: 5000,
+					title: isConflict ? t("blockDeleteConflictTitle") : t("deleteMessageFailed"),
+					message: isConflict ? t("blockDeleteConflictDesc") : t("deleteMessageFailedDesc"),
+					color: isConflict ? "yellow" : "red",
+					autoClose: isConflict ? 10000 : 5000,
 				});
 			}
 		},
-		[narratorId, t],
+		[narratorId, pendingBlockDelete, t],
 	);
 
 	const [pendingRollback, setPendingRollback] = useState<{
@@ -3832,7 +4013,6 @@ export function NarratorPanel({
 		setPaymentRequired,
 		leakedToolEvent,
 		setLeakedToolEvent,
-		expandedToolUseId,
 		unreadCount,
 		setUnreadCount,
 		viewers,
@@ -5560,14 +5740,19 @@ export function NarratorPanel({
 	}, [compactingMarkerKind, isWorkspacePreview, scrollToMessageTarget, t]);
 
 	// --- Scroll to highlighted message ---
+	// Chunked path only. The virtual list owns this jump itself (it needs the
+	// document index to reach an unmounted row, and it flashes the revealed node
+	// imperatively instead of through panel state), so driving it from here too
+	// would issue the same scroll twice.
 	useEffect(() => {
+		if (narratorVirtualList) return;
 		if (!highlightMessageId || highlightScrolledRef.current) return;
 		highlightScrolledRef.current = scrollToMessageTarget({
 			domIds: [`msg-${highlightMessageId}`],
 			targetIds: [highlightMessageId],
 			highlightId: highlightMessageId,
 		});
-	}, [highlightMessageId, scrollToMessageTarget]);
+	}, [highlightMessageId, narratorVirtualList, scrollToMessageTarget]);
 
 	const applyBufferedSendResult = useCallback(
 		(
@@ -5806,7 +5991,9 @@ export function NarratorPanel({
 					permissionMode: fetchedNarrator?.permissionMode ?? narrator?.permissionMode ?? undefined,
 					reasoningEffort:
 						fetchedNarrator?.reasoningEffort ?? narrator?.reasoningEffort ?? undefined,
-					fastMode: fetchedNarrator?.fastMode ?? narrator?.fastMode ?? undefined,
+					fastModeOverride: normalizeBooleanOverride(
+						fetchedNarrator?.fastModeOverride ?? narrator?.fastModeOverride,
+					),
 					relaxedPlan: fetchedNarrator?.relaxedPlan ?? narrator?.relaxedPlan ?? undefined,
 					planReflectionAutoApproveOverride: normalizeBooleanOverride(
 						fetchedNarrator?.planReflectionAutoApproveOverride ??
@@ -6563,13 +6750,19 @@ export function NarratorPanel({
 					style={{ flexShrink: 0 }}
 				>
 					<Tooltip
-						label={t("fast_mode_tooltip")}
+						label={
+							fastModeOverride === "inherit"
+								? t("fast_mode_inherit_tooltip", {
+										state: fastModeDefault ? t("fast_mode_on") : t("fast_mode_off"),
+									})
+								: t("fast_mode_tooltip")
+						}
 						position={position.startsWith("top") ? "top" : "bottom"}
 						disabled={fastModeSettingsOpened}
 					>
 						<ActionIcon
 							variant="subtle"
-							color={narrator.fastMode ? "yellow" : "gray"}
+							color={fastModeEnabled ? "yellow" : "gray"}
 							size="sm"
 							aria-label={t("fast_mode")}
 							onPointerDown={startFastModeLongPress}
@@ -6584,9 +6777,11 @@ export function NarratorPanel({
 									fastModeLongPressFiredRef.current = false;
 									return;
 								}
+								// Clicking pins this session against its current effective
+								// state; the popover restores "follow default".
 								fastModeMutation.mutate({
 									id: narratorId,
-									fastMode: !narrator.fastMode,
+									fastModeOverride: fastModeEnabled ? "off" : "on",
 								});
 							}}
 						>
@@ -6602,6 +6797,30 @@ export function NarratorPanel({
 				<Stack gap={8}>
 					<Text size="sm" fw={600}>
 						{t("fast_mode")}
+					</Text>
+					<SegmentedControl
+						size="xs"
+						fullWidth
+						value={fastModeOverride}
+						onChange={(value) =>
+							fastModeMutation.mutate({
+								id: narratorId,
+								fastModeOverride: value as "inherit" | "on" | "off",
+							})
+						}
+						data={[
+							{
+								value: "inherit",
+								label: t("fast_mode_session_inherit", {
+									state: fastModeDefault ? t("fast_mode_on") : t("fast_mode_off"),
+								}),
+							},
+							{ value: "on", label: t("fast_mode_on") },
+							{ value: "off", label: t("fast_mode_off") },
+						]}
+					/>
+					<Text size="xs" c="dimmed">
+						{t("fast_mode_session_desc")}
 					</Text>
 					<Switch
 						size="sm"
@@ -7486,7 +7705,6 @@ export function NarratorPanel({
 																narratorId={narratorId}
 																isSubagent={isSubagent}
 																permCb={renderPermCb}
-																expandedToolUseId={expandedToolUseId}
 																showTokenUsage={showTokenUsage}
 																pruneBoundaryMessageId={pruneBoundaryMessageId}
 																pruneDividerLabel={pruneDividerLabel}
@@ -7522,6 +7740,7 @@ export function NarratorPanel({
 																	permCb={renderPermCb}
 																	pruneDividerLabel={pruneDividerLabel}
 																	hasChapter={hasChapter}
+																	highlightMessageId={highlightMessageId}
 																	tailFooter={
 																		isSubagent &&
 																		narrator &&
@@ -7558,7 +7777,6 @@ export function NarratorPanel({
 																highlightedId={highlightedId}
 																highlightMessageId={highlightMessageId}
 																onHighlightTarget={scheduleHighlight}
-																expandedToolUseId={expandedToolUseId}
 																showTokenUsage={showTokenUsage}
 																pruneBoundaryMessageId={pruneBoundaryMessageId}
 																pruneDividerLabel={pruneDividerLabel}
@@ -9241,6 +9459,12 @@ export function NarratorPanel({
 				pendingRollback={pendingRollback}
 				onConfirm={confirmRollback}
 				onCancel={() => setPendingRollback(null)}
+			/>
+			<BlockDeleteConfirmModal
+				narratorId={narratorId}
+				pending={pendingBlockDelete}
+				onConfirm={confirmBlockDelete}
+				onCancel={() => setPendingBlockDelete(null)}
 			/>
 			<ModelPriceModal
 				model={priceModel}

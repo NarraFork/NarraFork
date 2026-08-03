@@ -95,6 +95,59 @@ describe("getDraftDrift", () => {
 	});
 });
 
+// The batch drift check exists so list views don't call getDraftDrift per row — that returns
+// three full document bodies each. It must agree with the per-entry verdict exactly, or a
+// library listing would mislabel which copies need a rebase.
+describe("findDriftedDraftIds (batch) agrees with getDraftDrift", () => {
+	test("classifies drifted, up-to-date and standalone rows in one query", async () => {
+		// (a) drifted: fork, then advance main.
+		const drifted = await knowledgeService.createEntry({
+			collectionId,
+			title: `BatchDrifted ${TAG}`,
+			content: "base\n",
+		});
+		const driftedDraft = await knowledgeBranchService.createDraft(principal, drifted.id, {});
+		await knowledgeService.addRevision(drifted.id, { content: "moved on\n" });
+
+		// (b) up to date: fork and leave main alone.
+		const fresh = await knowledgeService.createEntry({
+			collectionId,
+			title: `BatchFresh ${TAG}`,
+			content: "stable\n",
+		});
+		const freshDraft = await knowledgeBranchService.createDraft(principal, fresh.id, {});
+
+		// (c) standalone: no global counterpart, so drift is not even defined.
+		const standalone = await knowledgeBranchService.createStandalone(principal, {
+			title: `BatchStandalone ${TAG}`,
+			content: "mine only\n",
+			targetCollectionId: collectionId,
+		});
+
+		const rows = [driftedDraft, freshDraft, standalone];
+		const batch = await knowledgeBranchService.findDriftedDraftIds(rows);
+
+		expect(batch.has(driftedDraft.id)).toBe(true);
+		expect(batch.has(freshDraft.id)).toBe(false);
+		expect(batch.has(standalone.id)).toBe(false);
+
+		// Equivalence with the per-entry path for both linked rows.
+		for (const [draft, entryId] of [
+			[driftedDraft, drifted.id],
+			[freshDraft, fresh.id],
+		] as const) {
+			const single = await knowledgeBranchService.getDraftDrift(principal, entryId);
+			expect(single.hasDraft).toBe(true);
+			if (single.hasDraft) expect(batch.has(draft.id)).toBe(single.drifted);
+		}
+	});
+
+	test("an empty input performs no query and returns an empty set", async () => {
+		const batch = await knowledgeBranchService.findDriftedDraftIds([]);
+		expect(batch.size).toBe(0);
+	});
+});
+
 describe("rebaseDraft", () => {
 	test("clean rebase: non-overlapping changes merge onto current main", async () => {
 		// Multi-paragraph body so the two edits sit in well-separated diff hunks (a realistic

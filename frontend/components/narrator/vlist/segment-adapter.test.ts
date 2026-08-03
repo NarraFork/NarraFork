@@ -1878,8 +1878,8 @@ describe("adaptSegment — subagent card timing passthrough", () => {
 		};
 	}
 
-	function data(seg: AdapterSegment) {
-		const spec = adaptSegment(seg, { lod: 5 }).find((s) => s.key === "tool-tu-a");
+	function data(seg: AdapterSegment, ctx: AdapterContext = { lod: 5 }) {
+		const spec = adaptSegment(seg, ctx).find((s) => s.key === "tool-tu-a");
 		return (spec?.data ?? {}) as Record<string, unknown>;
 	}
 
@@ -1924,6 +1924,60 @@ describe("adaptSegment — subagent card timing passthrough", () => {
 		const d = data(subagentSeg({}));
 		expect(d.recentCallNames).toEqual([]);
 		expect(d.recentCallTimings).toEqual([]);
+	});
+
+	/**
+	 * The rows are TRACE rows now, so they need what a trace row shows: a
+	 * `Tool · summary` label and a category chip. Before this the vlist copy printed
+	 * the bare tool name, so the same child call read differently here than in the
+	 * chunked card.
+	 *
+	 * The summary cannot be derived inside the pure adapter (it needs `getSummary`,
+	 * and these rows carry only the server's whitelisted `inputSummary` projection),
+	 * so it arrives through an injected resolver — the same injection pattern
+	 * `resolveToolSummary` already uses.
+	 */
+	it("derives per-row summaries + categories, paired with the names", () => {
+		const d = data(
+			subagentSeg({
+				_subagentActivity: {
+					latestToolCalls: [
+						{ toolName: "Read", status: "success", inputSummary: { file_path: "/a/loop.ts" } },
+						{ toolName: "Bash", status: "success", inputSummary: { description: "run tests" } },
+					],
+				},
+			}),
+			{
+				lod: 5,
+				resolveToolCategory: (toolName: string) => (toolName === "Read" ? "read" : "bash"),
+				resolveSubagentRecentSummary: (toolName: string, inputSummary: unknown) => {
+					const summary = (inputSummary ?? {}) as { file_path?: string; description?: string };
+					if (toolName === "Read") return summary.file_path?.split("/").pop() ?? null;
+					return summary.description ?? null;
+				},
+			},
+		);
+		expect(d.recentCallNames).toEqual(["Read", "Bash"]);
+		expect(d.recentCallSummaries).toEqual(["loop.ts", "run tests"]);
+		expect(d.recentCallCategories).toEqual(["read", "bash"]);
+	});
+
+	it("falls back to nulls when no resolver is injected (never a phantom label)", () => {
+		// Without the shell's resolver a row must degrade to its bare tool name rather
+		// than inventing one from raw input fields, which is what would let the two
+		// render paths word the same call differently again.
+		const d = data(
+			subagentSeg({
+				_subagentActivity: {
+					latestToolCalls: [
+						{ toolName: "Read", status: "success", inputSummary: { file_path: "/a/loop.ts" } },
+					],
+				},
+			}),
+			{ lod: 5 },
+		);
+		expect(d.recentCallSummaries).toEqual([null]);
+		expect(d.recentCallCategories).toEqual([null]);
 	});
 });
 
@@ -2099,5 +2153,124 @@ describe("adaptSegment — tool-call header summary", () => {
 	it("an empty resolver result is respected rather than falling back", () => {
 		const ctx: AdapterContext = { ...FILE_CTX, resolveToolSummary: () => "" };
 		expect(summaryOf(editSeg({ file_path: PATH }), ctx)).toBe("");
+	});
+});
+
+describe("adaptSegment — per-turn usage rows", () => {
+	const USAGE = { input_tokens: 100, output_tokens: 20 };
+	const assistantSeg = (extra: Record<string, unknown> = {}): AdapterSegment => ({
+		kind: "message",
+		msg: {
+			id: "a1",
+			role: "assistant",
+			contentJson: [{ type: "text", text: "hello" }],
+			turnUsageJson: USAGE,
+			...extra,
+		},
+	});
+	const usageCtx: AdapterContext = { lod: 5, showTokenUsage: true };
+
+	it("emits NO usage spec when the preference is off (identical item list)", () => {
+		const specs = adaptSegment(assistantSeg(), CTX);
+		expect(specs.map((s) => s.kind)).toEqual(["markdown"]);
+	});
+
+	it("brackets the body with a leading and a trailing usage row", () => {
+		const specs = adaptSegment(assistantSeg(), usageCtx);
+		expect(specs.map((s) => s.kind)).toEqual(["turn-usage", "markdown", "turn-usage"]);
+		expect((specs[0]!.data as { placement: string }).placement).toBe("leading");
+		expect((specs[2]!.data as { placement: string }).placement).toBe("trailing");
+	});
+
+	it("keeps the usage spec keys distinct from every block key", () => {
+		const specs = adaptSegment(assistantSeg(), usageCtx);
+		const keys = specs.map((s) => s.key);
+		expect(new Set(keys).size).toBe(keys.length);
+		expect(keys[0]).toBe("a1-usage-leading");
+		expect(keys[2]).toBe("a1-usage-trailing");
+	});
+
+	it("never adds usage rows to a user message", () => {
+		const specs = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "u1",
+					role: "user",
+					contentJson: [{ type: "text", text: "hi" }],
+					turnUsageJson: USAGE,
+				},
+			},
+			usageCtx,
+		);
+		expect(specs.map((s) => s.kind)).toEqual(["message-bubble"]);
+	});
+
+	it("never adds usage rows to the live streaming placeholder", () => {
+		const specs = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "__streaming__",
+					role: "assistant",
+					contentJson: [{ type: "text", text: "partial" }],
+					turnUsageJson: USAGE,
+				},
+			},
+			usageCtx,
+		);
+		expect(specs.map((s) => s.kind)).toEqual(["markdown"]);
+	});
+
+	it("emits nothing when an assistant message carries no usage at all", () => {
+		const specs = adaptSegment(
+			{
+				kind: "message",
+				msg: { id: "a2", role: "assistant", contentJson: [{ type: "text", text: "x" }] },
+			},
+			usageCtx,
+		);
+		expect(specs.map((s) => s.kind)).toEqual(["markdown"]);
+	});
+
+	it("splits the trailing summary onto a second line on a compact viewport", () => {
+		const specs = adaptSegment(
+			assistantSeg({ turnUsageJson: { ...USAGE, cached_input_tokens: 8 }, costUsd: 0.5 }),
+			{ ...usageCtx, compactUsageLines: true },
+		);
+		const trailing = specs.at(-1)!.data as { text: string; secondaryText?: string };
+		expect(trailing.text).toBe("Σ 108 ctx · 100 in · 20 out");
+		expect(trailing.secondaryText).toBe("8 cache hit · $0.5000");
+	});
+
+	it("omits secondaryText on a desktop viewport", () => {
+		const specs = adaptSegment(assistantSeg({ costUsd: 0.5 }), usageCtx);
+		const trailing = specs.at(-1)!.data as { text: string; secondaryText?: string };
+		expect(trailing.text).toBe("Σ 100 ctx · 100 in · 20 out · $0.5000");
+		expect(trailing.secondaryText).toBeUndefined();
+	});
+
+	it("applies the injected number formatter", () => {
+		const specs = adaptSegment(
+			assistantSeg({ turnUsageJson: { input_tokens: 1000, output_tokens: 2 } }),
+			{ ...usageCtx, formatUsageNumber: (n) => n.toLocaleString("en-US") },
+		);
+		expect((specs[0]!.data as { text: string }).text).toBe("↑ 1,000");
+	});
+
+	it("measures through the registry at a stable, content-independent height", () => {
+		const specs = adaptSegment(assistantSeg(), usageCtx);
+		const entry = VLIST_REGISTRY["turn-usage"];
+		const short = entry.measure(specs.at(-1)!.data, 600, 5);
+		const long = entry.measure(
+			{
+				placement: "trailing",
+				text: "Σ 999,999,999 ctx · 888,888 in · 777,777 out · $99.9999",
+			},
+			600,
+			5,
+		);
+		expect(short.height).toBe(long.height);
+		expect(short.height).toBeGreaterThan(0);
 	});
 });

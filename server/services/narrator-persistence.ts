@@ -33,6 +33,7 @@ import type {
 import { withDbRetry } from "../lib/db-resilience";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { legacyFastModeMirror } from "../lib/fast-mode";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
@@ -1821,11 +1822,19 @@ export const narratorPersistence = {
 			.where(eq(narrators.id, narratorId));
 	},
 
-	async updateFastMode(narratorId: string, fastMode: boolean) {
+	/**
+	 * Set the tri-state fast-mode override. The deprecated `fastMode` boolean is
+	 * mirrored so older readers of the same database still see explicit opt-ins.
+	 */
+	async updateFastModeOverride(narratorId: string, fastModeOverride: BooleanOverride) {
 		const now = new Date().toISOString();
 		await db
 			.update(narrators)
-			.set({ fastMode, updatedAt: now })
+			.set({
+				fastModeOverride,
+				fastMode: legacyFastModeMirror(fastModeOverride),
+				updatedAt: now,
+			})
 			.where(eq(narrators.id, narratorId));
 	},
 

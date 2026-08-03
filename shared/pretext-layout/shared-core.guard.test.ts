@@ -18,6 +18,7 @@ const CORE_FILES = [
 	"segment-adapter.ts",
 	"tool-detail.ts",
 	"tool-io-projection.ts",
+	"turn-usage.ts",
 	"prepared-block.ts",
 	"pretext-fonts.ts",
 	"pretext-metrics.ts",

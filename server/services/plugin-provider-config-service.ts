@@ -56,11 +56,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Whether a single JSON Schema property node declares a secret value.
+ *
+ * Three markers are accepted because three of them are already in use and they
+ * disagreed. `04-server-rpc-and-provider.md` specifies `writeOnly: true` plus
+ * `x-narrafork-secret: true`, and `plugin-provider-rpc.ts` enforces that pair when it
+ * rejects secret defaults — but this service originally recognized only
+ * `format: "password"`. A plugin following the documented spelling therefore had its
+ * credential classified as an ordinary field and written to `state.json` in plain
+ * text. Accepting all three closes that hole without invalidating either spelling.
+ *
+ * Exported so the RPC layer and any future consumer share one definition rather than
+ * re-deriving it and drifting apart again.
+ */
+export function isSecretSchemaNode(node: unknown): boolean {
+	if (!isRecord(node)) return false;
+	return (
+		node.format === "password" || node.writeOnly === true || node["x-narrafork-secret"] === true
+	);
+}
+
+/**
  * Field names a schema marks as secret.
  *
- * Only top-level string properties with `format: "password"` qualify. Nested secrets
- * are intentionally unsupported: the flat key shape keeps secret-broker keys
- * predictable and the config form simple, and no real provider has needed more.
+ * Only top-level string properties qualify. Nested secrets are intentionally
+ * unsupported: the flat key shape keeps secret-broker keys predictable and the config
+ * form simple, and no real provider has needed more.
  */
 export function secretFieldsOf(schema: ProviderRegistryEntry["configSchema"]): string[] {
 	if (typeof schema === "boolean") return [];
@@ -69,7 +90,7 @@ export function secretFieldsOf(schema: ProviderRegistryEntry["configSchema"]): s
 	const fields: string[] = [];
 	for (const [name, definition] of Object.entries(properties)) {
 		if (!isRecord(definition)) continue;
-		if (definition.type === "string" && definition.format === "password") fields.push(name);
+		if (definition.type === "string" && isSecretSchemaNode(definition)) fields.push(name);
 	}
 	return fields;
 }

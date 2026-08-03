@@ -4,7 +4,7 @@ import { generateShortId } from "@server/lib/id";
 import type { InvocationScope } from "./plugin-capability-broker";
 
 export type PluginUiSurfaceScope = "workspace" | "narrator" | "project" | "global";
-export type PluginUiSurface = "workspace" | "director" | "focus" | "settings";
+export type PluginUiSurface = "workspace" | "director" | "focus" | "settings" | "provider-settings";
 
 export interface PluginUiSessionBinding {
 	pluginId: string;
@@ -133,7 +133,9 @@ export class PluginUiSessionService {
 				assertText(String(value), `scope.${key}`, 128);
 			}
 		}
-		if (!["workspace", "director", "focus", "settings"].includes(binding.surface)) {
+		if (
+			!["workspace", "director", "focus", "settings", "provider-settings"].includes(binding.surface)
+		) {
 			throw new ValidationError("Invalid surface");
 		}
 		if (!["workspace", "narrator", "project", "global"].includes(binding.surfaceScope)) {

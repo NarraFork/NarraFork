@@ -492,8 +492,13 @@ interface ProviderDescribeResult {
 - `providerTypeId` 由宿主使用 `${pluginId}/${localId}` 构造；
 - `configSchema` 只描述 provider instance 配置，不描述插件安装配置；
 - secret 字段使用 JSON Schema `writeOnly: true` 和扩展
-  `"x-narrafork-secret": true`；
+  `"x-narrafork-secret": true`；宿主亦接受 `format: "password"`，三种标记等价，由
+  `isSecretSchemaNode` 统一识别（历史上只识别 `format: "password"`，导致按本文写法声明的密钥
+  被当作普通字段写入 `state.json` 明文，已修复并有回归测试）；
+- 只有顶层 string 属性会被当作 secret，嵌套 secret 不支持：扁平键名保证
+  `provider.<contributionId>.<field>` 可预测；
 - 响应不得包含密钥默认值；
+- secret 的实际下发方式见 26 节 D-04（已决策：按请求在 `config` 中注入解析值）；
 - `maxConcurrent*` 未声明时默认 1；
 - `mayLeakXmlToolCalls` 默认 false，v1 强烈建议插件始终发送结构化工具事件。
 
@@ -1736,13 +1741,59 @@ handling 测试，确保加入 Registry 后：
 
 ### D-04：secret 的实际注入方式
 
-可选方案：
+**[已决策]** 采用「每次 RPC 在 `config` 中发送解析后的 secret」。
 
-- 每次 RPC 在 `config` 中发送解析后的 secret；
-- 启动时通过专用 secret channel 注入，RPC 只发送引用；
-- 容器 secret/file descriptor。
+实现位置：
 
-**本文协议建议**先允许 RPC config 传值，但日志必须深度脱敏；最终选择应由安全实现阶段确认。
+- `server/services/plugin-provider-credential-resolver.ts` —— 唯一的解析入口。按
+  `providerInstanceId` 取该 provider 自己 schema 声明的 secret 字段，与非密 config 合并后
+  作为 `ProviderBaseParams.config` 下发。
+- 接入点：`plugin-provider-adapter-factory.ts`（chat/generate）与
+  `plugin-provider-catalog-refresh.ts`（listModels）共用同一个 resolver，因此模型枚举与对话
+  使用同一套凭据。
+- 接线：`plugin-platform-services.ts`。
+
+约束（均有回归测试）：
+
+- **每次调用现场解析，不缓存**：轮换密钥或禁用插件在下一次请求即生效，不需重启。
+- **未配置的 secret 字段不出现在 `config` 里**（而非空串），使插件能区分「未配置」与
+  「配置为空」。
+- **只下发该 provider 自己声明的字段**：键名为 `provider.<contributionId>.<field>`，插件无法
+  拿到兄弟 provider 或其他插件的凭据，也没有任何列举能力。
+- **日志深度脱敏**：这是本方案成立的前提。解析结果不得进入日志、错误详情或诊断；解析失败
+  只记录字段名。`plugin-provider-credential-resolver.test.ts` 与
+  `plugin-provider-credential-e2e.test.ts` 会捕获一次真实 chat 期间的全部日志并断言其中不含
+  密钥值。
+
+未采用「专用 secret channel + 引用」与「容器 secret/file descriptor」：两者都需要插件侧主动
+申请，而本方案由宿主单向推送，插件不具备申请动作，攻击面更小。`plugin-secret-broker` 的租约
+机制保留给未来确有主动申请需求的场景，本路径不经过它。
+
+secret 字段的声明写法见 8.2 节（`writeOnly: true` + `"x-narrafork-secret": true`）；
+`format: "password"` 亦被接受，三种写法由
+`isSecretSchemaNode`（`plugin-provider-config-service.ts`）统一识别。
+
+### D-04b：插件声明的 command 如何被调用（已决策）
+
+**[已决策]** 新增 Host→Plugin 方法 **`commands.invoke`**。
+
+背景：Manifest 一直支持 `contributes.commands[].handler: "server"`，但没有任何消费方。
+`commands.execute`（插件 UI 调用的方法）解析的是**宿主自己的** `CommandRegistry`，其条目是宿主函数，
+因此插件声明的 command 无法被路由——是死代码。
+
+实现：
+
+- `commands.invoke` 与 `tools.invoke` 同形（宿主发起、插件应答），带超时、输入/输出字节上限、取消。
+  参数为 `{ contributionId, input?, context: { requestId, correlationId?, deadlineAt?, idempotencyKey? } }`。
+- `server/services/plugin-command-registry.ts` 从 manifest 注册 `handler: "server"` 条目；
+  `handler: "ui"` 的条目也被记录，但调用时报「由 UI 处理、没有后端」，与「不存在该 command」区分开。
+- `PluginUiHost.command()` 在宿主 `CommandRegistry` **未命中时**才回落到插件注册表，因此插件无法用
+  同名 id 遮蔽宿主 command（有专门回归测试）。
+- 结果 schema 为 `{ output?, secretWrites? }`。`secretWrites` 的语义与限制见 07 号文档 §13。
+
+**不影响既有清单**：`commands.invoke` 是新增的**另一个方向**的方法，不进
+`PLUGIN_TO_HOST_REQUEST_METHODS`，也不进 iframe 的 `PLUGIN_UI_BACKEND_METHODS`；冻结这两个清单相等的
+contract parity 断言未改动。
 
 ### D-05：prefix 与内置 provider 的冲突策略
 

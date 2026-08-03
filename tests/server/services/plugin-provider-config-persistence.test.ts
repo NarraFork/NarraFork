@@ -37,9 +37,21 @@ import { PluginToolRegistry } from "@server/services/plugin-tool-registry";
 const pluginId = "com.example.provider-config";
 const hash = "d".repeat(64);
 
-function manifestInput(overrides: { version?: string; withSecret?: boolean } = {}): ManifestInput {
+function manifestInput(
+	overrides: {
+		version?: string;
+		withSecret?: boolean;
+		/** Which secret spelling to declare. Defaults to `format: "password"`. */
+		secretMarker?: Record<string, unknown>;
+	} = {},
+): ManifestInput {
 	const configSchema: Record<string, unknown> = { apiMode: { type: "string" } };
-	if (overrides.withSecret) configSchema.apiKey = { type: "string", format: "password" };
+	if (overrides.withSecret) {
+		configSchema.apiKey = {
+			type: "string",
+			...(overrides.secretMarker ?? { format: "password" }),
+		};
+	}
 	return {
 		schemaVersion: 1,
 		pluginId,
@@ -316,6 +328,63 @@ describe("provider config persistence", () => {
 			expect(cleared.secretsSet).toEqual([]);
 			expect(cleared.config.apiKey).toBeUndefined();
 		});
+	});
+
+	/**
+	 * `04-server-rpc-and-provider.md` §8.2 specifies `writeOnly: true` plus
+	 * `"x-narrafork-secret": true`, and `plugin-provider-rpc.ts` enforces that pair when
+	 * rejecting secret defaults — but this service originally recognized only
+	 * `format: "password"`. A plugin using the documented spelling therefore had its
+	 * credential treated as an ordinary field and written to `state.json` in plain text.
+	 *
+	 * Each spelling is asserted against the file on disk, because that is where the leak
+	 * actually appeared; checking only `secretsSet` would pass even if the value were
+	 * also persisted.
+	 */
+	test("treats every documented secret marker as a secret, not plain config", async () => {
+		for (const marker of [
+			{ format: "password" },
+			{ writeOnly: true },
+			{ "x-narrafork-secret": true },
+			// The documented pair, used together as a real plugin would.
+			{ writeOnly: true, "x-narrafork-secret": true },
+		]) {
+			await withStateStore(async (stateStore, root) => {
+				const manifest = parseManifest(manifestInput({ withSecret: true, secretMarker: marker }));
+				const { providerRegistry, coordinator } = harness(manifest, stateStore);
+				await coordinator.initialize(snapshotFor(manifest), { lifecycleStates: lifecycle() });
+				const entry = providerRegistry.list().find((item) => item.pluginId === pluginId);
+				const instanceId = entry?.providerInstanceId ?? "";
+
+				const secrets = new Map<string, string>();
+				const service = new PluginProviderConfigService({
+					registry: providerRegistry,
+					stateStore,
+					secretStore: {
+						setSecret: ({ pluginId: id, key, value }) => void secrets.set(`${id}:${key}`, value),
+						deleteSecret: ({ pluginId: id, key }) => void secrets.delete(`${id}:${key}`),
+						hasSecret: ({ pluginId: id, key }) => secrets.has(`${id}:${key}`),
+					},
+				});
+
+				const view = await service.update(pluginId, instanceId, {
+					apiMode: "balanced",
+					apiKey: "sk-marker-secret",
+				});
+
+				const label = JSON.stringify(marker);
+				expect(view.secretFields, label).toEqual(["apiKey"]);
+				expect(secrets.get(`${pluginId}:provider.demo.apiKey`), label).toBe("sk-marker-secret");
+				expect(view.config.apiKey, label).toBe(SECRET_PLACEHOLDER);
+				// The decisive assertion: the value must not be on disk in plain text.
+				expect(await Bun.file(join(root, "state.json")).text(), label).not.toContain(
+					"sk-marker-secret",
+				);
+				expect(stateStore.getCachedState(pluginId)?.providerConfigs.demo, label).toEqual({
+					apiMode: "balanced",
+				});
+			});
+		}
 	});
 
 	test("prunes config for a provider the plugin stopped contributing", async () => {

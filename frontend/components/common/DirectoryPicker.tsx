@@ -54,6 +54,10 @@ import {
 } from "../../hooks/useFavoriteDirectories";
 import { useFileSystemCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
+import {
+	DIRECTORY_BROWSER_MODAL_STYLES,
+	DIRECTORY_BROWSER_ROOT_STYLE,
+} from "./directory-browser-modal";
 import { PathInput } from "./PathInput";
 
 const MAX_DIRECTORY_ENTRIES = 1_000;
@@ -149,15 +153,7 @@ export function DirectoryPicker({
 				onClose={close}
 				title={t("selectDirectory")}
 				size={isWide ? 880 : "md"}
-				styles={{
-					body: {
-						padding: 0,
-						maxHeight: "85vh",
-						display: "flex",
-						flexDirection: "column",
-						overflow: "hidden",
-					},
-				}}
+				styles={DIRECTORY_BROWSER_MODAL_STYLES}
 			>
 				<DirectoryBrowser
 					initialPath={browsePath}
@@ -465,7 +461,7 @@ export function DirectoryBrowser({
 	);
 
 	return (
-		<Stack gap={0} style={{ height: "calc(85vh - 60px)" }}>
+		<Stack gap={0} style={DIRECTORY_BROWSER_ROOT_STYLE}>
 			{/* ── Toolbar ── */}
 			<Group gap={4} px="sm" py={6} wrap="nowrap">
 				<Tooltip label={t("homeDirectory")} openDelay={400}>
@@ -665,8 +661,14 @@ export function DirectoryBrowser({
 						</Stack>
 					</ScrollArea>
 
-					{/* Directory listing */}
-					<ScrollArea style={{ flex: 1 }} h={isWide ? "100%" : 350} type="auto" offsetScrollbars>
+					{/*
+					 * Directory listing. `100%` at every breakpoint, never a fixed pixel height:
+					 * the row is already bounded by the browser's own definite height, and a
+					 * fixed height left the pane short of the modal's bottom edge on a narrow
+					 * portrait viewport — visible as dead space under the last folder while the
+					 * list itself still had to scroll.
+					 */}
+					<ScrollArea style={{ flex: 1, minWidth: 0 }} h="100%" type="auto" offsetScrollbars>
 						{!browseSupported && (
 							<Text c="dimmed" size="sm" ta="center" mt="xl" px="sm">
 								{browseUnavailableReason}

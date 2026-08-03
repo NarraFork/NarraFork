@@ -9,7 +9,9 @@ import {
 	type RuntimeSettingsOverride,
 	TODO_REMINDER_TOOL_INTERVAL,
 } from "../lib/agent";
+import { normalizeBooleanOverride } from "../lib/boolean-override";
 import { eventBus } from "../lib/event-bus";
+import { resolveFastModeForUser } from "../lib/fast-mode";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
@@ -584,7 +586,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		.catch(() => []);
 	const defaultDeviceId = initialNarrator.defaultDeviceId ?? null;
 	let narratorReasoningEffort = initialNarrator.reasoningEffort ?? undefined;
-	let narratorFastMode = initialNarrator.fastMode ?? false;
+	let narratorFastModeOverride = normalizeBooleanOverride(initialNarrator.fastModeOverride);
 	const disabledTools = getDisabledToolSet(initialNarrator.traits);
 	const blockedSkills = getBlockedSkills(initialNarrator.traits);
 
@@ -613,8 +615,11 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		};
 
 		const resolvedProvider = resolveProvider(model);
+		// "inherit" resolves against the acting user's fastModeDefault on every loop,
+		// so changing that preference affects running sessions from the next turn.
+		const resolvedFastMode = await resolveFastModeForUser(narratorFastModeOverride, currentUserId);
 		const resolvedServiceTier =
-			narratorFastMode && usesCodexModel(resolvedProvider, model) ? "priority" : undefined;
+			resolvedFastMode && usesCodexModel(resolvedProvider, model) ? "priority" : undefined;
 		let todoReminderCompletedToolCount = 0;
 		// Completed-tool count when the spec reminder was last injected for this
 		// subagent loop. Gates buildSpecToolResultReminder to the same cadence the
@@ -1122,7 +1127,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		const freshNarrator = await narratorService.getById(narratorId);
 		pruneBoundaryId = freshNarrator.pruneBoundaryMessageId ?? null;
 		narratorReasoningEffort = freshNarrator.reasoningEffort ?? undefined;
-		narratorFastMode = freshNarrator.fastMode ?? false;
+		narratorFastModeOverride = normalizeBooleanOverride(freshNarrator.fastModeOverride);
 
 		// Sync model from the active subagent settings map (may have been changed via UI)
 		const saSettings = activeSubagentSettings.get(narratorId);

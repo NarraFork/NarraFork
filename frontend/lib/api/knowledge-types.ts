@@ -3,12 +3,10 @@
 
 export type KnowledgeFormat = "markdown" | "text" | "json";
 export type KnowledgeEntryStatus = "active" | "archived";
-export type KnowledgeDraftStatus =
-	| "draft"
-	| "pending_review"
-	| "changes_requested"
-	| "merged"
-	| "abandoned";
+// Personal-entry lifecycle. The publish-request lifecycle lives on
+// knowledge_submissions, so a personal entry itself is only in use or retired.
+// Mirrors knowledge_drafts.status in server/db/schema.ts.
+export type KnowledgeDraftStatus = "active" | "archived";
 export type KnowledgeSubmissionStatus =
 	| "pending"
 	| "approved"
@@ -101,10 +99,15 @@ export interface KnowledgeDraft {
 }
 
 /**
- * A personal-library entry (the knowledge_drafts row under the personal-library model).
- * `entryId` null = standalone (no global counterpart yet); set = linked to a global entry.
+ * A personal-library entry (the knowledge_drafts row under the personal-library model)
+ * WITHOUT its body. `entryId` null = standalone (no global counterpart yet); set = linked
+ * to a global entry.
+ *
+ * The list endpoint (`GET /personal-entries`) returns this shape: it projects the `content`
+ * blob away in SQL and reports `contentLength` instead, so a library listing never carries
+ * N full document bodies. Use {@link KnowledgePersonalEntry} for single-entry reads.
  */
-export interface KnowledgePersonalEntry {
+export interface KnowledgePersonalEntrySummary {
 	id: string;
 	entryId: string | null;
 	authorUserId: string;
@@ -112,7 +115,8 @@ export interface KnowledgePersonalEntry {
 	title: string | null;
 	targetCollectionId: string | null;
 	baseRevisionId: string | null;
-	content: string;
+	/** Body size in characters — computed in SQL; the body itself is not returned. */
+	contentLength: number;
 	contentHash: string;
 	format: KnowledgeFormat;
 	/** Author-declared keywords (standalone personal entries) for passive auto-injection. */
@@ -120,6 +124,16 @@ export interface KnowledgePersonalEntry {
 	status: "active" | "archived";
 	createdAt: string;
 	updatedAt: string;
+}
+
+/**
+ * A single personal-library entry WITH its body, as returned by the detail / create /
+ * update endpoints. The editor needs the body; list views deliberately do not (see
+ * {@link KnowledgePersonalEntrySummary}).
+ */
+export interface KnowledgePersonalEntry
+	extends Omit<KnowledgePersonalEntrySummary, "contentLength"> {
+	content: string;
 }
 
 /**

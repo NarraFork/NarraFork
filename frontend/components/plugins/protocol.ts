@@ -128,6 +128,13 @@ export const PLUGIN_UI_BACKEND_METHODS = [
 	"storage.delete",
 	"storage.list",
 	"config.get",
+	// Same four secret methods the backend exposes. A UI plugin reaching them is not a new
+	// exposure: it could already read the same values by calling its own backend command.
+	// The host derives the storage key from the session's plugin identity, so a view cannot
+	// name another plugin's secret.
+	"secrets.get",
+	"secrets.set",
+	"secrets.delete",
 	"secrets.list",
 	"diagnostics.getOwn",
 ] as const;
@@ -198,7 +205,10 @@ export type UiRpcEnvelope = z.infer<typeof uiRpcEnvelopeSchema>;
 export type UiRpcError = z.infer<typeof uiRpcErrorSchema>;
 
 export type PluginPanelBinding =
-	| { kind: "host-surface"; surface: "focus" | "workspace" | "director" | "settings" }
+	| {
+			kind: "host-surface";
+			surface: "focus" | "workspace" | "director" | "settings" | "provider-settings";
+	  }
 	| { kind: "focus-current-narrator" }
 	| { kind: "workspace"; workspaceId: string }
 	| { kind: "workspace-narrator"; workspaceId: string; ownerNarratorId: string }
@@ -208,7 +218,7 @@ const bindingSchema = z.discriminatedUnion("kind", [
 	z
 		.object({
 			kind: z.literal("host-surface"),
-			surface: z.enum(["focus", "workspace", "director", "settings"]),
+			surface: z.enum(["focus", "workspace", "director", "settings", "provider-settings"]),
 		})
 		.strict(),
 	z.object({ kind: z.literal("focus-current-narrator") }).strict(),

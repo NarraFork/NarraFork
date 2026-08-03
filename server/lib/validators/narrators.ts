@@ -53,7 +53,9 @@ export const createNarratorSchema = z.object({
 	startInPlanMode: z.boolean().optional(),
 	cwd: z.string().min(1).max(4096).optional(),
 	reasoningEffort: reasoningEffortSchema.nullable().optional(),
+	/** @deprecated Use fastModeOverride. Kept so older clients keep working. */
 	fastMode: z.boolean().optional(),
+	fastModeOverride: booleanOverrideSchema.optional(),
 	relaxedPlan: z.boolean().optional(),
 	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
 	dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),
@@ -297,6 +299,30 @@ export const updateNarratorModelSchema = z.object({
 	model: z.union([z.literal("__default__"), z.string().min(1).max(200)]),
 });
 
+// === Narrator transcript export ===
+
+/**
+ * Query for `GET /api/narrators/:id/export`.
+ *
+ * Every field defaults. `scope` defaults to `visible` — the transcript as the
+ * user currently sees it — and `full` opts into pre-compact history. The export
+ * itself states when `visible` left earlier messages out, so the narrower default
+ * cannot masquerade as a complete archive.
+ *
+ * Booleans arrive as query strings, so they are parsed from the explicit
+ * "true"/"false" spellings rather than JS truthiness (where "false" is true).
+ */
+const exportBooleanSchema = z
+	.enum(["true", "false", "1", "0"])
+	.transform((value) => value === "true" || value === "1");
+
+export const narratorExportQuerySchema = z.object({
+	format: z.enum(["markdown", "json"]).default("markdown"),
+	scope: z.enum(["full", "visible"]).default("visible"),
+	includeToolIO: exportBooleanSchema.default(true),
+	lang: z.enum(["en", "zh-CN"]).default("en"),
+});
+
 /**
  * Bulk-migrate narrators off a model whose provider can no longer serve them.
  * The id list is explicit (never "all matching") so the confirmed set is exactly
@@ -388,6 +414,9 @@ export const batchDeleteBlocksSchema = z.object({
 		.max(200),
 	// When true, delete the blocks from history only, leaving files/spec untouched.
 	skipRevert: z.boolean().optional(),
+	// The narrator scope is the default and refuses on conflict, so the caller needs
+	// a way to ask for the wider one its error suggests.
+	scope: revertScopeSchema,
 });
 
 export const forkFromMessagesSchema = z.object({

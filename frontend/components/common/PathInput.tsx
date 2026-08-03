@@ -21,6 +21,13 @@ interface PathInputBaseProps {
 	leftSection?: React.ReactNode;
 	rightSection?: React.ReactNode;
 	rightSectionWidth?: number;
+	/** Called after the dropdown closes on blur, for callers that persist on blur. */
+	onBlur?: () => void;
+	/**
+	 * Controlled mode only: Enter confirmed the typed value (no dropdown option
+	 * was highlighted). Lets a parent form submit on Enter.
+	 */
+	onSubmit?: () => void;
 }
 
 interface UncontrolledPathInputProps extends PathInputBaseProps {
@@ -68,6 +75,8 @@ export function PathInput(props: PathInputProps) {
 		leftSection,
 		rightSection: rightSectionProp,
 		rightSectionWidth,
+		onBlur,
+		onSubmit,
 	} = props;
 	const isControlled = props.value !== undefined;
 	const { t } = useTranslation("common");
@@ -207,7 +216,9 @@ export function PathInput(props: PathInputProps) {
 			combobox.closeDropdown();
 
 			if (isControlled) {
-				// Controlled mode: just close dropdown on Enter
+				// Controlled mode: the parent owns the value, so Enter only signals
+				// intent to confirm it.
+				onSubmit?.();
 				return;
 			}
 			// Uncontrolled mode: confirm and clear
@@ -241,7 +252,10 @@ export function PathInput(props: PathInputProps) {
 					onFocus={() => {
 						interactedRef.current = true;
 					}}
-					onBlur={() => combobox.closeDropdown()}
+					onBlur={() => {
+						combobox.closeDropdown();
+						onBlur?.();
+					}}
 					onKeyDown={handleKeyDown}
 					leftSection={leftSection}
 					rightSection={rightSectionProp ?? (isFetching ? <Loader size={14} /> : undefined)}

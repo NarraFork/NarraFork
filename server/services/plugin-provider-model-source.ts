@@ -34,6 +34,14 @@ export interface PluginProviderModelGroup {
 	/** True when the catalog has never been refreshed or the last refresh failed. */
 	catalogStale: boolean;
 	pluginId?: string;
+	/**
+	 * Provider contribution id within the owning plugin.
+	 *
+	 * The prefix alone is not enough to address a provider: it is user-overridable, so a
+	 * settings UI that wants to load this provider's config or its `provider-settings`
+	 * view needs the stable contribution id.
+	 */
+	contributionId?: string;
 }
 
 function isPluginProvider(entry: ProviderRegistryEntry): boolean {
@@ -108,6 +116,7 @@ export function listPluginProviderModelGroups(
 			models,
 			catalogStale: entry.catalogStale,
 			...(entry.pluginId ? { pluginId: entry.pluginId } : {}),
+			...(entry.localId ? { contributionId: entry.localId } : {}),
 		});
 	}
 	return groups;

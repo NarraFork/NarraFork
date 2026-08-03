@@ -45,6 +45,15 @@ export interface PluginProviderAdapterFactoryOptions {
 	clientPool?: PluginProviderClientPool;
 	/** Host identity reported during the `provider.describe` handshake. */
 	host?: ProviderClientHost;
+	/**
+	 * Merge stored credentials into the config sent with each request.
+	 *
+	 * Resolved per request rather than captured here, because the factory runs once per
+	 * model resolution while a credential can be rotated or revoked at any time. Without
+	 * it the adapter sends only the plain config the registry holds, which is the
+	 * pre-credential behaviour.
+	 */
+	resolveConfig?: (providerInstanceId: string) => Promise<Record<string, JsonValue>>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -127,12 +136,14 @@ export function createPluginProviderAdapterFactory(
 			providerPrefix: entry.providerPrefix,
 			modelCount: modelCatalog.size,
 		});
+		const resolveConfig = options.resolveConfig;
 		return new RemoteProviderAdapter({
 			rpc,
 			providerTypeId: entry.providerTypeId,
 			providerInstanceId: entry.providerInstanceId,
 			providerPrefix: entry.providerPrefix,
 			config: toJsonConfig(config),
+			...(resolveConfig ? { resolveConfig: () => resolveConfig(entry.providerInstanceId) } : {}),
 			modelCatalog: cloneCatalog(modelCatalog),
 			descriptor: descriptorFor(entry),
 		});

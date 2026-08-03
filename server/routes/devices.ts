@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
 import {
 	createRemoteDeviceSchema,
+	deviceBrowseQuerySchema,
 	deviceStatQuerySchema,
 	deviceTransferSchema,
 	updateRemoteDeviceSchema,
@@ -20,6 +21,7 @@ import {
 	updateDevice,
 } from "../services/device-service";
 import {
+	browseRemoteDirectory,
 	cancelDeviceTransferTask,
 	downloadDirectory,
 	downloadFile,
@@ -133,6 +135,29 @@ deviceRoutes.get("/:id/fs", async (c) => {
 		maxEntries: 10_000,
 	});
 	return c.json(result);
+});
+
+// List one level of a remote directory, for interactive path pickers. Separate
+// from /fs above because that endpoint's recursive mode walks whole subtrees.
+deviceRoutes.get("/:id/browse", async (c) => {
+	const device = await getDevice(c.req.param("id"));
+	if (!device) throw new ValidationError("Device not found");
+	const parsed = deviceBrowseQuerySchema.safeParse({
+		path: c.req.query("path") || undefined,
+		showHidden: c.req.query("showHidden") === "1",
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	try {
+		return c.json(
+			await browseRemoteDirectory(device.id, parsed.data.path, {
+				showHidden: parsed.data.showHidden,
+			}),
+		);
+	} catch (err) {
+		// Offline devices, missing directories and permission errors are all
+		// user-correctable input problems here, not server faults.
+		throw new ValidationError(err instanceof Error ? err.message : String(err));
+	}
 });
 
 // Background transfer tasks return immediately and can be paused/resumed.

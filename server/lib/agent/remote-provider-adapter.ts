@@ -48,6 +48,15 @@ export interface RemoteProviderAdapterOptions {
 	providerInstanceId: string;
 	providerPrefix: string;
 	config: Record<string, JsonValue>;
+	/**
+	 * Resolve the config to send with each request, replacing the static `config`.
+	 *
+	 * Plugin providers use this to merge stored credentials in at call time (see
+	 * `plugin-provider-credential-resolver`). It is invoked per request rather than once
+	 * at construction so a rotated key or a revoked plugin takes effect immediately.
+	 * When omitted, the static `config` is sent unchanged.
+	 */
+	resolveConfig?: () => Promise<Record<string, JsonValue>>;
 	modelCatalog:
 		| ReadonlyMap<string, ProviderModelDescriptor>
 		| ModelCatalog
@@ -83,6 +92,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 	private readonly providerInstanceId: string;
 	private readonly providerPrefix: string;
 	private readonly config: Record<string, JsonValue>;
+	private readonly resolveConfig?: () => Promise<Record<string, JsonValue>>;
 	readonly modelCatalog: ReadonlyMap<string, ProviderModelDescriptor>;
 	private activeReasoningSource: string;
 
@@ -94,6 +104,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		this.providerInstanceId = options.providerInstanceId;
 		this.providerPrefix = options.providerPrefix;
 		this.config = cloneJson(options.config);
+		if (options.resolveConfig) this.resolveConfig = options.resolveConfig;
 		this.modelCatalog = normalizeModelCatalog(options.modelCatalog);
 		this.activeReasoningSource = this.defaultReasoningSource();
 		this.mayLeakXmlToolCalls = options.descriptor?.capabilities.mayLeakXmlToolCalls ?? false;
@@ -173,7 +184,9 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		if (params.signal.aborted) throw createAbortError(params.signal.reason);
-		const operation = await this.rpc.chat(this.buildChatParams(params), { signal: params.signal });
+		const operation = await this.rpc.chat(await this.buildChatParams(params), {
+			signal: params.signal,
+		});
 		if (params.signal.aborted) {
 			await operation.cancel("user_abort").catch(() => undefined);
 			throw createAbortError(params.signal.reason);
@@ -449,13 +462,13 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		});
 	}
 
-	private buildChatParams(params: ChatParams): ProviderChatParams {
+	private async buildChatParams(params: ChatParams): Promise<ProviderChatParams> {
 		const history = canonicalHistory(params.history, this.activeReasoningSource);
 		const toolResults = params.toolResults
 			.map(canonicalizeToolResult)
 			.filter(isProviderContentBlock);
 		return {
-			...this.baseParams(params.model),
+			...(await this.baseParams(params.model)),
 			conversation: {
 				conversationId: params.conversationId,
 				...(params.stickySessionKey ? { stickySessionKey: params.stickySessionKey } : {}),
@@ -489,17 +502,28 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		};
 	}
 
-	private baseParams(
+	/**
+	 * Async because `resolveConfig` may read stored credentials. Both call sites are
+	 * already inside async request paths, so this adds no new suspension point; a
+	 * resolver failure surfaces as the request's own error rather than being swallowed
+	 * into a silently unauthenticated call.
+	 */
+	private async baseParams(
 		model: string,
-	): Pick<
-		ProviderChatParams,
-		"providerTypeId" | "providerInstanceId" | "providerPrefix" | "config" | "modelId"
+	): Promise<
+		Pick<
+			ProviderChatParams,
+			"providerTypeId" | "providerInstanceId" | "providerPrefix" | "config" | "modelId"
+		>
 	> {
+		const config = this.resolveConfig
+			? cloneJson(await this.resolveConfig())
+			: cloneJson(this.config);
 		return {
 			providerTypeId: this.providerTypeId,
 			providerInstanceId: this.providerInstanceId,
 			providerPrefix: this.providerPrefix,
-			config: cloneJson(this.config),
+			config,
 			modelId: modelIdFor(model, this.providerPrefix),
 		};
 	}
@@ -512,7 +536,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		if (input.options?.signal?.aborted) throw createAbortError(input.options.signal.reason);
 		const operation = await this.rpc.generate(
 			{
-				...this.baseParams(input.model),
+				...(await this.baseParams(input.model)),
 				request: cloneJson(input.request),
 				...(input.options?.reasoningEffort
 					? { options: { reasoningEffort: input.options.reasoningEffort } }

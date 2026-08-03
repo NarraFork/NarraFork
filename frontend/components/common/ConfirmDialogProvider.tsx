@@ -1,6 +1,7 @@
 import { Button, Group, Modal, Stack, Text } from "@mantine/core";
-import { createContext, type ReactNode, useCallback, useContext, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { createSharedContext } from "../../lib/shared-context";
 import { Z } from "../../lib/z-index";
 
 interface ConfirmOptions {
@@ -19,7 +20,15 @@ interface ConfirmDialogContextValue {
 	confirm: (options: ConfirmOptions) => Promise<boolean>;
 }
 
-const ConfirmDialogContext = createContext<ConfirmDialogContextValue | null>(null);
+/**
+ * Registry-keyed for the same reason as the image viewer: the provider is mounted
+ * once in `main.tsx`, while `useConfirmDialog()` is called from lazily-loaded
+ * route chunks and dock panels. See `lib/shared-context.ts`.
+ */
+const ConfirmDialogContext = createSharedContext<ConfirmDialogContextValue | null>(
+	"common/ConfirmDialogProvider",
+	null,
+);
 
 export function ConfirmDialogProvider({ children }: { children: ReactNode }) {
 	const { t } = useTranslation("common");

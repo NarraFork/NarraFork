@@ -238,10 +238,12 @@ function formatPlanSource(template: string, file: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Category → colour (mirrors ToolCallCard getCategoryColor). Kept local so the
-// renderer never imports the heavy ToolCallCard module.
+// Category → colour (mirrors ToolCallCard getCategoryColor). Kept local to the
+// vlist render layer so it never imports the heavy ToolCallCard module; exported
+// so a subagent card's recent-call rows tint their chips from the same table the
+// tool header and the trace rows use.
 // ─────────────────────────────────────────────────────────────────────────────
-const CATEGORY_COLOR: Record<ToolCategory, string> = {
+export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	read: "lime",
 	file: "violet",
 	bash: "orange",

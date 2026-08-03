@@ -425,6 +425,87 @@ describe("row unitId is height-neutral", () => {
 	});
 });
 
+/**
+ * A folded row now shows its OUTCOME (status glyph) and its DURATION, so a reader
+ * who drops to a low LOD no longer loses "did it fail" and "how long did it take".
+ *
+ * Both additions are render-only, and that is exactly what has to be proven: they
+ * sit inside the row's existing 16.8px content lane, so a row carrying them must
+ * measure identically to one that does not. If either ever grew the row, every
+ * committed row below it would shift the moment a live status transition landed —
+ * the stable-height invariant this whole layer is built around.
+ */
+describe("row status + timing are height-neutral", () => {
+	const withStatusAndTiming = (rows: ReturnType<typeof toolRows>) =>
+		rows.map((row, i) => ({
+			...row,
+			status: i === 0 ? "running" : i === 1 ? "fail" : "success",
+			timing: { createdAt: 1_000 * i, completedAt: 1_000 * i + 4_200, durationMs: 4_200 },
+		}));
+
+	it("changes no measured geometry, at any width", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const plain = toolRows(3);
+		for (const width of [320, 512, 900]) {
+			const a = measureCollapsibleTrace({ items: plain, maxVisible: 10 }, width);
+			const b = measureCollapsibleTrace(
+				{ items: withStatusAndTiming(plain), maxVisible: 10 },
+				width,
+			);
+			expect(b.height).toBe(a.height);
+			expect(b.rows.map((r) => r.top)).toEqual(a.rows.map((r) => r.top));
+			expect(b.rows.map((r) => r.blockHeight)).toEqual(a.rows.map((r) => r.blockHeight));
+		}
+	});
+
+	it("a status TRANSITION cannot move the row (the live case)", async () => {
+		// The real failure mode is temporal: one row walks streaming → running →
+		// success while the reader is looking at it. Every step must land on the same
+		// geometry, not merely "with vs without".
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const heights = new Set<number>();
+		for (const status of ["streaming", "running", "success", "fail", "cancelled", ""]) {
+			const r = measureCollapsibleTrace(
+				{ items: [{ ...toolRows(1)[0], status }], maxVisible: 10 },
+				512,
+			);
+			heights.add(r.height);
+			expect(r.rows[0]?.blockHeight).toBeCloseTo(18.8, 5);
+		}
+		expect(heights.size).toBe(1);
+	});
+
+	it("normalizes the stamps once, in the measure layer", async () => {
+		// The renderer must never re-parse wire shapes; it indexes `row.timing`
+		// directly. Absent timing stays null so the row draws no slot at all.
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const r = measureCollapsibleTrace(
+			{
+				items: [
+					{ ...toolRows(1)[0], status: "success", timing: { createdAt: 5, durationMs: 900 } },
+					{ ...toolRows(2)[1], key: "t-plain" },
+				],
+				maxVisible: 10,
+			},
+			512,
+		);
+		expect(r.rows[0]?.status).toBe("success");
+		expect(r.rows[0]?.timing).toMatchObject({ createdAt: 5, durationMs: 900 });
+		// A row that carried neither reports both as null, not undefined — so the
+		// renderer's `row.timing ? …` gate is a single unambiguous check.
+		expect(r.rows[1]?.status).toBeNull();
+		expect(r.rows[1]?.timing).toBeNull();
+	});
+
+	it("the status slot fits inside the row's content lane (why it is free)", async () => {
+		// The arithmetic reason the assertions above hold: the xs text line dominates
+		// every glyph in the row, so adding a 12px slot cannot raise the max.
+		const m = await import("./measure-tool-run");
+		expect(m.TRACE_ROW_STATUS).toBeLessThan(m.TRACE_XS_LINE);
+		expect(m.TRACE_ROW_CONTENT).toBeCloseTo(m.TRACE_XS_LINE, 5);
+	});
+});
+
 // ── Drill-down: an expanded tool row nests a real tool card ───────────────────
 
 /** A minimal ToolCallData with a capped code detail (the common Read shape). */

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { isSecretSchemaNode } from "@server/services/plugin-provider-config-service";
 import { PluginProviderRegistry } from "@server/services/plugin-provider-registry";
 import {
 	buildConfigFormModel,
@@ -254,6 +255,45 @@ describe("plugin config client checks agree with the server validator", () => {
 		const model = buildConfigFormModel(schema);
 		expect(checkFieldValue(fieldByName(model.fields, "label"), "")).toBeUndefined();
 		expect(checkFieldValue(fieldByName(model.fields, "label"), undefined)).toBeUndefined();
+	});
+});
+
+/**
+ * The form's notion of "this is a secret" must match the backend's, because the backend
+ * decides which fields are diverted to the vault. If the form recognized fewer markers, a
+ * credential would be rendered as an ordinary visible text input and echoed back into the
+ * form — so this asserts against `isSecretSchemaNode`, the function the server actually
+ * uses, rather than against a copy of its rules.
+ */
+describe("plugin config secret marker parity", () => {
+	const markers: Array<Record<string, JsonValue>> = [
+		{ format: "password" },
+		{ writeOnly: true },
+		{ "x-narrafork-secret": true },
+		{ writeOnly: true, "x-narrafork-secret": true },
+	];
+
+	test("every marker the backend calls secret renders as a password field", () => {
+		for (const marker of markers) {
+			const node = { type: "string", ...marker };
+			const label = JSON.stringify(marker);
+			expect(isSecretSchemaNode(node), label).toBe(true);
+			const model = buildConfigFormModel({
+				type: "object",
+				properties: { apiKey: node as SchemaNode },
+			});
+			expect(fieldByName(model.fields, "apiKey").kind, label).toBe("password");
+		}
+	});
+
+	test("a plain string field is secret on neither side", () => {
+		const node = { type: "string" };
+		expect(isSecretSchemaNode(node)).toBe(false);
+		const model = buildConfigFormModel({
+			type: "object",
+			properties: { label: node as SchemaNode },
+		});
+		expect(fieldByName(model.fields, "label").kind).toBe("string");
 	});
 });
 

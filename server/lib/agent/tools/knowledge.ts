@@ -20,9 +20,15 @@ async function principalOf(ctx: ToolContext): Promise<Principal> {
  * Discoverability hint appended to read-tool output. The write tools live in
  * OPTIONAL_TOOLS (must be loaded explicitly — a deliberate security default), so a
  * plain narrator would otherwise never learn they exist.
+ *
+ * Worded to stay correct for BOTH audiences, because ToolContext does not carry the
+ * session's enabled-tool set and so this cannot be conditionalised: a narrator that
+ * already has the write tools (e.g. a Knowledge Steward) reads it as "use them", while a
+ * plain narrator reads it as "load them first". Phrasing it as an unconditional "load them
+ * first" would be a false instruction for the former on every single search.
  */
 const KNOWLEDGE_WRITE_TOOL_HINT =
-	"To create or edit knowledge, load the write tools first: `/load KnowledgeCreate` / `/load KnowledgeEdit` (they are optional and not enabled by default).";
+	"To write knowledge, use KnowledgeCreate / KnowledgeEdit — if they are not in your tool list, load them first (`/load KnowledgeCreate`, `/load KnowledgeEdit`).";
 
 // ─── KnowledgeSearch ───
 export const knowledgeSearchTool: ToolDefinition = {
@@ -319,28 +325,23 @@ export const knowledgeLibraryTool: ToolDefinition = {
 				};
 			}
 			// Scalar-only summaries: content is deliberately dropped (bounded output rule).
-			const summaries = await Promise.all(
-				mine.map(async (d) => {
-					let drifted = false;
-					if (d.entryId) {
-						const drift = await knowledgeBranchService
-							.getDraftDrift(principal, d.entryId)
-							.catch(() => null);
-						drifted = drift?.hasDraft === true && drift.drifted === true;
-					}
-					return {
-						personalEntryId: d.id,
-						title: d.title ?? null,
-						linkedEntryId: d.entryId ?? null,
-						standalone: !d.entryId,
-						targetCollectionId: d.targetCollectionId ?? null,
-						status: d.status,
-						drifted,
-						contentLength: d.content.length,
-						updatedAt: d.updatedAt,
-					};
-				}),
-			);
+			// Drift is resolved for the whole page in ONE query — the per-entry getDraftDrift
+			// returns three full bodies each, which would be N×3 documents for N booleans.
+			const driftedIds = await knowledgeBranchService
+				.findDriftedDraftIds(mine)
+				.catch(() => new Set<string>());
+			const summaries = mine.map((d) => ({
+				personalEntryId: d.id,
+				title: d.title ?? null,
+				linkedEntryId: d.entryId ?? null,
+				standalone: !d.entryId,
+				targetCollectionId: d.targetCollectionId ?? null,
+				status: d.status,
+				drifted: driftedIds.has(d.id),
+				// Computed in SQL by listMine — the body itself is never loaded here.
+				contentLength: d.contentLength,
+				updatedAt: d.updatedAt,
+			}));
 			const lines = summaries.map((s) => {
 				const kind = s.standalone
 					? `standalone${s.targetCollectionId ? ` → collection ${s.targetCollectionId}` : " (no publish target set — use KnowledgeEdit action 'set_target')"}`

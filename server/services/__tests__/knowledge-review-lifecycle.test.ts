@@ -736,3 +736,72 @@ describe("resolveConflict self-review guard", () => {
 		expect(res.mergedRevisionId).toBeTruthy();
 	});
 });
+
+// ─── Reviewer worklist agrees with the inbox badge ───────────────────────
+//
+// Regression guard for a cross-package inconsistency: `countReviewInbox` (the badge) has
+// always skipped the caller's own submissions for non-admins, but `listSubmissions` (the
+// worklist) did not. A non-admin with write access to the target collection therefore saw
+// their OWN publish request in the review centre while the badge read 0 — and every review
+// action on it was refused downstream by the self-review guard.
+//
+// Admins are deliberately NOT filtered: the self-review guard in `review` exempts them
+// (`principal.role !== "admin"`), so for an admin those rows really are actionable, and both
+// the badge and the worklist keep them.
+describe("listSubmissions agrees with countReviewInbox on own submissions", () => {
+	test("a non-admin owner who could otherwise review does not see their own request", async () => {
+		// Own the collection, so the standalone gate (canWriteCollection) genuinely passes:
+		// the only remaining reason to hide the row is that it is the caller's own.
+		const col = await knowledgeService.createCollection({
+			name: `self-worklist-${TAG}`,
+			ownerUserId: author.userId,
+		});
+		const mine = await knowledgeBranchService.createStandalone(author, {
+			title: `SelfWorklist ${TAG}`,
+			content: "body\n",
+			targetCollectionId: col.id,
+		});
+		const submission = await knowledgeBranchService.submitForReview(author, mine.id, {});
+		const submissionId = submission?.id as string;
+
+		// Sanity: the author really does hold write access to the target collection, so this
+		// row is not being hidden by the ACL gate.
+		const scope = await knowledgeBranchService.getMyReviewScope(author);
+		expect(scope.collections.some((c) => c.id === col.id)).toBe(true);
+
+		// Worklist hides it, badge counts 0, and reviewing it is refused — all three agree.
+		const worklist = await knowledgeBranchService.listSubmissions(author, {});
+		expect(worklist.some((s) => s.id === submissionId)).toBe(false);
+
+		const inbox = await knowledgeBranchService.countReviewInbox(author);
+		expect(inbox.count).toBe(0);
+
+		expect(
+			knowledgeBranchService.review(author, submissionId, { verdict: "approve" }),
+		).rejects.toThrow(/your own/i);
+
+		// The author still reads it through their own publish history.
+		const history = await knowledgeBranchService.listSubmissionsForDraft(author, mine.id);
+		expect(history.map((s) => s.id)).toContain(submissionId);
+	});
+
+	test("an admin KEEPS their own request, matching the self-review exemption", async () => {
+		const col = await knowledgeService.createCollection({ name: `self-worklist-admin-${TAG}` });
+		const mine = await knowledgeBranchService.createStandalone(admin, {
+			title: `SelfWorklistAdmin ${TAG}`,
+			content: "body\n",
+			targetCollectionId: col.id,
+		});
+		const submission = await knowledgeBranchService.submitForReview(admin, mine.id, {});
+		const submissionId = submission?.id as string;
+
+		// The row stays in the worklist because an admin may actually act on it: hiding it
+		// would strand a submission only an admin can clear.
+		const worklist = await knowledgeBranchService.listSubmissions(admin, {});
+		expect(worklist.some((s) => s.id === submissionId)).toBe(true);
+
+		// And the action really does succeed, so the list is not advertising a dead end.
+		const res = await knowledgeBranchService.review(admin, submissionId, { verdict: "approve" });
+		expect(res.status).toBe("approved");
+	});
+});

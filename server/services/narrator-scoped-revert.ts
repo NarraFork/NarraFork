@@ -51,12 +51,13 @@
  * comes from comparing the merge's own change set against the recorded subagent
  * paths — never from a fixed claim that they were left alone.
  */
-import { and, asc, eq, gte, inArray, isNotNull, ne } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { fileAttributions, narratorMessageRefs, narrators, narratorToolCalls } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { logger } from "../lib/logger";
 import { normalizeWorkspacePath } from "./git-workspace";
+import { invalidateWorkspaceTreeCache, isWorkspaceBeingWritten } from "./narrator-session-state";
 import {
 	EMPTY_RESULT,
 	type RevertResult,
@@ -73,13 +74,32 @@ import {
 } from "./worktree-tree-snapshot";
 
 /** One recorded pre/post workspace boundary for a single tool call. */
-interface BoundaryPair {
+export interface BoundaryPair {
 	toolUseId: string;
 	messageId: string;
 	seq: number;
 	before: string;
 	after: string;
 }
+
+/**
+ * Which of a narrator's recorded writes a rollback should reverse.
+ *
+ * `toolUses` is the real unit of work: a boundary pair is recorded per tool call,
+ * so a single call is the finest window that can be reversed, and one assistant
+ * message can contain several. The message- and seq-shaped variants are
+ * conveniences that expand to a set of tool calls.
+ *
+ * A tool use is addressed by `(messageId, toolUseId)` rather than the bare id.
+ * The pair is what is actually unique: a message that gets cloned (a shared
+ * message being edited, a rewritten history segment) leaves the same `toolUseId`
+ * on rows under different `messageId`s, and selecting by id alone would return the
+ * same boundary twice and reverse that one change twice.
+ */
+export type ScopedRevertSelector =
+	| { minSeq: number }
+	| { messageIds: string[] }
+	| { toolUses: Array<{ messageId: string; toolUseId: string }> };
 
 /**
  * Why a narrator-scoped rollback is not available for a given window.
@@ -109,9 +129,10 @@ export interface ScopedRevertPlan {
  */
 async function selectPairs(
 	narratorId: string,
-	scope: { minSeq: number } | { messageIds: string[] },
+	scope: ScopedRevertSelector,
 ): Promise<BoundaryPair[]> {
 	if ("messageIds" in scope && scope.messageIds.length === 0) return [];
+	if ("toolUses" in scope && scope.toolUses.length === 0) return [];
 	const rows = await db
 		.select({
 			toolUseId: narratorToolCalls.toolUseId,
@@ -137,20 +158,83 @@ async function selectPairs(
 				isNotNull(narratorToolCalls.treeHashAfter),
 				// Only calls that actually moved the workspace can be reversed.
 				ne(narratorToolCalls.treeHashBefore, narratorToolCalls.treeHashAfter),
-				"messageIds" in scope
-					? inArray(narratorToolCalls.messageId, scope.messageIds)
-					: gte(narratorMessageRefs.seq, scope.minSeq),
+				selectorCondition(scope),
 			),
 		)
 		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt));
 
-	return rows.map((row) => ({
-		toolUseId: row.toolUseId,
-		messageId: row.messageId,
-		seq: row.seq,
-		before: row.before as string,
-		after: row.after as string,
-	}));
+	return dedupeBoundaryRows(rows);
+}
+
+/**
+ * Drop boundary rows that describe the same recorded change twice.
+ *
+ * Real data contains the same `toolUseId` under more than one `messageId` (a message
+ * cloned when shared history is edited), so a select can return one boundary twice.
+ *
+ * This is not a data-loss guard: reversing the same boundary again is
+ * `merge(base=after, ours=before, theirs=before)`, which yields `before` unchanged.
+ * It removes redundant work — a duplicate cannot chain with its own copy (chaining
+ * needs `after === before`), so it would become an extra segment and cost one more
+ * `merge-tree` per rollback.
+ *
+ * Exported for tests: the effect is invisible on disk precisely because reversal is
+ * idempotent, so the only honest way to test it is on the selected pairs.
+ */
+export function dedupeBoundaryRows(
+	rows: Array<{
+		toolUseId: string;
+		messageId: string;
+		seq: number;
+		before: string | null;
+		after: string | null;
+	}>,
+): BoundaryPair[] {
+	const seen = new Set<string>();
+	const pairs: BoundaryPair[] = [];
+	for (const row of rows) {
+		// Keyed without `messageId`: the clone this exists for lives under a *different*
+		// message, so including it would defeat the dedupe entirely. Identical
+		// `before`/`after` hashes mean a byte-identical workspace transition, so the
+		// rows describe one change no matter which message they hang off.
+		const key = `${row.toolUseId}\u0000${row.before}\u0000${row.after}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		pairs.push({
+			toolUseId: row.toolUseId,
+			messageId: row.messageId,
+			seq: row.seq,
+			before: row.before as string,
+			after: row.after as string,
+		});
+	}
+	return pairs;
+}
+
+/** Translate a selector into the SQL predicate that narrows the boundary rows. */
+function selectorCondition(scope: ScopedRevertSelector) {
+	if ("messageIds" in scope) {
+		return inArray(narratorToolCalls.messageId, scope.messageIds);
+	}
+	if ("toolUses" in scope) {
+		// An empty list must never reach `or()`: drizzle returns undefined for zero
+		// arguments, `and()` drops undefined members, and the predicate would vanish —
+		// selecting every boundary this narrator ever recorded and rolling back all of
+		// it. Callers guard against this, but the failure is too destructive to leave
+		// resting on a caller's check.
+		if (scope.toolUses.length === 0) return sql`1 = 0`;
+		// Matched as pairs: a bare `toolUseId IN (...)` would also pick up a clone of
+		// the same call living under a different message.
+		return or(
+			...scope.toolUses.map((target) =>
+				and(
+					eq(narratorToolCalls.messageId, target.messageId),
+					eq(narratorToolCalls.toolUseId, target.toolUseId),
+				),
+			),
+		);
+	}
+	return gte(narratorMessageRefs.seq, scope.minSeq);
 }
 
 /**
@@ -161,7 +245,7 @@ async function selectPairs(
  */
 export async function planNarratorScopedRevert(
 	narratorId: string,
-	scope: { minSeq: number } | { messageIds: string[] },
+	scope: ScopedRevertSelector,
 ): Promise<{ plan: ScopedRevertPlan } | { unavailable: ScopedRevertUnavailableReason }> {
 	if (!(await supportsMergeTree())) return { unavailable: "git_unsupported" };
 
@@ -227,7 +311,7 @@ export interface ScopedRevertPreview {
  */
 export async function previewNarratorScopedRevert(
 	narratorId: string,
-	scope: { minSeq: number } | { messageIds: string[] },
+	scope: ScopedRevertSelector,
 	opts?: { withContents?: boolean },
 ): Promise<ScopedRevertPreview> {
 	const planned = await planNarratorScopedRevert(narratorId, scope);
@@ -383,7 +467,7 @@ function joinWorktreePath(worktreePath: string, relPath: string): string {
  */
 async function revertNarratorScoped(
 	narratorId: string,
-	scope: { minSeq: number } | { messageIds: string[] },
+	scope: ScopedRevertSelector,
 ): Promise<RevertResult | null> {
 	const planned = await planNarratorScopedRevert(narratorId, scope);
 	if ("unavailable" in planned) {
@@ -395,6 +479,27 @@ async function revertNarratorScoped(
 	}
 	const { plan } = planned;
 
+	// Planning did several awaited DB and git reads, so a loop could have started in
+	// the meantime even though the route admitted this request. Re-checked here, the
+	// last point before files are written, mirroring what the revert/unrevert
+	// endpoints do around their own DB work. Without it the rollback races the
+	// narrator's own tools and fails on the state-drift guard instead.
+	if (isWorkspaceBeingWritten(plan.worktreePath)) {
+		return {
+			...EMPTY_RESULT,
+			failures: [
+				treeFailure(
+					plan.worktreePath,
+					"PREPARE_FAILED",
+					new Error(
+						"Something is writing to this workspace (the narrator or one of its subagents); " +
+							"stop it before rolling back.",
+					),
+				),
+			],
+		};
+	}
+
 	let outcome: Awaited<ReturnType<typeof worktreeTreeSnapshot.reverseAndRestore>>;
 	try {
 		outcome = await worktreeTreeSnapshot.reverseAndRestore(
@@ -403,11 +508,16 @@ async function revertNarratorScoped(
 			LOCAL_DEVICE_ID,
 		);
 	} catch (error) {
+		// The reversal writes the worktree without going through a tool, so any live
+		// session's cached tree hash must not survive it — including on failure, which
+		// can land after some files were already written.
+		invalidateWorkspaceTreeCache(plan.worktreePath);
 		return {
 			...EMPTY_RESULT,
 			failures: [treeFailure(plan.worktreePath, "TREE_RESTORE_FAILED", error)],
 		};
 	}
+	invalidateWorkspaceTreeCache(plan.worktreePath);
 
 	if (outcome.conflicts.length > 0) {
 		return {
@@ -471,6 +581,30 @@ export function revertNarratorScopedForMessages(
 	messageIds: string[],
 ): Promise<RevertResult | null> {
 	return revertNarratorScoped(narratorId, { messageIds });
+}
+
+/**
+ * Scoped rollback for individual tool calls — the finest window there is.
+ *
+ * This is what makes "undo just this one operation" work on the unit the user
+ * actually sees. Because each segment is merged against the accumulated result,
+ * work that came after the targeted call survives; a genuine overlap surfaces as a
+ * conflict rather than silently discarding it.
+ */
+export function revertNarratorScopedForToolUses(
+	narratorId: string,
+	toolUses: Array<{ messageId: string; toolUseId: string }>,
+): Promise<RevertResult | null> {
+	return revertNarratorScoped(narratorId, { toolUses });
+}
+
+/** Preview for rolling back individual tool calls. */
+export function previewNarratorScopedForToolUses(
+	narratorId: string,
+	toolUses: Array<{ messageId: string; toolUseId: string }>,
+	opts?: { withContents?: boolean },
+): Promise<ScopedRevertPreview> {
+	return previewNarratorScopedRevert(narratorId, { toolUses }, opts);
 }
 
 /** Preview for "undo everything from this message onwards". */

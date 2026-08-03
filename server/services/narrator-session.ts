@@ -42,6 +42,7 @@ import {
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { resolveFastModeForUser } from "../lib/fast-mode";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import {
@@ -588,7 +589,7 @@ async function executeQueuedNewCommand(
 		systemPrompt: sourceNarrator.systemPrompt ?? undefined,
 		permissionMode: sourceNarrator.permissionMode ?? undefined,
 		reasoningEffort: sourceNarrator.reasoningEffort ?? undefined,
-		fastMode: sourceNarrator.fastMode ?? undefined,
+		fastModeOverride: normalizeBooleanOverride(sourceNarrator.fastModeOverride),
 		relaxedPlan: sourceNarrator.relaxedPlan ?? undefined,
 		planReflectionAutoApproveOverride: normalizeOptionalBooleanOverride(
 			sourceNarrator.planReflectionAutoApproveOverride,
@@ -2449,8 +2450,15 @@ export async function runAgentLoop(
 				freshNarrator.reasoningEffort ||
 				resolveDefaultReasoningEffort(resolved.provider, resolved.model);
 
+			// Resolved per turn, not frozen at creation: an "inherit" override follows
+			// the acting user's fastModeDefault preference, so flipping that default
+			// takes effect on existing narrators from their next turn onward.
+			const resolvedFastMode = await resolveFastModeForUser(
+				freshNarrator.fastModeOverride,
+				active._currentUserId,
+			);
 			const resolvedServiceTier =
-				freshNarrator.fastMode && usesCodexModel(resolved.provider, resolved.model)
+				resolvedFastMode && usesCodexModel(resolved.provider, resolved.model)
 					? "priority"
 					: undefined;
 

@@ -336,8 +336,22 @@ manifestRequested
 
 ### 关键未决
 
-- **[待决策]** provider secret 的注入通道（RPC config、secret channel、容器 secret）见 ADR-017/OQ-005。
+- **[已决策]** provider secret 的注入通道：选定 **RPC config 按请求注入解析值**（原 ADR-017/OQ-005）。宿主在每次
+  `provider.chat`/`generate`/`listModels` 前解析该 provider 自己声明的 secret 字段，随 `config` 下发；插件无任何
+  读取/列举/持久化 secret 的方法。实现见 `server/services/plugin-provider-credential-resolver.ts`，
+  契约与约束见 04 号文档 D-04。前提条件「日志深度脱敏」已有回归测试覆盖。
 - **[待决策]** v1 是否支持 web search/image generation 的完整实时事件；推荐先保留规范化 block，实时扩展后置。
+- **[待决策]** 动态 secret key 与前后端方法集拆分。当前插件只能写 `configSchema` 中**声明过**的
+  secret 字段，因此「第 N 条凭据的 token」这类可变数量的 secret 只能整体塞进一个 bundle 字段
+  插件后端开放受限的 `secrets.set`/`delete`，而这要求把 `PLUGIN_TO_HOST_REQUEST_METHODS` 与
+  iframe 的 `PLUGIN_UI_BACKEND_METHODS` 拆成两个清单（今天由 contract parity 断言强制相等）。
+  在有第二个确实需要的消费方之前不做。
+- **[已决策]** 插件声明的 command 通过新增 Host→Plugin 方法 `commands.invoke` 分发；插件 command
+  可用 `secretWrites` 请求宿主写入自身命名空间的 secret。契约见 04 号文档 D-04b，安全限制与负向测试
+  见 07 号文档 §13。
+- **[待决策]** 本地进程插件的出站网络阻断（07 号文档 §6.2 同项）。当前 `permissions.network` 只在 manifest 层校验，
+  **没有运行时强制**：声明 `mode: "none"` 的本地进程插件实际仍可发起任意出站请求。
+  的插件强制提升到 Podman。
 
 ---
 

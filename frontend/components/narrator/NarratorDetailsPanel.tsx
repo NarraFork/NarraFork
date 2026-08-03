@@ -4,6 +4,7 @@ import {
 	Badge,
 	Box,
 	Button,
+	Checkbox,
 	CloseButton,
 	Code,
 	Divider,
@@ -13,6 +14,7 @@ import {
 	Paper,
 	ScrollArea,
 	SegmentedControl,
+	Select,
 	SimpleGrid,
 	Stack,
 	Switch,
@@ -22,7 +24,7 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconInfoCircle, IconRefresh, IconUsers } from "@tabler/icons-react";
+import { IconDownload, IconInfoCircle, IconRefresh, IconUsers } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
@@ -55,6 +57,7 @@ import {
 	useNarratorContainerBrowserToolAutoEnableCapability,
 } from "../../hooks/usePlatform";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
+import { useUserPreferences } from "../../hooks/useUserPreferences";
 import type {
 	ApiEntity,
 	BlacklistCmd,
@@ -244,6 +247,7 @@ export function NarratorDetailsPanel({
 	const { data: chapter } = useChapter(opened ? chapterId : "");
 	const { data: parentNarrator } = useNarrator(opened ? parentNarratorId : "");
 	const { data: usageStats } = useNarratorUsageStats(narratorId, true, opened);
+	const { data: userPrefs } = useUserPreferences();
 	const browserSessionsCapability = useNarratorBrowserSessionsCapability();
 	const browserSessionsSupported = browserSessionsCapability.supported !== false;
 	const browserSessionsDefaultOff = browserSessionsCapability.defaultEnabled === false;
@@ -339,6 +343,13 @@ export function NarratorDetailsPanel({
 	const [disabledToolSelection, setDisabledToolSelection] = useState<string[]>([]);
 	const [blockAllSkills, setBlockAllSkills] = useState(false);
 	const [blockedSkillSelection, setBlockedSkillSelection] = useState<string[]>([]);
+	const [exportFormat, setExportFormat] = useState<"markdown" | "json">("markdown");
+	const [exportIncludeToolIO, setExportIncludeToolIO] = useState(true);
+	// Unchecked by default: the export matches what the panel currently shows. The
+	// exported file states when this left earlier history out, so the narrower
+	// default cannot be mistaken for a complete archive.
+	const [exportFullHistory, setExportFullHistory] = useState(false);
+	const [exporting, setExporting] = useState(false);
 
 	const modelOptions = useMemo(
 		() =>
@@ -401,6 +412,17 @@ export function NarratorDetailsPanel({
 	};
 
 	const formatBoolean = (value?: boolean | null) => (value ? t("details.on") : t("details.off"));
+
+	// Fast mode is a tri-state: "inherit" resolves against the user's default at
+	// request time, so report the effective value and note where it came from.
+	const formatFastMode = (override?: "inherit" | "on" | "off" | null) => {
+		if (override === "on") return t("details.on");
+		if (override === "off") return t("details.off");
+		const effective = userPrefs?.fastModeDefault ?? false;
+		return t("details.fastModeInherited", {
+			state: effective ? t("details.on") : t("details.off"),
+		});
+	};
 
 	const formatStatNumber = (value?: number | null) =>
 		value == null ? "—" : value.toLocaleString(i18n.language);
@@ -506,6 +528,44 @@ export function NarratorDetailsPanel({
 				message: error instanceof Error ? error.message : t("details.cwdUpdateError"),
 				color: "red",
 			});
+		}
+	};
+
+	const handleExport = async () => {
+		if (exporting) return;
+		setExporting(true);
+		let objectUrl: string | null = null;
+		try {
+			const { blob, fileName } = await api.exportNarratorMessages(narratorId, {
+				format: exportFormat,
+				scope: exportFullHistory ? "full" : "visible",
+				includeToolIO: exportIncludeToolIO,
+				lang: i18n.language,
+			});
+			objectUrl = URL.createObjectURL(blob);
+			const link = document.createElement("a");
+			link.href = objectUrl;
+			// The server proposes a name (title + timestamp); fall back to the id so a
+			// missing or unparseable header still produces a sensible file.
+			link.download =
+				fileName ?? `narrafork-${narratorId}.${exportFormat === "json" ? "json" : "md"}`;
+			document.body.append(link);
+			link.click();
+			link.remove();
+			notifications.show({
+				title: t("details.exportDoneTitle"),
+				message: t("details.exportDone", { file: link.download }),
+				color: "teal",
+			});
+		} catch (error) {
+			notifications.show({
+				title: t("details.exportErrorTitle"),
+				message: error instanceof Error ? error.message : t("details.exportError"),
+				color: "red",
+			});
+		} finally {
+			if (objectUrl) URL.revokeObjectURL(objectUrl);
+			setExporting(false);
 		}
 	};
 
@@ -888,7 +948,7 @@ export function NarratorDetailsPanel({
 				/>
 				<DetailRow
 					label={t("details.fastMode")}
-					value={<Text size="sm">{formatBoolean(narrator?.fastMode)}</Text>}
+					value={<Text size="sm">{formatFastMode(narrator?.fastModeOverride)}</Text>}
 				/>
 				<DetailRow
 					label={t("details.relaxedPlan")}
@@ -1074,6 +1134,47 @@ export function NarratorDetailsPanel({
 						}
 					/>
 				) : null}
+			</DetailSection>
+
+			<DetailSection title={t("details.export")}>
+				<Text size="xs" c="dimmed">
+					{t("details.exportDescription")}
+				</Text>
+				<Select
+					label={t("details.exportFormat")}
+					data={[
+						{ value: "markdown", label: t("details.exportFormatMarkdown") },
+						{ value: "json", label: t("details.exportFormatJson") },
+					]}
+					value={exportFormat}
+					onChange={(value) => setExportFormat(value === "json" ? "json" : "markdown")}
+					allowDeselect={false}
+					disabled={exporting}
+				/>
+				<Checkbox
+					label={t("details.exportIncludeToolIO")}
+					description={t("details.exportIncludeToolIODescription")}
+					checked={exportIncludeToolIO}
+					onChange={(event) => setExportIncludeToolIO(event.currentTarget.checked)}
+					disabled={exporting}
+				/>
+				<Checkbox
+					label={t("details.exportFullHistory")}
+					description={t("details.exportFullHistoryDescription")}
+					checked={exportFullHistory}
+					onChange={(event) => setExportFullHistory(event.currentTarget.checked)}
+					disabled={exporting}
+				/>
+				<Group justify="flex-end">
+					<Button
+						size="xs"
+						leftSection={<IconDownload size={14} />}
+						loading={exporting}
+						onClick={handleExport}
+					>
+						{t("details.exportAction")}
+					</Button>
+				</Group>
 			</DetailSection>
 
 			<DetailSection title={t("details.customTraits")}>

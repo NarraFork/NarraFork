@@ -64,7 +64,7 @@ const sessionInputSchema = z
 		hash: z.string().regex(/^[a-f0-9]{64}$/),
 		contributionId: z.string().min(1).max(128),
 		panelInstanceId: z.string().min(1).max(256),
-		surface: z.enum(["workspace", "director", "focus", "settings"]),
+		surface: z.enum(["workspace", "director", "focus", "settings", "provider-settings"]),
 		surfaceScope: z.enum(["workspace", "narrator", "project", "global"]),
 		scope: invocationScopeSchema.optional(),
 	})

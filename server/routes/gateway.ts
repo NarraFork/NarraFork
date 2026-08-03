@@ -142,6 +142,8 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 			messageCount: 0,
 			totalCostUsd: 0,
 			pruneEnabled: settings.agent.defaultPruneEnabled,
+			// webhook 无人值守路径同样显式关闭 priority，不跟随用户默认值。
+			fastModeOverride: "off",
 			fastMode: false,
 			// 全部允许时强制宽松，忽略用户默认设置，避免 webhook 无人值守路径被计划模式卡住。
 			relaxedPlan: resolveInitialRelaxedPlan({

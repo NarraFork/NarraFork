@@ -273,9 +273,21 @@ async function renderStatusIcon(status: string) {
 }
 
 function statusSlot(): HTMLElement {
-	const slot = container?.querySelector('[data-testid="subagent-activity-status-slot"]');
+	// The row is a TRACE row, so its status slot is the shared `TraceStatusSlot`
+	// (same testid a folded trace row uses) rather than a subagent-specific box.
+	const slot = container?.querySelector('[data-testid="trace-row-status-slot"]');
 	if (!slot) throw new Error("activity status slot not rendered");
 	return slot as unknown as HTMLElement;
+}
+
+/**
+ * True when the row drew NO status slot.
+ *
+ * Distinct from an empty slot on purpose: an unmarked row must reserve no width at
+ * all, or the blank gap is the same useless column the check was.
+ */
+function noStatusSlot(): boolean {
+	return (container?.querySelectorAll('[data-testid="trace-row-status-slot"]') ?? []).length === 0;
 }
 
 /** The glyph inside the status slot, or null when the slot is empty. */
@@ -347,11 +359,13 @@ describe("activity row status glyph across the real event sequence", () => {
 		await renderHeader(activity.apply(toolStartedFrame()));
 		expectSpinner();
 
-		// FRAME 3 — tool_completed. Only now does the glyph become a terminal mark.
+		// FRAME 3 — tool_completed, successfully. The spinner does not become a check:
+		// it goes AWAY. Success is the default expectation, so a column of green checks
+		// is noise that costs the reader the attention a real failure needs — only
+		// deviation is marked (see @shared/tool-row-status). The failing case below is
+		// what proves this is "unmarked on success", not "never marks a terminal".
 		await renderHeader(activity.apply(toolCompletedFrame("success")));
-		const done = statusGlyph();
-		expect(glyphName(done)).toBe("check");
-		expect(isSpinning(done)).toBe(false);
+		expect(noStatusSlot()).toBe(true);
 	});
 
 	test("a failed call ends on an X rather than a check", async () => {

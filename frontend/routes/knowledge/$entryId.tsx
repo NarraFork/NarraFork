@@ -657,10 +657,9 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 		);
 	}
 
-	const isActive =
-		draft.status === "draft" ||
-		draft.status === "changes_requested" ||
-		draft.status === "pending_review";
+	// A personal entry is editable while it is in use; `archived` means it was retired
+	// (e.g. after a successful publish) and no longer accepts edits or submissions.
+	const isActive = draft.status === "active";
 
 	const driftData = drift.data;
 	const isDrifted = !!driftData && driftData.hasDraft && driftData.drifted;
@@ -789,8 +788,8 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 			) : null}
 
 			<Group justify="space-between">
-				<Badge variant="light" color={draft.status === "pending_review" ? "blue" : "gray"}>
-					{t(`draftStatus_${draft.status}`)}
+				<Badge variant="light" color={isActive ? "blue" : "gray"}>
+					{t(`personalEntryStatus_${draft.status}`)}
 				</Badge>
 				<Group gap="xs">
 					<Button

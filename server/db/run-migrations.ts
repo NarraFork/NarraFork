@@ -92,10 +92,62 @@ function tableExists(sqlite: Database, name: string): boolean {
 	);
 }
 
-/** A statement that drops a real (non-`__new_` rebuild scratch) table can destroy data. */
-function isAlreadyMissingTableError(err: unknown): boolean {
-	const msg = String(err instanceof Error ? err.message : err);
-	return /no such table/i.test(msg);
+/** A SQLite identifier: bare, `"quoted"`, backtick-quoted, or `[bracketed]`. */
+const SQLITE_IDENTIFIER = String.raw`"(?:[^"]|"")*"|\`(?:[^\`]|\`\`)*\`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*`;
+/** A table reference with an optional schema prefix (`main.foo`, `"main"."foo"`). */
+const SQLITE_TABLE_REF = String.raw`(?:${SQLITE_IDENTIFIER})(?:\s*\.\s*(?:${SQLITE_IDENTIFIER}))?`;
+const DROP_TABLE_PREFIX = String.raw`DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`;
+
+/**
+ * Reduce a table reference to its bare name: drop any schema prefix and identifier quoting so
+ * the spelling in a migration's SQL can be compared against the spelling SQLite echoes back in
+ * an error message. Case is preserved because `sqlite_master.name` lookups are BINARY-collated.
+ */
+function normalizeTableName(raw: string): string {
+	const parts = raw.match(new RegExp(SQLITE_IDENTIFIER, "g")) ?? [];
+	const last = (parts.at(-1) ?? raw).trim();
+	const first = last[0];
+	const end = last.at(-1);
+	if (last.length >= 2) {
+		if ((first === '"' && end === '"') || (first === "`" && end === "`")) {
+			return last.slice(1, -1).replaceAll(first + first, first);
+		}
+		if (first === "[" && end === "]") return last.slice(1, -1);
+	}
+	return last;
+}
+
+/** SQLite resolves ASCII identifiers case-insensitively, so tolerate spelling differences. */
+function sameTableName(a: string, b: string): boolean {
+	return a.toLowerCase() === b.toLowerCase();
+}
+
+/**
+ * The table SQLite reported as absent (`no such table: main.foo`), or null for any other
+ * failure. Returning null for unrecognized errors keeps the caller's tolerance narrow: it can
+ * only ever skip a failure whose missing table it was able to identify.
+ */
+function missingTableFromError(err: unknown): string | null {
+	const messages = [String(err instanceof Error ? err.message : err)];
+	// DrizzleError wraps the original SQLiteError in `cause`.
+	if (err instanceof Error && err.cause) messages.push(String(err.cause));
+	for (const message of messages) {
+		const match = /no such table:\s*([^\s;]+)/i.exec(message);
+		if (match) return normalizeTableName(match[1]);
+	}
+	return null;
+}
+
+/**
+ * The table this single statement drops, or null when the statement is anything else. Anchored
+ * at the statement start so a `DROP TABLE` appearing inside a trigger body or string literal
+ * cannot make an unrelated statement look like a plain drop.
+ */
+function droppedTableOfStatement(stmt: string): string | null {
+	const match = new RegExp(String.raw`^\s*${DROP_TABLE_PREFIX}(${SQLITE_TABLE_REF})`, "i").exec(
+		stmt,
+	);
+	return match ? normalizeTableName(match[1]) : null;
 }
 
 /**
@@ -107,14 +159,38 @@ function isAlreadyMissingTableError(err: unknown): boolean {
  */
 function migrationDropsRealTables(statements: readonly string[]): string[] {
 	const dropped: string[] = [];
+	const dropPattern = new RegExp(`${DROP_TABLE_PREFIX}(${SQLITE_TABLE_REF})`, "gi");
 	for (const stmt of statements) {
-		for (const match of stmt.matchAll(/DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?[`"]?(\w+)[`"]?/gi)) {
-			const table = match[1];
+		for (const match of stmt.matchAll(dropPattern)) {
+			const table = normalizeTableName(match[1]);
 			if (table.startsWith("__new_")) continue;
 			dropped.push(table);
 		}
 	}
 	return dropped;
+}
+
+/**
+ * Whether a failed statement is exactly the harmless case of dropping a table this database
+ * never had: the statement itself is a `DROP TABLE`, and the table SQLite reported missing is
+ * the one that statement targets and one this migration legitimately drops.
+ *
+ * The narrowness is the point. Tolerating "no such table" for *every* statement of a
+ * destructive migration silently destroys data, because Drizzle's rebuild sequence keeps
+ * going after a failure: an `INSERT INTO __new_x SELECT ... FROM y` that fails on an unrelated
+ * missing `y` would be skipped, then `DROP TABLE x` deletes the live rows and the RENAME
+ * leaves an empty table behind — a successful-looking migration with the data gone.
+ */
+function isMissingDropTargetError(
+	err: unknown,
+	stmt: string,
+	droppedTables: readonly string[],
+): boolean {
+	const missingTable = missingTableFromError(err);
+	if (missingTable === null) return false;
+	const target = droppedTableOfStatement(stmt);
+	if (target === null || !sameTableName(target, missingTable)) return false;
+	return droppedTables.some((table) => sameTableName(table, missingTable));
 }
 
 /**
@@ -132,14 +208,17 @@ function migrationDropsRealTables(statements: readonly string[]): string[] {
  *   as "already effective but unstamped": its SQL is NOT re-run, only its hash is recorded.
  *   This protects live data on a dirty database from a needless DROP/rebuild.
  * - Every other pending migration is executed statement-by-statement, tolerating
- *   "already exists"/"duplicate column" (safe re-create) and, for a genuinely-unapplied
- *   destructive migration, "no such table" (dropping a table that isn't there yet).
+ *   "already exists"/"duplicate column" (safe re-create) and a `DROP TABLE` of a table this
+ *   database never had. "no such table" from any other statement is fatal.
  *
  * Runs inside a single transaction with foreign keys disabled (matching Drizzle's own
  * table-rebuild migrations); any unexpected error rolls back and rethrows so real failures
  * stay visible.
+ *
+ * Exported for tests so the statement-level error tolerance can be exercised against purpose-
+ * built migration folders instead of only the committed journal.
  */
-function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder: string): void {
+export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder: string): void {
 	const journalPath = join(migrationsFolder, "meta", "_journal.json");
 	if (!existsSync(journalPath)) {
 		throw new Error(`Can't find meta/_journal.json in ${migrationsFolder}`);
@@ -217,9 +296,14 @@ function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder: string
 							sqlite.run(stmt);
 						} catch (err) {
 							if (isAlreadyExistsError(err)) continue;
-							// A genuinely-unapplied destructive migration may DROP a table that was
-							// never created on this database; tolerate that specific case only.
-							if (isDestructive && isAlreadyMissingTableError(err)) continue;
+							// Scoped to the failing statement, not the whole migration: only a
+							// `DROP TABLE` whose own target is the table SQLite reports missing is
+							// harmless. Anything else failing with "no such table" means the
+							// migration's assumptions are broken, and continuing through the rest of
+							// a rebuild sequence would drop live rows into an empty replacement.
+							if (isDestructive && isMissingDropTargetError(err, stmt, droppedTables)) {
+								continue;
+							}
 							throw err;
 						}
 					}
@@ -959,6 +1043,7 @@ export async function runMigrations(sqlite: Database): Promise<{
 	// tell a genuine upgrade (column about to be added) from an already-migrated
 	// database. Captured before migrations run.
 	const hadMfaEnabledColumn = usersHasColumn(sqlite, "mfa_enabled");
+	const hadFastModeOverrideColumn = tableHasColumn(sqlite, "narrators", "fast_mode_override");
 
 	const resolved = await resolveMigrationsFolder();
 	try {
@@ -974,6 +1059,9 @@ export async function runMigrations(sqlite: Database): Promise<{
 		if (!hadMfaEnabledColumn) {
 			backfillMfaEnabled(sqlite);
 		}
+		if (!hadFastModeOverrideColumn) {
+			backfillFastModeOverride(sqlite);
+		}
 		return { source: resolved.source, folder: resolved.folder };
 	} finally {
 		resolved.cleanup?.();
@@ -982,12 +1070,48 @@ export async function runMigrations(sqlite: Database): Promise<{
 
 /** Whether the `users` table exists and already has the given column. */
 function usersHasColumn(sqlite: Database, column: string): boolean {
-	const usersTableExists = sqlite
-		.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'")
-		.get();
-	if (!usersTableExists) return true; // fresh DB — no legacy rows to backfill
-	const cols = sqlite.prepare("PRAGMA table_info('users')").all() as { name: string }[];
+	return tableHasColumn(sqlite, "users", column);
+}
+
+/**
+ * Whether `table` exists and already has `column`. A missing table reports true
+ * so a fresh database (created straight from the latest schema) never runs a
+ * legacy data backfill.
+ */
+function tableHasColumn(sqlite: Database, table: string, column: string): boolean {
+	const tableExists = sqlite
+		.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+		.get(table);
+	if (!tableExists) return true; // fresh DB — no legacy rows to backfill
+	const cols = sqlite.prepare(`PRAGMA table_info('${table}')`).all() as { name: string }[];
 	return cols.some((c) => c.name === column);
+}
+
+/**
+ * One-time backfill: `narrators.fast_mode` used to be the only source of truth,
+ * so the user's "fast mode by default" preference was frozen into each row at
+ * creation time and changing it never affected existing narrators. The new
+ * `fast_mode_override` tri-state defaults to "inherit" (follow the preference),
+ * so narrators that had fast mode ON must be pinned to "on" to keep behaving the
+ * same. Rows that were OFF stay "inherit" and start following the default.
+ */
+function backfillFastModeOverride(sqlite: Database): void {
+	try {
+		const result = sqlite
+			.prepare(
+				`UPDATE narrators SET fast_mode_override = 'on'
+				 WHERE fast_mode = 1 AND fast_mode_override = 'inherit'`,
+			)
+			.run();
+		if (result.changes > 0) {
+			logger.info("Backfilled fast_mode_override for narrators with fast mode enabled", {
+				count: result.changes,
+			});
+		}
+	} catch (err) {
+		// Non-fatal: never block startup on an optional backfill.
+		logger.warn("fast_mode_override backfill failed (non-fatal)", { error: String(err) });
+	}
 }
 
 /**

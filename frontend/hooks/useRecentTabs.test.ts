@@ -4,14 +4,16 @@ import { QueryClient } from "@tanstack/react-query";
 import {
 	buildRecentTabUpsert,
 	buildSubagentRecentTab,
+	bumpRecentTabRuntimeVersions,
 	mergeRecentTabPatch,
 	mergeRecentTabRuntime,
-	pruneRecentTabsTerminalCountVersions,
+	pruneRecentTabsRuntimeVersions,
 	type RecentTab,
 	reconcileRecentTabsRuntimePatches,
 	selectRecentTabsLiveWindow,
 	shouldAddSubagentRecentTab,
 	shouldApplyRecentTabsRuntimeResponse,
+	snapshotRecentTabRuntimeVersions,
 } from "./recent-tabs-utils";
 import type { RecentTabsInfiniteData } from "./useRecentTabs";
 
@@ -50,6 +52,7 @@ afterAll(() => {
 const {
 	addRecentTabsBatch,
 	applyRecentTabsDelta,
+	applyRecentTabsRuntimePatches,
 	collectRecentTabsDeltaFrame,
 	recentTabsDataRevision,
 	recentTabsSectionQueryKey,
@@ -632,31 +635,98 @@ describe("recent tabs loaded-window refresh", () => {
 			qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages[0].revision,
 		).toBe(3);
 	});
+
+	test("keeps runtime fields a WS event wrote while the pages were in flight", async () => {
+		const qc = new QueryClient();
+		qc.setQueryData(
+			recentTabsSectionQueryKey("work"),
+			pageData(
+				[
+					{
+						type: "narrator",
+						id: "n1",
+						title: "N1",
+						lastVisitedAt: 1,
+						status: "idle",
+					} as RecentTab,
+				],
+				1,
+			),
+		);
+		const original = api.getRecentTabsPage;
+		let resolvePage:
+			| ((page: Awaited<ReturnType<typeof api.getRecentTabsPage>>) => void)
+			| undefined;
+		api.getRecentTabsPage = () =>
+			new Promise((resolve) => {
+				resolvePage = resolve;
+			});
+		try {
+			const refresh = refreshRecentTabsLoadedWindow(qc, { minimumRevision: 2 });
+			while (!resolvePage) await Promise.resolve();
+			// A narrator started working while the page request was open.
+			applyRecentTabsRuntimePatches(qc, [
+				{ key: "narrator:n1", patch: { status: "working", substatus: ["reasoning"] } },
+			]);
+			resolvePage({
+				items: [{ type: "narrator", id: "n1", title: "N1", lastVisitedAt: 1, status: "idle" }],
+				revision: 2,
+				hasMore: false,
+			});
+			await refresh;
+		} finally {
+			api.getRecentTabsPage = original;
+		}
+
+		const tab = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages[0]
+			.items[0] as RecentTab | undefined;
+		expect(tab?.status).toBe("working");
+		expect(tab?.substatus).toEqual(["reasoning"]);
+	});
 });
 
 describe("recent tabs runtime races", () => {
 	test("prunes versions outside the live window but retains in-flight snapshots", () => {
 		const versions = new Map([
-			["live", 1],
-			["in-flight", 2],
-			["stale", 3],
+			["live", new Map([["status", 1]])],
+			["in-flight", new Map([["status", 2]])],
+			["stale", new Map([["status", 3]])],
 		]);
 
-		pruneRecentTabsTerminalCountVersions(versions, new Set(["live"]), [new Set(["in-flight"])]);
-		expect(versions).toEqual(
-			new Map([
-				["live", 1],
-				["in-flight", 2],
-			]),
-		);
+		pruneRecentTabsRuntimeVersions(versions, new Set(["live"]), [new Set(["in-flight"])]);
+		expect([...versions.keys()]).toEqual(["live", "in-flight"]);
 
-		pruneRecentTabsTerminalCountVersions(versions, new Set(["live"]), []);
-		expect(versions).toEqual(new Map([["live", 1]]));
+		pruneRecentTabsRuntimeVersions(versions, new Set(["live"]), []);
+		expect([...versions.keys()]).toEqual(["live"]);
 	});
 
 	test("rejects an older runtime request generation", () => {
 		expect(shouldApplyRecentTabsRuntimeResponse(4, 5)).toBeFalse();
 		expect(shouldApplyRecentTabsRuntimeResponse(5, 5)).toBeTrue();
+	});
+
+	test("bumps only the fields a WS event actually delivered", () => {
+		const versions = new Map();
+		bumpRecentTabRuntimeVersions(versions, "n1", ["status", "substatus"]);
+		bumpRecentTabRuntimeVersions(versions, "n1", ["status"]);
+
+		expect(versions.get("n1")).toEqual(
+			new Map([
+				["status", 2],
+				["substatus", 1],
+			]),
+		);
+	});
+
+	test("snapshots per-narrator field counters independently of later bumps", () => {
+		const versions = new Map();
+		bumpRecentTabRuntimeVersions(versions, "n1", ["status"]);
+		const snapshot = snapshotRecentTabRuntimeVersions(versions, ["n1", "n2"]);
+		bumpRecentTabRuntimeVersions(versions, "n1", ["status"]);
+
+		expect(snapshot.get("n1")).toEqual(new Map([["status", 1]]));
+		expect(snapshot.get("n2")).toEqual(new Map());
+		expect(versions.get("n1")).toEqual(new Map([["status", 2]]));
 	});
 
 	test("drops only a stale terminal count after a newer WS update", () => {
@@ -668,11 +738,35 @@ describe("recent tabs runtime races", () => {
 				},
 			],
 			new Map([["narrator:n1", "n1"]]),
-			new Map([["n1", 2]]),
-			new Map([["n1", 3]]),
+			new Map([["n1", new Map([["activeTerminalCount", 2]])]]),
+			new Map([["n1", new Map([["activeTerminalCount", 3]])]]),
 		);
 
 		expect(patches).toEqual([{ key: "narrator:n1", patch: { status: "working", hasDraft: true } }]);
+	});
+
+	test("keeps a status delivered by WS while still refreshing untouched fields", () => {
+		const patches = reconcileRecentTabsRuntimePatches(
+			[
+				{
+					key: "narrator:n1",
+					patch: { status: "idle", substatus: null, activeTerminalCount: 2 },
+				},
+			],
+			new Map([["narrator:n1", "n1"]]),
+			new Map([["n1", new Map()]]),
+			new Map([
+				[
+					"n1",
+					new Map([
+						["status", 1],
+						["substatus", 1],
+					]),
+				],
+			]),
+		);
+
+		expect(patches).toEqual([{ key: "narrator:n1", patch: { activeTerminalCount: 2 } }]);
 	});
 
 	test("filters a patch emptied by dropping its stale terminal count", () => {
@@ -685,8 +779,8 @@ describe("recent tabs runtime races", () => {
 				["narrator:n1", "n1"],
 				["narrator:n2", "n2"],
 			]),
-			new Map([["n1", 2]]),
-			new Map([["n1", 3]]),
+			new Map([["n1", new Map([["activeTerminalCount", 2]])]]),
+			new Map([["n1", new Map([["activeTerminalCount", 3]])]]),
 		);
 
 		expect(patches).toEqual([{ key: "narrator:n2", patch: { hasDraft: false } }]);
@@ -696,8 +790,8 @@ describe("recent tabs runtime races", () => {
 		const patches = reconcileRecentTabsRuntimePatches(
 			[{ key: "chapter:c1", patch: { activeTerminalCount: 0 } }],
 			new Map([["chapter:c1", "n1"]]),
-			new Map([["n1", 7]]),
-			new Map([["n1", 7]]),
+			new Map([["n1", new Map([["activeTerminalCount", 7]])]]),
+			new Map([["n1", new Map([["activeTerminalCount", 7]])]]),
 		);
 
 		expect(patches).toEqual([{ key: "chapter:c1", patch: { activeTerminalCount: 0 } }]);

@@ -17,16 +17,20 @@ import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { formatLocaleNumber } from "@frontend/lib/intl-format";
 import {
 	NARRATOR_CENTERED_COLUMN_MAX_WIDTH,
 	resolveNarratorColumnWidth,
 } from "@frontend/lib/narrator-content-column";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { type PretextLayoutIndex, resolveVisibleWindow } from "@shared/pretext-layout";
 import type { LaidOutItem, ListLayout } from "@shared/pretext-layout/vlist-virtualization";
+import { normalizeSubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import {
 	forwardRef,
 	lazy,
@@ -59,7 +63,12 @@ import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import { useRenderLod } from "../RenderLodCtx";
 import { recentRunSegmentMessageIds } from "../run-segments";
 import { TraceRowInteraction } from "../TraceRowInteraction";
-import { getCategory, getCategoryColor, getSummary } from "../tool-display";
+import {
+	getCategory,
+	getCategoryColor,
+	getSummary,
+	subagentRecentCallSummary,
+} from "../tool-display";
 import type { TraceRowIdentity } from "../trace-row-identity";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-call";
@@ -79,6 +88,7 @@ import { useVListToolDetails } from "./useVListToolDetails";
 import { VListContentViewHost, type VListViewControls } from "./VListContentViewHost";
 import { VListContentViewModal } from "./VListContentViewModal";
 import { VListRowInteraction } from "./VListRowInteraction";
+import { VListUserMarkers } from "./VListUserMarkers";
 import { useVListAskInPassing } from "./vlist-ask-in-passing-bridge";
 import { isVListAskInPassingPending } from "./vlist-ask-in-passing-target";
 import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-target";
@@ -96,6 +106,7 @@ import {
 import {
 	hasEditableTextBlock,
 	resolveVListEditedMeta,
+	resolveVListEditorWidth,
 	resolveVListEditTarget,
 	type VListEditRole,
 } from "./vlist-edit-target";
@@ -105,6 +116,7 @@ import {
 	layoutItemsWithOverrides,
 	pruneHeightOverrides,
 } from "./vlist-height-overrides";
+import { createHighlightController } from "./vlist-highlight";
 import {
 	createVListInteractionState,
 	isFullPayloadRequestedRow,
@@ -158,6 +170,11 @@ import {
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
 import { injectUserBubbleAttachmentOpen, injectUserBubbleHeader } from "./vlist-user-bubble-header";
+import {
+	collectVListUserMarkers,
+	resolveVListUserMarkerScrollTop,
+	type VListUserMarker,
+} from "./vlist-user-markers";
 import { resolvePinnedRowIndices } from "./vlist-virtualization";
 
 // Editing chrome is lazy: a list that is only being read never pays for the
@@ -179,6 +196,12 @@ const ITEM_GAP = 4;
  * the exact layout keeps intra-unit items at ITEM_GAP so runs stay compact.
  */
 const SEGMENT_GAP = 12;
+/**
+ * Breathing room (px) left above a user turn when jumping to it from the marker
+ * index. Matches the canvas top padding, so the turn reads as the top of a page
+ * rather than being flush against the viewport edge.
+ */
+const VLIST_USER_MARKER_JUMP_LEAD = PAGE_PADDING;
 const BOTTOM_DISTANCE_EPSILON = 1;
 const STREAMING_PLACEHOLDER_ID = "__streaming__";
 /** Scroll distance from the top within which an upward gesture may auto-load older history. */
@@ -220,6 +243,15 @@ type PretextExactMessageListProps = {
 	pruneDividerLabel?: string;
 	/** Narrator is bound to a chapter (git) → user-edit offers the rollback option. */
 	hasChapter?: boolean;
+	/**
+	 * Deep-link / search target: jump to this message once and flash it.
+	 *
+	 * Only the target ID is needed. The chunked path additionally takes
+	 * `highlightedId` + `onHighlightTarget` because it renders the flash from panel
+	 * state; here the flash is a local, imperative DOM effect (see vlist-highlight),
+	 * so no state crosses the boundary and no row re-renders for it.
+	 */
+	highlightMessageId?: string;
 	tailFooter?: ReactNode;
 };
 
@@ -1034,11 +1066,29 @@ const ExactRow = memo(
 		// last one — tool details run header/command → output/result, so the final
 		// body is the payload the reader came for).
 		const menuViewTarget = viewControls ? resolvePrimaryViewTarget(viewTargets ?? []) : undefined;
+		// A user bubble is painted right-aligned and shrink-wrapped, so its editor
+		// must stay on that side at a comparable width. Letting it expand to the full
+		// column moved the caret, the attach button and the submit pair to the far
+		// left the instant the reader picked "edit" — a full column's worth of mouse
+		// travel away from the bubble they were hovering. Assistant bodies are
+		// left-aligned and full width already, so they resolve to null (unchanged).
+		const editorWidth =
+			editorSlot != null
+				? resolveVListEditorWidth(kind, extra.role, item.measured.usedWidth, contentWidth)
+				: null;
+		const editorBody =
+			editorSlot != null && editorWidth != null ? (
+				<div style={{ display: "flex", justifyContent: "flex-end" }}>
+					<div style={{ width: editorWidth, maxWidth: "100%" }}>{editorSlot}</div>
+				</div>
+			) : (
+				editorSlot
+			);
 		// While editing, the editor REPLACES the row: no measured body, no menu /
 		// selection surface. The chunked path behaves the same way (its edit branch
 		// returns before ContentViewer), so the row temporarily has no
 		// data-block-id — expected, and it comes back when editing ends.
-		const body = editorSlot ?? renderElement(kind, item.measured, extra);
+		const body = editorBody ?? renderElement(kind, item.measured, extra);
 		// A plain content row has no capped box of its own, so its viewer action bar
 		// wraps the whole row body. Never while editing: the editor replaces the row.
 		const viewableBody =
@@ -1272,6 +1322,7 @@ export const PretextExactMessageList = forwardRef<
 		permCb,
 		pruneDividerLabel,
 		hasChapter,
+		highlightMessageId,
 		tailFooter,
 	} = props;
 	const lod = useRenderLod() as RenderLod;
@@ -1285,6 +1336,10 @@ export const PretextExactMessageList = forwardRef<
 	const viewportRef = useRef<HTMLDivElement | null>(null);
 	const contentNodeRef = useRef<HTMLDivElement | null>(null);
 	const footerNodeRef = useRef<HTMLDivElement | null>(null);
+	// One-flash-at-a-time jump highlight. A ref (not state) on purpose: the flash is
+	// a decoration written straight to the revealed row's node, so it must not
+	// invalidate a single row's memo or the measurement cache.
+	const highlightRef = useRef(createHighlightController());
 	const pinnedToBottomRef = useRef(true);
 	const suppressScrollStateRef = useRef(false);
 	/**
@@ -1490,6 +1545,15 @@ export const PretextExactMessageList = forwardRef<
 			metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>) : undefined,
 		);
 	}, []);
+	// A subagent recent-call row's label detail. Same shared helper the chunked
+	// `SubagentActivityRow` calls, so one child call is worded identically in both
+	// render paths. It takes the projected `inputSummary` rather than a tool call
+	// because that is all these rows ever carry.
+	const resolveExactSubagentRecentSummary = useCallback(
+		(toolName: string, inputSummary: unknown) =>
+			subagentRecentCallSummary(toolName, normalizeSubagentToolInputSummary(inputSummary)),
+		[],
+	);
 	const resolveRecentMessageIds = useCallback(
 		(messages: readonly NarratorMsg[]) => recentRunSegmentMessageIds([...messages], 2),
 		[],
@@ -1759,6 +1823,19 @@ export const PretextExactMessageList = forwardRef<
 		},
 		[takeOverReflection],
 	);
+	// Read before the document hook: `showTokenUsage` is a build input (the adapter
+	// emits the usage rows only when it is on), and the older-history controls below
+	// consume the same query.
+	const {
+		data: userPrefs,
+		isLoading: userPrefsLoading,
+		isFetched: userPrefsFetched,
+	} = useUserPreferences();
+	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
+	// The chunked path splits the trailing usage summary with CSS breakpoints, which
+	// a zero-DOM height model cannot see — so the breakpoint is resolved here and
+	// becomes an explicit measure input (one line vs two).
+	const isMobileViewport = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const pretextDocument = usePretextDocument(narratorId, {
 		lod,
 		labels: vlistLabels,
@@ -1783,23 +1860,22 @@ export const PretextExactMessageList = forwardRef<
 		resolveToolCategory: getCategory,
 		resolveToolColor: resolveExactToolColor,
 		resolveToolSummary: resolveExactToolSummary,
+		resolveSubagentRecentSummary: resolveExactSubagentRecentSummary,
 		resolveRecentMessageIds,
 		resolveHasPendingPermission,
 		resolvePendingPlan,
 		resolvePendingPermissionSuggestions,
 		resolveFullToolInput,
 		resolveFullToolOutput,
+		showTokenUsage,
+		compactUsageLines: isMobileViewport,
+		formatUsageNumber: formatLocaleNumber,
 		onScrollTopCorrection,
 		isSubagent,
 	});
 	appendMessageRef.current = pretextDocument.appendMessage;
 
 	// --- Reverse infinite scroll (load older) ---
-	const {
-		data: userPrefs,
-		isLoading: userPrefsLoading,
-		isFetched: userPrefsFetched,
-	} = useUserPreferences();
 	const autoLoadEnabled = resolveOlderHistoryAutoLoadEnabled(
 		userPrefs?.autoLoadOlderMessages,
 		userPrefsLoading,
@@ -2478,6 +2554,34 @@ export const PretextExactMessageList = forwardRef<
 		setPinnedToBottom(false);
 	}, []);
 
+	// Quick index of user turns beside the scrollbar (parity with the chunked
+	// path's ScrollbarUserMarkers). Positions come from the exact layout's real
+	// document offsets rather than a seq ordinal, so a mark lands on the turn it
+	// points at regardless of how much output surrounds it.
+	//
+	// The fractions are taken against the FULL scrollable height (canvas + tail
+	// footer) so the track shares the scrollbar's coordinate system.
+	const scrollableHeight = (exactLayout?.totalHeight ?? 0) + footerHeight;
+	const userMarkers = useMemo(
+		() => collectVListUserMarkers(renderItems, exactLayout?.items ?? [], scrollableHeight),
+		[renderItems, exactLayout?.items, scrollableHeight],
+	);
+	const handleUserMarkerJump = useCallback(
+		(marker: VListUserMarker) => {
+			// A jump is an explicit reading action: unpin so streaming output cannot
+			// immediately pull the reader back to the tail.
+			pinnedToBottomRef.current = false;
+			setPinnedToBottom(false);
+			writeScrollTop(resolveVListUserMarkerScrollTop(marker.top, VLIST_USER_MARKER_JUMP_LEAD));
+		},
+		[writeScrollTop],
+	);
+	const resolveUserMarkerLabel = useCallback(
+		(ordinal: number) =>
+			t("jumpToUserMessage", { ordinal, defaultValue: `Jump to message #${ordinal}` }),
+		[t],
+	);
+
 	const onLodStepRef = useRef(onLodStep);
 	onLodStepRef.current = onLodStep;
 	useEffect(() => {
@@ -2566,7 +2670,20 @@ export const PretextExactMessageList = forwardRef<
 	}, [detachFromBottom]);
 
 	const scrollToMessageTarget = useCallback(
-		async ({ domIds, targetIds }: { domIds: string[]; targetIds: string[] }) => {
+		async ({
+			domIds,
+			targetIds,
+			highlightId,
+		}: {
+			domIds: string[];
+			targetIds: string[];
+			highlightId?: string;
+		}) => {
+			// The row that was actually revealed, so the flash lands on the node the
+			// reader is now looking at rather than on a guessed id. Unlike the chunked
+			// path — which arms a 400ms timer and hopes the scroll finished — the flash
+			// is driven by the reveal itself, so it can never fire on a failed jump or
+			// on a row that has since scrolled away.
 			const revealMounted = () => {
 				const candidates = [
 					...domIds,
@@ -2578,6 +2695,9 @@ export const PretextExactMessageList = forwardRef<
 					pinnedToBottomRef.current = false;
 					setPinnedToBottom(false);
 					element.scrollIntoView?.({ block: "center" });
+					// Flash the row itself (not a wrapper): the id is on the ExactRow hit
+					// box, so the outline traces the row the jump landed on.
+					if (highlightId) highlightRef.current.flash(element);
 					return true;
 				}
 				return false;
@@ -2612,6 +2732,42 @@ export const PretextExactMessageList = forwardRef<
 		}),
 		[detachFromBottom, pretextDocument.reload, scrollToBottom, scrollToMessageTarget],
 	);
+
+	// Deep-link / search jump: reveal the target once per (narrator, target) pair.
+	//
+	// Retried while it fails rather than latched on the first attempt: the document
+	// may still be loading, and the target may live above the loaded window (the
+	// jump then resolves once an older page arrives). Only a SUCCESSFUL reveal is
+	// recorded, so a subsequent rebuild does not re-jump — and returning to the same
+	// target later (a repeated search hit) re-flashes because the panel hands the id
+	// back as a fresh mount.
+	const jumpedHighlightRef = useRef<string | null>(null);
+	useEffect(() => {
+		if (!highlightMessageId) {
+			jumpedHighlightRef.current = null;
+			return;
+		}
+		const key = `${narratorId}:${highlightMessageId}`;
+		if (jumpedHighlightRef.current === key) return;
+		let cancelled = false;
+		void scrollToMessageTarget({
+			domIds: [`msg-${highlightMessageId}`],
+			targetIds: [highlightMessageId],
+			highlightId: highlightMessageId,
+		}).then((ok) => {
+			if (ok && !cancelled) jumpedHighlightRef.current = key;
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [highlightMessageId, narratorId, scrollToMessageTarget]);
+
+	// A flash outlives its row's mount (the reader can scroll away mid-animation),
+	// so the controller is stopped explicitly on unmount.
+	useEffect(() => {
+		const controller = highlightRef.current;
+		return () => controller.cancel();
+	}, []);
 
 	const manifestItems = pretextDocument.manifest?.items ?? [];
 	const hasRenderableLayout = hasRenderableExactLayout(
@@ -2806,6 +2962,10 @@ export const PretextExactMessageList = forwardRef<
 	// a collapsed trace its own. Built in a memo that does NOT depend on scroll
 	// state, so each slot stays referentially stable and the ExactRow memo keeps
 	// skipping unchanged rows while scrolling.
+	//
+	// `rowBody` is the row's ENTIRE painted block, drill-down included — a revealed
+	// card is the same tool call the row summarizes, so both live inside one
+	// interactive block (one menu, one swipe, one selection outline).
 	const rowInteractionByKey = useMemo(() => {
 		const map = new Map<string, TraceRowInteractionSlot>();
 		if (!selectionIndex) return map;
@@ -2813,7 +2973,7 @@ export const PretextExactMessageList = forwardRef<
 		const handlers = rowHandlers ?? {};
 		for (const item of renderItems) {
 			if (!item || !TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind)) continue;
-			map.set(item.spec.key, (row, titleRow) => {
+			map.set(item.spec.key, (row, rowBody) => {
 				const identity = resolveTraceRowIdentity(row, selectionIndex, toolMetaIndex);
 				if (!identity) return null;
 				const actions = buildRowCtxActions(
@@ -2834,7 +2994,7 @@ export const PretextExactMessageList = forwardRef<
 							onDetachSubagent={handlers.onDetachSubagent}
 							onCancelBackgroundTask={handlers.onCancelBackgroundTask}
 						>
-							{titleRow}
+							{rowBody}
 						</TraceRowInteraction>
 					</MessageContextMenuCtx.Provider>
 				);
@@ -2903,6 +3063,17 @@ export const PretextExactMessageList = forwardRef<
 			}}
 			data-pretext-exact-message-list
 		>
+			{/* User-turn quick index, pinned to the viewport's right edge. A zero-height
+			    sticky box, so it indexes the document without adding to it. Placed
+			    BEFORE the canvas so its marks paint above the rows. */}
+			<VListUserMarkers
+				markers={userMarkers}
+				documentHeight={scrollableHeight}
+				trackHeight={viewportHeight}
+				onJump={handleUserMarkerJump}
+				viewportRef={viewportRef}
+				resolveLabel={resolveUserMarkerLabel}
+			/>
 			{/* Full width on purpose: each row centers its own `contentWidth` column
 			    instead of relying on a narrow, centered parent. A centered parent
 			    left the space beside it as bare scroll container with no in-flow

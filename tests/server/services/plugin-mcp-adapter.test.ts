@@ -128,9 +128,11 @@ describe("PluginMcpAdapter mcp.bridge", () => {
 	});
 
 	test("checks authorization, cancellation and output limits before crossing the plugin boundary", async () => {
+		// Denies via an absent grant. `hostPolicy: []` no longer denies on its own: policy
+		// sources that merely omit a capability are not a refusal, but a missing grant still is.
 		const denied = new PluginMcpAdapter({
 			capabilityBroker: new CapabilityBroker({
-				bindings: new Map([[principal.pluginId, bridgeBinding({ hostPolicy: [] })]]),
+				bindings: new Map([[principal.pluginId, bridgeBinding({ installationGrants: [] })]]),
 			}),
 		});
 		denied.registerBridge(tool());

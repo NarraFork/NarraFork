@@ -138,6 +138,26 @@ const eventsUnsubscribeParamsSchema = z
 	.object({ subscriptionId: z.string().trim().min(1).max(128) })
 	.strict();
 
+/**
+ * Secret params carry a `key` but never a `pluginId`: the host takes the owner from the
+ * bound principal, so one plugin cannot address another's namespace.
+ *
+ * The 64KB value ceiling stays. It is not a trust limit — the vault is a synchronous
+ * JSON read/modify/write on the main thread, so an unbounded value would stall every
+ * request. See CLAUDE.md on main-thread blocking.
+ */
+const MAX_SECRET_KEY_LENGTH = 256;
+const MAX_SECRET_VALUE_BYTES = 64 * 1024;
+const secretKeyParamsSchema = z
+	.object({ key: z.string().trim().min(1).max(MAX_SECRET_KEY_LENGTH) })
+	.strict();
+const secretSetParamsSchema = z
+	.object({
+		key: z.string().trim().min(1).max(MAX_SECRET_KEY_LENGTH),
+		value: z.string().max(MAX_SECRET_VALUE_BYTES),
+	})
+	.strict();
+
 export interface PluginHostRuntimeBindingInput {
 	pluginId: string;
 	packageVersion: string;
@@ -195,12 +215,28 @@ export interface PluginHostServicesOptions {
 	 * that split and is the intended supplier.
 	 */
 	providerConfigReader?: (pluginId: string) => Promise<JsonValue> | JsonValue;
-	/**
-	 * Secret *key names* for `secrets.list`. Values are deliberately unavailable: the
-	 * security contract says a plugin may receive a reference or a request-scoped value
-	 * from the broker, never an enumerable copy of the host's secrets.
-	 */
+	/** Secret *key names* for `secrets.list`, without values. */
 	secretKeyLister?: (pluginId: string) => Promise<readonly string[]> | readonly string[];
+	/**
+	 * Read/write/delete access to the calling plugin's own secrets.
+	 *
+	 * Every function takes `pluginId` as its first argument and the host supplies it from
+	 * the bound principal — plugins never pass it. That is the whole isolation mechanism,
+	 * and it is the same one VS Code relies on (`JSON.stringify({ extensionId, key })` in
+	 * `mainThreadSecretState`): identity is injected, not self-reported, so naming another
+	 * plugin's secret is not expressible in the API.
+	 *
+	 * Values used to be withheld entirely, on the theory that a plugin should only ever
+	 * receive a request-scoped injection. That cost real functionality — a settings view
+	 * could not show which credential was configured — while preventing nothing, since a
+	 * plugin's own backend could return the value anyway.
+	 */
+	secretReader?: (
+		pluginId: string,
+		key: string,
+	) => Promise<string | undefined> | string | undefined;
+	secretWriter?: (pluginId: string, key: string, value: string) => Promise<void> | void;
+	secretDeleter?: (pluginId: string, key: string) => Promise<boolean> | boolean;
 	now?: () => Date;
 }
 
@@ -393,6 +429,9 @@ export class PluginHostServices {
 	readonly storageFactory: PluginStorageFactoryLike;
 	private readonly providerConfigReader?: PluginHostServicesOptions["providerConfigReader"];
 	private readonly secretKeyLister?: PluginHostServicesOptions["secretKeyLister"];
+	private readonly secretReader?: PluginHostServicesOptions["secretReader"];
+	private readonly secretWriter?: PluginHostServicesOptions["secretWriter"];
+	private readonly secretDeleter?: PluginHostServicesOptions["secretDeleter"];
 	private readonly queryHandler?: PluginHostQueryHandler;
 	private readonly diagnosticsHandler?: PluginHostServicesOptions["diagnosticsHandler"];
 	private readonly auditSink?: PluginHostServicesOptions["auditSink"];
@@ -412,6 +451,9 @@ export class PluginHostServices {
 			options.storageFactory ?? new PluginStorageFactory({ root: options.storageRoot });
 		this.providerConfigReader = options.providerConfigReader;
 		this.secretKeyLister = options.secretKeyLister;
+		this.secretReader = options.secretReader;
+		this.secretWriter = options.secretWriter;
+		this.secretDeleter = options.secretDeleter;
 		this.queryHandler = options.queryHandler;
 		this.diagnosticsHandler = options.diagnosticsHandler;
 		this.auditSink = options.auditSink;
@@ -696,6 +738,33 @@ export class PluginHostServices {
 					capability: "secret.use_self",
 					maxResponseBytes: 64 * 1024,
 					handler: (_params, context) => this.secretsList(context),
+				},
+				"secrets.get": {
+					method: "secrets.get",
+					paramsSchema: secretKeyParamsSchema,
+					resultSchema: jsonValueSchema,
+					capability: "secret.use_self",
+					maxResponseBytes: 64 * 1024,
+					handler: (params, context) =>
+						this.secretsGet(context, params as z.infer<typeof secretKeyParamsSchema>),
+				},
+				"secrets.set": {
+					method: "secrets.set",
+					paramsSchema: secretSetParamsSchema,
+					resultSchema: jsonValueSchema,
+					capability: "secret.use_self",
+					maxResponseBytes: 4 * 1024,
+					handler: (params, context) =>
+						this.secretsSet(context, params as z.infer<typeof secretSetParamsSchema>),
+				},
+				"secrets.delete": {
+					method: "secrets.delete",
+					paramsSchema: secretKeyParamsSchema,
+					resultSchema: jsonValueSchema,
+					capability: "secret.use_self",
+					maxResponseBytes: 4 * 1024,
+					handler: (params, context) =>
+						this.secretsDelete(context, params as z.infer<typeof secretKeyParamsSchema>),
 				},
 				"storage.list": {
 					method: "storage.list",
@@ -1120,15 +1189,47 @@ export class PluginHostServices {
 		return (await this.providerConfigReader(context.plugin.pluginId)) ?? {};
 	}
 
-	/**
-	 * Own secret key names plus a configured flag — never values. This lets a plugin
-	 * decide whether to prompt for setup without giving it an enumerable credential
-	 * store, which the sandbox contract prohibits.
-	 */
+	/** Own secret key names plus a configured flag. Values come from `secrets.get`. */
 	private async secretsList(context: PluginHostCallContext): Promise<JsonValue> {
 		if (!this.secretKeyLister) return { secrets: [] };
 		const keys = await this.secretKeyLister(context.plugin.pluginId);
 		return { secrets: keys.map((key) => ({ key, configured: true })) };
+	}
+
+	/**
+	 * Read one of the plugin's own secrets.
+	 *
+	 * `context.plugin.pluginId` is host-supplied, so the namespace is not selectable by the
+	 * caller. An unset key returns `{ value: null }` rather than an error, matching
+	 * `secrets.get` in VS Code returning `undefined`.
+	 */
+	private async secretsGet(
+		context: PluginHostCallContext,
+		params: z.infer<typeof secretKeyParamsSchema>,
+	): Promise<JsonValue> {
+		if (!this.secretReader) return { key: params.key, value: null };
+		const value = await this.secretReader(context.plugin.pluginId, params.key);
+		return { key: params.key, value: value ?? null };
+	}
+
+	private async secretsSet(
+		context: PluginHostCallContext,
+		params: z.infer<typeof secretSetParamsSchema>,
+	): Promise<JsonValue> {
+		if (!this.secretWriter) {
+			throw new PluginHostDispatcherError("HOST_UNAVAILABLE", "Secret storage is unavailable");
+		}
+		await this.secretWriter(context.plugin.pluginId, params.key, params.value);
+		return { key: params.key, stored: true };
+	}
+
+	private async secretsDelete(
+		context: PluginHostCallContext,
+		params: z.infer<typeof secretKeyParamsSchema>,
+	): Promise<JsonValue> {
+		if (!this.secretDeleter) return { key: params.key, deleted: false };
+		const deleted = await this.secretDeleter(context.plugin.pluginId, params.key);
+		return { key: params.key, deleted };
 	}
 
 	private storageFor(input: PluginHostRuntimeBindingInput) {

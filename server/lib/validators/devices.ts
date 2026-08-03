@@ -62,3 +62,14 @@ export const deviceStatQuerySchema = z.object({
 	path: z.string().min(1).max(4096),
 	recursive: z.boolean().optional(),
 });
+
+/**
+ * Single-level directory listing for interactive browsing. Unlike
+ * deviceStatQuerySchema's recursive mode (which walks an entire tree and is
+ * meant for transfer manifests), this lists one directory at a time. `path` is
+ * optional so the picker can open at the device's default working directory.
+ */
+export const deviceBrowseQuerySchema = z.object({
+	path: z.string().min(1).max(4096).optional(),
+	showHidden: z.boolean().optional(),
+});

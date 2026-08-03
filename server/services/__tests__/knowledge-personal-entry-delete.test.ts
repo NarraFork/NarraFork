@@ -4,8 +4,10 @@
  * Covers:
  *  - Authorization: only the author (or an admin) may delete; anyone else gets NotFound
  *    (existence is not leaked) and the entry stays active.
- *  - Open publish requests (pending / conflict) are rejected alongside the delete, in the
- *    same transaction, so reviewers can't act on a retired entry's proposal.
+ *  - Open publish requests (pending / conflict) are closed as `withdrawn` alongside the
+ *    delete, in the same transaction, so reviewers can't act on a retired entry's proposal.
+ *    `withdrawn` (not `rejected`) because the author retired it themselves — no reviewer
+ *    passed judgement, so no verdict is written either.
  *  - A soft-deleted entry is archived, disappears from listMine({ status: "active" }), and
  *    is no longer editable / publishable.
  *  - Author-scoped publish history (listSubmissionsForDraft) is visible to the author, whose
@@ -109,7 +111,7 @@ describe("deletePersonalEntry authorization", () => {
 });
 
 describe("deletePersonalEntry invalidates open publish requests", () => {
-	test("a pending submission is rejected alongside the delete, and the submitter is notified", async () => {
+	test("a pending submission is withdrawn alongside the delete, and the submitter is notified", async () => {
 		const created = await knowledgeBranchService.createStandalone(author, {
 			title: `WithPending ${TAG}`,
 			content: "proposed body\n",
@@ -136,8 +138,12 @@ describe("deletePersonalEntry invalidates open publish requests", () => {
 		const row = await db.query.knowledgeSubmissions.findFirst({
 			where: eq(knowledgeSubmissions.id, submissionId),
 		});
-		expect(row?.status).toBe("rejected");
+		expect(row?.status).toBe("withdrawn");
 		expect(row?.reviewedAt).toBeTruthy();
+		// No reviewer judged this — the author retired their own entry. A verdict here would
+		// render as "a reviewer rejected you" in the author's publish history.
+		expect(row?.verdict).toBeNull();
+		expect(row?.reviewerUserId).toBeNull();
 
 		// The submitter is told their publish request was closed, with the delete reason.
 		expect(seen).toHaveLength(1);
@@ -149,7 +155,7 @@ describe("deletePersonalEntry invalidates open publish requests", () => {
 		});
 	});
 
-	test("a conflicted submission is rejected too", async () => {
+	test("a conflicted submission is withdrawn too", async () => {
 		const created = await knowledgeBranchService.createStandalone(author, {
 			title: `WithConflict ${TAG}`,
 			content: "proposed body\n",
@@ -170,7 +176,8 @@ describe("deletePersonalEntry invalidates open publish requests", () => {
 		const row = await db.query.knowledgeSubmissions.findFirst({
 			where: eq(knowledgeSubmissions.id, submissionId),
 		});
-		expect(row?.status).toBe("rejected");
+		expect(row?.status).toBe("withdrawn");
+		expect(row?.verdict).toBeNull();
 	});
 
 	test("an already-reviewed submission is left untouched", async () => {

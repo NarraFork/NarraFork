@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
 import { hotSafe } from "../lib/hot-safe";
+import { normalizePathForComparison } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
 import type { ImageRef } from "../lib/uploads";
 import type { FrozenExecutionTarget } from "./execution-policy/types";
@@ -379,6 +380,54 @@ export function resetActiveUpstreamSession(narratorId: string): boolean {
 	active.conversationId = randomUUID();
 	active._resetUpstreamSessionOnNextRequest = true;
 	return true;
+}
+
+/**
+ * Drop the cached workspace tree hash for every session sharing a worktree.
+ *
+ * `_lastTreeHash` is reused as the next tool's `before` boundary, so anything
+ * that changes the worktree behind the session's back must invalidate it. A
+ * rollback does exactly that: it rewrites files without going through a tool.
+ *
+ * Leaving the cache in place is not merely a stale-attribution problem. Segment
+ * planning decides "nothing else wrote in between" by testing
+ * `previous.after === next.before`, so a `before` describing a state that no
+ * longer exists can make two segments merge that should have stayed split — and
+ * a merged span reverses whatever another actor wrote inside it.
+ *
+ * Every active session on the same worktree is cleared, not just the narrator
+ * that triggered the rollback: a shared worktree means the write landed in their
+ * workspace too. Matching is by normalized path so `/a/b` and `/a/b/` agree.
+ */
+export function invalidateWorkspaceTreeCache(worktreePath: string): void {
+	const target = normalizePathForComparison(worktreePath);
+	for (const active of activeNarrators.values()) {
+		if (normalizePathForComparison(active.cwd) !== target) continue;
+		active._lastTreeHash = undefined;
+	}
+}
+
+/**
+ * Whether any live agent loop is currently running against this worktree.
+ *
+ * Scoped to the workspace rather than one narrator on purpose. A rollback competes
+ * with whoever is writing the *directory*, and that is not only the narrator being
+ * rolled back: subagents share their parent's cwd, and a background subagent keeps
+ * writing after the parent loop returned — so the parent reads as idle while its
+ * child is still mutating files. Other narrators attached to the same chapter are
+ * the same situation.
+ *
+ * Reads `_loopRunning` rather than the DB status because that flag is the
+ * authoritative in-memory signal; a status row can lag behind a turn that is still
+ * draining.
+ */
+export function isWorkspaceBeingWritten(worktreePath: string): boolean {
+	const target = normalizePathForComparison(worktreePath);
+	for (const active of activeNarrators.values()) {
+		if (!active.alive || active._loopRunning !== true) continue;
+		if (normalizePathForComparison(active.cwd) === target) return true;
+	}
+	return false;
 }
 
 /**

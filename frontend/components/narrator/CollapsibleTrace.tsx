@@ -1,9 +1,11 @@
 import { Box, Group, Text, ThemeIcon } from "@mantine/core";
+import { hasToolRowStatusMark } from "@shared/tool-row-status";
 import { IconChevronDown, IconChevronRight, IconDots } from "@tabler/icons-react";
-import { memo, type ReactNode, useState } from "react";
+import { type CSSProperties, memo, type ReactNode, useState } from "react";
 import { LazyCollapse } from "./LazyCollapse";
 import type { MessageContextMenuActions } from "./MessageContextMenuCtx";
 import { MessageContextMenuCtx } from "./MessageContextMenuCtx";
+import { STATUS_COLORS, StatusIcon } from "./ToolCallCard";
 import { isTraceRowSelectionClick, TraceRowInteraction } from "./TraceRowInteraction";
 import type { TraceRowIdentity } from "./trace-row-identity";
 
@@ -20,11 +22,34 @@ import type { TraceRowIdentity } from "./trace-row-identity";
 
 // --- Cross-remount persistence (LRU) ---------------------------------------
 const MAX_STATE_ENTRIES = 1000;
-const TRACE_ROW_MIN_HEIGHT = 18;
-const TRACE_ROW_LINE_HEIGHT = "16px";
-const TRACE_CHEVRON_SLOT_WIDTH = 12;
-const TRACE_ICON_SLOT_SIZE = 14;
+export const TRACE_ROW_MIN_HEIGHT = 18;
+export const TRACE_ROW_LINE_HEIGHT = "16px";
+export const TRACE_CHEVRON_SLOT_WIDTH = 12;
+export const TRACE_ICON_SLOT_SIZE = 14;
+/** Trailing status glyph box (matches `StatusIcon`'s own 12px glyph). */
+export const TRACE_STATUS_SLOT_SIZE = 12;
+/** Gap between the cells of a trace row. */
+export const TRACE_ROW_GAP = 6;
 const expandState = new Map<string, boolean>();
+
+/**
+ * Fixed slot for the trailing status glyph.
+ *
+ * An auto-sized wrapper around an inline `<svg>` takes its line box from the ROOT
+ * font size (16 × 1.55 = 24.8px) rather than from the 12px glyph, and `StatusIcon`
+ * returns null for statuses outside its known set — so an unstyled wrapper both
+ * INFLATED the row when it drew and collapsed to 0×0 when it did not. Sizing it
+ * explicitly and laying it out as flex makes the glyph height-neutral either way,
+ * which is what lets the row keep its 18px reservation.
+ */
+export const TRACE_STATUS_SLOT_STYLE = {
+	width: TRACE_STATUS_SLOT_SIZE,
+	height: TRACE_STATUS_SLOT_SIZE,
+	flexShrink: 0,
+	display: "flex",
+	alignItems: "center",
+	justifyContent: "center",
+} as const satisfies CSSProperties;
 
 function readState(key: string | undefined): boolean | undefined {
 	if (!key) return undefined;
@@ -60,6 +85,24 @@ export interface CollapsibleTraceItem {
 	body?: ReactNode | null;
 	/** Streaming shimmer on this row (the latest live item). */
 	shimmer?: boolean;
+	/**
+	 * Tool-call status for the trailing glyph (spinner in flight, then ✓/✗/⊘).
+	 *
+	 * A folded row used to say only WHAT ran — a failed call and a finished one read
+	 * identically, and shimmer could only mean "something is live". Omit for rows
+	 * that have no such lifecycle (reasoning steps): the slot is then not rendered at
+	 * all, so those rows are unchanged.
+	 */
+	status?: string;
+	/**
+	 * Trailing node after the title, e.g. this row's `ToolTimingArea`.
+	 *
+	 * Injected rather than typed as a tool call so this component stays content
+	 * agnostic — it must not know what a tool call is. Callers are responsible for
+	 * keeping it height-neutral: a single line that shares the row's 18px
+	 * reservation, with any popover portaled.
+	 */
+	trailing?: ReactNode;
 	/** Persist-key override; defaults to `${persistKeyBase}:${key}`. */
 	persistKey?: string;
 	/**
@@ -106,7 +149,12 @@ export interface CollapsibleTraceProps {
 	rowContext?: CollapsibleTraceRowContext;
 }
 
-function TraceChevronSlot({ children }: { children: ReactNode }) {
+/**
+ * Exported (with the slots below) so every compact row in the chunk path — a
+ * folded trace row here AND a subagent card's recent-call row — is assembled from
+ * the SAME definitions rather than from two copies that happen to agree today.
+ */
+export function TraceChevronSlot({ children }: { children: ReactNode }) {
 	return (
 		<Box
 			data-trace-chevron-slot
@@ -123,7 +171,16 @@ function TraceChevronSlot({ children }: { children: ReactNode }) {
 	);
 }
 
-function TraceIconSlot({ icon, color = "gray" }: { icon?: ReactNode; color?: string }) {
+/** The "not expandable" marker a plain trace row shows in its chevron slot. */
+export function TraceRowDot() {
+	return (
+		<Text span size="xs" c="dimmed" style={{ opacity: 0.5, lineHeight: 1, fontSize: 10 }}>
+			•
+		</Text>
+	);
+}
+
+export function TraceIconSlot({ icon, color = "gray" }: { icon?: ReactNode; color?: string }) {
 	return (
 		<Box
 			data-trace-icon-slot
@@ -141,6 +198,34 @@ function TraceIconSlot({ icon, color = "gray" }: { icon?: ReactNode; color?: str
 					{icon}
 				</ThemeIcon>
 			)}
+		</Box>
+	);
+}
+
+/**
+ * The trailing status glyph of a row, in its fixed height-neutral slot.
+ *
+ * Renders only for a status worth MARKING — in flight, failed, or cancelled. A
+ * successful call draws nothing at all (not even a blank slot), because success is
+ * the default expectation and a column of green checks is noise that costs the
+ * reader exactly the attention a real failure needs. The rule itself lives in
+ * `@shared/tool-row-status` so the vlist rows cannot diverge from these.
+ *
+ * `StatusIcon` is the same component the tool card's header paints, so a marked row
+ * and the card it expands into cannot disagree about what "running" or "cancelled"
+ * looks like. (The header still shows its check: it displays one call at a time, so
+ * there is no column for a check to clutter.)
+ */
+export function TraceStatusSlot({ status }: { status?: string }) {
+	if (!hasToolRowStatusMark(status)) return null;
+	const resolved = status as string;
+	return (
+		<Box
+			data-testid="trace-row-status-slot"
+			c={STATUS_COLORS[resolved] ?? "gray"}
+			style={TRACE_STATUS_SLOT_STYLE}
+		>
+			<StatusIcon status={resolved} />
 		</Box>
 	);
 }
@@ -175,7 +260,7 @@ const TraceRow = memo(function TraceRow({
 	const titleRow = (
 		<Group
 			data-testid="collapsible-trace-row"
-			gap={6}
+			gap={TRACE_ROW_GAP}
 			wrap="nowrap"
 			align="center"
 			py={1}
@@ -194,22 +279,31 @@ const TraceRow = memo(function TraceRow({
 						<IconChevronRight size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
 					)
 				) : (
-					<Text span size="xs" c="dimmed" style={{ opacity: 0.5, lineHeight: 1, fontSize: 10 }}>
-						•
-					</Text>
+					<TraceRowDot />
 				)}
 			</TraceChevronSlot>
 			<TraceIconSlot icon={item.icon} color={item.iconColor} />
+			{/* `flex: 0 1 auto` (not `flex: 1`) is what lets the status + duration HUG the
+			    title. Right-aligning them meant the reader had to trace a far-right number
+			    back across the gap to find its own row. */}
 			<Text
 				data-trace-title
 				size="xs"
 				c="dimmed"
 				truncate
 				className={item.shimmer ? "reasoning-step-shimmer" : undefined}
-				style={{ flex: 1, minWidth: 0, lineHeight: TRACE_ROW_LINE_HEIGHT }}
+				style={{ flex: "0 1 auto", minWidth: 0, lineHeight: TRACE_ROW_LINE_HEIGHT }}
 			>
 				{item.title || "…"}
 			</Text>
+			{/* Outcome + duration, adjacent to the label. Both are fixed-height cells
+			    inside the row's existing 18px reservation (the glyph in a sized flex slot,
+			    the timing a single nowrap line with a portaled popover), so adding them
+			    does not move the row. Rows without a lifecycle pass neither. */}
+			<TraceStatusSlot status={item.status} />
+			{item.trailing}
+			{/* Absorbs the remaining width so the cells above stay left-packed. */}
+			<Box style={{ flex: 1, minWidth: 0 }} />
 		</Group>
 	);
 

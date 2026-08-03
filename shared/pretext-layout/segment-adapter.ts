@@ -39,6 +39,7 @@ import {
 } from "./reflection";
 import { classifyToolDetail, isTruncated } from "./tool-detail";
 import { collectTruncatedLeaves, hasTruncatedLeaf, readLeafText } from "./tool-io-projection";
+import { resolveTurnUsageLines, type TurnUsageJson, type UsageNumberFormatter } from "./turn-usage";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Minimal structural mirrors of the app types (avoid importing app modules here
@@ -137,6 +138,14 @@ export interface AdapterMessage {
 	origin?: string | null;
 	/** Display-only source label (`sourceKey` or `sourceKey:detail`). */
 	originLabel?: string | null;
+	/**
+	 * Per-turn usage accounting, surfaced as measured text rows around an assistant
+	 * message when the reader enabled `showTokenUsage`. See `./turn-usage.ts`.
+	 */
+	turnUsageJson?: TurnUsageJson | null;
+	tokensIn?: number | null;
+	costUsd?: number | null;
+	meterUsage?: number | null;
 }
 
 /** A tool-run item (structural subset of message-segments ToolRunItem).
@@ -345,10 +354,20 @@ interface AdapterTraceItem {
 	/** Resolved header summary (kept for parity/debugging; height-neutral). */
 	summary?: string;
 	/**
-	 * Raw tool status. Height-neutral, but part of the measure cache's
-	 * `traceRevision` so a status transition on a folded row re-keys the trace.
+	 * Raw tool status. Height-neutral (a fixed 12px glyph slot inside the row's
+	 * existing content lane), and part of the measure cache's `traceRevision` so a
+	 * status transition on a folded row re-keys the trace.
 	 */
 	status?: string | null;
+	/**
+	 * Lifecycle stamps for the row's timing slot (elapsed while running, final
+	 * duration once finished, plus the portaled breakdown popover).
+	 *
+	 * Height-neutral for the same reason the tool card's header timing is: the text
+	 * is a single truncation-free span in the row's fixed-height flex line and the
+	 * popover is portaled.
+	 */
+	timing?: Record<string, number>;
 	/** Selection / menu coordinates (renderer only, height-neutral). */
 	identity?: AdapterTraceRowIdentity;
 	/**
@@ -467,6 +486,17 @@ export interface AdapterContext {
 	 */
 	resolveToolSummary?: (tc: AdapterToolItem["tc"]) => string;
 	/**
+	 * Label detail for ONE subagent recent-call row, from the tool name plus the
+	 * whitelisted short input keys the server projected (`inputSummary`).
+	 *
+	 * A separate resolver from `resolveToolSummary` because these rows never carry a
+	 * tool call: the activity query deliberately does not select `input_json` (it can
+	 * hold a whole file), so all the row has is the projection. The shell injects the
+	 * same formatter the chunked row uses, so the two cannot word one call
+	 * differently. Height-neutral: the row title is a single truncating line.
+	 */
+	resolveSubagentRecentSummary?: (toolName: string, inputSummary: unknown) => string | null;
+	/**
 	 * True when a tool/subagent item currently has a pending permission request
 	 * (injected by the shell from the live WS permission list). Forces the card
 	 * expanded (lodExempt) so its permission form area is visible. The form itself
@@ -511,6 +541,23 @@ export interface AdapterContext {
 	 * makes the new text observable.
 	 */
 	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
+	/**
+	 * Reader enabled "show token usage per turn". When false (the default) NO
+	 * turn-usage spec is emitted at all, so the item list — and therefore every
+	 * measurement cache key — is byte-identical to a build without the feature.
+	 * That is why this is a plain boolean rather than a revision folded into the
+	 * cache key: toggling it changes the item COUNT, which already invalidates the
+	 * layout.
+	 */
+	showTokenUsage?: boolean;
+	/**
+	 * Viewport is phone-sized, which SPLITS the trailing usage summary across two
+	 * lines (the chunked path does this with CSS breakpoints, which a zero-DOM
+	 * height model cannot observe — so the decision is an explicit measure input).
+	 */
+	compactUsageLines?: boolean;
+	/** Locale-aware number grouping for the usage lines; defaults to `String`. */
+	formatUsageNumber?: UsageNumberFormatter;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -832,6 +879,16 @@ function adaptMessage(
 	// assistant messages: dispatch each visible block, merging adjacent reasoning
 	// blocks into the same run as MessageBubble/ReasoningStepsTrace does.
 	const streaming = msg.id === "__streaming__";
+	// Per-turn usage rows bracket the body (see appendTurnUsageSpecs). Resolved up
+	// front so the leading row can be pushed before the first block.
+	const usageLines = resolveAdapterTurnUsage(msg, ctx);
+	if (usageLines?.leading) {
+		specs.push({
+			kind: "turn-usage",
+			key: `${idBase}-usage-leading`,
+			data: { placement: "leading", text: usageLines.leading },
+		});
+	}
 	const parseReasoning = ctx.resolveReasoningSegments ?? parseReasoningSegments;
 	for (let position = 0; position < indices.length; position++) {
 		const bi = indices[position];
@@ -901,7 +958,37 @@ function adaptMessage(
 				break;
 		}
 	}
+	if (usageLines?.trailing) {
+		specs.push({
+			kind: "turn-usage",
+			key: `${idBase}-usage-trailing`,
+			data: {
+				placement: "trailing",
+				text: usageLines.trailing,
+				...(usageLines.trailingSecondary ? { secondaryText: usageLines.trailingSecondary } : {}),
+			},
+		});
+	}
 	return specs;
+}
+
+/**
+ * Resolve the per-turn usage lines for a message, or null when none should be
+ * drawn.
+ *
+ * Gated on the reader's preference FIRST so a disabled toggle costs nothing and,
+ * more importantly, emits no specs — keeping the item list identical to a build
+ * without the feature. The streaming placeholder is excluded because its usage
+ * is not accounted until the turn is persisted; letting a row appear mid-stream
+ * would grow the live tail for a reason unrelated to the arriving text.
+ */
+function resolveAdapterTurnUsage(msg: AdapterMessage, ctx: AdapterContext) {
+	if (!ctx.showTokenUsage) return null;
+	if (msg.id === "__streaming__") return null;
+	return resolveTurnUsageLines(msg, {
+		mobile: ctx.compactUsageLines,
+		formatNumber: ctx.formatUsageNumber,
+	});
 }
 
 /**
@@ -1586,6 +1673,22 @@ function adaptToolItemFull(
 			...(typeof call.status === "string" ? { status: call.status } : {}),
 			...recentCallTiming(call),
 		}));
+		// Row label detail + category chip. These rows are TRACE rows now, and a trace
+		// row says `Tool · summary` with a tinted category chip — the vlist copy used to
+		// show the bare tool name in a grey box, so the same child call read differently
+		// here than in the chunked card. Both are render-only (one truncating line, one
+		// fixed 14px chip slot).
+		//
+		// The summary comes from the header's `inputSummary` — the whitelisted short
+		// keys the server projects INSIDE SQLite — through a resolver the shell injects
+		// (the pure adapter has no access to `getSummary`).
+		const recentCallSummaries = namedRecentCalls.map(
+			(call) =>
+				ctx.resolveSubagentRecentSummary?.(call.toolName as string, call.inputSummary) ?? null,
+		);
+		const recentCallCategories = namedRecentCalls.map(
+			(call) => ctx.resolveToolCategory?.(call.toolName as string) ?? null,
+		);
 		const resultText = typeof item.tc.outputJson === "string" ? item.tc.outputJson : undefined;
 		const isActive = !isTerminalStatus(item.tc.status);
 		// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
@@ -1645,6 +1748,8 @@ function adaptToolItemFull(
 				isBackground,
 				recentCallCount: recentCallNames.length,
 				recentCallNames,
+				recentCallSummaries,
+				recentCallCategories,
 				// Mirrors SubagentCard: the recent-calls header offers "open full
 				// session" only once the activity summary knows the child narrator.
 				// Height-bearing (compact-xs button row > plain xs text row).
@@ -2047,6 +2152,9 @@ function toolTraceItem(
 		key: toolItemKey(item),
 		summary,
 		status: item.tc.status ?? null,
+		// Same stamp record a subagent card's header uses, so a folded row shows the
+		// SAME duration the full card would at a higher LOD. Height-neutral.
+		timing: cardTiming(item.tc),
 		identity: toolRowIdentity(item),
 		// Same value the standalone card carries, so the two renderings of this tool
 		// are pairable across an LOD change (see AdapterTraceItem.unitId).

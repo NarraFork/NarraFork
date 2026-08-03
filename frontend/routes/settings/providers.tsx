@@ -18,6 +18,7 @@ import {
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { getModelDefaultContextWindow } from "../../components/providers/model-context-defaults";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
+import { PluginProviderSection } from "../../components/providers/PluginProviderSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
 import {
 	type AddProviderType,
@@ -477,6 +478,7 @@ function SettingsProvidersPage() {
 		clineByProvider,
 		geminiByProvider,
 		nugByProvider,
+		pluginProviderGroups,
 	} = useAllModels();
 
 	const providerModelsMap = useMemo(() => {
@@ -597,6 +599,16 @@ function SettingsProvidersPage() {
 	// ── Build provider groups for overview ──
 	const providerGroups = useMemo(() => {
 		const byPrefix = new Map<string, ModelOption[]>();
+		// Executable-plugin providers, keyed by prefix. They are presented like platform
+		// providers (single instance, not user-addable) but need their own lookup because
+		// the detail area has to reach the owning plugin rather than a builtin section.
+		const pluginByPrefix = new Map<string, { pluginId?: string; contributionId?: string }>();
+		for (const group of pluginProviderGroups ?? []) {
+			pluginByPrefix.set(group.prefix, {
+				...(group.pluginId ? { pluginId: group.pluginId } : {}),
+				...(group.contributionId ? { contributionId: group.contributionId } : {}),
+			});
+		}
 
 		const getBadgeLabel = (prefix: string): string | undefined => {
 			const customApiProvider = state.customApiProviders.find((p) => p.prefix === prefix);
@@ -639,14 +651,24 @@ function SettingsProvidersPage() {
 			if (prefix) addModel(prefix, m);
 		}
 
+		for (const group of pluginProviderGroups ?? []) {
+			for (const m of group.models) addModel(group.prefix, m);
+		}
+
 		// Ensure platform providers always present
 		for (const p of platformPrefixes) ensureEmpty(p);
+		// A freshly installed plugin has no model catalog until `listModels` runs, but the
+		// card must still appear or the provider looks like it failed to install.
+		for (const prefix of pluginByPrefix.keys()) ensureEmpty(prefix);
 		// Ensure multi-instance providers always present (even disabled)
 		for (const p of state.customApiProviders) ensureEmpty(p.prefix);
 		for (const p of state.nugProviders) ensureEmpty(p.prefix);
 
 		return [...byPrefix].map(([prefix, models]) => {
-			const isPlatform = platformPrefixes.has(prefix);
+			const plugin = pluginByPrefix.get(prefix);
+			// Plugin providers sit in the platform column: like the builtins they are single
+			// instance and cannot be added or removed from this page.
+			const isPlatform = platformPrefixes.has(prefix) || plugin !== undefined;
 
 			// Find provider config for multi-instance providers so local detail toggles
 			// (provider.disabled) and overview toggles (disabledProviders) agree immediately.
@@ -655,16 +677,26 @@ function SettingsProvidersPage() {
 					state.nugProviders.find((p) => p.prefix === prefix))
 				: undefined;
 			const providerId = match?.id;
+			// `disabledProviders` is a plain prefix set, so the overview toggle already
+			// governs plugin providers without any extra wiring. Turning one off hides its
+			// models; it deliberately does NOT stop the plugin, which may also contribute
+			// tools and views.
 			const disabled = state.disabledProviders.has(prefix) || !!match?.disabled;
 
 			return {
 				prefix,
 				providerId,
 				label: providerLabels[prefix] ?? prefix,
-				badgeLabel: isPlatform ? undefined : getBadgeLabel(prefix),
+				badgeLabel: plugin
+					? t("providerBadgePlugin")
+					: isPlatform
+						? undefined
+						: getBadgeLabel(prefix),
 				models,
 				disabled,
 				isPlatform,
+				...(plugin?.pluginId ? { pluginId: plugin.pluginId } : {}),
+				...(plugin?.contributionId ? { contributionId: plugin.contributionId } : {}),
 			};
 		});
 	}, [
@@ -674,6 +706,7 @@ function SettingsProvidersPage() {
 		clineByProvider,
 		geminiByProvider,
 		nugByProvider,
+		pluginProviderGroups,
 		state.customModels,
 		providerLabels,
 		state.disabledProviders,
@@ -683,9 +716,27 @@ function SettingsProvidersPage() {
 	]);
 
 	// ── Provider label for detail panel ──
+	/**
+	 * Owning plugin for the selected provider, or undefined for builtins.
+	 *
+	 * A plugin provider is addressed by its prefix (it is single-instance, like the
+	 * builtins), so this is a prefix lookup against the groups built above.
+	 */
+	const selectedPluginProvider = useMemo(() => {
+		if (!selectedProvider) return undefined;
+		const group = providerGroups.find((item) => item.prefix === selectedProvider);
+		if (!group?.pluginId || !group.contributionId) return undefined;
+		return { pluginId: group.pluginId, contributionId: group.contributionId };
+	}, [selectedProvider, providerGroups]);
+
 	const selectedProviderLabel = useMemo(() => {
 		if (!selectedProvider) return "";
 		// Platform providers: selectedProvider is the prefix
+			return providerLabels[selectedProvider] ?? selectedProvider;
+		}
+		// Plugin providers are also addressed by prefix; without this they would fall
+		// through to the multi-instance lookup and render with an empty title.
+		if (selectedPluginProvider) {
 			return providerLabels[selectedProvider] ?? selectedProvider;
 		}
 		// Multi-instance providers: selectedProvider is the provider ID
@@ -694,7 +745,13 @@ function SettingsProvidersPage() {
 			state.nugProviders.find((p) => p.id === selectedProvider);
 		if (p?.prefix) return providerLabels[p.prefix] ?? p.prefix;
 		return p?.name ?? "";
-	}, [selectedProvider, state.customApiProviders, state.nugProviders, providerLabels]);
+	}, [
+		selectedProvider,
+		selectedPluginProvider,
+		state.customApiProviders,
+		state.nugProviders,
+		providerLabels,
+	]);
 
 	// ── Auto-fetch models + fill default context windows after a manual save ──
 	// Triggered by handleSave (only when a provider is being edited). Refreshes the
@@ -801,6 +858,7 @@ function SettingsProvidersPage() {
 				>
 					<ProviderSectionContent
 						providerKey={selectedProvider}
+						pluginProvider={selectedPluginProvider}
 						settings={settings}
 						state={state}
 						dispatchers={dispatchers}
@@ -923,6 +981,12 @@ function SettingsProvidersPage() {
 
 interface ProviderSectionContentProps {
 	providerKey: string;
+	/**
+	 * Owning plugin when the selected provider comes from a plugin. Matched by prefix in
+	 * `providerGroups`, because `providerKey` for a plugin provider IS its prefix (plugin
+	 * providers are single-instance, like the builtins).
+	 */
+	pluginProvider?: { pluginId: string; contributionId: string };
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic settings JSON
 	settings: any;
 	state: ProvidersState;
@@ -944,6 +1008,7 @@ interface ProviderSectionContentProps {
 
 function ProviderSectionContent({
 	providerKey,
+	pluginProvider,
 	settings,
 	state,
 	dispatchers,
@@ -999,6 +1064,18 @@ function ProviderSectionContent({
 				onContextWindowChange={dispatchers.handleContextWindowChange}
 				onMergeContextWindows={onServerContextWindowsMerge}
 				onTestModel={onTestModel}
+			/>
+		);
+	}
+
+	// Plugin providers: the plugin either ships its own `provider-settings` view or falls
+	// back to the host's schema-driven form. Checked before the multi-instance lookups
+	// because a plugin prefix can never be a custom-API or NUG provider id.
+	if (pluginProvider) {
+		return (
+			<PluginProviderSection
+				pluginId={pluginProvider.pluginId}
+				contributionId={pluginProvider.contributionId}
 			/>
 		);
 	}

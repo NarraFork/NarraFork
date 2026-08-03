@@ -36,6 +36,43 @@ export function shouldClearEditDraft(result: unknown): result is true {
 }
 
 /**
+ * Read the download filename out of a `Content-Disposition` header.
+ *
+ * `filename*` (RFC 5987) wins when present because it carries the real, possibly
+ * non-ASCII title; the quoted `filename` is the ASCII fallback. Returns null when
+ * the header is absent or unparseable, leaving the caller to name the file.
+ *
+ * Any path separators in the result are dropped: the value comes from a server
+ * response and is about to become a download name, so it must not be able to
+ * express a path.
+ */
+export function parseContentDispositionFileName(header: string | null): string | null {
+	if (!header) return null;
+
+	const extended = header.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+	if (extended?.[1]) {
+		try {
+			const decoded = decodeURIComponent(extended[1].trim());
+			const safe = sanitizeDownloadName(decoded);
+			if (safe) return safe;
+		} catch {
+			// Malformed percent-encoding: fall through to the plain filename.
+		}
+	}
+
+	const plain =
+		header.match(/filename\s*=\s*"([^"]*)"/i) ?? header.match(/filename\s*=\s*([^;]+)/i);
+	if (plain?.[1]) return sanitizeDownloadName(plain[1].trim());
+	return null;
+}
+
+function sanitizeDownloadName(value: string): string | null {
+	const base = value.replace(/\\/g, "/").split("/").pop()?.trim() ?? "";
+	if (!base || base === "." || base === "..") return null;
+	return base;
+}
+
+/**
  * How wide a file rollback reaches. `narrator` undoes only this narrator's own
  * changes; `workspace` restores every file in the window.
  */
@@ -80,6 +117,23 @@ export interface RevertPreviewFileWithContent extends RevertPreviewFile {
 }
 
 /**
+ * What deleting a single tool_use block would roll back.
+ *
+ * Narrower than {@link RevertScopePreviews}: a block is one recorded call, so there
+ * is no scope to choose between. `available: false` means the change cannot be
+ * reversed precisely (no recorded boundary, a remote workspace) and deletion falls
+ * back to replaying tool inputs, which cannot see what Bash or an editor wrote.
+ */
+export interface BlockDeletePreview {
+	available: boolean;
+	reason?: ScopedRevertUnavailableReason | "not_a_tool_use";
+	files: RevertPreviewFileWithContent[];
+	/** Paths another actor changed in the same regions; deletion would be refused. */
+	conflicts: string[];
+	subagentWarning?: { changeCount: number; sampleFiles: string[] };
+}
+
+/**
  * Both rollback scopes for one window, so the dialog can compare them.
  *
  * Optional because a workspace without tree snapshots (pre-snapshot history, a
@@ -114,6 +168,15 @@ export interface NarratorExecutionDevice {
 	online: boolean;
 	platform?: { os: string; arch: string; shellPath?: string };
 	defaultCwd?: string | null;
+}
+
+/** One level of a remote device's directory tree, in that device's path syntax. */
+export interface RemoteDirectoryListing {
+	path: string;
+	entries: Array<{ name: string; path: string; isDirectory: boolean }>;
+	parent: string | null;
+	sep: string;
+	truncated: boolean;
 }
 
 export interface PermissionDecisionPayload {
@@ -335,7 +398,7 @@ export const narratorsApi = {
 		permissionMode?: string;
 		startInPlanMode?: boolean;
 		reasoningEffort?: string | null;
-		fastMode?: boolean;
+		fastModeOverride?: "inherit" | "on" | "off";
 		relaxedPlan?: boolean;
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
@@ -416,6 +479,39 @@ export const narratorsApi = {
 		const params = new URLSearchParams({ q });
 		if (limit != null) params.set("limit", String(limit));
 		return request<NarratorMessageSearchResponse>(`/narrators/${id}/search?${params.toString()}`);
+	},
+	/**
+	 * Download the transcript as Markdown or JSON.
+	 *
+	 * Returns a Blob plus the server-proposed filename rather than going through
+	 * `request`, which assumes a JSON body. The response is streamed by the server,
+	 * so the browser can start writing to disk before the export finishes.
+	 */
+	exportNarratorMessages: async (
+		id: string,
+		opts: {
+			format: "markdown" | "json";
+			scope: "full" | "visible";
+			includeToolIO: boolean;
+			lang: string;
+		},
+	) => {
+		const params = new URLSearchParams({
+			format: opts.format,
+			scope: opts.scope,
+			includeToolIO: String(opts.includeToolIO),
+			// The server only localizes Markdown labels for the languages it knows.
+			lang: opts.lang === "zh-CN" ? "zh-CN" : "en",
+		});
+		const res = await authorizedFetch(`${BASE}/narrators/${id}/export?${params.toString()}`);
+		if (!res.ok) {
+			const error = await readFetchError(res, "Export failed");
+			throw new ApiError(error.message, res.status, error.data);
+		}
+		return {
+			blob: await res.blob(),
+			fileName: parseContentDispositionFileName(res.headers.get("content-disposition")),
+		};
 	},
 	getToolCallDetail: (narratorId: string, toolUseId: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),
@@ -661,6 +757,21 @@ export const narratorsApi = {
 		request<{ defaultDeviceId: string | null; devices: NarratorExecutionDevice[] }>(
 			`/narrators/${id}/execution-devices`,
 		),
+	/**
+	 * Browse one level of a device's filesystem through a narrator's device
+	 * authorization, so non-admin users can use the remote path picker.
+	 */
+	browseNarratorDevice: (
+		id: string,
+		deviceId: string,
+		path?: string,
+		opts?: { showHidden?: boolean },
+	) => {
+		const params = new URLSearchParams({ deviceId });
+		if (path) params.set("path", path);
+		if (opts?.showHidden) params.set("showHidden", "1");
+		return request<RemoteDirectoryListing>(`/narrators/${id}/device-browse?${params}`);
+	},
 	updateNarratorDefaultDevice: (id: string, deviceId: string | null) =>
 		request<{ defaultDeviceId: string | null }>(`/narrators/${id}/default-device`, {
 			method: "PATCH",
@@ -774,11 +885,14 @@ export const narratorsApi = {
 			method: "PATCH",
 			body: JSON.stringify({ reasoningEffort }),
 		}),
-	updateNarratorFastMode: (id: string, fastMode: boolean) =>
-		request<{ ok: boolean }>(`/narrators/${id}/fast-mode`, {
-			method: "PATCH",
-			body: JSON.stringify({ fastMode }),
-		}),
+	updateNarratorFastMode: (id: string, fastModeOverride: "inherit" | "on" | "off") =>
+		request<{ ok: boolean; fastModeOverride: "inherit" | "on" | "off"; fastMode: boolean }>(
+			`/narrators/${id}/fast-mode`,
+			{
+				method: "PATCH",
+				body: JSON.stringify({ fastModeOverride }),
+			},
+		),
 	updateNarratorRelaxedPlan: (id: string, relaxedPlan: boolean) =>
 		request<{ ok: boolean; relaxedPlan: boolean }>(`/narrators/${id}/relaxed-plan`, {
 			method: "PATCH",
@@ -1050,18 +1164,30 @@ export const narratorsApi = {
 				method: "DELETE",
 			},
 		),
+	/** What deleting one tool_use block would roll back, for the confirm dialog. */
+	blockDeletePreview: (narratorId: string, messageId: string, blockIndex: number) =>
+		request<BlockDeletePreview>(
+			`/narrators/${narratorId}/block-delete-preview?messageId=${encodeURIComponent(
+				messageId,
+			)}&blockIndex=${blockIndex}`,
+		),
 	deleteMessageBlock: (
 		narratorId: string,
 		messageId: string,
 		blockIndex: number,
-		opts?: { skipRevert?: boolean },
-	) =>
-		request<{ ok: boolean; messageDeleted: boolean }>(
+		opts?: { skipRevert?: boolean; scope?: RevertScope },
+	) => {
+		const params = new URLSearchParams();
+		if (opts?.skipRevert) params.set("skipRevert", "1");
+		if (opts?.scope) params.set("scope", opts.scope);
+		const query = params.toString();
+		return request<{ ok: boolean; messageDeleted: boolean }>(
 			`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}${
-				opts?.skipRevert ? "?skipRevert=1" : ""
+				query ? `?${query}` : ""
 			}`,
 			{ method: "DELETE" },
-		),
+		);
+	},
 	deleteMessageBlocks: (
 		narratorId: string,
 		blocks: Array<{ messageId: string; blockIndex: number }>,

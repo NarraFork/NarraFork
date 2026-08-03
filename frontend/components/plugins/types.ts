@@ -3,6 +3,20 @@ import type { PluginUiHostLocalRouterOptions, PluginUiPanelDelegate } from "./ho
 import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
 import type { JsonValue, PluginDockPanelParams, UiRpcNotification, UiRpcRequest } from "./protocol";
 
+/**
+ * Surfaces a plugin view may declare.
+ *
+ * Defined once and reused: the same list previously appeared inline in half a dozen
+ * places, so adding a surface meant finding every copy. Mirrors the manifest enum in
+ * `server/lib/plugins/manifest.ts`.
+ */
+export type PluginViewSurface =
+	| "workspace"
+	| "director"
+	| "focus"
+	| "settings"
+	| "provider-settings";
+
 export type PluginUiStatus =
 	| "available"
 	| "missing"
@@ -32,7 +46,7 @@ export interface PluginUiContribution {
 	stylePath?: string;
 	scope?: "workspace" | "narrator" | "project" | "global";
 	/** Surfaces this view may mount on; the session route re-checks them server-side. */
-	surfaces?: Array<"workspace" | "director" | "focus" | "settings">;
+	surfaces?: PluginViewSurface[];
 	status?: PluginUiStatus;
 	unavailableReason?: string;
 }
@@ -54,7 +68,7 @@ export interface PluginContributionIdentity {
 export interface PluginContributionRecord extends PluginContributionIdentity {
 	scope?: "workspace" | "narrator" | "project" | "global";
 	/** Surfaces this view may mount on; used to filter per-surface, never to authorize. */
-	surfaces?: Array<"workspace" | "director" | "focus" | "settings">;
+	surfaces?: PluginViewSurface[];
 	title: string;
 	pluginName?: string;
 	availability: PluginContributionAvailability;
@@ -90,7 +104,7 @@ export interface PluginUiContext {
 	};
 	plugin: { id: string; version: string; contributionId: string; panelInstanceId: string };
 	surface: {
-		kind: "narrator-focus" | "workspace" | "director" | "settings";
+		kind: "narrator-focus" | "workspace" | "director" | "settings" | "provider-settings";
 		active: boolean;
 		visible: boolean;
 	};

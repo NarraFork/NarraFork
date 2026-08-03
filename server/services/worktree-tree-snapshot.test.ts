@@ -334,6 +334,26 @@ describe("planTreeRevertSegments", () => {
 		expect(planTreeRevertSegments([])).toEqual([]);
 	});
 
+	test("a duplicate pair does not chain, so it costs an extra segment", () => {
+		// Why `selectPairs` dedupes. The same boundary recorded twice (a cloned
+		// tool-call row) cannot collapse, because chaining requires `after === before`
+		// and here they differ. Each copy becomes its own segment, so a rollback pays
+		// one extra `merge-tree` per duplicate.
+		//
+		// Note this is a cost concern, not a correctness one: reversing the same
+		// boundary again is `merge(base=after, ours=before, theirs=before)`, which
+		// yields `before` unchanged.
+		expect(
+			planTreeRevertSegments([
+				{ before: "a", after: "b" },
+				{ before: "a", after: "b" },
+			]),
+		).toEqual([
+			{ before: "a", after: "b" },
+			{ before: "a", after: "b" },
+		]);
+	});
+
 	test("does not mutate the caller's pairs", () => {
 		const pairs = [
 			{ before: "a", after: "b" },
