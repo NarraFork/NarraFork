@@ -1,4 +1,5 @@
 import { Group, Text, ThemeIcon } from "@mantine/core";
+import { getReflectionSuggestion } from "@shared/pretext-layout/reflection";
 import { IconTool } from "@tabler/icons-react";
 import { memo } from "react";
 import { useTranslation } from "react-i18next";
@@ -33,6 +34,17 @@ function displaySummary(item: ToolRunItem): string {
 function isToolActive(item: ToolRunItem): boolean {
 	const s = item.tc.status;
 	return s === "running" || s === "pending" || s === "initializing";
+}
+
+/**
+ * A tool's reflection-gate status, or undefined when it has no gate. Only the status
+ * is needed (it picks the row's shimmer colour), so this does not build the whole
+ * notice a card does — a fold can hold hundreds of rows.
+ */
+function reflectionStatusOfToolCall(tc: ToolRunItem["tc"]): string | undefined {
+	const suggestions = tc.permissionSuggestions;
+	if (!Array.isArray(suggestions)) return undefined;
+	return getReflectionSuggestion(suggestions)?.status;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +90,9 @@ export const ToolRunSummary = memo(function ToolRunSummary({
 				// The tc-/sa- prefix must match the selection entry's PRIMARY id, whose
 				// rule is narrower than ToolRunItem.isSubagent — see isSelectionSubagentTool.
 				const messageId = item.msg?.id;
+				// Resolved ONCE: it walks `permissionSuggestions`, and a fold can hold
+				// hundreds of rows (matching ActivityTrace's `reflectionStatusOf` call).
+				const reflectionStatus = reflectionStatusOfToolCall(item.tc);
 				const identity =
 					messageId && messageId !== "__streaming__"
 						? (toolTraceRowIdentity(
@@ -104,6 +119,9 @@ export const ToolRunSummary = memo(function ToolRunSummary({
 					// Outcome + duration, matching the activity fold and the subagent card's
 					// recent-call rows. Height-neutral (see CollapsibleTrace's row).
 					status: item.tc.status,
+					// A gate parks its tool at `pending`, which otherwise reads as "waiting on
+					// the user". Supplying the gate's status keeps a deliberating row purple.
+					...(reflectionStatus ? { reflectionStatus } : {}),
 					trailing: <ToolTimingArea toolCall={item.tc} isActive={isToolActive(item)} />,
 					identity,
 					actions,
@@ -118,6 +136,14 @@ export const ToolRunSummary = memo(function ToolRunSummary({
 			showEarlierLabel={(n) => t("reasoningShowEarlier", { count: n })}
 			hideEarlierLabel={t("reasoningHideEarlier")}
 			rowContext={rowContext}
+			// Names the five colour-only shimmer states (see CollapsibleTrace).
+			shimmerStateLabels={{
+				streaming: t("traceRowState.streaming"),
+				reflecting: t("traceRowState.reflecting"),
+				running: t("traceRowState.running"),
+				success: t("traceRowState.success"),
+				failed: t("traceRowState.failed"),
+			}}
 		/>
 	);
 });

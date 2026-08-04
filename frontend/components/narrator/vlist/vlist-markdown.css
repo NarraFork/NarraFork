@@ -49,6 +49,14 @@
 	--vlist-diff-removed-bg: var(--mantine-color-red-light);
 	--vlist-diff-added-word-bg: var(--mantine-color-green-light-hover);
 	--vlist-diff-removed-word-bg: var(--mantine-color-red-light-hover);
+	/* Table chrome. Mirrors Mantine Table's own dark-scheme custom properties
+	   (--table-border-color / --table-striped-color / --table-hover-color) so a
+	   pretext-drawn table is indistinguishable from the chunked <Table> path.
+	   Colours never affect geometry. */
+	--vlist-table-border: var(--mantine-color-dark-4);
+	--vlist-table-striped-bg: var(--mantine-color-dark-6);
+	--vlist-table-hover-bg: var(--mantine-color-dark-5);
+	--vlist-table-header-bg: transparent;
 }
 :root[data-mantine-color-scheme="light"] {
 	--vlist-quote-bg: rgba(76, 110, 245, 0.07);
@@ -70,6 +78,32 @@
 	--vlist-diff-removed-bg: rgba(255, 99, 71, 0.13);
 	--vlist-diff-added-word-bg: rgba(46, 160, 67, 0.25);
 	--vlist-diff-removed-word-bg: rgba(255, 99, 71, 0.25);
+	/* Mantine Table's light-scheme custom properties. */
+	--vlist-table-border: var(--mantine-color-gray-3);
+	--vlist-table-striped-bg: var(--mantine-color-gray-0);
+	--vlist-table-hover-bg: var(--mantine-color-gray-1);
+	--vlist-table-header-bg: transparent;
+}
+
+/* Table row backgrounds (chunked path's `striped` + `highlightOnHover`).
+   Colours only — the row box is already reserved by the height model, so these
+   rules are geometry-neutral. Header rows are excluded from both, matching
+   Mantine's striping of tbody alone. */
+.vlist-table-row[data-vlist-table-row="header"] {
+	background: var(--vlist-table-header-bg);
+}
+.vlist-table-row[data-vlist-table-row="body"][data-striped] {
+	background: var(--vlist-table-striped-bg);
+}
+
+/* Hover is gated on a hover-capable pointer for the same reason Mantine gates
+   it: on touch the rule would latch after a tap and never clear. It follows the
+   striping rules in source order and matches at equal-or-higher specificity, so
+   it wins the cascade without !important. */
+@media (hover: hover) {
+	.vlist-table-row[data-vlist-table-row="body"]:hover {
+		background: var(--vlist-table-hover-bg);
+	}
 }
 
 /* Base fragment: measure paints size via `font:`; keep line-box neutral. */
@@ -229,104 +263,16 @@
 	animation: vlist-spin 1s linear infinite;
 }
 
-/* Tool-card sweep shimmer (StatusIcon / card-state parity with ToolCallCard).
-   The chunk-mode `tool-*-shimmer` keyframes are injected by ToolCallCard
-   (outside vlist), so the vlist path defines its own scoped copies — the
-   `vlist-` prefix avoids any collision when both paths coexist. Each uses an
-   `::after` overlay with `overflow: hidden`, so the sweep never changes the
-   element box height (preserves the zero-DOM exact-measure contract). */
+/* ── Tool-card / trace-row shimmer: NOT here ──────────────────────────────────
+   The card sweep (`nf-card-shimmer--*`) and the compact-row text shimmer
+   (`nf-trace-shimmer--*`) live in `frontend/styles/card-shimmer.css` and
+   `trace-shimmer.css`, loaded globally by main.tsx, and are selected through
+   CARD_SHIMMER_CLASS / TRACE_SHIMMER_CLASS in `@shared/tool-shimmer`.
 
-/* Streaming input — a subtle neutral sweep. */
-@keyframes vlist-tool-shimmer {
-	to {
-		transform: translateX(100%);
-	}
-}
-.vlist-tool-card-shimmer {
-	position: relative;
-	overflow: hidden;
-}
-.vlist-tool-card-shimmer::after {
-	content: "";
-	position: absolute;
-	inset: 0;
-	transform: translateX(-100%);
-	background: linear-gradient(
-		90deg,
-		transparent 0%,
-		light-dark(rgba(0, 0, 0, 0.04), rgba(255, 255, 255, 0.04)) 40%,
-		light-dark(rgba(0, 0, 0, 0.07), rgba(255, 255, 255, 0.07)) 50%,
-		light-dark(rgba(0, 0, 0, 0.04), rgba(255, 255, 255, 0.04)) 60%,
-		transparent 100%
-	);
-	animation: vlist-tool-shimmer 2s ease-in-out infinite;
-	pointer-events: none;
-}
-
-/* Running — a blue sweep while the tool executes. */
-@keyframes vlist-tool-running-shimmer {
-	from {
-		transform: translateX(-100%);
-	}
-	to {
-		transform: translateX(100%);
-	}
-}
-.vlist-tool-running-shimmer {
-	position: relative;
-	overflow: hidden;
-}
-.vlist-tool-running-shimmer::after {
-	content: "";
-	position: absolute;
-	inset: 0;
-	transform: translateX(-100%);
-	background: linear-gradient(
-		90deg,
-		transparent 0%,
-		rgba(77, 171, 247, 0.06) 30%,
-		rgba(77, 171, 247, 0.13) 50%,
-		rgba(77, 171, 247, 0.06) 70%,
-		transparent 100%
-	);
-	animation: vlist-tool-running-shimmer 2s ease-in-out infinite;
-	pointer-events: none;
-}
-
-/* Done — a one-shot green sweep on the running → success transition. */
-@keyframes vlist-tool-done-shimmer {
-	from {
-		transform: translateX(100%);
-	}
-	to {
-		transform: translateX(-100%);
-	}
-}
-.vlist-tool-done-shimmer {
-	position: relative;
-	overflow: hidden;
-}
-.vlist-tool-done-shimmer::after {
-	content: "";
-	position: absolute;
-	inset: 0;
-	transform: translateX(100%);
-	background: linear-gradient(
-		90deg,
-		transparent 0%,
-		rgba(64, 192, 87, 0.06) 30%,
-		rgba(64, 192, 87, 0.13) 50%,
-		rgba(64, 192, 87, 0.06) 70%,
-		transparent 100%
-	);
-	animation: vlist-tool-done-shimmer 600ms ease-out forwards;
-	pointer-events: none;
-}
-
-@media (prefers-reduced-motion: reduce) {
-	.vlist-tool-card-shimmer::after,
-	.vlist-tool-running-shimmer::after,
-	.vlist-tool-done-shimmer::after {
-		animation: none;
-	}
-}
+   They are global rather than vlist-local on purpose: the chunk path paints the
+   same cards and rows, vlist may not import it, and the previous arrangement — a
+   private `vlist-tool-*-shimmer` copy here plus a runtime <style> in ToolCallCard —
+   is exactly how the two paths came to agree on neutral/blue/green while BOTH
+   lacked the purple (reflecting) and red (failed) states. Height-neutrality is
+   unchanged: the card sweep is an `inset: 0` overlay, the row shimmer only recolours
+   text. */

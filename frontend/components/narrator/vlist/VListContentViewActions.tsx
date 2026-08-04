@@ -137,7 +137,11 @@ export function VListContentViewActions({
 }: VListContentViewActionsProps) {
 	const { t } = useTranslation("common");
 	const { t: tNarrator } = useTranslation("narrator");
-	const isMarkdown = isMarkdownTarget(target);
+	// Offered only when the ROW can actually swap its body for the raw source.
+	// Flipping shell state that the row's renderer ignores would leave the reader
+	// clicking a lit-up button with nothing changing on screen — the toggle is not
+	// "always available for markdown", it is available where a renderer honours it.
+	const canShowSource = isMarkdownTarget(target) && target.sourceInline === true;
 	// A diff body has its own two-column gutter and always soft-wraps per row;
 	// offering a wrap toggle there would suggest a control the diff renderer's
 	// own `wordWrap` already owns via the modal.
@@ -172,7 +176,7 @@ export function VListContentViewActions({
 						</ActionIcon>
 					</Tooltip>
 				) : null}
-				{isMarkdown ? (
+				{canShowSource ? (
 					<Tooltip label={showSource ? t("rendered") : t("source")} withArrow position="top">
 						<ActionIcon
 							size={BUTTON_SIZE}

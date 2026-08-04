@@ -16,6 +16,11 @@
  *      CopyButton tree per fenced block;
  *   3. hovering NEVER changes the row's measured height (CONTRACT §0 iron law 2 —
  *      the overlay is absolute inside the already-reserved panel box).
+ *
+ * A fourth group covers a follow-up bug: when the fenced block LEADS the body it
+ * shares its top-right corner with the row's own hover action bar, which paints
+ * above block chrome by design — so the copy button was fully covered and the
+ * panel looked like it had none. It must step aside in that case, and only then.
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
@@ -208,6 +213,81 @@ describe("fenced code copy button (virtual list)", () => {
 		const view = await renderMarkdownBody(`\`\`\`js\n${CODE}\n\`\`\``, { interactive: false });
 		view.hover();
 		expect(copyOverlay(view.container)).toBeNull();
+		view.unmount();
+	});
+});
+
+/**
+ * The row's hover action bar (source / wrap / copy / fullscreen) parks at the
+ * BODY's top-right corner with `zIndex: 2`, deliberately above block-level chrome
+ * at `zIndex: 1`. A fenced panel pins its copy button to the same corner, so a
+ * body whose first block is a code block hid that button completely.
+ *
+ * The repair moves the button to the panel's BOTTOM-right corner. Not sideways:
+ * parking it beside the bar produced five grey icons in one strip, two of them
+ * copy glyphs with different scopes (this panel vs the whole message) — visually
+ * noisy and ambiguous about what would be copied.
+ *
+ * The move must be conditional. A panel that already clears the bar keeps the
+ * conventional corner, and a panel too short to separate the two corners paints
+ * no button at all (the bar's own copy button covers that spot anyway).
+ */
+describe("fenced code copy button vs the row action bar", () => {
+	const placement = (root: Element): string | null =>
+		copyOverlay(root)?.getAttribute("data-vlist-code-copy-placement") ?? null;
+
+	it("drops to the bottom corner when the code block leads the body", async () => {
+		const view = await renderMarkdownBody(`\`\`\`js\n${CODE}\n\`\`\``);
+		expect(placement(view.container)).toBe("bottom-right");
+		const overlay = copyOverlay(view.container) as unknown as HTMLElement;
+		// Anchored to the bottom edge, and no longer to the top one: leaving `top`
+		// set would pin the button to both and stretch the overlay down the panel.
+		// (linkedom reports an unset property as undefined, hence `toBeFalsy`.)
+		expect(overlay.style.bottom).toBe("4px");
+		expect(overlay.style.top).toBeFalsy();
+		expect(overlay.style.right).toBe("4px");
+		view.unmount();
+	});
+
+	it("keeps the top corner when prose precedes it (nothing to dodge)", async () => {
+		const view = await renderMarkdownBody(`Intro text\n\n\`\`\`js\n${CODE}\n\`\`\``);
+		// A leading paragraph pushes the panel a full text line down, past the bar.
+		expect(placement(view.container)).toBe("top-right");
+		const overlay = copyOverlay(view.container) as unknown as HTMLElement;
+		expect(overlay.style.top).toBe("4px");
+		expect(overlay.style.bottom).toBeFalsy();
+		view.unmount();
+	});
+
+	it("paints no button when the panel is too short to hold both corners apart", async () => {
+		// One unlabelled line: the bottom-right corner would still sit under the
+		// bar's own button, so a per-panel button there would be an unclickable
+		// duplicate. The row bar's copy button remains the way to copy.
+		const view = await renderMarkdownBody("```\nconst a = 1;\n```");
+		expect(copyOverlay(view.container)).toBeNull();
+		view.unmount();
+	});
+
+	it("moving corners never changes the measured height", async () => {
+		const view = await renderMarkdownBody(`\`\`\`js\n${CODE}\n\`\`\``);
+		const before = view.height;
+		const panelHeight = (view.panel as unknown as HTMLElement).style.height;
+		view.hover();
+		expect(placement(view.container)).toBe("bottom-right");
+		expect(view.height).toBe(before);
+		expect((view.panel as unknown as HTMLElement).style.height).toBe(panelHeight);
+		view.unmount();
+	});
+
+	it("later panels in the same body keep the conventional corner", async () => {
+		const view = await renderMarkdownBody(
+			`\`\`\`js\n${CODE}\n\`\`\`\n\nProse between.\n\n\`\`\`js\n${CODE}\n\`\`\``,
+		);
+		const overlays = [...view.container.querySelectorAll("[data-vlist-code-copy]")];
+		expect(overlays).toHaveLength(2);
+		// Only the leading panel collides with the bar.
+		expect(overlays[0]?.getAttribute("data-vlist-code-copy-placement")).toBe("bottom-right");
+		expect(overlays[1]?.getAttribute("data-vlist-code-copy-placement")).toBe("top-right");
 		view.unmount();
 	});
 });

@@ -28,20 +28,59 @@ const GLOBAL_KEYS = [
 	"Element",
 	"Node",
 	"getComputedStyle",
+	// linkedom's `window` is a proxy that forwards defineProperty onto globalThis, so
+	// the per-test `matchMedia` installed on `window` below lands here as well and has
+	// to be restored like any other global this file writes.
+	"matchMedia",
 	"IS_REACT_ACT_ENVIRONMENT",
 ] as const;
 
+/**
+ * globalThis descriptors as they were before this file touched anything.
+ *
+ * Snapshotted once at module load instead of per install: the three describe blocks
+ * each install their own DOM, so re-snapshotting would capture the previous round's
+ * linkedom objects as the "original" state and the restore chain would never return
+ * globalThis to its real baseline.
+ */
+const pristineDescriptors: ReadonlyMap<string, PropertyDescriptor | undefined> = new Map(
+	GLOBAL_KEYS.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
+);
+
+/**
+ * Put globalThis back the way this file found it.
+ *
+ * Data properties are rebuilt as writable+configurable rather than written back
+ * verbatim: a snapshot can itself hold a readonly descriptor (linkedom's window proxy
+ * plants those, and an earlier-loaded suite may leave one behind), and replaying it
+ * would keep the hazard alive for whoever loads next. Every later suite that does
+ * `Object.assign(globalThis, ...)` needs these to stay assignable. Accessors are
+ * restored as-is because forcing them into data properties would be the real damage.
+ */
+function restoreGlobals() {
+	for (const [key, descriptor] of pristineDescriptors) {
+		if (!descriptor) {
+			Reflect.deleteProperty(globalThis, key);
+			continue;
+		}
+		if (descriptor.get || descriptor.set) {
+			Object.defineProperty(globalThis, key, descriptor);
+			continue;
+		}
+		Object.defineProperty(globalThis, key, {
+			configurable: true,
+			writable: true,
+			enumerable: descriptor.enumerable,
+			value: descriptor.value,
+		});
+	}
+}
+
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
-let restoreGlobals: (() => void) | undefined;
 
 /** Install a fresh DOM whose `matchMedia` reports the requested pointer type. */
 function installIsolatedDom(finePointer: boolean) {
-	const descriptors = new Map<PropertyKey, PropertyDescriptor | undefined>();
-	for (const key of GLOBAL_KEYS) {
-		descriptors.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
-	}
-
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
 	const matchMedia = (query: string) => ({
 		matches: query.includes("pointer: fine") ? finePointer : false,
@@ -53,7 +92,14 @@ function installIsolatedDom(finePointer: boolean) {
 		removeEventListener() {},
 		dispatchEvent: () => false,
 	});
-	Object.defineProperty(window, "matchMedia", { configurable: true, value: matchMedia });
+	// `writable: true` matters: linkedom forwards this onto globalThis, and omitting it
+	// left a readonly global `matchMedia` behind that made `Object.assign(globalThis, …)`
+	// throw in every suite loaded after this file.
+	Object.defineProperty(window, "matchMedia", {
+		configurable: true,
+		writable: true,
+		value: matchMedia,
+	});
 
 	const globals = {
 		window,
@@ -65,18 +111,12 @@ function installIsolatedDom(finePointer: boolean) {
 		Element: window.Element,
 		Node: window.Node,
 		getComputedStyle: window.getComputedStyle?.bind(window) ?? (() => ({})),
+		matchMedia,
 		IS_REACT_ACT_ENVIRONMENT: true,
-	};
+	} satisfies Record<(typeof GLOBAL_KEYS)[number], unknown>;
 	for (const [key, value] of Object.entries(globals)) {
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
-
-	restoreGlobals = () => {
-		for (const [key, descriptor] of descriptors) {
-			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
-			else Reflect.deleteProperty(globalThis, key);
-		}
-	};
 }
 
 function mount() {
@@ -114,8 +154,34 @@ function bodyUserSelect() {
 	return document.body.style.userSelect ?? "";
 }
 
-/** Press on the toast and drag sideways far enough to pass useDrag's threshold. */
+/**
+ * Press on the toast and drag sideways far enough to pass useDrag's threshold.
+ *
+ * Both pointer events are dispatched inside ONE `act()` on purpose. `useDrag`
+ * keeps its gesture state in a ref that is reset by the ref-callback cleanup, so
+ * if React is allowed to flush a re-render between pointerdown and pointermove
+ * (which an `act()` boundary forces), the notification can remount and the move
+ * arrives on a gesture whose `isActive` was just cleared: the handler runs but
+ * returns early, `activateDrag()` never fires and `body.userSelect` stays empty.
+ * Whether that re-render lands depends on unrelated timer/microtask pressure in
+ * the process, which is why the split version passed alone and failed ~half the
+ * time in a full run. Keeping the gesture atomic removes the race window instead
+ * of weakening what the test asserts.
+ */
 async function dragAcross(toast: HTMLElement) {
+	// Let every pending render/effect settle FIRST, so the gesture starts against a
+	// notification whose refs have stopped churning. Mantine's NotificationContainer
+	// binds useDrag through `useMergedRef(ref, notificationRef, dragRef)`, and
+	// useMergedRef's useCallback depends on the raw `refs` array: any re-render that
+	// hands it a new `ref` identity detaches and re-attaches useDrag's ref callback,
+	// whose cleanup resets the gesture ref. If that lands between pointerdown and
+	// pointermove, the move handler runs but sees `isActive === false` and returns
+	// before activateDrag(), leaving body.userSelect empty. In a full-suite run there
+	// is enough timer/microtask pressure for that re-render to arrive mid-gesture,
+	// which is exactly why this test passed alone and failed in the whole suite.
+	await act(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	});
 	await act(async () => {
 		toast.dispatchEvent(pointerEvent("pointerdown", 0, 0));
 	});
@@ -130,8 +196,7 @@ afterEach(async () => {
 	container?.remove();
 	root = undefined;
 	container = undefined;
-	restoreGlobals?.();
-	restoreGlobals = undefined;
+	restoreGlobals();
 });
 
 describe("toast text selection with a mouse", () => {

@@ -383,6 +383,68 @@ describe("PretextLayoutCoordinator", () => {
 		expect(String(manifest.documentRevision).startsWith(`${page().messageVersion}`)).toBe(true);
 	});
 
+	/**
+	 * The FONT generation rides the document revision for the same reason the KaTeX
+	 * one does, one level broader: every prepared fragment carries a pixel width
+	 * baked against the then-available face, so a face swap invalidates heights on
+	 * math-free documents too. Without it here the measure cache would serve the
+	 * pre-swap heights while the DOM repaints with the new face.
+	 */
+	it("carries the font generation on the documentRevision too", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
+		const manifest = coordinator.getSnapshot().manifest;
+		if (!manifest) throw new Error("expected manifest");
+		expect(String(manifest.documentRevision)).toContain("~f:");
+	});
+
+	/**
+	 * The prepared cache had NO teardown hook in production — the only reference to
+	 * `resetPreparedMarkdownCache` was its own definition and its own test, while the
+	 * streaming cache next to it is released on narrator change. Each entry retains a
+	 * whole `PreparedBlock[]` (every pretext handle for that body), so switching
+	 * narrators accumulated the union of every document opened in the session.
+	 */
+	it("releases the prepared-block cache on reset (narrator switch / teardown)", async () => {
+		const { getPreparedMarkdownBlocks, preparedMarkdownCacheStats } = await import(
+			"@shared/pretext-layout/prepared-markdown-cache"
+		);
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
+		getPreparedMarkdownBlocks("# retained body\n\nsome prose", undefined, 0);
+		expect(preparedMarkdownCacheStats().size).toBeGreaterThan(0);
+
+		coordinator.reset();
+		expect(preparedMarkdownCacheStats().size).toBe(0);
+		expect(coordinator.getSnapshot().status).toBe("idle");
+	});
+
+	it("drops both caches and rebuilds when the font generation moves", async () => {
+		const { getPreparedMarkdownBlocks } = await import(
+			"@shared/pretext-layout/prepared-markdown-cache"
+		);
+		const { measureCache } = await import("./measure-cache");
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
+		const body = "# body\n\nprose";
+		const stalePrepared = getPreparedMarkdownBlocks(body, undefined, 0);
+		expect(getPreparedMarkdownBlocks(body, undefined, 0)).toBe(stalePrepared);
+		expect(measureCache.size).toBeGreaterThan(0);
+
+		expect(coordinator.invalidateFontDependentLayout()).toBe(true);
+		// The stale handles carry the OLD face's baked widths, so that exact array may
+		// never be served again. (Both caches are repopulated by the rebuild this
+		// triggers, so a size check would just observe the new generation's entries.)
+		expect(getPreparedMarkdownBlocks(body, undefined, 0)).not.toBe(stalePrepared);
+		expect(coordinator.getSnapshot().status).toBe("ready");
+		expect(coordinator.getSnapshot().index).toBeDefined();
+	});
+
+	it("no-ops the font invalidation before the first commit", () => {
+		const coordinator = new PretextLayoutCoordinator();
+		expect(coordinator.invalidateFontDependentLayout()).toBe(false);
+	});
+
 	it("clamps a non-bottom anchor when the anchored item becomes shorter", async () => {
 		const coordinator = new PretextLayoutCoordinator();
 		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });

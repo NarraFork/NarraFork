@@ -10,6 +10,12 @@ interface OffscreenCard {
 	worldY: number;
 	status: string;
 	narratorStatus: string | null;
+	/**
+	 * Narrator is parked until an unavailable model recovers. Such a card must not
+	 * raise a bubble: its status is `waiting`, but there is nothing for the user to
+	 * act on, and bubbles exist purely to surface offscreen attention.
+	 */
+	narratorModelUnavailable?: boolean;
 }
 
 interface OffscreenBubblesProps {
@@ -130,6 +136,8 @@ export const OffscreenBubbles = memo(function OffscreenBubbles({
 		for (const card of cards) {
 			const ns = card.narratorStatus;
 			if (!ns || !BUBBLE_NARRATOR_STATUSES.has(ns)) continue;
+			// `waiting` because a model is down is not an attention state.
+			if (card.narratorModelUnavailable) continue;
 
 			const sx = card.worldX * scale + panX;
 			const sy = card.worldY * scale + panY;

@@ -45,8 +45,16 @@ export type ReflectionDecision = "allow" | "deny" | "aborted" | (string & {});
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * `tool_started` → the card flips to running and gains its start timestamps.
- * Mirrors useNarratorChunksWS.ts:1433-1446.
+ * `tool_started` → the card gains its resolved input and start timestamps.
+ *
+ * ⚠️ Writes `initializing`, NOT `running`. This frame means the tool's INPUT finished
+ * parsing; the permission prompt, any reflection gate and the final admission wait all
+ * come after it. `toolExecutingPatch` below carries the actual "now running" fact.
+ *
+ * `status` is omitted entirely when a later phase may already have landed — see the
+ * `preserveStatus` option. Eager execution makes `tool_executing` arrive BEFORE this
+ * frame for most tools, so writing a status unconditionally would demote a tool that
+ * is demonstrably executing.
  */
 export function toolStartedPatch(opts: {
 	toolUseId: string;
@@ -54,7 +62,7 @@ export function toolStartedPatch(opts: {
 	input?: Record<string, unknown>;
 }): LivePatch {
 	const fields: Record<string, unknown> = {
-		status: "running",
+		status: "initializing",
 		startedAt: opts.streamStartedAt ?? Date.now(),
 		...(opts.streamStartedAt != null ? { streamStartedAt: opts.streamStartedAt } : {}),
 		...(opts.input ? { inputJson: opts.input } : {}),
@@ -116,6 +124,23 @@ export function timeoutUpdatedPatch(opts: { toolUseId: string; timeoutMs: number
  */
 export function permissionRequestedPatch(toolUseId: string): LivePatch {
 	return (messages) => patchToolCallFields(messages, toolUseId, { status: "pending" });
+}
+
+/**
+ * `tool_executing` → the permission gate passed and the tool is now running.
+ *
+ * The positive evidence a persisted card needs. `tool_started` only means the input
+ * finished parsing, and the auto-allow path writes `running` to the database without
+ * broadcasting it — so before this frame existed a card had no way to learn that
+ * execution had actually begun, and the client had to assume it.
+ *
+ * Structurally the same as `permissionResolvedPatch`'s allow branch, minus the
+ * `startedAt` stamp: that field is the STREAM start (already set when the arguments
+ * began arriving), and overwriting it here would restart the elapsed counter partway
+ * through a call.
+ */
+export function toolExecutingPatch(toolUseId: string): LivePatch {
+	return (messages) => patchToolCallFields(messages, toolUseId, { status: "running" });
 }
 
 /**

@@ -40,6 +40,20 @@
  */
 export type GlyphWidthResolver = (glyph: string, fontCss: string) => number | null;
 
+/**
+ * Resolve a glyph's VERTICAL extent (px above / below the baseline) for a font
+ * KaTeX has no metrics for. Return `null` when it cannot be measured.
+ *
+ * Needed for the same reason as `GlyphWidthResolver`: KaTeX substitutes capital
+ * "M" for CJK, and M has NO descender, so a `\text{…}` run of CJK reports
+ * `depth: 0` and its box is too short — the render layer then clips the glyph's
+ * top and bottom. Real font metrics come from the injected resolver instead.
+ */
+export type GlyphVerticalResolver = (
+	glyph: string,
+	fontCss: string,
+) => { ascent: number; descent: number } | null;
+
 export interface KatexGeometry {
 	/** Rendered width (px) at the requested base font size. */
 	width: number;
@@ -62,6 +76,11 @@ export interface MeasureKatexOptions {
 	basePx: number;
 	/** Real-font measurement for glyphs KaTeX has no metrics for (CJK etc.). */
 	glyphWidth?: GlyphWidthResolver;
+	/**
+	 * Real-font VERTICAL measurement for the same glyphs. Without it a CJK run keeps
+	 * KaTeX's capital-M substitute metrics (no descender) and renders clipped.
+	 */
+	glyphVertical?: GlyphVerticalResolver;
 }
 
 /**
@@ -463,6 +482,58 @@ function nodeWidth(node: KatexNode, ctx: WalkContext): Width {
 	return width;
 }
 
+/**
+ * Extra vertical extent (px) that glyphs KaTeX lacks metrics for actually paint,
+ * beyond what the tree's own `height`/`depth` claim.
+ *
+ * KaTeX substitutes capital "M" for CJK. M has a smaller cap height than a
+ * full-width CJK glyph and, crucially, NO descender — so a `\text{速度}` run
+ * reports `depth: 0` and an ink box several px too short. Every affected
+ * SymbolNode is re-measured with the real font and the surplus is returned, to be
+ * folded into the formula's ascent/descent.
+ *
+ * Returns zeros when nothing needs correcting, so ASCII formulas are untouched.
+ */
+function verticalOverflow(
+	node: KatexNode,
+	ctx: WalkContext,
+	resolve: GlyphVerticalResolver,
+): { ascent: number; descent: number } {
+	let ascent = 0;
+	let descent = 0;
+
+	const visit = (current: KatexNode, scale: number): void => {
+		const classes = current.classes ?? [];
+		for (const cls of classes) {
+			if (ZERO_WIDTH_CLASSES.has(cls)) return;
+		}
+		const inner = scale * sizingScale(classes);
+
+		if (typeof current.text === "string" && current.width !== undefined) {
+			const glyphs = Array.from(current.text).filter((g) => needsRealFontMeasure(g));
+			if (glyphs.length === 0) return;
+			const fontCss = fontCssFor(classes, ctx.rootFontPx * inner);
+			// KaTeX's claim for this node, in px at the node's own scale.
+			const claimedAscent = (current.height ?? 0) * inner * ctx.rootFontPx;
+			const claimedDescent = (current.depth ?? 0) * inner * ctx.rootFontPx;
+			for (const glyph of glyphs) {
+				const real = resolve(glyph, fontCss);
+				if (!real) continue;
+				const extraAscent = real.ascent - claimedAscent;
+				const extraDescent = real.descent - claimedDescent;
+				if (extraAscent > ascent) ascent = extraAscent;
+				if (extraDescent > descent) descent = extraDescent;
+			}
+			return;
+		}
+
+		for (const child of current.children ?? []) visit(child, inner);
+	};
+
+	visit(node, ctx.scale);
+	return { ascent: Math.max(0, ascent), descent: Math.max(0, descent) };
+}
+
 /** Root node of the rendered tree, skipping the optional `.katex-display` wrap. */
 function unwrapDisplay(root: KatexNode): KatexNode {
 	if (root.classes?.includes("katex-display")) {
@@ -483,7 +554,7 @@ export function measureKatex(
 	latex: string,
 	opts: MeasureKatexOptions,
 ): KatexGeometry {
-	const { displayMode, basePx, glyphWidth } = opts;
+	const { displayMode, basePx, glyphWidth, glyphVertical } = opts;
 	const rootFontPx = basePx * KATEX_FONT_SCALE;
 	const lineBox = rootFontPx * KATEX_LINE_HEIGHT;
 
@@ -511,17 +582,26 @@ export function measureKatex(
 	if (html.includes("katex-error")) error = "katex parse error";
 
 	const content = unwrapDisplay(tree);
-	const width = nodeWidth(content, { scale: 1, rootFontPx, glyphWidth, katex });
+	const walkCtx: WalkContext = { scale: 1, rootFontPx, glyphWidth, katex };
+	const width = nodeWidth(content, walkCtx);
 	const ascentEm = content.height ?? 0;
 	const descentEm = content.depth ?? 0;
-	const contentHeight = (ascentEm + descentEm) * rootFontPx;
+	// Glyphs KaTeX has no metrics for (CJK) paint beyond the box it reported; recover
+	// the surplus from real font metrics so the render layer's `overflow: hidden` box
+	// cannot shave their tops and bottoms off.
+	const overflow = glyphVertical
+		? verticalOverflow(content, walkCtx, glyphVertical)
+		: { ascent: 0, descent: 0 };
+	const ascent = ascentEm * rootFontPx + overflow.ascent;
+	const descent = descentEm * rootFontPx + overflow.descent;
+	const contentHeight = ascent + descent;
 
 	return {
 		width: width.em * rootFontPx + width.px,
 		// The inline box never collapses below `.katex`'s own line box.
 		height: Math.max(contentHeight, lineBox),
-		ascent: ascentEm * rootFontPx,
-		descent: descentEm * rootFontPx,
+		ascent,
+		descent,
 		html,
 		error,
 	};

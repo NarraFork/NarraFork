@@ -59,6 +59,15 @@ export interface ReasoningLabels {
 interface RenderReasoningProps {
 	measured: MeasuredReasoning;
 	labels?: ReasoningLabels;
+	/**
+	 * Show the run's raw text instead of the rendered markdown (viewer toggle).
+	 *
+	 * Only the EXPANDED form has a body to swap; the other three are single header
+	 * rows, which is why the shell only advertises the toggle for an expanded run.
+	 */
+	showSource?: boolean;
+	/** The raw text, needed only while `showSource` holds. */
+	sourceText?: string;
 	onToggle?: () => void;
 	onToggleTranslation?: () => void;
 	/** Forwarded for mermaid/katex local-measure refinement in the body. */
@@ -82,6 +91,8 @@ function BrainBadge() {
 export function RenderReasoning({
 	measured,
 	labels = {},
+	showSource,
+	sourceText,
 	onToggle,
 	onToggleTranslation,
 	onUnknownHeight,
@@ -100,6 +111,8 @@ export function RenderReasoning({
 				<ExpandedView
 					measured={measured}
 					labels={labels}
+					showSource={showSource}
+					sourceText={sourceText}
 					onToggle={onToggle}
 					onToggleTranslation={onToggleTranslation}
 					onUnknownHeight={onUnknownHeight}
@@ -243,6 +256,8 @@ function ReasoningHeaderRow({
 function ExpandedView({
 	measured,
 	labels,
+	showSource,
+	sourceText,
 	onToggle,
 	onToggleTranslation,
 	onUnknownHeight,
@@ -251,6 +266,8 @@ function ExpandedView({
 }: {
 	measured: MeasuredReasoning;
 	labels: ReasoningLabels;
+	showSource?: boolean;
+	sourceText?: string;
 	onToggle?: () => void;
 	onToggleTranslation?: () => void;
 	onUnknownHeight?: (height: number) => void;
@@ -288,8 +305,12 @@ function ExpandedView({
 					marginTop: 0,
 				}}
 			>
+				{/* Source view swaps the render for the raw text inside the SAME reserved
+				    body geometry, so the card cannot move (RenderMarkdown pins the box). */}
 				<RenderMarkdown
 					measured={bodyMeasured}
+					showSource={showSource}
+					sourceText={sourceText}
 					onUnknownHeight={onUnknownHeight}
 					animateStreaming={animateStreaming}
 					animKeyBase={animKeyBase != null ? `${animKeyBase}:reasoning` : undefined}

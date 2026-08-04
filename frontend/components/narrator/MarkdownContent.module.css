@@ -255,6 +255,33 @@
 	opacity: 1;
 }
 
+/* A fenced block that LEADS a ContentViewer body shares its top-right corner with
+   the viewer's own sticky action bar (source / wrap / copy / fullscreen). That bar
+   paints above block-level chrome by design (z-index 2 vs 1), so leaving the copy
+   button there hides it completely and the panel looks like it has none.
+
+   Move it to the panel's BOTTOM-right corner. Not sideways: parking it beside the
+   bar produced five grey icons in one strip, two of them copy glyphs with
+   different scopes (this block vs the whole message) — noisy and ambiguous.
+
+   Mirrors the virtual list's `resolveCodeCopyPlacement`
+   (vlist/vlist-content-view-float.ts), which resolves the same collision from
+   measured geometry. Scoped to `[data-content-block]` because MarkdownContent also
+   renders without a ContentViewer (compact summaries, reasoning bodies), where
+   there is no bar to dodge. */
+[data-content-block] :is(.root, .rootNoWrap) > .codeBlock:first-child .codeCopy {
+	top: auto;
+	bottom: 4px;
+}
+
+/* Known gap vs the virtual list: `resolveCodeCopyPlacement` also has a `hidden`
+   outcome for a panel too short to separate the two corners (a single unlabelled
+   line, ~39px, against the 44px both buttons need). CSS cannot branch on a box's
+   height, so here such a panel keeps its bottom-right button and the two overlap
+   by a few pixels. Left as-is deliberately: this is the opt-out renderer (the
+   virtual list is the default), and a mostly-clickable button beats the original
+   bug of a fully hidden one. */
+
 .codeBlock.codeBlockWithLang pre {
 	padding-top: calc(var(--mantine-spacing-xs) + 12px);
 }

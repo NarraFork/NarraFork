@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, mock as bunMock, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
@@ -66,149 +66,214 @@ const rulerData = {
 	},
 };
 
-// Snapshot the shared api barrel before mocking so afterAll can re-point it back
-// to the real implementation. Bun's mock.module is process-wide and mock.restore()
-// does NOT undo it, so without this the partial `api` stub below leaks into every
-// later-loaded frontend suite (lib/api/*.test, GitPanel, ChapterBatchMergeModal),
-// where methods like api.search / api.createProjectStream go missing.
-//
-// Only the api barrel is re-pointed: the hook / heavy-component mocks
-// (NarratorPanel, pixi, SegmentCanvas) are RulerFlow-local and importing the REAL
-// versions here would eagerly evaluate `import.meta.glob`-based modules that Bun
-// cannot load in this test context. Those niche mocks don't break other suites.
-const realApiModule = { ...(await import("../../lib/api")) };
-const realRulerFlowModules: Record<string, () => unknown> = {
-	"../../lib/api": () => realApiModule,
-};
-
-mock.module("../../hooks/useRuler", () => ({
-	useRulerData: () => ({ data: rulerData, isLoading: false, error: null }),
-}));
-
-mock.module("../../hooks/useRulerChapterActivity", () => ({
-	useRulerChapterActivity: () => new Map(),
-}));
-
-mock.module("../../hooks/useUserPreferences", () => ({
-	useUserPreferences: () => ({ data: { graphViewports: {} } }),
-}));
-
-mock.module("../../hooks/usePlatform", () => ({
-	useChapterBatchMergeCapability: () => ({
-		supported: true,
-		mode: "async-merge-session",
-		frontendCompletionMode: "progress-event-or-session-poll",
-		routes: { start: true, session: true },
-	}),
-	useNarratorReviewToolsCapability: () => ({
-		supported: true,
-		convertToSubagent: true,
-		promote: true,
-		dismiss: true,
-	}),
-}));
-
-mock.module("../../hooks/useRecentTabs", () => ({
-	addRecentTab: () => {},
-}));
-
 class TestApiError extends Error {
 	data?: Record<string, unknown>;
 }
 
-mock.module("../../lib/api", () => ({
-	ApiError: TestApiError,
-	api: {
-		saveGraphViewport: () => Promise.resolve(),
-		getRulerSegment: () => Promise.resolve({ chapters: [] }),
-		rulerFork: () => Promise.resolve({}),
-		forkChapter: () => Promise.resolve({ id: "forked", title: "Forked" }),
-		listNarrators: () => Promise.resolve([]),
-		rulerMerge: () => Promise.resolve({}),
-		rulerRebase: () => Promise.resolve({}),
-		createReview: () => Promise.resolve({}),
-		rulerAbandon: () => Promise.resolve({}),
-		convertReviewToSubagent: () => Promise.resolve({}),
-		promoteReview: () => Promise.resolve({}),
-		dismissReview: () => Promise.resolve({}),
-		updateRulerPositions: () => Promise.resolve({}),
+/**
+ * Real namespaces of every module this file replaces, snapshotted BEFORE any mock is
+ * installed so `afterAll` can re-point each specifier back at the genuine module.
+ *
+ * Bun's `mock.module` is process-wide and `mock.restore()` does NOT undo it, so a stub
+ * left standing here bleeds into every frontend suite loaded later in the same
+ * `bun test` process. A stub that merely behaves differently is survivable; a stub
+ * that omits an export is not — the victim file dies during module evaluation with
+ * `SyntaxError: Export named 'x' not found in module ...`, which reads as a bug in the
+ * innocent file. That is how the two-export `usePlatform` stub killed every suite that
+ * reached `useUploadCapability` (via vlist-image), and how the partial `api` barrel
+ * took out lib/api/*.test, GitPanel and ChapterBatchMergeModal before it.
+ *
+ * Restoring ALL of them, rather than only the ones provably missing exports, is
+ * deliberate: "is this factory export-complete, and does anything downstream need the
+ * real behaviour?" is a judgement call that must be re-made on every edit and fails
+ * silently when wrong. Blanket restoration deletes the judgement call.
+ *
+ * These keys are the single source of truth for what this file is allowed to mock.
+ */
+const realRulerFlowModules = {
+	"../../hooks/useRuler": { ...(await import("../../hooks/useRuler")) },
+	"../../hooks/useRulerChapterActivity": {
+		...(await import("../../hooks/useRulerChapterActivity")),
 	},
-}));
+	"../../hooks/useUserPreferences": { ...(await import("../../hooks/useUserPreferences")) },
+	"../../hooks/usePlatform": { ...(await import("../../hooks/usePlatform")) },
+	"../../hooks/useRecentTabs": { ...(await import("../../hooks/useRecentTabs")) },
+	"../../lib/api": { ...(await import("../../lib/api")) },
+	"../narrator/NarratorPanel": { ...(await import("../narrator/NarratorPanel")) },
+	"./pixi/RulerPixiLayer": { ...(await import("./pixi/RulerPixiLayer")) },
+	"./SegmentCanvas": { ...(await import("./SegmentCanvas")) },
+};
 
-mock.module("../narrator/NarratorPanel", () => ({
-	NarratorPanel: ({ narratorId }: { narratorId: string }) => (
-		<div data-testid="mock-narrator-panel">{narratorId}</div>
-	),
-}));
+type MockedSpecifier = keyof typeof realRulerFlowModules;
 
-mock.module("./pixi/RulerPixiLayer", () => ({
-	RulerPixiLayer: ({ pixiRef }: { pixiRef: { current: unknown } }) => {
-		pixiRef.current = {
-			getCardHitRects: () => [],
-			updateCamera: () => {},
-			updateChapters: () => {},
-			render: () => {},
-		};
-		return <div data-testid="mock-ruler-pixi-layer" />;
-	},
-}));
+const mockedSpecifiers = Object.keys(realRulerFlowModules) as MockedSpecifier[];
 
-mock.module("./SegmentCanvas", () => ({
-	SegmentCanvas: ({
-		fromSha,
-		onChaptersLoaded,
-	}: {
-		fromSha: string;
-		onChaptersLoaded: (
-			fromSha: string,
-			chapters: Array<{
-				id: string;
-				status: string;
-				title: string;
-				branch: string;
-				role: string;
-				parentChapterId?: string | null;
-				narratorId: string | null;
-				narratorStatus: string | null;
-				startCommitSha: string | null;
-				mergeCommitSha?: string | null;
-				layoutX: number;
-				layoutY: number;
-			}>,
-		) => void;
-	}) => {
-		useEffect(() => {
-			onChaptersLoaded(fromSha, [
-				{
-					id: "chapter-one",
-					status: "active",
-					title: "Chapter One",
-					branch: "chapter/one",
-					role: "branch",
-					parentChapterId: null,
-					narratorId: "narrator-one",
-					narratorStatus: "idle",
-					startCommitSha: "commit-one",
-					mergeCommitSha: null,
-					layoutX: 0,
-					layoutY: 0,
-				},
-			]);
-		}, [fromSha, onChaptersLoaded]);
-		return <div data-testid="mock-segment-canvas" />;
-	},
-}));
+/**
+ * `bun:test`'s `mock`, shadowed so its `module()` only accepts specifiers that
+ * `realRulerFlowModules` has a real namespace for.
+ *
+ * This is the anti-regression device, and shadowing the familiar name is the point:
+ * the natural way to add a mock is to write `mock.module("../../hooks/useFoo", …)`
+ * copied from any other suite, and in this file that resolves to the narrowed
+ * signature and fails to compile (TS2345) until the specifier is snapshotted above.
+ * A separate opt-in helper would have been trivial to walk around by importing `mock`
+ * the usual way; there is no ergonomic path around this one.
+ */
+const mock = {
+	module: (specifier: MockedSpecifier, factory: () => unknown) =>
+		bunMock.module(specifier, factory),
+	restore: () => bunMock.restore(),
+};
 
-const { RulerFlow } = await import("./RulerFlow");
-
-// Re-point all mocked modules back to real once the file finishes, so the api
-// barrel + hook stubs don't leak into later-loaded frontend suites.
+/**
+ * Registered before the stubs and before `import("./RulerFlow")` on purpose.
+ *
+ * If a stub omits an export RulerFlow actually imports, that dynamic import throws
+ * while this module is still evaluating, and no `afterAll` registered after it ever
+ * runs — so every mock stays installed for the rest of the process. The import-time
+ * crash and the cross-file contamination were one and the same bug; hoisting the
+ * restore hook makes the leak survivable even when this file fails to load.
+ */
 afterAll(() => {
-	for (const [specifier, factory] of Object.entries(realRulerFlowModules)) {
-		mock.module(specifier, factory);
+	for (const specifier of mockedSpecifiers) {
+		const namespace = realRulerFlowModules[specifier];
+		mock.module(specifier, () => namespace);
 	}
+	// Clears spies/implementations set by `mock()`; it does NOT undo `mock.module`,
+	// which is why the loop above has to exist at all.
 	mock.restore();
 });
+
+/**
+ * The stub factories, keyed by the same specifiers as the snapshot table.
+ *
+ * `satisfies Record<MockedSpecifier, () => unknown>` locks the two tables together in
+ * both directions: a stub for a module absent from `realRulerFlowModules` is an
+ * excess-property error (TS2353), and snapshotting a module without stubbing it is a
+ * missing-property error (TS2739). Combined with the narrowed `mock` above, there is
+ * no way to install a stub that the `afterAll` restore loop will not undo.
+ */
+const rulerFlowModuleMocks = {
+	"../../hooks/useRuler": () => ({
+		useRulerData: () => ({ data: rulerData, isLoading: false, error: null }),
+	}),
+	"../../hooks/useRulerChapterActivity": () => ({
+		useRulerChapterActivity: () => new Map(),
+	}),
+	"../../hooks/useUserPreferences": () => ({
+		useUserPreferences: () => ({ data: { graphViewports: {} } }),
+	}),
+	"../../hooks/usePlatform": () => ({
+		useChapterBatchMergeCapability: () => ({
+			supported: true,
+			mode: "async-merge-session",
+			frontendCompletionMode: "progress-event-or-session-poll",
+			routes: { start: true, session: true },
+		}),
+		useNarratorReviewToolsCapability: () => ({
+			supported: true,
+			convertToSubagent: true,
+			promote: true,
+			dismiss: true,
+		}),
+	}),
+	"../../hooks/useRecentTabs": () => ({
+		addRecentTab: () => {},
+	}),
+	"../../lib/api": () => ({
+		ApiError: TestApiError,
+		api: {
+			saveGraphViewport: () => Promise.resolve(),
+			getRulerSegment: () => Promise.resolve({ chapters: [] }),
+			rulerFork: () => Promise.resolve({}),
+			forkChapter: () => Promise.resolve({ id: "forked", title: "Forked" }),
+			listNarrators: () => Promise.resolve([]),
+			rulerMerge: () => Promise.resolve({}),
+			rulerRebase: () => Promise.resolve({}),
+			createReview: () => Promise.resolve({}),
+			rulerAbandon: () => Promise.resolve({}),
+			convertReviewToSubagent: () => Promise.resolve({}),
+			promoteReview: () => Promise.resolve({}),
+			dismissReview: () => Promise.resolve({}),
+			updateRulerPositions: () => Promise.resolve({}),
+		},
+	}),
+	"../narrator/NarratorPanel": () => ({
+		NarratorPanel: ({ narratorId }: { narratorId: string }) => (
+			<div data-testid="mock-narrator-panel">{narratorId}</div>
+		),
+	}),
+	"./pixi/RulerPixiLayer": () => ({
+		RulerPixiLayer: ({ pixiRef }: { pixiRef: { current: unknown } }) => {
+			pixiRef.current = {
+				getCardHitRects: () => [],
+				updateCamera: () => {},
+				updateChapters: () => {},
+				render: () => {},
+			};
+			return <div data-testid="mock-ruler-pixi-layer" />;
+		},
+		// RulerFlow imports the real card geometry from this module to build its
+		// world-space card registry, so the stub has to carry it too: a factory that
+		// omits a used export makes the whole file fail at import time (before any
+		// test body runs), which is the failure mode the hoisted afterAll guards.
+		RULER_CARD_GEOMETRY: { nodeWidth: 220, nodeHeight: 72, cardTopOffset: 2 },
+	}),
+	"./SegmentCanvas": () => ({
+		SegmentCanvas: ({
+			fromSha,
+			onChaptersLoaded,
+		}: {
+			fromSha: string;
+			onChaptersLoaded: (
+				fromSha: string,
+				chapters: Array<{
+					id: string;
+					status: string;
+					title: string;
+					branch: string;
+					role: string;
+					parentChapterId?: string | null;
+					narratorId: string | null;
+					narratorStatus: string | null;
+					startCommitSha: string | null;
+					mergeCommitSha?: string | null;
+					layoutX: number;
+					layoutY: number;
+				}>,
+			) => void;
+		}) => {
+			useEffect(() => {
+				onChaptersLoaded(fromSha, [
+					{
+						id: "chapter-one",
+						status: "active",
+						title: "Chapter One",
+						branch: "chapter/one",
+						role: "branch",
+						parentChapterId: null,
+						narratorId: "narrator-one",
+						narratorStatus: "idle",
+						startCommitSha: "commit-one",
+						mergeCommitSha: null,
+						layoutX: 0,
+						layoutY: 0,
+					},
+				]);
+			}, [fromSha, onChaptersLoaded]);
+			return <div data-testid="mock-segment-canvas" />;
+		},
+	}),
+} satisfies Record<MockedSpecifier, () => unknown>;
+
+// Driven by the snapshot table's keys, not the stub table's: iterating the mocks with
+// `Object.entries` would widen the specifier back to `string` and silently re-open the
+// hole this narrowing exists to close.
+for (const specifier of mockedSpecifiers) {
+	mock.module(specifier, rulerFlowModuleMocks[specifier]);
+}
+
+const { RulerFlow } = await import("./RulerFlow");
 
 class TestResizeObserver {
 	private callback: ResizeObserverCallback;
@@ -330,5 +395,25 @@ describe("RulerFlow", () => {
 		expect(document.body.textContent).toContain("2 commits");
 		expect(document.querySelector('[data-testid="mock-ruler-pixi-layer"]')).not.toBeNull();
 		expect(document.querySelector('[data-testid="mock-segment-canvas"]')).not.toBeNull();
+	});
+});
+
+/**
+ * Runtime backstop for the one thing the type system cannot express: that the restore
+ * table is complete relative to what actually got mocked. The types guarantee the two
+ * tables share a key set, this guarantees neither is empty and both still line up at
+ * execution time — cheap insurance against a future refactor that keeps them
+ * compiling while decoupling them (e.g. widening a type to `Record<string, …>`).
+ */
+describe("RulerFlow mock hygiene", () => {
+	test("every mocked module has a real namespace queued for restore", () => {
+		expect(mockedSpecifiers.length).toBeGreaterThan(0);
+		expect(Object.keys(rulerFlowModuleMocks).sort()).toEqual([...mockedSpecifiers].sort());
+
+		// A snapshot captured after its own mock was installed would "restore" the stub
+		// and defeat the whole mechanism, so verify each namespace looks real.
+		for (const specifier of mockedSpecifiers) {
+			expect(Object.keys(realRulerFlowModules[specifier]).length).toBeGreaterThan(0);
+		}
 	});
 });

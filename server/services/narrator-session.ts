@@ -153,7 +153,13 @@ import {
 	generateQuickTitle,
 	setProvisionalTitleFromUserMessage,
 } from "./narrator-title";
-import { recordTreeSnapshotAfter, recordTreeSnapshotBefore } from "./narrator-tree-snapshot-hooks";
+import {
+	abandonSessionTreeSnapshots,
+	abandonTreeSnapshot,
+	declaredWorktreePaths,
+	recordTreeSnapshotAfter,
+	recordTreeSnapshotBefore,
+} from "./narrator-tree-snapshot-hooks";
 import { resolveContinueTurnTiming } from "./narrator-turn-timing";
 import {
 	assertOAuthNarratorRuntimeActive,
@@ -2359,9 +2365,14 @@ export async function runAgentLoop(
 				// content-addressed git tree of the whole worktree, so it also covers
 				// writes the tool inputs do not describe (Bash, build scripts, editors).
 				onSnapshotBefore: active._isInGitRepo
-					? async (toolUseId, toolName) => {
+					? async (toolUseId, toolName, input) => {
 							if (!FILE_MUTATING_TOOLS.has(toolName)) return;
-							await recordTreeSnapshotBefore(active, narratorId, toolUseId);
+							// Write/Edit can name their target up front, which is what lets the
+							// resulting tree delta be attributed in a shared worktree. Bash
+							// cannot, so it declares nothing and its set is derived instead.
+							const declared =
+								toolName === SHELL_TOOL_NAME ? null : declaredWorktreePaths(active.cwd, input);
+							await recordTreeSnapshotBefore(active, narratorId, toolUseId, declared);
 						}
 					: undefined,
 				// Capture the resulting state, persist both boundaries, and attribute the
@@ -2395,6 +2406,15 @@ export async function runAgentLoop(
 					: undefined,
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message, diagnostics) => {
+					// Every abort path in the agent loop ends by yielding error("Aborted"), so
+					// this is the one place that sees a turn stop without its remaining tools
+					// reporting results. Write/Edit/Bash never execute eagerly, which is
+					// exactly the set whose pre-execution hook has already opened a write
+					// claim by then — and an unclosed claim is read as extending to now, so it
+					// would go on subtracting its declared paths from every other narrator's
+					// shell call in this worktree, making their real writes unrevertable.
+					// Sealed first: it must not be skipped by an early return below.
+					if (active._isInGitRepo) abandonSessionTreeSnapshots(active, narratorId);
 					// Prepared EnterPlanMode state is ephemeral and must never survive an error/abort.
 					active._preparedPlanModes?.clear();
 					if (!active._planFileId) active._planFilePath = undefined;
@@ -3862,6 +3882,14 @@ export async function runAgentLoop(
 		active._loopRunning = false;
 		active.alive = false;
 		unregisterUpdateLoop();
+
+		// Backstop for the write-claim registry: `onErrorCleanup` covers the loop's own
+		// abort/error events, but a throw out of executeAgentLoop itself never reaches
+		// it. Any claim still in flight once the loop is over belongs to a tool that
+		// will never report a result, and leaving it open makes its declared paths
+		// shadow every later window in this worktree. Idempotent — sealing an already
+		// closed claim does nothing.
+		if (active._isInGitRepo) abandonSessionTreeSnapshots(active, narratorId);
 
 		try {
 			const cleared = await clearPipelineStateIfActive(narratorId);
@@ -5392,7 +5420,14 @@ export async function reExecuteDeniedToolCall(
 		// A re-run starts from whatever is on disk now, so the cached hash from the
 		// original pass must not be reused as this run's baseline.
 		active._lastTreeHash = undefined;
-		await recordTreeSnapshotBefore(active, narratorId, toolUseId);
+		// Same declaration rule as the loop hook: only a re-run that can name its
+		// target up front gets its delta attributed by declaration.
+		await recordTreeSnapshotBefore(
+			active,
+			narratorId,
+			toolUseId,
+			isShellTool ? null : declaredWorktreePaths(active.cwd, toolInput),
+		);
 	} else if (isShellTool && requestedDevice !== LOCAL_DEVICE_ID) {
 		logger.debug("Skipping Bash rerun snapshot for remote execution target", {
 			narratorId,
@@ -5458,6 +5493,13 @@ export async function reExecuteDeniedToolCall(
 		const executionTarget = result.metadata?.executionTarget as
 			| { deviceId?: string; cwd?: string }
 			| undefined;
+		if (canSnapshotRerun && executionTarget?.deviceId !== LOCAL_DEVICE_ID) {
+			// The before-hook already opened a write claim, and nothing here will close
+			// it: a claim left in flight is read as extending to now, so its declared
+			// paths would be subtracted from every other narrator's shell call in this
+			// worktree from now on — turning their real writes into unrevertable ones.
+			abandonTreeSnapshot(active, narratorId, toolUseId);
+		}
 		if (canSnapshotRerun && executionTarget?.deviceId === LOCAL_DEVICE_ID) {
 			try {
 				const { changedFiles } = await recordTreeSnapshotAfter(active, narratorId, toolUseId);
@@ -5476,6 +5518,10 @@ export async function reExecuteDeniedToolCall(
 					);
 				}
 			} catch (err) {
+				// The after-hook closes the claim before it can fail, but a failure here
+				// leaves that unproven, and a claim left in flight overlaps every later
+				// window. Sealing is a no-op once it is already closed.
+				abandonTreeSnapshot(active, narratorId, toolUseId);
 				logger.debug("Bash rerun after-snapshot failed", {
 					narratorId,
 					toolUseId,
@@ -5484,6 +5530,9 @@ export async function reExecuteDeniedToolCall(
 			}
 		}
 	} catch (err) {
+		// executeTool threw, so the after-hook above is skipped entirely. The claim the
+		// before-hook opened has to be sealed here or it stays "in flight" forever.
+		if (canSnapshotRerun) abandonTreeSnapshot(active, narratorId, toolUseId);
 		const message = err instanceof Error ? err.message : String(err);
 		logger.error("Failed to re-execute denied tool call", {
 			narratorId,

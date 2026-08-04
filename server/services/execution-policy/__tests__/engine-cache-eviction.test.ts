@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { PathIdentity } from "@server/lib/agent/execution/backend";
 import { targetPathSemantics } from "@server/lib/agent/execution/path-semantics";
 import type { ToolExecutionTarget } from "@server/lib/agent/types";
+import { getSettingsRevision } from "@server/lib/settings";
 import { ExecutionPolicyEngine } from "../engine";
 import { normalizeExecutionPolicyRuleSet } from "../normalize";
 import type { ExecutionTargetContext } from "../types";
@@ -11,7 +12,17 @@ import type { ExecutionTargetContext } from "../types";
  * cache. After a transient failure, the next call must retry compilation
  * (fail-closed is preserved: the failure still results in a rejection, not a
  * silent allow).
+ *
+ * Every seeded cache entry must carry the LIVE settings revision: `load()`
+ * discards an entry whose revision has moved on and falls through to the real
+ * repository, which fails with "Narrator not found" for these synthetic ids.
+ * The revision is a process-wide counter bumped by any saveSettings() /
+ * reloadSettings() call, so hardcoding a number only works while this file runs
+ * first — it must be read at seed time instead.
  */
+function currentSettingsRevision(): number {
+	return getSettingsRevision();
+}
 
 function makeMinimalPolicy(overrides: Partial<any> = {}) {
 	return {
@@ -19,7 +30,7 @@ function makeMinimalPolicy(overrides: Partial<any> = {}) {
 		ownerNarratorId: "test-narrator",
 		projectId: null,
 		projectGitPath: null,
-		settingsRevision: 1,
+		settingsRevision: currentSettingsRevision(),
 		directoryWhitelist: [],
 		directoryBlacklist: [],
 		commandWhitelist: [],
@@ -88,7 +99,7 @@ describe("execution policy engine cache eviction on failure", () => {
 		const entry = {
 			narratorId,
 			ownerNarratorId: policy.ownerNarratorId ?? narratorId,
-			settingsRevision: 1,
+			settingsRevision: currentSettingsRevision(),
 			promise: Promise.resolve(policy),
 		};
 		(engine as any).loadedCache.set(narratorId, entry);
@@ -220,7 +231,7 @@ describe("execution policy engine cache eviction on failure", () => {
 		rejectedPromise.catch(() => {}); // Suppress unhandled rejection
 		const failEntry = {
 			narratorId,
-			settingsRevision: 1,
+			settingsRevision: currentSettingsRevision(),
 			promise: rejectedPromise,
 		};
 		loadedCache.set(narratorId, failEntry);
@@ -232,7 +243,7 @@ describe("execution policy engine cache eviction on failure", () => {
 		const entry = {
 			narratorId,
 			ownerNarratorId: narratorId,
-			settingsRevision: 1,
+			settingsRevision: currentSettingsRevision(),
 			promise: Promise.resolve(makeMinimalPolicy({ narratorId })),
 		};
 		loadedCache.set(narratorId, entry);

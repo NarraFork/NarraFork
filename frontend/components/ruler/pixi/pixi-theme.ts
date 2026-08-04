@@ -3,6 +3,8 @@
  * Call resolvePixiTheme() to get a snapshot; cache it and re-resolve on theme change.
  */
 
+import { getEffectiveNarratorDisplay, statusAccentVar } from "../../../lib/status-registry";
+
 export interface PixiTheme {
 	accent: number;
 	accentBorder: number;
@@ -31,6 +33,11 @@ export interface PixiTheme {
 	narratorManualOverride: number;
 	narratorInterrupted: number;
 	narratorSuspended: number;
+	/**
+	 * Waiting for an unavailable model to recover. Blue-toned neutral so it is
+	 * clearly distinct from the yellow/orange "needs your attention" states.
+	 */
+	narratorModelUnavailable: number;
 }
 
 /** Parse a CSS color string (rgb, hex, etc.) into a 0xRRGGBB number. */
@@ -63,6 +70,34 @@ function varToHex(name: string, fallback: number): number {
 	if (!val) return fallback;
 	return cssColorToHex(val);
 }
+
+/**
+ * The variable name the status registry pins for "waiting for an unavailable model",
+ * derived rather than written out.
+ *
+ * Pixi needs a numeric hex, so it cannot use the registry's Mantine props directly —
+ * but it CAN ask the registry which variable to read. Hardcoding
+ * `"--mantine-color-slate-5"` here is how the two got out of step once already: the
+ * first release of this feature shipped a stale shade in exactly this copy, and
+ * nothing failed — the dots were just the wrong colour.
+ */
+/** `var(--x)` → `--x`, since `getComputedStyle` wants the bare property name. */
+function cssVarName(varExpression: string): string {
+	const match = /^var\(\s*(--[^,)\s]+)/.exec(varExpression);
+	return match?.[1] ?? varExpression;
+}
+
+/**
+ * Registry-derived variable names this bridge reads.
+ *
+ * Exported so the status-registry test can assert the derivation from both ends
+ * instead of regex-matching this file's source text for a hardcoded shade.
+ */
+export const PIXI_THEME_VARS = {
+	narratorModelUnavailable: cssVarName(
+		statusAccentVar(getEffectiveNarratorDisplay("waiting", ["model_unavailable"]), "filled"),
+	),
+} as const;
 
 let cached: { scheme: string; theme: PixiTheme } | null = null;
 
@@ -119,10 +154,18 @@ export function resolvePixiTheme(): PixiTheme {
 		narratorUnread: varToHex("--mantine-color-green-5", 0x22c55e),
 		narratorError: varToHex("--mantine-color-red-5", 0xef4444),
 		narratorWaiting: varToHex("--mantine-color-yellow-5", 0xeab308),
-		narratorReflecting: varToHex("--mantine-color-grape-5", 0xa855f7),
+		// Orange, matching `status-registry`'s `reflecting` substatus: a running gate is
+		// interactive, so it joins the attention family. (It was grape, which `reasoning`
+		// owns, then teal, which sat too close to green — see `StatusShape`.)
+		narratorReflecting: varToHex("--mantine-color-orange-5", 0xff922b),
 		narratorManualOverride: varToHex("--mantine-color-orange-5", 0xf97316),
 		narratorInterrupted: varToHex("--mantine-color-orange-5", 0xf97316),
 		narratorSuspended: varToHex("--mantine-color-yellow-5", 0xeab308),
+		// DERIVED from the status registry's `model_unavailable` entry rather than
+		// re-spelling its shade (see PIXI_THEME_VARS). The theme's `slate` filled step
+		// is far too dark to read as a dot on a dark card, which is why that entry pins
+		// an accent step at all.
+		narratorModelUnavailable: varToHex(PIXI_THEME_VARS.narratorModelUnavailable, 0x7d95b8),
 	};
 
 	cached = { scheme, theme };

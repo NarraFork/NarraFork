@@ -160,6 +160,9 @@ describe("resolveToolDetailViewTargets — markdown bodies", () => {
 		const [only] = t.resolveToolDetailViewTargets(KEY, { detail });
 		expect(only?.kind).toBe("markdown");
 		expect(only?.text).toBe(plan);
+		// The card's renderer swaps this body for the raw source inside its capped
+		// box, so the inline toggle is real here (unlike a body whose row cannot).
+		expect(only?.sourceInline).toBe(true);
 	});
 });
 
@@ -241,6 +244,10 @@ describe("resolveSubagentViewTargets", () => {
 			["code", "Prompt"],
 			["markdown", "explore — scan"],
 		]);
+		// SubagentBody honours `isSourceShown` on the result body, so it may offer the
+		// inline toggle; the prompt is monospace already and has no rendered form.
+		expect(withBoth[1]?.sourceInline).toBe(true);
+		expect(withBoth[0]?.sourceInline).toBeUndefined();
 
 		const collapsed = t.resolveSubagentViewTargets(
 			KEY,
@@ -262,6 +269,23 @@ describe("resolveRowViewTargets", () => {
 		expect(found).toEqual([
 			{ id: "m1-b0:body", slot: "body", kind: "markdown", text: "hello **world**" },
 		]);
+	});
+
+	it("advertises an in-place source view only when the caller says the row can paint one", async () => {
+		const t = await targets();
+		const spec = { kind: "markdown" as const, key: "m1-b0", data: "# hi" };
+		// The caller decides, because it depends on the MEASURED form (a collapsed
+		// reasoning run paints no body). Unflagged bodies must not claim the ability,
+		// or the action bar offers a toggle nothing honours.
+		expect(t.resolveRowViewTargets(spec)[0]?.sourceInline).toBeUndefined();
+		expect(t.resolveRowViewTargets(spec, undefined, { sourceInline: true })[0]?.sourceInline).toBe(
+			true,
+		);
+		const reasoning = { kind: "reasoning" as const, key: "m1-b1", data: { text: "thought" } };
+		expect(
+			t.resolveRowViewTargets(reasoning, undefined, { sourceInline: true })[0]?.sourceInline,
+		).toBe(true);
+		expect(t.resolveRowViewTargets(reasoning)[0]?.sourceInline).toBeUndefined();
 	});
 
 	it("a reasoning row follows what is ON SCREEN, not the original text", async () => {

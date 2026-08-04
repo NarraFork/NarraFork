@@ -34,17 +34,67 @@
  * `overflow:hidden` entirely, so it can never be clipped.
  */
 
-/**
- * Reserved height (px) of the action bar: an 18px `ActionIcon size="xs"`
- * (`--ai-size-xs` = 1.125rem) plus the 4px inset above and below it.
- */
-export const VIEW_ACTION_BAR_HEIGHT = 26;
-
 /** Inset (px) between the bar and the edge it is pinned to. */
 export const VIEW_ACTION_BAR_GAP = 4;
 
+/**
+ * Edge (px) of one bar button: an `ActionIcon size="xs"`, i.e. Mantine's
+ * `--ai-size-xs` = 1.125rem.
+ */
+export const VIEW_ACTION_BUTTON_SIZE = 18;
+
+/**
+ * Reserved height (px) of the action bar: one button plus the inset above and
+ * below it.
+ */
+export const VIEW_ACTION_BAR_HEIGHT = VIEW_ACTION_BUTTON_SIZE + VIEW_ACTION_BAR_GAP * 2;
+
 /** Gap (px) left above a body's head when jumping back to its start. */
 export const VIEW_SCROLL_TO_TOP_GAP = 8;
+
+/**
+ * Where a fenced code panel may put its own copy button, given that the row's
+ * hover action bar parks at the BODY's top-right corner.
+ *
+ * `hidden` is a real outcome, not a failure: the row bar paints above block-level
+ * chrome by design, so a panel with nowhere clear to go must not paint a button
+ * that the bar would silently swallow.
+ */
+export type CodeCopyPlacement = "top-right" | "bottom-right" | "hidden";
+
+/**
+ * Decide where one fenced panel's copy button goes.
+ *
+ * The collision this resolves: the row bar's button occupies the vertical band
+ * `[GAP, GAP + SIZE]` measured from the body's content origin, and it wins the
+ * stacking order (`zIndex: 2` vs `1`). A panel's own button therefore has to land
+ * outside that band or not be painted at all.
+ *
+ * Three cases, in order of preference:
+ *   - the panel starts below the band → keep the conventional top-right corner;
+ *   - it starts inside the band but is tall enough that its BOTTOM-right corner
+ *     clears it → move down there;
+ *   - it is too short for either → `hidden`. The row bar's own copy button sits
+ *     right there, so the panel is still reachable, just not per-panel.
+ *
+ * Both offsets are given relative to the body's content origin, so the caller
+ * does not need to know about the surrounding renderer's padding (which only ever
+ * adds clearance, making this conservative).
+ */
+export function resolveCodeCopyPlacement(
+	panelTop: number,
+	panelHeight: number,
+	gap: number = VIEW_ACTION_BAR_GAP,
+	size: number = VIEW_ACTION_BUTTON_SIZE,
+): CodeCopyPlacement {
+	if (!Number.isFinite(panelTop) || !Number.isFinite(panelHeight)) return "top-right";
+	// The panel's top-right button starts at `panelTop + gap`; the bar's button
+	// ends at `gap + size`. Clear when the former is at or past the latter.
+	if (panelTop >= size) return "top-right";
+	// The bottom-right button starts at `panelTop + panelHeight - gap - size`.
+	if (panelTop + panelHeight >= 2 * (gap + size)) return "bottom-right";
+	return "hidden";
+}
 
 /** Rectangles the render layer reads and hands in (this module touches no DOM). */
 export interface FloatGeometry {

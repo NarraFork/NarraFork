@@ -193,3 +193,65 @@ describe("media image reserved height", () => {
 		expect(MEDIA_IMAGE_CONTENT_PX).toBeLessThanOrEqual(DETAIL_CAPS.media);
 	});
 });
+
+/**
+ * The DELIBERATE monotonicity exception, pinned so it stays deliberate.
+ *
+ * Nearly every measure in this directory gets taller as its column narrows (text wraps
+ * into more lines). `image_generation` with intrinsic dimensions does the opposite: the
+ * image is scaled to fit the column, so a narrower column yields a SHORTER block. That
+ * matches the renderer (`width: min(100%, displayWidth)` + `objectFit: contain`), so it
+ * is correct — but it also means the vlist's width feedback loop cannot rely on
+ * measure-layer monotonicity for termination, which is why
+ * `vlist-width-settle.ts` carries a structural cycle guard.
+ *
+ * These assertions exist so that (a) nobody "fixes" the growth into a width-independent
+ * reservation without noticing it would letterbox narrow columns, and (b) nobody
+ * reinstates a global monotonicity invariant elsewhere while this exception stands.
+ */
+describe("image_generation height vs column width (monotonicity exception)", () => {
+	const block = {
+		type: "image_generation",
+		status: "completed",
+		width: 1024,
+		height: 512,
+		result: "x",
+	} as const;
+
+	it("GROWS with the column while the image is being scaled to fit", async () => {
+		const { measureMedia } = await import("./measure-media");
+		const heightAt = (w: number) => measureMedia({ ...block }, w).height;
+		// 1px steps: the growth is ~0.5px per px of column, so a coarse stride can land
+		// on equal values and read as flat.
+		let increases = 0;
+		let previous = heightAt(320);
+		for (let width = 321; width <= 532; width++) {
+			const height = heightAt(width);
+			if (height > previous) increases++;
+			expect(height).toBeGreaterThanOrEqual(previous);
+			previous = height;
+		}
+		expect(increases).toBeGreaterThan(50);
+		expect(heightAt(532)).toBeGreaterThan(heightAt(320));
+	});
+
+	it("saturates once the column exceeds the display cap, so growth is bounded", async () => {
+		const { measureMedia, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		const cap = MEASURE_MEDIA_CONSTANTS.IMGGEN_MAX_DISPLAY_WIDTH;
+		const heightAt = (w: number) => measureMedia({ ...block }, w).height;
+		const atCap = heightAt(cap + MEASURE_MEDIA_CONSTANTS.IMGGEN_PAPER_PADDING * 2);
+		for (const width of [700, 900, 1200, 1600]) {
+			expect(heightAt(width)).toBe(atCap);
+		}
+	});
+
+	// Without intrinsic dimensions there is nothing to scale, so the placeholder is
+	// width-independent and the exception does not apply.
+	it("does not apply to the unknown-size placeholder", async () => {
+		const { measureMedia } = await import("./measure-media");
+		const unknown = { type: "image_generation", status: "completed", result: "x" } as const;
+		const narrow = measureMedia({ ...unknown }, 320).height;
+		const wide = measureMedia({ ...unknown }, 900).height;
+		expect(narrow).toBe(wide);
+	});
+});

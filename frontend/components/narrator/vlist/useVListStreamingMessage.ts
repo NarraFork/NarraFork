@@ -41,6 +41,7 @@ import { commitGrowthSignature, type HandoffMessage } from "./streaming-handoff"
 import {
 	applyStreamingToolChunk,
 	applyStreamingToolCompleted,
+	applyStreamingToolExecuting,
 	applyStreamingToolLongRunning,
 	applyStreamingToolOutput,
 	applyStreamingToolStarted,
@@ -116,6 +117,14 @@ export function useVListStreamingMessage(
 		>
 	>(new Map());
 	const rafRef = useRef(0);
+	/**
+	 * Which text/reasoning lane last received a delta, or -1 when the model has moved
+	 * on to tool calls. Stamped onto the published row so renderers can tell a
+	 * FINISHED reasoning run from the one still being written — array position cannot,
+	 * because the tool cards are appended after the text lanes whatever order the
+	 * provider used (see @shared/pretext-layout/streaming-live-blocks).
+	 */
+	const liveBlockIndexRef = useRef(-1);
 	const [version, setVersion] = useState(0);
 	/**
 	 * Total characters this row has accumulated, and the value at the moment the
@@ -148,6 +157,7 @@ export function useVListStreamingMessage(
 		clearOutputTimers();
 		accumulatedCharsRef.current = 0;
 		charsAtLastCommitRef.current = 0;
+		liveBlockIndexRef.current = -1;
 		const hadContent = blocksRef.current.length > 0 || toolStoreRef.current.size > 0;
 		if (hadContent) {
 			blocksRef.current = [];
@@ -281,9 +291,16 @@ export function useVListStreamingMessage(
 		subscriptionId,
 		{
 			onStreamEvent: (wsData: { event?: Record<string, unknown>; [key: string]: unknown }) => {
-				if (
-					applyExactStreamDelta(blocksRef.current, wsData.event as StreamDeltaEvent, isSubagent)
-				) {
+				const result = applyExactStreamDelta(
+					blocksRef.current,
+					wsData.event as StreamDeltaEvent,
+					isSubagent,
+				);
+				if (result.applied) {
+					// The lane this delta landed in is now the live one. A reasoning delta
+					// arriving after a tool call legitimately REOPENS the text lane, which is
+					// why this is set on every delta rather than only advanced forward.
+					liveBlockIndexRef.current = result.blockIndex;
 					accumulatedCharsRef.current = currentCharCount();
 					flush();
 				}
@@ -373,6 +390,10 @@ export function useVListStreamingMessage(
 				streamingField,
 			) => {
 				if (!isSubagent && rawParentToolUseId) return;
+				// The model is writing tool arguments, so no text lane is open: whatever
+				// reasoning or text preceded this is finished and must settle now instead of
+				// waiting for the turn to persist.
+				liveBlockIndexRef.current = -1;
 				if (
 					applyStreamingToolChunk(toolStoreRef.current, {
 						toolUseId,
@@ -398,6 +419,13 @@ export function useVListStreamingMessage(
 						...(meta ? { metadata: meta as Record<string, unknown> } : {}),
 					})
 				)
+					flush();
+			},
+			// Execution actually began (permission granted). Separate from onToolStarted,
+			// which only means the input finished parsing — see streaming-tool-chunks.ts.
+			onToolExecuting: (toolUseId, executionStartedAt, rawParentToolUseId) => {
+				if (!isSubagent && rawParentToolUseId) return;
+				if (applyStreamingToolExecuting(toolStoreRef.current, { toolUseId, executionStartedAt }))
 					flush();
 			},
 			onToolCompleted: (
@@ -456,6 +484,7 @@ export function useVListStreamingMessage(
 			streamingBlocks: blocksRef.current,
 			toolChunksMsg,
 			narratorId,
+			liveBlockIndex: liveBlockIndexRef.current,
 		});
 	}, [enabled, narratorId, version]);
 }

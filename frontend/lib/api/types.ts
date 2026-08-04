@@ -670,6 +670,16 @@ export interface TreeMessage {
 	children: TreeMessage[];
 	/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */
 	_blockOriginalIndices?: number[];
+	/**
+	 * Synthetic live row only: index of the text/reasoning block still being written,
+	 * or -1 when the model has moved on to tool calls.
+	 *
+	 * Set by the streaming accumulators, which are the only place that sees the real
+	 * arrival order (`buildStreamingMsg` appends tool cards after the text lanes, so
+	 * array position cannot express it). Consumers read it through
+	 * `@shared/pretext-layout/streaming-live-blocks`, never directly.
+	 */
+	liveBlockIndex?: number;
 }
 
 export interface PaginatedNarrators {
@@ -823,6 +833,8 @@ export interface CodexCredentialEntry {
 	priority: number;
 	disabled: boolean;
 	disabledReason?: string;
+	/** Epoch milliseconds when archived (retired from the pool, data retained). */
+	archivedAt?: number;
 	successCount: number;
 	failureCount: number;
 	lastUsedAt?: string;

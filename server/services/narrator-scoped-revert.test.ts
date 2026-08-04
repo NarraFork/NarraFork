@@ -62,13 +62,21 @@ async function createNarrator(cwd: string, parentNarratorId?: string): Promise<s
 	return id;
 }
 
-/** Run one tool "turn": snapshot, apply the mutation, snapshot again. */
+/**
+ * Run one tool "turn": snapshot, apply the mutation, snapshot again.
+ *
+ * `declaredPaths` mirrors what the real session passes: Write/Edit name their
+ * target up front, Bash cannot and passes null. That declaration is what lets a
+ * shared worktree attribute the resulting delta, so a helper that always passed
+ * null would test a configuration the product never runs.
+ */
 async function runToolTurn(
 	session: TreeSnapshotSession,
 	narratorId: string,
 	seq: number,
 	mutate: () => void,
 	toolName = "Write",
+	declaredPaths: string[] | null = null,
 ): Promise<{ toolUseId: string; messageId: string }> {
 	const messageId = generateId();
 	const toolUseId = generateId();
@@ -92,7 +100,7 @@ async function runToolTurn(
 		createdAt: now,
 	});
 
-	await recordTreeSnapshotBefore(session, narratorId, toolUseId);
+	await recordTreeSnapshotBefore(session, narratorId, toolUseId, declaredPaths);
 	mutate();
 	await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 	return { toolUseId, messageId };
@@ -173,6 +181,7 @@ async function runMultiToolMessage(
 function outsideChange(session: TreeSnapshotSession, mutate: () => void): void {
 	mutate();
 	session._lastTreeHash = undefined;
+	session._lastTreeHashAt = undefined;
 }
 
 afterEach(async () => {
@@ -461,18 +470,26 @@ describe("narrator-scoped revert", () => {
 		await runToolTurn(session, narratorId, 1, () => {
 			writeFileSync(join(repo, "real.txt"), "v2\n");
 		});
-		const specTurn = await runToolTurn(session, narratorId, 2, () => {}, "Edit");
+		const specTurn = await runToolTurn(session, narratorId, 2, () => {}, "Edit", [
+			// What `declaredWorktreePaths` yields for a spec:// URI: declared, owns nothing.
+		]);
 
 		// The no-op call must not become a rollback anchor: a window starting at it
-		// has nothing to reverse.
+		// has nothing to reverse. The reason distinguishes "proven to own nothing"
+		// from "no boundary was recorded".
 		const noop = await revertNarratorScopedFromSeq(narratorId, 2);
-		expect(noop).toBeNull();
+		expect(noop).not.toBeNull();
+		expect(noop?.fileCount).toBe(0);
+		expect(noop?.failures).toEqual([]);
 
 		const specCall = await db.query.narratorToolCalls.findFirst({
 			where: eq(narratorToolCalls.toolUseId, specTurn.toolUseId),
-			columns: { treeHashBefore: true, treeHashAfter: true },
+			columns: { ownedPathsJson: true },
 		});
-		expect(specCall?.treeHashBefore).toBe(specCall?.treeHashAfter as string);
+		// Asserted on the owned set rather than on hash equality: in a shared worktree
+		// a neighbour's write makes the hashes differ even for a spec:// call, so hash
+		// equality is not what proves it changed nothing.
+		expect(specCall?.ownedPathsJson).toEqual([]);
 
 		// The earlier real change is still reversible.
 		const result = await revertNarratorScopedFromSeq(narratorId, 1);
@@ -851,7 +868,14 @@ describe("tool-use scoped revert", () => {
 		// reversal is idempotent: reversing one boundary twice is
 		// `merge(base=after, ours=before, theirs=before)` = `before`. A disk-level
 		// assertion would therefore pass with dedupe removed and prove nothing.
-		const row = { toolUseId: "tool-1", messageId: "msg-1", seq: 1, before: "a", after: "b" };
+		const row = {
+			toolUseId: "tool-1",
+			messageId: "msg-1",
+			seq: 1,
+			before: "a",
+			after: "b",
+			ownedPaths: ["a.txt"],
+		};
 		expect(dedupeBoundaryRows([row, { ...row }])).toEqual([row]);
 
 		// The same call cloned under another message is still one change.
@@ -861,9 +885,32 @@ describe("tool-use scoped revert", () => {
 	test("distinct boundaries survive dedupe even when they share a tool id", () => {
 		// A retried call keeps its id but records a different boundary, so both have to
 		// be reversed; collapsing them would leave one change applied.
-		const first = { toolUseId: "tool-1", messageId: "msg-1", seq: 1, before: "a", after: "b" };
+		const first = {
+			toolUseId: "tool-1",
+			messageId: "msg-1",
+			seq: 1,
+			before: "a",
+			after: "b",
+			ownedPaths: ["a.txt"],
+		};
 		const second = { ...first, before: "b", after: "c" };
 		expect(dedupeBoundaryRows([first, second])).toEqual([first, second]);
+	});
+
+	test("clones resolving to different owned sets are both kept", () => {
+		// One clone can carry a recorded set while its twin only has a derived one, and
+		// they need not agree. Collapsing them on the boundary alone would silently
+		// keep whichever was selected first and reverse the wrong set of paths.
+		const recorded = {
+			toolUseId: "tool-1",
+			messageId: "msg-1",
+			seq: 1,
+			before: "a",
+			after: "b",
+			ownedPaths: ["mine.txt"],
+		};
+		const derived = { ...recorded, messageId: "msg-2", ownedPaths: null };
+		expect(dedupeBoundaryRows([recorded, derived])).toEqual([recorded, derived]);
 	});
 
 	test("a duplicated tool-call row still reverts to the pre-call state", async () => {
@@ -970,6 +1017,472 @@ describe("tool-use scoped revert", () => {
 		expect(
 			await revertNarratorScopedForToolUses(narratorId, [{ messageId, toolUseId }]),
 		).toBeNull();
+	});
+});
+
+/**
+ * A worktree is shared by many narrators at once, and a tree hash covers the whole
+ * directory. So the span between one tool's `before` and `after` also contains
+ * whatever the neighbours wrote while it ran — which is how a narrator that only
+ * ran `git log` and `bun test` came to offer reverting three files another narrator
+ * was editing.
+ */
+describe("concurrent writers in a shared worktree", () => {
+	test("a read-only shell turn owns nothing even though the boundaries differ", async () => {
+		const repo = await createRepo("nf-shared-readonly-");
+		const narratorId = await createNarrator(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		writeFileSync(join(repo, "neighbour.txt"), "theirs-v1\n");
+
+		// The reported shape: a shell command that reads (git log / bun test) while
+		// another narrator edits a file in the same directory. The neighbour's own
+		// snapshot hook is what declares its target, so it is opened here exactly as a
+		// concurrent session would.
+		const neighbourId = await createNarrator(repo);
+		const neighbour: TreeSnapshotSession = { cwd: repo };
+		await recordTreeSnapshotBefore(neighbour, neighbourId, "neighbour-edit", ["neighbour.txt"]);
+
+		const turn = await runToolTurn(
+			session,
+			narratorId,
+			1,
+			() => {
+				outsideChange(session, () => {
+					writeFileSync(join(repo, "neighbour.txt"), "theirs-v2\n");
+				});
+			},
+			"Bash",
+			null,
+		);
+
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, turn.toolUseId),
+			columns: { treeHashBefore: true, treeHashAfter: true, ownedPathsJson: true },
+		});
+		// The hashes genuinely moved — that is the trap that made a read-only turn look
+		// destructive. Only the owned set can say the movement was not this call's.
+		expect(row?.treeHashBefore).not.toBe(row?.treeHashAfter);
+		expect(row?.ownedPathsJson).toEqual([]);
+	});
+
+	test("an external write is subtracted from a shell set at rollback time", async () => {
+		const repo = await createRepo("nf-shared-external-");
+		const narratorId = await createNarrator(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		writeFileSync(join(repo, "edited-by-hand.txt"), "v1\n");
+
+		// A terminal or editor declares nothing and holds no claim, so at record time
+		// it is indistinguishable from the shell command's own write. The worktree
+		// watcher does record it, which is what makes it separable later.
+		const turn = await runToolTurn(
+			session,
+			narratorId,
+			1,
+			() => {
+				outsideChange(session, () => {
+					writeFileSync(join(repo, "edited-by-hand.txt"), "v2\n");
+				});
+			},
+			"Bash",
+			null,
+		);
+		const recorded = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, turn.toolUseId),
+			columns: { ownedPathsJson: true },
+		});
+		// Honest about the limit: at record time the path could not be excluded.
+		expect(recorded?.ownedPathsJson).toEqual(["edited-by-hand.txt"]);
+
+		// The watcher's row lands inside the call's real window, which is what bounds the
+		// subtraction. `completedAt` is stamped from the actual clock, exactly as the tool
+		// pipeline does — an earlier version of this test pushed it 60 seconds into the
+		// future, and that fictional window hid the fact that the boundary captures happen
+		// *outside* `[createdAt, completedAt]`: `onSnapshotBefore` runs before the row is
+		// inserted, `onSnapshotAfter` after `completedAt` is written. With a real window,
+		// only the grace applied by the production code makes this subtraction happen.
+		await db
+			.update(narratorToolCalls)
+			.set({ completedAt: new Date().toISOString() })
+			.where(eq(narratorToolCalls.toolUseId, turn.toolUseId));
+		await recordAttribution({
+			deviceId: "local",
+			workspacePath: repo,
+			filePath: "edited-by-hand.txt",
+			narratorId: null,
+			action: "external",
+			toolName: null,
+		});
+
+		// By rollback time the external record exists, so the path is subtracted and
+		// the hand edit is not offered for reverting.
+		const preview = await previewNarratorScopedFromSeq(narratorId, 1);
+		expect(preview.available).toBe(true);
+		expect(preview.files).toEqual([]);
+
+		const result = await revertNarratorScopedFromSeq(narratorId, 1);
+		expect(result).not.toBeNull();
+		expect(result?.fileCount).toBe(0);
+		if (result) finalizeSnapshotRevert(result);
+		expect(readFileSync(join(repo, "edited-by-hand.txt"), "utf8")).toBe("v2\n");
+	});
+
+	test("a narrator that changed nothing reports no files and reverts nothing", async () => {
+		const repo = await createRepo("nf-shared-nothing-");
+		const readerId = await createNarrator(repo);
+		const writerId = await createNarrator(repo);
+		const reader: TreeSnapshotSession = { cwd: repo };
+		const writer: TreeSnapshotSession = { cwd: repo };
+		writeFileSync(join(repo, "theirs.txt"), "v1\n");
+
+		// The writer declares its target, as Write/Edit do.
+		await runToolTurn(
+			writer,
+			writerId,
+			1,
+			() => {
+				writeFileSync(join(repo, "theirs.txt"), "v2\n");
+			},
+			"Edit",
+			["theirs.txt"],
+		);
+		reader._lastTreeHash = undefined;
+		reader._lastTreeHashAt = undefined;
+
+		// The writer's next edit is in flight while the reader's shell command runs —
+		// the interleaving that produced the report.
+		await recordTreeSnapshotBefore(writer, writerId, "writer-second-edit", ["theirs.txt"]);
+		await runToolTurn(
+			reader,
+			readerId,
+			2,
+			() => {
+				outsideChange(reader, () => {
+					writeFileSync(join(repo, "theirs.txt"), "v3\n");
+				});
+			},
+			"Bash",
+			null,
+		);
+
+		const preview = await previewNarratorScopedFromSeq(readerId, 2);
+		// `available: true` is the point: a false here flips the caller to the
+		// workspace scope, whose boundary still contains the writer's edits.
+		expect(preview.available).toBe(true);
+		expect(preview.reason).toBe("nothing_owned");
+		expect(preview.files).toEqual([]);
+		expect(preview.conflicts).toEqual([]);
+
+		// Non-null is equally load-bearing: every caller reads null as "this strategy
+		// does not apply" and falls through to a whole-workspace restore.
+		const result = await revertNarratorScopedFromSeq(readerId, 2);
+		expect(result).not.toBeNull();
+		expect(result?.fileCount).toBe(0);
+		expect(result?.files).toEqual([]);
+		expect(result?.failures).toEqual([]);
+		if (result) finalizeSnapshotRevert(result);
+
+		// The writer's work is untouched, byte for byte.
+		expect(readFileSync(join(repo, "theirs.txt"), "utf8")).toBe("v3\n");
+	});
+
+	test("a declared write owns only its own path, not a neighbour's concurrent one", async () => {
+		const repo = await createRepo("nf-shared-declared-");
+		const mineId = await createNarrator(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		writeFileSync(join(repo, "mine.txt"), "mine-v1\n");
+		writeFileSync(join(repo, "theirs.txt"), "theirs-v1\n");
+
+		const turn = await runToolTurn(
+			session,
+			mineId,
+			1,
+			() => {
+				writeFileSync(join(repo, "mine.txt"), "mine-v2\n");
+				// Lands inside the same window, from another actor.
+				outsideChange(session, () => {
+					writeFileSync(join(repo, "theirs.txt"), "theirs-v2\n");
+				});
+			},
+			"Edit",
+			["mine.txt"],
+		);
+
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, turn.toolUseId),
+			columns: { ownedPathsJson: true },
+		});
+		expect(row?.ownedPathsJson).toEqual(["mine.txt"]);
+
+		const preview = await previewNarratorScopedFromSeq(mineId, 1);
+		expect(preview.files.map((file) => file.relPath)).toEqual(["mine.txt"]);
+
+		const result = await revertNarratorScopedFromSeq(mineId, 1);
+		expect(result?.failures).toEqual([]);
+		if (result) finalizeSnapshotRevert(result);
+		expect(readFileSync(join(repo, "mine.txt"), "utf8")).toBe("mine-v1\n");
+		// The neighbour's file must survive: it was never this call's to revert.
+		expect(readFileSync(join(repo, "theirs.txt"), "utf8")).toBe("theirs-v2\n");
+	});
+
+	test("a shell turn subtracts a neighbour's declared path but keeps its own writes", async () => {
+		const repo = await createRepo("nf-shared-shell-");
+		const shellId = await createNarrator(repo);
+		const neighbourId = await createNarrator(repo);
+		const shell: TreeSnapshotSession = { cwd: repo };
+		const neighbourSession: TreeSnapshotSession = { cwd: repo };
+		writeFileSync(join(repo, "built.txt"), "old-build\n");
+		writeFileSync(join(repo, "theirs.txt"), "theirs-v1\n");
+
+		// The neighbour's claim has to be open while the shell command runs, which is
+		// what the subtraction relies on.
+		await recordTreeSnapshotBefore(neighbourSession, neighbourId, "neighbour-tool", ["theirs.txt"]);
+
+		const turn = await runToolTurn(
+			shell,
+			shellId,
+			1,
+			() => {
+				// The shell command's own write, which no tool input describes.
+				writeFileSync(join(repo, "built.txt"), "new-build\n");
+				outsideChange(shell, () => {
+					writeFileSync(join(repo, "theirs.txt"), "theirs-v2\n");
+				});
+			},
+			"Bash",
+			null,
+		);
+
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, turn.toolUseId),
+			columns: { ownedPathsJson: true },
+		});
+		// Its own build output is kept; the declared neighbour path is removed.
+		expect(row?.ownedPathsJson).toEqual(["built.txt"]);
+
+		const result = await revertNarratorScopedFromSeq(shellId, 1);
+		expect(result?.failures).toEqual([]);
+		if (result) finalizeSnapshotRevert(result);
+		expect(readFileSync(join(repo, "built.txt"), "utf8")).toBe("old-build\n");
+		expect(readFileSync(join(repo, "theirs.txt"), "utf8")).toBe("theirs-v2\n");
+	});
+
+	test("history with no owned set at all still reports no_boundaries and falls back", async () => {
+		const repo = await createRepo("nf-shared-legacy-");
+		const narratorId = await createNarrator(repo);
+		const messageId = generateId();
+		const now = new Date().toISOString();
+		await db.insert(narratorMessages).values({
+			id: messageId,
+			narratorId,
+			role: "assistant",
+			contentJson: [],
+			createdAt: now,
+		});
+		await db
+			.insert(narratorMessageRefs)
+			.values({ id: generateId(), narratorId, messageId, seq: 1 });
+		await db.insert(narratorToolCalls).values({
+			id: generateId(),
+			narratorId,
+			messageId,
+			toolUseId: generateId(),
+			toolName: "Edit",
+			inputJson: {},
+			status: "success",
+			createdAt: now,
+		});
+
+		// Guards the distinction the fix rests on: `nothing_owned` must not swallow the
+		// genuine "nothing recorded" case, whose replay fallback is still correct.
+		const preview = await previewNarratorScopedFromSeq(narratorId, 1);
+		expect(preview.available).toBe(false);
+		expect(preview.reason).toBe("no_boundaries");
+		expect(await revertNarratorScopedFromSeq(narratorId, 1)).toBeNull();
+	});
+});
+
+/**
+ * A rollback and a preview both run on the thread that serves every other request,
+ * so their cost has to be bounded by the change set rather than by history size.
+ */
+describe("request-bounded selection and preview", () => {
+	test("an external write inside the real window is subtracted without a fake window", async () => {
+		const repo = await createRepo("nf-scoped-real-window-");
+		const narratorId = await createNarrator(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		writeFileSync(join(repo, "by-hand.txt"), "v1\n");
+
+		// The gap the DB window cannot see: `onSnapshotBefore` captures the boundary on
+		// the `tool_call` event, before the tool-call row exists. An external write that
+		// lands there is inside the span the hashes describe but outside
+		// `[createdAt, completedAt]`, so without the grace it escapes the subtraction and
+		// the rollback would undo someone's hand edit.
+		const beforeRow = new Date().toISOString();
+		await recordAttribution({
+			deviceId: "local",
+			workspacePath: repo,
+			filePath: "by-hand.txt",
+			narratorId: null,
+			action: "external",
+			toolName: null,
+		});
+		const turn = await runToolTurn(
+			session,
+			narratorId,
+			1,
+			() => {
+				outsideChange(session, () => {
+					writeFileSync(join(repo, "by-hand.txt"), "v2\n");
+				});
+			},
+			"Bash",
+			null,
+		);
+		// The row is stamped *after* the attribution, reproducing the real ordering.
+		await db
+			.update(narratorToolCalls)
+			.set({ createdAt: new Date(Date.parse(beforeRow) + 200).toISOString() })
+			.where(eq(narratorToolCalls.toolUseId, turn.toolUseId));
+
+		const preview = await previewNarratorScopedFromSeq(narratorId, 1);
+		expect(preview.available).toBe(true);
+		expect(preview.files).toEqual([]);
+		expect(readFileSync(join(repo, "by-hand.txt"), "utf8")).toBe("v2\n");
+	});
+
+	test("a window past the boundary-row limit is refused, not silently widened", async () => {
+		const repo = await createRepo("nf-scoped-window-cap-");
+		const narratorId = await createNarrator(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		writeFileSync(join(repo, "a.txt"), "v0\n");
+
+		const turn = await runToolTurn(session, narratorId, 1, () => {
+			writeFileSync(join(repo, "a.txt"), "v1\n");
+		});
+		// Cloning one recorded row past the limit is what makes this reachable without
+		// running a thousand real turns; the selection cap counts rows, not distinct
+		// changes.
+		const original = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, turn.toolUseId),
+		});
+		if (!original) throw new Error("expected the recorded tool call");
+		for (let index = 0; index < 1_001; index++) {
+			await db.insert(narratorToolCalls).values({
+				...original,
+				id: generateId(),
+				toolUseId: `clone-${index}`,
+			});
+		}
+
+		// A failure, not null: null makes every caller widen to a whole-workspace
+		// restore, so an over-large window would undo more than the user selected —
+		// precisely because it was too large to compute precisely.
+		const result = await revertNarratorScopedFromSeq(narratorId, 1);
+		expect(result).not.toBeNull();
+		expect(result?.failures.map((f) => f.code)).toEqual(["PREPARE_FAILED"]);
+		expect(result?.failures[0]?.message).toMatch(/too many to roll back/);
+		// Nothing was written.
+		expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("v1\n");
+
+		const preview = await previewNarratorScopedFromSeq(narratorId, 1);
+		expect(preview.reason).toBe("window_too_large");
+		expect(preview.files).toEqual([]);
+	});
+
+	test("a preview caps its file list but still reports the real total", async () => {
+		const repo = await createRepo("nf-scoped-preview-cap-");
+		const narratorId = await createNarrator(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+
+		// Comfortably over the content cap and under the list cap, so the list is
+		// complete while contents stop early: attaching content for every file is two
+		// `cat-file` runs per side, which is what made one GET spawn hundreds of
+		// processes.
+		await runToolTurn(session, narratorId, 1, () => {
+			for (let index = 0; index < 60; index++) {
+				writeFileSync(join(repo, `f-${index}.txt`), `v${index}\n`);
+			}
+		});
+
+		const preview = await previewNarratorScopedFromSeq(narratorId, 1, { withContents: true });
+		expect(preview.available).toBe(true);
+		expect(preview.totalFileCount).toBe(60);
+		expect(preview.files).toHaveLength(60);
+		expect(preview.hasMore).toBeUndefined();
+		// The first files carry a diff body; the tail is listed without one.
+		const withContent = preview.files.filter((file) => file.currentContent !== undefined);
+		expect(withContent).toHaveLength(50);
+
+		// The rollback itself is never capped: it has to reverse the whole window.
+		const result = await revertNarratorScopedFromSeq(narratorId, 1);
+		expect(result?.failures).toEqual([]);
+		if (result) finalizeSnapshotRevert(result);
+		expect(result?.fileCount).toBe(60);
+		expect(existsSync(join(repo, "f-59.txt"))).toBe(false);
+	});
+
+	test("a legacy row whose path does not match the current cwd still undoes the change", async () => {
+		const repo = await createRepo("nf-scoped-legacy-mismatch-");
+		const narratorId = await createNarrator(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		writeFileSync(join(repo, "a.txt"), "v1\n");
+
+		const turn = await runToolTurn(session, narratorId, 1, () => {
+			writeFileSync(join(repo, "a.txt"), "v2\n");
+		});
+		// The pre-owned-set shape, with an absolute path under a worktree this narrator no
+		// longer resolves to — what a dormant chapter looks like, since it falls back to
+		// the project repo. `relative()` yields `..`, which used to be reported as
+		// "declared, owns nothing": the pair was then dropped, the window resolved to
+		// `nothing_owned`, and the user saw "success, 0 files" with the file still changed
+		// and no replay attempted.
+		await db
+			.update(narratorToolCalls)
+			.set({
+				ownedPathsJson: null,
+				resolvedFilePath: "/somewhere/else/.worktrees/old/a.txt",
+			})
+			.where(eq(narratorToolCalls.toolUseId, turn.toolUseId));
+
+		// Reported as unknown instead, which keeps the legacy whole-tree reversal for that
+		// segment — so the recorded boundary is still honoured and the change is undone.
+		const preview = await previewNarratorScopedFromSeq(narratorId, 1);
+		expect(preview.available).toBe(true);
+		expect(preview.reason).toBeUndefined();
+		expect(preview.files.map((file) => file.relPath)).toEqual(["a.txt"]);
+
+		const result = await revertNarratorScopedFromSeq(narratorId, 1);
+		expect(result?.failures).toEqual([]);
+		expect(result?.fileCount).toBe(1);
+		if (result) finalizeSnapshotRevert(result);
+		expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("v1\n");
+	});
+
+	test("a legacy spec:// row is a positive no-op rather than unknown", async () => {
+		const repo = await createRepo("nf-scoped-legacy-spec-");
+		const narratorId = await createNarrator(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		writeFileSync(join(repo, "a.txt"), "v1\n");
+
+		const turn = await runToolTurn(session, narratorId, 1, () => {
+			// A spec:// write touches no file on disk; a neighbour moves the tree instead.
+			outsideChange(session, () => {
+				writeFileSync(join(repo, "a.txt"), "moved-by-someone-else\n");
+			});
+		});
+		await db
+			.update(narratorToolCalls)
+			.set({ ownedPathsJson: null, resolvedFilePath: "spec://tasks.json" })
+			.where(eq(narratorToolCalls.toolUseId, turn.toolUseId));
+
+		// Virtual files never reached any worktree, so this is provable regardless of
+		// which directory the narrator resolves to now — and it must not be confused with
+		// the path-mismatch case above.
+		const result = await revertNarratorScopedFromSeq(narratorId, 1);
+		expect(result).not.toBeNull();
+		expect(result?.fileCount).toBe(0);
+		if (result) finalizeSnapshotRevert(result);
+		expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("moved-by-someone-else\n");
 	});
 });
 

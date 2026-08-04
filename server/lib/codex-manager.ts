@@ -2,7 +2,7 @@
 // Manages ChatGPT Pro/Plus OAuth tokens for the codex provider
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
 	type AgentIdentityKey,
@@ -124,10 +124,23 @@ export interface CodexCredential {
 	disabledReason?: DisabledReason;
 	/** Epoch milliseconds when quota resets (from API error.resets_at). */
 	quotaResetsAt?: number;
+	/**
+	 * Epoch milliseconds when this credential was archived. Archived credentials
+	 * are retired from the pool — never selected for requests, excluded from the
+	 * availability counters and the usage scheduler — but all of their data
+	 * (usage snapshots, history, stats) is kept so the credential can be brought
+	 * back with `unarchiveCredential`. Absent = active.
+	 */
+	archivedAt?: number;
 	/** Cached usage snapshot persisted with credential. */
 	usage?: CodexUsageResult;
 	/** Rolling usage snapshots used to extend quota forecasts into the recent past. */
 	usageHistory?: CodexUsageHistoryEntry[];
+}
+
+/** Archived credentials are retired from the pool but keep all of their data. */
+export function isArchivedCodexCredential(cred: Pick<CodexCredential, "archivedAt">): boolean {
+	return typeof cred.archivedAt === "number" && cred.archivedAt > 0;
 }
 
 /** Resolve the effective auth mode for a credential (absent = oauth). */
@@ -152,6 +165,18 @@ function isUnhealthyDisabledCredential(entry: {
 	);
 }
 
+/**
+ * The PUBLIC shape of a credential: what `/api/codex/status` and friends hand to the
+ * browser.
+ *
+ * ⚠️ NO SECRETS, EVER. `CodexCredential` carries `refreshToken`, `accessToken` and
+ * `agentPrivateKey`; none of them may appear here, and neither may any future secret
+ * field. This type is the boundary — `mapEntry` builds it by listing fields explicitly
+ * rather than spreading the credential, so a new secret on `CodexCredential` cannot
+ * leak by default. Keep it that way: adding a field here means deciding that the value
+ * is safe for any authenticated user's browser (and for logs and bug reports, since
+ * this response ends up in both).
+ */
 export interface CredentialSnapshot {
 	id: string;
 	displayName?: string;
@@ -161,6 +186,8 @@ export interface CredentialSnapshot {
 	priority: number;
 	disabled: boolean;
 	disabledReason?: DisabledReason;
+	/** Epoch milliseconds when archived; absent for active credentials. */
+	archivedAt?: number;
 	successCount: number;
 	failureCount: number;
 	lastUsedAt?: string;
@@ -180,8 +207,11 @@ export interface ManagerSnapshot {
 	entries: CredentialSnapshot[];
 	availableEntries: CredentialSnapshot[];
 	unavailableEntries: CredentialSnapshot[];
+	/** Retired credentials: out of the pool, data retained. */
+	archivedEntries: CredentialSnapshot[];
 	availableTotal: number;
 	unavailableTotal: number;
+	archivedTotal: number;
 	unhealthyTotal: number;
 	currentId: string;
 	loadBalancingMode: LoadBalancingMode;
@@ -239,6 +269,7 @@ export interface PublicCodexQuotaOverview {
 export interface SnapshotOptions {
 	availablePage?: number;
 	unavailablePage?: number;
+	archivedPage?: number;
 	pageSize?: number;
 }
 
@@ -316,6 +347,29 @@ function getCredentialsPath(baseDir?: string): string {
 
 function getStatsPath(baseDir?: string): string {
 	return resolve(getCodexDataDir(baseDir), STATS_FILE);
+}
+
+/**
+ * Write a file containing secrets with owner-only permissions (0o600).
+ *
+ * The Codex credential file holds refresh tokens, personal access tokens and
+ * Agent Identity Ed25519 private keys. A plain writeFileSync lands on the umask
+ * default (usually 0o644), i.e. world-readable — every other secret store in the
+ * so this matches.
+ *
+ * `mode` only applies when the file is created, so pre-existing files from
+ * earlier versions are chmod'd as well. Both the mode argument and the chmod are
+ * no-ops on Windows, where NTFS ACLs govern access instead; the chmod failure is
+ * swallowed rather than treated as an error there.
+ */
+function writeSecretFile(path: string, contents: string): void {
+	writeFileSync(path, contents, { mode: 0o600 });
+	if (process.platform === "win32") return;
+	try {
+		chmodSync(path, 0o600);
+	} catch {
+		// Network filesystems can reject chmod; the file content is already written.
+	}
 }
 
 // === Helpers ===
@@ -697,7 +751,9 @@ export class CodexManager {
 		this.reviveQuotaResetCredentials();
 		this.applyCachedQuotaStates();
 		this.pruneSessionAffinity();
-		const total = this.entries.length;
+		// Archived credentials are retired: they never participate in selection, so
+		// the retry budget must only count the pool that can actually serve.
+		const total = this.poolEntries.length;
 		const triedIds = new Set<string>();
 		const stickyEnabled =
 			(this.loadBalancingMode === "balanced" || this.loadBalancingMode === "tier-balanced") &&
@@ -707,7 +763,7 @@ export class CodexManager {
 			const sticky = this.sessionAffinity.get(sessionKey);
 			if (sticky) {
 				const stickyEntry = this.entries.find((e) => e.id === sticky.credentialId);
-				if (!stickyEntry || stickyEntry.disabled) {
+				if (!stickyEntry || stickyEntry.disabled || isArchivedCodexCredential(stickyEntry)) {
 					this.unbindSession(sessionKey);
 				} else {
 					const ctx = await this.tryEnsureToken(stickyEntry);
@@ -755,9 +811,15 @@ export class CodexManager {
 		throw new Error(`All Codex credentials exhausted (available: ${this.availableCount}/${total})`);
 	}
 
+	/** Credentials that are still part of the live pool (i.e. not archived). */
+	private get poolEntries(): CodexCredential[] {
+		return this.entries.filter((e) => !isArchivedCodexCredential(e));
+	}
+
 	private selectEntry(excludeIds?: Set<string>): CodexCredential | null {
 		const available = this.entries.filter((e) => {
 			if (e.disabled) return false;
+			if (isArchivedCodexCredential(e)) return false;
 			if (excludeIds?.has(e.id)) return false;
 			return true;
 		});
@@ -1055,7 +1117,7 @@ export class CodexManager {
 
 		this.saveStatsDebounced();
 		this.rescheduleUsageRefresh();
-		return this.entries.some((e) => !e.disabled);
+		return this.hasUsablePoolCredential();
 	}
 
 	reportQuotaExhausted(id: string, resetsAt?: number): boolean {
@@ -1076,7 +1138,7 @@ export class CodexManager {
 
 		this.saveStatsDebounced();
 		this.rescheduleUsageRefresh();
-		return this.entries.some((e) => !e.disabled);
+		return this.hasUsablePoolCredential();
 	}
 
 	async reportQuotaExhaustedAndRefreshUsage(id: string, resetsAt?: number): Promise<boolean> {
@@ -1095,7 +1157,7 @@ export class CodexManager {
 			});
 		}
 
-		return this.entries.some((e) => !e.disabled);
+		return this.hasUsablePoolCredential();
 	}
 
 	markBanned(id: string): boolean {
@@ -1116,25 +1178,27 @@ export class CodexManager {
 
 		this.saveStatsDebounced();
 		this.rescheduleUsageRefresh();
-		return this.entries.some((e) => !e.disabled);
+		return this.hasUsablePoolCredential();
 	}
 
 	// ==================== Self-healing ====================
 
 	private trySelfHeal(): boolean {
 		const revivedQuota = this.reviveQuotaResetCredentials();
-		const hasTooManyFailures = this.entries.some(
+		// Archived credentials are retired, so healing them would only churn the
+		// credentials file without ever making a request possible.
+		const pool = this.poolEntries;
+		const hasTooManyFailures = pool.some(
 			(e) => e.disabled && e.disabledReason === "too_many_failures",
 		);
 		if (!hasTooManyFailures) return revivedQuota;
 
-		for (const e of this.entries) {
-			if (e.disabledReason === "too_many_failures") {
-				e.disabled = false;
-				e.disabledReason = undefined;
-				const stats = this.stats.get(e.id);
-				if (stats) stats.failureCount = 0;
-			}
+		for (const e of pool) {
+			if (e.disabledReason !== "too_many_failures") continue;
+			e.disabled = false;
+			e.disabledReason = undefined;
+			const stats = this.stats.get(e.id);
+			if (stats) stats.failureCount = 0;
 		}
 		this.saveCredentials();
 		this.schedulePublicQuotaOverviewBroadcast();
@@ -1143,7 +1207,9 @@ export class CodexManager {
 
 	private reviveQuotaResetCredentials(now = Date.now()): boolean {
 		let changed = false;
-		for (const e of this.entries) {
+		// Archived credentials keep the state they had when retired; unarchiving
+		// runs this again so a since-reset quota is cleared on the way back in.
+		for (const e of this.poolEntries) {
 			if (e.disabledReason !== "quota_exhausted") continue;
 			if (!e.quotaResetsAt || e.quotaResetsAt > now) continue;
 			e.disabled = false;
@@ -1183,6 +1249,9 @@ export class CodexManager {
 	}
 
 	private shouldTrackUsageReset(entry: CodexCredential): boolean {
+		// Archived credentials can still be refreshed on demand, but the scheduler
+		// must not spend upstream requests on credentials that cannot serve traffic.
+		if (isArchivedCodexCredential(entry)) return false;
 		if (
 			entry.disabledReason === "manual" ||
 			entry.disabledReason === "too_many_failures" ||
@@ -1293,8 +1362,11 @@ export class CodexManager {
 		this.pruneSessionAffinity();
 
 		const now = Date.now();
-		const summary = buildCodexUsageSummary(this.entries, now);
-		const trend = buildCodexUsageForecast(this.entries, now);
+		// Remaining-capacity numbers must reflect what can actually serve traffic,
+		// so retired credentials are excluded from the quota rollup.
+		const pool = this.poolEntries;
+		const summary = buildCodexUsageSummary(pool, now);
+		const trend = buildCodexUsageForecast(pool, now);
 		const visibleTiers = this.getEffectiveTierOrder().filter(
 			(tier): tier is PublicCodexPlanTier =>
 				tier !== "other" && (summary.byTier[tier]?.accountCount ?? 0) > 0,
@@ -1397,6 +1469,7 @@ export class CodexManager {
 				priority: e.priority,
 				disabled: e.disabled,
 				disabledReason: e.disabledReason,
+				archivedAt: e.archivedAt,
 				successCount: stats?.successCount ?? 0,
 				failureCount: stats?.failureCount ?? 0,
 				lastUsedAt: stats?.lastUsedAt,
@@ -1406,9 +1479,13 @@ export class CodexManager {
 			};
 		};
 
-		const allAvailable = this.entries.filter((e) => !e.disabled);
-		const allUnavailable = this.entries.filter((e) => e.disabled);
-		const unhealthyTotal = this.entries.filter(isUnhealthyDisabledCredential).length;
+		// Archived credentials form their own bucket: they are neither "available"
+		// (never selected) nor "unavailable" (not a health problem to act on).
+		const pool = this.poolEntries;
+		const allAvailable = pool.filter((e) => !e.disabled);
+		const allUnavailable = pool.filter((e) => e.disabled);
+		const allArchived = this.entries.filter(isArchivedCodexCredential);
+		const unhealthyTotal = pool.filter(isUnhealthyDisabledCredential).length;
 
 		const pageSize = opts?.pageSize ?? 0; // 0 = no pagination
 		const isPaged = pageSize > 0;
@@ -1423,10 +1500,12 @@ export class CodexManager {
 
 		const pagedAvailable = slicePage(allAvailable, opts?.availablePage);
 		const pagedUnavailable = slicePage(allUnavailable, opts?.unavailablePage);
+		const pagedArchived = slicePage(allArchived, opts?.archivedPage);
 
 		const availableSnapshots = pagedAvailable.map(mapEntry);
 		const unavailableSnapshots = pagedUnavailable.map(mapEntry);
-		const allPagedEntries = [...availableSnapshots, ...unavailableSnapshots];
+		const archivedSnapshots = pagedArchived.map(mapEntry);
+		const allPagedEntries = [...availableSnapshots, ...unavailableSnapshots, ...archivedSnapshots];
 
 		// Only include usage for paged entries to reduce payload
 		const usageCacheObj: Record<string, CodexUsageResult> = {};
@@ -1440,8 +1519,10 @@ export class CodexManager {
 			entries: allPagedEntries,
 			availableEntries: availableSnapshots,
 			unavailableEntries: unavailableSnapshots,
+			archivedEntries: archivedSnapshots,
 			availableTotal: allAvailable.length,
 			unavailableTotal: allUnavailable.length,
+			archivedTotal: allArchived.length,
 			unhealthyTotal,
 			currentId: this.currentId,
 			loadBalancingMode: this.loadBalancingMode,
@@ -1451,8 +1532,8 @@ export class CodexManager {
 			available: allAvailable.length,
 			stickySessionCount: this.sessionAffinity.size,
 			usageCache: usageCacheObj,
-			usageSummary: buildCodexUsageSummary(this.entries, now),
-			usageForecast: buildCodexUsageForecast(this.entries, now),
+			usageSummary: buildCodexUsageSummary(pool, now),
+			usageForecast: buildCodexUsageForecast(pool, now),
 			usageScheduler: this.getUsageSchedulerSnapshot(),
 			usageQueue: codexUsageQueue.getSnapshot(),
 			lastBrowserAuthError: this._lastBrowserAuthError,
@@ -1561,9 +1642,55 @@ export class CodexManager {
 	}
 
 	removeUnhealthyCredentials(): { removed: string[]; reasons: DisabledReason[] } {
-		const ids = this.entries.filter(isUnhealthyDisabledCredential).map((entry) => entry.id);
+		// Archiving is the explicit "retire but keep the data" action, so the
+		// bulk unhealthy sweep must never delete something the user archived.
+		const ids = this.poolEntries.filter(isUnhealthyDisabledCredential).map((entry) => entry.id);
 		const result = this.removeCredentials(ids);
 		return { removed: result.removed, reasons: [...UNHEALTHY_DISABLED_REASONS] };
+	}
+
+	/**
+	 * Retire a credential from the pool while keeping every byte of its data
+	 * (usage snapshot, rolling history, success/failure stats). Archived
+	 * credentials are never selected for requests and are skipped by the usage
+	 * scheduler, but can still be refreshed on demand and brought back with
+	 * `unarchiveCredential`.
+	 */
+	archiveCredential(id: string): void {
+		const entry = this.entries.find((e) => e.id === id);
+		if (!entry) throw new Error(`Credential not found: ${id}`);
+		if (isArchivedCodexCredential(entry)) return;
+
+		entry.archivedAt = Date.now();
+		// A retired credential must not keep serving sticky sessions, and the
+		// scheduler bookkeeping for it is meaningless while it is out of the pool.
+		this.evictSessionsByCredential(id);
+		this.usageSchedulerRetryAfter.delete(id);
+		if (this.currentId === id) {
+			this.currentId = this.poolEntries[0]?.id ?? "";
+		}
+		this.saveCredentials();
+		this.rescheduleUsageRefresh();
+		this.schedulePublicQuotaOverviewBroadcast();
+		logger.info("Codex credential archived", { credentialId: id, accountId: entry.accountId });
+	}
+
+	/** Bring an archived credential back into the pool with its data intact. */
+	unarchiveCredential(id: string): void {
+		const entry = this.entries.find((e) => e.id === id);
+		if (!entry) throw new Error(`Credential not found: ${id}`);
+		if (!isArchivedCodexCredential(entry)) return;
+
+		entry.archivedAt = undefined;
+		if (!this.currentId) this.currentId = entry.id;
+		this.saveCredentials();
+		// Quota state was frozen at archive time: a since-elapsed reset should be
+		// cleared, and a still-exhausted window re-applied, before it serves again.
+		this.reviveQuotaResetCredentials();
+		this.applyCachedQuotaStates();
+		this.rescheduleUsageRefresh();
+		this.schedulePublicQuotaOverviewBroadcast();
+		logger.info("Codex credential unarchived", { credentialId: id, accountId: entry.accountId });
 	}
 
 	updateCredential(id: string, fields: { displayName?: string; priority?: number }): void {
@@ -1716,7 +1843,9 @@ export class CodexManager {
 
 	private applyCachedQuotaStates(now = Date.now()): boolean {
 		let changed = false;
-		for (const entry of this.entries) {
+		// Archived credentials are not selectable, so pre-emptively disabling them
+		// on cached quota data would only rewrite the credentials file for nothing.
+		for (const entry of this.poolEntries) {
 			if (entry.disabled || !entry.usage) continue;
 			const quotaState = this.evaluateQuotaFromUsage(entry.usage, now);
 			if (!quotaState.exhausted) continue;
@@ -2133,7 +2262,7 @@ export class CodexManager {
 			const baseDir = this.options?.homeDir;
 			const path = getCredentialsPath(baseDir);
 			mkdirSync(getCodexDataDir(baseDir), { recursive: true });
-			writeFileSync(path, JSON.stringify(this.entries, null, 2));
+			writeSecretFile(path, JSON.stringify(this.entries, null, 2));
 		} catch (err) {
 			logger.warn("Failed to save Codex credentials", {
 				error: err instanceof Error ? err.message : String(err),
@@ -2181,8 +2310,23 @@ export class CodexManager {
 
 	// ==================== Accessors ====================
 
+	/** Enabled, non-archived credentials — i.e. what can actually serve a request. */
 	get availableCount(): number {
-		return this.entries.filter((e) => !e.disabled).length;
+		return this.poolEntries.filter((e) => !e.disabled).length;
+	}
+
+	/** Number of retired credentials whose data is retained. */
+	get archivedCount(): number {
+		return this.entries.filter(isArchivedCodexCredential).length;
+	}
+
+	/**
+	 * Whether any credential in the live pool can still serve a request. Callers
+	 * use this as the "should I fail over?" signal, so archived credentials must
+	 * not count: they are never selected.
+	 */
+	private hasUsablePoolCredential(): boolean {
+		return this.poolEntries.some((e) => !e.disabled);
 	}
 
 	get hasCredentials(): boolean {

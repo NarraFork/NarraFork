@@ -216,6 +216,11 @@ function traceRevision(d: Record<string, unknown>): string {
 		if (typeof r.key === "string") rev += `|tk:${r.key}`;
 		if (typeof r.title === "string") rev += `|tt:${textSignature(r.title)}`;
 		if (typeof r.status === "string") rev += `|ts:${r.status}`;
+		// A gate's status is height-neutral but PAINTED from the cached payload (it picks
+		// the row's shimmer colour), so it needs keying for the same reason `status` does:
+		// a gate resolving does not necessarily move the tool's own status, and a stale
+		// entry would keep a settled row purple.
+		if (typeof r.reflectionStatus === "string") rev += `|trs:${r.reflectionStatus}`;
 		// The row's duration is height-neutral but PAINTED from the cached payload, so
 		// it needs the same treatment `timeoutMs` gets above. `status` normally moves
 		// with it (running → success arrives together with `durationMs`); this keys the

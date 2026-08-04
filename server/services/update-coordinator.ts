@@ -15,6 +15,13 @@ export type UpdatePhase = "idle" | "draining_background_bash" | "quiescing_tools
 export type UpdateExecutionKind = "background_bash" | "ordinary" | "resumable";
 type LegacyUpdateExecutionKind = "bash" | "subagent";
 
+export interface UpdateWaitBlocker {
+	kind: "background_bash" | "ordinary" | "response" | "tool_start_grant" | "pre_admission";
+	narratorId?: string;
+	toolUseId?: string;
+	waitingMs: number;
+}
+
 export interface UpdateCoordinationStatus {
 	phase: UpdatePhase;
 	scheduled: boolean;
@@ -29,7 +36,13 @@ export interface UpdateCoordinationStatus {
 	activeResponseCount: number;
 	/** Compatibility total for callers that have not migrated to per-kind counts. */
 	pendingExecutionCount: number;
+	/** Whether an administrator asked to abandon the scheduled update. */
+	cancelRequested: boolean;
+	/** Oldest blockers holding the current wait open, for operator diagnosis. */
+	blockers: UpdateWaitBlocker[];
 	error?: string;
+	/** Distinguishes an operator cancellation from a genuine update failure. */
+	errorKind?: "failed" | "cancelled";
 }
 
 export interface NarratorRecoveryTarget {
@@ -79,6 +92,21 @@ interface CoordinatorState {
 	targetVersion?: string;
 	updateEpoch?: string;
 	error?: string;
+	errorKind?: "failed" | "cancelled";
+	/** Set by cancelScheduledUpdate; every unbounded wait observes it as a stop request. */
+	cancelRequestedEpoch?: string;
+}
+
+/**
+ * Raised by an unbounded coordination wait once an administrator cancels the scheduled
+ * update. Callers must treat this as "abandon this attempt", not as an update failure
+ * caused by narrator work.
+ */
+export class UpdateCancelledError extends Error {
+	constructor(readonly updateEpoch: string) {
+		super(`Scheduled update ${updateEpoch} was cancelled by an administrator`);
+		this.name = "UpdateCancelledError";
+	}
 }
 
 interface ExecutionRecord {
@@ -164,9 +192,14 @@ if (state.phase !== "idle" && !state.updateEpoch) {
 	state.updateEpoch = generateUpdateEpoch();
 }
 
-let backgroundBashDrainWaiters: Array<() => void> = [];
-let ordinaryDrainWaiters: Array<() => void> = [];
-let checkpointFenceWaiters: Array<() => void> = [];
+interface CoordinationWaiter {
+	resolve: () => void;
+	cancel: (error: UpdateCancelledError) => void;
+}
+
+let backgroundBashDrainWaiters: CoordinationWaiter[] = [];
+let ordinaryDrainWaiters: CoordinationWaiter[] = [];
+let checkpointFenceWaiters: CoordinationWaiter[] = [];
 const gateWaiters = new Map<string, GateWaiter>();
 
 function generateToken(prefix: string): string {
@@ -193,6 +226,47 @@ function countExecutions(kind: UpdateExecutionKind): number {
 	return count;
 }
 
+/** How many blockers a status payload reports; enough to diagnose, bounded for the API. */
+const STATUS_BLOCKER_LIMIT = 10;
+
+function collectBlockers(now: number): UpdateWaitBlocker[] {
+	const blockers: UpdateWaitBlocker[] = [];
+	for (const record of executions.values()) {
+		const kind = normalizeExecutionKind(record.kind);
+		// Resumable work never blocks a restart, so it is not a blocker.
+		if (kind === "resumable") continue;
+		blockers.push({
+			kind,
+			...(record.narratorId ? { narratorId: record.narratorId } : {}),
+			waitingMs: now - record.startedAt,
+		});
+	}
+	for (const record of responseActivities.values()) {
+		blockers.push({
+			kind: "response",
+			narratorId: record.narratorId,
+			waitingMs: now - record.startedAt,
+		});
+	}
+	for (const record of toolStartGrants.values()) {
+		blockers.push({
+			kind: "tool_start_grant",
+			narratorId: record.narratorId,
+			toolUseId: record.toolUseId,
+			waitingMs: now - record.startedAt,
+		});
+	}
+	for (const record of preAdmissionActivities.values()) {
+		blockers.push({
+			kind: "pre_admission",
+			narratorId: record.narratorId,
+			...(record.toolUseId ? { toolUseId: record.toolUseId } : {}),
+			waitingMs: now - record.startedAt,
+		});
+	}
+	return blockers.sort((a, b) => b.waitingMs - a.waitingMs).slice(0, STATUS_BLOCKER_LIMIT);
+}
+
 function resolveStatus(): UpdateCoordinationStatus {
 	const pendingBackgroundBashCount = countExecutions("background_bash");
 	const pendingOrdinaryExecutionCount = countExecutions("ordinary");
@@ -211,7 +285,9 @@ function resolveStatus(): UpdateCoordinationStatus {
 		pendingExecutionCount:
 			pendingBackgroundBashCount + pendingOrdinaryExecutionCount + resumableExecutionCount,
 		pendingToolStartGrantCount: toolStartGrants.size,
-		...(state.error ? { error: state.error } : {}),
+		cancelRequested: isUpdateCancelRequested(),
+		blockers: state.phase === "idle" ? [] : collectBlockers(Date.now()),
+		...(state.error ? { error: state.error, errorKind: state.errorKind ?? "failed" } : {}),
 	};
 }
 
@@ -219,12 +295,12 @@ function resolveDrainWaitersIfReady(): void {
 	if (countExecutions("background_bash") === 0 && backgroundBashDrainWaiters.length > 0) {
 		const waiters = backgroundBashDrainWaiters;
 		backgroundBashDrainWaiters = [];
-		for (const resolve of waiters) resolve();
+		for (const waiter of waiters) waiter.resolve();
 	}
 	if (countExecutions("ordinary") === 0 && ordinaryDrainWaiters.length > 0) {
 		const waiters = ordinaryDrainWaiters;
 		ordinaryDrainWaiters = [];
-		for (const resolve of waiters) resolve();
+		for (const waiter of waiters) waiter.resolve();
 	}
 }
 
@@ -238,7 +314,7 @@ function resolveCheckpointFenceWaitersIfReady(): void {
 	if (!checkpointFenceIsStable() || checkpointFenceWaiters.length === 0) return;
 	const waiters = checkpointFenceWaiters;
 	checkpointFenceWaiters = [];
-	for (const resolve of waiters) resolve();
+	for (const waiter of waiters) waiter.resolve();
 }
 
 function registerCheckpointActivity(
@@ -288,6 +364,131 @@ export function isUpdateScheduled(): boolean {
 	return state.phase !== "idle";
 }
 
+/** Whether the currently scheduled update has an outstanding cancellation request. */
+export function isUpdateCancelRequested(): boolean {
+	return state.phase !== "idle" && state.cancelRequestedEpoch === state.updateEpoch;
+}
+
+function cancellationError(): UpdateCancelledError | null {
+	if (!isUpdateCancelRequested() || !state.updateEpoch) return null;
+	return new UpdateCancelledError(state.updateEpoch);
+}
+
+/**
+ * Throw if the scheduled update was cancelled. Restart orchestration calls this at every
+ * step boundary so a cancellation lands before an irreversible action (writing the recovery
+ * manifest, spawning the replacement process).
+ */
+export function assertUpdateNotCancelled(): void {
+	const error = cancellationError();
+	if (error) throw error;
+}
+
+function cancelCoordinationWaiters(error: UpdateCancelledError): void {
+	const pending = [
+		...backgroundBashDrainWaiters,
+		...ordinaryDrainWaiters,
+		...checkpointFenceWaiters,
+	];
+	backgroundBashDrainWaiters = [];
+	ordinaryDrainWaiters = [];
+	checkpointFenceWaiters = [];
+	for (const waiter of pending) waiter.cancel(error);
+}
+
+/**
+ * Ask the running restart orchestration to abandon the scheduled update.
+ *
+ * Every coordination wait is unbounded on purpose: narrator work legitimately takes
+ * minutes (a five-minute first-token timeout with retries, a permission request nobody
+ * answered yet), and a deadline would abort an otherwise healthy update. Cancellation is
+ * the operator's escape hatch instead. It unblocks the waits with `UpdateCancelledError`;
+ * the orchestration then runs its normal failure cleanup, which reopens the tool gate so
+ * paused work resumes. Returns false when no update is scheduled.
+ */
+export function cancelScheduledUpdate(reason?: string): boolean {
+	if (state.phase === "idle" || !state.updateEpoch) return false;
+	if (state.cancelRequestedEpoch !== state.updateEpoch) {
+		state.cancelRequestedEpoch = state.updateEpoch;
+		logger.warn("Scheduled update cancellation requested", {
+			updateEpoch: state.updateEpoch,
+			phase: state.phase,
+			reason,
+			blockers: collectBlockers(Date.now()),
+		});
+	}
+	const error = cancellationError();
+	if (error) cancelCoordinationWaiters(error);
+	return true;
+}
+
+/** Interval between progress logs while an unbounded coordination wait is open. */
+const WAIT_PROGRESS_LOG_INTERVAL_MS = 30_000;
+
+/**
+ * Register an unbounded wait. It settles when `isReady()` becomes true (the caller's
+ * resolve path) or rejects when the scheduled update is cancelled. While it is open, the
+ * blockers holding it are logged periodically so an operator can see what to act on.
+ */
+function waitForCoordination(
+	label: string,
+	waiters: () => CoordinationWaiter[],
+	isReady: () => boolean,
+): Promise<void> {
+	// Cancellation outranks readiness. An already-satisfied wait must still fail once the
+	// operator cancelled, so orchestration cannot slip forward into an irreversible step
+	// through a step that happened to have nothing left to wait for.
+	const pendingCancellation = cancellationError();
+	if (pendingCancellation) return Promise.reject(pendingCancellation);
+	if (isReady()) return Promise.resolve();
+
+	const startedAt = Date.now();
+	return new Promise<void>((resolve, reject) => {
+		let settled = false;
+		const progressTimer = setInterval(() => {
+			logger.warn("Still waiting before the planned update can restart", {
+				label,
+				updateEpoch: state.updateEpoch,
+				phase: state.phase,
+				waitingMs: Date.now() - startedAt,
+				blockers: collectBlockers(Date.now()),
+			});
+		}, WAIT_PROGRESS_LOG_INTERVAL_MS);
+		(progressTimer as { unref?: () => void }).unref?.();
+
+		const remove = () => {
+			const list = waiters();
+			const index = list.indexOf(waiter);
+			if (index >= 0) list.splice(index, 1);
+		};
+		const waiter: CoordinationWaiter = {
+			resolve: () => {
+				if (settled) return;
+				settled = true;
+				clearInterval(progressTimer);
+				remove();
+				resolve();
+			},
+			cancel: (error) => {
+				if (settled) return;
+				settled = true;
+				clearInterval(progressTimer);
+				remove();
+				reject(error);
+			},
+		};
+		waiters().push(waiter);
+		// Close the race where readiness or cancellation landed between the checks above
+		// and registration.
+		if (isReady()) {
+			waiter.resolve();
+			return;
+		}
+		const late = cancellationError();
+		if (late) waiter.cancel(late);
+	});
+}
+
 /**
  * Track one provider response that may still produce tool rows. Phase two prevents new
  * responses from entering while allowing a response already in flight to reach persistence.
@@ -316,47 +517,17 @@ export function beginUpdatePreAdmissionActivity(
 	});
 }
 
-export async function waitForUpdateCheckpointFence(
-	options: { timeoutMs?: number } = {},
-): Promise<void> {
-	if (checkpointFenceIsStable()) return;
-	const timeoutMs = options.timeoutMs ?? 30_000;
-	await new Promise<void>((resolve, reject) => {
-		let settled = false;
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const finish = () => {
-			if (settled) return;
-			settled = true;
-			if (timer) clearTimeout(timer);
-			checkpointFenceWaiters = checkpointFenceWaiters.filter((waiter) => waiter !== finish);
-			resolve();
-		};
-		checkpointFenceWaiters.push(finish);
-		if (checkpointFenceIsStable()) {
-			finish();
-			return;
-		}
-		timer = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			checkpointFenceWaiters = checkpointFenceWaiters.filter((waiter) => waiter !== finish);
-			logger.error("Timed out waiting for the planned-update checkpoint fence", {
-				timeoutMs,
-				activeResponses: [...responseActivities.values()].slice(0, 20),
-				pendingToolStartGrants: [...toolStartGrants.values()].slice(0, 20),
-				pendingPreAdmissions: [...preAdmissionActivities.values()].slice(0, 20),
-			});
-			reject(
-				new Error(
-					`Timed out waiting for update checkpoint fence after ${timeoutMs}ms ` +
-						`(${responseActivities.size} active responses, ` +
-						`${toolStartGrants.size} tool start grants, ` +
-						`${preAdmissionActivities.size} pre-admissions)`,
-				),
-			);
-		}, timeoutMs);
-		(timer as { unref?: () => void }).unref?.();
-	});
+/**
+ * Wait until no response, tool-start grant, or durable pre-admission can still add a tool
+ * row. This wait is unbounded by design — see `cancelScheduledUpdate` for why — and only
+ * rejects with `UpdateCancelledError`.
+ */
+export async function waitForUpdateCheckpointFence(): Promise<void> {
+	await waitForCoordination(
+		"checkpoint_fence",
+		() => checkpointFenceWaiters,
+		checkpointFenceIsStable,
+	);
 }
 
 export function canStartFinalUpdateExecution(kind: UpdateExecutionKind): boolean {
@@ -529,6 +700,9 @@ export function scheduleUpdate(targetVersion?: string): UpdateCoordinationStatus
 	state.targetVersion = targetVersion;
 	state.updateEpoch = generateUpdateEpoch();
 	state.error = undefined;
+	state.errorKind = undefined;
+	// A cancellation belongs to the epoch that was cancelled; never inherit it.
+	state.cancelRequestedEpoch = undefined;
 	logger.info("Update scheduled; draining background Bash executions", {
 		targetVersion,
 		updateEpoch: state.updateEpoch,
@@ -539,11 +713,13 @@ export function scheduleUpdate(targetVersion?: string): UpdateCoordinationStatus
 	return resolveStatus();
 }
 
+/** Unbounded; only rejects with `UpdateCancelledError`. */
 export async function waitForBackgroundBashDrain(): Promise<void> {
-	if (countExecutions("background_bash") === 0) return;
-	await new Promise<void>((resolve) => {
-		backgroundBashDrainWaiters.push(resolve);
-	});
+	await waitForCoordination(
+		"background_bash_drain",
+		() => backgroundBashDrainWaiters,
+		() => countExecutions("background_bash") === 0,
+	);
 }
 
 export function beginQuiescingTools(): UpdateCoordinationStatus {
@@ -561,11 +737,13 @@ export function beginQuiescingTools(): UpdateCoordinationStatus {
 	return resolveStatus();
 }
 
+/** Unbounded; only rejects with `UpdateCancelledError`. */
 export async function waitForOrdinaryToolDrain(): Promise<void> {
-	if (countExecutions("ordinary") === 0) return;
-	await new Promise<void>((resolve) => {
-		ordinaryDrainWaiters.push(resolve);
-	});
+	await waitForCoordination(
+		"ordinary_tool_drain",
+		() => ordinaryDrainWaiters,
+		() => countExecutions("ordinary") === 0,
+	);
 }
 
 /** Compatibility drain helper. Resumable work intentionally never blocks restart. */
@@ -605,18 +783,23 @@ export function markUpdateRestarting(): UpdateCoordinationStatus {
 	return resolveStatus();
 }
 
-export function failScheduledUpdate(error: string): UpdateCoordinationStatus {
+export function failScheduledUpdate(
+	error: string,
+	options: { cancelled?: boolean } = {},
+): UpdateCoordinationStatus {
 	state.phase = "idle";
 	state.targetVersion = undefined;
 	state.updateEpoch = undefined;
+	state.cancelRequestedEpoch = undefined;
 	state.error = error;
+	state.errorKind = options.cancelled ? "cancelled" : "failed";
 	openUpdateGate();
-	logger.error("Scheduled update failed before replacement startup", { error });
+	if (options.cancelled) {
+		logger.info("Scheduled update cancelled; paused work resumed", { error });
+	} else {
+		logger.error("Scheduled update failed before replacement startup", { error });
+	}
 	return resolveStatus();
-}
-
-export function clearUpdateError(): void {
-	state.error = undefined;
 }
 
 export function capturePlannedUpdateRecoverySnapshot(): PlannedUpdateRecoverySnapshot {
@@ -811,15 +994,21 @@ export function resetUpdateCoordinationForTests(): void {
 	toolStartGrants.clear();
 	preAdmissionActivities.clear();
 	responseActivities.clear();
+	const pending = [
+		...backgroundBashDrainWaiters,
+		...ordinaryDrainWaiters,
+		...checkpointFenceWaiters,
+	];
 	backgroundBashDrainWaiters = [];
 	ordinaryDrainWaiters = [];
-	const fenceWaiters = checkpointFenceWaiters;
 	checkpointFenceWaiters = [];
-	for (const resolve of fenceWaiters) resolve();
+	for (const waiter of pending) waiter.resolve();
 	state.phase = "idle";
 	state.targetVersion = undefined;
 	state.updateEpoch = undefined;
 	state.error = undefined;
+	state.errorKind = undefined;
+	state.cancelRequestedEpoch = undefined;
 	openUpdateGate();
 	try {
 		unlinkSync(RECOVERY_SNAPSHOT_PATH);

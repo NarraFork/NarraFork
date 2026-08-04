@@ -372,6 +372,20 @@ export type AgentEvent =
 			metadata?: Record<string, unknown>;
 			sideCars?: AgentSideCar[];
 	  }
+	/**
+	 * The tool passed its permission gate and final admission — execution begins NOW.
+	 *
+	 * ⚠️ Distinct from `tool_call`, and the distinction is the whole point. `tool_call`
+	 * fires when the tool's INPUT finished parsing; the permission prompt, any danger /
+	 * plan reflection gate, and the final admission wait all sit between the two. A
+	 * client that treats `tool_call` as "executing" therefore claims work has started
+	 * while the narrator may in fact be waiting on a human.
+	 *
+	 * Emitted exactly once per execution attempt. A tool that is denied never reaches
+	 * this point, and a tool resumed after a transparent update wait re-stamps
+	 * `executionStartedAt` so paused time is not counted as execution time.
+	 */
+	| { type: "tool_executing"; toolUseId: string; executionStartedAt: number }
 	| { type: "tool_progress"; toolUseId: string; elapsed: number }
 	| { type: "tool_output"; toolUseId: string; output: string }
 	// Watchdog notification: tool has been running for ≥60s

@@ -818,6 +818,21 @@ export interface NarraForkSettings {
 		/** Additional request headers injected on Codex requests. */
 		extraHeaders?: Record<string, string>;
 	};
+	/**
+	 * Official reference price overrides, in USD per 1M tokens.
+	 *
+	 * The built-in table in `server/lib/model-pricing.ts` carries the published
+	 * vendor list prices, but vendors change them faster than NarraFork ships
+	 * releases. Keys are bare model IDs (`gpt-5.6-sol`, not `codex:gpt-5.6-sol`);
+	 * omitted fields keep the built-in value, and an entry for a model that has
+	 * no built-in row prices it from scratch.
+	 */
+	pricing?: {
+		overrides?: Record<
+			string,
+			{ input?: number; output?: number; cacheRead?: number; cacheWrite?: number }
+		>;
+	};
 	/** Unified web search channel configuration. */
 	search?: SearchSettings;
 	/** Built-in routines configuration. */

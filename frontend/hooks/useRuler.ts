@@ -33,6 +33,13 @@ export interface RulerActiveChapter {
 	mergeCommitSha?: string | null;
 	narratorId: string | null;
 	narratorStatus: string | null;
+	/**
+	 * Narrator is parked until an unavailable model recovers. Sent separately from
+	 * `narratorStatus` (which stays `"waiting"`) because the Pixi card renders and
+	 * measures the status string as raw text; this only drives color and offscreen
+	 * bubble suppression.
+	 */
+	narratorModelUnavailable?: boolean;
 	axisOffset: number;
 	crossOffset: number;
 }

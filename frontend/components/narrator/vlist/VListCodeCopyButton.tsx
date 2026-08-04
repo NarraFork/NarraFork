@@ -28,6 +28,7 @@ import type { CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../MessageSelectionCtx";
 import { useRenderInteractive } from "../RenderLodCtx";
+import { type CodeCopyPlacement, VIEW_ACTION_BAR_GAP } from "./vlist-content-view-float";
 
 const ICON_SIZE = 12;
 
@@ -41,8 +42,24 @@ const ICON_SIZE = 12;
  */
 const overlayStyle: CSSProperties = {
 	position: "absolute",
-	top: 4,
-	right: 4,
+	top: VIEW_ACTION_BAR_GAP,
+	right: VIEW_ACTION_BAR_GAP,
+	zIndex: 1,
+};
+
+/**
+ * The panel's BOTTOM-right corner, used when the row's hover bar has claimed the
+ * top one (this panel leads the body).
+ *
+ * Vertical rather than horizontal displacement: parking the button beside the row
+ * bar put five grey icons in one strip, two of them copy glyphs with different
+ * scopes — visually noisy and genuinely ambiguous about what would be copied.
+ * The opposite corner keeps the button unmistakably attached to this panel.
+ */
+const bottomOverlayStyle: CSSProperties = {
+	position: "absolute",
+	bottom: VIEW_ACTION_BAR_GAP,
+	right: VIEW_ACTION_BAR_GAP,
 	zIndex: 1,
 };
 
@@ -56,28 +73,42 @@ export interface VListCodeCopyButtonProps {
 	 * is hovered or focused.
 	 */
 	hidden?: boolean;
+	/**
+	 * Which corner of the panel to occupy. `hidden` (too short a panel with the
+	 * row bar on its top corner) renders nothing at all — see
+	 * `resolveCodeCopyPlacement`. Defaults to the conventional top-right.
+	 */
+	placement?: CodeCopyPlacement;
 }
 
 /**
  * Copy one code panel's source. Renders nothing on a read-only surface (preview
  * panes set `interactive: false`) or for an empty panel.
  */
-export function VListCodeCopyButton({ value, hidden }: VListCodeCopyButtonProps) {
+export function VListCodeCopyButton({
+	value,
+	hidden,
+	placement = "top-right",
+}: VListCodeCopyButtonProps) {
 	const { t } = useTranslation("common");
 	const interactive = useRenderInteractive();
 	if (!interactive || value.length === 0) return null;
+	// Nowhere clear of the row bar to paint: the bar's own copy button covers this
+	// corner, so a per-panel button here would just be an unclickable duplicate.
+	if (placement === "hidden") return null;
 
 	return (
 		// Marked selection-ignore so a Ctrl/Cmd-click aimed at the button cannot
 		// double as a block-selection toggle (same contract as the row view bar).
 		<div
 			style={{
-				...overlayStyle,
+				...(placement === "bottom-right" ? bottomOverlayStyle : overlayStyle),
 				visibility: hidden ? "hidden" : "visible",
 				opacity: hidden ? 0 : 1,
 				transition: "opacity 0.15s, visibility 0.15s",
 			}}
 			data-vlist-code-copy
+			data-vlist-code-copy-placement={placement}
 			// The exact text this overlay will put on the clipboard. Present so a test
 			// can assert WHAT gets copied without reaching into Mantine's clipboard
 			// hook (which other suites replace with a module mock) or stubbing

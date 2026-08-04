@@ -78,12 +78,20 @@ function sanitizeDownloadName(value: string): string | null {
  */
 export type RevertScope = "narrator" | "workspace";
 
-/** Why a narrator-scoped rollback is unavailable for a window. */
+/**
+ * Why a narrator-scoped rollback reports no files for a window.
+ *
+ * `nothing_owned` is the one value that arrives together with `available: true`:
+ * the boundaries were recorded and prove this narrator changed nothing, which is
+ * an answer rather than a missing capability. The others mean the scope could not
+ * be computed, and the workspace scope is offered instead.
+ */
 export type ScopedRevertUnavailableReason =
 	| "no_boundaries"
 	| "snapshot_missing"
 	| "no_workspace"
-	| "git_unsupported";
+	| "git_unsupported"
+	| "nothing_owned";
 
 /**
  * Structured advisory about changes a rollback discarded beyond the intended scope.

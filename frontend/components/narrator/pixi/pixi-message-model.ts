@@ -7,6 +7,10 @@ import {
 } from "@frontend/lib/intl-format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import { hasUsablePlanBody } from "@shared/plan-reference";
+import {
+	resolveLiveBlockIndex,
+	STREAMING_MESSAGE_ID,
+} from "@shared/pretext-layout/streaming-live-blocks";
 import { hasTruncatedLeaf, stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
 import { collectSegmentTargetIds, segmentMessages, type ToolRunItem } from "../message-segments";
 import type { MessagesPage, NarratorMsg, PendingPermission } from "../narrator-panel-types";
@@ -485,7 +489,12 @@ function messageBlocks(
 		? visibleBlockIndices.map((i) => ({ raw: blocks[i], index: i })).filter((entry) => entry.raw)
 		: blocks.map((raw, index) => ({ raw, index }));
 	const result: PixiMessageBlockModel[] = [];
-	const isStreaming = msg.id === "__streaming__";
+	// `isStreaming` = this is the synthetic un-persisted row; it drives the key
+	// choice (which must stay stable across the hand-off). Whether a given block is
+	// still BEING WRITTEN is a separate, per-block question — only the last content
+	// block can be (see @shared/pretext-layout/streaming-live-blocks).
+	const isStreaming = msg.id === STREAMING_MESSAGE_ID;
+	const liveBlockIndex = resolveLiveBlockIndex(isStreaming, msg);
 	for (const { raw, index } of chosen) {
 		const block = raw as Record<string, unknown>;
 		const type = String(block.type ?? "unknown");
@@ -561,7 +570,11 @@ function messageBlocks(
 		if (type === "reasoning" || type === "thinking") {
 			const text = reasoningDisplayText(block);
 			const isEncrypted = hasEncryptedReasoningMetadata(block) && !block.text && !block.thinking;
-			if (!text && !isStreaming) continue;
+			// Only the live block gets the empty "thinking…" placeholder. An earlier
+			// empty reasoning block of the same live row is finished content, so it is
+			// dropped exactly like a persisted one.
+			const isLiveBlock = index === liveBlockIndex;
+			if (!text && !isLiveBlock) continue;
 			const formatted = formatLocaleNumber(text.length);
 			const identity = reasoningBlockIdentity(block, index);
 			const reasoningKey = isStreaming
@@ -595,7 +608,7 @@ function messageBlocks(
 				reasoningExpanded: reasoningExpanded && !!text,
 				reasoningCharCount: text.length,
 				reasoningEncrypted: isEncrypted,
-				reasoningStreaming: isStreaming,
+				reasoningStreaming: isLiveBlock,
 				reasoningLabel: tNarrator("reasoning", "Reasoning"),
 				reasoningCharsLabel: tNarrator("reasoningChars", `${formatted} chars`, { formatted }),
 				reasoningThinkingLabel: tNarrator("thinking", "Thinking"),

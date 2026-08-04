@@ -64,6 +64,12 @@ export interface PixiChapterInfo {
 	role: string;
 	narratorId: string | null;
 	narratorStatus: string | null;
+	/**
+	 * Narrator is parked until an unavailable model recovers. Carried alongside
+	 * `narratorStatus` (which stays `"waiting"`) so the card can recolor without
+	 * changing the drawn/measured status text.
+	 */
+	narratorModelUnavailable?: boolean;
 	startCommitSha: string | null;
 	mergeCommitSha?: string | null;
 	/** Parent chapter ID — used to draw connector to parent instead of ruler for orphan chapters */
@@ -160,7 +166,28 @@ const measureStyle = new TextStyle({ fontFamily: "sans-serif", fontWeight: "600"
 const measureBadgeStyle = new TextStyle({ fontFamily: "sans-serif", fontSize: 9 });
 const CARD_TOP_OFFSET = 2;
 
-function narratorStatusColor(theme: PixiTheme, status: string): number {
+/**
+ * Card geometry, exported for RulerFlow's world-space card registry.
+ *
+ * That registry feeds cross-axis pan bounds and the offscreen bubbles, so its rects
+ * must agree with what this layer actually DRAWS. Re-declaring 220 / 72 / 2 there is
+ * how the two would drift silently — nothing would look wrong, the bounds would just
+ * be a little off.
+ */
+export const RULER_CARD_GEOMETRY = {
+	nodeWidth: NODE_WIDTH,
+	nodeHeight: NODE_HEIGHT,
+	cardTopOffset: CARD_TOP_OFFSET,
+} as const;
+
+function narratorStatusColor(theme: PixiTheme, status: string, modelUnavailable?: boolean): number {
+	/*
+	 * Waiting for a model to recover arrives as `waiting` plus a separate flag
+	 * (the status string is drawn as raw text and measured for card width, so it
+	 * must stay short and stable). Recolor only, and check it first so it is not
+	 * painted with the attention hue the user cannot act on.
+	 */
+	if (modelUnavailable) return theme.narratorModelUnavailable;
 	switch (status) {
 		case "working":
 			return theme.narratorWorking;
@@ -1112,7 +1139,11 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 
 							// Narrator status (if any)
 							if (ch.narratorStatus) {
-								const nsColor = narratorStatusColor(theme, ch.narratorStatus);
+								const nsColor = narratorStatusColor(
+									theme,
+									ch.narratorStatus,
+									ch.narratorModelUnavailable,
+								);
 								const nsX =
 									nodeLeft +
 									18 * cardScale +

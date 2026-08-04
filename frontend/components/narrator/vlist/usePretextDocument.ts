@@ -15,6 +15,7 @@ import {
 	useSyncExternalStore,
 } from "react";
 import type { NarratorMsg } from "../narrator-panel-types";
+import { onFontRevisionChange } from "./katex-runtime";
 import type { RenderLod } from "./prepared-block";
 import type { PretextDocumentLoadOptions } from "./pretext-document-loader";
 import {
@@ -137,6 +138,7 @@ export interface UsePretextDocumentResult {
 	hasPrev: boolean;
 	/** An older-page fetch is in flight. */
 	loadingOlder: boolean;
+
 	error?: Error;
 	reload: () => void;
 	/** Extend the loaded window upward by one older page (reverse infinite scroll). */
@@ -355,8 +357,29 @@ export function usePretextDocument(
 			);
 			return;
 		}
-		if (current.input) coordinator.rebuild(buildOptions, anchor, options.viewportHeight);
-		else
+		if (current.input) {
+			// SWALLOW the rethrow, deliberately.
+			//
+			// `rebuild` is synchronous and rethrows after recording `status: "error"`
+			// on the snapshot. Letting that escape an effect hands the error to the
+			// route's CatchBoundary, which remounts this subtree — and the remount
+			// re-runs this very effect, which throws again. That loop is not
+			// hypothetical: a missing `Array.prototype.at` on Safari 14 made every
+			// markdown measure throw, and the list flickered forever with no message
+			// rendered and no error shown (the shell's own error card reads
+			// `pretextDocument.error`, which the escaping throw skipped past).
+			//
+			// The coordinator has already published the error by the time it rethrows,
+			// so catching here loses no information: the shell renders its retry card
+			// from the snapshot instead of dying. `load`'s failures are equivalent and
+			// already discarded via `void` on a rejected promise; this is the same
+			// contract for the synchronous path.
+			try {
+				coordinator.rebuild(buildOptions, anchor, options.viewportHeight);
+			} catch {
+				// Reported through the snapshot (status: "error" + error).
+			}
+		} else
 			void coordinator.load(
 				narratorId,
 				buildOptions,
@@ -377,6 +400,33 @@ export function usePretextDocument(
 		options.viewportHeight,
 		reloadToken,
 	]);
+	// A font face resolving mid-session invalidates every baked fragment width, so
+	// the prepared blocks AND the heights derived from them must be dropped and the
+	// layout rebuilt — otherwise the committed geometry keeps the old wrap points
+	// while the DOM repaints with the real face (scroll jumps + overlapping rows).
+	// This is the ONLY subscriber to that generation, so without it the mechanism in
+	// katex-runtime / prepared-markdown-cache would never fire.
+	//
+	// A no-op today: the app ships system font stacks only, so the generation stays
+	// 0 (see the FONT REVISION note in prepared-markdown-cache). Plumbed because the
+	// assumption is one `@font-face` away from being wrong and the failure is silent.
+	//
+	// The view is read LIVE at invalidation time and the gesture focus point is
+	// dropped (same contract as loadOlder / applyLivePatch): fonts settle without
+	// the reader pointing at anything, so the rebuild anchors on the viewport top.
+	useEffect(() => {
+		if (!coordinator) return;
+		return onFontRevisionChange(() => {
+			coordinator.invalidateFontDependentLayout(() => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			});
+		});
+	}, [coordinator, options.getCurrentView]);
 	// Apply the scroll correction in a layout effect (before the browser paints),
 	// not a passive effect. A passive effect runs AFTER paint, so the taller canvas
 	// would render one frame with the stale scrollTop — the content jumps to the
@@ -470,6 +520,7 @@ export function usePretextDocument(
 		scrollTopCorrectionKind: snapshot.scrollTopAnchorKind,
 		hasPrev: snapshot.hasPrev ?? false,
 		loadingOlder: snapshot.loadingOlder ?? false,
+
 		error: snapshot.error,
 		reload,
 		loadOlder,

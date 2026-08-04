@@ -1,3 +1,9 @@
+// MUST stay the first import: it installs runtime built-ins that older Safari/WebKit
+// lacks (Array.prototype.at, findLast/findLastIndex, Object.hasOwn, structuredClone).
+// Vite's `safari14` target down-levels syntax only, so a shim installed after another
+// module's top-level code has already run would be too late. See that file's header
+// for the Safari 14 virtual-list flicker this prevents.
+import "@frontend/lib/legacy-browser-polyfills";
 import { reportReactRenderError } from "@frontend/lib/hmr-guard";
 import "@frontend/lib/dom-mutation-guard";
 import {
@@ -36,6 +42,11 @@ import "@frontend/styles/blur-anim.css";
 import "@frontend/styles/nav-collapsed.css";
 import "@frontend/styles/safe-area.css";
 import "@frontend/styles/toast.css";
+// Tool-call shimmer classes (card face + compact row text). Global because BOTH
+// narrator render paths paint these and vlist may not import the chunk path — see
+// each stylesheet's header.
+import "@frontend/styles/card-shimmer.css";
+import "@frontend/styles/trace-shimmer.css";
 
 import { QueryClientProvider } from "@tanstack/react-query";
 import {
@@ -58,6 +69,40 @@ import { routeTree } from "./routeTree.gen";
 const theme = createTheme({
 	primaryColor: "indigo",
 	defaultRadius: "sm",
+	colors: {
+		/*
+		 * Blue-toned neutral for "the system is waiting on itself" states — e.g. a
+		 * narrator parked until an unavailable model recovers. Orange/yellow is
+		 * reserved for states that genuinely need the user's attention, so those
+		 * two must never share a hue.
+		 *
+		 * The palette is deliberately tuned between two neighbours it must not be
+		 * confused with, at the `-5` step used for status accents:
+		 *   idle    gray-6  #868e96 — 11% saturation (flat neutral)
+		 *   this    slate-5 #7d95b8 — 32% saturation (clearly blue-leaning)
+		 *   working blue-6  #228be6 — 85% saturation (unmistakably "active")
+		 * An earlier attempt used Tailwind slate, whose light steps sit at ~20%
+		 * saturation and read as plain gray next to idle. Keep enough blue here to
+		 * separate from idle without impersonating an actively working narrator.
+		 *
+		 * Note on shades: Mantine's dark `primaryShade` is 8, so
+		 * `--mantine-color-slate-filled` resolves to the darkest steps, too dark to
+		 * read as a dot or badge on a dark surface. Consumers pick an explicit
+		 * light step via the registry's `accentShade`.
+		 */
+		slate: [
+			"#f2f5f9",
+			"#e4e9f2",
+			"#c7d2e3",
+			"#a9b9d3",
+			"#93a8c8",
+			"#7d95b8",
+			"#6a83a8",
+			"#556c8e",
+			"#425572",
+			"#314056",
+		],
+	},
 	components: {
 		NavLink: {
 			styles: {

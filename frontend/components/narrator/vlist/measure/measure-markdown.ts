@@ -15,9 +15,9 @@
  *   - return { height, blocks, frame, usedWidth }
  */
 
-import { MARKDOWN_CONSTANTS, parseMarkdownToPreparedBlocks } from "../parse-markdown";
+import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import { accumulateFrame, type MeasuredElement, type PreparedBlock } from "../prepared-block";
-import { markdownMathSupport } from "./math-support";
+import { preparedMarkdownBlocks } from "./math-support";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // Fenced-code box chrome. The settled HighlightedCode view is `padding: xs`
@@ -42,8 +42,10 @@ export function measureMarkdown(
 	contentWidth: number,
 	opts: MeasureMarkdownOptions = {},
 ): MeasuredElement {
-	const blocks =
-		opts.preparedBlocks ?? parseMarkdownToPreparedBlocks(markdown, markdownMathSupport());
+	// Cross-width memo: the parse is width-independent and dominates this measure,
+	// so a resize must not re-run it (see prepared-markdown-cache). The streaming
+	// path still passes its own incrementally prepared blocks via `opts`.
+	const blocks = opts.preparedBlocks ?? preparedMarkdownBlocks(markdown);
 	const frame = accumulateFrame(blocks, contentWidth, pretextLineMetrics, {
 		codePaddingX: CODE_PADDING_X,
 		codePaddingY: CODE_PADDING_Y,
@@ -64,7 +66,7 @@ export function measureMarkdown(
 export function prepareMarkdownMeasurer(
 	markdown: string,
 ): (contentWidth: number) => MeasuredElement {
-	const blocks = parseMarkdownToPreparedBlocks(markdown, markdownMathSupport());
+	const blocks = preparedMarkdownBlocks(markdown);
 	return (contentWidth: number) =>
 		measureMarkdown(markdown, contentWidth, { preparedBlocks: blocks });
 }

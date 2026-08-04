@@ -41,6 +41,7 @@ import { useNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useNarratorSubagentsCapability } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { api, type SubagentToolCallHeader, type SubagentToolInputSummary } from "../../lib/api";
+import { statusRegistry } from "../../lib/status-registry";
 import { Z } from "../../lib/z-index";
 import type { PendingPermission } from "../../types/narrator";
 import {
@@ -633,6 +634,15 @@ export const SubagentCard = memo(function SubagentCard({
 	const isTakenOver = substatus.includes("taken_over");
 	const isWorking = narratorData?.status === "working";
 	const isWaiting = narratorData?.status === "waiting";
+	/**
+	 * Parked until an unavailable model recovers. Also reported as `waiting`, but
+	 * the user has nothing to approve, so it must not borrow the attention color.
+	 */
+	const isWaitingForModel = substatus.includes("model_unavailable");
+	/** Registry-owned accent for that state, so the shade lives in one place. */
+	const modelUnavailableColor = statusRegistry.accentColor(
+		statusRegistry.narratorSubstatus("model_unavailable"),
+	);
 	/** Live spinner wins over the status glyph while the subagent is still running. */
 	const showLiveLoader = (isWorking || isWaiting) && !isTerminal;
 
@@ -876,7 +886,12 @@ export const SubagentCard = memo(function SubagentCard({
 									style={SUBAGENT_STATUS_SLOT_STYLE}
 								>
 									{showLiveLoader ? (
-										<Loader size={12} color={isWaiting ? "yellow" : "blue"} />
+										<Loader
+											size={12}
+											color={
+												isWaitingForModel ? modelUnavailableColor : isWaiting ? "yellow" : "blue"
+											}
+										/>
 									) : (
 										<StatusIcon status={toolCall.status} />
 									)}

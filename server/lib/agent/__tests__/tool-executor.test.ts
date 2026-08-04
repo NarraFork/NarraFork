@@ -307,7 +307,7 @@ describe("executeTool update admission gate", () => {
 		scheduleUpdate("test-version");
 		beginQuiescingTools();
 		let checkpointStable = false;
-		const checkpointFence = waitForUpdateCheckpointFence({ timeoutMs: 1_000 }).then(() => {
+		const checkpointFence = waitForUpdateCheckpointFence().then(() => {
 			checkpointStable = true;
 		});
 		await Promise.resolve();
@@ -490,7 +490,7 @@ describe("executeTool update admission gate", () => {
 		scheduleUpdate("test-version");
 		beginQuiescingTools();
 		let checkpointStable = false;
-		const checkpointFence = waitForUpdateCheckpointFence({ timeoutMs: 1_000 }).then(() => {
+		const checkpointFence = waitForUpdateCheckpointFence().then(() => {
 			checkpointStable = true;
 		});
 		await Promise.resolve();

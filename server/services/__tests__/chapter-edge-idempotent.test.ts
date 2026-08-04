@@ -1,11 +1,20 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { chapterEdges, chapters, projects } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
+// Snapshot the real db module before mocking so afterAll can re-point it back.
+// Bun's mock.module is process-wide and mock.restore() does NOT undo it, so this
+// migration-only in-memory db (no runtime seeds such as the knowledge
+// classification levels) would otherwise leak into later real-db suites.
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+
+afterAll(() => {
+	mock.module("../../db", () => realDbModule);
+	mock.restore();
+});
 
 const { chapterEdgeService } = await import("../chapter-edge-service");
 

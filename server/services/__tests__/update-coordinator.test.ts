@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+	assertUpdateNotCancelled,
 	beginNarratorResponseActivity,
 	beginQuiescingTools,
 	beginToolStartAdmission,
 	beginUpdatePreAdmissionActivity,
+	cancelScheduledUpdate,
 	capturePlannedUpdateRecoverySnapshot,
 	consumePlannedUpdateRecoverySnapshot,
 	convertToolStartGrantToExecution,
@@ -17,6 +19,7 @@ import {
 	scheduleUpdate,
 	tryAcquireFinalUpdateExecution,
 	tryAcquireUpdateExecution,
+	UpdateCancelledError,
 	waitForBackgroundBashDrain,
 	waitForOrdinaryToolDrain,
 	waitForUpdateCheckpointFence,
@@ -90,7 +93,7 @@ describe("update coordinator", () => {
 		scheduleUpdate("9.9.9");
 		beginQuiescingTools();
 		let stable = false;
-		const fence = waitForUpdateCheckpointFence({ timeoutMs: 1_000 }).then(() => {
+		const fence = waitForUpdateCheckpointFence().then(() => {
 			stable = true;
 		});
 		await Promise.resolve();
@@ -109,7 +112,7 @@ describe("update coordinator", () => {
 		beginQuiescingTools();
 
 		let checkpointStable = false;
-		const checkpointFence = waitForUpdateCheckpointFence({ timeoutMs: 1_000 }).then(() => {
+		const checkpointFence = waitForUpdateCheckpointFence().then(() => {
 			checkpointStable = true;
 		});
 		await Promise.resolve();
@@ -189,7 +192,7 @@ describe("update coordinator", () => {
 		expect(admission).not.toBeNull();
 
 		let stable = false;
-		const waiting = waitForUpdateCheckpointFence({ timeoutMs: 1_000 }).then(() => {
+		const waiting = waitForUpdateCheckpointFence().then(() => {
 			stable = true;
 		});
 		await Promise.resolve();
@@ -207,6 +210,95 @@ describe("update coordinator", () => {
 		expect(stable).toBe(true);
 	});
 
+	test("checkpoint fence has no deadline and only ends on readiness or cancellation", async () => {
+		const response = await beginNarratorResponseActivity("slow-response");
+		scheduleUpdate("9.9.9");
+		beginQuiescingTools();
+
+		let settled = false;
+		const waiting = waitForUpdateCheckpointFence().then(
+			() => {
+				settled = true;
+			},
+			(error: unknown) => {
+				settled = true;
+				throw error;
+			},
+		);
+		// A response legitimately outlives any short deadline (first-token timeout plus retries),
+		// so the fence must still be open well past the former 30s budget.
+		await Bun.sleep(60);
+		expect(settled).toBe(false);
+		expect(getUpdateCoordinationStatus()).toMatchObject({
+			activeResponseCount: 1,
+			cancelRequested: false,
+		});
+
+		expect(cancelScheduledUpdate("operator asked to stop")).toBe(true);
+		await expect(waiting).rejects.toBeInstanceOf(UpdateCancelledError);
+		expect(getUpdateCoordinationStatus().cancelRequested).toBe(true);
+		response.release();
+	});
+
+	test("cancellation unblocks the drain waits and clears once the update is abandoned", async () => {
+		const backgroundBash = tryAcquireFinalUpdateExecution("background_bash", "narrator-bg");
+		expect(backgroundBash).not.toBeNull();
+		scheduleUpdate("9.9.9");
+
+		const draining = waitForBackgroundBashDrain();
+		await Promise.resolve();
+		expect(cancelScheduledUpdate()).toBe(true);
+		await expect(draining).rejects.toBeInstanceOf(UpdateCancelledError);
+
+		// A wait started after cancellation fails immediately instead of hanging.
+		await expect(waitForOrdinaryToolDrain()).rejects.toBeInstanceOf(UpdateCancelledError);
+		expect(() => assertUpdateNotCancelled()).toThrow(UpdateCancelledError);
+
+		failScheduledUpdate("cancelled by operator", { cancelled: true });
+		expect(getUpdateCoordinationStatus()).toMatchObject({
+			phase: "idle",
+			cancelRequested: false,
+			errorKind: "cancelled",
+		});
+		backgroundBash?.release();
+
+		// The next attempt must not inherit the previous epoch's cancellation.
+		scheduleUpdate("9.9.10");
+		const rescheduled = getUpdateCoordinationStatus();
+		expect(rescheduled.cancelRequested).toBe(false);
+		expect(rescheduled.errorKind).toBeUndefined();
+		expect(rescheduled.error).toBeUndefined();
+		expect(() => assertUpdateNotCancelled()).not.toThrow();
+	});
+
+	test("cancelling without a scheduled update is a no-op", () => {
+		expect(cancelScheduledUpdate()).toBe(false);
+		expect(getUpdateCoordinationStatus().cancelRequested).toBe(false);
+	});
+
+	test("status reports the blockers holding a scheduled update open", async () => {
+		const response = await beginNarratorResponseActivity("blocking-narrator");
+		// A grant issued during phase one is exactly the case a fence wait must observe: the tool
+		// has already started, so it can still add rows after the phase switch.
+		const admission = beginToolStartAdmission("ordinary", "grant-narrator", "grant-tool-use");
+		expect(admission.status).toBe("granted");
+		scheduleUpdate("9.9.9");
+		beginQuiescingTools();
+
+		const blockers = getUpdateCoordinationStatus().blockers;
+		expect(blockers.map((blocker) => blocker.kind).sort()).toEqual([
+			"response",
+			"tool_start_grant",
+		]);
+		expect(blockers.find((blocker) => blocker.kind === "tool_start_grant")).toMatchObject({
+			narratorId: "grant-narrator",
+			toolUseId: "grant-tool-use",
+		});
+
+		if (admission.status === "granted") admission.grant.release();
+		response.release();
+	});
+
 	test("phase two prevents a new narrator response from entering the checkpoint fence", async () => {
 		scheduleUpdate("9.9.9");
 		beginQuiescingTools();
@@ -217,7 +309,7 @@ describe("update coordinator", () => {
 		});
 		await Promise.resolve();
 		expect(entered).toBe(false);
-		await waitForUpdateCheckpointFence({ timeoutMs: 1_000 });
+		await waitForUpdateCheckpointFence();
 
 		failScheduledUpdate("test failure");
 		const response = await responsePromise;
@@ -309,6 +401,151 @@ describe("update coordinator", () => {
 			capturedAt: "2026-07-20T00:00:00.000Z",
 			narrators: [{ narratorId: "narrator-1", locale: "en" }],
 		});
+	});
+
+	test("aborting a gate wait rejects and removes its abort listener", async () => {
+		scheduleUpdate("9.9.9");
+		beginQuiescingTools();
+
+		const controller = new AbortController();
+		const waiting = waitUntilUpdateGateOpens(controller.signal);
+		await Promise.resolve();
+		expect(getUpdateCoordinationStatus().pausedToolCount).toBe(1);
+
+		controller.abort();
+		await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+		// The waiter must be gone, not merely rejected: a leaked entry would keep the coordinator
+		// reporting a paused tool that no longer exists.
+		expect(getUpdateCoordinationStatus().pausedToolCount).toBe(0);
+
+		// Opening the gate afterwards must not double-settle the already-rejected waiter.
+		expect(() => failScheduledUpdate("cleanup")).not.toThrow();
+	});
+
+	test("an already-aborted signal fails the gate wait without registering a waiter", async () => {
+		scheduleUpdate("9.9.9");
+		beginQuiescingTools();
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(waitUntilUpdateGateOpens(controller.signal)).rejects.toMatchObject({
+			name: "AbortError",
+		});
+		expect(getUpdateCoordinationStatus().pausedToolCount).toBe(0);
+	});
+
+	test("an aborted gate waiter is not resolved when the gate later opens", async () => {
+		scheduleUpdate("9.9.9");
+		beginQuiescingTools();
+		const controller = new AbortController();
+		const aborted = waitUntilUpdateGateOpens(controller.signal);
+		const surviving = waitUntilUpdateGateOpens();
+		await Promise.resolve();
+		expect(getUpdateCoordinationStatus().pausedToolCount).toBe(2);
+
+		controller.abort();
+		await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
+
+		let resumed = false;
+		const survivingTracked = surviving.then(() => {
+			resumed = true;
+		});
+		failScheduledUpdate("spawn failed");
+		await survivingTracked;
+		expect(resumed).toBe(true);
+	});
+
+	test("gate waiting is a no-op once the coordinator is idle", async () => {
+		await expect(waitUntilUpdateGateOpens()).resolves.toBeUndefined();
+		const controller = new AbortController();
+		controller.abort();
+		// Idle short-circuits before the abort check, so an aborted signal is irrelevant here.
+		await expect(waitUntilUpdateGateOpens(controller.signal)).resolves.toBeUndefined();
+	});
+
+	test("a rejected tool start becomes a durable pause that fences checkpointing", async () => {
+		const scheduled = scheduleUpdate("9.9.9");
+		beginQuiescingTools();
+
+		const admission = beginToolStartAdmission("ordinary", "narrator-late", "tool-late");
+		expect(admission.status).toBe("paused");
+		if (admission.status !== "paused") throw new Error("Expected a paused admission");
+		expect(admission.updateEpoch).toBe(scheduled.updateEpoch as string);
+		expect(getUpdateCoordinationStatus()).toMatchObject({
+			pendingPreAdmissionCount: 1,
+			pendingToolStartGrantCount: 0,
+		});
+
+		let stable = false;
+		const fence = waitForUpdateCheckpointFence().then(() => {
+			stable = true;
+		});
+		await Promise.resolve();
+		expect(stable).toBe(false);
+
+		admission.activity.release();
+		await fence;
+		expect(stable).toBe(true);
+		expect(getUpdateCoordinationStatus().pendingPreAdmissionCount).toBe(0);
+	});
+
+	test("background Bash is rejected during phase one while ordinary work is still admitted", () => {
+		scheduleUpdate("9.9.9");
+		const rejected = beginToolStartAdmission("background_bash", "narrator-bg", "tool-bg");
+		expect(rejected.status).toBe("paused");
+		const granted = beginToolStartAdmission("ordinary", "narrator-ord", "tool-ord");
+		expect(granted.status).toBe("granted");
+		if (rejected.status === "paused") rejected.activity.release();
+		if (granted.status === "granted") granted.grant.release();
+	});
+
+	test("pre-admission activity is refused for a stale epoch and while idle", () => {
+		// Idle: nothing to fence, so no activity may be registered.
+		expect(beginUpdatePreAdmissionActivity("any-epoch", "narrator-1", "tool-1")).toBeNull();
+
+		const scheduled = scheduleUpdate("9.9.9");
+		if (!scheduled.updateEpoch) throw new Error("Expected update epoch");
+		// A tool paused by a previous attempt must not fence the current one.
+		expect(beginUpdatePreAdmissionActivity("stale-epoch", "narrator-1", "tool-1")).toBeNull();
+		expect(getUpdateCoordinationStatus().pendingPreAdmissionCount).toBe(0);
+
+		const activity = beginUpdatePreAdmissionActivity(scheduled.updateEpoch, "narrator-1", "tool-1");
+		expect(activity).not.toBeNull();
+		activity?.release();
+	});
+
+	test("blockers are sorted oldest first and capped for the status payload", async () => {
+		const leases = [];
+		// 12 blockers exceeds the 10-entry status limit.
+		for (let index = 0; index < 12; index++) {
+			const lease = tryAcquireFinalUpdateExecution("ordinary", `narrator-${index}`);
+			expect(lease).not.toBeNull();
+			leases.push(lease);
+			// Stagger start times so the sort order is observable without relying on insertion order.
+			await Bun.sleep(2);
+		}
+		// Resumable work never blocks a restart, so it must not appear among the blockers.
+		const resumable = tryAcquireFinalUpdateExecution("resumable", "narrator-resumable");
+		scheduleUpdate("9.9.9");
+
+		const blockers = getUpdateCoordinationStatus().blockers;
+		expect(blockers).toHaveLength(10);
+		expect(blockers.every((blocker) => blocker.kind === "ordinary")).toBe(true);
+		// Longest wait first.
+		const waits = blockers.map((blocker) => blocker.waitingMs);
+		expect([...waits].sort((a, b) => b - a)).toEqual(waits);
+		// The two most recent leases are the ones dropped by the cap.
+		expect(blockers.map((blocker) => blocker.narratorId)).not.toContain("narrator-11");
+		expect(blockers.map((blocker) => blocker.narratorId)).toContain("narrator-0");
+
+		resumable?.release();
+		for (const lease of leases) lease?.release();
+	});
+
+	test("an idle coordinator reports no blockers even while work is running", () => {
+		const lease = tryAcquireFinalUpdateExecution("ordinary", "narrator-idle");
+		expect(getUpdateCoordinationStatus().blockers).toEqual([]);
+		lease?.release();
 	});
 
 	test("repeated scheduling keeps the original epoch and legacy callers still compile", () => {

@@ -29,15 +29,21 @@ function withoutCanvas<T>(fn: () => T): T {
 }
 
 const {
+	bumpFontRevisionForTest,
 	ensureKatexLoaded,
+	getFontRevision,
 	getGlyphCacheSize,
 	getKatexRevision,
 	getKatexRuntime,
 	GLYPH_CACHE_CEILING,
 	isKatexReady,
 	measureGlyphWidth,
+	onFontRevisionChange,
 	resetKatexRuntimeForTest,
 } = await import("./katex-runtime");
+const { resetPreparedFontRevisionForTest } = await import(
+	"@shared/pretext-layout/prepared-markdown-cache"
+);
 
 describe("katex-runtime lazy loading", () => {
 	beforeEach(() => {
@@ -296,6 +302,88 @@ describe("webfont readiness — revision bump and cache invalidation", () => {
 			expect(getKatexRevision()).toBe(revAfterLoad);
 		} finally {
 			dispose();
+			if (prevDocument !== undefined) {
+				g.document = prevDocument;
+			} else {
+				delete g.document;
+			}
+		}
+	});
+});
+
+/**
+ * DOCUMENT font generation — broader than the KaTeX webfont watch above.
+ *
+ * `onWebfontsReady` covers KaTeX's own faces, which only affects formulas. But the
+ * prepared layer bakes a pixel width into every fragment of every body, so a face
+ * swap invalidates plain prose too. This module owns the observation (the shared
+ * core may not read `document.fonts`) and pushes the generation into the prepared
+ * cache's key.
+ *
+ * A generation change alone is not sufficient — heights derived from those blocks
+ * live in `measureCache` and the layout is already committed — so subscribers must
+ * be notified to clear and rebuild. That notification is what these pin.
+ */
+describe("document font generation", () => {
+	beforeEach(() => {
+		resetKatexRuntimeForTest();
+		resetPreparedFontRevisionForTest();
+	});
+
+	it("starts at generation 0 (no webfonts in this app today)", () => {
+		expect(getFontRevision()).toBe(0);
+	});
+
+	it("advances the generation and notifies subscribers", () => {
+		let calls = 0;
+		const unsubscribe = onFontRevisionChange(() => {
+			calls++;
+		});
+		bumpFontRevisionForTest();
+		expect(getFontRevision()).toBe(1);
+		expect(calls).toBe(1);
+		unsubscribe();
+	});
+
+	it("stops notifying after unsubscribe", () => {
+		let calls = 0;
+		const unsubscribe = onFontRevisionChange(() => {
+			calls++;
+		});
+		unsubscribe();
+		bumpFontRevisionForTest();
+		expect(calls).toBe(0);
+	});
+
+	it("invalidates the prepared cache for a math-free body when the generation moves", async () => {
+		const { getPreparedMarkdownBlocks } = await import(
+			"@shared/pretext-layout/prepared-markdown-cache"
+		);
+		const dispose = installCanvasStub({ widthRatio: 0.5 });
+		try {
+			const body = "# heading\n\nplain prose with no formulas at all\n";
+			const before = getPreparedMarkdownBlocks(body, undefined, getKatexRevision());
+			expect(getPreparedMarkdownBlocks(body, undefined, getKatexRevision())).toBe(before);
+
+			bumpFontRevisionForTest();
+			// The old baked widths must not be served against the new face.
+			expect(getPreparedMarkdownBlocks(body, undefined, getKatexRevision())).not.toBe(before);
+		} finally {
+			dispose();
+		}
+	});
+
+	it("stays at generation 0 without the Font Loading API", () => {
+		const g = globalThis as { document?: unknown };
+		const prevDocument = g.document;
+		// An engine that cannot report readiness also cannot swap a face under us in a
+		// way we could detect, so staying put is the correct degradation.
+		g.document = {};
+		try {
+			const unsubscribe = onFontRevisionChange(() => {});
+			expect(getFontRevision()).toBe(0);
+			unsubscribe();
+		} finally {
 			if (prevDocument !== undefined) {
 				g.document = prevDocument;
 			} else {

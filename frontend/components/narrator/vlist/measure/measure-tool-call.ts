@@ -70,7 +70,7 @@ import { measureLineStats, prepareWithSegments } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
 import type { DiffLine } from "@shared/pretext-layout/diff-core";
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
-import { MARKDOWN_CONSTANTS, parseMarkdownToPreparedBlocks } from "../parse-markdown";
+import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import {
 	accumulateFrame,
 	type BlockFrame,
@@ -93,7 +93,7 @@ import {
 	SANS_FAMILY,
 	SPACING,
 } from "../pretext-fonts";
-import { markdownMathSupport } from "./math-support";
+import { preparedMarkdownBlocks } from "./math-support";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "./measure-markdown";
 import { IMAGE_FIXED_HEIGHT } from "./measure-media";
 import {
@@ -1316,7 +1316,7 @@ function buildMarkdownDetailFrame(
 	innerWidth: number,
 	sourcePath: string | undefined,
 ): { blocks: PreparedBlock[]; frame: ElementFrame; boxContent: number } {
-	const mdBlocks = parseMarkdownToPreparedBlocks(markdown, markdownMathSupport());
+	const mdBlocks = preparedMarkdownBlocks(markdown);
 	const blocks: PreparedBlock[] = [];
 	if (sourcePath) {
 		blocks.push(makeFixed(XS_LINE_HEIGHT, "detail-plan-source", DETAIL_TOP_MARGIN, { sourcePath }));
@@ -1324,10 +1324,22 @@ function buildMarkdownDetailFrame(
 	for (const [index, block] of mdBlocks.entries()) {
 		// The leading gap belongs to the merged list's first block: a markdown block
 		// only claims DETAIL_TOP_MARGIN when no provenance line precedes it.
-		if (index === 0) {
-			block.marginTop = sourcePath ? DETAIL_SOURCE_LINE_MARGIN_BOTTOM : DETAIL_TOP_MARGIN;
-		}
-		blocks.push(block);
+		//
+		// This RE-WRAPS rather than assigning `block.marginTop` in place. The parsed
+		// array is shared (see prepared-markdown-cache): the same markdown measured by
+		// another element — or by this one at a different width — hands back the very
+		// same block objects, so writing to one would silently re-margin every other
+		// consumer of that text. A shallow copy is cheap (blocks are flat records; the
+		// expensive `flow` / `prepared` payloads are referenced, not cloned) and keeps
+		// the cached blocks pristine.
+		blocks.push(
+			index === 0
+				? {
+						...block,
+						marginTop: sourcePath ? DETAIL_SOURCE_LINE_MARGIN_BOTTOM : DETAIL_TOP_MARGIN,
+					}
+				: block,
+		);
 	}
 	if (blocks.length === 0) {
 		blocks.push(makeFixed(XS_LINE_HEIGHT, "detail-plan-empty", DETAIL_TOP_MARGIN));

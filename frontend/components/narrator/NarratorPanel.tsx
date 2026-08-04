@@ -9,6 +9,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import {
@@ -183,6 +184,7 @@ import {
 	type ModelOption,
 	parseAggModelValue,
 	resolveDisplayModel,
+	statusRegistry,
 } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
@@ -2017,7 +2019,14 @@ function RollbackConfirmModal({
 							</>
 						) : (
 							<Text size="sm" c="dimmed">
-								{conflicts.length > 0 ? t("revertScopeBlocked") : t("rollbackConfirmNoFiles")}
+								{conflicts.length > 0
+									? t("revertScopeBlocked")
+									: scope === "narrator" && narratorScope?.reason === "nothing_owned"
+										? // Says why the list is empty. A shared worktree makes "no files"
+											// ambiguous — the user can see other narrators editing the same
+											// directory — so state that this narrator's own set is empty.
+											t("revertScopeNothingOwned")
+										: t("rollbackConfirmNoFiles")}
 							</Text>
 						)}
 					</>
@@ -2159,7 +2168,11 @@ function BlockDeleteConfirmModal({
 						) : (
 							!previewFailed && (
 								<Text size="sm" c="dimmed">
-									{conflicts.length > 0 ? t("revertScopeBlocked") : t("blockDeleteConfirmNoFiles")}
+									{conflicts.length > 0
+										? t("revertScopeBlocked")
+										: data?.reason === "nothing_owned"
+											? t("revertScopeNothingOwned")
+											: t("blockDeleteConfirmNoFiles")}
 								</Text>
 							)
 						)}
@@ -3618,6 +3631,9 @@ export function NarratorPanel({
 	// Unset (new users) resolves to Virtual; Chunk is now an explicit opt-out.
 	const [narratorVirtualListRequested] = useLocalPref("narrafork_narrator_virtual_list");
 	const narratorVirtualList = resolveNarratorVirtualListEnabled(narratorVirtualListRequested);
+	// Reading-width preference, needed here only so the lazy-chunk fallback lays its
+	// skeleton out in the same column the list will use (no width step on mount).
+	const [narratorCenteredColumn] = useLocalPref("narrafork_narrator_centered_column");
 	const isAtBottomRef = useRef(isAtBottom);
 	isAtBottomRef.current = isAtBottom;
 	const scrollToBottomRef = useRef<(instant?: boolean) => void>(() => {});
@@ -4466,6 +4482,16 @@ export function NarratorPanel({
 	}, [closeContextThresholdSettings, contextThresholdDraft, t, updateSettingsMutation]);
 	const isPlanning = hasPlanTrait && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
+	/*
+	 * Parked until an unavailable model recovers. Shares the `waiting` status with
+	 * "waiting for your approval", so it must be checked first to keep the
+	 * attention-colored (yellow) treatment off a wait the user cannot resolve.
+	 */
+	const isWaitingForModel = substatus.includes("model_unavailable");
+	/** Registry-owned accent for that state, so the shade lives in one place. */
+	const modelUnavailableColor = statusRegistry.accentColor(
+		statusRegistry.narratorSubstatus("model_unavailable"),
+	);
 	// Derive compacting flags from substatus. "compacting" is blocking; background compact
 	// can run alongside an active turn or after the turn has become idle.
 	const isBlockingCompacting = substatus.includes("compacting");
@@ -4481,6 +4507,23 @@ export function NarratorPanel({
 		? decodeURIComponent(queueMessage.slice("queue_message:".length))
 		: null;
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting || isRetrying);
+	/*
+	 * Single source for the work-indicator accent, shared by the spinner and its
+	 * label so the two can never drift. `model_unavailable` uses the blue-toned
+	 * neutral from the status registry so it reads as "the system is waiting", not
+	 * "you need to do something".
+	 */
+	const workIndicatorColor = isRetrying
+		? "yellow"
+		: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
+			? "orange"
+			: isWaitingForModel
+				? modelUnavailableColor
+				: isWaiting
+					? "yellow"
+					: isPlanning
+						? "green"
+						: "blue";
 
 	// --- Turn elapsed timer ---
 	const turnStartedAt = narrator?.turnStartedAt as string | null | undefined;
@@ -7542,9 +7585,16 @@ export function NarratorPanel({
 															// Same message-shaped skeleton the list itself shows while its
 															// document loads, so the lazy-chunk wait and the document wait
 															// look like one continuous placeholder (no blank → text flash).
+															//
+															// The column geometry comes from the shared helper rather than
+															// Mantine padding, so this fallback, the list's own placeholder
+															// and the real rows are all the same width — otherwise the
+															// mount stepped through two different column widths.
 															<Suspense
 																fallback={
-																	<Box py="sm" px="md">
+																	<Box
+																		style={narratorColumnPlaceholderStyle(narratorCenteredColumn)}
+																	>
 																		<NarratorMessageListSkeleton />
 																	</Box>
 																}
@@ -8108,36 +8158,8 @@ export function NarratorPanel({
 								style={{ minWidth: 0, flex: 1 }}
 							>
 								<Group gap={6} wrap="nowrap">
-									<Loader
-										size={14}
-										color={
-											isRetrying
-												? "yellow"
-												: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
-													? "orange"
-													: isWaiting
-														? "yellow"
-														: isPlanning
-															? "green"
-															: "blue"
-										}
-										style={{ flexShrink: 0 }}
-									/>
-									<Text
-										size="xs"
-										c={
-											isRetrying
-												? "yellow"
-												: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
-													? "orange"
-													: isWaiting
-														? "yellow"
-														: isPlanning
-															? "green"
-															: "blue"
-										}
-										truncate
-									>
+									<Loader size={14} color={workIndicatorColor} style={{ flexShrink: 0 }} />
+									<Text size="xs" c={workIndicatorColor} truncate>
 										{isRetrying
 											? retryCountdown > 0
 												? t("retryingCountdown", {
@@ -8151,15 +8173,17 @@ export function NarratorPanel({
 													})
 											: isBlockingCompacting
 												? `${t("compacting")} · ${compactProgressText}`
-												: currentSpecTask
-													? currentSpecTask.text
-													: isWaiting
-														? t("status_waiting")
-														: isPlanning
-															? t("planning")
-															: isBackgroundCompacting
-																? `${t("backgroundCompacting")} · ${compactProgressText}`
-																: t("thinking")}
+												: isWaitingForModel
+													? t("status_model_unavailable")
+													: currentSpecTask
+														? currentSpecTask.text
+														: isWaiting
+															? t("status_waiting")
+															: isPlanning
+																? t("planning")
+																: isBackgroundCompacting
+																	? `${t("backgroundCompacting")} · ${compactProgressText}`
+																	: t("thinking")}
 									</Text>
 									{(queuePosition != null || queueMessageValue) && (
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
@@ -8187,7 +8211,7 @@ export function NarratorPanel({
 									h={8}
 									style={{
 										borderRadius: "50%",
-										backgroundColor: `var(--mantine-color-${statusBarDisplay.color}-filled)`,
+										backgroundColor: statusRegistry.accentVar(statusBarDisplay, "filled"),
 										flexShrink: 0,
 									}}
 								/>

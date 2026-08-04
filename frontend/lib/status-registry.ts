@@ -15,9 +15,74 @@ export type StatusEntry = {
 	color: string;
 	icon: string;
 	i18nKey: string;
+	/**
+	 * Shade to use when this status is painted as a small solid accent (status
+	 * dot, loader, `variant="dot"` badge) instead of as a filled background
+	 * behind white text.
+	 *
+	 * Saturated hues stay legible at Mantine's default step, but a desaturated
+	 * neutral like `slate` resolves to a near-background color there (dark
+	 * `primaryShade` is 8) and the accent disappears. Leave undefined to keep the
+	 * call site's own default step.
+	 */
+	accentShade?: number;
+	/**
+	 * Render this status with a filled/solid glyph rather than an outline.
+	 *
+	 * Surfaces like the sidebar tab icons signal "nothing is happening" with a
+	 * hollow shape and "something is happening" with a filled one. A state that is
+	 * genuinely occupied — even if the user cannot act on it — must be filled, or
+	 * it stays indistinguishable from idle however the hue is tuned.
+	 */
+	solidAccent?: boolean;
+	/**
+	 * The SHAPE a surface should draw for this state, when it can draw one.
+	 *
+	 * ── WHY SHAPE AND NOT JUST COLOUR ─────────────────────────────────────────
+	 * The narrator palette ran out of usable hues. Measured hue distances: teal sits
+	 * only 31° from green (success) and 46° from blue (working); cyan is 21° from blue;
+	 * violet 27° from indigo; pink 21° from red. Every remaining slot collides with a
+	 * state it has to be told apart from, so adding one more colour could not fix
+	 * anything — two states that matter were always going to look alike.
+	 *
+	 * Shape carries the distinction instead, and colour is free to group states by what
+	 * they ASK OF THE READER rather than by identity. That is why `reflecting` is orange
+	 * like the other attention states: a running gate can be approved, rejected or taken
+	 * over by hand, so it belongs with "you can act on this" — and its shield shape is
+	 * what keeps it distinct from a plain permission prompt.
+	 *
+	 * ⚠️ NOT the `icon` field above. That one holds Unicode glyphs (`◉` / `◔` / …) which
+	 * NOTHING renders — every consumer reads only `color` / `solidAccent`. Rather than
+	 * revive a dead field with a second meaning, `shape` is a small closed vocabulary the
+	 * drawing surfaces map to their own icon sets (Tabler in React, geometry in Pixi).
+	 * Leave it undefined for states with no special shape; the surface keeps its default.
+	 */
+	shape?: StatusShape;
 };
 
+/**
+ * The closed vocabulary of status shapes.
+ *
+ * Deliberately semantic rather than pictorial: a surface picks its own glyph, so the
+ * sidebar can use Tabler's filled check while the Pixi ruler draws geometry, without
+ * either one hard-coding the mapping twice.
+ */
+export type StatusShape =
+	/** Finished as intended — the reader needs nothing from this. */
+	| "check"
+	/** A reflection gate is deliberating; the reader MAY intervene (approve/reject/take over). */
+	| "shield"
+	/** Blocked on the reader — nothing proceeds until they act. */
+	| "alert";
+
 type StatusMap<K extends string = string> = Record<K, StatusEntry>;
+
+/**
+ * The subset of {@link StatusEntry} the accent helpers need, so callers that
+ * carry a color + shade without the icon/i18n fields (e.g. the narrator status
+ * bar's derived display) can use them too.
+ */
+export type StatusAccent = Pick<StatusEntry, "color" | "accentShade">;
 
 // ---------------------------------------------------------------------------
 // Chapter Status
@@ -55,7 +120,13 @@ export type NarratorStatus = "idle" | "working" | "waiting" | "archived";
 const narratorStatusMap: StatusMap<NarratorStatus> = {
 	idle: { color: "gray", icon: "○", i18nKey: "status.narratorIdle" },
 	working: { color: "blue", icon: "◉", i18nKey: "status.narratorWorking" },
-	waiting: { color: "yellow", icon: "◔", i18nKey: "status.narratorWaiting" },
+	/**
+	 * Blocked on the user — a permission prompt or a question. `alert` because nothing
+	 * proceeds until they act, which is precisely what distinguishes this from the other
+	 * waiting-ish substatuses below (`retrying` / `queued` / `model_unavailable` all wait
+	 * on the MACHINE and deliberately keep the default shape).
+	 */
+	waiting: { color: "yellow", icon: "◔", i18nKey: "status.narratorWaiting", shape: "alert" },
 	archived: { color: "dark", icon: "◌", i18nKey: "status.narratorArchived" },
 };
 
@@ -76,16 +147,46 @@ export type NarratorSubstatus =
 	| "background_compacting"
 	| "planning"
 	| "retrying"
-	| "queued";
+	| "queued"
+	| "model_unavailable";
 
 const narratorSubstatusMap: StatusMap<NarratorSubstatus> = {
-	unread: { color: "green", icon: "●", i18nKey: "status.narratorUnread" },
+	/**
+	 * A finished turn the reader has not seen yet. `check` because the work COMPLETED —
+	 * this is the only narrator state that reports a finished result, so it owns the tick.
+	 */
+	unread: { color: "green", icon: "●", i18nKey: "status.narratorUnread", shape: "check" },
 	error: { color: "red", icon: "✗", i18nKey: "status.narratorError" },
 	interrupted: { color: "orange", icon: "⊘", i18nKey: "status.narratorInterrupted" },
 	suspended: { color: "yellow", icon: "◔", i18nKey: "status.narratorSuspended" },
 	manual_override: { color: "orange", icon: "◔", i18nKey: "status.narratorManualOverride" },
 	taken_over: { color: "grape", icon: "◉", i18nKey: "status.narratorTakenOver" },
-	reflecting: { color: "grape", icon: "◉", i18nKey: "status.narratorReflecting" },
+	/**
+	 * ORANGE + a SHIELD. Colour groups it with the other states the user can act on;
+	 * shape is what keeps it distinct from them.
+	 *
+	 * The colour history is worth keeping, because two earlier attempts were both wrong
+	 * for instructive reasons. It was grape, which `reasoning` still owns — but reasoning
+	 * is ordinary progress while a gate has PAUSED the session, so one hue for both was
+	 * misleading. Then teal, which measured only 31° from green: indistinguishable from
+	 * the success/unread colour in exactly the places they sit side by side.
+	 *
+	 * Orange is right for a reason that is not "a free slot": a running gate is
+	 * INTERACTIVE — it can be approved, rejected or taken over manually — so it belongs
+	 * with the attention family rather than with the "machine is busy" colours. The
+	 * shield then separates it from a plain permission prompt's alert.
+	 *
+	 * `solidAccent` because a reflecting narrator is genuinely OCCUPIED. The gate parks it
+	 * at `waiting` (narrator-permission.ts) — a status the sidebar's fill rule does not
+	 * cover — so without this the tab icon stayed HOLLOW, i.e. shaped exactly like idle.
+	 */
+	reflecting: {
+		color: "orange",
+		icon: "◉",
+		i18nKey: "status.narratorReflecting",
+		solidAccent: true,
+		shape: "shield",
+	},
 	reasoning: { color: "grape", icon: "◉", i18nKey: "status.narratorReasoning" },
 	compacting: { color: "orange", icon: "◉", i18nKey: "status.narratorCompacting" },
 	background_compacting: {
@@ -96,6 +197,24 @@ const narratorSubstatusMap: StatusMap<NarratorSubstatus> = {
 	planning: { color: "green", icon: "◉", i18nKey: "status.narratorPlanning" },
 	retrying: { color: "yellow", icon: "◔", i18nKey: "status.narratorRetrying" },
 	queued: { color: "yellow", icon: "◔", i18nKey: "status.narratorQueued" },
+	/*
+	 * Parked until an unavailable model recovers. Deliberately NOT yellow/orange:
+	 * the user has nothing to act on, so it must not read as "needs attention".
+	 * `slate` is the blue-toned neutral registered in the app theme; shade 5 is
+	 * the tuned accent step that separates it from idle gray without looking like
+	 * an actively working narrator (see the palette comment in main.tsx).
+	 *
+	 * `solidAccent` matters as much as the hue: several surfaces distinguish idle
+	 * from busy by outline-vs-filled glyph, so a hollow blue-gray dot still reads
+	 * as idle no matter how the color is tuned.
+	 */
+	model_unavailable: {
+		color: "slate",
+		icon: "◉",
+		i18nKey: "status.narratorModelUnavailable",
+		accentShade: 5,
+		solidAccent: true,
+	},
 };
 
 /**
@@ -113,6 +232,10 @@ export function getEffectiveNarratorDisplay(status: string, substatus?: string[]
 		const priority: NarratorSubstatus[] = [
 			"error",
 			"retrying",
+			// The actual reason the turn is stalled, so it outranks secondary
+			// bookkeeping tags (compacting/queued) but yields to error/retrying,
+			// which describe a more specific failure.
+			"model_unavailable",
 			"compacting",
 			"background_compacting",
 			"suspended",
@@ -132,6 +255,28 @@ export function getEffectiveNarratorDisplay(status: string, substatus?: string[]
 		}
 	}
 	return lookup(narratorStatusMap, status);
+}
+
+/**
+ * Build a Mantine `color` prop for a status painted as a small solid accent
+ * (status dot, loader, `variant="dot"` badge).
+ *
+ * Returns `"slate.5"`-style shorthand when the entry pins an accent shade, and
+ * the bare color name otherwise so existing call sites keep their own default.
+ */
+export function statusAccentColor(entry: StatusAccent): string {
+	return entry.accentShade === undefined ? entry.color : `${entry.color}.${entry.accentShade}`;
+}
+
+/**
+ * Same as {@link statusAccentColor} but as a raw CSS variable, for call sites
+ * that build a `background`/`color` string instead of passing a Mantine prop.
+ *
+ * `fallbackShade` is the step to use when the entry does not pin one — pass
+ * whatever the call site already hardcoded so its appearance is unchanged.
+ */
+export function statusAccentVar(entry: StatusAccent, fallbackShade: number | "filled"): string {
+	return `var(--mantine-color-${entry.color}-${entry.accentShade ?? fallbackShade})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +391,10 @@ export const statusRegistry = {
 	narratorSubstatus: (s: string) => lookup(narratorSubstatusMap, s),
 	/** Resolve effective display for a narrator given status + substatus tags */
 	narratorEffective: getEffectiveNarratorDisplay,
+	/** Mantine `color` prop for a status rendered as a small solid accent */
+	accentColor: statusAccentColor,
+	/** Raw CSS variable for a status rendered as a small solid accent */
+	accentVar: statusAccentVar,
 	containerStatus: (s: string) => lookup(containerStatusMap, s),
 	toolCallStatus: (s: string) => lookup(toolCallStatusMap, s),
 	projectStatus: (s: string) => lookup(projectStatusMap, s),

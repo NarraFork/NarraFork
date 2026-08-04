@@ -43,6 +43,7 @@ import {
 	subagentConclusionPatch,
 	timeoutUpdatedPatch,
 	toolCompletedPatch,
+	toolExecutingPatch,
 	toolStartedPatch,
 } from "./vlist-live-events";
 import {
@@ -307,6 +308,13 @@ export function useVListLivePatches(
 			onTimeoutUpdated: (toolUseId, timeoutMs) => {
 				if (!toolUseId) return;
 				enqueue(timeoutUpdatedPatch({ toolUseId, timeoutMs }));
+			},
+
+			// Execution began (permission granted). The persisted half of the same signal
+			// `useVListStreamingMessage` folds into the live store.
+			onToolExecuting: (toolUseId) => {
+				if (!toolUseId) return;
+				enqueue(toolExecutingPatch(toolUseId));
 			},
 
 			// ── Permissions (persisted status half; the live form is separate) ──

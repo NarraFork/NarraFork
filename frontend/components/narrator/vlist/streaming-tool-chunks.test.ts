@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	applyStreamingToolChunk,
 	applyStreamingToolCompleted,
+	applyStreamingToolExecuting,
 	applyStreamingToolLongRunning,
 	applyStreamingToolOutput,
 	applyStreamingToolStarted,
@@ -70,11 +71,11 @@ describe("applyStreamingToolChunk — arguments being written", () => {
 			toolName: "Bash",
 			input: { command: "ls" },
 		});
-		// Out-of-order delivery must not demote a running card back to "writing args".
+		// Out-of-order delivery must not demote a promoted card back to "writing args".
 		expect(
 			applyStreamingToolChunk(store, { toolUseId: "t1", toolName: "Bash", inputCharsTotal: 9 }),
 		).toBe(false);
-		expect(streamingToolChunks(store)[0]?._status).toBe("running");
+		expect(streamingToolChunks(store)[0]?._status).toBe("initializing");
 	});
 
 	it("rejects an event with no tool id", () => {
@@ -107,9 +108,79 @@ describe("applyStreamingToolStarted / Completed — lifecycle", () => {
 		).toBe(true);
 		const [chunk] = streamingToolChunks(store);
 		expect(chunk?._started).toBe(true);
-		expect(chunk?._status).toBe("running");
+		// `initializing`, NOT `running`: `tool_started` means the input finished parsing,
+		// and the permission gate sits after it. `tool_executing` is what proves execution.
+		expect(chunk?._status).toBe("initializing");
 		expect(chunk?._input).toEqual({ command: "npm test" });
 		expect(chunk?._startedAt).toBe(1234);
+	});
+
+	it("turns a tool RUNNING only once execution actually begins", () => {
+		// The lifecycle thefive-state shimmer depends on: `tool_started` (input parsed) is
+		// NOT execution; `tool_executing` (permission granted) is.
+		const store = createStreamingToolStore();
+		applyStreamingToolStarted(store, { toolUseId: "t1", toolName: "Bash" });
+		expect(streamingToolChunks(store)[0]?._status).toBe("initializing");
+		expect(applyStreamingToolExecuting(store, { toolUseId: "t1" })).toBe(true);
+		expect(streamingToolChunks(store)[0]?._status).toBe("running");
+	});
+
+	it("⚠️ keeps RUNNING when tool_started arrives LATE — and still lands the input", () => {
+		// The regression this guard exists for. `loop.ts` starts eager execution BEFORE it
+		// yields `tool_call`, so for most tools `tool_executing` reaches the client first
+		// and `tool_started` lands after it.
+		//
+		// BOTH assertions are required. Guarding by dropping the whole late event would
+		// satisfy the status check while losing `_input` — and `_input` is carried ONLY by
+		// `tool_started`, so the card would render with no command and no file path. That
+		// trades a colour bug for missing content, which is worse.
+		const store = createStreamingToolStore();
+		applyStreamingToolExecuting(store, { toolUseId: "t1" });
+		expect(streamingToolChunks(store)[0]?._status).toBe("running");
+
+		applyStreamingToolStarted(store, {
+			toolUseId: "t1",
+			toolName: "Bash",
+			input: { command: "npm test" },
+			streamStartedAt: 4321,
+		});
+		const [chunk] = streamingToolChunks(store);
+		expect(chunk?._status).toBe("running");
+		expect(chunk?._input).toEqual({ command: "npm test" });
+		expect(chunk?._startedAt).toBe(4321);
+		expect(chunk?.toolName).toBe("Bash");
+	});
+
+	it("never reopens a tool that already finished", () => {
+		// A reconnect can replay `tool_executing` after the `tool_completed` that
+		// superseded it. Letting it through would spin a finished card forever, because
+		// nothing completes it a second time.
+		const store = createStreamingToolStore();
+		applyStreamingToolStarted(store, { toolUseId: "t1", toolName: "Bash" });
+		applyStreamingToolCompleted(store, { toolUseId: "t1", status: "success" });
+		applyStreamingToolExecuting(store, { toolUseId: "t1" });
+		expect(streamingToolChunks(store)[0]?._status).toBe("success");
+		// A late `tool_started` must not reopen it either.
+		applyStreamingToolStarted(store, { toolUseId: "t1", toolName: "Bash" });
+		expect(streamingToolChunks(store)[0]?._status).toBe("success");
+	});
+
+	it("creates the entry when executing arrives for an unknown tool", () => {
+		// Deliberately unlike `applyStreamingToolOutput`, which ignores unknown ids:
+		// out-of-order delivery makes this the FIRST frame for a tool, so discarding it
+		// would lose the only fact it carries.
+		const store = createStreamingToolStore();
+		expect(applyStreamingToolExecuting(store, { toolUseId: "t-new" })).toBe(true);
+		const [chunk] = streamingToolChunks(store);
+		expect(chunk?._status).toBe("running");
+		// A tool that is executing has necessarily finished parsing its input, so the card
+		// must render as a real card rather than an argument-progress placeholder.
+		expect(chunk?._started).toBe(true);
+	});
+
+	it("rejects an executing event with no tool id", () => {
+		const store = createStreamingToolStore();
+		expect(applyStreamingToolExecuting(store, { toolUseId: "" })).toBe(false);
 	});
 
 	it("records the terminal status and output, keeping the entry", () => {

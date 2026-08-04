@@ -65,18 +65,32 @@ const DEFAULT_LABELS: Required<Pick<ReflectionNoticeLabels, "takeOver">> = {
 	takeOver: "Take over",
 };
 
-/** Status/kind → icon, mirroring the original component's chain. */
+/**
+ * Status/kind → icon, mirroring the original component's chain.
+ *
+ * A running gate shows a SHIELD rather than a spinner: a spinner says "wait, nothing for
+ * you here", while the whole point of a gate is that the user MAY step in. The shield is
+ * the same shape this state carries in the sidebar, so the surfaces agree.
+ */
 function noticeIcon(status: string | undefined) {
-	if (status === "running") return <IconLoader2 size={14} className="vlist-spin" />;
+	if (status === "running") return <IconShield size={14} />;
 	if (status === "confirmed") return <IconCheck size={14} />;
 	if (status === "cancelled") return <IconX size={14} />;
 	if (status === "aborted") return <IconBan size={14} />;
 	return <IconShield size={14} />;
 }
 
-/** Status → ThemeIcon colour, mirroring the original component. */
+/**
+ * Status → ThemeIcon colour, mirroring the original component.
+ *
+ * A running gate is ORANGE, grouping it with the states the user can act on: the gate can
+ * be approved, rejected or taken over by hand, so it is genuinely interactive. Its SHIELD
+ * shape (see the icon picker above) is what distinguishes it from a plain permission
+ * prompt — colour groups by "what is asked of the reader", shape carries identity. The
+ * palette had no free hue left to do both; see `StatusShape` in status-registry.
+ */
 function iconColor(status: string | undefined): string {
-	if (status === "running") return "yellow";
+	if (status === "running") return "orange";
 	if (status === "confirmed") return "green";
 	if (status === "cancelled") return "red";
 	if (status === "aborted") return "orange";
@@ -236,18 +250,19 @@ export function RenderReflectionNotice({
 	const { blocks, frame, contentWidth, metas, status, height, topMargin } = measured;
 	const running = status === "running";
 
-	// Tinted like the original: yellow while the gate runs, neutral once resolved.
+	// Tinted ORANGE while the gate runs, neutral once resolved. See `iconColor` above for
+	// why orange — the state is interactive, so it belongs with the attention family.
 	const background = running
-		? "light-dark(color-mix(in srgb, var(--mantine-color-yellow-0) 88%, white), color-mix(in srgb, var(--mantine-color-yellow-9) 34%, transparent))"
+		? "light-dark(color-mix(in srgb, var(--mantine-color-orange-0) 88%, white), color-mix(in srgb, var(--mantine-color-orange-9) 34%, transparent))"
 		: "light-dark(color-mix(in srgb, var(--mantine-color-gray-0) 88%, white), color-mix(in srgb, var(--mantine-color-dark-5) 52%, transparent))";
 	const borderColor = running
-		? "light-dark(var(--mantine-color-yellow-3), color-mix(in srgb, var(--mantine-color-yellow-6) 45%, transparent))"
+		? "light-dark(var(--mantine-color-orange-3), color-mix(in srgb, var(--mantine-color-orange-6) 45%, transparent))"
 		: "var(--mantine-color-default-border)";
 	const titleColor = running
-		? "light-dark(var(--mantine-color-yellow-9), var(--mantine-color-yellow-2))"
+		? "light-dark(var(--mantine-color-orange-9), var(--mantine-color-orange-2))"
 		: "var(--mantine-color-text)";
 	const bodyColor = running
-		? "light-dark(var(--mantine-color-yellow-9), var(--mantine-color-yellow-1))"
+		? "light-dark(var(--mantine-color-orange-9), var(--mantine-color-orange-1))"
 		: "var(--mantine-color-dimmed)";
 
 	const colorFor = (meta: ReflectionBlockMeta | undefined): string =>
@@ -315,7 +330,7 @@ export function RenderReflectionNotice({
 								<Button
 									size="xs"
 									variant="light"
-									color="yellow"
+									color="orange"
 									leftSection={<IconPlayerStop size={12} />}
 									loading={takingOver}
 									style={{ flexShrink: 0 }}

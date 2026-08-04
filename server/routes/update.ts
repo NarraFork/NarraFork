@@ -7,6 +7,7 @@ import { APP_VERSION } from "../lib/version";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 import {
 	applyUpdate,
+	cancelPreparedUpdate,
 	checkForUpdate,
 	cleanupOldUpdates,
 	downloadUpdate,
@@ -21,8 +22,13 @@ export const updateRoutes = new Hono();
 /**
  * GET /api/update/check
  * Check for available updates.
+ *
+ * Admin-only because this reaches out to the configured update server: an unauthenticated caller
+ * could otherwise make the deployment emit outbound requests on demand, and the reply exposes
+ * release metadata and download URLs. Every caller in the UI already sits behind the login gate,
+ * and acting on the result (`/download`, `/apply`) is admin-only anyway.
  */
-updateRoutes.get("/check", async (c) => {
+updateRoutes.get("/check", requireAuth, requireAdmin, async (c) => {
 	const result = await checkForUpdate();
 	return c.json(result);
 });
@@ -30,8 +36,13 @@ updateRoutes.get("/check", async (c) => {
 /**
  * GET /api/update/version
  * Get current version info.
+ *
+ * Authenticated but not admin-gated: the build identity is useful to any signed-in user and is
+ * purely local. It stays reachable without admin so a non-admin session can still tell which
+ * build it is talking to. Unauthenticated clients that need this during startup should keep
+ * using the public `/api/health`, which already reports version and platform.
  */
-updateRoutes.get("/version", (c) => {
+updateRoutes.get("/version", requireAuth, (c) => {
 	return c.json({
 		version: APP_VERSION,
 		platform: process.platform,
@@ -83,7 +94,15 @@ updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
 			});
 		};
 
-		const result = await downloadUpdate(releaseInfo, onProgress, { forceDownload: retry });
+		// A client that cancels its own fetch must also stop the server-side work; without this
+		// the download and patch application keep running with nobody listening.
+		const abort = new AbortController();
+		stream.onAbort(() => abort.abort());
+
+		const result = await downloadUpdate(releaseInfo, onProgress, {
+			forceDownload: retry,
+			signal: abort.signal,
+		});
 
 		if (result.success && result.updatePath) {
 			const instructions = getUpdateInstructions(result.updatePath, result.newBinaryPath);
@@ -132,9 +151,9 @@ updateRoutes.get("/directory", requireAuth, requireAdmin, (c) => {
  * GET /api/update/status
  * Check if an update is downloaded and ready to apply.
  */
-updateRoutes.get("/status", requireAuth, requireAdmin, (c) => {
+updateRoutes.get("/status", requireAuth, requireAdmin, async (c) => {
 	const targetVersion = c.req.query("version") || undefined;
-	return c.json(getUpdateStatus(targetVersion));
+	return c.json(await getUpdateStatus(targetVersion));
 });
 
 /**
@@ -152,6 +171,19 @@ updateRoutes.post("/apply", requireAuth, requireAdmin, async (c) => {
 	} catch {
 		// Empty body is OK; applyUpdate still validates the prepared update metadata.
 	}
-	const result = applyUpdate({ targetVersion });
+	const result = await applyUpdate({ targetVersion });
 	return c.json(result);
+});
+
+/**
+ * POST /api/update/cancel
+ * Abandon a scheduled update that is still waiting for narrator work to reach a safe point.
+ *
+ * The coordination waits are unbounded on purpose, so this is the operator's escape hatch.
+ * Paused tool calls resume and the prepared binary stays in place for a later attempt.
+ * Once the replacement process has been spawned (`restarting`) there is nothing to cancel.
+ */
+updateRoutes.post("/cancel", requireAuth, requireAdmin, (c) => {
+	const { cancelled, status } = cancelPreparedUpdate("Cancelled from the update dialog");
+	return c.json({ success: true, cancelled, ...status });
 });

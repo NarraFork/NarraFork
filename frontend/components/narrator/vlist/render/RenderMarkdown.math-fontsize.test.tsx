@@ -160,6 +160,97 @@ describe("inline math font size (virtual list)", () => {
 	});
 });
 
+describe("a formula never wraps inside its host box", () => {
+	// KaTeX deliberately splits a formula into SEVERAL `.base` spans, cutting after
+	// binary/relation operators so a browser can break a long formula there. Those
+	// cuts are real line-break opportunities. The host box is width-pinned to the
+	// measured width with no slack, so any sub-pixel rounding lets the box wrap at
+	// one of those cuts — the formula then renders on two stacked lines, clipped by
+	// the fixed height. Observed on `$x_1 + x_2$`, `$\nabla f(x) = 0$` and
+	// `$f(x) = \sum…$`: each broke exactly at its operator.
+	//
+	// The fix must suppress wrapping rather than widen the box: widening would
+	// desync the paint from the reserved geometry (zero-DOM contract).
+	const MULTI_BASE = [
+		"x_1 + x_2",
+		"\\nabla f(x) = 0",
+		"E = mc^2",
+		"f(x) = \\sum_{i=1}^{n} \\frac{(x - \\mu_i)^2}{2\\sigma_i^2}",
+	];
+
+	it("emits multi-base markup for the formulas that broke (regression premise)", async () => {
+		// Guards the premise: if KaTeX ever stopped splitting bases, the assertions
+		// below would pass for the wrong reason.
+		const katex = (await import("katex")).default;
+		for (const latex of MULTI_BASE) {
+			const html = katex.renderToString(latex, {
+				displayMode: false,
+				throwOnError: false,
+				output: "html",
+			});
+			expect((html.match(/class="base"/g) ?? []).length).toBeGreaterThan(1);
+		}
+	});
+
+	it("pins white-space so the operator cuts cannot become line breaks", async () => {
+		for (const latex of MULTI_BASE) {
+			const view = await renderMarkdownBody(`prose $${latex}$ tail`);
+			const host = inlineMathHost(view.container);
+			expect(host).not.toBeNull();
+			// `nowrap` is what removes the break opportunity between `.base` spans.
+			expect(host?.style.whiteSpace).toBe("nowrap");
+			view.unmount();
+		}
+	});
+
+	it("keeps the host a single unwrappable run even in a narrow column", async () => {
+		// The real trigger is a tight column: the row is measured at a width the
+		// formula only just fits into.
+		const { ensureKatexLoaded } = await import("../katex-runtime");
+		const { measureMarkdown } = await import("../measure/measure-markdown");
+		const { RenderMarkdown } = await import("./RenderMarkdown");
+		const markdown = "设 $f(x) = \\sum_{i=1}^{n} \\frac{(x - \\mu_i)^2}{2\\sigma_i^2}$ 为目标函数";
+		await ensureKatexLoaded(markdown);
+		const measured = measureMarkdown(markdown, 240);
+
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		const reactRoot = createRoot(container);
+		act(() => {
+			reactRoot.render(
+				<MantineProvider>
+					<RenderLodCtx.Provider value={{ lod: 5, interactive: true }}>
+						<RenderMarkdown measured={measured} />
+					</RenderLodCtx.Provider>
+				</MantineProvider>,
+			);
+		});
+		const host = inlineMathHost(container as unknown as Element);
+		expect(host?.style.whiteSpace).toBe("nowrap");
+		act(() => reactRoot.unmount());
+		container.remove();
+	});
+});
+
+describe("measure and render agree on the base", () => {
+	it("pins the same size the measure layer measured with", async () => {
+		// The render layer keeps its own `MATH_BASE_FONT_SIZE` (the dev server does not
+		// watch `shared/`, so a render-side import of a NEW shared export breaks HMR —
+		// see the constant's comment). Both sides derive from FONT_SIZE.sm, and this
+		// asserts they actually still agree: if one moves, the painted formula silently
+		// desyncs from the reserved geometry again.
+		const { MATH_BASE_FONT_SIZE } = await import("../pretext-fonts");
+		const { FONT_SIZE } = await import("../pretext-fonts");
+		expect(MATH_BASE_FONT_SIZE).toBe(FONT_SIZE.sm);
+		expect(MATH_BASE_FONT_SIZE).toBe(MEASURED_BASE_PX);
+
+		// And the painted host uses that very value.
+		const view = await renderMarkdownBody("value $x^2$ here");
+		expect(inlineMathHost(view.container)?.style.fontSize).toBe(`${MATH_BASE_FONT_SIZE}px`);
+		view.unmount();
+	});
+});
+
 describe("display math font size (virtual list)", () => {
 	it("paints display math at the measured px base too", async () => {
 		const view = await renderMarkdownBody("$$\\int_0^1 x^2 dx$$");
@@ -171,13 +262,15 @@ describe("display math font size (virtual list)", () => {
 });
 
 describe("source fallback is untouched", () => {
-	it("renders LaTeX source as text when KaTeX produced no markup", async () => {
-		// Directly exercise the fallback branch: an empty `html` means KaTeX was
-		// unavailable or failed, and the render layer must show the source instead
-		// of an empty width-pinned box. No KaTeX box → no font-size pinning needed.
+	/**
+	 * Render the fallback branch: `html: ""` means KaTeX was unavailable or failed,
+	 * so the render layer shows the LaTeX source instead of an empty box. `width` is
+	 * left at the measured value, which is the state the reserved slot is in.
+	 */
+	async function renderSourceFallback(markdown: string) {
 		const { measureMarkdown } = await import("../measure/measure-markdown");
 		const { RenderMarkdown } = await import("./RenderMarkdown");
-		const measured = measureMarkdown("value $x$ here", CONTENT_WIDTH);
+		const measured = measureMarkdown(markdown, CONTENT_WIDTH);
 		const blocks = measured.blocks.map((block) => {
 			if (block.kind !== "inline" || !block.mathHtmls) return block;
 			return {
@@ -198,9 +291,45 @@ describe("source fallback is untouched", () => {
 				</MantineProvider>,
 			);
 		});
-		expect(container.querySelector('[data-vlist-math="inline"]')).toBeNull();
-		expect(container.querySelector(".vlist-frag--math-source")?.textContent).toBe("x");
-		act(() => reactRoot.unmount());
-		container.remove();
+		/** The measured geometry of the first formula in the body. */
+		const reserved = blocks
+			.flatMap((block) => (block.kind === "inline" ? (block.mathHtmls ?? []) : []))
+			.find((m) => m != null);
+		return {
+			container,
+			reserved,
+			unmount: () => {
+				act(() => reactRoot.unmount());
+				container.remove();
+			},
+		};
+	}
+
+	it("renders LaTeX source as text when KaTeX produced no markup", async () => {
+		const view = await renderSourceFallback("value $x$ here");
+		expect(view.container.querySelector('[data-vlist-math="inline"]')).toBeNull();
+		expect(view.container.querySelector(".vlist-frag--math-source")?.textContent).toBe("x");
+		view.unmount();
+	});
+
+	/**
+	 * The fallback must be PINNED to the measured slot, not sized by its own text.
+	 *
+	 * The slot was reserved from the formula's RENDERED width, and LaTeX source bears
+	 * no relation to it — `\sum_{i=1}^{n}` is far wider as source than as a formula.
+	 * An unpinned span would overflow the slot and push every later fragment on the
+	 * line sideways, so the painted line would no longer match the measured one.
+	 */
+	it("pins the fallback to the reserved width and clips the overflow", async () => {
+		const view = await renderSourceFallback("value $\\sum_{i=1}^{n} x_i$ here");
+		const fallback = view.container.querySelector(".vlist-frag--math-source");
+		if (!fallback) throw new Error("expected the source fallback span");
+		const style = fallback.getAttribute("style") ?? "";
+		const reservedWidth = view.reserved?.width ?? 0;
+		expect(reservedWidth).toBeGreaterThan(0);
+		// Same width pin + clip the rendered branch uses, so the slot cannot grow.
+		expect(style).toMatch(new RegExp(`width:\\s*${reservedWidth}px`));
+		expect(style).toMatch(/overflow:\s*hidden/);
+		view.unmount();
 	});
 });

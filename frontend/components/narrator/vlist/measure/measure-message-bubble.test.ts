@@ -24,6 +24,39 @@ describe("measureMessageBubble — assistant", () => {
 		const narrow = measureMessageBubble({ role: "assistant", text: md }, 120);
 		expect(narrow.height).toBeGreaterThan(wide.height);
 	});
+
+	/**
+	 * An assistant message IS a markdown body plus this element's own insets.
+	 *
+	 * `RenderMessageBubble`'s assistant branch hands the measured element straight to
+	 * `RenderMarkdown`, whose code panel draws `MEASURE_MARKDOWN_CODE_PADDING`
+	 * (11px per side: 10 xs + 1 border, per HighlightedCode.module.css). This measure
+	 * used to keep its OWN copy of the code chrome at `codePaddingY: 8`, so every
+	 * fenced block in an assistant message reserved 6px less than it painted — and
+	 * `CODE_PANEL_BORDER`'s compensation in the renderer assumed 11 as well.
+	 *
+	 * Pinned as EQUALITY against `measureMarkdown` rather than as the constant 11, so
+	 * the two cannot drift again regardless of what the padding becomes.
+	 */
+	it("measures a fenced code block exactly as measureMarkdown does", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const { measureMarkdown } = await import("./measure-markdown");
+		const md = "before\n\n```ts\nconst a = 1;\nconst b = 2;\n```\n\nafter";
+		const contentWidth = 800;
+		const innerWidth = contentWidth - MEASURE_MESSAGE_CONSTANTS.ASSISTANT_PAD_X * 2;
+
+		const bubble = measureMessageBubble({ role: "assistant", text: md }, contentWidth);
+		const markdown = measureMarkdown(md, innerWidth);
+		expect(bubble.height).toBe(markdown.height + MEASURE_MESSAGE_CONSTANTS.ASSISTANT_PAD_Y * 2);
+		// Block-for-block identical geometry, so the renderer's per-block offsets line
+		// up with what it would draw for a plain markdown element.
+		expect(bubble.frame.blocks.map((b) => b.height)).toEqual(
+			markdown.frame.blocks.map((b) => b.height),
+		);
+		expect(bubble.frame.blocks.map((b) => b.top)).toEqual(markdown.frame.blocks.map((b) => b.top));
+	});
 });
 
 describe("measureMessageBubble — user", () => {

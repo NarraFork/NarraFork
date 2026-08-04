@@ -36,6 +36,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
+import { clearClaims } from "./worktree-write-claims";
 
 const SHADOW_ROOT = getNarraforkPath("tree-snapshots");
 
@@ -51,6 +52,54 @@ const GIT_TIMEOUT_MS = 15_000;
 /** Cap on captured git output; tree hashes and status are tiny. */
 const GIT_MAX_OUTPUT_BYTES = 1024 * 1024;
 
+/**
+ * Cap on captured output for commands that legitimately list a whole tree.
+ *
+ * A path listing is not "tiny": one line per file means a large repository blows
+ * past the 1 MB cap that suffices for hashes, and the truncation guard then turns a
+ * rollback into a hard failure. Restore avoids whole-tree listings entirely (it asks
+ * only about the paths it is going to touch), so this applies to the explicitly
+ * whole-tree API used by previews.
+ */
+const GIT_MAX_LISTING_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Most paths written into the index in one `update-index` invocation, and the
+ * budget for that invocation's argument bytes.
+ *
+ * One spawn per path meant 300 child processes for a 300-path owned set, all while
+ * holding the shadow lock — every other capture on that worktree queues behind it.
+ * The byte budget keeps the batched argv well under the platform's `ARG_MAX`
+ * (≥256 KB even on the strictest supported systems).
+ */
+const UPDATE_INDEX_BATCH_PATHS = 256;
+const UPDATE_INDEX_BATCH_BYTES = 96 * 1024;
+
+/** Path count past which a snapshot operation is logged as slow. */
+const SLOW_PATH_COUNT = 2_000;
+
+/**
+ * Elapsed time past which one capture is reported as slow.
+ *
+ * Deliberately far below {@link GIT_TIMEOUT_MS}: a capture at this point still
+ * succeeds, so the warning exists to surface the trend *before* the cap starts
+ * being hit and boundaries start going missing. A warm capture re-stats the tree
+ * against the shadow repo's persisted index and lands in the tens of milliseconds,
+ * so this only fires on a genuinely expensive scan.
+ */
+const SLOW_CAPTURE_WARN_MS = 2_000;
+
+/**
+ * Least time between capture-cost warnings of the same severity for one shadow repo.
+ *
+ * Capture runs twice per file-mutating tool call, so an unthrottled warning on a
+ * slow filesystem would itself become the hot-path cost it is reporting.
+ */
+const SLOW_CAPTURE_WARN_INTERVAL_MS = 60_000;
+
+/** Last capture-cost warning per shadow repo and severity, to keep the log bounded. */
+const captureWarnedAt = new Map<string, number>();
+
 /** Serializes snapshot work per shadow repository. */
 const shadowLock = new AsyncMutex();
 
@@ -64,6 +113,28 @@ export class TreeSnapshotError extends Error {
 	) {
 		super(message);
 		this.name = "TreeSnapshotError";
+	}
+}
+
+/**
+ * A restore that had already begun writing when it failed.
+ *
+ * Carries the tree captured immediately before the write started, which is what a
+ * caller needs to register a compensation: without it, a failure mid-restore leaves
+ * the caller holding no description of the pre-rollback state, so none of the three
+ * capture-then-compensate exits can undo it. `compensated` says whether this module
+ * already put that state back — `false` means the worktree may be half-applied and
+ * the caller's compensation is the remaining line of defence.
+ */
+export class TreeRestoreError extends TreeSnapshotError {
+	constructor(
+		message: string,
+		public readonly capturedTreeHash: string,
+		public readonly compensated: boolean,
+		cause?: unknown,
+	) {
+		super(message, cause);
+		this.name = "TreeRestoreError";
 	}
 }
 
@@ -100,11 +171,12 @@ async function runGitRaw(
 	args: string[],
 	gitDir: string,
 	workTree: string,
+	opts?: { maxOutputBytes?: number },
 ): Promise<GitResult & { stdoutTruncated?: boolean }> {
 	const result = await safeSpawn({
 		cmd: ["git", "--git-dir", gitDir, "--work-tree", workTree, ...args],
 		timeout: GIT_TIMEOUT_MS,
-		maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
+		maxOutputBytes: opts?.maxOutputBytes ?? GIT_MAX_OUTPUT_BYTES,
 	});
 	return {
 		stdout: result.stdout,
@@ -140,8 +212,9 @@ async function runGitPaths(
 	args: string[],
 	gitDir: string,
 	workTree: string,
+	opts?: { maxOutputBytes?: number },
 ): Promise<{ paths: string[]; exitCode: number; stderr: string }> {
-	const result = await runGitRaw(args, gitDir, workTree);
+	const result = await runGitRaw(args, gitDir, workTree, opts);
 	if (result.stdoutTruncated) {
 		throw new TreeSnapshotError("snapshot path listing exceeded the size limit");
 	}
@@ -203,35 +276,78 @@ async function resolveGlobalGitignore(worktreePath: string): Promise<string | nu
 const globalIgnoreCache = new Map<string, { path: string | null; mtime: number }>();
 
 /**
+ * Locate the repository-level `info/exclude` that applies to a worktree.
+ *
+ * Every NarraFork chapter is a *linked* worktree under `.worktrees/`, where `.git`
+ * is a file pointing at `<main>/.git/worktrees/<name>`. That per-worktree gitdir has
+ * no `info/` at all: the repository-level exclude lives in the common dir, named by
+ * the `commondir` file next to the pointer (relative to the gitdir, so it has to be
+ * resolved against it). Reading `<gitdir>/info/exclude` therefore found nothing in
+ * exactly the shape production runs, and the user's repo-level ignore rules were
+ * silently never mirrored — so build output entered snapshots, and a rollback would
+ * then delete files git itself considers ignored.
+ *
+ * Returns both candidates when they differ: git honours a per-worktree
+ * `info/exclude` too when `extensions.worktreeConfig` is in play, and mirroring both
+ * is strictly closer to git's own behaviour than picking one.
+ */
+function resolveRepoExcludeFiles(worktreePath: string): string[] {
+	const dotGitPath = resolve(worktreePath, ".git");
+	const candidates: string[] = [];
+	try {
+		const stat = statSync(dotGitPath);
+		if (stat.isDirectory()) {
+			candidates.push(resolve(dotGitPath, "info", "exclude"));
+			return candidates;
+		}
+		if (!stat.isFile()) return candidates;
+		const match = readFileSync(dotGitPath, "utf-8").match(/^gitdir:\s*(.+)$/m);
+		if (!match) return candidates;
+		const gitDir = resolve(worktreePath, match[1].trim());
+		// The linked gitdir's own exclude, if this repo uses one.
+		candidates.push(resolve(gitDir, "info", "exclude"));
+		try {
+			const commonRel = readFileSync(resolve(gitDir, "commondir"), "utf-8").trim();
+			if (commonRel) {
+				// `commondir` is relative to the gitdir (typically `../..`).
+				candidates.push(resolve(gitDir, commonRel, "info", "exclude"));
+			}
+		} catch {
+			// No commondir: this is a normal (non-linked) gitdir reached via a pointer
+			// file, so its own info/exclude above is the repository-level one.
+		}
+	} catch {
+		// No .git at all (plain directory) — only .gitignore rules apply.
+	}
+	return candidates;
+}
+
+/**
  * Mirror the worktree's ignore rules into the shadow repo.
  *
  * The shadow repo has its own `info/exclude` because it never sees the user's
  * `.git`. Without this, `git add -A` would capture build output and dependency
  * directories, making every snapshot enormous.
+ *
+ * Nested `.gitignore` files are deliberately *not* copied here. The shadow repo runs
+ * every command with `--work-tree <worktree>`, so `git add -A` reads `.gitignore` at
+ * each directory level straight from disk, with the correct per-directory scoping
+ * that a flattened copy could not reproduce. Only the two sources that live inside
+ * `.git` (repo-level exclude) or outside the tree (`core.excludesFile`) are
+ * invisible to it and need mirroring.
  */
 async function syncExcludes(dir: string, worktreePath: string): Promise<void> {
 	const infoDir = resolve(dir, "info");
 	mkdirSync(infoDir, { recursive: true });
 	const parts: string[] = [];
 
-	const gitignorePath = resolve(worktreePath, ".gitignore");
-	if (existsSync(gitignorePath)) {
-		parts.push(readFileSync(gitignorePath, "utf-8"));
-	}
-
-	// For a linked worktree, `.git` is a file pointing at the real gitdir, so the
-	// per-repo exclude file has to be resolved through it.
-	let userExclude = resolve(worktreePath, ".git", "info", "exclude");
-	const dotGitPath = resolve(worktreePath, ".git");
-	try {
-		if (statSync(dotGitPath).isFile()) {
-			const match = readFileSync(dotGitPath, "utf-8").match(/^gitdir:\s*(.+)$/m);
-			if (match) userExclude = resolve(match[1].trim(), "info", "exclude");
+	for (const excludePath of resolveRepoExcludeFiles(worktreePath)) {
+		try {
+			if (existsSync(excludePath)) parts.push(readFileSync(excludePath, "utf-8"));
+		} catch {
+			// Unreadable exclude file — the remaining sources still apply.
 		}
-	} catch {
-		// No .git (plain directory) — the .gitignore rules above are all we have.
 	}
-	if (existsSync(userExclude)) parts.push(readFileSync(userExclude, "utf-8"));
 
 	// Read the global gitignore (core.excludesFile). Git checks, in order:
 	// 1. The value of `core.excludesFile` from git config (global/system)
@@ -250,7 +366,13 @@ async function syncExcludes(dir: string, worktreePath: string): Promise<void> {
 	await Bun.write(resolve(infoDir, "exclude"), parts.join("\n"));
 }
 
-/** Re-sync ignore rules only when .gitignore or global gitignore changed. */
+/**
+ * Re-sync ignore rules only when a mirrored source changed.
+ *
+ * Only the mirrored sources belong in this key. Nested `.gitignore` files are read
+ * from disk by git on every `add -A`, so they need no re-sync and stat'ing them all
+ * would put a recursive directory walk on the tool-execution path.
+ */
 async function syncExcludesIfStale(dir: string, worktreePath: string): Promise<void> {
 	const gitignorePath = resolve(worktreePath, ".gitignore");
 	let localMtime = 0;
@@ -258,6 +380,19 @@ async function syncExcludesIfStale(dir: string, worktreePath: string): Promise<v
 		if (existsSync(gitignorePath)) localMtime = statSync(gitignorePath).mtimeMs;
 	} catch {
 		// Unreadable .gitignore — fall through and reuse whatever we have.
+	}
+
+	// The repo-level exclude is mirrored, so editing it has to invalidate the copy;
+	// otherwise a newly ignored build directory keeps entering snapshots until the
+	// process restarts. Two or three stat calls, no directory walk.
+	let repoExcludeMtime = 0;
+	for (const excludePath of resolveRepoExcludeFiles(worktreePath)) {
+		try {
+			repoExcludeMtime += statSync(excludePath).mtimeMs;
+		} catch {
+			// Absent or unreadable — contributes nothing, and its later appearance
+			// changes the sum.
+		}
 	}
 
 	// Include global gitignore mtime in staleness check. Cache the resolved path
@@ -288,8 +423,8 @@ async function syncExcludesIfStale(dir: string, worktreePath: string): Promise<v
 		}
 	}
 
-	// Combine both mtimes into a single cache key for the shadow dir
-	const combinedKey = `${localMtime}:${globalMtime}`;
+	// Combine every mirrored source's mtime into a single cache key for the shadow dir
+	const combinedKey = `${localMtime}:${globalMtime}:${repoExcludeMtime}`;
 	if (excludeMtimes.get(dir) === combinedKey) return;
 	await syncExcludes(dir, worktreePath);
 	excludeMtimes.set(dir, combinedKey);
@@ -361,10 +496,18 @@ export interface TreeMergeResult {
  * `before`/`after` are tree hashes of real bytes, so `after === before` of the
  * next pair proves nothing else wrote in between — that is what lets consecutive
  * pairs be collapsed while a gap forces a separate segment.
+ *
+ * `ownedPaths` narrows the reversal to the paths the recorded call is attributable
+ * for. It is needed because the hashes cover the *whole* worktree: in a shared
+ * directory the span between them also contains writes from other narrators,
+ * terminals and build scripts, and reversing the full span would discard them.
+ * null means the range is unknown (a row recorded before owned sets existed), in
+ * which case the whole-tree behaviour is kept.
  */
 export interface TreeBoundaryPair {
 	before: string;
 	after: string;
+	ownedPaths?: string[] | null;
 }
 
 /** A maximal run of boundary pairs with no foreign write between them. */
@@ -373,6 +516,11 @@ export interface TreeRevertSegment {
 	before: string;
 	/** End state of the run — the merge base for this segment. */
 	after: string;
+	/**
+	 * Union of the collapsed pairs' owned paths, or null when any of them was
+	 * unknown. null keeps the legacy whole-tree reversal for that segment.
+	 */
+	ownedPaths: string[] | null;
 }
 
 /**
@@ -387,17 +535,31 @@ export interface TreeRevertSegment {
  *
  * Pairs where `before === after` are skipped: the call changed nothing on disk, so
  * it neither needs reversing nor may act as an anchor.
+ *
+ * Owned paths are unioned across a collapsed run, since the resulting span covers
+ * every one of those calls. A single unknown range poisons the union to null: the
+ * span then has to be reversed whole, because there is no statement of which paths
+ * inside it belonged to the actor.
  */
 export function planTreeRevertSegments(pairs: TreeBoundaryPair[]): TreeRevertSegment[] {
 	const segments: TreeRevertSegment[] = [];
 	for (const pair of pairs) {
 		if (pair.before === pair.after) continue;
+		const owned = pair.ownedPaths === undefined ? null : pair.ownedPaths;
 		const open = segments[segments.length - 1];
 		if (open && open.after === pair.before) {
 			open.after = pair.after;
+			open.ownedPaths =
+				open.ownedPaths === null || owned === null
+					? null
+					: [...new Set([...open.ownedPaths, ...owned])];
 			continue;
 		}
-		segments.push({ before: pair.before, after: pair.after });
+		segments.push({
+			before: pair.before,
+			after: pair.after,
+			ownedPaths: owned === null ? null : [...new Set(owned)],
+		});
 	}
 	return segments;
 }
@@ -482,21 +644,220 @@ export interface SegmentReversalPlan {
 }
 
 /**
+ * Split arguments into invocations bounded by both count and byte size.
+ *
+ * A single git call carrying thousands of paths risks exceeding the platform's
+ * `ARG_MAX`, which surfaces as a spawn error rather than a git error and would be
+ * read as "the snapshot failed".
+ */
+function* batchArgs(values: string[]): Generator<string[]> {
+	let batch: string[] = [];
+	let bytes = 0;
+	for (const value of values) {
+		const size = Buffer.byteLength(value, "utf-8") + 1;
+		if (
+			batch.length > 0 &&
+			(batch.length >= UPDATE_INDEX_BATCH_PATHS || bytes + size > UPDATE_INDEX_BATCH_BYTES)
+		) {
+			yield batch;
+			batch = [];
+			bytes = 0;
+		}
+		batch.push(value);
+		bytes += size;
+	}
+	if (batch.length > 0) yield batch;
+}
+
+/** One entry of a tree, as `ls-tree -z` reports it. */
+interface TreeEntry {
+	mode: string;
+	objectId: string;
+	path: string;
+}
+
+/**
+ * Read specific paths out of a tree.
+ *
+ * `ls-tree` is given the paths explicitly rather than filtered afterwards, so the
+ * cost is proportional to the requested set instead of the tree size. Paths absent
+ * from the tree simply do not come back, which is how a deletion is detected.
+ */
+async function readTreeEntries(
+	dir: string,
+	worktreePath: string,
+	treeHash: string,
+	paths: string[],
+): Promise<Map<string, TreeEntry>> {
+	const entries = new Map<string, TreeEntry>();
+	if (paths.length === 0) return entries;
+	// Batched for the same reason the index writes are: a few thousand paths in one
+	// argv can exceed the platform's ARG_MAX, which fails the spawn rather than git.
+	for (const batch of batchArgs(paths)) {
+		const result = await runGitRaw(
+			["ls-tree", "-r", "-z", treeHash, "--", ...batch],
+			dir,
+			worktreePath,
+			{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
+		);
+		if (result.exitCode !== 0) {
+			throw new TreeSnapshotError(`snapshot ls-tree failed: ${result.stderr.trim()}`);
+		}
+		if (result.stdoutTruncated) {
+			throw new TreeSnapshotError("snapshot ls-tree output exceeded the size limit");
+		}
+		for (const record of result.stdout.split("\0").filter(Boolean)) {
+			// `<mode> SP <type> SP <object> TAB <path>` — the tab is what separates the
+			// path, which is why the path itself may contain spaces safely.
+			const tabIndex = record.indexOf("\t");
+			if (tabIndex < 0) continue;
+			const meta = record.slice(0, tabIndex).split(" ");
+			const path = record.slice(tabIndex + 1);
+			if (meta.length < 3) continue;
+			entries.set(path, { mode: meta[0], objectId: meta[2], path });
+		}
+	}
+	return entries;
+}
+
+/**
+ * Which of `paths` exist as blobs in a tree.
+ *
+ * Deliberately not "list the tree and intersect": a full `ls-tree -r` on a large
+ * repository produces megabytes of path names, which is both wasted work and — once
+ * it passed the captured-output cap — turned every rollback in a big repository into
+ * a hard failure. Asking about the requested paths makes the cost proportional to
+ * the change set instead of the repository.
+ *
+ * `-r` matters even with explicit paths: without it, a path that is a *directory* in
+ * the target tree comes back as a tree entry, and a path nested under a directory
+ * that changed shape would be missed.
+ */
+async function pathsPresentInTree(
+	dir: string,
+	worktreePath: string,
+	treeHash: string,
+	paths: string[],
+): Promise<Set<string>> {
+	const present = new Set<string>();
+	if (paths.length === 0) return present;
+	for (const batch of batchArgs(paths)) {
+		const result = await runGitPaths(
+			["ls-tree", "-r", "--name-only", "-z", treeHash, "--", ...batch],
+			dir,
+			worktreePath,
+			{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
+		);
+		if (result.exitCode !== 0) {
+			throw new TreeSnapshotError(`restore ls-tree failed: ${result.stderr}`);
+		}
+		for (const path of result.paths) present.add(path);
+	}
+	return present;
+}
+
+/**
+ * Produce a tree equal to `baseTree` except that `paths` take their state from
+ * `sourceTree`.
+ *
+ * This is what confines a reversal to one actor's changes. A whole-tree merge
+ * result cannot be adopted directly in a shared worktree: it also carries back the
+ * paths other actors changed in the same window. Rebuilding the index from
+ * `baseTree` and overwriting only the owned paths keeps everything else exactly as
+ * it is on disk now.
+ *
+ * Modes are copied from the source entry, so an executable bit or a symlink
+ * round-trips. A path missing from `sourceTree` is removed, which is how "this
+ * file did not exist before the call" is expressed.
+ */
+async function adoptPathsUnlocked(
+	dir: string,
+	worktreePath: string,
+	baseTree: string,
+	sourceTree: string,
+	paths: string[],
+): Promise<string> {
+	if (paths.length === 0) return baseTree;
+	const readTree = await runGit(["read-tree", baseTree], dir, worktreePath);
+	if (readTree.exitCode !== 0) {
+		throw new TreeSnapshotError(`adopt read-tree failed: ${readTree.stderr}`);
+	}
+	const sourceEntries = await readTreeEntries(dir, worktreePath, sourceTree, paths);
+
+	// Adds and removals are two different `update-index` modes, so they are
+	// partitioned and each mode is issued in batches. One spawn per path meant a
+	// 300-path owned set cost 300 child processes while holding the shadow lock,
+	// blocking every other capture on this worktree for the duration.
+	const additions: string[] = [];
+	const removals: string[] = [];
+	for (const path of paths) {
+		const entry = sourceEntries.get(path);
+		if (entry) additions.push(`${entry.mode},${entry.objectId},${path}`);
+		else removals.push(path);
+	}
+	if (paths.length >= SLOW_PATH_COUNT) {
+		logger.warn("Adopting a very large owned path set into a snapshot", {
+			worktreePath,
+			pathCount: paths.length,
+		});
+	}
+	// Removals go first, and the order is load-bearing rather than cosmetic. A path
+	// can be a file in one tree and a directory in the other (`foo` becoming
+	// `foo/x.txt` or the reverse), and git's index cannot hold both at once: adding
+	// `foo` as a blob while `foo/x.txt` is still indexed fails with "looks like both a
+	// file and a directory". Clearing the stale side first is what makes either
+	// direction of that transition adoptable.
+	for (const batch of batchArgs(removals)) {
+		// `--` terminates options, so a path starting with `-` stays a path.
+		const updated = await runGit(
+			["update-index", "--force-remove", "--", ...batch],
+			dir,
+			worktreePath,
+		);
+		if (updated.exitCode !== 0) {
+			throw new TreeSnapshotError(`adopt update-index failed: ${updated.stderr}`);
+		}
+	}
+	// `--cacheinfo <mode>,<oid>,<path>` is the comma form on purpose: the path is
+	// part of one argument, so a path starting with `-` cannot be read as an option.
+	for (const batch of batchArgs(additions)) {
+		const args = ["update-index", "--add"];
+		for (const spec of batch) args.push("--cacheinfo", spec);
+		const updated = await runGit(args, dir, worktreePath);
+		if (updated.exitCode !== 0) {
+			throw new TreeSnapshotError(`adopt update-index failed: ${updated.stderr}`);
+		}
+	}
+	const written = await runGit(["write-tree"], dir, worktreePath);
+	if (written.exitCode !== 0 || !written.stdout) {
+		throw new TreeSnapshotError(`adopt write-tree failed: ${written.stderr}`);
+	}
+	return written.stdout;
+}
+
+/**
  * Reverse each segment out of the current state, newest segment first, without
  * touching the worktree.
  *
  * Reversing is a three-way merge per segment with `base = segment.after`,
  * `ours = the state accumulated so far` and `theirs = segment.before`: git keeps
  * `ours` wherever `base` and `theirs` agree, so only the bytes that segment
- * introduced are rolled back.
+ * introduced are rolled back. The merge is what allows two actors to have edited
+ * the same file in non-overlapping regions and still have both survive.
+ *
+ * When the segment states which paths it owns, only those are adopted from the
+ * merge result. The merge is computed over the whole tree, so without this step a
+ * shared worktree would have another actor's concurrent writes reversed along with
+ * the segment — the boundary hashes cannot distinguish them. Conflicts outside the
+ * owned set are likewise not this reversal's problem.
  *
  * Segments are applied newest first so each merge base is the state that segment
  * actually produced, and the intermediate trees are chained in memory — the
  * worktree is written at most once, by the caller.
  *
- * A conflict aborts the chain: it means another actor's change overlaps the region
- * being reversed, and a conflicted tree carries conflict markers that must never
- * reach the working tree.
+ * A conflict inside the owned set aborts the chain: it means another actor's change
+ * overlaps the very region being reversed, and a conflicted tree carries conflict
+ * markers that must never reach the working tree.
  */
 async function planSegmentReversalUnlocked(
 	dir: string,
@@ -513,15 +874,33 @@ async function planSegmentReversalUnlocked(
 			accumulated,
 			segment.before,
 		);
-		if (merged.conflicts.length > 0) {
+		const owned = segment.ownedPaths;
+		// Membership goes through a Set rather than `Array.includes`: both sides scale
+		// with the change set, so a conflicted merge in a large window was O(n·m) — a
+		// few thousand owned paths against a few thousand conflicts is millions of
+		// string comparisons on the rollback path. The truthiness test is kept exactly
+		// as it was: only null/undefined mean "unknown range, reverse the whole tree",
+		// while an empty array remains a positive "owns nothing" and must still filter
+		// every conflict away.
+		const ownedLookup = owned ? new Set(owned) : null;
+		const conflicts = ownedLookup
+			? merged.conflicts.filter((path) => ownedLookup.has(path))
+			: merged.conflicts;
+		if (conflicts.length > 0) {
 			return {
 				currentTree,
 				mergedTree: accumulated,
-				conflicts: merged.conflicts,
+				conflicts,
 				changedPaths: [],
 			};
 		}
-		accumulated = merged.tree;
+		if (!owned) {
+			accumulated = merged.tree;
+		} else if (owned.length > 0) {
+			// A conflicted merge tree is only safe to read at the paths that merged
+			// cleanly, and every owned path did (checked above).
+			accumulated = await adoptPathsUnlocked(dir, worktreePath, accumulated, merged.tree, owned);
+		}
 	}
 
 	if (accumulated === currentTree) {
@@ -531,6 +910,7 @@ async function planSegmentReversalUnlocked(
 		["diff-tree", "-r", "--name-only", "--no-commit-id", "-z", accumulated, currentTree],
 		dir,
 		worktreePath,
+		{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
 	);
 	if (changed.exitCode !== 0) {
 		throw new TreeSnapshotError(`snapshot diff-tree failed: ${changed.stderr}`);
@@ -544,11 +924,67 @@ async function planSegmentReversalUnlocked(
 }
 
 /**
+ * Report a capture whose `add -A` cost stands out, at most once a minute per repo.
+ *
+ * Throttled per shadow repo *and* severity so that a worktree crossing from "slow"
+ * into "timed out" is always reported immediately rather than being swallowed by the
+ * window a slow-capture warning just opened.
+ */
+function reportCaptureCost(worktreePath: string, dir: string, elapsed: number, ok: boolean): void {
+	if (ok && elapsed < SLOW_CAPTURE_WARN_MS) return;
+	const key = `${dir}\u0000${ok ? "slow" : "failed"}`;
+	const now = Date.now();
+	const last = captureWarnedAt.get(key) ?? 0;
+	if (now - last < SLOW_CAPTURE_WARN_INTERVAL_MS) return;
+	captureWarnedAt.set(key, now);
+	if (ok) {
+		logger.warn("Workspace snapshot scan is slow", {
+			worktreePath,
+			elapsedMs: elapsed,
+			timeoutMs: GIT_TIMEOUT_MS,
+		});
+		return;
+	}
+	// A failed capture is what actually costs revert precision, so it is reported
+	// even when it failed quickly (a stale lock, a vanished worktree).
+	logger.warn("Workspace snapshot scan did not complete", {
+		worktreePath,
+		elapsedMs: elapsed,
+		timeoutMs: GIT_TIMEOUT_MS,
+		timedOut: elapsed >= GIT_TIMEOUT_MS,
+	});
+}
+
+/**
  * Capture the worktree without taking the shadow lock.
  *
  * `AsyncMutex` is not reentrant — `acquire` always queues behind the current
  * tail — so a composite operation that already holds the lock must call this
  * instead of {@link worktreeTreeSnapshot.capture}, which would deadlock.
+ *
+ * ## Why the whole-tree `add -A` is kept on the hot path
+ *
+ * This runs before and after every file-mutating tool, and `add -A` walks the
+ * worktree, so on a huge repository or a cold filesystem it can approach
+ * {@link GIT_TIMEOUT_MS}. That cost is accepted rather than avoided by skipping
+ * captures, because the two are not comparable in kind:
+ *
+ *   - The cost is bounded and self-limiting. The shadow repo keeps its index
+ *     between captures, so only changed paths are re-hashed; a warm capture is
+ *     milliseconds, and the expensive walk is the first one after a cold start.
+ *   - Skipping is unbounded in consequence. A skipped capture records a null
+ *     boundary, which sends a rollback to the per-file replay path — and replay
+ *     only knows Write/Edit tool inputs, so a Bash command's, build script's or
+ *     external editor's writes in that window become unrevertable. Trading a
+ *     few seconds for silently losing the ability to undo is the wrong trade on a
+ *     data-safety path.
+ *
+ * A timeout is already handled safely: `safeSpawn` kills the child and reports a
+ * non-zero exit (it does not throw), this throws {@link TreeSnapshotError}, and
+ * `tryCapture` turns that into null so the tool itself is unaffected and the
+ * boundary is simply recorded as absent. Git removes its own `index.lock` when
+ * killed, so the next capture recovers on its own. Slow filesystems are therefore
+ * an observability problem, which is what {@link reportCaptureCost} addresses.
  */
 async function captureUnlocked(
 	dir: string,
@@ -556,7 +992,9 @@ async function captureUnlocked(
 	deviceId: string,
 ): Promise<string> {
 	await ensureShadowRepo(dir, worktreePath);
+	const startedAt = Date.now();
 	const added = await runGit(["add", "-A"], dir, worktreePath);
+	reportCaptureCost(worktreePath, dir, Date.now() - startedAt, added.exitCode === 0);
 	if (added.exitCode !== 0) {
 		throw new TreeSnapshotError(`snapshot add failed: ${added.stderr}`);
 	}
@@ -607,38 +1045,129 @@ async function restoreUnlocked(
 		["diff-tree", "-r", "--name-only", "--no-commit-id", "-z", treeHash, currentTree.stdout],
 		dir,
 		worktreePath,
+		{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
 	);
 	if (changed.exitCode !== 0) {
 		throw new TreeSnapshotError(`restore diff-tree failed: ${changed.stderr}`);
 	}
 	const changedPaths = changed.paths;
-
-	// Paths absent from the target tree were created after it and must go.
-	const inTarget = await runGitPaths(
-		["ls-tree", "-r", "--name-only", "-z", treeHash],
-		dir,
-		worktreePath,
-	);
-	if (inTarget.exitCode !== 0) {
-		throw new TreeSnapshotError(`restore ls-tree failed: ${inTarget.stderr}`);
-	}
-	const targetPaths = new Set(inTarget.paths);
-	for (const relPath of changedPaths) {
-		if (targetPaths.has(relPath)) continue;
-		const absolute = resolve(worktreePath, relPath);
-		if (existsSync(absolute)) rmSync(absolute, { force: true });
+	if (changedPaths.length >= SLOW_PATH_COUNT) {
+		logger.warn("Restoring a very large change set", {
+			worktreePath,
+			pathCount: changedPaths.length,
+		});
 	}
 
-	// Load the target tree into the index, then materialise it on disk.
-	const readTree = await runGit(["read-tree", treeHash], dir, worktreePath);
-	if (readTree.exitCode !== 0) {
-		throw new TreeSnapshotError(`restore read-tree failed: ${readTree.stderr}`);
-	}
-	const checkout = await runGit(["checkout-index", "-a", "-f"], dir, worktreePath);
-	if (checkout.exitCode !== 0) {
-		throw new TreeSnapshotError(`restore checkout-index failed: ${checkout.stderr}`);
+	// Everything past this point writes to the worktree, so a failure has to put the
+	// captured state back. Deletion in particular can fail partway through — a path
+	// that became a directory (EISDIR) or is locked by another process (EPERM/EBUSY)
+	// throws while earlier files are already gone — and without this the caller sees
+	// only "restore failed" over a half-applied worktree it has no way to describe.
+	try {
+		// Paths absent from the target tree were created after it and must go. Asked
+		// about only the changed paths, so the cost tracks the change set rather than
+		// the repository size.
+		const targetPaths = await pathsPresentInTree(dir, worktreePath, treeHash, changedPaths);
+		for (const relPath of changedPaths) {
+			if (targetPaths.has(relPath)) continue;
+			const absolute = resolve(worktreePath, relPath);
+			if (!existsSync(absolute)) continue;
+			// `recursive` covers the case the plain unlink cannot: the path is a file in
+			// the target tree's view but a directory on disk now.
+			rmSync(absolute, { force: true, recursive: true });
+		}
+
+		// Load the target tree into the index, then materialise it on disk.
+		const readTree = await runGit(["read-tree", treeHash], dir, worktreePath);
+		if (readTree.exitCode !== 0) {
+			throw new TreeSnapshotError(`restore read-tree failed: ${readTree.stderr}`);
+		}
+		const checkout = await runGit(["checkout-index", "-a", "-f"], dir, worktreePath);
+		if (checkout.exitCode !== 0) {
+			throw new TreeSnapshotError(`restore checkout-index failed: ${checkout.stderr}`);
+		}
+	} catch (error) {
+		// The same two steps as a normal restore, aimed back at the state captured
+		// above, so a half-applied worktree does not survive the failure. Reported as a
+		// failure either way: the caller must never treat a compensated rollback as one
+		// that happened.
+		const compensated = await compensateRestore(
+			dir,
+			worktreePath,
+			currentTree.stdout,
+			changedPaths,
+		);
+		if (!compensated) {
+			logger.error("Snapshot restore failed and could not be undone", {
+				worktreePath,
+				capturedTree: currentTree.stdout,
+				error: String(error),
+			});
+		}
+		throw new TreeRestoreError(
+			`${error instanceof Error ? error.message : String(error)}${
+				compensated
+					? " (the workspace was restored to its pre-rollback state)"
+					: ` (WARNING: the workspace may be partially rolled back; snapshot ${currentTree.stdout.slice(0, 12)} holds the pre-rollback state)`
+			}`,
+			currentTree.stdout,
+			compensated,
+			error,
+		);
 	}
 	return changedPaths;
+}
+
+/**
+ * Put the worktree back to `capturedTree` after a failed restore.
+ *
+ * Mirrors the restore steps rather than only checking the tree out: a partially
+ * applied restore can have *created* files that `capturedTree` does not contain
+ * (the target tree held them), and `checkout-index` never removes anything. Scoped
+ * to the paths the restore was going to touch, so nothing outside that set is
+ * disturbed.
+ *
+ * Never throws — it runs from a catch block whose original error must be the one
+ * that surfaces.
+ */
+async function compensateRestore(
+	dir: string,
+	worktreePath: string,
+	capturedTree: string,
+	changedPaths: string[],
+): Promise<boolean> {
+	try {
+		const inCaptured = await pathsPresentInTree(dir, worktreePath, capturedTree, changedPaths);
+		for (const relPath of changedPaths) {
+			if (inCaptured.has(relPath)) continue;
+			const absolute = resolve(worktreePath, relPath);
+			if (!existsSync(absolute)) continue;
+			try {
+				rmSync(absolute, { force: true, recursive: true });
+			} catch {
+				// The very condition that failed the restore can also block this one path.
+				// Keep going: the remaining paths are still worth restoring, and the tree
+				// comparison below decides whether the result counts as compensated.
+			}
+		}
+		const readBack = await runGit(["read-tree", capturedTree], dir, worktreePath);
+		if (readBack.exitCode !== 0) return false;
+		// Scoped to the paths the restore was going to touch, and issued in batches.
+		// `checkout-index -a` would rewrite every file in the worktree, so whatever
+		// blocked the restore (a locked file, a read-only directory) would block the
+		// compensation too even when it lies outside the change set.
+		for (const batch of batchArgs(changedPaths)) {
+			await runGit(["checkout-index", "-f", "--", ...batch], dir, worktreePath);
+		}
+		// Verified by hash rather than by exit code: what matters is that the bytes are
+		// back, and a per-path failure outside the change set does not change that.
+		const added = await runGit(["add", "-A"], dir, worktreePath);
+		if (added.exitCode !== 0) return false;
+		const nowTree = await runGit(["write-tree"], dir, worktreePath);
+		return nowTree.exitCode === 0 && nowTree.stdout === capturedTree;
+	} catch {
+		return false;
+	}
 }
 
 export const worktreeTreeSnapshot = {
@@ -697,10 +1226,13 @@ export const worktreeTreeSnapshot = {
 	): Promise<string[]> {
 		assertLocal(deviceId);
 		const dir = shadowDir(deviceId, worktreePath);
+		// The one genuinely whole-tree listing left, so it gets the listing cap rather
+		// than the hash-sized one: a large repository's path names alone exceed 1 MB.
 		const result = await runGitPaths(
 			["ls-tree", "-r", "--name-only", "-z", treeHash],
 			dir,
 			worktreePath,
+			{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
 		);
 		if (result.exitCode !== 0) {
 			throw new TreeSnapshotError(`snapshot ls-tree failed: ${result.stderr}`);
@@ -739,6 +1271,26 @@ export const worktreeTreeSnapshot = {
 		return result.stdout.includes("\uFFFD") ? null : result.stdout;
 	},
 
+	/**
+	 * Which of `paths` a snapshot contains.
+	 *
+	 * The bounded counterpart of {@link listPaths}, for callers that only need to test
+	 * a known set (does this changed path survive the rollback?). Cost tracks the
+	 * requested set instead of the repository, so it stays usable on a large repo where
+	 * a full listing would be megabytes of path names.
+	 */
+	async listPathsIn(
+		worktreePath: string,
+		treeHash: string,
+		paths: string[],
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<string[]> {
+		assertLocal(deviceId);
+		if (paths.length === 0) return [];
+		const dir = shadowDir(deviceId, worktreePath);
+		return [...(await pathsPresentInTree(dir, worktreePath, treeHash, paths))];
+	},
+
 	/** Paths that differ between two snapshots. */
 	async diffPaths(
 		worktreePath: string,
@@ -752,6 +1304,7 @@ export const worktreeTreeSnapshot = {
 			["diff-tree", "-r", "--name-only", "--no-commit-id", "-z", fromTree, toTree],
 			dir,
 			worktreePath,
+			{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
 		);
 		if (result.exitCode !== 0) {
 			throw new TreeSnapshotError(`snapshot diff-tree failed: ${result.stderr}`);
@@ -897,6 +1450,11 @@ export const worktreeTreeSnapshot = {
 		const dir = shadowDir(deviceId, worktreePath);
 		if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
 		excludeMtimes.delete(dir);
+		// The in-memory write declarations describe this same directory, so they die
+		// with it. Cleared here rather than at each call site because a leftover entry
+		// would keep answering overlap questions for a path that no longer exists — and
+		// a recreated worktree at the same path would inherit them.
+		clearClaims(worktreePath);
 	},
 
 	/** Prune loose objects across every shadow repository. */

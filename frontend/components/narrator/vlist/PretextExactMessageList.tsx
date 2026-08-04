@@ -19,7 +19,8 @@ import { narratorsApi } from "@frontend/lib/api/narrators";
 import type { TreeMessage } from "@frontend/lib/api/types";
 import { formatLocaleNumber } from "@frontend/lib/intl-format";
 import {
-	NARRATOR_CENTERED_COLUMN_MAX_WIDTH,
+	NARRATOR_COLUMN_GUTTER_PX,
+	narratorColumnPlaceholderStyle,
 	resolveNarratorColumnWidth,
 } from "@frontend/lib/narrator-content-column";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
@@ -29,6 +30,7 @@ import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { type PretextLayoutIndex, resolveVisibleWindow } from "@shared/pretext-layout";
+import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
 import type { LaidOutItem, ListLayout } from "@shared/pretext-layout/vlist-virtualization";
 import { normalizeSubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import {
@@ -70,6 +72,7 @@ import {
 	subagentRecentCallSummary,
 } from "../tool-display";
 import type { TraceRowIdentity } from "../trace-row-identity";
+import type { MeasuredReasoning } from "./measure/measure-reasoning";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-call";
 import type { MeasuredCollapsibleTrace, MeasuredTraceRow } from "./measure/measure-tool-run";
@@ -143,6 +146,7 @@ import {
 } from "./vlist-lod-gesture";
 import { usePermissionSlots } from "./vlist-permission-bridge";
 import type { VListItem } from "./vlist-pipeline";
+import { createPointerDragTracker } from "./vlist-pointer-drag";
 import { buildReflectionSourceIndex } from "./vlist-reflection-index";
 import {
 	resolveExactReloadDecision,
@@ -176,6 +180,12 @@ import {
 	type VListUserMarker,
 } from "./vlist-user-markers";
 import { resolvePinnedRowIndices } from "./vlist-virtualization";
+import {
+	bucketViewportHeight,
+	pushCommittedWidth,
+	resolveWidthSettle,
+	type WidthSettleTrigger,
+} from "./vlist-width-settle";
 
 // Editing chrome is lazy: a list that is only being read never pays for the
 // editor's module graph (attachment thumbs, upload flow) or the modal.
@@ -187,7 +197,15 @@ const OriginalContentModal = lazy(() =>
 );
 
 const ITEM_OVERSCAN = 600;
-const PAGE_PADDING = 16;
+/**
+ * Horizontal (and canvas vertical) gutter of the content column.
+ *
+ * Read from the shared constant rather than declared locally: the loading
+ * placeholders lay their column out with the same number, so a local literal here
+ * would let the two drift and reintroduce a width jump when the real rows replace
+ * the skeleton.
+ */
+const PAGE_PADDING = NARRATOR_COLUMN_GUTTER_PX;
 /** Tight gap between items INSIDE one render unit (content blocks / in-run cards). */
 const ITEM_GAP = 4;
 /**
@@ -544,10 +562,28 @@ function resolveItemViewTargets(
 			{ prompt: renderLabels.subagent.prompt },
 		);
 	}
-	return resolveRowViewTargets(item.spec, {
-		reasoning: renderLabels.reasoning.reasoning,
-		thinking: renderLabels.reasoning.thinking,
-	});
+	return resolveRowViewTargets(
+		item.spec,
+		{
+			reasoning: renderLabels.reasoning.reasoning,
+			thinking: renderLabels.reasoning.thinking,
+		},
+		// Whether the ROW's renderer can swap its body for the raw source. Decided
+		// from the MEASURED form, which is why it cannot live in the pure target
+		// module: a markdown row always paints a body, while a reasoning run only
+		// does so when expanded — its three other forms are single header rows with
+		// nowhere to put the text, so the toggle would be a dead control there.
+		{ sourceInline: canShowRowSourceInline(item) },
+	);
+}
+
+/** True when this plain content row paints a body an in-place source view can replace. */
+function canShowRowSourceInline(item: VListItem): boolean {
+	if (item.spec.kind === "markdown") return true;
+	if (item.spec.kind === "reasoning") {
+		return (item.measured as MeasuredReasoning).form === "expanded";
+	}
+	return false;
 }
 
 /**
@@ -1062,6 +1098,15 @@ const ExactRow = memo(
 		}
 		const rowViewTarget =
 			!cardHostsOwnBars && viewTargets && viewTargets.length > 0 ? viewTargets[0] : undefined;
+		// A plain content row's own body honours the source toggle: the renderer
+		// swaps the measured markdown for the raw text inside the SAME reserved
+		// geometry. Only wired while the toggle is actually on, so an untouched row
+		// keeps referentially identical extras and the memo below still skips it
+		// during scroll.
+		if (rowViewTarget?.sourceInline && viewControls?.isSourceShown(rowViewTarget)) {
+			extra.showSource = true;
+			extra.sourceText = rowViewTarget.text;
+		}
 		// The row menu's single "fullscreen" item targets the row's MAIN body (the
 		// last one — tool details run header/command → output/result, so the final
 		// body is the payload the reader came for).
@@ -1195,7 +1240,27 @@ const ExactRow = memo(
 		);
 	},
 	(prev, next) =>
-		prev.item === next.item &&
+		// Compare what the row actually RENDERS FROM, not the disposable wrapper.
+		//
+		// `item` is `{ spec, measured }`, freshly allocated by every layout build, so
+		// `prev.item === next.item` was false on every rebuild — including rebuilds that
+		// changed nothing this row draws. Measured: on a height-only rebuild 300/300
+		// `measured` objects are byte-identical (they come from the measure cache), yet
+		// every mounted row still rebuilt its absolutely positioned spans: 20 prose rows
+		// = 1601 DOM nodes, 22.3ms in linkedom (no style/layout/paint, so a browser is
+		// strictly slower).
+		//
+		// `measured` carries the geometry AND the prepared blocks the render layer walks,
+		// and `spec.key`/`spec.kind` select the renderer, so this pair is the row's true
+		// render identity. `spec.data` needs no comparison: it is measured INTO
+		// `measured`, and the measure cache keys on a content revision, so different data
+		// yields a different `measured` object (see measure-cache.extractDataRevision).
+		prev.item.measured === next.item.measured &&
+		prev.item.spec.key === next.item.spec.key &&
+		prev.item.spec.kind === next.item.spec.kind &&
+		// Painted as `data-nf-unit` (the LOD-independent row identity), so a change
+		// must reach the DOM even though it affects nothing else.
+		prev.item.spec.unitId === next.item.spec.unitId &&
 		prev.top === next.top &&
 		prev.height === next.height &&
 		prev.hitHeight === next.hitHeight &&
@@ -1334,6 +1399,24 @@ export const PretextExactMessageList = forwardRef<
 	// viewport like the chunked path; ON caps it at a centered reading width.
 	const [centeredColumn] = useLocalPref("narrafork_narrator_centered_column");
 	const viewportRef = useRef<HTMLDivElement | null>(null);
+	/**
+	 * The SAME node as `viewportRef.current`, held in state so effects that observe
+	 * it can depend on it.
+	 *
+	 * A ref cannot be an effect dependency, and the resize effect below reads the
+	 * node once on mount. `assignViewport` is rebuilt whenever the host's `scrollRef`
+	 * prop changes identity (an inline arrow does that every render), and React
+	 * answers a changed ref callback by detaching with `null` and re-attaching the
+	 * node — WITHOUT re-running an effect that merely read the ref. The observer
+	 * would then keep watching whatever node it captured first, so a later width
+	 * change never arrives and the column freezes at its last committed width (the
+	 * `!changed` early-out in resolveWidthSettle makes the pointer-release path a
+	 * no-op too, since it re-reads the same stale node).
+	 *
+	 * Keeping the node in state makes "the node changed → rebuild the observer" a
+	 * type-level fact rather than a property of how the host writes its props.
+	 */
+	const [viewportNode, setViewportNode] = useState<HTMLDivElement | null>(null);
 	const contentNodeRef = useRef<HTMLDivElement | null>(null);
 	const footerNodeRef = useRef<HTMLDivElement | null>(null);
 	// One-flash-at-a-time jump highlight. A ref (not state) on purpose: the flash is
@@ -1363,7 +1446,24 @@ export const PretextExactMessageList = forwardRef<
 	const [viewportHeight, setViewportHeight] = useState(0);
 	const viewportHeightRef = useRef(0);
 	viewportHeightRef.current = viewportHeight;
-	const [contentWidth, setContentWidth] = useState(NARRATOR_CENTERED_COLUMN_MAX_WIDTH);
+	// 0 = NOT YET MEASURED, and it is a sentinel rather than a plausible width on
+	// purpose.
+	//
+	// It used to start at NARRATOR_CENTERED_COLUMN_MAX_WIDTH, which the loading
+	// placeholder then PAINTED: every mount showed an 860px centered skeleton before
+	// the first measurement landed, even for a reader who never enabled the centered
+	// reading width. A sentinel cannot be mistaken for a real width, and nothing
+	// paints from it — the placeholder lays itself out in CSS
+	// (narratorColumnPlaceholderStyle) and the rows only render once
+	// `hasRenderableLayout` is true, by which time the layout effect below has
+	// committed the measured width.
+	const [contentWidth, setContentWidth] = useState(0);
+	// The width the LAYOUT was last built with. Distinct from `contentWidth` state
+	// only for one frame (the setter is async), but the resize handler runs outside
+	// render and must compare against the committed value synchronously — reading
+	// state there would re-defer against a stale width on every observer callback.
+	const committedContentWidthRef = useRef(0);
+
 	const [pinnedToBottom, setPinnedToBottom] = useState(true);
 	const [footerHeight, setFooterHeight] = useState(0);
 	const footerHeightRef = useRef(0);
@@ -1373,6 +1473,11 @@ export const PretextExactMessageList = forwardRef<
 	const assignViewport = useCallback(
 		(node: HTMLDivElement | null) => {
 			viewportRef.current = node;
+			// Mirror into state so the ResizeObserver effect re-runs when the node is
+			// replaced (see viewportNode). Written unconditionally: React calls this
+			// with null on detach and the real node on attach, and a state write with
+			// the same value is a no-op React bails on.
+			setViewportNode(node);
 			if (typeof scrollRef === "function") scrollRef(node);
 			else setExternalRef(scrollRef, node);
 		},
@@ -1836,13 +1941,22 @@ export const PretextExactMessageList = forwardRef<
 	// a zero-DOM height model cannot see — so the breakpoint is resolved here and
 	// becomes an explicit measure input (one line vs two).
 	const isMobileViewport = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+	// Height as the LAYOUT sees it (see the buildOptions comment below). Derived here
+	// so the value handed to the document hook only changes at bucket boundaries.
+	const layoutViewportHeight = bucketViewportHeight(viewportHeight);
 	const pretextDocument = usePretextDocument(narratorId, {
 		lod,
 		labels: vlistLabels,
 		labelsRevision,
 		widthBucket: String(Math.round(contentWidth)),
 		contentWidth,
-		viewportHeight,
+		// BUCKETED on purpose. Height reaches the build for exactly one reason (the
+		// plan-detail cap), but at pixel resolution it made every frame of a sash drag
+		// re-measure the whole document — bypassing the width gate entirely, which is
+		// why continuous dragging still janked. The exact height is still used for the
+		// mounted window, scroll anchoring and bottom-pinning; those read
+		// `viewportHeight` directly and never go through a rebuild.
+		viewportHeight: layoutViewportHeight,
 		scrollTop,
 		pinnedToBottom,
 		getCurrentView: readCurrentView,
@@ -2401,19 +2515,142 @@ export const PretextExactMessageList = forwardRef<
 
 	// Re-runs when the reading-width preference flips so the column width (and the
 	// layout keyed on it) is recomputed without a reload.
+	//
+	// WIDTH is answered through `resolveWidthSettle` rather than written straight to
+	// state. A width change re-measures EVERY item (the exact list needs a precise
+	// total height), which is O(items) — 102ms at 8000 messages. A pointer drag emits
+	// one observer callback per frame, so on a long session every frame would try to
+	// spend that. When a measured rebuild proves too slow, the new width is held and
+	// committed once the drag settles; the committed geometry keeps painting in the
+	// meantime. HEIGHT is unaffected and always applied immediately: it does not
+	// change wrapping, so it costs nothing to honour.
+	//
+	// Depends on `viewportNode` (state), NOT `viewportRef.current`: a ref read at
+	// mount time silently outlives the node it read. See the viewportNode comment.
 	useLayoutEffect(() => {
-		const node = viewportRef.current;
+		const node = viewportNode;
 		if (!node) return;
+		let settleTimer: ReturnType<typeof setTimeout> | undefined;
+		// Whether a deferral is currently held open, so the pointer-release handler
+		// knows if it has anything to commit. Without it every unrelated click in the
+		// app would run a decision pass.
+		let deferred = false;
+		// The last few committed widths, feeding the settle decision's cycle guard.
+		//
+		// A measurement feedback loop (commit → re-measure → the vertical scrollbar
+		// appears or disappears → clientWidth moves ~15px → commit) alternates between
+		// exactly two widths and never terminates on its own; the guard recognises that
+		// alternation and stops committing. Reset on `gesture-end` because a pointer
+		// drag is EXTERNAL input: dragging the sash back to a previous width must apply
+		// even if feedback had just pinned it.
+		let recentCommittedWidths: readonly number[] = [];
+
+		const applyWidth = (trigger: WidthSettleTrigger) => {
+			const nextWidth = resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn);
+			// FIRST MEASUREMENT — commit immediately, bypassing the settle decision.
+			//
+			// This is not a width CHANGE, it is this list learning how wide it is. Routed
+			// through `resolveWidthSettle` it read as an ordinary observer callback with no
+			// pointer down, so it DEFERRED for WIDTH_SETTLE_DELAY_MS: the placeholder
+			// painted a frame at the sentinel geometry and the column then jumped to its
+			// real width 140ms later. That was the first of the mount-time jumps.
+			//
+			// Running inside the layout effect's synchronous `measure()` means the width is
+			// final before the browser paints, so the first painted frame is already
+			// correct. `recentCommittedWidths` is deliberately NOT touched: the cycle guard
+			// tracks widths that could oscillate, and a first measurement has no prior hop
+			// to alternate with.
+			if (committedContentWidthRef.current === 0) {
+				committedContentWidthRef.current = nextWidth;
+				setContentWidth(nextWidth);
+				return;
+			}
+			const decision = resolveWidthSettle({
+				nextWidth,
+				committedWidth: committedContentWidthRef.current,
+				trigger,
+				// Read LIVE: the gesture may have started or ended between the observer
+				// callback that armed the deferral and this evaluation.
+				pointerDown: pointerTracker.isDown(),
+				recentCommittedWidths,
+			});
+			if (settleTimer !== undefined) {
+				clearTimeout(settleTimer);
+				settleTimer = undefined;
+			}
+			if (decision.commit) {
+				// Release the withheld height with the width, so every commit path (a
+				// gesture end, the quiet period, the backstop) lands one consistent
+				// geometry instead of leaving a stale height behind.
+				if (deferred) setViewportHeight(node.clientHeight);
+				deferred = false;
+				// A gesture is external input, so it starts the cycle history over: the
+				// user may legitimately be dragging back to a width feedback had pinned.
+				recentCommittedWidths =
+					trigger === "gesture-end" ? [] : pushCommittedWidth(recentCommittedWidths, nextWidth);
+				committedContentWidthRef.current = nextWidth;
+				setContentWidth(nextWidth);
+				return;
+			}
+			if (!decision.defer) {
+				deferred = false;
+				return;
+			}
+			deferred = true;
+			settleTimer = setTimeout(() => {
+				settleTimer = undefined;
+				applyWidth("timer");
+			}, decision.deferForMs);
+		};
+
+		// A pointer release is the commit point for a drag-held deferral. Created
+		// before the observer so the first callback can already read its state.
+		const pointerTracker = createPointerDragTracker(() => {
+			// `applyWidth` releases the withheld height as part of its commit branch.
+			if (deferred) applyWidth("gesture-end");
+		});
+
+		/**
+		 * Whether this frame's height write must be withheld.
+		 *
+		 * True only while a deferral is actually open AND a pointer is down — i.e.
+		 * exactly during a drag on an expensive document. A cheap document never
+		 * defers, so it keeps its per-frame live height as before; a non-pointer resize
+		 * settles on the short quiet period rather than being frozen.
+		 */
+		const suppressHeightWrite = () => deferred && pointerTracker.isDown();
+
 		const measure = () => {
-			setViewportHeight(node.clientHeight);
-			setContentWidth(resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn));
+			// HEIGHT is a React state write, and that is the expensive part — not the
+			// arithmetic. A re-render of the shell re-runs `adaptRenderUnits`, which
+			// mints fresh `{ spec, measured }` objects, so `ExactRow`'s
+			// `prev.item === next.item` fails for EVERY mounted row and their absolutely
+			// positioned spans are all rebuilt (measured: 20 prose rows = 1601 DOM
+			// nodes, 22.3ms to re-render in linkedom, which has no style/layout/paint —
+			// a browser is strictly slower).
+			//
+			// So while a deferral is in force the height write is suppressed too.
+			// Otherwise the width gate would hold back the rebuild while the height
+			// write kept re-rendering the same 1601 nodes every frame, which is the
+			// jank that survived three rounds of measurement-side fixes.
+			//
+			// Nothing is lost by waiting: `viewportHeight` state feeds the mounted
+			// window, bottom-pinning and the plan cap, and all three are recomputed on
+			// the commit. Anything needing the live height mid-drag reads
+			// `node.clientHeight` directly (see readCurrentView).
+			if (!suppressHeightWrite()) setViewportHeight(node.clientHeight);
+			applyWidth("observer");
 		};
 		measure();
-		if (typeof ResizeObserver === "undefined") return;
+		if (typeof ResizeObserver === "undefined") return () => pointerTracker.dispose();
 		const observer = new ResizeObserver(measure);
 		observer.observe(node);
-		return () => observer.disconnect();
-	}, [centeredColumn]);
+		return () => {
+			observer.disconnect();
+			pointerTracker.dispose();
+			if (settleTimer !== undefined) clearTimeout(settleTimer);
+		};
+	}, [viewportNode, centeredColumn]);
 
 	const hasTailFooter = tailFooter != null;
 	useLayoutEffect(() => {
@@ -3053,6 +3290,22 @@ export const PretextExactMessageList = forwardRef<
 				position: "relative",
 				height: "100%",
 				overflow: "auto",
+				// Reserve the vertical scrollbar's track from the very first frame.
+				//
+				// Without it, `clientWidth` drops ~15px the moment the loaded document
+				// becomes taller than the viewport, so the column was measured once
+				// without a scrollbar and again with one — the last of the mount-time
+				// width jumps. It also removes the (commit → re-measure → scrollbar
+				// toggles → width changes again) feedback pair at its source, leaving
+				// `isWidthFeedbackCycle` as a pure backstop instead of a routine path.
+				//
+				// `stable`, not `both-edges`: a session that stays shorter than the
+				// viewport pays a constant ~15px (under 2% of the reading cap, and
+				// exactly the width it takes on as soon as it grows), whereas
+				// `both-edges` costs ~30px to buy back a fixed ~7.5px of horizontal
+				// centering that has no reference point to be noticed against. Overlay
+				// scrollbars (macOS) reserve nothing either way.
+				scrollbarGutter: "stable",
 				// This list owns its scroll position: every geometry change is answered
 				// with an explicit anchored write (captureCoordinatorAnchor →
 				// restorePretextLayoutAnchor → writeScrollTop). The browser's own scroll
@@ -3174,7 +3427,15 @@ export const PretextExactMessageList = forwardRef<
 									sourceIds={sourceIds}
 									// Layout-affecting interaction state PLUS the viewer's pure render
 									// state, so a wrap / source toggle re-renders just this row.
-									interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}`}
+									//
+									// The live reasoning tail rides here too. It is read at DRAW time from
+									// `spec.data` (never measured — see reasoning-live-tail), so none of the
+									// three things the memo compares below moves when it advances: a folded
+									// trace's `measured` is the SAME cached object, its key is constant, and
+									// the tail is height-neutral. Without this term the memo skips the
+									// re-render and the newest characters never reach the DOM. Empty string
+									// for every settled row, so scroll-time memo hits are unaffected.
+									interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}`}
 									toggles={getRowToggles(item.spec.key)}
 									renderLabels={renderLabels}
 									interaction={interactionsByKey.get(item.spec.key)}
@@ -3218,13 +3479,16 @@ export const PretextExactMessageList = forwardRef<
 					// laid out we keep the SAME message-shaped skeleton the panel showed
 					// before this list mounted, so the transition reads as one continuous
 					// placeholder instead of a skeleton followed by a bare text line.
+					//
+					// Laid out in CSS, NOT from `contentWidth`: reading the measured width
+					// here is what painted the sentinel geometry for a frame on every mount.
+					// The shared helper reproduces the row column's arithmetic in px, so the
+					// skeleton and the rows that replace it occupy the same column.
 					<div
 						data-pretext-exact-status
 						style={{
 							minHeight: 64,
-							padding: PAGE_PADDING,
-							width: contentWidth,
-							margin: "0 auto",
+							...narratorColumnPlaceholderStyle(centeredColumn),
 						}}
 					>
 						{pretextDocument.error ? (

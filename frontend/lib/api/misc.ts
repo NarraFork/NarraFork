@@ -1,3 +1,8 @@
+import type {
+	CredentialUsageTotals,
+	CredentialUsageTotalsDetail,
+} from "@frontend/types/usage-history";
+import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
 import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
 import type {
 	ApiEntity,
@@ -365,19 +370,23 @@ export const miscApi = {
 	codexStatus: (params?: {
 		availablePage?: number;
 		unavailablePage?: number;
+		archivedPage?: number;
 		pageSize?: number;
 	}) => {
 		const qs = new URLSearchParams();
 		if (params?.availablePage) qs.set("availablePage", String(params.availablePage));
 		if (params?.unavailablePage) qs.set("unavailablePage", String(params.unavailablePage));
+		if (params?.archivedPage) qs.set("archivedPage", String(params.archivedPage));
 		if (params?.pageSize) qs.set("pageSize", String(params.pageSize));
 		const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
 		return request<{
 			entries: CodexCredentialEntry[];
 			availableEntries: CodexCredentialEntry[];
 			unavailableEntries: CodexCredentialEntry[];
+			archivedEntries: CodexCredentialEntry[];
 			availableTotal: number;
 			unavailableTotal: number;
+			archivedTotal: number;
 			unhealthyTotal: number;
 			currentId: string;
 			loadBalancingMode: CodexLoadBalancingMode;
@@ -437,6 +446,21 @@ export const miscApi = {
 		request<{ ok: boolean }>(`/codex/credentials/${id}/enable`, { method: "POST" }),
 	codexCredentialReset: (id: string) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}/reset`, { method: "POST" }),
+	codexCredentialArchive: (id: string) =>
+		request<{ ok: boolean }>(`/codex/credentials/${id}/archive`, { method: "POST" }),
+	codexCredentialUnarchive: (id: string) =>
+		request<{ ok: boolean }>(`/codex/credentials/${id}/unarchive`, { method: "POST" }),
+	/**
+	 * Lifetime token/cost totals for every Codex credential.
+	 *
+	 * Sourced from `credential_usage_totals`, so unlike the per-request history
+	 * these survive narrator deletion and credential archiving.
+	 */
+	codexCredentialUsageTotals: () =>
+		request<{ entries: CredentialUsageTotals[] }>("/codex/credentials/usage-stats"),
+	/** Lifetime totals for one Codex credential, broken down by model. */
+	codexCredentialUsageTotalsDetail: (id: string) =>
+		request<CredentialUsageTotalsDetail>(`/codex/credentials/${id}/usage-stats`),
 	codexCredentialDelete: (id: string) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}`, { method: "DELETE" }),
 	codexCredentialBatchDelete: (ids: string[]) =>
@@ -1602,21 +1626,18 @@ export const miscApi = {
 	cleanupUpdates: () => request<{ success: boolean }>("/update/cleanup", { method: "POST" }),
 	getUpdateStatus: (version?: string) => {
 		const suffix = version ? `?version=${encodeURIComponent(version)}` : "";
-		return request<{
-			ready: boolean;
-			updateFile?: string;
-			canAutoRestart: boolean;
-			newBinaryPath?: string;
-			updatePath?: string;
-			placed?: boolean;
-			version?: string;
-			phase?: "idle" | "draining" | "restarting";
-			scheduled?: boolean;
-			targetVersion?: string;
-			pendingExecutionCount?: number;
-			error?: string;
-		}>(`/update/status${suffix}`);
+		return request<PreparedUpdateStatus>(`/update/status${suffix}`);
 	},
+	cancelUpdate: () =>
+		request<{
+			success: boolean;
+			cancelled: boolean;
+			phase?: UpdateCoordinationPhase;
+			scheduled?: boolean;
+			cancelRequested?: boolean;
+			error?: string;
+			errorKind?: "failed" | "cancelled";
+		}>("/update/cancel", { method: "POST" }),
 	applyUpdate: (version?: string) =>
 		request<{
 			success: boolean;
@@ -1625,9 +1646,13 @@ export const miscApi = {
 			newBinaryPath?: string;
 			restarting?: boolean;
 			scheduled?: boolean;
-			phase?: "idle" | "draining" | "restarting";
+			phase?: UpdateCoordinationPhase;
 			targetVersion?: string;
 			pendingExecutionCount?: number;
+			pendingBackgroundBashCount?: number;
+			pendingOrdinaryExecutionCount?: number;
+			resumableExecutionCount?: number;
+			pausedToolCount?: number;
 			drainStartedAt?: string;
 			replacementPid?: number;
 		}>("/update/apply", {

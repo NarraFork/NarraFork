@@ -6,9 +6,11 @@ import {
 	type PretextLayoutManifest,
 	restorePretextLayoutAnchor,
 } from "@shared/pretext-layout";
+import { resetPreparedMarkdownCache } from "@shared/pretext-layout/prepared-markdown-cache";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import type { NarratorMsg } from "../narrator-panel-types";
-import { ensureKatexLoaded, getKatexRevision } from "./katex-runtime";
+import { ensureKatexLoaded, getFontRevision, getKatexRevision } from "./katex-runtime";
+import { measureCache } from "./measure-cache";
 import type { RenderLod } from "./prepared-block";
 import {
 	type BuildPretextDocumentLayoutOptions,
@@ -54,6 +56,16 @@ export interface PretextLayoutCoordinatorSnapshot {
 	hasPrev?: boolean;
 	/** An older-page fetch is in flight (drives the load indicator). */
 	loadingOlder?: boolean;
+	/**
+	 * Wall-clock cost (ms) of the most recent layout build.
+	 *
+	 * DIAGNOSTIC ONLY. It deliberately drives no behaviour: it times the measurement
+	 * pass, and using it to decide whether a resize could "afford" a rebuild is exactly
+	 * what made the drag freeze inert (a realistic window measures ~2ms while its
+	 * mounted DOM takes an order of magnitude longer to rebuild). See
+	 * vlist-width-settle for why no cost estimate is consulted at all.
+	 */
+	lastBuildMs?: number;
 	error?: Error;
 }
 
@@ -80,6 +92,11 @@ export interface PretextLayoutBuildOptions
  * the coordinator's own live-patch path must capture identically — two copies
  * would be free to drift and silently reintroduce viewport jumps.
  */
+/** Monotonic clock, falling back to Date.now in environments without performance. */
+function now(): number {
+	return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
 export function captureCoordinatorAnchor(
 	index: PretextLayoutIndex,
 	view: {
@@ -499,6 +516,22 @@ export class PretextLayoutCoordinator {
 		this.pendingLoad = null;
 	}
 
+	/**
+	 * Abandon the loaded document (narrator switch / teardown).
+	 *
+	 * Also releases the cross-width PREPARED cache, which is the teardown hook that
+	 * `resetStreamingBlockCache` has on the streaming side and this had nowhere at
+	 * all. That cache retains a full `PreparedBlock[]` — every pretext handle, with
+	 * every fragment's baked geometry — per distinct body, and its bulk-clear only
+	 * fires at the retention ceiling. Without a release here, switching narrators
+	 * and browsing a long SPA session accumulated the union of every document ever
+	 * opened. The next build re-parses the current window in one pass, which is the
+	 * cost this cache was measured saving on RESIZE, not on document switch.
+	 *
+	 * `measureCache` deliberately stays: it is keyed by `documentRevision`, so its
+	 * stale entries are unreachable rather than wrong, and it has its own ceiling.
+	 * The prepared cache is the one holding the large payloads.
+	 */
 	reset(): void {
 		this.generation++;
 		this.pendingLoad = null;
@@ -507,7 +540,38 @@ export class PretextLayoutCoordinator {
 		this.loadingOlder = false;
 		this.streamingMessage = null;
 		this.current = { status: "idle" };
+		resetPreparedMarkdownCache();
 		this.emit();
+	}
+
+	/**
+	 * Drop every cached measurement and prepared body, then rebuild at the last
+	 * committed params.
+	 *
+	 * This is the FONT-GENERATION path (see the `documentRevision` note): the
+	 * prepared handles carry pixel widths baked against the previous face, so they
+	 * cannot be reused, and the heights derived from them are already on screen.
+	 * The rebuild anchors so the reader is not moved by the corrected geometry.
+	 *
+	 * No-ops before the first commit — the first build will use the new generation
+	 * anyway.
+	 */
+	invalidateFontDependentLayout(getView?: () => PrependView): boolean {
+		resetPreparedMarkdownCache();
+		measureCache.clear();
+		if (!this.input || !this.lastBuildOptions) return false;
+		const view = getView?.();
+		const anchor =
+			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
+		const generation = ++this.generation;
+		this.commitLayout(
+			this.input,
+			this.lastBuildOptions,
+			anchor,
+			view?.viewportHeight ?? this.lastViewportHeight,
+			generation,
+		);
+		return true;
 	}
 
 	/**
@@ -521,15 +585,28 @@ export class PretextLayoutCoordinator {
 		return [...input.messages, this.streamingMessage];
 	}
 
+	/**
+	 * Cost (ms) of the last completed build, exposed on the snapshot so the shell can
+	 * size its resize strategy from measurement rather than a guess.
+	 */
+	private lastBuildMs = 0;
+
 	/** Build the exact layout for the loaded input (shared by every commit path). */
 	private buildLayout(input: PretextDocumentInput, buildOptions: PretextLayoutBuildOptions) {
+		const startedAt = now();
+		const built = this.buildLayoutInner(input, buildOptions);
+		this.lastBuildMs = now() - startedAt;
+		return built;
+	}
+
+	private buildLayoutInner(input: PretextDocumentInput, buildOptions: PretextLayoutBuildOptions) {
 		const messages = this.layoutMessages(input);
 		return buildPretextDocumentLayout(messages as unknown as NarratorMsg[], {
 			...buildOptions,
 			pruneBoundaryMessageId: input.pruneBoundaryMessageId,
 			// The loaded-message count keeps the revision distinct as the window
 			// grows upward within one document version (prepended older pages).
-			layoutRevision: `${input.messageVersion}:${input.messages.length}:${buildOptions.widthBucket}:${buildOptions.lod}:k${getKatexRevision()}`,
+			layoutRevision: `${input.messageVersion}:${input.messages.length}:${buildOptions.widthBucket}:${buildOptions.lod}:k${getKatexRevision()}:f${getFontRevision()}`,
 			// The KaTeX revision belongs on the DOCUMENT revision, not just the layout
 			// revision: `layoutRevision` only reaches the manifest identity, while the
 			// measure cache keys on `documentRevision` + the data revision. Without it
@@ -537,7 +614,12 @@ export class PretextLayoutCoordinator {
 			// are served from cache afterwards — a display formula measured as literal
 			// text stays an `inline` block, so the row keeps the wrong height AND never
 			// paints the formula at all.
-			documentRevision: `${input.messageVersion}~k:${getKatexRevision()}`,
+			//
+			// The FONT generation rides along for the same reason, one level broader:
+			// every prepared fragment carries a baked pixel width measured against the
+			// then-available face, so a face swap invalidates heights on math-free
+			// documents too (see prepared-markdown-cache's FONT REVISION note).
+			documentRevision: `${input.messageVersion}~k:${getKatexRevision()}~f:${getFontRevision()}`,
 		});
 	}
 
@@ -589,6 +671,7 @@ export class PretextLayoutCoordinator {
 				items: built.items,
 				hasPrev: input.hasPrev,
 				loadingOlder: this.loadingOlder,
+				lastBuildMs: this.lastBuildMs,
 				// A successful commit clears any retained diagnostic error. loadOlder
 				// deliberately stays "ready" after a failed upward page and keeps its
 				// error for diagnostics; without clearing it here that error would ride
@@ -649,6 +732,7 @@ export class PretextLayoutCoordinator {
 				items: built.items,
 				hasPrev: input.hasPrev,
 				loadingOlder: this.loadingOlder,
+				lastBuildMs: this.lastBuildMs,
 				// Same contract as commitLayout: a successful page clears the retained
 				// error of an earlier failed one.
 				error: undefined,

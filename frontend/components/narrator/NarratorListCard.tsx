@@ -22,11 +22,12 @@ import { useTranslation } from "react-i18next";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { formatSmartTime } from "../../lib/format";
 import { highlightSearchText } from "../../lib/search-utils";
-import { getEffectiveNarratorDisplay } from "../../lib/status-registry";
+import { getEffectiveNarratorDisplay, statusAccentColor } from "../../lib/status-registry";
 import { UserAvatar } from "../UserAvatar";
 
 const ATTENTION_TAG_PRIORITY = [
 	"error",
+	"model_unavailable",
 	"compacting",
 	"background_compacting",
 	"suspended",
@@ -135,7 +136,7 @@ function getNarratorBadgeInfo(
 		: substatus?.includes("planning")
 			? "status_planning"
 			: `status_${status}`;
-	return { color: display.color, labelKey };
+	return { color: statusAccentColor(display), labelKey };
 }
 
 function NarratorTitle({

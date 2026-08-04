@@ -16,6 +16,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { open } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { inArray } from "drizzle-orm";
 import { db } from "../db";
@@ -25,11 +26,14 @@ import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { beginGracefulRestartSession, cancelGracefulRestartSession } from "../lib/server-restart";
 import { settings } from "../lib/settings";
+import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
 import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
-import { applyZstdPatch, type ZstdPatchMeta } from "../lib/zstd-patch";
+import { applyZstdPatchToFile, type ZstdPatchMeta } from "../lib/zstd-patch";
 import { toolContinuationService } from "./tool-continuation-service";
 import {
+	assertUpdateNotCancelled,
 	beginQuiescingTools,
+	cancelScheduledUpdate,
 	capturePlannedUpdateRecoverySnapshot,
 	consumePlannedUpdateRecoverySnapshot,
 	failScheduledUpdate,
@@ -38,6 +42,8 @@ import {
 	type PlannedUpdateRecoverySnapshot,
 	removePlannedUpdateRecoverySnapshot,
 	scheduleUpdate,
+	UpdateCancelledError,
+	type UpdateCoordinationStatus,
 	waitForBackgroundBashDrain,
 	waitForOrdinaryToolDrain,
 	waitForUpdateCheckpointFence,
@@ -48,43 +54,50 @@ import {
 	verifySendAwaitCheckpointEpoch,
 } from "./update-recovery-service";
 
+/** Probe budget for `zstd --version`; a hung probe must not stall the request. */
+const ZSTD_PROBE_TIMEOUT_MS = 5_000;
+
+/** Asynchronously check whether a zstd binary answers `--version`. */
+async function zstdCliResponds(binary: string): Promise<boolean> {
+	let proc: ReturnType<typeof Bun.spawn>;
+	try {
+		proc = Bun.spawn([binary, "--version"], {
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+	} catch {
+		return false;
+	}
+	const timer = setTimeout(() => proc.kill(), ZSTD_PROBE_TIMEOUT_MS);
+	try {
+		return (await proc.exited) === 0;
+	} catch {
+		return false;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 /**
  * Find or download the zstd CLI binary.
  * - Checks system PATH first.
  * - Falls back to a NarraFork-managed helper binary cached under ~/.narrafork/bin.
  * Returns the path to zstd binary, or null if unavailable.
  *
+ * Nothing here installs software. A package-manager install (the former macOS
+ * `brew install zstd`) can block for minutes and has no business running inside an HTTP
+ * request; the client surfaces an install hint instead when this returns null.
+ *
  * When `forceDownload` is true (explicit user retry), the recent-failure cache
  * is bypassed so a previous network timeout does not short-circuit the attempt.
  */
 async function getZstdCliPath(forceDownload = false): Promise<string | null> {
-	try {
-		const result = Bun.spawnSync(["zstd", "--version"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		if (result.exitCode === 0) return "zstd";
-	} catch {
-		// zstd not in PATH
-	}
+	if (await zstdCliResponds("zstd")) return "zstd";
 
 	if (process.platform === "darwin") {
-		// Keep the existing macOS behavior: Homebrew is the most reliable source
-		// for a signed, architecture-correct zstd binary.
-		const brewResult = Bun.spawnSync(["brew", "install", "zstd"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		if (brewResult.exitCode === 0) {
-			const recheck = Bun.spawnSync(["zstd", "--version"], {
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			if (recheck.exitCode === 0) {
-				logger.info("Installed zstd via Homebrew");
-				return "zstd";
-			}
-		}
+		// No prebuilt helper binary is published for macOS, and installing one from a request
+		// handler is not acceptable. The client shows the `brew install zstd` hint.
 		return null;
 	}
 
@@ -172,8 +185,21 @@ export interface UpdateProgress {
 
 const UPDATE_DIR = getNarraforkPath("updates");
 const PLACED_UPDATE_INFO_PATH = join(UPDATE_DIR, "placed-update.json");
+/** Recovery manifest name, owned by update-coordinator; cleanup must never delete it. */
+const RECOVERY_SNAPSHOT_FILE_NAME = "planned-update-recovery.json";
+const PLACED_UPDATE_INFO_FILE_NAME = "placed-update.json";
+/** Small JSON metadata: a slow server here should fail fast rather than hang the SSE stream. */
+const METADATA_FETCH_TIMEOUT_MS = 30_000;
+/** Patch payloads can legitimately take a while on a slow link, but never forever. */
+const PAYLOAD_FETCH_TIMEOUT_MS = 15 * 60_000;
+/** Wall-clock budget for one zstd reconstruction. */
+const PATCH_APPLY_TIMEOUT_MS = 10 * 60_000;
+/** Absolute ceilings, independent of what the server announces. */
+const MAX_PATCH_BYTES = 512 * 1024 * 1024;
+const MAX_BINARY_BYTES = 1024 * 1024 * 1024;
+/** Tolerance over the announced patch size before a download is rejected. */
+const PATCH_SIZE_SLACK = 1.25;
 const REPLACEMENT_HANDOFF_WATCHDOG_MS = 75_000;
-const CHECKPOINT_FENCE_TIMEOUT_MS = 30_000;
 const CHECKPOINT_MAX_ROUNDS = 8;
 const CHECKPOINT_REQUIRED_STABLE_PASSES = 2;
 const CHECKPOINT_ACTIVE_TOOL_LIMIT = 10_001;
@@ -236,6 +262,80 @@ function isPathInsideDirectory(childPath: string, parentPath: string): boolean {
 	return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
 }
 
+/**
+ * Fetch with a hard deadline.
+ *
+ * Every update-server request needs one: without it a hung server keeps the SSE stream and
+ * the whole download call pending forever, and the client-side cancel only aborts the
+ * client's own fetch.
+ */
+async function fetchWithTimeout(
+	url: string,
+	options: { timeoutMs: number; signal?: AbortSignal },
+): Promise<Response> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), Math.max(1, options.timeoutMs));
+	const onAbort = () => controller.abort();
+	options.signal?.addEventListener("abort", onAbort, { once: true });
+	try {
+		return await fetch(url, { signal: controller.signal });
+	} finally {
+		clearTimeout(timer);
+		options.signal?.removeEventListener("abort", onAbort);
+	}
+}
+
+/**
+ * Stream a response body to disk with a byte ceiling.
+ *
+ * `arrayBuffer()` would let the server decide how much memory this process allocates, so the
+ * body is written incrementally and aborted as soon as it exceeds `maxBytes`.
+ */
+async function streamResponseToFile(
+	response: Response,
+	filePath: string,
+	options: { maxBytes: number; onProgress?: (bytesWritten: number) => void },
+): Promise<number> {
+	const declaredLength = Number(response.headers.get("content-length") ?? 0);
+	if (Number.isFinite(declaredLength) && declaredLength > options.maxBytes) {
+		throw new Error(
+			`Update payload declares ${declaredLength} bytes, over the ${options.maxBytes}-byte limit`,
+		);
+	}
+	if (!response.body) throw new Error("Update payload response had no body");
+
+	const handle = await open(filePath, "w");
+	let written = 0;
+	try {
+		const reader = response.body.getReader();
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				written += value.byteLength;
+				if (written > options.maxBytes) {
+					throw new Error(`Update payload exceeded the ${options.maxBytes}-byte limit`);
+				}
+				await handle.write(value);
+				options.onProgress?.(written);
+			}
+		} finally {
+			await reader.cancel().catch(() => {});
+		}
+	} finally {
+		await handle.close();
+	}
+	return written;
+}
+
+function safeUnlink(filePath: string): void {
+	try {
+		if (existsSync(filePath)) unlinkSync(filePath);
+	} catch {
+		// Best effort cleanup.
+	}
+}
+
 function sanitizeVersionFragment(version: string): string {
 	return version.replace(/[^a-zA-Z0-9._-]+/g, "-") || "unknown";
 }
@@ -260,7 +360,7 @@ interface PreparedBinaryDestination {
 	alreadyPresent: boolean;
 }
 
-function chooseNonOverwritingDestination({
+async function chooseNonOverwritingDestination({
 	directory,
 	baseName,
 	version,
@@ -272,7 +372,7 @@ function chooseNonOverwritingDestination({
 	version: string;
 	sha512: string;
 	disallowedPath?: string;
-}): PreparedBinaryDestination {
+}): Promise<PreparedBinaryDestination> {
 	const versionSuffix = sanitizeVersionFragment(version);
 	const candidates = [
 		baseName,
@@ -290,7 +390,7 @@ function chooseNonOverwritingDestination({
 		if (existsSync(candidatePath)) {
 			try {
 				const stat = statSync(candidatePath);
-				if (stat.isFile() && computeFileSha512Sync(candidatePath) === sha512) {
+				if (stat.isFile() && (await verifyFileSha512Cached(candidatePath, stat, sha512))) {
 					return { path: candidatePath, fileName, alreadyPresent: true };
 				}
 			} catch {
@@ -308,7 +408,7 @@ function chooseNonOverwritingDestination({
 function resolvePreparedBinaryDestination(
 	execPath: string,
 	releaseInfo: ReleaseInfo,
-): PreparedBinaryDestination {
+): Promise<PreparedBinaryDestination> {
 	return chooseNonOverwritingDestination({
 		directory: dirname(execPath),
 		baseName: sanitizeUpdateFileName(releaseInfo.path, releaseInfo.version),
@@ -318,7 +418,9 @@ function resolvePreparedBinaryDestination(
 	});
 }
 
-function resolveUpdateCacheDestination(releaseInfo: ReleaseInfo): PreparedBinaryDestination {
+function resolveUpdateCacheDestination(
+	releaseInfo: ReleaseInfo,
+): Promise<PreparedBinaryDestination> {
 	return chooseNonOverwritingDestination({
 		directory: UPDATE_DIR,
 		baseName: sanitizeUpdateFileName(releaseInfo.path, releaseInfo.version),
@@ -361,11 +463,92 @@ interface V2CheckResponse {
 }
 
 /**
+ * Re-exported so existing importers (and the settings Zod schema) keep one source of truth.
+ * The predicate itself lives in `lib/` because the write path needs it too — see that module.
+ */
+export { isTrustedUpdateServerUrl };
+
+/**
  * Build the base URL for the update server (strips trailing slash).
  * Falls back to the default update server when the configured URL is empty.
+ *
+ * Returns an empty string for an untrusted origin, which every caller already treats as
+ * "update server not configured".
  */
 function getServerBaseUrl(): string {
-	return getHelperBinaryServerBaseUrl();
+	const url = getHelperBinaryServerBaseUrl();
+	if (!url) return "";
+	if (!isTrustedUpdateServerUrl(url)) {
+		logger.warn("Ignoring update server URL that cannot be trusted to deliver code", { url });
+		return "";
+	}
+	return url;
+}
+
+/**
+ * Resolve a URL reported by the update server against its own origin.
+ *
+ * String concatenation is not safe here: a value like `@evil.com/x` turns
+ * `https://updates.example.com` + `@evil.com/x` into a request to `evil.com` with the update
+ * host as userinfo. Parsing and asserting the origin keeps the update server's own response
+ * from redirecting the download anywhere else.
+ */
+function resolveSameOriginUrl(serverBase: string, candidate: string): string | null {
+	try {
+		const base = new URL(serverBase);
+		const resolved = new URL(candidate, base);
+		if (resolved.origin !== base.origin) {
+			logger.warn("Discarded update URL pointing at a different origin", {
+				serverOrigin: base.origin,
+				resolvedOrigin: resolved.origin,
+			});
+			return null;
+		}
+		return resolved.toString();
+	} catch (error) {
+		logger.warn("Discarded unparseable update URL", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return null;
+	}
+}
+
+/** @internal Exported for update URL trust tests. */
+export function __resolveSameOriginUrlForTests(
+	serverBase: string,
+	candidate: string,
+): string | null {
+	return resolveSameOriginUrl(serverBase, candidate);
+}
+
+function resolveSameOriginPatchUrls(
+	serverBase: string,
+	step: { url: string; metaUrl: string },
+): { url: string; metaUrl: string } | null {
+	const url = resolveSameOriginUrl(serverBase, step.url);
+	const metaUrl = resolveSameOriginUrl(serverBase, step.metaUrl);
+	if (!url || !metaUrl) return null;
+	return { url, metaUrl };
+}
+
+/** Resolve a patch chain, dropping the whole chain when any step leaves the server origin. */
+function resolveSameOriginPatchChain(
+	serverBase: string,
+	chain: Array<{
+		fromVersion: string;
+		toVersion: string;
+		patchSize: number;
+		url: string;
+		metaUrl: string;
+	}>,
+): NonNullable<ReleaseInfo["_v2"]>["patchChain"] {
+	const resolved: NonNullable<NonNullable<ReleaseInfo["_v2"]>["patchChain"]> = [];
+	for (const step of chain) {
+		const urls = resolveSameOriginPatchUrls(serverBase, step);
+		if (!urls) return undefined;
+		resolved.push({ ...step, ...urls });
+	}
+	return resolved;
 }
 
 /**
@@ -426,7 +609,7 @@ async function checkChannel(
 	const checkUrl = `${serverUrl}/api/v2/products/${product}/releases/latest?channel=${channel}&platform=${platform}&version=${APP_VERSION}`;
 	logger.debug("Checking for updates", { url: checkUrl, channel });
 
-	const response = await fetch(checkUrl);
+	const response = await fetchWithTimeout(checkUrl, { timeoutMs: METADATA_FETCH_TIMEOUT_MS });
 	if (!response.ok) {
 		logger.warn("Update check failed", { status: response.status, channel });
 		return { updateAvailable: false, currentVersion: APP_VERSION };
@@ -442,6 +625,13 @@ async function checkChannel(
 		};
 	}
 
+	const directPatchUrls = data.zstdPatch
+		? resolveSameOriginPatchUrls(serverUrl, data.zstdPatch)
+		: null;
+	const chainUrls = data.patchChain
+		? resolveSameOriginPatchChain(serverUrl, data.patchChain)
+		: undefined;
+
 	const releaseInfo: ReleaseInfo = {
 		version: data.version,
 		releaseDate: data.releaseDate ?? new Date().toISOString(),
@@ -456,13 +646,9 @@ async function checkChannel(
 			},
 		],
 		_v2: {
-			zstdPatchUrl: data.zstdPatch ? `${serverUrl}${data.zstdPatch.url}` : undefined,
-			zstdPatchMetaUrl: data.zstdPatch ? `${serverUrl}${data.zstdPatch.metaUrl}` : undefined,
-			patchChain: data.patchChain?.map((step) => ({
-				...step,
-				url: `${serverUrl}${step.url}`,
-				metaUrl: `${serverUrl}${step.metaUrl}`,
-			})),
+			zstdPatchUrl: directPatchUrls?.url,
+			zstdPatchMetaUrl: directPatchUrls?.metaUrl,
+			patchChain: chainUrls,
 		},
 		releaseNotesPerVersion: data.releaseNotesPerVersion,
 	};
@@ -472,16 +658,12 @@ async function checkChannel(
 	let strategy: "zstd" | undefined;
 	let patchChain: UpdateCheckResult["patchChain"];
 
-	if (data.zstdPatch && data.zstdPatch.fromVersion === APP_VERSION) {
+	if (data.zstdPatch && directPatchUrls && data.zstdPatch.fromVersion === APP_VERSION) {
 		zstdPatchSize = data.zstdPatch.patchSize;
 		strategy = "zstd";
 		downloadSize = zstdPatchSize;
-	} else if (data.patchChain && data.patchChain.length > 0) {
-		patchChain = data.patchChain.map((step) => ({
-			...step,
-			url: `${serverUrl}${step.url}`,
-			metaUrl: `${serverUrl}${step.metaUrl}`,
-		}));
+	} else if (chainUrls && chainUrls.length > 0) {
+		patchChain = chainUrls;
 		strategy = "zstd";
 		downloadSize = patchChain.reduce((sum, s) => sum + s.patchSize, 0);
 	}
@@ -543,13 +725,141 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 	}
 }
 
+interface PatchApplicationContext {
+	/** Source binary for this step. */
+	sourcePath: string;
+	/** Destination for the reconstructed binary. */
+	outputPath: string;
+	stepUrl: string;
+	meta: ZstdPatchMeta;
+	declaredPatchSize: number;
+	forceDownload: boolean;
+	signal?: AbortSignal;
+	onProgress?: (progress: UpdateProgress) => void;
+	progressBase: number;
+	progressSpan: number;
+}
+
+class ZstdCliMissingError extends Error {
+	constructor() {
+		super("zstd CLI required for patch-from mode");
+		this.name = "ZstdCliMissingError";
+	}
+}
+
+async function fetchPatchMeta(
+	metaUrl: string,
+	signal: AbortSignal | undefined,
+): Promise<ZstdPatchMeta> {
+	const metaResp = await fetchWithTimeout(metaUrl, {
+		timeoutMs: METADATA_FETCH_TIMEOUT_MS,
+		signal,
+	});
+	if (!metaResp.ok) {
+		throw new Error(`Failed to fetch patch meta: ${metaResp.status}`);
+	}
+	return (await metaResp.json()) as ZstdPatchMeta;
+}
+
+/**
+ * Fetch one patch to disk and reconstruct the next binary, file-to-file.
+ *
+ * Every network hop is bounded (timeout plus a byte ceiling derived from the announced patch
+ * size) and the reconstruction itself happens in a child process / off-thread binding, so the
+ * event loop stays free for ordinary HTTP, WebSocket and agent traffic.
+ */
+async function downloadAndApplyPatchStep(context: PatchApplicationContext): Promise<void> {
+	const patchTempPath = `${context.outputPath}.patch.${process.pid}.${Date.now()}.tmp`;
+	const meta = context.meta;
+	try {
+		context.onProgress?.({
+			phase: "downloading",
+			bytesDownloaded: 0,
+			totalBytes: meta.patchSize,
+			percent: Math.round(context.progressBase),
+		});
+
+		const patchResp = await fetchWithTimeout(context.stepUrl, {
+			timeoutMs: PAYLOAD_FETCH_TIMEOUT_MS,
+			signal: context.signal,
+		});
+		if (!patchResp.ok) {
+			throw new Error(`Failed to fetch patch: ${patchResp.status}`);
+		}
+		// Trust the smaller of the two announced sizes, with slack for header/framing drift.
+		const declared = Math.max(meta.patchSize || 0, context.declaredPatchSize || 0);
+		const maxPatchBytes = Math.min(
+			MAX_PATCH_BYTES,
+			declared > 0 ? Math.ceil(declared * PATCH_SIZE_SLACK) + 64 * 1024 : MAX_PATCH_BYTES,
+		);
+		const patchBytes = await streamResponseToFile(patchResp, patchTempPath, {
+			maxBytes: maxPatchBytes,
+			onProgress: (bytesWritten) => {
+				context.onProgress?.({
+					phase: "downloading",
+					bytesDownloaded: bytesWritten,
+					totalBytes: meta.patchSize,
+					percent: Math.round(
+						context.progressBase +
+							context.progressSpan * 0.5 * Math.min(1, bytesWritten / (meta.patchSize || 1)),
+					),
+				});
+			},
+		});
+
+		let zstdCliPath: string | undefined;
+		if (meta.mode === "patch-from") {
+			const cli = await getZstdCliPath(context.forceDownload);
+			if (!cli) throw new ZstdCliMissingError();
+			zstdCliPath = cli;
+		}
+
+		logger.info("Applying zstd patch", {
+			patchSize: patchBytes,
+			newFileSize: meta.newFileSize,
+			mode: meta.mode ?? "dictionary",
+		});
+		context.onProgress?.({
+			phase: "applying",
+			bytesDownloaded: patchBytes,
+			totalBytes: meta.newFileSize,
+			percent: Math.round(context.progressBase + context.progressSpan * 0.5),
+		});
+
+		await applyZstdPatchToFile({
+			oldFilePath: context.sourcePath,
+			patchFilePath: patchTempPath,
+			outputFilePath: context.outputPath,
+			meta,
+			zstdPath: zstdCliPath,
+			signal: context.signal,
+			timeoutMs: PATCH_APPLY_TIMEOUT_MS,
+			maxOutputBytes: MAX_BINARY_BYTES,
+		});
+
+		context.onProgress?.({
+			phase: "applying",
+			bytesDownloaded: patchBytes,
+			totalBytes: meta.newFileSize,
+			percent: Math.round(context.progressBase + context.progressSpan),
+		});
+	} finally {
+		safeUnlink(patchTempPath);
+	}
+}
+
 /**
  * Download and apply an update using zstd patches.
+ *
+ * The whole pipeline is asynchronous and bounded: fetches carry timeouts, payloads stream to
+ * disk under a byte ceiling, and patch reconstruction runs as a child process (or through the
+ * async zlib binding for legacy dictionary patches). Nothing here holds a ~100MB binary on the
+ * heap or blocks the event loop, which matters most during an update.
  */
 export async function downloadUpdate(
 	releaseInfo: ReleaseInfo,
 	onProgress?: (progress: UpdateProgress) => void,
-	options: { forceDownload?: boolean } = {},
+	options: { forceDownload?: boolean; signal?: AbortSignal } = {},
 ): Promise<{
 	success: boolean;
 	error?: string;
@@ -559,6 +869,7 @@ export async function downloadUpdate(
 	placed?: boolean;
 }> {
 	const forceDownload = options.forceDownload ?? false;
+	const signal = options.signal;
 	const serverUrl = getServerBaseUrl();
 	if (!serverUrl) {
 		return { success: false, error: "Update server not configured" };
@@ -572,6 +883,8 @@ export async function downloadUpdate(
 	const releaseFileName = sanitizeUpdateFileName(releaseInfo.path, releaseInfo.version);
 	const updatePath = join(UPDATE_DIR, releaseFileName);
 	const tempPath = `${updatePath}.${process.pid}.${Date.now()}.tmp`;
+	// Patch chains reconstruct one intermediate binary per step; both slots are reused.
+	const intermediatePaths = [`${tempPath}.step-a`, `${tempPath}.step-b`];
 
 	logger.info("Starting update download", {
 		version: releaseInfo.version,
@@ -597,78 +910,34 @@ export async function downloadUpdate(
 
 			if (zstdMetaUrl && zstdPatchUrl) {
 				try {
-					const metaResp = await fetch(zstdMetaUrl);
-					if (metaResp.ok) {
-						const meta = (await metaResp.json()) as ZstdPatchMeta;
-						if (meta.fromVersion === APP_VERSION) {
-							onProgress?.({
-								phase: "downloading",
-								bytesDownloaded: 0,
-								totalBytes: meta.patchSize,
-								percent: 0,
-							});
-
-							const patchResp = await fetch(zstdPatchUrl);
-							if (patchResp.ok) {
-								const patchBuf = Buffer.from(await patchResp.arrayBuffer());
-								onProgress?.({
-									phase: "downloading",
-									bytesDownloaded: patchBuf.length,
-									totalBytes: patchBuf.length,
-									percent: 100,
-								});
-
-								logger.info("Applying zstd patch", {
-									patchSize: patchBuf.length,
-									newFileSize: meta.newFileSize,
-									mode: meta.mode ?? "dictionary",
-								});
-
-								onProgress?.({
-									phase: "applying",
-									bytesDownloaded: patchBuf.length,
-									totalBytes: meta.newFileSize,
-									percent: 50,
-								});
-
-								// For patch-from mode, we need zstd CLI
-								let zstdCliPath: string | undefined;
-								if (meta.mode === "patch-from") {
-									const cli = await getZstdCliPath(forceDownload);
-									if (!cli) {
-										logger.warn("Zstd CLI not available for patch-from mode, skipping");
-										zstdCliMissing = true;
-										throw new Error("zstd CLI required for patch-from mode");
-									}
-									zstdCliPath = cli;
-								}
-
-								const oldBuf = readFileSync(execPath);
-								const newBuf = applyZstdPatch(oldBuf, patchBuf, meta, zstdCliPath);
-								writeFileSync(tempPath, newBuf);
-								applied = true;
-
-								onProgress?.({
-									phase: "applying",
-									bytesDownloaded: patchBuf.length,
-									totalBytes: meta.newFileSize,
-									percent: 100,
-								});
-
-								logger.info("Zstd patch applied successfully", {
-									patchSize: patchBuf.length,
-									resultSize: newBuf.length,
-								});
-							}
-						} else {
-							logger.debug("Zstd patch version mismatch", {
-								patchFrom: meta.fromVersion,
-								current: APP_VERSION,
-							});
-						}
+					// Check the base version before spending a payload download on an unusable patch.
+					const meta = await fetchPatchMeta(zstdMetaUrl, signal);
+					if (meta.fromVersion !== APP_VERSION) {
+						logger.debug("Zstd patch version mismatch", {
+							patchFrom: meta.fromVersion,
+							current: APP_VERSION,
+						});
+					} else {
+						await downloadAndApplyPatchStep({
+							sourcePath: execPath,
+							outputPath: tempPath,
+							stepUrl: zstdPatchUrl,
+							meta,
+							declaredPatchSize: meta.patchSize,
+							forceDownload,
+							signal,
+							onProgress,
+							progressBase: 0,
+							progressSpan: 100,
+						});
+						applied = true;
+						logger.info("Zstd patch applied successfully", { resultSize: meta.newFileSize });
 					}
 				} catch (err) {
+					if (err instanceof ZstdCliMissingError) zstdCliMissing = true;
+					safeUnlink(tempPath);
 					logger.warn("Zstd patch failed", { error: String(err) });
+					if (signal?.aborted) throw err;
 				}
 			}
 		}
@@ -679,76 +948,38 @@ export async function downloadUpdate(
 			if (chain && chain.length > 0) {
 				try {
 					logger.info("Using patch chain", { steps: chain.length });
-					let currentBuf: Buffer<ArrayBufferLike> = readFileSync(execPath);
+					let sourcePath = execPath;
 
 					for (let i = 0; i < chain.length; i++) {
 						const step = chain[i];
-						onProgress?.({
-							phase: "downloading",
-							bytesDownloaded: 0,
-							totalBytes: step.patchSize,
-							percent: Math.round((i / chain.length) * 100),
+						const isLast = i === chain.length - 1;
+						const outputPath = isLast ? tempPath : intermediatePaths[i % 2];
+						const meta = await fetchPatchMeta(step.metaUrl, signal);
+						await downloadAndApplyPatchStep({
+							sourcePath,
+							outputPath,
+							stepUrl: step.url,
+							meta,
+							declaredPatchSize: step.patchSize,
+							forceDownload,
+							signal,
+							onProgress,
+							progressBase: (i / chain.length) * 100,
+							progressSpan: (1 / chain.length) * 100,
 						});
-
-						const metaResp = await fetch(step.metaUrl);
-						if (!metaResp.ok) {
-							throw new Error(
-								`Failed to fetch patch meta for step ${i + 1}/${chain.length}: ${metaResp.status}`,
-							);
-						}
-						const meta = (await metaResp.json()) as ZstdPatchMeta;
-
-						const patchResp = await fetch(step.url);
-						if (!patchResp.ok) {
-							throw new Error(
-								`Failed to fetch patch for step ${i + 1}/${chain.length}: ${patchResp.status}`,
-							);
-						}
-						const patchBuf = Buffer.from(await patchResp.arrayBuffer());
-
-						logger.info("Applying patch chain step", {
-							step: `${i + 1}/${chain.length}`,
-							from: step.fromVersion,
-							to: step.toVersion,
-							patchSize: patchBuf.length,
-						});
-
-						onProgress?.({
-							phase: "applying",
-							bytesDownloaded: patchBuf.length,
-							totalBytes: meta.newFileSize,
-							percent: Math.round(((i + 0.5) / chain.length) * 100),
-						});
-
-						let zstdCliPath: string | undefined;
-						if (meta.mode === "patch-from") {
-							const cli = await getZstdCliPath(forceDownload);
-							if (!cli) {
-								zstdCliMissing = true;
-								throw new Error("zstd CLI required for patch-from mode");
-							}
-							zstdCliPath = cli;
-						}
-
-						currentBuf = applyZstdPatch(currentBuf, patchBuf, meta, zstdCliPath);
+						// The previous intermediate is no longer needed once the next one exists.
+						if (sourcePath !== execPath) safeUnlink(sourcePath);
+						sourcePath = outputPath;
 					}
 
-					writeFileSync(tempPath, currentBuf);
 					applied = true;
-
-					onProgress?.({
-						phase: "applying",
-						bytesDownloaded: currentBuf.length,
-						totalBytes: currentBuf.length,
-						percent: 100,
-					});
-
-					logger.info("Patch chain applied successfully", {
-						steps: chain.length,
-						resultSize: currentBuf.length,
-					});
+					logger.info("Patch chain applied successfully", { steps: chain.length });
 				} catch (err) {
+					if (err instanceof ZstdCliMissingError) zstdCliMissing = true;
 					logger.warn("Patch chain failed", { error: String(err) });
+					if (signal?.aborted) throw err;
+				} finally {
+					for (const path of intermediatePaths) safeUnlink(path);
 				}
 			}
 		}
@@ -790,7 +1021,7 @@ export async function downloadUpdate(
 		let finalFileName = releaseFileName;
 
 		if (execPath) {
-			const destination = resolvePreparedBinaryDestination(execPath, releaseInfo);
+			const destination = await resolvePreparedBinaryDestination(execPath, releaseInfo);
 			newBinaryPath = destination.path;
 			finalFileName = destination.fileName;
 			if (destination.alreadyPresent) {
@@ -810,7 +1041,7 @@ export async function downloadUpdate(
 			});
 		} else {
 			// Development mode fallback: keep the rebuilt binary in the update cache.
-			const destination = resolveUpdateCacheDestination(releaseInfo);
+			const destination = await resolveUpdateCacheDestination(releaseInfo);
 			finalUpdatePath = destination.path;
 			finalFileName = destination.fileName;
 			if (destination.alreadyPresent) {
@@ -882,10 +1113,95 @@ async function computeFileSha512(filePath: string): Promise<string> {
 	});
 }
 
-function computeFileSha512Sync(filePath: string): string {
-	const hash = createHash("sha512");
-	hash.update(readFileSync(filePath));
-	return hash.digest("base64");
+interface VerifiedFileFingerprint {
+	sizeBytes: number;
+	mtimeMs: number;
+	sha512: string;
+}
+
+/**
+ * Remembers which (path, size, mtime) fingerprint already hashed to which digest.
+ *
+ * `/api/update/status` is polled roughly once a second while an update is draining, and the
+ * prepared binary is around 100MB. Hashing it on every poll would be a ~100MB read plus a full
+ * SHA-512 on the only JS thread — exactly the wrong thing to do while HTTP, WS and agent traffic
+ * must stay responsive. The digest is therefore computed once per distinct fingerprint; any
+ * change in size or mtime invalidates it and forces a real re-verification.
+ */
+const verifiedFileDigests = new Map<string, VerifiedFileFingerprint>();
+
+interface InFlightFileDigest {
+	sizeBytes: number;
+	mtimeMs: number;
+	promise: Promise<string>;
+}
+
+/**
+ * Verifications currently reading a file, so overlapping callers share one read.
+ *
+ * The cache above only helps once a digest exists. Hashing a ~100MB binary takes longer than the
+ * one-second status poll interval, so the very first verification is still in progress when the
+ * next poll (or a second browser tab, or a concurrent `/apply`) asks the same question. Without
+ * this every one of them would start its own full read of the same file and multiply the I/O the
+ * cache exists to avoid. Sharing is keyed on the fingerprint as well as the path: a different
+ * size or mtime means different bytes, which deserve their own read rather than another caller's
+ * answer about the previous file.
+ */
+const inFlightFileDigests = new Map<string, InFlightFileDigest>();
+
+/** Test seam: counts how often a real hash was computed rather than served from the cache. */
+let verifiedFileDigestComputations = 0;
+
+/** @internal Exported for the status-hash caching test. */
+export function __getVerifiedDigestComputationCount(): number {
+	return verifiedFileDigestComputations;
+}
+
+/** @internal Exported so tests can start from a known cache state. */
+export function __resetVerifiedDigestCacheForTests(): void {
+	verifiedFileDigests.clear();
+	verifiedFileDigestComputations = 0;
+}
+
+async function verifyFileSha512Cached(
+	filePath: string,
+	stat: { size: number; mtimeMs: number },
+	expectedSha512: string,
+): Promise<boolean> {
+	const cached = verifiedFileDigests.get(filePath);
+	if (cached && cached.sizeBytes === stat.size && cached.mtimeMs === stat.mtimeMs) {
+		return cached.sha512 === expectedSha512;
+	}
+
+	const pending = inFlightFileDigests.get(filePath);
+	if (pending && pending.sizeBytes === stat.size && pending.mtimeMs === stat.mtimeMs) {
+		return (await pending.promise) === expectedSha512;
+	}
+
+	verifiedFileDigestComputations++;
+	// Streamed rather than read whole: a failed hash must not leave a stale in-flight entry
+	// behind, or every later caller would await a promise that already rejected.
+	const promise = computeFileSha512(filePath)
+		.then((sha512) => {
+			verifiedFileDigests.set(filePath, {
+				sizeBytes: stat.size,
+				mtimeMs: stat.mtimeMs,
+				sha512,
+			});
+			return sha512;
+		})
+		.finally(() => {
+			if (inFlightFileDigests.get(filePath)?.promise === promise) {
+				inFlightFileDigests.delete(filePath);
+			}
+		});
+	inFlightFileDigests.set(filePath, {
+		sizeBytes: stat.size,
+		mtimeMs: stat.mtimeMs,
+		promise,
+	});
+
+	return (await promise) === expectedSha512;
 }
 
 function writePlacedUpdateInfo(info: PlacedUpdateInfo): void {
@@ -893,7 +1209,9 @@ function writePlacedUpdateInfo(info: PlacedUpdateInfo): void {
 	writeFileSync(PLACED_UPDATE_INFO_PATH, JSON.stringify(info, null, 2));
 }
 
-function readPlacedUpdateInfo(options: { targetVersion?: string } = {}): PlacedUpdateInfo | null {
+async function readPlacedUpdateInfo(
+	options: { targetVersion?: string } = {},
+): Promise<PlacedUpdateInfo | null> {
 	if (!existsSync(PLACED_UPDATE_INFO_PATH)) return null;
 	try {
 		const info = JSON.parse(readFileSync(PLACED_UPDATE_INFO_PATH, "utf8")) as PlacedUpdateInfo;
@@ -917,7 +1235,7 @@ function readPlacedUpdateInfo(options: { targetVersion?: string } = {}): PlacedU
 
 		const stat = statSync(resolvedCandidatePath);
 		if (!stat.isFile() || stat.size !== info.sizeBytes) return null;
-		if (computeFileSha512Sync(resolvedCandidatePath) !== info.sha512) return null;
+		if (!(await verifyFileSha512Cached(resolvedCandidatePath, stat, info.sha512))) return null;
 
 		return {
 			...info,
@@ -962,7 +1280,20 @@ export function getUpdateInstructions(
 }
 
 /**
- * Clean up old update files.
+ * Names in the update directory that age-based cleanup must never touch.
+ *
+ * These are live state, not stale artifacts: the recovery manifest is how a failed or
+ * interrupted update finds its narrators again, and deleting the placed-update record would
+ * leave a perfectly good verified binary on disk while `ready` flips to false, forcing the
+ * user to download it all over again.
+ */
+const CLEANUP_PROTECTED_FILE_NAMES = new Set([
+	RECOVERY_SNAPSHOT_FILE_NAME,
+	PLACED_UPDATE_INFO_FILE_NAME,
+]);
+
+/**
+ * Clean up old update artifacts (stale temp files and superseded binaries).
  */
 export function cleanupOldUpdates(): void {
 	if (!existsSync(UPDATE_DIR)) return;
@@ -972,6 +1303,7 @@ export function cleanupOldUpdates(): void {
 	const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 	for (const file of files) {
+		if (CLEANUP_PROTECTED_FILE_NAMES.has(file)) continue;
 		const filePath = join(UPDATE_DIR, file);
 		try {
 			const stat = statSync(filePath);
@@ -992,17 +1324,25 @@ export function getUpdateDirectory(): string {
 
 /**
  * Check if an update has been downloaded and is ready to apply.
+ *
+ * `instructions` mirrors what the download stream reports on completion, so a client that
+ * reloaded (or opened the dialog in a second tab) can restore the same "run this binary" hint
+ * instead of falling back to a locally reconstructed message.
  */
-export function getUpdateStatus(targetVersion?: string): {
-	ready: boolean;
-	updateFile?: string;
-	canAutoRestart: boolean;
-	newBinaryPath?: string;
-	updatePath?: string;
-	placed?: boolean;
-	version?: string;
-} {
-	const placedInfo = readPlacedUpdateInfo({ targetVersion });
+export async function getUpdateStatus(targetVersion?: string): Promise<
+	UpdateCoordinationStatus & {
+		ready: boolean;
+		updateFile?: string;
+		canAutoRestart: boolean;
+		newBinaryPath?: string;
+		updatePath?: string;
+		placed?: boolean;
+		version?: string;
+		instructions?: ReturnType<typeof getUpdateInstructions>;
+	}
+> {
+	const placedInfo = await readPlacedUpdateInfo({ targetVersion });
+	const artifactPath = placedInfo?.updatePath ?? placedInfo?.newBinaryPath;
 	return {
 		ready: !!placedInfo,
 		updateFile: placedInfo?.fileName,
@@ -1011,6 +1351,9 @@ export function getUpdateStatus(targetVersion?: string): {
 		updatePath: placedInfo?.updatePath,
 		placed: placedInfo?.placed,
 		version: placedInfo?.version,
+		...(artifactPath
+			? { instructions: getUpdateInstructions(artifactPath, placedInfo?.newBinaryPath) }
+			: {}),
 		...getUpdateCoordinationStatus(),
 	};
 }
@@ -1030,7 +1373,7 @@ function moveFileNoOverwriteSync(src: string, dst: string): void {
  * The replacement process is spawned after background Bash drains, ordinary tools
  * quiesce, and the recovery snapshot is persisted.
  */
-export function applyUpdate(options: { targetVersion?: string } = {}): {
+export async function applyUpdate(options: { targetVersion?: string } = {}): Promise<{
 	success: boolean;
 	error?: string;
 	/** Stable code for the fixed pre-flight failures so clients can localize them. */
@@ -1047,13 +1390,13 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 	pausedToolCount?: number;
 	replacementPid?: number;
 	drainStartedAt?: string;
-} {
+}> {
 	const execPath = getCurrentExecutablePath();
 	if (!execPath) {
 		return { success: false, error: "Not running as compiled binary", code: "NOT_COMPILED_BINARY" };
 	}
 
-	const placedInfo = readPlacedUpdateInfo({ targetVersion: options.targetVersion });
+	const placedInfo = await readPlacedUpdateInfo({ targetVersion: options.targetVersion });
 	const newExecPath = placedInfo?.newBinaryPath ?? placedInfo?.updatePath;
 	if (!placedInfo || !newExecPath) {
 		return {
@@ -1103,11 +1446,12 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 		targetVersion: placedInfo.version,
 		updateEpoch,
 	}).catch((error) => {
-		const message = error instanceof Error ? error.message : String(error);
+		const cancelled = error instanceof UpdateCancelledError;
 		runFailedUpdateCleanup({
 			updateEpoch,
 			targetVersion: placedInfo.version,
-			error: message,
+			error: error instanceof Error ? error.message : String(error),
+			cancelled,
 		});
 	});
 
@@ -1168,6 +1512,8 @@ export async function failPreparedUpdateAttempt(options: {
 	updateEpoch: string;
 	targetVersion: string;
 	error: string;
+	/** Operator-initiated abandonment rather than a genuine failure. */
+	cancelled?: boolean;
 }): Promise<void> {
 	const current = getUpdateCoordinationStatus();
 	if (current.updateEpoch !== options.updateEpoch) {
@@ -1190,12 +1536,25 @@ export async function failPreparedUpdateAttempt(options: {
 			cancelledCount,
 		});
 	} catch (error) {
-		logger.error("Failed to cancel planned-update continuations; keeping recovery gate closed", {
+		const cancelError = error instanceof Error ? error.message : String(error);
+		logger.error("Failed to cancel planned-update continuations; preserving recovery evidence", {
 			updateEpoch: options.updateEpoch,
 			updateError: options.error,
-			cancelError: error instanceof Error ? error.message : String(error),
+			cancelError,
 		});
+		// Keep the manifest: it is what a later recovery pass (or the next startup) needs to find
+		// the affected narrators again. But do not also freeze the coordinator. Leaving the phase
+		// at quiescing_tools/restarting means openUpdateGate() never runs, so every subsequent tool
+		// call blocks forever in waitUntilUpdateGateOpens with no escape hatch left — cancel only
+		// sets a flag, and the orchestration promise has already settled. Recovery evidence lives in
+		// the manifest, not in a stuck phase.
 		preserveFailedUpdateRecoveryEvidence(options);
+		const stillOurs = getUpdateCoordinationStatus();
+		if (stillOurs.updateEpoch === options.updateEpoch) {
+			failScheduledUpdate(`${options.error} (continuation cleanup failed: ${cancelError})`, {
+				cancelled: options.cancelled,
+			});
+		}
 		return;
 	}
 
@@ -1212,13 +1571,14 @@ export async function failPreparedUpdateAttempt(options: {
 	// this atomic (no consume-then-delete TOCTOU): a manifest owned by a different/newer epoch is
 	// preserved for its owner.
 	removePlannedUpdateRecoverySnapshot({ expectedEpoch: options.updateEpoch });
-	failScheduledUpdate(options.error);
+	failScheduledUpdate(options.error, { cancelled: options.cancelled });
 }
 
 function runFailedUpdateCleanup(options: {
 	updateEpoch: string;
 	targetVersion: string;
 	error: string;
+	cancelled?: boolean;
 }): void {
 	void failPreparedUpdateAttempt(options).catch((error) => {
 		logger.error("Unexpected prepared-update failure cleanup error", {
@@ -1226,6 +1586,32 @@ function runFailedUpdateCleanup(options: {
 			error: error instanceof Error ? error.message : String(error),
 		});
 	});
+}
+
+/**
+ * Abandon the scheduled update on operator request.
+ *
+ * The coordination waits are unbounded, so this is the only way to get out of a restart that
+ * is blocked behind long-running narrator work. Cleanup reuses the ordinary failure path:
+ * continuations for this epoch are cancelled, the recovery manifest is removed, and the tool
+ * gate reopens so paused work resumes. The prepared binary stays in place, so the update can
+ * be scheduled again later.
+ */
+export function cancelPreparedUpdate(reason?: string): {
+	cancelled: boolean;
+	status: UpdateCoordinationStatus;
+} {
+	const before = getUpdateCoordinationStatus();
+	if (!before.scheduled || !before.updateEpoch) {
+		return { cancelled: false, status: before };
+	}
+	// Cancelling during `restarting` would leave the already-spawned replacement racing this
+	// process for the same port and handoff; let the handoff watchdog resolve that instead.
+	if (before.phase === "restarting") {
+		return { cancelled: false, status: before };
+	}
+	cancelScheduledUpdate(reason);
+	return { cancelled: true, status: getUpdateCoordinationStatus() };
 }
 
 export interface PlannedUpdateCheckpointHooks {
@@ -1262,9 +1648,7 @@ export async function checkpointPreparedUpdateFence(
 	updateEpoch: string,
 	hooks: PlannedUpdateCheckpointHooks = {},
 ): Promise<PlannedUpdateRecoverySnapshot> {
-	const waitForFence =
-		hooks.waitForFence ??
-		(() => waitForUpdateCheckpointFence({ timeoutMs: CHECKPOINT_FENCE_TIMEOUT_MS }));
+	const waitForFence = hooks.waitForFence ?? waitForUpdateCheckpointFence;
 	const checkpoint = hooks.checkpoint ?? checkpointPlannedUpdateContinuations;
 	const loadActiveToolCallIds = hooks.listActiveToolCallIds ?? listActiveToolCallIds;
 	const loadCoveredToolCallIds =
@@ -1277,6 +1661,9 @@ export async function checkpointPreparedUpdateFence(
 	let snapshot: PlannedUpdateRecoverySnapshot | null = null;
 	for (let round = 1; round <= CHECKPOINT_MAX_ROUNDS; round++) {
 		await waitForFence();
+		// Persisting continuations is observable work; do not start another round once the
+		// operator asked to abandon this update.
+		assertUpdateNotCancelled();
 		snapshot = await checkpoint();
 		if (snapshot.updateEpoch !== updateEpoch) {
 			throw new Error("Planned-update recovery snapshot epoch changed during checkpoint");
@@ -1325,9 +1712,13 @@ async function drainAndSpawnPreparedUpdate(options: {
 	updateEpoch: string;
 }): Promise<void> {
 	await waitForBackgroundBashDrain();
+	assertUpdateNotCancelled();
 	beginQuiescingTools();
 	await waitForOrdinaryToolDrain();
 	const recoverySnapshot = await checkpointPreparedUpdateFence(options.updateEpoch);
+	// Last cancellation checkpoint before the two irreversible steps: writing the recovery
+	// manifest and spawning the replacement process.
+	assertUpdateNotCancelled();
 	writePlannedUpdateRecoverySnapshot(recoverySnapshot);
 	markUpdateRestarting();
 

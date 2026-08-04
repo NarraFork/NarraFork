@@ -22,23 +22,21 @@ import {
 	IconPower,
 	IconX,
 } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform, useUpdateCapability } from "../hooks/usePlatform";
 import {
 	type UpdateDownloadResult,
-	type UpdateInstructions,
 	useUpdateApply,
 	useUpdateDownload,
 } from "../hooks/useUpdateCheck";
+import { useUpdateScheduleStatus } from "../hooks/useUpdateSchedule";
 import { api } from "../lib/api";
 import { normalizeLanguage } from "../lib/i18n";
 import { formatLocaleDate } from "../lib/intl-format";
 import {
 	resolveUpdateCoordinationCounts,
 	shouldShowUpdateScheduleButton,
-	type UpdateCoordinationPhase,
 } from "../lib/update-state";
 import { CopyButton } from "./common/CopyButton";
 import { MarkdownContent } from "./narrator/MarkdownContent";
@@ -96,30 +94,6 @@ export interface UpdateModalProps {
 	data: UpdateModalData;
 }
 
-type PreparedUpdateStatus = {
-	ready: boolean;
-	updateFile?: string;
-	canAutoRestart: boolean;
-	newBinaryPath?: string;
-	updatePath?: string;
-	artifactPath?: string;
-	directory?: string;
-	placed?: boolean;
-	version?: string;
-	phase?: UpdateCoordinationPhase;
-	scheduled?: boolean;
-	targetVersion?: string;
-	pendingExecutionCount?: number;
-	pendingBackgroundBashCount?: number;
-	pendingOrdinaryExecutionCount?: number;
-	resumableExecutionCount?: number;
-	pausedToolCount?: number;
-	error?: string;
-	selfUpdateAvailable?: boolean;
-	manualOnly?: boolean;
-	instructions?: UpdateInstructions;
-};
-
 export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const { t, i18n } = useTranslation("common");
 	const { download, cancel, reset, progress, result, isDownloading } = useUpdateDownload();
@@ -129,6 +103,8 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	);
 	const [applyAttemptStartedAt, setApplyAttemptStartedAt] = useState<number | null>(null);
 	const [restartWaitError, setRestartWaitError] = useState<string | null>(null);
+	const [cancelError, setCancelError] = useState<string | null>(null);
+	const [isCancellingSchedule, setIsCancellingSchedule] = useState(false);
 	const updateCapability = useUpdateCapability();
 	const platform = usePlatform();
 	const downloadAvailable = updateCapability.download.supported && updateCapability.download.sse;
@@ -165,19 +141,11 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		dataUpdatedAt: preparedStatusUpdatedAt,
 		isLoading: isCheckingPreparedStatus,
 		refetch: refetchPreparedStatus,
-	} = useQuery({
-		queryKey: ["update-status", targetVersion],
-		queryFn: () => api.getUpdateStatus(targetVersion),
-		enabled: !!targetVersion && (opened || applyResult?.scheduled === true),
-		staleTime: 0,
-		refetchInterval: (query) => {
-			const status = query.state.data as PreparedUpdateStatus | undefined;
-			const statusErrorIsCurrent =
-				!!status?.error &&
-				(applyAttemptStartedAt === null || query.state.dataUpdatedAt >= applyAttemptStartedAt);
-			if (statusErrorIsCurrent && !status?.scheduled) return false;
-			return applyResult?.scheduled === true || status?.scheduled === true ? 1000 : false;
-		},
+	} = useUpdateScheduleStatus({
+		targetVersion,
+		enabled: opened || applyResult?.scheduled === true,
+		errorSinceMs: applyAttemptStartedAt,
+		assumeScheduled: applyResult?.scheduled === true,
 	});
 
 	const handleDownload = (options?: { retry?: boolean }) => {
@@ -230,9 +198,32 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		reset();
 	};
 
+	/**
+	 * Abandon a scheduled update that is still waiting for narrator work. The server keeps the
+	 * prepared binary, so the schedule button comes back and the update can be retried later.
+	 */
+	const handleCancelSchedule = async () => {
+		setIsCancellingSchedule(true);
+		setCancelError(null);
+		try {
+			await api.cancelUpdate();
+			restartWaitRef.current?.controller.abort();
+			restartWaitRef.current = null;
+			setRestartWaitError(null);
+			await refetchPreparedStatus();
+		} catch (error) {
+			// This is a plain call rather than a mutation, so the global mutation error toast never
+			// fires. Without an explicit message the button would just spin and return to normal,
+			// leaving the user to believe a cancellation happened that never did.
+			setCancelError(error instanceof Error ? error.message : String(error));
+		} finally {
+			setIsCancellingSchedule(false);
+		}
+	};
+
 	const savingsPercent =
 		downloadSize && totalSize ? Math.round((1 - downloadSize / totalSize) * 100) : 0;
-	const preparedStatusDetails = preparedStatus as PreparedUpdateStatus | undefined;
+	const preparedStatusDetails = preparedStatus;
 	const preparedStatusMatches =
 		preparedStatusDetails?.ready &&
 		!!targetVersion &&
@@ -244,17 +235,10 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					success: true,
 					version: preparedStatusDetails.version,
 					ready: preparedStatusDetails.ready,
-					updatePath:
-						preparedStatusDetails.updatePath ??
-						preparedStatusDetails.newBinaryPath ??
-						preparedStatusDetails.artifactPath,
-					artifactPath: preparedStatusDetails.artifactPath,
+					updatePath: preparedStatusDetails.updatePath ?? preparedStatusDetails.newBinaryPath,
 					newBinaryPath: preparedStatusDetails.newBinaryPath,
-					directory: preparedStatusDetails.directory,
 					placed: preparedStatusDetails.placed,
-					selfUpdateAvailable: preparedStatusDetails.selfUpdateAvailable,
 					canAutoRestart: preparedStatusDetails.canAutoRestart,
-					manualOnly: preparedStatusDetails.manualOnly,
 					phase: preparedStatusDetails.phase,
 					scheduled: preparedStatusDetails.scheduled,
 					targetVersion: preparedStatusDetails.targetVersion,
@@ -282,8 +266,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		effectiveResult?.instructions?.newBinaryPath ??
 		effectiveResult?.newBinaryPath ??
 		effectiveResult?.instructions?.updatePath ??
-		effectiveResult?.updatePath ??
-		effectiveResult?.artifactPath;
+		effectiveResult?.updatePath;
 	const preparedCommand =
 		effectiveResult?.instructions?.command ??
 		(preparedBinaryPath ? `"${preparedBinaryPath}"` : undefined);
@@ -296,6 +279,10 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		!!preparedStatusDetails?.error &&
 		(applyAttemptStartedAt === null || preparedStatusUpdatedAt >= applyAttemptStartedAt);
 	const coordinationFailed = statusErrorIsCurrent && preparedStatusDetails?.scheduled !== true;
+	// An operator cancellation lands in the same error field as a genuine failure, but it is an
+	// expected outcome rather than something that went wrong.
+	const coordinationCancelled =
+		coordinationFailed && preparedStatusDetails?.errorKind === "cancelled";
 	const updateScheduled = coordinationFailed
 		? false
 		: applyResult?.scheduled === true || preparedStatusDetails?.scheduled === true;
@@ -312,6 +299,8 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		resumableExecutionCount,
 		pausedToolCount,
 	} = resolveUpdateCoordinationCounts(coordinationCountsSource);
+	const waitBlockers = updateScheduled ? (preparedStatusDetails?.blockers ?? []) : [];
+	const cancelRequested = updateScheduled && preparedStatusDetails?.cancelRequested === true;
 	const canRestartIntoUpdate =
 		autoApplyAvailable &&
 		!updateScheduled &&
@@ -337,6 +326,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const isZstdMissing = rawDownloadError === "ZSTD_CLI_MISSING";
 	const downloadError = isZstdMissing ? null : rawDownloadError;
 	const applyError =
+		cancelError ??
 		restartWaitError ??
 		(applyResult && !applyResult.success ? applyResult.error : null) ??
 		(statusErrorIsCurrent ? preparedStatusDetails?.error : null) ??
@@ -644,12 +634,61 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 								{t("updateResumableExecutions", { count: resumableExecutionCount })}
 							</Alert>
 						)}
+
+						{updateScheduled && !restartStarted && (
+							<Stack gap="xs">
+								{waitBlockers.length > 0 && (
+									<Stack gap={2}>
+										<Text size="xs" c="dimmed">
+											{t("updateWaitBlockersTitle")}
+										</Text>
+										{waitBlockers.slice(0, 5).map((blocker) => (
+											<Text
+												key={`${blocker.kind}-${blocker.narratorId ?? ""}-${blocker.toolUseId ?? ""}`}
+												size="xs"
+												c="dimmed"
+											>
+												{t(`updateWaitBlocker_${blocker.kind}`, {
+													seconds: Math.round(blocker.waitingMs / 1000),
+												})}
+											</Text>
+										))}
+									</Stack>
+								)}
+								<Text size="xs" c="dimmed">
+									{t("updateNoWaitDeadline")}
+								</Text>
+								<Button
+									variant="subtle"
+									color="red"
+									size="compact-sm"
+									leftSection={<IconX size={14} />}
+									onClick={handleCancelSchedule}
+									loading={isCancellingSchedule}
+									disabled={cancelRequested}
+								>
+									{cancelRequested ? t("updateCancellingSchedule") : t("updateCancelSchedule")}
+								</Button>
+							</Stack>
+						)}
 					</Stack>
 				)}
 
 				{applyError && (
-					<Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />}>
-						<Text size="sm">{applyError}</Text>
+					<Alert
+						color={coordinationCancelled && !cancelError ? "gray" : "red"}
+						variant="light"
+						icon={
+							coordinationCancelled && !cancelError ? (
+								<IconClock size={16} />
+							) : (
+								<IconAlertTriangle size={16} />
+							)
+						}
+					>
+						<Text size="sm">
+							{coordinationCancelled && !cancelError ? t("updateScheduleCancelled") : applyError}
+						</Text>
 					</Alert>
 				)}
 

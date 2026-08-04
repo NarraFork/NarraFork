@@ -26,6 +26,7 @@
  * titles) flow through the adapter instead, where they are measured.
  */
 
+import type { ToolShimmerKind } from "@shared/tool-shimmer";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -158,8 +159,19 @@ export interface VListRenderLabels {
 	trace: {
 		hideEarlier: string;
 		showEarlier: (hiddenCount: number) => string;
+		/** Size prefix of a live reasoning row's scrolling tail ("1234 字符"). */
+		liveTailChars: (formatted: string) => string;
 		/** Per-row timing popover (a folded row shows its own duration). */
 		timing: VListTimingLabels;
+		/**
+		 * One name per shimmer state, for a reader who does not receive the colour.
+		 *
+		 * The five shimmer states are carried by COLOUR ALONE, which reaches neither a
+		 * screen reader nor a colour-blind reader — and success/failure is exactly the
+		 * pair where that matters. Rendered as `title` + `aria-label` attributes, so
+		 * this stays height-neutral.
+		 */
+		shimmerState: Record<ToolShimmerKind, string>;
 	};
 	subagent: {
 		recentCalls: string;
@@ -442,9 +454,21 @@ export function useVListLabels(): VListLabels {
 			trace: {
 				hideEarlier: t("reasoningHideEarlier"),
 				showEarlier: (hiddenCount: number) => t("reasoningShowEarlier", { count: hiddenCount }),
+				// Size prefix of a live reasoning row's scrolling tail. Reuses the same
+				// `reasoningChars` string the L3+ collapsed reasoning header shows, so one
+				// concept is worded identically at every level.
+				liveTailChars: (formatted: string) => t("reasoningChars", { formatted }),
 				// Same bundle the tool card and the subagent card use: a folded row now
 				// carries its own duration + lifecycle popover.
 				timing,
+				// Names for the five shimmer states, so the row's state is not colour-only.
+				shimmerState: {
+					streaming: t("traceRowState.streaming"),
+					reflecting: t("traceRowState.reflecting"),
+					running: t("traceRowState.running"),
+					success: t("traceRowState.success"),
+					failed: t("traceRowState.failed"),
+				},
 			},
 			subagent: {
 				recentCalls: t("subagentRecentCalls"),

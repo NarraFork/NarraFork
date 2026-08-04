@@ -5,13 +5,15 @@ import {
 	encodeUsageHistoryCursor,
 	type UsageHistoryCursor,
 } from "@server/lib/usage-history-cursor";
-import { and, desc, eq, gte, like, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, lte, or, sql } from "drizzle-orm";
 
 export interface UsageHistoryFilters {
 	narratorId?: string;
 	chapterId?: string;
 	projectId?: string;
 	provider?: string;
+	/** Exact credential id — narrows history to one account in a provider pool. */
+	credentialId?: string;
 	model?: string;
 	kind?: string;
 	startDate?: string;
@@ -93,6 +95,22 @@ function parseDateOrNull(value: string | undefined): Date | null {
 	if (!value) return null;
 	const date = new Date(value);
 	return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/** Longest model substring we will match on. Model ids are far shorter. */
+const MODEL_FILTER_MAX_LENGTH = 128;
+
+/**
+ * Normalize a model filter into a safe LIKE needle.
+ *
+ * Escapes the LIKE wildcards so a `%` typed by the user narrows nothing
+ * unexpectedly, and caps the length so the per-row comparison stays cheap on a
+ * filter that is already known to scan (see buildWhereConditions).
+ */
+function normalizeModelFilter(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed) return undefined;
+	return trimmed.slice(0, MODEL_FILTER_MAX_LENGTH).replace(/[\\%_]/g, (ch) => `\\${ch}`);
 }
 
 function normalizeToBucketStart(date: Date, granularity: UsageHistoryGranularity): Date {
@@ -317,7 +335,7 @@ export class UsageHistoryService {
 	}
 
 	async listProviders(): Promise<string[]> {
-		const rows = await db
+		const rows = await this.database
 			.select({ provider: apiRequests.provider })
 			.from(apiRequests)
 			.where(sql`${apiRequests.provider} is not null and trim(${apiRequests.provider}) <> ''`)
@@ -462,7 +480,7 @@ export class UsageHistoryService {
 	async getUsageStats(filters: UsageHistoryFilters): Promise<UsageHistoryStats> {
 		const conditions = this.buildWhereConditions(filters);
 
-		const [stats] = await db
+		const [stats] = await this.database
 			.select({
 				totalRequests: sql<number>`count(*)`,
 				totalInputTokens: sql<number>`coalesce(sum(${apiRequests.inputTokens}), 0)`,
@@ -518,7 +536,7 @@ export class UsageHistoryService {
 		});
 		const bucket = getBucketExpression(granularity);
 
-		const rows = await db
+		const rows = await this.database
 			.select({
 				bucket,
 				requestCount: sql<number>`count(*)`,
@@ -592,7 +610,7 @@ export class UsageHistoryService {
 	}
 
 	async getUsageRecord(id: string): Promise<UsageHistoryRecord | null> {
-		const [record] = await db
+		const [record] = await this.database
 			.select({
 				id: apiRequests.id,
 				narratorId: apiRequests.narratorId,
@@ -647,8 +665,9 @@ export class UsageHistoryService {
 	private buildWhereConditions(filters: UsageHistoryFilters) {
 		const conditions = [];
 		const provider = filters.provider?.trim();
-		const model = filters.model?.trim();
+		const model = normalizeModelFilter(filters.model);
 		const kind = filters.kind?.trim();
+		const credentialId = filters.credentialId?.trim();
 
 		if (filters.narratorId) {
 			conditions.push(
@@ -663,8 +682,25 @@ export class UsageHistoryService {
 		if (filters.chapterId) conditions.push(eq(narrators.chapterId, filters.chapterId));
 		if (filters.projectId) conditions.push(eq(chapters.projectId, filters.projectId));
 		if (provider) conditions.push(eq(apiRequests.provider, provider));
+		// Exact match, backed by idx_api_requests_credential: credential ids are
+		// opaque nanoids, so a LIKE here would only buy a table scan.
+		if (credentialId) conditions.push(eq(apiRequests.credentialId, credentialId));
 		if (kind) conditions.push(eq(apiRequests.kind, kind));
-		if (model) conditions.push(like(apiRequests.model, `%${model}%`));
+		// KNOWN SCAN: substring matching cannot use idx_api_requests_provider, so a
+		// model filter reads every candidate row. Kept as a substring because the UI
+		// exposes it as a free-text box ("Filter by model") and users rely on partial
+		// names like "codex" or "mini"; switching to a prefix would silently change
+		// what their saved filters return.
+		//
+		// It is bounded in practice: this filter is only reachable from the admin
+		// usage-history page, every caller of buildWhereConditions applies a LIMIT
+		// (page/cursor pagination) or aggregates into a fixed number of buckets, and
+		// the pattern is length-capped above so a pathological input cannot make the
+		// per-row comparison expensive. Escaped for LIKE so `%`/`_` in the input
+		// cannot widen the match beyond what the user typed.
+		if (model) {
+			conditions.push(sql`${apiRequests.model} LIKE ${`%${model}%`} ESCAPE '\\'`);
+		}
 		if (filters.startDate) conditions.push(gte(apiRequests.createdAt, filters.startDate));
 		if (filters.endDate) conditions.push(lte(apiRequests.createdAt, filters.endDate));
 

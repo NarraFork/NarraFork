@@ -29,6 +29,13 @@ import {
 	stringifyForDisplay,
 } from "@shared/pretext-layout/tool-io-projection";
 import {
+	CARD_SHIMMER_CLASS,
+	resolveToolShimmerFlash,
+	resolveToolShimmerOutcome,
+	resolveToolShimmerPhase,
+	type ToolShimmerFlash,
+} from "@shared/tool-shimmer";
+import {
 	IconArrowBackUp,
 	IconBan,
 	IconBook,
@@ -1777,23 +1784,32 @@ export function ReflectionNotice({
 		}
 	};
 
+	// A RUNNING gate is TEAL throughout — notice, title, icon and takeover button.
+	//
+	// It used to be yellow, which said the wrong thing twice: yellow is this app's
+	// "awaiting a human" colour (the `pending` status, the permission border), and a
+	// running gate is the opposite — the machine is deliberating and the user has
+	// nothing to do yet. It also disagreed with the card's own shimmer. Teal is the one
+	// hue no other tool state claims (grape = reasoning, blue = executing, green/red =
+	// outcomes, orange = cancelled), so the whole reflecting state now speaks with one
+	// voice. Resolved states keep their outcome colours below.
 	const noticeStyle: React.CSSProperties = {
 		marginTop: "var(--mantine-spacing-xs)",
 		background: running
-			? "light-dark(color-mix(in srgb, var(--mantine-color-yellow-0) 88%, white), color-mix(in srgb, var(--mantine-color-yellow-9) 34%, transparent))"
+			? "light-dark(color-mix(in srgb, var(--mantine-color-orange-0) 88%, white), color-mix(in srgb, var(--mantine-color-orange-9) 34%, transparent))"
 			: "light-dark(color-mix(in srgb, var(--mantine-color-gray-0) 88%, white), color-mix(in srgb, var(--mantine-color-dark-5) 52%, transparent))",
 		borderColor: running
-			? "light-dark(var(--mantine-color-yellow-3), color-mix(in srgb, var(--mantine-color-yellow-6) 45%, transparent))"
+			? "light-dark(var(--mantine-color-orange-3), color-mix(in srgb, var(--mantine-color-orange-6) 45%, transparent))"
 			: "var(--mantine-color-default-border)",
 	};
 	const titleColor = running
-		? "light-dark(var(--mantine-color-yellow-9), var(--mantine-color-yellow-2))"
+		? "light-dark(var(--mantine-color-orange-9), var(--mantine-color-orange-2))"
 		: "var(--mantine-color-text)";
 	const summaryColor = running
-		? "light-dark(var(--mantine-color-yellow-9), var(--mantine-color-yellow-1))"
+		? "light-dark(var(--mantine-color-orange-9), var(--mantine-color-orange-1))"
 		: "var(--mantine-color-dimmed)";
 	const iconColor = running
-		? "yellow"
+		? "orange"
 		: reflection.status === "confirmed"
 			? "green"
 			: reflection.status === "cancelled"
@@ -1801,8 +1817,12 @@ export function ReflectionNotice({
 				: reflection.status === "aborted"
 					? "orange"
 					: "gray";
+	// A running gate shows a SHIELD, not a spinner. The gate's defining property is that
+	// the user may step in (approve, reject, take over manually), and a spinner says the
+	// opposite — "wait, nothing for you here". The shield is also the shape this state
+	// carries in the sidebar, so the two surfaces agree (see `StatusShape`).
 	const icon = running ? (
-		<IconLoader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
+		<IconShield size={14} />
 	) : reflection.status === "confirmed" ? (
 		<IconCheck size={14} />
 	) : reflection.status === "cancelled" ? (
@@ -1844,7 +1864,7 @@ export function ReflectionNotice({
 							<Button
 								size="xs"
 								variant="light"
-								color="yellow"
+								color="orange"
 								leftSection={<IconPlayerStop size={12} />}
 								loading={takingOver}
 								onClick={handleTakeOver}
@@ -2854,7 +2874,7 @@ function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
 				</Text>
 			)}
 			{mode && (
-				<Badge size="xs" variant="light" color="teal" mt={4}>
+				<Badge size="xs" variant="light" color="orange" mt={4}>
 					{mode}
 				</Badge>
 			)}
@@ -3171,7 +3191,7 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 								</Badge>
 							)}
 							{preview && previewType && previewSupported && (
-								<Badge size="xs" variant="light" color="teal">
+								<Badge size="xs" variant="light" color="orange">
 									{t("shareFile.preview")}
 								</Badge>
 							)}
@@ -3539,7 +3559,7 @@ function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
 		<Box mt="xs">
 			<Group gap={6} mb={4}>
 				{action && (
-					<Badge size="xs" variant="light" color="teal">
+					<Badge size="xs" variant="light" color="orange">
 						{action}
 					</Badge>
 				)}
@@ -5398,12 +5418,16 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// Streaming tool chunks (still being generated) — not expandable
 	const isStreaming = toolCall.inputJson?._streamingChars != null;
 
-	// --- Green shimmer on running → success transition ---
-	// prevStatusRef starts as null so we can detect the *mount* case: when the
-	// streaming synthetic message is replaced by the real assistant message the
-	// outer container key changes, React mounts a fresh ToolCallCard whose
-	// initial status is already "success".  For non-truncated data this means
-	// the tool just finished, so we should still play the shimmer.
+	// --- One-shot outcome sweep on in-flight → settled (green success / red failure) ---
+	// The colour mapping and the transition rule come from `@shared/tool-shimmer`, so
+	// this card cannot disagree with the vlist card or either folded-row path.
+	//
+	// What stays LOCAL is the fresh-mount allowance, which the shared rule
+	// deliberately refuses: prevStatusRef starts as null so we can detect the *mount*
+	// case: when the streaming synthetic message is replaced by the real assistant
+	// message the outer container key changes, React mounts a fresh ToolCallCard whose
+	// initial status is already "success".  For non-truncated data this means the tool
+	// just finished, so we should still play the sweep.
 	//
 	// Guard against narrator-switch remounts: when the user switches narrators
 	// all cards remount with prev=null.  We distinguish "just finished in the
@@ -5415,30 +5439,40 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// finished less than 2 s ago to cover edge cases.
 	const isTruncated = hasTruncatedData(toolCall);
 	const prevStatusRef = useRef<string | null>(null);
-	const [doneShimmer, setDoneShimmer] = useState(false);
+	const [outcomeFlash, setOutcomeFlash] = useState<ToolShimmerFlash | null>(null);
 	useEffect(() => {
 		const prev = prevStatusRef.current;
 		prevStatusRef.current = toolCall.status;
-		const wasRunning = prev === "running" || prev === "pending" || prev === "initializing";
 		let freshMount = prev === null && !isTruncated;
 		if (freshMount) {
 			if (toolCall.startedAt == null) {
 				// No startedAt → loaded from history or real-message replacement,
-				// the shimmer was already played on the streaming card (if any).
+				// the sweep was already played on the streaming card (if any).
 				freshMount = false;
 			} else if (toolCall.durationMs != null) {
-				// Has timing info — only shimmer if finished within the last 2 s.
+				// Has timing info — only sweep if finished within the last 2 s.
 				const finishedAt = toolCall.startedAt + toolCall.durationMs;
 				if (Date.now() - finishedAt > 2000) {
 					freshMount = false;
 				}
 			}
 		}
-		if (toolCall.status === "success" && (wasRunning || freshMount)) {
-			setDoneShimmer(true);
-			const timer = setTimeout(() => setDoneShimmer(false), 650);
-			return () => clearTimeout(timer);
+		// A real transition, or a mount this card has independent evidence for.
+		const next = freshMount
+			? resolveToolShimmerOutcome(toolCall.status)
+			: resolveToolShimmerFlash(prev, toolCall.status);
+		// ⚠️ A transition with no flash CLEARS the stored one; it must not just bail.
+		// The 650ms timer is torn down by this effect's own cleanup, so a flash that
+		// `shimmerPhase` outranked (a retry inside the window: running → fail →
+		// running) survived and replayed on the NEXT quiet status — a red sweep on
+		// `cancelled`, which must never flash, or a green one while awaiting approval.
+		if (!next) {
+			setOutcomeFlash(null);
+			return;
 		}
+		setOutcomeFlash(next);
+		const timer = setTimeout(() => setOutcomeFlash(null), 650);
+		return () => clearTimeout(timer);
 	}, [toolCall.status, toolCall.startedAt, toolCall.durationMs, isTruncated]);
 	// Auto-expand: permission pending, todo tools, or edit tools.
 	// Failed Edit cards auto-expand so the user can see the failure reason.
@@ -5895,13 +5929,22 @@ export const ToolCallCard = memo(function ToolCallCard({
 			: null;
 	const effectivePlanPreviewOverride = editPlanPreviewOverride ?? pendingPlanFallback;
 
-	const shimmerClass = isStreaming
-		? "tool-card-shimmer"
-		: doneShimmer
-			? "tool-done-shimmer"
-			: isRunning && !pendingPermission
-				? "tool-running-shimmer"
-				: undefined;
+	// Five states, one shared rule (`@shared/tool-shimmer`). `reflection?.status` is
+	// what turns a deliberating gate PURPLE: a gate parks its tool at `pending`, so
+	// the old status-first chain painted it blue — claiming execution that had not
+	// begun. A live phase outranks the closing flash, so a retry resuming inside the
+	// flash window shows its current activity rather than the previous outcome.
+	const shimmerPhase = resolveToolShimmerPhase({
+		isStreaming,
+		status: toolCall.status,
+		reflectionStatus: reflection?.status ?? null,
+		hasPendingPermission: !!pendingPermission,
+	});
+	const shimmerClass = shimmerPhase
+		? CARD_SHIMMER_CLASS[shimmerPhase]
+		: outcomeFlash
+			? CARD_SHIMMER_CLASS[outcomeFlash]
+			: undefined;
 
 	const hasStreamingDetail =
 		isStreaming &&
@@ -6209,81 +6252,21 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 	);
 });
 
-// CSS keyframes — inject once
+// CSS keyframes — inject once.
+//
+// ⚠️ The card SHIMMER rules used to live here too (`tool-card-shimmer` /
+// `tool-running-shimmer` / `tool-done-shimmer`). They now live in
+// `frontend/styles/card-shimmer.css` (loaded by main.tsx) as five states resolved
+// through CARD_SHIMMER_CLASS, because the vlist card path needs the same rules and
+// cannot import this module — two private copies is exactly how both paths ended up
+// missing the purple and red states. Only `spin` remains: it is a plain rotation
+// used by this path's status glyphs, not part of the shimmer family.
 if (typeof document !== "undefined") {
 	const id = "tool-call-spin";
 	if (!document.getElementById(id)) {
 		const style = document.createElement("style");
 		style.id = id;
-		style.textContent = `
-@keyframes spin { to { transform: rotate(360deg) } }
-@keyframes tool-shimmer { to { transform: translateX(100%) } }
-@keyframes tool-running-shimmer { from { transform: translateX(-100%) } to { transform: translateX(100%) } }
-@keyframes tool-done-shimmer { from { transform: translateX(100%) } to { transform: translateX(-100%) } }
-.tool-card-shimmer {
-  position: relative;
-  overflow: hidden;
-}
-.tool-card-shimmer::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  transform: translateX(-100%);
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    light-dark(rgba(0,0,0,.04), rgba(255,255,255,.04)) 40%,
-    light-dark(rgba(0,0,0,.07), rgba(255,255,255,.07)) 50%,
-    light-dark(rgba(0,0,0,.04), rgba(255,255,255,.04)) 60%,
-    transparent 100%
-  );
-  animation: tool-shimmer 2s ease-in-out infinite;
-  pointer-events: none;
-}
-.tool-running-shimmer {
-  position: relative;
-  overflow: hidden;
-}
-.tool-running-shimmer::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  transform: translateX(-100%);
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    rgba(77,171,247,.06) 30%,
-    rgba(77,171,247,.13) 50%,
-    rgba(77,171,247,.06) 70%,
-    transparent 100%
-  );
-  animation: tool-running-shimmer 2s ease-in-out infinite;
-  pointer-events: none;
-}
-.tool-done-shimmer {
-  position: relative;
-  overflow: hidden;
-}
-.tool-done-shimmer::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  transform: translateX(100%);
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    rgba(64,192,87,.06) 30%,
-    rgba(64,192,87,.13) 50%,
-    rgba(64,192,87,.06) 70%,
-    transparent 100%
-  );
-  animation: tool-done-shimmer 600ms ease-out forwards;
-  pointer-events: none;
-}
-@media (prefers-reduced-motion: reduce) {
-  .tool-running-shimmer::after { animation: none; }
-  .tool-done-shimmer::after { animation: none; }
-}`;
+		style.textContent = `@keyframes spin { to { transform: rotate(360deg) } }`;
 		document.head.appendChild(style);
 	}
 }

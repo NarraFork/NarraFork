@@ -2,6 +2,10 @@ import { ValidationError } from "@server/lib/errors";
 import { decodeUsageHistoryCursor } from "@server/lib/usage-history-cursor";
 import { requireAdmin, requireAuth } from "@server/middleware/auth";
 import {
+	listProviderCredentialTotals,
+	serializeCredentialUsageTotalsList,
+} from "@server/services/credential-usage-totals";
+import {
 	type UsageHistoryService,
 	usageHistoryService,
 } from "@server/services/usage-history-service";
@@ -30,6 +34,7 @@ const listFilterShape = {
 	chapterId: z.string().optional(),
 	projectId: z.string().optional(),
 	provider: z.string().optional(),
+	credentialId: z.string().optional(),
 	model: z.string().optional(),
 	kind: z.string().optional(),
 	startDate: z.string().optional(),
@@ -55,6 +60,7 @@ const statsQuerySchema = z.object({
 	chapterId: z.string().optional(),
 	projectId: z.string().optional(),
 	provider: z.string().optional(),
+	credentialId: z.string().optional(),
 	model: z.string().optional(),
 	kind: z.string().optional(),
 	startDate: z.string().optional(),
@@ -63,6 +69,11 @@ const statsQuerySchema = z.object({
 
 const timeSeriesQuerySchema = statsQuerySchema.extend({
 	granularity: z.enum(["hour", "day", "month"]).default("day"),
+});
+
+const credentialTotalsQuerySchema = z.object({
+	provider: z.string().min(1),
+	limit: z.coerce.number().int().positive().max(1000).default(200),
 });
 
 export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {}) {
@@ -147,6 +158,23 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 		const { granularity, ...filters } = query;
 		const result = await service.getUsageTimeSeries(filters, { granularity });
 		return c.json(result);
+	});
+
+	/**
+	 * GET /api/usage-history/credential-totals?provider=codex
+	 *
+	 * Lifetime token/cost totals per credential. Unlike everything else on this
+	 * route these come from `credential_usage_totals`, not `api_requests`, so they
+	 * survive narrator deletion. Registered before `/:id` so the literal path wins.
+	 */
+	routes.get("/credential-totals", (c) => {
+		const query = credentialTotalsQuerySchema.parse(c.req.query());
+		return c.json({
+			provider: query.provider,
+			entries: serializeCredentialUsageTotalsList(
+				listProviderCredentialTotals(query.provider, query.limit),
+			),
+		});
 	});
 
 	/**

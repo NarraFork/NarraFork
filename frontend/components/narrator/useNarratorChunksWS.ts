@@ -16,7 +16,6 @@ import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import {
 	buildStreamingMsg,
 	clearToolBlockCache,
-	findStreamingInsertIndex,
 	mergeStreamingSnapshotBlocks,
 	type StreamingBlock,
 	upsertStreamingImageGenerationBlock,
@@ -37,7 +36,6 @@ import {
 } from "./message-tree-utils";
 import {
 	appendSideCarsToLatestAssistant,
-	appendStreamingTextPreview,
 	buildTopLevelStreamingChunksMsg,
 	getStreamingFieldPreview,
 	getSyntheticTopLevelStreamingChunks,
@@ -52,6 +50,7 @@ import {
 	topLevelStreamingChunkToToolFields,
 } from "./narrator-message-helpers";
 import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
+import { applyStreamingDelta, type StreamDeltaEvent } from "./streaming-delta-fold";
 
 /**
  * WebSocket integration for the chunk data layer.
@@ -667,6 +666,13 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 
 	// --- Streaming text/reasoning accumulation ---
 	const streamingBlocksRef = useRef<StreamingBlock[]>([]);
+	/**
+	 * Which text/reasoning lane last received a delta, or -1 when the model has moved
+	 * on to tool calls. Published on the synthetic row so a FINISHED reasoning run
+	 * settles at once instead of staying live until the turn persists; array position
+	 * cannot express it (see @shared/pretext-layout/streaming-live-blocks).
+	 */
+	const liveBlockIndexRef = useRef(-1);
 	const [streamingVersion, setStreamingVersion] = useState(0);
 	const bumpStreamingVersion = useCallback(() => {
 		startTransition(() => setStreamingVersion((version) => version + 1));
@@ -717,6 +723,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			if (streamingRafRef.current) cancelAnimationFrame(streamingRafRef.current);
 			if (toolChunkRafRef.current) cancelAnimationFrame(toolChunkRafRef.current);
 			streamingBlocksRef.current = [];
+			liveBlockIndexRef.current = -1;
 			pendingToolChunkRef.current.clear();
 			toolStreamingFieldRef.current.clear();
 			for (const state of toolOutputPreviewRef.current.values()) {
@@ -733,6 +740,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on narratorId change
 	useEffect(() => {
 		streamingBlocksRef.current = [];
+		liveBlockIndexRef.current = -1;
 		pendingToolChunkRef.current.clear();
 		toolStreamingFieldRef.current.clear();
 		for (const state of toolOutputPreviewRef.current.values()) {
@@ -822,6 +830,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 	const clearStreamingOnSessionEnd = useCallback(() => {
 		if (streamingBlocksRef.current.length > 0) {
 			streamingBlocksRef.current = [];
+			liveBlockIndexRef.current = -1;
 			if (streamingRafRef.current) {
 				cancelAnimationFrame(streamingRafRef.current);
 				streamingRafRef.current = 0;
@@ -905,78 +914,28 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				streamingBlocksRef.current.length > 0 ? streamingBlocksRef.current : undefined,
 			toolChunksMsg: topLevelStreamingChunks,
 			narratorId,
+			liveBlockIndex: liveBlockIndexRef.current,
 		});
 	}, [streamingVersion, topLevelStreamingChunks, narratorId]);
 
 	const { connected, disconnected, reconnect } = useNarratorWS(
 		narratorId,
 		{
+			// The fold itself lives in the shared accumulator so both message lists
+			// derive identical blocks AND an identical live-lane stamp. Keeping a second
+			// copy here is what let the two paths drift.
 			onStreamEvent: (wsData: Record<string, unknown>) => {
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				const ev = wsData.event as Record<string, any> | undefined;
-				if (ev?.type !== "content_block_delta") return;
-				// On a subagent's own page, the self-broadcast may still carry
-				// subagentToolUseId (e.g. runAgentLoop takeover paths that don't
-				// strip it). Treat such deltas as this page's top-level stream.
-				if (!isSubagent && ev.subagentToolUseId) return;
-				if (!ev.delta?.text) return;
-
-				if (ev.delta.type === "text_delta") {
-					const blocks = streamingBlocksRef.current;
-					const outputIndex = typeof ev.outputIndex === "number" ? ev.outputIndex : undefined;
-					const existingIdx =
-						outputIndex != null
-							? blocks.findIndex((b) => b.type === "text" && b.outputIndex === outputIndex)
-							: -1;
-					if (existingIdx !== -1) {
-						const existing = blocks[existingIdx];
-						if (existing.type === "text") {
-							existing.text = appendStreamingTextPreview(existing.text, ev.delta.text);
-						}
-					} else {
-						const lastBlock = blocks[blocks.length - 1];
-						if (lastBlock?.type === "text" && outputIndex == null) {
-							lastBlock.text = appendStreamingTextPreview(lastBlock.text, ev.delta.text);
-						} else {
-							blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
-								type: "text",
-								text: appendStreamingTextPreview("", ev.delta.text),
-								...(outputIndex != null ? { outputIndex } : {}),
-							});
-						}
-					}
-					flushStreamingVersion();
-					return;
-				}
-				if (ev.delta.type === "reasoning_delta") {
-					const blocks = streamingBlocksRef.current;
-					const reasoningId =
-						typeof ev.delta.id === "string" && ev.delta.id.length > 0 ? ev.delta.id : undefined;
-					const outputIndex =
-						typeof ev.delta.outputIndex === "number" ? ev.delta.outputIndex : undefined;
-					const existingIdx = blocks.findIndex((b) => {
-						if (b.type !== "reasoning") return false;
-						if (reasoningId) return b.id === reasoningId;
-						if (outputIndex != null) return b.outputIndex === outputIndex;
-						return !b.id && b.outputIndex == null;
-					});
-					if (existingIdx !== -1) {
-						const existing = blocks[existingIdx];
-						if (existing.type === "reasoning") {
-							existing.text = appendStreamingTextPreview(existing.text, ev.delta.text);
-							if (reasoningId) existing.id = reasoningId;
-							if (outputIndex != null) existing.outputIndex = outputIndex;
-						}
-					} else {
-						blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
-							type: "reasoning",
-							text: appendStreamingTextPreview("", ev.delta.text),
-							...(reasoningId ? { id: reasoningId } : {}),
-							...(outputIndex != null ? { outputIndex } : {}),
-						});
-					}
-					flushStreamingVersion();
-				}
+				const result = applyStreamingDelta(
+					streamingBlocksRef.current,
+					wsData.event as StreamDeltaEvent | undefined,
+					isSubagent === true,
+				);
+				if (!result.applied) return;
+				// The lane this delta landed in is the one still being written. Assigned
+				// (not advanced) because a reasoning delta after a tool call legitimately
+				// reopens the text lane.
+				liveBlockIndexRef.current = result.blockIndex;
+				flushStreamingVersion();
 			},
 			onStreamingReset: (parentToolUseId) => {
 				// A reasoning-only dead turn was discarded server-side. Drop any live
@@ -988,6 +947,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				if (parentToolUseId) return;
 				if (streamingBlocksRef.current.length > 0) {
 					streamingBlocksRef.current = [];
+					liveBlockIndexRef.current = -1;
 					flushStreamingVersion();
 				}
 			},
@@ -1042,6 +1002,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				const isAssistant = newMsg.role === "assistant";
 				if (isAssistant) {
 					streamingBlocksRef.current = [];
+					liveBlockIndexRef.current = -1;
 					if (streamingRafRef.current) {
 						cancelAnimationFrame(streamingRafRef.current);
 						streamingRafRef.current = 0;
@@ -1101,6 +1062,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				// Persisted top-level messages supersede any restored streaming text.
 				if (topLevel.length > 0) {
 					streamingBlocksRef.current = [];
+					liveBlockIndexRef.current = -1;
 					bumpStreamingVersion();
 				}
 
@@ -1155,6 +1117,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			},
 			onFullReload: () => {
 				streamingBlocksRef.current = [];
+				liveBlockIndexRef.current = -1;
 				cancelPendingToolChunks(true, true);
 				bumpStreamingVersion();
 				onStructuralDirty("full");
@@ -1196,6 +1159,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			},
 			onCompactDone: () => {
 				streamingBlocksRef.current = [];
+				liveBlockIndexRef.current = -1;
 				cancelPendingToolChunks(true, true);
 				bumpStreamingVersion();
 				onStructuralDirty("full");
@@ -1368,6 +1332,37 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					return state;
 				});
 			},
+			/**
+			 * Execution actually began (permission granted + final admission).
+			 *
+			 * The positive evidence that `running` is true. `onToolStarted` only means the
+			 * INPUT finished parsing, so before this event the card had to assume execution
+			 * and consequently animated an approval prompt as though work were under way.
+			 *
+			 * Creates the live entry when absent: eager execution means this can arrive
+			 * BEFORE `tool_started`, and dropping it would lose the only fact it carries.
+			 */
+			onToolExecuting: (toolUseId: string, _executionStartedAt: number, rawParent?: string) => {
+				const parentToolUseId = isSubagent ? undefined : rawParent;
+				if (!parentToolUseId) {
+					const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
+					if (!loadedContainsToolUseId(loadedRef.current, toolUseId)) {
+						topLevelStreamingChunkRef.current.set(toolUseId, {
+							...(streamingEntry ?? { toolUseId, toolName: "Tool", inputCharsTotal: -1 }),
+							_started: true,
+							_status: "running",
+						});
+						bumpTopLevelChunksVersion();
+					}
+				}
+				// The persisted half: a card already in the loaded document needs the same
+				// correction, mirroring permissionResolvedPatch's allow branch.
+				scheduleChunkUpdate((state) =>
+					applyToChunkContaining(state, toolUseId, (w) =>
+						mergeFieldsByIndex(w, toolUseId, { status: "running" }, EMPTY_INDEX),
+					),
+				);
+			},
 			onToolLongRunning: (toolUseId: string, _elapsed: number, rawParentToolUseId?: string) => {
 				const parentToolUseId = isSubagent ? undefined : rawParentToolUseId;
 				if (!parentToolUseId) {
@@ -1447,6 +1442,9 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					);
 					return;
 				}
+				// A tool of THIS row started, so no text lane is open: whatever reasoning or
+				// text preceded it is finished and must settle now.
+				liveBlockIndexRef.current = -1;
 				const hasPersistedTool = loadedContainsToolUseId(loadedRef.current, toolUseId);
 
 				if (!parentToolUseId) {
@@ -1460,6 +1458,13 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						_started: true,
 						_input: input,
 						_startedAt: streamStartedAt,
+						// ⚠️ Preserve a status that is already further along. Eager execution means
+						// `tool_executing` (→ `running`) can land BEFORE this frame, and letting the
+						// promotion default reset it would demote a demonstrably executing tool back
+						// to the neutral phase. `_input` above still merges — that is the whole point
+						// of guarding only this one field. See streaming-tool-chunks.ts's
+						// `resolveLiveToolStatus` for the shared rule.
+						...(streamingEntry?._status === "running" ? { _status: "running" } : {}),
 					});
 					if (!topLevelStreamingCreatedAtRef.current) {
 						topLevelStreamingCreatedAtRef.current = new Date().toISOString();
@@ -1511,6 +1516,9 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					);
 					return;
 				}
+				// The model is writing tool arguments → no text lane is open (see the note
+				// in onToolStarted).
+				liveBlockIndexRef.current = -1;
 				// Accumulate streaming field value across frames (not cleared per RAF).
 				if (streamingField) {
 					const prev = toolStreamingFieldRef.current.get(toolUseId);
@@ -1994,7 +2002,10 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 								subagentHeaderFromEvent(
 									chunk.toolUseId,
 									chunk.toolName,
-									chunk.started ? "running" : "streaming",
+									// `executing` is the only field that proves the tool is running;
+									// `started` merely means its input finished parsing, so a
+									// reconnect mid-approval used to be restored as "running".
+									chunk.executing ? "running" : chunk.started ? "initializing" : "streaming",
 									activityMeta,
 								),
 								activityMeta,
@@ -2009,6 +2020,10 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 								toolName: chunk.toolName,
 								inputCharsTotal: -1,
 								_started: true,
+								// Restore the tool's real phase. Without `executing` the only signal was
+								// `started` ("input parsed"), so reconnecting while a tool waited for
+								// approval brought it back as though it were running.
+								_status: chunk.executing ? "running" : "initializing",
 								_input: chunk.input as Record<string, unknown> | undefined,
 								_startedAt: chunk.streamStartedAt,
 								_streamingOutput: chunk.streamingOutput,

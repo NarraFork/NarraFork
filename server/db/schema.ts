@@ -907,6 +907,21 @@ export const narratorToolCalls = sqliteTable(
 		 */
 		treeHashBefore: text("tree_hash_before"),
 		treeHashAfter: text("tree_hash_after"),
+		/**
+		 * Worktree-relative paths this call was proven to have changed itself.
+		 *
+		 * The tree hashes above cover the whole workspace, and a worktree is shared:
+		 * between `before` and `after` other narrators, terminals and build scripts
+		 * write to it too. A rollback must only touch what this call did, so the
+		 * boundary pair alone is not enough — the owned set records which paths
+		 * inside that window are attributable to this call.
+		 *
+		 * null means the row predates this mechanism (rollback derives the set from
+		 * recorded inputs and attributions instead). An empty array is a positive
+		 * result: this call changed nothing on disk, even when the boundary hashes
+		 * differ because a neighbour wrote during the window.
+		 */
+		ownedPathsJson: text("owned_paths_json", { mode: "json" }).$type<string[]>(),
 		// Token usage fields
 		inputTokens: integer("input_tokens").notNull().default(0),
 		outputTokens: integer("output_tokens").notNull().default(0),
@@ -1880,6 +1895,73 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_provider").on(table.provider, table.createdAt),
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
+		// Per-credential filtering would otherwise scan the whole table.
+		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
+	],
+);
+
+// === credential_usage_totals ===
+// Lifetime token/cost rollup per (provider, credential, model).
+//
+// `api_requests` holds the per-request detail but is deleted along with its
+// narrator, and the cleanup UI even flags that as "deletesUsageHistory". That
+// makes it unusable as the source of truth for "how much has this credential
+// consumed in total". This table is the durable counterpart: it is written on
+// the same path as the detail row, is never touched by narrator cleanup, and is
+// only cleared when the credential itself is deleted.
+//
+// Costs are USD at the vendors' official reference prices (see
+// server/lib/model-pricing.ts). For subscription-based access that is an
+// equivalent-consumption figure, not an amount actually billed.
+//
+// SCOPE — this is NOT a full ledger of the deployment's spend. Rows only exist
+// OpenAI direct connections carry credentialId = null (see
+// usage-history-service.getCredentialName) and are deliberately not rolled up
+// here: a synthetic bucket would give every unrelated keyless provider one
+// shared row, and the natural key would stop meaning "one credential".
+// "How much has this deployment spent in total" is answered from `api_requests`
+// for as long as those rows live. Do not read a sum over this table as the
+// deployment total.
+export const credentialUsageTotals = sqliteTable(
+	"credential_usage_totals",
+	{
+		id: text("id").primaryKey(),
+		provider: text("provider").notNull(),
+		credentialId: text("credential_id").notNull(),
+		model: text("model").notNull(),
+		requestCount: integer("request_count").notNull().default(0),
+		inputTokens: integer("input_tokens").notNull().default(0),
+		outputTokens: integer("output_tokens").notNull().default(0),
+		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+		cacheCreationTokens: integer("cache_creation_tokens").notNull().default(0),
+		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+		/** Summed USD cost of the requests that had a known price. */
+		costUsd: real("cost_usd").notNull().default(0),
+		/**
+		 * Requests whose model had no reference price. Kept so the UI can say
+		 * "cost covers N of M requests" instead of presenting a silent undercount.
+		 */
+		unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+		firstSeenAt: text("first_seen_at").notNull(),
+		lastSeenAt: text("last_seen_at").notNull(),
+	},
+	(table) => [
+		// The natural key. A unique index (rather than a composite primary key)
+		// keeps the row addressable by a single id, matching every other table.
+		uniqueIndex("idx_credential_usage_totals_key").on(
+			table.provider,
+			table.credentialId,
+			table.model,
+		),
+		// Serves both queries in getCredentialUsageTotals (SQL aggregate + capped
+		// per-model breakdown) and the provider-wide group-by, all of which lead
+		// with an equality on provider.
+		//
+		// No index on lastSeenAt alone: every read path already filters by
+		// provider (+ credentialId) first, so the composite above covers the
+		// ORDER BY and a lastSeenAt index would only add write amplification to a
+		// table written once per API request.
+		index("idx_credential_usage_totals_credential").on(table.provider, table.credentialId),
 	],
 );
 

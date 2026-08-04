@@ -21,6 +21,7 @@ import { hasUsablePlanBody } from "../plan-reference";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
 import type { VListElementKind } from "./element-kinds";
 import type { RenderLod } from "./prepared-block";
+import { type ReasoningLiveTail, resolveReasoningLiveTail } from "./reasoning-live-tail";
 import {
 	type ContentBlockLike,
 	groupReasoningRuns,
@@ -37,6 +38,11 @@ import {
 	reflectionTitleKeyPrefix,
 	reflectionTitleKeySuffix,
 } from "./reflection";
+import {
+	isLiveStreamingBlock,
+	isLiveStreamingRun,
+	STREAMING_MESSAGE_ID,
+} from "./streaming-live-blocks";
 import { classifyToolDetail, isTruncated } from "./tool-detail";
 import { collectTruncatedLeaves, hasTruncatedLeaf, readLeafText } from "./tool-io-projection";
 import { resolveTurnUsageLines, type TurnUsageJson, type UsageNumberFormatter } from "./turn-usage";
@@ -122,6 +128,16 @@ export interface AdapterMessage {
 	commandText?: string | null;
 	/** Owning narrator — the upload scope fallback for a user message's images. */
 	narratorId?: string | null;
+	/**
+	 * Synthetic live row only: index of the text/reasoning block still being written,
+	 * or -1 when the model has moved on to tool calls.
+	 *
+	 * Stamped by the streaming accumulators, the only layer that sees the real arrival
+	 * order — the row builder appends tool cards after the text lanes, so array
+	 * position cannot express it. Read through `./streaming-live-blocks`, which falls
+	 * back to a positional rule when this is absent.
+	 */
+	liveBlockIndex?: number;
 	creator?: {
 		id?: string;
 		username: string;
@@ -360,6 +376,15 @@ interface AdapterTraceItem {
 	 */
 	status?: string | null;
 	/**
+	 * A live reflection gate's status on this call, when it has one.
+	 *
+	 * Render-only and height-neutral: it selects the row's shimmer colour (purple while
+	 * a gate deliberates) and nothing else. Present so a folded row cannot read its
+	 * tool's `pending` as some other phase — the same disambiguation the card gets from
+	 * its measured reflection notice. See `@shared/tool-shimmer`.
+	 */
+	reflectionStatus?: string;
+	/**
 	 * Lifecycle stamps for the row's timing slot (elapsed while running, final
 	 * duration once finished, plus the portaled breakdown popover).
 	 *
@@ -370,6 +395,18 @@ interface AdapterTraceItem {
 	timing?: Record<string, number>;
 	/** Selection / menu coordinates (renderer only, height-neutral). */
 	identity?: AdapterTraceRowIdentity;
+	/**
+	 * LIVE tail of a streaming reasoning row ("1234 字符…<尾部>"), so the newest
+	 * characters stay on screen instead of freezing behind a settled step title.
+	 * See `./reasoning-live-tail.ts` for the rationale and the cost bound.
+	 *
+	 * ⚠️ Consumed at DRAW time and deliberately absent from `traceRevision`, so it
+	 * cannot re-key the measurement cache on every delta. Height-neutral: the row is
+	 * one fixed truncating line whatever text it carries. Because the cache is keyed
+	 * without it, the renderer must read it from the freshly adapted spec rather
+	 * than from a measured payload (which may be a cache hit).
+	 */
+	liveTail?: ReasoningLiveTail;
 	/**
 	 * LOD-INDEPENDENT identity of the content this row shows (renderer only,
 	 * height-neutral).
@@ -878,7 +915,14 @@ function adaptMessage(
 
 	// assistant messages: dispatch each visible block, merging adjacent reasoning
 	// blocks into the same run as MessageBubble/ReasoningStepsTrace does.
-	const streaming = msg.id === "__streaming__";
+	//
+	// `streamingMessage` says the row is the synthetic un-persisted one; it does NOT
+	// say any given block is still being written. Only the message's LAST content
+	// block can be (see streaming-live-blocks.ts), so per-block liveness is resolved
+	// against the full `blocks` array below — `indices` may be a filtered view, and a
+	// reasoning run must still count the text/tool blocks that follow it as proof
+	// that it closed.
+	const streamingMessage = msg.id === STREAMING_MESSAGE_ID;
 	// Per-turn usage rows bracket the body (see appendTurnUsageSpecs). Resolved up
 	// front so the leading row can be pushed before the first block.
 	const usageLines = resolveAdapterTurnUsage(msg, ctx);
@@ -909,6 +953,16 @@ function adaptMessage(
 				reasoningBlocks.push(next);
 				nextPosition++;
 			}
+			// Live only while this run holds the message's last content block. Once
+			// answer text or a tool call follows it, the run is finished and must render
+			// like history — collapsible, LOD-foldable, no shimmer — even though the
+			// turn has not persisted yet.
+			const runIndices: number[] = [bi];
+			for (let p = position + 1; p < nextPosition; p++) {
+				const runIndex = indices[p];
+				if (runIndex != null) runIndices.push(runIndex);
+			}
+			const streaming = isLiveStreamingRun(streamingMessage, msg, runIndices);
 			const data = reasoningData(reasoningBlocks, streaming);
 			// A translated run displays its translation by default; the reader can flip
 			// it back to the original. Resolved HERE (not at paint time) because the two
@@ -921,8 +975,7 @@ function adaptMessage(
 			// element kind could swap in a trace with no way back.
 			const displayText = data.translatedText ?? data.text;
 			const parsed = parseReasoning(displayText);
-			const structured = !data.isStreaming && hasStructuredReasoning(parsed);
-			if (structured || (data.isStreaming && hasStructuredReasoning(parsed))) {
+			if (hasStructuredReasoning(parsed)) {
 				specs.push({
 					kind: "reasoning-steps",
 					key,
@@ -1982,6 +2035,28 @@ function parseEpochMs(value: unknown): number | undefined {
 }
 
 /**
+ * A tool's reflection-gate STATUS, or undefined when it has no gate.
+ *
+ * Split out from `resolveToolReflection` because a folded row needs only this one
+ * field (to pick its shimmer colour) and must not pay for building a whole measurable
+ * notice — a fold can hold hundreds of rows. Same live-wins precedence as the card,
+ * so the two cannot disagree about whether a gate is running.
+ */
+function resolveToolReflectionStatus(
+	item: AdapterToolItem,
+	ctx: AdapterContext,
+): string | undefined {
+	const suggestions = item.tc.permissionSuggestions;
+	const live = ctx.resolvePendingPermissionSuggestions?.(item.tc.toolUseId);
+	if (!Array.isArray(live) && !Array.isArray(suggestions)) return undefined;
+	const parsed = getPermissionReflectionSuggestion({
+		suggestions: Array.isArray(live) ? live : null,
+		permissionSuggestions: Array.isArray(suggestions) ? suggestions : null,
+	});
+	return parsed?.status;
+}
+
+/**
  * Resolve the reflection notice a tool card should show, mirroring the chunked
  * precedence (ToolCallCard.tsx:5419):
  *
@@ -2143,6 +2218,8 @@ function toolTraceItem(
 	// Only a real, identifiable tool call can be drilled into: the card's detail
 	// classification and its on-demand payload fetch are both keyed by tool use id.
 	const canDrillDown = !!item.tc.toolUseId;
+	// The gate's own status, read with the same live-wins precedence the card uses.
+	const reflectionStatus = resolveToolReflectionStatus(item, ctx);
 	return {
 		title: truncateTitle(rawTitle),
 		hasIcon: true,
@@ -2152,6 +2229,14 @@ function toolTraceItem(
 		key: toolItemKey(item),
 		summary,
 		status: item.tc.status ?? null,
+		// A live reflection gate's status, so a folded row can show the PURPLE
+		// "deliberating" shimmer instead of reading its tool's `pending` as something
+		// else. Render-only and height-neutral — same lane as `status`.
+		//
+		// A gate normally keeps its tool out of a fold (`pending` items render as their
+		// own card), so this is usually absent; it exists so the row is correct wherever
+		// a gated call does end up folded, rather than silently mis-coloured.
+		...(reflectionStatus ? { reflectionStatus } : {}),
 		// Same stamp record a subagent card's header uses, so a folded row shows the
 		// SAME duration the full card would at a higher LOD. Height-neutral.
 		timing: cardTiming(item.tc),
@@ -2313,11 +2398,33 @@ function reasoningRowKeyBase(item: Extract<AdapterActivityInput, { kind: "reason
 	return `r-${item.msg?.id ?? "msg"}-${item.blockIndex ?? 0}`;
 }
 
-/** True for a reasoning row belonging to the LIVE streaming message. */
+/**
+ * True for a reasoning row belonging to the synthetic (un-persisted) streaming row.
+ *
+ * This is the PARSER question, not the "is it still being written" question. The
+ * whole live message is re-adapted on every delta, so any reasoning inside it must go
+ * through the incremental parser — including a run that has already finished, since
+ * re-parsing its accumulated body every frame is the O(len²)-per-turn shape
+ * `reasoning-segments-cache.ts` exists to remove. For the visual live state see
+ * `isLiveReasoningItem`.
+ */
 function isStreamingReasoningItem(
 	item: Extract<AdapterActivityInput, { kind: "reasoning" }>,
 ): boolean {
-	return item.msg?.id === "__streaming__";
+	return item.msg?.id === STREAMING_MESSAGE_ID;
+}
+
+/**
+ * True when this reasoning row is the one STILL BEING WRITTEN.
+ *
+ * Only the live message's last content block can be (see streaming-live-blocks.ts).
+ * A reasoning block followed by answer text or a tool call is finished, so it must
+ * stop shimmering and stop carrying a scrolling live tail the moment that next block
+ * appears — not when the turn eventually persists, which for a tool-calling turn is
+ * many seconds and several executions later.
+ */
+function isLiveReasoningItem(item: Extract<AdapterActivityInput, { kind: "reasoning" }>): boolean {
+	return isLiveStreamingBlock(isStreamingReasoningItem(item), item.msg, item.blockIndex ?? 0);
 }
 
 function adaptActivityItems(
@@ -2366,18 +2473,34 @@ function adaptActivityItems(
 			reasoningCount += rows.length;
 			const identity = reasoningRowIdentity(item);
 			const keyBase = reasoningRowKeyBase(item);
+			// Visual live state is per BLOCK, not per message: a reasoning run that the
+			// answer text or a tool call already followed is finished, and must settle
+			// immediately rather than shimmer until the turn persists.
+			const streaming = isLiveReasoningItem(item);
+			// The LAST row of the live run is the one still being written, so it shows a
+			// scrolling tail instead of its settled title (which a never-closing step
+			// would freeze on).
+			//
+			// Derived from the RAW accumulated `text`, never from `rows[last].body`: the
+			// rows come from `parseStreamingReasoningTitles`, which truncates every body
+			// to its first line, so a row body is itself a settled prefix — the exact
+			// thing the tail exists to look past. The end of `text` is the end of the
+			// last step, i.e. the newest characters.
+			const liveTail = streaming ? resolveReasoningLiveTail(text) : null;
 			traceItems.push(
-				...rows.map(
-					(row, index): AdapterTraceItem => ({
+				...rows.map((row, index): AdapterTraceItem => {
+					const isLast = index === rows.length - 1;
+					return {
 						title: reasoningStepTitle(row),
 						hasIcon: true,
 						iconColor: "grape",
 						key: `${keyBase}-step-${index}`,
-						shimmer: item.msg?.id === "__streaming__" && index === rows.length - 1,
+						shimmer: streaming && isLast,
 						identity,
 						unitId: `reason-${keyBase}-${index}`,
-					}),
-				),
+						...(liveTail && isLast ? { liveTail } : {}),
+					};
+				}),
 			);
 			continue;
 		}

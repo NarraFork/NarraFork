@@ -1,109 +1,38 @@
 /**
- * exact-streaming-accumulator.ts — pure text/reasoning streaming-block folding
- * for the exact-layout shell's live tail.
+ * exact-streaming-accumulator.ts — the exact shell's view of the shared text /
+ * reasoning delta fold.
  *
- * This is a deliberately narrow copy of the useNarratorChunksWS text/reasoning
- * accumulation (it does NOT handle live tool-call chunks): the band renderer it
- * replaces only surfaces a plain text tail, so text + reasoning parity is enough
- * to retire the band path for the active state. Keeping the fold here (pure,
- * mutation-on-a-passed-array) makes it unit-testable with no WS or React.
+ * The fold itself moved to `../streaming-delta-fold.ts` so the ALWAYS-ON chunked path
+ * can share it: that path may not statically import `vlist/` (see
+ * `vlist-isolation.guard.test.ts` — with the flag off, vlist code must never even be
+ * fetched), while vlist importing outward is fine. Two copies of the fold is how the
+ * two lists drift, and the live-lane stamp is precisely the kind of state that must
+ * not: it decides when a reasoning run settles.
  *
- * All functions mutate the passed `blocks` array in place and return whether the
- * caller should bump its render version (mirrors the ref + rAF pattern).
+ * This module is kept as the vlist-facing name so the shell and its tests keep one
+ * stable import site.
  */
 
+export type {
+	StreamDeltaEvent,
+	StreamDeltaResult,
+} from "../streaming-delta-fold";
+
+import type { StreamingBlock } from "../message-segments";
 import {
-	findStreamingInsertIndex,
-	mergeStreamingSnapshotBlocks,
-	type StreamingBlock,
-} from "../message-segments";
-import { appendStreamingTextPreview } from "../narrator-message-helpers";
+	applyStreamingDelta,
+	applyStreamingSnapshotBlocks,
+	type StreamDeltaEvent,
+	type StreamDeltaResult,
+} from "../streaming-delta-fold";
 
-/** A decoded `content_block_delta` stream event (the shape onStreamEvent passes). */
-export interface StreamDeltaEvent {
-	type?: unknown;
-	subagentToolUseId?: unknown;
-	outputIndex?: unknown;
-	delta?: {
-		type?: unknown;
-		text?: unknown;
-		id?: unknown;
-		outputIndex?: unknown;
-	};
-}
-
-/**
- * Fold a single content_block_delta into `blocks`. Returns true when a text or
- * reasoning delta was applied (caller should bump its render version).
- *
- * `isSubagent` mirrors the legacy guard: on a top-level page, deltas that still
- * carry a subagentToolUseId belong to a child stream and are ignored.
- */
+/** Fold one `content_block_delta` into `blocks` (see applyStreamingDelta). */
 export function applyExactStreamDelta(
 	blocks: StreamingBlock[],
 	event: StreamDeltaEvent | undefined,
 	isSubagent: boolean,
-): boolean {
-	if (!event || event.type !== "content_block_delta") return false;
-	if (!isSubagent && event.subagentToolUseId) return false;
-	const delta = event.delta;
-	const deltaText = typeof delta?.text === "string" ? delta.text : "";
-	if (!delta || !deltaText) return false;
-
-	if (delta.type === "text_delta") {
-		const outputIndex = typeof event.outputIndex === "number" ? event.outputIndex : undefined;
-		const existingIdx =
-			outputIndex != null
-				? blocks.findIndex((b) => b.type === "text" && b.outputIndex === outputIndex)
-				: -1;
-		if (existingIdx !== -1) {
-			const existing = blocks[existingIdx];
-			if (existing.type === "text") {
-				existing.text = appendStreamingTextPreview(existing.text, deltaText);
-			}
-		} else {
-			const lastBlock = blocks[blocks.length - 1];
-			if (lastBlock?.type === "text" && outputIndex == null) {
-				lastBlock.text = appendStreamingTextPreview(lastBlock.text, deltaText);
-			} else {
-				blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
-					type: "text",
-					text: appendStreamingTextPreview("", deltaText),
-					...(outputIndex != null ? { outputIndex } : {}),
-				});
-			}
-		}
-		return true;
-	}
-
-	if (delta.type === "reasoning_delta") {
-		const reasoningId = typeof delta.id === "string" && delta.id.length > 0 ? delta.id : undefined;
-		const outputIndex = typeof delta.outputIndex === "number" ? delta.outputIndex : undefined;
-		const existingIdx = blocks.findIndex((b) => {
-			if (b.type !== "reasoning") return false;
-			if (reasoningId) return b.id === reasoningId;
-			if (outputIndex != null) return b.outputIndex === outputIndex;
-			return !b.id && b.outputIndex == null;
-		});
-		if (existingIdx !== -1) {
-			const existing = blocks[existingIdx];
-			if (existing.type === "reasoning") {
-				existing.text = appendStreamingTextPreview(existing.text, deltaText);
-				if (reasoningId) existing.id = reasoningId;
-				if (outputIndex != null) existing.outputIndex = outputIndex;
-			}
-		} else {
-			blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
-				type: "reasoning",
-				text: appendStreamingTextPreview("", deltaText),
-				...(reasoningId ? { id: reasoningId } : {}),
-				...(outputIndex != null ? { outputIndex } : {}),
-			});
-		}
-		return true;
-	}
-
-	return false;
+): StreamDeltaResult {
+	return applyStreamingDelta(blocks, event, isSubagent);
 }
 
 /** Merge a reconnect snapshot into `blocks`; returns true when anything changed. */
@@ -111,6 +40,5 @@ export function applyExactStreamingSnapshot(
 	blocks: StreamingBlock[],
 	snapshotBlocks: StreamingBlock[],
 ): boolean {
-	if (snapshotBlocks.length === 0) return false;
-	return mergeStreamingSnapshotBlocks(blocks, snapshotBlocks);
+	return applyStreamingSnapshotBlocks(blocks, snapshotBlocks);
 }

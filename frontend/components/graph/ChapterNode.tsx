@@ -267,7 +267,11 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 									</Badge>
 								)}
 								{d.narratorStatus && narratorDisplay ? (
-									<Badge size="xs" variant="dot" color={narratorDisplay.color}>
+									<Badge
+										size="xs"
+										variant="dot"
+										color={statusRegistry.accentColor(narratorDisplay)}
+									>
 										{tc(narratorDisplay.i18nKey)}
 									</Badge>
 								) : (

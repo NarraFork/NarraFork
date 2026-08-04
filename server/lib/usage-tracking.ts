@@ -1,6 +1,7 @@
 import { db } from "@server/db";
 import { narratorMessages, narratorToolCalls } from "@server/db/schema";
 import { eq } from "drizzle-orm";
+import { resolveModelPricing } from "./model-pricing";
 
 export interface UsageData {
 	inputTokens: number;
@@ -50,49 +51,51 @@ export function buildUsageDataFromSnapshot(snapshot?: {
 }
 
 /**
- * 从 usage 数据计算费用
- * 价格参考 Anthropic 和 OpenAI 的定价（2024年）
+ * Providers whose reported `input_tokens` is the *total* prompt size, cached
+ * tokens included. For these, the cached portion must be subtracted before
+ * applying the full input rate or those tokens get billed twice — once at the
+ * input rate and again at the cache-read rate.
+ *
+ * Anthropic is the opposite: `input_tokens` already excludes
+ * `cache_read_input_tokens` and `cache_creation_input_tokens`, so subtracting
+ * would undercount.
+ *
+ * This set describes token *semantics*, not price coverage: `gemini`, `cline`,
+ * `model-pricing.ts` only ships rows for the gpt/claude families. Until an
+ * operator adds overrides those requests resolve to no price at all and this
+ * subtraction never runs for them — which is intended, not an oversight.
  */
-export function calculateCost(usage: UsageData, _provider: string, model: string): CostData | null {
-	// 简化的价格表（实际应该从配置或数据库读取）
-	const pricing: Record<
-		string,
-		{ input: number; output: number; cacheRead: number; cacheWrite: number }
-	> = {
-		// Anthropic Claude 3.5 Sonnet (per 1M tokens)
-		"claude-3-5-sonnet": {
-			input: 3.0,
-			output: 15.0,
-			cacheRead: 0.3,
-			cacheWrite: 3.75,
-		},
-		// OpenAI GPT-4o (per 1M tokens)
-		"gpt-4o": {
-			input: 2.5,
-			output: 10.0,
-			cacheRead: 1.25,
-			cacheWrite: 0,
-		},
-	};
+const PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT = new Set([
+	"openai",
+	"codex",
+	"cline",
+	"nug",
+	"gemini",
+]);
 
-	// 查找匹配的价格（简单匹配模型名称前缀）
-	let modelPricing = null;
-	for (const [key, value] of Object.entries(pricing)) {
-		if (model.toLowerCase().includes(key)) {
-			modelPricing = value;
-			break;
-		}
-	}
+/**
+ * Attribute a USD cost to one request's token usage using the official
+ * reference prices in `model-pricing.ts`.
+ *
+ * Returns null when the model has no known price, so callers can record "not
+ * priced" rather than a misleading 0. For subscription-based access (Codex on a
+ * cost through the metered API, not an amount actually billed.
+ */
+export function calculateCost(usage: UsageData, provider: string, model: string): CostData | null {
+	const pricing = resolveModelPricing(model);
+	if (!pricing) return null;
 
-	if (!modelPricing) {
-		return null;
-	}
+	const cachedInputTokens = Math.max(0, usage.cachedInputTokens || 0);
+	const cacheCreationTokens = Math.max(0, usage.cacheCreationInputTokens || 0);
+	const reportedInput = Math.max(0, usage.inputTokens || 0);
+	const uncachedInputTokens = PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT.has(provider.toLowerCase())
+		? Math.max(0, reportedInput - cachedInputTokens)
+		: reportedInput;
 
-	const inputCost = (usage.inputTokens / 1_000_000) * modelPricing.input;
-	const outputCost = (usage.outputTokens / 1_000_000) * modelPricing.output;
-	const cacheReadCost = ((usage.cachedInputTokens || 0) / 1_000_000) * modelPricing.cacheRead;
-	const cacheCreationCost =
-		((usage.cacheCreationInputTokens || 0) / 1_000_000) * modelPricing.cacheWrite;
+	const inputCost = (uncachedInputTokens / 1_000_000) * pricing.input;
+	const outputCost = (Math.max(0, usage.outputTokens || 0) / 1_000_000) * pricing.output;
+	const cacheReadCost = (cachedInputTokens / 1_000_000) * pricing.cacheRead;
+	const cacheCreationCost = (cacheCreationTokens / 1_000_000) * pricing.cacheWrite;
 
 	return {
 		inputCost,

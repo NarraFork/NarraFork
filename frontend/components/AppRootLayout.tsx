@@ -1,4 +1,10 @@
-import { useResizableNav } from "@frontend/hooks/useResizableNav";
+import {
+	startNavResize,
+	toggleNavCollapsed,
+	useNavCollapsed,
+	useNavWidth,
+} from "@frontend/hooks/useResizableNav";
+import type { AppShellProps } from "@mantine/core";
 import {
 	ActionIcon,
 	Anchor,
@@ -237,6 +243,45 @@ function OutputStatsBadge({ enabled }: { enabled: boolean }) {
 	);
 }
 
+/**
+ * The AppShell, with the live nav width injected here and NOWHERE ELSE.
+ *
+ * This exists purely to bound what a resize drag re-renders. `useNavWidth`
+ * subscribes to every `mousemove` frame, so whichever component calls it re-renders
+ * at ~60Hz for the duration of the drag. Calling it in `AuthenticatedLayout` (1031
+ * lines, ~86 hooks) meant re-rendering the whole shell each frame — both
+ * `RecentTabList`s, every navbar `NavLink` and its `Tooltip`. The same file already
+ * records the cost of exactly that shape: a per-second tick re-rendering "the whole
+ * AppShell (navbar NavLinks, tab strip, tooltips)" measured ~140ms of main-thread
+ * work per second (see OutputStatsBadge, which was extracted for the same reason).
+ *
+ * Because `children` arrives as an already-created element, React re-renders only
+ * this function body and reuses the entire subtree by reference — the navbar content
+ * is not re-rendered at all.
+ *
+ * ⚠️ Do not read `useNavWidth()` outside this component, and do not move navbar
+ * content into it. Either change silently restores the original per-frame cost while
+ * leaving the code looking correct.
+ */
+function AppShellWithNavWidth({
+	navbar,
+	wizardWidth,
+	children,
+	...props
+}: Omit<AppShellProps, "navbar"> & {
+	navbar: Omit<NonNullable<AppShellProps["navbar"]>, "width"> &
+		Pick<NonNullable<AppShellProps["navbar"]>, "breakpoint">;
+	/** Fixed width while the setup wizard owns the sidebar (overrides the drag). */
+	wizardWidth?: string;
+}) {
+	const navWidth = useNavWidth();
+	return (
+		<AppShell {...props} navbar={{ ...navbar, width: wizardWidth ?? navWidth }}>
+			{children}
+		</AppShell>
+	);
+}
+
 function AuthenticatedLayout() {
 	const [opened, { toggle, open: openNav, close: closeNav }] = useDisclosure();
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY, undefined, {
@@ -287,12 +332,11 @@ function AuthenticatedLayout() {
 	const appShellReady =
 		hasToken && !sessionLost && !(isLoading || (!user && fetchStatus === "fetching"));
 	useAppShellMainScrollRestoration(appShellScrollKey, appShellReady);
-	const {
-		width: navWidth,
-		collapsed: navCollapsed,
-		onDragStart: onNavDragStart,
-		toggleCollapsed: toggleNavCollapsed,
-	} = useResizableNav();
+	// COLLAPSED ONLY — deliberately not the width. The navbar content below needs the
+	// boolean (labels, tooltips, padding), which flips at most once per drag, whereas
+	// the width changes every frame. Subscribing to the width here is what made a
+	// resize re-render this entire component; it now lives in AppShellWithNavWidth.
+	const navCollapsed = useNavCollapsed();
 	const {
 		entries: navEntries,
 		visibleItems: navVisibleItems,
@@ -524,7 +568,6 @@ function AuthenticatedLayout() {
 	// Whether the projects section is visible (can be tucked into the overflow menu)
 	const projectsVisible = navVisibleItems.some((item) => item.id === "projects");
 	const secondaryNavDefs = new Map(CUSTOMIZABLE_NAV_ITEMS.map((def) => [def.id, def]));
-	const effectiveNavWidth = wizardOpen ? "min(420px, 100vw)" : navWidth;
 	// The Navbar's gutter for the three sides that are not the bottom edge. The bottom
 	// edge is owned by the `data-safe-area` spacer, which folds this same value into a
 	// `max()` against the inset instead of adding to it.
@@ -539,15 +582,17 @@ function AuthenticatedLayout() {
 	};
 
 	return (
-		<AppShell
+		<AppShellWithNavWidth
 			className={APP_SHELL_CLASSNAME}
 			layout="alt"
 			header={{ height: APP_SHELL_HEADER_HEIGHT }}
+			// `width` is supplied by the wrapper, which is the ONLY component
+			// subscribed to the drag's pixel stream (see AppShellWithNavWidth).
 			navbar={{
-				width: effectiveNavWidth,
 				breakpoint: "sm",
 				collapsed: { mobile: !opened },
 			}}
+			wizardWidth={wizardOpen ? "min(420px, 100vw)" : undefined}
 			padding="md"
 		>
 			<WSConnectionAlert />
@@ -749,7 +794,7 @@ function AuthenticatedLayout() {
 						{/* Drag handle for resizing navbar */}
 						<Box
 							visibleFrom="sm"
-							onMouseDown={onNavDragStart}
+							onMouseDown={startNavResize}
 							style={{
 								position: "absolute",
 								top: 0,
@@ -1026,6 +1071,6 @@ function AuthenticatedLayout() {
 					</Suspense>
 				</LazyOverlayBoundary>
 			)}
-		</AppShell>
+		</AppShellWithNavWidth>
 	);
 }
