@@ -86,7 +86,21 @@ describe("codex HTTP chat request parity", () => {
 		expect(req.headers["user-agent"]).toMatch(new RegExp(`^${ORIGINATOR_CODEX}/[^ ]+ `));
 		// The Codex Responses transport is always streamed.
 		expect(req.headers.accept).toBe("text/event-stream");
-		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBe("true");
+	});
+
+	/**
+	 * Parity here means matching a real non-lite Codex request: top-level
+	 * instructions + tools. The lite header is the opt-in for the *other* contract
+	 * (instructions/tools removed, additional_tools spliced into input,
+	 * parallel_tool_calls off), so sending it alongside this body matches no real
+	 * client and upstream rejects the pairing outright.
+	 */
+	test("does not claim the responses-lite contract while sending a non-lite body", async () => {
+		const req = await captureChat();
+
+		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
+		expect(req.body.tools).toBeDefined();
+		expect(req.body.instructions).toBeTruthy();
 	});
 
 	test("correlates the conversation identity across headers and body", async () => {

@@ -91,7 +91,16 @@ describe.each([
 			new RegExp(`unknown \\(${ORIGINATOR_CODEX}; [^)]+\\)$`),
 		);
 		expect(req.headers.accept).toBe("text/event-stream");
-		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBe("true");
+	});
+
+	/**
+	 * Utility requests (title/compact/reflection) go through the same transport and
+	 * the same non-lite body shape, so they must not claim the lite contract either.
+	 */
+	test("does not claim the responses-lite contract", async () => {
+		const req = await capture(run);
+
+		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
 	});
 
 	test("sends one correlated conversation identity across headers", async () => {

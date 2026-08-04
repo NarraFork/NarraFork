@@ -5,7 +5,7 @@ import type WebSocket from "ws";
 import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages } from "../../db/schema";
 import { logger } from "../logger";
-import { getHttpCodexUserAgent, ORIGINATOR_CODEX } from "../user-agent";
+import { getHttpCodexUserAgent, ORIGINATOR_CODEX, stripResponsesLiteHeader } from "../user-agent";
 import { parseGatewayDataEvent } from "./gateway-events";
 import {
 	type OAIMessage,
@@ -347,11 +347,14 @@ function buildHandshakeHeaders(
 	options: StreamCodexResponsesWebSocketOptions,
 	session: CachedSession,
 ): Record<string, string> {
+	// No x-openai-internal-codex-responses-lite here: the lite opt-in is a body
+	// contract (no top-level instructions/tools, additional_tools spliced into
+	// input, parallel_tool_calls off) that this transport does not implement, and
+	// upstream rejects the header outright when `tools` carries hosted tools.
 	const headers: Record<string, string> = {
 		Authorization: options.authorization?.trim() || `Bearer ${options.apiKey}`,
 		"User-Agent": options.userAgent ?? getHttpCodexUserAgent(),
 		originator: ORIGINATOR_CODEX,
-		"x-openai-internal-codex-responses-lite": "true",
 		"session-id": options.conversationId,
 		"thread-id": options.conversationId,
 		Origin: isOfficialChatGPTDomain(options.baseUrl) ? "https://chatgpt.com" : options.baseUrl,
@@ -374,6 +377,9 @@ function buildHandshakeHeaders(
 	for (const [key, value] of Object.entries(options.extraHeaders ?? {})) {
 		if (value) headers[key] = value;
 	}
+	// extraHeaders is merged last, so it is also the one place that could put the
+	// lite opt-in back on the wire. Strip it for the same reason it is not set above.
+	stripResponsesLiteHeader(headers);
 	return headers;
 }
 

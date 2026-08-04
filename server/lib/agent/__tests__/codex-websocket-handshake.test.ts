@@ -86,7 +86,27 @@ describe("Codex WebSocket handshake reported to diagnostics", () => {
 
 		expect(prepared.headers.originator).toBe(ORIGINATOR_CODEX);
 		expect(prepared.headers.originator).not.toBe("narrafork");
-		expect(prepared.headers["x-openai-internal-codex-responses-lite"]).toBe("true");
+	});
+
+	/**
+	 * The WS transport sends the same non-lite body as HTTP, so it must not claim
+	 * the lite contract. Covered on the handshake because the header is set during
+	 * the upgrade, before any turn is written.
+	 */
+	test("does not claim the responses-lite contract", async () => {
+		const prepared = await capturePrepared();
+
+		expect(prepared.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
+	});
+
+	test("strips a responses-lite header pushed in through caller fingerprint headers", async () => {
+		const prepared = await capturePrepared({
+			extraHeaders: { "X-OpenAI-Internal-Codex-Responses-Lite": "true" },
+		});
+
+		for (const key of Object.keys(prepared.headers)) {
+			expect(key.toLowerCase()).not.toBe("x-openai-internal-codex-responses-lite");
+		}
 	});
 
 	test("correlates session/thread/client-request ids to one conversation", async () => {

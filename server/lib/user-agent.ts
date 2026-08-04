@@ -16,6 +16,28 @@ const CODEX_CLI_VERSION = "0.146.0";
 export const ORIGINATOR_CODEX = "codex-tui";
 
 /**
+ * The upstream header that opts a Responses request into the "lite" request
+ * contract. NarraFork must never send it — see {@link buildCodexEmulationHeaders}
+ * for the full contract it would obligate us to implement, and
+ * {@link stripResponsesLiteHeader} for the enforcement.
+ */
+export const RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite";
+
+/**
+ * Strip the lite header from an outbound header map.
+ *
+ * Applied to user-supplied `extraHeaders` because those are merged last and
+ * would otherwise re-introduce a header whose body contract NarraFork does not
+ * implement, turning every request to a strict endpoint into a 400. Operators
+ * who genuinely need lite must first implement the body half of the contract.
+ */
+export function stripResponsesLiteHeader(headers: Record<string, string>): void {
+	for (const key of Object.keys(headers)) {
+		if (key.toLowerCase() === RESPONSES_LITE_HEADER) delete headers[key];
+	}
+}
+
+/**
  * Get OS type string in Codex format.
  * Maps Node.js os.type() to Codex-style OS names.
  */
@@ -198,11 +220,32 @@ export function getHttpCodexUserAgent(): string {
  * remote_compaction_v2, use_agent_identity, workspace_dependencies, ...), so a
  * hardcoded value would claim capabilities NarraFork does not implement.
  *
+ * Also omitted: x-openai-internal-codex-responses-lite. In the real client that
+ * header is not an identity marker at all — it is one half of a request contract
+ * driven by the per-model `ModelInfo.use_responses_lite` flag, which upstream
+ * publishes in its model catalog. When that flag is set, codex-rs/core/src/client.rs
+ * simultaneously (a) sends the header, (b) omits top-level `instructions` and
+ * `tools` entirely, (c) splices an `additional_tools` item plus a developer
+ * instructions message to the front of `input`, and (d) forces
+ * `parallel_tool_calls: false`. Upstream validates the pairing and rejects the
+ * header whenever `tools` carries anything but function/custom/client-executed
+ * search tools:
+ *
+ *   "X-OpenAI-Internal-Codex-Responses-Lite only supports function tools,
+ *    custom tools, and client-executed tool search."
+ *
+ * NarraFork emits the classic non-lite body (top-level instructions + tools,
+ * including the hosted `web_search`/`image_generation` tools), so claiming lite
+ * produced a request no real client emits and hard-failed any endpoint that
+ * enforces the pairing. Non-lite is the universally accepted shape and is what
+ * real Codex sends for every model whose catalog entry leaves the flag false, so
+ * the header is dropped rather than the tools. {@link stripResponsesLiteHeader}
+ * enforces this on every outbound header map, and the codex parity tests pin it.
+ *
  * Included:
  * - originator: codex-tui
  * - x-codex-installation-id: <persisted UUID>
  * - session-id / thread-id / x-client-request-id: one stable conversation id
- * - x-openai-internal-codex-responses-lite: true
  */
 export function buildCodexEmulationHeaders(opts: {
 	installationId: string;
@@ -211,7 +254,6 @@ export function buildCodexEmulationHeaders(opts: {
 	const headers: Record<string, string> = {
 		originator: ORIGINATOR_CODEX,
 		"x-codex-installation-id": opts.installationId,
-		"x-openai-internal-codex-responses-lite": "true",
 	};
 	if (opts.conversationId) {
 		headers["session-id"] = opts.conversationId;
@@ -264,6 +306,9 @@ export function resolveHttpUserAgent(options: {
  *
  * Passing `installationId` is what opts a caller into the Codex header set, so
  * non-codex providers never leak codex-specific identifiers.
+ *
+ * The one header `extraHeaders` may not set is the responses-lite opt-in: it is a
+ * body contract, not an identity string, and NarraFork emits the non-lite body.
  */
 export function resolveClientFingerprint(options: {
 	mode?: UserAgentMode;
@@ -292,5 +337,6 @@ export function resolveClientFingerprint(options: {
 	for (const [key, value] of Object.entries(options.extraHeaders ?? {})) {
 		if (value) headers[key] = value;
 	}
+	stripResponsesLiteHeader(headers);
 	return { userAgent, headers };
 }
