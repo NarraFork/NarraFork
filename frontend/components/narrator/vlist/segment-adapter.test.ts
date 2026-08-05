@@ -2274,3 +2274,161 @@ describe("adaptSegment — per-turn usage rows", () => {
 		expect(short.height).toBeGreaterThan(0);
 	});
 });
+
+describe("adaptSegment — sidecar cards", () => {
+	const sidecarMsg = (
+		role: string,
+		sideCars: Array<Record<string, unknown>>,
+		over: Record<string, unknown> = {},
+	): AdapterSegment => ({
+		kind: "message",
+		msg: {
+			id: "m1",
+			role,
+			contentJson: [{ type: "text", text: "body" }],
+			// The records are structurally AdapterSidecar; the test builds plain literals.
+			sideCars: sideCars as never,
+			...over,
+		},
+	});
+
+	it("assistant message: one sidecar card per visible user_message record, trailing the body", () => {
+		const specs = adaptSegment(
+			sidecarMsg("assistant", [
+				{ target: "user_message", source: "silent_progress", content: "note one" },
+				{ target: "user_message", source: "bg_agent", content: "agent done" },
+			]),
+			CTX,
+		);
+		// markdown body + two sidecar cards.
+		expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar", "sidecar"]);
+		const card = specs[1]!.data as { source: string; previewText: string; fullText: string };
+		expect(card.source).toBe("silent_progress");
+		expect(card.fullText).toBe("note one");
+	});
+
+	it("filters out tool_result records and empty content", () => {
+		const specs = adaptSegment(
+			sidecarMsg("assistant", [
+				{ target: "tool_result", source: "x", content: "goes on the tool card" },
+				{ target: "user_message", source: "y", content: "   " },
+				{ target: "user_message", source: "z", content: "kept" },
+			]),
+			CTX,
+		);
+		expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar"]);
+	});
+
+	it("user bubble: sidecars trail the bubble", () => {
+		const specs = adaptSegment(
+			sidecarMsg("user", [{ target: "user_message", source: "group_message", content: "hi" }]),
+			CTX,
+		);
+		expect(specs.map((s) => s.kind)).toEqual(["message-bubble", "sidecar"]);
+	});
+
+	it("origin_notice branch: sidecars still surface (chunk parity)", () => {
+		const specs = adaptSegment(
+			sidecarMsg("user", [{ target: "user_message", source: "bg_bash", content: "done" }], {
+				origin: "system",
+			}),
+			CTX,
+		);
+		expect(specs.map((s) => s.kind)).toEqual(["system-text", "sidecar"]);
+	});
+
+	it("sidecar opts carry the per-card fold state from ctx.isExpanded", () => {
+		const ctx: AdapterContext = { lod: 5, isExpanded: (key) => key === "m1-sc0" };
+		const specs = adaptSegment(
+			sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
+			ctx,
+		);
+		expect(specs[1]!.opts?.expanded).toBe(true);
+	});
+
+	it("measures through the registry: collapsed is the constant height", () => {
+		const specs = adaptSegment(
+			sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
+			CTX,
+		);
+		const measured = VLIST_REGISTRY.sidecar.measure(specs[1]!.data, 600, 5, specs[1]!.opts);
+		expect(measured.height).toBeGreaterThan(0);
+		const open = VLIST_REGISTRY.sidecar.measure(specs[1]!.data, 600, 5, { expanded: true });
+		expect(open.height).toBeGreaterThan(measured.height);
+	});
+});
+
+describe("adaptToolRun — tool-result + tool-only-message sidecars", () => {
+	const toolItem = (
+		toolUseId: string,
+		sideCars: unknown[] | undefined,
+		msg?: { id?: string; contentJson?: unknown[]; sideCars?: unknown[] },
+	) =>
+		({
+			blockIndex: 0,
+			isSubagent: false,
+			tc: { toolName: "Bash", status: "success", toolUseId, sideCars },
+			...(msg ? { msg: { role: "assistant", ...msg } } : {}),
+		}) as never;
+
+	it("tool card data carries tool_result sidecars as mini-card payloads", () => {
+		const specs = adaptSegments(
+			[
+				{
+					kind: "tool-run",
+					sourceMessages: [],
+					items: [
+						toolItem("tu1", [
+							{ target: "tool_result", source: "silent_progress", content: "injected" },
+						]),
+					],
+				},
+			],
+			{ lod: 6 },
+		);
+		const card = specs[0]!.data as { sidecars?: { fullText: string }[] | null };
+		expect(card.sidecars).toHaveLength(1);
+		expect(card.sidecars?.[0]?.fullText).toBe("injected");
+	});
+
+	it("a tool-only source message's user_message sidecars trail the run", () => {
+		const specs = adaptSegments(
+			[
+				{
+					kind: "tool-run",
+					sourceMessages: [],
+					items: [
+						toolItem("tu1", undefined, {
+							id: "src1",
+							contentJson: [{ type: "tool_use" }],
+							sideCars: [{ target: "user_message", source: "bg_agent", content: "done" }],
+						}),
+					],
+				},
+			],
+			{ lod: 6 },
+		);
+		expect(specs.map((s) => s.kind)).toEqual(["tool-call", "sidecar"]);
+	});
+
+	it("a source message WITH visible content is NOT duplicated into the run", () => {
+		const specs = adaptSegments(
+			[
+				{
+					kind: "tool-run",
+					sourceMessages: [],
+					items: [
+						toolItem("tu1", undefined, {
+							id: "src1",
+							// visible text block → the bubble segment renders the sidecar instead.
+							contentJson: [{ type: "text", text: "answer" }, { type: "tool_use" }],
+							sideCars: [{ target: "user_message", source: "bg_agent", content: "done" }],
+						}),
+					],
+				},
+			],
+			{ lod: 6 },
+		);
+		expect(specs.map((s) => s.kind)).toEqual(["tool-call"]);
+	});
+});

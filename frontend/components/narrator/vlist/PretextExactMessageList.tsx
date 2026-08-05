@@ -106,6 +106,7 @@ import {
 	type VListViewTarget,
 	viewTargetSpecKey,
 } from "./vlist-content-view-target";
+import { installVListCopyHandler } from "./vlist-copy-text";
 import {
 	hasEditableTextBlock,
 	resolveVListEditedMeta,
@@ -658,6 +659,8 @@ const TOGGLEABLE_CARD_KINDS = new Set([
 	// Slash-command bubbles fold their expanded prompt behind a toggle. Plain user
 	// bubbles carry no `commandText`, so the render layer ignores the callback.
 	"message-bubble",
+	// A sidecar card folds/expands on its own header row (per-record fold).
+	"sidecar",
 ]);
 /** Trace-family kinds with header/earlier/row toggles. */
 const TRACE_KINDS = new Set(["activity-trace", "tool-run-summary", "reasoning-steps"]);
@@ -728,18 +731,143 @@ function resolveTraceRowIdentity(
 }
 
 /**
+ * Is this row's card currently OPEN? — the value `onToggle` inverts.
+ *
+ * Answered from the MEASURED element wherever possible, because that is the only
+ * place the LOD-resolved truth lives: `effectiveOpened` / `effectiveExpanded` are
+ * "what the reader is actually looking at" after LOD, recency and lodExempt have
+ * had their say, which is not the same as the stored preference. Per-kind shapes:
+ *
+ *   tool-call      → `effectiveOpened`
+ *   subagent-card  → `effectiveExpanded`
+ *   reasoning      → `form === "expanded"` (its four forms encode the fold)
+ *   message-bubble → `form === "command"` + `expanded` (a slash-command bubble's
+ *                    `form` is the literal "command", so the generic checks above
+ *                    cannot see its fold; plain bubbles have no fold at all)
+ *   sidecar        → `expanded` (a per-record card, no LOD involvement)
+ *
+ * The `state` fallback exists for the keys that have NO measured entry: a tool
+ * card's sidecar mini-cards fold under `${rowKey}-sc${index}`, which is not a
+ * top-level layout item and therefore never appears in `measuredByKeyRef`. With
+ * `undefined` for both measured and fallback the expression collapsed to `false`
+ * every time, so each click wrote `expanded = true` and the card could be opened
+ * but never closed. The state map IS authoritative for those keys — nothing but
+ * this toggle writes them.
+ */
+export function resolveRowOpenState(
+	measuredElement: VListItem["measured"] | undefined,
+	state: VListInteractionState,
+	key: string,
+): boolean {
+	const measured = measuredElement as
+		| {
+				effectiveOpened?: boolean;
+				effectiveExpanded?: boolean;
+				form?: string;
+				expanded?: boolean;
+		  }
+		| undefined;
+	if (measured) {
+		// Slash-command bubble: its own `expanded` flag, checked first because its
+		// `form` value would otherwise fall through to the `"expanded"` comparison.
+		if (measured.form === "command") return measured.expanded === true;
+		if (measured.effectiveOpened !== undefined) return measured.effectiveOpened;
+		if (measured.effectiveExpanded !== undefined) return measured.effectiveExpanded;
+		if (measured.form !== undefined) return measured.form === "expanded";
+		// A standalone sidecar card: no `form`, no LOD-effective flag — just its own
+		// measured fold state.
+		if (measured.expanded !== undefined) return measured.expanded;
+	}
+	// No measured element for this key (a tool card's `-sc{i}` mini-card).
+	return state.expanded.get(key) === true;
+}
+
+/**
+ * The fold key of ONE sidecar mini-card inside a row, matching the adapter's own
+ * scheme (`${keyBase}-sc${index}` — see segment-adapter's buildSidecarSpecs).
+ */
+export function sidecarFoldKey(rowKey: string, index: number): string {
+	return `${rowKey}-sc${index}`;
+}
+
+/** Row key → its stable per-index sidecar fold dispatcher. */
+export type SidecarToggleCache = Map<string, (index: number) => void>;
+
+/**
+ * The row's sidecar fold dispatcher, memoized BY ROW KEY.
+ *
+ * Referential stability is a hard requirement, not an optimization: this is handed
+ * to every mounted tool card and the ExactRow memo compares it identity-wise, so a
+ * fresh arrow per render re-renders the whole window on every document rebuild (the
+ * measured 22.3ms/frame the comparator exists to avoid). Same discipline as
+ * `getRowToggles` / `getLoadFullPayload` / `terminateRunningTool`.
+ *
+ * One dispatcher per ROW rather than per (row, index): the index arrives as an
+ * argument, so a single function covers all of that card's mini-cards.
+ *
+ * Extracted from the component so the stability property can be asserted against
+ * the real implementation instead of a re-implementation in a test.
+ */
+export function resolveSidecarToggle(
+	cache: SidecarToggleCache,
+	rowKey: string,
+	toggleFold: (foldKey: string) => void,
+): (index: number) => void {
+	const cached = cache.get(rowKey);
+	if (cached) return cached;
+	const toggle = (index: number) => toggleFold(sidecarFoldKey(rowKey, index));
+	cache.set(rowKey, toggle);
+	return toggle;
+}
+
+/**
+ * How many sidecar mini-cards this row owns, i.e. how many `-sc{i}` fold keys can
+ * exist under it. Read from the MEASURED card, which is where the count is already
+ * resolved (the adapter filtered the invisible records out).
+ *
+ * Only tool cards host mini-cards. A STANDALONE sidecar element carries its own
+ * `-sc{i}` suffix in its own spec key and folds through the ordinary `expanded`
+ * channel, so it owns no sub-keys of its own.
+ */
+export function rowSidecarCount(item: VListItem): number {
+	if (item.spec.kind !== "tool-call") return 0;
+	return (item.measured as MeasuredToolCall).sidecars?.length ?? 0;
+}
+
+/**
  * Compact signature of everything in the interaction state that can change a
  * single row's height/appearance. Rows whose signature is unchanged (and whose
  * item + geometry are unchanged) can skip re-rendering entirely during scroll.
  */
-function rowInteractionSig(state: VListInteractionState, key: string): string {
+export function rowInteractionSig(
+	state: VListInteractionState,
+	key: string,
+	sidecarCount: number,
+): string {
 	const expanded = state.expanded.get(key);
 	const lodOverride = state.lodUserOverrides.has(key) ? 1 : 0;
 	const showEarlier = state.showEarlier.has(key) ? 1 : 0;
 	const rows = state.expandedRows.get(key);
 	const rowsSig = rows && rows.size > 0 ? [...rows].sort((a, b) => a - b).join(",") : "";
 	const promptOpen = state.promptOpen.has(key) ? 1 : 0;
-	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${promptOpen}`;
+	// Tool-result sidecar fold states live under `${key}-sc${index}`. A tool card
+	// can carry several; fold each into the row's signature so expanding one
+	// re-renders the card (its measured height changes).
+	//
+	// Iterated over the row's ACTUAL mini-card count, not "until a key is missing".
+	// The reader is free to expand only the SECOND card, in which case `-sc0` has no
+	// entry at all and a break-on-missing loop stops before ever reading `-sc1` —
+	// leaving that fold out of the signature entirely. It happened not to show,
+	// because the memo's `item.measured` comparison catches the height change
+	// anyway; a signature that silently omits state is still wrong, and relying on
+	// another term to cover for it is exactly how the live-tail bug slipped through.
+	// The count is tiny (injections per tool result), so this stays O(small).
+	let sidecarSig = "";
+	for (let i = 0; i < sidecarCount; i++) {
+		const v = state.expanded.get(sidecarFoldKey(key, i));
+		if (v !== undefined) sidecarSig += `${i}${v ? "1" : "0"}`;
+	}
+	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${promptOpen}:${sidecarSig}`;
 }
 
 /** Stable per-key toggle callbacks, memoized so equal rows keep referential props. */
@@ -836,15 +964,6 @@ interface ExactRowProps {
 	 */
 	permissionSlot?: ReactNode;
 	/**
-	 * Request this row's un-truncated payload (the truncation notice's action).
-	 *
-	 * A row grows when the payload lands, which is legitimate BECAUSE this is a
-	 * click: it is the only channel allowed to change a committed row's height.
-	 */
-	resolveLoadFullPayload?: (key: string) => (() => void) | undefined;
-	/** Tool use ids whose full payload is currently in flight. */
-	loadingFullPayloadToolUseIds?: ReadonlySet<string>;
-	/**
 	 * Inline message editor for THIS row. When present it REPLACES the row body
 	 * entirely (no zero-DOM copy, no interaction wrapper — editing has no context
 	 * menu, matching the chunked path) and the row switches to the post-paint
@@ -914,6 +1033,12 @@ interface ExactRowProps {
 	 * the fade-in on already-settled text.
 	 */
 	animateStreaming?: boolean;
+	/**
+	 * Fold toggle for a tool card's tool-result sidecar mini-card (index-addressed).
+	 * The shell resolves it through the memoized getRowToggles so a sidecar fold
+	 * re-renders exactly like any other row fold. Absent → sidecars render inert.
+	 */
+	onToggleSidecar?: (index: number) => void;
 }
 
 /**
@@ -938,8 +1063,6 @@ const ExactRow = memo(
 		openAttachmentLabel,
 		narratorId,
 		permissionSlot,
-		resolveLoadFullPayload,
-		loadingFullPayloadToolUseIds,
 		editorSlot,
 		onUnknownHeight,
 		onTerminate,
@@ -954,6 +1077,7 @@ const ExactRow = memo(
 		onOpenAskInPassingTarget,
 		viewControls,
 		animateStreaming,
+		onToggleSidecar,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
@@ -973,6 +1097,13 @@ const ExactRow = memo(
 		// on click — the render layer only draws what it is handed.
 		if (kind === "reasoning") {
 			extra.onToggleTranslation = toggles.onToggleTranslation;
+		}
+		// A tool card's tool-result sidecars fold independently of the card body.
+		// Their fold state is keyed `${spec.key}-sc${index}` (the adapter's own
+		// scheme); the per-index toggle is resolved by the shell (which owns the
+		// memoized getRowToggles) and handed in as a plain callback.
+		if (kind === "tool-call" && onToggleSidecar) {
+			extra.onToggleSidecar = onToggleSidecar;
 		}
 		if (TRACE_KINDS.has(kind)) {
 			extra.onToggleItems = toggles.onToggleItems;
@@ -1000,13 +1131,6 @@ const ExactRow = memo(
 					// paint a collapsed header inside a box reserved for the full card.
 					onToggle: () => toggles.onToggleRow(row.itemIndex),
 				};
-				if (card.truncatedLeafCount > 0) {
-					const handler = resolveLoadFullPayload?.(rowKey);
-					if (handler) cardExtra.onLoadFullPayload = handler;
-					if (card.toolUseId && loadingFullPayloadToolUseIds?.has(card.toolUseId)) {
-						cardExtra.fullPayloadLoading = true;
-					}
-				}
 				if (viewControls) {
 					const cardTargets = resolveToolDetailViewTargets(rowKey, card, {
 						sections: renderLabels.toolCall.sections,
@@ -1103,19 +1227,6 @@ const ExactRow = memo(
 		// A live permission form (pending-permission tool/subagent card) is injected
 		// as a slot; the pure renderer draws it in place of the zero-DOM copy.
 		if (permissionSlot !== undefined) extra.permissionSlot = permissionSlot;
-		// Truncation notice action. Only wired for a card that actually has truncated
-		// fields, so an untouched row keeps referentially stable props and the memo
-		// below can keep skipping it during scroll.
-		if (kind === "tool-call") {
-			const measured = item.measured as MeasuredToolCall;
-			if (measured.truncatedLeafCount > 0) {
-				const handler = resolveLoadFullPayload?.(item.spec.key);
-				if (handler) extra.onLoadFullPayload = handler;
-				if (measured.toolUseId && loadingFullPayloadToolUseIds?.has(measured.toolUseId)) {
-					extra.fullPayloadLoading = true;
-				}
-			}
-		}
 		// Manual takeover of a RUNNING reflection gate. The notice itself is measured
 		// + rendered on the pure path; only this action needs the app layer.
 		if (kind === "tool-call" && onReflectionTakeOver) {
@@ -1320,8 +1431,6 @@ const ExactRow = memo(
 		prev.onOpenFilePanel === next.onOpenFilePanel &&
 		prev.openAttachmentLabel === next.openAttachmentLabel &&
 		prev.permissionSlot === next.permissionSlot &&
-		prev.resolveLoadFullPayload === next.resolveLoadFullPayload &&
-		prev.loadingFullPayloadToolUseIds === next.loadingFullPayloadToolUseIds &&
 		prev.editorSlot === next.editorSlot &&
 		prev.onUnknownHeight === next.onUnknownHeight &&
 		prev.onTerminate === next.onTerminate &&
@@ -1334,7 +1443,13 @@ const ExactRow = memo(
 		prev.compactCancelTitle === next.compactCancelTitle &&
 		prev.askInPassingFormSlot === next.askInPassingFormSlot &&
 		prev.onOpenAskInPassingTarget === next.onOpenAskInPassingTarget &&
-		prev.viewControls === next.viewControls,
+		prev.viewControls === next.viewControls &&
+		// The sidecar fold dispatcher IS a prop the row renders from, so it belongs
+		// here like every other callback. It is cached by row key (getSidecarToggle),
+		// so an unchanged row keeps the same identity across document rebuilds and
+		// this term is a hit — the point of comparing it is that a future change to
+		// its construction cannot silently start feeding rows a stale handler.
+		prev.onToggleSidecar === next.onToggleSidecar,
 );
 
 /**
@@ -1796,22 +1911,11 @@ export const PretextExactMessageList = forwardRef<
 			if (cached) return cached;
 			const toggles: RowToggles = {
 				onToggle: () => {
-					const measured = measuredByKeyRef.current.get(key) as
-						| {
-								effectiveOpened?: boolean;
-								effectiveExpanded?: boolean;
-								form?: string;
-								expanded?: boolean;
-						  }
-						| undefined;
-					// A slash-command bubble reports its fold state on `expanded` (its `form`
-					// is the literal "command", so the generic checks below cannot see it).
-					const current =
-						measured?.form === "command"
-							? measured.expanded === true
-							: (measured?.effectiveOpened ??
-								measured?.effectiveExpanded ??
-								measured?.form === "expanded");
+					const current = resolveRowOpenState(
+						measuredByKeyRef.current.get(key),
+						activeInteractionRef.current,
+						key,
+					);
 					captureFoldBefore(key);
 					if (collapsesByLodByKeyRef.current.get(key) === true) {
 						setInteraction((prev) => toggleVListLodUserOverride(prev, key));
@@ -1846,6 +1950,19 @@ export const PretextExactMessageList = forwardRef<
 			return toggles;
 		},
 		[captureFoldBefore],
+	);
+
+	// Per-index sidecar fold dispatcher, cached by row key (see resolveSidecarToggle
+	// for why the identity must be stable). It previously escaped notice as a fresh
+	// arrow per render only because the prop was absent from the ExactRow comparator
+	// — a memo hit that depended on the comparator not looking.
+	const sidecarTogglesCacheRef = useRef<SidecarToggleCache>(new Map());
+	const getSidecarToggle = useCallback(
+		(rowKey: string) =>
+			resolveSidecarToggle(sidecarTogglesCacheRef.current, rowKey, (foldKey) =>
+				getRowToggles(foldKey).onToggle(),
+			),
+		[getRowToggles],
 	);
 
 	// Subagent-recovery card submit. The card's row set tracks DESELECTED indices
@@ -2303,15 +2420,15 @@ export const PretextExactMessageList = forwardRef<
 	const renderItemsRef = useRef(renderItems);
 	renderItemsRef.current = renderItems;
 
-	// Tool uses whose full payload the USER asked for (the truncation notice's
-	// "load full content"). Publishing the list into state rather than reading it
-	// during the build keeps the data flow one-way — the fetched payloads feed the
-	// NEXT build through the resolvers above.
+	// Tool uses whose full payload the USER asked for — by reading past the halfway
+	// mark of a prefix body, or by opening one in fullscreen. Publishing the list
+	// into state rather than reading it during the build keeps the data flow
+	// one-way — the fetched payloads feed the NEXT build through the resolvers above.
 	//
-	// The gate is `fullPayloadRequested`, NOT `expanded`: growing a committed row is
-	// only acceptable when a click asked for those bytes. Merely expanding a card
-	// shows the (already measured) preview and must not change its height, which is
-	// why the two signals are separate sets.
+	// The gate is `fullPayloadRequested`, NOT `expanded`: fetching for a committed
+	// row is only acceptable when the reader actually engaged with that body. Merely
+	// expanding a card shows the (already measured) preview, which is why the two
+	// signals are separate sets.
 	// A subagent card's PROMPT is the same kind of request through a different
 	// affordance: unfolding the prompt IS the click that asks for those bytes, so
 	// `promptOpen` gates the fetch (never mere card expansion, and never a card the
@@ -2337,8 +2454,8 @@ export const PretextExactMessageList = forwardRef<
 			// A drilled-in trace row hosts a real tool card, so it reaches the same
 			// truncated payloads. Gated per ROW (several rows of one trace can be open),
 			// and — like the standalone card — only on an explicit request: the card
-			// already reserves the full cap while truncated, so loading is a shrink the
-			// reader asked for, never a surprise growth.
+			// already reserves the full cap while truncated, so the landing payload
+			// measures to the same box, never a surprise growth.
 			if (TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind)) {
 				const measured = item.measured as MeasuredCollapsibleTrace;
 				for (const row of measured.rows) {
@@ -2358,9 +2475,9 @@ export const PretextExactMessageList = forwardRef<
 		);
 	}, [truncatedExpandedToolUseIds]);
 
-	// Stable per-key "load full payload" callbacks, so a row that is not loading
-	// keeps referentially identical props and the ExactRow memo can keep skipping it
-	// while the user scrolls.
+	// Mark a row as having asked for its full payload. Referentially stable per key
+	// so the viewer controls (compared identity-wise by every mounted row's memo)
+	// never churn during a scroll.
 	const loadFullPayloadCacheRef = useRef<Map<string, () => void>>(new Map());
 	const getLoadFullPayload = useCallback((key: string): (() => void) => {
 		const cached = loadFullPayloadCacheRef.current.get(key);
@@ -2371,22 +2488,15 @@ export const PretextExactMessageList = forwardRef<
 		loadFullPayloadCacheRef.current.set(key, handler);
 		return handler;
 	}, []);
-	// Requested-but-not-yet-resolved ids drive the notice's loading text. A payload
-	// that has landed leaves `truncatedToolUseIds` (its leaf count drops to zero), so
-	// membership here IS "in flight".
-	const loadingFullPayloadToolUseIds = useMemo(
-		() => new Set(truncatedToolUseIds),
-		[truncatedToolUseIds],
-	);
 
 	// Fullscreen content viewer: per-body wrap / source state plus the single open
 	// target. Deliberately NOT part of `VListInteractionState` — that object feeds
 	// computeLayout, and these are pure render state (see useVListContentView).
 	//
-	// `requestFullPayload` is the second entry point into the SAME grow-only
-	// interaction channel the truncation notice uses: opening a prefix body in
-	// fullscreen is unambiguously a request for those bytes, so the reader does not
-	// have to find and click the notice line first.
+	// `requestFullPayload` is how a prefix body reaches its real bytes: reading past
+	// the halfway mark of an inline body, or opening one in fullscreen. Both are
+	// user actions on the grow-only interaction channel, which is what lets a
+	// committed row's payload change at all.
 	const contentView = useVListContentView({ requestFullPayload: getLoadFullPayload });
 
 	// The open modal's body, re-derived from the CURRENT document.
@@ -2885,6 +2995,16 @@ export const PretextExactMessageList = forwardRef<
 			if (settleTimer !== undefined) clearTimeout(settleTimer);
 		};
 	}, [viewportNode, centeredColumn]);
+
+	// Rebuild the copied text from the vlist's own structure instead of letting the
+	// browser serialize the absolute-positioned boxes. Every visual line and every
+	// blank-strip caret filler is a block-level box, so the native serializer turns
+	// soft wraps into hard newlines and paragraph gaps into a doubled newline holding
+	// an invisible U+200B. See vlist-copy-text.ts.
+	//
+	// Keyed on `viewportNode` (state) for the same reason as the effect above: a ref
+	// read at mount time outlives the node it read.
+	useEffect(() => installVListCopyHandler(viewportNode), [viewportNode]);
 
 	const hasTailFooter = tailFooter != null;
 	useLayoutEffect(() => {
@@ -3670,17 +3790,16 @@ export const PretextExactMessageList = forwardRef<
 									// the tail is height-neutral. Without this term the memo skips the
 									// re-render and the newest characters never reach the DOM. Empty string
 									// for every settled row, so scroll-time memo hits are unaffected.
-									interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}`}
+									interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key, rowSidecarCount(item))}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}`}
 									toggles={getRowToggles(item.spec.key)}
 									renderLabels={renderLabels}
 									interaction={interactionsByKey.get(item.spec.key)}
 									rowInteraction={rowInteractionByKey.get(item.spec.key)}
 									narratorId={narratorId}
+									onToggleSidecar={getSidecarToggle(item.spec.key)}
 									onOpenFilePanel={rowHandlers?.onOpenFilePanel}
 									openAttachmentLabel={openAttachmentLabel}
 									permissionSlot={permissionSlot}
-									resolveLoadFullPayload={getLoadFullPayload}
-									loadingFullPayloadToolUseIds={loadingFullPayloadToolUseIds}
 									editorSlot={editorSlot}
 									onTerminate={terminateRunningTool}
 									resolveUpdateTimeout={getUpdateTimeout}

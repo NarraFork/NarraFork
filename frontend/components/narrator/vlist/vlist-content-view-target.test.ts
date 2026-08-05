@@ -90,6 +90,71 @@ describe("resolveToolDetailViewTargets — capped bodies", () => {
 		expect(t.resolveToolDetailViewTargets(KEY, { detail: prefix })[0]?.truncated).toBe(true);
 	});
 
+	it("flags a server-truncated MARKDOWN body too (plan / skill / knowledge)", async () => {
+		const t = await targets();
+		const m = await measureMod();
+		// The markdown branch used to drop `textTruncated` on the floor, so a plan or
+		// knowledge body whose payload was a preview looked complete to the viewer —
+		// and with the truncation notice gone that left it with NO route to its real
+		// bytes at all.
+		const prefix = m.measureToolDetail(
+			{
+				kind: "capped",
+				cap: "plan",
+				contentLines: 2,
+				text: "# Plan\n\n- step one",
+				markdown: true,
+				textTruncated: true,
+			},
+			WIDTH,
+		);
+		const [only] = t.resolveToolDetailViewTargets(KEY, { detail: prefix });
+		expect(only?.kind).toBe("markdown");
+		expect(only?.truncated).toBe(true);
+
+		// A complete markdown body stays unflagged: there is nothing to fetch.
+		const whole = m.measureToolDetail(
+			{
+				kind: "capped",
+				cap: "plan",
+				contentLines: 2,
+				text: "# Plan\n\n- step one",
+				markdown: true,
+			},
+			WIDTH,
+		);
+		expect(t.resolveToolDetailViewTargets(KEY, { detail: whole })[0]?.truncated).toBeUndefined();
+	});
+
+	it("flags a server-truncated markdown body inside a SECTION", async () => {
+		const t = await targets();
+		const m = await measureMod();
+		// Sectioned details (skill / knowledge / Send) carry the flag per body, so the
+		// copy into the section descriptor has to survive too.
+		const detail = m.measureToolDetail(
+			{
+				kind: "sections",
+				sections: [
+					{
+						label: "result",
+						body: {
+							kind: "capped",
+							cap: "code",
+							contentLines: 2,
+							text: "# Entry\n\nbody text",
+							markdown: true,
+							textTruncated: true,
+						},
+					},
+				],
+			},
+			WIDTH,
+		);
+		const [only] = t.resolveToolDetailViewTargets(KEY, { detail });
+		expect(only?.kind).toBe("markdown");
+		expect(only?.truncated).toBe(true);
+	});
+
 	it("classifies terminal output as the term visual", async () => {
 		const t = await targets();
 		const m = await measureMod();

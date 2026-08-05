@@ -69,11 +69,11 @@ export interface UseVListContentViewOptions {
 	/**
 	 * Ask the shell to fetch a row's un-truncated payload.
 	 *
-	 * Opening a body in fullscreen IS a request for that body's bytes, so a target
-	 * flagged `truncated` triggers this — the same channel the truncation notice
-	 * uses, keyed by the target's spec key. Without it the modal could only ever
-	 * show the server-side prefix, which is exactly what a reader opens fullscreen
-	 * to get past.
+	 * Reaching a body's later half, or opening it in fullscreen, IS a request for
+	 * that body's bytes, so a target flagged `truncated` triggers this — keyed by
+	 * the target's spec key. Without it a body could only ever show the server-side
+	 * prefix, which is exactly what a reader scrolls (or opens fullscreen) to get
+	 * past.
 	 */
 	requestFullPayload?: (specKey: string) => void;
 }
@@ -113,16 +113,30 @@ export function useVListContentView(
 		[showSource],
 	);
 
-	const openFullscreen = useCallback((target: VListViewTarget) => {
-		setOpenTarget(target);
-		// A prefix body is the one case where opening the modal must also FETCH. The
-		// request is idempotent and grow-only (see markVListFullPayloadRequested), so
-		// re-opening the same body costs nothing.
-		if (target.truncated === true) {
-			const specKey = viewTargetSpecKey(target.id);
-			if (specKey) requestFullPayloadRef.current?.(specKey);
-		}
+	/**
+	 * Ask the shell for a body's real payload. A no-op for a body that is already
+	 * complete, so every caller can hand it any target unconditionally.
+	 *
+	 * Two callers today: opening the body in fullscreen, and reading past the
+	 * halfway mark of an inline one (VListContentViewHost). Both are user actions,
+	 * and the underlying request is idempotent + grow-only, so neither has to know
+	 * about the other.
+	 */
+	const requestFullPayload = useCallback((target: VListViewTarget) => {
+		if (target.truncated !== true) return;
+		const specKey = viewTargetSpecKey(target.id);
+		if (specKey) requestFullPayloadRef.current?.(specKey);
 	}, []);
+
+	const openFullscreen = useCallback(
+		(target: VListViewTarget) => {
+			setOpenTarget(target);
+			// A prefix body is the one case where opening the modal must also FETCH:
+			// the prefix is exactly what the reader opened fullscreen to get past.
+			requestFullPayload(target);
+		},
+		[requestFullPayload],
+	);
 
 	const controls = useMemo<VListViewControls>(
 		() => ({
@@ -131,8 +145,9 @@ export function useVListContentView(
 			toggleWrap: (target) => toggle(setWrap, target.id, defaultWrap(target)),
 			toggleSource: (target) => toggle(setShowSource, target.id, false),
 			openFullscreen,
+			requestFullPayload,
 		}),
-		[isWrapped, isSourceShown, defaultWrap, openFullscreen],
+		[isWrapped, isSourceShown, defaultWrap, openFullscreen, requestFullPayload],
 	);
 
 	const refreshOpenTarget = useCallback((next: VListViewTarget) => {

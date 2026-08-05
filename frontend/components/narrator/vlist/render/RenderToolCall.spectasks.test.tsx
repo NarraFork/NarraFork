@@ -61,11 +61,38 @@ function render(node: ReactNode): Element {
 	return document.getElementById("r") as unknown as Element;
 }
 
+/**
+ * The absolutely-positioned LINE BOX that owns a fragment — the element whose
+ * `left` is the measured text indent.
+ *
+ * Walked up rather than reached with a fixed number of `.parentElement` hops,
+ * because a fragment is NOT a direct child of its line box: `LineFragments`
+ * (line-fragments.tsx) inserts one `data-vlist-line-frags` block span around all
+ * of a line's fragments. That wrapper is load-bearing — CSS blockifies flex
+ * items, so without it the plain-text serializer put a newline before AND after
+ * every inline code span / link / bold run when a reader copied a selection.
+ * Counting hops here would break again the next time the render layer wraps a
+ * line, so we look for the positioning itself instead.
+ */
+function lineBoxOf(frag: Element): Element | null {
+	let el: Element | null = frag.parentElement;
+	while (el) {
+		const style = el.getAttribute("style") ?? "";
+		// A line box is the absolutely-positioned FLEX row: the flex is what
+		// vertically centers the fragments inside the reserved line height, and it is
+		// what distinguishes the line from the block's own absolute wrapper above it.
+		if (style.includes("position:absolute") && style.includes("display:flex")) return el;
+		el = el.parentElement;
+	}
+	return null;
+}
+
 /** The painted `left` of each task text line, in row order. */
 function textLefts(root: Element): number[] {
 	return Array.from(root.querySelectorAll(".vlist-tc-spec-task")).map((frag) => {
-		const style = frag.parentElement?.getAttribute("style") ?? "";
-		return Number.parseInt(/left:\s*(-?\d+)px/.exec(style)?.[1] ?? "-1", 10);
+		const style = lineBoxOf(frag)?.getAttribute("style") ?? "";
+		// `px` optional: React serializes a zero-valued `left` as plain `0`.
+		return Number.parseInt(/left:\s*(-?\d+)(?:px)?/.exec(style)?.[1] ?? "-1", 10);
 	});
 }
 

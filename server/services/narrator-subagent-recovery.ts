@@ -33,14 +33,20 @@
 import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
-import { AsyncMutex } from "../lib/async-mutex";
+import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { isSubagentVariant, parseSubstatus, parseTraits } from "../lib/narrator-utils";
+import {
+	isSubagentVariant,
+	NARRATOR_RECOVERY_OFFERED_TRAIT_PREFIX,
+	parseSubstatus,
+	parseTraits,
+} from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
+import { parseTurnPauseTiming } from "./narrator-turn-timing";
 import { registerAndPersistSubagentAlias } from "./subagent-alias";
 
 /** Statuses that mean "this tool call never produced a usable result". */
@@ -187,8 +193,18 @@ export interface RecoveryCardSubagentInput extends RecoverySubagentInput {
 	variant?: string | null;
 	errorMessage?: string | null;
 	createdAt: string;
+	/**
+	 * Last write to this subagent row. Used only as a FALLBACK failure timestamp —
+	 * see {@link recoveryFailureTimeMs} for why it cannot be trusted on its own.
+	 */
+	updatedAt?: string | null;
 	/** The parent Agent tool_use id that originally spawned this subagent. */
 	originToolUseId?: string | null;
+	/**
+	 * Traits of the subagent, used to read the "already offered" watermark that
+	 * suppresses re-listing a failure the user has already seen on a card.
+	 */
+	traits?: unknown;
 }
 
 export interface RecoveryCardCandidate {
@@ -202,28 +218,132 @@ export interface RecoveryCardCandidate {
 }
 
 /**
- * Pick the subagents that belong on the recovery card: settled with an error,
- * created within the window, and NOT already handled by Path A.
+ * Trait prefix recording that this subagent's failure has ALREADY been offered on a
+ * recovery card, together with the failure timestamp that was offered.
+ *
+ * Without this watermark the card is rebuilt from scratch on every single narrator
+ * error, so one long session with a handful of old failures re-proposes the same
+ * dead subagents again and again — the user declines, the next error re-lists them.
+ * Storing the offered failure time (rather than a plain boolean) keeps a subagent
+ * eligible again if it genuinely fails a SECOND time after being resumed.
+ *
+ * Unlike every other trait, this is INTERNAL runtime bookkeeping, not something the
+ * user or the platform configured, so it is registered in
+ * {@link NARRATOR_INTERNAL_TRAIT_PREFIXES} and never reaches an API response.
+ */
+export const RECOVERY_OFFERED_TRAIT_PREFIX = NARRATOR_RECOVERY_OFFERED_TRAIT_PREFIX;
+
+export function buildRecoveryOfferedTrait(failedAtMs: number): string {
+	return `${RECOVERY_OFFERED_TRAIT_PREFIX}${Math.floor(failedAtMs)}`;
+}
+
+/** Read the failure timestamp already offered for this subagent, if any. */
+export function parseRecoveryOfferedAtMs(traits: unknown): number | null {
+	let offered: number | null = null;
+	for (const trait of parseTraits(traits)) {
+		if (!trait.startsWith(RECOVERY_OFFERED_TRAIT_PREFIX)) continue;
+		const value = Number(trait.slice(RECOVERY_OFFERED_TRAIT_PREFIX.length));
+		if (!Number.isFinite(value)) continue;
+		offered = offered == null ? value : Math.max(offered, value);
+	}
+	return offered;
+}
+
+/** Replace any existing watermark with one recording `failedAtMs`. */
+export function withRecoveryOfferedTrait(traits: unknown, failedAtMs: number): string[] {
+	const kept = parseTraits(traits).filter(
+		(trait) => !trait.startsWith(RECOVERY_OFFERED_TRAIT_PREFIX),
+	);
+	return [...kept, buildRecoveryOfferedTrait(failedAtMs)];
+}
+
+/**
+ * The moment a settled subagent actually failed, as far as the row can tell.
+ *
+ * Three sources, in descending order of trustworthiness:
+ *
+ * 1. **`turn_pause_started_ms:` in `substatus`** — written by
+ *    `transitionTurnTimingSubstatus` in the very `updateStatus` call that tags the row
+ *    `error`/`interrupted`/`payment_required`, and cleared only when the row goes back
+ *    to `working`. This is the real failure instant, and nothing outside the
+ *    status/substatus path ever rewrites it: title syncs, trait writes, alias
+ *    persistence and detach all touch other columns.
+ *
+ * 2. **`updatedAt`** — a FALLBACK for rows that predate turn timing or were settled by
+ *    a path that wrote no timing tag. It is only an upper bound on the failure time:
+ *    `updatedAt` is the last write to the row from ANY source, so a subagent that
+ *    failed hours ago has its `updatedAt` pushed to "now" by e.g.
+ *    `persistSubagentAlias` (subagent-alias), the `background` tagging in
+ *    `subagent-detach`, a title sync (narrator-title), or a user editing this
+ *    subagent's custom traits. When that happens with no timing tag present, the stale
+ *    failure looks fresh again and the card re-offers it — precisely the symptom the
+ *    watermark exists to kill, which is why the watermark is the second line of
+ *    defence and this is not the primary source.
+ *
+ * 3. **`createdAt`** — last resort, so a row with no usable timestamp at all is simply
+ *    dropped by the caller rather than treated as "failed at epoch".
+ *
+ * A dedicated `failed_at` column would make (1) unconditional instead of derived, but
+ * that needs a schema change; the timing tag is an existing, equally durable signal.
+ */
+export function recoveryFailureTimeMs(sa: RecoveryCardSubagentInput): number | null {
+	const { pauseStartedAtMs } = parseTurnPauseTiming(parseSubstatus(sa.substatus));
+	if (pauseStartedAtMs != null) return pauseStartedAtMs;
+	const failedMs = Date.parse(sa.updatedAt ?? "");
+	if (Number.isFinite(failedMs)) return failedMs;
+	const createdMs = Date.parse(sa.createdAt);
+	return Number.isFinite(createdMs) ? createdMs : null;
+}
+
+/**
+ * Pick the subagents that belong on the recovery card.
+ *
+ * A candidate must be settled with an error, have FAILED recently (not merely
+ * been created recently), not already be owned by Path A, and not already have
+ * been offered on an earlier card. The failure-time test is what keeps a card
+ * about "the error that just happened" from also dragging in every subagent that
+ * died hours ago earlier in the same session.
  */
 export function selectRecoveryCardCandidates(
 	subagents: RecoveryCardSubagentInput[],
 	options: {
 		nowMs: number;
 		windowMs?: number;
+		/**
+		 * Start of the parent turn that just failed. Failures older than this
+		 * belong to turns the parent already finished (and was already told about
+		 * through the background-completion notice), so they are not part of the
+		 * work this card offers to resume.
+		 */
+		turnStartedAtMs?: number | null;
 		/** Agent tool_use ids on the latest assistant turn (owned by Path A). */
 		latestTurnToolUseIds?: Set<string>;
 	},
 ): RecoveryCardCandidate[] {
 	const windowMs = options.windowMs ?? RECOVERY_CARD_WINDOW_MS;
-	const cutoffMs = options.nowMs - windowMs;
+	// The turn boundary is the precise rule; the window is only an outer bound for
+	// rows whose turn start is unknown (pre-feature data, externally driven runs).
+	const turnStartedAtMs =
+		options.turnStartedAtMs != null && Number.isFinite(options.turnStartedAtMs)
+			? options.turnStartedAtMs
+			: null;
+	const cutoffMs = Math.max(options.nowMs - windowMs, turnStartedAtMs ?? Number.NEGATIVE_INFINITY);
 	const latest = options.latestTurnToolUseIds ?? new Set<string>();
 	const candidates: RecoveryCardCandidate[] = [];
 
 	for (const sa of subagents) {
 		if (sa.status !== "idle") continue;
 		if (!parseSubstatus(sa.substatus).includes("error")) continue;
-		const createdMs = Date.parse(sa.createdAt);
-		if (!Number.isFinite(createdMs) || createdMs < cutoffMs) continue;
+		// The window applies to the FAILURE, not to the spawn: a subagent created
+		// early in a long session and failed minutes ago is relevant, while one that
+		// failed many hours ago is not, no matter when it was created.
+		// See recoveryFailureTimeMs for why the substatus timing tag is preferred over
+		// updatedAt, and what goes wrong when only the fallback is available.
+		const failedMs = recoveryFailureTimeMs(sa);
+		if (failedMs == null || failedMs < cutoffMs) continue;
+		// Already proposed once. Only a NEWER failure re-opens the offer.
+		const offeredAtMs = parseRecoveryOfferedAtMs(sa.traits);
+		if (offeredAtMs != null && failedMs <= offeredAtMs) continue;
 		// Path A owns the latest turn; never list the same work twice.
 		if (sa.originToolUseId && latest.has(sa.originToolUseId) && !sa.isBackground) continue;
 
@@ -731,16 +851,28 @@ export interface SubagentRecoveryCardEntry extends RecoveryCardCandidate {}
 export async function persistSubagentRecoveryCard(narratorId: string): Promise<boolean> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { id: true, variant: true },
+		columns: { id: true, variant: true, turnStartedAt: true },
 	});
 	if (!narrator || isSubagentVariant(narrator.variant)) return false;
 
-	const cutoff = new Date(Date.now() - RECOVERY_CARD_WINDOW_MS).toISOString();
+	const nowMs = Date.now();
+	const turnStartedAtMs = narrator.turnStartedAt ? Date.parse(narrator.turnStartedAt) : Number.NaN;
+	// The turn that just failed is the relevant scope. Fall back to the 24h window
+	// only when the turn start is unknown.
+	const cutoffMs = Number.isFinite(turnStartedAtMs)
+		? Math.max(nowMs - RECOVERY_CARD_WINDOW_MS, turnStartedAtMs)
+		: nowMs - RECOVERY_CARD_WINDOW_MS;
+	// SQL prefilter on updatedAt, not createdAt: selecting by spawn time pulled in every
+	// subagent a long session ever started. It stays a PREFILTER only — `updatedAt` is
+	// the last write from any source, so it is an upper bound on the failure time and can
+	// only ever be too generous, never too strict (any row whose real failure time is
+	// within the cutoff necessarily has `updatedAt >= cutoff`). The precise decision is
+	// made in-memory by recoveryFailureTimeMs, which prefers the substatus timing tag.
 	const rows = await db.query.narrators.findMany({
 		where: and(
 			eq(narrators.parentNarratorId, narratorId),
 			eq(narrators.status, "idle"),
-			gte(narrators.createdAt, cutoff),
+			gte(narrators.updatedAt, new Date(cutoffMs).toISOString()),
 		),
 		columns: {
 			id: true,
@@ -751,7 +883,9 @@ export async function persistSubagentRecoveryCard(narratorId: string): Promise<b
 			subagentType: true,
 			variant: true,
 			errorMessage: true,
+			traits: true,
 			createdAt: true,
+			updatedAt: true,
 		},
 		limit: 50,
 	});
@@ -777,9 +911,11 @@ export async function persistSubagentRecoveryCard(narratorId: string): Promise<b
 		...row,
 		originToolUseId: origins.get(row.id) ?? null,
 	}));
+	const byId = new Map(withOrigin.map((row) => [row.id, row]));
 
 	const candidates = selectRecoveryCardCandidates(withOrigin, {
-		nowMs: Date.now(),
+		nowMs,
+		turnStartedAtMs: Number.isFinite(turnStartedAtMs) ? turnStartedAtMs : null,
 		latestTurnToolUseIds,
 	});
 	if (candidates.length === 0) return false;
@@ -789,7 +925,110 @@ export async function persistSubagentRecoveryCard(narratorId: string): Promise<b
 		`[Subagent recovery] ${candidates.length} subagent(s) stopped with an error.`,
 		[{ type: "subagent_recovery", status: "pending", subagents: candidates }],
 	);
+	// Watermark AFTER the card exists, so a failed insert leaves the offer open.
+	// Without this, the next narrator error rebuilds the very same card and the user
+	// is asked about the same dead subagents over and over.
+	await markRecoveryOffered(
+		candidates.map((candidate) => {
+			const row = byId.get(candidate.id);
+			return { id: candidate.id, failedAtMs: row ? recoveryFailureTimeMs(row) : null };
+		}),
+	);
 	return true;
+}
+
+/**
+ * Build the column patch that stamps the watermark onto one subagent row.
+ *
+ * ⚠️ THIS MUST NEVER WRITE `updatedAt`, and the omission is deliberate — do not
+ * "fix" it to match the rest of the codebase.
+ *
+ * `updatedAt` is the fallback failure timestamp of this whole mechanism (see
+ * {@link recoveryFailureTimeMs}). Touching it here would move the recorded failure
+ * time forward to the moment the card was OFFERED, so on the next narrator error the
+ * comparison `failedMs <= offeredAtMs` would flip to false for every row we just
+ * watermarked and the card would re-propose the very same dead subagents — the exact
+ * bug the watermark exists to prevent. It would also keep resurrecting stale failures
+ * into the 24h window forever.
+ *
+ * `narrator-subagent-recovery.test.ts` asserts both that this patch carries no
+ * `updatedAt` key and that a real watermark write leaves the stored value untouched.
+ */
+export function buildRecoveryOfferedUpdate(
+	traits: unknown,
+	failedAtMs: number,
+): { traits: string[] } {
+	return { traits: withRecoveryOfferedTrait(traits, failedAtMs) };
+}
+
+/**
+ * Stamp the "already offered" watermark on the subagents a card just listed.
+ *
+ * Serialized through {@link narratorTraitsLock}, the same per-narrator lock every other
+ * trait writer uses (`updateNarratorTraits` in routes/narrators, narrator-plan-mode,
+ * pipeline-state). `traits` is a whole-column JSON array, so an unlocked
+ * read-modify-write here would silently drop a concurrent write — e.g. a user editing
+ * this subagent's disabled-tools at the same moment.
+ *
+ * Two-phase on purpose: one batched read decides which rows still need a write, then
+ * only those take the lock and re-read. On the common repeat path (rows already
+ * watermarked at this failure time) the batch read is the only query, instead of a
+ * select + update per candidate. Row count is bounded by the card's 50-candidate cap.
+ *
+ * Best-effort per row: a failed write only means that subagent may be offered once
+ * more, which is far better than skipping the whole batch.
+ */
+export async function markRecoveryOffered(
+	entries: Array<{ id: string; failedAtMs: number | null }>,
+): Promise<void> {
+	const wanted = new Map<string, number>();
+	for (const entry of entries) {
+		if (entry.failedAtMs == null) continue;
+		wanted.set(entry.id, entry.failedAtMs);
+	}
+	if (wanted.size === 0) return;
+
+	let existing: Array<{ id: string; traits: unknown }>;
+	try {
+		existing = await db.query.narrators.findMany({
+			where: inArray(narrators.id, [...wanted.keys()]),
+			columns: { id: true, traits: true },
+		});
+	} catch (err) {
+		logger.warn("Failed to read traits before watermarking offered recovery subagents", {
+			count: wanted.size,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return;
+	}
+
+	for (const row of existing) {
+		const failedAtMs = wanted.get(row.id);
+		if (failedAtMs == null) continue;
+		// Already watermarked at (or past) this failure — nothing to write.
+		const offeredAtMs = parseRecoveryOfferedAtMs(row.traits);
+		if (offeredAtMs != null && offeredAtMs >= failedAtMs) continue;
+		try {
+			await narratorTraitsLock.acquire(row.id, async () => {
+				// Re-read INSIDE the lock: the batched read above may be stale by now, and
+				// writing from it would clobber whatever landed in between.
+				const current = await db.query.narrators.findFirst({
+					where: eq(narrators.id, row.id),
+					columns: { traits: true },
+				});
+				if (!current) return;
+				await db
+					.update(narrators)
+					.set(buildRecoveryOfferedUpdate(current.traits, failedAtMs))
+					.where(eq(narrators.id, row.id));
+			});
+		} catch (err) {
+			logger.warn("Failed to watermark an offered recovery subagent", {
+				subagentId: row.id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
 }
 
 export interface ResumeRecoverySubagentsResult {
@@ -881,18 +1120,31 @@ export async function resumeRecoverySubagents(input: {
 				alias,
 				title,
 			});
-			// c) mark the narrator itself as background (detach's job, done by hand)
-			await db
-				.update(narrators)
-				.set({
-					isBackground: true,
-					backgroundStatus: "running",
-					backgroundResult: null,
-					backgroundCompletedAt: null,
-					traits: [...new Set([...parseTraits(subagent.traits), "background"])],
-					updatedAt: new Date().toISOString(),
-				})
-				.where(eq(narrators.id, subagentId));
+			// c) mark the narrator itself as background (detach's job, done by hand).
+			//    Under narratorTraitsLock with a fresh read, because `traits` is a whole-column
+			//    JSON array: writing the copy fetched at the top of this iteration would drop
+			//    any trait written since (including the watermark this very card just stamped).
+			//    `updatedAt` IS written here on purpose — unlike the watermark, this row is
+			//    being resumed, so its old failure time is no longer the relevant one.
+			await narratorTraitsLock.acquire(subagentId, async () => {
+				const current = await db.query.narrators.findFirst({
+					where: eq(narrators.id, subagentId),
+					columns: { traits: true },
+				});
+				await db
+					.update(narrators)
+					.set({
+						isBackground: true,
+						backgroundStatus: "running",
+						backgroundResult: null,
+						backgroundCompletedAt: null,
+						traits: [
+							...new Set([...parseTraits(current?.traits ?? subagent.traits), "background"]),
+						],
+						updatedAt: new Date().toISOString(),
+					})
+					.where(eq(narrators.id, subagentId));
+			});
 
 			// d) restart, keeping background semantics and leaving the historical
 			//    Agent tool_result untouched.

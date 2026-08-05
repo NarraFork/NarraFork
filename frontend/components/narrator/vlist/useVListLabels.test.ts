@@ -40,6 +40,7 @@ const STUB_LABELS = {
 	permission: { tag: "permission" },
 	askUserQuestion: { tag: "askUserQuestion" },
 	askInPassing: { tag: "askInPassing" },
+	sidecar: { tag: "sidecar" },
 	planCard: "plan",
 	pruneDivider: "pruned",
 } as unknown as VListRenderLabels;

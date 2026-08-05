@@ -146,14 +146,17 @@ export interface NugUsageSummary {
 // === NUG-specific API response types ===
 
 export interface NugChannelHealthStatus {
+	/** Channel instance name; several instances may share one channelType. */
+	channel?: string;
 	channelType: string;
-	totalCredentials: number;
-	availableCredentials: number;
-	disabledCredentials: number;
+	healthy?: boolean;
 	availabilityRate: number;
-	currentConcurrency: number;
-	maxConcurrency: number;
-	queueDepth: number;
+	totalCredentials?: number;
+	availableCredentials?: number;
+	disabledCredentials?: number;
+	currentConcurrency?: number;
+	maxConcurrency?: number;
+	queueDepth?: number;
 }
 
 export interface NugQuota {

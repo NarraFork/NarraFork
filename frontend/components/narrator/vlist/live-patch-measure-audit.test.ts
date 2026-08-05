@@ -746,19 +746,31 @@ describe("live-patch audit: fields that are height-NEUTRAL (single header row)",
 		expect(identified.height).toBe(base.height);
 	});
 
-	it("sideCars presence does not change the measured height", async () => {
-		// tool_completed may carry sidecars; they are not part of the card body.
+	it("tool_result sideCars grow the card (they render as mini-cards now)", async () => {
+		// tool_completed may carry sidecars; since the vlist sidecar feature they are
+		// part of the card body (mini-cards between the header and the detail), so
+		// their presence ADDS height. This is the reverse of the pre-feature
+		// assertion that they were not part of the body at all.
 		const { measureToolCall } = await measureMod();
 		const base = measureToolCall(expandedCard(), WIDTH, LOD, OPENED);
 		const withSideCars = measureToolCall(
 			expandedCard({
-				sideCars: [{ target: "tool_result", source: "hook", content: "note" }],
+				sidecars: [
+					{
+						source: "silent_progress",
+						sourceLabel: "Progress reminder",
+						color: "indigo",
+						target: "tool_result",
+						previewText: "note",
+						fullText: "note",
+					},
+				],
 			} as unknown as Partial<ToolCallData>),
 			WIDTH,
 			LOD,
 			OPENED,
 		);
-		expect(withSideCars.height).toBe(base.height);
+		expect(withSideCars.height).toBeGreaterThan(base.height);
 	});
 });
 

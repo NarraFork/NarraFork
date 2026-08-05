@@ -31,6 +31,7 @@
  * content changes between measurements.
  */
 
+import { SIDECAR_PAYLOAD_KIND } from "@shared/pretext-layout/sidecar";
 import type { MeasuredElement } from "./prepared-block";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,6 +171,7 @@ export function extractDataRevision(data: unknown): string | undefined {
 	if (typeof d.truncatedLeafCount === "number") rev += `|tp:${d.truncatedLeafCount}`;
 	rev += detailTextRevision(d.detail);
 	rev += reflectionRevision(d.reflection);
+	rev += sidecarRevision(d);
 	rev += subagentRevision(d);
 	rev += traceRevision(d);
 	return rev || undefined;
@@ -250,6 +252,49 @@ function traceRevision(d: Record<string, unknown>): string {
 			rev += detailTextRevision(card.detail);
 			rev += reflectionRevision(card.reflection);
 		}
+	}
+	return rev;
+}
+
+/**
+ * Revision of a sidecar payload — BOTH shapes that carry one:
+ *
+ * 1. A standalone `sidecar` element's data. The card's expanded body height comes
+ *    from the full text, so a live `sidecars` event that appends to an
+ *    already-loaded message must re-measure — yet the spec key, messageVersion
+ *    and opts all stay put (the append reuses the same spec key for an existing
+ *    index only when the count is unchanged, which is exactly when a SAME-INDEX
+ *    content swap would be invisible).
+ * 2. A tool call's `sidecars` array. `toolCompletedPatch` writes `tc.sideCars`
+ *    in place while `status` moves to a terminal value — but a completion with
+ *    sidecars on an ALREADY-terminal reload, or a same-status re-delivery, moves
+ *    nothing else. CONTRACT.md §4.5 names this exact trap: the patch changes a
+ *    field the measure reads, so the revision must cover it.
+ *
+ * The two are told apart by the adapter's EXPLICIT `payloadKind` marker, not by
+ * sniffing for `fullText` + `source`. Shape sniffing put any future payload that
+ * happens to carry those two field names into branch 1, where it would be keyed by
+ * a revision describing something else — i.e. served a stale height. A literal
+ * discriminant cannot be collided into by accident.
+ *
+ * Cost is O(n) with n = sidecar count (always tiny), each a bounded signature.
+ */
+function sidecarRevision(d: Record<string, unknown>): string {
+	// Standalone sidecar element (positively identified by the adapter's marker).
+	if (d.payloadKind === SIDECAR_PAYLOAD_KIND) {
+		const source = typeof d.source === "string" ? d.source : "";
+		const body = typeof d.fullText === "string" ? d.fullText : "";
+		return `|sc:${source}|scb:${textSignature(body)}`;
+	}
+	// Tool card's sidecar array.
+	const list = d.sidecars;
+	if (!Array.isArray(list) || list.length === 0) return "";
+	let rev = `|scs:${list.length}`;
+	for (const item of list) {
+		if (item == null || typeof item !== "object") continue;
+		const sc = item as Record<string, unknown>;
+		if (typeof sc.source === "string") rev += `|s:${sc.source}`;
+		if (typeof sc.fullText === "string") rev += `|b:${textSignature(sc.fullText)}`;
 	}
 	return rev;
 }

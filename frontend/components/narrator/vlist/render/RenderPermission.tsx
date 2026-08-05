@@ -31,7 +31,7 @@ import {
 } from "@chenglou/pretext/rich-inline";
 import { Alert, Badge, Box, Button, Group, Paper, Text } from "@mantine/core";
 import { IconClockHour4 } from "@tabler/icons-react";
-import { useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import {
 	ALERT_PADDING,
 	ASK_BUTTON_ROW_HEIGHT,
@@ -46,6 +46,7 @@ import {
 	TARGET_PADDING,
 } from "../measure/measure-permission";
 import type { PreparedInlineBlock } from "../prepared-block";
+import { FragmentGap, LineFragments } from "./line-fragments";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared inline-line materialization (mirrors RenderMarkdown InlineBlockView).
@@ -116,22 +117,28 @@ function InlineLines({
 						width: "max-content",
 					}}
 				>
-					{line.fragments.map((frag, fi) => (
-						<span
-							// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-							key={fi}
-							className={frag.className}
-							style={{
-								font: frag.font,
-								marginLeft: frag.gapBefore,
-								whiteSpace: "pre",
-								display: "inline-block",
-								color,
-							}}
-						>
-							{frag.text}
-						</span>
-					))}
+					<LineFragments>
+						{line.fragments.map((frag, fi) => (
+							<Fragment
+								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+								key={fi}
+							>
+								<FragmentGap gapBefore={frag.gapBefore} />
+								<span
+									className={frag.className}
+									style={{
+										font: frag.font,
+										marginLeft: frag.gapBefore,
+										whiteSpace: "pre",
+										display: "inline-block",
+										color,
+									}}
+								>
+									{frag.text}
+								</span>
+							</Fragment>
+						))}
+					</LineFragments>
 				</div>
 			))}
 		</div>

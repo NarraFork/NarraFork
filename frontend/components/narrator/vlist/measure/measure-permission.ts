@@ -267,7 +267,10 @@ export interface AskUserQuestionData {
 export interface InlinePermissionData {
 	/** readOnly display: drops the button bar for a single "unavailable" line. */
 	readOnly?: boolean;
-	/** Whether the frozen execution-target Paper is shown. */
+	/**
+	 * Whether the frozen execution-target Paper is shown. Ignored when
+	 * `isExitPlanMode` is true — the plan gate suppresses the block.
+	 */
 	hasExecutionTarget?: boolean;
 	/** Wrapped line count of the cwd row (0 = absent); default 1 with a target. */
 	executionCwdLines?: number;
@@ -588,8 +591,11 @@ export function measureInlinePermission(
 		metas.push(meta);
 	};
 
-	// Execution-target Paper (mb="xs").
-	if (data.hasExecutionTarget) {
+	// Execution-target Paper (mb="xs"). ExitPlanMode never paints it: the plan gate
+	// is an approval decision, not a routed filesystem/command action, so the card
+	// suppresses the block (ToolCallCard.tsx InlinePermission) — measuring it would
+	// reserve height for a Paper that never mounts.
+	if (data.hasExecutionTarget && data.isExitPlanMode !== true) {
 		const cwdLines = data.executionCwdLines ?? 1;
 		const pathLines = data.executionPathLines ?? 0;
 		push(

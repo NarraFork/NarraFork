@@ -185,6 +185,8 @@ function markdownTarget(
 	title: string | undefined,
 	/** The row paints only a prefix of `sourceText` (parse ceiling). */
 	bodyIsPrefix?: boolean,
+	/** `sourceText` is itself only a server-side prefix (payload truncation). */
+	textTruncated?: boolean,
 ): VListViewTarget | null {
 	const body = text(sourceText);
 	if (!body) return null;
@@ -202,6 +204,10 @@ function markdownTarget(
 		// fullscreen viewer is the only place the rest can be read. Flagged so the
 		// bar can point there instead of letting the inline body end mid-document.
 		...(bodyIsPrefix === true ? { rowShowsPrefix: true } : {}),
+		// Even `sourceText` is incomplete: the server sent a preview, so the rest has
+		// to be fetched. Without this a plan / skill / knowledge body had no way to
+		// ask for its own bytes (the measure layer used to drop the flag entirely).
+		...(textTruncated === true ? { truncated: true } : {}),
 	};
 }
 
@@ -233,7 +239,14 @@ export function resolveDetailViewTargets(
 			const slot = sectionSlot(index);
 			const title = sectionTitle(part.label, labels);
 			if (part.markdown) {
-				const md = markdownTarget(specKey, slot, part.sourceText, title, part.bodyIsPrefix);
+				const md = markdownTarget(
+					specKey,
+					slot,
+					part.sourceText,
+					title,
+					part.bodyIsPrefix,
+					part.textTruncated,
+				);
 				if (md) out.push(md);
 				return;
 			}
@@ -251,6 +264,7 @@ export function resolveDetailViewTargets(
 			detail.sourceText,
 			undefined,
 			detail.bodyIsPrefix,
+			detail.textTruncated,
 		);
 		return md ? [md] : [];
 	}

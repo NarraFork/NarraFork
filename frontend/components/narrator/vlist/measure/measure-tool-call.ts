@@ -70,6 +70,7 @@ import { measureLineStats, prepareWithSegments } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
 import type { DiffLine } from "@shared/pretext-layout/diff-core";
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
+import type { SidecarSpecData } from "@shared/pretext-layout/segment-adapter";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import {
 	accumulateFrame,
@@ -118,6 +119,7 @@ import {
 	type MeasuredReflectionNotice,
 	measureReflectionNotice,
 } from "./measure-reflection-notice";
+import { type MeasuredSidecar, measureSidecar } from "./measure-sidecar";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -255,9 +257,6 @@ export const DETAIL_MARKDOWN_PREFIX_MAX_CHARS = 32 * 1024;
 
 /** Gap between the `_planFile` provenance line and the markdown body. */
 export const DETAIL_SOURCE_LINE_MARGIN_BOTTOM = 4;
-
-/** Gap above the truncation notice row (mirrors the detail region's top margin). */
-export const TRUNCATION_NOTICE_MARGIN_TOP = 4;
 
 /** Shared xs text line box (measured detail bodies): 12×1.4 = 17. */
 export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
@@ -723,6 +722,13 @@ export interface ToolCallData {
 	 * reflection row's height is final on its first paint.
 	 */
 	reflection?: ReflectionNoticeData | null;
+	/**
+	 * Tool-result sidecars (system injections the model saw in this tool's output).
+	 * Each renders as a measured mini-card between the header and the detail, and —
+	 * mirroring the chunked ToolCallCard, whose SideCarNotice sits OUTSIDE the
+	 * collapse — shows even on a folded card. Null/absent → no sidecar region.
+	 */
+	sidecars?: SidecarSpecData[] | null;
 	/** Rendered inside a run: no border, a trailing 1px divider unless last. */
 	inRun?: boolean;
 	/** In-run only: whether this is the last card (drops the divider). */
@@ -813,6 +819,13 @@ export interface MeasureToolCallOpts {
 	 * permission height is baked in here.
 	 */
 	hasPendingPermission?: boolean;
+	/**
+	 * Indices of the tool-result sidecar mini-cards currently expanded. A plain
+	 * number[] (not a resolver) so the measure cache's digestOpts folds it into
+	 * the cache key — an expanded sidecar measures a taller body, so the fold
+	 * state participates in keying exactly like a trace's `expandedIndices`.
+	 */
+	sidecarExpanded?: readonly number[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -872,6 +885,11 @@ export interface MeasuredToolDetailSection {
 	 * exceeded the parse ceiling). See `MeasuredToolDetail.bodyIsPrefix`.
 	 */
 	bodyIsPrefix?: boolean;
+	/**
+	 * `sourceText` is only a SERVER-side prefix; the rest must be fetched. See
+	 * `MeasuredToolDetail.textTruncated` — height-neutral output field.
+	 */
+	textTruncated?: boolean;
 }
 
 /** A measured detail region (the LazyCollapse body's DetailRenderer part). */
@@ -905,12 +923,25 @@ export interface MeasuredToolDetail {
 	 * The painted markdown blocks cover only a PREFIX of `sourceText`, because the
 	 * body exceeded `DETAIL_MARKDOWN_PREFIX_MAX_CHARS`.
 	 *
-	 * Distinct from `ToolCappedDetail.textTruncated`, which says the SERVER sent a
-	 * preview. This one says the client chose not to parse the rest, so the full
-	 * text is already in hand (`sourceText`) and the viewer can show all of it.
+	 * Distinct from `textTruncated` below, which says the SERVER sent a preview.
+	 * This one says the client chose not to parse the rest, so the full text is
+	 * already in hand (`sourceText`) and the viewer can show all of it.
 	 * Height-neutral output field.
 	 */
 	bodyIsPrefix?: boolean;
+	/**
+	 * `sourceText` is only a SERVER-side prefix of the real body (a `markdown`
+	 * capped region only — a plain capped body keeps the flag in its block `data`).
+	 *
+	 * The opposite direction from `bodyIsPrefix`: there the whole text is in hand
+	 * and only the viewer is needed, here the remaining bytes must be fetched. The
+	 * viewer host reads it to decide whether reading into this body should request
+	 * them.
+	 *
+	 * Output-only: the height was already reserved at the full cap inside
+	 * `measureMarkdownDetail`, so this field carries no geometry of its own.
+	 */
+	textTruncated?: boolean;
 	/**
 	 * Per-section geometry — present only for `kind === "sections"`. Parallel view
 	 * over the flat `blocks`/`frame` arrays (never a second copy of them).
@@ -954,6 +985,14 @@ export interface MeasuredToolCall extends MeasuredElement {
 	reflection: MeasuredReflectionNotice | null;
 	/** Reflection region top within the card content box. */
 	reflectionTop: number;
+	/**
+	 * Measured tool-result sidecar mini-cards (one per injection), else null. They
+	 * sit between the header and the detail region and — like the chunked card —
+	 * are visible whether or not the card body is expanded.
+	 */
+	sidecars: MeasuredSidecar[] | null;
+	/** Top of the first sidecar within the card content box (== headerHeight). */
+	sidecarsTop: number;
 	/** Passthrough render metadata. */
 	category: ToolCategory;
 	status: ToolCallStatus;
@@ -973,15 +1012,15 @@ export interface MeasuredToolCall extends MeasuredElement {
 	toolUseId: string | null;
 	/**
 	 * Number of payload fields still showing a preview (0 = nothing truncated), and
-	 * their combined original size. The shell reads the count to decide which rows
-	 * may fetch the full payload, and the render layer shows both in the notice.
+	 * their combined original size.
+	 *
+	 * PAYLOAD COMPLETENESS SIGNAL, not geometry: nothing is reserved for it. The
+	 * shell reads the count to decide which rows may fetch the full payload and
+	 * which requests are still in flight, and the measure cache keys on it (`|tp:`)
+	 * because it is the only field that moves when a fetched payload lands.
 	 */
 	truncatedLeafCount: number;
 	truncatedTotalBytes: number;
-	/** Y offset of the reserved truncation-notice row inside the card. */
-	truncationNoticeTop: number;
-	/** Reserved height of the truncation-notice row; 0 when there is none. */
-	truncationNoticeHeight: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1310,6 +1349,16 @@ export function measureMarkdownDetail(
 	cap: number,
 	availableWidth: number,
 	sourcePath: string | undefined,
+	/**
+	 * `text` is only a server-side PREFIX of the real body → reserve the FULL cap,
+	 * exactly like `cappedBodyHeight` does for a plain capped body.
+	 *
+	 * Without this the box was sized to whatever the projection budget happened to
+	 * include, so the height depended on the server's cut (and a wider layout wrapped
+	 * that prefix into fewer lines, shrinking the box while the remaining scrollable
+	 * content had nowhere to go). The cap can never clip — the box scrolls.
+	 */
+	textTruncated?: boolean,
 ): {
 	blocks: PreparedBlock[];
 	frame: ElementFrame;
@@ -1336,7 +1385,8 @@ export function measureMarkdownDetail(
 	// width is a hit — so the full parse is paid once per body, not once per layout.
 	const prefix = markdownMeasurePrefix(text, DETAIL_MARKDOWN_PREFIX_MAX_CHARS);
 	const built = buildMarkdownDetailFrame(prefix, innerWidth, sourcePath);
-	const height = DETAIL_TOP_MARGIN + Math.min(built.boxContent, cap);
+	const boxHeight = textTruncated === true ? cap : Math.min(built.boxContent, cap);
+	const height = DETAIL_TOP_MARGIN + boxHeight;
 	return {
 		blocks: built.blocks,
 		frame: built.frame,
@@ -1737,6 +1787,11 @@ function measureSectionsDetail(
 			// sectioned body (skill / knowledge / Send message) hits the same parse
 			// ceiling, and the viewer has to make the same statement about it.
 			...(body.bodyIsPrefix === true ? { bodyIsPrefix: true } : {}),
+			// And for "the server only sent a prefix": a sectioned markdown body
+			// (skill / knowledge / Send message) is truncated by the same projection,
+			// and its viewer host needs the flag to request the rest. Another boolean
+			// copy — it cannot move `y` any more than `sourceText` can.
+			...(body.textTruncated === true ? { textTruncated: true } : {}),
 		});
 	}
 
@@ -1791,7 +1846,13 @@ export function measureToolDetail(
 			// of one opaque fixed block, so the render layer can paint headings/lists/
 			// code the way the chunked card's ContentViewer does.
 			if (detail.markdown && detail.text != null && detail.text.length > 0) {
-				const md = measureMarkdownDetail(detail.text, cap, innerWidth, detail.sourcePath);
+				const md = measureMarkdownDetail(
+					detail.text,
+					cap,
+					innerWidth,
+					detail.sourcePath,
+					detail.textTruncated,
+				);
 				return {
 					kind: "capped",
 					height: md.height,
@@ -1808,6 +1869,12 @@ export function measureToolDetail(
 					// parse ceiling. Reported so the viewer can say the inline body is
 					// incomplete rather than let it end mid-document.
 					...(md.isPrefix ? { bodyIsPrefix: true } : {}),
+					// `sourceText` is only a SERVER-side prefix, so the body's real bytes
+					// still have to be fetched. Carried out for the same reason
+					// `textTruncated` is on a plain capped block: it is what tells the
+					// viewer host this body can ask for more. Height was already reserved
+					// at the full cap above — this field is output-only.
+					...(detail.textTruncated === true ? { textTruncated: true } : {}),
 				};
 			}
 			const hasLabel = detail.hasLabel ?? CAPPED_WITH_LABEL.has(detail.cap);
@@ -2070,35 +2137,52 @@ export function measureToolCall(
 	const frame = accumulateFrame(blocks, innerWidth, RESOLVER);
 
 	// ── Collapsed height ───────────────────────────────────────────────────────
-	const collapsedHeight = chromeY + HEADER_ROW_HEIGHT + dividerExtra;
+	// The sidecar band is part of the COLLAPSED card too (the chunked notice is
+	// outside the collapse), so a folded card with sidecars is taller than one
+	// without. The band's height is added below once it is measured; here we only
+	// reserve the header + chrome.
+	const baseCollapsedHeight = chromeY + HEADER_ROW_HEIGHT + dividerExtra;
 
 	// ── Expanded regions ───────────────────────────────────────────────────────
 	let detail: MeasuredToolDetail | null = null;
 	let permission: MeasuredInlinePermission | null = null;
 	let reflection: MeasuredReflectionNotice | null = null;
 	let innerContentH = HEADER_ROW_HEIGHT;
-	const detailTop = HEADER_ROW_HEIGHT;
-	let permissionTop = HEADER_ROW_HEIGHT;
-	let reflectionTop = HEADER_ROW_HEIGHT;
 
-	// The truncation notice: ONE fixed single-line row at the end of the detail
-	// region, present whenever any payload field is still a preview. A fixed line
-	// box keeps it pure arithmetic (no DOM), and it disappears once the user loads
-	// the full payload — a height change with a click behind it.
-	const truncatedLeafCount = data.truncatedLeafCount ?? 0;
-	let truncationNoticeHeight = 0;
+	// ── Sidecar region (tool_result injections) ────────────────────────────────
+	// Mirrors the chunked ToolCallCard, whose SideCarNotice sits OUTSIDE the
+	// collapse: the mini-cards show whether or not the card body is expanded, so
+	// their height is added UNCONDITIONALLY (not gated on effectiveOpened). Each
+	// card keeps its own fold state (the vlist redesign folds per-record).
+	let sidecars: MeasuredSidecar[] | null = null;
+	const sidecarsTop = HEADER_ROW_HEIGHT;
+	let sidecarsHeight = 0;
+	if (data.sidecars && data.sidecars.length > 0) {
+		const expandedSet = new Set(opts.sidecarExpanded ?? []);
+		sidecars = data.sidecars.map((sc, index) =>
+			measureSidecar(sc, innerWidth, lod, { expanded: expandedSet.has(index) }),
+		);
+		sidecarsHeight = sidecars.reduce((sum, sc) => sum + sc.height, 0);
+		innerContentH += sidecarsHeight;
+	}
+	// The expanded regions begin BELOW the sidecar band.
+	const expandedRegionTop = HEADER_ROW_HEIGHT + sidecarsHeight;
+	const detailTop = expandedRegionTop;
+	let permissionTop = expandedRegionTop;
+	let reflectionTop = expandedRegionTop;
+	// Collapsed card = header + chrome + the sidecar band (chunk parity: the
+	// notice is outside the collapse). + the divider.
+	const collapsedHeight = baseCollapsedHeight + sidecarsHeight;
 
+	// A still-truncated payload costs NO geometry: a prefix body already reserves
+	// its full cap (see `cappedBodyHeight`), and the rest is fetched when the reader
+	// scrolls into the body's later half (VListContentViewHost) or opens it
+	// fullscreen — so there is nothing to announce and no row to reserve.
 	if (effectiveOpened) {
 		if (data.detail) {
 			detail = measureToolDetail(data.detail, innerWidth, opts.viewportHeight);
 			innerContentH += detail.height;
-			permissionTop = HEADER_ROW_HEIGHT + detail.height;
-			reflectionTop = permissionTop;
-		}
-		if (truncatedLeafCount > 0) {
-			truncationNoticeHeight = TRUNCATION_NOTICE_MARGIN_TOP + XS_LINE_HEIGHT;
-			innerContentH += truncationNoticeHeight;
-			permissionTop += truncationNoticeHeight;
+			permissionTop = expandedRegionTop + detail.height;
 			reflectionTop = permissionTop;
 		}
 		// A reflection notice REPLACES the permission form, mirroring the chunked
@@ -2127,9 +2211,6 @@ export function measureToolCall(
 		contentWidth: innerWidth,
 		usedWidth: contentWidth,
 		effectiveOpened,
-		// Reserved geometry for the truncation notice (0 when nothing is truncated).
-		truncationNoticeTop: HEADER_ROW_HEIGHT + (detail?.height ?? 0),
-		truncationNoticeHeight,
 		lodExempt,
 		isStreaming,
 		inRun,
@@ -2145,6 +2226,8 @@ export function measureToolCall(
 		permissionTop,
 		reflection,
 		reflectionTop,
+		sidecars,
+		sidecarsTop,
 		category: data.category,
 		status: data.status,
 		toolName: data.toolName,

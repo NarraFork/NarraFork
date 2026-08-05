@@ -13,6 +13,8 @@
  */
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -28,6 +30,7 @@ mock.module("react-i18next", () => ({
 	useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+const { RenderLodCtx } = await import("../RenderLodCtx");
 const { VListContentViewHost } = await import("./VListContentViewHost");
 type VListViewTarget = import("./vlist-content-view-target").VListViewTarget;
 type VListViewControls = import("./VListContentViewHost").VListViewControls;
@@ -128,23 +131,39 @@ const DIFF_TARGET: VListViewTarget = {
 	diff: { oldStr: "a", newStr: "b" },
 };
 
+/** A body whose payload is only a server-side prefix (the auto-load case). */
+const TRUNCATED_TARGET: VListViewTarget = {
+	id: "tool-tu_3:b0",
+	slot: "b0",
+	kind: "term",
+	text: "first 8KB of output…",
+	truncated: true,
+};
+
 interface Recorded {
 	wrapToggles: string[];
 	sourceToggles: string[];
 	opened: string[];
+	payloadRequests: string[];
 }
 
 function makeControls(overrides: Partial<VListViewControls> = {}): {
 	controls: VListViewControls;
 	recorded: Recorded;
 } {
-	const recorded: Recorded = { wrapToggles: [], sourceToggles: [], opened: [] };
+	const recorded: Recorded = {
+		wrapToggles: [],
+		sourceToggles: [],
+		opened: [],
+		payloadRequests: [],
+	};
 	const controls: VListViewControls = {
 		isWrapped: () => true,
 		isSourceShown: () => false,
 		toggleWrap: (target) => recorded.wrapToggles.push(target.id),
 		toggleSource: (target) => recorded.sourceToggles.push(target.id),
 		openFullscreen: (target) => recorded.opened.push(target.id),
+		requestFullPayload: (target) => recorded.payloadRequests.push(target.id),
 		...overrides,
 	};
 	return { controls, recorded };
@@ -153,15 +172,59 @@ function makeControls(overrides: Partial<VListViewControls> = {}): {
 async function renderHost(opts: {
 	target?: VListViewTarget;
 	controls?: VListViewControls;
+	/** Render on a non-interactive surface (workspace preview). */
+	interactive?: boolean;
 }): Promise<void> {
 	await act(async () => {
 		root?.render(
 			<MantineProvider>
-				<VListContentViewHost target={opts.target} controls={opts.controls}>
-					<div data-testid="body">body</div>
-				</VListContentViewHost>
+				<RenderLodCtx.Provider value={{ lod: 5, interactive: opts.interactive !== false }}>
+					<VListContentViewHost target={opts.target} controls={opts.controls}>
+						<div data-testid="body">
+							{/* The scrollport the auto-load listener observes. Production bodies
+							    are `overflow:auto` boxes nested inside the host exactly like
+							    this, which is why the listener is registered in the CAPTURE
+							    phase (scroll does not bubble). */}
+							<div data-testid="scrollbox">body</div>
+						</div>
+					</VListContentViewHost>
+				</RenderLodCtx.Provider>
 			</MantineProvider>,
 		);
+	});
+}
+
+/**
+ * Scroll the inner box to `ratio` of its scrollable range and fire `scroll`.
+ *
+ * linkedom has no layout, so the three metrics the ratio is computed from are
+ * stubbed directly. `scrollable = scrollHeight - clientHeight`, matching the
+ * production arithmetic.
+ *
+ * `bubbles: true` is a LINKEDOM WORKAROUND, not a claim about real scroll events.
+ * A real `scroll` does not bubble, but per DOM spec it still runs the CAPTURE
+ * phase down to its target, which is how the host's capture listener sees a
+ * descendant box scrolling. linkedom only walks ancestors for bubbling events, so
+ * without this flag no listener fires at all and the handler would go untested.
+ * The registration itself is pinned separately (see the capture-phase guard).
+ */
+async function scrollBody(opts: {
+	ratio: number;
+	scrollHeight?: number;
+	clientHeight?: number;
+}): Promise<void> {
+	const box = container?.querySelector("[data-testid='scrollbox']") as HTMLElement | null;
+	if (!box) throw new Error("scroll box not found");
+	const scrollHeight = opts.scrollHeight ?? 1000;
+	const clientHeight = opts.clientHeight ?? 200;
+	const scrollable = Math.max(0, scrollHeight - clientHeight);
+	Object.defineProperties(box, {
+		scrollHeight: { configurable: true, writable: true, value: scrollHeight },
+		clientHeight: { configurable: true, writable: true, value: clientHeight },
+		scrollTop: { configurable: true, writable: true, value: scrollable * opts.ratio },
+	});
+	await act(async () => {
+		box.dispatchEvent(new (globalThis.Event as typeof Event)("scroll", { bubbles: true }));
 	});
 }
 
@@ -583,5 +646,166 @@ describe("VListContentViewHost — mobile", () => {
 			(host as HTMLElement).click();
 		});
 		expect(recorded.opened).toEqual([CODE_TARGET.id]);
+	});
+});
+
+/**
+ * Reading into a PREFIX body fetches the rest.
+ *
+ * This replaced a clickable "content truncated (17KB) — click here to load"
+ * footer, which cost every truncated card a reserved 21px row and read as a
+ * warning rather than an affordance. The body's own scroll position is the
+ * signal instead: passing the halfway mark says the reader is working through
+ * this body and will want what follows.
+ *
+ * The request stays a USER action, which is what keeps the height invariant
+ * intact — and a prefix body already reserves its full cap, so the landing
+ * payload measures into the same box.
+ */
+describe("VListContentViewHost — auto-load on scroll", () => {
+	test("requests the full payload once the reader passes the halfway mark", async () => {
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		await scrollBody({ ratio: 0.5 });
+		expect(recorded.payloadRequests).toEqual([TRUNCATED_TARGET.id]);
+	});
+
+	test("asks only once, however far the reader keeps scrolling", async () => {
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		await scrollBody({ ratio: 0.6 });
+		await scrollBody({ ratio: 0.8 });
+		await scrollBody({ ratio: 1 });
+		expect(recorded.payloadRequests).toEqual([TRUNCATED_TARGET.id]);
+	});
+
+	test("stays quiet while the reader is still in the body's first half", async () => {
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		await scrollBody({ ratio: 0 });
+		await scrollBody({ ratio: 0.49 });
+		expect(recorded.payloadRequests).toEqual([]);
+	});
+
+	test("never fires for a body that is already complete", async () => {
+		// CODE_TARGET carries no `truncated` flag, so there is nothing to fetch —
+		// scrolling to the very bottom of it must not hit the API.
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		await scrollBody({ ratio: 1 });
+		expect(recorded.payloadRequests).toEqual([]);
+	});
+
+	test("ignores a box with nothing to scroll (ratio would be meaningless)", async () => {
+		// `scrollHeight === clientHeight` → scrollable is 0, so scrollTop says nothing
+		// about how much the reader has read. Without the guard this divides by zero.
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		await scrollBody({ ratio: 1, scrollHeight: 200, clientHeight: 200 });
+		expect(recorded.payloadRequests).toEqual([]);
+	});
+
+	test("a non-interactive surface never issues the request", async () => {
+		// Workspace previews render the same bodies read-only; they must not fetch
+		// payloads for content nobody is reading.
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls, interactive: false });
+		await scrollBody({ ratio: 1 });
+		expect(recorded.payloadRequests).toEqual([]);
+	});
+
+	test("scrolling the LIST behind the body is not mistaken for reading it", async () => {
+		// The list viewport is an ANCESTOR of the host, so its scroll events never
+		// reach the host's capture path. This is the reason the listener is on the
+		// host rather than on the document.
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		const scroller = container as unknown as HTMLElement;
+		Object.defineProperties(scroller, {
+			scrollHeight: { configurable: true, writable: true, value: 10_000 },
+			clientHeight: { configurable: true, writable: true, value: 600 },
+			scrollTop: { configurable: true, writable: true, value: 9_000 },
+		});
+		await act(async () => {
+			scroller.dispatchEvent(new (globalThis.Event as typeof Event)("scroll"));
+		});
+		expect(recorded.payloadRequests).toEqual([]);
+	});
+
+	test("does nothing when the shell wired no request channel", async () => {
+		const { controls, recorded } = makeControls({ requestFullPayload: undefined });
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		await scrollBody({ ratio: 1 });
+		expect(recorded.payloadRequests).toEqual([]);
+	});
+
+	/**
+	 * "Once" spans the body's IDENTITY, not one render of it.
+	 *
+	 * `target` is derived from the measured document and reallocated on every build,
+	 * and the narrator list rebuilds on every live WS patch. While the effect
+	 * depended on the whole object it re-registered the listener and reset its
+	 * one-shot flag for every visible body on every one of those frames — so a body
+	 * the reader had already scrolled past would ask again after the next patch. The
+	 * request is deduped server-side, which is why this was invisible rather than
+	 * broken; the effect is keyed on `target.id` instead.
+	 */
+	test("a rebuilt-but-identical body does not ask a second time", async () => {
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		await scrollBody({ ratio: 0.6 });
+		expect(recorded.payloadRequests).toEqual([TRUNCATED_TARGET.id]);
+		// A fresh object for the SAME body, exactly what a document rebuild produces.
+		await renderHost({ target: { ...TRUNCATED_TARGET }, controls });
+		await scrollBody({ ratio: 0.9 });
+		expect(recorded.payloadRequests).toEqual([TRUNCATED_TARGET.id]);
+	});
+
+	test("a DIFFERENT truncated body in the same host gets its own shot", async () => {
+		// The flip side: keying on `target.id` must still let a genuinely new body
+		// (a recycled row scrolling into view) issue its own request.
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		await scrollBody({ ratio: 0.6 });
+		const other: VListViewTarget = { ...TRUNCATED_TARGET, id: "tool-tu_9:b0" };
+		await renderHost({ target: other, controls });
+		await scrollBody({ ratio: 0.6 });
+		expect(recorded.payloadRequests).toEqual([TRUNCATED_TARGET.id, other.id]);
+	});
+
+	/**
+	 * Narrowing the deps to `target.id` must not leave the handler holding a stale
+	 * object: the id is the same across a rebuild, so the closure would keep whatever
+	 * target was current when the listener was installed. The latest one is read from
+	 * a ref at fire time, which this pins by giving the rebuilt object a field the
+	 * assertion can see.
+	 */
+	test("requests the CURRENT target object, not the one captured at mount", async () => {
+		const seen: VListViewTarget[] = [];
+		const { controls } = makeControls({ requestFullPayload: (t) => seen.push(t) });
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		const rebuilt: VListViewTarget = { ...TRUNCATED_TARGET, text: "a longer prefix…" };
+		await renderHost({ target: rebuilt, controls });
+		await scrollBody({ ratio: 0.6 });
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.text).toBe(rebuilt.text);
+	});
+
+	test("registers in the CAPTURE phase (scroll does not bubble in a browser)", () => {
+		// The behavioural tests above dispatch a BUBBLING scroll, because linkedom
+		// only walks ancestors for bubbling events. That makes them blind to the one
+		// mistake that would break this in a real browser: registering on the bubble
+		// phase, where a descendant box's scroll never arrives. Pinned at the source,
+		// which is the only place the distinction is observable here.
+		const src = readFileSync(join(import.meta.dir, "VListContentViewHost.tsx"), "utf8");
+		const fn = src.slice(
+			src.indexOf("function useAutoLoadOnScroll("),
+			src.indexOf("export interface VListContentViewHostProps"),
+		);
+		expect(fn.length).toBeGreaterThan(0);
+		expect(fn).toContain('node.addEventListener("scroll", onScroll, { capture: true');
+		// Passive too: this handler never calls preventDefault, and a non-passive
+		// scroll listener costs the browser a main-thread round trip per frame.
+		expect(fn).toContain("passive: true");
 	});
 });

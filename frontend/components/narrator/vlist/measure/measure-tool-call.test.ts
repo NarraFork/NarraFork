@@ -198,6 +198,65 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		expect(noVp.detail!.appliedCap).toBe(DETAIL_CAPS.plan);
 	});
 
+	it("a server-truncated MARKDOWN body reserves the full cap, like a plain one", async () => {
+		const { measureToolCall, DETAIL_TOP_MARGIN } = await mod();
+		// The markdown branch used to size the box to whatever prefix the projection
+		// budget happened to include, so the height depended on the server's cut and a
+		// wider layout shrank the box while the rest of the (scrollable) body had
+		// nowhere to go. `textTruncated` pins it to the cap instead, matching
+		// `cappedBodyHeight`.
+		const short = "# Plan\n\n- one";
+		const card = (textTruncated?: boolean) =>
+			measureToolCall(
+				baseCard({
+					category: "plan",
+					detail: {
+						kind: "capped",
+						cap: "plan",
+						contentLines: 3,
+						text: short,
+						markdown: true,
+						...(textTruncated ? { textTruncated: true } : {}),
+					},
+				}),
+				600,
+				6,
+				{ viewportHeight: 1000 },
+			);
+		const prefix = card(true);
+		const whole = card();
+		// 0.85 × 1000 = 850, reserved in full despite the tiny prefix.
+		expect(prefix.detail!.height).toBe(DETAIL_TOP_MARGIN + 850);
+		// A complete body of the same text is measured exactly, so it stays far shorter.
+		expect(whole.detail!.height).toBeLessThan(prefix.detail!.height);
+		// And the flag travels out as a height-neutral output field, which is what
+		// lets the viewer host request the missing bytes.
+		expect(prefix.detail!.textTruncated).toBe(true);
+		expect(whole.detail!.textTruncated).toBeUndefined();
+	});
+
+	it("does not reserve any row for a truncated payload (there is no notice line)", async () => {
+		const { measureToolCall } = await mod();
+		// Truncation is announced by nothing at all now: the reader reaches the real
+		// payload by scrolling into the body. Two cards differing ONLY in their
+		// truncation counters must therefore measure identically.
+		const card = (truncated: boolean) =>
+			measureToolCall(
+				baseCard({
+					category: "read",
+					detail: { kind: "capped", cap: "code", contentLines: 4, text: "a\nb\nc\nd" },
+					...(truncated ? { truncatedLeafCount: 1, truncatedTotalBytes: 17 * 1024 } : {}),
+				}),
+				600,
+				6,
+			);
+		expect(card(true).height).toBe(card(false).height);
+		// The counters still travel through as the payload-completeness signal the
+		// shell and the measure cache read.
+		expect(card(true).truncatedLeafCount).toBe(1);
+		expect(card(true).truncatedTotalBytes).toBe(17 * 1024);
+	});
+
 	it("generic detail sums an input + optional output section (each capped 200)", async () => {
 		const { measureToolCall } = await mod();
 		const inputOnly = measureToolCall(
@@ -978,5 +1037,59 @@ describe("measureToolCall — MeasuredElement shape", () => {
 		const narrow = measure(160, 6);
 		expect(collapsed.effectiveOpened).toBe(false);
 		expect(narrow.height).toBeGreaterThan(wide.height);
+	});
+});
+
+// ── Tool-result sidecar band (the mini-cards between header and detail) ──────
+describe("measureToolCall — tool-result sidecar band", () => {
+	const SIDECAR = {
+		source: "silent_progress",
+		sourceLabel: "Progress reminder",
+		color: "indigo",
+		target: "tool_result",
+		previewText: "note",
+		fullText: "note",
+	};
+
+	it("a sidecar grows BOTH the collapsed and the expanded card (chunk parity: outside the collapse)", async () => {
+		const { measureToolCall } = await mod();
+		const { SIDECAR_COLLAPSED_HEIGHT } = await import("./measure-sidecar");
+		const base = baseCard();
+		const withSc = baseCard({ sidecars: [SIDECAR] });
+		// Collapsed (L4 collapses a success card): the band is still measured.
+		const collapsedBase = measureToolCall(base, 600, 4);
+		const collapsedSc = measureToolCall(withSc, 600, 4);
+		expect(collapsedSc.height).toBeGreaterThan(collapsedBase.height);
+		// Expanded too (the band sits above the detail).
+		const openBase = measureToolCall(base, 600, 6);
+		const openSc = measureToolCall(withSc, 600, 6);
+		expect(openSc.height).toBeGreaterThan(openBase.height);
+		// The collapsed delta is exactly one collapsed sidecar card.
+		expect(collapsedSc.height - collapsedBase.height).toBe(SIDECAR_COLLAPSED_HEIGHT);
+	});
+
+	it("the band stacks one measured mini-card per record, top-aligned under the header", async () => {
+		const { measureToolCall, HEADER_ROW_HEIGHT } = await mod();
+		const r = measureToolCall(baseCard({ sidecars: [SIDECAR, SIDECAR] }), 600, 6);
+		expect(r.sidecars).toHaveLength(2);
+		expect(r.sidecarsTop).toBe(HEADER_ROW_HEIGHT);
+	});
+
+	it("an expanded sidecar (via opts.sidecarExpanded) measures a taller band", async () => {
+		const { measureToolCall } = await mod();
+		const data = baseCard({
+			sidecars: [{ ...SIDECAR, fullText: "one\ntwo\nthree" }],
+		});
+		const collapsed = measureToolCall(data, 600, 6, { sidecarExpanded: [] });
+		const expanded = measureToolCall(data, 600, 6, { sidecarExpanded: [0] });
+		expect(expanded.height).toBeGreaterThan(collapsed.height);
+		expect(expanded.sidecars?.[0]?.expanded).toBe(true);
+	});
+
+	it("no sidecars → null band, byte-identical geometry to before the feature", async () => {
+		const { measureToolCall } = await mod();
+		const r = measureToolCall(baseCard(), 600, 6);
+		expect(r.sidecars).toBeNull();
+		expect(r.sidecarsTop).toBeGreaterThanOrEqual(0);
 	});
 });

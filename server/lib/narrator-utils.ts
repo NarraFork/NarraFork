@@ -119,8 +119,46 @@ export function isDraftTrait(trait: string): boolean {
 	return trait.startsWith(NARRATOR_DRAFT_TRAIT_PREFIX);
 }
 
+/**
+ * Trait prefix recording that a subagent's failure was already offered on a recovery
+ * card (see narrator-subagent-recovery). Lives here rather than in the service so the
+ * public-response filter below does not have to import a service from `lib/`.
+ */
+export const NARRATOR_RECOVERY_OFFERED_TRAIT_PREFIX = "recovery-offered:";
+
+/**
+ * Trait prefixes carrying INTERNAL runtime state rather than user- or system-configured
+ * tags, and which must never reach a client.
+ *
+ * Everything else in `traits` is something the user or the platform deliberately
+ * configured (`standalone`, `background`, encoded `custom-*` settings, …) and the
+ * frontend legitimately reads it. These prefixes are different: they are bookkeeping
+ * the server writes on its own (draft bodies, recovery watermarks), they change on
+ * their own schedule, and exposing them both leaks internal state and churns the
+ * identity of every narrator object the frontend caches.
+ */
+export const NARRATOR_INTERNAL_TRAIT_PREFIXES = [
+	NARRATOR_DRAFT_TRAIT_PREFIX,
+	NARRATOR_RECOVERY_OFFERED_TRAIT_PREFIX,
+] as const;
+
+/** Whether this trait is server-internal bookkeeping that must stay out of responses. */
+export function isInternalTrait(trait: string): boolean {
+	return NARRATOR_INTERNAL_TRAIT_PREFIXES.some((prefix) => trait.startsWith(prefix));
+}
+
+/** Strip every internal trait, producing the array that is safe to send to a client. */
+export function redactInternalTraits(raw: unknown): string[] {
+	return parseTraits(raw).filter((trait) => !isInternalTrait(trait));
+}
+
+/**
+ * @deprecated Kept as the historical name of {@link redactInternalTraits}. It always
+ * meant "traits for a public response", so it filters every internal prefix, not just
+ * drafts — existing call sites get new prefixes for free.
+ */
 export function redactDraftTraits(raw: unknown): string[] {
-	return parseTraits(raw).filter((trait) => !isDraftTrait(trait));
+	return redactInternalTraits(raw);
 }
 
 function encodeDraftTrait(payload: NarratorDraftTrait): string {

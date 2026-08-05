@@ -132,6 +132,26 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 | tool_loaded/unloaded | Paper p=xs + 单行文本 pre-wrap🔴 | ≈37 |
 | bash_command | Paper p=xs + 命令 monospace pre-wrap🔴 | ≈37 |
 
+### sidecar 迷你卡（系统注入，`measure-sidecar` / `RenderSidecar`）
+
+**每条注入一张卡**，不是 chunked 那个聚合的 `SideCarNotice`（后者是"×N"一行展开成列表）。这是刻意的重设计：一次 turn 可能同时注入进度提醒、后台任务完成、群聊投递、spec 更新几类互不相关的内容，聚合成一条会让读者只能整组展开、无法只留下自己关心的那一条。代价是每条各有自己的折叠状态，因此高度模型必须能表达"同一行内第 k 张卡展开"。
+
+| 形态 | 结构 | 高度 |
+|------|------|------|
+| 折叠 | Paper p=xs + 单行 header（accent rail 2 + info icon 14 + 来源 badge + target badge + 预览 lineClamp=1 + chevron + copy）🟢 | **恒定 37px**（`SIDECAR_COLLAPSED_HEIGHT`）|
+| 展开 | 同一 header + `HEADER_BODY_GAP` 6 + 正文 pre-wrap🔴（`SIDECAR_DETAIL_MAX_LINES`=40 封顶）+ 截断时 `NOTICE_GAP` 4 + 提示行 17 | 37 + 6 + 行数×17 [+ 4 + 17] |
+
+- **折叠态高度与内容完全无关**：预览是 `lineClamp={1}`，所以它的长度不进高度（§3 的 truncate 规则）。这是为什么无论注入多大，折叠态都能不测量。
+- **正文走 `PreparedCodeBlock`**（同 `measure-system-text`）：渲染层用 measure 换行过的同一个 prepared + 同一个 `FONT_XS` 逐行还原，零漂移、零 DOM。高度**不读 `lod`** —— sidecar 从不因 LOD 折叠消失，它是"模型看到过什么"的证据，低 LOD 下把它藏掉会让读者以为没发生。
+- **两个上限，两种性质**：adapter 侧 `SIDECAR_DETAIL_MAX_CHARS`=120_000 截字符并把 `sidecarTruncated` 标签**追加进文本**（于是被当作普通正文行测量）；measure 侧 `SIDECAR_DETAIL_MAX_LINES`=40 截行数，用于给病态记录一个有界的测量成本和可预测的最大卡高。
+- **行数被截断必须给提示，且提示行的高度由 measure 保留**（`SIDECAR_TRUNCATION_NOTICE_HEIGHT` / `_GAP`）。正文盒是固定高 `overflow:hidden`、没有滚动条，所以渲染层自作主张多画一行只有两个结果：被裁掉，或把一行正文顶出盒子——两者都违反 §0 铁律 2。文案跟其它 adapter 字符串一样走 `ctx.labels` 注入（`sidecarTruncated`），渲染层只画 measure 交给它的 `noticeText`；没有 label 时 measure 不保留、渲染层不画，保证"保留的高度"和"画出来的行"永远一致。
+- **工具卡内的 sidecar 带（`measure-tool-call` 的 `sidecars` / `sidecarsTop`）在折叠态也算高度**：chunked 的 notice 画在 collapse 之外，所以一张带注入的折叠工具卡就是比不带的高一个 `SIDECAR_COLLAPSED_HEIGHT`。这些迷你卡的折叠态**不能**用工具卡自己的 `expanded` 表达（它们各自独立），所以按 index 存进 `opts.sidecarExpanded: number[]`，由 `digestOpts` 进缓存键。空数组时**省略该字段**，让没有 sidecar 的卡片缓存键与本功能之前 byte-identical —— 这是刻意保证的性质，有测试守着。
+- **折叠状态的 key 是 `${key}-sc${index}`**，adapter（`buildSidecarSpecs`）和工具卡（`opts.sidecarExpanded` 的探测）共用这一套编号。独立 sidecar 元件把这个后缀写在**自己的 spec.key** 里、走普通 `expanded` 通道；工具卡的迷你卡则是**子 key**，不是顶层布局项，所以 `measuredByKeyRef` 里永远没有它们。
+  - ⚠️ 由此得到一条易错点（已发生过）：shell 的折叠开关靠"从 measured 读当前是否已展开"再取反，而这两条路径都答不上来 —— 子 key 没有 measured 条目，`MeasuredSidecar` 又只有 `expanded`（没有 `form` / `effectiveOpened` / `effectiveExpanded`）。结果两条路径的每次点击都写 `expanded = true`：卡片能展开、永远关不掉。所以 `resolveRowOpenState` 显式列出每种 kind 的字段，并在**没有 measured 条目时回落到交互状态**（对子 key 而言状态就是权威，除了这个开关没人写它）。
+  - ⚠️ 同理，行签名（`rowInteractionSig`）必须按该行**实际的迷你卡数量**迭代 `-sc{i}`，不能"遇到缺失就 break"：读者完全可以只展开第 2 张，那时 `-sc0` 不存在，break 版本在 index 0 就停、`-sc1` 永远不进签名。这属于 §4.5 反复说的那类"靠别处兜底所以看不出来"的坏签名（这里恰好被 memo 的 `item.measured` 比较兜住）。
+- **`payloadKind` 是显式判别标记**：measure cache 必须区分"独立 sidecar 元件的 data"和"工具卡的 `sidecars` 数组"，两者的 revision 分支不同。用字段形状嗅探（有 `fullText` 且有 `source`）只是猜测，任何将来带这两个字段名的 payload 都会误入前一分支、拿到描述别的东西的 revision —— 也就是命中错误高度的缓存条目。
+- **交互**：header 整行是折叠热区，并且是**可键盘操作的**（`role="button"` + `tabIndex` + Enter/Space + `aria-expanded`），全部是属性和 handler，不动已测量的几何。内部的 copy 按钮是真 `<button>`，鼠标路径靠外层 `stopPropagation` 隔离、键盘路径靠 `event.target !== currentTarget` 提前返回 —— 否则一次 Enter 会同时复制并折叠。
+
 > 注：`bash_command` / `tool_loaded` / `tool_unloaded` 三种块**由 role=user 的消息承载**（服务端为了让模型看到它们而存成 user 角色），但视觉上是 system 卡。adapter 的 user 分支必须先检测它们并路由到 system 卡，否则会画出一个只有头部的空气泡。
 
 > 注：`error` 卡是唯一 chrome 不完全由 kind 决定的 system 卡。它的右侧两个图标控件（标记可重试 / 关闭）恒定，但「关闭图像生成并重试」这个 provider 修复是**带文字的按钮**，占据正文下方独立一行，因此**会改变卡片高度**。是否显示由 adapter 通过 `ctx.canOfferProviderFix(errorText)` 在适配阶段决定并写入 `data.buttons`，measure 读同一个数组加上 `STACK_GAP + BUTTON_COMPACT_XS`。之所以不做成第三个图标：图标控件只能靠 hover tooltip 说明自己，触屏用户永远看不到，而这是唯一能真正解决该故障的操作。
@@ -144,6 +164,10 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
   - 上限内的高度按**有界换行测量**得出（见 §4 开头 🟡 说明）：携带正文的详情一律测量换行，不再只数硬换行。
   - **需测量🔴**：SpecTasks 列表(任务数×行高)、Recall/Send/Pipeline/WebSearch 结构化列表段、各 badge 头部行、error 文本、AskUserQuestionBanner、ReflectionNotice、InlinePermission 的 Textarea(1-3/8-30 行)+动态按钮行。
   - isPlan 的 `vpHeight`=0.85×视口高 → **用视口高公式替代，不测 DOM**。plan 正文按 **markdown** 测量/渲染（与 chunked 路径的 `ContentViewer markdown` 对齐），并可前置一行 `_planFile` 来源提示；正文解析同样走有界前缀（块边界截断）。plan 详情**不向上转发 `onUnknownHeight`** —— 外框高度由 cap 决定，转发会让虚拟列表与滚动框互相打架。
+- **服务端截断的正文（`textTruncated`）预留整个 cap，且不占任何额外行**：
+  - 无论普通 capped 正文（`cappedBodyHeight`）还是 markdown 正文（`measureMarkdownDetail`），只要正文是服务端前缀就把盒高钉在 `cap`，**不测前缀**。测前缀会让高度取决于服务端预算切在哪里（更宽的布局把前缀折成更少行 → 盒子变矮，剩余可滚内容无处安放）；cap 永不裁切，因为盒子本身 `overflow:auto`。
+  - **没有"内容已截断"提示行**：完整 payload 由读者在正文盒内滚过一半时自动取（`VListContentViewHost` 的 capture 阶段 scroll 监听），或打开全屏查看器时取。两条路都经同一个 `fullPayloadRequested` 门控，所以仍是用户动作；又因为盒高已钉在 cap，落地的完整正文测得 `min(exact, cap)` —— 对任何溢出盒子的正文（每个服务端前缀都溢出）逐像素相同。
+  - `truncatedLeafCount` / `truncatedTotalBytes` 因此是**纯 payload 完整性信号**，不带几何：shell 用它判断哪些行可以取数、哪些请求在飞，measure cache 用它做 `|tp:` revision（payload 落地时唯一会动的字段）。
 - **effectiveOpened**：lodExempt(running/streaming/pendingPermission)恒展开；L6 全展开；L5 近卡随 opened、旧卡折叠；L4 全折叠 header；L1-L3 上游 gate 处理。
 - **分组卡**：Paper p=xs + header(+×N badge) + 展开体(子 ToolCallCard 累加)。折叠 default=false。
 
@@ -182,6 +206,8 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
    已发生过的实例：`patchSubagentActivity` 只写 `_subagentActivity`，adapter 把它派生成 `recentCallCount`，而 revision 当时既不认识前者也不认识后者 —— 卡片一直服用 0 行的高度，recent calls 区域被完全裁掉。同类还有 `subagentConclusionPatch` 写 `outputJson`（→ `resultText`/`resultPreview`）：卡片本来已是 `success` 且无错时 `status` 不动，结果体是唯一的增量。
 
    派生字段尤其危险：patch 写的字段名和 measure 读的字段名往往不是同一个（`_subagentActivity` → `recentCallCount`），所以审计要顺着 **patch → adapter → measure** 整条链走，不能只看 patch 写了什么。
+
+   `appendMessageSidecars` 是这条链最长的一例，也正是本节警告的形态：它只往最新 assistant 消息的 `sideCars` 追加记录（`sidecars` WS 事件带来的 turn 间注入 —— 后台任务完成、群聊投递、spec 更新），既不新增消息也不动 `messageVersion`；但 adapter 会由这个字段**派生出全新的 sidecar 元件**（§4 的迷你卡），每一张都自带高度。`toolCompletedPatch` 写 `tc.sideCars` 是同一条链的工具卡版本，而且更隐蔽：一次已是终态的重放或同状态重投递会让 `status` 完全不动，sidecar 就是唯一的增量。两者都由 `sidecarRevision` 覆盖（独立元件按自身文本、工具卡按每条注入的文本），并且**靠 `payloadKind` 标记而不是字段形状**来选分支 —— 形状嗅探会让将来任何带 `fullText`+`source` 的 payload 误入独立元件分支、拿到错误的 revision，也就是错误的高度。
 
    revision 在**每次 measure 时都会调用**，所以必须保持 O(1)：只读基元字段，文本走 `textSignature`（长度 + 定量采样哈希），禁止 `JSON.stringify` 整个 payload、禁止随内容规模增长的遍历。
 

@@ -49,6 +49,7 @@ import { hasUnpredictableBlock } from "../vlist-unpredictable-blocks";
 import "../vlist-markdown.css";
 import { VListCodeCopyButton } from "../VListCodeCopyButton";
 import { CaretFiller } from "./caret-filler";
+import { FragmentGap, LineFragments } from "./line-fragments";
 import { StreamAnimStore, splitFragmentForAnim } from "./stream-token-anim";
 import { TokenText } from "./TokenLines";
 
@@ -580,50 +581,61 @@ function TableCellView({
 						justifyContent,
 					}}
 				>
-					{line.fragments.map((frag, fi) =>
-						// Reuse the paragraph path's math host so a cell formula inherits the
-						// same guards (measured width pin, KaTeX font-size base, no-wrap).
-						frag.math ? (
-							<InlineMathView
+					<LineFragments>
+						{line.fragments.map((frag, fi) => (
+							<Fragment
 								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
 								key={fi}
-								math={frag.math}
-								gapBefore={frag.gapBefore}
-								lineHeight={lineHeight}
-							/>
-						) : frag.href != null ? (
-							<a
-								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-								key={fi}
-								href={frag.href}
-								target="_blank"
-								rel="noreferrer"
-								className={frag.className}
-								style={{
-									font: frag.font,
-									marginLeft: frag.gapBefore,
-									whiteSpace: "pre",
-									display: "inline-block",
-								}}
 							>
-								{frag.text}
-							</a>
-						) : (
-							<span
-								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-								key={fi}
-								className={frag.className}
-								style={{
-									font: frag.font,
-									marginLeft: frag.gapBefore,
-									whiteSpace: "pre",
-									display: "inline-block",
-								}}
-							>
-								{frag.text}
-							</span>
-						),
-					)}
+								{/* Precedes the fragment: the space belongs to the boundary
+								    before it, not to the fragment's own text. */}
+								<FragmentGap gapBefore={frag.gapBefore} />
+								{
+									// Reuse the paragraph path's math host so a cell formula inherits
+									// the same guards (measured width pin, KaTeX font-size base,
+									// no-wrap).
+									frag.math ? (
+										<InlineMathView
+											math={frag.math}
+											gapBefore={frag.gapBefore}
+											lineHeight={lineHeight}
+										/>
+									) : frag.href != null ? (
+										<a
+											href={frag.href}
+											target="_blank"
+											// `noopener` is implied by `target="_blank"` in current browsers,
+											// but stated anyway so both markdown paths carry the same `rel`
+											// (the chunked MarkdownContent does) and neither depends on that
+											// default holding.
+											rel="noopener noreferrer"
+											className={frag.className}
+											style={{
+												font: frag.font,
+												marginLeft: frag.gapBefore,
+												whiteSpace: "pre",
+												display: "inline-block",
+											}}
+										>
+											{frag.text}
+										</a>
+									) : (
+										<span
+											className={frag.className}
+											style={{
+												font: frag.font,
+												marginLeft: frag.gapBefore,
+												whiteSpace: "pre",
+												display: "inline-block",
+											}}
+										>
+											{frag.text}
+										</span>
+									)
+								}
+							</Fragment>
+						))}
+					</LineFragments>
 				</div>
 			))}
 		</div>
@@ -712,6 +724,12 @@ function InlineBlockView({
 
 	return (
 		<div
+			// Marks the boundary of ONE logical inline block (a paragraph, heading or
+			// list item). The `data-vlist-line` children inside it are VISUAL lines
+			// produced by soft wrapping, which the source had no newline for — the copy
+			// handler (vlist-copy-text.ts) needs this boundary to tell "same paragraph,
+			// wrapped" from "next paragraph".
+			data-vlist-inline-block
 			style={{
 				position: "absolute",
 				top: frame.top,
@@ -779,59 +797,71 @@ function InlineBlockView({
 						width: `calc(100% - ${block.contentLeft}px)`,
 					}}
 				>
-					{line.fragments.map((frag, fi) => {
-						// An inline formula replaces its placeholder glyph with real KaTeX
-						// output, pinned to the width the measure layer reserved.
-						if (frag.math) {
-							return (
+					<LineFragments>
+						{line.fragments.map((frag, fi) => {
+							// An inline formula replaces its placeholder glyph with real KaTeX
+							// output, pinned to the width the measure layer reserved.
+							const body = frag.math ? (
 								<InlineMathView
-									// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-									key={fi}
 									math={frag.math}
 									gapBefore={frag.gapBefore}
 									lineHeight={block.lineHeight}
 								/>
-							);
-						}
-						const content =
-							animating && boundary < frag.globalStart + frag.text.length ? (
-								<FragmentAnimContent key="anim" frag={frag} boundary={boundary} />
 							) : (
-								frag.text
+								(() => {
+									const content =
+										animating && boundary < frag.globalStart + frag.text.length ? (
+											<FragmentAnimContent key="anim" frag={frag} boundary={boundary} />
+										) : (
+											frag.text
+										);
+									return frag.href != null ? (
+										<a
+											href={frag.href}
+											target="_blank"
+											// `noopener` is implied by `target="_blank"` in current browsers,
+											// but stated anyway so both markdown paths carry the same `rel`
+											// (the chunked MarkdownContent does) and neither depends on that
+											// default holding.
+											rel="noopener noreferrer"
+											className={frag.className}
+											style={{
+												font: frag.font,
+												marginLeft: frag.gapBefore,
+												whiteSpace: "pre",
+												display: "inline-block",
+											}}
+										>
+											{content}
+										</a>
+									) : (
+										<span
+											className={frag.className}
+											style={{
+												font: frag.font,
+												marginLeft: frag.gapBefore,
+												whiteSpace: "pre",
+												display: "inline-block",
+											}}
+										>
+											{content}
+										</span>
+									);
+								})()
 							);
-						return frag.href != null ? (
-							<a
-								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-								key={fi}
-								href={frag.href}
-								target="_blank"
-								rel="noreferrer"
-								className={frag.className}
-								style={{
-									font: frag.font,
-									marginLeft: frag.gapBefore,
-									whiteSpace: "pre",
-									display: "inline-block",
-								}}
-							>
-								{content}
-							</a>
-						) : (
-							<span
-								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-								key={fi}
-								className={frag.className}
-								style={{
-									font: frag.font,
-									marginLeft: frag.gapBefore,
-									whiteSpace: "pre",
-									display: "inline-block",
-								}}
-							>
-								{content}
-							</span>
-						);
-					})}
+							return (
+								<Fragment
+									// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+									key={fi}
+								>
+									{/* Precedes the fragment: the space belongs to the boundary
+									    before it, not to the fragment's own text. */}
+									<FragmentGap gapBefore={frag.gapBefore} />
+									{body}
+								</Fragment>
+							);
+						})}
+					</LineFragments>
 				</div>
 			))}
 		</div>
@@ -921,9 +951,66 @@ function InlineMathView({
 				// box instead would desync it from the reserved geometry.
 				whiteSpace: "nowrap",
 			}}
-			// biome-ignore lint/security/noDangerouslySetInnerHtml: KaTeX-generated markup, not model text (trust:false blocks \href/\url)
-			dangerouslySetInnerHTML={{ __html: math.html }}
-		/>
+		>
+			{/* The LaTeX source, for copying only. KaTeX is rendered with
+			    `output: "html"` (katex-geometry), so the MathML `<annotation>` that
+			    normally carries the source is absent — without this the clipboard gets
+			    the VISUAL spans instead, which read as "E=mc2": the superscript
+			    structure is gone and the result is silently wrong maths. */}
+			<MathSourceForCopy latex={math.latex} display={false} />
+			<span
+				// The visual layer must not reach the clipboard; the source above is what
+				// gets copied. `aria-hidden` is already on KaTeX's own katex-html span, but
+				// that governs assistive tech, not selection.
+				style={{ userSelect: "none", WebkitUserSelect: "none" }}
+				// biome-ignore lint/security/noDangerouslySetInnerHtml: KaTeX-generated markup, not model text (trust:false blocks \href/\url)
+				dangerouslySetInnerHTML={{ __html: math.html }}
+			/>
+		</span>
+	);
+}
+
+/**
+ * The copyable LaTeX source of a formula, visually absent and geometry-neutral.
+ *
+ * Why it has to exist at all: `katex-geometry` renders with `output: "html"`, so the
+ * MathML subtree — and with it the `<annotation encoding="application/x-tex">` that
+ * normally holds the source — is never emitted. That leaves only the visual spans for
+ * the serializer to read, and they serialize as flattened nonsense: `E = mc^2` comes
+ * out `"E=mc \n2"` (verified in Chrome 146), i.e. the exponent silently becomes a
+ * factor. `\sum_{i=1}^{n} i` fares worse.
+ *
+ * Restoring MathML just for this would double the markup for every formula on a path
+ * whose whole point is minimal DOM, and its `textContent` still needs filtering. The
+ * source is already in hand (`InlineMathFragment.latex`), so it is carried directly.
+ *
+ * Hidden with the standard clip technique rather than `display:none` /
+ * `visibility:hidden` (which remove the text from the selection entirely) and rather
+ * than `width: 0; overflow: hidden` (which Chrome also drops from serialization — the
+ * same trap `FragmentGap` hit). `position: absolute` keeps it out of flow, so the
+ * formula box measures exactly as before.
+ *
+ * The delimiters are included so the pasted text is valid markdown that round-trips
+ * back into a formula.
+ */
+function MathSourceForCopy({ latex, display }: { latex: string; display: boolean }) {
+	const delimiter = display ? "$$" : "$";
+	return (
+		<span
+			data-vlist-math-source
+			style={{
+				position: "absolute",
+				width: 1,
+				height: 1,
+				overflow: "hidden",
+				// `inset(50%)` collapses the painted area to nothing while leaving the box
+				// (and therefore its text) part of the document for selection purposes.
+				clipPath: "inset(50%)",
+				whiteSpace: "nowrap",
+			}}
+		>
+			{`${delimiter}${latex}${delimiter}`}
+		</span>
 	);
 }
 
@@ -1180,6 +1267,9 @@ function UnknownBlockView({
 					<div
 						className="vlist-math-display"
 						style={{
+							// `relative` anchors the absolutely-positioned copy source below;
+							// it establishes no new geometry of its own.
+							position: "relative",
 							width: "100%",
 							overflowX: "auto",
 							overflowY: "hidden",
@@ -1188,9 +1278,18 @@ function UnknownBlockView({
 							// or the block renders taller than its reserved frame.
 							fontSize: MATH_BASE_FONT_SIZE,
 						}}
-						// biome-ignore lint/security/noDangerouslySetInnerHtml: KaTeX-generated markup, not model text (trust:false blocks \href/\url)
-						dangerouslySetInnerHTML={{ __html: html }}
-					/>
+					>
+						{/* Same reasoning as the inline case: with `output: "html"` there is
+						    no MathML annotation to copy, and the visual spans serialize as
+						    broken maths. Display math needs it more, not less — natively it
+						    copied as a column of loose symbols. */}
+						<MathSourceForCopy latex={source} display />
+						<span
+							style={{ userSelect: "none", WebkitUserSelect: "none" }}
+							// biome-ignore lint/security/noDangerouslySetInnerHtml: KaTeX-generated markup, not model text (trust:false blocks \href/\url)
+							dangerouslySetInnerHTML={{ __html: html }}
+						/>
+					</div>
 				);
 			}
 			default:

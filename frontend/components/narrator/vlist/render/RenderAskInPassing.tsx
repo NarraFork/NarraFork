@@ -26,7 +26,7 @@ import {
 } from "@chenglou/pretext/rich-inline";
 import { Box, Button, Group, Paper, Stack, Text, TextInput } from "@mantine/core";
 import { IconArrowRight, IconMessageQuestion } from "@tabler/icons-react";
-import { type KeyboardEvent, type ReactNode, useCallback, useMemo } from "react";
+import { Fragment, type KeyboardEvent, type ReactNode, useCallback, useMemo } from "react";
 import {
 	PENDING_HINT_MARGIN,
 	PENDING_PADDING_X,
@@ -40,6 +40,7 @@ import {
 	RESOLVED_PADDING_Y,
 } from "../measure/measure-ask-in-passing";
 import type { MeasuredElement, PreparedFixedBlock, PreparedInlineBlock } from "../prepared-block";
+import { FragmentGap, LineFragments } from "./line-fragments";
 
 const CARD_BG = "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))";
 
@@ -246,21 +247,27 @@ function ResolvedCard({
 									width: "max-content",
 								}}
 							>
-								{frags.map((frag, fi) => (
-									<span
-										// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-										key={fi}
-										style={{
-											font: frag.font,
-											marginLeft: frag.gapBefore,
-											whiteSpace: "pre",
-											display: "inline-block",
-											color: "var(--mantine-color-text)",
-										}}
-									>
-										{frag.text}
-									</span>
-								))}
+								<LineFragments>
+									{frags.map((frag, fi) => (
+										<Fragment
+											// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+											key={fi}
+										>
+											<FragmentGap gapBefore={frag.gapBefore} />
+											<span
+												style={{
+													font: frag.font,
+													marginLeft: frag.gapBefore,
+													whiteSpace: "pre",
+													display: "inline-block",
+													color: "var(--mantine-color-text)",
+												}}
+											>
+												{frag.text}
+											</span>
+										</Fragment>
+									))}
+								</LineFragments>
 							</div>
 						))}
 					</div>

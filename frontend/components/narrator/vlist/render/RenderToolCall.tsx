@@ -79,7 +79,7 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import type { ComponentType, ReactNode } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
 import {
@@ -112,8 +112,6 @@ import {
 	type ToolRowAction,
 	type ToolSectionLabel,
 	type ToolTimingStamps,
-	TRUNCATION_NOTICE_MARGIN_TOP,
-	XS_LINE_HEIGHT,
 } from "../measure/measure-tool-call";
 import type { BlockFrame, PreparedInlineBlock } from "../prepared-block";
 import { useShikiTokens } from "../useShikiTokens";
@@ -126,9 +124,11 @@ import {
 	type VListViewTarget,
 } from "../vlist-content-view-target";
 import { categoryIcon } from "./category-icons";
+import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
+import { RenderSidecar } from "./RenderSidecar";
 import { TokenFlowText, TokenText } from "./TokenLines";
 import { VListImage, type VListImageRef } from "./vlist-image";
 
@@ -175,17 +175,12 @@ export interface ToolCallLabels {
 	diffTruncated?: string;
 	/** Placeholder line for a valid but EMPTY spec task document. */
 	tasksEmpty?: string;
-	/**
-	 * Truncation notice text. Carries `{{size}}` / `{{count}}` placeholders, filled
-	 * in the row. The row is a FIXED single line, so its wording cannot move a
-	 * measured height.
-	 */
-	truncatedPreview?: string;
-	truncatedLoading?: string;
 	/** Permission labels forwarded to RenderInlinePermission. */
 	permission?: InlinePermissionLabels;
 	/** Reflection-notice labels forwarded to RenderReflectionNotice. */
 	reflection?: ReflectionNoticeLabels;
+	/** Sidecar mini-card chrome (copy tooltip). */
+	sidecar?: { copy?: string; copied?: string };
 }
 
 const DEFAULT_LABELS: Required<
@@ -201,8 +196,6 @@ const DEFAULT_LABELS: Required<
 		| "terminate"
 		| "diffTruncated"
 		| "tasksEmpty"
-		| "truncatedPreview"
-		| "truncatedLoading"
 	>
 > = {
 	input: "Input",
@@ -215,8 +208,6 @@ const DEFAULT_LABELS: Required<
 	terminate: "Terminate",
 	diffTruncated: "… {count} more rows not shown",
 	tasksEmpty: "Task list is empty",
-	truncatedPreview: "Content truncated ({size}) — click to load full data",
-	truncatedLoading: "Loading full data ({size})…",
 };
 
 /** English fallback used when a diff body is rendered without injected labels. */
@@ -395,22 +386,28 @@ function InlineLines({
 						width: "max-content",
 					}}
 				>
-					{line.fragments.map((frag, fi) => (
-						<span
-							// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-							key={fi}
-							className={frag.className}
-							style={{
-								font: frag.font,
-								marginLeft: frag.gapBefore,
-								whiteSpace: "pre",
-								display: "inline-block",
-								color,
-							}}
-						>
-							{frag.text}
-						</span>
-					))}
+					<LineFragments>
+						{line.fragments.map((frag, fi) => (
+							<Fragment
+								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+								key={fi}
+							>
+								<FragmentGap gapBefore={frag.gapBefore} />
+								<span
+									className={frag.className}
+									style={{
+										font: frag.font,
+										marginLeft: frag.gapBefore,
+										whiteSpace: "pre",
+										display: "inline-block",
+										color,
+									}}
+								>
+									{frag.text}
+								</span>
+							</Fragment>
+						))}
+					</LineFragments>
 				</div>
 			))}
 		</div>
@@ -1283,91 +1280,6 @@ function MarkdownDetailBody({
 	);
 }
 
-/**
- * The truncated-payload notice: a fixed single-line row at the end of the detail
- * region, offering to load the un-truncated payload.
- *
- * Height-neutral by construction — the row's height comes from the measure pass
- * (`TRUNCATION_NOTICE_MARGIN_TOP + XS_LINE_HEIGHT`) and is pinned here, so nothing
- * inside it can move the card. Clicking is the ONLY thing that grows this card,
- * which is what keeps the "no height change without a user action" invariant.
- */
-function TruncationNotice({
-	height,
-	leafCount,
-	totalBytes,
-	label,
-	loadingLabel,
-	loading,
-	onLoadFull,
-}: {
-	height: number;
-	leafCount: number;
-	totalBytes: number;
-	label: string;
-	loadingLabel: string;
-	loading: boolean;
-	onLoadFull?: () => void;
-}) {
-	const size = totalBytes > 0 ? `${Math.max(1, Math.round(totalBytes / 1024))}KB` : "";
-	const text = (loading ? loadingLabel : label)
-		.replace("{size}", size)
-		.replace("{count}", String(leafCount));
-	// Actionable only while a handler exists and nothing is in flight. The line is
-	// the ONLY way to reach a truncated payload, so when it can be clicked it has
-	// to LOOK clickable — a dimmed italic footnote was routinely read as "this
-	// content is simply gone". Hover is tracked in state rather than CSS so the
-	// emphasis stays inside the component (and inside the fixed line box).
-	const clickable = !loading && onLoadFull != null;
-	const [hovered, setHovered] = useState(false);
-	return (
-		<Box
-			style={{
-				height,
-				paddingTop: TRUNCATION_NOTICE_MARGIN_TOP,
-				boxSizing: "border-box",
-				overflow: "hidden",
-			}}
-		>
-			<UnstyledButton
-				onClick={
-					clickable
-						? (event) => {
-								// The row sits inside the card's own click target, which toggles
-								// the fold — loading the payload must not also collapse the card.
-								event.stopPropagation();
-								onLoadFull?.();
-							}
-						: undefined
-				}
-				onMouseEnter={clickable ? () => setHovered(true) : undefined}
-				onMouseLeave={clickable ? () => setHovered(false) : undefined}
-				title={clickable ? text : undefined}
-				style={{
-					display: "block",
-					width: "100%",
-					lineHeight: `${XS_LINE_HEIGHT}px`,
-					cursor: clickable ? "pointer" : "default",
-				}}
-			>
-				<Text
-					size="xs"
-					c={clickable ? (hovered ? "indigo.3" : "indigo.4") : "dimmed"}
-					fs="italic"
-					truncate
-					style={
-						clickable
-							? { textDecoration: hovered ? "underline solid" : "underline dotted" }
-							: undefined
-					}
-				>
-					{text}
-				</Text>
-			</UnstyledButton>
-		</Box>
-	);
-}
-
 /** Resolved label bundle the detail renderers need. */
 type DetailLabels = Required<
 	Pick<
@@ -1899,21 +1811,30 @@ function SectionsDetailBody({
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
 }) {
+	// kind === "sections" guarantees the section list (the caller gates on it).
 	const sections = detail.sections ?? [];
 	return (
 		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
-			{sections.map((part, index) => (
+			{sections.map((part, sectionIndex) => (
 				<SectionView
-					// biome-ignore lint/suspicious/noArrayIndexKey: sections are a stable ordered list
-					key={index}
+					// biome-ignore lint/suspicious/noArrayIndexKey: sections are a stable ordered list — the measure pass fixes their order and count, and a section is never inserted, removed or reordered without a re-measure that rebuilds this whole region
+					key={sectionIndex}
 					detail={detail}
 					part={part}
 					availableWidth={availableWidth}
 					labels={labels}
 					narratorId={narratorId}
-					// Each section owns the `s{index}` slot, so the render layer finds its
-					// own target without ever knowing the row's spec key.
-					viewTarget={findViewTarget(viewTargets, sectionSlot(index))}
+					// SLOT lookup, never `viewTargets[sectionIndex]`:
+					// `resolveDetailViewTargets` pushes CONDITIONALLY (a section whose body
+					// yields no readable target — error text, a label-only row, a media
+					// placeholder — contributes nothing), so the target array is SPARSE
+					// relative to the section list and array indices do not line up.
+					// Indexing it hands section 0 the target that belongs to section 1,
+					// which both misroutes the hover bar / wrap / source / fullscreen
+					// controls and — since `truncated` is the only gate for fetching the
+					// bytes the server withheld — leaves the real body unable to ever load
+					// its full payload.
+					viewTarget={findViewTarget(viewTargets, sectionSlot(sectionIndex))}
 					viewControls={viewControls}
 				/>
 			))}
@@ -2639,10 +2560,6 @@ export interface RenderToolCallProps {
 	 * copy; its height is corrected after paint via the shell's onUnknownHeight.
 	 */
 	permissionSlot?: ReactNode;
-	/** Load this card's un-truncated payload (the truncation notice's action). */
-	onLoadFullPayload?: () => void;
-	/** The requested full payload is in flight. */
-	fullPayloadLoading?: boolean;
 	/**
 	 * Manual takeover of a RUNNING reflection gate (stop it and decide yourself).
 	 * The API call lives outside vlist/, so the integration layer supplies it; the
@@ -2665,6 +2582,13 @@ export interface RenderToolCallProps {
 	 */
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
+	/**
+	 * Fold toggle for ONE tool-result sidecar mini-card (index-addressed). The
+	 * shell owns the interaction state; absent → the sidecar cards render inert
+	 * (still fully visible, just not foldable). Height-affecting state is resolved
+	 * during measurement, so this only ever flips an already-measured card.
+	 */
+	onToggleSidecar?: (index: number) => void;
 }
 
 /** How long a one-shot outcome sweep stays mounted (600ms animation + a margin). */
@@ -2739,12 +2663,11 @@ export function RenderToolCall({
 	onPermissionAllow,
 	onPermissionDeny,
 	permissionSlot,
-	onLoadFullPayload,
-	fullPayloadLoading,
 	onReflectionTakeOver,
 	reflectionTakingOver,
 	viewTargets,
 	viewControls,
+	onToggleSidecar,
 }: RenderToolCallProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	const {
@@ -2753,6 +2676,7 @@ export function RenderToolCall({
 		detail,
 		permission,
 		reflection,
+		sidecars,
 		hasBorder,
 		inRun,
 		isLast,
@@ -2802,6 +2726,23 @@ export function RenderToolCall({
 				onTerminate={onTerminate}
 				terminateLabel={merged.terminate}
 			/>
+			{/* Tool-result sidecars — the injections the model saw in this tool's
+			    output. They render between the header and the detail region and, like
+			    the chunked SideCarNotice, show whether or not the card body is open.
+			    Each is its own measured mini-card with an independent fold. */}
+			{sidecars && sidecars.length > 0 ? (
+				<Stack gap={6} mt={6}>
+					{sidecars.map((sc, index) => (
+						<RenderSidecar
+							// biome-ignore lint/suspicious/noArrayIndexKey: sidecars are a stable ordered list — the measure pass derives them from this tool result's injections in emission order, and `onToggleSidecar` addresses them by that same index, so the index IS the identity
+							key={index}
+							measured={sc}
+							onToggle={onToggleSidecar ? () => onToggleSidecar(index) : undefined}
+							labels={merged.sidecar}
+						/>
+					))}
+				</Stack>
+			) : null}
 			{effectiveOpened ? (
 				<>
 					{detail ? (
@@ -2819,19 +2760,6 @@ export function RenderToolCall({
 								/>
 							</div>
 						</Box>
-					) : null}
-					{/* Truncation notice: ONE row covering every still-previewed field of this
-					    payload, drawn at exactly the height the measure pass reserved. */}
-					{measured.truncationNoticeHeight > 0 ? (
-						<TruncationNotice
-							height={measured.truncationNoticeHeight}
-							leafCount={measured.truncatedLeafCount}
-							totalBytes={measured.truncatedTotalBytes}
-							label={merged.truncatedPreview}
-							loadingLabel={merged.truncatedLoading}
-							loading={fullPayloadLoading === true}
-							onLoadFull={onLoadFullPayload}
-						/>
 					) : null}
 					{/* A reflection notice REPLACES the permission area (chunked precedence,
 					    ToolCallCard.tsx:5419). It is fully MEASURED, so it renders on the

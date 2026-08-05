@@ -23,7 +23,7 @@ import {
 } from "@chenglou/pretext/rich-inline";
 import { Loader, Paper, ThemeIcon } from "@mantine/core";
 import { IconWorldSearch } from "@tabler/icons-react";
-import { useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import {
 	WEB_SEARCH_BORDER,
 	WEB_SEARCH_ICON_SIZE,
@@ -34,6 +34,7 @@ import {
 	webSearchChromeLeft,
 } from "../measure/measure-web-search";
 import type { MeasuredElement, PreparedInlineBlock } from "../prepared-block";
+import { FragmentGap, LineFragments } from "./line-fragments";
 
 interface RenderWebSearchProps {
 	measured: MeasuredElement;
@@ -129,21 +130,27 @@ export function RenderWebSearch({ measured, isSearching = false }: RenderWebSear
 								width: "max-content",
 							}}
 						>
-							{line.fragments.map((frag, fi) => (
-								<span
-									// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-									key={fi}
-									style={{
-										font: frag.font,
-										marginLeft: frag.gapBefore,
-										whiteSpace: "pre",
-										display: "inline-block",
-										color: fragColor(frag.className),
-									}}
-								>
-									{frag.text}
-								</span>
-							))}
+							<LineFragments>
+								{line.fragments.map((frag, fi) => (
+									<Fragment
+										// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+										key={fi}
+									>
+										<FragmentGap gapBefore={frag.gapBefore} />
+										<span
+											style={{
+												font: frag.font,
+												marginLeft: frag.gapBefore,
+												whiteSpace: "pre",
+												display: "inline-block",
+												color: fragColor(frag.className),
+											}}
+										>
+											{frag.text}
+										</span>
+									</Fragment>
+								))}
+							</LineFragments>
 						</div>
 					))}
 				</div>

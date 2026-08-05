@@ -39,6 +39,15 @@ import {
 	reflectionTitleKeySuffix,
 } from "./reflection";
 import {
+	type AdapterSidecar,
+	adapterMessageHasVisibleContent,
+	collectVisibleSidecars,
+	SIDECAR_PAYLOAD_KIND,
+	SIDECAR_SOURCE_META,
+	sidecarDetailText,
+	sidecarPreviewText,
+} from "./sidecar";
+import {
 	isLiveStreamingBlock,
 	isLiveStreamingRun,
 	STREAMING_MESSAGE_ID,
@@ -162,6 +171,13 @@ export interface AdapterMessage {
 	tokensIn?: number | null;
 	costUsd?: number | null;
 	meterUsage?: number | null;
+	/**
+	 * System-injected sidecar records attached to this message. The adapter reads
+	 * only the `user_message`-targeted ones (the `tool_result` ones are surfaced on
+	 * their owning tool card instead). Each visible record becomes its own small
+	 * collapsible `sidecar` element AFTER the message's other content.
+	 */
+	sideCars?: AdapterSidecar[] | null;
 }
 
 /** A tool-run item (structural subset of message-segments ToolRunItem).
@@ -802,6 +818,108 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Sidecar element specs (one collapsible card per visible record).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The measure/render payload for ONE sidecar card. `previewText` is the
+ * collapsed single line; `fullText` the expanded body (capped). Both are
+ * composed HERE because the expanded body is measured — the render layer only
+ * paints what the measure layer wrapped. Labels (source/target/copy) flow
+ * through `ctx.labels` like every other adapter-composed string.
+ */
+export interface SidecarSpecData {
+	/**
+	 * Explicit payload discriminant. **Every adapter construction point stamps it**
+	 * (`buildSidecarSpecs`, `buildToolSidecarData`); the invariant is asserted by
+	 * `sidecar-payload-kind.test.ts` rather than by the type, because the field is
+	 * declared optional so hand-written measure fixtures stay valid.
+	 *
+	 * The measure cache has to distinguish a standalone sidecar element's data from
+	 * a tool card's `sidecars` array (different revision branches, therefore
+	 * different heights). It used to do that by sniffing for `fullText` + `source`,
+	 * which any future payload carrying those names would collide with — silently
+	 * taking the wrong branch and being served a stale height. This marker makes
+	 * the identification positive instead of incidental.
+	 */
+	payloadKind?: typeof SIDECAR_PAYLOAD_KIND;
+	source: string;
+	/** Localized source label (badge text). */
+	sourceLabel: string;
+	/** Mantine colour for the accent rail + badge. */
+	color: string;
+	/** "user_message" | "tool_result" (badge text is the raw target). */
+	target: string;
+	/** Collapsed single-line preview (height-neutral: the row is fixed). */
+	previewText: string;
+	/** Expanded body (MEASURED — the card's height comes from this). */
+	fullText: string;
+	/**
+	 * Localized "you are not seeing all of it, use copy" notice.
+	 *
+	 * Composed here (like every other adapter string) and used by BOTH caps: the
+	 * char cap appends it as the last body line (`sidecarDetailText`), and the
+	 * measure layer reserves it as a notice row when the LINE cap clipped the body
+	 * — otherwise an expanded long sidecar just stops after 40 lines inside an
+	 * `overflow:hidden` box with nothing telling the reader why.
+	 *
+	 * Optional for the same reason as `payloadKind`: the adapter always sets it, but
+	 * measure fixtures may omit it (the notice row then reserves nothing).
+	 */
+	truncatedLabel?: string;
+}
+
+/**
+ * Build the sidecar specs for a list of records already filtered to one target.
+ * One spec per record, each with its own expand state (`opts.expanded`, keyed by
+ * the spec key so the reader folds cards independently — the redesign replaces
+ * the chunked notice's single aggregate toggle with per-card folds).
+ */
+function buildSidecarSpecs(
+	sideCars: readonly AdapterSidecar[],
+	keyBase: string,
+	ctx: AdapterContext,
+): ElementSpec[] {
+	const specs: ElementSpec[] = [];
+	for (let i = 0; i < sideCars.length; i++) {
+		const sc = sideCars[i];
+		if (!sc) continue;
+		const meta = SIDECAR_SOURCE_META[sc.source];
+		const key = `${keyBase}-sc${i}`;
+		const truncatedLabel = sysLabel(ctx, "sidecarTruncated");
+		specs.push({
+			kind: "sidecar",
+			key,
+			data: {
+				payloadKind: SIDECAR_PAYLOAD_KIND,
+				source: sc.source,
+				sourceLabel: meta
+					? sysLabel(ctx, meta.labelKey)
+					: sc.source || sysLabel(ctx, "sidecarUnknown"),
+				color: meta?.color ?? "gray",
+				target: sc.target,
+				previewText: sidecarPreviewText(sc.content),
+				fullText: sidecarDetailText(sc.content, truncatedLabel),
+				truncatedLabel,
+			} satisfies SidecarSpecData,
+			opts: { expanded: ctx.isExpanded?.(key) ?? false },
+		});
+	}
+	return specs;
+}
+
+/** The visible `user_message` sidecars of a message, as element specs. */
+function messageSidecarSpecs(
+	msg: AdapterMessage,
+	idBase: string,
+	ctx: AdapterContext,
+): ElementSpec[] {
+	const visible = collectVisibleSidecars(msg.sideCars, "user_message");
+	if (visible.length === 0) return [];
+	return buildSidecarSpecs(visible, idBase, ctx);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public: segment → ElementSpec[]
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -839,7 +957,10 @@ function adaptMessage(
 		// them to the same system card the classic renderer uses.
 		const systemCardBlock = blocks.find((b) => USER_SYSTEM_CARD_TYPES.has(b.type));
 		if (systemCardBlock) {
-			return [adaptSystemBlock(systemCardBlock.type, systemCardBlock, idBase, msg, ctx)];
+			return [
+				adaptSystemBlock(systemCardBlock.type, systemCardBlock, idBase, msg, ctx),
+				...messageSidecarSpecs(msg, idBase, ctx),
+			];
 		}
 		// Turns stored as role=user for protocol/scheduling reasons that no human
 		// wrote (auto-continuation, review kickoff, AI-initiated sends). Painting
@@ -863,6 +984,7 @@ function adaptMessage(
 						originLabel: msg.originLabel ?? null,
 					},
 				},
+				...messageSidecarSpecs(msg, idBase, ctx),
 			];
 		}
 		const visible = indices.map((i) => blocks[i]).filter((b): b is AdapterContentBlock => !!b);
@@ -910,6 +1032,7 @@ function adaptMessage(
 						}
 					: {}),
 			},
+			...messageSidecarSpecs(msg, idBase, ctx),
 		];
 	}
 
@@ -921,6 +1044,7 @@ function adaptMessage(
 		const sysBlock = blocks.find((b) => isRecognizedSystemBlockType(b.type)) ??
 			blocks[0] ?? { type: "info" };
 		specs.push(adaptSystemBlock(sysBlock.type, sysBlock, idBase, msg, ctx));
+		specs.push(...messageSidecarSpecs(msg, idBase, ctx));
 		return specs;
 	}
 
@@ -1033,6 +1157,11 @@ function adaptMessage(
 			},
 		});
 	}
+	// Message-level (user_message) sidecars, one collapsible card per record —
+	// the redesign replaces the chunked aggregate notice. Assistant bubbles render
+	// their content above; the cards trail the body exactly like the chunked
+	// MessageBubble's notice sat after the content blocks.
+	specs.push(...messageSidecarSpecs(msg, idBase, ctx));
 	return specs;
 }
 
@@ -1167,6 +1296,23 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	taskReflectionAborted: "Task review interrupted",
 	taskReflectionResolved: "Task review finished",
 	reflectionNextSteps: "Next: {nextSteps}",
+	// ── sidecar cards (one collapsible card per system injection) ─────────────
+	// The source badge text is measured into the card's single-line header, so it
+	// flows through the adapter like every other composed chrome string. Keys map
+	// 1:1 onto the existing `sidecar.sources.*` narrator strings (shell injects).
+	sidecarUnknown: "unknown",
+	sidecarTruncated: "[Preview truncated…]",
+	sidecarSourceSilentProgress: "Progress reminder",
+	sidecarSourceTodoReminder: "TODO reminder",
+	sidecarSourceRelaxedPlan: "Plan mode reminder",
+	sidecarSourceKnowledgeBaseHint: "Knowledge base hint",
+	sidecarSourceBgAgent: "Background agent",
+	sidecarSourceBgBash: "Background command",
+	sidecarSourceTeamMessage: "Team message",
+	sidecarSourceBufferedUser: "Buffered user message",
+	sidecarSourceGroupMessage: "Group message",
+	sidecarSourceSubagentMessage: "Subagent message",
+	sidecarSourceSpecUpdate: "Outline update",
 };
 
 /** Resolve a system-card chrome label (injected i18n → English fallback). */
@@ -1715,6 +1861,21 @@ function adaptToolItemFull(
 		opened === undefined && item.isSubagent && runContext.isSoleSubagent ? true : opened;
 	const lodUserOverride = ctx.isLodUserOverride?.(key) ?? false;
 	const hasPendingPermission = ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false;
+	// Per-sidecar fold states, keyed by index within this card. Carried as a plain
+	// number[] (NOT a resolver closure) so the measure cache's digestOpts can fold
+	// it into the cache key — an expanded sidecar measures a taller body, so the
+	// state must participate in keying exactly like `expandedIndices` does for a
+	// trace. Keyed `${key}-sc${index}` to match the standalone sidecar specs.
+	const sidecarExpandedIndices: number[] = [];
+	{
+		const raw = (item.tc as { sideCars?: unknown }).sideCars;
+		const count = Array.isArray(raw)
+			? collectVisibleSidecars(raw as AdapterSidecar[], "tool_result").length
+			: 0;
+		for (let i = 0; i < count; i++) {
+			if (ctx.isExpanded?.(`${key}-sc${i}`) === true) sidecarExpandedIndices.push(i);
+		}
+	}
 	const opts = {
 		isRecent: isRecentToolItem(item, ctx),
 		...(defaultOpened === undefined ? {} : { opened: defaultOpened }),
@@ -1729,6 +1890,9 @@ function adaptToolItemFull(
 			!hasPendingPermission &&
 			!isActiveToolItem(item) &&
 			(ctx.lod === 4 || (ctx.lod === 5 && !isRecentToolItem(item, ctx))),
+		// Empty array omits the field (digestOpts skips it), keeping sidecar-free
+		// cards' cache keys byte-identical to before this feature.
+		...(sidecarExpandedIndices.length > 0 ? { sidecarExpanded: sidecarExpandedIndices } : {}),
 	};
 	if (item.isSubagent) {
 		// Map height-relevant SubagentCardData fields (NOT `status` — that field
@@ -1918,6 +2082,12 @@ function buildToolCardData(
 		// permission area, and is MEASURED — the row's height is final on first
 		// paint instead of being corrected by a ResizeObserver afterwards.
 		reflection: resolveToolReflection(item, ctx, hasPendingPermission),
+		// Tool-result sidecars (system injections the model saw in this tool's
+		// output). Each becomes a measured mini-card inside the tool card, between
+		// the header and the detail — the chunked ToolCallCard renders its
+		// SideCarNotice at exactly that spot (outside the collapse, so it shows
+		// even on a folded card). Measured, never a slot.
+		sidecars: buildToolSidecarData(item, ctx),
 		// Expanded detail region height model (line counts / body lines / px).
 		// null when the tool call has no meaningful detail body.
 		detail: classifyToolDetail({
@@ -1935,6 +2105,38 @@ function buildToolCardData(
 			...(ctx.labels ? { labels: ctx.labels } : {}),
 		}),
 	};
+}
+
+/**
+ * Build the tool card's tool_result sidecar payloads (the mini-cards rendered
+ * between the header and the detail region). Returns null when the tool carries
+ * no visible ones so the card data stays byte-identical to a sidecar-free build
+ * (keeping the measure cache key stable for the overwhelmingly common case).
+ */
+function buildToolSidecarData(
+	item: AdapterToolItem,
+	ctx: AdapterContext,
+): SidecarSpecData[] | null {
+	const raw = (item.tc as { sideCars?: unknown }).sideCars;
+	if (!Array.isArray(raw)) return null;
+	const visible = collectVisibleSidecars(raw as AdapterSidecar[], "tool_result");
+	if (visible.length === 0) return null;
+	const truncatedLabel = sysLabel(ctx, "sidecarTruncated");
+	return visible.map((sc) => {
+		const meta = SIDECAR_SOURCE_META[sc.source];
+		return {
+			payloadKind: SIDECAR_PAYLOAD_KIND,
+			source: sc.source,
+			sourceLabel: meta
+				? sysLabel(ctx, meta.labelKey)
+				: sc.source || sysLabel(ctx, "sidecarUnknown"),
+			color: meta?.color ?? "gray",
+			target: sc.target,
+			previewText: sidecarPreviewText(sc.content),
+			fullText: sidecarDetailText(sc.content, truncatedLabel),
+			truncatedLabel,
+		} satisfies SidecarSpecData;
+	});
 }
 
 /** Chunk parity: Bash falls back to a 120s deadline (ToolCallCard.tsx:1327). */
@@ -2315,14 +2517,22 @@ function foldedToolItems(
 function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpec[] {
 	const isMultiRun = items.length >= 2;
 	const isSoleSubagent = items.filter((item) => item.isSubagent).length === 1;
+	// Message-level sidecars of PURE-TOOL source messages (no visible content
+	// block): such a message never produces a bubble segment, so its sidecars
+	// would be lost entirely. Surface them at the END of the run — the chunked
+	// MessageRenderer does exactly this (skipping messages that DO have a bubble,
+	// which renders its own sidecars, to avoid duplication).
+	const toolOnlySidecars = collectToolOnlyMessageSidecars(items);
+	const sidecarSpecs = buildSidecarSpecs(toolOnlySidecars, toolRunSidecarKeyBase(items), ctx);
 	if (ctx.lod >= 4) {
-		return items.map((item, index) =>
+		const specs = items.map((item, index) =>
 			adaptToolItemFull(item, ctx, {
 				inRun: isMultiRun,
 				isLast: index === items.length - 1,
 				isSoleSubagent,
 			}),
 		);
+		return [...specs, ...sidecarSpecs];
 	}
 	const groups = groupToolItemsForLod(items);
 	const specs: ElementSpec[] = [];
@@ -2371,7 +2581,36 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 			});
 		}
 	}
-	return specs;
+	return [...specs, ...sidecarSpecs];
+}
+
+/**
+ * The `user_message` sidecars of the run's PURE-TOOL source messages, deduped
+ * by message id and ordered by first appearance. A message that has its own
+ * visible content block is skipped — its bubble already renders those cards.
+ * Mirrors MessageRenderer.tsx:233-243 (same predicate, same dedup).
+ */
+function collectToolOnlyMessageSidecars(items: readonly AdapterToolItem[]): AdapterSidecar[] {
+	const seen = new Set<string>();
+	const out: AdapterSidecar[] = [];
+	for (const item of items) {
+		const srcMsg = item.msg;
+		if (!srcMsg) continue;
+		if (srcMsg.id) {
+			if (seen.has(srcMsg.id)) continue;
+			seen.add(srcMsg.id);
+		}
+		if (adapterMessageHasVisibleContent(srcMsg)) continue;
+		out.push(...collectVisibleSidecars(srcMsg.sideCars, "user_message"));
+	}
+	return out;
+}
+
+/** Stable key base for a run's trailing sidecar cards (first member's identity). */
+function toolRunSidecarKeyBase(items: readonly AdapterToolItem[]): string {
+	const first = items[0];
+	if (!first) return "toolrun";
+	return `toolrun-sc-${toolItemKey(first)}`;
 }
 
 /**

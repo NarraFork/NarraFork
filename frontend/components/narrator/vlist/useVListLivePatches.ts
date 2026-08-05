@@ -47,6 +47,7 @@ import {
 	toolStartedPatch,
 } from "./vlist-live-events";
 import {
+	appendMessageSidecars,
 	type LivePatch,
 	LivePatchQueue,
 	patchSubagentActivitySnapshots,
@@ -395,6 +396,19 @@ export function useVListLivePatches(
 			onBackgroundTaskCancelled: (_taskNarratorId, toolUseId) => {
 				if (!toolUseId) return;
 				enqueue(backgroundTaskPatch({ toolUseId, status: "cancelled", text: "Cancelled" }));
+			},
+
+			// ── Standalone message-level sidecars (user_message target) ─────────
+			// The `sidecars` event carries the injections that arrive BETWEEN turns
+			// (background completions, group-chat deliveries, spec updates). Only the
+			// user_message ones are message-level — the tool_result ones rode in on
+			// `tool_completed` already. Appended to the latest assistant message,
+			// exactly like the chunked path's onSideCars (useNarratorChunksWS:1319).
+			onSideCars: (sideCars, rawParent) => {
+				const parentToolUseId = routeParent(rawParent);
+				const userSideCars = sideCars.filter((sc) => sc.target === "user_message");
+				if (userSideCars.length === 0) return;
+				enqueue((messages) => appendMessageSidecars(messages, userSideCars, parentToolUseId));
 			},
 
 			// ── Reconnect catch-up: authoritative activity snapshots ────────────

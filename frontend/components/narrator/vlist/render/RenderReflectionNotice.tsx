@@ -36,7 +36,7 @@ import {
 	IconShield,
 	IconX,
 } from "@tabler/icons-react";
-import { useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import { useReflectionProgress } from "../../reflection-progress-store";
 import {
 	type MeasuredReflectionNotice,
@@ -49,6 +49,7 @@ import {
 } from "../measure/measure-reflection-notice";
 import type { PreparedInlineBlock } from "../prepared-block";
 import { RADIUS } from "../pretext-fonts";
+import { FragmentGap, LineFragments } from "./line-fragments";
 
 export interface ReflectionNoticeLabels {
 	/** Manual-takeover button label. */
@@ -162,22 +163,28 @@ function InlineRow({
 						width: "max-content",
 					}}
 				>
-					{line.fragments.map((frag, fi) => (
-						<span
-							// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-							key={fi}
-							className={frag.className}
-							style={{
-								font: frag.font,
-								marginLeft: frag.gapBefore,
-								whiteSpace: "pre",
-								display: "inline-block",
-								color,
-							}}
-						>
-							{frag.text}
-						</span>
-					))}
+					<LineFragments>
+						{line.fragments.map((frag, fi) => (
+							<Fragment
+								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+								key={fi}
+							>
+								<FragmentGap gapBefore={frag.gapBefore} />
+								<span
+									className={frag.className}
+									style={{
+										font: frag.font,
+										marginLeft: frag.gapBefore,
+										whiteSpace: "pre",
+										display: "inline-block",
+										color,
+									}}
+								>
+									{frag.text}
+								</span>
+							</Fragment>
+						))}
+					</LineFragments>
 				</div>
 			))}
 		</div>

@@ -23,6 +23,7 @@ import { RenderPruneDivider } from "./render/RenderMisc";
 import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPermission";
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
+import { RenderSidecar } from "./render/RenderSidecar";
 import { RenderSubagent } from "./render/RenderSubagent";
 import { RenderSubagentRecovery } from "./render/RenderSubagentRecovery";
 import { RenderSystemList } from "./render/RenderSystemList";
@@ -103,6 +104,12 @@ export function resolveRenderExtra(spec: {
 				extra.kind = data.kind;
 				extra.data = data;
 			}
+			break;
+		case "sidecar":
+			// The card's payload is fully composed by the adapter (source label /
+			// preview / full text); the fold toggle comes through opts and the copy
+			// tooltip through the standard render labels bundle (`extra.labels`).
+			extra.data = data;
 			break;
 		case "subagent-recovery":
 			// The measured block already carries the full payload; only the live
@@ -266,6 +273,14 @@ export function renderElement(
 					errorActions={extra.errorNoticeActions as never}
 				/>
 			);
+		case "sidecar":
+			return (
+				<RenderSidecar
+					measured={m}
+					onToggle={extra.onToggle as (() => void) | undefined}
+					labels={extra.labels as never}
+				/>
+			);
 		case "knowledge-hint":
 			return <RenderSystemList measured={m} onOpenEntry={extra.onOpenEntry as never} />;
 		case "plan-card":
@@ -309,11 +324,6 @@ export function renderElement(
 					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}
 					onReflectionTakeOver={extra.onReflectionTakeOver as (() => void) | undefined}
-					// The truncation notice's action + its in-flight state. Dropping these
-					// left the "content truncated — click to load" row painted but inert:
-					// the only way to reach a truncated payload in the exact list.
-					onLoadFullPayload={extra.onLoadFullPayload as (() => void) | undefined}
-					fullPayloadLoading={extra.fullPayloadLoading as boolean | undefined}
 					// Per-body viewer wiring (copy / wrap / source / fullscreen action bar).
 					// The shell derives the targets from the MEASURED card, so without this
 					// forward every body inside a tool card lost its action bar.

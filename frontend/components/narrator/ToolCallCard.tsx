@@ -5109,7 +5109,11 @@ export function InlinePermission({
 	// Regular permission: feedback textarea + Allow/Deny buttons
 	return (
 		<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}>
-			{permissionTargetDeviceId && (
+			{/* ExitPlanMode is a plan-approval gate, not a filesystem/command action:
+			    its routed "target" is just the plan file the platform already read.
+			    Showing device/cwd/lexical/canonical paths there is noise, and the
+			    block's variable height fought the plan card's measured geometry. */}
+			{permissionTargetDeviceId && !isExitPlan && (
 				<Paper withBorder p="xs" mb="xs" radius="sm">
 					<Group gap="xs" mb={permissionTargetCwd || permissionLexicalPath ? 4 : 0} wrap="wrap">
 						<Text size="xs" fw={600}>

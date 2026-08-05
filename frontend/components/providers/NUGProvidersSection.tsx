@@ -44,6 +44,8 @@ import { formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
 import type { ProxyOverride } from "../../lib/proxy";
 import { extractPrimaryDomainLabel } from "../../lib/url";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
+import type { ChannelHealth } from "./channel-health";
+import { channelHealthKey, normalizeChannelHealth } from "./channel-health";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 
@@ -66,17 +68,6 @@ export interface NUGProviderState {
 }
 
 type ProvidersUpdater = NUGProviderState[] | ((prev: NUGProviderState[]) => NUGProviderState[]);
-
-interface ChannelHealth {
-	channelType: string;
-	totalCredentials: number;
-	availableCredentials: number;
-	disabledCredentials: number;
-	availabilityRate: number;
-	currentConcurrency: number;
-	maxConcurrency: number;
-	queueDepth: number;
-}
 
 interface QuotaInfo {
 	balance: number;
@@ -491,7 +482,7 @@ function NUGChannelHealth({ providerId }: { providerId: string }) {
 		setLoading(true);
 		try {
 			const res = await api.nugGetChannelsHealth(providerId);
-			setChannels(res.channels ?? []);
+			setChannels(normalizeChannelHealth(res.channels));
 		} catch {
 			/* ignore */
 		} finally {
@@ -519,11 +510,21 @@ function NUGChannelHealth({ providerId }: { providerId: string }) {
 				{channels.map((ch) => {
 					const pct = Math.round(ch.availabilityRate * 100);
 					const color = CHANNEL_COLORS[ch.channelType] ?? "blue";
+					const name = ch.channel ?? ch.channelType;
+					const hasCredentials =
+						typeof ch.availableCredentials === "number" && typeof ch.totalCredentials === "number";
+					const hasConcurrency =
+						typeof ch.currentConcurrency === "number" && typeof ch.maxConcurrency === "number";
 					return (
-						<Group key={ch.channelType} gap="xs" wrap="nowrap">
-							<Text size="xs" w={80} fw={500} tt="capitalize">
-								{ch.channelType}
+						<Group key={channelHealthKey(ch)} gap="xs" wrap="nowrap">
+							<Text size="xs" w={80} fw={500} truncate title={name}>
+								{name}
 							</Text>
+							{ch.channel && ch.channel !== ch.channelType && (
+								<Badge size="xs" variant="light" color={color}>
+									{ch.channelType}
+								</Badge>
+							)}
 							<Progress
 								value={pct}
 								color={pct >= 80 ? color : pct >= 50 ? "yellow" : "red"}
@@ -534,19 +535,23 @@ function NUGChannelHealth({ providerId }: { providerId: string }) {
 							<Text size="xs" w={40} ta="right">
 								{pct}%
 							</Text>
-							<Text size="xs" c="dimmed" w={60} ta="right">
-								{ch.availableCredentials}/{ch.totalCredentials}
-							</Text>
-							<Tooltip
-								label={t("nugConcurrency", {
-									current: ch.currentConcurrency,
-									max: ch.maxConcurrency,
-								})}
-							>
-								<Badge size="xs" variant="dot" color={color}>
-									{ch.currentConcurrency}/{ch.maxConcurrency}
-								</Badge>
-							</Tooltip>
+							{hasCredentials && (
+								<Text size="xs" c="dimmed" w={60} ta="right">
+									{ch.availableCredentials}/{ch.totalCredentials}
+								</Text>
+							)}
+							{hasConcurrency && (
+								<Tooltip
+									label={t("nugConcurrency", {
+										current: ch.currentConcurrency,
+										max: ch.maxConcurrency,
+									})}
+								>
+									<Badge size="xs" variant="dot" color={color}>
+										{ch.currentConcurrency}/{ch.maxConcurrency}
+									</Badge>
+								</Tooltip>
+							)}
 						</Group>
 					);
 				})}

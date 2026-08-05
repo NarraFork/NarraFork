@@ -43,6 +43,7 @@
  */
 
 import type {
+	SideCarRecord,
 	SubagentActivitySummary,
 	SubagentToolCallHeader,
 	TreeMessage,
@@ -59,6 +60,7 @@ import {
 	updateSubagentActivityInMessages,
 	upsertSubagentToolCallHeader,
 } from "../message-tree-utils";
+import { appendSideCarsToLatestAssistant } from "../narrator-message-helpers";
 import { isLiveToolStatusRegression } from "./streaming-tool-chunks";
 
 /** Result of one patch attempt over the loaded document. */
@@ -401,6 +403,38 @@ export function patchSubagentActivitySnapshots(
 function normalizeModel(value: unknown): string | null {
 	if (typeof value !== "string") return null;
 	return value.trim() || null;
+}
+
+/**
+ * Append user_message sidecars to the LATEST assistant message, mirroring the
+ * chunked path's `appendSideCarsToLatestAssistant` (narrator-message-helpers).
+ *
+ * The standalone `sidecars` WS event carries the message-level injections that
+ * arrive BETWEEN turns (background-task completions, group-chat deliveries, spec
+ * updates). Unlike `tool_completed`'s sidecars these are NOT tied to a tool call,
+ * so the patch targets the newest assistant message's `sideCars` list.
+ *
+ * This is a field-level append on an existing message, not a structural insert:
+ * the adapter turns each record into a NEW sidecar element spec at layout time,
+ * so the document's message count and messageVersion are unchanged — only the
+ * touched message's data revision moves (see measure-cache's sidecarRevision).
+ */
+export function appendMessageSidecars(
+	messages: readonly TreeMessage[],
+	sideCars: readonly SideCarRecord[],
+	parentToolUseId?: string,
+): LivePatchResult {
+	if (!Array.isArray(messages) || messages.length === 0 || sideCars.length === 0) {
+		return unchanged(messages);
+	}
+	// The chunked helper takes a mutable list view; the patch layer owns the only
+	// copy, so widening the readonly input here is safe.
+	const result = appendSideCarsToLatestAssistant(
+		messages as TreeMessage[],
+		sideCars as SideCarRecord[],
+		parentToolUseId,
+	);
+	return result.changed ? { messages: result.messages, changed: true } : unchanged(messages);
 }
 
 /**

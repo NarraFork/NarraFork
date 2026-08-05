@@ -306,6 +306,22 @@ describe("measureInlinePermission — execution target", () => {
 		// Additional path lines add one xs line each.
 		expect(executionTargetHeight(1, 2) - executionTargetHeight(1, 0)).toBe(2 * c.XS_LINE_HEIGHT);
 	});
+
+	it("suppresses the execution-target Paper for ExitPlanMode (the card never paints it)", async () => {
+		const { measureInlinePermission } = await import("./measure-permission");
+		const plain = measureInlinePermission({ isExitPlanMode: true }, 600);
+		const withTarget = measureInlinePermission(
+			{
+				isExitPlanMode: true,
+				hasExecutionTarget: true,
+				executionCwdLines: 1,
+				executionPathLines: 2,
+			},
+			600,
+		);
+		expect(withTarget.metas.map((m) => m.role)).not.toContain("exec-target");
+		expect(withTarget.height).toBe(plain.height);
+	});
 });
 
 describe("measureInlinePermission — ExitPlanMode editing", () => {

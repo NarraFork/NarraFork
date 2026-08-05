@@ -677,14 +677,16 @@ export const miscApi = {
 	nugGetChannelsHealth: (providerId: string) =>
 		request<{
 			channels: Array<{
+				channel?: string;
 				channelType: string;
-				totalCredentials: number;
-				availableCredentials: number;
-				disabledCredentials: number;
+				healthy?: boolean;
 				availabilityRate: number;
-				currentConcurrency: number;
-				maxConcurrency: number;
-				queueDepth: number;
+				totalCredentials?: number;
+				availableCredentials?: number;
+				disabledCredentials?: number;
+				currentConcurrency?: number;
+				maxConcurrency?: number;
+				queueDepth?: number;
 			}>;
 		}>(`/nug/providers/${providerId}/channels/health`),
 	nugGetUsage: (providerId: string, range: string) =>

@@ -7,6 +7,7 @@ export type VListElementKind =
 	| "web-search"
 	| "system-simple"
 	| "system-text"
+	| "sidecar"
 	| "knowledge-hint"
 	| "plan-card"
 	| "ask-in-passing"

@@ -36,14 +36,6 @@ import { useTranslation } from "react-i18next";
  * layer replaces `{count}` with the live value.
  */
 const COUNT_PLACEHOLDER = "{count}" as unknown as number;
-/**
- * Literal `{size}` marker for the truncation notice.
- *
- * The label is interpolated ONCE per locale (so it stays a stable measure-cache
- * key) and the row substitutes the actual size at draw time — the row is a fixed
- * single line, so the substituted text cannot change any height.
- */
-const SIZE_PLACEHOLDER = "{size}";
 
 /**
  * Literal placeholders for the timing bundle's interpolated entries. Unlike
@@ -136,8 +128,6 @@ export interface VListRenderLabels {
 		 * literal `{count}` because the hidden row count is per body.
 		 */
 		diffTruncated: string;
-		truncatedPreview: string;
-		truncatedLoading: string;
 		/** Placeholder for a valid but EMPTY spec task document (`{ tasks: [] }`). */
 		tasksEmpty: string;
 		/** Header timing breakdown popover + timeout editor. */
@@ -154,6 +144,8 @@ export interface VListRenderLabels {
 			thinkingChars: (chars: number) => string;
 			outputChars: (chars: number) => string;
 		};
+		/** Tool-result sidecar mini-card chrome (copy tooltip). */
+		sidecar: { copy: string; copied: string };
 	};
 	toolCallGroup: { label: string; statusLabel: string };
 	trace: {
@@ -207,6 +199,8 @@ export interface VListRenderLabels {
 		cancel: string;
 		resolvedLabel: string;
 	};
+	/** Standalone sidecar card chrome (copy tooltip). */
+	sidecar: { copy: string; copied: string };
 	planCard: string;
 	pruneDivider: string;
 }
@@ -363,6 +357,23 @@ export function useVListLabels(): VListLabels {
 			// through the adapter rather than the render layer.
 			...reflectionTitleLabels(t),
 			reflectionNextSteps: t("reflectionNextSteps", { nextSteps: "{nextSteps}" }),
+			// ── sidecar cards (one collapsible card per system injection) ─────────
+			// The source badge text is composed during adaptation (it sits in the
+			// measured header row), so these flow through the adapter labels. They
+			// reuse the existing `sidecar.sources.*` narrator strings 1:1.
+			sidecarUnknown: t("sidecar.unknownSource"),
+			sidecarTruncated: t("sidecar.truncated"),
+			sidecarSourceSilentProgress: t("sidecar.sources.silent_progress"),
+			sidecarSourceTodoReminder: t("sidecar.sources.todo_reminder"),
+			sidecarSourceRelaxedPlan: t("sidecar.sources.relaxed_plan"),
+			sidecarSourceKnowledgeBaseHint: t("sidecar.sources.knowledge_base_hint"),
+			sidecarSourceBgAgent: t("sidecar.sources.bg_agent"),
+			sidecarSourceBgBash: t("sidecar.sources.bg_bash"),
+			sidecarSourceTeamMessage: t("sidecar.sources.team_message"),
+			sidecarSourceBufferedUser: t("sidecar.sources.buffered_user"),
+			sidecarSourceGroupMessage: t("sidecar.sources.group_message"),
+			sidecarSourceSubagentMessage: t("sidecar.sources.subagent_message"),
+			sidecarSourceSpecUpdate: t("sidecar.sources.spec_update"),
 		}),
 		[t, tCommon],
 	);
@@ -436,10 +447,6 @@ export function useVListLabels(): VListLabels {
 				// `{count}` stays literal: the render layer substitutes the per-body
 				// hidden row count — same trick as COUNT_PLACEHOLDER above.
 				diffTruncated: t("toolDiffRowsTruncated", { count: COUNT_PLACEHOLDER }),
-				// Placeholders are kept literal: the notice row fills them, so the label
-				// stays a single cache-stable string.
-				truncatedPreview: t("truncatedPreview", { size: SIZE_PLACEHOLDER }),
-				truncatedLoading: t("truncatedLoading", { size: SIZE_PLACEHOLDER }),
 				tasksEmpty: t("spec.tasksEmpty"),
 				timing,
 				permission,
@@ -451,6 +458,7 @@ export function useVListLabels(): VListLabels {
 					thinkingChars: (chars: number) => t("reflectionThinkingChars", { count: chars }),
 					outputChars: (chars: number) => t("reflectionOutputChars", { count: chars }),
 				},
+				sidecar: { copy: t("sidecar.copy"), copied: t("sidecar.copied") },
 			},
 			toolCallGroup: {
 				label: t("toolCalls"),
@@ -502,6 +510,7 @@ export function useVListLabels(): VListLabels {
 				cancel: t("askInPassing_cancel"),
 				resolvedLabel: t("askInPassing_resolvedLabel"),
 			},
+			sidecar: { copy: t("sidecar.copy"), copied: t("sidecar.copied") },
 			planCard: t("perm_plan"),
 			pruneDivider: t("pruneBoundaryLabel"),
 		};
@@ -533,6 +542,8 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 			return labels.askUserQuestion;
 		case "ask-in-passing":
 			return labels.askInPassing;
+		case "sidecar":
+			return labels.sidecar;
 		default:
 			return undefined;
 	}

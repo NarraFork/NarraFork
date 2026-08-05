@@ -770,7 +770,7 @@ function collectInlineLines(
 					walk((token as Tokens.Del).tokens ?? [], { ...marks, strike: true });
 					continue;
 				case "codespan":
-					push(codePiece((token as Tokens.Codespan).text));
+					push(codePiece((token as Tokens.Codespan).text, marks));
 					continue;
 				case "link":
 					walk((token as Tokens.Link).tokens ?? [], {
@@ -814,13 +814,22 @@ function textPiece(text: string, marks: MarkState, variant: InlineVariant): Inli
 	};
 }
 
-function codePiece(text: string): InlinePiece | null {
+/**
+ * An inline `code` run. `href` is inherited from the surrounding marks so that
+ * ``[`code`](url)`` stays a link: the codespan token carries no href of its own,
+ * and hardcoding `null` here dropped the target of every link whose label was
+ * entirely (or partly) inline code — the render layer emits a `<span>` instead
+ * of an `<a>` when the fragment's href is null, so the text simply went dead.
+ * Geometry is unaffected: the href only decides which element wraps the same
+ * measured fragment box.
+ */
+function codePiece(text: string, marks: MarkState): InlinePiece | null {
 	if (text.length === 0) return null;
 	return {
 		text,
 		font: FONT_INLINE_CODE,
-		className: "vlist-frag vlist-frag--code",
-		href: null,
+		className: `vlist-frag vlist-frag--code${marks.href !== null ? " is-link" : ""}`,
+		href: marks.href,
 		breakMode: "normal",
 		extraWidth: INLINE_CODE_EXTRA_WIDTH,
 	};
@@ -1163,13 +1172,200 @@ function lineHeightForVariant(variant: InlineVariant): number {
 	return lineBoxHeight(h.size, h.lineHeight);
 }
 
+/**
+ * The only schemes allowed to reach an `<a href>`.
+ *
+ * A WHITELIST, not a blacklist of `javascript:` and friends: a blacklist has to
+ * anticipate every spelling of every dangerous scheme (and every encoding of it,
+ * see `decodeCharacterReferences`), while this only has to name the four forms
+ * that are actually wanted. Anything else a model writes stays plain text.
+ */
+const SAFE_HREF_SCHEME = /^(?:https?|mailto|tel)$/i;
+
+/** Shape of a scheme per the URL parser: alpha, then alphanumeric / `+` `-` `.`. */
+const HREF_SCHEME_SHAPE = /^[A-Za-z][A-Za-z0-9+.-]*$/;
+
+/** Numeric character reference, with or without the terminating `;`. */
+const NUMERIC_CHARACTER_REFERENCE = /&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));?/g;
+
+/** Named character reference candidate; only names in the table below decode. */
+const NAMED_CHARACTER_REFERENCE = /&([A-Za-z]+);?/g;
+
+/**
+ * Named references that can build URL SYNTAX — a scheme's characters, the colon
+ * that ends it, or the `/` `?` `#` that prove a colon is NOT a scheme's.
+ *
+ * Deliberately not the full HTML entity table (~2200 names): a name that decodes
+ * to `é` or `→` cannot appear in a scheme, so decoding it would only add weight to
+ * a check that runs per link. `amp` is here because it is what makes a DOUBLE
+ * encoding (`&amp;#106;…`) collapse on the second pass.
+ */
+const NAMED_CHARACTER_REFERENCE_VALUES: Readonly<Record<string, string>> = {
+	amp: "&",
+	AMP: "&",
+	colon: ":",
+	semi: ";",
+	num: "#",
+	sol: "/",
+	quest: "?",
+	period: ".",
+	plus: "+",
+	Tab: "\t",
+	NewLine: "\n",
+};
+
+/** One decoding pass: every reference in `value` replaced by its character. */
+function decodeCharacterReferencesOnce(value: string): string {
+	return value
+		.replace(NUMERIC_CHARACTER_REFERENCE, (_match, hex: string | undefined, dec) => {
+			const code = Number.parseInt(hex ?? dec, hex ? 16 : 10);
+			// An out-of-range reference is a parse error the browser turns into U+FFFD;
+			// keeping the source text would be the only alternative and is strictly
+			// less safe (it re-hides whatever follows from the scheme check).
+			if (!Number.isFinite(code) || code < 0 || code > 0x10ffff) return "\ufffd";
+			return String.fromCodePoint(code);
+		})
+		.replace(NAMED_CHARACTER_REFERENCE, (match, name: string) => {
+			const decoded = Object.hasOwn(NAMED_CHARACTER_REFERENCE_VALUES, name)
+				? NAMED_CHARACTER_REFERENCE_VALUES[name]
+				: undefined;
+			return decoded ?? match;
+		});
+}
+
+/**
+ * How many decoding passes to run before giving up.
+ *
+ * One pass is enough for the single-encoded forms; the extra passes exist so a
+ * value that arrives double-encoded (`&amp;#106;avascript:`) is still judged on
+ * what it would become after an HTML round trip. Three is well past anything a
+ * real serializer chain produces, and the loop exits as soon as a pass changes
+ * nothing.
+ */
+const MAX_CHARACTER_REFERENCE_PASSES = 3;
+
+/**
+ * Decode the HTML character references in a link target, purely so the scheme
+ * check below sees what a BROWSER would see.
+ *
+ * marked hands over the link destination exactly as written, references intact —
+ * unlike remark, which decodes them in the lexer, so react-markdown's sanitizer
+ * always receives `javascript:alert(1)` and never the encoded spelling. Without
+ * this step the same source reaches our check as `&#106;avascript:alert(1)`, no
+ * scheme pattern matches, and the target is waved through: the classic
+ * entity-encoded `javascript:` bypass. `&#x6a;`, the semicolon-less `&#106a…`
+ * (which the HTML tokenizer still decodes, with a parse error) and `&colon;` /
+ * `&Tab;` inside an otherwise plain scheme are the same hole.
+ *
+ * The result is used ONLY for the accept/reject decision — the href written to the
+ * DOM stays the original text. Decoding the output instead would rewrite ordinary
+ * links (`?a=1&amp;b=2`) for no reason, and rejecting anything containing `&`
+ * would kill every URL with a multi-parameter query.
+ */
+function decodeCharacterReferences(value: string): string {
+	let out = value;
+	for (let pass = 0; pass < MAX_CHARACTER_REFERENCE_PASSES; pass++) {
+		const next = decodeCharacterReferencesOnce(out);
+		if (next === out) break;
+		out = next;
+	}
+	return out;
+}
+
+/**
+ * The scheme of a link target, or null when it has none (a relative path, a
+ * query, a fragment, or a protocol-relative `//host` URL).
+ *
+ * Mirrors the URL parser rather than reaching for `new URL`, because the question
+ * here is "does this string LOOK like it names a scheme", which has to be answered
+ * for strings `URL` refuses outright.
+ */
+function hrefScheme(value: string): string | null {
+	// A browser strips ASCII tab / newline from ANYWHERE in a URL, and leading C0
+	// controls and spaces from the front, which is how `java\tscript:` and
+	// `\u0001javascript:` still execute. Interior spaces are NOT stripped
+	// (`my note:1.md` stays a relative path), so the two rules are separate.
+	//
+	// The leading trim is a loop rather than a character-class regex because the
+	// class would be a literal control-character range (biome forbids those, with
+	// good reason: they are unreadable and easy to get wrong by one code point).
+	let start = 0;
+	const stripped = value.replace(/[\t\n\r]/g, "");
+	while (start < stripped.length) {
+		const code = stripped.charCodeAt(start);
+		if (code > 0x20) break;
+		start++;
+	}
+	const cleaned = stripped.slice(start);
+	const colon = cleaned.indexOf(":");
+	if (colon <= 0) return null;
+	// A colon that follows a `/`, `?` or `#` belongs to a path, query or fragment,
+	// not to a scheme — same test react-markdown's `defaultUrlTransform` makes, and
+	// what keeps `docs/a:b` and `?next=http://x` out of this branch.
+	for (const delimiter of "/?#") {
+		const at = cleaned.indexOf(delimiter);
+		if (at !== -1 && at < colon) return null;
+	}
+	const scheme = cleaned.slice(0, colon);
+	// Not a legal scheme → no browser reads it as one, so it resolves relatively.
+	return HREF_SCHEME_SHAPE.test(scheme) ? scheme : null;
+}
+
+/**
+ * Normalize a link target, or return null when it must not be rendered as a link.
+ *
+ * Absolute http(s) URLs are canonicalized through `URL` (that is what the chunked
+ * path's tests pin: `https://example.com` → `https://example.com/`).
+ *
+ * Everything the `URL` constructor cannot parse standalone used to be rejected
+ * outright, which silently killed every NON-absolute link the model writes —
+ * in-app routes (`/knowledge/e1`), same-document anchors (`#section`), relative
+ * paths and `mailto:` — the render layer saw `href: null` and painted plain text.
+ * A target with no scheme is therefore preserved verbatim, and a target WITH one
+ * must name a scheme in `SAFE_HREF_SCHEME`. Geometry is untouched either way: the
+ * href only decides whether the same measured fragment is wrapped in an `<a>` or a
+ * `<span>`.
+ *
+ * WHERE THIS DIVERGES FROM THE CHUNKED PATH
+ * react-markdown's `defaultUrlTransform` whitelists `^(https?|ircs?|mailto|xmpp)$`
+ * under the same "first colon before any `/`, `?`, `#`" rule. Three deliberate
+ * differences:
+ *   - `tel:` is allowed here and not there. Models write phone numbers into
+ *     knowledge-base prose, and a `tel:` target hands the string to the platform's
+ *     dialer — it cannot name a page, let alone run script.
+ *   - `ircs:` and `xmpp:` are refused here. Neither has ever appeared in this
+ *     product's content, and a scheme nobody uses is a handler this app should not
+ *     be able to launch. They are one entry away if that changes.
+ *   - Protocol-relative `//host/path` is allowed by BOTH, for the same reason: it
+ *     carries no colon, so it is not a scheme and inherits the page's own. Worth
+ *     naming because it reads like an absolute URL and is not treated as one.
+ * The scheme is read from the DECODED target (see `decodeCharacterReferences`),
+ * which is the step that makes this comparable to react-markdown at all: remark
+ * decodes character references before its sanitizer runs, marked does not.
+ */
 function parseHref(href: string | null | undefined): string | null {
 	if (href == null) return null;
+	const trimmed = href.trim();
+	if (trimmed.length === 0) return null;
+	// Decoding only matters when there is a reference to decode; skipping the
+	// regex passes keeps the common link on one string scan.
+	const probe = trimmed.includes("&") ? decodeCharacterReferences(trimmed) : trimmed;
+	const scheme = hrefScheme(probe);
+	// No scheme: a relative path, a query or a fragment. Keep it as written so the
+	// app's own router (or the browser) resolves it.
+	if (scheme === null) return trimmed;
+	if (!SAFE_HREF_SCHEME.test(scheme)) return null;
 	try {
-		const url = new URL(href);
-		return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+		const url = new URL(trimmed);
+		if (url.protocol === "http:" || url.protocol === "https:") return url.href;
+		// `mailto:` / `tel:` keep their exact source text: `URL` normalizes neither
+		// usefully, and both are opaque to the router.
+		return trimmed;
 	} catch {
-		return null;
+		// A whitelisted scheme that `URL` still refuses (e.g. `https://` with no
+		// host) is left as written rather than dropped — the browser will do the
+		// same thing with it that it does on the chunked path.
+		return trimmed;
 	}
 }
 

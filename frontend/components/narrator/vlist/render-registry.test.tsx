@@ -221,17 +221,27 @@ describe("render-registry dispatch", () => {
 		);
 	});
 
-	it("hands the tool card its truncation-notice action (else the only route to a truncated payload is inert)", () => {
-		// The shell computes `onLoadFullPayload` for every card that still has a
-		// preview field, but the dispatch used to drop it — so the "content
-		// truncated — click to load" line was painted with no handler, and a
-		// truncated tool payload was unreachable in the exact list. Asserted on the
-		// forwarded props, which is the exact hole.
-		const onLoadFullPayload = () => {};
-		const node = renderElement("tool-call", STUB, { onLoadFullPayload, fullPayloadLoading: true });
+	it("hands the tool card its viewer wiring (the route to a truncated payload)", () => {
+		// A truncated payload is now reached through the BODY, not through a notice
+		// row: the viewer host requests the real bytes once the reader scrolls into
+		// the body's later half (or opens it fullscreen). That makes `viewControls`
+		// the load-bearing forward — dropping it leaves every prefix body stuck on
+		// its preview with no route out, which is the hole this pins down.
+		const viewControls = {
+			isWrapped: () => true,
+			isSourceShown: () => false,
+			toggleWrap: () => {},
+			toggleSource: () => {},
+			openFullscreen: () => {},
+			requestFullPayload: () => {},
+		};
+		const viewTargets = [
+			{ id: "tool-tu_1:b0", slot: "b0", kind: "code" as const, text: "body", truncated: true },
+		];
+		const node = renderElement("tool-call", STUB, { viewTargets, viewControls });
 		const props = isValidElement(node) ? (node as React.ReactElement).props : {};
-		expect((props as { onLoadFullPayload?: () => void }).onLoadFullPayload).toBe(onLoadFullPayload);
-		expect((props as { fullPayloadLoading?: boolean }).fullPayloadLoading).toBe(true);
+		expect((props as { viewControls?: unknown }).viewControls).toBe(viewControls);
+		expect((props as { viewTargets?: unknown }).viewTargets).toBe(viewTargets);
 	});
 
 	it("hands plain content rows their source toggle (else 'view source' is inert)", () => {

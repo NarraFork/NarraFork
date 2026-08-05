@@ -16,7 +16,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
-import { useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import {
 	IMGGEN_GROUP_GAP,
 	IMGGEN_ICON_SIZE,
@@ -29,6 +29,7 @@ import type {
 	PreparedFixedBlock,
 	PreparedInlineBlock,
 } from "../prepared-block";
+import { FragmentGap, LineFragments } from "./line-fragments";
 import { inlineImageSrcFromResult, VListImage, type VListImageRef } from "./vlist-image";
 import { TextFileRow } from "./vlist-text-file-row";
 
@@ -316,26 +317,32 @@ function HeaderInlineView({
 						width: "max-content",
 					}}
 				>
-					{line.fragments.map((frag, fi) => (
-						<span
-							// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-							key={fi}
-							className={frag.className}
-							style={{
-								font: frag.font,
-								marginLeft: frag.gapBefore,
-								whiteSpace: "pre",
-								display: "inline-block",
-								color:
-									frag.className === "vlist-imggen-prompt"
-										? // `c="violet"`: violet-4 on dark, violet-filled on light.
-											"var(--mantine-color-violet-text)"
-										: "var(--mantine-color-dimmed)",
-							}}
-						>
-							{frag.text}
-						</span>
-					))}
+					<LineFragments>
+						{line.fragments.map((frag, fi) => (
+							<Fragment
+								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+								key={fi}
+							>
+								<FragmentGap gapBefore={frag.gapBefore} />
+								<span
+									className={frag.className}
+									style={{
+										font: frag.font,
+										marginLeft: frag.gapBefore,
+										whiteSpace: "pre",
+										display: "inline-block",
+										color:
+											frag.className === "vlist-imggen-prompt"
+												? // `c="violet"`: violet-4 on dark, violet-filled on light.
+													"var(--mantine-color-violet-text)"
+												: "var(--mantine-color-dimmed)",
+									}}
+								>
+									{frag.text}
+								</span>
+							</Fragment>
+						))}
+					</LineFragments>
 				</div>
 			))}
 		</div>

@@ -98,7 +98,7 @@ import {
 	isSubagentVariant,
 	parseSubstatus,
 	parseTraits,
-	redactDraftTraits,
+	redactInternalTraits,
 	removeTrait,
 } from "../lib/narrator-utils";
 import { isPermissionMode, PERMISSION_MODES } from "../lib/permission-modes";
@@ -454,14 +454,19 @@ function publicNarratorResponse<T extends { traits: unknown; substatus?: unknown
 ) {
 	return {
 		...narrator,
-		traits: redactDraftTraits(narrator.traits),
+		traits: redactInternalTraits(narrator.traits),
 		hasDraft,
 		substatus: parseSubstatus(narrator.substatus),
 	};
 }
 
+/**
+ * The trait array clients are allowed to see: semantic tags and encoded user settings,
+ * with server-internal bookkeeping (draft bodies, recovery watermarks) stripped. See
+ * NARRATOR_INTERNAL_TRAIT_PREFIXES for why those must not leak.
+ */
 function publicTraitsResponse(traits: unknown): string[] {
-	return redactDraftTraits(traits);
+	return redactInternalTraits(traits);
 }
 
 // List narrators — by chapterId, or standalone (chapterId IS NULL)
