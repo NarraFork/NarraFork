@@ -206,3 +206,121 @@ describe("AnthropicProvider effort blocklist through a routing channel", () => {
 		expect(body.output_config).toEqual({ effort: "high" });
 	});
 });
+
+type CapturedMessage = {
+	role: string;
+	content: Array<{
+		type: string;
+		thinking?: string;
+		signature?: string;
+		id?: string;
+		name?: string;
+		input?: Record<string, unknown>;
+	}>;
+};
+
+function assistantMessages(body: Record<string, unknown>): CapturedMessage[] {
+	return (body.messages as CapturedMessage[]).filter((message) => message.role === "assistant");
+}
+
+describe("AnthropicProvider thinking request sanitization", () => {
+	test("drops empty Claude thinking without removing the adjacent tool call", async () => {
+		mockFetchCapturingRequest();
+		const provider = new AnthropicProvider(config({ defaultModel: "claude-sonnet-4-5" }));
+		const body = await sendAndCapture(
+			provider,
+			chatParams({
+				model: "relay:claude-sonnet-4-5",
+				reasoningEffort: "high",
+				history: [
+					{ role: "user", content: [{ type: "text", text: "Run a tool." }] },
+					{
+						role: "assistant",
+						content: [
+							{ type: "thinking", thinking: "", signature: "orphan-signature" },
+							{ type: "tool_use", id: "toolu_1", name: "Read", input: {} },
+						],
+					},
+					{
+						role: "user",
+						content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "done" }],
+					},
+				],
+			}),
+		);
+
+		expect(assistantMessages(body)[0].content).toEqual([
+			{ type: "tool_use", id: "toolu_1", name: "Read", input: {} },
+		]);
+	});
+
+	test("uses non-empty thinking and signature placeholders for DeepSeek history", async () => {
+		mockFetchCapturingRequest();
+		const provider = new AnthropicProvider(config({ defaultModel: "deepseek-v4-flash-0731" }));
+		const body = await sendAndCapture(
+			provider,
+			chatParams({
+				model: "relay:deepseek-v4-flash-0731",
+				reasoningEffort: "high",
+				history: [
+					{ role: "user", content: [{ type: "text", text: "Run a tool." }] },
+					{
+						role: "assistant",
+						content: [
+							{ type: "thinking", thinking: "", signature: "orphan-signature" },
+							{ type: "tool_use", id: "toolu_1", name: "Read", input: {} },
+						],
+					},
+					{
+						role: "user",
+						content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "done" }],
+					},
+					{
+						role: "assistant",
+						content: [
+							{ type: "thinking", thinking: "real reasoning", signature: "" },
+							{ type: "text", text: "Finished." },
+						],
+					},
+					{ role: "user", content: [{ type: "text", text: "Continue." }] },
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "thinking",
+								thinking: "signed reasoning",
+								signature: "real-signature",
+							},
+							{ type: "text", text: "Still finished." },
+						],
+					},
+				],
+			}),
+		);
+
+		const assistants = assistantMessages(body);
+		expect(assistants[0].content[0]).toEqual({
+			type: "thinking",
+			thinking: " ",
+			signature: "narrafork-deepseek-compat",
+		});
+		expect(assistants[1].content[0]).toEqual({
+			type: "thinking",
+			thinking: "real reasoning",
+			signature: "narrafork-deepseek-compat",
+		});
+		expect(assistants[2].content[0]).toEqual({
+			type: "thinking",
+			thinking: "signed reasoning",
+			signature: "real-signature",
+		});
+		expect(
+			assistants
+				.flatMap((message) => message.content)
+				.every((block) => {
+					if (block.type !== "thinking") return true;
+					return (block.thinking?.length ?? 0) > 0 && (block.signature?.length ?? 0) > 0;
+				}),
+		).toBe(true);
+	});
+});

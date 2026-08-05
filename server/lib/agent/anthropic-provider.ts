@@ -2954,35 +2954,46 @@ function stripThinkingBlocks(messages: AnthropicMessage[]): void {
 	}
 }
 
+const DEEPSEEK_SYNTHETIC_THINKING = " ";
+const DEEPSEEK_SYNTHETIC_SIGNATURE = "narrafork-deepseek-compat";
+
 /**
  * DeepSeek's Anthropic-compatible API doesn't support redacted_thinking blocks.
- * Remove them before replay, then patch assistant messages with a regular
- * thinking block if needed.
+ * Some relays omit signatures in responses but still require a non-empty signature
+ * when that thinking is replayed. Preserve authentic signatures and use a clearly
+ * marked compatibility value only when the upstream supplied none.
  */
 function sanitizeDeepSeekThinkingBlocks(messages: AnthropicMessage[]): void {
 	for (const msg of messages) {
 		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
 		const parts = msg.content as AnthropicContentPart[];
-		const filtered = parts.filter((b) => b.type !== "redacted_thinking");
-		if (filtered.length !== parts.length) {
-			// Preserve a non-empty assistant message if this was not already filtered out.
-			if (
-				!filtered.some((b) => b.type === "thinking" || b.type === "text" || b.type === "tool_use")
-			) {
-				filtered.push({ type: "text", text: "…" });
+		const filtered: AnthropicContentPart[] = [];
+		for (const block of parts) {
+			if (block.type === "redacted_thinking") continue;
+			if (block.type !== "thinking") {
+				filtered.push(block);
+				continue;
 			}
-			msg.content = filtered;
+
+			filtered.push(
+				block.signature?.trim() ? block : { ...block, signature: DEEPSEEK_SYNTHETIC_SIGNATURE },
+			);
 		}
+
+		if (
+			!filtered.some((b) => b.type === "thinking" || b.type === "text" || b.type === "tool_use")
+		) {
+			filtered.push({ type: "text", text: "…" });
+		}
+		msg.content = filtered;
 	}
 	patchMissingThinkingBlocks(messages);
 }
 
 /**
- * Patch assistant messages that lack a thinking block.
- * DeepSeek thinking mode (via Anthropic-compatible API) requires a thinking
- * block on ALL assistant messages, not just those with tool_use. When switching
- * from a non-thinking model, historical messages lack this — prepend an
- * empty thinking block so the API doesn't reject the request.
+ * DeepSeek requires thinking on historical assistant messages. When authentic
+ * reasoning is unavailable, use a single-space placeholder plus the compatibility
+ * signature required by strict Anthropic relays. Neither value is persisted.
  */
 function patchMissingThinkingBlocks(messages: AnthropicMessage[]): void {
 	for (const msg of messages) {
@@ -2990,8 +3001,11 @@ function patchMissingThinkingBlocks(messages: AnthropicMessage[]): void {
 		const parts = msg.content as AnthropicContentPart[];
 		const hasThinking = parts.some((b) => b.type === "thinking");
 		if (hasThinking) continue;
-		// Prepend an empty thinking block
-		parts.unshift({ type: "thinking", thinking: "", signature: "" });
+		parts.unshift({
+			type: "thinking",
+			thinking: DEEPSEEK_SYNTHETIC_THINKING,
+			signature: DEEPSEEK_SYNTHETIC_SIGNATURE,
+		});
 	}
 }
 
