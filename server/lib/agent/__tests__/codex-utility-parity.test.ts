@@ -108,7 +108,18 @@ describe.each([
 
 		expect(req.headers["session-id"]).toBeTruthy();
 		expect(req.headers["thread-id"]).toBe(req.headers["session-id"]);
-		expect(req.headers["x-client-request-id"]).toBe(req.headers["session-id"]);
+	});
+
+	/**
+	 * codex-rs writes x-client-request-id in exactly one place —
+	 * build_websocket_headers — so the HTTP /responses path (and
+	 * /responses/compact) never carries it. Sending it here produced a shape no
+	 * real client emits: a non-lite HTTP body with a websocket-only header.
+	 */
+	test("does not send the websocket-only x-client-request-id over HTTP", async () => {
+		const req = await capture(run);
+
+		expect(req.headers["x-client-request-id"]).toBeUndefined();
 	});
 
 	test("sets prompt_cache_key to the same id", async () => {

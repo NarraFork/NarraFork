@@ -17,6 +17,7 @@ import { describe, expect, test } from "bun:test";
 import { getHttpCodexUserAgent, ORIGINATOR_CODEX } from "../../user-agent";
 import { deriveCodexWindowId } from "../codex-request";
 import {
+	applyTurnStateToRequest,
 	buildHandshakeHeaders,
 	type CodexResponsesRequestBody,
 	type StreamCodexResponsesWebSocketOptions,
@@ -54,9 +55,8 @@ function makeOptions(
 
 function build(
 	overrides: Partial<StreamCodexResponsesWebSocketOptions> = {},
-	turnState: string | null = null,
 ): Record<string, string> {
-	return buildHandshakeHeaders(makeOptions(overrides), { turnState });
+	return buildHandshakeHeaders(makeOptions(overrides));
 }
 
 describe("codex WebSocket handshake headers", () => {
@@ -139,8 +139,14 @@ describe("codex WebSocket handshake headers", () => {
 		expect(build()["ChatGPT-Account-Id"]).toBeUndefined();
 	});
 
-	test("x-codex-turn-state is replayed only when the session captured one", () => {
-		expect(build({}, "turn-state-token")["x-codex-turn-state"]).toBe("turn-state-token");
+	/**
+	 * The handshake structurally cannot carry the turn-state token: it is learned from
+	 * the first response of a turn, long after this connection's upgrade was sent, and
+	 * the connection is then reused for the rest of the turn. codex-rs's
+	 * build_websocket_headers passes `/*turn_state*​/ None` for the same reason and
+	 * routes the token through the websocket client_metadata instead.
+	 */
+	test("never carries the turn-state token on the handshake", () => {
 		expect(build()["x-codex-turn-state"]).toBeUndefined();
 	});
 
@@ -179,5 +185,57 @@ describe("codex WebSocket handshake headers", () => {
 		const headers = build({ extraHeaders: { originator: "" } });
 
 		expect(headers.originator).toBe(ORIGINATOR_CODEX);
+	});
+});
+
+/**
+ * The other half of the turn-state contract: the token the handshake cannot carry
+ * has to reach the wire through the request body, or sticky routing silently never
+ * happens (the symptom is invisible — requests just scatter across backends).
+ */
+describe("applyTurnStateToRequest", () => {
+	test("adds the token to client_metadata, preserving existing keys", () => {
+		const request: Record<string, unknown> = {
+			type: "response.create",
+			client_metadata: { session_id: "conv-1", thread_id: "conv-1" },
+		};
+
+		applyTurnStateToRequest(request, "turn-state-token");
+
+		expect(request.client_metadata).toEqual({
+			session_id: "conv-1",
+			thread_id: "conv-1",
+			"x-codex-turn-state": "turn-state-token",
+		});
+	});
+
+	test("creates client_metadata when the request has none", () => {
+		const request: Record<string, unknown> = { type: "response.create" };
+
+		applyTurnStateToRequest(request, "turn-state-token");
+
+		expect(request.client_metadata).toEqual({ "x-codex-turn-state": "turn-state-token" });
+	});
+
+	test("is a no-op before the turn has produced a token", () => {
+		const request: Record<string, unknown> = {
+			type: "response.create",
+			client_metadata: { session_id: "conv-1" },
+		};
+
+		applyTurnStateToRequest(request, null);
+
+		expect(request.client_metadata).toEqual({ session_id: "conv-1" });
+	});
+
+	test("overwrites a stale token rather than appending", () => {
+		const request: Record<string, unknown> = {
+			type: "response.create",
+			client_metadata: { "x-codex-turn-state": "old" },
+		};
+
+		applyTurnStateToRequest(request, "new");
+
+		expect(request.client_metadata).toEqual({ "x-codex-turn-state": "new" });
 	});
 });

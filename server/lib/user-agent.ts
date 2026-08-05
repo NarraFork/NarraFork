@@ -256,10 +256,16 @@ export function getHttpCodexUserAgent(): string {
  * the header is dropped rather than the tools. {@link stripResponsesLiteHeader}
  * enforces this on every outbound header map, and the codex parity tests pin it.
  *
+ * Also omitted: x-client-request-id. codex-rs writes it in exactly one place —
+ * build_websocket_headers — and neither the HTTP /responses path nor
+ * /responses/compact sends it. It is a websocket-handshake header, not part of
+ * the shared client identity, so it is set by the WS transport itself rather
+ * than here (see buildHandshakeHeaders).
+ *
  * Included:
  * - originator: codex-tui
  * - x-codex-installation-id: <persisted UUID>
- * - session-id / thread-id / x-client-request-id: one stable conversation id
+ * - session-id / thread-id: one stable conversation id
  * - x-codex-window-id: window UUID derived from the conversation id
  */
 export function buildCodexEmulationHeaders(opts: {
@@ -273,7 +279,6 @@ export function buildCodexEmulationHeaders(opts: {
 	if (opts.conversationId) {
 		headers["session-id"] = opts.conversationId;
 		headers["thread-id"] = opts.conversationId;
-		headers["x-client-request-id"] = opts.conversationId;
 		headers["x-codex-window-id"] = deriveCodexWindowId(opts.conversationId);
 	}
 	return headers;
