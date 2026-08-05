@@ -121,7 +121,9 @@ describe("codex HTTP chat request parity", () => {
 
 		expect(req.body.tool_choice).toBe("auto");
 		expect(req.body.parallel_tool_calls).toBe(false);
-		expect(req.body.reasoning).toEqual({ effort: "high", summary: "auto", context: "all_turns" });
+		// No reasoning.context: the real client only sends it in responses-lite
+		// mode; the non-lite shape omits it so the server default applies.
+		expect(req.body.reasoning).toEqual({ effort: "high", summary: "auto" });
 		expect(req.body.include).toEqual(["reasoning.encrypted_content"]);
 		expect(req.body.text).toEqual({ verbosity: "low" });
 		expect(req.body.store).toBe(false);
@@ -131,13 +133,20 @@ describe("codex HTTP chat request parity", () => {
 	test("normalizes the requested reasoning effort onto the Codex ladder", async () => {
 		const req = await captureChat({ reasoningEffort: "medium" });
 
-		expect(req.body.reasoning).toEqual({ effort: "medium", summary: "auto", context: "all_turns" });
+		expect(req.body.reasoning).toEqual({ effort: "medium", summary: "auto" });
 	});
 
-	test("omits per-turn tracking headers the emulation deliberately drops", async () => {
+	test("sends the window identity and omits the turn-metadata blob", async () => {
 		const req = await captureChat();
+		const clientMetadata = req.body.client_metadata as Record<string, string>;
 
 		expect(req.headers["x-codex-turn-metadata"]).toBeUndefined();
-		expect(req.headers["x-codex-window-id"]).toBeUndefined();
+		// Window id is conversation-stable and mirrored between the direct
+		// header and client_metadata, like the real client's compatibility
+		// projection of CodexResponsesMetadata.
+		expect(req.headers["x-codex-window-id"]).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
+		expect(clientMetadata["x-codex-window-id"]).toBe(req.headers["x-codex-window-id"]);
 	});
 });

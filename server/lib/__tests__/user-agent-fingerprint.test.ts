@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { deriveCodexWindowId } from "../agent/codex-request";
 import {
 	buildCodexEmulationHeaders,
 	getHttpUserAgent,
@@ -47,14 +48,18 @@ describe("buildCodexEmulationHeaders", () => {
 		expect(withConversation["x-client-request-id"]).toBe("conv-123");
 	});
 
-	test("never emits tracking or semantic headers", () => {
+	test("emits the conversation-stable window id but no turn tracking", () => {
 		const headers = buildCodexEmulationHeaders({
 			installationId: INSTALLATION_ID,
 			conversationId: "conv-123",
 		});
 		expect(headers["x-codex-turn-metadata"]).toBeUndefined();
-		expect(headers["x-codex-window-id"]).toBeUndefined();
 		expect(headers.sandbox).toBeUndefined();
+		// Same conversation → same window; the value is a derived UUID.
+		expect(headers["x-codex-window-id"]).toBe(deriveCodexWindowId("conv-123"));
+
+		const without = buildCodexEmulationHeaders({ installationId: INSTALLATION_ID });
+		expect(without["x-codex-window-id"]).toBeUndefined();
 	});
 });
 

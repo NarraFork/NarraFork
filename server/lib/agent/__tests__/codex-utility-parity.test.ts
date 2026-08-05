@@ -124,7 +124,8 @@ describe.each([
 
 		expect(req.body.tool_choice).toBe("auto");
 		expect(req.body.parallel_tool_calls).toBe(false);
-		expect(req.body.reasoning).toEqual({ effort: "high", summary: "auto", context: "all_turns" });
+		// No reasoning.context — real non-lite requests omit it (lite-only field).
+		expect(req.body.reasoning).toEqual({ effort: "high", summary: "auto" });
 		expect(req.body.include).toEqual(["reasoning.encrypted_content"]);
 		expect(req.body.text).toEqual({ verbosity: "low" });
 		expect(metadata.session_id).toBe(req.headers["session-id"]);
@@ -133,11 +134,13 @@ describe.each([
 		expect(metadata["x-codex-installation-id"]).toBe(req.headers["x-codex-installation-id"]);
 	});
 
-	test("omits per-turn tracking headers the emulation deliberately drops", async () => {
+	test("sends the window identity and omits the turn-metadata blob", async () => {
 		const req = await capture(run);
+		const metadata = req.body.client_metadata as Record<string, string>;
 
 		// buildCodexEmulationHeaders intentionally excludes turn-level tracking.
 		expect(req.headers["x-codex-turn-metadata"]).toBeUndefined();
-		expect(req.headers["x-codex-window-id"]).toBeUndefined();
+		expect(req.headers["x-codex-window-id"]).toBeTruthy();
+		expect(metadata["x-codex-window-id"]).toBe(req.headers["x-codex-window-id"]);
 	});
 });

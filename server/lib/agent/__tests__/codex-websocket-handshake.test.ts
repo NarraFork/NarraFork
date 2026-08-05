@@ -119,6 +119,18 @@ describe("Codex WebSocket handshake reported to diagnostics", () => {
 		expect(prepared.headers.session_id).toBeUndefined();
 	});
 
+	test("carries the conversation-stable window id, mirroring codex-rs", async () => {
+		const prepared = await capturePrepared({ conversationId: "conv-abc" });
+
+		// codex-rs build_websocket_headers inserts x-codex-window-id directly; the
+		// value is a conversation-derived UUID, stable across the whole session.
+		expect(prepared.headers["x-codex-window-id"]).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
+		const again = await capturePrepared({ conversationId: "conv-abc" });
+		expect(again.headers["x-codex-window-id"]).toBe(prepared.headers["x-codex-window-id"]);
+	});
+
 	test("reports the real Authorization header rather than a placeholder", async () => {
 		const prepared = await capturePrepared({ authorization: "Bearer real-token" });
 

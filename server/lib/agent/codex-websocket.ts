@@ -6,6 +6,7 @@ import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages } from "../../db/schema";
 import { logger } from "../logger";
 import { getHttpCodexUserAgent, ORIGINATOR_CODEX, stripResponsesLiteHeader } from "../user-agent";
+import { deriveCodexWindowId } from "./codex-request";
 import { parseGatewayDataEvent } from "./gateway-events";
 import {
 	type OAIMessage,
@@ -357,6 +358,10 @@ function buildHandshakeHeaders(
 		originator: ORIGINATOR_CODEX,
 		"session-id": options.conversationId,
 		"thread-id": options.conversationId,
+		// Window id is conversation-stable, mirroring codex-rs build_websocket_headers,
+		// which inserts x-codex-window-id directly (compatibility_headers) rather than
+		// only through the client fingerprint.
+		"x-codex-window-id": deriveCodexWindowId(options.conversationId),
 		Origin: isOfficialChatGPTDomain(options.baseUrl) ? "https://chatgpt.com" : options.baseUrl,
 		[OPENAI_BETA_HEADER]: RESPONSES_WS_BETA_HEADER,
 		[CLIENT_REQUEST_ID_HEADER]: options.conversationId,

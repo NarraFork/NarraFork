@@ -1,4 +1,5 @@
 import os from "node:os";
+import { deriveCodexWindowId } from "./agent/codex-request";
 import { APP_VERSION } from "./version";
 
 const ORIGINATOR = "narrafork";
@@ -209,11 +210,14 @@ export function getHttpCodexUserAgent(): string {
 /**
  * Build the stable Codex client headers, transcribed from captured codex-tui
  * traffic, while deliberately omitting the volatile per-turn tracking headers
- * the real client also sends (x-codex-turn-metadata, x-codex-window-id).
+ * the real client also sends (x-codex-turn-metadata).
  *
- * Those carry runtime environment and timing detail — sandbox mode, window id,
- * turn start timestamp — that NarraFork has no reason to report upstream. Every
- * header below is stable for the lifetime of a conversation.
+ * The turn-metadata blob carries runtime environment and timing detail —
+ * sandbox mode, workspace git state, turn start timestamp — that NarraFork has
+ * no reason to report upstream. Every header below is stable for the lifetime
+ * of a conversation, including x-codex-window-id, which codex-rs keeps stable
+ * per TUI window and NarraFork derives deterministically per conversation
+ * (see deriveCodexWindowId).
  *
  * Also omitted: x-codex-beta-features. The real client derives it from the beta
  * features it actually has enabled (responses_websockets_v2,
@@ -246,6 +250,7 @@ export function getHttpCodexUserAgent(): string {
  * - originator: codex-tui
  * - x-codex-installation-id: <persisted UUID>
  * - session-id / thread-id / x-client-request-id: one stable conversation id
+ * - x-codex-window-id: window UUID derived from the conversation id
  */
 export function buildCodexEmulationHeaders(opts: {
 	installationId: string;
@@ -259,6 +264,7 @@ export function buildCodexEmulationHeaders(opts: {
 		headers["session-id"] = opts.conversationId;
 		headers["thread-id"] = opts.conversationId;
 		headers["x-client-request-id"] = opts.conversationId;
+		headers["x-codex-window-id"] = deriveCodexWindowId(opts.conversationId);
 	}
 	return headers;
 }

@@ -6,7 +6,11 @@
  * Lock the contract here so the shared helper cannot drift back apart.
  */
 import { describe, expect, test } from "bun:test";
-import { applyCodexStableRequestFields, createCodexRequestIdentity } from "../codex-request";
+import {
+	applyCodexStableRequestFields,
+	createCodexRequestIdentity,
+	deriveCodexWindowId,
+} from "../codex-request";
 
 describe("createCodexRequestIdentity", () => {
 	test("correlates session/thread ids to one conversation id", () => {
@@ -15,6 +19,24 @@ describe("createCodexRequestIdentity", () => {
 		expect(identity.conversationId).toBe("conv-1");
 		expect(identity.clientMetadata.session_id).toBe("conv-1");
 		expect(identity.clientMetadata.thread_id).toBe("conv-1");
+	});
+
+	test("derives a conversation-stable window id in UUID shape", () => {
+		const identity = createCodexRequestIdentity("conv-1");
+		const again = createCodexRequestIdentity("conv-1");
+		const other = createCodexRequestIdentity("conv-2");
+
+		expect(identity.clientMetadata["x-codex-window-id"]).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
+		// Rebuilt identities for one conversation must agree on the window.
+		expect(again.clientMetadata["x-codex-window-id"]).toBe(
+			identity.clientMetadata["x-codex-window-id"],
+		);
+		expect(other.clientMetadata["x-codex-window-id"]).not.toBe(
+			identity.clientMetadata["x-codex-window-id"],
+		);
+		expect(identity.clientMetadata["x-codex-window-id"]).toBe(deriveCodexWindowId("conv-1"));
 	});
 
 	test("carries the persisted installation id, not a per-call value", () => {
@@ -50,7 +72,8 @@ describe("applyCodexStableRequestFields", () => {
 		expect(body.prompt_cache_key).toBe("conv-1");
 		expect(body.tool_choice).toBe("auto");
 		expect(body.parallel_tool_calls).toBe(false);
-		expect(body.reasoning).toEqual({ effort: "high", summary: "auto", context: "all_turns" });
+		// context is a responses-lite-only field; the non-lite contract omits it.
+		expect(body.reasoning).toEqual({ effort: "high", summary: "auto" });
 		expect(body.include).toEqual(["reasoning.encrypted_content"]);
 		expect(body.text).toEqual({ verbosity: "low" });
 	});
