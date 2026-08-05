@@ -15,7 +15,11 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { getEffectiveNarratorDisplay, statusRegistry } from "@frontend/lib/status-registry";
+import {
+	getEffectiveNarratorDisplay,
+	type StatusShape,
+	statusRegistry,
+} from "@frontend/lib/status-registry";
 import { Z } from "@frontend/lib/z-index";
 import {
 	ActionIcon,
@@ -38,8 +42,10 @@ import {
 	IconArrowUp,
 	IconBox,
 	IconBrain,
+	IconCheck,
 	IconClock,
 	IconColumns,
+	IconExclamationMark,
 	IconFolder,
 	IconGitBranch,
 	IconMessageCircle,
@@ -49,6 +55,7 @@ import {
 	IconPinnedOff,
 	IconPlus,
 	IconRobot,
+	IconShield,
 	IconTerminal2,
 	IconUsers,
 	IconX,
@@ -111,10 +118,51 @@ function getRecentTabDisplaySubstatus(tab: RecentTab): string[] | undefined {
 function getRecentTabIconColor(tab: RecentTab): string | undefined {
 	const substatus = getRecentTabDisplaySubstatus(tab);
 	if (!tab.status && !substatus?.length) return undefined;
-	return mantineVar(getEffectiveNarratorDisplay(tab.status ?? "idle", substatus).color);
+	return statusRegistry.accentVar(getEffectiveNarratorDisplay(tab.status ?? "idle", substatus), 6);
 }
 
+/**
+ * The state shape for a tab, or undefined when it has none.
+ *
+ * Derived from the registry rather than re-enumerated here, so a state that gains a
+ * shape tomorrow is picked up automatically — the same contract `isFilledRecentTabStatus`
+ * follows for `solidAccent`.
+ */
+function getRecentTabShape(tab: RecentTab): StatusShape | undefined {
+	return getEffectiveNarratorDisplay(tab.status ?? "idle", getRecentTabDisplaySubstatus(tab)).shape;
+}
+
+/** Tabler glyph + badge tint per shape. Sizes match the existing corner markers. */
+const SHAPE_MARKERS: Record<
+	StatusShape,
+	{ Icon: typeof IconCheck; background: string; color: string }
+> = {
+	check: {
+		Icon: IconCheck,
+		background: "var(--mantine-color-green-6)",
+		color: "var(--mantine-color-white)",
+	},
+	shield: {
+		Icon: IconShield,
+		background: "var(--mantine-color-orange-6)",
+		color: "var(--mantine-color-white)",
+	},
+	alert: {
+		Icon: IconExclamationMark,
+		background: "var(--mantine-color-orange-6)",
+		color: "var(--mantine-color-white)",
+	},
+};
+
 function isFilledRecentTabStatus(tab: RecentTab): boolean {
+	// Hollow vs filled is this surface's "idle vs occupied" signal, so a state
+	// that owns a solid accent (e.g. waiting for a model) must fill too —
+	// otherwise it stays a hollow dot next to idle's hollow dot regardless of hue.
+	if (
+		getEffectiveNarratorDisplay(tab.status ?? "idle", getRecentTabDisplaySubstatus(tab)).solidAccent
+	) {
+		return true;
+	}
 	return (
 		tab.status === "working" ||
 		!!tab.substatus?.includes("planning") ||
@@ -330,8 +378,19 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 
 			if (event.type === "status") {
 				const isReflecting = event.substatus?.includes("reflecting");
+				/*
+				 * A narrator parked until an unavailable model recovers is also
+				 * `waiting`, but the user has nothing to act on: no favicon dot, no
+				 * sound, no PWA notification. Those channels are reserved for real
+				 * attention (the preference behind them is literally "notify when a
+				 * narrator needs permission", and the PWA body text says so too).
+				 * The panel keeps a persistent in-app notice explaining the wait.
+				 */
+				const isWaitingForModel = event.substatus?.includes("model_unavailable");
 				const shouldNotify =
-					!isReflecting && (event.status === "waiting" || event.substatus?.includes("unread"));
+					!isReflecting &&
+					!isWaitingForModel &&
+					(event.status === "waiting" || event.substatus?.includes("unread"));
 				if (isReflecting) {
 					setFaviconAlert(narratorId, "reflecting");
 				} else if (shouldNotify) {
@@ -1318,7 +1377,13 @@ function TabIcon({
 	const showDraft = !!tab.hasDraft && canShowMarker;
 	const showReasoning = !!tab.substatus?.includes("reasoning") && canShowMarker;
 	const showScheduled = !!tab.isScheduled && canShowMarker;
-	if (!showDraft && !showReasoning && !showScheduled) return icon;
+	// The state SHAPE (tick / shield / alert). A badge rather than a swap of the icon
+	// itself, because the main glyph identifies the tab's TYPE — clicking a chapter and
+	// clicking a narrator navigate to different places, so that meaning cannot be traded
+	// away for a status. The palette had no hue left to distinguish these states (see
+	// `StatusShape`), which is why the shape is worth its own corner.
+	const shape = canShowMarker ? getRecentTabShape(tab) : undefined;
+	if (!showDraft && !showReasoning && !showScheduled && !shape) return icon;
 
 	return (
 		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
@@ -1387,6 +1452,34 @@ function TabIcon({
 					}}
 				>
 					<IconPencil size={7} stroke={2.5} />
+				</Box>
+			)}
+			{/* State shape, bottom-left — the one corner the existing markers left free
+			    (scheduled = bottom-right, reasoning = top-left, draft = top-right). */}
+			{shape && (
+				<Box
+					component="span"
+					data-tab-shape={shape}
+					style={{
+						position: "absolute",
+						left: -4,
+						bottom: -4,
+						width: 11,
+						height: 11,
+						borderRadius: "50%",
+						background: SHAPE_MARKERS[shape].background,
+						border: "1px solid var(--mantine-color-body)",
+						display: "inline-flex",
+						alignItems: "center",
+						justifyContent: "center",
+						color: SHAPE_MARKERS[shape].color,
+						pointerEvents: "none",
+					}}
+				>
+					{(() => {
+						const { Icon } = SHAPE_MARKERS[shape];
+						return <Icon size={7} stroke={3} />;
+					})()}
 				</Box>
 			)}
 		</Box>

@@ -299,6 +299,31 @@ export function measureImageGeneration(
 	let contentHeight = headerHeight;
 
 	if (metrics) {
+		// ⚠️ DELIBERATE EXCEPTION to "layout height is monotone non-increasing in width".
+		//
+		// Almost every measure in this directory gets TALLER as the column narrows (text
+		// wraps into more lines). This one does the opposite: while
+		// `innerWidth < min(intrinsicWidth, IMGGEN_MAX_DISPLAY_WIDTH)` the image is
+		// scaled to fit the column, so a narrower column produces a SHORTER block. At
+		// 1024x512 the reserved height climbs 200px → 306px across a 320 → 532px column
+		// and then saturates.
+		//
+		// This is not fixable here, and must not be "fixed": the renderer sizes the frame
+		// `width: min(100%, displayWidth)` with the intrinsic aspect ratio and
+		// `objectFit: contain` (render/RenderMedia.tsx, mirroring MessageBubble), which is
+		// how a responsive image is supposed to behave. Reserving a width-independent
+		// height instead (the `measureImage` approach, a flat 200px) would letterbox every
+		// generated image on a narrow column — a 1024x512 at a 300px column paints 150px
+		// tall while 256px was reserved, leaving ~106px of dead space under it. And the
+		// vlist CONTRACT requires the measured height to EQUAL the rendered height, so
+		// diverging here would corrupt the scroll geometry rather than just look wrong.
+		//
+		// Consequence for the width loop: because this height rises with width, "a
+		// scrollbar that appears can never become unnecessary" is FALSE, so the width
+		// feedback cycle is reachable (measured: 59 commits in 60 hops on a 380x1656
+		// viewport). Termination therefore cannot rest on measure-layer monotonicity — it
+		// rests on the structural cycle guard in `vlist-width-settle.ts`
+		// (`isWidthFeedbackCycle`), which assumes nothing about content shape.
 		const displayWidth = Math.min(innerWidth, Math.min(metrics.width, IMGGEN_MAX_DISPLAY_WIDTH));
 		const imageHeight = Math.round((displayWidth * metrics.height) / metrics.width);
 		const imageBlock: PreparedFixedBlock = {

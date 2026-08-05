@@ -31,6 +31,19 @@ function resolveNarratorDisplayStatus(status: string, substatusRaw?: string | nu
 	return status;
 }
 
+/**
+ * Whether the narrator is parked until an unavailable model recovers.
+ *
+ * Reported as a separate flag rather than folded into the display status because
+ * the Pixi card paints `narratorStatus` as raw text (and measures it for card
+ * width) with no i18n available, so the status string must stay short and
+ * stable. The flag only drives color and offscreen-bubble suppression: this wait
+ * is not actionable, so it must not use the attention hue or raise a bubble.
+ */
+function resolveNarratorModelUnavailable(substatusRaw?: string | null): boolean {
+	return parseSubstatus(substatusRaw).includes("model_unavailable");
+}
+
 function hasChapterId<T extends { chapterId: string | null }>(
 	narrator: T,
 ): narrator is T & { chapterId: string } {
@@ -76,17 +89,56 @@ function chapterBelongsToSegment(
 	return false;
 }
 
+/** Commits per page when the client does not ask; matches the frontend's own default. */
+const DEFAULT_COMMIT_LIMIT = 200;
+
+/**
+ * Hard ceiling on commits per request.
+ *
+ * `limit` reaches `gitService.getLog` as `--max-count`, so an unclamped value lets any
+ * caller ask git to walk an entire repository's history and serialize it into one JSON
+ * response — a slow `git log` subprocess plus an unbounded body, which is exactly the
+ * "no upper bound on a list API" failure mode. The frontend never requests more than
+ * `DEFAULT_COMMIT_LIMIT`; the extra headroom is only so a deliberate deep-link cannot
+ * be capped below what the UI itself would ask for.
+ */
+const MAX_COMMIT_LIMIT = 1000;
+
+/**
+ * Parse a non-negative integer query parameter, falling back on anything unusable.
+ *
+ * `Number.parseInt` is lenient in ways that matter here: `?limit=abc` and
+ * `?limit=Infinity` both yield NaN (it stops at the first non-digit), `?limit=-5` yields
+ * a negative, and `?limit=50.9` a fraction. These reach a git subprocess and the
+ * response's index arithmetic, where each fails differently: `--max-count=NaN` aborts
+ * `git log` outright ("not an integer"), while a negative `--skip` is quietly ACCEPTED
+ * by git and instead corrupts the `oldestLoadedIndex`/`newestLoadedIndex` the client
+ * pages against. Coerce, then clamp, so neither path can see a bad value.
+ */
+function parseBoundedInt(raw: string | undefined, fallback: number, min: number, max: number) {
+	if (raw === undefined || raw === "") return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	// Also rejects ±Infinity: parseInt never produces it, but Number.isFinite keeps this
+	// correct if the coercion is ever swapped for Number().
+	if (!Number.isFinite(parsed)) return fallback;
+	return Math.min(Math.max(Math.trunc(parsed), min), max);
+}
+
 export const rulerRoutes = new Hono();
 
 // GET /:id/ruler — Main ruler data (commit backbone + segments + active chapters)
 rulerRoutes.get("/:id/ruler", async (c) => {
 	const projectId = c.req.param("id");
-	const limitParam = c.req.query("limit");
-	const skipParam = c.req.query("skip");
 	const cursor = c.req.query("cursor");
 	const direction = c.req.query("direction") as "older" | "newer" | undefined;
-	const limit = limitParam ? Number.parseInt(limitParam, 10) : 200;
-	let skip = skipParam ? Number.parseInt(skipParam, 10) : 0;
+	// Minimum of 1: `--max-count=0` returns no commits at all, which the segment/index
+	// arithmetic below would report as an empty backbone rather than a bad request.
+	const limit = parseBoundedInt(c.req.query("limit"), DEFAULT_COMMIT_LIMIT, 1, MAX_COMMIT_LIMIT);
+	// `skip` needs no upper bound — an offset past HEAD is a legitimately empty page, and
+	// git does the walking — but it must not go negative: git accepts that silently and
+	// the reported `oldestLoadedIndex`/`newestLoadedIndex` would then be wrong.
+	// MAX_SAFE_INTEGER only keeps the arithmetic below exact.
+	let skip = parseBoundedInt(c.req.query("skip"), 0, 0, Number.MAX_SAFE_INTEGER);
 
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
@@ -132,7 +184,13 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 	// Build a SHA set for fast lookup
 	const commitShaSet = new Set(commits.map((co) => co.sha));
 
-	// Get all non-root chapters for this project
+	// Get all non-root chapters for this project.
+	//
+	// Deliberately UNPAGINATED: `resolveEffectiveSha` walks each chapter's
+	// parentChapterId chain to find an ancestor on the backbone, so a truncated set
+	// would silently drop chapters whose parent fell outside the page. Bounded instead
+	// by the `columns` projection (no large fields) and by chapters-per-project, which
+	// is human-scale. The commit log is the side that pages.
 	const projectChapters = await db.query.chapters.findMany({
 		where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 0)),
 		columns: {
@@ -154,19 +212,21 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 		.filter((ch) => ch.status === "active")
 		.map((ch) => ch.id);
 
-	let narratorMap = new Map<string, { id: string; status: string }>();
+	let narratorMap = new Map<string, { id: string; status: string; modelUnavailable: boolean }>();
 	if (activeChapterIds.length > 0) {
 		const chapterNarrators = await db.query.narrators.findMany({
 			where: and(inArray(narrators.chapterId, activeChapterIds), eq(narrators.variant, "primary")),
 			columns: { id: true, chapterId: true, status: true, substatus: true },
 		});
 		narratorMap = new Map(
-			chapterNarrators
-				.filter(hasChapterId)
-				.map((n) => [
-					n.chapterId,
-					{ id: n.id, status: resolveNarratorDisplayStatus(n.status, n.substatus) },
-				]),
+			chapterNarrators.filter(hasChapterId).map((n) => [
+				n.chapterId,
+				{
+					id: n.id,
+					status: resolveNarratorDisplayStatus(n.status, n.substatus),
+					modelUnavailable: resolveNarratorModelUnavailable(n.substatus),
+				},
+			]),
 		);
 	}
 
@@ -252,6 +312,7 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 				startCommitSha: ch.startCommitSha,
 				narratorId: narrator?.id ?? null,
 				narratorStatus: narrator?.status ?? null,
+				narratorModelUnavailable: narrator?.modelUnavailable ?? false,
 				axisOffset: ch.axisOffset ?? 0,
 				crossOffset: ch.crossOffset ?? 0,
 			};
@@ -271,6 +332,7 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 			mergeCommitSha: ch.mergeCommitSha,
 			narratorId: null as string | null,
 			narratorStatus: null as string | null,
+			narratorModelUnavailable: false,
 			axisOffset: ch.axisOffset ?? 0,
 			crossOffset: ch.crossOffset ?? 0,
 		}));
@@ -291,12 +353,17 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 	const projectId = c.req.param("id");
 	const fromSha = c.req.query("from");
 	const _toSha = c.req.query("to");
+	// Compared against "summary" below, so any unrecognised value falls through to the
+	// "full" branch. Nothing here reaches git or a LIMIT, so an odd value costs at most
+	// the wider column projection — no clamping needed, unlike the commit log above.
 	const detail = (c.req.query("detail") ?? "full") as "summary" | "full";
 
 	if (!fromSha) return c.json({ chapters: [], edges: [] });
 
 	if (detail === "summary") {
-		// Lightweight: id, title, status, role, narrator status + layout position
+		// Lightweight: id, title, status, role, narrator status + layout position.
+		// Unpaginated for the same reason as the main endpoint: `chapterBelongsToSegment`
+		// needs the full parentChapterId chain to decide membership.
 		const projectChapters = await db.query.chapters.findMany({
 			where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 0)),
 			columns: {
@@ -319,16 +386,20 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 		);
 		const chapterIds = segmentChapters.map((ch) => ch.id);
 
-		let narratorMap = new Map<string, string>();
+		let narratorMap = new Map<string, { status: string; modelUnavailable: boolean }>();
 		if (chapterIds.length > 0) {
 			const chapterNarrators = await db.query.narrators.findMany({
 				where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.variant, "primary")),
 				columns: { chapterId: true, status: true, substatus: true },
 			});
 			narratorMap = new Map(
-				chapterNarrators
-					.filter(hasChapterId)
-					.map((n) => [n.chapterId, resolveNarratorDisplayStatus(n.status, n.substatus)]),
+				chapterNarrators.filter(hasChapterId).map((n) => [
+					n.chapterId,
+					{
+						status: resolveNarratorDisplayStatus(n.status, n.substatus),
+						modelUnavailable: resolveNarratorModelUnavailable(n.substatus),
+					},
+				]),
 			);
 		}
 
@@ -338,7 +409,8 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 				title: ch.title,
 				status: ch.status,
 				role: ch.role,
-				narratorStatus: narratorMap.get(ch.id) ?? null,
+				narratorStatus: narratorMap.get(ch.id)?.status ?? null,
+				narratorModelUnavailable: narratorMap.get(ch.id)?.modelUnavailable ?? false,
 				anchorCommitSha: ch.anchorCommitSha ?? ch.startCommitSha ?? null,
 				axisOffset: ch.axisOffset ?? 0,
 				crossOffset: ch.crossOffset ?? 0,
@@ -349,7 +421,9 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 
 	// detail === "full" — existing behavior
 
-	// Get chapters whose startCommitSha matches the segment range
+	// Get chapters whose startCommitSha matches the segment range.
+	// Unpaginated by design (full parent chain required); the projection keeps large
+	// columns out of the response.
 	const projectChapters = await db.query.chapters.findMany({
 		where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 0)),
 		columns: {
@@ -397,12 +471,14 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 		: [[], []];
 
 	const narratorMap = new Map(
-		chapterNarrators
-			.filter(hasChapterId)
-			.map((n) => [
-				n.chapterId,
-				{ id: n.id, status: resolveNarratorDisplayStatus(n.status, n.substatus) },
-			]),
+		chapterNarrators.filter(hasChapterId).map((n) => [
+			n.chapterId,
+			{
+				id: n.id,
+				status: resolveNarratorDisplayStatus(n.status, n.substatus),
+				modelUnavailable: resolveNarratorModelUnavailable(n.substatus),
+			},
+		]),
 	);
 
 	const result = segmentChapters.map((ch) => {
@@ -420,6 +496,7 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 			color: ch.color,
 			narratorId: narrator?.id ?? null,
 			narratorStatus: narrator?.status ?? null,
+			narratorModelUnavailable: narrator?.modelUnavailable ?? false,
 			reviewSourceChapterId: ch.reviewSourceChapterId,
 			reviewStatus: ch.reviewStatus,
 			anchorCommitSha: ch.anchorCommitSha ?? ch.startCommitSha ?? null,

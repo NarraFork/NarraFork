@@ -1,3 +1,5 @@
+import { useLocalPref } from "@frontend/hooks/useLocalPref";
+import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import { Box, Group, Skeleton, Stack } from "@mantine/core";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 
@@ -7,6 +9,10 @@ import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
  * content area jitter caused by hydration delays and progressive rendering.
  */
 export function NarratorPanelSkeleton() {
+	// Same column the real list will draw into, so the panel skeleton, the lazy
+	// chunk's fallback and the list's own placeholder are all one width — the
+	// transition no longer steps through a full-bleed and a centered variant.
+	const [centeredColumn] = useLocalPref("narrafork_narrator_centered_column");
 	return (
 		<Stack h="100%" gap={0} style={{ overflow: "hidden" }}>
 			{/* Header skeleton */}
@@ -29,9 +35,12 @@ export function NarratorPanelSkeleton() {
 				</Group>
 			</Group>
 
-			{/* Message area skeleton */}
-			<Box style={{ flex: 1, minHeight: 0, overflow: "hidden" }} py="sm" px="md">
-				<NarratorMessageListSkeleton />
+			{/* Message area skeleton. The column geometry comes from the shared helper
+			    (never a local padding), so it matches the rows that replace it. */}
+			<Box style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+				<Box style={narratorColumnPlaceholderStyle(centeredColumn)}>
+					<NarratorMessageListSkeleton />
+				</Box>
 			</Box>
 
 			{/* Status bar skeleton */}

@@ -189,6 +189,14 @@ export interface TraceItemData {
 	bodyText?: string | null;
 	/** Streaming shimmer on this row (renderer only). */
 	shimmer?: boolean;
+	/**
+	 * A live reflection gate's status (renderer only; height-neutral).
+	 *
+	 * Selects the row's shimmer colour — purple while a gate deliberates — and nothing
+	 * else. See `@shared/tool-shimmer` for why the tool's own `pending` status cannot
+	 * express this on its own.
+	 */
+	reflectionStatus?: string;
 	/** Stable row key (renderer only); falls back to the row index. */
 	key?: string;
 	/**
@@ -330,6 +338,8 @@ export interface MeasuredTraceRow {
 	category?: string;
 	/** Streaming shimmer flag (renderer). */
 	shimmer: boolean;
+	/** Live reflection-gate status for the shimmer colour (renderer; height-neutral). */
+	reflectionStatus?: string;
 	/** Whether this row has an expandable body. */
 	expandable: boolean;
 	/** Whether the body is currently expanded (height-affecting). */
@@ -603,6 +613,7 @@ export function measureCollapsibleTrace(
 			status: item.status ?? null,
 			timing: item.timing ? resolveToolTimingStamps(item.timing) : null,
 			shimmer: !!item.shimmer,
+			reflectionStatus: item.reflectionStatus,
 			expandable,
 			expanded,
 			top: bf.top,
@@ -650,6 +661,8 @@ export interface ToolRunSummaryItem {
 	hasIcon?: boolean;
 	iconColor?: string;
 	shimmer?: boolean;
+	/** Live reflection-gate status for the shimmer colour (renderer; height-neutral). */
+	reflectionStatus?: string;
 	key?: string;
 	/** Trailing status glyph (renderer only; height-neutral). */
 	status?: string | null;
@@ -698,6 +711,8 @@ export interface ActivityTraceItem {
 	hasIcon?: boolean;
 	iconColor?: string;
 	shimmer?: boolean;
+	/** Live reflection-gate status for the shimmer colour (renderer; height-neutral). */
+	reflectionStatus?: string;
 	key?: string;
 	/** Trailing status glyph (renderer only; height-neutral). */
 	status?: string | null;

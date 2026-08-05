@@ -16,6 +16,7 @@ import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
+import { resolveKnownUnavailableNugModel } from "../lib/nug-model-availability";
 import { markNugCachedModelUnavailable } from "../lib/nug-model-cache";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import {
@@ -801,6 +802,103 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		needsRestart = false;
 		compactConsumedInLoop = false;
 
+		/**
+		 * Suspend this subagent until a NUG model becomes available again, then
+		 * report whether the loop may continue.
+		 *
+		 * Shared by the pre-flight check below (the catalog already recorded an
+		 * outage) and the post-request `modelUnavailable` branch (the gateway just
+		 * refused), so both park on the shared availability poller — which polls
+		 * only the lightweight `/v1/models` list — with identical status, broadcast
+		 * and history-rebuild behaviour.
+		 *
+		 * @returns true when the model recovered and the caller should `continue`;
+		 * false when the wait was aborted and the caller must `break`.
+		 */
+		const suspendUntilNugModelAvailable = async (
+			mu: Omit<NonNullable<ExecuteLoopResult["modelUnavailable"]>, "provider">,
+		): Promise<boolean> => {
+			// Finalize/clean up the partial message from the failed turn.
+			const partialId = eventContext.getPartialMessageId();
+			let keptPartial = false;
+			if (partialId) {
+				keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
+				eventContext.setPartialMessageId(undefined);
+			}
+
+			await narratorService.updateStatus(narratorId, "waiting", {
+				substatus: ["model_unavailable"],
+			});
+			broadcastToNarrator(parentNarratorId, {
+				type: "subagent_model_unavailable_waiting",
+				narratorId: parentNarratorId,
+				subagentNarratorId: narratorId,
+				message: mu.message,
+				model: mu.model,
+				nugModelId: mu.nugModelId,
+				diagnostics: mu.diagnostics,
+			});
+
+			const outcome =
+				mu.providerId && mu.nugModelId
+					? await nugAvailabilityPoller.waitForModelAvailable({
+							providerId: mu.providerId,
+							nugModelId: mu.nugModelId,
+							signal,
+						})
+					: "aborted";
+
+			if (signal.aborted || outcome === "aborted") return false;
+
+			broadcastToNarrator(parentNarratorId, {
+				type: "subagent_model_unavailable_recovered",
+				narratorId: parentNarratorId,
+				subagentNarratorId: narratorId,
+				model: mu.model,
+				nugModelId: mu.nugModelId,
+			});
+			await narratorService.updateStatus(narratorId, "working");
+			if (keptPartial) {
+				prompt = "";
+			}
+			const rebuilt = await loadSubagentHistory(
+				narratorId,
+				model,
+				resolvedProvider,
+				pruneBoundaryId,
+			);
+			history = rebuilt.history;
+			trailingToolResults = rebuilt.trailingToolResults;
+			currentConversationId = randomUUID();
+			resetUpstreamSessionOnNextRequest = true;
+			return true;
+		};
+
+		// --- Pre-flight: the model is already known to be unavailable ---
+		// A subagent's model comes from settings or its parent, so it can point at a
+		// model whose outage is already recorded. Waiting here rather than sending
+		// the request avoids uploading the whole history just to be refused, and it
+		// does not depend on the gateway's error text being recognized. An unknown
+		// model counts as usable, so a working model is never held back.
+		{
+			const known = resolveKnownUnavailableNugModel(model, resolvedProvider);
+			if (known && !signal.aborted) {
+				const resumed = await suspendUntilNugModelAvailable({
+					message: `Model ${known.model} is recorded as temporarily unavailable; waiting for it to recover before sending the request.`,
+					model: known.model,
+					providerId: known.providerId,
+					providerPrefix: known.providerPrefix,
+					nugModelId: known.nugModelId,
+				});
+				if (!resumed) {
+					aborted = true;
+					break;
+				}
+				transientRetries = 0;
+				continue;
+			}
+		}
+
 		const baselineCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
 		const result = await executeAgentLoop({
 			config,
@@ -900,62 +998,10 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			if (mu.providerId && mu.nugModelId) {
 				markNugCachedModelUnavailable(mu.providerId, mu.nugModelId);
 			}
-			// Finalize/clean up the partial message from the failed turn.
-			const partialId = eventContext.getPartialMessageId();
-			let keptPartial = false;
-			if (partialId) {
-				keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
-				eventContext.setPartialMessageId(undefined);
-			}
-
-			await narratorService.updateStatus(narratorId, "waiting", {
-				substatus: ["model_unavailable"],
-			});
-			broadcastToNarrator(parentNarratorId, {
-				type: "subagent_model_unavailable_waiting",
-				narratorId: parentNarratorId,
-				subagentNarratorId: narratorId,
-				message: mu.message,
-				model: mu.model,
-				nugModelId: mu.nugModelId,
-				diagnostics: mu.diagnostics,
-			});
-
-			const outcome =
-				mu.providerId && mu.nugModelId
-					? await nugAvailabilityPoller.waitForModelAvailable({
-							providerId: mu.providerId,
-							nugModelId: mu.nugModelId,
-							signal,
-						})
-					: "aborted";
-
-			if (signal.aborted || outcome === "aborted") {
+			if (!(await suspendUntilNugModelAvailable(mu))) {
 				aborted = true;
 				break;
 			}
-
-			broadcastToNarrator(parentNarratorId, {
-				type: "subagent_model_unavailable_recovered",
-				narratorId: parentNarratorId,
-				subagentNarratorId: narratorId,
-				model: mu.model,
-				nugModelId: mu.nugModelId,
-			});
-			await narratorService.updateStatus(narratorId, "working");
-			if (keptPartial) {
-				prompt = "";
-			}
-			const rebuilt = await loadSubagentHistory(
-				narratorId,
-				model,
-				resolvedProvider,
-				pruneBoundaryId,
-			);
-			history = rebuilt.history;
-			trailingToolResults = rebuilt.trailingToolResults;
-			currentConversationId = randomUUID();
-			resetUpstreamSessionOnNextRequest = true;
 			transientRetries = 0;
 			continue;
 		}

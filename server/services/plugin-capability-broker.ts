@@ -19,8 +19,6 @@ import {
 	invocationScopeSchema as permissionInvocationScopeSchema,
 	type RuntimeState,
 	runtimeStateSchema,
-	TRUST_TIERS,
-	type TrustTier,
 } from "@server/lib/plugins/permissions";
 import { type JsonValue, PLUGIN_ERROR_CODES } from "@server/lib/plugins/protocol";
 import type { CanonicalCapabilityId } from "@shared/integrations/capabilities";
@@ -160,7 +158,6 @@ const lifecycleStateSchema = z
 		desiredState: desiredStateSchema,
 		compatibilityState: z.enum(COMPATIBILITY_STATES),
 		runtimeState: runtimeStateSchema,
-		trustTier: z.enum(TRUST_TIERS).optional(),
 		runtimeGeneration: z.number().int().nonnegative().optional(),
 	})
 	.strict();
@@ -170,7 +167,6 @@ export interface PluginCapabilityBinding {
 	desiredState: DesiredState;
 	compatibilityState: CompatibilityState;
 	runtimeState: RuntimeState;
-	trustTier?: TrustTier;
 	runtimeGeneration?: number;
 	manifestRequested: readonly string[];
 	installationGrants: readonly PermissionGrant[];
@@ -188,7 +184,6 @@ export interface PluginCapabilityBindingInput
 			| "desiredState"
 			| "compatibilityState"
 			| "runtimeState"
-			| "trustTier"
 			| "runtimeGeneration"
 			| "manifestRequested"
 			| "installationGrants"
@@ -207,7 +202,6 @@ export interface PluginCapabilityBindingInput
 		compatibilityState?: CompatibilityState;
 		runtimeState?: RuntimeState;
 		runtimeGeneration?: number;
-		trustTier?: TrustTier;
 	};
 	manifest?: { permissions?: { host?: readonly string[] } };
 }
@@ -367,7 +361,6 @@ interface NormalizedBinding {
 	desiredState: DesiredState;
 	compatibilityState: CompatibilityState;
 	runtimeState: RuntimeState;
-	trustTier: TrustTier | undefined;
 	runtimeGeneration: number;
 	manifestRequested: string[];
 	installationGrants: PermissionGrant[];
@@ -1205,7 +1198,6 @@ export class CapabilityBroker {
 		const compatibilityState =
 			raw.compatibilityState ?? state.compatibilityState ?? state.compatibility;
 		const runtimeState = raw.runtimeState ?? state.runtimeState;
-		const trustTier = raw.trustTier ?? state.trustTier;
 		const runtimeGeneration =
 			raw.runtimeGeneration ?? state.runtimeGeneration ?? plugin.runtimeGeneration;
 		const manifestRequested = raw.manifestRequested ?? raw.manifest?.permissions?.host;
@@ -1234,7 +1226,6 @@ export class CapabilityBroker {
 			desiredState,
 			compatibilityState,
 			runtimeState,
-			trustTier,
 			runtimeGeneration,
 		});
 		if (!parsedState.success) return undefined;
@@ -1246,7 +1237,6 @@ export class CapabilityBroker {
 			desiredState: parsedState.data.desiredState,
 			compatibilityState: parsedState.data.compatibilityState,
 			runtimeState: parsedState.data.runtimeState,
-			trustTier: parsedState.data.trustTier,
 			runtimeGeneration: parsedState.data.runtimeGeneration ?? plugin.runtimeGeneration,
 			manifestRequested: parsedManifest,
 			installationGrants: parsedGrants.data,
@@ -1358,9 +1348,11 @@ export class CapabilityBroker {
 		if (binding.runtimeState !== "active" && binding.runtimeState !== "degraded") {
 			return this.error(PLUGIN_ERROR_CODES.HOST_UNAVAILABLE, "PLUGIN_RUNTIME_UNAVAILABLE", 503);
 		}
-		if (binding.trustTier === "T3") {
-			return this.error(PLUGIN_ERROR_CODES.PLUGIN_DISABLED, "PLUGIN_RUNTIME_UNAVAILABLE", 423);
-		}
+		// A `trustTier === "T3"` denial used to sit here and was the trust axis's only runtime
+		// consumer. Because installs always produced `T3` and no code path could raise it, an
+		// enabled plugin with a live runtime had every Host API call rejected with 423; the
+		// lifecycle e2e tests had to write `T2` into the state store by hand to get past it.
+		// See the removal note in `server/lib/plugins/permissions.ts`.
 		return undefined;
 	}
 

@@ -182,8 +182,13 @@ export interface EventHooks {
 	 * Awaited, because the captured state must predate the tool's writes. All
 	 * file-mutating tools are excluded from the loop's eager execution, so the tool
 	 * has not started when this runs.
+	 *
+	 * `input` is passed because a shared worktree makes the tree hash alone
+	 * ambiguous: it captures every actor's writes in the window, so the tool's own
+	 * declaration of what it will write (Write/Edit's `file_path`) is needed to
+	 * attribute the resulting delta. It is complete at this point in the event.
 	 */
-	onSnapshotBefore?: (toolUseId: string, toolName: string) => Promise<void> | void;
+	onSnapshotBefore?: (toolUseId: string, toolName: string, input: unknown) => Promise<void> | void;
 	/** Snapshot: record the workspace tree hash after a file-mutating tool completes */
 	onSnapshotAfter?: (toolUseId: string, toolName: string) => Promise<void> | void;
 	/** Completed tool result, after persistence and broadcast. */
@@ -212,8 +217,21 @@ export interface ToolChunkSnapshot {
 	contentCharsReceived?: number;
 	extractedFields?: Record<string, string>;
 	metadata?: Record<string, unknown>;
-	/** Whether tool_started has fired (tool is executing) */
+	/**
+	 * Whether `tool_started` has fired — i.e. the tool's INPUT finished parsing.
+	 *
+	 * ⚠️ NOT "the tool is executing", which is what this comment used to claim. The
+	 * permission prompt, any reflection gate and the final admission wait all sit after
+	 * this point; `executing` below is the flag that means execution actually began.
+	 */
 	started?: boolean;
+	/**
+	 * Whether `tool_executing` has fired — permission granted, execution under way.
+	 *
+	 * Kept on the snapshot so a client reconnecting mid-tool can distinguish "waiting on
+	 * a human" from "running" instead of inferring it from `started`.
+	 */
+	executing?: boolean;
 	/** Input payload from tool_started */
 	input?: unknown;
 	/** Timestamp from tool_started */
@@ -809,7 +827,7 @@ export async function processEvent(
 			// Snapshot: capture tree state before the tool modifies files. Awaited so
 			// the snapshot cannot race the tool's own writes.
 			if (hooks?.onSnapshotBefore) {
-				await hooks.onSnapshotBefore(event.toolUseId, event.toolName);
+				await hooks.onSnapshotBefore(event.toolUseId, event.toolName, event.input);
 			}
 			const routing = subagentToolRouting(ctx, event.toolUseId);
 			// The child row's label. Computed once and reused by both the snapshot and
@@ -1731,6 +1749,35 @@ export async function processEvent(
 				narratorId: broadcastTargetId,
 				toolUseId: event.toolUseId,
 				output: event.output,
+				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+			});
+			return null;
+		}
+
+		/**
+		 * Execution actually began (permission granted + final admission acquired).
+		 *
+		 * This is the frame that lets a client stop GUESSING. `tool_started` only means
+		 * the input finished parsing, so before this event existed the UI had to treat it
+		 * as "executing" and consequently painted a card that was waiting on a human
+		 * approval as though work were under way.
+		 *
+		 * Also recorded on the snapshot: a client that reconnects mid-execution must
+		 * learn the tool is running rather than inferring it from `started`.
+		 */
+		case "tool_executing": {
+			{
+				const snap = getOrCreateSnapshot(broadcastTargetId);
+				const existing = snap.toolChunks.get(event.toolUseId);
+				if (existing) {
+					snap.toolChunks.set(event.toolUseId, { ...existing, executing: true });
+				}
+			}
+			dualBroadcast(ctx, {
+				type: "tool_executing",
+				narratorId: broadcastTargetId,
+				toolUseId: event.toolUseId,
+				executionStartedAt: event.executionStartedAt,
 				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 			return null;

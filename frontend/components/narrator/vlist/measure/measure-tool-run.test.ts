@@ -475,6 +475,57 @@ describe("row status + timing are height-neutral", () => {
 		expect(heights.size).toBe(1);
 	});
 
+	it("a row's reflection status is height-neutral too", async () => {
+		// `reflectionStatus` is a pure renderer passthrough (it picks the shimmer colour
+		// when a gate is deliberating). Like `status` it must never reach the height math.
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const base = toolRows(1)[0];
+		const heights = new Set<number>();
+		for (const reflectionStatus of [undefined, "running", "confirmed", "awaiting_user"]) {
+			const r = measureCollapsibleTrace(
+				{ items: [{ ...base, status: "pending", reflectionStatus }], maxVisible: 10 },
+				512,
+			);
+			heights.add(r.height);
+			expect(r.rows[0]?.blockHeight).toBeCloseTo(18.8, 5);
+		}
+		expect(heights.size).toBe(1);
+		// And it reaches the measured row unchanged, so the renderer can read it.
+		const withGate = measureCollapsibleTrace(
+			{ items: [{ ...base, status: "pending", reflectionStatus: "running" }], maxVisible: 10 },
+			512,
+		);
+		expect(withGate.rows[0]?.reflectionStatus).toBe("running");
+		const without = measureCollapsibleTrace({ items: [base], maxVisible: 10 }, 512);
+		expect(without.rows[0]?.reflectionStatus).toBeUndefined();
+	});
+
+	it("the five-state SHIMMER cannot move the row either", async () => {
+		// A row now animates in one of five states (neutral / purple / blue, plus a
+		// one-shot green / red) derived from `status` + `shimmer`. That is safe ONLY
+		// because the row shimmer recolours its own text rather than adding a box
+		// (frontend/styles/trace-shimmer.css) — a card-style `::after` overlay would need
+		// `position: relative` on a row the measure layer positions absolutely.
+		//
+		// This asserts the measure side of that contract: neither input is readable as
+		// geometry. Every combination — including a row carrying both — lands on one
+		// height.
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const base = toolRows(1)[0];
+		const heights = new Set<number>();
+		for (const shimmer of [undefined, false, true]) {
+			for (const status of [undefined, "streaming", "running", "success", "fail"]) {
+				const r = measureCollapsibleTrace(
+					{ items: [{ ...base, ...(status ? { status } : {}), shimmer }], maxVisible: 10 },
+					512,
+				);
+				heights.add(r.height);
+				expect(r.rows[0]?.blockHeight).toBeCloseTo(18.8, 5);
+			}
+		}
+		expect(heights.size).toBe(1);
+	});
+
 	it("normalizes the stamps once, in the measure layer", async () => {
 		// The renderer must never re-parse wire shapes; it indexes `row.timing`
 		// directly. Absent timing stays null so the row draws no slot at all.

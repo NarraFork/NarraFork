@@ -28,7 +28,7 @@ import { prepareWithSegments } from "@chenglou/pretext";
 import type { RichInlineItem } from "@chenglou/pretext/rich-inline";
 import { measureRichInlineStats, prepareRichInline } from "@chenglou/pretext/rich-inline";
 import { marked, type Token, type Tokens } from "marked";
-import type { GlyphWidthResolver, KatexRuntime } from "./katex-geometry";
+import type { GlyphVerticalResolver, GlyphWidthResolver, KatexRuntime } from "./katex-geometry";
 import { measureKatex } from "./katex-geometry";
 import { normalizeMathDelimiters, splitMathOutsideCode } from "./math-delimiters";
 import type {
@@ -38,6 +38,8 @@ import type {
 	PreparedCodeBlock,
 	PreparedInlineBlock,
 	PreparedRuleBlock,
+	PreparedTableBlock,
+	PreparedTableCell,
 	PreparedUnknownBlock,
 } from "./prepared-block";
 import {
@@ -56,6 +58,7 @@ import {
 	headingFont,
 	LINE_HEIGHT,
 	lineBoxHeight,
+	MATH_BASE_FONT_SIZE,
 	SANS_FAMILY,
 } from "./pretext-fonts";
 
@@ -73,6 +76,12 @@ const LIST_INDENT = emToPx(1.5, FONT_SIZE.sm); // padding-inline-start 1.5em @14
 const BLOCKQUOTE_PADDING = 10; // spacing xs
 const BLOCKQUOTE_BORDER = 3;
 const CODE_LANG_EXTRA_TOP = 12; // codeBlockWithLang: pad-top = xs + 12px (12px extra)
+const TABLE_MARGIN_TOP = emToPx(0.35, FONT_SIZE.sm);
+/**
+ * Upper bound used to measure a cell's max-content width. Large enough that no
+ * realistic cell wraps, small enough to stay far from float-precision trouble.
+ */
+const TABLE_NATURAL_WIDTH_BOUND = 1e7;
 
 /**
  * Conservative placeholder heights for intrinsically unpredictable blocks.
@@ -130,6 +139,8 @@ export interface MathSupport {
 	katex: KatexRuntime;
 	/** Real-font measurement for glyphs KaTeX lacks metrics for (CJK). */
 	glyphWidth?: GlyphWidthResolver;
+	/** Real-font VERTICAL metrics for the same glyphs (KaTeX reports no descender). */
+	glyphVertical?: GlyphVerticalResolver;
 }
 
 /**
@@ -189,8 +200,12 @@ function placeholderAdvance(font: string): number {
 function mathPiece(latex: string, font: string, math: MathSupport): InlinePiece | null {
 	const geometry = measureKatex(math.katex, latex, {
 		displayMode: false,
-		basePx: FONT_SIZE.sm,
+		// MUST stay in lockstep with the font size the render layer pins on the math
+		// host — KaTeX's root is `1.21em`, so any mismatch rescales the formula away
+		// from this measurement (see MATH_BASE_FONT_SIZE).
+		basePx: MATH_BASE_FONT_SIZE,
 		glyphWidth: math.glyphWidth,
+		glyphVertical: math.glyphVertical,
 	});
 	if (geometry.width <= 0) return null;
 	return {
@@ -253,10 +268,48 @@ function prepareSingleToken(
 	if (isFirst) return parseBlockTokens([token], ctx);
 	// Any preceding block makes the next one "non-first"; a plain paragraph is the
 	// cheapest seed and its own blocks are discarded.
-	const seedTokens = marked.lexer("x\n\n", { gfm: true });
-	const seeded = parseBlockTokens([...seedTokens, token], ctx);
-	const seedOnly = parseBlockTokens(seedTokens, ctx);
-	return seeded.slice(seedOnly.length);
+	//
+	// Both the seed's lex and its block COUNT are constants, so each is computed at
+	// most once (see below). This function runs per unit on the streaming path —
+	// every frame, for every unit of the live tail — and it used to re-lex `"x\n\n"`
+	// and run `parseBlockTokens` TWICE per call to rediscover the same two values.
+	const seeded = parseBlockTokens([...marginSeedTokens(), token], ctx);
+	return seeded.slice(marginSeedBlockCount());
+}
+
+/**
+ * Lexed seed used to give a non-first token its contextual top margin: a plain
+ * paragraph plus the blank line after it, the cheapest thing that makes
+ * `appendGroup` treat the NEXT token as mid-document.
+ */
+let cachedMarginSeedTokens: readonly Token[] | undefined;
+
+function marginSeedTokens(): readonly Token[] {
+	cachedMarginSeedTokens ??= marked.lexer("x\n\n", { gfm: true });
+	return cachedMarginSeedTokens;
+}
+
+/**
+ * Blocks the seed itself contributes (one paragraph; the `space` token emits none).
+ *
+ * Independent of the parse context — the seed is plain ASCII with no math, no list
+ * nesting and no quote nesting, so no `ParseContext` field can change how many
+ * blocks it produces. Derived rather than hard-coded so it follows the seed source.
+ *
+ * Computed LAZILY, never at module scope: `parseBlockTokens` reaches pretext, which
+ * needs a canvas, and measure tests install their stub in `beforeAll` — after the
+ * import graph is built (CONTRACT §5). Doing this eagerly threw
+ * "Text measurement requires OffscreenCanvas" at import time for every test that
+ * loads this module statically.
+ */
+let cachedMarginSeedBlockCount: number | undefined;
+
+function marginSeedBlockCount(): number {
+	cachedMarginSeedBlockCount ??= parseBlockTokens(marginSeedTokens(), {
+		listDepth: 0,
+		quoteDepth: 0,
+	}).length;
+	return cachedMarginSeedBlockCount;
 }
 
 /** One top-level markdown block: its source text plus its prepared blocks. */
@@ -415,13 +468,7 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 				appendGroup(blocks, [buildRuleBlock(ctx)], PARAGRAPH_MARGIN_TOP);
 				continue;
 			case "table":
-				// Render tables as a monospace pre-wrap block (parity-lite; matches
-				// the demo's approach of formatting a table as fixed text).
-				appendGroup(
-					blocks,
-					[buildCodeBlock(formatTable(token as Tokens.Table), null, ctx)],
-					CODE_MARGIN_TOP,
-				);
+				appendGroup(blocks, [buildTableBlock(token as Tokens.Table, ctx)], TABLE_MARGIN_TOP);
 				continue;
 			case "text": {
 				const t = token as Tokens.Text;
@@ -468,8 +515,10 @@ function buildDisplayMathBlock(
 	}
 	const geometry = measureKatex(ctx.math.katex, source, {
 		displayMode: true,
-		basePx: FONT_SIZE.sm,
+		// Same lockstep requirement as inline math (see MATH_BASE_FONT_SIZE).
+		basePx: MATH_BASE_FONT_SIZE,
 		glyphWidth: ctx.math.glyphWidth,
+		glyphVertical: ctx.math.glyphVertical,
 	});
 	const block = buildUnknownBlock("katex", Math.max(1, Math.ceil(geometry.height)), ctx, {
 		source,
@@ -833,6 +882,210 @@ function buildRuleBlock(ctx: ParseContext): PreparedRuleBlock {
 	return { ...blockBase(ctx), kind: "rule", height: RULE_HEIGHT };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tables
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build a GFM table as a first-class prepared block.
+ *
+ * Each cell is prepared exactly like a paragraph (same inline walker, so bold /
+ * links / inline code / inline math all work inside cells), then measured twice to
+ * capture the intrinsic widths the column solver needs:
+ *   - natural (max-content): laid out at effectively infinite width
+ *   - min     (min-content): laid out at 1px, which forces every legal break
+ *
+ * Both are width-independent properties of the content, so they belong here in the
+ * prepared layer and never need recomputing on resize.
+ */
+function buildTableBlock(token: Tokens.Table, ctx: ParseContext): PreparedTableBlock {
+	const header = token.header.map((cell) => buildTableCell(cell, true, ctx));
+	const rows = token.rows.map((row) => row.map((cell) => buildTableCell(cell, false, ctx)));
+
+	let columns = header.length;
+	for (const row of rows) {
+		if (row.length > columns) columns = row.length;
+	}
+
+	// `align` is normalized to `columns` entries so it can be indexed by column.
+	//
+	// It comes from the DELIMITER row, so `token.align.length` is the HEADER's column
+	// count, whereas `columns` is the max across header and body. Those agree for
+	// every input marked can currently produce — it truncates a body row to the
+	// header's width at the lexer (a 4-cell row under a 2-column header arrives as 2
+	// cells) and refuses a table whose delimiter row disagrees with its header
+	// outright — so today the two lengths cannot diverge.
+	//
+	// Normalizing anyway makes `align.length === columns` a property of this block
+	// rather than a coincidence of the lexer's ragged-row handling, because the cost
+	// of it silently ceasing to hold is high and invisible: every consumer walks by
+	// column index (`solveTableColumns`, `layoutTable`, the renderer's
+	// `columnWidths[i]` / `align[i]`), so a short `align` would drop the surplus
+	// columns from measurement AND paint in lockstep — no layout drift to notice,
+	// just content gone. Unspecified columns get GFM's default alignment, which is
+	// what the delimiter row says about a column it never described.
+	// `parse-markdown-table.test.ts` asserts the invariant across malformed sources.
+	const align: Array<"left" | "center" | "right" | null> = new Array(columns).fill(null);
+	for (let c = 0; c < columns; c++) {
+		align[c] = token.align[c] ?? null;
+	}
+
+	return {
+		...blockBase(ctx),
+		kind: "table",
+		header,
+		rows,
+		align,
+		columns,
+		lineHeight: BODY_LINE_HEIGHT,
+	};
+}
+
+/** Prepare one table cell's inline flow plus its two intrinsic widths. */
+function buildTableCell(
+	cell: Tokens.TableCell,
+	isHeader: boolean,
+	ctx: ParseContext,
+): PreparedTableCell {
+	// A cell is single-line by nature: `collectInlineLines` can split on `<br>`,
+	// but a table cell has no block flow to stack them into, so every piece is
+	// flattened into one flow (which then wraps on width like any inline text).
+	const lines = collectInlineLines(cell.tokens ?? [], "body", ctx);
+	const pieces: InlinePiece[] = [];
+	for (const line of lines) {
+		for (const piece of line) pieces.push(piece);
+	}
+	// Header cells paint at medium weight (Mantine Table.Th), so they must also be
+	// MEASURED at that weight or the predicted column width is too narrow.
+	const resolved = isHeader ? pieces.map(boldenPiece) : pieces;
+	const items: RichInlineItem[] = resolved.map((p) => ({
+		text: p.text,
+		font: p.font,
+		break: p.breakMode,
+		extraWidth: p.extraWidth,
+	}));
+	const flow = prepareRichInline(items);
+	// Natural width (max-content): a bound large enough that no wrap can occur.
+	const natural = measureRichInlineStats(flow, TABLE_NATURAL_WIDTH_BOUND);
+	// A cell formula must survive into the render layer, exactly like a paragraph's
+	// (see PreparedTableCell.mathHtmls). Dropping it here paints the atom placeholder
+	// — blank space of the right width. `mathHeight` is the tallest formula, which the
+	// row-height solver needs so a stacked formula is not clipped.
+	const hasMath = resolved.some((p) => p.math != null);
+	let mathHeight = 0;
+	if (hasMath) {
+		for (const piece of resolved) {
+			if (piece.math && piece.math.height > mathHeight) mathHeight = piece.math.height;
+		}
+	}
+	return {
+		flow,
+		classNames: resolved.map((p) => p.className),
+		hrefs: resolved.map((p) => p.href),
+		fonts: resolved.map((p) => p.font),
+		...(hasMath ? { mathHtmls: resolved.map((p) => p.math ?? null), mathHeight } : {}),
+		naturalWidth: natural.maxLineWidth,
+		minWidth: measureCellMinWidth(resolved),
+	};
+}
+
+/**
+ * Min-content width of a cell: the widest piece that cannot be broken.
+ *
+ * Measuring the flow at width 1 does NOT give this. pretext's `break: "normal"`
+ * will split mid-word as a last resort when a single word cannot fit, so a 1px
+ * probe reports the widest GRAPHEME (~one character) and every column would look
+ * infinitely squeezable — collapsing the solver's third regime entirely.
+ *
+ * Instead the text is re-prepared through `prepareWithSegments`, whose `segments`
+ * ARE pretext's own break units (whole words for Latin, per-character for CJK,
+ * matching how a browser breaks), and the widest of those is measured as an
+ * unbreakable atom.
+ */
+function measureCellMinWidth(pieces: readonly InlinePiece[]): number {
+	let widest = 0;
+	for (const piece of pieces) {
+		// A math atom is unbreakable and already carries its full width.
+		if (piece.math != null) {
+			const width = piece.math.width;
+			if (width > widest) widest = width;
+			continue;
+		}
+		const pieceMin = pieceMinWidth(piece);
+		if (pieceMin > widest) widest = pieceMin;
+	}
+	return widest;
+}
+
+/**
+ * Min-content width of ONE piece, memoised on `(font, extraWidth, text)`.
+ *
+ * The uncached cost is per SEGMENT, not per piece: a 20×10 table with ten words per
+ * cell runs 200 `prepareWithSegments` calls plus 2000 single-item
+ * `prepareRichInline` + `measureRichInlineStats` pairs, all on the synchronous
+ * prepare path. Tables repeat values heavily down a column (statuses, flags, short
+ * identifiers, empty cells), so the memo turns most of that into map lookups.
+ *
+ * The key includes `extraWidth` because it is added to the measured atom, and the
+ * font because it decides every advance. Text is the rest of the key, so entries are
+ * exact — this memoises a pure function, it does not approximate.
+ *
+ * NOTE: the entries hold NUMBERS, not prepared handles, so this cache is cheap to
+ * retain. It is still keyed by font (never by "the current font generation") because
+ * a face swap changes the advances: `resetPreparedFontRevisionForTest` and
+ * `setPreparedFontRevision` clear it through `clearCellMinWidthCache`.
+ */
+const cellMinWidthCache = new Map<string, number>();
+
+/**
+ * Entry ceiling for the min-width memo. Bulk-clear on overflow, matching the other
+ * caches in this layer: recomputing one entry is a single pretext pass, and a
+ * sequential table scan is exactly the access pattern an LRU handles worst.
+ */
+const CELL_MIN_WIDTH_CACHE_CEILING = 16384;
+
+function pieceMinWidth(piece: InlinePiece): number {
+	const key = `${piece.font}\u0000${piece.extraWidth ?? 0}\u0000${piece.text}`;
+	const cached = cellMinWidthCache.get(key);
+	if (cached !== undefined) return cached;
+	let widest = 0;
+	// `segments` ARE pretext's own break units (whole words for Latin, per-character
+	// for CJK), which is why each is measured as an unbreakable atom.
+	const { segments } = prepareWithSegments(piece.text, piece.font);
+	for (const segment of segments) {
+		if (segment.trim().length === 0) continue;
+		const atom = prepareRichInline([
+			{ text: segment, font: piece.font, break: "never", extraWidth: piece.extraWidth },
+		]);
+		const { maxLineWidth } = measureRichInlineStats(atom, TABLE_NATURAL_WIDTH_BOUND);
+		if (maxLineWidth > widest) widest = maxLineWidth;
+	}
+	if (cellMinWidthCache.size >= CELL_MIN_WIDTH_CACHE_CEILING) cellMinWidthCache.clear();
+	cellMinWidthCache.set(key, widest);
+	return widest;
+}
+
+/**
+ * Drop the min-width memo. Called when the font generation advances: the cached
+ * advances were measured against the previous face.
+ */
+export function clearCellMinWidthCache(): void {
+	cellMinWidthCache.clear();
+	placeholderAdvanceCache.clear();
+}
+
+/**
+ * Re-resolve a piece at bold weight for header cells. Inline code keeps its own
+ * monospace font (the chunked path does not embolden `<code>` inside `<th>`), and
+ * a math atom's width is already baked into `extraWidth`, so both pass through.
+ */
+function boldenPiece(piece: InlinePiece): InlinePiece {
+	if (piece.math != null || piece.font === FONT_INLINE_CODE) return piece;
+	const bold = piece.font === FONT_BODY_ITALIC ? FONT_BODY_BOLD_ITALIC : FONT_BODY_BOLD;
+	if (piece.font === bold) return piece;
+	return { ...piece, font: bold };
+}
+
 /** Build an unknown-height placeholder block (mermaid / katex). */
 export function buildUnknownBlock(
 	tag: PreparedUnknownBlock["tag"],
@@ -925,33 +1178,6 @@ function fallbackText(token: Token): string {
 		return (token as { text: string }).text;
 	}
 	return (token as { raw?: string }).raw ?? "";
-}
-
-function formatTable(token: Tokens.Table): string {
-	const header = token.header.map((cell) => inlineToPlain(cell.tokens)).join(" | ");
-	const divider = token.header.map(() => "---").join(" | ");
-	const rows = token.rows.map((row) => row.map((cell) => inlineToPlain(cell.tokens)).join(" | "));
-	return [header, divider, ...rows].join("\n");
-}
-
-function inlineToPlain(tokens: readonly Token[]): string {
-	let text = "";
-	for (const token of tokens) {
-		switch (token.type) {
-			case "strong":
-			case "em":
-			case "del":
-			case "link":
-				text += inlineToPlain((token as Tokens.Strong).tokens ?? []);
-				break;
-			case "br":
-				text += "\n";
-				break;
-			default:
-				text += fallbackText(token);
-		}
-	}
-	return text;
 }
 
 function stripTrailingNewline(text: string): string {

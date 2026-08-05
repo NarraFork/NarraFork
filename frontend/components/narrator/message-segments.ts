@@ -702,8 +702,19 @@ export function buildStreamingMsg(opts: {
 	streamingBlocks?: StreamingBlock[] | null;
 	toolChunksMsg?: NarratorMsg | null;
 	narratorId: string;
+	/**
+	 * Which text/reasoning lane last received a delta, as an index into
+	 * `streamingBlocks`, or -1 when the model has moved on to tool calls.
+	 *
+	 * Only the accumulator sees the real ARRIVAL order, and it is the order that
+	 * decides liveness: this builder always appends the tool cards after the text
+	 * lanes, so a reasoning block's array position cannot tell a finished run from
+	 * one the model reopened after a tool call. Absent → the consumer falls back to
+	 * the positional rule (see @shared/pretext-layout/streaming-live-blocks).
+	 */
+	liveBlockIndex?: number;
 }): NarratorMsg | null {
-	const { streamingBlocks, toolChunksMsg, narratorId } = opts;
+	const { streamingBlocks, toolChunksMsg, narratorId, liveBlockIndex } = opts;
 
 	const hasStreamingBlocks = !!streamingBlocks && streamingBlocks.length > 0;
 	const hasToolChunks = !!toolChunksMsg;
@@ -773,6 +784,9 @@ export function buildStreamingMsg(opts: {
 		toolCalls: toolChunksMsg?.toolCalls ?? [],
 		createdAt: toolChunksMsg?.createdAt ?? new Date().toISOString(),
 		children: [],
+		// Text/reasoning blocks are emitted first and in the same order as
+		// `streamingBlocks`, so the accumulator's index carries over unchanged.
+		...(liveBlockIndex != null ? { liveBlockIndex } : {}),
 	} as NarratorMsg;
 }
 

@@ -141,6 +141,11 @@ export const DEFAULTS: NarraForkSettings = {
 		// Present the built-in Codex adapter as the real Codex CLI by default.
 		userAgentMode: "codex",
 	},
+	// Empty by default: the built-in reference price table in
+	// server/lib/model-pricing.ts applies until an operator corrects a row.
+	pricing: {
+		overrides: {},
+	},
 	search: {
 		channels: [
 			{ id: "native", kind: "native", enabled: true },
@@ -787,6 +792,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"clientFingerprint.installationId": {
 		desc: "作为 x-codex-installation-id 发送的持久化 UUID（客户端指纹身份，首次访问自动生成）。",
 		type: "string",
+	},
+
+	// ── pricing ─────────────────────────────────────────────────────────
+	"pricing.overrides": {
+		type: "object",
 	},
 
 	// ── search ──────────────────────────────────────────────────────────

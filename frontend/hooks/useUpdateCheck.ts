@@ -3,6 +3,7 @@ import i18n from "i18next";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, authorizedFetch, readFetchError } from "../lib/api";
 import type { UpdateCoordinationPhase } from "../lib/update-state";
+import { useCurrentUser } from "./useAuth";
 import { useUpdateCapability } from "./usePlatform";
 
 const MAX_SSE_BUFFER_CHARS = 64_000;
@@ -191,16 +192,43 @@ export function extractUpdateFailureDiagnostic(
 	};
 }
 
+/**
+ * Poll the configured update server for a newer release.
+ *
+ * `GET /api/update/check` is admin-only: it makes the deployment emit an outbound request and
+ * replies with release metadata and download URLs. The admin gate therefore lives HERE rather
+ * than in each caller — this hook already owns the `enabled` decision through `intervalMs`, and
+ * the only consumer (`UpdateBadge`) renders for every signed-in user via the app shell. Leaving
+ * the gate to callers guaranteed a 403 per interval for non-admins and would silently repeat that
+ * for every future caller.
+ *
+ * A non-admin therefore gets a query that never runs: `updateAvailable` stays false and the badge
+ * renders nothing, which is the right outcome since acting on a result (`/download`, `/apply`) is
+ * admin-only too.
+ */
 export function useUpdateCheck(intervalMs = 60 * 60_000) {
 	const [dismissed, setDismissed] = useState(false);
+	const { data: user } = useCurrentUser();
+	const isAdmin = user?.role === "admin";
 
-	const { data, isLoading, refetch } = useQuery({
+	const {
+		data,
+		isLoading,
+		refetch: refetchQuery,
+	} = useQuery({
 		queryKey: ["update-check"],
 		queryFn: () => api.checkUpdate(),
 		refetchInterval: intervalMs,
 		staleTime: intervalMs,
-		enabled: intervalMs > 0,
+		enabled: isAdmin && intervalMs > 0,
 	});
+
+	// `refetch()` ignores `enabled` in React Query v5, so exposing it raw would reopen the same
+	// guaranteed 403 through any caller that wires it to a "check now" control.
+	const refetch = useCallback(async () => {
+		if (!isAdmin) return;
+		await refetchQuery();
+	}, [isAdmin, refetchQuery]);
 
 	const updateAvailable = !dismissed && data?.updateAvailable === true;
 

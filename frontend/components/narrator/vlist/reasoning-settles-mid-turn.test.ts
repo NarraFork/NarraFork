@@ -1,0 +1,171 @@
+/**
+ * reasoning-settles-mid-turn.test.ts — Reasoning must settle when the MODEL moves on,
+ * not when the turn is persisted.
+ *
+ * ── The reported bug ──────────────────────────────────────────────────────────
+ *
+ * "reasoning 从流式归到固定的时机不对：后续 content 已经在输出，甚至后续工具调用都开始
+ * 执行了，reasoning 还在流式中。"
+ *
+ * Cause: the live row is ONE synthetic message (`__streaming__`) that accumulates the
+ * whole turn, and every renderer asked "is this the streaming message?" then applied
+ * the answer to every block in it. A finished reasoning run therefore kept the live
+ * treatment — force-expanded rather than collapsible, shimmering, LOD-fold exempt,
+ * labelled with a scrolling live tail — until the turn persisted, which for a
+ * tool-calling turn is many seconds and several tool executions later.
+ *
+ * This exercises the REAL adapter (the layer both message lists share), because the
+ * unit test on `streaming-live-blocks` can only prove the predicate, not that the
+ * three visual consequences actually follow from it.
+ */
+
+import { beforeAll, describe, expect, it } from "bun:test";
+import { installCanvasStub } from "./measure/test-canvas-stub";
+import { type AdapterSegment, adaptSegment } from "./segment-adapter";
+
+beforeAll(() => {
+	installCanvasStub();
+});
+
+/** A reasoning body with a bold title, i.e. the structured (trace) shape. */
+const REASONING = { type: "reasoning", text: "**分析步骤**\n\n先读取相关文件确认现状。" };
+const TEXT = { type: "text", text: "我先定位这段逻辑。" };
+const TOOL = { type: "tool_use", id: "tu-1", name: "Read" };
+
+function liveSegment(
+	blocks: Record<string, unknown>[],
+	liveBlockIndex: number | undefined,
+): AdapterSegment {
+	return {
+		kind: "message",
+		msg: {
+			id: "__streaming__",
+			role: "assistant",
+			contentJson: blocks as never,
+			...(liveBlockIndex != null ? { liveBlockIndex } : {}),
+		},
+	};
+}
+
+/** The reasoning spec of an adapted assistant message (steps trace or plain card). */
+function reasoningSpec(seg: AdapterSegment, lod: 2 | 5) {
+	const specs = adaptSegment(seg, { lod });
+	return specs.find((spec) => spec.kind === "reasoning-steps" || spec.kind === "reasoning");
+}
+
+describe("live reasoning settles once the model produces later content", () => {
+	it("keeps the run live while it is the only thing streaming", () => {
+		const spec = reasoningSpec(liveSegment([REASONING], 0), 5);
+		expect(spec?.kind).toBe("reasoning-steps");
+		// The last step shimmers, marking it as the one still being written.
+		const steps = (spec?.data as { steps: { shimmer?: boolean }[] }).steps;
+		expect(steps.at(-1)?.shimmer).toBe(true);
+	});
+
+	it("stops shimmering as soon as answer text starts arriving", () => {
+		const spec = reasoningSpec(liveSegment([REASONING, TEXT], 1), 5);
+		const steps = (spec?.data as { steps: { shimmer?: boolean }[] }).steps;
+		expect(steps.every((step) => !step.shimmer)).toBe(true);
+	});
+
+	it("stops shimmering as soon as a tool call starts, before the turn persists", () => {
+		// The exact reported case: tools already executing, reasoning still "live".
+		const spec = reasoningSpec(liveSegment([REASONING, TOOL], -1), 5);
+		const steps = (spec?.data as { steps: { shimmer?: boolean }[] }).steps;
+		expect(steps.every((step) => !step.shimmer)).toBe(true);
+	});
+
+	it("rejoins the low-LOD titles-only fold once settled", () => {
+		// `titlesOnly` is suppressed for live reasoning (full live feedback) and applies
+		// to history. A finished run inside the un-persisted row belongs to history, so
+		// at L3/L4 it must fold like any other — this is the layout half of the bug.
+		const live = adaptSegment(liveSegment([REASONING], 0), { lod: 3 });
+		const settled = adaptSegment(liveSegment([REASONING, TOOL], -1), { lod: 3 });
+		const liveOpts = live.find((s) => s.kind === "reasoning-steps")?.opts as {
+			titlesOnly: boolean;
+		};
+		const settledOpts = settled.find((s) => s.kind === "reasoning-steps")?.opts as {
+			titlesOnly: boolean;
+		};
+		expect(liveOpts.titlesOnly).toBe(false);
+		expect(settledOpts.titlesOnly).toBe(true);
+	});
+
+	it("settles only the FINISHED run of an interleaved turn", () => {
+		// reasoning → tool → reasoning, where the second run is still being written.
+		// `buildStreamingMsg` appends the tool card AFTER both text lanes, so array
+		// position alone would name the wrong run — the accumulator stamp decides.
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: {
+				id: "__streaming__",
+				role: "assistant",
+				contentJson: [
+					REASONING,
+					{ type: "text", text: "先看第一处。" },
+					{ type: "reasoning", text: "**第二轮**\n\n再确认另一处实现。" },
+					TOOL,
+				] as never,
+				liveBlockIndex: 2,
+			},
+		};
+		const specs = adaptSegment(seg, { lod: 5 });
+		const runs = specs.filter((s) => s.kind === "reasoning-steps");
+		expect(runs).toHaveLength(2);
+		const shimmerOf = (spec: (typeof runs)[number] | undefined) =>
+			(spec?.data as { steps: { shimmer?: boolean }[] }).steps.some((step) => step.shimmer);
+		expect(shimmerOf(runs[0])).toBe(false);
+		expect(shimmerOf(runs[1])).toBe(true);
+	});
+
+	it("keeps a persisted message settled regardless of its shape", () => {
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: { id: "real-1", role: "assistant", contentJson: [REASONING] as never },
+		};
+		const spec = reasoningSpec(seg, 5);
+		const steps = (spec?.data as { steps: { shimmer?: boolean }[] }).steps;
+		expect(steps.every((step) => !step.shimmer)).toBe(true);
+	});
+});
+
+describe("the folded L1/L2 trace drops the live tail when a run settles", () => {
+	/** Adapt ONE folded reasoning row and read its live-tail label, if any. */
+	async function foldedRowTail(liveBlockIndex: number, blockIndex: number) {
+		const { adaptRenderUnits } = await import("./segment-adapter");
+		// A long body, so a live row would definitely carry a tail (short ones never do).
+		const longReasoning = { type: "reasoning", text: `**分析步骤**\n\n${"长文本".repeat(120)}` };
+		const msg = {
+			id: "__streaming__",
+			role: "assistant",
+			contentJson: [longReasoning, TOOL] as never,
+			liveBlockIndex,
+		};
+		const specs = adaptRenderUnits(
+			[
+				{
+					kind: "activity",
+					key: "activity-0",
+					items: [{ kind: "reasoning", msg, blockIndex, block: longReasoning }],
+					sourceMessages: [msg],
+				},
+			],
+			{ lod: 2 },
+		);
+		const trace = specs.find((s) => s.kind === "activity-trace");
+		const items = (trace?.data as { items: { liveTail?: unknown }[] }).items;
+		return items.map((item) => item.liveTail);
+	}
+
+	it("labels the row with a scrolling tail while it is being written", async () => {
+		const tails = await foldedRowTail(0, 0);
+		expect(tails.some((tail) => tail != null)).toBe(true);
+	});
+
+	it("drops the tail once a tool call proves the run finished", async () => {
+		// A settled row's title is correct and final, so a scrolling tail there is
+		// motion the reader cannot act on.
+		const tails = await foldedRowTail(-1, 0);
+		expect(tails.every((tail) => tail == null)).toBe(true);
+	});
+});

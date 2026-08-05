@@ -8,7 +8,6 @@
 
 ### 1.1 实际导出
 
-- `TRUST_TIERS`：`T0`、`T1`、`T2`、`T3`。
 - `SCOPE_TYPES`：`global`、`session`、`user`、`project`、`workspace`、`chapter`、`narrator`、`provider`、`device`。
 - `INVOCATION_SCOPE_TYPES`：`global`、`user`、`project`、`workspace`、`chapter`、`narrator`、`provider`、`device`。
 - `CAPABILITIES`：本文第 2 节的完整白名单。
@@ -113,18 +112,13 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 
 它对应 `global`、`user`、`project`、`workspace`、`chapter`、`narrator`、`provider`、`device` 八类 invocation scope。插件提供的 `scope` 只能从宿主当前上下文收窄，不能切换到另一个用户或资源。
 
-## 4. T0–T3 信任等级
+## 4. 信任等级（已撤销）
 
-信任等级使用 `TRUST_TIERS` 的四个规范值，并且与 capability grant、当前用户权限和 runner enforcement 分开保存。
+**[已撤销]** 原条款规定 `TRUST_TIERS` 四个规范值（`T0` core-compiled / `T1` official-or-organization-trusted / `T2` administrator-approved-third-party / `T3` unapproved-or-unknown），并把可执行性绑定到等级。该轴已随「安装即信任」原则移除，理由见 `../11-capability-policy.md` §3.7。
 
-| 等级 | `TRUST_TIER_DESCRIPTIONS` | 可执行性与运行位置 | 规范结论 |
-|---|---|---|---|
-| `T0` | `core-compiled` | 随 NarraFork 核心编译，在核心进程 | 不是可安装的第三方插件；可以访问核心内部实现，但不代表插件 API 授权。 |
-| `T1` | `official-or-organization-trusted` | 官方/组织可信插件，仍在独立受监管进程 | 可申请较宽 capability，但必须经过 Grant、当前 authority、scope、审计和 runner 检查。 |
-| `T2` | `administrator-approved-third-party` | 管理员批准的第三方插件，独立进程；高风险推荐或要求 Podman | 只获得多层交集；LocalProcessRunner 只能作为弱故障隔离，不能宣称为强安全沙箱。 |
-| `T3` | `unapproved-or-unknown` | 不得激活或执行 | 只允许读取包元数据、签名、摘要和静态 Manifest，不能获得 runtime、secret、事件订阅或 Host API。 |
+要点：一根有序轴同时编码了来源可信度、隔离强度和授权宽度三件互不相关的事，而这三者分别由签名验证、manifest 的 `engine.runner` 和 grant ∩ canonical adapter 决定。四级中 `T0` 不可达（核心代码不作为插件安装），`T1` 需要生产环境从未配置的 trust keyring；剩下 `T2`/`T3` 只是复述 admin-only 安装路由已经做过的决定。
 
-T1/T2 均不得通过配置切换为核心进程内插件。签名证明来源/完整性，不证明行为安全，也不自动启用或授予权限。Podman 是否对特定 T2 capability 强制使用仍是未决产品/运维决策，不在本文隐式接受。
+现存的边界见 `../11-capability-policy.md` §4：管理员安装门槛、canonical adapter 门禁、grant 列表即撤销状态、manifest 声明的 runner、B 类存活限制。
 
 ## 5. Effective intersection
 

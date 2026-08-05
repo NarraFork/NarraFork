@@ -10,7 +10,7 @@
  *   - error      → red    (a narrator hit an error)
  *   - waiting    → yellow (a narrator is waiting for permission)
  *   - unread     → green  (a narrator finished / has unread output)
- *   - reflecting → purple (a narrator is running an automated reflection gate)
+ *   - reflecting → teal (a narrator is running an automated reflection gate)
  *
  * Alerts are tracked per narrator.  The favicon shows the highest-severity
  * color among all active alerts (error > waiting > unread > reflecting).  An
@@ -33,9 +33,14 @@ const ALERT_SEVERITY: Record<FaviconAlertKind, number> = {
 };
 
 // Dot colors, matching the in-app narrator status palette (Mantine 6-shade):
-//   grape-6 / green-6 / yellow-6 / red-6.
+//   teal-6 / green-6 / yellow-6 / red-6.
+//
+// `reflecting` is orange to match `status-registry`'s substatus colour — a running gate
+// is interactive, so it joins the attention family (its shield SHAPE is what separates it
+// from a plain permission prompt). Keep these in sync: the favicon is the one place the
+// palette is hard-coded rather than read from CSS variables.
 const ALERT_COLOR: Record<FaviconAlertKind, string> = {
-	reflecting: "#be4bdb",
+	reflecting: "#fd7e14",
 	unread: "#40c057",
 	waiting: "#fab005",
 	error: "#fa5252",

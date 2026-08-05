@@ -118,6 +118,10 @@ export const PLUGIN_CAPABILITY_ADAPTER = {
 		descriptorId: "provider.refresh_catalog",
 		visibility: "integration",
 	},
+	// A search source executes against the provider contribution it binds to. It gets its own
+	// canonical descriptor rather than reusing `provider.use`, because this adapter must stay
+	// one-to-one reversible — two protocol strings mapping to one descriptor breaks that.
+	"search.provide": { descriptorId: "provider.search", visibility: "integration" },
 	"config.read_self": { descriptorId: "config.read", visibility: "integration" },
 	"config.write_self": { descriptorId: "config.write", visibility: "integration" },
 	"secret.use_self": { descriptorId: "secret.use", visibility: "integration" },

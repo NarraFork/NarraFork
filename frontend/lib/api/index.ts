@@ -155,7 +155,6 @@ export type {
 	PluginRuntimeState,
 	PluginStatusEnvelope,
 	PluginSummary,
-	PluginTrustTier,
 	PluginUiContributionItem,
 	PluginUiHealth,
 } from "./plugins";

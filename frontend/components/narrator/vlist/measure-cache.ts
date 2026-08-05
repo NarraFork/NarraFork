@@ -157,6 +157,17 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// rebuild serves the pre-update measured payload and the header keeps showing
 	// the OLD timeout even though the server already applied the new one.
 	if (typeof d.timeoutMs === "number") rev += `|to:${d.timeoutMs}`;
+	// Truncated-payload state. Height-AFFECTING (a non-zero count reserves the
+	// truncation notice row) and, more importantly, the ONLY key component that
+	// moves when a fetched payload lands: `status` is already terminal, and the
+	// detail body's own signature can legitimately stay put because a capped box
+	// only ever measures a bounded PREFIX — an 8KB preview and the 40KB full text
+	// slice to the same measured prefix. Without this the rebuild after the fetch
+	// hit the pre-fetch entry, so the card kept `truncatedLeafCount > 0`, the row
+	// stayed in the shell's in-flight set, and the notice read "loading full
+	// data…" forever. The nested (drilled-in trace row) path already keys it via
+	// `|tdn:` — this is the same contract for a standalone card.
+	if (typeof d.truncatedLeafCount === "number") rev += `|tp:${d.truncatedLeafCount}`;
 	rev += detailTextRevision(d.detail);
 	rev += reflectionRevision(d.reflection);
 	rev += subagentRevision(d);
@@ -205,6 +216,11 @@ function traceRevision(d: Record<string, unknown>): string {
 		if (typeof r.key === "string") rev += `|tk:${r.key}`;
 		if (typeof r.title === "string") rev += `|tt:${textSignature(r.title)}`;
 		if (typeof r.status === "string") rev += `|ts:${r.status}`;
+		// A gate's status is height-neutral but PAINTED from the cached payload (it picks
+		// the row's shimmer colour), so it needs keying for the same reason `status` does:
+		// a gate resolving does not necessarily move the tool's own status, and a stale
+		// entry would keep a settled row purple.
+		if (typeof r.reflectionStatus === "string") rev += `|trs:${r.reflectionStatus}`;
 		// The row's duration is height-neutral but PAINTED from the cached payload, so
 		// it needs the same treatment `timeoutMs` gets above. `status` normally moves
 		// with it (running → success arrives together with `durationMs`); this keys the

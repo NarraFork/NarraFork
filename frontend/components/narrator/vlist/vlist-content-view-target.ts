@@ -63,6 +63,19 @@ export interface VListViewTarget {
 	codeLangPath?: string;
 	/** `text` is only a prefix of the real body → the modal says so. */
 	truncated?: boolean;
+	/**
+	 * The ROW can swap this markdown body for its raw source IN PLACE.
+	 *
+	 * The inline action bar's source/rendered toggle is gated on this, because that
+	 * button only flips shell state — the row's renderer has to actually honour it.
+	 * A body whose renderer cannot (a collapsed reasoning header paints no body at
+	 * all) would otherwise offer a control that changes nothing on screen.
+	 *
+	 * Absent → the toggle is hidden from the bar only; the fullscreen modal still
+	 * offers it, since the modal renders the text itself and never depends on the
+	 * row.
+	 */
+	sourceInline?: boolean;
 }
 
 /** Localized strings this module needs; a subset of `VListRenderLabels`. */
@@ -168,6 +181,10 @@ function markdownTarget(
 		kind: "markdown",
 		...(title ? { title } : {}),
 		text: body,
+		// A tool card's markdown body lives in a measure-fixed, internally scrolling
+		// box, and both renderers (CappedMarkdownBody / MarkdownDetailBody) already
+		// swap it for the raw source, so the inline toggle is real here.
+		sourceInline: true,
 	};
 }
 
@@ -331,6 +348,9 @@ export function resolveSubagentViewTargets(
 			kind: "markdown",
 			...(opts.title ? { title: opts.title } : {}),
 			text: resultText,
+			// SubagentBody paints the result inside a capped scroll box and honours
+			// `isSourceShown` there, so the inline toggle has a real effect.
+			sourceInline: true,
 		});
 	}
 	return out;
@@ -347,13 +367,23 @@ export function resolveSubagentViewTargets(
 export function resolveRowViewTargets(
 	spec: Pick<ElementSpec, "kind" | "key" | "data" | "opts">,
 	labels?: VListViewTargetLabels,
+	opts?: RowViewTargetOptions,
 ): VListViewTarget[] {
+	const inline = opts?.sourceInline === true ? { sourceInline: true as const } : {};
 	if (spec.kind === "markdown") {
 		// markdownData() returns the block text directly.
 		const body = text(spec.data);
 		// No title: the chunked path's assistant ContentViewer passes none either.
 		return body
-			? [{ id: `${spec.key}:${BODY_SLOT}`, slot: BODY_SLOT, kind: "markdown", text: body }]
+			? [
+					{
+						id: `${spec.key}:${BODY_SLOT}`,
+						slot: BODY_SLOT,
+						kind: "markdown",
+						text: body,
+						...inline,
+					},
+				]
 			: [];
 	}
 	if (spec.kind === "reasoning") {
@@ -371,10 +401,24 @@ export function resolveRowViewTargets(
 				kind: "markdown",
 				...(title ? { title } : {}),
 				text: body,
+				...inline,
 			},
 		];
 	}
 	return [];
+}
+
+/** Caller-supplied render capabilities for a plain content row's body. */
+export interface RowViewTargetOptions {
+	/**
+	 * This row's renderer will honour an in-place source view.
+	 *
+	 * Declared by the CALLER because it depends on the MEASURED form, which this
+	 * module never sees: a markdown row always paints its body, while a reasoning
+	 * row paints one only in the expanded form — a collapsed header has nowhere to
+	 * put the raw text, so offering the toggle there would be a dead control.
+	 */
+	sourceInline?: boolean;
 }
 
 /**

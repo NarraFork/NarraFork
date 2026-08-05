@@ -72,7 +72,6 @@ function routes(views: Array<Record<string, unknown>>) {
 				desiredState: "enabled",
 				compatibility: "compatible",
 				current: { version, hash },
-				trustTier: "T2" as const,
 			}),
 			getPermissions: async () => ({
 				revision: 1,

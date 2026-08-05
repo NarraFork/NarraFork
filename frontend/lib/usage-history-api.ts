@@ -1,4 +1,5 @@
 import type {
+	CredentialTotalsResponse,
 	UsageHistoryCursorListResponse,
 	UsageHistoryFilters,
 	UsageHistoryGranularity,
@@ -25,6 +26,7 @@ function appendUsageHistoryFilters(params: URLSearchParams, filters: UsageHistor
 	if (filters.chapterId) params.append("chapterId", filters.chapterId);
 	if (filters.projectId) params.append("projectId", filters.projectId);
 	if (filters.provider) params.append("provider", filters.provider);
+	if (filters.credentialId) params.append("credentialId", filters.credentialId);
 	if (filters.model) params.append("model", filters.model);
 	if (filters.kind) params.append("kind", filters.kind);
 	if (filters.startDate) params.append("startDate", filters.startDate);
@@ -91,6 +93,21 @@ export const usageHistoryApi = {
 	 */
 	async listProviders(): Promise<UsageHistoryProvidersResponse> {
 		return fetchJson("/api/usage-history/providers");
+	},
+
+	/**
+	 * 按凭据聚合的终生 token/成本累计。
+	 *
+	 * 数据来自 credential_usage_totals，不随叙述者删除而消失。注意该表只覆盖
+	 * 不在此表内，因此这里的数字不是整个部署的总账。
+	 */
+	async getCredentialTotals(
+		provider: string,
+		options: { limit?: number; signal?: AbortSignal } = {},
+	): Promise<CredentialTotalsResponse> {
+		const params = new URLSearchParams({ provider });
+		if (options.limit) params.append("limit", options.limit.toString());
+		return fetchJson(`/api/usage-history/credential-totals?${params.toString()}`, options.signal);
 	},
 
 	/**

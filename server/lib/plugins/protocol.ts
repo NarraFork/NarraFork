@@ -822,6 +822,189 @@ export type CommandSecretWrite = z.infer<typeof commandSecretWriteSchema>;
 export type CommandsInvokeParams = z.infer<typeof commandsInvokeParamsSchema>;
 export type CommandsInvokeResult = z.infer<typeof commandsInvokeResultSchema>;
 
+/* -------------------------------------------------------------------------- */
+/* Host → Plugin: provider.search                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `provider.search` runs one web search through a `contributes.searchProviders` source.
+ *
+ * Deliberately **unary**, unlike `provider.chat`: there is no accepted/event/done triple and
+ * no operation id. The host's search layer (`server/lib/search/router.ts`) awaits a single
+ * text or result list per channel and falls through to the next channel on failure, so a
+ * streaming protocol would have nothing to stream into. If incremental results are ever
+ * wanted, that is a new method rather than an extension of this one.
+ *
+ * Like `commands.invoke` this is a *Host→Plugin* method: it does not belong in
+ * `PLUGIN_TO_HOST_REQUEST_METHODS` or the iframe method inventory, so the parity assertion
+ * that freezes those two lists is unaffected.
+ *
+ * Credentials arrive the same way they do for `provider.chat` — resolved from the vault by
+ * the host and passed in `config` per request. The fields belong to the *bound provider*
+ * contribution (`searchProviders[].providerId`), because search has no vault namespace of
+ * its own; see `searchProviderContributionSchema` in `manifest.ts`.
+ */
+export const PROVIDER_SEARCH_METHOD = "provider.search" as const;
+
+/**
+ * Outbound network hints the host attaches to every provider method call.
+ *
+ * ## Design rationale
+ *
+ * The host resolves proxy config from its own settings and delivers it per-RPC-call rather than
+ * via environment variables (`SAFE_ENV_KEYS`). The rejected alternative — adding `*_PROXY` to
+ * `SAFE_ENV_KEYS` — grants all plugins unconditional proxy inheritance at process level, which
+ * is a wider authorization surface that bypasses per-call control. The RPC-parameter approach
+ * means the host decides *per request* whether proxy should apply, which fields carry
+ * credentials are explicit, and no proxy appears in env dumps or diagnostics.
+ *
+ * ## Security: proxy URLs may contain credentials
+ *
+ * A proxy URL like `http://user:pass@host:port` is secret-grade. It MUST NOT appear in:
+ * - Diagnostic dumps (`ProviderRpcDiagnostics`)
+ * - Operation logs (request/response logging paths)
+ * - `provider.event` stream (WebSocket broadcast)
+ * - WebSocket or SSE payloads sent to the frontend
+ *
+ * The host strips `outbound` from any logged/diagnostic representation of the request.
+ *
+ * ## When absent
+ *
+ * When no proxy is configured, the field is omitted entirely. An absent field means
+ * "the host has no proxy policy for you; use your own default". An explicit empty string
+ * would mean "direct connect, bypass any default", which is a different semantic — so the
+ * host never sends an empty string.
+ */
+export const providerOutboundHintsSchema = z
+	.object({
+		/**
+		 * HTTP(S) proxy URL the plugin should use for upstream API calls.
+		 *
+		 * May contain credentials (userinfo). Treat as secret.
+		 * Absent = no proxy policy from the host. Empty string is never sent.
+		 */
+		proxyUrl: z.string().trim().min(1).max(2_048).optional(),
+	})
+	.strict();
+
+/**
+ * Concurrency budget hint the host attaches to streaming provider methods.
+ *
+ * ## Design rationale
+ *
+ * The host already enforces a hard ceiling via `descriptor.limits.maxConcurrentChat` — it
+ * simply rejects requests above that count. But that only limits plugin-to-host concurrency;
+ * it does not prevent the plugin from opening more connections *to the upstream API* than the
+ * shared account can tolerate (free-tier 429s, rate-limit bans).
+ *
+ * This hint tells the plugin how many concurrent upstream connections it should open. The
+ * host cannot enforce this (the plugin process makes its own TCP connections), so this is a
+ * cooperative protocol, documented honestly here. A well-behaved plugin should use this to
+ * cap its own outbound semaphore/pool.
+ *
+ * ## Distinction from maxConcurrentChat
+ *
+ * `maxConcurrentChat` (in descriptor.limits) = host-side hard limit; host REJECTS over-budget.
+ * `concurrencyBudget` (in request params) = hint to plugin; plugin SHOULD self-throttle.
+ *
+ * ## When absent
+ *
+ * Absent means the host has no opinion on upstream concurrency. The plugin should fall back
+ * to its own default (typically the value it declares in `descriptor.limits.maxConcurrentChat`).
+ */
+export const providerConcurrencyBudgetSchema = z
+	.object({
+		/**
+		 * Maximum concurrent upstream API connections this plugin should maintain.
+		 *
+		 * This is a hint, not enforcement. The host cannot prevent the plugin from exceeding it.
+		 * A plugin sharing an account with the host's built-in provider should respect this to
+		 * avoid aggregate 429s.
+		 *
+		 * ## Current delivery status
+		 *
+		 * The host does NOT currently populate this field. The only per-provider concurrency
+		 * value the host knows is `descriptor.limits.maxConcurrentChat`, which the plugin itself
+		 * declared — sending it back would be pure noise since the plugin already has it.
+		 *
+		 * Meaningful delivery requires the host to know how much of a shared upstream quota is
+		 * not leak into the generic plugin protocol. When a cross-path budget coordination
+		 * mechanism exists, this field becomes the delivery vehicle.
+		 */
+		maxConcurrentUpstream: z.number().int().min(1).max(1_000).optional(),
+	})
+	.strict();
+
+/**
+ * Combined host-provided hints attached to every provider method request.
+ *
+ * Optional at the top level: old plugins that do not understand these fields simply ignore them
+ * (the schema is additive, .strict() is on the inner objects). The host omits the entire field
+ * when there is nothing to communicate.
+ */
+export const providerHostHintsSchema = z
+	.object({
+		outbound: providerOutboundHintsSchema.optional(),
+		concurrency: providerConcurrencyBudgetSchema.optional(),
+	})
+	.strict();
+
+export type ProviderOutboundHints = z.infer<typeof providerOutboundHintsSchema>;
+export type ProviderConcurrencyBudget = z.infer<typeof providerConcurrencyBudgetSchema>;
+export type ProviderHostHints = z.infer<typeof providerHostHintsSchema>;
+
+export const providerSearchParamsSchema = z
+	.object({
+		protocolVersion: z.string().trim().min(1).max(32),
+		/** Search contribution to run. Namespaced by the plugin's own manifest. */
+		contributionId: z.string().trim().min(1).max(128),
+		/** Resolved config of the bound provider contribution, secrets included. */
+		config: jsonObjectSchema.optional(),
+		query: z.string().trim().min(1).max(4_000),
+		/** Present only for channels the host runs with a stated research goal. */
+		purpose: z.string().max(4_000).optional(),
+		allowedDomains: z.array(z.string().trim().min(1).max(253)).max(64).optional(),
+		blockedDomains: z.array(z.string().trim().min(1).max(253)).max(64).optional(),
+		recencyDays: z.number().int().min(1).max(3_650).optional(),
+		maxResults: z.number().int().min(1).max(100).optional(),
+		locale: z.string().trim().min(1).max(32).optional(),
+		/** Host-provided network and concurrency hints. Absent = no hints. */
+		hostHints: providerHostHintsSchema.optional(),
+	})
+	.strict();
+
+/**
+ * A single search hit. Field names mirror the host's own `SearchResultItem`
+ * (`server/lib/search/types.ts`) so the host can render them with the same helper it uses
+ * for built-in adapters.
+ */
+export const providerSearchResultItemSchema = z
+	.object({
+		title: z.string().max(1_000).optional(),
+		url: z.string().max(2_048).optional(),
+		snippet: z.string().max(8_000).optional(),
+		publishedAt: z.string().max(64).optional(),
+		source: z.string().max(200).optional(),
+	})
+	.strict();
+
+export const providerSearchResultSchema = z
+	.object({
+		/** Rendered answer. Optional when `results` is present: the host can render those itself. */
+		text: z.string().max(1_000_000).optional(),
+		results: z.array(providerSearchResultItemSchema).max(100).optional(),
+	})
+	.strict()
+	.refine((result) => !!result.text?.length || !!result.results?.length, {
+		// An empty response would otherwise register as a successful search with no content,
+		// stopping the router's fallback chain at a channel that returned nothing.
+		message: "provider.search result must carry text or results",
+	});
+
+export type ProviderSearchParams = z.infer<typeof providerSearchParamsSchema>;
+export type ProviderSearchResultItem = z.infer<typeof providerSearchResultItemSchema>;
+export type ProviderSearchResult = z.infer<typeof providerSearchResultSchema>;
+
 export const providerDoneSchema = providerEventSchema.refine(
 	(message) => message.params.event.type === "done",
 	{ message: "provider.event must contain a done event" },

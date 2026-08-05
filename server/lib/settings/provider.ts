@@ -1016,7 +1016,30 @@ export function getBuiltinModelContextWindows(
 	return result;
 }
 
-export function getModelContextWindow(model: string, provider: string): number | null {
+/**
+ * Where an effective context window came from, in descending priority.
+ *
+ * - `user`: a per-model override typed in settings (agent.modelContextWindows)
+ * - `provider`: the provider's own `defaultContextWindow` field
+ * - `catalog`: model metadata reported by a gateway (NUG model catalog)
+ * - `builtin`: NarraFork's built-in model table (exact or fuzzy match)
+ * - `fallback`: nothing matched, the 128k default
+ *
+ * Callers that apply a capability floor (e.g. Anthropic's 1M official-API
+ * window) must skip the floor for `user` / `provider` so an explicitly
+ * configured smaller window is not silently overridden.
+ */
+export type ModelContextWindowSource = "user" | "provider" | "catalog" | "builtin" | "fallback";
+
+export interface ModelContextWindowResolution {
+	contextWindow: number;
+	source: ModelContextWindowSource;
+}
+
+export function resolveModelContextWindow(
+	model: string,
+	provider: string,
+): ModelContextWindowResolution {
 	// Defensive: callers may pass a meta-model reference instead of a concrete
 	// model — either the follow-default sentinel or an aggregation value. When an
 	// aggregation value (`__agg__:<id>`) is split into provider/model halves by a
@@ -1035,7 +1058,7 @@ export function getModelContextWindow(model: string, provider: string): number |
 		const concrete = resolveMetaModelForLookup(metaRef);
 		if (concrete && concrete !== metaRef) {
 			const parsed = parseModelId(concrete);
-			return getModelContextWindow(parsed.model, parsed.provider ?? "");
+			return resolveModelContextWindow(parsed.model, parsed.provider ?? "");
 		}
 	}
 
@@ -1045,35 +1068,41 @@ export function getModelContextWindow(model: string, provider: string): number |
 	// 0. Check per-model user overrides (highest priority)
 	const userOverrides = s().agent.modelContextWindows ?? {};
 	if (userOverrides[fullModelValue]) {
-		return userOverrides[fullModelValue];
+		return { contextWindow: userOverrides[fullModelValue], source: "user" };
 	}
 	if (model !== fullModelValue && userOverrides[model]) {
-		return userOverrides[model];
+		return { contextWindow: userOverrides[model], source: "user" };
 	}
 
 	// 1. Check NUG model-catalog metadata. NUG model ids often include a
 	// channel prefix (e.g. antigravity:claude-opus-4-6-thinking), so the
 	// built-in model table alone would otherwise miss them and fall back to 128k.
 	const nugContextWindow = getNugModelContextWindow(model, provider);
-	if (nugContextWindow) return nugContextWindow;
+	if (nugContextWindow) return { contextWindow: nugContextWindow, source: "catalog" };
 
 	// 2. Check provider configuration
 		const oaiConfig = getOpenaiProviderConfig(provider);
 		if (oaiConfig?.defaultContextWindow) {
-			return oaiConfig.defaultContextWindow;
+			return { contextWindow: oaiConfig.defaultContextWindow, source: "provider" };
 		}
 		const anthropicConfig = getAnthropicProviderConfig(provider);
 		if (anthropicConfig?.defaultContextWindow) {
-			return anthropicConfig.defaultContextWindow;
+			return { contextWindow: anthropicConfig.defaultContextWindow, source: "provider" };
 		}
 		const geminiConfig = getGeminiProviderConfig(provider);
 		if (geminiConfig?.defaultContextWindow) {
-			return geminiConfig.defaultContextWindow;
+			return { contextWindow: geminiConfig.defaultContextWindow, source: "provider" };
 		}
 	}
 
 	// 3. Check built-in table and fuzzy matches
-	return getBuiltinModelContextWindow(model) ?? 128_000;
+	const builtin = getBuiltinModelContextWindow(model);
+	if (builtin) return { contextWindow: builtin, source: "builtin" };
+	return { contextWindow: 128_000, source: "fallback" };
+}
+
+export function getModelContextWindow(model: string, provider: string): number | null {
+	return resolveModelContextWindow(model, provider).contextWindow;
 }
 
 /** Threshold above which a model is considered "large context". */

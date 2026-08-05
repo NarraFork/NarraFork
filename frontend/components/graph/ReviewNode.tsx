@@ -154,7 +154,7 @@ function ReviewNodeInner({ data, id }: NodeProps) {
 								width: 6,
 								height: 6,
 								borderRadius: "50%",
-								background: `var(--mantine-color-${narratorDisplay.color}-5)`,
+								background: statusRegistry.accentVar(narratorDisplay, 5),
 							}}
 						/>
 						<Text size="xs" c="dimmed">

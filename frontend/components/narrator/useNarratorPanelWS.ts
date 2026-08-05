@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
+import { statusRegistry } from "../../lib/status-registry";
 import { localizeNarratorError } from "./error-localization";
 import {
 	isActiveReflectionPermissionLike,
@@ -1118,7 +1119,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					id: `model-unavailable-${narratorId}`,
 					title: t("modelUnavailableWaitingTitle"),
 					message: t("modelUnavailableWaitingDesc", { model: info.model }),
-					color: "yellow",
+					// Blue-toned neutral, not yellow: nothing here is actionable.
+					color: statusRegistry.accentColor(statusRegistry.narratorSubstatus("model_unavailable")),
 					autoClose: false,
 				});
 			},

@@ -97,7 +97,11 @@ describe("a live tool becomes a card while its arguments are still being written
 		expect(built.items.some((item) => item.spec.kind === "markdown")).toBe(true);
 	});
 
-	it("renders a running card with its resolved input once the tool starts", async () => {
+	it("renders the resolved input as soon as the arguments are complete", async () => {
+		// `tool_started` means the INPUT finished parsing — the card must show the real
+		// command immediately. Its status is `initializing`, not `running`: the permission
+		// gate has not been passed yet, so claiming execution here is what used to animate
+		// an about-to-prompt card as though it were working.
 		const mod = await load();
 		const store = mod.createStreamingToolStore();
 		mod.applyStreamingToolChunk(store, {
@@ -111,6 +115,23 @@ describe("a live tool becomes a card while its arguments are still being written
 			input: { command: "npm run build" },
 		});
 		const row = toolRow(layoutRow(mod, store, "started-1"));
+		const data = row?.spec.data as { status?: string; summary?: string };
+		expect(data.status).toBe("initializing");
+		expect(data.summary).toBe("npm run build");
+	});
+
+	it("becomes a RUNNING card once execution actually begins", async () => {
+		// `tool_executing` is the frame that earns the blue "executing" treatment, and it
+		// must not disturb the input the previous frame resolved.
+		const mod = await load();
+		const store = mod.createStreamingToolStore();
+		mod.applyStreamingToolStarted(store, {
+			toolUseId: "t1",
+			toolName: "Bash",
+			input: { command: "npm run build" },
+		});
+		mod.applyStreamingToolExecuting(store, { toolUseId: "t1" });
+		const row = toolRow(layoutRow(mod, store, "exec-1"));
 		const data = row?.spec.data as { status?: string; summary?: string };
 		expect(data.status).toBe("running");
 		expect(data.summary).toBe("npm run build");

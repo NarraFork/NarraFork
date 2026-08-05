@@ -234,6 +234,18 @@ describe("render-registry dispatch", () => {
 		expect((props as { fullPayloadLoading?: boolean }).fullPayloadLoading).toBe(true);
 	});
 
+	it("hands plain content rows their source toggle (else 'view source' is inert)", () => {
+		// The dispatch used to drop these, so a markdown / reasoning row's action bar
+		// flipped shell state that no renderer read: the button lit up and the text on
+		// screen never changed. Asserted on the forwarded props, which is the hole.
+		for (const kind of ["markdown", "reasoning"] as const) {
+			const node = renderElement(kind, STUB, { showSource: true, sourceText: "# raw" });
+			const props = isValidElement(node) ? (node as React.ReactElement).props : {};
+			expect((props as { showSource?: boolean }).showSource).toBe(true);
+			expect((props as { sourceText?: string }).sourceText).toBe("# raw");
+		}
+	});
+
 	it("hands the card + subagent bodies their fullscreen-viewer wiring", () => {
 		// Same dispatch hole: without these forwards every body inside a tool or
 		// subagent card lost its hover action bar (copy / wrap / source / fullscreen),

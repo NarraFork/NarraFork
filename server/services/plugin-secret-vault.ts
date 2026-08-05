@@ -257,6 +257,28 @@ export class PluginSecretVault {
 		const document = await this.load();
 		return Object.keys(document.secrets[pluginId] ?? {}).sort();
 	}
+
+	/**
+	 * Key names already in memory, or `undefined` when the vault has not been read yet.
+	 *
+	 * Exists for one caller shape: deciding whether a credential is present on a synchronous
+	 * hot path. `getNormalizedSearchChannels()` runs on every tool execution and every
+	 * provider request-body build, so the plugin search registry cannot await a vault read
+	 * there. The document is loaded once and then kept (writes replace it), so after any
+	 * earlier vault access this answers exactly; before that it answers "unknown" and the
+	 * caller decides what to assume.
+	 *
+	 * Returns key names only, never values.
+	 */
+	peekKeys(pluginId: string): string[] | undefined {
+		if (!this.document) return undefined;
+		return Object.keys(this.document.secrets[pluginId] ?? {});
+	}
+
+	/** Load the vault into memory so `peekKeys` can answer. Safe to call repeatedly. */
+	async warm(): Promise<void> {
+		await this.load();
+	}
 }
 
 /** Shared vault instance used by the platform services graph. */

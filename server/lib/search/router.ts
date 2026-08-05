@@ -17,6 +17,7 @@ import {
 	supportsNativeSearch,
 	usesSideRequestNativeSearch,
 } from "./native";
+import { executeExtraSearchChannel, findExtraSearchChannel } from "./plugin-source";
 import {
 	DEFAULT_SEARCH_MAX_OUTPUT_CHARS,
 	DEFAULT_SEARCH_TIMEOUT_MS,
@@ -53,6 +54,10 @@ function channelLabel(channel: SearchChannelConfig, config: NarraForkSettings = 
 			return `Custom: ${findCustomProvider(channel, config)?.name ?? channel.providerId ?? channel.id}`;
 		case "subagent":
 			return "Search subagent";
+		case "plugin":
+			// The owning source resolves the plugin and contribution titles; the settings
+			// object knows nothing about plugin contributions.
+			return findExtraSearchChannel(channel.id)?.label ?? channel.id;
 	}
 }
 
@@ -202,11 +207,14 @@ async function nativeSideRequestSearch(
 }
 
 function channelTimeout(channel: SearchChannelConfig): number {
-	const providerTimeout =
-		channel.kind === "custom-api" ? findCustomProvider(channel)?.timeoutMs : undefined;
+	let declaredTimeout: number | undefined;
+	if (channel.kind === "custom-api") declaredTimeout = findCustomProvider(channel)?.timeoutMs;
+	// A plugin declares its timeout in the manifest rather than in host settings.
+	else if (channel.kind === "plugin")
+		declaredTimeout = findExtraSearchChannel(channel.id)?.timeoutMs;
 	return (
 		channel.timeoutMs ??
-		providerTimeout ??
+		declaredTimeout ??
 		settings.search?.defaultTimeoutMs ??
 		DEFAULT_SEARCH_TIMEOUT_MS
 	);
@@ -243,6 +251,17 @@ async function runChannel(
 				channelTimeout(channel),
 			);
 		}
+		case "plugin":
+			return withSearchTimeout(
+				request.signal,
+				async (signal) => {
+					const result = await executeExtraSearchChannel(channel.id, request, signal);
+					// The source returns the channel id it was given; keep the router's own
+					// label so a stale registry entry cannot relabel the attempt record.
+					return { ...result, channelId: channel.id, channelLabel: channelLabel(channel) };
+				},
+				channelTimeout(channel),
+			);
 		case "subagent":
 			return searchSubagent(channel, request);
 		case "native":
@@ -265,6 +284,10 @@ function isPotentiallyUsableFunctionChannel(channel: SearchChannelConfig): boole
 			const provider = findCustomProvider(channel);
 			return isCustomSearchProviderUsable(provider);
 		}
+		case "plugin":
+			// Synchronous registry read: the source already computed availability from the
+			// plugin's lifecycle state and stored config.
+			return findExtraSearchChannel(channel.id)?.available === true;
 		case "subagent":
 			return isSubagentChannelUsable(channel);
 		case "native":

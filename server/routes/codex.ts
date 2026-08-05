@@ -19,11 +19,30 @@ import {
 	codexUseWebSocketSchema,
 } from "../lib/validators";
 import { requireAdmin, requireAuth } from "../middleware/auth";
+import {
+	deleteCredentialUsageTotals,
+	getCredentialUsageTotals,
+	listProviderCredentialTotals,
+	serializeCredentialUsageSummary,
+	serializeCredentialUsageTotalsList,
+} from "../services/credential-usage-totals";
 
 export const codexRoutes = new Hono();
 
 function isCodexLoadBalancingMode(mode: unknown): mode is LoadBalancingMode {
 	return mode === "priority" || mode === "balanced" || mode === "tier-balanced";
+}
+
+/**
+ * Drop the lifetime usage rollup for deleted credentials.
+ *
+ * Only on real deletion: archiving keeps the totals, which is the point of
+ * having an archive state at all.
+ */
+function dropCodexUsageTotals(ids: string[]): void {
+	for (const id of ids) {
+		deleteCredentialUsageTotals("codex", id);
+	}
 }
 
 const REFRESH_TOKEN_SEARCH_PATTERN = /rt_[A-Za-z0-9._-]+/g;
@@ -166,9 +185,15 @@ codexRoutes.get("/status", (c) => {
 
 	const availablePage = Number(c.req.query("availablePage")) || undefined;
 	const unavailablePage = Number(c.req.query("unavailablePage")) || undefined;
+	const archivedPage = Number(c.req.query("archivedPage")) || undefined;
 	const pageSize = Number(c.req.query("pageSize")) || undefined;
 
-	const snapshot = manager.snapshot({ availablePage, unavailablePage, pageSize });
+	const snapshot = manager.snapshot({
+		availablePage,
+		unavailablePage,
+		archivedPage,
+		pageSize,
+	});
 
 	return c.json({
 		...snapshot,
@@ -330,12 +355,47 @@ codexRoutes.post("/credentials/:id/reset", (c) => {
 });
 
 /**
+ * POST /api/codex/credentials/:id/archive
+ * Retire a credential from the pool while keeping its usage data and stats.
+ */
+codexRoutes.post("/credentials/:id/archive", (c) => {
+	const id = c.req.param("id");
+	const manager = getCodexManager();
+	try {
+		manager.archiveCredential(id);
+		return c.json({ ok: true });
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return c.json({ error: msg }, 404);
+	}
+});
+
+/**
+ * POST /api/codex/credentials/:id/unarchive
+ * Bring an archived credential back into the pool.
+ */
+codexRoutes.post("/credentials/:id/unarchive", (c) => {
+	const id = c.req.param("id");
+	const manager = getCodexManager();
+	try {
+		manager.unarchiveCredential(id);
+		return c.json({ ok: true });
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return c.json({ error: msg }, 404);
+	}
+});
+
+/**
  * DELETE /api/codex/credentials/unhealthy
  * Remove all credentials disabled for too many failures or banned status.
+ * Archived credentials are never touched: archiving is the explicit
+ * "retire but keep the data" action.
  */
 codexRoutes.delete("/credentials/unhealthy", (c) => {
 	const manager = getCodexManager();
 	const result = manager.removeUnhealthyCredentials();
+	dropCodexUsageTotals(result.removed);
 	return c.json(result);
 });
 
@@ -351,6 +411,7 @@ codexRoutes.delete("/credentials/batch", async (c) => {
 	}
 	const manager = getCodexManager();
 	const result = manager.removeCredentials(ids);
+	dropCodexUsageTotals(result.removed);
 	return c.json(result);
 });
 
@@ -363,11 +424,41 @@ codexRoutes.delete("/credentials/:id", (c) => {
 	const manager = getCodexManager();
 	try {
 		manager.removeCredential(id);
+		dropCodexUsageTotals([id]);
 		return c.json({ ok: true });
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		return c.json({ error: msg }, 404);
 	}
+});
+
+/**
+ * GET /api/codex/credentials/usage-stats
+ * Lifetime totals for every Codex credential, aggregated per credential.
+ *
+ * Registered before the `:id` variant so the literal path wins the match.
+ */
+codexRoutes.get("/credentials/usage-stats", (c) => {
+	return c.json({
+		entries: serializeCredentialUsageTotalsList(listProviderCredentialTotals("codex")),
+	});
+});
+
+/**
+ * GET /api/codex/credentials/:id/usage-stats
+ * Lifetime token/cost totals for one credential, broken down by model.
+ *
+ * These survive narrator deletion (unlike `api_requests`) and archiving, so
+ * they answer "how much has this account consumed overall". Costs are USD at
+ * official reference prices — for a ChatGPT subscription that is equivalent
+ * consumption, not an amount billed.
+ *
+ * The top-level figures always cover every model; `byModel` is capped and sets
+ * `byModelTruncated` when the credential has used more models than it returns.
+ */
+codexRoutes.get("/credentials/:id/usage-stats", (c) => {
+	const id = c.req.param("id");
+	return c.json(serializeCredentialUsageSummary(getCredentialUsageTotals("codex", id)));
 });
 
 /**

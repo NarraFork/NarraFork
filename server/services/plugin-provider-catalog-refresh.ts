@@ -25,7 +25,10 @@ import type {
 	ProviderModelDescriptor,
 	ProviderRegistryEntry,
 } from "./plugin-provider-registry";
-import type { ProviderModelDescriptor as RpcModelDescriptor } from "./plugin-provider-rpc";
+import type {
+	ProviderHostHints,
+	ProviderModelDescriptor as RpcModelDescriptor,
+} from "./plugin-provider-rpc";
 
 /**
  * Hard ceiling on pages followed in one refresh. With the protocol's 200-model page
@@ -58,6 +61,14 @@ export interface PluginProviderCatalogRefresherOptions {
 	 * plain config when omitted.
 	 */
 	resolveConfig?: (providerInstanceId: string) => Promise<Record<string, JsonValue>>;
+	/**
+	 * Resolve host-provided hints (proxy URL, concurrency budget) for listModels requests.
+	 *
+	 * Without this, model discovery in proxy-required environments fails even when chat
+	 * works fine — the adapter factory has its own resolver but this code path is separate.
+	 * Returns undefined when there is nothing to communicate.
+	 */
+	resolveHostHints?: () => ProviderHostHints | undefined;
 }
 
 /**
@@ -109,6 +120,7 @@ export class PluginProviderCatalogRefresher {
 	private readonly resolveConfig?: (
 		providerInstanceId: string,
 	) => Promise<Record<string, JsonValue>>;
+	private readonly resolveHostHints?: () => ProviderHostHints | undefined;
 	private readonly inFlight = new Map<string, Promise<ProviderCatalogRefreshResult>>();
 
 	constructor(options: PluginProviderCatalogRefresherOptions) {
@@ -116,6 +128,7 @@ export class PluginProviderCatalogRefresher {
 		this.clientPool = options.clientPool;
 		this.maxPages = Math.max(1, options.maxPages ?? MAX_CATALOG_PAGES);
 		if (options.resolveConfig) this.resolveConfig = options.resolveConfig;
+		if (options.resolveHostHints) this.resolveHostHints = options.resolveHostHints;
 	}
 
 	/**
@@ -215,6 +228,9 @@ export class PluginProviderCatalogRefresher {
 				? await this.resolveConfig(entry.providerInstanceId)
 				: this.registry.getConfig(entry.providerInstanceId);
 
+			// Resolve once per refresh — same proxy applies to all pages of one logical operation.
+			const hostHints = this.resolveHostHints?.();
+
 			for (let page = 0; page < this.maxPages; page += 1) {
 				const catalog = await client.listModels(
 					{
@@ -223,6 +239,7 @@ export class PluginProviderCatalogRefresher {
 						config,
 						...(cursor ? { cursor } : {}),
 						...(options.force ? { refresh: true } : {}),
+						...(hostHints ? { hostHints } : {}),
 					},
 					options.signal,
 				);

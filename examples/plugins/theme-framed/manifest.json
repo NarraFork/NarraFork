@@ -1,0 +1,86 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.framed",
+	"version": "1.0.0",
+	"displayName": "Framed (Nine-Slice)",
+	"description": "A theme-only plugin that paints a packaged nine-slice bitmap as the border of controlled host targets (buttons, cards, inputs, panels). Demonstrates border-image frames declared purely as whitelisted design tokens; the host compiles them into scoped CSS that repaints without reserving layout space.",
+	"publisher": { "id": "com.example", "name": "Example Team" },
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": [],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"activationEvents": [],
+	"contributes": {
+		"providers": [],
+		"tools": [],
+		"commands": [],
+		"events": [],
+		"views": [],
+		"themes": [
+			{
+				"id": "framed",
+				"title": "Framed (Nine-Slice)",
+				"colorScheme": "both",
+				"tokens": {
+					"primaryColor": "#c8a44e",
+					"radius": "2px",
+					"frames": {
+						"button": {
+							"image": "assets/frame.png",
+							"slice": 16,
+							"width": 6,
+							"repeat": "stretch"
+						},
+						"actionIcon": {
+							"image": "assets/frame.png",
+							"slice": 16,
+							"width": 5,
+							"repeat": "stretch"
+						},
+						"input": {
+							"image": "assets/frame.png",
+							"slice": 16,
+							"width": 5,
+							"repeat": "stretch"
+						},
+						"card": {
+							"image": "assets/frame.png",
+							"slice": 16,
+							"width": 14,
+							"repeat": "round"
+						},
+						"modal": {
+							"image": "assets/frame.png",
+							"slice": 16,
+							"width": 14,
+							"repeat": "round"
+						}
+					},
+					"light": {
+						"body": "#f7f1e2",
+						"text": "#231c10"
+					},
+					"dark": {
+						"body": "#14110c",
+						"text": "#f4ecd9"
+					}
+				}
+			}
+		]
+	},
+	"permissions": {
+		"host": ["ui.theme"],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

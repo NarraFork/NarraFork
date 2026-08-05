@@ -9,6 +9,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import {
@@ -166,6 +167,8 @@ import {
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
 	usePlatform,
+	useProviderModelRefreshCapability,
+	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
@@ -181,6 +184,7 @@ import {
 	type ModelOption,
 	parseAggModelValue,
 	resolveDisplayModel,
+	statusRegistry,
 } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
@@ -250,6 +254,7 @@ import {
 	resolveSelectedBlockMeta,
 	resolveSelectedMessageIds,
 } from "./MessageSelectionCtx";
+import { ModelMenuItems } from "./ModelMenuItems";
 import { ModelPriceModal } from "./ModelPriceModal";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
@@ -586,222 +591,6 @@ function getMessageViewportScrollBottom(scroller: HTMLElement) {
 
 function _getMessageViewportDistanceFromBottom(scroller: HTMLElement) {
 	return getMessageViewportScrollBottom(scroller) - scroller.scrollTop;
-}
-
-function ModelMenuItems({
-	allModels,
-	currentModel,
-	totalCostUsd,
-	onSelect,
-	onShowPrice,
-	label,
-	providerLabels,
-	onEditDefaultModel,
-	onEditSummaryModel,
-}: {
-	allModels: ModelOption[];
-	currentModel: string | null | undefined;
-	totalCostUsd: number | null | undefined;
-	onSelect: (model: string) => void;
-	onShowPrice?: (model: ModelOption) => void;
-	label?: string;
-	/** Provider prefix → display name, used to label provider groups. */
-	providerLabels?: Record<string, string>;
-	/** When provided, an edit button on the "Default" group opens the global default model picker. */
-	onEditDefaultModel?: () => void;
-	/** When provided, an edit button on the "Summary" group opens the global summary model picker. */
-	onEditSummaryModel?: () => void;
-}) {
-	const { t } = useTranslation("narrator");
-	const [filter, setFilter] = useState("");
-	const filterInputRef = useRef<HTMLInputElement>(null);
-	useEffect(() => {
-		const id = window.setTimeout(() => filterInputRef.current?.focus({ preventScroll: true }));
-		return () => window.clearTimeout(id);
-	}, []);
-	const groups = new Map<string, ModelOption[]>();
-	for (const m of allModels) {
-		if (!groups.has(prov)) groups.set(prov, []);
-		groups.get(prov)?.push(m);
-	}
-	const provLabels: Record<string, string> = {
-		openai: "OpenAI",
-		...providerLabels,
-		__default__: t("modelGroupDefault"),
-		__summary__: t("modelGroupSummary"),
-		__agg__: t("modelGroupAggregations"),
-	};
-	const entries = [...groups.entries()];
-	const normalizedFilter = filter.trim().toLowerCase();
-	const filteredEntries = normalizedFilter
-		? entries
-				.map(([prov, models]) => {
-					const providerLabel = provLabels[prov] ?? prov;
-					const filteredModels = models.filter((m) => {
-						const haystack = [
-							m.label,
-							m.value,
-							m.provider ?? "",
-							providerLabel,
-							m.rateMultiplier != null ? String(m.rateMultiplier) : "",
-						]
-							.join(" ")
-							.toLowerCase();
-						return haystack.includes(normalizedFilter);
-					});
-					return [prov, filteredModels] as const;
-				})
-				.filter(([, models]) => models.length > 0)
-		: entries;
-	// For aggregation selection check: parse current model to see if it's an aggregation
-	const currentAgg = currentModel ? parseAggModelValue(currentModel) : null;
-	return (
-		<>
-			{totalCostUsd != null && totalCostUsd > 0 && (
-				<>
-					<Menu.Label ta="right">${totalCostUsd.toFixed(4)}</Menu.Label>
-					<Menu.Divider />
-				</>
-			)}
-			{label && <Menu.Label>{label}</Menu.Label>}
-			{filteredEntries.length === 0 ? (
-				<Text c="dimmed" p="xs" size="xs">
-					{t("noModelMatches")}
-				</Text>
-			) : (
-				filteredEntries.map(([prov, models], gi) => {
-					const isDefaultGroup = prov === "__default__";
-					const isSummaryGroup = prov === "__summary__";
-					const editHandler = isDefaultGroup
-						? onEditDefaultModel
-						: isSummaryGroup
-							? onEditSummaryModel
-							: undefined;
-					return (
-						<span key={prov}>
-							{gi > 0 && <Menu.Divider />}
-							{editHandler ? (
-								<Menu.Label
-									style={{
-										display: "flex",
-										alignItems: "center",
-										justifyContent: "space-between",
-										gap: 4,
-									}}
-								>
-									<span>{provLabels[prov] ?? prov}</span>
-									<ActionIcon
-										component="div"
-										role="button"
-										tabIndex={0}
-										variant="subtle"
-										color="gray"
-										size="sm"
-										aria-label={isDefaultGroup ? t("editDefaultModel") : t("editSummaryModel")}
-										title={isDefaultGroup ? t("editDefaultModel") : t("editSummaryModel")}
-										onClick={(e) => {
-											e.stopPropagation();
-											e.preventDefault();
-											editHandler();
-										}}
-									>
-										<IconPencil size={12} />
-									</ActionIcon>
-								</Menu.Label>
-							) : (
-								<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
-							)}
-							{models.map((m) => {
-								// For aggregation items, check if the current model's aggId matches
-								const isAggItem = m.provider === "__agg__";
-								const aggId = isAggItem ? m.value.slice(AGG_MODEL_PREFIX.length) : null;
-								const selected = isAggItem ? currentAgg?.aggId === aggId : currentModel === m.value;
-								return (
-									<Menu.Item
-										key={m.value}
-										onClick={() => onSelect(m.value)}
-										rightSection={
-											<Group gap={4} wrap="nowrap">
-												{m.available === false && (
-													<Badge size="xs" variant="light" color="yellow">
-														{t("modelTemporarilyUnavailable")}
-													</Badge>
-												)}
-												{m.rateMultiplier != null && (
-													<Badge size="xs" variant="outline" color="gray">
-														×{m.rateMultiplier}
-													</Badge>
-												)}
-												{m.pricing && (
-													<ActionIcon
-														component="div"
-														role="button"
-														tabIndex={0}
-														variant="subtle"
-														color="gray"
-														size="sm"
-														aria-label={t("viewModelPrice")}
-														onClick={(e) => {
-															e.stopPropagation();
-															e.preventDefault();
-															onShowPrice?.(m);
-														}}
-													>
-														<IconInfoCircle size={14} />
-													</ActionIcon>
-												)}
-												<IconCheck
-													size={14}
-													style={{ visibility: selected ? "visible" : "hidden" }}
-												/>
-											</Group>
-										}
-										fw={selected ? 600 : 400}
-										c={m.available === false ? "dimmed" : undefined}
-									>
-										{m.label}
-									</Menu.Item>
-								);
-							})}
-						</span>
-					);
-				})
-			)}
-			<Menu.Divider />
-			<Box
-				p={4}
-				style={{
-					position: "sticky",
-					bottom: 0,
-					zIndex: 2,
-					background: "var(--mantine-color-body)",
-				}}
-				onClick={(e) => e.stopPropagation()}
-			>
-				<TextInput
-					ref={filterInputRef}
-					leftSection={<IconSearch size={14} />}
-					onChange={(e) => setFilter(e.currentTarget.value)}
-					onKeyDown={(e) => e.stopPropagation()}
-					placeholder={t("modelFilterPlaceholder")}
-					rightSection={
-						filter ? (
-							<CloseButton
-								aria-label={t("clearModelFilter")}
-								onClick={(e) => {
-									e.stopPropagation();
-									setFilter("");
-								}}
-								size="xs"
-							/>
-						) : undefined
-					}
-					size="xs"
-					value={filter}
-				/>
-			</Box>
-		</>
-	);
 }
 
 /**
@@ -2230,7 +2019,14 @@ function RollbackConfirmModal({
 							</>
 						) : (
 							<Text size="sm" c="dimmed">
-								{conflicts.length > 0 ? t("revertScopeBlocked") : t("rollbackConfirmNoFiles")}
+								{conflicts.length > 0
+									? t("revertScopeBlocked")
+									: scope === "narrator" && narratorScope?.reason === "nothing_owned"
+										? // Says why the list is empty. A shared worktree makes "no files"
+											// ambiguous — the user can see other narrators editing the same
+											// directory — so state that this narrator's own set is empty.
+											t("revertScopeNothingOwned")
+										: t("rollbackConfirmNoFiles")}
 							</Text>
 						)}
 					</>
@@ -2372,7 +2168,11 @@ function BlockDeleteConfirmModal({
 						) : (
 							!previewFailed && (
 								<Text size="sm" c="dimmed">
-									{conflicts.length > 0 ? t("revertScopeBlocked") : t("blockDeleteConfirmNoFiles")}
+									{conflicts.length > 0
+										? t("revertScopeBlocked")
+										: data?.reason === "nothing_owned"
+											? t("revertScopeNothingOwned")
+											: t("blockDeleteConfirmNoFiles")}
 								</Text>
 							)
 						)}
@@ -2599,6 +2399,7 @@ export function NarratorPanel({
 		settingsData,
 		aggregations,
 		providerLabels,
+		nugProviderIdByPrefix,
 	} = useAllModels();
 	const { data: currentUser } = useCurrentUser();
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
@@ -2730,6 +2531,43 @@ export function NarratorPanel({
 		},
 		[updateSettingsMutation, t],
 	);
+	// Re-fetch one NUG gateway's model catalog straight from the model menu. This
+	// is also how a stale "temporarily unavailable" flag gets cleared, since a
+	// refresh replaces the cached list wholesale.
+	const nugModelRefreshCapability = useProviderModelRefreshCapability("nug");
+	const nugRuntimeCapability = useProviderRuntimeCapability("nug");
+	const canRefreshNugModels =
+		nugModelRefreshCapability.supported &&
+		nugRuntimeCapability?.routes?.supported !== false &&
+		nugRuntimeCapability?.routes?.perProviderModelsRefresh !== false;
+	const [refreshingNugProviderId, setRefreshingNugProviderId] = useState<string | null>(null);
+	const handleRefreshNugModels = useCallback(
+		async (providerId: string) => {
+			setRefreshingNugProviderId(providerId);
+			try {
+				await api.nugRefreshProviderModels(providerId);
+				await qc.invalidateQueries({ queryKey: ["settings"] });
+			} catch (error) {
+				notifications.show({
+					color: "red",
+					title: t("refreshProviderModelsErrorTitle"),
+					message: error instanceof Error ? error.message : String(error),
+				});
+			} finally {
+				setRefreshingNugProviderId(null);
+			}
+		},
+		[qc, t],
+	);
+	const modelMenuRefreshProps = canRefreshNugModels
+		? {
+				nugProviderIdByPrefix,
+				onRefreshProviderModels: (providerId: string) => {
+					void handleRefreshNugModels(providerId);
+				},
+				refreshingProviderId: refreshingNugProviderId,
+			}
+		: {};
 	const dangerReflectionGlobalLevel = normalizeDangerReflectionLevel(
 		settingsData?.agent?.dangerReflectionLevel,
 		settingsData?.agent?.dangerReflectionEnabled ?? true,
@@ -3793,6 +3631,9 @@ export function NarratorPanel({
 	// Unset (new users) resolves to Virtual; Chunk is now an explicit opt-out.
 	const [narratorVirtualListRequested] = useLocalPref("narrafork_narrator_virtual_list");
 	const narratorVirtualList = resolveNarratorVirtualListEnabled(narratorVirtualListRequested);
+	// Reading-width preference, needed here only so the lazy-chunk fallback lays its
+	// skeleton out in the same column the list will use (no width step on mount).
+	const [narratorCenteredColumn] = useLocalPref("narrafork_narrator_centered_column");
 	const isAtBottomRef = useRef(isAtBottom);
 	isAtBottomRef.current = isAtBottom;
 	const scrollToBottomRef = useRef<(instant?: boolean) => void>(() => {});
@@ -4641,6 +4482,16 @@ export function NarratorPanel({
 	}, [closeContextThresholdSettings, contextThresholdDraft, t, updateSettingsMutation]);
 	const isPlanning = hasPlanTrait && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
+	/*
+	 * Parked until an unavailable model recovers. Shares the `waiting` status with
+	 * "waiting for your approval", so it must be checked first to keep the
+	 * attention-colored (yellow) treatment off a wait the user cannot resolve.
+	 */
+	const isWaitingForModel = substatus.includes("model_unavailable");
+	/** Registry-owned accent for that state, so the shade lives in one place. */
+	const modelUnavailableColor = statusRegistry.accentColor(
+		statusRegistry.narratorSubstatus("model_unavailable"),
+	);
 	// Derive compacting flags from substatus. "compacting" is blocking; background compact
 	// can run alongside an active turn or after the turn has become idle.
 	const isBlockingCompacting = substatus.includes("compacting");
@@ -4656,6 +4507,23 @@ export function NarratorPanel({
 		? decodeURIComponent(queueMessage.slice("queue_message:".length))
 		: null;
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting || isRetrying);
+	/*
+	 * Single source for the work-indicator accent, shared by the spinner and its
+	 * label so the two can never drift. `model_unavailable` uses the blue-toned
+	 * neutral from the status registry so it reads as "the system is waiting", not
+	 * "you need to do something".
+	 */
+	const workIndicatorColor = isRetrying
+		? "yellow"
+		: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
+			? "orange"
+			: isWaitingForModel
+				? modelUnavailableColor
+				: isWaiting
+					? "yellow"
+					: isPlanning
+						? "green"
+						: "blue";
 
 	// --- Turn elapsed timer ---
 	const turnStartedAt = narrator?.turnStartedAt as string | null | undefined;
@@ -7717,9 +7585,16 @@ export function NarratorPanel({
 															// Same message-shaped skeleton the list itself shows while its
 															// document loads, so the lazy-chunk wait and the document wait
 															// look like one continuous placeholder (no blank → text flash).
+															//
+															// The column geometry comes from the shared helper rather than
+															// Mantine padding, so this fallback, the list's own placeholder
+															// and the real rows are all the same width — otherwise the
+															// mount stepped through two different column widths.
 															<Suspense
 																fallback={
-																	<Box py="sm" px="md">
+																	<Box
+																		style={narratorColumnPlaceholderStyle(narratorCenteredColumn)}
+																	>
 																		<NarratorMessageListSkeleton />
 																	</Box>
 																}
@@ -8283,36 +8158,8 @@ export function NarratorPanel({
 								style={{ minWidth: 0, flex: 1 }}
 							>
 								<Group gap={6} wrap="nowrap">
-									<Loader
-										size={14}
-										color={
-											isRetrying
-												? "yellow"
-												: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
-													? "orange"
-													: isWaiting
-														? "yellow"
-														: isPlanning
-															? "green"
-															: "blue"
-										}
-										style={{ flexShrink: 0 }}
-									/>
-									<Text
-										size="xs"
-										c={
-											isRetrying
-												? "yellow"
-												: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
-													? "orange"
-													: isWaiting
-														? "yellow"
-														: isPlanning
-															? "green"
-															: "blue"
-										}
-										truncate
-									>
+									<Loader size={14} color={workIndicatorColor} style={{ flexShrink: 0 }} />
+									<Text size="xs" c={workIndicatorColor} truncate>
 										{isRetrying
 											? retryCountdown > 0
 												? t("retryingCountdown", {
@@ -8326,15 +8173,17 @@ export function NarratorPanel({
 													})
 											: isBlockingCompacting
 												? `${t("compacting")} · ${compactProgressText}`
-												: currentSpecTask
-													? currentSpecTask.text
-													: isWaiting
-														? t("status_waiting")
-														: isPlanning
-															? t("planning")
-															: isBackgroundCompacting
-																? `${t("backgroundCompacting")} · ${compactProgressText}`
-																: t("thinking")}
+												: isWaitingForModel
+													? t("status_model_unavailable")
+													: currentSpecTask
+														? currentSpecTask.text
+														: isWaiting
+															? t("status_waiting")
+															: isPlanning
+																? t("planning")
+																: isBackgroundCompacting
+																	? `${t("backgroundCompacting")} · ${compactProgressText}`
+																	: t("thinking")}
 									</Text>
 									{(queuePosition != null || queueMessageValue) && (
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
@@ -8362,7 +8211,7 @@ export function NarratorPanel({
 									h={8}
 									style={{
 										borderRadius: "50%",
-										backgroundColor: `var(--mantine-color-${statusBarDisplay.color}-filled)`,
+										backgroundColor: statusRegistry.accentVar(statusBarDisplay, "filled"),
 										flexShrink: 0,
 									}}
 								/>
@@ -8572,6 +8421,7 @@ export function NarratorPanel({
 															providerLabels={providerLabels}
 															onEditDefaultModel={() => setGlobalModelEditTarget("default")}
 															onEditSummaryModel={() => setGlobalModelEditTarget("summary")}
+															{...modelMenuRefreshProps}
 														/>
 													</Menu.Dropdown>
 												</Menu>
@@ -8859,6 +8709,7 @@ export function NarratorPanel({
 																	providerLabels={providerLabels}
 																	onEditDefaultModel={() => setGlobalModelEditTarget("default")}
 																	onEditSummaryModel={() => setGlobalModelEditTarget("summary")}
+																	{...modelMenuRefreshProps}
 																/>
 															</Menu.Dropdown>
 														</Menu>

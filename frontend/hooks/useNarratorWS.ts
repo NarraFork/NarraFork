@@ -420,6 +420,18 @@ interface NarratorWSCallbacks {
 		meta?: SubagentToolEventMeta,
 	) => void;
 	onSideCars?: (sideCars: SideCarRecord[], parentToolUseId?: string) => void;
+	/**
+	 * The tool passed its permission gate and began executing.
+	 *
+	 * The signal that lets a live card stop guessing: `onToolStarted` only means the
+	 * input finished parsing, so anything painted from it alone claims work has begun
+	 * while the narrator may still be waiting on a human approval.
+	 */
+	onToolExecuting?: (
+		toolUseId: string,
+		executionStartedAt: number,
+		parentToolUseId?: string,
+	) => void;
 	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
 	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
 	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
@@ -633,7 +645,10 @@ interface NarratorWSCallbacks {
 			contentCharsReceived?: number;
 			extractedFields?: Record<string, string>;
 			metadata?: Record<string, unknown>;
+			/** The INPUT finished parsing — NOT "executing" (see `executing`). */
 			started?: boolean;
+			/** Permission granted and execution under way. */
+			executing?: boolean;
 			input?: unknown;
 			streamStartedAt?: number;
 			streamingOutput?: string;
@@ -940,6 +955,13 @@ export function useNarratorWS(
 					case "sidecars":
 						callbackOwner.callbacks.onSideCars?.(
 							data.sideCars as SideCarRecord[],
+							data.parentToolUseId as string | undefined,
+						);
+						break;
+					case "tool_executing":
+						callbackOwner.callbacks.onToolExecuting?.(
+							data.toolUseId as string,
+							data.executionStartedAt as number,
 							data.parentToolUseId as string | undefined,
 						);
 						break;
@@ -1401,7 +1423,10 @@ export function useNarratorWS(
 								contentCharsReceived?: number;
 								extractedFields?: Record<string, string>;
 								metadata?: Record<string, unknown>;
+								/** The INPUT finished parsing — NOT "executing" (see `executing`). */
 								started?: boolean;
+								/** Permission granted and execution under way. */
+								executing?: boolean;
 								input?: unknown;
 								streamStartedAt?: number;
 								streamingOutput?: string;

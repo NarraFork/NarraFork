@@ -1021,6 +1021,15 @@ export interface ReflectionLoopRunOptions {
 	 * identity, so only the caller can address the right card.
 	 */
 	onProgress?: (snapshot: ProgressSnapshot) => void;
+	/**
+	 * Whether the nested loop should inject the parent's system prompt itself.
+	 *
+	 * Defaults to `false` whenever a non-empty parent history is inherited: that
+	 * history was already produced by the parent loop's own injection, so a second
+	 * injection duplicates the prompt and shifts the cacheable prefix. Callers that
+	 * pass a raw history with no system prompt of its own can set this to `true`.
+	 */
+	injectParentSystemPrompt?: boolean;
 }
 
 export interface ReflectionLoopObservation {
@@ -1129,9 +1138,25 @@ export async function runReflectionLoop(
 		maxTurns = 1,
 		label = "reflection loop",
 		onProgress,
+		injectParentSystemPrompt,
 	} = options;
 	const allowedTools = new Set(reflectionLoop.allowedTools);
 	const progress = createThrottledProgressReporter(onProgress);
+	// The history handed to us is the parent agentLoop's own post-injection array:
+	// agentLoop calls injectSystemPrompt once before its turn loop, so a non-empty
+	// inherited history already carries the system prompt as its leading entry.
+	//
+	// Letting the nested loop inject again produced two copies — a stray
+	// `__SYSTEM__:` user block on Anthropic, doubled `instructions` on
+	// the duplicate lands at the very front, it shifted every following byte and
+	// destroyed the cacheable prefix this loop shares with the parent
+	// conversation. Prompt caching is a byte-exact prefix match, so a reflection
+	// on a 200k-token conversation re-billed the whole prefix at full price.
+	//
+	// `injectParentSystemPrompt` lets a caller that builds a raw history (rather
+	// than inheriting the parent's) opt back in.
+	const inheritsInjectedSystemPrompt =
+		injectParentSystemPrompt === undefined ? history.length > 0 : !injectParentSystemPrompt;
 	const pendingApiRequests = new Map<string, ApiRequestHandle>();
 	const observed: ReflectionLoopObservation = {
 		assistantMessages: 0,
@@ -1150,6 +1175,10 @@ export async function runReflectionLoop(
 			signal: abortController.signal,
 			maxTurns,
 			reflectionLoop,
+			// See inheritsInjectedSystemPrompt above: the inherited history already
+			// carries the parent's system prompt, so clearing it here keeps the
+			// reflection request byte-identical to the parent prefix.
+			...(inheritsInjectedSystemPrompt ? { systemPrompt: undefined } : {}),
 			// Reflection is an auxiliary call: follow the user's retry policy but
 			// hard-cap attempts (e.g. don't inherit an infinite/-1 or oversized
 			// maxTransientRetries from the parent primary loop).

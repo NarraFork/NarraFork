@@ -50,4 +50,17 @@ describe("caret filler wiring (drag-selection regression)", () => {
 		const source = readFileSync(`${import.meta.dir}/../PretextExactMessageList.tsx`, "utf8");
 		expect(source).toContain("<CaretFiller top={height} height={hitHeight - height}");
 	});
+
+	it("makes each fenced code row fill its slot, and fills the panel's padding", () => {
+		// The strip the first pass missed: a code row was `top`-only, so the ~4px of
+		// leading between rows (17px slot vs a `font`-shorthand `line-height: normal`
+		// box) and the blank space past the last glyph resolved no caret, and a drag
+		// inside a multi-line block snapped back to the top of the history.
+		// RenderMarkdown.codecaret.test.tsx asserts the resulting geometry; this only
+		// guards the wiring so the declarations cannot quietly disappear.
+		const source = readFileSync(`${import.meta.dir}/RenderMarkdown.tsx`, "utf8");
+		expect(source).toContain("lineHeight: `${block.lineHeight}px`");
+		expect(source).toContain("<CaretFiller top={0} height={langTop}");
+		expect(source).toContain("top={linesBottom}");
+	});
 });

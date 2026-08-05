@@ -1,3 +1,8 @@
+import { getReflectionSuggestion } from "@shared/pretext-layout/reflection";
+import {
+	isLiveStreamingBlock,
+	STREAMING_MESSAGE_ID,
+} from "@shared/pretext-layout/streaming-live-blocks";
 import { IconBrain, IconTool } from "@tabler/icons-react";
 import { memo } from "react";
 import { useTranslation } from "react-i18next";
@@ -158,6 +163,19 @@ export function activityTraceRowKeys(items: ActivityInput[]): string[] {
 	});
 }
 
+/**
+ * A tool's reflection-gate status, or undefined when it has no gate.
+ *
+ * Only the STATUS is needed here: it picks the row's shimmer colour. A fold can hold
+ * hundreds of rows, so this deliberately does not build the whole notice the card
+ * does. Mirrors the vlist adapter's `resolveToolReflectionStatus`.
+ */
+function reflectionStatusOf(tc: ToolRunItem["tc"]): string | undefined {
+	const suggestions = tc.permissionSuggestions;
+	if (!Array.isArray(suggestions)) return undefined;
+	return getReflectionSuggestion(suggestions)?.status;
+}
+
 export const ActivityTrace = memo(function ActivityTrace({
 	items,
 	runKey,
@@ -188,14 +206,21 @@ export const ActivityTrace = memo(function ActivityTrace({
 	// Shimmer: the last row that is still live. While streaming, that's the last
 	// item of the streaming message (reasoning growing / latest tool); otherwise
 	// the last active tool.
+	//
+	// Reasoning liveness is per BLOCK: only the live message's LAST content block can
+	// still be written, so a reasoning run that answer text or a tool call already
+	// followed must stop shimmering right away instead of waiting for the turn to
+	// persist (see @shared/pretext-layout/streaming-live-blocks).
 	let shimmerKey: string | null = null;
 	for (let i = items.length - 1; i >= 0; i--) {
 		const item = items[i];
 		const isLive =
 			item.kind === "tool" &&
-			(toolIsActive(item.tc) || (streaming && item.msg.id === "__streaming__"));
+			(toolIsActive(item.tc) || (streaming && item.msg.id === STREAMING_MESSAGE_ID));
 		const isStreamingReasoning =
-			item.kind === "reasoning" && streaming && item.msg.id === "__streaming__";
+			item.kind === "reasoning" &&
+			streaming &&
+			isLiveStreamingBlock(item.msg.id === STREAMING_MESSAGE_ID, item.msg, item.blockIndex);
 		if (isLive || isStreamingReasoning) {
 			shimmerKey =
 				item.kind === "tool"
@@ -267,6 +292,7 @@ export const ActivityTrace = memo(function ActivityTrace({
 		const Icon = getCategoryIcon(cat, item.tc.toolName);
 		const key = activityToolRowKey(item);
 		const active = toolIsActive(item.tc);
+		const reflectionStatus = reflectionStatusOf(item.tc);
 		return {
 			key,
 			icon: <Icon size={9} />,
@@ -277,6 +303,10 @@ export const ActivityTrace = memo(function ActivityTrace({
 			// Outcome + duration, so folding to a low LOD no longer costs the reader
 			// "did it fail" and "how long did it take". Height-neutral (see the row).
 			status: item.tc.status,
+			// A gate parks its tool at `pending`, which otherwise reads as "waiting on the
+			// user" and silences the row. Supplying the gate's own status is what keeps a
+			// deliberating call purple instead.
+			...(reflectionStatus ? { reflectionStatus } : {}),
 			trailing: <ToolTimingArea toolCall={item.tc} isActive={active} />,
 			identity,
 			actions,
@@ -299,6 +329,15 @@ export const ActivityTrace = memo(function ActivityTrace({
 			hideEarlierLabel={t("reasoningHideEarlier")}
 			collapseItems={collapsed}
 			rowContext={rowContext}
+			// The shimmer's five states are colour-only otherwise; naming them is what
+			// makes a failed row reachable for a screen reader / colour-blind reader.
+			shimmerStateLabels={{
+				streaming: t("traceRowState.streaming"),
+				reflecting: t("traceRowState.reflecting"),
+				running: t("traceRowState.running"),
+				success: t("traceRowState.success"),
+				failed: t("traceRowState.failed"),
+			}}
 		/>
 	);
 });

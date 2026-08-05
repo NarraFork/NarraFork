@@ -16,7 +16,7 @@
  */
 
 import { measureLineStats, measureNaturalWidth, prepareWithSegments } from "@chenglou/pretext";
-import { MARKDOWN_CONSTANTS, parseMarkdownToPreparedBlocks } from "../parse-markdown";
+import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
 import {
 	accumulateFrame,
 	type ElementFrame,
@@ -35,7 +35,7 @@ import {
 	SANS_FAMILY,
 	SPACING,
 } from "../pretext-fonts";
-import { markdownMathSupport } from "./math-support";
+import { measureMarkdown } from "./measure-markdown";
 import { IMAGE_FIXED_HEIGHT, TEXT_FILE_HEIGHT } from "./measure-media";
 import { pretextLineMetrics } from "./pretext-metrics";
 
@@ -212,6 +212,18 @@ export function measureMessageBubble(
 }
 
 // ── assistant: markdown body, no bubble, small padding ───────────────────────
+/**
+ * Measure an assistant message: the markdown body plus this element's own insets.
+ *
+ * DELEGATES to `measureMarkdown` rather than re-running `accumulateFrame` here.
+ * The two are painted by the SAME renderer — `RenderMessageBubble`'s assistant
+ * branch hands the measured element straight to `RenderMarkdown`, whose code panel
+ * reads `MEASURE_MARKDOWN_CODE_PADDING` — so a second copy of the code-chrome
+ * constants is a divergence waiting to happen. It already had: this measured
+ * fenced code at `codePaddingY: 8` while the renderer drew 11 (10 xs + 1 border,
+ * per HighlightedCode.module.css), losing 6px per code block, and
+ * `CODE_PANEL_BORDER`'s compensation assumed 11 as well.
+ */
 function measureAssistantMessage(
 	input: MeasureMessageInput,
 	contentWidth: number,
@@ -219,21 +231,13 @@ function measureAssistantMessage(
 	const innerWidth = Math.max(1, contentWidth - ASSISTANT_PAD_X * 2);
 	// Assistant text is the main markdown surface, so it is also where LaTeX shows
 	// up. Math support is undefined until KaTeX loads; formulas then stay literal
-	// text and the layout rebuilds once the runtime revision bumps.
-	const blocks = parseMarkdownToPreparedBlocks(input.text, markdownMathSupport());
-	const frame = accumulateFrame(blocks, innerWidth, pretextLineMetrics, {
-		codePaddingX: 12,
-		codePaddingY: 8,
-		codeLangExtraTop: MARKDOWN_CONSTANTS.CODE_LANG_EXTRA_TOP,
-		quotePaddingY: MARKDOWN_CONSTANTS.BLOCKQUOTE_PADDING,
-		quoteMarginTop: MARKDOWN_CONSTANTS.PARAGRAPH_MARGIN_TOP,
-	});
+	// text and the layout rebuilds once the runtime revision bumps. (Reached via
+	// measureMarkdown's own preparedMarkdownBlocks call.)
+	const measured = measureMarkdown(input.text, innerWidth);
 	return {
-		height: frame.contentHeight + ASSISTANT_PAD_Y * 2,
-		blocks,
-		frame,
-		contentWidth: innerWidth,
-		usedWidth: frame.usedWidth + ASSISTANT_PAD_X * 2,
+		...measured,
+		height: measured.height + ASSISTANT_PAD_Y * 2,
+		usedWidth: measured.usedWidth + ASSISTANT_PAD_X * 2,
 	};
 }
 
@@ -289,7 +293,9 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 	if (input.text.length > 0 || !hasAttachments) {
 		const bodyBlock: PreparedCodeBlock = {
 			kind: "code",
-			prepared: prepareWithSegments(input.text, USER_BODY_FONT, { whiteSpace: "pre-wrap" }),
+			// Cross-width memo (see prepared-markdown-cache): the segment precompute is
+			// width-independent and is the dominant cost of a user bubble.
+			prepared: getPreparedTextWithSegments(input.text, USER_BODY_FONT, "pre-wrap"),
 			lineHeight: BODY_LINE_HEIGHT,
 			lang: null,
 			marginTop: hasAttachments ? USER_ATTACHMENT_GAP : 0,

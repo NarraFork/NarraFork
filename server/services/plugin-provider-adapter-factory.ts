@@ -36,6 +36,7 @@ import type {
 	ProviderChatParams,
 	ProviderDescriptor,
 	ProviderGenerateParams,
+	ProviderHostHints,
 	ProviderOperation,
 } from "./plugin-provider-rpc";
 
@@ -54,6 +55,17 @@ export interface PluginProviderAdapterFactoryOptions {
 	 * pre-credential behaviour.
 	 */
 	resolveConfig?: (providerInstanceId: string) => Promise<Record<string, JsonValue>>;
+	/**
+	 * Resolve host-provided hints (proxy URL, concurrency budget) for each request.
+	 *
+	 * Called per-request so that settings changes take effect immediately. Returns
+	 * undefined when there is nothing to communicate; an empty object is never sent.
+	 *
+	 * SECURITY: The returned `outbound.proxyUrl` may contain credentials. The caller
+	 * (PooledProviderRpcClient) injects it into RPC params which cross a process boundary
+	 * but are NOT logged, NOT sent to diagnostics, NOT echoed to WebSocket/SSE.
+	 */
+	resolveHostHints?: () => ProviderHostHints | undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -78,16 +90,23 @@ const DEFAULT_PROVIDER_LIMITS = {
  * `RemoteProviderAdapter` only calls `chat()` and `generate()`, both of which return
  * promises, so activation hides behind them without breaking the adapter's
  * synchronous construction contract.
+ *
+ * This class also injects `hostHints` (proxy URL, concurrency budget) into every
+ * outgoing request. The hints are resolved per-call so settings changes and
+ * concurrency state take effect immediately.
  */
 class PooledProviderRpcClient implements RemoteProviderRpcClient {
-	constructor(private readonly deferred: DeferredProviderClient) {}
+	constructor(
+		private readonly deferred: DeferredProviderClient,
+		private readonly resolveHostHints?: () => ProviderHostHints | undefined,
+	) {}
 
 	async chat(
 		params: ProviderChatParams,
 		options?: { signal?: AbortSignal },
 	): Promise<ProviderOperation> {
 		const client = await this.deferred.acquire(options?.signal);
-		return client.chat(params, options);
+		return client.chat(this.injectHints(params), options);
 	}
 
 	async generate(
@@ -95,7 +114,21 @@ class PooledProviderRpcClient implements RemoteProviderRpcClient {
 		options?: { signal?: AbortSignal },
 	): Promise<ProviderOperation> {
 		const client = await this.deferred.acquire(options?.signal);
-		return client.generate(params, options);
+		return client.generate(this.injectHints(params), options);
+	}
+
+	/**
+	 * Inject host hints into params. The hints field is only added when the resolver
+	 * returns a non-empty object, preserving backward compatibility with plugins that
+	 * do not expect it.
+	 */
+	private injectHints<T extends { hostHints?: ProviderHostHints }>(params: T): T {
+		if (!this.resolveHostHints) return params;
+		const hints = this.resolveHostHints();
+		if (!hints) return params;
+		// Only attach if there is at least one meaningful hint
+		if (!hints.outbound?.proxyUrl && !hints.concurrency?.maxConcurrentUpstream) return params;
+		return { ...params, hostHints: hints };
 	}
 }
 
@@ -129,6 +162,7 @@ export function createPluginProviderAdapterFactory(
 				providerTypeId: entry.providerTypeId,
 				providerInstanceId: entry.providerInstanceId,
 			}),
+			options.resolveHostHints,
 		);
 		logger.debug("plugin provider adapter created", {
 			pluginId: entry.pluginId,

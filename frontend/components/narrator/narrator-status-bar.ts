@@ -1,7 +1,10 @@
-import { getEffectiveNarratorDisplay } from "../../lib/status-registry";
+import { getEffectiveNarratorDisplay, type StatusAccent } from "../../lib/status-registry";
 
 const STATUS_BAR_SUBSTATUS_PRIORITY = [
 	"error",
+	// Without this the label falls back to the base status ("Waiting"), which
+	// reads as "waiting for you" instead of "waiting for the model".
+	"model_unavailable",
 	"interrupted",
 	"suspended",
 	"manual_override",
@@ -30,7 +33,7 @@ export function getNarratorStatusBarDisplay(options: {
 	panelNarratorId: string;
 	narrator: NarratorStatusBarSource;
 	liveSubstatus: string[];
-}): { color: string; labelKey: string } {
+}): StatusAccent & { labelKey: string } {
 	const ownsNarrator =
 		typeof options.narrator.id !== "string" || options.narrator.id === options.panelNarratorId;
 	let status =
@@ -53,6 +56,7 @@ export function getNarratorStatusBarDisplay(options: {
 	const effective = getEffectiveNarratorDisplay(status, displaySubstatus);
 	return {
 		color: effective.color || "gray",
+		accentShade: effective.accentShade,
 		labelKey: activeSubstatus ? `status_${activeSubstatus}` : `status_${status}`,
 	};
 }

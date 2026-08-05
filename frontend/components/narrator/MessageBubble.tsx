@@ -32,6 +32,7 @@ import {
 	isCompactRetryableDetail,
 } from "@shared/compact-message";
 import { isHumanOrigin } from "@shared/message-origin";
+import { isLiveStreamingRun } from "@shared/pretext-layout/streaming-live-blocks";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
 import { formatFileSize } from "@shared/text-file-types";
 import {
@@ -404,6 +405,12 @@ interface MessageBubbleProps {
 		/** Complete unfiltered contentJson retained when rendering one visual segment. */
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		_allContentJson?: any[];
+		/**
+		 * Live row only: index of the block still being written (see
+		 * `@shared/pretext-layout/streaming-live-blocks`). Indexes the COMPLETE block
+		 * array, so it pairs with `_allContentJson`.
+		 */
+		liveBlockIndex?: number;
 	};
 	onForkFromMessage?: (messageId: string) => void;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
@@ -4973,7 +4980,18 @@ export const MessageBubble = memo(function MessageBubble({
 								blocks={runBlocks}
 								blockIndices={runRealIndices}
 								isLastContent={run?.isLastContent ?? true}
-								streaming={isStreaming}
+								// Per-RUN, not per-message: the live row accumulates the whole turn,
+								// so a reasoning run that answer text or a tool call already
+								// followed is finished and must settle now rather than stay
+								// force-expanded until the turn persists.
+								streaming={isLiveStreamingRun(
+									isStreaming,
+									{
+										contentJson: message._allContentJson ?? blocks,
+										liveBlockIndex: message.liveBlockIndex,
+									},
+									runRealIndices,
+								)}
 								narratorId={narratorId}
 								messageId={message.id}
 							/>

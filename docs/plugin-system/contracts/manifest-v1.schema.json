@@ -45,6 +45,7 @@
 			"$ref": "#/$defs/contributes",
 			"default": {
 				"providers": [],
+				"searchProviders": [],
 				"tools": [],
 				"commands": [],
 				"events": [],
@@ -84,6 +85,14 @@
 								"required": ["providers"],
 								"properties": {
 									"providers": {
+										"minItems": 1
+									}
+								}
+							},
+							{
+								"required": ["searchProviders"],
+								"properties": {
+									"searchProviders": {
 										"minItems": 1
 									}
 								}
@@ -535,6 +544,84 @@
 				}
 			}
 		},
+		"searchProviderContribution": {
+			"type": "object",
+			"additionalProperties": false,
+			"description": "A web search source served over provider.search. providerId is required: search has no config or secret namespace of its own and reads both through the bound provider contribution.",
+			"required": ["id", "title", "providerId"],
+			"properties": {
+				"id": {
+					"$ref": "#/$defs/contributionId"
+				},
+				"title": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 200
+						}
+					]
+				},
+				"description": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 2000
+						}
+					]
+				},
+				"providerId": {
+					"$ref": "#/$defs/contributionId"
+				},
+				"requiresConfig": {
+					"type": "array",
+					"maxItems": 32,
+					"description": "Config fields of the bound provider that must be populated for this source to count as usable. Checked synchronously by the host because availability is decided on a hot path.",
+					"items": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 128
+					}
+				},
+				"capabilities": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"domainFilter": {
+							"type": "boolean"
+						},
+						"recency": {
+							"type": "boolean"
+						},
+						"maxResults": {
+							"type": "boolean"
+						},
+						"purpose": {
+							"type": "boolean"
+						}
+					}
+				},
+				"limits": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"timeoutMs": {
+							"type": "integer",
+							"minimum": 1000,
+							"maximum": 300000
+						},
+						"maxOutputBytes": {
+							"type": "integer",
+							"minimum": 1024,
+							"maximum": 4194304
+						}
+					}
+				}
+			}
+		},
 		"toolContribution": {
 			"type": "object",
 			"additionalProperties": false,
@@ -718,6 +805,14 @@
 					},
 					"default": []
 				},
+				"searchProviders": {
+					"type": "array",
+					"maxItems": 200,
+					"items": {
+						"$ref": "#/$defs/searchProviderContribution"
+					},
+					"default": []
+				},
 				"tools": {
 					"type": "array",
 					"maxItems": 200,
@@ -759,7 +854,7 @@
 			"type": "string",
 			"minLength": 3,
 			"maxLength": 200,
-			"pattern": "^(?:plugin|query|command|event|storage|config|secret|network|filesystem|process|ui|schedule|diagnostics|provider|device)\\.[A-Za-z0-9][A-Za-z0-9._-]*$",
+			"pattern": "^(?:plugin|query|command|event|storage|config|secret|network|filesystem|process|ui|schedule|diagnostics|provider|search|device)\\.[A-Za-z0-9][A-Za-z0-9._-]*$",
 			"allOf": [
 				{
 					"not": {

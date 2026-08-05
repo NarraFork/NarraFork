@@ -22,8 +22,16 @@
  * routed here instead.
  */
 
-import type { GlyphWidthResolver, KatexRuntime } from "@shared/pretext-layout/katex-geometry";
+import type {
+	GlyphVerticalResolver,
+	GlyphWidthResolver,
+	KatexRuntime,
+} from "@shared/pretext-layout/katex-geometry";
 import { hasMarkdownMath } from "@shared/pretext-layout/math-delimiters";
+import {
+	getPreparedFontRevision,
+	setPreparedFontRevision,
+} from "@shared/pretext-layout/prepared-markdown-cache";
 
 let runtime: KatexRuntime | null = null;
 let loadPromise: Promise<KatexRuntime | null> | null = null;
@@ -99,8 +107,10 @@ interface FontFaceSet {
 
 function onWebfontsReady(): void {
 	// Only act if there are stale entries that were measured with fallback fonts.
-	if (glyphCache.size > 0) {
+	// Vertical metrics are just as font-dependent as advances, so both caches go.
+	if (glyphCache.size > 0 || verticalCache.size > 0) {
 		glyphCache.clear();
+		verticalCache.clear();
 		revision++;
 	}
 }
@@ -143,14 +153,92 @@ export function getKatexRevision(): number {
 	return revision;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DOCUMENT font readiness — the same hazard, one level up from KaTeX.
+//
+// `onWebfontsReady` above covers KaTeX's own faces. But the prepared layer bakes
+// a pixel width into EVERY fragment of EVERY body (see prepared-markdown-cache's
+// FONT REVISION note), math or not, and those widths come from canvas
+// `measureText` against whatever face was resolvable at that moment. A body
+// prepared under a fallback face therefore keeps its old wrap points while the
+// DOM repaints with the real one — measurement and render diverge, which is the
+// failure the exact list exists to prevent.
+//
+// This app currently ships no webfonts (system stacks only, verified: no
+// `@font-face` and no font `<link>` in frontend/), so the generation below is
+// expected to stay 0 in production. It is plumbed anyway because the assumption
+// is one stylesheet away from being wrong and the failure mode is silent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let documentFontWatchScheduled = false;
+/** Notified when the font generation advances, so the layout can be rebuilt. */
+const fontRevisionListeners = new Set<() => void>();
+
+/**
+ * Subscribe to font-generation changes.
+ *
+ * Clearing the prepared cache is not enough on its own: heights derived from it
+ * live in `measureCache` and the layout that placed them is already committed, so
+ * the listener must clear that cache and rebuild. Returns an unsubscribe.
+ */
+export function onFontRevisionChange(listener: () => void): () => void {
+	fontRevisionListeners.add(listener);
+	ensureDocumentFontWatch();
+	return () => fontRevisionListeners.delete(listener);
+}
+
+/** Current font generation (shared with the prepared cache's key). */
+export function getFontRevision(): number {
+	return getPreparedFontRevision();
+}
+
+/**
+ * Watch `document.fonts.ready` once and advance the generation when it settles.
+ *
+ * Idempotent, and a no-op without the Font Loading API (Bun tests, older
+ * engines) — an engine that cannot report readiness also cannot swap a face
+ * underneath us mid-session in a way we could detect, so staying at generation 0
+ * is the correct degradation.
+ */
+function ensureDocumentFontWatch(): void {
+	if (documentFontWatchScheduled) return;
+	if (typeof document === "undefined") return;
+	const fonts = (document as { fonts?: FontFaceSet }).fonts;
+	if (!fonts?.ready || typeof fonts.ready.then !== "function") return;
+	documentFontWatchScheduled = true;
+	fonts.ready.then(
+		() => {
+			bumpFontRevision();
+		},
+		() => {
+			// A rejected readiness promise leaves us on the current generation, which
+			// is the same state as an engine without the API.
+		},
+	);
+}
+
+/** Advance the font generation and notify subscribers when it actually moves. */
+function bumpFontRevision(): void {
+	if (!setPreparedFontRevision(getPreparedFontRevision() + 1)) return;
+	for (const listener of fontRevisionListeners) listener();
+}
+
+/** Test seam: drive the font generation without a real FontFaceSet. */
+export function bumpFontRevisionForTest(): void {
+	bumpFontRevision();
+}
+
 /** Test seam: reset module state so each test starts from a known baseline. */
 export function resetKatexRuntimeForTest(): void {
 	runtime = null;
 	loadPromise = null;
 	revision = 0;
 	glyphCache.clear();
+	verticalCache.clear();
 	measureCtx = undefined;
 	webfontWatchScheduled = false;
+	documentFontWatchScheduled = false;
+	fontRevisionListeners.clear();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -201,6 +289,50 @@ function getMeasureContext() {
 	}
 	return measureCtx;
 }
+
+/**
+ * Vertical extent of a glyph with a real font, via canvas `TextMetrics`'s
+ * `fontBoundingBox*` (falling back to `actualBoundingBox*`).
+ *
+ * KaTeX substitutes capital "M" for CJK, and M has NO descender, so a `\text{…}`
+ * CJK run reports `depth: 0` and an ink box too short — the width-pinned,
+ * `overflow: hidden` math host then shaves the glyph's top and bottom. Real metrics
+ * come from here instead. Returns null when unavailable so geometry degrades to
+ * KaTeX's own numbers rather than guessing.
+ */
+export const measureGlyphVertical: GlyphVerticalResolver = (glyph, fontCss) => {
+	const key = `${glyph}|${fontCss}`;
+	const cached = verticalCache.get(key);
+	if (cached !== undefined) return cached;
+	const ctx = getMeasureContext();
+	if (!ctx) return null;
+	try {
+		ctx.font = fontCss;
+		const metrics = ctx.measureText(glyph) as {
+			fontBoundingBoxAscent?: number;
+			fontBoundingBoxDescent?: number;
+			actualBoundingBoxAscent?: number;
+			actualBoundingBoxDescent?: number;
+		};
+		// `fontBoundingBox*` describes the FONT's em box (stable across glyphs, which is
+		// what a line box should reserve); `actualBoundingBox*` is per-glyph ink and is
+		// the fallback where the former is unsupported (older Safari).
+		const ascent = metrics.fontBoundingBoxAscent ?? metrics.actualBoundingBoxAscent;
+		const descent = metrics.fontBoundingBoxDescent ?? metrics.actualBoundingBoxDescent;
+		if (!Number.isFinite(ascent) || !Number.isFinite(descent)) return null;
+		const value = { ascent: ascent as number, descent: descent as number };
+		if (verticalCache.size >= GLYPH_CACHE_CEILING) {
+			verticalCache.clear();
+		}
+		verticalCache.set(key, value);
+		return value;
+	} catch {
+		return null;
+	}
+};
+
+/** `glyph|fontCss` → real vertical extent (px). Same bounding policy as glyphCache. */
+const verticalCache = new Map<string, { ascent: number; descent: number }>();
 
 /**
  * Measure a glyph with a real font. Returns null when no canvas is available,

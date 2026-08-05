@@ -103,6 +103,21 @@ export const FONT_MARKDOWN_CODE = `${FONT_WEIGHT.regular} ${CODE_BLOCK_FONT_SIZE
 // Small dimmed metadata / xs text.
 export const FONT_XS = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
 
+/**
+ * Font size (px) every LaTeX formula is measured AND painted at.
+ *
+ * KaTeX sizes its own root box relatively — `.katex { font: normal 1.21em … }` —
+ * so the rendered geometry depends entirely on the font size the formula's DOM
+ * ancestor carries. The height model measures against this constant (katex-geometry
+ * `basePx`), so the render layer MUST pin the same value on the math host: left to
+ * inherit, KaTeX picks up the document default (Mantine `body` = 16px), renders
+ * ~14% larger than measured, and gets clipped by the width-pinned host box.
+ *
+ * Body text is the reference context for a formula, hence `FONT_SIZE.sm`. Formulas
+ * inside headings keep this base too — the measure layer never varies it.
+ */
+export const MATH_BASE_FONT_SIZE = FONT_SIZE.sm;
+
 /** Build a heading font string for h1..h6. */
 export function headingFont(level: 1 | 2 | 3 | 4 | 5 | 6): string {
 	const h = HEADING[`h${level}` as keyof typeof HEADING];

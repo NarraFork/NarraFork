@@ -184,6 +184,30 @@ const SAMPLE_MATH_MD = [
 	"$$\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}$$",
 ].join("\n");
 
+/**
+ * GFM table calibration sample.
+ *
+ * Tables are the one block the browser's own `table-layout: auto` would decide, so
+ * the height model solves the columns itself (`layoutTable`) and the renderer paints
+ * absolutely-positioned cells instead of a real `<table>`. That makes them the block
+ * most exposed to a measure/render divergence, and the divergence is INTEGER-shaped:
+ * column widths are solved from intrinsic min/max advances and then rounded, so a
+ * cell that wraps at one extra line under real font metrics but not under the test
+ * canvas stub is invisible to unit tests and visible here.
+ *
+ * Deliberately mixes short and long cells (so the solver has to distribute slack),
+ * an inline-code cell, and CJK (whose advances the stub models as uniform).
+ */
+const SAMPLE_TABLE_MD = [
+	"| Field | Meaning | Default |",
+	"| --- | --- | --- |",
+	"| `widthBucket` | Rounded content width folded into the measurement cache key | none |",
+	"| `lod` | Render level of detail, 1 (count lines) through 6 (full cards) | 5 |",
+	"| 字体世代 | 字体换代计数，prepared 缓存键的一部分 | 0 |",
+	"",
+	"A trailing paragraph, so the table's own bottom margin participates too.",
+].join("\n");
+
 const SAMPLE_USER_TEXT =
 	"Can you extend the calibration harness so every batch-2 element gets a preview case?\nInclude the tool-call and subagent cards too.";
 
@@ -419,6 +443,31 @@ const HARNESS_CASES: HarnessCase[] = [
 		renderActual: (width) => <MarkdownActual width={width} md={SAMPLE_MD} />,
 		predict: (width) => measureMarkdown(SAMPLE_MD, width).height,
 		renderPredicted: (width) => <RenderMarkdown measured={measureMarkdown(SAMPLE_MD, width)} />,
+	},
+
+	// ── GFM table (DOM ground truth for layoutTable's column solve) ───────────
+	// Two widths on purpose: the wide case has slack to distribute, the narrow one
+	// forces cells to wrap and is where a rounding-recovery bug shows up as an
+	// off-by-one-row height.
+	{
+		id: "markdown-table",
+		label: "Markdown table @600px",
+		width: 600,
+		renderActual: (width) => <MarkdownActual width={width} md={SAMPLE_TABLE_MD} />,
+		predict: (width) => measureMarkdown(SAMPLE_TABLE_MD, width).height,
+		renderPredicted: (width) => (
+			<RenderMarkdown measured={measureMarkdown(SAMPLE_TABLE_MD, width)} />
+		),
+	},
+	{
+		id: "markdown-table-narrow",
+		label: "Markdown table @320px (cells wrap; column rounding recovery)",
+		width: 320,
+		renderActual: (width) => <MarkdownActual width={width} md={SAMPLE_TABLE_MD} />,
+		predict: (width) => measureMarkdown(SAMPLE_TABLE_MD, width).height,
+		renderPredicted: (width) => (
+			<RenderMarkdown measured={measureMarkdown(SAMPLE_TABLE_MD, width)} />
+		),
 	},
 
 	// ── LaTeX (DOM ground truth for katex-geometry) ───────────────────────────

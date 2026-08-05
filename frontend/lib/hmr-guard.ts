@@ -1,10 +1,7 @@
-// --- Polyfills for older browsers (Safari < 15.4 / iOS 14–15.3) ---
-// Object.hasOwn is ES2022; used internally by @xyflow/react and others.
-// esbuild's `target` only down-levels syntax, not runtime APIs.
-if (typeof Object.hasOwn !== "function") {
-	const _hasOwnProperty = Object.prototype.hasOwnProperty;
-	Object.hasOwn = (obj: object, key: PropertyKey) => _hasOwnProperty.call(obj, key);
-}
+// Legacy-browser built-in shims (Object.hasOwn, Array.prototype.at, …) used to live
+// here. They now sit in `legacy-browser-polyfills.ts`, which `main.tsx` imports before
+// anything else — this module is about HMR recovery and most of its body is gated
+// behind `import.meta.hot`, so it was the wrong home for a production-critical shim.
 
 /**
  * Prevent Vite HMR from triggering a full page reload when the browser tab

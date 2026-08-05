@@ -8,7 +8,9 @@ import {
 } from "@dnd-kit/core";
 import { arrayMove, rectSortingStrategy, SortableContext, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { formatCompactNumber } from "@frontend/lib/compact-number";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import type { CredentialUsageTotals } from "@frontend/types/usage-history";
 import {
 	ActionIcon,
 	Alert,
@@ -34,6 +36,8 @@ import {
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
+	IconArchive,
+	IconArchiveOff,
 	IconCheck,
 	IconDeviceFloppy,
 	IconGripVertical,
@@ -43,7 +47,7 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useCodexManagerParityCapability,
@@ -97,6 +101,14 @@ interface CodexImportCredential {
 }
 
 const CODEX_STATUS_GC_TIME_MS = 60_000;
+/**
+ * Query key for the durable lifetime rollup.
+ *
+ * Named because every mutation that *deletes* a credential has to invalidate it:
+ * the server drops the credential's rollup row, and a poll-only refresh would
+ * leave the deleted account's totals on screen until the next interval fires.
+ */
+const LIFETIME_TOTALS_QUERY_KEY = ["codex", "credential-usage-totals"] as const;
 const REFRESH_TOKEN_PATTERN = /^rt_[A-Za-z0-9._-]+$/;
 const REFRESH_TOKEN_SEARCH_PATTERN = /rt_[A-Za-z0-9._-]+/g;
 
@@ -417,6 +429,8 @@ export const CodexSection = React.memo(function CodexSection({
 	const canResetCredential = isCodexRouteSupported("credentialReset");
 	const canUpdateCredential = isCodexRouteSupported("credentialUpdate");
 	const canDeleteCredential = isCodexRouteSupported("credentialDelete");
+	const canArchiveCredential =
+		isCodexRouteSupported("credentialArchive") && isCodexRouteSupported("credentialUnarchive");
 	const canBatchDeleteCredentials = isCodexRouteSupported("credentialBatchDelete");
 	const canDeleteUnhealthyCredentials = isCodexRouteSupported("credentialDeleteUnhealthy");
 	const canImportCredentials = isCodexRouteSupported("import");
@@ -466,6 +480,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 	const [availablePage, setAvailablePage] = useState(1);
 	const [unavailablePage, setUnavailablePage] = useState(1);
+	const [archivedPage, setArchivedPage] = useState(1);
 	const PAGE_SIZE = 20;
 	const tierOrderSensors = useSensors(
 		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -495,8 +510,13 @@ export const CodexSection = React.memo(function CodexSection({
 		queryFn: api.getSettings,
 	});
 	const { data: status } = useQuery({
-		queryKey: ["codex", "status", { availablePage, unavailablePage, pageSize: PAGE_SIZE }],
-		queryFn: () => api.codexStatus({ availablePage, unavailablePage, pageSize: PAGE_SIZE }),
+		queryKey: [
+			"codex",
+			"status",
+			{ availablePage, unavailablePage, archivedPage, pageSize: PAGE_SIZE },
+		],
+		queryFn: () =>
+			api.codexStatus({ availablePage, unavailablePage, archivedPage, pageSize: PAGE_SIZE }),
 		enabled: canReadCodexStatus,
 		refetchInterval: (query) => {
 			if (browserAuthPending) return 3_000;
@@ -509,6 +529,17 @@ export const CodexSection = React.memo(function CodexSection({
 		queryKey: ["codex", "fingerprint"],
 		queryFn: api.codexGetFingerprint,
 		enabled: canReadCodexStatus,
+	});
+	// Lifetime totals come from their own durable table, so they are fetched
+	// separately from the pool snapshot and refresh far less often.
+	const { data: lifetimeTotalsData } = useQuery({
+		queryKey: LIFETIME_TOTALS_QUERY_KEY,
+		queryFn: api.codexCredentialUsageTotals,
+		enabled: canReadCodexStatus,
+		refetchInterval: 60_000,
+		// The rollup only moves as requests complete, so a minute-old value is
+		// fine; without this every remount refires the query on top of the poll.
+		staleTime: 30_000,
 	});
 
 	// Seed local fingerprint state from server data once loaded.
@@ -529,11 +560,20 @@ export const CodexSection = React.memo(function CodexSection({
 	const entries = status?.entries ?? [];
 	const availableEntries = status?.availableEntries ?? [];
 	const unavailableEntries = status?.unavailableEntries ?? [];
+	const archivedEntries = status?.archivedEntries ?? [];
 	const availableTotal = status?.availableTotal ?? 0;
 	const unavailableTotal = status?.unavailableTotal ?? 0;
+	const archivedTotal = status?.archivedTotal ?? 0;
 	const unhealthyTotal = status?.unhealthyTotal ?? 0;
 	const loadBalancingMode = status?.loadBalancingMode ?? "tier-balanced";
 	const usageCache = status?.usageCache ?? {};
+	const lifetimeTotals = useMemo(() => {
+		const map: Record<string, CredentialUsageTotals> = {};
+		for (const entry of lifetimeTotalsData?.entries ?? []) {
+			map[entry.credentialId] = entry;
+		}
+		return map;
+	}, [lifetimeTotalsData]);
 	const stickySessionCount = status?.stickySessionCount ?? 0;
 	const lastBrowserAuthError = status?.lastBrowserAuthError;
 	const statusTierOrder = status ? status.tierOrder : null;
@@ -541,9 +581,18 @@ export const CodexSection = React.memo(function CodexSection({
 	useEffect(() => {
 		const maxAvailablePage = Math.max(1, Math.ceil(availableTotal / PAGE_SIZE));
 		const maxUnavailablePage = Math.max(1, Math.ceil(unavailableTotal / PAGE_SIZE));
+		const maxArchivedPage = Math.max(1, Math.ceil(archivedTotal / PAGE_SIZE));
 		if (availablePage > maxAvailablePage) setAvailablePage(maxAvailablePage);
 		if (unavailablePage > maxUnavailablePage) setUnavailablePage(maxUnavailablePage);
-	}, [availableTotal, unavailableTotal, availablePage, unavailablePage]);
+		if (archivedPage > maxArchivedPage) setArchivedPage(maxArchivedPage);
+	}, [
+		availableTotal,
+		unavailableTotal,
+		archivedTotal,
+		availablePage,
+		unavailablePage,
+		archivedPage,
+	]);
 
 	useEffect(() => {
 		if (!status) return;
@@ -609,6 +658,19 @@ export const CodexSection = React.memo(function CodexSection({
 	});
 	const deleteMut = useMutation({
 		mutationFn: (id: string) => api.codexCredentialDelete(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			// Deletion clears the server-side rollup; refetch so the removed
+			// account's lifetime totals disappear with it.
+			qc.invalidateQueries({ queryKey: LIFETIME_TOTALS_QUERY_KEY });
+		},
+	});
+	const archiveMut = useMutation({
+		mutationFn: (id: string) => api.codexCredentialArchive(id),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["codex", "status"] }),
+	});
+	const unarchiveMut = useMutation({
+		mutationFn: (id: string) => api.codexCredentialUnarchive(id),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["codex", "status"] }),
 	});
 	const updateMut = useMutation({
@@ -707,6 +769,7 @@ export const CodexSection = React.memo(function CodexSection({
 		onSuccess: (data) => {
 			setSelectedIds(new Set());
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			qc.invalidateQueries({ queryKey: LIFETIME_TOTALS_QUERY_KEY });
 			notifications.show({
 				message: t("codexBatchDeleteSuccess", { count: data.removed.length }),
 				color: "green",
@@ -718,6 +781,7 @@ export const CodexSection = React.memo(function CodexSection({
 		onSuccess: (data) => {
 			setSelectedIds(new Set());
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			qc.invalidateQueries({ queryKey: LIFETIME_TOTALS_QUERY_KEY });
 			notifications.show({
 				message: t("codexDeleteUnhealthySuccess", { count: data.removed.length }),
 				color: "green",
@@ -1371,6 +1435,7 @@ export const CodexSection = React.memo(function CodexSection({
 								onPageChange={setAvailablePage}
 								currentId={status?.currentId}
 								usageCache={usageCache}
+								lifetimeTotals={lifetimeTotals}
 								editingId={editingId}
 								editForm={editForm}
 								onEdit={handleEdit}
@@ -1382,6 +1447,8 @@ export const CodexSection = React.memo(function CodexSection({
 								disableMut={disableMut}
 								resetMut={resetMut}
 								deleteMut={deleteMut}
+								archiveMut={archiveMut}
+								unarchiveMut={unarchiveMut}
 								selectedIds={selectedIds}
 								onToggleSelect={toggleSelect}
 								onToggleSelectAll={toggleSelectAll}
@@ -1392,6 +1459,7 @@ export const CodexSection = React.memo(function CodexSection({
 								canResetCredential={canResetCredential}
 								canUpdateCredential={canUpdateCredential}
 								canDeleteCredential={canDeleteCredential}
+								canArchiveCredential={canArchiveCredential}
 								credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
 							/>
 						</Stack>
@@ -1415,6 +1483,7 @@ export const CodexSection = React.memo(function CodexSection({
 								onPageChange={setUnavailablePage}
 								currentId={status?.currentId}
 								usageCache={usageCache}
+								lifetimeTotals={lifetimeTotals}
 								editingId={editingId}
 								editForm={editForm}
 								onEdit={handleEdit}
@@ -1426,6 +1495,8 @@ export const CodexSection = React.memo(function CodexSection({
 								disableMut={disableMut}
 								resetMut={resetMut}
 								deleteMut={deleteMut}
+								archiveMut={archiveMut}
+								unarchiveMut={unarchiveMut}
 								selectedIds={selectedIds}
 								onToggleSelect={toggleSelect}
 								onToggleSelectAll={toggleSelectAll}
@@ -1436,6 +1507,60 @@ export const CodexSection = React.memo(function CodexSection({
 								canResetCredential={canResetCredential}
 								canUpdateCredential={canUpdateCredential}
 								canDeleteCredential={canDeleteCredential}
+								canArchiveCredential={canArchiveCredential}
+								credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
+							/>
+						</Stack>
+					)}
+
+					{archivedTotal > 0 && (
+						<Stack gap="xs">
+							<Group justify="space-between">
+								<Stack gap={2}>
+									<Text size="sm" fw={500}>
+										{t("codexCredentialsArchived")}
+									</Text>
+									<Text size="xs" c="dimmed">
+										{t("codexCredentialsArchivedDesc")}
+									</Text>
+								</Stack>
+								<Badge size="sm" color="gray">
+									{archivedTotal}
+								</Badge>
+							</Group>
+							<CredentialList
+								entries={archivedEntries}
+								totalEntries={archivedTotal}
+								page={archivedPage}
+								pageSize={PAGE_SIZE}
+								onPageChange={setArchivedPage}
+								currentId={status?.currentId}
+								usageCache={usageCache}
+								lifetimeTotals={lifetimeTotals}
+								editingId={editingId}
+								editForm={editForm}
+								onEdit={handleEdit}
+								onSaveEdit={handleSaveEdit}
+								onCancelEdit={() => setEditingId(null)}
+								onEditFormChange={setEditForm}
+								usageMut={usageMut}
+								enableMut={enableMut}
+								disableMut={disableMut}
+								resetMut={resetMut}
+								deleteMut={deleteMut}
+								archiveMut={archiveMut}
+								unarchiveMut={unarchiveMut}
+								selectedIds={selectedIds}
+								onToggleSelect={toggleSelect}
+								onToggleSelectAll={toggleSelectAll}
+								t={t}
+								canQueryCredentialUsage={canQueryCredentialUsage}
+								canEnableCredential={canEnableCredential}
+								canDisableCredential={canDisableCredential}
+								canResetCredential={canResetCredential}
+								canUpdateCredential={canUpdateCredential}
+								canDeleteCredential={canDeleteCredential}
+								canArchiveCredential={canArchiveCredential}
 								credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
 							/>
 						</Stack>
@@ -1509,30 +1634,35 @@ export const CodexSection = React.memo(function CodexSection({
 });
 
 // Credential list wrapper (responsive)
-function CredentialList(props: {
-	entries: Array<{
-		id: string;
-		displayName?: string;
-		authMode?: CodexAuthMode;
-		accountId?: string;
-		priority: number;
-		disabled: boolean;
-		disabledReason?: string;
-		successCount: number;
-		failureCount: number;
-		lastUsedAt?: string;
-		expiresAt?: number;
-	}>;
+interface CodexCredentialListEntry {
+	id: string;
+	displayName?: string;
+	authMode?: CodexAuthMode;
+	accountId?: string;
+	priority: number;
+	disabled: boolean;
+	disabledReason?: string;
+	/** Set when the credential is archived (retired from the pool, data retained). */
+	archivedAt?: number;
+	successCount: number;
+	failureCount: number;
+	lastUsedAt?: string;
+	expiresAt?: number;
+}
+
+interface CodexCredentialListProps {
+	entries: CodexCredentialListEntry[];
 	totalEntries: number;
 	page: number;
 	pageSize: number;
 	onPageChange: (page: number) => void;
 	currentId?: string;
 	usageCache: Record<string, CodexUsageData>;
+	/** Lifetime token/cost totals keyed by credential id. */
+	lifetimeTotals: Record<string, CredentialUsageTotals>;
 	editingId: string | null;
 	editForm: { displayName: string; priority: number };
-	// biome-ignore lint/suspicious/noExplicitAny: entry type matches parent array
-	onEdit: (entry: any) => void;
+	onEdit: (entry: CodexCredentialListEntry) => void;
 	onSaveEdit: () => void;
 	onCancelEdit: () => void;
 	onEditFormChange: (form: { displayName: string; priority: number }) => void;
@@ -1547,6 +1677,10 @@ function CredentialList(props: {
 	resetMut: any;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
 	deleteMut: any;
+	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
+	archiveMut: any;
+	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
+	unarchiveMut: any;
 	selectedIds: Set<string>;
 	onToggleSelect: (id: string) => void;
 	onToggleSelectAll: (entryIds: string[]) => void;
@@ -1557,8 +1691,65 @@ function CredentialList(props: {
 	canResetCredential: boolean;
 	canUpdateCredential: boolean;
 	canDeleteCredential: boolean;
+	canArchiveCredential: boolean;
 	credentialRouteUnsupportedReason: string;
+}
+
+/**
+ * Lifetime token + USD consumption for one credential.
+ *
+ * The dollar figure is at OpenAI's official reference prices. A ChatGPT
+ * subscription is not billed per token, so this is "what these tokens would
+ * have cost through the metered API" — the tooltip says so, because presenting
+ * it as spend would be wrong.
+ */
+function CodexLifetimeUsageCell({
+	totals,
+	t,
+}: {
+	totals?: CredentialUsageTotals;
+	t: (key: string, options?: Record<string, unknown>) => string;
 }) {
+	if (!totals || totals.requestCount === 0) {
+		return (
+			<Text size="xs" c="dimmed">
+				-
+			</Text>
+		);
+	}
+	const tokens = formatCompactNumber(totals.totalTokens);
+	const cost = totals.costUsd;
+	// A cost of exactly 0 with requests on record means nothing could be priced.
+	// "$0.0000*" reads as "this was free"; an em dash says "unknown", which is all
+	// we actually know. Kept as a symbol rather than a translated string so it
+	// needs no locale entry.
+	const costLabel = cost > 0 ? `$${cost >= 0.01 ? cost.toFixed(2) : cost.toFixed(4)}` : "—";
+	return (
+		<Tooltip
+			multiline
+			w={280}
+			label={
+				`${t("codexLifetimeTokensExact", { count: tokens.exact })}\n` +
+				`${t("codexLifetimeRequests", { count: totals.requestCount })}\n` +
+				`${t("codexLifetimeCostNote")}` +
+				(totals.costIsPartial
+					? `\n${t("codexLifetimeCostPartial", { count: totals.unpricedRequestCount })}`
+					: "")
+			}
+			style={{ whiteSpace: "pre-line" }}
+		>
+			<Stack gap={0}>
+				<Text size="xs">{tokens.compact}</Text>
+				<Text size="xs" c="dimmed">
+					{costLabel}
+					{totals.costIsPartial ? "*" : ""}
+				</Text>
+			</Stack>
+		</Tooltip>
+	);
+}
+
+function CredentialList(props: CodexCredentialListProps) {
 	const {
 		entries,
 		totalEntries,
@@ -1567,6 +1758,7 @@ function CredentialList(props: {
 		onPageChange,
 		currentId,
 		usageCache,
+		lifetimeTotals,
 		editingId,
 		editForm,
 		onEdit,
@@ -1578,6 +1770,8 @@ function CredentialList(props: {
 		disableMut,
 		resetMut,
 		deleteMut,
+		archiveMut,
+		unarchiveMut,
 		selectedIds,
 		onToggleSelect,
 		onToggleSelectAll,
@@ -1588,6 +1782,7 @@ function CredentialList(props: {
 		canResetCredential,
 		canUpdateCredential,
 		canDeleteCredential,
+		canArchiveCredential,
 		credentialRouteUnsupportedReason,
 	} = props;
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY);
@@ -1623,6 +1818,7 @@ function CredentialList(props: {
 						<Table.Th>{t("codexColStatus")}</Table.Th>
 						<Table.Th>{t("codexColStats")}</Table.Th>
 						<Table.Th>{t("codexColUsage")}</Table.Th>
+						<Table.Th>{t("codexColLifetime")}</Table.Th>
 						<Table.Th>{t("codexColLastUsed")}</Table.Th>
 						<Table.Th>{t("codexColActions")}</Table.Th>
 					</Table.Tr>
@@ -1680,15 +1876,7 @@ function CredentialList(props: {
 									)}
 								</Table.Td>
 								<Table.Td>
-									{entry.disabled ? (
-										<Badge size="sm" color="red">
-											{entry.disabledReason || "Disabled"}
-										</Badge>
-									) : (
-										<Badge size="sm" color="green">
-											Active
-										</Badge>
-									)}
+									<CodexCredentialStatusBadge entry={entry} t={t} />
 								</Table.Td>
 								<Table.Td>
 									<Text size="xs">
@@ -1697,6 +1885,9 @@ function CredentialList(props: {
 								</Table.Td>
 								<Table.Td>
 									<CodexUsageDisplay usage={usage} />
+								</Table.Td>
+								<Table.Td>
+									<CodexLifetimeUsageCell totals={lifetimeTotals[entry.id]} t={t} />
 								</Table.Td>
 								<Table.Td>
 									<Text size="xs" c="dimmed">
@@ -1801,6 +1992,14 @@ function CredentialList(props: {
 														</ActionIcon>
 													</Tooltip>
 												)}
+												<CodexArchiveActionIcon
+													entry={entry}
+													archiveMut={archiveMut}
+													unarchiveMut={unarchiveMut}
+													canArchiveCredential={canArchiveCredential}
+													credentialRouteUnsupportedReason={credentialRouteUnsupportedReason}
+													t={t}
+												/>
 												<Tooltip label={t("codexDelete")}>
 													<ActionIcon
 														size="sm"
@@ -1844,56 +2043,77 @@ function CredentialList(props: {
 	);
 }
 
-// Mobile: card layout
-function CredentialCards(props: {
-	entries: Array<{
-		id: string;
-		displayName?: string;
-		authMode?: CodexAuthMode;
-		accountId?: string;
-		priority: number;
-		disabled: boolean;
-		disabledReason?: string;
-		successCount: number;
-		failureCount: number;
-		lastUsedAt?: string;
-		expiresAt?: number;
-	}>;
-	totalEntries: number;
-	page: number;
-	pageSize: number;
-	onPageChange: (page: number) => void;
-	currentId?: string;
-	usageCache: Record<string, CodexUsageData>;
-	editingId: string | null;
-	editForm: { displayName: string; priority: number };
-	// biome-ignore lint/suspicious/noExplicitAny: entry type matches parent array
-	onEdit: (entry: any) => void;
-	onSaveEdit: () => void;
-	onCancelEdit: () => void;
-	onEditFormChange: (form: { displayName: string; priority: number }) => void;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
-	usageMut: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
-	enableMut: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
-	disableMut: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
-	resetMut: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
-	deleteMut: any;
-	selectedIds: Set<string>;
-	onToggleSelect: (id: string) => void;
-	onToggleSelectAll: (entryIds: string[]) => void;
+/**
+ * Status badge for one Codex credential. Archived wins over enabled/disabled:
+ * an archived credential never serves traffic regardless of its stored
+ * disabled flag, so showing "Active" for it would be misleading.
+ */
+function CodexCredentialStatusBadge({
+	entry,
+	t,
+}: {
+	entry: Pick<CodexCredentialListEntry, "disabled" | "disabledReason" | "archivedAt">;
 	t: (key: string) => string;
-	canQueryCredentialUsage: boolean;
-	canEnableCredential: boolean;
-	canDisableCredential: boolean;
-	canResetCredential: boolean;
-	canUpdateCredential: boolean;
-	canDeleteCredential: boolean;
-	credentialRouteUnsupportedReason: string;
 }) {
+	if (entry.archivedAt) {
+		return (
+			<Badge size="sm" color="gray">
+				{t("codexArchived")}
+			</Badge>
+		);
+	}
+	if (entry.disabled) {
+		return (
+			<Badge size="sm" color="red">
+				{entry.disabledReason || "Disabled"}
+			</Badge>
+		);
+	}
+	return (
+		<Badge size="sm" color="green">
+			Active
+		</Badge>
+	);
+}
+
+/** Archive / unarchive toggle for one credential row. */
+function CodexArchiveActionIcon({
+	entry,
+	archiveMut,
+	unarchiveMut,
+	canArchiveCredential,
+	credentialRouteUnsupportedReason,
+	t,
+}: {
+	entry: Pick<CodexCredentialListEntry, "id" | "archivedAt">;
+	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
+	archiveMut: any;
+	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
+	unarchiveMut: any;
+	canArchiveCredential: boolean;
+	credentialRouteUnsupportedReason: string;
+	t: (key: string) => string;
+}) {
+	const isArchived = !!entry.archivedAt;
+	const mut = isArchived ? unarchiveMut : archiveMut;
+	return (
+		<Tooltip label={t(isArchived ? "codexUnarchive" : "codexArchive")}>
+			<ActionIcon
+				size="sm"
+				color={isArchived ? "teal" : "gray"}
+				onClick={() => canArchiveCredential && mut.mutate(entry.id)}
+				loading={mut.isPending}
+				disabled={!canArchiveCredential}
+				title={!canArchiveCredential ? credentialRouteUnsupportedReason : undefined}
+			>
+				{isArchived ? <IconArchiveOff size={16} /> : <IconArchive size={16} />}
+			</ActionIcon>
+		</Tooltip>
+	);
+}
+
+// Mobile: card layout
+function CredentialCards(props: CodexCredentialListProps) {
 	const {
 		entries,
 		totalEntries,
@@ -1902,6 +2122,7 @@ function CredentialCards(props: {
 		onPageChange,
 		currentId,
 		usageCache,
+		lifetimeTotals,
 		editingId,
 		editForm,
 		onEdit,
@@ -1913,6 +2134,8 @@ function CredentialCards(props: {
 		disableMut,
 		resetMut,
 		deleteMut,
+		archiveMut,
+		unarchiveMut,
 		selectedIds,
 		onToggleSelect,
 		t,
@@ -1922,6 +2145,7 @@ function CredentialCards(props: {
 		canResetCredential,
 		canUpdateCredential,
 		canDeleteCredential,
+		canArchiveCredential,
 		credentialRouteUnsupportedReason,
 	} = props;
 
@@ -1966,15 +2190,7 @@ function CredentialCards(props: {
 									<CodexAuthModeBadge authMode={entry.authMode} />
 								</Group>
 								<Group gap="xs">
-									{entry.disabled ? (
-										<Badge color="red" size="sm">
-											{entry.disabledReason || "Disabled"}
-										</Badge>
-									) : (
-										<Badge color="green" size="sm">
-											Active
-										</Badge>
-									)}
+									<CodexCredentialStatusBadge entry={entry} t={t} />
 								</Group>
 							</Group>
 
@@ -2063,6 +2279,14 @@ function CredentialCards(props: {
 										</Text>
 										<CodexUsageDisplay usage={usage} />
 									</Stack>
+
+									{/* Row 3b: Lifetime consumption */}
+									<Group justify="space-between" wrap="nowrap">
+										<Text size="xs" c="dimmed">
+											{t("codexColLifetime")}
+										</Text>
+										<CodexLifetimeUsageCell totals={lifetimeTotals[entry.id]} t={t} />
+									</Group>
 								</>
 							)}
 
@@ -2127,6 +2351,20 @@ function CredentialCards(props: {
 												{t("codexReset")}
 											</Button>
 										)}
+										<Button
+											variant="subtle"
+											size="compact-xs"
+											color={entry.archivedAt ? "teal" : "gray"}
+											onClick={() =>
+												canArchiveCredential &&
+												(entry.archivedAt ? unarchiveMut : archiveMut).mutate(entry.id)
+											}
+											loading={(entry.archivedAt ? unarchiveMut : archiveMut).isPending}
+											disabled={!canArchiveCredential}
+											title={!canArchiveCredential ? credentialRouteUnsupportedReason : undefined}
+										>
+											{t(entry.archivedAt ? "codexUnarchive" : "codexArchive")}
+										</Button>
 										<ActionIcon
 											variant="subtle"
 											color="red"

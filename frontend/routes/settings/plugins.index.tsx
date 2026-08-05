@@ -31,7 +31,6 @@ import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider"
 import { isPluginsDisabledError, localizePluginError } from "../../components/plugins-admin/errors";
 import { PluginInstallModal } from "../../components/plugins-admin/PluginInstallModal";
 import { PluginStatusBadge } from "../../components/plugins-admin/PluginStatusBadge";
-import { PluginTrustBadges } from "../../components/plugins-admin/PluginTrustBadges";
 import {
 	pluginKeys,
 	useDisablePlugin,
@@ -209,7 +208,6 @@ function SettingsPluginsPage() {
 								<Table.Th>{t("admin.table.name")}</Table.Th>
 								<Table.Th>{t("admin.table.status")}</Table.Th>
 								<Table.Th>{t("admin.table.version")}</Table.Th>
-								<Table.Th>{t("admin.table.trust")}</Table.Th>
 								<Table.Th>{t("admin.table.diagnostics")}</Table.Th>
 								<Table.Th>{t("admin.table.actions")}</Table.Th>
 							</Table.Tr>
@@ -242,9 +240,6 @@ function SettingsPluginsPage() {
 										</Table.Td>
 										<Table.Td>
 											<Text size="sm">{plugin.version ?? "—"}</Text>
-										</Table.Td>
-										<Table.Td>
-											<PluginTrustBadges trustTier={plugin.trustTier} />
 										</Table.Td>
 										<Table.Td>
 											{diagnosticCount > 0 ? (

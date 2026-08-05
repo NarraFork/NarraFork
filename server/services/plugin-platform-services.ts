@@ -1,5 +1,7 @@
 import { logger } from "@server/lib/logger";
+import { getOutboundProxy } from "@server/lib/net/proxy";
 import type { JsonValue } from "@server/lib/plugins/protocol";
+import { registerExtraSearchChannelSource } from "@server/lib/search/plugin-source";
 import { registerExtraModelSource } from "@server/lib/settings";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
 import {
@@ -33,6 +35,7 @@ import {
 	pluginProviderRegistry as defaultPluginProviderRegistry,
 	type PluginProviderRegistry,
 } from "./plugin-provider-registry";
+import type { ProviderHostHints } from "./plugin-provider-rpc";
 import {
 	CommandRegistry,
 	PluginPublicApi,
@@ -41,6 +44,8 @@ import {
 } from "./plugin-public-api";
 import { RuntimeSupervisor } from "./plugin-runtime";
 import { PluginScheduler } from "./plugin-scheduler";
+import { PluginSearchRegistry } from "./plugin-search-registry";
+import { pluginSearchChannelSource } from "./plugin-search-source";
 import { PluginSecretBroker } from "./plugin-secret-broker";
 import { type PluginSecretVault, pluginSecretVault } from "./plugin-secret-vault";
 import { PluginStateStore } from "./plugin-state-store";
@@ -110,6 +115,8 @@ export interface PluginPlatformServicesOptions {
 	pluginCommandRegistry?: PluginCommandRegistry;
 	mcpAdapter?: PluginMcpAdapter;
 	providerRegistry?: PluginProviderRegistry;
+	/** Registry of `contributes.searchProviders` sources. */
+	searchRegistry?: PluginSearchRegistry;
 	providerClientPool?: PluginProviderClientPool;
 	providerCatalogRefresher?: PluginProviderCatalogRefresher;
 	contributionRegistry?: PluginContributionRegistry;
@@ -528,6 +535,20 @@ export function createPluginPlatformServices(
 	});
 	const resolveProviderConfig = (providerInstanceId: string) =>
 		providerCredentialResolver.resolve(providerInstanceId);
+	// Resolve host-provided hints (proxy, concurrency budget) for plugin provider requests.
+	// reflected immediately without restarting plugins.
+	//
+	// Concurrency budget is intentionally not populated: the only value the host could send
+	// is the plugin's own declared maxConcurrentChat, which is noise. Real cross-path budget
+	const resolveProviderHostHints = (): ProviderHostHints | undefined => {
+		const proxyUrl = getOutboundProxy();
+		// Only build hints when there is at least one piece of information to deliver.
+		// An empty object would be harmless but noisy on the wire.
+		if (!proxyUrl) return undefined;
+		return {
+			outbound: { proxyUrl },
+		};
+	};
 	// Give registered providers a working `createAdapter()`. The runtime is resolved
 	// (and started if needed) on first chat/generate rather than at registration, so
 	// a catalog refresh never spawns plugin processes.
@@ -535,6 +556,7 @@ export function createPluginPlatformServices(
 		createPluginProviderAdapterFactory({
 			clientPool: providerClientPool,
 			resolveConfig: resolveProviderConfig,
+			resolveHostHints: resolveProviderHostHints,
 		}),
 	);
 	const providerCatalogRefresher =
@@ -543,6 +565,7 @@ export function createPluginPlatformServices(
 			registry: providerRegistry,
 			clientPool: providerClientPool,
 			resolveConfig: resolveProviderConfig,
+			resolveHostHints: resolveProviderHostHints,
 		});
 	const providerConfigService = new PluginProviderConfigService({
 		registry: providerRegistry,
@@ -556,6 +579,24 @@ export function createPluginPlatformServices(
 		listModels: () => listPluginProviderModelValues(providerRegistry),
 		resolveProvider: (bareModel) => findPluginProviderForModel(providerRegistry, bareModel),
 	});
+	// Plugin-contributed web search sources. Credentials and config come from the provider
+	// each source binds to, which is why this reuses the provider registry, credential
+	// resolver and client pool rather than owning any of them.
+	const searchRegistry =
+		options.searchRegistry ??
+		new PluginSearchRegistry({
+			providerRegistry,
+			credentialResolver: providerCredentialResolver,
+			// Availability is decided synchronously on a hot path, so secret presence is read
+			// from the vault's in-memory document rather than awaited.
+			secretPeek: secretVault,
+			resolveClient: (input) => providerClientPool.get(input).acquire(),
+			resolveHostHints: resolveProviderHostHints,
+		});
+	// Warm the vault so the first synchronous availability check can see stored secrets
+	// instead of reporting every credentialed channel as unconfigured.
+	void secretVault.warm().catch(() => undefined);
+	registerExtraSearchChannelSource("plugins", pluginSearchChannelSource(searchRegistry));
 	const contributionCoordinator =
 		options.contributionCoordinator ??
 		new PluginContributionCoordinator({
@@ -563,6 +604,7 @@ export function createPluginPlatformServices(
 			toolRegistry,
 			pluginCommandRegistry,
 			providerRegistry,
+			searchRegistry,
 			agentToolBridge: toolBridge,
 			lifecycleStates: () => stateStore.listStates(),
 			// Synchronous read from the already-loaded state document, so a restart
@@ -623,6 +665,7 @@ export function createPluginPlatformServices(
 		pluginCommandRegistry,
 		mcpAdapter,
 		providerRegistry,
+		searchRegistry,
 		providerClientPool,
 		providerCatalogRefresher,
 		providerConfigService,

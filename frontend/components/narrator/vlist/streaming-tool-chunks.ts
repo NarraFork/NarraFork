@@ -33,6 +33,14 @@ import {
 /** Live per-tool state for the streaming row, keyed by toolUseId in arrival order. */
 export type StreamingToolStore = Map<string, TopLevelStreamingChunk>;
 
+/**
+ * Placeholder for an entry created by an event that carries no tool name.
+ *
+ * Only `tool_executing` can do that, and only when it arrives before `tool_started`
+ * (eager execution). It is replaced the moment the named event lands.
+ */
+const UNKNOWN_TOOL_NAME = "Tool";
+
 export function createStreamingToolStore(): StreamingToolStore {
 	return new Map();
 }
@@ -102,8 +110,80 @@ export interface ToolStartedEvent {
 }
 
 /**
- * Promote a tool to RUNNING. From here the card renders as a real tool card with
- * its resolved input rather than an argument-progress placeholder.
+ * Lifecycle phases a live tool entry can be in, ordered. Used ONLY to stop a late
+ * event from moving a tool BACKWARDS (see `resolveLiveToolStatus`).
+ *
+ * `pending` deliberately shares rank 1 with `initializing`: it is a sibling outcome
+ * of the permission gate ("waiting on a human"), not a later phase, and the events
+ * that set it are authoritative in their own right.
+ */
+const LIVE_TOOL_PHASE_RANK: Readonly<Record<string, number>> = {
+	streaming: 0,
+	initializing: 1,
+	pending: 1,
+	running: 2,
+	// Anything terminal outranks everything: a completed tool must never reopen.
+	success: 3,
+	completed: 3,
+	fail: 3,
+	failed: 3,
+	error: 3,
+	cancelled: 3,
+	canceled: 3,
+	aborted: 3,
+	denied: 3,
+	timeout: 3,
+};
+
+/**
+ * Whether moving from `existing` to `incoming` would take a tool BACKWARDS.
+ *
+ * ⚠️ This exists because the server does NOT guarantee event order. `loop.ts` starts
+ * eager execution BEFORE it yields `tool_call` (:3514-3538), so for the majority of
+ * tools `tool_executing` reaches the client first and `tool_started` lands after it.
+ * Without this guard, `tool_started`'s `initializing` would overwrite `running` and a
+ * tool that is demonstrably executing would fall back to the neutral shimmer.
+ *
+ * Unknown statuses never count as a regression, because refusing an unrecognised
+ * status would silently freeze a card on a state this frontend does understand — the
+ * worse failure of the two.
+ *
+ * Exported so the persisted-document channel (`vlist-live-patch`) applies the SAME
+ * rule as the live store; two copies of an ordering rule is how they drift.
+ */
+export function isLiveToolStatusRegression(existing: unknown, incoming: unknown): boolean {
+	if (typeof existing !== "string" || typeof incoming !== "string") return false;
+	const existingRank = LIVE_TOOL_PHASE_RANK[existing];
+	const incomingRank = LIVE_TOOL_PHASE_RANK[incoming];
+	if (existingRank === undefined || incomingRank === undefined) return false;
+	return existingRank > incomingRank;
+}
+
+/** The status a live entry should keep when an event carrying `incoming` arrives. */
+function resolveLiveToolStatus(existing: string | undefined, incoming: string): string {
+	return isLiveToolStatusRegression(existing, incoming) ? (existing as string) : incoming;
+}
+
+/**
+ * Fold `tool_started`: the tool's INPUT finished parsing.
+ *
+ * ⚠️ NOT the start of execution, which is the distinction this whole event chain was
+ * missing. The server yields `tool_call` right after CALLING `executeTool`, and the
+ * permission gate is the first thing inside — so at this point the tool may still be
+ * waiting on a human. `tool_executing` is what proves execution began; see
+ * `applyStreamingToolExecuting` and `@shared/tool-shimmer`.
+ *
+ * The card still switches from an argument-progress placeholder to a real tool card
+ * here, because that transition is about having a complete input to show — which IS
+ * true now.
+ *
+ * ⚠️ This event MUST NOT be dropped when a later phase already landed, even though
+ * `applyStreamingToolChunk` above does exactly that for a late argument chunk. The
+ * situations differ: a late chunk carries nothing unique, whereas `tool_started` is
+ * the ONLY carrier of `_input` (the parsed arguments). Dropping it wholesale would
+ * leave `_input` empty forever, and `buildTopLevelStreamingChunksMsg`'s
+ * `chunk._input ?? {}` would render a card with no file path and no command — trading
+ * a colour error for missing content. So the guard is scoped to `_status` alone.
  */
 export function applyStreamingToolStarted(
 	store: StreamingToolStore,
@@ -112,15 +192,64 @@ export function applyStreamingToolStarted(
 	if (!event.toolUseId) return false;
 	const existing = store.get(event.toolUseId);
 	store.set(event.toolUseId, {
-		toolUseId: event.toolUseId,
-		toolName: event.toolName || existing?.toolName || "Tool",
 		inputCharsTotal: existing?.inputCharsTotal ?? 0,
 		...existing,
+		toolUseId: event.toolUseId,
+		// AFTER the spread, not before: `applyStreamingToolExecuting` may have created this
+		// entry with a placeholder name (it gets no name of its own), and `...existing`
+		// would otherwise let that placeholder shadow the real one this event carries.
+		toolName: event.toolName || existing?.toolName || UNKNOWN_TOOL_NAME,
 		_started: true,
-		_status: "running",
+		// Field-scoped guard: everything else in this object still merges normally.
+		_status: resolveLiveToolStatus(existing?._status, "initializing"),
 		...(event.input ? { _input: event.input } : {}),
 		...(event.streamStartedAt != null ? { _startedAt: event.streamStartedAt } : {}),
 		...(event.metadata ? { _metadata: event.metadata } : {}),
+	});
+	return true;
+}
+
+export interface ToolExecutingEvent {
+	toolUseId: string;
+	executionStartedAt?: number;
+}
+
+/**
+ * Fold `tool_executing`: the permission gate passed and the tool is now running.
+ *
+ * This is the positive evidence the blue "executing" shimmer needs. Before this event
+ * existed the client had to assume `tool_started` meant execution — the auto-allow
+ * path writes `running` to the database and broadcasts nothing, so no later frame
+ * supplied it — which is why a card awaiting approval used to animate as though work
+ * were under way.
+ *
+ * Creates the entry when the tool is unknown, unlike `applyStreamingToolOutput` below
+ * which deliberately ignores unknown ids. The asymmetry is intentional: eager
+ * execution means this event can legitimately arrive BEFORE `tool_started`, so
+ * discarding it would lose the one fact it carries. A later `tool_started` then fills
+ * in the input without demoting the status.
+ */
+export function applyStreamingToolExecuting(
+	store: StreamingToolStore,
+	event: ToolExecutingEvent,
+): boolean {
+	if (!event.toolUseId) return false;
+	const existing = store.get(event.toolUseId);
+	const nextStatus = resolveLiveToolStatus(existing?._status, "running");
+	// Nothing to do when a terminal status already won — avoids a pointless rerender.
+	if (existing && existing._status === nextStatus && existing._started) return false;
+	store.set(event.toolUseId, {
+		inputCharsTotal: existing?.inputCharsTotal ?? 0,
+		...existing,
+		toolUseId: event.toolUseId,
+		// This event carries NO tool name of its own. The placeholder only ever survives
+		// until `tool_started` lands (which may be after this frame, hence the ordering
+		// note over there); it must never overwrite a name already known.
+		toolName: existing?.toolName ?? UNKNOWN_TOOL_NAME,
+		// A tool that is executing has necessarily finished parsing its input, so the
+		// card should render as a real card even if `tool_started` has not landed yet.
+		_started: true,
+		_status: nextStatus,
 	});
 	return true;
 }

@@ -171,6 +171,29 @@ function shikiLanguageAliases(): Plugin {
 }
 
 /**
+ * Watch `shared/` explicitly — it sits OUTSIDE the Vite `root` (`frontend/`).
+ *
+ * Out-of-root modules are served fine (via `/@fs/…`) but the dev server's watcher
+ * does not pick them up, so the transform result is cached for the lifetime of the
+ * process: editing `shared/**` leaves the browser importing the PREVIOUS version.
+ * The failure is silent and misleading — a newly added export shows up as
+ * "does not provide an export named 'X'" even though the file on disk has it, and
+ * disk-based checks (`bun test`, `tsgo`) all pass because they never consult the
+ * dev server's graph. Adding the directory to the watcher makes an edit under
+ * `shared/` invalidate the module the same way an in-root edit does.
+ */
+function watchSharedDirectory(): Plugin {
+	const sharedDir = resolve(__dirname, "..", "shared");
+	return {
+		name: "narrafork-watch-shared",
+		apply: "serve",
+		configureServer(server) {
+			server.watcher.add(sharedDir);
+		},
+	};
+}
+
+/**
  * Vite 8/Rolldown closes the input build before output hooks run. Move PWA's SW
  * generation to writeBundle so final emitted HTML can be captured first.
  */
@@ -307,6 +330,7 @@ export default defineConfig(({ mode, command }) => {
 			__LICENSE_DATA__: JSON.stringify(licenseData),
 		},
 		plugins: [
+			watchSharedDirectory(),
 			shikiLanguageAliases(),
 			shikiRuntimeAssets(),
 			TanStackRouterVite({

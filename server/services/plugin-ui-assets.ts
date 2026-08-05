@@ -3,7 +3,7 @@ import { basename, join, relative, resolve, sep } from "node:path";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import {
-	collectThemeBackgroundImages,
+	collectThemeImages,
 	type Manifest,
 	manifestPathSchema,
 	pluginIdSchema,
@@ -151,10 +151,10 @@ export class PluginUiAssetService {
 			throw new AppError("Plugin manifest identity is invalid", 422, "PLUGIN_IDENTITY_MISMATCH");
 		}
 		// A package may serve assets if it has a UI contribution (views) OR a
-		// theme that declares background images. Theme-only plugins have no `ui`
-		// but still need their declared background images served.
+		// theme that declares images (region backgrounds / nine-slice frames).
+		// Theme-only plugins have no `ui` but still need those images served.
 		const hasThemeAssets = parsed.data.contributes.themes.some(
-			(theme) => collectThemeBackgroundImages(theme).length > 0,
+			(theme) => collectThemeImages(theme).length > 0,
 		);
 		if (!parsed.data.ui && !hasThemeAssets) {
 			throw new AppError("Plugin has no UI contribution", 404, "PLUGIN_UI_UNAVAILABLE");
@@ -177,10 +177,10 @@ export class PluginUiAssetService {
 			declaredAssets.add(view.entry);
 			if (view.style) declaredAssets.add(view.style);
 		}
-		// Theme background images are served the same way: only paths a theme
-		// contribution explicitly declares become fetchable.
+		// Theme images (backgrounds and nine-slice frames) are served the same way:
+		// only paths a theme contribution explicitly declares become fetchable.
 		for (const theme of pkg.manifest.contributes.themes) {
-			for (const image of collectThemeBackgroundImages(theme)) declaredAssets.add(image);
+			for (const image of collectThemeImages(theme)) declaredAssets.add(image);
 		}
 		if (!declaredAssets.has(safePath)) throw new NotFoundError("Plugin UI asset", safePath);
 		const filePath = resolve(pkg.packagePath, ...safePath.split("/"));

@@ -48,7 +48,6 @@
 			"name": "Name",
 			"status": "Status",
 			"version": "Version",
-			"trust": "Trust",
 			"diagnostics": "Diagnostics",
 			"actions": "Actions"
 		},
@@ -77,13 +76,6 @@
 			"unknown": "Unknown",
 			"compatible": "Compatible",
 			"incompatible": "Incompatible"
-		},
-		"trust": {
-			"T0": "T0 · Core",
-			"T1": "T1 · Trusted",
-			"T2": "T2 · Verified",
-			"T3": "T3 · Untrusted",
-			"unknown": "Unknown"
 		},
 		"actions": {
 			"enable": "Enable",
@@ -140,7 +132,6 @@
 				"desiredState": "Desired state",
 				"runtimeState": "Runtime state",
 				"compatibility": "Compatibility",
-				"trustTier": "Trust tier",
 				"crashCount": "Crash count",
 				"restartCount": "Restart count",
 				"consecutiveFailures": "Consecutive failures",

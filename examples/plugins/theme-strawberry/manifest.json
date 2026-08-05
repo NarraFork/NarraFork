@@ -1,0 +1,358 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.strawberry",
+	"version": "1.0.0",
+	"displayName": "Strawberry Fields",
+	"description": "A soft candy-pink theme with a tiled berry wallpaper, rounded gradient controls, pill badges and a readability scrim, in complete light and dark variants. Demonstrates every token group together; all art is procedurally generated and shipped in the package.",
+	"publisher": {
+		"id": "com.example",
+		"name": "Example Team"
+	},
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": [],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"activationEvents": [],
+	"contributes": {
+		"providers": [],
+		"tools": [],
+		"commands": [],
+		"events": [],
+		"views": [],
+		"themes": [
+			{
+				"id": "strawberry",
+				"title": "Strawberry Fields",
+				"colorScheme": "both",
+				"tokens": {
+					"primaryColor": "#e8447a",
+					"radius": "12px",
+					"shadow": 14,
+					"fontFamily": "system-ui",
+					"colors": {
+						"berry": "#e8447a",
+						"leaf": "#5aa860"
+					},
+					"frames": {
+						"card": {
+							"image": "assets/frame-candy.png",
+							"slice": 10,
+							"width": 9,
+							"repeat": "round"
+						},
+						"modal": {
+							"image": "assets/frame-candy.png",
+							"slice": 10,
+							"width": 9,
+							"repeat": "round"
+						},
+						"button": {
+							"image": "assets/frame-candy.png",
+							"slice": 10,
+							"width": 4,
+							"repeat": "round"
+						}
+					},
+					"textColors": {
+						"button": "#ffffff",
+						"badge": "#ffffff"
+					},
+					"borders": {
+						"badge": {
+							"radius": 11
+						},
+						"navLink": {
+							"radius": 10
+						},
+						"code": {
+							"radius": 6
+						},
+						"menu": {
+							"radius": 12
+						},
+						"menuItem": {
+							"radius": 8
+						},
+						"tooltip": {
+							"radius": 8
+						},
+						"input": {
+							"radius": 10
+						},
+						"scrollbarThumb": {
+							"radius": 6
+						},
+						"actionIcon": {
+							"radius": 8
+						}
+					},
+					"light": {
+						"body": "#fffafc",
+						"text": "#4a1228",
+						"gradients": {
+							"header": {
+								"from": "#ff9ec4",
+								"to": "#f2568a"
+							},
+							"navbar": {
+								"from": "#fffdfe",
+								"to": "#fff2f7"
+							},
+							"footer": {
+								"from": "#fff6fa",
+								"to": "#ffeef5"
+							},
+							"button": {
+								"from": "#ff8fbc",
+								"to": "#e8447a"
+							},
+							"buttonHover": {
+								"from": "#ffa6ca",
+								"to": "#f2568a"
+							},
+							"card": {
+								"from": "#ffffff",
+								"to": "#fffafc"
+							},
+							"paper": {
+								"from": "#ffffff",
+								"to": "#fffcfd"
+							},
+							"modal": {
+								"from": "#ffffff",
+								"to": "#fffafc"
+							},
+							"input": {
+								"from": "#ffffff",
+								"to": "#fffcfd"
+							},
+							"navLinkActive": {
+								"from": "#ffd9e8",
+								"to": "#ffbfd8"
+							},
+							"navLinkHover": {
+								"from": "#fffcfd",
+								"to": "#fff2f7"
+							},
+							"code": {
+								"from": "#fff6fa",
+								"to": "#ffeef5"
+							},
+							"tableHeader": {
+								"from": "#fff2f7",
+								"to": "#ffe6f0"
+							},
+							"badge": {
+								"from": "#ff8fbc",
+								"to": "#e8447a"
+							},
+							"menu": {
+								"from": "#ffffff",
+								"to": "#fffcfd"
+							},
+							"menuItemHover": {
+								"from": "#fff6fa",
+								"to": "#ffeef5"
+							},
+							"tooltip": {
+								"from": "#4a1228",
+								"to": "#2e0a18"
+							},
+							"scrollbarThumb": {
+								"from": "#ffb3d1",
+								"to": "#e8447a"
+							},
+							"divider": {
+								"from": "#ffdcea",
+								"to": "#ffdcea"
+							},
+							"actionIcon": {
+								"from": "#ff8fbc",
+								"to": "#e8447a"
+							},
+							"actionIconHover": {
+								"from": "#ffa6ca",
+								"to": "#f2568a"
+							},
+							"table": {
+								"from": "#ffffff",
+								"to": "#fffafc"
+							},
+							"menuItem": {
+								"from": "#ffffff",
+								"to": "#fffcfd"
+							}
+						},
+						"textColors": {
+							"header": "#ffffff",
+							"card": "#4a1228",
+							"input": "#4a1228",
+							"code": "#8e2148",
+							"tableHeader": "#4a1228",
+							"tooltip": "#ffe4ef",
+							"navLinkActive": "#4a1228",
+							"actionIcon": "#ffffff",
+							"table": "#4a1228",
+							"menuItem": "#4a1228"
+						},
+						"backgrounds": {
+							"main": {
+								"image": "assets/berry-tile.png",
+								"size": "auto",
+								"repeat": "repeat",
+								"overlay": "scrim-light",
+								"opacity": 0.9
+							}
+						}
+					},
+					"dark": {
+						"body": "#1d0f16",
+						"text": "#ffe4ef",
+						"gradients": {
+							"header": {
+								"from": "#7d2244",
+								"to": "#4a1228"
+							},
+							"navbar": {
+								"from": "#2a1420",
+								"to": "#1d0f16"
+							},
+							"footer": {
+								"from": "#2a1420",
+								"to": "#1d0f16"
+							},
+							"button": {
+								"from": "#c33366",
+								"to": "#8e2148"
+							},
+							"buttonHover": {
+								"from": "#d94177",
+								"to": "#a52a56"
+							},
+							"card": {
+								"from": "#2a1420",
+								"to": "#1d0f16"
+							},
+							"paper": {
+								"from": "#241119",
+								"to": "#1d0f16"
+							},
+							"modal": {
+								"from": "#2a1420",
+								"to": "#1d0f16"
+							},
+							"input": {
+								"from": "#311824",
+								"to": "#24111a"
+							},
+							"navLinkActive": {
+								"from": "#4a1228",
+								"to": "#33101f"
+							},
+							"navLinkHover": {
+								"from": "#2f1622",
+								"to": "#26121b"
+							},
+							"code": {
+								"from": "#33101f",
+								"to": "#280d18"
+							},
+							"tableHeader": {
+								"from": "#3a1526",
+								"to": "#2a1420"
+							},
+							"badge": {
+								"from": "#c33366",
+								"to": "#8e2148"
+							},
+							"menu": {
+								"from": "#2a1420",
+								"to": "#1d0f16"
+							},
+							"menuItemHover": {
+								"from": "#3a1526",
+								"to": "#2a1420"
+							},
+							"tooltip": {
+								"from": "#ffd0e3",
+								"to": "#ffb3d1"
+							},
+							"scrollbarThumb": {
+								"from": "#8e2148",
+								"to": "#5c1530"
+							},
+							"divider": {
+								"from": "#3a1526",
+								"to": "#3a1526"
+							},
+							"actionIcon": {
+								"from": "#c33366",
+								"to": "#8e2148"
+							},
+							"actionIconHover": {
+								"from": "#d94177",
+								"to": "#a52a56"
+							},
+							"table": {
+								"from": "#2a1420",
+								"to": "#1d0f16"
+							},
+							"menuItem": {
+								"from": "#2a1420",
+								"to": "#241119"
+							}
+						},
+						"textColors": {
+							"header": "#ffe4ef",
+							"card": "#ffe4ef",
+							"input": "#ffe4ef",
+							"code": "#ffb3d1",
+							"tableHeader": "#ffe4ef",
+							"tooltip": "#4a1228",
+							"navLinkActive": "#ffe4ef",
+							"actionIcon": "#ffe4ef",
+							"table": "#ffe4ef",
+							"menuItem": "#ffe4ef"
+						},
+						"backgrounds": {
+							"main": {
+								"image": "assets/berry-tile.png",
+								"size": "auto",
+								"repeat": "repeat",
+								"overlay": "scrim-dark",
+								"opacity": 0.88
+							}
+						}
+					}
+				}
+			}
+		]
+	},
+	"permissions": {
+		"host": ["ui.theme"],
+		"network": {
+			"mode": "none",
+			"allow": []
+		},
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "none",
+			"workspace": "none"
+		},
+		"process": {
+			"spawn": "none"
+		}
+	},
+	"secrets": [],
+	"dependencies": {
+		"plugins": {},
+		"runtime": {}
+	}
+}

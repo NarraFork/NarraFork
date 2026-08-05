@@ -26,15 +26,21 @@ import {
 } from "./elastic-layout";
 import { screenToWorld, solvePanForAnchor, viewCenterFromPan, worldToScreen } from "./fisheye";
 import { OffscreenBubbles } from "./OffscreenBubbles";
-import { type PixiChapterInfo, type RulerPixiHandle, RulerPixiLayer } from "./pixi/RulerPixiLayer";
+import {
+	type PixiChapterInfo,
+	RULER_CARD_GEOMETRY,
+	type RulerPixiHandle,
+	RulerPixiLayer,
+} from "./pixi/RulerPixiLayer";
 import { RebaseConflictDialog } from "./RebaseConflictDialog";
 import { ChapterContextMenu, TickContextMenu } from "./RulerContextMenus";
-import { SegmentCanvas } from "./SegmentCanvas";
+import { type CardWorldInfo, SegmentCanvas } from "./SegmentCanvas";
 import {
 	DEFAULT_RULER_THICKNESS,
 	MAX_RULER_THICKNESS,
 	type RulerEdge,
 	type RulerOrientation,
+	type RulerPixiChapterPayload,
 } from "./types";
 import {
 	getPanelFadeOpacity,
@@ -437,26 +443,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		fromContextMenu?: boolean;
 	} | null>(null);
 	// Chapter data for PixiJS — populated by SegmentCanvas callbacks
-	const pixiChaptersMapRef = useRef<
-		Map<
-			string,
-			Array<{
-				id: string;
-				status: string;
-				title: string;
-				branch: string;
-				role: string;
-				parentChapterId?: string | null;
-				narratorId: string | null;
-				narratorStatus: string | null;
-				reviewStatus?: string | null;
-				startCommitSha: string | null;
-				mergeCommitSha?: string | null;
-				layoutX: number;
-				layoutY: number;
-			}>
-		>
-	>(new Map());
+	const pixiChaptersMapRef = useRef<Map<string, RulerPixiChapterPayload[]>>(new Map());
 
 	/** Resolve the actual pixiChaptersMapRef key for a chapter.
 	 *  Orphan chapters may be keyed under their parent's segment SHA. */
@@ -510,21 +497,16 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const zoomCenterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 	// --- Offscreen card tracking (ref-based, no re-render) ---
-	const cardRegistryRef = useRef<
-		Map<
-			string,
-			Array<{
-				id: string;
-				title: string;
-				worldX: number;
-				worldY: number;
-				worldW: number;
-				worldH: number;
-				status: string;
-				narratorStatus: string | null;
-			}>
-		>
-	>(new Map());
+	// Shares SegmentCanvas's CardWorldInfo so a field added for the bubbles (e.g.
+	// narratorModelUnavailable) cannot be dropped between producer and consumer.
+	//
+	// ⚠️ Mirrors `cardWorldInfos` below. It used to be written by SegmentCanvas through
+	// a `cardRegistry` prop, but the PixiJS pipeline (commit c7d623ad) removed the
+	// writer while leaving the prop declared — so it stayed EMPTY, silently disabling
+	// both consumers: `getBounds().maxContentCross` was always 0, which clamped
+	// cross-axis panning to the content top edge, and `OffscreenBubbles` always
+	// received zero cards (so its attention bubbles never appeared at all).
+	const cardRegistryRef = useRef<CardWorldInfo[]>([]);
 
 	/** Total main-axis content length (commit ruler), updated after layout computation. */
 	const totalMainRef = useRef(0);
@@ -534,11 +516,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		const cam = cameraRef.current;
 		const isH = cam.orientation === "horizontal";
 		let maxCross = 0;
-		for (const cards of cardRegistryRef.current.values()) {
-			for (const c of cards) {
-				const bottom = isH ? c.worldY + c.worldH : c.worldX + c.worldW;
-				if (bottom > maxCross) maxCross = bottom;
-			}
+		for (const c of cardRegistryRef.current) {
+			const bottom = isH ? c.worldY + c.worldH : c.worldX + c.worldW;
+			if (bottom > maxCross) maxCross = bottom;
 		}
 		const el = containerRef.current;
 		const crossVp = isH
@@ -1243,11 +1223,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 					let worldMouseCross = (canvasMouseCross - crossPan) / cam.scale;
 					let maxCardCross = 0;
-					for (const cards of cardRegistryRef.current.values()) {
-						for (const c of cards) {
-							const cc = isH ? c.worldY + c.worldH : c.worldX + c.worldW;
-							if (cc > maxCardCross) maxCardCross = cc;
-						}
+					for (const c of cardRegistryRef.current) {
+						const cc = isH ? c.worldY + c.worldH : c.worldX + c.worldW;
+						if (cc > maxCardCross) maxCardCross = cc;
 					}
 					if (maxCardCross > 0) {
 						worldMouseCross = Math.min(worldMouseCross, maxCardCross);
@@ -2246,24 +2224,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	);
 
 	const handleChaptersLoaded = useCallback(
-		(
-			fromSha: string,
-			chapters: Array<{
-				id: string;
-				status: string;
-				title: string;
-				branch: string;
-				role: string;
-				parentChapterId?: string | null;
-				narratorId: string | null;
-				narratorStatus: string | null;
-				reviewStatus?: string | null;
-				startCommitSha: string | null;
-				mergeCommitSha?: string | null;
-				layoutX: number;
-				layoutY: number;
-			}>,
-		) => {
+		(fromSha: string, chapters: RulerPixiChapterPayload[]) => {
 			if (chapters.length === 0) {
 				pixiChaptersMapRef.current.delete(fromSha);
 			} else {
@@ -2281,6 +2242,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							...ch,
 							narratorId: ch.narratorId ?? old.narratorId,
 							narratorStatus: ch.narratorStatus ?? old.narratorStatus,
+							narratorModelUnavailable: ch.narratorModelUnavailable ?? old.narratorModelUnavailable,
 							branch: ch.branch || old.branch,
 							startCommitSha: ch.startCommitSha ?? old.startCommitSha,
 							mergeCommitSha: ch.mergeCommitSha ?? old.mergeCommitSha,
@@ -2304,23 +2266,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	/** Lightweight drag-move handler: updates ref + triggers PixiJS redraw without React state. */
 	const handleChapterDragMove = useCallback(
-		(
-			fromSha: string,
-			chapters: Array<{
-				id: string;
-				status: string;
-				title: string;
-				branch: string;
-				role: string;
-				parentChapterId?: string | null;
-				narratorId: string | null;
-				narratorStatus: string | null;
-				startCommitSha: string | null;
-				mergeCommitSha?: string | null;
-				layoutX: number;
-				layoutY: number;
-			}>,
-		) => {
+		(fromSha: string, chapters: RulerPixiChapterPayload[]) => {
 			if (chapters.length === 0) {
 				pixiChaptersMapRef.current.delete(fromSha);
 			} else {
@@ -2347,6 +2293,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						parentChapterId: ch.parentChapterId,
 						narratorId: ch.narratorId,
 						narratorStatus: ch.narratorStatus,
+						narratorModelUnavailable: ch.narratorModelUnavailable,
 						startCommitSha: ch.startCommitSha,
 						mergeCommitSha: ch.mergeCommitSha,
 						layoutX: ch.layoutX,
@@ -2392,6 +2339,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					parentChapterId: ch.parentChapterId,
 					narratorId: ch.narratorId,
 					narratorStatus: ch.narratorStatus,
+					narratorModelUnavailable: ch.narratorModelUnavailable,
 					startCommitSha: ch.startCommitSha,
 					mergeCommitSha: ch.mergeCommitSha,
 					layoutX: ch.layoutX,
@@ -2430,6 +2378,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					parentChapterId: ch.parentChapterId,
 					narratorId: ch.narratorId,
 					narratorStatus: ch.narratorStatus,
+					narratorModelUnavailable: ch.narratorModelUnavailable,
 					startCommitSha: ch.startCommitSha,
 					mergeCommitSha: ch.mergeCommitSha,
 					layoutX: ch.layoutX,
@@ -2451,6 +2400,45 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		closingPanelChapterIds,
 		tickPositions,
 	]);
+
+	/**
+	 * World-space card rects for the two consumers that need them: cross-axis pan
+	 * bounds (`getBounds`) and the offscreen attention bubbles.
+	 *
+	 * Derived from `pixiChapters` — the same list PixiJS draws — rather than from a
+	 * per-segment callback, so a card cannot be in the picture but missing here.
+	 *
+	 * Geometry matches `RulerPixiLayer`'s own (`RULER_CARD_GEOMETRY`): main axis =
+	 * `segMainPos + layoutX`, cross axis = `layoutY + cardTopOffset`, and an open
+	 * panel's size when it has one. `worldX/worldY` are main/cross in HORIZONTAL
+	 * orientation; both consumers swap the axes themselves via `cam.orientation`.
+	 *
+	 * A FLAT list, not the old sha-keyed Map: both consumers only ever iterated every
+	 * value, so the grouping bought nothing and a Map read during render would need a
+	 * re-render to be observed.
+	 */
+	const cardWorldInfos = useMemo<CardWorldInfo[]>(() => {
+		const isH = orientation === "horizontal";
+		return pixiChapters.map((ch) => {
+			const mainPos = ch.segMainPos + ch.layoutX;
+			const crossPos = ch.layoutY + RULER_CARD_GEOMETRY.cardTopOffset;
+			return {
+				id: ch.id,
+				title: ch.title,
+				worldX: isH ? mainPos : crossPos,
+				worldY: isH ? crossPos : mainPos,
+				worldW: ch.panelWidth ?? RULER_CARD_GEOMETRY.nodeWidth,
+				worldH: ch.panelHeight ?? RULER_CARD_GEOMETRY.nodeHeight,
+				status: ch.status,
+				narratorStatus: ch.narratorStatus,
+				narratorModelUnavailable: ch.narratorModelUnavailable,
+			};
+		});
+	}, [pixiChapters, orientation]);
+
+	// Mirrored into a ref for `getBounds` and the wheel handler, which run inside
+	// pointer/animation frames and must not depend on a render having happened.
+	cardRegistryRef.current = cardWorldInfos;
 
 	// Always-visible chapters for L0 dot rendering.
 	// Uses activeChapters + mergedChapters from the main ruler query (no segment fetch needed).
@@ -2513,6 +2501,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					role: ch.role ?? "branch",
 					narratorId: ch.narratorId ?? null,
 					narratorStatus: ch.narratorStatus ?? null,
+					narratorModelUnavailable: ch.narratorModelUnavailable ?? false,
 					startCommitSha: ch.startCommitSha,
 					mergeCommitSha: ch.mergeCommitSha,
 					parentChapterId: ch.parentChapterId,
@@ -2817,7 +2806,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 									orientation={orientation}
 									viewTop={worldViewTop}
 									viewHeight={worldViewHeight}
-									cardRegistry={cardRegistryRef}
 									onFitToView={fitRectToView}
 									zoomCenterWorldX={fisheyeCenter}
 									viewportSize={mainViewport}
@@ -2886,7 +2874,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			</Box>
 
 			<OffscreenBubbles
-				cards={Array.from(cardRegistryRef.current.values()).flat()}
+				cards={cardWorldInfos}
 				panX={panX}
 				panY={panY}
 				scale={scale}

@@ -64,7 +64,6 @@ function binding(
 		desiredState: "enabled",
 		compatibilityState: "compatible",
 		runtimeState: "active",
-		trustTier: "T2",
 		runtimeGeneration: plugin.runtimeGeneration,
 		manifestRequested: ["ui.panel"],
 		installationGrants: granted

@@ -352,6 +352,36 @@ describe("extractDataRevision", () => {
 		);
 	});
 
+	// A STANDALONE card's truncated → full payload swap. The drilled-in trace row
+	// keyed this all along (`tdn:`); the standalone card did not, and that is the
+	// "loading full data…" that never resolved: a capped box only measures a
+	// bounded PREFIX, so an 8KB preview and the 40KB full text can slice to the
+	// same measured text — the detail signature does not move, `status` is already
+	// terminal, and nothing else in the key changes either. The rebuild after the
+	// fetch then hit the pre-fetch entry, whose payload still said
+	// `truncatedLeafCount > 0`, so the notice kept painting its loading state.
+	it("re-keys a standalone card when its truncated payload is replaced", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const card = (over: Record<string, unknown> = {}) => ({
+			status: "success",
+			detail: { kind: "capped", cap: "term", text: "identical measured prefix" },
+			...over,
+		});
+		const truncated = extractDataRevision(
+			card({ truncatedLeafCount: 1, truncatedTotalBytes: 3072 }),
+		);
+		// Post-fetch the adapter omits the fields entirely (see truncatedPayloadFields).
+		const resolved = extractDataRevision(card());
+		expect(truncated).not.toBe(resolved);
+		expect(truncated).toContain("tp:1");
+		// Several cut fields is a distinct height from one (the notice reports both),
+		// and an unchanged card must still HIT or nothing would ever cache.
+		expect(extractDataRevision(card({ truncatedLeafCount: 2 }))).not.toBe(truncated);
+		expect(extractDataRevision(card({ truncatedLeafCount: 1 }))).toBe(
+			extractDataRevision(card({ truncatedLeafCount: 1 })),
+		);
+	});
+
 	it("tracks generic input/output body lengths", async () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const rev = extractDataRevision({

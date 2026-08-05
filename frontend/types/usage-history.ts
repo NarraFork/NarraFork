@@ -101,10 +101,59 @@ export interface UsageHistoryFilters {
 	chapterId?: string;
 	projectId?: string;
 	provider?: string;
+	/** Exact credential id — narrows history to one account in a provider pool. */
+	credentialId?: string;
 	model?: string;
 	kind?: string;
 	startDate?: string;
 	endDate?: string;
+}
+
+/**
+ * Lifetime totals for one credential, from `credential_usage_totals`.
+ *
+ * Unlike the rest of this module these survive narrator deletion, so they are
+ * the durable answer to "how much has this account consumed". `costUsd` is at
+ * official reference prices; for subscription access it is equivalent
+ * consumption, not an amount billed, and `costIsPartial` marks that some
+ * requests had no known price.
+ */
+export interface CredentialUsageTotals {
+	provider: string;
+	credentialId: string;
+	requestCount: number;
+	inputTokens: number;
+	outputTokens: number;
+	cachedInputTokens: number;
+	cacheCreationTokens: number;
+	reasoningTokens: number;
+	totalTokens: number;
+	costUsd: number;
+	unpricedRequestCount: number;
+	costIsPartial: boolean;
+	firstSeenAt: string | null;
+	lastSeenAt: string | null;
+}
+
+export interface CredentialUsageTotalsByModel extends CredentialUsageTotals {
+	model: string;
+}
+
+export interface CredentialUsageTotalsDetail extends CredentialUsageTotals {
+	byModel: CredentialUsageTotalsByModel[];
+	/**
+	 * True when the credential has used more models than `byModel` lists.
+	 *
+	 * The top-level totals always cover every model (they are summed server-side
+	 * over all rows); only this breakdown is capped. Surface it, or the per-model
+	 * rows will visibly fail to add up to the total.
+	 */
+	byModelTruncated: boolean;
+}
+
+export interface CredentialTotalsResponse {
+	provider: string;
+	entries: CredentialUsageTotals[];
 }
 
 export interface UsageHistoryListResponse {

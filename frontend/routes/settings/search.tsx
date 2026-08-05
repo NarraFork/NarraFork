@@ -28,6 +28,21 @@ export const Route = createFileRoute("/settings/search")({
 	component: SettingsSearchPage,
 });
 
+type SearchChannelKind =
+	| "native"
+	| "nug-mcp"
+	| "custom-api"
+	| "subagent"
+	/** Contributed by a plugin through `contributes.searchProviders`. */
+	| "plugin";
+
+/** Backend-resolved label and availability, keyed by channel id. */
+interface SearchChannelInfo {
+	id: string;
+	kind: SearchChannelKind;
+	label: string;
+	available: boolean;
+}
 
 interface SearchChannelConfig {
 	id: string;
@@ -69,6 +84,7 @@ interface SearchSettingsState {
 interface SearchSettingsResponse {
 	search?: Partial<SearchSettingsState>;
 	nugProviders?: Array<{ id: string; name?: string }>;
+	searchChannelInfo?: SearchChannelInfo[];
 }
 
 function asSearchSettingsResponse(value: unknown): SearchSettingsResponse | undefined {
@@ -102,6 +118,8 @@ function channelBadgeColor(kind: SearchChannelKind): string {
 			return "orange";
 		case "subagent":
 			return "pink";
+		case "plugin":
+			return "teal";
 	}
 }
 
@@ -111,6 +129,12 @@ function channelLabel(
 ): string {
 	if (channel.kind === "native") return "Model native search";
 	if (channel.kind === "subagent") return "Search subagent";
+	if (channel.kind === "plugin") {
+		// Only the backend knows the plugin and contribution titles; there is nothing in
+		// settings to derive them from.
+		const info = settings?.searchChannelInfo?.find((item) => item.id === channel.id);
+		return info?.label ?? channel.id;
+	}
 	const providerId = channel.providerId;
 	if (channel.kind === "nug-mcp") {
 		const provider = settings?.nugProviders?.find((p) => p.id === providerId);
@@ -413,6 +437,16 @@ function SettingsSearchPage() {
 												{t("searchNativeFirstOnly")}
 											</Badge>
 										)}
+										{channel.kind === "plugin" &&
+											settingsRecord?.searchChannelInfo?.find((item) => item.id === channel.id)
+												?.available === false && (
+												// A plugin channel is unusable when its plugin is disabled or the
+												// bound provider has no credential yet. Without this the channel
+												// looks ready and quietly fails when dispatched.
+												<Badge color="gray" variant="light">
+													{t("searchChannelUnavailable")}
+												</Badge>
+											)}
 									</Group>
 									<Group gap="xs">
 										<ActionIcon

@@ -8,6 +8,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
+import { setModelPricingOverrides } from "../model-pricing";
 import { getNarraforkHome } from "../narrafork-home";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
 import { normalizeSearchSettings } from "../search/settings";
@@ -71,6 +72,8 @@ export {
 	isAnthropicProvider,
 	isGeminiProvider,
 	LARGE_CONTEXT_BOUNDARY,
+	type ModelContextWindowResolution,
+	type ModelContextWindowSource,
 	nugProviderPrefix,
 	openaiProviderPrefix,
 	parseAggModelValue,
@@ -92,6 +95,7 @@ export {
 	resolveAllowedModelCandidate,
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
+	resolveModelContextWindow,
 	resolveProvider,
 	usesCodexApiMode,
 	usesCodexModel,
@@ -399,6 +403,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 
 	if (needsSave) saveSettings(merged);
 
+	// Pricing lives in its own module so cost attribution does not have to pull in
+	// the settings module graph; push the operator overrides into it on load.
+	setModelPricingOverrides(merged.pricing?.overrides);
+
 	return merged;
 }
 
@@ -633,6 +641,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 		throw error;
 	}
 	settingsRevision++;
+	setModelPricingOverrides(newSettings.pricing?.overrides);
 	if (_cache.current) {
 		stripObsoleteSettingsKeys(_cache.current as unknown as Record<string, unknown>);
 		for (const key of Object.keys(_cache.current) as Array<keyof NarraForkSettings>) {

@@ -58,7 +58,6 @@ function bind(
 		desiredState: "enabled",
 		compatibilityState: "compatible",
 		runtimeState: "active",
-		trustTier: "T2",
 		manifestRequested: ["diagnostics.readOwnLogs"],
 		grants: [grant("diagnostics.readOwnLogs")],
 		getDiagnostics: () => ({

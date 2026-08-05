@@ -305,7 +305,6 @@ describe("PluginManager", () => {
 		});
 		const installed = await manager.install(source);
 		if (!installed.current) throw new Error("Installed plugin has no current package");
-		await stateStore.updateState(pluginId, { trustTier: "T2" });
 		const granted = await manager.replacePermissions(pluginId, {
 			expectedRevision: 1,
 			grantedBy: "admin-user-1",
@@ -816,7 +815,11 @@ describe("PluginManager", () => {
 		});
 	});
 
-	test("fails closed for T3 activation and required signature policy", async () => {
+	test("activates an unsigned package under a trust policy that does not require a signature", async () => {
+		// Used to assert the opposite. A `trustTier === "T3"` check refused activation whenever
+		// a trust policy was enabled, and since install always produced T3 with no route to
+		// raise it, enabling the policy meant no plugin could activate at all. The tier axis is
+		// gone; an enabled policy now only enforces what it can actually read from the package.
 		const root = await makeTempRoot();
 		const supervisor = new FakeSupervisor();
 		const manager = new PluginManager({
@@ -825,12 +828,14 @@ describe("PluginManager", () => {
 			runtimeSupervisor: supervisor,
 			trustPolicy: { enabled: true },
 		});
-		const unapproved = await manager.install(await makePackage(root, "com.example.unapproved"));
-		await manager.enable(unapproved.pluginId);
-		await expect(manager.activate(unapproved.pluginId)).rejects.toMatchObject({
-			code: "PLUGIN_TRUST_REQUIRED",
-		});
+		const installed = await manager.install(await makePackage(root, "com.example.unsigned"));
+		await manager.enable(installed.pluginId);
+		const active = await manager.activate(installed.pluginId);
+		expect(active.runtimeState).toBe("active");
+	});
 
+	test("fails closed when the trust policy requires a signature", async () => {
+		const root = await makeTempRoot();
 		const requiredSignature = new PluginManager({
 			root: join(root, "required-signature"),
 			disabled: false,
@@ -838,9 +843,7 @@ describe("PluginManager", () => {
 			trustPolicy: { enabled: true, requireSignature: true },
 		});
 		await expect(
-			requiredSignature.install(await makePackage(root, "com.example.signature-required"), {
-				trustTier: "T2",
-			}),
+			requiredSignature.install(await makePackage(root, "com.example.signature-required")),
 		).rejects.toMatchObject({ code: "PLUGIN_SIGNATURE_REQUIRED" });
 	});
 

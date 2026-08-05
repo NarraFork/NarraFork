@@ -21,7 +21,7 @@ import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
-import { executeSearch } from "../lib/search/router";
+import { executeSearch, listSearchChannels } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
@@ -45,6 +45,9 @@ import {
 	settings,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
+// Imported from lib (not the update service) so a route never depends on a service
+// for pure validation; update-service re-exports the same predicate.
+import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
 import {
 	blacklistDirEntrySchema,
 	codexTierOrderSchema,
@@ -297,8 +300,11 @@ const externalWebSocketOriginSchema = z
  * Instance-wide settings that only admins may change (enforced by `requireAdmin`
  * on the PATCH route). Per-user preferences live in `/api/user-preferences`, so
  * every field here is shared state. `auth.jwtSecret` stays excluded regardless.
+ *
+ * Exported for tests: `update.serverUrl` is a code-delivery origin, so its https gate
+ * is a security boundary rather than input hygiene and is asserted directly.
  */
-const updateSettingsSchema = z
+export const updateSettingsSchema = z
 	.object({
 		server: z
 			.object({
@@ -610,7 +616,21 @@ const updateSettingsSchema = z
 		update: z
 			.object({
 				// "" clears the override so the built-in default server is used again.
-				serverUrl: z.union([z.string().url(), z.literal("")]).optional(),
+				//
+				// The https refine is a real gate, not cosmetics: update payloads are trusted
+				// on TLS alone (the expected SHA-512 ships in the same response as the
+				// binary), so a plaintext origin hands a man in the middle code execution.
+				// `getServerBaseUrl` already refuses to fetch from one, but without this an
+				// administrator typing `http://` would get a 200 and a silently disabled
+				// updater instead of being told why.
+				serverUrl: z
+					.union([
+						z.string().url().refine(isTrustedUpdateServerUrl, {
+							message: "Update server must use https (plaintext http is only allowed for loopback)",
+						}),
+						z.literal(""),
+					])
+					.optional(),
 				product: z.string().min(1).optional(),
 				channel: z.enum(["stable", "beta"]).optional(),
 				checkIntervalMinutes: z.number().int().min(0).optional(),
@@ -846,6 +866,14 @@ function buildSettingsResponse(
 		// Executable-plugin providers, grouped per provider prefix. Read straight from
 		// the in-memory registry; no plugin process is started to build this.
 		pluginProviderModelsGrouped: listPluginProviderModelGroups(pluginProviderRegistry),
+		// Label and availability for every channel, including plugin-contributed ones whose
+		// names the frontend cannot derive from settings alone. Synchronous registry reads.
+		searchChannelInfo: listSearchChannels().map((channel) => ({
+			id: channel.id,
+			kind: channel.kind,
+			label: channel.label,
+			available: channel.available,
+		})),
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),

@@ -34,6 +34,7 @@ import {
 	RenderTraceCountLine,
 	type TraceRowCardSlot,
 	type TraceRowInteractionSlot,
+	type TraceRowLiveTails,
 } from "./render/RenderToolRun";
 import { RenderTurnUsage } from "./render/RenderTurnUsage";
 import { RenderWebSearch } from "./render/RenderWebSearch";
@@ -122,6 +123,16 @@ export function resolveRenderExtra(spec: {
 				};
 			}
 			break;
+		case "activity-trace": {
+			// Live reasoning tails, read from the FRESH spec rather than the measured
+			// payload: the trace's measured result is cache-served and its key ignores
+			// the tail by design (see shared/pretext-layout/reasoning-live-tail.ts), so
+			// the measured rows can carry a stale tail while `spec.data` is rebuilt on
+			// every delta.
+			const tails = collectRowLiveTails(data.items);
+			if (tails) extra.rowLiveTails = tails;
+			break;
+		}
 		case "subagent-card":
 			if ("description" in data) extra.description = data.description;
 			if ("agentType" in data) extra.agentType = data.agentType;
@@ -147,6 +158,29 @@ export function resolveRenderExtra(spec: {
 }
 
 /**
+ * Index an activity trace's rows by key → live tail, or undefined when no row has
+ * one (the overwhelmingly common case: a settled trace, or a live one whose text is
+ * still short). Returning undefined keeps `extra` free of an empty map so the
+ * render props stay referentially simple for non-streaming traces.
+ */
+function collectRowLiveTails(items: unknown): TraceRowLiveTails | undefined {
+	if (!Array.isArray(items)) return undefined;
+	let map: Map<string, { charCount: number; tail: string }> | undefined;
+	for (const item of items) {
+		if (item == null || typeof item !== "object") continue;
+		const row = item as Record<string, unknown>;
+		const tail = row.liveTail;
+		if (tail == null || typeof tail !== "object") continue;
+		const { charCount, tail: text } = tail as Record<string, unknown>;
+		if (typeof charCount !== "number" || typeof text !== "string") continue;
+		if (typeof row.key !== "string") continue;
+		map ??= new Map();
+		map.set(row.key, { charCount, tail: text });
+	}
+	return map;
+}
+
+/**
  * Render one vlist element by kind. Returns null for kinds whose render props
  * are incomplete (defensive; the integration layer should always pass what a
  * kind needs — see the harness for the reference prop shapes).
@@ -162,6 +196,11 @@ export function renderElement(
 			return (
 				<RenderMarkdown
 					measured={m}
+					// Per-body source toggle. Without this forward the row's action bar
+					// flipped shell state that nothing read, so "view source" was inert on
+					// every plain markdown message.
+					showSource={extra.showSource as boolean | undefined}
+					sourceText={extra.sourceText as string | undefined}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					animateStreaming={extra.animateStreaming as boolean | undefined}
 					animKeyBase={extra.animKeyBase as string | undefined}
@@ -186,6 +225,9 @@ export function renderElement(
 				<RenderReasoning
 					measured={m}
 					labels={extra.labels as never}
+					// Same per-body source toggle as markdown (expanded form only).
+					showSource={extra.showSource as boolean | undefined}
+					sourceText={extra.sourceText as string | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onToggleTranslation={extra.onToggleTranslation as (() => void) | undefined}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
@@ -306,6 +348,7 @@ export function renderElement(
 					// needs, and spec.opts feeds the measure cache key — putting a React
 					// factory there would digest as `?function` and blur the key's meaning.
 					rowCard={extra.rowCard as TraceRowCardSlot | undefined}
+					rowLiveTails={extra.rowLiveTails as TraceRowLiveTails | undefined}
 				/>
 			);
 		case "tool-run-count":

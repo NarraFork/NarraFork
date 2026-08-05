@@ -306,7 +306,6 @@ function sanitizeSummary(value: unknown): RouteResult {
 		"desiredState",
 		"runtimeState",
 		"compatibility",
-		"trustTier",
 		"version",
 		"hash",
 		"isCurrent",

@@ -148,7 +148,7 @@ function RangeBoundarySelector({
 			py={6}
 			style={{
 				flexShrink: 0,
-				borderBottom: "1px solid var(--mantine-color-dark-4)",
+				borderBottom: "1px solid var(--mantine-color-default-border)",
 			}}
 		>
 			<Group gap="xs" wrap="nowrap" align="flex-end">
@@ -320,7 +320,7 @@ export function FileSummaryTab({
 									key={key}
 									style={{
 										borderRadius: "var(--mantine-radius-sm)",
-										border: "1px solid var(--mantine-color-dark-4)",
+										border: "1px solid var(--mantine-color-default-border)",
 										overflow: "hidden",
 									}}
 								>
@@ -330,7 +330,9 @@ export function FileSummaryTab({
 										py={6}
 										px="xs"
 										style={{
-											backgroundColor: isExpanded ? "var(--mantine-color-dark-5)" : undefined,
+											backgroundColor: isExpanded
+												? "var(--mantine-color-default-hover)"
+												: undefined,
 										}}
 									>
 										<Group

@@ -59,6 +59,7 @@ import {
 	updateSubagentActivityInMessages,
 	upsertSubagentToolCallHeader,
 } from "../message-tree-utils";
+import { isLiveToolStatusRegression } from "./streaming-tool-chunks";
 
 /** Result of one patch attempt over the loaded document. */
 export interface LivePatchResult {
@@ -171,7 +172,18 @@ function withoutTerminalRegression(
 	fields: Record<string, unknown>,
 ): Record<string, unknown> {
 	if (!("status" in fields) || isTerminalToolStatus(fields.status)) return fields;
-	if (!isTerminalToolStatus(newestToolStatus(messages, toolUseId))) return fields;
+	const newest = newestToolStatus(messages, toolUseId);
+	// A NON-terminal regression, e.g. `running` → `initializing`. The server yields
+	// `tool_call` after starting eager execution (loop.ts:3514-3538), so for most tools
+	// `tool_executing` lands FIRST and the later `tool_started` would otherwise demote a
+	// card that is demonstrably executing back to the pre-permission phase. Only the
+	// lifecycle position is dropped; the frame's input / timestamps still merge, because
+	// `tool_started` is the sole carrier of the resolved input.
+	if (!isTerminalToolStatus(newest) && isLiveToolStatusRegression(newest, fields.status)) {
+		const { status: _demoted, ...keptFields } = fields;
+		return keptFields;
+	}
+	if (!isTerminalToolStatus(newest)) return fields;
 	const { status: _status, startedAt: _startedAt, ...rest } = fields;
 	if (hasActiveReflectionSuggestion(rest.permissionSuggestions)) {
 		const { permissionSuggestions: _suggestions, ...withoutSuggestions } = rest;

@@ -35,7 +35,6 @@ interface PluginUiManagerLike {
 				desiredState?: string;
 				compatibility?: string;
 				current?: { version: string; hash: string } | null;
-				trustTier?: "T0" | "T1" | "T2" | "T3";
 		  }
 		| undefined
 	>;
@@ -217,8 +216,14 @@ interface UiCapabilityPrincipalInput {
 	generation: number;
 }
 
+/**
+ * Build the capability binding for one UI preflight.
+ *
+ * Takes no plugin status: the caller has already established that the plugin is installed,
+ * enabled and compatible before reaching here, which is why the lifecycle fields below are
+ * fixed rather than copied from a status record.
+ */
 function createUiCapabilityBinding(
-	status: NonNullable<Awaited<ReturnType<PluginUiManagerLike["getStatus"]>>>,
 	permissions: { revision: number; grants: PermissionGrant[] },
 	principal: UiCapabilityPrincipalInput,
 	manifest: { permissions?: { host?: string[] } },
@@ -241,7 +246,6 @@ function createUiCapabilityBinding(
 		compatibilityState: "compatible",
 		runtimeState: "active",
 		runtimeGeneration: principal.generation,
-		trustTier: status.trustTier,
 		manifestRequested: requested,
 		installationGrants: permissions.grants,
 		hostPolicy: effective,
@@ -265,8 +269,13 @@ function uiScopeResourceId(input: z.infer<typeof sessionInputSchema>): string | 
 	}
 }
 
+/**
+ * Reject a UI session before it is created when the `ui.panel` grant does not cover it.
+ *
+ * Takes no plugin status: the caller has already run `assertEnabled`, and what is checked here
+ * is the grant, not the lifecycle.
+ */
 async function assertUsableUiPanelGrant(
-	status: NonNullable<Awaited<ReturnType<PluginUiManagerLike["getStatus"]>>>,
 	permissions: { revision: number; grants: PermissionGrant[] },
 	input: z.infer<typeof sessionInputSchema>,
 	manifest: { permissions?: { host?: string[] } },
@@ -281,7 +290,7 @@ async function assertUsableUiPanelGrant(
 		runtimeId: "ui:preflight",
 		generation: 1,
 	};
-	const binding = createUiCapabilityBinding(status, permissions, principal, manifest);
+	const binding = createUiCapabilityBinding(permissions, principal, manifest);
 	const broker = new CapabilityBroker({
 		bindings: [binding],
 		cacheTtlMs: 0,
@@ -320,9 +329,14 @@ async function assertUsableUiPanelGrant(
 	}
 }
 
+/**
+ * Bind a UI session's capabilities on the broker.
+ *
+ * Takes no plugin status: every caller has already gone through `assertEnabled`, which is the
+ * lifecycle gate. Passing the status record on would suggest this function re-checks it.
+ */
 function bindUiCapability(
 	broker: CapabilityBroker,
-	status: NonNullable<Awaited<ReturnType<PluginUiManagerLike["getStatus"]>>>,
 	permissions: { revision: number; grants: PermissionGrant[] },
 	session: {
 		pluginId: string;
@@ -337,7 +351,6 @@ function bindUiCapability(
 	broker.setBinding(
 		session.pluginId,
 		createUiCapabilityBinding(
-			status,
 			permissions,
 			{
 				pluginId: session.pluginId,
@@ -648,12 +661,9 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const body = sessionInputSchema.safeParse(await c.req.json().catch(() => undefined));
 			if (!body.success) throw new ValidationError(formatZodError(body.error));
 			assertSurfaceScope(body.data);
-			const status = await assertEnabled(
-				manager,
-				body.data.pluginId,
-				body.data.version,
-				body.data.hash,
-			);
+			// Called for its lifecycle gate, not its value: a session must not be created for a
+			// plugin that is disabled, uninstalled or superseded.
+			await assertEnabled(manager, body.data.pluginId, body.data.version, body.data.hash);
 			const permissions = await getUiPermissions(manager, body.data.pluginId);
 			const pkg = await assets.inspectPackage(
 				body.data.pluginId,
@@ -663,17 +673,10 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const contribution = assertUiContribution(pkg.manifest, body.data);
 			const user = c.get("user");
 			const principalId = user.sub;
-			await assertUsableUiPanelGrant(
-				status,
-				permissions,
-				body.data,
-				pkg.manifest,
-				principalId,
-				user.role,
-			);
+			await assertUsableUiPanelGrant(permissions, body.data, pkg.manifest, principalId, user.role);
 			const created = sessions.create({ ...body.data, principalId });
 			try {
-				bindUiCapability(broker, status, permissions, created.session, pkg.manifest);
+				bindUiCapability(broker, permissions, created.session, pkg.manifest);
 			} catch (error) {
 				sessions.remove(created.session.sessionId, "capability-binding-failed");
 				throw error;
@@ -721,11 +724,13 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const user = c.get("user");
 			const session = sessions.authenticate(id, token, user.sub);
 			assertSurfaceScope(session);
-			const status = await assertEnabled(manager, session.pluginId, session.version, session.hash);
+			// Called for its lifecycle gate, not its value: an existing session must not keep
+			// dispatching after the plugin is disabled, uninstalled or superseded.
+			await assertEnabled(manager, session.pluginId, session.version, session.hash);
 			const permissions = await getUiPermissions(manager, session.pluginId);
 			const pkg = await assets.inspectPackage(session.pluginId, session.version, session.hash);
 			assertUiContribution(pkg.manifest, session);
-			bindUiCapability(broker, status, permissions, session, pkg.manifest);
+			bindUiCapability(broker, permissions, session, pkg.manifest);
 			const response = await uiHost.dispatch({
 				session,
 				principalId: user.sub,

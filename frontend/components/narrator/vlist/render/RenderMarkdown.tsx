@@ -27,6 +27,7 @@ import {
 import { Box } from "@mantine/core";
 import { Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "../measure/measure-markdown";
+import { pretextLineMetrics } from "../measure/pretext-metrics";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import type {
 	BlockFrame,
@@ -35,10 +36,14 @@ import type {
 	PreparedBlock,
 	PreparedCodeBlock,
 	PreparedInlineBlock,
+	PreparedTableBlock,
+	PreparedTableCell,
 	PreparedUnknownBlock,
 } from "../prepared-block";
-import { CODE_BLOCK_FONT_SIZE, FONT_WEIGHT, MONO_FAMILY } from "../pretext-fonts";
+import { DEFAULT_TABLE_METRICS, layoutTable, tableRowLineHeight } from "../prepared-block";
+import { CODE_BLOCK_FONT_SIZE, FONT_SIZE, FONT_WEIGHT, MONO_FAMILY } from "../pretext-fonts";
 import { useShikiTokens } from "../useShikiTokens";
+import { type CodeCopyPlacement, resolveCodeCopyPlacement } from "../vlist-content-view-float";
 import { splitTokensByVisualLines } from "../vlist-token-lines";
 import "../vlist-markdown.css";
 import { VListCodeCopyButton } from "../VListCodeCopyButton";
@@ -58,6 +63,29 @@ const streamAnimStore = new StreamAnimStore();
 // match measure (parse-markdown FONT_MARKDOWN_CODE / CODE_LINE_HEIGHT).
 const CODE_FONT = `${FONT_WEIGHT.regular} ${CODE_BLOCK_FONT_SIZE}px ${MONO_FAMILY}`;
 
+/**
+ * The fenced panel's border, per side. The measure layer folds it into the box's
+ * vertical padding (MEASURE_MARKDOWN_CODE_PADDING.y = 10 xs + 1 border); the
+ * render layer needs it on its own because absolutely positioned children are
+ * placed against the PADDING box, which is 1px inside the border-box the frame
+ * height describes.
+ */
+const CODE_PANEL_BORDER = 1;
+
+/**
+ * Font size (px) every LaTeX formula is painted at. MUST equal the `basePx` the
+ * measure layer passes to katex-geometry (parse-markdown MATH_BASE_FONT_SIZE) —
+ * both are `FONT_SIZE.sm`, derived here from the same shared constant rather than
+ * hardcoded, so the two cannot silently diverge.
+ *
+ * Why this is load-bearing: KaTeX sizes its own root box RELATIVELY
+ * (`.katex { font: normal 1.21em … }`), so the rendered geometry depends entirely
+ * on the font size the formula's DOM ancestor carries. Left to inherit, KaTeX picks
+ * up the document default (Mantine `body` = 16px) and paints ~14% larger than
+ * measured — which the width-pinned, `overflow:hidden` host box then clips.
+ */
+const MATH_BASE_FONT_SIZE = FONT_SIZE.sm;
+
 /** Lightweight mermaid host — reuses the real MermaidDiagram via dynamic import
  * so the vlist shell never statically depends on the heavy mermaid bundle
  * path at first paint. Failures fall back to a monospaced source box. */
@@ -67,6 +95,18 @@ const LazyMermaidDiagram = lazy(() =>
 
 interface RenderMarkdownProps {
 	measured: MeasuredElement;
+	/**
+	 * Show `sourceText` as raw monospace text instead of the measured render.
+	 *
+	 * Height-neutral by construction: the raw source goes into a box pinned to the
+	 * SAME `measured.height` and scrolls internally, exactly like a tool card's
+	 * capped body. That is what lets a plain content row offer the toggle at all —
+	 * the two forms wrap to completely different line counts, so anything but a
+	 * fixed box would resize a committed row.
+	 */
+	showSource?: boolean;
+	/** The raw markdown, needed only while `showSource` holds. */
+	sourceText?: string;
 	/**
 	 * Fired once the unknown-block subtree settles at a real pixel height.
 	 * Only used for PreparedUnknownBlock; ordinary blocks never call this.
@@ -90,12 +130,17 @@ interface RenderMarkdownProps {
  */
 export function RenderMarkdown({
 	measured,
+	showSource,
+	sourceText,
 	onUnknownHeight,
 	animateStreaming,
 	animKeyBase,
 }: RenderMarkdownProps) {
 	const { blocks, frame, contentWidth } = measured;
 	const hostRef = useRef<HTMLDivElement | null>(null);
+	// Non-default copy-button corners, for panels that would otherwise sit under
+	// the row's hover action bar (see resolveCodeCopyPlacements).
+	const copyPlacements = useMemo(() => resolveCodeCopyPlacements(blocks, frame), [blocks, frame]);
 
 	// One-shot observe: if any TRULY unpredictable block is present, report the
 	// host's real height after paint/layout. ResizeObserver is the controlled
@@ -128,6 +173,16 @@ export function RenderMarkdown({
 			ro.disconnect();
 		};
 	}, [hasUnknown, onUnknownHeight]);
+
+	// Raw-source view. Deliberately BEFORE the unknown-block branch: the source is
+	// plain text, so a mermaid/katex placeholder inside the rendered form is
+	// irrelevant to it, and the flowing layout that branch installs would let the
+	// source box decide its own height.
+	if (showSource && sourceText) {
+		return (
+			<MarkdownSourceBody text={sourceText} width={contentWidth} height={frame.contentHeight} />
+		);
+	}
 
 	// When any unpredictable block is present, switch the whole host to a
 	// simple stacked flow. Absolute frame tops cannot reflow subsequent siblings
@@ -166,6 +221,7 @@ export function RenderMarkdown({
 								contentWidth={contentWidth}
 								flowing
 								animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
+								codeCopyPlacement={copyPlacements.get(index)}
 							/>
 						</div>
 					);
@@ -200,12 +256,92 @@ export function RenderMarkdown({
 							contentWidth={contentWidth}
 							flowing={false}
 							animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
+							codeCopyPlacement={copyPlacements.get(index)}
 						/>
 					</Fragment>
 				);
 			})}
 		</div>
 	);
+}
+
+/**
+ * The raw markdown of a content row, inside a box pinned to the row's MEASURED
+ * height.
+ *
+ * This is the one structural difference from the chunked path's source toggle. In
+ * `ContentViewer` the source view reflows the row, because there the DOM owns the
+ * height. Here the height was committed arithmetically from the RENDERED markdown
+ * — headings, lists and wrapped prose — while the source is unwrapped monospace
+ * text with a completely different line count. Letting it size itself would move
+ * a committed row with every toggle (CONTRACT §0: a row's height changes only when
+ * the reader asks for a height change), so the source scrolls inside the reserved
+ * box instead. Exactly what a tool card's capped markdown body already does.
+ */
+function MarkdownSourceBody({
+	text,
+	width,
+	height,
+}: {
+	text: string;
+	width: number;
+	height: number;
+}) {
+	return (
+		<div
+			data-vlist-markdown-source
+			style={{
+				position: "relative",
+				width,
+				height,
+				overflow: "auto",
+				fontSize: CODE_BLOCK_FONT_SIZE,
+				// The integer line box the measure layer uses for code, for the same
+				// reason: a unitless ratio makes the browser pick a fractional height.
+				lineHeight: `${MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT}px`,
+				fontFamily: MONO_FAMILY,
+				whiteSpace: "pre-wrap",
+				wordBreak: "break-word",
+				boxSizing: "border-box",
+			}}
+		>
+			{text}
+		</div>
+	);
+}
+
+/**
+ * Where the FIRST fenced panel puts its copy button, keyed by block index.
+ *
+ * Why only the first: the row's hover action bar is a zero-height overlay parked
+ * at the body's own top-right corner with `zIndex: 2`, deliberately above any
+ * block-level chrome (`zIndex: 1`). A fenced panel pins its copy button to that
+ * same corner, so a code block near the top of the body has its button covered
+ * entirely. Every later panel is far below the bar and keeps the default corner.
+ *
+ * Read off the measured frame rather than assuming block 0, because both mistakes
+ * are real: a body can open with a zero-height block and still put a panel under
+ * the bar, and a panel starting one text line down already clears it and must not
+ * be moved for no visible reason.
+ */
+function resolveCodeCopyPlacements(
+	blocks: readonly PreparedBlock[],
+	frame: MeasuredElement["frame"],
+): Map<number, CodeCopyPlacement> {
+	const out = new Map<number, CodeCopyPlacement>();
+	for (let index = 0; index < blocks.length; index++) {
+		const block = blocks[index];
+		const blockFrame = frame.blocks[index];
+		if (!block || !blockFrame) continue;
+		// Only fenced panels paint in that corner today, so an early paragraph must
+		// not end the scan and mask a following code block that does overlap it.
+		if (block.kind !== "code") continue;
+		const placement = resolveCodeCopyPlacement(blockFrame.top, blockFrame.height);
+		// "top-right" is the component default; recording it would only add noise.
+		if (placement !== "top-right") out.set(index, placement);
+		break;
+	}
+	return out;
 }
 
 /**
@@ -224,6 +360,7 @@ function BlockView({
 	contentWidth,
 	flowing,
 	animKey,
+	codeCopyPlacement,
 }: {
 	block: PreparedBlock;
 	frame: BlockFrame;
@@ -232,6 +369,8 @@ function BlockView({
 	flowing: boolean;
 	/** Streaming per-grapheme animation key for this block (undefined = no anim). */
 	animKey?: string;
+	/** Non-default corner for a fenced panel's copy button; absent → top-right. */
+	codeCopyPlacement?: CodeCopyPlacement;
 }) {
 	switch (block.kind) {
 		case "inline":
@@ -244,7 +383,16 @@ function BlockView({
 				/>
 			);
 		case "code":
-			return <CodeBlockView block={block} frame={frame} contentWidth={contentWidth} />;
+			return (
+				<CodeBlockView
+					block={block}
+					frame={frame}
+					contentWidth={contentWidth}
+					copyPlacement={codeCopyPlacement}
+				/>
+			);
+		case "table":
+			return <TableBlockView block={block} frame={frame} contentWidth={contentWidth} />;
 		case "rule":
 			return <RuleBlockView frame={frame} block={block} />;
 		case "fixed":
@@ -252,6 +400,242 @@ function BlockView({
 		case "unknown":
 			return <UnknownBlockView block={block} frame={frame} flowing={flowing} />;
 	}
+}
+
+// ── Table block: solved columns, absolutely positioned cells ─────────────────
+
+/**
+ * Paint a GFM table WITHOUT a real `<table>`.
+ *
+ * The browser's `table-layout: auto` cannot be predicted arithmetically, so the
+ * height model solves the columns itself (`layoutTable`) and this component
+ * re-runs that same pure solver to place every cell. Because both sides call one
+ * function with one set of inputs, the painted geometry is the predicted geometry
+ * by construction — there is nothing left to drift.
+ *
+ * An overflowing table scrolls horizontally inside its own box, mirroring the
+ * chunked path's `overflowX: auto` wrapper. The height model reserved a fixed
+ * `scrollbarHeight` for that bar (see DEFAULT_TABLE_METRICS): rows are laid out
+ * from the top, so if the platform's real bar is thinner or absent, only the gap
+ * below the last row varies and no row ever moves.
+ */
+function TableBlockView({
+	block,
+	frame,
+	contentWidth,
+}: {
+	block: PreparedTableBlock;
+	frame: BlockFrame;
+	contentWidth: number;
+}) {
+	const boxWidth = Math.max(1, contentWidth - block.contentLeft);
+	const layout = useMemo(
+		() => layoutTable(block, boxWidth, pretextLineMetrics, DEFAULT_TABLE_METRICS),
+		[block, boxWidth],
+	);
+
+	const { paddingX, paddingY, rowBorder } = DEFAULT_TABLE_METRICS;
+	const hasHeader = block.header.length > 0;
+	// Row order matches the height model: header first (when present), then body.
+	const allRows = hasHeader ? [block.header, ...block.rows] : block.rows;
+
+	// Column x offsets, accumulated once so each cell is a lookup rather than a scan.
+	// DEFAULT_TABLE_METRICS is a module constant, so paddingX is stable and stays
+	// out of the dependency list.
+	const columnLefts = useMemo(() => {
+		const lefts: number[] = [];
+		let x = 0;
+		for (const width of layout.columnWidths) {
+			lefts.push(x);
+			x += width + paddingX * 2;
+		}
+		return lefts;
+	}, [layout.columnWidths]);
+
+	let rowTop = 0;
+
+	return (
+		<div
+			data-vlist-table
+			style={{
+				position: "absolute",
+				top: frame.top,
+				left: block.contentLeft,
+				width: boxWidth,
+				height: frame.height,
+				// Only an overflowing table scrolls; a fitting one must not create a
+				// scroll container (it would clip the hover highlight at the edges).
+				overflowX: layout.overflowing ? "auto" : "visible",
+				overflowY: "hidden",
+				// Pin the bar to a predictable thickness so the reserved space is close
+				// to the real one on classic-scrollbar platforms.
+				scrollbarWidth: "thin",
+			}}
+		>
+			<div style={{ position: "relative", width: layout.tableWidth, height: frame.height }}>
+				{allRows.map((cells, rowIndex) => {
+					const rowHeight = layout.rowHeights[rowIndex] ?? 0;
+					const top = rowTop;
+					rowTop += rowHeight;
+					const isHeader = hasHeader && rowIndex === 0;
+					// Striping counts BODY rows only, matching Mantine's `striped="odd"`
+					// applied to tbody (the header is never striped).
+					const bodyIndex = hasHeader ? rowIndex - 1 : rowIndex;
+					const striped = !isHeader && bodyIndex % 2 === 0;
+					return (
+						<div
+							// biome-ignore lint/suspicious/noArrayIndexKey: rows are a stable ordered list
+							key={rowIndex}
+							data-vlist-table-row={isHeader ? "header" : "body"}
+							// Striping and hover live in CSS, not inline styles: an inline
+							// background would outrank any class-based hover rule and force an
+							// `!important` to claw it back.
+							data-striped={striped ? "" : undefined}
+							className="vlist-table-row"
+							style={{
+								position: "absolute",
+								top,
+								left: 0,
+								width: layout.tableWidth,
+								height: rowHeight,
+								// The separator is inside the reserved row height (measure adds
+								// `rowBorder` per row), so drawing it never shifts anything.
+								borderBottom: `${rowBorder}px solid var(--vlist-table-border)`,
+								boxSizing: "border-box",
+							}}
+						>
+							{cells.map((cell, columnIndex) => {
+								const width = layout.columnWidths[columnIndex];
+								const left = columnLefts[columnIndex];
+								if (width === undefined || left === undefined) return null;
+								return (
+									<TableCellView
+										// biome-ignore lint/suspicious/noArrayIndexKey: cells are a stable ordered list
+										key={columnIndex}
+										cell={cell}
+										width={width}
+										left={left + paddingX}
+										top={paddingY}
+										lineHeight={tableRowLineHeight(cells, block.lineHeight)}
+										align={block.align[columnIndex] ?? null}
+									/>
+								);
+							})}
+						</div>
+					);
+				})}
+			</div>
+		</div>
+	);
+}
+
+/** One table cell's inline flow, materialized at the solved column width. */
+function TableCellView({
+	cell,
+	width,
+	left,
+	top,
+	lineHeight,
+	align,
+}: {
+	cell: PreparedTableCell;
+	width: number;
+	left: number;
+	top: number;
+	lineHeight: number;
+	align: "left" | "center" | "right" | null;
+}) {
+	const lines = useMemo(() => {
+		const out: InlineLine[] = [];
+		walkRichInlineLineRanges(cell.flow, width, (range) => {
+			const line = materializeRichInlineLineRange(cell.flow, range);
+			out.push({
+				fragments: line.fragments.map((f) => ({
+					text: f.text,
+					font: cell.fonts[f.itemIndex] ?? "",
+					className: cell.classNames[f.itemIndex] ?? "",
+					href: cell.hrefs[f.itemIndex] ?? null,
+					gapBefore: f.gapBefore,
+					globalStart: 0,
+					// A cell formula reaches here the same way a paragraph's does; leaving
+					// this null painted the atom placeholder (an NBSP) instead of the KaTeX
+					// markup, i.e. correctly-sized blank space.
+					math: cell.mathHtmls?.[f.itemIndex] ?? null,
+				})),
+			});
+		});
+		return out;
+	}, [cell, width]);
+
+	const justifyContent =
+		align === "center" ? "center" : align === "right" ? "flex-end" : "flex-start";
+
+	return (
+		<div style={{ position: "absolute", left, top, width }}>
+			{lines.map((line, lineIndex) => (
+				<div
+					// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
+					key={lineIndex}
+					data-vlist-line
+					style={{
+						position: "absolute",
+						left: 0,
+						top: lineIndex * lineHeight,
+						width,
+						height: lineHeight,
+						display: "flex",
+						alignItems: "center",
+						justifyContent,
+					}}
+				>
+					{line.fragments.map((frag, fi) =>
+						// Reuse the paragraph path's math host so a cell formula inherits the
+						// same guards (measured width pin, KaTeX font-size base, no-wrap).
+						frag.math ? (
+							<InlineMathView
+								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+								key={fi}
+								math={frag.math}
+								gapBefore={frag.gapBefore}
+								lineHeight={lineHeight}
+							/>
+						) : frag.href != null ? (
+							<a
+								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+								key={fi}
+								href={frag.href}
+								target="_blank"
+								rel="noreferrer"
+								className={frag.className}
+								style={{
+									font: frag.font,
+									marginLeft: frag.gapBefore,
+									whiteSpace: "pre",
+									display: "inline-block",
+								}}
+							>
+								{frag.text}
+							</a>
+						) : (
+							<span
+								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+								key={fi}
+								className={frag.className}
+								style={{
+									font: frag.font,
+									marginLeft: frag.gapBefore,
+									whiteSpace: "pre",
+									display: "inline-block",
+								}}
+							>
+								{frag.text}
+							</span>
+						),
+					)}
+				</div>
+			))}
+		</div>
+	);
 }
 
 // ── Inline block: materialize line ranges and lay out fragments ──────────────
@@ -469,6 +853,12 @@ function InlineBlockView({
  * KaTeX version drift can never push the surrounding text around — the geometry
  * the height model committed to always wins (zero-DOM contract).
  *
+ * `fontSize` is load-bearing, not cosmetic: KaTeX sizes its root box RELATIVELY
+ * (`.katex { font: normal 1.21em … }`), so without an explicit base it inherits
+ * the document default (Mantine `body` = 16px) and paints ~14% larger than
+ * katex-geometry measured — which the width pin then clips. Pinning
+ * MATH_BASE_FONT_SIZE reproduces the measurement context exactly.
+ *
  * The markup comes from KaTeX's own renderer, not from model output: KaTeX
  * escapes anything it cannot parse and its default `trust: false` refuses
  * `\href` / `\url` / `\includegraphics`, which is the same guarantee the
@@ -484,11 +874,31 @@ function InlineMathView({
 	lineHeight: number;
 }) {
 	if (math.html.length === 0) {
-		// KaTeX unavailable or failed: show the source so content is never lost.
+		// KaTeX unavailable or failed: show the source so content is never lost — but
+		// inside the SAME width-pinned, clipped box the rendered branch uses.
+		//
+		// The reserved slot was measured from the RENDERED width, and LaTeX source
+		// bears no relation to it (`\sum_{i=1}^{n}` is far wider as text than as a
+		// formula). Left to size itself, the source text would overflow its slot and
+		// push every later fragment on the line sideways — measured geometry and
+		// painted geometry disagree, which is the one thing this path may not do.
+		//
+		// `measureKatex`'s structural-failure branch returns `width: 0` (and
+		// `mathPiece` then degrades to a text piece), so this branch is normally
+		// reached only for `html: ""` with a real width. Pinning covers it either way:
+		// a zero width collapses the box, which is the correct answer for a slot that
+		// reserved nothing.
 		return (
 			<span
 				className="vlist-frag vlist-frag--math-source"
-				style={{ marginLeft: gapBefore, whiteSpace: "pre", display: "inline-block" }}
+				style={{
+					marginLeft: gapBefore,
+					whiteSpace: "pre",
+					display: "inline-block",
+					width: math.width,
+					height: lineHeight,
+					overflow: "hidden",
+				}}
 			>
 				{math.latex}
 			</span>
@@ -505,6 +915,19 @@ function InlineMathView({
 				width: math.width,
 				height: lineHeight,
 				overflow: "hidden",
+				// Reproduce the measurement context: KaTeX's `1.21em` root resolves
+				// against this size, so it must match katex-geometry's `basePx`.
+				fontSize: MATH_BASE_FONT_SIZE,
+				// KaTeX splits a formula into several `.base` spans, cut after binary /
+				// relation operators precisely so a browser MAY break there. The box is
+				// pinned to the measured width with zero slack, so sub-pixel rounding was
+				// enough to take one of those breaks and stack the formula onto a second
+				// line (clipped by the fixed height) — seen on `x_1 + x_2`,
+				// `\nabla f(x) = 0`, `f(x) = \sum…`. The atom is unbreakable by
+				// construction in the measure layer (an NBSP placeholder with
+				// `break: "never"`), so the paint must be unbreakable too. Widening the
+				// box instead would desync it from the reserved geometry.
+				whiteSpace: "nowrap",
 			}}
 			// biome-ignore lint/security/noDangerouslySetInnerHtml: KaTeX-generated markup, not model text (trust:false blocks \href/\url)
 			dangerouslySetInnerHTML={{ __html: math.html }}
@@ -539,19 +962,29 @@ function CodeBlockView({
 	block,
 	frame,
 	contentWidth,
+	copyPlacement,
 }: {
 	block: PreparedCodeBlock;
 	frame: BlockFrame;
 	contentWidth: number;
+	/** Non-default corner for the copy button; absent → the usual top-right. */
+	copyPlacement?: CodeCopyPlacement;
 }) {
 	const { x: padX, y: padY } = MEASURE_MARKDOWN_CODE_PADDING;
 	const langTop = block.lang != null ? padY + 12 : padY;
 	const boxWidth = Math.max(1, contentWidth - block.contentLeft);
-	const lines = useMemo(() => {
-		const innerWidth = Math.max(1, boxWidth - padX * 2);
-		return layoutWithLines(block.prepared, innerWidth, block.lineHeight).lines;
-	}, [block, boxWidth]);
 	// MEASURE_MARKDOWN_CODE_PADDING.x is a module constant — padX is stable.
+	const innerWidth = Math.max(1, boxWidth - padX * 2);
+	const lines = useMemo(
+		() => layoutWithLines(block.prepared, innerWidth, block.lineHeight).lines,
+		[block, innerWidth],
+	);
+	// Absolute children are laid out against the PADDING box, so the geometry a
+	// full-bleed child spans is the frame minus the border on each side.
+	const innerBoxWidth = Math.max(1, boxWidth - CODE_PANEL_BORDER * 2);
+	const innerBoxHeight = Math.max(0, frame.height - CODE_PANEL_BORDER * 2);
+	/** Bottom of the painted line stack — the start of the panel's bottom padding. */
+	const linesBottom = langTop + lines.length * block.lineHeight;
 
 	// Shiki needs the ORIGINAL source, not the wrapped lines: joining visual lines
 	// would insert newlines that aren't in the code and break the grammar context.
@@ -600,7 +1033,7 @@ function CodeBlockView({
 				overflow: "hidden",
 			}}
 		>
-			<VListCodeCopyButton value={source} hidden={!showCopy} />
+			<VListCodeCopyButton value={source} hidden={!showCopy} placement={copyPlacement} />
 			{block.lang != null ? (
 				<span
 					style={{
@@ -615,16 +1048,44 @@ function CodeBlockView({
 					{block.lang}
 				</span>
 			) : null}
+			{/* The panel's own padding carries no text: the top strip (plus the
+			    language label band) above the first line, and the bottom strip below
+			    the last one. Every child here is absolutely positioned, so the panel
+			    has no line box of its own to fall back on — without a filler a drag
+			    through those strips resolves no caret and the selection snaps to the
+			    start of the scroll container. */}
+			<CaretFiller top={0} height={langTop} width={innerBoxWidth} />
 			{lines.map((line, lineIndex) => (
 				<div
 					// biome-ignore lint/suspicious/noArrayIndexKey: code lines are a stable ordered list
 					key={lineIndex}
+					data-vlist-code-line
 					style={{
 						position: "absolute",
-						left: padX,
+						left: 0,
 						top: langTop + lineIndex * block.lineHeight,
+						// Fill the whole slot the measure layer reserved, in both axes.
+						// The row used to be a shrink-to-fit box: ~13px tall (see
+						// `lineHeight` below) inside a 17px slot and only as wide as its
+						// glyphs, so the 4px leading between rows, the blank remainder
+						// past the last glyph and the box padding all belonged to NO line
+						// box — the caret-less strips that made a drag selection snap back
+						// to the top of the history. `paddingLeft` (with border-box) keeps
+						// the glyphs at exactly `padX` while the row's box spans edge to
+						// edge; `minWidth` preserves the old overflow behaviour for a long
+						// line (still clipped by the panel).
+						width: innerBoxWidth,
+						height: block.lineHeight,
+						paddingLeft: padX,
+						boxSizing: "border-box",
+						minWidth: "max-content",
 						whiteSpace: "pre",
 						font: CODE_FONT,
+						// MUST stay after `font`: the shorthand resets line-height to
+						// `normal` (~13px at 11px), which both left the leading uncovered
+						// and painted the text ~2px above the settled Shiki view — that one
+						// half-leads at 11px/1.55, i.e. exactly this line height.
+						lineHeight: `${block.lineHeight}px`,
 						// Syntax colours arrive per token; this stays the fallback for
 						// uncoloured tokens and for the pre-highlight / plain-text paint.
 						color: "var(--vlist-code-fg)",
@@ -633,6 +1094,7 @@ function CodeBlockView({
 					<TokenText text={line.text} tokens={tokenLines?.[lineIndex]} />
 				</div>
 			))}
+			<CaretFiller top={linesBottom} height={innerBoxHeight - linesBottom} width={innerBoxWidth} />
 		</Box>
 	);
 }
@@ -725,7 +1187,15 @@ function UnknownBlockView({
 				return (
 					<div
 						className="vlist-math-display"
-						style={{ width: "100%", overflowX: "auto", overflowY: "hidden" }}
+						style={{
+							width: "100%",
+							overflowX: "auto",
+							overflowY: "hidden",
+							// Same relative-root problem as inline math: KaTeX's `1.21em`
+							// must resolve against the base the height model measured with,
+							// or the block renders taller than its reserved frame.
+							fontSize: MATH_BASE_FONT_SIZE,
+						}}
 						// biome-ignore lint/security/noDangerouslySetInnerHtml: KaTeX-generated markup, not model text (trust:false blocks \href/\url)
 						dangerouslySetInnerHTML={{ __html: html }}
 					/>

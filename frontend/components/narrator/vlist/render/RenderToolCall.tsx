@@ -56,6 +56,12 @@ import {
 	formatDiffGutter,
 } from "@shared/pretext-layout/diff-core";
 import {
+	CARD_SHIMMER_CLASS,
+	resolveToolShimmerFlash,
+	resolveToolShimmerPhase,
+	type ToolShimmerFlash,
+} from "@shared/tool-shimmer";
+import {
 	IconBan,
 	IconCheck,
 	IconChevronDown,
@@ -2661,39 +2667,64 @@ export interface RenderToolCallProps {
 	viewControls?: VListViewControls;
 }
 
+/** How long a one-shot outcome sweep stays mounted (600ms animation + a margin). */
+const OUTCOME_FLASH_MS = 650;
+
 /**
- * Resolve the sweep-shimmer class for a card (parity with ToolCallCard :5937):
- *   - streaming input            → neutral card shimmer (looping)
- *   - running (no permission)    → blue running shimmer (looping)
- *   - running → success just now → one-shot green done shimmer (650ms)
+ * Resolve the sweep-shimmer class for a card: neutral while its input streams,
+ * PURPLE while a reflection gate deliberates, blue while it executes, and a
+ * one-shot green / red pass as it settles.
  *
- * The done shimmer is a timed transition, so it needs component state: we track
- * the previous status and only fire when we actually observe a running → success
- * flip. Unlike ToolCallCard we have no startedAt/durationMs here, so we DON'T
- * fire on a fresh mount (prev === null) — that keeps history loads from flashing
- * while still animating real live completions.
+ * The state decision lives in `@shared/tool-shimmer` because four surfaces make it
+ * (both card paths and both folded-row paths) and they cannot share components.
+ * Notably it is what fixed the reflecting case: a gate parks its tool at `pending`,
+ * so asking `isRunningStatus` first painted a deliberating card BLUE — claiming
+ * execution that had not started.
+ *
+ * The closing flash is a timed transition, so it needs component state: we track the
+ * previous status and fire only on an observed in-flight → terminal flip. Unlike
+ * ToolCallCard we have no startedAt/durationMs to consult here, so a fresh mount
+ * (prev === null) never fires — that keeps scrolling through history quiet while
+ * still animating real live completions.
  */
 function useToolCardShimmerClass(
 	status: ToolCallStatus,
 	isStreaming: boolean,
 	hasPermission: boolean,
+	reflectionStatus: string | null,
 ): string | undefined {
 	const prevStatusRef = useRef<ToolCallStatus | null>(null);
-	const [doneShimmer, setDoneShimmer] = useState(false);
+	const [flash, setFlash] = useState<ToolShimmerFlash | null>(null);
 	useEffect(() => {
 		const prev = prevStatusRef.current;
 		prevStatusRef.current = status;
-		const wasRunning = prev != null && isRunningStatus(prev);
-		if (status === "success" && wasRunning) {
-			setDoneShimmer(true);
-			const timer = setTimeout(() => setDoneShimmer(false), 650);
-			return () => clearTimeout(timer);
+		const next = resolveToolShimmerFlash(prev, status);
+		// ⚠️ A transition with no flash CLEARS the stored one; it must not just bail.
+		// The 650ms timer is torn down by this effect's own cleanup, so a flash that
+		// the live `phase` below outranked (a retry inside the window: running → fail
+		// → running) survived and replayed on the NEXT quiet status — a red sweep on
+		// `cancelled`, which must never flash, or a green one on a card sitting on an
+		// approve/deny form.
+		if (!next) {
+			setFlash(null);
+			return;
 		}
+		setFlash(next);
+		const timer = setTimeout(() => setFlash(null), OUTCOME_FLASH_MS);
+		return () => clearTimeout(timer);
 	}, [status]);
 
-	if (isStreaming) return "vlist-tool-card-shimmer";
-	if (doneShimmer) return "vlist-tool-done-shimmer";
-	if (isRunningStatus(status) && !hasPermission) return "vlist-tool-running-shimmer";
+	// A live phase outranks the closing flash: if a call went straight back to work
+	// (a retry landing within the flash window) the current activity is the truer
+	// thing to show.
+	const phase = resolveToolShimmerPhase({
+		isStreaming,
+		status,
+		reflectionStatus,
+		hasPendingPermission: hasPermission,
+	});
+	if (phase) return CARD_SHIMMER_CLASS[phase];
+	if (flash) return CARD_SHIMMER_CLASS[flash];
 	return undefined;
 }
 
@@ -2729,7 +2760,16 @@ export function RenderToolCall({
 		category,
 		status,
 	} = measured;
-	const shimmerClass = useToolCardShimmerClass(status, isStreaming, permission != null);
+	// `reflection?.status` is what turns a deliberating gate purple instead of blue.
+	// It is reliably present when it matters: a running gate parks its tool at
+	// `pending`, which makes the card `lodExempt` → always measured expanded, and the
+	// reflection notice is only measured inside that expanded branch.
+	const shimmerClass = useToolCardShimmerClass(
+		status,
+		isStreaming,
+		permission != null,
+		reflection?.status ?? null,
+	);
 	const borderColor =
 		permission != null
 			? cssColor("yellow", 6)

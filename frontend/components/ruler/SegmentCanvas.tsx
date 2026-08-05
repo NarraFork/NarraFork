@@ -3,7 +3,7 @@ import { memo, useEffect, useMemo } from "react";
 import type { RulerSegment } from "../../hooks/useRuler";
 import { api } from "../../lib/api";
 import { localScale } from "./fisheye";
-import type { RulerOrientation } from "./types";
+import type { RulerOrientation, RulerPixiChapterPayload } from "./types";
 import { getCardModeForChapter } from "./zoom-tiers";
 
 /** Active segments refresh faster; historical ones can be stale longer. */
@@ -23,6 +23,8 @@ interface SegmentChapter {
 	parentChapterId: string | null;
 	narratorId: string | null;
 	narratorStatus: string | null;
+	/** Narrator is parked until an unavailable model recovers (see PixiChapterInfo). */
+	narratorModelUnavailable?: boolean;
 	reviewStatus: string | null;
 	startCommitSha: string | null;
 	mergeCommitSha: string | null;
@@ -47,6 +49,12 @@ export interface CardWorldInfo {
 	worldH: number;
 	status: string;
 	narratorStatus: string | null;
+	/**
+	 * Narrator is parked until an unavailable model recovers. Offscreen bubbles
+	 * use this to stay silent: the wait is not actionable, so it must not raise an
+	 * attention bubble even though the status reads `waiting`.
+	 */
+	narratorModelUnavailable?: boolean;
 }
 
 interface SegmentCanvasProps {
@@ -65,8 +73,11 @@ interface SegmentCanvasProps {
 	viewTop?: number;
 	/** World-space cross-axis size of the viewport */
 	viewHeight?: number;
-	/** Shared mutable map for registering card world positions (no re-render) */
-	cardRegistry?: React.MutableRefObject<Map<string, CardWorldInfo[]>>;
+	// ⚠️ No `cardRegistry` prop. This component writes NO world positions: since the
+	// PixiJS pipeline took over drawing (commit c7d623ad) it only loads segment data
+	// and reports chapters through `onChaptersLoaded`. The prop lingered here, declared
+	// but never destructured, which left RulerFlow's registry permanently empty. It is
+	// now filled in RulerFlow from `pixiChapters` — the same list PixiJS draws.
 	/** Request the parent to fit a world-space rect into the viewport */
 	onFitToView?: (worldX: number, worldY: number, worldW: number, worldH: number) => void;
 	/** World-space X of the zoom center (for morph proximity) */
@@ -80,42 +91,9 @@ interface SegmentCanvasProps {
 	/** Screen-space cross-axis offset (crossPan + rulerThickness) */
 	screenCrossOffset?: number;
 	/** Callback when chapters are loaded for a segment */
-	onChaptersLoaded?: (
-		fromSha: string,
-		chapters: Array<{
-			id: string;
-			status: string;
-			title: string;
-			branch: string;
-			role: string;
-			parentChapterId?: string | null;
-			narratorId: string | null;
-			narratorStatus: string | null;
-			reviewStatus?: string | null;
-			startCommitSha: string | null;
-			mergeCommitSha?: string | null;
-			layoutX: number;
-			layoutY: number;
-		}>,
-	) => void;
+	onChaptersLoaded?: (fromSha: string, chapters: RulerPixiChapterPayload[]) => void;
 	/** Lightweight callback during card drag — updates PixiJS without React re-render */
-	onChapterDragMove?: (
-		fromSha: string,
-		chapters: Array<{
-			id: string;
-			status: string;
-			title: string;
-			branch: string;
-			role: string;
-			parentChapterId?: string | null;
-			narratorId: string | null;
-			narratorStatus: string | null;
-			startCommitSha: string | null;
-			mergeCommitSha?: string | null;
-			layoutX: number;
-			layoutY: number;
-		}>,
-	) => void;
+	onChapterDragMove?: (fromSha: string, chapters: RulerPixiChapterPayload[]) => void;
 }
 
 const NODE_WIDTH = 220;
@@ -213,6 +191,7 @@ export const SegmentCanvas = memo(
 						parentChapterId: ch.parentChapterId,
 						narratorId: ch.narratorId,
 						narratorStatus: ch.narratorStatus,
+						narratorModelUnavailable: ch.narratorModelUnavailable,
 						reviewStatus: ch.reviewStatus,
 						startCommitSha: ch.startCommitSha,
 						mergeCommitSha: ch.mergeCommitSha,

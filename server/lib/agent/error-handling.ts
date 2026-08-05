@@ -1,3 +1,7 @@
+import {
+	isTransientTlsHandshakeError,
+	TRANSIENT_TLS_HANDSHAKE_CODE,
+} from "../net/tls-transport-error";
 import { settings } from "../settings";
 import { StreamStaleError } from "../stream-timeout";
 import type { ApiRequestDiagnostics } from "./types";
@@ -60,6 +64,11 @@ const RETRYABLE_PATTERNS = [
 	"stream read error",
 	"unable to connect",
 	"the operation timed out",
+	// A TLS handshake that failed without an attributable certificate defect —
+	// a disturbed handshake (relay/VPN/interception), not a bad certificate.
+	// Specific defects (CERT_HAS_EXPIRED, HOSTNAME_MISMATCH, ...) are deliberately
+	// absent here so a real misconfiguration still fails fast.
+	TRANSIENT_TLS_HANDSHAKE_CODE.toLowerCase(),
 	"server_error",
 	"internal_server_error",
 	"the server had an error",
@@ -97,6 +106,9 @@ const RETRYABLE_ERROR_CODES = new Set([
 	"CONNECTIONREFUSED",
 	"CONNECTIONRESET",
 	"CONNECTIONABORTED",
+	// See TRANSIENT_TLS_HANDSHAKE_CODE: an unattributable handshake failure, not a
+	// certificate defect. Specific X509 codes stay out of this set on purpose.
+	TRANSIENT_TLS_HANDSHAKE_CODE,
 ]);
 
 const NON_RETRYABLE_PATTERNS = [
@@ -850,6 +862,12 @@ export function isRetryableError(
 	if (causeCode && RETRYABLE_ERROR_CODES.has(causeCode)) {
 		return true;
 	}
+
+	// The code checks above only reach two levels of nesting. A transport-level
+	// handshake failure can sit deeper once a provider wraps it, so scan the whole
+	// bounded cause chain for the one TLS code that is transient rather than a
+	// certificate misconfiguration.
+	if (isTransientTlsHandshakeError(err)) return true;
 
 	// Check HTTP status codes. 429 needs a rate-limit/load keyword to avoid retrying billing/quota failures;
 	// every 5xx status is treated as a transient upstream failure.

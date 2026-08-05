@@ -29,6 +29,29 @@ let makeEvent: (type: string, init?: EventInit) => Event;
  */
 let setNativeValue: (input: HTMLInputElement, value: string) => void;
 
+/**
+ * A KeyboardEvent that actually carries `key`.
+ *
+ * linkedom implements no KeyboardEvent at all, so the old `window.KeyboardEvent ??
+ * window.Event` fallback published a plain `Event` as the global `KeyboardEvent`.
+ * That global is process-wide: because `mock.restore()` does not undo global
+ * assignment and nothing here restored it, every later-loaded suite that does
+ * `new KeyboardEvent("keydown", { key: "Enter" })` silently got an event with NO
+ * `key` — so React's onKeyDown saw `key === undefined` and Enter/Space handlers
+ * never fired (see vlist-ask-in-passing-interaction). Subclassing Event and
+ * assigning `key` keeps the global honest for whoever loads next.
+ */
+function makeKeyboardEventClass(EventCtor: typeof Event): typeof KeyboardEvent {
+	return class TestKeyboardEvent extends EventCtor {
+		key: string;
+
+		constructor(type: string, init?: KeyboardEventInit) {
+			super(type, init);
+			this.key = init?.key ?? "";
+		}
+	} as unknown as typeof KeyboardEvent;
+}
+
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	makeEvent = (type, init) => new (window as unknown as { Event: typeof Event }).Event(type, init);
@@ -88,7 +111,8 @@ function installDom() {
 		navigator: window.navigator,
 		Event: window.Event,
 		MouseEvent: window.MouseEvent ?? window.Event,
-		KeyboardEvent: window.KeyboardEvent ?? window.Event,
+		KeyboardEvent:
+			window.KeyboardEvent ?? makeKeyboardEventClass(window.Event as unknown as typeof Event),
 		HTMLElement: window.HTMLElement,
 		HTMLInputElement: window.HTMLInputElement,
 		HTMLTextAreaElement: window.HTMLTextAreaElement,

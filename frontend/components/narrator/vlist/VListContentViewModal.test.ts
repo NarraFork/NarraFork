@@ -58,12 +58,19 @@ describe("the fullscreen viewer leaves the list's measured geometry alone", () =
  * guard above would be protecting nothing.
  */
 describe("viewportHeight / contentWidth are document-build inputs", () => {
+	// Anchored on the effect's real boundaries. An earlier version opened the slice at
+	// `const node = viewportRef.current;` and closed it at `}, [centeredColumn]);` —
+	// neither of which is the resize effect any more (the node comes from state, and
+	// the dependency list is `[viewportNode, centeredColumn]`), so `indexOf` returned
+	// -1, `slice(0, -1)` kept almost the whole file, and every assertion below passed
+	// on unrelated code.
 	it("the shell measures both from the viewport through a ResizeObserver", () => {
 		const src = read("PretextExactMessageList.tsx");
-		const block = src.slice(
-			src.indexOf("const node = viewportRef.current;", src.indexOf("useLayoutEffect(() => {")),
-		);
-		const measure = block.slice(0, block.indexOf("}, [centeredColumn]);"));
+		const start = src.indexOf("const node = viewportNode;");
+		expect(start).toBeGreaterThan(-1);
+		const end = src.indexOf("}, [viewportNode, centeredColumn]);", start);
+		expect(end).toBeGreaterThan(start);
+		const measure = src.slice(start, end);
 		expect(measure).toContain("setViewportHeight(node.clientHeight)");
 		expect(measure).toContain("node.clientWidth");
 		expect(measure).toContain("new ResizeObserver(measure)");

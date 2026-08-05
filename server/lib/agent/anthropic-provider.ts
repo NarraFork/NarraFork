@@ -11,10 +11,10 @@ import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { AnthropicProviderConfig } from "../settings";
 import {
-	getModelContextWindow,
 	getReasoningEffortBlocklist,
 	getSettingsRevision,
 	parseModelId,
+	resolveModelContextWindow,
 	settings,
 } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
@@ -697,20 +697,22 @@ export function supportsAnthropic1mContext(model: string): boolean {
 	return atLeastVersion(parsed, 4, 6);
 }
 
-function getAnthropicEffectiveContextWindow(
+export function getAnthropicEffectiveContextWindow(
 	model: string,
 	config: AnthropicProviderConfig,
 ): number | null {
-	const configuredWindow = getModelContextWindow(model, config.prefix);
-	// Official-API floor only. On third-party relays the 1M default comes from
-	// the built-in model table inside getModelContextWindow, which sits BELOW
-	// the user's explicit per-model / per-provider configuration in the lookup
-	// order. Applying a floor here instead would override an explicitly
-	// configured smaller window and break auto-compact for those setups.
-	if (config.officialApi && supportsAnthropic1mContext(model)) {
-		return Math.max(configuredWindow ?? 0, 1_000_000);
+	const resolved = resolveModelContextWindow(model, config.prefix);
+	// Official-API floor, but never above an explicit configuration. A per-model
+	// override typed in settings, or the provider's own defaultContextWindow, is
+	// a deliberate user decision (relays commonly cap far below 1M) — raising it
+	// to 1M here would make the custom value look ignored and delay auto-compact
+	// past the real limit. Only derived values (gateway catalog, built-in table,
+	// 128k fallback) get lifted to the official 1M window.
+	const explicit = resolved.source === "user" || resolved.source === "provider";
+	if (!explicit && config.officialApi && supportsAnthropic1mContext(model)) {
+		return Math.max(resolved.contextWindow, 1_000_000);
 	}
-	return configuredWindow;
+	return resolved.contextWindow;
 }
 
 function calculateAnthropicContextPercent(

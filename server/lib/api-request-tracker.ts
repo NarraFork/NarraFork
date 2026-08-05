@@ -4,6 +4,7 @@ import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { settings } from "@server/lib/settings";
 import { calculateCost, type UsageData } from "@server/lib/usage-tracking";
+import { recordCredentialUsage } from "@server/services/credential-usage-totals";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./agent/error-diagnostics";
 import type { ApiRequestDiagnostics } from "./agent/types";
 
@@ -159,6 +160,8 @@ export async function finishApiRequest(
 			? { ...options, rawDump: undefined }
 			: options;
 	const rawDump = shouldPersistRawDump(options) ? serializeRawDump(persistenceOptions) : null;
+	const credentialId = options.credentialId ?? handle.credentialId ?? null;
+	const createdAt = new Date().toISOString();
 
 	await db.insert(apiRequests).values({
 		id: handle.id,
@@ -166,7 +169,7 @@ export async function finishApiRequest(
 		messageId: options.messageId ?? null,
 		kind: handle.kind,
 		provider: handle.provider,
-		credentialId: options.credentialId ?? handle.credentialId ?? null,
+		credentialId,
 		model: handle.model,
 		inputTokens: usage?.inputTokens ?? 0,
 		outputTokens: usage?.outputTokens ?? 0,
@@ -183,8 +186,38 @@ export async function finishApiRequest(
 		meterUnit: options.meterUnit ?? null,
 		errorMessage: options.errorMessage ?? null,
 		rawDumpJson: rawDump,
-		createdAt: new Date().toISOString(),
+		createdAt,
 	});
+
+	// Roll the same numbers into the durable per-credential totals. This must
+	// happen on the same path as the detail insert so the two cannot drift; the
+	// detail row is later deleted with its narrator, the rollup is not.
+	//
+	// Failed requests (no usage at all) are skipped: they consumed no tokens and
+	// counting them would make "requests" mean two different things.
+	//
+	// Requests without a credentialId are skipped too, and that is deliberate:
+	// Anthropic and OpenAI direct connections have no credential management, so
+	// there is nothing to attribute the usage to. Bucketing them under a shared
+	// sentinel would break the table's "one row per real credential" key and give
+	// several unrelated providers a single merged row. The consequence is that
+	// `credential_usage_totals` is a per-credential rollup, not a deployment-wide
+	// ledger — see the SCOPE note on the table in db/schema.ts. Deployment totals
+	// come from `api_requests` while those rows exist.
+	if (credentialId && usage) {
+		recordCredentialUsage({
+			provider: handle.provider,
+			credentialId,
+			model: handle.model,
+			inputTokens: usage.inputTokens,
+			outputTokens: usage.outputTokens,
+			cachedInputTokens: usage.cachedInputTokens,
+			cacheCreationTokens: usage.cacheCreationInputTokens,
+			reasoningTokens: usage.reasoningTokens,
+			costUsd: cost?.totalCost ?? null,
+			at: createdAt,
+		});
+	}
 
 	return handle.id;
 }

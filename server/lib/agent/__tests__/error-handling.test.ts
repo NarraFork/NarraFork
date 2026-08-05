@@ -171,6 +171,61 @@ describe("agent error handling", () => {
 		).toBe(false);
 	});
 
+	test("retries a TLS handshake that failed without an attributable cause", () => {
+		// Bun falls back to this code when no X509 verify code explains the failure —
+		// a disturbed handshake (relay/VPN/interception), not a bad certificate.
+		expect(
+			isRetryableError(
+				Object.assign(new Error("unknown certificate verification error"), {
+					code: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR",
+				}),
+			),
+		).toBe(true);
+		// The wrapped NetworkRequestError keeps the code only inside its message.
+		expect(
+			isRetryableError(
+				new Error(
+					"Network request failed [tls/UNKNOWN_CERTIFICATE_VERIFICATION_ERROR] after 15571 ms: " +
+						"The TLS handshake or certificate verification failed.",
+				),
+			),
+		).toBe(true);
+		// Also reachable when a provider buries the transport failure deeper than
+		// the two nesting levels the code checks inspect directly.
+		expect(
+			isRetryableError(
+				new Error("NUG chat request failed", {
+					cause: new Error("transport failed", {
+						cause: Object.assign(new Error("handshake failed"), {
+							code: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR",
+						}),
+					}),
+				}),
+			),
+		).toBe(true);
+	});
+
+	test("does not retry attributable certificate failures", () => {
+		for (const [code, message] of [
+			["CERT_HAS_EXPIRED", "certificate has expired"],
+			["DEPTH_ZERO_SELF_SIGNED_CERT", "self signed certificate"],
+			["SELF_SIGNED_CERT_IN_CHAIN", "self signed certificate in certificate chain"],
+			["UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "unable to get local issuer certificate"],
+			["ERR_TLS_CERT_ALTNAME_INVALID", "hostname/IP does not match certificate's altnames"],
+			["HOSTNAME_MISMATCH", "hostname mismatch"],
+		] as const) {
+			expect(isRetryableError(Object.assign(new Error(message), { code }))).toBe(false);
+			expect(
+				isRetryableError(
+					new Error(
+						`Network request failed [tls/${code}] after 120 ms: POST https://example.com/v1/chat ` +
+							"via direct connection. The TLS handshake or certificate verification failed.",
+					),
+				),
+			).toBe(false);
+		}
+	});
+
 	test("classifies OpenAI 400 input-token-count errors as context overflow", () => {
 		expect(
 			isContextWindowExceededError(

@@ -1075,6 +1075,15 @@ export async function executeTool(
 		let progressTimer: ReturnType<typeof setInterval> | undefined;
 		if (config.onEvent) {
 			const onEvent = config.onEvent;
+			// The ONE moment that proves execution has begun: permission granted, final
+			// admission acquired, `tool.execute` not yet called. Everything upstream of here
+			// (input parsing, the approval prompt, a reflection gate, the admission wait) is
+			// preparation the UI must not paint as work in progress.
+			//
+			// `executionStartedAt` rather than `Date.now()`: a tool resumed after a
+			// transparent update wait re-stamps it above, so this matches the value the
+			// eventual `tool_result` reports and the two cannot disagree.
+			onEvent({ type: "tool_executing", toolUseId: tu.toolUseId, executionStartedAt });
 			let elapsed = 0;
 			progressTimer = setInterval(() => {
 				elapsed += PROGRESS_INTERVAL_MS / 1000;

@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
 
 /**
  * Session-token issuance and verification, exercised without the database.
@@ -6,8 +6,20 @@ import { describe, expect, mock, test } from "bun:test";
  * `server/lib/auth.ts` imports `../db` for the login/registration helpers, which
  * would run the whole migration stack. Only the JWT layer is under test here, so
  * the module is stubbed out.
+ *
+ * Snapshot the real module first. Bun's mock.module is process-wide and
+ * mock.restore() does NOT undo it, so afterAll re-points the specifier back —
+ * otherwise this `{ db: {} }` stub leaks into every later-loaded suite that
+ * touches the database (oauth-provider, oauth-rate-limit, …) and even breaks the
+ * `sqlite` named export other suites re-mock.
  */
+const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db: {} }));
+
+afterAll(() => {
+	mock.module("../../db", () => realDbModule);
+	mock.restore();
+});
 
 const [
 	{ createToken, isAuthenticSessionTokenIgnoringExpiry, renewToken, verifyToken },

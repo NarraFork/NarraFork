@@ -277,7 +277,12 @@ export function topLevelStreamingChunkToToolFields(
 ): Record<string, unknown> {
 	if (chunk._started) {
 		return {
-			status: chunk._status ?? "running",
+			// `initializing`, not `running`: `_started` means the tool's INPUT finished
+			// parsing, and the permission gate sits after that. The real `running` arrives
+			// with `tool_executing` (which the store folds into `_status`), so defaulting to
+			// it here would claim execution that may not have begun — the bug that made a
+			// card awaiting approval animate as though it were working.
+			status: chunk._status ?? "initializing",
 			...(chunk._input ? { inputJson: chunk._input } : {}),
 			...(chunk._startedAt != null ? { startedAt: chunk._startedAt } : {}),
 			...(chunk._output !== undefined ? { outputJson: chunk._output } : {}),
@@ -438,7 +443,9 @@ export function buildTopLevelStreamingChunksMsg(
 			if (tcIdx !== -1) {
 				toolCalls[tcIdx] = {
 					...toolCalls[tcIdx],
-					status: chunk._status ?? "running",
+					// See topLevelStreamingChunkToToolFields: `_started` is "input parsed", not
+					// "executing", so the default must not be `running`.
+					status: chunk._status ?? "initializing",
 					...(chunk._startedAt && { startedAt: chunk._startedAt }),
 					...(chunk._output !== undefined && { outputJson: chunk._output }),
 					...(chunk._durationMs != null && { durationMs: chunk._durationMs }),

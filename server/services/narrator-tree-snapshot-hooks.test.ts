@@ -15,6 +15,9 @@ import { generateId } from "../lib/id";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import {
+	abandonSessionTreeSnapshots,
+	abandonTreeSnapshot,
+	declaredWorktreePaths,
 	recordTreeSnapshotAfter,
 	recordTreeSnapshotBefore,
 	type TreeSnapshotSession,
@@ -73,6 +76,11 @@ async function seedToolCall(
 
 function makeSession(cwd: string): TreeSnapshotSession {
 	return { cwd };
+}
+
+/** Worktree-relative declaration for a Write/Edit turn, as the session computes it. */
+function declare(cwd: string, relPath: string): string[] {
+	return declaredWorktreePaths(cwd, { file_path: join(cwd, relPath) });
 }
 
 afterEach(async () => {
@@ -249,5 +257,305 @@ describe("narrator tree snapshot hooks", () => {
 		await recordTreeSnapshotBefore(session, narratorId, toolUseId);
 		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 		expect(result.changedFiles).toEqual([]);
+	});
+});
+
+/**
+ * What happens to a write claim when the second half of the lifecycle never runs.
+ *
+ * A claim is opened before the tool executes and closed after it reports a result.
+ * There are real paths where the second never happens: the tool throws, the turn is
+ * aborted between `tool_call` and `tool_result`, a re-run's execution metadata does
+ * not name a local device. An unclosed claim reads as "still running, so it extends
+ * to now", which makes it overlap *every* later window — and because the shell path
+ * only ever subtracts, one leaked declaration silently turns another narrator's real
+ * writes into unrevertable ones. These are the only cases that catch that.
+ */
+describe("unfinished tool lifecycles", () => {
+	test("abandoning a call stops its declaration shadowing later windows", async () => {
+		const repo = await createRepo("nf-hook-abandon-");
+		const narratorId = await createNarrator(repo);
+		const neighbourId = await createNarrator(repo);
+		const session = makeSession(repo);
+		const neighbour = makeSession(repo);
+		writeFileSync(join(repo, "target.txt"), "v1\n");
+
+		// The neighbour's Edit declares its target and then throws, so its after-hook
+		// never runs. This is the leak.
+		await recordTreeSnapshotBefore(neighbour, neighbourId, "threw-mid-write", ["target.txt"]);
+		abandonTreeSnapshot(neighbour, neighbourId, "threw-mid-write");
+
+		// A shell command starting afterwards genuinely writes that file, and must keep
+		// it: without the seal the abandoned claim still overlaps and subtracts it.
+		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
+		writeFileSync(join(repo, "target.txt"), "written-by-shell\n");
+		session._lastTreeHash = undefined;
+		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+
+		expect(result.changedFiles).toEqual(["target.txt"]);
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, toolUseId),
+			columns: { ownedPathsJson: true },
+		});
+		expect(row?.ownedPathsJson).toEqual(["target.txt"]);
+	});
+
+	test("an abandoned call still shadows a neighbour inside the span it occupied", async () => {
+		const repo = await createRepo("nf-hook-abandon-overlap-");
+		const narratorId = await createNarrator(repo);
+		const neighbourId = await createNarrator(repo);
+		const session = makeSession(repo);
+		const neighbour = makeSession(repo);
+		writeFileSync(join(repo, "theirs.txt"), "v1\n");
+
+		// The shell window opens first, so the failed Edit's span lies inside it. The Edit
+		// may well have written its target before failing, so the declaration must not be
+		// discarded — only its window pinned.
+		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
+		await recordTreeSnapshotBefore(neighbour, neighbourId, "threw-mid-write", ["theirs.txt"]);
+		writeFileSync(join(repo, "theirs.txt"), "v2\n");
+		abandonTreeSnapshot(neighbour, neighbourId, "threw-mid-write");
+		session._lastTreeHash = undefined;
+		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+
+		expect(result.workspaceDelta).toEqual(["theirs.txt"]);
+		expect(result.changedFiles).toEqual([]);
+	});
+
+	test("an interrupted turn abandons every call the narrator still holds", async () => {
+		const repo = await createRepo("nf-hook-abandon-turn-");
+		const abortedId = await createNarrator(repo);
+		const otherId = await createNarrator(repo);
+		const shellId = await createNarrator(repo);
+		const aborted = makeSession(repo);
+		const other = makeSession(repo);
+		const shell = makeSession(repo);
+		writeFileSync(join(repo, "one.txt"), "v1\n");
+		writeFileSync(join(repo, "two.txt"), "v1\n");
+
+		// Two tools announced and never resolved — the interrupt shape: Write/Edit/Bash
+		// are all excluded from eager execution, so on abort their `tool_call` has been
+		// emitted and their `tool_result` never will be.
+		await recordTreeSnapshotBefore(aborted, abortedId, "edit-a", ["one.txt"]);
+		await recordTreeSnapshotBefore(aborted, abortedId, "edit-b", ["two.txt"]);
+		// A different narrator is genuinely still running and must not be sealed.
+		await recordTreeSnapshotBefore(other, otherId, "still-running", ["two.txt"]);
+
+		abandonSessionTreeSnapshots(aborted, abortedId);
+
+		const { toolUseId } = await seedToolCall(shellId, "Bash", 1);
+		await recordTreeSnapshotBefore(shell, shellId, toolUseId, null);
+		writeFileSync(join(repo, "one.txt"), "shell-wrote-this\n");
+		writeFileSync(join(repo, "two.txt"), "shell-wrote-this\n");
+		shell._lastTreeHash = undefined;
+		const result = await recordTreeSnapshotAfter(shell, shellId, toolUseId);
+
+		// `one.txt` survives (its claim was sealed before the shell window opened);
+		// `two.txt` is still claimed by the narrator that is actually running.
+		expect(result.workspaceDelta.sort()).toEqual(["one.txt", "two.txt"]);
+		expect(result.changedFiles).toEqual(["one.txt"]);
+	});
+
+	test("abandoning drops the staged boundary and the cached hash", async () => {
+		const repo = await createRepo("nf-hook-abandon-state-");
+		const narratorId = await createNarrator(repo);
+		const session = makeSession(repo);
+		writeFileSync(join(repo, "a.txt"), "v1\n");
+
+		const first = await seedToolCall(narratorId, "Write", 1);
+		await recordTreeSnapshotBefore(session, narratorId, first.toolUseId);
+		// The tool wrote and then failed, so the cache from before it ran is stale.
+		writeFileSync(join(repo, "a.txt"), "half-written\n");
+		abandonTreeSnapshot(session, narratorId, first.toolUseId);
+		expect(session._lastTreeHash).toBeUndefined();
+
+		// The next tool's `before` must describe the real disk, including what the failed
+		// tool managed to write — otherwise segment planning would chain across a state
+		// that never existed.
+		const truthful = await worktreeTreeSnapshot.capture(repo);
+		const second = await seedToolCall(narratorId, "Write", 2);
+		await recordTreeSnapshotBefore(session, narratorId, second.toolUseId);
+		writeFileSync(join(repo, "a.txt"), "v2\n");
+		const result = await recordTreeSnapshotAfter(session, narratorId, second.toolUseId);
+		expect(result.before).toBe(truthful);
+
+		// The abandoned call recorded no boundary of its own.
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, first.toolUseId),
+			columns: { treeHashAfter: true },
+		});
+		expect(row?.treeHashAfter).toBeNull();
+	});
+
+	test("abandoning an unknown call is a no-op rather than an error", async () => {
+		const repo = await createRepo("nf-hook-abandon-unknown-");
+		const narratorId = await createNarrator(repo);
+		const session = makeSession(repo);
+		// The cleanup paths run unconditionally, including for tools that never opened a
+		// claim (remote target, non-git workspace), so neither may throw.
+		expect(() => abandonTreeSnapshot(session, narratorId, "never-opened")).not.toThrow();
+		expect(() => abandonSessionTreeSnapshots(session, narratorId)).not.toThrow();
+	});
+});
+
+describe("declaredWorktreePaths", () => {
+	test("resolves an absolute path inside the worktree to a git-shaped relative path", () => {
+		expect(declaredWorktreePaths("/work/repo", { file_path: "/work/repo/src/a.ts" })).toEqual([
+			"src/a.ts",
+		]);
+	});
+
+	test("treats a spec:// URI as owning nothing on disk", () => {
+		// Virtual files never reach the worktree, so there is nothing to restore. This
+		// used to be inferred from `before === after`, which stops holding in a shared
+		// worktree where a neighbour moves the hash during the call.
+		expect(declaredWorktreePaths("/work/repo", { file_path: "spec://tasks.json" })).toEqual([]);
+	});
+
+	test("treats a path outside the worktree as owning nothing", () => {
+		// Reported as a declaration of "nothing here", not as unknown: the call cannot
+		// have changed a file this rollback is able to touch.
+		expect(declaredWorktreePaths("/work/repo", { file_path: "/etc/hosts" })).toEqual([]);
+		expect(declaredWorktreePaths("/work/repo", { file_path: "/work/other/a.ts" })).toEqual([]);
+	});
+
+	test("returns nothing for input that names no file", () => {
+		expect(declaredWorktreePaths("/work/repo", {})).toEqual([]);
+		expect(declaredWorktreePaths("/work/repo", null)).toEqual([]);
+		expect(declaredWorktreePaths("/work/repo", { file_path: 42 })).toEqual([]);
+	});
+});
+
+/**
+ * A worktree is shared, and a tree hash covers all of it. So the span between a
+ * tool's two boundaries also holds whatever the neighbours wrote while it ran —
+ * which is how a narrator that only ran `git log` and `bun test` came to report
+ * three modified files belonging to other narrators.
+ */
+describe("attribution in a shared worktree", () => {
+	test("a read-only shell call owns nothing even though the tree moved", async () => {
+		const repo = await createRepo("nf-hook-shared-readonly-");
+		const narratorId = await createNarrator(repo);
+		const neighbourId = await createNarrator(repo);
+		const session = makeSession(repo);
+		const neighbour = makeSession(repo);
+		writeFileSync(join(repo, "theirs.txt"), "v1\n");
+
+		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
+		// The neighbour's Write/Edit declares its target before it writes, exactly as
+		// its own snapshot hook does.
+		await recordTreeSnapshotBefore(neighbour, neighbourId, "neighbour-tool", ["theirs.txt"]);
+		writeFileSync(join(repo, "theirs.txt"), "v2\n");
+		session._lastTreeHash = undefined;
+		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+
+		// The workspace genuinely moved, and the raw delta still says so — that is the
+		// trap. Attribution is what separates the two.
+		expect(result.before).not.toBe(result.after);
+		expect(result.workspaceDelta).toEqual(["theirs.txt"]);
+		expect(result.changedFiles).toEqual([]);
+
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, toolUseId),
+			columns: { ownedPathsJson: true },
+		});
+		expect(row?.ownedPathsJson).toEqual([]);
+	});
+
+	test("a declared write owns only its own target, not a concurrent neighbour's", async () => {
+		const repo = await createRepo("nf-hook-shared-declared-");
+		const narratorId = await createNarrator(repo);
+		const neighbourId = await createNarrator(repo);
+		const session = makeSession(repo);
+		const neighbour = makeSession(repo);
+		writeFileSync(join(repo, "mine.txt"), "mine-v1\n");
+		writeFileSync(join(repo, "theirs.txt"), "theirs-v1\n");
+
+		const { toolUseId } = await seedToolCall(narratorId, "Edit", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, declare(repo, "mine.txt"));
+		await recordTreeSnapshotBefore(neighbour, neighbourId, "neighbour-tool", ["theirs.txt"]);
+		writeFileSync(join(repo, "mine.txt"), "mine-v2\n");
+		writeFileSync(join(repo, "theirs.txt"), "theirs-v2\n");
+		session._lastTreeHash = undefined;
+		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+
+		expect(result.workspaceDelta.sort()).toEqual(["mine.txt", "theirs.txt"]);
+		// Attributing the raw delta is what credited one narrator with another's edits
+		// in `file_attributions`.
+		expect(result.changedFiles).toEqual(["mine.txt"]);
+	});
+
+	test("a declared path the tool did not actually write is not claimed", async () => {
+		const repo = await createRepo("nf-hook-declared-noop-");
+		const narratorId = await createNarrator(repo);
+		const session = makeSession(repo);
+		writeFileSync(join(repo, "target.txt"), "unchanged\n");
+		writeFileSync(join(repo, "other.txt"), "v1\n");
+
+		// An Edit that produces identical bytes changes nothing, while something else
+		// moves the tree during the window. Neither path may be claimed: one was not
+		// written, the other was never declared.
+		const { toolUseId } = await seedToolCall(narratorId, "Edit", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, declare(repo, "target.txt"));
+		writeFileSync(join(repo, "other.txt"), "v2\n");
+		session._lastTreeHash = undefined;
+		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+
+		expect(result.workspaceDelta).toEqual(["other.txt"]);
+		expect(result.changedFiles).toEqual([]);
+	});
+
+	test("a shell call keeps its own writes while dropping a declared neighbour's", async () => {
+		const repo = await createRepo("nf-hook-shared-shell-");
+		const narratorId = await createNarrator(repo);
+		const neighbourId = await createNarrator(repo);
+		const session = makeSession(repo);
+		const neighbour = makeSession(repo);
+		writeFileSync(join(repo, "built.txt"), "old\n");
+		writeFileSync(join(repo, "theirs.txt"), "theirs-v1\n");
+
+		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
+		await recordTreeSnapshotBefore(neighbour, neighbourId, "neighbour-tool", ["theirs.txt"]);
+		// A real build step writing a file no tool input describes, plus the
+		// neighbour's concurrent edit.
+		await safeSpawn({
+			cmd: ["sh", "-c", "printf 'new\\n' > built.txt && printf 'theirs-v2\\n' > theirs.txt"],
+			cwd: repo,
+			timeout: 15_000,
+		});
+		session._lastTreeHash = undefined;
+		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+
+		expect(result.workspaceDelta.sort()).toEqual(["built.txt", "theirs.txt"]);
+		// The capability that must not regress: a shell command's own writes are still
+		// captured, even though they were never declared.
+		expect(result.changedFiles).toEqual(["built.txt"]);
+	});
+
+	test("a neighbour that finished before the window began is not subtracted", async () => {
+		const repo = await createRepo("nf-hook-stale-claim-");
+		const narratorId = await createNarrator(repo);
+		const neighbourId = await createNarrator(repo);
+		const session = makeSession(repo);
+		const neighbour = makeSession(repo);
+		writeFileSync(join(repo, "shared.txt"), "v1\n");
+
+		// The neighbour declares and completes first. Its declaration must not shadow a
+		// later shell call that genuinely wrote the same file, or that write would
+		// become unrevertable.
+		await recordTreeSnapshotBefore(neighbour, neighbourId, "neighbour-tool", ["shared.txt"]);
+		await recordTreeSnapshotAfter(neighbour, neighbourId, "neighbour-tool");
+
+		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
+		writeFileSync(join(repo, "shared.txt"), "v2\n");
+		session._lastTreeHash = undefined;
+		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+
+		expect(result.changedFiles).toEqual(["shared.txt"]);
 	});
 });

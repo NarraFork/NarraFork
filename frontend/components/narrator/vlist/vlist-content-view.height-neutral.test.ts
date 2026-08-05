@@ -93,3 +93,44 @@ describe("wrap / source toggles stay out of the measure path", () => {
 		expect(consumers[0]).toContain("interactionSig");
 	});
 });
+
+/**
+ * A plain content row's source view is the one place a source toggle reaches a
+ * body whose height was measured from the RENDERED markdown. The two forms wrap to
+ * different line counts, so the raw text must go into a box pinned to the measured
+ * height — otherwise flipping the toggle resizes a committed row, which is exactly
+ * the invariant the whole exact path is built on.
+ */
+describe("a plain row's source view cannot resize the row", () => {
+	it("pins the source box to the measured height and scrolls the overflow", () => {
+		const src = read("render/RenderMarkdown.tsx");
+		const start = src.indexOf("function MarkdownSourceBody(");
+		expect(start).toBeGreaterThan(-1);
+		// Up to the next top-level declaration — the destructured params contain their
+		// own `\n}`, so the closing brace alone is not a reliable terminator.
+		const body = src.slice(start, src.indexOf("\n/**", start));
+		// Height comes from the caller (the measured frame), never from the content.
+		expect(body).toContain("height,");
+		expect(body).toContain('overflow: "auto"');
+		// No growth escape hatches: either of these would let the text set the height.
+		expect(body).not.toContain("minHeight");
+		expect(body).not.toContain("maxHeight");
+	});
+
+	it("hands the box the measured content height, not an intrinsic one", () => {
+		const src = read("render/RenderMarkdown.tsx");
+		expect(src).toMatch(
+			/<MarkdownSourceBody[\s\S]{0,160}height=\{frame\.contentHeight\}[\s\S]{0,40}\/>/,
+		);
+	});
+
+	it("wires the row's source state without touching the layout inputs", () => {
+		const shell = read("PretextExactMessageList.tsx");
+		// The toggle is read from the viewer controls (pure render state) and handed to
+		// the renderer through `extra` — the same channel every other render-only prop
+		// uses. `resolveItemViewTargets` decides ELIGIBILITY from the measured form.
+		expect(shell).toContain("rowViewTarget?.sourceInline && viewControls?.isSourceShown(");
+		expect(shell).toContain("extra.showSource = true");
+		expect(shell).toContain("function canShowRowSourceInline(");
+	});
+});

@@ -257,7 +257,6 @@ describe("C3 production plugin tool lifecycle", () => {
 		});
 		expect(agentRegistry.get(canonical)?.isAvailable?.()).toBe(false);
 
-		await stateStore.updateState(pluginId, { trustTier: "T2" });
 		await manager.replacePermissions(pluginId, {
 			expectedRevision: 1,
 			grantedBy: "admin-user-1",

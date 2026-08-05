@@ -136,6 +136,7 @@ sqlite.exec(`
 		is_file_history_checkpoint INTEGER NOT NULL DEFAULT 0,
 		tree_hash_before TEXT,
 		tree_hash_after TEXT,
+		owned_paths_json TEXT,
 		input_tokens INTEGER NOT NULL DEFAULT 0,
 		output_tokens INTEGER NOT NULL DEFAULT 0,
 		cache_creation_tokens INTEGER NOT NULL DEFAULT 0,

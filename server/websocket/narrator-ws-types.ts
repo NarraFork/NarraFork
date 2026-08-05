@@ -266,6 +266,21 @@ export type NarratorServerMessage =
 			messageId: string;
 			newNarratorId: string;
 	  }
+	/**
+	 * The tool passed its permission gate and began executing.
+	 *
+	 * Separate from `tool_started` (which means the INPUT finished parsing) because the
+	 * approval prompt and any reflection gate sit between the two — a client that reads
+	 * `tool_started` as "executing" claims work has begun while the narrator may be
+	 * waiting on a person.
+	 */
+	| {
+			type: "tool_executing";
+			narratorId: string;
+			toolUseId: string;
+			executionStartedAt: number;
+			parentToolUseId?: string;
+	  }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
 	| {
 			type: "tool_output";
@@ -743,7 +758,14 @@ export type NarratorServerMessage =
 				contentCharsReceived?: number;
 				extractedFields?: Record<string, string>;
 				metadata?: Record<string, unknown>;
+				/** The tool's INPUT finished parsing (NOT "it is executing" — see `executing`). */
 				started?: boolean;
+				/**
+				 * Execution actually began (permission granted). A client reconnecting mid-tool
+				 * needs this to tell "waiting on a human" apart from "running"; without it the
+				 * only available signal was `started`, which is true in both cases.
+				 */
+				executing?: boolean;
 				input?: unknown;
 				streamStartedAt?: number;
 				streamingOutput?: string;

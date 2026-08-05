@@ -103,6 +103,21 @@ const MARKDOWN_TARGET: VListViewTarget = {
 	slot: "body",
 	kind: "markdown",
 	text: "# hi",
+	// The row's renderer honours an in-place source view, which is what the bar's
+	// source/rendered toggle is gated on.
+	sourceInline: true,
+};
+
+/**
+ * A markdown body whose ROW cannot swap in the raw source (e.g. a collapsed
+ * reasoning run, which paints no body at all). The toggle must not be offered:
+ * it would only flip shell state that no renderer reads.
+ */
+const MARKDOWN_NO_INLINE_SOURCE: VListViewTarget = {
+	id: "m1-b1:body",
+	slot: "body",
+	kind: "markdown",
+	text: "# hi",
 };
 
 const DIFF_TARGET: VListViewTarget = {
@@ -326,6 +341,21 @@ describe("VListContentViewHost — which actions each body offers", () => {
 		await renderHost({ target: MARKDOWN_TARGET, controls });
 		await hover();
 		expect(actionLabels()).toContain("source");
+	});
+
+	test("hides the source toggle when the row cannot render the raw source", async () => {
+		// The regression this closes: the bar offered "view source" on every markdown
+		// body, but only the tool-card / subagent renderers honoured it — so on a
+		// plain message the button lit up and the text on screen never changed.
+		const { controls } = makeControls();
+		await renderHost({ target: MARKDOWN_NO_INLINE_SOURCE, controls });
+		await hover();
+		const labels = actionLabels();
+		expect(labels).not.toContain("source");
+		expect(labels).not.toContain("rendered");
+		// The rest of the bar is unaffected — the body is still copyable and openable.
+		expect(labels).toContain("copy");
+		expect(labels).toContain("fullscreen");
 	});
 
 	test("a diff body has no wrap toggle (its rows own their own wrapping)", async () => {

@@ -25,17 +25,28 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const VLIST_DIR = import.meta.dir;
 
-/** The modules that MUST be pure (data → height/geometry), zero DOM. */
+/**
+ * The modules that MUST be pure (data → height/geometry), zero DOM.
+ *
+ * ⚠️ Only files with a real BODY belong here. The height kernel moved to
+ * `shared/pretext-layout/`, leaving several vlist paths as two-line re-export shells
+ * — and scanning a shell is indistinguishable from not scanning at all: the patterns
+ * below match against `export * from "@shared/…"` and always pass, while the
+ * arithmetic they are supposed to protect sits in another file. Those implementations
+ * are covered by `shared/pretext-layout/shared-core.guard.test.ts`, which ENUMERATES
+ * its directory (so a new module there is covered by default). `MIGRATED_SHELL_FILES`
+ * below records the hand-off and asserts it is still true.
+ *
+ * `vlist-virtualization.ts` and `vlist-pipeline.ts` re-export from shared too, but
+ * they are NOT shells: each adds frontend-side logic (`resolvePinnedRowIndices`, and
+ * the measurement-registry injection), so they stay scanned here.
+ */
 const PURE_PATH_FILES = [
-	"prepared-block.ts",
-	"pretext-fonts.ts",
-	"parse-markdown.ts",
-	"segment-adapter.ts",
 	"registry.ts",
 	"vlist-tail-meta.ts",
 	"vlist-selection.ts",
@@ -61,7 +72,6 @@ const PURE_PATH_FILES = [
 	// put DOM measurement on a path the guard is meant to keep clean.
 	"vlist-content-view-target.ts",
 	"vlist-content-view-float.ts",
-	"measure/pretext-metrics.ts",
 	"measure/measure-markdown.ts",
 	"measure/measure-message-bubble.ts",
 	"measure/measure-media.ts",
@@ -80,6 +90,24 @@ const PURE_PATH_FILES = [
 	"measure/measure-subagent-recovery.ts",
 	"measure/measure-misc.ts",
 ];
+
+/**
+ * The migrated modules: `vlist/<shell>` → `shared/pretext-layout/<implementation>`.
+ *
+ * Removed from `PURE_PATH_FILES` because scanning a two-line re-export is empty
+ * coverage. Listed here so the removal stays HONEST: the test below asserts each
+ * really is a shell (nothing to scan) AND that the shared implementation it points at
+ * exists in the enumerated directory — so no module can end up outside both guards.
+ */
+const MIGRATED_SHELL_FILES: ReadonlyArray<{ shell: string; implementation: string }> = [
+	{ shell: "prepared-block.ts", implementation: "prepared-block.ts" },
+	{ shell: "pretext-fonts.ts", implementation: "pretext-fonts.ts" },
+	{ shell: "parse-markdown.ts", implementation: "parse-markdown.ts" },
+	{ shell: "segment-adapter.ts", implementation: "segment-adapter.ts" },
+	{ shell: "measure/pretext-metrics.ts", implementation: "pretext-metrics.ts" },
+];
+
+const SHARED_CORE_DIR = join(VLIST_DIR, "..", "..", "..", "..", "shared", "pretext-layout");
 
 /** DOM-measurement API patterns that must never appear in a pure-path module. */
 const FORBIDDEN = [
@@ -137,6 +165,63 @@ describe("zero-DOM-measurement guard (protected invariant)", () => {
 			);
 		}
 		expect(offenders).toHaveLength(0);
+	});
+
+	it("every module dropped from the scan is a shell whose implementation IS covered", () => {
+		// The hand-off, checked from both ends. If a "shell" ever grows a body it must
+		// come back into PURE_PATH_FILES; if a shared implementation is renamed away, the
+		// enumerated guard is no longer covering what this file stopped covering.
+		const sharedModules = new Set(
+			readdirSync(SHARED_CORE_DIR).filter(
+				(name) => name.endsWith(".ts") && !name.endsWith(".test.ts"),
+			),
+		);
+		for (const { shell, implementation } of MIGRATED_SHELL_FILES) {
+			const source = readFileSync(join(VLIST_DIR, shell), "utf8");
+			const code = source
+				.split("\n")
+				.map((line) => line.trim())
+				.filter((line) => line.length > 0 && !line.startsWith("/*") && !line.startsWith("*"))
+				.filter((line) => !line.startsWith("//"));
+			// A shell is exactly one statement: the re-export. Anything more is a body that
+			// needs scanning again.
+			expect(code, `${shell} is no longer a pure re-export shell`).toEqual([
+				`export * from "@shared/pretext-layout/${implementation.replace(/\.ts$/, "")}";`,
+			]);
+			expect(
+				sharedModules.has(implementation),
+				`shared/pretext-layout/${implementation} is missing, so ${shell}'s implementation is unguarded`,
+			).toBe(true);
+		}
+		// And a shell must never also be listed as a scanned pure path (double bookkeeping
+		// would let a re-listed shell masquerade as coverage).
+		for (const { shell } of MIGRATED_SHELL_FILES) {
+			expect(PURE_PATH_FILES).not.toContain(shell);
+		}
+	});
+
+	it("the migrated implementations are scanned with THIS file's full pattern set", () => {
+		// The shared enumerated guard covers the whole directory, but with a narrower
+		// regex (getBoundingClientRect / offset{Height,Width} / createElement, plus
+		// `document.` / `window.`). It would not see `new ResizeObserver`,
+		// `getComputedStyle`, `.getClientRects()`, `.scroll*` or `.client*`. Scanning the
+		// five implementations here as well means moving a module to shared can never
+		// LOSE a pattern — which is what "the shell hand-off is honest" has to mean.
+		const offenders: Array<{ file: string; api: string; line: number }> = [];
+		for (const { implementation } of MIGRATED_SHELL_FILES) {
+			const code = stripCommentsAndStrings(
+				readFileSync(join(SHARED_CORE_DIR, implementation), "utf8"),
+			);
+			const lines = code.split("\n");
+			for (let i = 0; i < lines.length; i++) {
+				for (const pattern of FORBIDDEN) {
+					if (pattern.test(lines[i]!)) {
+						offenders.push({ file: implementation, api: pattern.source, line: i + 1 });
+					}
+				}
+			}
+		}
+		expect(offenders).toEqual([]);
 	});
 
 	it("guard self-check: the forbidden patterns actually match real API usage", () => {
