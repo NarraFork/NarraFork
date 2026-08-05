@@ -176,6 +176,16 @@ export function hasEncryptedReasoningMetadata(block: unknown): boolean {
 	const providerMetadata = (block as Record<string, unknown>).providerMetadata;
 	if (!providerMetadata || typeof providerMetadata !== "object") return false;
 
+	// A read response may carry the PROJECTED form instead of the real metadata.
+	// `providerMetadata` is replay state the browser can neither use nor display
+	// (ciphertext, signatures, item ids), so `stripProviderMetadata` in
+	// server/services/narrator-messages.ts removes it from the exact-layout page —
+	// but this presence bit IS a display input (it drives MessageBubble's lock-icon
+	// placeholder and the substituted body), so the projection preserves it as this
+	// flag. Treating the flag as equivalent is what keeps that row rendered, and its
+	// height unchanged, on a stripped payload.
+	if ((providerMetadata as Record<string, unknown>).hasEncryptedReasoning === true) return true;
+
 	return Object.values(providerMetadata as Record<string, unknown>).some((metadata) => {
 		if (!metadata || typeof metadata !== "object") return false;
 		const encrypted = (metadata as Record<string, unknown>).reasoningEncryptedContent;

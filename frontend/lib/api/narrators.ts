@@ -1263,6 +1263,7 @@ export const narratorsApi = {
 					createdAt: string;
 				}>;
 			}>;
+			/** Newest window only; see `timelineTruncated`. */
 			timeline: Array<{
 				messageId: string;
 				createdAt: string;
@@ -1270,6 +1271,8 @@ export const narratorsApi = {
 				role: string;
 				hasEdits: boolean;
 			}>;
+			/** True when older messages exist outside the returned timeline window. */
+			timelineTruncated?: boolean;
 		}>(`/narrators/${narratorId}/file-modifications${qs ? `?${qs}` : ""}`);
 	},
 	getFileDiff: (

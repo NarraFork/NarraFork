@@ -129,6 +129,7 @@ import {
 } from "./MessageSelectionCtx";
 import { collectTextBlocksPreview, resolveEditorInitialText } from "./message-edit-text";
 import { generateBlockKeys } from "./message-segments";
+import { NarratorImageGenFixAction } from "./NarratorImageGenFixAction";
 import { NarratorModelTestAction } from "./NarratorModelTestAction";
 import { compactProgressLabel } from "./progress-label";
 import { ReasoningCountLine } from "./ReasoningCountLine";
@@ -2639,39 +2640,45 @@ function ErrorNotice({
 	return (
 		<>
 			<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
-				<Group gap={6} wrap="nowrap" align="flex-start">
-					<IconAlertTriangle
-						size={16}
-						style={{ flexShrink: 0, marginTop: 1, color: "var(--mantine-color-red-7)" }}
-					/>
-					<Text
-						size="xs"
-						c="red.9"
-						style={{ whiteSpace: "pre-wrap", flex: 1, minWidth: 0, overflowWrap: "anywhere" }}
-					>
-						{message}
-					</Text>
-					<NarratorModelTestAction narratorId={narratorId} errorMessage={message} />
-					<Tooltip label={t("markRetryable")} withArrow>
-						<ActionIcon
+				<Stack gap={6}>
+					<Group gap={6} wrap="nowrap" align="flex-start">
+						<IconAlertTriangle
+							size={16}
+							style={{ flexShrink: 0, marginTop: 1, color: "var(--mantine-color-red-7)" }}
+						/>
+						<Text
+							size="xs"
+							c="red.9"
+							style={{ whiteSpace: "pre-wrap", flex: 1, minWidth: 0, overflowWrap: "anywhere" }}
+						>
+							{message}
+						</Text>
+						<NarratorModelTestAction narratorId={narratorId} errorMessage={message} />
+						<Tooltip label={t("markRetryable")} withArrow>
+							<ActionIcon
+								size="xs"
+								variant="subtle"
+								color="red.7"
+								style={{ flexShrink: 0 }}
+								onClick={openRuleModal}
+							>
+								<IconRepeat size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<CloseButton
 							size="xs"
 							variant="subtle"
-							color="red.7"
+							c="red.7"
 							style={{ flexShrink: 0 }}
-							onClick={openRuleModal}
-						>
-							<IconRepeat size={14} />
-						</ActionIcon>
-					</Tooltip>
-					<CloseButton
-						size="xs"
-						variant="subtle"
-						c="red.7"
-						style={{ flexShrink: 0 }}
-						disabled={dismissing}
-						onClick={handleDismiss}
-					/>
-				</Group>
+							disabled={dismissing}
+							onClick={handleDismiss}
+						/>
+					</Group>
+					{/* Its own row, below the message: a labelled button is the only form
+					    a touch user can read (a tooltip never opens for them), and the
+					    action strip above has no room for words. */}
+					<NarratorImageGenFixAction narratorId={narratorId} errorMessage={message} />
+				</Stack>
 			</Paper>
 
 			<RetryRuleModal opened={ruleModalOpened} onClose={closeRuleModal} errorMessage={message} />

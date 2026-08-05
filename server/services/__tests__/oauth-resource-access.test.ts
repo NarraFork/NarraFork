@@ -77,6 +77,7 @@ const allowGlobalPolicy: OAuthClientPolicy = {
 	maxDangerReflectionPromptChars: 0,
 	allowRobotDiagnosticPreset: false,
 	deviceAccess: { host: "denied", global: "denied", selfRegistered: "denied" },
+	messageDetail: "summary",
 };
 
 const denyGlobalPolicy: OAuthClientPolicy = {

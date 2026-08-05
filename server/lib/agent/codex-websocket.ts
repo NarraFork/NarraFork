@@ -344,9 +344,19 @@ function isOfficialChatGPTDomain(baseUrl: string): boolean {
 	}
 }
 
-function buildHandshakeHeaders(
+/**
+ * Build the WebSocket handshake headers.
+ *
+ * Exported for tests: a typo or a wrong conditional here only shows up as a
+ * silent fallback to HTTP, which is hard to diagnose from logs. The session
+ * parameter is narrowed to the one field that is read so tests do not have to
+ * fabricate a whole cached session.
+ *
+ * See docs/codex-websocket.md for the documented header contract.
+ */
+export function buildHandshakeHeaders(
 	options: StreamCodexResponsesWebSocketOptions,
-	session: CachedSession,
+	session: Pick<CachedSession, "turnState">,
 ): Record<string, string> {
 	// No x-openai-internal-codex-responses-lite here: the lite opt-in is a body
 	// contract (no top-level instructions/tools, additional_tools spliced into

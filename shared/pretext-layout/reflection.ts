@@ -32,7 +32,19 @@ export type ReflectionKind =
 	| "question_reflection"
 	| "task_reflection";
 
-export type ReflectionStatus = "running" | "awaiting_user" | "confirmed" | "cancelled" | "aborted";
+/**
+ * `failed` is distinct from `cancelled` on purpose: cancelled means the gate JUDGED the
+ * operation and said no, failed means it never reached a judgement (provider error,
+ * exhausted retries, a crash). Both deny the tool, but only one is a verdict, and showing
+ * "rejected this operation" for a network fault misrepresents what happened.
+ */
+export type ReflectionStatus =
+	| "running"
+	| "awaiting_user"
+	| "confirmed"
+	| "cancelled"
+	| "aborted"
+	| "failed";
 
 export interface ReflectionSuggestion {
 	kind: ReflectionKind;
@@ -83,7 +95,10 @@ export function getReflectionSuggestion(
 				? "confirmed"
 				: rawStatus === "deny"
 					? "cancelled"
-					: rawStatus === "confirmed" || rawStatus === "cancelled" || rawStatus === "aborted"
+					: rawStatus === "confirmed" ||
+							rawStatus === "cancelled" ||
+							rawStatus === "aborted" ||
+							rawStatus === "failed"
 						? (rawStatus as ReflectionStatus)
 						: "running";
 		return {
@@ -124,6 +139,23 @@ export function normalizeReflectionAfterToolStatus(
 		toolStatus === "fail"
 	) {
 		return { ...reflection, status: "aborted" };
+	}
+	// A SUCCEEDED tool with a still-"running" gate is a stale row, not a live gate: the
+	// reflection write was lost (a busy SQLite write inside a catch that swallows) while the
+	// tool went on to execute. Without this the card renders "危险反思正在检查此操作" with a
+	// live elapsed timer forever — the timer counts from the tool's start, so old rows show
+	// absurd durations.
+	//
+	// `awaiting_user` is deliberately NOT converged here. It means the gate handed the
+	// decision to the user, and that state is authoritative until the user acts; inferring a
+	// verdict from the row would overwrite a human decision point with a guess.
+	if (
+		reflection &&
+		!hasPendingPermission &&
+		reflection.status === "running" &&
+		toolStatus === "success"
+	) {
+		return { ...reflection, status: "confirmed" };
 	}
 	return reflection;
 }
@@ -236,6 +268,8 @@ export function reflectionTitleKeySuffix(status: ReflectionStatus): string {
 			return "Cancelled";
 		case "aborted":
 			return "Aborted";
+		case "failed":
+			return "Failed";
 		default:
 			return "Resolved";
 	}

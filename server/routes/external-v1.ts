@@ -16,6 +16,7 @@ import { requireOAuthAuth } from "../middleware/auth";
 import {
 	getExternalDevice,
 	getExternalNarrator,
+	getExternalToolCallDetail,
 	interruptExternalNarrator,
 	listExternalDevices,
 	listExternalNarratorMessages,
@@ -143,6 +144,14 @@ externalV1Routes.get("/narrators/:id/messages", async (c) => {
 	return c.json(
 		await listExternalNarratorMessages(ctx, c.req.param("id"), parseMessageListQuery(c)),
 	);
+});
+
+// Single tool call with a larger payload budget than an inline page item. Kept a
+// separate endpoint so a page stays bounded and the client fetches only the calls
+// it actually opened.
+externalV1Routes.get("/narrators/:id/tool-calls/:toolUseId", async (c) => {
+	const ctx = await requireExternalOAuthContext(c);
+	return c.json(await getExternalToolCallDetail(ctx, c.req.param("id"), c.req.param("toolUseId")));
 });
 
 externalV1Routes.post("/narrators/:id/interrupt", async (c) => {

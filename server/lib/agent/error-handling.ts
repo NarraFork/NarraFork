@@ -1,3 +1,4 @@
+import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import {
 	isTransientTlsHandshakeError,
 	TRANSIENT_TLS_HANDSHAKE_CODE,
@@ -387,6 +388,27 @@ export function classifyInvalidState(
 	// An executable-plugin provider may explicitly classify its own error. A hard
 	// quota/billing message above still vetoes an optimistic plugin classification.
 	if (providerRetryable === false || diagnostics?.retryable === false) {
+		// A user-authored rule is an explicit override and outranks the provider's
+		// own "do not retry" verdict — that is the entire point of adding one by
+		// hand. Hard quota/billing/refusal/limit failures were already returned
+		// above, so this can only flip a soft provider judgement.
+		//
+		// An explicitly resumable failure is exempt: partial output was already
+		// produced, so the loop's continuation path is both safer and strictly more
+		// recovery than a retry would be. Replaying the whole request instead could
+		// duplicate visible output, and `retryable`/`resumable` are mutually
+		// exclusive in this classification.
+		if (
+			!providerResumable &&
+			matchesCustomRetryRules(
+				{ reason, message, status: statusCode },
+				[normalizedReason, normalizedMessage].filter(Boolean),
+				statusCode ? new Set([statusCode]) : undefined,
+				customRetryRules,
+			)
+		) {
+			return { category: "transient", retryable: true, resumable: false, statusCode };
+		}
 		return {
 			category: "non_retryable",
 			retryable: false,
@@ -822,7 +844,16 @@ export function isRetryableError(
 					: typeof causeObj?.retryable === "boolean"
 						? causeObj.retryable
 						: undefined;
-	if (structuredRetryable != null) return structuredRetryable;
+	if (structuredRetryable === true) return true;
+	if (structuredRetryable === false) {
+		// A hand-written rule is a deliberate user override and outranks the
+		// provider's "do not retry". Hard quota/billing patterns already returned
+		// above, so only a soft provider judgement can be flipped here. An
+		// explicitly resumable failure stays out of it: the loop continues from the
+		// partial output it already produced, which beats replaying the request.
+		if (isResumableError(err)) return false;
+		return matchesCustomRetryRules(obj, msgCandidates, statusCodes, customRetryRules);
+	}
 
 	// Check for known retryable reason/code fields.
 	if (
@@ -905,8 +936,12 @@ export function matchesCustomRetryRules(
 		let matched = true;
 		let hasCondition = false;
 
-		const domain = rule.domain?.trim().toLowerCase();
-		const keyword = rule.keyword?.trim().toLowerCase();
+		// Keywords are routinely copied out of the rendered error card, which carries
+		// a `[Error] ` / `Error: ` display prefix that never exists in the raw provider
+		// message this matcher searches. Strip it so such a rule can match at all
+		// (see shared/retry-rule-keyword.ts).
+		const domain = stripErrorDisplayPrefix(rule.domain ?? "").toLowerCase();
+		const keyword = stripErrorDisplayPrefix(rule.keyword ?? "").toLowerCase();
 		if (domain) {
 			hasCondition = true;
 			if (!allText.includes(domain)) matched = false;

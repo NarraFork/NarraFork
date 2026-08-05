@@ -326,6 +326,64 @@ describe("robot diagnostic preset policy", () => {
 	});
 });
 
+describe("layered message detail policy", () => {
+	// Unlike every other ceiling here, this one does NOT default to its strictest
+	// value. The others guard actions with side effects, so closing them by default
+	// costs an administrator nothing; this guards a read the user already had to
+	// consent to via `message.summary.read`, and defaulting it closed would demand
+	// two independent opt-ins for one approved capability. Payload disclosure
+	// ("full") is the part that gets its own decision.
+	test("defaults to summary so consent alone is enough for structure", () => {
+		expect(oauthClientPolicySchema.parse({}).messageDetail).toBe("summary");
+	});
+
+	test("accepts each level and rejects anything else", () => {
+		for (const level of ["none", "summary", "full"] as const) {
+			expect(oauthClientPolicySchema.parse({ messageDetail: level }).messageDetail).toBe(level);
+		}
+		expect(oauthClientPolicySchema.safeParse({ messageDetail: "skeleton" }).success).toBe(false);
+		expect(oauthClientPolicySchema.safeParse({ messageDetail: "all" }).success).toBe(false);
+	});
+
+	test("intersections can only retain or reduce the level", () => {
+		const full = oauthClientPolicySchema.parse({ messageDetail: "full" });
+		const summary = oauthClientPolicySchema.parse({ messageDetail: "summary" });
+		const none = oauthClientPolicySchema.parse({ messageDetail: "none" });
+		expect(intersectOAuthClientPolicies(full, full)).toMatchObject({ messageDetail: "full" });
+		expect(intersectOAuthClientPolicies(full, summary)).toMatchObject({
+			messageDetail: "summary",
+		});
+		expect(intersectOAuthClientPolicies(summary, full)).toMatchObject({
+			messageDetail: "summary",
+		});
+		expect(intersectOAuthClientPolicies(full, none)).toMatchObject({ messageDetail: "none" });
+		expect(intersectOAuthClientPolicies(none, summary, full)).toMatchObject({
+			messageDetail: "none",
+		});
+	});
+
+	test("a single policy intersects to itself rather than widening to full", () => {
+		// The reduce seeds at "full", so a one-element intersection is the case where a
+		// wrong seed would silently promote the level.
+		expect(intersectOAuthClientPolicies(oauthClientPolicySchema.parse({}))).toMatchObject({
+			messageDetail: "summary",
+		});
+	});
+
+	test("a policy frozen before this field existed parses at the default", () => {
+		const legacyStored = {
+			defaultPermissionMode: "readOnly",
+			allowedPermissionModes: ["readOnly"],
+			systemPromptMode: "managed",
+			maxSystemPromptChars: 0,
+			allowGlobalDevice: false,
+			allowKnowledgeWrite: false,
+			deviceAccess: { host: "denied", global: "readWrite", selfRegistered: "readWrite" },
+		};
+		expect(oauthClientPolicySchema.parse(legacyStored).messageDetail).toBe("summary");
+	});
+});
+
 describe("narrator provision snapshots", () => {
 	const baseSnapshot = {
 		version: 3 as const,

@@ -1,3 +1,8 @@
+import {
+	EXTERNAL_MESSAGE_DETAIL_LEVELS,
+	EXTERNAL_MESSAGE_LIMIT_BY_DETAIL,
+	type ExternalMessageDetail,
+} from "@shared/external/message-detail";
 import { SUPPORTED_LOCALES } from "@shared/i18n-locales";
 import { z } from "zod";
 import {
@@ -136,16 +141,66 @@ export const externalListQuerySchema = z
 	})
 	.strict();
 
+/** Largest page size any tier permits; the per-tier ceiling is checked below. */
+const EXTERNAL_MESSAGE_MAX_LIMIT_ANY_DETAIL = Math.max(
+	...Object.values(EXTERNAL_MESSAGE_LIMIT_BY_DETAIL),
+);
+
+/**
+ * Page size ceiling for a tier. A `full` page embeds projected tool payloads, so
+ * its ceiling is far below the scalar tiers' — see EXTERNAL_MESSAGE_LIMIT_BY_DETAIL.
+ */
+export function externalMessageLimitCeiling(detail: ExternalMessageDetail): number {
+	return EXTERNAL_MESSAGE_LIMIT_BY_DETAIL[detail];
+}
+
+/**
+ * Message page query.
+ *
+ * `detail` defaults to `text`, the pre-existing bounded plain-text projection, so
+ * a client written against the original endpoint keeps its exact behaviour and
+ * needs none of the new scopes.
+ *
+ * There is ONE cursor, and `order` decides which way it walks: `asc` continues
+ * into newer messages (the original behaviour), `desc` continues into older ones
+ * — which is what a client rendering a tail-first view needs. A separate
+ * `before` parameter was considered and rejected: it would admit four
+ * cursor/order combinations, two of which have no coherent meaning.
+ */
 export const externalMessageListQuerySchema = z
 	.object({
 		cursor: externalCursorSchema,
-		limit: createLimitSchema(50)
+		detail: z
+			.enum(EXTERNAL_MESSAGE_DETAIL_LEVELS)
 			.optional()
-			.transform((value) => value ?? EXTERNAL_V1_DEFAULT_LIMIT),
+			.transform((value): ExternalMessageDetail => value ?? "text"),
+		order: z
+			.enum(["asc", "desc"])
+			.optional()
+			.transform((value) => value ?? "asc"),
+		limit: createLimitSchema(EXTERNAL_MESSAGE_MAX_LIMIT_ANY_DETAIL).optional(),
 	})
-	.strict();
+	.strict()
+	.superRefine((query, ctx) => {
+		const ceiling = externalMessageLimitCeiling(query.detail);
+		if (query.limit != null && query.limit > ceiling) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["limit"],
+				message: `limit must be an integer from 1 to ${ceiling} at detail=${query.detail}`,
+			});
+		}
+	})
+	.transform((query) => ({
+		...query,
+		limit: Math.min(
+			query.limit ?? EXTERNAL_V1_DEFAULT_LIMIT,
+			externalMessageLimitCeiling(query.detail),
+		),
+	}));
 
 export type ExternalDeviceProvisionInput = z.infer<typeof externalDeviceProvisionBodySchema>;
 export type ExternalNarratorProvisionInput = z.infer<typeof externalNarratorProvisionBodySchema>;
 export type ExternalSendMessageInput = z.infer<typeof externalSendMessageBodySchema>;
 export type ExternalListQuery = z.infer<typeof externalListQuerySchema>;
+export type ExternalMessageListQuery = z.infer<typeof externalMessageListQuerySchema>;

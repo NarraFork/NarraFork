@@ -85,6 +85,13 @@ export interface ComputeLayoutOptions {
 	 * projection (the activity query never selects `input_json`).
 	 */
 	resolveSubagentRecentSummary?: (toolName: string, inputSummary: unknown) => string | null;
+	/**
+	 * Whether an error card may offer the "turn off image generation and retry"
+	 * provider fix. Injected by the shell (eligibility depends on the user's role
+	 * and the narrator's resolved provider). The fix is a LABELLED button on its own
+	 * row, so this decision changes the card's measured height.
+	 */
+	canOfferProviderFix?: (errorText: string) => boolean;
 	/** True when a tool/subagent item has a live pending permission request; forces
 	 * its card expanded and folds into the measure cache key. */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
@@ -159,6 +166,7 @@ export function computePretextVListLayout(
 		resolveToolTitle: opts.resolveToolTitle as AdapterContext["resolveToolTitle"],
 		resolveToolSummary: opts.resolveToolSummary as AdapterContext["resolveToolSummary"],
 		resolveSubagentRecentSummary: opts.resolveSubagentRecentSummary,
+		canOfferProviderFix: opts.canOfferProviderFix,
 		resolveHasPendingPermission: opts.resolveHasPendingPermission,
 		resolvePendingPlan: opts.resolvePendingPlan,
 		resolveFullToolInput: opts.resolveFullToolInput,

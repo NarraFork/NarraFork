@@ -10,6 +10,8 @@
  * (MessageBubble's ErrorNotice) has always driven the real flows.
  *
  * Behaviour parity with the chunked card:
+ *   - fix    → (conditional) turn off the provider's native image_generation tool
+ *              and retry, for the one failure where that is the actual cause
  *   - retry  → open the shared RetryRuleModal prefilled with this error's text
  *              (POST /settings/retry-rules + settings query invalidation live
  *              inside that component)
@@ -31,6 +33,7 @@ import { type ReactNode, useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { removeMessagesFromCache } from "../MessageBubble";
 import { RetryRuleModal } from "../RetryRuleModal";
+import { useCodexImageGenerationFix } from "../useCodexImageGenerationFix";
 import type { ErrorNoticeActions } from "./render/RenderSystemText";
 import type { VListItem } from "./vlist-pipeline";
 
@@ -78,6 +81,13 @@ export interface VListErrorNoticeActions {
 	resolve: ErrorNoticeActionsResolver;
 	/** The single retry-rule dialog for the whole list (mounted by the shell). */
 	ruleModal: ReactNode;
+	/**
+	 * Whether an error card with this text may offer the provider fix. Handed to
+	 * the document build as `canOfferProviderFix`: the fix is a labelled button on
+	 * its own row, so its presence changes the card's measured height and must be
+	 * known during adaptation, not at paint time.
+	 */
+	canOfferProviderFix: (errorText: string) => boolean;
 }
 
 /**
@@ -94,6 +104,10 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 	// The error text the rule dialog is currently open for (null → closed).
 	const [ruleTarget, setRuleTarget] = useState<string | null>(null);
 	const [dismissingId, setDismissingId] = useState<string | null>(null);
+	// The provider-settings fix is per-narrator (it disables the tool for the
+	// provider this narrator resolved to and retries its last turn), but whether a
+	// given ROW may offer it depends on that row's error text, hence `canFix`.
+	const imageGenFix = useCodexImageGenerationFix(narratorId);
 	// Read at click time so a second click is rejected without making the handler
 	// depend on the in-flight state.
 	const dismissingRef = useRef(dismissingId);
@@ -132,16 +146,33 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 			if (!messageId) return undefined;
 			const cached = cache.get(messageId);
 			if (cached) return cached;
+			// Whether the fix BUTTON exists was already decided during adaptation (it
+			// occupies a measured row), so this only makes the painted button live for
+			// the rows that carry it.
+			const offerImageGenFix = imageGenFix.canFix(errorText);
 			const actions: ErrorNoticeActions = {
 				onMarkRetryable: () => setRuleTarget(errorText),
 				onDismiss: () => void dismiss(messageId),
 				dismissing: dismissingId === messageId,
 				markRetryableLabel,
+				...(offerImageGenFix
+					? { onDisableImageGen: imageGenFix.run, disablingImageGen: imageGenFix.busy }
+					: {}),
 			};
 			cache.set(messageId, actions);
 			return actions;
 		};
-	}, [dismiss, dismissingId, markRetryableLabel]);
+		// The whole resolver is rebuilt (dropping its cache) whenever the fix's
+		// applicability or busy state changes, so a row cannot keep serving a stale
+		// loading flag — same reason `dismissingId` is a dependency.
+	}, [
+		dismiss,
+		dismissingId,
+		markRetryableLabel,
+		imageGenFix.canFix,
+		imageGenFix.run,
+		imageGenFix.busy,
+	]);
 
 	const closeRuleModal = useCallback(() => setRuleTarget(null), []);
 
@@ -150,5 +181,5 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 			<RetryRuleModal opened onClose={closeRuleModal} errorMessage={ruleTarget} />
 		);
 
-	return { resolve, ruleModal };
+	return { resolve, ruleModal, canOfferProviderFix: imageGenFix.canFix };
 }

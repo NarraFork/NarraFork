@@ -399,23 +399,80 @@ describe("PretextLayoutCoordinator", () => {
 	});
 
 	/**
-	 * The prepared cache had NO teardown hook in production — the only reference to
-	 * `resetPreparedMarkdownCache` was its own definition and its own test, while the
-	 * streaming cache next to it is released on narrator change. Each entry retains a
-	 * whole `PreparedBlock[]` (every pretext handle for that body), so switching
-	 * narrators accumulated the union of every document opened in the session.
+	 * `reset` deliberately KEEPS the prepared-block cache.
+	 *
+	 * It used to drop it, to stop a long session accumulating the union of every
+	 * document opened. But its keys are the body TEXT plus the KaTeX/font
+	 * generations — no narrator identity — so its entries are exactly as valid after
+	 * a switch as before one, and it bounds itself at
+	 * `PREPARED_CACHE_CHAR_CEILING` with a bulk-clear. Dropping it on switch bought
+	 * no correctness and forced the returning document to re-parse every body, which
+	 * is ~94% of a full measure and the largest single cost in repainting a first
+	 * screen. `measureCache` was already left alone for the same reason.
+	 *
+	 * The memory bound is asserted here rather than assumed, because "keep it" is
+	 * only defensible while something else caps it.
 	 */
-	it("releases the prepared-block cache on reset (narrator switch / teardown)", async () => {
-		const { getPreparedMarkdownBlocks, preparedMarkdownCacheStats } = await import(
-			"@shared/pretext-layout/prepared-markdown-cache"
-		);
+	it("keeps the prepared-block cache across reset, under a bounded ceiling", async () => {
+		const { getPreparedMarkdownBlocks, preparedMarkdownCacheStats, PREPARED_CACHE_CHAR_CEILING } =
+			await import("@shared/pretext-layout/prepared-markdown-cache");
 		const coordinator = new PretextLayoutCoordinator();
 		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
-		getPreparedMarkdownBlocks("# retained body\n\nsome prose", undefined, 0);
+		const body = "# retained body\n\nsome prose";
+		const prepared = getPreparedMarkdownBlocks(body, undefined, 0);
 		expect(preparedMarkdownCacheStats().size).toBeGreaterThan(0);
 
 		coordinator.reset();
-		expect(preparedMarkdownCacheStats().size).toBe(0);
+		expect(coordinator.getSnapshot().status).toBe("idle");
+		// The SAME prepared array is served after the switch: this is the reuse that
+		// makes a revisit cheap, and identity proves no re-parse happened.
+		expect(getPreparedMarkdownBlocks(body, undefined, 0)).toBe(prepared);
+		expect(preparedMarkdownCacheStats().chars).toBeLessThanOrEqual(PREPARED_CACHE_CHAR_CEILING);
+	});
+
+	/**
+	 * A switch publishes the outgoing window so the next mount can adopt it, which
+	 * is what turns a revisit from "refetch 283KB-1.3MB + cold measure" into a
+	 * synchronous commit. Without the publish in `reset`, the route's
+	 * `key={narratorId}` teardown loses the document before anything can cache it.
+	 */
+	it("publishes the document on reset so a later restore can adopt it", async () => {
+		const { clearPretextDocumentCache, peekCachedPretextDocument } = await import(
+			"./pretext-document-cache"
+		);
+		clearPretextDocumentCache();
+		try {
+			const coordinator = new PretextLayoutCoordinator();
+			await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
+			const loaded = coordinator.getSnapshot().input;
+			if (!loaded) throw new Error("expected a loaded document");
+
+			coordinator.reset();
+			expect(peekCachedPretextDocument("n1")).toBe(loaded);
+
+			// And a fresh coordinator adopts it without any transport at all: the
+			// fetchPage below would throw if the restore path touched the network.
+			const revisit = new PretextLayoutCoordinator();
+			expect(
+				revisit.restore("n1", buildOptions, {
+					fetchPage: async () => {
+						throw new Error("restore must not fetch");
+					},
+				}),
+			).toBe(true);
+			expect(revisit.getSnapshot().status).toBe("ready");
+			expect(revisit.getSnapshot().index).toBeDefined();
+			expect(revisit.getSnapshot().input?.messages.length).toBe(loaded?.messages.length);
+		} finally {
+			clearPretextDocumentCache();
+		}
+	});
+
+	it("restore reports false for a narrator with nothing cached", async () => {
+		const { clearPretextDocumentCache } = await import("./pretext-document-cache");
+		clearPretextDocumentCache();
+		const coordinator = new PretextLayoutCoordinator();
+		expect(coordinator.restore("never-seen", buildOptions)).toBe(false);
 		expect(coordinator.getSnapshot().status).toBe("idle");
 	});
 

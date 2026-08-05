@@ -455,7 +455,92 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 		expect(m.markdownMeasurePrefix(realistic)).toBe(realistic);
 	});
 
-	it("parse cost does not grow with the plan size (escalating budgets stop early)", async () => {
+	/**
+	 * The regression this file previously asserted the WRONG WAY ROUND.
+	 *
+	 * An escalating budget stopped parsing as soon as the measured content passed
+	 * the cap, on the theory that the cap hides the rest. It does not: the box is
+	 * `overflow: auto` and scrolls internally, so the un-parsed remainder was
+	 * content with no blocks to scroll to. A real 15.7K-char plan ended at char
+	 * 8154 — the reader scrolled to the bottom and the document just stopped.
+	 *
+	 * Scrollable content height is therefore the invariant, not parse count.
+	 */
+	it("parses PAST the cap: a body 2× longer has 2× the scrollable content", async () => {
+		const m = await mod();
+		const block = "## Section\n\nSome body text that is reasonably long enough to wrap.\n\n";
+		const measure = (text: string) =>
+			m.measureToolDetail(
+				{ kind: "capped", cap: "plan", contentLines: 1, text, markdown: true },
+				600,
+				1000,
+			);
+		// Sized to STRADDLE the old first budget (8K chars): both bodies are far past
+		// the cap, and the longer one reaches past 8K where the early break used to
+		// stop. Two bodies that both fit under 8K prove nothing — the old algorithm
+		// parsed those whole too.
+		const shorter = block.repeat(150); // ~10K chars
+		const longer = block.repeat(300); // ~20K chars
+		expect(shorter.length).toBeGreaterThan(8 * 1024);
+		expect(longer.length).toBeLessThan(m.DETAIL_MARKDOWN_PREFIX_MAX_CHARS);
+		const shortDetail = measure(shorter);
+		const longDetail = measure(longer);
+		// The OUTER height is identical (both clamp at the cap)...
+		expect(shortDetail.height).toBe(longDetail.height);
+		expect(shortDetail.height).toBe(m.DETAIL_TOP_MARGIN + 850);
+		// ...while the scrollable content really does double. Under the old early
+		// break both collapsed to the same 8K prefix and these were equal.
+		const contentOf = (d: { frame: { contentHeight: number } }) => d.frame.contentHeight;
+		expect(contentOf(longDetail)).toBeGreaterThan(contentOf(shortDetail) * 1.8);
+		// Every block of the longer body is present, not just the pre-cap ones.
+		expect(longDetail.blocks.length).toBeGreaterThan(shortDetail.blocks.length * 1.8);
+	});
+
+	it("a long real-world plan is painted to its LAST block", async () => {
+		const m = await mod();
+		// Mirrors the shape that regressed: ~16K chars of headings + prose, well
+		// over the cap but under the parse ceiling, with a unique final marker.
+		const body = Array.from(
+			{ length: 60 },
+			(_, i) => `### Section ${i}\n\nSome prose for section ${i} that wraps at this width.`,
+		).join("\n\n");
+		const plan = `# Plan\n\n${body}\n\n## END-OF-PLAN-MARKER\n\nThe closing line.`;
+		expect(plan.length).toBeLessThan(m.DETAIL_MARKDOWN_PREFIX_MAX_CHARS);
+		const detail = m.measureToolDetail(
+			{ kind: "capped", cap: "plan", contentLines: 1, text: plan, markdown: true },
+			600,
+			1000,
+		);
+		// The whole text was parsed: nothing was dropped at a budget boundary.
+		expect(detail.bodyIsPrefix).toBeUndefined();
+		expect(detail.sourceText).toBe(plan);
+		// Content is taller than the box, i.e. the tail is reachable by scrolling
+		// rather than absent.
+		expect(detail.frame.contentHeight).toBeGreaterThan(detail.height);
+		// And the block count matches a full parse of the same text.
+		const full = m.measureMarkdownDetail(plan, 10 ** 9, 600, undefined);
+		expect(detail.blocks.length).toBe(full.blocks.length);
+	});
+
+	it("reports bodyIsPrefix ONLY when the parse ceiling actually cut the body", async () => {
+		const m = await mod();
+		const block = "## Section\n\nSome body text that is reasonably long.\n\n";
+		const measure = (text: string) =>
+			m.measureToolDetail(
+				{ kind: "capped", cap: "plan", contentLines: 1, text, markdown: true },
+				600,
+				1000,
+			);
+		// Over the cap but under the ceiling → complete, so no prefix claim.
+		expect(measure(block.repeat(100)).bodyIsPrefix).toBeUndefined();
+		// Over the ceiling → genuinely cut, and the flag says so. The full text is
+		// still carried for the viewer.
+		const over = measure(block.repeat(2000));
+		expect(over.bodyIsPrefix).toBe(true);
+		expect(over.sourceText?.length).toBeGreaterThan(m.DETAIL_MARKDOWN_PREFIX_MAX_CHARS);
+	});
+
+	it("keeps the 1MB worst case bounded by the parse ceiling", async () => {
 		const m = await mod();
 		const block = "## Section\n\nSome body text that is reasonably long enough to wrap.\n\n";
 		const measureMs = (text: string) => {
@@ -469,11 +554,11 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 		};
 		// Warm the module/canvas paths so the first call is not charged for setup.
 		measureMs(block.repeat(20));
-		const overCap = measureMs(block.repeat(300)); // ~20KB
-		const enormous = measureMs(block.repeat(16000)); // ~1MB, the schema's worst case
-		// A body 50× larger costs about the same: the first budget already proves
-		// the cap is exceeded, so the rest is never parsed.
-		expect(enormous).toBeLessThan(overCap * 4);
+		const atCeiling = measureMs(`${block.repeat(600)}\n\nunique-a`); // ~40KB > ceiling
+		const enormous = measureMs(`${block.repeat(16000)}\n\nunique-b`); // ~1MB
+		// 25× the input costs no more: both are cut at the ceiling, so the ceiling —
+		// not the payload — bounds the synchronous work.
+		expect(enormous).toBeLessThan(Math.max(atCeiling, 1) * 4);
 	});
 
 	it("a plan that fits under the cap keeps its exact measured height", async () => {

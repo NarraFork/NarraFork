@@ -10,11 +10,15 @@ export const OAUTH_APP_AVAILABLE_SCOPES = [
 	"narrator.provision",
 	"narrator.send_message",
 	"narrator.interrupt",
+	"message.summary.read",
+	"message.content.read",
 ] as const;
 
 export type OAuthAppPermissionMode = "readOnly" | "dontAsk";
 export type OAuthAppSystemPromptMode = "managed" | "append";
 export type DeviceOperationLevel = "denied" | "readOnly" | "readWrite";
+/** Ceiling on the layered message projection (see docs/OPEN_API.md §7.6). */
+export type OAuthAppMessageDetail = "none" | "summary" | "full";
 
 export interface DeviceAccessPolicy {
 	host: DeviceOperationLevel;
@@ -30,6 +34,7 @@ export interface OAuthAppPolicy {
 	allowGlobalDevice: boolean;
 	allowKnowledgeWrite: boolean;
 	deviceAccess: DeviceAccessPolicy;
+	messageDetail: OAuthAppMessageDetail;
 }
 
 export function createDefaultOAuthAppPolicy(): OAuthAppPolicy {
@@ -44,6 +49,10 @@ export function createDefaultOAuthAppPolicy(): OAuthAppPolicy {
 		// global and selfRegistered are open (a client only governs devices it registered
 		// and owns, or global-scoped devices it was bound into a narrator session for).
 		deviceAccess: { host: "denied", global: "readWrite", selfRegistered: "readWrite" },
+		// Structure is readable once the client holds `message.summary.read` and the user
+		// consented to it; payload disclosure ("full") is the part an administrator opts
+		// into. Keep in sync with the server schema default.
+		messageDetail: "summary",
 	};
 }
 

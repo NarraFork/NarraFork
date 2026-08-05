@@ -50,7 +50,9 @@ mock.module("../narrator-service", () => ({
 }));
 
 const { stopDangerReflectionLoop } = await import("../narrator-permission");
-const { pendingDangerReflections } = await import("../narrator-session-state");
+const { claimNarratorRuntime, pendingDangerReflections } = await import(
+	"../narrator-session-state"
+);
 
 const PARENT_ID = "takeover-parent-narrator";
 const SUBAGENT_ID = "takeover-subagent-narrator";
@@ -172,11 +174,18 @@ describe("stopDangerReflectionLoop (live runtime pause)", () => {
 		});
 	});
 
-	test("clears the reflecting substatus on both narrators", async () => {
+	test("clears the reflecting substatus on both narrators while the parent is busy", async () => {
 		await seedSubagentReflection();
 		registerRuntimePause();
+		// A parent that is genuinely running still gets the mirrored clear, otherwise
+		// its own badge would keep advertising "reflecting" after the takeover.
+		const release = claimNarratorRuntime(PARENT_ID, "test-parent-busy");
 
-		await stopDangerReflectionLoop(TOOL_CALL_ID);
+		try {
+			await stopDangerReflectionLoop(TOOL_CALL_ID);
+		} finally {
+			release();
+		}
 
 		expect(statusUpdates.length).toBeGreaterThanOrEqual(2);
 		for (const update of statusUpdates) {
@@ -187,6 +196,25 @@ describe("stopDangerReflectionLoop (live runtime pause)", () => {
 		expect(statusUpdates.map((update) => update.narratorId).sort()).toEqual(
 			[PARENT_ID, SUBAGENT_ID].sort(),
 		);
+	});
+
+	test("does not write the status of an idle parent", async () => {
+		await seedSubagentReflection();
+		registerRuntimePause();
+
+		// No runtime claim and no live loop: this parent already finished its turn.
+		// Mirroring `waiting` onto it used to resurrect it as busy forever, which then
+		// blocked /continue and /subagent-recovery with "already running" and wiped the
+		// error substatus that the recovery card keys on.
+		await stopDangerReflectionLoop(TOOL_CALL_ID);
+
+		expect(statusUpdates).toEqual([{ narratorId: SUBAGENT_ID, status: "waiting", substatus: [] }]);
+		// The parent still learns about the takeover — via WS frames, not a status write.
+		expect(
+			broadcasts.some(
+				(entry) => entry.target === PARENT_ID && entry.message.type === "danger_reflection_stopped",
+			),
+		).toBe(true);
 	});
 
 	test("hands the decision back as an awaiting_user permission and aborts the loop", async () => {

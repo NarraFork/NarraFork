@@ -97,7 +97,14 @@ export interface SystemTextData {
 	title?: string;
 	/** Leading badge labels (spec_goal_added / carryover). Height-neutral. */
 	badges?: string[];
-	/** Button labels (spec_goal / carryover / segment dismiss). Height-neutral. */
+	/**
+	 * Button labels (spec_goal / carryover / segment dismiss). Height-neutral for
+	 * those kinds, whose chrome ALWAYS reserves a button row.
+	 *
+	 * The `error` card is the exception: its button row is conditional (only the
+	 * provider fix adds one), so for that kind a non-empty `buttons` array ADDS a
+	 * row — see `resolveSystemTextChrome`.
+	 */
 	buttons?: string[];
 	/** Primary Mantine colour (indigo / red / orange …). Height-neutral. */
 	color?: string;
@@ -166,7 +173,7 @@ export const SPEC_FORK_BADGE_RESERVE = 110 + GROUP_GAP_XS; // 120
 
 // ── Per-kind chrome descriptor ───────────────────────────────────────────────
 
-interface KindChrome {
+export interface KindChrome {
 	/** CSS font shorthand for the body (measure MUST match render). */
 	font: string;
 	/** pretext white-space mode: pre-wrap (keep newlines) vs normal (collapse). */
@@ -302,6 +309,26 @@ export function resolveBodyText(kind: SystemTextKind, data: SystemTextData): str
 }
 
 /**
+ * The chrome for one card instance.
+ *
+ * Every kind's geometry is a static property of the kind EXCEPT the error card's
+ * button row: the "turn off image generation and retry" fix only applies to one
+ * specific failure, so reserving its row unconditionally would add 24px of empty
+ * space under every unrelated error. A labelled button is the point (an icon-only
+ * control hides its meaning in a hover tooltip that touch users never see), and a
+ * labelled button needs a row, so this one kind reads its data.
+ *
+ * The adapter decides whether the button exists, so the decision is already made
+ * before measurement — measure and render both read the same `buttons` array and
+ * cannot disagree.
+ */
+export function resolveSystemTextChrome(kind: SystemTextKind, data: SystemTextData): KindChrome {
+	const chrome = KIND_CHROME[kind];
+	if (kind !== "error" || !data.buttons?.length) return chrome;
+	return { ...chrome, postBody: STACK_GAP + BUTTON_COMPACT_XS };
+}
+
+/**
  * Measure a multi-line / pre-wrap system card. The body wraps in its true
  * available width (contentWidth minus card padding and the kind's left/right
  * chrome); the fixed chrome rows are added by the per-kind height model. Height
@@ -313,7 +340,7 @@ export function measureSystemTextCard(
 	contentWidth: number,
 	_lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredElement {
-	const chrome = KIND_CHROME[kind];
+	const chrome = resolveSystemTextChrome(kind, data);
 	const bodyText = resolveBodyText(kind, data);
 
 	// True body width = card inner width minus the flanking chrome reserves.
@@ -362,13 +389,20 @@ export function measureSystemTextCard(
  * registry. For horizontal-sibling kinds (error/segment) the sideMin floor may
  * raise the total when the body is tiny — the total is always
  * `CARD_PADDING*2 + max(sideMin, preBody + bodyHeight + postBody)`.
+ *
+ * Reports the kind's BASELINE chrome. An error card carrying the conditional
+ * provider-fix button row is taller by `STACK_GAP + BUTTON_COMPACT_XS`; only
+ * `measureSystemTextCard` (which sees the data) accounts for it.
  */
 export function systemTextChromeHeight(kind: SystemTextKind): number {
 	const chrome = KIND_CHROME[kind];
 	return CARD_PADDING * 2 + chrome.preBody + chrome.postBody;
 }
 
-/** Single-line height of a card kind (body = exactly one 17px line). */
+/**
+ * Single-line height of a card kind (body = exactly one 17px line), for the
+ * kind's baseline chrome — see the note on `systemTextChromeHeight`.
+ */
 export function systemTextSingleLineHeight(kind: SystemTextKind): number {
 	const chrome = KIND_CHROME[kind];
 	const bodyStack = chrome.preBody + BODY_LINE_HEIGHT + chrome.postBody;

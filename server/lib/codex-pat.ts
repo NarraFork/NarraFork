@@ -9,7 +9,7 @@
  * Reference: sub2api openai_codex_pat_service.go
  */
 
-import { getHttpCodexUserAgent, ORIGINATOR_CODEX } from "./user-agent";
+import { getHttpCodexUserAgent } from "./user-agent";
 
 const WHOAMI_URL = "https://auth.openai.com/api/accounts/v1/user-auth-credential/whoami";
 const PAT_PREFIX = "at-";
@@ -123,7 +123,7 @@ export async function validateCodexPersonalAccessToken(
 				headers: {
 					authorization: `Bearer ${token}`,
 					accept: "application/json",
-					originator: ORIGINATOR_CODEX,
+					originator: "codex_cli_rs",
 					"user-agent": getHttpCodexUserAgent(),
 				},
 				signal: abortController.signal,

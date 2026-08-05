@@ -81,6 +81,7 @@ import { integrationResourceBindingService } from "./integration-resource-bindin
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
+	isNarratorRuntimeBusy,
 	type PendingDangerReflection,
 	type PendingExecutionTarget,
 	type PendingPermission,
@@ -3047,6 +3048,43 @@ function pendingPermissionRoutingIdentity(pending: PendingPermission) {
 	);
 }
 
+/**
+ * Mirror a permission-gate status transition onto the WS broadcast target.
+ *
+ * When the gate belongs to a SUBAGENT, `broadcastTargetId` is its parent: the
+ * parent page renders the request inside the SubagentCard, so it must be told
+ * about the transition. But a narrator's status row is owned by its own turn, and
+ * a subagent pausing for permission says nothing about whether the parent is
+ * running. Writing the parent's status here used to resurrect an already-finished
+ * parent as `working`/`waiting` — the status then outlived every runtime owner and
+ * blocked `/continue` and `/subagent-recovery` with "already running", while the
+ * error substatus that drove the recovery card got wiped.
+ *
+ * So the mirror is a no-op unless the target genuinely owns running work. The
+ * real-time UI signal is carried by the permission_* WS frames, which are
+ * broadcast unconditionally and do not depend on this write.
+ *
+ * Self-transitions (target === owner) are always applied: that is the narrator
+ * writing its own status, not a mirror.
+ */
+async function mirrorPermissionStatusToTarget(
+	ownerNarratorId: string,
+	broadcastTargetId: string | undefined,
+	status: "working" | "waiting",
+	options?: { substatus?: string[] },
+): Promise<void> {
+	if (!broadcastTargetId || broadcastTargetId === ownerNarratorId) return;
+	if (!isNarratorRuntimeBusy(broadcastTargetId)) {
+		logger.debug("Skipped permission status mirror to an idle broadcast target", {
+			ownerNarratorId,
+			broadcastTargetId,
+			status,
+		});
+		return;
+	}
+	await narratorService.updateStatus(broadcastTargetId, status, options);
+}
+
 export interface RuntimePermissionConstraint {
 	/**
 	 * "bypassPermissions" does not skip review for external narrators: since they cannot
@@ -3633,11 +3671,9 @@ export async function handlePermission(
 		await narratorService.updateStatus(narratorId, "waiting", {
 			substatus: ["reflecting"],
 		});
-		if (wsTarget !== narratorId) {
-			await narratorService.updateStatus(wsTarget, "waiting", {
-				substatus: ["reflecting"],
-			});
-		}
+		await mirrorPermissionStatusToTarget(narratorId, wsTarget, "waiting", {
+			substatus: ["reflecting"],
+		});
 		if (signal.aborted) {
 			await markDangerReflectionAborted(
 				requestId,
@@ -4067,9 +4103,7 @@ export async function handlePermission(
 		eventBus.emit({ type: "narrator:attention", narratorId, reason: "waiting_permission" });
 	}
 	await narratorService.updateStatus(narratorId, "waiting");
-	if (broadcastTargetId && broadcastTargetId !== narratorId) {
-		await narratorService.updateStatus(broadcastTargetId, "waiting");
-	}
+	await mirrorPermissionStatusToTarget(narratorId, broadcastTargetId, "waiting");
 
 	if (signal.aborted) {
 		broadcastToNarrator(wsTarget, {
@@ -4126,9 +4160,7 @@ export async function handlePermission(
 					permissionDecidedAt: new Date().toISOString(),
 				})
 				.where(eq(narratorToolCalls.id, toolCallId));
-			if (broadcastTargetId && broadcastTargetId !== narratorId) {
-				await narratorService.updateStatus(broadcastTargetId, "working");
-			}
+			await mirrorPermissionStatusToTarget(narratorId, broadcastTargetId, "working");
 			resolve({ behavior: "deny", message: "Narrator aborted" });
 		};
 
@@ -4299,9 +4331,7 @@ export async function resolvePermission(
 
 	try {
 		await narratorService.updateStatus(pending.narratorId, "working");
-		if (pending.broadcastTargetId !== pending.narratorId) {
-			await narratorService.updateStatus(pending.broadcastTargetId, "working");
-		}
+		await mirrorPermissionStatusToTarget(pending.narratorId, pending.broadcastTargetId, "working");
 		const now = new Date().toISOString();
 		const effectiveDenyMessage = denyMessage || feedbackText?.trim() || undefined;
 		await db
@@ -4516,7 +4546,7 @@ function dangerReflectionSuggestions(
 		startedAt?: number;
 		requestId?: string;
 	},
-	status: "running" | "awaiting_user" | "confirmed" | "cancelled" | "aborted",
+	status: "running" | "awaiting_user" | "confirmed" | "cancelled" | "aborted" | "failed",
 	reason?: string,
 ) {
 	return [
@@ -4606,9 +4636,7 @@ async function markDangerReflectionAborted(
 			},
 		);
 		await narratorService.updateStatus(narratorId, "working").catch(() => {});
-		if (broadcastTargetId !== narratorId) {
-			await narratorService.updateStatus(broadcastTargetId, "working").catch(() => {});
-		}
+		await mirrorPermissionStatusToTarget(narratorId, broadcastTargetId, "working").catch(() => {});
 	} catch (err) {
 		logger.warn("Failed to mark danger reflection as aborted", {
 			requestId,
@@ -4617,9 +4645,7 @@ async function markDangerReflectionAborted(
 		});
 	} finally {
 		await narratorService.updateStatus(narratorId, "working").catch(() => {});
-		if (broadcastTargetId !== narratorId) {
-			await narratorService.updateStatus(broadcastTargetId, "working").catch(() => {});
-		}
+		await mirrorPermissionStatusToTarget(narratorId, broadcastTargetId, "working").catch(() => {});
 		if (options.cleanup) {
 			pendingDangerReflections.get(requestId)?.cleanup();
 			pendingDangerReflections.delete(requestId);
@@ -4799,9 +4825,9 @@ export async function stopDangerReflectionLoop(
 		// it set kept every view's status badge / favicon / list card claiming the
 		// reflection was still running after the takeover.
 		await narratorService.updateStatus(pause.narratorId, "waiting", { substatus: [] });
-		if (pause.broadcastTargetId !== pause.narratorId) {
-			await narratorService.updateStatus(pause.broadcastTargetId, "waiting", { substatus: [] });
-		}
+		await mirrorPermissionStatusToTarget(pause.narratorId, pause.broadcastTargetId, "waiting", {
+			substatus: [],
+		});
 	} catch (err) {
 		logger.warn("Failed to stop danger reflection loop", {
 			requestId,
@@ -4861,9 +4887,11 @@ export async function confirmDangerReflection(
 			await enableRelaxedPlanAfterPlanSoftDeny(pause.narratorId, pause.broadcastTargetId);
 		}
 		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
-		if (pause.broadcastTargetId !== pause.narratorId) {
-			await narratorService.updateStatus(pause.broadcastTargetId, "working").catch(() => {});
-		}
+		await mirrorPermissionStatusToTarget(
+			pause.narratorId,
+			pause.broadcastTargetId,
+			"working",
+		).catch(() => {});
 	} catch (err) {
 		logger.warn("Failed to finalize confirmed danger reflection", {
 			requestId,
@@ -4872,9 +4900,11 @@ export async function confirmDangerReflection(
 		});
 	} finally {
 		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
-		if (pause.broadcastTargetId !== pause.narratorId) {
-			await narratorService.updateStatus(pause.broadcastTargetId, "working").catch(() => {});
-		}
+		await mirrorPermissionStatusToTarget(
+			pause.narratorId,
+			pause.broadcastTargetId,
+			"working",
+		).catch(() => {});
 		pause.resolve(result);
 	}
 	return true;
@@ -4884,6 +4914,7 @@ export async function cancelDangerReflection(
 	requestId: string,
 	reason?: string,
 	decidedBy: DangerReflectionDecidedBy = "reflection",
+	options: { failed?: boolean } = {},
 ): Promise<boolean> {
 	const pause = pendingDangerReflections.get(requestId);
 	if (!pause) return false;
@@ -4894,6 +4925,11 @@ export async function cancelDangerReflection(
 		(decidedBy === "user"
 			? "Danger reflection pause cancelled by user"
 			: "Danger reflection pause cancelled by reflection loop");
+	// A gate that COULD NOT decide is not a gate that decided "no". Both deny the tool, but
+	// only the latter is a judgement about the operation, so they must not share a status:
+	// "危险反思已拒绝此操作" on a provider 520 tells the user the operation was judged unsafe
+	// when in fact nothing was ever judged.
+	const status = options.failed ? "failed" : "cancelled";
 	const result: PermissionResult = {
 		behavior: "deny",
 		message,
@@ -4908,7 +4944,7 @@ export async function cancelDangerReflection(
 				permissionDecidedBy: decidedBy,
 				permissionDecidedAt: now,
 				permissionDecisionReason: message,
-				permissionSuggestions: dangerReflectionSuggestions(pause, "cancelled", message),
+				permissionSuggestions: dangerReflectionSuggestions(pause, status, message),
 			})
 			.where(eq(narratorToolCalls.id, pause.toolCallId));
 		broadcastReflectionFrame(pause, {
@@ -4917,11 +4953,14 @@ export async function cancelDangerReflection(
 			toolUseId: pause.toolUseId,
 			decision: "deny",
 			reason: message,
+			...(options.failed ? { failed: true } : {}),
 		});
 		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
-		if (pause.broadcastTargetId !== pause.narratorId) {
-			await narratorService.updateStatus(pause.broadcastTargetId, "working").catch(() => {});
-		}
+		await mirrorPermissionStatusToTarget(
+			pause.narratorId,
+			pause.broadcastTargetId,
+			"working",
+		).catch(() => {});
 	} catch (err) {
 		logger.warn("Failed to finalize cancelled danger reflection", {
 			requestId,
@@ -4930,9 +4969,11 @@ export async function cancelDangerReflection(
 		});
 	} finally {
 		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
-		if (pause.broadcastTargetId !== pause.narratorId) {
-			await narratorService.updateStatus(pause.broadcastTargetId, "working").catch(() => {});
-		}
+		await mirrorPermissionStatusToTarget(
+			pause.narratorId,
+			pause.broadcastTargetId,
+			"working",
+		).catch(() => {});
 		pause.resolve(result);
 	}
 	return true;
@@ -4949,9 +4990,11 @@ async function restoreReprocessedPermissionStatus(pending: {
 	broadcastTargetId: string;
 }): Promise<void> {
 	await narratorService.updateStatus(pending.narratorId, "working").catch(() => {});
-	if (pending.broadcastTargetId !== pending.narratorId) {
-		await narratorService.updateStatus(pending.broadcastTargetId, "working").catch(() => {});
-	}
+	await mirrorPermissionStatusToTarget(
+		pending.narratorId,
+		pending.broadcastTargetId,
+		"working",
+	).catch(() => {});
 }
 
 /**

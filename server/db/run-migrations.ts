@@ -92,18 +92,38 @@ function tableExists(sqlite: Database, name: string): boolean {
 	);
 }
 
+/** Whether an index with the given name currently exists (any owning table). */
+function indexExists(sqlite: Database, name: string): boolean {
+	return (
+		sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(name) !=
+		null
+	);
+}
+
+/**
+ * Whether `table` currently has `column`. Identifiers come from migration SQL we authored, and
+ * PRAGMA cannot bind them, so the table name is quoted rather than parameterized.
+ */
+function columnExists(sqlite: Database, table: string, column: string): boolean {
+	const columns = sqlite
+		.prepare(`PRAGMA table_info(${quoteSqliteIdentifier(table)})`)
+		.all() as Array<{ name: string }>;
+	return columns.some((row) => sameObjectName(row.name, column));
+}
+
 /** A SQLite identifier: bare, `"quoted"`, backtick-quoted, or `[bracketed]`. */
 const SQLITE_IDENTIFIER = String.raw`"(?:[^"]|"")*"|\`(?:[^\`]|\`\`)*\`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*`;
 /** A table reference with an optional schema prefix (`main.foo`, `"main"."foo"`). */
 const SQLITE_TABLE_REF = String.raw`(?:${SQLITE_IDENTIFIER})(?:\s*\.\s*(?:${SQLITE_IDENTIFIER}))?`;
 const DROP_TABLE_PREFIX = String.raw`DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`;
+const DROP_INDEX_PREFIX = String.raw`DROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?`;
 
 /**
- * Reduce a table reference to its bare name: drop any schema prefix and identifier quoting so
+ * Reduce an object reference to its bare name: drop any schema prefix and identifier quoting so
  * the spelling in a migration's SQL can be compared against the spelling SQLite echoes back in
  * an error message. Case is preserved because `sqlite_master.name` lookups are BINARY-collated.
  */
-function normalizeTableName(raw: string): string {
+function normalizeObjectName(raw: string): string {
 	const parts = raw.match(new RegExp(SQLITE_IDENTIFIER, "g")) ?? [];
 	const last = (parts.at(-1) ?? raw).trim();
 	const first = last[0];
@@ -118,8 +138,16 @@ function normalizeTableName(raw: string): string {
 }
 
 /** SQLite resolves ASCII identifiers case-insensitively, so tolerate spelling differences. */
-function sameTableName(a: string, b: string): boolean {
+function sameObjectName(a: string, b: string): boolean {
 	return a.toLowerCase() === b.toLowerCase();
+}
+
+/** The names SQLite reported for a failure, including the DrizzleError-wrapped `cause`. */
+function errorMessages(err: unknown): string[] {
+	const messages = [String(err instanceof Error ? err.message : err)];
+	// DrizzleError wraps the original SQLiteError in `cause`.
+	if (err instanceof Error && err.cause) messages.push(String(err.cause));
+	return messages;
 }
 
 /**
@@ -128,12 +156,36 @@ function sameTableName(a: string, b: string): boolean {
  * only ever skip a failure whose missing table it was able to identify.
  */
 function missingTableFromError(err: unknown): string | null {
-	const messages = [String(err instanceof Error ? err.message : err)];
-	// DrizzleError wraps the original SQLiteError in `cause`.
-	if (err instanceof Error && err.cause) messages.push(String(err.cause));
-	for (const message of messages) {
+	for (const message of errorMessages(err)) {
 		const match = /no such table:\s*([^\s;]+)/i.exec(message);
-		if (match) return normalizeTableName(match[1]);
+		if (match) return normalizeObjectName(match[1]);
+	}
+	return null;
+}
+
+/** The index SQLite reported as absent (`no such index: main.idx_foo`), or null otherwise. */
+function missingIndexFromError(err: unknown): string | null {
+	for (const message of errorMessages(err)) {
+		const match = /no such index:\s*([^\s;]+)/i.exec(message);
+		if (match) return normalizeObjectName(match[1]);
+	}
+	return null;
+}
+
+/**
+ * The column SQLite reported as absent, or null otherwise. `ALTER TABLE ... DROP COLUMN` echoes
+ * the name back exactly as written, so backtick-quoted migration SQL yields
+ * `no such column: "`gone`"` — the quoting has to be peeled off twice.
+ */
+function missingColumnFromError(err: unknown): string | null {
+	for (const message of errorMessages(err)) {
+		const match = /no such column:\s*(.+?)\s*$/i.exec(message);
+		if (!match) continue;
+		let name = match[1].trim();
+		if (name.length >= 2 && name.startsWith('"') && name.endsWith('"')) {
+			name = name.slice(1, -1).replaceAll('""', '"');
+		}
+		return normalizeObjectName(name);
 	}
 	return null;
 }
@@ -147,7 +199,29 @@ function droppedTableOfStatement(stmt: string): string | null {
 	const match = new RegExp(String.raw`^\s*${DROP_TABLE_PREFIX}(${SQLITE_TABLE_REF})`, "i").exec(
 		stmt,
 	);
-	return match ? normalizeTableName(match[1]) : null;
+	return match ? normalizeObjectName(match[1]) : null;
+}
+
+/** The index this statement drops, or null when the statement is anything else. */
+function droppedIndexOfStatement(stmt: string): string | null {
+	const match = new RegExp(
+		String.raw`^\s*${DROP_INDEX_PREFIX}(${SQLITE_TABLE_REF})\s*;?\s*$`,
+		"i",
+	).exec(stmt);
+	return match ? normalizeObjectName(match[1]) : null;
+}
+
+/**
+ * The `{ table, column }` this statement drops via `ALTER TABLE ... DROP COLUMN`, or null when
+ * the statement is anything else. Anchored and terminated so only a lone column drop matches.
+ */
+function droppedColumnOfStatement(stmt: string): { table: string; column: string } | null {
+	const match = new RegExp(
+		String.raw`^\s*ALTER\s+TABLE\s+(${SQLITE_TABLE_REF})\s+DROP\s+(?:COLUMN\s+)?(${SQLITE_IDENTIFIER})\s*;?\s*$`,
+		"i",
+	).exec(stmt);
+	if (!match) return null;
+	return { table: normalizeObjectName(match[1]), column: normalizeObjectName(match[2]) };
 }
 
 /**
@@ -162,7 +236,7 @@ function migrationDropsRealTables(statements: readonly string[]): string[] {
 	const dropPattern = new RegExp(`${DROP_TABLE_PREFIX}(${SQLITE_TABLE_REF})`, "gi");
 	for (const stmt of statements) {
 		for (const match of stmt.matchAll(dropPattern)) {
-			const table = normalizeTableName(match[1]);
+			const table = normalizeObjectName(match[1]);
 			if (table.startsWith("__new_")) continue;
 			dropped.push(table);
 		}
@@ -189,8 +263,46 @@ function isMissingDropTargetError(
 	const missingTable = missingTableFromError(err);
 	if (missingTable === null) return false;
 	const target = droppedTableOfStatement(stmt);
-	if (target === null || !sameTableName(target, missingTable)) return false;
-	return droppedTables.some((table) => sameTableName(table, missingTable));
+	if (target === null || !sameObjectName(target, missingTable)) return false;
+	return droppedTables.some((table) => sameObjectName(table, missingTable));
+}
+
+/**
+ * Whether a failed statement is the already-satisfied case of dropping an index or column this
+ * database no longer has — the drop's own goal is already true, so skipping it leaves the schema
+ * exactly where the migration wanted it.
+ *
+ * This is what makes a hash "hole" self-healing. A source-built machine that upgrades to a
+ * release binary can carry a database whose schema already advanced past a migration whose hash
+ * was never recorded (locally generated migrations hash differently from the released files).
+ * Replaying such a migration re-runs its `DROP INDEX`/`DROP COLUMN`, which then fails on a
+ * target that the earlier local run already removed, and startup aborts.
+ *
+ * Three guards keep this from masking a real problem:
+ * - the statement must be exactly a lone `DROP INDEX` / `ALTER TABLE ... DROP COLUMN`;
+ * - the object SQLite reported missing must be that statement's own target, so an unrelated
+ *   failure inside a multi-statement migration is still fatal;
+ * - the catalog is consulted: the object must genuinely be absent right now. A "no such
+ *   index/column" error raised for any other reason keeps propagating.
+ */
+function isAlreadySatisfiedDropError(sqlite: Database, err: unknown, stmt: string): boolean {
+	const missingIndex = missingIndexFromError(err);
+	if (missingIndex !== null) {
+		const target = droppedIndexOfStatement(stmt);
+		if (target === null || !sameObjectName(target, missingIndex)) return false;
+		return !indexExists(sqlite, target);
+	}
+
+	const missingColumn = missingColumnFromError(err);
+	if (missingColumn !== null) {
+		const target = droppedColumnOfStatement(stmt);
+		if (target === null || !sameObjectName(target.column, missingColumn)) return false;
+		// A missing table is a different failure; report it rather than swallowing it here.
+		if (!tableExists(sqlite, target.table)) return false;
+		return !columnExists(sqlite, target.table, target.column);
+	}
+
+	return false;
 }
 
 /**
@@ -296,6 +408,9 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 							sqlite.run(stmt);
 						} catch (err) {
 							if (isAlreadyExistsError(err)) continue;
+							// An index/column drop whose target is already gone: the statement's
+							// own goal is satisfied, verified against the live catalog.
+							if (isAlreadySatisfiedDropError(sqlite, err, stmt)) continue;
 							// Scoped to the failing statement, not the whole migration: only a
 							// `DROP TABLE` whose own target is the table SQLite reports missing is
 							// harmless. Anything else failing with "no such table" means the

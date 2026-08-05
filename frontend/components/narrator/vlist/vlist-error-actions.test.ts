@@ -34,6 +34,12 @@ const DISPATCH = readFileSync(join(DIR, "render-registry.tsx"), "utf8");
 const CARD = readFileSync(join(DIR, "render", "RenderSystemText.tsx"), "utf8");
 const ACTIONS = readFileSync(join(DIR, "vlist-error-actions.tsx"), "utf8");
 const MODAL = readFileSync(join(DIR, "..", "RetryRuleModal.tsx"), "utf8");
+const LABELS = readFileSync(join(DIR, "useVListLabels.ts"), "utf8");
+const MEASURE = readFileSync(join(DIR, "measure", "measure-system-text.ts"), "utf8");
+const ADAPTER = readFileSync(
+	join(DIR, "..", "..", "..", "..", "shared", "pretext-layout", "segment-adapter.ts"),
+	"utf8",
+);
 
 /** A minimal item stub — the resolvers only read `spec.kind` / `spec.data`. */
 function item(kind: string, data?: Record<string, unknown>): VListItem {
@@ -123,6 +129,39 @@ describe("error notice actions — shell wiring", () => {
 		// icon with no click target at all.
 		expect(CARD).toContain("onClick={actions?.onMarkRetryable}");
 		expect(CARD).toContain("onClick={actions?.onDismiss}");
+		// The provider fix is bound the same way; its click behaviour and its visible
+		// label are covered by the real-DOM errorcard test.
+		expect(CARD).toContain("onClick={actions?.onDisableImageGen}");
+	});
+
+	it("reads the fix button's label from the adapter, never from the render layer", () => {
+		// The fix must be a LABELLED button: an icon-only control explains itself only
+		// through a hover tooltip, which touch users never see. The wording therefore
+		// has to travel through the adapter (where it is measured) — the render layer
+		// holds no i18n at all.
+		expect(CARD).toContain("data.buttons?.[0]");
+		expect(LABELS).toContain('disableImageGen: t("disableImageGen")');
+		expect(ADAPTER).toContain('sysLabel(ctx, "disableImageGen")');
+	});
+
+	it("decides the fix button during ADAPTATION so its row is measured", () => {
+		// The button sits below the message and makes the card taller. Deciding it at
+		// paint time would draw it outside the row's reserved box.
+		expect(ADAPTER).toContain("ctx.canOfferProviderFix?.(errorText) === true");
+		expect(MEASURE).toContain('kind !== "error" || !data.buttons?.length');
+		expect(SHELL).toContain("canOfferProviderFix: errorNotice.canOfferProviderFix");
+	});
+
+	it("offers the fix only for the rows whose own error matches", () => {
+		// The fix action is per-narrator (one provider, one retry), but eligibility is
+		// per-row: attaching it unconditionally would put a "turn off image generation"
+		// button on unrelated failures.
+		expect(ACTIONS).toContain("useCodexImageGenerationFix(narratorId)");
+		expect(ACTIONS).toContain("imageGenFix.canFix(errorText)");
+		expect(ACTIONS).toContain("onDisableImageGen: imageGenFix.run");
+		// The resolver caches one object per message id, so the in-flight flag must be
+		// a dependency or a row would keep painting a stale loading spinner.
+		expect(ACTIONS).toContain("imageGenFix.busy");
 	});
 
 	it("dismissal deletes the message and prunes the messages cache", () => {
@@ -139,8 +178,16 @@ describe("error notice actions — shell wiring", () => {
 
 	it("resets the rule form for the row that opened it", () => {
 		// One shared modal serving many rows must not keep the first error's text.
-		expect(MODAL).toContain("setKeyword(errorMessage)");
+		expect(MODAL).toContain("setKeyword(stripErrorDisplayPrefix(errorMessage))");
 		expect(MODAL).toMatch(/\[opened, errorMessage\]/);
+	});
+
+	it("prefills the keyword without the card's error display prefix", () => {
+		// The card text reads `Error: <provider message>`, but the server matches
+		// custom retry rules against the RAW provider message — prefilling the
+		// decorated text produced rules that could never fire.
+		expect(MODAL).toContain('from "@shared/retry-rule-keyword"');
+		expect(MODAL).toContain("stripErrorDisplayPrefix(keyword)");
 	});
 
 	it("keeps the render layer free of app imports (CONTRACT.md §0)", () => {

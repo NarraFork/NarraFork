@@ -29,6 +29,9 @@ import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
 import { ensureFileSnapshot } from "./file-snapshot-service";
 import {
+	buildCanonicalIdentityAliases,
+	canonicalizeDeviceFileIdentity,
+	canonicalizeDeviceFileIdentityWith,
 	deviceFileKey,
 	getToolCallFileIdentity,
 	getToolCallFileIdentityStrict,
@@ -1770,6 +1773,68 @@ describe("device-aware file state rebuild", () => {
 		});
 		expect(() => groupByDeviceFileStrict(rows, cwd)).toThrow(
 			"targeted remote device legacy-remote",
+		);
+	});
+
+	/**
+	 * `/file-modifications` canonicalizes one identity per snapshot. Rebuilding the
+	 * alias map inside that loop is O(snapshots × toolCalls) of synchronous work and
+	 * froze the event loop for ~4.3s on a 1436 × 7213 narrator. The hoisted form must
+	 * resolve every alias — lexical, canonical and case-folded — identically, or the
+	 * speedup would come at the cost of files silently splitting into two entries.
+	 */
+	test("a hoisted alias map resolves identities exactly like the per-identity call", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-alias-hoist-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+
+		await addToolCall(
+			narratorId,
+			1,
+			{ file_path: "C:\\Work\\Link\\a.txt", content: "a" },
+			{
+				deviceId: "windows-device",
+				filePath: "C:\\Work\\Real\\a.txt",
+				pathFlavor: "windows",
+				lexicalPath: "C:\\Work\\Link\\a.txt",
+				canonicalPath: "C:\\Work\\Real\\a.txt",
+			},
+		);
+		await addToolCall(
+			narratorId,
+			2,
+			{ file_path: "/workspace/b.txt", content: "b" },
+			{ deviceId: "local", filePath: "/workspace/b.txt" },
+		);
+
+		const toolCalls = await queryOrderedToolCalls(narratorId, undefined, {
+			filePathOnly: true,
+		});
+		const aliases = buildCanonicalIdentityAliases(toolCalls, cwd);
+
+		// Includes the lexical alias, its case-folded variant and an unknown path that
+		// must fall through to the normalized input unchanged.
+		const probes = [
+			{ deviceId: "windows-device", filePath: "C:\\Work\\Link\\a.txt" },
+			{ deviceId: "windows-device", filePath: "c:\\work\\link\\A.TXT" },
+			{ deviceId: "windows-device", filePath: "C:\\Work\\Real\\a.txt" },
+			{ deviceId: "local", filePath: "/workspace/b.txt" },
+			{ deviceId: "local", filePath: "/workspace/never-touched.txt" },
+		];
+
+		for (const probe of probes) {
+			expect(canonicalizeDeviceFileIdentityWith(probe, aliases)).toEqual(
+				canonicalizeDeviceFileIdentity(probe, toolCalls, cwd),
+			);
+		}
+
+		// The alias really is doing work: the lexical path resolves to the canonical one.
+		expect(canonicalizeDeviceFileIdentityWith(probes[0], aliases).filePath).toBe(
+			"C:\\Work\\Real\\a.txt",
+		);
+		// An unknown path is preserved rather than mapped onto an unrelated entry.
+		expect(canonicalizeDeviceFileIdentityWith(probes[4], aliases).filePath).toBe(
+			"/workspace/never-touched.txt",
 		);
 	});
 

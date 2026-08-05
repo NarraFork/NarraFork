@@ -293,10 +293,10 @@ export class NugProvider implements ProviderAdapter {
 				return new OpenAIProvider({
 					...delegateBase,
 					baseUrl: `${this.baseUrl}/v1`,
-					// apiMode codex already presents the codex-tui originator,
-					// installation id and the stable codex body contract.
 					apiMode: "codex",
 					codexWebSocket: false,
+					// apiMode codex already presents the codex-tui originator,
+					// installation id and the stable codex body contract.
 				});
 			case "openai":
 				return new OpenAIProvider({
@@ -1044,7 +1044,14 @@ export class NugProvider implements ProviderAdapter {
 		return (await response.json()) as NugUsageSummary;
 	}
 
-	async getModels(): Promise<{
+	/**
+	 * Fetch the gateway's model catalog.
+	 *
+	 * `signal` is optional so existing callers keep their current (unbounded)
+	 * behaviour; opportunistic callers that run on a user interaction pass a
+	 * timeout signal so a hung gateway cannot stall them.
+	 */
+	async getModels(options?: { signal?: AbortSignal }): Promise<{
 		models: Array<Record<string, unknown>>;
 		modelHash?: string;
 		hash?: string;
@@ -1052,6 +1059,7 @@ export class NugProvider implements ProviderAdapter {
 	}> {
 		const response = await this.pfetch(`${this.baseUrl}/v1/models`, {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
+			...(options?.signal ? { signal: options.signal } : {}),
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");

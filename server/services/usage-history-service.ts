@@ -670,11 +670,18 @@ export class UsageHistoryService {
 		const credentialId = filters.credentialId?.trim();
 
 		if (filters.narratorId) {
+			// Both sides of the OR must be predicates on `api_requests.narrator_id` so
+			// SQLite can serve them from idx_api_requests_narrator (it plans this as a
+			// MULTI-INDEX OR). Matching `narrators.parentNarratorId` directly puts a
+			// joined-table column in the OR instead, which defeats that index and
+			// degrades every caller into a full scan of api_requests — measured at
+			// 223ms vs 46ms over 385k rows, on a query that runs whenever a narrator
+			// page is opened.
 			conditions.push(
 				filters.includeSubagents
 					? or(
 							eq(apiRequests.narratorId, filters.narratorId),
-							eq(narrators.parentNarratorId, filters.narratorId),
+							sql`${apiRequests.narratorId} IN (SELECT ${narrators.id} FROM ${narrators} WHERE ${narrators.parentNarratorId} = ${filters.narratorId})`,
 						)
 					: eq(apiRequests.narratorId, filters.narratorId),
 			);

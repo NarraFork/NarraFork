@@ -169,6 +169,44 @@ export type SubagentInterruptionPlan =
 			promptKey: "interruptionContinue" | "resumeAfterTransientError";
 	  };
 
+export type SubagentCompactRestartDecision =
+	/** Rebuild history from the compact summary and drive another pass. */
+	| { action: "restart" }
+	/** The pass already finished its work; apply nothing further and end the run. */
+	| { action: "finish"; reason: "completed_naturally" | "compact_consumed_in_loop" };
+
+/**
+ * Decide whether a completed subagent pass should be restarted after a compact.
+ *
+ * `needsRestart` only records that a compact finished *somewhere* during the
+ * pass. It is set from `onCompactDone`, which runs at the end of a detached
+ * fire-and-forget chain (`onContextUsage` → `triggerMidTurnCompact` →
+ * `runCustomCompact` → `onCompactDone`) that races the loop it belongs to.
+ * Treating it as "there is more work to do" is what produced spurious extra
+ * turns when the compact landed after the subagent had already wrapped up.
+ *
+ * Kept pure so both orderings of that race are directly testable.
+ */
+export function planSubagentCompactRestart(input: {
+	result: Pick<ExecuteLoopResult, "completedNaturally" | "contextLengthExceeded">;
+	compactConsumedInLoop: boolean;
+	compactDoneFlag: boolean;
+}): SubagentCompactRestartDecision {
+	const { result, compactConsumedInLoop, compactDoneFlag } = input;
+	// A context overflow means the pass never delivered its work, so the compacted
+	// history must be retried regardless of the other signals.
+	if (result.contextLengthExceeded) return { action: "restart" };
+	// The model stopped calling tools: the subagent is done and another request
+	// could only produce a filler turn (and would overwrite finalText for subagent
+	// types that have no conclusion file).
+	if (result.completedNaturally) return { action: "finish", reason: "completed_naturally" };
+	// onBeforeTurn already rebuilt history inside the loop, so needsRestart is stale.
+	if (compactConsumedInLoop && !compactDoneFlag) {
+		return { action: "finish", reason: "compact_consumed_in_loop" };
+	}
+	return { action: "restart" };
+}
+
 /** Decide how a subagent should continue after a provider-interrupted partial turn. */
 export function planSubagentInterruption(
 	result: Pick<
@@ -265,6 +303,55 @@ export function clearSubagentBufferedMessages(subagentId: string): void {
 /** Get the full subagent buffer queue (for REST hydration). */
 export function getSubagentBufferedMessages(subagentId: string): SubagentBufferedMessage[] {
 	return getSubagentBufferedMessagesMap().get(subagentId) ?? [];
+}
+
+/**
+ * Edit the text of one queued subagent message. Returns false when the queue or
+ * message id does not exist, so callers can fall through to the primary-narrator
+ * queue (the two queues live in separate maps and never share ids).
+ */
+export function updateSubagentBufferedMessage(
+	subagentId: string,
+	messageId: string,
+	text: string,
+): boolean {
+	const queue = getSubagentBufferedMessagesMap().get(subagentId);
+	const message = queue?.find((queued) => queued.id === messageId);
+	if (!message) return false;
+	message.text = text;
+	message.bufferedAt = new Date().toISOString();
+	return true;
+}
+
+/**
+ * Remove one queued subagent message. When the queue becomes empty the pending
+ * post-tool soft stop is dropped too, otherwise the running turn would stop at
+ * the next tool boundary with nothing left to resume.
+ */
+export function removeSubagentBufferedMessage(subagentId: string, messageId: string): boolean {
+	const queue = getSubagentBufferedMessagesMap().get(subagentId);
+	if (!queue) return false;
+	const index = queue.findIndex((queued) => queued.id === messageId);
+	if (index === -1) return false;
+	queue.splice(index, 1);
+	if (queue.length === 0) clearSubagentBufferedMessages(subagentId);
+	return true;
+}
+
+/** Reorder the subagent buffer queue by an exact list of its message ids. */
+export function reorderSubagentBufferedMessages(subagentId: string, orderedIds: string[]): boolean {
+	const queue = getSubagentBufferedMessagesMap().get(subagentId);
+	if (!queue || queue.length === 0) return false;
+	if (orderedIds.length !== queue.length) return false;
+	const byId = new Map(queue.map((queued) => [queued.id, queued]));
+	const reordered: SubagentBufferedMessage[] = [];
+	for (const id of orderedIds) {
+		const message = byId.get(id);
+		if (!message) return false;
+		reordered.push(message);
+	}
+	getSubagentBufferedMessagesMap().set(subagentId, reordered);
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,17 +1238,22 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 		if (!needsRestart || signal.aborted || hasError) break;
 
-		// If onBeforeTurn already handled the compact (inner path), the flag
-		// was cleared and needsRestart is stale. Skip the outer restart.
-		// Do not key this on finalText: explore/plan subagents may write their
-		// actual result to the conclusion file, which is read after the loop.
-		if (compactConsumedInLoop && !compactDoneFlag && !result.contextLengthExceeded) {
-			logger.info("Subagent compact already handled by onBeforeTurn, skipping outer restart", {
+		// Do not key this decision on finalText: explore/plan subagents may write
+		// their actual result to the conclusion file, which is read after the loop.
+		const restartDecision = planSubagentCompactRestart({
+			result,
+			compactConsumedInLoop,
+			compactDoneFlag,
+		});
+		if (restartDecision.action === "finish") {
+			logger.info("Subagent skipping restart after compact", {
 				narratorId,
 				parentNarratorId,
+				reason: restartDecision.reason,
 				finalTextLength: finalText.length,
 			});
 			needsRestart = false;
+			compactDoneFlag = false;
 			break;
 		}
 		compactDoneFlag = false;

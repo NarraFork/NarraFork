@@ -178,12 +178,22 @@ export function getClaudeCliUserAgent(): string {
 }
 
 /**
+ * Upper bound on an outbound User-Agent, well above any real client's UA.
+ *
+ * A UA is partly built from host-supplied text (`PRETTY_NAME` in /etc/os-release,
+ * terminal env vars, an operator's custom string), none of which is length-bounded
+ * at the source. Some upstreams reject oversized request headers outright, so an
+ * unusual host string would otherwise break every request with a confusing error.
+ */
+const MAX_USER_AGENT_LENGTH = 256;
+
+/**
  * Sanitize User-Agent string to ensure it's a valid HTTP header value.
- * Replaces invalid characters with underscores.
+ * Replaces invalid characters with underscores and bounds the length.
  */
 export function sanitizeUserAgent(userAgent: string): string {
 	// HTTP header values must be ASCII printable characters (0x20-0x7E)
-	return userAgent.replace(/[^\x20-\x7E]/g, "_");
+	return userAgent.replace(/[^\x20-\x7E]/g, "_").slice(0, MAX_USER_AGENT_LENGTH);
 }
 
 /**

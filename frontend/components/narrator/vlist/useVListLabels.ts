@@ -317,6 +317,11 @@ export function useVListLabels(): VListLabels {
 			// ── spec fork-carryover / context-cleared card ──────────────────────────
 			specForkCarryover: t("specForkCarryoverTitle"),
 			specContextCleared: t("specClearedCarryoverTitle"),
+			// ── error card's conditional provider fix ────────────────────────────────
+			// An ADAPTER label: the fix is a labelled button on its own row, so its
+			// presence changes the card's measured height (unlike the always-reserved
+			// button rows of the spec cards, whose wording is height-neutral).
+			disableImageGen: t("disableImageGen"),
 			specViewTasks: t("specGoalViewTasks"),
 			specClearTasks: t("specForkClearTasks"),
 			specResetTasks: t("specForkResetSpec"),

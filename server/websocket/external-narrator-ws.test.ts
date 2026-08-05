@@ -215,6 +215,21 @@ describe("external narrator kernel control events", () => {
 			});
 		}
 	});
+
+	test("keeps documentRevision off pushed frames even when the event carries one", () => {
+		// The revision is only meaningful as a cheap "can I skip re-reading?" answer, and
+		// filling it here would cost one indexed read per subscriber per event on the
+		// fan-out path. `sync_check` is the client-initiated frame that carries it.
+		expect(
+			externalFrameForEvent(
+				{
+					topic: "narrafork.narrator.message.changed",
+					data: { narratorId: "n1", messageVersion: 42, documentRevision: 42 },
+				},
+				"n1",
+			),
+		).toEqual({ type: "narrator_changed", narratorId: "n1" });
+	});
 });
 
 describe("external narrator OAuth connection registry", () => {

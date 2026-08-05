@@ -232,24 +232,26 @@ export const DETAIL_BODY_FONT = `${FONT_WEIGHT.regular} ${DETAIL_BODY_FONT_SIZE}
 export const DETAIL_MEASURE_PREFIX_MAX_CHARS = 8 * 1024;
 
 /**
- * Escalating budgets (chars) for how much markdown body text is PARSED for a
- * capped detail (ExitPlanMode plans).
+ * Hard ceiling (chars) on how much markdown body text is PARSED for a capped
+ * detail (ExitPlanMode plans, skill/knowledge bodies).
  *
- * Markdown parsing is the expensive step (~250ms for a 20KB document — the same
- * price the assistant-markdown path already pays), so a single large budget would
- * make every oversized plan pay for text the cap can never reveal. Instead the
- * measurement escalates: the first budget already exceeds the cap for a big plan
- * (→ stop), and a plan small enough to fit is parsed whole on that first pass
- * (→ exact). Only the narrow middle band pays for a second parse.
+ * Markdown parsing is the expensive step (~180ms for a 16KB document — the same
+ * price the assistant-markdown path already pays), and the schema allows a 1MB
+ * plan file, which must never reach the synchronous layout path in full. This is
+ * the ONE place body content is legitimately dropped, so `markdownMeasurePrefix`
+ * cuts on a block boundary and the measurement reports `isPrefix`.
  *
- * The last entry is the hard ceiling: the schema allows a 1MB plan file, which
- * must never reach the synchronous layout path in full. Observed real plans top
- * out around 18K chars, comfortably inside the first budget.
+ * NOT TO BE CONFUSED WITH THE CAP: the cap fixes the scroll box's OUTER height,
+ * but the box is `overflow: auto` and the reader scrolls the rest. "Already past
+ * the cap" is therefore not a reason to stop parsing — a previous escalating
+ * budget did exactly that and a 15.7K-char plan lost everything after char 8154
+ * (see measureMarkdownDetail).
+ *
+ * Sized so every observed real plan (~18K chars) is parsed whole. Mirrored by
+ * `TOOL_IO_BUDGETS.markdownLeaf`, the payload budget that has to deliver the text
+ * this ceiling is willing to read.
  */
-export const DETAIL_MARKDOWN_PREFIX_BUDGETS = [8 * 1024, 32 * 1024] as const;
-/** Hard ceiling (chars) on parsed markdown body text. */
-export const DETAIL_MARKDOWN_PREFIX_MAX_CHARS =
-	DETAIL_MARKDOWN_PREFIX_BUDGETS[DETAIL_MARKDOWN_PREFIX_BUDGETS.length - 1] ?? 32 * 1024;
+export const DETAIL_MARKDOWN_PREFIX_MAX_CHARS = 32 * 1024;
 
 /** Gap between the `_planFile` provenance line and the markdown body. */
 export const DETAIL_SOURCE_LINE_MARGIN_BOTTOM = 4;
@@ -865,6 +867,11 @@ export interface MeasuredToolDetailSection {
 	 * this is only populated for markdown ones.
 	 */
 	sourceText?: string;
+	/**
+	 * The painted markdown blocks cover only a PREFIX of `sourceText` (the body
+	 * exceeded the parse ceiling). See `MeasuredToolDetail.bodyIsPrefix`.
+	 */
+	bodyIsPrefix?: boolean;
 }
 
 /** A measured detail region (the LazyCollapse body's DetailRenderer part). */
@@ -894,6 +901,16 @@ export interface MeasuredToolDetail {
 	 * never a block and never part of the frame.
 	 */
 	sourceText?: string;
+	/**
+	 * The painted markdown blocks cover only a PREFIX of `sourceText`, because the
+	 * body exceeded `DETAIL_MARKDOWN_PREFIX_MAX_CHARS`.
+	 *
+	 * Distinct from `ToolCappedDetail.textTruncated`, which says the SERVER sent a
+	 * preview. This one says the client chose not to parse the rest, so the full
+	 * text is already in hand (`sourceText`) and the viewer can show all of it.
+	 * Height-neutral output field.
+	 */
+	bodyIsPrefix?: boolean;
 	/**
 	 * Per-section geometry — present only for `kind === "sections"`. Parallel view
 	 * over the flat `blocks`/`frame` arrays (never a second copy of them).
@@ -1293,21 +1310,40 @@ export function measureMarkdownDetail(
 	cap: number,
 	availableWidth: number,
 	sourcePath: string | undefined,
-): { blocks: PreparedBlock[]; frame: ElementFrame; contentWidth: number; height: number } {
+): {
+	blocks: PreparedBlock[];
+	frame: ElementFrame;
+	contentWidth: number;
+	height: number;
+	/** The parsed body was cut at the ceiling — blocks cover only a prefix. */
+	isPrefix: boolean;
+} {
 	const innerWidth = Math.max(1, availableWidth - DETAIL_BOX_CHROME_X);
 
-	// Escalate through the parse budgets. A pass is authoritative as soon as it
-	// either consumed the whole text (exact height) or already overflows the cap
-	// (the rest can only add more, and the box clamps at `cap` regardless).
-	let result: ReturnType<typeof buildMarkdownDetailFrame> | null = null;
-	for (const budget of DETAIL_MARKDOWN_PREFIX_BUDGETS) {
-		const prefix = markdownMeasurePrefix(text, budget);
-		result = buildMarkdownDetailFrame(prefix, innerWidth, sourcePath);
-		if (prefix.length === text.length || result.boxContent >= cap) break;
-	}
-	const built = result ?? buildMarkdownDetailFrame(text, innerWidth, sourcePath);
+	// Parse the whole body, bounded only by the hard ceiling.
+	//
+	// This must NOT stop at "boxContent >= cap". The cap fixes the box's OUTER
+	// height, but the box is `overflow: auto` and scrolls internally, so everything
+	// past the cap is content the reader reaches by scrolling. Breaking there left
+	// the remainder unparsed — no blocks, nothing to scroll to — a real truncation
+	// of the body on screen rather than a saved measurement (a 15.7K-char plan
+	// stopped dead at char 8154, ~40% of the way in).
+	//
+	// Work stays bounded by `markdownMeasurePrefix`: a body over the ceiling is cut
+	// on a block boundary, which is the one case where content is genuinely dropped
+	// (`isPrefix` reports it so the render layer can say so). The cost is also
+	// amortized by the prepared-block cache — re-measuring the same text at another
+	// width is a hit — so the full parse is paid once per body, not once per layout.
+	const prefix = markdownMeasurePrefix(text, DETAIL_MARKDOWN_PREFIX_MAX_CHARS);
+	const built = buildMarkdownDetailFrame(prefix, innerWidth, sourcePath);
 	const height = DETAIL_TOP_MARGIN + Math.min(built.boxContent, cap);
-	return { blocks: built.blocks, frame: built.frame, contentWidth: innerWidth, height };
+	return {
+		blocks: built.blocks,
+		frame: built.frame,
+		contentWidth: innerWidth,
+		height,
+		isPrefix: prefix.length < text.length,
+	};
 }
 
 /** Parse + frame one markdown prefix; `boxContent` excludes the outer mt gap. */
@@ -1697,6 +1733,10 @@ function measureSectionsDetail(
 			// Forward the markdown body's raw source (see MeasuredToolDetailSection).
 			// Copying one string into the section descriptor cannot move `y`.
 			...(body.sourceText === undefined ? {} : { sourceText: body.sourceText }),
+			// Same for "the painted blocks are only a prefix of that source": a
+			// sectioned body (skill / knowledge / Send message) hits the same parse
+			// ceiling, and the viewer has to make the same statement about it.
+			...(body.bodyIsPrefix === true ? { bodyIsPrefix: true } : {}),
 		});
 	}
 
@@ -1764,6 +1804,10 @@ export function measureToolDetail(
 					// the fullscreen viewer can show the whole body (the box only reveals
 					// `cap` px of it). Output-only field — no block, no frame entry.
 					sourceText: detail.text,
+					// The rendered blocks stop short of the text: only a body past the
+					// parse ceiling. Reported so the viewer can say the inline body is
+					// incomplete rather than let it end mid-document.
+					...(md.isPrefix ? { bodyIsPrefix: true } : {}),
 				};
 			}
 			const hasLabel = detail.hasLabel ?? CAPPED_WITH_LABEL.has(detail.cap);

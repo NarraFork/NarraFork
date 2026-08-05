@@ -11,6 +11,10 @@ import {
 	type NugModelInfo,
 	saveAllCachedNugModels,
 } from "../lib/nug-model-cache";
+import {
+	NUG_MODEL_REFRESH_COOLDOWN_MS,
+	nugModelRefreshCoordinator,
+} from "../lib/nug-model-refresh-coordinator";
 import { applyNugModelCatalogUpdate } from "../lib/nug-model-sync";
 import {
 	type NUGProviderConfig,
@@ -712,6 +716,24 @@ nugRoutes.post("/models/refresh", async (c) => {
 		models: getActiveNugCachedModels(),
 		fromCache: false,
 		modelContextWindows: settings.agent.modelContextWindows ?? {},
+	});
+});
+
+/**
+ * Opportunistic refresh used when a model picker opens.
+ *
+ * Unlike `/models/refresh` (an explicit user action that always hits upstream),
+ * this is rate-limited by a process-wide cooldown so every tab, panel and user
+ * opening a picker cannot multiply into upstream traffic. The response carries
+ * only status/counters — clients re-read the catalog from `/api/settings`, which
+ * keeps this endpoint off the "list APIs must not return big fields" path.
+ */
+nugRoutes.post("/models/refresh-if-stale", async (c) => {
+	const results = await nugModelRefreshCoordinator.refreshAllIfStale(settings.nugProviders ?? []);
+	return c.json({
+		results,
+		refreshed: results.some((r) => r.attempted && !r.error),
+		cooldownMs: NUG_MODEL_REFRESH_COOLDOWN_MS,
 	});
 });
 

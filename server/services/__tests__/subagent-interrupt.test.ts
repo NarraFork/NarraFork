@@ -30,8 +30,11 @@ const {
 	MAX_SUBAGENT_INTERRUPTION_RETRIES,
 	planSubagentInterruption,
 	pushSubagentBufferedMessage,
+	removeSubagentBufferedMessage,
+	reorderSubagentBufferedMessages,
 	requestSubagentBufferedMessageSoftStop,
 	shouldStopSubagentForBufferedMessage,
+	updateSubagentBufferedMessage,
 } = await import("../subagent-executor");
 
 const SUBAGENT_ID = "subagent-interrupt-test";
@@ -160,7 +163,77 @@ describe("foreground subagent interrupt semantics", () => {
 
 		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
 	});
+});
 
+/**
+ * Single-message queue mutations, as reached by DELETE/PATCH /:id/buffer/:mid and
+ * the remove_buffer/update_buffer WS frames.
+ *
+ * Regression: those routes only knew about the primary-narrator queue, which
+ * lives in a different map. A queued message on a taken-over subagent could not
+ * be removed at all — the route 404'd and the frontend rolled its optimistic
+ * removal back, so the card looked stuck.
+ */
+describe("subagent buffer single-message mutations", () => {
+	test("removing the last queued message also drops the soft-stop request", () => {
+		const queued = pushSubagentBufferedMessage(SUBAGENT_ID, "only");
+		requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
+
+		expect(removeSubagentBufferedMessage(SUBAGENT_ID, queued.id)).toBe(true);
+
+		expect(getSubagentBufferedMessages(SUBAGENT_ID)).toEqual([]);
+		// A stale soft stop would end the next turn with nothing left to resume.
+		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+	});
+
+	test("removing one of several messages keeps the rest and the soft stop", () => {
+		const first = pushSubagentBufferedMessage(SUBAGENT_ID, "first");
+		pushSubagentBufferedMessage(SUBAGENT_ID, "second");
+		requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
+
+		expect(removeSubagentBufferedMessage(SUBAGENT_ID, first.id)).toBe(true);
+
+		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual(["second"]);
+		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
+	});
+
+	test("unknown ids report a miss so the caller can fall back to the primary queue", () => {
+		pushSubagentBufferedMessage(SUBAGENT_ID, "queued");
+
+		expect(removeSubagentBufferedMessage(SUBAGENT_ID, "no-such-id")).toBe(false);
+		expect(updateSubagentBufferedMessage(SUBAGENT_ID, "no-such-id", "edited")).toBe(false);
+		expect(removeSubagentBufferedMessage("no-such-subagent", "no-such-id")).toBe(false);
+	});
+
+	test("editing a queued message replaces its text", () => {
+		const queued = pushSubagentBufferedMessage(SUBAGENT_ID, "before");
+
+		expect(updateSubagentBufferedMessage(SUBAGENT_ID, queued.id, "after")).toBe(true);
+
+		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual(["after"]);
+	});
+
+	test("reorder applies an exact permutation and rejects a mismatched id list", () => {
+		const first = pushSubagentBufferedMessage(SUBAGENT_ID, "first");
+		const second = pushSubagentBufferedMessage(SUBAGENT_ID, "second");
+
+		expect(reorderSubagentBufferedMessages(SUBAGENT_ID, [second.id, first.id])).toBe(true);
+		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual([
+			"second",
+			"first",
+		]);
+
+		// A partial or foreign id list must leave the queue untouched.
+		expect(reorderSubagentBufferedMessages(SUBAGENT_ID, [first.id])).toBe(false);
+		expect(reorderSubagentBufferedMessages(SUBAGENT_ID, [second.id, "foreign"])).toBe(false);
+		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual([
+			"second",
+			"first",
+		]);
+	});
+});
+
+describe("foreground subagent interrupt controls", () => {
 	test("soft interrupt aborts the foreground controller without marking a hard interrupt", () => {
 		const ctrl = new AbortController();
 		getForegroundAbortControllers().set(SUBAGENT_ID, ctrl);

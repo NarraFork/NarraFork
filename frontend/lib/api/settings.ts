@@ -129,6 +129,22 @@ export const settingsApi = {
 				body: JSON.stringify({ providerId }),
 			},
 		),
+	/**
+	 * Turn off the native image_generation tool for the provider behind `model`
+	 * (a prefix or a full `prefix:model` reference). The server resolves whether
+	 * that is the built-in Codex adapter or a custom API provider.
+	 */
+	disableCodexImageGeneration: (model: string) =>
+		request<{
+			ok: boolean;
+			target: "builtin-codex" | "custom-api-provider";
+			prefix: string;
+			providerName: string;
+			changed: boolean;
+		}>("/settings/disable-codex-image-generation", {
+			method: "POST",
+			body: JSON.stringify({ model }),
+		}),
 	testModel: (model: string, prompt: string) =>
 		request<ModelTestResponse>("/settings/test-model", {
 			method: "POST",

@@ -350,6 +350,10 @@ function tCommon(key: string, fallback: string, options?: Record<string, unknown
 function hasEncryptedReasoningMetadata(block: Record<string, unknown>): boolean {
 	const providerMetadata = block.providerMetadata;
 	if (!providerMetadata || typeof providerMetadata !== "object") return false;
+	// Accept the PROJECTED flag as well, matching the shared implementation in
+	// shared/pretext-layout/reasoning-segments.ts: a read response may have had its
+	// (undisplayable) replay metadata stripped down to this presence bit.
+	if ((providerMetadata as Record<string, unknown>).hasEncryptedReasoning === true) return true;
 	return Object.values(providerMetadata as Record<string, unknown>).some((metadata) => {
 		if (!metadata || typeof metadata !== "object") return false;
 		const encrypted = (metadata as Record<string, unknown>).reasoningEncryptedContent;

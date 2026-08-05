@@ -45,6 +45,7 @@ interface OAuthClientPolicy extends Record<string, unknown> {
 	maxDangerReflectionPromptChars: number;
 	allowRobotDiagnosticPreset: boolean;
 	deviceAccess: DeviceAccessPolicy;
+	messageDetail: "none" | "summary" | "full";
 }
 
 const DEFAULT_POLICY: OAuthClientPolicy = {
@@ -64,6 +65,9 @@ const DEFAULT_POLICY: OAuthClientPolicy = {
 	// NarraFork host is a separate, higher-risk group that defaults to denied but remains
 	// individually configurable.
 	deviceAccess: { host: "denied", global: "readWrite", selfRegistered: "readWrite" },
+	// Structural message reads follow the user's consent to `message.summary.read`;
+	// only payload disclosure ("full") needs an administrator decision.
+	messageDetail: "summary",
 };
 
 interface PortableManifest extends Record<string, unknown> {
@@ -295,6 +299,7 @@ describe("oauth-apps admin CRUD", () => {
 			maxDangerReflectionPromptChars: 2048,
 			allowRobotDiagnosticPreset: true,
 			deviceAccess: { host: "readOnly", global: "readWrite", selfRegistered: "readWrite" },
+			messageDetail: "full",
 		};
 
 		const createRes = await app.request("/api/oauth-apps", {
@@ -322,6 +327,7 @@ describe("oauth-apps admin CRUD", () => {
 					maxSystemPromptChars: 1000,
 					allowKnowledgeWrite: false,
 					deviceAccess: { host: "denied", global: "readWrite", selfRegistered: "readOnly" },
+					messageDetail: "summary",
 				},
 			}),
 		});
@@ -333,6 +339,7 @@ describe("oauth-apps admin CRUD", () => {
 			maxSystemPromptChars: 1000,
 			allowKnowledgeWrite: false,
 			deviceAccess: { host: "denied", global: "readWrite", selfRegistered: "readOnly" },
+			messageDetail: "summary",
 		});
 
 		// bypassPermissions is now a legal external mode (risky calls route into the danger

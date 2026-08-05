@@ -51,7 +51,22 @@ export type ExternalNarratorServerMessage =
 	| { type: "ready"; version: 1; maxSubscriptions: number }
 	| { type: "subscribed"; narratorIds: string[]; requestId?: string }
 	| { type: "unsubscribed"; narratorIds: string[]; requestId?: string }
-	| { type: "narrator_changed"; narratorId: string; requestId?: string }
+	/**
+	 * Something about the narrator changed; the client re-reads over REST.
+	 *
+	 * `documentRevision` is present ONLY on a `sync_check` reply, never on a pushed
+	 * frame. It mirrors `narrators.message_version`, the same value the REST message
+	 * page returns, so a client can compare it against the revision it already holds
+	 * and skip re-reading a page that cannot have changed — a meaningful saving at
+	 * the `full` detail tier, where a page build joins tool rows and projects
+	 * payloads.
+	 *
+	 * It is deliberately absent from pushed frames: the domain event that produces
+	 * them carries no version, so filling the field would mean one indexed read per
+	 * subscriber per event on the fan-out path. A pushed frame stays a pure signal;
+	 * a client that wants the cheap check asks for it with `sync_check`.
+	 */
+	| { type: "narrator_changed"; narratorId: string; documentRevision?: number; requestId?: string }
 	/**
 	 * A tool call reached a terminal state. Bounded metadata only: tool input/output are never sent.
 	 * Best-effort — grants without the tool topic simply never receive this frame.

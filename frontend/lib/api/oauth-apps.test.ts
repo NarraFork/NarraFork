@@ -13,6 +13,8 @@ describe("OAuth app canonical scopes", () => {
 			"narrator.provision",
 			"narrator.send_message",
 			"narrator.interrupt",
+			"message.summary.read",
+			"message.content.read",
 		]);
 		expect(new Set(OAUTH_APP_AVAILABLE_SCOPES).size).toBe(OAUTH_APP_AVAILABLE_SCOPES.length);
 		expect(OAUTH_APP_AVAILABLE_SCOPES.every((scope) => scope.includes("."))).toBe(true);
@@ -31,6 +33,8 @@ describe("OAuth app policy defaults", () => {
 			allowGlobalDevice: false,
 			allowKnowledgeWrite: false,
 			deviceAccess: { host: "denied", global: "readWrite", selfRegistered: "readWrite" },
+			// Structure is readable once consented; payload disclosure needs "full".
+			messageDetail: "summary",
 		});
 	});
 

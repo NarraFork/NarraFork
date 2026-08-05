@@ -54,6 +54,8 @@ export interface BuildPretextDocumentLayoutOptions {
 	resolveToolSummary?: (tc: unknown) => string;
 	/** Label detail for a subagent recent-call row (tool name + projected input keys). */
 	resolveSubagentRecentSummary?: (toolName: string, inputSummary: unknown) => string | null;
+	/** Whether an error card may offer the provider fix (a measured button row). */
+	canOfferProviderFix?: (errorText: string) => boolean;
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
 	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
 	/** Full (un-truncated) tool payloads once the shell has fetched them. */

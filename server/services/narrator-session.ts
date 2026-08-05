@@ -211,9 +211,11 @@ import {
 	activeNarrators,
 	activeSubagentSettings,
 	bufferedMessages,
+	claimNarratorRuntime,
 	clearActiveHistoryCompactPending,
 	compactLocks,
 	hasPendingHistoryCompact,
+	isNarratorRuntimeBusy,
 	knowledgeInjectionCycleStates,
 	narratorCreationLocks,
 	pendingFeedback,
@@ -298,6 +300,11 @@ export function registerPlannedUpdateRecoveryController(
 		interruptForegroundSubagents: options.interruptForegroundSubagents ?? false,
 	};
 	plannedUpdateRecoveryControls.set(narratorId, control);
+	// These recovery stages drive a narrator with NO activeNarrators entry, yet they
+	// legitimately hold it in `working`. Claim the runtime for the registration's
+	// lifetime so the zombie-status reconcile does not mistake that for an orphaned
+	// row and flip a genuinely busy narrator back to idle mid-recovery.
+	const releaseRuntimeClaim = claimNarratorRuntime(narratorId, token);
 	const finalizeInterrupt = (): Promise<void> => {
 		if (control.interruptFinalizer) return control.interruptFinalizer;
 		const current = plannedUpdateRecoveryControls.get(narratorId);
@@ -309,6 +316,7 @@ export function registerPlannedUpdateRecoveryController(
 		token,
 		finalizeInterrupt,
 		unregister: () => {
+			releaseRuntimeClaim();
 			if (plannedUpdateRecoveryControls.get(narratorId)?.token === token) {
 				plannedUpdateRecoveryControls.delete(narratorId);
 			}
@@ -6890,32 +6898,68 @@ export function isLoopRunning(narratorId: string): boolean {
 }
 
 /**
- * Reconcile a stale narrator status: when a loop is actually running in memory
- * but the DB status wrongly shows a non-running state (idle/archived), flip it
- * back to "working" and broadcast.
+ * Reconcile a narrator status that disagrees with the in-memory runtime, in
+ * either direction. Returns true only when an actual correction was made.
  *
  * This is called from every path that buffers or rejects a user action because
- * a loop is already running. Without it, a stale idle status would leave the
- * user stuck — the frontend hides the interrupt button when status is idle, so
- * the user could neither continue (blocked) nor stop (no button).
+ * the narrator looks busy. Without it a lying status leaves the user stuck.
  *
- * CAS only matches ["idle", "archived"]: it never overwrites a legitimate
- * waiting/reflecting state, and is a no-op when status is already working. The
- * transition clears stale substatus tags (unread/error) by design — the
- * narrator is in fact running, so those tags no longer apply.
+ * Forward (idle/archived → working): a loop IS running but the DB says it is
+ * not. The frontend hides the interrupt button when status is idle, so the user
+ * could neither continue (blocked) nor stop (no button). CAS only matches
+ * ["idle", "archived"], so a legitimate waiting/reflecting state is never
+ * overwritten. Clearing stale unread/error tags is intended here — the narrator
+ * really is running, so those tags no longer apply.
  *
- * Returns true only when an actual correction was made.
+ * Reverse (working/waiting → idle): the DB claims running work but no runtime
+ * owner exists — no loop, no permission or reflection pause, no registered
+ * runtime claim. Such a row is a zombie: it outlived its writer, and every
+ * admission check keyed on DB status ("Cannot continue…", "Cannot recover
+ * subagents…") rejects the user forever while offering no way out.
+ *
+ * The reverse direction is what makes the status self-healing rather than
+ * one-way, and it is deliberately conservative:
+ * - `isNarratorRuntimeBusy` covers loop-less owners (recovery stages, the
+ *   recovery Await batch) that legitimately hold a running status, so their work
+ *   is never mistaken for a zombie;
+ * - the substatus is carried over unchanged instead of being reset, because the
+ *   reason the narrator stopped (`error`, `interrupted`) is exactly what the
+ *   recovery UI keys on. Passing `[]` here would erase the error tag and hide
+ *   the recovery card. Turn-timing tags are normalized by the status writer.
  */
 export async function reconcileRunningStatus(narratorId: string): Promise<boolean> {
-	if (!isLoopRunning(narratorId)) return false;
+	if (isLoopRunning(narratorId)) {
+		const changed = await narratorService.compareAndSetStatus(
+			narratorId,
+			["idle", "archived"],
+			"working",
+		);
+		if (changed) {
+			logger.warn("Reconciled stale narrator status → working (loop was actually running)", {
+				narratorId,
+			});
+		}
+		return changed;
+	}
+
+	if (isNarratorRuntimeBusy(narratorId)) return false;
+
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { status: true, substatus: true },
+	});
+	if (narrator?.status !== "working" && narrator?.status !== "waiting") return false;
+
 	const changed = await narratorService.compareAndSetStatus(
 		narratorId,
-		["idle", "archived"],
-		"working",
+		["working", "waiting"],
+		"idle",
+		{ substatus: parseSubstatus(narrator.substatus) },
 	);
 	if (changed) {
-		logger.warn("Reconciled stale narrator status → working (loop was actually running)", {
+		logger.warn("Reconciled zombie narrator status → idle (no runtime owner)", {
 			narratorId,
+			previousStatus: narrator.status,
 		});
 	}
 	return changed;

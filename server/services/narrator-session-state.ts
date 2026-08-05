@@ -584,6 +584,73 @@ export const planModeAskedOnce = hotSafe<Set<string>>(
 	() => new Set(),
 );
 
+/**
+ * Extra owners of a narrator's `working`/`waiting` status that are NOT an agent loop.
+ *
+ * Some parent-side work runs with no `activeNarrators` entry at all (subagent
+ * recovery stages, the recovery Await batch, planned-update recovery). Those
+ * legitimately hold the narrator in a running status, so a busy check based only
+ * on `_loopRunning` would wrongly declare them idle. They register here for the
+ * duration of that work.
+ */
+const narratorRuntimeClaims = hotSafe<Map<string, Set<string>>>(
+	"narrafork.narratorRuntimeClaims",
+	() => new Map(),
+);
+
+/**
+ * Claim a narrator as busy for non-loop parent-side work. Returns a release
+ * function; releasing a claim that was already released is a no-op.
+ */
+export function claimNarratorRuntime(narratorId: string, token: string): () => void {
+	const claims = narratorRuntimeClaims.get(narratorId) ?? new Set<string>();
+	claims.add(token);
+	narratorRuntimeClaims.set(narratorId, claims);
+	return () => {
+		const current = narratorRuntimeClaims.get(narratorId);
+		if (!current) return;
+		current.delete(token);
+		if (current.size === 0) narratorRuntimeClaims.delete(narratorId);
+	};
+}
+
+export function hasNarratorRuntimeClaim(narratorId: string): boolean {
+	return (narratorRuntimeClaims.get(narratorId)?.size ?? 0) > 0;
+}
+
+/**
+ * Whether this narrator legitimately owns a `working`/`waiting` DB status right now.
+ *
+ * This is the authoritative in-memory answer to "is this narrator actually busy",
+ * and it is deliberately broader than `_loopRunning`:
+ * - a live agent loop (`activeNarrators` + `_loopRunning`);
+ * - a permission or danger reflection awaiting a decision, which suspends the
+ *   loop but keeps the turn alive;
+ * - a registered runtime claim for loop-less parent-side work.
+ *
+ * Two consumers depend on it:
+ * - status mirroring for a subagent's permission gates, which must never promote
+ *   an idle parent into a fake running state;
+ * - the reverse reconcile in `reconcileRunningStatus`, which repairs a DB status
+ *   that outlived every runtime owner.
+ *
+ * Only pending entries OWNED by this narrator count. An entry whose
+ * `broadcastTargetId` merely points here belongs to a subagent, and a subagent's
+ * pause is not the parent's work.
+ */
+export function isNarratorRuntimeBusy(narratorId: string): boolean {
+	const active = activeNarrators.get(narratorId);
+	if (active?.alive === true && active._loopRunning === true) return true;
+	if (hasNarratorRuntimeClaim(narratorId)) return true;
+	for (const pending of pendingPermissions.values()) {
+		if (pending.narratorId === narratorId) return true;
+	}
+	for (const pause of pendingDangerReflections.values()) {
+		if (pause.narratorId === narratorId) return true;
+	}
+	return false;
+}
+
 export const bufferedMessages = hotSafe<Map<string, BufferedMessage[]>>(
 	"narrafork.bufferedMessages",
 	() => new Map(),

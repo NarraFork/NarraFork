@@ -28,11 +28,12 @@ describe("vlist inline editing wiring", () => {
 	it("treats the editing row as dynamic so its real height overrides the arithmetic one", () => {
 		// dynamicRowKeys gates which keys may hold a height override.
 		expect(SHELL).toMatch(/if \(editingRow\) keys\.add\(editingRow\.key\)/);
-		// The row must receive a height reporter when it hosts the editor. Other
-		// slot-hosting rows (permission form, the live ask-in-passing form) join the
-		// same disjunction, so the assertion pins the editor's term rather than the
-		// full expression.
-		expect(SHELL).toMatch(/const isDynamicRow =[\s\S]{0,200}?editorSlot !== undefined/);
+		// The row must receive a height reporter when it hosts the editor. That is now
+		// derived from the SAME set, rather than a parallel disjunction of slots: the
+		// set decides which keys may hold an override and the row decides which rows
+		// report one, so any divergence left a row either clipped with no way to
+		// report or reporting into a set that pruned it away.
+		expect(SHELL).toMatch(/const isDynamicRow = dynamicRowKeys\.has\(item\.spec\.key\)/);
 		expect(SHELL).toMatch(
 			/isDynamicRow \? getUnknownHeightReporter\(item\.spec\.key\) : undefined/,
 		);

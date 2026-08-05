@@ -27,7 +27,16 @@ import { generateId } from "./id";
 import { logger } from "./logger";
 import { recordOAuthSecurityEvent } from "./oauth-security-observability";
 
-/** Canonical scopes exposed by the OAuth provider and External API v1. */
+/**
+ * Canonical scopes exposed by the OAuth provider and External API v1.
+ *
+ * `message.summary.read` / `message.content.read` gate the layered message
+ * projection (see shared/external/message-detail.ts). They are separate from
+ * `narrator.read` because that scope only authorizes narrator STATE plus the
+ * legacy bounded plain-text projection; reading a narrator's structure (tool
+ * identity, reasoning steps) and especially tool payloads is a distinctly
+ * larger disclosure, so consent has to name it.
+ */
 export const OAUTH_EXTERNAL_V1_SCOPES = [
 	"project.read",
 	"device.read",
@@ -38,6 +47,8 @@ export const OAUTH_EXTERNAL_V1_SCOPES = [
 	"narrator.provision",
 	"narrator.send_message",
 	"narrator.interrupt",
+	"message.summary.read",
+	"message.content.read",
 ] as const;
 
 /** Scopes the provider currently understands. Unknown scopes are rejected. */

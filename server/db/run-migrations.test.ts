@@ -928,3 +928,188 @@ describe("fast_mode_override backfill (real migration replay)", () => {
 		expect(overrideOf(sqlite, "narrator-fast")).toBe("inherit");
 	});
 });
+
+/**
+ * A machine that developed NarraFork from source and then upgraded to a release binary carries
+ * a database whose schema already advanced past migrations whose hashes were never recorded
+ * (locally generated migrations hash differently from the released SQL files). Replaying such a
+ * migration re-runs its `DROP INDEX` / `DROP COLUMN` against a target the earlier local run
+ * already removed. That used to abort startup with `no such index: ...`.
+ */
+describe("already-satisfied drop tolerance (source-built upgrade holes)", () => {
+	const tempFolders: string[] = [];
+
+	afterEach(() => {
+		for (const folder of tempFolders.splice(0)) rmSync(folder, { recursive: true, force: true });
+	});
+
+	function migrationsFolderWith(tag: string, statements: readonly string[]): string {
+		const root = mkdtempSync(join(tmpdir(), "narrafork-drop-tolerance-"));
+		tempFolders.push(root);
+		const folder = join(root, "drizzle");
+		mkdirSync(join(folder, "meta"), { recursive: true });
+		writeFileSync(
+			join(folder, "meta", "_journal.json"),
+			JSON.stringify({
+				version: "7",
+				dialect: "sqlite",
+				entries: [{ idx: 0, version: "6", when: 1_700_000_000_000, tag, breakpoints: true }],
+			}),
+		);
+		writeFileSync(join(folder, `${tag}.sql`), statements.join("\n--> statement-breakpoint\n"));
+		return folder;
+	}
+
+	function stampedHashes(database: Database): number {
+		return (
+			database.prepare("SELECT COUNT(*) AS count FROM __drizzle_migrations").get() as {
+				count: number;
+			}
+		).count;
+	}
+
+	function columnNames(database: Database, table: string): string[] {
+		return (database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+			(row) => row.name,
+		);
+	}
+
+	// folderMillis of 0103_redundant_valkyrie — the migration from the reported incident: it
+	// drops idx_blacklist_cmds_narrator_pattern and replaces it with two partial indexes.
+	const BLACKLIST_PARTIAL_INDEX_WHEN = 1785508212529;
+
+	test("heals the reported incident: replaying 0103 when its dropped index is already gone", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+
+		// The dev machine's state: schema fully advanced, but 0103's hash absent.
+		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [
+			BLACKLIST_PARTIAL_INDEX_WHEN,
+		]);
+
+		await runMigrations(sqlite);
+
+		// The replacement partial indexes survive; the legacy index stays gone.
+		const indexes = (
+			sqlite
+				.prepare(
+					"SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='narrator_blacklist_cmds' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+				)
+				.all() as Array<{ name: string }>
+		).map((row) => row.name);
+		expect(indexes).toEqual([
+			"idx_blacklist_cmds_narrator",
+			"idx_blacklist_cmds_narrator_pattern_scoped",
+			"idx_blacklist_cmds_narrator_pattern_unscoped",
+		]);
+	});
+
+	test("replays the entire journal against an already-final schema without failing", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+
+		// Worst case for a source-built machine: not a single recorded hash matches the
+		// released files, so every migration is replayed against its own end state.
+		sqlite.run("DELETE FROM __drizzle_migrations");
+
+		await runMigrations(sqlite);
+
+		expect(stampedHashes(sqlite)).toBeGreaterThan(0);
+		expect(
+			sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='narrators'").get(),
+		).toBeTruthy();
+	});
+
+	test("skips a DROP INDEX whose index is already absent and keeps going", () => {
+		sqlite = new Database(":memory:");
+		sqlite.run("CREATE TABLE t (id text PRIMARY KEY NOT NULL, payload text)");
+		const folder = migrationsFolderWith("0000_drop_absent_index", [
+			"DROP INDEX `idx_already_gone`;",
+			"CREATE INDEX `idx_t_payload` ON `t` (`payload`);",
+		]);
+
+		applyPendingMigrationsByHash(sqlite, folder);
+
+		expect(
+			sqlite
+				.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?")
+				.get("idx_t_payload"),
+		).toBeTruthy();
+		expect(stampedHashes(sqlite)).toBe(1);
+	});
+
+	test("skips a DROP COLUMN whose column is already absent, preserving rows", () => {
+		sqlite = new Database(":memory:");
+		sqlite.run("CREATE TABLE t (id text PRIMARY KEY NOT NULL, keep text)");
+		sqlite.run("INSERT INTO t (id, keep) VALUES ('row-1', 'keep-me')");
+		const folder = migrationsFolderWith("0000_drop_absent_column", [
+			"ALTER TABLE `t` DROP COLUMN `already_gone`;",
+			"ALTER TABLE `t` ADD `added` text;",
+		]);
+
+		applyPendingMigrationsByHash(sqlite, folder);
+
+		expect(columnNames(sqlite, "t")).toEqual(["id", "keep", "added"]);
+		expect(
+			(sqlite.prepare("SELECT keep FROM t WHERE id = 'row-1'").get() as { keep: string }).keep,
+		).toBe("keep-me");
+		expect(stampedHashes(sqlite)).toBe(1);
+	});
+
+	test("does not forgive a missing column for a statement that is not a column drop", () => {
+		sqlite = new Database(":memory:");
+		sqlite.run("CREATE TABLE t (id text PRIMARY KEY NOT NULL)");
+		// `CREATE INDEX` on an absent column also reports "no such column"; tolerating it
+		// would leave the database silently missing an index the migration promised.
+		const folder = migrationsFolderWith("0000_index_on_absent_column", [
+			"CREATE INDEX `idx_absent_col` ON `t` (`gone`);",
+		]);
+
+		expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow(
+			/no such column/i,
+		);
+		expect(stampedHashes(sqlite)).toBe(0);
+	});
+
+	test("does not forgive a DROP COLUMN whose table is missing entirely", () => {
+		sqlite = new Database(":memory:");
+		const folder = migrationsFolderWith("0000_drop_column_absent_table", [
+			"ALTER TABLE `never_created` DROP COLUMN `whatever`;",
+		]);
+
+		expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow();
+		expect(stampedHashes(sqlite)).toBe(0);
+	});
+
+	test("does not forgive a DROP COLUMN when the reported column is a different one", () => {
+		sqlite = new Database(":memory:");
+		sqlite.run("CREATE TABLE t (id text PRIMARY KEY NOT NULL, present text)");
+		// SQLite refuses to drop the last remaining PK-bearing column etc.; more importantly a
+		// mismatch between the reported name and the statement's target must stay fatal.
+		const folder = migrationsFolderWith("0000_drop_column_mismatch", [
+			"CREATE TRIGGER `tr` AFTER INSERT ON `t` BEGIN SELECT `absent_col` FROM `t`; END;",
+			"ALTER TABLE `t` DROP COLUMN `present`;",
+		]);
+
+		expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow(
+			/no such column/i,
+		);
+		expect(columnNames(sqlite, "t")).toEqual(["id", "present"]);
+		expect(stampedHashes(sqlite)).toBe(0);
+	});
+
+	test("still drops an index that really exists", () => {
+		sqlite = new Database(":memory:");
+		sqlite.run("CREATE TABLE t (id text PRIMARY KEY NOT NULL, payload text)");
+		sqlite.run("CREATE INDEX `idx_t_payload` ON `t` (`payload`)");
+		const folder = migrationsFolderWith("0000_drop_present_index", ["DROP INDEX `idx_t_payload`;"]);
+
+		applyPendingMigrationsByHash(sqlite, folder);
+
+		expect(
+			sqlite
+				.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?")
+				.get("idx_t_payload"),
+		).toBeNull();
+	});
+});

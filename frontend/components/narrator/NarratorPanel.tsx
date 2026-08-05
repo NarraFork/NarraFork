@@ -195,6 +195,7 @@ import {
 import { formatLocaleNumber } from "../../lib/intl-format";
 import { resolveNarratorVirtualListEnabled } from "../../lib/narrator-virtual-list";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
 import { formatRevertWarning, formatRevertWarnings } from "../../lib/revert-warnings";
 import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
@@ -225,6 +226,11 @@ import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
+import {
+	hasComposerAttachments,
+	hasComposerText,
+	hasSendableComposerContent,
+} from "./composer-send-gate";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import {
 	clearDraftImageAttachments,
@@ -2559,6 +2565,17 @@ export function NarratorPanel({
 		},
 		[qc, t],
 	);
+	// Opening the picker also kicks off an opportunistic catalog refresh, so a
+	// model that recovered upstream stops showing as "temporarily unavailable"
+	// without the user having to find the per-provider refresh button. The real
+	// rate limit is a process-wide cooldown on the server; `requestNugModelRefresh…`
+	// only avoids redundant round-trips from this tab.
+	const handleModelPickerOpened = useCallback(() => {
+		void requestNugModelRefreshOnPickerOpen().then((refreshed) => {
+			if (refreshed) qc.invalidateQueries({ queryKey: ["settings"] });
+		});
+	}, [qc]);
+	const hasNugModelGroups = Object.keys(nugProviderIdByPrefix).length > 0;
 	const modelMenuRefreshProps = canRefreshNugModels
 		? {
 				nugProviderIdByPrefix,
@@ -2566,6 +2583,8 @@ export function NarratorPanel({
 					void handleRefreshNugModels(providerId);
 				},
 				refreshingProviderId: refreshingNugProviderId,
+				// No NUG gateway in the picker → nothing to refresh, so don't even ask.
+				...(hasNugModelGroups ? { onPickerOpened: handleModelPickerOpened } : {}),
 			}
 		: {};
 	const dangerReflectionGlobalLevel = normalizeDangerReflectionLevel(
@@ -4319,6 +4338,22 @@ export function NarratorPanel({
 	// running and not already taken over.
 	const isTakenOver = isSubagent && substatus.includes("taken_over");
 	const canTakeover = isSubagent && isActive && !isTakenOver && retryRecoveryAllowsInterrupt;
+	/**
+	 * Whether the composer may offer the cut-in (priority queue) action.
+	 *
+	 * Cutting in means "stop at the next safe tool boundary and take my message
+	 * first", which the server implements by pairing the queued message with a soft
+	 * stop. A taken-over subagent is deliberately excluded from that: the user is
+	 * driving it, so `POST /:id/messages` queues their input with
+	 * `requestSoftStop: false` rather than interrupting the user's own turn. The
+	 * cut-in label and its hold gesture would promise something the server refuses
+	 * to do, so a taken-over subagent gets the ordinary send button instead — the
+	 * message still queues (202) and runs as the next turn.
+	 *
+	 * This is most visible during the takeover "settling" window, where the
+	 * taken_over tag is already written but the DB status is still working.
+	 */
+	const canCutInLine = isActive && !isTakenOver;
 	const hasPlanTrait = Array.isArray(narrator?.traits)
 		? narrator.traits.includes("plan")
 		: !!narrator?.planMode;
@@ -4569,10 +4604,20 @@ export function NarratorPanel({
 		[setFileModDrawerOpened],
 	);
 
-	// True when the main input is empty and there's a non-question pending permission.
-	// Used to show Enter-key hints on permission buttons via PermEnterHintCtx.
+	// What the composer currently holds. Attachments count as content, so an
+	// image-only draft behaves like a typed one everywhere below.
+	const composerContent = {
+		text: input,
+		imageCount: attachedImages.length,
+		textFileCount: attachedTextFiles.length,
+	};
+
+	// True when the composer carries nothing to send and there's a non-question pending
+	// permission. Used to show Enter-key hints on permission buttons via PermEnterHintCtx.
+	// A staged attachment keeps Enter bound to sending it rather than silently approving
+	// the permission.
 	const permHintActive =
-		!input.trim() &&
+		!hasSendableComposerContent(composerContent) &&
 		!!renderPermCb.pendingPermission &&
 		renderPermCb.pendingPermission.toolName !== "AskUserQuestion";
 
@@ -5818,9 +5863,11 @@ export function NarratorPanel({
 	 */
 	const handleSendWithMode = async (mode: "turn" | "tool" | "interrupt") => {
 		const msg = input.trim();
-		if (!msg || sendingRef.current) return;
-		sendingRef.current = true;
 		const attachmentCount = attachedImages.length + attachedTextFiles.length;
+		// An attachment-only message is a valid turn: images (and text files) carry the
+		// content by themselves, so an empty textarea must not block the send.
+		if (!hasSendableComposerContent(composerContent) || sendingRef.current) return;
+		sendingRef.current = true;
 		lastProgressPercentRef.current = -1;
 		const abortController = new AbortController();
 		sendAbortRef.current = abortController;
@@ -5898,6 +5945,14 @@ export function NarratorPanel({
 				// and never use the generic interrupt route (which hard-stops subagents).
 				if (isSubagent && !isTakenOver) {
 					await doSendBuffered(msg, true, abortController.signal);
+					return;
+				}
+				// A taken-over subagent queues without a soft stop, so the "interrupt"
+				// mode's follow-up interrupt has nothing to hand over — and the generic
+				// interrupt route hard-stops subagents, which would end the takeover.
+				// Queue plainly; the runner drains the message when the turn suspends.
+				if (isSubagent) {
+					await doSendBuffered(msg, mode !== "turn", abortController.signal);
 					return;
 				}
 				if (mode === "turn") {
@@ -6298,10 +6353,18 @@ export function NarratorPanel({
 		if (mentionPopoverVisible && e.key !== "Enter") return;
 
 		if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-			// Permission shortcut: when input is empty and a permission is pending,
-			// the global keydown handler (useEffect above) handles Enter.
-			// preventDefault here to stop the textarea from inserting a newline.
-			if (effectiveFocusIndex != null && !input.trim() && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+			// Permission shortcut: when the composer holds nothing to send and a
+			// permission is pending, the global keydown handler (useEffect above)
+			// handles Enter. preventDefault here to stop the textarea from inserting
+			// a newline. `effectiveFocusIndex` already accounts for staged
+			// attachments, so an image-only draft falls through to the send below.
+			if (
+				effectiveFocusIndex != null &&
+				!hasSendableComposerContent(composerContent) &&
+				!e.shiftKey &&
+				!e.ctrlKey &&
+				!e.metaKey
+			) {
 				e.preventDefault();
 				return; // action handled by global handler
 			}
@@ -9019,8 +9082,8 @@ export function NarratorPanel({
 									/>
 								</Box>
 								{(() => {
-									const hasInput = !!input.trim();
-									const hasAttachments = attachedImages.length > 0 || attachedTextFiles.length > 0;
+									const hasInput = hasComposerText(composerContent);
+									const hasAttachments = hasComposerAttachments(composerContent);
 
 									// Takeover button: shown while a subagent is running and not yet
 									// taken over. Clicking it interrupts the current turn and hands
@@ -9148,7 +9211,7 @@ export function NarratorPanel({
 												</Button>,
 											);
 										}
-										return isActive
+										return canCutInLine
 											? withSendOptions(
 													<Tooltip
 														label={t("queueButtonPressHint", {

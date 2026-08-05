@@ -210,8 +210,12 @@ Content-Type: application/x-www-form-urlencoded
 | `narrator.provision` | 幂等创建独立叙述者 |
 | `narrator.send_message` | 向叙述者发送纯文本消息 |
 | `narrator.interrupt` | 中断叙述者运行 |
+| `message.summary.read` | 读取分层消息投影的 `skeleton` / `summary` 层（消息结构、推理步骤标题、工具身份/目标/状态） |
+| `message.content.read` | 追加 `full` 层（推理正文、工具 input/output）与单工具下钻端点 |
 
 新建 OAuth 应用时，管理 UI 默认选择这些细粒度 scope。
+
+`message.*` 与 `narrator.read` 是两件不同的事：`narrator.read` 只授权叙述者状态和既有的有界纯文本投影；读取叙述者的**结构**（工具身份、推理步骤），尤其是工具 payload，是明显更大的披露，必须在同意页单独出现。详见 §7.6。
 
 ---
 
@@ -232,6 +236,9 @@ Content-Type: application/x-www-form-urlencoded
 | `allowDangerReflectionPrompt` | 客户端是否可提供 danger reflection 附加提示词 | `false` |
 | `maxDangerReflectionPromptChars` | danger reflection 附加提示词最大字符数 | `0` |
 | `allowRobotDiagnosticPreset` | 是否将服务端定义的机器人诊断只读预设合并到该客户端的 allow-list | `false` |
+| `messageDetail` | 分层消息投影的层级上限：`none` / `summary` / `full`（见 §7.6） | `summary` |
+
+**为什么 `messageDetail` 默认不是最严值：** 本表其它上限守护的都是**有副作用的动作**（在设备上执行、放宽提示词、写知识库），默认关闭对管理员零成本。而这一项守护的是一次**读取**，且客户端已经必须取得 `message.summary.read` 的用户同意；若再默认关闭，就等于让同一个已获批准的能力需要两次独立开闸。真正值得第二次决策的是 payload 披露，所以 `full` 是管理员必须显式选择的值。
 
 ### 6.2 设备访问模型（`deviceAccess`）
 
@@ -313,8 +320,9 @@ Base URL 从 discovery 的 `narrafork_external_api.base_url` 获取。
 | `POST /devices/:id/credentials/rotate` | `device.rotate` | 轮换设备凭证 |
 | `PUT /narrators/provisions/:provisionKey` | `narrator.provision` | 幂等创建叙述者 |
 | `GET /narrators/:id` | `narrator.read` | 读取叙述者状态 |
-| `GET /narrators/:id/messages` | `narrator.read` | 游标分页读取纯文本消息 |
+| `GET /narrators/:id/messages` | `narrator.read`（+ `message.*` 用于结构化层） | 游标分页读取消息，层级由 `detail` 选择 |
 | `POST /narrators/:id/messages` | `narrator.send_message` | 发送纯文本消息 |
+| `GET /narrators/:id/tool-calls/:toolUseId` | `message.content.read` | 单工具 payload 下钻（预算大于页内内联） |
 | `POST /narrators/:id/interrupt` | `narrator.interrupt` | 中断运行 |
 | `POST /ws-tickets` | `narrator.read event.subscribe` | 获取单次 WebSocket ticket |
 
@@ -395,7 +403,7 @@ Content-Type: application/json
 GET /api/external/v1/narrators/<id>/messages?limit=50&cursor=<opaque-cursor>
 ```
 
-响应只包含用户/助手的有界纯文本投影，不返回原始 tool payload、thinking、文件快照或其它内部消息结构：
+默认层级（`detail=text`）只包含用户/助手的有界纯文本投影，不返回原始 tool payload、thinking、文件快照或其它内部消息结构：
 
 ```json
 {
@@ -409,11 +417,147 @@ GET /api/external/v1/narrators/<id>/messages?limit=50&cursor=<opaque-cursor>
       "createdAt": "2026-07-18T00:00:00.000Z"
     }
   ],
-  "nextCursor": null
+  "nextCursor": null,
+  "documentRevision": 41,
+  "detail": "text",
+  "pruneBoundaryMessageId": null,
+  "prunedPercent": null
 }
 ```
 
-cursor 是不透明值，客户端不得解析或修改。
+cursor 是不透明值，客户端不得解析或修改。`documentRevision` 对应叙述者的消息版本，可用于跳过无变化的重读（见 §8.4）。
+
+按需读取更多结构见 §7.6。**未传 `detail` 的请求行为与本节完全一致**：既有客户端无需改动、也无需申请新 scope。
+
+### 7.6 分层消息读取（LOD 渐进获取）
+
+#### 为什么是三层而不是照搬 UI 的 LOD
+
+NarraFork 自己的界面用 `RenderLod` 1..6 控制细节。它的内部端点同样是游标分页的，但**每页只有一种详细度**：服务端不区分调用方需要多少，一律发出渲染所需的完整消息结构（含全部 content block 与按字节预算截断的工具 input/output），LOD 纯粹在客户端拿到这份数据之后决定渲染成「整卡 / 一行 / 计数行」。
+
+对外不能照搬这套分级：L5 的「最近两段展开」是位置相关而非级别相关，L1 的收起是 CSS 高度——两者都无法在服务端忠实表达。更重要的是，那份按页结构无条件包含工具 payload，原样对外等于让「只想看工具计数」的客户端也必须接收命令输出全文。
+
+所以这里新增的是一个与分页**正交**的详细度维度：分页决定取哪些消息，`detail` 决定每条消息披露到哪一层。
+
+因此对外契约是三个稳定的**数据层**，按披露程度递增：
+
+| `detail` | 含义 |
+|---|---|
+| `text`（默认） | 既有的有界纯文本投影，形状不变 |
+| `skeleton` | 仅有界标量：文本长度、工具计数、推理 token 数。不读任何大 JSON 列 |
+| `summary` | 带身份的结构：正文、推理步骤标题、每个工具的名称/目标/状态/字节数 |
+| `full` | 追加推理正文与按字节预算投影的工具 input/output |
+
+客户端若要镜像 NarraFork 的细节滑块，推荐映射为 `1 → skeleton`、`2..4 → summary`、`5..6 → full`。该映射仅供参考，服务端只认上面四个字符串，所以 UI 分级变化不会破坏外部契约。
+
+#### 有效层级与降级语义
+
+有效层级 = `min(请求的 detail, scope 上限, policy.messageDetail)`，三者任一收紧立即生效。
+
+- **超额请求会降级，而不是失败。** 客户端上调细节不该把一个能用的页面变成 403；诚实的答案是「你有权看到的那一页」，并通过 `detailRequested` 告知被压低了。
+- **完全没有结构化 scope 则拒绝。** 请求 `skeleton`/`summary`/`full` 但不持有 `message.summary.read` → `403 INSUFFICIENT_SCOPE`。这不是「细节少一点」，而是用户从未授予的能力。
+- **policy 为 `none` 则拒绝。** 即使持有 scope，`403 OAUTH_POLICY_FORBIDDEN`——不会静默退回 `text` 形状。
+
+```http
+GET /api/external/v1/narrators/<id>/messages?detail=summary&limit=30
+GET /api/external/v1/narrators/<id>/messages?detail=skeleton&order=desc&limit=50
+```
+
+| 参数 | 语义 |
+|---|---|
+| `detail` | `text`（默认）/ `skeleton` / `summary` / `full` |
+| `order` | `asc`（默认，走向更新的消息）/ `desc`（tail-first，走向更旧的消息） |
+| `cursor` | 不透明游标；方向由 `order` 决定 |
+| `limit` | 上限按层分档：`text`/`skeleton` 50、`summary` 30、`full` 10 |
+
+只有一个 cursor，方向由 `order` 决定。曾考虑过单独的 `before` 参数但未采用：那会引入四种 cursor/order 组合，其中两种没有合理语义。
+
+结构化层的响应形状：
+
+```json
+{
+  "items": [
+    {
+      "id": "<message-id>",
+      "seq": 12,
+      "role": "assistant",
+      "createdAt": "2026-07-18T00:00:00.000Z",
+      "kind": "message",
+      "textChars": 20,
+      "text": "Running diagnostics.",
+      "reasoning": {
+        "tokens": 128,
+        "steps": [{ "title": "Check the logs", "chars": 27 }]
+      },
+      "tools": {
+        "count": 1, "running": 0, "failed": 0, "awaitingPermission": 0,
+        "items": [
+          {
+            "toolUseId": "<tool-use-id>",
+            "name": "Bash",
+            "target": "systemctl status robot",
+            "status": "success",
+            "durationMs": 42,
+            "inputBytes": 40,
+            "outputBytes": 80,
+            "hasDetail": true
+          }
+        ]
+      },
+      "subagents": { "count": 1, "items": [{ "toolUseId": "...", "type": "explore", "title": null, "status": "running", "recentCallCount": 0 }] }
+    }
+  ],
+  "nextCursor": null,
+  "documentRevision": 41,
+  "detail": "summary",
+  "detailRequested": "full",
+  "pruneBoundaryMessageId": null,
+  "prunedPercent": null
+}
+```
+
+要点：
+
+- **计数永远精确。** `count` 从不被截断；`itemsTruncated` 只表示**枚举**被裁剪，所以客户端即使只看到前 64 项也可以信任 `count`。
+- **`subagents` 与 `tools` 分开计数。** `Agent`/`Task`/`Send` 归入 `subagents`，因此客户端的「N 次工具调用」与 NarraFork 界面一致。
+- **system 行只作为 compact 标记出现**（`kind: "compact"`），任何层级都不返回其正文；内部 system 文本不属于外部契约。
+- **`target`** 由固定 key 白名单在 SQL 内投影，按 `file_path` → `command` → `pattern` → `url` → `query` → … 的具体程度取第一个命中值。
+- **`hasDetail: true`** 表示下钻端点能返回比该项更多的内容。
+- **`reasoning.unavailable`** 区分「本条没有推理」（`steps: []`）与「有推理但因体积守卫未被读取」。
+
+`full` 层额外给出 `reasoning.steps[].body` 与每个工具的 `input`/`output`。payload 走既有的字节预算投影，超限叶子保持 `{ "_truncated": true, "preview": "...", "fullLength": N }` 形状，并在项上标记 `inputTruncated` / `outputTruncated`。
+
+`full` 层的预算刻意小于内部 vlist：内部的 8KB/leaf 是为了填满卡片已经预留的高度，而外部客户端没有那个盒子，同样预算乘上一页工具密集的消息就是响应体积问题本身。页内内联只覆盖每条消息**前 8 个**工具调用，其余项仍带身份、状态与字节数并报告 `hasDetail`。
+
+#### 单工具下钻
+
+```http
+GET /api/external/v1/narrators/<id>/tool-calls/<tool-use-id>
+```
+
+需要 `message.content.read` 且 `policy.messageDetail === "full"`。预算显著大于页内内联（32KB/leaf、128KB/工具），所以页面裁掉的内容可以在这里取回：
+
+```json
+{
+  "toolUseId": "<tool-use-id>",
+  "name": "Bash",
+  "status": "success",
+  "target": "systemctl status robot",
+  "durationMs": 42,
+  "inputBytes": 40,
+  "outputBytes": 80,
+  "input": { "command": "systemctl status robot" },
+  "output": { "stdout": "..." },
+  "inputTruncated": false,
+  "outputTruncated": false,
+  "createdAt": "2026-07-18T00:00:00.000Z",
+  "completedAt": "2026-07-18T00:00:01.000Z"
+}
+```
+
+可见性沿用叙述者自身的 ref 归属规则，与第一方界面一致：fork 的共享历史仍可读，已离开调用方视图的行则消失。属于其它 grant 的工具 ID 按 404 处理。
+
+本端点**不返回** sidecar 原文、文件快照或图片二进制——这些超出「消息渲染数据」范畴，未纳入本次开放。
 
 ---
 
@@ -479,6 +623,7 @@ wss://narrafork.example.com/ws/external/v1/narrators?ticket=<ticket>
 { "type": "subscribed", "narratorIds": ["n1"], "requestId": "r1" }
 { "type": "unsubscribed", "narratorIds": ["n1"], "requestId": "r2" }
 { "type": "narrator_changed", "narratorId": "n1" }
+{ "type": "narrator_changed", "narratorId": "n1", "documentRevision": 41, "requestId": "r3" }
 { "type": "message_accepted", "narratorId": "n1", "requestId": "r4" }
 { "type": "interrupted", "narratorId": "n1", "requestId": "r5" }
 { "type": "rate_limited", "retryAfterSeconds": 1, "requestId": "r4" }
@@ -488,6 +633,8 @@ wss://narrafork.example.com/ws/external/v1/narrators?ticket=<ticket>
 ```
 
 `narrator_changed` 只是变化提示。客户端应通过 REST 详情和消息分页接口拉取权威状态，而不是假设 WebSocket 推送完整消息内容。
+
+`documentRevision` **只出现在 `sync_check` 的回复上，不出现在服务端主动推送的帧里**。它与 REST 消息页返回的是同一个值，客户端可以和自己已持有的版本比较，从而完全跳过一次重读——在 `full` 层尤其值得，因为那一页要 join 工具行并投影 payload。推送帧刻意不带它：产生推送的领域事件本身不携带版本号，填这个字段就意味着在扇出路径上为每个订阅者、每个事件多做一次索引读取。推送帧保持纯信号，需要便宜检查的客户端用 `sync_check` 主动问。
 
 每个已解析帧都会重新验证 access token、grant、client 和基础订阅 scope。涉及资源的帧还会重新验证项目白名单和 ownership。
 
@@ -539,6 +686,7 @@ External API 使用 NarraFork 结构化错误，常见 code：
 - `INSUFFICIENT_SCOPE`
 - `OAUTH_PROJECT_FORBIDDEN`
 - `OAUTH_POLICY_FORBIDDEN`
+- `INTEGRATION_AUTHORIZATION_DENIED`
 - `PAYLOAD_TOO_LARGE`
 - `OAUTH_WS_TICKET_CAPACITY`
 
@@ -556,6 +704,8 @@ External API 使用 NarraFork 结构化错误，常见 code：
 - 宿主机执行（`deviceAccess.host`）默认 denied；remote 设备组默认 readWrite，管理员可按需收紧；在客户端 UI 中明确展示执行能力状态；
 - 使用稳定、非显示名称的 `provisionKey`；
 - 只保存首次返回的设备 credential；
+- 消息读取按需申请 `message.summary.read` / `message.content.read`，并把响应里的 `detail` 当作权威层级（可能低于请求值）；
+- 按层遵守 `limit` 上限；用 `documentRevision` 跳过无变化的重读；对 `itemsTruncated` / `stepsTruncated` / `*Truncated` / `hasDetail` 做处理，需要完整 payload 时走单工具下钻端点而不是提高 `limit`；
 - 处理 refresh rotation 和 refresh reuse 失效；
 - 对 429、`rate_limited` 和临时网络错误做有界退避；
 - 收到 `auth_lost` 后停止盲目重连；
