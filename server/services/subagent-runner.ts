@@ -56,7 +56,7 @@ import {
 	loadSubagentHistory,
 	type SubagentExecOptions,
 } from "./subagent-executor";
-import { waitForManualOverride } from "./subagent-manual-override";
+import { resumeManualOverride, waitForManualOverride } from "./subagent-manual-override";
 import {
 	clearTakenOver,
 	consumePendingStopTakeover,
@@ -993,6 +993,43 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 	let detachReadyPromise: Promise<DetachSetupResult> | undefined;
 	let currentForegroundAbortController: AbortController | undefined;
 
+	/**
+	 * Hand a still-queued user message to the suspension we just registered.
+	 *
+	 * A taken-over subagent is driven by the user, so its queued messages are
+	 * pushed WITHOUT a soft-stop request — interrupting the user's own turn would
+	 * be wrong. That leaves nobody to drain the queue: the loop reaches the
+	 * takeover suspension and blocks in waitForManualOverride, which only wakes on
+	 * an HTTP action and never inspects the buffer. A message sent during the turn
+	 * would be stranded forever: never persisted, never displayed, never answered.
+	 *
+	 * The drain must run AFTER the manual-override entry is registered, not before.
+	 * Draining first leaves a window where a concurrent send sees a non-blocked
+	 * subagent and starts a second, competing run. Resolving the registered entry
+	 * instead reuses the ordinary resume path, so the queued message becomes the
+	 * next turn through exactly the same plumbing as an interactive send.
+	 */
+	const feedQueuedMessageIntoSuspension = async (): Promise<void> => {
+		const queued = await consumeNextBufferedSubagentMessage({
+			narratorId: subagentId,
+			parentNarratorId,
+			toolUseId,
+			model: currentModel,
+			provider: currentProvider,
+			cwd,
+		});
+		if (!queued) return;
+		// A user action may have settled the suspension while the drain was in
+		// flight; resumeManualOverride then returns false and the message stays in
+		// the persisted history, to be picked up by the resumed turn's context.
+		resumeManualOverride(subagentId, {
+			prompt: queued.prompt,
+			history: queued.history,
+			trailingToolResults: queued.trailingToolResults,
+			userId: queued.userId ?? null,
+		});
+	};
+
 	const suspendForUserControl = async (substatus: string[]) => {
 		await narratorService.updateStatus(subagentId, "idle", { substatus });
 		broadcastToNarrator(parentNarratorId, {
@@ -1007,7 +1044,16 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 			status: "idle",
 			substatus,
 		});
-		return waitForManualOverride(subagentId, controlSignal, parentNarratorId, toolUseId);
+		// waitForManualOverride registers its entry synchronously, so the drain
+		// below can never observe an unregistered suspension.
+		const control = waitForManualOverride(subagentId, controlSignal, parentNarratorId, toolUseId);
+		await feedQueuedMessageIntoSuspension().catch((err) => {
+			logger.warn("Failed to consume queued subagent message on suspend", {
+				subagentId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+		return control;
 	};
 
 	const applyControlResult = async (

@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { networkInterfaces } from "node:os";
+import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { Hono } from "hono";
 import { z } from "zod";
 import { agentGenerateWithMetaResolved } from "../lib/agent";
@@ -57,6 +58,10 @@ import {
 } from "../lib/validators";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
+import {
+	CodexImageGenerationFixError,
+	disableCodexImageGenerationForPrefix,
+} from "../services/codex-image-generation-fix";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { clearOAuthWsTickets } from "../services/oauth-ws-ticket-service";
 import { listPluginProviderModelGroups } from "../services/plugin-provider-model-source";
@@ -156,6 +161,7 @@ const customApiProviderSchema = z.object({
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
+	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -177,6 +183,7 @@ const openaiProviderSchema = z.object({
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
+	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -198,6 +205,7 @@ const anthropicProviderSchema = z.object({
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
+	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -596,6 +604,7 @@ export const updateSettingsSchema = z
 				userAgentMode: userAgentModeSchema,
 				customUserAgent: customUserAgentSchema,
 				extraHeaders: extraHeadersSchema,
+				emulateCodexHeaders: z.boolean().optional(),
 			})
 			.partial()
 			.optional(),
@@ -1663,9 +1672,24 @@ settingsRoutes.post("/retry-rules", requireAdmin, async (c) => {
 	const parsed = addRetryRuleSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
+	// Store the form the matcher compares against: the raw provider message has no
+	// `Error: ` / `[Error] ` display prefix, so a keyword lifted from a rendered
+	// error card must be normalized (see shared/retry-rule-keyword.ts).
+	const normalizedDomain = parsed.data.domain
+		? stripErrorDisplayPrefix(parsed.data.domain) || undefined
+		: undefined;
+	const normalizedKeyword = parsed.data.keyword
+		? stripErrorDisplayPrefix(parsed.data.keyword) || undefined
+		: undefined;
+	if (!normalizedDomain && !parsed.data.statusCode && !normalizedKeyword) {
+		throw new ValidationError("At least one of domain, statusCode, or keyword is required");
+	}
+
 	const rule = {
 		id: generateShortId(),
 		...parsed.data,
+		domain: normalizedDomain,
+		keyword: normalizedKeyword,
 		enabled: true,
 	};
 
@@ -1741,4 +1765,39 @@ settingsRoutes.post("/fix-provider-baseurl", requireAdmin, async (c) => {
 	});
 
 	return c.json({ ok: true, providerId: target.id, baseUrl: newBaseUrl });
+});
+
+const disableCodexImageGenerationSchema = z.object({
+	/**
+	 * The provider prefix, or a full `prefix:model` reference (the failing
+	 * narrator's runtime model). Never the flag value: the target is resolved and
+	 * the write decided server-side.
+	 */
+	model: z.string().min(1).max(200),
+});
+
+/**
+ * Turn off the native `image_generation` tool for the provider that just failed
+ * with "Image generation is not enabled".
+ *
+ * Offered as a one-click fix on the narrator error card: NarraFork injects that
+ * server-side tool by default, so on an upstream that does not license it every
+ * turn dies before producing a token, and the setting that fixes it is buried in
+ * provider settings. See `services/codex-image-generation-fix.ts` for why the
+ * target cannot simply be a settings path.
+ */
+settingsRoutes.post("/disable-codex-image-generation", requireAdmin, async (c) => {
+	const body = await c.req.json();
+	const parsed = disableCodexImageGenerationSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	try {
+		const result = disableCodexImageGenerationForPrefix(parsed.data.model);
+		return c.json({ ok: true, ...result });
+	} catch (err) {
+		if (err instanceof CodexImageGenerationFixError) {
+			throw new ValidationError(err.message);
+		}
+		throw err;
+	}
 });

@@ -34,6 +34,7 @@ export interface CustomApiProviderState {
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
+	emulateCodexHeaders?: boolean;
 	disabled?: boolean;
 }
 
@@ -54,6 +55,7 @@ export interface OpenAIProviderState {
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
+	emulateCodexHeaders?: boolean;
 	proxy?: ProxyOverride;
 	disabled?: boolean;
 }
@@ -73,6 +75,7 @@ export interface AnthropicProviderState {
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
+	emulateCodexHeaders?: boolean;
 	disabled?: boolean;
 }
 

@@ -99,6 +99,7 @@ const oauthDevicePolicy: OAuthClientPolicy = {
 	maxDangerReflectionPromptChars: 0,
 	allowRobotDiagnosticPreset: false,
 	deviceAccess: { host: "denied", global: "denied", selfRegistered: "denied" },
+	messageDetail: "summary",
 };
 
 async function insertDirectDevice(input: {

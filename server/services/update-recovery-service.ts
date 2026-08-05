@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessages, narratorToolCalls } from "../db/schema";
 import {
@@ -357,17 +357,26 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 	const toolCalls = await db.query.narratorToolCalls.findMany({
 		where: inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
 	});
-	const linkedSubagentMessages = await db
-		.select({
-			narratorId: narratorMessages.narratorId,
-			parentToolUseId: narratorMessages.parentToolUseId,
-		})
-		.from(narratorMessages)
-		.where(isNotNull(narratorMessages.parentToolUseId));
+	// Scoped to the unfinished calls instead of every subagent message in the database:
+	// the origin map is only consulted for these tool_use ids, and the unscoped version
+	// read ~72k rows to build 3.1k mappings when 8 were needed. Empty input means no
+	// query at all, which is the common case on a healthy restart.
+	const originToolUseIds = toolCalls.flatMap((toolCall) =>
+		toolCall.toolUseId ? [toolCall.toolUseId] : [],
+	);
 	const subagentByOrigin = new Map<string, string>();
-	for (const message of linkedSubagentMessages) {
-		if (message.parentToolUseId && !subagentByOrigin.has(message.parentToolUseId)) {
-			subagentByOrigin.set(message.parentToolUseId, message.narratorId);
+	if (originToolUseIds.length > 0) {
+		const linkedSubagentMessages = await db
+			.select({
+				narratorId: narratorMessages.narratorId,
+				parentToolUseId: narratorMessages.parentToolUseId,
+			})
+			.from(narratorMessages)
+			.where(inArray(narratorMessages.parentToolUseId, originToolUseIds));
+		for (const message of linkedSubagentMessages) {
+			if (message.parentToolUseId && !subagentByOrigin.has(message.parentToolUseId)) {
+				subagentByOrigin.set(message.parentToolUseId, message.narratorId);
+			}
 		}
 	}
 

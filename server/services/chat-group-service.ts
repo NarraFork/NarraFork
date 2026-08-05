@@ -17,7 +17,7 @@
 
 import { formatOriginLabel } from "@shared/message-origin";
 import { extractMentionsWithCandidates, foldHandle } from "@shared/narrator-handle";
-import { and, desc, eq, lt } from "drizzle-orm";
+import { and, desc, eq, inArray, lt } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chatGroupMembers,
@@ -741,13 +741,27 @@ async function notifyGroupsOfPermissionRequest(
 	});
 	const toolName = pending?.toolName ?? "a tool";
 
+	// Members for every candidate group in one query. This runs on the
+	// `narrator:permission_request` path, so a per-group query meant one synchronous
+	// SQLite round trip per group on every permission prompt.
+	const controllerGroupIds = new Set<string>();
+	const memberRows = await db.query.chatGroupMembers.findMany({
+		where: inArray(
+			chatGroupMembers.groupId,
+			groups.map((group) => group.id),
+		),
+		columns: { groupId: true, memberType: true, narratorId: true, canControl: true },
+	});
+	for (const member of memberRows) {
+		if (member.memberType !== "narrator" || !member.narratorId) continue;
+		if (!member.canControl) continue;
+		if (member.narratorId === requestingNarratorId) continue;
+		controllerGroupIds.add(member.groupId);
+	}
+
 	for (const group of groups) {
 		// Only notify groups that have at least one OTHER controlling narrator member.
-		const members = await chatGroupService.listNarratorMembers(group.id);
-		const hasController = members.some(
-			(m) => m.canControl && m.narratorId && m.narratorId !== requestingNarratorId,
-		);
-		if (!hasController) continue;
+		if (!controllerGroupIds.has(group.id)) continue;
 
 		await chatGroupService.postMessage({
 			groupId: group.id,

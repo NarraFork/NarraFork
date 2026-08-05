@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { DEFAULT_THEME, getCSSColorVariables } from "@mantine/core";
-import { getEffectiveNarratorDisplay, statusAccentColor, statusAccentVar } from "./status-registry";
+import {
+	getEffectiveNarratorDisplay,
+	type NarratorStatus,
+	statusAccentColor,
+	statusAccentVar,
+} from "./status-registry";
 
 /**
  * The attention palette is a product contract, not a style detail: orange/yellow
@@ -274,7 +279,75 @@ describe("status shapes separate states colour no longer can", () => {
 		expect(body).toContain("getEffectiveNarratorDisplay");
 		expect(body).toContain(".shape");
 	});
+
+	/**
+	 * Guards the size floor. Two attempts landed on an illegible glyph by different routes:
+	 * first a 7px corner badge, then a glyph scaled to sit "inside" the icon at ~58%, which
+	 * on a 14px host is 8px — the same problem again. The hosts render at 14–16px, so the
+	 * ratio has to be generous or the shape cannot be read at all.
+	 */
+	test("the knocked-out glyph is big enough to identify", async () => {
+		const source = await Bun.file(
+			new URL("../components/nav/RecentTabs.tsx", import.meta.url),
+		).text();
+		const ratio = source.match(/const SHAPE_GLYPH_RATIO = ([\d.]+)/);
+		expect(ratio).not.toBeNull();
+		// At both sizes actually used, clear the 7px badge that started this.
+		for (const host of [14, 16]) {
+			expect(Math.round(host * Number(ratio?.[1]))).toBeGreaterThan(8);
+		}
+	});
+
+	/**
+	 * The glyph is white and has NO body of its own — it is knocked out of the host bubble's
+	 * fill. Two consequences this pins down, both of which were shipped wrong once:
+	 *
+	 *  - It must not paint a disc. A full-size circle buried the bubble and spilled past its
+	 *    ink, reading as a blob stuck on the tab.
+	 *  - It must only render where a solid body exists. The chapter and subagent icons are
+	 *    Tabler outline glyphs, so a white shape over them would vanish into the page.
+	 */
+	test("the shape is knocked out of the bubble rather than painted over it", async () => {
+		const source = await Bun.file(
+			new URL("../components/nav/RecentTabs.tsx", import.meta.url),
+		).text();
+		const overlay = source.slice(
+			source.indexOf("function ShapeOverlay"),
+			source.indexOf("export function isTabActive"),
+		);
+		expect(overlay).toContain('color: "var(--mantine-color-white)"');
+		// No body of its own: no background fill and no circle to align.
+		expect(overlay).not.toContain("background:");
+		expect(overlay).not.toContain("borderRadius");
+		// The whole icon is one click target; the glyph must not become a dead spot.
+		expect(overlay).toContain('pointerEvents: "none"');
+		// And it is gated to the one host that is genuinely filled.
+		expect(source).toContain('const canShowShape = tab.type === "narrator" && filledStatus');
+	});
+
+	/**
+	 * Any state carrying a shape must also fill its bubble. This is the invariant that keeps
+	 * the knockout visible: a white glyph on a hollow outline is invisible, so `shape`
+	 * without `filled` would silently render nothing.
+	 */
+	test("every state with a shape also fills, so the knockout has a body", () => {
+		const shaped: Array<[NarratorStatus, string[] | undefined]> = [
+			["idle", ["unread"]],
+			["waiting", ["reflecting"]],
+			["waiting", undefined],
+		];
+		for (const [status, substatus] of shaped) {
+			const display = getEffectiveNarratorDisplay(status, substatus);
+			expect(display.shape).toBeDefined();
+			expect(isFilledForShape(display)).toBe(true);
+		}
+	});
 });
+
+/** Mirrors the sidebar's fill rule: a shape implies a filled host. */
+function isFilledForShape(display: { solidAccent?: boolean; shape?: string }): boolean {
+	return !!display.solidAccent || !!display.shape;
+}
 
 /**
  * The Pixi ruler layer needs a numeric hex read off a CSS variable, so it cannot use

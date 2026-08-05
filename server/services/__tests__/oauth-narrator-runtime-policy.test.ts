@@ -43,6 +43,7 @@ const appendPolicy: OAuthClientPolicy = {
 	maxDangerReflectionPromptChars: 0,
 	allowRobotDiagnosticPreset: false,
 	deviceAccess: { host: "denied", global: "readWrite", selfRegistered: "readWrite" },
+	messageDetail: "summary",
 };
 const managedPolicy: OAuthClientPolicy = {
 	defaultPermissionMode: "readOnly",
@@ -55,6 +56,7 @@ const managedPolicy: OAuthClientPolicy = {
 	maxDangerReflectionPromptChars: 0,
 	allowRobotDiagnosticPreset: false,
 	deviceAccess: { host: "denied", global: "denied", selfRegistered: "denied" },
+	messageDetail: "summary",
 };
 
 beforeAll(async () => {

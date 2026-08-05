@@ -20,17 +20,24 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
 当前 WebSocket 传输使用：
 
 - WebSocket URL：`wss://chatgpt.com/backend-api/codex/responses`
-- 握手头：
-  - `Authorization: Bearer ...`
-  - `User-Agent: codex-tui/{managed-version} (...)`
-  - `originator: codex-tui`
+- 握手头（`buildHandshakeHeaders`，按实际发送顺序）：
+  - `Authorization: Bearer ...`（`authorization` 选项优先，否则用 `apiKey`）
+  - `User-Agent`：调用方传入的 `userAgent`，缺省为 NarraFork UA
+  - `originator: narrafork`（可被 `extraHeaders` 覆盖）
+  - `Origin`：官方域名下为 `https://chatgpt.com`，否则为 `baseUrl`
   - `OpenAI-Beta: responses_websockets=2026-02-06`
-  - `session-id` / `thread-id` / `x-client-request-id`
-  - `x-codex-installation-id`
-  - `x-openai-internal-codex-responses-lite: true`
-  - 可选 `ChatGPT-Account-Id`
-  - 可选 `x-codex-turn-state`
-- 请求体：`{ type: "response.create", ...ResponsesRequestBody }`，包含稳定的 `client_metadata`、`prompt_cache_key`、`tool_choice: "auto"`、`parallel_tool_calls: false`、`reasoning.context: "all_turns"` 与 `text.verbosity: "low"`
+  - `x-client-request-id`：取 `sessionKey`（每会话稳定标识）
+  - 可选 `ChatGPT-Account-Id`（仅官方域名且提供了 accountId 时）
+  - 可选 `x-codex-turn-state`（上一轮响应回放）
+  - 可选 `x-codex-turn-metadata`（仅调用方显式传入时）
+  - 最后合并调用方的 `extraHeaders`，因此它可以覆盖上面任意一项
+- 请求体：`{ type: "response.create", ...ResponsesRequestBody }`
+
+两条调用路径传入的指纹不同：`openai-provider.ts` 的 codex 通道会传
+`userAgent` + `extraHeaders`（由 `resolveClientFingerprint` 解析，含
+`originator`、`x-codex-installation-id`、`session-id`/`thread-id`）；内置
+Codex adapter（`codex-provider.ts`）两者都不传，因此走缺省的 NarraFork UA 与
+`originator: narrafork`。
 
 ## 已实现能力
 

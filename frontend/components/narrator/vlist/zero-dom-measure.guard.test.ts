@@ -56,6 +56,12 @@ const PURE_PATH_FILES = [
 	"vlist-permission-match.ts",
 	"vlist-reflection-index.ts",
 	"vlist-interaction-state.ts",
+	// Fold transition PLANNING. It consumes geometry the layout already published and
+	// decides what to animate; reading a real element's size here would make a
+	// decoration a second source of truth for a height the pure path owns. (The DOM
+	// edge that plays the plan is `vlist-fold-motion.ts`, deliberately not scanned:
+	// it is a shell-level effect like vlist-highlight.)
+	"vlist-fold-animation.ts",
 	// Live lifecycle patching: rewrites the loaded document, then a rebuild derives
 	// the new heights arithmetically. Reaching for a real element's size here would
 	// make a server event (not a user action) the source of a measured height.

@@ -67,6 +67,19 @@ export interface ExecuteLoopResult {
 	/** Whether at least one provider assistant turn completed before this pass ended. */
 	completedAssistantTurn?: boolean;
 	/**
+	 * Set when the agent loop ended because the model stopped calling tools — the
+	 * loop's single `done` event. This is the authoritative "the work is finished"
+	 * signal, and it is strictly stronger than `completedAssistantTurn` (which is
+	 * true for any completed turn, including ones that ended mid-work with tool
+	 * calls still pending).
+	 *
+	 * Callers that decide whether to drive another pass must consult this: an
+	 * out-of-band event that landed during the final turn (e.g. a background
+	 * compact completing) otherwise looks indistinguishable from "there is more
+	 * work to do", and would produce an extra no-op request.
+	 */
+	completedNaturally?: boolean;
+	/**
 	 * Set when the provider explicitly reports output was cut off — either by
 	 * completion token limits (`output_truncated`) or by a transient failure
 	 * that occurred after partial output was already produced
@@ -128,6 +141,7 @@ export async function executeAgentLoop(
 	let sawAssistantMessage = false;
 	let lastAssistantHadToolUses = false;
 	let hadToolUses = false;
+	let completedNaturally = false;
 	const taskReflectionDenialFingerprints = new Set<string>();
 
 	for await (const event of eventSource) {
@@ -188,6 +202,12 @@ export async function executeAgentLoop(
 					taskReflectionDenialFingerprints.add(fingerprint);
 				}
 			}
+		}
+		if (event.type === "done") {
+			// The loop emits `done` only when a turn produced no tool calls, i.e. the
+			// model has nothing left to do. Recorded rather than `break`-ing so the
+			// remaining events of this pass are still drained normally.
+			completedNaturally = true;
 		}
 		if (event.type === "context_length_exceeded") {
 			contextLengthExceeded = true;
@@ -292,6 +312,9 @@ export async function executeAgentLoop(
 				? [...taskReflectionDenialFingerprints].sort().join("\n")
 				: undefined,
 		completedAssistantTurn: sawAssistantMessage,
+		// An aborted pass never counts as a natural completion, even if `done` was
+		// observed while draining post-abort events.
+		completedNaturally: completedNaturally && !aborted,
 		interrupted,
 		interruptedReason,
 		maxTurnsExceeded,

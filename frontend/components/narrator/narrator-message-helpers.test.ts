@@ -199,6 +199,23 @@ describe("normalizeReflectionAfterToolStatus", () => {
 			runningReflection,
 		);
 	});
+
+	// A gate whose reflection write was lost (busy SQLite inside a catch that swallows) while
+	// the tool went on to succeed leaves a row that is terminal but still says "running". The
+	// card then renders "危险反思正在检查此操作" with a live timer counting from the tool's
+	// start, which is why old rows showed absurd durations. A succeeded tool means the gate
+	// let it through, so converge on confirmed.
+	test("converges a stale running reflection once the tool succeeded", () => {
+		expect(normalizeReflectionAfterToolStatus(runningReflection, "success", false)).toMatchObject({
+			status: "confirmed",
+			requestId: "danger-1",
+		});
+	});
+
+	test("leaves a resolved reflection untouched", () => {
+		const failed = { ...runningReflection, status: "failed" as const };
+		expect(normalizeReflectionAfterToolStatus(failed, "success", false)).toBe(failed);
+	});
 });
 
 describe("findLatestSpecTasksToolUseId", () => {

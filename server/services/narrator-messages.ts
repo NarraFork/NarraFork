@@ -1151,6 +1151,125 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 	});
 }
 
+/**
+ * Drop the `toolCalls` relation array from an already-ENRICHED message tree.
+ *
+ * WHY THIS IS SAFE — and why it must run only after `enrichToolUseBlocks`.
+ *
+ * The wire payload used to carry every tool call twice: once as the relation row
+ * in `toolCalls[]`, and once copied onto its `tool_use` block by
+ * `enrichToolUseBlocks`. Measured on real narrators the array was ~33% of the
+ * exact-layout page (98KB of 283KB, 151KB of 458KB), of which the duplicated
+ * `outputJson` alone was 11-15%.
+ *
+ * The renderer never needs the array on this path. `segmentMessages`
+ * (frontend/components/narrator/message-segments.ts) builds each `ToolCallData`
+ * as `block.<field> ?? tc?.<field>` for every field it reads — the block is
+ * always preferred and the row is only a fallback — and `enrichToolUseBlocks`
+ * writes all of those fields onto the block (with `id`/`createdAt` landing as
+ * `tcId`/`tcCreatedAt`, which is exactly where `segmentMessages` looks for them).
+ * Verified empirically over 157 matched tool_use/toolCall pairs across the four
+ * largest narrators: no field present on a row was ever missing from its block.
+ *
+ * HEIGHT NEUTRALITY: measurement reads only the `ToolCallData` that
+ * `segmentMessages` produces, and that object is byte-identical whether or not
+ * the fallback array was present — so no measured height can move. This is a
+ * transport-only projection, which is why it is confined to the one endpoint
+ * whose consumer is the vlist loader rather than applied in `truncateToolIO`
+ * (whose other five call sites include the chunked path and WS broadcasts, where
+ * the array is NOT redundant).
+ *
+ * `toolCalls` is replaced with `[]` rather than deleted: `segmentMessages` and
+ * several call sites do `msg.toolCalls?.find(...)` / `Array.isArray(msg.toolCalls)`,
+ * and an empty array keeps every one of those a well-typed no-op.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+export function stripRedundantToolCallRows(tree: any[]): any[] {
+	return tree.map((msg) => {
+		const hasRows = Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0;
+		const children = msg.children?.length ? stripRedundantToolCallRows(msg.children) : msg.children;
+		if (!hasRows) return children === msg.children ? msg : { ...msg, children };
+		return { ...msg, toolCalls: [], children };
+	});
+}
+
+/**
+ * Drop `providerMetadata` from every content block for transport.
+ *
+ * `ReasoningProviderMetadata`) is purely REPLAY state: every field exists so the
+ * server can echo a reasoning block back to the upstream that minted it, and none
+ * of them is displayable.
+ *
+ *   openai.reasoningEncryptedContent  opaque ciphertext, replayed as
+ *                                     `encrypted_content`
+ *   openai.itemId                     Responses API reasoning item id
+ *   anthropic.signature               thinking-block signature, must be echoed
+ *   gemini.thoughtSignature           ditto, or the next turn 400s
+ *   signatureSource                   which upstream minted the signature
+ *
+ * they read it from the DATABASE when replaying history — never from anything the
+ * browser sent back. The frontend has no API that returns a message body to the
+ * server (edit / retry / fork all address messages by id), so removing it from a
+ * read response cannot affect continuation.
+ *
+ * WHY IT IS WORTH REMOVING. Measured over the six largest narrators' first
+ * screens: 254KB across 98 blocks, 10.9% of 2331KB. The ciphertext dominates
+ * (212KB) but `anthropic.signature` is another 33KB, so eliding only the
+ * ciphertext — the previous version of this function — left a third of the weight
+ * on the wire for no reason.
+ *
+ * THE ONE BIT THAT MUST SURVIVE. Presence of a ciphertext is a display input even
+ * though its content is not: `hasEncryptedReasoningMetadata`
+ * (shared/pretext-layout/reasoning-segments.ts) tests
+ * `typeof encrypted === "string" && encrypted.length > 0`, and
+ * `getReasoningEncryptionState` turns that into `"only"` / `"partial"`, which
+ * `MessageBubble` renders as a lock-icon placeholder and substitutes for the empty
+ * reasoning text. A bare deletion would silently flip that state to `"none"`,
+ * removing a rendered row. So the projection replaces the whole object with
+ * `{ hasEncryptedReasoning: true }` on exactly the blocks that had one, and
+ * `hasEncryptedReasoningMetadata` accepts that flag as an equivalent signal.
+ *
+ * The vlist adapter never reads `providerMetadata` at all (it derives a reasoning
+ * row from `thinking`/`text`), so on the exact path this is height-neutral by
+ * construction; the flag is what keeps it height-neutral for the chunked renderer
+ * too. Both are pinned by tests.
+ *
+ * Transport-only, and confined to the exact-layout page for the same reason
+ * `stripRedundantToolCallRows` is: the real value must survive on every path that
+ * feeds history back to a provider.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+export function stripProviderMetadata(tree: any[]): any[] {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const stripBlock = (block: any) => {
+		const providerMetadata = block?.providerMetadata;
+		if (!providerMetadata || typeof providerMetadata !== "object") return block;
+		const hadEncrypted = Object.values(providerMetadata as Record<string, unknown>).some(
+			(metadata) => {
+				if (!metadata || typeof metadata !== "object") return false;
+				const encrypted = (metadata as Record<string, unknown>).reasoningEncryptedContent;
+				return typeof encrypted === "string" && encrypted.length > 0;
+			},
+		);
+		const { providerMetadata: _dropped, ...rest } = block;
+		return hadEncrypted ? { ...rest, providerMetadata: { hasEncryptedReasoning: true } } : rest;
+	};
+
+	return tree.map((msg) => {
+		const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : null;
+		const children = msg.children?.length ? stripProviderMetadata(msg.children) : msg.children;
+		if (!blocks) return children === msg.children ? msg : { ...msg, children };
+		let changed = false;
+		const contentJson = blocks.map((block: unknown) => {
+			const next = stripBlock(block);
+			if (next !== block) changed = true;
+			return next;
+		});
+		if (!changed) return children === msg.children ? msg : { ...msg, children };
+		return { ...msg, contentJson, children };
+	});
+}
+
 const SUBAGENT_ACTIVITY_LIMIT = 3;
 
 export interface SubagentActivityToolCallTiming {
@@ -2610,12 +2729,21 @@ export const narratorMessageQueries = {
 			};
 		}
 
-		const tree = await buildTreeFromTopLevelRefs(
-			pageRows,
-			isSubagent,
-			// The ONLY path whose bodies are measured for the exact layout: the budget
-			// must fill the detail caps, or a card reserves a box it cannot fill.
-			EXACT_TOOL_IO_BUDGET,
+		// Transport-only projections, applied AFTER enrichment so both are safe: the
+		// tool rows are pure duplicates of the enriched blocks, and `providerMetadata`
+		// is replay state the browser can neither display nor send back (its one
+		// display-relevant bit is preserved as a flag). Together they removed ~46% of
+		// the page on the six largest narrators measured.
+		const tree = stripProviderMetadata(
+			stripRedundantToolCallRows(
+				await buildTreeFromTopLevelRefs(
+					pageRows,
+					isSubagent,
+					// The ONLY path whose bodies are measured for the exact layout: the budget
+					// must fill the detail caps, or a card reserves a box it cannot fill.
+					EXACT_TOOL_IO_BUDGET,
+				),
+			),
 		);
 		const minSeq = pageRows[0]?.seq ?? null;
 		const maxSeq = pageRows.at(-1)?.seq ?? null;

@@ -506,6 +506,17 @@ export interface AdapterContext {
 	viewportHeight?: number;
 	/** i18n labels for system cards / traces, passed through to measures. */
 	labels?: Record<string, string>;
+	/**
+	 * Whether an error card may offer the "turn off image generation and retry"
+	 * provider fix, given that card's error text.
+	 *
+	 * Injected by the shell because eligibility depends on the current user's role
+	 * and the narrator's resolved provider — neither of which the pure adapter may
+	 * read. It is consulted during ADAPTATION rather than at paint time because the
+	 * fix is a labelled button on its own row and therefore changes the card's
+	 * measured height.
+	 */
+	canOfferProviderFix?: (errorText: string) => boolean;
 	/** Pure resolvers injected by the shell; deterministic fallbacks keep tests simple. */
 	resolveReasoningSegments?: (text: string) => ReasoningSegment[];
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
@@ -1063,6 +1074,10 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	unknownError: "Unknown error",
 	specForkCarryover: "Fork carryover",
 	specContextCleared: "Context cleared",
+	// The error card's conditional provider fix. A LABELLED button, not a bare
+	// icon: an icon-only control hides its meaning behind a hover tooltip, which
+	// touch users never see at all.
+	disableImageGen: "Turn off image generation and retry",
 	specViewTasks: "View tasks",
 	specClearTasks: "Clear",
 	specResetTasks: "Reset",
@@ -1559,13 +1574,23 @@ function adaptSystemTextData(
 		// what made cwd-change and other display notices invisible in the vlist.
 		case "info":
 			return { kind: "info", text: block.message ?? block.text ?? contentText };
-		case "error":
+		case "error": {
+			const errorText = block.message ?? block.text ?? sysLabel(ctx, "unknownError");
+			// The provider fix is a LABELLED button on its own row, so it changes the
+			// card's height and must be decided here, during measurement — not painted
+			// in later by the render layer. `canOfferProviderFix` is injected by the
+			// shell (it depends on the user's role and the narrator's resolved
+			// provider, neither of which belongs in the pure adapter); the error-text
+			// match itself is a pure predicate the shell applies.
+			const offerFix = ctx.canOfferProviderFix?.(errorText) === true;
 			return {
 				kind: "error",
-				text: block.message ?? block.text ?? sysLabel(ctx, "unknownError"),
+				text: errorText,
 				color: "red",
 				actions: true,
+				...(offerFix ? { buttons: [sysLabel(ctx, "disableImageGen")] } : {}),
 			};
+		}
 		case "bash_command":
 			return {
 				kind: "bash_command",

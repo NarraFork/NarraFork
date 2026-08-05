@@ -10,10 +10,10 @@ const ORIGINATOR = "narrafork";
  * User-Agent and billing block disagree does not match any real CLI release.
  */
 export const CLAUDE_CLI_VERSION = "2.1.220";
-// Managed Codex client version used only for outbound protocol emulation.
-// Keep the User-Agent prefix/suffix and originator aligned when updating it.
-const CODEX_CLI_VERSION = "0.146.0";
-export const ORIGINATOR_CODEX = "codex-tui";
+// Codex CLI version mimicked by the "codex" User-Agent mode.
+// Matches the codex_cli_rs originator/version format. Update manually as needed.
+// Bumped to 0.144.0 to satisfy gpt-5.6 family minimal_client_version gating.
+const CODEX_CLI_VERSION = "0.144.0";
 
 /**
  * Get OS type string in Codex format.
@@ -73,19 +73,6 @@ function getArchitecture(): string {
 	return os.arch();
 }
 
-function getCodexArchitecture(): string {
-	switch (os.arch()) {
-		case "x64":
-			return "x86_64";
-		case "arm64":
-			return "aarch64";
-		case "ia32":
-			return "x86";
-		default:
-			return os.arch();
-	}
-}
-
 /**
  * Get terminal/runtime information.
  * Mimics Codex's user_agent() function from codex_terminal_detection.
@@ -131,15 +118,23 @@ export function getUserAgent(): string {
 }
 
 /**
- * Build the managed Codex client User-Agent shape:
- * codex-tui/{version} ({os_type} {os_version}; {arch}) unknown (codex-tui; {version})
+ * Build User-Agent string in Codex CLI format:
+ * codex_cli_rs/{version} ({os_type} {os_version}; {arch}) {terminal_info}
+ *
+ * Mirrors the official Codex CLI `get_codex_user_agent()` output so requests
+ * can present themselves as the Codex client. When no terminal is detected the
+ * token falls back to "unknown", matching the real Codex CLI (it never reports a
+ * runtime version here).
+ *
+ * Example: codex_cli_rs/0.144.0 (Linux Ubuntu 22.04; x64) unknown
  */
 export function getCodexUserAgent(): string {
 	const osType = getOsType();
 	const osVersion = getOsVersion();
-	const arch = getCodexArchitecture();
+	const arch = getArchitecture();
+	const terminalInfo = getTerminalInfo("unknown");
 
-	return `${ORIGINATOR_CODEX}/${CODEX_CLI_VERSION} (${osType} ${osVersion}; ${arch}) unknown (${ORIGINATOR_CODEX}; ${CODEX_CLI_VERSION})`;
+	return `codex_cli_rs/${CODEX_CLI_VERSION} (${osType} ${osVersion}; ${arch}) ${terminalInfo}`;
 }
 
 /**
@@ -155,12 +150,22 @@ export function getClaudeCliUserAgent(): string {
 }
 
 /**
+ * Upper bound on an outbound User-Agent, well above any real client's UA.
+ *
+ * A UA is partly built from host-supplied text (`PRETTY_NAME` in /etc/os-release,
+ * terminal env vars, an operator's custom string), none of which is length-bounded
+ * at the source. Some upstreams reject oversized request headers outright, so an
+ * unusual host string would otherwise break every request with a confusing error.
+ */
+const MAX_USER_AGENT_LENGTH = 256;
+
+/**
  * Sanitize User-Agent string to ensure it's a valid HTTP header value.
- * Replaces invalid characters with underscores.
+ * Replaces invalid characters with underscores and bounds the length.
  */
 export function sanitizeUserAgent(userAgent: string): string {
 	// HTTP header values must be ASCII printable characters (0x20-0x7E)
-	return userAgent.replace(/[^\x20-\x7E]/g, "_");
+	return userAgent.replace(/[^\x20-\x7E]/g, "_").slice(0, MAX_USER_AGENT_LENGTH);
 }
 
 /**
@@ -184,25 +189,19 @@ export function getHttpCodexUserAgent(): string {
 	return sanitizeUserAgent(getCodexUserAgent());
 }
 
+/** Originator token used by the real Codex CLI. */
+export const ORIGINATOR_CODEX = "codex_cli_rs";
+
 /**
- * Build the stable Codex client headers, transcribed from captured codex-tui
- * traffic, while deliberately omitting the volatile per-turn tracking headers
- * the real client also sends (x-codex-turn-metadata, x-codex-window-id).
- *
- * Those carry runtime environment and timing detail — sandbox mode, window id,
- * turn start timestamp — that NarraFork has no reason to report upstream. Every
- * header below is stable for the lifetime of a conversation.
- *
- * Also omitted: x-codex-beta-features. The real client derives it from the beta
- * features it actually has enabled (responses_websockets_v2,
- * remote_compaction_v2, use_agent_identity, workspace_dependencies, ...), so a
- * hardcoded value would claim capabilities NarraFork does not implement.
+ * Build the stable Codex-emulation headers, mirroring the real Codex CLI's
+ * durable request headers while deliberately omitting tracking/semantic headers
+ * (x-codex-turn-metadata, workspaces, sandbox, x-codex-window-id, ...).
  *
  * Included:
- * - originator: codex-tui
+ * - originator: codex_cli_rs
  * - x-codex-installation-id: <persisted UUID>
- * - session-id / thread-id / x-client-request-id: one stable conversation id
- * - x-openai-internal-codex-responses-lite: true
+ * - session-id / thread-id: weak per-conversation identifiers (only when a
+ *   conversation id is available). These are not turn-level tracking headers.
  */
 export function buildCodexEmulationHeaders(opts: {
 	installationId: string;
@@ -211,12 +210,10 @@ export function buildCodexEmulationHeaders(opts: {
 	const headers: Record<string, string> = {
 		originator: ORIGINATOR_CODEX,
 		"x-codex-installation-id": opts.installationId,
-		"x-openai-internal-codex-responses-lite": "true",
 	};
 	if (opts.conversationId) {
 		headers["session-id"] = opts.conversationId;
 		headers["thread-id"] = opts.conversationId;
-		headers["x-client-request-id"] = opts.conversationId;
 	}
 	return headers;
 }
@@ -258,18 +255,20 @@ export function resolveHttpUserAgent(options: {
  * provider request.
  *
  * Header precedence (later wins):
- *   1. Codex client headers — emitted whenever `installationId` is supplied.
+ *   1. Codex emulation headers (only when `emulateCodex` is true).
  *   2. User-configured `extraHeaders` — always applied last so operators can
- *      override or clear any emitted header.
+ *      override or clear any emulated header.
  *
- * Passing `installationId` is what opts a caller into the Codex header set, so
- * non-codex providers never leak codex-specific identifiers.
+ * Codex semantic headers are only injected when `emulateCodex` is true, so
+ * non-codex providers never leak codex-specific identifiers unless explicitly
+ * opted in.
  */
 export function resolveClientFingerprint(options: {
 	mode?: UserAgentMode;
 	custom?: string;
 	fallback: string;
 	extraHeaders?: Record<string, string>;
+	emulateCodex?: boolean;
 	installationId?: string;
 	conversationId?: string;
 }): { userAgent: string; headers: Record<string, string> } {
@@ -280,7 +279,7 @@ export function resolveClientFingerprint(options: {
 	});
 
 	const headers: Record<string, string> = {};
-	if (options.installationId) {
+	if (options.emulateCodex && options.installationId) {
 		Object.assign(
 			headers,
 			buildCodexEmulationHeaders({

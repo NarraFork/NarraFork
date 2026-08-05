@@ -114,6 +114,12 @@ import {
 	type VListEditRole,
 } from "./vlist-edit-target";
 import { resolveErrorNoticeActions, useVListErrorNoticeActions } from "./vlist-error-actions";
+import { type FoldRowGeometry, isFoldCaptureUsable, planFoldMotion } from "./vlist-fold-animation";
+import {
+	captureFoldGeometry,
+	createFoldMotionController,
+	prefersReducedMotion,
+} from "./vlist-fold-motion";
 import {
 	hasEffectiveHeightOverride,
 	layoutItemsWithOverrides,
@@ -173,6 +179,7 @@ import {
 } from "./vlist-spec-carryover-actions";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
+import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
 import { injectUserBubbleAttachmentOpen, injectUserBubbleHeader } from "./vlist-user-bubble-header";
 import {
 	collectVListUserMarkers,
@@ -483,6 +490,41 @@ function domIdForItem(item: VListItem, sourceIds: readonly string[]): string | u
 
 function messageIdFromTarget(target: string): string {
 	return target.startsWith("msg-") ? target.slice(4) : target;
+}
+
+/**
+ * Normalize a manifest `documentRevision` to a number for the fold capture's
+ * validity check.
+ *
+ * The manifest types it as `string | number` (it is built as a composite string:
+ * `messageVersion~k:…~f:…`), while the fold only needs "is this the same document as
+ * when the click happened". Hashing the string gives that as a cheap scalar; two
+ * different documents colliding would at worst animate one fold from a slightly
+ * wrong offset, and the age bound in `isFoldCaptureUsable` limits even that to the
+ * ~400ms after a click.
+ */
+export function foldRevisionOf(revision: string | number | undefined): number {
+	if (typeof revision === "number") return revision;
+	if (typeof revision !== "string") return -1;
+	let hash = 0;
+	for (let i = 0; i < revision.length; i++) {
+		hash = (hash * 31 + revision.charCodeAt(i)) | 0;
+	}
+	return hash;
+}
+
+/**
+ * Escape a spec key for use inside an attribute selector.
+ *
+ * Spec keys are generated (`tool-<toolUseId>`, `<messageId>-b3`), so in practice they
+ * are alphanumeric with dashes — but they are DATA, and building a selector by
+ * interpolating data is how a stray quote turns into a thrown `SyntaxError` that
+ * takes the whole render down. `CSS.escape` where available, a conservative manual
+ * escape otherwise (linkedom / older WebViews).
+ */
+export function cssAttrEscape(value: string): string {
+	if (typeof CSS !== "undefined" && typeof CSS.escape === "function") return CSS.escape(value);
+	return value.replace(/["\\]/g, "\\$&");
 }
 
 /**
@@ -1198,6 +1240,10 @@ const ExactRow = memo(
 				// becomes at L1/L2, so the two renderings are pairable across a level
 				// change. Height-neutral (a data attribute).
 				data-nf-unit={item.spec.unitId}
+				// The row's spec key, so the fold transition can resolve a planned motion
+				// to this node (see vlist-fold-motion). `id` cannot serve: it is the
+				// MESSAGE id, which several rows of one message share. Height-neutral.
+				data-nf-row-key={item.spec.key}
 				style={{
 					position: "absolute",
 					top,
@@ -1684,51 +1730,123 @@ export const PretextExactMessageList = forwardRef<
 	// the current render items.
 	const measuredByKeyRef = useRef<Map<string, VListItem["measured"]>>(new Map());
 	const collapsesByLodByKeyRef = useRef<Map<string, boolean>>(new Map());
+	/**
+	 * Fold transition (see vlist-fold-animation.ts).
+	 *
+	 * The exact canvas has no flow layout to transition, so an expand/collapse is a
+	 * FLIP: the pre-toggle geometry of the MOUNTED rows is captured here, in the click
+	 * handler, and the layout effect below plays each row from where it used to be
+	 * back to where the rebuild put it.
+	 *
+	 * A ref, not state, on purpose — the same reason `highlightRef` is one. This is a
+	 * decoration written straight to the row nodes; putting it in state would
+	 * invalidate every row's memo and (worse) make a purely visual concern part of the
+	 * render that produces the geometry it animates.
+	 */
+	const foldMotionRef = useRef(createFoldMotionController());
+	const foldCaptureRef = useRef<{
+		toggledKey: string;
+		documentRevision: number;
+		capturedAt: number;
+		scrollTop: number;
+		geometry: Map<string, FoldRowGeometry>;
+	} | null>(null);
+	/**
+	 * Reads the geometry of the CURRENTLY mounted rows.
+	 *
+	 * Assigned during render (below, once the layout and the window are known) rather
+	 * than closed over here, because this callback is created before either exists. It
+	 * is the same render-time ref assignment `resumeRecoveryRef` uses, and it keeps the
+	 * capture reading the committed values instead of a stale copy.
+	 */
+	const readFoldGeometryRef = useRef<
+		(() => { geometry: Map<string, FoldRowGeometry>; documentRevision: number }) | null
+	>(null);
+	/**
+	 * Snapshot the mounted rows' current geometry so the commit this click produces
+	 * can be animated from it.
+	 *
+	 * Reads the LAYOUT (not the DOM): the offsets are already known to the pixel, and
+	 * calling getBoundingClientRect on every mounted row inside a click handler would
+	 * force a synchronous layout for information we already have.
+	 */
+	const captureFoldBefore = useCallback((key: string) => {
+		// Reduced motion: no capture, so the layout effect below finds nothing to play
+		// and the fold applies instantly (the committed geometry).
+		if (prefersReducedMotion()) return;
+		const read = readFoldGeometryRef.current?.();
+		if (!read || read.geometry.size === 0) {
+			foldCaptureRef.current = null;
+			return;
+		}
+		foldCaptureRef.current = {
+			toggledKey: key,
+			documentRevision: read.documentRevision,
+			capturedAt: Date.now(),
+			scrollTop: scrollTopRef.current,
+			geometry: read.geometry,
+		};
+	}, []);
 	// Stable RowToggles per key (memoized) so unchanged rows keep referential props
 	// and skip React.memo re-render during scroll.
 	const togglesCacheRef = useRef<Map<string, RowToggles>>(new Map());
-	const getRowToggles = useCallback((key: string): RowToggles => {
-		const cached = togglesCacheRef.current.get(key);
-		if (cached) return cached;
-		const toggles: RowToggles = {
-			onToggle: () => {
-				const measured = measuredByKeyRef.current.get(key) as
-					| {
-							effectiveOpened?: boolean;
-							effectiveExpanded?: boolean;
-							form?: string;
-							expanded?: boolean;
-					  }
-					| undefined;
-				// A slash-command bubble reports its fold state on `expanded` (its `form`
-				// is the literal "command", so the generic checks below cannot see it).
-				const current =
-					measured?.form === "command"
-						? measured.expanded === true
-						: (measured?.effectiveOpened ??
-							measured?.effectiveExpanded ??
-							measured?.form === "expanded");
-				if (collapsesByLodByKeyRef.current.get(key) === true) {
-					setInteraction((prev) => toggleVListLodUserOverride(prev, key));
-				} else {
-					setInteraction((prev) => setVListExpanded(prev, key, !current));
-				}
-			},
-			onToggleItems: () => {
-				const measured = measuredByKeyRef.current.get(key) as
-					| { header?: { opened?: boolean } }
-					| undefined;
-				setInteraction((prev) => setVListExpanded(prev, key, !(measured?.header?.opened ?? false)));
-			},
-			onToggleEarlier: () => setInteraction((prev) => toggleVListShowEarlier(prev, key)),
-			onToggleRow: (rowIndex: number) =>
-				setInteraction((prev) => toggleVListRow(prev, key, rowIndex)),
-			onToggleTranslation: () => setInteraction((prev) => toggleVListShowOriginal(prev, key)),
-			onTogglePrompt: () => setInteraction((prev) => toggleVListPromptOpen(prev, key)),
-		};
-		togglesCacheRef.current.set(key, toggles);
-		return toggles;
-	}, []);
+	const getRowToggles = useCallback(
+		(key: string): RowToggles => {
+			const cached = togglesCacheRef.current.get(key);
+			if (cached) return cached;
+			const toggles: RowToggles = {
+				onToggle: () => {
+					const measured = measuredByKeyRef.current.get(key) as
+						| {
+								effectiveOpened?: boolean;
+								effectiveExpanded?: boolean;
+								form?: string;
+								expanded?: boolean;
+						  }
+						| undefined;
+					// A slash-command bubble reports its fold state on `expanded` (its `form`
+					// is the literal "command", so the generic checks below cannot see it).
+					const current =
+						measured?.form === "command"
+							? measured.expanded === true
+							: (measured?.effectiveOpened ??
+								measured?.effectiveExpanded ??
+								measured?.form === "expanded");
+					captureFoldBefore(key);
+					if (collapsesByLodByKeyRef.current.get(key) === true) {
+						setInteraction((prev) => toggleVListLodUserOverride(prev, key));
+					} else {
+						setInteraction((prev) => setVListExpanded(prev, key, !current));
+					}
+				},
+				onToggleItems: () => {
+					const measured = measuredByKeyRef.current.get(key) as
+						| { header?: { opened?: boolean } }
+						| undefined;
+					captureFoldBefore(key);
+					setInteraction((prev) =>
+						setVListExpanded(prev, key, !(measured?.header?.opened ?? false)),
+					);
+				},
+				onToggleEarlier: () => {
+					captureFoldBefore(key);
+					setInteraction((prev) => toggleVListShowEarlier(prev, key));
+				},
+				onToggleRow: (rowIndex: number) => {
+					captureFoldBefore(key);
+					setInteraction((prev) => toggleVListRow(prev, key, rowIndex));
+				},
+				onToggleTranslation: () => setInteraction((prev) => toggleVListShowOriginal(prev, key)),
+				onTogglePrompt: () => {
+					captureFoldBefore(key);
+					setInteraction((prev) => toggleVListPromptOpen(prev, key));
+				},
+			};
+			togglesCacheRef.current.set(key, toggles);
+			return toggles;
+		},
+		[captureFoldBefore],
+	);
 
 	// Subagent-recovery card submit. The card's row set tracks DESELECTED indices
 	// (it starts fully selected), so the payload is derived by subtracting them
@@ -1974,6 +2092,10 @@ export const PretextExactMessageList = forwardRef<
 		resolveToolCategory: getCategory,
 		resolveToolColor: resolveExactToolColor,
 		resolveToolSummary: resolveExactToolSummary,
+		// The provider fix is a labelled button on its own row, so whether an error
+		// card offers it changes that card's HEIGHT and must be resolved during
+		// adaptation rather than painted in afterwards.
+		canOfferProviderFix: errorNotice.canOfferProviderFix,
 		resolveSubagentRecentSummary: resolveExactSubagentRecentSummary,
 		resolveRecentMessageIds,
 		resolveHasPendingPermission,
@@ -2176,6 +2298,10 @@ export const PretextExactMessageList = forwardRef<
 	}, [reloadDecision.reload, messageRevision]);
 
 	const renderItems = pretextDocument.items;
+	// Read by the fold capture (a click handler), which must see the committed items
+	// without being rebuilt on every document change.
+	const renderItemsRef = useRef(renderItems);
+	renderItemsRef.current = renderItems;
 
 	// Tool uses whose full payload the USER asked for (the truncation notice's
 	// "load full content"). Publishing the list into state rather than reading it
@@ -2326,8 +2452,9 @@ export const PretextExactMessageList = forwardRef<
 	});
 
 	// Keys that currently host a dynamic (post-paint measured) body — rows carrying
-	// a live permission FORM, plus the row being edited inline. Only these may hold
-	// a height override; every other row is pure arithmetic.
+	// a live permission FORM, a row hosting an intrinsically unpredictable block
+	// (mermaid / unknown-size image), plus the row being edited inline. Only these
+	// may hold a height override; every other row is pure arithmetic.
 	//
 	// Reflection rows are deliberately NOT here: the notice is measured
 	// (measure-reflection-notice), so putting it on the dynamic path would let a
@@ -2342,6 +2469,14 @@ export const PretextExactMessageList = forwardRef<
 			// the reserved 77px is a prediction of the zero-DOM copy, not of the live
 			// component. Without this the form would be clipped to that box.
 			else if (isVListAskInPassingPending(item.spec.kind, item.spec.data)) keys.add(item.spec.key);
+			// A mermaid diagram (or an image of unknown intrinsic size) only reserves a
+			// conservative PLACEHOLDER, so its row must be allowed to report the settled
+			// height. This is the CONTRACT's controlled exception, not a new one: the
+			// render layer already switches such an element to a flowing layout and runs
+			// a ResizeObserver — it just had nowhere to report to, so the row stayed
+			// clipped to the placeholder and a diagram switched to "actual size" hid
+			// every row below it.
+			else if (hostsUnpredictableBlock(item.spec.kind, item.measured)) keys.add(item.spec.key);
 		}
 		if (editingRow) keys.add(editingRow.key);
 		return keys;
@@ -2402,6 +2537,105 @@ export const PretextExactMessageList = forwardRef<
 	visibleRef.current = visible;
 	const exactLayoutRef = useRef(exactLayout);
 	exactLayoutRef.current = exactLayout;
+
+	/**
+	 * Identity of the currently committed DOCUMENT (not its geometry).
+	 *
+	 * `manifest.documentRevision` advances on every structural change — a new message,
+	 * an edit, a live patch, an older page — but NOT on a fold, which only changes
+	 * build options. That is exactly the discriminator the FLIP needs: a capture taken
+	 * before a click is valid only if the commit it is consumed by came from that
+	 * click. `layoutRevision` would be wrong here (it moves with width/LOD too, and a
+	 * fold does change the manifest identity).
+	 */
+	const foldDocumentRevision = pretextDocument.manifest?.documentRevision;
+	// Serve the click handler's capture from the committed layout + mounted window.
+	// Assigned every render so the capture always reads current values (the callback
+	// itself is created long before either exists).
+	readFoldGeometryRef.current = () => {
+		const layout = exactLayoutRef.current;
+		const items = renderItemsRef.current;
+		const window = visibleRef.current;
+		const revision = foldRevisionOf(foldDocumentRevision);
+		if (!layout)
+			return { geometry: new Map<string, FoldRowGeometry>(), documentRevision: revision };
+		// Only the MOUNTED rows: an unmounted row has no node to animate, and bounding
+		// the map here is what keeps a fold O(window) rather than O(history).
+		const keys: string[] = [];
+		const indices: number[] = [];
+		for (let index = window.start; index < window.end; index++) {
+			const item = items[index];
+			if (!item || !layout.items[index]) continue;
+			keys.push(item.spec.key);
+			indices.push(index);
+		}
+		return {
+			geometry: captureFoldGeometry(keys, (position) => {
+				const index = indices[position];
+				return index === undefined ? undefined : layout.items[index];
+			}),
+			documentRevision: revision,
+		};
+	};
+
+	/**
+	 * Play the fold transition for the commit a toggle just produced.
+	 *
+	 * A LAYOUT effect, not a passive one: it must start the animations in the same
+	 * frame the new geometry is written, before the browser paints. A passive effect
+	 * runs after paint, so the reader would see the jumped-to state for one frame and
+	 * then watch it animate back — a flicker instead of a transition.
+	 *
+	 * `afterScrollTop` is read from the container rather than from state because the
+	 * anchored rebuild's scroll correction is itself applied in a layout effect; the
+	 * live value is what the reader will actually see (see planFoldMotion's note on
+	 * viewport coordinates).
+	 */
+	useLayoutEffect(() => {
+		const capture = foldCaptureRef.current;
+		if (!capture) return;
+		const node = viewportRef.current;
+		const layout = exactLayoutRef.current;
+		if (!node || !layout) return;
+		if (!isFoldCaptureUsable(capture, foldRevisionOf(foldDocumentRevision), Date.now())) {
+			// Something other than this fold rebuilt the document in between (or the
+			// rebuild never came). Dropping the capture is the whole point: animating
+			// that delta would move rows for a change the reader did not make.
+			foldCaptureRef.current = null;
+			return;
+		}
+		const after = readFoldGeometryRef.current?.().geometry;
+		if (!after) return;
+		const motions = planFoldMotion({
+			before: capture.geometry,
+			after,
+			toggledKey: capture.toggledKey,
+			beforeScrollTop: capture.scrollTop,
+			afterScrollTop: node.scrollTop,
+		});
+		// NOTHING TO PLAY IS NOT THE SAME AS DONE, and conflating the two is why an
+		// earlier version of this never animated at all. `setInteraction` re-renders
+		// FIRST; the document rebuild happens in usePretextDocument's passive effect
+		// afterwards. So this effect runs once on the pre-rebuild commit, where the
+		// geometry is still identical to the capture — consuming the capture there
+		// would throw it away one commit before the geometry it was taken for.
+		//
+		// Keeping it costs nothing and is bounded from both ends: the revision check
+		// above rejects a capture whose document changed underneath it, and the age
+		// bound expires one whose rebuild never arrived.
+		if (motions.length === 0) return;
+		foldCaptureRef.current = null;
+		foldMotionRef.current.play(motions, (key) =>
+			node.querySelector<HTMLElement>(`[data-nf-row-key="${cssAttrEscape(key)}"]`),
+		);
+	});
+
+	// A fold animation outlives the click (the reader can scroll away or switch
+	// narrator mid-transition), so the controller is stopped explicitly on unmount.
+	useEffect(() => {
+		const controller = foldMotionRef.current;
+		return () => controller.cancel();
+	}, []);
 
 	// Live streaming output is the document's LAST ROW, not an overlay.
 	//
@@ -3407,10 +3641,11 @@ export const PretextExactMessageList = forwardRef<
 							const editorSlot =
 								editingRow?.key === item.spec.key ? renderEditorSlot(editingRow) : undefined;
 							const askInPassingFormSlot = askInPassing.pendingSlots.get(item.spec.key);
-							const isDynamicRow =
-								permissionSlot !== undefined ||
-								editorSlot !== undefined ||
-								askInPassingFormSlot !== undefined;
+							// Must agree with `dynamicRowKeys` above: that set gates which keys may
+							// HOLD an override, this decides which rows get a reporter and the
+							// unclipped box. A row in one but not the other is either clipped with
+							// no way to report, or reports into a set that drops it.
+							const isDynamicRow = dynamicRowKeys.has(item.spec.key);
 							return (
 								<ExactRow
 									key={item.spec.key}

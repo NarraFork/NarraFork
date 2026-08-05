@@ -6,6 +6,7 @@ import {
 } from "@shared/reasoning-effort-support";
 import { computeFingerprint } from "../fingerprint";
 import { generateId } from "../id";
+import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -20,6 +21,7 @@ import {
 import { readWithTimeout } from "../stream-timeout";
 import { extractAnthropicUsage } from "../usage-tracking";
 import {
+	buildCodexEmulationHeaders,
 	CLAUDE_CLI_VERSION,
 	getHttpClaudeCliUserAgent,
 	getHttpUserAgent,
@@ -1015,6 +1017,11 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	private applyExtraHeaders(headers: Record<string, string>): Record<string, string> {
+		// Optional Codex CLI header emulation (opt-in for Anthropic providers).
+		// Applied before user extraHeaders so operators can still override.
+		if (this.config.emulateCodexHeaders) {
+			Object.assign(headers, buildCodexEmulationHeaders({ installationId: getInstallationId() }));
+		}
 		for (const [key, value] of Object.entries(this.config.extraHeaders ?? {})) {
 			if (value) headers[key] = value;
 		}

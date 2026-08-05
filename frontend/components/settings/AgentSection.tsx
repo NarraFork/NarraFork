@@ -15,6 +15,7 @@ import {
 	Title,
 } from "@mantine/core";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
+import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import {
 	IconAlertTriangle,
 	IconEye,
@@ -795,8 +796,11 @@ function RetryRuleEditor({
 	const [note, setNote] = useState("");
 
 	const handleAdd = () => {
-		const d = domain.trim() || undefined;
-		const k = keyword.trim() || undefined;
+		// Matching runs against the RAW provider message, which has no `Error: ` /
+		// `[Error] ` display prefix — strip it so a keyword pasted from an error card
+		// can actually fire (see shared/retry-rule-keyword.ts).
+		const d = stripErrorDisplayPrefix(domain) || undefined;
+		const k = stripErrorDisplayPrefix(keyword) || undefined;
 		const sc = typeof statusCode === "number" ? statusCode : undefined;
 		if (!d && !sc && !k) return;
 		const id = Math.random().toString(36).slice(2, 10);

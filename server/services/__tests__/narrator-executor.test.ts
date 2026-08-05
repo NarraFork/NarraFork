@@ -206,6 +206,100 @@ describe("executeAgentLoop result handling", () => {
 		expect(result.shouldReplayInterruptedToolResultTurn).toBe(true);
 	});
 
+	test("reports completedNaturally when the model stops calling tools", async () => {
+		const ac = new AbortController();
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{ type: "assistant_message", text: "final answer", toolUses: [] },
+					{ type: "done" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.completedNaturally).toBe(true);
+	});
+
+	test("does not report completedNaturally when the pass ends without done", async () => {
+		const ac = new AbortController();
+
+		// A tool-carrying turn that never reached `done`: the loop returned because
+		// of an out-of-band condition, so there may still be work left.
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{
+						type: "assistant_message",
+						text: "",
+						toolUses: [{ toolUseId: "toolu_1", name: "Read", input: {} }],
+					},
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.completedNaturally).toBe(false);
+		expect(result.completedAssistantTurn).toBe(true);
+	});
+
+	test("does not report completedNaturally for an aborted pass", async () => {
+		const ac = new AbortController();
+		ac.abort();
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([{ type: "done" }]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.aborted).toBe(true);
+		expect(result.completedNaturally).toBe(false);
+	});
+
+	test("does not report completedNaturally when the context overflowed", async () => {
+		const ac = new AbortController();
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{ type: "context_length_exceeded", message: "too long" },
+					{ type: "done" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.contextLengthExceeded).toBe(true);
+		expect(result.completedNaturally).toBe(false);
+	});
+
 	test("handles an image-only assistant turn", async () => {
 		const ac = new AbortController();
 

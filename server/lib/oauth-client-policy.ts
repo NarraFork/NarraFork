@@ -30,6 +30,46 @@ export const OAUTH_MAX_DANGER_REFLECTION_PROMPT_CHARS = 4_000;
 export const deviceOperationLevelSchema = z.enum(["denied", "readOnly", "readWrite"]);
 export type DeviceOperationLevel = z.infer<typeof deviceOperationLevelSchema>;
 
+/**
+ * Ceiling on the layered message projection an OAuth client may read
+ * (see shared/external/message-detail.ts).
+ *
+ * - "none": structural tiers are refused entirely; only the pre-existing bounded
+ *   plain-text projection remains reachable via `narrator.read`.
+ * - "summary": message structure with identity — prose, reasoning step titles,
+ *   per-tool name/target/status. No tool payload bodies.
+ * - "full": additionally allows reasoning bodies and byte-budgeted tool
+ *   input/output, plus the per-tool drill-down endpoint.
+ *
+ * The default is "summary", not the strictest value, and that is deliberate.
+ * Every other ceiling here guards an ACTION with side effects (executing on a
+ * device, widening a prompt, writing knowledge), so closing it by default costs
+ * an administrator nothing. This one guards a read that the client already had
+ * to obtain `message.summary.read` consent for, and defaulting it closed would
+ * mean two independent opt-ins for a single capability the user already
+ * approved. Payload disclosure is the part that genuinely warrants a second
+ * decision, so "full" is the value an administrator must choose explicitly.
+ */
+export const externalMessageDetailLevelSchema = z.enum(["none", "summary", "full"]);
+export type ExternalMessageDetailLevel = z.infer<typeof externalMessageDetailLevelSchema>;
+
+/** Strictest to most permissive; index order is load-bearing for intersection. */
+const EXTERNAL_MESSAGE_DETAIL_ORDER: readonly ExternalMessageDetailLevel[] = [
+	"none",
+	"summary",
+	"full",
+];
+
+/** The stricter (lower-disclosure) of two message detail ceilings. */
+export function stricterExternalMessageDetailLevel(
+	a: ExternalMessageDetailLevel,
+	b: ExternalMessageDetailLevel,
+): ExternalMessageDetailLevel {
+	return EXTERNAL_MESSAGE_DETAIL_ORDER.indexOf(a) <= EXTERNAL_MESSAGE_DETAIL_ORDER.indexOf(b)
+		? a
+		: b;
+}
+
 const DEVICE_OPERATION_LEVEL_ORDER: readonly DeviceOperationLevel[] = [
 	"denied",
 	"readOnly",
@@ -116,6 +156,12 @@ const oauthClientPolicyShape = {
 	 */
 	allowRobotDiagnosticPreset: z.boolean(),
 	deviceAccess: deviceAccessPolicySchema,
+	/**
+	 * Highest layered message-projection tier this client may reach. Combines with
+	 * the `message.summary.read` / `message.content.read` scopes: the effective
+	 * tier is the strictest of (requested, scope ceiling, this).
+	 */
+	messageDetail: externalMessageDetailLevelSchema,
 };
 
 const LEGACY_REMOTE_DEVICE_KEYS = [
@@ -184,6 +230,7 @@ export const oauthClientPolicySchema = z.preprocess(
 				oauthClientPolicyShape.maxDangerReflectionPromptChars.default(0),
 			allowRobotDiagnosticPreset: oauthClientPolicyShape.allowRobotDiagnosticPreset.default(false),
 			deviceAccess: oauthClientPolicyShape.deviceAccess.default(DEFAULT_DEVICE_ACCESS_POLICY),
+			messageDetail: oauthClientPolicyShape.messageDetail.default("summary"),
 		})
 		.strict()
 		.superRefine((policy, ctx) => {
@@ -318,6 +365,10 @@ export function intersectOAuthClientPolicies(
 		),
 		allowRobotDiagnosticPreset: policies.every((policy) => policy.allowRobotDiagnosticPreset),
 		deviceAccess,
+		messageDetail: policies.reduce<ExternalMessageDetailLevel>(
+			(acc, policy) => stricterExternalMessageDetailLevel(acc, policy.messageDetail),
+			"full",
+		),
 	};
 }
 

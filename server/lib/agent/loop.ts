@@ -1040,6 +1040,94 @@ export interface ReflectionLoopObservation {
 	toolResults: Array<{ toolName: string; isError: boolean; outputPreview: string }>;
 	errors: string[];
 	invalidStates: string[];
+	/** Transient retries the nested loop performed before settling. */
+	retries: number;
+	/** Last retry message, kept so an exhausted retry chain can name its cause. */
+	lastRetryMessage?: string;
+	/**
+	 * One user-facing sentence explaining why the loop produced no decision, or
+	 * undefined when it decided normally.
+	 *
+	 * The gates used to discard this entirely: `observed.errors` went to the log and the
+	 * card showed a generic "did not call DangerConfirm or DangerCancel", so a provider
+	 * 520, an exhausted retry chain, and a model that simply answered in prose were all
+	 * indistinguishable to the person deciding whether to retry or take over.
+	 */
+	failureSummary?: string;
+}
+
+/** Longest failure reason surfaced to a card; long provider HTML gets clipped. */
+const REFLECTION_FAILURE_SUMMARY_LIMIT = 300;
+
+/**
+ * One sentence a gate can persist as its decision reason.
+ *
+ * Keeps the gate's name first (the card shows this next to the tool), then the concrete
+ * cause. Falls back to the historical wording when no cause could be derived, so the string
+ * is never empty.
+ */
+export function buildReflectionFallbackMessage(
+	gateLabel: string,
+	failureSummary: string | undefined,
+): string {
+	return failureSummary
+		? `${gateLabel} could not decide: ${failureSummary}`
+		: `${gateLabel} did not reach a decision in its single allowed response`;
+}
+
+/**
+ * Collapse whitespace and clip, so an HTML error page (Cloudflare 520s arrive as a full
+ * document) becomes one readable line instead of flooding the card and the DB row.
+ */
+function condenseReflectionFailure(text: string): string {
+	const flat = text
+		.replace(/<[^>]*>/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return flat.length > REFLECTION_FAILURE_SUMMARY_LIMIT
+		? `${flat.slice(0, REFLECTION_FAILURE_SUMMARY_LIMIT)}…`
+		: flat;
+}
+
+/**
+ * Derive the user-facing failure reason from what the nested loop actually observed.
+ *
+ * Ordered by diagnostic value: a hard error names the cause, an invalid state names the
+ * protocol fault, an errored decision tool names the rejected call, and retries alone at
+ * least say the attempt was made. A loop that called its decision tool successfully has no
+ * failure at all.
+ */
+export function summarizeReflectionFailure(
+	observed: ReflectionLoopObservation,
+	options: { threw?: boolean } = {},
+): string | undefined {
+	if (observed.errors.length > 0) {
+		const detail = condenseReflectionFailure(observed.errors[0]);
+		return observed.retries > 0
+			? `provider error after ${observed.retries} ${observed.retries === 1 ? "retry" : "retries"}: ${detail}`
+			: `provider error: ${detail}`;
+	}
+	if (observed.invalidStates.length > 0) {
+		return `invalid provider response: ${condenseReflectionFailure(observed.invalidStates[0])}`;
+	}
+	const erroredTool = observed.toolResults.find((result) => result.isError);
+	if (erroredTool) {
+		return `the ${erroredTool.toolName} decision was rejected: ${condenseReflectionFailure(
+			erroredTool.outputPreview,
+		)}`;
+	}
+	if (options.threw) return "the reflection loop crashed before producing a decision";
+	if (observed.toolCalls.length > 0) return undefined;
+	if (observed.retries > 0) {
+		const detail = observed.lastRetryMessage
+			? `: ${condenseReflectionFailure(observed.lastRetryMessage)}`
+			: "";
+		return `no decision after ${observed.retries} ${
+			observed.retries === 1 ? "retry" : "retries"
+		}${detail}`;
+	}
+	if (observed.assistantMessages === 0) return "the model returned an empty response";
+	return "the model replied without calling a decision tool";
 }
 
 type ApiRequestEndEvent = Extract<AgentEvent, { type: "api_request_end" }>;
@@ -1166,6 +1254,7 @@ export async function runReflectionLoop(
 		toolResults: [],
 		errors: [],
 		invalidStates: [],
+		retries: 0,
 	};
 	const onParentAbort = () => abortController.abort();
 	parentConfig.signal.addEventListener("abort", onParentAbort, { once: true });
@@ -1254,16 +1343,34 @@ export async function runReflectionLoop(
 				});
 			} else if (event.type === "invalid_state") {
 				observed.invalidStates.push(`${event.reason}: ${event.message}`);
+			} else if (event.type === "retrying") {
+				// Retries were previously invisible: the nested loop swallowed the event, so a
+				// gate that quietly burned its whole auxiliary retry budget looked identical to
+				// one that answered on the first try. Counting them lets the failure reason say
+				// how hard we tried, and lets a caller report live retry progress.
+				observed.retries++;
+				observed.lastRetryMessage = event.message;
+				logger.warn(`${label} retrying after a transient error`, {
+					narratorId: parentConfig.narratorId,
+					kind: reflectionLoop.context.kind,
+					requestId: reflectionLoop.context.requestId,
+					attempt: event.attempt,
+					maxRetries: event.maxRetries,
+					delayMs: event.delayMs,
+					message: event.message,
+				});
 			} else if (event.type === "error") {
 				observed.errors.push(event.message);
 				logger.warn(`${label} ended with error`, {
 					narratorId: parentConfig.narratorId,
 					kind: reflectionLoop.context.kind,
 					requestId: reflectionLoop.context.requestId,
+					retries: observed.retries,
 					message: event.message,
 				});
 			}
 		}
+		observed.failureSummary = summarizeReflectionFailure(observed);
 		if (observed.toolCalls.length === 0 || observed.toolResults.some((result) => result.isError)) {
 			logger.warn(`${label} completed without a successful reflection tool decision`, {
 				narratorId: parentConfig.narratorId,
@@ -1322,9 +1429,9 @@ async function runExitPlanModeReflectionLoop(
 	toolUse: AgentToolUse,
 	input: Record<string, unknown>,
 	reflectionAbort: AbortController,
-): Promise<void> {
+): Promise<ReflectionLoopObservation> {
 	const locale = (parentConfig.locale as Locale) ?? "en";
-	await runReflectionLoop({
+	return runReflectionLoop({
 		parentConfig,
 		history,
 		prompt: buildExitPlanReflectionPrompt(requestId, input, locale, parentConfig),
@@ -1354,9 +1461,9 @@ async function runTaskReflectionLoop(
 	input: Record<string, unknown>,
 	mutations: ProtectedTaskMutation[],
 	reflectionAbort: AbortController,
-): Promise<void> {
+): Promise<ReflectionLoopObservation> {
 	const locale = (parentConfig.locale as Locale) ?? "en";
-	await runReflectionLoop({
+	return runReflectionLoop({
 		parentConfig,
 		history,
 		prompt: buildTaskReflectionPrompt(requestId, input, mutations, locale),
@@ -1421,6 +1528,27 @@ async function isDangerReflectionWaitingForUser(requestId: string): Promise<bool
 	return pendingDangerReflections.get(requestId)?.reflectionStoppedByUser === true;
 }
 
+/**
+ * Drop the in-memory pause entry for a decided gate.
+ *
+ * A user takeover (`reflectionStoppedByUser`) deliberately keeps the entry alive: the decision
+ * moved to the user and `resolvePermissionOrDangerReflection` still needs to find it.
+ */
+async function discardDangerReflectionRuntimeState(requestId: string): Promise<void> {
+	try {
+		const { pendingDangerReflections } = await import("@server/services/narrator-session-state");
+		const pending = pendingDangerReflections.get(requestId);
+		if (!pending || pending.reflectionStoppedByUser) return;
+		pending.cleanup();
+		pendingDangerReflections.delete(requestId);
+	} catch (err) {
+		logger.warn("Failed to discard danger reflection runtime state", {
+			requestId,
+			err: String(err),
+		});
+	}
+}
+
 async function resolveDangerReflectionDecision(
 	config: AgentConfig,
 	history: unknown[],
@@ -1430,15 +1558,51 @@ async function resolveDangerReflectionDecision(
 	const reflectionAbort = new AbortController();
 	await setDangerReflectionAbortController(pause.requestId, reflectionAbort);
 	let reflectionDone = false;
+	// The `.catch()` must sit HERE, at the source, not on the race arm below.
+	//
+	// A bare `reflectionPromise.then(onFulfilled)` propagates a rejection straight into
+	// `Promise.race`, so a throwing reflection loop (an unresolvable model id reaching
+	// `resolveProviderAndModel`, a failed dynamic import, a SQLite error while recording the
+	// auxiliary request) rejected this whole function and SKIPPED the fallback below. Nothing
+	// then resolved `pause.decision`, nothing wrote the tool row, and nothing removed the
+	// `pendingDangerReflections` entry — the gate stayed `pending`/`running` forever, showing a
+	// "still reflecting" card that survived reloads because the backend really was stuck.
+	//
+	// Converting the rejection to a fulfilment keeps the fallback path reachable, which is what
+	// cancels the gate and converges the row. The plan and task gates already do exactly this.
 	const reflectionPromise = runDangerReflectionLoop(
 		config,
 		history,
 		pause,
 		toolUse,
 		reflectionAbort,
-	).finally(() => {
-		reflectionDone = true;
-	});
+	)
+		.catch((err) => {
+			const crashMessage = extractErrorMessage(err);
+			logger.warn("Danger reflection loop ended unexpectedly", {
+				narratorId: config.narratorId,
+				requestId: pause.requestId,
+				err: crashMessage,
+			});
+			// Preserve the crash as a normal observation so the fallback below can name it.
+			// Returning bare `undefined` here is what made every crash surface as the generic
+			// "did not call DangerConfirm or DangerCancel".
+			const crashed: ReflectionLoopObservation = {
+				assistantMessages: 0,
+				assistantText: "",
+				assistantTextPreview: "",
+				toolCalls: [],
+				toolResults: [],
+				errors: [crashMessage],
+				invalidStates: [],
+				retries: 0,
+			};
+			crashed.failureSummary = summarizeReflectionFailure(crashed, { threw: true });
+			return crashed;
+		})
+		.finally(() => {
+			reflectionDone = true;
+		});
 	const decision = await Promise.race([
 		pause.decision.finally(() => reflectionAbort.abort()),
 		reflectionPromise.then(async (observed) => {
@@ -1458,10 +1622,18 @@ async function resolveDangerReflectionDecision(
 				if (resolved) return pause.decision;
 			}
 
-			const fallbackMessage =
-				"Danger reflection loop did not call DangerConfirm or DangerCancel in its single allowed response";
+			// Name the actual cause. The gate is being denied either way, but "provider error
+			// after 3 retries: 520 Web server is returning an unknown error" tells the user to
+			// retry, whereas "the model replied without calling a decision tool" tells them the
+			// model misbehaved — the old single generic sentence told them neither.
+			const fallbackMessage = buildReflectionFallbackMessage(
+				"Danger reflection",
+				observed.failureSummary,
+			);
 			const { cancelDangerReflection } = await import("@server/services/narrator-permission");
-			const cancelled = await cancelDangerReflection(pause.requestId, fallbackMessage);
+			const cancelled = await cancelDangerReflection(pause.requestId, fallbackMessage, undefined, {
+				failed: true,
+			});
 			if (cancelled) return pause.decision;
 
 			// If the cancellation path could not find the pending request, do not leave the
@@ -1480,6 +1652,10 @@ async function resolveDangerReflectionDecision(
 			logger.warn("Danger reflection loop cleanup failed", { err: String(err) });
 		});
 	}
+	// Whichever arm won, this gate is decided. A surviving runtime entry would keep the
+	// narrator tagged "reflecting" and let a later takeover act on a resolved gate, so drop
+	// it unconditionally — every resolve path is idempotent about an already-removed entry.
+	await discardDangerReflectionRuntimeState(pause.requestId);
 	return decision;
 }
 
@@ -1543,14 +1719,26 @@ async function resolveExitPlanModeReflection(
 		decisionPromise.finally(() => reflectionAbort.abort()),
 		reflectionPromise
 			.catch((err) => {
-				logger.warn("ExitPlanMode reflection loop ended unexpectedly", { err: String(err) });
+				const crashMessage = extractErrorMessage(err);
+				logger.warn("ExitPlanMode reflection loop ended unexpectedly", { err: crashMessage });
+				return crashMessage;
 			})
-			.then(async () => {
+			.then(async (outcome) => {
 				if (isExitPlanReflectionWaitingForUser(requestId)) {
 					return { action: "manual" as const };
 				}
-				const fallbackMessage =
-					"ExitPlanMode reflection loop did not call ExitPlanConfirm or ExitPlanRevise in its single allowed response";
+				// The plan gate's feedback goes back to the MODEL as revision guidance, so a
+				// concrete cause matters twice over: a provider fault tells it to retry the same
+				// plan, while "replied without calling a decision tool" tells it to answer with
+				// the tool. The old fixed string asserted the latter even for the former.
+				const failureSummary =
+					typeof outcome === "string"
+						? `the reflection loop crashed before producing a decision: ${outcome}`
+						: outcome.failureSummary;
+				const fallbackMessage = buildReflectionFallbackMessage(
+					"ExitPlanMode reflection",
+					failureSummary,
+				);
 				const cancelled = await cancelExitPlanReflection(requestId, fallbackMessage);
 				if (cancelled) return decisionPromise;
 
@@ -1779,20 +1967,25 @@ async function resolveTaskReflection(
 		reflectionAbort,
 	)
 		.catch((err) => {
-			logger.warn("Task reflection loop ended unexpectedly", { err: String(err) });
+			const crashMessage = extractErrorMessage(err);
+			logger.warn("Task reflection loop ended unexpectedly", { err: crashMessage });
+			return crashMessage;
 		})
 		.finally(() => {
 			reflectionDone = true;
 		});
 	const decision = await Promise.race([
 		decisionPromise.finally(() => reflectionAbort.abort()),
-		reflectionPromise.then(async () => {
+		reflectionPromise.then(async (outcome) => {
 			// The user took over: hand the decision to their approve/deny instead of
 			// letting the AI reflection fall back (mirrors danger/plan takeover).
 			if (isTaskReflectionWaitingForUser(requestId)) return decisionPromise;
 
-			const fallbackMessage =
-				"taskReflection loop did not call TaskReflectConfirm or TaskReflectRevise in its single allowed response.";
+			const failureSummary =
+				typeof outcome === "string"
+					? `the reflection loop crashed before producing a decision: ${outcome}`
+					: outcome.failureSummary;
+			const fallbackMessage = buildReflectionFallbackMessage("taskReflection", failureSummary);
 			const fallbackNextSteps =
 				"Review the protected task, gather concrete evidence, and try the tasks.json change again only if it remains justified.";
 			// Broadcast a resolved (cancelled) state so live clients converge instead of
@@ -2359,7 +2552,11 @@ export async function* agentLoop(
 			yield { type: "error", message: "Aborted" };
 			return;
 		}
-		const responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal);
+		// A reflection sub-loop runs inside the parent's tool admission, so it must not be
+		// parked behind the update gate — see beginNarratorResponseActivity for the deadlock.
+		const responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal, {
+			isReflection: !!config.reflectionLoop,
+		});
 		try {
 			// Delivery is de-duplicated only within one model turn. If persistence failed,
 			// the still-pending state may be attached again on the next turn.

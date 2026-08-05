@@ -274,7 +274,9 @@ describe("resolveRowReflection", () => {
 		"question_reflection",
 		"task_reflection",
 	] as const;
-	const STATUSES = ["running", "awaiting_user", "confirmed", "cancelled", "aborted"] as const;
+	// "running" is excluded here and covered separately below: against a SUCCEEDED tool it is
+	// a stale row that normalizeReflectionAfterToolStatus deliberately converges.
+	const STATUSES = ["awaiting_user", "confirmed", "cancelled", "aborted", "failed"] as const;
 
 	it("resolves every reflection kind × status from the persisted suggestions", () => {
 		for (const kind of KINDS) {
@@ -289,6 +291,28 @@ describe("resolveRowReflection", () => {
 				expect(resolved?.status).toBe(status);
 				expect(resolved?.reason).toBe(`${kind}:${status}`);
 			}
+		}
+	});
+
+	it("keeps a running gate live while its tool is still running", () => {
+		for (const kind of KINDS) {
+			const source: VListReflectionSource = {
+				toolName: "Bash",
+				status: "running",
+				suggestions: [suggestion(kind, "running", { reason: "deliberating" })],
+			};
+			expect(resolveRowReflection(source, null)?.status).toBe("running");
+		}
+	});
+
+	it("converges a stale running gate whose tool already succeeded", () => {
+		for (const kind of KINDS) {
+			const source: VListReflectionSource = {
+				toolName: "Bash",
+				status: "success",
+				suggestions: [suggestion(kind, "running", { reason: "lost write" })],
+			};
+			expect(resolveRowReflection(source, null)?.status).toBe("confirmed");
 		}
 	});
 

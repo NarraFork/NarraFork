@@ -37,6 +37,14 @@ export const OAUTH_SCOPE_CAPABILITY_ADAPTER = {
 		visibility: "integration",
 	},
 	"narrator.interrupt": { descriptorId: "narrator.interrupt", visibility: "integration" },
+	"message.summary.read": {
+		descriptorId: "message.summary.read",
+		visibility: "integration",
+	},
+	"message.content.read": {
+		descriptorId: "message.content.read",
+		visibility: "integration",
+	},
 } as const satisfies Record<string, CapabilityAdapterEntry>;
 
 /**

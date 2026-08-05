@@ -17,6 +17,7 @@
 import { api } from "@frontend/lib/api";
 import { Button, Modal, NumberInput, Stack, TextInput } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -40,24 +41,31 @@ export function RetryRuleModal({ opened, onClose, errorMessage }: RetryRuleModal
 	const qc = useQueryClient();
 	const [domain, setDomain] = useState("");
 	const [statusCode, setStatusCode] = useState<number | string>("");
-	const [keyword, setKeyword] = useState(errorMessage);
+	const [keyword, setKeyword] = useState(() => stripErrorDisplayPrefix(errorMessage));
 	const [note, setNote] = useState("");
 	const [submitting, setSubmitting] = useState(false);
 
 	// A shared host reuses one modal for every error row, so the draft must follow
 	// the row that opened it instead of keeping the first error's text forever.
+	//
+	// The card's text carries a `Error: ` / `[Error] ` display prefix that the
+	// server-side matcher never sees (it matches the RAW provider message), so
+	// prefilling it verbatim produced rules that could never fire. Strip it here;
+	// the matcher strips it again for already-saved rules.
 	useEffect(() => {
 		if (!opened) return;
 		setDomain("");
 		setStatusCode("");
-		setKeyword(errorMessage);
+		setKeyword(stripErrorDisplayPrefix(errorMessage));
 		setNote("");
 	}, [opened, errorMessage]);
 
 	const handleAddRule = async () => {
 		const code = typeof statusCode === "number" ? statusCode : undefined;
-		const trimmedDomain = domain.trim() || undefined;
-		const trimmedKeyword = keyword.trim() || undefined;
+		// Normalize at the source too: if the user pasted the card text back in (or
+		// typed the prefix by hand), store the form the matcher actually compares.
+		const trimmedDomain = stripErrorDisplayPrefix(domain) || undefined;
+		const trimmedKeyword = stripErrorDisplayPrefix(keyword) || undefined;
 		if (!trimmedDomain && !code && !trimmedKeyword) {
 			notifications.show({ message: ts("retryRuleAtLeastOne"), color: "yellow" });
 			return;

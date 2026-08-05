@@ -71,7 +71,8 @@ export const TOOL_IO_BUDGETS = {
 	 * Only `plan` qualifies: `resolveDetailCap` gives ExitPlanMode plans
 	 * `0.85 × viewportHeight` (68+ lines on a tall window) instead of a fixed 400px,
 	 * so 8K would clamp a real plan that could have been measured exactly.
-	 * Mirrors the last entry of `DETAIL_MARKDOWN_PREFIX_BUDGETS`.
+	 * Mirrors `DETAIL_MARKDOWN_PREFIX_MAX_CHARS`, the ceiling on how much markdown
+	 * the measure layer will parse — this budget has to deliver what that reads.
 	 *
 	 * Knowledge/skill bodies deliberately do NOT get this: they arrive as the
 	 * output's `_text`, a field name with no discriminating power, and their cap is

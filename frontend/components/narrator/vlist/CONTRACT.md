@@ -126,13 +126,15 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 | spec_goal_added | Paper p=xs + Stack(徽标行+文本 pre-wrap🔴 + 1按钮) | ≈72 |
 | spec_continuation/blocked | Paper p=xs + 单行 truncate 🟢 | ≈37px |
 | cwd_recovery | Paper p=sm + 多段 + DirectoryPicker(动态) | 较高，非固定 |
-| error | Paper p=xs + 单行(图标16 + 错误 pre-wrap🔴) | 最小≈37 |
+| error | Paper p=xs + Stack(图标16 + 错误 pre-wrap🔴 + 2 图标控件, [可选修复按钮行]) | 最小≈37（带修复按钮 +24） |
 | knowledge_hint | Paper p=xs + heading行 + N条目(每行 truncate🟢) | 20+17×(1+N) 线性可预测 |
 | info | Paper p=xs + 文本 pre-wrap🔴 | 最小≈37 |
 | tool_loaded/unloaded | Paper p=xs + 单行文本 pre-wrap🔴 | ≈37 |
 | bash_command | Paper p=xs + 命令 monospace pre-wrap🔴 | ≈37 |
 
 > 注：`bash_command` / `tool_loaded` / `tool_unloaded` 三种块**由 role=user 的消息承载**（服务端为了让模型看到它们而存成 user 角色），但视觉上是 system 卡。adapter 的 user 分支必须先检测它们并路由到 system 卡，否则会画出一个只有头部的空气泡。
+
+> 注：`error` 卡是唯一 chrome 不完全由 kind 决定的 system 卡。它的右侧两个图标控件（标记可重试 / 关闭）恒定，但「关闭图像生成并重试」这个 provider 修复是**带文字的按钮**，占据正文下方独立一行，因此**会改变卡片高度**。是否显示由 adapter 通过 `ctx.canOfferProviderFix(errorText)` 在适配阶段决定并写入 `data.buttons`，measure 读同一个数组加上 `STACK_GAP + BUTTON_COMPACT_XS`。之所以不做成第三个图标：图标控件只能靠 hover tooltip 说明自己，触屏用户永远看不到，而这是唯一能真正解决该故障的操作。
 
 ### ToolCallCard（最复杂）
 - **折叠态整卡 ≈ 40-42px**（Paper p=xs + header 单行 ~18-20px + border 1px×2）。inRun 无边框 + Divider。
@@ -184,6 +186,29 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
    revision 在**每次 measure 时都会调用**，所以必须保持 O(1)：只读基元字段，文本走 `textSignature`（长度 + 定量采样哈希），禁止 `JSON.stringify` 整个 payload、禁止随内容规模增长的遍历。
 
 **回归防线：** `live-patch-measure-audit.test.ts` 的 EXHAUSTIVE 组对每个 patch 函数跑真实的 segmentMessages → adaptSegments → measure，断言"高度变了的行，缓存键必须也变"。新增 patch 时把它加进那份列表即可自动获得覆盖，不需要手工列字段。
+
+## 4.6 折叠过渡动画（FLIP，纯装饰层）
+
+§4/§4.5 描述的是"高度是多少"，这一节描述的是"高度改变时怎么看起来在动"。
+
+chunked 路径靠 Mantine `<Collapse>`：正文在正常流里，浏览器补间 `height`，下面的内容自然跟着滑。精确画布做不到——每行绝对定位在纯算术给出的 `top`，所以一次展开就是"重建 → 写新 top → 整列瞬移一帧"。正确但生硬。
+
+实现是 FLIP（`vlist-fold-animation.ts` 纯算 + `vlist-fold-motion.ts` 播放 + shell 接线），三条设计约束：
+
+1. **不能用 CSS transition 直接补间 `top`/`height`。** 行会随窗口挂载/卸载，新进窗口的行没有"上一个值"可补间，会从浏览器上次见到该 key 的位置飞进来；而且 `top`/`height` 是布局属性，几十行同时补间等于每帧一次全画布布局。更关键的是，全局 transition 会把**所有**几何变化都变成可见位移，包括 live patch、翻页、宽度沉降——那些重建之所以要锚定，正是为了让它们不可见。所以动画必须按用户动作逐次 opt-in。
+2. **必须在视口坐标系里计算，不是文档坐标系。** 折叠重建是锚定的（`captureCoordinatorAnchor` → `restorePretextLayoutAnchor`），展开视口上方的卡片会用 +Δ 的 `scrollTop` 写入抵消 +Δ 的文档位移——屏幕上那些行根本没动。用原始 `top` 差值会给"看起来没动的行"编造 Δ 像素滑动，正是锚点要消除的伪影。两侧各减自己的 scrollTop 后，这种情况自然坍缩成"不动画"。
+3. **展开与折叠不对称，这是刻意的。** 展开时新正文已在 commit 后的 DOM 里，所以被点的那行保持**最终盒高**（下方各行因此已经正确），用 `clip-path` 揭开新增区域，读起来就是正文在固定框里展开。折叠时展开态正文**已经被 React 卸载**，没有东西可裁，动画由下方各行从原位上滑承担（卡片头部不动，让出的空隙在 200ms 内闭合）。备选方案是 `cloneNode` 深拷贝旧子树——在 click handler 里同步克隆一张 400px 的卡片，不值得。
+
+铁律层面的位置：
+- **不属于高度模型。** 只写 `transform` / `clip-path`，都是合成属性、不参与布局、不回读。`height` 会反馈进布局并可能扰动已测高度，`top` 会和布局拥有的绝对定位打架，两者都禁止（`vlist-fold-wiring.test.ts` 按关键帧构造函数逐个断言）。
+- **不进 React state、不进测量缓存。** 和 `vlist-highlight.ts` 同一范式：用 ref 持有，直接写行节点。进 state 会为一个装饰让全窗口 memo 失效，还会把视觉关注点塞进"产生被动画几何"的那次 render。
+- 行上新增 `data-nf-row-key`（data 属性，height-neutral）供控制器定位节点；`id` 不能用，它是**消息** id，一条消息的多行共享它。
+
+两个易错点（都有守卫）：
+- **捕获必须在 click handler 里、`setInteraction` 之前。** 放在 effect 里读到的是重建后的几何，差值恒为 0。
+- **"没有可播的动作"不等于"播完了"。** `setInteraction` 先触发一次 re-render，文档重建发生在 `usePretextDocument` 的后续 effect 里。所以播放用的 layout effect 会先在"几何还没变"的那次 commit 上跑一遍——那次若消费掉 capture，就等于在它真正对应的几何到来前一次 commit 把它扔了（早期版本因此完全不动画）。保留它的代价为零，两端都有界：revision 校验挡住"文档被别的东西改了"的 capture，年龄上限（~400ms）淘汰"重建始终没来"的 capture。
+
+`prefers-reduced-motion: reduce` 下直接不捕获，于是播放 effect 找不到东西，折叠瞬时生效。
 
 ## 5. 测试约定
 

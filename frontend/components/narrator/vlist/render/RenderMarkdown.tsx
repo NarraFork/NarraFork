@@ -45,6 +45,7 @@ import { CODE_BLOCK_FONT_SIZE, FONT_SIZE, FONT_WEIGHT, MONO_FAMILY } from "../pr
 import { useShikiTokens } from "../useShikiTokens";
 import { type CodeCopyPlacement, resolveCodeCopyPlacement } from "../vlist-content-view-float";
 import { splitTokensByVisualLines } from "../vlist-token-lines";
+import { hasUnpredictableBlock } from "../vlist-unpredictable-blocks";
 import "../vlist-markdown.css";
 import { VListCodeCopyButton } from "../VListCodeCopyButton";
 import { CaretFiller } from "./caret-filler";
@@ -147,10 +148,11 @@ export function RenderMarkdown({
 	// exception. Display math is excluded: katex-geometry measures it exactly, so
 	// it needs no post-paint correction and must not drag the whole element onto
 	// the flowing path.
-	const hasUnknown = useMemo(
-		() => blocks.some((b) => b.kind === "unknown" && !isExactlyMeasured(b)),
-		[blocks],
-	);
+	// Shared with the SHELL's dynamic-row predicate (vlist-unpredictable-blocks):
+	// the shell decides whether to hand this row a reporter, this decides whether to
+	// observe. Two copies of the rule would eventually disagree, and either half
+	// disagreeing leaves the row clipped or un-recorded.
+	const hasUnknown = useMemo(() => hasUnpredictableBlock(blocks), [blocks]);
 	useEffect(() => {
 		if (!hasUnknown || !onUnknownHeight) return;
 		const node = hostRef.current;
@@ -342,16 +344,6 @@ function resolveCodeCopyPlacements(
 		break;
 	}
 	return out;
-}
-
-/**
- * True when an "unknown" block's geometry was in fact measured exactly, so the
- * render layer must NOT fall back to post-paint DOM measurement. Display math
- * measured by katex-geometry reports `intrinsicWidth`; mermaid and unknown-size
- * images do not.
- */
-function isExactlyMeasured(block: PreparedUnknownBlock): boolean {
-	return block.tag === "katex" && block.intrinsicWidth != null;
 }
 
 function BlockView({

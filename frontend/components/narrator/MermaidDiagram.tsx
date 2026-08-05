@@ -6,7 +6,16 @@ import {
 	IconArrowsMinimize,
 	IconDownload,
 } from "@tabler/icons-react";
-import { type CSSProperties, memo, useCallback, useEffect, useId, useRef, useState } from "react";
+import {
+	type CSSProperties,
+	memo,
+	useCallback,
+	useEffect,
+	useId,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { PANZOOM_TOOLTIP_Z, PanZoomStage } from "../common/PanZoomStage";
@@ -229,6 +238,19 @@ export const MermaidDiagram = memo(function MermaidDiagram({
 
 	const tooLarge = code.length > MERMAID_MAX_CHARS;
 
+	/**
+	 * Stable `dangerouslySetInnerHTML` payload.
+	 *
+	 * React compares this prop BY OBJECT IDENTITY, so a fresh `{__html: svg}`
+	 * literal made it re-write `innerHTML` on every re-render — replacing the <svg>
+	 * node and wiping the inline width/height `applySvgSize` had written. The
+	 * visible symptom was that clicking the diagram (which opens fullscreen, hence
+	 * a re-render) ALSO dropped the height cap, so the inline diagram jumped to its
+	 * full size as if the size toggle had been pressed. Memoizing keeps the node —
+	 * and its sizing — alive across re-renders.
+	 */
+	const svgHtml = useMemo(() => (svg ? { __html: svg } : null), [svg]);
+
 	useEffect(() => {
 		if (tooLarge) return;
 		const trimmed = code.trim();
@@ -266,6 +288,12 @@ export const MermaidDiagram = memo(function MermaidDiagram({
 
 	// After the SVG is injected (or the mode toggles), rewrite its inline size so
 	// mermaid's own `max-width` doesn't pin narrow diagrams tiny or break "actual".
+	//
+	// This only stays correct because `svgHtml` is memoized on `svg`: React re-applies
+	// `dangerouslySetInnerHTML` whenever that prop object changes IDENTITY, replacing
+	// the <svg> node and discarding the sizing written here. With a fresh literal the
+	// node was rebuilt on re-renders this effect does not observe, so the sizing was
+	// silently lost. `[svg, sizeMode]` covers every case in which the node can change.
 	useEffect(() => {
 		if (!svg) return;
 		applySvgSize(svgHostRef.current, sizeMode);
@@ -289,6 +317,13 @@ export const MermaidDiagram = memo(function MermaidDiagram({
 			el.style.height = `${Math.round(size.height)}px`;
 		}
 	}, [fullscreen, svg]);
+
+	// Flip the inline height cap. The new height is picked up by the host's own
+	// ResizeObserver (the vlist's onUnknownHeight path), so no explicit
+	// notification is needed — the diagram just has to actually change size.
+	const toggleSizeMode = useCallback(() => {
+		setSizeMode((mode) => (mode === "fit" ? "actual" : "fit"));
+	}, []);
 
 	const handleExportPng = useCallback(async () => {
 		// Prefer the fullscreen SVG when the fullscreen view is mounted, else the
@@ -347,7 +382,7 @@ export const MermaidDiagram = memo(function MermaidDiagram({
 		);
 	}
 
-	if (pending || !svg) {
+	if (pending || !svg || !svgHtml) {
 		return (
 			<Text size="xs" c="dimmed" fs="italic" p="xs">
 				{t("mermaidRendering")}
@@ -372,7 +407,8 @@ export const MermaidDiagram = memo(function MermaidDiagram({
 							size="sm"
 							variant="filled"
 							color="gray"
-							onClick={() => setSizeMode((m) => (m === "fit" ? "actual" : "fit"))}
+							data-nf-mermaid-size-toggle
+							onClick={toggleSizeMode}
 							aria-label={sizeMode === "fit" ? t("mermaidSwitchToActual") : t("mermaidSwitchToFit")}
 						>
 							{/* Icon reflects the ACTION: fit → maximize (grow to actual),
@@ -421,10 +457,11 @@ export const MermaidDiagram = memo(function MermaidDiagram({
 				<div
 					ref={svgHostRef}
 					className={hostClassName}
+					data-nf-mermaid-body
 					style={{ cursor: "zoom-in" }}
 					onClick={openFullscreen}
 					// biome-ignore lint/security/noDangerouslySetInnerHtml: SVG produced by mermaid with securityLevel "strict"
-					dangerouslySetInnerHTML={{ __html: svg }}
+					dangerouslySetInnerHTML={svgHtml}
 				/>
 			</div>
 
@@ -449,9 +486,10 @@ export const MermaidDiagram = memo(function MermaidDiagram({
 						<div
 							ref={fullscreenHostRef}
 							className="nf-mermaid"
+							data-nf-mermaid-fullscreen
 							style={{ display: "flex" }}
 							// biome-ignore lint/security/noDangerouslySetInnerHtml: SVG produced by mermaid with securityLevel "strict"
-							dangerouslySetInnerHTML={{ __html: svg }}
+							dangerouslySetInnerHTML={svgHtml}
 						/>
 					</PanZoomStage>,
 					document.body,

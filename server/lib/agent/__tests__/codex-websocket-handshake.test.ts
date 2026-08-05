@@ -1,26 +1,25 @@
 /**
- * The Codex Responses WebSocket handshake used to be reported to request
- * diagnostics as a hand-written stand-in (`originator: narrafork` plus a
- * hardcoded beta header), so the dump never matched what was actually sent on
- * the wire. The transport now surfaces the real handshake headers and the exact
- * `response.create` envelope through `onRequestPrepared` before connecting.
+ * Handshake headers for the Codex Responses WebSocket.
  *
- * These tests drive that callback with an already-aborted signal: the transport
- * prepares the request, reports it, and then fails fast in ensureConnection —
- * so the real header/envelope builders are exercised with no network access.
+ * These are worth pinning because a wrong header or a wrong conditional does not
+ * surface as a visible error: the upstream refuses the upgrade and the transport
+ * silently falls back to HTTP, so the only symptom is "WS never works" with no
+ * useful log. The two callers also deliberately differ — openai-provider's codex
+ * channel supplies a fingerprint, the built-in Codex adapter does not — so the
+ * default path and the override path both need coverage.
+ *
+ * See docs/codex-websocket.md for the documented contract.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { ORIGINATOR_CODEX } from "../../user-agent";
+import { describe, expect, test } from "bun:test";
+import { getHttpUserAgent } from "../../user-agent";
 import {
+	buildHandshakeHeaders,
 	type CodexResponsesRequestBody,
-	clearCodexResponsesWebSocketSessions,
 	type StreamCodexResponsesWebSocketOptions,
-	streamCodexResponsesWebSocket,
 } from "../codex-websocket";
 
-type Prepared = { url: string; headers: Record<string, string>; body: Record<string, unknown> };
-
-const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const RELAY_BASE_URL = "https://relay.example.com/codex";
 
 function makeRequest(): CodexResponsesRequestBody {
 	return {
@@ -32,105 +31,107 @@ function makeRequest(): CodexResponsesRequestBody {
 	};
 }
 
-/**
- * Run the transport far enough to capture the prepared request, then let the
- * aborted signal tear it down. Returns whatever onRequestPrepared observed.
- */
-async function capturePrepared(
+function makeOptions(
 	overrides: Partial<StreamCodexResponsesWebSocketOptions> = {},
-): Promise<Prepared> {
-	let prepared: Prepared | undefined;
-	const controller = new AbortController();
-	controller.abort();
-
-	const options: StreamCodexResponsesWebSocketOptions = {
-		baseUrl: CODEX_BASE_URL,
+): StreamCodexResponsesWebSocketOptions {
+	return {
+		baseUrl: OFFICIAL_BASE_URL,
 		apiKey: "sk-test-key",
 		sessionKey: "session-key",
-		conversationId: "conv-1",
 		credentialId: "cred-1",
 		model: "gpt-5.3-codex",
 		request: makeRequest(),
-		signal: controller.signal,
-		onRequestPrepared: (request) => {
-			prepared = request as Prepared;
-		},
+		signal: new AbortController().signal,
 		...overrides,
 	};
-
-	try {
-		for await (const _event of streamCodexResponsesWebSocket(options)) {
-			// The aborted signal ends the stream; no events are expected.
-		}
-	} catch {
-		// ensureConnection rejects on an aborted signal — that is the point.
-	}
-
-	if (!prepared) throw new Error("onRequestPrepared was never called");
-	return prepared;
 }
 
-afterEach(async () => {
-	await clearCodexResponsesWebSocketSessions();
-});
+function build(
+	overrides: Partial<StreamCodexResponsesWebSocketOptions> = {},
+	turnState: string | null = null,
+): Record<string, string> {
+	return buildHandshakeHeaders(makeOptions(overrides), { turnState });
+}
 
-describe("Codex WebSocket handshake reported to diagnostics", () => {
-	test("targets the /responses websocket endpoint", async () => {
-		const prepared = await capturePrepared();
+describe("codex WebSocket handshake headers", () => {
+	test("built-in Codex adapter path (no fingerprint) sends the narrafork defaults", () => {
+		const headers = build();
 
-		expect(prepared.url).toBe("wss://chatgpt.com/backend-api/codex/responses");
+		expect(headers.Authorization).toBe("Bearer sk-test-key");
+		expect(headers["User-Agent"]).toBe(getHttpUserAgent());
+		expect(headers.originator).toBe("narrafork");
+		expect(headers["OpenAI-Beta"]).toBe("responses_websockets=2026-02-06");
 	});
 
-	test("sends the managed Codex client identity, not a narrafork originator", async () => {
-		const prepared = await capturePrepared();
+	test("authorization overrides the bearer form (Agent Identity assertions)", () => {
+		const headers = build({ authorization: "  AgentAssertion abc  " });
 
-		expect(prepared.headers.originator).toBe(ORIGINATOR_CODEX);
-		expect(prepared.headers.originator).not.toBe("narrafork");
-		expect(prepared.headers["x-openai-internal-codex-responses-lite"]).toBe("true");
+		expect(headers.Authorization).toBe("AgentAssertion abc");
 	});
 
-	test("correlates session/thread/client-request ids to one conversation", async () => {
-		const prepared = await capturePrepared({ conversationId: "conv-abc" });
+	test("a blank authorization falls back to the api key rather than sending an empty header", () => {
+		const headers = build({ authorization: "   " });
 
-		expect(prepared.headers["session-id"]).toBe("conv-abc");
-		expect(prepared.headers["thread-id"]).toBe("conv-abc");
-		expect(prepared.headers["x-client-request-id"]).toBe("conv-abc");
-		// The real CLI uses hyphenated names; the legacy underscore form is gone.
-		expect(prepared.headers.session_id).toBeUndefined();
+		expect(headers.Authorization).toBe("Bearer sk-test-key");
 	});
 
-	test("reports the real Authorization header rather than a placeholder", async () => {
-		const prepared = await capturePrepared({ authorization: "Bearer real-token" });
+	test("x-client-request-id carries the session key", () => {
+		const headers = build({ sessionKey: "narrator-42" });
 
-		expect(prepared.headers.Authorization).toBe("Bearer real-token");
+		expect(headers["x-client-request-id"]).toBe("narrator-42");
 	});
 
-	test("applies the caller's fingerprint headers over transport defaults", async () => {
-		const prepared = await capturePrepared({
-			userAgent: "codex-tui/test (probe)",
-			extraHeaders: { originator: "custom-originator", "x-codex-installation-id": "install-1" },
+	test("Origin is the chatgpt origin on official domains and the base url elsewhere", () => {
+		expect(build().Origin).toBe("https://chatgpt.com");
+		expect(build({ baseUrl: RELAY_BASE_URL }).Origin).toBe(RELAY_BASE_URL);
+	});
+
+	test("ChatGPT-Account-Id is only sent to official domains", () => {
+		expect(build({ accountId: "acct-1" })["ChatGPT-Account-Id"]).toBe("acct-1");
+		expect(
+			build({ accountId: "acct-1", baseUrl: RELAY_BASE_URL })["ChatGPT-Account-Id"],
+		).toBeUndefined();
+	});
+
+	test("ChatGPT-Account-Id is omitted when no account is known", () => {
+		expect(build()["ChatGPT-Account-Id"]).toBeUndefined();
+	});
+
+	test("x-codex-turn-state is replayed only when the session captured one", () => {
+		expect(build({}, "turn-state-token")["x-codex-turn-state"]).toBe("turn-state-token");
+		expect(build()["x-codex-turn-state"]).toBeUndefined();
+	});
+
+	test("x-codex-turn-metadata is only sent when the caller supplies it", () => {
+		expect(build({ turnMetadata: "meta" })["x-codex-turn-metadata"]).toBe("meta");
+		expect(build()["x-codex-turn-metadata"]).toBeUndefined();
+	});
+
+	test("userAgent overrides the default UA", () => {
+		const headers = build({ userAgent: "codex_cli_rs/0.144.0 (Linux; x64) unknown" });
+
+		expect(headers["User-Agent"]).toBe("codex_cli_rs/0.144.0 (Linux; x64) unknown");
+	});
+
+	test("extraHeaders win over the built-in defaults, including originator", () => {
+		const headers = build({
+			extraHeaders: {
+				originator: "codex_cli_rs",
+				"x-codex-installation-id": "install-1",
+				"session-id": "sess-1",
+				"thread-id": "thread-1",
+			},
 		});
 
-		expect(prepared.headers["User-Agent"]).toBe("codex-tui/test (probe)");
-		expect(prepared.headers.originator).toBe("custom-originator");
-		expect(prepared.headers["x-codex-installation-id"]).toBe("install-1");
+		expect(headers.originator).toBe("codex_cli_rs");
+		expect(headers["x-codex-installation-id"]).toBe("install-1");
+		expect(headers["session-id"]).toBe("sess-1");
+		expect(headers["thread-id"]).toBe("thread-1");
 	});
 
-	test("omits volatile per-turn tracking headers by default", async () => {
-		const prepared = await capturePrepared();
+	test("empty extraHeader values do not clobber a built-in default", () => {
+		const headers = build({ extraHeaders: { originator: "" } });
 
-		expect(prepared.headers["x-codex-turn-metadata"]).toBeUndefined();
-		expect(prepared.headers["x-codex-turn-state"]).toBeUndefined();
-	});
-
-	test("reports the exact response.create envelope that will be sent", async () => {
-		const prepared = await capturePrepared();
-
-		// The envelope is the wire frame itself, not the bare request body.
-		expect(prepared.body.type).toBe("response.create");
-		expect(prepared.body.model).toBe("gpt-5.3-codex");
-		expect(prepared.body.stream).toBe(true);
-		// A fresh session has no previous response to chain from.
-		expect(prepared.body.previous_response_id).toBeUndefined();
+		expect(headers.originator).toBe("narrafork");
 	});
 });

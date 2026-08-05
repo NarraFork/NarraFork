@@ -64,6 +64,17 @@ export interface VListViewTarget {
 	/** `text` is only a prefix of the real body → the modal says so. */
 	truncated?: boolean;
 	/**
+	 * `text` is COMPLETE, but the row paints only a prefix of it (the body exceeded
+	 * the markdown parse ceiling).
+	 *
+	 * The opposite direction from `truncated`: there the modal has less than the
+	 * real payload, here the modal has MORE than the row shows. Both are statements
+	 * about a gap between what is on screen and what exists, which is why they live
+	 * side by side, but they point the reader at different places — `truncated`
+	 * needs a server fetch, this one only needs the viewer that already has the text.
+	 */
+	rowShowsPrefix?: boolean;
+	/**
 	 * The ROW can swap this markdown body for its raw source IN PLACE.
 	 *
 	 * The inline action bar's source/rendered toggle is gated on this, because that
@@ -172,6 +183,8 @@ function markdownTarget(
 	slot: string,
 	sourceText: string | undefined,
 	title: string | undefined,
+	/** The row paints only a prefix of `sourceText` (parse ceiling). */
+	bodyIsPrefix?: boolean,
 ): VListViewTarget | null {
 	const body = text(sourceText);
 	if (!body) return null;
@@ -185,6 +198,10 @@ function markdownTarget(
 		// box, and both renderers (CappedMarkdownBody / MarkdownDetailBody) already
 		// swap it for the raw source, so the inline toggle is real here.
 		sourceInline: true,
+		// The full text IS here, but the ROW only painted a prefix of it, so the
+		// fullscreen viewer is the only place the rest can be read. Flagged so the
+		// bar can point there instead of letting the inline body end mid-document.
+		...(bodyIsPrefix === true ? { rowShowsPrefix: true } : {}),
 	};
 }
 
@@ -216,7 +233,7 @@ export function resolveDetailViewTargets(
 			const slot = sectionSlot(index);
 			const title = sectionTitle(part.label, labels);
 			if (part.markdown) {
-				const md = markdownTarget(specKey, slot, part.sourceText, title);
+				const md = markdownTarget(specKey, slot, part.sourceText, title, part.bodyIsPrefix);
 				if (md) out.push(md);
 				return;
 			}
@@ -228,7 +245,13 @@ export function resolveDetailViewTargets(
 		return out;
 	}
 	if (detail.markdown) {
-		const md = markdownTarget(specKey, BODY_SLOT, detail.sourceText, undefined);
+		const md = markdownTarget(
+			specKey,
+			BODY_SLOT,
+			detail.sourceText,
+			undefined,
+			detail.bodyIsPrefix,
+		);
 		return md ? [md] : [];
 	}
 	// capped / generic: one fixed block per body, in order.

@@ -310,6 +310,28 @@ function checkpointFenceIsStable(): boolean {
 	);
 }
 
+/** Test-only view of the fence predicate. */
+export function checkpointFenceIsStableForTests(): boolean {
+	return checkpointFenceIsStable();
+}
+
+/**
+ * A lease that tracks nothing, for work that is already inside the checkpoint fence via
+ * another holder — currently only reflection decision tools, which resolve a gate whose
+ * parent tool still holds its start grant. Registering them again would make them block the
+ * checkpoint they are exempt from.
+ */
+export function inertUpdateExecutionLease(
+	kind: UpdateExecutionKind = "ordinary",
+): UpdateExecutionLease {
+	return {
+		kind,
+		token: generateToken("inert"),
+		setNarratorId() {},
+		release() {},
+	};
+}
+
 function resolveCheckpointFenceWaitersIfReady(): void {
 	if (!checkpointFenceIsStable() || checkpointFenceWaiters.length === 0) return;
 	const waiters = checkpointFenceWaiters;
@@ -492,11 +514,29 @@ function waitForCoordination(
 /**
  * Track one provider response that may still produce tool rows. Phase two prevents new
  * responses from entering while allowing a response already in flight to reach persistence.
+ *
+ * A REFLECTION request is exempt, and must be: a reflection gate (danger / plan / task /
+ * question) runs inside tool admission, so by the time it issues its request the parent
+ * loop already holds both the tool's `startGrant` and its own response lease — the two
+ * things `checkpointFenceIsStable()` waits for. Parking the reflection here deadlocked the
+ * pair: the fence could not stabilize while the tool stayed paused, and the tool could not
+ * finish deliberating until the gate reopened, which only happens on failure/cancellation.
+ * Both waits are unbounded by design, so the tool row stayed `pending` forever showing a
+ * "still reflecting" card and the update never proceeded.
+ *
+ * The exemption is safe because a reflection produces no new tool row: it decides the fate
+ * of a row that already exists and is already fenced by the grant it runs under. For the
+ * same reason it must NOT register its own activity — counting it would make it block the
+ * very checkpoint it just bypassed, recreating the deadlock from the other side.
  */
 export async function beginNarratorResponseActivity(
 	narratorId: string,
 	signal?: AbortSignal,
+	options: { isReflection?: boolean } = {},
 ): Promise<UpdateCheckpointActivityLease> {
+	if (options.isReflection) {
+		return { token: generateToken("reflection_response"), release() {} };
+	}
 	while (state.phase === "quiescing_tools" || state.phase === "restarting") {
 		await waitUntilUpdateGateOpens(signal);
 	}

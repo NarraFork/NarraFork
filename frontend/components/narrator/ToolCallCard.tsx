@@ -36,6 +36,7 @@ import {
 	type ToolShimmerFlash,
 } from "@shared/tool-shimmer";
 import {
+	IconAlertTriangle,
 	IconArrowBackUp,
 	IconBan,
 	IconBook,
@@ -1816,7 +1817,11 @@ export function ReflectionNotice({
 				? "red"
 				: reflection.status === "aborted"
 					? "orange"
-					: "gray";
+					: // `failed` is yellow, not red: red is the "judged unsafe" colour and this
+						// gate never reached a judgement.
+						reflection.status === "failed"
+						? "yellow"
+						: "gray";
 	// A running gate shows a SHIELD, not a spinner. The gate's defining property is that
 	// the user may step in (approve, reject, take over manually), and a spinner says the
 	// opposite — "wait, nothing for you here". The shield is also the shape this state
@@ -1829,6 +1834,8 @@ export function ReflectionNotice({
 		<IconX size={14} />
 	) : reflection.status === "aborted" ? (
 		<IconBan size={14} />
+	) : reflection.status === "failed" ? (
+		<IconAlertTriangle size={14} />
 	) : (
 		<IconShield size={14} />
 	);

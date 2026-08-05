@@ -54,6 +54,7 @@ import {
 	type DeviceOperationLevel,
 	OAUTH_APP_AVAILABLE_SCOPES,
 	type OAuthAppManifest,
+	type OAuthAppMessageDetail,
 	type OAuthAppPermissionMode,
 	type OAuthAppPolicy,
 	type OAuthAppSystemPromptMode,
@@ -68,6 +69,7 @@ export const Route = createFileRoute("/settings/oauth-apps")({
 const PERMISSION_MODES = ["readOnly", "dontAsk"] as const;
 const DEVICE_OPERATION_LEVELS = ["denied", "readOnly", "readWrite"] as const;
 const DEVICE_ACCESS_GROUPS = ["host", "global", "selfRegistered"] as const;
+const MESSAGE_DETAIL_LEVELS = ["none", "summary", "full"] as const;
 
 interface ExternalWebSocketSettingsForm {
 	ticketTtlMs: number;
@@ -450,6 +452,9 @@ function SettingsOAuthAppsPage() {
 			)
 		) {
 			return t("oauthAppsPolicyInvalidDeviceAccess");
+		}
+		if (!MESSAGE_DETAIL_LEVELS.some((level) => level === candidate.messageDetail)) {
+			return t("oauthAppsPolicyInvalidMessageDetail");
 		}
 		return null;
 	};
@@ -1139,6 +1144,10 @@ function PolicyFields({
 		t(`oauthAppsPolicyDeviceAccess${group[0].toUpperCase()}${group.slice(1)}`);
 	const deviceOperationLevelLabel = (level: DeviceOperationLevel) =>
 		t(`oauthAppsPolicyDeviceAccessLevel${level[0].toUpperCase()}${level.slice(1)}`);
+	const messageDetailLabel = (level: OAuthAppMessageDetail) =>
+		t(`oauthAppsPolicyMessageDetail${level[0].toUpperCase()}${level.slice(1)}`);
+	const messageDetailDescription = (level: OAuthAppMessageDetail) =>
+		t(`oauthAppsPolicyMessageDetail${level[0].toUpperCase()}${level.slice(1)}Desc`);
 	const updateDeviceAccess = (
 		group: (typeof DEVICE_ACCESS_GROUPS)[number],
 		value: string | null,
@@ -1251,6 +1260,22 @@ function PolicyFields({
 					/>
 				</Stack>
 			</Alert>
+			<Select
+				label={t("oauthAppsPolicyMessageDetail")}
+				description={t("oauthAppsPolicyMessageDetailDesc")}
+				value={policy.messageDetail}
+				data={MESSAGE_DETAIL_LEVELS.map((level) => ({
+					value: level,
+					label: messageDetailLabel(level),
+				}))}
+				onChange={(value) =>
+					value && onChange({ ...policy, messageDetail: value as OAuthAppMessageDetail })
+				}
+				allowDeselect={false}
+			/>
+			<Text size="xs" c={policy.messageDetail === "full" ? "orange" : "dimmed"} mt={-8}>
+				{messageDetailDescription(policy.messageDetail)}
+			</Text>
 			<Alert
 				color="red"
 				variant="light"
@@ -1297,6 +1322,8 @@ function PolicySummary({
 		t(`oauthAppsPolicyDeviceAccess${group[0].toUpperCase()}${group.slice(1)}`);
 	const deviceOperationLevelLabel = (level: DeviceOperationLevel) =>
 		t(`oauthAppsPolicyDeviceAccessLevel${level[0].toUpperCase()}${level.slice(1)}`);
+	const messageDetailLabel = (level: OAuthAppMessageDetail) =>
+		t(`oauthAppsPolicyMessageDetail${level[0].toUpperCase()}${level.slice(1)}`);
 	return (
 		<Stack gap={4}>
 			<Text size="xs">{permissionModeLabel(policy.defaultPermissionMode)}</Text>
@@ -1339,6 +1366,19 @@ function PolicySummary({
 						</Badge>
 					);
 				})}
+				<Badge
+					size="xs"
+					color={
+						policy.messageDetail === "full"
+							? "red"
+							: policy.messageDetail === "summary"
+								? "yellow"
+								: "gray"
+					}
+					variant="light"
+				>
+					{t("oauthAppsPolicyMessageDetail")} · {messageDetailLabel(policy.messageDetail)}
+				</Badge>
 			</Group>
 		</Stack>
 	);
@@ -1355,6 +1395,8 @@ function scopeLabel(scope: string, t: (key: string, options?: Record<string, unk
 		"narrator.provision": "oauthAppsScopeNarratorProvision",
 		"narrator.send_message": "oauthAppsScopeNarratorMessage",
 		"narrator.interrupt": "oauthAppsScopeNarratorInterrupt",
+		"message.summary.read": "oauthAppsScopeMessageSummaryRead",
+		"message.content.read": "oauthAppsScopeMessageContentRead",
 	};
 	const key = keyByScope[scope];
 	return key ? t(key) : scope;

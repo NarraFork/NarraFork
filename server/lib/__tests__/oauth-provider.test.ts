@@ -148,6 +148,8 @@ describe("oauth-provider canonical scopes", () => {
 			"narrator.provision",
 			"narrator.send_message",
 			"narrator.interrupt",
+			"message.summary.read",
+			"message.content.read",
 		]);
 		expect(OAUTH_SUPPORTED_SCOPES).toEqual(OAUTH_EXTERNAL_V1_SCOPES);
 	});

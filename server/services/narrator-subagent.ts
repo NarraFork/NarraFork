@@ -53,9 +53,12 @@ export {
 	getSubagentBufferedMessagesMap,
 	loadSubagentHistory,
 	pushSubagentBufferedMessage,
+	removeSubagentBufferedMessage,
+	reorderSubagentBufferedMessages,
 	requestSubagentBufferedMessageSoftStop,
 	type SubagentBufferedMessage,
 	type SubagentExecOptions,
+	updateSubagentBufferedMessage,
 } from "./subagent-executor";
 
 // Manual override + conclusion watchers

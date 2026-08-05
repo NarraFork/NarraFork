@@ -1,4 +1,7 @@
 import { Buffer } from "node:buffer";
+import { eq } from "drizzle-orm";
+import { db } from "../db";
+import { narrators } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotOnce } from "../lib/hot-safe";
@@ -372,10 +375,19 @@ async function handleSyncCheck(
 		throw new AppError("Narrator is not subscribed", 400, "NOT_SUBSCRIBED");
 	}
 	await requireOwnedExternalNarrator(ctx, msg.narratorId);
+	// One indexed single-column read, on a client-initiated control frame only. It
+	// lets the client compare against the revision its last REST page reported and
+	// skip a re-read entirely; pushed frames stay version-free so the fan-out path
+	// keeps doing no database work.
+	const revision = await db.query.narrators.findFirst({
+		where: eq(narrators.id, msg.narratorId),
+		columns: { messageVersion: true },
+	});
 	if (!isExternalNarratorConnectionRegistered(ws)) return;
 	sendExternalNarratorFrame(ws, {
 		type: "narrator_changed",
 		narratorId: msg.narratorId,
+		...(revision ? { documentRevision: revision.messageVersion } : {}),
 		requestId: msg.requestId,
 	});
 }

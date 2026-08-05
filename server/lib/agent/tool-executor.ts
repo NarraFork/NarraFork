@@ -1,6 +1,7 @@
 import {
 	beginToolStartAdmission,
 	convertToolStartGrantToExecution,
+	inertUpdateExecutionLease,
 	type UpdateCheckpointActivityLease,
 	type UpdateExecutionKind,
 	type UpdateExecutionLease,
@@ -456,6 +457,21 @@ export function releaseToolAdmissionState(state: ToolAdmissionState): void {
 	state.preAdmissionComplete = false;
 }
 
+/**
+ * A reflection loop's decision tool (DangerConfirm/DangerCancel, ExitPlanConfirm/...) must
+ * bypass update admission.
+ *
+ * These tools resolve a gate that is ALREADY inside the checkpoint fence: the parent tool
+ * holds its `startGrant` for as long as the gate deliberates. Making the decision tool wait
+ * for the gate to open deadlocked the pair — the fence cannot stabilize while the parent tool
+ * stays paused, and the parent cannot finish until the decision lands. They also create no new
+ * tool row and touch no execution target, so there is nothing for the fence to exclude.
+ */
+function isReflectionDecisionTool(tu: AgentToolUse, config: AgentConfig): boolean {
+	if (!config.reflectionLoop) return false;
+	return config.reflectionLoop.allowedTools.includes(tu.name);
+}
+
 export async function preAdmitToolExecution(
 	tu: AgentToolUse,
 	config: AgentConfig,
@@ -466,6 +482,10 @@ export async function preAdmitToolExecution(
 ): Promise<ToolAdmissionState> {
 	const state = options.state ?? {};
 	if (state.startGrant) return state;
+	if (isReflectionDecisionTool(tu, config)) {
+		state.preAdmissionComplete = true;
+		return state;
+	}
 	const kind = classifyToolUpdateExecution(tu);
 	for (;;) {
 		const admission = beginToolStartAdmission(kind, config.narratorId, tu.toolUseId);
@@ -493,6 +513,11 @@ async function acquireFinalToolExecution(
 	executionTarget: ToolExecutionTarget | undefined,
 	state: ToolAdmissionState,
 ): Promise<{ lease: UpdateExecutionLease; resumed: boolean }> {
+	// Reflection decision tools never take a grant (see isReflectionDecisionTool), so they
+	// have no lease to convert either. Hand back an inert lease instead of failing the gate.
+	if (isReflectionDecisionTool(tu, config)) {
+		return { lease: inertUpdateExecutionLease(), resumed: false };
+	}
 	if (!state.startGrant) {
 		await preAdmitToolExecution(tu, config, { executionTarget, state });
 	}

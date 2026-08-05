@@ -31,6 +31,7 @@ export function ModelMenuItems({
 	nugProviderIdByPrefix,
 	onRefreshProviderModels,
 	refreshingProviderId,
+	onPickerOpened,
 }: {
 	allModels: ModelOption[];
 	currentModel: string | null | undefined;
@@ -54,6 +55,14 @@ export function ModelMenuItems({
 	onRefreshProviderModels?: (providerId: string) => void;
 	/** Provider id whose refresh is in flight, used to show the spinner. */
 	refreshingProviderId?: string | null;
+	/**
+	 * Called once when the menu opens. The dropdown only mounts this component
+	 * while open, so mounting *is* the open event. Used to kick off an
+	 * opportunistic model-catalog refresh, which is what clears a stale
+	 * "temporarily unavailable" flag without the user hunting for the refresh
+	 * button.
+	 */
+	onPickerOpened?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
 	const [filter, setFilter] = useState("");
@@ -61,6 +70,13 @@ export function ModelMenuItems({
 	useEffect(() => {
 		const id = window.setTimeout(() => filterInputRef.current?.focus({ preventScroll: true }));
 		return () => window.clearTimeout(id);
+	}, []);
+	// Fire once per open. `onPickerOpened` is deliberately read through a ref so an
+	// unstable inline callback cannot re-trigger the refresh on every render.
+	const onPickerOpenedRef = useRef(onPickerOpened);
+	onPickerOpenedRef.current = onPickerOpened;
+	useEffect(() => {
+		onPickerOpenedRef.current?.();
 	}, []);
 	const groups = new Map<string, ModelOption[]>();
 	for (const m of allModels) {

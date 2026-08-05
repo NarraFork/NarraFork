@@ -83,6 +83,7 @@ export function openAIProviderToCustomApi(provider: OpenAIProviderConfig): Custo
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
+		emulateCodexHeaders: provider.emulateCodexHeaders,
 	};
 }
 
@@ -106,6 +107,7 @@ export function anthropicProviderToCustomApi(
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
+		emulateCodexHeaders: provider.emulateCodexHeaders,
 	};
 }
 
@@ -180,6 +182,7 @@ export function customApiProviderToOpenAI(
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
+		emulateCodexHeaders: provider.emulateCodexHeaders,
 	};
 }
 
@@ -204,6 +207,7 @@ export function customApiProviderToAnthropic(
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
+		emulateCodexHeaders: provider.emulateCodexHeaders,
 	};
 }
 

@@ -505,18 +505,21 @@ export const miscApi = {
 			userAgentMode: "narrafork" | "claude-code" | "codex" | "custom";
 			customUserAgent: string;
 			extraHeaders: Record<string, string>;
+			emulateCodexHeaders: boolean;
 			installationId: string;
 		}>("/codex/fingerprint"),
 	codexSetFingerprint: (data: {
 		userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
 		customUserAgent?: string;
 		extraHeaders?: Record<string, string>;
+		emulateCodexHeaders?: boolean;
 	}) =>
 		request<{
 			ok: boolean;
 			userAgentMode: "narrafork" | "claude-code" | "codex" | "custom";
 			customUserAgent: string;
 			extraHeaders: Record<string, string>;
+			emulateCodexHeaders: boolean;
 		}>("/codex/fingerprint", {
 			method: "POST",
 			body: JSON.stringify(data),
@@ -716,6 +719,24 @@ export const miscApi = {
 			totalCacheWriteTokens: number;
 			totalCacheReadTokens: number;
 		}>(`/nug/providers/${providerId}/usage/summary?range=${range}`),
+	/**
+	 * Opportunistic catalog refresh (used when a model picker opens). Rate-limited
+	 * server-side by a process-wide cooldown, so calling it on every picker open is
+	 * safe. Returns status only — re-read `/settings` for the refreshed catalog.
+	 */
+	nugRefreshStaleModels: () =>
+		request<{
+			results: Array<{
+				providerId: string;
+				attempted: boolean;
+				skipped?: "cooldown" | "not-configured";
+				retryAfterMs: number;
+				modelCount?: number;
+				error?: string;
+			}>;
+			refreshed: boolean;
+			cooldownMs: number;
+		}>("/nug/models/refresh-if-stale", { method: "POST" }),
 	nugRefreshProviderModels: (providerId: string) =>
 		request<{
 			models: Array<{

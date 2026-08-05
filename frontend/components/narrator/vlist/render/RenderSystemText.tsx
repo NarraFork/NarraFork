@@ -34,6 +34,7 @@ import {
 	IconGitFork,
 	IconListCheck,
 	IconLock,
+	IconPhotoOff,
 	IconRepeat,
 	IconRestore,
 	IconTrash,
@@ -47,6 +48,7 @@ import {
 	ICON_MARGIN_TOP,
 	KIND_CHROME,
 	ORIGIN_HEADING_GAP,
+	STACK_GAP,
 	type SystemTextData,
 	type SystemTextKind,
 } from "../measure/measure-system-text";
@@ -73,14 +75,14 @@ export interface SpecCarryoverActions {
 }
 
 /**
- * Live actions for the error card's two right-side controls. Both mutations (the
- * retry-rule dialog, the dismiss DELETE) live outside vlist/, so the shell
- * injects them; an absent handler renders the control disabled instead of
- * silently inert — the regression this slot closes.
+ * Live actions for the error card's right-side controls. Every mutation (the
+ * provider-settings fix, the retry-rule dialog, the dismiss DELETE) lives outside
+ * vlist/, so the shell injects them; an absent handler renders the control
+ * disabled instead of silently inert — the regression this slot closes.
  *
- * The two controls occupy exactly the width the measure layer reserves
- * (ERROR_RIGHT = gap + ActionIcon xs + gap + CloseButton xs), so wiring them
- * changes no height and no wrap point.
+ * The controls occupy the width the measure layer reserves for the strip
+ * (ERROR_RIGHT = 3 × (gap + xs control)), so wiring them — including showing or
+ * hiding the conditional fix — changes no height and no wrap point.
  */
 export interface ErrorNoticeActions {
 	/** Open the "mark as retryable" rule dialog prefilled with this error. */
@@ -91,6 +93,17 @@ export interface ErrorNoticeActions {
 	dismissing?: boolean;
 	/** Localized tooltip / aria-label for the retry-rule control. */
 	markRetryableLabel?: string;
+	/**
+	 * Turn off the provider's native image_generation tool and retry.
+	 *
+	 * Whether the button EXISTS is decided by the adapter (it occupies a measured
+	 * row, so `data.buttons` carries its label); this handler only makes the
+	 * painted button live. An absent handler therefore renders it disabled, like
+	 * the other controls.
+	 */
+	onDisableImageGen?: () => void;
+	/** The disable+retry round trip is in flight. */
+	disablingImageGen?: boolean;
 }
 
 interface RenderSystemTextProps {
@@ -250,11 +263,17 @@ function PlainNoticeCard({
 	);
 }
 
-// ── error: icon + body + retry/close actions ─────────────────────────────────
-// The two right-side controls are REAL controls (parity with the chunked
-// ErrorNotice): "mark as retryable" opens the rule dialog, the close button
-// deletes the notice. Both handlers are injected; without them the controls
-// render disabled rather than looking clickable while doing nothing.
+// ── error: Stack(icon + body + retry/close actions, [fix button row]) ────────
+// The right-side icons are REAL controls (parity with the chunked ErrorNotice):
+// "mark as retryable" opens the rule dialog, the close button deletes the notice.
+// Handlers are injected; without them the controls render disabled rather than
+// looking clickable while doing nothing.
+//
+// The provider fix is a LABELLED button on its own row instead of a third icon:
+// an icon-only control explains itself only through a hover tooltip, which touch
+// users never see, so the one action that actually resolves the failure would be
+// undiscoverable. Its label comes from `data.buttons[0]` — the adapter put it
+// there, which is also how the measure layer knew to reserve this row.
 function ErrorCard({
 	body,
 	width,
@@ -272,44 +291,61 @@ function ErrorCard({
 }) {
 	const showActions = data.actions !== false;
 	const markLabel = actions?.markRetryableLabel ?? "Mark as retryable";
+	const fixLabel = data.buttons?.[0];
 	return (
 		<Paper
 			p="xs"
 			radius="sm"
 			style={{ backgroundColor: cssLight("red"), height, boxSizing: "border-box" }}
 		>
-			<Group gap={GROUP_GAP} wrap="nowrap" align="flex-start" h="100%">
-				<IconAlertTriangle
-					size={ICON_16}
-					style={{ flexShrink: 0, marginTop: ICON_MARGIN_TOP, color: cssColor("red", 7) }}
-				/>
-				<SystemTextBody body={body} width={width} font={font} color={cssColor("red", 9)} />
-				{showActions ? (
-					<>
-						<Tooltip label={markLabel} withArrow>
-							<ActionIcon
+			<Stack gap={STACK_GAP} h="100%">
+				<Group gap={GROUP_GAP} wrap="nowrap" align="flex-start">
+					<IconAlertTriangle
+						size={ICON_16}
+						style={{ flexShrink: 0, marginTop: ICON_MARGIN_TOP, color: cssColor("red", 7) }}
+					/>
+					<SystemTextBody body={body} width={width} font={font} color={cssColor("red", 9)} />
+					{showActions ? (
+						<>
+							<Tooltip label={markLabel} withArrow>
+								<ActionIcon
+									size="xs"
+									variant="subtle"
+									color="red.7"
+									style={{ flexShrink: 0 }}
+									aria-label={markLabel}
+									disabled={!actions?.onMarkRetryable}
+									onClick={actions?.onMarkRetryable}
+								>
+									<IconRepeat size={14} />
+								</ActionIcon>
+							</Tooltip>
+							<CloseButton
 								size="xs"
 								variant="subtle"
-								color="red.7"
+								c="red.7"
 								style={{ flexShrink: 0 }}
-								aria-label={markLabel}
-								disabled={!actions?.onMarkRetryable}
-								onClick={actions?.onMarkRetryable}
-							>
-								<IconRepeat size={14} />
-							</ActionIcon>
-						</Tooltip>
-						<CloseButton
-							size="xs"
-							variant="subtle"
-							c="red.7"
-							style={{ flexShrink: 0 }}
-							disabled={!actions?.onDismiss || actions.dismissing === true}
-							onClick={actions?.onDismiss}
-						/>
-					</>
+								disabled={!actions?.onDismiss || actions.dismissing === true}
+								onClick={actions?.onDismiss}
+							/>
+						</>
+					) : null}
+				</Group>
+				{showActions && fixLabel ? (
+					<Button
+						size="compact-xs"
+						variant="light"
+						color="red"
+						leftSection={<IconPhotoOff size={12} />}
+						style={{ alignSelf: "flex-start" }}
+						loading={actions?.disablingImageGen === true}
+						disabled={!actions?.onDisableImageGen}
+						onClick={actions?.onDisableImageGen}
+					>
+						{fixLabel}
+					</Button>
 				) : null}
-			</Group>
+			</Stack>
 		</Paper>
 	);
 }

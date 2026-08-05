@@ -171,6 +171,115 @@ describe("agent error handling", () => {
 		).toBe(false);
 	});
 
+	// The rendered error card prefixes the provider message with `Error: ` (and the
+	// stored plain text with `[Error] `), but matching only ever sees the RAW
+	// message. A keyword copied out of that card — exactly what the "mark as
+	// retryable" dialog used to prefill — must still match.
+	test("retries custom keyword rules whose keyword carries the error-card display prefix", () => {
+		const err = new Error("Concurrency limit exceeded for account, please retry later");
+		expect(
+			isRetryableError(err, [
+				{
+					id: "r1",
+					keyword: "Error: Concurrency limit exceeded for account, please retry later",
+					enabled: true,
+				},
+			]),
+		).toBe(true);
+		// The doubly-decorated form persisted for error-card messages.
+		expect(
+			isRetryableError(err, [
+				{ id: "r2", keyword: "[Error] Error: Concurrency limit exceeded", enabled: true },
+			]),
+		).toBe(true);
+		// An invalid_state message goes through classifyInvalidState's rule path.
+		expect(
+			isRetryableInvalidStateReason("upstream_busy", "vendor queue draining", [
+				{ id: "r3", keyword: "Error: vendor queue draining", enabled: true },
+			]),
+		).toBe(true);
+	});
+
+	test("a prefix-only keyword contributes no condition", () => {
+		expect(
+			isRetryableError({ status: 418, message: "some unrelated failure" }, [
+				{ id: "r1", keyword: "Error:", enabled: true },
+			]),
+		).toBe(false);
+	});
+
+	// A hand-written rule is a deliberate user override: it outranks a provider's
+	// own `retryable: false`, which otherwise short-circuits before rules run.
+	test("custom rules override a provider-declared retryable:false", () => {
+		const message = "Concurrency limit exceeded for account, please retry later";
+		const rules = [{ id: "r1", keyword: "Concurrency limit exceeded", enabled: true }];
+		expect(isRetryableError(Object.assign(new Error(message), { retryable: false }), rules)).toBe(
+			true,
+		);
+		expect(
+			isRetryableError(
+				Object.assign(new Error(message), { diagnostics: { retryable: false } }),
+				rules,
+			),
+		).toBe(true);
+		expect(
+			classifyInvalidState("upstream_busy", message, { retryable: false }, rules).retryable,
+		).toBe(true);
+	});
+
+	test("provider retryable:false still wins when no custom rule matches", () => {
+		expect(
+			isRetryableError(
+				Object.assign(new Error("Concurrency limit exceeded for account"), { retryable: false }),
+				[{ id: "r1", keyword: "some other error", enabled: true }],
+			),
+		).toBe(false);
+	});
+
+	// A resumable failure already produced visible output; the loop continues from
+	// it instead of replaying the request, so a rule must not downgrade that into a
+	// full retry (which could duplicate output).
+	test("custom rules do not override an explicitly resumable failure", () => {
+		const message = "upstream stream error";
+		const rules = [{ id: "r1", keyword: "upstream stream error", enabled: true }];
+		expect(
+			isRetryableError(
+				Object.assign(new Error(message), {
+					retryable: false,
+					diagnostics: { resumable: true },
+				}),
+				rules,
+			),
+		).toBe(false);
+		expect(
+			classifyInvalidState(
+				"weird_unknown_reason",
+				message,
+				{ statusCode: 400, retryable: false, resumable: true },
+				rules,
+			),
+		).toMatchObject({ category: "non_retryable", retryable: false, resumable: true });
+	});
+
+	// Quota/billing is classified as hard non-retryable before rules are consulted,
+	// so an over-broad user rule cannot turn a paid-out account into a retry loop.
+	test("custom rules cannot override hard quota failures", () => {
+		expect(
+			isRetryableError(
+				Object.assign(new Error("Your credit balance is too low"), { retryable: false }),
+				[{ id: "r1", keyword: "credit balance", enabled: true }],
+			),
+		).toBe(false);
+		expect(
+			classifyInvalidState(
+				"insufficient_quota",
+				"You exceeded your current quota",
+				{ retryable: false },
+				[{ id: "r1", keyword: "quota", enabled: true }],
+			).retryable,
+		).toBe(false);
+	});
+
 	test("retries a TLS handshake that failed without an attributable cause", () => {
 		// Bun falls back to this code when no X509 verify code explains the failure —
 		// a disturbed handshake (relay/VPN/interception), not a bad certificate.

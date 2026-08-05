@@ -13,6 +13,11 @@ import { ensureKatexLoaded, getFontRevision, getKatexRevision } from "./katex-ru
 import { measureCache } from "./measure-cache";
 import type { RenderLod } from "./prepared-block";
 import {
+	invalidateCachedPretextDocument,
+	peekCachedPretextDocument,
+	writeCachedPretextDocument,
+} from "./pretext-document-cache";
+import {
 	type BuildPretextDocumentLayoutOptions,
 	buildPretextDocumentLayout,
 } from "./pretext-document-layout";
@@ -517,22 +522,25 @@ export class PretextLayoutCoordinator {
 	}
 
 	/**
-	 * Abandon the loaded document (narrator switch / teardown).
+	 * Abandon the loaded document (narrator switch / teardown), publishing it to
+	 * the cross-switch document cache first so a return visit can restore it
+	 * without a refetch (see `restore`).
 	 *
-	 * Also releases the cross-width PREPARED cache, which is the teardown hook that
-	 * `resetStreamingBlockCache` has on the streaming side and this had nowhere at
-	 * all. That cache retains a full `PreparedBlock[]` — every pretext handle, with
-	 * every fragment's baked geometry — per distinct body, and its bulk-clear only
-	 * fires at the retention ceiling. Without a release here, switching narrators
-	 * and browsing a long SPA session accumulated the union of every document ever
-	 * opened. The next build re-parses the current window in one pass, which is the
-	 * cost this cache was measured saving on RESIZE, not on document switch.
+	 * The PREPARED cache is deliberately NOT released here any more.
 	 *
-	 * `measureCache` deliberately stays: it is keyed by `documentRevision`, so its
-	 * stale entries are unreachable rather than wrong, and it has its own ceiling.
-	 * The prepared cache is the one holding the large payloads.
+	 * It used to be, to stop a long SPA session accumulating the union of every
+	 * document ever opened. But its keys are the body TEXT (plus the KaTeX/font
+	 * generations) — they carry no narrator identity — so its entries are exactly
+	 * as valid after a switch as before one, and it already bounds itself at 4M
+	 * source chars with a bulk-clear. Dropping it on switch therefore bought no
+	 * correctness and forced the returning document to re-parse every body
+	 * (measured at 94% of a full measure), which is the single largest cost in
+	 * repainting a first screen. `measureCache` was already left alone for the same
+	 * reason: keyed by `documentRevision`, its stale entries are unreachable rather
+	 * than wrong.
 	 */
 	reset(): void {
+		this.publishDocumentSnapshot();
 		this.generation++;
 		this.pendingLoad = null;
 		this.input = undefined;
@@ -540,8 +548,67 @@ export class PretextLayoutCoordinator {
 		this.loadingOlder = false;
 		this.streamingMessage = null;
 		this.current = { status: "idle" };
-		resetPreparedMarkdownCache();
 		this.emit();
+	}
+
+	/**
+	 * Publish the loaded window to the cross-switch cache.
+	 *
+	 * Called on `reset` (the narrator switch / teardown path) and directly by the
+	 * hook on unmount, because an unmount does not necessarily route through
+	 * `reset`. Writing the same snapshot twice is harmless — the cache's
+	 * `shouldReplace` gate keeps the wider/newer one.
+	 */
+	publishDocumentSnapshot(): void {
+		if (!this.narratorId || !this.input) return;
+		writeCachedPretextDocument({ narratorId: this.narratorId, input: this.input });
+	}
+
+	/**
+	 * Adopt a cached document for `narratorId` and commit its layout synchronously.
+	 *
+	 * This is the fast path for revisiting a narrator: the tail page (283KB-1.3MB on
+	 * long histories) is already in hand, so the first screen paints from a single
+	 * measure pass that hits `measureCache` for every row whose `messageVersion` and
+	 * geometry are unchanged. A `diff` reconcile against the server still has to
+	 * confirm the window is current — that is the caller's job (it triggers a
+	 * background reload), because a restore is an optimisation and never authority.
+	 *
+	 * Returns false when nothing was cached, so the caller falls back to `load`.
+	 */
+	restore(
+		narratorId: string,
+		buildOptions: PretextLayoutBuildOptions,
+		loadOptions: PretextDocumentLoadOptions = {},
+		viewportHeight = 0,
+	): boolean {
+		const cached = peekCachedPretextDocument(narratorId);
+		if (!cached) return false;
+		this.generation++;
+		const generation = this.generation;
+		this.pendingLoad = null;
+		this.narratorId = narratorId;
+		this.loadOptions = loadOptions;
+		this.loadingOlder = false;
+		this.streamingMessage = null;
+		this.input = cached;
+		try {
+			// No anchor: a restore establishes the document rather than perturbing an
+			// existing one, and the shell opens pinned to the bottom (see
+			// PretextExactMessageList's `pinnedToBottom` initial state).
+			this.commitLayout(cached, buildOptions, undefined, viewportHeight, generation);
+			return true;
+		} catch {
+			// A restore must never be able to wedge the list: drop the suspect entry
+			// and report failure so the caller performs a normal load. The error is
+			// already recorded on the snapshot by commitLayout.
+			invalidateCachedPretextDocument(narratorId);
+			this.input = undefined;
+			this.narratorId = undefined;
+			this.current = { status: "idle" };
+			this.emit();
+			return false;
+		}
 	}
 
 	/**

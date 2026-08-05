@@ -5,7 +5,7 @@ import type WebSocket from "ws";
 import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages } from "../../db/schema";
 import { logger } from "../logger";
-import { getHttpCodexUserAgent, ORIGINATOR_CODEX } from "../user-agent";
+import { getHttpUserAgent } from "../user-agent";
 import { parseGatewayDataEvent } from "./gateway-events";
 import {
 	type OAIMessage,
@@ -86,8 +86,6 @@ export interface StreamCodexResponsesWebSocketOptions {
 	accountId?: string;
 	proxy?: string;
 	sessionKey: string;
-	/** Stable conversation/thread identity sent in headers and request metadata. */
-	conversationId: string;
 	narratorId?: string;
 	credentialId: string;
 	model: string;
@@ -104,12 +102,6 @@ export interface StreamCodexResponsesWebSocketOptions {
 	 * Applied last so they can override the built-in defaults.
 	 */
 	extraHeaders?: Record<string, string>;
-	/** Observe the exact request envelope and effective handshake headers. */
-	onRequestPrepared?: (request: {
-		url: string;
-		headers: Record<string, string>;
-		body: Record<string, unknown>;
-	}) => void;
 }
 
 export class CodexWebSocketFallbackError extends Error {
@@ -343,20 +335,29 @@ function isOfficialChatGPTDomain(baseUrl: string): boolean {
 	}
 }
 
-function buildHandshakeHeaders(
+/**
+ * Build the WebSocket handshake headers.
+ *
+ * Exported for tests: a typo or a wrong conditional here only shows up as a
+ * silent fallback to HTTP, which is hard to diagnose from logs. The session
+ * parameter is narrowed to the one field that is read so tests do not have to
+ * fabricate a whole cached session.
+ *
+ * See docs/codex-websocket.md for the documented header contract.
+ */
+export function buildHandshakeHeaders(
 	options: StreamCodexResponsesWebSocketOptions,
-	session: CachedSession,
+	session: Pick<CachedSession, "turnState">,
 ): Record<string, string> {
 	const headers: Record<string, string> = {
 		Authorization: options.authorization?.trim() || `Bearer ${options.apiKey}`,
-		"User-Agent": options.userAgent ?? getHttpCodexUserAgent(),
-		originator: ORIGINATOR_CODEX,
-		"x-openai-internal-codex-responses-lite": "true",
-		"session-id": options.conversationId,
-		"thread-id": options.conversationId,
+		"User-Agent": options.userAgent ?? getHttpUserAgent(),
+		originator: "narrafork",
 		Origin: isOfficialChatGPTDomain(options.baseUrl) ? "https://chatgpt.com" : options.baseUrl,
 		[OPENAI_BETA_HEADER]: RESPONSES_WS_BETA_HEADER,
-		[CLIENT_REQUEST_ID_HEADER]: options.conversationId,
+		// The real Codex CLI keys x-client-request-id off the thread id. We only have the
+		// sticky session key here, which is the stablest per-conversation identifier available.
+		[CLIENT_REQUEST_ID_HEADER]: options.sessionKey,
 	};
 	if (options.accountId && isOfficialChatGPTDomain(options.baseUrl)) {
 		headers["ChatGPT-Account-Id"] = options.accountId;
@@ -367,10 +368,10 @@ function buildHandshakeHeaders(
 	if (options.turnMetadata) {
 		headers[TURN_METADATA_HEADER] = options.turnMetadata;
 	}
-	// Client fingerprint (originator, x-codex-installation-id, session-id/thread-id,
-	// user-configured headers) applied last so it overrides built-in defaults such as
-	// originator. The session-id/thread-id pair (matching the real Codex CLI's hyphenated
-	// header names) is supplied here rather than hardcoded above.
+	// Caller-supplied fingerprint headers, applied last so they override the built-in
+	// defaults above (including `originator`). Only the openai-provider codex channel
+	// passes these; the built-in Codex adapter passes none, so that path keeps the
+	// NarraFork UA and `originator: narrafork` defaults.
 	for (const [key, value] of Object.entries(options.extraHeaders ?? {})) {
 		if (value) headers[key] = value;
 	}
@@ -693,7 +694,6 @@ class ReusableWebSocketConnection {
 async function ensureConnection(
 	session: CachedSession,
 	options: StreamCodexResponsesWebSocketOptions,
-	handshakeHeaders?: Record<string, string>,
 ): Promise<ReusableWebSocketConnection> {
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
@@ -708,7 +708,7 @@ async function ensureConnection(
 	const url = buildCodexResponsesWebSocketUrl(options.baseUrl);
 	const connection = new ReusableWebSocketConnection(
 		url,
-		handshakeHeaders ?? buildHandshakeHeaders(options, session),
+		buildHandshakeHeaders(options, session),
 		options.proxy,
 		(response) => {
 			const turnState = response.headers[TURN_STATE_HEADER];
@@ -771,16 +771,10 @@ export async function* streamCodexResponsesWebSocket(
 			session.lastCompleted,
 		);
 		const requestText = JSON.stringify(websocketRequest);
-		const handshakeHeaders = buildHandshakeHeaders(options, session);
-		options.onRequestPrepared?.({
-			url: buildCodexResponsesWebSocketUrl(options.baseUrl),
-			headers: handshakeHeaders,
-			body: websocketRequest,
-		});
 		let reconnectCount = 0;
 		let hasYieldedEvents = false;
 
-		connection = await ensureConnection(session, options, handshakeHeaders);
+		connection = await ensureConnection(session, options);
 		if (options.signal.aborted) {
 			yield { silentDisconnect: true };
 			return;

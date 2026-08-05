@@ -79,6 +79,11 @@ export interface UsePretextDocumentOptions {
 	/** Label detail for a subagent recent-call row (tool name + projected input keys),
 	 * so the vlist row says the same thing the chunked one does. */
 	resolveSubagentRecentSummary?: (toolName: string, inputSummary: unknown) => string | null;
+	/** Whether an error card may offer the "turn off image generation" fix. Its
+	 * button is a measured row, so this reaches the adapter (see AdapterContext).
+	 * The reference changes with the user/narrator/provider it depends on, which is
+	 * why folding it into buildOptions triggers a rebuild. */
+	canOfferProviderFix?: (errorText: string) => boolean;
 	/** Resolve a tool item's pending-permission presence (live WS list). Its
 	 * reference changes when the pending set changes, so folding it into
 	 * buildOptions triggers a document rebuild (cards expand / collapse). */
@@ -253,6 +258,7 @@ export function usePretextDocument(
 			resolveToolColor: options.resolveToolColor,
 			resolveToolSummary: options.resolveToolSummary,
 			resolveSubagentRecentSummary: options.resolveSubagentRecentSummary,
+			canOfferProviderFix: options.canOfferProviderFix,
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
 			resolvePendingPlan: options.resolvePendingPlan,
 			resolveFullToolInput: options.resolveFullToolInput,
@@ -286,6 +292,11 @@ export function usePretextDocument(
 			options.resolveToolColor,
 			options.resolveToolSummary,
 			options.resolveSubagentRecentSummary,
+			// The fix button is a measured row, so eligibility must rebuild the
+			// document: the predicate's identity changes when the current user or the
+			// narrator's resolved provider does, and a card that gains (or loses) the
+			// button changes height.
+			options.canOfferProviderFix,
 			// Rebuild when the pending-permission set changes (its reference changes
 			// with the set), so cards expand/collapse as permissions come and go.
 			options.resolveHasPendingPermission,
@@ -328,6 +339,33 @@ export function usePretextDocument(
 		if (previousNarratorRef.current !== narratorId) {
 			previousNarratorRef.current = narratorId;
 			coordinator.reset();
+			// Adopt a cached document for this narrator so the first screen paints from
+			// memory instead of a 283KB-1.3MB tail refetch plus a cold measure pass.
+			//
+			// A restore is an OPTIMISATION, never authority: the window it replays was
+			// current when the reader left, and anything that happened since (new
+			// messages, an edit, a compact) is invisible to it. So a successful restore
+			// always schedules one structural revalidation, which replaces the window
+			// with the live tail. The reader sees their history immediately and the
+			// refresh lands underneath them, pinned to the bottom exactly as a cold
+			// load would be.
+			//
+			// Returns here rather than falling through: the restore already committed a
+			// layout at these very build options, so continuing would rebuild the
+			// identical document a second time in this same effect run. The revalidation
+			// is scheduled by bumping the reload token, which re-runs THIS effect and
+			// takes its `forceReload` branch — the same path a manual refresh uses, so
+			// the restored window is replaced by the live tail with no special-case
+			// commit logic. The restored screen stays visible until that fetch commits
+			// (the coordinator keeps its `input` while `status` is "loading"), making it
+			// a background refresh rather than a flash back to a skeleton.
+			if (
+				coordinator.restore(narratorId, buildOptions, options.loadOptions, options.viewportHeight)
+			) {
+				lastLodRef.current = options.lod;
+				setReloadToken((value) => value + 1);
+				return;
+			}
 		}
 		const current = coordinator.getSnapshot();
 		const lodChanged = lastLodRef.current !== options.lod;
@@ -400,6 +438,16 @@ export function usePretextDocument(
 		options.viewportHeight,
 		reloadToken,
 	]);
+	// Publish the loaded window on teardown so the next mount can restore it.
+	//
+	// `reset()` already publishes on the narrator-switch path, but an unmount does
+	// not route through it (the route destroys the whole subtree under
+	// `key={narratorId}`), which is precisely the case this cache exists for.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId drives the cleanup that publishes the outgoing narrator's document
+	useEffect(() => {
+		if (!coordinator) return;
+		return () => coordinator.publishDocumentSnapshot();
+	}, [coordinator, narratorId]);
 	// A font face resolving mid-session invalidates every baked fragment width, so
 	// the prepared blocks AND the heights derived from them must be dropped and the
 	// layout rebuilt — otherwise the committed geometry keeps the old wrap points

@@ -234,4 +234,38 @@ describe("getReasoningEncryptionState", () => {
 			]),
 		).toBe("none");
 	});
+
+	/**
+	 * `providerMetadata` is replay state the browser can neither display nor send
+	 * back, so `stripProviderMetadata` (server/services/narrator-messages.ts) removes
+	 * it from read responses — but its PRESENCE bit is a display input (it drives the
+	 * lock-icon placeholder and the substituted body), so the projection keeps it as
+	 * `{ hasEncryptedReasoning: true }`. If this equivalence ever breaks, a stripped
+	 * payload silently loses a rendered row and the message measures shorter.
+	 */
+	test("treats the projected presence flag as equivalent to real ciphertext", () => {
+		const projected: ContentBlockLike = {
+			type: "reasoning",
+			providerMetadata: { hasEncryptedReasoning: true },
+		};
+		expect(getReasoningEncryptionState([projected])).toBe("only");
+		expect(
+			getReasoningEncryptionState([{ type: "reasoning", text: "visible reasoning" }, projected]),
+		).toBe("partial");
+	});
+
+	test("a false or absent flag is not an encryption signal", () => {
+		expect(
+			getReasoningEncryptionState([
+				{ type: "reasoning", providerMetadata: { hasEncryptedReasoning: false } },
+			]),
+		).toBe("none");
+		// Signature-only metadata survives nothing on the wire, but must never be
+		// mistaken for encrypted content while it is still present.
+		expect(
+			getReasoningEncryptionState([
+				{ type: "reasoning", providerMetadata: { anthropic: { signature: "sig" } } },
+			]),
+		).toBe("none");
+	});
 });

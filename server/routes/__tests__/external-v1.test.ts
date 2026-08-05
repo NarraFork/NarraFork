@@ -79,7 +79,15 @@ const ALL_EXTERNAL_SCOPES = [
 	"narrator.provision",
 	"narrator.send_message",
 	"narrator.interrupt",
+	"message.summary.read",
+	"message.content.read",
 ];
+
+/** Scopes a client gets when the layered message read must NOT be authorized. */
+const NO_MESSAGE_SCOPES = ALL_EXTERNAL_SCOPES.filter((scope) => !scope.startsWith("message."));
+
+/** Scopes that authorize structure but not payloads. */
+const SUMMARY_ONLY_SCOPES = ALL_EXTERNAL_SCOPES.filter((scope) => scope !== "message.content.read");
 
 const DEFAULT_POLICY = {
 	defaultPermissionMode: "readOnly",
@@ -92,6 +100,9 @@ const DEFAULT_POLICY = {
 	maxDangerReflectionPromptChars: 0,
 	allowRobotDiagnosticPreset: false,
 	deviceAccess: { host: "denied", global: "denied", selfRegistered: "denied" },
+	// Matches the schema default: structure follows consent, payloads need an
+	// explicit administrator decision.
+	messageDetail: "summary",
 } as const;
 
 const app = new Hono();
@@ -159,6 +170,51 @@ interface MessagePage {
 		[key: string]: unknown;
 	}>;
 	nextCursor: string | null;
+	documentRevision?: number;
+	detail?: string;
+	detailRequested?: string;
+	pruneBoundaryMessageId?: string | null;
+	prunedPercent?: number | null;
+}
+
+interface LayeredMessage {
+	id: string;
+	seq: number;
+	role: string;
+	createdAt: string;
+	kind: string;
+	textChars: number;
+	text?: string;
+	reasoning: {
+		tokens: number | null;
+		steps?: Array<{ title: string | null; chars: number; body?: string }>;
+		stepsTruncated?: boolean;
+		unavailable?: boolean;
+	};
+	tools: {
+		count: number;
+		running: number;
+		failed: number;
+		awaitingPermission: number;
+		items?: Array<{
+			toolUseId: string;
+			name: string;
+			target: string | null;
+			status: string;
+			inputBytes: number | null;
+			outputBytes: number | null;
+			hasDetail: boolean;
+			input?: unknown;
+			output?: unknown;
+		}>;
+	};
+	subagents: { count: number; items?: Array<{ toolUseId: string; type: string | null }> };
+}
+
+interface LayeredMessagePage extends Omit<MessagePage, "items"> {
+	items: LayeredMessage[];
+	detail: string;
+	documentRevision: number;
 }
 
 function bearer(token: string): Record<string, string> {
@@ -1728,6 +1784,12 @@ describe("External v1 narrator messages", () => {
 				),
 			).toBe(true);
 		}
+		// The envelope gained fields, but the default tier is still the legacy text
+		// projection: a client written before the layered tiers existed must keep
+		// getting exactly the item shape it parses today.
+		expect(first.detail).toBe("text");
+		expect(first.detailRequested).toBeUndefined();
+		expect(typeof first.documentRevision).toBe("number");
 
 		const maxAccepted = await app.request(
 			`/api/external/v1/narrators/${narratorId}/messages?limit=50`,
@@ -1744,6 +1806,388 @@ describe("External v1 narrator messages", () => {
 			{ headers: bearer(token) },
 		);
 		expect(oversizedCursor.status).toBe(400);
+	});
+});
+
+describe("External v1 layered message detail", () => {
+	interface LayeredFixture {
+		narratorId: string;
+		assistantMessageId: string;
+		compactMessageId: string;
+	}
+
+	async function seedLayeredNarrator(
+		label: string,
+		options: { scopes?: string[]; policy?: Record<string, unknown> } = {},
+	): Promise<LayeredFixture & { token: string }> {
+		const projectId = await createProject(label);
+		const client = await createClient(label, options.policy ?? DEFAULT_POLICY);
+		const grant = await createGrant({
+			client,
+			label,
+			projectIds: [projectId],
+			...(options.scopes ? { scopes: options.scopes } : {}),
+			...(options.policy ? { policy: options.policy } : {}),
+		});
+		const token = await oauthToken(grant);
+		const device = await provisionDevice(token, `${label}-device`, { projectId });
+		const provisioned = await provisionNarrator(token, `${label}-narrator`, {
+			projectId,
+			deviceId: device.body.device.id,
+		});
+		const narratorId = provisioned.body.narrator.id;
+		const now = Date.now();
+		const userMessageId = generateId();
+		const assistantMessageId = generateId();
+		const compactMessageId = generateId();
+		await db.insert(narratorMessages).values([
+			{
+				id: userMessageId,
+				narratorId,
+				role: "user" as const,
+				contentJson: [{ type: "text", text: "please inspect the robot" }],
+				contentText: "please inspect the robot",
+				createdAt: new Date(now).toISOString(),
+			},
+			{
+				id: assistantMessageId,
+				narratorId,
+				role: "assistant" as const,
+				contentJson: [
+					{ type: "thinking", thinking: "**Check the logs**\n\nThe drive reported a fault." },
+					{ type: "text", text: "Running diagnostics." },
+					{
+						type: "tool_use",
+						id: "layered-bash",
+						name: "Bash",
+						input: { command: "systemctl status robot" },
+					},
+					{
+						type: "tool_use",
+						id: "layered-agent",
+						name: "Agent",
+						input: { subagent_type: "explore", description: "trace the fault" },
+					},
+				],
+				contentText: "Running diagnostics.",
+				reasoningTokens: 128,
+				createdAt: new Date(now + 1).toISOString(),
+			},
+			{
+				id: compactMessageId,
+				narratorId,
+				role: "system" as const,
+				contentJson: [{ type: "compact", status: "compacted", summary: "internal compact prose" }],
+				contentText: "internal compact prose",
+				createdAt: new Date(now + 2).toISOString(),
+			},
+		]);
+		await db.insert(narratorMessageRefs).values([
+			{ id: generateId(), narratorId, messageId: userMessageId, seq: 1 },
+			{ id: generateId(), narratorId, messageId: assistantMessageId, seq: 2 },
+			{ id: generateId(), narratorId, messageId: compactMessageId, seq: 3, isCompact: 1 },
+		]);
+		await db.insert(narratorToolCalls).values([
+			{
+				id: generateId(),
+				narratorId,
+				messageId: assistantMessageId,
+				toolUseId: "layered-bash",
+				toolName: "Bash",
+				inputJson: { command: "systemctl status robot" },
+				outputJson: { stdout: "layered-output-secret" },
+				status: "success" as const,
+				durationMs: 42,
+				createdAt: new Date(now + 1).toISOString(),
+				completedAt: new Date(now + 2).toISOString(),
+			},
+			{
+				id: generateId(),
+				narratorId,
+				messageId: assistantMessageId,
+				toolUseId: "layered-agent",
+				toolName: "Agent",
+				inputJson: { subagent_type: "explore", description: "trace the fault" },
+				status: "running" as const,
+				createdAt: new Date(now + 1).toISOString(),
+			},
+		]);
+		return { narratorId, assistantMessageId, compactMessageId, token };
+	}
+
+	async function fetchPage(
+		token: string,
+		narratorId: string,
+		query: string,
+	): Promise<{ status: number; body: LayeredMessagePage }> {
+		const response = await app.request(
+			`/api/external/v1/narrators/${narratorId}/messages?${query}`,
+			{ headers: bearer(token) },
+		);
+		return { status: response.status, body: (await response.json()) as LayeredMessagePage };
+	}
+
+	test("refuses structural tiers without message.summary.read", async () => {
+		const fixture = await seedLayeredNarrator("no-msg-scope", { scopes: NO_MESSAGE_SCOPES });
+		for (const detail of ["skeleton", "summary", "full"]) {
+			const response = await app.request(
+				`/api/external/v1/narrators/${fixture.narratorId}/messages?detail=${detail}`,
+				{ headers: bearer(fixture.token) },
+			);
+			expect(response.status).toBe(403);
+			expect(await responseCode(response)).toBe("INSUFFICIENT_SCOPE");
+		}
+		// The legacy tier stays reachable on narrator.read alone.
+		const legacy = await fetchPage(fixture.token, fixture.narratorId, "limit=10");
+		expect(legacy.status).toBe(200);
+		expect(legacy.body.detail).toBe("text");
+	});
+
+	test("skeleton returns bounded scalars with no prose or payloads", async () => {
+		const fixture = await seedLayeredNarrator("skeleton");
+		const { status, body } = await fetchPage(
+			fixture.token,
+			fixture.narratorId,
+			"detail=skeleton&limit=10",
+		);
+		expect(status).toBe(200);
+		expect(body.detail).toBe("skeleton");
+		const assistant = body.items.find((item) => item.id === fixture.assistantMessageId);
+		expect(assistant).toBeDefined();
+		expect(assistant?.textChars).toBe("Running diagnostics.".length);
+		expect(assistant?.text).toBeUndefined();
+		expect(assistant?.reasoning).toEqual({ tokens: 128 });
+		// One Bash call plus one Agent spawn: the subagent is counted separately, not
+		// as a tool, so a client's "N tool calls" line matches the UI's.
+		expect(assistant?.tools).toEqual({
+			count: 1,
+			running: 0,
+			failed: 0,
+			awaitingPermission: 0,
+		});
+		expect(assistant?.subagents).toEqual({ count: 1 });
+		const serialized = JSON.stringify(body);
+		for (const forbidden of [
+			"layered-output-secret",
+			"systemctl status robot",
+			"Check the logs",
+			"Running diagnostics",
+		]) {
+			expect(serialized).not.toContain(forbidden);
+		}
+	});
+
+	test("summary exposes structure and identity but never payload bodies", async () => {
+		const fixture = await seedLayeredNarrator("summary");
+		const { status, body } = await fetchPage(
+			fixture.token,
+			fixture.narratorId,
+			"detail=summary&limit=10",
+		);
+		expect(status).toBe(200);
+		expect(body.detail).toBe("summary");
+		const assistant = body.items.find((item) => item.id === fixture.assistantMessageId);
+		expect(assistant?.text).toBe("Running diagnostics.");
+		expect(assistant?.reasoning.steps).toEqual([
+			{ title: "Check the logs", chars: "The drive reported a fault.".length },
+		]);
+		const bash = assistant?.tools.items?.find((item) => item.toolUseId === "layered-bash");
+		expect(bash).toMatchObject({
+			name: "Bash",
+			target: "systemctl status robot",
+			status: "success",
+			hasDetail: true,
+		});
+		expect(bash?.input).toBeUndefined();
+		expect(bash?.output).toBeUndefined();
+		expect(bash?.outputBytes).toBeGreaterThan(0);
+		expect(assistant?.subagents.items?.[0]).toMatchObject({
+			toolUseId: "layered-agent",
+			type: "explore",
+		});
+		// The reasoning STEP BODY is a payload-class field, so it stays absent here
+		// even though the step title is present.
+		const serialized = JSON.stringify(body);
+		expect(serialized).not.toContain("layered-output-secret");
+		expect(serialized).not.toContain("The drive reported a fault.");
+	});
+
+	test("system rows surface as compact markers without their internal prose", async () => {
+		const fixture = await seedLayeredNarrator("compact-marker");
+		const { body } = await fetchPage(fixture.token, fixture.narratorId, "detail=summary&limit=10");
+		const compact = body.items.find((item) => item.id === fixture.compactMessageId);
+		expect(compact).toMatchObject({ role: "system", kind: "compact" });
+		expect(compact?.text).toBeUndefined();
+		expect(JSON.stringify(body)).not.toContain("internal compact prose");
+	});
+
+	test("degrades full to summary when only the summary scope is held", async () => {
+		const fixture = await seedLayeredNarrator("degrade-scope", {
+			scopes: SUMMARY_ONLY_SCOPES,
+			policy: { ...DEFAULT_POLICY, messageDetail: "full" },
+		});
+		const { status, body } = await fetchPage(
+			fixture.token,
+			fixture.narratorId,
+			"detail=full&limit=5",
+		);
+		expect(status).toBe(200);
+		expect(body.detail).toBe("summary");
+		expect(body.detailRequested).toBe("full");
+		expect(JSON.stringify(body)).not.toContain("layered-output-secret");
+	});
+
+	test("degrades full to summary when the policy ceiling stays at summary", async () => {
+		const fixture = await seedLayeredNarrator("degrade-policy");
+		const { body } = await fetchPage(fixture.token, fixture.narratorId, "detail=full&limit=5");
+		expect(body.detail).toBe("summary");
+		expect(body.detailRequested).toBe("full");
+		expect(JSON.stringify(body)).not.toContain("layered-output-secret");
+	});
+
+	test("refuses structural tiers when the policy forbids them outright", async () => {
+		const fixture = await seedLayeredNarrator("policy-none", {
+			policy: { ...DEFAULT_POLICY, messageDetail: "none" },
+		});
+		const response = await app.request(
+			`/api/external/v1/narrators/${fixture.narratorId}/messages?detail=summary`,
+			{ headers: bearer(fixture.token) },
+		);
+		expect(response.status).toBe(403);
+		expect(await responseCode(response)).toBe("OAUTH_POLICY_FORBIDDEN");
+	});
+
+	test("full returns projected payloads once both ceilings allow it", async () => {
+		const fixture = await seedLayeredNarrator("full-tier", {
+			policy: { ...DEFAULT_POLICY, messageDetail: "full" },
+		});
+		const { status, body } = await fetchPage(
+			fixture.token,
+			fixture.narratorId,
+			"detail=full&limit=5",
+		);
+		expect(status).toBe(200);
+		expect(body.detail).toBe("full");
+		expect(body.detailRequested).toBeUndefined();
+		const assistant = body.items.find((item) => item.id === fixture.assistantMessageId);
+		const bash = assistant?.tools.items?.find((item) => item.toolUseId === "layered-bash");
+		expect(bash?.input).toEqual({ command: "systemctl status robot" });
+		expect(bash?.output).toEqual({ stdout: "layered-output-secret" });
+		expect(assistant?.reasoning.steps?.[0]?.body).toBe("The drive reported a fault.");
+	});
+
+	test("truncates an oversized payload leaf instead of dropping or inlining it whole", async () => {
+		const fixture = await seedLayeredNarrator("full-truncate", {
+			policy: { ...DEFAULT_POLICY, messageDetail: "full" },
+		});
+		// Above the 4KB per-leaf budget but below the 64KB select guard, so the row is
+		// read and projected rather than skipped.
+		const huge = "z".repeat(8 * 1024);
+		await db
+			.update(narratorToolCalls)
+			.set({ outputJson: { stdout: huge } })
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, fixture.narratorId),
+					eq(narratorToolCalls.toolUseId, "layered-bash"),
+				),
+			);
+		const { body } = await fetchPage(fixture.token, fixture.narratorId, "detail=full&limit=5");
+		const assistant = body.items.find((item) => item.id === fixture.assistantMessageId);
+		const bash = assistant?.tools.items?.find((item) => item.toolUseId === "layered-bash");
+		expect((bash as { outputTruncated?: boolean } | undefined)?.outputTruncated).toBe(true);
+		const output = bash?.output as { stdout?: { _truncated?: boolean; fullLength?: number } };
+		expect(output.stdout?._truncated).toBe(true);
+		expect(output.stdout?.fullLength).toBe(huge.length);
+	});
+
+	test("caps the page size per tier", async () => {
+		const fixture = await seedLayeredNarrator("tier-limits", {
+			policy: { ...DEFAULT_POLICY, messageDetail: "full" },
+		});
+		const cases: Array<[string, number, number]> = [
+			["skeleton", 50, 51],
+			["summary", 30, 31],
+			["full", 10, 11],
+		];
+		for (const [detail, accepted, rejected] of cases) {
+			const ok = await app.request(
+				`/api/external/v1/narrators/${fixture.narratorId}/messages?detail=${detail}&limit=${accepted}`,
+				{ headers: bearer(fixture.token) },
+			);
+			expect(ok.status).toBe(200);
+			const bad = await app.request(
+				`/api/external/v1/narrators/${fixture.narratorId}/messages?detail=${detail}&limit=${rejected}`,
+				{ headers: bearer(fixture.token) },
+			);
+			expect(bad.status).toBe(400);
+		}
+	});
+
+	test("walks older messages with order=desc without overlap or gaps", async () => {
+		const fixture = await seedLayeredNarrator("desc-order");
+		const first = await fetchPage(
+			fixture.token,
+			fixture.narratorId,
+			"detail=skeleton&order=desc&limit=2",
+		);
+		expect(first.body.items.map((item) => item.seq)).toEqual([3, 2]);
+		expect(first.body.nextCursor).not.toBeNull();
+		const second = await fetchPage(
+			fixture.token,
+			fixture.narratorId,
+			`detail=skeleton&order=desc&limit=2&cursor=${encodeURIComponent(first.body.nextCursor as string)}`,
+		);
+		expect(second.body.items.map((item) => item.seq)).toEqual([1]);
+		expect(second.body.nextCursor).toBeNull();
+	});
+
+	test("serves the tool drill-down only with the content scope and a full policy", async () => {
+		const summaryOnly = await seedLayeredNarrator("drill-summary");
+		const denied = await app.request(
+			`/api/external/v1/narrators/${summaryOnly.narratorId}/tool-calls/layered-bash`,
+			{ headers: bearer(summaryOnly.token) },
+		);
+		expect(denied.status).toBe(403);
+		expect(await responseCode(denied)).toBe("OAUTH_POLICY_FORBIDDEN");
+
+		const noScope = await seedLayeredNarrator("drill-no-scope", {
+			scopes: SUMMARY_ONLY_SCOPES,
+			policy: { ...DEFAULT_POLICY, messageDetail: "full" },
+		});
+		const missingScope = await app.request(
+			`/api/external/v1/narrators/${noScope.narratorId}/tool-calls/layered-bash`,
+			{ headers: bearer(noScope.token) },
+		);
+		expect(missingScope.status).toBe(403);
+		expect(await responseCode(missingScope)).toBe("INSUFFICIENT_SCOPE");
+
+		const allowed = await seedLayeredNarrator("drill-full", {
+			policy: { ...DEFAULT_POLICY, messageDetail: "full" },
+		});
+		const response = await app.request(
+			`/api/external/v1/narrators/${allowed.narratorId}/tool-calls/layered-bash`,
+			{ headers: bearer(allowed.token) },
+		);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({
+			toolUseId: "layered-bash",
+			name: "Bash",
+			status: "success",
+			target: "systemctl status robot",
+			input: { command: "systemctl status robot" },
+			output: { stdout: "layered-output-secret" },
+			inputTruncated: false,
+			outputTruncated: false,
+		});
+
+		// A tool id belonging to another grant's narrator is a 404, not a 403: the
+		// facade must not confirm that the resource exists.
+		const crossGrant = await app.request(
+			`/api/external/v1/narrators/${summaryOnly.narratorId}/tool-calls/layered-bash`,
+			{ headers: bearer(allowed.token) },
+		);
+		expect(crossGrant.status).toBe(404);
 	});
 });
 

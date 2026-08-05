@@ -441,6 +441,10 @@ async function prepareAndStartRecovery(input: {
 	const candidates = selectRecoverableToolCalls(toolCalls, subagentByOrigin);
 	if (candidates.length === 0) return { recovering: false, items: [] };
 
+	// Indexed once: a linear scan per candidate is O(candidates × toolCalls) over rows
+	// that carry recorded tool input.
+	const toolCallsById = new Map(toolCalls.map((toolCall) => [toolCall.id, toolCall]));
+
 	// Re-arm each row so buildHistory does not treat the stale result as final.
 	// Broadcasting tool_started puts the card back into its running visual state.
 	for (const candidate of candidates) {
@@ -448,7 +452,7 @@ async function prepareAndStartRecovery(input: {
 			.update(narratorToolCalls)
 			.set(TOOL_CALL_RESET_FIELDS)
 			.where(eq(narratorToolCalls.id, candidate.toolCallId));
-		const source = toolCalls.find((tc) => tc.id === candidate.toolCallId);
+		const source = toolCallsById.get(candidate.toolCallId);
 		broadcastToNarrator(narratorId, {
 			type: "tool_started",
 			narratorId,
