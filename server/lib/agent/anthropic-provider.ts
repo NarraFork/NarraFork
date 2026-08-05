@@ -1385,6 +1385,9 @@ export class AnthropicProvider implements ProviderAdapter {
 		//    API requires assistant messages to end with text or tool_use, not
 		//    thinking/redacted_thinking.
 		if (thinkingEnabled) {
+			// Runs first: removing an empty thinking block can leave a message
+			// thinking-only or empty, and the two filters below are what clean that up.
+			dropEmptyThinkingBlocks(messages);
 			filterThinkingOnlyAssistantMessages(messages);
 			stripTrailingThinkingFromLastAssistant(messages);
 
@@ -1676,10 +1679,28 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (reasoningBlocks) {
 			for (let i = 0; i < reasoningBlocks.length; i++) {
 				const rb = reasoningBlocks[i];
+				// A thinking block with empty text is rejected upstream
+				// ("messages.N.content.M.thinking: ... too short"), and because the
+				// offending block lives in replayed history every later turn fails at
+				// the same index — the conversation is permanently wedged.
+				//
+				// Empty text with a signature is produced by an interrupted stream:
+				// content_block_start opens a thinking block, signature_delta fills the
+				// signature, and the connection dies before any thinking_delta arrives.
+				// Such a block carries no information — the signature is only meaningful
+				// as proof-of-origin for text that exists — so it is dropped rather than
+				// padded. Padding is not an option: the signature is cryptographically
+				// bound to the original text, so invented filler turns a length error
+				// into a harder-to-diagnose signature verification failure.
+				if (!rb.text || rb.text.trim() === "") continue;
 				const sig = rb.providerMetadata?.anthropic?.signature ?? "";
 				indexed.push({
 					part: { type: "thinking", thinking: rb.text, signature: sig },
-					outputIndex: rb.outputIndex ?? i,
+					// Fallback uses the kept-block count (indexed.length), not the raw
+					// loop index i: dropping an empty block above must not leave a gap
+					// that reorders the surviving block after the text/tool_use blocks,
+					// which anchor their own fallback to indexed.length too.
+					outputIndex: rb.outputIndex ?? indexed.length,
 				});
 			}
 		}
@@ -3037,5 +3058,43 @@ function filterThinkingOnlyAssistantMessages(messages: AnthropicMessage[]): void
 			});
 			messages.splice(i, 1);
 		}
+	}
+}
+
+/**
+ * Drop `thinking` blocks whose text is empty, anywhere in the history.
+ *
+ * The API requires every thinking block to be non-empty and rejects the whole
+ * request otherwise ("messages.N.content.M.thinking: ... too short"). Because the
+ * offending block sits in replayed history, the failure is not transient: every
+ * subsequent turn re-sends the same block at the same index and fails
+ * identically, wedging the conversation permanently.
+ *
+ * The producers are guarded at their source, but this runs on every request as a
+ * last line of defence, because histories persisted before those guards existed
+ * are still on disk. It is deliberately position-agnostic:
+ * `filterThinkingOnlyAssistantMessages` only removes messages where *every* block
+ * is thinking, and `stripTrailingThinkingFromLastAssistant` only looks at the tail
+ * of the final message — an empty thinking block sitting at `content[0]` of a
+ * mid-history message alongside text/tool_use escapes both.
+ *
+ * Blocks are dropped rather than padded: a thinking signature is cryptographically
+ * bound to its original text, so substituting filler text would trade a length
+ * error for a signature verification failure. `redacted_thinking` is untouched —
+ * it legitimately carries no text, only opaque `data`.
+ */
+function dropEmptyThinkingBlocks(messages: AnthropicMessage[]): void {
+	for (const msg of messages) {
+		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+		const content = msg.content as AnthropicContentPart[];
+		const kept = content.filter(
+			(b) => b.type !== "thinking" || (typeof b.thinking === "string" && b.thinking.trim() !== ""),
+		);
+		if (kept.length === content.length) continue;
+		logger.warn("Dropping empty thinking block before API call", {
+			removed: content.length - kept.length,
+			remaining: kept.length,
+		});
+		msg.content = kept;
 	}
 }

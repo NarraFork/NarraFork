@@ -271,4 +271,76 @@ describe("AnthropicProvider thinking continuation", () => {
 			},
 		]);
 	});
+
+	/**
+	 * An interrupted stream can open a thinking block and fill in its signature
+	 * without ever delivering a thinking_delta, which used to reach the wire as
+	 * `{ type: "thinking", thinking: "", signature: "..." }` and get rejected with
+	 * "messages.N.content.M.thinking: ... too short". Since the block lived in
+	 * replayed history, every later turn failed at the same index.
+	 */
+	it("drops a signature-only reasoning block instead of sending empty thinking", () => {
+		const provider = new AnthropicProvider({
+			id: "test",
+			name: "Test",
+			prefix: "anthropic",
+			apiKey: "test-key",
+			baseUrl: "https://api.anthropic.com/v1",
+			defaultModel: "claude-sonnet-4-5",
+		});
+		const history: unknown[] = [];
+
+		provider.pushAssistantTurn(
+			history,
+			"answer",
+			[],
+			[
+				// Signature arrived, thinking text never did.
+				{ text: "", providerMetadata: { anthropic: { blockIndex: 0, signature: "sig-orphan" } } },
+				{ text: "   ", providerMetadata: { anthropic: { blockIndex: 1, signature: "sig-blank" } } },
+				{ text: "real", providerMetadata: { anthropic: { blockIndex: 2, signature: "sig-real" } } },
+			],
+		);
+
+		expect(history).toEqual([
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "real", signature: "sig-real" },
+					{ type: "text", text: "answer" },
+				],
+			},
+		]);
+	});
+
+	/**
+	 * The interrupted-stream shape end to end: content_block_start opens the
+	 * thinking block, signature_delta lands, the stream stops with no
+	 * thinking_delta. The stop event carries signature metadata but no reasoning
+	 * text, which is what produced the empty block upstream rejected.
+	 */
+	it("emits no reasoning text when a thinking block is interrupted before any delta", async () => {
+		const events = await Array.fromAsync(
+			parseAnthropicSSEStream(
+				sseStream([
+					{ type: "message_start", message: { id: "msg_1" } },
+					{ type: "content_block_start", index: 0, content_block: { type: "thinking" } },
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "signature_delta", signature: "sig-orphan" },
+					},
+					{ type: "content_block_stop", index: 0 },
+				]),
+			),
+		);
+
+		expect(events.filter((event) => event.reasoning)).toEqual([]);
+		// The signature still surfaces, so the block is only recoverable as metadata.
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				reasoningMetadata: { anthropic: { blockIndex: 0, signature: "sig-orphan" } },
+			}),
+		);
+	});
 });
