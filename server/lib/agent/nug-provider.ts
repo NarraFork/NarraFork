@@ -298,9 +298,8 @@ export class NugProvider implements ProviderAdapter {
 					baseUrl: `${this.baseUrl}/v1`,
 					apiMode: "codex",
 					codexWebSocket: false,
-					// Force Codex CLI header emulation on the NUG codex channel so it
-					// always presents the codex_cli_rs originator + installation id.
-					emulateCodexHeaders: true,
+					// apiMode codex already presents the codex-tui originator,
+					// installation id and the stable codex body contract.
 				});
 			case "openai":
 				return new OpenAIProvider({

@@ -110,7 +110,6 @@ function customApiToOpenAI(provider: CustomApiProviderState): OpenAIProviderStat
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
-		emulateCodexHeaders: provider.emulateCodexHeaders,
 		disabled: provider.disabled ?? false,
 	};
 }
@@ -132,7 +131,6 @@ function customApiToAnthropic(provider: CustomApiProviderState): AnthropicProvid
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
-		emulateCodexHeaders: provider.emulateCodexHeaders,
 		disabled: provider.disabled ?? false,
 	};
 }
@@ -180,7 +178,6 @@ function normalizeCustomApiProvider(
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
-		emulateCodexHeaders: provider.emulateCodexHeaders,
 		disabled: provider.disabled ?? false,
 	};
 }
@@ -287,7 +284,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				userAgentMode: p.userAgentMode,
 				customUserAgent: p.customUserAgent,
 				extraHeaders: p.extraHeaders,
-				emulateCodexHeaders: p.emulateCodexHeaders,
 				proxy: p.proxy,
 				disabled: p.disabled ?? false,
 			}));
@@ -307,7 +303,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				userAgentMode: p.userAgentMode,
 				customUserAgent: p.customUserAgent,
 				extraHeaders: p.extraHeaders,
-				emulateCodexHeaders: p.emulateCodexHeaders,
 				disabled: p.disabled ?? false,
 			}));
 

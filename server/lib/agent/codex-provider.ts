@@ -5,17 +5,17 @@
 import { isAgentTaskInvalidMessage } from "../codex-agent-identity";
 import { type CallContext, getCodexManager } from "../codex-manager";
 import { isUnauthorizedCodexUsageError } from "../codex-usage";
+import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { resolveOverride } from "../net/proxy";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import { parseModelId, settings } from "../settings";
+import { getHttpCodexUserAgent, resolveClientFingerprint } from "../user-agent";
 import { CodexRebuildHistoryRetryError } from "./codex-errors";
+import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./codex-request";
 import {
-	buildCodexResponsesWebSocketUrl,
-	buildHandshakeHeaders,
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
-	type StreamCodexResponsesWebSocketOptions,
 	shouldTreatCodexStreamEventAsYielded,
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
@@ -23,10 +23,10 @@ import {
 	appendCodexNativeTools,
 	CODEX_DEFAULT_INSTRUCTIONS,
 	convertHistoryToResponsesApi,
-	normalizeCodexReasoningEffort,
 	type OAIContentPart,
 	type OAIMessage,
 	OpenAIProvider,
+	resolveCodexRequestReasoningEffort,
 } from "./openai-provider";
 import type {
 	ChatParams,
@@ -84,23 +84,32 @@ const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
 /**
  * Resolve the client-fingerprint config for the built-in Codex adapter from
- * `settings.codex`. Defaults present the adapter as the real Codex CLI
- * (codex UA + emulated stable headers); users can override via settings.
+ * `settings.codex`. The adapter always presents itself as the Codex client;
+ * users can still override the UA or individual headers via settings.
  */
 function codexFingerprintConfig(): {
 	userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
-	emulateCodexHeaders?: boolean;
 } {
 	const codex = settings.codex;
 	return {
 		userAgentMode: codex?.userAgentMode ?? "codex",
 		customUserAgent: codex?.customUserAgent,
 		extraHeaders: codex?.extraHeaders,
-		// Emulate by default unless the operator explicitly disabled it.
-		emulateCodexHeaders: codex?.emulateCodexHeaders ?? true,
 	};
+}
+
+function resolveCodexProviderFingerprint(conversationId: string) {
+	const config = codexFingerprintConfig();
+	return resolveClientFingerprint({
+		mode: config.userAgentMode,
+		custom: config.customUserAgent,
+		fallback: getHttpCodexUserAgent(),
+		extraHeaders: config.extraHeaders,
+		installationId: getInstallationId(),
+		conversationId,
+	});
 }
 
 export interface CodexProviderOptions {
@@ -556,33 +565,33 @@ export class CodexProvider implements ProviderAdapter {
 
 			try {
 				const request = this.buildResponsesWebSocketRequest(params);
-				const streamOptions: StreamCodexResponsesWebSocketOptions = {
+				const fingerprint = resolveCodexProviderFingerprint(params.conversationId);
+
+				params.onRequestStart?.({ credentialId: ctx.id });
+				for await (const event of streamCodexResponsesWebSocket({
 					baseUrl: CODEX_BASE_URL,
 					apiKey: ctx.token,
 					authorization: ctx.authorization,
 					accountId: ctx.credential.accountId,
 					proxy: resolveOverride(settings.codex?.proxy),
 					sessionKey: params.stickySessionKey ?? params.conversationId,
+					conversationId: params.conversationId,
 					narratorId: params.stickySessionKey,
 					credentialId: ctx.id,
 					model: params.model,
 					request,
 					signal: params.signal,
 					resetSessionBeforeRequest: params.resetUpstreamSession,
-				};
-				// Report the headers the transport will actually build, rather than a
-				// hand-written stand-in: a dump that disagrees with the wire misleads
-				// whoever is debugging it. `x-codex-turn-state` is per-session state that
-				// only exists after a completed turn, so it is not known here.
-				params.requestDump?.setRequest({
-					transport: "websocket",
-					url: buildCodexResponsesWebSocketUrl(CODEX_BASE_URL),
-					headers: sanitizeHeaders(buildHandshakeHeaders(streamOptions, { turnState: null })),
-					body: { type: "response.create", ...request },
-				});
-
-				params.onRequestStart?.({ credentialId: ctx.id });
-				for await (const event of streamCodexResponsesWebSocket(streamOptions)) {
+					userAgent: fingerprint.userAgent,
+					extraHeaders: fingerprint.headers,
+					onRequestPrepared: ({ url, headers, body }) =>
+						params.requestDump?.setRequest({
+							transport: "websocket",
+							url,
+							headers: sanitizeHeaders(headers),
+							body,
+						}),
+				})) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 					yield { ...event, credentialId: ctx.id };
 				}
@@ -778,8 +787,6 @@ export class CodexProvider implements ProviderAdapter {
 			input: convertHistoryToResponsesApi(sanitizedInputMessages),
 			stream: true,
 			store: false,
-			prompt_cache_key: params.conversationId,
-			parallel_tool_calls: true,
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
@@ -789,14 +796,10 @@ export class CodexProvider implements ProviderAdapter {
 		});
 		request.tools = tools;
 
-		const reasoningEffort = normalizeCodexReasoningEffort(model, params.reasoningEffort);
-		if (reasoningEffort) {
-			request.reasoning = {
-				effort: reasoningEffort,
-				summary: "auto",
-			};
-			request.include = ["reasoning.encrypted_content"];
-		}
+		applyCodexStableRequestFields(request, {
+			identity: createCodexRequestIdentity(params.conversationId),
+			reasoningEffort: resolveCodexRequestReasoningEffort(model, params.reasoningEffort),
+		});
 		if (params.serviceTier) {
 			request.service_tier = params.serviceTier;
 		}

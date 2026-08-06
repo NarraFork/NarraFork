@@ -6,7 +6,6 @@ import {
 } from "@shared/reasoning-effort-support";
 import { computeFingerprint } from "../fingerprint";
 import { generateId } from "../id";
-import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -21,7 +20,6 @@ import {
 import { readWithTimeout } from "../stream-timeout";
 import { extractAnthropicUsage } from "../usage-tracking";
 import {
-	buildCodexEmulationHeaders,
 	CLAUDE_CLI_VERSION,
 	getHttpClaudeCliUserAgent,
 	getHttpUserAgent,
@@ -1017,11 +1015,6 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	private applyExtraHeaders(headers: Record<string, string>): Record<string, string> {
-		// Optional Codex CLI header emulation (opt-in for Anthropic providers).
-		// Applied before user extraHeaders so operators can still override.
-		if (this.config.emulateCodexHeaders) {
-			Object.assign(headers, buildCodexEmulationHeaders({ installationId: getInstallationId() }));
-		}
 		for (const [key, value] of Object.entries(this.config.extraHeaders ?? {})) {
 			if (value) headers[key] = value;
 		}
@@ -1394,6 +1387,9 @@ export class AnthropicProvider implements ProviderAdapter {
 		//    API requires assistant messages to end with text or tool_use, not
 		//    thinking/redacted_thinking.
 		if (thinkingEnabled) {
+			// Runs first: removing an empty thinking block can leave a message
+			// thinking-only or empty, and the two filters below are what clean that up.
+			dropEmptyThinkingBlocks(messages);
 			filterThinkingOnlyAssistantMessages(messages);
 			stripTrailingThinkingFromLastAssistant(messages);
 
@@ -1685,10 +1681,28 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (reasoningBlocks) {
 			for (let i = 0; i < reasoningBlocks.length; i++) {
 				const rb = reasoningBlocks[i];
+				// A thinking block with empty text is rejected upstream
+				// ("messages.N.content.M.thinking: ... too short"), and because the
+				// offending block lives in replayed history every later turn fails at
+				// the same index — the conversation is permanently wedged.
+				//
+				// Empty text with a signature is produced by an interrupted stream:
+				// content_block_start opens a thinking block, signature_delta fills the
+				// signature, and the connection dies before any thinking_delta arrives.
+				// Such a block carries no information — the signature is only meaningful
+				// as proof-of-origin for text that exists — so it is dropped rather than
+				// padded. Padding is not an option: the signature is cryptographically
+				// bound to the original text, so invented filler turns a length error
+				// into a harder-to-diagnose signature verification failure.
+				if (!rb.text || rb.text.trim() === "") continue;
 				const sig = rb.providerMetadata?.anthropic?.signature ?? "";
 				indexed.push({
 					part: { type: "thinking", thinking: rb.text, signature: sig },
-					outputIndex: rb.outputIndex ?? i,
+					// Fallback uses the kept-block count (indexed.length), not the raw
+					// loop index i: dropping an empty block above must not leave a gap
+					// that reorders the surviving block after the text/tool_use blocks,
+					// which anchor their own fallback to indexed.length too.
+					outputIndex: rb.outputIndex ?? indexed.length,
 				});
 			}
 		}
@@ -2940,35 +2954,46 @@ function stripThinkingBlocks(messages: AnthropicMessage[]): void {
 	}
 }
 
+const DEEPSEEK_SYNTHETIC_THINKING = " ";
+const DEEPSEEK_SYNTHETIC_SIGNATURE = "narrafork-deepseek-compat";
+
 /**
  * DeepSeek's Anthropic-compatible API doesn't support redacted_thinking blocks.
- * Remove them before replay, then patch assistant messages with a regular
- * thinking block if needed.
+ * Some relays omit signatures in responses but still require a non-empty signature
+ * when that thinking is replayed. Preserve authentic signatures and use a clearly
+ * marked compatibility value only when the upstream supplied none.
  */
 function sanitizeDeepSeekThinkingBlocks(messages: AnthropicMessage[]): void {
 	for (const msg of messages) {
 		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
 		const parts = msg.content as AnthropicContentPart[];
-		const filtered = parts.filter((b) => b.type !== "redacted_thinking");
-		if (filtered.length !== parts.length) {
-			// Preserve a non-empty assistant message if this was not already filtered out.
-			if (
-				!filtered.some((b) => b.type === "thinking" || b.type === "text" || b.type === "tool_use")
-			) {
-				filtered.push({ type: "text", text: "…" });
+		const filtered: AnthropicContentPart[] = [];
+		for (const block of parts) {
+			if (block.type === "redacted_thinking") continue;
+			if (block.type !== "thinking") {
+				filtered.push(block);
+				continue;
 			}
-			msg.content = filtered;
+
+			filtered.push(
+				block.signature?.trim() ? block : { ...block, signature: DEEPSEEK_SYNTHETIC_SIGNATURE },
+			);
 		}
+
+		if (
+			!filtered.some((b) => b.type === "thinking" || b.type === "text" || b.type === "tool_use")
+		) {
+			filtered.push({ type: "text", text: "…" });
+		}
+		msg.content = filtered;
 	}
 	patchMissingThinkingBlocks(messages);
 }
 
 /**
- * Patch assistant messages that lack a thinking block.
- * DeepSeek thinking mode (via Anthropic-compatible API) requires a thinking
- * block on ALL assistant messages, not just those with tool_use. When switching
- * from a non-thinking model, historical messages lack this — prepend an
- * empty thinking block so the API doesn't reject the request.
+ * DeepSeek requires thinking on historical assistant messages. When authentic
+ * reasoning is unavailable, use a single-space placeholder plus the compatibility
+ * signature required by strict Anthropic relays. Neither value is persisted.
  */
 function patchMissingThinkingBlocks(messages: AnthropicMessage[]): void {
 	for (const msg of messages) {
@@ -2976,8 +3001,11 @@ function patchMissingThinkingBlocks(messages: AnthropicMessage[]): void {
 		const parts = msg.content as AnthropicContentPart[];
 		const hasThinking = parts.some((b) => b.type === "thinking");
 		if (hasThinking) continue;
-		// Prepend an empty thinking block
-		parts.unshift({ type: "thinking", thinking: "", signature: "" });
+		parts.unshift({
+			type: "thinking",
+			thinking: DEEPSEEK_SYNTHETIC_THINKING,
+			signature: DEEPSEEK_SYNTHETIC_SIGNATURE,
+		});
 	}
 }
 
@@ -3046,5 +3074,43 @@ function filterThinkingOnlyAssistantMessages(messages: AnthropicMessage[]): void
 			});
 			messages.splice(i, 1);
 		}
+	}
+}
+
+/**
+ * Drop `thinking` blocks whose text is empty, anywhere in the history.
+ *
+ * The API requires every thinking block to be non-empty and rejects the whole
+ * request otherwise ("messages.N.content.M.thinking: ... too short"). Because the
+ * offending block sits in replayed history, the failure is not transient: every
+ * subsequent turn re-sends the same block at the same index and fails
+ * identically, wedging the conversation permanently.
+ *
+ * The producers are guarded at their source, but this runs on every request as a
+ * last line of defence, because histories persisted before those guards existed
+ * are still on disk. It is deliberately position-agnostic:
+ * `filterThinkingOnlyAssistantMessages` only removes messages where *every* block
+ * is thinking, and `stripTrailingThinkingFromLastAssistant` only looks at the tail
+ * of the final message — an empty thinking block sitting at `content[0]` of a
+ * mid-history message alongside text/tool_use escapes both.
+ *
+ * Blocks are dropped rather than padded: a thinking signature is cryptographically
+ * bound to its original text, so substituting filler text would trade a length
+ * error for a signature verification failure. `redacted_thinking` is untouched —
+ * it legitimately carries no text, only opaque `data`.
+ */
+function dropEmptyThinkingBlocks(messages: AnthropicMessage[]): void {
+	for (const msg of messages) {
+		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+		const content = msg.content as AnthropicContentPart[];
+		const kept = content.filter(
+			(b) => b.type !== "thinking" || (typeof b.thinking === "string" && b.thinking.trim() !== ""),
+		);
+		if (kept.length === content.length) continue;
+		logger.warn("Dropping empty thinking block before API call", {
+			removed: content.length - kept.length,
+			remaining: kept.length,
+		});
+		msg.content = kept;
 	}
 }

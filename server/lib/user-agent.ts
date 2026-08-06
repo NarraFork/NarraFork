@@ -1,4 +1,5 @@
 import os from "node:os";
+import { deriveCodexWindowId } from "./agent/codex-request";
 import { APP_VERSION } from "./version";
 
 const ORIGINATOR = "narrafork";
@@ -10,10 +11,32 @@ const ORIGINATOR = "narrafork";
  * User-Agent and billing block disagree does not match any real CLI release.
  */
 export const CLAUDE_CLI_VERSION = "2.1.220";
-// Codex CLI version mimicked by the "codex" User-Agent mode.
-// Matches the codex_cli_rs originator/version format. Update manually as needed.
-// Bumped to 0.144.0 to satisfy gpt-5.6 family minimal_client_version gating.
-const CODEX_CLI_VERSION = "0.144.0";
+// Managed Codex client version used only for outbound protocol emulation.
+// Keep the User-Agent prefix/suffix and originator aligned when updating it.
+const CODEX_CLI_VERSION = "0.146.0";
+export const ORIGINATOR_CODEX = "codex-tui";
+
+/**
+ * The upstream header that opts a Responses request into the "lite" request
+ * contract. NarraFork must never send it — see {@link buildCodexEmulationHeaders}
+ * for the full contract it would obligate us to implement, and
+ * {@link stripResponsesLiteHeader} for the enforcement.
+ */
+export const RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite";
+
+/**
+ * Strip the lite header from an outbound header map.
+ *
+ * Applied to user-supplied `extraHeaders` because those are merged last and
+ * would otherwise re-introduce a header whose body contract NarraFork does not
+ * implement, turning every request to a strict endpoint into a 400. Operators
+ * who genuinely need lite must first implement the body half of the contract.
+ */
+export function stripResponsesLiteHeader(headers: Record<string, string>): void {
+	for (const key of Object.keys(headers)) {
+		if (key.toLowerCase() === RESPONSES_LITE_HEADER) delete headers[key];
+	}
+}
 
 /**
  * Get OS type string in Codex format.
@@ -73,6 +96,19 @@ function getArchitecture(): string {
 	return os.arch();
 }
 
+function getCodexArchitecture(): string {
+	switch (os.arch()) {
+		case "x64":
+			return "x86_64";
+		case "arm64":
+			return "aarch64";
+		case "ia32":
+			return "x86";
+		default:
+			return os.arch();
+	}
+}
+
 /**
  * Get terminal/runtime information.
  * Mimics Codex's user_agent() function from codex_terminal_detection.
@@ -118,23 +154,15 @@ export function getUserAgent(): string {
 }
 
 /**
- * Build User-Agent string in Codex CLI format:
- * codex_cli_rs/{version} ({os_type} {os_version}; {arch}) {terminal_info}
- *
- * Mirrors the official Codex CLI `get_codex_user_agent()` output so requests
- * can present themselves as the Codex client. When no terminal is detected the
- * token falls back to "unknown", matching the real Codex CLI (it never reports a
- * runtime version here).
- *
- * Example: codex_cli_rs/0.144.0 (Linux Ubuntu 22.04; x64) unknown
+ * Build the managed Codex client User-Agent shape:
+ * codex-tui/{version} ({os_type} {os_version}; {arch}) unknown (codex-tui; {version})
  */
 export function getCodexUserAgent(): string {
 	const osType = getOsType();
 	const osVersion = getOsVersion();
-	const arch = getArchitecture();
-	const terminalInfo = getTerminalInfo("unknown");
+	const arch = getCodexArchitecture();
 
-	return `codex_cli_rs/${CODEX_CLI_VERSION} (${osType} ${osVersion}; ${arch}) ${terminalInfo}`;
+	return `${ORIGINATOR_CODEX}/${CODEX_CLI_VERSION} (${osType} ${osVersion}; ${arch}) unknown (${ORIGINATOR_CODEX}; ${CODEX_CLI_VERSION})`;
 }
 
 /**
@@ -189,19 +217,56 @@ export function getHttpCodexUserAgent(): string {
 	return sanitizeUserAgent(getCodexUserAgent());
 }
 
-/** Originator token used by the real Codex CLI. */
-export const ORIGINATOR_CODEX = "codex_cli_rs";
-
 /**
- * Build the stable Codex-emulation headers, mirroring the real Codex CLI's
- * durable request headers while deliberately omitting tracking/semantic headers
- * (x-codex-turn-metadata, workspaces, sandbox, x-codex-window-id, ...).
+ * Build the stable Codex client headers, transcribed from captured codex-tui
+ * traffic, while deliberately omitting the volatile per-turn tracking headers
+ * the real client also sends (x-codex-turn-metadata).
+ *
+ * The turn-metadata blob carries runtime environment and timing detail —
+ * sandbox mode, workspace git state, turn start timestamp — that NarraFork has
+ * no reason to report upstream. Every header below is stable for the lifetime
+ * of a conversation, including x-codex-window-id, which codex-rs keeps stable
+ * per TUI window and NarraFork derives deterministically per conversation
+ * (see deriveCodexWindowId).
+ *
+ * Also omitted: x-codex-beta-features. The real client derives it from the beta
+ * features it actually has enabled (responses_websockets_v2,
+ * remote_compaction_v2, use_agent_identity, workspace_dependencies, ...), so a
+ * hardcoded value would claim capabilities NarraFork does not implement.
+ *
+ * Also omitted: x-openai-internal-codex-responses-lite. In the real client that
+ * header is not an identity marker at all — it is one half of a request contract
+ * driven by the per-model `ModelInfo.use_responses_lite` flag, which upstream
+ * publishes in its model catalog. When that flag is set, codex-rs/core/src/client.rs
+ * simultaneously (a) sends the header, (b) omits top-level `instructions` and
+ * `tools` entirely, (c) splices an `additional_tools` item plus a developer
+ * instructions message to the front of `input`, and (d) forces
+ * `parallel_tool_calls: false`. Upstream validates the pairing and rejects the
+ * header whenever `tools` carries anything but function/custom/client-executed
+ * search tools:
+ *
+ *   "X-OpenAI-Internal-Codex-Responses-Lite only supports function tools,
+ *    custom tools, and client-executed tool search."
+ *
+ * NarraFork emits the classic non-lite body (top-level instructions + tools,
+ * including the hosted `web_search`/`image_generation` tools), so claiming lite
+ * produced a request no real client emits and hard-failed any endpoint that
+ * enforces the pairing. Non-lite is the universally accepted shape and is what
+ * real Codex sends for every model whose catalog entry leaves the flag false, so
+ * the header is dropped rather than the tools. {@link stripResponsesLiteHeader}
+ * enforces this on every outbound header map, and the codex parity tests pin it.
+ *
+ * Also omitted: x-client-request-id. codex-rs writes it in exactly one place —
+ * build_websocket_headers — and neither the HTTP /responses path nor
+ * /responses/compact sends it. It is a websocket-handshake header, not part of
+ * the shared client identity, so it is set by the WS transport itself rather
+ * than here (see buildHandshakeHeaders).
  *
  * Included:
- * - originator: codex_cli_rs
+ * - originator: codex-tui
  * - x-codex-installation-id: <persisted UUID>
- * - session-id / thread-id: weak per-conversation identifiers (only when a
- *   conversation id is available). These are not turn-level tracking headers.
+ * - session-id / thread-id: one stable conversation id
+ * - x-codex-window-id: window UUID derived from the conversation id
  */
 export function buildCodexEmulationHeaders(opts: {
 	installationId: string;
@@ -214,6 +279,7 @@ export function buildCodexEmulationHeaders(opts: {
 	if (opts.conversationId) {
 		headers["session-id"] = opts.conversationId;
 		headers["thread-id"] = opts.conversationId;
+		headers["x-codex-window-id"] = deriveCodexWindowId(opts.conversationId);
 	}
 	return headers;
 }
@@ -255,20 +321,21 @@ export function resolveHttpUserAgent(options: {
  * provider request.
  *
  * Header precedence (later wins):
- *   1. Codex emulation headers (only when `emulateCodex` is true).
+ *   1. Codex client headers — emitted whenever `installationId` is supplied.
  *   2. User-configured `extraHeaders` — always applied last so operators can
- *      override or clear any emulated header.
+ *      override or clear any emitted header.
  *
- * Codex semantic headers are only injected when `emulateCodex` is true, so
- * non-codex providers never leak codex-specific identifiers unless explicitly
- * opted in.
+ * Passing `installationId` is what opts a caller into the Codex header set, so
+ * non-codex providers never leak codex-specific identifiers.
+ *
+ * The one header `extraHeaders` may not set is the responses-lite opt-in: it is a
+ * body contract, not an identity string, and NarraFork emits the non-lite body.
  */
 export function resolveClientFingerprint(options: {
 	mode?: UserAgentMode;
 	custom?: string;
 	fallback: string;
 	extraHeaders?: Record<string, string>;
-	emulateCodex?: boolean;
 	installationId?: string;
 	conversationId?: string;
 }): { userAgent: string; headers: Record<string, string> } {
@@ -279,7 +346,7 @@ export function resolveClientFingerprint(options: {
 	});
 
 	const headers: Record<string, string> = {};
-	if (options.emulateCodex && options.installationId) {
+	if (options.installationId) {
 		Object.assign(
 			headers,
 			buildCodexEmulationHeaders({
@@ -291,5 +358,6 @@ export function resolveClientFingerprint(options: {
 	for (const [key, value] of Object.entries(options.extraHeaders ?? {})) {
 		if (value) headers[key] = value;
 	}
+	stripResponsesLiteHeader(headers);
 	return { userAgent, headers };
 }

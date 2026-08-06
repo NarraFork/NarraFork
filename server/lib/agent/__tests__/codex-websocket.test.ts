@@ -113,6 +113,35 @@ describe("Codex Responses WebSocket helpers", () => {
 		expect(envelope.input).toEqual(nextRequest.input);
 	});
 
+	/**
+	 * client_metadata must not participate in the continuation decision. It carries
+	 * per-request runtime values — notably x-codex-turn-state, which only exists after
+	 * the first response of a turn — so comparing it would make every request after the
+	 * first look like a new one. The failure is silent: continuation degrades into full
+	 * resends and the prompt cache is lost, with no error anywhere. codex-rs draws the
+	 * same line in responses_request_properties_match ("ignores metadata").
+	 */
+	test("still continues when only client_metadata differs", () => {
+		const lastRequest = makeRequest([makeUserMessage("hello")]);
+		lastRequest.client_metadata = { session_id: "conv-1", thread_id: "conv-1" };
+		const lastCompleted = makeCompleted("resp-1", [makeAssistantMessage("assistant output")]);
+		const nextRequest = makeRequest([
+			makeUserMessage("hello"),
+			makeAssistantMessage("assistant output"),
+			makeUserMessage("second"),
+		]);
+		// The turn-state token appears only on later requests of a turn.
+		nextRequest.client_metadata = {
+			session_id: "conv-1",
+			thread_id: "conv-1",
+			"x-codex-turn-state": "turn-state-token",
+		};
+
+		const envelope = buildCodexResponsesWebSocketRequest(nextRequest, lastRequest, lastCompleted);
+		expect(envelope.previous_response_id).toBe("resp-1");
+		expect(envelope.input).toEqual([makeUserMessage("second")]);
+	});
+
 	test("treats narrator activity within five minutes as recent", () => {
 		const now = Date.parse("2026-01-01T00:10:00.000Z");
 		expect(hasRecentNarratorMessage("2026-01-01T00:05:01.000Z", now)).toBe(true);

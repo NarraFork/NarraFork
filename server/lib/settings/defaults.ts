@@ -140,7 +140,6 @@ export const DEFAULTS: NarraForkSettings = {
 		useImageGeneration: true,
 		// Present the built-in Codex adapter as the real Codex CLI by default.
 		userAgentMode: "codex",
-		emulateCodexHeaders: true,
 	},
 	// Empty by default: the built-in reference price table in
 	// server/lib/model-pricing.ts applies until an operator corrects a row.
@@ -789,10 +788,6 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"codex.extraHeaders": {
 		desc: "内置 Codex 请求附加的自定义请求头（同名时覆盖仿真请求头）。",
 		type: "object",
-	},
-	"codex.emulateCodexHeaders": {
-		desc: "仿真真实 Codex CLI 的稳定请求头（originator、x-codex-installation-id、session/thread id）。默认开启；不发送 turn metadata 等跟踪类请求头。",
-		type: "boolean",
 	},
 	"clientFingerprint.installationId": {
 		desc: "作为 x-codex-installation-id 发送的持久化 UUID（客户端指纹身份，首次访问自动生成）。",

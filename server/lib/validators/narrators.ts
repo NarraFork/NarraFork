@@ -117,7 +117,6 @@ export const codexFingerprintSchema = z.object({
 	userAgentMode: z.enum(["narrafork", "claude-code", "codex", "custom"]).optional(),
 	customUserAgent: z.string().max(500).optional(),
 	extraHeaders: z.record(z.string(), z.string().max(2048)).optional(),
-	emulateCodexHeaders: z.boolean().optional(),
 });
 
 export const sendMessageSchema = z.object({

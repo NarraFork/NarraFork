@@ -5,7 +5,8 @@ import type WebSocket from "ws";
 import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages } from "../../db/schema";
 import { logger } from "../logger";
-import { getHttpUserAgent } from "../user-agent";
+import { getHttpCodexUserAgent, ORIGINATOR_CODEX, stripResponsesLiteHeader } from "../user-agent";
+import { deriveCodexWindowId } from "./codex-request";
 import { parseGatewayDataEvent } from "./gateway-events";
 import {
 	type OAIMessage,
@@ -86,6 +87,8 @@ export interface StreamCodexResponsesWebSocketOptions {
 	accountId?: string;
 	proxy?: string;
 	sessionKey: string;
+	/** Stable conversation/thread identity sent in headers and request metadata. */
+	conversationId: string;
 	narratorId?: string;
 	credentialId: string;
 	model: string;
@@ -102,6 +105,12 @@ export interface StreamCodexResponsesWebSocketOptions {
 	 * Applied last so they can override the built-in defaults.
 	 */
 	extraHeaders?: Record<string, string>;
+	/** Observe the exact request envelope and effective handshake headers. */
+	onRequestPrepared?: (request: {
+		url: string;
+		headers: Record<string, string>;
+		body: Record<string, unknown>;
+	}) => void;
 }
 
 export class CodexWebSocketFallbackError extends Error {
@@ -135,11 +144,27 @@ function isPrefixExtension(baseline: unknown[], input: unknown[]): boolean {
 	return true;
 }
 
+/**
+ * Project a request down to the fields that decide whether the previous
+ * websocket response can be continued with `previous_response_id`.
+ *
+ * `input` is blanked because it is compared separately as a prefix extension,
+ * and `client_metadata` is dropped entirely: it carries per-request runtime
+ * values (notably `x-codex-turn-state`, which only exists after the first
+ * response of a turn) that change between otherwise identical requests. Leaving
+ * it in would make every request after the first look like a different request,
+ * silently degrading continuation into full resends and losing the prompt cache.
+ *
+ * codex-rs draws the same line in `responses_request_properties_match`:
+ * "request equality includes `input` and `client_metadata`, while websocket
+ * reuse compares the input separately and ignores metadata."
+ */
 function requestWithoutInput(
 	request: CodexResponsesRequestBody,
 ): Omit<CodexResponsesRequestBody, "input"> & { input: [] } {
+	const { client_metadata: _clientMetadata, ...rest } = cloneJson(request);
 	return {
-		...cloneJson(request),
+		...rest,
 		input: [],
 	};
 }
@@ -339,42 +364,59 @@ function isOfficialChatGPTDomain(baseUrl: string): boolean {
  * Build the WebSocket handshake headers.
  *
  * Exported for tests: a typo or a wrong conditional here only shows up as a
- * silent fallback to HTTP, which is hard to diagnose from logs. The session
- * parameter is narrowed to the one field that is read so tests do not have to
- * fabricate a whole cached session.
+ * silent fallback to HTTP, which is hard to diagnose from logs.
+ *
+ * Depends only on `options` — nothing session- or turn-scoped reaches the
+ * handshake, matching codex-rs's `build_websocket_headers`, which takes no turn
+ * state either. Anything learned mid-turn (the turn-state token) must travel in
+ * the request body instead; see {@link applyTurnStateToRequest}.
  *
  * See docs/codex-websocket.md for the documented header contract.
  */
 export function buildHandshakeHeaders(
 	options: StreamCodexResponsesWebSocketOptions,
-	session: Pick<CachedSession, "turnState">,
 ): Record<string, string> {
+	// No x-openai-internal-codex-responses-lite here: the lite opt-in is a body
+	// contract (no top-level instructions/tools, additional_tools spliced into
+	// input, parallel_tool_calls off) that this transport does not implement, and
+	// upstream rejects the header outright when `tools` carries hosted tools.
 	const headers: Record<string, string> = {
 		Authorization: options.authorization?.trim() || `Bearer ${options.apiKey}`,
-		"User-Agent": options.userAgent ?? getHttpUserAgent(),
-		originator: "narrafork",
+		"User-Agent": options.userAgent ?? getHttpCodexUserAgent(),
+		originator: ORIGINATOR_CODEX,
+		"session-id": options.conversationId,
+		"thread-id": options.conversationId,
+		// Window id is conversation-stable, mirroring codex-rs build_websocket_headers,
+		// which inserts x-codex-window-id directly (compatibility_headers) rather than
+		// only through the client fingerprint.
+		"x-codex-window-id": deriveCodexWindowId(options.conversationId),
 		Origin: isOfficialChatGPTDomain(options.baseUrl) ? "https://chatgpt.com" : options.baseUrl,
 		[OPENAI_BETA_HEADER]: RESPONSES_WS_BETA_HEADER,
-		// The real Codex CLI keys x-client-request-id off the thread id. We only have the
-		// sticky session key here, which is the stablest per-conversation identifier available.
-		[CLIENT_REQUEST_ID_HEADER]: options.sessionKey,
+		[CLIENT_REQUEST_ID_HEADER]: options.conversationId,
 	};
 	if (options.accountId && isOfficialChatGPTDomain(options.baseUrl)) {
 		headers["ChatGPT-Account-Id"] = options.accountId;
 	}
-	if (session.turnState) {
-		headers[TURN_STATE_HEADER] = session.turnState;
-	}
+	// No x-codex-turn-state here. The token only exists after the first response of
+	// a turn, by which point this connection's handshake is long since sent — and the
+	// connection is reused for every later request in the turn, so a handshake header
+	// could never carry it. It travels in each response.create's client_metadata
+	// instead (see applyTurnStateToRequest). codex-rs makes the same split: its
+	// build_websocket_headers passes `/*turn_state*/ None` and puts the token in the
+	// websocket client_metadata, while the HTTP path sends it as a request header.
 	if (options.turnMetadata) {
 		headers[TURN_METADATA_HEADER] = options.turnMetadata;
 	}
-	// Caller-supplied fingerprint headers, applied last so they override the built-in
-	// defaults above (including `originator`). Only the openai-provider codex channel
-	// passes these; the built-in Codex adapter passes none, so that path keeps the
-	// NarraFork UA and `originator: narrafork` defaults.
+	// Client fingerprint (originator, x-codex-installation-id, session-id/thread-id,
+	// user-configured headers) applied last so it overrides built-in defaults such as
+	// originator. The session-id/thread-id pair (matching the real Codex CLI's hyphenated
+	// header names) is supplied here rather than hardcoded above.
 	for (const [key, value] of Object.entries(options.extraHeaders ?? {})) {
 		if (value) headers[key] = value;
 	}
+	// extraHeaders is merged last, so it is also the one place that could put the
+	// lite opt-in back on the wire. Strip it for the same reason it is not set above.
+	stripResponsesLiteHeader(headers);
 	return headers;
 }
 
@@ -483,6 +525,33 @@ export function buildCodexResponsesWebSocketRequest(
 		input: deltaInput,
 		previous_response_id: lastCompleted.responseId,
 	};
+}
+
+/**
+ * Attach the turn's sticky-routing token to an outgoing `response.create`.
+ *
+ * The server hands `x-codex-turn-state` back on the first response of a turn and
+ * expects it replayed on every later request of that same turn (retries,
+ * incremental appends, continuations) so they land on the same backend. On this
+ * transport it cannot ride a handshake header — the connection is established
+ * before the token exists and is then reused — so it goes in the request body,
+ * mirroring codex-rs's websocket path.
+ *
+ * Must run AFTER buildCodexResponsesWebSocketRequest: that function compares the
+ * previous and current request to decide on continuation, and this key changes
+ * between turns. Injecting first would defeat the comparison.
+ */
+export function applyTurnStateToRequest(
+	websocketRequest: Record<string, unknown>,
+	turnState: string | null,
+): void {
+	if (!turnState) return;
+	const existing = websocketRequest.client_metadata;
+	const metadata = (
+		existing && typeof existing === "object" ? { ...(existing as Record<string, string>) } : {}
+	) as Record<string, string>;
+	metadata[TURN_STATE_HEADER] = turnState;
+	websocketRequest.client_metadata = metadata;
 }
 
 async function closeSessionConnection(session: CachedSession): Promise<void> {
@@ -694,6 +763,7 @@ class ReusableWebSocketConnection {
 async function ensureConnection(
 	session: CachedSession,
 	options: StreamCodexResponsesWebSocketOptions,
+	handshakeHeaders?: Record<string, string>,
 ): Promise<ReusableWebSocketConnection> {
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
@@ -708,7 +778,7 @@ async function ensureConnection(
 	const url = buildCodexResponsesWebSocketUrl(options.baseUrl);
 	const connection = new ReusableWebSocketConnection(
 		url,
-		buildHandshakeHeaders(options, session),
+		handshakeHeaders ?? buildHandshakeHeaders(options),
 		options.proxy,
 		(response) => {
 			const turnState = response.headers[TURN_STATE_HEADER];
@@ -770,16 +840,30 @@ export async function* streamCodexResponsesWebSocket(
 			session.lastRequest,
 			session.lastCompleted,
 		);
-		const requestText = JSON.stringify(websocketRequest);
+		// Serialized per send, not once up front: the turn-state token is learned from
+		// a handshake response, which happens after the first serialization would have
+		// run, and every resend below is a "subsequent request in the turn" that must
+		// carry it. Injection stays after the continuation decision above, never before,
+		// because this key varies between turns.
+		const nextRequestText = (): string => {
+			applyTurnStateToRequest(websocketRequest, session.turnState);
+			return JSON.stringify(websocketRequest);
+		};
+		const handshakeHeaders = buildHandshakeHeaders(options);
+		options.onRequestPrepared?.({
+			url: buildCodexResponsesWebSocketUrl(options.baseUrl),
+			headers: handshakeHeaders,
+			body: websocketRequest,
+		});
 		let reconnectCount = 0;
 		let hasYieldedEvents = false;
 
-		connection = await ensureConnection(session, options);
+		connection = await ensureConnection(session, options, handshakeHeaders);
 		if (options.signal.aborted) {
 			yield { silentDisconnect: true };
 			return;
 		}
-		await connection.send(requestText);
+		await connection.send(nextRequestText());
 		requestDispatched = true;
 
 		while (true) {
@@ -828,7 +912,7 @@ export async function* streamCodexResponsesWebSocket(
 						yield { silentDisconnect: true };
 						return;
 					}
-					await connection.send(requestText);
+					await connection.send(nextRequestText());
 					continue;
 				}
 				await resetSession(session, false);
@@ -883,7 +967,7 @@ export async function* streamCodexResponsesWebSocket(
 								yield { silentDisconnect: true };
 								return;
 							}
-							await connection.send(requestText);
+							await connection.send(nextRequestText());
 							continue;
 						}
 						await resetSession(session, false);
@@ -940,7 +1024,7 @@ export async function* streamCodexResponsesWebSocket(
 						yield { silentDisconnect: true };
 						return;
 					}
-					await connection.send(requestText);
+					await connection.send(nextRequestText());
 					continue;
 				}
 				await resetSession(session, false);
@@ -989,7 +1073,7 @@ export async function* streamCodexResponsesWebSocket(
 							yield { silentDisconnect: true };
 							return;
 						}
-						await connection.send(requestText);
+						await connection.send(nextRequestText());
 						continue;
 					}
 					await resetSession(session, false);

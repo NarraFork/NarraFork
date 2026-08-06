@@ -1,14 +1,4 @@
-import {
-	ActionIcon,
-	Button,
-	Group,
-	Select,
-	Stack,
-	Switch,
-	Text,
-	TextInput,
-	Tooltip,
-} from "@mantine/core";
+import { ActionIcon, Button, Group, Select, Stack, Text, TextInput, Tooltip } from "@mantine/core";
 import { IconCheck, IconCopy, IconPlus, IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -20,20 +10,11 @@ export interface ClientFingerprintValue {
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
-	emulateCodexHeaders?: boolean;
 }
 
 interface ClientFingerprintFieldsProps {
 	value: ClientFingerprintValue;
 	onChange: (next: Partial<ClientFingerprintValue>) => void;
-	/** Show the "emulate Codex headers" toggle (Codex + OpenAI-style providers). */
-	showEmulateToggle?: boolean;
-	/**
-	 * Effective emulation state when `emulateCodexHeaders` is unset (tri-state):
-	 * codex-mode providers default to on, others off. Used so the toggle reflects
-	 * the real backend behaviour instead of always appearing off.
-	 */
-	emulateCodexDefault?: boolean;
 	/** Show the persisted installation id + regenerate control. */
 	showInstallationId?: boolean;
 	installationId?: string;
@@ -67,8 +48,6 @@ function recordSignature(record?: Record<string, string>): string {
 export function ClientFingerprintFields({
 	value,
 	onChange,
-	showEmulateToggle,
-	emulateCodexDefault = false,
 	showInstallationId,
 	installationId,
 	onRegenerateInstallationId,
@@ -76,8 +55,6 @@ export function ClientFingerprintFields({
 	disabled,
 }: ClientFingerprintFieldsProps) {
 	const { t } = useTranslation("settings");
-	// Tri-state: explicit flag wins, otherwise fall back to the provider default.
-	const emulateActive = value.emulateCodexHeaders ?? emulateCodexDefault;
 
 	// Local rows allow editing empty keys/values without losing focus; the parent
 	// record is only updated with committed (non-empty-key) rows. Each row carries
@@ -158,25 +135,12 @@ export function ClientFingerprintFields({
 				/>
 			)}
 
-			{showEmulateToggle && (
-				<Switch
-					size="xs"
-					label={t("fingerprintEmulateCodex")}
-					description={t("fingerprintEmulateCodexDesc")}
-					checked={emulateActive}
-					disabled={disabled}
-					onChange={(e) => onChange({ emulateCodexHeaders: e.currentTarget.checked })}
-				/>
-			)}
-
 			<Stack gap={4}>
 				<Text size="xs" fw={500}>
 					{t("fingerprintExtraHeaders")}
 				</Text>
 				<Text size="xs" c="dimmed">
-					{emulateActive
-						? t("fingerprintExtraHeadersDescEmulating")
-						: t("fingerprintExtraHeadersDesc")}
+					{t("fingerprintExtraHeadersDesc")}
 				</Text>
 				{rows.map((row) => (
 					<Group key={row.id} gap="xs" align="flex-end" wrap="nowrap">

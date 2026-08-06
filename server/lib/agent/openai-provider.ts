@@ -11,13 +11,11 @@ import { getReasoningEffortBlocklist, parseModelId, settings } from "../settings
 import { readWithTimeout } from "../stream-timeout";
 import { getImagePath, imageToBase64 } from "../uploads";
 import { extractOpenAIUsage } from "../usage-tracking";
-import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
+import { getHttpCodexUserAgent, getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
+import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./codex-request";
 import {
-	buildCodexResponsesWebSocketUrl,
-	buildHandshakeHeaders,
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
-	type StreamCodexResponsesWebSocketOptions,
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
@@ -242,6 +240,23 @@ export function normalizeCodexReasoningEffort(
 }
 
 /**
+ * Resolve the effort value sent on a Codex Responses request, falling back to
+ * the configured default. Shared with CodexProvider so both entry points send
+ * the same value for the same settings.
+ */
+export function resolveCodexRequestReasoningEffort(
+	model: string,
+	reasoningEffort?: string,
+): string {
+	return (
+		normalizeCodexReasoningEffort(
+			model,
+			reasoningEffort ?? settings.agent.defaultReasoningEffort ?? "max",
+		) ?? "none"
+	);
+}
+
+/**
  * Apply a reasoning-effort hint on the two generic (non-Codex) wire formats.
  *
  * Blacklist policy: every model gets a hint unless it is excluded. Previously
@@ -290,6 +305,13 @@ function applyGenericReasoningEffort(
 	body.reasoning_effort = effort;
 }
 
+/**
+ * Reasoning options for the non-Codex one-shot generate paths.
+ *
+ * Codex never reaches here: its utility requests go through
+ * applyCodexStableRequestFields so the HTTP, WebSocket and utility transports
+ * all share one body contract.
+ */
 function applyGenerateReasoningOptions(
 	body: Record<string, unknown>,
 	apiMode: OpenAIApiMode,
@@ -298,15 +320,6 @@ function applyGenerateReasoningOptions(
 ): void {
 	const reasoningEffort = options?.reasoningEffort;
 	if (reasoningEffort === undefined) return;
-
-	if (apiMode === "codex") {
-		const normalized = normalizeCodexReasoningEffort(model, reasoningEffort);
-		if (normalized) {
-			body.reasoning = { effort: normalized, summary: "auto" };
-			body.include = ["reasoning.encrypted_content"];
-		}
-		return;
-	}
 
 	applyGenericReasoningEffort(body, apiMode, model, reasoningEffort);
 }
@@ -743,14 +756,6 @@ export class OpenAIProvider implements ProviderAdapter {
 			// previous_response_id is unsupported — always send full history.
 			body = { model, input: responsesInput, stream: true, store: false };
 
-			// Codex: set prompt_cache_key to conversationId for server-side prompt caching.
-			// Codex CLI uses conversation_id as the cache key so the server can reuse
-			// cached prompt prefixes across turns within the same session.
-			if (this.apiMode === "codex") {
-				body.prompt_cache_key = params.conversationId;
-				body.parallel_tool_calls = true;
-			}
-
 			if (instructions) {
 				body.instructions = instructions;
 			} else if (this.apiMode === "codex") {
@@ -769,18 +774,16 @@ export class OpenAIProvider implements ProviderAdapter {
 				body.tools = toolsArr;
 			}
 
-			// Add reasoning configuration for Codex provider requests.
 			const normalizedCodexReasoningEffort =
 				this.apiMode === "codex"
-					? normalizeCodexReasoningEffort(model, params.reasoningEffort)
+					? resolveCodexRequestReasoningEffort(model, params.reasoningEffort)
 					: params.reasoningEffort;
-			if (normalizedCodexReasoningEffort && this.apiMode === "codex") {
-				body.reasoning = {
-					effort: normalizedCodexReasoningEffort,
-					summary: "auto",
-				};
-				body.include = ["reasoning.encrypted_content"];
-			} else if (this.apiMode !== "codex") {
+			if (this.apiMode === "codex") {
+				applyCodexStableRequestFields(body, {
+					identity: createCodexRequestIdentity(params.conversationId),
+					reasoningEffort: normalizedCodexReasoningEffort as string,
+				});
+			} else {
 				// Plain responses-compatible relays: send the effort hint too. These
 				// used to get nothing at all, so their tier menu was dead weight.
 				applyGenericReasoningEffort(body, this.apiMode, model, params.reasoningEffort);
@@ -1013,6 +1016,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				input: [{ role: "user", content: text }],
 				store: false,
 			};
+			const codexIdentity = this.apiMode === "codex" ? createCodexRequestIdentity() : undefined;
 			if (systemInstruction) {
 				body.instructions = systemInstruction;
 			} else if (this.apiMode === "codex") {
@@ -1021,8 +1025,23 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			// Responses and Codex lightweight generation always use the streaming API.
 			body.stream = true;
-			applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
-			return this.requestResponsesTextWithMeta(baseUrl, apiKey, body, options?.signal, options);
+			if (codexIdentity) {
+				applyCodexStableRequestFields(body, {
+					identity: codexIdentity,
+					reasoningEffort: resolveCodexRequestReasoningEffort(bareModel, options?.reasoningEffort),
+				});
+			} else {
+				applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
+			}
+			const conversationId = codexIdentity?.conversationId;
+			return this.requestResponsesTextWithMeta(
+				baseUrl,
+				apiKey,
+				body,
+				options?.signal,
+				options,
+				conversationId,
+			);
 		}
 
 		// Completions: POST /chat/completions
@@ -1082,10 +1101,26 @@ export class OpenAIProvider implements ProviderAdapter {
 				input: [{ role: "user", content: `${reminder}\n\n${content}` }],
 				store: false,
 			};
+			const codexIdentity = this.apiMode === "codex" ? createCodexRequestIdentity() : undefined;
 			// Responses and Codex lightweight generation always use the streaming API.
 			body.stream = true;
-			applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
-			return this.requestResponsesTextWithMeta(baseUrl, apiKey, body, options?.signal, options);
+			if (codexIdentity) {
+				applyCodexStableRequestFields(body, {
+					identity: codexIdentity,
+					reasoningEffort: resolveCodexRequestReasoningEffort(bareModel, options?.reasoningEffort),
+				});
+			} else {
+				applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
+			}
+			const conversationId = codexIdentity?.conversationId;
+			return this.requestResponsesTextWithMeta(
+				baseUrl,
+				apiKey,
+				body,
+				options?.signal,
+				options,
+				conversationId,
+			);
 		}
 
 		// Completions
@@ -1108,13 +1143,14 @@ export class OpenAIProvider implements ProviderAdapter {
 		body: Record<string, unknown>,
 		signal?: AbortSignal,
 		options?: GenerateOptions,
+		conversationId?: string,
 	): Promise<GenerateMetaResult> {
 		if (body.stream !== true) {
 			throw new Error("OpenAI lightweight Responses generation requires stream=true");
 		}
 		const response = await this.pfetch(`${baseUrl}/responses`, {
 			method: "POST",
-			headers: this.buildHeaders(apiKey),
+			headers: this.buildHeaders(apiKey, conversationId),
 			body: JSON.stringify(body),
 			signal,
 		});
@@ -1228,22 +1264,15 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * Whether Codex CLI header emulation applies to this provider. The
-	 * `emulateCodexHeaders` flag is tri-state: an explicit boolean always wins,
-	 * so codex-mode providers can opt out; when unset it defaults on for the
-	 * codex apiMode and off otherwise.
-	 */
-	private get emulateCodex(): boolean {
-		if (typeof this.config.emulateCodexHeaders === "boolean") {
-			return this.config.emulateCodexHeaders;
-		}
-		return this.apiMode === "codex";
-	}
-
-	/**
-	 * Resolve the client fingerprint (User-Agent + emulated/extra headers) for
-	 * this provider. Codex semantic headers are only injected when emulation is
-	 * enabled, so non-codex providers stay clean by default.
+	 * Resolve the client fingerprint (User-Agent + Codex/extra headers) for this
+	 * provider.
+	 *
+	 * The Codex header set follows apiMode rather than a separate toggle: the
+	 * codex transport already sends a codex UA, codex instructions, native codex
+	 * tools and the stable codex body contract, so suppressing only these headers
+	 * produced a shape no real client emits (body carrying an installation id
+	 * while the matching header was absent). Operators who need a different
+	 * identity use userAgentMode/extraHeaders, which still override everything here.
 	 */
 	private resolveFingerprint(conversationId?: string): {
 		userAgent: string;
@@ -1252,10 +1281,9 @@ export class OpenAIProvider implements ProviderAdapter {
 		return resolveClientFingerprint({
 			mode: this.config.userAgentMode,
 			custom: this.config.customUserAgent,
-			fallback: getHttpUserAgent(),
+			fallback: this.apiMode === "codex" ? getHttpCodexUserAgent() : getHttpUserAgent(),
 			extraHeaders: this.config.extraHeaders,
-			emulateCodex: this.emulateCodex,
-			installationId: this.emulateCodex ? getInstallationId() : undefined,
+			installationId: this.apiMode === "codex" ? getInstallationId() : undefined,
 			conversationId,
 		});
 	}
@@ -1269,6 +1297,9 @@ export class OpenAIProvider implements ProviderAdapter {
 			"User-Agent": fingerprint.userAgent,
 		};
 		if (this.apiMode === "codex") {
+			// The Codex Responses transport is always streamed; the real CLI
+			// explicitly advertises the expected SSE response media type.
+			headers.Accept = "text/event-stream";
 			const accountId = this.config.codexAccountId;
 			// Only send ChatGPT-Account-Id to official ChatGPT domains
 			if (accountId && this.isOfficialChatGPTDomain()) {
@@ -1307,46 +1338,35 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 
 		const request = this.buildCodexWebSocketRequest(params);
-		// The sticky session key is the session-level identifier for this WS connection;
-		// conversationId is the per-conversation (thread) identifier. Mirror the real Codex
-		// CLI, which sends distinct hyphenated session-id / thread-id headers.
 		const sessionKey = params.stickySessionKey ?? params.conversationId;
 		const fingerprint = this.resolveFingerprint(params.conversationId);
-		if (this.emulateCodex && sessionKey && fingerprint.headers["session-id"]) {
-			// resolveFingerprint seeds both ids from conversationId; realign session-id to the
-			// session-level key so it isn't identical to thread-id (which stays conversationId).
-			fingerprint.headers["session-id"] = sessionKey;
-		}
-		const streamOptions: StreamCodexResponsesWebSocketOptions = {
-			baseUrl,
-			apiKey,
-			authorization: this.config.authorizationHeader,
-			accountId: this.config.codexAccountId,
-			proxy: this.proxy,
-			sessionKey,
-			narratorId: params.stickySessionKey,
-			credentialId: this.config.id,
-			model: params.model,
-			request,
-			signal: params.signal,
-			resetSessionBeforeRequest: params.resetUpstreamSession,
-			userAgent: fingerprint.userAgent,
-			extraHeaders: fingerprint.headers,
-		};
-		// Report the headers the transport will actually build, rather than a
-		// hand-written stand-in: a dump that disagrees with the wire misleads whoever
-		// is debugging it. `x-codex-turn-state` is per-session state that only exists
-		// after a completed turn, so it is not known here.
-		params.requestDump?.setRequest({
-			transport: "websocket",
-			url: buildCodexResponsesWebSocketUrl(baseUrl),
-			headers: sanitizeHeaders(buildHandshakeHeaders(streamOptions, { turnState: null })),
-			body: { type: "response.create", ...request },
-		});
 
 		try {
 			params.onRequestStart?.({ credentialId: this.config.id });
-			for await (const event of streamCodexResponsesWebSocket(streamOptions)) {
+			for await (const event of streamCodexResponsesWebSocket({
+				baseUrl,
+				apiKey,
+				authorization: this.config.authorizationHeader,
+				accountId: this.config.codexAccountId,
+				proxy: this.proxy,
+				sessionKey,
+				conversationId: params.conversationId,
+				narratorId: params.stickySessionKey,
+				credentialId: this.config.id,
+				model: params.model,
+				request,
+				signal: params.signal,
+				resetSessionBeforeRequest: params.resetUpstreamSession,
+				userAgent: fingerprint.userAgent,
+				extraHeaders: fingerprint.headers,
+				onRequestPrepared: ({ url, headers, body }) =>
+					params.requestDump?.setRequest({
+						transport: "websocket",
+						url,
+						headers: sanitizeHeaders(headers),
+						body,
+					}),
+			})) {
 				yield event;
 			}
 		} catch (err) {
@@ -1426,8 +1446,6 @@ export class OpenAIProvider implements ProviderAdapter {
 			input: convertHistoryToResponsesApi(sanitizedInputMessages),
 			stream: true,
 			store: false,
-			prompt_cache_key: params.conversationId,
-			parallel_tool_calls: true,
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
@@ -1437,14 +1455,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		});
 		request.tools = tools;
 
-		const reasoningEffort = normalizeCodexReasoningEffort(model, params.reasoningEffort);
-		if (reasoningEffort) {
-			request.reasoning = {
-				effort: reasoningEffort,
-				summary: "auto",
-			};
-			request.include = ["reasoning.encrypted_content"];
-		}
+		applyCodexStableRequestFields(request, {
+			identity: createCodexRequestIdentity(params.conversationId),
+			reasoningEffort: resolveCodexRequestReasoningEffort(model, params.reasoningEffort),
+		});
 		if (params.serviceTier) {
 			request.service_tier = params.serviceTier;
 		}
