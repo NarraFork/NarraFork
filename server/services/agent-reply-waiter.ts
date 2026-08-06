@@ -5,7 +5,7 @@ const DEFAULT_REPLY_TIMEOUT_MS = 60_000;
 const MAX_REPLY_TIMEOUT_MS = 86_400_000;
 const MAX_REPLY_CHARS = 16_000;
 
-export type AgentReplyScopeType = "parent-child" | "team" | "chat-group";
+export type AgentReplyScopeType = "parent-child" | "team";
 export interface AgentReplyScope {
 	type: AgentReplyScopeType;
 	id: string;

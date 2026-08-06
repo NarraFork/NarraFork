@@ -387,8 +387,12 @@ const READ_ONLY_SUBCOMMAND_CHECKS: Record<string, (tokens: string[]) => boolean>
 	npx: (tokens) => isReadOnlyPackageRunner(tokens, "npx"),
 	bunx: (tokens) => isReadOnlyPackageRunner(tokens, "bunx"),
 	// find：纯搜索是只读的，但 -delete/-exec/-fprintf 等会写文件或执行命令。
-	// -delete/-exec 家族同时会被 CONDITIONAL_COMMANDS 判为危险模式，这里做独立的
-	// 自包含检查，确保 -fprintf/-fls 这类只写文件不执行命令的参数也被排除。
+	//
+	// 这里刻意比 `classifyFind` 更严：即使 `-exec` 执行的是只读命令，`find … -exec cat
+	// /etc/shadow \;` 的目标路径也只存在于 exec 参数里，不会进入 `filePaths`，
+	// 而只读自动放行会跳过用户确认 —— 边界检查读的是 `filePaths`，拦不住它。
+	// 因此任何 -exec 家族参数都放弃只读结论，交回用户确认。
+	// `classifyFind` 服务于危险反思（"这个操作有多危险"），语义不同，不要合并。
 	find: (tokens) => !tokens.slice(1).some((arg) => FIND_WRITE_FLAGS.has(arg.split("=")[0])),
 	// sleep 不写任何东西，但会独占一个执行窗口直到 bash 超时 —— 与 `tail -f` 被
 	// READ_ONLY_DISQUALIFYING_FLAGS 排除的理由完全相同。短暂 sleep 仍算只读，
@@ -438,6 +442,87 @@ const FIND_WRITE_FLAGS = new Set([
 	"-fprintf",
 	"-fls",
 ]);
+
+/** find 直接把结果写进任意文件的参数（不执行命令，但目标路径不进 filePaths）。 */
+const FIND_FILE_OUTPUT_FLAGS = new Set(["-fprint", "-fprint0", "-fprintf", "-fls"]);
+
+/** find -exec/-execdir 家族 —— 每个匹配项都会被当作参数执行一次命令。 */
+const FIND_EXEC_FLAGS = ["-exec", "-execdir", "-ok", "-okdir"] as const;
+
+/**
+ * find 调用的分类结果。
+ *
+ * 四态而不是"危险/不危险"两态，因为自动放行和危险反思需要的粒度不同：
+ * - `safe`：纯搜索，或 `-exec` 执行的是可证明只读的命令（`-exec cat`）。
+ * - `sideEffects`：`-exec` 执行的是白名单内但有写/网络副作用的命令（`cp`/`mkdir`/`curl`），
+ *   或 `-fprintf` 这类直接写文件的参数。白名单放行语义保持原样（不进
+ *   `dangerousPatterns`），但危险反思要把它当作确定的高风险 —— find 会把这个副作用
+ *   施加到每个匹配项上，且 `-exec` 子命令的目标路径不会进入 `filePaths`，
+ *   worktree 边界检查拦不住它。
+ * - `dangerous`：确认危险（`-delete`、`-exec rm`、`-exec` 的子命令自带危险参数）。
+ * - `unknown`：被执行命令无法分类 —— 只能证明"不确定"，不能证明"危险"。
+ */
+export type FindClassification =
+	| { kind: "safe" }
+	| { kind: "sideEffects"; pattern: string }
+	| { kind: "dangerous"; pattern: string }
+	| { kind: "unknown"; pattern: string };
+
+/**
+ * find 调用的分类 —— 白名单判定与危险反思共用的唯一来源。
+ *
+ * 权限层必须复用这里的结论，不要退化成"只要带 `-exec` 就算高危"：那会让
+ * `find … -exec cat {} \;` 这类纯读取在宽松反思档被误拦。
+ */
+export function classifyFind(tokens: string[]): FindClassification {
+	if (tokens.some((t) => t === "-delete")) {
+		return { kind: "dangerous", pattern: "find with -delete (removes files)" };
+	}
+
+	const outputFlag = tokens.find((t) => FIND_FILE_OUTPUT_FLAGS.has(t.split("=")[0]));
+	if (outputFlag) {
+		return { kind: "sideEffects", pattern: `find with ${outputFlag} (writes to files)` };
+	}
+
+	for (const flag of FIND_EXEC_FLAGS) {
+		const idx = tokens.indexOf(flag);
+		if (idx < 0) continue;
+
+		// -exec 后面到 \; 或 + 之间的 tokens 就是被执行的命令
+		const execCmd = tokens[idx + 1];
+		if (!execCmd) return { kind: "unknown", pattern: `find with ${flag} (empty command)` };
+
+		// 递归分类：被执行的命令是否危险
+		if (ALWAYS_ASK_COMMANDS.has(execCmd)) {
+			return { kind: "dangerous", pattern: `find ${flag} ${execCmd} (dangerous command)` };
+		}
+
+		// 提取 -exec 后面到终止符之间的完整 tokens
+		const endIdx = tokens.findIndex((t, i) => i > idx && (t === ";" || t === "+"));
+		const subTokens = tokens.slice(idx + 1, endIdx > 0 ? endIdx : undefined);
+
+		// 检查条件安全命令的危险参数
+		if (execCmd in CONDITIONAL_COMMANDS) {
+			const danger = CONDITIONAL_COMMANDS[execCmd](subTokens, subTokens.join(" "));
+			if (danger) return { kind: "dangerous", pattern: `find ${flag} → ${danger}` };
+		}
+
+		// 可证明只读的子命令 — 整条 find 无副作用
+		if (isReadOnlyCommand(subTokens)) return { kind: "safe" };
+
+		// 白名单内但有副作用（cp/mv/mkdir/touch/curl/tar/git write 子命令…）
+		if (SAFE_COMMANDS.has(execCmd)) {
+			return {
+				kind: "sideEffects",
+				pattern: `find ${flag} ${execCmd} (side effects on every match)`,
+			};
+		}
+
+		// 未知命令 — 保守拦截，但只能算"未分类"
+		return { kind: "unknown", pattern: `find ${flag} ${execCmd} (unknown command)` };
+	}
+	return { kind: "safe" };
+}
 
 /**
  * git 全局 flag：能注入配置或改写可执行文件查找路径，从而让任意只读子命令
@@ -1118,38 +1203,14 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			// 未知子命令 — 可能是脚本名（bun <script>），保守拦截
 			return `bun ${sub} (unknown bun subcommand)`;
 		},
-		// find -exec / -execdir — 提取被执行的命令进行递归分类
+		// find -exec / -execdir — 提取被执行的命令进行递归分类（见 classifyFind）。
+		// `sideEffects` 不进 dangerousPatterns：`-exec cp`/`-fprintf` 的子命令本身在白名单里，
+		// 自动放行语义保持原样，额外的风险由危险反思层（classifyShellDanger）处理。
 		find: (tokens) => {
-			if (tokens.some((t) => t === "-delete")) return "find with -delete (removes files)";
-
-			const execFlags = ["-exec", "-execdir", "-ok", "-okdir"];
-			for (const flag of execFlags) {
-				const idx = tokens.indexOf(flag);
-				if (idx < 0) continue;
-
-				// -exec 后面到 \; 或 + 之间的 tokens 就是被执行的命令
-				const execCmd = tokens[idx + 1];
-				if (!execCmd) return `find with ${flag} (empty command)`;
-
-				// 递归分类：被执行的命令是否危险
-				if (ALWAYS_ASK_COMMANDS.has(execCmd)) return `find ${flag} ${execCmd} (dangerous command)`;
-
-				// 检查条件安全命令的危险参数
-				if (execCmd in CONDITIONAL_COMMANDS) {
-					// 提取 -exec 后面到终止符之间的完整 tokens
-					const endIdx = tokens.findIndex((t, i) => i > idx && (t === ";" || t === "+"));
-					const subTokens = tokens.slice(idx + 1, endIdx > 0 ? endIdx : undefined);
-					const danger = CONDITIONAL_COMMANDS[execCmd](subTokens, subTokens.join(" "));
-					if (danger) return `find ${flag} → ${danger}`;
-				}
-
-				// 被执行的命令在白名单中 — 安全
-				if (SAFE_COMMANDS.has(execCmd)) return null;
-
-				// 未知命令 — 保守拦截
-				return `find ${flag} ${execCmd} (unknown command)`;
-			}
-			return null;
+			const classification = classifyFind(tokens);
+			return classification.kind === "dangerous" || classification.kind === "unknown"
+				? classification.pattern
+				: null;
 		},
 		// sed -i 可以修改文件
 		sed: (tokens) => {

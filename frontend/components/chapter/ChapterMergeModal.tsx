@@ -95,6 +95,13 @@ export function ChapterMergeModal({
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
+			// A merge changes the story network and the timeline too, and these were being
+			// left stale — so the graph and ruler views kept showing the source chapter as
+			// active until something else happened to refetch them.
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
+			qc.invalidateQueries({ queryKey: ["ruler"] });
+			qc.invalidateQueries({ queryKey: ["rulerSegment"] });
+			qc.invalidateQueries({ queryKey: ["chapterEdges"] });
 			handleClose();
 		},
 	});

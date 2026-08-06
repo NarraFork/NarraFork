@@ -43,7 +43,86 @@ describe("narrators API", () => {
 				}),
 			configurable: true,
 		});
-		expect(await api.editAndRegenerate("narrator-1", "message-1", "draft", false)).toBe(false);
+		expect(await api.editAndRegenerate("narrator-1", "message-1", "draft")).toEqual({ ok: false });
+	});
+
+	test("sends the edit's revert choice and scope", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+			configurable: true,
+		});
+		let requestInit: RequestInit | undefined;
+		Object.defineProperty(g, "fetch", {
+			value: async (_url: string, init?: RequestInit) => {
+				requestInit = init;
+				return new Response(JSON.stringify({ ok: true }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			},
+			configurable: true,
+		});
+
+		await api.editAndRegenerate("narrator-1", "message-1", "draft", {
+			skipRevert: true,
+			scope: "workspace",
+		});
+
+		expect(JSON.parse(String(requestInit?.body))).toMatchObject({
+			content: "draft",
+			skipRevert: true,
+			scope: "workspace",
+		});
+	});
+
+	test("omits the revert fields when the caller did not choose", async () => {
+		// The server defaults to reverting; sending `skipRevert: false` unasked would
+		// state a choice the caller never made.
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+			configurable: true,
+		});
+		let requestInit: RequestInit | undefined;
+		Object.defineProperty(g, "fetch", {
+			value: async (_url: string, init?: RequestInit) => {
+				requestInit = init;
+				return new Response(JSON.stringify({ ok: true }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			},
+			configurable: true,
+		});
+
+		await api.editAndRegenerate("narrator-1", "message-1", "draft");
+
+		const body = JSON.parse(String(requestInit?.body));
+		expect("skipRevert" in body).toBe(false);
+		expect("scope" in body).toBe(false);
+	});
+
+	test("surfaces rollback warnings from an edit", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+			configurable: true,
+		});
+		Object.defineProperty(g, "fetch", {
+			value: async () =>
+				new Response(
+					JSON.stringify({
+						ok: true,
+						warnings: [
+							{ code: "SUBAGENT_CHANGES_REVERTED", changeCount: 2, sampleFilePaths: ["a.ts"] },
+						],
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				),
+			configurable: true,
+		});
+
+		const result = await api.editAndRegenerate("narrator-1", "message-1", "draft");
+		expect(result.ok).toBe(true);
+		expect(result.warnings).toHaveLength(1);
 	});
 
 	test("preserves the COW retry ID contract", async () => {

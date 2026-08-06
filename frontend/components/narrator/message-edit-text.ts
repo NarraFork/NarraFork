@@ -54,3 +54,39 @@ export function resolveEditorInitialText(
 	const maxChars = role === "user" ? MAX_USER_MESSAGE_EDIT_CHARS : MAX_ASSISTANT_MESSAGE_EDIT_CHARS;
 	return collectTextBlocksPreview(blocks, maxChars);
 }
+
+/**
+ * Whether editing this message needs the revert confirmation dialog.
+ *
+ * True whenever the edit would destroy something the user cannot see from the
+ * editor: a file the rollback would change, or a later message it would delete.
+ * When neither exists there is nothing to decide, so the edit submits directly.
+ *
+ * An absent preview returns true: not knowing what an edit would destroy is not a
+ * reason to skip asking. This deliberately replaces the old "is this the last user
+ * message?" shortcut, which submitted without a prompt while the server reverted
+ * files anyway.
+ *
+ * Structurally typed rather than importing the API types, to keep this module free
+ * of the api/ graph (see the file header).
+ */
+export function editRevertNeedsConfirm(
+	preview:
+		| {
+				affectedFiles?: unknown[];
+				narratorScope?: { files?: unknown[] };
+				workspaceScope?: { files?: unknown[] };
+				deletedMessageCount?: number;
+		  }
+		| undefined,
+): boolean {
+	if (!preview) return true;
+	if ((preview.deletedMessageCount ?? 0) > 0) return true;
+	// Any scope having files is enough: the dialog lets the user switch between them,
+	// so a scope that is not currently selected still represents a real choice.
+	return (
+		(preview.affectedFiles?.length ?? 0) > 0 ||
+		(preview.narratorScope?.files?.length ?? 0) > 0 ||
+		(preview.workspaceScope?.files?.length ?? 0) > 0
+	);
+}

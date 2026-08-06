@@ -2,7 +2,6 @@ import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { getSubagentType, isSubagentVariant, parseSubstatus } from "@server/lib/narrator-utils";
 import type { Locale } from "@server/lib/prompt-i18n";
-import { foldHandle } from "@shared/narrator-handle";
 import {
 	type AgentReplyScope,
 	type AgentReplyWaitHandle,
@@ -752,222 +751,6 @@ export async function awaitAgentResult(opts: AwaitAgentInput): Promise<string> {
 }
 
 /**
- * Resolve a single selector to a fellow chat-group member narrator of the caller.
- * Matches by exact id, handle, slugified title, or title. Returns the member's
- * narrator id and the shared group id, or null if the selector is not a fellow
- * group member.
- */
-function normalizeGroupMemberSelector(selector: string): string {
-	const trimmed = selector.trim();
-	return trimmed.startsWith("@") ? trimmed.slice(1).trim() : trimmed;
-}
-
-async function resolveGroupMemberSelector(
-	callerNarratorId: string,
-	selector: string,
-): Promise<{ narratorId: string; groupId: string } | null> {
-	const { chatGroupService } = await import("./chat-group-service");
-	const groups = await chatGroupService.listGroupsForNarrator(callerNarratorId);
-	if (groups.length === 0) return null;
-
-	const rawSelector = selector.trim();
-	const normalizedSelector = normalizeGroupMemberSelector(selector);
-	// Case-insensitive handle key (matches the storage fold), so "@MyBot" resolves
-	// a narrator whose stored handle is "MyBot" / "mybot".
-	const foldedSelector = foldHandle(normalizedSelector);
-
-	for (const group of groups) {
-		const members = await chatGroupService.listNarratorMembers(group.id);
-		for (const member of members) {
-			if (!member.narratorId || member.narratorId === callerNarratorId) continue;
-			const narrator = await narratorService.getById(member.narratorId).catch(() => null);
-			if (!narrator) continue;
-			const narratorFold =
-				narrator.handleFold ?? (narrator.handle ? foldHandle(narrator.handle) : null);
-			if (
-				narrator.id === rawSelector ||
-				narrator.id === normalizedSelector ||
-				(narratorFold !== null && narratorFold === foldedSelector) ||
-				subagentMatchesSelector(narrator, rawSelector) ||
-				subagentMatchesSelector(narrator, normalizedSelector)
-			) {
-				return { narratorId: narrator.id, groupId: group.id };
-			}
-		}
-	}
-	return null;
-}
-
-/**
- * Attempt to route a Send via a chat group. Returns a result if every selector
- * resolves to a fellow group member; returns null if no selector matches a group
- * member (so the caller can fall through to the subagent-team path).
- */
-async function tryRouteViaChatGroup(input: SendSubagentInput): Promise<SendSubagentResult | null> {
-	const selectors = getSelectors(input);
-	if (selectors.length === 0) return null;
-
-	const { chatGroupService } = await import("./chat-group-service");
-	const resolved: { selector: string; narratorId: string; groupId: string }[] = [];
-	for (const selector of selectors) {
-		const match = await resolveGroupMemberSelector(input.callerNarratorId, selector);
-		if (match) resolved.push({ selector, ...match });
-	}
-	// If none of the selectors are group members, this isn't a group send.
-	if (resolved.length === 0) return null;
-	if (resolved.length !== selectors.length) {
-		const resolvedSelectors = new Set(resolved.map((item) => item.selector));
-		const targets = selectors.map((selector) => ({
-			id: selector,
-			status: "failed" as const,
-			error: resolvedSelectors.has(selector)
-				? "Mixed group and non-group Send targets are not delivered together; split this into separate Send calls."
-				: "Target is not a fellow chat-group member.",
-		}));
-		return {
-			output: targets
-				.map((target) => `Failed to deliver to "${target.id}": ${target.error}`)
-				.join("\n"),
-			targets,
-		};
-	}
-
-	const distinctTargets = [
-		...new Map(resolved.map((target) => [target.narratorId, target])).values(),
-	];
-	if (input.replyTo && distinctTargets.length !== 1) {
-		return {
-			output: "An explicit replyTo Send must address exactly one requester.",
-			targets: distinctTargets.map((target) => ({
-				id: target.selector,
-				status: "failed" as const,
-				error: "replyTo requires exactly one target.",
-			})),
-		};
-	}
-	const incomingReplies = resolveIncomingSendReplies(
-		input.callerNarratorId,
-		distinctTargets.map((target) => ({
-			id: target.narratorId,
-			label: target.selector,
-			scope: { type: "chat-group", id: target.groupId },
-		})),
-		input.message,
-		input.replyTo,
-	);
-	if (incomingReplies) return incomingReplies;
-
-	const replyHandles = new Map<string, AgentReplyWaitHandle>();
-	if (input.shouldAwait) {
-		try {
-			for (const target of distinctTargets) {
-				replyHandles.set(
-					target.narratorId,
-					registerAgentReplyWait({
-						requesterId: input.callerNarratorId,
-						responderId: target.narratorId,
-						scope: { type: "chat-group", id: target.groupId },
-						timeoutMs: input.timeoutMs,
-						signal: input.signal,
-						run: input.replyRun,
-						toolUseId: input.toolUseId,
-						label: target.selector,
-					}),
-				);
-			}
-		} catch (err) {
-			for (const handle of replyHandles.values()) handle.cancel();
-			const error = err instanceof Error ? err.message : String(err);
-			return {
-				output: `Cannot wait for chat-group Send replies: ${error}`,
-				targets: distinctTargets.map((target) => ({
-					id: target.selector,
-					status: "failed",
-					awaited: true,
-					error,
-				})),
-			};
-		}
-	}
-
-	const groupErrors = new Map<string, string>();
-	if (input.shouldAwait) {
-		for (const target of distinctTargets) {
-			const handle = replyHandles.get(target.narratorId) as AgentReplyWaitHandle;
-			try {
-				await chatGroupService.postMessage({
-					groupId: target.groupId,
-					content: appendSendReplyRequest(
-						input.message,
-						input.callerNarratorId,
-						handle.requestId,
-						input.locale as Locale,
-					),
-					senderType: "narrator",
-					senderNarratorId: input.callerNarratorId,
-					locale: input.locale as Locale,
-					deliverNarratorIds: [target.narratorId],
-				});
-			} catch (err) {
-				groupErrors.set(target.narratorId, err instanceof Error ? err.message : String(err));
-			}
-		}
-	} else {
-		for (const groupId of new Set(distinctTargets.map((target) => target.groupId))) {
-			try {
-				await chatGroupService.postMessage({
-					groupId,
-					content: input.message,
-					senderType: "narrator",
-					senderNarratorId: input.callerNarratorId,
-					locale: input.locale as Locale,
-				});
-			} catch (err) {
-				for (const target of distinctTargets) {
-					if (target.groupId === groupId) {
-						groupErrors.set(target.narratorId, err instanceof Error ? err.message : String(err));
-					}
-				}
-			}
-		}
-	}
-
-	if (input.shouldAwait) {
-		const pendingReplies: PendingSendReply[] = [];
-		for (const target of distinctTargets) {
-			const handle = replyHandles.get(target.narratorId) as AgentReplyWaitHandle;
-			const error = groupErrors.get(target.narratorId);
-			const deliveryNote = error
-				? `Could not deliver to group member "${target.selector}".`
-				: `Delivered to group member "${target.selector}" and requested a Send reply.`;
-			handle.updateSnapshot({ deliveryNote });
-			if (error) handle.fail(error);
-			pendingReplies.push({
-				id: target.narratorId,
-				label: target.selector,
-				handle,
-				deliveryNote,
-			});
-		}
-		return waitForSendReplies(pendingReplies, input.replyRun);
-	}
-
-	const sections: string[] = [];
-	const targetResults: SendTargetResult[] = [];
-	for (const target of distinctTargets) {
-		const error = groupErrors.get(target.narratorId);
-		if (error) {
-			sections.push(`Failed to deliver to "${target.selector}": ${error}`);
-			targetResults.push({ id: target.selector, status: "failed", error });
-		} else {
-			sections.push(`Delivered to group member "${target.selector}".`);
-			targetResults.push({ id: target.selector, status: "completed" });
-		}
-	}
-	return { output: sections.join("\n"), targets: targetResults };
-}
-
-/**
  * Reserved selectors a subagent can use to address the narrator that launched
  * it (its parent). Matched case-insensitively before sibling alias resolution.
  */
@@ -1072,7 +855,7 @@ async function deliverSubagentMessageToParent(
  * Attempt to route a Send from a subagent to its parent narrator. Returns a
  * result when every selector targets the parent; returns null when no selector
  * is parent-bound (caller falls through to sibling routing). A mix of parent
- * and non-parent selectors is rejected (mirrors chat-group mixed-target rules).
+ * and non-parent selectors is rejected.
  */
 async function tryRouteToParent(
 	input: SendSubagentInput,
@@ -1204,15 +987,6 @@ async function sendSubagentMessageDetailedWithRun(
 ): Promise<SendSubagentResult> {
 	const scope = await getCommunicationScope(input.callerNarratorId);
 	assertSubagentSendIsAsync(scope.callerIsSubagent, input.shouldAwait);
-
-	// Chat-group routing: if the caller is a primary narrator and the selector(s)
-	// resolve to fellow chat-group member narrators, deliver via the group instead
-	// of the subagent-team path. This is how named narrators converse across
-	// sessions. Subagents continue to use the team path exclusively.
-	if (!scope.callerIsSubagent && !input.doInterrupt) {
-		const groupResult = await tryRouteViaChatGroup(input);
-		if (groupResult) return groupResult;
-	}
 
 	if (input.doInterrupt && scope.callerIsSubagent) {
 		throw new Error("doInterrupt is only supported from a primary narrator to its child subagents");

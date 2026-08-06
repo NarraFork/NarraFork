@@ -2,8 +2,7 @@
  * Parent-narrator inbound message queue.
  *
  * Standalone module (no db dependency) to avoid circular imports between
- * narrator-session and agent-communication — mirrors bg-completion-queue and
- * chat-group-queue.
+ * narrator-session and agent-communication — mirrors bg-completion-queue.
  *
  * When a subagent uses `Send({ id: "parent", message })` to report progress to
  * the narrator that launched it, the message is queued here keyed by the parent

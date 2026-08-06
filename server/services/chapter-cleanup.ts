@@ -8,6 +8,9 @@ import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { chapterEdgeService } from "./chapter-edge-service";
+import { clearedSnapshotMergeFields } from "./chapter-merge";
+import { restoreSourceSnapshot } from "./chapter-merge-snapshot";
+import { ensureChapterSnapshot } from "./chapter-snapshot-ref";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
@@ -58,7 +61,32 @@ export const chapterCleanup = {
 				}
 			}
 
+			// Step 2.5: Record the workspace in the snapshot DAG before anything removes
+			// it. The auto-commit below is allowed to fail (see the recovery block, which
+			// ends in "Proceed anyway"), and the worktree is then deleted regardless — so
+			// without a snapshot taken here, a chapter that went dormant with a failing
+			// commit loses every uncommitted byte with no record of them anywhere.
+			//
+			// Taken BEFORE the commit rather than after so it captures the workspace as the
+			// user left it, including files the commit would not pick up.
+			const dormantSnapshot = await ensureChapterSnapshot(
+				chapter.worktreePath,
+				"state before going dormant",
+			);
+			if (!dormantSnapshot) {
+				logger.warn("Could not snapshot a chapter's workspace before making it dormant", {
+					chapterId,
+					worktreePath: chapter.worktreePath,
+				});
+			}
+
 			// Step 3: Auto-commit with conflict recovery
+			//
+			// `commitFailed` decides whether the snapshot above is still needed on wake. When
+			// the commit succeeds the branch tip carries the work, and restoring a snapshot
+			// on top would be a pointless (and slightly risky) rewrite of a clean worktree.
+			// When it fails, that snapshot is the ONLY copy.
+			let commitFailed = false;
 			try {
 				await gitService.autoCommit(chapter.worktreePath, "auto-save before dormant");
 			} catch (commitErr) {
@@ -79,6 +107,7 @@ export const chapterCleanup = {
 						error: String(recoveryErr),
 					});
 					// Proceed anyway — worktree will be removed, branch state preserved
+					commitFailed = true;
 				}
 			}
 
@@ -104,7 +133,19 @@ export const chapterCleanup = {
 			const now = new Date().toISOString();
 			await db
 				.update(chapters)
-				.set({ status: "dormant", worktreePath: null, updatedAt: now })
+				.set({
+					status: "dormant",
+					worktreePath: null,
+					// Recorded only when the commit failed, so it means exactly one thing:
+					// "the branch does not carry this chapter's work, the snapshot does".
+					// Waking reads it to decide whether a restore is needed at all, and a
+					// value written after a SUCCESSFUL commit would make every wake rewrite
+					// a worktree that git had already restored correctly.
+					...(commitFailed && dormantSnapshot
+						? { dormantSnapshotCommitSha: dormantSnapshot.commitSha }
+						: {}),
+					updatedAt: now,
+				})
 				.where(eq(chapters.id, chapterId));
 
 			logger.info("Chapter made dormant", { chapterId });
@@ -130,6 +171,32 @@ export const chapterCleanup = {
 			// Step 1: Create worktree
 			await gitService.createWorktree(gitPath, worktreePath, chapter.branch);
 
+			// Step 1.5: Put back the uncommitted work the branch does not carry.
+			//
+			// Two ways a chapter can hold state its branch tip does not:
+			//   - it was merged without a commit, so the merge never advanced the branch and
+			//     `mergedSourceSnapshotSha` is the only copy of what it contributed;
+			//   - it went dormant while the auto-commit failed, which `dormant` explicitly
+			//     tolerates ("Proceed anyway") before deleting the worktree — leaving the
+			//     snapshot taken at that point as the only copy.
+			//
+			// The merge coordinate wins when both exist: it names the state that was actually
+			// merged away, which is what waking a merged chapter is expected to hand back.
+			// `restoreSourceSnapshot` verifies the commit against the shadow repository and
+			// reports rather than throws, so a pruned or missing snapshot degrades to "you got
+			// the last commit" instead of failing the wake.
+			const restoreTarget = chapter.mergedSourceSnapshotSha ?? chapter.dormantSnapshotCommitSha;
+			if (restoreTarget) {
+				const restored = await restoreSourceSnapshot(worktreePath, restoreTarget);
+				if (!restored.restored) {
+					logger.warn("Wake could not restore the chapter's uncommitted work", {
+						chapterId,
+						snapshot: restoreTarget,
+						reason: restored.reason,
+					});
+				}
+			}
+
 			// Step 2: Update DB — if this fails, clean up the orphan worktree
 			const now = new Date().toISOString();
 			try {
@@ -140,9 +207,26 @@ export const chapterCleanup = {
 						worktreePath,
 						lastAccessedAt: now,
 						updatedAt: now,
-						// Clear merge metadata when waking a merged chapter
+						// The dormant snapshot has been consumed (or was found unrestorable), and
+						// the chapter now has a live worktree whose state is tracked by
+						// `snapshotCommitSha`. Cleared so it keeps meaning "the branch is missing
+						// this chapter's work": left behind, a LATER dormant cycle whose commit
+						// succeeded would still find this stale value and restore an old workspace
+						// over the one git had just restored correctly.
+						dormantSnapshotCommitSha: null,
+						// Clear merge metadata when waking a merged chapter. Every coordinate of
+						// the dissolved merge has to go, snapshot ones included: `unmerge` routes
+						// on `mergeSnapshotCommitSha`, so a leftover value would later send it
+						// down the snapshot path with coordinates for a merge that no longer
+						// exists. `preMergeTargetSha` was already being missed here.
 						...(chapter.status === "merged"
-							? { mergedIntoChapterId: null, mergeCommitSha: null, mergeStrategy: null }
+							? {
+									mergedIntoChapterId: null,
+									mergeCommitSha: null,
+									mergeStrategy: null,
+									preMergeTargetSha: null,
+									...clearedSnapshotMergeFields(),
+								}
 							: {}),
 					})
 					.where(eq(chapters.id, chapterId));

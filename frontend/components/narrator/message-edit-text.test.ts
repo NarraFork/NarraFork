@@ -3,10 +3,68 @@
 import { describe, expect, it } from "bun:test";
 import {
 	collectTextBlocksPreview,
+	editRevertNeedsConfirm,
 	MAX_ASSISTANT_MESSAGE_EDIT_CHARS,
 	MAX_USER_MESSAGE_EDIT_CHARS,
 	resolveEditorInitialText,
 } from "./message-edit-text";
+
+describe("editRevertNeedsConfirm", () => {
+	it("skips the prompt when nothing would be destroyed", () => {
+		expect(
+			editRevertNeedsConfirm({
+				affectedFiles: [],
+				narratorScope: { files: [] },
+				workspaceScope: { files: [] },
+				deletedMessageCount: 0,
+			}),
+		).toBe(false);
+	});
+
+	it("asks when the narrator scope would change files", () => {
+		expect(
+			editRevertNeedsConfirm({
+				affectedFiles: [],
+				narratorScope: { files: [{ filePath: "a.ts" }] },
+				workspaceScope: { files: [] },
+				deletedMessageCount: 0,
+			}),
+		).toBe(true);
+	});
+
+	it("asks when only the workspace scope would change files", () => {
+		// The dialog lets the user switch scopes, so an unselected scope with files
+		// still represents a real choice.
+		expect(
+			editRevertNeedsConfirm({
+				affectedFiles: [],
+				narratorScope: { files: [] },
+				workspaceScope: { files: [{ filePath: "b.ts" }] },
+				deletedMessageCount: 0,
+			}),
+		).toBe(true);
+	});
+
+	it("asks when later messages would be deleted even with no file changes", () => {
+		expect(
+			editRevertNeedsConfirm({
+				affectedFiles: [],
+				narratorScope: { files: [] },
+				workspaceScope: { files: [] },
+				deletedMessageCount: 3,
+			}),
+		).toBe(true);
+	});
+
+	it("asks when the legacy replay preview reports files", () => {
+		expect(editRevertNeedsConfirm({ affectedFiles: [{ filePath: "c.ts" }] })).toBe(true);
+	});
+
+	it("asks when the preview is unavailable", () => {
+		// Not knowing what an edit would destroy is not a reason to skip asking.
+		expect(editRevertNeedsConfirm(undefined)).toBe(true);
+	});
+});
 
 describe("collectTextBlocksPreview", () => {
 	it("joins text blocks with a blank line", () => {

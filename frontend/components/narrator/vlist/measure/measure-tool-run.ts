@@ -171,7 +171,12 @@ export function traceBodyInnerWidth(contentWidth: number): number {
 // ── Data types ───────────────────────────────────────────────────────────────
 
 /** Which concrete trace this is (renderer picks header icon / colour / label). */
-export type TraceVariant = "collapsible" | "tool-run-summary" | "activity" | "reasoning-steps";
+export type TraceVariant =
+	| "collapsible"
+	| "tool-run-summary"
+	| "activity"
+	| "reasoning-steps"
+	| "sidecar";
 
 /** One trace row. Title is single-line/truncated → height-neutral. */
 export interface TraceItemData {
@@ -788,6 +793,49 @@ export function measureReasoningStepsTrace(
 		},
 		contentWidth,
 		expandState,
+	);
+}
+
+/**
+ * LOW-LOD sidecar form: ONE record as a bare CollapsibleTrace — the header shows
+ * the localized source label, and the single row carries the single-line preview
+ * (expanding reveals the full text as a markdown body, exactly like a reasoning
+ * step's body). This is the low-LOD redesign form that replaces the full Paper
+ * card: no background, no border, the same 24.8px header + 18.8px row geometry
+ * every other folded trace uses, so the sidecar reads as one more bare row.
+ *
+ * The row icon tints by the sidecar's source colour (`iconColor`), which the
+ * renderer maps to the same accent the full card would show at high LOD.
+ */
+export function measureSidecarTrace(
+	data: {
+		sourceLabel: string;
+		color: string;
+		previewText: string;
+		fullText: string;
+	},
+	contentWidth: number,
+	expandState: TraceExpandState = {},
+	lod: RenderLod = DEFAULT_RENDER_LOD,
+): MeasuredCollapsibleTrace {
+	return measureCollapsibleTrace(
+		{
+			items: [
+				{
+					title: data.previewText,
+					hasIcon: true,
+					iconColor: data.color,
+					bodyText: data.fullText,
+				},
+			],
+			maxVisible: 1,
+			variant: "sidecar",
+			headerLabel: data.sourceLabel,
+			headerCount: "",
+		},
+		contentWidth,
+		expandState,
+		lod,
 	);
 }
 

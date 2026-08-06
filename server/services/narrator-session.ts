@@ -110,11 +110,6 @@ import {
 	drainCompletedBackgroundSubagents,
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
-import {
-	drainGroupMessagesForNarrator,
-	formatGroupMessages,
-	hasQueuedGroupMessages,
-} from "./chat-group-queue";
 import { gitService } from "./git-service";
 import { getStatusSummaryCached, invalidateStatus } from "./git-status-cache";
 import { knowledgeInjection } from "./knowledge-injection";
@@ -2724,16 +2719,6 @@ export async function runAgentLoop(
 						});
 					}
 
-					// Drain queued chat-group messages (delivered to a working narrator)
-					const groupMsgs = drainGroupMessagesForNarrator(narratorId);
-					if (groupMsgs.length > 0) {
-						sideCars.push({
-							target: "user_message",
-							source: "group_message",
-							content: formatGroupMessages(groupMsgs),
-						});
-					}
-
 					// Drain progress reports sent by child subagents via Send({ id: "parent" }).
 					const parentInbound = drainParentInboundMessages(narratorId);
 					if (parentInbound.length > 0) {
@@ -4763,8 +4748,8 @@ export async function startBackgroundCompletionContinuationIfPossible(
  * Wake an idle parent narrator to consume progress reports sent by its child
  * subagents via Send({ id: "parent" }). A working/waiting parent drains the
  * queue at its next after_tools sidecar boundary, so this only acts on idle
- * narrators. Plan-mode narrators are not auto-woken (mirrors goal continuation
- * and chat-group delivery) — the message stays queued until their next activity.
+ * narrators. Plan-mode narrators are not auto-woken (mirrors goal continuation)
+ * — the message stays queued until their next activity.
  *
  * Reuses continuationStartLock so it cannot race the background-task
  * completion continuation into starting two concurrent loops.
@@ -5939,8 +5924,13 @@ function buildEditedUserContentJson(
 /**
  * Edit a user message and regenerate the response.
  * Updates the message content, deletes everything after it, and re-runs the agent loop.
- * If rollback is true and the narrator is bound to a chapter, resets git to the state
- * before the original message was sent.
+ *
+ * `opts.revertFiles` (default true) decides whether the file changes the deleted
+ * messages made are rolled back, and `opts.revertScope` how wide that rollback
+ * reaches — the same two choices the rollback dialog offers. They are options, not
+ * a fixed behaviour, because "edit this message again" and "undo what the assistant
+ * wrote to my files" are separate intents that used to be welded together: the old
+ * `rollback` flag was accepted and then ignored, so every edit reverted files.
  *
  * `opts.keepImageIds` / `opts.newImages` let the caller manage attached images during
  * editing (keep a subset of existing images, drop the rest, and/or append new uploads).
@@ -5954,27 +5944,27 @@ export async function editAndRegenerate(
 	newContent: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
-	rollback = false,
-	opts?: {
-		keepImageIds?: string[];
-		newImages?: File[];
-		keepTextFilePaths?: string[];
-		newTextFiles?: File[];
-		userId?: string | null;
-		deferContinuation?: boolean;
-	},
-): Promise<{ ok: boolean }> {
+	opts?: EditAndRegenerateOptions,
+): Promise<{ ok: boolean; warnings?: RevertWarning[] }> {
 	return continuationStartLock.acquire(narratorId, () =>
-		editAndRegenerateUnlocked(
-			narratorId,
-			messageId,
-			newContent,
-			locale,
-			replyInUserLanguage,
-			rollback,
-			opts,
-		),
+		editAndRegenerateUnlocked(narratorId, messageId, newContent, locale, replyInUserLanguage, opts),
 	);
+}
+
+export interface EditAndRegenerateOptions {
+	keepImageIds?: string[];
+	newImages?: File[];
+	keepTextFilePaths?: string[];
+	newTextFiles?: File[];
+	userId?: string | null;
+	deferContinuation?: boolean;
+	/**
+	 * Roll back the file changes the truncated messages made. Defaults to true,
+	 * which is what every edit did before this was expressible.
+	 */
+	revertFiles?: boolean;
+	/** How wide that rollback reaches; omitted means the server default (`narrator`). */
+	revertScope?: RevertScope;
 }
 
 async function editAndRegenerateUnlocked(
@@ -5983,16 +5973,8 @@ async function editAndRegenerateUnlocked(
 	newContent: string,
 	locale: Locale,
 	replyInUserLanguage: boolean,
-	rollback: boolean,
-	opts?: {
-		keepImageIds?: string[];
-		newImages?: File[];
-		keepTextFilePaths?: string[];
-		newTextFiles?: File[];
-		userId?: string | null;
-		deferContinuation?: boolean;
-	},
-): Promise<{ ok: boolean }> {
+	opts?: EditAndRegenerateOptions,
+): Promise<{ ok: boolean; warnings?: RevertWarning[] }> {
 	// Every admission and attachment check must finish before the first file write.
 	if (isLoopRunning(narratorId)) {
 		logger.warn("editAndRegenerate blocked: loop already running", { narratorId });
@@ -6147,10 +6129,31 @@ async function editAndRegenerateUnlocked(
 		return { ok: false };
 	}
 
-	// File rollback is handled automatically by deleteMessagesAfter via snapshot revert.
-	if (rollback) {
-		logger.debug("editAndRegenerate: rollback param is now a no-op (auto-revert via snapshot)", {
+	// Truncate (and optionally roll the files back) BEFORE materialising this edit's
+	// attachments. A workspace-scoped tree rollback deletes whatever the target tree
+	// does not contain, and files just written into `.narrafork/attached/` are exactly
+	// that — so writing them first meant the rollback silently ate the user's new
+	// uploads. The boundary is the ORIGINAL message id: copy-on-write below may hand
+	// the row a new id, but the ref keeps its `seq`, which is what selects the tail.
+	//
+	// The cost of this order is that a failure in the attachment/copy-on-write steps
+	// leaves the history truncated while the edit is unsaved. That is recoverable —
+	// the request fails, the client keeps the draft, and the user can resubmit —
+	// whereas destroying an attachment the user just added is not.
+	const { deletedMessageIds, revertWarnings } = await narratorService.deleteMessagesAfter(
+		narratorId,
+		messageId,
+		{
+			preserveConversationId: true,
+			skipRevert: opts?.revertFiles === false,
+			...(opts?.revertScope ? { scope: opts.revertScope } : {}),
+		},
+	);
+	if (deletedMessageIds.length > 0) {
+		broadcastToNarrator(narratorId, {
+			type: "messages_deleted",
 			narratorId,
+			deletedMessageIds,
 		});
 	}
 
@@ -6240,25 +6243,14 @@ async function editAndRegenerateUnlocked(
 		}
 	}
 
-	// Delete everything after this message while preserving the API cache key.
-	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(
-		narratorId,
-		privateMessageId,
-		{ preserveConversationId: true },
-	);
-	if (deletedMessageIds.length > 0) {
-		broadcastToNarrator(narratorId, {
-			type: "messages_deleted",
-			narratorId,
-			deletedMessageIds,
-		});
-	}
-
 	const imageRefs = existingImages;
+	// Surfaced so the caller can pass the advice on: a rollback can reach past the
+	// chosen scope (subagent writes, a workspace restore).
+	const warnings = revertWarnings?.length ? { warnings: revertWarnings } : {};
 
 	if (opts?.deferContinuation) {
 		await narratorService.updateStatus(narratorId, "idle", { substatus: [] });
-		return { ok: true };
+		return { ok: true, ...warnings };
 	}
 	if (!active) {
 		throw new ValidationError("Narrator session was not initialized for regeneration");
@@ -6290,7 +6282,7 @@ async function editAndRegenerateUnlocked(
 		},
 	);
 
-	return { ok: true };
+	return { ok: true, ...warnings };
 }
 
 /**
@@ -6969,15 +6961,12 @@ export async function reconcileRunningStatus(narratorId: string): Promise<boolea
  * Whether a soft-stop for queued input still has something to deliver.
  *
  * A soft stop is only worth taking at a tool boundary when the work that
- * requested it is still pending. Both sources are checked because both raise
- * `_bufferSoftStop`: the buffer queue (priority "cut in after the current tool
- * call" messages) and urgent chat-group messages waiting for a sidecar
- * boundary. If the user cancels the queued message before the boundary is
- * reached, neither has anything left and the loop must keep running.
+ * requested it is still pending: the buffer queue holds priority "cut in after
+ * the current tool call" messages. If the user cancels the queued message before
+ * the boundary is reached, there is nothing left and the loop must keep running.
  */
 function hasPendingBufferedWork(narratorId: string): boolean {
-	if ((bufferedMessages.get(narratorId)?.length ?? 0) > 0) return true;
-	return hasQueuedGroupMessages(narratorId);
+	return (bufferedMessages.get(narratorId)?.length ?? 0) > 0;
 }
 
 /**

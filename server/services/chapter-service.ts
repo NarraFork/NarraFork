@@ -371,13 +371,17 @@ export const chapterService = {
 						error: String(err),
 					});
 				}
-				// Snapshots are keyed by worktree path, so they become unreachable with it.
-				await worktreeTreeSnapshot.destroy(chapter.worktreePath).catch((err) =>
-					logger.debug("Failed to remove tree snapshots during chapter delete", {
-						chapterId: id,
-						error: String(err),
-					}),
-				);
+				// The chapter itself is going away, so its lineage has no future reader —
+				// `force` is required because the ownership guard would otherwise keep the
+				// repository alive on the strength of the very row being deleted.
+				await worktreeTreeSnapshot
+					.destroy(chapter.worktreePath, undefined, { force: true })
+					.catch((err) =>
+						logger.debug("Failed to remove tree snapshots during chapter delete", {
+							chapterId: id,
+							error: String(err),
+						}),
+					);
 			}
 
 			// Detach self-referencing FKs pointing to this chapter
@@ -454,13 +458,17 @@ export const chapterService = {
 						});
 					}
 				}
-				// Snapshots are keyed by worktree path, so they become unreachable with it.
-				await worktreeTreeSnapshot.destroy(chapter.worktreePath).catch((err) =>
-					logger.debug("Failed to remove tree snapshots during chapter delete", {
-						chapterId: id,
-						error: String(err),
-					}),
-				);
+				// The chapter itself is going away, so its lineage has no future reader —
+				// `force` is required because the ownership guard would otherwise keep the
+				// repository alive on the strength of the very row being deleted.
+				await worktreeTreeSnapshot
+					.destroy(chapter.worktreePath, undefined, { force: true })
+					.catch((err) =>
+						logger.debug("Failed to remove tree snapshots during chapter delete", {
+							chapterId: id,
+							error: String(err),
+						}),
+					);
 			}
 
 			// Detach self-referencing FKs pointing to this chapter

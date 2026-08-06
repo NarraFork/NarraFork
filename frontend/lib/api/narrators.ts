@@ -1039,12 +1039,20 @@ export const narratorsApi = {
 				}),
 			},
 		),
+	/**
+	 * Edit a user message and regenerate from it.
+	 *
+	 * `skipRevert` / `scope` are the same two choices rollback-to-block offers, and
+	 * they are sent explicitly: the superseded `rollback` flag was accepted by the
+	 * server and then ignored, so every edit reverted files regardless of it.
+	 */
 	editAndRegenerate: async (
 		narratorId: string,
 		messageId: string,
 		content: string,
-		rollback: boolean,
 		opts?: {
+			skipRevert?: boolean;
+			scope?: RevertScope;
 			keepImageIds?: string[];
 			newImages?: File[];
 			keepTextFilePaths?: string[];
@@ -1061,7 +1069,10 @@ export const narratorsApi = {
 		if (opts?.newImages?.length || opts?.newTextFiles?.length) {
 			const formData = new FormData();
 			formData.append("content", content);
-			formData.append("rollback", rollback ? "true" : "false");
+			if (opts.skipRevert !== undefined) {
+				formData.append("skipRevert", opts.skipRevert ? "true" : "false");
+			}
+			if (opts.scope) formData.append("scope", opts.scope);
 			if (opts.keepImageIds) {
 				formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
 			}
@@ -1075,7 +1086,8 @@ export const narratorsApi = {
 			headers["Content-Type"] = "application/json";
 			body = JSON.stringify({
 				content,
-				rollback,
+				...(opts?.skipRevert !== undefined ? { skipRevert: opts.skipRevert } : {}),
+				...(opts?.scope ? { scope: opts.scope } : {}),
 				...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
 				...(opts?.keepTextFilePaths ? { keepTextFilePaths: opts.keepTextFilePaths } : {}),
 			});
@@ -1095,8 +1107,11 @@ export const narratorsApi = {
 			const error = await readFetchError(res, "Request failed");
 			throw new ApiError(error.message, res.status, error.data);
 		}
-		const result = (await res.json()) as { ok?: unknown };
-		return result.ok === true;
+		const result = (await res.json()) as { ok?: unknown; warnings?: RevertWarning[] };
+		return {
+			ok: result.ok === true,
+			...(result.warnings?.length ? { warnings: result.warnings } : {}),
+		};
 	},
 	editAssistantMessage: (narratorId: string, messageId: string, content: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/edit-message/${messageId}`, {
@@ -1326,6 +1341,22 @@ export const narratorsApi = {
 		>(
 			`/narrators/${narratorId}/rollback-preview?messageId=${encodeURIComponent(messageId)}&blockIndex=${blockIndex}`,
 		),
+	/**
+	 * What editing this user message and regenerating would roll back.
+	 *
+	 * Same endpoint as the rollback preview, with no `blockIndex`: editing keeps the
+	 * whole user turn and truncates what follows, which is exactly the window the
+	 * server computes when no index is given. Sharing it is what keeps the dialog's
+	 * promise identical to the rollback that runs.
+	 */
+	getEditRegeneratePreview: (narratorId: string, messageId: string) =>
+		request<
+			RevertScopePreviews<RevertPreviewFile> & {
+				toolCallCount: number;
+				deletedBlockCount: number;
+				deletedMessageCount: number;
+			}
+		>(`/narrators/${narratorId}/rollback-preview?messageId=${encodeURIComponent(messageId)}`),
 	getPermissionFilePreview: (narratorId: string, toolUseId: string) =>
 		request<{
 			deviceId: string;

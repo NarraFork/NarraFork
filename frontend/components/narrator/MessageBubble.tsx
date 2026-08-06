@@ -1,3 +1,4 @@
+import type { RevertScope } from "@frontend/lib/api/narrators";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	ActionIcon,
@@ -436,7 +437,7 @@ interface MessageBubbleProps {
 	onEditAndRegenerate?: (
 		messageId: string,
 		newContent: string,
-		rollback: boolean,
+		revertOpts: { skipRevert: boolean; scope?: RevertScope },
 		opts?: {
 			keepImageIds: string[];
 			newImages: File[];

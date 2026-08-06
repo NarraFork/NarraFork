@@ -78,7 +78,6 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { resolveFastModeForUser } from "../lib/fast-mode";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { hasMention } from "../lib/mentions";
 import {
 	BLOCKED_SKILLS_TRAIT_PREFIX,
 	buildCustomTraitsResponse,
@@ -128,6 +127,7 @@ import {
 	createWhitelistCmdSchema,
 	createWhitelistDirSchema,
 	deviceBrowseQuerySchema,
+	editAndRegenerateJsonSchema,
 	editAssistantMessageSchema,
 	forkNarratorSchema,
 	migrateBrokenModelNarratorsSchema,
@@ -163,7 +163,6 @@ import {
 	undoLastBrokenModelMigration,
 } from "../services/broken-model-migration-service";
 import { chapterFork } from "../services/chapter-fork";
-import { chatGroupService } from "../services/chat-group-service";
 import type {
 	BashCommandResult,
 	BlockAllSkillsResult,
@@ -787,14 +786,6 @@ narratorRoutes.get("/:id", async (c) => {
 	});
 });
 
-// List active chat groups a narrator participates in
-narratorRoutes.get("/:id/groups", async (c) => {
-	const id = c.req.param("id");
-	await narratorService.getById(id); // 404 if missing
-	const groups = await chatGroupService.listGroupsForNarrator(id);
-	return c.json({ groups });
-});
-
 // Download the raw SSE request/response dump for a leaked-tool-call diagnostic.
 // Narrator-scoped so non-admin users participating in debugging can fetch the data,
 // with an ownership check preventing access to other narrators' requests.
@@ -1050,35 +1041,6 @@ narratorRoutes.delete("/:id/custom-traits/blocked-skills", async (c) => {
 		customTraits: customTraitsResponse(traits),
 	});
 });
-
-/**
- * Resolve @handle mentions of named narrators and bring them into a chat group
- * with this session. Fire-and-forget: never blocks or fails the message request,
- * and runs regardless of whether the message was sent immediately (idle) or
- * buffered (the narrator was working). Resolves locale internally because the
- * buffered path does not compute it.
- */
-function dispatchMentions(originNarratorId: string, content: string, userId: string): void {
-	// Cheap Unicode-aware gate; the authoritative longest-match parse (which needs
-	// the registered-handle set) happens inside handleMentions.
-	if (!hasMention(content)) return;
-	void (async () => {
-		const locale = await getUserLanguage(userId);
-		await chatGroupService.handleMentions({
-			originNarratorId,
-			content,
-			createdBy: userId,
-			projectId: null,
-			locale,
-			fromUser: true,
-		});
-	})().catch((err) => {
-		logger.warn("Failed to handle @mentions", {
-			narratorId: originNarratorId,
-			error: String(err),
-		});
-	});
-}
 
 // Send message — fire-and-forget; all streaming events delivered via WebSocket
 narratorRoutes.post("/:id/messages", async (c) => {
@@ -1387,12 +1349,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			if (priority) {
 				requestBufferedMessageSoftStop(id);
 			}
-			// Resolve @handle mentions even when the message was buffered (the
-			// narrator was working/waiting); otherwise mentioning a busy named
-			// narrator would never create the chat group.
-			if (!queuedNewCommand) {
-				dispatchMentions(id, message, userId);
-			}
 			return c.json(
 				{
 					buffered: true,
@@ -1444,7 +1400,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		if (modelOverride?.model) {
 			updateNarratorModel(id, modelOverride.model);
 		}
-		if (!queuedNewCommand) dispatchMentions(id, message, userId);
 		return c.json(resumed.userMessage ?? { ok: true }, 201);
 	}
 
@@ -1465,13 +1420,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// Broadcast model change to frontend (ensureNarrator already picked up the new model from DB)
 	if (modelOverride?.model) {
 		updateNarratorModel(id, modelOverride.model);
-	}
-
-	// Resolve @handle mentions of named narrators: bring them into a chat group
-	// with this session. Fire-and-forget so the HTTP response isn't blocked by
-	// delivery/wake of the mentioned narrators.
-	if (!queuedNewCommand) {
-		dispatchMentions(id, message, userId);
 	}
 
 	return c.json(userMsg, 201);
@@ -1751,7 +1699,11 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 
 	let content: string;
-	let rollback = false;
+	// Whether the truncated messages' file changes are rolled back, and how wide.
+	// Undefined => the legacy `rollback` field decides (see below), then default true.
+	let skipRevert: boolean | undefined;
+	let legacyRollback: boolean | undefined;
+	let scope: RevertScope | undefined;
 	// undefined => keep all existing images (legacy); array => keep only these ids.
 	let keepImageIds: string[] | undefined;
 	// undefined => keep all existing text files (legacy); array => keep only these paths.
@@ -1777,7 +1729,12 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	if (contentType.includes("multipart/form-data")) {
 		const formData = await c.req.formData();
 		content = (formData.get("content") as string) ?? "";
-		rollback = formData.get("rollback") === "true";
+		const rawSkipRevert = formData.get("skipRevert");
+		if (typeof rawSkipRevert === "string") skipRevert = rawSkipRevert === "true";
+		const rawRollback = formData.get("rollback");
+		if (typeof rawRollback === "string") legacyRollback = rawRollback === "true";
+		const rawScope = formData.get("scope");
+		scope = revertScopeSchema.parse(typeof rawScope === "string" ? rawScope : undefined);
 		if (typeof formData.get("keepImageIds") === "string") {
 			keepImageIds = parseJsonStringArray(formData.get("keepImageIds"), "keepImageIds");
 		}
@@ -1811,18 +1768,20 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 			throw new ValidationError("Combined attachments exceed the 128 MiB limit");
 		}
 	} else {
-		const body = await c.req.json();
-		content = typeof body.content === "string" ? body.content : "";
-		rollback = !!body.rollback;
-		if (Array.isArray(body.keepImageIds)) {
-			keepImageIds = body.keepImageIds.filter((v: unknown): v is string => typeof v === "string");
-		}
-		if (Array.isArray(body.keepTextFilePaths)) {
-			keepTextFilePaths = body.keepTextFilePaths.filter(
-				(v: unknown): v is string => typeof v === "string",
-			);
-		}
+		const body = editAndRegenerateJsonSchema.parse(await c.req.json());
+		content = body.content ?? "";
+		skipRevert = body.skipRevert;
+		legacyRollback = body.rollback;
+		scope = body.scope;
+		keepImageIds = body.keepImageIds;
+		keepTextFilePaths = body.keepTextFilePaths;
 	}
+
+	// `skipRevert` is authoritative. A client that only sends the legacy `rollback`
+	// field gets that field's ORIGINAL meaning honoured — "revert files" — which is
+	// what the old UI offered and the server then ignored. Neither present => revert,
+	// preserving the behaviour every edit actually had.
+	const revertFiles = skipRevert !== undefined ? !skipRevert : (legacyRollback ?? true);
 
 	const narrator = await narratorService.getById(id);
 
@@ -1839,13 +1798,18 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	if (isSubagentVariant(narrator.variant)) {
+		// The revert choice has to be forwarded explicitly here. Editing a subagent
+		// message runs through resumeSubagent rather than calling editAndRegenerate
+		// directly, so a field left off this object is simply dropped — which is how
+		// the old `rollback` flag came to be ignored in the first place.
 		const resumed = await resumeSubagent({
 			subagentId: id,
 			intent: "regenerate_edited_message",
 			actor: "user",
 			editMessageId: messageId,
 			editContent: content,
-			editRollback: rollback,
+			editRevertFiles: revertFiles,
+			...(scope ? { editRevertScope: scope } : {}),
 			editKeepImageIds: keepImageIds,
 			editNewImages: newImages.length > 0 ? newImages : undefined,
 			editKeepTextFilePaths: keepTextFilePaths,
@@ -1854,24 +1818,21 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 			locale,
 			replyInUserLanguage,
 		});
-		return c.json({ ok: resumed.started });
+		return c.json({
+			ok: resumed.started,
+			...(resumed.revertWarnings?.length ? { warnings: resumed.revertWarnings } : {}),
+		});
 	}
 
-	const result = await editAndRegenerate(
-		id,
-		messageId,
-		content,
-		locale,
-		replyInUserLanguage,
-		rollback,
-		{
-			keepImageIds,
-			newImages: newImages.length > 0 ? newImages : undefined,
-			keepTextFilePaths,
-			newTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
-			userId,
-		},
-	);
+	const result = await editAndRegenerate(id, messageId, content, locale, replyInUserLanguage, {
+		keepImageIds,
+		newImages: newImages.length > 0 ? newImages : undefined,
+		keepTextFilePaths,
+		newTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
+		userId,
+		revertFiles,
+		...(scope ? { revertScope: scope } : {}),
+	});
 	return c.json(result);
 });
 
@@ -4578,15 +4539,27 @@ narratorRoutes.post("/:id/revert-file", async (c) => {
 	return c.json({ success: true, originalExists: snap.originalContent !== null });
 });
 
-/** Preview file changes that would be reverted by a rollback-to-block operation */
+/**
+ * Preview file changes that would be reverted by a rollback-to-block operation.
+ *
+ * `blockIndex` is optional. Omitting it means "everything after this message",
+ * which is the window edit-and-regenerate truncates: it keeps the whole user turn
+ * and removes the later ones. That is the same boundary the endpoint already
+ * computes for a user message, since `normalizeRollbackBlockIndexForMessage` pins
+ * a user message's index to its last block — so the edit dialog can share this
+ * preview instead of inventing a block index that only looks meaningful.
+ */
 narratorRoutes.get("/:id/rollback-preview", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.query("messageId");
 	const blockIndexStr = c.req.query("blockIndex");
 	if (!messageId) return c.json({ error: "messageId query param is required" }, 400);
-	if (!blockIndexStr) return c.json({ error: "blockIndex query param is required" }, 400);
-	const blockIndex = Number.parseInt(blockIndexStr, 10);
-	if (Number.isNaN(blockIndex) || blockIndex < 0) {
+	const requestedBlockIndex =
+		blockIndexStr === undefined ? null : Number.parseInt(blockIndexStr, 10);
+	if (
+		requestedBlockIndex !== null &&
+		(Number.isNaN(requestedBlockIndex) || requestedBlockIndex < 0)
+	) {
 		return c.json({ error: "blockIndex must be a non-negative integer" }, 400);
 	}
 
@@ -4615,15 +4588,15 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 	const blocks = Array.isArray(targetMsg.contentJson)
 		? (targetMsg.contentJson as { type: string; id?: string }[])
 		: [];
-	if (blockIndex >= blocks.length) {
-		return c.json({ error: `Block index ${blockIndex} out of range` }, 400);
+	if (requestedBlockIndex !== null && requestedBlockIndex >= blocks.length) {
+		return c.json({ error: `Block index ${requestedBlockIndex} out of range` }, 400);
 	}
 
-	const effectiveBlockIndex = normalizeRollbackBlockIndexForMessage(
-		targetMsg.role,
-		blockIndex,
-		blocks.length,
-	);
+	// No index requested => keep the whole message, drop what follows.
+	const effectiveBlockIndex =
+		requestedBlockIndex === null
+			? blocks.length - 1
+			: normalizeRollbackBlockIndexForMessage(targetMsg.role, requestedBlockIndex, blocks.length);
 
 	// Collect tool_use IDs from blocks after the effective boundary in the target message
 	const truncatedToolUseIds: string[] = [];

@@ -237,30 +237,6 @@ export type NarraForkEvent =
 			text: string;
 			isBroadcast: boolean;
 	  }
-	// Chat group (named-narrator @mention multi-party conversations)
-	| { type: "group:created"; groupId: string; originNarratorId: string | null }
-	| {
-			type: "group:member_joined";
-			groupId: string;
-			narratorId: string | null;
-			userId: string | null;
-	  }
-	| {
-			/** A group is fully set up (created + members added). Targeted to createdBy for tab/notification. */
-			type: "group:ready";
-			groupId: string;
-			title: string;
-			createdBy: string | null;
-			originNarratorId: string | null;
-	  }
-	| {
-			type: "group:message";
-			groupId: string;
-			messageId: string;
-			senderType: "user" | "narrator" | "system";
-			senderNarratorId: string | null;
-			senderUserId: string | null;
-	  }
 	// Container lifecycle
 	| { type: "container:started"; chapterId: string }
 	| { type: "container:stopped"; chapterId: string }

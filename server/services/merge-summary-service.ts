@@ -87,6 +87,27 @@ export async function collectMergeContext(
 	return { commits, diffStat };
 }
 
+/**
+ * Read the merge round out of a message's content blocks.
+ *
+ * Returns 0 when absent, which is how cards written before rounds were recorded
+ * behave — they sort below any real round and so are never picked as "the newest".
+ */
+function mergeRoundOf(contentJson: unknown): number {
+	if (!Array.isArray(contentJson)) return 0;
+	for (const block of contentJson) {
+		if (
+			block &&
+			typeof block === "object" &&
+			(block as { type?: unknown }).type === "merge_summary"
+		) {
+			const round = (block as { mergeRound?: unknown }).mergeRound;
+			if (typeof round === "number" && Number.isFinite(round)) return round;
+		}
+	}
+	return 0;
+}
+
 export const mergeSummaryService = {
 	/**
 	 * Asynchronously generate a merge summary and inject it as a message
@@ -367,28 +388,56 @@ export const mergeSummaryService = {
 	},
 
 	/**
-	 * Remove the merge_summary message for a specific merge (identified by commitSha).
-	 * Called during unmerge to clean up only the card for that particular merge,
-	 * preserving historical cards from earlier merge rounds.
+	 * @internal Exposed for the round-based lookup below and its tests.
+	 */
+	_mergeRoundOf: mergeRoundOf,
+
+	/**
+	 * Remove the merge_summary message for one specific merge.
+	 *
+	 * Called during unmerge, and it has to delete *only* that merge's card: a chapter
+	 * can be merged, woken and merged again, and the earlier rounds' cards are history
+	 * the user should keep.
+	 *
+	 * `commitSha` identifies the round when there is one. A commit-free merge has none,
+	 * so the round number does the same job — it is already recorded in every card
+	 * (assigned by counting existing cards at injection time) and is what distinguishes
+	 * one round from another. Passing null selects the newest round, which is the only
+	 * one that can be unmerged.
 	 */
 	async cleanupForMerge(
 		sourceChapterId: string,
-		commitSha: string,
+		commitSha: string | null,
 	): Promise<{ deletedCount: number; narratorIds: string[] }> {
 		const rows = await db
-			.select({ id: narratorMessages.id })
+			.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
 			.from(narratorMessages)
 			.where(
 				and(
 					sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
 					sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
-					sql`${narratorMessages.contentJson} LIKE ${`%${commitSha}%`}`,
+					...(commitSha ? [sql`${narratorMessages.contentJson} LIKE ${`%${commitSha}%`}`] : []),
 				),
 			);
 
 		if (rows.length === 0) return { deletedCount: 0, narratorIds: [] };
 
-		const ids = rows.map((r) => r.id);
+		// Without a commit sha, narrow to the highest round rather than deleting every
+		// card for this source chapter — which would wipe the earlier rounds' history.
+		//
+		// The reduce (rather than `Math.max(...rounds)`) keeps this correct on its own
+		// terms: spreading an empty array yields -Infinity, which would match nothing and
+		// silently delete no card. That cannot happen today because of the early return
+		// above, but the safety would be an invisible dependency on it — and this also
+		// avoids spreading an unbounded argument list.
+		let selected = rows;
+		if (!commitSha) {
+			const rounds = rows.map((row) => ({ row, round: mergeRoundOf(row.contentJson) }));
+			const newest = rounds.reduce((max, entry) => (entry.round > max ? entry.round : max), 0);
+			selected = rounds.filter((entry) => entry.round === newest).map((entry) => entry.row);
+		}
+
+		const ids = selected.map((r) => r.id);
 
 		// Get ALL narrators referencing these messages (via refs junction table)
 		const refRows = await db

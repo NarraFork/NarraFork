@@ -276,7 +276,19 @@ describe("recent-tabs row-level persistence", () => {
 });
 
 describe("recent-tabs pagination and workspace groups", () => {
-	it("places group tabs in work and only project tabs in projects", async () => {
+	it("places narrator tabs in work and only project tabs in projects", async () => {
+		seedLegacyTabs([
+			makeTab("project-1", { type: "project" }),
+			makeTab("narrator-1", { type: "narrator" }),
+		]);
+
+		const projects = await recentTabs.listPage("user-1", "projects");
+		const work = await recentTabs.listPage("user-1", "work");
+		expect(projects.items.map((tab) => `${tab.type}:${tab.id}`)).toEqual(["project:project-1"]);
+		expect(work.items.map((tab) => `${tab.type}:${tab.id}`)).toEqual(["narrator:narrator-1"]);
+	});
+
+	it("drops legacy chat-group tabs (the feature was removed)", async () => {
 		seedLegacyTabs([
 			makeTab("project-1", { type: "project" }),
 			makeTab("group-1", { type: "group" }),
@@ -285,7 +297,7 @@ describe("recent-tabs pagination and workspace groups", () => {
 		const projects = await recentTabs.listPage("user-1", "projects");
 		const work = await recentTabs.listPage("user-1", "work");
 		expect(projects.items.map((tab) => `${tab.type}:${tab.id}`)).toEqual(["project:project-1"]);
-		expect(work.items.map((tab) => `${tab.type}:${tab.id}`)).toEqual(["group:group-1"]);
+		expect(work.items).toEqual([]);
 	});
 
 	it("rejects cursors from another section or stale revision", async () => {

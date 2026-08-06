@@ -167,6 +167,14 @@ import {
 	type VListRowToolActions,
 } from "./vlist-row-actions";
 import {
+	beginRowPayloadFrame,
+	commitRowPayloadFrame,
+	type RowPayloadReuseState,
+	reuseRowPayload,
+	sameBoundActionKeys,
+	sameNumberList,
+} from "./vlist-row-payload-reuse";
+import {
 	buildSelectionIndex,
 	computeSelectedRange,
 	entriesToBlockMeta,
@@ -190,6 +198,7 @@ import {
 import { resolvePinnedRowIndices } from "./vlist-virtualization";
 import {
 	bucketViewportHeight,
+	isExternalGeometryChange,
 	pushCommittedWidth,
 	resolveWidthSettle,
 	type WidthSettleTrigger,
@@ -663,7 +672,12 @@ const TOGGLEABLE_CARD_KINDS = new Set([
 	"sidecar",
 ]);
 /** Trace-family kinds with header/earlier/row toggles. */
-const TRACE_KINDS = new Set(["activity-trace", "tool-run-summary", "reasoning-steps"]);
+const TRACE_KINDS = new Set([
+	"activity-trace",
+	"tool-run-summary",
+	"reasoning-steps",
+	"sidecar-trace",
+]);
 /**
  * Folded traces whose individual ROWS get their own interaction surface.
  *
@@ -868,6 +882,62 @@ export function rowInteractionSig(
 		if (v !== undefined) sidecarSig += `${i}${v ? "1" : "0"}`;
 	}
 	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${promptOpen}:${sidecarSig}`;
+}
+
+/**
+ * Do two `RowInteraction` payloads describe the same row content?
+ *
+ * Used to keep the PREVIOUS frame's object when a rebuild changed nothing this row
+ * renders (see vlist-row-payload-reuse.ts for why identity matters and why the
+ * closures are compared by BOUND KEYS rather than by reference).
+ *
+ * Every field the row paints or dispatches from is covered: dropping one would let
+ * a row keep stale content, which is exactly the frozen-live-tail failure mode one
+ * layer down.
+ */
+export function sameRowInteraction(a: RowInteraction, b: RowInteraction): boolean {
+	return (
+		a.blockId === b.blockId &&
+		a.messageId === b.messageId &&
+		a.blockIndex === b.blockIndex &&
+		sameNumberList(a.blockIndices, b.blockIndices) &&
+		a.copyText === b.copyText &&
+		a.toolUseId === b.toolUseId &&
+		// Tool facts drive the row's menu items and the card's open-session button.
+		// Compared field-wise: the index is rebuilt per frame, so the object identity
+		// always differs even when the facts do not.
+		sameToolMeta(a.toolMeta, b.toolMeta) &&
+		// Which ACTIONS are bound is the part that can change within a generation (a
+		// tool going terminal drops "detach", a resolved await gains "open session").
+		sameBoundActionKeys(
+			a.toolActions as Record<string, unknown> | undefined,
+			b.toolActions as Record<string, unknown> | undefined,
+		) &&
+		sameBoundActionKeys(
+			a.actions as unknown as Record<string, unknown>,
+			b.actions as unknown as Record<string, unknown>,
+		) &&
+		// Presence only: the callback closes over `messageId`, already compared above.
+		!!a.onViewOriginal === !!b.onViewOriginal
+	);
+}
+
+/** Field-wise comparison of the tool facts a row payload carries. */
+function sameToolMeta(a: VListToolMeta | undefined, b: VListToolMeta | undefined): boolean {
+	if (a === b) return true;
+	if (!a || !b) return false;
+	return (
+		a.toolName === b.toolName &&
+		a.filePath === b.filePath &&
+		a.isFileTool === b.isFileTool &&
+		a.isReadTool === b.isReadTool &&
+		a.subagentNarratorId === b.subagentNarratorId &&
+		a.awaitAgentTargetId === b.awaitAgentTargetId &&
+		a.awaitAgentNarratorId === b.awaitAgentNarratorId &&
+		a.isBackground === b.isBackground &&
+		a.isTerminal === b.isTerminal &&
+		a.resultMessageId === b.resultMessageId
+	);
 }
 
 /** Stable per-key toggle callbacks, memoized so equal rows keep referential props. */
@@ -1191,7 +1261,12 @@ const ExactRow = memo(
 		// animate (they would re-fade every time they re-enter the mounted window).
 		if (animateStreaming && (kind === "markdown" || kind === "reasoning")) {
 			extra.animateStreaming = true;
-			extra.animKeyBase = item.spec.key;
+			// Namespaced by narrator: a live row's spec.key derives from the synthetic
+			// `__streaming__` id, so it is IDENTICAL across narrators. The anim store is
+			// module-level, so switching to another narrator mid-stream found the
+			// previous one's text under the same key, read it as a rewrite, and asked
+			// for the whole body to animate at once.
+			extra.animKeyBase = `${narratorId}:${item.spec.key}`;
 		}
 		// Subagent card's in-card "open full session" button. RenderSubagent has
 		// always accepted onOpenSession, but nothing supplied it — the button was
@@ -2888,9 +2963,25 @@ export const PretextExactMessageList = forwardRef<
 		// drag is EXTERNAL input: dragging the sash back to a previous width must apply
 		// even if feedback had just pinned it.
 		let recentCommittedWidths: readonly number[] = [];
+		/**
+		 * The viewport's OUTER width at the last commit, so a host-driven resize can be
+		 * told apart from scrollbar feedback WITHOUT a pointer gesture.
+		 *
+		 * A vertical scrollbar moves `clientWidth` and leaves `offsetWidth` alone, so a
+		 * changed outer box means something outside this list resized it — a dock panel
+		 * toggled from a button, a restored layout, a window resize. That distinction is
+		 * what keeps the cycle guard from mistaking repeated panel toggles (which flip
+		 * between exactly two widths, the A B A B shape it matches on) for a measurement
+		 * loop and pinning the column from the fifth toggle onwards.
+		 *
+		 * `undefined` until the first commit records one, which reads as "cannot tell"
+		 * and leaves the guard in charge.
+		 */
+		let committedBoxWidth: number | undefined;
 
 		const applyWidth = (trigger: WidthSettleTrigger) => {
 			const nextWidth = resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn);
+			const boxWidth = node.offsetWidth;
 			// FIRST MEASUREMENT — commit immediately, bypassing the settle decision.
 			//
 			// This is not a width CHANGE, it is this list learning how wide it is. Routed
@@ -2906,6 +2997,7 @@ export const PretextExactMessageList = forwardRef<
 			// to alternate with.
 			if (committedContentWidthRef.current === 0) {
 				committedContentWidthRef.current = nextWidth;
+				committedBoxWidth = boxWidth;
 				setContentWidth(nextWidth);
 				return;
 			}
@@ -2917,6 +3009,8 @@ export const PretextExactMessageList = forwardRef<
 				// callback that armed the deferral and this evaluation.
 				pointerDown: pointerTracker.isDown(),
 				recentCommittedWidths,
+				boxWidth,
+				committedBoxWidth,
 			});
 			if (settleTimer !== undefined) {
 				clearTimeout(settleTimer);
@@ -2928,11 +3022,21 @@ export const PretextExactMessageList = forwardRef<
 				// geometry instead of leaving a stale height behind.
 				if (deferred) setViewportHeight(node.clientHeight);
 				deferred = false;
-				// A gesture is external input, so it starts the cycle history over: the
-				// user may legitimately be dragging back to a width feedback had pinned.
+				// EXTERNAL INPUT starts the cycle history over, so a width the guard had
+				// pinned can be reached again. Two shapes count, and both must:
+				//  - a gesture: the user may be dragging back to a pinned width.
+				//  - a resized outer box: a dock panel toggle / window resize / layout
+				//    restore, which carries no gesture at all. Without this the ring kept
+				//    the panel's two widths forever (`gesture-end` being its only reset),
+				//    so repeated toggles filled it and the fifth one pinned the column.
+				// Feedback never takes either path: it leaves `offsetWidth` untouched.
+				const externalGeometry = isExternalGeometryChange(boxWidth, committedBoxWidth);
 				recentCommittedWidths =
-					trigger === "gesture-end" ? [] : pushCommittedWidth(recentCommittedWidths, nextWidth);
+					trigger === "gesture-end" || externalGeometry
+						? []
+						: pushCommittedWidth(recentCommittedWidths, nextWidth);
 				committedContentWidthRef.current = nextWidth;
+				committedBoxWidth = boxWidth;
 				setContentWidth(nextWidth);
 				return;
 			}
@@ -3436,9 +3540,21 @@ export const PretextExactMessageList = forwardRef<
 	// — never on scroll — so each row's payload stays referentially stable and
 	// the ExactRow memo keeps skipping unchanged rows. Rows without a single-block
 	// target (aggregates / non-interactive chrome) are absent and render plainly.
+	// Payload REUSE across rebuilds. See vlist-row-payload-reuse.ts: `renderItems`
+	// is a fresh array on every commit — including the one each streaming delta
+	// produces — so without this every mounted row's `interaction` prop changed
+	// identity per frame and the whole window re-rendered while a turn streamed.
+	const interactionReuseRef = useRef<RowPayloadReuseState<RowInteraction> | null>(null);
 	const interactionsByKey = useMemo(() => {
+		// The closures below capture these; a change must rebuild every payload
+		// rather than reuse one wired to stale handlers (see the module's note).
+		const generation = [selectionIndex, rowHandlers, openEditor, messagesById] as const;
+		const previous = beginRowPayloadFrame(interactionReuseRef.current, generation);
 		const map = new Map<string, RowInteraction>();
-		if (!selectionIndex) return map;
+		if (!selectionIndex) {
+			commitRowPayloadFrame(interactionReuseRef, generation, map);
+			return map;
+		}
 		const manifestByKey = new Map(manifestItems.map((m) => [m.itemKey, m]));
 		// Tool facts the layout spec deliberately drops (child narrator id, file
 		// path, background state). Keyed by toolUseId — a tool/subagent row's
@@ -3497,7 +3613,7 @@ export const PretextExactMessageList = forwardRef<
 			// An edited message offers "view original"; the modal is a single
 			// shell-level instance, so the row only carries the open callback.
 			const editedMeta = resolveVListEditedMeta(msg);
-			map.set(item.spec.key, {
+			const next: RowInteraction = {
 				blockId: target.blockId,
 				messageId,
 				blockIndex,
@@ -3508,8 +3624,10 @@ export const PretextExactMessageList = forwardRef<
 				toolMeta,
 				toolActions,
 				...(editedMeta ? { onViewOriginal: () => setOriginalModalMessageId(messageId) } : {}),
-			});
+			};
+			map.set(item.spec.key, reuseRowPayload(previous, item.spec.key, next, sameRowInteraction));
 		}
+		commitRowPayloadFrame(interactionReuseRef, generation, map);
 		return map;
 	}, [
 		selectionIndex,
@@ -3557,42 +3675,64 @@ export const PretextExactMessageList = forwardRef<
 	// `rowBody` is the row's ENTIRE painted block, drill-down included — a revealed
 	// card is the same tool call the row summarizes, so both live inside one
 	// interactive block (one menu, one swipe, one selection outline).
-	const rowInteractionByKey = useMemo(() => {
-		const map = new Map<string, TraceRowInteractionSlot>();
-		if (!selectionIndex) return map;
+	//
+	// ⚠️ ONE shared slot for every trace row, memoized WITHOUT `renderItems`.
+	//
+	// The closure captures nothing per-item — it resolves everything from the `row`
+	// it is handed — so a per-key function was never more than N copies of one
+	// behaviour. That distinction is load-bearing rather than cosmetic: `renderItems`
+	// is a fresh array on every layout commit, including the one each streaming delta
+	// produces, so minting the slots inside a memo that depends on it gave every
+	// mounted trace row a new `rowInteraction` prop per frame. The ExactRow memo
+	// compares that prop by identity, so the whole window re-rendered ~per frame for
+	// the duration of a live turn, and the folded row's CSS shimmer stuttered under
+	// the reconciliation (see vlist-row-payload-reuse.ts for the same problem on the
+	// `interaction` payload, which does carry per-row data and so needs a cache).
+	const traceRowInteractionSlot = useMemo<TraceRowInteractionSlot | undefined>(() => {
+		if (!selectionIndex) return undefined;
 		const toolMetaIndex = buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]);
 		const handlers = rowHandlers ?? {};
-		for (const item of renderItems) {
-			if (!item || !TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind)) continue;
-			map.set(item.spec.key, (row, rowBody) => {
-				const identity = resolveTraceRowIdentity(row, selectionIndex, toolMetaIndex);
-				if (!identity) return null;
-				const actions = buildRowCtxActions(
-					{
-						messageId: identity.messageId,
-						blockIndex: identity.blockIndex,
-						blockIndices: identity.blockIndices,
-					},
-					handlers,
-				);
-				return (
-					<MessageContextMenuCtx.Provider value={actions}>
-						<TraceRowInteraction
-							identity={identity}
-							actions={actions}
-							narratorId={narratorId}
-							onViewSubagentSession={handlers.onViewSubagentSession}
-							onDetachSubagent={handlers.onDetachSubagent}
-							onCancelBackgroundTask={handlers.onCancelBackgroundTask}
-						>
-							{rowBody}
-						</TraceRowInteraction>
-					</MessageContextMenuCtx.Provider>
-				);
-			});
-		}
-		return map;
-	}, [selectionIndex, renderItems, rowHandlers, pretextDocument.messages, narratorId]);
+		return (row, rowBody) => {
+			const identity = resolveTraceRowIdentity(row, selectionIndex, toolMetaIndex);
+			if (!identity) return null;
+			const actions = buildRowCtxActions(
+				{
+					messageId: identity.messageId,
+					blockIndex: identity.blockIndex,
+					blockIndices: identity.blockIndices,
+				},
+				handlers,
+			);
+			return (
+				<MessageContextMenuCtx.Provider value={actions}>
+					<TraceRowInteraction
+						identity={identity}
+						actions={actions}
+						narratorId={narratorId}
+						onViewSubagentSession={handlers.onViewSubagentSession}
+						onDetachSubagent={handlers.onDetachSubagent}
+						onCancelBackgroundTask={handlers.onCancelBackgroundTask}
+					>
+						{rowBody}
+					</TraceRowInteraction>
+				</MessageContextMenuCtx.Provider>
+			);
+		};
+	}, [selectionIndex, rowHandlers, pretextDocument.messages, narratorId]);
+
+	/**
+	 * Resolve the row-interaction slot for one list element.
+	 *
+	 * Kept a FUNCTION of the item rather than a prebuilt map so the lookup needs no
+	 * per-frame allocation at all: the answer is "the shared slot, if this kind folds
+	 * rows". A map keyed by `spec.key` would have to be rebuilt from `renderItems`
+	 * each commit, which is the churn this shape removes.
+	 */
+	const resolveRowInteraction = useCallback(
+		(item: VListItem): TraceRowInteractionSlot | undefined =>
+			TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind) ? traceRowInteractionSlot : undefined,
+		[traceRowInteractionSlot],
+	);
 
 	// Item index of the row being edited, so it can be pinned into the mounted
 	// window. -1 → not in the loaded document (nothing to pin).
@@ -3794,7 +3934,7 @@ export const PretextExactMessageList = forwardRef<
 									toggles={getRowToggles(item.spec.key)}
 									renderLabels={renderLabels}
 									interaction={interactionsByKey.get(item.spec.key)}
-									rowInteraction={rowInteractionByKey.get(item.spec.key)}
+									rowInteraction={resolveRowInteraction(item)}
 									narratorId={narratorId}
 									onToggleSidecar={getSidecarToggle(item.spec.key)}
 									onOpenFilePanel={rowHandlers?.onOpenFilePanel}

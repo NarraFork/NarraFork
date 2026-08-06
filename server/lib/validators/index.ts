@@ -36,11 +36,6 @@ export {
 	updateGraphPositionsSchema,
 } from "./chapters";
 export {
-	addGroupMemberSchema,
-	createGroupSchema,
-	postGroupMessageSchema,
-} from "./chat-groups";
-export {
 	blacklistDirEntrySchema,
 	commandBlacklistEntrySchema,
 	commandSchema,
@@ -138,6 +133,7 @@ export {
 	createNarratorSchema,
 	createWhitelistCmdSchema,
 	createWhitelistDirSchema,
+	editAndRegenerateJsonSchema,
 	editAssistantMessageSchema,
 	forkFromMessagesSchema,
 	forkNarratorSchema,

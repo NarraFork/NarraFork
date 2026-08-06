@@ -1081,12 +1081,14 @@ describe("mobile safe-area layout contract", () => {
 	});
 
 	test("Narrator viewport containers own the bottom exclusion zone", async () => {
+		// The chat-group route used to be checked here too. It was removed with the
+		// feature, so reading it now fails the whole case on ENOENT — which says nothing
+		// about the safe-area contract this test exists to protect.
 		const [
 			appShell,
 			narratorRoute,
 			workspaceRoute,
 			projectRoute,
-			groupRoute,
 			terminalPanel,
 			narratorPanel,
 			safeArea,
@@ -1095,7 +1097,6 @@ describe("mobile safe-area layout contract", () => {
 			Bun.file(new URL("../routes/narrators/$narratorId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/narrators/workspace/$workspaceId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/projects/$projectId.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../routes/groups/$groupId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/terminal/TerminalPanel.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/narrator/NarratorPanel.tsx", import.meta.url)).text(),
 			Bun.file(new URL("./safe-area.ts", import.meta.url)).text(),
@@ -1125,14 +1126,10 @@ describe("mobile safe-area layout contract", () => {
 		expect(narratorRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(2);
 		expect(workspaceRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(2);
 		expect(projectRoute).toContain("height: APP_SHELL_CONTENT_HEIGHT");
-		for (const route of [narratorRoute, workspaceRoute, projectRoute, groupRoute]) {
+		for (const route of [narratorRoute, workspaceRoute, projectRoute]) {
 			expect(route).not.toContain("APP_SHELL_SAFE_VIEWPORT_HEIGHT");
 			expect(route).not.toContain("APP_SHELL_PADDED_SAFE_VIEWPORT_HEIGHT");
 		}
-		// Centered loaders/empty states do not cancel Main's padding, so a full-bleed
-		// height would overflow it; they take the content-box height instead.
-		expect(groupRoute.match(/h=\{APP_SHELL_CONTENT_HEIGHT\}/g)?.length).toBe(2);
-		expect(groupRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(1);
 		expect(narratorRoute).not.toContain('h="calc(100dvh - 60px)"');
 		expect(terminalPanel).not.toContain("kbHeight");
 		expect(terminalPanel).not.toContain("window.visualViewport");

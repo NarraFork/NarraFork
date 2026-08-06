@@ -345,6 +345,7 @@ export function renderElement(
 		case "tool-run-summary":
 		case "activity-trace":
 		case "reasoning-steps":
+		case "sidecar-trace":
 			return (
 				<RenderToolRun
 					measured={m}

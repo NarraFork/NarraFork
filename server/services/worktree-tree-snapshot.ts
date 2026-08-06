@@ -25,10 +25,11 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { worktreeTreeSnapshots } from "../db/schema";
+import { chapters, worktreeTreeSnapshots } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { AsyncMutex } from "../lib/async-mutex";
 import { generateId } from "../lib/id";
@@ -197,6 +198,34 @@ async function runGit(args: string[], gitDir: string, workTree: string): Promise
 }
 
 /**
+ * Run a shadow-repo git command against a throwaway index.
+ *
+ * Needed when hashing a worktree that is *not* the one this shadow repo belongs to
+ * (copying a snapshot into a fork). The repo's own index is a cache of the source
+ * worktree's state, and reusing it would both corrupt that cache — making the next
+ * capture there re-stat everything or report the wrong tree — and read the wrong
+ * files' stat data.
+ */
+async function runGitWithIndex(
+	args: string[],
+	gitDir: string,
+	workTree: string,
+	indexFile: string,
+): Promise<GitResult> {
+	const result = await safeSpawn({
+		cmd: ["git", "--git-dir", gitDir, "--work-tree", workTree, ...args],
+		timeout: GIT_TIMEOUT_MS,
+		maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
+		env: { ...process.env, GIT_INDEX_FILE: indexFile },
+	});
+	return {
+		stdout: result.stdout.trim(),
+		stderr: result.stderr.trim(),
+		exitCode: result.exitCode,
+	};
+}
+
+/**
  * Run a path-listing git command and return the paths verbatim.
  *
  * Every path-producing command must go through here with `-z`. Without it git
@@ -231,6 +260,113 @@ function assertLocal(deviceId: string): void {
 			`Tree snapshots are not implemented for remote device ${deviceId} yet.`,
 		);
 	}
+}
+
+/**
+ * Namespace for every ref this module writes into a shadow repository.
+ *
+ * Refs exist for one reason: reachability. A bare tree written by `write-tree` is
+ * unreachable from any ref, so `git gc` is entitled to delete it — and did, for
+ * anything older than the prune window, while the database kept pointing at it.
+ * Anchoring snapshots under one namespace makes them reachable, and makes
+ * "everything NarraFork owns" a single prefix that {@link gcAll} can keep.
+ */
+const SNAPSHOT_REF_PREFIX = "refs/nf";
+
+/** The ref tracking a worktree's latest snapshot commit. */
+export const SNAPSHOT_HEAD_REF = `${SNAPSHOT_REF_PREFIX}/head`;
+
+/** The ref recording the snapshot a chapter was forked from. */
+export const SNAPSHOT_BASE_REF = `${SNAPSHOT_REF_PREFIX}/base`;
+
+/** Ref for a snapshot lineage fetched in from another worktree's shadow repo. */
+export function snapshotIncomingRef(key: string): string {
+	return `${SNAPSHOT_REF_PREFIX}/incoming/${key}`;
+}
+
+/**
+ * Reject a ref name that is not ours or that git would refuse.
+ *
+ * The name reaches `update-ref`/`fetch` as an argument, and a caller-supplied key
+ * (a chapter id) flows into {@link snapshotIncomingRef}. Constraining it to the
+ * namespace keeps a malformed or hostile id from writing outside `refs/nf/` — and
+ * from being read as an option, since a leading `-` cannot pass this check.
+ */
+function assertSnapshotRef(ref: string): void {
+	if (!ref.startsWith(`${SNAPSHOT_REF_PREFIX}/`)) {
+		throw new TreeSnapshotError(`Refusing to touch a ref outside ${SNAPSHOT_REF_PREFIX}/: ${ref}`);
+	}
+	// `git check-ref-format` rules that matter here, checked locally so the failure
+	// is a clear error rather than a git usage message.
+	if (
+		ref.includes("..") ||
+		ref.endsWith("/") ||
+		ref.endsWith(".lock") ||
+		/[~^:?*[\\]/.test(ref) ||
+		// Control characters and space are rejected by git too. Tested by code point
+		// rather than a character-class range, which reads as a literal control
+		// character in source.
+		[...ref].some((char) => {
+			const code = char.codePointAt(0) ?? 0;
+			return code <= 0x20 || code === 0x7f;
+		})
+	) {
+		throw new TreeSnapshotError(`Invalid snapshot ref name: ${ref}`);
+	}
+}
+
+/** A full 40-character hex object id, as git prints it. */
+function assertObjectId(sha: string): void {
+	if (!/^[0-9a-f]{40}$/.test(sha)) {
+		throw new TreeSnapshotError(`Not a git object id: ${sha}`);
+	}
+}
+
+/**
+ * Identity used for snapshot commits.
+ *
+ * Set explicitly because the shadow repo has no configured user, and a missing
+ * `user.email` makes `commit-tree` fail outright. It is also deliberately *not*
+ * the user's identity: these commits are NarraFork's bookkeeping, never the
+ * user's authored history, and they must be recognisable as such.
+ *
+ * The dates are fixed rather than "now" so that a snapshot commit is a pure
+ * function of its tree, parents and message. Two captures of identical content
+ * with identical lineage then produce the same commit hash, which keeps the DAG
+ * deduplicated and makes the fork/merge tests deterministic.
+ */
+const SNAPSHOT_IDENTITY = {
+	GIT_AUTHOR_NAME: "NarraFork Snapshot",
+	GIT_AUTHOR_EMAIL: "snapshot@narrafork.local",
+	GIT_COMMITTER_NAME: "NarraFork Snapshot",
+	GIT_COMMITTER_EMAIL: "snapshot@narrafork.local",
+	GIT_AUTHOR_DATE: "1970-01-01T00:00:00Z",
+	GIT_COMMITTER_DATE: "1970-01-01T00:00:00Z",
+} as const;
+
+/**
+ * Run a shadow-repo git command with the snapshot identity applied.
+ *
+ * Separate from {@link runGit} because only object-writing commands need it, and
+ * because inheriting the ambient environment for every call would let a stray
+ * `GIT_*` variable in the server's environment change what gets written.
+ */
+async function runGitAuthored(
+	args: string[],
+	gitDir: string,
+	workTree: string,
+): Promise<GitResult> {
+	const result = await safeSpawn({
+		cmd: ["git", "--git-dir", gitDir, "--work-tree", workTree, ...args],
+		timeout: GIT_TIMEOUT_MS,
+		maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
+		env: { ...process.env, ...SNAPSHOT_IDENTITY },
+	});
+	return {
+		stdout: result.stdout.trim(),
+		stderr: result.stderr.trim(),
+		exitCode: result.exitCode,
+	};
 }
 
 /**
@@ -564,6 +700,33 @@ export function planTreeRevertSegments(pairs: TreeBoundaryPair[]): TreeRevertSeg
 	return segments;
 }
 
+/**
+ * Whether a chapter still depends on this shadow repository.
+ *
+ * Keyed on `chapters.snapshotShadowKey` rather than `worktreePath`, because the
+ * situation this protects against is precisely the one where `worktreePath` has
+ * already been nulled (a dormant chapter) while the lineage is still wanted.
+ *
+ * Errs on the side of keeping data: a database error answers "claimed", so a
+ * transient failure costs some disk rather than a chapter's snapshot history.
+ */
+async function isShadowRepoClaimed(deviceId: string, worktreePath: string): Promise<boolean> {
+	const key = treeSnapshotKey(deviceId, worktreePath);
+	try {
+		const claimed = await db.query.chapters.findFirst({
+			where: eq(chapters.snapshotShadowKey, key),
+			columns: { id: true },
+		});
+		return claimed != null;
+	} catch (error) {
+		logger.warn("Could not verify tree-snapshot ownership; keeping the repository", {
+			worktreePath,
+			error: String(error),
+		});
+		return true;
+	}
+}
+
 async function recordTreeHash(
 	deviceId: string,
 	worktreePath: string,
@@ -589,12 +752,19 @@ async function recordTreeHash(
  * newline-separated (unsafe for paths containing newlines) and the human-readable
  * message block is locale-dependent.
  *
+ * `base` may be null, which omits `--merge-base` and lets git find the merge base
+ * itself by walking the commits' ancestry. That only works for *commits*: bare
+ * trees have no ancestry, so the rollback path always passes an explicit base while
+ * the snapshot-DAG path relies on git's own computation. Getting this base wrong is
+ * what produces spurious conflicts, so deferring to git is strictly safer wherever
+ * a real DAG exists.
+ *
  * Exit 0 means a clean merge, 1 means conflicts, anything else is a real failure.
  */
 async function mergeTreeUnlocked(
 	dir: string,
 	worktreePath: string,
-	base: string,
+	base: string | null,
 	ours: string,
 	theirs: string,
 ): Promise<TreeMergeResult> {
@@ -610,7 +780,7 @@ async function mergeTreeUnlocked(
 			"--name-only",
 			"--no-messages",
 			"-z",
-			`--merge-base=${base}`,
+			...(base === null ? [] : [`--merge-base=${base}`]),
 			ours,
 			theirs,
 		],
@@ -1170,6 +1340,106 @@ async function compensateRestore(
 	}
 }
 
+/**
+ * Read a ref, without taking the shadow lock.
+ * Returns null for a ref that does not exist — the normal state before the first
+ * snapshot, not an error.
+ */
+async function getRefUnlocked(
+	dir: string,
+	worktreePath: string,
+	ref: string,
+): Promise<string | null> {
+	// `--verify` makes an absent ref an error rather than an echo of the input, and
+	// `--quiet` keeps that expected case out of stderr.
+	const result = await runGit(
+		["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+		dir,
+		worktreePath,
+	);
+	if (result.exitCode !== 0 || !result.stdout) return null;
+	return result.stdout;
+}
+
+/**
+ * Write a snapshot commit, without taking the shadow lock.
+ *
+ * A commit is what gives a snapshot two things a bare tree cannot have: ancestry,
+ * so git can compute a merge base between two independent lines of uncommitted
+ * work, and reachability, so `gc` keeps it. Parents that do not resolve are
+ * dropped rather than failing the write — a lineage with a hole is still far more
+ * useful than no snapshot at all, and a missing parent is exactly what an older
+ * pruned history looks like.
+ */
+async function commitSnapshotUnlocked(
+	dir: string,
+	worktreePath: string,
+	treeHash: string,
+	parents: string[],
+	message: string,
+): Promise<string> {
+	assertObjectId(treeHash);
+	const args = ["commit-tree", treeHash];
+	for (const parent of parents) {
+		assertObjectId(parent);
+		// A parent that no longer exists (pruned, or a shadow repo restored from an
+		// older state) would make commit-tree fail outright and cost the caller its
+		// snapshot. Skipping it truncates the lineage instead.
+		const exists = await runGit(["cat-file", "-e", `${parent}^{commit}`], dir, worktreePath);
+		if (exists.exitCode !== 0) {
+			logger.debug("Skipping an unresolvable snapshot parent", { worktreePath, parent });
+			continue;
+		}
+		args.push("-p", parent);
+	}
+	// `-m` keeps the message out of stdin, so no partial-write path exists.
+	args.push("-m", message);
+	const result = await runGitAuthored(args, dir, worktreePath);
+	if (result.exitCode !== 0 || !result.stdout) {
+		throw new TreeSnapshotError(`snapshot commit-tree failed: ${result.stderr}`);
+	}
+	return result.stdout;
+}
+
+/**
+ * Append a tree to the lineage and move the head ref onto it, without locking.
+ *
+ * Reusing the existing head when the tree is unchanged is what keeps the DAG
+ * proportional to real change: snapshots are taken twice per file-mutating tool,
+ * and a tool that wrote nothing (an Edit producing identical bytes, a read-only
+ * shell command) would otherwise add a no-op link every time.
+ */
+async function linkSnapshotUnlocked(
+	dir: string,
+	worktreePath: string,
+	treeHash: string,
+	message: string,
+): Promise<{ treeHash: string; commitSha: string }> {
+	const parent = await getRefUnlocked(dir, worktreePath, SNAPSHOT_HEAD_REF);
+	if (parent) {
+		const parentTree = await runGit(
+			["rev-parse", "--verify", "--quiet", `${parent}^{tree}`],
+			dir,
+			worktreePath,
+		);
+		if (parentTree.exitCode === 0 && parentTree.stdout === treeHash) {
+			return { treeHash, commitSha: parent };
+		}
+	}
+	const commitSha = await commitSnapshotUnlocked(
+		dir,
+		worktreePath,
+		treeHash,
+		parent ? [parent] : [],
+		message,
+	);
+	const updated = await runGit(["update-ref", SNAPSHOT_HEAD_REF, commitSha], dir, worktreePath);
+	if (updated.exitCode !== 0) {
+		throw new TreeSnapshotError(`snapshot update-ref failed: ${updated.stderr}`);
+	}
+	return { treeHash, commitSha };
+}
+
 export const worktreeTreeSnapshot = {
 	/**
 	 * Capture the current worktree state and return its tree hash.
@@ -1421,6 +1691,13 @@ export const worktreeTreeSnapshot = {
 	 * Copy a snapshot from one worktree onto another.
 	 * Used when forking, so the new worktree starts from the exact state a message
 	 * observed rather than from the nearest commit plus a best-effort rebuild.
+	 *
+	 * "Exact" requires deleting as well as writing. `checkout-index` only ever writes
+	 * the paths a tree contains, and the target worktree was created from a commit, so
+	 * anything the snapshot does *not* contain is still sitting there — a file the
+	 * parent deleted without committing would come back from the dead in the fork.
+	 * The files to remove are identified by comparing the target's current state
+	 * against the snapshot, so only tracked, non-ignored paths are ever touched.
 	 */
 	async restoreInto(
 		sourceWorktreePath: string,
@@ -1434,6 +1711,64 @@ export const worktreeTreeSnapshot = {
 			throw new TreeSnapshotError(`No snapshot repository for ${sourceWorktreePath}`);
 		}
 		await shadowLock.acquire(sourceDir, async () => {
+			// Hash the target as it is now, using a scratch index so the source repo's
+			// own index — which tracks the *source* worktree — is left alone.
+			//
+			// Kept OUTSIDE the shadow repository: the `finally` below removes it, but a
+			// killed process cannot run that, and `gcAll` only ever deletes a shadow
+			// directory for a missing `HEAD` — so a residue here would persist
+			// indefinitely inside a directory that is otherwise entirely git-managed.
+			// The system temp directory is swept by the OS, which is the whole point.
+			const scratchIndex = resolve(tmpdir(), `nf-restore-into-${generateId()}.index`);
+			let currentTree: string | null = null;
+			try {
+				const added = await runGitWithIndex(
+					["add", "-A"],
+					sourceDir,
+					targetWorktreePath,
+					scratchIndex,
+				);
+				if (added.exitCode === 0) {
+					const written = await runGitWithIndex(
+						["write-tree"],
+						sourceDir,
+						targetWorktreePath,
+						scratchIndex,
+					);
+					if (written.exitCode === 0 && written.stdout) currentTree = written.stdout;
+				}
+			} finally {
+				rmSync(scratchIndex, { force: true });
+				// git guards index writes with a sibling lock file; an interrupted `add`
+				// can leave it behind, and it would then block a later reuse of this name.
+				rmSync(`${scratchIndex}.lock`, { force: true });
+			}
+
+			if (currentTree && currentTree !== treeHash) {
+				const changed = await runGitPaths(
+					["diff-tree", "-r", "--name-only", "--no-commit-id", "-z", treeHash, currentTree],
+					sourceDir,
+					targetWorktreePath,
+					{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
+				);
+				if (changed.exitCode === 0 && changed.paths.length > 0) {
+					const inSnapshot = await pathsPresentInTree(
+						sourceDir,
+						targetWorktreePath,
+						treeHash,
+						changed.paths,
+					);
+					for (const relPath of changed.paths) {
+						if (inSnapshot.has(relPath)) continue;
+						const absolute = resolve(targetWorktreePath, relPath);
+						if (!existsSync(absolute)) continue;
+						// `recursive` covers a path that is a file in the snapshot's view but a
+						// directory on disk.
+						rmSync(absolute, { force: true, recursive: true });
+					}
+				}
+			}
+
 			const readTree = await runGit(["read-tree", treeHash], sourceDir, targetWorktreePath);
 			if (readTree.exitCode !== 0) {
 				throw new TreeSnapshotError(`fork read-tree failed: ${readTree.stderr}`);
@@ -1445,19 +1780,479 @@ export const worktreeTreeSnapshot = {
 		});
 	},
 
-	/** Remove a worktree's shadow repository and its recorded hashes. */
-	async destroy(worktreePath: string, deviceId: string = LOCAL_DEVICE_ID): Promise<void> {
+	// === Snapshot DAG ===
+	//
+	// The methods above treat a snapshot as an isolated tree, which is all a
+	// rollback needs: it always knows both endpoints of the span it is reversing.
+	// Forking and merging do not — they need to know what two diverging lines of
+	// *uncommitted* work had in common. Chaining snapshots into commits supplies
+	// exactly that, because a merge base is a property of ancestry, and ancestry is
+	// something only commits have.
+	//
+	// These commits live solely in the shadow repository. They never enter the
+	// user's object store, never become a branch, and never appear in `git log`.
+
+	/**
+	 * Record a tree as a snapshot commit and return its id.
+	 *
+	 * Distinct from {@link capture}, which only hashes bytes: this places that hash
+	 * into a lineage. Pass the previous snapshot as the sole parent for ordinary
+	 * progress, or two parents when the state resulted from combining two lines —
+	 * a merge parent is not cosmetic, it is what stops the next merge from
+	 * recomputing an ancestor that predates the combination and reporting conflicts
+	 * that were already resolved.
+	 */
+	async commitSnapshot(
+		worktreePath: string,
+		treeHash: string,
+		parents: string[] = [],
+		message = "snapshot",
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<string> {
+		assertLocal(deviceId);
 		const dir = shadowDir(deviceId, worktreePath);
+		return shadowLock.acquire(dir, async () => {
+			await ensureShadowRepo(dir, worktreePath);
+			return commitSnapshotUnlocked(dir, worktreePath, treeHash, parents, message);
+		});
+	},
+
+	/**
+	 * Capture the worktree and append it to the lineage in one critical section.
+	 *
+	 * The composite exists because the two halves must not interleave: between a
+	 * separate `capture` and `commitSnapshot`, another capture could advance the ref
+	 * and this commit would then be parented to a state that came *after* its own
+	 * tree, inverting the lineage.
+	 *
+	 * Returns null rather than throwing. This runs on the tool-execution path, where
+	 * the DAG is an enhancement layered on top of the boundary hashes that were
+	 * already recorded — losing a link must never cost the user their tool call.
+	 */
+	async advanceSnapshotRef(
+		worktreePath: string,
+		message = "snapshot",
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<{ treeHash: string; commitSha: string } | null> {
+		try {
+			assertLocal(deviceId);
+			const dir = shadowDir(deviceId, worktreePath);
+			return await shadowLock.acquire(dir, async () => {
+				await ensureShadowRepo(dir, worktreePath);
+				const treeHash = await captureUnlocked(dir, worktreePath, deviceId);
+				return linkSnapshotUnlocked(dir, worktreePath, treeHash, message);
+			});
+		} catch (error) {
+			logger.debug("Failed to advance the snapshot lineage", {
+				worktreePath,
+				deviceId,
+				error: String(error),
+			});
+			return null;
+		}
+	},
+
+	/**
+	 * Append an already-captured tree to the lineage.
+	 *
+	 * The counterpart of {@link advanceSnapshotRef} for callers that just captured
+	 * the workspace for another purpose. The tool-execution hooks are the reason it
+	 * exists: they capture a boundary hash on every file-mutating tool, and having
+	 * the DAG re-run `add -A` would double the one cost on that path that is
+	 * proportional to repository size.
+	 *
+	 * Returns null instead of throwing, for the same reason as
+	 * {@link advanceSnapshotRef}.
+	 */
+	async linkSnapshot(
+		worktreePath: string,
+		treeHash: string,
+		message = "snapshot",
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<{ treeHash: string; commitSha: string } | null> {
+		try {
+			assertLocal(deviceId);
+			assertObjectId(treeHash);
+			const dir = shadowDir(deviceId, worktreePath);
+			return await shadowLock.acquire(dir, async () => {
+				await ensureShadowRepo(dir, worktreePath);
+				return linkSnapshotUnlocked(dir, worktreePath, treeHash, message);
+			});
+		} catch (error) {
+			logger.debug("Failed to link a snapshot into the lineage", {
+				worktreePath,
+				deviceId,
+				error: String(error),
+			});
+			return null;
+		}
+	},
+
+	/** Point a snapshot ref at a commit. Refs outside `refs/nf/` are rejected. */
+	async setRef(
+		worktreePath: string,
+		ref: string,
+		commitSha: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<void> {
+		assertLocal(deviceId);
+		assertSnapshotRef(ref);
+		assertObjectId(commitSha);
+		const dir = shadowDir(deviceId, worktreePath);
+		await shadowLock.acquire(dir, async () => {
+			await ensureShadowRepo(dir, worktreePath);
+			const result = await runGit(["update-ref", ref, commitSha], dir, worktreePath);
+			if (result.exitCode !== 0) {
+				throw new TreeSnapshotError(`snapshot update-ref failed: ${result.stderr}`);
+			}
+		});
+	},
+
+	/** Resolve a snapshot ref to a commit id, or null when it does not exist. */
+	async getRef(
+		worktreePath: string,
+		ref: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<string | null> {
+		assertLocal(deviceId);
+		assertSnapshotRef(ref);
+		const dir = shadowDir(deviceId, worktreePath);
+		if (!existsSync(resolve(dir, "HEAD"))) return null;
+		return shadowLock.acquire(dir, () => getRefUnlocked(dir, worktreePath, ref));
+	},
+
+	/** The tree recorded by a snapshot commit, or null if it cannot be resolved. */
+	async treeOfSnapshot(
+		worktreePath: string,
+		commitSha: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<string | null> {
+		assertLocal(deviceId);
+		assertObjectId(commitSha);
+		const dir = shadowDir(deviceId, worktreePath);
+		if (!existsSync(resolve(dir, "HEAD"))) return null;
+		return shadowLock.acquire(dir, async () => {
+			const result = await runGit(
+				["rev-parse", "--verify", "--quiet", `${commitSha}^{tree}`],
+				dir,
+				worktreePath,
+			);
+			return result.exitCode === 0 && result.stdout ? result.stdout : null;
+		});
+	},
+
+	/**
+	 * Import a commit from the user's real repository into a shadow repository.
+	 *
+	 * Needed because two chapters' snapshot lineages are frequently *unrelated*: a
+	 * lineage begins the first time a workspace is captured, so two chapters created
+	 * independently (rather than one forked from the other) have no common snapshot
+	 * ancestor at all, and git refuses to merge unrelated histories. Their real
+	 * branches do share history, and that shared commit is the correct merge base.
+	 *
+	 * `fetch` is used rather than an alternates link on purpose: it copies the objects,
+	 * so the shadow repository stays self-contained and the user's own `git gc` cannot
+	 * invalidate a base NarraFork still depends on.
+	 *
+	 * Returns null when the commit cannot be imported, leaving the caller to decide.
+	 */
+	async importCommitFromRepo(
+		worktreePath: string,
+		repoPath: string,
+		commitSha: string,
+		ref: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<string | null> {
+		assertLocal(deviceId);
+		assertSnapshotRef(ref);
+		assertObjectId(commitSha);
+		const dir = shadowDir(deviceId, worktreePath);
+		return shadowLock.acquire(dir, async () => {
+			await ensureShadowRepo(dir, worktreePath);
+			const result = await runGit(
+				["fetch", "--no-tags", "--quiet", repoPath, `+${commitSha}:${ref}`],
+				dir,
+				worktreePath,
+			);
+			if (result.exitCode !== 0) {
+				logger.debug("Could not import a repository commit into the shadow repo", {
+					worktreePath,
+					commitSha,
+					stderr: result.stderr,
+				});
+				return null;
+			}
+			return getRefUnlocked(dir, worktreePath, ref);
+		});
+	},
+
+	/**
+	 * Copy a snapshot lineage from another worktree's shadow repository.
+	 *
+	 * Shadow repositories share no objects — deliberately, because the alternative
+	 * (an `objects/info/alternates` link to the user's repository) makes snapshot
+	 * durability depend on the user's own `git gc`, and a routine history rewrite
+	 * then destroys snapshots NarraFork promised to keep. `fetch` copies the objects
+	 * instead, so the receiving repository is self-contained afterwards and the
+	 * source may be discarded.
+	 *
+	 * The fetched history is what makes a cross-worktree merge base computable: both
+	 * sides then descend from a common snapshot commit inside one repository.
+	 */
+	async fetchSnapshotFrom(
+		targetWorktreePath: string,
+		sourceWorktreePath: string,
+		sourceRef: string,
+		targetRef: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<string | null> {
+		assertLocal(deviceId);
+		assertSnapshotRef(sourceRef);
+		assertSnapshotRef(targetRef);
+		const sourceDir = shadowDir(deviceId, sourceWorktreePath);
+		if (!existsSync(resolve(sourceDir, "HEAD"))) return null;
+		const targetDir = shadowDir(deviceId, targetWorktreePath);
+
+		const runFetch = async (): Promise<string | null> => {
+			await ensureShadowRepo(targetDir, targetWorktreePath);
+			const source = await getRefUnlocked(sourceDir, sourceWorktreePath, sourceRef);
+			if (!source) return null;
+			// `--no-tags` and an explicit refspec keep this to the one lineage asked
+			// for; a bare fetch would also drag in whatever else the source holds.
+			const result = await runGit(
+				["fetch", "--no-tags", "--quiet", sourceDir, `+${sourceRef}:${targetRef}`],
+				targetDir,
+				targetWorktreePath,
+			);
+			if (result.exitCode !== 0) {
+				throw new TreeSnapshotError(`snapshot fetch failed: ${result.stderr}`);
+			}
+			return getRefUnlocked(targetDir, targetWorktreePath, targetRef);
+		};
+
+		// Both repositories are touched, so both locks are needed — unless they are
+		// the same repository, in which case taking it twice would deadlock: the mutex
+		// queues every acquire behind the current tail and is not reentrant. Copying a
+		// lineage within one repo is a legitimate call (aliasing a ref), so this is
+		// handled rather than rejected.
+		if (sourceDir === targetDir) {
+			return shadowLock.acquire(targetDir, runFetch);
+		}
+		// Locked in a canonical order (sorted by directory) because a fork and a merge
+		// can run in opposite directions between the same pair; locking in call order
+		// would let the two deadlock against each other.
+		const [first, second] = [sourceDir, targetDir].sort();
+		return shadowLock.acquire(first, () => shadowLock.acquire(second, runFetch));
+	},
+
+	/**
+	 * Three-way merge two snapshot commits, letting git derive the merge base.
+	 *
+	 * Both commits must already be present in this worktree's shadow repository —
+	 * use {@link fetchSnapshotFrom} first for a lineage that came from elsewhere.
+	 *
+	 * Nothing is written to the worktree, including when the merge conflicts: the
+	 * resulting tree then contains conflict markers, and checking it out would
+	 * corrupt the very files it claims to merge. The caller decides whether to
+	 * materialise the clean result or surface the conflicting paths.
+	 *
+	 * `fallbackBase` covers the case where the two commits share no ancestry at all,
+	 * which is normal rather than exceptional: a lineage begins at a workspace's first
+	 * capture, so two chapters created independently — as opposed to one forked from the
+	 * other — have no common snapshot ancestor even though their git branches do share
+	 * history. git refuses such a merge outright, and the branches' real merge base is
+	 * the correct answer. It is consulted only after ancestry has been ruled out, so a
+	 * genuine relationship is always preferred.
+	 */
+	async mergeSnapshots(
+		worktreePath: string,
+		ours: string,
+		theirs: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+		fallbackBase?: string,
+	): Promise<TreeMergeResult> {
+		assertLocal(deviceId);
+		assertObjectId(ours);
+		assertObjectId(theirs);
+		if (fallbackBase) assertObjectId(fallbackBase);
+		const dir = shadowDir(deviceId, worktreePath);
+		return shadowLock.acquire(dir, async () => {
+			await ensureShadowRepo(dir, worktreePath);
+			const shared = await runGit(["merge-base", ours, theirs], dir, worktreePath);
+			if (shared.exitCode === 0 && shared.stdout) {
+				// Ancestry exists, so let git derive the base: a hand-computed base is what
+				// produces spurious conflicts when a real relationship is available.
+				return mergeTreeUnlocked(dir, worktreePath, null, ours, theirs);
+			}
+			if (!fallbackBase) {
+				throw new TreeSnapshotError(
+					"snapshot merge has no common ancestor and no fallback base was supplied",
+				);
+			}
+			return mergeTreeUnlocked(dir, worktreePath, fallbackBase, ours, theirs);
+		});
+	},
+
+	/**
+	 * Roll one snapshot's contribution back out of another, keeping later work.
+	 *
+	 * A three-way merge with the base deliberately set to the snapshot being reversed:
+	 * `base = contribution`, `ours = current state`, `theirs = state before it landed`.
+	 * git preserves `ours` wherever `base` and `theirs` agree, so only the bytes that
+	 * `contribution` introduced are undone — everything done afterwards survives.
+	 *
+	 * This is what undoing a commit-free merge needs. The commit-based equivalent has
+	 * to choose between resetting (safe only if nothing followed) and reverting
+	 * (needed once it has); one reverse merge covers both, because "what changed since"
+	 * is exactly what a three-way merge already reasons about.
+	 *
+	 * A conflict means the current state edited the same region being rolled back. The
+	 * tree is still returned but must not be written out.
+	 */
+	async reverseMergeSnapshots(
+		worktreePath: string,
+		contribution: string,
+		current: string,
+		beforeContribution: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<TreeMergeResult> {
+		assertLocal(deviceId);
+		assertObjectId(contribution);
+		assertObjectId(current);
+		assertObjectId(beforeContribution);
+		const dir = shadowDir(deviceId, worktreePath);
+		return shadowLock.acquire(dir, async () => {
+			await ensureShadowRepo(dir, worktreePath);
+			// The base is given explicitly here, unlike `mergeSnapshots`. Letting git
+			// derive it would find the common ancestor of the two sides, which is not the
+			// question being asked: the reversal is defined relative to the contribution
+			// itself, so that is what has to be the base.
+			return mergeTreeUnlocked(dir, worktreePath, contribution, current, beforeContribution);
+		});
+	},
+
+	/**
+	 * The merge base of two snapshot commits, or null when they share no ancestry.
+	 *
+	 * Exposed for diagnostics and tests; {@link mergeSnapshots} does not need it,
+	 * since git computes the base internally.
+	 */
+	async snapshotMergeBase(
+		worktreePath: string,
+		a: string,
+		b: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<string | null> {
+		assertLocal(deviceId);
+		assertObjectId(a);
+		assertObjectId(b);
+		const dir = shadowDir(deviceId, worktreePath);
+		if (!existsSync(resolve(dir, "HEAD"))) return null;
+		return shadowLock.acquire(dir, async () => {
+			const result = await runGit(["merge-base", a, b], dir, worktreePath);
+			// Exit 1 means "no common ancestor", which is a legitimate answer for two
+			// unrelated lineages rather than a failure.
+			if (result.exitCode !== 0) return null;
+			return result.stdout || null;
+		});
+	},
+
+	/**
+	 * Write a tree onto a worktree, deleting whatever the tree does not contain.
+	 *
+	 * The named counterpart of {@link restore} for callers that hold a tree rather
+	 * than a snapshot boundary (a fork materialising its start state, a merge
+	 * applying its result). Shares the same implementation, so it inherits the parts
+	 * that make a partial write survivable: files created after the tree are removed
+	 * explicitly, since `checkout-index` never deletes, and a failure mid-write is
+	 * compensated back to the pre-write state.
+	 */
+	async materializeTree(
+		worktreePath: string,
+		treeHash: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+		expectedCurrentTree?: string,
+	): Promise<string[]> {
+		assertLocal(deviceId);
+		assertObjectId(treeHash);
+		const dir = shadowDir(deviceId, worktreePath);
+		return shadowLock.acquire(dir, () =>
+			restoreUnlocked(dir, worktreePath, treeHash, expectedCurrentTree),
+		);
+	},
+
+	/**
+	 * Remove a worktree's shadow repository and its recorded hashes.
+	 *
+	 * Refuses when a chapter still claims this shadow repository, unless `force` is
+	 * set. The guard exists because a worktree directory disappearing does *not*
+	 * always mean its history is finished with:
+	 *
+	 *   - Making a chapter dormant removes the worktree and nulls `worktreePath`,
+	 *     but waking it rebuilds the very same path, so the shadow repo is expected
+	 *     to still be there.
+	 *   - If that removal fails, the directory survives while the database already
+	 *     reads as dormant — and the orphan sweep, which walks directories that no
+	 *     active chapter claims, would then delete both the directory and this
+	 *     repository, taking the chapter's whole snapshot lineage with it.
+	 *
+	 * `chapters.snapshotShadowKey` is what makes the second case distinguishable
+	 * from a genuine orphan: it survives `worktreePath` being nulled. Callers that
+	 * are deleting the chapter itself pass `force`.
+	 */
+	async destroy(
+		worktreePath: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+		options?: { force?: boolean },
+	): Promise<boolean> {
+		const dir = shadowDir(deviceId, worktreePath);
+		if (!options?.force && (await isShadowRepoClaimed(deviceId, worktreePath))) {
+			logger.warn("Kept a tree-snapshot repo that a chapter still references", {
+				worktreePath,
+			});
+			return false;
+		}
 		if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
 		excludeMtimes.delete(dir);
+		// The recorded hashes describe a repository that no longer exists, so leaving
+		// them behind means every later reader has to probe the filesystem to discover
+		// they are dangling. The doc comment always claimed this happened; it did not.
+		await db
+			.delete(worktreeTreeSnapshots)
+			.where(
+				and(
+					eq(worktreeTreeSnapshots.deviceId, deviceId),
+					eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(worktreePath)),
+				),
+			);
 		// The in-memory write declarations describe this same directory, so they die
 		// with it. Cleared here rather than at each call site because a leftover entry
 		// would keep answering overlap questions for a path that no longer exists — and
 		// a recreated worktree at the same path would inherit them.
 		clearClaims(worktreePath);
+		return true;
 	},
 
-	/** Prune loose objects across every shadow repository. */
+	/**
+	 * Repack every shadow repository, keeping everything still referenced.
+	 *
+	 * Repacking is necessary: each capture writes loose objects, so without it the
+	 * repos grow with every tool call.
+	 *
+	 * What must *not* happen is pruning a snapshot the database still points at.
+	 * Snapshot trees are unreachable by construction — `write-tree` creates no ref —
+	 * so an unqualified prune is entitled to delete them, and did: with a 7-day
+	 * window, any snapshot older than that disappeared while `narrator_tool_calls`,
+	 * `narrator_messages` and `worktree_tree_snapshots` all still referenced it, and
+	 * a rollback of older history could only report the snapshot as missing.
+	 *
+	 * Two changes fix that. Snapshots now live under `refs/nf/`, which makes them
+	 * reachable and therefore exempt from pruning; and pruning is restricted to
+	 * objects old enough to predate any lineage NarraFork would still be extending,
+	 * so a repo written before refs existed is repacked without having its history
+	 * deleted underneath it. The residue is bounded because identical content
+	 * deduplicates by hash.
+	 */
 	async gcAll(): Promise<void> {
 		if (!existsSync(SHADOW_ROOT)) return;
 		for (const entry of readdirSync(SHADOW_ROOT, { withFileTypes: true })) {
@@ -1468,10 +2263,19 @@ export const worktreeTreeSnapshot = {
 				rmSync(dir, { recursive: true, force: true });
 				continue;
 			}
-			const result = await runGit(["gc", "--prune=7.days", "--quiet"], dir, dir);
-			if (result.exitCode !== 0) {
-				logger.warn("Tree snapshot gc failed", { dir, stderr: result.stderr });
-			}
+			// Serialized against captures: `gc` rewrites the object store, and a
+			// concurrent `add -A`/`write-tree` in the same repo can fail or race with
+			// the repack.
+			await shadowLock.acquire(dir, async () => {
+				// `--no-prune` is the load-bearing flag. Repacking is the point; deleting
+				// unreachable objects is not, because "unreachable" is the normal state of
+				// a snapshot recorded before the DAG existed, and the database is the real
+				// reference for those.
+				const result = await runGit(["gc", "--no-prune", "--quiet"], dir, dir);
+				if (result.exitCode !== 0) {
+					logger.warn("Tree snapshot gc failed", { dir, stderr: result.stderr });
+				}
+			});
 		}
 	},
 };

@@ -894,16 +894,6 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 		});
 	});
 
-	// === Chat group ready: notify the initiating user so their UI can add a tab ===
-	eventBus.on("group:ready", (event) => {
-		if (!event.createdBy) return;
-		broadcastToUser(event.createdBy, {
-			type: "group:ready",
-			groupId: event.groupId,
-			title: event.title,
-		});
-	});
-
 	// === Batch merge progress broadcast ===
 	eventBus.onAny((event) => {
 		if (!event.type.startsWith("merge:")) return;

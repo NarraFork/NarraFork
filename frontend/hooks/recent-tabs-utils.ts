@@ -263,7 +263,6 @@ function recentTabMatchesPath(tab: RecentTab, pathname: string): boolean {
 		return !!tab.narratorId && pathname === `/narrators/${tab.narratorId}`;
 	}
 	if (tab.type === "workspace") return pathname === `/narrators/workspace/${tab.id}`;
-	if (tab.type === "group") return pathname === `/groups/${tab.id}`;
 	return pathname === `/narrators/${tab.id}`;
 }
 

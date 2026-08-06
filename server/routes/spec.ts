@@ -1,8 +1,9 @@
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
+import { getUserLanguage } from "../lib/prompt-i18n";
 import { specFileQuerySchema, updateSpecFileSchema } from "../lib/validators";
+import { interjectSpecEditAsUserMessage } from "../services/spec-edit-interject";
 import { compileSpecTasks, parseSpecTasksDocument } from "../services/spec-task-service";
-import { pushSpecUpdateForNarrator } from "../services/spec-update-queue";
 import { specVfsService } from "../services/spec-vfs-service";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
@@ -137,7 +138,10 @@ specRoutes.put("/:id/spec/file", async (c) => {
 		source: "ui",
 	});
 
-	// Queue sidecar notification for the agent (unless explicitly disabled)
+	// Notify the agent (unless explicitly disabled). A working narrator receives
+	// the edit as a cut-in user message so it carries real user-turn weight; an
+	// idle one falls back to the sidecar queue.
+	let interjected = false;
 	if (notifyAgent !== false) {
 		let taskSummary: string | null = null;
 		let preview: string | null = null;
@@ -163,15 +167,23 @@ specRoutes.put("/:id/spec/file", async (c) => {
 			preview = content.slice(0, 300);
 		}
 
-		pushSpecUpdateForNarrator(narratorId, {
-			uri: written.uri,
-			path,
-			revisionId: written.revisionId ?? null,
-			updatedBy: "user",
-			preview,
-			taskSummary,
-			timestamp: new Date().toISOString(),
-		});
+		const userId = c.get("user").sub;
+		const locale = await getUserLanguage(userId);
+		const { delivered } = await interjectSpecEditAsUserMessage(
+			narratorId,
+			{
+				uri: written.uri,
+				path,
+				revisionId: written.revisionId ?? null,
+				updatedBy: "user",
+				preview,
+				taskSummary,
+				timestamp: new Date().toISOString(),
+			},
+			locale,
+			userId,
+		);
+		interjected = delivered === "interjected";
 	}
 
 	return c.json({
@@ -179,5 +191,6 @@ specRoutes.put("/:id/spec/file", async (c) => {
 		uri: written.uri,
 		revisionId: written.revisionId ?? null,
 		readonly: written.readonly,
+		interjected,
 	});
 });

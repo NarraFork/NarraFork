@@ -20,6 +20,7 @@ import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodAnchor } from "../../hooks/useLodAnchor";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import type { RevertScope } from "../../lib/api/narrators";
 import { resolveNarratorColumnMaxWidth } from "../../lib/narrator-content-column";
 import {
 	createForegroundBottomResumeIntent,
@@ -590,7 +591,7 @@ interface MountedChunkProps {
 	onEditAndRegenerate?: (
 		messageId: string,
 		newContent: string,
-		rollback: boolean,
+		revertOpts: { skipRevert: boolean; scope?: RevertScope },
 		opts?: {
 			keepImageIds: string[];
 			newImages: File[];
@@ -787,7 +788,7 @@ interface ChunkedMessageListProps {
 	onEditAndRegenerate?: (
 		messageId: string,
 		newContent: string,
-		rollback: boolean,
+		revertOpts: { skipRevert: boolean; scope?: RevertScope },
 		opts?: {
 			keepImageIds: string[];
 			newImages: File[];

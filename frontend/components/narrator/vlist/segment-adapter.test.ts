@@ -2356,6 +2356,63 @@ describe("adaptSegment — sidecar cards", () => {
 		const open = VLIST_REGISTRY.sidecar.measure(specs[1]!.data, 600, 5, { expanded: true });
 		expect(open.height).toBeGreaterThan(measured.height);
 	});
+
+	// ── Low-LOD degraded form (one bare trace per record, no card skin) ────────
+	it("low LOD (<4): each record becomes a sidecar-trace, not a card", () => {
+		for (const lod of [1, 2, 3] as const) {
+			const specs = adaptSegment(
+				sidecarMsg("assistant", [
+					{ target: "user_message", source: "silent_progress", content: "one" },
+					{ target: "user_message", source: "bg_agent", content: "two" },
+				]),
+				{ lod },
+			);
+			expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar-trace", "sidecar-trace"]);
+		}
+	});
+
+	it("high LOD (>=4): each record stays a full sidecar card", () => {
+		for (const lod of [4, 5, 6] as const) {
+			const specs = adaptSegment(
+				sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
+				{ lod },
+			);
+			expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar"]);
+		}
+	});
+
+	it("low-LOD trace carries the same payload and reads expandedRows for its row fold", () => {
+		const ctx: AdapterContext = { lod: 2, expandedRows: (key) => (key === "m1-sc0" ? [0] : []) };
+		const specs = adaptSegment(
+			sidecarMsg("assistant", [{ target: "user_message", source: "bg_agent", content: "full" }]),
+			ctx,
+		);
+		const trace = specs[1]!;
+		expect(trace.kind).toBe("sidecar-trace");
+		const data = trace.data as { sourceLabel: string; previewText: string; fullText: string };
+		expect(data.sourceLabel).toBeTruthy();
+		expect(data.fullText).toBe("full");
+		expect(trace.opts?.expandedIndices).toEqual([0]);
+	});
+
+	it("low-LOD sidecar-trace measures through the registry (header + one row)", () => {
+		const specs = adaptSegment(
+			sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
+			{ lod: 2 },
+		);
+		const collapsed = VLIST_REGISTRY["sidecar-trace"].measure(
+			specs[1]!.data,
+			600,
+			2,
+			specs[1]!.opts,
+		);
+		expect(collapsed.height).toBeGreaterThan(0);
+		// Expanding the single row reveals the body → taller.
+		const open = VLIST_REGISTRY["sidecar-trace"].measure(specs[1]!.data, 600, 2, {
+			expandedIndices: [0],
+		});
+		expect(open.height).toBeGreaterThan(collapsed.height);
+	});
 });
 
 describe("adaptToolRun — tool-result + tool-only-message sidecars", () => {

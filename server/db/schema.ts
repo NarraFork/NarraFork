@@ -114,6 +114,36 @@ export const chapters = sqliteTable(
 		mergeCommitSha: text("merge_commit_sha"),
 		mergeStrategy: text("merge_strategy", { enum: ["merge", "squash", "cherry-pick"] }),
 		preMergeTargetSha: text("pre_merge_target_sha"),
+
+		/**
+		 * Snapshot commit produced by a commit-free merge.
+		 *
+		 * The snapshot-space counterpart of `mergeCommitSha`, and the flag that routes
+		 * an unmerge: present means the merge happened in the shadow DAG and has to be
+		 * reversed there, absent means it produced a real git commit. Deliberately a
+		 * separate column rather than reusing `mergeCommitSha`, which nine backend and
+		 * five frontend readers interpret as a genuine git commit — a snapshot id put
+		 * there would be a lie they cannot detect.
+		 */
+		mergeSnapshotCommitSha: text("merge_snapshot_commit_sha"),
+		/**
+		 * Target's snapshot immediately before a commit-free merge.
+		 *
+		 * The snapshot-space counterpart of `preMergeTargetSha`, used to undo the merge
+		 * and to abort a conflicted one.
+		 */
+		preMergeTargetSnapshotSha: text("pre_merge_target_snapshot_sha"),
+		/**
+		 * The source snapshot that was merged in.
+		 *
+		 * Serves two purposes, both load-bearing. It is the merge base for the reverse
+		 * three-way merge that undoes the merge; and it is the only remaining record of
+		 * the source's uncommitted work, since a commit-free merge leaves the source
+		 * branch tip untouched while its worktree is removed. Waking or unmerging the
+		 * source restores this tree, without which the user would get back a chapter
+		 * holding only its last commit.
+		 */
+		mergedSourceSnapshotSha: text("merged_source_snapshot_sha"),
 		containerConfig: text("container_config", { mode: "json" }),
 
 		// 探索组
@@ -128,6 +158,43 @@ export const chapters = sqliteTable(
 		headCommitSha: text("head_commit_sha"),
 		startCommitSha: text("start_commit_sha"),
 		commitCount: integer("commit_count").default(0),
+
+		/**
+		 * Latest snapshot commit for this chapter's workspace — its narrative state
+		 * independent of whether the user has committed anything.
+		 *
+		 * The chapter's identity used to be defined purely by commits, which is why
+		 * forking and merging required one: there was no other name for "the state
+		 * this chapter is in". This is that name. It advances as the workspace
+		 * changes and needs no cooperation from the user's git history.
+		 */
+		snapshotCommitSha: text("snapshot_commit_sha"),
+		/**
+		 * Canonical key of the shadow repository holding this chapter's snapshots.
+		 *
+		 * Recorded separately from `worktreePath` because it must outlive it. Going
+		 * dormant nulls `worktreePath` while the lineage stays valuable (waking
+		 * rebuilds the identical path), so without this the orphan sweep cannot tell
+		 * a dormant chapter's shadow repository from a genuinely abandoned one, and
+		 * would delete the chapter's entire snapshot history.
+		 */
+		snapshotShadowKey: text("snapshot_shadow_key"),
+		/**
+		 * Snapshot holding work the branch tip does NOT carry, recorded when going
+		 * dormant.
+		 *
+		 * Written only when the pre-dormant auto-commit failed — which `dormant`
+		 * deliberately tolerates before deleting the worktree, so at that moment the
+		 * snapshot becomes the only copy of the user's uncommitted work. Waking
+		 * restores it.
+		 *
+		 * Deliberately not written after a successful commit, so its presence carries
+		 * one unambiguous meaning: "the branch is missing this chapter's state". A value
+		 * set unconditionally would make every wake overwrite a worktree that git had
+		 * already restored correctly. Distinct from `snapshotCommitSha`, which tracks
+		 * the latest state regardless of whether it is also committed.
+		 */
+		dormantSnapshotCommitSha: text("dormant_snapshot_commit_sha"),
 
 		// 图可视化
 		color: text("color"),
@@ -164,6 +231,9 @@ export const chapters = sqliteTable(
 		index("idx_chapters_merged_into").on(table.mergedIntoChapterId),
 		index("idx_chapters_review_source").on(table.reviewSourceChapterId),
 		index("idx_chapters_exploration_group").on(table.explorationGroupId),
+		// Looked up on every shadow-repo destroy to decide whether a chapter still
+		// claims it; without an index that is a full table scan per orphan swept.
+		index("idx_chapters_snapshot_shadow_key").on(table.snapshotShadowKey),
 	],
 );
 
@@ -719,6 +789,16 @@ export const narratorMessages = sqliteTable(
 		 * for this boundary and callers fall back to the per-file replay path.
 		 */
 		treeHashAfter: text("tree_hash_after"),
+		/**
+		 * Snapshot commit for {@link treeHashAfter}, i.e. this boundary's position in
+		 * the shadow DAG.
+		 *
+		 * Kept alongside the tree hash rather than replacing it: rolling back only
+		 * needs the bytes, and every existing row has them. Forking from this message
+		 * needs the ancestry, which only the commit carries — it is what lets the new
+		 * chapter's later work still find a merge base with this one.
+		 */
+		snapshotCommitSha: text("snapshot_commit_sha"),
 		// 斜杠命令原始文本（展示用），如 "/translate typescript some code"
 		commandText: text("command_text"),
 		// 触发此消息的人类用户 ID。与 origin 正交：系统代发的消息也可以带触发者
@@ -1545,6 +1625,19 @@ export const worktreeTreeSnapshots = sqliteTable(
 		worktreePath: text("worktree_path").notNull(),
 		/** Git tree object hash inside the shadow repository for this worktree. */
 		treeHash: text("tree_hash").notNull(),
+		/**
+		 * Snapshot commit that records this tree in the shadow repository's DAG.
+		 *
+		 * A tree alone has no ancestry, so two diverging lines of uncommitted work
+		 * have no computable merge base. Wrapping each capture in a commit whose
+		 * parent is the previous capture supplies that ancestry, which is what lets
+		 * fork and merge operate on uncommitted state. It also makes the snapshot
+		 * reachable from a ref, so `git gc` stops being entitled to delete it.
+		 *
+		 * null for rows written before the DAG existed; those still have a usable
+		 * `treeHash` and remain revertable, they just cannot be a merge endpoint.
+		 */
+		snapshotCommitSha: text("snapshot_commit_sha"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -1606,6 +1699,33 @@ export const mergeSessions = sqliteTable(
 		mergedCount: integer("merged_count").notNull().default(0),
 		currentSourceChapterId: text("current_source_chapter_id"),
 		conflictFiles: text("conflict_files", { mode: "json" }).$type<string[]>(),
+		/**
+		 * Target's workspace snapshot before the in-flight merge was applied.
+		 *
+		 * A git-based interactive merge keeps its own half-finished state on disk, so
+		 * `git merge --abort` knows what to return to. A snapshot merge has no such
+		 * state: the conflicted tree is simply written into the worktree, so the way
+		 * back has to be recorded explicitly. Persisted rather than held in memory
+		 * because the two halves of an interactive merge are separate requests and a
+		 * restart between them must not strand the worktree in a conflicted state.
+		 */
+		preMergeTree: text("pre_merge_tree"),
+		/** The conflicted tree written to the worktree, kept for diagnosis and replay. */
+		conflictTree: text("conflict_tree"),
+		/**
+		 * The two snapshot commits being merged, recorded so the resolution can be
+		 * committed with both parents.
+		 *
+		 * Not re-derived at completion time: the target's head ref can legitimately
+		 * advance while the conflict is being resolved (the workspace watcher records
+		 * the narrator's edits), so reading it later would name a conflicted state
+		 * instead of the merge's actual parents — and a wrong parent makes the *next*
+		 * merge recompute a stale base and report already-resolved conflicts.
+		 */
+		preMergeTargetSnapshot: text("pre_merge_target_snapshot"),
+		mergeSourceSnapshot: text("merge_source_snapshot"),
+		/** Target's git HEAD before the merge, for parity with the commit path. */
+		preMergeTargetSha: text("pre_merge_target_sha"),
 		error: text("error"),
 		locale: text("locale").$type<Locale>(),
 		createdAt: text("created_at").notNull(),
@@ -2223,99 +2343,6 @@ export const fileAttributions = sqliteTable(
 		),
 		index("idx_file_attr_narrator").on(table.narratorId),
 		index("idx_file_attr_workspace").on(table.workspacePath, table.changedAt),
-	],
-);
-
-// === chat_groups ===
-// A multi-party conversation created when a narrator/user @mentions one or more
-// named narrators. Members = the originating session's narrator + the user(s) +
-// the mentioned named narrator(s). Messages are the source of truth and are
-// delivered into each narrator member's own session (wake if idle, sidecar if working).
-export const chatGroups = sqliteTable(
-	"chat_groups",
-	{
-		id: text("id").primaryKey(),
-		title: text("title"),
-		/** The narrator whose session originated this group (the "origin" member). */
-		originNarratorId: text("origin_narrator_id").references(() => narrators.id, {
-			onDelete: "set null",
-		}),
-		/** Optional project scope (inherited from the origin narrator's chapter, if any). */
-		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
-		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
-		status: text("status", { enum: ["active", "archived"] })
-			.notNull()
-			.default("active"),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-	},
-	(table) => [
-		index("idx_chat_groups_origin").on(table.originNarratorId),
-		index("idx_chat_groups_project").on(table.projectId),
-		index("idx_chat_groups_status").on(table.status, table.updatedAt),
-		// FK covering index for user deletion.
-		index("idx_chat_groups_created_by").on(table.createdBy),
-	],
-);
-
-// === chat_group_members ===
-export const chatGroupMembers = sqliteTable(
-	"chat_group_members",
-	{
-		id: text("id").primaryKey(),
-		groupId: text("group_id")
-			.notNull()
-			.references(() => chatGroups.id, { onDelete: "cascade" }),
-		memberType: text("member_type", { enum: ["user", "narrator"] }).notNull(),
-		userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
-		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
-		/** Role within the group: origin (the source session), named (a mentioned narrator), or participant. */
-		role: text("role", { enum: ["origin", "named", "participant"] })
-			.notNull()
-			.default("participant"),
-		/**
-		 * Whether this member can control other members' narrators (send messages,
-		 * proxy-approve permission requests, interrupt). Granted to named narrators.
-		 */
-		canControl: integer("can_control", { mode: "boolean" }).notNull().default(false),
-		joinedAt: text("joined_at").notNull(),
-	},
-	(table) => [
-		index("idx_chat_group_members_group").on(table.groupId),
-		index("idx_chat_group_members_narrator").on(table.narratorId),
-		uniqueIndex("idx_chat_group_members_group_narrator").on(table.groupId, table.narratorId),
-		uniqueIndex("idx_chat_group_members_group_user").on(table.groupId, table.userId),
-		// FK covering index for user deletion (the unique index above leads with groupId).
-		index("idx_chat_group_members_user").on(table.userId),
-	],
-);
-
-// === chat_group_messages ===
-// Source of truth for group conversation. Each row is delivered to narrator members.
-export const chatGroupMessages = sqliteTable(
-	"chat_group_messages",
-	{
-		id: text("id").primaryKey(),
-		groupId: text("group_id")
-			.notNull()
-			.references(() => chatGroups.id, { onDelete: "cascade" }),
-		senderType: text("sender_type", { enum: ["user", "narrator", "system"] }).notNull(),
-		senderUserId: text("sender_user_id").references(() => users.id, { onDelete: "set null" }),
-		senderNarratorId: text("sender_narrator_id").references(() => narrators.id, {
-			onDelete: "set null",
-		}),
-		content: text("content").notNull(),
-		/** When true, delivery to working members triggers a soft interrupt instead of a passive sidecar. */
-		urgent: integer("urgent", { mode: "boolean" }).notNull().default(false),
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		index("idx_chat_group_messages_group").on(table.groupId, table.createdAt),
-		// FK covering index: chat messages grow without bound, and narrator deletion (which
-		// happens on every subagent cleanup) enforces this ON DELETE SET NULL constraint.
-		index("idx_chat_group_messages_sender_narrator").on(table.senderNarratorId),
-		// FK covering index for user deletion.
-		index("idx_chat_group_messages_sender_user").on(table.senderUserId),
 	],
 );
 

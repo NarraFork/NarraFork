@@ -15,7 +15,7 @@ import {
 const REQUESTER_ID = "requester-narrator";
 const RESPONDER_ID = "responder-narrator";
 const TEAM_SCOPE: AgentReplyScope = { type: "team", id: "parent-narrator" };
-const OTHER_SCOPE: AgentReplyScope = { type: "chat-group", id: "group-1" };
+const OTHER_SCOPE: AgentReplyScope = { type: "parent-child", id: "other-pair" };
 
 afterEach(() => {
 	clearPendingAgentReplyWaits();

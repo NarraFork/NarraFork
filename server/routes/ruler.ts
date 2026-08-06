@@ -589,21 +589,24 @@ rulerRoutes.post("/:id/ruler/merge", async (c) => {
 		throw new ValidationError("Root chapter has no worktree");
 	}
 
-	// Dirty check: ensure trunk worktree is clean
-	const trunkStatus = await gitService.getStatus(rootChapter.worktreePath);
-	if (trunkStatus.trim()) {
-		return c.json({ error: "MERGE_DIRTY_TRUNK", code: "VALIDATION_ERROR" }, 400);
-	}
-
-	// Dirty check: ensure source worktree is clean
 	const source = await db.query.chapters.findFirst({
 		where: and(eq(chapters.id, sourceChapterId), eq(chapters.projectId, projectId)),
 	});
 	if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-	if (source.worktreePath) {
-		const sourceStatus = await gitService.getStatus(source.worktreePath);
-		if (sourceStatus.trim()) {
-			return c.json({ error: "MERGE_DIRTY_SOURCE", code: "VALIDATION_ERROR" }, 400);
+
+	// Only the commit-based merge needs clean worktrees: it reads branch tips, so
+	// uncommitted work would be dropped. The default snapshot merge operates on the
+	// workspaces themselves, where being dirty is normal.
+	if (parsed.data.mode === "commit") {
+		const trunkStatus = await gitService.getStatus(rootChapter.worktreePath);
+		if (trunkStatus.trim()) {
+			return c.json({ error: "MERGE_DIRTY_TRUNK", code: "VALIDATION_ERROR" }, 400);
+		}
+		if (source.worktreePath) {
+			const sourceStatus = await gitService.getStatus(source.worktreePath);
+			if (sourceStatus.trim()) {
+				return c.json({ error: "MERGE_DIRTY_SOURCE", code: "VALIDATION_ERROR" }, 400);
+			}
 		}
 	}
 
@@ -614,6 +617,7 @@ rulerRoutes.post("/:id/ruler/merge", async (c) => {
 		targetChapterId: rootChapter.id,
 		strategy: mergeStrategy,
 		message,
+		mode: parsed.data.mode,
 	});
 
 	if (result.success) {

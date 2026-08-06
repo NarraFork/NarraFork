@@ -100,11 +100,11 @@ function createPngFile(name: string, width: number, height: number): File {
 	return new File([bytes], name, { type: "image/png" });
 }
 
-async function runEdit(opts: Parameters<typeof editAndRegenerate>[6]) {
+async function runEdit(opts: Parameters<typeof editAndRegenerate>[5]) {
 	// editAndRegenerate persists the rebuilt contentJson before the (failing in
 	// this bare harness) agent loop runs, so we can inspect the persisted result.
 	try {
-		await editAndRegenerate("n1", "m1", "new", "en", false, false, opts);
+		await editAndRegenerate("n1", "m1", "new", "en", false, opts);
 	} catch {
 		/* expected: agent loop cannot run without a real provider */
 	}
@@ -254,7 +254,7 @@ describe("editAndRegenerate text_file management", () => {
 			(_, index) => new File([String(index)], `new-${index}.txt`, { type: "text/plain" }),
 		);
 		await expect(
-			editAndRegenerate("n1", "m1", "new", "en", false, false, {
+			editAndRegenerate("n1", "m1", "new", "en", false, {
 				keepTextFilePaths: ["legacy/a", "legacy/b"],
 				newTextFiles,
 			}),
@@ -276,7 +276,7 @@ describe("editAndRegenerate text_file management", () => {
 		});
 
 		await expect(
-			editAndRegenerate("n1", "m1", "new", "en", false, false, {
+			editAndRegenerate("n1", "m1", "new", "en", false, {
 				keepImageIds: [],
 				keepTextFilePaths: [],
 				newImages: [image],
@@ -319,12 +319,12 @@ describe("editAndRegenerate text_file management", () => {
 			},
 		});
 
-		const firstEdit = editAndRegenerate("n1", "m1", "first edit", "en", false, false, {
+		const firstEdit = editAndRegenerate("n1", "m1", "first edit", "en", false, {
 			keepTextFilePaths: [],
 			newTextFiles: [firstFile],
 		});
 		await firstEntered;
-		const secondEdit = editAndRegenerate("n1", "m1", "second edit", "en", false, false, {
+		const secondEdit = editAndRegenerate("n1", "m1", "second edit", "en", false, {
 			keepTextFilePaths: [],
 			newTextFiles: [secondFile],
 		});
@@ -364,7 +364,7 @@ describe("editAndRegenerate text_file management", () => {
 			.values({ id: "ref-n2-m1", narratorId: "n2", messageId: "m1", seq: 0, isCompact: 0 })
 			.run();
 
-		const result = await editAndRegenerate("n2", "m1", "new", "en", false, false, {
+		const result = await editAndRegenerate("n2", "m1", "new", "en", false, {
 			keepTextFilePaths: [sourcePath],
 		});
 		expect(result.ok).toBe(true);
@@ -392,7 +392,7 @@ describe("editAndRegenerate text_file management", () => {
 			{ type: "text", text: "old" },
 		]);
 		await expect(
-			editAndRegenerate("n1", "m1", "new", "en", false, false, {
+			editAndRegenerate("n1", "m1", "new", "en", false, {
 				keepTextFilePaths: [sourcePath],
 			}),
 		).rejects.toThrow("attachments exceed the 128 MiB limit");

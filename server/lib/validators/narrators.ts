@@ -428,3 +428,24 @@ export const forkFromMessagesSchema = z.object({
 export const editAssistantMessageSchema = z.object({
 	content: z.string().min(1).max(100000),
 });
+
+/**
+ * JSON body for edit-and-regenerate (the multipart variant is parsed by hand
+ * because it also carries files).
+ *
+ * `content` may be empty: an edit that keeps only attachments is valid, and the
+ * service rejects the genuinely empty case where no text and no attachment remains.
+ *
+ * `rollback` is the superseded field. It is still accepted so an older client keeps
+ * working, and its ORIGINAL meaning — "revert the files" — is what the route honours,
+ * since that is what its UI offered.
+ */
+export const editAndRegenerateJsonSchema = z.object({
+	content: z.string().max(100000).optional(),
+	keepImageIds: z.array(z.string()).max(100).optional(),
+	keepTextFilePaths: z.array(z.string()).max(100).optional(),
+	/** True => delete the messages but leave the workspace alone. */
+	skipRevert: z.boolean().optional(),
+	scope: revertScopeSchema,
+	rollback: z.boolean().optional(),
+});

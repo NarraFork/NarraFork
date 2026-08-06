@@ -6,7 +6,8 @@
  * the SAME editor instead of reimplementing it (which would immediately drift).
  * It owns the whole editing interaction:
  *   - user messages: textarea + kept/new image & text-file attachments, the
- *     rollback confirmation modal, and the edit-and-regenerate submit;
+ *     revert confirmation modal (shared with rollback-to-block), and the
+ *     edit-and-regenerate submit;
  *   - assistant messages: a plain textarea that persists the edited text without
  *     truncating later messages or regenerating.
  *
@@ -20,32 +21,26 @@
  * — same reasoning as TraceRowInteraction.tsx).
  */
 
-import {
-	ActionIcon,
-	Button,
-	Group,
-	Modal,
-	Paper,
-	Stack,
-	Text,
-	Textarea,
-	Tooltip,
-} from "@mantine/core";
+import { useEditRegeneratePreview } from "@frontend/hooks/useNarrator";
+import { ActionIcon, Button, Group, Paper, Stack, Text, Textarea, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import { IconPaperclip } from "@tabler/icons-react";
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import type { RevertScope } from "../../lib/api/narrators";
 import { shouldClearEditDraft } from "../../lib/api/narrators";
 import { UserAvatar } from "../UserAvatar";
 import { EditExistingImageThumb, EditNewImageThumb, EditTextFileChip } from "./EditAttachmentChips";
 import { EditingMessageCtx } from "./EditingMessageCtx";
+import { editRevertNeedsConfirm } from "./message-edit-text";
 import {
 	ACCEPTED_TYPES,
 	MAX_IMAGE_LONG_EDGE,
 	MAX_IMAGE_SIZE,
 	resizeImageIfNeeded,
 } from "./narrator-panel-types";
+import { RevertScopeConfirmModal } from "./RevertScopeConfirmModal";
 
 /** Maximum attachments (images / text files) an edit may carry. */
 const MAX_EDIT_ATTACHMENTS = 10;
@@ -78,14 +73,25 @@ export interface MessageEditorPanelProps {
 	} | null;
 	/** Pre-resolved initial text (see resolveEditorInitialText). */
 	initialText: string;
-	/** Last user message → submit directly instead of asking about rollback. */
+	/**
+	 * Whether this is the newest user message.
+	 *
+	 * No longer decides whether the confirmation appears — that follows from what the
+	 * server says the edit would destroy. Editing the last user message still reverts
+	 * files, so skipping the prompt for it hid a destructive action.
+	 */
 	isLastUserMessage?: boolean;
-	/** Narrator is bound to a chapter (git) → the rollback option is offered. */
+	/**
+	 * Narrator is bound to a chapter (git).
+	 *
+	 * Informational only: whether files can be reverted is answered by the preview,
+	 * which reports an empty change set for a workspace without snapshots.
+	 */
 	hasChapter?: boolean;
 	onEditAndRegenerate?: (
 		messageId: string,
 		newContent: string,
-		rollback: boolean,
+		revertOpts: { skipRevert: boolean; scope?: RevertScope },
 		opts?: {
 			keepImageIds: string[];
 			newImages: File[];
@@ -106,8 +112,10 @@ export function MessageEditorPanel({
 	blocks,
 	creator,
 	initialText,
-	isLastUserMessage,
-	hasChapter,
+	// `isLastUserMessage` and `hasChapter` are deliberately not destructured: the
+	// confirmation now follows from the server's preview, so neither influences this
+	// component. They stay on the props because both are threaded down a long chain
+	// (NarratorPanel → list → MessageBubble) and MessageBubble's memo compares them.
 	onEditAndRegenerate,
 	onEditAssistantMessage,
 	onClose,
@@ -117,6 +125,14 @@ export function MessageEditorPanel({
 
 	const [editContent, setEditContent] = useState(initialText);
 	const [showConfirmModal, setShowConfirmModal] = useState(false);
+	// Prefetched while the user is still typing, so the submit handler already knows
+	// whether anything would be destroyed. Works for subagents too: the endpoint keys
+	// off the narrator id alone, and a subagent has its own record and worktree.
+	const { data: revertPreview, isLoading: revertPreviewLoading } = useEditRegeneratePreview(
+		narratorId ?? "",
+		messageId,
+		isUser && !!narratorId && !!messageId,
+	);
 	// Existing image blocks kept during editing (user can remove some) + newly
 	// added image files. Only meaningful for user messages.
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON image blocks
@@ -284,7 +300,7 @@ export function MessageEditorPanel({
 	);
 
 	const submitUserEdit = useCallback(
-		async (rollback: boolean) => {
+		async (revertOpts: { skipRevert: boolean; scope?: RevertScope }) => {
 			if (!messageId || !onEditAndRegenerate || !canSubmitEdit || isSubmittingEditRef.current) {
 				return;
 			}
@@ -294,7 +310,7 @@ export function MessageEditorPanel({
 				const result: unknown = await onEditAndRegenerate(
 					messageId,
 					editContent.trim(),
-					rollback,
+					revertOpts,
 					buildEditImageOpts(),
 				);
 				// Only an explicit successful response may discard the draft attachments
@@ -323,8 +339,12 @@ export function MessageEditorPanel({
 			return;
 		}
 		if (!canSubmitEdit || isSubmittingEditRef.current) return;
-		if (isLastUserMessage) {
-			void submitUserEdit(false);
+		// Ask whenever the edit would destroy something the editor does not show: a
+		// file the rollback would change, or a later message it would delete. Only a
+		// preview that reports neither submits straight through — and then reverting
+		// is a no-op, so the choice would be meaningless anyway.
+		if (!editRevertNeedsConfirm(revertPreview)) {
+			void submitUserEdit({ skipRevert: false });
 			return;
 		}
 		setShowConfirmModal(true);
@@ -332,16 +352,16 @@ export function MessageEditorPanel({
 		editContent,
 		canSubmitEdit,
 		isUser,
-		isLastUserMessage,
 		messageId,
 		onEditAssistantMessage,
 		submitUserEdit,
 		onClose,
+		revertPreview,
 	]);
 
 	const submitEdit = useCallback(
-		(rollback: boolean) => {
-			void submitUserEdit(rollback);
+		(revertOpts: { skipRevert: boolean; scope?: RevertScope }) => {
+			void submitUserEdit(revertOpts);
 		},
 		[submitUserEdit],
 	);
@@ -565,75 +585,28 @@ export function MessageEditorPanel({
 					</Group>
 				</Stack>
 			</Paper>
-			<Modal
+			{/* The same dialog rollback-to-block uses: the scope choice, the exact files,
+			    and a history-only exit. Editing used to offer a "keep code changes"
+			    button the server ignored, so this is what makes the choice real. */}
+			<RevertScopeConfirmModal
 				opened={showConfirmModal}
-				onClose={() => {
+				title={t("editRevertConfirmTitle")}
+				description={
+					(revertPreview?.deletedMessageCount ?? 0) > 0
+						? t("editRevertConfirmDesc", { messageCount: revertPreview?.deletedMessageCount ?? 0 })
+						: t("editRevertConfirmDescNoMessages")
+				}
+				data={revertPreview}
+				isLoading={revertPreviewLoading}
+				submitting={isSubmittingEdit}
+				confirmWithRevertLabel={t("editRevertConfirmWithRevert")}
+				confirmNoFilesLabel={t("editRevertConfirmNoFiles")}
+				messagesOnlyLabel={t("editRevertConfirmMessagesOnly")}
+				onConfirm={submitEdit}
+				onCancel={() => {
 					if (!isSubmittingEdit) setShowConfirmModal(false);
 				}}
-				title={t("editConfirmTitle")}
-				centered
-				size="sm"
-			>
-				<Stack gap="md">
-					{hasChapter ? (
-						<>
-							<Text size="sm">{t("editConfirmDesc")}</Text>
-							<Stack gap="xs">
-								<Button
-									fullWidth
-									onClick={() => submitEdit(false)}
-									loading={isSubmittingEdit}
-									disabled={isSubmittingEdit}
-								>
-									{t("editConfirmKeep")}
-								</Button>
-
-								<Button
-									fullWidth
-									variant="light"
-									color="orange"
-									onClick={() => submitEdit(true)}
-									loading={isSubmittingEdit}
-									disabled={isSubmittingEdit}
-								>
-									{t("editConfirmRollback")}
-								</Button>
-								<Button
-									fullWidth
-									variant="subtle"
-									onClick={() => setShowConfirmModal(false)}
-									disabled={isSubmittingEdit}
-								>
-									{t("editCancel")}
-								</Button>
-							</Stack>
-						</>
-					) : (
-						<>
-							<Text size="sm">{t("editConfirmStandaloneDesc")}</Text>
-							<Stack gap="xs">
-								<Button
-									fullWidth
-									onClick={() => submitEdit(false)}
-									loading={isSubmittingEdit}
-									disabled={isSubmittingEdit}
-								>
-									{t("editConfirmProceed")}
-								</Button>
-
-								<Button
-									fullWidth
-									variant="subtle"
-									onClick={() => setShowConfirmModal(false)}
-									disabled={isSubmittingEdit}
-								>
-									{t("editCancel")}
-								</Button>
-							</Stack>
-						</>
-					)}
-				</Stack>
-			</Modal>
+			/>
 		</>
 	);
 }

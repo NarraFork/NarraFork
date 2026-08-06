@@ -40,6 +40,12 @@ export interface SpecWriteResult {
 	uri: string;
 	revisionId: string | null;
 	readonly: boolean;
+	/**
+	 * True when the edit was delivered to a working narrator as a cut-in user
+	 * message (it lands right after the current tool call). False when the
+	 * narrator was idle and the edit was queued as context instead.
+	 */
+	interjected?: boolean;
 }
 
 export const specApi = {

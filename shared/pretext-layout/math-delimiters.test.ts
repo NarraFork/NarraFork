@@ -158,6 +158,35 @@ describe("splitMathSegments", () => {
 	test("does not let inline math swallow an escaped dollar in the body", () => {
 		expect(splitMathSegments("$a\\$b$")).toEqual([{ kind: "inline-math", latex: "a\\$b" }]);
 	});
+
+	test("inline math does not span a newline", () => {
+		// The opening `$` must not pair with a `$` on the next line — this is what
+		// tore `$price` tables apart before the fix.
+		expect(splitMathSegments("first $x\nsecond $y$ here")).toEqual([
+			{ kind: "text", text: "first $x\nsecond " },
+			{ kind: "inline-math", latex: "y" },
+			{ kind: "text", text: " here" },
+		]);
+	});
+
+	test("inline math does not span a blank line", () => {
+		expect(splitMathSegments("a $x\n\nb $y$")).toEqual([
+			{ kind: "text", text: "a $x\n\nb " },
+			{ kind: "inline-math", latex: "y" },
+		]);
+	});
+
+	test("display math still spans single newlines", () => {
+		expect(splitMathSegments("$$\na+b\n$$")).toEqual([{ kind: "display-math", latex: "a+b" }]);
+	});
+
+	test("display math stops at a blank line", () => {
+		// An unmatched `$$` must not swallow the rest of the document.
+		expect(splitMathSegments("$$\na+b\n\nc $$d$$")).toEqual([
+			{ kind: "text", text: "$$\na+b\n\nc " },
+			{ kind: "display-math", latex: "d" },
+		]);
+	});
 });
 
 describe("splitMathOutsideCode", () => {
@@ -206,6 +235,25 @@ describe("splitMathOutsideCode", () => {
 		const text = "prose with `code` and\n    indented\nmore prose";
 		const segments = splitMathOutsideCode(text);
 		expect(segments.map((s) => (s.kind === "text" ? s.text : "")).join("")).toBe(text);
+	});
+
+	test("does not pair `$price` cells across table rows", () => {
+		// Regression for the vlist table bug: every row's `$…/秒` stayed literal, so
+		// no fake formula spans the `|---|` delimiter and the table survives.
+		const table = [
+			"| 模型 | 美元价 | 人民币 |",
+			"|---|---:|---:|",
+			"| Seedance 1.5 Pro | $0.0192/秒 | **¥0.130/秒** |",
+			"| Seedance 2.0 Mini | $0.032/秒 | **¥0.217/秒** |",
+		].join("\n");
+		const segments = splitMathOutsideCode(table);
+		expect(segments.every((s) => s.kind === "text")).toBe(true);
+		expect(segments.map((s) => (s.kind === "text" ? s.text : "")).join("")).toBe(table);
+	});
+
+	test("still detects a single-line formula inside a table cell", () => {
+		const segments = splitMathOutsideCode("| a | b |\n|---|---|\n| $x^2$ | y |");
+		expect(segments.some((s) => s.kind === "inline-math" && s.latex === "x^2")).toBe(true);
 	});
 });
 

@@ -870,10 +870,26 @@ export interface SidecarSpecData {
 }
 
 /**
+ * LOD threshold for the sidecar's visual form. Below it every record renders as
+ * a bare CollapsibleTrace (the low-LOD "bare row" paradigm, no card skin); at
+ * and above it each record is the full collapsible card. The threshold matches
+ * the tool-run fold boundary (L3 folds tools into traces, L4 keeps full cards),
+ * so a sidecar never reads as heavier than the tool rows beside it.
+ */
+export const SIDECAR_CARD_LOD_THRESHOLD: RenderLod = 4;
+
+/**
  * Build the sidecar specs for a list of records already filtered to one target.
- * One spec per record, each with its own expand state (`opts.expanded`, keyed by
- * the spec key so the reader folds cards independently — the redesign replaces
- * the chunked notice's single aggregate toggle with per-card folds).
+ *
+ * Two forms by LOD (the low-LOD redesign — one trace per record, not one card):
+ *
+ *   - LOW LOD (< SIDECAR_CARD_LOD_THRESHOLD): one `sidecar-trace` spec per
+ *     record — a bare CollapsibleTrace whose header shows the source label and
+ *     whose single row carries the preview, expanding to the full text. This is
+ *     the same bare-row paradigm the folded tool / reasoning traces use, so the
+ *     sidecar stops standing out as the only coloured Paper card on screen.
+ *   - HIGH LOD: one `sidecar` card per record, each with its own fold state
+ *     (the per-card fold the redesign chose over the chunked aggregate notice).
  */
 function buildSidecarSpecs(
 	sideCars: readonly AdapterSidecar[],
@@ -881,29 +897,41 @@ function buildSidecarSpecs(
 	ctx: AdapterContext,
 ): ElementSpec[] {
 	const specs: ElementSpec[] = [];
+	const lowLod = ctx.lod < SIDECAR_CARD_LOD_THRESHOLD;
 	for (let i = 0; i < sideCars.length; i++) {
 		const sc = sideCars[i];
 		if (!sc) continue;
 		const meta = SIDECAR_SOURCE_META[sc.source];
 		const key = `${keyBase}-sc${i}`;
 		const truncatedLabel = sysLabel(ctx, "sidecarTruncated");
-		specs.push({
-			kind: "sidecar",
-			key,
-			data: {
-				payloadKind: SIDECAR_PAYLOAD_KIND,
-				source: sc.source,
-				sourceLabel: meta
-					? sysLabel(ctx, meta.labelKey)
-					: sc.source || sysLabel(ctx, "sidecarUnknown"),
-				color: meta?.color ?? "gray",
-				target: sc.target,
-				previewText: sidecarPreviewText(sc.content),
-				fullText: sidecarDetailText(sc.content, truncatedLabel),
-				truncatedLabel,
-			} satisfies SidecarSpecData,
-			opts: { expanded: ctx.isExpanded?.(key) ?? false },
-		});
+		const sourceLabel = meta
+			? sysLabel(ctx, meta.labelKey)
+			: sc.source || sysLabel(ctx, "sidecarUnknown");
+		const data: SidecarSpecData = {
+			payloadKind: SIDECAR_PAYLOAD_KIND,
+			source: sc.source,
+			sourceLabel,
+			color: meta?.color ?? "gray",
+			target: sc.target,
+			previewText: sidecarPreviewText(sc.content),
+			fullText: sidecarDetailText(sc.content, truncatedLabel),
+			truncatedLabel,
+		};
+		if (lowLod) {
+			specs.push({
+				kind: "sidecar-trace",
+				key,
+				data,
+				opts: { expandedIndices: ctx.expandedRows?.(key) ?? [] },
+			});
+		} else {
+			specs.push({
+				kind: "sidecar",
+				key,
+				data,
+				opts: { expanded: ctx.isExpanded?.(key) ?? false },
+			});
+		}
 	}
 	return specs;
 }

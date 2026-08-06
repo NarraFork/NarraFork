@@ -17,6 +17,7 @@
  * the row's tool metadata (vlist-tool-meta.ts).
  */
 
+import type { RevertScope } from "../../../lib/api/narrators";
 import type { MessageContextMenuActions } from "../MessageContextMenuCtx";
 import type { VListToolMeta } from "./vlist-tool-meta";
 
@@ -45,7 +46,7 @@ export interface VListRowHandlers {
 	onEditAndRegenerate?: (
 		messageId: string,
 		newContent: string,
-		rollback: boolean,
+		revertOpts: { skipRevert: boolean; scope?: RevertScope },
 		opts?: {
 			keepImageIds: string[];
 			newImages: File[];

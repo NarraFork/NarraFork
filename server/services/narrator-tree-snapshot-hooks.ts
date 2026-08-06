@@ -32,6 +32,7 @@ import { db } from "../db";
 import { narratorMessages, narratorToolCalls } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { logger } from "../lib/logger";
+import { advanceChapterSnapshot } from "./chapter-snapshot-ref";
 import { specVfsService } from "./spec-vfs-service";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 import {
@@ -297,6 +298,19 @@ export async function recordTreeSnapshotAfter(
 				),
 			)
 			.returning({ messageId: narratorToolCalls.messageId });
+		// Link this state into the workspace's snapshot DAG. Done with the tree that
+		// was just captured rather than by re-capturing: `add -A` is the one cost here
+		// that scales with repository size, and it has already been paid.
+		//
+		// The lineage is what makes this boundary usable as a *fork or merge* endpoint,
+		// not just a rollback target: a bare tree has no ancestry, so two diverging
+		// workspaces have no computable merge base. Failure is tolerated — the boundary
+		// hashes above are already durable, so the worst case is that forking from this
+		// point falls back to the older commit-plus-replay path.
+		const linked = after
+			? await advanceChapterSnapshot(session.cwd, after, "narrator tool boundary")
+			: null;
+
 		// Mirror the resulting state onto the owning message so rolling back "to just
 		// after this message" has a boundary to restore. A later tool in the same
 		// message overwrites it, which is correct: the boundary is the state after the
@@ -304,7 +318,10 @@ export async function recordTreeSnapshotAfter(
 		if (after && updated?.messageId) {
 			await db
 				.update(narratorMessages)
-				.set({ treeHashAfter: after })
+				.set({
+					treeHashAfter: after,
+					...(linked && { snapshotCommitSha: linked.commitSha }),
+				})
 				.where(eq(narratorMessages.id, updated.messageId));
 		}
 	} catch (err) {

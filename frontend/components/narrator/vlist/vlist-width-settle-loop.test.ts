@@ -22,6 +22,7 @@
 
 import { describe, expect, it } from "bun:test";
 import {
+	isExternalGeometryChange,
 	isWidthFeedbackCycle,
 	pushCommittedWidth,
 	resolveWidthSettle,
@@ -395,6 +396,109 @@ describe("width settle loop — scrollbar feedback", () => {
 			expect(runFeedback(delta, true, 500).length).toBeLessThanOrEqual(WIDTH_CYCLE_RING);
 		});
 	}
+});
+
+/**
+ * REPEATED PANEL TOGGLES — the shape that wedged the column, reported from the app.
+ *
+ * "Open the right dock, close it, open, close, open — the fifth one never resizes the
+ * chat, and no amount of toggling fixes it after that."
+ *
+ * A toggle is real input with NO POINTER GESTURE: a button click, a keyboard shortcut,
+ * a restored layout. It flips the list between exactly two widths, which is the very
+ * A B A B alternation the cycle guard matches on — and `gesture-end` was the ring's
+ * only reset, so the ring filled up and never drained:
+ *
+ *     toggle 1 open  → commit, ring [600]
+ *     toggle 2 close → commit, ring [600 1000]
+ *     toggle 3 open  → commit, ring [600 1000 600]
+ *     toggle 4 close → commit, ring [600 1000 600 1000]
+ *     toggle 5 open  → PINNED, and so is every toggle after it
+ *
+ * What separates the two sources without a gesture is the OUTER BOX: a scrollbar moves
+ * `clientWidth` only, while a host resize moves `offsetWidth`. These tests drive the
+ * toggle loop with those two measurements to pin both directions — a toggle always
+ * commits, and feedback on a constant box is still bounded.
+ */
+describe("width settle loop — repeated programmatic panel toggles", () => {
+	/** Outer width the host gives the list, per dock state. */
+	const BOX_OPEN = 632;
+	const BOX_CLOSED = 1032;
+	/** Content column widths those boxes resolve to (gutters removed). */
+	const COLUMN_OPEN = 600;
+	const COLUMN_CLOSED = 1000;
+
+	/**
+	 * Toggle a dock panel `times` times with no pointer at all.
+	 *
+	 * @param reportBox false → omit the outer-box measurements, reproducing the shipped
+	 *                  behaviour so the regression stays visible.
+	 */
+	function runToggles(times: number, reportBox = true) {
+		let committedWidth = COLUMN_CLOSED;
+		let committedBoxWidth: number | undefined = reportBox ? BOX_CLOSED : undefined;
+		let recent: readonly number[] = [];
+		let open = false;
+		const commits: number[] = [];
+
+		for (let toggle = 0; toggle < times; toggle++) {
+			open = !open;
+			const boxWidth = reportBox ? (open ? BOX_OPEN : BOX_CLOSED) : undefined;
+			const nextWidth = open ? COLUMN_OPEN : COLUMN_CLOSED;
+			// The observer defers on the quiet period (no pointer), then the timer decides.
+			const deferral = resolveWidthSettle({
+				nextWidth,
+				committedWidth,
+				trigger: "observer",
+				pointerDown: false,
+				recentCommittedWidths: recent,
+				boxWidth,
+				committedBoxWidth,
+			});
+			const decision = deferral.defer
+				? resolveWidthSettle({
+						nextWidth,
+						committedWidth,
+						trigger: "timer",
+						pointerDown: false,
+						recentCommittedWidths: recent,
+						boxWidth,
+						committedBoxWidth,
+					})
+				: deferral;
+			if (!decision.commit) continue;
+			const external = isExternalGeometryChange(boxWidth, committedBoxWidth);
+			recent = external ? [] : pushCommittedWidth(recent, nextWidth);
+			committedWidth = nextWidth;
+			committedBoxWidth = boxWidth;
+			commits.push(nextWidth);
+		}
+		return commits;
+	}
+
+	// THE regression: every toggle must apply, however many came before it.
+	it("commits every toggle, including the fifth and beyond", () => {
+		const commits = runToggles(12);
+		expect(commits.length).toBe(12);
+		// Strictly alternating, so the column always matches the dock state.
+		for (const [index, width] of commits.entries()) {
+			expect(width).toBe(index % 2 === 0 ? COLUMN_OPEN : COLUMN_CLOSED);
+		}
+	});
+
+	// The exact reported count, called out so a partial fix cannot pass the case above
+	// by coincidence.
+	it("does not stop resizing at the fifth toggle", () => {
+		expect(runToggles(5).at(-1)).toBe(COLUMN_OPEN);
+		expect(runToggles(5).length).toBe(5);
+	});
+
+	// The pre-fix behaviour, kept as the counterexample: with no outer-box measurement
+	// the guard cannot tell a toggle from feedback, so it pins after four commits.
+	it("wedges after WIDTH_CYCLE_RING commits when the outer box is not reported", () => {
+		const commits = runToggles(12, false);
+		expect(commits.length).toBe(WIDTH_CYCLE_RING);
+	});
 });
 
 /**

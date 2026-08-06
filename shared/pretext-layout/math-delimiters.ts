@@ -165,14 +165,29 @@ export function splitMathOutsideCode(text: string): MathSegment[] {
 /**
  * Index of the closing `$`/`$$` for math opened at `from`, or -1 when absent.
  *
- * Inline math must not span a blank line: an unmatched `$` in prose would
- * otherwise swallow the rest of the document.
+ * Inline math must not span a newline at all. This is what keeps a table full of
+ * `$price` cells from being torn apart: the opening `$` of one row's `$0.0192/秒`
+ * would otherwise pair with the next `$` on a LATER row, swallowing the rows in
+ * between — including the `|---|` delimiter — into a fake "formula" and erasing
+ * the table before marked ever sees it. remark-math (the chunked path) follows
+ * CommonMark, where inline math cannot cross a line break, so this also keeps the
+ * two renderers in agreement.
+ *
+ * Display math may span single newlines (a multi-line `$$…$$` block is normal),
+ * but a BLANK line still ends the search: an unmatched `$$` in prose must not
+ * swallow the rest of the document.
  */
 function findClosingDollar(text: string, from: number, isDisplay: boolean): number {
 	for (let i = from; i < text.length; i++) {
 		const char = text[i];
 		if (char === "\\") {
 			i++; // skip the escaped character
+			continue;
+		}
+		if (char === "\n") {
+			// Inline math stops at any newline; display math stops only at a blank line.
+			if (!isDisplay) return -1;
+			if (text[i + 1] === "\n") return -1;
 			continue;
 		}
 		if (char !== "$") continue;

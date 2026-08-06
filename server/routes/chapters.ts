@@ -143,22 +143,28 @@ chapterRoutes.post("/:id/merge", async (c) => {
 	const parsed = mergeChapterSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	// Dirty check: ensure source and target worktrees are clean
 	const source = await db.query.chapters.findFirst({ where: eq(chapters.id, id) });
 	if (!source) throw new NotFoundError("Chapter", id);
-	if (source.worktreePath) {
-		const sourceStatus = await gitService.getStatus(source.worktreePath);
-		if (sourceStatus.trim()) {
-			return c.json({ error: "MERGE_DIRTY_SOURCE", code: "VALIDATION_ERROR" }, 400);
-		}
-	}
 	const target = await db.query.chapters.findFirst({
 		where: eq(chapters.id, parsed.data.targetChapterId),
 	});
-	if (target?.worktreePath) {
-		const targetStatus = await gitService.getStatus(target.worktreePath);
-		if (targetStatus.trim()) {
-			return c.json({ error: "MERGE_DIRTY_TARGET", code: "VALIDATION_ERROR" }, 400);
+
+	// Uncommitted changes are only a problem for the commit-based merge, which reads
+	// branch tips and would silently drop them. The default snapshot merge takes the
+	// workspaces as they are, so a dirty chapter is an ordinary state there rather
+	// than an error — refusing it was the very restriction being removed.
+	if (parsed.data.mode === "commit") {
+		if (source.worktreePath) {
+			const sourceStatus = await gitService.getStatus(source.worktreePath);
+			if (sourceStatus.trim()) {
+				return c.json({ error: "MERGE_DIRTY_SOURCE", code: "VALIDATION_ERROR" }, 400);
+			}
+		}
+		if (target?.worktreePath) {
+			const targetStatus = await gitService.getStatus(target.worktreePath);
+			if (targetStatus.trim()) {
+				return c.json({ error: "MERGE_DIRTY_TARGET", code: "VALIDATION_ERROR" }, 400);
+			}
 		}
 	}
 

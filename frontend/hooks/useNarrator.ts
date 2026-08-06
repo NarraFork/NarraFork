@@ -134,6 +134,25 @@ export function useRollbackPreview(
 	});
 }
 
+/**
+ * What editing a user message and regenerating would roll back.
+ *
+ * Prefetched as soon as the editor opens, so the submit handler already knows
+ * whether there is anything to confirm rather than deciding after the fact.
+ */
+export function useEditRegeneratePreview(
+	narratorId: string,
+	messageId: string | null,
+	enabled = false,
+) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "edit-regenerate-preview", messageId],
+		queryFn: () => api.getEditRegeneratePreview(narratorId, messageId as string),
+		enabled: enabled && !!messageId,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
+	});
+}
+
 /** What deleting one tool_use block would roll back, for its confirm dialog. */
 export function useBlockDeletePreview(
 	narratorId: string,

@@ -1,11 +1,4 @@
-import {
-	IconBook2,
-	IconClock,
-	IconDatabase,
-	IconFolders,
-	IconUsers,
-	IconWand,
-} from "@tabler/icons-react";
+import { IconBook2, IconClock, IconDatabase, IconFolders, IconWand } from "@tabler/icons-react";
 import type { ComponentType } from "react";
 
 /**
@@ -43,13 +36,6 @@ export const CUSTOMIZABLE_NAV_ITEMS: readonly NavItemDef[] = [
 		labelKey: "projects",
 		to: "/projects",
 		icon: IconFolders,
-	},
-	{
-		id: "groups",
-		labelKey: "groups",
-		to: "/groups",
-		icon: IconUsers,
-		activePrefix: "/groups",
 	},
 	{
 		id: "routines",

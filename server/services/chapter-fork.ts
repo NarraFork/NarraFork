@@ -3,6 +3,7 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { and, desc, eq, isNotNull, lte, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narratorMessageRefs, narratorMessages, narrators, projects } from "../db/schema";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
@@ -12,13 +13,20 @@ import type { Locale } from "../lib/prompt-i18n";
 import { slugify } from "../lib/slug";
 import { safeSpawn } from "../lib/spawn";
 import { chapterEdgeService } from "./chapter-edge-service";
+import { ensureChapterSnapshot } from "./chapter-snapshot-ref";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { FileHistoryError, rebuildFileStatesAtMessage } from "./file-state-rebuild";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
 import { portAllocator } from "./port-allocator";
-import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
+import {
+	SNAPSHOT_BASE_REF,
+	SNAPSHOT_HEAD_REF,
+	snapshotIncomingRef,
+	treeSnapshotKey,
+	worktreeTreeSnapshot,
+} from "./worktree-tree-snapshot";
 
 export interface ForkChapterInput {
 	title?: string;
@@ -164,37 +172,90 @@ export const chapterFork = {
 			await gitService.createWorktree(gitPath, worktreePath, branchName);
 			rollback.push(() => gitService.removeWorktree(gitPath, worktreePath));
 
-			// Step 1.5: Restore file state to match what the model saw at the fork message.
-			// The worktree is at the resolved commit, but the model may have made file
-			// changes (via Write/Edit/Bash) that weren't committed yet at that point.
+			// Step 1.5: Put the new worktree into the state the fork point actually
+			// describes.
 			//
-			// Preferred: copy the workspace tree snapshot recorded at that message. It is
-			// byte-exact and includes changes no tool input describes. Only history from
-			// before snapshots existed falls back to rebuilding files one by one.
+			// The worktree currently sits at a commit, and a commit is almost never the
+			// state anyone means by "fork from here": the parent's real state includes
+			// everything written since that commit. Copying the workspace snapshot is what
+			// closes that gap — byte-exact, and inclusive of writes no tool input
+			// describes (Bash, build scripts, the user's own editor).
+			//
+			// This runs whether or not a fork-point message was named. When none was, the
+			// intent is "fork from the parent as it is now", and the previous behaviour —
+			// silently starting from HEAD — discarded every uncommitted change the parent
+			// had. That was a real loss of work with no warning, and it is the main defect
+			// this step exists to remove.
 			let restoredFromTree = false;
-			if (forkMessage && parent.worktreePath) {
-				const treeHash = await this.resolveTreeHashForMessage(parentChapterId, forkMessage.id);
-				if (treeHash) {
+			let baseSnapshotCommit: string | null = null;
+			/**
+			 * Why the byte-exact restore did not happen, when a snapshot existed for the
+			 * fork point but could not be applied.
+			 *
+			 * Distinct from "no snapshot was available at all": here the exact state was
+			 * on record and the fork still ended up with a reconstruction, so the user
+			 * has to be told that what they got is an approximation.
+			 */
+			let snapshotRestoreError: string | null = null;
+			if (parent.worktreePath) {
+				const snapshot = forkMessage
+					? await this.resolveSnapshotForMessage(parentChapterId, forkMessage.id)
+					: await this.resolveCurrentSnapshot(parent.worktreePath);
+				if (snapshot) {
 					try {
-						await worktreeTreeSnapshot.restoreInto(parent.worktreePath, worktreePath, treeHash);
+						await worktreeTreeSnapshot.restoreInto(
+							parent.worktreePath,
+							worktreePath,
+							snapshot.treeHash,
+						);
 						restoredFromTree = true;
+						// Carry the parent's lineage over so the fork keeps a computable
+						// relationship to it. Without this the two workspaces share no
+						// ancestry, and a later merge would have no merge base to reason from —
+						// every overlapping edit would surface as a conflict.
+						baseSnapshotCommit = snapshot.commitSha
+							? await this.adoptParentLineage(parent.worktreePath, worktreePath, snapshot.commitSha)
+							: null;
 						logger.info("Restored forked worktree from tree snapshot", {
 							parentChapterId,
 							childChapterId: id,
-							treeHash,
+							treeHash: snapshot.treeHash,
+							baseSnapshotCommit,
+							forkedFromMessage: forkMessage != null,
 						});
 					} catch (err) {
+						// Remembered so the fallback below can say the state it produces is
+						// weaker than the one that was available. Replay reconstructs files from
+						// recorded Write/Edit inputs, so anything written by Bash, a build step
+						// or an external editor is absent from it — silently, which is how a
+						// fork could look complete while missing work the snapshot had captured
+						// byte-for-byte.
+						snapshotRestoreError = String(err);
 						logger.warn("Tree snapshot restore failed during fork; falling back to replay", {
 							parentChapterId,
 							childChapterId: id,
-							treeHash,
-							error: String(err),
+							treeHash: snapshot.treeHash,
+							error: snapshotRestoreError,
 						});
 					}
 				}
 			}
 
 			if (forkMessage && !restoredFromTree) {
+				// A snapshot existed for this fork point but could not be applied, so what
+				// follows is a reconstruction from recorded tool inputs rather than the exact
+				// state. Said once here, before the replay's own outcome is known, because
+				// the loss is caused by the failed restore either way: a replay that applies
+				// nothing (no recorded Write/Edit) leaves the worktree at the commit, and one
+				// that applies everything it has still cannot cover Bash or external writes.
+				if (snapshotRestoreError) {
+					warnings.push(
+						"The parent's exact workspace state could not be copied " +
+							`(${snapshotRestoreError}), so this fork was rebuilt from recorded file ` +
+							"edits instead. Changes made by shell commands or outside the narrator " +
+							"are not part of that record — check the worktree before continuing.",
+					);
+				}
 				try {
 					const fileStates = await this.resolveFileStatesForMessage(
 						parentChapterId,
@@ -264,6 +325,27 @@ export const chapterFork = {
 				}
 			}
 
+			// A fork with no named fork point has no replay path to fall back on: replay
+			// reconstructs state from recorded Write/Edit inputs, and without a message
+			// there is no point in the timeline to replay up to. So if the snapshot could
+			// not be applied, the worktree is sitting at a commit and any uncommitted
+			// parent work is absent. Say so — this case used to pass silently, which is
+			// how uncommitted work went missing without the user ever being told.
+			if (!forkMessage && !restoredFromTree && parent.worktreePath) {
+				const dirty = await gitService.getStatus(parent.worktreePath).catch(() => "");
+				if (dirty.trim().length > 0) {
+					logger.warn("Forked without the parent's uncommitted state", {
+						parentChapterId,
+						childChapterId: id,
+					});
+					warnings.push(
+						"The parent's uncommitted changes could not be captured, so this fork starts from " +
+							`its last commit (${commitSha.slice(0, 7)}) instead. Check the parent worktree ` +
+							"before continuing.",
+					);
+				}
+			}
+
 			// Step 2: Compute initial graph position
 			// Place close to the ruler (small crossOffset) and avoid overlapping existing chapters.
 			const NODE_CROSS_SIZE = 100; // approximate height of a chapter card + gap
@@ -316,6 +398,13 @@ export const chapterFork = {
 					parentChapterId,
 					forkPoint,
 					startCommitSha: commitSha,
+					// The narrative state this chapter starts from, independent of commits.
+					// `snapshotShadowKey` is recorded here rather than left to the first tool
+					// call so the ownership guard protects this worktree's lineage immediately —
+					// a chapter made dormant before running anything would otherwise have its
+					// shadow repository swept as an orphan.
+					snapshotCommitSha: baseSnapshotCommit,
+					snapshotShadowKey: treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath),
 					anchorCommitSha,
 					axisOffset,
 					crossOffset,
@@ -579,6 +668,89 @@ export const chapterFork = {
 	 * falls back to replaying recorded edits.
 	 */
 	async resolveTreeHashForMessage(chapterId: string, messageId: string): Promise<string | null> {
+		return (await this.resolveSnapshotForMessage(chapterId, messageId))?.treeHash ?? null;
+	},
+
+	/**
+	 * The parent workspace's current state, for a fork with no named fork point.
+	 *
+	 * Captures on demand rather than trusting the stored pointer, because "fork from
+	 * the parent as it is now" has to mean *now*: the user may have edited since the
+	 * last tool call, and starting from a stale boundary would drop exactly the
+	 * changes they expect to carry over.
+	 */
+	async resolveCurrentSnapshot(
+		parentWorktreePath: string,
+	): Promise<{ treeHash: string; commitSha: string | null } | null> {
+		const advanced = await ensureChapterSnapshot(parentWorktreePath, "fork point");
+		if (advanced) return { treeHash: advanced.treeHash, commitSha: advanced.commitSha };
+		// The DAG could not be extended (a non-git directory, a git failure). A bare
+		// capture still yields a forkable state, just without lineage.
+		const treeHash = await worktreeTreeSnapshot.tryCapture(parentWorktreePath);
+		return treeHash ? { treeHash, commitSha: null } : null;
+	},
+
+	/**
+	 * Copy the parent's snapshot lineage into the fork's shadow repository.
+	 *
+	 * Shadow repositories share no objects, so the fork cannot see the parent's
+	 * history until it is fetched across. Doing so is what preserves a merge base
+	 * between the two: afterwards both descend from the same snapshot commit inside
+	 * the fork's own repository, and it stays valid even if the parent chapter is
+	 * later deleted, because `fetch` copies objects rather than referencing them.
+	 *
+	 * Returns the adopted commit, or null when the lineage could not be transferred —
+	 * the fork still has correct bytes in that case, it just starts fresh ancestry.
+	 */
+	async adoptParentLineage(
+		parentWorktreePath: string,
+		worktreePath: string,
+		parentSnapshotCommit: string,
+	): Promise<string | null> {
+		try {
+			// Point a temporary ref at the exact fork commit: the parent's head may have
+			// moved past it (forking from an earlier message), and fetching the head would
+			// import a state the fork never observed.
+			const forkRef = snapshotIncomingRef(`fork-${generateShortId(8)}`);
+			await worktreeTreeSnapshot.setRef(parentWorktreePath, forkRef, parentSnapshotCommit);
+			const adopted = await worktreeTreeSnapshot.fetchSnapshotFrom(
+				worktreePath,
+				parentWorktreePath,
+				forkRef,
+				SNAPSHOT_BASE_REF,
+			);
+			if (!adopted) return null;
+			// The fork continues from where the parent left off, so its head starts there
+			// too; subsequent captures chain onto it.
+			await worktreeTreeSnapshot.setRef(worktreePath, SNAPSHOT_HEAD_REF, adopted);
+			return adopted;
+		} catch (err) {
+			logger.warn("Could not carry the parent's snapshot lineage into the fork", {
+				parentWorktreePath,
+				worktreePath,
+				parentSnapshotCommit,
+				error: String(err),
+			});
+			return null;
+		}
+	},
+
+	/**
+	 * Find the snapshot boundary to fork from, with its DAG position when it has one.
+	 *
+	 * The tree is what the new worktree is built from; the commit is what lets the
+	 * fork keep a computable relationship to its parent afterwards. A boundary
+	 * recorded before the DAG existed has only the tree, which still forks correctly —
+	 * it just starts a lineage of its own.
+	 *
+	 * Walks backwards from the fork point for the same reason commit resolution does:
+	 * a message with no tool calls took no snapshot of its own, but the state it
+	 * observed is the one the previous tool left behind.
+	 */
+	async resolveSnapshotForMessage(
+		chapterId: string,
+		messageId: string,
+	): Promise<{ treeHash: string; commitSha: string | null } | null> {
 		const primaryNarrator = await db.query.narrators.findFirst({
 			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
 			columns: { id: true },
@@ -595,7 +767,10 @@ export const chapterFork = {
 		if (!targetRef) return null;
 
 		const [row] = await db
-			.select({ treeHashAfter: narratorMessages.treeHashAfter })
+			.select({
+				treeHashAfter: narratorMessages.treeHashAfter,
+				snapshotCommitSha: narratorMessages.snapshotCommitSha,
+			})
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 			.where(
@@ -608,7 +783,8 @@ export const chapterFork = {
 			.orderBy(desc(narratorMessageRefs.seq))
 			.limit(1);
 
-		return row?.treeHashAfter ?? null;
+		if (!row?.treeHashAfter) return null;
+		return { treeHash: row.treeHashAfter, commitSha: row.snapshotCommitSha ?? null };
 	},
 
 	/**

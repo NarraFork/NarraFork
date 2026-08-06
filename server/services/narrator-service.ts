@@ -1157,7 +1157,6 @@ export async function prepareNarratorCreation(
 		displayHandle = input.handle.trim();
 		foldedHandle = foldHandle(displayHandle);
 		traits.push("named");
-		enabledToolsSet.add("GroupControl");
 	}
 
 	if (input.extraTraits?.length) {
@@ -1481,15 +1480,8 @@ export const narratorService = {
 			}
 			const currentTraits = parseTraits(narrator.traits);
 			const nextTraits = currentTraits.filter((t) => t !== "named");
-			let nextEnabledTools = narrator.enabledTools;
 			if (displayHandle) {
 				nextTraits.push("named");
-				const currentTools = Array.isArray(narrator.enabledTools)
-					? narrator.enabledTools.filter((tool): tool is string => typeof tool === "string")
-					: [];
-				if (!currentTools.includes("GroupControl")) {
-					nextEnabledTools = [...currentTools, "GroupControl"];
-				}
 			}
 			const [updated] = await db
 				.update(narrators)
@@ -1497,7 +1489,6 @@ export const narratorService = {
 					handle: displayHandle,
 					handleFold: foldedHandle,
 					traits: nextTraits,
-					enabledTools: nextEnabledTools,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))

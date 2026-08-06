@@ -56,6 +56,14 @@ export const mergeChapterSchema = z.object({
 	targetChapterId: z.string().min(1),
 	strategy: z.enum(["merge", "squash", "cherry-pick"]).optional(),
 	message: z.string().max(500).optional(),
+	/**
+	 * Which space the merge is carried out in.
+	 *
+	 * Omitted means "decide automatically", which prefers `snapshot` — merging the
+	 * workspaces as they stand, without requiring or creating commits. `commit` asks
+	 * for the historical behaviour, including its uncommitted-changes rejection.
+	 */
+	mode: z.enum(["snapshot", "commit"]).optional(),
 });
 
 export const mergeCheckSchema = z.object({

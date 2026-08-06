@@ -656,6 +656,12 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 					}
 					// The worktree's snapshot shadow repo is keyed by its path, so it is
 					// unreachable once the worktree is gone and would leak otherwise.
+					//
+					// Deliberately not forced. "No active chapter claims this directory" is
+					// not the same as "no chapter wants this history": a dormant chapter has
+					// no `worktreePath`, and if its worktree removal had failed the directory
+					// would still be here — sweeping it would then delete that chapter's
+					// entire snapshot lineage. The guard inside `destroy` declines those.
 					await worktreeTreeSnapshot.destroy(fullPath).catch((err) =>
 						logger.debug("Failed to remove tree snapshots for orphaned worktree", {
 							path: fullPath,

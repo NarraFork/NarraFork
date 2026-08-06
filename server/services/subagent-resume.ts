@@ -11,6 +11,7 @@ import { resolveEffectiveModel, resolveProvider } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
+import type { RevertScope, RevertWarning } from "./snapshot-revert";
 import { loadSubagentHistory } from "./subagent-executor";
 import {
 	claimManualOverride,
@@ -45,7 +46,10 @@ export interface ResumeSubagentInput {
 	retryToolUseId?: string;
 	editMessageId?: string;
 	editContent?: string;
-	editRollback?: boolean;
+	/** Roll back the truncated messages' file changes; defaults to true. */
+	editRevertFiles?: boolean;
+	/** How wide that rollback reaches; omitted means the server default. */
+	editRevertScope?: RevertScope;
 	editKeepImageIds?: string[];
 	editNewImages?: File[];
 	editKeepTextFilePaths?: string[];
@@ -84,6 +88,14 @@ export interface ResumeSubagentResult {
 	/** Resolves only after the restarted runner reaches its true terminal boundary. */
 	terminalCompletion?: Promise<string>;
 	userMessage?: Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>;
+	/**
+	 * Advisories from the file rollback a `regenerate_edited_message` resume ran.
+	 *
+	 * Reported here rather than logged, because a rollback can reach past the scope
+	 * the user picked, and editing a subagent message must surface that as plainly
+	 * as editing a primary narrator's does.
+	 */
+	revertWarnings?: RevertWarning[];
 }
 
 interface ActiveResumeRun {
@@ -318,6 +330,9 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 
 		const originToolUseId = await resolveSubagentOriginToolUseId(input.subagentId);
 		let effectiveInput = input;
+		// Set by the regenerate_edited_message branch below, then attached to every
+		// return path so the advisory is not lost between the rollback and the reply.
+		let editRevertWarnings: RevertWarning[] | undefined;
 		if (input.intent === "retry_denied_tool") {
 			if (!input.retryToolUseId) {
 				throw new ValidationError("retryToolUseId is required to retry a denied tool");
@@ -354,7 +369,6 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				effectiveInput.editContent,
 				effectiveInput.locale,
 				effectiveInput.replyInUserLanguage ?? false,
-				effectiveInput.editRollback ?? false,
 				{
 					keepImageIds: effectiveInput.editKeepImageIds,
 					newImages: effectiveInput.editNewImages,
@@ -362,11 +376,19 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 					newTextFiles: effectiveInput.editNewTextFiles,
 					userId: effectiveInput.createdBy,
 					deferContinuation: true,
+					revertFiles: effectiveInput.editRevertFiles ?? true,
+					...(effectiveInput.editRevertScope
+						? { revertScope: effectiveInput.editRevertScope }
+						: {}),
 				},
 			);
 			if (!edited.ok) {
 				throw new ValidationError("Cannot edit a subagent message while it is running");
 			}
+			// Carried out to the route: the rollback that just ran may have reached past
+			// the chosen scope, and the user has to hear about it here exactly as they
+			// would for a primary narrator.
+			editRevertWarnings = edited.warnings;
 			effectiveInput = { ...effectiveInput, intent: "retry_last_input" };
 		}
 		const manualClaim = manualOverride ? claimManualOverride(input.subagentId, "resume") : null;
@@ -438,6 +460,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 					resumedSuspendedRunner: true,
 					originToolUseId,
 					userMessage,
+					...(editRevertWarnings?.length ? { revertWarnings: editRevertWarnings } : {}),
 				};
 			} catch (error) {
 				releaseManualOverrideClaim(manualClaim);
@@ -538,6 +561,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				token,
 				terminalCompletion,
 				userMessage: started.userMessage,
+				...(editRevertWarnings?.length ? { revertWarnings: editRevertWarnings } : {}),
 			};
 		} catch (error) {
 			if (activeResumeRuns.get(input.subagentId)?.token === token) {

@@ -871,30 +871,6 @@ export type NarratorServerMessage =
 			subagentNarratorId: string;
 	  }
 	| {
-			/** A new message was posted in a chat group this narrator belongs to. */
-			type: "group_message";
-			/** The narrator member this broadcast is routed to (WS subscription key). */
-			narratorId: string;
-			groupId: string;
-			message: {
-				id: string;
-				groupId: string;
-				senderType: "user" | "narrator" | "system";
-				senderNarratorId: string | null;
-				senderUserId: string | null;
-				senderLabel: string;
-				content: string;
-				urgent: boolean;
-				createdAt: string;
-			};
-	  }
-	| {
-			/** A chat group was fully set up; sent only to the initiating user. */
-			type: "group:ready";
-			groupId: string;
-			title: string;
-	  }
-	| {
 			type: "spec_changed";
 			narratorId: string;
 			uri: string;

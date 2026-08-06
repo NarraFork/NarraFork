@@ -151,7 +151,13 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 			if (editVersionRef.current === savedVersion) {
 				setDirty(false);
 			}
-			notifications.show({ message: t("spec.saved"), color: "green", autoClose: 1500 });
+			// A working narrator gets the edit as a cut-in message right after its
+			// current tool call, so say so rather than implying it landed silently.
+			notifications.show({
+				message: result.interjected ? t("spec.savedInterjected") : t("spec.saved"),
+				color: "green",
+				autoClose: result.interjected ? 2500 : 1500,
+			});
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			if (msg.includes("conflict") || msg.includes("409")) {

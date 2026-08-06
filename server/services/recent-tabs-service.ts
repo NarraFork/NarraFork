@@ -16,7 +16,7 @@ import {
 	type RecentTabsSection,
 	type RecentTabType,
 } from "@shared/recent-tabs";
-import { and, asc, eq, gt, inArray, isNull, or } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, ne, or } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narrators,
@@ -189,13 +189,15 @@ function normalizeLegacyTab(value: unknown): PersistedRecentTab | null {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const raw = value as Record<string, unknown>;
 	const rawType = raw.type === "session" ? "narrator" : raw.type;
+	// "group" (chat-group) tabs are dropped: the feature was removed, so such a
+	// tab would render without a target route. The enum itself stays so historical
+	// rows still decode; they are filtered out on read (see readRows).
 	if (
 		rawType !== "chapter" &&
 		rawType !== "narrator" &&
 		rawType !== "project" &&
 		rawType !== "workspace" &&
-		rawType !== "subagent" &&
-		rawType !== "group"
+		rawType !== "subagent"
 	) {
 		return null;
 	}
@@ -386,11 +388,19 @@ function rowToTab(row: RecentTabRow): PersistedRecentTab {
 	return tab;
 }
 
+/**
+ * Chat groups were removed, but historical `type = "group"` rows are still in the
+ * table (the enum is kept so they decode). They have no route to open, so every
+ * read path excludes them at the SQL level — inside the query, so cursor/hasMore
+ * math on the paginated path stays consistent.
+ */
+const EXCLUDE_REMOVED_TAB_TYPES = ne(userRecentTabs.type, "group");
+
 function readRows(userId: string): RecentTabRow[] {
 	return db
 		.select()
 		.from(userRecentTabs)
-		.where(eq(userRecentTabs.userId, userId))
+		.where(and(eq(userRecentTabs.userId, userId), EXCLUDE_REMOVED_TAB_TYPES))
 		.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
 		.limit(RECENT_TABS_STORAGE_LIMIT + 1)
 		.all();
@@ -1243,6 +1253,7 @@ export async function listPage(
 			eq(userRecentTabs.userId, userId),
 			eq(userRecentTabs.section, section),
 			isNull(userRecentTabs.workspaceId),
+			EXCLUDE_REMOVED_TAB_TYPES,
 		);
 		const cursorWhere = decoded
 			? or(

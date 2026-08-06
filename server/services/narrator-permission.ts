@@ -10,7 +10,7 @@ import type {
 	PermissionHandlerOptions,
 	PermissionResult,
 } from "../lib/agent";
-import { analyzeShellCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
+import { analyzeShellCommand, type BashAnalysis, classifyFind } from "../lib/agent/bash-analyze";
 import type { ExecutionBackend, TargetPathSemantics } from "../lib/agent/execution/backend";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { resolveBackendPath, toolBaseCwd } from "../lib/agent/execution/path-resolve";
@@ -1893,18 +1893,45 @@ function classifyShellDanger(
 				"high",
 			);
 		}
-		if (name === "find" && (args.includes("-delete") || args.includes("-exec"))) {
-			if (isCommandWhitelisted(cmd, commandWhitelist)) continue;
-			return danger(
-				"Find is being used with deletion or command execution.",
-				["It can affect many matching files at once, including files the agent did not inspect."],
-				[
-					"Run the same find command without -delete/-exec first.",
-					"Apply changes to explicit paths.",
-				],
-				[`Command: ${cmd.text}`],
-				"high",
-			);
+		if (name === "find") {
+			// Reuse the shared classifier instead of deriving danger from the mere presence of
+			// `-exec`: `find … -exec cat {} \;` only reads, and reporting that as "high" made
+			// read-only inspection reflect even on the light reflection level.
+			const findClass = classifyFind(cmd.tokens);
+			if (findClass.kind !== "safe" && !isCommandWhitelisted(cmd, commandWhitelist)) {
+				if (findClass.kind === "unknown") {
+					return danger(
+						"Find runs a command NarraFork could not classify.",
+						[
+							"The executed command's side effects are unknown, and find applies it to every match.",
+							"In Bypass All mode this would otherwise execute without user approval.",
+						],
+						[
+							"Run the same find command without -exec first to see what it would match.",
+							"Invoke the command directly on explicit paths instead.",
+						],
+						[`Command: ${cmd.text}`, `Pattern: ${findClass.pattern}`],
+						"medium",
+					);
+				}
+				return danger(
+					findClass.kind === "dangerous"
+						? "Find is being used to delete files or run a destructive command."
+						: "Find applies a state-changing command to every match.",
+					[
+						"It can affect many matching files at once, including files the agent did not inspect.",
+						// -exec/-fprintf target paths live inside the expression, so they never reach
+						// `filePaths` and the worktree boundary check cannot see them.
+						"Paths written through the find expression are not covered by the worktree boundary check.",
+					],
+					[
+						"Run the same find command without -delete/-exec first.",
+						"Apply changes to explicit paths.",
+					],
+					[`Command: ${cmd.text}`, `Pattern: ${findClass.pattern}`],
+					"high",
+				);
+			}
 		}
 	}
 	if (chapterGitIssues.length > 0) {
@@ -4206,8 +4233,8 @@ export interface ResolvePermissionOpts {
 	userId?: string;
 	/**
 	 * Who decided this permission. `"user"`/`"auto"`/`"reflection"` are the built-in
-	 * deciders; `narrator:<id>` marks a proxy approval by a controlling named narrator
-	 * (chat-group "full control"). The value is persisted to permissionDecidedBy.
+	 * deciders; `narrator:<id>` only appears in historical rows written by the
+	 * removed proxy-approval path. The value is persisted to permissionDecidedBy.
 	 */
 	decidedBy?: "user" | "auto" | "reflection" | `narrator:${string}`;
 	exitPlanCancelled?: boolean;
@@ -4482,61 +4509,6 @@ export async function resolvePermissionOrDangerReflection(
 	}
 
 	return resolvePermission(requestId, decision, opts);
-}
-
-/**
- * Proxy-resolve a pending permission request on behalf of a controlling named
- * narrator (chat-group "full control"). Validates that the caller shares an
- * active chat group with the request's target narrator AND has canControl, then
- * resolves the request exactly like a user decision would (same recovery path),
- * recording the decider as `narrator:<callerId>` for audit.
- *
- * Returns { ok, reason } — ok=false with a human-readable reason when the caller
- * is not authorized or the request no longer exists.
- */
-export async function resolvePermissionAsNarrator(
-	requestId: string,
-	callerNarratorId: string,
-	decision: "allow" | "deny",
-	opts: { denyMessage?: string; feedbackText?: string } = {},
-): Promise<{ ok: boolean; reason?: string }> {
-	// Locate the target narrator for this request (pending permission or danger reflection).
-	const pendingPerm = pendingPermissions.get(requestId);
-	const pendingDanger = pendingPerm ? undefined : pendingDangerReflections.get(requestId);
-	const targetNarratorId = pendingPerm?.narratorId ?? pendingDanger?.narratorId;
-	if (!targetNarratorId) {
-		return { ok: false, reason: "Permission request not found or already resolved." };
-	}
-	if (targetNarratorId === callerNarratorId) {
-		return { ok: false, reason: "Cannot proxy-approve your own permission request." };
-	}
-
-	// Authorize: caller must share an active chat group with the target and have canControl.
-	const { chatGroupService } = await import("./chat-group-service");
-	const authorized = await chatGroupService.canControlNarrator(callerNarratorId, targetNarratorId);
-	if (!authorized) {
-		return {
-			ok: false,
-			reason:
-				"Not authorized: you must be a controlling member of a chat group that includes the target narrator.",
-		};
-	}
-
-	const resolved = await resolvePermissionOrDangerReflection(requestId, decision, {
-		denyMessage: opts.denyMessage,
-		feedbackText: opts.feedbackText,
-		decidedBy: `narrator:${callerNarratorId}`,
-	});
-	if (!resolved) {
-		return { ok: false, reason: "Permission request not found or already resolved." };
-	}
-	logger.info("Permission proxy-resolved by narrator", {
-		requestId,
-		callerNarratorId,
-		targetNarratorId,
-		decision,
-	});
-	return { ok: true };
 }
 
 function dangerReflectionSuggestions(

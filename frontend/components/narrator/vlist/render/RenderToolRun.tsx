@@ -47,6 +47,7 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconDots,
+	IconInfoCircle,
 	IconTool,
 } from "@tabler/icons-react";
 import { useEffect, useRef, useState } from "react";
@@ -91,14 +92,14 @@ function categoryColor(category: string | undefined): string {
 
 /** Header visual per variant (icon + tint). Tool traces gray, reasoning grape. */
 function variantHeaderColor(variant: TraceVariant): string {
-	return variant === "reasoning-steps" ? "grape" : "gray";
+	if (variant === "reasoning-steps") return "grape";
+	if (variant === "sidecar") return "indigo";
+	return "gray";
 }
 function VariantHeaderIcon({ variant }: { variant: TraceVariant }) {
-	return variant === "reasoning-steps" ? (
-		<IconBrain size={HEADER_INNER_ICON} />
-	) : (
-		<IconTool size={HEADER_INNER_ICON} />
-	);
+	if (variant === "reasoning-steps") return <IconBrain size={HEADER_INNER_ICON} />;
+	if (variant === "sidecar") return <IconInfoCircle size={HEADER_INNER_ICON} />;
+	return <IconTool size={HEADER_INNER_ICON} />;
 }
 
 /**
@@ -448,10 +449,34 @@ function TraceRowTitle({ row, shimmerClass }: { row: MeasuredTraceRow; shimmerCl
  *
  * ⚠️ The tail is anchored to its END. A plain `truncate` (`text-overflow: ellipsis`)
  * clips the RIGHT side, which on a live tail would hide precisely the newest
- * characters — the opposite of the point. `direction: rtl` moves the clip to the
- * left so the newest text stays pinned at the right edge and older text slides out,
- * and `unicode-bidi: plaintext` keeps the tail's own characters in their natural
- * order (without it, trailing latin/punctuation would be reordered).
+ * characters — the opposite of the point. `direction: rtl` on the CELL moves the
+ * clip to the left, so the newest text stays pinned at the right edge and older
+ * text slides out of view on the left.
+ *
+ * ⚠️ The cell HUGS its text (`flex: 0 1 auto`), so the right edge it anchors to is
+ * the end of the TEXT, not the end of the row. That distinction only shows up on a
+ * short tail: with a growing basis the cell spans the row's whole remainder, and a
+ * tail that fits was flung to the far right with a gap between it and the size
+ * readout it belongs to. Right-anchoring earns its keep only while the text
+ * overflows — which is exactly when a shrinking cell is at full width anyway.
+ *
+ * ⚠️ The tail text itself must then sit in an ISOLATED inner run
+ * (`direction: ltr; unicode-bidi: isolate`), and this pair is load-bearing:
+ *
+ *   - Isolation makes the whole tail ONE unit for the cell's bidi resolution, so
+ *     the RTL cell places it at its inline start (the right edge) and lets the
+ *     overflow hang off the left. Inside the unit, ordinary bidi resolution
+ *     resumes at an LTR base, so mixed scripts still read correctly.
+ *   - `unicode-bidi: plaintext` on the cell (what this used to do) is the exact
+ *     opposite: plaintext DERIVES the paragraph direction from the content's first
+ *     strong character and thereby IGNORES `direction: rtl`. Reasoning text starts
+ *     with Han/latin (both Bidi_Class L), so the row resolved as an LTR paragraph —
+ *     left-aligned, clipped on the right, hiding the newest characters. That is the
+ *     bug this shape fixes, so plaintext must not come back here.
+ *   - `<bdo dir="ltr">` (what `common/TruncatedPath` uses for file paths) would also
+ *     right-anchor the run, but it is an OVERRIDE: it would force RTL scripts inside
+ *     the reasoning text to render backwards. Isolation gets the same anchoring
+ *     without touching the tail's own bidi.
  *
  * Height-neutral: both cells sit inside the row's existing fixed line lane, so the
  * measure layer needs no change (the row is `TRACE_ROW_HEIGHT` either way).
@@ -480,24 +505,35 @@ function LiveTailText({
 				c="dimmed"
 				className={shimmerClass}
 				style={{
-					// `flex: 1` (unlike a settled title's `0 1 auto`) so the tail CLAIMS the
-					// row's leftover width instead of hugging its own text. A live row has no
-					// status glyph or duration to keep adjacent, so there is nothing to crowd
-					// — and hugging meant the trailing spacer ate the space the tail should
-					// use, leaving a short label on a wide row.
-					flex: 1,
+					// `0 1 auto` — HUG the tail's own text, shrinking only under pressure.
+					// The same basis a settled title uses, and for the same reason.
+					//
+					// ⚠️ NOT `flex: 1`. Claiming the row's whole leftover width makes the cell
+					// as wide as the row whatever the text measures, and since the text is
+					// right-anchored inside it (`direction: rtl` below), a tail that FITS got
+					// pushed to the far right edge — leaving a conspicuous gap between the
+					// size readout and the words it belongs to. Right-anchoring is only
+					// meaningful while the text OVERFLOWS; when it fits, the tail belongs
+					// beside its prefix like any other row label.
+					//
+					// Shrinking preserves the overflow case exactly: a long tail compresses
+					// the cell to the available width, so the box fills the row's remainder
+					// and the clip below still hides the OLD end.
+					flex: "0 1 auto",
 					minWidth: 0,
 					overflow: "hidden",
 					whiteSpace: "nowrap",
 					// Clip on the LEFT so the newest characters stay pinned at the right
-					// edge. No `textAlign` override: under `direction: rtl` the inline start
-					// IS the right edge, so leaving it alone keeps the text flush against the
-					// newest end (forcing `left` would strand a short tail away from it).
+					// edge of the cell. No `textAlign` override: under `direction: rtl` the
+					// inline start IS the right edge, and with the hugging basis above the
+					// cell is only wider than its text when nothing is being clipped anyway.
 					direction: "rtl",
-					unicodeBidi: "plaintext",
 				}}
 			>
-				{tail.tail}
+				{/* Isolated LTR run — the tail is ONE unit for the RTL cell (so it anchors
+				    right and overflows left) while keeping its own characters in natural
+				    order. See the header note on why plaintext / bdo are both wrong here. */}
+				<span style={{ direction: "ltr", unicodeBidi: "isolate" }}>{tail.tail}</span>
 			</Text>
 		</>
 	);
@@ -634,11 +670,12 @@ function TraceRowView({
 			{/* Eats the remaining width so the cells above stay left-packed. Zero-height,
 			    so it cannot affect the measured row.
 
-			    Omitted for a live-tail row: the tail cell is itself `flex: 1`, and two
-			    flexible siblings would SPLIT the leftover width, capping the tail at half
-			    the row — the same "too short on a wide row" symptom, just subtler. With no
-			    status/duration cells to keep left-packed, a live row needs no spacer. */}
-			{liveTail ? null : <Box style={{ flex: 1, minWidth: 0 }} />}
+			    Present on a live-tail row too, now that the tail cell HUGS its text
+			    (`flex: 0 1 auto`). It used to be omitted because the tail was `flex: 1`
+			    and two growing siblings would have split the leftover width between them.
+			    With a zero basis this spacer never competes for SHRINK either — shrink is
+			    weighted by base size, so a long tail still compresses alone. */}
+			<Box style={{ flex: 1, minWidth: 0 }} />
 		</Group>
 	);
 

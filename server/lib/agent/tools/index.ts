@@ -16,7 +16,6 @@ import {
 import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
 import { grepTool } from "./grep";
-import { groupControlTool } from "./group-control";
 import { knowledgeLibraryTool, knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
 import { knowledgeAdminTool } from "./knowledge-admin";
 import { knowledgeCreateTool, knowledgeEditTool } from "./knowledge-edit";
@@ -55,7 +54,6 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Browser", browserTool],
 	["ForkNarrator", forkNarratorTool],
 	["NarraForkAdmin", narraforkAdminTool],
-	["GroupControl", groupControlTool],
 	["PackList", packListTool],
 	["PackActivate", packActivateTool],
 	["PackDeactivate", packDeactivateTool],

@@ -136,6 +136,42 @@ describe("resize inputs cannot reach the layout at pixel resolution", () => {
 		expect(source).toMatch(/pointerDown:\s*pointerTracker\.isDown\(\)/);
 	});
 
+	// The OUTER-BOX measurement, without which a gesture-free host resize (a dock panel
+	// toggled from a button) is indistinguishable from scrollbar feedback — the ring
+	// filled with the panel's two widths and pinned the column from the FIFTH toggle
+	// onwards, permanently, because `gesture-end` was its only reset.
+	//
+	// A wiring guard because the pure-function tests pass either way: the exemption is
+	// only reachable if the shell actually measures and threads both widths.
+	it("threads the outer box width into the settle decision", () => {
+		const source = read("PretextExactMessageList.tsx");
+		const call = source.slice(
+			source.indexOf("resolveWidthSettle({"),
+			source.indexOf("});", source.indexOf("resolveWidthSettle({")),
+		);
+		expect(call).toMatch(/boxWidth[,:]/);
+		expect(call).toMatch(/committedBoxWidth[,:]/);
+		// Measured from the OUTER box. `clientWidth` excludes the scrollbar, so reading
+		// it here would make feedback look like a host resize and release the guard on
+		// exactly the loop it bounds.
+		expect(source).toMatch(/const\s+boxWidth\s*=\s*node\.offsetWidth\s*;/);
+	});
+
+	// A host resize must also RESET the cycle history, not merely bypass the guard once:
+	// leaving the alternation in the ring would pin the very next toggle instead.
+	it("clears the cycle history on a host resize as well as a gesture", () => {
+		const source = read("PretextExactMessageList.tsx");
+		const effect = source.slice(source.indexOf("const applyWidth = (trigger: WidthSettleTrigger)"));
+		const commitIndex = effect.indexOf("if (decision.commit) {");
+		expect(commitIndex).toBeGreaterThan(-1);
+		const branch = effect.slice(commitIndex, effect.indexOf("\t\t\treturn;", commitIndex));
+		expect(branch).toMatch(/isExternalGeometryChange\(\s*boxWidth\s*,\s*committedBoxWidth\s*\)/);
+		expect(branch).toMatch(/trigger\s*===\s*"gesture-end"\s*\|\|\s*externalGeometry/);
+		// And the reference the next comparison reads must advance with the commit, or
+		// every later frame would keep reporting the same resize as still external.
+		expect(branch).toMatch(/committedBoxWidth\s*=\s*boxWidth\s*;/);
+	});
+
 	// INVERTED from an earlier version of this guard, which REQUIRED cost inputs.
 	//
 	// Two cost predictors were tried and both silently disabled the freeze:

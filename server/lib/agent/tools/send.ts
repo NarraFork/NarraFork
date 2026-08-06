@@ -64,10 +64,9 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 export const sendTool: ToolDefinition = {
 	name: "Send",
 	description:
-		"Send a message to one or more accessible subagents or fellow chat-group members. " +
+		"Send a message to one or more accessible subagents. " +
 		"Primary narrators may send to their child subagents; subagents may send to sibling subagents. " +
 		'Subagents may also report progress to the narrator that launched them via the reserved target "parent" (or "main"), e.g. Send({ id: "parent", message: "..." }). ' +
-		"If you are a named narrator in a chat group, you may send to fellow group members by their @handle, id, or name. " +
 		"Use Send for new information, changed requirements, or concrete corrections—not for routine " +
 		"status checks after an Await timeout. Repeated messages can distract a working subagent. " +
 		"Set doInterrupt=true only when the current work must stop immediately; never use it merely " +

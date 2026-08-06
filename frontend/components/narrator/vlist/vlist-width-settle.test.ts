@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	bucketViewportHeight,
+	isExternalGeometryChange,
 	isWidthFeedbackCycle,
 	pushCommittedWidth,
 	resolveWidthSettle,
@@ -166,6 +167,116 @@ describe("isWidthFeedbackCycle", () => {
 	it("is safe on an empty or short history", () => {
 		expect(isWidthFeedbackCycle([], 700)).toBe(false);
 		expect(isWidthFeedbackCycle([700], 700)).toBe(false);
+	});
+});
+
+/**
+ * The OUTER BOX discriminator, which is what tells a gesture-free host resize (a dock
+ * panel toggled from a button) apart from scrollbar feedback.
+ *
+ * A vertical scrollbar lives inside the border box: it moves `clientWidth` and leaves
+ * `offsetWidth` alone. Everything external resizes the box itself.
+ */
+describe("isExternalGeometryChange", () => {
+	it("reports a changed outer box as external", () => {
+		expect(isExternalGeometryChange(1000, 600)).toBe(true);
+		expect(isExternalGeometryChange(600, 1000)).toBe(true);
+	});
+
+	// Scrollbar feedback: same box, different inner width. Must NOT read as external,
+	// or the cycle guard would be released on exactly the loop it exists to bound.
+	it("reports an unchanged outer box as not external", () => {
+		expect(isExternalGeometryChange(1000, 1000)).toBe(false);
+	});
+
+	// Rounded on both sides, matching the `changed` comparison and the ring, so a
+	// fractional wobble in a computed layout cannot masquerade as a host resize.
+	it("compares on rounded pixels", () => {
+		expect(isExternalGeometryChange(1000.4, 1000)).toBe(false);
+		expect(isExternalGeometryChange(1000.6, 1000)).toBe(true);
+	});
+
+	// "Cannot tell" must leave the guard in charge: a released guard costs the bounded
+	// oscillation it was added to stop, so absent measurements take the safe side.
+	it("is false when either side is unmeasured or not finite", () => {
+		expect(isExternalGeometryChange(undefined, 1000)).toBe(false);
+		expect(isExternalGeometryChange(1000, undefined)).toBe(false);
+		expect(isExternalGeometryChange(undefined, undefined)).toBe(false);
+		expect(isExternalGeometryChange(Number.NaN, 1000)).toBe(false);
+		expect(isExternalGeometryChange(Number.POSITIVE_INFINITY, 1000)).toBe(false);
+	});
+});
+
+/**
+ * A pinned cycle must be released by a HOST RESIZE, not only by a pointer gesture.
+ *
+ * The shipped guard reset its ring on `gesture-end` alone, so a dock panel toggled from
+ * a button — real input with no gesture — filled the ring with its own two widths and
+ * then pinned the column from the fifth toggle onwards, permanently.
+ */
+describe("resolveWidthSettle — outer-box exemption", () => {
+	const oscillating = (): readonly number[] => {
+		let ring: readonly number[] = [];
+		for (const w of [1000, 600, 1000, 600]) ring = pushCommittedWidth(ring, w);
+		return ring;
+	};
+
+	it("commits a pinned width when the outer box also changed", () => {
+		const decision = resolveWidthSettle({
+			nextWidth: 1000,
+			committedWidth: 600,
+			trigger: "timer",
+			pointerDown: false,
+			recentCommittedWidths: oscillating(),
+			boxWidth: 1032,
+			committedBoxWidth: 632,
+		});
+		expect(decision.commit).toBe(true);
+	});
+
+	// The exemption must be narrow: scrollbar feedback reports the SAME outer box, so
+	// the guard still bounds it.
+	it("still pins a cycle when the outer box did not change", () => {
+		const decision = resolveWidthSettle({
+			nextWidth: 1000,
+			committedWidth: 600,
+			trigger: "timer",
+			pointerDown: false,
+			recentCommittedWidths: oscillating(),
+			boxWidth: 1032,
+			committedBoxWidth: 1032,
+		});
+		expect(decision.commit).toBe(false);
+		expect(decision.defer).toBe(false);
+	});
+
+	// The exemption releases the CYCLE GUARD only. A sash drag changes `offsetWidth`
+	// every frame, so letting it bypass the deferral would reinstate the per-frame
+	// rebuild the freeze exists to prevent.
+	it("does not let a changed outer box bypass the pointer-drag deferral", () => {
+		const decision = resolveWidthSettle({
+			...base,
+			pointerDown: true,
+			boxWidth: 1032,
+			committedBoxWidth: 632,
+		});
+		expect(decision.commit).toBe(false);
+		expect(decision.defer).toBe(true);
+		expect(decision.deferForMs).toBe(WIDTH_POINTER_BACKSTOP_MS);
+	});
+
+	// Omitting both fields must behave exactly as before, so the option cannot change
+	// behaviour anywhere it is not wired.
+	it("is unaffected when no box widths are supplied", () => {
+		const decision = resolveWidthSettle({
+			nextWidth: 1000,
+			committedWidth: 600,
+			trigger: "timer",
+			pointerDown: false,
+			recentCommittedWidths: oscillating(),
+		});
+		expect(decision.commit).toBe(false);
+		expect(decision.defer).toBe(false);
 	});
 });
 

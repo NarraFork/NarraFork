@@ -93,6 +93,7 @@ sqlite.exec(`
 		edited_by TEXT,
 		original_content_json TEXT,
 		tree_hash_after TEXT,
+		snapshot_commit_sha TEXT,
 		created_at TEXT NOT NULL
 	);
 	CREATE TABLE narrator_message_refs (

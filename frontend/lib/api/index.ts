@@ -1,6 +1,5 @@
 import { authApi } from "./auth";
 import { chaptersApi } from "./chapters";
-import { chatGroupsApi } from "./chat-groups";
 import { BASE } from "./client";
 import { devicesApi } from "./devices";
 import { gitApi } from "./git";
@@ -31,7 +30,6 @@ export const api = {
 	...gitApi,
 	...integrationsApi,
 	...miscApi,
-	...chatGroupsApi,
 	...knowledgeApi,
 	...specApi,
 	...devicesApi,
@@ -56,7 +54,6 @@ export {
 	type SsoProvider,
 	type TotpSetupResult,
 } from "./auth";
-export type { ChatGroup, ChatGroupMember, ChatGroupMessage, ChatGroupSummary } from "./chat-groups";
 export {
 	ApiError,
 	absorbRenewedToken,

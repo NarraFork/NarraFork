@@ -21,6 +21,22 @@
 /** Max number of animation keys retained before oldest entries are evicted. */
 export const STREAM_ANIM_MAX_KEYS = 512;
 
+/**
+ * Largest append (in code units) still treated as "freshly typed" and animated.
+ *
+ * A real delta is tens of characters. Anything far larger is a JUMP, not typing:
+ * a reconnect snapshot, a fresh mount whose key already carried text, or a body
+ * that was rewritten. Animating a jump mounts one blurred span PER GRAPHEME for
+ * the whole body at once — tens of thousands of compositor layers each running a
+ * `filter: blur()` keyframe, which froze the tab outright (the text sat at the
+ * animation's `opacity: 0` start frame, so only inline-code chip backgrounds were
+ * visible). Past this bound the frame is SEALED instead: the text simply appears.
+ *
+ * Chosen well above any plausible single delta and far below the point where the
+ * span count costs anything.
+ */
+export const STREAM_ANIM_MAX_APPEND = 512;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Grapheme segmentation (mirrors MarkdownContent.segmentMarkdownText)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,6 +99,16 @@ export function commonPrefixLength(previous: string, next: string): number {
 	return offset;
 }
 
+/**
+ * Bound the animated span of a frame to its trailing STREAM_ANIM_MAX_APPEND code
+ * units. `boundary` is where new text starts; pushing it forward shrinks what
+ * animates and never grows it, so a normal delta passes through untouched.
+ */
+export function clampAnimBoundary(boundary: number, totalLength: number): number {
+	const floor = totalLength - STREAM_ANIM_MAX_APPEND;
+	return boundary < floor ? floor : boundary;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Animation boundary store — per animKey previous-text memory across frames
 // ─────────────────────────────────────────────────────────────────────────────
@@ -113,14 +139,28 @@ export class StreamAnimStore {
 	 * AnimatedMarkdownText:
 	 *   - first sighting of a key → boundary = fullText.length (no animation, so
 	 *     a reconnect / narrator switch doesn't flash the whole block);
-	 *   - pure append (next starts with prev) → boundary = prev length;
-	 *   - otherwise (rewrite/reset) → boundary = common-prefix length.
+	 *   - pure append (next starts with prev) → boundary = prev length, clamped to
+	 *     the trailing STREAM_ANIM_MAX_APPEND window;
+	 *   - NOT an append (rewrite / reset / front-truncation) → boundary =
+	 *     fullText.length, i.e. sealed, nothing animates.
+	 *
+	 * The non-append case used to animate from the common-prefix point, and that is
+	 * what hung the tab. A jump is not typing, and it hits EVERY block of the body
+	 * in the same frame — so a per-block window cannot bound it, only refusing to
+	 * animate can. Causes seen in practice: a stale entry left by another narrator
+	 * under the same `__streaming__`-derived key, a reconnect snapshot, a retry that
+	 * rewrites the body, and the front-truncation `appendStreamingTextPreview`
+	 * applies past its 120k cap. Each mounted one blurred span PER GRAPHEME for the
+	 * whole body at once — tens of thousands of `filter: blur()` layers, with the
+	 * text stuck at the keyframe's `opacity: 0` so only inline-code chip
+	 * backgrounds were visible.
 	 */
 	peekBoundary(animKey: string, fullText: string): number {
 		const prev = this.entries.get(animKey);
 		if (prev === undefined) return fullText.length;
-		if (fullText.startsWith(prev.text)) return prev.len;
-		return commonPrefixLength(prev.text, fullText);
+		// A jump is sealed outright; only genuine growth animates.
+		if (!fullText.startsWith(prev.text)) return fullText.length;
+		return clampAnimBoundary(prev.len, fullText.length);
 	}
 
 	/**

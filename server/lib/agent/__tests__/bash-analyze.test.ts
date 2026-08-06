@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
+import type { DangerInfo } from "../../../lib/agent";
 import {
 	classifyDanger,
 	createDangerFingerprint,
 	isInsideWorktree,
 	resolvePermissionDecision,
+	shouldTriggerDangerReflection,
 } from "../../../services/narrator-permission";
 import { analyzeBashCommand, analyzePowerShellCommand, type BashAnalysis } from "../bash-analyze";
 import {
@@ -414,6 +416,12 @@ describe("prompt injection: indirect execution", () => {
 	test("find -exec rm", () => expectBlocked('find / -name "*.log" -exec rm {} \\;'));
 	test("find -execdir", () => expectBlocked('find / -name "*.sh" -execdir chmod +x {} \\;'));
 	test("find without -exec → allow", () => expectAllowed("find . -name '*.ts' -type f"));
+	test("find -exec with a read-only command → allow", () =>
+		expectAllowed('find src -name "*.ts" -exec cat -n {} \\;'));
+	test("find -exec with a whitelisted side-effect command → allow (whitelist semantics)", () =>
+		expectAllowed('find src -name "*.ts" -exec cp {} /tmp/ \\;'));
+	test("find -exec with an unknown command → block", () =>
+		expectBlocked('find src -name "*.ts" -exec mystery {} \\;'));
 
 	test("eval 'rm -rf /'", () => expectBlocked('eval "rm -rf /"'));
 	test("exec rm -rf /", () => expectBlocked("exec rm -rf /"));
@@ -1672,6 +1680,85 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				bashAnalysis: analysis,
 			}),
 		).toBe("allow");
+	});
+});
+
+// ══════════════════════════════════════════════════════════
+// find 危险分级 — 危险反思档位的输入
+// ══════════════════════════════════════════════════════════
+
+/**
+ * `find -exec` 曾被一律判为 high，导致 `find … -exec cat -n {} \;` 这种纯读取
+ * 在"宽松"反思档（阈值 = high）也会触发危险反思暂停。分级现在跟随被执行的命令，
+ * 所以这里同时钉住 severity 和自动放行语义。
+ */
+describe("find danger severity", () => {
+	async function findDanger(command: string) {
+		const analysis = await analyzeBashCommand(command, CWD);
+		return classifyDanger("Bash", { command }, CWD, analysis);
+	}
+
+	test("-exec with a read-only command is not dangerous", async () => {
+		expect(await findDanger('find src -name "*.ts" -exec cat -n {} \\;')).toBeNull();
+		expect(await findDanger('find src -name "*.ts" -exec grep -n TODO {} +')).toBeNull();
+	});
+
+	test("plain search is not dangerous", async () => {
+		expect(await findDanger('find src -name "*.ts" -type f')).toBeNull();
+		// `-o` is the OR operator here, not an output file.
+		expect(await findDanger("find . -name a -o -name b")).toBeNull();
+	});
+
+	test("-delete and -exec rm stay high", async () => {
+		expect((await findDanger("find . -name '*.log' -delete"))?.severity).toBe("high");
+		expect((await findDanger("find . -name '*.log' -exec rm {} \\;"))?.severity).toBe("high");
+	});
+
+	test("-exec with a whitelisted side-effect command is high, not silently allowed", async () => {
+		// `cp` is whitelisted, so the analyzer records no dangerous pattern — but find applies
+		// it to every match and the destination never reaches `filePaths`, so the reflection
+		// layer must still treat it as high.
+		const danger = await findDanger('find src -name "*.ts" -exec cp {} /tmp/ \\;');
+		expect(danger?.severity).toBe("high");
+		expect(danger?.details?.join("\n")).toContain("side effects on every match");
+	});
+
+	test("-fprintf writes to files and stays high", async () => {
+		const danger = await findDanger("find . -name '*.ts' -fprintf /tmp/out.txt '%p\\n'");
+		expect(danger?.severity).toBe("high");
+	});
+
+	test("-exec with an unknown command is medium (unclassified, not proven dangerous)", async () => {
+		expect((await findDanger('find src -name "*.ts" -exec mystery {} \\;'))?.severity).toBe(
+			"medium",
+		);
+	});
+
+	test("read-only -exec no longer reflects on any level; -exec rm still does", async () => {
+		const readOnly = await findDanger(
+			'find composeApp/src/commonMain -name "SshEndpointResolver.kt" -exec cat -n {} \\;',
+		);
+		expect(readOnly).toBeNull();
+
+		const destructive = await findDanger("find . -name '*.log' -exec rm {} \\;");
+		expect(destructive).not.toBeNull();
+		expect(shouldTriggerDangerReflection(destructive as DangerInfo, "light")).toBe(true);
+
+		// Unclassified -exec is medium: the "light" level intentionally lets unknown/unclassified
+		// Bash through, while "standard" still pauses for it.
+		const unknown = await findDanger('find src -name "*.ts" -exec mystery {} \\;');
+		expect(shouldTriggerDangerReflection(unknown as DangerInfo, "light")).toBe(false);
+		expect(shouldTriggerDangerReflection(unknown as DangerInfo, "standard")).toBe(true);
+	});
+
+	test("an explicit command whitelist entry clears the find danger", async () => {
+		const command = 'find src -name "*.ts" -exec cp {} /tmp/ \\;';
+		const analysis = await analyzeBashCommand(command, CWD);
+		expect(
+			classifyDanger("Bash", { command }, CWD, analysis, [], [
+				{ pattern: "find *", enabled: true },
+			] as never),
+		).toBeNull();
 	});
 });
 

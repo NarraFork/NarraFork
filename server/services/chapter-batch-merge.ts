@@ -62,6 +62,22 @@ function sourceIdAt(session: MergeSessionRow): string | null {
 	return session.currentSourceChapterId ?? session.sourceChapterIds[session.currentIndex] ?? null;
 }
 
+/**
+ * The in-flight snapshot merge coordinates, reset to null.
+ *
+ * Applied at every exit from `waiting_decision`, because `preMergeTree` is not a
+ * record of what happened — it is a live instruction to restore the worktree, read
+ * by cancellation and by the startup sweep. Once the conflict is resolved or the
+ * merge is abandoned, that instruction has to stop existing, or a later reader would
+ * roll the worktree back past work it should have kept.
+ */
+const CLEARED_SNAPSHOT_MERGE_STATE = {
+	preMergeTree: null,
+	conflictTree: null,
+	preMergeTargetSnapshot: null,
+	mergeSourceSnapshot: null,
+} as const;
+
 export const chapterBatchMerge = {
 	/**
 	 * Orchestrate a batch merge:
@@ -211,6 +227,16 @@ export const chapterBatchMerge = {
 					.set({
 						status: "waiting_decision",
 						conflictFiles,
+						// A snapshot merge leaves no git state behind, so how to finish or
+						// abort it has to be written down. Persisted rather than kept in memory
+						// because the decision arrives in a later request, possibly after a
+						// restart — and a lost pre-merge tree would strand the worktree with
+						// conflict markers and no way back.
+						preMergeTree: result.snapshotState?.preMergeTree ?? null,
+						conflictTree: result.snapshotState?.conflictTree ?? null,
+						preMergeTargetSnapshot: result.snapshotState?.targetSnapshot ?? null,
+						mergeSourceSnapshot: result.snapshotState?.sourceSnapshot ?? null,
+						preMergeTargetSha: result.snapshotState?.preMergeTargetSha ?? null,
 						updatedAt: conflictNow,
 					})
 					.where(eq(mergeSessions.id, input.mergeSessionId));
@@ -359,10 +385,44 @@ export const chapterBatchMerge = {
 		}
 
 		if (decision === "cancel") {
+			// A cancelled snapshot merge has to be undone explicitly. The commit path can
+			// rely on `git merge --abort`, but here the conflicted tree was written straight
+			// into the worktree — leaving it would hand the user a directory full of
+			// conflict markers with no pending merge to abort.
+			//
+			// Gated on `waiting_decision` for the same reason the continue branch is, and
+			// here it is destructive rather than merely wasteful: restoring writes the
+			// pre-merge tree over the worktree, so a second cancellation — a double click,
+			// a re-delivered WebSocket frame, a cancel arriving after startup already
+			// restored this session — would discard everything done since the first one.
+			// Only a session still awaiting a decision has a conflicted tree to undo.
+			const restorable = session.status === "waiting_decision" && !!session.preMergeTree;
+			if (restorable && target.worktreePath) {
+				try {
+					await chapterMerge.abortInteractiveSnapshotMerge(
+						target.worktreePath,
+						session.preMergeTree as string,
+					);
+				} catch (err) {
+					logger.error("Failed to restore the worktree after cancelling a snapshot merge", {
+						mergeSessionId,
+						targetChapterId: session.targetChapterId,
+						preMergeTree: session.preMergeTree,
+						error: String(err),
+					});
+				}
+			}
 			const now = new Date().toISOString();
 			await db
 				.update(mergeSessions)
-				.set({ status: "cancelled", error: "User cancelled on conflict", updatedAt: now })
+				.set({
+					status: "cancelled",
+					error: "User cancelled on conflict",
+					// The merge is dissolved, so its coordinates must not survive to route
+					// another restore at this tree.
+					...CLEARED_SNAPSHOT_MERGE_STATE,
+					updatedAt: now,
+				})
 				.where(eq(mergeSessions.id, mergeSessionId));
 			eventBus.emit({
 				type: "merge:cancelled",
@@ -382,14 +442,31 @@ export const chapterBatchMerge = {
 			return;
 		}
 
-		const result = await chapterMerge.completeInteractiveConflictMerge(
-			sourceId,
-			{
-				targetChapterId: session.targetChapterId,
-				strategy: session.strategy,
-			},
-			undefined,
-		);
+		// A session carrying snapshot state was started in snapshot mode, so it has to be
+		// finished the same way: there is no git merge in progress for the commit path to
+		// conclude.
+		const result = session.preMergeTree
+			? await chapterMerge.completeInteractiveSnapshotMergeById(
+					sourceId,
+					session.targetChapterId,
+					session.strategy,
+					{
+						preMergeTree: session.preMergeTree,
+						conflictTree: session.conflictTree ?? session.preMergeTree,
+						targetSnapshot: session.preMergeTargetSnapshot ?? "",
+						sourceSnapshot: session.mergeSourceSnapshot ?? "",
+						preMergeTargetSha: session.preMergeTargetSha ?? null,
+						conflictFiles: session.conflictFiles ?? [],
+					},
+				)
+			: await chapterMerge.completeInteractiveConflictMerge(
+					sourceId,
+					{
+						targetChapterId: session.targetChapterId,
+						strategy: session.strategy,
+					},
+					undefined,
+				);
 		if (!result.resolved) {
 			const remainingFiles = result.remainingFiles ?? [];
 			await chapterMerge.ensurePendingMergeEdge(
@@ -429,6 +506,12 @@ export const chapterBatchMerge = {
 				mergedCount,
 				conflictFiles: null,
 				error: null,
+				// This conflict is resolved and recorded, so its coordinates are spent.
+				// Leaving them would be actively harmful rather than untidy: the session
+				// goes back to `running` while the queue advances, and a restart in that
+				// window would find a non-null `preMergeTree` and restore the worktree to
+				// the state before a merge that has already completed.
+				...CLEARED_SNAPSHOT_MERGE_STATE,
 				updatedAt: now,
 			})
 			.where(eq(mergeSessions.id, mergeSessionId));
@@ -504,27 +587,107 @@ export const chapterBatchMerge = {
 	/**
 	 * Mark stale sessions (running/ai_resolving/waiting_decision) as error on server startup.
 	 * These sessions were interrupted by a server restart.
+	 *
+	 * A stale SNAPSHOT merge cannot just be marked: its conflicted tree was written
+	 * straight into the target worktree, and `preMergeTree` is the only way back. Once
+	 * the session is `error` nothing reaches `resolveDecision` any more — the decision
+	 * only arrives over WebSocket, and the notification that carried it died with the
+	 * previous process — so the recorded tree would become dead data while the user is
+	 * left holding a directory full of conflict markers with no UI path to undo it.
+	 * That is exactly the restart the tree was persisted to survive, so the restore
+	 * happens here, before the row stops being actionable.
 	 */
 	async cleanupStaleSessions(): Promise<void> {
-		const now = new Date().toISOString();
 		const staleStatuses = ["running", "ai_resolving", "waiting_decision"] as const;
 		const stale = await db.query.mergeSessions.findMany({
 			where: inArray(mergeSessions.status, [...staleStatuses]),
 		});
 		if (stale.length === 0) return;
 
-		await db
-			.update(mergeSessions)
-			.set({
-				status: "error",
-				error: "Server restarted during merge",
-				updatedAt: now,
-			})
-			.where(inArray(mergeSessions.status, [...staleStatuses]));
+		// Only snapshot-mode sessions left bytes on disk. The commit path has git's own
+		// half-finished merge state, which `git merge --abort` can still resolve later.
+		const snapshotStale = stale.filter((session) => session.preMergeTree !== null);
+		const restored: string[] = [];
+		for (const session of snapshotStale) {
+			const outcome = await this.restoreStaleSnapshotWorktree(session);
+			if (outcome.restored) restored.push(session.id);
+			const now = new Date().toISOString();
+			await db
+				.update(mergeSessions)
+				.set({
+					status: "error",
+					error: outcome.restored
+						? "Server restarted during merge; the target worktree was restored to its pre-merge state"
+						: `Server restarted during merge; the target worktree may still contain conflict markers (${outcome.reason})`,
+					// Cleared whether or not the restore succeeded. These coordinates describe
+					// a merge that can no longer be completed, and `resolveDecision` reads
+					// `preMergeTree` to route a cancellation — a leftover value would let a
+					// stale decision overwrite whatever the user has done since the restart
+					// with pre-merge bytes.
+					...CLEARED_SNAPSHOT_MERGE_STATE,
+					updatedAt: now,
+				})
+				.where(eq(mergeSessions.id, session.id));
+		}
+
+		const remaining = stale
+			.filter((session) => session.preMergeTree === null)
+			.map((session) => session.id);
+		if (remaining.length > 0) {
+			const now = new Date().toISOString();
+			await db
+				.update(mergeSessions)
+				.set({
+					status: "error",
+					error: "Server restarted during merge",
+					updatedAt: now,
+				})
+				.where(inArray(mergeSessions.id, remaining));
+		}
 
 		logger.info("Cleaned up stale merge sessions", {
 			count: stale.length,
 			ids: stale.map((s) => s.id),
+			snapshotSessions: snapshotStale.length,
+			worktreesRestored: restored.length,
 		});
+	},
+
+	/**
+	 * Return one interrupted snapshot merge's target worktree to its pre-merge bytes.
+	 *
+	 * Never throws: this runs during startup over every stale session, so one
+	 * unrestorable worktree must not stop the others from being cleaned up. The reason
+	 * is returned instead, to be recorded on the session where the user can see it.
+	 */
+	async restoreStaleSnapshotWorktree(
+		session: MergeSessionRow,
+	): Promise<{ restored: boolean; reason?: string }> {
+		const preMergeTree = session.preMergeTree;
+		if (!preMergeTree) return { restored: false, reason: "no pre-merge tree recorded" };
+		try {
+			const target = await chapterService.getById(session.targetChapterId);
+			if (!target?.worktreePath) {
+				// Nothing to restore into. The snapshot itself still exists in the shadow
+				// repository, so waking the chapter can recover the state.
+				return { restored: false, reason: "target chapter has no worktree" };
+			}
+			await chapterMerge.abortInteractiveSnapshotMerge(target.worktreePath, preMergeTree);
+			logger.info("Restored a worktree left conflicted by an interrupted snapshot merge", {
+				mergeSessionId: session.id,
+				targetChapterId: session.targetChapterId,
+				preMergeTree,
+			});
+			return { restored: true };
+		} catch (err) {
+			const reason = err instanceof Error ? err.message : String(err);
+			logger.error("Could not restore a worktree left conflicted by an interrupted merge", {
+				mergeSessionId: session.id,
+				targetChapterId: session.targetChapterId,
+				preMergeTree,
+				error: reason,
+			});
+			return { restored: false, reason };
+		}
 	},
 };

@@ -105,7 +105,10 @@ export function pushCommittedWidth(recent: readonly number[], width: number): re
  *  1. A pointer gesture is external input, and `gesture-end` is checked BEFORE this
  *     guard — so a drag (or drag back) always commits and always clears the ring.
  *     Feedback has no gesture: it runs entirely on observer → quiet timer.
- *  2. Feedback is driven by a BINARY cause (the scrollbar is present or it is not), so
+ *  2. Feedback leaves the viewport's OUTER box untouched (see
+ *     `isExternalGeometryChange`), so a host that resizes the box is recognised
+ *     without a gesture and bypasses this guard entirely.
+ *  3. Feedback is driven by a BINARY cause (the scrollbar is present or it is not), so
  *     it can only ever produce two widths, strictly alternating. Requiring the full
  *     A B A B pattern means a pointer-free resize (OS window chrome) has to land on
  *     exactly two alternating pixel widths four times in a row to be mistaken for it,
@@ -113,7 +116,8 @@ export function pushCommittedWidth(recent: readonly number[], width: number): re
  *     it and the alternation test below stops matching.
  *
  * So the guard pins only a width that has already proven it oscillates, and any real
- * input — a gesture, or a width the cycle could not have produced — releases it.
+ * input — a gesture, a box resize, or a width the cycle could not have produced —
+ * releases it.
  */
 export function isWidthFeedbackCycle(recent: readonly number[], nextWidth: number): boolean {
 	if (recent.length < WIDTH_CYCLE_RING) return false;
@@ -123,6 +127,55 @@ export function isWidthFeedbackCycle(recent: readonly number[], nextWidth: numbe
 	if (a === b || a !== c || b !== d) return false;
 	// ...and this commit would be the next hop of that same alternation.
 	return Math.round(nextWidth) === a;
+}
+
+/**
+ * Whether the viewport's OUTER BOX changed size — i.e. the host resized this list.
+ *
+ * ── The failure this exists for ───────────────────────────────────────────────
+ *
+ * The cycle guard above separates feedback from real input on the assumption that real
+ * input arrives as a POINTER GESTURE, which clears the ring. A dockview panel toggled
+ * from a button (or a keyboard shortcut, or a layout restore) is real input with NO
+ * gesture at all, and toggling it flips the list between exactly two widths — the same
+ * A B A B shape the guard is built to recognise. Measured against the shipped guard:
+ *
+ *     toggle 1 open  → commit, ring [600]
+ *     toggle 2 close → commit, ring [600 1000]
+ *     toggle 3 open  → commit, ring [600 1000 600]
+ *     toggle 4 close → commit, ring [600 1000 600 1000]
+ *     toggle 5 open  → PINNED — and every toggle after it, forever
+ *
+ * The ring never drains, because `gesture-end` is its only reset and a programmatic
+ * toggle never produces one. So the fifth toggle wedged the column at the wrong width
+ * permanently, which is exactly the reported behaviour.
+ *
+ * ── Why the outer box is the right discriminator ──────────────────────────────
+ *
+ * A vertical scrollbar lives INSIDE the border box: its appearance moves `clientWidth`
+ * and leaves `offsetWidth` alone. Every external cause — a sash drag, a panel toggle,
+ * a window resize, a layout restore — resizes the box itself. So the two sources are
+ * distinguishable structurally, with no gesture, no clock and no content assumption:
+ *
+ *     scrollbar feedback  → clientWidth moves, offsetWidth constant
+ *     host resized us     → offsetWidth moves
+ *
+ * This only ever RELEASES the cycle guard; it never bypasses the pointer-drag
+ * deferral, which is checked separately and still holds a sash drag to one commit on
+ * release (a drag changes `offsetWidth` on every frame, so bypassing the deferral here
+ * would reinstate the per-frame rebuild the freeze exists to prevent).
+ *
+ * Unmeasured (`undefined`) on either side means "cannot tell", which reports false and
+ * leaves the guard in charge — the conservative direction, since a wrongly released
+ * guard only costs the bounded oscillation it was added to stop.
+ */
+export function isExternalGeometryChange(
+	boxWidth: number | undefined,
+	committedBoxWidth: number | undefined,
+): boolean {
+	if (boxWidth === undefined || committedBoxWidth === undefined) return false;
+	if (!Number.isFinite(boxWidth) || !Number.isFinite(committedBoxWidth)) return false;
+	return Math.round(boxWidth) !== Math.round(committedBoxWidth);
 }
 
 /** What prompted this evaluation. */
@@ -163,6 +216,17 @@ export interface WidthSettleInput {
 	 * or short means "not enough history", which can never pin a width.
 	 */
 	recentCommittedWidths?: readonly number[];
+	/**
+	 * The viewport's OUTER (border-box) width right now, e.g. `offsetWidth`.
+	 *
+	 * Paired with `committedBoxWidth` to recognise a host-driven resize that carries no
+	 * pointer gesture — a dock panel toggled from a button is the case that mattered.
+	 * See `isExternalGeometryChange`. Omit (both of them) to keep the previous
+	 * behaviour, where only a gesture could release the cycle guard.
+	 */
+	boxWidth?: number;
+	/** The outer width recorded when the committed width was last committed. */
+	committedBoxWidth?: number;
 }
 
 const NO_ACTION: WidthSettleDecision = { commit: false, defer: false, deferForMs: 0 };
@@ -217,9 +281,19 @@ export function resolveWidthSettle(input: WidthSettleInput): WidthSettleDecision
 	// shape, so a future non-monotone element cannot reopen the failure.
 	//
 	// Pinning is not a wedge: the width keeps painting at the last committed value, and
-	// any external input releases it (a gesture takes the branch above; a genuinely new
-	// width breaks the alternation the ring is matching on).
-	if (isWidthFeedbackCycle(input.recentCommittedWidths ?? [], input.nextWidth)) {
+	// any external input releases it (a gesture takes the branch above; a resized outer
+	// box takes the `isExternalGeometryChange` exemption; a genuinely new width breaks
+	// the alternation the ring is matching on).
+	//
+	// The outer-box exemption is what makes a GESTURE-FREE host resize — a dock panel
+	// toggled from a button — external input rather than "the fifth hop of a cycle".
+	// Without it the ring filled with the panel's two widths and pinned the column
+	// permanently from the fifth toggle on, because `gesture-end` is its only reset and
+	// a programmatic toggle never produces one.
+	if (
+		!isExternalGeometryChange(input.boxWidth, input.committedBoxWidth) &&
+		isWidthFeedbackCycle(input.recentCommittedWidths ?? [], input.nextWidth)
+	) {
 		return NO_ACTION;
 	}
 

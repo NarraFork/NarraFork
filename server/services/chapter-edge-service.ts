@@ -138,7 +138,16 @@ class ChapterEdgeService {
 		projectId: string,
 		sourceId: string,
 		targetId: string,
-		metadata: { mergeCommitSha?: string; strategy: string; status?: "pending" | "completed" },
+		metadata: {
+			mergeCommitSha?: string;
+			/**
+			 * Set instead of `mergeCommitSha` when the merge happened in snapshot space
+			 * and produced no git commit.
+			 */
+			mergeSnapshotCommitSha?: string;
+			strategy: string;
+			status?: "pending" | "completed";
+		},
 	) {
 		const existing = await db.query.chapterEdges.findFirst({
 			where: and(

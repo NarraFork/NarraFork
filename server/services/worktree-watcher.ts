@@ -23,6 +23,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { isNativeWatcherEnabled, ParcelRecursiveWatcher } from "../lib/watcher/parcel-watcher";
+import { advanceChapterSnapshot } from "./chapter-snapshot-ref";
 import { commitSyncService } from "./commit-sync-service";
 import { recordAttributions, wasRecentlyAttributed } from "./file-attribution-service";
 import { gitService } from "./git-service";
@@ -537,6 +538,11 @@ export const worktreeWatcher = {
 		// A boundary here is what makes an external edit revertable at all.
 		const treeHash = await worktreeTreeSnapshot.tryCapture(worktreePath, LOCAL_DEVICE_ID);
 		if (treeHash) {
+			// Link it into the snapshot DAG with the tree just captured. Without this the
+			// lineage would only advance on narrator tool calls, so a fork taken after
+			// the user edited in their own editor — or after a build script wrote — would
+			// start from a state that predates those writes and silently lose them.
+			await advanceChapterSnapshot(worktreePath, treeHash, "external workspace change");
 			eventBus.emit({
 				type: "chapter:external_change_recorded",
 				chapterId: entry.chapterId,

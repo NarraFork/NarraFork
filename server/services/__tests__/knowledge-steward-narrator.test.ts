@@ -126,7 +126,7 @@ describe("create() preinstall", () => {
 		).rejects.toThrow();
 	});
 
-	test("named + knowledge steward coexist: enabledTools merges GroupControl + knowledge tools", async () => {
+	test("named + knowledge steward coexist: naming does not clobber the knowledge toolset", async () => {
 		const narrator = await narratorService.create({
 			kind: "knowledge",
 			makeNamed: true,
@@ -135,9 +135,7 @@ describe("create() preinstall", () => {
 			locale: "en",
 		});
 		const tools = (narrator.enabledTools as string[] | null) ?? [];
-		// Named contributes GroupControl…
-		expect(tools).toContain("GroupControl");
-		// …and knowledge contributes its toolset — neither clobbers the other.
+		// Knowledge contributes its toolset; naming only adds the trait/handle.
 		for (const t of KNOWLEDGE_KIND_PRELOAD_TOOLS) expect(tools).toContain(t);
 		// No duplicates.
 		expect(new Set(tools).size).toBe(tools.length);

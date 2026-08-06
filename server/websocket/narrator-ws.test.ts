@@ -204,9 +204,9 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 		getNarratorConnections().add(unindexed.ws);
 
 		broadcastToUser("user-1", {
-			type: "group:ready",
-			groupId: "group-1",
-			title: "Group 1",
+			type: "user:recent_tabs_snapshot",
+			tabs: [],
+			revision: 1,
 		});
 		expect(first.sent).toHaveLength(1);
 		expect(otherUser.sent).toHaveLength(0);
@@ -214,26 +214,26 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 
 		handleNarratorWS.close(first.ws);
 		broadcastToUser("user-1", {
-			type: "group:ready",
-			groupId: "group-2",
-			title: "Group 2",
+			type: "user:recent_tabs_snapshot",
+			tabs: [],
+			revision: 2,
 		});
 		expect(first.sent).toHaveLength(1);
 
 		const broken = openFakeWs({ userId: "user-1" });
 		broken.setThrowOnSend(true);
 		broadcastToUser("user-1", {
-			type: "group:ready",
-			groupId: "group-3",
-			title: "Group 3",
+			type: "user:recent_tabs_snapshot",
+			tabs: [],
+			revision: 3,
 		});
 		expect(getNarratorConnections().has(broken.ws)).toBe(false);
 
 		broken.setThrowOnSend(false);
 		broadcastToUser("user-1", {
-			type: "group:ready",
-			groupId: "group-4",
-			title: "Group 4",
+			type: "user:recent_tabs_snapshot",
+			tabs: [],
+			revision: 4,
 		});
 		expect(broken.sent).toHaveLength(0);
 	});

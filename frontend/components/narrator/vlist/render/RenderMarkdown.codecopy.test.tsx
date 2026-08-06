@@ -23,7 +23,7 @@
  * panel looked like it had none. It must step aside in that case, and only then.
  */
 
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -35,11 +35,15 @@ const CONTENT_WIDTH = 800;
 const CODE = "const a = 1;\nconst b = 2;\nconsole.log(a + b);";
 
 let makeMouseEvent: (type: string) => Event;
+let previousWindow: unknown;
+let previousDocument: unknown;
 
 beforeAll(() => {
 	installCanvasStub();
 	const { window: win } = parseHTML("<!doctype html><html><body></body></html>");
 	const g = globalThis as unknown as Record<string, unknown>;
+	previousWindow = g.window;
+	previousDocument = g.document;
 	g.window = win;
 	g.document = win.document;
 	g.navigator = win.navigator;
@@ -52,15 +56,24 @@ beforeAll(() => {
 	// root listener the same way, which is all `onMouseEnter/Leave` needs.
 	const EventCtor = (win as unknown as { Event: typeof Event }).Event;
 	makeMouseEvent = (type: string) => new EventCtor(type, { bubbles: true, cancelable: true });
-	if (typeof g.matchMedia !== "function") {
-		g.matchMedia = () => ({
-			matches: false,
-			addEventListener: () => {},
-			removeEventListener: () => {},
-			addListener: () => {},
-			removeListener: () => {},
-		});
-	}
+	// Installed on THIS window — unconditionally, and not on globalThis.
+	//
+	// Both matter. `VListCodeCopyButton` reads `window.matchMedia` to decide whether
+	// the pointer can hover at all (the touch branch, covered by
+	// RenderMarkdown.codecopy-touch.test.tsx), and every assertion below describes
+	// the HOVER surface: a query that matches would make the button permanently
+	// visible and this whole file meaningless. A `globalThis` stub does not serve
+	// that read, because the line above rebinds `globalThis.window` to a fresh
+	// linkedom window; and the old `typeof !== "function"` guard made the stub
+	// order-dependent — whichever suite installed one first won, across files.
+	(win as unknown as Record<string, unknown>).matchMedia = (query: string) => ({
+		media: query,
+		matches: false,
+		addEventListener: () => {},
+		removeEventListener: () => {},
+		addListener: () => {},
+		removeListener: () => {},
+	});
 	if (typeof g.ResizeObserver !== "function") {
 		g.ResizeObserver = class {
 			observe() {}
@@ -75,6 +88,14 @@ beforeAll(() => {
 	if (typeof g.cancelAnimationFrame !== "function") {
 		g.cancelAnimationFrame = (handle: number) => clearTimeout(handle as unknown as Timer);
 	}
+});
+
+// Hand the globals back, so a suite that ran before this one keeps its own DOM
+// (and its own matchMedia) if it has any work left.
+afterAll(() => {
+	const g = globalThis as unknown as Record<string, unknown>;
+	g.window = previousWindow;
+	g.document = previousDocument;
 });
 
 interface Rendered {

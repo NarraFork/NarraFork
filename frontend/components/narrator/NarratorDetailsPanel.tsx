@@ -34,7 +34,6 @@ import {
 	IconInfoCircle,
 	IconRefresh,
 	IconSearch,
-	IconUsers,
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -42,7 +41,6 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from "
 import { useTranslation } from "react-i18next";
 import { useBrowserSessions } from "../../hooks/useBrowserSessions";
 import { useChapter } from "../../hooks/useChapters";
-import { useNarratorGroups } from "../../hooks/useChatGroup";
 import {
 	useBlacklistDirs,
 	useClearBlockedSkills,
@@ -362,21 +360,11 @@ export function NarratorDetailsPanel({
 	const { data: cmdWhitelist } = useCmdWhitelist(opened ? narratorId : "");
 	const { data: cmdBlacklist } = useCmdBlacklist(opened ? narratorId : "");
 	const { data: narratorSkills } = useNarratorSkills(narratorId, opened);
-	// Named narrators can participate in chat groups — surface them here.
-	// biome-ignore lint/suspicious/noExplicitAny: narrator is loosely typed (ApiEntity)
-	const isNamed = Array.isArray((narrator as any)?.traits)
-		? // biome-ignore lint/suspicious/noExplicitAny: loose
-			((narrator as any).traits as string[]).includes("named")
-		: false;
 	// biome-ignore lint/suspicious/noExplicitAny: narrator is loosely typed (ApiEntity)
 	const isKnowledgeSteward = Array.isArray((narrator as any)?.traits)
 		? // biome-ignore lint/suspicious/noExplicitAny: loose
 			((narrator as any).traits as string[]).includes("knowledge-steward")
 		: false;
-	const { data: narratorGroupsData } = useNarratorGroups(
-		opened && isNamed ? narratorId : undefined,
-	);
-	const narratorGroups = narratorGroupsData?.groups ?? [];
 	const refreshNarratorSkillsMutation = useRefreshNarratorSkills();
 
 	const resolvedModel =
@@ -1087,36 +1075,6 @@ export function NarratorDetailsPanel({
 						/>
 					) : null}
 				</DetailsPanelSection>
-
-				{isNamed ? (
-					<DetailsPanelSection
-						id="groups"
-						title={t("details.groups")}
-						badge={narratorGroups.length || null}
-						searchableText={narratorGroups.map((g) => g.title || "")}
-					>
-						{narratorGroups.length === 0 ? (
-							<Text size="sm" c="dimmed">
-								{t("details.groupsEmpty")}
-							</Text>
-						) : (
-							<Stack gap="xs">
-								{narratorGroups.map((g) => (
-									<Button
-										key={g.id}
-										variant="default"
-										size="xs"
-										justify="flex-start"
-										leftSection={<IconUsers size={14} />}
-										onClick={() => navigate({ to: "/groups/$groupId", params: { groupId: g.id } })}
-									>
-										{g.title || t("details.groupUntitled")}
-									</Button>
-								))}
-							</Stack>
-						)}
-					</DetailsPanelSection>
-				) : null}
 
 				<DetailsPanelSection
 					id="skills"

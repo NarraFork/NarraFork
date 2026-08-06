@@ -5,6 +5,7 @@ import {
 	getPromptTokenFootprint,
 } from "@shared/pretext-layout/turn-usage";
 import type { SideCarRecord } from "../../lib/api";
+import type { RevertScope } from "../../lib/api/narrators";
 import { formatLocaleNumber } from "../../lib/intl-format";
 import { ActivityTrace } from "./ActivityTrace";
 import { BlurInOnAppear } from "./BlurInOnAppear";
@@ -465,7 +466,7 @@ export function renderTreeMessages(
 	onEditAndRegenerate?: (
 		messageId: string,
 		newContent: string,
-		rollback: boolean,
+		revertOpts: { skipRevert: boolean; scope?: RevertScope },
 		opts?: {
 			keepImageIds: string[];
 			newImages: File[];

@@ -57,7 +57,6 @@ import {
 	IconRobot,
 	IconShield,
 	IconTerminal2,
-	IconUsers,
 	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -469,20 +468,6 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 
 	const handleGlobalEvent = useCallback(
 		(event: { type: string; [key: string]: unknown }) => {
-			if (event.type === "group:ready" && typeof event.groupId === "string") {
-				const groupId = event.groupId;
-				const title = (event.title as string) || t("groupChat");
-				addRecentTab({ type: "group", id: groupId, title });
-				notifications.show({
-					title: t("groupCreatedTitle"),
-					message: t("groupCreatedMessage", { title }),
-					color: "grape",
-					autoClose: 6000,
-					style: { cursor: "pointer" },
-					onClick: () => navigate({ to: "/groups/$groupId", params: { groupId } }),
-				});
-				return;
-			}
 			if (
 				event.type === "user:recent_tabs_delta" &&
 				typeof event.baseRevision === "number" &&
@@ -533,7 +518,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				void refreshRecentTabsLoadedWindow(qc, { reset: true }).catch(() => {});
 			}
 		},
-		[flushTabPatches, navigate, qc, t],
+		[flushTabPatches, navigate, qc],
 	);
 
 	const lastReconnectRefreshRef = useRef(0);
@@ -1388,7 +1373,6 @@ function TabIcon({
 			<IconGitBranch size={size} color={iconColor} fill={filledStatus ? "currentColor" : "none"} />
 		);
 	} else if (tab.type === "subagent") icon = <IconRobot size={size} color={iconColor} />;
-	else if (tab.type === "group") icon = <IconUsers size={size} color={iconColor} />;
 	else {
 		icon = filledStatus ? (
 			<IconMessageCircleFilled size={size} color={iconColor} />
@@ -1554,9 +1538,6 @@ export function isTabActive(tab: RecentTab, pathname: string): boolean {
 	}
 	if (tab.type === "workspace") {
 		return pathname === `/narrators/workspace/${tab.id}`;
-	}
-	if (tab.type === "group") {
-		return pathname === `/groups/${tab.id}`;
 	}
 	// narrator and subagent both route to /narrators/:id
 	return pathname === `/narrators/${tab.id}`;
@@ -1843,9 +1824,7 @@ const SortableTabItem = React.memo(function SortableTabItem({
 				? `/narrators/${tab.narratorId}`
 				: tab.type === "workspace"
 					? `/narrators/workspace/${tab.id}`
-					: tab.type === "group"
-						? `/groups/${tab.id}`
-						: `/narrators/${tab.id}`;
+					: `/narrators/${tab.id}`;
 	const iconColor = getRecentTabIconColor(tab);
 	const filledStatus = isFilledRecentTabStatus(tab);
 

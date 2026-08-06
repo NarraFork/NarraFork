@@ -227,7 +227,6 @@ beforeAll(async () => {
 				content: string,
 				locale: string,
 				replyInUserLanguage: boolean,
-				rollback: boolean,
 				options: Record<string, unknown>,
 			) => {
 				if (narratorId === "n1" || narratorId === "n2") {
@@ -237,7 +236,6 @@ beforeAll(async () => {
 						content,
 						locale as "en",
 						replyInUserLanguage,
-						rollback,
 						options,
 					);
 				}
@@ -247,7 +245,6 @@ beforeAll(async () => {
 					content,
 					locale,
 					replyInUserLanguage,
-					rollback,
 					options,
 				});
 				return { ok: true };
@@ -595,7 +592,6 @@ describe("resumeSubagent", () => {
 			actor: "user",
 			editMessageId: "user-message-to-edit",
 			editContent: "edited prompt",
-			editRollback: true,
 			editKeepImageIds: ["old-image"],
 			editNewImages: [image],
 			editKeepTextFilePaths: ["/work/old.txt"],
@@ -613,7 +609,6 @@ describe("resumeSubagent", () => {
 				content: "edited prompt",
 				locale: "en",
 				replyInUserLanguage: true,
-				rollback: true,
 				options: {
 					keepImageIds: ["old-image"],
 					newImages: [image],
@@ -621,6 +616,8 @@ describe("resumeSubagent", () => {
 					newTextFiles: [textFile],
 					userId: "user-5",
 					deferContinuation: true,
+					// Omitted by the caller => revert, the behaviour every edit had.
+					revertFiles: true,
 				},
 			},
 		]);
@@ -629,6 +626,32 @@ describe("resumeSubagent", () => {
 			prompt: "edited prompt",
 			persistPrompt: false,
 			userId: "user-5",
+		});
+		await finishRun(subagentId);
+	});
+
+	// Guards the wiring that made this bug possible: editing a subagent message goes
+	// through resumeSubagent rather than calling editAndRegenerate, so a dropped field
+	// silently discards the user's choice instead of failing.
+	test("forwards the revert choice and scope when editing a subagent message", async () => {
+		const subagentId = "resume-edited-message-skip-revert";
+
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "regenerate_edited_message",
+			actor: "user",
+			editMessageId: "user-message-to-edit",
+			editContent: "edited prompt",
+			editRevertFiles: false,
+			editRevertScope: "workspace",
+			createdBy: "user-6",
+			locale: "en",
+		});
+
+		expect(result.started).toBe(true);
+		expect(editedMessageCalls[0]?.options).toMatchObject({
+			revertFiles: false,
+			revertScope: "workspace",
 		});
 		await finishRun(subagentId);
 	});

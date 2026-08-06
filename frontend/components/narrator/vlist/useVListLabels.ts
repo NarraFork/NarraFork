@@ -533,6 +533,7 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 		case "tool-run-summary":
 		case "activity-trace":
 		case "reasoning-steps":
+		case "sidecar-trace":
 			return labels.trace;
 		case "subagent-card":
 			return labels.subagent;

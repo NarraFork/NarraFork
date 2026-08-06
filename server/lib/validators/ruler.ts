@@ -4,6 +4,8 @@ export const rulerMergeSchema = z.object({
 	sourceChapterId: z.string().min(1),
 	strategy: z.enum(["merge", "squash"]).default("merge"),
 	message: z.string().max(500).optional(),
+	/** See `mergeChapterSchema.mode`. Omitted prefers the commit-free snapshot merge. */
+	mode: z.enum(["snapshot", "commit"]).optional(),
 });
 
 export const rulerAbandonSchema = z.object({
