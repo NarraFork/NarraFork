@@ -767,6 +767,8 @@
 	"browser.title": "浏览器",
 	"browser.closeSession": "关闭会话",
 	"browser.refreshScreenshot": "刷新",
+	"browser.expandPreview": "放大预览",
+	"browser.closeExpandedPreview": "关闭放大预览",
 	"browser.lastActive": "{{time}} 前活跃",
 	"browser.expiresIn": "{{time}} 后关闭",
 	"browser.autoClose": "自动关闭",
