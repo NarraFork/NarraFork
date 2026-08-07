@@ -27,11 +27,13 @@ describe("plugin GA release validation", () => {
 		const summary = await validatePluginRelease(examplesRoot);
 		expect(summary.valid).toBe(true);
 		expect(summary.mode).toBe("static");
-		expect(summary.packageCount).toBe(10);
-		// 10 packages across the 6 os/arch combinations the release matrix supports.
-		expect(summary.matrixCombinationCount).toBe(60);
+		expect(summary.packageCount).toBe(11);
+		// 11 packages across the 6 os/arch combinations the release matrix supports.
+		expect(summary.matrixCombinationCount).toBe(66);
 		expect(summary.errors).toEqual([]);
+		// Discovery sorts by directory name, so this list is alphabetical.
 		expect(summary.packages.map((item) => item.kind)).toEqual([
+			"cline-external",
 			"provider",
 			"sandbox-ui-panel",
 			"theme-duo",

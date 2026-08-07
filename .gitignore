@@ -31,6 +31,9 @@ scripts/*
 scripts/lib/*
 !scripts/lib/latest-yml.ts
 !scripts/lib/release-git.ts
+# Imported by scripts/release.ts and tests/scripts/stable-baseline-patch*.test.ts, so it has
+# to be in the repo or both the release script and `bun test` break in a fresh clone.
+!scripts/lib/stable-baseline-patch.ts
 !scripts/lib/__tests__/
 scripts/lib/__tests__/*
 !scripts/lib/__tests__/latest-yml.test.ts

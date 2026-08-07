@@ -96,6 +96,86 @@ export function generateZstdPatch(
 	return { patch, meta };
 }
 
+export interface GenerateZstdPatchToFileOptions {
+	/** Published source binary the patch applies to. */
+	oldFilePath: string;
+	/** Target binary the patch reconstructs. */
+	newFilePath: string;
+	/** Destination for the generated patch payload. */
+	patchOutputPath: string;
+	fromVersion: string;
+	toVersion: string;
+	/** zstd compression level; defaults to the release level (19). */
+	level?: number;
+	/** Custom zstd binary. */
+	zstdPath?: string;
+	signal?: AbortSignal;
+	/** Wall-clock budget for the zstd CLI invocation. */
+	timeoutMs?: number;
+}
+
+/**
+ * Metadata from a freshly generated patch.
+ *
+ * The source identity fields are optional on `ZstdPatchMeta` because patches published before
+ * they existed are still readable, but anything generated now always has them. Stating that in
+ * the return type lets callers verify the source binary without a runtime narrowing check that
+ * could never fail.
+ */
+export type GeneratedZstdPatchMeta = ZstdPatchMeta &
+	Required<Pick<ZstdPatchMeta, "oldFileSize" | "oldFileSha512">>;
+
+/**
+ * Generate a patch file-to-file, without holding either binary on the JS heap.
+ *
+ * Release tooling needs this when it produces extra upgrade paths (for example a direct
+ * previous-stable → target patch) outside the build's per-platform workers: several ~140MB
+ * binaries would otherwise be buffered at once. Identity fields are computed by streaming
+ * both inputs, so the metadata matches `generateZstdPatch` byte for byte.
+ */
+export async function generateZstdPatchToFile(
+	options: GenerateZstdPatchToFileOptions,
+): Promise<GeneratedZstdPatchMeta> {
+	const level = options.level ?? 19;
+	await runZstdCli(
+		[
+			options.zstdPath ?? "zstd",
+			`--patch-from=${options.oldFilePath}`,
+			options.newFilePath,
+			"-o",
+			options.patchOutputPath,
+			`-${level}`,
+			"--force",
+			"--long=31",
+		],
+		"patch generation",
+		options,
+	);
+
+	const [oldStat, newStat, patchStat] = await Promise.all([
+		Bun.file(options.oldFilePath).stat(),
+		Bun.file(options.newFilePath).stat(),
+		Bun.file(options.patchOutputPath).stat(),
+	]);
+	const [oldFileSha512, newFileSha512] = await Promise.all([
+		streamFileSha512(options.oldFilePath),
+		streamFileSha512(options.newFilePath),
+	]);
+
+	return {
+		fromVersion: options.fromVersion,
+		toVersion: options.toVersion,
+		oldFileSize: oldStat.size,
+		oldFileSha512,
+		stableEnd: 0,
+		newTailSize: newStat.size,
+		patchSize: patchStat.size,
+		newFileSize: newStat.size,
+		newFileSha512,
+		mode: "patch-from",
+	};
+}
+
 /** Generate a patch using zstd CLI --patch-from, or throw with diagnostic output. */
 function tryZstdCliPatchFrom(oldBuf: Buffer, newBuf: Buffer, level: number): Buffer {
 	const { tmpdir } = require("node:os");
@@ -291,14 +371,10 @@ export async function applyZstdPatchToFile(
 	return { sizeBytes: stat.size, sha512 };
 }
 
-async function runZstdCliDecompress(options: ApplyZstdPatchToFileOptions): Promise<void> {
-	const zstdBin = options.zstdPath ?? "zstd";
-	const timeoutMs = Math.max(1, options.timeoutMs ?? DEFAULT_CLI_TIMEOUT_MS);
-	options.signal?.throwIfAborted();
-
-	const proc = Bun.spawn(
+function runZstdCliDecompress(options: ApplyZstdPatchToFileOptions): Promise<void> {
+	return runZstdCli(
 		[
-			zstdBin,
+			options.zstdPath ?? "zstd",
 			"-d",
 			`--patch-from=${options.oldFilePath}`,
 			options.patchFilePath,
@@ -307,8 +383,25 @@ async function runZstdCliDecompress(options: ApplyZstdPatchToFileOptions): Promi
 			"--force",
 			"--long=31",
 		],
-		{ stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+		"decompression",
+		options,
 	);
+}
+
+/**
+ * Run one zstd CLI invocation as an asynchronous child process with a timeout, a bounded
+ * diagnostic buffer, and abort support. Diagnostics are never collected unbounded because
+ * zstd can be verbose on large inputs.
+ */
+async function runZstdCli(
+	command: string[],
+	label: string,
+	options: { signal?: AbortSignal; timeoutMs?: number },
+): Promise<void> {
+	const timeoutMs = Math.max(1, options.timeoutMs ?? DEFAULT_CLI_TIMEOUT_MS);
+	options.signal?.throwIfAborted();
+
+	const proc = Bun.spawn(command, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 
 	let timedOut = false;
 	const timer = setTimeout(() => {
@@ -325,12 +418,12 @@ async function runZstdCliDecompress(options: ApplyZstdPatchToFileOptions): Promi
 			proc.exited,
 		]);
 		if (timedOut) {
-			throw new Error(`zstd CLI decompression timed out after ${timeoutMs}ms`);
+			throw new Error(`zstd CLI ${label} timed out after ${timeoutMs}ms`);
 		}
 		options.signal?.throwIfAborted();
 		if (exitCode !== 0) {
 			throw new Error(
-				`zstd CLI decompression failed (exit ${exitCode}): ${formatProcessOutput(stdout, stderr)}`,
+				`zstd CLI ${label} failed (exit ${exitCode}): ${formatProcessOutput(stdout, stderr)}`,
 			);
 		}
 	} finally {

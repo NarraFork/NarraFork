@@ -1608,6 +1608,19 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			? buildServerRestartUrl(c.req.url, newHost, newPort, newTls?.enabled === true)
 			: undefined;
 
+		// Observability: record who changed the instance-wide summary model and to
+		// what. This setting has been silently rewritten in the field (provider
+		// purge, prefix migration, or an admin picker), so log every transition
+		// against the admin that triggered the PATCH. `current.agent.summaryModel`
+		// is the pre-merge snapshot; `merged.agent.summaryModel` is what landed.
+		if (current.agent.summaryModel !== merged.agent.summaryModel) {
+			logger.info("Summary model changed via settings PATCH", {
+				from: current.agent.summaryModel,
+				to: merged.agent.summaryModel,
+				userId: c.get("user").sub,
+			});
+		}
+
 		return c.json(
 			buildSettingsResponse(merged, {
 				serverRestarting: needsRestart,

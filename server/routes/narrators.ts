@@ -282,6 +282,7 @@ import {
 import {
 	activeNarrators,
 	getNarratorRuntimeModel,
+	isNarratorRuntimeBusy,
 	isWorkspaceBeingWritten,
 	planModeAskedOnce,
 	resetActiveUpstreamSession,
@@ -1362,7 +1363,25 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		if (result.full) {
 			throw new ValidationError("Message queue is full");
 		}
-		// Narrator not active in memory — fall through to normal send
+		// The queue refused this message. Falling through to a normal send is only
+		// correct when the narrator turned out NOT to be busy after all — the
+		// legitimate case is a zombie `working`/`waiting` row whose writer is gone,
+		// which `reconcileRunningStatus` above has just repaired to idle.
+		//
+		// If a runtime owner still exists, falling through would start a second agent
+		// loop next to the live one. `feedMessage`'s own guard cannot catch that: it
+		// tests `active._loopRunning`, and a loop-less owner (planned-update recovery,
+		// a subagent recovery stage, the recovery Await batch) has no `activeNarrators`
+		// entry at all, so `ensureNarrator` hands back a fresh session whose flag is
+		// false. That is exactly how a post-update restart ended up talking over its
+		// own still-running subagent.
+		if (isNarratorRuntimeBusy(id)) {
+			logger.warn("Refused to send while a loop-less runtime owner holds the narrator", {
+				narratorId: id,
+			});
+			throw new ValidationError("Narrator is busy; the message could not be queued");
+		}
+		// No runtime owner: the busy status was stale. Fall through to a normal send.
 	}
 
 	const locale = await getUserLanguage(userId);

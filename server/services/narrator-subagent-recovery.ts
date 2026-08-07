@@ -609,7 +609,15 @@ async function prepareAndStartRecovery(input: {
 				error: err instanceof Error ? err.message : String(err),
 			});
 		})
-		.finally(() => registration.unregister());
+		.finally(async () => {
+			registration.unregister();
+			// Only after the claim is gone can an orphaned queue be recognized as such.
+			await drainQueuedMessagesAfterRecoveryStage(
+				narratorId,
+				input.locale,
+				input.replyInUserLanguage,
+			);
+		});
 
 	return {
 		recovering: true,
@@ -663,6 +671,38 @@ async function runRecoveryStage(
 				})
 				.catch(() => {});
 		}
+	}
+}
+
+/**
+ * Consume messages a user queued while a recovery stage held this narrator busy.
+ *
+ * The stages below run with no `activeNarrators` entry and instead claim the narrator's
+ * runtime, which is what lets `pushBufferedMessage` accept input for them (see
+ * `canQueueForNarrator`). Normally the queue's owner is the loop that `continueNarrator`
+ * starts at the end of the stage — but when that call fails the stage settles the narrator
+ * to `idle`/error and releases the claim, leaving the queue with nobody to consume it.
+ *
+ * Must run AFTER `registration.unregister()`: while the claim is live
+ * `resumeBufferedMessagesIfIdle` correctly declines, since a claim means an owner exists.
+ *
+ * Best-effort — a failure here must not turn a completed recovery into a reported failure,
+ * and the resume helper itself declines whenever another owner appeared or the narrator
+ * must not be woken.
+ */
+async function drainQueuedMessagesAfterRecoveryStage(
+	narratorId: string,
+	locale: Locale,
+	replyInUserLanguage: boolean,
+): Promise<void> {
+	try {
+		const { resumeBufferedMessagesIfIdle } = await import("./narrator-session");
+		await resumeBufferedMessagesIfIdle(narratorId, locale, replyInUserLanguage);
+	} catch (err) {
+		logger.warn("Failed to resume queued messages after a subagent recovery stage", {
+			narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
 	}
 }
 
@@ -1343,7 +1383,15 @@ export async function startRecoveryAwaitBatch(input: {
 				error: err instanceof Error ? err.message : String(err),
 			});
 		})
-		.finally(() => registration.unregister());
+		.finally(async () => {
+			registration.unregister();
+			// Only after the claim is gone can an orphaned queue be recognized as such.
+			await drainQueuedMessagesAfterRecoveryStage(
+				input.narratorId,
+				input.locale,
+				input.replyInUserLanguage,
+			);
+		});
 
 	return { messageId: message.id, toolUseIds: blocks.map((block) => block.id) };
 }

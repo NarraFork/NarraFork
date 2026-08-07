@@ -48,6 +48,7 @@ import {
 	type ToolAdmissionState,
 	type ToolExecResult,
 } from "./tool-executor";
+import { isValidToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
 import {
 	applyToolUseIdRemap,
@@ -2200,6 +2201,19 @@ export async function* agentLoop(
 	let allTools: ResolvedToolDefinition[] = toolRegistry
 		.all()
 		.filter((t) => t.name && (!t.isAvailable || t.isAvailable()))
+		// Last line of defence before the wire. Providers validate the whole `tools`
+		// array and reject the entire request when one name breaks their alphabet
+		// (OpenAI: `Invalid 'tools[19].function.name': ... '^[a-zA-Z0-9_-]+$'`), so a
+		// single malformed dynamic tool would otherwise make every turn fail. Names are
+		// minted sanitized upstream (MCP + plugin bridges); dropping the tool here keeps
+		// the session usable if a future source misses that, instead of rewriting the
+		// name behind the registry's back — a renamed tool could not be executed or
+		// matched against history.
+		.filter((t) => {
+			if (isValidToolName(t.name)) return true;
+			logger.warn("Dropping tool with a provider-invalid name", { toolName: t.name });
+			return false;
+		})
 		.map((t) => ({
 			...t,
 			description: typeof t.description === "function" ? t.description(config) : t.description,

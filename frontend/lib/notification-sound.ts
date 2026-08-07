@@ -12,6 +12,89 @@ function getAudioContext(): AudioContext {
 	return audioCtx;
 }
 
+// --- Volume + concurrency control ---
+
+/** Base gain for built-in oscillator sounds at 100% volume. */
+const BUILTIN_BASE_GAIN = 0.3;
+/** Base gain for custom audio files at 100% volume. */
+const CUSTOM_BASE_GAIN = 0.5;
+
+export const DEFAULT_SOUND_VOLUME = 100;
+export const DEFAULT_SOUND_MAX_CONCURRENT = 2;
+export const MIN_SOUND_MAX_CONCURRENT = 1;
+export const MAX_SOUND_MAX_CONCURRENT = 10;
+
+/** Clamp a stored volume percentage (0-100) into a 0..1 gain multiplier. */
+export function resolveVolumeMultiplier(volume?: number | null): number {
+	if (typeof volume !== "number" || !Number.isFinite(volume)) return 1;
+	return Math.min(100, Math.max(0, volume)) / 100;
+}
+
+/** Clamp a stored concurrency limit into the supported range. */
+export function resolveMaxConcurrent(max?: number | null): number {
+	if (typeof max !== "number" || !Number.isFinite(max)) return DEFAULT_SOUND_MAX_CONCURRENT;
+	return Math.min(MAX_SOUND_MAX_CONCURRENT, Math.max(MIN_SOUND_MAX_CONCURRENT, Math.round(max)));
+}
+
+/*
+ * Number of sounds currently playing. A slow client can queue up many narrator
+ * status events at once (e.g. after the tab was frozen or the server was busy),
+ * and playing every one of them overlapping is painfully loud. We cap how many
+ * can sound simultaneously and simply drop the overflow — a notification sound
+ * only needs to signal "something happened", not "N things happened".
+ */
+let activeSoundCount = 0;
+
+/**
+ * Fallback ceiling for a slot whose real duration is unknown — a custom audio
+ * file, whose length is only known once it decodes. Without it an <audio>
+ * element that never fires ended/error would hold the slot forever and silence
+ * every later notification.
+ */
+const SOUND_SLOT_MAX_HOLD_MS = 15_000;
+
+/**
+ * Grace added to a known playback duration before the slot is force-released.
+ * Absorbs scheduling jitter and the AudioContext's own start latency, so the
+ * safety net never fires while the sound is genuinely still playing.
+ */
+const SOUND_SLOT_HOLD_GRACE_MS = 500;
+
+/**
+ * Try to reserve a playback slot; returns a release fn, or null when full.
+ *
+ * `maxHoldMs` is a safety net, not the expected lifetime — the normal release is
+ * driven by the sound actually ending. Callers that know how long their sound
+ * lasts pass that duration, so a playback which never signals completion (a
+ * suspended AudioContext with no user gesture yet, an <audio> that fires
+ * neither ended nor error) frees the slot on roughly its own timescale instead
+ * of blocking notifications for many seconds.
+ */
+function acquireSoundSlot(maxConcurrent: number, maxHoldMs: number): (() => void) | null {
+	const limit = resolveMaxConcurrent(maxConcurrent);
+	if (activeSoundCount >= limit) return null;
+	activeSoundCount++;
+	let released = false;
+	const release = () => {
+		if (released) return;
+		released = true;
+		clearTimeout(timer);
+		activeSoundCount = Math.max(0, activeSoundCount - 1);
+	};
+	const timer = setTimeout(release, Math.max(1, maxHoldMs));
+	return release;
+}
+
+/** Test/inspection helper: how many sounds are currently counted as playing. */
+export function getActiveSoundCount(): number {
+	return activeSoundCount;
+}
+
+/** Test helper: reset the concurrency counter. */
+export function resetActiveSoundCount(): void {
+	activeSoundCount = 0;
+}
+
 // --- Built-in sounds via OscillatorNode ---
 
 interface BuiltinSoundDef {
@@ -71,16 +154,54 @@ const BUILTIN_SOUNDS: Record<string, BuiltinSoundDef> = {
 
 export const BUILTIN_SOUND_NAMES = Object.keys(BUILTIN_SOUNDS);
 
-export function playBuiltinSound(name: string): void {
+/**
+ * Total wall-clock length of a built-in sound, in ms.
+ *
+ * Mirrors the scheduling loop in `playBuiltinSound`: every note contributes its
+ * own duration, and audible notes additionally contribute the 20ms gap that the
+ * loop inserts after them. Used to bound the playback slot, so a built-in sound
+ * that never reports completion frees its slot in well under a second rather
+ * than holding it for the unknown-duration fallback.
+ */
+function builtinSoundDurationMs(def: BuiltinSoundDef): number {
+	let total = 0;
+	for (const [freqMul, durMul] of def.notes) {
+		total += def.duration * durMul;
+		if (freqMul !== 0) total += 20;
+	}
+	return total;
+}
+
+export interface PlaybackOptions {
+	/** Volume percentage 0-100 (default 100). */
+	volume?: number | null;
+	/** Max sounds allowed to play at once (default 2). */
+	maxConcurrent?: number | null;
+	/** Skip the concurrency limit (used by the settings preview button). */
+	bypassLimit?: boolean;
+}
+
+export function playBuiltinSound(name: string, options: PlaybackOptions = {}): void {
 	const def = BUILTIN_SOUNDS[name];
 	if (!def) return;
+
+	const gain = BUILTIN_BASE_GAIN * resolveVolumeMultiplier(options.volume);
+	if (gain <= 0) return;
+
+	const release = options.bypassLimit
+		? () => {}
+		: acquireSoundSlot(
+				options.maxConcurrent ?? DEFAULT_SOUND_MAX_CONCURRENT,
+				builtinSoundDurationMs(def) + SOUND_SLOT_HOLD_GRACE_MS,
+			);
+	if (!release) return;
 
 	const ctx = getAudioContext();
 	if (ctx.state === "suspended") ctx.resume();
 
 	const gainNode = ctx.createGain();
 	gainNode.connect(ctx.destination);
-	gainNode.gain.value = 0.3;
+	gainNode.gain.value = gain;
 
 	let offset = ctx.currentTime;
 	let activeOscillators = 0;
@@ -97,6 +218,7 @@ export function playBuiltinSound(name: string): void {
 			} catch {
 				// Already disconnected.
 			}
+			release();
 		}
 	};
 	for (const [freqMul, durMul] of def.notes) {
@@ -120,11 +242,12 @@ export function playBuiltinSound(name: string): void {
 
 	if (activeOscillators === 0) {
 		gainNode.disconnect();
+		release();
 		return;
 	}
 
 	// Fade out gain at the end
-	gainNode.gain.setValueAtTime(0.3, offset - 0.05);
+	gainNode.gain.setValueAtTime(gain, offset - 0.05);
 	gainNode.gain.linearRampToValueAtTime(0, offset);
 }
 
@@ -151,7 +274,26 @@ function trimAudioCache() {
 	}
 }
 
-export async function playCustomSound(url: string): Promise<void> {
+export async function playCustomSound(url: string, options: PlaybackOptions = {}): Promise<void> {
+	const volume = CUSTOM_BASE_GAIN * resolveVolumeMultiplier(options.volume);
+	if (volume <= 0) return;
+
+	/*
+	 * Reserve the slot before the (possibly slow) fetch so a burst of
+	 * notifications can't all pass the check while the first download is still
+	 * in flight and then play together.
+	 */
+	const release = options.bypassLimit
+		? () => {}
+		: acquireSoundSlot(
+				options.maxConcurrent ?? DEFAULT_SOUND_MAX_CONCURRENT,
+				// A user-supplied file has no known length here (it is fetched and decoded
+				// below), and it can legitimately run for several seconds, so this slot
+				// keeps the generic ceiling. The normal release is `ended`/`error`.
+				SOUND_SLOT_MAX_HOLD_MS,
+			);
+	if (!release) return;
+
 	let blobUrl = audioCache.get(url);
 	if (blobUrl) {
 		touchAudioCache(url, blobUrl);
@@ -160,14 +302,19 @@ export async function playCustomSound(url: string): Promise<void> {
 			const res = await authorizedFetch(url);
 			if (!res.ok) {
 				await clearTokenOnSessionFailure(res);
+				release();
 				return;
 			}
 			const blob = await res.blob();
-			if (blob.size > MAX_CUSTOM_AUDIO_BLOB_BYTES) return;
+			if (blob.size > MAX_CUSTOM_AUDIO_BLOB_BYTES) {
+				release();
+				return;
+			}
 			blobUrl = URL.createObjectURL(blob);
 			touchAudioCache(url, blobUrl);
 			trimAudioCache();
 		} catch {
+			release();
 			return;
 		}
 	}
@@ -176,8 +323,9 @@ export async function playCustomSound(url: string): Promise<void> {
 		audio.pause();
 		audio.removeAttribute("src");
 		audio.load();
+		release();
 	};
-	audio.volume = 0.5;
+	audio.volume = Math.min(1, volume);
 	audio.addEventListener("ended", cleanup, { once: true });
 	audio.addEventListener("error", cleanup, { once: true });
 	audio.play().catch(cleanup);
@@ -189,12 +337,18 @@ export interface NotificationSoundPrefs {
 	notifySoundType: "builtin" | "custom";
 	notifySoundBuiltin: string;
 	notifySoundFileId: string | null;
+	notifySoundVolume?: number | null;
+	notifySoundMaxConcurrent?: number | null;
 }
 
 export function playNotificationSound(prefs: NotificationSoundPrefs): void {
+	const options: PlaybackOptions = {
+		volume: prefs.notifySoundVolume ?? DEFAULT_SOUND_VOLUME,
+		maxConcurrent: prefs.notifySoundMaxConcurrent ?? DEFAULT_SOUND_MAX_CONCURRENT,
+	};
 	if (prefs.notifySoundType === "custom" && prefs.notifySoundFileId) {
-		playCustomSound(`/api/notification-sounds/${prefs.notifySoundFileId}`);
+		playCustomSound(`/api/notification-sounds/${prefs.notifySoundFileId}`, options);
 	} else {
-		playBuiltinSound(prefs.notifySoundBuiltin || "gentle");
+		playBuiltinSound(prefs.notifySoundBuiltin || "gentle", options);
 	}
 }

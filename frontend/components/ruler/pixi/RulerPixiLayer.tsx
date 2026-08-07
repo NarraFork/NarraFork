@@ -46,7 +46,17 @@ function destroyPixiApplication(app: Application): void {
 	if (typeof pixiApp._cancelResize !== "function") {
 		pixiApp._cancelResize = () => {};
 	}
-	app.destroy(true, { children: true });
+	// `removeView: true` (not the boolean `true`) — the boolean form reaches
+	// `AbstractRenderer.destroy` as `options === true`, which additionally fires
+	// `GlobalResourceRegistry.release()`. That empties PROCESS-WIDE pools
+	// (`TexturePool._texturePool = {}`) while leaving `_poolKeyHash` populated, so
+	// any Text destroyed afterwards — including this app's own stage teardown,
+	// which happens BEFORE the renderer is destroyed — hits
+	// `this._texturePool[key].push(...)` on `undefined`. The pools are shared
+	// globals, not this app's property, so tearing one layer down must not clear
+	// them. `removeView` keeps the only behaviour we actually wanted from `true`:
+	// detaching the canvas from the DOM.
+	app.destroy({ removeView: true }, { children: true });
 }
 
 // Reusable buffers to avoid per-frame allocations in redraw.
@@ -443,10 +453,18 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			cancelAnimationFrame(panelAnimRafRef.current);
 			// Only destroy if init completed and app was fully set up. If init is
 			// still pending, the then() handler above will destroy the late app.
-			if (appRef.current) {
-				destroyPixiApplication(appRef.current);
-			}
+			const live = appRef.current;
+			// Clear the ref BEFORE destroying, not after. `destroy()` runs Pixi
+			// internals that can throw (stage teardown touches global pools); a throw
+			// used to skip the assignment below and leave `appRef` pointing at a
+			// half-destroyed app, after which every `updateCamera` → `redraw` →
+			// `app.render()` crashed on a null render pipe. Dropping the reference
+			// first makes teardown failure degrade to "layer stops drawing" instead of
+			// a render loop throwing on every camera move.
 			appRef.current = null;
+			if (live) {
+				destroyPixiApplication(live);
+			}
 		};
 	}, []); // Only once
 

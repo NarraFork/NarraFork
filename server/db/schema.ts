@@ -1240,6 +1240,12 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.default("builtin"),
 	notifySoundBuiltin: text("notify_sound_builtin").notNull().default("gentle"),
 	notifySoundFileId: text("notify_sound_file_id"),
+	// Master playback volume as a percentage (0-100). 100 keeps the historical
+	// per-source base gain (built-in 0.3, custom file 0.5).
+	notifySoundVolume: integer("notify_sound_volume").notNull().default(100),
+	// Upper bound on sounds playing at the same time. Extra notifications that
+	// arrive while the limit is reached are dropped instead of stacking up.
+	notifySoundMaxConcurrent: integer("notify_sound_max_concurrent").notNull().default(2),
 	notifyDingtalkEnabled: integer("notify_dingtalk_enabled", { mode: "boolean" })
 		.notNull()
 		.default(false),

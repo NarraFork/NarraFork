@@ -119,6 +119,7 @@
 		"build:windows": "bun scripts/build-cross-platform.ts --platform=windows",
 		"plugins:validate-release": "bun scripts/validate-plugin-release.ts",
 		"build:plugin": "bun scripts/build-plugin.ts",
+		"plugins:check-artifacts": "bun scripts/build-plugin.ts --check",
 		"check": "bunx @biomejs/biome check .",
 		"db:generate": "bunx drizzle-kit generate",
 		"db:migrate": "bun server/db/migrate.ts",

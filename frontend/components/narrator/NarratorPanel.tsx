@@ -116,6 +116,7 @@ import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
 import { useLocalPref } from "../../hooks/useLocalPref";
+import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useAllModels } from "../../hooks/useModels";
 import { useNamedNarrators } from "../../hooks/useNamedNarrator";
 import {
@@ -298,7 +299,7 @@ import {
 } from "./narrator-panel-types";
 import { getNarratorStatusBarDisplay } from "./narrator-status-bar";
 import { compactProgressLabel } from "./progress-label";
-import { RenderLodCtx } from "./RenderLodCtx";
+import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
 import { RevertScopeConfirmModal } from "./RevertScopeConfirmModal";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
 import {
@@ -2951,6 +2952,7 @@ export function NarratorPanel({
 	const {
 		lod: renderLod,
 		isDefault: renderLodIsDefault,
+		setLod,
 		stepUp,
 		stepDown,
 		setAsDefault,
@@ -3521,6 +3523,25 @@ export function NarratorPanel({
 	const viewportRef = useRef<HTMLDivElement>(null);
 	const contentRef = useRef<HTMLDivElement>(null);
 	const chunkListRef = useRef<ChunkedMessageListHandle>(null);
+	// The message area box — the LOD indicator's containing block, and the hover
+	// region that decides whether holding Alt targets THIS panel.
+	const messageAreaRef = useRef<HTMLDivElement>(null);
+	const lodIndicatorPinned = useLodIndicatorTrigger(messageAreaRef, !isWorkspacePreview);
+	// Indicator-driven level pick (notch click or −/+). Unlike the gestures there
+	// is no pointer event to anchor on, so anchor on the indicator's own position
+	// (the middle of the message area) before the rebuild — otherwise picking a
+	// level would jump the content the user is reading.
+	const handleSelectLod = useCallback(
+		(next: RenderLod) => {
+			const el = messageAreaRef.current;
+			if (el) {
+				const rect = el.getBoundingClientRect();
+				chunkListRef.current?.prepareLodChange(rect.top + rect.height / 2);
+			}
+			setLod(next);
+		},
+		[setLod],
+	);
 	// Persist the user's direct Chunk/Virtual choice; the rollout gate controls availability only.
 	// Unset (new users) resolves to Virtual; Chunk is now an explicit opt-out.
 	const [narratorVirtualListRequested] = useLocalPref("narrafork_narrator_virtual_list");
@@ -5358,8 +5379,16 @@ export function NarratorPanel({
 		};
 	}, []);
 
+	/**
+	 * Reveal a message, returning whether the jump actually landed.
+	 *
+	 * Async because the virtual list may have to page upward into unloaded history before it
+	 * can position anything, and its answer is the real one — a caller that treats "handed
+	 * off" as "revealed" would mark the jump done and never retry. Callers that only fire and
+	 * forget can `void` it.
+	 */
 	const scrollToMessageTarget = useCallback(
-		({
+		async ({
 			domIds,
 			targetIds,
 			highlightId,
@@ -5367,25 +5396,31 @@ export function NarratorPanel({
 			domIds: string[];
 			targetIds: string[];
 			highlightId?: string;
-		}) => {
-			for (const domId of domIds) {
-				const el = document.getElementById(domId);
-				if (el) {
-					requestAnimationFrame(() => {
-						el.scrollIntoView({ behavior: "smooth", block: "center" });
-						if (highlightId) {
-							scheduleHighlight(highlightId, 400);
-						}
-					});
-					return true;
+		}): Promise<boolean> => {
+			// The virtual list owns the whole jump (reveal, flash, and paging upward into
+			// not-yet-loaded history). Short-circuiting on a mounted DOM node here would
+			// hand it only the easy case AND paint no highlight: the flash is written to
+			// the revealed node imperatively inside the list, not driven by this panel's
+			// `highlightedId` state.
+			if (!narratorVirtualList) {
+				for (const domId of domIds) {
+					const el = document.getElementById(domId);
+					if (el) {
+						requestAnimationFrame(() => {
+							el.scrollIntoView({ behavior: "smooth", block: "center" });
+							if (highlightId) {
+								scheduleHighlight(highlightId, 400);
+							}
+						});
+						return true;
+					}
 				}
 			}
 			const handle = chunkListRef.current;
 			if (!handle) return false;
-			handle.scrollToMessageTarget({ domIds, targetIds, highlightId });
-			return true;
+			return await handle.scrollToMessageTarget({ domIds, targetIds, highlightId });
 		},
-		[scheduleHighlight],
+		[narratorVirtualList, scheduleHighlight],
 	);
 
 	// Bridge: let the sibling search panel jump to a message in this chat via the
@@ -5394,7 +5429,9 @@ export function NarratorPanel({
 	useEffect(() => {
 		if (!registerScrollToMessage) return;
 		return registerScrollToMessage((messageId: string) => {
-			scrollToMessageTarget({
+			// The dock callback is synchronous; the list reports an unreachable target to the
+			// user itself, so there is nothing for the search panel to do with the result.
+			void scrollToMessageTarget({
 				domIds: [`msg-${messageId}`],
 				targetIds: [messageId],
 				highlightId: messageId,
@@ -5432,7 +5469,9 @@ export function NarratorPanel({
 				source.scrollIntoView({ behavior: "smooth", block: "center" });
 				return;
 			}
-			scrollToMessageTarget({
+			// Fire and forget: the overlay's job is to start the jump, and the list already
+			// tells the user when a target cannot be reached.
+			void scrollToMessageTarget({
 				domIds: [`msg-${messageId}`],
 				targetIds: [messageId],
 				highlightId: messageId,
@@ -5535,11 +5574,19 @@ export function NarratorPanel({
 	useEffect(() => {
 		if (narratorVirtualList) return;
 		if (!highlightMessageId || highlightScrolledRef.current) return;
-		highlightScrolledRef.current = scrollToMessageTarget({
+		let active = true;
+		// Latched only on success, so a jump that could not land yet is retried when the
+		// effect re-runs (a later render may have mounted the row).
+		void scrollToMessageTarget({
 			domIds: [`msg-${highlightMessageId}`],
 			targetIds: [highlightMessageId],
 			highlightId: highlightMessageId,
+		}).then((revealed) => {
+			if (active && revealed) highlightScrolledRef.current = true;
 		});
+		return () => {
+			active = false;
+		};
 	}, [highlightMessageId, narratorVirtualList, scrollToMessageTarget]);
 
 	const applyBufferedSendResult = useCallback(
@@ -7470,6 +7517,7 @@ export function NarratorPanel({
 
 					{/* Messages */}
 					<Box
+						ref={messageAreaRef}
 						pos="relative"
 						style={{ flex: 1, minHeight: 0, overflow: "hidden", isolation: "isolate" }}
 					>
@@ -7663,6 +7711,8 @@ export function NarratorPanel({
 														lod={renderLod}
 														isDefault={renderLodIsDefault}
 														onSetAsDefault={setAsDefault}
+														onSelectLod={handleSelectLod}
+														pinned={lodIndicatorPinned}
 													/>
 												</EditingMessageCtx.Provider>
 											</LatestTodosToolUseIdCtx.Provider>
@@ -8081,7 +8131,7 @@ export function NarratorPanel({
 									if (isRetrying) return;
 									if (isCompacting) {
 										if (!compactingMarkerMessageId) return;
-										scrollToMessageTarget({
+										void scrollToMessageTarget({
 											domIds: [`msg-${compactingMarkerMessageId}`],
 											targetIds: [compactingMarkerMessageId],
 											highlightId: compactingMarkerMessageId,

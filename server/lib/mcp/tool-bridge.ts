@@ -1,5 +1,6 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod/v4";
+import { normalizeToolName, sanitizeToolNameSegment } from "../agent/tool-name";
 import { toolRegistry } from "../agent/tool-registry";
 import type { ToolContext, ToolDefinition, ToolResult } from "../agent/types";
 import { logger } from "../logger";
@@ -7,14 +8,18 @@ import { mcpManager } from "./manager";
 
 /**
  * Build a NarraFork tool name from MCP server name + tool name.
- * Format: mcp__<sanitizedServerName>__<toolName>
+ * Format: mcp__<sanitizedServerName>__<sanitizedToolName>
+ *
+ * Both segments are sanitized: MCP itself places no alphabet restriction on tool
+ * names, so servers legitimately expose dotted/namespaced names like
+ * `github.search_issues`, while providers reject anything outside
+ * `^[a-zA-Z0-9_-]+$` — and they reject the *whole request*, not just that tool.
+ * The assembled name is normalized once more to enforce the length budget.
  */
 function buildToolName(serverName: string, toolName: string): string {
-	const sanitized = serverName.replace(/[^a-zA-Z0-9_-]/g, "_").toLowerCase();
-	// Ensure neither part is empty — fall back to "unknown" if sanitization yields nothing
-	const safeName = sanitized.replace(/^_+$/, "") || "unknown";
-	const safeTool = toolName || "unknown";
-	return `mcp__${safeName}__${safeTool}`;
+	const safeName = sanitizeToolNameSegment(serverName).toLowerCase();
+	const safeTool = sanitizeToolNameSegment(toolName);
+	return normalizeToolName(`mcp__${safeName}__${safeTool}`);
 }
 
 /**

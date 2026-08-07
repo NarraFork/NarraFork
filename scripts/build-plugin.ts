@@ -59,7 +59,21 @@ export const PLUGIN_BUILDS: Record<string, PluginBuildConfig> = {
 			},
 		],
 	},
+	"cline-external": {
+		targets: [
+			{ entry: "src/server.ts", outfile: "server/index.js", target: "bun", format: "esm" },
+			{
+				entry: "src/ui/provider-settings.ts",
+				outfile: "ui/provider-settings.iife.js",
+				target: "browser",
+				format: "iife",
+			},
+		],
+	},
 };
+
+/** Every plugin with a build definition, for callers that check them all. */
+export const BUILDABLE_PLUGINS = Object.keys(PLUGIN_BUILDS);
 
 export interface BuiltArtifact {
 	outfile: string;
@@ -142,29 +156,42 @@ export async function checkPluginArtifacts(pluginName: string): Promise<string[]
 if (import.meta.main) {
 	const args = process.argv.slice(2);
 	const check = args.includes("--check");
-	const pluginName = args.find((arg) => !arg.startsWith("--"));
+	const requested = args.filter((arg) => !arg.startsWith("--"));
 
-	if (!pluginName) {
+	// `--check` with no plugin named checks every one. A per-plugin list in `package.json` went
+	// stale the moment a second plugin was added, so the script derives it from the build
+	// definitions instead.
+	if (requested.length === 0 && !check) {
 		console.error("Usage: bun scripts/build-plugin.ts <plugin-name> [--check]");
-		console.error(`Known plugins: ${Object.keys(PLUGIN_BUILDS).join(", ") || "(none)"}`);
+		console.error("       bun scripts/build-plugin.ts --check    # every plugin");
+		console.error(`Known plugins: ${BUILDABLE_PLUGINS.join(", ") || "(none)"}`);
 		process.exit(1);
 	}
 
+	const plugins = requested.length > 0 ? requested : BUILDABLE_PLUGINS;
+
 	if (check) {
-		const stale = await checkPluginArtifacts(pluginName);
-		if (stale.length > 0) {
-			console.error(`Stale artifacts in ${pluginName}:`);
-			for (const item of stale) console.error(`  - ${item}`);
-			console.error(`\nRun: bun scripts/build-plugin.ts ${pluginName}`);
-			process.exit(1);
+		let failed = false;
+		for (const pluginName of plugins) {
+			const stale = await checkPluginArtifacts(pluginName);
+			if (stale.length > 0) {
+				failed = true;
+				console.error(`Stale artifacts in ${pluginName}:`);
+				for (const item of stale) console.error(`  - ${item}`);
+				console.error(`  Run: bun scripts/build-plugin.ts ${pluginName}`);
+				continue;
+			}
+			console.log(`${pluginName}: artifacts are up to date`);
 		}
-		console.log(`${pluginName}: artifacts are up to date`);
+		if (failed) process.exit(1);
 	} else {
-		const artifacts = await buildPluginArtifacts(pluginName);
-		await writePluginArtifacts(pluginName, artifacts);
-		for (const artifact of artifacts) {
-			console.log(`  ${artifact.outfile}  ${(artifact.code.length / 1024).toFixed(1)} KB`);
+		for (const pluginName of plugins) {
+			const artifacts = await buildPluginArtifacts(pluginName);
+			await writePluginArtifacts(pluginName, artifacts);
+			for (const artifact of artifacts) {
+				console.log(`  ${artifact.outfile}  ${(artifact.code.length / 1024).toFixed(1)} KB`);
+			}
+			console.log(`${pluginName}: built ${artifacts.length} artifact(s)`);
 		}
-		console.log(`${pluginName}: built ${artifacts.length} artifact(s)`);
 	}
 }

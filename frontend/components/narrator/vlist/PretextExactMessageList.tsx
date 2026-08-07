@@ -141,6 +141,8 @@ import {
 	toggleVListShowOriginal,
 	type VListInteractionState,
 } from "./vlist-interaction-state";
+import { jumpTargetMessageId, resolveJumpTargetSeq } from "./vlist-jump-target";
+import { resolveJumpWindowDecision } from "./vlist-jump-window";
 import {
 	createLodFocusPoint,
 	createLodStepThrottle,
@@ -498,9 +500,11 @@ function domIdForItem(item: VListItem, sourceIds: readonly string[]): string | u
 	return id ? `msg-${id}` : undefined;
 }
 
-function messageIdFromTarget(target: string): string {
-	return target.startsWith("msg-") ? target.slice(4) : target;
-}
+/**
+ * Re-export of the jump module's id normalizer, so the DOM-locator path and the
+ * seq-resolution path cannot disagree about what "msg-abc" means.
+ */
+const messageIdFromTarget = jumpTargetMessageId;
 
 /**
  * Normalize a manifest `documentRevision` to a number for the fold capture's
@@ -1659,6 +1663,12 @@ export const PretextExactMessageList = forwardRef<
 	// a decoration written straight to the revealed row's node, so it must not
 	// invalidate a single row's memo or the measurement cache.
 	const highlightRef = useRef(createHighlightController());
+	/**
+	 * Monotonic id of the newest jump, so a jump that pages through history across
+	 * awaits can tell it has been superseded (another search hit clicked, the reader
+	 * navigating away) and stop scrolling instead of fighting the new target.
+	 */
+	const jumpTokenRef = useRef(0);
 	const pinnedToBottomRef = useRef(true);
 	const suppressScrollStateRef = useRef(false);
 	/**
@@ -2302,13 +2312,18 @@ export const PretextExactMessageList = forwardRef<
 		isSubagent,
 	});
 	appendMessageRef.current = pretextDocument.appendMessage;
+	// Read by the jump loop, which spans awaits and must see the CURRENT document
+	// (its `readWindow` reads the coordinator snapshot synchronously, so it is also
+	// correct between a commit and the React re-render it triggers).
+	const pretextDocumentRef = useRef(pretextDocument);
+	pretextDocumentRef.current = pretextDocument;
 
 	// --- Reverse infinite scroll (load older) ---
 	const autoLoadEnabled = resolveOlderHistoryAutoLoadEnabled(
 		userPrefs?.autoLoadOlderMessages,
 		userPrefsLoading,
 	);
-	const { hasPrev, loadingOlder, loadOlder } = pretextDocument;
+	const { hasPrev, loadingOlder, loadOlder, loadOlderAsync, oldestLoadedSeq } = pretextDocument;
 	const hasPrevRef = useRef(hasPrev);
 	hasPrevRef.current = hasPrev;
 	const loadingOlderRef = useRef(loadingOlder);
@@ -2317,6 +2332,12 @@ export const PretextExactMessageList = forwardRef<
 	autoLoadEnabledRef.current = autoLoadEnabled;
 	const loadOlderRef = useRef(loadOlder);
 	loadOlderRef.current = loadOlder;
+	// Read through refs by the jump loop, which pages upward across awaits and must
+	// see the CURRENT window (not the values captured when the jump started).
+	const loadOlderAsyncRef = useRef(loadOlderAsync);
+	loadOlderAsyncRef.current = loadOlderAsync;
+	const oldestLoadedSeqRef = useRef(oldestLoadedSeq);
+	oldestLoadedSeqRef.current = oldestLoadedSeq;
 	// A near-top scroll only auto-loads when it follows a recent upward gesture
 	// (wheel/touch), mirroring the chunk list's intent gate so momentum settling
 	// at the top does not endlessly page history.
@@ -3374,6 +3395,11 @@ export const PretextExactMessageList = forwardRef<
 			targetIds: string[];
 			highlightId?: string;
 		}) => {
+			// One jump at a time. A second jump (another search hit clicked while the
+			// first is still paging through history) invalidates the first, which must
+			// then stop scrolling and stop paging rather than fight the new target.
+			const token = ++jumpTokenRef.current;
+			const cancelled = () => token !== jumpTokenRef.current;
 			// The row that was actually revealed, so the flash lands on the node the
 			// reader is now looking at rather than on a guessed id. Unlike the chunked
 			// path — which arms a 400ms timer and hopes the scroll finished — the flash
@@ -3397,25 +3423,111 @@ export const PretextExactMessageList = forwardRef<
 				}
 				return false;
 			};
+			// Scroll to a message that HAS a layout item, then let the mounted-window
+			// recomputation (one frame) produce the node the flash needs.
+			const revealByLayout = async (messageIds: readonly string[]) => {
+				for (const messageId of messageIds) {
+					if (!messageId) continue;
+					const index = pretextDocumentRef.current.readWindow().index;
+					const node = viewportRef.current;
+					if (!index || !node) return false;
+					const itemIndex = index.itemIndicesForSourceMessageId(messageId)[0];
+					if (itemIndex == null) continue;
+					const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
+					pinnedToBottomRef.current = false;
+					setPinnedToBottom(false);
+					writeScrollTop(targetTop);
+					await waitAnimationFrame();
+					if (cancelled()) return false;
+					if (revealMounted()) return true;
+				}
+				return false;
+			};
 			if (revealMounted()) return true;
-			const index = pretextDocument.index;
-			const node = viewportRef.current;
-			if (!index || !node) return false;
-			for (const target of targetIds) {
-				const messageId = messageIdFromTarget(target);
-				const itemIndex = index.itemIndicesForSourceMessageId(messageId)[0];
-				if (itemIndex == null) continue;
-				const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
+			const localIds = targetIds.map(messageIdFromTarget);
+			if (await revealByLayout(localIds)) return true;
+			if (cancelled()) return false;
+
+			// Not in the loaded window.
+			//
+			// The exact list loads the newest page and extends UPWARD only, so a search
+			// hit / deep link older than the loaded window has no layout item and no DOM
+			// node — the case that used to make the jump silently do nothing. Resolve the
+			// target's seq on the server, then page older until the window covers it.
+			const resolved = await resolveJumpTargetSeq(targetIds, {
+				fetchMessageLocation: (messageId) => narratorsApi.getMessageLocation(narratorId, messageId),
+				fetchToolMessage: async (toolUseId) => {
+					const detail = await narratorsApi.getToolCallDetail(narratorId, toolUseId);
+					return {
+						messageId: typeof detail?.messageId === "string" ? detail.messageId : undefined,
+					};
+				},
+			});
+			if (!resolved || cancelled()) return false;
+			// The top-level message that RENDERS the target may be an ancestor (a
+			// message inside a subagent tree), so try it too when locating the row.
+			const revealIds = resolved.topLevelMessageId
+				? [...localIds, resolved.topLevelMessageId]
+				: localIds;
+
+			for (let expansions = 0; ; expansions++) {
+				const loaded = pretextDocumentRef.current.readWindow();
+				const decision = resolveJumpWindowDecision({
+					targetSeq: resolved.seq,
+					oldestLoadedSeq: loaded.oldestLoadedSeq,
+					hasPrev: loaded.hasPrev,
+					expansions,
+				});
+				if (decision.kind === "in-window") break;
+				if (decision.kind === "unreachable") {
+					// Say so rather than looking broken: the reader clicked a result and
+					// nothing moved, and the two reasons (history genuinely does not contain
+					// it / this jump hit its page budget) are both worth distinguishing from
+					// a frozen UI.
+					notifications.show({
+						color: "yellow",
+						message:
+							decision.reason === "budget-exhausted"
+								? t("jumpTargetTooFar")
+								: t("jumpTargetUnavailable"),
+					});
+					return false;
+				}
+				// Paging upward while pinned to the bottom would re-snap the canvas to the
+				// tail on every commit (commitPrependLayout's pinned branch), fighting the
+				// jump. A jump is an explicit reading action, so unpin first.
 				pinnedToBottomRef.current = false;
 				setPinnedToBottom(false);
-				writeScrollTop(targetTop);
-				await waitAnimationFrame();
-				if (revealMounted()) return true;
+				const added = await loadOlderAsyncRef.current().catch(() => 0);
+				if (cancelled()) return false;
+				// A page that prepended nothing while still claiming `hasPrev` would spin
+				// this loop against an unchanged window; treat it as the end of history.
+				if (added <= 0 && pretextDocumentRef.current.readWindow().hasPrev) {
+					notifications.show({ color: "yellow", message: t("jumpTargetUnavailable") });
+					return false;
+				}
 			}
-			return false;
+			// The window now covers the target; wait for the layout commit the last page
+			// produced before reading item offsets from it.
+			await waitAnimationFrame();
+			if (cancelled()) return false;
+			return revealByLayout(revealIds);
 		},
-		[pretextDocument.index, writeScrollTop],
+		[narratorId, t, writeScrollTop],
 	);
+
+	// UI-driven LOD changes (the indicator's notches / steppers) never pass through
+	// the wheel/pinch handlers, so they publish their focus point here instead —
+	// same field the gesture writes, same TTL, so the rebuild path is identical.
+	const prepareLodChange = useCallback((clientY: number) => {
+		const node = viewportRef.current;
+		if (!node) return;
+		lodFocusRef.current = createLodFocusPoint(
+			clientY,
+			node.getBoundingClientRect().top,
+			Date.now(),
+		);
+	}, []);
 
 	useImperativeHandle(
 		ref,
@@ -3424,38 +3536,46 @@ export const PretextExactMessageList = forwardRef<
 			refreshStructure: () => pretextDocument.reload(),
 			detachFromBottom,
 			scrollToMessageTarget,
+			prepareLodChange,
 		}),
-		[detachFromBottom, pretextDocument.reload, scrollToBottom, scrollToMessageTarget],
+		[
+			detachFromBottom,
+			pretextDocument.reload,
+			prepareLodChange,
+			scrollToBottom,
+			scrollToMessageTarget,
+		],
 	);
 
 	// Deep-link / search jump: reveal the target once per (narrator, target) pair.
 	//
-	// Retried while it fails rather than latched on the first attempt: the document
-	// may still be loading, and the target may live above the loaded window (the
-	// jump then resolves once an older page arrives). Only a SUCCESSFUL reveal is
-	// recorded, so a subsequent rebuild does not re-jump — and returning to the same
-	// target later (a repeated search hit) re-flashes because the panel hands the id
-	// back as a fresh mount.
+	// Gated on a READY document rather than retried per rebuild. The jump now reaches
+	// history above the loaded window by paging toward it itself, so the only thing
+	// it cannot do is start before there is a window at all — and a retry loop over a
+	// path that fetches (and can report failure to the reader) would fire a request
+	// and a notice on every intermediate commit. Only a SUCCESSFUL reveal is
+	// recorded, so returning to the same target later (a repeated search hit)
+	// re-flashes because the panel hands the id back as a fresh mount.
 	const jumpedHighlightRef = useRef<string | null>(null);
+	const documentReady = pretextDocument.status === "ready";
 	useEffect(() => {
 		if (!highlightMessageId) {
 			jumpedHighlightRef.current = null;
 			return;
 		}
+		if (!documentReady) return;
 		const key = `${narratorId}:${highlightMessageId}`;
 		if (jumpedHighlightRef.current === key) return;
-		let cancelled = false;
+		// Latch BEFORE awaiting: a failed deep-link jump has already told the reader
+		// why (the notice inside scrollToMessageTarget), and re-running it on the next
+		// commit would repeat both the fetch and the notice.
+		jumpedHighlightRef.current = key;
 		void scrollToMessageTarget({
 			domIds: [`msg-${highlightMessageId}`],
 			targetIds: [highlightMessageId],
 			highlightId: highlightMessageId,
-		}).then((ok) => {
-			if (ok && !cancelled) jumpedHighlightRef.current = key;
 		});
-		return () => {
-			cancelled = true;
-		};
-	}, [highlightMessageId, narratorId, scrollToMessageTarget]);
+	}, [documentReady, highlightMessageId, narratorId, scrollToMessageTarget]);
 
 	// A flash outlives its row's mount (the reader can scroll away mid-animation),
 	// so the controller is stopped explicitly on unmount.
