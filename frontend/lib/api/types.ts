@@ -4,9 +4,11 @@ export type {
 	CompactMessageDetail,
 } from "@shared/compact-message";
 
+import type { TextCitation } from "@shared/citations";
 import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
+export type { TextCitation } from "@shared/citations";
 export type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type ChangelogEntry = {
@@ -396,6 +398,8 @@ export interface BaseContentBlock {
 	uploadNarratorId?: string;
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
 	_subagentActivity?: SubagentActivitySummary;
+	/** Source citations on assistant text blocks, indexed against `text`. */
+	citations?: TextCitation[];
 	[key: string]: unknown;
 }
 

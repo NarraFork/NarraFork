@@ -10,6 +10,7 @@ import {
 	type ProviderResolution,
 	resolveProviderAndModel,
 } from "./provider";
+import { stripCitationMarkersForModel } from "./strip-citation-markers";
 import { stripPlanBodyForModel } from "./strip-plan-body";
 import "./tools";
 import { uniquifyDbMessageToolUseIds } from "./tool-use-id-dedup";
@@ -69,11 +70,15 @@ export async function buildHistory(
 	// persisted DB rows keep the full plan for the UI; this only mutates the
 	// in-memory copy passed to the provider adapter.
 	const modelMessages = stripPlanBodyForModel(dbMessages);
+	// Historical rows may still embed provider-internal citation markers. Replaying
+	// them teaches the model the markers are part of its output format, so it keeps
+	// producing them; strip on the in-memory copy only.
+	const cleanedMessages = stripCitationMarkersForModel(modelMessages);
 	// Some providers mint the same tool_use id for every call (e.g. "call_go_0"),
 	// which only breaks once several turns accumulate: the replayed history then
 	// carries duplicate ids and the API rejects the request with 400. Rename the
 	// later collisions in this in-memory copy — DB rows keep the original ids.
-	const uniqueMessages = uniquifyDbMessageToolUseIds(modelMessages, {
+	const uniqueMessages = uniquifyDbMessageToolUseIds(cleanedMessages, {
 		narratorId,
 		provider: resolved.provider,
 		model: resolved.model,

@@ -30,6 +30,7 @@ import type {
 	GenerateOptions,
 	ParsedStreamEvent,
 	ProviderAdapter,
+	ProviderTextCitation,
 } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
 import {
@@ -1759,9 +1760,67 @@ export interface ResponsesAPIChunk {
 	/** Present on response.image_generation_call.partial_image events. */
 	partial_image_index?: number;
 	partial_image_b64?: string;
+	/** Present on response.output_text.annotation.added events. */
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
+	annotation?: any;
+	annotation_index?: number;
 	sequence_number?: number;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
 	response?: any;
+}
+
+/**
+ * Map a Responses API annotation object to the shared provider citation shape.
+ *
+ * Only `url_citation` carries a resolvable source today; other annotation types
+ * (file_citation, container_file_citation, …) are kept as internal refs so the
+ * reference number still renders without exposing the raw id.
+ */
+function parseResponsesAnnotation(
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
+	annotation: any,
+	outputIndex?: number,
+): ProviderTextCitation | null {
+	if (!annotation || typeof annotation !== "object") return null;
+	const endIndex = annotation.end_index ?? annotation.endIndex;
+	if (typeof endIndex !== "number" || !Number.isFinite(endIndex)) return null;
+	const startIndexRaw = annotation.start_index ?? annotation.startIndex;
+	const url = typeof annotation.url === "string" ? annotation.url : undefined;
+	const title = typeof annotation.title === "string" ? annotation.title : undefined;
+	const sourceRef =
+		typeof annotation.file_id === "string"
+			? annotation.file_id
+			: typeof annotation.id === "string"
+				? annotation.id
+				: undefined;
+	if (!url && !title && !sourceRef) return null;
+	return {
+		startIndex: typeof startIndexRaw === "number" ? startIndexRaw : undefined,
+		endIndex,
+		url,
+		title,
+		sourceRef,
+		outputIndex,
+	};
+}
+
+/** Collect annotations from a finalized assistant message output item. */
+function collectAssistantItemCitations(
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
+	item: any,
+	outputIndex?: number,
+): ProviderTextCitation[] {
+	const parts = Array.isArray(item?.content) ? item.content : [];
+	const out: ProviderTextCitation[] = [];
+	for (const part of parts) {
+		if (part?.type !== "output_text") continue;
+		const annotations = Array.isArray(part.annotations) ? part.annotations : [];
+		for (const annotation of annotations) {
+			const citation = parseResponsesAnnotation(annotation, outputIndex);
+			if (citation) out.push(citation);
+		}
+	}
+	return out;
 }
 
 /** Accumulator for a single Responses API tool call, keyed by output_index. */
@@ -1893,6 +1952,16 @@ export function parseResponsesAPIEvent(
 		return results;
 	}
 
+	// ── Text citations: streamed annotations ──
+	// Native web search reports sources out-of-band instead of (only) as inline
+	// markers. Surfacing them structurally is what keeps `citeturn…` control
+	// markers out of the visible text.
+	if (type === "response.output_text.annotation.added") {
+		const citation = parseResponsesAnnotation(chunk.annotation, chunk.output_index);
+		if (citation) results.push({ textCitations: [citation] });
+		return results;
+	}
+
 	// ── Assistant message items ──
 	// Responses API surfaces assistant messages as output items with stable item ids.
 	// Capture the id so higher layers can persist and replay it as the official
@@ -1904,6 +1973,13 @@ export function parseResponsesAPIEvent(
 		chunk.item.id
 	) {
 		results.push({ messageId: chunk.item.id });
+		// The finalized item also carries the authoritative annotation list. Emit
+		// it as a fallback for gateways that never send the incremental events —
+		// the loop dedupes, so emitting both is safe.
+		if (type === "response.output_item.done") {
+			const citations = collectAssistantItemCitations(chunk.item, chunk.output_index);
+			if (citations.length > 0) results.push({ textCitations: citations });
+		}
 		return results;
 	}
 

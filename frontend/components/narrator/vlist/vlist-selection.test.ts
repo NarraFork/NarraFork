@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { CHATGPT_CITATION_CLOSE, CHATGPT_CITATION_OPEN } from "@shared/citations";
 import type { NarratorMsg } from "../narrator-panel-types";
 import {
 	buildSelectionIndex,
@@ -13,6 +14,8 @@ import {
  * coded to lock the ON-path selection semantics against drift from the
  * ChunkedMessageList reference implementation.
  */
+
+const CITATION_MARKER = `${CHATGPT_CITATION_OPEN}turn204588view0${CHATGPT_CITATION_CLOSE}`;
 
 // biome-ignore lint/suspicious/noExplicitAny: test fixtures are structural
 function msg(partial: Record<string, any>): NarratorMsg {
@@ -106,6 +109,46 @@ describe("buildSelectionIndex", () => {
 			contentJson: [{ type: "text", text: "x" }],
 		});
 		expect(buildSelectionIndex([bad, noSeq]).entries).toHaveLength(0);
+	});
+
+	/**
+	 * Copying is where a leaked internal marker does lasting damage: it leaves the
+	 * app and lands in the user's document. Assistant text is therefore cleaned,
+	 * while a user quoting the same string keeps it — the asymmetry is the point.
+	 */
+	test("assistant copyText drops the exact citation envelope", () => {
+		const withMarker = msg({
+			id: "m-cite",
+			role: "assistant",
+			seq: 7,
+			contentJson: [{ type: "text", text: `已修复${CITATION_MARKER}` }],
+		});
+		const index = buildSelectionIndex([withMarker]);
+		expect(index.entries[0]?.copyText).toBe("已修复");
+	});
+
+	test("assistant copyText keeps ref-shaped text from other protocols", () => {
+		const text = "见 https://example.com/turn0search1 与 turn204588view0";
+		const plain = msg({
+			id: "m-plain",
+			role: "assistant",
+			seq: 9,
+			contentJson: [{ type: "text", text }],
+		});
+		expect(buildSelectionIndex([plain]).entries[0]?.copyText).toBe(text);
+	});
+
+	test("user copyText keeps a quoted citation marker verbatim", () => {
+		const quoted = `${CITATION_MARKER} 是什么`;
+		const quoting = msg({
+			id: "u-cite",
+			role: "user",
+			seq: 8,
+			contentText: quoted,
+			contentJson: [{ type: "text", text: quoted }],
+		});
+		const index = buildSelectionIndex([quoting]);
+		expect(index.entries[0]?.copyText).toBe(quoted);
 	});
 });
 

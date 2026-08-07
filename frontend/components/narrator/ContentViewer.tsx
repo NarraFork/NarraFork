@@ -150,6 +150,14 @@ interface ContentViewerProps {
 	autoFollow?: boolean;
 	/** Changing this resets auto-follow for a new streaming session. */
 	autoFollowKey?: string | number | null;
+	/**
+	 * Text used for copy actions when it must differ from what is displayed.
+	 *
+	 * Assistant text with citations displays projected Markdown (`[1](<url>)`)
+	 * but should copy as the author's prose — pasting link syntax the model never
+	 * wrote would be wrong. Defaults to the displayed content.
+	 */
+	copyText?: string;
 }
 
 /** Sticky wrapper: zero-height, sticks to the top of the nearest scroll
@@ -225,6 +233,7 @@ export const ContentViewer = memo(
 			streaming,
 			autoFollow,
 			autoFollowKey,
+			copyText,
 		},
 		ref,
 	) {
@@ -268,9 +277,10 @@ export const ContentViewer = memo(
 					userToggled.current = true;
 					setWordWrap((v) => !v);
 				},
-				getContent: () => fullContent ?? content,
+				// Handle consumers copy/export, so they get the clean text too.
+				getContent: () => copyText ?? fullContent ?? content,
 			}),
-			[content, fullContent, open],
+			[content, copyText, fullContent, open],
 		);
 
 		useImperativeHandle(ref, () => handle, [handle]);
@@ -513,13 +523,15 @@ export const ContentViewer = memo(
 				)}
 			</CopyButton>
 		);
-		const copyContent = fullContent ?? content;
+		// `copyText` decouples the clipboard from the rendering when the two must
+		// differ (citation projection). The modal keeps showing the displayed form.
+		const copyContent = copyText ?? fullContent ?? content;
 		// Keep inline rendering bounded: huge full payloads remain available via copy/fullscreen,
 		// but the chat list itself should keep rendering the already-truncated preview.
 		const inlineContent =
 			fullContent && fullContent.length <= INLINE_FULL_CONTENT_MAX_CHARS ? fullContent : content;
 		const copyBtn = makeCopyBtn(copyContent);
-		const modalContent = copyContent;
+		const modalContent = fullContent ?? content;
 		const modalPreview =
 			modalContent.length > MODAL_FULL_CONTENT_MAX_CHARS
 				? {
