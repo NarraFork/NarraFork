@@ -102,6 +102,8 @@ export type PluginProviderPrefixMap = Record<string, string>;
 export interface PluginStateRecord {
 	pluginId: string;
 	current: PluginPackageReference | null;
+	/** Internal authority generation; package hash remains the immutable package identity. */
+	authorityInstallationId: string | null;
 	desiredState: DesiredState;
 	compatibility: CompatibilityState;
 	runtimeState: RuntimeState;
@@ -285,6 +287,26 @@ function parsePackageReference(value: unknown, label: string): PluginPackageRefe
 	return { version: value.version, hash: value.hash };
 }
 
+function parseAuthorityInstallationId(
+	value: unknown,
+	current: PluginPackageReference | null,
+	pluginId: string,
+): string | null {
+	// Legacy state files used the immutable package hash directly as the authority identity.
+	if (value === undefined) return current?.hash ?? null;
+	if (value === null) return null;
+	if (
+		typeof value !== "string" ||
+		!value ||
+		value.length > 128 ||
+		value !== value.trim() ||
+		/[\0\r\n]/u.test(value)
+	) {
+		throw new ValidationError(`Plugin authority installation id is invalid: ${pluginId}`);
+	}
+	return value;
+}
+
 function parseGrantSummary(value: unknown): PluginGrantSummary {
 	if (!isRecord(value)) throw new ValidationError("Plugin grants summary is invalid");
 	if (!isNonNegativeInteger(value.count))
@@ -389,9 +411,15 @@ function parseStateRecord(
 	if (!isIsoDate(value.createdAt) || !isIsoDate(value.updatedAt)) {
 		throw new ValidationError(`Plugin timestamps are invalid: ${pluginId}`);
 	}
+	const current = parsePackageReference(value.current, `${pluginId}.current`);
 	return {
 		pluginId,
-		current: parsePackageReference(value.current, `${pluginId}.current`),
+		current,
+		authorityInstallationId: parseAuthorityInstallationId(
+			value.authorityInstallationId,
+			current,
+			pluginId,
+		),
 		desiredState: value.desiredState as DesiredState,
 		compatibility: value.compatibility as CompatibilityState,
 		runtimeState: value.runtimeState as RuntimeState,
@@ -652,6 +680,7 @@ export function createPluginStateRecord(
 	return {
 		pluginId,
 		current: null,
+		authorityInstallationId: null,
 		desiredState: "disabled",
 		compatibility: "unknown",
 		runtimeState: "inactive",

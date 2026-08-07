@@ -10,6 +10,8 @@ export interface PluginUiSessionBinding {
 	pluginId: string;
 	version: string;
 	hash: string;
+	/** Internal authority generation; hash remains the package/asset identity. */
+	authorityInstallationId: string;
 	principalId: string;
 	contributionId: string;
 	panelInstanceId: string;
@@ -187,6 +189,7 @@ export class PluginUiSessionService {
 			"pluginId",
 			"version",
 			"hash",
+			"authorityInstallationId",
 			"contributionId",
 			"panelInstanceId",
 			"surface",
@@ -249,6 +252,7 @@ export class PluginUiSessionService {
 			"pluginId",
 			"version",
 			"hash",
+			"authorityInstallationId",
 			"contributionId",
 			"panelInstanceId",
 			"surface",

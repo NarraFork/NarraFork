@@ -22,6 +22,7 @@ function makeSession(): PluginUiSession {
 		pluginId: "com.example.host",
 		version: "1.0.0",
 		hash: "c".repeat(64),
+		authorityInstallationId: "installation-ui-host",
 		principalId: "user-1",
 		contributionId: "panel",
 		panelInstanceId: "panel-1",
@@ -117,7 +118,7 @@ describe("PluginUiHost", () => {
 		const hostServices = new PluginHostServices({ capabilityBroker, storageFactory });
 		const session = makeSession();
 		const runtimeId = "runtime-shared-storage";
-		const installationId = session.hash;
+		const installationId = session.authorityInstallationId;
 		const capabilities: StoredPermissionGrant["capability"][] = [
 			"storage.read_self",
 			"storage.write_self",

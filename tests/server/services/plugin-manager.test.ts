@@ -253,6 +253,30 @@ describe("PluginManager", () => {
 		expect((await manager.stateStore.listOperations(installed.pluginId)).at(-1)?.status).toBe(
 			"succeeded",
 		);
+
+		const reinstalled = await manager.install(source);
+		expect(reinstalled.current).toEqual(installed.current);
+		expect(reinstalled.authorityInstallationId).toBeTruthy();
+		expect(reinstalled.authorityInstallationId).not.toBe(installed.current.hash);
+		const replacementAuthorityId = pluginInstallationAuthorityId(
+			reinstalled.pluginId,
+			reinstalled.authorityInstallationId as string,
+		);
+		expect((await integrationAuthorityService.requireSnapshot(authorityId)).authority.state).toBe(
+			"revoked",
+		);
+		expect(
+			(await integrationAuthorityService.requireSnapshot(replacementAuthorityId)).authority.state,
+		).toBe("active");
+		expect(
+			(await manager.list()).filter((item) => item.pluginId === installed.pluginId),
+		).toHaveLength(1);
+
+		const repeated = await manager.install(source);
+		expect(repeated.authorityInstallationId).toBe(reinstalled.authorityInstallationId);
+		expect(
+			(await manager.list()).filter((item) => item.pluginId === installed.pluginId),
+		).toHaveLength(1);
 	});
 
 	test("binds each runtime generation and refreshes or revokes access with grant lifecycle changes", async () => {
@@ -665,6 +689,46 @@ describe("PluginManager", () => {
 		expect(statusA1.runtimeState).toBe("active");
 		expect(statusA2.runtimeState).toBe("active");
 		expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
+	});
+
+	test("isolates a revoked residual plugin during initialization", async () => {
+		const root = await makeTempRoot();
+		const storeRoot = join(root, "plugins");
+		const first = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const badSource = await makePackage(root, "com.example.revoked-residual");
+		const bad = await first.install(badSource);
+		const healthy = await first.install(await makePackage(root, "com.example.healthy-residual"));
+		if (!bad.current || !healthy.current) throw new Error("Installed plugin has no package");
+		await first.uninstall(bad.pluginId);
+
+		const residual = await first.packageStore.install(badSource);
+		await first.stateStore.updateState(bad.pluginId, {
+			current: { version: residual.version, hash: residual.hash },
+			authorityInstallationId: residual.hash,
+			desiredState: "enabled",
+			compatibility: "compatible",
+			runtimeState: "inactive",
+		});
+
+		const recovered = new PluginManager({
+			root: storeRoot,
+			disabled: true,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await expect(recovered.initialize()).resolves.toBeDefined();
+		const badStatus = await recovered.getStatus(bad.pluginId);
+		expect(badStatus).toMatchObject({
+			desiredState: "disabled",
+			runtimeState: "failed",
+			lastError: { code: "INTEGRATION_AUTHORITY_CONFLICT" },
+		});
+		const healthyStatus = await recovered.getStatus(healthy.pluginId);
+		expect(healthyStatus?.lastError?.code).not.toBe("INTEGRATION_AUTHORITY_CONFLICT");
+		expect(healthyStatus?.current).toEqual(healthy.current);
 	});
 
 	test("recovers incomplete journal operations by disabling automatic activation", async () => {

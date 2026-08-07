@@ -28,6 +28,7 @@ const expectedGrant = {
 	grantedBy: "admin-1",
 };
 const defaultPermissionSet = {
+	installationId: hash,
 	revision: 7,
 	grants: [
 		{
@@ -626,6 +627,7 @@ describe("plugin UI routes", () => {
 			pluginId,
 			version,
 			hash,
+			authorityInstallationId: hash,
 			principalId: "user-1",
 			contributionId: "panel",
 			panelInstanceId: "listener-test",

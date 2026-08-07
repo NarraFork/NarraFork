@@ -846,7 +846,7 @@ export class PluginPermissionStore {
 		if (!this.stateStore) return;
 		const state = await this.stateStore.getState(pluginId);
 		if (!state) return;
-		const installationId = state.current?.hash;
+		const installationId = state.authorityInstallationId ?? state.current?.hash;
 		const set = installationId
 			? this.document?.plugins[pluginId]?.[installationId]
 			: Object.values(this.document?.plugins[pluginId] ?? {}).sort((a, b) =>

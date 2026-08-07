@@ -160,6 +160,33 @@ describe("PluginIntegrationAuthorityService", () => {
 		await expect(
 			service.ensureInstallation(pluginId, installationId, permissionSummary(revokedGrant.set)),
 		).rejects.toThrow(/cannot be reactivated/i);
+
+		const reinstalled = await service.ensureInstallation(
+			pluginId,
+			installationId,
+			{
+				count: 1,
+				capabilities: ["diagnostics.readOwnLogs"],
+				revision: 1,
+			},
+			undefined,
+			{ replaceRevoked: true },
+		);
+		expect(reinstalled.installationId).not.toBe(installationId);
+		expect(reinstalled.grants.map((grant) => grant.capability)).toEqual([
+			"diagnostics.readOwnLogs",
+		]);
+		const replacementAuthorityId = pluginInstallationAuthorityId(
+			pluginId,
+			reinstalled.installationId,
+		);
+		authorityIds.add(replacementAuthorityId);
+		expect((await service.authorityService.requireSnapshot(authorityId)).authority.state).toBe(
+			"revoked",
+		);
+		expect(
+			(await service.authorityService.requireSnapshot(replacementAuthorityId)).authority.state,
+		).toBe("active");
 	});
 
 	test("requires the live authority final gate even when the legacy broker cache allows", async () => {

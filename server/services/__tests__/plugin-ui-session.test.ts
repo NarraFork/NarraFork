@@ -6,6 +6,7 @@ const binding = {
 	pluginId: "com.example.ui",
 	version: "1.0.0",
 	hash: "a".repeat(64),
+	authorityInstallationId: "installation-ui-authority",
 	principalId: "user-1",
 	contributionId: "panel",
 	panelInstanceId: "panel-1",
