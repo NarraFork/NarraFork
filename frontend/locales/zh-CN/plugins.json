@@ -210,6 +210,7 @@
 			"PLUGIN_RETRY_REQUIRES_RESTART": "该插件已被隔离，需要重启服务器或重新安装后才能重试。",
 			"PLUGIN_REQUIRES_ADMIN": "该插件需要管理员权限。非管理员用户只能安装和管理纯主题插件。",
 			"PLUGIN_THEME_NOT_FOUND": "该主题不可用。",
+			"INTEGRATION_AUTHORITY_CONFLICT": "插件授权状态与当前安装冲突。",
 			"NOT_FOUND": "未找到请求的插件资源。",
 			"VALIDATION_ERROR": "请求未通过服务端校验。",
 			"UNKNOWN": "发生了未知的插件错误。"

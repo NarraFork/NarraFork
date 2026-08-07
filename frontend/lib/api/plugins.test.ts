@@ -6,9 +6,11 @@ describe("plugins API", () => {
 	const g = globalThis as typeof globalThis & {
 		localStorage?: Storage;
 		fetch: typeof fetch;
+		XMLHttpRequest?: typeof XMLHttpRequest;
 	};
 	const originalFetch = g.fetch;
 	const originalLocalStorage = g.localStorage;
+	const originalXMLHttpRequest = g.XMLHttpRequest;
 
 	afterEach(() => {
 		Object.defineProperty(g, "fetch", { value: originalFetch, configurable: true });
@@ -16,6 +18,14 @@ describe("plugins API", () => {
 			Reflect.deleteProperty(g, "localStorage");
 		} else {
 			Object.defineProperty(g, "localStorage", { value: originalLocalStorage, configurable: true });
+		}
+		if (originalXMLHttpRequest === undefined) {
+			Reflect.deleteProperty(g, "XMLHttpRequest");
+		} else {
+			Object.defineProperty(g, "XMLHttpRequest", {
+				value: originalXMLHttpRequest,
+				configurable: true,
+			});
 		}
 	});
 
@@ -38,6 +48,37 @@ describe("plugins API", () => {
 		return new Response(JSON.stringify(body), {
 			status,
 			headers: { "content-type": "application/json" },
+		});
+	}
+
+	function installUploadEnvironment(body: unknown, status = 400): void {
+		installEnvironment(jsonResponse({}));
+		const serializedBody = JSON.stringify(body);
+		class MockXMLHttpRequest {
+			status = status;
+			statusText = status === 400 ? "Bad Request" : "OK";
+			responseText = serializedBody;
+			upload = { onprogress: null };
+			onload: (() => void) | null = null;
+			onerror: (() => void) | null = null;
+			ontimeout: (() => void) | null = null;
+			onabort: (() => void) | null = null;
+
+			open(): void {}
+			setRequestHeader(): void {}
+			getAllResponseHeaders(): string {
+				return "content-type: application/json\r\n";
+			}
+			send(): void {
+				queueMicrotask(() => this.onload?.());
+			}
+			abort(): void {
+				this.onabort?.();
+			}
+		}
+		Object.defineProperty(g, "XMLHttpRequest", {
+			value: MockXMLHttpRequest as unknown as typeof XMLHttpRequest,
+			configurable: true,
 		});
 	}
 
@@ -135,6 +176,26 @@ describe("plugins API", () => {
 			const apiError = error as ApiError;
 			expect(apiError.status).toBe(503);
 			expect(apiError.data?.code).toBe("PLUGINS_DISABLED");
+		}
+	});
+
+	test("upload preserves the server error field in ApiError", async () => {
+		installUploadEnvironment({
+			error: "Invalid plugin manifest: contributes.themes.0.tokens: unrecognized key",
+			code: "VALIDATION_ERROR",
+		});
+
+		try {
+			await api.installUpload(new File(["PK"], "theme.zip", { type: "application/zip" }));
+			expect.unreachable("expected ApiError");
+		} catch (error) {
+			expect(error).toBeInstanceOf(ApiError);
+			const apiError = error as ApiError;
+			expect(apiError.status).toBe(400);
+			expect(apiError.message).toBe(
+				"Invalid plugin manifest: contributes.themes.0.tokens: unrecognized key",
+			);
+			expect(apiError.data?.code).toBe("VALIDATION_ERROR");
 		}
 	});
 

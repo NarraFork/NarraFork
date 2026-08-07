@@ -515,7 +515,7 @@ export class PluginUiHost {
 			runtimeId: `ui:${input.session.sessionId}`,
 			runtimeGeneration: input.session.generation,
 			contributionId: input.session.contributionId,
-			installationId: input.session.hash,
+			installationId: input.session.authorityInstallationId,
 		};
 		const contextInput = {
 			requestId: input.request.id,
@@ -689,7 +689,7 @@ export class PluginUiHost {
 			throw new PluginUiHostError("INVALID_PARAMS", "Invalid event subscription parameters");
 		const principal: PluginEventPrincipal = {
 			pluginId: input.session.pluginId,
-			installationId: input.session.hash,
+			installationId: input.session.authorityInstallationId,
 			packageVersion: input.session.version,
 			runtimeId: `ui:${input.session.sessionId}`,
 			generation: input.session.generation,

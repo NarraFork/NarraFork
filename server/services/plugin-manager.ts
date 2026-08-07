@@ -400,11 +400,15 @@ function packageReference(
 }
 
 function packagePointersEqual(
-	left: PluginPackageReference | undefined,
+	left: PluginPackageReference | null | undefined,
 	right: PluginPackageReference | null | undefined,
 ): boolean {
 	if (!left || !right) return !left && !right;
 	return left.version === right.version && left.hash === right.hash;
+}
+
+function authorityInstallationId(state: PluginStateRecord | undefined): string | undefined {
+	return state?.authorityInstallationId ?? state?.current?.hash;
 }
 
 function errorMessage(error: unknown): string {
@@ -422,7 +426,7 @@ async function resolveManagerToolPrincipal(
 	const diagnostics = runtime.getDiagnostics();
 	const state = await stateStore.getState(pluginId);
 	const packageVersion = diagnostics.pluginVersion ?? state?.current?.version;
-	const installationId = state?.current?.hash;
+	const installationId = authorityInstallationId(state);
 	if (!packageVersion || !installationId) return undefined;
 	return {
 		pluginId,
@@ -1091,9 +1095,11 @@ export class PluginManager {
 			const packageSummary = currentPackage(plugin);
 			const currentState =
 				stateById.get(pluginId) ?? createPluginStateRecord(pluginId, this.timestamp());
+			const nextCurrent = plugin?.current ?? currentState.current;
 			const next: PluginStateRecord = {
 				...currentState,
-				current: plugin?.current ?? currentState.current,
+				current: nextCurrent,
+				authorityInstallationId: currentState.authorityInstallationId ?? nextCurrent?.hash ?? null,
 				compatibility: packageCompatibility(plugin),
 				updatedAt: this.timestamp(),
 			};
@@ -1148,12 +1154,30 @@ export class PluginManager {
 		await this.refreshCatalog("initialize");
 		for (const state of reconciled) {
 			if (!state.current) continue;
-			const permissions = await this.integrationAuthorityService.ensureInstallation(
-				state.pluginId,
-				state.current.hash,
-				state.grants,
-			);
-			await this.syncPermissionSummary(state.pluginId, permissions);
+			const installationId = authorityInstallationId(state);
+			if (!installationId) continue;
+			try {
+				const permissions = await this.integrationAuthorityService.ensureInstallation(
+					state.pluginId,
+					installationId,
+					state.grants,
+				);
+				await this.syncPermissionSummary(state.pluginId, permissions);
+			} catch (error) {
+				await this.stateStore.updateState(state.pluginId, {
+					desiredState: "disabled",
+					runtimeState: "failed",
+					lastError: pluginStateError(error, {
+						phase: "authority-initialize",
+						at: this.timestamp(),
+					}),
+				});
+				logger.warn("Plugin authority reconciliation failed; plugin isolated", {
+					pluginId: state.pluginId,
+					installationId,
+					error: errorMessage(error),
+				});
+			}
 		}
 
 		for (const [pluginId, operations] of incompleteByPlugin) {
@@ -1189,7 +1213,8 @@ export class PluginManager {
 
 		this.initialized = true;
 		if (!this.disabled) {
-			const startupPlugins = reconciled.filter((state) => {
+			const startupStates = await this.stateStore.listStates();
+			const startupPlugins = startupStates.filter((state) => {
 				const plugin = this.catalogPlugin(state.pluginId);
 				const manifest = currentPackage(plugin)?.manifest;
 				return (
@@ -1251,10 +1276,13 @@ export class PluginManager {
 		try {
 			const previousState = await this.stateStore.getState(installed.pluginId);
 			const nextPackage = { version: installed.version, hash: installed.hash };
+			const samePackage = packagePointersEqual(previousState?.current, nextPackage);
+			const previousInstallationId = authorityInstallationId(previousState);
+			const requestedInstallationId = samePackage
+				? (previousInstallationId ?? installed.hash)
+				: installed.hash;
 			const isUpgrade =
-				previousState?.current !== null &&
-				previousState?.current !== undefined &&
-				!packagePointersEqual(previousState.current, nextPackage);
+				previousState?.current !== null && previousState?.current !== undefined && !samePackage;
 			if (isUpgrade) {
 				const runtime = this.runtimeSupervisor.get(installed.pluginId);
 				await this.revokePluginLifecycle(installed.pluginId, "upgrade", "manager-upgrade", {
@@ -1277,6 +1305,7 @@ export class PluginManager {
 			await this.stateStore.updateState(installed.pluginId, (current) => ({
 				...current,
 				current: { version: installed.version, hash: installed.hash },
+				authorityInstallationId: requestedInstallationId,
 				desiredState: "disabled",
 				compatibility,
 				runtimeState: "inactive",
@@ -1295,14 +1324,15 @@ export class PluginManager {
 			}));
 			const permissions = await this.integrationAuthorityService.ensureInstallation(
 				installed.pluginId,
-				installed.hash,
+				requestedInstallationId,
 				seedGrantsFromManifest(
 					previousState?.grants ??
 						createPluginStateRecord(installed.pluginId, this.timestamp()).grants,
 					installed.manifest.permissions.host,
 					{ pluginId: installed.pluginId },
 				),
-				previousState?.current?.hash,
+				isUpgrade ? previousInstallationId : undefined,
+				{ replaceRevoked: true },
 			);
 			await this.syncPermissionSummary(installed.pluginId, permissions);
 			await this.refreshCatalog("install");
@@ -1543,7 +1573,14 @@ export class PluginManager {
 		runtimeId: string,
 		runtimeGeneration: number,
 	): Promise<ReturnType<PluginHostServices["bindRuntime"]>> {
-		const installationId = context.package.hash;
+		const installationId = authorityInstallationId(context.state);
+		if (!installationId) {
+			throw new PluginManagerError(
+				"Plugin authority installation is unavailable",
+				"PLUGIN_PACKAGE_UNAVAILABLE",
+				422,
+			);
+		}
 		const permissions = await this.integrationAuthorityService.ensureInstallation(
 			context.pluginId,
 			installationId,
@@ -1977,21 +2014,25 @@ export class PluginManager {
 
 	private async currentInstallationId(pluginId: string): Promise<string> {
 		const state = await this.requireState(pluginId);
-		if (!state.current?.hash) {
+		const installationId = authorityInstallationId(state);
+		if (!state.current?.hash || !installationId) {
 			throw new PluginManagerError(
 				"Plugin has no current installation package",
 				"PLUGIN_PACKAGE_UNAVAILABLE",
 				422,
 			);
 		}
-		return state.current.hash;
+		return installationId;
 	}
 
 	private async syncPermissionSummary(
 		pluginId: string,
 		permissions: PluginPermissionSet,
 	): Promise<void> {
-		await this.stateStore.updateGrantSummary(pluginId, permissionSummary(permissions));
+		await this.stateStore.updateState(pluginId, {
+			authorityInstallationId: permissions.installationId,
+			grants: permissionSummary(permissions),
+		});
 	}
 
 	private async applyPermissionMutationLocked(
@@ -2096,8 +2137,9 @@ export class PluginManager {
 					},
 				);
 				const state = await this.requireState(pluginId);
-				if (state.current?.hash) {
-					await this.bindRuntimeForRuntime(pluginId, state.current.hash, diagnostics);
+				const installationId = authorityInstallationId(state);
+				if (state.current?.hash && installationId) {
+					await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
 				}
 				await this.restorePluginLifecycle(pluginId);
 			}

@@ -39,6 +39,7 @@ interface PluginUiManagerLike {
 		| undefined
 	>;
 	getPermissions?(pluginId: string): Promise<{
+		installationId: string;
 		revision: number;
 		grants: readonly unknown[];
 	}>;
@@ -156,7 +157,7 @@ function permissionGrantFromDetails(value: unknown): PermissionGrant {
 async function getUiPermissions(
 	manager: PluginUiManagerLike,
 	pluginId: string,
-): Promise<{ revision: number; grants: PermissionGrant[] }> {
+): Promise<{ installationId: string; revision: number; grants: PermissionGrant[] }> {
 	if (!manager.getPermissions) {
 		throw new AppError(
 			"Plugin permission details are unavailable",
@@ -176,6 +177,9 @@ async function getUiPermissions(
 	}
 	if (
 		!details ||
+		typeof details.installationId !== "string" ||
+		!details.installationId ||
+		details.installationId.length > 128 ||
 		!Number.isSafeInteger(details.revision) ||
 		details.revision < 0 ||
 		!Array.isArray(details.grants)
@@ -187,6 +191,7 @@ async function getUiPermissions(
 		);
 	}
 	return {
+		installationId: details.installationId,
 		revision: details.revision,
 		grants: details.grants.map(permissionGrantFromDetails),
 	};
@@ -210,7 +215,7 @@ function assertSurfaceScope(
 interface UiCapabilityPrincipalInput {
 	pluginId: string;
 	version: string;
-	hash: string;
+	authorityInstallationId: string;
 	contributionId: string;
 	runtimeId: string;
 	generation: number;
@@ -240,7 +245,7 @@ function createUiCapabilityBinding(
 			runtimeId: principal.runtimeId,
 			runtimeGeneration: principal.generation,
 			contributionId: principal.contributionId,
-			installationId: principal.hash,
+			installationId: principal.authorityInstallationId,
 		},
 		desiredState: "enabled",
 		compatibilityState: "compatible",
@@ -276,7 +281,7 @@ function uiScopeResourceId(input: z.infer<typeof sessionInputSchema>): string | 
  * is the grant, not the lifecycle.
  */
 async function assertUsableUiPanelGrant(
-	permissions: { revision: number; grants: PermissionGrant[] },
+	permissions: { installationId: string; revision: number; grants: PermissionGrant[] },
 	input: z.infer<typeof sessionInputSchema>,
 	manifest: { permissions?: { host?: string[] } },
 	principalId: string,
@@ -285,7 +290,7 @@ async function assertUsableUiPanelGrant(
 	const principal: UiCapabilityPrincipalInput = {
 		pluginId: input.pluginId,
 		version: input.version,
-		hash: input.hash,
+		authorityInstallationId: permissions.installationId,
 		contributionId: input.contributionId,
 		runtimeId: "ui:preflight",
 		generation: 1,
@@ -342,6 +347,7 @@ function bindUiCapability(
 		pluginId: string;
 		version: string;
 		hash: string;
+		authorityInstallationId: string;
 		sessionId: string;
 		generation: number;
 		contributionId: string;
@@ -355,7 +361,7 @@ function bindUiCapability(
 			{
 				pluginId: session.pluginId,
 				version: session.version,
-				hash: session.hash,
+				authorityInstallationId: session.authorityInstallationId,
 				contributionId: session.contributionId,
 				runtimeId: `ui:${session.sessionId}`,
 				generation: session.generation,
@@ -677,7 +683,11 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const user = c.get("user");
 			const principalId = user.sub;
 			await assertUsableUiPanelGrant(permissions, body.data, pkg.manifest, principalId, user.role);
-			const created = sessions.create({ ...body.data, principalId });
+			const created = sessions.create({
+				...body.data,
+				authorityInstallationId: permissions.installationId,
+				principalId,
+			});
 			try {
 				bindUiCapability(broker, permissions, created.session, pkg.manifest);
 			} catch (error) {

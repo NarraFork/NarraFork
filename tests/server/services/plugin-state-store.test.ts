@@ -59,6 +59,28 @@ describe("PluginStateStore", () => {
 		expect((await readdir(root)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
 	});
 
+	test("migrates legacy package-hash authority identities on read", async () => {
+		const root = await makeTempRoot();
+		await mkdir(root, { recursive: true });
+		const pluginId = "com.example.legacy-authority";
+		const legacy = createPluginStateRecord(pluginId);
+		legacy.current = { version: "1.0.0", hash: "b".repeat(64) };
+		const rawLegacy = structuredClone(legacy) as unknown as Record<string, unknown>;
+		delete rawLegacy.authorityInstallationId;
+		await writeFile(
+			join(root, "state.json"),
+			JSON.stringify({
+				version: 1,
+				plugins: { [pluginId]: rawLegacy },
+				diagnostics: [],
+				updatedAt: legacy.updatedAt,
+			}),
+		);
+
+		const store = new PluginStateStore(root);
+		expect((await store.getState(pluginId))?.authorityInstallationId).toBe(legacy.current.hash);
+	});
+
 	test("keeps the previous document when an atomic rename fails", async () => {
 		const root = await makeTempRoot();
 		const initial = new PluginStateStore(root);
