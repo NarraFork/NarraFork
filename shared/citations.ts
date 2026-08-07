@@ -667,36 +667,17 @@ export function projectAssistantTextForDisplay(
 }
 
 /**
- * Project a currently streaming assistant block.
- *
- * The caller holds the full accumulated text, so a fresh literal stream parser
- * can replay it cheaply and intentionally does NOT call `finish()`: a partial
- * opener or an opened-but-not-closed citation remains buffered and invisible.
- * This is the same behavior Codex uses for incremental assistant text.
- */
-export function projectStreamingAssistantText(
-	text: string,
-	citations?: readonly TextCitation[],
-): string {
-	if (!text) return text;
-	const parser = new CitationMarkupStreamParser();
-	const chunk = parser.push(text);
-	const legacy: TextCitation[] = chunk.citations.map(({ anchorIndex, sources }) => ({
-		startIndex: anchorIndex,
-		endIndex: anchorIndex,
-		sources,
-	}));
-	const structured = citations ?? [];
-	return projectCitationsToMarkdown(chunk.visibleText, [...structured, ...legacy]).markdown;
-}
-
-/**
  * Resolve what an assistant text block should DISPLAY versus what it should COPY.
  *
  * These deliberately differ: the display carries numbered reference markers (and
  * Markdown links for resolved sources), while the clipboard carries the prose the
  * model actually wrote. Pasting `[1](<https://…>)` into a document would put link
  * syntax the author never typed into the user's text.
+ *
+ * Streaming text is already clean at the loop boundary, matching Codex's
+ * `emit_streamed_assistant_text_delta`: clients only receive `visible_text` and
+ * must not replay the hidden-markup parser over an ever-growing accumulated
+ * string. The legacy parser is therefore settled-history compatibility only.
  *
  * `copyText` is `null` when the two are identical, so callers can skip passing an
  * override and keep the default copy path untouched.
@@ -707,9 +688,11 @@ export function resolveAssistantTextDisplay(
 	options: { streaming?: boolean } = {},
 ): { display: string; copyText: string | null } {
 	if (!text) return { display: text, copyText: null };
-	const display = options.streaming
-		? projectStreamingAssistantText(text, citations)
-		: projectAssistantTextForDisplay(text, citations);
+	if (options.streaming) {
+		const display = projectCitationsToMarkdown(text, citations).markdown;
+		return { display, copyText: display === text ? null : text };
+	}
+	const display = projectAssistantTextForDisplay(text, citations);
 	const copy = cleanAssistantText(text).text;
 	return { display, copyText: copy === display ? null : copy };
 }

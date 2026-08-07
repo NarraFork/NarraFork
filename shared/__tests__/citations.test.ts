@@ -23,7 +23,6 @@ import {
 	parseLegacyCitationMarkers,
 	projectAssistantTextForDisplay,
 	projectCitationsToMarkdown,
-	projectStreamingAssistantText,
 	remapIndexThroughRemovals,
 	resolveAssistantTextDisplay,
 	sanitizeCitationUrl,
@@ -152,7 +151,7 @@ describe("other protocols are byte-identical when no exact citation envelope exi
 			"正文结尾有个图标 \ue205",
 			"构建通过 \ue200 后面还有很长一段正文内容需要保留",
 		]) {
-			expect(projectStreamingAssistantText(raw)).toBe(raw);
+			expect(resolveAssistantTextDisplay(raw, undefined, { streaming: true }).display).toBe(raw);
 		}
 	});
 
@@ -307,9 +306,14 @@ describe("citation projection", () => {
 		});
 	});
 
-	it("keeps a partial exact opener hidden only while streaming", () => {
+	it("does not replay the hidden-markup parser in the streaming renderer", () => {
+		// The loop owns streaming parsing, exactly like Codex's server-side
+		// emit_streamed_assistant_text_delta. A client fed malformed/raw data must
+		// display what it received rather than maintain a second parser state.
 		const partial = "进行中\ue200ci";
-		expect(projectStreamingAssistantText(partial)).toBe("进行中");
+		expect(resolveAssistantTextDisplay(partial, undefined, { streaming: true }).display).toBe(
+			partial,
+		);
 		expect(projectAssistantTextForDisplay(partial)).toBe(partial);
 	});
 

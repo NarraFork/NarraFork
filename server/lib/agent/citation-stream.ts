@@ -32,12 +32,20 @@ export interface FinalizedAssistantText {
 }
 
 export class TextCitationAccumulator {
-	private provider: ProviderTextCitation[] = [];
+	private provider: Array<ProviderTextCitation & { baseOffset: number }> = [];
 
-	/** Record provider-reported citations. Duplicates are resolved at finalize. */
-	add(citations: readonly ProviderTextCitation[] | undefined): void {
+	/**
+	 * Record provider-reported citations.
+	 *
+	 * `baseOffset` is where the annotation's own output item starts inside the
+	 * turn's concatenated assistant text. Responses annotation indices are
+	 * per-item, so with a single text item the offset is 0 and this is a no-op;
+	 * a second text item would otherwise anchor its references at the wrong
+	 * place. Duplicates are resolved at finalize.
+	 */
+	add(citations: readonly ProviderTextCitation[] | undefined, baseOffset = 0): void {
 		if (!citations || citations.length === 0) return;
-		for (const citation of citations) this.provider.push(citation);
+		for (const citation of citations) this.provider.push({ ...citation, baseOffset });
 	}
 
 	/** Clear state between turns; the accumulator is reused across a session. */
@@ -65,13 +73,13 @@ export class TextCitationAccumulator {
 
 		const remapped: TextCitation[] = [];
 		for (const citation of this.provider) {
-			const endIndex = parsed.changed
-				? remapIndexThroughRemovals(citation.endIndex, parsed.removals)
-				: citation.endIndex;
-			const startRaw = citation.startIndex ?? citation.endIndex;
+			// Per-item annotation index → turn-level raw index, then → cleaned index.
+			const rawEnd = citation.endIndex + citation.baseOffset;
+			const rawStart = (citation.startIndex ?? citation.endIndex) + citation.baseOffset;
+			const endIndex = parsed.changed ? remapIndexThroughRemovals(rawEnd, parsed.removals) : rawEnd;
 			const startIndex = parsed.changed
-				? remapIndexThroughRemovals(startRaw, parsed.removals)
-				: startRaw;
+				? remapIndexThroughRemovals(rawStart, parsed.removals)
+				: rawStart;
 			remapped.push({
 				startIndex,
 				endIndex,

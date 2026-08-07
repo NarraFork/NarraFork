@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import type { TextCitation } from "@shared/citations";
+import { CitationMarkupStreamParser, type TextCitation } from "@shared/citations";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
@@ -2621,6 +2621,28 @@ export async function* agentLoop(
 			/** Source citations reported for this turn's assistant text (native search). */
 			const citationAccum = new TextCitationAccumulator();
 			/**
+			 * Per-output literal citation parsers for the client-visible delta stream.
+			 *
+			 * Codex keeps one AssistantTextStreamParser per response item and emits only
+			 * `parsed.visible_text` to clients. `textOutputIndex` is the stable item
+			 * identity available in NarraFork's provider-neutral protocol, so it fills
+			 * the same role here. Raw text still accumulates in `assistantText`; final
+			 * normalization needs its original coordinates to remap URL annotations.
+			 */
+			const citationStreamParsers = new Map<
+				string,
+				{ parser: CitationMarkupStreamParser; outputIndex?: number }
+			>();
+			/**
+			 * Where each text output item begins inside `assistantText`.
+			 *
+			 * Responses annotation indices are relative to their own output item, so a
+			 * turn with two text items would anchor the second item's references at the
+			 * wrong offset without this. With the usual single text item every offset is
+			 * 0 and the mapping is an identity.
+			 */
+			const textItemBaseOffsets = new Map<string, number>();
+			/**
 			 * Reasoning blocks accumulated during streaming, keyed by itemId.
 			 * Supports multiple reasoning items per turn (e.g. interleaved with tool calls).
 			 * Falls back to a synthetic key "__default" for providers that don't supply itemId.
@@ -3137,6 +3159,52 @@ export async function* agentLoop(
 				yield { type: "tool_use_discarded", toolUseIds: abandoned };
 			}
 
+			/**
+			 * Parse one raw provider text delta into client-visible text.
+			 *
+			 * One parser per output item mirrors Codex's `parsers_by_item`. The parser
+			 * is exact-literal and therefore a byte-identical pass-through for every
+			 * protocol that does not emit the citation envelope.
+			 */
+			function citationStreamKey(outputIndex?: number): string {
+				return outputIndex == null ? "__default" : `output:${outputIndex}`;
+			}
+
+			function visibleCitationDelta(
+				text: string,
+				outputIndex: number | undefined,
+				rawOffsetBefore: number,
+			): string {
+				const key = citationStreamKey(outputIndex);
+				let entry = citationStreamParsers.get(key);
+				if (!entry) {
+					entry = { parser: new CitationMarkupStreamParser(), outputIndex };
+					citationStreamParsers.set(key, entry);
+					// First delta of this item: remember where it starts in the raw text.
+					if (!textItemBaseOffsets.has(key)) textItemBaseOffsets.set(key, rawOffsetBefore);
+				}
+				return entry.parser.push(text).visibleText;
+			}
+
+			/** Codex `finish_item`: flush one output item at its provider completion event. */
+			function* finishCitationDeltaStream(outputIndex?: number): Generator<AgentEvent> {
+				const key = citationStreamKey(outputIndex);
+				const entry = citationStreamParsers.get(key);
+				if (!entry) return;
+				citationStreamParsers.delete(key);
+				const tail = entry.parser.finish();
+				if (tail.visibleText) {
+					yield { type: "stream_text", text: tail.visibleText, outputIndex: entry.outputIndex };
+				}
+			}
+
+			/** Safety-net flush for protocols that do not expose per-item completion. */
+			function* finishCitationDeltaStreams(): Generator<AgentEvent> {
+				for (const { outputIndex } of [...citationStreamParsers.values()]) {
+					yield* finishCitationDeltaStream(outputIndex);
+				}
+			}
+
 			chatRetryLoop: for (;;) {
 				// Reset per-attempt accumulators so a retry starts with a clean slate.
 				// (On the first attempt these are already empty; on retries they may
@@ -3152,6 +3220,8 @@ export async function* agentLoop(
 				assistantText = "";
 				textOutputIndex = undefined;
 				citationAccum.reset();
+				citationStreamParsers.clear();
+				textItemBaseOffsets.clear();
 				reasoningBlockMap.clear();
 				toolUses.length = 0;
 				toolOrderIdentities.clear();
@@ -3307,17 +3377,40 @@ export async function* agentLoop(
 						}
 
 						if (parsed.text) {
+							const rawOffsetBefore = assistantText.length;
 							assistantText += parsed.text;
 							if (parsed.text.trim()) silentToolCallCount = 0;
 							if (parsed.textOutputIndex != null) {
 								textOutputIndex = parsed.textOutputIndex;
 							}
-							yield { type: "stream_text", text: parsed.text, outputIndex: parsed.textOutputIndex };
+							// Match Codex's stream boundary: clients receive only visible text.
+							// The raw delta stays in assistantText so final annotation indices can
+							// still be remapped through the removed envelope ranges.
+							const visibleText = visibleCitationDelta(
+								parsed.text,
+								parsed.textOutputIndex,
+								rawOffsetBefore,
+							);
+							if (visibleText) {
+								yield {
+									type: "stream_text",
+									text: visibleText,
+									outputIndex: parsed.textOutputIndex,
+								};
+							}
 						}
 						// Citations are metadata, not visible output: accumulate silently and
 						// attach them when the text block is finalized. Broadcasting them per
 						// event would add a high-frequency WS channel for no visual gain.
-						if (parsed.textCitations) citationAccum.add(parsed.textCitations);
+						if (parsed.textCitations) {
+							const key = citationStreamKey(
+								parsed.textCitations[0]?.outputIndex ?? parsed.textOutputIndex,
+							);
+							citationAccum.add(parsed.textCitations, textItemBaseOffsets.get(key) ?? 0);
+						}
+						if (parsed.textItemDone) {
+							yield* finishCitationDeltaStream(parsed.textOutputIndex);
+						}
 						if (parsed.toolUses) {
 							// ── Tool use dedup ──
 							// via BOTH the non-streaming `parsed.toolUses` array AND the streaming
@@ -5185,6 +5278,10 @@ export async function* agentLoop(
 				// Chat call succeeded — break out of the retry loop
 				break;
 			} // end for (;;) retry loop
+
+			// Equivalent to Codex's `finish_item`: release a partial opener prefix or
+			// finalize an opened citation before the authoritative block is emitted.
+			yield* finishCitationDeltaStreams();
 
 			// Final safety net: if a provider/parser accidentally surfaced the same toolUseId
 			// multiple times in one turn, collapse them before any drain/execution logic below.

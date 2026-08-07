@@ -1972,7 +1972,12 @@ export function parseResponsesAPIEvent(
 		chunk.item.role === "assistant" &&
 		chunk.item.id
 	) {
-		results.push({ messageId: chunk.item.id });
+		results.push({
+			messageId: chunk.item.id,
+			...(type === "response.output_item.done"
+				? { textItemDone: true, textOutputIndex: chunk.output_index }
+				: {}),
+		});
 		// The finalized item also carries the authoritative annotation list. Emit
 		// it as a fallback for gateways that never send the incremental events —
 		// the loop dedupes, so emitting both is safe.

@@ -21,6 +21,8 @@ type Scenario =
 	| "marker_only"
 	| "annotations"
 	| "annotations_and_marker"
+	| "two_items_annotation"
+	| "item_boundary"
 	| "plain"
 	| "marker_then_tool";
 
@@ -42,8 +44,11 @@ const testProvider: ProviderAdapter = {
 		attempt++;
 		params.onRequestStart?.();
 		if (scenario === "marker_only") {
-			yield { text: "结论成立" };
-			yield { text: `${PUA_START}cite${PUA_MID}turn0search1${PUA_END}` };
+			// Split across arbitrary provider deltas: none of the partial envelope may
+			// cross the loop's stream_text boundary.
+			yield { text: `结论成立${PUA_START}ci` };
+			yield { text: `te${PUA_MID}turn0sea` };
+			yield { text: `rch1${PUA_END}` };
 			return;
 		}
 		if (scenario === "marker_then_tool") {
@@ -73,6 +78,29 @@ const testProvider: ProviderAdapter = {
 					{ startIndex: raw.length - 2, endIndex: raw.length, url: "https://example.test/b" },
 				],
 			};
+			return;
+		}
+		if (scenario === "two_items_annotation") {
+			// Two text items. The annotation belongs to item 1 and its indices are
+			// RELATIVE TO THAT ITEM ("second" → end index 6), not to the joined text.
+			yield { text: "first ", textOutputIndex: 0 };
+			yield { textItemDone: true, textOutputIndex: 0 };
+			yield { text: "second", textOutputIndex: 1 };
+			yield {
+				textCitations: [
+					{ startIndex: 0, endIndex: 6, url: "https://example.test/c", outputIndex: 1 },
+				],
+			};
+			yield { textItemDone: true, textOutputIndex: 1 };
+			return;
+		}
+		if (scenario === "item_boundary") {
+			// A literal partial opener at item 0's end must be released BEFORE item 1.
+			// Flushing only at response end would reorder the stream as "AB<partial>".
+			yield { text: `A${PUA_START}ci`, textOutputIndex: 0 };
+			yield { textItemDone: true, textOutputIndex: 0 };
+			yield { text: "B", textOutputIndex: 1 };
+			yield { textItemDone: true, textOutputIndex: 1 };
 			return;
 		}
 		yield { text: "plain answer" };
@@ -150,6 +178,10 @@ function assistantMessages(events: AgentEvent[]) {
 	return events.flatMap((event) => (event.type === "assistant_message" ? [event] : []));
 }
 
+function streamedText(events: AgentEvent[]): string {
+	return events.flatMap((event) => (event.type === "stream_text" ? [event.text] : [])).join("");
+}
+
 describe("inline marker stripping", () => {
 	test("markers are removed from the persisted block and the assistant message", async () => {
 		const events = await runTurn("marker_only");
@@ -168,12 +200,16 @@ describe("inline marker stripping", () => {
 		expect(messages[0].text).not.toContain("turn0search1");
 	});
 
-	test("no visible text field in any event carries the raw marker", async () => {
+	test("the stream boundary emits only visible text, matching Codex", async () => {
 		const events = await runTurn("marker_only");
 
+		// Before the Codex-alignment change raw marker deltas crossed WebSocket and
+		// every renderer had to rediscover and hide them. Now the joined stream is
+		// already the same clean prose as block_complete/assistant_message.
+		expect(streamedText(events)).toBe("结论成立");
 		for (const event of events) {
-			if (event.type === "stream_text") continue; // deltas are pre-finalize by design
 			const visible: string[] = [];
+			if (event.type === "stream_text") visible.push(event.text);
 			if (event.type === "assistant_message") visible.push(event.text);
 			if (event.type === "block_complete" && event.block.type === "text") {
 				visible.push(event.block.text);
@@ -184,6 +220,13 @@ describe("inline marker stripping", () => {
 				expect(text).not.toContain("cite");
 			}
 		}
+	});
+
+	test("finishes each output item before the next item streams", async () => {
+		const events = await runTurn("item_boundary");
+
+		expect(streamedText(events)).toBe(`A${PUA_START}ciB`);
+		expect(textBlocks(events)[0].text).toBe(`A${PUA_START}ciB`);
 	});
 
 	test("the next turn's model history receives the cleaned text", async () => {
@@ -215,6 +258,18 @@ describe("structured annotations", () => {
 		expect(assistantMessages(events)[0].citations).toHaveLength(1);
 		// The visible text stays clean prose, without Markdown link syntax.
 		expect(assistantMessages(events)[0].text).toBe("answer text");
+	});
+
+	test("a second output item's annotation anchors by item-relative index", async () => {
+		const events = await runTurn("two_items_annotation");
+
+		const block = textBlocks(events)[0];
+		expect(block.text).toBe("first second");
+		// Item-relative [0,6) inside item 1 → [6,12) in the joined text. Without the
+		// per-item base offset this would anchor at [0,6) and cite "first ".
+		expect(block.citations).toEqual([
+			{ startIndex: 6, endIndex: 12, sources: [{ url: "https://example.test/c" }] },
+		]);
 	});
 
 	test("annotation indices are remapped after markers shift the text", async () => {

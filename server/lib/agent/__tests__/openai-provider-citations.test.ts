@@ -115,8 +115,16 @@ describe("final output_item.done fallback", () => {
 			},
 		});
 
-		// The message id must survive: it is persisted as the official item id.
-		expect(events.some((event) => event.messageId === "msg_123")).toBe(true);
+		// The message id must survive, and the same event closes this output item's
+		// stream parser just like Codex's `finish_item(item_id)`.
+		expect(
+			events.some(
+				(event) =>
+					event.messageId === "msg_123" &&
+					event.textItemDone === true &&
+					event.textOutputIndex === 2,
+			),
+		).toBe(true);
 		const citations = events.flatMap((event) => event.textCitations ?? []);
 		expect(citations).toHaveLength(1);
 		expect(citations[0].url).toBe("https://example.test/b");
@@ -162,7 +170,9 @@ describe("final output_item.done fallback", () => {
 			item: { type: "message", role: "assistant", id: "msg_3", content: [{ type: "output_text" }] },
 		});
 
-		expect(events).toEqual([{ messageId: "msg_3" }]);
+		expect(events).toEqual([
+			{ messageId: "msg_3", textItemDone: true, textOutputIndex: undefined },
+		]);
 	});
 });
 

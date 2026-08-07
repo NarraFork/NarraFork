@@ -4,10 +4,10 @@
  * happen for both renderers to agree.
  *
  * Two asymmetries are load-bearing and easy to break:
- *  - assistant text is projected, user text is NOT (a user quoting `citeturn…`
+ *  - assistant text is projected, user text is NOT (a user quoting an envelope
  *    must see their own words back);
- *  - a live block additionally hides a half-arrived marker, a settled one does
- *    not (on finished text a trailing "cite" can be a real word).
+ *  - settled history gets legacy-envelope compatibility, while live blocks trust
+ *    the loop's Codex-aligned `visible_text` boundary and do not parse again.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -102,18 +102,28 @@ describe("user text is never projected", () => {
 	});
 });
 
-describe("streaming tail handling", () => {
-	it("hides a half-arrived exact opener on the live block", () => {
-		const msg = assistantMessage([{ type: "text", text: "进行中\ue200ci" }], STREAMING_MESSAGE_ID);
+describe("stream boundary ownership", () => {
+	it("does not run a second hidden-markup parser on the live block", () => {
+		const raw = "进行中\ue200ci";
+		const msg = assistantMessage([{ type: "text", text: raw }], STREAMING_MESSAGE_ID);
 		const specs = markdownSpecs(msg);
 
-		expect(specs[0].data).toBe("进行中");
+		expect(specs[0].data).toBe(raw);
 	});
 
-	it("keeps a trailing word that only looks like a marker prefix once settled", () => {
-		const msg = assistantMessage([{ type: "text", text: "please cite" }], "settled");
+	it("still projects structured citations on a live block", () => {
+		const msg = assistantMessage(
+			[
+				{
+					type: "text",
+					text: "结论",
+					citations: [{ startIndex: 2, endIndex: 2, sources: [{ url: "https://a.test" }] }],
+				},
+			],
+			STREAMING_MESSAGE_ID,
+		);
 		const specs = markdownSpecs(msg);
 
-		expect(specs[0].data).toBe("please cite");
+		expect(specs[0].data).toBe("结论[1](<https://a.test>)");
 	});
 });
