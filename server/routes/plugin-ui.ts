@@ -430,13 +430,16 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 	const payloadTooLarge = (c: Parameters<MiddlewareHandler>[0]) =>
 		c.json(
 			{
-				error: "Plugin UI request exceeds the 256 KiB limit",
+				error: `Plugin UI request exceeds the ${PLUGIN_UI_HOST_REQUEST_MAX_BYTES / (1024 * 1024)} MiB limit`,
 				code: "PAYLOAD_TOO_LARGE",
 			},
 			413,
 		);
+	// This router shares the /api/plugins mount with package-management routes. Keep the
+	// iframe RPC body cap under /ui/* so large /install multipart uploads can reach the
+	// package route's independent 100 MB limit instead of being rejected by the UI cap.
 	app.use(
-		"*",
+		"/ui/*",
 		bodyLimit({
 			maxSize: PLUGIN_UI_HOST_REQUEST_MAX_BYTES,
 			onError: payloadTooLarge,

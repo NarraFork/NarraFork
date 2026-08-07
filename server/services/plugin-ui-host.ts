@@ -40,7 +40,7 @@ import {
 } from "./plugin-storage";
 import type { PluginUiSession } from "./plugin-ui-session";
 
-export const PLUGIN_UI_HOST_REQUEST_MAX_BYTES = 256 * 1024;
+export const PLUGIN_UI_HOST_REQUEST_MAX_BYTES = 5 * 1024 * 1024;
 export const PLUGIN_UI_HOST_RESPONSE_MAX_BYTES = 1024 * 1024;
 export const PLUGIN_UI_HOST_TIMEOUT_MS = 10_000;
 

@@ -12,7 +12,7 @@ import { CapabilityBroker, capabilityBroker } from "../../services/plugin-capabi
 import { PluginHealthRegistry } from "../../services/plugin-health";
 import { pluginInstallationAuthorityId } from "../../services/plugin-integration-authority-service";
 import { PluginUiAssetService } from "../../services/plugin-ui-assets";
-import { PluginUiHost } from "../../services/plugin-ui-host";
+import { PLUGIN_UI_HOST_REQUEST_MAX_BYTES, PluginUiHost } from "../../services/plugin-ui-host";
 import { PluginUiSessionService } from "../../services/plugin-ui-session";
 import { createPluginUiRoutes } from "../plugin-ui";
 
@@ -575,7 +575,7 @@ describe("plugin UI routes", () => {
 
 	test("rejects oversized JSON before route parsing", async () => {
 		const routes = await makeRoutes();
-		const body = JSON.stringify({ padding: "x".repeat(256 * 1024) });
+		const body = JSON.stringify({ padding: "x".repeat(PLUGIN_UI_HOST_REQUEST_MAX_BYTES) });
 		for (const headers of [
 			new Headers({ "content-type": "application/json" }),
 			new Headers({ "content-type": "application/json", "content-length": "1" }),
@@ -588,6 +588,16 @@ describe("plugin UI routes", () => {
 			expect(response.status).toBe(413);
 			expect(await response.json()).toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
 		}
+	});
+
+	test("does not apply the UI body cap to sibling plugin routes", async () => {
+		const routes = await makeRoutes();
+		const response = await routes.request("http://localhost/install", {
+			method: "POST",
+			headers: { "content-type": "application/octet-stream" },
+			body: "x".repeat(PLUGIN_UI_HOST_REQUEST_MAX_BYTES + 1),
+		});
+		expect(response.status).toBe(404);
 	});
 
 	test("replaces the route removal cascade when a factory is recreated", () => {
