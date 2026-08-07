@@ -8,6 +8,7 @@ import {
 	resolveOverride,
 	resolveProxyForUrl,
 } from "@server/lib/net/proxy";
+import { neutralizeAmbientProxyEnv, resetProxyEnvStateForTest } from "@server/lib/net/proxy-env";
 import { normalizeProxyUrl, normalizeSettingsProxyUrls, settings } from "@server/lib/settings";
 
 const ENV_KEYS = [
@@ -21,6 +22,16 @@ const ENV_KEYS = [
 	"no_proxy",
 ];
 
+/**
+ * The resolver reads the startup snapshot rather than the live environment, so a
+ * test that wants an ambient proxy must set it and then re-take the snapshot.
+ */
+function setAmbientProxyEnv(vars: Record<string, string>): void {
+	resetProxyEnvStateForTest();
+	for (const [k, v] of Object.entries(vars)) process.env[k] = v;
+	neutralizeAmbientProxyEnv();
+}
+
 describe("net/proxy resolver", () => {
 	let savedEnv: Record<string, string | undefined>;
 	let savedProxy: typeof settings.proxy;
@@ -32,6 +43,9 @@ describe("net/proxy resolver", () => {
 			delete process.env[k];
 		}
 		savedProxy = settings.proxy;
+		// No ambient proxy unless a test explicitly installs one.
+		resetProxyEnvStateForTest();
+		neutralizeAmbientProxyEnv();
 	});
 
 	afterEach(() => {
@@ -40,11 +54,12 @@ describe("net/proxy resolver", () => {
 			else process.env[k] = savedEnv[k];
 		}
 		settings.proxy = savedProxy;
+		resetProxyEnvStateForTest();
 	});
 
 	test("direct mode returns no proxy", () => {
 		settings.proxy = { mode: "direct" };
-		process.env.HTTPS_PROXY = "http://sys:8080";
+		setAmbientProxyEnv({ HTTPS_PROXY: "http://sys:8080" });
 		expect(getOutboundProxy()).toBeUndefined();
 		expect(resolveProxyForUrl("https://api.anthropic.com")).toBeUndefined();
 	});
@@ -57,14 +72,14 @@ describe("net/proxy resolver", () => {
 
 	test("system mode reads env vars", () => {
 		settings.proxy = { mode: "system" };
-		process.env.HTTPS_PROXY = "http://sys:8080";
+		setAmbientProxyEnv({ HTTPS_PROXY: "http://sys:8080" });
 		expect(detectSystemProxy()).toBe("http://sys:8080");
 		expect(getOutboundProxy()).toBe("http://sys:8080");
 	});
 
 	test("defaults to direct when no policy is set", () => {
 		settings.proxy = undefined;
-		process.env.ALL_PROXY = "socks5://sys:1080";
+		setAmbientProxyEnv({ ALL_PROXY: "socks5://sys:1080" });
 		expect(getOutboundProxy()).toBeUndefined();
 	});
 
@@ -94,7 +109,7 @@ describe("net/proxy resolver", () => {
 
 	test("NO_PROXY entries are exempted", () => {
 		settings.proxy = { mode: "custom", url: "http://custom:3128" };
-		process.env.NO_PROXY = "example.com,.internal.net";
+		setAmbientProxyEnv({ NO_PROXY: "example.com,.internal.net" });
 		expect(resolveProxyForUrl("https://api.example.com")).toBeUndefined();
 		expect(resolveProxyForUrl("https://svc.internal.net")).toBeUndefined();
 		expect(resolveProxyForUrl("https://api.anthropic.com")).toBe("http://custom:3128");
@@ -122,6 +137,7 @@ describe("net/proxy per-location override", () => {
 			else process.env[k] = savedEnv[k];
 		}
 		settings.proxy = savedProxy;
+		resetProxyEnvStateForTest();
 	});
 
 	test("undefined / default override inherits the global policy", () => {
@@ -135,7 +151,7 @@ describe("net/proxy per-location override", () => {
 	});
 
 	test("system override reads env vars regardless of global", () => {
-		process.env.HTTPS_PROXY = "http://sys:8080";
+		setAmbientProxyEnv({ HTTPS_PROXY: "http://sys:8080" });
 		expect(resolveOverride({ mode: "system" })).toBe("http://sys:8080");
 	});
 

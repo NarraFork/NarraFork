@@ -9,6 +9,7 @@ import { NotFoundError, PodmanNotFoundError, ValidationError } from "../lib/erro
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { getContainerUnsupportedReason, supportsContainers } from "../lib/platform";
 import { isInsidePath } from "../lib/platform-path";
 import { settings } from "../lib/settings";
@@ -244,7 +245,7 @@ export async function getContainerSetupStatus(refresh = false): Promise<Containe
 		const result = await safeSpawn({
 			cmd: ["podman", "compose", "version"],
 			timeout: 5000,
-			env: { ...process.env },
+			env: envWithAmbientProxy(),
 		});
 		if (result.exitCode === 0) {
 			const out = result.stdout.trim();
@@ -394,7 +395,9 @@ async function exec(
 	const result = await safeSpawn({
 		cmd: ["podman", ...args],
 		cwd,
-		env: { ...process.env, ...env },
+		// podman pulls from user-configured registries, so it keeps the user's
+		// ambient proxy configuration.
+		env: envWithAmbientProxy(env),
 		// Quick podman ops only (ps/inspect/down/pause/stop/logs). Long-running
 		// builds go through execStreaming (10min timeout), never here. Guard against
 		// a hung podman pinning the caller.
@@ -429,7 +432,8 @@ async function execStreaming(
 		cwd,
 		stdout: "pipe",
 		stderr: "pipe",
-		env: { ...process.env, ...env },
+		// Image builds/pulls reach user-configured registries — keep their proxy.
+		env: envWithAmbientProxy(env),
 	});
 
 	let timedOut = false;

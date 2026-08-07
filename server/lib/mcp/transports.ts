@@ -2,6 +2,7 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { envWithAmbientProxy } from "../net/proxy-env";
 import type { McpServerConfig } from "../settings";
 
 export function createTransport(config: McpServerConfig): Transport {
@@ -22,11 +23,14 @@ function createStdioTransport(config: McpServerConfig): Transport {
 		throw new Error(`MCP server "${config.name}": stdio transport requires a command`);
 	}
 
-	// Merge config env with process env, filtering out undefined values
+	// Merge config env with process env, filtering out undefined values.
+	// An MCP server is third-party tooling the user configured and may need to
+	// reach the network, so it gets the user's ambient proxy rather than the
+	// blanked values NarraFork keeps for its own outbound fetch.
 	let env: Record<string, string> | undefined;
 	if (config.env) {
 		const base: Record<string, string> = {};
-		for (const [k, v] of Object.entries(process.env)) {
+		for (const [k, v] of Object.entries(envWithAmbientProxy())) {
 			if (v !== undefined) base[k] = v;
 		}
 		env = { ...base, ...config.env };

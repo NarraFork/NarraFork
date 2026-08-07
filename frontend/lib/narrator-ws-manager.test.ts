@@ -896,3 +896,82 @@ describe("structural catch-up state", () => {
 		expect(catchUpInternals(manager).stagedCatchUpStates.has("n1")).toBe(false);
 	});
 });
+
+/**
+ * TEMPORARY: injection point for the mock-stream harness
+ * (components/narrator/mock/, see its README-REMOVAL.md). Delete this block with
+ * `dispatchLocalFrame` itself.
+ */
+describe("dispatchLocalFrame (synthetic frames)", () => {
+	test("delivers to matching listeners using the same filter as real frames", () => {
+		const manager = new NarratorWSManager();
+		const matched: string[] = [];
+		const wrongNarrator: string[] = [];
+		const wrongType: string[] = [];
+		manager.addListener({ narratorIds: ["n1"] }, (frame) => {
+			matched.push(frame.type as string);
+		});
+		manager.addListener({ narratorIds: ["n2"] }, (frame) => {
+			wrongNarrator.push(frame.type as string);
+		});
+		manager.addListener({ narratorIds: ["n1"], types: ["message"] }, (frame) => {
+			wrongType.push(frame.type as string);
+		});
+
+		manager.dispatchLocalFrame({ type: "stream_event", narratorId: "n1", event: {} });
+
+		expect(matched).toEqual(["stream_event"]);
+		expect(wrongNarrator).toEqual([]);
+		expect(wrongType).toEqual([]);
+	});
+
+	test("leaves sync bookkeeping untouched so no catch_up/full_reload is provoked", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 7);
+		const before = {
+			version: manager.getMessageVersion("n1"),
+			realtimeEpoch: manager.getRealtimeEpoch("n1"),
+			structuralEpoch: manager.getStructuralEpoch("n1"),
+		};
+
+		// Frame types that WOULD bump every counter on the real path.
+		manager.dispatchLocalFrame({ type: "message", narratorId: "n1", message: { id: "mock" } });
+		manager.dispatchLocalFrame({ type: "tool_completed", narratorId: "n1", toolUseId: "t1" });
+
+		expect(manager.getMessageVersion("n1")).toBe(before.version);
+		expect(manager.getRealtimeEpoch("n1")).toBe(before.realtimeEpoch);
+		expect(manager.getStructuralEpoch("n1")).toBe(before.structuralEpoch);
+	});
+
+	test("never routes to a request-scoped listener awaiting a snapshot", () => {
+		const manager = new NarratorWSManager();
+		const handle = manager.subscribe(["n1"], { kind: "messages" });
+		const received: string[] = [];
+		// A snapshot/catch-up consumer binds itself to its subscription id; a
+		// synthetic frame carries no requestId, so it is delivered by the normal
+		// type/narrator filter rather than being scoped to one request.
+		manager.addListener({ narratorIds: ["n1"], subscriptionId: handle._id }, (frame) => {
+			received.push(frame.type as string);
+		});
+
+		manager.dispatchLocalFrame({ type: "tool_output", narratorId: "n1", toolUseId: "t1" });
+
+		expect(received).toEqual(["tool_output"]);
+	});
+
+	test("a listener throwing does not stop the remaining fan-out", () => {
+		const manager = new NarratorWSManager();
+		const reached: string[] = [];
+		manager.addListener({ narratorIds: ["n1"] }, () => {
+			throw new Error("listener boom");
+		});
+		manager.addListener({ narratorIds: ["n1"] }, (frame) => {
+			reached.push(frame.type as string);
+		});
+
+		expect(() =>
+			manager.dispatchLocalFrame({ type: "streaming_reset", narratorId: "n1" }),
+		).not.toThrow();
+		expect(reached).toEqual(["streaming_reset"]);
+	});
+});

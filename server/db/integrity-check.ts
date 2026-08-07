@@ -25,6 +25,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { getDbPath } from "./connection";
 import {
 	DB_INTEGRITY_MODE_ENV,
@@ -141,8 +142,11 @@ export async function runIntegrityProbe(
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
+			// The probe is another NarraFork process and re-runs
+			// `neutralizeAmbientProxyEnv()`; pass the real ambient proxy values so its
+			// snapshot matches ours rather than the blanked placeholders.
 			env: {
-				...process.env,
+				...envWithAmbientProxy(),
 				[DB_INTEGRITY_PATH_ENV]: dbPath,
 				[DB_INTEGRITY_MODE_ENV]: mode,
 				// The probe must not re-enter server startup paths that take the instance lock.

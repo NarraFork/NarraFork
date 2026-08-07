@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { GitAuthError, GitError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
 
@@ -1062,11 +1063,12 @@ export const gitService = {
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
-			env: {
-				...process.env,
+			// git talks to the user's remotes, so it keeps the user's ambient proxy
+			// configuration rather than NarraFork's blanked one.
+			env: envWithAmbientProxy({
 				GIT_TERMINAL_PROMPT: "0",
 				...(askPassScript ? { GIT_ASKPASS: askPassScript } : {}),
-			},
+			}),
 		});
 
 		// Read stderr in streaming fashion — git progress uses \r for in-place updates

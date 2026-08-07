@@ -672,6 +672,46 @@ export class NarratorWSManager {
 	}
 
 	// -----------------------------------------------------------------------
+	// Local (synthetic) frame injection — DEV/mock only
+	// -----------------------------------------------------------------------
+
+	/**
+	 * Fan a synthetic frame out to listeners as if the server had sent it.
+	 *
+	 * Used ONLY by the temporary mock-stream panel
+	 * (`components/narrator/mock/`), which replays scripted streaming output so
+	 * the virtual list's measurement/animation work can be tuned without asking a
+	 * real model for a turn.
+	 *
+	 * ⚠️ DELIBERATELY skips every piece of sync bookkeeping that
+	 * `_dispatchImmediate` performs (`noteRealtimeEvent`, `bumpMessageVersion`,
+	 * `noteStructuralEvent`). Mock content is never persisted, so counting it
+	 * would leave the client's `messageVersion` ahead of the server's; the next
+	 * `sync_check` would then answer with a `catch_up` or `full_reload` and
+	 * disturb the REAL document. Mock frames are purely visual and disappear on
+	 * reload.
+	 *
+	 * Delivery uses the same listener filter as real frames, so a mock frame
+	 * reaches exactly the consumers a real one would.
+	 */
+	dispatchLocalFrame(data: Record<string, unknown>): void {
+		const msgType = typeof data.type === "string" ? data.type : undefined;
+		const narratorId = typeof data.narratorId === "string" ? data.narratorId : undefined;
+		for (const entry of this.listeners.values()) {
+			// No `subscriptionRequestId`: a synthetic frame is always a realtime
+			// frame, never a response to a snapshot/catch-up request.
+			if (!shouldDeliverToListener(entry.opts, msgType, narratorId, undefined, undefined)) {
+				continue;
+			}
+			try {
+				entry.cb(data);
+			} catch {
+				// listener error — ignore
+			}
+		}
+	}
+
+	// -----------------------------------------------------------------------
 	// Last message ID tracking (for catch-up on reconnect)
 	// -----------------------------------------------------------------------
 

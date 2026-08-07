@@ -15,6 +15,7 @@ import {
 } from "../lib/pack-archives";
 import { isInsidePath } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
+import { extractZipArchive } from "../lib/zip-archive";
 import type { Principal } from "./knowledge-acl";
 import { knowledgePackService, type Pack } from "./knowledge-pack-service";
 
@@ -33,11 +34,40 @@ export interface ActivationResult {
 	reused: boolean;
 }
 
-/** Build the extraction command for a given archive format. */
-function extractCmd(format: PackArchiveFormat, archive: string, destDir: string): string[] {
-	if (format === "tar.gz") return ["tar", "-xzf", archive, "-C", destDir];
-	// zip: -o overwrite without prompting, -q quiet, -d target dir.
-	return ["unzip", "-o", "-q", archive, "-d", destDir];
+/** Build the extraction command for tar.gz archives (zip is handled in-process). */
+function tarExtractCmd(archive: string, destDir: string): string[] {
+	return ["tar", "-xzf", archive, "-C", destDir];
+}
+
+/**
+ * Extract a pack archive into destDir.
+ *
+ * zip goes through the in-process reader (`node:zlib`) because Windows has no
+ * `unzip` binary; tar.gz still shells out to `tar`, which ships with Windows 10+
+ * as well as every supported unix.
+ */
+async function extractArchive(
+	format: PackArchiveFormat,
+	archive: string,
+	destDir: string,
+): Promise<void> {
+	if (format === "zip") {
+		const limits = { maxTotalBytes: maxPackUncompressedBytes() };
+		// Symlinks are rejected here for the same reason inspectExtraction rejects
+		// them: they can point outside the sandbox at use time.
+		await extractZipArchive(archive, destDir, { limits, rejectSymlinks: true });
+		return;
+	}
+	const res = await safeSpawn({
+		cmd: tarExtractCmd(archive, destDir),
+		timeout: EXTRACT_TIMEOUT_MS,
+		maxOutputBytes: EXTRACT_MAX_OUTPUT_BYTES,
+	});
+	if (res.exitCode !== 0) {
+		throw new ValidationError(
+			`Pack extraction failed (exit ${res.exitCode}): ${res.stderr.slice(0, 500) || res.stdout.slice(0, 500)}`,
+		);
+	}
 }
 
 /**
@@ -158,16 +188,7 @@ async function activate(
 	}
 
 	try {
-		const res = await safeSpawn({
-			cmd: extractCmd(pack.archiveFormat as PackArchiveFormat, archive, destDir),
-			timeout: EXTRACT_TIMEOUT_MS,
-			maxOutputBytes: EXTRACT_MAX_OUTPUT_BYTES,
-		});
-		if (res.exitCode !== 0) {
-			throw new ValidationError(
-				`Pack extraction failed (exit ${res.exitCode}): ${res.stderr.slice(0, 500) || res.stdout.slice(0, 500)}`,
-			);
-		}
+		await extractArchive(pack.archiveFormat as PackArchiveFormat, archive, destDir);
 	} catch (err) {
 		rmSync(destDir, { recursive: true, force: true });
 		if (err instanceof ValidationError) throw err;

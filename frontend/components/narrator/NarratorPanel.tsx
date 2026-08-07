@@ -72,6 +72,8 @@ import {
 	IconExternalLink,
 	IconFile,
 	IconFileCode,
+	// TEMPORARY mock-stream harness icon (see ./mock/README-REMOVAL.md).
+	IconFlask,
 	IconFolderPlus,
 	IconGitBranch,
 	IconGitFork,
@@ -263,6 +265,9 @@ import {
 } from "./MessageSelectionCtx";
 import { ModelMenuItems } from "./ModelMenuItems";
 import { ModelPriceModal } from "./ModelPriceModal";
+// TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
+// Store-only import — the panel component itself is lazy-loaded by the dock.
+import { useMockStreamActive } from "./mock/mock-stream-store";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import {
@@ -3549,6 +3554,11 @@ export function NarratorPanel({
 	// Reading-width preference, needed here only so the lazy-chunk fallback lays its
 	// skeleton out in the same column the list will use (no width step on mount).
 	const [narratorCenteredColumn] = useLocalPref("narrafork_narrator_centered_column");
+	// TEMPORARY: the mock-stream harness (see ./mock/README-REMOVAL.md). The pref
+	// gates both the toolbar entry and the store read, so with it off this costs
+	// one constant-false subscription and nothing else.
+	const [mockStreamEnabled] = useLocalPref("narrafork_mock_stream");
+	const mockStreamActive = useMockStreamActive(narratorId, mockStreamEnabled);
 	const isAtBottomRef = useRef(isAtBottom);
 	isAtBottomRef.current = isAtBottom;
 	const scrollToBottomRef = useRef<(instant?: boolean) => void>(() => {});
@@ -4227,7 +4237,17 @@ export function NarratorPanel({
 	]);
 
 	const isWorking = narrator?.status === "working";
-	const isActive = narrator?.status === "working" || narrator?.status === "waiting";
+	/**
+	 * Whether the live streaming tail should be mounted.
+	 *
+	 * `mockStreamActive` is the TEMPORARY harness term (see ./mock/README-REMOVAL.md):
+	 * a mock run never writes to the database, so the narrator stays `idle` and the
+	 * streaming subscription — gated on this flag — would never mount. Faking a
+	 * `status_change` frame instead does not work; `useNarratorPanelWS` invalidates
+	 * the narrator query and the refetch restores `idle`.
+	 */
+	const isActive =
+		narrator?.status === "working" || narrator?.status === "waiting" || mockStreamActive;
 	const isWaiting = narrator?.status === "waiting";
 	// Takeover: the user is operating this subagent directly while the parent
 	// tool call stays blocked. canTakeover is shown only while the subagent is
@@ -7228,6 +7248,20 @@ export function NarratorPanel({
 											</Tooltip>
 										}
 									/>
+								)}
+								{/* TEMPORARY mock-stream harness entry — see ./mock/README-REMOVAL.md.
+								    Label is hard-coded (not i18n) like the rest of that debug surface. */}
+								{dock && mockStreamEnabled && (
+									<Tooltip label="Mock stream (debug)">
+										<ActionIcon
+											size="sm"
+											variant={dock.openToolTypes.has("mock") ? "light" : "subtle"}
+											color={dock.openToolTypes.has("mock") ? "indigo" : "gray"}
+											onClick={() => dock.toggleToolPanel("mock")}
+										>
+											<IconFlask size={16} />
+										</ActionIcon>
+									</Tooltip>
 								)}
 								<Tooltip label={t("archiveNarrator")}>
 									<ActionIcon

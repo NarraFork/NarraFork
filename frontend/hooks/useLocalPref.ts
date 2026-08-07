@@ -13,7 +13,9 @@ type Key =
 	| "narrafork_advanced_anim"
 	| "narrafork_expand_reasoning"
 	| "narrafork_narrator_virtual_list"
-	| "narrafork_narrator_centered_column";
+	| "narrafork_narrator_centered_column"
+	// TEMPORARY debug surface — see components/narrator/mock/README-REMOVAL.md.
+	| "narrafork_mock_stream";
 
 const listeners = new Set<() => void>();
 

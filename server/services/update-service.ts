@@ -24,6 +24,7 @@ import { narratorToolCalls } from "../db/schema";
 import { downloadHelperBinary, getHelperBinaryServerBaseUrl } from "../lib/helper-binaries";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
+import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { beginGracefulRestartSession, cancelGracefulRestartSession } from "../lib/server-restart";
 import { settings } from "../lib/settings";
 import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
@@ -1730,8 +1731,12 @@ async function drainAndSpawnPreparedUpdate(options: {
 	}
 
 	try {
+		// The ambient proxy variables are blanked in THIS process (see
+		// lib/net/proxy-env.ts). Handing the blanked values to the replacement
+		// would make it snapshot "no ambient proxy", so a user on "system" proxy
+		// mode would silently fall back to direct connections after every update.
 		const env = {
-			...process.env,
+			...envWithAmbientProxy(),
 			NARRAFORK_GRACEFUL_RESTART_URL: session.url,
 			NARRAFORK_GRACEFUL_RESTART_TOKEN: session.token,
 			NARRAFORK_GRACEFUL_RESTART_MARKER_PATH: session.markerPath,

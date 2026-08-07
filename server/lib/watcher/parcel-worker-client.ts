@@ -1,4 +1,5 @@
 import { logger } from "../logger";
+import { envWithAmbientProxy } from "../net/proxy-env";
 import type { IFileChange } from "./types";
 import {
 	WATCHER_WORKER_FLAG,
@@ -40,9 +41,15 @@ function buildWorkerCommand(): string[] {
 	return [process.execPath, "server/index.ts", WATCHER_WORKER_FLAG];
 }
 
+/**
+ * The worker is another NarraFork process, so it re-runs
+ * `neutralizeAmbientProxyEnv()` on startup. Handing it this process' already
+ * blanked proxy values would make it snapshot "no ambient proxy"; the real
+ * values are restored so its snapshot matches ours.
+ */
 function cloneEnv(): Record<string, string> {
 	const env: Record<string, string> = {};
-	for (const [key, value] of Object.entries(process.env)) {
+	for (const [key, value] of Object.entries(envWithAmbientProxy())) {
 		if (value !== undefined) env[key] = value;
 	}
 	env.NARRAFORK_WATCHER_WORKER = "1";

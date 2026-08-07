@@ -793,6 +793,8 @@
 	"advancedAnimationDesc": "Enable blur-in for newly appearing user messages, tool call cards, and reasoning cards",
 	"narratorCenteredColumn": "Limit Message Reading Width",
 	"narratorCenteredColumnDesc": "Cap the narrator message column at a centered 860px reading width instead of filling the window. Applies to both the Chunk and Virtual lists.",
+	"mockStreamPanel": "Mock Stream Panel (debug)",
+	"mockStreamPanelDesc": "Show a temporary harness in the narrator dock that replays scripted reasoning / text / tool output for tuning list animations. Nothing is persisted.",
 	"expandReasoning": "Expand Reasoning by Default",
 	"expandReasoningDesc": "Automatically expand reasoning/thinking blocks in narrator messages instead of showing them collapsed",
 	"pwaSection": "App Update",

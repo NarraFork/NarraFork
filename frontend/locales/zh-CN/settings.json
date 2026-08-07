@@ -793,6 +793,8 @@
 	"advancedAnimationDesc": "为新出现的用户消息、工具调用卡片和推理卡片启用 blur-in 动画",
 	"narratorCenteredColumn": "限制消息阅读宽度",
 	"narratorCenteredColumnDesc": "把叙述者消息列限制在居中的 860px 阅读宽度内，而不是撑满窗口。对 Chunk 和 Virtual 两种列表都生效。",
+	"mockStreamPanel": "模拟流式输出面板（调试）",
+	"mockStreamPanelDesc": "在叙述者 dock 中显示一个临时面板，可回放脚本化的思考 / 文本 / 工具输出，用于调优列表动画。不会写入任何数据。",
 	"expandReasoning": "默认展开推理内容",
 	"expandReasoningDesc": "自动展开叙述者消息中的推理/思考块，而不是默认折叠显示",
 	"pwaSection": "应用更新",

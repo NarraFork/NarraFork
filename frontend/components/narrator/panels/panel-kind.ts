@@ -28,6 +28,7 @@ import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
  * - `subagent` — a multi-instance child-narrator session in the cluster's secondary area.
  * - `file`     — a multi-instance read-only file viewer in the secondary area.
  * - `webview`  — a standalone webview (workspace only).
+ * - `mock`     — TEMPORARY streaming harness (see `../mock/README-REMOVAL.md`).
  */
 export type PanelKind =
 	| "chat"
@@ -42,7 +43,8 @@ export type PanelKind =
 	| "subagent"
 	| "file"
 	| "webview"
-	| "plugin";
+	| "plugin"
+	| "mock";
 
 /**
  * Singleton resource panels controlled by the narrator toolbar.
@@ -141,6 +143,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	file: "file",
 	webview: "webview",
 	plugin: "plugin",
+	mock: "mock",
 };
 
 /** Stable dockview panel id for a per-narrator singleton tool panel. */
@@ -164,4 +167,5 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	file: "File",
 	webview: "Webview",
 	plugin: "Plugin",
+	mock: "Mock stream",
 };

@@ -21,7 +21,12 @@ import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { isInsidePath } from "../lib/platform-path";
 import { type Manifest, pluginIdSchema, safeParseManifest } from "../lib/plugins/manifest";
-import { safeSpawn } from "../lib/spawn";
+import {
+	extractZipArchive,
+	normalizeZipEntryName,
+	readZipArchive,
+	type ZipArchiveInfo,
+} from "../lib/zip-archive";
 
 const DEFAULT_MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_MAX_UNPACKED_BYTES = 500 * 1024 * 1024;
@@ -29,7 +34,6 @@ const DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024;
 const DEFAULT_MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
 const DEFAULT_MAX_FILES = 10_000;
 const DEFAULT_OPERATION_TIMEOUT_MS = 60_000;
-const DEFAULT_ARCHIVE_OUTPUT_BYTES = 8 * 1024 * 1024;
 const CURRENT_POINTER_VERSION = 1;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const VERSION_PATTERN =
@@ -402,15 +406,28 @@ async function computePackageHash(root: string, limits: PackageStoreLimits): Pro
 	return hash.digest("hex");
 }
 
-function parseZipEntryNames(output: string, maxEntries: number): string[] {
-	const names = output.split(/\r?\n/).filter(Boolean);
-	if (names.length > maxEntries)
-		throw new ValidationError(`Package contains more than ${maxEntries} archive entries`);
+/**
+ * Plugin-specific central-directory checks, applied before any bytes are written.
+ *
+ * Only what the shared reader does NOT already cover: it enforces entry count,
+ * per-file and total size caps and rejects `..`/absolute names itself, so this
+ * adds duplicate and case-collision detection (a case-insensitive filesystem
+ * would otherwise let one entry silently overwrite another) plus the
+ * plugin-level "must contain files" and symlink rules.
+ */
+function assertZipEntryPolicy(info: ZipArchiveInfo): void {
 	const seen = new Set<string>();
 	const caseFolded = new Set<string>();
-	for (const name of names) {
-		const normalized = assertArchiveRelativePath(name.endsWith("/") ? name.slice(0, -1) : name);
-		if (!normalized) continue;
+	for (const entry of info.entries) {
+		if (entry.isSymlink || entry.isSpecial) {
+			throw new ValidationError("Package archive contains a symlink or special filesystem entry");
+		}
+		if (!entry.isDirectory && !Number.isSafeInteger(entry.uncompressedSize)) {
+			throw new ValidationError("Package archive contains an invalid file size");
+		}
+		// Shares the extractor's normalization, so a `./`-prefixed archive is
+		// accepted here exactly as it is during extraction.
+		const normalized = normalizeZipEntryName(entry.name);
 		if (seen.has(normalized))
 			throw new ValidationError(`Package archive contains a duplicate entry: ${normalized}`);
 		seen.add(normalized);
@@ -419,81 +436,60 @@ function parseZipEntryNames(output: string, maxEntries: number): string[] {
 			throw new ValidationError(`Package archive contains a case collision: ${normalized}`);
 		caseFolded.add(folded);
 	}
-	return names;
+	if (info.fileCount === 0)
+		throw new ValidationError("Package archive has no readable file entries");
 }
 
-function inspectZipMetadata(output: string, limits: PackageStoreLimits): void {
-	let totalUnpacked = 0;
-	let sizeCount = 0;
-	for (const line of output.split(/\r?\n/)) {
-		const attributes = line.match(/Unix file attributes \(([0-7]+) octal\):\s+([^\s]+)/);
-		if (attributes && /^[lbcps]/.test(attributes[2])) {
-			throw new ValidationError("Package archive contains a symlink or special filesystem entry");
-		}
-		const size = line.match(/^\s*uncompressed size:\s*([0-9]+) bytes/);
-		if (!size) continue;
-		const bytes = Number(size[1]);
-		if (!Number.isSafeInteger(bytes))
-			throw new ValidationError("Package archive contains an invalid file size");
-		sizeCount += 1;
-		if (bytes > limits.maxFileBytes)
-			throw new ValidationError("Package file exceeds the file-size limit");
-		totalUnpacked += bytes;
-		if (totalUnpacked > limits.maxUnpackedBytes) {
-			throw new ValidationError("Package exceeds the unpacked-size limit");
-		}
-	}
-	if (sizeCount === 0) throw new ValidationError("Package archive has no readable file entries");
-}
-
+/**
+ * Extract a plugin package archive.
+ *
+ * Pure JS (node:zlib) rather than the `unzip` binary: Windows has no `unzip`, so
+ * shelling out made plugin installation impossible there. All the checks that
+ * used to be parsed out of `unzip -Z` output are now read straight from the
+ * central directory before a single byte is written.
+ */
 async function extractZip(
 	archivePath: string,
 	destination: string,
 	limits: PackageStoreLimits,
 ): Promise<void> {
-	const listing = await withTimeout(
-		safeSpawn({
-			cmd: ["unzip", "-Z1", archivePath],
-			timeout: limits.timeoutMs,
-			maxOutputBytes: DEFAULT_ARCHIVE_OUTPUT_BYTES,
-		}),
-		limits.timeoutMs,
-		"package archive listing",
-	);
-	if (listing.exitCode !== 0 || listing.stdoutTruncated) {
-		throw new ValidationError("Unable to inspect plugin package archive entries");
+	const zipLimits = {
+		maxEntries: limits.maxFiles,
+		maxFileBytes: limits.maxFileBytes,
+		maxTotalBytes: limits.maxUnpackedBytes,
+	};
+	let info: ZipArchiveInfo;
+	try {
+		info = await withTimeout(
+			readZipArchive(archivePath, zipLimits),
+			limits.timeoutMs,
+			"package archive listing",
+		);
+		// Inside the same guard: the reader and the shared name normalizer both
+		// signal with `ZipArchiveError`, which is not an AppError and would surface
+		// as a 500 instead of a 400 for what is really a bad upload.
+		assertZipEntryPolicy(info);
+	} catch (error) {
+		if (error instanceof ValidationError) throw error;
+		throw new ValidationError(
+			`Unable to inspect plugin package archive entries: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
-	parseZipEntryNames(listing.stdout, limits.maxFiles);
-	const metadata = await withTimeout(
-		safeSpawn({
-			cmd: ["unzip", "-Z", "-v", archivePath],
-			timeout: limits.timeoutMs,
-			maxOutputBytes: DEFAULT_ARCHIVE_OUTPUT_BYTES,
-		}),
-		limits.timeoutMs,
-		"package archive metadata",
-	);
-	if (metadata.exitCode !== 0 || metadata.stdoutTruncated) {
-		throw new ValidationError("Unable to inspect plugin package metadata");
-	}
-	inspectZipMetadata(metadata.stdout, limits);
 	await withTimeout(
 		mkdir(destination, { recursive: true }),
 		limits.timeoutMs,
 		"package extraction directory create",
 	);
-	const extracted = await withTimeout(
-		safeSpawn({
-			cmd: ["unzip", "-q", "-o", archivePath, "-d", destination],
-			timeout: limits.timeoutMs,
-			maxOutputBytes: DEFAULT_ARCHIVE_OUTPUT_BYTES,
-		}),
-		limits.timeoutMs,
-		"package extraction",
-	);
-	if (extracted.exitCode !== 0) {
+	try {
+		await withTimeout(
+			extractZipArchive(archivePath, destination, { limits: zipLimits, info }),
+			limits.timeoutMs,
+			"package extraction",
+		);
+	} catch (error) {
+		if (error instanceof ValidationError) throw error;
 		throw new ValidationError(
-			`Plugin package extraction failed: ${extracted.stderr.slice(0, 500)}`,
+			`Plugin package extraction failed: ${(error instanceof Error ? error.message : String(error)).slice(0, 500)}`,
 		);
 	}
 }
