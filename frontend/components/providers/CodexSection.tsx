@@ -46,7 +46,7 @@ import {
 	IconTrash,
 	IconX,
 } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -518,6 +518,7 @@ export const CodexSection = React.memo(function CodexSection({
 		queryFn: () =>
 			api.codexStatus({ availablePage, unavailablePage, archivedPage, pageSize: PAGE_SIZE }),
 		enabled: canReadCodexStatus,
+		placeholderData: keepPreviousData,
 		refetchInterval: (query) => {
 			if (browserAuthPending) return 3_000;
 			if (query.state.data?.usageQueue?.isRunning) return 3_000;
@@ -771,7 +772,7 @@ export const CodexSection = React.memo(function CodexSection({
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
 			qc.invalidateQueries({ queryKey: LIFETIME_TOTALS_QUERY_KEY });
 			notifications.show({
-				message: t("codexBatchDeleteSuccess", { count: data.removed.length }),
+				message: t("credentialBatchDeleteSuccess", { count: data.removed.length }),
 				color: "green",
 			});
 		},
@@ -783,7 +784,7 @@ export const CodexSection = React.memo(function CodexSection({
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
 			qc.invalidateQueries({ queryKey: LIFETIME_TOTALS_QUERY_KEY });
 			notifications.show({
-				message: t("codexDeleteUnhealthySuccess", { count: data.removed.length }),
+				message: t("credentialDeleteUnhealthySuccess", { count: data.removed.length }),
 				color: "green",
 			});
 		},
@@ -817,14 +818,18 @@ export const CodexSection = React.memo(function CodexSection({
 
 	const handleBatchDelete = async () => {
 		if (!canBatchDeleteCredentials || selectedIds.size === 0) return;
-		if (await confirm({ message: t("codexBatchDeleteConfirm", { count: selectedIds.size }) })) {
+		if (
+			await confirm({ message: t("credentialBatchDeleteConfirm", { count: selectedIds.size }) })
+		) {
 			batchDeleteMut.mutate([...selectedIds]);
 		}
 	};
 
 	const handleDeleteUnhealthy = async () => {
 		if (!canDeleteUnhealthyCredentials || unhealthyTotal === 0) return;
-		if (await confirm({ message: t("codexDeleteUnhealthyConfirm", { count: unhealthyTotal }) })) {
+		if (
+			await confirm({ message: t("credentialDeleteUnhealthyConfirm", { count: unhealthyTotal }) })
+		) {
 			deleteUnhealthyMut.mutate();
 		}
 	};
@@ -1400,7 +1405,7 @@ export const CodexSection = React.memo(function CodexSection({
 									disabled={!canBatchDeleteCredentials}
 									title={!canBatchDeleteCredentials ? providerRouteUnsupportedReason : undefined}
 								>
-									{t("codexBatchDelete")} ({selectedIds.size})
+									{t("credentialBatchDelete")} ({selectedIds.size})
 								</Button>
 							)}
 							<Button
@@ -1413,7 +1418,7 @@ export const CodexSection = React.memo(function CodexSection({
 								disabled={!canDeleteUnhealthyCredentials || unhealthyTotal === 0}
 								title={!canDeleteUnhealthyCredentials ? providerRouteUnsupportedReason : undefined}
 							>
-								{t("codexDeleteUnhealthy")} ({unhealthyTotal})
+								{t("credentialDeleteUnhealthy")} ({unhealthyTotal})
 							</Button>
 						</Group>
 					</Group>
@@ -1809,7 +1814,7 @@ function CredentialList(props: CodexCredentialListProps) {
 								checked={allSelected}
 								indeterminate={someSelected}
 								onChange={() => onToggleSelectAll(entryIds)}
-								aria-label={t("codexSelectAll")}
+								aria-label={t("credentialSelectAll")}
 							/>
 						</Table.Th>
 						<Table.Th>{t("codexColName")}</Table.Th>
@@ -2031,7 +2036,7 @@ function CredentialList(props: CodexCredentialListProps) {
 				<Group justify="center">
 					<Pagination size="sm" total={totalPages} value={page} onChange={onPageChange} />
 					<Text size="xs" c="dimmed">
-						{tSettings("codexPageInfo", {
+						{tSettings("credentialPageInfo", {
 							current: page,
 							total: totalPages,
 							count: totalEntries,
@@ -2391,7 +2396,7 @@ function CredentialCards(props: CodexCredentialListProps) {
 				<Group justify="center">
 					<Pagination size="sm" total={totalPages} value={page} onChange={onPageChange} />
 					<Text size="xs" c="dimmed">
-						{tSettings("codexPageInfo", {
+						{tSettings("credentialPageInfo", {
 							current: page,
 							total: totalPages,
 							count: totalEntries,
