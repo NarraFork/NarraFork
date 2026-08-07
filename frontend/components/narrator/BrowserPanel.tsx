@@ -48,7 +48,9 @@ import {
 } from "../../lib/safe-area";
 import {
 	type BrowserPreviewViewport,
+	getBrowserPreviewExpandedWidth,
 	getBrowserPreviewNavigationUrl,
+	openBrowserPreviewNavigation,
 	translateBrowserPreviewCoordinate,
 } from "./browser-preview";
 
@@ -416,6 +418,8 @@ function BrowserPreviewSurface({
 			onWheel={handleWheel}
 			style={{
 				position: "relative",
+				width: expanded ? getBrowserPreviewExpandedWidth(viewport.width) : undefined,
+				marginInline: expanded ? "auto" : undefined,
 				borderRadius: "var(--mantine-radius-sm)",
 				overflow: expanded ? "visible" : "hidden",
 				backgroundColor: "var(--mantine-color-dark-8)",
@@ -750,6 +754,14 @@ function BrowserSessionCard({
 	const currentUrl = session.url;
 	const navigationUrl = getBrowserPreviewNavigationUrl(currentUrl);
 	const previewViewport = session.viewport;
+	const handleNavigationClick = useCallback(
+		(event: React.MouseEvent<HTMLAnchorElement>) => {
+			event.preventDefault();
+			event.stopPropagation();
+			if (navigationUrl) openBrowserPreviewNavigation(navigationUrl);
+		},
+		[navigationUrl],
+	);
 
 	return (
 		<Box
@@ -767,6 +779,9 @@ function BrowserSessionCard({
 					{navigationUrl ? (
 						<Anchor
 							href={navigationUrl}
+							target="_blank"
+							rel="noopener noreferrer"
+							onClick={handleNavigationClick}
 							size="xs"
 							ff="monospace"
 							truncate
@@ -936,6 +951,9 @@ function BrowserSessionCard({
 						{navigationUrl ? (
 							<Anchor
 								href={navigationUrl}
+								target="_blank"
+								rel="noopener noreferrer"
+								onClick={handleNavigationClick}
 								size="sm"
 								ff="monospace"
 								truncate

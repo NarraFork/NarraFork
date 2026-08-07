@@ -19,6 +19,24 @@ export function getBrowserPreviewNavigationUrl(url: string): string | null {
 	}
 }
 
+export type BrowserPreviewWindowOpener = (url: string, target: string, features: string) => unknown;
+
+export function openBrowserPreviewNavigation(
+	url: string,
+	opener: BrowserPreviewWindowOpener = (href, target, features) =>
+		window.open(href, target, features),
+): boolean {
+	const navigationUrl = getBrowserPreviewNavigationUrl(url);
+	if (!navigationUrl) return false;
+	opener(navigationUrl, "_blank", "noopener,noreferrer");
+	return true;
+}
+
+export function getBrowserPreviewExpandedWidth(viewportWidth: number): string {
+	if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) return "100%";
+	return `min(100%, ${Math.round(viewportWidth)}px)`;
+}
+
 export function translateBrowserPreviewCoordinate(
 	rect: BrowserPreviewClientRect,
 	viewport: BrowserPreviewViewport,

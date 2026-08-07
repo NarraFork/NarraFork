@@ -1,13 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import {
+	getBrowserPreviewExpandedWidth,
 	getBrowserPreviewNavigationUrl,
+	openBrowserPreviewNavigation,
 	translateBrowserPreviewCoordinate,
 } from "./browser-preview";
 
 const viewport = { width: 1280, height: 900 };
 
 describe("getBrowserPreviewNavigationUrl", () => {
-	it("allows HTTP pages to navigate in the current tab", () => {
+	it("allows HTTP pages to be rendered as navigation links", () => {
 		expect(getBrowserPreviewNavigationUrl("https://example.com/docs?q=1")).toBe(
 			"https://example.com/docs?q=1",
 		);
@@ -20,6 +22,41 @@ describe("getBrowserPreviewNavigationUrl", () => {
 		expect(getBrowserPreviewNavigationUrl("javascript:alert(1)")).toBeNull();
 		expect(getBrowserPreviewNavigationUrl("data:text/html,hello")).toBeNull();
 		expect(getBrowserPreviewNavigationUrl("not a url")).toBeNull();
+	});
+});
+
+describe("openBrowserPreviewNavigation", () => {
+	it("forces web URLs into a new isolated browsing context", () => {
+		const calls: Array<[string, string, string]> = [];
+		const opened = openBrowserPreviewNavigation(
+			"https://example.com/docs",
+			(url, target, features) => calls.push([url, target, features]),
+		);
+
+		expect(opened).toBe(true);
+		expect(calls).toEqual([["https://example.com/docs", "_blank", "noopener,noreferrer"]]);
+	});
+
+	it("does not invoke the opener for unsafe URLs", () => {
+		let called = false;
+		expect(
+			openBrowserPreviewNavigation("javascript:alert(1)", () => {
+				called = true;
+			}),
+		).toBe(false);
+		expect(called).toBe(false);
+	});
+});
+
+describe("getBrowserPreviewExpandedWidth", () => {
+	it("caps the enlarged preview at the screenshot viewport width", () => {
+		expect(getBrowserPreviewExpandedWidth(1280)).toBe("min(100%, 1280px)");
+		expect(getBrowserPreviewExpandedWidth(1920.4)).toBe("min(100%, 1920px)");
+	});
+
+	it("falls back safely for invalid viewport widths", () => {
+		expect(getBrowserPreviewExpandedWidth(0)).toBe("100%");
+		expect(getBrowserPreviewExpandedWidth(Number.NaN)).toBe("100%");
 	});
 });
 
