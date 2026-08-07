@@ -164,6 +164,13 @@ export interface ChunkedMessageListHandle {
 	scrollToBottom: (instant?: boolean) => void;
 	refreshStructure: (mode?: "diff" | "full") => void;
 	detachFromBottom: () => void;
+	/**
+	 * Announce an imminent LOD change centered on a viewport point, so the list can
+	 * keep that point visually fixed across the rebuild. The wheel/pinch handlers
+	 * capture this themselves; UI-driven changes (the indicator's notches and
+	 * steppers) have no gesture to capture from and call this instead.
+	 */
+	prepareLodChange: (clientY: number) => void;
 }
 
 export interface ChunkTailMeta {
@@ -1661,10 +1668,26 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			[scheduleFollowTail],
 		);
 
+		// UI-driven LOD changes (indicator notches / steppers) have no wheel or
+		// pinch to read a focus point from; anchor on the horizontal center of the
+		// scroller at the caller's Y so the same anchor machinery applies.
+		const prepareLodChange = useCallback((clientY: number) => {
+			const el = scrollerRef.current;
+			if (!el) return;
+			const rect = el.getBoundingClientRect();
+			captureAnchorRef.current(rect.left + rect.width / 2, clientY);
+		}, []);
+
 		useImperativeHandle(
 			ref,
-			() => ({ scrollToMessageTarget, scrollToBottom, refreshStructure, detachFromBottom }),
-			[refreshStructure, scrollToBottom, scrollToMessageTarget, detachFromBottom],
+			() => ({
+				scrollToMessageTarget,
+				scrollToBottom,
+				refreshStructure,
+				detachFromBottom,
+				prepareLodChange,
+			}),
+			[refreshStructure, scrollToBottom, scrollToMessageTarget, detachFromBottom, prepareLodChange],
 		);
 		// Set once the initial scroll-to-bottom has settled; until then the scroll
 		// handler must not recenter (the programmatic scroll + unsettled heights

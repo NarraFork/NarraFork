@@ -19,6 +19,7 @@ import { ActionIcon, Badge, Box, Center, Group, Loader, Text, Tooltip } from "@m
 import {
 	IconFileCode,
 	IconFileText,
+	IconFlask,
 	IconGitBranch,
 	IconInfoCircle,
 	IconNotebook,
@@ -76,6 +77,11 @@ const FileViewerContent = lazy(() =>
 );
 const LazyPluginDockPanel = lazy(() =>
 	import("../../plugins/PluginDockPanel").then((m) => ({ default: m.PluginDockPanel })),
+);
+// TEMPORARY streaming harness — lazy so it is never fetched unless opened.
+// Removed together with `../mock/` (see its README-REMOVAL.md).
+const MockStreamPanel = lazy(() =>
+	import("../mock/MockStreamPanel").then((m) => ({ default: m.MockStreamPanel })),
 );
 
 function LazyPanelBoundary({ children }: { children: React.ReactNode }) {
@@ -671,6 +677,31 @@ export function SearchDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPar
 	);
 }
 
+// ── Mock stream harness (TEMPORARY, see ../mock/README-REMOVAL.md) ──
+export function MockDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const dock = useNarratorDockContext();
+	// Live context is the source of truth (see ChatDockPanel note).
+	const narratorId = dock?.narratorId ?? props.params.narratorId;
+
+	// Title is hard-coded (not i18n) like the rest of this debug surface.
+	useLayoutEffect(() => {
+		if (props.api.title !== "Mock stream") props.api.setTitle("Mock stream");
+	}, [props.api]);
+
+	return (
+		<ToolPanelShell
+			title="Mock stream"
+			icon={<IconFlask size={16} color="var(--mantine-color-dimmed)" />}
+			props={props}
+			subjectId="__mock__"
+		>
+			<LazyPanelBoundary>
+				<MockStreamPanel narratorId={narratorId} />
+			</LazyPanelBoundary>
+		</ToolPanelShell>
+	);
+}
+
 // ── File viewer (multi-instance, one panel per path) ──
 export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 	const { t } = useTranslation("narrator");
@@ -732,6 +763,8 @@ export const narratorDockComponents: Record<
 	subagent: SubagentDockPanel,
 	file: FileDockPanel,
 	plugin: PluginDockPanel,
+	// TEMPORARY (see ../mock/README-REMOVAL.md).
+	mock: MockDockPanel,
 };
 
 /**

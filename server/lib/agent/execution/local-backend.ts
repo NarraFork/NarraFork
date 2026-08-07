@@ -20,6 +20,7 @@ import {
 	unlink,
 } from "node:fs/promises";
 import { isAbsolute, posix as posixPath, resolve } from "node:path";
+import { envWithAmbientProxy } from "../../net/proxy-env";
 import { getHome, IS_WINDOWS } from "../../platform";
 import { pathsEqualForOS, toForwardSlash } from "../../platform-path";
 import { resolveRgPath } from "../../ripgrep";
@@ -540,11 +541,13 @@ export class LocalBackend implements ExecutionBackend {
 		if (freshEnv) {
 			env = buildMinimalEnv(shellInfo.extraEnv);
 		} else {
-			env = {
-				...process.env,
+			// Agent-run commands are the user's tooling (curl, git, package managers),
+			// so restore the ambient proxy variables NarraFork blanks for its own
+			// outbound fetch.
+			env = envWithAmbientProxy({
 				HOME: getHome(),
 				...shellInfo.extraEnv,
-			};
+			});
 			if (isWin && !env.PATH && process.env.PATH) {
 				env.PATH = process.env.PATH;
 			}

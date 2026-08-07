@@ -45,6 +45,7 @@ export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
 	subagent: PANEL_COMPONENT.subagent,
 	file: PANEL_COMPONENT.file,
 	plugin: PANEL_COMPONENT.plugin,
+	mock: PANEL_COMPONENT.mock,
 };
 
 /** Stable dockview panel id for a singleton panel type within one narrator surface. */
@@ -98,6 +99,7 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 	subagent: PANEL_DEFAULT_TITLE.subagent,
 	file: PANEL_DEFAULT_TITLE.file,
 	plugin: PANEL_DEFAULT_TITLE.plugin,
+	mock: PANEL_DEFAULT_TITLE.mock,
 };
 
 const NARRATOR_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set([
@@ -109,6 +111,10 @@ const NARRATOR_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set([
 	"browser",
 	"tasks",
 	"search",
+	// TEMPORARY: the streaming harness participates in the toolbar's
+	// open/close/toggle vocabulary so its button can show active state.
+	// Removed together with `../mock/` (see its README-REMOVAL.md).
+	"mock",
 ]);
 
 /** Runtime guard used when scanning serialized/live dock panels. */

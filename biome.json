@@ -26,6 +26,8 @@
 			"!**/server/generated",
 			"!**/frontend/routeTree.gen.ts",
 			"!**/drizzle",
+			"!**/examples/plugins/cline-external/server/index.js",
+			"!**/examples/plugins/cline-external/ui/*.iife.js"
 		]
 	}
 }

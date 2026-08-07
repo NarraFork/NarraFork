@@ -8,6 +8,7 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL, getHome, IS_WINDOWS } from "../lib/platform";
 import { BufferManager } from "../terminal/buffer-manager";
 import {
@@ -364,11 +365,13 @@ export const terminalService = {
 			const spawnOpts: TerminalSpawnOptions = {
 				cmd: [DEFAULT_SHELL, "-l"],
 				cwd,
-				env: {
-					...process.env,
+				// User-facing shell: restore the ambient proxy variables NarraFork
+				// blanks for its own fetch, so the user's tools behave as they do
+				// outside NarraFork.
+				env: envWithAmbientProxy({
 					HISTFILE: DEV_NULL,
 					TERM: "xterm-256color",
-				},
+				}),
 				cols,
 				rows,
 				onData: (data) => onData(id, buffer, data),

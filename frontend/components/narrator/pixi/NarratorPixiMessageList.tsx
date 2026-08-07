@@ -1,5 +1,6 @@
 import { clearCache as clearPretextCache, setLocale as setPretextLocale } from "@chenglou/pretext";
 import i18n from "@frontend/lib/i18n";
+import { installPixiCanvasPoolHmrGuard } from "@frontend/lib/pixi-hmr";
 import { Z } from "@frontend/lib/z-index";
 import { Box, Menu } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
@@ -101,10 +102,23 @@ interface NarratorPixiMessageListProps {
 	shift?: boolean;
 }
 
+// The pools this surface returns textures/canvases to are Pixi module singletons
+// shared with every other Pixi surface, so the guards must be installed here too
+// rather than relying on the ruler layer having been mounted first.
+installPixiCanvasPoolHmrGuard();
+
 function destroyPixiApplication(app: Application): void {
 	const pixiApp = app as unknown as { _cancelResize?: () => void; destroy: Application["destroy"] };
 	if (typeof pixiApp._cancelResize !== "function") pixiApp._cancelResize = () => {};
-	app.destroy(true, { children: true });
+	// `removeView: true`, never the boolean `true`. The boolean form reaches
+	// `AbstractRenderer.destroy` as `options === true`, which also fires
+	// `GlobalResourceRegistry.release()` — emptying PROCESS-WIDE pools
+	// (`TexturePool._texturePool = {}`) that this app does not own, while leaving
+	// `_poolKeyHash` pointing at the vanished buckets. Every Text still alive
+	// anywhere then throws on unload ("Cannot read properties of undefined
+	// (reading 'push')"), including in OTHER Pixi surfaces such as the ruler layer.
+	// `removeView` keeps the only part we wanted: detaching the canvas.
+	app.destroy({ removeView: true }, { children: true });
 }
 
 type RenderableContainer = Container & { destroyed?: boolean; children?: unknown[] | null };

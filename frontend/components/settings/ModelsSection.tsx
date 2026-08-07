@@ -167,6 +167,11 @@ export function ModelsSection({
 				searchable
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={defaultModel}
+				onChange={(v) => {
+					// Guard against a null change (controlled-value mismatch): never
+					// write a fabricated fallback model into the dirty state.
+					if (v) setDefaultModel(v);
+				}}
 			/>
 			<Select
 				label={t("summaryModel")}
@@ -174,6 +179,10 @@ export function ModelsSection({
 				searchable
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={summaryModel}
+				onChange={(v) => {
+					// Guard against a null change: persisting a hardcoded fallback
+					if (v) setSummaryModel(v);
+				}}
 			/>
 			<Select
 				label={t("translationModel")}

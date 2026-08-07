@@ -1,5 +1,6 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "@server/lib/settings/types";
+import { canonicalPluginToolName } from "./plugin-agent-tool-bridge";
 import {
 	type CapabilityBroker,
 	capabilityBroker as defaultCapabilityBroker,
@@ -158,13 +159,19 @@ function boundedInteger(value: number | undefined, fallback: number, max: number
 	return Math.min(max, Math.max(1, Math.floor(value ?? fallback)));
 }
 
+/**
+ * Sanitizer for internal identifiers (MCP server IDs) — these never travel to a model
+ * provider, so the looser alphabet is kept to avoid churning already-issued IDs.
+ */
 function safeName(value: string): string {
 	const normalized = value.replace(/[^a-zA-Z0-9_.-]/g, "_");
 	return normalized || "unknown";
 }
 
 function bridgeName(pluginId: string, contributionId: string): string {
-	return `plugin__${safeName(pluginId)}__${safeName(contributionId)}`;
+	// Same alphabet as the Agent-facing canonical name, so a plugin tool is addressed
+	// identically whether it is reached through the MCP bridge or the Agent registry.
+	return canonicalPluginToolName(pluginId, contributionId);
 }
 
 function hasUnsafeText(value: string): boolean {

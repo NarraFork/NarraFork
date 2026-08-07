@@ -1506,6 +1506,40 @@ async function restoreLegacyNarrators(
 	}
 }
 
+/**
+ * Consume messages a user queued while recovery held these narrators busy.
+ *
+ * `pushBufferedMessage` accepts input for a narrator whose runtime is claimed by a
+ * loop-less recovery stage, which is what keeps a post-restart send from starting a
+ * second agent loop beside the work being restored. The queue then needs an owner.
+ * Recovery paths that call `continueNarrator` provide one; a background-agents-only
+ * epoch does not, so this sweep is the sole consumer for that case.
+ *
+ * Best-effort per narrator: a failure here must never turn a successful recovery into
+ * a reported failure, and `resumeBufferedMessagesIfIdle` already declines whenever
+ * another owner exists or the narrator must not be woken.
+ */
+async function drainQueuedMessagesAfterRecovery(
+	snapshot: PlannedUpdateRecoverySnapshot,
+	narratorIds: readonly string[],
+): Promise<void> {
+	if (narratorIds.length === 0) return;
+	const { resumeBufferedMessagesIfIdle } = await import("./narrator-session");
+	for (const narratorId of narratorIds) {
+		const target = snapshot.narrators.find((entry) => entry.narratorId === narratorId);
+		await resumeBufferedMessagesIfIdle(
+			narratorId,
+			localeFor(snapshot, narratorId),
+			target?.replyInUserLanguage ?? false,
+		).catch((error) => {
+			logger.warn("Failed to resume queued messages after planned-update recovery", {
+				narratorId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	}
+}
+
 export interface PlannedUpdateRecoveryHandle {
 	/** Resolves after every long-running recovery and owner delivery reaches a safe boundary. */
 	completion: Promise<void>;
@@ -1601,6 +1635,11 @@ export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 			removePlannedUpdateRecoverySnapshot({ expectedEpoch: snapshot.updateEpoch });
 		} finally {
 			for (const control of parentControls.values()) control.registration.unregister();
+			// Only now, with every runtime claim released, can queued input be judged
+			// orphaned. Messages sent while recovery held these narrators busy are
+			// consumed by whichever loop recovery started; a background-agents-only
+			// epoch starts no loop at all, so those queues would otherwise stay stuck.
+			await drainQueuedMessagesAfterRecovery(snapshot, [...parentControls.keys()]);
 		}
 	})();
 	void completion.catch((error) => {

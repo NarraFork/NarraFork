@@ -1,0 +1,16 @@
+{
+	"spdxVersion": "SPDX-2.3",
+	"dataLicense": "CC0-1.0",
+	"SPDXID": "SPDXRef-DOCUMENT",
+	"name": "com.narrafork.cline-external",
+	"documentNamespace": "https://narrafork.local/sbom/com.narrafork.cline-external",
+	"packages": [
+		{
+			"SPDXID": "SPDXRef-cline-external",
+			"name": "com.narrafork.cline-external",
+			"versionInfo": "0.1.0",
+			"licenseDeclared": "Apache-2.0",
+			"licenseConcluded": "Apache-2.0"
+		}
+	]
+}

@@ -28,6 +28,12 @@ export const DEFAULTS: NarraForkSettings = {
 	agent: {
 		defaultPermissionMode: "acceptEdits",
 		defaultStartInPlanMode: false,
+		// Deliberately empty: an unset summary model follows the default model
+		// (resolveConfiguredSummaryModel). Shipping a concrete model here would
+		// present a provider the user never configured as a real selection, and
+		// `checkSummaryModelAvailable` would then fail it and open the picker on a
+		// fresh install.
+		summaryModel: "",
 		translationModel: "__summary__",
 		customModels: [],
 		hiddenModels: [],
@@ -374,7 +380,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 
 	"agent.summaryModel": {
-		desc: "用于生成摘要的模型。用于压缩上下文、标题生成等辅助任务。应选择速度快成本低的模型。",
+		desc: "用于生成摘要的模型。用于压缩上下文、标题生成等辅助任务。应选择速度快成本低的模型。留空则跟随默认模型。",
 		type: "string",
 	},
 	"agent.translationModel": {

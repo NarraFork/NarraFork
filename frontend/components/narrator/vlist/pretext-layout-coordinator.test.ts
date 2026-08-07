@@ -697,6 +697,58 @@ describe("PretextLayoutCoordinator", () => {
 		expect(coordinator.getSnapshot().status).toBe("ready");
 	});
 
+	// A second caller used to be told "0 prepended" while a page was in flight. That
+	// is fine for the scroll gate but wrong for the jump path, which pages upward in
+	// a loop and reads the count to decide whether to page again: a premature 0 ends
+	// the jump one page short of its target, so the search hit never appears.
+	it("joins an in-flight older page instead of reporting nothing prepended", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		const olderGate: { release: (() => void) | null } = { release: null };
+		let olderFetches = 0;
+		const fetchPage = async (
+			_id: string,
+			opts: { beforeSeq?: number; limit: number },
+		): Promise<PretextDocumentPageResult> => {
+			if (opts.beforeSeq == null) {
+				return {
+					messages: [message(2, "three")],
+					minSeq: 2,
+					maxSeq: 2,
+					hasNext: false,
+					hasPrev: true,
+					messageVersion: 3,
+					pruneBoundaryMessageId: null,
+					prunedPercent: null,
+				};
+			}
+			olderFetches++;
+			await new Promise<void>((resolve) => {
+				olderGate.release = resolve;
+			});
+			return {
+				messages: [message(1, "two")],
+				minSeq: 1,
+				maxSeq: 1,
+				hasNext: true,
+				hasPrev: false,
+				messageVersion: 3,
+				pruneBoundaryMessageId: null,
+				prunedPercent: null,
+			};
+		};
+		await coordinator.load("n1", buildOptions, { fetchPage });
+		const view = () => ({ scrollTop: 40, pinnedToBottom: false, viewportHeight: 720 });
+
+		const first = coordinator.loadOlder(buildOptions, view);
+		const joined = coordinator.loadOlder(buildOptions, view);
+		olderGate.release?.();
+		// Both see the same prepended count, from a SINGLE request.
+		expect(await first).toBe(1);
+		expect(await joined).toBe(1);
+		expect(olderFetches).toBe(1);
+		expect(coordinator.getSnapshot().input?.messages.map((m) => m.seq)).toEqual([1, 2]);
+	});
+
 	it("clears the loadingOlder flag even when a rebuild bumps the generation mid-fetch", async () => {
 		const coordinator = new PretextLayoutCoordinator();
 		const olderGate: { release: (() => void) | null } = { release: null };

@@ -1,4 +1,4 @@
-import { Stack, Title } from "@mantine/core";
+import { Stack, Switch, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
@@ -20,6 +20,9 @@ function SettingsAppearancePage() {
 	const [advancedAnim, setAdvancedAnim] = useLocalPref("narrafork_advanced_anim");
 	const [expandReasoning, setExpandReasoning] = useLocalPref("narrafork_expand_reasoning");
 	const [centeredColumn, setCenteredColumn] = useLocalPref("narrafork_narrator_centered_column");
+	// TEMPORARY debug toggle — see components/narrator/mock/README-REMOVAL.md.
+	// Kept here rather than inside AppearanceSection so removal touches one file.
+	const [mockStream, setMockStream] = useLocalPref("narrafork_mock_stream");
 
 	// Sync fullscreen state when user exits via browser shortcut (Esc / F11)
 	useEffect(() => {
@@ -46,6 +49,13 @@ function SettingsAppearancePage() {
 				setExpandReasoning={setExpandReasoning}
 				centeredColumn={centeredColumn}
 				setCenteredColumn={setCenteredColumn}
+			/>
+			{/* TEMPORARY debug toggle (mock stream harness). Delete with ../mock/. */}
+			<Switch
+				label={t("mockStreamPanel")}
+				description={t("mockStreamPanelDesc")}
+				checked={mockStream}
+				onChange={(e) => setMockStream(e.currentTarget.checked)}
 			/>
 		</Stack>
 	);

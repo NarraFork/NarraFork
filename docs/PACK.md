@@ -62,7 +62,7 @@ Pack 补上这一层：把"一套流程所需的文件 + 脚本"打包成一个�
 - **目录访问**：解压目录注册为 `narrator_whitelist_dirs`（`accessLevel: readWrite`）。这让文件工具与"白名单安全"的 bash 命令对该目录的读写**自动放行**（`resolveWhitelistDecision`），无需改任何工具代码。
 - **脚本执行仍审批**：`./setup.sh`、`bash script.sh` 等路径执行命中 `bash-analyze.ts` 的 `isPathExecution` → 产生 `dangerousPatterns` → 即使目录在白名单内，bash 分支仍返回 `ask`。**这是有意保留的安全闸门**：pack 作者不能凭"上传一个 pack"就获得在用户机器上静默执行代码的能力，每个脚本执行都要用户点头。
 - **不提权**：whitelist 只放宽"目录访问"，blacklist 与 catastrophic 命令检测优先级更高，仍然生效。pack 解压目录的 whitelist 是 `readWrite` 而非 `full`（`full` 才放宽更多 bash 写操作）。
-- **解压防护**：用 `safeSpawn` 调系统 tar/unzip（带超时 + 输出上限 + 进程树清理），并防 zip-slip（解压路径逃逸校验，见 4.2）。
+- **解压防护**：tar.gz 用 `safeSpawn` 调系统 tar（带超时 + 输出上限 + 进程树清理）；zip 走进程内 `server/lib/zip-archive.ts`（`node:zlib`，Windows 无 `unzip` 命令）。两者都防 zip-slip（解压路径逃逸校验，见 4.2）。
 
 ---
 
@@ -201,10 +201,9 @@ packActivationService = {
 **activate 流程**：
 1. `canActivate` ACL 校验（拒绝 → NotFound 不泄露存在性）。
 2. 幂等：已有 active 激活且 `archiveHash` 一致 → 直接返回现有目录（不重复解压）。
-3. 解压：`extractDir = ~/.narrafork/packs/<narratorId>/<packId>/`，`mkdir -p`，用 `safeSpawn` 调
-   - tar.gz：`tar -xzf <archive> -C <extractDir>`
-   - zip：`unzip -o <archive> -d <extractDir>`（或回退库）
-   - 带 `timeout`、`maxOutputBytes`、`signal`（叙述者 abort）。
+3. 解压：`extractDir = ~/.narrafork/packs/<narratorId>/<packId>/`，`mkdir -p`，然后
+   - tar.gz：`safeSpawn` 调 `tar -xzf <archive> -C <extractDir>`，带 `timeout`、`maxOutputBytes`、`signal`（叙述者 abort）。
+   - zip：进程内 `extractZipArchive()`（`server/lib/zip-archive.ts`），不依赖外部 `unzip`（Windows 没有该命令）；解压前先读中央目录校验条目名/大小/符号链接，逐条目流式解压并校验 CRC 与大小上限。
 4. **zip-slip 防护**：解压后遍历校验所有文件路径都在 `extractDir` 内（`isInsidePath`），发现逃逸立即清理并报错。也校验解压总大小不超过上限（防 zip bomb）。
 5. 注册 whitelist：往 `narrator_whitelist_dirs` 插 `{ narratorId, path: extractDir, accessLevel: "readWrite", enabled: true }`，记下行 id。
 6. 写 `knowledge_pack_activations`。

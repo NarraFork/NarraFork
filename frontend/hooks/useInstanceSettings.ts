@@ -146,6 +146,7 @@ function makeDefaults(): InstanceSettingsState {
 		updateChannel: "stable",
 		updateAutoDownload: false,
 		permissionMode: "acceptEdits",
+		summaryModel: "",
 		translationModel: "__summary__",
 		maxTurns: 1000,
 		subagentExploreModel: "",
@@ -241,6 +242,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				updateAutoDownload: settings.update?.autoDownload ?? false,
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
 				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
+				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? ""),
 				translationModel: settings.agent?.translationModel?.startsWith("__")
 					? settings.agent.translationModel
 					: ensurePrefix(settings.agent?.translationModel ?? "__summary__"),

@@ -3,9 +3,11 @@ import {
 	Button,
 	FileInput,
 	Group,
+	NumberInput,
 	PasswordInput,
 	SegmentedControl,
 	Select,
+	Slider,
 	Stack,
 	Switch,
 	Text,
@@ -18,6 +20,10 @@ import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import {
 	BUILTIN_SOUND_NAMES,
+	DEFAULT_SOUND_MAX_CONCURRENT,
+	DEFAULT_SOUND_VOLUME,
+	MAX_SOUND_MAX_CONCURRENT,
+	MIN_SOUND_MAX_CONCURRENT,
 	playBuiltinSound,
 	playCustomSound,
 } from "../../lib/notification-sound";
@@ -50,6 +56,11 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 	const [feishuWebhook, setFeishuWebhook] = useState("");
 	const [feishuSecret, setFeishuSecret] = useState("");
 	const [webhookInited, setWebhookInited] = useState(false);
+	// Local slider value so dragging stays smooth. Held until the saved preference
+	// catches up (see below) rather than cleared on release: the mutation has no
+	// optimistic update, so dropping it at release time would snap the thumb back
+	// to the old value for the duration of the request and then jump forward again.
+	const [volumeDraft, setVolumeDraft] = useState<number | null>(null);
 
 	useEffect(() => {
 		if (userPrefs && !webhookInited) {
@@ -60,6 +71,21 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 			setWebhookInited(true);
 		}
 	}, [userPrefs, webhookInited]);
+
+	// Hand control back to the stored value once it agrees with the draft. Keyed on
+	// equality rather than on the request finishing, because the hook invalidates
+	// without awaiting the refetch — so the fresh value can arrive well after the
+	// mutation resolves.
+	useEffect(() => {
+		if (volumeDraft !== null && userPrefs?.notifySoundVolume === volumeDraft) {
+			setVolumeDraft(null);
+		}
+	}, [userPrefs?.notifySoundVolume, volumeDraft]);
+
+	const soundVolume = volumeDraft ?? userPrefs?.notifySoundVolume ?? DEFAULT_SOUND_VOLUME;
+	const soundMaxConcurrent = userPrefs?.notifySoundMaxConcurrent ?? DEFAULT_SOUND_MAX_CONCURRENT;
+	// Previews bypass the concurrency limit so repeated clicks always sound.
+	const previewOptions = { volume: soundVolume, bypassLimit: true };
 
 	const soundOptions = BUILTIN_SOUND_NAMES.map((name) => ({
 		value: name,
@@ -240,7 +266,9 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 									variant="subtle"
 									size="xs"
 									leftSection={<IconPlayerPlay size={14} />}
-									onClick={() => playBuiltinSound(userPrefs?.notifySoundBuiltin ?? "gentle")}
+									onClick={() =>
+										playBuiltinSound(userPrefs?.notifySoundBuiltin ?? "gentle", previewOptions)
+									}
 								>
 									{t("notifySoundPreview")}
 								</Button>
@@ -261,7 +289,10 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 										size="xs"
 										leftSection={<IconPlayerPlay size={14} />}
 										onClick={() =>
-											playCustomSound(`/api/notification-sounds/${userPrefs.notifySoundFileId}`)
+											playCustomSound(
+												`/api/notification-sounds/${userPrefs.notifySoundFileId}`,
+												previewOptions,
+											)
 										}
 									>
 										{t("notifySoundPreview")}
@@ -269,6 +300,58 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 								)}
 							</Group>
 						)}
+						<Stack gap={4} mt="xs">
+							<Text size="xs" fw={500}>
+								{t("notifySoundVolume")}
+							</Text>
+							<Text size="xs" c="dimmed">
+								{t("notifySoundVolumeDesc")}
+							</Text>
+							<Slider
+								min={0}
+								max={100}
+								step={5}
+								value={soundVolume}
+								label={(v) => `${v}%`}
+								marks={[
+									{ value: 0, label: "0%" },
+									{ value: 50, label: "50%" },
+									{ value: 100, label: "100%" },
+								]}
+								onChange={setVolumeDraft}
+								onChangeEnd={(v) => {
+									// Keep the draft: the effect above releases it once the saved
+									// value matches, so the thumb never snaps back mid-request.
+									setVolumeDraft(v);
+									updateUserPref.mutate(
+										{ notifySoundVolume: v },
+										// A rejected save must not leave the thumb parked on a value
+										// the server never accepted.
+										{ onError: () => setVolumeDraft(null) },
+									);
+								}}
+								mb="md"
+							/>
+						</Stack>
+						<NumberInput
+							label={t("notifySoundMaxConcurrent")}
+							description={t("notifySoundMaxConcurrentDesc")}
+							min={MIN_SOUND_MAX_CONCURRENT}
+							max={MAX_SOUND_MAX_CONCURRENT}
+							step={1}
+							clampBehavior="strict"
+							allowDecimal={false}
+							value={soundMaxConcurrent}
+							onChange={(v) => {
+								const next = typeof v === "number" ? v : Number.parseInt(String(v), 10);
+								if (!Number.isFinite(next)) return;
+								if (next < MIN_SOUND_MAX_CONCURRENT || next > MAX_SOUND_MAX_CONCURRENT) return;
+								if (next === soundMaxConcurrent) return;
+								updateUserPref.mutate({ notifySoundMaxConcurrent: next });
+							}}
+							size="xs"
+							w={200}
+						/>
 					</>
 				)}
 			</Stack>

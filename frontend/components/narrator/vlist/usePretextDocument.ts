@@ -143,11 +143,50 @@ export interface UsePretextDocumentResult {
 	hasPrev: boolean;
 	/** An older-page fetch is in flight. */
 	loadingOlder: boolean;
+	/**
+	 * Smallest loaded top-level seq, or null when nothing is loaded yet.
+	 *
+	 * The one coordinate that answers "is this message inside the loaded window?"
+	 * for a target that has no layout item yet — which is what a jump into
+	 * not-yet-loaded history has to decide before it can page toward it (see
+	 * vlist-jump-window).
+	 */
+	oldestLoadedSeq: number | null;
+	/**
+	 * SYNCHRONOUS read of the currently committed window, straight from the
+	 * coordinator.
+	 *
+	 * For callers that page across `await`s. Every field above is render state, so
+	 * after awaiting a page they still describe the window as it was BEFORE it grew
+	 * (the commit has been published to the store but React may not have re-rendered
+	 * yet). A loop that decides "page again?" from those values would either stall or
+	 * fetch a page twice; this reads the authoritative snapshot instead.
+	 */
+	readWindow: () => {
+		oldestLoadedSeq: number | null;
+		hasPrev: boolean;
+		index?: PretextLayoutIndex;
+	};
 
 	error?: Error;
 	reload: () => void;
 	/** Extend the loaded window upward by one older page (reverse infinite scroll). */
 	loadOlder: () => void;
+	/**
+	 * `loadOlder` as an awaitable step, resolving with the number of messages
+	 * prepended (0 when the document had nothing older to give).
+	 *
+	 * Exists for the ONE caller that has to know when the page landed: a jump into
+	 * history pages upward in a loop until the window covers its target, and a
+	 * fire-and-forget `loadOlder` gives it nothing to await, so the loop would spin
+	 * against a window that has not grown yet.
+	 *
+	 * In-flight fetches are COALESCED rather than queued: while a page is loading
+	 * (typically one the reader's own upward scroll started), every caller awaits
+	 * that same promise instead of starting a second request. Rejects when the page
+	 * fails, so the jump loop aborts instead of looping on an unchanged window.
+	 */
+	loadOlderAsync: () => Promise<number>;
 	/** Apply a live compact-progress tick to the loaded document (no refetch). */
 	applyCompactProgress: (messageId: string, progress: ProgressSnapshot, isSegment: boolean) => void;
 	/**
@@ -486,18 +525,21 @@ export function usePretextDocument(
 		options.onScrollTopCorrection?.(snapshot.scrollTop, snapshot.scrollTopAnchorKind);
 	}, [options.onScrollTopCorrection, snapshot.scrollTop, snapshot.scrollTopAnchorKind]);
 	const reload = useCallback(() => setReloadToken((value) => value + 1), []);
-	const loadOlder = useCallback(() => {
-		if (!coordinator) return;
+	// Preserve the visible content by height arithmetic: the coordinator shifts
+	// scrollTop by the exact height prepended above it. No item-key anchor is
+	// used, so a tool-run regrouping across the new page boundary cannot desync
+	// the position. Pinned-to-bottom (first-screen fill) stays pinned instead.
+	// The view is read LIVE at commit time (after the fetch) so scrolling during
+	// a slow request cannot desync the base scrollTop from the correction.
+	const loadOlderAsync = useCallback(async () => {
+		if (!coordinator) return 0;
 		const current = coordinator.getSnapshot();
-		if (current.status !== "ready" || !current.hasPrev || current.loadingOlder) return;
-		if (!current.index) return;
-		// Preserve the visible content by height arithmetic: the coordinator shifts
-		// scrollTop by the exact height prepended above it. No item-key anchor is
-		// used, so a tool-run regrouping across the new page boundary cannot desync
-		// the position. Pinned-to-bottom (first-screen fill) stays pinned instead.
-		// The view is read LIVE at commit time (after the fetch) so scrolling during
-		// a slow request cannot desync the base scrollTop from the correction.
-		void coordinator.loadOlder(buildOptions, () => {
+		// `loadingOlder` is NOT a rejection here (unlike the other guards): the
+		// coordinator joins an in-flight page, which is exactly what a caller that
+		// awaits the result needs. Only a document that cannot page at all returns 0.
+		if (current.status !== "ready" || !current.hasPrev) return 0;
+		if (!current.index) return 0;
+		return coordinator.loadOlder(buildOptions, () => {
 			const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
 			return {
 				scrollTop: view.scrollTop,
@@ -506,6 +548,17 @@ export function usePretextDocument(
 			};
 		});
 	}, [buildOptions, coordinator, options.getCurrentView]);
+	// Fire-and-forget wrapper for the scroll gate / first-screen fill, which have
+	// nothing to await and no way to report a failure. The rejection is swallowed
+	// here (the coordinator has already recorded it on the snapshot and stayed
+	// "ready", so the next upward gesture retries) rather than surfacing as an
+	// unhandled rejection.
+	const loadOlder = useCallback(() => {
+		if (!coordinator || coordinator.getSnapshot().loadingOlder) return;
+		void loadOlderAsync().catch(() => {
+			// Reported through the snapshot's retained error; paging stays available.
+		});
+	}, [coordinator, loadOlderAsync]);
 	const applyCompactProgress = useCallback(
 		(messageId: string, progress: ProgressSnapshot, isSegment: boolean) => {
 			coordinator?.applyCompactProgress(messageId, progress, isSegment);
@@ -526,6 +579,14 @@ export function usePretextDocument(
 			}) ?? false,
 		[coordinator, options.getCurrentView],
 	);
+	const readWindow = useCallback<UsePretextDocumentResult["readWindow"]>(() => {
+		const current = coordinator?.getSnapshot();
+		return {
+			oldestLoadedSeq: current?.input?.oldestLoadedSeq ?? null,
+			hasPrev: current?.hasPrev ?? false,
+			index: current?.index,
+		};
+	}, [coordinator]);
 	const appendMessage = useCallback(
 		(message: TreeMessage) =>
 			coordinator?.appendMessage(message, options.isSubagent === true, () => {
@@ -568,10 +629,13 @@ export function usePretextDocument(
 		scrollTopCorrectionKind: snapshot.scrollTopAnchorKind,
 		hasPrev: snapshot.hasPrev ?? false,
 		loadingOlder: snapshot.loadingOlder ?? false,
+		oldestLoadedSeq: snapshot.input?.oldestLoadedSeq ?? null,
+		readWindow,
 
 		error: snapshot.error,
 		reload,
 		loadOlder,
+		loadOlderAsync,
 		applyCompactProgress,
 		applyLivePatch,
 		setStreamingMessage,

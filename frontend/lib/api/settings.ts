@@ -191,6 +191,8 @@ export const settingsApi = {
 			notifySoundType: "builtin" | "custom";
 			notifySoundBuiltin: string;
 			notifySoundFileId: string | null;
+			notifySoundVolume: number;
+			notifySoundMaxConcurrent: number;
 			notifyDingtalkEnabled: boolean;
 			notifyDingtalkWebhook: string;
 			notifyDingtalkSecret: string;
@@ -242,6 +244,8 @@ export const settingsApi = {
 		notifySoundType?: "builtin" | "custom";
 		notifySoundBuiltin?: string;
 		notifySoundFileId?: string | null;
+		notifySoundVolume?: number;
+		notifySoundMaxConcurrent?: number;
 		notifyDingtalkEnabled?: boolean;
 		notifyDingtalkWebhook?: string;
 		notifyDingtalkSecret?: string;

@@ -194,9 +194,11 @@ function shouldReplayTransportFailure(
 
 /**
  * Fetch through Bun's native transport so streaming Response bodies and
- * AbortSignal use Bun's supported implementation. Direct requests explicitly
- * set `proxy: ""` to ignore ambient HTTP(S)_PROXY variables; configured proxies
- * are limited to the HTTP(S) protocols supported by Bun fetch.
+ * AbortSignal use Bun's supported implementation. Direct requests pass
+ * `proxy: ""`; that alone does NOT defeat an ambient HTTP(S)_PROXY on Bun
+ * (see `net/proxy-env.ts`, which blanks those variables at startup so this
+ * explicit value is authoritative). Configured proxies are limited to the
+ * HTTP(S) protocols supported by Bun fetch.
  */
 export async function outboundFetch(
 	input: string | URL | Request,

@@ -1,6 +1,9 @@
 /**
  * Release script: bump version, tag, build, and upload to update server.
  *
+ * When the version publishes as stable (x.y.0), an extra direct patch from the previous
+ * stable release is generated and uploaded so stable users upgrade in a single step.
+ *
  * Usage:
  *   bun scripts/release.ts 0.2.0                          # full release
  *   bun scripts/release.ts 0.2.0 --changelog=notes.json   # with changelog
@@ -24,6 +27,11 @@ import {
 	type PublishedBaselineCandidate,
 } from "../server/lib/release-baseline";
 import { getUnexpectedReleaseChanges, resolveGitCommit } from "./lib/release-git";
+import {
+	ensureStableBaselinePatches,
+	formatStableBaselineSummary,
+	resolvePlatformSuffixes,
+} from "./lib/stable-baseline-patch";
 
 const ROOT = join(import.meta.dir, "..");
 const PKG_PATH = join(ROOT, "package.json");
@@ -46,6 +54,7 @@ const uploadOnly = args.includes("--upload-only");
 const changelogArg = args.find((a) => a.startsWith("--changelog="))?.split("=").slice(1).join("=");
 const platformArg = args.find((a) => a.startsWith("--platform="))?.split("=").slice(1).join("=");
 const patchFromArg = args.find((a) => a.startsWith("--patch-from="))?.split("=").slice(1).join("=");
+const skipStablePatch = args.includes("--skip-stable-patch");
 const patchFromVersions = patchFromArg
 	?.split(",")
 	.map((value) => value.trim())
@@ -58,6 +67,9 @@ if (!version) {
 	console.error("  --changelog=<file>    JSON file with localized release notes");
 	console.error("  --platform=<target>   Build and upload only this platform (e.g. windows-x64)");
 	console.error("  --patch-from=<v,...>  Upload direct patches for the listed base versions");
+	console.error(
+		"  --skip-stable-patch   Skip the automatic previous-stable patch on stable releases",
+	);
 	console.error("  --dry-run             Build only, do not upload or tag");
 	console.error("  --skip-build          Skip compilation (use existing dist/)");
 	console.error("  --upload-only         Only upload, skip version bump and build");
@@ -104,24 +116,10 @@ if (!dryRun && !TOKEN) {
 	process.exit(1);
 }
 
-// Platform mapping: dist filename suffix → update server platform ID
-const PLATFORM_MAP: Record<string, string> = {
-	"linux-x64": "linux-x64",
-	"linux-x64-baseline": "linux-x64-baseline",
-	"linux-arm64": "linux-arm64",
-	"macos-arm64": "darwin-arm64",
-	"macos-x64": "darwin-x64",
-	"windows-x64.exe": "win-x64",
-	"windows-x64-baseline.exe": "win-x64-baseline",
-};
-
-// The platform argument uses build-script naming, while map keys use dist suffixes.
-const uploadEntries = platformArg
-	? Object.entries(PLATFORM_MAP).filter(([suffix]) => {
-			const bare = suffix.replace(/\.exe$/, "");
-			return bare === platformArg || suffix === platformArg;
-		})
-	: Object.entries(PLATFORM_MAP);
+// [dist filename suffix, update server platform ID], honouring --platform=<build name>.
+const uploadEntries = [...resolvePlatformSuffixes(platformArg)].map(
+	([platform, suffix]) => [suffix, platform] as const,
+);
 
 interface PublishedReleaseMetadata {
 	version: string;
@@ -532,6 +530,9 @@ async function validateTargetIdentity(
 	].join("\n");
 }
 
+// Channel: x.y.0 → stable, anything else (x.y.z where z>0, or pre-release) → beta
+const channel: "stable" | "beta" = /^\d+\.\d+\.0$/.test(version) ? "stable" : "beta";
+
 const prefix = `narrafork-${version}-`;
 let uploaded = 0;
 let failed = 0;
@@ -583,7 +584,6 @@ for (const [suffix, platform] of uploadEntries) {
 			failed++;
 			continue;
 		}
-		const channel = /^\d+\.\d+\.0$/.test(version) ? "stable" : "beta";
 		const form = new FormData();
 		form.append("version", version);
 		form.append("channel", channel);
@@ -649,8 +649,6 @@ for (const [suffix, platform] of uploadEntries) {
 			continue;
 		}
 
-		// Channel: x.y.0 → stable, anything else (x.y.z where z>0, or pre-release) → beta
-		const channel = /^\d+\.\d+\.0$/.test(version) ? "stable" : "beta";
 		const form = new FormData();
 		form.append("version", version);
 		form.append("channel", channel);
@@ -698,6 +696,32 @@ for (const [suffix, platform] of uploadEntries) {
 }
 
 console.log(`\n✅ Release v${version} complete: ${uploaded} uploaded, ${failed} failed`);
+
+// ── Step 6: Direct previous-stable patch (stable releases only) ─────────────
+
+// A stable release must be reachable from the previous *stable* release in one step. The
+// build only produces a patch from the immediately preceding version, which is usually a
+// beta, so stable users would otherwise replay the whole intermediate chain. Failures here
+// are warnings: the chain still works, it is just larger.
+if (channel === "stable" && !skipStablePatch && uploaded > 0) {
+	console.log("\n→ Ensuring a direct previous-stable upgrade path...");
+	const stablePatchResult = await ensureStableBaselinePatches({
+		client: { serverUrl: SERVER, token: TOKEN, product: "narrafork" },
+		targetVersion: version,
+		distDir: DIST_DIR,
+		platformSuffixes: resolvePlatformSuffixes(platformArg),
+		availableFilenames: readDistFilenames(),
+		log: (message) => console.log(message),
+	});
+	for (const line of formatStableBaselineSummary(stablePatchResult)) console.log(line);
+	if (
+		stablePatchResult.uploaded.length === 0 &&
+		stablePatchResult.failed.length === 0 &&
+		stablePatchResult.skipped.length === 0
+	) {
+		console.log("✓ Direct previous-stable patches were already published");
+	}
+}
 
 if (failed > 0 || uploaded === 0) {
 	if (uploaded === 0) console.error("❌ No release artifacts were uploaded");

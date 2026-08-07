@@ -11,11 +11,35 @@ import {
 	type BufferCreator,
 	type BufferedMessage,
 	bufferedMessages,
+	isNarratorRuntimeBusy,
 	type SavedBufferedFile,
 } from "./narrator-session-state";
 
 /** Maximum number of messages that can be queued per narrator. */
 const MAX_BUFFERED_MESSAGES = 50;
+
+/**
+ * Whether this narrator can hold a queued message right now.
+ *
+ * An `activeNarrators` entry is NOT the only form of "there is a runtime that will
+ * eventually consume this". Several parent-side stages drive a narrator with no
+ * entry at all while legitimately holding it in `working`:
+ * planned-update continuation recovery, the subagent recovery stages, and the
+ * recovery Await batch (see `registerPlannedUpdateRecoveryController`, which claims
+ * the runtime for exactly that reason).
+ *
+ * Rejecting those made the queue silently unavailable during the window right after
+ * an update restart. The caller in `routes/narrators.ts` treats a rejection as
+ * "narrator not active in memory" and falls through to a normal send, so a message
+ * sent while recovery was still driving a foreground subagent started a SECOND agent
+ * loop beside it — the parent then talked over its own running subagent.
+ *
+ * `isNarratorRuntimeBusy` is the authoritative in-memory answer to "is this narrator
+ * busy", covering live loops, permission/danger pauses and loop-less runtime claims.
+ */
+function canQueueForNarrator(narratorId: string): boolean {
+	return activeNarrators.has(narratorId) || isNarratorRuntimeBusy(narratorId);
+}
 
 /** Directory under ~/.narrafork where buffered text files are persisted. */
 function getBufferedFilesDir(): string {
@@ -114,7 +138,7 @@ export async function pushBufferedMessage(
 	position: "back" | "front" = "back",
 	bashCommand?: string | null,
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
-	if (!activeNarrators.has(narratorId)) {
+	if (!canQueueForNarrator(narratorId)) {
 		return { ok: false, bufferedAt: "", id: "" };
 	}
 	const queue = bufferedMessages.get(narratorId) ?? [];

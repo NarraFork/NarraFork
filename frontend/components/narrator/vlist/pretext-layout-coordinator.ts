@@ -130,6 +130,16 @@ export class PretextLayoutCoordinator {
 	private loadOptions: PretextDocumentLoadOptions = {};
 	private loadingOlder = false;
 	/**
+	 * The in-flight upward page, so a second caller can AWAIT it instead of being
+	 * told "0 prepended" and looping against a window that is about to grow.
+	 *
+	 * Only the awaitable jump path needs this. `loadOlder`'s fire-and-forget callers
+	 * (the scroll gate, first-screen fill) are content with the early return, but a
+	 * jump that pages toward a target must not mistake "someone else is already
+	 * fetching this page" for "there is nothing more to load".
+	 */
+	private pendingOlder: Promise<number> | null = null;
+	/**
 	 * Last committed build options + viewport, retained so an out-of-band mutation
 	 * (e.g. a compact_progress tick that patches an already-loaded message in place)
 	 * can rebuild the layout without the shell re-plumbing the current build params.
@@ -277,8 +287,22 @@ export class PretextLayoutCoordinator {
 	): Promise<number> {
 		const previous = this.input;
 		if (!previous?.hasPrev || this.narratorId == null) return 0;
-		if (this.loadingOlder) return 0;
+		// Join the in-flight page rather than reporting "nothing prepended": the
+		// awaitable jump path uses the resolved count to decide whether to page
+		// again, and a premature 0 would end the jump one page short of its target.
+		if (this.loadingOlder) return this.pendingOlder ?? 0;
 		this.loadingOlder = true;
+		const promise = this.runLoadOlder(previous, buildOptions, getView);
+		this.pendingOlder = promise;
+		return promise;
+	}
+
+	private async runLoadOlder(
+		previous: PretextDocumentInput,
+		buildOptions: PretextLayoutBuildOptions,
+		getView: () => PrependView,
+	): Promise<number> {
+		if (this.narratorId == null) return 0;
 		const generation = this.generation;
 		const previousTotalHeight = this.current.index?.totalHeight ?? 0;
 		this.current = { ...this.current, loadingOlder: true };
@@ -322,6 +346,7 @@ export class PretextLayoutCoordinator {
 			throw error;
 		} finally {
 			this.loadingOlder = false;
+			this.pendingOlder = null;
 			// Repair a stale spinner flag even if a concurrent rebuild/reload bumped
 			// the generation while this fetch was in flight (that commit captured
 			// loadingOlder=true). Never resurrect a snapshot from an older generation.

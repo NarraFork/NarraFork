@@ -192,6 +192,29 @@ effectiveCapabilities =
 - `settings.proxy` 的全局 direct/system/custom 是宿主出站策略；插件不能自行覆盖宿主安全策略或强制 direct 绕过企业代理。
 - **[待决策]** v1 是否实现本地进程的完整出站阻断；若不能可靠实现，应将“需要网络隔离”的插件自动提升到 Podman，而不是仅在 UI 显示警告。
 
+### 6.3 入站监听：已知例外（loopback OAuth 回调）
+
+本节 6.1–6.2 只规范**出站**。`permissions.network` 目前是文档而非强制——`manifest.ts` 的
+`uninspectedPermissionSchema` 注释明确记录宿主没有任何 reader，插件进程的网络能力来自操作系统。
+因此插件在技术上**可以**监听本机端口，不会被运行时拦截。
+
+`examples/plugins/cline-external` 是第一个真正依赖这一点的插件，如实记录为已知例外：
+
+- **为什么需要**：Cline 的 OAuth 授权流把凭据回传到一个 `callback_url`。该 URL 随授权请求发往
+  上游，必须与实际监听的地址端口一致，所以无法用宿主端点代收，也不能静默改端口。
+- **风险面收窄**：只绑 `127.0.0.1`（不是 `0.0.0.0`）；只在一次登录进行中开启；单一固定端口
+  19876；5 分钟超时后自动关闭；`deactivate` 与 `shutdown` 必须 `server.stop(true)`。
+- **不可用时如实上报**：Podman runner 下 loopback 不在宿主命名空间内，浏览器回调打不到。
+  插件的 `status` 命令返回三态 `browserAuth: "available" | "port_busy" | "unsupported"`，
+  UI 据此隐藏按钮并引导用户改用「粘贴回调 URL」路径——该路径不依赖任何监听端口，
+  是远程部署与容器环境下的正式方案，不是降级兜底。
+- **端口冲突**：内置 Cline 适配器使用同一端口。冲突时返回明确的 `PORT_IN_USE`，
+  不静默换端口。
+
+**这条先例的代价**：后续插件可以引用它申请同类能力。若要真正约束，应当在 runner 层实现
+（Podman 网络命名空间已天然阻断），而不是依赖 manifest 声明——与 6.2 末尾那条 [待决策]
+是同一个缺口的两个方向。
+
 ## 7. 文件系统权限
 
 ### 7.1 逻辑范围

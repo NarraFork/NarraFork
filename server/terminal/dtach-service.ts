@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { detectShell } from "../lib/agent/shell";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
+import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL, IS_WINDOWS } from "../lib/platform";
 import type { TerminalRuntime } from "./runtime";
 import { spawnBunTerminal } from "./runtime-bun";
@@ -419,12 +420,12 @@ export const dtachService = {
 
 		const proc = Bun.spawn(["dtach", "-n", socketPath, "-z", shell, "-li"], {
 			cwd: opts.cwd,
-			env: {
-				...process.env,
+			// User-facing shell: keep the user's ambient proxy configuration.
+			env: envWithAmbientProxy({
 				...opts.env,
 				HISTFILE: DEV_NULL,
 				TERM: "xterm-256color",
-			},
+			}),
 			stdio: ["ignore", "ignore", "ignore"],
 		});
 
@@ -445,7 +446,7 @@ export const dtachService = {
 		return spawnBunTerminal({
 			cmd: ["sh", "-c", 'stty -echoctl && exec dtach -a "$1" -z', "_", socketPath],
 			cwd: process.cwd(),
-			env: { ...process.env, TERM: "xterm-256color" },
+			env: envWithAmbientProxy({ TERM: "xterm-256color" }),
 			cols: opts.cols,
 			rows: opts.rows,
 			onData: opts.onData,

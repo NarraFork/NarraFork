@@ -4745,6 +4745,51 @@ export async function startBackgroundCompletionContinuationIfPossible(
 }
 
 /**
+ * Drain a narrator's queued messages once no runtime owner is left to consume them.
+ *
+ * Every ordinary path hands the queue to a loop: `runAgentLoop` consumes it at its
+ * own boundaries, and the recovery stages that drive a loop-less narrator all finish
+ * by calling `continueNarrator`, whose loop then drains it.
+ *
+ * One path does not. Planned-update recovery skips owner continuation when the epoch
+ * holds background Agents only (`deliverRecoveredMessageOwner`), because a background
+ * task keeps running on its own and the parent has nothing to resume. Messages queued
+ * during that window would then sit untouched until the user acted again — and they
+ * are queued now precisely because the recovery claim made the narrator look busy.
+ *
+ * Deliberately conservative: it never competes with a live owner, never wakes a
+ * plan-mode narrator (mirroring goal/inbound continuation), and repairs a status row
+ * that outlived recovery before starting anything.
+ */
+export async function resumeBufferedMessagesIfIdle(
+	narratorId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+): Promise<{ resumed: boolean }> {
+	if ((bufferedMessages.get(narratorId)?.length ?? 0) === 0) return { resumed: false };
+	return continuationStartLock.acquire(narratorId, async () => {
+		if ((bufferedMessages.get(narratorId)?.length ?? 0) === 0) return { resumed: false };
+		// A live loop (or any other runtime owner) will consume the queue itself.
+		if (isNarratorRuntimeBusy(narratorId)) return { resumed: false };
+
+		// Recovery left the row at `working` with nobody behind it; drop it to idle so
+		// the resumed turn transitions honestly instead of stacking onto a zombie.
+		await reconcileRunningStatus(narratorId);
+
+		const narrator = await narratorService.getById(narratorId);
+		if (isSubagentVariant(narrator.variant)) return { resumed: false };
+		if (narrator.status !== "idle") return { resumed: false };
+		if (isPlanModeTrait(narrator.traits)) return { resumed: false };
+
+		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+		if (active._loopRunning) return { resumed: false };
+
+		resumeNextBufferedMessage(active, locale);
+		return { resumed: true };
+	});
+}
+
+/**
  * Wake an idle parent narrator to consume progress reports sent by its child
  * subagents via Send({ id: "parent" }). A working/waiting parent drains the
  * queue at its next after_tools sidecar boundary, so this only acts on idle

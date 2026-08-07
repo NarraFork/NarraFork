@@ -111,7 +111,9 @@ describe("PluginMcpAdapter mcp.bridge", () => {
 		const descriptor = adapterInstance.registerBridge(tool());
 
 		expect(descriptor).toMatchObject({
-			name: "plugin__com.example.mcp__echo",
+			// Reverse-DNS dots are folded to `_`: providers reject function names outside
+			// `^[a-zA-Z0-9_-]+$` and fail the whole request, not just the offending tool.
+			name: "plugin__com_example_mcp__echo",
 			pluginId: principal.pluginId,
 			contributionId: "echo",
 			fullId: "com.example.mcp/echo",

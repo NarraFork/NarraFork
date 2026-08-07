@@ -1,3 +1,4 @@
+import { normalizeToolName, sanitizeToolNameSegment } from "@server/lib/agent/tool-name";
 import {
 	toolRegistry as defaultAgentToolRegistry,
 	type ToolProvider,
@@ -21,18 +22,19 @@ const MAX_ERROR_MESSAGE = 1_000;
 /**
  * The public Agent-facing name for a plugin tool. The mapping is intentionally kept in one place;
  * callers must use PluginAgentToolBridge.fullIdForCanonical() rather than reconstructing a full ID.
+ *
+ * Plugin IDs are reverse-DNS (`com.example.duo`), so the dots must be folded away: every provider
+ * constrains function names to `^[a-zA-Z0-9_-]+$` and rejects the entire request — not just the
+ * offending entry — when one tool violates it.
  */
 export function canonicalPluginToolName(pluginId: string, contributionId: string): string {
-	return `plugin__${safeName(pluginId)}__${safeName(contributionId)}`;
+	return normalizeToolName(
+		`plugin__${sanitizeToolNameSegment(pluginId)}__${sanitizeToolNameSegment(contributionId)}`,
+	);
 }
 
 /** Backwards-compatible alias used by callers that spell the operation as a conversion. */
 export const pluginToolCanonicalName = canonicalPluginToolName;
-
-function safeName(value: string): string {
-	const normalized = value.replace(/[^a-zA-Z0-9_.-]/g, "_");
-	return normalized || "unknown";
-}
 
 function clone<T>(value: T): T {
 	return structuredClone(value);

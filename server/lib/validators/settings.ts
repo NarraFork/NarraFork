@@ -107,6 +107,8 @@ export const updateUserPreferencesSchema = z.object({
 	notifySoundType: z.enum(["builtin", "custom"]).optional(),
 	notifySoundBuiltin: z.string().max(50).optional(),
 	notifySoundFileId: z.string().max(50).nullable().optional(),
+	notifySoundVolume: z.number().int().min(0).max(100).optional(),
+	notifySoundMaxConcurrent: z.number().int().min(1).max(10).optional(),
 	notifyDingtalkEnabled: z.boolean().optional(),
 	notifyDingtalkWebhook: z
 		.string()

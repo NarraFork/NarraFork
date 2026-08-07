@@ -8,6 +8,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { isInsidePath } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
 import { slugify } from "../lib/slug";
@@ -521,11 +522,13 @@ export const chapterFork = {
 					const result = await safeSpawn({
 						cmd: ["sh", "-c", project.startupScript],
 						cwd: worktreePath,
-						env: {
-							...process.env,
+						// A user-authored startup script commonly installs dependencies, so it
+						// keeps the user's ambient proxy rather than the blanked values
+						// NarraFork uses for its own outbound fetch.
+						env: envWithAmbientProxy({
 							NARRAFORK_CHAPTER_ID: id,
 							NARRAFORK_STARTUP_SCRIPT: "1",
-						},
+						}),
 						timeout: 60_000,
 						killProcessTree: true,
 					});

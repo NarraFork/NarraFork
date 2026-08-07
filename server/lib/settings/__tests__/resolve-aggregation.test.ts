@@ -117,6 +117,29 @@ describe("resolveAggregation", () => {
 		expect(draft.agent.translationModel).toBe("__summary__");
 	});
 
+	test("purging a stale summary model logs the previous value and prefix", async () => {
+		const { logger } = await import("../../logger");
+		const warnCalls: Array<Record<string, unknown> | undefined> = [];
+		const originalWarn = logger.warn;
+		logger.warn = (_msg: string, data?: Record<string, unknown>) => {
+			warnCalls.push(data);
+		};
+		try {
+			const draft = structuredClone(DEFAULTS);
+			draft.agent.summaryModel = "removed:model";
+
+			expect(purgeStaleAgentModelRefs(draft, (prefix) => prefix === "removed")).toBe(true);
+			expect(draft.agent.summaryModel).toBe("");
+			expect(warnCalls).toHaveLength(1);
+			expect(warnCalls[0]).toMatchObject({
+				previousValue: "removed:model",
+				stalePrefix: "removed",
+			});
+		} finally {
+			logger.warn = originalWarn;
+		}
+	});
+
 	test("returns null when every member's provider is disabled", () => {
 		setAggregation({
 			name: "Test",

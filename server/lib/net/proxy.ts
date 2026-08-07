@@ -4,29 +4,29 @@
  * Cline, NUG, WebFetch, browser) resolve their proxy through this module so a
  * single global policy (`settings.proxy`) controls every outbound request.
  *
- * Bun's global `fetch()` also reads HTTP(S)_PROXY automatically. Fetch callers
- * therefore use `outbound-fetch.ts`, which passes `proxy: ""` for direct/NO_PROXY
- * routes and an explicit HTTP(S) URL for system/custom proxy routes.
+ * Bun's global `fetch()` also reads HTTP(S)_PROXY automatically, and the
+ * per-request `proxy` option cannot opt out of it (`proxy: ""` / `undefined` /
+ * omitted are all still proxied on Bun 1.3.14). The ambient variables are
+ * therefore snapshotted and blanked at startup by `proxy-env.ts`, which leaves
+ * the explicit `proxy` value that `outbound-fetch.ts` passes as the only thing
+ * deciding whether a request is proxied. "system" mode reads the snapshot.
  */
 
 import { settings } from "../settings";
 import type { ProxyOverride } from "../settings/types";
 import { createOutboundProxyDispatcher, OutboundProxyConfigurationError } from "./outbound-fetch";
+import { ambientNoProxy, ambientSystemProxy } from "./proxy-env";
 
 /**
- * Detect a proxy URL from standard environment variables (case-insensitive).
+ * Detect the proxy URL the process was started with (case-insensitive).
  * Order: HTTPS_PROXY → HTTP_PROXY → ALL_PROXY.
+ *
+ * Reads the startup snapshot from `proxy-env.ts` rather than the live
+ * environment, because the ambient variables are deliberately blanked at startup
+ * so Bun's fetch cannot proxy a request behind this module's back.
  */
 export function detectSystemProxy(): string | undefined {
-	return (
-		process.env.HTTPS_PROXY ||
-		process.env.https_proxy ||
-		process.env.HTTP_PROXY ||
-		process.env.http_proxy ||
-		process.env.ALL_PROXY ||
-		process.env.all_proxy ||
-		undefined
-	);
+	return ambientSystemProxy();
 }
 
 /**
@@ -84,9 +84,12 @@ function isLoopbackHost(hostname: string): boolean {
 	return false;
 }
 
-/** Read the NO_PROXY / no_proxy env var into a normalized entry list. */
+/**
+ * Read the startup NO_PROXY / no_proxy value into a normalized entry list.
+ * Uses the snapshot for the same reason as `detectSystemProxy`.
+ */
 function getNoProxyEntries(): string[] {
-	const raw = process.env.NO_PROXY || process.env.no_proxy || "";
+	const raw = ambientNoProxy();
 	return raw
 		.split(",")
 		.map((e) => e.trim().toLowerCase())

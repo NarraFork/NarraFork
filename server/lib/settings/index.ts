@@ -8,6 +8,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
+import { logger } from "../logger";
 import { setModelPricingOverrides } from "../model-pricing";
 import { getNarraforkHome } from "../narrafork-home";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
@@ -456,6 +457,10 @@ export function purgeStaleAgentModelRefs(
 
 	let dirty = false;
 	if (isStale(settings.agent.summaryModel)) {
+		logger.warn("Cleared stale summary model reference", {
+			previousValue: settings.agent.summaryModel,
+			stalePrefix: settings.agent.summaryModel.split(":")[0],
+		});
 		settings.agent.summaryModel = "";
 		dirty = true;
 	}
