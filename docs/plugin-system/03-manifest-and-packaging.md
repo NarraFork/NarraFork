@@ -285,7 +285,7 @@ cn.example.team.provider
 - `commands[]`：局部 ID、纯文本标题、参数 schema、handler 位置、有限 `when` context-key；不允许运行期注册 callback。
 - `events[]`：公共 topic、静态 filter schema、是否允许后台接收、最大事件频率；不透传原始事件 payload。
 - `views[]`：UI entry、surface、scope、instance 策略、默认位置、关联 command；只允许宿主声明式 panel。
-- `themes[]`：局部 ID、纯文本标题、`colorScheme`（light/dark/both）和受白名单约束的设计 `tokens`（primaryColor 单色、body/text 颜色、自定义 colors、spacing/fontSize/radius，以及可选的 `backgrounds` 区域背景和 `frames` 九宫格贴图边框）。**插件只声明 token，不提交任何 CSS**；宿主校验每个值（颜色只允许 `#hex`/`rgb()` 安全子集，盒模型值做范围钳制并拒绝 `calc()`/`var()`/表达式），在 catalog refresh 时把单色扩展成 10 级色阶并编译成一段作用于 `[data-plugin-theme]` 的 Mantine CSS 变量覆盖。主题贡献是零 JS、零代码执行的声明式 token，风险与内置 OLED 模式同级，因此 `ui.theme` **不是**高风险能力（详见下方 3.5.1 插件分级）。切换主题只改 `<html data-plugin-theme>` 属性，不重建 React 树。
+- `themes[]`：局部 ID、纯文本标题、`colorScheme`（light/dark/both）、可选的受控 `fonts[]` WOFF2 声明，以及白名单设计 `tokens`（primaryColor 单色、body/text 颜色、自定义 colors、spacing/fontSize/radius、字体角色引用、`backgrounds` 区域背景和 `frames` 九宫格贴图边框）。**插件只声明结构化数据，不提交任何 CSS**；宿主校验每个值，在 catalog refresh 时生成色阶、唯一 `@font-face` 和作用于 `[data-plugin-theme]` 的 Mantine CSS 变量覆盖。主题贡献仍是零 JS、零代码执行的声明式资源，风险与内置 OLED 模式同级，因此 `ui.theme` **不是**高风险能力（详见下方 3.5.1 插件分级）。切换主题只改 `<html data-plugin-theme>` 属性，不重建 React 树。
 - `menus`/`status`：后续阶段可加入，但只能声明文本、宿主 icon token、排序和 command，不能注入 HTML/CSS/React。
 
 ### 3.5.1 插件分级（tier）与安装/启用门槛
@@ -312,8 +312,8 @@ cn.example.team.provider
 - 区域为固定白名单枚举，映射到稳定宿主类，**不开放任意选择器**。页面级：`body`（页面底）、`app`（`.nf-app-shell`）、`main`（`.nf-app-shell-main`）、`navbar`（`.mantine-AppShell-navbar`）、`header`（`.mantine-AppShell-header`）；容器级：`paper`（`.mantine-Paper-root`）、`card`（`.mantine-Card-root`）、`modal`（`.mantine-Modal-content`）、`input`（`.mantine-Input-input`）。
 - 每区域字段：`image`（**包内相对路径**，经 `manifestPathSchema` 校验，拒绝 URL scheme/绝对路径/`..` 穿越）、`size`/`position`/`repeat`/`overlay` 枚举、`opacity`（0–1，作为遮罩强度）。全部枚举/钳制，**不接受任意 CSS 值**。
 - **插件绝不写 `url()`**：宿主在编译期把 `image` 路径拼成**同源受控端点** URL 后再 emit `background-image`。硬禁外链（外链会泄露用户 IP/在线状态、可追踪）。
-- **资源端点** `GET /api/plugins/ui/:pluginId/:version/:hash/theme-asset/:assetPath`：不绑 UI session（theme-only 无 session），能力=**精确包 hash（内容绑定 sha256）+ 插件已启用且为 current 包**；只服务主题**显式声明**的图片路径（`readAsset` 的 declaredAssets 白名单）；复用路径穿越/symlink/大小（10MB）防护。因为宿主主文档 CSS `url()` 请求不带 `Authorization`，端点不能用 Bearer/cookie 认证，故采用 URL 内嵌 hash 能力模型。
-- **仅允许位图，SVG 硬禁**（`.png`/`.jpg`/`.jpeg`/`.webp`/`.gif`/`.avif`）。该端点无认证且同源，响应 `Content-Type` 由扩展名决定，因此任何活动类型（`.html`/`.js`/`.svg`/`.json`）都等于同源脚本投递。SVG 可携带脚本且背景不需要矢量，故直接排除；manifest schema 与端点各校验一次（defense in depth），并附 `nosniff` + `Content-Security-Policy: default-src 'none'; img-src 'self'; sandbox` + `Content-Disposition: inline`，即使直接导航到 URL 也不执行脚本。
+- **资源端点** `GET /api/plugins/ui/:pluginId/:version/:hash/theme-asset/:assetPath`：不绑 UI session（theme-only 无 session），能力=**精确包 hash（内容绑定 sha256）+ 插件已启用且为 current 包**；只服务主题**显式声明**的图片或 WOFF2 字体路径（`readAsset` 的 declaredAssets 白名单）；复用路径穿越/symlink/大小防护。因为宿主主文档 CSS 资源请求不带 `Authorization`，端点不能用 Bearer/cookie 认证，故采用 URL 内嵌 hash 能力模型。
+- 背景与 frame **仅允许位图，SVG 硬禁**（`.png`/`.jpg`/`.jpeg`/`.webp`/`.gif`/`.avif`）；字体能力只额外允许 `.woff2`。该端点无认证且同源，响应 `Content-Type` 由扩展名决定，因此任何活动类型（`.html`/`.js`/`.svg`/`.json`）都等于同源脚本投递。SVG 可携带脚本且背景不需要矢量，故直接排除；manifest schema 与端点各校验一次（defense in depth），并附 `nosniff`、`Content-Security-Policy: default-src 'none'; img-src 'self'; sandbox` 和 `Content-Disposition: inline`；WOFF2 还额外检查 `wOF2` 魔数。
 - `overlay`（`none`/`scrim-light`/`scrim-dark`）在背景图上叠加一层基于 `--mantine-color-body` 的半透明遮罩以保证文字可读性，`opacity` 控制遮罩强度。深浅变体（`light`/`dark`）可各自声明不同背景。
 
 ### 3.5.3 九宫格贴图边框（`frames`）
@@ -326,7 +326,7 @@ cn.example.team.provider
 - **[安全] 结构性禁止 reflow**：编译器只 emit `border-style: solid` + **`border-width: 0`** + 四个 `border-image-*`，视觉厚度全部由 `border-image-width` 承载。零边框不占布局空间，内容盒不变，因此主题**无法**触发 reflow。非零 `border-width` 与 `border-image-outset` 在 token schema 中**不可表达**：outset 绘制在 border box 之外，会被任何 `overflow: hidden` 祖先整块裁掉（Mantine `Button` 自身即设置该属性），属于不可靠而非有用。
 - **`slice` 描述源图，`width` 描述渲染结果，二者解耦是刻意的**：frame 从元素边缘向**内**绘制且不占布局空间，因此小控件上厚边框会压住文字。作者应对紧凑控件（按钮/输入框）调小 `width`，只在卡片/模态框等宽裕表面用接近 `slice` 的厚度。
 - 编译顺序固定在 `FRAME_TARGET_ORDER` 而非跟随 manifest 键序：`.mantine-Paper-root` 与 `.mantine-Card-root` 在同一元素上特异度相同（Card 内部渲染 Paper），`buttonHover` 也必须排在 `button` 之后，靠源码顺序决胜。
-- 每主题编译产物有 48 KiB 硬上限（`MAX_COMPILED_THEME_CSS_LENGTH`），超限则整个主题产出空字符串，不输出截断样式表。
+- 每主题编译产物有 192 KiB 硬上限（`MAX_COMPILED_THEME_CSS_LENGTH`），超限则整个主题产出空字符串，不输出截断样式表。
 - 参考实现：`examples/plugins/theme-framed/`。
 
 ### 3.5.4 渐变、字体、阴影与分表面文字色
@@ -341,10 +341,14 @@ cn.example.team.provider
 - **[实测] 只 emit `background-image`，绝不 emit `background` 简写或 `background-color`**：Mantine 的 `Button`/`ActionIcon` 自身规则用 `background` 简写（隐含 `background-image: none`），而 `AppShell.Header`/`Input` 用 `background-color`。由于主题作用域选择器特异度更高，单发 `background-image` 既能覆盖简写隐含的 `none`，又不破坏组件自己的 `background-color`。headless Chrome 实测四类目标 `gradientPainted` 全部为 true，因此**一条统一代码路径**即可，无需按目标分类。
 - **[架构] 渐变与 `backgrounds` 必须同一趟编译**：二者共用 `background-image` 一个属性，分两趟发规则会让后写的规则静默擦掉前一条。宿主把 scrim / 图片 / 渐变合成为一个图层栈（scrim 在上保证可读性，渐变在最下作为底色），并让 `background-size`/`position`/`repeat` 的每个槽位与图层顺序对齐。
 
-**`fontFamily` / `fontFamilyHeadings` / `fontFamilyMonospace`**
+**`fonts[]` + `fontFamily` / `fontFamilyHeadings` / `fontFamilyMonospace`**
 
-- 只接受泛型 CSS 关键字枚举 `THEME_FONT_FAMILIES` = `system-ui`/`sans-serif`/`serif`/`monospace`/`cursive`。
-- **[安全] 拒绝具体字体名，也拒绝包内字体文件**：字体是由平台文字引擎解析的复杂二进制，攻击面远大于位图；而任意字体名字符串可用于探测用户已安装字体，属指纹识别向量。关键字已足够承载意图（`serif` 即宋体/Times 那类观感）。
+- 字体角色仍可直接使用泛型 CSS 关键字 `system-ui`/`sans-serif`/`serif`/`monospace`/`cursive`，旧 manifest 行为不变。
+- 主题也可声明最多 4 个包内 WOFF2 font face：`id`、`source`、100–900 的 `weight.min/max`、`style`（normal/italic）和 `display`（swap/fallback/optional）。字体角色通过 `{ font: "<id>", fallback: "system-ui" }` 引用，不接受插件提供的 CSS family 名。
+- 宿主生成包含 package hash/theme/font ID 的唯一内部 family，生成固定 `@font-face`，并把 `source` 编译为同源 `/theme-asset/` URL。任意远程 URL、本机具体字体名、TTF/OTF/WOFF1 和 raw CSS descriptors 均不可表达。
+- **[架构] 字体不新增资源通道**：`fonts[].source` 与背景图共用 3.5.2 的同一个 theme-asset 端点、同一个 `collectThemeAssets` 白名单、同一套路径穿越/symlink/包边界/大小检查。声明侧只有一个收集器，"这个文件允许是什么"由服务时的扩展名决定，因此下一种资源类型不需要再铺一条并行链路。
+- **[安全]** 字体唯一的额外检查是 `wOF2` 魔数：`.woff2` 决定响应 `Content-Type` 并把字节直接交给平台文字引擎，所以不能只信扩展名。大小沿用统一的 asset 上限，不设字体专用配额——包体积在打包期已由 `maxFileBytes`/`maxUnpackedBytes` 约束，再加一层只会让热路径多做 stat。
+- WOFF2 仍由平台文字引擎解析，因此该能力刻意保持窄接口；theme-only 风险级别不变，因为插件仍无 JS、无进程、无任意网络请求。
 
 **`shadow`**
 

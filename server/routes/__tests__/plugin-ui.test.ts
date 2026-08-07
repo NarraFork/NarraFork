@@ -825,7 +825,19 @@ describe("plugin UI theme-asset endpoint", () => {
 						id: "scenic",
 						title: "Scenic",
 						colorScheme: "both",
-						tokens: { backgrounds: { main: { image: "assets/bg.png" } } },
+						fonts: [
+							{
+								id: "brand",
+								source: "assets/brand.woff2",
+								weight: { min: 100, max: 900 },
+								style: "normal",
+								display: "swap",
+							},
+						],
+						tokens: {
+							fontFamily: { font: "brand", fallback: "system-ui" },
+							backgrounds: { main: { image: "assets/bg.png" } },
+						},
 					},
 				],
 			},
@@ -839,6 +851,10 @@ describe("plugin UI theme-asset endpoint", () => {
 		await writeFile(join(pkgDir, "manifest.json"), JSON.stringify(manifest));
 		// A 1x1 PNG (bytes are irrelevant to the route; declaredAssets + path matter).
 		await writeFile(join(pkgDir, "assets", "bg.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+		await writeFile(
+			join(pkgDir, "assets", "brand.woff2"),
+			Buffer.from([0x77, 0x4f, 0x46, 0x32, 1, 2, 3]),
+		);
 		await writeFile(join(pkgDir, "assets", "secret.png"), Buffer.from([0x89, 0x50]));
 		const auth: MiddlewareHandler = async (c, next) => {
 			c.set("user", { sub: "u1", role: "user", iat: 0, exp: 9_999_999_999 });
@@ -869,6 +885,19 @@ describe("plugin UI theme-asset endpoint", () => {
 		expect(res.headers.get("content-type")).toBe("image/png");
 		expect(res.headers.get("x-content-type-options")).toBe("nosniff");
 		expect(res.headers.get("cross-origin-resource-policy")).toBe("same-origin");
+	});
+
+	test("serves a declared WOFF2 theme font without a session", async () => {
+		const routes = await makeThemeAssetRoutes();
+		const res = await routes.request(assetUrl("assets/brand.woff2"));
+		expect(res.status).toBe(200);
+		expect(res.headers.get("content-type")).toBe("font/woff2");
+		expect(res.headers.get("cache-control")).toContain("immutable");
+		expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+		expect(res.headers.get("cross-origin-resource-policy")).toBe("same-origin");
+		expect([...new Uint8Array(await res.arrayBuffer()).slice(0, 4)]).toEqual([
+			0x77, 0x4f, 0x46, 0x32,
+		]);
 	});
 
 	test("refuses an undeclared file in the same package", async () => {

@@ -706,6 +706,37 @@ export const THEME_FONT_FAMILIES = [
 
 const fontFamilySchema = z.enum(THEME_FONT_FAMILIES);
 
+/** A package-relative WOFF2 font asset declared by one theme contribution. */
+const themeFontFaceSchema = z
+	.object({
+		id: contributionIdSchema,
+		source: manifestPathSchema.refine(
+			(value) => value.toLowerCase().endsWith(".woff2"),
+			"theme font source must be a package-relative .woff2 file",
+		),
+		weight: z
+			.object({
+				min: z.number().int().min(100).max(900),
+				max: z.number().int().min(100).max(900),
+			})
+			.strict()
+			.refine((weight) => weight.min <= weight.max, "font weight min must not exceed max")
+			.default({ min: 400, max: 400 }),
+		style: z.enum(["normal", "italic"]).default("normal"),
+		display: z.enum(["swap", "fallback", "optional"]).default("swap"),
+	})
+	.strict();
+
+/** Reference to a theme-declared font with a safe generic fallback. */
+const themeFontReferenceSchema = z
+	.object({
+		font: contributionIdSchema,
+		fallback: fontFamilySchema,
+	})
+	.strict();
+
+const themeFontFamilySchema = z.union([fontFamilySchema, themeFontReferenceSchema]);
+
 /**
  * Shadow strength, expressed as a clamped blur radius in px. The host derives
  * the full xs..xl ladder and the color; a theme cannot author an arbitrary
@@ -791,9 +822,9 @@ const themeTokenFields = {
 	gradients: gradientsSchema.optional(),
 	textColors: textColorsSchema.optional(),
 	borders: bordersSchema.optional(),
-	fontFamily: fontFamilySchema.optional(),
-	fontFamilyHeadings: fontFamilySchema.optional(),
-	fontFamilyMonospace: fontFamilySchema.optional(),
+	fontFamily: themeFontFamilySchema.optional(),
+	fontFamilyHeadings: themeFontFamilySchema.optional(),
+	fontFamilyMonospace: themeFontFamilySchema.optional(),
 	shadow: shadowSchema.optional(),
 };
 
@@ -814,13 +845,59 @@ const themeTokensSchema = z
 	})
 	.strict();
 
+const THEME_FONT_ROLES = ["fontFamily", "fontFamilyHeadings", "fontFamilyMonospace"] as const;
+
 const themeContributionSchema = contributionBaseSchema
 	.extend({
 		title: textSchema(200),
 		colorScheme: z.enum(["light", "dark", "both"]),
+		fonts: z.array(themeFontFaceSchema).max(4).default([]),
 		tokens: themeTokensSchema,
 	})
-	.strict();
+	.strict()
+	.superRefine((theme, ctx) => {
+		const declared = new Set<string>();
+		for (let index = 0; index < theme.fonts.length; index += 1) {
+			const font = theme.fonts[index];
+			if (declared.has(font.id)) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["fonts", index, "id"],
+					message: `duplicate theme font id: ${font.id}`,
+				});
+			}
+			declared.add(font.id);
+		}
+
+		const checkReferences = (
+			tokens: Record<string, unknown> | undefined,
+			path: Array<string | number>,
+		) => {
+			if (!tokens) return;
+			for (const role of THEME_FONT_ROLES) {
+				const value = tokens[role];
+				if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+				const font = (value as { font?: unknown }).font;
+				if (typeof font === "string" && !declared.has(font)) {
+					ctx.addIssue({
+						code: "custom",
+						path: [...path, role, "font"],
+						message: `theme font reference is not declared: ${font}`,
+					});
+				}
+			}
+		};
+
+		checkReferences(theme.tokens as unknown as Record<string, unknown>, ["tokens"]);
+		checkReferences(theme.tokens.light as unknown as Record<string, unknown> | undefined, [
+			"tokens",
+			"light",
+		]);
+		checkReferences(theme.tokens.dark as unknown as Record<string, unknown> | undefined, [
+			"tokens",
+			"dark",
+		]);
+	});
 
 const configurationSchema = z
 	.object({
@@ -1329,12 +1406,18 @@ export type ThemeBorderSurface = (typeof THEME_BORDER_SURFACES)[number];
 export type ThemeBorder = z.output<typeof borderSchema>;
 /** A generic font-family keyword a theme may select. */
 export type ThemeFontFamily = (typeof THEME_FONT_FAMILIES)[number];
+/** A validated reference to a theme-declared font. */
+export type ThemeFontReference = z.output<typeof themeFontReferenceSchema>;
+/** A generic family or a reference to a theme-declared font. */
+export type ThemeFontValue = z.output<typeof themeFontFamilySchema>;
+/** A package-relative WOFF2 face declared by one theme contribution. */
+export type ThemeFontFace = z.output<typeof themeFontFaceSchema>;
 
 /**
  * Collect every package-relative image path a theme contribution declares —
  * region backgrounds and nine-slice frames alike — across the base tokens and
- * the optional light/dark variants. Used to extend the served-asset whitelist so
- * these images (and only declared ones) can be fetched by the host document.
+ * the optional light/dark variants. Feeds {@link collectThemeAssets}, which is
+ * the whitelist the served-asset route enforces.
  */
 export function collectThemeImages(contribution: ThemeContribution): string[] {
 	const paths = new Set<string>();
@@ -1360,6 +1443,24 @@ export function collectThemeImages(contribution: ThemeContribution): string[] {
 	addFrom(contribution.tokens.light);
 	addFrom(contribution.tokens.dark);
 	return [...paths];
+}
+
+/**
+ * Collect every package file a theme may fetch from the host origin: the images
+ * from {@link collectThemeImages} plus the WOFF2 faces in `fonts`.
+ *
+ * This is the whitelist the asset route enforces, so it is deliberately one
+ * function over all asset kinds rather than one per kind. What a served file is
+ * *allowed to contain* is decided by its extension at serve time, which keeps
+ * the declaration side from having to be re-plumbed for the next asset type.
+ */
+export function collectThemeAssets(contribution: ThemeContribution): string[] {
+	return [
+		...new Set([
+			...collectThemeImages(contribution),
+			...contribution.fonts.map((font) => font.source),
+		]),
+	];
 }
 
 /**

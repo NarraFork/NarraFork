@@ -72,9 +72,9 @@ const sessionInputSchema = z
 const themeToggleSchema = z.object({ enabled: z.boolean() }).strict();
 
 /**
- * Content types the unauthenticated theme-asset route may return. Kept in lockstep
- * with the manifest's background-image extension allowlist; SVG is excluded
- * because it can carry script.
+ * Passive content types the unauthenticated theme-asset route may return. Images
+ * and WOFF2 fonts are explicitly declared in the manifest; active types remain
+ * forbidden because the route is same-origin and sessionless.
  */
 const THEME_ASSET_ALLOWED_CONTENT_TYPES = new Set([
 	"image/png",
@@ -82,6 +82,7 @@ const THEME_ASSET_ALLOWED_CONTENT_TYPES = new Set([
 	"image/webp",
 	"image/gif",
 	"image/avif",
+	"font/woff2",
 ]);
 
 function errorResponse(c: Parameters<MiddlewareHandler>[0], error: unknown): Response {
@@ -820,12 +821,11 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 		}
 	});
 
-	// Theme background asset. Unlike the view asset route this is NOT bound to a UI
-	// session (theme-only plugins have none): the capability is the exact package
-	// hash (content-bound sha256) plus the plugin being enabled + current, and
-	// readAsset only serves paths a theme contribution explicitly declared. No
-	// auth middleware, because CSS `url()` requests from the host document carry
-	// no Authorization header. The image is same-origin and contains no user data.
+	// Controlled theme asset (raster image or WOFF2 font). Unlike the view asset
+	// route this is NOT bound to a UI session (theme-only plugins have none): the
+	// capability is the exact package hash plus the plugin being enabled + current,
+	// and readAsset only serves paths a theme contribution explicitly declared. No
+	// auth middleware, because CSS resource requests carry no Authorization header.
 	app.get("/ui/:pluginId/:version/:hash/theme-asset/:assetPath{.+}", async (c) => {
 		try {
 			const pluginId = c.req.param("pluginId");
@@ -833,12 +833,10 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const hash = c.req.param("hash");
 			await assertEnabled(manager, pluginId, version, hash);
 			const asset = await assets.readAsset(pluginId, version, hash, c.req.param("assetPath"));
-			// This route is unauthenticated (CSS `url()` carries no Authorization
-			// header) and same-origin, so the served Content-Type must never be an
-			// active type: an `.html`/`.js`/`.svg` "background" would otherwise be
-			// same-origin script delivery. The manifest schema already restricts
-			// backgrounds to raster images; re-assert it here (defense in depth) so a
-			// schema regression cannot reopen the hole.
+			// This route is unauthenticated and same-origin, so the served Content-Type
+			// must remain passive. The manifest restricts assets to raster images and
+			// WOFF2; re-assert that allowlist here so a schema regression cannot turn
+			// the endpoint into same-origin active content delivery.
 			if (!THEME_ASSET_ALLOWED_CONTENT_TYPES.has(asset.contentType)) {
 				throw new NotFoundError("Plugin theme asset", asset.path);
 			}
@@ -849,8 +847,10 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 					ETag: `"${hash}-${asset.path}"`,
 					"X-Content-Type-Options": "nosniff",
 					"Cross-Origin-Resource-Policy": "same-origin",
-					// Belt-and-braces for direct navigation: render inline as an image
-					// and forbid every subresource/script in that document.
+					// Belt-and-braces for direct navigation: render an image inline and forbid
+					// every other subresource/script. Fonts need no directive of their own —
+					// they are fetched as a subresource of the host document, never navigated
+					// to as a document that loads anything.
 					"Content-Disposition": "inline",
 					"Content-Security-Policy": "default-src 'none'; img-src 'self'; sandbox",
 				},
