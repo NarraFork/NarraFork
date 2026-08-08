@@ -585,11 +585,33 @@ export interface CitationProjection {
 }
 
 /**
+ * Whether the cited range already contains this URL as the model's own link.
+ *
+ * Providers running native search report a source BOTH ways at once: the model
+ * writes an ordinary Markdown link in the prose AND the API reports a
+ * `url_citation` annotation covering it. Appending a reference number on top
+ * renders the identical URL twice, and because the annotation range ends after
+ * the model's closing paren the number lands inside it —
+ * `([example.com](url)[1](<url>))`. Verified by replaying the documented
+ * web_search wire shape, not inferred from a stored sample.
+ *
+ * Scoped strictly to the range the provider itself reported. A point anchor
+ * (`startIndex === endIndex`) cites no text, so there is nothing to compare and
+ * the citation is numbered normally: guessing a lookbehind window would risk
+ * reaching an unrelated sentence and silently swallowing a real reference.
+ */
+function citedTextAlreadyLinks(text: string, citation: TextCitation, url: string): boolean {
+	if (citation.startIndex >= citation.endIndex) return false;
+	return text.slice(citation.startIndex, citation.endIndex).includes(url);
+}
+
+/**
  * Project cleaned text + structured citations into plain Markdown.
  *
  * Resolved sources become `[n](<url>)` links; sources with only an internal ref
  * become a plain `[n]` label so provider-internal identifiers are never shown.
- * Insertion points falling inside code spans are skipped.
+ * Insertion points falling inside code spans are skipped, and a source the model
+ * already linked inline is not numbered again (see `citedTextAlreadyLinks`).
  */
 export function projectCitationsToMarkdown(
 	text: string,
@@ -608,6 +630,9 @@ export function projectCitationsToMarkdown(
 		if (isInsideRanges(citation.endIndex, codeRanges)) continue;
 		let rendered = "";
 		for (const source of citation.sources) {
+			// The model already linked this source in the prose: numbering it again
+			// would duplicate the URL and break the surrounding punctuation.
+			if (source.url && citedTextAlreadyLinks(text, citation, source.url)) continue;
 			const key = sourceKey(source);
 			let number = numbers.get(key);
 			if (number == null) {

@@ -297,6 +297,53 @@ describe("citation projection", () => {
 		expect(markdown).not.toContain("turn0view0");
 	});
 
+	/**
+	 * Native search reports one source twice at once: the model writes a Markdown
+	 * link in the prose AND the API sends a `url_citation` annotation covering it.
+	 * Confirmed by replaying the documented web_search wire shape through the real
+	 * parser — this is the provider's normal output, not an edge case.
+	 */
+	it("does not number a source the model already linked inside the cited range", () => {
+		const url = "https://example.com/report";
+		const text = `Revenue grew 12%. ([example.com](${url}))`;
+		const { markdown, references } = projectCitationsToMarkdown(text, [
+			{ startIndex: 0, endIndex: text.length, sources: [{ url, title: "Report" }] },
+		]);
+
+		// Numbering here would render the URL twice and, because the annotation
+		// range ends after the closing paren, put the number inside it.
+		expect(markdown).toBe(text);
+		expect(references).toHaveLength(0);
+	});
+
+	it("numbers only the sources that were not already linked", () => {
+		const linked = "https://a.test/x";
+		const text = `见 ([a](${linked}))`;
+		const { markdown, references } = projectCitationsToMarkdown(text, [
+			{
+				startIndex: 0,
+				endIndex: text.length,
+				sources: [{ url: linked }, { url: "https://b.test/y" }],
+			},
+		]);
+
+		expect(markdown).toBe(`${text}[1](<https://b.test/y>)`);
+		expect(references).toHaveLength(1);
+	});
+
+	it("numbers a point anchor rather than guessing a lookbehind window", () => {
+		// A point anchor cites no text. Scanning backwards for a "nearby" link would
+		// need an arbitrary window that could reach an unrelated sentence and drop a
+		// real reference, so the citation is numbered normally.
+		const url = "https://a.test/x";
+		const text = `前一句 ([a](${url})) 另一句结论`;
+		const { markdown } = projectCitationsToMarkdown(text, [
+			{ startIndex: text.length, endIndex: text.length, sources: [{ url }] },
+		]);
+
+		expect(markdown).toBe(`${text}[1](<${url}>)`);
+	});
+
 	it("projects an exact legacy envelope and copies only prose", () => {
 		const raw = `已修复${marker("turn204588view0")}`;
 		expect(projectAssistantTextForDisplay(raw)).toBe("已修复[1]");
