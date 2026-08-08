@@ -53,6 +53,12 @@ const isolatedNarraforkHome = requestedNarraforkHome
 	? resolve(requestedNarraforkHome)
 	: resolve(isolatedHome, ".narrafork");
 
+// Keep the original home dir reachable for code that must distinguish the real
+// user home from the isolated test home. `os.homedir()` follows HOME/USERPROFILE
+// on Bun (as on Node), so after the overrides below it no longer resolves to the
+// host account — server/db/connection.ts consults this backup to refuse opening
+// the real database from a test process.
+process.env.NARRAFORK_ORIGINAL_HOME = originalHome;
 process.env.HOME = isolatedHome;
 process.env.USERPROFILE = isolatedHome;
 process.env.NARRAFORK_HOME = isolatedNarraforkHome;
@@ -96,5 +102,12 @@ afterEach(() => {
 afterAll(() => {
 	// The temporary HOME is always owned by this preload, even when an explicit
 	// isolated NARRAFORK_HOME was supplied for a database-heavy test.
-	rmSync(isolatedHome, { recursive: true, force: true, maxRetries: 2 });
+	// On Windows an open bun:sqlite handle can still hold the directory at this
+	// point (EBUSY); the OS temp dir reclaims it later, so a failed sweep is only
+	// a warning, never a test failure.
+	try {
+		rmSync(isolatedHome, { recursive: true, force: true, maxRetries: 2 });
+	} catch (error) {
+		console.warn(`Failed to clean isolated test home: ${String(error)}`);
+	}
 });

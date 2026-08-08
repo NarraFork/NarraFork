@@ -1,12 +1,19 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { and, desc, eq, inArray, lt, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
-import { chapters } from "../db/schema";
+import { chapters, narrators } from "../db/schema";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { RESOURCE_SCOPE_FIELD_BY_TYPE, scopeContains } from "../lib/integrations/resource-scope";
 import { pluginIdSchema } from "../lib/plugins/manifest";
 import type { Capability } from "../lib/plugins/permissions";
 import type { JsonValue, PublicErrorCode } from "../lib/plugins/protocol";
+import { EXTERNAL_V1_MAX_MESSAGE_CHARS } from "../lib/validators/external";
 import { listIntegrationProjects } from "./integration-resource-service";
+import { narratorService } from "./narrator-service";
+import {
+	interruptNarrator as interruptNarratorSession,
+	sendMessage as sendNarratorMessage,
+} from "./narrator-session";
 import {
 	type CapabilityAuthorizationRequest as BrokerAuthorizationRequest,
 	type AuthorizationResult as BrokerAuthorizationResult,
@@ -1196,11 +1203,64 @@ export interface PluginLifecycleAdapter {
 	): Promise<PluginListSource>;
 }
 
+/**
+ * Public narrator summary. A bounded projection of `narrators` joined with its
+ * chapter's project; never carries `systemPrompt`, `cwd` or raw JSON columns.
+ */
+export interface NarratorListSource {
+	id: string;
+	chapterId: string | null;
+	projectId: string | null;
+	title: string | null;
+	handle: string | null;
+	variant: string;
+	type: string;
+	status: string;
+	substatus: string[];
+	model: string | null;
+	permissionMode: string | null;
+	messageCount: number;
+	lastMessageAt: string | null;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface NarratorQueryAdapter {
+	list(input: {
+		limit: number;
+		after?: TimestampCursor;
+		projectId?: string;
+		chapterId?: string;
+		status?: Array<"idle" | "working" | "waiting" | "archived">;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<NarratorListSource[]>;
+}
+
+export interface NarratorCommandAdapter {
+	sendMessage(input: {
+		narratorId: string;
+		message: string;
+		locale?: "en" | "zh-CN";
+		replyInUserLanguage?: boolean;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ messageId: string }>;
+	interrupt(input: {
+		narratorId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ interrupted: boolean }>;
+}
+
 export interface PluginPublicApiAdapters {
 	plugins?: PluginQueryAdapter;
 	projects?: ProjectQueryAdapter;
 	chapters?: ChapterQueryAdapter;
 	pluginLifecycle?: PluginLifecycleAdapter;
+	narrators?: NarratorQueryAdapter;
+	narratorCommands?: NarratorCommandAdapter;
 }
 
 const listInputBase = {
@@ -1237,6 +1297,27 @@ export const chaptersListInputSchema = z
 	})
 	.strict();
 export const pluginLifecycleInputSchema = z.object({ pluginId: pluginIdSchema }).strict();
+export const narratorsListInputSchema = z
+	.object({
+		...listInputBase,
+		projectId: idSchema.optional(),
+		chapterId: idSchema.optional(),
+		status: z
+			.array(z.enum(["idle", "working", "waiting", "archived"]))
+			.min(1)
+			.max(4)
+			.optional(),
+	})
+	.strict();
+export const narratorSendMessageInputSchema = z
+	.object({
+		narratorId: idSchema,
+		message: z.string().trim().min(1).max(EXTERNAL_V1_MAX_MESSAGE_CHARS),
+		locale: z.enum(["en", "zh-CN"]).optional(),
+		replyInUserLanguage: z.boolean().optional(),
+	})
+	.strict();
+export const narratorInterruptInputSchema = z.object({ narratorId: idSchema }).strict();
 
 const pluginCursorSchema = z.object({ pluginId: pluginIdSchema }).strict();
 const timestampCursorSchema = z.object({ updatedAt: deadlineSchema, id: idSchema }).strict();
@@ -1309,6 +1390,38 @@ function mapChapterSummary(row: ChapterListSource): Record<string, JsonValue> {
 		status: row.status,
 		role: row.role,
 		commitCount: Math.max(0, Math.trunc(row.commitCount ?? 0)),
+		createdAt: row.createdAt,
+		updatedAt: row.updatedAt,
+	};
+}
+
+/** Parse the `substatus` JSON-array text column defensively; never throw. */
+function parseNarratorSubstatus(raw: string | null): string[] {
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (!Array.isArray(parsed)) return [];
+		return parsed.filter((item): item is string => typeof item === "string").slice(0, 10);
+	} catch {
+		return [];
+	}
+}
+
+function mapNarratorSummary(row: NarratorListSource): Record<string, JsonValue> {
+	return {
+		id: row.id,
+		chapterId: row.chapterId ?? null,
+		projectId: row.projectId ?? null,
+		title: boundedSummaryText(row.title ?? undefined, 1_024) ?? null,
+		handle: boundedSummaryText(row.handle ?? undefined, 256) ?? null,
+		variant: boundedSummaryText(row.variant, 64) ?? "primary",
+		type: boundedSummaryText(row.type, 64) ?? "primary",
+		status: boundedSummaryText(row.status, 64) ?? "idle",
+		substatus: Array.isArray(row.substatus) ? row.substatus.slice(0, 10) : [],
+		model: boundedSummaryText(row.model ?? undefined, 256) ?? null,
+		permissionMode: boundedSummaryText(row.permissionMode ?? undefined, 64) ?? null,
+		messageCount: Math.max(0, Math.trunc(row.messageCount ?? 0)),
+		lastMessageAt: row.lastMessageAt ?? null,
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,
 	};
@@ -1557,6 +1670,87 @@ export class PluginPublicApi {
 					const adapter = requireAdapter(this.adapters.pluginLifecycle, "Plugin lifecycle");
 					const status = await adapter[action](input.pluginId, call.host, call.signal);
 					return { data: mapPluginSummary(status) };
+				},
+			});
+		}
+		if (!this.queries.has("narrafork.narrators.list")) {
+			this.queries.register({
+				queryId: "narrafork.narrators.list",
+				capability: "query.read.narrators",
+				inputSchema: narratorsListInputSchema,
+				redaction: "user_scoped",
+				paginated: true,
+				resource: (input, context) => {
+					const projectId = context.scope.projectId ?? input.projectId;
+					return projectId ? { type: "project", id: projectId } : undefined;
+				},
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narrators, "Narrator query");
+					const after = call.cursor ? timestampCursorSchema.parse(call.cursor) : undefined;
+					const requested = input.limit + 1;
+					// A project-scoped invocation must never list another project's narrators,
+					// even if the plugin supplies a different projectId. Mirror projects/chapters.
+					const projectId = call.host.scope.projectId ?? input.projectId;
+					const rows = boundedAdapterRows(
+						await adapter.list({
+							limit: requested,
+							after,
+							projectId,
+							chapterId: input.chapterId,
+							status: input.status,
+							context: call.host,
+							signal: call.signal,
+						}),
+						requested,
+					).map(mapNarratorSummary);
+					return pageResponse(rows, input.limit, (row) => ({
+						updatedAt: row.updatedAt,
+						id: row.id,
+					}));
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.send_message")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.send_message",
+				capability: "command.narrator.send_message",
+				inputSchema: narratorSendMessageInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const sent = await adapter.sendMessage({
+						narratorId: input.narratorId,
+						message: input.message,
+						locale: input.locale,
+						replyInUserLanguage: input.replyInUserLanguage,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: { accepted: true, messageId: sent.messageId } };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.interrupt")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.interrupt",
+				capability: "command.narrator.interrupt",
+				inputSchema: narratorInterruptInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.interrupt({
+						narratorId: input.narratorId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: { interrupted: result.interrupted } };
 				},
 			});
 		}
@@ -2369,6 +2563,40 @@ export function createCommandRequest<T>(
 type NarraForkDatabase = typeof import("../db")["db"];
 type PluginManagerPublicMethods = Pick<PluginManager, "list" | "getStatus" | "enable" | "disable">;
 
+/** Narrow facade over narrator services so tests can inject a fake. */
+export type NarratorSessionFacade = {
+	sendMessage: typeof sendNarratorMessage;
+	interruptNarrator: typeof interruptNarratorSession;
+	getById: typeof narratorService.getById;
+};
+
+/** Map core narrator errors to stable public error codes. */
+function mapNarratorCommandError(error: unknown): PluginPublicApiError {
+	if (error instanceof PluginPublicApiError) return error;
+	if (error instanceof NotFoundError) {
+		return new PluginPublicApiError("NOT_FOUND", "Narrator was not found");
+	}
+	if (error instanceof ValidationError) {
+		const message = error instanceof Error ? error.message : "";
+		if (message.includes("already running")) {
+			return new PluginPublicApiError("CONFLICT", "Narrator is busy", {
+				retryable: true,
+			});
+		}
+		if (message.includes("resumeSubagent")) {
+			return new PluginPublicApiError(
+				"INVALID_PARAMS",
+				"Subagent messages must be sent through the parent narrator",
+			);
+		}
+		return new PluginPublicApiError("INVALID_PARAMS", "Invalid narrator operation");
+	}
+	return new PluginPublicApiError(
+		"INTERNAL_ERROR",
+		"The narrator operation failed inside the host",
+	);
+}
+
 /**
  * Concrete limited adapters for core integration. DB queries select finite columns and use
  * `(updatedAt,id)` keyset predicates with `LIMIT n+1`; plugin lifecycle results are projected
@@ -2377,8 +2605,14 @@ type PluginManagerPublicMethods = Pick<PluginManager, "list" | "getStatus" | "en
 export function createCorePluginPublicApiAdapters(options: {
 	db: NarraForkDatabase;
 	pluginManager: PluginManagerPublicMethods;
+	narratorSession?: NarratorSessionFacade;
 }): PluginPublicApiAdapters {
 	const { db, pluginManager } = options;
+	const session = options.narratorSession ?? {
+		sendMessage: sendNarratorMessage,
+		interruptNarrator: interruptNarratorSession,
+		getById: narratorService.getById,
+	};
 	return {
 		plugins: {
 			async getOwn(input) {
@@ -2485,6 +2719,99 @@ export function createCorePluginPublicApiAdapters(options: {
 				return pluginStatusSource(await pluginManager.disable(pluginId));
 			},
 		},
+		narrators: {
+			async list(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
+				const predicates: SQL[] = [];
+				if (input.chapterId) predicates.push(eq(narrators.chapterId, input.chapterId));
+				if (input.status?.length) predicates.push(inArray(narrators.status, input.status));
+				if (input.after) {
+					const afterPredicate = or(
+						lt(narrators.updatedAt, input.after.updatedAt),
+						and(eq(narrators.updatedAt, input.after.updatedAt), lt(narrators.id, input.after.id)),
+					);
+					if (afterPredicate) predicates.push(afterPredicate);
+				}
+				if (input.projectId) predicates.push(eq(chapters.projectId, input.projectId));
+				const rows = await db
+					.select({
+						id: narrators.id,
+						chapterId: narrators.chapterId,
+						projectId: chapters.projectId,
+						title: narrators.title,
+						handle: narrators.handle,
+						variant: narrators.variant,
+						type: narrators.type,
+						status: narrators.status,
+						substatus: narrators.substatus,
+						model: narrators.model,
+						permissionMode: narrators.permissionMode,
+						messageCount: narrators.messageCount,
+						lastMessageAt: narrators.lastMessageAt,
+						createdAt: narrators.createdAt,
+						updatedAt: narrators.updatedAt,
+					})
+					.from(narrators)
+					.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+					.where(predicates.length ? and(...predicates) : undefined)
+					.orderBy(desc(narrators.updatedAt), desc(narrators.id))
+					.limit(input.limit);
+				return rows.map((row) => ({
+					id: row.id,
+					chapterId: row.chapterId,
+					projectId: row.projectId ?? null,
+					title: row.title,
+					handle: row.handle,
+					variant: row.variant,
+					type: row.type,
+					status: row.status,
+					substatus: parseNarratorSubstatus(row.substatus),
+					model: row.model,
+					permissionMode: row.permissionMode,
+					messageCount: row.messageCount ?? 0,
+					lastMessageAt: row.lastMessageAt,
+					createdAt: row.createdAt,
+					updatedAt: row.updatedAt,
+				}));
+			},
+		},
+		narratorCommands: {
+			async sendMessage(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const sent = await session.sendMessage(
+						input.narratorId,
+						input.message,
+						undefined,
+						input.locale ?? "en",
+						input.replyInUserLanguage ?? false,
+						null,
+						null,
+						undefined,
+						null,
+						{ origin: "user", originLabel: `plugin:${input.pluginId}` },
+					);
+					return { messageId: sent.id };
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async interrupt(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				// `interruptNarrator` returns false for unknown ids; resolve existence first so
+				// the caller gets a stable NOT_FOUND instead of a silent no-op.
+				try {
+					await session.getById(input.narratorId);
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+				const interrupted = session.interruptNarrator(input.narratorId);
+				return { interrupted };
+			},
+		},
 	};
 }
 
@@ -2493,11 +2820,14 @@ export const PUBLIC_QUERY_IDS = [
 	"narrafork.plugins.list",
 	"narrafork.projects.list",
 	"narrafork.chapters.list",
+	"narrafork.narrators.list",
 ] as const;
 
 export const PUBLIC_COMMAND_IDS = [
 	"narrafork.plugins.enable",
 	"narrafork.plugins.disable",
+	"narrafork.narrator.send_message",
+	"narrafork.narrator.interrupt",
 ] as const;
 
 export type PublicQueryId = (typeof PUBLIC_QUERY_IDS)[number];

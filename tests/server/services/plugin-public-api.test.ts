@@ -153,11 +153,14 @@ describe("PluginPublicApi", () => {
 		const { api, broker } = buildApi();
 		expect(api.queries.listIds()).toEqual([
 			"narrafork.chapters.list",
+			"narrafork.narrators.list",
 			"narrafork.plugin.getOwn",
 			"narrafork.plugins.list",
 			"narrafork.projects.list",
 		]);
 		expect(api.commands.listIds()).toEqual([
+			"narrafork.narrator.interrupt",
+			"narrafork.narrator.send_message",
 			"narrafork.plugins.disable",
 			"narrafork.plugins.enable",
 		]);
