@@ -66,6 +66,38 @@ function clampLineContent(line: string): string {
 	return line.length > MAX_DIFF_LINE_CHARS ? `${line.slice(0, MAX_DIFF_LINE_CHARS)} …` : line;
 }
 
+/**
+ * Public wrapper over the per-line clamp.
+ *
+ * `parse-unified-diff.ts` builds `DiffLine` rows straight from a patch instead of
+ * from two texts, so it needs the SAME per-line ceiling this module applies. A
+ * second clamp implementation there would be a second rule to keep in sync.
+ */
+export function clampDiffLineContent(line: string): string {
+	return clampLineContent(line);
+}
+
+/**
+ * Word-level chunks for one modified line pair, or null when the pair is too
+ * large to diff.
+ *
+ * Extracted so BOTH row producers share one definition of "what changed inside a
+ * modified line": `computeDiff` (two texts) and `parseUnifiedDiff` (a patch).
+ * The word diff is quadratic, hence the `MAX_WORD_DIFF_CHARS` budget over the
+ * combined length — returning null tells the caller to emit plain rows.
+ */
+export function pairWordChanges(
+	removedLine: string,
+	addedLine: string,
+): { removed: DiffWordChange[]; added: DiffWordChange[] } | null {
+	if (removedLine.length + addedLine.length > MAX_WORD_DIFF_CHARS) return null;
+	const chunks = diffWordsWithSpace(removedLine, addedLine);
+	return {
+		removed: chunks.filter((c) => !c.added),
+		added: chunks.filter((c) => !c.removed),
+	};
+}
+
 function splitIntoLines(value: string): string[] {
 	if (!value) return [];
 	const lines = value.split("\n");
@@ -165,13 +197,12 @@ export function computeDiff(oldStr: string, newStr: string, startLine = 1): Diff
 				for (let j = 0; j < maxPaired; j++) {
 					const removedLine = removedLines[j] ?? "";
 					const addedLine = addedLines[j] ?? "";
-					const shouldWordDiff = removedLine.length + addedLine.length <= MAX_WORD_DIFF_CHARS;
-					const wc = shouldWordDiff ? diffWordsWithSpace(removedLine, addedLine) : null;
+					const wc = pairWordChanges(removedLine, addedLine);
 					if (
 						!appendLine({
 							type: "removed",
 							content: removedLine,
-							wordChanges: wc?.filter((c) => !c.added),
+							wordChanges: wc?.removed,
 							oldLineNo: oldLine,
 						})
 					) {
@@ -182,7 +213,7 @@ export function computeDiff(oldStr: string, newStr: string, startLine = 1): Diff
 						!appendLine({
 							type: "added",
 							content: addedLine,
-							wordChanges: wc?.filter((c) => !c.removed),
+							wordChanges: wc?.added,
 							newLineNo: newLine,
 						})
 					) {
@@ -327,16 +358,36 @@ export function diffCacheStats(): { entries: number; rows: number } {
 }
 
 /**
+ * Default floor for one line-number column.
+ *
+ * The pretext measure layer is pinned to this value (`measure-diff.test.ts`
+ * asserts `diffGutterWidthChars({ diffLineNoWidth: 3 }) === 8`, and
+ * `tool-detail.test.ts` asserts `body.diffLineNoWidth === 3`), so it must stay 3
+ * for every caller that feeds a measured height.
+ */
+export const DIFF_LINE_NO_MIN_WIDTH = 3;
+
+/**
  * Width (in characters) of ONE line-number column, so both columns align and the
  * gutter has a fixed width. Mirrors the chunked DiffView's own calculation.
+ *
+ * @param minWidth Floor for the column. Defaults to `DIFF_LINE_NO_MIN_WIDTH`
+ *   because the measure layer depends on that number. A caller that owns its own
+ *   layout (the git panel, which is not measured) may pass a smaller floor so
+ *   two-digit line numbers stop reserving a third padding column — on a phone that
+ *   padding costs real horizontal room before the code even starts.
  */
-export function diffLineNoWidth(lines: readonly DiffLine[], lineNumberPrefix?: string): number {
+export function diffLineNoWidth(
+	lines: readonly DiffLine[],
+	lineNumberPrefix?: string,
+	minWidth: number = DIFF_LINE_NO_MIN_WIDTH,
+): number {
 	let maxNo = 1;
 	for (const line of lines) {
 		if (line.oldLineNo != null && line.oldLineNo > maxNo) maxNo = line.oldLineNo;
 		if (line.newLineNo != null && line.newLineNo > maxNo) maxNo = line.newLineNo;
 	}
-	return Math.max(3, `${lineNumberPrefix ?? ""}${maxNo}`.length);
+	return Math.max(minWidth, `${lineNumberPrefix ?? ""}${maxNo}`.length);
 }
 
 /** One right-aligned line-number cell, or blanks when the side has no number. */

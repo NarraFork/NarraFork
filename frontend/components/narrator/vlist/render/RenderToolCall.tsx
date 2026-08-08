@@ -30,6 +30,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import { DiffWordTokens } from "@frontend/components/narrator/DiffWordTokens";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import type { ShikiToken } from "@frontend/lib/shiki-token-cache";
@@ -1576,24 +1577,17 @@ function DiffRowContent({
 	hasHighlight: boolean;
 }) {
 	if (line.wordChanges && line.wordChanges.length > 0) {
+		// Chunk tint outside, Shiki colour inside. Imported from OUTSIDE vlist/ so
+		// DiffView can share it — the isolation guard only forbids the reverse.
 		return (
-			<>
-				{line.wordChanges.map((change, j) => (
-					<span
-						// biome-ignore lint/suspicious/noArrayIndexKey: word chunks have no stable id
-						key={j}
-						style={
-							change.removed
-								? { background: colors.removedWord, borderRadius: 2 }
-								: change.added
-									? { background: colors.addedWord, borderRadius: 2 }
-									: undefined
-						}
-					>
-						{change.value}
-					</span>
-				))}
-			</>
+			<DiffWordTokens
+				wordChanges={line.wordChanges}
+				tokens={tokens}
+				styles={{
+					removedWord: { background: colors.removedWord, borderRadius: 2 },
+					addedWord: { background: colors.addedWord, borderRadius: 2 },
+				}}
+			/>
 		);
 	}
 	if (hasHighlight) return <TokenText text={line.content} tokens={tokens} />;

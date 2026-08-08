@@ -8,10 +8,12 @@ import {
 	formatDiffGutter,
 	MAX_DIFF_LINES,
 } from "@shared/pretext-layout/diff-core";
-import { memo, useEffect, useMemo, useState } from "react";
+import type { ParsedDiffHunk } from "@shared/pretext-layout/parse-unified-diff";
+import { Fragment, memo, useEffect, useMemo, useState } from "react";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { loadShiki } from "../../lib/shiki-loader";
 import { AutoFollowScroll } from "./AutoFollowScroll";
+import { DiffWordTokens } from "./DiffWordTokens";
 
 export type { DiffLine } from "@shared/pretext-layout/diff-core";
 // The diff MODEL (line/word structure, line numbers, bounds) lives in
@@ -22,9 +24,25 @@ export { computeDiff, normalizeDiffLineEndings } from "@shared/pretext-layout/di
 
 // --- Types ---
 
+/**
+ * Two mutually exclusive input modes:
+ *
+ *   - SELF-COMPUTED: pass `oldStr`/`newStr` and the diff is derived here.
+ *   - PRE-COMPUTED: pass `lines` when the rows already exist. The git panel uses
+ *     this, because a patch's diff is computed by git and its `@@` headers carry
+ *     real file line numbers that reconstructing two texts would destroy.
+ */
 interface DiffViewProps {
-	oldStr: string;
-	newStr: string;
+	oldStr?: string;
+	newStr?: string;
+	/** Pre-computed rows. When present, `oldStr`/`newStr` are ignored. */
+	lines?: readonly DiffLine[];
+	/**
+	 * Hunk boundaries for the pre-computed rows, drawn as separators above the row
+	 * each one points at. Only the git panel has these — a two-text diff is one
+	 * continuous region with no hunks to separate.
+	 */
+	hunks?: readonly ParsedDiffHunk[];
 	/** Max height in px. When undefined, uses flex to fill parent. */
 	maxHeight?: number;
 	/** Enable word-wrap. Defaults to false (horizontal scroll). */
@@ -35,6 +53,13 @@ interface DiffViewProps {
 	startLine?: number;
 	/** Optional prefix for provisional line numbers while the real match location is unknown. */
 	lineNumberPrefix?: string;
+	/**
+	 * Floor for one line-number column. Defaults to the measure layer's value.
+	 * Pass a smaller floor only from a surface that owns its own layout (the git
+	 * panel), where reserving a third column for two-digit numbers wastes width on
+	 * a phone.
+	 */
+	gutterMinWidth?: number;
 	/** Enable streaming auto-follow for the scrollable diff container. */
 	autoFollowKey?: string | number | null;
 	/** During replacement streaming, follow the latest added line instead of the diff bottom. */
@@ -98,7 +123,7 @@ const gutterStyle = {
 type TokenMap = Map<string, ThemedToken[]>;
 
 function useTokenMap(
-	lines: DiffLine[],
+	lines: readonly DiffLine[],
 	language: string | undefined,
 	theme: string,
 ): TokenMap | null {
@@ -237,26 +262,7 @@ const DiffLineRow = memo(function DiffLineRow({
 				<span style={{ ...gutterStyle, color: gutterColor }}>{prefix}</span>
 			)}
 			{line.wordChanges ? (
-				line.wordChanges.map((wc, j) => {
-					if (wc.removed) {
-						return (
-							// biome-ignore lint/suspicious/noArrayIndexKey: diff word chunks lack stable IDs
-							<span key={j} style={diffStyles.removedWord}>
-								{wc.value}
-							</span>
-						);
-					}
-					if (wc.added) {
-						return (
-							// biome-ignore lint/suspicious/noArrayIndexKey: diff word chunks lack stable IDs
-							<span key={j} style={diffStyles.addedWord}>
-								{wc.value}
-							</span>
-						);
-					}
-					// biome-ignore lint/suspicious/noArrayIndexKey: diff word chunks lack stable IDs
-					return <span key={j}>{wc.value}</span>;
-				})
+				<DiffWordTokens wordChanges={line.wordChanges} tokens={tokens} styles={diffStyles} />
 			) : tokens ? (
 				renderTokens(tokens)
 			) : (
@@ -270,16 +276,43 @@ const DiffLineRow = memo(function DiffLineRow({
 	);
 });
 
+/**
+ * A hunk boundary: the `@@` range plus git's context hint.
+ *
+ * Without it, a jump from old line 16 to old line 48 renders as two adjacent rows
+ * with no indication that 31 lines were skipped, and the enclosing function name
+ * git supplied is thrown away.
+ */
+const HunkSeparatorRow = memo(function HunkSeparatorRow({ hunk }: { hunk: ParsedDiffHunk }) {
+	return (
+		<div
+			data-diff-hunk-separator="true"
+			style={{
+				color: "var(--mantine-color-dimmed)",
+				backgroundColor: "var(--mantine-color-default-hover)",
+				opacity: 0.85,
+				userSelect: "none",
+			}}
+		>
+			{`@@ ${hunk.range} @@`}
+			{hunk.heading ? ` ${hunk.heading}` : ""}
+		</div>
+	);
+});
+
 // --- Exported component ---
 
 export const DiffView = memo(function DiffView({
 	oldStr,
 	newStr,
+	lines: providedLines,
+	hunks,
 	maxHeight,
 	wordWrap,
 	language,
 	startLine,
 	lineNumberPrefix,
+	gutterMinWidth,
 	autoFollowKey,
 	autoFollowTarget = "bottom",
 }: DiffViewProps) {
@@ -287,12 +320,29 @@ export const DiffView = memo(function DiffView({
 	const isDark = computedScheme === "dark";
 	const theme = isDark ? "github-dark-default" : "github-light-default";
 	const diffStyles = getDiffStyles(isDark);
-	const lines = useMemo(() => computeDiff(oldStr, newStr, startLine), [oldStr, newStr, startLine]);
-	const tokenMap = useTokenMap(lines, language, theme);
-	const lineNoWidth = useMemo(
-		() => (startLine == null ? undefined : diffLineNoWidth(lines, lineNumberPrefix)),
-		[startLine, lineNumberPrefix, lines],
+	const lines = useMemo(
+		() => providedLines ?? computeDiff(oldStr ?? "", newStr ?? "", startLine),
+		[providedLines, oldStr, newStr, startLine],
 	);
+	const tokenMap = useTokenMap(lines, language, theme);
+	// Pre-computed rows carry their own numbers (a patch's `@@` headers) without
+	// passing `startLine`, so the gutter must also switch on their presence.
+	const lineNoWidth = useMemo(
+		() =>
+			startLine == null && !lines.some((l) => l.oldLineNo != null || l.newLineNo != null)
+				? undefined
+				: diffLineNoWidth(lines, lineNumberPrefix, gutterMinWidth),
+		[startLine, lineNumberPrefix, gutterMinWidth, lines],
+	);
+	// rowIndex → separator, so a hunk boundary is emitted just before its first row
+	// without the row array itself carrying a non-row entry. Must stay above the
+	// empty-rows early return: hooks run unconditionally.
+	const hunkByRow = useMemo(() => {
+		if (!hunks || hunks.length === 0) return null;
+		const map = new Map<number, ParsedDiffHunk>();
+		for (const hunk of hunks) map.set(hunk.rowIndex, hunk);
+		return map;
+	}, [hunks]);
 
 	if (lines.length === 0) return null;
 
@@ -325,16 +375,19 @@ export const DiffView = memo(function DiffView({
 		<div style={wordWrap ? undefined : { minWidth: "fit-content" }}>
 			{lines.map((line, i) => {
 				const key = `${line.type}-${i}`;
+				const hunk = hunkByRow?.get(i);
 				return (
-					<DiffLineRow
-						key={key}
-						line={line}
-						tokens={!line.wordChanges ? (tokenMap?.get(String(i)) ?? undefined) : undefined}
-						diffStyles={diffStyles}
-						lineNoWidth={lineNoWidth}
-						lineNumberPrefix={lineNumberPrefix}
-						autoFollowTarget={i === latestAddedIndex}
-					/>
+					<Fragment key={key}>
+						{hunk ? <HunkSeparatorRow hunk={hunk} /> : null}
+						<DiffLineRow
+							line={line}
+							tokens={!line.wordChanges ? (tokenMap?.get(String(i)) ?? undefined) : undefined}
+							diffStyles={diffStyles}
+							lineNoWidth={lineNoWidth}
+							lineNumberPrefix={lineNumberPrefix}
+							autoFollowTarget={i === latestAddedIndex}
+						/>
+					</Fragment>
 				);
 			})}
 			{truncated && (
@@ -350,7 +403,7 @@ export const DiffView = memo(function DiffView({
 			<AutoFollowScroll
 				asChild
 				followKey={autoFollowKey}
-				deps={[oldStr, newStr, tokenMap]}
+				deps={[oldStr, newStr, providedLines, tokenMap]}
 				followTo={autoFollowTarget === "latest-added" ? scrollToDiffTarget : undefined}
 			>
 				<Box style={style}>{content}</Box>
