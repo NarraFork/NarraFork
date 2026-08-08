@@ -23,7 +23,6 @@ type Scenario =
 	| "annotations_and_marker"
 	| "two_items_annotation"
 	| "item_boundary"
-	| "abort_mid_prefix"
 	| "plain"
 	| "marker_then_tool";
 
@@ -93,13 +92,6 @@ const testProvider: ProviderAdapter = {
 				],
 			};
 			yield { textItemDone: true, textOutputIndex: 1 };
-			return;
-		}
-		if (scenario === "abort_mid_prefix") {
-			// Prose whose tail is an opener PREFIX, then the stream dies. The parser is
-			// still withholding those bytes when the abort path runs.
-			yield { text: `结论已经确认${PUA_START}ci` };
-			yield { invalidState: { reason: "stream_closed", message: "connection lost" } };
 			return;
 		}
 		if (scenario === "item_boundary") {
@@ -208,21 +200,27 @@ describe("inline marker stripping", () => {
 		expect(messages[0].text).not.toContain("turn0search1");
 	});
 
-	test("the stream boundary emits only visible text, matching Codex", async () => {
+	/**
+	 * Deltas are forwarded verbatim; the read side projects them.
+	 *
+	 * An earlier design stripped at the delta boundary so the wire carried only
+	 * clean text. That put a second, incremental parser over the same bytes as the
+	 * settled one and they disagreed twice (a withheld prefix never released on
+	 * abort, and fenced examples emptied mid-stream then refilled). Everything that
+	 * is PERSISTED or replayed to the model is still clean — that is the invariant
+	 * that actually stops the leak.
+	 */
+	test("deltas pass through raw while persisted output stays clean", async () => {
 		const events = await runTurn("marker_only");
 
-		// Before the Codex-alignment change raw marker deltas crossed WebSocket and
-		// every renderer had to rediscover and hide them. Now the joined stream is
-		// already the same clean prose as block_complete/assistant_message.
-		expect(streamedText(events)).toBe("结论成立");
+		expect(streamedText(events)).toContain(PUA_START);
 		for (const event of events) {
-			const visible: string[] = [];
-			if (event.type === "stream_text") visible.push(event.text);
-			if (event.type === "assistant_message") visible.push(event.text);
+			const persisted: string[] = [];
+			if (event.type === "assistant_message") persisted.push(event.text);
 			if (event.type === "block_complete" && event.block.type === "text") {
-				visible.push(event.block.text);
+				persisted.push(event.block.text);
 			}
-			for (const text of visible) {
+			for (const text of persisted) {
 				expect(text).not.toContain("turn0search1");
 				expect(text).not.toContain(PUA_START);
 				expect(text).not.toContain("cite");
@@ -230,26 +228,11 @@ describe("inline marker stripping", () => {
 		}
 	});
 
-	/**
-	 * An abort path persists the RAW accumulated text, so it must first release
-	 * whatever the stream parser is still holding as a possible opener prefix.
-	 * Otherwise the live view ends up shorter than the block persisted in the same
-	 * tick, and the difference reappears on reload.
-	 */
-	test("abort releases the withheld opener prefix before persisting", async () => {
-		const events = await runTurn("abort_mid_prefix");
-
-		const block = textBlocks(events)[0];
-		expect(block).toBeDefined();
-		// Fail open: an opener that never completed stays visible, matching Codex.
-		expect(block.text).toBe(`结论已经确认${PUA_START}ci`);
-		// The stream must carry exactly what was persisted — no silent shortfall.
-		expect(streamedText(events)).toBe(block.text);
-	});
-
-	test("finishes each output item before the next item streams", async () => {
+	test("text from several output items joins in arrival order", async () => {
 		const events = await runTurn("item_boundary");
 
+		// No per-item buffering means no reordering risk: whatever the provider sent
+		// is what the client receives, and the persisted block matches it.
 		expect(streamedText(events)).toBe(`A${PUA_START}ciB`);
 		expect(textBlocks(events)[0].text).toBe(`A${PUA_START}ciB`);
 	});

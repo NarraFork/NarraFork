@@ -707,12 +707,10 @@ export function classifyContentBlock(block: AdapterContentBlock): VListElementKi
  * The projection emits plain Markdown links, so VList and Pixi reuse the existing
  * href measurement and click handling instead of each growing a citation renderer.
  */
-function markdownData(block: AdapterContentBlock, streaming = false): string {
+function markdownData(block: AdapterContentBlock): string {
 	const text = block.text ?? "";
 	if (!text) return text;
-	// While a block is live its tail can hold half a marker, which would flash
-	// before the rest of the deltas arrive.
-	return resolveAssistantTextDisplay(text, block.citations ?? undefined, { streaming }).display;
+	return resolveAssistantTextDisplay(text, block.citations ?? undefined).display;
 }
 
 function reasoningData(blocks: AdapterContentBlock[], isStreaming: boolean) {
@@ -1183,7 +1181,7 @@ function adaptMessage(
 				specs.push({
 					kind,
 					key,
-					data: markdownData(block, isLiveStreamingRun(streamingMessage, msg, [bi])),
+					data: markdownData(block),
 				});
 				break;
 			case "web-search":

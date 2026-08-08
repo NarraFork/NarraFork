@@ -14,7 +14,6 @@ import {
 	CHATGPT_CITATION_OPEN,
 	CHATGPT_CITATION_SOURCE_SEPARATOR,
 	CITATION_LIMITS,
-	CitationMarkupStreamParser,
 	cleanAssistantText,
 	findCodeRanges,
 	hasLegacyCitationMarkers,
@@ -146,12 +145,12 @@ describe("other protocols are byte-identical when no exact citation envelope exi
 		expect(cleanAssistantText(between).text).toBe(between);
 	});
 
-	it("does not trim a Nerd Font glyph or following prose while streaming", () => {
+	it("does not trim a Nerd Font glyph or the prose after it", () => {
 		for (const raw of [
 			"正文结尾有个图标 \ue205",
 			"构建通过 \ue200 后面还有很长一段正文内容需要保留",
 		]) {
-			expect(resolveAssistantTextDisplay(raw, undefined, { streaming: true }).display).toBe(raw);
+			expect(resolveAssistantTextDisplay(raw).display).toBe(raw);
 		}
 	});
 
@@ -163,48 +162,6 @@ describe("other protocols are byte-identical when no exact citation envelope exi
 		]) {
 			expect(resolveAssistantTextDisplay(raw)).toEqual({ display: raw, copyText: null });
 		}
-	});
-});
-
-describe("CitationMarkupStreamParser", () => {
-	it("parses an envelope split across arbitrary chunk boundaries", () => {
-		const parser = new CitationMarkupStreamParser();
-		const chunks = [
-			parser.push("Hello \ue200ci"),
-			parser.push("te\ue202turn0sea"),
-			parser.push("rch1\ue201 world"),
-			parser.finish(),
-		];
-
-		expect(chunks.map((chunk) => chunk.visibleText).join("")).toBe("Hello  world");
-		expect(chunks.flatMap((chunk) => chunk.citations)).toEqual([
-			{ anchorIndex: 6, sources: [{ sourceRef: "turn0search1" }] },
-		]);
-	});
-
-	it("buffers a partial opener, but emits it literally at EOF", () => {
-		const parser = new CitationMarkupStreamParser();
-		expect(parser.push("hello \ue200ci").visibleText).toBe("hello ");
-		expect(parser.finish().visibleText).toBe("\ue200ci");
-	});
-
-	it("auto-closes a valid opened envelope at EOF", () => {
-		const parser = new CitationMarkupStreamParser();
-		expect(parser.push(`x${CHATGPT_CITATION_OPEN}turn0view1`).visibleText).toBe("x");
-		expect(parser.finish().citations).toEqual([
-			{ anchorIndex: 1, sources: [{ sourceRef: "turn0view1" }] },
-		]);
-	});
-
-	it("fails open for invalid and oversized payloads", () => {
-		const invalid = new CitationMarkupStreamParser();
-		const invalidRaw = `${CHATGPT_CITATION_OPEN}not-a-ref${CHATGPT_CITATION_CLOSE}`;
-		expect(invalid.push(invalidRaw).visibleText).toBe(invalidRaw);
-
-		const oversized = new CitationMarkupStreamParser();
-		const payload = "x".repeat(CITATION_LIMITS.maxMarkerLength + 1);
-		const out = oversized.push(`${CHATGPT_CITATION_OPEN}${payload}`);
-		expect(out.visibleText).toBe(`${CHATGPT_CITATION_OPEN}${payload}`);
 	});
 });
 
@@ -353,14 +310,12 @@ describe("citation projection", () => {
 		});
 	});
 
-	it("does not replay the hidden-markup parser in the streaming renderer", () => {
-		// The loop owns streaming parsing, exactly like Codex's server-side
-		// emit_streamed_assistant_text_delta. A client fed malformed/raw data must
-		// display what it received rather than maintain a second parser state.
+	it("leaves an incomplete opener visible rather than guessing", () => {
+		// Only the exact opener counts. A partial one may show for a frame mid-stream;
+		// hiding it would mean guessing which trailing bytes are a marker prefix, and
+		// that guess deleted real Nerd Font glyphs in an earlier design.
 		const partial = "进行中\ue200ci";
-		expect(resolveAssistantTextDisplay(partial, undefined, { streaming: true }).display).toBe(
-			partial,
-		);
+		expect(resolveAssistantTextDisplay(partial).display).toBe(partial);
 		expect(projectAssistantTextForDisplay(partial)).toBe(partial);
 	});
 
