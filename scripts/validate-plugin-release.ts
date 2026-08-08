@@ -496,10 +496,18 @@ export async function validatePluginRelease(
 		.map((entry) => join(pluginsRoot, entry.name))
 		.sort((left, right) => basename(left).localeCompare(basename(right)));
 	const packages = await Promise.all(
-		packageRoots.map((packageRoot) =>
-			validatePackage(packageRoot, normalized.mode, normalized.runtimeTimeoutMs),
-		),
-	);
+		packageRoots.map(async (packageRoot) => {
+			// A directory without a manifest is not a plugin package (e.g. an
+			// unrelated folder or a test directory living next to the package).
+			try {
+				const stat = await lstat(join(packageRoot, "manifest.json"));
+				if (!stat.isFile()) return null;
+			} catch {
+				return null;
+			}
+			return validatePackage(packageRoot, normalized.mode, normalized.runtimeTimeoutMs);
+		}),
+	).then((results) => results.filter((item): item is NonNullable<typeof item> => item !== null));
 	const errors = packages.flatMap((item) => item.errors.map((error) => `${item.kind}: ${error}`));
 	return {
 		valid: errors.length === 0 && packages.length > 0,
