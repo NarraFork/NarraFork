@@ -45,8 +45,8 @@ export const ClampableText = memo(function ClampableText({
 	// rows without structured citations still get their internal markers stripped
 	// here, so no DB migration is needed to stop showing them.
 	const { display, copyText } = useMemo(
-		() => resolveAssistantTextDisplay(text, citations, { streaming }),
-		[text, citations, streaming],
+		() => resolveAssistantTextDisplay(text, citations),
+		[text, citations],
 	);
 
 	const clampable = !streaming && lod <= 1 && display.length > CLAMP_MIN_CHARS;

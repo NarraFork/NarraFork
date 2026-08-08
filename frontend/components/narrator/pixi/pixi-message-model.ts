@@ -515,7 +515,6 @@ function messageBlocks(
 						? resolveAssistantTextDisplay(
 								raw,
 								Array.isArray(block.citations) ? (block.citations as TextCitation[]) : undefined,
-								{ streaming: isStreaming && liveBlockIndex === index },
 							)
 						: { display: raw, copyText: null };
 				result.push({

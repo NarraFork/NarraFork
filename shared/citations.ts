@@ -449,111 +449,6 @@ export function parseLegacyCitationMarkers(text: string): LegacyCitationParseRes
 	};
 }
 
-export interface CitationMarkupStreamChunk {
-	visibleText: string;
-	citations: Array<{ anchorIndex: number; sources: CitationSource[] }>;
-}
-
-/**
- * Streaming envelope parser, ported from Codex's `InlineHiddenTagParser`
- * (`codex-rs/utils/stream-parser/src/inline_hidden_tag.rs`).
- *
- * The load-bearing detail is `longestSuffixPrefixLength`, Codex's
- * `longest_suffix_prefix_len`: only the suffix that could still grow into the
- * exact opener is withheld from visible output. That is what keeps a marker split
- * across deltas (`"…\ue200ci"` then `"te\ue202turn0view0\ue201"`) from ever
- * flashing on screen, without buffering the whole message.
- *
- * Codex swallows an unterminated tag at `finish()`. Here an unterminated tag is
- * only swallowed when its payload validates as a ref list; otherwise it is
- * emitted verbatim, because this text is shown to a user rather than consumed by
- * a protocol layer.
- */
-export class CitationMarkupStreamParser {
-	private pending = "";
-	private activePayload: string | null = null;
-	private visibleLength = 0;
-
-	push(chunk: string): CitationMarkupStreamChunk {
-		this.pending += chunk;
-		const out: CitationMarkupStreamChunk = { visibleText: "", citations: [] };
-
-		while (this.pending) {
-			if (this.activePayload !== null) {
-				const close = this.pending.indexOf(CHATGPT_CITATION_CLOSE);
-				if (close >= 0) {
-					const payload = this.activePayload + this.pending.slice(0, close);
-					this.pending = this.pending.slice(close + CHATGPT_CITATION_CLOSE.length);
-					this.finishEnvelope(payload, out, true);
-					continue;
-				}
-				this.activePayload += this.pending;
-				this.pending = "";
-				if (this.activePayload.length > CITATION_LIMITS.maxMarkerLength) {
-					out.visibleText += CHATGPT_CITATION_OPEN + this.activePayload;
-					this.activePayload = null;
-				}
-				break;
-			}
-
-			const open = this.pending.indexOf(CHATGPT_CITATION_OPEN);
-			if (open >= 0) {
-				out.visibleText += this.pending.slice(0, open);
-				this.pending = this.pending.slice(open + CHATGPT_CITATION_OPEN.length);
-				this.activePayload = "";
-				continue;
-			}
-
-			const keep = longestSuffixPrefixLength(this.pending, CHATGPT_CITATION_OPEN);
-			const visibleLength = this.pending.length - keep;
-			out.visibleText += this.pending.slice(0, visibleLength);
-			this.pending = this.pending.slice(visibleLength);
-			break;
-		}
-		this.visibleLength += out.visibleText.length;
-		return out;
-	}
-
-	finish(): CitationMarkupStreamChunk {
-		const out: CitationMarkupStreamChunk = { visibleText: "", citations: [] };
-		if (this.activePayload !== null) {
-			this.finishEnvelope(this.activePayload, out, false);
-			this.activePayload = null;
-		}
-		out.visibleText += this.pending;
-		this.pending = "";
-		this.visibleLength += out.visibleText.length;
-		return out;
-	}
-
-	private finishEnvelope(payload: string, out: CitationMarkupStreamChunk, hadClose: boolean): void {
-		const sources = parseCitationPayload(payload);
-		if (sources) {
-			out.citations.push({
-				anchorIndex: this.visibleLength + out.visibleText.length,
-				sources,
-			});
-		} else {
-			out.visibleText += CHATGPT_CITATION_OPEN + payload + (hadClose ? CHATGPT_CITATION_CLOSE : "");
-		}
-		this.activePayload = null;
-	}
-}
-
-/**
- * Longest suffix of `value` that is a proper prefix of `delimiter`.
- *
- * Direct port of Codex's `longest_suffix_prefix_len`. This is what makes the
- * streaming parser exact rather than heuristic.
- */
-function longestSuffixPrefixLength(value: string, delimiter: string): number {
-	const max = Math.min(value.length, delimiter.length - 1);
-	for (let length = max; length > 0; length--) {
-		if (value.endsWith(delimiter.slice(0, length))) return length;
-	}
-	return 0;
-}
-
 /**
  * Translate an index from original text coordinates into cleaned coordinates
  * after `removals` were applied. Indices landing inside a removed marker
@@ -699,10 +594,13 @@ export function projectAssistantTextForDisplay(
  * model actually wrote. Pasting `[1](<https://…>)` into a document would put link
  * syntax the author never typed into the user's text.
  *
- * Streaming text is already clean at the loop boundary, matching Codex's
- * `emit_streamed_assistant_text_delta`: clients only receive `visible_text` and
- * must not replay the hidden-markup parser over an ever-growing accumulated
- * string. The legacy parser is therefore settled-history compatibility only.
+ * Streaming and settled text take the SAME path. Deltas are forwarded verbatim
+ * by the loop, so both arrive here raw and one projection covers both. An earlier
+ * design stripped at the delta boundary instead, which meant two parsers over the
+ * same bytes — and two ways for them to disagree (they did, twice). A partial
+ * opener may therefore be visible for one frame mid-stream; that is a single
+ * unrenderable character until the next delta, and the alternative was guessing
+ * which trailing bytes are a marker prefix, which risks deleting a real glyph.
  *
  * `copyText` is `null` when the two are identical, so callers can skip passing an
  * override and keep the default copy path untouched.
@@ -710,13 +608,8 @@ export function projectAssistantTextForDisplay(
 export function resolveAssistantTextDisplay(
 	text: string,
 	citations?: readonly TextCitation[],
-	options: { streaming?: boolean } = {},
 ): { display: string; copyText: string | null } {
 	if (!text) return { display: text, copyText: null };
-	if (options.streaming) {
-		const display = projectCitationsToMarkdown(text, citations).markdown;
-		return { display, copyText: display === text ? null : text };
-	}
 	const display = projectAssistantTextForDisplay(text, citations);
 	const copy = cleanAssistantText(text).text;
 	return { display, copyText: copy === display ? null : copy };
