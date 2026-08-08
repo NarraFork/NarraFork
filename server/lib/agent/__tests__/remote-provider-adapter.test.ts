@@ -305,6 +305,49 @@ describe("RemoteProviderAdapter", () => {
 		expect(adapter.getActiveReasoningSource()).toBe("remote:channel-a");
 	});
 
+	/**
+	 * `text.citation` is the plugin-side equivalent of a Responses API annotation.
+	 * It must map onto the same `textCitations` field the loop already consumes —
+	 * otherwise a plugin's sources would be silently discarded while its inline
+	 * markers still reached the UI.
+	 */
+	test("chat maps plugin text.citation events onto textCitations", async () => {
+		const rpc = makeRpc([
+			event("text.delta", { text: "answer" }),
+			event("text.citation", {
+				citations: [
+					{
+						startIndex: 0,
+						endIndex: 6,
+						url: "https://example.test/a",
+						title: "A",
+						outputIndex: 0,
+					},
+					{ endIndex: 6, sourceRef: "plugin-ref-1" },
+				],
+			}),
+			event("done", { status: "completed", stopReason: "end_turn" }),
+		]);
+		const events = await collect(makeAdapter(rpc).chat(chatParams()));
+
+		expect(events).toEqual([
+			{ text: "answer", textOutputIndex: undefined },
+			{
+				textCitations: [
+					{
+						startIndex: 0,
+						endIndex: 6,
+						url: "https://example.test/a",
+						title: "A",
+						outputIndex: 0,
+					},
+					{ endIndex: 6, sourceRef: "plugin-ref-1" },
+				],
+			},
+			{ stopReason: "end_turn" },
+		]);
+	});
+
 	test("chat maps streaming tool chunks and complete tool calls", async () => {
 		const rpc = makeRpc([
 			event("tool_call.start", { toolUseId: "call-1", name: "Read", outputIndex: 0 }),

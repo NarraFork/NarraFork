@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { CitationMarkupStreamParser, type TextCitation } from "@shared/citations";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
@@ -12,6 +13,7 @@ import { shouldUseNativeSearch } from "../search/native";
 import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { analyzeShellCommand } from "./bash-analyze";
+import { finalizeAssistantTextWithCitations, TextCitationAccumulator } from "./citation-stream";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./error-diagnostics";
 import {
@@ -548,11 +550,19 @@ function hasPersistableStreamContent(parsed: ParsedStreamEvent): boolean {
 }
 
 /** Yield block_complete events for accumulated reasoning blocks and assistant text.
- *  Used in every early-return / error path to persist partial progress. */
+ *  Used in every early-return / error path to persist partial progress.
+ *
+ *  The text block is finalized here rather than at each call site: there are ~19
+ *  partial-flush paths (abort, resumable error, invalid state, …) and every one
+ *  of them must strip provider-internal citation markers. Doing it inside the
+ *  single generator is what guarantees no path can leak `citeturn…` into a
+ *  persisted block. `citations` is supplied by the success path, which already
+ *  finalized the text to reuse it for the model history. */
 function* flushPartialContent(
 	reasoningBlockMap: Map<string, ReasoningBlockEntry>,
 	assistantText: string,
 	textOutputIndex?: number,
+	citations?: TextCitation[],
 ): Generator<AgentEvent> {
 	for (const entry of reasoningBlockMap.values()) {
 		if (entry.text || entry.providerMetadata) {
@@ -567,12 +577,22 @@ function* flushPartialContent(
 			};
 		}
 	}
-	if (assistantText) {
-		yield {
-			type: "block_complete",
-			block: { type: "text", text: assistantText, outputIndex: textOutputIndex },
-		};
-	}
+	if (!assistantText) return;
+	// Already-finalized text re-parses to itself, so this stays correct whether
+	// or not the caller pre-computed citations.
+	const finalized = citations
+		? { text: assistantText, citations }
+		: finalizeAssistantTextWithCitations(assistantText);
+	if (!finalized.text) return;
+	yield {
+		type: "block_complete",
+		block: {
+			type: "text",
+			text: finalized.text,
+			outputIndex: textOutputIndex,
+			...(finalized.citations.length > 0 ? { citations: finalized.citations } : {}),
+		},
+	};
 }
 
 // Cadence (in completed tool calls) for the periodic spec (tasks.json) reminder.
@@ -2598,6 +2618,30 @@ export async function* agentLoop(
 			let assistantText = "";
 			/** Provider-native content block index for the text block (for interleaved ordering). */
 			let textOutputIndex: number | undefined;
+			/** Source citations reported for this turn's assistant text (native search). */
+			const citationAccum = new TextCitationAccumulator();
+			/**
+			 * Per-output literal citation parsers for the client-visible delta stream.
+			 *
+			 * Codex keeps one AssistantTextStreamParser per response item and emits only
+			 * `parsed.visible_text` to clients. `textOutputIndex` is the stable item
+			 * identity available in NarraFork's provider-neutral protocol, so it fills
+			 * the same role here. Raw text still accumulates in `assistantText`; final
+			 * normalization needs its original coordinates to remap URL annotations.
+			 */
+			const citationStreamParsers = new Map<
+				string,
+				{ parser: CitationMarkupStreamParser; outputIndex?: number }
+			>();
+			/**
+			 * Where each text output item begins inside `assistantText`.
+			 *
+			 * Responses annotation indices are relative to their own output item, so a
+			 * turn with two text items would anchor the second item's references at the
+			 * wrong offset without this. With the usual single text item every offset is
+			 * 0 and the mapping is an identity.
+			 */
+			const textItemBaseOffsets = new Map<string, number>();
 			/**
 			 * Reasoning blocks accumulated during streaming, keyed by itemId.
 			 * Supports multiple reasoning items per turn (e.g. interleaved with tool calls).
@@ -3115,6 +3159,69 @@ export async function* agentLoop(
 				yield { type: "tool_use_discarded", toolUseIds: abandoned };
 			}
 
+			/**
+			 * Parse one raw provider text delta into client-visible text.
+			 *
+			 * One parser per output item mirrors Codex's `parsers_by_item`. The parser
+			 * is exact-literal and therefore a byte-identical pass-through for every
+			 * protocol that does not emit the citation envelope.
+			 */
+			function citationStreamKey(outputIndex?: number): string {
+				return outputIndex == null ? "__default" : `output:${outputIndex}`;
+			}
+
+			function visibleCitationDelta(
+				text: string,
+				outputIndex: number | undefined,
+				rawOffsetBefore: number,
+			): string {
+				const key = citationStreamKey(outputIndex);
+				let entry = citationStreamParsers.get(key);
+				if (!entry) {
+					entry = { parser: new CitationMarkupStreamParser(), outputIndex };
+					citationStreamParsers.set(key, entry);
+					// First delta of this item: remember where it starts in the raw text.
+					if (!textItemBaseOffsets.has(key)) textItemBaseOffsets.set(key, rawOffsetBefore);
+				}
+				return entry.parser.push(text).visibleText;
+			}
+
+			/** Codex `finish_item`: flush one output item at its provider completion event. */
+			function* finishCitationDeltaStream(outputIndex?: number): Generator<AgentEvent> {
+				const key = citationStreamKey(outputIndex);
+				const entry = citationStreamParsers.get(key);
+				if (!entry) return;
+				citationStreamParsers.delete(key);
+				const tail = entry.parser.finish();
+				if (tail.visibleText) {
+					yield { type: "stream_text", text: tail.visibleText, outputIndex: entry.outputIndex };
+				}
+			}
+
+			/** Safety-net flush for protocols that do not expose per-item completion. */
+			function* finishCitationDeltaStreams(): Generator<AgentEvent> {
+				for (const { outputIndex } of [...citationStreamParsers.values()]) {
+					yield* finishCitationDeltaStream(outputIndex);
+				}
+			}
+
+			/**
+			 * Partial flush for every abort / error path.
+			 *
+			 * `flushPartialContent` persists the RAW accumulated text, which already
+			 * contains any bytes the stream parser is still holding as a possible
+			 * opener prefix. Without releasing that buffer first, the live streaming
+			 * view would end up to 6 characters SHORTER than the block that is being
+			 * persisted in the same tick. Codex has the same requirement and solves it
+			 * the same way: `finish()` runs before the item is finalized, and a partial
+			 * opener that never completed is emitted as ordinary visible text
+			 * (fail open) rather than deleted.
+			 */
+			function* flushPartialWithCitationTail(): Generator<AgentEvent> {
+				yield* finishCitationDeltaStreams();
+				yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex, undefined);
+			}
+
 			chatRetryLoop: for (;;) {
 				// Reset per-attempt accumulators so a retry starts with a clean slate.
 				// (On the first attempt these are already empty; on retries they may
@@ -3129,6 +3236,9 @@ export async function* agentLoop(
 				// dispatch), so this is safe.
 				assistantText = "";
 				textOutputIndex = undefined;
+				citationAccum.reset();
+				citationStreamParsers.clear();
+				textItemBaseOffsets.clear();
 				reasoningBlockMap.clear();
 				toolUses.length = 0;
 				toolOrderIdentities.clear();
@@ -3284,12 +3394,39 @@ export async function* agentLoop(
 						}
 
 						if (parsed.text) {
+							const rawOffsetBefore = assistantText.length;
 							assistantText += parsed.text;
 							if (parsed.text.trim()) silentToolCallCount = 0;
 							if (parsed.textOutputIndex != null) {
 								textOutputIndex = parsed.textOutputIndex;
 							}
-							yield { type: "stream_text", text: parsed.text, outputIndex: parsed.textOutputIndex };
+							// Match Codex's stream boundary: clients receive only visible text.
+							// The raw delta stays in assistantText so final annotation indices can
+							// still be remapped through the removed envelope ranges.
+							const visibleText = visibleCitationDelta(
+								parsed.text,
+								parsed.textOutputIndex,
+								rawOffsetBefore,
+							);
+							if (visibleText) {
+								yield {
+									type: "stream_text",
+									text: visibleText,
+									outputIndex: parsed.textOutputIndex,
+								};
+							}
+						}
+						// Citations are metadata, not visible output: accumulate silently and
+						// attach them when the text block is finalized. Broadcasting them per
+						// event would add a high-frequency WS channel for no visual gain.
+						if (parsed.textCitations) {
+							const key = citationStreamKey(
+								parsed.textCitations[0]?.outputIndex ?? parsed.textOutputIndex,
+							);
+							citationAccum.add(parsed.textCitations, textItemBaseOffsets.get(key) ?? 0);
+						}
+						if (parsed.textItemDone) {
+							yield* finishCitationDeltaStream(parsed.textOutputIndex);
 						}
 						if (parsed.toolUses) {
 							// ── Tool use dedup ──
@@ -4079,7 +4216,7 @@ export async function* agentLoop(
 							}
 							const classification = classifyInvalidState(reason, message, requestDiagnostics);
 							if (classification.category === "context_overflow") {
-								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* flushPartialWithCitationTail();
 								yield* finishRequest(message);
 								yield { type: "context_length_exceeded", message };
 								return;
@@ -4113,7 +4250,7 @@ export async function* agentLoop(
 									isModelUnavailableError({ message, diagnostics: requestDiagnostics }) &&
 									!hasStartedEarlyToolExecution()
 								) {
-									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+									yield* flushPartialWithCitationTail();
 									yield* finishRequest(message);
 									const prefixToken = `${nugProvider.prefix}:`;
 									const nugModelId = effectiveModel.startsWith(prefixToken)
@@ -4256,7 +4393,7 @@ export async function* agentLoop(
 									// Retry budget spent (or a stateful provider that cannot replay the
 									// request): fall back to a textual continuation rather than failing.
 								}
-								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* flushPartialWithCitationTail();
 								yield* finishRequest(message);
 								yield { type: "resumable_error", message, diagnostics: requestDiagnostics };
 								return;
@@ -4271,7 +4408,7 @@ export async function* agentLoop(
 										toolCount: toolUses.length,
 										startedToolCount: earlyExecMap.size,
 									});
-									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+									yield* flushPartialWithCitationTail();
 									yield* drainStartedEarlyToolResults();
 									yield* finishRequest(message);
 									yield {
@@ -4323,7 +4460,7 @@ export async function* agentLoop(
 								}
 								// Exhausted retries — yield block_complete for partial content
 								// then signal retryable_error to the caller.
-								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* flushPartialWithCitationTail();
 								yield* finishRequest(message);
 								yield { type: "retryable_error", message, diagnostics: requestDiagnostics };
 								return;
@@ -4334,7 +4471,7 @@ export async function* agentLoop(
 							// downstream empty-response check (which would retry and eventually
 							// report a misleading "Provider returned an empty response" message).
 							sawErrorEvent = true;
-							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+							yield* flushPartialWithCitationTail();
 							yield* finishRequest(message);
 							yield {
 								type: "invalid_state",
@@ -4357,7 +4494,7 @@ export async function* agentLoop(
 						// Do not await still-running eager tools beyond the bounded abort drain. Their
 						// execution cleanup is handled by the tool executor.
 						// Even on abort, yield block_complete for accumulated content so it can be persisted
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest("Aborted");
 						yield { type: "error", message: "Aborted" };
 						return;
@@ -4434,7 +4571,7 @@ export async function* agentLoop(
 							toolCount: toolUses.length,
 							startedToolCount: earlyExecMap.size,
 						});
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* drainStartedEarlyToolResults();
 						yield* finishRequest(message);
 						yield {
@@ -4463,7 +4600,7 @@ export async function* agentLoop(
 					);
 					const paymentRequired = nugProvider ? getPaymentRequiredErrorInfo(err) : null;
 					if (paymentRequired) {
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						yield {
 							type: "payment_required",
@@ -4485,7 +4622,7 @@ export async function* agentLoop(
 					// poller, instead of retrying the full request (with its whole history)
 					// over and over. Only for NUG providers.
 					if (nugProvider && isModelUnavailableError(err)) {
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						// `effectiveModel` is `${prefix}:${channel:bareModel}`; strip the
 						// provider prefix to recover the gateway model id (`channel:bareModel`)
@@ -4513,7 +4650,7 @@ export async function* agentLoop(
 						(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
 					) {
 						// Persist partial content before signalling overflow
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						yield { type: "context_length_exceeded", message: msg };
 						return;
@@ -4521,7 +4658,7 @@ export async function* agentLoop(
 					// Detect context overflow errors from OpenAI/Codex-compatible providers.
 					// Treat as context_length_exceeded so caller can prune/compact+retry.
 					if (isContextWindowExceededError(err)) {
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						yield { type: "context_length_exceeded", message: msg };
 						return;
@@ -4634,7 +4771,7 @@ export async function* agentLoop(
 							// Retry budget spent (or a stateful provider that cannot replay the
 							// request): fall back to a textual continuation rather than failing.
 						}
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						yield { type: "resumable_error", message: msg, diagnostics: requestDiagnostics };
 						return;
@@ -4681,13 +4818,13 @@ export async function* agentLoop(
 							}
 						}
 						// Exhausted retries — persist partial content and signal caller
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						yield { type: "retryable_error", message: msg, diagnostics: requestDiagnostics };
 						return;
 					}
 					// Non-retryable error — persist partial content and signal caller
-					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+					yield* flushPartialWithCitationTail();
 					yield* finishRequest(msg);
 					yield { type: "error", message: msg, diagnostics: requestDiagnostics };
 					return;
@@ -5159,6 +5296,10 @@ export async function* agentLoop(
 				break;
 			} // end for (;;) retry loop
 
+			// Equivalent to Codex's `finish_item`: release a partial opener prefix or
+			// finalize an opened citation before the authoritative block is emitted.
+			yield* finishCitationDeltaStreams();
+
 			// Final safety net: if a provider/parser accidentally surfaced the same toolUseId
 			// multiple times in one turn, collapse them before any drain/execution logic below.
 			dedupeToolUsesInPlace(toolUses, effectiveProvider, effectiveModel);
@@ -5225,6 +5366,24 @@ export async function* agentLoop(
 					};
 				}
 			}
+
+			// ── Finalize citations for this turn's assistant text ──
+			// Runs once, here, so the SAME cleaned text feeds token estimation, the
+			// `assistant_message` event, persistence and `pushAssistantTurn`. If the
+			// raw text were used for the model history, the next turn would see the
+			// internal markers and happily reproduce them.
+			const finalizedText = citationAccum.finalize(assistantText);
+			const turnCitations = finalizedText.citations;
+			if (finalizedText.strippedMarkers) {
+				logger.debug("Stripped provider-internal citation markers from assistant text", {
+					narratorId: config.narratorId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					requestId,
+					citationCount: turnCitations.length,
+				});
+			}
+			assistantText = finalizedText.text;
 
 			// Tool chunks may complete out of order. Reconstruct the provider's native order
 			// from identities recorded at tool start before persistence, execution grouping,
@@ -5313,7 +5472,12 @@ export async function* agentLoop(
 
 			// Yield accumulated content before assistant_message so partial-block
 			// persistence is finalized for both normal and truncated turns.
-			yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+			yield* flushPartialContent(
+				reasoningBlockMap,
+				assistantText,
+				textOutputIndex,
+				turnCitations.length > 0 ? turnCitations : undefined,
+			);
 
 			// Drain settled tool results before assistant_message so the DB
 			// has correct tool call statuses when the message is broadcast.
@@ -5357,6 +5521,7 @@ export async function* agentLoop(
 				toolUses,
 				messageId,
 				credentialId,
+				...(turnCitations.length > 0 ? { citations: turnCitations } : {}),
 			};
 			// The provider response is now complete and every produced tool has a stable row.
 			// Tool execution may remain paused behind phase two without holding the response fence.

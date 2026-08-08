@@ -1552,7 +1552,12 @@ export const narratorPersistence = {
 		messageId: string,
 		narratorId: string,
 		block:
-			| { type: "text"; text: string; outputIndex?: number }
+			| {
+					type: "text";
+					text: string;
+					outputIndex?: number;
+					citations?: import("@shared/citations").TextCitation[];
+			  }
 			| {
 					type: "reasoning";
 					text: string;
@@ -1595,7 +1600,12 @@ export const narratorPersistence = {
 		if (!existing) return;
 
 		type StoredAssistantBlock =
-			| { type: "text"; text: string; outputIndex?: number }
+			| {
+					type: "text";
+					text: string;
+					outputIndex?: number;
+					citations?: import("@shared/citations").TextCitation[];
+			  }
 			| {
 					type: "reasoning";
 					text: string;

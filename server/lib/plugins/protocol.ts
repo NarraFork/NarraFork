@@ -1,3 +1,4 @@
+import { CITATION_LIMITS } from "@shared/citations";
 import { z } from "zod";
 import { capabilityListSchema, invocationScopeSchema } from "./permissions";
 
@@ -479,6 +480,7 @@ const operationIdSchema = z.string().trim().min(1).max(128);
 const positiveSequenceSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 const outputIndexSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional();
 const optionalTextSchema = z.string().max(4_000).optional();
+const citationIndexSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 
 export const providerUsageSchema = z
 	.object({
@@ -517,6 +519,34 @@ export const providerStreamEventSchema = z.discriminatedUnion("type", [
 			type: z.literal("text.delta"),
 			text: z.string().min(1).max(MAX_JSON_STRING_LENGTH),
 			outputIndex: outputIndexSchema,
+		})
+		.strict(),
+	// Source citations for assistant text (native search). Additive: plugins that
+	// never emit this keep working unchanged. Bounds mirror CITATION_LIMITS so a
+	// plugin cannot push unbounded metadata through the stream.
+	z
+		.object({
+			type: z.literal("text.citation"),
+			citations: z
+				.array(
+					z
+						.object({
+							startIndex: citationIndexSchema.optional(),
+							endIndex: citationIndexSchema,
+							url: z.string().trim().min(1).max(CITATION_LIMITS.maxUrlLength).optional(),
+							title: z.string().trim().min(1).max(CITATION_LIMITS.maxTitleLength).optional(),
+							sourceRef: z
+								.string()
+								.trim()
+								.min(1)
+								.max(CITATION_LIMITS.maxSourceRefLength)
+								.optional(),
+							outputIndex: outputIndexSchema,
+						})
+						.strict(),
+				)
+				.min(1)
+				.max(CITATION_LIMITS.maxCitations),
 		})
 		.strict(),
 	z
