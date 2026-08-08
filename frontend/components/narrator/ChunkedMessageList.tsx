@@ -1,5 +1,6 @@
 import { Box } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { cleanAssistantText } from "@shared/citations";
 import { stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
 import {
 	forwardRef,
@@ -337,8 +338,18 @@ function stableStringify(value: unknown, maxChars = 4000): string {
 	return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
 }
 
-function getBlockCopyText(block: ContentBlock): string {
-	if (typeof block.text === "string") return block.text;
+/**
+ * Copy text for one block.
+ *
+ * `assistant` enables citation cleanup: a historical assistant text block may
+ * still embed provider-internal `citeturn…` markers, and copying them would
+ * paste machine-only identifiers into the user's document. User blocks never opt
+ * in — quoting the marker is legitimate there.
+ */
+function getBlockCopyText(block: ContentBlock, assistant = false): string {
+	if (typeof block.text === "string") {
+		return assistant ? cleanAssistantText(block.text).text : block.text;
+	}
 	if (typeof block.thinking === "string") return block.thinking;
 	if (block.type === "text_file") {
 		return [block.filename, typeof block.size === "number" ? `${block.size} bytes` : null]
@@ -455,7 +466,7 @@ function buildSelectionIndex(chunks: ChunkData[]): SelectionIndex {
 							? userCopyText
 							: reasoningRun
 								? getReasoningRunCopyText(representedBlocks)
-								: getBlockCopyText(block),
+								: getBlockCopyText(block, msg.role === "assistant"),
 				};
 				index.entries.push(entry);
 				index.byBlockId.set(primaryId, entry);

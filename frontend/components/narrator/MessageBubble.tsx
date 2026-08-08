@@ -4957,6 +4957,7 @@ export const MessageBubble = memo(function MessageBubble({
 							<ClampableText
 								key={key}
 								text={block.text}
+								citations={block.citations}
 								blockIndex={realIndex}
 								streaming={isStreaming}
 							/>

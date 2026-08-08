@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import type { TextCitation } from "@shared/citations";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
@@ -12,6 +13,7 @@ import { shouldUseNativeSearch } from "../search/native";
 import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { analyzeShellCommand } from "./bash-analyze";
+import { finalizeAssistantTextWithCitations, TextCitationAccumulator } from "./citation-stream";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./error-diagnostics";
 import {
@@ -548,11 +550,19 @@ function hasPersistableStreamContent(parsed: ParsedStreamEvent): boolean {
 }
 
 /** Yield block_complete events for accumulated reasoning blocks and assistant text.
- *  Used in every early-return / error path to persist partial progress. */
+ *  Used in every early-return / error path to persist partial progress.
+ *
+ *  The text block is finalized here rather than at each call site: there are ~19
+ *  partial-flush paths (abort, resumable error, invalid state, …) and every one
+ *  of them must strip provider-internal citation markers. Doing it inside the
+ *  single generator is what guarantees no path can leak `citeturn…` into a
+ *  persisted block. `citations` is supplied by the success path, which already
+ *  finalized the text to reuse it for the model history. */
 function* flushPartialContent(
 	reasoningBlockMap: Map<string, ReasoningBlockEntry>,
 	assistantText: string,
 	textOutputIndex?: number,
+	citations?: TextCitation[],
 ): Generator<AgentEvent> {
 	for (const entry of reasoningBlockMap.values()) {
 		if (entry.text || entry.providerMetadata) {
@@ -567,12 +577,22 @@ function* flushPartialContent(
 			};
 		}
 	}
-	if (assistantText) {
-		yield {
-			type: "block_complete",
-			block: { type: "text", text: assistantText, outputIndex: textOutputIndex },
-		};
-	}
+	if (!assistantText) return;
+	// Already-finalized text re-parses to itself, so this stays correct whether
+	// or not the caller pre-computed citations.
+	const finalized = citations
+		? { text: assistantText, citations }
+		: finalizeAssistantTextWithCitations(assistantText);
+	if (!finalized.text) return;
+	yield {
+		type: "block_complete",
+		block: {
+			type: "text",
+			text: finalized.text,
+			outputIndex: textOutputIndex,
+			...(finalized.citations.length > 0 ? { citations: finalized.citations } : {}),
+		},
+	};
 }
 
 // Cadence (in completed tool calls) for the periodic spec (tasks.json) reminder.
@@ -2598,6 +2618,17 @@ export async function* agentLoop(
 			let assistantText = "";
 			/** Provider-native content block index for the text block (for interleaved ordering). */
 			let textOutputIndex: number | undefined;
+			/** Source citations reported for this turn's assistant text (native search). */
+			const citationAccum = new TextCitationAccumulator();
+			/**
+			 * Where each text output item begins inside `assistantText`.
+			 *
+			 * Responses annotation indices are relative to their own output item, so a
+			 * turn with two text items would anchor the second item's references at the
+			 * wrong offset without this. With the usual single text item every offset is
+			 * 0 and the mapping is an identity.
+			 */
+			const textItemBaseOffsets = new Map<string, number>();
 			/**
 			 * Reasoning blocks accumulated during streaming, keyed by itemId.
 			 * Supports multiple reasoning items per turn (e.g. interleaved with tool calls).
@@ -3115,6 +3146,16 @@ export async function* agentLoop(
 				yield { type: "tool_use_discarded", toolUseIds: abandoned };
 			}
 
+			/**
+			 * Key for a text output item, used to anchor its annotation offsets.
+			 *
+			 * Providers that omit `output_index` collapse onto a single default key,
+			 * which is correct: without an item identity there is only one text run.
+			 */
+			function citationStreamKey(outputIndex?: number): string {
+				return outputIndex == null ? "__default" : `output:${outputIndex}`;
+			}
+
 			chatRetryLoop: for (;;) {
 				// Reset per-attempt accumulators so a retry starts with a clean slate.
 				// (On the first attempt these are already empty; on retries they may
@@ -3129,6 +3170,8 @@ export async function* agentLoop(
 				// dispatch), so this is safe.
 				assistantText = "";
 				textOutputIndex = undefined;
+				citationAccum.reset();
+				textItemBaseOffsets.clear();
 				reasoningBlockMap.clear();
 				toolUses.length = 0;
 				toolOrderIdentities.clear();
@@ -3284,12 +3327,30 @@ export async function* agentLoop(
 						}
 
 						if (parsed.text) {
+							// First delta of this output item: remember where it starts in the raw
+							// text, so a later annotation's item-relative index can be rebased.
+							const key = citationStreamKey(parsed.textOutputIndex);
+							if (!textItemBaseOffsets.has(key)) {
+								textItemBaseOffsets.set(key, assistantText.length);
+							}
 							assistantText += parsed.text;
 							if (parsed.text.trim()) silentToolCallCount = 0;
 							if (parsed.textOutputIndex != null) {
 								textOutputIndex = parsed.textOutputIndex;
 							}
+							// Deltas are forwarded verbatim. Stripping happens once at finalize,
+							// and the read side projects historical rows anyway — a second,
+							// incremental parser here only created two ways to disagree.
 							yield { type: "stream_text", text: parsed.text, outputIndex: parsed.textOutputIndex };
+						}
+						// Citations are metadata, not visible output: accumulate silently and
+						// attach them when the text block is finalized. Broadcasting them per
+						// event would add a high-frequency WS channel for no visual gain.
+						if (parsed.textCitations) {
+							const key = citationStreamKey(
+								parsed.textCitations[0]?.outputIndex ?? parsed.textOutputIndex,
+							);
+							citationAccum.add(parsed.textCitations, textItemBaseOffsets.get(key) ?? 0);
 						}
 						if (parsed.toolUses) {
 							// ── Tool use dedup ──
@@ -5226,6 +5287,24 @@ export async function* agentLoop(
 				}
 			}
 
+			// ── Finalize citations for this turn's assistant text ──
+			// Runs once, here, so the SAME cleaned text feeds token estimation, the
+			// `assistant_message` event, persistence and `pushAssistantTurn`. If the
+			// raw text were used for the model history, the next turn would see the
+			// internal markers and happily reproduce them.
+			const finalizedText = citationAccum.finalize(assistantText);
+			const turnCitations = finalizedText.citations;
+			if (finalizedText.strippedMarkers) {
+				logger.debug("Stripped provider-internal citation markers from assistant text", {
+					narratorId: config.narratorId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					requestId,
+					citationCount: turnCitations.length,
+				});
+			}
+			assistantText = finalizedText.text;
+
 			// Tool chunks may complete out of order. Reconstruct the provider's native order
 			// from identities recorded at tool start before persistence, execution grouping,
 			// and model-facing tool results consume the completed calls.
@@ -5313,7 +5392,12 @@ export async function* agentLoop(
 
 			// Yield accumulated content before assistant_message so partial-block
 			// persistence is finalized for both normal and truncated turns.
-			yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+			yield* flushPartialContent(
+				reasoningBlockMap,
+				assistantText,
+				textOutputIndex,
+				turnCitations.length > 0 ? turnCitations : undefined,
+			);
 
 			// Drain settled tool results before assistant_message so the DB
 			// has correct tool call statuses when the message is broadcast.
@@ -5357,6 +5441,7 @@ export async function* agentLoop(
 				toolUses,
 				messageId,
 				credentialId,
+				...(turnCitations.length > 0 ? { citations: turnCitations } : {}),
 			};
 			// The provider response is now complete and every produced tool has a stable row.
 			// Tool execution may remain paused behind phase two without holding the response fence.

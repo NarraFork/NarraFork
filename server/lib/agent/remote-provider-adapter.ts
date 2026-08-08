@@ -629,6 +629,10 @@ function mapStreamEvent(
 	switch (event.type) {
 		case "text.delta":
 			return { text: event.text, textOutputIndex: event.outputIndex };
+		case "text.citation":
+			// Schema-level bounds already applied; the loop normalizes and drops
+			// anything that does not resolve against the cleaned text.
+			return { textCitations: event.citations.map((citation) => ({ ...citation })) };
 		case "reasoning.delta":
 			return {
 				reasoning: event.text,

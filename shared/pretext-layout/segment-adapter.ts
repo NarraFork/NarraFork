@@ -17,6 +17,7 @@
  * raw block/tool so the render layer can pull details lazily.
  */
 
+import { resolveAssistantTextDisplay, type TextCitation } from "../citations";
 import { hasUsablePlanBody } from "../plan-reference";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
 import type { VListElementKind } from "./element-kinds";
@@ -116,6 +117,8 @@ export interface AdapterContentBlock {
 	thinkingChars?: number | null;
 	/** segment_compact: number of messages folded into the segment summary. */
 	messageCount?: number | null;
+	/** assistant text: source citations indexed against `text`. */
+	citations?: TextCitation[] | null;
 	[key: string]: unknown;
 }
 
@@ -693,8 +696,21 @@ export function classifyContentBlock(block: AdapterContentBlock): VListElementKi
 // Data extraction per kind.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Assistant markdown, with source citations projected into the text.
+ *
+ * Only reached for assistant messages (the user and system branches return
+ * earlier), which is what makes the legacy-marker pass safe here: a user quoting
+ * `citeturn…` keeps their text verbatim, while a historical assistant row gets
+ * the marker replaced by a numbered reference without a DB migration.
+ *
+ * The projection emits plain Markdown links, so VList and Pixi reuse the existing
+ * href measurement and click handling instead of each growing a citation renderer.
+ */
 function markdownData(block: AdapterContentBlock): string {
-	return block.text ?? "";
+	const text = block.text ?? "";
+	if (!text) return text;
+	return resolveAssistantTextDisplay(text, block.citations ?? undefined).display;
 }
 
 function reasoningData(blocks: AdapterContentBlock[], isStreaming: boolean) {
@@ -1162,7 +1178,11 @@ function adaptMessage(
 		}
 		switch (kind) {
 			case "markdown":
-				specs.push({ kind, key, data: markdownData(block) });
+				specs.push({
+					kind,
+					key,
+					data: markdownData(block),
+				});
 				break;
 			case "web-search":
 				specs.push({ kind, key, data: webSearchData(block) });

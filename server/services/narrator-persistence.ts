@@ -8,7 +8,7 @@ import {
 	truncateCompactError,
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
-import { and, desc, eq, gte, inArray, like, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, like, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	narratorMessageRefs,
@@ -1552,7 +1552,12 @@ export const narratorPersistence = {
 		messageId: string,
 		narratorId: string,
 		block:
-			| { type: "text"; text: string; outputIndex?: number }
+			| {
+					type: "text";
+					text: string;
+					outputIndex?: number;
+					citations?: import("@shared/citations").TextCitation[];
+			  }
 			| {
 					type: "reasoning";
 					text: string;
@@ -1595,7 +1600,12 @@ export const narratorPersistence = {
 		if (!existing) return;
 
 		type StoredAssistantBlock =
-			| { type: "text"; text: string; outputIndex?: number }
+			| {
+					type: "text";
+					text: string;
+					outputIndex?: number;
+					citations?: import("@shared/citations").TextCitation[];
+			  }
 			| {
 					type: "reasoning";
 					text: string;
@@ -1707,12 +1717,43 @@ export const narratorPersistence = {
 			.where(eq(narratorMessages.id, messageId));
 	},
 
-	async updateConversationId(narratorId: string, apiConversationId: string) {
+	/**
+	 * Persist the upstream conversation id so the next activation can resume the
+	 * API session instead of paying a cold cache miss.
+	 *
+	 * `expectedConversationId` makes this a compare-and-set, which matters because
+	 * a compact clears `apiConversationId` to signal "the history was replaced,
+	 * the next request MUST start a fresh upstream session". A background compact
+	 * settles asynchronously and can land after the turn that started it, so an
+	 * unconditional write here would overwrite that null with the id the session
+	 * was holding in memory. The next activation would then read a non-null id,
+	 * skip the upstream session reset, and send compacted history down a session
+	 * that still carries the pre-compact turns — which the provider answers twice.
+	 *
+	 * Pass the value read when the session was created so the write applies only
+	 * while nothing else has touched the row. Returns whether it applied.
+	 */
+	async updateConversationId(
+		narratorId: string,
+		apiConversationId: string,
+		expectedConversationId?: string | null,
+	): Promise<boolean> {
 		const now = new Date().toISOString();
-		await db
+		const updated = await db
 			.update(narrators)
 			.set({ apiConversationId, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
+			.where(
+				expectedConversationId === undefined
+					? eq(narrators.id, narratorId)
+					: and(
+							eq(narrators.id, narratorId),
+							expectedConversationId === null
+								? isNull(narrators.apiConversationId)
+								: eq(narrators.apiConversationId, expectedConversationId),
+						),
+			)
+			.returning({ id: narrators.id });
+		return updated.length > 0;
 	},
 
 	async updateStats(narratorId: string, costUsd: number) {

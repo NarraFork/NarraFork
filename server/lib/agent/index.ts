@@ -10,6 +10,7 @@ import {
 	type ProviderResolution,
 	resolveProviderAndModel,
 } from "./provider";
+import { stripCitationMarkersForModel } from "./strip-citation-markers";
 import { stripPlanBodyForModel } from "./strip-plan-body";
 import "./tools";
 import { uniquifyDbMessageToolUseIds } from "./tool-use-id-dedup";
@@ -69,11 +70,15 @@ export async function buildHistory(
 	// persisted DB rows keep the full plan for the UI; this only mutates the
 	// in-memory copy passed to the provider adapter.
 	const modelMessages = stripPlanBodyForModel(dbMessages);
+	// Historical rows may still embed provider-internal citation markers. Replaying
+	// them teaches the model the markers are part of its output format, so it keeps
+	// producing them; strip on the in-memory copy only.
+	const cleanedMessages = stripCitationMarkersForModel(modelMessages);
 	// Some providers mint the same tool_use id for every call (e.g. "call_go_0"),
 	// which only breaks once several turns accumulate: the replayed history then
 	// carries duplicate ids and the API rejects the request with 400. Rename the
 	// later collisions in this in-memory copy — DB rows keep the original ids.
-	const uniqueMessages = uniquifyDbMessageToolUseIds(modelMessages, {
+	const uniqueMessages = uniquifyDbMessageToolUseIds(cleanedMessages, {
 		narratorId,
 		provider: resolved.provider,
 		model: resolved.model,
@@ -263,6 +268,7 @@ async function withSummaryRetry<T>(
 	signal: AbortSignal | undefined,
 	model: string,
 	reportSummaryModelErrors = true,
+	onRetryProgress?: () => void,
 ): Promise<T> {
 	const maxRetries = getAuxiliaryMaxRetries();
 	let lastErr: unknown;
@@ -270,6 +276,12 @@ async function withSummaryRetry<T>(
 		if (signal?.aborted) {
 			throw new DOMException("Summary generation aborted", "AbortError");
 		}
+		// Starting an attempt is observable progress. Callers that bound a summary by
+		// INACTIVITY (compact's watchdog) would otherwise see this whole retry chain
+		// as one silent gap: the backoff alone sums to ~126s at the default cap, so
+		// a rate-limited-but-recovering summary can outlast a 5-minute stall window
+		// and be killed while it is actively retrying.
+		onRetryProgress?.();
 		try {
 			return await fn();
 		} catch (err) {
@@ -297,7 +309,11 @@ async function withSummaryRetry<T>(
 					delayMs,
 					error: errMsg,
 				});
+				// Beat on both sides of the sleep: a single backoff can be 15s, and the
+				// next attempt may itself run long before failing.
+				onRetryProgress?.();
 				await new Promise((r) => setTimeout(r, delayMs));
+				onRetryProgress?.();
 				continue;
 			}
 			// Non-provider, non-retryable (or retries exhausted) — broadcast error
@@ -372,6 +388,7 @@ export async function summaryGenerate(
 	maxOutputTokens?: number,
 	reportSummaryModelErrors = true,
 	onReasoningDelta?: GenerateOptions["onReasoningDelta"],
+	onRetryProgress?: () => void,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
 	const generateOptions: GenerateOptions = {
@@ -386,6 +403,7 @@ export async function summaryGenerate(
 		signal,
 		model,
 		reportSummaryModelErrors,
+		onRetryProgress,
 	);
 }
 

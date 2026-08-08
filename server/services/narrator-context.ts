@@ -59,6 +59,16 @@ export type CompactSummaryTextDeltaHandler = (delta: string) => void | Promise<v
  */
 export type CompactSummaryReasoningDeltaHandler = (delta: string) => void | Promise<void>;
 
+/**
+ * Liveness signal for callers that bound a compact by inactivity.
+ *
+ * Deltas alone are not enough: a summary model that returns its whole answer in
+ * one non-streaming response emits no deltas at all, and a cascading compact can
+ * spend minutes per chunk. Both would look stalled. This fires at each chunk
+ * boundary so "slow but advancing" stays distinguishable from "stuck".
+ */
+export type CompactSummaryProgressHandler = () => void;
+
 const TODO_REMINDER_BLOCK_RE = /\n?\s*<todo_reminder>[\s\S]*?<\/todo_reminder>\s*/g;
 
 function stripTodoReminderBlocks(value: unknown): unknown {
@@ -225,6 +235,7 @@ export const narratorContext = {
 		modelOverride?: string,
 		onTextDelta?: CompactSummaryTextDeltaHandler,
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
+		onProgress?: CompactSummaryProgressHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const messages =
 			providedMessages ?? (await narratorService.getModelHistorySinceLastCompact(narratorId));
@@ -305,6 +316,7 @@ export const narratorContext = {
 			modelOverride,
 			onTextDelta,
 			onReasoningDelta,
+			onProgress,
 		);
 	},
 
@@ -321,6 +333,7 @@ export const narratorContext = {
 		modelOverride?: string,
 		onTextDelta?: CompactSummaryTextDeltaHandler,
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
+		onProgress?: CompactSummaryProgressHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		let rollingSummary = initialSummary;
 		let lastContextPercent: number | undefined;
@@ -337,6 +350,7 @@ export const narratorContext = {
 				depth,
 				isLast,
 			});
+			onProgress?.();
 
 			const result = await this._summarizeChunkWithOverflowFallback(
 				narratorId,
@@ -351,8 +365,10 @@ export const narratorContext = {
 				modelOverride,
 				onTextDelta,
 				onReasoningDelta,
+				onProgress,
 			);
 
+			onProgress?.();
 			rollingSummary = result.summary;
 			lastContextPercent = result.contextPercent;
 
@@ -382,6 +398,7 @@ export const narratorContext = {
 		modelOverride?: string,
 		onTextDelta?: CompactSummaryTextDeltaHandler,
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
+		onProgress?: CompactSummaryProgressHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		try {
 			return await this._summarizeChunk(
@@ -396,6 +413,7 @@ export const narratorContext = {
 				modelOverride,
 				onTextDelta,
 				onReasoningDelta,
+				onProgress,
 			);
 		} catch (err) {
 			if (!isCompactContextOverflowError(err) || depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH) {
@@ -431,6 +449,7 @@ export const narratorContext = {
 				modelOverride,
 				onTextDelta,
 				onReasoningDelta,
+				onProgress,
 			);
 		}
 	},
@@ -451,6 +470,7 @@ export const narratorContext = {
 		modelOverride?: string,
 		onTextDelta?: CompactSummaryTextDeltaHandler,
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
+		onProgress?: CompactSummaryProgressHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const previousSummaryPrefix = previousSummary
 			? `[Previous context summary]:\n${previousSummary}\n\n---\n\n`
@@ -545,6 +565,9 @@ export const narratorContext = {
 			if (signal?.aborted) {
 				throw new DOMException("Compact summary aborted", "AbortError");
 			}
+			// Starting an attempt is progress even if the previous one produced
+			// nothing, so an inactivity watchdog must not fire mid-retry.
+			onProgress?.();
 			try {
 				const result = await summaryGenerate(
 					compactUserText,
@@ -559,6 +582,11 @@ export const narratorContext = {
 					undefined,
 					undefined,
 					onReasoningDelta,
+					// summaryGenerate retries transient failures internally with backoff
+					// that sums to minutes. Without this, that entire chain looks like one
+					// silent gap to an inactivity watchdog, which would abort a compact
+					// that is merely being rate-limited and recovering.
+					onProgress,
 				);
 				if (!result.text?.trim()) {
 					throw new Error("Compact summary model returned empty output");

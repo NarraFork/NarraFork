@@ -6,6 +6,7 @@ import {
 	formatLocaleTime,
 } from "@frontend/lib/intl-format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
+import { resolveAssistantTextDisplay, type TextCitation } from "@shared/citations";
 import { hasUsablePlanBody } from "@shared/plan-reference";
 import {
 	resolveLiveBlockIndex,
@@ -503,15 +504,26 @@ function messageBlocks(
 		const block = raw as Record<string, unknown>;
 		const type = String(block.type ?? "unknown");
 		if (type === "text") {
-			const text = typeof block.text === "string" ? block.text : "";
-			if (text.trim()) {
+			const raw = typeof block.text === "string" ? block.text : "";
+			if (raw.trim()) {
+				// Assistant text carries citations; the Pixi path lays it out as
+				// markdown (see pixi-message-layout `shouldRenderMarkdown`), so the
+				// projected form measures and paints like any other link. User text is
+				// left verbatim — a quoted marker is the user's own words.
+				const projected =
+					msg.role === "assistant"
+						? resolveAssistantTextDisplay(
+								raw,
+								Array.isArray(block.citations) ? (block.citations as TextCitation[]) : undefined,
+							)
+						: { display: raw, copyText: null };
 				result.push({
 					type,
-					text,
+					text: projected.display,
 					messageId: msg.id,
 					messageUuid: msg.messageUuid,
 					blockIndex: index,
-					copyText: text,
+					copyText: projected.copyText ?? projected.display,
 				});
 			}
 			continue;

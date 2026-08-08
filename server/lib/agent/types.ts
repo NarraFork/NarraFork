@@ -348,6 +348,8 @@ export type AgentEvent =
 			toolUses: AgentToolUse[];
 			messageId?: string;
 			credentialId?: string;
+			/** Source citations for `text`, when the provider reported any. */
+			citations?: import("@shared/citations").TextCitation[];
 	  }
 	| { type: "stream_text"; text: string; outputIndex?: number }
 	| {
@@ -618,7 +620,16 @@ export type AgentEvent =
 
 /** A fully-streamed content block within an assistant message. */
 export type ContentBlock =
-	| { type: "text"; text: string; outputIndex?: number }
+	| {
+			type: "text";
+			text: string;
+			outputIndex?: number;
+			/**
+			 * Source citations for this text, indexed against `text`.
+			 * Present only when the provider reported sources (native search).
+			 */
+			citations?: import("@shared/citations").TextCitation[];
+	  }
 	| {
 			type: "reasoning";
 			text: string;

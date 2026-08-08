@@ -145,6 +145,17 @@ export interface ActiveNarrator {
 	/** One-shot reset for reusable upstream provider sessions before the next request. */
 	_resetUpstreamSessionOnNextRequest?: boolean;
 	/**
+	 * The persisted `apiConversationId` this session started from, used as the
+	 * compare-and-set baseline when teardown writes the id back.
+	 *
+	 * Teardown must not resurrect an id that a compact deliberately cleared: a
+	 * background compact nulls the column to force a fresh upstream session, and it
+	 * can settle after the turn that started it. Writing unconditionally at that
+	 * point would make the next activation resume a session whose upstream state
+	 * still holds the pre-compact history.
+	 */
+	_persistedConversationId?: string | null;
+	/**
 	 * Latest history compact seq that has completed while this narrator is alive,
 	 * but has not yet been consumed by a rebuilt in-memory agent history.
 	 */
@@ -373,12 +384,21 @@ export const knowledgeInjectionCycleStates = hotSafe<Map<string, KnowledgeInject
 /**
  * Reset reusable upstream provider/session state for the active narrator before
  * its next model request. Returns false when the narrator is not currently active.
+ *
+ * Every caller reaches here right after an operation that cleared the persisted
+ * `apiConversationId` (compact finalize, plan compact, clear-context), so the
+ * teardown CAS baseline is moved to null in step. Without that, teardown would
+ * compare against the pre-compact id, lose the CAS, and never persist the fresh
+ * id — costing the next activation a needless cold upstream session. Claiming the
+ * empty column is safe here precisely because the new id belongs to a session
+ * that has only ever carried post-compact history.
  */
 export function resetActiveUpstreamSession(narratorId: string): boolean {
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return false;
 	active.conversationId = randomUUID();
 	active._resetUpstreamSessionOnNextRequest = true;
+	active._persistedConversationId = null;
 	return true;
 }
 

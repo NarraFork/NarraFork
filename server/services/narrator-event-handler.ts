@@ -1019,6 +1019,7 @@ export async function processEvent(
 					type: "text",
 					text: block.text,
 					outputIndex: block.outputIndex,
+					...(block.citations?.length ? { citations: block.citations } : {}),
 				});
 			} else if (block.type === "reasoning") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
@@ -1204,7 +1205,13 @@ export async function processEvent(
 				// No partial message — fallback to full persistence
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				const content: any[] = [];
-				if (event.text) content.push({ type: "text", text: event.text });
+				if (event.text) {
+					content.push({
+						type: "text",
+						text: event.text,
+						...(event.citations?.length ? { citations: event.citations } : {}),
+					});
+				}
 				for (const tu of event.toolUses) {
 					content.push({
 						type: "tool_use",

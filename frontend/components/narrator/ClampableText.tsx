@@ -1,6 +1,7 @@
 import { Box, Button, Text } from "@mantine/core";
+import { resolveAssistantTextDisplay, type TextCitation } from "@shared/citations";
 import { IconChevronDown, IconChevronUp } from "@tabler/icons-react";
-import { memo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ContentViewer } from "./ContentViewer";
 import { useRenderInteractive, useRenderLod } from "./RenderLodCtx";
@@ -18,10 +19,13 @@ const CLAMP_MIN_CHARS = 600;
  */
 export const ClampableText = memo(function ClampableText({
 	text,
+	citations,
 	blockIndex,
 	streaming,
 }: {
 	text: string;
+	/** Source citations for `text`; projected into display-only Markdown. */
+	citations?: TextCitation[];
 	blockIndex?: number;
 	streaming?: boolean;
 }) {
@@ -36,12 +40,22 @@ export const ClampableText = memo(function ClampableText({
 		setExpanded(false);
 	}
 
-	const clampable = !streaming && lod <= 1 && text.length > CLAMP_MIN_CHARS;
+	// Display gets numbered references (clickable when the source resolved to a
+	// URL); the clipboard keeps the prose the model actually wrote. Historical
+	// rows without structured citations still get their internal markers stripped
+	// here, so no DB migration is needed to stop showing them.
+	const { display, copyText } = useMemo(
+		() => resolveAssistantTextDisplay(text, citations),
+		[text, citations],
+	);
+
+	const clampable = !streaming && lod <= 1 && display.length > CLAMP_MIN_CHARS;
 	const clamped = clampable && !expanded;
 
 	const viewer = (
 		<ContentViewer
-			content={text}
+			content={display}
+			copyText={copyText ?? undefined}
 			markdown
 			contentType="markdown"
 			blockIndex={blockIndex}

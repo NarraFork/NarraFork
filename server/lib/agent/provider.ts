@@ -9,6 +9,7 @@ import type {
 	DbSideCar,
 	DbToolCall,
 	ParsedStreamEvent,
+	ProviderTextCitation,
 	ReasoningProviderMetadata,
 	WebSearchAction,
 import {
@@ -51,6 +52,7 @@ export type {
 	DbSideCar,
 	DbToolCall,
 	ParsedStreamEvent,
+	ProviderTextCitation,
 	ReasoningProviderMetadata,
 	WebSearchAction,
 };
