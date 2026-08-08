@@ -220,7 +220,7 @@ describe("gutter formatting", () => {
 	});
 
 	it("widens the columns for large line numbers and honours the minimum", () => {
-		expect(diffLineNoWidth([{ type: "context", content: "", oldLineNo: 5, newLineNo: 5 }])).toBe(3);
+		expect(diffLineNoWidth([{ type: "context", content: "", oldLineNo: 5, newLineNo: 5 }])).toBe(2);
 		expect(
 			diffLineNoWidth([{ type: "context", content: "", oldLineNo: 12345, newLineNo: 12345 }]),
 		).toBe(5);

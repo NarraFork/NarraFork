@@ -367,7 +367,7 @@ export function diffLineNoWidth(lines: readonly DiffLine[], lineNumberPrefix?: s
 		if (line.oldLineNo != null && line.oldLineNo > maxNo) maxNo = line.oldLineNo;
 		if (line.newLineNo != null && line.newLineNo > maxNo) maxNo = line.newLineNo;
 	}
-	return Math.max(3, `${lineNumberPrefix ?? ""}${maxNo}`.length);
+	return Math.max(2, `${lineNumberPrefix ?? ""}${maxNo}`.length);
 }
 
 /** One right-aligned line-number cell, or blanks when the side has no number. */
