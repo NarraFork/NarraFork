@@ -66,6 +66,38 @@ function clampLineContent(line: string): string {
 	return line.length > MAX_DIFF_LINE_CHARS ? `${line.slice(0, MAX_DIFF_LINE_CHARS)} …` : line;
 }
 
+/**
+ * Public wrapper over the per-line clamp.
+ *
+ * `parse-unified-diff.ts` builds `DiffLine` rows straight from a patch instead of
+ * from two texts, so it needs the SAME per-line ceiling this module applies. A
+ * second clamp implementation there would be a second rule to keep in sync.
+ */
+export function clampDiffLineContent(line: string): string {
+	return clampLineContent(line);
+}
+
+/**
+ * Word-level chunks for one modified line pair, or null when the pair is too
+ * large to diff.
+ *
+ * Extracted so BOTH row producers share one definition of "what changed inside a
+ * modified line": `computeDiff` (two texts) and `parseUnifiedDiff` (a patch).
+ * The word diff is quadratic, hence the `MAX_WORD_DIFF_CHARS` budget over the
+ * combined length — returning null tells the caller to emit plain rows.
+ */
+export function pairWordChanges(
+	removedLine: string,
+	addedLine: string,
+): { removed: DiffWordChange[]; added: DiffWordChange[] } | null {
+	if (removedLine.length + addedLine.length > MAX_WORD_DIFF_CHARS) return null;
+	const chunks = diffWordsWithSpace(removedLine, addedLine);
+	return {
+		removed: chunks.filter((c) => !c.added),
+		added: chunks.filter((c) => !c.removed),
+	};
+}
+
 function splitIntoLines(value: string): string[] {
 	if (!value) return [];
 	const lines = value.split("\n");
@@ -165,13 +197,12 @@ export function computeDiff(oldStr: string, newStr: string, startLine = 1): Diff
 				for (let j = 0; j < maxPaired; j++) {
 					const removedLine = removedLines[j] ?? "";
 					const addedLine = addedLines[j] ?? "";
-					const shouldWordDiff = removedLine.length + addedLine.length <= MAX_WORD_DIFF_CHARS;
-					const wc = shouldWordDiff ? diffWordsWithSpace(removedLine, addedLine) : null;
+					const wc = pairWordChanges(removedLine, addedLine);
 					if (
 						!appendLine({
 							type: "removed",
 							content: removedLine,
-							wordChanges: wc?.filter((c) => !c.added),
+							wordChanges: wc?.removed,
 							oldLineNo: oldLine,
 						})
 					) {
@@ -182,7 +213,7 @@ export function computeDiff(oldStr: string, newStr: string, startLine = 1): Diff
 						!appendLine({
 							type: "added",
 							content: addedLine,
-							wordChanges: wc?.filter((c) => !c.removed),
+							wordChanges: wc?.added,
 							newLineNo: newLine,
 						})
 					) {

@@ -22,9 +22,19 @@ export { computeDiff, normalizeDiffLineEndings } from "@shared/pretext-layout/di
 
 // --- Types ---
 
+/**
+ * Two mutually exclusive input modes:
+ *
+ *   - SELF-COMPUTED: pass `oldStr`/`newStr` and the diff is derived here.
+ *   - PRE-COMPUTED: pass `lines` when the rows already exist. The git panel uses
+ *     this, because a patch's diff is computed by git and its `@@` headers carry
+ *     real file line numbers that reconstructing two texts would destroy.
+ */
 interface DiffViewProps {
-	oldStr: string;
-	newStr: string;
+	oldStr?: string;
+	newStr?: string;
+	/** Pre-computed rows. When present, `oldStr`/`newStr` are ignored. */
+	lines?: readonly DiffLine[];
 	/** Max height in px. When undefined, uses flex to fill parent. */
 	maxHeight?: number;
 	/** Enable word-wrap. Defaults to false (horizontal scroll). */
@@ -98,7 +108,7 @@ const gutterStyle = {
 type TokenMap = Map<string, ThemedToken[]>;
 
 function useTokenMap(
-	lines: DiffLine[],
+	lines: readonly DiffLine[],
 	language: string | undefined,
 	theme: string,
 ): TokenMap | null {
@@ -275,6 +285,7 @@ const DiffLineRow = memo(function DiffLineRow({
 export const DiffView = memo(function DiffView({
 	oldStr,
 	newStr,
+	lines: providedLines,
 	maxHeight,
 	wordWrap,
 	language,
@@ -287,10 +298,18 @@ export const DiffView = memo(function DiffView({
 	const isDark = computedScheme === "dark";
 	const theme = isDark ? "github-dark-default" : "github-light-default";
 	const diffStyles = getDiffStyles(isDark);
-	const lines = useMemo(() => computeDiff(oldStr, newStr, startLine), [oldStr, newStr, startLine]);
+	const lines = useMemo(
+		() => providedLines ?? computeDiff(oldStr ?? "", newStr ?? "", startLine),
+		[providedLines, oldStr, newStr, startLine],
+	);
 	const tokenMap = useTokenMap(lines, language, theme);
+	// Pre-computed rows carry their own numbers (a patch's `@@` headers) without
+	// passing `startLine`, so the gutter must also switch on their presence.
 	const lineNoWidth = useMemo(
-		() => (startLine == null ? undefined : diffLineNoWidth(lines, lineNumberPrefix)),
+		() =>
+			startLine == null && !lines.some((l) => l.oldLineNo != null || l.newLineNo != null)
+				? undefined
+				: diffLineNoWidth(lines, lineNumberPrefix),
 		[startLine, lineNumberPrefix, lines],
 	);
 
@@ -350,7 +369,7 @@ export const DiffView = memo(function DiffView({
 			<AutoFollowScroll
 				asChild
 				followKey={autoFollowKey}
-				deps={[oldStr, newStr, tokenMap]}
+				deps={[oldStr, newStr, providedLines, tokenMap]}
 				followTo={autoFollowTarget === "latest-added" ? scrollToDiffTarget : undefined}
 			>
 				<Box style={style}>{content}</Box>

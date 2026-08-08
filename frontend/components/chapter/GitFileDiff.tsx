@@ -1,4 +1,8 @@
-import { Code, Loader, Modal, ScrollArea, Text } from "@mantine/core";
+import { DiffView } from "@frontend/components/narrator/DiffView";
+import { getShikiLang } from "@frontend/lib/shiki-lang";
+import { Loader, Modal, ScrollArea, Text } from "@mantine/core";
+import { parseUnifiedDiff } from "@shared/pretext-layout/parse-unified-diff";
+import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useGitDiff } from "../../hooks/useGit";
 
@@ -9,16 +13,20 @@ interface GitFileDiffProps {
 	onClose: () => void;
 }
 
-const MAX_RENDERED_DIFF_CHARS = 160_000;
-
 export function GitFileDiff({ chapterId, file, staged = false, onClose }: GitFileDiffProps) {
 	const { t } = useTranslation("git");
 	const { data, isLoading } = useGitDiff(chapterId, file, staged);
-	const renderedDiff =
-		data?.diff && data.diff.length > MAX_RENDERED_DIFF_CHARS
-			? data.diff.slice(0, MAX_RENDERED_DIFF_CHARS)
-			: data?.diff;
-	const diffDisplayTruncated = !!data?.truncated || !!(data?.diff && data.diff !== renderedDiff);
+
+	// Git already computed this diff, so the rows are parsed from the patch rather
+	// than recomputed from two texts. That keeps the real file line numbers the
+	// `@@` headers carry, and lets the shared renderer supply highlighting, the
+	// added/removed tint and word-level marking that the old plain <Code> block
+	// could not.
+	const parsed = useMemo(() => (data?.diff ? parseUnifiedDiff(data.diff) : null), [data?.diff]);
+
+	// Server-side byte cap and the row cap are both truncation the reader should
+	// know about.
+	const showTruncated = !!data?.truncated || !!parsed?.truncated;
 
 	return (
 		<Modal opened={!!file} onClose={onClose} title={file ? t("diffTitle", { file }) : ""} size="xl">
@@ -30,16 +38,24 @@ export function GitFileDiff({ chapterId, file, staged = false, onClose }: GitFil
 				</Text>
 			)}
 
-			{!isLoading && renderedDiff && (
+			{!isLoading && parsed?.binary && (
+				<Text size="sm" c="dimmed">
+					{t("diffBinary")}
+				</Text>
+			)}
+
+			{!isLoading && parsed && !parsed.binary && parsed.lines.length > 0 && (
 				<ScrollArea.Autosize mah={500}>
-					{diffDisplayTruncated && (
+					{showTruncated && (
 						<Text size="xs" c="yellow" mb="xs">
 							{t("diffTruncated")}
 						</Text>
 					)}
-					<Code block style={{ whiteSpace: "pre", fontSize: 12, lineHeight: 1.5 }}>
-						{renderedDiff}
-					</Code>
+					<DiffView
+						lines={parsed.lines}
+						language={file ? getShikiLang(file) : undefined}
+						maxHeight={500}
+					/>
 				</ScrollArea.Autosize>
 			)}
 		</Modal>
