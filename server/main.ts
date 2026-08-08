@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, rmSync } from "node:fs";
-import { extname, resolve } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 
 import { eq } from "drizzle-orm";
 
@@ -362,9 +362,20 @@ if (isProd) {
 		}
 	}
 
-	// Fallback: serve from filesystem (bundle mode or bun run start)
+	// Fallback: serve from filesystem (bundle mode or bun run start).
+	// Compiled single-executable binaries resolve import.meta.dir inside the
+	// virtual $bunfs tree, so also consider real directories next to the exe
+	// (dist/frontend beside the binary, or a flat frontend/ folder) — this lets
+	// a build ship the UI as deployable assets instead of embedding it.
 	if (!hasEmbedded) {
-		const staticDir = resolve(import.meta.dir, "..", "dist", "frontend");
+		const embeddedRelativeDir = resolve(import.meta.dir, "..", "dist", "frontend");
+		const exeDir = isCompiledBinary ? dirname(process.execPath) : undefined;
+		const staticCandidates = [
+			embeddedRelativeDir,
+			...(exeDir ? [join(exeDir, "dist", "frontend"), join(exeDir, "frontend")] : []),
+		];
+		const staticDir =
+			staticCandidates.find((dir) => existsSync(join(dir, "index.html"))) ?? staticCandidates[0];
 		logger.info(
 			`Static file serving: filesystem mode, dir=${staticDir}, exists=${existsSync(staticDir)}`,
 		);
