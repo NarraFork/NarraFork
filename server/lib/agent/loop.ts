@@ -3205,6 +3205,23 @@ export async function* agentLoop(
 				}
 			}
 
+			/**
+			 * Partial flush for every abort / error path.
+			 *
+			 * `flushPartialContent` persists the RAW accumulated text, which already
+			 * contains any bytes the stream parser is still holding as a possible
+			 * opener prefix. Without releasing that buffer first, the live streaming
+			 * view would end up to 6 characters SHORTER than the block that is being
+			 * persisted in the same tick. Codex has the same requirement and solves it
+			 * the same way: `finish()` runs before the item is finalized, and a partial
+			 * opener that never completed is emitted as ordinary visible text
+			 * (fail open) rather than deleted.
+			 */
+			function* flushPartialWithCitationTail(): Generator<AgentEvent> {
+				yield* finishCitationDeltaStreams();
+				yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex, undefined);
+			}
+
 			chatRetryLoop: for (;;) {
 				// Reset per-attempt accumulators so a retry starts with a clean slate.
 				// (On the first attempt these are already empty; on retries they may
@@ -4199,7 +4216,7 @@ export async function* agentLoop(
 							}
 							const classification = classifyInvalidState(reason, message, requestDiagnostics);
 							if (classification.category === "context_overflow") {
-								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* flushPartialWithCitationTail();
 								yield* finishRequest(message);
 								yield { type: "context_length_exceeded", message };
 								return;
@@ -4233,7 +4250,7 @@ export async function* agentLoop(
 									isModelUnavailableError({ message, diagnostics: requestDiagnostics }) &&
 									!hasStartedEarlyToolExecution()
 								) {
-									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+									yield* flushPartialWithCitationTail();
 									yield* finishRequest(message);
 									const prefixToken = `${nugProvider.prefix}:`;
 									const nugModelId = effectiveModel.startsWith(prefixToken)
@@ -4376,7 +4393,7 @@ export async function* agentLoop(
 									// Retry budget spent (or a stateful provider that cannot replay the
 									// request): fall back to a textual continuation rather than failing.
 								}
-								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* flushPartialWithCitationTail();
 								yield* finishRequest(message);
 								yield { type: "resumable_error", message, diagnostics: requestDiagnostics };
 								return;
@@ -4391,7 +4408,7 @@ export async function* agentLoop(
 										toolCount: toolUses.length,
 										startedToolCount: earlyExecMap.size,
 									});
-									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+									yield* flushPartialWithCitationTail();
 									yield* drainStartedEarlyToolResults();
 									yield* finishRequest(message);
 									yield {
@@ -4443,7 +4460,7 @@ export async function* agentLoop(
 								}
 								// Exhausted retries — yield block_complete for partial content
 								// then signal retryable_error to the caller.
-								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* flushPartialWithCitationTail();
 								yield* finishRequest(message);
 								yield { type: "retryable_error", message, diagnostics: requestDiagnostics };
 								return;
@@ -4454,7 +4471,7 @@ export async function* agentLoop(
 							// downstream empty-response check (which would retry and eventually
 							// report a misleading "Provider returned an empty response" message).
 							sawErrorEvent = true;
-							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+							yield* flushPartialWithCitationTail();
 							yield* finishRequest(message);
 							yield {
 								type: "invalid_state",
@@ -4477,7 +4494,7 @@ export async function* agentLoop(
 						// Do not await still-running eager tools beyond the bounded abort drain. Their
 						// execution cleanup is handled by the tool executor.
 						// Even on abort, yield block_complete for accumulated content so it can be persisted
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest("Aborted");
 						yield { type: "error", message: "Aborted" };
 						return;
@@ -4554,7 +4571,7 @@ export async function* agentLoop(
 							toolCount: toolUses.length,
 							startedToolCount: earlyExecMap.size,
 						});
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* drainStartedEarlyToolResults();
 						yield* finishRequest(message);
 						yield {
@@ -4583,7 +4600,7 @@ export async function* agentLoop(
 					);
 					const paymentRequired = nugProvider ? getPaymentRequiredErrorInfo(err) : null;
 					if (paymentRequired) {
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						yield {
 							type: "payment_required",
@@ -4605,7 +4622,7 @@ export async function* agentLoop(
 					// poller, instead of retrying the full request (with its whole history)
 					// over and over. Only for NUG providers.
 					if (nugProvider && isModelUnavailableError(err)) {
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						// `effectiveModel` is `${prefix}:${channel:bareModel}`; strip the
 						// provider prefix to recover the gateway model id (`channel:bareModel`)
@@ -4633,7 +4650,7 @@ export async function* agentLoop(
 						(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
 					) {
 						// Persist partial content before signalling overflow
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						yield { type: "context_length_exceeded", message: msg };
 						return;
@@ -4641,7 +4658,7 @@ export async function* agentLoop(
 					// Detect context overflow errors from OpenAI/Codex-compatible providers.
 					// Treat as context_length_exceeded so caller can prune/compact+retry.
 					if (isContextWindowExceededError(err)) {
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						yield { type: "context_length_exceeded", message: msg };
 						return;
@@ -4754,7 +4771,7 @@ export async function* agentLoop(
 							// Retry budget spent (or a stateful provider that cannot replay the
 							// request): fall back to a textual continuation rather than failing.
 						}
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						yield { type: "resumable_error", message: msg, diagnostics: requestDiagnostics };
 						return;
@@ -4801,13 +4818,13 @@ export async function* agentLoop(
 							}
 						}
 						// Exhausted retries — persist partial content and signal caller
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* flushPartialWithCitationTail();
 						yield* finishRequest(msg);
 						yield { type: "retryable_error", message: msg, diagnostics: requestDiagnostics };
 						return;
 					}
 					// Non-retryable error — persist partial content and signal caller
-					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+					yield* flushPartialWithCitationTail();
 					yield* finishRequest(msg);
 					yield { type: "error", message: msg, diagnostics: requestDiagnostics };
 					return;

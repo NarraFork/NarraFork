@@ -23,6 +23,7 @@ type Scenario =
 	| "annotations_and_marker"
 	| "two_items_annotation"
 	| "item_boundary"
+	| "abort_mid_prefix"
 	| "plain"
 	| "marker_then_tool";
 
@@ -92,6 +93,13 @@ const testProvider: ProviderAdapter = {
 				],
 			};
 			yield { textItemDone: true, textOutputIndex: 1 };
+			return;
+		}
+		if (scenario === "abort_mid_prefix") {
+			// Prose whose tail is an opener PREFIX, then the stream dies. The parser is
+			// still withholding those bytes when the abort path runs.
+			yield { text: `结论已经确认${PUA_START}ci` };
+			yield { invalidState: { reason: "stream_closed", message: "connection lost" } };
 			return;
 		}
 		if (scenario === "item_boundary") {
@@ -220,6 +228,23 @@ describe("inline marker stripping", () => {
 				expect(text).not.toContain("cite");
 			}
 		}
+	});
+
+	/**
+	 * An abort path persists the RAW accumulated text, so it must first release
+	 * whatever the stream parser is still holding as a possible opener prefix.
+	 * Otherwise the live view ends up shorter than the block persisted in the same
+	 * tick, and the difference reappears on reload.
+	 */
+	test("abort releases the withheld opener prefix before persisting", async () => {
+		const events = await runTurn("abort_mid_prefix");
+
+		const block = textBlocks(events)[0];
+		expect(block).toBeDefined();
+		// Fail open: an opener that never completed stays visible, matching Codex.
+		expect(block.text).toBe(`结论已经确认${PUA_START}ci`);
+		// The stream must carry exactly what was persisted — no silent shortfall.
+		expect(streamedText(events)).toBe(block.text);
 	});
 
 	test("finishes each output item before the next item streams", async () => {
