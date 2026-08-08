@@ -998,6 +998,7 @@ async function createNarrator(
 		narratorId,
 		conversationId: effectiveConversationId ?? randomUUID(),
 		_resetUpstreamSessionOnNextRequest: effectiveConversationId == null,
+		_persistedConversationId: effectiveConversationId ?? null,
 		cwd: narratorCwd,
 		_modelRef: narratorModelRef,
 		_settingsRevision: getSettingsRevision(),
@@ -1406,6 +1407,50 @@ async function maybeStartSpecContinuation(
 	});
 	active._continuationTurn = "task";
 	return prompt;
+}
+
+/**
+ * Write the session's upstream conversation id back to the DB, but only while the
+ * row still holds the id this session started from.
+ *
+ * The guard exists because `apiConversationId = null` is a compact's way of saying
+ * "the history was replaced; the next request must open a fresh upstream session".
+ * Background compacts are fire-and-forget and routinely settle around a turn
+ * boundary, so a plain write at teardown — on a turn that ended with no error at
+ * all — could reinstate the stale id and make the next activation resume a session
+ * whose upstream state still contains the pre-compact conversation.
+ *
+ * Losing the CAS is the correct outcome, not a failure: it means someone
+ * deliberately moved the row, so we leave their value alone.
+ */
+function persistConversationIdIfUnchanged(
+	narratorId: string,
+	active: ActiveNarrator,
+	context?: string,
+): void {
+	const expected = active._persistedConversationId ?? null;
+	const next = active.conversationId;
+	// Nothing to write: the row already holds exactly this id.
+	if (expected === next) return;
+	narratorService
+		.updateConversationId(narratorId, next, expected)
+		.then((applied) => {
+			if (applied) {
+				active._persistedConversationId = next;
+				return;
+			}
+			logger.debug("Skipped conversationId write: row moved since session start", {
+				narratorId,
+				...(context ? { context } : {}),
+			});
+		})
+		.catch((err) => {
+			logger.error("Failed to persist conversationId", {
+				narratorId,
+				...(context ? { context } : {}),
+				error: String(err),
+			});
+		});
 }
 
 /**
@@ -3161,6 +3206,11 @@ export async function runAgentLoop(
 				if (overflow.action === "retry_compacted") {
 					active.conversationId = overflow.newConversationId;
 					active._resetUpstreamSessionOnNextRequest = true;
+					// Whichever compact this rode on already nulled the persisted id, so
+					// move the teardown CAS baseline with it — otherwise the baseline
+					// still names the pre-compact session, the CAS loses, and this fresh
+					// id is never persisted (costing the next activation a cold session).
+					active._persistedConversationId = null;
 					transientRetries = 0;
 					continue;
 				}
@@ -4093,12 +4143,14 @@ export async function runAgentLoop(
 		}
 		// Persist conversationId so the next activation can resume the API session
 		// (avoids cache miss from generating a new random UUID every time).
-		narratorService.updateConversationId(narratorId, active.conversationId).catch((err) => {
-			logger.error("Failed to persist conversationId", {
-				narratorId,
-				error: String(err),
-			});
-		});
+		//
+		// Compare-and-set against the id this session started from. A compact clears
+		// the column to demand a fresh upstream session on the next request, and a
+		// background compact can land after the turn that started it — including on a
+		// turn that ended perfectly normally. An unconditional write would undo that
+		// signal, and the next activation would resume a session still holding the
+		// pre-compact history alongside the compacted one.
+		persistConversationIdIfUnchanged(narratorId, active);
 		active._preparedPlanModes?.clear();
 		activeNarrators.delete(narratorId);
 		planModeAskedOnce.delete(narratorId);
@@ -5164,12 +5216,7 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 	if (active._worktreePath) {
 		worktreeWatcher.unwatch(active._worktreePath, narratorId);
 	}
-	narratorService.updateConversationId(narratorId, active.conversationId).catch((err) => {
-		logger.error("Failed to persist conversationId for inactive narrator session", {
-			narratorId,
-			error: String(err),
-		});
-	});
+	persistConversationIdIfUnchanged(narratorId, active, "inactive narrator session");
 	active._preparedPlanModes?.clear();
 	activeNarrators.delete(narratorId);
 	planModeAskedOnce.delete(narratorId);

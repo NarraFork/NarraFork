@@ -25,9 +25,47 @@ import {
 	resetActiveUpstreamSession,
 } from "./narrator-session-state";
 
-/** Compact operation timeout in milliseconds (5 minutes). */
-const COMPACT_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * How long a compact may make NO observable progress before it is aborted.
+ *
+ * This is a stall timer, not a total-duration budget. A large context is
+ * summarized by cascading over several chunks, so a healthy compact can legitimately
+ * run far longer than any single request; capping total duration killed those.
+ */
+const COMPACT_STALL_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Absolute ceiling as a backstop against a compact that trickles forever (each
+ * chunk resets the stall timer, so progress alone cannot bound total runtime).
+ */
+const COMPACT_MAX_TOTAL_MS = 30 * 60 * 1000;
+/**
+ * How long we wait, after the watchdog aborted a run, for that run to actually
+ * settle before flagging it as stuck.
+ *
+ * Aborting instead of racing means the lock is held until `doRunCustomCompact`
+ * returns. That is the point — it prevents a second `[Compacting]` marker — but
+ * it also means a provider that ignores its AbortSignal keeps the lock forever
+ * and silently disables every later compact for that narrator. This timer cannot
+ * fix that, so it makes it loud instead of invisible.
+ */
+const COMPACT_ABORT_GRACE_MS = 60 * 1000;
 const COMPACT_PROGRESS_THROTTLE_MS = 120;
+
+/**
+ * Watchdog timing overrides for tests.
+ *
+ * The production windows are minutes long, so the only way to exercise what a
+ * timeout DOES — keep the marker, record the reason, error a blocking run — is to
+ * shorten them. Kept here rather than threaded through every call site, since the
+ * timings are an internal policy of `runCustomCompact` / `runSegmentCompact`.
+ */
+let compactWatchdogTimingOverrides: { stallMs?: number; maxTotalMs?: number } | null = null;
+
+export function __setCompactWatchdogTimingsForTests(
+	overrides: { stallMs?: number; maxTotalMs?: number } | null,
+): void {
+	compactWatchdogTimingOverrides = overrides;
+}
 const COMPACT_FAILURE_TEXT = "[Compact Failed]";
 const COMPACTING_SUBSTATUS = "compacting";
 const BACKGROUND_COMPACTING_SUBSTATUS = "background_compacting";
@@ -36,6 +74,159 @@ interface CompactProgressReporter {
 	onTextDelta: (delta: string) => void;
 	onReasoningDelta: (delta: string) => void;
 	finish: () => void;
+}
+
+/**
+ * Human-readable duration for a timeout reason.
+ *
+ * The reason string is persisted on the failed marker and shown to the user, so
+ * rounding minutes would print "0 minute ceiling" for any sub-minute window
+ * (which the tests use).
+ */
+function formatDuration(ms: number): string {
+	if (ms < 1_000) return `${ms}ms`;
+	if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+	const minutes = ms / 60_000;
+	const rendered = Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1);
+	return `${rendered} minutes`;
+}
+
+export interface CompactWatchdog {
+	/** Record observable progress and restart the stall window. */
+	beat: () => void;
+	/** Stop every timer, including the post-abort grace timer. Idempotent. */
+	stop: () => void;
+	/** The reason this compact was aborted by the watchdog, or null if it wasn't. */
+	firedReason: () => string | null;
+}
+
+/**
+ * Hooks a compact run exposes to its watchdog.
+ *
+ * Bundled rather than passed as two more parameters, so a run's liveness and its
+ * timeout classification always travel together.
+ */
+export interface CompactRunHooks {
+	/** Liveness signal — resets the stall window. */
+	beat?: () => void;
+	/**
+	 * Non-null once the watchdog aborted this run, and only then.
+	 *
+	 * The run reads this to tell a watchdog timeout apart from a user cancellation:
+	 * both arrive as an `AbortError`, but a timeout must surface as a FAILED
+	 * compact (marker kept, reason recorded, blocking runs marked errored) rather
+	 * than the silent rollback a deliberate cancel gets. A caller-initiated cancel
+	 * takes precedence, so this returns null whenever the caller's own signal
+	 * aborted.
+	 */
+	timeoutReason?: () => string | null;
+}
+
+/**
+ * Bound a compact by INACTIVITY rather than total duration, and make the bound
+ * effective by aborting the underlying summary request.
+ *
+ * Two failure modes motivated this. A `Promise.race` against a total-duration
+ * timer released the per-narrator lock while `doRunCustomCompact` kept running:
+ * the still-live compact held its `[Compacting]` marker and `compacting`
+ * substatus, and the freed lock let the next trigger insert a SECOND marker, so
+ * two "compacting" rows sat side by side and neither shrank the context. And
+ * because the budget covered the whole cascade, a healthy multi-chunk compact of
+ * a large context was killed for taking longer than one request should.
+ *
+ * So: every chunk/delta resets the stall window, the abort actually cancels the
+ * upstream request, and the caller keeps awaiting the aborted run so the lock is
+ * released only after the compact has really settled. `COMPACT_MAX_TOTAL_MS`
+ * remains as a backstop, since progress alone cannot bound total runtime.
+ *
+ * Holding the lock until the aborted run settles is the trade this design makes,
+ * and it has a failure mode of its own: a provider that ignores its AbortSignal
+ * would hold the lock forever and quietly disable compaction for that narrator.
+ * `stop()` is expected within `COMPACT_ABORT_GRACE_MS` of firing; missing that
+ * deadline is logged at error level so the stall is observable rather than a
+ * narrator that mysteriously stops compacting.
+ */
+export function createCompactWatchdog(options: {
+	narratorId: string;
+	onTimeout: (reason: string) => void;
+	stallMs?: number;
+	maxTotalMs?: number;
+	/** How long the aborted run may take to settle before it is logged as stuck. */
+	abortGraceMs?: number;
+	/** Test seam for the stuck-after-abort report (defaults to an error log). */
+	onAbortNotSettled?: (info: { narratorId: string; reason: string; graceMs: number }) => void;
+}): CompactWatchdog {
+	const stallMs = options.stallMs ?? COMPACT_STALL_TIMEOUT_MS;
+	const maxTotalMs = options.maxTotalMs ?? COMPACT_MAX_TOTAL_MS;
+	const abortGraceMs = options.abortGraceMs ?? COMPACT_ABORT_GRACE_MS;
+	let stallTimer: ReturnType<typeof setTimeout> | undefined;
+	let totalTimer: ReturnType<typeof setTimeout> | undefined;
+	let graceTimer: ReturnType<typeof setTimeout> | undefined;
+	let firedReason: string | null = null;
+	let stopped = false;
+
+	const clearTimers = () => {
+		if (stallTimer !== undefined) clearTimeout(stallTimer);
+		if (totalTimer !== undefined) clearTimeout(totalTimer);
+		stallTimer = undefined;
+		totalTimer = undefined;
+	};
+
+	const fire = (reason: string) => {
+		if (stopped || firedReason) return;
+		firedReason = reason;
+		clearTimers();
+		logger.warn("Compact watchdog aborting stalled compact", {
+			narratorId: options.narratorId,
+			reason,
+		});
+		// The lock stays held until the aborted run settles. If it never does, the
+		// narrator silently loses compaction, so make that state visible.
+		graceTimer = setTimeout(() => {
+			graceTimer = undefined;
+			if (stopped) return;
+			if (options.onAbortNotSettled) {
+				options.onAbortNotSettled({
+					narratorId: options.narratorId,
+					reason,
+					graceMs: abortGraceMs,
+				});
+				return;
+			}
+			logger.error("Compact did not settle after watchdog abort; compact lock is still held", {
+				narratorId: options.narratorId,
+				reason,
+				graceMs: abortGraceMs,
+			});
+		}, abortGraceMs);
+		options.onTimeout(reason);
+	};
+
+	const armStall = () => {
+		if (stopped || firedReason) return;
+		if (stallTimer !== undefined) clearTimeout(stallTimer);
+		stallTimer = setTimeout(
+			() => fire(`Compact made no progress for ${formatDuration(stallMs)}`),
+			stallMs,
+		);
+	};
+
+	armStall();
+	totalTimer = setTimeout(
+		() => fire(`Compact exceeded the ${formatDuration(maxTotalMs)} ceiling`),
+		maxTotalMs,
+	);
+
+	return {
+		beat: armStall,
+		stop: () => {
+			stopped = true;
+			clearTimers();
+			if (graceTimer !== undefined) clearTimeout(graceTimer);
+			graceTimer = undefined;
+		},
+		firedReason: () => firedReason,
+	};
 }
 
 /**
@@ -56,6 +247,13 @@ export function createCompactProgressReporter(options: {
 	messageId: string;
 	mode: CompactMode;
 	isSegment?: boolean;
+	/**
+	 * Called on every non-empty delta, BEFORE throttling. The stall watchdog uses
+	 * this as its liveness signal, so it must not be tied to the throttled
+	 * broadcast: a compact that streams slower than the throttle window is still
+	 * making progress.
+	 */
+	onActivity?: () => void;
 }): CompactProgressReporter {
 	const reporter = createThrottledProgressReporter((snapshot) => {
 		broadcastToNarrator(options.narratorId, {
@@ -69,9 +267,23 @@ export function createCompactProgressReporter(options: {
 			...(options.isSegment ? { isSegment: true } : {}),
 		});
 	}, COMPACT_PROGRESS_THROTTLE_MS);
+	const onActivity = options.onActivity;
+	if (!onActivity) {
+		return {
+			onTextDelta: reporter.addOutput,
+			onReasoningDelta: reporter.addThinking,
+			finish: reporter.finish,
+		};
+	}
 	return {
-		onTextDelta: reporter.addOutput,
-		onReasoningDelta: reporter.addThinking,
+		onTextDelta: (delta) => {
+			if (delta) onActivity();
+			reporter.addOutput(delta);
+		},
+		onReasoningDelta: (delta) => {
+			if (delta) onActivity();
+			reporter.addThinking(delta);
+		},
 		finish: reporter.finish,
 	};
 }
@@ -236,6 +448,20 @@ function compactAbortError(): DOMException {
 	return new DOMException("Aborted", "AbortError");
 }
 
+/**
+ * A compact the watchdog aborted for inactivity (or for exceeding the ceiling).
+ *
+ * Distinct from an `AbortError` on purpose: callers treat `AbortError` as "the
+ * user cancelled" and stay quiet, whereas a timeout is a real failure they should
+ * log and, for blocking runs, surface.
+ */
+export class CompactTimeoutError extends Error {
+	constructor(reason: string) {
+		super(reason);
+		this.name = "CompactTimeoutError";
+	}
+}
+
 function waitForCompactPromise<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 	if (!signal) return promise;
 	if (signal.aborted) return Promise.reject(compactAbortError());
@@ -249,8 +475,12 @@ function waitForCompactPromise<T>(promise: Promise<T>, signal?: AbortSignal): Pr
 /**
  * Await any in-progress compact for this narrator to settle. A compact can hand
  * off to a follow-up lock (e.g. history_probe → history), so re-check after each
- * settles. Each underlying compact promise is bounded by its own 5-minute
- * timeout; the small iteration cap guards against unexpected relock churn.
+ * settles; the small iteration cap guards against unexpected relock churn.
+ *
+ * Each underlying compact is bounded by its watchdog: `COMPACT_STALL_TIMEOUT_MS`
+ * without observable progress, or `COMPACT_MAX_TOTAL_MS` overall. A healthy
+ * multi-chunk compact keeps beating, so this wait can legitimately last up to the
+ * ceiling — pass a `signal` if the caller cannot afford to wait that long.
  * Rejections (cancel/failure) are swallowed unless the caller aborts its wait.
  */
 export async function awaitCompactCompletion(
@@ -284,11 +514,17 @@ function isCompactAbortError(err: unknown): boolean {
  * clearing the transient substatus) is performed by `doRunCustomCompact`'s
  * abort branch once the aborted request rejects.
  *
+ * Segment compacts are deliberately excluded even though they now carry an
+ * AbortController (their watchdog needs one). This endpoint is the context
+ * marker's cancel affordance, and the UI offers no cancel on segment markers —
+ * their rollback path is a `[Segment Compact Failed]` row, not a silent removal.
+ *
  * Returns true if a cancellable compact was found and aborted, false otherwise.
  */
 export function cancelCompact(narratorId: string): boolean {
 	const lock = compactLocks.get(narratorId);
 	if (!lock?.abortController) return false;
+	if (lock.kind === "segment") return false;
 	if (lock.abortController.signal.aborted) return true;
 	logger.info("Cancelling in-progress compact", { narratorId, kind: lock.kind });
 	lock.abortController.abort();
@@ -457,28 +693,47 @@ export async function runCustomCompact(
 	const abortController = new AbortController();
 	const abortFromCaller = () => abortController.abort();
 	callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
-	let compactTimer: ReturnType<typeof setTimeout>;
-	const compactPromise: Promise<CompactLockResult> = Promise.race([
-		doRunCustomCompact(
-			narratorId,
-			locale,
-			beforeMessageId,
-			mode,
-			abortController.signal,
-			appendHint,
-			options,
-		).then((compacted) => ({
-			kind: "history" as const,
-			compacted,
-			mode: currentHistoryCompactMode(narratorId, mode),
-		})),
-		new Promise<CompactLockResult>((_, reject) => {
-			compactTimer = setTimeout(
-				() => reject(new Error("Compact operation timed out after 5 minutes")),
-				COMPACT_TIMEOUT_MS,
-			);
-		}),
-	]);
+	// The watchdog aborts the run instead of racing it. Racing a timer released
+	// this lock while the compact kept running, so its `[Compacting]` marker and
+	// `compacting` substatus stayed live and the freed lock let the next trigger
+	// insert a second marker over the same stale context.
+	const watchdog = createCompactWatchdog({
+		narratorId,
+		onTimeout: () => abortController.abort(),
+		...(compactWatchdogTimingOverrides ?? {}),
+	});
+	// A caller-initiated cancel wins: the user asked for the silent rollback, so it
+	// keeps that path even if the watchdog happens to fire in the same tick.
+	const timeoutReason = () => (callerSignal?.aborted ? null : watchdog.firedReason());
+	const compactPromise: Promise<CompactLockResult> = doRunCustomCompact({
+		narratorId,
+		locale,
+		beforeMessageId,
+		mode,
+		signal: abortController.signal,
+		...(appendHint !== undefined ? { appendHint } : {}),
+		...(options !== undefined ? { options } : {}),
+		hooks: { beat: watchdog.beat, timeoutReason },
+	}).then(
+		(compacted) => {
+			watchdog.stop();
+			return {
+				kind: "history" as const,
+				compacted,
+				mode: currentHistoryCompactMode(narratorId, mode),
+			};
+		},
+		(err) => {
+			watchdog.stop();
+			// A watchdog abort surfaces as an AbortError, which every caller reads as
+			// "the user cancelled". Re-label it so timeouts stay distinguishable from
+			// cancellation for waiters and logs; the run itself already recorded the
+			// timeout as a compact FAILURE via `timeoutReason`.
+			const reason = timeoutReason();
+			if (reason && isCompactAbortError(err)) throw new CompactTimeoutError(reason);
+			throw err;
+		},
+	);
 	const compactLock: CompactLock = {
 		kind: "history",
 		promise: compactPromise,
@@ -497,8 +752,7 @@ export async function runCustomCompact(
 		throw err;
 	} finally {
 		callerSignal?.removeEventListener("abort", abortFromCaller);
-		// biome-ignore lint/style/noNonNullAssertion: timer is always assigned before race settles
-		clearTimeout(compactTimer!);
+		watchdog.stop();
 		if (compactLocks.get(narratorId) === compactLock) {
 			compactLocks.delete(narratorId);
 		}
@@ -572,15 +826,29 @@ export async function retryFailedCompact(
 	}
 }
 
-async function doRunCustomCompact(
-	narratorId: string,
-	locale: Locale,
-	beforeMessageId: string | undefined,
-	mode: CompactMode,
-	signal?: AbortSignal,
-	appendHint?: string,
-	options?: CustomCompactOptions,
-): Promise<boolean> {
+/** Everything one history-compact run needs. Named to keep call sites readable. */
+interface DoRunCustomCompactArgs {
+	narratorId: string;
+	locale: Locale;
+	beforeMessageId?: string;
+	mode: CompactMode;
+	signal?: AbortSignal;
+	/** Extra text appended to the summary (e.g. context-overflow recovery hint). */
+	appendHint?: string;
+	options?: CustomCompactOptions;
+	hooks?: CompactRunHooks;
+}
+
+async function doRunCustomCompact({
+	narratorId,
+	locale,
+	beforeMessageId,
+	mode,
+	signal,
+	appendHint,
+	options,
+	hooks,
+}: DoRunCustomCompactArgs): Promise<boolean> {
 	const selectedModel = options?.model?.trim() || settings.agent.summaryModel;
 	const replacementFields = compactReplacementFields(options);
 	const isRetry = options?.preparedRetryMessage != null;
@@ -661,6 +929,7 @@ async function doRunCustomCompact(
 		narratorId,
 		messageId: compactingMsg.id,
 		mode,
+		...(hooks?.beat ? { onActivity: hooks.beat } : {}),
 	});
 
 	try {
@@ -673,6 +942,9 @@ async function doRunCustomCompact(
 			selectedModel,
 			compactProgress.onTextDelta,
 			compactProgress.onReasoningDelta,
+			// Chunk boundaries are the only liveness signal for a summary model that
+			// does not stream, so a multi-chunk cascade must not read as a stall.
+			hooks?.beat,
 		);
 		compactProgress.finish();
 		// Providers should honor the signal, but enforce cancellation at the
@@ -764,12 +1036,17 @@ async function doRunCustomCompact(
 		return true;
 	} catch (err) {
 		compactProgress.finish();
-		const errorMsg = err instanceof Error ? err.message : String(err);
+		// A watchdog abort arrives as an AbortError but is NOT a cancellation: nobody
+		// asked for it, the context was not compacted, and a blocking run must not
+		// continue its turn believing the context shrank. Report the timeout reason
+		// instead of "Aborted" and fall through to the failure path below.
+		const watchdogTimeout = isCompactAbortError(err) ? (hooks?.timeoutReason?.() ?? null) : null;
+		const errorMsg = watchdogTimeout ?? (err instanceof Error ? err.message : String(err));
 
 		// Cancelled by the user — silently roll back the in-progress compact:
 		// remove the placeholder marker, reset context state, and clear the
 		// transient substatus WITHOUT marking the narrator as errored.
-		if (isCompactAbortError(err)) {
+		if (isCompactAbortError(err) && !watchdogTimeout) {
 			logger.info("Custom compact cancelled by user", {
 				narratorId,
 				messageId: compactingMsg.id,
@@ -860,6 +1137,7 @@ async function doRunCustomCompact(
 			narratorId,
 			messageId: compactingMsg.id,
 			error: errorMsg,
+			...(watchdogTimeout ? { timedOut: true } : {}),
 		});
 
 		const failureMode = currentHistoryCompactMode(narratorId, mode);
@@ -953,21 +1231,33 @@ export async function runSegmentCompact(
 		return;
 	}
 
-	let timer: ReturnType<typeof setTimeout>;
-	const promise: Promise<CompactLockResult> = Promise.race([
-		doRunSegmentCompact(narratorId, locale, messageIds).then((compacted) => ({
-			kind: "segment" as const,
-			compacted,
-			mode: "blocking" as const,
-		})),
-		new Promise<CompactLockResult>((_, reject) => {
-			timer = setTimeout(
-				() => reject(new Error("Segment compact timed out after 5 minutes")),
-				COMPACT_TIMEOUT_MS,
-			);
-		}),
-	]);
-	const lock: CompactLock = { kind: "segment", promise, mode: "blocking" };
+	// Same stall-not-duration contract as the history path, for the same reason: a
+	// raced timer would free the lock while the run kept its marker "compacting".
+	const abortController = new AbortController();
+	const watchdog = createCompactWatchdog({
+		narratorId,
+		onTimeout: () => abortController.abort(),
+		...(compactWatchdogTimingOverrides ?? {}),
+	});
+	const promise: Promise<CompactLockResult> = doRunSegmentCompact({
+		narratorId,
+		locale,
+		messageIds,
+		signal: abortController.signal,
+		hooks: { beat: watchdog.beat, timeoutReason: watchdog.firedReason },
+	}).then(
+		(compacted) => {
+			watchdog.stop();
+			return { kind: "segment" as const, compacted, mode: "blocking" as const };
+		},
+		(err) => {
+			watchdog.stop();
+			const reason = watchdog.firedReason();
+			if (reason && isCompactAbortError(err)) throw new CompactTimeoutError(reason);
+			throw err;
+		},
+	);
+	const lock: CompactLock = { kind: "segment", promise, mode: "blocking", abortController };
 	compactLocks.set(narratorId, lock);
 	try {
 		await promise;
@@ -978,19 +1268,26 @@ export async function runSegmentCompact(
 		});
 		throw err;
 	} finally {
-		// biome-ignore lint/style/noNonNullAssertion: timer is always assigned before race settles
-		clearTimeout(timer!);
+		watchdog.stop();
 		if (compactLocks.get(narratorId) === lock) {
 			compactLocks.delete(narratorId);
 		}
 	}
 }
 
-async function doRunSegmentCompact(
-	narratorId: string,
-	locale: Locale,
-	messageIds: string[],
-): Promise<boolean> {
+async function doRunSegmentCompact({
+	narratorId,
+	locale,
+	messageIds,
+	signal,
+	hooks,
+}: {
+	narratorId: string;
+	locale: Locale;
+	messageIds: string[];
+	signal?: AbortSignal;
+	hooks?: CompactRunHooks;
+}): Promise<boolean> {
 	logger.info("Starting segment compact", { narratorId, messageCount: messageIds.length });
 
 	const { message: markerMsg, hiddenMessageIds } =
@@ -1008,6 +1305,7 @@ async function doRunSegmentCompact(
 		messageId: markerMsg.id,
 		mode: "blocking",
 		isSegment: true,
+		...(hooks?.beat ? { onActivity: hooks.beat } : {}),
 	});
 
 	try {
@@ -1030,12 +1328,16 @@ async function doRunSegmentCompact(
 			locale,
 			messages,
 			null,
-			undefined,
+			signal,
 			undefined,
 			compactProgress.onTextDelta,
 			compactProgress.onReasoningDelta,
+			hooks?.beat,
 		);
 		compactProgress.finish();
+		// Enforce cancellation at the persistence boundary too, so a summary that
+		// arrives after the watchdog fired cannot finalize a marker whose lock is gone.
+		if (signal?.aborted) throw compactAbortError();
 
 		const finalizedMsg = await narratorService.finalizeSegmentCompact(
 			markerMsg.id,
@@ -1074,11 +1376,15 @@ async function doRunSegmentCompact(
 		return true;
 	} catch (err) {
 		compactProgress.finish();
-		const errorMsg = err instanceof Error ? err.message : String(err);
+		// A watchdog abort is a bare "Aborted" AbortError, which tells the user
+		// nothing about why their segment summary failed. Record the timeout reason.
+		const watchdogTimeout = isCompactAbortError(err) ? (hooks?.timeoutReason?.() ?? null) : null;
+		const errorMsg = watchdogTimeout ?? (err instanceof Error ? err.message : String(err));
 		logger.error("Segment compact failed", {
 			narratorId,
 			messageId: markerMsg.id,
 			error: errorMsg,
+			...(watchdogTimeout ? { timedOut: true } : {}),
 		});
 
 		const failedSummary = `${COMPACT_FAILURE_TEXT}\n${errorMsg}`;

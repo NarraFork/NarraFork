@@ -203,8 +203,11 @@ export async function handleContextOverflow(opts: {
 		}
 		try {
 			// awaitCompactCompletion drains probe→history lock hand-offs and honors
-			// the interrupt signal, so a user/parent abort ends the wait promptly
-			// instead of blocking up to the compact's 5-minute ceiling.
+			// the interrupt signal. That signal matters more than it looks: the
+			// compact is bounded by an inactivity watchdog, not a total-duration
+			// budget, so a compact that keeps making progress can legitimately run to
+			// its 30-minute ceiling. Passing the signal is what keeps a user/parent
+			// abort from waiting that long.
 			await awaitCompactCompletion(narratorId, signal);
 			const seqAfterInflight = await narratorService.getLatestCompactSeq(narratorId);
 			if (

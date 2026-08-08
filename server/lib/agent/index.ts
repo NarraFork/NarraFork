@@ -263,6 +263,7 @@ async function withSummaryRetry<T>(
 	signal: AbortSignal | undefined,
 	model: string,
 	reportSummaryModelErrors = true,
+	onRetryProgress?: () => void,
 ): Promise<T> {
 	const maxRetries = getAuxiliaryMaxRetries();
 	let lastErr: unknown;
@@ -270,6 +271,12 @@ async function withSummaryRetry<T>(
 		if (signal?.aborted) {
 			throw new DOMException("Summary generation aborted", "AbortError");
 		}
+		// Starting an attempt is observable progress. Callers that bound a summary by
+		// INACTIVITY (compact's watchdog) would otherwise see this whole retry chain
+		// as one silent gap: the backoff alone sums to ~126s at the default cap, so
+		// a rate-limited-but-recovering summary can outlast a 5-minute stall window
+		// and be killed while it is actively retrying.
+		onRetryProgress?.();
 		try {
 			return await fn();
 		} catch (err) {
@@ -297,7 +304,11 @@ async function withSummaryRetry<T>(
 					delayMs,
 					error: errMsg,
 				});
+				// Beat on both sides of the sleep: a single backoff can be 15s, and the
+				// next attempt may itself run long before failing.
+				onRetryProgress?.();
 				await new Promise((r) => setTimeout(r, delayMs));
+				onRetryProgress?.();
 				continue;
 			}
 			// Non-provider, non-retryable (or retries exhausted) — broadcast error
@@ -372,6 +383,7 @@ export async function summaryGenerate(
 	maxOutputTokens?: number,
 	reportSummaryModelErrors = true,
 	onReasoningDelta?: GenerateOptions["onReasoningDelta"],
+	onRetryProgress?: () => void,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
 	const generateOptions: GenerateOptions = {
@@ -386,6 +398,7 @@ export async function summaryGenerate(
 		signal,
 		model,
 		reportSummaryModelErrors,
+		onRetryProgress,
 	);
 }
 
