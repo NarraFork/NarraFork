@@ -1,5 +1,6 @@
+import { existsSync } from "node:fs";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { db } from "@server/db";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
@@ -1652,17 +1653,32 @@ export class PluginManager {
 	 * runtime is `bun`.
 	 *
 	 * In development the host itself runs under Bun, so `process.execPath` is
-	 * correct. A compiled single-file Windows executable, however, embeds the
-	 * host entrypoint — `process.execPath` points at the host binary, which does
-	 * NOT accept a script argument (it ignores it and boots the app again,
-	 * colliding with the instance lock and exiting 1). Resolve a real `bun`
-	 * from PATH instead, falling back to `process.execPath` only when Bun's
-	 * resolver finds nothing (pure dev mode).
+	 * correct (it points at the real bun binary). A compiled single-file Windows
+	 * executable, however, embeds the host entrypoint — `process.execPath`
+	 * points at the host binary, which does NOT accept a script argument (it
+	 * ignores it and boots the app again, colliding with the instance lock and
+	 * exiting 1). In that case resolve a real bun from PATH; npm's `bun.cmd`
+	 * shim is not directly spawnable, so follow it to the underlying
+	 * `bun.exe` (typically node_modules/bun/bin/bun.exe).
 	 */
 	private resolveBunExecutable(): string {
-		const fromPath = typeof Bun !== "undefined" ? Bun.which("bun") : undefined;
-		if (fromPath) return fromPath;
-		return process.execPath;
+		const execPath = process.execPath;
+		// dev（宿主本身由 bun 运行）：execPath 就是真实的 bun 二进制
+		if (execPath && /(^|[\\/])bun(\.exe)?$/i.test(execPath)) return execPath;
+		const candidates = [
+			typeof Bun !== "undefined" ? Bun.which("bun.exe") : undefined,
+			typeof Bun !== "undefined" ? Bun.which("bun") : undefined,
+		];
+		for (const candidate of candidates) {
+			if (!candidate) continue;
+			if (/\.exe$/i.test(candidate)) return candidate;
+			if (/\.cmd$/i.test(candidate)) {
+				// npm shim → real binary lives next to it as node_modules/bun/bin/bun.exe
+				const viaShim = resolve(dirname(candidate), "node_modules", "bun", "bin", "bun.exe");
+				if (existsSync(viaShim)) return viaShim;
+			}
+		}
+		return execPath;
 	}
 
 	private async defaultRuntimeOptions(
