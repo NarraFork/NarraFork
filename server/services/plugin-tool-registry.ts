@@ -291,7 +291,12 @@ const toolPermissionSchema = z
 	.strict();
 
 function clone<T>(value: T): T {
-	return structuredClone(value);
+	return deepClone(value) as T;
+}
+
+/** JSON round-trip: drops undefined fields and non-finite numbers → strict JsonValue. */
+function toStrictJson<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function deepFreeze<T>(value: T): T {
@@ -1179,7 +1184,11 @@ export class PluginToolRegistry {
 			{
 				contributionId: entry.descriptor.contributionId,
 				input: clone(input),
-				context: {
+				// RPC params must be strictly JSON (jsonValueSchema): strip any
+				// undefined fields (e.g. deadlineAt when absent) that would fail
+				// the outbound envelope validation ("Cannot enqueue an invalid
+				// JSON-RPC envelope").
+				context: toStrictJson({
 					requestId: context.host.requestId,
 					correlationId: context.host.correlationId,
 					deadlineAt: context.host.deadlineAt,
@@ -1187,7 +1196,7 @@ export class PluginToolRegistry {
 					scope: clone(context.scope),
 					target: context.target ? clone(context.target) : null,
 					permission: clone(context.permission),
-				},
+				}),
 			},
 			{ signal: context.signal, timeoutMs },
 		);
