@@ -291,7 +291,7 @@ const toolPermissionSchema = z
 	.strict();
 
 function clone<T>(value: T): T {
-	return deepClone(value) as T;
+	return structuredClone(value) as T;
 }
 
 /** JSON round-trip: drops undefined fields and non-finite numbers → strict JsonValue. */
