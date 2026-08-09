@@ -385,11 +385,17 @@ export function PluginUiRuntimeProvider({
 			) {
 				return;
 			}
+			// Idempotent: no-ops must NOT rerender. The dock panel re-invokes this
+			// on every render (its effect depends on the runtime context value,
+			// which rebuilds whenever sessionRevision bumps), so an unconditional
+			// rerender here would ping-pong with sessionRevision → render loop
+			// (React #185 "Maximum update depth exceeded").
+			if (JSON.stringify(parsed) === JSON.stringify(record.params)) return;
 			record.params = parsed;
 			record.controller?.updateParams(parsed);
 			rerenderSoon();
 		},
-		[rerenderSoon],
+		[],
 	);
 
 	const getSessionSnapshot = useCallback(
