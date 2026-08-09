@@ -44,7 +44,10 @@ const DEFAULT_REQUEST_BYTES = 256 * 1024;
 const DEFAULT_RESPONSE_BYTES = 1024 * 1024;
 const DEFAULT_JSON_DEPTH = 12;
 const DEFAULT_ARRAY_LENGTH = 100;
-const DEFAULT_OBJECT_KEYS = 1_000;
+// Must comfortably exceed DEFAULT_ARRAY_LENGTH × typical row key count: a full
+// 100-row narrators.list page (14 keys/row) alone is 1400 keys — 1000 would
+// reject every full page (fire-and-forget "too many object keys" for plugins).
+const DEFAULT_OBJECT_KEYS = 8_192;
 const DEFAULT_STRING_BYTES = 64 * 1024;
 const DEFAULT_DIAGNOSTICS = 20;
 const DEFAULT_CURSOR_TTL_MS = 15 * 60 * 1000;
