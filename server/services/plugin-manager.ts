@@ -1770,6 +1770,7 @@ export class PluginManager {
 				NF_PLUGIN_DATA_DIR: context.dataPath,
 				NF_PLUGIN_TEMP_DIR: context.tempPath,
 				NF_PLUGIN_LOG_DIR: context.logPath,
+				NF_PLUGIN_PACKAGE_DIGEST: context.package.hash,
 			},
 			timeouts: {
 				handshakeMs: server.startupTimeoutMs,

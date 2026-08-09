@@ -75,6 +75,7 @@ const SAFE_ENV_KEYS = [
 	"NF_PLUGIN_DATA_DIR",
 	"NF_PLUGIN_TEMP_DIR",
 	"NF_PLUGIN_LOG_DIR",
+	"NF_PLUGIN_PACKAGE_DIGEST",
 ] as const;
 
 export type RuntimeState =
