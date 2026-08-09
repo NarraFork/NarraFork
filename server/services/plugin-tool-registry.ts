@@ -1,4 +1,5 @@
 import { generateShortId } from "@server/lib/id";
+import { logger } from "@server/lib/logger";
 import {
 	getContributionFullId,
 	type Manifest,
@@ -991,6 +992,19 @@ export class PluginToolRegistry {
 				responseBytes: 0,
 			});
 			if (!authorization.allowed) {
+				const denied = authorization.error;
+				logger.warn("plugin tool call denied by capability broker", {
+					tool: fullId,
+					capability,
+					methodId: `tools.invoke:${entry.descriptor.fullId}`,
+					invocation: invocation,
+					scope,
+					code: denied?.code,
+					reason: (denied as { reason?: unknown } | undefined)?.reason,
+					message: denied?.message,
+					diagnosticId: (denied as { diagnosticId?: unknown } | undefined)?.diagnosticId,
+					contextKeys: host ? Object.keys(host) : undefined,
+				});
 				throw new PluginToolRegistryError(
 					authorization.error?.code ?? "PERMISSION_DENIED",
 					"Capability broker denied the plugin tool call",
