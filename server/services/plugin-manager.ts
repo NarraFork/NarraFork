@@ -1691,6 +1691,13 @@ export class PluginManager {
 		} else {
 			runner = new LocalProcessRunner({
 				allowedCwds: [context.packagePath, context.dataPath, context.tempPath],
+				// Windows has no rlimit equivalent in Bun.spawn and the default
+				// runner rejects unbounded local processes on win32; the official
+				// host behavior on Windows is to run without host resource limits
+				// (surfaced as a startup warning), so keep that contract here —
+				// otherwise every local plugin fails to spawn on Windows and lands
+				// in quarantine.
+				allowUnboundedResourceUsage: process.platform === "win32",
 			});
 			switch (context.manifest.engine.runtime) {
 				case "bun":
