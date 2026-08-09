@@ -28,7 +28,14 @@ let batchMergeCapability = {
 	reason: undefined as string | undefined,
 };
 
+// `mock.module` is process-global, so replacing usePlatform wholesale would strip
+// every other export for suites that run after this one (GitPanel imports
+// useChapterSplitCapability, for example). Keep the real module and override only
+// the two hooks this suite drives.
+const realPlatform = await import("../../hooks/usePlatform");
+
 mock.module("../../hooks/usePlatform", () => ({
+	...realPlatform,
 	useChapterBatchMergeCapability: () => batchMergeCapability,
 	useNarratorReviewToolsCapability: () => ({
 		supported: true,
