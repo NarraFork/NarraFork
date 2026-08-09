@@ -12,7 +12,7 @@ import {
 } from "@mantine/core";
 import { IconAlertTriangle, IconPlugConnected, IconRefresh, IconTrash } from "@tabler/icons-react";
 import type { IDockviewPanelProps } from "dockview-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
@@ -151,6 +151,7 @@ export function PluginDockPanelView({
 	const runtime = useOptionalPluginUiRuntime();
 	const surface = usePluginUiSurface();
 	const params = useMemo(() => parsePluginDockPanelParams(rawParams), [rawParams]);
+	const lastAppliedTitleRef = useRef<string | null>(null);
 	const ownerNarratorId = params ? surface?.resolveOwnerNarratorId(params) : undefined;
 	const { data: ownerNarrator } = useNarrator(ownerNarratorId ?? "");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator API entity
@@ -237,7 +238,15 @@ export function PluginDockPanelView({
 		if (!params || !contribution) return;
 		const title =
 			contribution.title?.trim() || contribution.pluginName?.trim() || params.contributionId;
-		if (title && hostApi.title !== title) hostApi.setTitle(title);
+		// Only apply the title once per distinct value. `contribution` is a fresh
+		// object on every render (toPluginUiContribution builds a new literal) and
+		// `hostApi.title` does not reflect `setTitle` on every dock implementation,
+		// so comparing against hostApi.title alone would re-invoke setTitle on every
+		// render → Dockview updates state → render loop (React #185).
+		if (title && lastAppliedTitleRef.current !== title) {
+			lastAppliedTitleRef.current = title;
+			hostApi.setTitle(title);
+		}
 	}, [contribution, params, hostApi]);
 
 	if (!params) {
