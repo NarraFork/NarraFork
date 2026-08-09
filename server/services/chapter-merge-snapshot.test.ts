@@ -401,22 +401,29 @@ describe("undoing a commit-free merge", () => {
 		expect(existsSync(join(present(row.worktreePath, "worktree"), BASE_FILE))).toBe(true);
 	});
 
-	test("waking a merged chapter also restores its uncommitted work", async () => {
+	test("waking a merged chapter is refused, because only unmerge can undo the target", async () => {
+		// `wake` used to accept a merged chapter and clear every merge coordinate, while
+		// leaving the target's content exactly as the merge had left it. That combination
+		// is unrecoverable: `unmerge` routes on those coordinates, so once they are gone
+		// the source's contribution can never be reversed out of the target, and merging
+		// the chapter again applies the same changes a second time.
+		//
+		// Refusing is what keeps the two operations from overlapping. Nothing is lost by
+		// it — `unmerge` restores the source's uncommitted work as well, which the
+		// "gives the source chapter back its uncommitted work" case above pins down.
 		const env = await createMergePair();
 		writeFileSync(join(env.source.worktree, BASE_FILE), BASE_CONTENT.replace("l9", "l9-feature"));
 		writeFileSync(join(env.source.worktree, "wake-me.txt"), "restore on wake\n");
 		await chapterMerge.merge(env.source.id, { targetChapterId: env.target.id });
 
-		await chapterCleanup.wake(env.source.id);
+		await expect(chapterCleanup.wake(env.source.id)).rejects.toThrow(/unmerge/i);
 
+		// Still merged, and every coordinate intact — that is precisely what makes the
+		// chapter recoverable through unmerge.
 		const row = await chapterRow(env.source.id);
-		const worktree = present(row.worktreePath, "woken worktree");
-		tempDirs.push(worktree);
-		expect(readFileSync(join(worktree, BASE_FILE), "utf-8")).toContain("l9-feature");
-		expect(readFileSync(join(worktree, "wake-me.txt"), "utf-8")).toBe("restore on wake\n");
-		// Same coordinate hygiene as unmerge, including the one wake used to miss.
-		expect(row.mergeSnapshotCommitSha).toBeNull();
-		expect(row.preMergeTargetSha).toBeNull();
+		expect(row.status).toBe("merged");
+		expect(row.mergeSnapshotCommitSha).toBeTruthy();
+		expect(row.mergedSourceSnapshotSha).toBeTruthy();
 	});
 
 	test("restoreSourceSnapshot reports rather than throws for a missing snapshot", async () => {
@@ -600,6 +607,451 @@ describe("interactive snapshot merge state lifecycle", () => {
 		// The sweep now has nothing to act on, so the resolution survives.
 		await chapterBatchMerge.cleanupStaleSessions();
 		expect(readFileSync(join(env.target.worktree, BASE_FILE), "utf-8")).toContain("l5-RESOLVED");
+	});
+});
+
+/**
+ * The reverse merge that undoes a commit-free merge, and the base it is computed from.
+ *
+ * Both cases here failed with the original base (`mergedSourceSnapshotSha`) and pass
+ * with the merge result. They are separated from the general unmerge cases above
+ * because neither is about the unmerge *flow* — both are about the three sides handed
+ * to git, where a plausible-looking choice yields a plausible-looking wrong answer.
+ */
+describe("reversing a commit-free merge computes against the merge result", () => {
+	test("does not resurrect an edit the target made before the merge and undid after", async () => {
+		const env = await createMergePair();
+		// The target edits l2 before the merge…
+		writeFileSync(join(env.target.worktree, BASE_FILE), BASE_CONTENT.replace("l2", "TARGET-EDIT"));
+		// …the source touches a line far away, so the two never overlap.
+		writeFileSync(join(env.source.worktree, BASE_FILE), BASE_CONTENT.replace("l9", "l9-feature"));
+		expect(
+			(await chapterMerge.merge(env.source.id, { targetChapterId: env.target.id })).success,
+		).toBe(true);
+		expect(readFileSync(join(env.target.worktree, BASE_FILE), "utf-8")).toContain("TARGET-EDIT");
+
+		// After the merge the target changes its mind and puts l2 back.
+		writeFileSync(
+			join(env.target.worktree, BASE_FILE),
+			readFileSync(join(env.target.worktree, BASE_FILE), "utf-8").replace("TARGET-EDIT", "l2"),
+		);
+
+		const result = await chapterMerge.unmerge(env.source.id);
+		expect(result.ok).toBe(true);
+		tempDirs.push(present((await chapterRow(env.source.id)).worktreePath, "restored worktree"));
+
+		const after = readFileSync(join(env.target.worktree, BASE_FILE), "utf-8");
+		// With the source snapshot as base, source→theirs still differs by TARGET-EDIT on a
+		// path the source never touched, so git reintroduces it as a theirs-side change and
+		// the deliberately-undone edit comes back from the dead.
+		expect(after).not.toContain("TARGET-EDIT");
+		expect(after).toContain("\nl2\n");
+		// And the source's contribution is still what got rolled back.
+		expect(after).not.toContain("l9-feature");
+	});
+
+	test("reports no conflict when the source only added files", async () => {
+		const env = await createMergePair();
+		// The target has a pre-merge edit; the source adds a file and touches nothing else.
+		writeFileSync(join(env.target.worktree, BASE_FILE), BASE_CONTENT.replace("l2", "TARGET-EDIT"));
+		writeFileSync(join(env.source.worktree, "feature.txt"), "new from feature\n");
+		expect(
+			(await chapterMerge.merge(env.source.id, { targetChapterId: env.target.id })).success,
+		).toBe(true);
+		expect(existsSync(join(env.target.worktree, "feature.txt"))).toBe(true);
+
+		// The target keeps working on its own line, still nowhere near the source.
+		writeFileSync(
+			join(env.target.worktree, BASE_FILE),
+			readFileSync(join(env.target.worktree, BASE_FILE), "utf-8").replace(
+				"TARGET-EDIT",
+				"TARGET-EDIT2",
+			),
+		);
+
+		// With the source snapshot as base this reported a conflict in app.txt — a file the
+		// merge never touched — and the unmerge refused outright.
+		const result = await chapterMerge.unmerge(env.source.id);
+		expect(result.ok).toBe(true);
+		tempDirs.push(present((await chapterRow(env.source.id)).worktreePath, "restored worktree"));
+
+		expect(existsSync(join(env.target.worktree, "feature.txt"))).toBe(false);
+		expect(readFileSync(join(env.target.worktree, BASE_FILE), "utf-8")).toContain("TARGET-EDIT2");
+	});
+
+	test("refuses rather than guesses when the merge result snapshot is gone", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.source.worktree, BASE_FILE), BASE_CONTENT.replace("l9", "l9-feature"));
+		await chapterMerge.merge(env.source.id, { targetChapterId: env.target.id });
+
+		// A row whose merge result no longer resolves — a swept shadow repo, a hand edit.
+		await db
+			.update(chapters)
+			.set({ mergeSnapshotCommitSha: "0".repeat(40) })
+			.where(eq(chapters.id, env.source.id));
+
+		// Every other candidate base produces a plausible but wrong tree, so declining is
+		// the only safe answer. `mergedSourceSnapshotSha` in particular is not a usable
+		// fallback: it is the source lineage's sha *inside the target's* shadow repository,
+		// so it is gone in exactly this situation — and even when present it is the base
+		// this function's doc comment rules out.
+		const message = await chapterMerge.unmerge(env.source.id).then(
+			() => "",
+			(err: unknown) => (err instanceof Error ? err.message : String(err)),
+		);
+		expect(message).toMatch(/cannot be reversed automatically/i);
+		// A refusal has to be actionable, not merely a refusal: it names the snapshot that
+		// is missing and states that nothing was changed, so the user knows the target is
+		// still intact and what to compare it against.
+		expect(message).toContain("000000000000");
+		expect(message).toMatch(/nothing has been changed/i);
+		expect((await chapterRow(env.source.id)).status).toBe("merged");
+	});
+});
+
+/**
+ * Preconditions whose absence puts a chapter somewhere no later operation can reach.
+ *
+ * Grouped together because they share a shape: each guards a state that is not merely
+ * wrong but *unrepairable* — a merge commit no branch points at, or a project trunk
+ * with no operation left that will accept it.
+ */
+describe("merge preconditions", () => {
+	test("refuses a target worktree that is not on the target's branch", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.source.worktree, "committed.txt"), "from feature\n");
+		await git(["add", "-A"], env.source.worktree);
+		await git(
+			["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "feature work"],
+			env.source.worktree,
+		);
+		// Detach the target's HEAD, as a `git checkout <sha>` in the terminal would.
+		const head = await git(["rev-parse", "HEAD"], env.target.worktree);
+		await git(["checkout", "--detach", head], env.target.worktree);
+		const targetRow = await chapterRow(env.target.id);
+
+		await expect(
+			chapterMerge.merge(env.source.id, { targetChapterId: env.target.id, mode: "commit" }),
+		).rejects.toThrow(/detached/i);
+
+		// Nothing was recorded, so the source is still mergeable once HEAD is reattached.
+		// Silently succeeding here produced a commit on no branch, with the source retired
+		// and its worktree deleted.
+		expect((await chapterRow(env.source.id)).status).toBe("active");
+		expect(await git(["rev-parse", "HEAD"], env.target.worktree)).toBe(head);
+		expect(targetRow.branch).toBeTruthy();
+	});
+
+	test("refuses the root chapter as a merge source", async () => {
+		const env = await createMergePair();
+		// The root chapter's worktree is the project's own git directory.
+		await db.update(chapters).set({ isRoot: 1 }).where(eq(chapters.id, env.source.id));
+
+		await expect(
+			chapterMerge.merge(env.source.id, { targetChapterId: env.target.id }),
+		).rejects.toThrow(/root chapter/i);
+		// Retiring it would null worktreePath while `git worktree remove` fatals on the main
+		// working tree, and neither dormant nor delete accepts a root chapter afterwards.
+		const row = await chapterRow(env.source.id);
+		expect(row.status).toBe("active");
+		expect(row.worktreePath).toBeTruthy();
+	});
+
+	test("the conflict preview accepts exactly what the merge accepts", async () => {
+		const env = await createMergePair();
+		// Dormant is a legal merge source, so a preview that rejects it makes the UI refuse
+		// an operation the API performs — and the only way through is to skip the check.
+		await db.update(chapters).set({ status: "dormant" }).where(eq(chapters.id, env.source.id));
+
+		const check = await chapterMerge.checkConflicts(env.source.id, env.target.id);
+		expect(check.hasConflicts).toBe(false);
+
+		// And both refuse a root source, with the same message.
+		await db
+			.update(chapters)
+			.set({ status: "active", isRoot: 1 })
+			.where(eq(chapters.id, env.source.id));
+		await expect(chapterMerge.checkConflicts(env.source.id, env.target.id)).rejects.toThrow(
+			/root chapter/i,
+		);
+	});
+});
+
+/**
+ * Cleaning up after a merge that conflicted in commit mode.
+ *
+ * The squash case is the one that mattered: `--squash --no-commit` writes no
+ * `MERGE_HEAD`, so `git merge --abort` exits 128 — and while that failure was
+ * swallowed, the markers stayed on disk until the next unattended save committed them
+ * as authored code.
+ */
+describe("commit-mode conflict cleanup", () => {
+	/** Commit conflicting content on both branches so a commit-mode merge collides. */
+	async function seedConflictingCommits(env: Awaited<ReturnType<typeof createMergePair>>) {
+		const commit = async (worktree: string, content: string, message: string) => {
+			writeFileSync(join(worktree, BASE_FILE), content);
+			await git(["add", "-A"], worktree);
+			await git(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", message], worktree);
+		};
+		await commit(env.source.worktree, BASE_CONTENT.replace("l5", "l5-FEATURE"), "feature edit");
+		await commit(env.target.worktree, BASE_CONTENT.replace("l5", "l5-TRUNK"), "trunk edit");
+	}
+
+	test("a conflicted squash leaves no markers and no unmerged index entries", async () => {
+		const env = await createMergePair();
+		await seedConflictingCommits(env);
+		const preMergeHead = await git(["rev-parse", "HEAD"], env.target.worktree);
+
+		const result = await chapterMerge.merge(env.source.id, {
+			targetChapterId: env.target.id,
+			strategy: "squash",
+			mode: "commit",
+		});
+		expect(result.success).toBe(false);
+		expect(result.conflictFiles).toEqual([BASE_FILE]);
+
+		// `git merge --abort` fatals here, so before the fix all three of these held.
+		expect(readFileSync(join(env.target.worktree, BASE_FILE), "utf-8")).not.toContain("<<<<<<<");
+		expect(await gitService.getConflictFiles(env.target.worktree)).toEqual([]);
+		expect(await git(["rev-parse", "HEAD"], env.target.worktree)).toBe(preMergeHead);
+
+		// The decisive assertion: an unattended save must now be a no-op rather than a
+		// commit of conflict markers. `autoCommit` refuses mid-conflict, so reaching this
+		// line at all requires the cleanup to have worked.
+		expect(await gitService.autoCommit(env.target.worktree, "auto-save while dormant")).toBeNull();
+		expect(await git(["rev-parse", "HEAD"], env.target.worktree)).toBe(preMergeHead);
+	});
+
+	test("a conflicted squash keeps the target's uncommitted work on untouched paths", async () => {
+		const env = await createMergePair();
+		await seedConflictingCommits(env);
+		// Work in progress on a path the merge never touches. `reset --hard` would erase
+		// it; `reset --merge` resets only the paths that differ from the target commit, so
+		// it has to survive — that preservation is the whole point of this rung.
+		writeFileSync(join(env.target.worktree, "notes.txt"), "seed\n");
+		await git(["add", "-A"], env.target.worktree);
+		await git(
+			["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "add notes"],
+			env.target.worktree,
+		);
+		writeFileSync(join(env.target.worktree, "notes.txt"), "seed\nuncommitted line\n");
+		// Untracked too: no reset removes these, but a cleanup that reached for
+		// `git clean` would.
+		writeFileSync(join(env.target.worktree, "scratch.txt"), "untracked scratch\n");
+
+		const result = await chapterMerge.merge(env.source.id, {
+			targetChapterId: env.target.id,
+			strategy: "squash",
+			mode: "commit",
+		});
+		expect(result.success).toBe(false);
+		// Nothing was destroyed, so there is nothing to warn about.
+		expect(result.warning).toBeUndefined();
+		expect(readFileSync(join(env.target.worktree, "notes.txt"), "utf-8")).toBe(
+			"seed\nuncommitted line\n",
+		);
+		expect(readFileSync(join(env.target.worktree, "scratch.txt"), "utf-8")).toBe(
+			"untracked scratch\n",
+		);
+		// And the conflict itself is still gone.
+		expect(readFileSync(join(env.target.worktree, BASE_FILE), "utf-8")).not.toContain("<<<<<<<");
+		expect(await gitService.getConflictFiles(env.target.worktree)).toEqual([]);
+	});
+
+	test("falls back to a hard reset, and says so, when reset --merge refuses", async () => {
+		const env = await createMergePair();
+		await seedConflictingCommits(env);
+		writeFileSync(join(env.target.worktree, "notes.txt"), "seed\n");
+		await git(["add", "-A"], env.target.worktree);
+		await git(
+			["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "add notes"],
+			env.target.worktree,
+		);
+		const preMergeHead = await git(["rev-parse", "HEAD"], env.target.worktree);
+
+		// `reset --merge` refuses when the index holds an entry matching neither HEAD nor
+		// the merge result. Simulated rather than constructed from git state: the natural
+		// shape for it (a staged-then-modified file) also makes git refuse to *start* the
+		// merge, so the two cannot be reproduced together through the public path.
+		const resetMerge = gitService.resetMerge;
+		gitService.resetMerge = async () => {
+			throw new Error("Entry 'notes.txt' not uptodate. Cannot merge.");
+		};
+		let result: Awaited<ReturnType<typeof chapterMerge.merge>>;
+		try {
+			result = await chapterMerge.merge(env.source.id, {
+				targetChapterId: env.target.id,
+				strategy: "squash",
+				mode: "commit",
+			});
+		} finally {
+			gitService.resetMerge = resetMerge;
+		}
+
+		expect(result.success).toBe(false);
+		// Escalating rather than giving up: markers left on disk is the worst outcome.
+		expect(readFileSync(join(env.target.worktree, BASE_FILE), "utf-8")).not.toContain("<<<<<<<");
+		expect(await gitService.getConflictFiles(env.target.worktree)).toEqual([]);
+		expect(await git(["rev-parse", "HEAD"], env.target.worktree)).toBe(preMergeHead);
+		// The hard reset is the one rung that can destroy something, so it must name the
+		// snapshot that holds the pre-reset state.
+		expect(result.warning).toMatch(/hard reset/i);
+		expect(result.warning).toMatch(/snapshot [0-9a-f]{12}/);
+	});
+
+	test("a conflicted non-squash merge is aborted without a spurious warning", async () => {
+		const env = await createMergePair();
+		await seedConflictingCommits(env);
+		writeFileSync(join(env.target.worktree, "notes.txt"), "seed\n");
+		await git(["add", "-A"], env.target.worktree);
+		await git(
+			["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "add notes"],
+			env.target.worktree,
+		);
+		writeFileSync(join(env.target.worktree, "notes.txt"), "seed\nuncommitted line\n");
+		// Captured after the setup commits, so it is the HEAD the merge actually starts from.
+		const preMergeHead = await git(["rev-parse", "HEAD"], env.target.worktree);
+
+		const result = await chapterMerge.merge(env.source.id, {
+			targetChapterId: env.target.id,
+			mode: "commit",
+		});
+		expect(result.success).toBe(false);
+		// `merge --abort` works for this strategy and keeps uncommitted work, so there is
+		// nothing to warn about.
+		expect(result.warning).toBeUndefined();
+		expect(readFileSync(join(env.target.worktree, "notes.txt"), "utf-8")).toBe(
+			"seed\nuncommitted line\n",
+		);
+		expect(readFileSync(join(env.target.worktree, BASE_FILE), "utf-8")).not.toContain("<<<<<<<");
+		expect(await gitService.getConflictFiles(env.target.worktree)).toEqual([]);
+		expect(await git(["rev-parse", "HEAD"], env.target.worktree)).toBe(preMergeHead);
+	});
+});
+
+/**
+ * Undoing a merge that produced real git commits.
+ *
+ * The fast-forward case is the dangerous one: it makes no merge commit, so
+ * `mergeCommitSha` names the source branch's tip and reverting it undoes one of
+ * several appended commits.
+ */
+describe("undoing a commit-mode merge", () => {
+	/** Commit `count` separate commits on the source branch, leaving the target behind. */
+	async function commitOnSource(
+		env: Awaited<ReturnType<typeof createMergePair>>,
+		count: number,
+	): Promise<void> {
+		for (let i = 1; i <= count; i++) {
+			writeFileSync(join(env.source.worktree, `step-${i}.txt`), `step ${i}\n`);
+			await git(["add", "-A"], env.source.worktree);
+			await git(
+				["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", `step ${i}`],
+				env.source.worktree,
+			);
+		}
+	}
+
+	test("refuses to unmerge a multi-commit fast-forward once the target has advanced", async () => {
+		const env = await createMergePair();
+		await commitOnSource(env, 3);
+		// The target has done nothing, so this fast-forwards and appends all three commits
+		// with no merge commit of its own.
+		const merged = await chapterMerge.merge(env.source.id, {
+			targetChapterId: env.target.id,
+			mode: "commit",
+		});
+		expect(merged.success).toBe(true);
+		expect(existsSync(join(env.target.worktree, "step-1.txt"))).toBe(true);
+
+		// The target commits afterwards, which rules out the reset branch of unmerge.
+		writeFileSync(join(env.target.worktree, "trunk-work.txt"), "later\n");
+		await git(["add", "-A"], env.target.worktree);
+		await git(
+			["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "trunk work"],
+			env.target.worktree,
+		);
+
+		// Reverting `mergeCommitSha` would drop step-3 and leave step-1 and step-2 in the
+		// target while the database stops recording where they came from.
+		await expect(chapterMerge.unmerge(env.source.id)).rejects.toThrow(/fast-forward/i);
+		expect((await chapterRow(env.source.id)).status).toBe("merged");
+		// All three are still there, which is the point: nothing was half-undone.
+		expect(existsSync(join(env.target.worktree, "step-1.txt"))).toBe(true);
+		expect(existsSync(join(env.target.worktree, "step-3.txt"))).toBe(true);
+	});
+
+	test("still reverts a real merge commit when the target has advanced", async () => {
+		const env = await createMergePair();
+		await commitOnSource(env, 2);
+		// A commit on the target first, so the merge cannot fast-forward.
+		writeFileSync(join(env.target.worktree, "trunk-first.txt"), "trunk\n");
+		await git(["add", "-A"], env.target.worktree);
+		await git(
+			["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "trunk first"],
+			env.target.worktree,
+		);
+
+		expect(
+			(await chapterMerge.merge(env.source.id, { targetChapterId: env.target.id, mode: "commit" }))
+				.success,
+		).toBe(true);
+		writeFileSync(join(env.target.worktree, "trunk-later.txt"), "later\n");
+		await git(["add", "-A"], env.target.worktree);
+		await git(
+			["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "trunk later"],
+			env.target.worktree,
+		);
+
+		// A merge commit is revertable with `-m 1` however many commits it brought in, so
+		// the fast-forward guard must not fire here.
+		const result = await chapterMerge.unmerge(env.source.id);
+		expect(result.ok).toBe(true);
+		tempDirs.push(present((await chapterRow(env.source.id)).worktreePath, "restored worktree"));
+		expect(existsSync(join(env.target.worktree, "step-1.txt"))).toBe(false);
+		expect(existsSync(join(env.target.worktree, "trunk-later.txt"))).toBe(true);
+	});
+
+	test("a commit-mode merge clears any snapshot coordinates left by an earlier one", async () => {
+		const env = await createMergePair();
+		// Round one: a commit-free merge, then undo it. Nothing should remain, but this is
+		// the path that used to leave a coordinate behind.
+		writeFileSync(join(env.source.worktree, BASE_FILE), BASE_CONTENT.replace("l9", "l9-feature"));
+		await chapterMerge.merge(env.source.id, { targetChapterId: env.target.id });
+		await chapterMerge.unmerge(env.source.id);
+		const restored = present((await chapterRow(env.source.id)).worktreePath, "restored worktree");
+		tempDirs.push(restored);
+
+		// A stale coordinate is planted directly, standing in for any path that leaves one:
+		// what matters is that markMerged does not trust the row it is overwriting.
+		await db
+			.update(chapters)
+			.set({
+				mergeSnapshotCommitSha: "1".repeat(40),
+				preMergeTargetSnapshotSha: "2".repeat(40),
+				mergedSourceSnapshotSha: "3".repeat(40),
+			})
+			.where(eq(chapters.id, env.source.id));
+
+		// Round two: a real commit-mode merge.
+		writeFileSync(join(restored, "committed.txt"), "from feature\n");
+		await git(["add", "-A"], restored);
+		await git(
+			["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "feature work"],
+			restored,
+		);
+		expect(
+			(await chapterMerge.merge(env.source.id, { targetChapterId: env.target.id, mode: "commit" }))
+				.success,
+		).toBe(true);
+
+		const row = await chapterRow(env.source.id);
+		expect(row.mergeCommitSha).toBeTruthy();
+		// `unmerge` routes on this field alone, so a leftover value would reverse a merge
+		// that no longer exists over the target's current work.
+		expect(row.mergeSnapshotCommitSha).toBeNull();
+		expect(row.preMergeTargetSnapshotSha).toBeNull();
+		expect(row.mergedSourceSnapshotSha).toBeNull();
 	});
 });
 

@@ -21,11 +21,12 @@ import {
 	planSnapshotUnmerge,
 	restoreSourceSnapshot,
 } from "./chapter-merge-snapshot";
-import { advanceChapterSnapshot } from "./chapter-snapshot-ref";
+import { advanceChapterSnapshot, ensureChapterSnapshot } from "./chapter-snapshot-ref";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 import { collectMergeContext, mergeSummaryService } from "./merge-summary-service";
 import { startSession } from "./narrator-session";
+import { parkUncommittedWork, reapplyParkedWork, restoreParkedWork } from "./snapshot-dirty-git-op";
 import { terminalService } from "./terminal-service";
 import { SNAPSHOT_HEAD_REF, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
@@ -259,6 +260,299 @@ export function clearedSnapshotMergeFields() {
 }
 
 /**
+ * Record where a chapter's uncommitted work has been parked.
+ *
+ * Written the moment the park succeeds rather than kept in the calling closure, because
+ * parking runs `reset --hard` + `clean` first: from then until the reapply the workspace
+ * holds nothing and the snapshot commit is the only copy. A process that exits in that
+ * window used to lose the id with the closure, leaving the bytes in the shadow DAG with
+ * no pointer anywhere — which is precisely what `schema.ts` says these two columns
+ * exist to prevent ("the reapply may happen in a later request").
+ *
+ * Non-fatal on failure: the git operation is already committed to and refusing here
+ * would abort it half-done. A missing pointer is worse than one that is merely late,
+ * so the failure is logged loudly instead.
+ */
+async function persistParkedWork(
+	chapterId: string,
+	parked: { commitSha: string; baseTree: string },
+): Promise<void> {
+	try {
+		await db
+			.update(chapters)
+			.set({
+				parkedSnapshotCommitSha: parked.commitSha,
+				parkedSnapshotBaseTree: parked.baseTree,
+			})
+			.where(eq(chapters.id, chapterId));
+	} catch (err) {
+		logger.error("Could not record where uncommitted work was parked", {
+			chapterId,
+			snapshotCommitSha: parked.commitSha,
+			error: String(err),
+		});
+	}
+}
+
+/**
+ * Forget a chapter's parked-work pointer once the work is provably back on disk.
+ *
+ * Every terminal path has to call this. A stale pointer is not inert: the Ruler's rebase
+ * endpoint finds it and settles it, restoring a workspace the user has since edited
+ * past, and the recovery banner stays up for work that is no longer parked.
+ */
+async function clearPersistedParkedWork(chapterId: string): Promise<void> {
+	try {
+		await db
+			.update(chapters)
+			.set({ parkedSnapshotCommitSha: null, parkedSnapshotBaseTree: null })
+			.where(eq(chapters.id, chapterId));
+	} catch (err) {
+		logger.error("Could not clear a chapter's parked-work coordinates", {
+			chapterId,
+			error: String(err),
+		});
+	}
+}
+
+/**
+ * Whether a recorded merge actually appended more than one commit to the target.
+ *
+ * Only a fast-forward does this, and the reason it is dangerous is that a fast-forward
+ * makes no commit of its own: `gitService.merge` reads HEAD afterwards, so
+ * `mergeCommitSha` ends up naming the *source branch's tip*. Every commit the source
+ * had that the target lacked is now on the target, and `git revert <tip>` undoes
+ * exactly one of them.
+ *
+ * The test is `mergeCommitSha^1 !== preMergeTargetSha`: for anything that made its own
+ * commit — a real merge, a squash, a one-commit fast-forward — the first parent is
+ * where the target stood before, verified for all four shapes. Comparing commit counts
+ * instead would not distinguish them: a `--no-ff` merge of three commits also reports
+ * four commits in the range while being perfectly revertable as a single merge commit.
+ *
+ * Answers false when it cannot tell (no `preMergeTargetSha` on the row, an unreadable
+ * commit). This gates a refusal, so an uncertain answer must not block an unmerge that
+ * the revert path would have handled — pre-fast-forward rows exist and are the common
+ * case for old merges.
+ */
+async function isMultiCommitMerge(
+	targetWorktree: string,
+	mergeCommitSha: string,
+	preMergeTargetSha: string | null,
+): Promise<boolean> {
+	if (!preMergeTargetSha) return false;
+	// A merge commit is revertable with `-m 1` however many commits it brought in, so
+	// the question does not apply to it.
+	if (await gitService.isMergeCommit(targetWorktree, mergeCommitSha).catch(() => false)) {
+		return false;
+	}
+	const firstParent = await gitService
+		.getRefCommit(targetWorktree, `${mergeCommitSha}^1`)
+		.then((sha) => sha.trim())
+		.catch(() => null);
+	if (!firstParent) return false;
+	return firstParent !== preMergeTargetSha.trim();
+}
+
+/**
+ * Return a target worktree to its pre-merge state after a conflicted merge attempt.
+ *
+ * Three cleanups, tried in order of how much they are allowed to destroy. Leaving the
+ * markers on disk is the worst outcome available — `git add -A` treats an unmerged path
+ * as resolved, so the next unattended save (making the chapter dormant, say) commits
+ * `<<<<<<<` as if it were authored code — so each rung falls through to the next rather
+ * than giving up.
+ *
+ * 1. `git merge --abort`, for any strategy that left a `MERGE_HEAD`. Squash never does:
+ *    `--squash --no-commit` writes the result into the index and the working tree
+ *    without starting a merge, so abort exits 128 with "there is no merge to abort".
+ *    That failure used to be swallowed by an empty catch, which is how the markers
+ *    reached user history in the first place.
+ *
+ * 2. `git reset --merge <preMergeTargetSha>`, which is what squash needs. It resets
+ *    only the paths that differ between the index and the target commit, so the
+ *    conflicted files and the partial result the squash staged both go while an
+ *    unrelated uncommitted edit elsewhere in the worktree survives. Verified: a squash
+ *    conflict on `app.txt` is cleared while a pending edit to `other.txt` is kept, and
+ *    HEAD does not move.
+ *
+ * 3. `git reset --hard <preMergeTargetSha>` only when `--merge` refused. It refuses in
+ *    one narrow shape — an index entry that matches neither HEAD nor the merge result,
+ *    e.g. a file staged and then modified again ("Entry 'x' not uptodate. Cannot
+ *    merge.") — and importantly it changes *nothing* when it refuses, so trying it
+ *    first costs nothing. `--hard` does discard uncommitted work on untouched paths, so
+ *    a snapshot is taken immediately before this rung only, and named in the warning to
+ *    make the loss recoverable rather than silent.
+ *
+ * `git checkout -- .` is not a candidate at any rung: it refuses an unmerged path
+ * outright, exiting 1 with the markers still in place.
+ *
+ * Returns a warning only when something was destroyed or the worktree could not be
+ * proven clean. The caller must surface it: a conflicted worktree the user does not know
+ * about is exactly the state this function exists to prevent.
+ */
+async function cleanUpConflictedMerge(
+	targetWorktree: string,
+	strategy: string,
+	preMergeTargetSha: string,
+): Promise<{ warning?: string }> {
+	/** Shared tail: prove the worktree is clean, then point the lineage at it. */
+	const verifyAndRecord = async (): Promise<{ warning?: string } | null> => {
+		// Verified rather than assumed: a reset that reports success while unmerged
+		// entries survive would leave the caller believing the worktree is usable.
+		const remaining = await gitService.getConflictFiles(targetWorktree).catch(() => [] as string[]);
+		if (remaining.length > 0) {
+			return {
+				warning:
+					`The merge conflicted and ${remaining.length} file(s) still have unresolved conflicts ` +
+					`after cleanup (${remaining.slice(0, 5).join(", ")}). Resolve or reset the target ` +
+					`worktree manually before committing.`,
+			};
+		}
+		// The lineage has to name what is on disk now: a later fork, merge or unmerge is
+		// computed from the recorded state, and leaving it pointing at the pre-cleanup tree
+		// would have those operations reason about files the cleanup removed.
+		await advanceChapterSnapshot(
+			targetWorktree,
+			null,
+			"target cleaned after a merge conflict",
+		).catch(() => null);
+		return null;
+	};
+
+	// Rung 1 — the strategy's own undo, where one exists.
+	if (strategy !== "squash") {
+		try {
+			await gitService.mergeAbort(targetWorktree);
+			return (await verifyAndRecord()) ?? {};
+		} catch (err) {
+			// Logged rather than swallowed, then handled by falling through. A non-squash
+			// merge that cannot be aborted is either already abandoned or in a state only
+			// the harder cleanups can address.
+			logger.warn("git merge --abort failed; falling back to resetting the target worktree", {
+				targetWorktree,
+				preMergeTargetSha,
+				error: String(err),
+			});
+		}
+	}
+
+	// Rung 2 — non-lossy by construction, so it is attempted before any snapshot is
+	// taken: on success there is nothing to preserve, and on refusal it wrote nothing.
+	try {
+		await gitService.resetMerge(targetWorktree, preMergeTargetSha);
+		return (await verifyAndRecord()) ?? {};
+	} catch (err) {
+		logger.warn("git reset --merge refused; falling back to a hard reset", {
+			targetWorktree,
+			strategy,
+			preMergeTargetSha,
+			error: String(err),
+		});
+	}
+
+	// Rung 3 — the lossy one. The snapshot is taken here rather than at the top of the
+	// function because this is the only rung that can destroy anything.
+	const preserved = await ensureChapterSnapshot(targetWorktree, "target state at merge conflict");
+
+	try {
+		await gitService.resetHard(targetWorktree, preMergeTargetSha);
+	} catch (err) {
+		logger.error("Could not clean up a conflicted merge; the target worktree is left dirty", {
+			targetWorktree,
+			strategy,
+			preMergeTargetSha,
+			error: String(err),
+		});
+		return {
+			warning:
+				`The merge conflicted and the target worktree could NOT be cleaned up (${String(err)}). ` +
+				`It still contains conflict markers — do not let it be committed. Reset it to ` +
+				`${preMergeTargetSha.slice(0, 12)} manually.` +
+				(preserved ? ` Its current state is in snapshot ${preserved.commitSha.slice(0, 12)}.` : ""),
+		};
+	}
+
+	const unclean = await verifyAndRecord();
+	if (unclean) return unclean;
+
+	// Reaching this rung means `--merge` refused, which only happens when the index holds
+	// a change the hard reset has just discarded — so unlike the other rungs this one
+	// always has something to report.
+	return {
+		warning:
+			`The merge conflicted, and cleaning it up required a hard reset to ` +
+			`${preMergeTargetSha.slice(0, 12)} because the target worktree held staged changes git ` +
+			`could not reconcile. That reset discarded them` +
+			(preserved
+				? `; snapshot ${preserved.commitSha.slice(0, 12)} holds the state from just before it.`
+				: ", and they could not be snapshotted first."),
+	};
+}
+
+/**
+ * The admission rules every entry point into a merge shares.
+ *
+ * Factored out because `checkConflicts` and `merge` had drifted: the check demanded an
+ * `active` source while the merge accepted `dormant` too, so the UI reported an error
+ * for an operation the API would happily perform — and the only way to do the legal
+ * thing was to skip the safety check. One function is the only way to keep a preview
+ * and its operation in agreement.
+ *
+ * The root chapter is rejected as a *source* specifically. Retiring a source nulls its
+ * `worktreePath` and removes the worktree, and the root chapter's worktree is the
+ * project's own git directory: `git worktree remove` reports a fatal error for the main
+ * working tree, so the directory survives while the row claims it is gone. Nothing can
+ * repair that afterwards — `chapterCleanup.dormant` refuses a root chapter, so does
+ * `chapterService.remove`, and unmerge needs the row's merge coordinates to be intact —
+ * leaving the project's main line with no operation that will accept it. As a merge
+ * *target* the root chapter is fine and common: a target keeps its worktree.
+ */
+function assertMergeableChapters(source: ChapterRow, target: ChapterRow): void {
+	if (source.isRoot) {
+		throw new ValidationError(
+			"The root chapter cannot be merged into another chapter: it owns the project's " +
+				"main working tree, which cannot be retired. Merge the other way round instead.",
+		);
+	}
+	if (source.status !== "active" && source.status !== "dormant") {
+		throw new ValidationError("Source chapter must be active or dormant");
+	}
+	if (target.status !== "active") throw new ValidationError("Target chapter must be active");
+	if (source.projectId !== target.projectId) {
+		throw new ValidationError("Cannot merge chapters from different projects");
+	}
+}
+
+/**
+ * Refuse to merge into a worktree that is not on the target's branch.
+ *
+ * A merge is recorded as having advanced `target.branch`, and every later reader
+ * believes it: unmerge resets that branch, the graph draws the edge, and the source is
+ * retired with its worktree deleted. On a detached HEAD the merge commit belongs to no
+ * branch at all, so it is unreachable the moment HEAD moves and `git gc` may collect
+ * it — the source's work would then be gone with the database still reporting a
+ * successful merge.
+ *
+ * Same shape as the check {@link autoCommitSourceBeforeMerge} already makes on the
+ * source side, and made inside the target's worktree lock so the branch cannot change
+ * between the check and the merge.
+ */
+async function assertTargetOnItsBranch(target: ChapterRow, targetWorktree: string): Promise<void> {
+	const currentBranch = (await gitService.getCurrentBranch(targetWorktree)).trim();
+	if (currentBranch !== target.branch) {
+		// `rev-parse --abbrev-ref HEAD` prints the literal "HEAD" for a detached head, so
+		// that string is translated rather than echoed as if it were a branch name.
+		const where = !currentBranch || currentBranch === "HEAD" ? "(detached)" : currentBranch;
+		throw new ValidationError(
+			`Target chapter worktree is on ${where}, expected branch ${target.branch}. ` +
+				`Check out ${target.branch} in the target worktree before merging, otherwise the ` +
+				"merge would produce a commit no branch points at.",
+		);
+	}
+}
+
+/**
  * Decide whether a merge runs in snapshot space or through git commits.
  *
  * Snapshot is the default because it is the only mode that can represent what the
@@ -427,11 +721,12 @@ export const chapterMerge = {
 		if (!target) throw new NotFoundError("Chapter", targetChapterId);
 		if (sourceChapterId === targetChapterId)
 			throw new ValidationError("Cannot merge a chapter into itself");
-		if (source.status !== "active") throw new ValidationError("Source chapter must be active");
-		if (target.status !== "active") throw new ValidationError("Target chapter must be active");
-		if (source.projectId !== target.projectId) {
-			throw new ValidationError("Cannot merge chapters from different projects");
-		}
+		// Deliberately the same admission rules as `merge`, down to the wording. A
+		// precondition that is stricter here than in the operation it previews is worse
+		// than no preview: the UI refuses a merge the API would have accepted, so the
+		// only way to perform a legal operation is to bypass the check that exists to
+		// make it safe.
+		assertMergeableChapters(source, target);
 
 		const gitPath = await getProjectGitPath(source.projectId);
 
@@ -589,14 +884,8 @@ export const chapterMerge = {
 		if (sourceChapterId === input.targetChapterId) {
 			throw new ValidationError("Cannot merge a chapter into itself");
 		}
-		if (source.status !== "active" && source.status !== "dormant") {
-			throw new ValidationError("Source chapter must be active or dormant");
-		}
-		if (target.status !== "active") throw new ValidationError("Target chapter must be active");
+		assertMergeableChapters(source, target);
 		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
-		if (source.projectId !== target.projectId) {
-			throw new ValidationError("Cannot merge chapters from different projects");
-		}
 
 		const gitPath = await getProjectGitPath(source.projectId);
 		const strategy = input.strategy ?? "merge";
@@ -637,11 +926,65 @@ export const chapterMerge = {
 		// window where another operation could modify the target between the
 		// SHA read and the actual merge.
 		return worktreeLock.acquire(targetWorktree, async () => {
+			await assertTargetOnItsBranch(target, targetWorktree);
 			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			let result: MergeResult;
 			if (strategy === "cherry-pick") {
+				// Cherry-pick has no snapshot equivalent — it replays a commit sequence, so
+				// commits are its whole output — but git also refuses to start it while the
+				// target is dirty, and *that* part is avoidable: the target's uncommitted work
+				// is parked in the DAG and three-way reapplied once the commits have landed.
+				// Without this, cherry-picking into a chapter someone is working in fails with
+				// git's "local changes would be overwritten" and nothing explains why.
+				const parked = await parkUncommittedWork(targetWorktree, "pre-cherry-pick target state");
+				// Persisted, not just held in this closure. Parking has already run
+				// `reset --hard` + `clean`, so at this instant the workspace is empty and the
+				// snapshot is the only copy — a crash or a restart during `cherryPick` used to
+				// take `parked.commitSha` with it and leave the work addressable from nowhere.
+				// These are the same two columns the Ruler's rebase path writes, which is why
+				// `schema.ts` describes them as coordinates a *later request* settles.
+				if (parked) await persistParkedWork(input.targetChapterId, parked);
 				const baseSha = await gitService.getMergeBase(gitPath, target.branch, source.branch);
-				result = await gitService.cherryPick(targetWorktree, gitPath, source.branch, baseSha);
+				try {
+					result = await gitService.cherryPick(targetWorktree, gitPath, source.branch, baseSha);
+				} catch (err) {
+					if (parked) {
+						await restoreParkedWork(targetWorktree, parked);
+						// The bytes are back on disk, so the debt is discharged and a stale pointer
+						// would make the next rebase restore a workspace the user has edited past.
+						await clearPersistedParkedWork(input.targetChapterId);
+					}
+					throw err;
+				}
+				if (parked) {
+					// `cherryPick` aborts internally on conflict, so the worktree is back at the
+					// pre-pick commit either way and the reapply is correct in both outcomes.
+					const reapplied = await reapplyParkedWork(targetWorktree, parked).catch((err) => {
+						logger.error("Could not reapply work parked for a cherry-pick", {
+							sourceChapterId,
+							targetChapterId: input.targetChapterId,
+							snapshotCommitSha: parked.commitSha,
+							error: String(err),
+						});
+						// Reported as a failure rather than as "no conflicts": the reapply wrote
+						// nothing, so treating it as clean would clear the coordinates below and
+						// strand the work. `null` keeps them, which is what makes the snapshot
+						// recoverable through `/ruler/rebase-parked`.
+						return null;
+					});
+					if (reapplied === null || reapplied.conflicts.length > 0) {
+						result = {
+							...result,
+							warning:
+								`The cherry-pick succeeded, but the target's uncommitted changes could not be ` +
+								`reapplied automatically (${reapplied?.conflicts.slice(0, 5).join(", ") ?? "reapply failed"}). ` +
+								`They are preserved in snapshot ${parked.commitSha.slice(0, 12)}.`,
+						};
+					} else {
+						// Landed back on disk — the only outcome that discharges the debt.
+						await clearPersistedParkedWork(input.targetChapterId);
+					}
+				}
 			} else {
 				result = await gitService.merge(targetWorktree, source.branch, strategy, message, {
 					fastForward: canFastForward,
@@ -678,26 +1021,81 @@ export const chapterMerge = {
 							preMergeTargetSha,
 						);
 					} catch (retryErr) {
-						// DB update failed twice — try to undo the git merge so we
-						// don't leave git and DB in an inconsistent state.
-						logger.error("Retry also failed, attempting git rollback", {
+						// DB update failed twice. Undoing the git merge keeps git and the DB
+						// consistent, but `reset --hard` is not a rollback in general — it
+						// discards *everything* between the two commits plus the whole working
+						// tree — so it is only issued when the evidence says nothing else is
+						// there to discard. When that cannot be established, the merge is left
+						// standing: an inconsistency the user can see and repair is strictly
+						// better than destroyed commits they cannot.
+						logger.error("Retry also failed, evaluating git rollback", {
 							sourceChapterId,
 							error: String(retryErr),
 						});
+						const unsafeRollback = async (reason: string): Promise<MergeResult> => {
+							logger.error("CRITICAL: DB update failed and the merge cannot be safely undone", {
+								sourceChapterId,
+								targetChapterId: input.targetChapterId,
+								mergeCommitSha: result.commitSha,
+								preMergeTargetSha,
+								reason,
+								dbError: String(retryErr),
+							});
+							return {
+								...result,
+								// Appended rather than assigned: a cherry-pick may already carry a
+								// warning naming the snapshot that holds work it could not reapply,
+								// and that is the one piece of information here the user cannot
+								// reconstruct from the repository.
+								warning:
+									`CRITICAL: the merge succeeded in git but the database update failed, and the ` +
+									`merge was NOT rolled back because ${reason}. The source chapter is still ` +
+									`marked unmerged while its work is present in ${target.branch}. Undo it ` +
+									`manually in the target worktree (its state before the merge was ` +
+									`${preMergeTargetSha.slice(0, 12)}). DB error: ${String(retryErr)}` +
+									(result.warning ? ` Also: ${result.warning}` : ""),
+							};
+						};
 						try {
 							const currentHead = (await gitService.getHeadCommit(targetWorktree)).trim();
-							logger.info("Recording current HEAD before git rollback", {
-								sourceChapterId,
-								currentHead,
-								rollbackTarget: preMergeTargetSha,
-							});
+							// The only state a reset can undo without collateral damage: HEAD is
+							// still exactly the commit this merge produced. Anything else means
+							// commits landed afterwards — an auto-commit, a narrator, the user —
+							// and resetting to the pre-merge sha would delete them too. The old
+							// code read this value, logged it, and then reset unconditionally.
+							if (!result.commitSha || currentHead !== result.commitSha.trim()) {
+								return await unsafeRollback(
+									`the target branch has moved on since the merge (HEAD is ` +
+										`${currentHead.slice(0, 12)}, the merge produced ` +
+										`${result.commitSha?.slice(0, 12) ?? "no commit"}), so resetting would ` +
+										`destroy the commits made after it`,
+								);
+							}
+							// `reset --hard` also wipes the working tree, and uncommitted work is
+							// exactly what has no other copy. Tracked modifications and staged
+							// changes both count; untracked files survive a reset, so they are not
+							// a reason to refuse.
+							const dirty = await gitService.getStatus(targetWorktree);
+							const dirtyTracked = dirty
+								.split("\n")
+								.filter((line) => line.trim() && !line.startsWith("??"));
+							if (dirtyTracked.length > 0) {
+								return await unsafeRollback(
+									`the target worktree has ${dirtyTracked.length} uncommitted change(s) that a ` +
+										`hard reset would erase`,
+								);
+							}
 							await gitService.resetHard(targetWorktree, preMergeTargetSha);
 							logger.info("Git rollback succeeded after DB failure", {
 								sourceChapterId,
+								resetTarget: preMergeTargetSha,
 							});
 							return {
 								success: false,
-								warning: `Merge rolled back: database update failed after git merge. Please retry. (${String(retryErr)})`,
+								warning:
+									`Merge rolled back: database update failed after git merge. Please retry. ` +
+									`(${String(retryErr)})` +
+									(result.warning ? ` Note from the merge itself: ${result.warning}` : ""),
 							};
 						} catch (resetErr) {
 							// Both DB and git rollback failed — critical state
@@ -708,7 +1106,10 @@ export const chapterMerge = {
 							});
 							return {
 								...result,
-								warning: `CRITICAL: Git merge succeeded but database update failed, and git rollback also failed. Manual intervention required. DB error: ${String(retryErr)}`,
+								warning:
+									`CRITICAL: Git merge succeeded but database update failed, and git rollback ` +
+									`also failed. Manual intervention required. DB error: ${String(retryErr)}` +
+									(result.warning ? ` Also: ${result.warning}` : ""),
 							};
 						}
 					}
@@ -720,11 +1121,19 @@ export const chapterMerge = {
 					targetId: input.targetChapterId,
 					files: result.conflictFiles,
 				});
+				// `cherryPick` aborts internally, so it is already clean; every other
+				// strategy is cleaned here, including squash — which cannot be aborted at
+				// all. See {@link cleanUpConflictedMerge}.
 				if (strategy !== "cherry-pick") {
-					try {
-						await gitService.mergeAbort(targetWorktree);
-					} catch {
-						// merge-abort may fail if no merge in progress
+					const cleanup = await cleanUpConflictedMerge(targetWorktree, strategy, preMergeTargetSha);
+					if (cleanup.warning) {
+						// Appended, since a warning already on `result` names something the user
+						// cannot reconstruct from the repository (a snapshot holding work that
+						// could not be reapplied).
+						result = {
+							...result,
+							warning: result.warning ? `${result.warning} ${cleanup.warning}` : cleanup.warning,
+						};
 					}
 				}
 			}
@@ -937,14 +1346,8 @@ export const chapterMerge = {
 		if (sourceChapterId === input.targetChapterId) {
 			throw new ValidationError("Cannot merge a chapter into itself");
 		}
-		if (source.status !== "active" && source.status !== "dormant") {
-			throw new ValidationError("Source chapter must be active or dormant");
-		}
-		if (target.status !== "active") throw new ValidationError("Target chapter must be active");
+		assertMergeableChapters(source, target);
 		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
-		if (source.projectId !== target.projectId) {
-			throw new ValidationError("Cannot merge chapters from different projects");
-		}
 
 		const gitPath = await getProjectGitPath(source.projectId);
 		const strategy = input.strategy ?? "merge";
@@ -979,6 +1382,7 @@ export const chapterMerge = {
 		);
 
 		return worktreeLock.acquire(targetWorktree, async () => {
+			await assertTargetOnItsBranch(target, targetWorktree);
 			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			const mergeResult = await gitService.mergeNoCommit(targetWorktree, source.branch, strategy);
 			if (!mergeResult.hasConflicts) {
@@ -1259,6 +1663,18 @@ export const chapterMerge = {
 		if (source.projectId !== target.projectId) {
 			throw new ValidationError("Cannot merge chapters from different projects");
 		}
+		// Only the root guard from `assertMergeableChapters`, not its status rules: this
+		// entry point deliberately never had them (it is reached from a retry after a
+		// conflict, where the source's status has already been decided) and imposing them
+		// now would refuse resolutions that work today. The root guard is different in
+		// kind — it prevents a state no later operation can repair, so it applies wherever
+		// a source can end up retired. See `assertMergeableChapters`.
+		if (source.isRoot) {
+			throw new ValidationError(
+				"The root chapter cannot be merged into another chapter: it owns the project's " +
+					"main working tree, which cannot be retired. Merge the other way round instead.",
+			);
+		}
 
 		const primaryNarrator = await db.query.narrators.findFirst({
 			where: and(eq(narrators.chapterId, input.targetChapterId), eq(narrators.variant, "primary")),
@@ -1300,7 +1716,37 @@ export const chapterMerge = {
 		// Lock the target worktree for the entire AI resolution.
 		// preMergeTargetSha is captured inside the lock (same rationale as merge()).
 		return worktreeLock.acquire(targetWorktree, async () => {
+			if (strategy !== "cherry-pick") await assertTargetOnItsBranch(target, targetWorktree);
 			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
+			/**
+			 * Undo whatever the failed resolution left in the worktree.
+			 *
+			 * Not `gitService.mergeAbort` directly: a squash merge leaves no `MERGE_HEAD`,
+			 * so abort exits 128 and — when its failure was swallowed — the markers stayed
+			 * on disk for the next unattended save to commit. See
+			 * {@link cleanUpConflictedMerge}. Cherry-pick is excluded because
+			 * `gitService.cherryPick` already aborts itself.
+			 */
+			const cleanUp = async (): Promise<string | undefined> => {
+				if (strategy === "cherry-pick") return undefined;
+				const cleanup = await cleanUpConflictedMerge(
+					targetWorktree,
+					strategy,
+					preMergeTargetSha,
+				).catch((err) => {
+					logger.error("Cleanup after a failed AI conflict resolution threw", {
+						sourceChapterId,
+						targetChapterId: input.targetChapterId,
+						error: String(err),
+					});
+					return {
+						warning:
+							`The target worktree may still contain conflict markers (cleanup failed: ` +
+							`${String(err)}). Reset it to ${preMergeTargetSha.slice(0, 12)} manually.`,
+					};
+				});
+				return cleanup.warning;
+			};
 			let conflictFiles: string[];
 
 			if (strategy === "cherry-pick") {
@@ -1361,10 +1807,12 @@ export const chapterMerge = {
 
 				const remainingConflicts = await gitService.getConflictFiles(targetWorktree);
 				if (remainingConflicts.length > 0) {
-					await gitService.mergeAbort(targetWorktree);
+					const cleanupWarning = await cleanUp();
 					return {
 						resolved: false,
-						error: `Narrator could not resolve all conflicts. Remaining: ${remainingConflicts.join(", ")}`,
+						error:
+							`Narrator could not resolve all conflicts. Remaining: ${remainingConflicts.join(", ")}` +
+							(cleanupWarning ? ` — ${cleanupWarning}` : ""),
 					};
 				}
 
@@ -1380,12 +1828,14 @@ export const chapterMerge = {
 				);
 			} catch (err) {
 				logger.error("AI conflict resolution failed", { error: String(err) });
-				try {
-					await gitService.mergeAbort(targetWorktree);
-				} catch {
-					// best effort
-				}
-				return { resolved: false, error: String(err) };
+				// The cleanup is reported rather than best-effort-and-silent: `autoCommit`
+				// now throws mid-conflict instead of committing markers, so this branch is
+				// reachable with an unmerged worktree that something has to describe.
+				const cleanupWarning = await cleanUp();
+				return {
+					resolved: false,
+					error: String(err) + (cleanupWarning ? ` — ${cleanupWarning}` : ""),
+				};
 			}
 		});
 	},
@@ -1415,6 +1865,14 @@ export const chapterMerge = {
 				mergeCommitSha: commitSha,
 				mergeStrategy: strategy as "merge" | "squash" | "cherry-pick",
 				preMergeTargetSha: preMergeTargetSha ?? null,
+				// This merge produced a real git commit, so any snapshot coordinate on the
+				// row belongs to an earlier commit-free merge that has since been undone.
+				// Leaving it would route this merge's unmerge down the snapshot path — with
+				// a base and a pre-merge tree from a merge that no longer exists — and
+				// reverse a merge that never happened over the target's current work. The
+				// paths a chapter can take here (merge → unmerge → merge in the other mode)
+				// make this reachable, not theoretical.
+				...clearedSnapshotMergeFields(),
 				updatedAt: now,
 			})
 			.where(eq(chapters.id, sourceChapterId));
@@ -1540,6 +1998,14 @@ export const chapterMerge = {
 	 * Uses `git reset --hard <mergeCommit>~1` instead of `git revert` because
 	 * revert poisons the merge base — a subsequent re-merge would silently
 	 * skip all previously merged commits.
+	 *
+	 * Reverting is only correct when the merge is *one* commit wide, and that is not
+	 * always true. A fast-forward merge does not create a commit at all: `mergeCommitSha`
+	 * ends up being the source branch's tip, and every commit between the pre-merge
+	 * state and that tip has been appended to the target. Reverting the tip then undoes
+	 * one of them and leaves the rest behind, with the database already reporting the
+	 * chapter unmerged — the source's work is silently in the target with nothing left
+	 * pointing at it. See {@link isMultiCommitMerge} for how that shape is recognised.
 	 */
 	async unmerge(sourceChapterId: string): Promise<{ ok: true; warning?: string }> {
 		const source = await db.query.chapters.findFirst({
@@ -1586,6 +2052,21 @@ export const chapterMerge = {
 				mergeCommitSha: source.mergeCommitSha,
 				resetTarget,
 			});
+		} else if (
+			await isMultiCommitMerge(target.worktreePath, source.mergeCommitSha, source.preMergeTargetSha)
+		) {
+			// A fast-forward brought several commits across and HEAD has since moved on, so
+			// neither undo is available: a reset would delete the target's later commits,
+			// and reverting `mergeCommitSha` would undo only the last of the appended ones
+			// while the database stops recording that the rest came from this chapter.
+			// Refusing keeps both sides intact and describes exactly what to undo.
+			throw new ValidationError(
+				`Cannot automatically unmerge: this merge fast-forwarded ${source.branch} onto ` +
+					`${target.branch}, so it introduced several commits rather than one, and the target ` +
+					`has advanced since. Reverting only the last of them would leave the rest behind. ` +
+					`Undo the range ${(source.preMergeTargetSha ?? "").slice(0, 12)}..` +
+					`${source.mergeCommitSha.slice(0, 12)} manually in the target worktree, then unmerge.`,
+			);
 		} else {
 			// Target has new commits — revert instead to preserve them
 			const isMerge = await gitService.isMergeCommit(target.worktreePath, source.mergeCommitSha);
@@ -1692,11 +2173,20 @@ export const chapterMerge = {
 	 * Undo a commit-free merge.
 	 *
 	 * Two halves, and the second is the one that is easy to overlook. Reversing the
-	 * target is a reverse three-way merge, which keeps whatever the target did after
-	 * the merge. Restoring the *source* then has to replay its snapshot: a commit-free
-	 * merge never advanced the source branch, so recreating its worktree from the
-	 * branch alone would return a directory holding only its last commit, silently
-	 * missing everything the user had not committed.
+	 * target is a three-way merge *based on the merge result*, which keeps whatever the
+	 * target did after the merge; see {@link planSnapshotUnmerge} for why the source
+	 * snapshot is the wrong base. Restoring the *source* then has to replay its
+	 * snapshot: a commit-free merge never advanced the source branch, so recreating its
+	 * worktree from the branch alone would return a directory holding only its last
+	 * commit, silently missing everything the user had not committed.
+	 *
+	 * Both coordinates are required and neither substitutes for the other. They are not
+	 * two views of the same thing: `mergeSnapshotCommitSha` is the merge *result* and is
+	 * the only correct base for reversing the target (see {@link planSnapshotUnmerge}),
+	 * while `mergedSourceSnapshotSha` is what gets replayed into the recreated source
+	 * worktree. Both are shas in the *target's* shadow repository, so a missing one is
+	 * reported rather than worked around — and step 2 degrades on its own if only the
+	 * source replay fails, which is why only step 1's coordinate is fatal.
 	 */
 	async unmergeSnapshot(source: ChapterRow): Promise<{ ok: true; warning?: string }> {
 		if (!source.mergedIntoChapterId) {
@@ -1721,10 +2211,16 @@ export const chapterMerge = {
 		const warnings: string[] = [];
 
 		// Step 1: reverse the source's contribution out of the target.
+		//
+		// The merge result is what the reversal is computed against, not the source
+		// snapshot: the merge result agrees with the pre-merge target on exactly the
+		// paths the source did not contribute to, which is what makes "roll back only
+		// the source's part" expressible as a single three-way merge.
+		const mergeSnapshotCommitSha = source.mergeSnapshotCommitSha;
 		await worktreeLock.acquire(targetWorktree, async () => {
 			const plan = await planSnapshotUnmerge(
 				targetWorktree,
-				source.mergedSourceSnapshotSha as string,
+				mergeSnapshotCommitSha,
 				preMergeTargetSnapshot,
 			);
 			if (plan.conflicts.length > 0) {

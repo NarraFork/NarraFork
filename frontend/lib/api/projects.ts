@@ -25,6 +25,55 @@ export interface ProjectGraphCapabilities {
 	[key: string]: unknown;
 }
 
+/**
+ * How a rebase's attempt to put parked work back on disk ended.
+ *
+ * `conflict` is a decision waiting for the user — the parked side and the rebased
+ * workspace disagree, and editing either can resolve it. `failed` is a NarraFork or git
+ * fault that no user action fixes. The distinction matters because the two used to be
+ * indistinguishable (both merely set `parkedSnapshot`), so a hard failure was reported
+ * with the same wording as an ordinary conflict.
+ */
+export type ParkedWorkStatus = "reapplied" | "conflict" | "failed" | "materialized";
+
+export interface ParkedWorkFields {
+	/**
+	 * Snapshot holding uncommitted work the rebase set aside. Present whenever work was
+	 * parked and did not make it fully back onto disk — a rebase no longer refuses a
+	 * dirty workspace, so this is how the user learns where it went.
+	 */
+	parkedSnapshot?: string;
+	/** True while the coordinates are still recorded, i.e. while recovery can still act. */
+	parkedWorkPending?: boolean;
+	parkedWorkStatus?: ParkedWorkStatus;
+	/** Paths whose reapplication conflicted with the rebased result. Set when status is `conflict`. */
+	reapplyConflictFiles?: string[];
+	/** Fault detail. Set instead of `reapplyConflictFiles` when status is `failed`. */
+	reapplyError?: string;
+	/**
+	 * An earlier rebase's parked work that can no longer be recovered at all — the
+	 * snapshot no longer resolves. Reported alongside an otherwise successful result,
+	 * because the alternative is that it disappears into a server log.
+	 */
+	lostParkedSnapshot?: string;
+}
+
+export interface RulerRebaseResponse extends ParkedWorkFields {
+	success: boolean;
+	commitSha?: string;
+	conflictFiles?: Array<{ file: string; conflictLines: number }>;
+}
+
+export interface RulerRebaseParkedResponse extends ParkedWorkFields {
+	success: boolean;
+	/** Set by the `discard` action. */
+	discardedSnapshot?: string;
+	/** Set by `materialize`: paths written with conflict markers. */
+	conflictFiles?: string[];
+	/** Set by `materialize`: how many paths the write touched. */
+	changedFiles?: number;
+}
+
 export interface ProjectGraphResponse {
 	nodes: ApiEntity[];
 	edges: ApiEntity[];
@@ -242,13 +291,27 @@ export const projectsApi = {
 			body: JSON.stringify({ chapterId }),
 		}),
 	rulerRebase: (projectId: string, chapterId: string) =>
-		request<{
-			success: boolean;
-			commitSha?: string;
-			conflictFiles?: Array<{ file: string; conflictLines: number }>;
-		}>(`/projects/${projectId}/ruler/rebase`, {
+		request<RulerRebaseResponse>(`/projects/${projectId}/ruler/rebase`, {
 			method: "POST",
 			body: JSON.stringify({ chapterId }),
+		}),
+	/**
+	 * Act on work a rebase parked and could not put back.
+	 *
+	 * `retry` re-attempts the three-way reapply (worth offering, because the conflicting
+	 * side is the current workspace and editing it can make the same merge succeed),
+	 * `materialize` writes the conflicted tree with markers so it can be resolved in an
+	 * editor, and `discard` forgets the coordinates. Restoring the parked tree wholesale
+	 * is deliberately not offered by the server: it would overwrite the rebased result.
+	 */
+	rulerRebaseParked: (
+		projectId: string,
+		chapterId: string,
+		action: "retry" | "materialize" | "discard",
+	) =>
+		request<RulerRebaseParkedResponse>(`/projects/${projectId}/ruler/rebase-parked`, {
+			method: "POST",
+			body: JSON.stringify({ chapterId, action }),
 		}),
 	rulerRebaseResolve: (
 		projectId: string,

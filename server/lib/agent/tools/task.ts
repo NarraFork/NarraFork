@@ -292,6 +292,9 @@ export const agentTool: ToolDefinition = {
 				background: run_in_background || false,
 				timeoutMs: timeout,
 				alias: alias || description || undefined,
+				// The subagent acts on behalf of whoever triggered this parent turn:
+				// knowledge ACL and fast-mode "inherit" both resolve against them.
+				userId: ctx.userId ?? null,
 			});
 
 			// Register alias for ALL subagents (foreground and background)

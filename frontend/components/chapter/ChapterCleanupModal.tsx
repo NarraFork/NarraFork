@@ -3,6 +3,11 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import {
+	extractCleanupErrors,
+	extractSkippedIds,
+	showOperationWarnings,
+} from "../../lib/operation-warnings";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 
 const MAX_CHAPTER_CLEANUP_LABEL_CHARS = 500;
@@ -39,6 +44,9 @@ export function ChapterCleanupModal({ chapters, opened, onClose }: ChapterCleanu
 		onClose();
 	};
 
+	const titleOf = (chapterId: string): string =>
+		clampCleanupLabel(chapters.find((ch) => ch.id === chapterId)?.title ?? chapterId);
+
 	const cleanup = useMutation({
 		mutationFn: () =>
 			api.cleanupChapters({
@@ -46,9 +54,35 @@ export function ChapterCleanupModal({ chapters, opened, onClose }: ChapterCleanu
 				force,
 				deleteBranch,
 			}),
-		onSuccess: () => {
+		onSuccess: (result) => {
+			// The report distinguishes cleaned from skipped and failed chapters, and the
+			// request succeeds either way. Closing the modal on success used to swallow
+			// both lists, so a cleanup that did nothing looked identical to one that
+			// removed everything. Skipped chapters are named by id only, so resolve the
+			// titles here from the list the user selected from.
+			const skipped = extractSkippedIds(result);
+			const errors = extractCleanupErrors(result);
+			const lines = [
+				...skipped.map((id) => t("cleanupSkippedItem", { title: titleOf(id) })),
+				...errors.map((entry) =>
+					t("cleanupErrorItem", {
+						title: titleOf(entry.chapterId),
+						error: entry.error || tc("unknownError"),
+					}),
+				),
+			];
+			if (skipped.length > 0) lines.push(t("cleanupSkippedReason"));
+			showOperationWarnings(t("cleanupSkippedTitle"), lines);
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
+			// Cleanup removes worktrees and branches, so the story network and the timeline
+			// are as stale afterwards as they are after a merge — and they were being left
+			// alone, which kept both views showing the chapter as active until something
+			// else happened to refetch them. Same set as `ChapterMergeModal`.
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
+			qc.invalidateQueries({ queryKey: ["ruler"] });
+			qc.invalidateQueries({ queryKey: ["rulerSegment"] });
+			qc.invalidateQueries({ queryKey: ["chapterEdges"] });
 			handleClose();
 		},
 	});

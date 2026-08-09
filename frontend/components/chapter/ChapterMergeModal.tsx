@@ -3,12 +3,15 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, api } from "../../lib/api";
+import { notifyResultWarnings } from "../../lib/operation-warnings";
 
 interface MergeCheckResult {
 	hasConflicts: boolean;
 	conflictFiles: string[];
 	isFastForward: boolean;
 }
+
+type MergeMode = "snapshot" | "commit";
 
 const MERGE_MODAL_QUERY_GC_TIME_MS = 60_000;
 
@@ -27,6 +30,10 @@ export function ChapterMergeModal({
 }: ChapterMergeModalProps) {
 	const [targetId, setTargetId] = useState<string | null>(null);
 	const [strategy, setStrategy] = useState<string>("merge");
+	// Defaults to snapshot, matching the server's own default: merging the workspaces
+	// as they stand, without touching the user's git history. `commit` is opt-in
+	// because it is the mode that requires clean worktrees and writes history.
+	const [mode, setMode] = useState<MergeMode>("snapshot");
 	const [message, setMessage] = useState("");
 	const [conflicts, setConflicts] = useState<MergeCheckResult | null>(null);
 	const qc = useQueryClient();
@@ -45,7 +52,13 @@ export function ChapterMergeModal({
 	const requireReview = !!cs?.requireReviewBeforeMerge;
 
 	// Query latest review conclusion for the source chapter
-	const { data: reviewData } = useQuery({
+	const {
+		data: reviewData,
+		isPending: reviewPending,
+		isError: reviewQueryFailed,
+		refetch: refetchReview,
+		isFetching: reviewFetching,
+	} = useQuery({
 		queryKey: ["reviewConclusion", "source", chapterId],
 		queryFn: () => api.getReviewConclusionForSource(chapterId),
 		enabled: opened && requireReview,
@@ -53,11 +66,21 @@ export function ChapterMergeModal({
 	});
 
 	const reviewVerdict = reviewData?.conclusion?.verdict ?? null;
-	const reviewBlocked = requireReview && reviewVerdict !== "approve";
+	// Three states, not two. `reviewData` is undefined both while the query is in
+	// flight and when it failed, and treating either as "not approved" left the
+	// merge button permanently disabled on a transient network error — including
+	// for chapters that DO have an approval recorded. Only a loaded conclusion that
+	// is not an approval actually blocks; a failure is surfaced as a retryable
+	// notice and leaves the decision with the user, who can see the review itself.
+	const reviewLoading = requireReview && reviewPending;
+	const reviewUnknown = requireReview && reviewQueryFailed;
+	const reviewBlocked =
+		requireReview && !reviewLoading && !reviewUnknown && reviewVerdict !== "approve";
 
 	const resetState = () => {
 		setTargetId(null);
 		setStrategy("merge");
+		setMode("snapshot");
 		setMessage("");
 		setConflicts(null);
 	};
@@ -90,9 +113,15 @@ export function ChapterMergeModal({
 			api.mergeChapter(chapterId, {
 				targetChapterId: targetId ?? "",
 				strategy,
+				mode,
 				message: message.trim() || undefined,
 			}),
-		onSuccess: () => {
+		onSuccess: (result) => {
+			// The server answers `{ success: true, warning }` when the merge went
+			// through but left something behind — most often a source worktree kept
+			// because its snapshot could not be verified. Closing on success without
+			// reading it meant the only record was a server log.
+			notifyResultWarnings(t("mergeWarning"), result);
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
 			// A merge changes the story network and the timeline too, and these were being
@@ -130,6 +159,16 @@ export function ChapterMergeModal({
 					]}
 					value={strategy}
 					onChange={(v) => setStrategy(v ?? "merge")}
+				/>
+				<Select
+					label={t("mergeMode")}
+					data={[
+						{ value: "snapshot", label: t("mergeModeSnapshot") },
+						{ value: "commit", label: t("mergeModeCommit") },
+					]}
+					value={mode}
+					onChange={(v) => setMode(v === "commit" ? "commit" : "snapshot")}
+					description={mode === "commit" ? t("mergeModeCommitDesc") : t("mergeModeSnapshotDesc")}
 				/>
 				<TextInput
 					label={t("mergeMessage")}
@@ -182,6 +221,29 @@ export function ChapterMergeModal({
 					</Alert>
 				)}
 
+				{reviewUnknown && (
+					<Alert color="yellow" title={t("reviewConclusionFailed")}>
+						<Stack gap="xs">
+							<Text size="sm">{t("reviewConclusionFailedDesc")}</Text>
+							<Button
+								size="xs"
+								variant="light"
+								loading={reviewFetching}
+								onClick={() => void refetchReview()}
+								style={{ alignSelf: "flex-start" }}
+							>
+								{t("reviewConclusionRetry")}
+							</Button>
+						</Stack>
+					</Alert>
+				)}
+
+				{reviewLoading && (
+					<Text size="sm" c="dimmed">
+						{t("reviewConclusionLoading")}
+					</Text>
+				)}
+
 				{reviewBlocked && (
 					<Alert
 						color={reviewVerdict === "request_changes" ? "red" : "orange"}
@@ -210,7 +272,10 @@ export function ChapterMergeModal({
 				<Button
 					onClick={() => merge.mutate()}
 					loading={merge.isPending}
-					disabled={!targetId || reviewBlocked}
+					// Only a loaded "not approved" conclusion, or a check still in flight,
+					// blocks. A failed check does not: it says nothing about the verdict, and
+					// disabling on it made an already-approved chapter unmergeable.
+					disabled={!targetId || reviewBlocked || reviewLoading}
 				>
 					{t("merge")}
 				</Button>

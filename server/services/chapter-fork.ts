@@ -19,6 +19,7 @@ import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { FileHistoryError, rebuildFileStatesAtMessage } from "./file-state-rebuild";
 import { gitService } from "./git-service";
+import { ensureRefsCoverMessage } from "./narrator-refs-backfill";
 import { narratorService } from "./narrator-service";
 import { portAllocator } from "./port-allocator";
 import {
@@ -71,32 +72,88 @@ function isRiskyNarraforkStartupScript(script: string, worktreePath: string): bo
  * does not match any uuid is also tried as a row id, since older callers passed
  * the id through that field. An unresolvable coordinate is a client error rather
  * than a silent fall back to HEAD, which would fork from the wrong point.
+ *
+ * The resolved message is then checked for *membership* in the chapter being
+ * forked, because "this row exists" and "this row is a fork point for this
+ * chapter" are different questions. Lookups are by global id, so a subagent
+ * message resolves fine here and then fails every downstream resolution: subagent
+ * messages carry a `parentToolUseId` and are never referenced by the primary
+ * narrator, so commit resolution, snapshot resolution and file-state rebuild all
+ * returned nothing and the fork silently fell back to the parent's HEAD. Worse,
+ * that combination (`forkMessage` set, no restore error) skipped both warning
+ * paths, so the parent's entire uncommitted workspace was dropped with no output
+ * at all. Rejecting is correct rather than conservative: forking "at" a subagent
+ * message has no defined workspace state, since the subagent's writes are recorded
+ * against its own timeline.
  */
 async function resolveForkPointMessage(
+	chapterId: string,
 	input: Pick<ForkChapterInput, "forkAtMessageId" | "forkAtMessageUuid">,
 ): Promise<{ id: string; messageUuid: string | null } | null> {
-	if (input.forkAtMessageId) {
-		const byId = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, input.forkAtMessageId),
-			columns: { id: true, messageUuid: true },
-		});
-		if (!byId) throw new ValidationError("Fork message not found");
-		return byId;
+	const resolved = await (async () => {
+		if (input.forkAtMessageId) {
+			const byId = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, input.forkAtMessageId),
+				columns: { id: true, messageUuid: true, parentToolUseId: true },
+			});
+			if (!byId) throw new ValidationError("Fork message not found");
+			return byId;
+		}
+		if (input.forkAtMessageUuid) {
+			const byUuid = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.messageUuid, input.forkAtMessageUuid),
+				columns: { id: true, messageUuid: true, parentToolUseId: true },
+			});
+			if (byUuid) return byUuid;
+			const byId = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, input.forkAtMessageUuid),
+				columns: { id: true, messageUuid: true, parentToolUseId: true },
+			});
+			if (!byId) throw new ValidationError("Fork message not found");
+			return byId;
+		}
+		return null;
+	})();
+	if (!resolved) return null;
+
+	if (resolved.parentToolUseId) {
+		throw new ValidationError(
+			"Cannot fork at a subagent message. Subagent work is recorded on its own timeline, " +
+				"so there is no chapter-level state to fork from — pick a message from the " +
+				"chapter's main conversation instead.",
+		);
 	}
-	if (input.forkAtMessageUuid) {
-		const byUuid = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.messageUuid, input.forkAtMessageUuid),
-			columns: { id: true, messageUuid: true },
-		});
-		if (byUuid) return byUuid;
-		const byId = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, input.forkAtMessageUuid),
-			columns: { id: true, messageUuid: true },
-		});
-		if (!byId) throw new ValidationError("Fork message not found");
-		return byId;
+
+	const primaryNarrator = await db.query.narrators.findFirst({
+		where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+		columns: { id: true },
+	});
+	if (!primaryNarrator) {
+		throw new ValidationError(
+			"This chapter has no primary narrator, so a message cannot be used as a fork point.",
+		);
 	}
-	return null;
+	// Lazily-forked narrators keep older refs in an ancestor rather than their own
+	// table, so a legitimate fork point may not be materialized yet. Materialize it
+	// before concluding the message does not belong here.
+	await ensureRefsCoverMessage(primaryNarrator.id, resolved.id).catch(() => {
+		// A backfill failure is reported by the membership check below.
+	});
+	const ref = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+			eq(narratorMessageRefs.messageId, resolved.id),
+		),
+		columns: { seq: true },
+	});
+	if (!ref) {
+		throw new ValidationError(
+			"That message does not belong to this chapter's conversation, so it cannot be used " +
+				"as a fork point.",
+		);
+	}
+
+	return { id: resolved.id, messageUuid: resolved.messageUuid };
 }
 
 export const chapterFork = {
@@ -109,8 +166,20 @@ export const chapterFork = {
 			where: eq(chapters.id, parentChapterId),
 		});
 		if (!parent) throw new NotFoundError("Chapter", parentChapterId);
-		if (parent.status !== "active") {
-			throw new ValidationError("Can only fork active chapters");
+		// A dormant parent is forkable; a merged or abandoned one is not.
+		//
+		// Dormant means "worktree removed, branch kept", and a branch tip is all this
+		// function needs — every worktree-dependent step below already has a null-path
+		// branch (commit resolution falls back to the repository HEAD, the snapshot copy
+		// and copyFiles are skipped, the dirty check does not apply). Refusing it was a
+		// pure limitation, and a costly one: `maxActiveWorktrees` defaults to 10, so
+		// auto-dormant silently made older chapters unforkable until the user waked one,
+		// which rebuilds a worktree and mutates the parent's state just to read its tip.
+		//
+		// Merged and abandoned stay rejected because their branches may already be
+		// deleted, so there is no guarantee of anything to fork from.
+		if (parent.status !== "active" && parent.status !== "dormant") {
+			throw new ValidationError("Can only fork active or dormant chapters");
 		}
 
 		const project = await db.query.projects.findFirst({
@@ -133,7 +202,7 @@ export const chapterFork = {
 		// Resolve the fork point message once, from whichever coordinate the caller
 		// supplied. Everything downstream (commit resolution, file-state rebuild,
 		// narrator fork) works off the local row id.
-		const forkMessage = await resolveForkPointMessage(input);
+		const forkMessage = await resolveForkPointMessage(parentChapterId, input);
 
 		// Resolve the commit SHA for the fork point.
 		// Priority: startCommitSha (ruler mode) > fork point message > parent HEAD
@@ -146,11 +215,17 @@ export const chapterFork = {
 				forkMessage.id,
 				gitPath,
 				parent.worktreePath,
+				parent.branch,
 			);
 		} else {
+			// With no worktree the fork point is the parent's *branch* tip, resolved by
+			// name. `getHeadCommit(gitPath)` reads the main repository's checkout instead —
+			// usually trunk — so a dormant parent would be forked from a commit that has
+			// nothing to do with it, silently producing a child that is missing all of the
+			// parent's work rather than continuing from it.
 			commitSha = parent.worktreePath
 				? await gitService.getHeadCommit(parent.worktreePath)
-				: await gitService.getHeadCommit(gitPath);
+				: await gitService.getRefCommit(gitPath, parent.branch);
 		}
 
 		const forkPoint: {
@@ -172,6 +247,17 @@ export const chapterFork = {
 
 			await gitService.createWorktree(gitPath, worktreePath, branchName);
 			rollback.push(() => gitService.removeWorktree(gitPath, worktreePath));
+			// The snapshot steps below create a shadow repository for this worktree (and
+			// write `refs/nf/head` into it), and neither automatic cleanup path can reach
+			// one that a rollback leaves behind: `gcAll` only removes directories missing a
+			// HEAD, and the orphan sweep only walks `.worktrees` directories that still
+			// exist on disk — which rollback has just deleted. Registered here, before the
+			// repo exists, so it covers every later step regardless of where the failure
+			// happens; `destroy` on a non-existent directory is a no-op. `force` is required
+			// because the chapter row (if it got as far as being inserted) claims this key.
+			rollback.push(async () => {
+				await worktreeTreeSnapshot.destroy(worktreePath, undefined, { force: true });
+			});
 
 			// Step 1.5: Put the new worktree into the state the fork point actually
 			// describes.
@@ -215,7 +301,12 @@ export const chapterFork = {
 						// ancestry, and a later merge would have no merge base to reason from —
 						// every overlapping edit would surface as a conflict.
 						baseSnapshotCommit = snapshot.commitSha
-							? await this.adoptParentLineage(parent.worktreePath, worktreePath, snapshot.commitSha)
+							? await this.adoptParentLineage(
+									parent.worktreePath,
+									worktreePath,
+									snapshot.commitSha,
+									id,
+								)
 							: null;
 						logger.info("Restored forked worktree from tree snapshot", {
 							parentChapterId,
@@ -326,23 +417,47 @@ export const chapterFork = {
 				}
 			}
 
-			// A fork with no named fork point has no replay path to fall back on: replay
-			// reconstructs state from recorded Write/Edit inputs, and without a message
-			// there is no point in the timeline to replay up to. So if the snapshot could
-			// not be applied, the worktree is sitting at a commit and any uncommitted
-			// parent work is absent. Say so — this case used to pass silently, which is
-			// how uncommitted work went missing without the user ever being told.
-			if (!forkMessage && !restoredFromTree && parent.worktreePath) {
-				const dirty = await gitService.getStatus(parent.worktreePath).catch(() => "");
-				if (dirty.trim().length > 0) {
+			// Whenever the byte-exact copy did not happen, report the uncommitted parent
+			// state this fork is missing.
+			//
+			// Gated on `!restoredFromTree` alone, deliberately decoupled from whether a fork
+			// point was named. The old `!forkMessage` condition left the most damaging case
+			// silent: a named fork point that resolves to no usable snapshot (a message
+			// whose narrator recorded none, or one that is not the chapter's at all) sets
+			// `forkMessage` without restoring anything, so this guard was skipped, and the
+			// replay path's own warning only fires when a restore was *attempted and
+			// failed*. The parent's whole uncommitted workspace could therefore be absent
+			// from the fork with no output whatsoever.
+			if (!restoredFromTree && parent.worktreePath) {
+				const status = await gitService
+					.getStatus(parent.worktreePath)
+					.then((out) => ({ ok: true as const, out }))
+					.catch((err) => ({ ok: false as const, error: String(err) }));
+				if (!status.ok) {
+					// "Could not check" is not "clean", and conflating the two is what the
+					// previous `.catch(() => "")` did: the single case where the code cannot
+					// tell whether work is being lost was also the case where it said nothing.
+					logger.warn("Could not check the parent for uncommitted work during fork", {
+						parentChapterId,
+						childChapterId: id,
+						error: status.error,
+					});
+					warnings.push(
+						`Could not check the parent worktree for uncommitted changes (${status.error}), ` +
+							`so this fork starts from commit ${commitSha.slice(0, 7)}. If the parent had ` +
+							"uncommitted work, it is not part of this fork.",
+					);
+				} else if (status.out.trim().length > 0) {
 					logger.warn("Forked without the parent's uncommitted state", {
 						parentChapterId,
 						childChapterId: id,
+						forkedFromMessage: forkMessage != null,
 					});
 					warnings.push(
 						"The parent's uncommitted changes could not be captured, so this fork starts from " +
-							`its last commit (${commitSha.slice(0, 7)}) instead. Check the parent worktree ` +
-							"before continuing.",
+							`its last commit (${commitSha.slice(0, 7)})${
+								forkMessage ? " plus whatever recorded file edits could be replayed" : ""
+							}. Check the parent worktree before continuing.`,
 					);
 				}
 			}
@@ -586,16 +701,29 @@ export const chapterFork = {
 		messageId: string,
 		gitPath: string,
 		worktreePath: string | null,
+		branch?: string,
 	): Promise<string> {
+		/**
+		 * The chapter's own tip.
+		 *
+		 * With a worktree that is its HEAD; without one it has to be resolved by branch
+		 * name, because `gitPath`'s HEAD is the main repository's checkout (usually trunk)
+		 * and has no relationship to this chapter. `branch` is optional only for older
+		 * callers; when it is absent the previous, weaker fallback is kept.
+		 */
+		const chapterTip = async (): Promise<string> => {
+			if (worktreePath) return gitService.getHeadCommit(worktreePath);
+			if (branch) return gitService.getRefCommit(gitPath, branch);
+			return gitService.getHeadCommit(gitPath);
+		};
+
 		// Find the primary narrator for this chapter
 		const primaryNarrator = await db.query.narrators.findFirst({
 			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
 		});
 		if (!primaryNarrator) {
 			logger.warn("No primary narrator found for commit resolution, using HEAD", { chapterId });
-			return worktreePath
-				? await gitService.getHeadCommit(worktreePath)
-				: await gitService.getHeadCommit(gitPath);
+			return chapterTip();
 		}
 
 		const targetMsg = await db.query.narratorMessages.findFirst({
@@ -604,9 +732,7 @@ export const chapterFork = {
 		});
 		if (!targetMsg) {
 			logger.warn("Fork message not found, using HEAD", { messageId });
-			return worktreePath
-				? await gitService.getHeadCommit(worktreePath)
-				: await gitService.getHeadCommit(gitPath);
+			return chapterTip();
 		}
 
 		// If the target message itself has a commitSha, use it directly
@@ -623,9 +749,7 @@ export const chapterFork = {
 		});
 		if (!targetRef) {
 			logger.warn("Fork message not in narrator refs, using HEAD", { messageId });
-			return worktreePath
-				? await gitService.getHeadCommit(worktreePath)
-				: await gitService.getHeadCommit(gitPath);
+			return chapterTip();
 		}
 
 		// Walk backwards from the target message to find the nearest commitSha
@@ -649,14 +773,12 @@ export const chapterFork = {
 			return rows[0].commitSha;
 		}
 
-		// No commit found in message history, fall back to HEAD
+		// No commit found in message history, fall back to the chapter's tip
 		logger.warn("No commitSha found in message history before fork point, using HEAD", {
 			chapterId,
 			messageId,
 		});
-		return worktreePath
-			? await gitService.getHeadCommit(worktreePath)
-			: await gitService.getHeadCommit(gitPath);
+		return chapterTip();
 	},
 
 	/**
@@ -709,12 +831,21 @@ export const chapterFork = {
 		parentWorktreePath: string,
 		worktreePath: string,
 		parentSnapshotCommit: string,
+		childChapterId: string,
 	): Promise<string | null> {
 		try {
-			// Point a temporary ref at the exact fork commit: the parent's head may have
-			// moved past it (forking from an earlier message), and fetching the head would
-			// import a state the fork never observed.
-			const forkRef = snapshotIncomingRef(`fork-${generateShortId(8)}`);
+			// Point a ref at the exact fork commit: the parent's head may have moved past it
+			// (forking from an earlier message), and fetching the head would import a state
+			// the fork never observed.
+			//
+			// The key is the child chapter id rather than a random one. A random key left a
+			// ref behind on every fork with no deleter anywhere, and each of those refs kept
+			// its snapshot commit and the whole tree under it reachable — permanently, since
+			// `gcAll` runs `gc --no-prune`. A deterministic key is overwritten by a repeat
+			// call for the same child, so the parent's shadow repo accumulates at most one
+			// ref per fork instead of one per attempt, and the ref that remains names
+			// something meaningful (which child adopted which commit).
+			const forkRef = snapshotIncomingRef(`fork-${childChapterId}`);
 			await worktreeTreeSnapshot.setRef(parentWorktreePath, forkRef, parentSnapshotCommit);
 			const adopted = await worktreeTreeSnapshot.fetchSnapshotFrom(
 				worktreePath,

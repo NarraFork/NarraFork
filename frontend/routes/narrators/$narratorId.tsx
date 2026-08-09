@@ -51,6 +51,7 @@ import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/use
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../lib/history-state";
+import { notifyResultWarnings } from "../../lib/operation-warnings";
 import {
 	isNarratorSubject,
 	onPanelDragEnd,
@@ -328,6 +329,12 @@ function NarratorDetailPage() {
 			qc.invalidateQueries({ queryKey: ["graph"] });
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			qc.invalidateQueries({ queryKey: ["narraFlow"] });
+			// A fork from a past message is reconstructed, and the server says how: the
+			// parent's exact workspace may not have been copyable, in which case the new
+			// worktree was rebuilt from recorded Write/Edit inputs and changes made by
+			// shell commands or outside the narrator are absent. Shown before the success
+			// toast so the ordering matches ChapterForkModal.
+			notifyResultWarnings(tc("forkWarning"), data);
 			if (data?.id) {
 				const narrators = await api.listNarrators({ chapterId: data.id });
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic API response

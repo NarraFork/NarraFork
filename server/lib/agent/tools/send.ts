@@ -152,6 +152,7 @@ export const sendTool: ToolDefinition = {
 				toolUseId: ctx.currentToolUseId,
 				signal: ctx.signal,
 				locale: ctx.locale,
+				userId: ctx.userId ?? null,
 			});
 			return {
 				output: result.output,

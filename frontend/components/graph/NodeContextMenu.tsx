@@ -1,4 +1,13 @@
-import { Divider, Paper, Stack, Text, UnstyledButton } from "@mantine/core";
+import {
+	Divider,
+	Paper,
+	Stack,
+	Text,
+	Tooltip,
+	UnstyledButton,
+	VisuallyHidden,
+} from "@mantine/core";
+import { useId } from "react";
 import { useTranslation } from "react-i18next";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
 import { Z } from "../../lib/z-index";
@@ -9,6 +18,69 @@ function clampNodeContextTitle(value: string): string {
 	return value.length > MAX_NODE_CONTEXT_TITLE_CHARS
 		? `${value.slice(0, MAX_NODE_CONTEXT_TITLE_CHARS)}…`
 		: value;
+}
+
+/**
+ * A menu action that can be unavailable, and says why.
+ *
+ * Uses `aria-disabled` plus a `data-disabled` style hook instead of the native
+ * `disabled` attribute. `<button disabled>` receives no pointer events at all, so the
+ * wrapping Mantine `Tooltip` never saw a hover and the explanation
+ * (`forkRequiresActive` / `dormantRequiresWorktree`) could not be shown — `opacity: 0.4`
+ * was the only signal, and a screen reader heard "disabled" with no reason. A disabled
+ * button is also dropped from the tab order, so the reason was unreachable by keyboard
+ * even in principle.
+ *
+ * Staying focusable keeps both channels open: the tooltip fires on hover and focus, and
+ * the reason is also attached through `aria-describedby` so it is announced whether or
+ * not the tooltip is open. The click guard has to live here instead of in the DOM, which
+ * is why `onClick` is only called when the action is available.
+ */
+function MenuAction({
+	label,
+	color,
+	reason,
+	available,
+	onSelect,
+}: {
+	label: string;
+	color?: string;
+	/** Why the action is unavailable. Shown as a tooltip and as the accessible description. */
+	reason?: string;
+	available: boolean;
+	onSelect: () => void;
+}) {
+	const reasonId = useId();
+	const button = (
+		<UnstyledButton
+			px="xs"
+			py={4}
+			onClick={() => available && onSelect()}
+			aria-disabled={available ? undefined : true}
+			data-disabled={available ? undefined : true}
+			aria-describedby={!available && reason ? reasonId : undefined}
+			style={{
+				borderRadius: 4,
+				opacity: available ? 1 : 0.4,
+				cursor: available ? undefined : "not-allowed",
+			}}
+		>
+			<Text size="sm" c={color}>
+				{label}
+			</Text>
+		</UnstyledButton>
+	);
+	if (available || !reason) return button;
+	return (
+		<>
+			<Tooltip label={reason} position="right" withinPortal>
+				{button}
+			</Tooltip>
+			{/* Sibling, not a child of the button: nesting it would fold the reason into the
+			    button's accessible name, so it would be read out as part of every label. */}
+			<VisuallyHidden id={reasonId}>{reason}</VisuallyHidden>
+		</>
+	);
 }
 
 interface ReviewActionAvailability {
@@ -69,6 +141,23 @@ export function NodeContextMenu({
 	const displayTitle = clampNodeContextTitle(nodeData.title);
 	const fsRevealCapability = useFsRevealCapability();
 	const canReveal = fsRevealCapability.supported && !!nodeData.worktreePath;
+	// Mirrors `chapterFork.fork`, which accepts an active OR dormant parent and rejects
+	// merged/abandoned. Dormant is deliberately allowed: it is an ordinary resting state
+	// that auto-dormant produces on a timer, and forking one resolves the start commit
+	// from the branch rather than a live worktree, so no worktree is needed.
+	const canFork = nodeData.status === "active" || nodeData.status === "dormant";
+	// Mirrors `chapterCleanup.dormant`, which requires BOTH an active status and a
+	// worktree — a chapter can be active with `worktreePath: null` (e.g. after a
+	// merge that kept the directory but cleared the column), and the status check
+	// alone let that through.
+	const canDormant = nodeData.status === "active" && !!nodeData.worktreePath;
+	// Dormant only. `chapterCleanup.wake` now refuses a merged chapter and points at
+	// unmerge instead: waking one used to erase the merge coordinates while leaving its
+	// changes applied in the target, producing a chapter that looked independent but
+	// could no longer be unmerged and would re-apply its diff if merged again.
+	const canWake = nodeData.status === "dormant";
+	// Same active-or-dormant rule as fork, mirroring `reviewService.createReview`.
+	const canReview = nodeData.status === "active" || nodeData.status === "dormant";
 	const effectiveReviewActions = reviewActions ?? {
 		request: true,
 		convertToSubagent: true,
@@ -110,9 +199,12 @@ export function NodeContextMenu({
 					<Text size="xs" fw={600} c="dimmed" px="xs">
 						{displayTitle}
 					</Text>
-					<UnstyledButton px="xs" py={4} onClick={() => onFork(nodeId)} style={{ borderRadius: 4 }}>
-						<Text size="sm">{t("contextMenu.fork")}</Text>
-					</UnstyledButton>
+					<MenuAction
+						label={t("contextMenu.fork")}
+						reason={t("contextMenu.forkRequiresActive")}
+						available={canFork}
+						onSelect={() => onFork(nodeId)}
+					/>
 					{canReveal && (
 						<UnstyledButton
 							px="xs"
@@ -123,20 +215,22 @@ export function NodeContextMenu({
 							<Text size="sm">{t("contextMenu.revealInExplorer")}</Text>
 						</UnstyledButton>
 					)}
-					{nodeData.status === "active" &&
-						nodeData.role !== "review" &&
-						effectiveReviewActions.request && (
-							<UnstyledButton
-								px="xs"
-								py={4}
-								onClick={() => onReview(nodeId)}
-								style={{ borderRadius: 4 }}
-							>
-								<Text size="sm" c="yellow">
-									{t("contextMenu.review")}
-								</Text>
-							</UnstyledButton>
-						)}
+					{/* Dormant included: `reviewService.createReview` accepts active OR dormant
+					    sources, for the same reason fork does — dormancy is a timer-driven
+					    resting state, and refusing it made auto-dormant silently remove the
+					    review action from older chapters. */}
+					{canReview && nodeData.role !== "review" && effectiveReviewActions.request && (
+						<UnstyledButton
+							px="xs"
+							py={4}
+							onClick={() => onReview(nodeId)}
+							style={{ borderRadius: 4 }}
+						>
+							<Text size="sm" c="yellow">
+								{t("contextMenu.review")}
+							</Text>
+						</UnstyledButton>
+					)}
 					{nodeData.status === "active" && nodeData.role === "review" && (
 						<>
 							<Divider my={4} />
@@ -203,16 +297,14 @@ export function NodeContextMenu({
 							))}
 							<Divider my={4} />
 							{nodeData.status === "active" && (
-								<UnstyledButton
-									px="xs"
-									py={4}
-									onClick={() => onDormant(nodeId)}
-									style={{ borderRadius: 4 }}
-								>
-									<Text size="sm">{t("contextMenu.dormant")}</Text>
-								</UnstyledButton>
+								<MenuAction
+									label={t("contextMenu.dormant")}
+									reason={t("contextMenu.dormantRequiresWorktree")}
+									available={canDormant}
+									onSelect={() => onDormant(nodeId)}
+								/>
 							)}
-							{(nodeData.status === "dormant" || nodeData.status === "merged") && (
+							{canWake && (
 								<UnstyledButton
 									px="xs"
 									py={4}

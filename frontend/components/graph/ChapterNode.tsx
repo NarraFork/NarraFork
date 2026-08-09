@@ -8,6 +8,7 @@ import { useTranslation } from "react-i18next";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
 import { CHAPTER_ROLE_ICONS, CHAPTER_STATUS_COLORS, statusRegistry } from "../../lib/constants";
+import { notifyResultWarnings } from "../../lib/operation-warnings";
 import { NarratorPanel } from "../narrator/NarratorPanel";
 import { NarratorPanelSkeleton } from "../narrator/NarratorPanelSkeleton";
 
@@ -69,6 +70,10 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 			queryClient.invalidateQueries({ queryKey: ["graph"] });
 			queryClient.invalidateQueries({ queryKey: ["narrators"] });
 			queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+			// Same reconstruction warnings as ChapterForkModal: a fork from a past
+			// message may be rebuilt from recorded file edits, without Bash or
+			// external-editor changes. Dropping them here made a lossy fork look clean.
+			notifyResultWarnings(tch("forkWarning"), data);
 			if (data?.id) {
 				// Add the forked chapter to recent tabs immediately
 				const narrators = await api.listNarrators({ chapterId: data.id });

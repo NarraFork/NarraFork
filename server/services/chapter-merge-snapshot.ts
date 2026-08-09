@@ -187,7 +187,18 @@ export async function applySnapshotMerge(
 	if (plan.conflicts.length > 0) {
 		throw new ValidationError("Refusing to apply a conflicted merge tree");
 	}
-	const changedFiles = await worktreeTreeSnapshot.materializeTree(targetWorktree, plan.tree);
+	// Guarded on the state the plan was computed from. `planSnapshotMerge` captures the
+	// target precisely so files present only on disk take part in the three-way merge,
+	// but that makes the result specific to that capture: anything written afterwards is
+	// outside the merged tree, and materialising it would delete the file rather than
+	// merge it. Aborting instead lets the caller retry against the newer state, which is
+	// cheap; the alternative is silent loss.
+	const changedFiles = await worktreeTreeSnapshot.materializeTree(
+		targetWorktree,
+		plan.tree,
+		undefined,
+		plan.preMergeTree,
+	);
 	const commitSha = await worktreeTreeSnapshot.commitSnapshot(
 		targetWorktree,
 		plan.tree,
@@ -279,6 +290,22 @@ function hasConflictMarkers(text: string): boolean {
  * Stronger than `git merge --abort`, which can only restore what git was tracking:
  * this restores the recorded workspace, so files the user had not staged — including
  * untracked ones present when the merge began — come back as they were.
+ *
+ * Deliberately *not* guarded with `expectedCurrentTree`, unlike {@link applySnapshotMerge}
+ * and {@link applySnapshotUnmerge}. The two cases differ in what the caller knows:
+ *
+ *   - An apply writes a tree computed from a specific state, so a state that moved
+ *     invalidates the tree and the write must be refused.
+ *   - An abort writes a tree that is correct by definition — the recorded pre-merge
+ *     bytes — and runs precisely when the worktree has been edited past the conflicted
+ *     tree, because a narrator or the user was part-way through resolving. Guarding it
+ *     on the conflicted tree would make abort fail in exactly the situation it exists
+ *     for and leave conflict markers on disk with nothing left to clean them up.
+ *
+ * The hazard an abort does have — replaying a stale restore over work done after an
+ * earlier abort — is addressed where the coordinate lives rather than here: the
+ * `merge_sessions` row's snapshot fields are cleared once consumed, so there is no
+ * second abort to issue. See `chapter-batch-merge.resolveDecision`.
  */
 export async function abortSnapshotMerge(
 	targetWorktree: string,
@@ -360,41 +387,104 @@ export interface SnapshotUnmergePlan {
 	conflicts: string[];
 	/** Target snapshot the reversal was computed from. */
 	targetSnapshot: string;
+	/** Tree of that snapshot, for the drift guard when the plan is applied. */
+	preUnmergeTree: string;
 }
 
 /**
  * Compute the reversal of a snapshot merge, without writing anything.
  *
- * A reverse three-way merge: base is the source snapshot that was merged in, "ours"
- * is the target as it stands now, and "theirs" is the state before the merge. git
- * keeps `ours` wherever base and theirs agree, so only the source's contribution is
- * rolled back and any work the target did *after* the merge is preserved. That single
- * operation covers both cases the commit path needs two branches for (reset when the
- * target has not moved, revert when it has).
+ * A three-way merge whose base is **the merge result**: `base = the tree the merge
+ * produced`, `ours = the target as it stands now`, `theirs = the target's state
+ * immediately before the merge`. git keeps `ours` wherever base and theirs agree, so
+ * base→theirs contributes exactly the inverse of what the source added, and
+ * base→ours contributes everything the target did afterwards. One operation therefore
+ * covers both cases the commit path needs two branches for (reset when the target has
+ * not moved, revert when it has).
  *
- * A conflict means the target has since edited the very lines being reversed, which is
- * a genuine question for a human — the same situation where the commit path reports
- * that revert conflicts.
+ * The base is emphatically *not* the source snapshot that was merged in, which is the
+ * obvious-looking choice and is wrong in two ways that both show up in practice:
+ *
+ *   - For a path the source never touched, source→theirs still differs by whatever
+ *     the target had edited *before* the merge. git reads that as a theirs-side
+ *     change and reintroduces it — so an edit the target made pre-merge and then
+ *     deliberately undid post-merge comes back from the dead, silently.
+ *   - When the source only *added* files, source→theirs and source→ours disagree
+ *     about every pre-existing file, so a merge that touched nothing in common
+ *     reports conflicts and the unmerge refuses to run at all.
+ *
+ * Both disappear with base = merge result, because the merge result agrees with the
+ * pre-merge target on precisely the paths the source did not contribute to.
+ *
+ * All three sides are passed as trees through {@link worktreeTreeSnapshot.mergeTreesWithBase}
+ * rather than as snapshot commits. The base has to be stated explicitly — deriving it
+ * from ancestry would find the common ancestor of the two sides, which is a different
+ * question — and trees make it impossible to mistake this for an ordinary merge.
+ *
+ * A conflict now means what it says: the target has since edited the very lines being
+ * reversed, which is a genuine question for a human — the same situation where the
+ * commit path reports that revert conflicts.
  */
 export async function planSnapshotUnmerge(
 	targetWorktree: string,
-	mergedSourceSnapshotSha: string,
+	mergeSnapshotCommitSha: string,
 	preMergeTargetSnapshotSha: string,
 ): Promise<SnapshotUnmergePlan> {
 	const current = await ensureChapterSnapshot(targetWorktree, "pre-unmerge target state");
 	if (!current) {
 		throw new ValidationError("Could not capture the target chapter's workspace before unmerging");
 	}
-	const reversed = await worktreeTreeSnapshot.reverseMergeSnapshots(
+	// Resolved rather than assumed, and a failure refuses the unmerge instead of
+	// falling back to another base: every other candidate produces a *plausible but
+	// wrong* tree, and writing that out is worse than declining. The merge result stays
+	// reachable through `refs/nf/head` in the normal case, so this is the abnormal one
+	// (a swept shadow repository, a hand-edited row).
+	//
+	// `mergedSourceSnapshotSha` is the obvious-looking fallback and is deliberately NOT
+	// used, for two independent reasons:
+	//
+	//   - It is not a *source-side* coordinate despite the name. It is
+	//     `planSnapshotMerge`'s `plan.sourceSnapshot`, i.e. the sha the source lineage
+	//     received after being fetched INTO the target's shadow repository, and every
+	//     lookup here goes through that same repository. So in the case this branch
+	//     actually fires — the target's shadow repo swept or rebuilt, which
+	//     `chapterService.remove` / `dismissReview` / `convertToSubagent` all do via
+	//     `destroy(..., { force: true })` — it has gone with the merge result and
+	//     resolves no better.
+	//   - Even where it does resolve, it is the wrong base. See this function's own
+	//     doc comment: with the source snapshot as base, a pre-merge target edit that
+	//     was later undone is resurrected, and a source that only added files reports
+	//     conflicts on paths the merge never touched. Both are silent wrong answers,
+	//     which is worse than a refusal the user can act on.
+	//
+	// So the refusal is kept and made actionable instead: it names what is missing and
+	// the coordinate in the user's *real* git history to aim at, which is the one thing
+	// here that does not live in a shadow repository.
+	const mergeResultTree = await worktreeTreeSnapshot
+		.treeOfSnapshot(targetWorktree, mergeSnapshotCommitSha)
+		.catch(() => null);
+	if (!mergeResultTree) {
+		throw new ValidationError(
+			`This merge cannot be reversed automatically: the snapshot recording its result ` +
+				`(${mergeSnapshotCommitSha.slice(0, 12)}) is no longer in the target chapter's ` +
+				`snapshot store, which usually means that chapter's worktree was deleted and ` +
+				`recreated. Reversing it from any other recorded state would produce a ` +
+				`plausible-looking but wrong result, so nothing has been changed. ` +
+				`To undo it by hand, compare the target worktree against its pre-merge commit; ` +
+				`the source chapter's own work is restored separately and is unaffected by this.`,
+		);
+	}
+	const reversed = await worktreeTreeSnapshot.mergeTreesWithBase(
 		targetWorktree,
-		mergedSourceSnapshotSha,
-		current.commitSha,
+		mergeResultTree,
+		current.treeHash,
 		preMergeTargetSnapshotSha,
 	);
 	return {
 		tree: reversed.tree,
 		conflicts: reversed.conflicts,
 		targetSnapshot: current.commitSha,
+		preUnmergeTree: current.treeHash,
 	};
 }
 
@@ -407,7 +497,15 @@ export async function applySnapshotUnmerge(
 	if (plan.conflicts.length > 0) {
 		throw new ValidationError("Refusing to apply a conflicted unmerge tree");
 	}
-	const changed = await worktreeTreeSnapshot.materializeTree(targetWorktree, plan.tree);
+	// Guarded on the state the plan was computed from: the reversal is only the correct
+	// answer for that exact workspace, so a write landing in between must abort the
+	// apply rather than have its work overwritten by a tree that never saw it.
+	const changed = await worktreeTreeSnapshot.materializeTree(
+		targetWorktree,
+		plan.tree,
+		undefined,
+		plan.preUnmergeTree,
+	);
 	const commitSha = await worktreeTreeSnapshot.commitSnapshot(
 		targetWorktree,
 		plan.tree,

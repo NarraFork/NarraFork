@@ -28,10 +28,12 @@ import { projectDbManager } from "../lib/project-db";
 import { createProjectSchema, updateProjectSchema } from "../lib/validators";
 import { chapterService } from "../services/chapter-service";
 import { refreshCache as refreshContainerProxyCache } from "../services/container-proxy";
+import { containerService } from "../services/container-service";
 import { gitService } from "../services/git-service";
 import { integrationResourceBindingService } from "../services/integration-resource-binding-service";
 import { propagateOAuthProjectRemoval } from "../services/oauth-runtime-revocation";
 import { ensureGitignoreEntry } from "../services/project-db-sync";
+import { terminalService } from "../services/terminal-service";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
 
 export const projectRoutes = new Hono();
@@ -375,6 +377,36 @@ projectRoutes.delete("/:id", async (c) => {
 	).map((ch) => ch.id);
 
 	if (remainingChapterIds.length > 0) {
+		// Host-side cleanup first, and this is no longer optional.
+		//
+		// These chapters are the ones whose `removeForProjectDeletion` threw, so their
+		// containers and terminals are still running and their ports still allocated.
+		// The rows below used to be deleted with `chapter_id` at `ON DELETE NO ACTION`,
+		// where a surviving container row made `DELETE FROM chapters` fail loudly — ugly,
+		// but it kept the host and the database describing the same world. Those FKs now
+		// cascade, so deleting the rows silently succeeds and leaves a Podman container
+		// running against a project that no longer exists, holding a port nothing will
+		// ever release. Best-effort per chapter: one host that refuses to stop must not
+		// strand the whole project as undeletable.
+		for (const chapterId of remainingChapterIds) {
+			try {
+				await terminalService.cleanupForChapter(chapterId);
+			} catch (err) {
+				logger.warn("Failed to stop terminals during project delete fallback", {
+					chapterId,
+					error: String(err),
+				});
+			}
+			try {
+				await containerService.removeChapterContainers(chapterId, { deleteVolumes: true });
+			} catch (err) {
+				logger.warn("Failed to remove containers during project delete fallback", {
+					chapterId,
+					error: String(err),
+				});
+			}
+		}
+
 		const remainingNarratorIds = (
 			await db.query.narrators.findMany({
 				where: inArray(narrators.chapterId, remainingChapterIds),

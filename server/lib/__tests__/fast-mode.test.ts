@@ -4,6 +4,7 @@ import {
 	legacyFastModeMirror,
 	resolveFastMode,
 	resolveFastModeForUser,
+	resolveSubagentActingUserId,
 } from "../fast-mode";
 
 describe("resolveFastMode", () => {
@@ -45,6 +46,24 @@ describe("fastModeOverrideFromLegacyInput", () => {
 	test("an explicit override takes precedence over the legacy boolean", () => {
 		expect(fastModeOverrideFromLegacyInput("inherit", true)).toBe("inherit");
 		expect(fastModeOverrideFromLegacyInput("off", true)).toBe("off");
+	});
+});
+
+describe("resolveSubagentActingUserId", () => {
+	test("the turn's own user wins when the run carries one", () => {
+		expect(resolveSubagentActingUserId("user-turn", "user-parent")).toBe("user-turn");
+	});
+
+	// Recovery/detached restarts start a subagent with no triggering user; without
+	// this fallback an "inherit" fast-mode preference silently resolved to off.
+	test("falls back to the parent session user when the run has none", () => {
+		expect(resolveSubagentActingUserId(null, "user-parent")).toBe("user-parent");
+		expect(resolveSubagentActingUserId(undefined, "user-parent")).toBe("user-parent");
+	});
+
+	test("stays anonymous only when neither side knows the user", () => {
+		expect(resolveSubagentActingUserId(null, null)).toBeNull();
+		expect(resolveSubagentActingUserId(undefined, undefined)).toBeNull();
 	});
 });
 

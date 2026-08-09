@@ -59,4 +59,30 @@ describe("Agent task tool", () => {
 		});
 		expect(updateExecutionLease.transfer).not.toHaveBeenCalled();
 	});
+
+	// The subagent acts for whoever triggered this parent turn. Dropping the id
+	// made the child anonymous, so "inherit" preferences (fast mode) fell back to
+	// the disabled default no matter what the user had configured.
+	test("forwards the triggering user so inherited preferences resolve", async () => {
+		runCalls.length = 0;
+		const ctx: ToolContext = {
+			narratorId: "parent-narrator",
+			cwd: "/worktree",
+			signal: new AbortController().signal,
+			locale: "en",
+			currentToolUseId: "agent-tool-use-2",
+			userId: "user-42",
+			updateExecutionLease: {
+				kind: "resumable",
+				setNarratorId: mock(() => {}),
+				transfer: mock(() => true),
+				release: mock(() => {}),
+			},
+			requestPermission: async () => ({ behavior: "allow" }),
+		};
+
+		await agentTool.execute({ prompt: "check preference plumbing", subagent_type: "general" }, ctx);
+
+		expect(runCalls[0]).toMatchObject({ userId: "user-42" });
+	});
 });

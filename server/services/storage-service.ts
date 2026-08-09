@@ -6,7 +6,7 @@ import { eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narratorMessages, narrators, projects } from "../db/schema";
 import { logger } from "../lib/logger";
-import { getNarraforkHome } from "../lib/narrafork-home";
+import { getNarraforkHome, getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
 import { databaseCleanupService } from "./database-cleanup-service";
@@ -40,6 +40,24 @@ export interface StorageScanResult {
 const NARRAFORK_DIR = getNarraforkHome();
 const SHARES_DIR = resolve(NARRAFORK_DIR, "shares");
 const TREE_SNAPSHOTS_DIR = resolve(NARRAFORK_DIR, "tree-snapshots");
+/**
+ * Git-ignored files a dormant chapter parked outside its worktree.
+ *
+ * Accounted for here because it is the one data area holding content git refuses to
+ * track — `.env` files, local credentials — and nothing else in the storage view would
+ * ever mention it. A chapter's own terminal transitions now discard its archive, but
+ * directories created before that was true have no owner at all, which is what the
+ * sweep below collects.
+ *
+ * Resolved per call rather than into a module constant, unlike the paths above.
+ * `getNarraforkHome` reads `NARRAFORK_HOME` on every call precisely so an override can
+ * land after import, and freezing this one at module load meant the sweep and its caller
+ * could be looking at different directories — the sweep would find nothing, report
+ * success, and leave the archives in place.
+ */
+function dormantIgnoredDir(): string {
+	return getNarraforkPath("dormant-ignored");
+}
 
 // ── Cache ──────────────────────────────────────────────────────────────────
 
@@ -292,6 +310,45 @@ async function scanTreeSnapshots(): Promise<StorageCategoryResult> {
 	};
 }
 
+/**
+ * Ignored-file archives left by dormant chapters (`~/.narrafork/dormant-ignored`).
+ *
+ * Reported separately from the snapshot repositories because the contents are the
+ * user's untracked secrets rather than derived data, so "how much is here and is any of
+ * it orphaned" is a question worth being able to answer.
+ */
+async function scanDormantIgnored(): Promise<StorageCategoryResult> {
+	const dir = dormantIgnoredDir();
+	const measured = await measureDirSize(dir);
+	let archiveCount = 0;
+	let orphanCount = 0;
+	try {
+		const entries = await readdir(dir, { withFileTypes: true });
+		const dirs = entries.filter((e) => e.isDirectory());
+		archiveCount = dirs.length;
+		if (dirs.length > 0) {
+			// One bounded query rather than a lookup per directory: the id set is
+			// human-scale (one entry per chapter that has ever gone dormant).
+			const liveChapterIds = new Set(
+				db
+					.select({ id: chapters.id })
+					.from(chapters)
+					.all()
+					.map((row) => row.id),
+			);
+			orphanCount = dirs.filter((dir) => !liveChapterIds.has(dir.name)).length;
+		}
+	} catch {
+		// dir may not exist yet
+	}
+	return {
+		key: "dormantIgnored",
+		sizeBytes: measured.sizeBytes,
+		...(measured.truncated ? { truncated: true } : {}),
+		details: { archiveCount, orphanCount },
+	};
+}
+
 async function scanWorktrees(): Promise<StorageCategoryResult> {
 	let totalSize = 0;
 	let worktreeCount = 0;
@@ -531,6 +588,12 @@ export async function* scanStorage(
 	yield { type: "category", data: treeSnapshotsResult };
 
 	throwIfAborted(signal);
+	yield { type: "progress", message: "scanning_dormant_ignored" };
+	const dormantIgnoredResult = await scanDormantIgnored();
+	categories.push(dormantIgnoredResult);
+	yield { type: "category", data: dormantIgnoredResult };
+
+	throwIfAborted(signal);
 	yield { type: "progress", message: "scanning_containers" };
 	const containersResult = await scanContainers();
 	categories.push(containersResult);
@@ -588,6 +651,69 @@ export async function cleanupOrphanedUploads(): Promise<{ removed: number; freed
 	}
 
 	// Invalidate cache
+	cachedResult = null;
+	return { removed, freedBytes };
+}
+
+/**
+ * Remove ignored-file archives whose chapter no longer exists.
+ *
+ * The archive is written when a chapter goes dormant and consumed when it wakes, so its
+ * lifetime is bounded by a chapter that can still do both. Chapter deletion, project
+ * deletion and batch cleanup now discard it directly, but directories created before
+ * that was true have no owner and no expiry — and what they hold is precisely the files
+ * git refuses to track, i.e. the user's plaintext credentials sitting under
+ * `~/.narrafork` indefinitely.
+ *
+ * Keyed on the chapter row existing at all rather than on its status: a dormant chapter
+ * still needs its archive, and any status can still be woken or deleted, so the row
+ * disappearing is the only signal that nothing will ever read it again.
+ */
+export async function cleanupOrphanedIgnoredArchives(): Promise<{
+	removed: number;
+	freedBytes: number;
+}> {
+	const baseDir = dormantIgnoredDir();
+	if (!existsSync(baseDir)) return { removed: 0, freedBytes: 0 };
+
+	let removed = 0;
+	let freedBytes = 0;
+	try {
+		const entries = await readdir(baseDir, { withFileTypes: true });
+		const liveChapterIds = new Set(
+			db
+				.select({ id: chapters.id })
+				.from(chapters)
+				.all()
+				.map((row) => row.id),
+		);
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			if (liveChapterIds.has(entry.name)) continue;
+			const dirPath = resolve(baseDir, entry.name);
+			// Per directory, not around the loop: one unreadable or permission-denied
+			// archive must not stop the sweep, because everything after it would then stay
+			// on disk indefinitely while the caller was told the clean-up ran.
+			try {
+				const size = await dirSize(dirPath);
+				await rm(dirPath, { recursive: true, force: true });
+				removed++;
+				freedBytes += size;
+				logger.info("Removed an ignored-file archive with no chapter", {
+					chapterId: entry.name,
+					size,
+				});
+			} catch (err) {
+				logger.warn("Could not remove an orphaned ignored-file archive", {
+					chapterId: entry.name,
+					error: String(err),
+				});
+			}
+		}
+	} catch (err) {
+		logger.error("Failed to clean up orphaned ignored-file archives", { error: String(err) });
+	}
+
 	cachedResult = null;
 	return { removed, freedBytes };
 }
@@ -685,6 +811,17 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 		logger.error("Failed to cleanup orphaned worktrees", { error: String(err) });
 	}
 
+	// Ignored-file archives are swept on the same trigger: they are the same class of
+	// leftover (per-chapter state outside the repository, orphaned when a chapter row
+	// goes), and a user reclaiming space has no reason to run two separate actions.
+	try {
+		const archives = await cleanupOrphanedIgnoredArchives();
+		removed += archives.removed;
+		freedBytes += archives.freedBytes;
+	} catch (err) {
+		logger.warn("Failed to sweep orphaned ignored-file archives", { error: String(err) });
+	}
+
 	// Repack the surviving snapshot repos. Each captured state writes loose objects,
 	// so without this they grow with every tool call. Runs after the orphan sweep so
 	// removed repos are not repacked first.
@@ -717,6 +854,7 @@ export const storageService = {
 	invalidateStorageCache,
 	scanStorage,
 	cleanupOrphanedUploads,
+	cleanupOrphanedIgnoredArchives,
 	cleanupAllShares,
 	cleanupOrphanedWorktrees,
 	pruneContainerImages,

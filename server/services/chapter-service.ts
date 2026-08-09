@@ -8,6 +8,7 @@ import {
 	narrators,
 	portAllocations,
 	projects,
+	terminals,
 	terminalTabs,
 	terminalViewState,
 } from "../db/schema";
@@ -18,7 +19,7 @@ import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { slugify } from "../lib/slug";
-import { chapterCleanup } from "./chapter-cleanup";
+import { chapterCleanup, discardIgnoredArchive } from "./chapter-cleanup";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
@@ -26,7 +27,7 @@ import { narratorService } from "./narrator-service";
 import { interruptNarrator } from "./narrator-session";
 import { terminalService } from "./terminal-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
-import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
+import { snapshotIncomingRef, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 /** Slash command definition stored in user preferences or project chapterSettings. */
 export interface CommandParam {
@@ -357,9 +358,13 @@ export const chapterService = {
 					chapterId: id,
 					error: String(err),
 				});
-				await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
-				await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
 			}
+			// Unconditional for the same reason as in `remove()`: these three FKs are
+			// NO ACTION, so a surviving row aborts the chapter delete below — and here that
+			// would abort the whole project deletion partway through.
+			await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
+			await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
+			await db.delete(terminals).where(eq(terminals.chapterId, id));
 
 			// Clean up git worktree — skip root chapters (their worktreePath is the repo itself)
 			if (chapter.worktreePath && projectGitPath && !chapter.isRoot) {
@@ -383,6 +388,14 @@ export const chapterService = {
 						}),
 					);
 			}
+
+			// Ignored-file archive from any dormant cycle. Not covered by the worktree
+			// removal above (it lives outside the repo, in `~/.narrafork/dormant-ignored`)
+			// and only ever consumed by a wake that can no longer happen. Since it holds
+			// precisely the untracked files — `secret.env`, `config.local.json`, tokens —
+			// deleting the project while leaving it behind meant leaving plaintext
+			// credentials on disk permanently.
+			discardIgnoredArchive(id);
 
 			// Detach self-referencing FKs pointing to this chapter
 			await db
@@ -438,10 +451,22 @@ export const chapterService = {
 					chapterId: id,
 					error: String(err),
 				});
-				// Fall back to DB-only cleanup
-				await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
-				await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
 			}
+			// Unconditionally, not only on the failure path above.
+			//
+			// `container_instances.chapter_id` and `port_allocations.chapter_id` are
+			// `ON DELETE NO ACTION`, so any surviving row makes the `DELETE FROM chapters`
+			// below fail with FOREIGN KEY constraint failed and takes the whole deletion
+			// down with it — after the worktree and branch are already gone. Doing this
+			// only inside the catch was not enough: `removeChapterContainers` can also
+			// return successfully while leaving rows behind (proxy mode deliberately keeps
+			// port allocations, and its own deletes are best-effort).
+			await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
+			await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
+			// Same class of FK, reached through a different table: `terminals.chapter_id` is
+			// also NO ACTION, and `cleanupForChapter` above deletes only rows it managed to
+			// enumerate. A row left by a failed kill would block the chapter delete.
+			await db.delete(terminals).where(eq(terminals.chapterId, id));
 
 			// Clean up git resources
 			if (chapter.worktreePath) {
@@ -469,6 +494,38 @@ export const chapterService = {
 							error: String(err),
 						}),
 					);
+			}
+
+			// Same for the ignored-file archive a dormant cycle may have left in
+			// `~/.narrafork/dormant-ignored/<id>`. It sits outside the repo, so removing the
+			// worktree does not touch it, and only a wake consumes it — which a deleted
+			// chapter can never have. Its contents are the files git refuses to track, i.e.
+			// the user's plaintext secrets, so "delete this chapter" has to mean them too.
+			discardIgnoredArchive(id);
+
+			// And the fork ref this chapter left in its *parent's* shadow repository.
+			//
+			// `adoptParentLineage` writes `refs/nf/incoming/fork-<childId>` there so the fork
+			// can fetch the exact commit it branched from. That ref lives in a repository this
+			// deletion does not touch, and it is a GC root: `gcAll` runs `gc --no-prune`, so
+			// while it exists the parent keeps that snapshot commit and every tree beneath it
+			// on disk for a chapter that no longer exists. The parent's own worktree path is
+			// needed to find the repository, so this runs before the row is gone.
+			if (chapter.parentChapterId) {
+				const parent = await db.query.chapters.findFirst({
+					where: eq(chapters.id, chapter.parentChapterId),
+					columns: { worktreePath: true },
+				});
+				if (parent?.worktreePath) {
+					await worktreeTreeSnapshot
+						.deleteRef(parent.worktreePath, snapshotIncomingRef(`fork-${id}`))
+						.catch((err) =>
+							logger.debug("Failed to drop the fork ref from the parent's snapshot repo", {
+								chapterId: id,
+								error: String(err),
+							}),
+						);
+				}
 			}
 
 			// Detach self-referencing FKs pointing to this chapter

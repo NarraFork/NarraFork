@@ -28,6 +28,10 @@ interface SegmentChapter {
 	reviewStatus: string | null;
 	startCommitSha: string | null;
 	mergeCommitSha: string | null;
+	/** Backbone anchor for the merge connector; see PixiChapterInfo. */
+	mergeAnchorCommitSha?: string | null;
+	/** Uncommitted work an earlier rebase parked; see RulerPixiChapterPayload. */
+	parkedSnapshot?: string | null;
 	anchorCommitSha: string | null;
 	axisOffset: number;
 	crossOffset: number;
@@ -195,6 +199,8 @@ export const SegmentCanvas = memo(
 						reviewStatus: ch.reviewStatus,
 						startCommitSha: ch.startCommitSha,
 						mergeCommitSha: ch.mergeCommitSha,
+						mergeAnchorCommitSha: ch.mergeAnchorCommitSha,
+						parkedSnapshot: ch.parkedSnapshot,
 						layoutX: ch.layoutX,
 						layoutY: ch.layoutY,
 					})),

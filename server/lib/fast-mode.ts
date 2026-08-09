@@ -70,6 +70,22 @@ export async function getUserFastModeDefault(userId: string | null | undefined):
 	return pref?.fastModeDefault ?? false;
 }
 
+/**
+ * Acting user for a subagent turn.
+ *
+ * A subagent has no owner of its own, and several paths start it without a
+ * triggering user (planned-update recovery, detached background restarts, tool
+ * calls that predate userId plumbing). Falling back to the parent session's
+ * current user keeps "inherit" preferences — fast mode in particular — resolving
+ * against a real person instead of silently degrading to the anonymous default.
+ */
+export function resolveSubagentActingUserId(
+	turnUserId: string | null | undefined,
+	parentSessionUserId: string | null | undefined,
+): string | null {
+	return turnUserId ?? parentSessionUserId ?? null;
+}
+
 /** Resolve the effective fast mode for a narrator row + the acting user. */
 export async function resolveFastModeForUser(
 	override: unknown,

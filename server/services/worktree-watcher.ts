@@ -14,6 +14,14 @@
  * If the native worker is disabled or unhealthy, the service keeps the same
  * registry active and falls back to low-frequency git-status polling. The main
  * server never loads @parcel/watcher's native addon directly.
+ *
+ * The native worker is opt-in (`NARRAFORK_ENABLE_NATIVE_WATCHER`), so polling is not a
+ * rare degraded mode — it is the default path for every attached narrator. That makes
+ * the per-tick cost a main-thread budget question rather than a footnote: a polled tick
+ * that finds an unchanged git status therefore skips the snapshot capture and DAG
+ * advance, which is where the expensive work is — but only for a bounded run of ticks,
+ * because an unchanged status signature does not prove an unchanged workspace. See
+ * `_processChange` and `MAX_SKIPPED_POLLS`.
  */
 
 import { relative } from "node:path";
@@ -65,7 +73,36 @@ interface WatcherEntry {
 	pendingPaths?: Set<string>;
 	/** True when more paths changed than {@link MAX_PENDING_PATHS} allows. */
 	pendingPathsTruncated?: boolean;
+	/**
+	 * Consecutive polled ticks skipped on an unchanged status signature.
+	 *
+	 * Reset by any tick that actually captures. Bounded by {@link MAX_SKIPPED_POLLS};
+	 * see `_processChange` for why an unchanged signature is not proof of an unchanged
+	 * workspace.
+	 */
+	skippedPolls?: number;
 }
+
+/**
+ * Skipped polled ticks after which one capture runs regardless of the signature.
+ *
+ * The signature is *not* strictly content-derived, contrary to what this file used to
+ * claim. It folds in `git diff --numstat` counts, the status code and the path, so a
+ * same-size edit to an already-dirty file — replacing `foo` with `bar` on one line —
+ * keeps `1 1`, keeps ` M`, keeps the path, and produces a byte-identical signature while
+ * the file on disk has different content. Every such tick was skipped, and polling is the
+ * default path (the native watcher needs `NARRAFORK_ENABLE_NATIVE_WATCHER`), so "an
+ * external edit is revertable" quietly did not hold for that shape of edit.
+ *
+ * 12 ticks at the default 5 s interval is one forced capture per minute, chosen against
+ * the two costs it sits between: a capture is a warm `add -A` plus a DAG link (tens of
+ * milliseconds, deduplicated by hash when nothing changed), and the exposure is how long
+ * a missed edit can go without a boundary. A minute keeps the idle overhead at ~1/12th of
+ * the unconditional behaviour this replaced while bounding the gap to something a user
+ * would still recognise as "just now". The intermediate states between forced captures
+ * genuinely have no boundary; the sweep is what stops the gap from being unbounded.
+ */
+export const MAX_SKIPPED_POLLS = 12;
 
 /**
  * Upper bound on paths tracked per debounce window.
@@ -362,12 +399,28 @@ export const worktreeWatcher = {
 		});
 		entry.pollTimer = setInterval(() => {
 			if (!this._entries.has(worktreePath)) return;
-			this._enqueueProcessChange(worktreePath, entry);
+			// Flagged as polled: this tick has no evidence anything was written, so
+			// `_processChange` may skip the snapshot work when the status is unchanged.
+			// Without that, polling — which is the *default* path, since the native watcher
+			// requires an opt-in env var — ran a whole-tree capture plus a DAG advance every
+			// interval per chapter, forever, on an idle workspace.
+			this._enqueueProcessChange(worktreePath, entry, true);
 		}, FALLBACK_POLL_INTERVAL_MS);
 	},
 
-	/** Internal: coalesce concurrent git-status refreshes per worktree. */
-	_enqueueProcessChange(worktreePath: string, entry: WatcherEntry): void {
+	/**
+	 * Internal: coalesce concurrent git-status refreshes per worktree.
+	 *
+	 * `polled` distinguishes a timer tick — which is speculative, since nothing said
+	 * anything changed — from a watcher event, which is evidence of a write. Only the
+	 * speculative kind is allowed to skip snapshot work on an unchanged status.
+	 *
+	 * A coalesced follow-up drops the flag: `pendingProcess` was set because a *second*
+	 * trigger arrived while the first was running, and there is no way to tell whether
+	 * that one was a poll or an event, so it is treated as an event. Erring toward doing
+	 * the work is the right direction on a data-safety path.
+	 */
+	_enqueueProcessChange(worktreePath: string, entry: WatcherEntry, polled = false): void {
 		if (!this._entries.has(worktreePath)) return;
 		if (entry.processing) {
 			entry.pendingProcess = true;
@@ -375,7 +428,7 @@ export const worktreeWatcher = {
 		}
 
 		entry.processing = true;
-		this._processChange(worktreePath, entry)
+		this._processChange(worktreePath, entry, polled)
 			.catch((err) => {
 				logger.debug("Worktree watcher change processing failed", {
 					worktreePath,
@@ -393,7 +446,7 @@ export const worktreeWatcher = {
 	},
 
 	/** Internal: process a debounced file change event. */
-	async _processChange(worktreePath: string, entry: WatcherEntry): Promise<void> {
+	async _processChange(worktreePath: string, entry: WatcherEntry, polled = false): Promise<void> {
 		const { chapterId, narratorIds } = entry;
 
 		// Claim the paths accumulated during this window before any await, so a
@@ -402,7 +455,6 @@ export const worktreeWatcher = {
 		const pathsTruncated = entry.pendingPathsTruncated === true;
 		entry.pendingPaths = undefined;
 		entry.pendingPathsTruncated = false;
-		await this._recordExternalChanges(worktreePath, entry, changedPaths, pathsTruncated);
 
 		// Files changed on disk → the cached status is stale. Invalidate then
 		// read through the shared cache so concurrent narrators reuse one query.
@@ -412,6 +464,61 @@ export const worktreeWatcher = {
 		const previousHead = entry.lastHeadSha;
 		const statusSignature = getStatusSignature(statusSummary);
 		const statusChanged = statusSignature !== entry.lastStatusSignature;
+
+		// Snapshot work is skipped on a *polling* tick whose status is byte-identical to
+		// the previous tick's, up to {@link MAX_SKIPPED_POLLS} ticks in a row. It stays
+		// unconditional for a real watcher event, because that event is proof something
+		// was written.
+		//
+		// The status query has to come first for this, which is why the call moved above
+		// the snapshot step: the signature is the evidence the decision rests on. It
+		// costs nothing extra — this tick was going to run it anyway.
+		//
+		// What the signature does and does not establish:
+		//
+		//   - It is derived from git's own view of the workspace rather than from mtimes:
+		//     `getStatusSignature` folds in per file the path, the status code and the
+		//     staged/unstaged line counts from `git diff --numstat`. A `touch` alone does
+		//     not move it, and that is correct — identical bytes produce an identical
+		//     tree, so a capture would have written no new object and linked no snapshot.
+		//   - It is *not* content-derived, which this comment used to assert. Line counts
+		//     are not content: editing one line of an already-dirty file in place
+		//     (`foo` → `bar`) leaves `1 1`, ` M` and the path all unchanged, so the
+		//     signature repeats even though the bytes differ. Those ticks are skipped, and
+		//     the intermediate states therefore have no boundary of their own — which is
+		//     what {@link MAX_SKIPPED_POLLS} bounds: the run converges on a capture, so
+		//     the latest state becomes revertable rather than the edit going unrecorded
+		//     indefinitely.
+		//   - Ignored files are outside this entirely: `status` does not report them, and a
+		//     snapshot excludes them, so a capture would not have seen the change either.
+		//     The one apparent exception is a tracked-but-ignored file, which *is* in the
+		//     tree; `status` reports those (verified: `git add -f .env` then editing it
+		//     shows as ` M .env`), so they are covered.
+		//   - Any real tool call captures its own boundaries through the tool hooks, so
+		//     what is at stake here is only edits made outside the tool path.
+		//
+		// What it replaces: ~9 git subprocesses per chapter every 5 s forever, since
+		// polling is the *default* path (the native watcher is opt-in via
+		// `NARRAFORK_ENABLE_NATIVE_WATCHER`), including a whole-tree `add -A` and a
+		// `chapters` UPDATE that has no index to use.
+		const skipped = entry.skippedPolls ?? 0;
+		const sweepDue = skipped >= MAX_SKIPPED_POLLS;
+		if (!polled || statusChanged || entry.lastStatusSignature === undefined || sweepDue) {
+			// Counted from the last tick that actually took a boundary, so the sweep fires
+			// once per run of skips rather than on every tick after the threshold.
+			entry.skippedPolls = 0;
+			await this._recordExternalChanges(worktreePath, entry, changedPaths, pathsTruncated);
+		} else {
+			entry.skippedPolls = skipped + 1;
+			if (changedPaths?.size) {
+				// Paths arrived from the native watcher but the status is unchanged, so no
+				// boundary is needed — the attribution still is, since the modification view is
+				// what tells the user who touched a file.
+				await this._recordExternalChanges(worktreePath, entry, changedPaths, pathsTruncated, {
+					skipSnapshot: true,
+				});
+			}
+		}
 
 		if (statusChanged) {
 			entry.lastStatusSignature = statusSignature;
@@ -492,6 +599,7 @@ export const worktreeWatcher = {
 		entry: WatcherEntry,
 		changedPaths: Set<string> | undefined,
 		truncated: boolean,
+		options?: { skipSnapshot?: boolean },
 	): Promise<void> {
 		if (entry.narratorIds.size === 0) return;
 		// Attribute to any attached narrator: the workspace timeline is shared by all
@@ -535,7 +643,10 @@ export const worktreeWatcher = {
 			});
 		}
 
-		// A boundary here is what makes an external edit revertable at all.
+		// A boundary here is what makes an external edit revertable at all — but only
+		// when something actually changed. See `_processChange` for why an unchanged git
+		// status is sufficient grounds to skip it.
+		if (options?.skipSnapshot) return;
 		const treeHash = await worktreeTreeSnapshot.tryCapture(worktreePath, LOCAL_DEVICE_ID);
 		if (treeHash) {
 			// Link it into the snapshot DAG with the tree just captured. Without this the

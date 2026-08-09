@@ -5,7 +5,17 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { projects } from "../db/schema";
 
-const SCHEMA_VERSION = 4;
+/**
+ * Stamped into `PRAGMA user_version` and, as of today, read by nothing — schema drift is
+ * repaired by {@link ensureProjectDbSchema}, which compares against `PRAGMA table_info`
+ * rather than against this number.
+ *
+ * So it is not bumped when the patch list only *loses* a column: the patches are
+ * additive, an existing file that already has the column keeps it harmlessly, and a
+ * bump would imply a migration step that does not exist. Bump it when something starts
+ * reading it, or when a change needs a real migration.
+ */
+const SCHEMA_VERSION = 5;
 const PROJECT_DB_DIR = ".narrafork";
 const PROJECT_DB_FILE = "project.db";
 
@@ -64,6 +74,33 @@ const PROJECT_DB_SCHEMA_PATCHES: Array<{
 			{ name: "reasoning_effort", type: "TEXT" },
 			{ name: "previous_permission_mode", type: "TEXT" },
 			{ name: "plan_file_id", type: "TEXT" },
+		],
+	},
+	{
+		// Snapshot-space coordinates. A commit-free merge records nothing in the user's
+		// git history, so these columns are the *only* description of what happened —
+		// without them a re-imported project reads as "merged with no merge commit",
+		// which `unmerge` and `wake` both reject. `snapshot_shadow_key` is included
+		// because it outlives `worktree_path` (a dormant chapter has none), and it is
+		// what lets the orphan sweep recognise a lineage still in use.
+		//
+		// `parked_snapshot_commit_sha` / `parked_snapshot_base_tree` are deliberately
+		// ABSENT, unlike the merge coordinates above. They point into this machine's
+		// shadow repository for an *in-flight* rebase, and nothing about import/export
+		// depends on them: carried across, the importing machine's next rebase would
+		// settle them, find nothing, and tell the user their work was lost — work that
+		// never existed on that machine. The rule at the top of this file is the one
+		// being applied; a debt that is only settleable where it was incurred is exactly
+		// the machine-local runtime reference it excludes.
+		table: "chapters",
+		columns: [
+			{ name: "snapshot_commit_sha", type: "TEXT" },
+			{ name: "snapshot_shadow_key", type: "TEXT" },
+			{ name: "dormant_snapshot_commit_sha", type: "TEXT" },
+			{ name: "pre_merge_target_sha", type: "TEXT" },
+			{ name: "merge_snapshot_commit_sha", type: "TEXT" },
+			{ name: "pre_merge_target_snapshot_sha", type: "TEXT" },
+			{ name: "merged_source_snapshot_sha", type: "TEXT" },
 		],
 	},
 ];

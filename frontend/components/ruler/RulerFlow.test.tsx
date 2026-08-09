@@ -12,6 +12,20 @@ import graphLocale from "../../locales/en/graph.json";
 // from other frontend suites can't leave this suite rendering raw i18n keys.
 const i18n = i18next.createInstance();
 
+/**
+ * Mutable page fixture, so a test can add a chapter anchored off the loaded backbone
+ * without re-declaring the whole dataset. Read through a function because the stub
+ * factory captures it at module scope and each test may have swapped it.
+ */
+let rulerPages: () => Array<typeof rulerData> = () => [rulerData];
+let rulerHasPreviousPage = false;
+let fetchPreviousPageCalls = 0;
+/**
+ * What `api.rulerRebaseParked` does, per test. A function so a test can make it reject
+ * with a 409 — the "retry conflicted again" path, which is deliberately non-terminal.
+ */
+let rulerRebaseParkedImpl: () => Promise<Record<string, unknown>> = () => Promise.resolve({});
+
 const rulerData = {
 	commits: [
 		{
@@ -90,8 +104,10 @@ class TestApiError extends Error {
  *
  * These keys are the single source of truth for what this file is allowed to mock.
  */
+const realUseRuler = await import("../../hooks/useRuler");
+
 const realRulerFlowModules = {
-	"../../hooks/useRuler": { ...(await import("../../hooks/useRuler")) },
+	"../../hooks/useRuler": { ...realUseRuler },
 	"../../hooks/useRulerChapterActivity": {
 		...(await import("../../hooks/useRulerChapterActivity")),
 	},
@@ -154,8 +170,23 @@ afterAll(() => {
  * no way to install a stub that the `afterAll` restore loop will not undo.
  */
 const rulerFlowModuleMocks = {
+	// RulerFlow reads the paginated hook and flattens the pages itself, so the stub has
+	// to hand back an infinite-query shape and the REAL `flattenRulerPages` — stubbing
+	// the flattener too would let a regression in page ordering or segment re-indexing
+	// pass unnoticed here.
 	"../../hooks/useRuler": () => ({
-		useRulerData: () => ({ data: rulerData, isLoading: false, error: null }),
+		flattenRulerPages: realUseRuler.flattenRulerPages,
+		useRulerInfinite: () => ({
+			data: { pages: rulerPages(), pageParams: [undefined] },
+			isLoading: false,
+			error: null,
+			hasPreviousPage: rulerHasPreviousPage,
+			fetchPreviousPage: () => {
+				fetchPreviousPageCalls++;
+				return Promise.resolve();
+			},
+			isFetchingPreviousPage: false,
+		}),
 	}),
 	"../../hooks/useRulerChapterActivity": () => ({
 		useRulerChapterActivity: () => new Map(),
@@ -192,6 +223,7 @@ const rulerFlowModuleMocks = {
 			rulerRebase: () => Promise.resolve({}),
 			createReview: () => Promise.resolve({}),
 			rulerAbandon: () => Promise.resolve({}),
+			rulerRebaseParked: () => rulerRebaseParkedImpl(),
 			convertReviewToSubagent: () => Promise.resolve({}),
 			promoteReview: () => Promise.resolve({}),
 			dismissReview: () => Promise.resolve({}),
@@ -274,6 +306,9 @@ for (const specifier of mockedSpecifiers) {
 }
 
 const { RulerFlow } = await import("./RulerFlow");
+// RulerFlow calls `useConfirmDialog`, which throws outside its provider — the parked-work
+// discard action is destructive and confirms first.
+const { ConfirmDialogProvider } = await import("../common/ConfirmDialogProvider");
 
 class TestResizeObserver {
 	private callback: ResizeObserverCallback;
@@ -324,6 +359,10 @@ function installDom() {
 		window,
 		document: window.document,
 		navigator: window.navigator,
+		// linkedom's own Event class: the platform global rejects assignment to the
+		// `target` property linkedom's dispatchEvent sets, so dispatching a native Event
+		// at a linkedom node throws "Attempted to assign to readonly property".
+		Event: window.Event,
 		HTMLElement: window.HTMLElement,
 		Element: window.Element,
 		Node: window.Node,
@@ -353,6 +392,26 @@ async function flushRender() {
 	await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/**
+ * Render RulerFlow inside every provider it requires.
+ *
+ * `ConfirmDialogProvider` is not optional: `useConfirmDialog` throws when absent, and
+ * RulerFlow calls it for the parked-work discard action.
+ */
+function renderRulerFlow(target: Root, client: QueryClient) {
+	target.render(
+		<I18nextProvider i18n={i18n}>
+			<MantineProvider env="test">
+				<QueryClientProvider client={client}>
+					<ConfirmDialogProvider>
+						<RulerFlow projectId="project-one" />
+					</ConfirmDialogProvider>
+				</QueryClientProvider>
+			</MantineProvider>
+		</I18nextProvider>,
+	);
+}
+
 describe("RulerFlow", () => {
 	let container: HTMLDivElement;
 	let root: Root;
@@ -361,6 +420,10 @@ describe("RulerFlow", () => {
 	beforeEach(async () => {
 		installDom();
 		await initI18n();
+		rulerPages = () => [rulerData];
+		rulerHasPreviousPage = false;
+		fetchPreviousPageCalls = 0;
+		rulerRebaseParkedImpl = () => Promise.resolve({});
 		queryClient = new QueryClient({
 			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
 		});
@@ -380,21 +443,234 @@ describe("RulerFlow", () => {
 	});
 
 	test("renders the ruler lifecycle surface without crashing", async () => {
-		root.render(
-			<I18nextProvider i18n={i18n}>
-				<MantineProvider env="test">
-					<QueryClientProvider client={queryClient}>
-						<RulerFlow projectId="project-one" />
-					</QueryClientProvider>
-				</MantineProvider>
-			</I18nextProvider>,
-		);
+		renderRulerFlow(root, queryClient);
 
 		await flushRender();
 
 		expect(document.body.textContent).toContain("2 commits");
 		expect(document.querySelector('[data-testid="mock-ruler-pixi-layer"]')).not.toBeNull();
 		expect(document.querySelector('[data-testid="mock-segment-canvas"]')).not.toBeNull();
+		// No off-backbone notice when every chapter resolves to a tick.
+		expect(document.querySelector('[data-testid="ruler-off-backbone-notice"]')).toBeNull();
+	});
+
+	test("reports chapters whose anchor commit is outside the loaded window", async () => {
+		// The chapter starts from a commit that is not in the page, and has no parent to
+		// borrow an anchor from — exactly the case that used to be dropped in silence.
+		rulerPages = () => [
+			{
+				...rulerData,
+				activeChapters: [
+					...rulerData.activeChapters,
+					{
+						id: "chapter-offscreen",
+						title: "Older Work",
+						branch: "chapter/older",
+						role: "branch",
+						parentChapterId: null,
+						startCommitSha: "commit-not-loaded",
+						mergeCommitSha: null,
+						narratorId: "narrator-two",
+						narratorStatus: "idle",
+						axisOffset: 0,
+						crossOffset: 0,
+					},
+				],
+			},
+		];
+		rulerHasPreviousPage = true;
+
+		renderRulerFlow(root, queryClient);
+
+		await flushRender();
+
+		const notice = document.querySelector('[data-testid="ruler-off-backbone-notice"]');
+		expect(notice).not.toBeNull();
+		expect(notice?.textContent).toContain("Older Work");
+		// While older pages remain, the notice offers to load them rather than declaring
+		// the chapter unreachable.
+		expect(notice?.textContent).toContain("Load older commits");
+		expect(notice?.textContent).not.toContain("whole timeline is loaded");
+
+		// The offer has to actually page: clicking it asks for the older window that
+		// contains the missing anchor commit.
+		const loadButton = Array.from(notice?.querySelectorAll("button") ?? []).find(
+			(el) => el.textContent?.trim() === "Load older commits",
+		);
+		expect(loadButton).toBeDefined();
+		loadButton?.dispatchEvent(new Event("click", { bubbles: true }));
+		await flushRender();
+		expect(fetchPreviousPageCalls).toBe(1);
+	});
+
+	test("exposes loading older commits as a focusable button, not a clickable Text", async () => {
+		// This is the ONLY route back to a chapter that fell outside the loaded window. As a
+		// bare `<Text onClick>` it had no role, no tab stop and no key handler, so keyboard
+		// and screen-reader users could not reach the recovery path at all.
+		rulerPages = () => [
+			{
+				...rulerData,
+				activeChapters: [
+					{
+						id: "chapter-offscreen",
+						title: "Older Work",
+						branch: "chapter/older",
+						role: "branch",
+						parentChapterId: null,
+						startCommitSha: "commit-not-loaded",
+						mergeCommitSha: null,
+						narratorId: "narrator-two",
+						narratorStatus: "idle",
+						axisOffset: 0,
+						crossOffset: 0,
+					},
+				],
+			},
+		];
+		rulerHasPreviousPage = true;
+
+		renderRulerFlow(root, queryClient);
+		await flushRender();
+
+		const notice = document.querySelector('[data-testid="ruler-off-backbone-notice"]');
+		const loadButton = Array.from(notice?.querySelectorAll("button") ?? []).find(
+			(el) => el.textContent?.trim() === "Load older commits",
+		);
+		expect(loadButton).toBeDefined();
+		expect(loadButton?.tagName.toLowerCase()).toBe("button");
+		// A real button is keyboard-operable by the platform, so no explicit tabindex=-1
+		// may sneak in and take it back out of the tab order.
+		expect(loadButton?.getAttribute("tabindex")).not.toBe("-1");
+		expect(loadButton?.hasAttribute("disabled")).toBe(false);
+	});
+
+	test("says the timeline is exhausted when no older page remains", async () => {
+		rulerPages = () => [
+			{
+				...rulerData,
+				activeChapters: [
+					{
+						id: "chapter-offscreen",
+						title: "Unreachable Work",
+						branch: "chapter/unreachable",
+						role: "branch",
+						parentChapterId: null,
+						startCommitSha: "commit-not-loaded",
+						mergeCommitSha: null,
+						narratorId: "narrator-two",
+						narratorStatus: "idle",
+						axisOffset: 0,
+						crossOffset: 0,
+					},
+				],
+			},
+		];
+		rulerHasPreviousPage = false;
+
+		renderRulerFlow(root, queryClient);
+
+		await flushRender();
+
+		const notice = document.querySelector('[data-testid="ruler-off-backbone-notice"]');
+		expect(notice?.textContent).toContain("Unreachable Work");
+		expect(notice?.textContent).toContain("whole timeline is loaded");
+		expect(notice?.textContent).not.toContain("Load older commits");
+	});
+
+	test("restores the parked-work panel from the chapter's persisted snapshot", async () => {
+		// The panel used to be written only by a rebase response, so a reload erased it
+		// while the server still tracked the debt — the next rebase came back 409 and no UI
+		// could act on the work. `parkedSnapshot` on the chapter row is the durable source.
+		rulerPages = () => [
+			{
+				...rulerData,
+				activeChapters: [{ ...rulerData.activeChapters[0], parkedSnapshot: "abcdef0123456789" }],
+			},
+		];
+
+		renderRulerFlow(root, queryClient);
+		await flushRender();
+
+		const panel = document.querySelector('[data-testid="ruler-parked-work-panel"]');
+		expect(panel).not.toBeNull();
+		expect(panel?.textContent).toContain("abcdef012345");
+		// Restored state carries no reason, so it must not assert a conflict it cannot back up.
+		expect(panel?.textContent).toContain("Parked uncommitted changes are waiting");
+		expect(panel?.textContent).not.toContain("uncommitted changes need attention");
+		// Which chapter owns the work: the title was already in state and never rendered.
+		expect(document.querySelector('[data-testid="ruler-parked-work-chapter"]')?.textContent).toBe(
+			"Chapter One",
+		);
+	});
+
+	test("keeps the panel and updates the conflict list when a retry conflicts again", async () => {
+		// "Retry conflicted again" is explicitly NOT terminal: the server still holds the
+		// coordinates, so closing the panel here would strand the work with no way back.
+		rulerPages = () => [
+			{
+				...rulerData,
+				activeChapters: [{ ...rulerData.activeChapters[0], parkedSnapshot: "abcdef0123456789" }],
+			},
+		];
+		rulerRebaseParkedImpl = () => {
+			const err = new TestApiError("still conflicting");
+			err.data = {
+				parkedWorkPending: true,
+				parkedWorkStatus: "conflict",
+				reapplyConflictFiles: ["src/still-conflicting.ts"],
+			};
+			return Promise.reject(err);
+		};
+
+		renderRulerFlow(root, queryClient);
+		await flushRender();
+
+		const retry = Array.from(document.body.querySelectorAll("button")).find(
+			(el) => el.textContent?.trim() === "Try restoring again",
+		);
+		expect(retry).toBeDefined();
+		retry?.dispatchEvent(new Event("click", { bubbles: true }));
+		await flushRender();
+		await flushRender();
+
+		const panel = document.querySelector('[data-testid="ruler-parked-work-panel"]');
+		expect(panel).not.toBeNull();
+		expect(panel?.textContent).toContain("src/still-conflicting.ts");
+		// The 409 carries the real reason, so the wording upgrades from the weaker
+		// restored-from-server phrasing to the reported conflict.
+		expect(panel?.textContent).toContain("uncommitted changes need attention");
+	});
+
+	test("does not resurrect the panel from stale server state after a terminal action", async () => {
+		// The action invalidates the ruler query, but the cache keeps serving the
+		// pre-action chapter row (still carrying `parkedSnapshot`) until the refetch lands.
+		// Restoring purely from server state would therefore flicker the panel straight
+		// back for work the user has already dealt with.
+		//
+		// Exercised through `materialize` rather than `discard`: both take the same settle
+		// path, and discard first opens the confirm dialog, which drags Mantine's modal
+		// (and its `getComputedStyle` requirements) into a test about state bookkeeping.
+		rulerPages = () => [
+			{
+				...rulerData,
+				activeChapters: [{ ...rulerData.activeChapters[0], parkedSnapshot: "abcdef0123456789" }],
+			},
+		];
+		rulerRebaseParkedImpl = () => Promise.resolve({ changedFiles: 2 });
+
+		renderRulerFlow(root, queryClient);
+		await flushRender();
+		expect(document.querySelector('[data-testid="ruler-parked-work-panel"]')).not.toBeNull();
+
+		const materialize = Array.from(document.body.querySelectorAll("button")).find(
+			(el) => el.textContent?.trim() === "Write out with conflict markers",
+		);
+		expect(materialize).toBeDefined();
+		materialize?.dispatchEvent(new Event("click", { bubbles: true }));
+		await flushRender();
+		await flushRender();
+
+		expect(document.querySelector('[data-testid="ruler-parked-work-panel"]')).toBeNull();
 	});
 });
 

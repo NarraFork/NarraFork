@@ -4,6 +4,7 @@ import { formatOriginLabel } from "@shared/message-origin";
 import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapterEdges, chapters, narrators, projects, reviewConclusions } from "../db/schema";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
@@ -12,10 +13,17 @@ import type { Locale } from "../lib/prompt-i18n";
 import { buildReviewSystemPrompt, getReviewStartMessage } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { slugify } from "../lib/slug";
+import { ensureChapterSnapshot } from "./chapter-snapshot-ref";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
 import { closeNarrator, sendMessage, updateNarratorChapterRole } from "./narrator-session";
+import {
+	SNAPSHOT_BASE_REF,
+	SNAPSHOT_HEAD_REF,
+	treeSnapshotKey,
+	worktreeTreeSnapshot,
+} from "./worktree-tree-snapshot";
 
 export interface CreateReviewInput {
 	title?: string;
@@ -35,8 +43,15 @@ export const reviewService = {
 			where: eq(chapters.id, sourceChapterId),
 		});
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-		if (source.status !== "active") {
-			throw new ValidationError("Can only review active chapters");
+		// Dormant sources are reviewable for the same reason they are forkable: dormant
+		// only means the worktree was removed, and every worktree-dependent step here
+		// already falls back to the repository path (`sourceWorktree` below, and the diff
+		// context builder). Refusing it turned auto-dormant — which fires at a default of
+		// 10 active worktrees — into "you must wake this chapter before it can be
+		// reviewed", where waking rebuilds a worktree and mutates the chapter just to read
+		// its branch tip. Merged and abandoned stay rejected: their branches may be gone.
+		if (source.status !== "active" && source.status !== "dormant") {
+			throw new ValidationError("Can only review active or dormant chapters");
 		}
 
 		const project = await db.query.projects.findFirst({
@@ -91,10 +106,21 @@ export const reviewService = {
 
 			await gitService.createWorktree(gitPath, worktreePath, branchName);
 			rollback.push(() => gitService.removeWorktree(gitPath, worktreePath));
+			// `transferWorkingState` creates a shadow repository for this worktree and points
+			// `refs/nf/head` into it, and a rollback that only removed the worktree left it
+			// stranded forever: `gcAll` deletes only directories missing a HEAD (this one has
+			// one), and the orphan sweep only walks `.worktrees` directories still present on
+			// disk (rollback just deleted this one). Registered before the repo exists so it
+			// covers every later failure point; `destroy` on a missing directory is a no-op,
+			// and `force` is needed because the chapter row would otherwise be read as an
+			// owner of this key.
+			rollback.push(async () => {
+				await worktreeTreeSnapshot.destroy(worktreePath, undefined, { force: true });
+			});
 
-			// Step 1.5: Copy uncommitted/untracked changes from source worktree
-			// so the reviewer can see the full working state, not just committed code.
-			await this.copyDirtyFiles(sourceWorktree, worktreePath);
+			// Step 1.5: Reproduce the source's working state, so the reviewer sees what the
+			// author is actually looking at rather than only the last commit.
+			const transferred = await this.transferWorkingState(sourceWorktree, worktreePath);
 
 			// Step 2: Create chapter record
 			const [chapter] = await db
@@ -114,6 +140,12 @@ export const reviewService = {
 					forkPoint: { commitSha: sourceHeadSha },
 					startCommitSha: sourceHeadSha,
 					headCommitSha: sourceHeadSha,
+					// Recorded here rather than left to the first tool call, so the review
+					// workspace has a DAG position from the moment it exists: without one it
+					// cannot be forked from, and the orphan sweep cannot tell its shadow
+					// repository from an abandoned one.
+					snapshotCommitSha: transferred.snapshotCommitSha,
+					snapshotShadowKey: treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath),
 					anchorCommitSha,
 					axisOffset,
 					crossOffset,
@@ -439,6 +471,14 @@ export const reviewService = {
 			} catch (err) {
 				logger.warn("Failed to delete review branch", { error: String(err) });
 			}
+			// The review workspace now has a shadow repository of its own, and the chapter
+			// row that claims it is about to go. `force` is required for exactly that
+			// reason: the ownership guard reads the row being deleted.
+			await worktreeTreeSnapshot
+				.destroy(chapter.worktreePath, undefined, { force: true })
+				.catch((err) =>
+					logger.debug("Failed to remove review tree snapshots", { error: String(err) }),
+				);
 		}
 
 		// Archive narrators (already closed above)
@@ -539,6 +579,16 @@ export const reviewService = {
 					error: String(err),
 				});
 			}
+			// Same reasoning as `deleteReview`: the workspace is gone and the row that
+			// claims its shadow repository is being emptied, so nothing will read the
+			// lineage again.
+			await worktreeTreeSnapshot
+				.destroy(chapter.worktreePath, undefined, { force: true })
+				.catch((err) =>
+					logger.debug("Failed to remove review tree snapshots during conversion", {
+						error: String(err),
+					}),
+				);
 		}
 
 		// Update review chapter status
@@ -624,9 +674,57 @@ export const reviewService = {
 	},
 
 	/**
+	 * Reproduce a source workspace's exact state in a freshly created review worktree.
+	 *
+	 * Prefers the snapshot DAG, which is byte-exact and gives the review workspace a
+	 * lineage of its own — the fallback has neither property. `copyDirtyFiles` walks
+	 * `git status --porcelain`, and porcelain reports a wholly new directory as a single
+	 * `?? dir/` entry, so reading it as a file fails and the entire subtree silently
+	 * misses the review. Adopting the source's lineage additionally means the review
+	 * chapter can later be forked or merged in snapshot space like any other.
+	 *
+	 * Never throws: a review that shows committed state plus a warning is far more
+	 * useful than no review at all.
+	 */
+	async transferWorkingState(
+		sourceWorktree: string,
+		targetWorktree: string,
+	): Promise<{ snapshotCommitSha: string | null; viaSnapshot: boolean }> {
+		try {
+			const source = await ensureChapterSnapshot(sourceWorktree, "review base state");
+			if (source) {
+				await worktreeTreeSnapshot.restoreInto(sourceWorktree, targetWorktree, source.treeHash);
+				// The review continues from the reviewed state, so its lineage starts there.
+				// Fetched rather than referenced, because shadow repositories share no objects
+				// and the source's may be removed while the review is still open.
+				const adopted = await worktreeTreeSnapshot.fetchSnapshotFrom(
+					targetWorktree,
+					sourceWorktree,
+					SNAPSHOT_HEAD_REF,
+					SNAPSHOT_BASE_REF,
+				);
+				if (adopted) {
+					await worktreeTreeSnapshot.setRef(targetWorktree, SNAPSHOT_HEAD_REF, adopted);
+				}
+				return { snapshotCommitSha: adopted ?? null, viaSnapshot: true };
+			}
+		} catch (err) {
+			logger.warn("Snapshot transfer into the review worktree failed; copying dirty files", {
+				sourceWorktree,
+				targetWorktree,
+				error: String(err),
+			});
+		}
+		await this.copyDirtyFiles(sourceWorktree, targetWorktree);
+		return { snapshotCommitSha: null, viaSnapshot: false };
+	},
+
+	/**
 	 * Copy uncommitted/untracked files from source worktree to target worktree.
 	 * Uses `git status --porcelain` to enumerate dirty files, then copies them.
 	 * Deleted files are also removed in the target.
+	 *
+	 * Fallback for {@link transferWorkingState}; see there for why it is not preferred.
 	 */
 	async copyDirtyFiles(sourceWorktree: string, targetWorktree: string): Promise<void> {
 		try {

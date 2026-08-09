@@ -318,14 +318,29 @@ export const scheduledTaskService = {
 			if (!task.chapterId) {
 				return { status: "skipped", narratorId: null, error: "Missing chapterId" };
 			}
-			// Wake the chapter if dormant/merged so the worktree exists.
+			// Wake the chapter if dormant so the worktree exists.
 			const chapter = await db.query.chapters.findFirst({
 				where: (c, { eq: e }) => e(c.id, task.chapterId as string),
 			});
 			if (!chapter) {
 				return { status: "skipped", narratorId: null, error: "Chapter not found" };
 			}
-			if (chapter.status === "dormant" || chapter.status === "merged") {
+			// Merged is reported as a skip rather than passed to `wake`.
+			//
+			// `wake` refuses a merged chapter outright (waking one erased the merge
+			// coordinates while its changes stayed applied downstream, making `unmerge`
+			// unreachable). This call is not inside a try, so including "merged" here turned
+			// every tick into a thrown ValidationError: the run failed instead of skipping,
+			// and the recorded error was `wake`'s prose about unmerge — accurate for someone
+			// who clicked Wake, meaningless as the outcome of a schedule.
+			if (chapter.status === "merged") {
+				return {
+					status: "skipped",
+					narratorId: null,
+					error: "Chapter is merged; unmerge it before this task can run",
+				};
+			}
+			if (chapter.status === "dormant") {
 				await chapterCleanup.wake(task.chapterId);
 			} else if (chapter.status !== "active") {
 				return {

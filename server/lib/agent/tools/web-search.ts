@@ -90,6 +90,7 @@ export const webSearchTool: ToolDefinition = {
 				cwd: ctx.cwd,
 				provider: ctx.provider,
 				model: ctx.model,
+				userId: ctx.userId ?? null,
 			});
 			return {
 				output: result.text || "No results found",

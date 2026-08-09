@@ -1,4 +1,15 @@
-import { ActionIcon, Box, Card, Center, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
+import {
+	ActionIcon,
+	Box,
+	Button,
+	Card,
+	Center,
+	Group,
+	Loader,
+	Stack,
+	Text,
+	Tooltip,
+} from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
 	IconArrowsHorizontal,
@@ -12,12 +23,20 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { useTranslation } from "react-i18next";
 import { useNarratorReviewToolsCapability } from "../../hooks/usePlatform";
 import { addRecentTab } from "../../hooks/useRecentTabs";
-import { type RulerData, type RulerSegment, useRulerData } from "../../hooks/useRuler";
+import {
+	flattenRulerPages,
+	type RulerData,
+	type RulerSegment,
+	useRulerInfinite,
+} from "../../hooks/useRuler";
 import { useRulerChapterActivity } from "../../hooks/useRulerChapterActivity";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { ApiError, api } from "../../lib/api";
+import type { ParkedWorkFields, ParkedWorkStatus } from "../../lib/api/projects";
 import { Z } from "../../lib/z-index";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { NarratorPanel } from "../narrator/NarratorPanel";
+import { resolveChapterAnchors } from "./chapter-anchoring";
 import {
 	COLLAPSED_GAP,
 	computeElasticLayout,
@@ -26,6 +45,7 @@ import {
 } from "./elastic-layout";
 import { screenToWorld, solvePanForAnchor, viewCenterFromPan, worldToScreen } from "./fisheye";
 import { OffscreenBubbles } from "./OffscreenBubbles";
+import { presentParkedWork, shortSnapshot } from "./parked-work";
 import {
 	type PixiChapterInfo,
 	RULER_CARD_GEOMETRY,
@@ -60,6 +80,14 @@ const SEGMENT_VIEWPORT_MULTIPLIER = 3;
 const RULER_SEGMENT_GC_TIME_MS = 60_000;
 const MAX_NOTIFICATION_LIST_ITEMS = 20;
 const MAX_NOTIFICATION_LIST_CHARS = 2_000;
+/** Per-title cap for chapter titles quoted in notices; titles are user-supplied. */
+const MAX_CHAPTER_TITLE_CHARS = 80;
+
+function clampChapterTitle(title: string): string {
+	return title.length > MAX_CHAPTER_TITLE_CHARS
+		? `${title.slice(0, MAX_CHAPTER_TITLE_CHARS)}…`
+		: title;
+}
 
 function formatNotificationList(items: string[] | undefined): string {
 	if (!items?.length) return "";
@@ -181,11 +209,33 @@ function clampCamera(cam: Camera, opts?: ClampBounds, soft?: boolean): Camera {
 	return changed ? { ...cam, panX: crossPan, panY: mainPan } : cam;
 }
 
+/**
+ * Structured worktree-state errors the server can return, mapped to i18n keys.
+ *
+ * `REBASE_DIRTY_*` are gone: a dirty source is now parked in the snapshot DAG and
+ * reapplied, and the trunk's worktree never mattered to a rebase in the first place
+ * (git reads the trunk *branch*). What remains is the case where parking cannot be
+ * settled — the reapply of an earlier rebase conflicts, so starting another one would
+ * compound the loss.
+ *
+ * `MERGE_DIRTY_*` are conditional, not unconditional: the server only rejects a dirty
+ * worktree when the request asked for `mode: "commit"`. The ruler's merge action does
+ * not send a mode, so it gets the snapshot merge and a dirty workspace is an ordinary
+ * state there. The entries stay because the codes are still reachable — a commit-mode
+ * merge started from the chapter merge modal can land the user back here — and their
+ * text now says which mode the requirement belongs to rather than asserting that
+ * uncommitted work must be committed before any merge.
+ */
 const DIRTY_ERROR_MAP: Record<string, string> = {
 	MERGE_DIRTY_TRUNK: "ruler.mergeDirtyTrunk",
 	MERGE_DIRTY_SOURCE: "ruler.mergeDirtySource",
-	REBASE_DIRTY_TRUNK: "ruler.rebaseDirtyTrunk",
-	REBASE_DIRTY_SOURCE: "ruler.rebaseDirtySource",
+	REBASE_PARKED_WORK_CONFLICT: "ruler.rebaseParkedWorkConflict",
+	// The workspace could not be read, so the earlier debt could not be settled. Distinct
+	// from the conflict above: the coordinates are deliberately KEPT, so this becomes
+	// settleable again rather than needing a user decision.
+	REBASE_PARKED_WORK_UNSETTLED: "ruler.rebaseParkedWorkUnsettled",
+	// The snapshot pointer outlived the snapshot. Nothing is recoverable.
+	PARKED_SNAPSHOT_UNRESOLVABLE: "ruler.parkedSnapshotUnresolvable",
 };
 
 /** Map a structured dirty-worktree ApiError to an i18n key, or null for unknown errors. */
@@ -196,10 +246,18 @@ function dirtyErrorKey(err: ApiError): string | null {
 
 export function RulerFlow({ projectId }: RulerFlowProps) {
 	const { t } = useTranslation("graph");
-	const { data, isLoading, error } = useRulerData(projectId);
+	// Paginated, not single-page. `useRulerData` fetches one page (server default 200
+	// commits) with no way to ask for more, so on any repository with a longer history
+	// the backbone was truncated — and a chapter anchored to a commit outside that
+	// window has no tick to attach to, so it was dropped from the layout entirely and
+	// simply looked deleted. `useRulerInfinite` walks the older direction, and
+	// `missingTickChapters` below reports whatever still cannot be placed.
+	const { data, isLoading, error, hasPreviousPage, fetchPreviousPage, isFetchingPreviousPage } =
+		useRulerInfinite(projectId);
 	const { data: prefs } = useUserPreferences();
 	const queryClient = useQueryClient();
 	const reviewToolsCapability = useNarratorReviewToolsCapability();
+	const confirm = useConfirmDialog();
 	const reviewActions = useMemo(
 		() => ({
 			request: reviewToolsCapability.supported,
@@ -490,6 +548,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		totalWidth: 0,
 	});
 	const commitShasRef = useRef<string[]>([]);
+	/** Latest flattened activeChapters, for callbacks defined above the flattening. */
+	const activeChaptersRef = useRef<RulerData["activeChapters"]>([]);
+	/** chapterId → the backbone sha it currently resolves to. Read by drag-end. */
+	const anchorByChapterRef = useRef<Map<string, string>>(new Map());
 
 	// Zoom center: world-space main-axis position of the last zoom gesture.
 	// Falls back to viewport center when no zoom is active.
@@ -742,6 +804,39 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		chapterTitle: string;
 		conflictFiles: Array<{ file: string; conflictLines: number }>;
 	} | null>(null);
+	/**
+	 * Work a rebase parked and could not put back, while it is still recoverable.
+	 *
+	 * Held in state rather than only announced in a toast because the conflict path is
+	 * otherwise a dead end: the user is left with a snapshot id and no operation that
+	 * accepts it. Cleared once the server reports a terminal outcome.
+	 */
+	const [parkedWork, setParkedWork] = useState<{
+		chapterId: string;
+		chapterTitle: string;
+		snapshot: string;
+		status: ParkedWorkStatus;
+		conflictFiles: string[];
+		error?: string;
+		/**
+		 * Rebuilt from the chapter's persisted `parkedSnapshot` rather than from a rebase
+		 * response, so the reason the work is parked was never sent — no conflict list, no
+		 * error. The panel has to say less in this case instead of claiming a conflict it
+		 * cannot substantiate.
+		 */
+		restored?: boolean;
+	} | null>(null);
+	const [parkedWorkBusy, setParkedWorkBusy] = useState<"retry" | "materialize" | "discard" | null>(
+		null,
+	);
+	/**
+	 * Snapshots this session already settled (discarded, materialized, reapplied, or lost).
+	 *
+	 * The restore effect below reads server state, and the invalidated ruler query keeps
+	 * serving the pre-action chapter row until the refetch lands — without this the panel
+	 * would immediately reappear for work the user just finished dealing with.
+	 */
+	const settledParkedSnapshotsRef = useRef<Set<string>>(new Set());
 
 	const closeAllMenus = useCallback(() => {
 		setTickMenu(null);
@@ -1008,22 +1103,213 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		[projectId, queryClient, t],
 	);
 
+	/**
+	 * Report what happened to work a rebase parked, and open the recovery panel when
+	 * something can still be done about it.
+	 *
+	 * Three distinct outcomes, previously collapsed into one yellow toast:
+	 *   - `conflict` — the parked side and the rebased workspace disagree. A user
+	 *     decision, so it offers retry / write-out / discard.
+	 *   - `failed` — a NarraFork or git fault. No user action fixes the cause, so it is
+	 *     red and quotes `reapplyError`; recovery is still offered because the snapshot
+	 *     coordinates survive and a retry may work once the cause is gone.
+	 *   - `lostParkedSnapshot` — an earlier snapshot no longer resolves. Nothing is
+	 *     recoverable, so it only informs.
+	 */
+	const reportParkedWork = useCallback(
+		(chapterId: string, chapterTitle: string, result: ParkedWorkFields): boolean => {
+			const presentation = presentParkedWork(result);
+			for (const notice of presentation.notices) {
+				const snapshot = shortSnapshot(notice.snapshot);
+				const title =
+					notice.kind === "lost"
+						? t("ruler.parkedWorkLost")
+						: notice.kind === "failed"
+							? t("ruler.rebaseReapplyFailed")
+							: t("ruler.rebaseReapplyConflict");
+				const message =
+					notice.kind === "lost"
+						? t("ruler.parkedWorkLostDesc", { snapshot })
+						: notice.kind === "failed"
+							? t("ruler.rebaseReapplyFailedDesc", {
+									error: result.reapplyError ?? "",
+									snapshot,
+								})
+							: t("ruler.rebaseReapplyConflictDesc", { snapshot });
+				notifications.show({ title, message, color: notice.color, autoClose: false });
+			}
+			// A lost snapshot is terminal even though nothing was clicked: remember it so
+			// the restore effect does not resurrect a panel from a stale chapter row.
+			if (result.lostParkedSnapshot) {
+				settledParkedSnapshotsRef.current.add(result.lostParkedSnapshot);
+			}
+			if (presentation.recoverable) {
+				setParkedWork({ chapterId, chapterTitle, ...presentation.recoverable });
+			}
+			return presentation.showSuccess;
+		},
+		[t],
+	);
+
+	/**
+	 * Close the panel for a snapshot whose fate is decided.
+	 *
+	 * Recording the id matters as much as clearing the state: the restore effect below
+	 * reads the ruler query, which still holds the pre-action chapter row until the
+	 * invalidated fetch lands, so a bare `setParkedWork(null)` would flicker the panel
+	 * straight back for work the user just discarded.
+	 */
+	const settleParkedWork = useCallback((snapshot: string) => {
+		settledParkedSnapshotsRef.current.add(snapshot);
+		setParkedWork(null);
+	}, []);
+
+	/**
+	 * Run one of the three recovery actions on parked work.
+	 *
+	 * Each terminal outcome clears the panel, because the server clears the coordinates
+	 * with it and any further action would be rejected. A retry that conflicts again is
+	 * NOT terminal: the panel stays, updated with the new conflict list.
+	 */
+	const handleParkedWorkAction = useCallback(
+		async (action: "retry" | "materialize" | "discard") => {
+			const target = parkedWork;
+			if (!target || parkedWorkBusy) return;
+			setParkedWorkBusy(action);
+			try {
+				const result = await api.rulerRebaseParked(projectId, target.chapterId, action);
+				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
+				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
+				if (action === "discard") {
+					notifications.show({
+						title: t("ruler.parkedWorkDiscarded"),
+						message: t("ruler.parkedWorkDiscardedDesc", {
+							snapshot: (result.discardedSnapshot ?? target.snapshot).slice(0, 12),
+						}),
+						color: "gray",
+					});
+					settleParkedWork(target.snapshot);
+					return;
+				}
+				if (action === "materialize") {
+					notifications.show({
+						title: t("ruler.parkedWorkMaterialized"),
+						message: t("ruler.parkedWorkMaterializedDesc", {
+							count: result.changedFiles ?? result.conflictFiles?.length ?? 0,
+						}),
+						color: "yellow",
+						autoClose: false,
+					});
+					settleParkedWork(target.snapshot);
+					return;
+				}
+				// retry
+				if (result.success) {
+					notifications.show({
+						title: t("ruler.parkedWorkRetried"),
+						message: t("ruler.parkedWorkRetriedDesc"),
+						color: "teal",
+					});
+					settleParkedWork(target.snapshot);
+				}
+			} catch (err) {
+				// A 409 carries the same parked-work fields as the rebase response, so the
+				// panel can be refreshed from it rather than losing the user's context.
+				if (err instanceof ApiError) {
+					const data = (err.data ?? {}) as ParkedWorkFields;
+					const msgKey = dirtyErrorKey(err);
+					notifications.show({
+						title: t("ruler.parkedWorkActionFailed"),
+						message: msgKey
+							? t(msgKey)
+							: (data.reapplyError ??
+								formatNotificationList(data.reapplyConflictFiles) ??
+								err.message),
+						color: "red",
+						autoClose: false,
+					});
+					// The pointer is gone, so nothing further is possible — close the panel
+					// rather than leaving actions that will all be rejected.
+					if (data.lostParkedSnapshot || err.data?.error === "PARKED_SNAPSHOT_UNRESOLVABLE") {
+						settleParkedWork(target.snapshot);
+					} else if (data.parkedWorkPending) {
+						setParkedWork((prev) =>
+							prev
+								? {
+										...prev,
+										status: data.parkedWorkStatus ?? prev.status,
+										conflictFiles: data.reapplyConflictFiles ?? prev.conflictFiles,
+										error: data.reapplyError,
+										// A 409 carries the real reason, so the panel is no longer working
+										// from bare server state and may state the conflict again.
+										restored: false,
+									}
+								: prev,
+						);
+					}
+				} else {
+					notifications.show({
+						title: t("ruler.parkedWorkActionFailed"),
+						message: err instanceof Error ? err.message : String(err),
+						color: "red",
+						autoClose: false,
+					});
+				}
+			} finally {
+				setParkedWorkBusy(null);
+			}
+		},
+		[parkedWork, parkedWorkBusy, projectId, queryClient, settleParkedWork, t],
+	);
+
+	/**
+	 * Confirm before discarding, because this is the one action that gives up work.
+	 *
+	 * The snapshot commit itself survives in the shadow repository, so the loss is
+	 * recoverable in principle — but only by someone willing to dig through it, which is
+	 * not a reasonable expectation of the person clicking the button.
+	 */
+	const handleParkedWorkDiscard = useCallback(async () => {
+		const target = parkedWork;
+		if (!target || parkedWorkBusy) return;
+		const confirmed = await confirm({
+			title: t("ruler.parkedWorkDiscardConfirm"),
+			message: t("ruler.parkedWorkDiscardConfirmDesc", {
+				snapshot: target.snapshot.slice(0, 12),
+			}),
+			confirmLabel: t("ruler.parkedWorkDiscard"),
+			confirmColor: "red",
+		});
+		if (!confirmed) return;
+		await handleParkedWorkAction("discard");
+	}, [parkedWork, parkedWorkBusy, confirm, t, handleParkedWorkAction]);
+
 	const handleChapterRebase = useCallback(
 		async (chapterId: string) => {
-			// Find chapter title for the dialog
-			const rd = data as RulerData | undefined;
-			const chapter = rd?.activeChapters?.find((ch) => ch.id === chapterId);
+			// Read through a ref rather than the query result: the flattened data is
+			// assembled further down (it depends on the paginated pages), and this callback
+			// only needs it at click time.
+			const chapter = activeChaptersRef.current.find((ch) => ch.id === chapterId);
 			const title = chapter?.title ?? chapterId;
 			try {
 				const result = await api.rulerRebase(projectId, chapterId);
 				if (result.success) {
 					queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
 					queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
-					notifications.show({
-						title: t("ruler.rebaseSuccess"),
-						message: t("ruler.rebaseSuccessDesc"),
-						color: "teal",
-					});
+					// A rebase now runs over a dirty workspace by parking the uncommitted work
+					// and reapplying it afterwards. Reported separately from the rebase itself,
+					// because "your changes are in a snapshot rather than on disk" is a state the
+					// user has to act on, and a plain success toast would bury it.
+					// The success toast is suppressed whenever there is parked-work news: a green
+					// "rebase completed" beside a red "your changes could not be restored" reads
+					// as though the loss were incidental.
+					if (reportParkedWork(chapterId, title, result)) {
+						notifications.show({
+							title: t("ruler.rebaseSuccess"),
+							message: t("ruler.rebaseSuccessDesc"),
+							color: "teal",
+						});
+					}
 				} else if (result.conflictFiles?.length) {
 					setRebaseConflict({
 						chapterId,
@@ -1048,7 +1334,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				}
 			}
 		},
-		[projectId, queryClient, t, data],
+		[projectId, queryClient, t, reportParkedWork],
 	);
 
 	const handleChapterReview = useCallback(
@@ -1576,7 +1862,11 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	);
 
 	// --- Layout computation ---
-	const rulerData = (data as RulerData) ?? { commits: [], segments: [], activeChapters: [] };
+	const rulerData = useMemo(() => flattenRulerPages(data?.pages ?? []), [data?.pages]);
+	// Also not served yet: the ruler endpoint sets neither `degraded` nor `fallback`, so
+	// this banner is currently unreachable by design rather than broken. Kept so the
+	// display exists the moment the server reports degradation, as the classic graph
+	// already does; absence must read as "healthy".
 	const rulerFallbackMessage = useMemo(() => {
 		if (!rulerData.degraded && !rulerData.fallback) return null;
 		const reasons = (rulerData.fallbacks ?? [])
@@ -1593,6 +1883,11 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			? formatNotificationList(reasons)
 			: t("ruler.degradedMode", { defaultValue: "Ruler is running in degraded mode." });
 	}, [rulerData.degraded, rulerData.fallback, rulerData.fallbacks, t]);
+	// The server does not send `capabilities` for the ruler yet (see `RulerData`), so
+	// `rulerMutations` is normally undefined and every flag below stays false — i.e.
+	// nothing is disabled. `=== false` rather than `!== true` is what makes that safe:
+	// a missing capability means "assume available", and only an explicit
+	// `supported: false` takes an action away.
 	const rulerMutations = rulerData.capabilities?.mutations;
 	const rulerMutationDisabled = useMemo(
 		() => ({
@@ -1671,6 +1966,37 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	segmentsRef.current = segments;
 	layoutRef.current = layout;
 	commitShasRef.current = commitShas;
+	activeChaptersRef.current = rulerData.activeChapters ?? [];
+
+	/**
+	 * Rebuild the recovery panel from persisted chapter state.
+	 *
+	 * The panel used to be written only by a rebase response, so reloading the page or
+	 * navigating away and back made it vanish while the server still tracked the debt —
+	 * the next rebase came back 409 `REBASE_PARKED_WORK_CONFLICT` and no UI could act on
+	 * the work. The server now reports `parkedSnapshot` on each chapter, which is the
+	 * durable truth; a live `parkedWork` always wins, so this only fills the gap where
+	 * there is no local state yet and never overwrites what the user is interacting with.
+	 */
+	useEffect(() => {
+		if (parkedWork) return;
+		const candidates = [...(rulerData.activeChapters ?? []), ...(rulerData.mergedChapters ?? [])];
+		const owner = candidates.find(
+			(ch) => ch.parkedSnapshot && !settledParkedSnapshotsRef.current.has(ch.parkedSnapshot),
+		);
+		if (!owner?.parkedSnapshot) return;
+		setParkedWork({
+			chapterId: owner.id,
+			chapterTitle: owner.title,
+			snapshot: owner.parkedSnapshot,
+			// The chapter row records that work is parked, not why. `conflict` is the state
+			// that offers actions, and `restored` makes the panel say only what is known
+			// rather than assert a conflict the server never reported.
+			status: "conflict",
+			conflictFiles: [],
+			restored: true,
+		});
+	}, [rulerData.activeChapters, rulerData.mergedChapters, parkedWork]);
 
 	const commitByShaRef = useRef(new Map<string, (typeof commits)[number]>());
 	commitByShaRef.current = useMemo(() => {
@@ -1932,6 +2258,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const handlePixiChapterDragEnd = useCallback(
 		(chapterId: string, fromSha: string, newAxisOffset: number, newCrossOffset: number) => {
 			const clampedCross = Math.max(0, newCrossOffset);
+			// `fromSha` is the segment key captured when the drag started, and it is the
+			// right cache key — but not necessarily the right anchor to persist. A rebase
+			// rewrites the commits the chapter used to hang from, so the sha the card was
+			// grouped under can already be gone from the backbone by the time the pointer
+			// lifts, and storing it makes the position unresolvable on the next load.
+			// Re-resolve against the current tick list, keeping `fromSha` only as fallback.
+			const anchorSha = anchorByChapterRef.current.get(chapterId) ?? fromSha;
 			const qk = ["rulerSegment", projectId, fromSha, "full"];
 			queryClient.setQueryData(qk, (old: unknown) => {
 				if (!old || typeof old !== "object") return old;
@@ -1945,24 +2278,33 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					),
 				};
 			});
-			// Also update the main ruler cache so alwaysVisibleChapters stays in sync
+			// Also update the main ruler cache so alwaysVisibleChapters stays in sync.
+			// That cache is an infinite query, so its entry is `{ pages, pageParams }` and
+			// every page carries the full chapter list — the offsets have to be rewritten in
+			// all of them, or a later flatten would pick the stale copy back up.
 			queryClient.setQueryData(["ruler", projectId], (old: unknown) => {
 				if (!old || typeof old !== "object") return old;
-				const rd = old as RulerData;
-				const updateOffset = (ch: { id: string; axisOffset: number; crossOffset: number }) =>
+				const cached = old as { pages?: RulerData[]; pageParams?: unknown[] };
+				if (!Array.isArray(cached.pages)) return old;
+				const updateOffset = <T extends { id: string; axisOffset: number; crossOffset: number }>(
+					ch: T,
+				): T =>
 					ch.id === chapterId
 						? { ...ch, axisOffset: newAxisOffset, crossOffset: clampedCross }
 						: ch;
 				return {
-					...rd,
-					activeChapters: rd.activeChapters.map(updateOffset),
-					mergedChapters: rd.mergedChapters?.map(updateOffset),
+					...cached,
+					pages: cached.pages.map((page) => ({
+						...page,
+						activeChapters: (page.activeChapters ?? []).map(updateOffset),
+						mergedChapters: page.mergedChapters?.map(updateOffset),
+					})),
 				};
 			});
 			api.updateRulerPositions(projectId, [
 				{
 					chapterId,
-					anchorCommitSha: fromSha,
+					anchorCommitSha: anchorSha,
 					axisOffset: newAxisOffset,
 					crossOffset: clampedCross,
 				},
@@ -2246,6 +2588,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							branch: ch.branch || old.branch,
 							startCommitSha: ch.startCommitSha ?? old.startCommitSha,
 							mergeCommitSha: ch.mergeCommitSha ?? old.mergeCommitSha,
+							mergeAnchorCommitSha: ch.mergeAnchorCommitSha ?? old.mergeAnchorCommitSha,
+							parkedSnapshot: ch.parkedSnapshot ?? old.parkedSnapshot,
 						};
 					});
 					pixiChaptersMapRef.current.set(fromSha, merged);
@@ -2296,6 +2640,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						narratorModelUnavailable: ch.narratorModelUnavailable,
 						startCommitSha: ch.startCommitSha,
 						mergeCommitSha: ch.mergeCommitSha,
+						mergeAnchorCommitSha: ch.mergeAnchorCommitSha,
+						parkedSnapshot: ch.parkedSnapshot,
 						layoutX: ch.layoutX,
 						layoutY: ch.layoutY,
 						segMainPos: tick.x,
@@ -2342,6 +2688,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					narratorModelUnavailable: ch.narratorModelUnavailable,
 					startCommitSha: ch.startCommitSha,
 					mergeCommitSha: ch.mergeCommitSha,
+					mergeAnchorCommitSha: ch.mergeAnchorCommitSha,
+					parkedSnapshot: ch.parkedSnapshot,
 					layoutX: ch.layoutX,
 					layoutY: ch.layoutY,
 					segMainPos: tick.x,
@@ -2381,6 +2729,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					narratorModelUnavailable: ch.narratorModelUnavailable,
 					startCommitSha: ch.startCommitSha,
 					mergeCommitSha: ch.mergeCommitSha,
+					mergeAnchorCommitSha: ch.mergeAnchorCommitSha,
+					parkedSnapshot: ch.parkedSnapshot,
 					layoutX: ch.layoutX,
 					layoutY: ch.layoutY,
 					segMainPos,
@@ -2442,52 +2792,39 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	// Always-visible chapters for L0 dot rendering.
 	// Uses activeChapters + mergedChapters from the main ruler query (no segment fetch needed).
-	const alwaysVisibleChapters = useMemo<PixiChapterInfo[]>(() => {
+	const {
+		anchoredChapters: alwaysVisibleChapters,
+		missingTickChapters,
+		anchorByChapter: liveAnchorByChapter,
+	} = useMemo<{
+		anchoredChapters: PixiChapterInfo[];
+		missingTickChapters: Array<{ id: string; title: string }>;
+		anchorByChapter: Map<string, string>;
+	}>(() => {
 		const activeChapters = rulerData.activeChapters ?? [];
 		const mergedChapters = rulerData.mergedChapters ?? [];
 		const allChapters = [...activeChapters, ...mergedChapters];
-		if (allChapters.length === 0) return [];
+		if (allChapters.length === 0)
+			return {
+				anchoredChapters: [],
+				missingTickChapters: [],
+				anchorByChapter: new Map<string, string>(),
+			};
 		const result: PixiChapterInfo[] = [];
 
-		// Build lookup by id for parent-chain traversal
-		const chapterById = new Map<string, (typeof allChapters)[number]>();
-		for (const ch of allChapters) chapterById.set(ch.id, ch);
-
-		// Resolve effective startCommitSha: if the chapter's own startCommitSha
-		// is not on the main-branch tick list (e.g. forked from a sub-branch commit),
-		// walk up the parentChapterId chain to find an ancestor whose startCommitSha
-		// IS on the ruler, so the chapter can "attach" to its parent's anchor.
-		const resolveEffectiveSha = (ch: (typeof allChapters)[number]): string | null => {
-			if (ch.startCommitSha && tickPositions.has(ch.startCommitSha)) {
-				return ch.startCommitSha;
-			}
-			const visited = new Set<string>();
-			let cur = ch;
-			while (cur.parentChapterId && !visited.has(cur.parentChapterId)) {
-				visited.add(cur.parentChapterId);
-				const parent = chapterById.get(cur.parentChapterId);
-				if (!parent) break;
-				if (parent.startCommitSha && tickPositions.has(parent.startCommitSha)) {
-					return parent.startCommitSha;
-				}
-				cur = parent;
-			}
-			return null;
-		};
-
-		// Group all chapters by effective startCommitSha
+		// Resolve each chapter to a backbone tick, walking the parent chain when its own
+		// start commit is off the ruler. Chapters that resolve to nothing come back
+		// separately instead of being dropped — that silent drop is what made chapters
+		// anchored to commits outside the loaded window look deleted.
 		const activeIdSet = new Set(activeChapters.map((ch) => ch.id));
-		const byStartSha = new Map<string, typeof allChapters>();
-		for (const ch of allChapters) {
-			const sha = resolveEffectiveSha(ch);
-			if (!sha) continue;
-			const list = byStartSha.get(sha) ?? [];
-			list.push(ch);
-			byStartSha.set(sha, list);
-		}
+		const { byStartSha, unanchored } = resolveChapterAnchors(allChapters, (sha) =>
+			tickPositions.has(sha),
+		);
+		const anchorByChapter = new Map<string, string>();
 		for (const [sha, chs] of byStartSha) {
 			const segMainPos = tickPositions.get(sha);
 			if (segMainPos == null) continue;
+			for (const ch of chs) anchorByChapter.set(ch.id, sha);
 			for (let i = 0; i < chs.length; i++) {
 				const ch = chs[i];
 				const isMerged = !activeIdSet.has(ch.id);
@@ -2504,6 +2841,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					narratorModelUnavailable: ch.narratorModelUnavailable ?? false,
 					startCommitSha: ch.startCommitSha,
 					mergeCommitSha: ch.mergeCommitSha,
+					mergeAnchorCommitSha: ch.mergeAnchorCommitSha,
+					parkedSnapshot: ch.parkedSnapshot,
 					parentChapterId: ch.parentChapterId,
 					layoutX: hasOffset ? ch.axisOffset : 20 + (i % 3) * (NODE_WIDTH + NODE_GAP),
 					layoutY: hasOffset ? ch.crossOffset : 20 + Math.floor(i / 3) * (NODE_HEIGHT + NODE_GAP),
@@ -2521,7 +2860,11 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				});
 			}
 		}
-		return result;
+		return {
+			anchoredChapters: result,
+			missingTickChapters: unanchored.map((ch) => ({ id: ch.id, title: ch.title })),
+			anchorByChapter,
+		};
 	}, [
 		rulerData.activeChapters,
 		rulerData.mergedChapters,
@@ -2530,6 +2873,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		openPanelChapterIds,
 		closingPanelChapterIds,
 	]);
+
+	// Mirrored for handlePixiChapterDragEnd, which is defined above this point and runs
+	// from a pointer handler rather than a render.
+	anchorByChapterRef.current = liveAnchorByChapter;
 
 	// --- Activity tracking for collapsed chapters ---
 	const activityChapters = useMemo(() => {
@@ -2666,6 +3013,147 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					<Text size="xs" c="orange">
 						{rulerFallbackMessage}
 					</Text>
+				</Card>
+			)}
+
+			{/* Chapters that could not be placed on the backbone.
+			    Without this they were dropped from the layout in silence, which reads as
+			    "my chapter was deleted". Offers the action that usually fixes it — paging
+			    in older commits — and says so plainly when there is nothing left to load. */}
+			{missingTickChapters.length > 0 && (
+				<Card
+					withBorder
+					padding="xs"
+					data-testid="ruler-off-backbone-notice"
+					style={{
+						position: "absolute",
+						top: rulerFallbackMessage ? 68 : 12,
+						left: 12,
+						zIndex: 50,
+						maxWidth: 520,
+					}}
+				>
+					<Stack gap={4}>
+						<Text size="xs" c="orange">
+							{t("ruler.offRulerChapters", {
+								count: missingTickChapters.length,
+								titles: formatNotificationList(
+									missingTickChapters.map((ch) => clampChapterTitle(ch.title)),
+								),
+							})}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{hasPreviousPage
+								? t("ruler.offRulerChaptersDesc")
+								: t("ruler.offRulerChaptersExhausted")}
+						</Text>
+						{/* A real <Button>, not a clickable <Text>.
+						    This is the only way back to a chapter that fell outside the loaded
+						    window, and as a bare `<Text onClick>` it had no role, no tab stop and
+						    no key handler — a keyboard or screen-reader user could not reach the
+						    single recovery path at all. The parked-work panel below already used
+						    Mantine's Button, so matching it costs nothing. */}
+						{hasPreviousPage && (
+							<Group gap="xs">
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									loading={isFetchingPreviousPage}
+									onClick={() => void fetchPreviousPage()}
+								>
+									{isFetchingPreviousPage
+										? t("ruler.loadingOlderCommits")
+										: t("ruler.loadOlderCommits")}
+								</Button>
+							</Group>
+						)}
+					</Stack>
+				</Card>
+			)}
+
+			{/* Recovery for work a rebase parked and could not put back.
+			    The toast alone was a dead end: it named a snapshot id that no user-facing
+			    operation accepted, so the only way out was to forget about the work. */}
+			{parkedWork && (
+				<Card
+					withBorder
+					padding="xs"
+					data-testid="ruler-parked-work-panel"
+					style={{
+						position: "absolute",
+						top: 12,
+						right: 12,
+						zIndex: 50,
+						maxWidth: 420,
+					}}
+				>
+					<Stack gap={6}>
+						<Text size="xs" fw={600} c={parkedWork.status === "failed" ? "red" : "orange"}>
+							{/* Restored from persisted state carries no reason, so it must not claim a
+							    conflict; it only says work is waiting. */}
+							{parkedWork.restored
+								? t("ruler.parkedWorkOutstanding")
+								: parkedWork.status === "failed"
+									? t("ruler.rebaseReapplyFailed")
+									: t("ruler.rebaseReapplyConflict")}
+						</Text>
+						{/* The panel floats in a corner and the project has many chapters, so
+						    without naming its owner the user cannot tell whose work this is —
+						    the title was already in state and simply never rendered. */}
+						<Text size="xs" fw={500} data-testid="ruler-parked-work-chapter">
+							{clampChapterTitle(parkedWork.chapterTitle)}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{parkedWork.restored
+								? t("ruler.parkedWorkOutstandingDesc", {
+										snapshot: parkedWork.snapshot.slice(0, 12),
+									})
+								: parkedWork.status === "failed"
+									? t("ruler.rebaseReapplyFailedDesc", {
+											error: parkedWork.error ?? "",
+											snapshot: parkedWork.snapshot.slice(0, 12),
+										})
+									: t("ruler.rebaseReapplyConflictDesc", {
+											snapshot: parkedWork.snapshot.slice(0, 12),
+										})}
+						</Text>
+						{parkedWork.conflictFiles.length > 0 && (
+							<Text size="xs" c="dimmed">
+								{formatNotificationList(parkedWork.conflictFiles)}
+							</Text>
+						)}
+						<Group gap="xs">
+							<Button
+								size="compact-xs"
+								variant="light"
+								loading={parkedWorkBusy === "retry"}
+								disabled={parkedWorkBusy !== null}
+								onClick={() => void handleParkedWorkAction("retry")}
+							>
+								{t("ruler.parkedWorkRetry")}
+							</Button>
+							<Button
+								size="compact-xs"
+								variant="light"
+								color="yellow"
+								loading={parkedWorkBusy === "materialize"}
+								disabled={parkedWorkBusy !== null}
+								onClick={() => void handleParkedWorkAction("materialize")}
+							>
+								{t("ruler.parkedWorkMaterialize")}
+							</Button>
+							<Button
+								size="compact-xs"
+								variant="subtle"
+								color="red"
+								loading={parkedWorkBusy === "discard"}
+								disabled={parkedWorkBusy !== null}
+								onClick={() => void handleParkedWorkDiscard()}
+							>
+								{t("ruler.parkedWorkDiscard")}
+							</Button>
+						</Group>
+					</Stack>
 				</Card>
 			)}
 
@@ -3043,12 +3531,18 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							});
 							const anchorSha = hr?.fromSha;
 							if (!anchorSha) return;
+							// The positions endpoint updates axisOffset/crossOffset unconditionally,
+							// so a resize has to resend the CURRENT offsets. Sending 0/0 — which this
+							// did — moved every resized chapter back to the origin of its anchor,
+							// discarding the layout the user had arranged. `hr.layoutX/layoutY` are
+							// the live world offsets the card is drawn at, which is exactly what
+							// handlePixiChapterDragEnd persists.
 							api.updateRulerPositions(projectId, [
 								{
 									chapterId: chId,
 									anchorCommitSha: anchorSha,
-									axisOffset: 0,
-									crossOffset: 0,
+									axisOffset: hr?.layoutX ?? 0,
+									crossOffset: Math.max(0, hr?.layoutY ?? 0),
 									width: newW,
 									height: newH,
 								},

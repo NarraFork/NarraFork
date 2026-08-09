@@ -82,6 +82,19 @@ export interface PixiChapterInfo {
 	narratorModelUnavailable?: boolean;
 	startCommitSha: string | null;
 	mergeCommitSha?: string | null;
+	/**
+	 * Backbone commit the merge connector anchors to. A commit-free merge has no
+	 * merge commit, so this falls back to the target's pre-merge HEAD server-side.
+	 */
+	mergeAnchorCommitSha?: string | null;
+	/**
+	 * Snapshot holding uncommitted work an earlier rebase parked and could not put back.
+	 *
+	 * Not drawn — carried so RulerFlow can restore its recovery panel from server state
+	 * after a reload. Dropping it in this layer's payload shape is how an optimistic
+	 * chapter update used to erase it.
+	 */
+	parkedSnapshot?: string | null;
 	/** Parent chapter ID — used to draw connector to parent instead of ruler for orphan chapters */
 	parentChapterId?: string | null;
 	/** World-space layout position within the segment */
@@ -1293,9 +1306,11 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				}
 			}
 
-			// Merge connector
-			if (ch.status === "merged" && ch.mergeCommitSha) {
-				const mergeTickMain = d.tickPositions.get(ch.mergeCommitSha);
+			// Merge connector. Anchored on `mergeAnchorCommitSha`, which the server fills
+			// from the pre-merge target HEAD when the merge produced no commit at all.
+			const mergeAnchor = ch.mergeAnchorCommitSha ?? ch.mergeCommitSha;
+			if (ch.status === "merged" && mergeAnchor) {
+				const mergeTickMain = d.tickPositions.get(mergeAnchor);
 				if (mergeTickMain != null) {
 					const mergeScreenMain = toScreen(mergeTickMain);
 

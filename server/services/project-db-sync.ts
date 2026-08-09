@@ -110,8 +110,12 @@ async function syncChapter(chapterId: string): Promise<void> {
 		 base_branch, parent_chapter_id, fork_point, merged_into_chapter_id,
 		 merge_commit_sha, merge_strategy, container_config, exploration_group_id,
 		 is_root, head_commit_sha, start_commit_sha, commit_count, color, group_label,
-		 pinned, anchor_commit_sha, axis_offset, cross_offset, last_accessed_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 pinned, anchor_commit_sha, axis_offset, cross_offset, last_accessed_at, created_at, updated_at,
+		 snapshot_commit_sha, snapshot_shadow_key, dormant_snapshot_commit_sha,
+		 pre_merge_target_sha, merge_snapshot_commit_sha, pre_merge_target_snapshot_sha,
+		 merged_source_snapshot_sha)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+		 ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			row.id,
 			row.projectId,
@@ -142,6 +146,23 @@ async function syncChapter(chapterId: string): Promise<void> {
 			row.lastAccessedAt,
 			row.createdAt,
 			row.updatedAt,
+			// Snapshot coordinates. A commit-free merge writes nothing to the user's git
+			// history, so these are the only record of it: dropping them here would make a
+			// re-imported chapter read as "merged, no merge commit", which both `unmerge`
+			// and `wake` reject outright.
+			//
+			// `parkedSnapshotCommitSha` / `parkedSnapshotBaseTree` are deliberately not
+			// carried: they describe a rebase still in flight on THIS machine, pointing at
+			// its shadow repository. Imported elsewhere, the next rebase would try to settle
+			// them, resolve nothing, and report `lostParkedSnapshot` — telling the user they
+			// lost work that was never on that machine. See `project-db.ts`.
+			row.snapshotCommitSha,
+			row.snapshotShadowKey,
+			row.dormantSnapshotCommitSha,
+			row.preMergeTargetSha,
+			row.mergeSnapshotCommitSha,
+			row.preMergeTargetSnapshotSha,
+			row.mergedSourceSnapshotSha,
 		],
 	);
 }

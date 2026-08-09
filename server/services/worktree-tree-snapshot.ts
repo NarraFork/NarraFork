@@ -14,6 +14,20 @@
  *   - Restoring is one `read-tree` + `checkout-index`, so there is no chance of a
  *     partially-applied or diverged rebuild.
  *
+ * "Byte-exact" is an outcome that has to be engineered, not a property inherited from
+ * using git. git's own content filters — `core.autocrlf`, `text=auto`, `filter=`,
+ * `working-tree-encoding`, `ident` — will happily change bytes in both directions, and
+ * do it in the one way that defeats the engine's own checks: the restored file differs
+ * on disk while re-hashing yields the *same* tree. {@link SHADOW_ATTRIBUTES} and
+ * {@link SHADOW_CONFIG_ENV} are what make the promise true.
+ *
+ * Two exclusions are likewise load-bearing rather than housekeeping. `/.worktrees/` is
+ * excluded because the root chapter's workspace *is* the project's git root, so a
+ * capture there descends into every other chapter's live worktree and a rollback would
+ * delete it. Conversely, files the real repository tracks *despite* an ignore rule are
+ * force-added back in, because a file missing from the tree makes both boundaries of a
+ * change identical and the revert planner then reads that as "nothing happened".
+ *
  * Scope is `(deviceId, worktreePath)`. Tying snapshots to a chapter (as the older
  * chapter-scoped implementation did) breaks as soon as several narrators share a
  * worktree, which already happens for subagents and for the root chapter.
@@ -27,7 +41,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, worktreeTreeSnapshots } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -78,6 +92,28 @@ const UPDATE_INDEX_BATCH_BYTES = 96 * 1024;
 
 /** Path count past which a snapshot operation is logged as slow. */
 const SLOW_PATH_COUNT = 2_000;
+
+/**
+ * Most tracked-but-ignored paths force-added into one capture.
+ *
+ * The set is normally empty or a handful (`.env`, a checked-in build artefact), so
+ * the cap only exists to stop a pathological repository — one that `git add -f`'d a
+ * whole ignored dependency tree — from putting thousands of extra argv bytes and a
+ * proportional index write on the tool-execution path. Past the cap the excess is
+ * dropped with a warning rather than silently: those paths stay outside snapshots,
+ * which is the pre-existing behaviour, and the warning is what makes it visible.
+ */
+const MAX_TRACKED_IGNORED_PATHS = 5_000;
+
+/**
+ * Reserved directory holding every chapter's linked worktree.
+ *
+ * `<project.gitPath>/.worktrees/<name>`, and the root chapter's own `worktreePath`
+ * *is* `gitPath` — so a capture of the root workspace walks straight into every
+ * other chapter's worktree. See {@link syncExcludes} for why that must never be
+ * snapshotted and {@link isWorktreeRoot} for the second line of defence.
+ */
+export const WORKTREES_DIR_NAME = ".worktrees";
 
 /**
  * Elapsed time past which one capture is reported as slow.
@@ -178,6 +214,7 @@ async function runGitRaw(
 		cmd: ["git", "--git-dir", gitDir, "--work-tree", workTree, ...args],
 		timeout: GIT_TIMEOUT_MS,
 		maxOutputBytes: opts?.maxOutputBytes ?? GIT_MAX_OUTPUT_BYTES,
+		env: { ...process.env, ...SHADOW_CONFIG_ENV },
 	});
 	return {
 		stdout: result.stdout,
@@ -216,7 +253,7 @@ async function runGitWithIndex(
 		cmd: ["git", "--git-dir", gitDir, "--work-tree", workTree, ...args],
 		timeout: GIT_TIMEOUT_MS,
 		maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
-		env: { ...process.env, GIT_INDEX_FILE: indexFile },
+		env: { ...process.env, ...SHADOW_CONFIG_ENV, GIT_INDEX_FILE: indexFile },
 	});
 	return {
 		stdout: result.stdout.trim(),
@@ -360,7 +397,7 @@ async function runGitAuthored(
 		cmd: ["git", "--git-dir", gitDir, "--work-tree", workTree, ...args],
 		timeout: GIT_TIMEOUT_MS,
 		maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
-		env: { ...process.env, ...SNAPSHOT_IDENTITY },
+		env: { ...process.env, ...SHADOW_CONFIG_ENV, ...SNAPSHOT_IDENTITY },
 	});
 	return {
 		stdout: result.stdout.trim(),
@@ -410,6 +447,65 @@ async function resolveGlobalGitignore(worktreePath: string): Promise<string | nu
 
 /** Cached global gitignore path + its mtime, to avoid re-resolving every snapshot. */
 const globalIgnoreCache = new Map<string, { path: string | null; mtime: number }>();
+
+/**
+ * Per-shadow-repo memo of the tracked-but-ignored force-add, keyed on the real
+ * repository's index identity.
+ *
+ * Both halves of that work are measurably expensive on the tool-execution path: on a
+ * 5 000-file repository `git ls-files -i -c` costs ~18 ms and the force-add another
+ * ~9 ms, against a ~26 ms warm capture — so doing them unconditionally nearly doubled
+ * the hot path. Caching is sound because of what the second `add` is *for*: it only
+ * ever needs to **introduce** an index entry. Once a path is in the shadow index, a
+ * plain `add -A` keeps its content current and records its deletion (both verified),
+ * so repeating the force-add on every capture buys nothing.
+ *
+ * The real repo's index mtime+size is the invalidation key because the set can only
+ * change by the user running `git add -f`, `git rm --cached` or a checkout — all of
+ * which write that index. One `stat` replaces two git subprocesses.
+ *
+ * That key alone is *not* sufficient, and the missing half is
+ * {@link readTreeIntoShadowIndex}: what the memo records is "the force-add has already
+ * introduced these entries", and the entries it is talking about live in the **shadow**
+ * index, which `read-tree` rewrites without touching the real one. See that function for
+ * the data loss the gap produced.
+ */
+const trackedIgnoredCache = new Map<string, { indexKey: string; paths: string[] }>();
+
+/**
+ * Load a tree into the shadow repository's own index, dropping the force-add memo.
+ *
+ * Every `read-tree` against the shadow index must go through here, because the memo in
+ * {@link trackedIgnoredCache} is keyed on the *real* repository's index identity and
+ * `read-tree` never writes that index. It does, however, replace every entry in the
+ * shadow index with the target tree's — so a tracked-but-ignored path the force-add
+ * introduced is **evicted** whenever the target tree does not contain it. The key is
+ * then unchanged, {@link trackedButIgnoredPaths} reports a cache hit and returns `[]`,
+ * and the next plain `add -A` silently drops the path again.
+ *
+ * Reproduced end to end in an isolated repository: capture `t0` without `.env`,
+ * `git add -f .env`, capture `t1` containing it, restore `t0`, write new bytes into
+ * `.env`, and the next capture comes back **equal to `t0`** — so the revert planner reads
+ * the boundary as "nothing changed" and skips the segment, leaving the edit unrevertable
+ * with no warning anywhere. The same workspace then fails `parkUncommittedWork`'s
+ * coverage check permanently, with an error pointing at `.gitignore` that the user
+ * cannot act on.
+ *
+ * So a read-tree counts as an invalidation event alongside a real-index write. Folding
+ * the shadow index's own identity into the cache key was the alternative and is worse:
+ * any capture that actually changes a file rewrites that index, so the memo would miss
+ * on precisely the calls it exists to make cheap. Dropping the entry *before* running
+ * the command is deliberate too — a failed `read-tree` may still have partially rewritten
+ * the index, and the safe direction of a wrong guess is one extra `ls-files`.
+ */
+async function readTreeIntoShadowIndex(
+	dir: string,
+	worktreePath: string,
+	treeHash: string,
+): Promise<GitResult> {
+	trackedIgnoredCache.delete(dir);
+	return runGit(["read-tree", treeHash], dir, worktreePath);
+}
 
 /**
  * Locate the repository-level `info/exclude` that applies to a worktree.
@@ -497,9 +593,177 @@ async function syncExcludes(dir: string, worktreePath: string): Promise<void> {
 		}
 	}
 
-	// Never snapshot the shadow repos themselves or the user's git metadata.
+	// Never snapshot the user's git metadata, and never snapshot the directory that
+	// holds every *other* chapter's worktree.
+	//
+	// `/.worktrees/` is not a convenience: the root chapter's `worktreePath` is the
+	// project's `gitPath` itself, so a capture of the root workspace descends into
+	// `<gitPath>/.worktrees/<child>`. A linked worktree enters the shadow tree as a
+	// `160000 commit` gitlink, which makes the child's whole directory a path in the
+	// tree — and a rollback to a state predating that child then finds the path absent
+	// from the target tree and takes it out with `rmSync(recursive)`, deleting a live
+	// chapter's uncommitted work.
+	//
+	// Written here rather than relying on the user's `.gitignore` because that is a
+	// file the user owns: the entry NarraFork adds on project create/update can fail
+	// (the write is best-effort), an imported repository never had it, the user may
+	// delete the line, and — worst of all — `.gitignore` is itself a snapshotted file,
+	// so a rollback can remove the very rule protecting the rollback. A rule inside
+	// the shadow repo's own `info/exclude` is outside all of that.
+	//
+	// Both the leading slash and the trailing slash are deliberate: anchored to the
+	// workspace root so a legitimately-tracked `docs/.worktrees` elsewhere is
+	// unaffected, and directory-only so a file literally named `.worktrees` is not
+	// silently dropped.
 	parts.push("/.git/\n");
+	parts.push(`/${WORKTREES_DIR_NAME}/\n`);
 	await Bun.write(resolve(infoDir, "exclude"), parts.join("\n"));
+	await writeShadowAttributes(dir);
+}
+
+/**
+ * Attributes forced on every path the shadow repository touches.
+ *
+ * The module's central promise is that a snapshot is *the bytes on disk*, and a
+ * restore writes those bytes back. git's content filters break that promise, and the
+ * way they break it is uniquely dangerous here: the corruption is invisible to the
+ * engine's own consistency check. Measured on git 2.47 with a shadow repo attached
+ * to a worktree via `--work-tree`:
+ *
+ *   - `* text=auto` in the *worktree's* `.gitattributes` applies, because attributes
+ *     are read from the working tree. A CRLF file is stored as LF and written back as
+ *     CRLF; a pure-LF file gets CRLF'd on the way out. Re-hashing afterwards yields
+ *     the *same* tree, so the engine concludes the restore was exact while the file
+ *     on disk has different bytes than it started with.
+ *   - `core.autocrlf=true` inherited from the user's global config does the same to
+ *     LF files even with no `.gitattributes` at all.
+ *   - `filter=<name>` runs a clean/smudge filter, so a snapshot can store content
+ *     that was never on disk.
+ *   - `working-tree-encoding` is worse than lossy: `add -A` exits 128 outright when
+ *     it cannot transcode, so the capture *fails* and the boundary is recorded as
+ *     absent.
+ *   - `ident` rewrites `$Id$`, which is a silent content change in both directions.
+ *
+ * `-text -filter -working-tree-encoding -ident` in `info/attributes` turns all of
+ * that off. `info/attributes` is used rather than config because it out-ranks the
+ * worktree's own `.gitattributes` in git's attribute precedence, which config cannot
+ * do — a `.gitattributes` committed by the user would otherwise win.
+ *
+ * Verified not to cost anything the engine relies on: `merge-tree --write-tree` still
+ * performs a line-level three-way merge under these attributes (only `-merge`/`-diff`
+ * would force binary-style merging, so they are deliberately *not* set), and modes,
+ * symlinks and the executable bit are tree metadata rather than attribute-driven.
+ */
+const SHADOW_ATTRIBUTES = "* -text -filter -working-tree-encoding -ident\n";
+
+/**
+ * Config forced onto every shadow-repo git invocation, via the environment.
+ *
+ * Belt to {@link SHADOW_ATTRIBUTES}' braces. `info/attributes` already neutralises
+ * the attribute path, but `core.autocrlf` is a *config* knob, and the shadow repo
+ * inherits the user's global and system config like any other repository. Passing it
+ * per-invocation rather than writing it into the shadow repo's own config file means
+ * a repository created by an older build is corrected the first time it is used,
+ * without a migration step that has to find and rewrite every existing shadow repo.
+ *
+ * `GIT_CONFIG_COUNT` overrides all config files, so this also beats a `core.autocrlf`
+ * set in the user's *system* config, which a repo-local setting would not.
+ */
+const SHADOW_CONFIG_ENTRIES: ReadonlyArray<readonly [key: string, value: string]> = [
+	// Never translate line endings on the way in or out.
+	["core.autocrlf", "false"],
+	["core.eol", "lf"],
+	// `safecrlf` only ever *rejects* content whose conversion would be irreversible;
+	// with conversion disabled it has nothing to guard, and leaving it enabled would
+	// turn an inherited `warn`/`true` into capture failures.
+	["core.safecrlf", "false"],
+	// A symlink must round-trip as a symlink. With `core.symlinks=false` (inheritable
+	// on Windows) `checkout-index` writes a regular file containing the target path,
+	// which is a different filesystem object than the one captured.
+	["core.symlinks", "true"],
+	// `add -A` must not be talked out of recording a file mode change.
+	["core.fileMode", "true"],
+];
+
+/**
+ * The above, in the numbered form git reads from the environment.
+ *
+ * Derived rather than written out, because `GIT_CONFIG_COUNT` and the `KEY_n`/`VALUE_n`
+ * slots are one invariant expressed in two places: git exits 128 outright when the count
+ * names a slot that is not set, so a hardcoded `"5"` turns "someone appended an entry
+ * and did not also bump the literal" into every shadow-repo git call failing — which
+ * `tryCapture` swallows into a null boundary, i.e. the whole workspace silently losing
+ * precise reverts. Counting the array cannot disagree with the array.
+ */
+const SHADOW_CONFIG_ENV: Record<string, string> = Object.fromEntries([
+	["GIT_CONFIG_COUNT", String(SHADOW_CONFIG_ENTRIES.length)],
+	...SHADOW_CONFIG_ENTRIES.flatMap(([key, value], index) => [
+		[`GIT_CONFIG_KEY_${index}`, key],
+		[`GIT_CONFIG_VALUE_${index}`, value],
+	]),
+]);
+
+/**
+ * Write the forced attributes, creating `info/` if needed.
+ *
+ * Called from both {@link syncExcludes} paths on purpose. A shadow repository created
+ * by an earlier build has an `info/exclude` but no `info/attributes`, and the
+ * exclude's mtime cache would otherwise keep the file from ever being written — the
+ * repo would stay byte-inexact for its whole life. Writing it alongside the exclude
+ * means the same staleness trigger repairs both, and a first-time create gets it too.
+ */
+async function writeShadowAttributes(dir: string): Promise<void> {
+	const attributesPath = resolve(dir, "info", "attributes");
+	try {
+		// Skipped when already correct: this sits behind the exclude staleness check,
+		// which fires whenever the user edits any ignore source, and rewriting an
+		// identical file would put a pointless write on the tool-execution path.
+		if (existsSync(attributesPath) && readFileSync(attributesPath, "utf-8") === SHADOW_ATTRIBUTES) {
+			return;
+		}
+	} catch {
+		// Unreadable — fall through and overwrite it.
+	}
+	await Bun.write(attributesPath, SHADOW_ATTRIBUTES);
+}
+
+/**
+ * Whether a directory is the root of a git worktree (or repository).
+ *
+ * The second line of defence for the deletion loops. `.git` present as either a file
+ * (a linked worktree's pointer) or a directory (a nested clone) means the directory
+ * belongs to a different repository, whose uncommitted contents this module has no
+ * snapshot of and therefore cannot restore. Excluding `/.worktrees/` already keeps
+ * NarraFork's own chapters out; this also covers a nested repository somewhere else
+ * in the tree, and a worktree that predates the exclude rule and is still recorded
+ * inside an old snapshot.
+ */
+function isWorktreeRoot(absolutePath: string): boolean {
+	try {
+		return existsSync(resolve(absolutePath, ".git"));
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Delete a path a target tree does not contain, refusing to take another
+ * repository's worktree with it.
+ *
+ * Returns whether the path was removed; a refusal is logged, because "the rollback
+ * did not fully apply" is something the caller's own tree comparison will notice and
+ * a silent skip would make that comparison inexplicable.
+ */
+function removePathNotInTree(worktreePath: string, absolute: string): boolean {
+	if (isWorktreeRoot(absolute)) {
+		logger.warn("Refusing to delete a nested git worktree during a snapshot rollback", {
+			worktreePath,
+			nestedWorktree: absolute,
+		});
+		return false;
+	}
+	rmSync(absolute, { force: true, recursive: true });
+	return true;
 }
 
 /**
@@ -717,7 +981,24 @@ async function isShadowRepoClaimed(deviceId: string, worktreePath: string): Prom
 			where: eq(chapters.snapshotShadowKey, key),
 			columns: { id: true },
 		});
-		return claimed != null;
+		if (claimed != null) return true;
+		// `snapshotShadowKey` is only written once something advances the lineage, so a
+		// chapter that has never run a file-mutating tool has it NULL and would be read
+		// as unclaimed — the very chapter whose *first* snapshot this repository is about
+		// to become. The live `worktreePath` answers that case; it is checked second
+		// because it is precisely what a dormant chapter lacks, which is why the key
+		// exists at all. Together the two cover both shapes.
+		//
+		// Both the raw and the normalized spelling are tried, because `worktreePath` is
+		// stored as the caller handed it over rather than normalized — a keeping-data
+		// question should not turn on which spelling a row happens to hold.
+		const normalized = normalizePathForComparison(worktreePath);
+		const candidates = normalized === worktreePath ? [worktreePath] : [worktreePath, normalized];
+		const byPath = await db.query.chapters.findFirst({
+			where: inArray(chapters.worktreePath, candidates),
+			columns: { id: true },
+		});
+		return byPath != null;
 	} catch (error) {
 		logger.warn("Could not verify tree-snapshot ownership; keeping the repository", {
 			worktreePath,
@@ -948,7 +1229,7 @@ async function adoptPathsUnlocked(
 	paths: string[],
 ): Promise<string> {
 	if (paths.length === 0) return baseTree;
-	const readTree = await runGit(["read-tree", baseTree], dir, worktreePath);
+	const readTree = await readTreeIntoShadowIndex(dir, worktreePath, baseTree);
 	if (readTree.exitCode !== 0) {
 		throw new TreeSnapshotError(`adopt read-tree failed: ${readTree.stderr}`);
 	}
@@ -1149,12 +1430,19 @@ function reportCaptureCost(worktreePath: string, dir: string, elapsed: number, o
  *     few seconds for silently losing the ability to undo is the wrong trade on a
  *     data-safety path.
  *
- * A timeout is already handled safely: `safeSpawn` kills the child and reports a
- * non-zero exit (it does not throw), this throws {@link TreeSnapshotError}, and
- * `tryCapture` turns that into null so the tool itself is unaffected and the
- * boundary is simply recorded as absent. Git removes its own `index.lock` when
- * killed, so the next capture recovers on its own. Slow filesystems are therefore
- * an observability problem, which is what {@link reportCaptureCost} addresses.
+ * A timeout is handled safely: `safeSpawn` kills the child and reports a non-zero
+ * exit (it does not throw), this throws {@link TreeSnapshotError}, and `tryCapture`
+ * turns that into null so the tool itself is unaffected and the boundary is simply
+ * recorded as absent. Slow filesystems are therefore an observability problem, which
+ * is what {@link reportCaptureCost} addresses.
+ *
+ * The residue a kill leaves behind is *not* self-healing, contrary to what this
+ * comment used to claim. git removes its own `index.lock` on `SIGTERM` because it
+ * installs a signal handler for it — but not on `SIGKILL` or an OOM kill, where no
+ * userspace code runs at all. The lock then survives forever, every subsequent
+ * `add -A` in that shadow repo exits 128, `tryCapture` returns null every time, and
+ * the whole workspace silently and permanently degrades to per-file replay. That is
+ * why {@link recoverStaleIndexLock} exists.
  */
 async function captureUnlocked(
 	dir: string,
@@ -1163,7 +1451,13 @@ async function captureUnlocked(
 ): Promise<string> {
 	await ensureShadowRepo(dir, worktreePath);
 	const startedAt = Date.now();
-	const added = await runGit(["add", "-A"], dir, worktreePath);
+	let added = await addAllUnlocked(dir, worktreePath);
+	// A stale lock is indistinguishable from a live one by exit code alone, so the
+	// retry is gated on the lock file's own age. Done here rather than in `ensure`
+	// because the lock can also appear *between* two captures.
+	if (added.exitCode !== 0 && recoverStaleIndexLock(dir, worktreePath, added.stderr)) {
+		added = await addAllUnlocked(dir, worktreePath);
+	}
 	reportCaptureCost(worktreePath, dir, Date.now() - startedAt, added.exitCode === 0);
 	if (added.exitCode !== 0) {
 		throw new TreeSnapshotError(`snapshot add failed: ${added.stderr}`);
@@ -1175,6 +1469,264 @@ async function captureUnlocked(
 	const treeHash = written.stdout;
 	await recordTreeHash(deviceId, worktreePath, treeHash);
 	return treeHash;
+}
+
+/**
+ * Stage every path that belongs in a snapshot.
+ *
+ * Two steps, because `add -A` alone has a blind spot that costs data. It honours the
+ * shadow repo's mirrored ignore rules, and a file the *real* repository tracks
+ * despite an ignore rule — `git add -f .env` with `.env` in `.gitignore`, a checked-in
+ * `dist/` artefact — is therefore absent from every snapshot. Measured consequence:
+ * a tool rewrites `.env`, the before and after boundary hashes come out *identical*
+ * because neither contains the file, the revert planner sees `before === after` and
+ * skips the segment as a no-op, and the modification is unrevertable with no warning
+ * anywhere. The engine's own comment at `mergeTreesWithBase` already noted that the
+ * shadow and the real repo disagree about such files; that disagreement is fixed
+ * here, at the capture, rather than only warned about downstream.
+ *
+ * The fix is `--force` on exactly the paths the real repository tracks *and* the
+ * shadow repo would exclude. Alternatives that were rejected:
+ *
+ *   - `!` negation lines in `info/exclude`: measured not to work. The worktree's own
+ *     `.gitignore` out-ranks `info/exclude` in git's precedence, so a rule in
+ *     `.gitignore` wins and the file stays excluded.
+ *   - Force-adding the *whole* tracked set: correct but pointless. Non-ignored
+ *     tracked files are already staged by `add -A`, so it is thousands of redundant
+ *     argv bytes on a hot path.
+ *   - Dropping the exclude mirroring entirely: that is what put `node_modules/` into
+ *     snapshots and made a rollback delete files git itself ignores.
+ *
+ * `ls-files -i -c --exclude-standard` asks the real repository the question directly
+ * and answers in ~20 ms on a 5 000-file repo, against a 12 ms warm `add -A`. The set
+ * is empty in a normal repository, in which case no second git call runs at all.
+ *
+ * Deletions need no special handling: once a path is in the shadow index, a plain
+ * `add -A` records its removal (verified), so the force-add is only ever needed to
+ * *introduce* an entry.
+ */
+async function addAllUnlocked(dir: string, worktreePath: string): Promise<GitResult> {
+	let added = await runGit(["add", "-A"], dir, worktreePath);
+	if (added.exitCode !== 0) {
+		const partial = await addAllIgnoringUnreadable(dir, worktreePath, added);
+		if (!partial) return added;
+		added = partial;
+	}
+
+	const forced = await trackedButIgnoredPaths(dir, worktreePath);
+	if (forced.length === 0) return added;
+
+	for (const batch of batchArgs(forced)) {
+		// `--force` overrides the exclude rules for these paths only. `--ignore-errors`
+		// keeps one unreadable file from failing the batch, and the missing-pathspec case
+		// is handled by filtering to paths that exist: git aborts the *entire* `add` with
+		// exit 128 on a pathspec that matches nothing, so a file deleted between the
+		// `ls-files` and this call would otherwise cost the whole capture.
+		const result = await runGit(
+			["add", "-A", "--force", "--ignore-errors", "--", ...batch],
+			dir,
+			worktreePath,
+		);
+		// Reported rather than fatal. The plain `add -A` already succeeded, so a tree
+		// missing these paths is still the pre-existing behaviour and strictly better
+		// than no snapshot at all — but it is a real loss of revert precision, so it
+		// must not be silent.
+		if (result.exitCode !== 0) {
+			logger.warn("Could not snapshot tracked-but-ignored paths", {
+				worktreePath,
+				pathCount: batch.length,
+				stderr: result.stderr.slice(0, 500),
+			});
+		}
+	}
+	return added;
+}
+
+/**
+ * Retry a failed `add -A` with `--ignore-errors`, for a worktree containing a file
+ * git cannot read.
+ *
+ * A plain `add -A` treats one unreadable path as fatal: it exits 128 and stages
+ * *nothing*, so a single `chmod 000` file — a fixture, a root-owned artefact a
+ * container wrote, a Windows file another process holds open — cost the capture
+ * outright and every boundary in that workspace with it. The whole repository became
+ * unrevertable because of one file.
+ *
+ * `--ignore-errors` skips just the unreadable paths and exits 1, having staged
+ * everything else. That is a *partial* snapshot, which is why it is not the default:
+ * a tree that silently omits paths would let a rollback delete a file it never
+ * recorded. It is safe as a fallback because of what it omits — a path already in the
+ * index keeps its previous entry (verified), so the omission is "this one file's
+ * latest bytes are missing" rather than "this file does not exist", and the rollback
+ * comparison sees no change for it instead of a deletion.
+ *
+ * Only accepted for exit 1, which is `--ignore-errors`' specific "some paths were
+ * skipped" code. Any other failure (a vanished worktree, a stale lock, a timeout) is
+ * a different problem and must keep failing the capture.
+ *
+ * Returns null when the retry did not help, so the caller reports the original error.
+ */
+async function addAllIgnoringUnreadable(
+	dir: string,
+	worktreePath: string,
+	original: GitResult,
+): Promise<GitResult | null> {
+	// The stderr wording is locale-dependent, so this is not gated on the message.
+	// Instead the *outcome* decides: a retry that also fails to make progress is
+	// discarded, and a stale lock is handled by its own dedicated path.
+	if (original.stderr.includes("index.lock")) return null;
+	const retried = await runGit(["add", "-A", "--ignore-errors"], dir, worktreePath);
+	if (retried.exitCode !== 0 && retried.exitCode !== 1) return null;
+	logger.warn("Snapshot captured without paths git could not read", {
+		worktreePath,
+		stderr: original.stderr.slice(0, 500),
+	});
+	// Normalised to success: the caller only distinguishes "usable index" from "no
+	// index", and the partial outcome has already been reported.
+	return { ...retried, exitCode: 0 };
+}
+
+/**
+ * Paths the real repository tracks even though an ignore rule covers them, or an
+ * empty list when the answer is already staged.
+ *
+ * `-i -c --exclude-standard` is git's own answer to exactly this question, so the rule
+ * evaluation is git's rather than a reimplementation — which matters, because the
+ * rules involved are nested `.gitignore` files, `info/exclude` and `core.excludesFile`
+ * with per-directory scoping and negation.
+ *
+ * Gated on {@link trackedIgnoredCache} so the two subprocesses this implies run once
+ * per change to the user's index rather than twice per file-mutating tool. Returning
+ * an empty list for a cache hit is the intended shape: the caller's only use for the
+ * result is a force-add whose job is done.
+ *
+ * Filtered to paths that still exist on disk, because `git add --force -- <missing>`
+ * aborts the whole invocation with exit 128 rather than skipping that one path. The
+ * missing ones need no action anyway: a deletion is recorded by the plain `add -A`.
+ *
+ * Never throws. This is an enhancement layered on a capture that already succeeded, so
+ * a failure degrades to the old behaviour instead of costing the boundary entirely.
+ */
+async function trackedButIgnoredPaths(dir: string, worktreePath: string): Promise<string[]> {
+	try {
+		const indexKey = realIndexIdentity(worktreePath);
+		const cached = trackedIgnoredCache.get(dir);
+		// A null key means the index could not be stat'ed (a non-git directory, or one
+		// whose gitdir moved). Caching on it would pin a stale answer, so the query runs
+		// every time — correct, and only reachable for a workspace that has no index for
+		// the tracked-but-ignored notion to even apply to.
+		if (indexKey !== null && cached?.indexKey === indexKey) return [];
+
+		const result = await safeSpawn({
+			cmd: ["git", "ls-files", "-i", "-c", "--exclude-standard", "-z"],
+			cwd: worktreePath,
+			timeout: GIT_TIMEOUT_MS,
+			maxOutputBytes: GIT_MAX_LISTING_BYTES,
+		});
+		if (result.exitCode !== 0 || result.stdoutTruncated) return [];
+		const paths = result.stdout.split("\0").filter(Boolean);
+		if (paths.length > MAX_TRACKED_IGNORED_PATHS) {
+			logger.warn("Too many tracked-but-ignored paths to snapshot; keeping the first batch", {
+				worktreePath,
+				pathCount: paths.length,
+				cap: MAX_TRACKED_IGNORED_PATHS,
+			});
+			paths.length = MAX_TRACKED_IGNORED_PATHS;
+		}
+		const present = paths.filter((relPath) => existsSync(resolve(worktreePath, relPath)));
+		// Recorded only once the paths are about to be staged, and only for a usable key,
+		// so an interrupted capture cannot leave the cache claiming work that never ran.
+		if (indexKey !== null) trackedIgnoredCache.set(dir, { indexKey, paths: present });
+		return present;
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * A cheap identity for the real repository's index: its size and mtime.
+ *
+ * The set of tracked-but-ignored paths can only change through a command that writes
+ * this index (`add -f`, `rm --cached`, a checkout, a branch switch), so its identity is
+ * a sound invalidation key — and one `stat` is ~0.04 ms against the ~27 ms the two git
+ * calls it replaces cost on a 5 000-file repository.
+ *
+ * Size is folded in alongside mtime because a coarse filesystem timestamp can repeat
+ * within the same second, and an index rewrite almost always changes its length.
+ *
+ * Returns null when there is no readable index, which the caller treats as "do not
+ * cache" rather than as an empty set.
+ */
+function realIndexIdentity(worktreePath: string): string | null {
+	try {
+		const dotGit = resolve(worktreePath, ".git");
+		const stat = statSync(dotGit);
+		// A linked worktree's `.git` is a pointer file, and its index lives in the
+		// per-worktree gitdir rather than the common dir — each worktree has its own.
+		let gitDir = dotGit;
+		if (stat.isFile()) {
+			const match = readFileSync(dotGit, "utf-8").match(/^gitdir:\s*(.+)$/m);
+			if (!match) return null;
+			gitDir = resolve(worktreePath, match[1].trim());
+		} else if (!stat.isDirectory()) {
+			return null;
+		}
+		const index = statSync(resolve(gitDir, "index"));
+		return `${index.mtimeMs}:${index.size}`;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Remove a shadow repo's `index.lock` when nothing can still be holding it.
+ *
+ * Needed because the failure it fixes is permanent and silent. A `SIGKILL`ed or
+ * OOM-killed git leaves the lock behind (it only cleans up on signals it can handle),
+ * after which every `add -A` and `write-tree` in that repository exits 128 forever;
+ * `tryCapture` swallows that into null, so the user sees no error at all while every
+ * boundary from then on is missing and every rollback quietly falls back to per-file
+ * replay.
+ *
+ * Age is the discriminator, not the exit code. Any live holder is a git process this
+ * module spawned, and {@link GIT_TIMEOUT_MS} bounds how long one can run before
+ * `safeSpawn` kills it — so a lock older than that timeout plus a margin cannot
+ * belong to a live invocation of ours. Deleting a lock a *live* git holds would
+ * corrupt its index write, which is why this is never unconditional.
+ *
+ * The shadow lock is held by the caller, so no other capture in this process can be
+ * mid-`add` here either; the age check is what covers a *previous* process.
+ *
+ * Returns whether a retry is worthwhile.
+ */
+function recoverStaleIndexLock(dir: string, worktreePath: string, stderr: string): boolean {
+	// The message is locale-dependent, so the path is what is matched on: git names the
+	// lock file it could not create, and that name is not translated.
+	if (!stderr.includes("index.lock")) return false;
+	const lockPath = resolve(dir, "index.lock");
+	try {
+		const age = Date.now() - statSync(lockPath).mtimeMs;
+		if (age < GIT_TIMEOUT_MS * 2) {
+			// Young enough that a concurrent git could legitimately still be finishing.
+			// Failing this capture is the safe outcome: the boundary is recorded as absent
+			// and the next capture tries again, whereas removing a live lock corrupts the
+			// index of whatever holds it.
+			logger.debug("Shadow repo index.lock is too recent to reclaim", {
+				worktreePath,
+				ageMs: age,
+			});
+			return false;
+		}
+		rmSync(lockPath, { force: true });
+		logger.warn("Removed a stale shadow-repo index.lock left by a killed git process", {
+			worktreePath,
+			ageMs: age,
+		});
+		return true;
+	} catch {
+		// Already gone, or unreadable. Either way there is nothing to reclaim.
+		return false;
+	}
 }
 
 /**
@@ -1193,8 +1745,12 @@ async function restoreUnlocked(
 ): Promise<string[]> {
 	await ensureShadowRepo(dir, worktreePath);
 
-	// Snapshot the present state first so the set of paths to delete is exact.
-	const added = await runGit(["add", "-A"], dir, worktreePath);
+	// Snapshot the present state first so the set of paths to delete is exact. Goes
+	// through the same staging helper as a capture, not a bare `add -A`: the current
+	// tree computed here is compared against `expectedCurrentTree` and diffed against
+	// the target, so staging a *different* path set than a capture does would make an
+	// unchanged workspace look like it had moved.
+	const added = await addAllUnlocked(dir, worktreePath);
 	if (added.exitCode !== 0) {
 		throw new TreeSnapshotError(`restore add failed: ${added.stderr}`);
 	}
@@ -1243,18 +1799,36 @@ async function restoreUnlocked(
 			const absolute = resolve(worktreePath, relPath);
 			if (!existsSync(absolute)) continue;
 			// `recursive` covers the case the plain unlink cannot: the path is a file in
-			// the target tree's view but a directory on disk now.
-			rmSync(absolute, { force: true, recursive: true });
+			// the target tree's view but a directory on disk now — and is exactly why the
+			// nested-worktree guard is needed, since a gitlink recorded by an older
+			// snapshot looks like precisely that.
+			removePathNotInTree(worktreePath, absolute);
 		}
 
 		// Load the target tree into the index, then materialise it on disk.
-		const readTree = await runGit(["read-tree", treeHash], dir, worktreePath);
+		const readTree = await readTreeIntoShadowIndex(dir, worktreePath, treeHash);
 		if (readTree.exitCode !== 0) {
 			throw new TreeSnapshotError(`restore read-tree failed: ${readTree.stderr}`);
 		}
-		const checkout = await runGit(["checkout-index", "-a", "-f"], dir, worktreePath);
-		if (checkout.exitCode !== 0) {
-			throw new TreeSnapshotError(`restore checkout-index failed: ${checkout.stderr}`);
+		// Scoped to the changed paths, in batches, rather than `checkout-index -a -f`.
+		// `-a` rewrites *every* file in the tree, so a rollback of three files reset the
+		// mtime of the whole repository and every build tool downstream — tsc, vite,
+		// make — then treated the entire project as needing a rebuild. It also widened
+		// the blast radius of a failure to files the rollback had no business touching:
+		// one read-only or locked file outside the change set could fail the whole
+		// restore. `compensateRestore` was already scoped this way, so this makes a
+		// restore and its own compensation touch exactly the same file set.
+		//
+		// Only paths the target tree actually contains are passed. The rest were deleted
+		// just above, and `checkout-index` errors with "not in the cache" for a path it
+		// has no entry for — so filtering keeps a real failure distinguishable from the
+		// expected shape of a deletion instead of having to parse the message.
+		const toWrite = changedPaths.filter((relPath) => targetPaths.has(relPath));
+		for (const batch of batchArgs(toWrite)) {
+			const checkout = await runGit(["checkout-index", "-f", "--", ...batch], dir, worktreePath);
+			if (checkout.exitCode !== 0) {
+				throw new TreeSnapshotError(`restore checkout-index failed: ${checkout.stderr}`);
+			}
 		}
 	} catch (error) {
 		// The same two steps as a normal restore, aimed back at the state captured
@@ -1313,14 +1887,14 @@ async function compensateRestore(
 			const absolute = resolve(worktreePath, relPath);
 			if (!existsSync(absolute)) continue;
 			try {
-				rmSync(absolute, { force: true, recursive: true });
+				removePathNotInTree(worktreePath, absolute);
 			} catch {
 				// The very condition that failed the restore can also block this one path.
 				// Keep going: the remaining paths are still worth restoring, and the tree
 				// comparison below decides whether the result counts as compensated.
 			}
 		}
-		const readBack = await runGit(["read-tree", capturedTree], dir, worktreePath);
+		const readBack = await readTreeIntoShadowIndex(dir, worktreePath, capturedTree);
 		if (readBack.exitCode !== 0) return false;
 		// Scoped to the paths the restore was going to touch, and issued in batches.
 		// `checkout-index -a` would rewrite every file in the worktree, so whatever
@@ -1330,8 +1904,10 @@ async function compensateRestore(
 			await runGit(["checkout-index", "-f", "--", ...batch], dir, worktreePath);
 		}
 		// Verified by hash rather than by exit code: what matters is that the bytes are
-		// back, and a per-path failure outside the change set does not change that.
-		const added = await runGit(["add", "-A"], dir, worktreePath);
+		// back, and a per-path failure outside the change set does not change that. Must
+		// stage the same path set a capture does, or the hash comparison below would
+		// declare a correctly-compensated workspace uncompensated.
+		const added = await addAllUnlocked(dir, worktreePath);
 		if (added.exitCode !== 0) return false;
 		const nowTree = await runGit(["write-tree"], dir, worktreePath);
 		return nowTree.exitCode === 0 && nowTree.stdout === capturedTree;
@@ -1438,6 +2014,89 @@ async function linkSnapshotUnlocked(
 		throw new TreeSnapshotError(`snapshot update-ref failed: ${updated.stderr}`);
 	}
 	return { treeHash, commitSha };
+}
+
+/**
+ * Put a missing `HEAD` back rather than deleting the repository around it.
+ *
+ * `HEAD` is the only file this module probes to decide a shadow repo exists, and the
+ * orphan sweep used to treat its absence as "invalid, delete the directory". That is
+ * a data-loss bug rather than a cleanup: `HEAD` is a 23-byte pointer whose *target*
+ * is never read (snapshots live under `refs/nf/`, and every command names its object
+ * explicitly), while `objects/` beside it holds every tree and snapshot commit that
+ * `narrator_tool_calls`, `narrator_messages` and `worktree_tree_snapshots` still
+ * reference. A truncated write, a full disk or an interrupted `git init` therefore
+ * cost a chapter its entire revert history.
+ *
+ * So the directory is only removed when there is demonstrably nothing to lose: no
+ * objects and no refs. Otherwise `HEAD` is rewritten with what `git init` would have
+ * produced, which is enough to make the repository usable again — and the result is
+ * verified by asking git, so a directory broken in some *other* way is left in place
+ * for a human instead of being silently deleted.
+ *
+ * Returns whether the repository is usable afterwards.
+ */
+async function repairShadowHead(dir: string): Promise<boolean> {
+	if (!shadowDirHasContent(dir)) {
+		logger.warn("Removing an empty tree-snapshot repo (missing HEAD, no objects or refs)", {
+			dir,
+		});
+		try {
+			rmSync(dir, { recursive: true, force: true });
+		} catch {
+			// Nothing to salvage either way; the next sweep tries again.
+		}
+		return false;
+	}
+	try {
+		await Bun.write(resolve(dir, "HEAD"), "ref: refs/heads/main\n");
+	} catch (error) {
+		logger.warn("Could not repair a tree-snapshot repo's missing HEAD; keeping it as is", {
+			dir,
+			error: String(error),
+		});
+		return false;
+	}
+	// `rev-parse --git-dir` is git's own validity check, so a repo broken in a way this
+	// repair does not cover is reported rather than repacked blindly.
+	const check = await runGit(["rev-parse", "--git-dir"], dir, dir);
+	if (check.exitCode !== 0) {
+		logger.warn("Tree-snapshot repo is still unusable after restoring HEAD; keeping it", {
+			dir,
+			stderr: check.stderr,
+		});
+		return false;
+	}
+	logger.warn("Restored a missing HEAD in a tree-snapshot repo that still holds objects", { dir });
+	return true;
+}
+
+/** Whether a shadow directory holds anything worth keeping: loose/packed objects, or refs. */
+function shadowDirHasContent(dir: string): boolean {
+	const hasEntries = (path: string): boolean => {
+		try {
+			return readdirSync(path).length > 0;
+		} catch {
+			return false;
+		}
+	};
+	// `objects/` always contains `info/` and `pack/` from `git init`, so emptiness has
+	// to be judged by looking inside rather than at the directory itself.
+	try {
+		for (const entry of readdirSync(resolve(dir, "objects"), { withFileTypes: true })) {
+			if (entry.name === "info") continue;
+			if (entry.name === "pack") {
+				if (hasEntries(resolve(dir, "objects", "pack"))) return true;
+				continue;
+			}
+			return true;
+		}
+	} catch {
+		// No objects directory at all.
+	}
+	// A ref whose objects are gone is still evidence the repo was in use, and the
+	// packed form lives in a file rather than under `refs/`.
+	return hasEntries(resolve(dir, "refs", "nf")) || existsSync(resolve(dir, "packed-refs"));
 }
 
 export const worktreeTreeSnapshot = {
@@ -1720,8 +2379,8 @@ export const worktreeTreeSnapshot = {
 			// indefinitely inside a directory that is otherwise entirely git-managed.
 			// The system temp directory is swept by the OS, which is the whole point.
 			const scratchIndex = resolve(tmpdir(), `nf-restore-into-${generateId()}.index`);
-			let currentTree: string | null = null;
 			try {
+				let currentTree: string | null = null;
 				const added = await runGitWithIndex(
 					["add", "-A"],
 					sourceDir,
@@ -1737,45 +2396,71 @@ export const worktreeTreeSnapshot = {
 					);
 					if (written.exitCode === 0 && written.stdout) currentTree = written.stdout;
 				}
+
+				if (currentTree && currentTree !== treeHash) {
+					const changed = await runGitPaths(
+						["diff-tree", "-r", "--name-only", "--no-commit-id", "-z", treeHash, currentTree],
+						sourceDir,
+						targetWorktreePath,
+						{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
+					);
+					if (changed.exitCode === 0 && changed.paths.length > 0) {
+						const inSnapshot = await pathsPresentInTree(
+							sourceDir,
+							targetWorktreePath,
+							treeHash,
+							changed.paths,
+						);
+						for (const relPath of changed.paths) {
+							if (inSnapshot.has(relPath)) continue;
+							const absolute = resolve(targetWorktreePath, relPath);
+							if (!existsSync(absolute)) continue;
+							// `recursive` covers a path that is a file in the snapshot's view but a
+							// directory on disk, and the guard keeps that from eating a nested
+							// worktree this module holds no snapshot of.
+							removePathNotInTree(targetWorktreePath, absolute);
+						}
+					}
+				}
+
+				// The write phase uses the scratch index too, for the reason the hash phase
+				// already documents: this repo's own index is a stat cache of the *source*
+				// worktree. `read-tree` overwrote it with the fork's tree and `checkout-index`
+				// re-stat'ed the *target*'s files into it, so every entry's stat data then
+				// described the wrong worktree — the source's next capture had to re-hash the
+				// entire repository, turning a 12 ms warm capture into a full cold scan on the
+				// tool-execution path. Using the throwaway index leaves the source's cache
+				// intact and costs nothing, since it is discarded either way.
+				//
+				// It is also why this `read-tree` does not go through
+				// {@link readTreeIntoShadowIndex}: the eviction that invalidation exists for
+				// happens to the *shadow* index, and this one never touches it.
+				const readTree = await runGitWithIndex(
+					["read-tree", treeHash],
+					sourceDir,
+					targetWorktreePath,
+					scratchIndex,
+				);
+				if (readTree.exitCode !== 0) {
+					throw new TreeSnapshotError(`fork read-tree failed: ${readTree.stderr}`);
+				}
+				// `-a` is correct here, unlike in `restore`: the target worktree is a fresh
+				// fork being brought to a known state wholesale, so there is no "outside the
+				// change set" whose mtime this could disturb.
+				const checkout = await runGitWithIndex(
+					["checkout-index", "-a", "-f"],
+					sourceDir,
+					targetWorktreePath,
+					scratchIndex,
+				);
+				if (checkout.exitCode !== 0) {
+					throw new TreeSnapshotError(`fork checkout-index failed: ${checkout.stderr}`);
+				}
 			} finally {
 				rmSync(scratchIndex, { force: true });
 				// git guards index writes with a sibling lock file; an interrupted `add`
 				// can leave it behind, and it would then block a later reuse of this name.
 				rmSync(`${scratchIndex}.lock`, { force: true });
-			}
-
-			if (currentTree && currentTree !== treeHash) {
-				const changed = await runGitPaths(
-					["diff-tree", "-r", "--name-only", "--no-commit-id", "-z", treeHash, currentTree],
-					sourceDir,
-					targetWorktreePath,
-					{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
-				);
-				if (changed.exitCode === 0 && changed.paths.length > 0) {
-					const inSnapshot = await pathsPresentInTree(
-						sourceDir,
-						targetWorktreePath,
-						treeHash,
-						changed.paths,
-					);
-					for (const relPath of changed.paths) {
-						if (inSnapshot.has(relPath)) continue;
-						const absolute = resolve(targetWorktreePath, relPath);
-						if (!existsSync(absolute)) continue;
-						// `recursive` covers a path that is a file in the snapshot's view but a
-						// directory on disk.
-						rmSync(absolute, { force: true, recursive: true });
-					}
-				}
-			}
-
-			const readTree = await runGit(["read-tree", treeHash], sourceDir, targetWorktreePath);
-			if (readTree.exitCode !== 0) {
-				throw new TreeSnapshotError(`fork read-tree failed: ${readTree.stderr}`);
-			}
-			const checkout = await runGit(["checkout-index", "-a", "-f"], sourceDir, targetWorktreePath);
-			if (checkout.exitCode !== 0) {
-				throw new TreeSnapshotError(`fork checkout-index failed: ${checkout.stderr}`);
 			}
 		});
 	},
@@ -1904,6 +2589,58 @@ export const worktreeTreeSnapshot = {
 			const result = await runGit(["update-ref", ref, commitSha], dir, worktreePath);
 			if (result.exitCode !== 0) {
 				throw new TreeSnapshotError(`snapshot update-ref failed: ${result.stderr}`);
+			}
+		});
+	},
+
+	/**
+	 * Remove a snapshot ref, if it is there.
+	 *
+	 * Exists because a ref is a garbage-collection root and this module had no way to
+	 * give one up. `chapter-fork` writes `refs/nf/incoming/fork-<childId>` into the
+	 * *parent's* shadow repository so the child can fetch that exact commit across, and
+	 * nothing ever removed it: `setRef` cannot clear a ref (it demands a real object id)
+	 * and `destroy` takes the whole repository, which the parent still needs. Since
+	 * `gcAll` runs `gc --no-prune`, every such ref kept its commit and the entire tree
+	 * beneath it alive forever — a chapter forked fifty times carried fifty object
+	 * graphs it could never drop.
+	 *
+	 * Idempotent by design: a missing ref, and a shadow repository that was never
+	 * created or has already been destroyed, are all "nothing to remove" rather than
+	 * errors. The callers are clean-up paths, which must not fail because the thing they
+	 * were cleaning up is already gone.
+	 *
+	 * {@link SNAPSHOT_HEAD_REF} and {@link SNAPSHOT_BASE_REF} are refused outright.
+	 * Deleting `head` would sever a workspace's lineage — every later capture would
+	 * start fresh ancestry and the existing chain would become unreachable, which is
+	 * exactly the data loss the snapshot DAG exists to prevent. Only auxiliary refs
+	 * (the `incoming/` namespace) are the caller's to remove.
+	 */
+	async deleteRef(
+		worktreePath: string,
+		ref: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<void> {
+		assertLocal(deviceId);
+		assertSnapshotRef(ref);
+		if (ref === SNAPSHOT_HEAD_REF || ref === SNAPSHOT_BASE_REF) {
+			throw new TreeSnapshotError(`Refusing to delete the lineage ref ${ref}`);
+		}
+		const dir = shadowDir(deviceId, worktreePath);
+		// Probed before taking the lock: `ensureShadowRepo` would otherwise *create* a
+		// repository just to delete a ref that cannot exist in it.
+		if (!existsSync(resolve(dir, "HEAD"))) return;
+		await shadowLock.acquire(dir, async () => {
+			const result = await runGit(["update-ref", "-d", ref], dir, worktreePath);
+			// `update-ref -d` on an absent ref succeeds, so a non-zero exit is a real
+			// failure. Logged rather than thrown: the caller is deleting something, and
+			// failing that delete over a leftover ref would be worse than the leak.
+			if (result.exitCode !== 0) {
+				logger.debug("Could not delete a snapshot ref", {
+					worktreePath,
+					ref,
+					stderr: result.stderr,
+				});
 			}
 		});
 	},
@@ -2109,6 +2846,41 @@ export const worktreeTreeSnapshot = {
 	 * A conflict means the current state edited the same region being rolled back. The
 	 * tree is still returned but must not be written out.
 	 */
+	/**
+	 * Three-way merge two trees against an explicitly given base.
+	 *
+	 * The tree-level counterpart of {@link mergeSnapshots}, for callers whose three
+	 * sides are trees with no ancestry to derive a base from — reapplying uncommitted
+	 * work after a rebase, where the base is "the state git was handed" rather than any
+	 * common ancestor. Trees carry no parents, so the base has to be stated.
+	 *
+	 * All three arguments must come from the same shadow repository. Mixing in a tree
+	 * read from the user's repository looks equivalent and is not: a shadow repository
+	 * applies its own exclude rules, so the two disagree about any file git tracks
+	 * despite an ignore rule, and a three-way merge reads that disagreement as a
+	 * deletion.
+	 *
+	 * Nothing is written to the worktree, conflicts included; the returned tree then
+	 * carries conflict markers and must not be checked out blindly.
+	 */
+	async mergeTreesWithBase(
+		worktreePath: string,
+		base: string,
+		ours: string,
+		theirs: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<TreeMergeResult> {
+		assertLocal(deviceId);
+		assertObjectId(base);
+		assertObjectId(ours);
+		assertObjectId(theirs);
+		const dir = shadowDir(deviceId, worktreePath);
+		return shadowLock.acquire(dir, async () => {
+			await ensureShadowRepo(dir, worktreePath);
+			return mergeTreeUnlocked(dir, worktreePath, base, ours, theirs);
+		});
+	},
+
 	async reverseMergeSnapshots(
 		worktreePath: string,
 		contribution: string,
@@ -2214,6 +2986,10 @@ export const worktreeTreeSnapshot = {
 		}
 		if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
 		excludeMtimes.delete(dir);
+		// The force-add memo describes an index inside the directory just removed. A
+		// recreated worktree at the same path hashes to the same shadow dir, so a leftover
+		// entry would make its first capture skip staging tracked-but-ignored paths.
+		trackedIgnoredCache.delete(dir);
 		// The recorded hashes describe a repository that no longer exists, so leaving
 		// them behind means every later reader has to probe the filesystem to discover
 		// they are dangling. The doc comment always claimed this happened; it did not.
@@ -2258,11 +3034,7 @@ export const worktreeTreeSnapshot = {
 		for (const entry of readdirSync(SHADOW_ROOT, { withFileTypes: true })) {
 			if (!entry.isDirectory()) continue;
 			const dir = resolve(SHADOW_ROOT, entry.name);
-			if (!existsSync(resolve(dir, "HEAD"))) {
-				logger.warn("Removing invalid tree-snapshot repo (missing HEAD)", { dir });
-				rmSync(dir, { recursive: true, force: true });
-				continue;
-			}
+			if (!existsSync(resolve(dir, "HEAD")) && !(await repairShadowHead(dir))) continue;
 			// Serialized against captures: `gc` rewrites the object store, and a
 			// concurrent `add -A`/`write-tree` in the same repo can fail or race with
 			// the repack.

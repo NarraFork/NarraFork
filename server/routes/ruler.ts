@@ -1,9 +1,12 @@
 import { formatOriginLabel } from "@shared/message-origin";
 import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
+import { z } from "zod";
 import { db } from "../db";
 import { chapterEdges, chapters, narrators, projects } from "../db/schema";
+import { worktreeLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
 
@@ -65,6 +68,15 @@ import { commitSyncService } from "../services/commit-sync-service";
 import { gitService } from "../services/git-service";
 import { narratorService } from "../services/narrator-service";
 import { sendMessage } from "../services/narrator-session";
+import {
+	type ParkedWork,
+	parkUncommittedWork,
+	reapplyParkedWork,
+	restoreParkedWork,
+	settleParkedWork,
+	untrackedCollisions,
+} from "../services/snapshot-dirty-git-op";
+import { worktreeTreeSnapshot } from "../services/worktree-tree-snapshot";
 
 /**
  * Check if a chapter belongs to a segment (identified by `targetSha`) by walking
@@ -202,6 +214,14 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 			parentChapterId: true,
 			startCommitSha: true,
 			mergeCommitSha: true,
+			preMergeTargetSha: true,
+			// Needed because the recovery entry point is otherwise unreachable after a
+			// reload: the debt lives in the row, but nothing else in the Ruler's data path
+			// reads it, so a refresh made the banner vanish while the next rebase still
+			// refused with REBASE_PARKED_WORK_CONFLICT. A 40-char sha is not a large field
+			// in the sense the list-API rule is about (no blobs, no JSON documents), so
+			// carrying it costs the projection nothing meaningful.
+			parkedSnapshotCommitSha: true,
 			axisOffset: true,
 			crossOffset: true,
 		},
@@ -313,6 +333,10 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 				narratorId: narrator?.id ?? null,
 				narratorStatus: narrator?.status ?? null,
 				narratorModelUnavailable: narrator?.modelUnavailable ?? false,
+				// Same name as the rebase endpoints' field on purpose: the Ruler's recovery
+				// panel reads one shape regardless of whether it learned about the debt from
+				// a rebase response or from a page load.
+				parkedSnapshot: ch.parkedSnapshotCommitSha ?? null,
 				axisOffset: ch.axisOffset ?? 0,
 				crossOffset: ch.crossOffset ?? 0,
 			};
@@ -330,6 +354,16 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 			parentChapterId: ch.parentChapterId ?? null,
 			startCommitSha: ch.startCommitSha,
 			mergeCommitSha: ch.mergeCommitSha,
+			// A commit-free merge produces no merge commit, so the ruler has nothing on
+			// the backbone to anchor its connector to. The target's HEAD at merge time is
+			// on the backbone and is the closest honest position for "this is where the
+			// chapter rejoined"; without it a snapshot-merged chapter draws no connector
+			// at all and reads as never merged.
+			mergeAnchorCommitSha: ch.mergeCommitSha ?? ch.preMergeTargetSha ?? null,
+			// Carried for every chapter the endpoint returns, not just the active ones: the
+			// field is what the recovery panel keys on, and a chapter that was merged while
+			// still owing a parked reapply would otherwise present as debt-free.
+			parkedSnapshot: ch.parkedSnapshotCommitSha ?? null,
 			narratorId: null as string | null,
 			narratorStatus: null as string | null,
 			narratorModelUnavailable: false,
@@ -435,6 +469,11 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 			parentChapterId: true,
 			startCommitSha: true,
 			mergeCommitSha: true,
+			preMergeTargetSha: true,
+			// See the main endpoint: without it the recovery entry point disappears on
+			// reload while the backend still considers the reapply owed. A short sha, so it
+			// does not make this a large-field projection.
+			parkedSnapshotCommitSha: true,
 			headCommitSha: true,
 			anchorCommitSha: true,
 			axisOffset: true,
@@ -492,6 +531,12 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 			parentChapterId: ch.parentChapterId ?? null,
 			startCommitSha: ch.startCommitSha,
 			mergeCommitSha: ch.mergeCommitSha,
+			// See the merged-chapters summary above: a snapshot merge has no merge commit,
+			// so the connector anchors to the target's HEAD at merge time instead.
+			mergeAnchorCommitSha: ch.mergeCommitSha ?? ch.preMergeTargetSha ?? null,
+			// Same field name as the rebase endpoints report, so the recovery panel has one
+			// shape to read whether the debt arrived in a mutation response or a page load.
+			parkedSnapshot: ch.parkedSnapshotCommitSha ?? null,
 			headCommitSha: ch.headCommitSha,
 			color: ch.color,
 			narratorId: narrator?.id ?? null,
@@ -573,6 +618,74 @@ rulerRoutes.post("/:id/ruler/fork", async (c) => {
 	return c.json(result, 201);
 });
 
+/**
+ * Delete a merged chapter's git branch — but only when the merge produced a commit.
+ *
+ * The Ruler deletes source branches to keep its timeline free of refs nothing points
+ * at any more. That is safe for a commit merge: the source's bytes are reachable from
+ * the merge commit on trunk, so the branch name carries no unique information.
+ *
+ * It is destructive for a snapshot (commit-free) merge, which is the DEFAULT mode here
+ * — `resolveMergeMode` only leaves snapshot space when explicitly asked or when the
+ * merge cannot be expressed as trees. A snapshot merge never advances the source
+ * branch, and `chapterMerge.unmergeSnapshot` rebuilds the source workspace by running
+ * `createWorktree` against exactly this branch before replaying
+ * `mergedSourceSnapshotSha` into it. Delete the branch and `git worktree add` fails
+ * with "invalid reference" — after unmerge has already reversed the target, which
+ * leaves the user with a modified target, no source chapter, and uncommitted work
+ * reachable only as a snapshot id in a log line.
+ *
+ * The obvious alternative — keep deleting and teach unmerge to recreate the branch
+ * from `mergedSourceSnapshotSha` — was rejected: snapshot commits live in the shadow
+ * repository, not in the user's, so there is no ref to recreate the branch from, and
+ * synthesising one would put NarraFork bookkeeping commits into the user's history,
+ * which is the exact thing commit-free merging exists to avoid.
+ *
+ * Tidiness is therefore given up in snapshot mode. If the leftover branch is visually
+ * noisy, hide it in the UI: a hidden ref is recoverable, a deleted one is not.
+ *
+ * Which mode ran is read back from the chapter row rather than from the request: the
+ * requested `mode` is only a preference, and `resolveMergeMode` silently falls back to
+ * commit mode for `requireReviewBeforeMerge`, cherry-pick strategies and worktree-less
+ * chapters. `mergeSnapshotCommitSha` is set exactly by the snapshot path and is the
+ * same coordinate `unmerge` dispatches on, so it answers the only question that
+ * matters: can an unmerge still need this branch?
+ */
+async function deleteMergedSourceBranch(projectId: string, sourceChapterId: string): Promise<void> {
+	const [project, source] = await Promise.all([
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+			columns: { gitPath: true },
+		}),
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, sourceChapterId),
+			columns: { branch: true, mergeSnapshotCommitSha: true, mergedSourceSnapshotSha: true },
+		}),
+	]);
+	if (!project?.gitPath || !source?.branch) return;
+	if (source.mergeSnapshotCommitSha || source.mergedSourceSnapshotSha) {
+		logger.debug("Keeping the merged chapter's branch: a commit-free merge needs it to unmerge", {
+			projectId,
+			sourceChapterId,
+			branch: source.branch,
+		});
+		return;
+	}
+	try {
+		await gitService.deleteBranch(project.gitPath, source.branch);
+	} catch (err) {
+		// Not fatal — the merge already succeeded and the branch is redundant either way.
+		// Logged rather than swallowed: the previous silent catch made a branch that is
+		// still present indistinguishable from one that was cleanly deleted.
+		logger.warn("Could not delete the merged chapter's branch", {
+			projectId,
+			sourceChapterId,
+			branch: source.branch,
+			error: String(err),
+		});
+	}
+}
+
 // POST /:id/ruler/merge — Merge a chapter back to trunk (freeze on merge)
 rulerRoutes.post("/:id/ruler/merge", async (c) => {
 	const projectId = c.req.param("id");
@@ -621,17 +734,7 @@ rulerRoutes.post("/:id/ruler/merge", async (c) => {
 	});
 
 	if (result.success) {
-		// Ruler mode: delete the source git branch after merge
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, projectId),
-		});
-		if (project?.gitPath && source.branch) {
-			try {
-				await gitService.deleteBranch(project.gitPath, source.branch);
-			} catch {
-				// Branch may already be deleted
-			}
-		}
+		await deleteMergedSourceBranch(projectId, sourceChapterId);
 		return c.json(result);
 	}
 
@@ -648,17 +751,10 @@ rulerRoutes.post("/:id/ruler/merge", async (c) => {
 		});
 
 		if (aiResult.resolved) {
-			// AI resolved — delete source branch (Ruler-specific)
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, projectId),
-			});
-			if (project?.gitPath && source.branch) {
-				try {
-					await gitService.deleteBranch(project.gitPath, source.branch);
-				} catch {
-					// Branch may already be deleted
-				}
-			}
+			// `rulerAiResolve` goes through `finalizeTempMerge`, which merges a temp branch
+			// into trunk and calls `markMerged` — the commit path — so no snapshot
+			// coordinates are recorded and the shared guard lets the deletion through.
+			await deleteMergedSourceBranch(projectId, sourceChapterId);
 			return c.json({
 				...aiResult.mergeResult,
 				aiResolved: true,
@@ -719,57 +815,531 @@ rulerRoutes.post("/:id/ruler/rebase", async (c) => {
 		where: eq(projects.id, projectId),
 	});
 	if (!project?.gitPath) throw new ValidationError("Project has no git path");
+	const gitPath = project.gitPath;
 
 	const trunkBranch = project.defaultBranch ?? "main";
 
-	// Verify source chapter
+	// Verify source chapter.
+	//
+	// Only `worktreePath` is taken from this read, and only because it is the lock key —
+	// it cannot be read from inside the lock it selects, and a rebase never changes it.
+	// Every other field, in particular the parked-work coordinates, is deliberately
+	// re-read after the lock is held: a request that queues behind another rebase enters
+	// the critical section against a row the previous holder has already rewritten, so
+	// deciding what to settle from *this* read means settling against coordinates that
+	// have since been cleared or replaced.
+	const preLockChapter = await db.query.chapters.findFirst({
+		where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+		columns: { worktreePath: true },
+	});
+	if (!preLockChapter) throw new NotFoundError("Chapter", chapterId);
+	if (!preLockChapter.worktreePath) throw new ValidationError("Chapter has no worktree");
+	const worktreePath = preLockChapter.worktreePath;
+
+	// Everything from here on is one indivisible sequence over a single workspace:
+	// settle → reset+capture (park) → `git rebase` → three-way reapply. Each step reads a
+	// state the previous one produced, so anything that writes to the worktree in between
+	// — a concurrent autoCommit, a narrator's Write tool, the worktree watcher's capture,
+	// or simply a second rebase from a double-clicked button — is enough to make the
+	// parked coordinates describe a state that no longer exists. Two overlapping
+	// `git rebase` runs additionally collide on `.git/rebase-merge` and leave the
+	// workspace mid-rebase with no owner.
+	//
+	// NOTE for future readers: this takes `worktreeLock` from `lib/async-mutex`, which is
+	// a DIFFERENT mutex from git-service's module-private `withWorktreeLock`. Neither is
+	// re-entrant, but they never contend with each other, so calling git-service from
+	// inside this block cannot self-deadlock: `gitService.rebase` takes no private lock
+	// at all, and `resetHard`/`cleanUntracked` (reached via `parkUncommittedWork`) take
+	// only the private one. `worktree-tree-snapshot`'s shadow-repo mutex is a third,
+	// separate instance keyed by the shadow directory. Do not "unify" these without
+	// re-checking every call in this block.
+	return worktreeLock.acquire(worktreePath, async () => {
+		// Re-read now that nobody else can be mid-sequence. The status check lives here for
+		// the same reason: a chapter that was merged or abandoned by whoever held the lock
+		// must not then be rebased on the strength of a pre-queue observation.
+		const chapter = await db.query.chapters.findFirst({
+			where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+		});
+		if (!chapter) throw new NotFoundError("Chapter", chapterId);
+		if (chapter.status !== "active") throw new ValidationError("Can only rebase active chapters");
+		if (chapter.worktreePath !== worktreePath) {
+			// The lock protects one path, so a chapter that moved worktrees while this
+			// request was queued is being guarded by the wrong key. Refusing sends the user
+			// back through a fresh request that locks the path the chapter now lives on.
+			throw new ValidationError(
+				"The chapter's worktree changed while this rebase was waiting; retry the rebase",
+			);
+		}
+
+		/**
+		 * Reported alongside the rebase result when an earlier rebase's parked work could
+		 * not be recovered at all. Not a reason to refuse this rebase — the snapshot is
+		 * already unreachable, so refusing would block the chapter permanently — but the
+		 * user has to be told rather than have it disappear into a log line.
+		 */
+		let lostParkedSnapshot: string | null = null;
+
+		// Settle a debt left by an earlier conflicted rebase before creating a new one.
+		// That rebase was finished by the narrator running `rebase --continue`, so no
+		// request ran at the moment it ended and the reapply had nowhere to happen. Doing
+		// it here keeps the invariant that a rebase never starts while another one's work
+		// is still parked, which would otherwise overwrite the first snapshot's
+		// coordinates and orphan it.
+		if (chapter.parkedSnapshotCommitSha && chapter.parkedSnapshotBaseTree) {
+			let settled: Awaited<ReturnType<typeof settleParkedWork>>;
+			try {
+				settled = await settleParkedWork(
+					worktreePath,
+					chapter.parkedSnapshotCommitSha,
+					chapter.parkedSnapshotBaseTree,
+				);
+			} catch (err) {
+				// A throw here means the workspace itself could not be captured, so parking
+				// would fail next anyway. Refusing keeps the coordinates — the debt is still
+				// owed and becomes settleable again once the workspace is readable — instead
+				// of clearing them and losing the only pointer to the work.
+				logger.warn("Could not settle work parked by an earlier rebase", {
+					chapterId,
+					snapshotCommitSha: chapter.parkedSnapshotCommitSha,
+					error: String(err),
+				});
+				return c.json(
+					{
+						error: "REBASE_PARKED_WORK_UNSETTLED",
+						code: "VALIDATION_ERROR",
+						parkedSnapshot: chapter.parkedSnapshotCommitSha,
+						parkedWorkPending: true,
+						detail: String(err),
+					},
+					409,
+				);
+			}
+			if (settled === null) {
+				// `settleParkedWork` documents null as "the snapshot no longer resolves",
+				// which its own comment says the caller must report rather than treat as
+				// success. Nothing can be recovered, so the coordinates are cleared to let
+				// the chapter move again — but the id travels back in the response.
+				logger.error("Work parked by an earlier rebase can no longer be recovered", {
+					chapterId,
+					snapshotCommitSha: chapter.parkedSnapshotCommitSha,
+				});
+				lostParkedSnapshot = chapter.parkedSnapshotCommitSha;
+				await clearParkedSnapshot(chapterId);
+			} else if (settled.conflicts.length) {
+				// Refusing is the safe direction: proceeding would park a workspace that is
+				// itself missing the earlier work, compounding the loss silently.
+				return c.json(
+					{
+						error: "REBASE_PARKED_WORK_CONFLICT",
+						code: "VALIDATION_ERROR",
+						conflictFiles: settled.conflicts,
+						parkedSnapshot: chapter.parkedSnapshotCommitSha,
+						parkedWorkPending: true,
+					},
+					409,
+				);
+			} else {
+				await clearParkedSnapshot(chapterId);
+			}
+		}
+
+		// The trunk worktree is deliberately NOT dirty-checked. `git rebase` reads the
+		// trunk *branch*, not its worktree, so uncommitted work over there cannot affect
+		// the outcome — the check only ever refused a rebase that would have succeeded.
+		//
+		// A dirty source is a real obstacle (git refuses to start), but not a reason to
+		// refuse: the work is parked in the snapshot DAG, git gets a clean worktree, and it
+		// is three-way reapplied afterwards.
+		//
+		// `parkUncommittedWork` refuses rather than proceeding whenever it cannot prove the
+		// reset is recoverable: an operation already in progress, unmerged paths, or a
+		// parked tree that does not cover every dirty path git reported. All three arrive
+		// as ValidationError and are left to propagate on purpose — the global handler
+		// turns them into a 400 whose `error` field is the message itself, which the Ruler
+		// shows verbatim for unrecognised codes. That matters most for the coverage
+		// refusal, which names the specific files the user has to commit first; mapping it
+		// to a generic string would delete the only actionable part. Nothing has been reset
+		// when any of them throws, so failing the request is the whole of the cleanup.
+		//
+		// An untracked-only workspace parks nothing (git replays straight over untracked
+		// files), unless one of those files is a path the incoming history also creates —
+		// then git refuses the entire rebase with "untracked working tree files would be
+		// overwritten" before touching anything. Checked up front rather than by retrying
+		// after the failure: the collision set is what decides whether the reset+clean
+		// round trip is worth paying for, and asking git first means the workspace is never
+		// left holding a failed rebase attempt. Deliberately NOT detected from git's error
+		// text — that message is localised, so a regex over it silently stops matching
+		// under a non-English locale and the collision becomes an unexplained failure.
+		const collisions = await untrackedCollisions(worktreePath, trunkBranch).catch((err) => {
+			// Non-fatal: a failure here only means the optimisation cannot be made. The
+			// rebase still runs, and a real collision surfaces as git's own error.
+			logger.warn("Could not check for untracked collisions before rebasing", {
+				chapterId,
+				trunkBranch,
+				error: String(err),
+			});
+			return [] as string[];
+		});
+		if (collisions.length > 0) {
+			logger.info("Parking an untracked-only workspace: the rebase would collide with it", {
+				chapterId,
+				collisions: collisions.slice(0, 10),
+				collisionCount: collisions.length,
+			});
+		}
+		const parked = await parkUncommittedWork(worktreePath, "pre-rebase workspace state", {
+			// Only forces when git would actually have refused. `force` on a workspace with
+			// no collision spends a reset + clean + capture to change nothing.
+			force: collisions.length > 0,
+		});
+		if (parked) {
+			// Persisted because a conflicted rebase stops with the worktree mid-rebase: the
+			// reapply then belongs to whichever later request resolves or aborts it.
+			await db
+				.update(chapters)
+				.set({
+					parkedSnapshotCommitSha: parked.commitSha,
+					parkedSnapshotBaseTree: parked.baseTree,
+				})
+				.where(eq(chapters.id, chapterId));
+		}
+
+		let result: Awaited<ReturnType<typeof gitService.rebase>>;
+		try {
+			result = await gitService.rebase(worktreePath, trunkBranch);
+		} catch (err) {
+			// The rebase never started, so the pre-rebase state is still the correct one.
+			if (parked) {
+				await restoreParkedWork(worktreePath, parked);
+				await clearParkedSnapshot(chapterId);
+			}
+			throw err;
+		}
+
+		if (result.success) {
+			// Read the tip of the trunk *branch*, not the HEAD of the trunk worktree. The
+			// rebase was run against the branch, so the branch tip is the new base by
+			// definition; the trunk worktree can legitimately be detached or itself mid
+			// rebase/bisect, in which case its HEAD names a commit this chapter was never
+			// rebased onto and `startCommitSha` would place the chapter at the wrong point
+			// on the ruler's backbone. Non-fatal on failure: the rebase already happened,
+			// and a missing `startCommitSha` update only costs layout precision.
+			const trunkTip = await gitService.getRefCommit(gitPath, trunkBranch).catch((err) => {
+				logger.warn("Rebase succeeded but the trunk branch tip could not be read", {
+					chapterId,
+					trunkBranch,
+					error: String(err),
+				});
+				return null;
+			});
+			await db
+				.update(chapters)
+				.set({
+					...(trunkTip ? { startCommitSha: trunkTip } : {}),
+					headCommitSha: result.commitSha,
+				})
+				.where(eq(chapters.id, chapterId));
+
+			// Sync commits
+			await commitSyncService.syncChapterCommits(chapterId).catch(() => {});
+
+			const reapply = parked ? await reapplyParked(chapterId, worktreePath, parked) : null;
+
+			return c.json({
+				success: true,
+				commitSha: result.commitSha,
+				...parkedWorkResponse(parked, reapply, lostParkedSnapshot),
+			});
+		}
+
+		// Conflict — the worktree stays mid-rebase for the narrator or the user to resolve,
+		// so the parked work stays parked and its coordinates stay in the DB.
+		return c.json({
+			success: false,
+			conflictFiles: result.conflictFiles,
+			...(parked ? { parkedSnapshot: parked.commitSha, parkedWorkPending: true } : {}),
+			...(lostParkedSnapshot ? { lostParkedSnapshot } : {}),
+		});
+	});
+});
+
+/** How a post-rebase reapply of parked work ended. */
+type ReapplyOutcome =
+	| { status: "reapplied" }
+	| { status: "conflict"; conflictFiles: string[] }
+	| { status: "failed"; detail: string };
+
+/**
+ * Put parked work back after a successful rebase, keeping the coordinates on any
+ * outcome the user still has to act on.
+ *
+ * The coordinates used to be cleared unconditionally here, on the theory that a
+ * conflicted reapply is "resolved by the user in the worktree". That was wrong in a way
+ * that loses data: the conflict path in `reapplyParkedWork` deliberately writes NOTHING
+ * — no markers, no partial tree — so there is nothing in the worktree to resolve, and
+ * once the snapshot id is dropped from the row the work is reachable only from a log
+ * line. `/ruler/rebase-parked` is the way back, and it needs these coordinates.
+ */
+async function reapplyParked(
+	chapterId: string,
+	worktreePath: string,
+	parked: ParkedWork,
+): Promise<ReapplyOutcome> {
+	try {
+		const reapplied = await reapplyParkedWork(worktreePath, parked);
+		if (reapplied.conflicts.length) {
+			logger.warn("Rebase succeeded but the parked work conflicts with the rebased result", {
+				chapterId,
+				snapshotCommitSha: parked.commitSha,
+				conflictFiles: reapplied.conflicts,
+			});
+			return { status: "conflict", conflictFiles: reapplied.conflicts };
+		}
+		await clearParkedSnapshot(chapterId);
+		return { status: "reapplied" };
+	} catch (err) {
+		logger.error("Rebase succeeded but the parked work could not be reapplied", {
+			chapterId,
+			snapshotCommitSha: parked.commitSha,
+			error: String(err),
+		});
+		return { status: "failed", detail: String(err) };
+	}
+}
+
+/**
+ * Describe the fate of parked work in the response.
+ *
+ * Additive on purpose. `parkedSnapshot` and `reapplyConflictFiles` keep their existing
+ * shape and meaning because the Ruler UI reads them today and is deployed
+ * independently; the new fields separate the two states the old response conflated. A
+ * conflict is a decision waiting for the user, while a failure is a NarraFork or git
+ * fault that no user action fixes — worth different wording and different urgency, and
+ * previously indistinguishable because both only set `parkedSnapshot`.
+ */
+function parkedWorkResponse(
+	parked: ParkedWork | null,
+	reapply: ReapplyOutcome | null,
+	lostParkedSnapshot: string | null,
+): Record<string, unknown> {
+	const lost = lostParkedSnapshot ? { lostParkedSnapshot } : {};
+	if (!parked || !reapply || reapply.status === "reapplied") return lost;
+	return {
+		...lost,
+		// Legacy field: present whenever work did not fully land back on disk.
+		parkedSnapshot: parked.commitSha,
+		// True while the coordinates are still in the row, i.e. while
+		// `/ruler/rebase-parked` can still act on them.
+		parkedWorkPending: true,
+		parkedWorkStatus: reapply.status,
+		...(reapply.status === "conflict"
+			? { reapplyConflictFiles: reapply.conflictFiles }
+			: { reapplyError: reapply.detail }),
+	};
+}
+
+/**
+ * What to do with work a rebase parked and could not put back.
+ *
+ * Exists because the conflict path is otherwise a dead end. A conflicted reapply writes
+ * nothing to the worktree by design, so the user is left with a rebased workspace, a
+ * warning naming a snapshot id, and no operation that accepts that id — every
+ * `materializeTree` caller in the codebase is on an internal merge/wake path. These
+ * three actions are the ones that are actually decidable by a user:
+ *
+ *   - `retry` — attempt the three-way reapply again. Worth offering because the
+ *     conflicting side is the *current* workspace: editing or reverting the offending
+ *     file makes the same merge succeed.
+ *   - `materialize` — write the conflicted tree, markers and all, so it can be resolved
+ *     in an editor. Mirrors `materializeConflicts` on the snapshot-merge path, which is
+ *     the established answer to "the user must see both sides".
+ *   - `discard` — forget the coordinates. Explicit, because the alternative is a
+ *     permanent banner on a chapter whose parked work the user no longer wants.
+ *
+ * Restoring the parked tree wholesale is deliberately NOT offered: it would overwrite
+ * the rebased result, which is the mistake `reapplyParkedWork` avoids by being a
+ * three-way merge rather than a restore.
+ */
+const rulerRebaseParkedSchema = z.object({
+	chapterId: z.string().min(1),
+	action: z.enum(["retry", "materialize", "discard"]),
+});
+
+// POST /:id/ruler/rebase-parked — Recover work a rebase parked and could not reapply
+rulerRoutes.post("/:id/ruler/rebase-parked", async (c) => {
+	const projectId = c.req.param("id");
+	const parsed = rulerRebaseParkedSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { chapterId, action } = parsed.data;
+
 	const chapter = await db.query.chapters.findFirst({
 		where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
 	});
 	if (!chapter) throw new NotFoundError("Chapter", chapterId);
-	if (chapter.status !== "active") throw new ValidationError("Can only rebase active chapters");
 	if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
-
-	// Dirty check
-	const status = await gitService.getStatus(chapter.worktreePath);
-	if (status.trim()) {
-		return c.json({ error: "REBASE_DIRTY_SOURCE", code: "VALIDATION_ERROR" }, 400);
+	const worktreePath = chapter.worktreePath;
+	const commitSha = chapter.parkedSnapshotCommitSha;
+	const baseTree = chapter.parkedSnapshotBaseTree;
+	if (!commitSha || !baseTree) {
+		throw new ValidationError("This chapter has no parked work to recover");
 	}
 
-	// Also check trunk worktree is clean
-	if (rootChapter.worktreePath) {
-		const trunkStatus = await gitService.getStatus(rootChapter.worktreePath);
-		if (trunkStatus.trim()) {
-			return c.json({ error: "REBASE_DIRTY_TRUNK", code: "VALIDATION_ERROR" }, 400);
+	if (action === "discard") {
+		// No git work, so no lock is needed: this only drops the row's pointer. The
+		// snapshot commit itself stays in the shadow DAG and is logged, so a user who
+		// discards by mistake has not destroyed anything irreversibly.
+		//
+		// Conditional on the sha the user was actually shown, though, because *this* read
+		// happened outside any lock. An unconditional `SET NULL` raced a concurrent rebase:
+		// that rebase holds `worktreeLock`, parks a NEW snapshot and writes its coordinates,
+		// and the discard then erased the new pointer while reporting the old id as
+		// discarded — losing work that was never displayed to anyone and cannot be reached
+		// from the row any more. Matching on the sha makes the update a no-op in that case.
+		logger.info("Discarding the coordinates of work parked by a rebase", {
+			chapterId,
+			snapshotCommitSha: commitSha,
+		});
+		const discarded = await clearParkedSnapshotIfUnchanged(chapterId, commitSha);
+		if (!discarded) {
+			// Refusing rather than discarding whatever is there now: the user consented to
+			// forgetting one specific snapshot, not to forgetting the chapter's parked work
+			// in general.
+			logger.warn("Refused to discard parked work: its coordinates changed meanwhile", {
+				chapterId,
+				snapshotCommitSha: commitSha,
+			});
+			return c.json(
+				{
+					error: "PARKED_SNAPSHOT_CHANGED",
+					code: "VALIDATION_ERROR",
+					staleSnapshot: commitSha,
+					detail:
+						"This chapter's parked work changed while the page was open, so nothing was discarded. Reload and check the current state before discarding.",
+				},
+				409,
+			);
 		}
+		return c.json({ success: true, discardedSnapshot: commitSha });
 	}
 
-	// Execute rebase
-	const result = await gitService.rebase(chapter.worktreePath, trunkBranch);
+	// Same lock as the rebase endpoint, for the same reason: both read the workspace,
+	// merge against it and write the result back.
+	return worktreeLock.acquire(worktreePath, async () => {
+		const treeHash = await worktreeTreeSnapshot
+			.treeOfSnapshot(worktreePath, commitSha)
+			.catch(() => null);
+		if (!treeHash) {
+			// The pointer outlived what it points at. Reported, then cleared, matching the
+			// rebase endpoint's handling of the same condition.
+			logger.error("Parked work can no longer be recovered: its snapshot does not resolve", {
+				chapterId,
+				snapshotCommitSha: commitSha,
+			});
+			await clearParkedSnapshot(chapterId);
+			return c.json(
+				{
+					error: "PARKED_SNAPSHOT_UNRESOLVABLE",
+					code: "VALIDATION_ERROR",
+					lostParkedSnapshot: commitSha,
+				},
+				409,
+			);
+		}
 
-	if (result.success) {
-		// Update chapter SHAs
-		const trunkHead = await gitService.getHeadCommit(project.gitPath);
-		await db
-			.update(chapters)
-			.set({
-				startCommitSha: trunkHead,
-				headCommitSha: result.commitSha,
-			})
-			.where(eq(chapters.id, chapterId));
+		if (action === "retry") {
+			const outcome = await reapplyParked(chapterId, worktreePath, {
+				commitSha,
+				treeHash,
+				baseTree,
+			});
+			if (outcome.status === "reapplied") {
+				return c.json({ success: true, parkedSnapshot: commitSha, parkedWorkStatus: "reapplied" });
+			}
+			return c.json(
+				{
+					success: false,
+					parkedSnapshot: commitSha,
+					parkedWorkPending: true,
+					parkedWorkStatus: outcome.status,
+					...(outcome.status === "conflict"
+						? { reapplyConflictFiles: outcome.conflictFiles }
+						: { reapplyError: outcome.detail }),
+				},
+				409,
+			);
+		}
 
-		// Sync commits
-		await commitSyncService.syncChapterCommits(chapterId).catch(() => {});
-
-		return c.json({ success: true, commitSha: result.commitSha });
-	}
-
-	// Conflict — return file list, worktree stays in rebase state
-	return c.json({
-		success: false,
-		conflictFiles: result.conflictFiles,
+		// action === "materialize"
+		const current = await worktreeTreeSnapshot.tryCapture(worktreePath);
+		if (!current) {
+			throw new ValidationError(
+				`Could not read the current workspace, so the conflict cannot be written out. Your work is still in snapshot ${commitSha.slice(0, 12)}.`,
+			);
+		}
+		const merged = await worktreeTreeSnapshot.mergeTreesWithBase(
+			worktreePath,
+			baseTree,
+			current,
+			treeHash,
+		);
+		const changedFiles = await worktreeTreeSnapshot.materializeTree(worktreePath, merged.tree);
+		// The bytes are on disk now — with markers where the two sides disagree — so the
+		// snapshot is no longer the only copy and the debt is discharged. Keeping the
+		// coordinates instead would make the next rebase try to settle a reapply against a
+		// worktree full of markers and refuse to start.
+		await clearParkedSnapshot(chapterId);
+		logger.info("Wrote parked work into the workspace as a conflicted tree", {
+			chapterId,
+			snapshotCommitSha: commitSha,
+			conflictFiles: merged.conflicts,
+		});
+		return c.json({
+			success: true,
+			parkedSnapshot: commitSha,
+			parkedWorkStatus: "materialized",
+			conflictFiles: merged.conflicts,
+			changedFiles,
+		});
 	});
 });
+
+/**
+ * Forget a chapter's parked-work coordinates.
+ *
+ * Called at every terminal outcome. A stale value is not cosmetic: the next rebase
+ * would find it and restore a workspace the user has long since edited past.
+ */
+async function clearParkedSnapshot(chapterId: string): Promise<void> {
+	await db
+		.update(chapters)
+		.set({ parkedSnapshotCommitSha: null, parkedSnapshotBaseTree: null })
+		.where(eq(chapters.id, chapterId));
+}
+
+/**
+ * Forget the coordinates only while they still name `expectedCommitSha`.
+ *
+ * For the one caller that decides outside `worktreeLock`: `discard` acts on a sha the
+ * user was shown, and between that read and the write a rebase holding the lock can
+ * have parked something else and stored its coordinates. An unconditional clear then
+ * erases a live pointer to work nobody has seen yet, while the response claims the old
+ * snapshot was the one discarded.
+ *
+ * Returns false when the row no longer matches, i.e. when the caller must report a
+ * stale view rather than assume the clear happened. `returning()` is used instead of a
+ * driver-specific affected-row count so the answer comes from the row itself.
+ */
+async function clearParkedSnapshotIfUnchanged(
+	chapterId: string,
+	expectedCommitSha: string,
+): Promise<boolean> {
+	const updated = await db
+		.update(chapters)
+		.set({ parkedSnapshotCommitSha: null, parkedSnapshotBaseTree: null })
+		.where(and(eq(chapters.id, chapterId), eq(chapters.parkedSnapshotCommitSha, expectedCommitSha)))
+		.returning({ id: chapters.id });
+	return updated.length > 0;
+}
 
 // POST /:id/ruler/rebase-resolve — Resolve rebase conflict (abort or let narrator handle)
 rulerRoutes.post("/:id/ruler/rebase-resolve", async (c) => {
@@ -783,10 +1353,56 @@ rulerRoutes.post("/:id/ruler/rebase-resolve", async (c) => {
 	});
 	if (!chapter) throw new NotFoundError("Chapter", chapterId);
 	if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
+	const resolveWorktreePath = chapter.worktreePath;
 
 	if (action === "abort") {
-		await gitService.rebaseAbort(chapter.worktreePath);
-		return c.json({ success: true });
+		// Locked for the same reason the rebase endpoint is: `rebaseAbort` and
+		// `restoreParkedWork` both write the workspace, and the second one is a wholesale
+		// restore, so a concurrent capture or a second rebase landing between them makes
+		// the restore overwrite state it never saw. The row is re-read inside the lock
+		// because the coordinates are what the restore acts on and whoever held the lock
+		// before may have settled or replaced them.
+		return worktreeLock.acquire(resolveWorktreePath, async () => {
+			const current = await db.query.chapters.findFirst({
+				where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+				columns: { parkedSnapshotCommitSha: true, parkedSnapshotBaseTree: true },
+			});
+			// Work parked by the rebase that is now ending, in whichever way.
+			const parked =
+				current?.parkedSnapshotCommitSha && current.parkedSnapshotBaseTree
+					? {
+							commitSha: current.parkedSnapshotCommitSha,
+							treeHash: "",
+							baseTree: current.parkedSnapshotBaseTree,
+						}
+					: null;
+
+			await gitService.rebaseAbort(resolveWorktreePath);
+			if (!parked) return c.json({ success: true });
+
+			// An abort means "as if the rebase never happened", so the parked tree — the
+			// exact pre-rebase workspace — is restored wholesale rather than merged.
+			const treeHash = await worktreeTreeSnapshot
+				.treeOfSnapshot(resolveWorktreePath, parked.commitSha)
+				.catch(() => null);
+			if (!treeHash) {
+				// Reported in the response rather than only logged. The old code cleared the
+				// coordinates and still answered `{ success: true, parkedSnapshot }`, which
+				// reads as "the abort put your workspace back" — while the uncommitted work is
+				// neither on disk nor tracked any more. `lostParkedSnapshot` is the field the
+				// rebase endpoint already uses for exactly this condition, and the Ruler's
+				// `parked-work` mapping renders it as an unrecoverable loss.
+				logger.error("Could not restore parked work after a rebase abort", {
+					chapterId,
+					snapshotCommitSha: parked.commitSha,
+				});
+				await clearParkedSnapshot(chapterId);
+				return c.json({ success: true, lostParkedSnapshot: parked.commitSha });
+			}
+			await restoreParkedWork(resolveWorktreePath, { ...parked, treeHash });
+			await clearParkedSnapshot(chapterId);
+			return c.json({ success: true, parkedSnapshot: parked.commitSha });
+		});
 	}
 
 	// action === "continue" — send conflict resolution message to narrator

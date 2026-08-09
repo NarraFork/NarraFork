@@ -9,13 +9,13 @@ import {
 	Textarea,
 	TextInput,
 } from "@mantine/core";
-import { notifications } from "@mantine/notifications";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
+import { notifyResultWarnings } from "../../lib/operation-warnings";
 
 interface ChapterForkModalProps {
 	chapterId: string;
@@ -95,17 +95,10 @@ export function ChapterForkModal({
 				}
 			}
 
-			// Show warnings as toast notifications if any
-			if (data?.warnings && Array.isArray(data.warnings)) {
-				for (const warning of data.warnings) {
-					notifications.show({
-						color: "yellow",
-						title: t("forkWarning"),
-						message: String(warning),
-						autoClose: 10_000,
-					});
-				}
-			}
+			// A time-travel fork may have been rebuilt from recorded file edits rather
+			// than the parent's exact bytes; the warnings say so. Shared with the two
+			// direct fork-from-message entry points so all three report it identically.
+			notifyResultWarnings(t("forkWarning"), data);
 			if (onForkSuccess && data?.id) {
 				handleClose();
 				onForkSuccess(data.id);

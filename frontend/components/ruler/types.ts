@@ -35,6 +35,22 @@ export interface RulerPixiChapterPayload {
 	reviewStatus?: string | null;
 	startCommitSha: string | null;
 	mergeCommitSha?: string | null;
+	/**
+	 * Backbone commit the merge connector is drawn to.
+	 *
+	 * Falls back to the target's pre-merge HEAD for a commit-free merge, which
+	 * produces no merge commit at all — anchoring on `mergeCommitSha` alone made
+	 * those chapters draw no connector and read as never merged.
+	 */
+	mergeAnchorCommitSha?: string | null;
+	/**
+	 * Snapshot holding uncommitted work an earlier rebase parked and could not put back.
+	 *
+	 * Carried through the layout chain because the recovery panel used to exist only in
+	 * the rebase response: a reload erased it while the server still refused the next
+	 * rebase with `REBASE_PARKED_WORK_CONFLICT`, leaving no UI able to act on the work.
+	 */
+	parkedSnapshot?: string | null;
 	layoutX: number;
 	layoutY: number;
 }

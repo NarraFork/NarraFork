@@ -15,6 +15,8 @@ export interface SearchRequest {
 	provider?: string;
 	/** Model ID of the session that requested the search (for the native channel). */
 	model?: string;
+	/** User who triggered the requesting turn (for the search-subagent channel). */
+	userId?: string | null;
 }
 
 export interface SearchResultItem {

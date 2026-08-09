@@ -93,6 +93,7 @@ import {
 import type { RetryFailedCompactResponse } from "../../lib/api/narrators";
 import { formatLocaleDateTime, formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { notifyResultWarnings } from "../../lib/operation-warnings";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { DirectoryPicker } from "../common/DirectoryPicker";
@@ -1801,7 +1802,6 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 	);
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
 function TextFileBlock({
 	block,
 	onOpen,
@@ -3799,7 +3799,7 @@ function MergeSummaryCard({
 
 	const unmergeMutation = useMutation({
 		mutationFn: () => api.unmergeChapter(block.sourceChapterId),
-		onSuccess: () => {
+		onSuccess: (result) => {
 			closeConfirm();
 			close();
 			// The backend deletes the merge_summary message during unmerge,
@@ -3807,11 +3807,16 @@ function MergeSummaryCard({
 			onDelete?.();
 			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 			qc.invalidateQueries({ queryKey: ["chapters"] });
-			notifications.show({
-				title: t("unmergeSuccess"),
-				message: t("unmergeSuccessDesc"),
-				color: "green",
-			});
+			// Warnings replace the plain success toast rather than stacking on top of it:
+			// "it worked, but ..." is the whole message, and a green "successful" beside a
+			// yellow caveat reads as though the caveat were incidental.
+			if (!notifyResultWarnings(t("unmergeWarning"), result)) {
+				notifications.show({
+					title: t("unmergeSuccess"),
+					message: t("unmergeSuccessDesc"),
+					color: "green",
+				});
+			}
 		},
 		onError: (err) => {
 			notifications.show({

@@ -55,6 +55,197 @@ describe("flattenRulerPages", () => {
 		expect(merged.commits).toHaveLength(2);
 	});
 
+	test("orders pages by absolute offset, not by array position", () => {
+		// React Query PREPENDS pages fetched in the "older" direction, so `pages` arrives
+		// oldest-batch-first while each batch is newest-first. Concatenating naively
+		// produced a commit list in neither order, and tick positions — hence every
+		// chapter's placement — are derived from this array.
+		const merged = flattenRulerPages([
+			page({
+				commits: [
+					{ sha: "c2", shortSha: "c2", message: "older-newest", author: "A", date: "d" },
+					{ sha: "c3", shortSha: "c3", message: "oldest", author: "A", date: "d" },
+				],
+				oldestLoadedIndex: 1,
+				newestLoadedIndex: 2,
+			}),
+			page({
+				commits: [{ sha: "c1", shortSha: "c1", message: "head", author: "A", date: "d" }],
+				oldestLoadedIndex: 0,
+				newestLoadedIndex: 0,
+			}),
+		]);
+
+		expect(merged.commits.map((c) => c.sha)).toEqual(["c1", "c2", "c3"]);
+	});
+
+	test("deduplicates commits that two pages both cover", () => {
+		// The "newer" cursor direction computes its offset as `cursorIndex - limit`, which
+		// deliberately overlaps the page it pages towards.
+		const merged = flattenRulerPages([
+			page({
+				commits: [
+					{ sha: "a", shortSha: "a", message: "one", author: "A", date: "d" },
+					{ sha: "b", shortSha: "b", message: "two", author: "A", date: "d" },
+				],
+				oldestLoadedIndex: 0,
+				newestLoadedIndex: 1,
+			}),
+			page({
+				commits: [
+					{ sha: "b", shortSha: "b", message: "two", author: "A", date: "d" },
+					{ sha: "c", shortSha: "c", message: "three", author: "A", date: "d" },
+				],
+				oldestLoadedIndex: 1,
+				newestLoadedIndex: 2,
+			}),
+		]);
+
+		expect(merged.commits.map((c) => c.sha)).toEqual(["a", "b", "c"]);
+	});
+
+	test("re-indexes segments against the flattened commit list", () => {
+		// The server computes fromIndex/toIndex per page, so a second page's indices
+		// address the wrong commits after concatenation. SHAs are absolute; indices are not.
+		const merged = flattenRulerPages([
+			page({
+				commits: [
+					{ sha: "a", shortSha: "a", message: "one", author: "A", date: "d" },
+					{ sha: "b", shortSha: "b", message: "two", author: "A", date: "d" },
+				],
+				oldestLoadedIndex: 0,
+				newestLoadedIndex: 1,
+				segments: [
+					{
+						fromSha: "a",
+						toSha: "a",
+						fromIndex: 0,
+						toIndex: 0,
+						activeChapterCount: 1,
+						totalChapterCount: 1,
+						activeChapterIds: ["ch-a"],
+						isExpandable: true,
+					},
+				],
+			}),
+			page({
+				commits: [{ sha: "c", shortSha: "c", message: "three", author: "A", date: "d" }],
+				oldestLoadedIndex: 2,
+				newestLoadedIndex: 2,
+				segments: [
+					{
+						fromSha: "c",
+						// Page-local index 0, which addresses commit "a" in the flattened list.
+						fromIndex: 0,
+						toSha: "c",
+						toIndex: 0,
+						activeChapterCount: 1,
+						totalChapterCount: 1,
+						activeChapterIds: ["ch-c"],
+						isExpandable: true,
+					},
+				],
+			}),
+		]);
+
+		const segC = merged.segments.find((seg) => seg.fromSha === "c");
+		expect(segC?.fromIndex).toBe(2);
+		expect(segC?.toIndex).toBe(2);
+		const segA = merged.segments.find((seg) => seg.fromSha === "a");
+		expect(segA?.fromIndex).toBe(0);
+	});
+
+	test("keeps the server's index when a segment's sha is outside the loaded window", () => {
+		const merged = flattenRulerPages([
+			page({
+				commits: [{ sha: "a", shortSha: "a", message: "one", author: "A", date: "d" }],
+				oldestLoadedIndex: 0,
+				newestLoadedIndex: 0,
+			}),
+			page({
+				commits: [{ sha: "b", shortSha: "b", message: "two", author: "A", date: "d" }],
+				oldestLoadedIndex: 1,
+				newestLoadedIndex: 1,
+				segments: [
+					{
+						fromSha: "unloaded",
+						toSha: "also-unloaded",
+						fromIndex: 7,
+						toIndex: 8,
+						activeChapterCount: 0,
+						totalChapterCount: 1,
+						activeChapterIds: [],
+						isExpandable: true,
+					},
+				],
+			}),
+		]);
+
+		const seg = merged.segments.find((s) => s.fromSha === "unloaded");
+		expect(seg?.fromIndex).toBe(7);
+		expect(seg?.toIndex).toBe(8);
+	});
+
+	test("reads totalCommitCount from the offset-ordered pages, not array position", () => {
+		// The aggregate fields must agree with the ordering this function just established.
+		// `pages[0]` was the head of an array it had already declared unordered — harmless
+		// while every page reports the same total, but the kind of line a later change
+		// copies into somewhere order actually matters.
+		const merged = flattenRulerPages([
+			page({
+				commits: [{ sha: "c2", shortSha: "c2", message: "older", author: "A", date: "d" }],
+				oldestLoadedIndex: 1,
+				newestLoadedIndex: 1,
+				totalCommitCount: 2,
+			}),
+			page({
+				commits: [{ sha: "c1", shortSha: "c1", message: "head", author: "A", date: "d" }],
+				oldestLoadedIndex: 0,
+				newestLoadedIndex: 0,
+				totalCommitCount: 2,
+			}),
+		]);
+
+		expect(merged.totalCommitCount).toBe(2);
+		expect(merged.oldestLoadedIndex).toBe(0);
+		expect(merged.newestLoadedIndex).toBe(1);
+	});
+
+	test("carries each chapter's parked snapshot through the merge", () => {
+		// The recovery panel is rebuilt from this field after a reload, so dropping it here
+		// would restore the pre-fix behaviour: server still tracking parked work, no UI able
+		// to act on it.
+		const merged = flattenRulerPages([
+			page({
+				commits: [{ sha: "a", shortSha: "a", message: "one", author: "A", date: "d" }],
+				oldestLoadedIndex: 0,
+				newestLoadedIndex: 0,
+				activeChapters: [
+					{
+						id: "ch-a",
+						title: "Alpha",
+						branch: "chapter/alpha",
+						role: "branch",
+						parentChapterId: null,
+						startCommitSha: "a",
+						parkedSnapshot: "abcdef0123456789",
+						narratorId: null,
+						narratorStatus: null,
+						axisOffset: 0,
+						crossOffset: 0,
+					},
+				],
+			}),
+			page({
+				commits: [{ sha: "b", shortSha: "b", message: "two", author: "A", date: "d" }],
+				oldestLoadedIndex: 1,
+				newestLoadedIndex: 1,
+			}),
+		]);
+
+		expect(merged.activeChapters[0]?.parkedSnapshot).toBe("abcdef0123456789");
+	});
+
 	test("deduplicates identical fallbacks", () => {
 		const merged = flattenRulerPages([
 			page({ fallbacks: [{ feature: "ruler.gitLog", reason: "git_log_failed", error: "boom" }] }),

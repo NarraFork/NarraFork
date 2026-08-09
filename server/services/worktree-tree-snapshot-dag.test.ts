@@ -12,13 +12,15 @@
  * relied upon.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, projects, worktreeTreeSnapshots } from "../db/schema";
 import { generateId } from "../lib/id";
+import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import {
@@ -643,5 +645,88 @@ describe("shadow repository ownership", () => {
 			.from(worktreeTreeSnapshots)
 			.where(eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(worktree)));
 		expect(after.length).toBe(0);
+	});
+
+	test("keeps a repository claimed only by a live worktreePath", async () => {
+		const { worktree } = await createWorktree("nf-dag-claimed-by-path-");
+		writeFileSync(join(worktree, "app.txt"), "first capture\n");
+		const snap = await worktreeTreeSnapshot.advanceSnapshotRef(worktree);
+
+		// `snapshotShadowKey` left NULL on purpose: that is the state of every chapter
+		// that has not yet run something which advances the lineage, and keying ownership
+		// on it alone read those as unclaimed — so the orphan sweep was entitled to delete
+		// the shadow repository of an *active* chapter.
+		const projectId = generateId();
+		const now = new Date().toISOString();
+		await db.insert(projects).values({
+			id: projectId,
+			name: "DAG path-claim project",
+			gitPath: worktree,
+			createdAt: now,
+			updatedAt: now,
+		});
+		createdProjects.push(projectId);
+		const chapterId = generateId();
+		await db.insert(chapters).values({
+			id: chapterId,
+			projectId,
+			title: "Active chapter with no shadow key",
+			branch: `chapter/dag-path-${chapterId.slice(0, 6)}`,
+			baseBranch: "main",
+			worktreePath: worktree,
+			snapshotShadowKey: null,
+			status: "active",
+			createdAt: now,
+			updatedAt: now,
+		});
+		createdChapters.push(chapterId);
+
+		expect(await worktreeTreeSnapshot.destroy(worktree)).toBe(false);
+		expect(await worktreeTreeSnapshot.hasTree(worktree, present(snap, "snapshot").treeHash)).toBe(
+			true,
+		);
+	});
+});
+
+/**
+ * `gcAll` used to delete any shadow directory whose `HEAD` was missing. `HEAD` is a
+ * 23-byte pointer nothing here dereferences, while `objects/` beside it holds every
+ * snapshot the database still points at — so an interrupted write cost a chapter its
+ * whole revert history.
+ */
+describe("shadow repository repair", () => {
+	/** The shadow directory backing a workspace, found by its `HEAD`. */
+	function shadowDirFor(worktree: string): string {
+		const digest = createHash("sha256").update(treeSnapshotKey("local", worktree)).digest("hex");
+		return getNarraforkPath("tree-snapshots", digest.slice(0, 32));
+	}
+
+	test("restores a missing HEAD instead of deleting the objects beside it", async () => {
+		const { worktree } = await createWorktree("nf-dag-repair-head-");
+		writeFileSync(join(worktree, "app.txt"), "work worth keeping\n");
+		const snap = present(await worktreeTreeSnapshot.advanceSnapshotRef(worktree), "snapshot");
+
+		const dir = shadowDirFor(worktree);
+		rmSync(join(dir, "HEAD"), { force: true });
+		await worktreeTreeSnapshot.gcAll();
+
+		expect(existsSync(join(dir, "HEAD"))).toBe(true);
+		// The point of the repair: the lineage is still readable afterwards.
+		expect(await worktreeTreeSnapshot.hasTree(worktree, snap.treeHash)).toBe(true);
+		expect(await worktreeTreeSnapshot.getRef(worktree, SNAPSHOT_HEAD_REF)).toBe(snap.commitSha);
+	});
+
+	test("still removes a directory with no objects and no refs", async () => {
+		// Nothing to lose here, so deleting is the correct outcome — the repair must not
+		// turn the sweep into a no-op that leaves junk accumulating forever.
+		const empty = getNarraforkPath("tree-snapshots", `deadbeef${generateId().slice(0, 8)}`);
+		mkdirSync(join(empty, "objects", "pack"), { recursive: true });
+		mkdirSync(join(empty, "refs"), { recursive: true });
+		try {
+			await worktreeTreeSnapshot.gcAll();
+			expect(existsSync(empty)).toBe(false);
+		} finally {
+			rmSync(empty, { recursive: true, force: true });
+		}
 	});
 });

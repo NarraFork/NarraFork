@@ -31,6 +31,7 @@ import { useCreateTerminal, useDeleteTerminal, useTerminals } from "@frontend/ho
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { api } from "@frontend/lib/api";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
+import { notifyResultWarnings } from "@frontend/lib/operation-warnings";
 import {
 	Alert,
 	Box,
@@ -302,7 +303,13 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 
 	const unmergeMutation = useMutation({
 		mutationFn: (id: string) => api.unmergeChapter(id),
-		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["narraFlow"] }),
+		onSuccess: (result) => {
+			// An unmerge can succeed while leaving state behind — a restored worktree it
+			// could not clean, snapshot content it could not verify. The server joins
+			// those into `warning`; invalidating and moving on discarded them.
+			notifyResultWarnings(t("unmergeWarning"), result);
+			queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+		},
 	});
 
 	const deleteChapter = useDeleteChapter();
@@ -312,7 +319,16 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const [terminalContextMenu, setTerminalContextMenu] = useState<TerminalContextMenuState | null>(
 		null,
 	);
-	const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
+	// `hasWorktree` decides which confirmation text is shown. The server only reaches its
+	// `deleteBranch` call inside an `if (chapter.worktreePath)` block, so a chapter
+	// without one — every snapshot-merged chapter, whose worktreePath is cleared on
+	// merge — keeps its git branch after deletion. Promising "the branch will be
+	// removed" there was simply untrue.
+	const [deleteTarget, setDeleteTarget] = useState<{
+		id: string;
+		title: string;
+		hasWorktree: boolean;
+	} | null>(null);
 	const [nodes, setNodes] = useState<Node[]>([]);
 	const [computedEdges, setComputedEdges] = useState<Edge[]>([]);
 
@@ -1922,8 +1938,9 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		(nodeId: string) => {
 			setContextMenu(null);
 			const node = nodes.find((n) => n.id === nodeId);
-			const title = (node?.data as { title?: string } | undefined)?.title ?? nodeId;
-			setDeleteTarget({ id: nodeId, title });
+			const data = node?.data as { title?: string; worktreePath?: string | null } | undefined;
+			const title = data?.title ?? nodeId;
+			setDeleteTarget({ id: nodeId, title, hasWorktree: !!data?.worktreePath });
 		},
 		[nodes],
 	);
@@ -2132,7 +2149,11 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			>
 				<Stack>
 					<Text size="sm">
-						{t("contextMenu.deleteConfirmMessage", { title: deleteTarget?.title ?? "" })}
+						{deleteTarget?.hasWorktree
+							? t("contextMenu.deleteConfirmMessage", { title: deleteTarget?.title ?? "" })
+							: t("contextMenu.deleteConfirmMessageNoWorktree", {
+									title: deleteTarget?.title ?? "",
+								})}
 					</Text>
 					<Group justify="flex-end">
 						<Button variant="default" onClick={() => setDeleteTarget(null)}>

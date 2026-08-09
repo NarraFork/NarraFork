@@ -6,17 +6,53 @@ import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
+import { supportsMergeTree, WORKTREES_DIR_NAME } from "./worktree-tree-snapshot";
 
 interface ExecResult {
 	stdout: string;
 	stderr: string;
 	exitCode: number;
+	/**
+	 * Output exceeded the capture limit, so `stdout` is a prefix of what git printed.
+	 *
+	 * Exposed rather than hidden because for a parser the difference matters: a
+	 * truncated `-z` listing ends mid-record and a truncated merge-tree result loses
+	 * conflict paths. Callers that can be wrong silently must check this; callers
+	 * that only show text to a human can ignore it.
+	 */
+	truncated?: boolean;
 }
 
 interface ExecOptions {
 	silent?: boolean;
 	optionalLocks?: boolean;
+	/**
+	 * Hard timeout in ms. Left undefined for write/network operations (clone, fetch,
+	 * push) where a legitimate run can take minutes and killing it mid-way is worse
+	 * than waiting.
+	 */
+	timeout?: number;
+	maxOutputBytes?: number;
 }
+
+/**
+ * Ceiling for read-only git commands.
+ *
+ * These all run on the server's single JS thread and are awaited by HTTP handlers,
+ * so an unbounded `git log`/`diff` against a pathological repository stalls every
+ * other request. 60 s is far above any healthy local invocation while still
+ * guaranteeing the request eventually returns.
+ */
+const READ_TIMEOUT_MS = 60_000;
+/**
+ * Capture ceiling for read-only git commands, an order of magnitude below
+ * safeSpawn's 10 MB default.
+ *
+ * Nothing here feeds a client more than ~100 KB (diffs are truncated, listings are
+ * capped at 200 entries), so retaining megabytes only inflates peak heap. The
+ * streams are still drained — only the retained string is bounded.
+ */
+const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 /**
  * Per-worktree mutex to prevent concurrent git write operations.
@@ -101,12 +137,29 @@ function commandOutputMentionsConflict(result: ExecResult): boolean {
 	return output.includes("conflict") || output.includes("冲突");
 }
 
-function normalizeExecOptions(options: boolean | ExecOptions = {}): Required<ExecOptions> {
+function normalizeExecOptions(options: boolean | ExecOptions = {}): ExecOptions {
 	if (typeof options === "boolean") return { silent: options, optionalLocks: true };
 	return {
 		silent: options.silent ?? false,
 		optionalLocks: options.optionalLocks ?? true,
+		timeout: options.timeout,
+		maxOutputBytes: options.maxOutputBytes,
 	};
+}
+
+/**
+ * Marker safeSpawn appends to a truncated stream.
+ *
+ * Removed here instead of being left in place because git output is *parsed*: a
+ * `-z` listing would gain the marker as a bogus path and a NUL-separated
+ * merge-tree result would gain it as a bogus conflict. The fact of truncation is
+ * carried by `ExecResult.truncated`, which is a signal a parser can act on.
+ */
+const SPAWN_TRUNCATION_MARKER = "[safeSpawn output truncated — exceeded capture limit]";
+
+function stripTruncationMarker(text: string): string {
+	const at = text.lastIndexOf(SPAWN_TRUNCATION_MARKER);
+	return at === -1 ? text : text.slice(0, at);
 }
 
 async function exec(
@@ -114,12 +167,17 @@ async function exec(
 	cwd: string,
 	options: boolean | ExecOptions = {},
 ): Promise<ExecResult> {
-	const { silent, optionalLocks } = normalizeExecOptions(options);
+	const { silent, optionalLocks, timeout, maxOutputBytes } = normalizeExecOptions(options);
 	const cmd = optionalLocks ? ["git", ...args] : ["git", "--no-optional-locks", ...args];
 	try {
-		const result = await safeSpawn({ cmd, cwd });
-		const trimmedStdout = stripTrailingLineBreaks(result.stdout);
-		const trimmedStderr = stripTrailingLineBreaks(result.stderr);
+		const result = await safeSpawn({ cmd, cwd, timeout, maxOutputBytes });
+		const truncated = result.stdoutTruncated === true || result.stderrTruncated === true;
+		const trimmedStdout = stripTrailingLineBreaks(
+			result.stdoutTruncated ? stripTruncationMarker(result.stdout) : result.stdout,
+		);
+		const trimmedStderr = stripTrailingLineBreaks(
+			result.stderrTruncated ? stripTruncationMarker(result.stderr) : result.stderr,
+		);
 		if (result.exitCode !== 0 && !silent) {
 			logger.error("git command failed", {
 				args: args.join(" "),
@@ -128,9 +186,22 @@ async function exec(
 				stderr: trimmedStderr ? truncateGitFailureOutput(trimmedStderr) : undefined,
 				exitCode: result.exitCode,
 				optionalLocks,
+				truncated: truncated || undefined,
 			});
 		}
-		return { stdout: trimmedStdout, stderr: trimmedStderr, exitCode: result.exitCode };
+		if (truncated) {
+			logger.warn("git command output truncated", {
+				args: args.join(" "),
+				cwd,
+				limit: maxOutputBytes,
+			});
+		}
+		return {
+			stdout: trimmedStdout,
+			stderr: trimmedStderr,
+			exitCode: result.exitCode,
+			truncated,
+		};
 	} catch (err) {
 		// When silent, swallow spawn errors (e.g. git not found) and return a
 		// synthetic failure result so callers that check exitCode still work.
@@ -148,8 +219,25 @@ async function exec(
 	}
 }
 
-function execRead(args: string[], cwd: string, silent = false): Promise<ExecResult> {
-	return exec(args, cwd, { silent, optionalLocks: false });
+/**
+ * Run a read-only git command.
+ *
+ * Read operations get a timeout and a capture ceiling by default; writes and network
+ * operations deliberately do not, since a slow `clone` or `merge` is normal and
+ * killing it half-done leaves the repository in a worse state than waiting does.
+ */
+function execRead(
+	args: string[],
+	cwd: string,
+	silent = false,
+	options?: { timeout?: number; maxOutputBytes?: number },
+): Promise<ExecResult> {
+	return exec(args, cwd, {
+		silent,
+		optionalLocks: false,
+		timeout: options?.timeout ?? READ_TIMEOUT_MS,
+		maxOutputBytes: options?.maxOutputBytes ?? READ_MAX_OUTPUT_BYTES,
+	});
 }
 
 async function detectUnmergedFiles(worktreePath: string): Promise<string[]> {
@@ -160,6 +248,43 @@ async function detectUnmergedFiles(worktreePath: string): Promise<string[]> {
 	);
 	if (statusResult.exitCode !== 0) return [];
 	return statusResult.stdout.split("\n").filter(Boolean);
+}
+
+/**
+ * Whether the repository has no commits at all (unborn HEAD).
+ *
+ * Distinguishes "brand new repository" from "git is broken or the ref is wrong",
+ * which `rev-list` reports identically as exit 128. Checked with
+ * `rev-parse --verify` because it exits 1 (not 128) for an unresolvable HEAD and
+ * prints nothing, so a genuine spawn failure still surfaces as an error elsewhere.
+ */
+async function hasNoCommits(repoPath: string): Promise<boolean> {
+	const result = await execRead(["rev-parse", "--verify", "--quiet", "HEAD"], repoPath, true);
+	return result.exitCode === 1 && !result.stdout.trim();
+}
+
+/**
+ * Whether `ref` names a branch/commit that simply is not in this repository.
+ *
+ * The companion to {@link hasNoCommits}, which only ever recognises an unborn HEAD: a
+ * repository that *has* commits but not under the name being asked about is a different
+ * situation, and `rev-list` reports both as exit 128. `rev-parse --verify --quiet` exits
+ * 1 with no output for an unresolvable ref and 128 only when git itself could not answer,
+ * so a probe of the ref separates "your ref is wrong" from "git is broken".
+ *
+ * A range (`<a>..<b>`) is deliberately never treated as a missing ref. Ranges reach
+ * {@link gitService.getCommitCount} from cursor pagination, where an endpoint that no
+ * longer resolves is a stale cursor the caller has to be *told* about — it falls back to
+ * skip-based loading — whereas answering 0 would page the timeline from the wrong end.
+ */
+async function refIsMissing(repoPath: string, ref: string): Promise<boolean> {
+	if (ref.includes("..")) return false;
+	const result = await execRead(
+		["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+		repoPath,
+		true,
+	);
+	return result.exitCode === 1 && !result.stdout.trim();
 }
 
 async function detectConflictFilesAfterFailedGitCommand(
@@ -290,6 +415,33 @@ function parseNumstatZ(
 	}
 
 	return entries;
+}
+
+/**
+ * Parse `--name-status -z` into a path -> raw status letter map.
+ *
+ * The record layout differs by status, which is why this cannot be a simple pairwise
+ * split: `M\0path\0`, but `R085\0old\0new\0`. Rename/copy entries are keyed under the
+ * new path, matching how numstat reports them.
+ */
+function parseNameStatusZ(output: string): Map<string, string> {
+	const fields = output.split("\0");
+	const statuses = new Map<string, string>();
+	let i = 0;
+	while (i < fields.length) {
+		const status = fields[i++];
+		if (!status) continue;
+		const takesTwoPaths = status.startsWith("R") || status.startsWith("C");
+		if (takesTwoPaths) {
+			const newPath = fields[i + 1];
+			i += 2;
+			if (newPath) statuses.set(newPath, status);
+			continue;
+		}
+		const path = fields[i++];
+		if (path) statuses.set(path, status);
+	}
+	return statuses;
 }
 
 function buildLineStatsMap(output: string): Map<string, LineStats> {
@@ -472,28 +624,64 @@ export const gitService = {
 		return result.exitCode === 0;
 	},
 
-	/** Simulate merge using merge-tree to detect conflicts without modifying worktree */
+	/**
+	 * Simulate a merge to detect conflicts without touching any worktree.
+	 *
+	 * Uses `merge-tree --write-tree` (git >= 2.38), whose contract is machine-readable:
+	 * exit 0 means clean, exit 1 means conflicted, and with `--name-only -z` stdout is
+	 * the result tree followed by the conflicting paths. The older three-argument form
+	 * cannot be used for this: it exits 0 either way and describes conflicts by
+	 * inlining `<<<<<<< .our` markers into a diff, so parsing it for `+++ b/` or
+	 * `CONFLICT` lines — patterns that only the new form emits — reported "no
+	 * conflicts" unconditionally and let the UI promise a clean merge that then failed.
+	 *
+	 * Throws on old git rather than falling back to the legacy form. A merge preview
+	 * that cannot see conflicts is worse than no preview: the caller can surface "not
+	 * checkable", but it cannot recover from being told a lie.
+	 */
 	async mergeTree(
 		repoPath: string,
 		baseSha: string,
 		ourBranch: string,
 		theirBranch: string,
 	): Promise<{ hasConflicts: boolean; conflictFiles: string[] }> {
-		const result = await execRead(["merge-tree", baseSha, ourBranch, theirBranch], repoPath);
-		const conflictFiles: string[] = [];
-		const lines = result.stdout.split("\n");
-		for (const line of lines) {
-			// merge-tree "changed in both" sections contain conflict file paths
-			const match = line.match(/^\+\+\+ b\/(.+)$/);
-			if (match) conflictFiles.push(match[1]);
+		if (!(await supportsMergeTree())) {
+			throw new GitError(
+				"Cannot check for merge conflicts: git merge-tree --write-tree is unavailable (requires git >= 2.38)",
+			);
 		}
-		for (const line of lines) {
-			const conflictMatch = line.match(/^CONFLICT \(.+\): .+ (.+)$/);
-			if (conflictMatch && !conflictFiles.includes(conflictMatch[1])) {
-				conflictFiles.push(conflictMatch[1]);
-			}
+		const result = await execRead(
+			[
+				"merge-tree",
+				"--write-tree",
+				"--name-only",
+				"--no-messages",
+				"-z",
+				`--merge-base=${baseSha}`,
+				ourBranch,
+				theirBranch,
+			],
+			repoPath,
+			// exit 1 is the documented "conflicts found" status, so it must not be logged
+			// as a command failure.
+			true,
+		);
+		if (result.exitCode !== 0 && result.exitCode !== 1) {
+			throw new GitError(gitFailureMessage("Merge conflict check failed", result));
 		}
-		return { hasConflicts: conflictFiles.length > 0, conflictFiles };
+		if (result.truncated) {
+			// A cut-off list would understate the conflicts, which is the exact failure
+			// this rewrite exists to remove.
+			throw new GitError("Merge conflict check produced more output than can be read");
+		}
+		const parts = result.stdout.split("\0").filter(Boolean);
+		// parts[0] is the merged tree — written to the object store even when
+		// conflicted, and irrelevant here since nothing gets checked out.
+		const [tree, ...conflictFiles] = parts;
+		if (!tree) throw new GitError("Merge conflict check returned no tree");
+		// Trust the exit code over the path list: `--name-only` omits paths for some
+		// conflict kinds, so exit 1 with no names still means "do not promise clean".
+		return { hasConflicts: result.exitCode === 1, conflictFiles };
 	},
 
 	/** Perform actual merge in a worktree */
@@ -693,10 +881,30 @@ export const gitService = {
 		return result.stdout;
 	},
 
+	/**
+	 * Stage everything and commit, for unattended saves (e.g. putting a chapter to sleep).
+	 *
+	 * Refuses to run mid-conflict. `git add -A` treats an unmerged path as *resolved*,
+	 * so a worktree parked on `UU` would have its `<<<<<<<` markers committed as if
+	 * they were the author's code — a commit nobody wrote, indistinguishable from real
+	 * work afterwards. Skipping silently is not an option either: the caller would
+	 * record a successful save. Throwing is safe because callers already treat an
+	 * autoCommit failure as "fall back to a snapshot", and it gives them a reason to
+	 * show the user.
+	 */
 	async autoCommit(worktreePath: string, message: string): Promise<string | null> {
 		return withWorktreeLock(worktreePath, async () => {
 			const status = await this.getStatus(worktreePath);
 			if (!status) return null;
+
+			const unmerged = await detectUnmergedFiles(worktreePath);
+			if (unmerged.length > 0) {
+				const shown = unmerged.slice(0, 5).join(", ");
+				const rest = unmerged.length > 5 ? `, +${unmerged.length - 5} more` : "";
+				throw new GitError(
+					`Refusing to auto-commit: ${unmerged.length} file(s) still have unresolved merge conflicts (${shown}${rest})`,
+				);
+			}
 
 			const addResult = await exec(["add", "-A"], worktreePath);
 			if (addResult.exitCode !== 0) throw new GitError(`git add failed: ${addResult.stderr}`);
@@ -803,16 +1011,17 @@ export const gitService = {
 
 	/** Get full diff of all uncommitted changes (staged + unstaged + untracked).
 	 *  Truncates at ~100KB to avoid blowing up AI token budgets.
-	 *  Binary files are excluded at the git level to prevent memory blowup. */
+	 *  Binary file *content* never appears — see the note on binary handling below. */
 	async getFullDiff(worktreePath: string, maxBytes = 100_000): Promise<string> {
 		// Diff of tracked files (staged + unstaged combined against HEAD).
-		// --no-binary: suppress binary file content in diff output.
+		//
+		// Binary content is kept out by doing nothing: git's default is a single
+		// "Binary files a/x and b/x differ" line, and only an explicit `--binary`
+		// (or `--text`) makes it emit content. There is no `--no-binary` — passing
+		// one makes git print usage and exit 129, which silently emptied every diff
+		// this method produced, including the one the review agent reads.
 		// -D/--irreversible-delete: omit full content of deleted files.
-		const diffResult = await execRead(
-			["diff", "HEAD", "--no-binary", "-D", "--no-color"],
-			worktreePath,
-			true,
-		);
+		const diffResult = await execRead(["diff", "HEAD", "-D", "--no-color"], worktreePath, true);
 		const parts: string[] = [];
 		let totalLen = 0;
 
@@ -844,9 +1053,9 @@ export const gitService = {
 		const filesToDiff = untrackedFiles.slice(0, MAX_UNTRACKED_DIFFS);
 		for (const file of filesToDiff) {
 			// --no-index always exits 1 when diff is found — silence the expected error log.
-			// --no-binary: skip binary file content.
+			// Binary files again produce only a "Binary files ... differ" line by default.
 			const showResult = await execRead(
-				["diff", "--no-index", "--no-binary", "--no-color", DEV_NULL, file],
+				["diff", "--no-index", "--no-color", DEV_NULL, file],
 				worktreePath,
 				true,
 			);
@@ -865,7 +1074,7 @@ export const gitService = {
 	 * Get diff between two refs (commits, branches, tags).
 	 * Useful for review: shows all changes between a base and head.
 	 * Truncates at maxBytes to avoid blowing up token budgets.
-	 * Binary files are excluded to prevent memory blowup.
+	 * Binary content is left out by git's default one-line summary, not by a flag.
 	 */
 	async getDiffBetweenRefs(
 		repoPath: string,
@@ -873,11 +1082,7 @@ export const gitService = {
 		headRef: string,
 		maxBytes = 100_000,
 	): Promise<string> {
-		const result = await execRead(
-			["diff", "--no-binary", "--no-color", `${baseRef}..${headRef}`],
-			repoPath,
-			true,
-		);
+		const result = await execRead(["diff", "--no-color", `${baseRef}..${headRef}`], repoPath, true);
 		if (!result.stdout) return "";
 		if (result.stdout.length > maxBytes) {
 			return `${result.stdout.slice(0, maxBytes)}\n\n[diff truncated — exceeded size limit]`;
@@ -888,6 +1093,15 @@ export const gitService = {
 	/**
 	 * Get the file list for a specific commit (stats only, no diff content).
 	 * Fast even for huge commits — only runs numstat + name-status.
+	 *
+	 * Both passes must agree on rename detection and quoting, so both get `-M -z`.
+	 * Previously only name-status had `-M`, which made the two views disagree about
+	 * what a rename even is: numstat split it into an add of the new path plus a
+	 * delete of the old one, and since name-status keyed the rename under the new
+	 * path only, the old path fell through to the default "modified" branch and the
+	 * UI listed a phantom file that does not exist in the commit. `-z` additionally
+	 * stops git from octal-escaping non-ASCII paths, which otherwise never matched
+	 * between the two maps for CJK filenames.
 	 */
 	async getCommitFiles(
 		repoPath: string,
@@ -901,51 +1115,31 @@ export const gitService = {
 			linesRemoved: number;
 		}>
 	> {
-		// Get numstat for per-file stats
-		const numstat = await execRead(
-			["diff-tree", "--no-commit-id", "-r", "--numstat", sha],
-			repoPath,
-		);
-		// Get name-status for file status (A/M/D/R)
-		const nameStatus = await execRead(
-			["diff-tree", "--no-commit-id", "-r", "--name-status", "-M", sha],
-			repoPath,
-		);
+		const [numstat, nameStatus] = await Promise.all([
+			execRead(["diff-tree", "--no-commit-id", "-r", "--numstat", "-M", "-z", sha], repoPath),
+			execRead(["diff-tree", "--no-commit-id", "-r", "--name-status", "-M", "-z", sha], repoPath),
+		]);
 
-		const statusMap = new Map<string, { status: string; oldPath?: string }>();
-		for (const line of nameStatus.stdout.split("\n").filter(Boolean)) {
-			const parts = line.split("\t");
-			const st = parts[0];
-			if (st.startsWith("R")) {
-				statusMap.set(parts[2], { status: "renamed", oldPath: parts[1] });
-			} else {
-				statusMap.set(parts[1], { status: st });
-			}
-		}
-
-		const statLines = numstat.stdout.split("\n").filter(Boolean);
-		return statLines.map((line) => {
-			const [addStr, delStr, filePath] = line.split("\t");
-			const linesAdded = addStr === "-" ? 0 : Number.parseInt(addStr, 10) || 0;
-			const linesRemoved = delStr === "-" ? 0 : Number.parseInt(delStr, 10) || 0;
-
-			const info = statusMap.get(filePath);
-			const rawStatus = info?.status ?? "M";
-			const status =
-				rawStatus === "A" || rawStatus === "added"
+		const statusMap = parseNameStatusZ(nameStatus.stdout);
+		return parseNumstatZ(numstat.stdout).map((entry) => {
+			const rawStatus = statusMap.get(entry.path);
+			// Fall back on the numstat record itself: it reports a rename as a pair of
+			// paths, which is enough to classify without name-status agreeing.
+			const status: "added" | "modified" | "deleted" | "renamed" =
+				rawStatus === "A"
 					? "added"
-					: rawStatus === "D" || rawStatus === "deleted"
+					: rawStatus === "D"
 						? "deleted"
-						: rawStatus === "renamed"
+						: rawStatus?.startsWith("R") || entry.oldPath
 							? "renamed"
 							: "modified";
 
 			return {
-				path: filePath,
-				oldPath: info?.oldPath,
-				status: status as "added" | "modified" | "deleted" | "renamed",
-				linesAdded,
-				linesRemoved,
+				path: entry.path,
+				oldPath: entry.oldPath,
+				status,
+				linesAdded: entry.added,
+				linesRemoved: entry.removed,
 			};
 		});
 	},
@@ -1339,10 +1533,40 @@ export const gitService = {
 			});
 	},
 
+	/**
+	 * Number of commits reachable from `branch` (default HEAD).
+	 *
+	 * Returns 0 for the two cases that legitimately mean zero — an unborn HEAD in a fresh
+	 * repository, and a ref that does not exist — and throws for everything else (git
+	 * missing, a broken repository, a timeout), because the previous `|| 0` made a broken
+	 * git indistinguishable from an empty repository and callers rendered "0 commits".
+	 *
+	 * "The ref does not exist" has to be its own case rather than being folded into
+	 * {@link hasNoCommits}, which only recognises an unborn *HEAD*. A repository with
+	 * commits on `master` while `project.defaultBranch` says `main` — a renamed or deleted
+	 * branch, or an import whose default differs — fails `rev-list --count main` with exit
+	 * 128 while HEAD resolves fine, so `hasNoCommits` said false and this threw. The
+	 * ruler timeline calls it inside a `Promise.all` with no catch, so the whole `/ruler`
+	 * endpoint returned 500 and the page would not open at all; before the throw was
+	 * introduced the same repository degraded to displaying 0.
+	 *
+	 * Probed with `rev-parse --verify --quiet` on the ref itself, which answers exactly
+	 * this question: exit 1 with no output for an unresolvable ref (including a range
+	 * whose endpoints do not resolve), exit 128 only when git could not run at all.
+	 */
 	async getCommitCount(worktreePath: string, branch?: string): Promise<number> {
-		const args = ["rev-list", "--count", branch ?? "HEAD"];
-		const result = await execRead(args, worktreePath, true);
-		return Number.parseInt(result.stdout.trim(), 10) || 0;
+		const ref = branch ?? "HEAD";
+		const result = await execRead(["rev-list", "--count", ref], worktreePath, true);
+		if (result.exitCode !== 0) {
+			if (await hasNoCommits(worktreePath)) return 0;
+			if (await refIsMissing(worktreePath, ref)) return 0;
+			throw new GitError(gitFailureMessage(`Failed to count commits for ${ref}`, result));
+		}
+		const count = Number.parseInt(result.stdout.trim(), 10);
+		if (!Number.isFinite(count)) {
+			throw new GitError(`Unexpected commit count output for ${ref}: ${result.stdout.trim()}`);
+		}
+		return count;
 	},
 
 	// === Reset ===
@@ -1358,6 +1582,65 @@ export const gitService = {
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["reset", "--hard", target], worktreePath);
 			if (result.exitCode !== 0) throw new GitError(`git reset --hard failed: ${result.stderr}`);
+		});
+	},
+
+	/**
+	 * Abandon a conflicted merge while keeping unrelated uncommitted work.
+	 *
+	 * The clean-up a failed `--squash` merge needs. `git merge --abort` cannot do it:
+	 * `--squash --no-commit` never writes MERGE_HEAD, so abort exits 128 and leaves the
+	 * conflict markers on disk — where the next auto-commit happily commits them.
+	 *
+	 * `reset --hard` would clear the conflict, but it also discards every other
+	 * uncommitted change in the worktree, which in a chapter someone is working in is
+	 * the loss this whole path exists to prevent. `--merge` resets only the paths that
+	 * differ between the index and the target commit, so the conflicted files are
+	 * restored while an unrelated edit elsewhere survives.
+	 *
+	 * `target` is normally the pre-merge HEAD. Omitting it resets to HEAD, which is
+	 * what a `--no-commit` merge wants since HEAD never moved.
+	 */
+	async resetMerge(worktreePath: string, target?: string): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["reset", "--merge", ...(target ? [target] : [])], worktreePath);
+			if (result.exitCode !== 0) {
+				throw new GitError(gitFailureMessage("git reset --merge failed", result));
+			}
+		});
+	},
+
+	/**
+	 * Delete untracked files and directories, leaving ignored ones and `.worktrees/` alone.
+	 *
+	 * Deliberately `-fd` without `-x`: ignored paths are build outputs, virtualenvs and
+	 * dependency trees, which are excluded from snapshots by design. Removing them would
+	 * be an unrecoverable loss dressed up as tidying, and nothing that needs a clean
+	 * worktree cares about them — git's own checkout only ever collides with untracked,
+	 * non-ignored paths.
+	 *
+	 * `-e /.worktrees/` is the same argument applied to the directory holding every other
+	 * chapter's worktree, and it has to be stated here because the equivalent exclude the
+	 * snapshot engine relies on lives in the *shadow* repository's `info/exclude`, which
+	 * the user's `git clean` cannot see. A registered linked worktree is protected by git
+	 * itself, but anything else under `.worktrees/` is not: measured on a root chapter
+	 * (where `worktreePath` *is* `gitPath`) with no `.gitignore`, `clean -fd` removed
+	 * `.worktrees/loose.txt` and the residue of an unregistered or broken worktree — and
+	 * those are precisely the paths the shadow exclude keeps out of snapshots, so there is
+	 * nothing to restore them from. A `.gitignore` entry covers this when it exists, and
+	 * the write that adds it is best-effort (see project-db-sync), which is the window.
+	 *
+	 * Correct for every caller, not just the parking path: `.worktrees/` is NarraFork's
+	 * own reserved directory, so no caller has a reason to want it deleted, and git will
+	 * not check out over it either — it is not part of any tracked tree.
+	 */
+	async cleanUntracked(worktreePath: string): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			// Anchored with a leading slash and directory-only, matching the shadow repo's
+			// rule: a legitimately-tracked `docs/.worktrees` elsewhere stays cleanable, and
+			// a plain file named `.worktrees` is not silently preserved.
+			const result = await exec(["clean", "-fd", "-e", `/${WORKTREES_DIR_NAME}/`], worktreePath);
+			if (result.exitCode !== 0) throw new GitError(`git clean failed: ${result.stderr}`);
 		});
 	},
 

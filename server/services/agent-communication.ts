@@ -52,6 +52,12 @@ export interface SendSubagentInput extends ResolveTargetsInput {
 	toolUseId: string;
 	signal: AbortSignal;
 	locale: string;
+	/**
+	 * User who triggered the sending turn. Carried onto the delivered message so
+	 * the receiving subagent resolves knowledge ACL and fast-mode "inherit"
+	 * against a real user instead of anonymous/disabled.
+	 */
+	userId?: string | null;
 	/** Internal aggregate registry used to checkpoint an already-delivered Send await. */
 	replyRun?: AgentReplyWaitRunHandle;
 }
@@ -1090,6 +1096,7 @@ async function sendSubagentMessageDetailedWithRun(
 			if (fresh.status === "working" || fresh.status === "waiting") {
 				const buffered = pushSubagentBufferedMessage(fresh.id, deliveredMessage, {
 					position: input.doInterrupt ? "front" : "back",
+					createdBy: input.userId ?? null,
 				});
 				if (!buffered.ok) {
 					throw new Error(
@@ -1133,6 +1140,7 @@ async function sendSubagentMessageDetailedWithRun(
 				intent: "follow_up",
 				actor: "parent_agent",
 				prompt: deliveredMessage,
+				createdBy: input.userId ?? null,
 				signal: bgAbort.signal,
 				locale: input.locale as Locale,
 			});

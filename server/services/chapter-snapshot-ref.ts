@@ -12,7 +12,7 @@
  * recorded independently, so failing to extend it degrades fork precision but must
  * never break a tool call, a watcher tick, or a merge.
  */
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { chapters } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -65,13 +65,33 @@ export async function advanceChapterSnapshot(
  */
 async function pointChaptersAt(worktreePath: string, commitSha: string): Promise<void> {
 	try {
-		await db
+		// Matched against both the raw and the normalized spelling. `chapters.worktreePath`
+		// is stored as whoever created the chapter supplied it (the project's `gitPath` for
+		// a root chapter, a constructed `.worktrees/<name>` for a fork) and is never
+		// normalized on write, while `snapshotShadowKey` in the same `set` *is* normalized.
+		// Comparing on the raw value alone therefore matched zero rows whenever the caller's
+		// path differed only in case or a trailing separator — and the update then silently
+		// did nothing, leaving the chapter pointing at an older snapshot while the DAG had
+		// already moved on. A fork from that chapter starts from the stale state.
+		const normalized = snapshotWorkspaceKey(worktreePath);
+		const candidates = normalized === worktreePath ? [worktreePath] : [worktreePath, normalized];
+		const updated = await db
 			.update(chapters)
 			.set({
 				snapshotCommitSha: commitSha,
 				snapshotShadowKey: treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath),
 			})
-			.where(eq(chapters.worktreePath, worktreePath));
+			.where(inArray(chapters.worktreePath, candidates))
+			.returning({ id: chapters.id });
+		// Zero rows is legitimate for a standalone narrator with no chapter, but it is also
+		// exactly what the silent-mismatch bug above looked like. Logged so the two are
+		// distinguishable from the outside instead of both being invisible.
+		if (updated.length === 0) {
+			logger.debug("No chapter row owns this workspace; snapshot pointer not stored", {
+				worktreePath,
+				commitSha,
+			});
+		}
 	} catch (error) {
 		// The DAG itself is already advanced and durable; only the denormalized
 		// pointer is behind. Fork falls back to walking the narrator timeline, so this
@@ -148,7 +168,15 @@ export async function ensureChapterSnapshot(
 	return advanceChapterSnapshot(worktreePath, null, message);
 }
 
-/** Normalized form of a workspace path, for callers comparing against DB rows. */
+/**
+ * Normalized form of a workspace path, for comparing against DB rows.
+ *
+ * Kept exported despite having had no callers: it is now what {@link pointChaptersAt}
+ * uses, so the normalization rule this module applies to `chapters.worktreePath` has
+ * exactly one definition. A caller that needs to find the same rows — and there is no
+ * index on that column yet, so such a query should be rare — must use this rather than
+ * a second `normalizePathForComparison` call that could drift from it.
+ */
 export function snapshotWorkspaceKey(worktreePath: string): string {
 	return normalizePathForComparison(worktreePath);
 }

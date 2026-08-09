@@ -195,6 +195,24 @@ export const chapters = sqliteTable(
 		 * the latest state regardless of whether it is also committed.
 		 */
 		dormantSnapshotCommitSha: text("dormant_snapshot_commit_sha"),
+		/**
+		 * Uncommitted work parked so a rebase could run, awaiting reapplication.
+		 *
+		 * Rebase and cherry-pick genuinely require commits — they replay a commit
+		 * sequence — but git also refuses to start either one over a dirty workspace,
+		 * which is what made a chapter with uncommitted work unrebasable at all. The
+		 * work is moved into the DAG first and put back afterwards.
+		 *
+		 * Persisted rather than held in memory because a conflicted rebase deliberately
+		 * *stops* with the worktree mid-rebase, so the reapply happens in a later
+		 * request (resolve, or abort) that has no other way to learn where the work went.
+		 * Non-null therefore means "this chapter owes itself a reapply"; it is cleared at
+		 * every terminal outcome, since a stale value would later restore an old
+		 * workspace over current work.
+		 */
+		parkedSnapshotCommitSha: text("parked_snapshot_commit_sha"),
+		/** Base tree of {@link parkedSnapshotCommitSha}, i.e. the clean state git was handed. */
+		parkedSnapshotBaseTree: text("parked_snapshot_base_tree"),
 
 		// 图可视化
 		color: text("color"),
@@ -234,6 +252,15 @@ export const chapters = sqliteTable(
 		// Looked up on every shadow-repo destroy to decide whether a chapter still
 		// claims it; without an index that is a full table scan per orphan swept.
 		index("idx_chapters_snapshot_shadow_key").on(table.snapshotShadowKey),
+		/**
+		 * Matched on every snapshot-pointer advance, which is the hottest write in the
+		 * system: the workspace watcher polls each active chapter and a narrator's every
+		 * file-mutating tool call crosses two boundaries. `advanceChapterSnapshot` updates
+		 * by workspace path rather than by chapter id — a workspace can back several
+		 * narrators, so the position belongs to the path — and without this index each of
+		 * those updates scanned the whole table.
+		 */
+		index("idx_chapters_worktree_path").on(table.worktreePath),
 	],
 );
 
@@ -1083,7 +1110,16 @@ export const terminals = sqliteTable(
 	"terminals",
 	{
 		id: text("id").primaryKey(),
-		chapterId: text("chapter_id").references(() => chapters.id),
+		/**
+		 * Cascaded rather than left to explicit clean-up, because the default
+		 * (`NO ACTION`) actively *blocked* deleting a chapter: SQLite refuses the parent
+		 * row while any terminal still references it, so one missed clean-up step turned
+		 * into "FOREIGN KEY constraint failed" and the entire delete failed. A terminal is
+		 * a derived resource with no meaning once its chapter is gone, so cascading is
+		 * both correct and the safer default. `chapter-service` still deletes these rows
+		 * explicitly — that is now defence in depth rather than the only line.
+		 */
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
 		narratorId: text("narrator_id").references(() => narrators.id),
 		name: text("name").notNull(),
 		cwd: text("cwd"),
@@ -1113,7 +1149,8 @@ export const terminalTabs = sqliteTable(
 	"terminal_tabs",
 	{
 		id: text("id").primaryKey(),
-		chapterId: text("chapter_id").references(() => chapters.id),
+		/** Cascaded for the same reason as `terminals.chapterId`; see there. */
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
 		narratorId: text("narrator_id").references(() => narrators.id),
 		name: text("name").notNull(),
 		sortOrder: integer("sort_order").notNull().default(0),
@@ -1168,9 +1205,10 @@ export const containerInstances = sqliteTable(
 	"container_instances",
 	{
 		id: text("id").primaryKey(),
+		/** Cascaded for the same reason as `terminals.chapterId`; see there. */
 		chapterId: text("chapter_id")
 			.notNull()
-			.references(() => chapters.id),
+			.references(() => chapters.id, { onDelete: "cascade" }),
 		containerId: text("container_id"),
 		serviceName: text("service_name").notNull(),
 		status: text("status", {
@@ -1199,7 +1237,13 @@ export const portAllocations = sqliteTable(
 	"port_allocations",
 	{
 		port: integer("port").primaryKey(),
-		chapterId: text("chapter_id").references(() => chapters.id),
+		/**
+		 * Cascaded for the same reason as `terminals.chapterId`, and this table was the
+		 * most likely one to block a delete: a port stays allocated in proxy mode even
+		 * after the container is removed, so `removeChapterContainers` could return
+		 * successfully while leaving a row that then refused the chapter's deletion.
+		 */
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
 		serviceName: text("service_name"),
 		allocatedAt: text("allocated_at").notNull(),
 	},
@@ -1691,9 +1735,15 @@ export const mergeSessions = sqliteTable(
 	"merge_sessions",
 	{
 		id: text("id").primaryKey(),
+		/**
+		 * Cascaded for the same reason as `terminals.chapterId`. A merge session describes
+		 * work in progress against this target; once the target is gone the session can
+		 * never be resumed, and leaving the row behind both blocked the delete and left
+		 * the startup sweep trying to restore a worktree that no longer exists.
+		 */
 		targetChapterId: text("target_chapter_id")
 			.notNull()
-			.references(() => chapters.id),
+			.references(() => chapters.id, { onDelete: "cascade" }),
 		sourceChapterIds: text("source_chapter_ids", { mode: "json" }).notNull().$type<string[]>(),
 		strategy: text("strategy", { enum: ["merge", "squash", "cherry-pick"] })
 			.notNull()

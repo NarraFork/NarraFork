@@ -22,6 +22,7 @@ import {
 	IconDatabase,
 	IconGitBranch,
 	IconInfoCircle,
+	IconLock,
 	IconPhoto,
 	IconRefresh,
 	IconShare,
@@ -108,6 +109,7 @@ const CATEGORY_ICONS: Record<string, React.ReactNode> = {
 	shares: <IconShare size={18} />,
 	worktrees: <IconGitBranch size={18} />,
 	treeSnapshots: <IconCamera size={18} />,
+	dormantIgnored: <IconLock size={18} />,
 	containers: <IconBox size={18} />,
 };
 
@@ -117,6 +119,7 @@ const CATEGORY_COLORS: Record<string, string> = {
 	shares: "teal",
 	worktrees: "orange",
 	treeSnapshots: "violet",
+	dormantIgnored: "yellow",
 	containers: "cyan",
 };
 /**
@@ -130,6 +133,7 @@ const DISPLAYED_CATEGORY_KEYS = [
 	"shares",
 	"worktrees",
 	"treeSnapshots",
+	"dormantIgnored",
 	"containers",
 ] as const;
 
@@ -603,6 +607,17 @@ export function StorageSection() {
 				return t("storageWorktreeCount", { count: Number(d.worktreeCount ?? 0) });
 			case "treeSnapshots":
 				return t("storageTreeSnapshotRepoCount", { count: Number(d.repoCount ?? 0) });
+			case "dormantIgnored": {
+				const archives = t("storageIgnoredArchiveCount", {
+					count: Number(d.archiveCount ?? 0),
+				});
+				const orphans = Number(d.orphanCount ?? 0);
+				// Orphans are called out because they are the actionable part: an archive
+				// belonging to a live chapter is waiting to be restored, one whose chapter is
+				// gone is untracked secrets nothing will ever read.
+				if (orphans <= 0) return archives;
+				return `${archives} · ${t("storageIgnoredArchiveOrphans", { count: orphans })}`;
+			}
 			case "containers":
 				if (d.available === false) return t("storageContainersUnavailable");
 				return null;

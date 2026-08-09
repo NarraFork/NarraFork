@@ -1414,6 +1414,12 @@ export interface RunSubagentInput {
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	background?: boolean;
 	alias?: string;
+	/**
+	 * User who triggered the parent turn that spawned this subagent. Flows into
+	 * knowledge ACL and fast-mode ("inherit") resolution, which would otherwise
+	 * degrade to anonymous/disabled for every tool-spawned subagent.
+	 */
+	userId?: string | null;
 	/** Existing tool/coordinator lease; tool leases are transferred into the runner lifecycle. */
 	updateExecutionLease?: SubagentUpdateExecutionLease;
 }
@@ -1440,6 +1446,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		reasoningEffort,
 		background,
 		alias,
+		userId,
 		updateExecutionLease,
 	} = input;
 	const timeoutMs =
@@ -1654,6 +1661,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			locale,
 			signal: bgAbort.signal,
 			timeoutMs,
+			userId: userId ?? null,
 			systemPrompt,
 			initialHistory: [],
 			customDef,
@@ -1689,6 +1697,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		locale,
 		signal,
 		timeoutMs,
+		userId: userId ?? null,
 		systemPrompt,
 		initialHistory: [],
 		customDef,

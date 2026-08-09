@@ -49,7 +49,18 @@ export const chaptersApi = {
 		request<ApiEntity>(`/chapters/${id}/merge-check?targetChapterId=${targetChapterId}`),
 	mergeChapter: (
 		id: string,
-		data: { targetChapterId: string; strategy?: string; message?: string },
+		data: {
+			targetChapterId: string;
+			strategy?: string;
+			message?: string;
+			/**
+			 * Which space the merge happens in. Omitted means the server decides, which
+			 * prefers `snapshot`: the workspaces are merged as they stand and the user's
+			 * git history is untouched. `commit` asks for a real merge commit and brings
+			 * back the clean-worktree requirement (MERGE_DIRTY_SOURCE/TARGET).
+			 */
+			mode?: "snapshot" | "commit";
+		},
 	) =>
 		request<ApiEntity>(`/chapters/${id}/merge`, {
 			method: "POST",

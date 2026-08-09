@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	existsSync,
@@ -8,6 +9,7 @@ import {
 	readFileSync,
 	rmSync,
 	statSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,12 +18,14 @@ import { eq } from "drizzle-orm";
 import iconv from "iconv-lite";
 import { db } from "../db";
 import { worktreeTreeSnapshots } from "../db/schema";
+import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import {
 	planTreeRevertSegments,
 	TreeRestoreError,
 	TreeSnapshotError,
+	treeSnapshotKey,
 	worktreeTreeSnapshot,
 } from "./worktree-tree-snapshot";
 
@@ -825,5 +829,354 @@ describe("path-restricted reversal", () => {
 		]);
 		expect(outcome.changedFiles).toEqual([cjk]);
 		expect(readFileSync(join(repo, cjk), "utf8")).toBe("第一版\n");
+	});
+});
+
+/**
+ * The root chapter's workspace *is* the project's git root, and every other chapter's
+ * worktree lives under `<root>/.worktrees/`. So a capture of the root workspace walks
+ * into other chapters' live directories, and a rollback that predates one of them
+ * deletes it — uncommitted work included.
+ */
+describe("nested chapter worktrees", () => {
+	test("a child worktree never enters the parent's snapshot", async () => {
+		const { main } = await createLinkedWorktree("nf-tree-nested-capture-");
+		snapshotPaths.push(normalizePathForComparison(main));
+		writeFileSync(join(main, "root.txt"), "root\n");
+
+		const tree = await worktreeTreeSnapshot.capture(main);
+		const paths = await worktreeTreeSnapshot.listPaths(main, tree);
+
+		// The child enters as a `160000 commit` gitlink when not excluded, which is what
+		// makes the whole child directory a single deletable path in the tree.
+		expect(paths).toContain("root.txt");
+		expect(paths.some((path) => path.startsWith(".worktrees"))).toBe(false);
+	});
+
+	test("rolling the parent back to before a child existed leaves the child alone", async () => {
+		// Main repo first, captured before any child exists — the exact history that made
+		// the child's path absent from the rollback target.
+		const main = await createRepo("nf-tree-nested-revert-main-");
+		writeFileSync(join(main, "seed.txt"), "seed\n");
+		await safeSpawn({ cmd: ["git", "add", "-A"], cwd: main, timeout: 15_000 });
+		await safeSpawn({ cmd: ["git", "commit", "-m", "seed"], cwd: main, timeout: 15_000 });
+		const beforeChild = await worktreeTreeSnapshot.capture(main);
+
+		const child = join(main, ".worktrees", "chapter");
+		const added = await safeSpawn({
+			cmd: ["git", "worktree", "add", child, "-b", "chapter"],
+			cwd: main,
+			timeout: 15_000,
+		});
+		expect(added.exitCode).toBe(0);
+		// Uncommitted, so nothing but this module's snapshots could bring it back.
+		writeFileSync(join(child, "precious.txt"), "hours of unsaved work\n");
+		writeFileSync(join(main, "seed.txt"), "edited\n");
+
+		await worktreeTreeSnapshot.restore(main, beforeChild);
+
+		expect(readFileSync(join(main, "seed.txt"), "utf8")).toBe("seed\n");
+		expect(existsSync(child)).toBe(true);
+		expect(readFileSync(join(child, "precious.txt"), "utf8")).toBe("hours of unsaved work\n");
+	});
+
+	test("refuses to delete a nested repository recorded by an older snapshot", async () => {
+		const repo = await createRepo("nf-tree-nested-guard-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+		const before = await worktreeTreeSnapshot.capture(repo);
+
+		// A plain nested repository rather than a `.worktrees/` child, so the exclude rule
+		// does not cover it and the deletion guard is what is under test. It needs a commit
+		// to become a `160000` gitlink — an uncommitted nested repo is refused by `add`
+		// instead and never enters the tree at all.
+		const nested = join(repo, "vendor", "lib");
+		mkdirSync(nested, { recursive: true });
+		await safeSpawn({ cmd: ["git", "init"], cwd: nested, timeout: 15_000 });
+		await safeSpawn({ cmd: ["git", "config", "user.email", "t@example.com"], cwd: nested });
+		await safeSpawn({ cmd: ["git", "config", "user.name", "T"], cwd: nested });
+		writeFileSync(join(nested, "committed.txt"), "vendored\n");
+		await safeSpawn({ cmd: ["git", "add", "-A"], cwd: nested, timeout: 15_000 });
+		await safeSpawn({ cmd: ["git", "commit", "-m", "vendor"], cwd: nested, timeout: 15_000 });
+		writeFileSync(join(nested, "unsaved.txt"), "someone else's work\n");
+
+		const withNested = await worktreeTreeSnapshot.capture(repo);
+		// The gitlink makes the entire nested directory one path in the tree, and it is
+		// absent from `before` — so the delete loop is handed the whole repository.
+		expect(await worktreeTreeSnapshot.diffPaths(repo, before, withNested)).toContain("vendor/lib");
+
+		await worktreeTreeSnapshot.restore(repo, before).catch(() => {});
+		expect(readFileSync(join(nested, "unsaved.txt"), "utf8")).toBe("someone else's work\n");
+		expect(readFileSync(join(nested, "committed.txt"), "utf8")).toBe("vendored\n");
+	});
+});
+
+/**
+ * The module's central promise is that a snapshot is the bytes on disk. git's line
+ * ending translation breaks it in the worst possible way: the restored file has
+ * different bytes, but re-hashing yields the *same* tree, so the engine's own
+ * consistency check reports a perfect restore.
+ */
+describe("byte exactness against git content filters", () => {
+	test("a CRLF file round-trips exactly under '* text=auto'", async () => {
+		const repo = await createRepo("nf-tree-crlf-");
+		// The user's own `.gitattributes` applies to shadow-repo commands, because they
+		// run with `--work-tree` pointed at this directory.
+		writeFileSync(join(repo, ".gitattributes"), "* text=auto\n");
+		const crlf = Buffer.from("first\r\nsecond\r\n", "binary");
+		const lf = Buffer.from("first\nsecond\n", "binary");
+		writeFileSync(join(repo, "crlf.txt"), crlf);
+		writeFileSync(join(repo, "lf.txt"), lf);
+
+		const before = await worktreeTreeSnapshot.capture(repo);
+		writeFileSync(join(repo, "crlf.txt"), Buffer.from("changed\r\n", "binary"));
+		writeFileSync(join(repo, "lf.txt"), Buffer.from("changed\n", "binary"));
+		await worktreeTreeSnapshot.capture(repo);
+		await worktreeTreeSnapshot.restore(repo, before);
+
+		// Compared as bytes, deliberately. A text comparison passes even when every line
+		// ending was rewritten, which is the whole failure mode.
+		expect(readFileSync(join(repo, "crlf.txt")).equals(crlf)).toBe(true);
+		expect(readFileSync(join(repo, "lf.txt")).equals(lf)).toBe(true);
+	});
+
+	test("the ident attribute cannot rewrite a restored file's contents", async () => {
+		const repo = await createRepo("nf-tree-ident-");
+		// `ident` needs no config to take effect, which makes it the cheapest proof that
+		// the worktree's own `.gitattributes` is being overridden rather than obeyed. A
+		// `filter=` attribute is the same mechanism with a config dependency attached.
+		writeFileSync(join(repo, ".gitattributes"), "* ident\n");
+		writeFileSync(join(repo, "f.txt"), "ver: $Id$\n");
+
+		const before = await worktreeTreeSnapshot.capture(repo);
+		writeFileSync(join(repo, "f.txt"), "overwritten\n");
+		await worktreeTreeSnapshot.capture(repo);
+		await worktreeTreeSnapshot.restore(repo, before);
+
+		// Without the override the restored file reads `$Id: <sha> $` — content the user
+		// never wrote, produced by a rollback that reported success.
+		expect(readFileSync(join(repo, "f.txt"), "utf8")).toBe("ver: $Id$\n");
+	});
+
+	test("a working-tree-encoding attribute does not fail the capture", async () => {
+		const repo = await createRepo("nf-tree-wt-encoding-");
+		// The dangerous shape is a file git cannot transcode: `add -A` then exits 128 and
+		// the capture fails outright, so the attribute did not corrupt snapshots — it made
+		// them impossible for the whole workspace, silently, via `tryCapture`'s null.
+		// A UTF-8 BOM under a UTF-16LE declaration is exactly that case.
+		writeFileSync(join(repo, ".gitattributes"), "*.txt working-tree-encoding=UTF-16LE\n");
+		const bom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("hello\n")]);
+		writeFileSync(join(repo, "bom.txt"), bom);
+
+		const before = await worktreeTreeSnapshot.capture(repo);
+		expect(await worktreeTreeSnapshot.listPaths(repo, before)).toContain("bom.txt");
+
+		writeFileSync(join(repo, "bom.txt"), Buffer.from("replaced\n"));
+		await worktreeTreeSnapshot.capture(repo);
+		await worktreeTreeSnapshot.restore(repo, before);
+		expect(readFileSync(join(repo, "bom.txt")).equals(bom)).toBe(true);
+	});
+});
+
+/**
+ * A file the real repository tracks despite an ignore rule (`git add -f .env`) was
+ * absent from every snapshot. Both boundary hashes then came out identical, the revert
+ * planner read that as "this call changed nothing", and the modification was lost with
+ * no warning anywhere.
+ */
+describe("tracked-but-ignored files", () => {
+	/** Track a file the ignore rules cover — the shape `git add -f` produces. */
+	async function forceTrack(repo: string, relPath: string): Promise<void> {
+		const added = await safeSpawn({
+			cmd: ["git", "add", "-f", relPath],
+			cwd: repo,
+			timeout: 15_000,
+		});
+		if (added.exitCode !== 0) throw new Error(`git add -f failed: ${added.stderr}`);
+		await safeSpawn({ cmd: ["git", "commit", "-m", "track"], cwd: repo, timeout: 15_000 });
+	}
+
+	test("captures a file git tracks despite an ignore rule", async () => {
+		const repo = await createRepo("nf-tree-tracked-ignored-");
+		writeFileSync(join(repo, ".gitignore"), ".env\nbuild/\n");
+		writeFileSync(join(repo, ".env"), "SECRET=1\n");
+		mkdirSync(join(repo, "build"), { recursive: true });
+		writeFileSync(join(repo, "build", "out.o"), "artifact\n");
+		await forceTrack(repo, ".env");
+
+		const tree = await worktreeTreeSnapshot.capture(repo);
+		const paths = await worktreeTreeSnapshot.listPaths(repo, tree);
+		expect(paths).toContain(".env");
+		// The rest of the ignore rules must still hold, or this fix would be the older
+		// bug where build output entered snapshots and rollbacks deleted ignored files.
+		expect(paths.some((path) => path.startsWith("build/"))).toBe(false);
+	});
+
+	test("a change to a tracked-but-ignored file moves the boundary and reverts", async () => {
+		const repo = await createRepo("nf-tree-tracked-ignored-revert-");
+		writeFileSync(join(repo, ".gitignore"), ".env\n");
+		writeFileSync(join(repo, ".env"), "SECRET=original\n");
+		await forceTrack(repo, ".env");
+
+		const before = await worktreeTreeSnapshot.capture(repo);
+		writeFileSync(join(repo, ".env"), "SECRET=overwritten\n");
+		const after = await worktreeTreeSnapshot.capture(repo);
+		// The precise failure: identical hashes made `planTreeRevertSegments` drop the
+		// segment as a no-op, so the rollback silently skipped it.
+		expect(after).not.toBe(before);
+
+		const outcome = await worktreeTreeSnapshot.reverseAndRestore(repo, [
+			{ before, after, ownedPaths: [".env"] },
+		]);
+		expect(outcome.conflicts).toEqual([]);
+		expect(readFileSync(join(repo, ".env"), "utf8")).toBe("SECRET=original\n");
+	});
+
+	test("a file force-tracked after the first capture is still picked up", async () => {
+		const repo = await createRepo("nf-tree-tracked-ignored-cache-");
+		writeFileSync(join(repo, ".gitignore"), ".env\n");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+		await safeSpawn({ cmd: ["git", "add", "-A"], cwd: repo, timeout: 15_000 });
+		await safeSpawn({ cmd: ["git", "commit", "-m", "seed"], cwd: repo, timeout: 15_000 });
+		// First capture memoizes "no tracked-but-ignored paths" — the state the cache has
+		// to be able to leave behind when the user changes their mind.
+		await worktreeTreeSnapshot.capture(repo);
+
+		writeFileSync(join(repo, ".env"), "SECRET=late\n");
+		await forceTrack(repo, ".env");
+
+		// `git add -f` rewrites the real index, which is what the cache keys on, so the
+		// memo must invalidate rather than pin the earlier empty answer forever.
+		const tree = await worktreeTreeSnapshot.capture(repo);
+		expect(await worktreeTreeSnapshot.listPaths(repo, tree)).toContain(".env");
+	});
+
+	test("a restore does not make the next capture drop the force-added path", async () => {
+		// The cache's other invalidation event, and the one it originally missed. The memo
+		// records "the force-add has already introduced this entry", but the entry lives in
+		// the *shadow* index and `read-tree` evicts it — while leaving the real index, which
+		// the cache keys on, untouched. So the key still matched, the query short-circuited
+		// to `[]`, and the plain `add -A` silently dropped `.env` again.
+		//
+		// The consequence is worse than a missing path: the post-restore capture comes back
+		// *equal to the pre-`add -f` tree*, so the boundary pair reads as "nothing changed"
+		// and the revert planner skips the segment. The edit is unrevertable with no warning
+		// anywhere, which is why this asserts on the tree hashes and not only on the listing.
+		const repo = await createRepo("nf-tree-tracked-ignored-readtree-");
+		writeFileSync(join(repo, ".gitignore"), ".env\n");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+		await safeSpawn({ cmd: ["git", "add", "-A"], cwd: repo, timeout: 15_000 });
+		await safeSpawn({ cmd: ["git", "commit", "-m", "seed"], cwd: repo, timeout: 15_000 });
+		// Memoizes "no tracked-but-ignored paths" for the pre-`add -f` index.
+		const withoutEnv = await worktreeTreeSnapshot.capture(repo);
+
+		writeFileSync(join(repo, ".env"), "SECRET=1\n");
+		await forceTrack(repo, ".env");
+		const withEnv = await worktreeTreeSnapshot.capture(repo);
+		expect(await worktreeTreeSnapshot.listPaths(repo, withEnv)).toContain(".env");
+
+		// `read-tree` of a tree that predates `.env` is what evicts the shadow index entry.
+		await worktreeTreeSnapshot.restore(repo, withoutEnv);
+		writeFileSync(join(repo, ".env"), "SECRET=after-restore\n");
+		const afterRestore = await worktreeTreeSnapshot.capture(repo);
+
+		expect(await worktreeTreeSnapshot.listPaths(repo, afterRestore)).toContain(".env");
+		// The silent-loss shape: identical to the tree captured before `.env` was ever
+		// tracked, so no boundary distinguishes the edit.
+		expect(afterRestore).not.toBe(withoutEnv);
+		expect(await worktreeTreeSnapshot.readFileAtTree(repo, afterRestore, ".env")).toBe(
+			"SECRET=after-restore\n",
+		);
+	});
+
+	test("deleting a tracked-but-ignored file is recorded", async () => {
+		const repo = await createRepo("nf-tree-tracked-ignored-delete-");
+		writeFileSync(join(repo, ".gitignore"), ".env\n");
+		writeFileSync(join(repo, ".env"), "SECRET=1\n");
+		await forceTrack(repo, ".env");
+
+		const before = await worktreeTreeSnapshot.capture(repo);
+		rmSync(join(repo, ".env"));
+		const after = await worktreeTreeSnapshot.capture(repo);
+		// The force-add only introduces the index entry; once present, a plain `add -A`
+		// records its removal, which is why no extra handling is needed for deletions.
+		expect(await worktreeTreeSnapshot.listPaths(repo, after)).not.toContain(".env");
+
+		await worktreeTreeSnapshot.restore(repo, before);
+		expect(readFileSync(join(repo, ".env"), "utf8")).toBe("SECRET=1\n");
+	});
+});
+
+/**
+ * git only removes its own `index.lock` for signals it can handle. After a `SIGKILL`
+ * or an OOM kill the lock survives, every later `add -A` in that shadow repo exits
+ * 128, and `tryCapture` swallows it into null — so the workspace silently and
+ * permanently loses precise reverts.
+ */
+describe("stale index.lock recovery", () => {
+	/**
+	 * The shadow repo directory for a workspace, derived the same way the module does.
+	 *
+	 * `getNarraforkPath` rather than a hardcoded `~/.narrafork`, because the test preload
+	 * redirects `NARRAFORK_HOME` to an isolated directory.
+	 */
+	function shadowDirFor(worktreePath: string): string {
+		const digest = createHash("sha256")
+			.update(treeSnapshotKey("local", worktreePath))
+			.digest("hex");
+		return getNarraforkPath("tree-snapshots", digest.slice(0, 32));
+	}
+
+	test("reclaims a lock left behind by a killed git process", async () => {
+		const repo = await createRepo("nf-tree-stale-lock-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+		await worktreeTreeSnapshot.capture(repo);
+
+		// Backdated past the reclaim threshold: age is what distinguishes an abandoned
+		// lock from one a live git is legitimately still holding.
+		const lockPath = join(shadowDirFor(repo), "index.lock");
+		writeFileSync(lockPath, "");
+		const longAgo = new Date(Date.now() - 10 * 60_000);
+		utimesSync(lockPath, longAgo, longAgo);
+
+		writeFileSync(join(repo, "a.txt"), "two\n");
+		const recovered = await worktreeTreeSnapshot.capture(repo);
+		expect(recovered).toMatch(/^[0-9a-f]{40}$/);
+		expect(existsSync(lockPath)).toBe(false);
+	});
+
+	test("leaves a fresh lock alone, so a live git is never corrupted", async () => {
+		const repo = await createRepo("nf-tree-fresh-lock-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+		await worktreeTreeSnapshot.capture(repo);
+
+		const lockPath = join(shadowDirFor(repo), "index.lock");
+		writeFileSync(lockPath, "");
+		try {
+			writeFileSync(join(repo, "a.txt"), "two\n");
+			// Failing is the correct outcome here: the boundary is recorded as absent and
+			// the next capture retries, whereas deleting a live lock destroys an index write.
+			expect(await worktreeTreeSnapshot.tryCapture(repo)).toBeNull();
+			expect(existsSync(lockPath)).toBe(true);
+		} finally {
+			rmSync(lockPath, { force: true });
+		}
+	});
+});
+
+/** One unreadable file used to cost the entire workspace its snapshots. */
+describe("unreadable files", () => {
+	test("captures everything else when one file cannot be read", async () => {
+		const repo = await createRepo("nf-tree-unreadable-");
+		writeFileSync(join(repo, "readable.txt"), "kept\n");
+		writeFileSync(join(repo, "locked.txt"), "unreadable\n");
+		chmodSync(join(repo, "locked.txt"), 0o000);
+		try {
+			// A plain `add -A` exits 128 and stages *nothing* here, so the whole repository
+			// became unrevertable because of one file.
+			const tree = await worktreeTreeSnapshot.capture(repo);
+			expect(await worktreeTreeSnapshot.listPaths(repo, tree)).toContain("readable.txt");
+		} finally {
+			chmodSync(join(repo, "locked.txt"), 0o600);
+		}
 	});
 });

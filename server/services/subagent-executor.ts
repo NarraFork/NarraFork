@@ -11,7 +11,7 @@ import {
 } from "../lib/agent";
 import { normalizeBooleanOverride } from "../lib/boolean-override";
 import { eventBus } from "../lib/event-bus";
-import { resolveFastModeForUser } from "../lib/fast-mode";
+import { resolveFastModeForUser, resolveSubagentActingUserId } from "../lib/fast-mode";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
@@ -53,6 +53,7 @@ import {
 	toBufferSummary,
 } from "./narrator-session";
 import {
+	activeNarrators,
 	activeSubagentSettings,
 	registerActiveSubagent,
 	unregisterActiveSubagent,
@@ -705,7 +706,16 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		const resolvedProvider = resolveProvider(model);
 		// "inherit" resolves against the acting user's fastModeDefault on every loop,
 		// so changing that preference affects running sessions from the next turn.
-		const resolvedFastMode = await resolveFastModeForUser(narratorFastModeOverride, currentUserId);
+		// A subagent has no user of its own: recovery/detached paths may start it
+		// without one, so fall back to the parent session's triggering user rather
+		// than silently degrading "inherit" to disabled.
+		const resolvedFastMode = await resolveFastModeForUser(
+			narratorFastModeOverride,
+			resolveSubagentActingUserId(
+				currentUserId,
+				activeNarrators.get(parentNarratorId)?._currentUserId,
+			),
+		);
 		const resolvedServiceTier =
 			resolvedFastMode && usesCodexModel(resolvedProvider, model) ? "priority" : undefined;
 		let todoReminderCompletedToolCount = 0;
