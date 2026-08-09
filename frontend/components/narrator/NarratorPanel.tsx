@@ -7030,10 +7030,11 @@ export function NarratorPanel({
 
 									if (def.id === "plugins") {
 										return (
-											<PluginContributionPicker
-												key={def.id}
-												onPick={openPluginPanel}
-												trigger={
+																				<PluginContributionPicker
+																					key={def.id}
+																					onPick={openPluginPanel}
+																					surface="focus"
+																					trigger={
 													<Tooltip label={label}>
 														<ActionIcon size="sm" variant="subtle" color="gray" aria-label={label}>
 															<Icon size={16} />
@@ -7083,7 +7084,7 @@ export function NarratorPanel({
 										</Tooltip>
 									);
 								})}
-								{/* TEMPORARY mock-stream harness entry — see ./mock/README-REMOVAL.md.
+							{/* TEMPORARY mock-stream harness entry — see ./mock/README-REMOVAL.md.
 								    Deliberately NOT in the registry: it is debug-only and due for
 								    removal, so it must not occupy a persisted layout id. */}
 								{dock && mockStreamEnabled && (

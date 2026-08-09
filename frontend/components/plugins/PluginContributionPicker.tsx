@@ -28,7 +28,7 @@ import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { usePluginContributions } from "../../hooks/usePluginContributions";
 import type { PluginContributionRecord } from "./PluginContributionStore";
-import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
+import type { PluginUiHostSurface, PluginUiSessionContext } from "./PluginUiSurfaceContext";
 
 export interface PluginContributionPick {
 	pluginId: string;
@@ -46,11 +46,32 @@ export interface PluginContributionPickerProps {
 	trigger?: React.ReactElement;
 	disabled?: boolean;
 	tooltip?: string;
+	/**
+	 * Host surface the picker is mounted on. Views whose declared surfaces do
+	 * not include it, or whose scope cannot be satisfied there (e.g. a
+	 * workspace-scoped view on the focus surface has no workspace id), are
+	 * hidden — otherwise picking them creates a panel whose session can only
+	 * fail with "…scope requires a live … id".
+	 */
+	surface?: PluginUiHostSurface;
 }
 
 function isPackageHash(value: string | undefined): value is string {
 	return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
+
+/**
+ * Scope ids a surface can actually provide: the session context built for that
+ * surface has exactly these ids (focus → narratorId; workspace/director →
+ * workspaceId; settings/provider-settings → neither).
+ */
+const SURFACE_ALLOWED_SCOPES: Record<PluginUiHostSurface, ReadonlySet<string>> = {
+	focus: new Set(["global", "narrator"]),
+	workspace: new Set(["global", "workspace"]),
+	director: new Set(["global", "workspace"]),
+	settings: new Set(["global"]),
+	"provider-settings": new Set(["global"]),
+};
 
 function statusColor(availability: PluginContributionRecord["availability"]): string {
 	switch (availability) {
@@ -72,18 +93,24 @@ export function PluginContributionPicker({
 	trigger,
 	disabled,
 	tooltip,
+	surface,
 }: PluginContributionPickerProps) {
 	const { t } = useTranslation("plugins");
 	const { contributions, synced, isFetching, invalidate } = usePluginContributions();
 
-	const records = useMemo(
-		() =>
-			Object.values(contributions).sort((a, b) => {
+	const records = useMemo(() => {
+		const allowedScopes = surface ? SURFACE_ALLOWED_SCOPES[surface] : undefined;
+		return Object.values(contributions)
+			.filter((record) => {
+				if (!surface) return true;
+				if (record.surfaces && !record.surfaces.includes(surface)) return false;
+				return allowedScopes?.has(record.scope ?? "global") ?? true;
+			})
+			.sort((a, b) => {
 				const pluginCmp = (a.pluginName ?? a.pluginId).localeCompare(b.pluginName ?? b.pluginId);
 				return pluginCmp !== 0 ? pluginCmp : a.title.localeCompare(b.title);
-			}),
-		[contributions],
-	);
+			});
+	}, [contributions, surface]);
 	const availableCount = records.filter(
 		(record) => record.availability === "available" && isPackageHash(record.hash),
 	).length;
