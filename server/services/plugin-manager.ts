@@ -1647,6 +1647,24 @@ export class PluginManager {
 		});
 	}
 
+	/**
+	 * Locate the Bun executable used to spawn `local-process` plugins whose
+	 * runtime is `bun`.
+	 *
+	 * In development the host itself runs under Bun, so `process.execPath` is
+	 * correct. A compiled single-file Windows executable, however, embeds the
+	 * host entrypoint — `process.execPath` points at the host binary, which does
+	 * NOT accept a script argument (it ignores it and boots the app again,
+	 * colliding with the instance lock and exiting 1). Resolve a real `bun`
+	 * from PATH instead, falling back to `process.execPath` only when Bun's
+	 * resolver finds nothing (pure dev mode).
+	 */
+	private resolveBunExecutable(): string {
+		const fromPath = typeof Bun !== "undefined" ? Bun.which("bun") : undefined;
+		if (fromPath) return fromPath;
+		return process.execPath;
+	}
+
 	private async defaultRuntimeOptions(
 		context: PluginRuntimeBuildContext,
 	): Promise<PluginRuntimeOptions> {
@@ -1701,7 +1719,7 @@ export class PluginManager {
 			});
 			switch (context.manifest.engine.runtime) {
 				case "bun":
-					command = [process.execPath, entryPath, ...server.args];
+					command = [this.resolveBunExecutable(), entryPath, ...server.args];
 					break;
 				case "node":
 					command = ["node", entryPath, ...server.args];
