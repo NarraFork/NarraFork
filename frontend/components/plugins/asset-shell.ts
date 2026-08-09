@@ -39,6 +39,74 @@ function escapeAttribute(value: string): string {
 	return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;");
 }
 
+/**
+ * Mantine tokens mirrored from the host document into the sandboxed iframe so
+ * plugin UIs can style themselves with the exact same design system (colors,
+ * radius, fonts, spacing) as the host — including light/dark scheme switches,
+ * because the srcdoc is rebuilt on theme change. Iframe documents do not
+ * inherit host CSS variables, so the shell copies the resolved values.
+ */
+const MANTINE_TOKEN_NAMES = [
+	"--mantine-color-body",
+	"--mantine-color-text",
+	"--mantine-color-dimmed",
+	"--mantine-color-default",
+	"--mantine-color-default-border",
+	"--mantine-color-default-hover",
+	"--mantine-color-black",
+	"--mantine-color-white",
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-gray-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-dark-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-blue-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-indigo-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-yellow-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-green-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-red-${i}`),
+	"--mantine-primary-color-0",
+	"--mantine-primary-color-1",
+	"--mantine-primary-color-2",
+	"--mantine-primary-color-3",
+	"--mantine-primary-color-4",
+	"--mantine-primary-color-5",
+	"--mantine-primary-color-6",
+	"--mantine-primary-color-7",
+	"--mantine-primary-color-8",
+	"--mantine-primary-color-9",
+	"--mantine-primary-color-filled",
+	"--mantine-primary-color-filled-hover",
+	"--mantine-primary-color-light",
+	"--mantine-primary-color-light-hover",
+	"--mantine-primary-color-contrast",
+	"--mantine-radius-xs",
+	"--mantine-radius-sm",
+	"--mantine-radius-md",
+	"--mantine-radius-lg",
+	"--mantine-spacing-xs",
+	"--mantine-spacing-sm",
+	"--mantine-spacing-md",
+	"--mantine-spacing-lg",
+	"--mantine-font-family",
+	"--mantine-font-family-monospace",
+	"--mantine-heading-font-family",
+	"--mantine-font-size-xs",
+	"--mantine-font-size-sm",
+	"--mantine-font-size-md",
+	"--mantine-font-size-lg",
+	"--mantine-line-height",
+];
+
+/** Read the host's live Mantine tokens. Safe to call during render (document is mounted). */
+export function readHostMantineTokens(): string {
+	if (typeof document === "undefined") return "";
+	const style = getComputedStyle(document.documentElement);
+	const parts: string[] = [];
+	for (const name of MANTINE_TOKEN_NAMES) {
+		const value = style.getPropertyValue(name).trim();
+		if (value) parts.push(`${name}:${value};`);
+	}
+	return parts.join("");
+}
+
 function escapeScriptJson(value: unknown): string {
 	return JSON.stringify(value).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e");
 }
@@ -299,7 +367,7 @@ export function createPluginAssetShell(options: PluginAssetShellOptions): string
 		"manifest-src 'none'",
 		"media-src 'none'",
 	].join("; ");
-	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"></head><body><script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
+	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"><style>:root{${readHostMantineTokens()}}</style></head><body><script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
 }
 
 export function createPluginNonce(): string {

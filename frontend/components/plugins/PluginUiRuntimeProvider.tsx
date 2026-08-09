@@ -738,7 +738,11 @@ export function PluginUiLayer() {
 							top: slot.rect.top,
 							width: slot.rect.width,
 							height: slot.rect.height,
-							pointerEvents: slot.active ? "auto" : "none",
+							// The iframe must stay clickable even when the dock reports the
+							// panel as inactive: a restored panel starts inactive, and
+							// pointer-events:none would swallow the very click that should
+							// activate it (the focus handler lives on the iframe itself) —
+							// a deadlock until the user manually refreshes the panel.
 							overflow: "hidden",
 						}}
 					>
@@ -756,7 +760,7 @@ export function PluginUiLayer() {
 								height: "100%",
 								border: 0,
 								display: "block",
-								pointerEvents: slot.active ? "auto" : "none",
+								pointerEvents: "auto",
 							}}
 						/>
 					</Box>
