@@ -358,16 +358,41 @@ export function diffCacheStats(): { entries: number; rows: number } {
 }
 
 /**
+ * Default floor for one line-number column.
+ *
+ * It exists only so a diff whose numbers are all single-digit does not get a
+ * ragged one-char column; it is NOT a readability requirement, so it is kept as
+ * tight as alignment allows. Anything larger just pads blanks between the two
+ * columns on small files.
+ *
+ * Changing it does not desynchronize the measure layer: `tool-detail.ts` computes
+ * the width ONCE and stores it on the detail, and both the measure layer
+ * (`diffGutterWidthChars`) and the renderer (`RenderToolCall`'s `lineNoWidth`)
+ * read back that same stored number rather than recomputing it.
+ */
+export const DIFF_LINE_NO_MIN_WIDTH = 2;
+
+/**
  * Width (in characters) of ONE line-number column, so both columns align and the
  * gutter has a fixed width. Mirrors the chunked DiffView's own calculation.
+ *
+ * @param minWidth Floor for the column. Defaults to `DIFF_LINE_NO_MIN_WIDTH`
+ *   because the measure layer depends on that number. A caller that owns its own
+ *   layout (the git panel, which is not measured) may pass a smaller floor so
+ *   two-digit line numbers stop reserving a third padding column — on a phone that
+ *   padding costs real horizontal room before the code even starts.
  */
-export function diffLineNoWidth(lines: readonly DiffLine[], lineNumberPrefix?: string): number {
+export function diffLineNoWidth(
+	lines: readonly DiffLine[],
+	lineNumberPrefix?: string,
+	minWidth: number = DIFF_LINE_NO_MIN_WIDTH,
+): number {
 	let maxNo = 1;
 	for (const line of lines) {
 		if (line.oldLineNo != null && line.oldLineNo > maxNo) maxNo = line.oldLineNo;
 		if (line.newLineNo != null && line.newLineNo > maxNo) maxNo = line.newLineNo;
 	}
-	return Math.max(2, `${lineNumberPrefix ?? ""}${maxNo}`.length);
+	return Math.max(minWidth, `${lineNumberPrefix ?? ""}${maxNo}`.length);
 }
 
 /** One right-aligned line-number cell, or blanks when the side has no number. */
@@ -400,6 +425,12 @@ export function formatDiffGutter(line: DiffLine, width: number, lineNumberPrefix
  * Rebuild plausible source text from the diff rows for syntax highlighting, or
  * null when it would exceed the highlight budget. Both renderers highlight the
  * row CONTENT (markers and gutters excluded) so the grammar sees real code.
+ *
+ * INTERLEAVED, so it is only correct for a single-sided diff. A TextMate grammar
+ * is a line-by-line state machine: concatenating removed and added rows lets a
+ * multi-line construct from one side leak into the other. Prefer
+ * `buildDiffHighlightPlan`, which splits the sides; this remains for callers that
+ * genuinely want one flat string.
  */
 export function buildDiffHighlightSource(lines: readonly DiffLine[]): string | null {
 	let totalLength = 0;
@@ -411,4 +442,106 @@ export function buildDiffHighlightSource(lines: readonly DiffLine[]): string | n
 		totalLength = nextLength;
 	}
 	return sourceLines.join("\n");
+}
+
+/** Where one diff row's tokens live: which source, and which line inside it. */
+export interface DiffHighlightRowRef {
+	/** Index into `DiffHighlightPlan.sources`. */
+	source: number;
+	/** 0-based line index within that source. */
+	line: number;
+}
+
+/**
+ * Sources to tokenize, plus the row → (source, line) lookup.
+ *
+ * `sources` holds ONE entry when the diff touches only one side (every row then
+ * belongs to the same reconstruction), and TWO when it mixes removals and
+ * additions: `[oldSide, newSide]`.
+ */
+export interface DiffHighlightPlan {
+	sources: string[];
+	rows: DiffHighlightRowRef[];
+}
+
+/**
+ * Plan syntax highlighting so each row is tokenized in the file it belongs to.
+ *
+ * WHY NOT ONE STRING
+ *
+ * A TextMate grammar carries state across lines (open block comment, unterminated
+ * template literal, heredoc). `buildDiffHighlightSource` concatenates context,
+ * removed and added rows into one document, so a construct opened on a REMOVED
+ * line stays open over the rows that follow it — including unchanged context. A
+ * diff that replaces `/* legacy note` with `// short note` therefore paints the
+ * untouched `const value = 1;` below it entirely comment-grey, because the old
+ * side's block comment is still open in the merged text.
+ *
+ * Reconstructing the two sides separately removes the interference: removed rows
+ * are tokenized inside the OLD file, context and added rows inside the NEW file.
+ * Context rows read the new side because that is the state the file is left in —
+ * the same side GitHub's unified view highlights.
+ *
+ * COST
+ *
+ * Two sources mean two tokenizer passes, so the split is only made when the diff
+ * actually mixes removals and additions — which is exactly when the interference
+ * is possible. A pure addition, a pure deletion, or an unchanged region yields a
+ * single source and the same work as before.
+ *
+ * The budget is checked against the SUM of what will be tokenized, so this can
+ * never ask the highlighter to do more total work than `MAX_DIFF_HIGHLIGHT_CHARS`.
+ */
+export function buildDiffHighlightPlan(lines: readonly DiffLine[]): DiffHighlightPlan | null {
+	let hasRemoved = false;
+	let hasAdded = false;
+	for (const line of lines) {
+		if (line.type === "removed") hasRemoved = true;
+		else if (line.type === "added") hasAdded = true;
+		if (hasRemoved && hasAdded) break;
+	}
+
+	// Only one side is present, so the merged text IS that side: no interference to
+	// remove, and no reason to pay for a second pass.
+	if (!hasRemoved || !hasAdded) {
+		const source = buildDiffHighlightSource(lines);
+		if (source == null) return null;
+		return {
+			sources: [source],
+			rows: lines.map((_, index) => ({ source: 0, line: index })),
+		};
+	}
+
+	const oldLines: string[] = [];
+	const newLines: string[] = [];
+	const rows: DiffHighlightRowRef[] = [];
+	let totalLength = 0;
+
+	/** Append to one side, charging the shared budget. Returns false when over. */
+	const take = (side: string[], content: string): boolean => {
+		totalLength += (side.length > 0 ? 1 : 0) + content.length;
+		if (totalLength > MAX_DIFF_HIGHLIGHT_CHARS) return false;
+		side.push(content);
+		return true;
+	};
+
+	for (const line of lines) {
+		if (line.type === "removed") {
+			if (!take(oldLines, line.content)) return null;
+			rows.push({ source: 0, line: oldLines.length - 1 });
+			continue;
+		}
+		if (line.type === "added") {
+			if (!take(newLines, line.content)) return null;
+			rows.push({ source: 1, line: newLines.length - 1 });
+			continue;
+		}
+		// Context belongs to both files and must occupy a line in each, or the
+		// following rows' indexes would drift out of step with their source.
+		if (!take(oldLines, line.content)) return null;
+		if (!take(newLines, line.content)) return null;
+		rows.push({ source: 1, line: newLines.length - 1 });
+	}
+
+	return { sources: [oldLines.join("\n"), newLines.join("\n")], rows };
 }

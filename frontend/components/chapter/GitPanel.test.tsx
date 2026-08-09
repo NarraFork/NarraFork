@@ -150,6 +150,33 @@ function makeStatus(): GitStatusSummary {
 	};
 }
 
+/** Deeply nested single-child chains, the case that would eat a narrow panel's width. */
+function makeDeepStatus(): GitStatusSummary {
+	return {
+		hasChanges: true,
+		staged: 0,
+		unstaged: 1,
+		untracked: 0,
+		files: [
+			{
+				status: " M",
+				path: "frontend/components/chapter/deep/nested/leaf.ts",
+				linesAdded: 1,
+				linesRemoved: 0,
+				stagedLinesAdded: 0,
+				stagedLinesRemoved: 0,
+				unstagedLinesAdded: 1,
+				unstagedLinesRemoved: 0,
+			},
+		],
+		totalFiles: 1,
+		headSha: "abc1234",
+		branch: "main",
+		linesAdded: 1,
+		linesRemoved: 0,
+	};
+}
+
 function stubInteractiveGitApi(calls: Array<{ name: string; body?: unknown }>) {
 	const original = {
 		getGitStatus: api.getGitStatus,
@@ -184,6 +211,21 @@ function buttonByLabel(container: HTMLElement, label: string): HTMLButtonElement
 		throw new Error(`Button not found: ${label}`);
 	}
 	return button;
+}
+
+/** Tree rows are role="button" divs so their own action icons can stay nested. */
+function rowByLabel(container: HTMLElement, label: string): HTMLElement {
+	const row = container.querySelector(`[role="button"][aria-label="${label}"]`);
+	if (!(row instanceof HTMLElement)) {
+		throw new Error(`Row not found: ${label}`);
+	}
+	return row;
+}
+
+function rowLabels(container: HTMLElement): string[] {
+	return Array.from(container.querySelectorAll('[role="button"][aria-label]'))
+		.map((row) => row.getAttribute("aria-label") ?? "")
+		.filter((label) => /^(Expand|Collapse) folder |^View diff of /.test(label));
 }
 
 function flushRender() {
@@ -233,9 +275,127 @@ describe("GitPanel", () => {
 
 		expect(container.textContent).toContain("Changes");
 		expect(container.textContent).toContain("Staged");
-		expect(container.textContent).toContain("src/staged.ts");
-		expect(container.textContent).toContain("src/unstaged.ts");
 		expect(container.textContent).toContain("Commit");
+
+		// Files are grouped under their folder instead of printing full paths.
+		expect(rowLabels(container)).toEqual([
+			"Collapse folder src",
+			"View diff of src/staged.ts",
+			"Collapse folder src",
+			"View diff of src/new-file.ts",
+			"View diff of src/unstaged.ts",
+		]);
+		expect(container.textContent).toContain("staged.ts");
+		expect(container.textContent).toContain("unstaged.ts");
+		expect(container.textContent).not.toContain("src/staged.ts");
+
+		queryClient.clear();
+	});
+
+	test("collapses a folder and stages every file beneath it", async () => {
+		const chapterId = "chapter-git-tree";
+		const calls: Array<{ name: string; body?: unknown }> = [];
+		stubInteractiveGitApi(calls);
+		const queryClient = new QueryClient({
+			defaultOptions: {
+				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
+				mutations: { retry: false },
+			},
+		});
+		queryClient.setQueryData(["gitStatus", chapterId], makeStatus());
+
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<GitPanel chapterId={chapterId} />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+
+		// Folder-level stage covers both unstaged files under src/. The folder row reuses
+		// the file wording, so scope the lookup to the row itself.
+		const stageFolderRow = Array.from(
+			container.querySelectorAll('[role="button"][aria-label="Collapse folder src"]'),
+		).at(-1);
+		if (!(stageFolderRow instanceof HTMLElement)) throw new Error("Folder row not found");
+		const stageFolderButton = stageFolderRow.querySelector('button[aria-label="Stage"]');
+		if (!(stageFolderButton instanceof HTMLButtonElement)) {
+			throw new Error("Folder stage button not found");
+		}
+		stageFolderButton.dispatchEvent(new Event("click", { bubbles: true }));
+		await flushRender();
+		expect(calls).toEqual([
+			{ name: "stage", body: { files: ["src/new-file.ts", "src/unstaged.ts"] } },
+		]);
+
+		// Collapsing hides that folder's children but leaves the staged section alone.
+		stageFolderRow.dispatchEvent(new Event("click", { bubbles: true }));
+		await flushRender();
+
+		expect(rowLabels(container)).toEqual([
+			"Collapse folder src",
+			"View diff of src/staged.ts",
+			"Expand folder src",
+		]);
+
+		rowByLabel(container, "Expand folder src").dispatchEvent(new Event("click", { bubbles: true }));
+		await flushRender();
+		expect(rowLabels(container)).toHaveLength(5);
+
+		queryClient.clear();
+	});
+
+	test("keeps deep paths to two rows so a narrow panel does not indent off-screen", async () => {
+		const chapterId = "chapter-git-deep";
+		const queryClient = new QueryClient({
+			defaultOptions: {
+				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
+				mutations: { retry: false },
+			},
+		});
+		queryClient.setQueryData(["gitStatus", chapterId], makeDeepStatus());
+
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<GitPanel chapterId={chapterId} />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+
+		// A 5-segment path collapses to one merged folder row plus the file, so the
+		// deepest indent stays at a single level instead of four.
+		expect(rowLabels(container)).toEqual([
+			"Collapse folder frontend/components/chapter/deep/nested",
+			"View diff of frontend/components/chapter/deep/nested/leaf.ts",
+		]);
+
+		const indents = Array.from(container.querySelectorAll('[role="button"][aria-label]'))
+			.filter((row) =>
+				/^(Collapse folder|View diff of) /.test(row.getAttribute("aria-label") ?? ""),
+			)
+			.map((row) => (row as HTMLElement).style.paddingLeft);
+		// Mantine rewrites numeric padding to scaled rem, so compare the rem values.
+		expect(indents).toEqual([
+			"calc(0.25rem * var(--mantine-scale))",
+			"calc(1rem * var(--mantine-scale))",
+		]);
 
 		queryClient.clear();
 	});

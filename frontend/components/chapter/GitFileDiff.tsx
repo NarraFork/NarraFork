@@ -53,8 +53,13 @@ export function GitFileDiff({ chapterId, file, staged = false, onClose }: GitFil
 					)}
 					<DiffView
 						lines={parsed.lines}
+						hunks={parsed.hunks}
 						language={file ? getShikiLang(file) : undefined}
 						maxHeight={500}
+						// This panel is not measured by pretext, so the column may shrink to
+						// the digits actually present. A two-digit file previously reserved a
+						// third padding column per side, which is wasted width on a phone.
+						gutterMinWidth={1}
 					/>
 				</ScrollArea.Autosize>
 			)}

@@ -23,8 +23,40 @@
 
 import { clampDiffLineContent, type DiffLine, MAX_DIFF_LINES, pairWordChanges } from "./diff-core";
 
+/**
+ * One hunk boundary, carried ALONGSIDE the rows rather than inside them.
+ *
+ * A `@@` header is not a diff row: `DiffLine["type"]` is a three-way union read by
+ * the measure layer and the pretext adapter, so widening it for a separator would
+ * ripple through every consumer. A parallel array keeps the row model untouched —
+ * a renderer that ignores `hunks` behaves exactly as before.
+ */
+export interface ParsedDiffHunk {
+	/** Index in `lines` of the first row this header precedes. */
+	rowIndex: number;
+	/** Trailing text of the `@@` line — usually the enclosing function signature. */
+	heading: string;
+	/** 1-based first line of the hunk on the old side. */
+	oldStart: number;
+	/** 1-based first line of the hunk on the new side. */
+	newStart: number;
+	/**
+	 * The header's range text, verbatim: `-12,6 +12,7`.
+	 *
+	 * Kept as the original string rather than rebuilt from the parsed numbers.
+	 * Reconstructing `-${oldStart} +${newStart}` silently DROPS the counts, so a
+	 * separator would read `@@ -12 +12 @@` for a header that actually said
+	 * `@@ -12,6 +12,7 @@` — a label shaped like a hunk header but carrying less
+	 * information than the one it came from. Git also omits the count when it is 1,
+	 * and only the source text knows which form was used.
+	 */
+	range: string;
+}
+
 export interface ParsedUnifiedDiff {
 	lines: DiffLine[];
+	/** Hunk boundaries in row order, for rendering separators. */
+	hunks: ParsedDiffHunk[];
 	/** Row count hit `MAX_DIFF_LINES` and parsing stopped early. */
 	truncated: boolean;
 	/** Patch declares a binary file; there are no text rows to render. */
@@ -33,8 +65,15 @@ export interface ParsedUnifiedDiff {
 	multiFile: boolean;
 }
 
-/** `@@ -oldStart,oldCount +newStart,newCount @@ optional heading` */
-const HUNK_HEADER = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+/**
+ * `@@ -oldStart,oldCount +newStart,newCount @@ optional heading`
+ *
+ * Group 1 captures the range verbatim (`-12,6 +12,7`) so a renderer can reprint it
+ * exactly; groups 2 and 3 give the two start lines for numbering; group 4 is git's
+ * context hint (the enclosing function), which the row model has no place for and
+ * which was previously discarded.
+ */
+const HUNK_HEADER = /^@@ (-(\d+)(?:,\d+)? \+(\d+)(?:,\d+)?) @@ ?(.*)$/;
 
 /**
  * Prefixes that carry patch metadata rather than file content.
@@ -78,16 +117,17 @@ function isBinaryMarker(line: string): boolean {
  *
  * Hunk headers intentionally produce NO row: `DiffLine["type"]` is a three-way
  * union consumed by the measure and pretext layers, and widening it for a
- * separator would ripple through all of them. The line-number gutter already
- * shows the jump between hunks.
+ * separator would ripple through all of them. They are reported in `hunks`
+ * instead, so a renderer can draw a separator without the row model changing.
  */
 export function parseUnifiedDiff(patch: string): ParsedUnifiedDiff {
 	const lines: DiffLine[] = [];
+	const hunks: ParsedDiffHunk[] = [];
 	let truncated = false;
 	let binary = false;
 	let multiFile = false;
 
-	if (!patch) return { lines, truncated, binary, multiFile };
+	if (!patch) return { lines, hunks, truncated, binary, multiFile };
 
 	let oldLineNo = 0;
 	let newLineNo = 0;
@@ -182,9 +222,20 @@ export function parseUnifiedDiff(patch: string): ParsedUnifiedDiff {
 		const hunk = HUNK_HEADER.exec(raw);
 		if (hunk) {
 			if (!flush()) break;
-			oldLineNo = Number(hunk[1]);
-			newLineNo = Number(hunk[2]);
+			oldLineNo = Number(hunk[2]);
+			newLineNo = Number(hunk[3]);
 			inHunk = true;
+			// `rowIndex` is the row this header sits ABOVE. Recorded before the hunk's
+			// rows exist, so it equals the current length; a header whose rows are all
+			// cut by the row cap is dropped after the loop rather than pointing past
+			// the end.
+			hunks.push({
+				rowIndex: lines.length,
+				heading: (hunk[4] ?? "").trim(),
+				oldStart: oldLineNo,
+				newStart: newLineNo,
+				range: hunk[1] ?? "",
+			});
 			continue;
 		}
 
@@ -223,5 +274,10 @@ export function parseUnifiedDiff(patch: string): ParsedUnifiedDiff {
 
 	if (!binary) flush();
 
-	return { lines, truncated, binary, multiFile };
+	// A binary patch emits no rows, and a header whose rows were all cut by the row
+	// cap would point past the end — either would render as a separator with nothing
+	// under it.
+	const anchored = binary ? [] : hunks.filter((h) => h.rowIndex < lines.length);
+
+	return { lines, hunks: anchored, truncated, binary, multiFile };
 }

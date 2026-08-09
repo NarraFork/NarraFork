@@ -149,6 +149,86 @@ describe("parseUnifiedDiff — special rows", () => {
 	});
 });
 
+describe("parseUnifiedDiff — hunks", () => {
+	it("reports each hunk's heading and start lines", () => {
+		const patch = [
+			"@@ -12,3 +12,3 @@ export function login(u, p) {",
+			"-a",
+			"+A",
+			"@@ -48,3 +49,3 @@ export function logout(id) {",
+			"-b",
+			"+B",
+		].join("\n");
+		expect(parseUnifiedDiff(patch).hunks).toEqual([
+			{
+				rowIndex: 0,
+				heading: "export function login(u, p) {",
+				oldStart: 12,
+				newStart: 12,
+				range: "-12,3 +12,3",
+			},
+			{
+				rowIndex: 2,
+				heading: "export function logout(id) {",
+				oldStart: 48,
+				newStart: 49,
+				range: "-48,3 +49,3",
+			},
+		]);
+	});
+
+	it("keeps the range verbatim so counts are not dropped", () => {
+		// Rebuilding `-${oldStart} +${newStart}` would print `@@ -12 +12 @@` for a
+		// header that said `@@ -12,6 +12,7 @@` — a label that looks like a hunk
+		// header but carries less than the one it came from.
+		const withCounts = parseUnifiedDiff(["@@ -12,6 +12,7 @@ f()", " ctx"].join("\n"));
+		expect(withCounts.hunks[0]?.range).toBe("-12,6 +12,7");
+
+		// Git omits the count when it is 1; the source text is the only thing that
+		// knows which form was used, so it is echoed rather than normalized.
+		const withoutCounts = parseUnifiedDiff(["@@ -3 +3 @@ f()", " ctx"].join("\n"));
+		expect(withoutCounts.hunks[0]?.range).toBe("-3 +3");
+
+		// Mixed: one side elides its count.
+		const mixed = parseUnifiedDiff(["@@ -7 +7,4 @@", " ctx"].join("\n"));
+		expect(mixed.hunks[0]?.range).toBe("-7 +7,4");
+	});
+
+	it("anchors rowIndex at the first row the header precedes", () => {
+		const patch = ["@@ -1,2 +1,2 @@ first", " ctx1", "-x", "@@ -9,1 +9,1 @@ second", " ctx2"].join(
+			"\n",
+		);
+		const { lines, hunks } = parseUnifiedDiff(patch);
+		// Each rowIndex must land on the row that follows its header.
+		expect(hunks.map((h) => [h.heading, lines[h.rowIndex]?.content])).toEqual([
+			["first", "ctx1"],
+			["second", "ctx2"],
+		]);
+	});
+
+	it("keeps an entry with an empty heading when the header carries none", () => {
+		const { hunks } = parseUnifiedDiff(["@@ -1,1 +1,1 @@", "-a", "+A"].join("\n"));
+		expect(hunks).toEqual([
+			{ rowIndex: 0, heading: "", oldStart: 1, newStart: 1, range: "-1,1 +1,1" },
+		]);
+	});
+
+	it("drops a trailing header whose rows never materialized", () => {
+		// The second header has no rows under it, so a separator there would sit
+		// above nothing.
+		const patch = ["@@ -1,1 +1,1 @@ real", "-a", "@@ -9,0 +9,0 @@ empty"].join("\n");
+		expect(parseUnifiedDiff(patch).hunks.map((h) => h.heading)).toEqual(["real"]);
+	});
+
+	it("reports no hunks for a binary or empty patch", () => {
+		const binary = ["diff --git a/i.png b/i.png", "Binary files a/i.png and b/i.png differ"].join(
+			"\n",
+		);
+		expect(parseUnifiedDiff(binary).hunks).toEqual([]);
+		expect(parseUnifiedDiff("").hunks).toEqual([]);
+	});
+});
+
 describe("parseUnifiedDiff — bounds", () => {
 	it("stops at the second file and reports it", () => {
 		const patch = [
@@ -175,6 +255,7 @@ describe("parseUnifiedDiff — bounds", () => {
 	it("handles an empty patch and a metadata-only patch without throwing", () => {
 		expect(parseUnifiedDiff("")).toEqual({
 			lines: [],
+			hunks: [],
 			truncated: false,
 			binary: false,
 			multiFile: false,
