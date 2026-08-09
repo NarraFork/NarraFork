@@ -1,6 +1,6 @@
 import { Box, useComputedColorScheme } from "@mantine/core";
 import {
-	buildDiffHighlightSource,
+	buildDiffHighlightPlan,
 	computeDiff,
 	type DiffLine,
 	diffLineMarker,
@@ -129,15 +129,15 @@ function useTokenMap(
 ): TokenMap | null {
 	const [tokenMap, setTokenMap] = useState<TokenMap | null>(null);
 
-	// Build the full source text for tokenisation with a hard total-size guard.
-	const sourceText = useMemo(() => {
+	// Each side is reconstructed and tokenized separately, so a multi-line construct
+	// on one side cannot bleed into the other's rows. See `buildDiffHighlightPlan`.
+	const plan = useMemo(() => {
 		if (!language || language === "text") return null;
-		// Reconstruct a plausible source from all lines so shiki gets proper context.
-		return buildDiffHighlightSource(lines);
+		return buildDiffHighlightPlan(lines);
 	}, [language, lines]);
 
 	useEffect(() => {
-		if (!language || language === "text" || !sourceText) {
+		if (!language || language === "text" || !plan) {
 			setTokenMap(null);
 			return;
 		}
@@ -150,17 +150,22 @@ function useTokenMap(
 				setTokenMap(null);
 				return;
 			}
-			shiki
-				.codeToTokens(sourceText, {
-					lang: effectiveLang as BundledLanguage,
-					theme,
-				})
-				.then((result) => {
+			Promise.all(
+				plan.sources.map((source) =>
+					shiki.codeToTokens(source, { lang: effectiveLang as BundledLanguage, theme }),
+				),
+			)
+				.then((results) => {
 					if (cancelled) return;
 					const map: TokenMap = new Map();
-					for (let i = 0; i < result.tokens.length && i < lines.length; i++) {
-						// Key by index to handle duplicate lines correctly
-						map.set(String(i), result.tokens[i]);
+					// Keyed by ROW index (not source line), so lookup stays a plain
+					// `get(String(i))` for the renderer while the row's tokens come from
+					// whichever side that row belongs to.
+					for (let i = 0; i < lines.length; i++) {
+						const ref = plan.rows[i];
+						if (!ref) continue;
+						const tokens = results[ref.source]?.tokens[ref.line];
+						if (tokens) map.set(String(i), tokens);
 					}
 					setTokenMap(map);
 				})
@@ -172,7 +177,7 @@ function useTokenMap(
 		return () => {
 			cancelled = true;
 		};
-	}, [language, sourceText, lines, theme]);
+	}, [language, plan, lines, theme]);
 
 	return tokenMap;
 }
@@ -277,23 +282,70 @@ const DiffLineRow = memo(function DiffLineRow({
 });
 
 /**
+ * Hunk separator colours, taken from GitHub's Primer diff palette rather than
+ * Mantine's neutral hover grey.
+ *
+ * GitHub tints this row with the ACCENT (blue) family, not a grey: the row is a
+ * position marker, and a grey band reads as just another muted code row next to
+ * the red/green change rows. `bgColor-accent-muted` / `fgColor-muted` are the
+ * tokens GitHub uses in each scheme.
+ */
+const darkHunkSeparator = {
+	backgroundColor: "#121d2f",
+	color: "#9198a1",
+	borderTop: "1px solid #1f2a37",
+	borderBottom: "1px solid #1f2a37",
+} as const;
+
+const lightHunkSeparator = {
+	backgroundColor: "#ddf4ff",
+	color: "#59636e",
+	borderTop: "1px solid #c6e6ff",
+	borderBottom: "1px solid #c6e6ff",
+} as const;
+
+/**
  * A hunk boundary: the `@@` range plus git's context hint.
  *
  * Without it, a jump from old line 16 to old line 48 renders as two adjacent rows
  * with no indication that 31 lines were skipped, and the enclosing function name
  * git supplied is thrown away.
+ *
+ * The gutter is reserved as blank space so the `@@` text starts in the SAME column
+ * as code, the way GitHub's unified view leaves the line-number cells empty and
+ * tinted. Reprinting the range verbatim (`hunk.range`) matters: rebuilding it from
+ * the parsed start lines would drop git's counts.
  */
-const HunkSeparatorRow = memo(function HunkSeparatorRow({ hunk }: { hunk: ParsedDiffHunk }) {
+const HunkSeparatorRow = memo(function HunkSeparatorRow({
+	hunk,
+	isDark,
+	lineNoWidth,
+}: {
+	hunk: ParsedDiffHunk;
+	isDark: boolean;
+	/** Gutter width in characters per side, matching `formatDiffGutter`. */
+	lineNoWidth?: number;
+}) {
+	// `formatDiffGutter` emits `old + " " + new + marker`, so the gutter spans two
+	// number columns plus two single characters. Without numbers the row only has
+	// the 1.5ch marker gutter.
+	const gutterWidth = lineNoWidth != null ? `${lineNoWidth * 2 + 2}ch` : "1.5ch";
+
 	return (
 		<div
 			data-diff-hunk-separator="true"
 			style={{
-				color: "var(--mantine-color-dimmed)",
-				backgroundColor: "var(--mantine-color-default-hover)",
-				opacity: 0.85,
+				...(isDark ? darkHunkSeparator : lightHunkSeparator),
 				userSelect: "none",
+				// Bleed through the container's padding so the band spans the full width,
+				// as GitHub's does, instead of floating inside an untinted margin.
+				marginLeft: "calc(-1 * var(--mantine-spacing-xs))",
+				marginRight: "calc(-1 * var(--mantine-spacing-xs))",
+				paddingLeft: "var(--mantine-spacing-xs)",
+				paddingRight: "var(--mantine-spacing-xs)",
 			}}
 		>
+			<span style={{ display: "inline-block", width: gutterWidth, flexShrink: 0 }} />
 			{`@@ ${hunk.range} @@`}
 			{hunk.heading ? ` ${hunk.heading}` : ""}
 		</div>
@@ -378,10 +430,18 @@ export const DiffView = memo(function DiffView({
 				const hunk = hunkByRow?.get(i);
 				return (
 					<Fragment key={key}>
-						{hunk ? <HunkSeparatorRow hunk={hunk} /> : null}
+						{hunk ? (
+							<HunkSeparatorRow hunk={hunk} isDark={isDark} lineNoWidth={lineNoWidth} />
+						) : null}
 						<DiffLineRow
 							line={line}
-							tokens={!line.wordChanges ? (tokenMap?.get(String(i)) ?? undefined) : undefined}
+							// Passed for EVERY row, including word-diffed ones. Withholding tokens
+							// from rows that carry `wordChanges` made modified lines — the rows a
+							// reader looks at first — the only ones rendered without syntax colour,
+							// because DiffWordTokens then falls back to its tint-only branch. Word
+							// chunks and Shiki tokens partition the same text, so they intersect
+							// rather than compete; RenderToolCall already passed both.
+							tokens={tokenMap?.get(String(i)) ?? undefined}
 							diffStyles={diffStyles}
 							lineNoWidth={lineNoWidth}
 							lineNumberPrefix={lineNumberPrefix}
