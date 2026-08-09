@@ -15,6 +15,8 @@ import {
 	IconCheck,
 	IconChevronDown,
 	IconChevronRight,
+	IconFolder,
+	IconFolderOpen,
 	IconMinus,
 	IconPlus,
 	IconSparkles,
@@ -41,6 +43,15 @@ const MAX_DISPLAY_FILES = 80;
 const MAX_GIT_FILE_PATH_CHARS = 1_000;
 /** Indent per tree level, in px. Small so deep paths still fit a narrow panel. */
 const TREE_INDENT_PX = 12;
+/**
+ * Width of a row's leading slot: the file status badge, and the folder row's
+ * chevron+glyph pair.
+ *
+ * Shared so the two stay locked together — the names after them only line up
+ * while both leading slots are the same width, and that alignment is the whole
+ * reason the folder row reserves this much space.
+ */
+const STATUS_BADGE_WIDTH = 28;
 
 function clampGitFilePath(path: string): string {
 	return path.length > MAX_GIT_FILE_PATH_CHARS
@@ -445,11 +456,25 @@ function DirectoryRow({
 				}
 				onActivate={() => ctx.onToggle(node.path)}
 			>
-				{expanded ? (
-					<IconChevronDown size={12} style={{ flexShrink: 0 }} />
-				) : (
-					<IconChevronRight size={12} style={{ flexShrink: 0 }} />
-				)}
+				{/*
+				 * Same footprint as a file row's status badge (STATUS_BADGE_WIDTH), so
+				 * folder and file names start at one column instead of a ragged edge —
+				 * a bare chevron is much narrower than the badge and left folder rows
+				 * looking unanchored. The folder glyph is what carries the "this is a
+				 * directory" signal; the chevron only carries open/closed.
+				 */}
+				<Group gap={2} wrap="nowrap" w={STATUS_BADGE_WIDTH} style={{ flexShrink: 0 }}>
+					{expanded ? (
+						<IconChevronDown size={12} style={{ flexShrink: 0 }} />
+					) : (
+						<IconChevronRight size={12} style={{ flexShrink: 0 }} />
+					)}
+					{expanded ? (
+						<IconFolderOpen size={14} style={{ flexShrink: 0, opacity: 0.75 }} />
+					) : (
+						<IconFolder size={14} style={{ flexShrink: 0, opacity: 0.75 }} />
+					)}
+				</Group>
 				<Text
 					size="xs"
 					fw={600}
@@ -504,7 +529,13 @@ function FileRow({
 			label={ctx.t("viewDiffOf", { path: file.path })}
 			onActivate={() => ctx.onOpenFile(file.path)}
 		>
-			<Badge size="xs" color={color} variant="filled" w={28} style={{ flexShrink: 0 }}>
+			<Badge
+				size="xs"
+				color={color}
+				variant="filled"
+				w={STATUS_BADGE_WIDTH}
+				style={{ flexShrink: 0 }}
+			>
 				{statusChar}
 			</Badge>
 			<Text

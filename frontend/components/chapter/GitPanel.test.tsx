@@ -353,6 +353,59 @@ describe("GitPanel", () => {
 		queryClient.clear();
 	});
 
+	test("gives folder rows a folder glyph aligned with the file status badge", async () => {
+		// A bare chevron made folder rows read as unanchored next to the files'
+		// status badge, and left the two name columns ragged. The glyph carries the
+		// "directory" signal; the equal leading width is what lines the names up.
+		const chapterId = "chapter-git-folder-glyph";
+		const queryClient = new QueryClient({
+			defaultOptions: {
+				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
+				mutations: { retry: false },
+			},
+		});
+		queryClient.setQueryData(["gitStatus", chapterId], makeStatus());
+
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<GitPanel chapterId={chapterId} />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+
+		const folderRow = rowByLabel(container, "Collapse folder src");
+		// Expanded folder → open-folder glyph, next to the chevron that shows state.
+		expect(folderRow.querySelector(".tabler-icon-folder-open")).not.toBeNull();
+		expect(folderRow.querySelector(".tabler-icon-chevron-down")).not.toBeNull();
+
+		// Both leading slots reserve the same width, so the names after them align.
+		const leadingWidth = (row: HTMLElement): string | undefined => {
+			const slot = row.firstElementChild;
+			return slot instanceof HTMLElement ? slot.style.width : undefined;
+		};
+		const fileRow = rowByLabel(container, "View diff of src/staged.ts");
+		expect(leadingWidth(folderRow)).toBe(leadingWidth(fileRow));
+		expect(leadingWidth(folderRow)).toBe("calc(1.75rem * var(--mantine-scale))");
+
+		// Collapsing swaps to the closed glyph, so the state reads without the chevron.
+		folderRow.dispatchEvent(new Event("click", { bubbles: true }));
+		await flushRender();
+		const collapsed = rowByLabel(container, "Expand folder src");
+		expect(collapsed.querySelector(".tabler-icon-folder")).not.toBeNull();
+		expect(collapsed.querySelector(".tabler-icon-folder-open")).toBeNull();
+
+		queryClient.clear();
+	});
+
 	test("keeps deep paths to two rows so a narrow panel does not indent off-screen", async () => {
 		const chapterId = "chapter-git-deep";
 		const queryClient = new QueryClient({
