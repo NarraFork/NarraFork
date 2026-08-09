@@ -3093,15 +3093,15 @@ export function createCorePluginPublicApiAdapters(options: {
 				return {
 					content: result.content,
 					revisionId: result.revisionId,
-					compiled: {
-						tasks: result.compiled.tasks.map((task) => ({
-							text: task.text,
-							status: task.status,
-							protected: task.protected,
-						})),
-						openCount: result.compiled.openCount,
-						protectedOpenCount: result.compiled.protectedOpenCount,
-					},
+				compiled: {
+					tasks: result.compiled.tasks.map((task) => ({
+						text: task.text,
+						status: task.status,
+						protected: task.protected ?? false,
+					})),
+					openCount: result.compiled.tasks.filter((task) => task.status !== "done").length,
+					protectedOpenCount: result.compiled.protectedOpenCount,
+				},
 				};
 			} catch (error) {
 				throw mapNarratorCommandError(error);

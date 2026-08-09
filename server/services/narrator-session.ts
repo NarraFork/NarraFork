@@ -5427,7 +5427,7 @@ export async function sendSubagentMessage(
 		delivered: "started",
 		started: resumed.started,
 		resumedSuspendedRunner: resumed.resumedSuspendedRunner,
-		messageId: resumed.userMessage?.id ?? null,
+		messageId: resumed.userMessage?.id ?? undefined,
 	};
 }
 

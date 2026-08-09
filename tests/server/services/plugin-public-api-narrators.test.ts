@@ -260,6 +260,33 @@ describe("narrafork.narrator.send_message (public API surface)", () => {
 				async interrupt() {
 					return { interrupted: false };
 				},
+				async sendSubagentMessage() {
+					return { delivered: "buffered" as const };
+				},
+				async createNarrator() {
+					return {
+						narratorId: "n-new",
+						title: null,
+						variant: "primary",
+						type: "primary" as const,
+						model: null,
+						cwd: null,
+						status: "idle",
+					};
+				},
+				async deleteNarrator() {
+					return { deleted: true as const };
+				},
+				async specTasksGet() {
+					return {
+						content: "",
+						revisionId: null,
+						compiled: { tasks: [], openCount: 0, protectedOpenCount: 0 },
+					};
+				},
+				async specTaskAdd() {
+					return { added: false, taskText: "", revisionId: null };
+				},
 			},
 		};
 		const { api, broker } = buildApi({ adapters });
@@ -299,6 +326,33 @@ describe("narrafork.narrator.send_message (public API surface)", () => {
 				async interrupt() {
 					return { interrupted: false };
 				},
+				async sendSubagentMessage() {
+					return { delivered: "buffered" as const };
+				},
+				async createNarrator() {
+					return {
+						narratorId: "n-new",
+						title: null,
+						variant: "primary",
+						type: "primary" as const,
+						model: null,
+						cwd: null,
+						status: "idle",
+					};
+				},
+				async deleteNarrator() {
+					return { deleted: true as const };
+				},
+				async specTasksGet() {
+					return {
+						content: "",
+						revisionId: null,
+						compiled: { tasks: [], openCount: 0, protectedOpenCount: 0 },
+					};
+				},
+				async specTaskAdd() {
+					return { added: false, taskText: "", revisionId: null };
+				},
 			},
 		};
 		const broker = new FakeBroker();
@@ -332,6 +386,33 @@ describe("narrafork.narrator.send_message (public API surface)", () => {
 				async interrupt() {
 					return { interrupted: false };
 				},
+				async sendSubagentMessage() {
+					return { delivered: "buffered" as const };
+				},
+				async createNarrator() {
+					return {
+						narratorId: "n-new",
+						title: null,
+						variant: "primary",
+						type: "primary" as const,
+						model: null,
+						cwd: null,
+						status: "idle",
+					};
+				},
+				async deleteNarrator() {
+					return { deleted: true as const };
+				},
+				async specTasksGet() {
+					return {
+						content: "",
+						revisionId: null,
+						compiled: { tasks: [], openCount: 0, protectedOpenCount: 0 },
+					};
+				},
+				async specTaskAdd() {
+					return { added: false, taskText: "", revisionId: null };
+				},
 			},
 		};
 		const { api } = buildApi({ adapters });
@@ -362,6 +443,33 @@ describe("narrafork.narrator.interrupt (public API surface)", () => {
 				async interrupt(input) {
 					expect(input.narratorId).toBe("n-worker");
 					return { interrupted: true };
+				},
+				async sendSubagentMessage() {
+					return { delivered: "started" as const, messageId: "msg-s1" };
+				},
+				async createNarrator() {
+					return {
+						narratorId: "n-new",
+						title: null,
+						variant: "primary",
+						type: "primary" as const,
+						model: null,
+						cwd: null,
+						status: "idle",
+					};
+				},
+				async deleteNarrator() {
+					return { deleted: true as const };
+				},
+				async specTasksGet() {
+					return {
+						content: "",
+						revisionId: null,
+						compiled: { tasks: [], openCount: 0, protectedOpenCount: 0 },
+					};
+				},
+				async specTaskAdd() {
+					return { added: false, taskText: "", revisionId: null };
 				},
 			},
 		};
@@ -521,6 +629,21 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			locale: string;
 		}> = [];
 		const fakeSession: NarratorSessionFacade = {
+			async sendSubagentMessage() {
+				return { delivered: "buffered" } as never;
+			},
+			async createNarrator() {
+				return { narratorId: "n-new" } as never;
+			},
+			async deleteNarrator() {
+				return { deleted: true } as never;
+			},
+			async specTasksGet() {
+				return {} as never;
+			},
+			async specTaskAdd() {
+				return { added: false, taskText: "", revisionId: null };
+			},
 			async sendMessage(
 				narratorId,
 				message,
@@ -586,6 +709,21 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 
 	test("sendMessage maps a busy narrator to retryable CONFLICT", async () => {
 		const fakeSession: NarratorSessionFacade = {
+			async sendSubagentMessage() {
+				return { delivered: "buffered" } as never;
+			},
+			async createNarrator() {
+				return { narratorId: "n-new" } as never;
+			},
+			async deleteNarrator() {
+				return { deleted: true } as never;
+			},
+			async specTasksGet() {
+				return {} as never;
+			},
+			async specTaskAdd() {
+				return { added: false, taskText: "", revisionId: null };
+			},
 			async sendMessage() {
 				throw new ValidationError("Narrator is already running");
 			},
@@ -631,6 +769,21 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 
 	test("sendMessage maps subagent rejection to INVALID_PARAMS", async () => {
 		const fakeSession: NarratorSessionFacade = {
+			async sendSubagentMessage() {
+				return { delivered: "buffered" } as never;
+			},
+			async createNarrator() {
+				return { narratorId: "n-new" } as never;
+			},
+			async deleteNarrator() {
+				return { deleted: true } as never;
+			},
+			async specTasksGet() {
+				return {} as never;
+			},
+			async specTaskAdd() {
+				return { added: false, taskText: "", revisionId: null };
+			},
 			async sendMessage() {
 				throw new ValidationError("Subagent messages must be sent through resumeSubagent");
 			},
@@ -676,6 +829,21 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 	test("interrupt resolves existence first and reports the outcome", async () => {
 		const interrupts: string[] = [];
 		const fakeSession: NarratorSessionFacade = {
+			async sendSubagentMessage() {
+				return { delivered: "buffered" } as never;
+			},
+			async createNarrator() {
+				return { narratorId: "n-new" } as never;
+			},
+			async deleteNarrator() {
+				return { deleted: true } as never;
+			},
+			async specTasksGet() {
+				return {} as never;
+			},
+			async specTaskAdd() {
+				return { added: false, taskText: "", revisionId: null };
+			},
 			async sendMessage() {
 				throw new Error("not used");
 			},
@@ -717,6 +885,21 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 
 	test("interrupt maps an unknown narrator to NOT_FOUND", async () => {
 		const fakeSession: NarratorSessionFacade = {
+			async sendSubagentMessage() {
+				return { delivered: "buffered" } as never;
+			},
+			async createNarrator() {
+				return { narratorId: "n-new" } as never;
+			},
+			async deleteNarrator() {
+				return { deleted: true } as never;
+			},
+			async specTasksGet() {
+				return {} as never;
+			},
+			async specTaskAdd() {
+				return { added: false, taskText: "", revisionId: null };
+			},
 			async sendMessage() {
 				throw new Error("not used");
 			},
