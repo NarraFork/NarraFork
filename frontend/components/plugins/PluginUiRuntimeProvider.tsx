@@ -223,6 +223,14 @@ export function PluginUiRuntimeProvider({
 				showNotification: hostLocalRef.current?.showNotification,
 				openPanel: hostLocalRef.current?.openPanel,
 				openExternal: hostLocalRef.current?.openExternal,
+				navigate:
+					// main.tsx injects the live-router navigate via hostLocal;
+					// fall back to a no-op-ish error so a missing bridge surfaces
+					// as an explicit rejection instead of a silent success.
+					hostLocalRef.current?.navigate ??
+					((_to: string) => {
+						throw new Error("Plugin UI navigation bridge is not wired");
+					}),
 			};
 			return routePluginUiHostLocalRequest(context, options);
 		},
@@ -422,6 +430,11 @@ export function PluginUiRuntimeProvider({
 		[],
 	);
 
+	const getSessionController = useCallback(
+		(panelInstanceId: string) => sessionsRef.current.get(panelInstanceId)?.controller,
+		[],
+	);
+
 	const reloadSession = useCallback(
 		(panelInstanceId: string, resetRecoveryBudget = true) => {
 			const record = sessionsRef.current.get(panelInstanceId);
@@ -603,6 +616,7 @@ export function PluginUiRuntimeProvider({
 			ensureSession,
 			updateSessionParams,
 			getSessionSnapshot,
+			getSessionController,
 			reloadSession,
 			disposeSession,
 			registerPanelDelegate,
@@ -617,6 +631,7 @@ export function PluginUiRuntimeProvider({
 			ensureSession,
 			updateSessionParams,
 			getSessionSnapshot,
+			getSessionController,
 			getSessions,
 			getSlots,
 			disposeSession,
@@ -643,7 +658,6 @@ export function PluginUiRuntimeProvider({
 	return (
 		<RuntimeContext.Provider value={value}>
 			{children}
-			<PluginUiLayer />
 		</RuntimeContext.Provider>
 	);
 }
@@ -710,64 +724,19 @@ export function fallbackPluginUiContext(
 	};
 }
 
-/** Stable top-level layer. A session keeps one iframe while slots move between surfaces. */
-export function PluginUiLayer() {
-	const runtime = usePluginUiRuntime();
-	return (
-		<Box
-			style={{ position: "fixed", inset: 0, zIndex: 20, pointerEvents: "none", overflow: "hidden" }}
-		>
-			{runtime.getSessions().map((session) => {
-				const slot = runtime
-					.getSlots(session.params.panelInstanceId)
-					.filter(isSlotVisible)
-					.sort((a, b) => b.priority - a.priority)[0];
-				if (
-					!slot ||
-					!session.controller ||
-					["pending", "error", "crashed", "disposed"].includes(session.snapshot.status)
-				)
-					return null;
-				const controller = session.controller;
-				return (
-					<Box
-						key={session.params.panelInstanceId}
-						style={{
-							position: "fixed",
-							left: slot.rect.left,
-							top: slot.rect.top,
-							width: slot.rect.width,
-							height: slot.rect.height,
-							// The iframe must stay clickable even when the dock reports the
-							// panel as inactive: a restored panel starts inactive, and
-							// pointer-events:none would swallow the very click that should
-							// activate it (the focus handler lives on the iframe itself) —
-							// a deadlock until the user manually refreshes the panel.
-							overflow: "hidden",
-						}}
-					>
-						<iframe
-							srcDoc={controller.getSrcdoc()}
-							sandbox="allow-scripts"
-							allow=""
-							referrerPolicy="no-referrer"
-							title={session.contribution.title}
-							onLoad={(event) => controller.attach(event.currentTarget)}
-							onFocus={() => controller.setFocused(true)}
-							onBlur={() => controller.setFocused(false)}
-							style={{
-								width: "100%",
-								height: "100%",
-								border: 0,
-								display: "block",
-								pointerEvents: "auto",
-							}}
-						/>
-					</Box>
-				);
-			})}
-		</Box>
-	);
+/**
+ * DISABLED overlay layer (kept exported for compatibility).
+ *
+ * Plugin iframes used to be rendered here as viewport-fixed overlays tracking
+ * the panel slot. That design fought the dock: the overlay could drift from
+ * the slot (covering host chrome), and mixed with tool panels it did not
+ * participate in native tab switching. The iframe now renders INSIDE the dock
+ * panel content (`PluginDockPanelView`), exactly like built-in tool panels, so
+ * the dock natively manages tabbing, hiding and movement. The slot registry
+ * stays for panel visibility/active notifications to the session.
+ */
+export function PluginUiLayer(): null {
+	return null;
 }
 
 export function PluginPanelSlot({
@@ -801,9 +770,26 @@ export function PluginPanelSlot({
 		const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
 		observer?.observe(element);
 		window.addEventListener("resize", update);
+		// ResizeObserver only reports SIZE changes; a dock layout move that keeps
+		// the same width/height (split, swap, restore, drag) leaves the iframe
+		// overlay stuck at its old rect — covering host chrome and trapping the
+		// panel until a browser refresh. Poll the element's POSITION on a low
+		// cadence so the overlay follows the slot. The check is cheap (one
+		// getBoundingClientRect per panel per tick) and updateSlot is idempotent
+		// (sameSlotState skips the rerender when nothing moved).
+		let lastLeft = -1;
+		let lastTop = -1;
+		const positionTimer = window.setInterval(() => {
+			const rect = element.getBoundingClientRect();
+			if (rect.left === lastLeft && rect.top === lastTop) return;
+			lastLeft = rect.left;
+			lastTop = rect.top;
+			update();
+		}, 300);
 		return () => {
 			observer?.disconnect();
 			window.removeEventListener("resize", update);
+			window.clearInterval(positionTimer);
 			unregisterRef.current?.();
 			unregisterRef.current = null;
 		};

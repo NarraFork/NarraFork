@@ -9,6 +9,7 @@ import {
 } from "../db/schema";
 import { AsyncMutex } from "../lib/async-mutex";
 import { generateId } from "../lib/id";
+import { eventBus } from "../lib/event-bus";
 import {
 	analyzeSpecTasksCandidate,
 	compileSpecTasks,
@@ -400,7 +401,16 @@ export async function writeSpecFile(
 			}
 		});
 
-		return readSpecFile(narratorId, toSpecUri(path));
+		const written = await readSpecFile(narratorId, toSpecUri(path));
+		eventBus.emit({
+			type: "spec:changed",
+			narratorId,
+			path,
+			uri: toSpecUri(path),
+			revisionId: written.revisionId ?? null,
+			updatedBy: actor,
+		});
+		return written;
 	});
 }
 

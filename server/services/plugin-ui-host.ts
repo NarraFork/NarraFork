@@ -1024,6 +1024,8 @@ export class PluginUiHost {
 	}
 
 	private context(input: PluginUiHostRequest): JsonValue {
+		const scope = input.session.scope ?? {};
+		const narratorId = typeof scope.narratorId === "string" ? scope.narratorId : undefined;
 		return {
 			contextVersion: 1,
 			host: { appVersion: "unknown", locale: "unknown", colorScheme: "dark", platform: "unknown" },
@@ -1045,6 +1047,17 @@ export class PluginUiHost {
 				active: true,
 				visible: true,
 			},
+			// Mirror the frontend `toPluginUiContext` narrator block so a panel can
+			// tell which narrator it is attached to (surface scope "narrator").
+			...(narratorId
+				? {
+						narrator: {
+							id: narratorId,
+							...(typeof scope.chapterId === "string" ? { chapterId: scope.chapterId } : {}),
+							...(typeof scope.projectId === "string" ? { projectId: scope.projectId } : {}),
+						},
+					}
+				: {}),
 			route: { routeId: "plugin-ui" },
 		};
 	}

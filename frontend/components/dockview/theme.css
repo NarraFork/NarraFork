@@ -81,18 +81,6 @@
 }
 
 /*
- * Single-tab groups: hide dockview's own tab strip entirely. Each NarraFork
- * panel (narrator / terminal / webview) renders its own header bar which also
- * doubles as the drag handle, so the dockview tab row is redundant noise when
- * a group holds a single panel. Dockview toggles `.dv-single-tab` on the
- * tabs-and-actions container whenever the group's tab count is exactly 1
- * (see dockview-core tabsContainer.updateClassnames()).
- */
-.dockview-theme-narrafork .dv-tabs-and-actions-container.dv-single-tab {
-	display: none;
-}
-
-/*
  * Custom panel headers act as drag handles (via usePanelHeaderDrag →
  * panel-drag singleton). On touch screens the browser would otherwise claim
  * vertical/horizontal swipes for native scrolling before our document-level

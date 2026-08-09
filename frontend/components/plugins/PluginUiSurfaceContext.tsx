@@ -80,8 +80,10 @@ export function resolvePluginUiOwnerNarratorId(
 ): string | undefined {
 	switch (params.binding.kind) {
 		case "focus-current-narrator":
-			// Both focus-family surfaces host exactly one narrator, so a panel bound
-			// to "the current narrator" resolves on either.
+			// Prefer the persisted narrator binding when available so recovered
+			// panels keep their owner across surfaces; otherwise resolve the live
+			// narrator on either focus-family surface.
+			if (params.binding.narratorId) return params.binding.narratorId;
 			return isFocusFamily(hostContext.surface) ? hostContext.narratorId : undefined;
 		case "workspace-narrator":
 			return (hostContext.surface === "workspace" || hostContext.surface === "director") &&

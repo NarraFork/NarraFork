@@ -113,6 +113,7 @@ export const PLUGIN_UI_HOST_LOCAL_METHODS = [
 	"panel.open",
 	"notifications.show",
 	"ui.openExternal",
+	"ui.navigate",
 ] as const;
 export type PluginUiHostLocalMethod = (typeof PLUGIN_UI_HOST_LOCAL_METHODS)[number];
 
@@ -209,7 +210,7 @@ export type PluginPanelBinding =
 			kind: "host-surface";
 			surface: "focus" | "workspace" | "director" | "settings" | "provider-settings";
 	  }
-	| { kind: "focus-current-narrator" }
+	| { kind: "focus-current-narrator"; narratorId?: string }
 	| { kind: "workspace"; workspaceId: string }
 	| { kind: "workspace-narrator"; workspaceId: string; ownerNarratorId: string }
 	| { kind: "global" };
@@ -221,7 +222,9 @@ const bindingSchema = z.discriminatedUnion("kind", [
 			surface: z.enum(["focus", "workspace", "director", "settings", "provider-settings"]),
 		})
 		.strict(),
-	z.object({ kind: z.literal("focus-current-narrator") }).strict(),
+	z
+		.object({ kind: z.literal("focus-current-narrator"), narratorId: idSchema.optional() })
+		.strict(),
 	z.object({ kind: z.literal("workspace"), workspaceId: idSchema }).strict(),
 	z
 		.object({

@@ -1,8 +1,8 @@
 /**
  * NarraFork Dockview layer — reusable Dockview surface + drag semantics.
  *
- * Import from here anywhere you embed Dockview and want the shared theme,
- * single-tab hiding, and three-zone (swap / merge / split) drop behaviour.
+ * Import from here anywhere you embed Dockview and want the shared theme and
+ * three-zone (swap / merge / split) drop behaviour.
  */
 
 export type { DockviewSurfaceProps } from "./DockviewSurface";

@@ -185,6 +185,11 @@ export function PluginDockPanelView({
 	}, [params, runtime]);
 	const snapshot =
 		params && runtime ? runtime.getSessionSnapshot(params.panelInstanceId) : undefined;
+	// The live session controller, if any. The session iframe renders INSIDE this
+	// panel's dock content (mirroring how built-in tool panels render their
+	// content), so the dock natively manages tab switching, hiding and movement.
+	const controller =
+		params && runtime ? runtime.getSessionController(params.panelInstanceId) : undefined;
 
 	useEffect(() => {
 		if (
@@ -317,6 +322,32 @@ export function PluginDockPanelView({
 			</PluginPanelSlot>
 		</Box>
 	);
+	// A crashed/disposed session must show the error placeholder, not the iframe.
+	const sessionBroken =
+		snapshot && ["error", "crashed", "disposed"].includes(snapshot.status);
+	if (controller && !sessionBroken) {
+		// Live session: render the iframe directly in the panel content. The
+		// handshake happens on iframe load (controller.attach), same as before.
+		return withSlot(
+			<iframe
+				srcDoc={controller.getSrcdoc()}
+				sandbox="allow-scripts"
+				allow=""
+				referrerPolicy="no-referrer"
+				title={contribution.title || params.contributionId}
+				onLoad={(event) => controller.attach(event.currentTarget)}
+				onFocus={() => controller.setFocused(true)}
+				onBlur={() => controller.setFocused(false)}
+				style={{
+					width: "100%",
+					height: "100%",
+					border: 0,
+					display: "block",
+					pointerEvents: "auto",
+				}}
+			/>,
+		);
+	}
 	if (!snapshot || ["pending", "registered", "connecting"].includes(snapshot.status)) {
 		return withSlot(
 			<Placeholder

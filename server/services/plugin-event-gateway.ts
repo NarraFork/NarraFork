@@ -623,6 +623,26 @@ export const defaultPluginEventMapper: PluginEventMapper = (event, context) => {
 			},
 		);
 	}
+	if (type === "spec:changed") {
+		return baseMapping(
+			"narrafork.narrator.spec.changed",
+			"state",
+			{
+				narratorId: String(value.narratorId),
+				path: String(value.path),
+				uri: String(value.uri),
+				...(value.revisionId ? { revisionId: String(value.revisionId) } : {}),
+				updatedBy: String(value.updatedBy),
+			},
+			"user_scoped",
+			context,
+			{
+				resource: resource("narrator", value.narratorId, {
+					narratorId: asString(value.narratorId),
+				}),
+			},
+		);
+	}
 	if (type === "narrator:tool_changed") {
 		// Bounded metadata only. The tool input/output stay server-side: subscribers need to know
 		// what ran, where, how long it took and whether it failed — not the payloads.

@@ -11,8 +11,13 @@ import { EXTERNAL_V1_MAX_MESSAGE_CHARS } from "../lib/validators/external";
 import { listIntegrationProjects } from "./integration-resource-service";
 import { narratorService } from "./narrator-service";
 import {
+	createNarratorForPlugin as createNarratorForPluginSession,
+	deleteNarratorForPlugin as deleteNarratorForPluginSession,
 	interruptNarrator as interruptNarratorSession,
+	readSpecTasksForPlugin as readSpecTasksForPluginSession,
+	addSpecTaskForPlugin as addSpecTaskForPluginSession,
 	sendMessage as sendNarratorMessage,
+	sendSubagentMessage as sendSubagentMessageToSession,
 } from "./narrator-session";
 import {
 	type CapabilityAuthorizationRequest as BrokerAuthorizationRequest,
@@ -1250,6 +1255,68 @@ export interface NarratorCommandAdapter {
 		context: HostCallContext;
 		signal: AbortSignal;
 	}): Promise<{ messageId: string }>;
+	sendSubagentMessage(input: {
+		narratorId: string;
+		message: string;
+		priority?: boolean;
+		locale?: "en" | "zh-CN";
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{
+		delivered: "buffered" | "started";
+		messageId?: string;
+		bufferedAt?: string;
+		started?: boolean;
+	}>;
+	createNarrator(input: {
+		title?: string;
+		model?: string;
+		cwd?: string;
+		chapterId?: string | null;
+		permissionMode?: string;
+		type?: "primary" | "subagent";
+		subagentType?: string;
+		parentNarratorId?: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{
+		narratorId: string;
+		title: string | null;
+		variant: string;
+		type: "primary" | "subagent";
+		model: string | null;
+		cwd: string | null;
+		status: string;
+	}>;
+	deleteNarrator(input: {
+		narratorId: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ deleted: true }>;
+	specTasksGet(input: {
+		narratorId: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{
+		content: string;
+		revisionId: string | null;
+		compiled: {
+			tasks: Array<{ text: string; status: string; protected: boolean }>;
+			openCount: number;
+			protectedOpenCount: number;
+		};
+	}>;
+	specTaskAdd(input: {
+		narratorId: string;
+		text: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ added: boolean; taskText: string; revisionId: string | null }>;
 	interrupt(input: {
 		narratorId: string;
 		context: HostCallContext;
@@ -1318,6 +1385,36 @@ export const narratorSendMessageInputSchema = z
 		message: z.string().trim().min(1).max(EXTERNAL_V1_MAX_MESSAGE_CHARS),
 		locale: z.enum(["en", "zh-CN"]).optional(),
 		replyInUserLanguage: z.boolean().optional(),
+	})
+	.strict();
+export const narratorSendSubagentMessageInputSchema = z
+	.object({
+		narratorId: idSchema,
+		message: z.string().trim().min(1).max(EXTERNAL_V1_MAX_MESSAGE_CHARS),
+		priority: z.boolean().optional(),
+		locale: z.enum(["en", "zh-CN"]).optional(),
+	})
+	.strict();
+export const narratorCreateInputSchema = z
+	.object({
+		title: z.string().min(1).max(200).optional(),
+		model: z.string().min(1).max(200).optional(),
+		cwd: z.string().min(1).max(4096).optional(),
+		chapterId: idSchema.nullish(),
+		permissionMode: z
+			.enum(["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"])
+			.optional(),
+		type: z.enum(["primary", "subagent"]).optional(),
+		subagentType: z.string().min(1).max(64).optional(),
+		parentNarratorId: idSchema.optional(),
+	})
+	.strict();
+export const narratorDeleteInputSchema = z.object({ narratorId: idSchema }).strict();
+export const narratorSpecTasksGetInputSchema = z.object({ narratorId: idSchema }).strict();
+export const narratorSpecTaskAddInputSchema = z
+	.object({
+		narratorId: idSchema,
+		text: z.string().trim().min(1).max(1000),
 	})
 	.strict();
 export const narratorInterruptInputSchema = z.object({ narratorId: idSchema }).strict();
@@ -1713,30 +1810,154 @@ export class PluginPublicApi {
 				},
 			});
 		}
-		if (!this.commands.has("narrafork.narrator.send_message")) {
-			this.commands.register({
-				commandId: "narrafork.narrator.send_message",
-				capability: "command.narrator.send_message",
-				inputSchema: narratorSendMessageInputSchema,
-				redaction: "user_scoped",
-				sideEffect: "non_idempotent",
-				idempotency: "optional",
-				resource: (input) => ({ type: "narrator", id: input.narratorId }),
-				handler: async (input, call) => {
-					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
-					const sent = await adapter.sendMessage({
-						narratorId: input.narratorId,
-						message: input.message,
-						locale: input.locale,
-						replyInUserLanguage: input.replyInUserLanguage,
-						pluginId: call.host.plugin.pluginId,
-						context: call.host,
-						signal: call.signal,
-					});
-					return { data: { accepted: true, messageId: sent.messageId } };
-				},
-			});
-		}
+	if (!this.commands.has("narrafork.narrator.send_message")) {
+		this.commands.register({
+			commandId: "narrafork.narrator.send_message",
+			capability: "command.narrator.send_message",
+			inputSchema: narratorSendMessageInputSchema,
+			redaction: "user_scoped",
+			sideEffect: "non_idempotent",
+			idempotency: "optional",
+			resource: (input) => ({ type: "narrator", id: input.narratorId }),
+			handler: async (input, call) => {
+				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+				const sent = await adapter.sendMessage({
+					narratorId: input.narratorId,
+					message: input.message,
+					locale: input.locale,
+					replyInUserLanguage: input.replyInUserLanguage,
+					pluginId: call.host.plugin.pluginId,
+					context: call.host,
+					signal: call.signal,
+				});
+				return { data: { accepted: true, messageId: sent.messageId } };
+			},
+		});
+	}
+	if (!this.commands.has("narrafork.narrator.send_subagent_message")) {
+		this.commands.register({
+			commandId: "narrafork.narrator.send_subagent_message",
+			capability: "command.narrator.send_subagent_message",
+			inputSchema: narratorSendSubagentMessageInputSchema,
+			redaction: "user_scoped",
+			sideEffect: "non_idempotent",
+			idempotency: "optional",
+			resource: (input) => ({ type: "narrator", id: input.narratorId }),
+			handler: async (input, call) => {
+				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+				const sent = await adapter.sendSubagentMessage({
+					narratorId: input.narratorId,
+					message: input.message,
+					priority: input.priority,
+					locale: input.locale,
+					pluginId: call.host.plugin.pluginId,
+					context: call.host,
+					signal: call.signal,
+				});
+				return {
+					data: {
+						delivered: sent.delivered,
+						...(sent.messageId ? { messageId: sent.messageId } : {}),
+						...(sent.bufferedAt ? { bufferedAt: sent.bufferedAt } : {}),
+						...(typeof sent.started === "boolean" ? { started: sent.started } : {}),
+					},
+				};
+			},
+		});
+	}
+	if (!this.commands.has("narrafork.narrator.create")) {
+		this.commands.register({
+			commandId: "narrafork.narrator.create",
+			capability: "command.narrator.create",
+			inputSchema: narratorCreateInputSchema,
+			redaction: "user_scoped",
+			sideEffect: "non_idempotent",
+			idempotency: "optional",
+			// The narrator does not exist yet; the capability grant is the gate.
+			resource: () => undefined,
+			handler: async (input, call) => {
+				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+				const created = await adapter.createNarrator({
+					title: input.title,
+					model: input.model,
+					cwd: input.cwd,
+					chapterId: input.chapterId,
+					permissionMode: input.permissionMode,
+					type: input.type,
+					subagentType: input.subagentType,
+					parentNarratorId: input.parentNarratorId,
+					pluginId: call.host.plugin.pluginId,
+					context: call.host,
+					signal: call.signal,
+				});
+				return { data: created };
+			},
+		});
+	}
+	if (!this.commands.has("narrafork.narrator.delete")) {
+		this.commands.register({
+			commandId: "narrafork.narrator.delete",
+			capability: "command.narrator.delete",
+			inputSchema: narratorDeleteInputSchema,
+			redaction: "user_scoped",
+			sideEffect: "non_idempotent",
+			idempotency: "optional",
+			resource: (input) => ({ type: "narrator", id: input.narratorId }),
+			handler: async (input, call) => {
+				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+				await adapter.deleteNarrator({
+					narratorId: input.narratorId,
+					pluginId: call.host.plugin.pluginId,
+					context: call.host,
+					signal: call.signal,
+				});
+				return { data: { deleted: true } };
+			},
+		});
+	}
+	if (!this.commands.has("narrafork.narrator.spec_tasks_get")) {
+		this.commands.register({
+			commandId: "narrafork.narrator.spec_tasks_get",
+			capability: "command.narrator.spec_tasks_get",
+			inputSchema: narratorSpecTasksGetInputSchema,
+			redaction: "user_scoped",
+			sideEffect: "non_idempotent",
+			idempotency: "optional",
+			resource: (input) => ({ type: "narrator", id: input.narratorId }),
+			handler: async (input, call) => {
+				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+				const result = await adapter.specTasksGet({
+					narratorId: input.narratorId,
+					pluginId: call.host.plugin.pluginId,
+					context: call.host,
+					signal: call.signal,
+				});
+				return { data: result };
+			},
+		});
+	}
+	if (!this.commands.has("narrafork.narrator.spec_task_add")) {
+		this.commands.register({
+			commandId: "narrafork.narrator.spec_task_add",
+			capability: "command.narrator.spec_task_add",
+			inputSchema: narratorSpecTaskAddInputSchema,
+			redaction: "user_scoped",
+			sideEffect: "non_idempotent",
+			idempotency: "optional",
+			resource: (input) => ({ type: "narrator", id: input.narratorId }),
+			handler: async (input, call) => {
+				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+				const result = await adapter.specTaskAdd({
+					narratorId: input.narratorId,
+					text: input.text,
+					pluginId: call.host.plugin.pluginId,
+					context: call.host,
+					signal: call.signal,
+				});
+				return { data: result };
+			},
+		});
+	}
 		if (!this.commands.has("narrafork.narrator.interrupt")) {
 			this.commands.register({
 				commandId: "narrafork.narrator.interrupt",
@@ -2569,6 +2790,11 @@ type PluginManagerPublicMethods = Pick<PluginManager, "list" | "getStatus" | "en
 /** Narrow facade over narrator services so tests can inject a fake. */
 export type NarratorSessionFacade = {
 	sendMessage: typeof sendNarratorMessage;
+	sendSubagentMessage: typeof sendSubagentMessageToSession;
+	createNarrator: typeof createNarratorForPluginSession;
+	deleteNarrator: typeof deleteNarratorForPluginSession;
+	specTasksGet: typeof readSpecTasksForPluginSession;
+	specTaskAdd: typeof addSpecTaskForPluginSession;
 	interruptNarrator: typeof interruptNarratorSession;
 	getById: typeof narratorService.getById;
 };
@@ -2592,7 +2818,9 @@ function mapNarratorCommandError(error: unknown): PluginPublicApiError {
 				"Subagent messages must be sent through the parent narrator",
 			);
 		}
-		return new PluginPublicApiError("INVALID_PARAMS", "Invalid narrator operation");
+		// Keep the concrete validation reason (e.g. a subagent that has never
+		// been started by its parent) instead of a generic message.
+		return new PluginPublicApiError("INVALID_PARAMS", message || "Invalid narrator operation");
 	}
 	return new PluginPublicApiError(
 		"INTERNAL_ERROR",
@@ -2613,6 +2841,11 @@ export function createCorePluginPublicApiAdapters(options: {
 	const { db, pluginManager } = options;
 	const session = options.narratorSession ?? {
 		sendMessage: sendNarratorMessage,
+		sendSubagentMessage: sendSubagentMessageToSession,
+		createNarrator: createNarratorForPluginSession,
+		deleteNarrator: deleteNarratorForPluginSession,
+		specTasksGet: readSpecTasksForPluginSession,
+		specTaskAdd: addSpecTaskForPluginSession,
 		interruptNarrator: interruptNarratorSession,
 		getById: narratorService.getById,
 	};
@@ -2796,11 +3029,98 @@ export function createCorePluginPublicApiAdapters(options: {
 						null,
 						{ origin: "user", originLabel: `plugin:${input.pluginId}` },
 					);
-					return { messageId: sent.id };
-				} catch (error) {
-					throw mapNarratorCommandError(error);
-				}
-			},
+				return { messageId: sent.id };
+			} catch (error) {
+				throw mapNarratorCommandError(error);
+			}
+		},
+		async sendSubagentMessage(input) {
+			if (input.signal.aborted)
+				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+			try {
+				const result = await session.sendSubagentMessage({
+					subagentId: input.narratorId,
+					message: input.message,
+					priority: input.priority,
+					locale: input.locale,
+					createdBy: null,
+					signal: input.signal,
+				});
+				return {
+					delivered: result.delivered,
+					...(result.messageId ? { messageId: result.messageId } : {}),
+					...(result.bufferedAt ? { bufferedAt: result.bufferedAt } : {}),
+					...(typeof result.started === "boolean" ? { started: result.started } : {}),
+				};
+			} catch (error) {
+				throw mapNarratorCommandError(error);
+			}
+		},
+		async createNarrator(input) {
+			if (input.signal.aborted)
+				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+			try {
+				const result = await session.createNarrator({
+					title: input.title,
+					model: input.model,
+					cwd: input.cwd,
+					chapterId: input.chapterId,
+					permissionMode: input.permissionMode,
+					type: input.type,
+					subagentType: input.subagentType,
+					parentNarratorId: input.parentNarratorId,
+				});
+				return result;
+			} catch (error) {
+				throw mapNarratorCommandError(error);
+			}
+		},
+		async deleteNarrator(input) {
+			if (input.signal.aborted)
+				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+			try {
+				await session.deleteNarrator(input.narratorId);
+				return { deleted: true };
+			} catch (error) {
+				throw mapNarratorCommandError(error);
+			}
+		},
+		async specTasksGet(input) {
+			if (input.signal.aborted)
+				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+			try {
+				const result = await session.specTasksGet(input.narratorId);
+				return {
+					content: result.content,
+					revisionId: result.revisionId,
+					compiled: {
+						tasks: result.compiled.tasks.map((task) => ({
+							text: task.text,
+							status: task.status,
+							protected: task.protected,
+						})),
+						openCount: result.compiled.openCount,
+						protectedOpenCount: result.compiled.protectedOpenCount,
+					},
+				};
+			} catch (error) {
+				throw mapNarratorCommandError(error);
+			}
+		},
+		async specTaskAdd(input) {
+			if (input.signal.aborted)
+				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+			try {
+				const result = await session.specTaskAdd(input.narratorId, input.text);
+				return {
+					added: result.added,
+					taskText: result.taskText,
+					revisionId: result.revisionId,
+				};
+			} catch (error) {
+				throw mapNarratorCommandError(error);
+			}
+		},
 			async interrupt(input) {
 				if (input.signal.aborted)
 					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
@@ -2830,7 +3150,12 @@ export const PUBLIC_COMMAND_IDS = [
 	"narrafork.plugins.enable",
 	"narrafork.plugins.disable",
 	"narrafork.narrator.send_message",
+	"narrafork.narrator.send_subagent_message",
 	"narrafork.narrator.interrupt",
+	"narrafork.narrator.create",
+	"narrafork.narrator.delete",
+	"narrafork.narrator.spec_tasks_get",
+	"narrafork.narrator.spec_task_add",
 ] as const;
 
 export type PublicQueryId = (typeof PUBLIC_QUERY_IDS)[number];

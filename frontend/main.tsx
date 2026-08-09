@@ -224,11 +224,38 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 		[colorScheme],
 	);
 
+	// Navigate to an internal route from a plugin panel. The live router
+	// instance is created in bootstrap() before React mounts, so reading the
+	// module-level binding here is safe. Using the typed template + params form
+	// matches how the rest of the app navigates to dynamic routes.
+	const navigate = React.useCallback((to: string) => {
+		const router = appRouter;
+		if (!router) return;
+		const narrator = to.match(/^\/narrators\/([^/]+)$/);
+		if (narrator) {
+			void router.navigate({
+				to: "/narrators/$narratorId",
+				params: { narratorId: narrator[1] },
+			});
+			return;
+		}
+		const project = to.match(/^\/projects\/([^/]+)$/);
+		if (project) {
+			void router.navigate({
+				to: "/projects/$projectId",
+				params: { projectId: project[1] },
+			});
+			return;
+		}
+		void router.navigate({ to });
+	}, []);
+
 	return (
 		<PluginUiRuntimeProvider
 			resolveContribution={resolvePluginUiContribution}
 			getContext={getContext}
 			onBackendRequest={requestPluginUiBackend}
+			hostLocal={{ navigate }}
 		>
 			{children}
 		</PluginUiRuntimeProvider>
@@ -251,13 +278,23 @@ function applyInitialPluginTheme() {
 	}
 }
 
+/** Created once in bootstrap(); exported so plugin UI internals that render
+ *  OUTSIDE RouterProvider (e.g. PluginUiRuntimeProvider) can still navigate. */
+let appRouter: AppRouter | undefined;
+
+/** Accessor for the live router instance (undefined until bootstrap runs). */
+export function getAppRouter(): AppRouter | undefined {
+	return appRouter;
+}
+
 async function bootstrap() {
 	applyInitialPluginTheme();
 	// Before React mounts, so the first gesture on the first paint is already
 	// covered. Safari in a browser tab ignores index.html's `user-scalable=no`, and
 	// a component-level handler is structurally too late (see pinch-zoom-guard.ts).
 	installPinchZoomGuard();
-	const router = createAppRouter(createBrowserHistory());
+	appRouter = createAppRouter(createBrowserHistory());
+	const router = appRouter;
 
 	// Sweep focus-dock layouts unopened for >30 days (best-effort, never throws).
 	cleanupStaleNarratorDockLayouts();

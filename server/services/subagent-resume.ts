@@ -360,7 +360,15 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 			throw new ValidationError("Subagent is already running; queue the message instead");
 		}
 
-		const originToolUseId = await resolveSubagentOriginToolUseId(input.subagentId);
+		const originToolUseId = await resolveSubagentOriginToolUseId(input.subagentId).catch(() => {
+			// Never-started subagent (e.g. a team temp worker recruited directly
+			// through the plugin API): there is no originating Agent tool call.
+			// Synthesize a standalone tool-use id so the message can still be
+			// persisted and the subagent run. Conclusion delivery back to a tool
+			// call is a no-op for the synthesized id (updateToolCallResult finds
+			// no matching row), which is exactly right for standalone runs.
+			return `standalone-${generateId()}`;
+		});
 		let effectiveInput = input;
 		// Set by the regenerate_edited_message branch below, then attached to every
 		// return path so the advisory is not lost between the rollback and the reply.

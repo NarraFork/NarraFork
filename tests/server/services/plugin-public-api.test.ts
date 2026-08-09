@@ -159,8 +159,13 @@ describe("PluginPublicApi", () => {
 			"narrafork.projects.list",
 		]);
 		expect(api.commands.listIds()).toEqual([
+			"narrafork.narrator.create",
+			"narrafork.narrator.delete",
 			"narrafork.narrator.interrupt",
 			"narrafork.narrator.send_message",
+			"narrafork.narrator.send_subagent_message",
+			"narrafork.narrator.spec_task_add",
+			"narrafork.narrator.spec_tasks_get",
 			"narrafork.plugins.disable",
 			"narrafork.plugins.enable",
 		]);

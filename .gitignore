@@ -57,3 +57,6 @@ IMPROVEMENT-PLAN.md
 
 # Dynamic Spec runtime state (per-narrator task queue / planning notes)
 spec/
+
+# bun build cache
+.*.bun-build

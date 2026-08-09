@@ -1,7 +1,7 @@
 /**
  * Dockview-backed workspace surface.
  *
- * Composes the reusable <DockviewSurface> (theme + single-tab hiding +
+ * Composes the reusable <DockviewSurface> (theme +
  * swap/merge/split drag semantics) and layers on the workspace-specific
  * concerns: layout persistence via the versioned envelope in
  * `dockview-layout.ts`, legacy split-tree migration, sidebar drag-and-drop

@@ -20,6 +20,8 @@ export interface PluginAssetShellOptions {
 	panelInstanceId: string;
 	entryUrl: string;
 	styleUrl?: string;
+	/** Panel title shown by the built-in loading splash (before the plugin script takes over). */
+	title?: string;
 	defaultTimeoutMs?: number;
 	/**
 	 * Shared host runtime (React + Mantine) to load before the plugin entry.
@@ -367,7 +369,14 @@ export function createPluginAssetShell(options: PluginAssetShellOptions): string
 		"manifest-src 'none'",
 		"media-src 'none'",
 	].join("; ");
-	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"><style>:root{${readHostMantineTokens()}}</style></head><body><script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
+	// The iframe body starts with a themed loading splash (spinner + panel
+	// title) so the frame is never a blank white rectangle while the bridge
+	// handshake and plugin script load. The plugin script takes over the body
+	// as soon as it runs (plugin UIs render their own content); the splash is
+	// deliberately inline/CSP-safe (style-src 'unsafe-inline').
+	const splashTitle = options.title ? escapeAttribute(options.title) : "Plugin panel";
+	const splash = `<div id="plugin-shell-splash" style="position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:var(--mantine-color-body,#1a1b1e);color:var(--mantine-color-dimmed,#909296);font-family:var(--mantine-font-family,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif);font-size:13px;"><div style="width:20px;height:20px;border:2px solid var(--mantine-color-default-border,#373a40);border-top-color:var(--mantine-primary-color-5,#4c6ef5);border-radius:50%;animation:plugin-shell-spin .9s linear infinite;"></div><div>${splashTitle}</div></div><style>@keyframes plugin-shell-spin{to{transform:rotate(360deg)}}</style>`;
+	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"><style>:root{${readHostMantineTokens()}}</style></head><body>${splash}<script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
 }
 
 export function createPluginNonce(): string {

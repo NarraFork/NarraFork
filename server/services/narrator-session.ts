@@ -5353,6 +5353,205 @@ export async function sendMessage(
 	return userMsg;
 }
 
+export interface SendSubagentMessageInput {
+	subagentId: string;
+	message: string;
+	priority?: boolean;
+	locale?: Locale;
+	createdBy?: string | null;
+	signal?: AbortSignal;
+}
+
+export interface SendSubagentMessageResult {
+	delivered: "buffered" | "started";
+	messageId?: string;
+	bufferedAt?: string;
+	started?: boolean;
+	resumedSuspendedRunner?: boolean;
+}
+
+/**
+ * Deliver a message to a subagent narrator and get it to act on it.
+ *
+ * Subagents have no independent message channel: a running subagent consumes
+ * buffered messages at its next safe boundary (soft stop), while an idle
+ * subagent is resumed in-place with a follow-up turn. This is the counterpart
+ * of {@link sendMessage} for primary narrators — the REST layer already routes
+ * subagent messages through `resumeSubagent`; this function centralizes the
+ * same decision (running → buffer, idle → resume) behind one callable.
+ */
+export async function sendSubagentMessage(
+	input: SendSubagentMessageInput,
+): Promise<SendSubagentMessageResult> {
+	const narrator = await narratorService.getById(input.subagentId);
+	if (!isSubagentVariant(narrator.variant)) {
+		throw new ValidationError("Target narrator is not a subagent");
+	}
+	if (narrator.status === "archived") {
+		throw new ValidationError("Archived subagents cannot receive messages");
+	}
+	const running = narrator.status === "working" || narrator.status === "waiting";
+	if (running) {
+		const { bufferSubagentUserMessage } = await import("./subagent-executor");
+		const { isTakenOver } = await import("./subagent-takeover");
+		const result = bufferSubagentUserMessage(input.subagentId, input.message, {
+			createdBy: input.createdBy ?? null,
+			priority: input.priority ?? false,
+			requestSoftStop: !isTakenOver(input.subagentId),
+		});
+		if (!result.ok) {
+			if (result.full) throw new ValidationError("Subagent message queue is full");
+			throw new ValidationError("Subagent is not running; it cannot be buffered right now");
+		}
+		return {
+			delivered: "buffered",
+			messageId: result.id,
+			bufferedAt: result.bufferedAt,
+		};
+	}
+	// Idle subagent: resume in-place with a follow-up turn. This requires the
+	// subagent to have been started at least once by its parent narrator (the
+	// originating Agent tool call is resolved internally); subagents that have
+	// never run report a clear ValidationError instead.
+	const { resumeSubagent } = await import("./subagent-resume");
+	const resumed = await resumeSubagent({
+		subagentId: input.subagentId,
+		intent: "follow_up",
+		actor: "parent_agent",
+		prompt: input.message,
+		locale: input.locale ?? "en",
+		createdBy: input.createdBy ?? null,
+		signal: input.signal,
+	});
+	return {
+		delivered: "started",
+		started: resumed.started,
+		resumedSuspendedRunner: resumed.resumedSuspendedRunner,
+		messageId: resumed.userMessage?.id ?? null,
+	};
+}
+
+export interface CreateNarratorForPluginInput {
+	title?: string;
+	model?: string;
+	cwd?: string;
+	chapterId?: string | null;
+	permissionMode?: string;
+	/** "subagent" creates a team temp worker owned by `parentNarratorId`. */
+	type?: "primary" | "subagent";
+	subagentType?: string;
+	parentNarratorId?: string;
+}
+
+export interface CreateNarratorForPluginResult {
+	narratorId: string;
+	title: string | null;
+	variant: string;
+	type: "primary" | "subagent";
+	model: string | null;
+	cwd: string | null;
+	status: string;
+}
+
+/**
+ * Create a narrator for a plugin (team recruit flow): a primary narrator for
+ * team members, or a subagent temp worker owned by the recruiting narrator.
+ */
+export async function createNarratorForPlugin(
+	input: CreateNarratorForPluginInput,
+): Promise<CreateNarratorForPluginResult> {
+	if (input.type === "subagent") {
+		if (!input.parentNarratorId) {
+			throw new ValidationError("Subagent temp workers require a recruiting parent narrator");
+		}
+		const parent = await narratorService.getById(input.parentNarratorId);
+		const narrator = await narratorService.createSubagent({
+			parentNarratorId: input.parentNarratorId,
+			subagentType: input.subagentType ?? "general",
+			title: input.title,
+			model: input.model,
+			cwd: input.cwd ?? parent.cwd ?? ".",
+			permissionMode: input.permissionMode as
+				| "default"
+				| "acceptEdits"
+				| "bypassPermissions"
+				| "readOnly"
+				| "dontAsk"
+				| undefined,
+		});
+		return {
+			narratorId: narrator.id,
+			title: narrator.title ?? null,
+			variant: narrator.variant,
+			type: "subagent",
+			model: narrator.model ?? null,
+			cwd: narrator.cwd ?? null,
+			status: narrator.status,
+		};
+	}
+	const narrator = await narratorService.create({
+		chapterId: input.chapterId ?? null,
+		title: input.title,
+		model: input.model,
+		cwd: input.cwd,
+		permissionMode: input.permissionMode,
+	});
+	return {
+		narratorId: narrator.id,
+		title: narrator.title ?? null,
+		variant: narrator.variant,
+		type: "primary",
+		model: narrator.model ?? null,
+		cwd: narrator.cwd ?? null,
+		status: narrator.status,
+	};
+}
+
+/** Delete a narrator entirely (team fire flow: removes the worker narrator). */
+export async function deleteNarratorForPlugin(narratorId: string): Promise<void> {
+	await narratorService.remove(narratorId);
+}
+
+/**
+ * Read a narrator's Dynamic Spec tasks.json (compiled). Used by the team plugin
+ * to track the shared task queue it maintains for each member.
+ */
+export async function readSpecTasksForPlugin(narratorId: string) {
+	const { readTasksFileForNarrator } = await import("./spec-vfs-service");
+	const { parseSpecTasksDocument, compileSpecTasks } = await import("./spec-task-service");
+	const file = await readTasksFileForNarrator(narratorId);
+	const document = parseSpecTasksDocument(file.content);
+	const compiled = compileSpecTasks(document);
+	return {
+		content: file.content,
+		revisionId: file.revisionId ?? null,
+		document,
+		compiled,
+	};
+}
+
+/**
+ * Append a protected task to a narrator's spec://tasks.json (the same mechanism
+ * the /goal command uses). Protected tasks auto-continue the narrator until
+ * done, which is exactly the queue semantics a team needs: dispatching a task
+ * enqueues it in the member's own task queue, and the member's loop picks it up.
+ * Idempotent: identical text is not appended twice (safe for redispatch).
+ */
+export async function addSpecTaskForPlugin(
+	narratorId: string,
+	text: string,
+): Promise<{ added: boolean; taskText: string; revisionId: string | null }> {
+	const { appendProtectedSpecTask } = await import("./spec-vfs-service");
+	const objective = text.trim();
+	if (!objective) throw new ValidationError("task text is required");
+	const { added, written } = await appendProtectedSpecTask(narratorId, objective);
+	return {
+		added,
+		taskText: objective,
+		revisionId: written.revisionId ?? null,
+	};
+}
+
 /**
  * Start the first execution turn for an explicit `/goal` after its protected
  * task has been persisted to Dynamic Spec. This deliberately bypasses an `off`

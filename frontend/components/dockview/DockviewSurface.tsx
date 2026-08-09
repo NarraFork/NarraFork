@@ -2,7 +2,7 @@
  * DockviewSurface — NarraFork's reusable Dockview wrapper.
  *
  * Bundles the custom behaviours we want everywhere we embed Dockview:
- *   - Mantine-aligned theme (theme.css) + single-tab hiding
+ *   - Mantine-aligned theme (theme.css)
  *   - three-zone drop semantics (center swap / surround merge / edge split)
  *     for both the panel-drag singleton and native panel drags
  *   - an overlay hint that distinguishes swap from merge/split
@@ -141,53 +141,14 @@ export function DockviewSurface({
 	const internalApiRef = useRef<DockviewApi | null>(null);
 	const apiRef = externalApiRef ?? internalApiRef;
 	const rootRef = useRef<HTMLDivElement | null>(null);
-	const relayoutDisposablesRef = useRef<Array<{ dispose(): void }>>([]);
-	const relayoutRafRef = useRef<number | null>(null);
-
-	// With defaultRenderer="always" dockview renders each panel into an
-	// absolutely-positioned overlay whose top/height are JS-computed from the
-	// content container and only recomputed on a dimension change. Our theme
-	// hides the tab strip via CSS (`.dv-single-tab { display:none }`) when a
-	// group drops to one tab; that grows the content box WITHOUT changing the
-	// group's pixel size, so no dimension-change event fires and the overlay
-	// keeps its stale offset (an empty tab-strip-high gap above the panel).
-	// Forcing a relayout at the current size re-propagates panel dimensions,
-	// which makes the overlay recompute its position. Harmless in
-	// onlyWhenVisible mode (content lives in the flex box), so always run it.
-	const scheduleRelayout = useCallback(() => {
-		if (relayoutRafRef.current !== null) return;
-		relayoutRafRef.current = requestAnimationFrame(() => {
-			relayoutRafRef.current = null;
-			const api = apiRef.current;
-			if (!api) return;
-			api.layout(api.width, api.height, true);
-		});
-	}, [apiRef]);
 
 	const handleReady = useCallback(
 		(event: DockviewReadyEvent) => {
 			apiRef.current = event.api;
-			// Re-run after add/remove so crossing the single-tab boundary (strip
-			// shown ↔ hidden) repositions the always-rendered panel overlays.
-			relayoutDisposablesRef.current = [
-				event.api.onDidAddPanel(() => scheduleRelayout()),
-				event.api.onDidRemovePanel(() => scheduleRelayout()),
-			];
 			onReady?.(event.api);
 		},
-		[apiRef, onReady, scheduleRelayout],
+		[apiRef, onReady],
 	);
-
-	useEffect(() => {
-		return () => {
-			if (relayoutRafRef.current !== null) {
-				cancelAnimationFrame(relayoutRafRef.current);
-				relayoutRafRef.current = null;
-			}
-			for (const d of relayoutDisposablesRef.current) d.dispose();
-			relayoutDisposablesRef.current = [];
-		};
-	}, []);
 
 	const handleDidDrop = useCallback(
 		(event: DockviewDidDropEvent) => {

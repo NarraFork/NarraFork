@@ -935,9 +935,7 @@ export const narratorDockComponents: Record<
  * Close-less tab for the chat panel. The chat panel is the cluster's
  * protagonist and must never be closed (focus-page rule), so its dockview tab
  * renders the title only — no close action. Tool panels keep the default tab
- * (with close). Note: when chat is alone in its group the tab strip is hidden
- * entirely (`.dv-single-tab`); this matters only when a tool is dragged into
- * chat's group, making the strip visible.
+ * (with close).
  */
 function ChatTab(props: IDockviewPanelHeaderProps) {
 	const [title, setTitle] = useState(props.api.title ?? "");

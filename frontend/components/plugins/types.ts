@@ -201,6 +201,13 @@ export interface PluginUiRuntimeApi {
 	) => void;
 	updateSessionParams: (panelInstanceId: string, params: PluginDockPanelParams) => void;
 	getSessionSnapshot: (panelInstanceId: string) => PluginUiSessionSnapshot | undefined;
+	/**
+	 * The live session controller for a panel (if any). The panel renders the
+	 * session's iframe inside its own dock content — mirroring how built-in tool
+	 * panels render their content directly — instead of an overlay layer, so the
+	 * dock natively manages tab switching, hiding, and movement.
+	 */
+	getSessionController: (panelInstanceId: string) => PluginUiSessionController | undefined;
 	reloadSession: (panelInstanceId: string) => void;
 	/** Dispose the session for one panel (if any) without scheduling a rebuild. */
 	disposeSession: (panelInstanceId: string) => void;
@@ -227,4 +234,13 @@ export interface PluginUiSessionSnapshot {
 	status: "pending" | "registered" | "connecting" | "ready" | "error" | "crashed" | "disposed";
 	diagnosticId?: string;
 	error?: string;
+}
+
+/** Narrow surface over the live session runtime used by the dock panel. */
+export interface PluginUiSessionController {
+	getSrcdoc(): string;
+	attach(iframe: HTMLIFrameElement): void;
+	setVisibility(visible: boolean): void;
+	setActive(active: boolean): void;
+	setFocused(focused: boolean): void;
 }

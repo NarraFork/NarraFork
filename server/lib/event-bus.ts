@@ -148,6 +148,14 @@ export type NarraForkEvent =
 	| { type: "narrator:message"; narratorId: string; role: string }
 	| { type: "narrator:status_changed"; narratorId: string; status: string; substatus?: string[] }
 	| {
+			type: "spec:changed";
+			narratorId: string;
+			path: string;
+			uri: string;
+			revisionId: string | null;
+			updatedBy: string;
+	  }
+	| {
 			type: "narrator:error";
 			narratorId: string;
 			error: string;

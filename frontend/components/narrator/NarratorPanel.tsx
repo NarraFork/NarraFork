@@ -3731,18 +3731,33 @@ export function NarratorPanel({
 			version: string;
 			hash: string;
 		}) => {
-			const api = dockApiRef?.current;
-			if (!api) return;
-			// Stack into the cluster's secondary group when one exists, otherwise
-			// split right of the chat/narrator panel (mirrors openToolPanel).
-			const request = buildPluginDockPanelOpenRequest({
-				pick,
-				hostContext: pluginSurface
-					? { ...pluginSurface.hostContext, narratorId, chapterId, projectId }
-					: undefined,
-				panels: api.panels,
-			});
-			api.addPanel(request);
+		const api = dockApiRef?.current;
+		if (!api) return;
+		// A plugin contribution is a singleton per narrator surface: re-picking it
+		// from the picker must focus the existing panel, not stack a second
+		// instance (each addPanel gets a fresh panelInstanceId).
+		const existingPlugin = api.panels.find((panel) => {
+			const params = panel.params as { panelType?: string; pluginId?: string; contributionId?: string } | undefined;
+			return (
+				params?.panelType === "plugin" &&
+				params.pluginId === pick.pluginId &&
+				params.contributionId === pick.contributionId
+			);
+		});
+		if (existingPlugin) {
+			existingPlugin.api.setActive();
+			return;
+		}
+		// Stack into the cluster's secondary group when one exists, otherwise
+		// split right of the chat/narrator panel (mirrors openToolPanel).
+		const request = buildPluginDockPanelOpenRequest({
+			pick,
+			hostContext: pluginSurface
+				? { ...pluginSurface.hostContext, narratorId, chapterId, projectId }
+				: undefined,
+			panels: api.panels,
+		});
+		api.addPanel(request);
 		},
 		[dockApiRef, pluginSurface, narratorId, chapterId, projectId],
 	);

@@ -160,6 +160,7 @@ export const CAPABILITY_TAXONOMY = {
 		"query.read.host_settings",
 	],
 	event: [
+		"event.subscribe",
 		"event.subscribe.chapter",
 		"event.subscribe.narrator",
 		"event.subscribe.permission",
@@ -171,7 +172,12 @@ export const CAPABILITY_TAXONOMY = {
 	],
 	command: [
 		"command.narrator.send_message",
+		"command.narrator.send_subagent_message",
 		"command.narrator.interrupt",
+		"command.narrator.create",
+		"command.narrator.delete",
+		"command.narrator.spec_tasks_get",
+		"command.narrator.spec_task_add",
 		"command.permission.decide",
 		"command.chapter.write",
 		"command.chapter.merge",

@@ -754,6 +754,16 @@ export class CapabilityBroker {
 			);
 			const boundPrincipal = staticBinding?.plugin ?? staticBinding?.principal;
 			if (boundPrincipal && !samePrincipal(parsedPlugin.data, boundPrincipal)) {
+				// TEMP-DEBUG: identity mismatch triage
+				// eslint-disable-next-line no-console
+				console.log(
+					"TEMP-DEBUG identity mismatch",
+					JSON.stringify(parsedPlugin.data),
+					"vs",
+					JSON.stringify(boundPrincipal),
+					"bindings:",
+					JSON.stringify([...this.staticBindings.keys()]),
+				);
 				throw this.error(PLUGIN_ERROR_CODES.CONTEXT_UNAVAILABLE, "PLUGIN_IDENTITY_MISMATCH");
 			}
 		}

@@ -1550,6 +1550,11 @@ export class PluginManager {
 				...created,
 				runtimeId,
 				generation: nextGeneration - 1,
+				// The capability broker registers this binding with the package hash
+				// as installationId; the spawned plugin process must carry the same
+				// value or every host call fails identity validation (the dispatcher
+				// would otherwise fall back to a `runtime:<id>` pseudo-installation).
+				installationId: context.package.hash,
 				dispatcher: binding.dispatcher,
 			};
 		}
