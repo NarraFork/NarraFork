@@ -1001,7 +1001,10 @@ export class PluginToolRegistry {
 					scope,
 					code: denied?.code,
 					reason: (denied as { reason?: unknown } | undefined)?.reason,
-					message: denied?.message,
+					message:
+						denied && typeof denied === "object" && "message" in denied
+							? String((denied as { message: unknown }).message)
+							: undefined,
 					diagnosticId: (denied as { diagnosticId?: unknown } | undefined)?.diagnosticId,
 					contextKeys: host ? Object.keys(host) : undefined,
 				});
