@@ -248,7 +248,9 @@
 		"gitAdded": "Added",
 		"gitDeleted": "Deleted",
 		"gitRenamed": "Renamed",
-		"gitUntracked": "Untracked"
+		"gitUntracked": "Untracked",
+		"gitCopied": "Copied",
+		"gitUnmerged": "Conflicted"
 	},
 	"operationFailed": "Operation failed",
 	"unexpectedError": "An unexpected error occurred",

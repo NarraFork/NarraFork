@@ -33,9 +33,11 @@ import {
 	useGitStatus,
 	useGitUnstage,
 } from "../../hooks/useGit";
+import { useGitFolderPrefs } from "../../hooks/useGitFolderPrefs";
 import { useNarrators } from "../../hooks/useNarrator";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { GitFileDiff } from "./GitFileDiff";
+import { type GitFileSection, gitFileBadgeChar } from "./git-file-status";
 import { buildGitFileTree, compactGitFileTree, type GitFileTreeNode } from "./git-file-tree";
 
 /** Max files to render per section to avoid UI freeze. */
@@ -72,7 +74,19 @@ interface DisplayFile {
 interface TreeContext {
 	keyPrefix: string;
 	action: "stage" | "unstage";
-	collapsed: Set<string>;
+	/**
+	 * Which half of the porcelain status these rows report. Carried explicitly
+	 * rather than derived from `action`: the badge letter depends on it, and
+	 * inferring "staged" from the verb "unstage" is the kind of double negative
+	 * that reads wrong at the call site.
+	 */
+	section: GitFileSection;
+	/**
+	 * Folder paths the user has opened. Folders default to CLOSED, so this is the
+	 * exception list rather than a collapsed list — an unseen path is collapsed
+	 * without anyone having to enumerate the tree.
+	 */
+	expandedFolders: Set<string>;
 	onToggle: (path: string) => void;
 	onAction: (files: string[]) => void;
 	onOpenFile: (path: string) => void;
@@ -102,9 +116,11 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	const [message, setMessage] = useState("");
 	const [diffFile, setDiffFile] = useState<string | null>(null);
 	const [diffStaged, setDiffStaged] = useState(false);
-	// Folders start expanded, so a fresh panel still shows every changed file.
-	const [collapsedStaged, setCollapsedStaged] = useState<Set<string>>(() => new Set());
-	const [collapsedUnstaged, setCollapsedUnstaged] = useState<Set<string>>(() => new Set());
+	// Folders start COLLAPSED and remember what the user opened across reloads.
+	// Keyed per chapter and per section, because `src/` under Staged and under
+	// Changes are independent rows.
+	const stagedFolders = useGitFolderPrefs(chapterId, "staged");
+	const unstagedFolders = useGitFolderPrefs(chapterId, "unstaged");
 
 	// path → attribution summary, and narratorId → display label.
 	const attrByPath = new Map((attributions ?? []).map((a) => [a.filePath, a]));
@@ -167,16 +183,6 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 		return y !== " " || s.startsWith("?");
 	}
 
-	function toggleFolder(section: "staged" | "unstaged", path: string) {
-		const setState = section === "staged" ? setCollapsedStaged : setCollapsedUnstaged;
-		setState((prev) => {
-			const next = new Set(prev);
-			if (next.has(path)) next.delete(path);
-			else next.add(path);
-			return next;
-		});
-	}
-
 	function handleCommit() {
 		if (!message.trim()) return;
 		commit.mutate(message.trim(), {
@@ -223,8 +229,9 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 							ctx={{
 								keyPrefix: "s",
 								action: "unstage",
-								collapsed: collapsedStaged,
-								onToggle: (path) => toggleFolder("staged", path),
+								section: "staged",
+								expandedFolders: stagedFolders.expanded,
+								onToggle: stagedFolders.toggle,
 								onAction: (files) => unstage.mutate({ files }),
 								onOpenFile: (path) => {
 									setDiffFile(path);
@@ -276,8 +283,9 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 							ctx={{
 								keyPrefix: "u",
 								action: "stage",
-								collapsed: collapsedUnstaged,
-								onToggle: (path) => toggleFolder("unstaged", path),
+								section: "unstaged",
+								expandedFolders: unstagedFolders.expanded,
+								onToggle: unstagedFolders.toggle,
 								onAction: (files) => stage.mutate({ files }),
 								onOpenFile: (path) => {
 									setDiffFile(path);
@@ -437,7 +445,7 @@ function DirectoryRow({
 	depth: number;
 	ctx: TreeContext;
 }) {
-	const expanded = !ctx.collapsed.has(node.path);
+	const expanded = ctx.expandedFolders.has(node.path);
 	const files = collectFiles(node);
 	const added = files.reduce((sum, f) => sum + f.displayLinesAdded, 0);
 	const removed = files.reduce((sum, f) => sum + f.displayLinesRemoved, 0);
@@ -519,7 +527,10 @@ function FileRow({
 	ctx: TreeContext;
 	children: string;
 }) {
-	const statusChar = file.status.replace(/\s/g, "") || "M";
+	// The badge shows what KIND of change this is; which SECTION the row is in
+	// already carries the staged/unstaged axis. Passing the section is what keeps
+	// `AM` from rendering as a two-letter gray blob.
+	const statusChar = gitFileBadgeChar(file.status, ctx.section);
 	const color = statusRegistry.gitFileStatus(statusChar).color;
 	const actionLabel = ctx.action === "stage" ? ctx.t("stageFile") : ctx.t("unstageFile");
 

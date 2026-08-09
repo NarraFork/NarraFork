@@ -248,7 +248,9 @@
 		"gitAdded": "已添加",
 		"gitDeleted": "已删除",
 		"gitRenamed": "已重命名",
-		"gitUntracked": "未跟踪"
+		"gitUntracked": "未跟踪",
+		"gitCopied": "已复制",
+		"gitUnmerged": "有冲突"
 	},
 	"operationFailed": "操作失败",
 	"unexpectedError": "发生了意外错误",

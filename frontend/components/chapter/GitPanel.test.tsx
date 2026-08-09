@@ -6,6 +6,7 @@ import { parseHTML } from "linkedom";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import type { GitStatusSummary } from "../../hooks/useGit";
+import { __resetGitFolderPrefsCache } from "../../hooks/useGitFolderPrefs";
 import { api } from "../../lib/api";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
@@ -42,6 +43,9 @@ let restoreGitApi: (() => void) | undefined;
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
 	const localStorage = new Map<string, string>();
+	// Folder expansion lives in sessionStorage (per-tab, cleared with the tab), so
+	// the harness has to provide it separately from localStorage.
+	const sessionStorage = new Map<string, string>();
 	const matchMedia = (query: string) => ({
 		matches: false,
 		media: query,
@@ -63,6 +67,12 @@ function installDom() {
 			setItem: (key: string, value: string) => localStorage.set(key, value),
 			removeItem: (key: string) => localStorage.delete(key),
 			clear: () => localStorage.clear(),
+		},
+		sessionStorage: {
+			getItem: (key: string) => sessionStorage.get(key) ?? null,
+			setItem: (key: string, value: string) => sessionStorage.set(key, value),
+			removeItem: (key: string) => sessionStorage.delete(key),
+			clear: () => sessionStorage.clear(),
 		},
 	});
 
@@ -235,6 +245,10 @@ function flushRender() {
 describe("GitPanel", () => {
 	beforeEach(async () => {
 		installDom();
+		// The folder-prefs snapshot is memoized at module scope; installDom() hands
+		// out a FRESH Map-backed sessionStorage each test, so a stale parse would leak
+		// one test's expanded folders into the next.
+		__resetGitFolderPrefsCache();
 		await initTestI18n();
 	});
 
@@ -277,16 +291,23 @@ describe("GitPanel", () => {
 		expect(container.textContent).toContain("Staged");
 		expect(container.textContent).toContain("Commit");
 
-		// Files are grouped under their folder instead of printing full paths.
+		// Nothing is expanded on a first visit: a repo with changes across many
+		// folders would otherwise open as one long undifferentiated file list, and
+		// the folder rows already carry the per-folder counts and +/- totals.
+		expect(rowLabels(container)).toEqual(["Expand folder src", "Expand folder src"]);
+
+		// Opening one section's folder reveals only that section's files — each
+		// section keeps its own expanded set even though both are named `src`.
+		rowByLabel(container, "Expand folder src").dispatchEvent(new Event("click", { bubbles: true }));
+		await flushRender();
 		expect(rowLabels(container)).toEqual([
 			"Collapse folder src",
 			"View diff of src/staged.ts",
-			"Collapse folder src",
-			"View diff of src/new-file.ts",
-			"View diff of src/unstaged.ts",
+			"Expand folder src",
 		]);
+
+		// Files are grouped under their folder instead of printing full paths.
 		expect(container.textContent).toContain("staged.ts");
-		expect(container.textContent).toContain("unstaged.ts");
 		expect(container.textContent).not.toContain("src/staged.ts");
 
 		queryClient.clear();
@@ -320,10 +341,12 @@ describe("GitPanel", () => {
 		);
 		await flushRender();
 
-		// Folder-level stage covers both unstaged files under src/. The folder row reuses
-		// the file wording, so scope the lookup to the row itself.
+		// Folder-level stage covers every file beneath, and works WITHOUT expanding:
+		// the whole point of defaulting to collapsed is that a folder can be staged
+		// as a unit. The folder row reuses the file wording, so scope the lookup to
+		// the row itself. Last match = the unstaged section.
 		const stageFolderRow = Array.from(
-			container.querySelectorAll('[role="button"][aria-label="Collapse folder src"]'),
+			container.querySelectorAll('[role="button"][aria-label="Expand folder src"]'),
 		).at(-1);
 		if (!(stageFolderRow instanceof HTMLElement)) throw new Error("Folder row not found");
 		const stageFolderButton = stageFolderRow.querySelector('button[aria-label="Stage"]');
@@ -336,19 +359,23 @@ describe("GitPanel", () => {
 			{ name: "stage", body: { files: ["src/new-file.ts", "src/unstaged.ts"] } },
 		]);
 
-		// Collapsing hides that folder's children but leaves the staged section alone.
+		// Expanding reveals that folder's children and leaves the other section alone.
 		stageFolderRow.dispatchEvent(new Event("click", { bubbles: true }));
 		await flushRender();
 
 		expect(rowLabels(container)).toEqual([
-			"Collapse folder src",
-			"View diff of src/staged.ts",
 			"Expand folder src",
+			"Collapse folder src",
+			"View diff of src/new-file.ts",
+			"View diff of src/unstaged.ts",
 		]);
 
-		rowByLabel(container, "Expand folder src").dispatchEvent(new Event("click", { bubbles: true }));
+		// And collapsing again hides them, without disturbing the staged section.
+		rowByLabel(container, "Collapse folder src").dispatchEvent(
+			new Event("click", { bubbles: true }),
+		);
 		await flushRender();
-		expect(rowLabels(container)).toHaveLength(5);
+		expect(rowLabels(container)).toEqual(["Expand folder src", "Expand folder src"]);
 
 		queryClient.clear();
 	});
@@ -382,8 +409,17 @@ describe("GitPanel", () => {
 		);
 		await flushRender();
 
+		// Collapsed (the default) → closed-folder glyph beside a right chevron.
+		const collapsedRow = rowByLabel(container, "Expand folder src");
+		expect(collapsedRow.querySelector(".tabler-icon-folder")).not.toBeNull();
+		expect(collapsedRow.querySelector(".tabler-icon-folder-open")).toBeNull();
+		expect(collapsedRow.querySelector(".tabler-icon-chevron-right")).not.toBeNull();
+
+		collapsedRow.dispatchEvent(new Event("click", { bubbles: true }));
+		await flushRender();
+
+		// Expanded → open-folder glyph, so the state reads without the chevron.
 		const folderRow = rowByLabel(container, "Collapse folder src");
-		// Expanded folder → open-folder glyph, next to the chevron that shows state.
 		expect(folderRow.querySelector(".tabler-icon-folder-open")).not.toBeNull();
 		expect(folderRow.querySelector(".tabler-icon-chevron-down")).not.toBeNull();
 
@@ -396,12 +432,180 @@ describe("GitPanel", () => {
 		expect(leadingWidth(folderRow)).toBe(leadingWidth(fileRow));
 		expect(leadingWidth(folderRow)).toBe("calc(1.75rem * var(--mantine-scale))");
 
-		// Collapsing swaps to the closed glyph, so the state reads without the chevron.
-		folderRow.dispatchEvent(new Event("click", { bubbles: true }));
+		queryClient.clear();
+	});
+
+	test("remembers which folders were opened within the browser session", async () => {
+		// The state has to outlive the component: a refresh used to reset every
+		// folder, which is the whole reason it now lives in sessionStorage.
+		const chapterId = "chapter-git-persist";
+		const makeClient = () =>
+			new QueryClient({
+				defaultOptions: {
+					queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
+					mutations: { retry: false },
+				},
+			});
+		const unmountPanel = () => {
+			root?.unmount();
+			root = undefined;
+		};
+		const renderPanel = (client: QueryClient) => {
+			const container = document.createElement("div");
+			document.body.appendChild(container);
+			const panelRoot = createRoot(container);
+			root = panelRoot;
+			panelRoot.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider>
+						<QueryClientProvider client={client}>
+							<ConfirmDialogProvider>
+								<GitPanel chapterId={chapterId} />
+							</ConfirmDialogProvider>
+						</QueryClientProvider>
+					</MantineProvider>
+				</I18nextProvider>,
+			);
+			return container;
+		};
+
+		const first = makeClient();
+		first.setQueryData(["gitStatus", chapterId], makeStatus());
+		const firstContainer = renderPanel(first);
 		await flushRender();
-		const collapsed = rowByLabel(container, "Expand folder src");
-		expect(collapsed.querySelector(".tabler-icon-folder")).not.toBeNull();
-		expect(collapsed.querySelector(".tabler-icon-folder-open")).toBeNull();
+
+		rowByLabel(firstContainer, "Expand folder src").dispatchEvent(
+			new Event("click", { bubbles: true }),
+		);
+		await flushRender();
+		expect(rowLabels(firstContainer)).toContain("View diff of src/staged.ts");
+
+		// Unmount and mount fresh — same sessionStorage, new component tree.
+		root?.unmount();
+		root = undefined;
+		first.clear();
+
+		const second = makeClient();
+		second.setQueryData(["gitStatus", chapterId], makeStatus());
+		const secondContainer = renderPanel(second);
+		await flushRender();
+
+		// The staged section is open again; the unstaged one was never opened.
+		expect(rowLabels(secondContainer)).toEqual([
+			"Collapse folder src",
+			"View diff of src/staged.ts",
+			"Expand folder src",
+		]);
+
+		// A DIFFERENT chapter does not inherit it — state is keyed per chapter.
+		unmountPanel();
+		const other = makeClient();
+		other.setQueryData(["gitStatus", "chapter-git-persist-other"], makeStatus());
+		const otherContainer = document.createElement("div");
+		document.body.appendChild(otherContainer);
+		const otherRoot = createRoot(otherContainer);
+		root = otherRoot;
+		otherRoot.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={other}>
+						<ConfirmDialogProvider>
+							<GitPanel chapterId="chapter-git-persist-other" />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+		expect(rowLabels(otherContainer)).toEqual(["Expand folder src", "Expand folder src"]);
+
+		second.clear();
+		other.clear();
+	});
+
+	test("labels a brand-new file as an addition in both sections", async () => {
+		// `??` (never staged) and `AM` (staged, then edited again) are the two
+		// shapes a new file takes. Both used to render something other than `A`:
+		// `??` printed the raw question marks, and `AM` fell through to the gray
+		// fallback because the badge concatenated BOTH porcelain halves.
+		const chapterId = "chapter-git-added-badge";
+		const queryClient = new QueryClient({
+			defaultOptions: {
+				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
+				mutations: { retry: false },
+			},
+		});
+		queryClient.setQueryData(["gitStatus", chapterId], {
+			hasChanges: true,
+			staged: 1,
+			unstaged: 1,
+			untracked: 1,
+			files: [
+				{
+					status: "AM",
+					path: "src/fresh.ts",
+					linesAdded: 5,
+					linesRemoved: 0,
+					stagedLinesAdded: 4,
+					stagedLinesRemoved: 0,
+					unstagedLinesAdded: 1,
+					unstagedLinesRemoved: 0,
+				},
+				{
+					status: "??",
+					path: "src/brand-new.ts",
+					linesAdded: 3,
+					linesRemoved: 0,
+					stagedLinesAdded: 0,
+					stagedLinesRemoved: 0,
+					unstagedLinesAdded: 3,
+					unstagedLinesRemoved: 0,
+				},
+			],
+			totalFiles: 2,
+			headSha: "abc1234",
+			branch: "main",
+			linesAdded: 8,
+			linesRemoved: 0,
+		} satisfies GitStatusSummary);
+
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<GitPanel chapterId={chapterId} />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+
+		// Open both folders so the file rows (and their badges) are rendered.
+		for (const row of Array.from(
+			container.querySelectorAll('[role="button"][aria-label="Expand folder src"]'),
+		)) {
+			row.dispatchEvent(new Event("click", { bubbles: true }));
+			await flushRender();
+		}
+
+		const badgeOf = (label: string): string | undefined => {
+			const row = rowByLabel(container, label);
+			// The badge is the row's leading element, same slot as a folder glyph.
+			return row.firstElementChild?.textContent ?? undefined;
+		};
+
+		// Staged half of `AM` is the addition; the unstaged half is the later edit.
+		expect(badgeOf("View diff of src/fresh.ts")).toBe("A");
+		// The untracked file lives only in the unstaged section, and reads as new.
+		expect(badgeOf("View diff of src/brand-new.ts")).toBe("A");
+		// No badge anywhere still prints a raw two-character porcelain pair.
+		expect(container.textContent).not.toContain("AM");
+		expect(container.textContent).not.toContain("??");
 
 		queryClient.clear();
 	});
@@ -433,7 +637,13 @@ describe("GitPanel", () => {
 		await flushRender();
 
 		// A 5-segment path collapses to one merged folder row plus the file, so the
-		// deepest indent stays at a single level instead of four.
+		// deepest indent stays at a single level instead of four. Expand first —
+		// folders start closed, and the indent being measured is the file's.
+		rowByLabel(container, "Expand folder frontend/components/chapter/deep/nested").dispatchEvent(
+			new Event("click", { bubbles: true }),
+		);
+		await flushRender();
+
 		expect(rowLabels(container)).toEqual([
 			"Collapse folder frontend/components/chapter/deep/nested",
 			"View diff of frontend/components/chapter/deep/nested/leaf.ts",
