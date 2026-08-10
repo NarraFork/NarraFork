@@ -1437,6 +1437,30 @@ export class NarratorWSManager {
 					);
 					return;
 				}
+				// Plugin lifecycle events pushed by the host: new pending permission
+				// requests, approvals/denials, and contribution catalog changes. The
+				// plugin management panel listens for these to invalidate its queries.
+				if (
+					data.type === "plugin:permission_request" ||
+					data.type === "plugin:permission_resolved" ||
+					data.type === "plugin:contributions_changed"
+				) {
+					window.dispatchEvent(
+						new CustomEvent("narrafork:plugin-event", {
+							detail: {
+								type: data.type,
+								pluginId:
+									typeof data.pluginId === "string" ? data.pluginId : undefined,
+								requestId:
+									typeof data.requestId === "string" ? data.requestId : undefined,
+								capability:
+									typeof data.capability === "string" ? data.capability : undefined,
+								status: typeof data.status === "string" ? data.status : undefined,
+							},
+						}),
+					);
+					return;
+				}
 				// The shared NUG availability poller refreshed a provider's model list
 				// (a suspended narrator is waiting for recovery). Signal model pickers
 				// to re-fetch so the available/unavailable state updates live.

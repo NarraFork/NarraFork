@@ -13,6 +13,8 @@ export const pluginKeys = {
 	all: ["plugins"] as const,
 	detail: (pluginId: string) => ["plugins", pluginId] as const,
 	diagnostics: (pluginId: string) => ["plugins", pluginId, "diagnostics"] as const,
+	grants: (pluginId: string) => ["plugins", pluginId, "grants"] as const,
+	permissionRequests: (pluginId: string) => ["plugins", pluginId, "permission-requests"] as const,
 	providerConfig: (pluginId: string) => ["plugins", pluginId, "provider-config"] as const,
 	uiContributions: ["plugins", "ui-contributions"] as const,
 	uiHealth: ["plugins", "ui-health"] as const,
@@ -61,6 +63,34 @@ export function usePlugin(pluginId: string, options?: { enabled?: boolean }) {
 		enabled: (options?.enabled ?? true) && pluginId.length > 0,
 		gcTime: PLUGINS_QUERY_GC_TIME_MS,
 		refetchInterval: PLUGIN_REFETCH_INTERVAL_MS,
+	});
+}
+
+/**
+ * Pending runtime permission requests (admin). Polls while the grants tab is
+ * mounted and is invalidated by pushed plugin events.
+ */
+export function usePluginPermissionRequests(pluginId: string) {
+	return useQuery({
+		queryKey: pluginKeys.permissionRequests(pluginId),
+		queryFn: async () => {
+			const data = await pluginsApi.listPendingGrants(pluginId);
+			return data.requests ?? [];
+		},
+		enabled: pluginId.length > 0,
+		refetchInterval: PLUGIN_REFETCH_INTERVAL_MS,
+		gcTime: PLUGINS_QUERY_GC_TIME_MS,
+	});
+}
+
+/** Full grant set for an installation (admin). Polls while mounted; invalidated by events. */
+export function usePluginGrants(pluginId: string, options?: { enabled?: boolean }) {
+	return useQuery({
+		queryKey: pluginKeys.grants(pluginId),
+		queryFn: () => pluginsApi.getGrants(pluginId),
+		enabled: (options?.enabled ?? true) && pluginId.length > 0,
+		refetchInterval: PLUGIN_REFETCH_INTERVAL_MS,
+		gcTime: PLUGINS_QUERY_GC_TIME_MS,
 	});
 }
 

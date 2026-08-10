@@ -909,6 +909,11 @@ export class PluginManager {
 				requestId,
 				status: "granted",
 			} as NarraForkEvent);
+			await this.broadcastPluginEvent("plugin:permission_resolved", {
+				pluginId,
+				requestId,
+				status: "granted",
+			});
 
 			return mutation;
 		});
@@ -936,6 +941,11 @@ export class PluginManager {
 			requestId,
 			status: "denied",
 		} as Record<string, unknown> as NarraForkEvent);
+		await this.broadcastPluginEvent("plugin:permission_resolved", {
+			pluginId,
+			requestId,
+			status: "denied",
+		});
 
 		return true;
 	}
@@ -2501,6 +2511,10 @@ export class PluginManager {
 				revision: report.revision,
 				reason: operation,
 			});
+			await this.broadcastPluginEvent("plugin:contributions_changed", {
+				revision: report.revision,
+				reason: operation,
+			});
 		}
 		return this.catalogSnapshot;
 	}
@@ -2542,11 +2556,33 @@ export class PluginManager {
 				requestId: req.requestId,
 				capability: input.capability,
 			} as NarraForkEvent);
+			await this.broadcastPluginEvent("plugin:permission_request", {
+				pluginId: input.pluginId,
+				requestId: req.requestId,
+				capability: input.capability,
+			});
 
 			return { requestId: req.requestId };
 		} catch (error) {
 			if (error instanceof ValidationError) return undefined;
 			throw error;
+		}
+	}
+
+	/**
+	 * Push a plugin lifecycle event to connected UI sessions so panels refresh
+	 * live (event-driven refresh on top of the foreground polling fallback).
+	 * Best-effort: a failure here never affects the operation itself.
+	 */
+	private async broadcastPluginEvent(
+		type: "plugin:permission_request" | "plugin:permission_resolved" | "plugin:contributions_changed",
+		payload: Record<string, unknown>,
+	): Promise<void> {
+		try {
+			const { broadcastToAll } = await import("../websocket/narrator-ws");
+			broadcastToAll({ type, ...payload });
+		} catch {
+			// Event push is best-effort; polling remains the fallback.
 		}
 	}
 

@@ -27,7 +27,8 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { isPluginsDisabledError, localizePluginError } from "../../components/plugins-admin/errors";
@@ -42,13 +43,15 @@ import {
 	useEnablePlugin,
 	usePlugin,
 	usePluginDiagnostics,
+	usePluginGrants,
+	usePluginPermissionRequests,
 	useRetryPlugin,
 	useUninstallPlugin,
+	pluginKeys,
 } from "../../hooks/usePlugins";
-import type { PluginDetail, PluginPermissionSet } from "../../lib/api/plugins";
+import type { PluginDetail } from "../../lib/api/plugins";
 import { pluginsApi } from "../../lib/api/plugins";
 import { formatLocaleDateTime } from "../../lib/intl-format";
-import { usePluginPermissionRequests } from "../../hooks/usePluginPermissionRequests";
 
 export const Route = createFileRoute("/settings/plugins/$pluginId")({
 	component: SettingsPluginDetailPage,
@@ -191,7 +194,7 @@ function ContributionsTab({ plugin }: { plugin: PluginDetail }) {
 function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 	const { t } = useTranslation("plugins");
 	const confirm = useConfirmDialog();
-	const [set, setSet] = useState<PluginPermissionSet | null>(null);
+	const queryClient = useQueryClient();
 	const [error, setError] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [adding, setAdding] = useState(false);
@@ -199,21 +202,20 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 	const [newScopeType, setNewScopeType] = useState("global");
 	const [newScopeId, setNewScopeId] = useState("");
 
-	const load = useCallback(async () => {
-		try {
-			setSet(await pluginsApi.getGrants(plugin.pluginId));
-			setError(null);
-		} catch (err) {
-			setError(localizePluginError(err, t));
-		}
-	}, [plugin.pluginId]);
-	useEffect(() => {
-		void load();
-		// Poll while the grants tab is mounted (tab open + window focused) so
-		// autonomous grant/request changes show up without a manual refresh.
-		const timer = setInterval(() => void load(), 15_000);
-		return () => clearInterval(timer);
-	}, [load]);
+	// Grants and pending requests are React Query-backed: they poll while the
+	// grants tab is mounted and are invalidated by pushed plugin events, so the
+	// panel stays live without manual refreshes.
+	const grantsQuery = usePluginGrants(plugin.pluginId);
+	const pendingQuery = usePluginPermissionRequests(plugin.pluginId);
+	const set = grantsQuery.data ?? null;
+	const pendingRequests = pendingQuery.data ?? [];
+
+	const invalidateGrants = () => {
+		void queryClient.invalidateQueries({ queryKey: pluginKeys.grants(plugin.pluginId) });
+		void queryClient.invalidateQueries({
+			queryKey: pluginKeys.permissionRequests(plugin.pluginId),
+		});
+	};
 
 	const revokeGrant = async (grantId: string, capability: string) => {
 		const ok = await confirm({
@@ -228,7 +230,7 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 				expectedRevision: set.revision,
 				grantIds: [grantId],
 			});
-			await load();
+			invalidateGrants();
 		} catch (err) {
 			setError(localizePluginError(err, t));
 		} finally {
@@ -261,7 +263,7 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 			setNewCapability("");
 			setNewScopeId("");
 			setAdding(false);
-			await load();
+			invalidateGrants();
 		} catch (err) {
 			setError(localizePluginError(err, t));
 		} finally {
@@ -269,18 +271,11 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 		}
 	};
 
-	const {
-		requests: pendingRequests,
-		loading: pendingLoading,
-		refresh: refreshPending,
-	} = usePluginPermissionRequests(plugin.pluginId);
-
 	const approvePending = async (requestId: string) => {
 		setBusy(true);
 		try {
 			await pluginsApi.approveGrantRequest(plugin.pluginId, requestId);
-			await refreshPending();
-			await load();
+			invalidateGrants();
 		} catch (err) {
 			setError(localizePluginError(err, t));
 		} finally {
@@ -292,8 +287,7 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 		setBusy(true);
 		try {
 			await pluginsApi.denyGrantRequest(plugin.pluginId, requestId);
-			await refreshPending();
-			await load();
+			invalidateGrants();
 		} catch (err) {
 			setError(localizePluginError(err, t));
 		} finally {
@@ -314,13 +308,13 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 		try {
 			const existing = set.grants.map((grant) => ({
 				capability: grant.capability,
-				scope: grant.scope,
-			}));
+			scope: grant.scope,
+		}));
 			await pluginsApi.replaceGrants(plugin.pluginId, {
 				expectedRevision: set.revision,
 				grants: [...existing, { capability, scope: { type: "global" } }],
 			});
-			await load();
+			invalidateGrants();
 		} catch (err) {
 			setError(localizePluginError(err, t));
 		} finally {
@@ -340,7 +334,7 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 					{t("admin.detail.grants.manageTitle")}
 				</Text>
 				<Group gap="xs">
-					<Button size="xs" variant="light" onClick={() => void load()} disabled={busy}>
+					<Button size="xs" variant="light" onClick={() => invalidateGrants()} disabled={busy}>
 						{t("admin.detail.grants.refresh")}
 					</Button>
 					<Button
