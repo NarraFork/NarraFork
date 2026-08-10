@@ -60,6 +60,13 @@ export interface ComputeLayoutOptions {
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
+	/**
+	 * Row-KEY addressed expansion, for the two traces that fold a LIVE row list
+	 * (`activity-trace` / `tool-run-summary`). See `AdapterContext.isRowExpanded`
+	 * for why an index cannot survive a live run — and why the append-only traces
+	 * stay on `expandedRows`.
+	 */
+	isRowExpanded?: (traceKey: string, rowKey: string) => boolean;
 	/** Resolve whether a translated body shows its ORIGINAL text. */
 	showOriginal?: (key: string) => boolean;
 	/** Resolve whether a subagent card's prompt body is open. */
@@ -156,6 +163,7 @@ export function computePretextVListLayout(
 		isLodUserOverride: opts.isLodUserOverride,
 		showEarlier: opts.showEarlier,
 		expandedRows: opts.expandedRows,
+		isRowExpanded: opts.isRowExpanded,
 		showOriginal: opts.showOriginal,
 		isPromptOpen: opts.isPromptOpen,
 		recentMessageIds: opts.recentMessageIds,

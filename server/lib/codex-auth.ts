@@ -253,6 +253,8 @@ interface PendingOAuth {
 	pkce: PkceCodes;
 	state: string;
 	proxy?: string;
+	/** Exact redirect_uri sent in the authorize request — must be replayed on exchange. */
+	redirectUri: string;
 	resolve: (tokens: TokenResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -316,14 +318,8 @@ async function ensureOAuthServer(): Promise<{ port: number; redirectUri: string 
 
 				const current = pendingOAuth;
 				pendingOAuth = undefined;
-				const port = oauthServer?.port ?? 0;
 
-				exchangeCodeForTokens(
-					code,
-					`http://localhost:${port}/auth/callback`,
-					current.pkce,
-					current.proxy,
-				)
+				exchangeCodeForTokens(code, current.redirectUri, current.pkce, current.proxy)
 					.then((tokens) => current.resolve(tokens))
 					.catch((err) => {
 						// Enhance error message when proxy is not configured
@@ -412,13 +408,14 @@ export async function startBrowserOAuth(proxy?: string): Promise<{
 					reject(new Error("OAuth callback timeout"));
 				}
 			},
-			5 * 60 * 1000,
+			15 * 60 * 1000,
 		);
 
 		pendingOAuth = {
 			pkce,
 			state,
 			proxy,
+			redirectUri,
 			resolve: (tokens) => {
 				clearTimeout(timeout);
 				const info = extractIdTokenInfo(tokens);
@@ -600,6 +597,101 @@ export async function pollDeviceCodeFlow(
 	}
 
 	throw new Error("Device code flow aborted");
+}
+
+/**
+ * Complete a pending browser OAuth flow from a manually pasted callback URL.
+ *
+ * Needed for remote deployments: the authorize redirect targets
+ * `http://localhost:1455/auth/callback`, which resolves on the *user's* machine,
+ * not on the NarraFork host. The browser then fails to reach the callback server
+ * and the user is left with a dead URL in the address bar. Pasting that URL here
+ * feeds the same code/state pair back into the pending flow.
+ *
+ * Accepts a full URL, a bare query string, or just the code value.
+ */
+export async function completeBrowserOAuthFromCallbackUrl(input: string): Promise<CodexTokens> {
+	const raw = input.trim();
+	if (!raw) throw new Error("Callback URL is empty");
+
+	const current = pendingOAuth;
+	if (!current) {
+		throw new Error(
+			"No pending browser authorization. Click the browser login button first, then paste the callback URL.",
+		);
+	}
+
+	const params = parseCallbackParams(raw);
+	const error = params.get("error");
+	if (error) {
+		throw new Error(params.get("error_description") || error);
+	}
+
+	const code = params.get("code");
+	if (!code) {
+		throw new Error("No 'code' parameter found in the callback URL");
+	}
+
+	// State is optional in the pasted value (some browsers truncate on copy), but
+	// when present it must match — a mismatch means the URL belongs to another flow.
+	const state = params.get("state");
+	if (state && state !== current.state) {
+		throw new Error("Callback state does not match the pending authorization");
+	}
+
+	// Detach while the exchange is in flight so a concurrent real callback can't
+	// spend the same pending flow twice.
+	pendingOAuth = undefined;
+	let tokens: TokenResponse;
+	try {
+		tokens = await exchangeCodeForTokens(code, current.redirectUri, current.pkce, current.proxy);
+	} catch (err) {
+		// Keep the flow pending so the user can fix the paste (or a transient proxy
+		// failure) and try again without restarting authorization from scratch.
+		// A newer flow started meanwhile wins and this one is dropped.
+		if (!pendingOAuth) pendingOAuth = current;
+		throw err instanceof Error ? err : new Error(String(err));
+	}
+
+	current.resolve(tokens);
+	const info = extractIdTokenInfo(tokens);
+	return {
+		accessToken: tokens.access_token,
+		refreshToken: tokens.refresh_token,
+		expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+		accountId: info.accountId,
+		email: info.email,
+		sub: info.sub,
+	};
+}
+
+/**
+ * Pull OAuth params out of whatever the user pasted: a full callback URL, a bare
+ * query string (`?code=...&state=...`), or a naked authorization code.
+ *
+ * Exported for tests; production callers go through
+ * `completeBrowserOAuthFromCallbackUrl`.
+ */
+export function parseCallbackParams(raw: string): URLSearchParams {
+	const queryStart = raw.indexOf("?");
+	if (queryStart >= 0) {
+		return new URLSearchParams(raw.slice(queryStart + 1));
+	}
+	if (raw.includes("=") && raw.includes("code")) {
+		return new URLSearchParams(raw);
+	}
+	return new URLSearchParams({ code: raw });
+}
+
+/** The redirect URI the authorize request uses, for surfacing in the UI. */
+export function getBrowserOAuthRedirectUri(): string {
+	const port = oauthServer?.port ?? CALLBACK_PORT;
+	return `http://localhost:${port}/auth/callback`;
+}
+
+/** Whether a browser OAuth flow is currently awaiting its callback. */
+export function hasPendingBrowserOAuth(): boolean {
+	return !!pendingOAuth;
 }
 
 /**

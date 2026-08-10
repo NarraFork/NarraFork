@@ -503,6 +503,32 @@ export interface AdapterContext {
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
 	/**
+	 * Row-KEY addressed expansion, resolved as `(traceKey, rowKey) => boolean`.
+	 *
+	 * ⚠️ The channel `activity-trace` and `tool-run-summary` must use — and the ONLY
+	 * two that must, because only they can gain a row ABOVE an existing one while a
+	 * turn streams. The activity fold expands one live reasoning block into one row
+	 * PER STEP, so the moment the model emits another `**title**` every row after it
+	 * shifts down by one. An index recorded at click time then addresses a different
+	 * row: the tool the reader opened silently folds shut, and the row that inherited
+	 * the index opens instead — the same click producing a different card mid-stream,
+	 * plus a height change with no user action behind it (the very thing CONTRACT §0
+	 * forbids).
+	 *
+	 * Row keys are hand-off stable by construction: a tool row is `tool-<toolUseId>`
+	 * live and persisted alike, and a reasoning row keys on its run ordinal within
+	 * the unit (`stableKeyBase`). So a key survives exactly the frames an index does
+	 * not.
+	 *
+	 * `expandedRows` stays for the append-only lists, whose ordinals are already
+	 * stable: a `reasoning-steps` element (step N stays row N however many steps
+	 * follow), a `sidecar-trace` (one row), and the subagent-recovery card's
+	 * checkboxes. The shell routes by kind (`traceRowFoldChannel`); an element read
+	 * here must be written there, or the reader's fold lands in a channel nothing
+	 * reads and the row stops opening.
+	 */
+	isRowExpanded?: (traceKey: string, rowKey: string) => boolean;
+	/**
 	 * Reader asked for the ORIGINAL text of a translated body (reasoning runs).
 	 *
 	 * Height-affecting, so it must be resolved during adaptation like every other
@@ -2539,19 +2565,27 @@ function toolTraceItem(
 
 /**
  * The folded rows of one tool batch, with the reader's drilled-in rows carrying
- * their full card payload.
+ * their full card payload, plus the row INDICES those rows landed on.
  *
- * `expandedIndices` are indices into THIS array (the measure layer resolves a
- * visible row back to `startIndex + vi`), so the two must agree on the numbering
- * or a click would open a different tool than the one under the cursor.
+ * Expansion is decided per ROW KEY (`ctx.isRowExpanded`) and the indices are
+ * DERIVED from the result, rather than the reverse. The measure layer resolves a
+ * visible row back to `startIndex + vi` over this very array, so deriving the
+ * indices here is what keeps the two sides numbering the same rows — and reading
+ * the reader's intent from a key is what makes the decision survive a row list
+ * that grows mid-stream (see `AdapterContext.isRowExpanded`).
  */
 function foldedToolItems(
 	items: AdapterToolItem[],
 	ctx: AdapterContext,
 	traceKey: string,
-): unknown[] {
-	const expanded = new Set(ctx.expandedRows?.(traceKey) ?? []);
-	return items.map((item, index) => toolTraceItem(item, ctx, expanded.has(index)));
+): { rows: unknown[]; expandedIndices: number[] } {
+	const expandedIndices: number[] = [];
+	const rows = items.map((item, index) => {
+		const expanded = ctx.isRowExpanded?.(traceKey, toolItemKey(item)) ?? false;
+		if (expanded) expandedIndices.push(index);
+		return toolTraceItem(item, ctx, expanded);
+	});
+	return { rows, expandedIndices };
 }
 
 /**
@@ -2603,17 +2637,21 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 			// and the per-row drill-down set, which must agree (a row's card is built
 			// from the same key the measure layer resolves `expandedIndices` from).
 			const specKey = `toolrun-summary-${traceKey}`;
+			const folded = foldedToolItems(group.items, ctx, specKey);
 			specs.push({
 				kind: "tool-run-summary",
 				key: specKey,
 				data: {
-					items: foldedToolItems(group.items, ctx, specKey),
+					items: folded.rows,
 					headerLabel: sysLabel(ctx, "toolCalls"),
 					headerCount: countLabel(ctx, "toolCallsCount", group.items.length),
 				},
 				opts: {
 					showEarlier: ctx.showEarlier?.(specKey) ?? false,
-					expandedIndices: ctx.expandedRows?.(specKey) ?? [],
+					// Derived from the rows just built, never resolved independently: the
+					// two must agree on WHICH rows are open, and a second lookup is exactly
+					// where they used to drift (see foldedToolItems).
+					expandedIndices: folded.expandedIndices,
 					viewportHeight: ctx.viewportHeight,
 				},
 			});
@@ -2747,17 +2785,29 @@ function adaptActivityItems(
 	traceItems: AdapterTraceItem[];
 	reasoningCount: number;
 	toolCount: number;
+	/**
+	 * Indices (into `traceItems`) of the rows that ended up expanded — DERIVED from
+	 * the per-key decisions taken while emitting, never resolved separately.
+	 */
+	expandedIndices: number[];
 } {
 	let reasoningCount = 0;
 	let toolCount = 0;
 	const traceItems: AdapterTraceItem[] = [];
-	// ⚠️ The drill-down set indexes the EMITTED ROW list, not the input `items`:
-	// one reasoning block expands into several rows, so the input index and the row
-	// index drift apart as soon as a multi-step reasoning run precedes a tool. The
-	// measure layer resolves a visible row to `startIndex + vi` over the same
-	// emitted array, so `traceItems.length` (read BEFORE the push) is the only
-	// numbering both sides agree on.
-	const expandedRowIndices = new Set(ctx.expandedRows?.(traceKey) ?? []);
+	// ⚠️ Expansion is decided per ROW KEY, and the index is recorded as the row is
+	// emitted. Both halves of that matter:
+	//
+	//  - The index numbering must be over the EMITTED ROW list, not the input
+	//    `items`: one reasoning block expands into several rows, so the two drift
+	//    apart as soon as a multi-step run precedes a tool. The measure layer
+	//    resolves a visible row to `startIndex + vi` over this same array, so
+	//    `traceItems.length` (read BEFORE the push) is the only numbering both
+	//    sides agree on.
+	//  - The reader's INTENT must not be stored as that index. A live reasoning run
+	//    emits one row per step, so the next `**title**` shifts every following row
+	//    down by one and a stored index starts addressing a different tool. See
+	//    `AdapterContext.isRowExpanded`.
+	const expandedIndices: number[] = [];
 	for (const item of items) {
 		if (item.kind === "reasoning") {
 			const block = item.block;
@@ -2826,27 +2876,35 @@ function adaptActivityItems(
 			});
 			continue;
 		}
-		const toolRow = toolTraceItem(
-			{
-				...item,
-				msg: item.msg,
-				blockIndex: item.blockIndex ?? 0,
-				isSubagent: false,
-				tc: item.tc,
-			},
-			ctx,
-			expandedRowIndices.has(traceItems.length),
-		);
+		const toolItem = {
+			...item,
+			msg: item.msg,
+			blockIndex: item.blockIndex ?? 0,
+			isSubagent: false,
+			tc: item.tc,
+		};
+		// The row's FINAL key, resolved BEFORE the expansion lookup.
+		//
 		// A retry's repeated tool-use id gets a suffix so its row cannot overlap the
-		// earlier one (see AdapterActivityInput.dedupeSuffix). The `unitId` moves with
-		// it: two calls sharing an id are still two distinct pieces of content.
+		// earlier one (see AdapterActivityInput.dedupeSuffix) — and that suffixed key is
+		// what the renderer paints and what the shell therefore records on a click. So
+		// the lookup has to use the same string; asking with the un-suffixed key would
+		// never match the reader's own second attempt.
+		const rowKey = item.dedupeSuffix
+			? `${toolItemKey(toolItem)}#${item.dedupeSuffix}`
+			: toolItemKey(toolItem);
+		const expanded = ctx.isRowExpanded?.(traceKey, rowKey) ?? false;
+		if (expanded) expandedIndices.push(traceItems.length);
+		const toolRow = toolTraceItem(toolItem, ctx, expanded);
+		// `unitId` moves with the key: two calls sharing an id are still two distinct
+		// pieces of content.
 		if (item.dedupeSuffix) {
-			toolRow.key = `${toolRow.key}#${item.dedupeSuffix}`;
+			toolRow.key = rowKey;
 			if (toolRow.unitId) toolRow.unitId = `${toolRow.unitId}#${item.dedupeSuffix}`;
 		}
 		traceItems.push(toolRow);
 	}
-	return { traceItems, reasoningCount, toolCount };
+	return { traceItems, reasoningCount, toolCount, expandedIndices };
 }
 
 /**
@@ -2897,7 +2955,9 @@ export function adaptActivityUnit(
 			collapsed: ctx.lod === 1 && !isRecentActivityUnit(items, ctx),
 			itemsOpened: ctx.isExpanded?.(key) ?? false,
 			showEarlier: ctx.showEarlier?.(key) ?? false,
-			expandedIndices: ctx.expandedRows?.(key) ?? [],
+			// Derived while the rows were emitted, never resolved a second time — see
+			// adaptActivityItems on why a stored index cannot survive a live run.
+			expandedIndices: activity.expandedIndices,
 			// A drilled-in row nests a real tool card, whose `plan` detail caps at
 			// 0.85 × viewport — so the trace needs the viewport height a standalone
 			// card already gets through its own opts.

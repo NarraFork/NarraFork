@@ -131,6 +131,7 @@ import {
 	createVListInteractionState,
 	isFullPayloadRequestedRow,
 	isPromptOpenRow,
+	isTraceRowExpanded,
 	markVListFullPayloadRequested,
 	resetVListInteractionStateForLod,
 	setVListExpanded,
@@ -139,6 +140,8 @@ import {
 	toggleVListRow,
 	toggleVListShowEarlier,
 	toggleVListShowOriginal,
+	toggleVListTraceRow,
+	traceRowFoldChannel,
 	type VListInteractionState,
 } from "./vlist-interaction-state";
 import { jumpTargetMessageId, resolveJumpTargetSeq } from "./vlist-jump-target";
@@ -867,6 +870,12 @@ export function rowInteractionSig(
 	const showEarlier = state.showEarlier.has(key) ? 1 : 0;
 	const rows = state.expandedRows.get(key);
 	const rowsSig = rows && rows.size > 0 ? [...rows].sort((a, b) => a - b).join(",") : "";
+	// A folded trace's drill-down lives in its own KEY-addressed channel, so it needs
+	// its own term here: without it a trace row opening changed nothing the memo
+	// compares (the index-addressed `rowsSig` stays empty for traces) and the row
+	// could skip the re-render that paints the revealed card.
+	const traceRows = state.expandedTraceRows.get(key);
+	const traceRowsSig = traceRows && traceRows.size > 0 ? [...traceRows].sort().join(",") : "";
 	const promptOpen = state.promptOpen.has(key) ? 1 : 0;
 	// Tool-result sidecar fold states live under `${key}-sc${index}`. A tool card
 	// can carry several; fold each into the row's signature so expanding one
@@ -885,7 +894,7 @@ export function rowInteractionSig(
 		const v = state.expanded.get(sidecarFoldKey(key, i));
 		if (v !== undefined) sidecarSig += `${i}${v ? "1" : "0"}`;
 	}
-	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${promptOpen}:${sidecarSig}`;
+	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}:${sidecarSig}`;
 }
 
 /**
@@ -949,7 +958,15 @@ interface RowToggles {
 	onToggle: () => void;
 	onToggleItems: () => void;
 	onToggleEarlier: () => void;
-	onToggleRow: (rowIndex: number) => void;
+	/**
+	 * Drill into one row.
+	 *
+	 * Passing `rowKey` selects the KEY-addressed channel (`expandedTraceRows`),
+	 * omitting it the index-addressed one (`expandedRows`). Which one an element
+	 * needs is decided by its kind, not by this callback — see
+	 * `traceRowFoldChannel`, and the routing at the `TRACE_KINDS` binding.
+	 */
+	onToggleRow: (rowIndex: number, rowKey?: string) => void;
 	/** Flip a translated body between its translation and the original. */
 	onToggleTranslation: () => void;
 	/**
@@ -1182,7 +1199,17 @@ const ExactRow = memo(
 		if (TRACE_KINDS.has(kind)) {
 			extra.onToggleItems = toggles.onToggleItems;
 			extra.onToggleEarlier = toggles.onToggleEarlier;
-			extra.onToggleRow = toggles.onToggleRow;
+			// Route the row fold to the channel THIS kind's adapter path actually
+			// reads. The render layer always reports both the index and the key, so
+			// without this every trace would write a key — and `reasoning-steps` /
+			// `sidecar-trace` (which resolve their `expandedIndices` from
+			// `ctx.expandedRows`) would store the reader's fold where nothing looks
+			// for it, leaving those rows silently unopenable.
+			const foldByKey = traceRowFoldChannel(kind) === "key";
+			const toggleRow = foldByKey
+				? toggles.onToggleRow
+				: (rowIndex: number) => toggles.onToggleRow(rowIndex);
+			extra.onToggleRow = toggleRow;
 			// Folded traces: give each ROW inside the trace its own menu / selection.
 			if (rowInteraction) extra.rowInteraction = rowInteraction;
 			// Drill-down: a row the reader opened nests a REAL tool card, dispatched
@@ -1203,7 +1230,11 @@ const ExactRow = memo(
 					// chevron is the other half of the same toggle). It must NOT be a card
 					// fold: the card is measured force-open, so folding it in place would
 					// paint a collapsed header inside a box reserved for the full card.
-					onToggle: () => toggles.onToggleRow(row.itemIndex),
+					//
+					// Goes through the SAME kind-routed dispatcher as the row's own chevron:
+					// the two halves of one toggle must address the same channel, or closing
+					// from the card would write an index while opening wrote a key.
+					onToggle: () => toggleRow(row.itemIndex, row.key),
 				};
 				if (viewControls) {
 					const cardTargets = resolveToolDetailViewTargets(rowKey, card, {
@@ -1859,6 +1890,12 @@ export const PretextExactMessageList = forwardRef<
 		(key: string) => [...(activeInteraction.expandedRows.get(key) ?? [])],
 		[activeInteraction],
 	);
+	// Folded traces resolve their drill-down by ROW KEY; the adapter derives the
+	// indices from the rows it emits (see AdapterContext.isRowExpanded).
+	const resolveTraceRowExpanded = useCallback(
+		(traceKey: string, rowKey: string) => isTraceRowExpanded(activeInteraction, traceKey, rowKey),
+		[activeInteraction],
+	);
 	const resolveShowOriginal = useCallback(
 		(key: string) => activeInteraction.showOriginal.has(key),
 		[activeInteraction],
@@ -2021,8 +2058,17 @@ export const PretextExactMessageList = forwardRef<
 					captureFoldBefore(key);
 					setInteraction((prev) => toggleVListShowEarlier(prev, key));
 				},
-				onToggleRow: (rowIndex: number) => {
+				onToggleRow: (rowIndex: number, rowKey?: string) => {
 					captureFoldBefore(key);
+					// The caller decides the channel by whether it passes a key, and the
+					// TRACE_KINDS binding picks that per element kind (traceRowFoldChannel).
+					// A key means the element folds a LIVE row list, where a reasoning step
+					// arriving above the reader's row makes the index they clicked address a
+					// different tool one frame later (see expandedTraceRows).
+					if (rowKey !== undefined) {
+						setInteraction((prev) => toggleVListTraceRow(prev, key, rowKey));
+						return;
+					}
 					setInteraction((prev) => toggleVListRow(prev, key, rowIndex));
 				},
 				onToggleTranslation: () => setInteraction((prev) => toggleVListShowOriginal(prev, key)),
@@ -2289,6 +2335,7 @@ export const PretextExactMessageList = forwardRef<
 		isLodUserOverride: resolveLodUserOverride,
 		showEarlier: resolveShowEarlier,
 		expandedRows: resolveExpandedRows,
+		isRowExpanded: resolveTraceRowExpanded,
 		showOriginal: resolveShowOriginal,
 		isPromptOpen: resolvePromptOpen,
 		resolveToolCategory: getCategory,

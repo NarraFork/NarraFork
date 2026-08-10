@@ -7,7 +7,33 @@ export interface VListInteractionState {
 	/** Temporary force-open state for L4 / old-L5 cards; reset on LOD change. */
 	lodUserOverrides: ReadonlySet<string>;
 	showEarlier: ReadonlySet<string>;
+	/**
+	 * INDEX-addressed per-row state, for lists whose row ORDINALS are stable:
+	 * the subagent-recovery card's checkboxes (where the set means "deselected"),
+	 * a `reasoning-steps` element's step rows, and a `sidecar-trace`'s single row.
+	 *
+	 * ⚠️ NOT for the two traces that fold a live row list. See `expandedTraceRows`
+	 * and `traceRowFoldChannel`.
+	 */
 	expandedRows: ReadonlyMap<string, ReadonlySet<number>>;
+	/**
+	 * KEY-addressed drill-down state for the two traces that fold a LIVE row list:
+	 * trace key → set of ROW KEYS. See `traceRowFoldChannel` for which kinds these
+	 * are and why the rest stay on `expandedRows`.
+	 *
+	 * A separate channel from `expandedRows` because a trace row's ORDINAL is not
+	 * stable while a turn streams. The activity fold emits one row per reasoning
+	 * STEP, so the moment the model writes another `**title**` every row below it
+	 * shifts down by one — and an index recorded at click time then addresses a
+	 * different tool. The reader watched the card they opened fold shut while a
+	 * neighbour opened in its place, which is also a height change with no user
+	 * action behind it.
+	 *
+	 * Row keys are stable across exactly those frames: `tool-<toolUseId>` is
+	 * identical live and persisted, and a reasoning row keys on its run ordinal
+	 * within the unit.
+	 */
+	expandedTraceRows: ReadonlyMap<string, ReadonlySet<string>>;
 	/**
 	 * Keys whose translated body is currently switched back to the ORIGINAL text.
 	 *
@@ -49,6 +75,7 @@ export function createVListInteractionState(lod: RenderLod): VListInteractionSta
 		lodUserOverrides: new Set(),
 		showEarlier: new Set(),
 		expandedRows: new Map(),
+		expandedTraceRows: new Map(),
 		showOriginal: new Set(),
 		fullPayloadRequested: new Set(),
 		promptOpen: new Set(),
@@ -176,4 +203,57 @@ export function toggleVListRow(
 	if (rows.size === 0) nextRows.delete(key);
 	else nextRows.set(key, rows);
 	return { ...state, expandedRows: nextRows };
+}
+
+/**
+ * Trace kinds whose row fold is addressed by ROW KEY (`expandedTraceRows`).
+ *
+ * ONLY these two, because only these two can have a row INSERTED above an
+ * existing one mid-stream: they fold reasoning rows and tool rows into one list,
+ * and a live reasoning run grows by a row per step. Every other trace appends
+ * only — a `reasoning-steps` element numbers step N as row N however many steps
+ * follow, and a `sidecar-trace` has exactly one row — so their ordinals are
+ * already stable and they stay on the index channel their adapter reads.
+ */
+const KEY_ADDRESSED_TRACE_KINDS = new Set(["activity-trace", "tool-run-summary"]);
+
+/**
+ * Which interaction channel one trace kind's row fold belongs in.
+ *
+ * The shell MUST route by this rather than hand every trace the same handler: the
+ * two channels are read by different adapter paths (`ctx.isRowExpanded` vs
+ * `ctx.expandedRows`), so writing a key for an index-addressed kind stores the
+ * reader's fold where nothing looks for it and the row silently stops opening.
+ */
+export function traceRowFoldChannel(kind: string): "key" | "index" {
+	return KEY_ADDRESSED_TRACE_KINDS.has(kind) ? "key" : "index";
+}
+
+/**
+ * Drill into (or back out of) ONE row of a folded trace, addressed by its ROW KEY.
+ *
+ * The trace counterpart of `toggleVListRow`. Keyed rather than indexed because a
+ * live turn re-numbers the rows under the reader — see `expandedTraceRows`.
+ */
+export function toggleVListTraceRow(
+	state: VListInteractionState,
+	traceKey: string,
+	rowKey: string,
+): VListInteractionState {
+	const next = new Map(state.expandedTraceRows);
+	const rows = new Set(next.get(traceKey) ?? []);
+	if (rows.has(rowKey)) rows.delete(rowKey);
+	else rows.add(rowKey);
+	if (rows.size === 0) next.delete(traceKey);
+	else next.set(traceKey, rows);
+	return { ...state, expandedTraceRows: next };
+}
+
+/** True when this trace row is drilled in. */
+export function isTraceRowExpanded(
+	state: VListInteractionState,
+	traceKey: string,
+	rowKey: string,
+): boolean {
+	return state.expandedTraceRows.get(traceKey)?.has(rowKey) === true;
 }

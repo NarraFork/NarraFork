@@ -108,6 +108,15 @@ export const codexUseImageGenerationSchema = z.object({
 	useImageGeneration: z.boolean().optional(),
 });
 
+/**
+ * Manually pasted Codex OAuth callback URL (remote deployments where the
+ * localhost redirect can't reach the server). Accepts a full URL, a bare query
+ * string, or the raw code value, so validation only caps the length.
+ */
+export const codexBrowserCallbackSchema = z.object({
+	callbackUrl: z.string().min(1).max(4096),
+});
+
 export const codexTierOrderSchema = z.object({
 	tierOrder: z.array(z.enum(["free", "plus", "team", "k12", "prolite", "pro", "other"])).max(7),
 });

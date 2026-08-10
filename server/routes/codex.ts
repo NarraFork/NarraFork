@@ -12,6 +12,7 @@ import { logger } from "../lib/logger";
 import { getNormalizedSearchChannels, SEARCH_NATIVE_CHANNEL_ID } from "../lib/search/settings";
 import { normalizeProxyUrl, saveSettings, settings } from "../lib/settings";
 import {
+	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
 	codexTierOrderSchema,
 	codexUseImageGenerationSchema,
@@ -215,9 +216,9 @@ codexRoutes.get("/status", (c) => {
 codexRoutes.post("/auth/browser", async (c) => {
 	try {
 		const manager = getCodexManager();
-		const { authorizeUrl } = await manager.startBrowserAuth();
+		const { authorizeUrl, redirectUri } = await manager.startBrowserAuth();
 
-		return c.json({ authorizeUrl });
+		return c.json({ authorizeUrl, redirectUri });
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		logger.error("Failed to start Codex browser OAuth", { error: msg });
@@ -247,6 +248,40 @@ codexRoutes.post("/auth/browser/wait", async (c) => {
 		const msg = err instanceof Error ? err.message : String(err);
 		return c.json({ error: msg, success: false }, 400);
 	}
+});
+
+/**
+ * POST /api/codex/auth/browser/callback
+ * Complete a pending browser OAuth flow from a manually pasted callback URL.
+ *
+ * The authorize redirect points at localhost:1455, which resolves on the user's
+ * machine. For remote NarraFork deployments that callback never reaches the
+ * server, so the user pastes the dead URL from the address bar here instead.
+ */
+codexRoutes.post("/auth/browser/callback", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = codexBrowserCallbackSchema.safeParse(body);
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.message);
+	}
+
+	try {
+		const manager = getCodexManager();
+		const result = await manager.completeBrowserAuthFromCallbackUrl(parsed.data.callbackUrl);
+		return c.json({ ok: true, ...result });
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		logger.warn("Failed to complete Codex browser OAuth from callback URL", { error: msg });
+		return c.json({ error: msg }, 400);
+	}
+});
+
+/**
+ * GET /api/codex/auth/browser/state
+ * Whether a browser OAuth flow is pending, plus the redirect URI in use.
+ */
+codexRoutes.get("/auth/browser/state", (c) => {
+	return c.json(getCodexManager().getBrowserAuthState());
 });
 
 /**

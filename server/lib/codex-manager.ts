@@ -14,7 +14,10 @@ import {
 } from "./codex-agent-identity";
 import {
 	type CodexTokens,
+	completeBrowserOAuthFromCallbackUrl,
 	extractCodexTokenInfo,
+	getBrowserOAuthRedirectUri,
+	hasPendingBrowserOAuth,
 	pollDeviceCodeFlow,
 	refreshCodexToken,
 	startBrowserOAuth,
@@ -1703,7 +1706,7 @@ export class CodexManager {
 
 	// ==================== OAuth Flows ====================
 
-	async startBrowserAuth(): Promise<{ authorizeUrl: string }> {
+	async startBrowserAuth(): Promise<{ authorizeUrl: string; redirectUri: string }> {
 		const { resolveOverride } = await import("./net/proxy");
 		const { settings } = await import("./settings");
 		const proxy = resolveOverride(settings.codex?.proxy);
@@ -1724,7 +1727,31 @@ export class CodexManager {
 				logger.warn("Codex browser auth failed", { error: this._lastBrowserAuthError });
 			});
 
-		return { authorizeUrl };
+		return { authorizeUrl, redirectUri: getBrowserOAuthRedirectUri() };
+	}
+
+	/**
+	 * Finish a browser OAuth flow from a manually pasted callback URL.
+	 *
+	 * The credential is added by the background `tokenPromise` handler in
+	 * `startBrowserAuth`, so this only reports which account was authorized.
+	 *
+	 * A failure here is NOT recorded in `_lastBrowserAuthError`: a bad paste or a
+	 * transient proxy error leaves the flow pending on purpose, so the user can fix
+	 * the input and retry. That field means "the flow itself failed" and the UI
+	 * reacts by closing the paste box — which would take the retry away. The caller
+	 * gets the message through the thrown error instead.
+	 */
+	async completeBrowserAuthFromCallbackUrl(
+		callbackUrl: string,
+	): Promise<{ accountId?: string; email?: string }> {
+		const tokens = await completeBrowserOAuthFromCallbackUrl(callbackUrl);
+		this._lastBrowserAuthError = undefined;
+		return { accountId: tokens.accountId, email: tokens.email };
+	}
+
+	getBrowserAuthState(): { pending: boolean; redirectUri: string } {
+		return { pending: hasPendingBrowserOAuth(), redirectUri: getBrowserOAuthRedirectUri() };
 	}
 
 	async startDeviceAuth(): Promise<{

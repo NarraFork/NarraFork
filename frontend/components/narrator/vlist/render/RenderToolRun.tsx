@@ -206,8 +206,17 @@ interface RenderToolRunProps {
 	onToggleItems?: () => void;
 	/** Toggle "show earlier". */
 	onToggleEarlier?: () => void;
-	/** Toggle one expandable row's body. */
-	onToggleRow?: (itemIndex: number) => void;
+	/**
+	 * Toggle one expandable row's body.
+	 *
+	 * Reports BOTH the row's index and its key, because which one identifies the row
+	 * depends on the element kind and this pure render layer does not decide that:
+	 * a trace folding a live row list is re-numbered under the reader (one row per
+	 * reasoning step, so a new step shifts everything below it) and must be addressed
+	 * by key, while an append-only trace is fine with its index. The integration
+	 * layer routes on kind — see `traceRowFoldChannel`.
+	 */
+	onToggleRow?: (itemIndex: number, rowKey: string) => void;
 	/** Wraps each row's title line in an interaction surface (see the type doc). */
 	rowInteraction?: TraceRowInteractionSlot;
 	/** Renders a drilled-in row's nested tool card (see the type doc). */
@@ -552,7 +561,7 @@ function TraceRowView({
 }: {
 	row: MeasuredTraceRow;
 	rowIcon?: (row: MeasuredTraceRow) => React.ReactNode;
-	onToggleRow?: (itemIndex: number) => void;
+	onToggleRow?: (itemIndex: number, rowKey: string) => void;
 	rowInteraction?: TraceRowInteractionSlot;
 	rowCard?: TraceRowCardSlot;
 	timingLabels?: ToolTimingLabels;
@@ -572,12 +581,12 @@ function TraceRowView({
 	const handleToggle = row.expandable
 		? (e: React.MouseEvent) => {
 				if (interactive && (e.metaKey || e.ctrlKey || e.shiftKey)) return;
-				onToggleRow?.(row.itemIndex);
+				onToggleRow?.(row.itemIndex, row.key);
 			}
 		: undefined;
 	// Enter / Space on a focused row, the keyboard equivalent of the click above.
 	const handleKeyDown = row.expandable
-		? activateOnKey(() => onToggleRow?.(row.itemIndex))
+		? activateOnKey(() => onToggleRow?.(row.itemIndex, row.key))
 		: undefined;
 	const titleRow = (
 		<Group

@@ -24,6 +24,8 @@ let saveSettingsCalls = 0;
 let codexImportedCredentials: unknown[] = [];
 let codexRemoveUnhealthyCalls = 0;
 let managerTierOrder = [...DEFAULT_CODEX_TIER_ORDER];
+let browserCallbackUrls: string[] = [];
+let browserCallbackError: string | null = null;
 
 function getEffectiveTierOrder(): CodexTier[] {
 	const effective = [...managerTierOrder];
@@ -85,6 +87,19 @@ mock.module("../../../server/lib/codex-manager", () => ({
 			codexRemoveUnhealthyCalls++;
 			return { removed: ["failed-1", "banned-1"], reasons: ["too_many_failures", "banned"] };
 		},
+		startBrowserAuth: async () => ({
+			authorizeUrl: "https://auth.openai.com/oauth/authorize?state=s1",
+			redirectUri: "http://localhost:1455/auth/callback",
+		}),
+		completeBrowserAuthFromCallbackUrl: async (callbackUrl: string) => {
+			browserCallbackUrls.push(callbackUrl);
+			if (browserCallbackError) throw new Error(browserCallbackError);
+			return { accountId: "acc-1", email: "user@example.com" };
+		},
+		getBrowserAuthState: () => ({
+			pending: true,
+			redirectUri: "http://localhost:1455/auth/callback",
+		}),
 		getPublicQuotaOverview: () => ({
 			generatedAt: "2026-05-01T00:00:00.000Z",
 			unit: "account_equivalent",
@@ -163,6 +178,8 @@ beforeEach(() => {
 	codexImportedCredentials = [];
 	codexRemoveUnhealthyCalls = 0;
 	managerTierOrder = [...DEFAULT_CODEX_TIER_ORDER];
+	browserCallbackUrls = [];
+	browserCallbackError = null;
 });
 
 afterAll(() => {
@@ -376,5 +393,67 @@ describe("codex routes validation", () => {
 			reasons: ["too_many_failures", "banned"],
 		});
 		expect(codexRemoveUnhealthyCalls).toBe(1);
+	});
+});
+
+describe("codex browser OAuth manual callback", () => {
+	it("returns the redirect URI so the UI can tell users what to paste", async () => {
+		const res = await app.request("/auth/browser", { method: "POST" });
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			authorizeUrl: "https://auth.openai.com/oauth/authorize?state=s1",
+			redirectUri: "http://localhost:1455/auth/callback",
+		});
+	});
+
+	it("completes a pending flow from a pasted callback URL", async () => {
+		const callbackUrl = "http://localhost:1455/auth/callback?code=abc123&state=s1";
+		const res = await app.request("/auth/browser/callback", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ callbackUrl }),
+		});
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			ok: true,
+			accountId: "acc-1",
+			email: "user@example.com",
+		});
+		expect(browserCallbackUrls).toEqual([callbackUrl]);
+	});
+
+	it("rejects an empty callback URL before touching the manager", async () => {
+		const res = await app.request("/auth/browser/callback", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ callbackUrl: "" }),
+		});
+
+		expect(res.status).toBe(400);
+		expect(browserCallbackUrls).toEqual([]);
+	});
+
+	it("surfaces the manager error as a 400 instead of a 500", async () => {
+		browserCallbackError = "No pending browser authorization.";
+		const res = await app.request("/auth/browser/callback", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ callbackUrl: "?code=abc" }),
+		});
+
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({ error: "No pending browser authorization." });
+	});
+
+	it("reports whether a browser flow is pending", async () => {
+		const res = await app.request("/auth/browser/state");
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			pending: true,
+			redirectUri: "http://localhost:1455/auth/callback",
+		});
 	});
 });

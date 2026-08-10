@@ -123,6 +123,7 @@ export {
 	askInPassingStartSchema,
 	batchDeleteBlocksSchema,
 	browserInteractSchema,
+	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
 	codexTierOrderSchema,
 	codexUseImageGenerationSchema,

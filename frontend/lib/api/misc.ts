@@ -419,11 +419,18 @@ export const miscApi = {
 		}>(`/codex/status${suffix}`);
 	},
 	codexBrowserAuth: () =>
-		request<{ authorizeUrl: string }>("/codex/auth/browser", {
+		request<{ authorizeUrl: string; redirectUri?: string }>("/codex/auth/browser", {
 			method: "POST",
 		}),
 	codexBrowserAuthCancel: () =>
 		request<{ ok: boolean }>("/codex/auth/browser/cancel", { method: "POST" }),
+	codexBrowserAuthCallback: (callbackUrl: string) =>
+		request<{ ok: boolean; accountId?: string; email?: string }>("/codex/auth/browser/callback", {
+			method: "POST",
+			body: JSON.stringify({ callbackUrl }),
+		}),
+	codexBrowserAuthState: () =>
+		request<{ pending: boolean; redirectUri: string }>("/codex/auth/browser/state"),
 	codexDeviceAuthStart: () =>
 		request<{
 			deviceAuthId: string;

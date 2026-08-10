@@ -31,6 +31,12 @@ export interface BuildPretextDocumentLayoutOptions {
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
+	/**
+	 * Row-KEY addressed expansion for `activity-trace` / `tool-run-summary`. See
+	 * `AdapterContext.isRowExpanded`: those rows' ordinals are not stable while a
+	 * turn streams, so the reader's intent is stored against the row's key.
+	 */
+	isRowExpanded?: (traceKey: string, rowKey: string) => boolean;
 	/** Resolve whether a translated reasoning body shows its ORIGINAL text. */
 	showOriginal?: (key: string) => boolean;
 	/** Resolve whether a subagent card's prompt body is open. */

@@ -60,6 +60,13 @@ export interface UsePretextDocumentOptions {
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
+	/**
+	 * Row-KEY addressed expansion for `activity-trace` / `tool-run-summary` (see
+	 * `AdapterContext.isRowExpanded`). Its identity moves with the expanded-row
+	 * state, so folding it into `buildOptions` is what rebuilds the document when
+	 * the reader drills into a row.
+	 */
+	isRowExpanded?: (traceKey: string, rowKey: string) => boolean;
 	/** Resolve whether a translated reasoning body shows its ORIGINAL text. */
 	showOriginal?: (key: string) => boolean;
 	/** Resolve whether a subagent card's prompt body is open. */
@@ -287,6 +294,7 @@ export function usePretextDocument(
 			isLodUserOverride: options.isLodUserOverride,
 			showEarlier: options.showEarlier,
 			expandedRows: options.expandedRows,
+			isRowExpanded: options.isRowExpanded,
 			showOriginal: options.showOriginal,
 			isPromptOpen: options.isPromptOpen,
 			recentMessageIds: options.recentMessageIds,
@@ -317,6 +325,10 @@ export function usePretextDocument(
 			options.formatUsageNumber,
 			options.contentWidth,
 			options.expandedRows,
+			// Drilling into a trace row adds a whole measured card, so the resolver's
+			// identity must move with the expanded-row state or the document never
+			// rebuilds and the row cannot open (same contract as `expandedRows`).
+			options.isRowExpanded,
 			options.gap,
 			options.segmentGap,
 			options.isExpanded,

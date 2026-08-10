@@ -1291,12 +1291,17 @@ describe("folded tool rows — drill-down payload", () => {
 		expect(activityRows(spec)[0]?.card).toBeUndefined();
 	});
 
+	/** `isRowExpanded` opening exactly `rowKeys` inside `traceKey`. */
+	const openRows = (traceKey: string, ...rowKeys: string[]) => ({
+		isRowExpanded: (key: string, rowKey: string) => key === traceKey && rowKeys.includes(rowKey),
+	});
+
 	it("an expanded row carries the classified card", async () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
 		const spec = adaptActivityUnit(
 			[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: readTc() }],
 			"act-1",
-			{ lod: 2, expandedRows: (key) => (key === "act-1" ? [0] : []) },
+			{ lod: 2, ...openRows("act-1", "tool-tu-1") },
 		);
 		const card = activityRows(spec)[0]?.card;
 		expect(card).toBeDefined();
@@ -1310,40 +1315,73 @@ describe("folded tool rows — drill-down payload", () => {
 			{ kind: "tool" as const, msg: msgWith([]), blockIndex: 0, tc: readTc("tu-1") },
 			{ kind: "tool" as const, msg: msgWith([]), blockIndex: 1, tc: readTc("tu-2") },
 		];
-		const spec = adaptActivityUnit(items, "act-1", {
-			lod: 2,
-			expandedRows: (key) => (key === "act-1" ? [1] : []),
-		});
+		const spec = adaptActivityUnit(items, "act-1", { lod: 2, ...openRows("act-1", "tool-tu-2") });
 		expect(activityRows(spec).map((row) => row.card != null)).toEqual([false, true]);
 		// Another trace's expansion must not leak into this one.
-		const other = adaptActivityUnit(items, "act-1", {
-			lod: 2,
-			expandedRows: (key) => (key === "act-2" ? [1] : []),
-		});
+		const other = adaptActivityUnit(items, "act-1", { lod: 2, ...openRows("act-2", "tool-tu-2") });
 		expect(activityRows(other).map((row) => row.card != null)).toEqual([false, false]);
 	});
 
-	it("row indices survive a multi-step reasoning run before the tool", async () => {
+	/**
+	 * The `expandedIndices` the trace reports must number the EMITTED ROW list, since
+	 * the measure layer resolves a visible row back to `startIndex + vi` over that
+	 * same array. A multi-step reasoning run is what pulls the two numberings apart:
+	 * it contributes one row per step, so the tool below it is input item 1 but row 2.
+	 */
+	it("reports the expanded row's index over the EMITTED rows, not the input items", async () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
-		// This reasoning block parses into TWO step rows, so the tool is input item 1
-		// but ROW index 2. Addressing the emitted row list is what makes the click
-		// land on the tool the reader pointed at rather than a reasoning step.
 		const blocks = [{ type: "reasoning", text: "**A**\n\nfirst\n\n**B**\n\nsecond" }];
 		const msg = msgWith(blocks);
 		const items = [
 			{ kind: "reasoning" as const, msg, blockIndex: 0, block: blocks[0] as never },
 			{ kind: "tool" as const, msg, blockIndex: 1, tc: readTc() },
 		];
-		const rows = activityRows(
-			adaptActivityUnit(items, "act-1", { lod: 2, expandedRows: () => [2] }),
-		);
+		const spec = adaptActivityUnit(items, "act-1", { lod: 2, ...openRows("act-1", "tool-tu-1") });
+		const rows = activityRows(spec);
 		expect(rows).toHaveLength(3);
 		expect(rows[2]?.card).toBeDefined();
-		// The input index (1) must NOT open anything — it points at a reasoning row.
-		const wrong = activityRows(
-			adaptActivityUnit(items, "act-1", { lod: 2, expandedRows: () => [1] }),
-		);
-		expect(wrong.map((row) => row.card != null)).toEqual([false, false, false]);
+		// Row 2, not input item 1 — the reasoning run emitted rows 0 and 1.
+		expect((spec.opts as { expandedIndices?: number[] }).expandedIndices).toEqual([2]);
+	});
+
+	/**
+	 * The regression this whole channel exists for (reported as a folded row that
+	 * would not stay open, and rows overlapping while a turn streamed).
+	 *
+	 * A live reasoning run emits ONE ROW PER STEP, so the next `**title**` shifts
+	 * every row below it down by one. While the reader's intent was stored as a row
+	 * INDEX, that shift silently re-pointed it: the tool they opened folded shut and
+	 * a neighbour opened in its place — a height change with no user action behind
+	 * it, which CONTRACT §0 forbids. A row KEY is stable across exactly those frames.
+	 */
+	it("keeps the SAME tool open as a live reasoning run emits more rows", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const openedFor = (text: string) => {
+			const blocks = [{ type: "reasoning", text }];
+			const msg = msgWith(blocks);
+			const spec = adaptActivityUnit(
+				[
+					{ kind: "reasoning" as const, msg, blockIndex: 0, block: blocks[0] as never },
+					{ kind: "tool" as const, msg, blockIndex: 1, tc: readTc() },
+				],
+				"act-1",
+				{ lod: 2, ...openRows("act-1", "tool-tu-1") },
+			);
+			return activityRows(spec)
+				.map((row, index) => ({ row, index }))
+				.filter(({ row }) => row.card != null);
+		};
+
+		const oneStep = openedFor("**A**\n\nfirst");
+		const threeSteps = openedFor("**A**\n\nfirst\n\n**B**\n\nsecond\n\n**C**\n\nthird");
+		// Still exactly one card, and still the tool's.
+		expect(oneStep).toHaveLength(1);
+		expect(threeSteps).toHaveLength(1);
+		expect(threeSteps[0]?.row.card?.toolName).toBe("Read");
+		// Its INDEX moved (the run grew above it) — which is precisely why the index
+		// could not be the thing stored.
+		expect(oneStep[0]?.index).toBe(1);
+		expect(threeSteps[0]?.index).toBe(3);
 	});
 
 	it("a tool without a toolUseId cannot be drilled into", async () => {
@@ -1351,10 +1389,39 @@ describe("folded tool rows — drill-down payload", () => {
 		const spec = adaptActivityUnit(
 			[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: { toolName: "Read" } }],
 			"act-1",
-			{ lod: 2, expandedRows: () => [0] },
+			{ lod: 2, isRowExpanded: () => true },
 		);
 		expect(activityRows(spec)[0]?.canDrillDown).toBeUndefined();
 		expect(activityRows(spec)[0]?.card).toBeUndefined();
+	});
+
+	/**
+	 * A provider retry puts the same tool-use id in two persisted messages, and the
+	 * second row is suffixed (`tool-tu-1#1`) so the two cannot overlap. That suffixed
+	 * key is what the renderer paints and therefore what a click reports, so the
+	 * lookup has to ask with it — asking with the bare id would never match the
+	 * reader's second attempt.
+	 */
+	it("addresses a retried call's suffixed row by its suffixed key", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const items = [
+			{ kind: "tool" as const, msg: msgWith([], "m1"), blockIndex: 0, tc: readTc("tu-1") },
+			{
+				kind: "tool" as const,
+				msg: msgWith([], "m2"),
+				blockIndex: 0,
+				tc: readTc("tu-1"),
+				dedupeSuffix: 1,
+			},
+		];
+		const second = adaptActivityUnit(items, "act-1", {
+			lod: 2,
+			...openRows("act-1", "tool-tu-1#1"),
+		});
+		expect(activityRows(second).map((row) => row.card != null)).toEqual([false, true]);
+		// The bare key opens the FIRST attempt only, so the two stay independent.
+		const first = adaptActivityUnit(items, "act-1", { lod: 2, ...openRows("act-1", "tool-tu-1") });
+		expect(activityRows(first).map((row) => row.card != null)).toEqual([true, false]);
 	});
 
 	it("the L3 tool-run-summary fold drills down under its own spec key", async () => {
@@ -1374,9 +1441,11 @@ describe("folded tool rows — drill-down payload", () => {
 
 		const expanded = adaptSegment(seg, {
 			lod: 3,
-			expandedRows: (key) => (key === "toolrun-summary-tool-tu-1" ? [0] : []),
+			...openRows("toolrun-summary-tool-tu-1", "tool-tu-1"),
 		})[0]!;
 		expect(activityRows(expanded).map((row) => row.card != null)).toEqual([true, false]);
+		// The reported indices are derived from those same rows.
+		expect((expanded.opts as { expandedIndices?: number[] }).expandedIndices).toEqual([0]);
 	});
 
 	it("the drilled-in card matches the standalone card the same tool produces", async () => {
@@ -1393,7 +1462,7 @@ describe("folded tool rows — drill-down payload", () => {
 		const drilled = activityRows(
 			adaptActivityUnit([{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc }], "act-1", {
 				lod: 2,
-				expandedRows: () => [0],
+				...openRows("act-1", "tool-tu-1"),
 			}),
 		)[0]?.card;
 		// One constructor, so the payloads are identical — which is what keeps the

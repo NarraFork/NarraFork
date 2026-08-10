@@ -352,7 +352,7 @@ export function renderElement(
 					labels={extra.labels as never}
 					onToggleItems={extra.onToggleItems as (() => void) | undefined}
 					onToggleEarlier={extra.onToggleEarlier as (() => void) | undefined}
-					onToggleRow={extra.onToggleRow as ((index: number) => void) | undefined}
+					onToggleRow={extra.onToggleRow as ((index: number, rowKey: string) => void) | undefined}
 					rowInteraction={extra.rowInteraction as TraceRowInteractionSlot | undefined}
 					// Drilled-in rows nest a real tool card. Supplied through `extra` (NOT
 					// spec.opts): the shell owns the labels / narrator / viewer wiring a card

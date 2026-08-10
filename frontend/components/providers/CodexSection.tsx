@@ -73,6 +73,7 @@ import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import { CodexQuotaOverview } from "./CodexQuotaOverview";
 import { CodexUsageDisplay } from "./CodexUsageDisplay";
+import { reconcileCodexBrowserAuthState } from "./codex-browser-auth-state";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
@@ -437,6 +438,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const canClearUsageQueue = usageQueueClearSupported && isCodexRouteSupported("usageQueueClear");
 	const canStartBrowserAuth = isCodexRouteSupported("browserAuth");
 	const canCancelBrowserAuth = isCodexRouteSupported("browserAuthCancel");
+	const canImportBrowserCallback = isCodexRouteSupported("browserAuthCallback");
 	const canStartDeviceAuth = isCodexRouteSupported("deviceAuthStart");
 	const canPollDeviceAuth = isCodexRouteSupported("deviceAuthPoll");
 	const canRunDeviceAuth = canStartDeviceAuth && canPollDeviceAuth;
@@ -447,6 +449,8 @@ export const CodexSection = React.memo(function CodexSection({
 		codexManagerParity?.snapshotPaginationParity === "partial";
 	const [browserAuthPending, setBrowserAuthPending] = useState(false);
 	const [browserAuthLoading, setBrowserAuthLoading] = useState(false);
+	const [browserCallbackUrl, setBrowserCallbackUrl] = useState("");
+	const [browserRedirectUri, setBrowserRedirectUri] = useState<string | null>(null);
 	const [deviceAuthModal, setDeviceAuthModal] = useState(false);
 	const [deviceAuthData, setDeviceAuthData] = useState<{
 		userCode: string;
@@ -488,6 +492,10 @@ export const CodexSection = React.memo(function CodexSection({
 	const deviceAuthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 	const browserAuthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 	const browserAuthTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const browserCallbackSubmittingRef = useRef(false);
+	// When THIS tab started a browser flow, so a browser-auth-state answer fetched
+	// earlier is not mistaken for a verdict on it (see reconcileCodexBrowserAuthState).
+	const browserAuthStartedAtRef = useRef<number | null>(null);
 	const lastSyncedTierOrderRef = useRef<string | null>(null);
 
 	// Cleanup polling intervals/timeouts on unmount
@@ -529,6 +537,16 @@ export const CodexSection = React.memo(function CodexSection({
 		queryKey: ["codex", "fingerprint"],
 		queryFn: api.codexGetFingerprint,
 		enabled: canReadCodexStatus,
+	});
+	// The pending flow lives on the server, so a page reload (or authorizing from a
+	// different tab) must not hide the manual callback box.
+	const { data: browserAuthState, dataUpdatedAt: browserAuthStateAt } = useQuery({
+		queryKey: ["codex", "browser-auth-state"],
+		queryFn: api.codexBrowserAuthState,
+		enabled: canImportBrowserCallback,
+		// Mount + window focus cover "a flow was started elsewhere"; polling only
+		// runs while a flow is pending, to notice it resolving or expiring.
+		refetchInterval: browserAuthPending ? 10_000 : false,
 	});
 	// Lifetime totals come from their own durable table, so they are fetched
 	// separately from the pool snapshot and refresh far less often.
@@ -621,6 +639,31 @@ export const CodexSection = React.memo(function CodexSection({
 		);
 	}, [statusTierOrder]);
 
+	// Adopt a server-side pending flow this tab did not start (page reload, other tab),
+	// and drop the pending UI once the server no longer has one (completed elsewhere,
+	// or expired past this tab's own timeout).
+	//
+	// The in-flight submit is tracked via a ref, not the mutation's own isPending:
+	// the mutation is declared further down, so reading it here would hit its TDZ.
+	useEffect(() => {
+		const next = reconcileCodexBrowserAuthState({
+			serverState: browserAuthState,
+			serverStateAt: browserAuthStateAt,
+			startedAt: browserAuthStartedAtRef.current,
+			knownRedirectUri: browserRedirectUri,
+			submitting: browserCallbackSubmittingRef.current,
+		});
+		if (next.redirectUri !== undefined && next.redirectUri !== browserRedirectUri) {
+			setBrowserRedirectUri(next.redirectUri);
+		}
+		if (next.pending === true) setBrowserAuthPending(true);
+		if (next.pending === false) {
+			setBrowserAuthPending(false);
+			setBrowserAuthLoading(false);
+			browserAuthStartedAtRef.current = null;
+		}
+	}, [browserAuthState, browserAuthStateAt, browserRedirectUri]);
+
 	// Auto-detect browser auth failure from server-side error
 	useEffect(() => {
 		if (browserAuthPending && lastBrowserAuthError) {
@@ -633,6 +676,7 @@ export const CodexSection = React.memo(function CodexSection({
 				clearTimeout(browserAuthTimeoutRef.current);
 				browserAuthTimeoutRef.current = null;
 			}
+			browserAuthStartedAtRef.current = null;
 			setBrowserAuthPending(false);
 			setBrowserAuthLoading(false);
 			notifications.show({
@@ -832,11 +876,18 @@ export const CodexSection = React.memo(function CodexSection({
 	const handleBrowserAuth = async () => {
 		if (!canStartBrowserAuth) return;
 		const initialTotal = status?.total ?? 0;
+		browserAuthStartedAtRef.current = Date.now();
 		setBrowserAuthLoading(true);
 		setBrowserAuthPending(true);
 
 		try {
 			const result = await api.codexBrowserAuth();
+			setBrowserRedirectUri(result.redirectUri ?? null);
+			setBrowserCallbackUrl("");
+			// The cached browser-auth-state predates this flow, so it still says
+			// `pending: false` — and the reconcile effect would read that as "no flow"
+			// and close the paste box we just opened. Refetch before it runs.
+			qc.invalidateQueries({ queryKey: ["codex", "browser-auth-state"] });
 			window.open(result.authorizeUrl, "_blank");
 
 			const cleanupBrowserAuth = () => {
@@ -850,15 +901,16 @@ export const CodexSection = React.memo(function CodexSection({
 				}
 			};
 
-			// Set timeout to auto-cancel after 60 seconds
+			// Auto-cancel well after the server-side pending window opens, so the
+			// manual "paste callback URL" fallback stays usable for remote setups.
 			browserAuthTimeoutRef.current = setTimeout(() => {
 				cleanupBrowserAuth();
 				handleCancelBrowserAuth();
 				notifications.show({
-					message: "Browser authorization timed out",
+					message: t("codexBrowserAuthTimeout"),
 					color: "orange",
 				});
-			}, 60_000);
+			}, 10 * 60_000);
 
 			// Monitor for new credentials
 			let detected = false;
@@ -874,8 +926,10 @@ export const CodexSection = React.memo(function CodexSection({
 				if (currentTotal > initialTotal) {
 					detected = true;
 					cleanupBrowserAuth();
+					browserAuthStartedAtRef.current = null;
 					setBrowserAuthPending(false);
 					setBrowserAuthLoading(false);
+					setBrowserCallbackUrl("");
 					notifications.show({
 						message: t("codexAuthSuccess"),
 						color: "green",
@@ -883,6 +937,7 @@ export const CodexSection = React.memo(function CodexSection({
 				}
 			}, 3_000);
 		} catch (err) {
+			browserAuthStartedAtRef.current = null;
 			setBrowserAuthPending(false);
 			setBrowserAuthLoading(false);
 			notifications.show({
@@ -896,14 +951,65 @@ export const CodexSection = React.memo(function CodexSection({
 		if (!canCancelBrowserAuth) return;
 		try {
 			await api.codexBrowserAuthCancel();
+			browserAuthStartedAtRef.current = null;
 			setBrowserAuthPending(false);
 			setBrowserAuthLoading(false);
+			setBrowserCallbackUrl("");
+			qc.invalidateQueries({ queryKey: ["codex", "browser-auth-state"] });
 		} catch (err) {
 			notifications.show({
 				message: err instanceof Error ? err.message : String(err),
 				color: "red",
 			});
 		}
+	};
+
+	const importBrowserCallbackMut = useMutation({
+		mutationFn: (url: string) => {
+			browserCallbackSubmittingRef.current = true;
+			return api.codexBrowserAuthCallback(url);
+		},
+		onSuccess: (result) => {
+			browserCallbackSubmittingRef.current = false;
+			browserAuthStartedAtRef.current = null;
+			if (browserAuthIntervalRef.current) {
+				clearInterval(browserAuthIntervalRef.current);
+				browserAuthIntervalRef.current = null;
+			}
+			if (browserAuthTimeoutRef.current) {
+				clearTimeout(browserAuthTimeoutRef.current);
+				browserAuthTimeoutRef.current = null;
+			}
+			setBrowserAuthPending(false);
+			setBrowserAuthLoading(false);
+			setBrowserCallbackUrl("");
+			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			qc.invalidateQueries({ queryKey: ["codex", "browser-auth-state"] });
+			notifications.show({
+				message: result.email
+					? t("codexBrowserCallbackSuccessWithEmail", { email: result.email })
+					: t("codexAuthSuccess"),
+				color: "green",
+			});
+		},
+		onError: (err) => {
+			browserCallbackSubmittingRef.current = false;
+			// The server keeps the flow pending on a failed exchange, so the paste box
+			// stays open for a retry instead of forcing a fresh authorization.
+			qc.invalidateQueries({ queryKey: ["codex", "browser-auth-state"] });
+			notifications.show({
+				message: err instanceof Error ? err.message : String(err),
+				color: "red",
+				autoClose: 10_000,
+			});
+		},
+	});
+
+	const handleImportBrowserCallback = () => {
+		if (!canImportBrowserCallback) return;
+		const trimmed = browserCallbackUrl.trim();
+		if (!trimmed) return;
+		importBrowserCallbackMut.mutate(trimmed);
 	};
 
 	const handleDeviceAuth = async () => {
@@ -1219,19 +1325,47 @@ export const CodexSection = React.memo(function CodexSection({
 						<Stack gap="xs">
 							<Group gap="xs">
 								<Text size="sm" c="blue">
-									Waiting for browser authorization...
+									{t("codexBrowserAuthWaiting")}
 								</Text>
 							</Group>
-							<Button
+							{/* Manual callback URL: the redirect targets localhost on the
+							    user's machine, which never reaches a remote NarraFork host. */}
+							<Text size="xs" c="dimmed">
+								{t("codexBrowserCallbackDesc", {
+									redirectUri: browserRedirectUri ?? "http://localhost:1455/auth/callback",
+								})}
+							</Text>
+							<Textarea
 								size="xs"
-								variant="light"
-								color="orange"
-								onClick={handleCancelBrowserAuth}
-								disabled={!canCancelBrowserAuth}
-								title={!canCancelBrowserAuth ? providerRouteUnsupportedReason : undefined}
-							>
-								Cancel
-							</Button>
+								placeholder={t("codexBrowserCallbackPlaceholder")}
+								value={browserCallbackUrl}
+								onChange={(e) => setBrowserCallbackUrl(e.currentTarget.value)}
+								minRows={2}
+								maxRows={4}
+								autosize
+								disabled={!canImportBrowserCallback}
+							/>
+							<Group gap="xs">
+								<Button
+									size="xs"
+									onClick={handleImportBrowserCallback}
+									loading={importBrowserCallbackMut.isPending}
+									disabled={!browserCallbackUrl.trim() || !canImportBrowserCallback}
+									title={!canImportBrowserCallback ? providerRouteUnsupportedReason : undefined}
+								>
+									{t("codexBrowserCallbackSubmit")}
+								</Button>
+								<Button
+									size="xs"
+									variant="light"
+									color="orange"
+									onClick={handleCancelBrowserAuth}
+									disabled={!canCancelBrowserAuth}
+									title={!canCancelBrowserAuth ? providerRouteUnsupportedReason : undefined}
+								>
+									{t("codexBrowserAuthCancel")}
+								</Button>
+							</Group>
 						</Stack>
 					</Paper>
 				) : (
