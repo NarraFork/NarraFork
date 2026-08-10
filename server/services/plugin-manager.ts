@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { db } from "@server/db";
 import { AsyncMutex } from "@server/lib/async-mutex";
@@ -1667,6 +1668,21 @@ export class PluginManager {
 	 * `bun.exe` (typically node_modules/bun/bin/bun.exe).
 	 */
 	private resolveBunExecutable(): string {
+		// Explicit override wins: lets a user pin the plugin runtime to a specific
+		// bun install without relying on PATH resolution (which is unreliable
+		// inside compiled single-file binaries).
+		const explicit = process.env.NF_PLUGIN_BUN_PATH?.trim();
+		if (explicit) {
+			const resolved = resolve(explicit);
+			if (!existsSync(resolved)) {
+				throw new PluginManagerError(
+					`NF_PLUGIN_BUN_PATH points at a missing executable: ${explicit}`,
+					"PLUGIN_BUN_RUNTIME_NOT_FOUND",
+					500,
+				);
+			}
+			return resolved;
+		}
 		const execPath = process.execPath;
 		// dev（宿主本身由 bun 运行）：execPath 就是真实的 bun 二进制
 		if (execPath && /(^|[\\/])bun(\.exe)?$/i.test(execPath)) return execPath;
@@ -1683,7 +1699,27 @@ export class PluginManager {
 				if (existsSync(viaShim)) return viaShim;
 			}
 		}
-		return execPath;
+		// Compiled single-file binaries may not resolve Bun.which against the
+		// runtime PATH. Probe well-known install locations before giving up.
+		const known = [
+			process.env.BUN_INSTALL && join(process.env.BUN_INSTALL, "bin", "bun.exe"),
+			join(homedir(), ".bun", "bin", "bun.exe"),
+			process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "bun", "bin", "bun.exe"),
+		].filter((p): p is string => Boolean(p));
+		for (const candidate of known) {
+			if (existsSync(candidate)) return candidate;
+		}
+		// Fail closed: falling back to process.execPath would spawn the host
+		// binary itself, which collides with the instance lock and exits 1 —
+		// surfacing as a silent plugin crash and quarantine. A loud, actionable
+		// error is strictly better than another invisible restart loop.
+		throw new PluginManagerError(
+			"bun runtime required for local-process plugin but no bun executable was found. " +
+				"Install bun and add it to PATH, or set NF_PLUGIN_BUN_PATH to a bun binary " +
+				"(e.g. C:\\Users\\you\\.bun\\bin\\bun.exe).",
+			"PLUGIN_BUN_RUNTIME_NOT_FOUND",
+			500,
+		);
 	}
 
 	private async defaultRuntimeOptions(
