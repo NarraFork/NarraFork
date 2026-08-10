@@ -108,7 +108,13 @@
 			"submit": "安装",
 			"invalidExtension": "插件包必须是 .nfplugin 或 .zip 文件。",
 			"success": "插件 {{name}} 已安装。",
-			"error": "插件安装失败。"
+			"error": "插件安装失败。",
+			"authorizeTitle": "插件「{{name}}」的能力授权",
+			"authorizeDescription": "安装时已自动授予以下能力。取消勾选你不需要的能力，确认后立即生效。",
+			"authorizeNotGranted": "未授予",
+			"authorizeConfirm": "确认",
+			"authorizeSkip": "保持全部",
+			"authorizeBusy": "应用中…"
 		},
 		"detail": {
 			"backToList": "返回插件列表",

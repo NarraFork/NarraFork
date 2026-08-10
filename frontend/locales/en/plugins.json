@@ -108,7 +108,13 @@
 			"submit": "Install",
 			"invalidExtension": "The package must be a .nfplugin or .zip file.",
 			"success": "Plugin {{name}} installed.",
-			"error": "Failed to install the plugin."
+			"error": "Failed to install the plugin.",
+			"authorizeTitle": "Capability grants for {{name}}",
+			"authorizeDescription": "The plugin was automatically granted the declared capabilities below. Uncheck any you do not want; your selection takes effect immediately.",
+			"authorizeNotGranted": "Not granted",
+			"authorizeConfirm": "Confirm",
+			"authorizeSkip": "Keep all",
+			"authorizeBusy": "Applying…"
 		},
 		"detail": {
 			"backToList": "Back to plugins",
