@@ -342,12 +342,15 @@ describe("PluginManager", () => {
 			],
 		});
 		expect(granted.permissions.revision).toBe(2);
-		await permissionStore.replace(pluginId, installed.current.hash, [], {
+		// replacePermissions already lazily migrated the identity to a stable UUID.
+		const migratedUuid = granted.permissions.installationId;
+		expect(migratedUuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+		await permissionStore.replace(pluginId, migratedUuid, [], {
 			expectedRevision: 2,
 			targetRevision: 3,
 			grantedBy: "legacy-file-editor",
 		});
-		expect((await permissionStore.getSet(pluginId, installed.current.hash)).grants).toEqual([]);
+		expect((await permissionStore.getSet(pluginId, migratedUuid)).grants).toEqual([]);
 
 		await manager.enable(pluginId);
 		const active = await manager.activate(pluginId);
@@ -361,7 +364,7 @@ describe("PluginManager", () => {
 		expect(binding).toMatchObject({
 			plugin: {
 				pluginId,
-				installationId: installed.current.hash,
+				installationId: migratedUuid,
 				runtimeId: runtime.runtimeId,
 				runtimeGeneration: 1,
 			},
@@ -575,7 +578,7 @@ describe("PluginManager", () => {
 		});
 		const installed = await manager.install(await makePackage(root, pluginId));
 		if (!installed.current) throw new Error("Installed plugin has no current package");
-		await manager.replacePermissions(pluginId, {
+		const granted = await manager.replacePermissions(pluginId, {
 			expectedRevision: 1,
 			grantedBy: "admin-user-1",
 			grants: [
@@ -589,6 +592,9 @@ describe("PluginManager", () => {
 				},
 			],
 		});
+		// Identity is a stable UUID from the first grant operation; upgrades never
+		// change it, so grants survive the package hash change below.
+		const stableUuid = granted.permissions.installationId;
 		const upgraded = await manager.install(
 			await makePackage(root, pluginId, (manifest) => {
 				manifest.version = "2.0.0";
@@ -598,7 +604,7 @@ describe("PluginManager", () => {
 		expect(upgraded.current.hash).not.toBe(installed.current.hash);
 		const permissions = await manager.getPermissions(pluginId);
 		expect(permissions).toMatchObject({
-			installationId: upgraded.current.hash,
+			installationId: stableUuid,
 			revision: 2,
 			grants: [
 				{
@@ -612,7 +618,13 @@ describe("PluginManager", () => {
 				},
 			],
 		});
-		expect(await manager.permissionStore.listSets(pluginId)).toHaveLength(2);
+		// The legacy hash set may linger for back-compat, but the active UUID set
+		// must carry the complete grants after the upgrade.
+		const sets = await manager.permissionStore.listSets(pluginId);
+		expect(sets.some((set) => set.installationId === stableUuid)).toBe(true);
+		expect(
+			sets.find((set) => set.installationId === stableUuid)?.grants.map((g) => g.capability),
+		).toContain("query.read.projects");
 	});
 
 	test("rejects enabling an incompatible package", async () => {
@@ -971,5 +983,104 @@ describe("PluginManager", () => {
 		expect(order[0]).toBe("state-initialize");
 		expect(order).toContain("contribution-refresh");
 		expect(order.indexOf("state-initialize")).toBeLessThan(order.indexOf("contribution-refresh"));
+	});
+
+	test("migrates legacy hash identity to a stable UUID and keeps grants across upgrades", async () => {
+		const root = await makeTempRoot();
+		const storeRoot = join(root, "plugins");
+		const pluginId = "com.example.identity-migration";
+		const supervisor = new FakeSupervisor();
+		const stateStore = new PluginStateStore(storeRoot);
+		const permissionStore = new PluginPermissionStore({ root: storeRoot, stateStore });
+		const capabilityBroker = new CapabilityBroker();
+		const hostServices = new PluginHostServices({ capabilityBroker, permissionStore });
+		const migrationDispatcher = new PluginHostDispatcher({
+			identity: {
+				pluginId,
+				runtimeId: "migration-runtime",
+				runtimeGeneration: 0,
+			},
+			methods: {},
+		});
+		const platform = createPluginPlatformServices({
+			runtimeSupervisor: supervisor as never,
+			stateStore,
+			permissionStore,
+			capabilityBroker,
+			hostServices,
+		});
+		const manager = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			stateStore,
+			permissionStore,
+			hostServices,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: async (context) => ({
+				pluginId: context.pluginId,
+				pluginVersion: context.manifest.version,
+				packageDigest: context.package.hash,
+				command: ["fake-runtime"],
+				cwd: context.packagePath,
+				dispatcher: migrationDispatcher,
+			}),
+			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
+			restorePluginLifecycle: platform.restorePlugin,
+		});
+		await manager.initialize();
+
+		// Install in the legacy hash-identity era and grant by hash. The first
+		// grant operation already lazily migrates the identity to a stable UUID.
+		const source = await makePackage(root, pluginId, (manifest) => {
+			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+		});
+		const installed = await manager.install(source);
+		if (!installed.current) throw new Error("Installed plugin has no current package");
+		const legacyHash = installed.current.hash;
+		const granted = await manager.replacePermissions(pluginId, {
+			expectedRevision: 1,
+			grantedBy: "admin-user-1",
+			grants: [
+				{
+					grantId: "grant-identity",
+					capability: "diagnostics.readOwnLogs",
+					scope: { type: "global" },
+					grantedBy: "admin-user-1",
+				},
+			],
+		});
+		// Migrated to a stable UUID, distinct from the legacy package hash.
+		expect(granted.permissions.installationId).not.toBe(legacyHash);
+		expect(granted.permissions.installationId).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+		);
+		expect(granted.permissions.revision).toBe(2);
+		expect(granted.permissions.grants.map((g) => g.capability)).toContain(
+			"diagnostics.readOwnLogs",
+		);
+
+		// First permission read lazily migrates to a stable UUID, inheriting the
+		// legacy hash's grants via sourceInstallationId.
+		const migrated = await manager.getPermissions(pluginId);
+		expect(migrated.installationId).not.toBe(legacyHash);
+		expect(migrated.installationId).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+		);
+		expect(migrated.grants.map((g) => g.capability)).toContain("diagnostics.readOwnLogs");
+
+		// UUID is persisted and idempotent on subsequent reads.
+		const persisted = await stateStore.getState(pluginId);
+		expect(persisted?.installationId).toBe(migrated.installationId);
+		const again = await manager.getPermissions(pluginId);
+		expect(again.installationId).toBe(migrated.installationId);
+
+		// Simulate an upgrade (package hash changes): identity and grants survive.
+		await stateStore.updateState(pluginId, (current) => ({
+			...current,
+			current: { version: "9.9.9", hash: "aa".repeat(32) },
+		}));
+		const upgraded = await manager.getPermissions(pluginId);
+		expect(upgraded.installationId).toBe(migrated.installationId);
+		expect(upgraded.grants.map((g) => g.capability)).toContain("diagnostics.readOwnLogs");
 	});
 });

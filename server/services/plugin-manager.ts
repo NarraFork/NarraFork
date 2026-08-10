@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { db } from "@server/db";
@@ -1456,7 +1457,11 @@ export class PluginManager {
 						: await this.runtimeSupervisor.start(runtimeOptions);
 					const diagnostics = runtime.getDiagnostics();
 					if (runtimeOptions.runtimeId && packageSummary.hash) {
-						await this.bindRuntimeForRuntime(pluginId, packageSummary.hash, diagnostics);
+						await this.bindRuntimeForRuntime(
+							pluginId,
+							await this.currentInstallationId(pluginId),
+							diagnostics,
+						);
 					}
 					await this.stateStore.updateState(pluginId, (current) => ({
 						...current,
@@ -1581,14 +1586,7 @@ export class PluginManager {
 		runtimeId: string,
 		runtimeGeneration: number,
 	): Promise<ReturnType<PluginHostServices["bindRuntime"]>> {
-		const installationId = authorityInstallationId(context.state);
-		if (!installationId) {
-			throw new PluginManagerError(
-				"Plugin authority installation is unavailable",
-				"PLUGIN_PACKAGE_UNAVAILABLE",
-				422,
-			);
-		}
+		const installationId = await this.currentInstallationId(context.pluginId);
 		const permissions = await this.integrationAuthorityService.ensureInstallation(
 			context.pluginId,
 			installationId,
@@ -2124,7 +2122,20 @@ export class PluginManager {
 				422,
 			);
 		}
-		return installationId;
+		// Stable UUID identity (created once, survives upgrades). Legacy state
+		// without one is lazily migrated here: the UUID inherits the old hash's
+		// grants via sourceInstallationId so upgrades never lose authorization.
+		if (state.installationId) return state.installationId;
+		const legacyHash = state.current.hash;
+		const uuid = randomUUID();
+		await this.integrationAuthorityService.ensureInstallation(
+			pluginId,
+			uuid,
+			state.grants,
+			legacyHash,
+		);
+		await this.stateStore.setInstallationId(pluginId, uuid);
+		return uuid;
 	}
 
 	private async syncPermissionSummary(
@@ -2239,9 +2250,13 @@ export class PluginManager {
 					},
 				);
 				const state = await this.requireState(pluginId);
-				const installationId = authorityInstallationId(state);
-				if (state.current?.hash && installationId) {
-					await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
+				if (state.current?.hash) {
+					await this.bindRuntimeForRuntime(
+						pluginId,
+						await this.currentInstallationId(pluginId),
+						diagnostics,
+					);
+				}
 				}
 				await this.restorePluginLifecycle(pluginId);
 			}
