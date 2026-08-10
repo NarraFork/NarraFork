@@ -20,7 +20,10 @@ const FRONTEND_DIR = join(ROOT, "dist", "frontend");
 const DRIZZLE_DIR = join(ROOT, "drizzle");
 const GENERATED_DIR = join(ROOT, "server", "generated");
 const VERSION = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8")).version ?? "0.0.0";
-const OUT = join(ROOT, "dist", `narrafork-${VERSION}-windows-x64-fix31.exe`);
+// BUILD_SUFFIX lets you avoid clobbering a currently running exe (Windows
+// cannot overwrite a live binary): e.g. BUILD_SUFFIX=fix32 bun build-local-exe.mjs
+const SUFFIX = process.env.BUILD_SUFFIX ?? "fix31";
+const OUT = join(ROOT, "dist", `narrafork-${VERSION}-windows-x64-${SUFFIX}.exe`);
 
 function walkDir(dir) {
 	const out = [];
