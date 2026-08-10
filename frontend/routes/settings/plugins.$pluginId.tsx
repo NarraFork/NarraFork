@@ -6,10 +6,12 @@ import {
 	Group,
 	Loader,
 	Paper,
+	Select,
 	Stack,
 	Table,
 	Tabs,
 	Text,
+	TextInput,
 	Title,
 } from "@mantine/core";
 import {
@@ -22,7 +24,7 @@ import {
 	IconTrash,
 } from "@tabler/icons-react";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { isPluginsDisabledError, localizePluginError } from "../../components/plugins-admin/errors";
@@ -40,7 +42,8 @@ import {
 	useRetryPlugin,
 	useUninstallPlugin,
 } from "../../hooks/usePlugins";
-import type { PluginDetail } from "../../lib/api/plugins";
+import type { PluginDetail, PluginPermissionSet } from "../../lib/api/plugins";
+import { pluginsApi } from "../../lib/api/plugins";
 import { formatLocaleDateTime } from "../../lib/intl-format";
 
 export const Route = createFileRoute("/settings/plugins/$pluginId")({
@@ -183,31 +186,155 @@ function ContributionsTab({ plugin }: { plugin: PluginDetail }) {
 
 function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 	const { t } = useTranslation("plugins");
-	const grants = plugin.grants;
-	const capabilities = grants?.capabilities ?? [];
+	const confirm = useConfirmDialog();
+	const [set, setSet] = useState<PluginPermissionSet | null>(null);
+	const [error, setError] = useState<string | null>(null);
+	const [busy, setBusy] = useState(false);
+	const [adding, setAdding] = useState(false);
+	const [newCapability, setNewCapability] = useState("");
+	const [newScopeType, setNewScopeType] = useState("global");
+	const [newScopeId, setNewScopeId] = useState("");
+
+	const load = useCallback(async () => {
+		try {
+			setSet(await pluginsApi.getGrants(plugin.pluginId));
+			setError(null);
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		}
+	}, [plugin.pluginId]);
+	useEffect(() => {
+		void load();
+	}, [load]);
+
+	const revokeGrant = async (grantId: string, capability: string) => {
+		const ok = await confirm({
+			title: t("admin.detail.grants.revokeConfirmTitle"),
+			message: t("admin.detail.grants.revokeConfirmMessage", { capability }),
+			confirmLabel: t("admin.detail.grants.revoke"),
+		});
+		if (!ok || !set) return;
+		setBusy(true);
+		try {
+			await pluginsApi.revokeGrants(plugin.pluginId, {
+				expectedRevision: set.revision,
+				grantIds: [grantId],
+			});
+			await load();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
+	const addGrant = async () => {
+		const capability = newCapability.trim();
+		if (!capability || !set) return;
+		setBusy(true);
+		try {
+			const existing = set.grants.map((grant) => ({
+				capability: grant.capability,
+				scope: grant.scope,
+			}));
+			await pluginsApi.replaceGrants(plugin.pluginId, {
+				expectedRevision: set.revision,
+				grants: [
+					...existing,
+					{
+						capability,
+						scope: {
+							type: newScopeType,
+							id: newScopeType === "global" ? undefined : (newScopeId.trim() || undefined),
+						},
+					},
+				],
+			});
+			setNewCapability("");
+			setNewScopeId("");
+			setAdding(false);
+			await load();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
 	return (
 		<Stack gap="md">
-			<Alert color="blue" variant="light" title={t("admin.detail.grants.readOnlyTitle")}>
-				<Text size="sm">{t("admin.detail.grants.readOnlyMessage")}</Text>
-			</Alert>
-			{grants && (
+			{error && (
+				<Alert color="red" variant="light" title={t("common.error")}>
+					<Text size="sm">{error}</Text>
+				</Alert>
+			)}
+			<Group justify="space-between">
+				<Text fw={600} size="sm">
+					{t("admin.detail.grants.manageTitle")}
+				</Text>
+				<Group gap="xs">
+					<Button size="xs" variant="light" onClick={() => void load()} disabled={busy}>
+						{t("admin.detail.grants.refresh")}
+					</Button>
+					<Button
+						size="xs"
+						variant="outline"
+						onClick={() => setAdding((v) => !v)}
+						disabled={busy}
+					>
+						{t("admin.detail.grants.add")}
+					</Button>
+				</Group>
+			</Group>
+			{adding && (
 				<Paper withBorder p="md" radius="md">
 					<Stack gap="xs">
-						{grants.revision !== undefined && (
+						<Field label={t("admin.detail.grants.addCapability")}>
+							<TextInput
+								value={newCapability}
+								onChange={(event) => setNewCapability(event.currentTarget.value)}
+								placeholder="command.narrator.send_message"
+							/>
+						</Field>
+						<Group grow>
+							<Field label={t("admin.detail.grants.scopeType")}>
+								<Select
+									data={["global", "project", "chapter", "narrator", "workspace", "device"]}
+									value={newScopeType}
+									onChange={(value) => setNewScopeType(value ?? "global")}
+								/>
+							</Field>
+							<Field label={t("admin.detail.grants.scopeId")}>
+								<TextInput
+									value={newScopeId}
+									onChange={(event) => setNewScopeId(event.currentTarget.value)}
+									disabled={newScopeType === "global"}
+									placeholder={t("admin.detail.grants.scopeIdHint")}
+								/>
+							</Field>
+						</Group>
+						<Button size="xs" onClick={() => void addGrant()} disabled={busy || !newCapability.trim()}>
+							{t("admin.detail.grants.addSubmit")}
+						</Button>
+					</Stack>
+				</Paper>
+			)}
+			{set && (
+				<Paper withBorder p="md" radius="md">
+					<Stack gap="xs">
+						<Group gap="lg">
 							<Field label={t("admin.detail.grants.revision")}>
-								<Text size="sm">{grants.revision}</Text>
+								<Text size="sm">{set.revision}</Text>
 							</Field>
-						)}
-						{grants.count !== undefined && (
-							<Field label={t("admin.detail.grants.count")}>
-								<Text size="sm">{grants.count}</Text>
+							<Field label={t("admin.detail.grants.installationId")}>
+								<Text size="sm" style={{ wordBreak: "break-all" }}>
+									{set.installationId}
+								</Text>
 							</Field>
-						)}
-						{grants.updatedAt && (
 							<Field label={t("admin.detail.grants.updatedAt")}>
-								<Text size="sm">{formatLocaleDateTime(grants.updatedAt)}</Text>
+								<Text size="sm">{formatLocaleDateTime(set.updatedAt)}</Text>
 							</Field>
-						)}
+						</Group>
 					</Stack>
 				</Paper>
 			)}
@@ -215,18 +342,47 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 				<Text fw={600} size="sm" mb="xs">
 					{t("admin.detail.grants.capabilities")}
 				</Text>
-				{capabilities.length === 0 ? (
+				{!set ? (
+					<Text size="sm" c="dimmed">
+						{t("admin.detail.grants.loading")}
+					</Text>
+				) : set.grants.length === 0 ? (
 					<Text size="sm" c="dimmed">
 						{t("admin.detail.grants.empty")}
 					</Text>
 				) : (
-					<Group gap="xs" wrap="wrap">
-						{capabilities.map((capability) => (
-							<Badge key={capability} color="indigo" variant="light" size="sm">
-								{capability}
-							</Badge>
+					<Stack gap="xs">
+						{set.grants.map((grant) => (
+							<Paper key={grant.grantId} withBorder p="xs" radius="md">
+								<Group justify="space-between" wrap="nowrap">
+									<Group gap="sm" wrap="wrap">
+										<Badge color="indigo" variant="light" size="sm">
+											{grant.capability}
+										</Badge>
+										<Badge color="gray" variant="light" size="sm">
+											{grant.scope.type}
+											{grant.scope.id ? `:${grant.scope.id}` : ""}
+										</Badge>
+										{grant.grantedBy && (
+											<Text size="xs" c="dimmed">
+												{t("admin.detail.grants.grantedBy")}: {grant.grantedBy}
+											</Text>
+										)}
+									</Group>
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										color="red"
+										leftSection={<IconTrash size={14} />}
+										onClick={() => void revokeGrant(grant.grantId, grant.capability)}
+										disabled={busy}
+									>
+										{t("admin.detail.grants.revoke")}
+									</Button>
+								</Group>
+							</Paper>
 						))}
-					</Group>
+					</Stack>
 				)}
 			</div>
 		</Stack>

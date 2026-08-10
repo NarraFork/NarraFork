@@ -73,6 +73,38 @@ export interface PluginGrantSummary {
 	updatedAt?: string;
 }
 
+export interface PluginGrantScope {
+	type: string;
+	id?: string;
+}
+
+export interface PluginStoredGrant {
+	grantId: string;
+	capability: string;
+	scope: PluginGrantScope;
+	grantedBy?: string;
+	revision?: number;
+}
+
+export interface PluginPermissionSet {
+	pluginId: string;
+	installationId: string;
+	revision: number;
+	grants: PluginStoredGrant[];
+	updatedAt: string;
+}
+
+export interface PluginGrantInput {
+	capability: string;
+	scope: PluginGrantScope;
+	grantId?: string;
+}
+
+export interface PluginPermissionMutationResponse {
+	status?: PluginPermissionSet | string;
+	permissions?: PluginPermissionSet;
+}
+
 export interface PluginRuntimeDiagnostics {
 	runtimeId?: string;
 	generation?: number;
@@ -318,6 +350,27 @@ export const pluginsApi = {
 		request<PluginProviderConfigUpdateResponse>(`${pluginPath(pluginId)}/providers/proxy`, {
 			method: "PUT",
 			body: JSON.stringify({ providerInstanceId, proxy }),
+		}),
+	/** Full permission set for an installation (admin). */
+	getGrants: (pluginId: string) =>
+		request<PluginPermissionSet>(`${pluginPath(pluginId)}/grants`),
+	/** Replace the full grant list (admin). */
+	replaceGrants: (
+		pluginId: string,
+		body: { expectedRevision: number; grants: PluginGrantInput[] },
+	) =>
+		request<PluginPermissionMutationResponse>(`${pluginPath(pluginId)}/grants`, {
+			method: "PUT",
+			body: JSON.stringify(body),
+		}),
+	/** Revoke specific grants by id (admin). */
+	revokeGrants: (
+		pluginId: string,
+		body: { expectedRevision: number; grantIds: string[] },
+	) =>
+		request<PluginPermissionMutationResponse>(`${pluginPath(pluginId)}/grants/revoke`, {
+			method: "POST",
+			body: JSON.stringify(body),
 		}),
 };
 
