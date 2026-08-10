@@ -209,6 +209,10 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 	}, [plugin.pluginId]);
 	useEffect(() => {
 		void load();
+		// Poll while the grants tab is mounted (tab open + window focused) so
+		// autonomous grant/request changes show up without a manual refresh.
+		const timer = setInterval(() => void load(), 15_000);
+		return () => clearInterval(timer);
 	}, [load]);
 
 	const revokeGrant = async (grantId: string, capability: string) => {

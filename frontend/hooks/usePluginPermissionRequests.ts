@@ -2,6 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import type { PluginPermissionRequestSummary } from "../lib/api/plugins";
 import { pluginsApi } from "../lib/api/plugins";
 
+// Poll while the grants tab is mounted (tab open + window focused): new pending
+// requests appear autonomously when the plugin runtime calls an un-granted
+// capability, and the admin should see them without a manual refresh.
+const PENDING_REQUESTS_REFETCH_INTERVAL_MS = 15_000;
+
 interface UsePluginPermissionRequestsResult {
 	requests: PluginPermissionRequestSummary[];
 	loading: boolean;
@@ -29,6 +34,8 @@ export function usePluginPermissionRequests(
 
 	useEffect(() => {
 		void load();
+		const timer = setInterval(() => void load(), PENDING_REQUESTS_REFETCH_INTERVAL_MS);
+		return () => clearInterval(timer);
 	}, [load]);
 
 	return { requests, loading, refresh: load };

@@ -3,6 +3,11 @@ import { normalizePluginList, pluginsApi } from "../lib/api/plugins";
 
 const PLUGINS_QUERY_GC_TIME_MS = 60_000;
 const PLUGIN_DIAGNOSTICS_REFETCH_INTERVAL_MS = 5_000;
+// Bounded foreground polling for plugin list/detail: plugin runtime state and
+// permission requests change autonomously (crash/restart, new pending requests),
+// so the panel refreshes while visible. React Query only polls while the window
+// has focus; event-push refresh will layer on top later.
+const PLUGIN_REFETCH_INTERVAL_MS = 15_000;
 
 export const pluginKeys = {
 	all: ["plugins"] as const,
@@ -40,6 +45,7 @@ export function usePlugins(options?: { enabled?: boolean }) {
 		select: normalizePluginList,
 		enabled: options?.enabled ?? true,
 		gcTime: PLUGINS_QUERY_GC_TIME_MS,
+		refetchInterval: PLUGIN_REFETCH_INTERVAL_MS,
 		retry: (failureCount, error) => {
 			// 503 PLUGINS_DISABLED is a steady state, not a transient failure.
 			if ((error as { status?: number }).status === 503) return false;
@@ -54,6 +60,7 @@ export function usePlugin(pluginId: string, options?: { enabled?: boolean }) {
 		queryFn: () => pluginsApi.get(pluginId),
 		enabled: (options?.enabled ?? true) && pluginId.length > 0,
 		gcTime: PLUGINS_QUERY_GC_TIME_MS,
+		refetchInterval: PLUGIN_REFETCH_INTERVAL_MS,
 	});
 }
 
