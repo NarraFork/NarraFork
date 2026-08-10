@@ -30,7 +30,7 @@
 	"goToFork": "Go to fork",
 	"splitHere": "Split here",
 	"splitChapterTitle": "Split chapter at commit",
-	"splitChapterDesc": "Create a frozen prefix at this commit, keep the current chapter as the continuation, and create a new fork from the split point.",
+	"splitChapterDesc": "Create a prefix chapter holding the history up to this commit, keep the current chapter as the continuation, and create a new fork from the split point.",
 	"splitNewForkTitle": "New fork title",
 	"splitNewForkDescription": "New fork description",
 	"splitConfirm": "Split chapter",

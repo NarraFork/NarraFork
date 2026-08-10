@@ -483,6 +483,31 @@ export const chapterFork = {
 				anchorCommitSha = commitSha;
 				axisOffset = 40; // slight main-axis offset so the fork line isn't perfectly straight
 
+				// NOTE: the slot search below is a read-then-write sequence with no lock, so two
+				// forks that reach it concurrently can pick the same slot and stack their cards
+				// on top of each other in the graph. Left unguarded deliberately, for now:
+				//
+				//   - It is cosmetic. Both chapters, worktrees and branches are correct; only the
+				//     initial `crossOffset` collides, and dragging either card fixes it.
+				//   - It could not be reproduced. Six concurrent forks of one parent still came
+				//     out with distinct, contiguous slots, because each fork does seconds of
+				//     subprocess git work (branch, worktree add, snapshot restore) before reaching
+				//     this query, which staggers them past each other. See the concurrency case in
+				//     `chapter-fork-snapshot.test.ts`.
+				//   - `chapterLock` on the parent is the wrong key, not merely a coarse one. The
+				//     collision is between rows sharing an `anchorCommitSha`, and the query below
+				//     spans the whole table — two forks of *different* parents anchored to the
+				//     same commit contend, and holding each parent's lock excludes neither from
+				//     the other. It would serialize forks that cannot collide while still
+				//     admitting the ones that can.
+				//   - A lock keyed on the anchor commit would cover it, but slot uniqueness is a
+				//     property of the stored rows, so the fix that actually holds is a unique
+				//     constraint on (anchorCommitSha, crossOffset) plus retry on violation. That
+				//     needs a schema change; an in-process mutex added first would hide the
+				//     symptom on one server while leaving the invariant unenforced.
+				//
+				// If it becomes worth fixing, do it with the constraint.
+				//
 				// Find all chapters already anchored to this commit to avoid overlap
 				const existing = await db
 					.select({ crossOffset: chapters.crossOffset })
@@ -674,7 +699,12 @@ export const chapterFork = {
 				forkCommit: commitSha,
 			});
 
-			eventBus.emit({ type: "chapter:forked", chapterId: id, parentId: parentChapterId });
+			eventBus.emit({
+				type: "chapter:forked",
+				chapterId: id,
+				parentId: parentChapterId,
+				projectId: parent.projectId,
+			});
 			return warnings.length > 0 ? { ...chapter, warnings } : chapter;
 		} catch (err) {
 			logger.error("Chapter fork failed, rolling back", { error: String(err) });

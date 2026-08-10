@@ -845,14 +845,21 @@ rulerRoutes.post("/:id/ruler/rebase", async (c) => {
 	// `git rebase` runs additionally collide on `.git/rebase-merge` and leave the
 	// workspace mid-rebase with no owner.
 	//
-	// NOTE for future readers: this takes `worktreeLock` from `lib/async-mutex`, which is
-	// a DIFFERENT mutex from git-service's module-private `withWorktreeLock`. Neither is
-	// re-entrant, but they never contend with each other, so calling git-service from
-	// inside this block cannot self-deadlock: `gitService.rebase` takes no private lock
-	// at all, and `resetHard`/`cleanUntracked` (reached via `parkUncommittedWork`) take
-	// only the private one. `worktree-tree-snapshot`'s shadow-repo mutex is a third,
-	// separate instance keyed by the shadow directory. Do not "unify" these without
-	// re-checking every call in this block.
+	// NOTE for future readers: `worktreeLock` is now the *only* worktree mutex —
+	// git-service's formerly-separate module-private lock derives its key the same way, so
+	// a nested `gitService` write from inside this block would wait on the lock this block
+	// already holds. It is not re-entrant and has no owner tracking, so that is a
+	// deterministic hang, not a race.
+	//
+	// Every write reached from here therefore uses an `*Unlocked` variant:
+	// `gitService.rebase` never locked at all, and `resetHard`/`cleanUntracked` (reached
+	// via `parkUncommittedWork`, which documents that its caller owns the lock) call the
+	// unlocked forms. `worktree-tree-snapshot`'s shadow-repo mutex is still a separate
+	// instance keyed by the shadow directory, and is a level below this one in the
+	// hierarchy documented in `lib/async-mutex`.
+	//
+	// Adding a `gitService` write call inside this block? Use its `*Unlocked` variant.
+	// `git-service-worktree-lock.test.ts` fails on a deadline if this is got wrong.
 	return worktreeLock.acquire(worktreePath, async () => {
 		// Re-read now that nobody else can be mid-sequence. The status check lives here for
 		// the same reason: a chapter that was merged or abandoned by whoever held the lock

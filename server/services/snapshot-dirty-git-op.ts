@@ -388,6 +388,22 @@ async function uncoveredDirtyPaths(
  * Returns null when there is nothing git would refuse to operate over. Pass
  * `force: true` to park an untracked-only workspace as well, which is worth its cost
  * only after git has actually reported an untracked collision.
+ *
+ * **The caller must already hold `worktreeLock` for `worktreePath`.** Both production
+ * callers (`routes/ruler`'s rebase endpoint and `chapter-merge`'s cherry-pick) do, and
+ * they have to: the capture → verify → `reset --hard` → re-capture sequence is only sound
+ * while nothing else writes the workspace between steps, and the reset destroys the only
+ * other copy of what the capture recorded. Hence the `*Unlocked` git calls below and no
+ * acquire of its own — taking the lock here would queue behind its own caller forever.
+ *
+ * A "callerHoldsLock" boolean parameter was the alternative and was rejected: it makes
+ * the dangerous value (`false`, meaning "acquire") the one a caller gets by omitting the
+ * argument, so a new lock-holding caller that forgets it deadlocks. A hard precondition
+ * fails the other way — a caller that does *not* hold the lock gets weaker mutual
+ * exclusion, which the existing preconditions (in-progress-operation check, snapshot
+ * verification, dirty-path coverage check) already refuse to proceed through. It also
+ * keeps one code path instead of two, so the locked and unlocked behaviours cannot
+ * diverge.
  */
 export async function parkUncommittedWork(
 	worktreePath: string,
@@ -450,11 +466,14 @@ export async function parkUncommittedWork(
 	}
 
 	const head = (await gitService.getHeadCommit(worktreePath)).trim();
-	await gitService.resetHard(worktreePath, head);
+	// Unlocked: the caller owns `worktreeLock` for this worktree (see the doc comment).
+	// These two must also be adjacent under one holder — a write landing between the reset
+	// and the clean would be deleted by the clean without ever having been snapshotted.
+	await gitService.resetHardUnlocked(worktreePath, head);
 	// `reset --hard` leaves untracked files in place, and git refuses to check out over
 	// one that the incoming history also creates. They are in the snapshot, so removing
 	// them costs nothing and is what lets the operation proceed.
-	await gitService.cleanUntracked(worktreePath);
+	await gitService.cleanUntrackedUnlocked(worktreePath);
 
 	// The clean state, in the same terms as the other two sides of the reapply.
 	const base = await worktreeTreeSnapshot.tryCapture(worktreePath);

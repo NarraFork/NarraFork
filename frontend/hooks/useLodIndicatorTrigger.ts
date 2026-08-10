@@ -15,7 +15,10 @@ import { isAltKey } from "../components/narrator/lod-indicator";
  *
  * Alt-held is resynced from every mouse/key event's `altKey`, because a keyup
  * can be swallowed (window switch, OS menu grabbing Alt) and a stuck "held"
- * state would leave the indicator pinned open.
+ * state would leave the indicator pinned open. blur/focus/visibilitychange all
+ * reset it: alt+tab swallows the keyup on the way OUT and gives us no way to
+ * learn the key's real state on the way BACK IN, so returning to the page must
+ * assume Alt is up rather than inherit a belief from before the switch.
  */
 export function useLodIndicatorTrigger(
 	containerRef: React.RefObject<HTMLElement | null>,
@@ -77,12 +80,16 @@ export function useLodIndicatorTrigger(
 		window.addEventListener("keyup", onKeyUp);
 		document.addEventListener("mousemove", onMouseMove, { passive: true });
 		window.addEventListener("blur", reset);
+		// Focus too, not just blur: alt+tab arrives back with Alt possibly released
+		// outside the page, and the following keyup never reaches us.
+		window.addEventListener("focus", reset);
 		document.addEventListener("visibilitychange", reset);
 		return () => {
 			window.removeEventListener("keydown", onKeyDown);
 			window.removeEventListener("keyup", onKeyUp);
 			document.removeEventListener("mousemove", onMouseMove);
 			window.removeEventListener("blur", reset);
+			window.removeEventListener("focus", reset);
 			document.removeEventListener("visibilitychange", reset);
 		};
 	}, [enabled, isInside]);

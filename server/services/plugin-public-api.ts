@@ -1113,6 +1113,12 @@ export interface ChapterListSource {
 	id: string;
 	projectId: string;
 	title: string;
+	/**
+	 * Keeps `frozen` even though the column no longer produces it (see schema.ts).
+	 * This is a published plugin contract: narrowing it would turn a request that
+	 * used to return an empty list into a validation failure for any plugin still
+	 * passing the old value. It simply never matches now.
+	 */
 	status: "active" | "dormant" | "merged" | "abandoned" | "frozen";
 	role: "trunk" | "branch" | "exploration" | "review";
 	commitCount: number | null;
@@ -2430,7 +2436,20 @@ export function createCorePluginPublicApiAdapters(options: {
 					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
 				const predicates: SQL[] = [eq(chapters.projectId, input.projectId)];
 				if (input.chapterId) predicates.push(eq(chapters.id, input.chapterId));
-				if (input.status?.length) predicates.push(inArray(chapters.status, input.status));
+				if (input.status?.length) {
+					// The plugin contract still accepts `frozen` while the column no longer
+					// produces it, so the requested set is narrowed to values the column can
+					// actually hold. Filtering on `frozen` alone therefore yields an empty
+					// list — the same answer as before it was removed — rather than a type
+					// error here or a rejected request for the caller.
+					const storedStatuses = input.status.filter(
+						(s): s is (typeof chapters.status)["_"]["data"] => s !== "frozen",
+					);
+					// An all-`frozen` filter must stay empty rather than degrade to "no filter",
+					// which would return every chapter — exactly the bug this value used to cause.
+					if (storedStatuses.length === 0) return [];
+					predicates.push(inArray(chapters.status, storedStatuses));
+				}
 				if (input.role?.length) predicates.push(inArray(chapters.role, input.role));
 				if (input.after) {
 					const afterPredicate = or(

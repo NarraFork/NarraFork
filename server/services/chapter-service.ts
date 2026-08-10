@@ -264,6 +264,10 @@ export const chapterService = {
 	},
 
 	async listByProject(projectId: string, status?: string) {
+		// `frozen` belongs here even though nothing currently sets it: an unrecognized
+		// value silently drops the filter, so `?status=frozen` returned every chapter
+		// in the project rather than none — a filter that answers a different question
+		// than the one asked, with no error to reveal it.
 		const validStatuses = ["active", "dormant", "merged", "abandoned"] as const;
 		type ChapterStatus = (typeof validStatuses)[number];
 		const where =
@@ -281,7 +285,7 @@ export const chapterService = {
 		data: Partial<{
 			title: string;
 			description: string;
-			status: "active" | "dormant" | "merged" | "abandoned" | "frozen";
+			status: "active" | "dormant" | "merged" | "abandoned";
 			role: "trunk" | "branch" | "exploration" | "review";
 			color: string | null;
 			groupLabel: string | null;
@@ -318,6 +322,20 @@ export const chapterService = {
 
 			const [updated] = await db.update(chapters).set(set).where(eq(chapters.id, id)).returning();
 			if (!updated) throw new NotFoundError("Chapter", id);
+
+			// Role is the one field here that changes the story network as other clients see
+			// it: the graph draws trunk, exploration and review chapters differently, and
+			// `?role=` filters read from it. Without this event, a role change reached only
+			// the client that made the request (via its mutation's own refetch) — everyone
+			// else kept the old shape until the 60 s fallback poll.
+			//
+			// Emitted only on an actual change: `update` is also how the graph persists
+			// panel geometry, and re-broadcasting on every resize would invalidate every
+			// client's graph for a field none of them render.
+			if (data.role !== undefined && data.role !== existing.role) {
+				eventBus.emit({ type: "chapter:role_changed", chapterId: id, role: updated.role });
+			}
+
 			return updated;
 		});
 	},

@@ -808,6 +808,51 @@ function debouncedContainerStatus(chapterId: string) {
 	);
 }
 
+/**
+ * Event prefixes whose members describe a change to the project's story network
+ * (nodes, edges, exploration groups, review chapters) and therefore invalidate the
+ * graph for every connected client.
+ */
+const GRAPH_TOPOLOGY_PREFIXES = ["chapter:", "dependency:", "exploration:", "review:"] as const;
+
+/**
+ * Events inside those prefixes that must NOT be broadcast to all connections.
+ *
+ * This list is the price of matching by prefix. Forwarding by prefix means a new
+ * lifecycle event reaches the graph without a second change here — but it also means
+ * a new event's *payload* reaches every client without anyone deciding that it
+ * should. `broadcastToAll` walks the whole connection set: it is not scoped by
+ * project, chapter or user. So the rule for anything under these prefixes is that its
+ * payload must be safe for every logged-in client to see, and must not be
+ * high-frequency. Anything else belongs here.
+ *
+ * Current members:
+ *
+ *   - `chapter:files_changed` / `chapter:external_change_recorded` — fire on the
+ *     worktree watcher's tick (every few seconds per active chapter) and say nothing
+ *     about graph topology, so fanning them out would be steady background traffic
+ *     for no redraw. Chapters that need file activity already get it narrator-scoped
+ *     via `narrator:ws_broadcast` (`git_status`).
+ *   - `chapter:conflict` — carries `files`, the conflicting paths of one merge. It
+ *     does not change graph topology (the outcome arrives as `chapter:merged`), no
+ *     client subscribes to it, and the merge UI learns about conflicts from its own
+ *     HTTP response and the narrator-scoped `merge:conflict` session events. Sending
+ *     one project's conflicting filenames to every open session is cost with no
+ *     reader.
+ *
+ * `chapter:commits_updated` is deliberately absent: it changes the commit count
+ * rendered on a node, and the watcher only emits it when HEAD actually moved.
+ *
+ * Adding an event under these prefixes? If its payload names file contents, paths,
+ * diffs, prompts or anything else scoped narrower than "the whole deployment", or if
+ * it can fire on a timer, add it here at the same time.
+ */
+const GRAPH_TOPOLOGY_EXCLUDED: ReadonlySet<string> = new Set([
+	"chapter:files_changed",
+	"chapter:external_change_recorded",
+	"chapter:conflict",
+]);
+
 // === Event bus listeners ===
 // Guard against duplicate registration during Bun --hot reloads.
 // The eventBus singleton survives reloads (via hotSafe in event-bus.ts),
@@ -897,6 +942,28 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	// === Batch merge progress broadcast ===
 	eventBus.onAny((event) => {
 		if (!event.type.startsWith("merge:")) return;
+		broadcastToAll(event as unknown as Record<string, unknown>);
+	});
+
+	// === Story-network graph topology broadcast ===
+	// The graph is project-global state, not narrator-scoped: a fork, merge, or
+	// dormancy performed by one client must invalidate every other client's view.
+	// Without this bridge the graph only refreshed on its 60 s fallback poll even
+	// though the events were already being emitted.
+	//
+	// Forwarded by prefix rather than by an explicit type list so the next
+	// lifecycle event someone emits reaches the frontend without a second change
+	// here — an allowlist is what let these nine events go unnoticed to begin
+	// with. The trade is that a new event's payload also ships by default, so
+	// `GRAPH_TOPOLOGY_EXCLUDED` carries the ones that must not: read its note before
+	// adding an event under these prefixes.
+	//
+	// What survives the filter is ids and small scalars, and clients treat the frame
+	// as an invalidation signal: they refetch the bounded graph snapshot over
+	// authenticated HTTP rather than trusting what arrived over WS.
+	eventBus.onAny((event) => {
+		if (!GRAPH_TOPOLOGY_PREFIXES.some((prefix) => event.type.startsWith(prefix))) return;
+		if (GRAPH_TOPOLOGY_EXCLUDED.has(event.type)) return;
 		broadcastToAll(event as unknown as Record<string, unknown>);
 	});
 

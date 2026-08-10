@@ -5,6 +5,7 @@ import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapterEdges, chapters, narrators, projects, reviewConclusions } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { worktreeLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
@@ -339,41 +340,51 @@ export const reviewService = {
 		const expectedSha = chapter.startCommitSha ?? chapter.headCommitSha;
 		if (!expectedSha) return { clean: true };
 
+		const worktreePath = chapter.worktreePath;
 		try {
-			// Check for uncommitted changes
-			const status = await gitService.getStatusSummary(chapter.worktreePath);
-			const hasChanges = status.staged > 0 || status.unstaged > 0 || status.untracked > 0;
+			// Held across the whole observe-then-restore sequence rather than relying on the
+			// individual writes' own locks. The decision of *what* to restore comes from the
+			// status and HEAD read at the top, so a write landing between the read and the
+			// reset would be judged by an observation that no longer describes the worktree:
+			// a `reset --hard` + `discardAll` chosen for an earlier state then destroys it.
+			// Two overlapping turn-end checks are the realistic trigger, and both would
+			// otherwise pass through the per-method locks one after the other.
+			return await worktreeLock.acquire(worktreePath, async () => {
+				// Check for uncommitted changes
+				const status = await gitService.getStatusSummary(worktreePath);
+				const hasChanges = status.staged > 0 || status.unstaged > 0 || status.untracked > 0;
 
-			// Check HEAD hasn't moved
-			const currentHead = await gitService.getHeadCommit(chapter.worktreePath);
-			const headMoved = currentHead !== expectedSha;
+				// Check HEAD hasn't moved
+				const currentHead = await gitService.getHeadCommit(worktreePath);
+				const headMoved = currentHead !== expectedSha;
 
-			if (!hasChanges && !headMoved) {
-				return { clean: true };
-			}
+				if (!hasChanges && !headMoved) {
+					return { clean: true };
+				}
 
-			// Reset to expected state
-			if (headMoved) {
-				await gitService.resetHard(chapter.worktreePath, expectedSha);
-			}
-			await gitService.discardAll(chapter.worktreePath);
+				// Reset to expected state. Unlocked variants: this block owns the lock.
+				if (headMoved) {
+					await gitService.resetHardUnlocked(worktreePath, expectedSha);
+				}
+				await gitService.discardAllUnlocked(worktreePath);
 
-			const reasons: string[] = [];
-			if (hasChanges) reasons.push("file modifications detected");
-			if (headMoved) reasons.push("HEAD commit was moved");
+				const reasons: string[] = [];
+				if (hasChanges) reasons.push("file modifications detected");
+				if (headMoved) reasons.push("HEAD commit was moved");
 
-			const message =
-				`[System] Your working tree has been reset to the original state (${reasons.join(", ")}). ` +
-				"As a reviewer, you must not modify any files. " +
-				"Please re-examine the code and output your review conclusion based on the original source.";
+				const message =
+					`[System] Your working tree has been reset to the original state (${reasons.join(", ")}). ` +
+					"As a reviewer, you must not modify any files. " +
+					"Please re-examine the code and output your review conclusion based on the original source.";
 
-			logger.info("Review git state reset", {
-				reviewChapterId,
-				reasons,
-				expectedSha,
+				logger.info("Review git state reset", {
+					reviewChapterId,
+					reasons,
+					expectedSha,
+				});
+
+				return { clean: false, message };
 			});
-
-			return { clean: false, message };
 		} catch (err) {
 			logger.error("Failed to check/reset review git state", {
 				reviewChapterId,

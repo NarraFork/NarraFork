@@ -185,6 +185,58 @@ class ChapterEdgeService {
 	}
 
 	/**
+	 * Internal: repoint an existing fork edge at a different target chapter.
+	 *
+	 * Exists for the chapter split, which inserts a new "prefix" chapter between a
+	 * chapter and its parent and therefore has to hand the parent→child edges over
+	 * to the prefix. Returns the *previous* target so the caller can register a
+	 * rollback that puts it back.
+	 *
+	 * A narrow method rather than a general edge update, and certainly rather than
+	 * raw SQL at the call site. `deleteEdge` refuses everything except dependency
+	 * edges on purpose (fork and merge edges mirror columns on `chapters`, so a
+	 * loose delete would desynchronize the graph from the rows), and this keeps
+	 * that invariant intact: only the target moves, the type and metadata are
+	 * untouched, and every edge write stays inside this service where the fork/merge
+	 * rules live.
+	 *
+	 * Rejects non-fork edges for the same reason `deleteEdge` does: a merge or
+	 * dependency edge's endpoints carry meaning this method makes no attempt to
+	 * keep consistent.
+	 */
+	async redirectForkEdgeTarget(id: string, newTargetId: string): Promise<string> {
+		const edge = await db.query.chapterEdges.findFirst({
+			where: eq(chapterEdges.id, id),
+		});
+		if (!edge) throw new NotFoundError("ChapterEdge", id);
+		if (edge.type !== "fork") {
+			throw new ValidationError("Only fork edges can be retargeted");
+		}
+		if (edge.sourceId === newTargetId) {
+			// Would make the edge a self-loop, which the graph renders as an
+			// unremovable artifact and every traversal treats as a cycle.
+			throw new ValidationError("Cannot retarget a fork edge to its own source");
+		}
+
+		const target = await db.query.chapters.findFirst({
+			where: eq(chapters.id, newTargetId),
+			columns: { id: true, projectId: true },
+		});
+		if (!target) throw new NotFoundError("Chapter", newTargetId);
+		if (target.projectId !== edge.projectId) {
+			throw new ValidationError("Cannot retarget a fork edge across projects");
+		}
+
+		const previousTargetId = edge.targetId;
+		if (previousTargetId === newTargetId) return previousTargetId;
+
+		await db.update(chapterEdges).set({ targetId: newTargetId }).where(eq(chapterEdges.id, id));
+
+		logger.debug("Fork edge retargeted", { edgeId: id, previousTargetId, newTargetId });
+		return previousTargetId;
+	}
+
+	/**
 	 * Delete an edge (only dependency type can be manually deleted).
 	 */
 	async deleteEdge(id: string) {

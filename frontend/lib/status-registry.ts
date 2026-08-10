@@ -88,6 +88,15 @@ export type StatusAccent = Pick<StatusEntry, "color" | "accentShade">;
 // Chapter Status
 // ---------------------------------------------------------------------------
 
+/**
+ * `frozen` is kept on the display side only.
+ *
+ * The server stopped producing it (see the note on `chapters.status` in
+ * `server/db/schema.ts`), but this map is what renders a status badge, and a
+ * missing entry would throw on any row that still carries the old value — from a
+ * project database written by an older build, for instance. Rendering it costs
+ * one line; crashing the graph on unexpected data costs a lot more.
+ */
 export type ChapterStatus = "active" | "dormant" | "merged" | "abandoned" | "frozen";
 
 const chapterStatusMap: StatusMap<ChapterStatus> = {

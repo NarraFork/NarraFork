@@ -17,6 +17,7 @@ import {
 	forkChapterSchema,
 	listCommitsSchema,
 	mergeChapterSchema,
+	splitChapterSchema,
 	updateChapterSchema,
 } from "../lib/validators";
 import { requireAdmin } from "../middleware/auth";
@@ -25,6 +26,7 @@ import { chapterCleanup } from "../services/chapter-cleanup";
 import { chapterFork } from "../services/chapter-fork";
 import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
+import { chapterSplit } from "../services/chapter-split";
 import { commitSyncService } from "../services/commit-sync-service";
 import { buildProxyUrl } from "../services/container-proxy";
 import {
@@ -114,6 +116,18 @@ chapterRoutes.post("/:id/fork", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const chapter = await chapterFork.fork(id, { ...parsed.data, locale });
 	return c.json(chapter, 201);
+});
+
+// === Split at commit ===
+
+chapterRoutes.post("/:id/split", async (c) => {
+	const id = c.req.param("id");
+	const parsed = splitChapterSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const result = await chapterSplit.split(id, { ...parsed.data, locale });
+	return c.json(result, 201);
 });
 
 // === Review ===

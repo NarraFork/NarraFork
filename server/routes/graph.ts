@@ -49,6 +49,36 @@ export interface GraphEdge {
 	metadata?: unknown;
 }
 
+/**
+ * One degraded aspect of a graph response, so the client can say *what* is stale
+ * rather than silently rendering cached numbers as if they were fresh.
+ *
+ * `feature`/`reason` are stable machine-readable identifiers the frontend formats
+ * into its alert; `message` is prose *we* wrote. Aggregated per feature — see the
+ * dedup note at the call site.
+ *
+ * Deliberately has no field for a raw error string. Not because of the worktree path
+ * such a string usually contains — `GraphNode.data.worktreePath` publishes that to
+ * the same clients anyway — but because git's stderr is unbounded output from a
+ * subprocess, shaped by the user's git version, locale and config. Putting it in a
+ * response means an untranslatable, arbitrarily long, arbitrarily detailed string
+ * rendered verbatim in the UI, and a response size nobody budgeted. `reason` is what
+ * the client actually needs: a fixed identifier it can translate and act on.
+ *
+ * The detail is not lost. It goes to `logger.warn` at the call site, which is where
+ * an operator diagnosing a broken repository is already looking.
+ *
+ * Adding a field that carries subprocess output or an exception message puts this
+ * back. Name a new `reason` instead.
+ */
+export interface GraphFallback {
+	feature: string;
+	reason?: string;
+	message?: string;
+	/** How many chapters were affected, so a repo-wide outage is distinguishable. */
+	failedChapters?: number;
+}
+
 export function buildGraph(
 	projectChapters: {
 		id: string;
@@ -162,6 +192,14 @@ graphRoutes.get("/:id/graph", async (c) => {
 		},
 	});
 
+	// Degradation is reported per feature, not per chapter: a repo-wide problem (git
+	// missing, worktrees gone after a disk move) fails every active chapter at once,
+	// and a few hundred identical entries would blow up a response the frontend
+	// renders as a single alert. `failedChapters` carries the scale instead.
+	const fallbacks: GraphFallback[] = [];
+	let commitSyncFailures = 0;
+	let firstCommitSyncError: string | undefined;
+
 	// Refresh git info for active chapters with worktrees (lightweight, with concurrency limit)
 	const activeChapters = projectChapters.filter((ch) => ch.status === "active" && ch.worktreePath);
 	if (activeChapters.length > 0) {
@@ -190,18 +228,48 @@ graphRoutes.get("/:id/graph", async (c) => {
 								}
 							}
 						}
-					} catch {
-						// Non-fatal — use cached values
+					} catch (err) {
+						// Still non-fatal — the cached commit count and HEAD are served as-is.
+						// But it is counted, because swallowing it silently is what made the
+						// `allSettled` check below dead code: this catch is inside the mapped
+						// function, so nothing ever rejected and `failures` was always empty.
+						commitSyncFailures += 1;
+						firstCommitSyncError ??= String(err);
 					}
 				}),
 			);
 			refreshResults.push(...batchResults);
 		}
-		const failures = refreshResults.filter((r) => r.status === "rejected");
+		if (commitSyncFailures > 0) {
+			// The error text stays here and does not go into the response; see the note on
+			// `GraphFallback`.
+			logger.warn("Graph served stale git metadata for some chapters", {
+				projectId,
+				failedChapters: commitSyncFailures,
+				error: firstCommitSyncError,
+			});
+			fallbacks.push({
+				feature: "graph.commitSync",
+				reason: "commit_sync_refresh_failed",
+				failedChapters: commitSyncFailures,
+			});
+		}
+		// Reserved for a rejection the per-chapter catch could not see (e.g. the DB
+		// write-back below it throwing). Raised to warn: the user is looking at a
+		// stale commit count and HEAD, which debug-level logging never revealed.
+		const failures = refreshResults.filter(
+			(r): r is PromiseRejectedResult => r.status === "rejected",
+		);
 		if (failures.length > 0) {
-			logger.debug("Some graph git refreshes failed", {
+			logger.warn("Some graph git refreshes failed", {
 				projectId,
 				failCount: failures.length,
+				error: String(failures[0]?.reason),
+			});
+			fallbacks.push({
+				feature: "graph.gitMetadata",
+				reason: "git_metadata_refresh_failed",
+				failedChapters: failures.length,
 			});
 		}
 	}
@@ -279,7 +347,14 @@ graphRoutes.get("/:id/graph", async (c) => {
 		edgeRows,
 	);
 
-	return c.json({ nodes, edges, explorationGroups: groups, openedTerminals });
+	return c.json({
+		nodes,
+		edges,
+		explorationGroups: groups,
+		openedTerminals,
+		degraded: fallbacks.length > 0,
+		fallbacks,
+	});
 });
 
 graphRoutes.patch("/:id/graph/positions", async (c) => {

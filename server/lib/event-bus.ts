@@ -28,9 +28,15 @@ export type NarraForkEvent =
 	  }
 	// Chapter lifecycle
 	| { type: "chapter:created"; chapterId: string; projectId: string }
-	| { type: "chapter:forked"; chapterId: string; parentId: string }
+	/**
+	 * `projectId` is required rather than optional because this event is broadcast to
+	 * every WS connection: the frontend's graph invalidation treats a *missing*
+	 * project id as "may concern me", so omitting it makes one project's fork refetch
+	 * every other project's graph.
+	 */
+	| { type: "chapter:forked"; chapterId: string; parentId: string; projectId: string }
 	| { type: "chapter:merged"; sourceId: string; targetId: string; userId?: string }
-	| { type: "chapter:conflict"; sourceId: string; targetId: string; files: string[] } // TODO: not yet emitted
+	| { type: "chapter:conflict"; sourceId: string; targetId: string; files: string[] }
 	| { type: "chapter:dormant"; chapterId: string }
 	| { type: "chapter:woken"; chapterId: string }
 	| { type: "chapter:abandoned"; chapterId: string; projectId: string }
@@ -39,15 +45,17 @@ export type NarraForkEvent =
 	| { type: "review:converted"; reviewChapterId: string; action: "subagent" | "promote" }
 	| { type: "review:dismissed"; reviewChapterId: string }
 	| {
-			type: "chapter:split"; // TODO: not yet emitted
+			type: "chapter:split";
 			prefixChapterId: string;
 			continuationChapterId: string;
 			newForkChapterId: string;
 			commitSha: string;
+			/** Required for the same reason as on `chapter:forked`. */
+			projectId: string;
 	  }
 	| { type: "chapter:cherry_picked"; sourceId: string; targetId: string; commits: string[] } // TODO: not yet emitted
 	| { type: "chapter:frozen"; chapterId: string } // TODO: not yet emitted
-	| { type: "chapter:role_changed"; chapterId: string; role: string } // TODO: not yet emitted
+	| { type: "chapter:role_changed"; chapterId: string; role: string }
 	| { type: "chapter:files_changed"; chapterId: string; worktreePath: string }
 	| {
 			/** An edit from outside the tool path was attributed and given a tree boundary. */
@@ -59,8 +67,8 @@ export type NarraForkEvent =
 	  }
 	| { type: "chapter:commits_updated"; chapterId: string; newCount: number }
 	// 依赖关系
-	| { type: "dependency:created"; edgeId: string; sourceId: string; targetId: string } // TODO: not yet emitted
-	| { type: "dependency:removed"; edgeId: string; sourceId: string; targetId: string } // TODO: not yet emitted
+	| { type: "dependency:created"; edgeId: string; sourceId: string; targetId: string }
+	| { type: "dependency:removed"; edgeId: string; sourceId: string; targetId: string }
 	| {
 			type: "dependency:upstream_updated"; // TODO: not yet emitted
 			edgeId: string;

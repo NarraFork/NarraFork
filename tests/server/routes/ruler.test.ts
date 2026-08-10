@@ -62,7 +62,7 @@ function seedProject() {
 function seedChapter(input: {
 	id: string;
 	title?: string;
-	status?: "active" | "dormant" | "merged" | "abandoned" | "frozen";
+	status?: "active" | "dormant" | "merged" | "abandoned";
 	parentChapterId?: string | null;
 	startCommitSha?: string | null;
 	mergeCommitSha?: string | null;

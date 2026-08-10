@@ -180,6 +180,20 @@ describe("useLodIndicatorTrigger", () => {
 		expect(active).toBe(false);
 	});
 
+	test("regaining focus clears a stuck Alt", async () => {
+		// Coming back from another window (alt+tab) with a swallowed keyup: the page
+		// cannot know whether Alt is still physically down, and assuming it is leaves
+		// the indicator pinned open. A later Alt press re-arms it.
+		await mount();
+		await mouseMove(child(), true);
+		expect(active).toBe(true);
+
+		await act(async () => {
+			window.dispatchEvent(makeEvent("focus", {}));
+		});
+		expect(active).toBe(false);
+	});
+
 	test("does nothing when disabled", async () => {
 		await mount(false);
 		await mouseMove(child(), true);

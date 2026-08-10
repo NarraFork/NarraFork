@@ -318,11 +318,23 @@ describe("getChapterBatchMergeCapability", () => {
 });
 
 describe("getChapterSplitCapability", () => {
-	test("defaults to unsupported when split capability is absent", () => {
+	/**
+	 * This case asserted the opposite until the split route was implemented, and
+	 * fail-closed was correct for as long as that was true: `/api/health` has never
+	 * advertised a capabilities block, and enabling the UI against a backend with no
+	 * `POST /chapters/:id/split` would only have produced a 404.
+	 *
+	 * Now that the route exists, fail-closed makes the feature permanently
+	 * unreachable, so this getter joins the 30+ others that read "no capabilities
+	 * block at all" as "the TypeScript backend, which implements this". An
+	 * explicitly-sent capabilities object still decides on its own contents — the
+	 * cases below cover that.
+	 */
+	test("assumes support when the backend sends no capabilities block", () => {
 		const result = getChapterSplitCapability(undefined);
 
 		expect(result).toEqual({
-			supported: false,
+			supported: true,
 			reason: undefined,
 			mode: undefined,
 			compressedAISummarySupported: false,
@@ -330,6 +342,12 @@ describe("getChapterSplitCapability", () => {
 			compressedAISummaryMode: undefined,
 			compressedAISummaryReason: undefined,
 		});
+	});
+
+	test("still requires explicit support once a capabilities block is present", () => {
+		const result = getChapterSplitCapability({});
+
+		expect(result.supported).toBe(false);
 	});
 
 	test("respects explicit unsupported split capability", () => {

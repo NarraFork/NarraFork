@@ -144,7 +144,10 @@ async function autoCommitSourceBeforeMerge(
 			);
 		}
 
-		const commitSha = await gitService.autoCommit(sourceWorktree, message);
+		// Unlocked: this block holds `worktreeLock` for `sourceWorktree`, and the locked
+		// `autoCommit` would queue behind its own caller. See the note on the unlocked
+		// variants in git-service.
+		const commitSha = await gitService.autoCommitUnlocked(sourceWorktree, message);
 		if (!commitSha) return null;
 
 		const normalizedSha = commitSha.trim();
@@ -390,6 +393,13 @@ async function isMultiCommitMerge(
  * Returns a warning only when something was destroyed or the worktree could not be
  * proven clean. The caller must surface it: a conflicted worktree the user does not know
  * about is exactly the state this function exists to prevent.
+ *
+ * **The caller must already hold `worktreeLock` for `targetWorktree`.** Both call sites
+ * do, and they must: the rungs below read the worktree's conflict state and then write
+ * it, so anything that mutates the worktree in between makes a later rung act on a state
+ * the earlier one did not see. That is why this function uses the `*Unlocked` git
+ * methods and does not acquire anything itself — taking the lock here would queue behind
+ * its own caller and hang forever.
  */
 async function cleanUpConflictedMerge(
 	targetWorktree: string,
@@ -440,7 +450,8 @@ async function cleanUpConflictedMerge(
 	// Rung 2 — non-lossy by construction, so it is attempted before any snapshot is
 	// taken: on success there is nothing to preserve, and on refusal it wrote nothing.
 	try {
-		await gitService.resetMerge(targetWorktree, preMergeTargetSha);
+		// Unlocked: the caller owns `worktreeLock` for this worktree (see the doc comment).
+		await gitService.resetMergeUnlocked(targetWorktree, preMergeTargetSha);
 		return (await verifyAndRecord()) ?? {};
 	} catch (err) {
 		logger.warn("git reset --merge refused; falling back to a hard reset", {
@@ -456,7 +467,8 @@ async function cleanUpConflictedMerge(
 	const preserved = await ensureChapterSnapshot(targetWorktree, "target state at merge conflict");
 
 	try {
-		await gitService.resetHard(targetWorktree, preMergeTargetSha);
+		// Unlocked: the caller owns `worktreeLock` for this worktree (see the doc comment).
+		await gitService.resetHardUnlocked(targetWorktree, preMergeTargetSha);
 	} catch (err) {
 		logger.error("Could not clean up a conflicted merge; the target worktree is left dirty", {
 			targetWorktree,
@@ -1085,7 +1097,8 @@ export const chapterMerge = {
 										`hard reset would erase`,
 								);
 							}
-							await gitService.resetHard(targetWorktree, preMergeTargetSha);
+							// Unlocked: inside this method's `worktreeLock` block for `targetWorktree`.
+							await gitService.resetHardUnlocked(targetWorktree, preMergeTargetSha);
 							logger.info("Git rollback succeeded after DB failure", {
 								sourceChapterId,
 								resetTarget: preMergeTargetSha,
@@ -1386,7 +1399,8 @@ export const chapterMerge = {
 			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			const mergeResult = await gitService.mergeNoCommit(targetWorktree, source.branch, strategy);
 			if (!mergeResult.hasConflicts) {
-				const commitSha = await gitService.autoCommit(targetWorktree, message);
+				// Unlocked: inside this method's `worktreeLock` block for `targetWorktree`.
+				const commitSha = await gitService.autoCommitUnlocked(targetWorktree, message);
 				const resolved = await this.markMergedResult(
 					sourceChapterId,
 					input.targetChapterId,
@@ -1490,7 +1504,8 @@ export const chapterMerge = {
 			}
 
 			let preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
-			let commitSha = await gitService.autoCommit(targetWorktree, message);
+			// Unlocked: inside this method's `worktreeLock` block for `targetWorktree`.
+			let commitSha = await gitService.autoCommitUnlocked(targetWorktree, message);
 			if (!commitSha) {
 				const status = await gitService.getStatus(targetWorktree);
 				if (status.trim()) {
@@ -1772,7 +1787,8 @@ export const chapterMerge = {
 			} else {
 				const mergeResult = await gitService.mergeNoCommit(targetWorktree, source.branch, strategy);
 				if (!mergeResult.hasConflicts) {
-					const commitSha = await gitService.autoCommit(targetWorktree, message);
+					// Unlocked: inside this method's `worktreeLock` block for `targetWorktree`.
+					const commitSha = await gitService.autoCommitUnlocked(targetWorktree, message);
 					return this.markMergedResult(
 						sourceChapterId,
 						input.targetChapterId,
@@ -1816,7 +1832,8 @@ export const chapterMerge = {
 					};
 				}
 
-				const commitSha = await gitService.autoCommit(targetWorktree, message);
+				// Unlocked: inside this method's `worktreeLock` block for `targetWorktree`.
+				const commitSha = await gitService.autoCommitUnlocked(targetWorktree, message);
 				return this.markMergedResult(
 					sourceChapterId,
 					input.targetChapterId,
@@ -2036,58 +2053,83 @@ export const chapterMerge = {
 		}
 
 		const gitPath = await getProjectGitPath(source.projectId);
+		const targetWorktree = target.worktreePath;
+		// Bound to a local so the value the guard above validated is the value used below.
+		// Reading `source.mergeCommitSha` inside the closure would also defeat TypeScript's
+		// narrowing, which is the compiler pointing at a real hazard rather than a nuisance.
+		const mergeCommitSha = source.mergeCommitSha;
 
 		// Step 1: Undo the merge on the target branch.
 		// When preMergeTargetSha is available and HEAD hasn't advanced past the merge,
 		// reset directly to it (handles fast-forward merges that introduce multiple commits).
 		// Fall back to git revert when the target has advanced (preserves later commits).
-		const headSha = (await gitService.getHeadCommit(target.worktreePath)).trim();
-		if (headSha === source.mergeCommitSha) {
-			// HEAD is the merge commit — safe to reset
-			const resetTarget = source.preMergeTargetSha ?? `${source.mergeCommitSha}~1`;
-			await gitService.resetHard(target.worktreePath, resetTarget);
-			logger.info("Reset target branch to before merge commit", {
-				sourceChapterId,
-				targetChapterId: target.id,
-				mergeCommitSha: source.mergeCommitSha,
-				resetTarget,
-			});
-		} else if (
-			await isMultiCommitMerge(target.worktreePath, source.mergeCommitSha, source.preMergeTargetSha)
-		) {
-			// A fast-forward brought several commits across and HEAD has since moved on, so
-			// neither undo is available: a reset would delete the target's later commits,
-			// and reverting `mergeCommitSha` would undo only the last of the appended ones
-			// while the database stops recording that the rest came from this chapter.
-			// Refusing keeps both sides intact and describes exactly what to undo.
-			throw new ValidationError(
-				`Cannot automatically unmerge: this merge fast-forwarded ${source.branch} onto ` +
-					`${target.branch}, so it introduced several commits rather than one, and the target ` +
-					`has advanced since. Reverting only the last of them would leave the rest behind. ` +
-					`Undo the range ${(source.preMergeTargetSha ?? "").slice(0, 12)}..` +
-					`${source.mergeCommitSha.slice(0, 12)} manually in the target worktree, then unmerge.`,
-			);
-		} else {
-			// Target has new commits — revert instead to preserve them
-			const isMerge = await gitService.isMergeCommit(target.worktreePath, source.mergeCommitSha);
-			try {
-				const revertSha = isMerge
-					? await gitService.revertMergeCommit(target.worktreePath, source.mergeCommitSha)
-					: await gitService.revertCommit(target.worktreePath, source.mergeCommitSha);
-				logger.info("Reverted merge commit on target (target had advanced)", {
+		//
+		// Locked across the whole decision, not just the writes: which of the three branches
+		// below applies is decided by the HEAD read at the top, and every branch is chosen
+		// *because* of what that read observed. A commit landing in between — a concurrent
+		// merge into the same target, an autoCommit from a narrator parking its chapter —
+		// makes the branch wrong rather than merely stale: the `reset --hard` rung would then
+		// discard a commit nobody has seen. Relying on the individual methods' own locks
+		// cannot express this, since they each cover only their own invocation.
+		await worktreeLock.acquire(targetWorktree, async () => {
+			const headSha = (await gitService.getHeadCommit(targetWorktree)).trim();
+			if (headSha === mergeCommitSha) {
+				// HEAD is the merge commit — safe to reset
+				const resetTarget = source.preMergeTargetSha ?? `${mergeCommitSha}~1`;
+				await gitService.resetHardUnlocked(targetWorktree, resetTarget);
+				logger.info("Reset target branch to before merge commit", {
 					sourceChapterId,
 					targetChapterId: target.id,
-					mergeCommitSha: source.mergeCommitSha,
-					revertSha,
+					mergeCommitSha,
+					resetTarget,
 				});
-			} catch {
+			} else if (
+				await isMultiCommitMerge(targetWorktree, mergeCommitSha, source.preMergeTargetSha)
+			) {
+				// A fast-forward brought several commits across and HEAD has since moved on, so
+				// neither undo is available: a reset would delete the target's later commits,
+				// and reverting `mergeCommitSha` would undo only the last of the appended ones
+				// while the database stops recording that the rest came from this chapter.
+				// Refusing keeps both sides intact and describes exactly what to undo.
 				throw new ValidationError(
-					`Cannot automatically unmerge: revert of ${source.mergeCommitSha.slice(0, 7)} ` +
-						`conflicts with later commits on the target branch. ` +
-						`Please resolve manually in the target worktree.`,
+					`Cannot automatically unmerge: this merge fast-forwarded ${source.branch} onto ` +
+						`${target.branch}, so it introduced several commits rather than one, and the target ` +
+						`has advanced since. Reverting only the last of them would leave the rest behind. ` +
+						`Undo the range ${(source.preMergeTargetSha ?? "").slice(0, 12)}..` +
+						`${mergeCommitSha.slice(0, 12)} manually in the target worktree, then unmerge.`,
 				);
+			} else {
+				// Target has new commits — revert instead to preserve them
+				const isMerge = await gitService.isMergeCommit(targetWorktree, mergeCommitSha);
+				try {
+					const revertSha = isMerge
+						? await gitService.revertMergeCommitUnlocked(targetWorktree, mergeCommitSha)
+						: await gitService.revertCommitUnlocked(targetWorktree, mergeCommitSha);
+					logger.info("Reverted merge commit on target (target had advanced)", {
+						sourceChapterId,
+						targetChapterId: target.id,
+						mergeCommitSha,
+						revertSha,
+					});
+				} catch (err) {
+					// A ValidationError from the branch above must not be reshaped into a
+					// conflict message, but that branch throws outside this try. What reaches
+					// here is a git failure, and the revert methods already abort their own
+					// partial state, so the worktree is usable.
+					logger.warn("Revert of a merge commit failed during unmerge", {
+						sourceChapterId,
+						targetChapterId: target.id,
+						mergeCommitSha,
+						error: String(err),
+					});
+					throw new ValidationError(
+						`Cannot automatically unmerge: revert of ${mergeCommitSha.slice(0, 7)} ` +
+							`conflicts with later commits on the target branch. ` +
+							`Please resolve manually in the target worktree.`,
+					);
+				}
 			}
-		}
+		});
 
 		// Step 2: Sync target chapter's commit list after undo
 		try {

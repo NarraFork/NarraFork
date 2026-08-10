@@ -286,12 +286,15 @@ describe("dormant refuses when nothing holds the work", () => {
 		// Both preservation mechanisms broken at once: this is the state in which the
 		// previous code deleted the worktree anyway, because the snapshot failure was a
 		// warn and the commit failure only set a flag.
-		const autoCommit = gitService.autoCommit;
+		// Stubs `autoCommitUnlocked`, which is what `dormant` calls: it takes `worktreeLock`
+		// itself, so the locked wrapper would wait on its own caller. Stubbing the wrapper
+		// would silently stop intercepting and the failure under test would never occur.
+		const autoCommit = gitService.autoCommitUnlocked;
 		const mergeAbort = gitService.mergeAbort;
 		const capture = worktreeTreeSnapshot.tryCapture;
 		const advance = worktreeTreeSnapshot.advanceSnapshotRef;
 		const getRef = worktreeTreeSnapshot.getRef;
-		gitService.autoCommit = async () => {
+		gitService.autoCommitUnlocked = async () => {
 			throw new Error("simulated index lock");
 		};
 		gitService.mergeAbort = async () => {
@@ -303,7 +306,7 @@ describe("dormant refuses when nothing holds the work", () => {
 		try {
 			await expect(chapterCleanup.dormant(env.chapterId)).rejects.toThrow(/Refusing/i);
 		} finally {
-			gitService.autoCommit = autoCommit;
+			gitService.autoCommitUnlocked = autoCommit;
 			gitService.mergeAbort = mergeAbort;
 			worktreeTreeSnapshot.tryCapture = capture;
 			worktreeTreeSnapshot.advanceSnapshotRef = advance;
@@ -321,9 +324,11 @@ describe("dormant refuses when nothing holds the work", () => {
 		const env = await createChapterEnv();
 		writeFileSync(join(env.worktree, "uncommitted.txt"), "snapshot has it\n");
 
-		const autoCommit = gitService.autoCommit;
+		// See the note above: `dormant` calls the unlocked variant from inside its own
+		// `worktreeLock` block.
+		const autoCommit = gitService.autoCommitUnlocked;
 		const mergeAbort = gitService.mergeAbort;
-		gitService.autoCommit = async () => {
+		gitService.autoCommitUnlocked = async () => {
 			throw new Error("simulated index lock");
 		};
 		gitService.mergeAbort = async () => {
@@ -334,7 +339,7 @@ describe("dormant refuses when nothing holds the work", () => {
 			// The snapshot is the only copy, so wake has to restore it.
 			expect(report.snapshotOnly).toBe(true);
 		} finally {
-			gitService.autoCommit = autoCommit;
+			gitService.autoCommitUnlocked = autoCommit;
 			gitService.mergeAbort = mergeAbort;
 		}
 

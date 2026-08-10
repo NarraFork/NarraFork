@@ -87,8 +87,27 @@ export const chapters = sqliteTable(
 			.references(() => projects.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
 		description: text("description"),
+		/**
+		 * `frozen` was removed rather than implemented.
+		 *
+		 * It was declared here and accepted by the validator, but no code path ever
+		 * wrote it, and every operation that matters rejected it: `fork` and `review`
+		 * require active/dormant, `wake` accepts only dormant, `dormant` requires
+		 * active. A chapter that reached `frozen` could therefore never be forked,
+		 * woken, merged or reviewed again — a state with no exit. The one observable
+		 * symptom was `GET /api/chapters?status=frozen` silently returning *every*
+		 * chapter, because the filter's own allowlist omitted it too.
+		 *
+		 * Dropping it needs no migration: Drizzle's `enum` is a TypeScript-level
+		 * constraint, and the SQLite column is a plain `text` with no CHECK (verified
+		 * against the live schema). No row has ever held the value.
+		 *
+		 * The idea it served — "merged chapters freeze on the ruler timeline" — is
+		 * better expressed by `merged`, which already means exactly that and has a
+		 * real exit (`unmerge`).
+		 */
 		status: text("status", {
-			enum: ["active", "dormant", "merged", "abandoned", "frozen"],
+			enum: ["active", "dormant", "merged", "abandoned"],
 		})
 			.notNull()
 			.default("active"),

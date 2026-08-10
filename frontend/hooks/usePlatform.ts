@@ -887,8 +887,30 @@ export function getChapterSplitCapability(capabilities: RuntimeCapabilities | un
 } {
 	const split = capabilities?.chapters?.split;
 	const compressedAISummary = split?.partials?.compressedAISummary;
+	/**
+	 * Same fallback the other 30+ getters in this file use: a backend that sends no
+	 * capabilities block at all is the TypeScript backend, which implements the
+	 * feature, so absence means "available" rather than "missing".
+	 *
+	 * This getter used to fail closed instead, and that was the right call while it
+	 * lasted: `POST /chapters/:id/split` did not exist, so enabling the UI would only
+	 * have produced a 404 the user could not act on. The route exists now, and since
+	 * `/api/health` has never sent a capabilities block, fail-closed made the feature
+	 * permanently unreachable. Fixing it by making health advertise capabilities is
+	 * not an option: a partial capabilities object flips every *other* getter's
+	 * `!capabilities` fallback off at once, turning 30+ working features unsupported.
+	 *
+	 * `routes.splitAtCommit` is checked only in the non-fallback branch, matching how
+	 * `getChapterBatchMergeCapability` treats its own route flags. A backend silent
+	 * about capabilities is equally silent about its routes, so requiring the flag on
+	 * both branches would leave the getter fail-closed for exactly the backend the
+	 * fallback exists to serve.
+	 */
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: split?.supported === true && split.routes?.splitAtCommit === true,
+		supported: assumeLegacyTSBackend
+			? true
+			: split?.supported === true && split.routes?.splitAtCommit === true,
 		reason: split?.reason,
 		mode: split?.mode,
 		compressedAISummarySupported: compressedAISummary?.supported === true,

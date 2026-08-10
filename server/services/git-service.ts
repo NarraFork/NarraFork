@@ -1,6 +1,7 @@
 import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { worktreeLock } from "../lib/async-mutex";
 import { GitAuthError, GitError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
@@ -55,32 +56,60 @@ const READ_TIMEOUT_MS = 60_000;
 const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 /**
- * Per-worktree mutex to prevent concurrent git write operations.
+ * Serialize git write operations for one worktree.
  *
  * Read-only operations (status, diff, log, etc.) usually don't need this
  * application-level mutex, but Git may still refresh the index and briefly
  * create `.git/index.lock`. Use execRead() for those commands so Git disables
  * optional index writes via `--no-optional-locks`.
+ *
+ * This is `lib/async-mutex`'s shared {@link worktreeLock}, not a module-private
+ * instance. It used to be private, which meant a worktree had two independent locks
+ * over it: this one, and the one the multi-step orchestrations (`chapter-merge`,
+ * `routes/ruler`) take around whole sequences. Two locks over one resource provide no
+ * mutual exclusion between their holders — a merge holding the outer lock and a plain
+ * `POST /api/git/.../commit` taking only this one could interleave their `git`
+ * invocations on the same index, which is the class of corruption both locks exist to
+ * prevent.
+ *
+ * Unifying them makes nesting fatal rather than merely redundant, which is what the
+ * `*Unlocked` variants below address; see the note above them.
  */
-const worktreeLocks = new Map<string, Promise<unknown>>();
-
 async function withWorktreeLock<T>(worktreePath: string, fn: () => Promise<T>): Promise<T> {
-	const prev = worktreeLocks.get(worktreePath) ?? Promise.resolve();
-	let resolve: () => void = () => {};
-	const lock = new Promise<void>((r) => {
-		resolve = r;
-	});
-	worktreeLocks.set(worktreePath, lock);
-	await prev;
-	try {
-		return await fn();
-	} finally {
-		resolve();
-		if (worktreeLocks.get(worktreePath) === lock) {
-			worktreeLocks.delete(worktreePath);
-		}
-	}
+	return worktreeLock.acquire(worktreePath, fn);
 }
+
+/**
+ * Why every locked write method here has an `*Unlocked` twin.
+ *
+ * The multi-step orchestrations (`chapter-merge`, `routes/ruler`,
+ * `snapshot-dirty-git-op`) must hold a worktree exclusively across a *sequence* of
+ * commands — settle, park, rebase, reapply — because each step reads the state the
+ * previous one produced. They take the worktree lock themselves and then call
+ * individual write methods from inside it.
+ *
+ * No mutex here is re-entrant, and `AsyncMutex.acquire` chains behind the current tail
+ * without checking who owns it, so such a nested call waits on a lock its own caller
+ * holds. That is a deterministic self-deadlock, and its symptom is a request that hangs
+ * forever rather than an error — nothing logs, nothing throws, the HTTP handler simply
+ * never returns.
+ *
+ * The alternative of making the mutex re-entrant was rejected: `AsyncMutex` backs 20+
+ * instances with unrelated semantics (`narratorTraitsLock`, plugin locks, draft locks),
+ * and owner tracking would need an `AsyncLocalStorage` context threaded through all of
+ * them, widening the blast radius of a lock bug from one subsystem to every one.
+ *
+ * So the split is explicit instead: `xxxUnlocked` holds the command sequence with no
+ * locking, `xxx` is a thin `withWorktreeLock` wrapper around it. Callers that already
+ * hold the lock call the former; everyone else keeps calling the latter and is
+ * unaffected. This mirrors `worktree-tree-snapshot`'s `captureUnlocked` /
+ * `restoreUnlocked` / `getRefUnlocked` convention.
+ *
+ * Adding a write method? Put the body in `xxxUnlocked` and wrap it. Calling one from
+ * inside a `worktreeLock` block? Use the unlocked variant, and note in a comment that
+ * the caller owns the lock. `git-service-worktree-lock.test.ts` fails on a deadline if
+ * either rule is broken.
+ */
 
 export interface GitStatusFile {
 	/** Two-character porcelain status, e.g. "M ", " M", "MM", "??". */
@@ -893,28 +922,31 @@ export const gitService = {
 	 * show the user.
 	 */
 	async autoCommit(worktreePath: string, message: string): Promise<string | null> {
-		return withWorktreeLock(worktreePath, async () => {
-			const status = await this.getStatus(worktreePath);
-			if (!status) return null;
+		return withWorktreeLock(worktreePath, () => this.autoCommitUnlocked(worktreePath, message));
+	},
 
-			const unmerged = await detectUnmergedFiles(worktreePath);
-			if (unmerged.length > 0) {
-				const shown = unmerged.slice(0, 5).join(", ");
-				const rest = unmerged.length > 5 ? `, +${unmerged.length - 5} more` : "";
-				throw new GitError(
-					`Refusing to auto-commit: ${unmerged.length} file(s) still have unresolved merge conflicts (${shown}${rest})`,
-				);
-			}
+	/** {@link autoCommit} for callers already holding the worktree lock. */
+	async autoCommitUnlocked(worktreePath: string, message: string): Promise<string | null> {
+		const status = await this.getStatus(worktreePath);
+		if (!status) return null;
 
-			const addResult = await exec(["add", "-A"], worktreePath);
-			if (addResult.exitCode !== 0) throw new GitError(`git add failed: ${addResult.stderr}`);
+		const unmerged = await detectUnmergedFiles(worktreePath);
+		if (unmerged.length > 0) {
+			const shown = unmerged.slice(0, 5).join(", ");
+			const rest = unmerged.length > 5 ? `, +${unmerged.length - 5} more` : "";
+			throw new GitError(
+				`Refusing to auto-commit: ${unmerged.length} file(s) still have unresolved merge conflicts (${shown}${rest})`,
+			);
+		}
 
-			const commitResult = await exec(["commit", "-m", message], worktreePath);
-			if (commitResult.exitCode !== 0)
-				throw new GitError(`git commit failed: ${commitResult.stderr}`);
+		const addResult = await exec(["add", "-A"], worktreePath);
+		if (addResult.exitCode !== 0) throw new GitError(`git add failed: ${addResult.stderr}`);
 
-			return this.getHeadCommit(worktreePath);
-		});
+		const commitResult = await exec(["commit", "-m", message], worktreePath);
+		if (commitResult.exitCode !== 0)
+			throw new GitError(`git commit failed: ${commitResult.stderr}`);
+
+		return this.getHeadCommit(worktreePath);
 	},
 
 	async getStatusSummary(worktreePath: string): Promise<GitStatusSummary> {
@@ -1339,97 +1371,127 @@ export const gitService = {
 
 	async stageFiles(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["add", "--", ...files], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git add failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.stageFilesUnlocked(worktreePath, files));
+	},
+
+	/** {@link stageFiles} for callers already holding the worktree lock. */
+	async stageFilesUnlocked(worktreePath: string, files: string[]): Promise<void> {
+		if (files.length === 0) return;
+		const result = await exec(["add", "--", ...files], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git add failed: ${result.stderr}`);
 	},
 
 	async stageAll(worktreePath: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["add", "-A"], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git add -A failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.stageAllUnlocked(worktreePath));
+	},
+
+	/** {@link stageAll} for callers already holding the worktree lock. */
+	async stageAllUnlocked(worktreePath: string): Promise<void> {
+		const result = await exec(["add", "-A"], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git add -A failed: ${result.stderr}`);
 	},
 
 	async unstageFiles(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["reset", "HEAD", "--", ...files], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.unstageFilesUnlocked(worktreePath, files));
+	},
+
+	/** {@link unstageFiles} for callers already holding the worktree lock. */
+	async unstageFilesUnlocked(worktreePath: string, files: string[]): Promise<void> {
+		if (files.length === 0) return;
+		const result = await exec(["reset", "HEAD", "--", ...files], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
 	},
 
 	async unstageAll(worktreePath: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["reset", "HEAD"], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.unstageAllUnlocked(worktreePath));
+	},
+
+	/** {@link unstageAll} for callers already holding the worktree lock. */
+	async unstageAllUnlocked(worktreePath: string): Promise<void> {
+		const result = await exec(["reset", "HEAD"], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
 	},
 
 	async commit(worktreePath: string, message: string): Promise<string> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["commit", "-m", message], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git commit failed: ${result.stderr}`);
-			return this.getHeadCommit(worktreePath);
-		});
+		return withWorktreeLock(worktreePath, () => this.commitUnlocked(worktreePath, message));
+	},
+
+	/** {@link commit} for callers already holding the worktree lock. */
+	async commitUnlocked(worktreePath: string, message: string): Promise<string> {
+		const result = await exec(["commit", "-m", message], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git commit failed: ${result.stderr}`);
+		return this.getHeadCommit(worktreePath);
 	},
 
 	async discardFiles(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
-		return withWorktreeLock(worktreePath, async () => {
-			const statusResult = await execRead(["status", "--porcelain", "--", ...files], worktreePath);
-			const tracked: string[] = [];
-			const untracked: string[] = [];
-			for (const line of statusResult.stdout.split("\n").filter(Boolean)) {
-				const path = line.slice(3);
-				if (line[0] === "?" && line[1] === "?") {
-					untracked.push(path);
-				} else {
-					tracked.push(path);
-				}
+		return withWorktreeLock(worktreePath, () => this.discardFilesUnlocked(worktreePath, files));
+	},
+
+	/** {@link discardFiles} for callers already holding the worktree lock. */
+	async discardFilesUnlocked(worktreePath: string, files: string[]): Promise<void> {
+		if (files.length === 0) return;
+		const statusResult = await execRead(["status", "--porcelain", "--", ...files], worktreePath);
+		const tracked: string[] = [];
+		const untracked: string[] = [];
+		for (const line of statusResult.stdout.split("\n").filter(Boolean)) {
+			const path = line.slice(3);
+			if (line[0] === "?" && line[1] === "?") {
+				untracked.push(path);
+			} else {
+				tracked.push(path);
 			}
-			if (tracked.length > 0) {
-				const r = await exec(["checkout", "HEAD", "--", ...tracked], worktreePath);
-				if (r.exitCode !== 0) throw new GitError(`git checkout failed: ${r.stderr}`);
-			}
-			if (untracked.length > 0) {
-				const r = await exec(["clean", "-f", "--", ...untracked], worktreePath);
-				if (r.exitCode !== 0) throw new GitError(`git clean failed: ${r.stderr}`);
-			}
-		});
+		}
+		if (tracked.length > 0) {
+			const r = await exec(["checkout", "HEAD", "--", ...tracked], worktreePath);
+			if (r.exitCode !== 0) throw new GitError(`git checkout failed: ${r.stderr}`);
+		}
+		if (untracked.length > 0) {
+			const r = await exec(["clean", "-f", "--", ...untracked], worktreePath);
+			if (r.exitCode !== 0) throw new GitError(`git clean failed: ${r.stderr}`);
+		}
 	},
 
 	async discardAll(worktreePath: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const r1 = await exec(["checkout", "HEAD", "--", "."], worktreePath);
-			if (r1.exitCode !== 0) throw new GitError(`git checkout failed: ${r1.stderr}`);
-			const r2 = await exec(["clean", "-fd"], worktreePath);
-			if (r2.exitCode !== 0) throw new GitError(`git clean failed: ${r2.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.discardAllUnlocked(worktreePath));
+	},
+
+	/** {@link discardAll} for callers already holding the worktree lock. */
+	async discardAllUnlocked(worktreePath: string): Promise<void> {
+		const r1 = await exec(["checkout", "HEAD", "--", "."], worktreePath);
+		if (r1.exitCode !== 0) throw new GitError(`git checkout failed: ${r1.stderr}`);
+		const r2 = await exec(["clean", "-fd"], worktreePath);
+		if (r2.exitCode !== 0) throw new GitError(`git clean failed: ${r2.stderr}`);
 	},
 
 	async stash(worktreePath: string, message?: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const args = ["stash", "push", "--include-untracked"];
-			if (message) args.push("-m", message);
-			const result = await exec(args, worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git stash failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.stashUnlocked(worktreePath, message));
+	},
+
+	/** {@link stash} for callers already holding the worktree lock. */
+	async stashUnlocked(worktreePath: string, message?: string): Promise<void> {
+		const args = ["stash", "push", "--include-untracked"];
+		if (message) args.push("-m", message);
+		const result = await exec(args, worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git stash failed: ${result.stderr}`);
 	},
 
 	async stashPop(worktreePath: string): Promise<{ hasConflicts: boolean }> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["stash", "pop"], worktreePath, true);
-			if (result.exitCode !== 0) {
-				const hasUnmerged = (await detectUnmergedFiles(worktreePath)).length > 0;
-				if (hasUnmerged || commandOutputMentionsConflict(result)) {
-					return { hasConflicts: true };
-				}
-				throw new GitError(gitFailureMessage("git stash pop failed", result));
+		return withWorktreeLock(worktreePath, () => this.stashPopUnlocked(worktreePath));
+	},
+
+	/** {@link stashPop} for callers already holding the worktree lock. */
+	async stashPopUnlocked(worktreePath: string): Promise<{ hasConflicts: boolean }> {
+		const result = await exec(["stash", "pop"], worktreePath, true);
+		if (result.exitCode !== 0) {
+			const hasUnmerged = (await detectUnmergedFiles(worktreePath)).length > 0;
+			if (hasUnmerged || commandOutputMentionsConflict(result)) {
+				return { hasConflicts: true };
 			}
-			return { hasConflicts: false };
-		});
+			throw new GitError(gitFailureMessage("git stash pop failed", result));
+		}
+		return { hasConflicts: false };
 	},
 
 	async stashList(
@@ -1452,10 +1514,13 @@ export const gitService = {
 	},
 
 	async stashDrop(worktreePath: string, index: number): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["stash", "drop", `stash@{${index}}`], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git stash drop failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.stashDropUnlocked(worktreePath, index));
+	},
+
+	/** {@link stashDrop} for callers already holding the worktree lock. */
+	async stashDropUnlocked(worktreePath: string, index: number): Promise<void> {
+		const result = await exec(["stash", "drop", `stash@{${index}}`], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git stash drop failed: ${result.stderr}`);
 	},
 
 	// === File diff (working tree) ===
@@ -1572,17 +1637,23 @@ export const gitService = {
 	// === Reset ===
 
 	async resetSoft(worktreePath: string, target: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["reset", "--soft", target], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git reset --soft failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.resetSoftUnlocked(worktreePath, target));
+	},
+
+	/** {@link resetSoft} for callers already holding the worktree lock. */
+	async resetSoftUnlocked(worktreePath: string, target: string): Promise<void> {
+		const result = await exec(["reset", "--soft", target], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git reset --soft failed: ${result.stderr}`);
 	},
 
 	async resetHard(worktreePath: string, target: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["reset", "--hard", target], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git reset --hard failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.resetHardUnlocked(worktreePath, target));
+	},
+
+	/** {@link resetHard} for callers already holding the worktree lock. */
+	async resetHardUnlocked(worktreePath: string, target: string): Promise<void> {
+		const result = await exec(["reset", "--hard", target], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git reset --hard failed: ${result.stderr}`);
 	},
 
 	/**
@@ -1602,12 +1673,15 @@ export const gitService = {
 	 * what a `--no-commit` merge wants since HEAD never moved.
 	 */
 	async resetMerge(worktreePath: string, target?: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["reset", "--merge", ...(target ? [target] : [])], worktreePath);
-			if (result.exitCode !== 0) {
-				throw new GitError(gitFailureMessage("git reset --merge failed", result));
-			}
-		});
+		return withWorktreeLock(worktreePath, () => this.resetMergeUnlocked(worktreePath, target));
+	},
+
+	/** {@link resetMerge} for callers already holding the worktree lock. */
+	async resetMergeUnlocked(worktreePath: string, target?: string): Promise<void> {
+		const result = await exec(["reset", "--merge", ...(target ? [target] : [])], worktreePath);
+		if (result.exitCode !== 0) {
+			throw new GitError(gitFailureMessage("git reset --merge failed", result));
+		}
 	},
 
 	/**
@@ -1635,13 +1709,16 @@ export const gitService = {
 	 * not check out over it either — it is not part of any tracked tree.
 	 */
 	async cleanUntracked(worktreePath: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			// Anchored with a leading slash and directory-only, matching the shadow repo's
-			// rule: a legitimately-tracked `docs/.worktrees` elsewhere stays cleanable, and
-			// a plain file named `.worktrees` is not silently preserved.
-			const result = await exec(["clean", "-fd", "-e", `/${WORKTREES_DIR_NAME}/`], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git clean failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.cleanUntrackedUnlocked(worktreePath));
+	},
+
+	/** {@link cleanUntracked} for callers already holding the worktree lock. */
+	async cleanUntrackedUnlocked(worktreePath: string): Promise<void> {
+		// Anchored with a leading slash and directory-only, matching the shadow repo's
+		// rule: a legitimately-tracked `docs/.worktrees` elsewhere stays cleanable, and
+		// a plain file named `.worktrees` is not silently preserved.
+		const result = await exec(["clean", "-fd", "-e", `/${WORKTREES_DIR_NAME}/`], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git clean failed: ${result.stderr}`);
 	},
 
 	// === Revert ===
@@ -1656,34 +1733,42 @@ export const gitService = {
 
 	/** Revert a merge commit (using -m 1 to specify the mainline parent) */
 	async revertMergeCommit(worktreePath: string, commitSha: string): Promise<string> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["revert", "-m", "1", "--no-edit", commitSha], worktreePath);
-			if (result.exitCode !== 0) {
-				// Abort the failed revert to leave worktree clean
-				await exec(["revert", "--abort"], worktreePath);
-				throw new GitError(
-					`git revert produced conflicts — the merge cannot be automatically undone. ` +
-						`Resolve manually with: git revert -m 1 ${commitSha}`,
-				);
-			}
-			const head = await execRead(["rev-parse", "HEAD"], worktreePath);
-			return head.stdout.trim();
-		});
+		return withWorktreeLock(worktreePath, () =>
+			this.revertMergeCommitUnlocked(worktreePath, commitSha),
+		);
+	},
+
+	/** {@link revertMergeCommit} for callers already holding the worktree lock. */
+	async revertMergeCommitUnlocked(worktreePath: string, commitSha: string): Promise<string> {
+		const result = await exec(["revert", "-m", "1", "--no-edit", commitSha], worktreePath);
+		if (result.exitCode !== 0) {
+			// Abort the failed revert to leave worktree clean
+			await exec(["revert", "--abort"], worktreePath);
+			throw new GitError(
+				`git revert produced conflicts — the merge cannot be automatically undone. ` +
+					`Resolve manually with: git revert -m 1 ${commitSha}`,
+			);
+		}
+		const head = await execRead(["rev-parse", "HEAD"], worktreePath);
+		return head.stdout.trim();
 	},
 
 	/** Revert a regular (non-merge) commit */
 	async revertCommit(worktreePath: string, commitSha: string): Promise<string> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["revert", "--no-edit", commitSha], worktreePath);
-			if (result.exitCode !== 0) {
-				await exec(["revert", "--abort"], worktreePath);
-				throw new GitError(
-					`git revert produced conflicts — the merge cannot be automatically undone. ` +
-						`Resolve manually with: git revert ${commitSha}`,
-				);
-			}
-			const head = await execRead(["rev-parse", "HEAD"], worktreePath);
-			return head.stdout.trim();
-		});
+		return withWorktreeLock(worktreePath, () => this.revertCommitUnlocked(worktreePath, commitSha));
+	},
+
+	/** {@link revertCommit} for callers already holding the worktree lock. */
+	async revertCommitUnlocked(worktreePath: string, commitSha: string): Promise<string> {
+		const result = await exec(["revert", "--no-edit", commitSha], worktreePath);
+		if (result.exitCode !== 0) {
+			await exec(["revert", "--abort"], worktreePath);
+			throw new GitError(
+				`git revert produced conflicts — the merge cannot be automatically undone. ` +
+					`Resolve manually with: git revert ${commitSha}`,
+			);
+		}
+		const head = await execRead(["rev-parse", "HEAD"], worktreePath);
+		return head.stdout.trim();
 	},
 };

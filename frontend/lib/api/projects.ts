@@ -8,12 +8,28 @@ import {
 } from "./client";
 import type { ApiEntity } from "./types";
 
+/**
+ * One degraded aspect of a graph response.
+ *
+ * `error`/`code` are kept even though `/projects/:id/graph` no longer sends them
+ * (see the note on `GraphFallback` in `server/routes/graph.ts`: git's stderr is
+ * unbounded subprocess output and stays in the server log). They remain declared
+ * because `formatGraphFallbackMessage` reads them as optional detail and this shape
+ * is also what other degraded payloads are funnelled through — narrowing it would
+ * only move the `unknown` casts around.
+ */
 export interface ProjectGraphFallback {
 	feature: string;
 	reason?: string;
 	message?: string;
 	error?: string;
 	code?: string;
+	/**
+	 * How many chapters hit this failure. Reported instead of one fallback per
+	 * chapter, because a repository-level fault (git gone, worktrees moved) fails
+	 * every active chapter at once while the UI only ever renders one alert.
+	 */
+	failedChapters?: number;
 	[key: string]: unknown;
 }
 

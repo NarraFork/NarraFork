@@ -107,6 +107,21 @@ export const LodSwitchToast = memo(function LodSwitchToast({
 		if (!visible) setHovered(false);
 	}, [visible]);
 
+	// Leaving the page (alt+tab, minimise, switching desktops) moves the pointer
+	// out of the document without ever firing mouseleave, because the pointer does
+	// not physically move. `hovered` would then stay latched and — together with
+	// `pinned` being reset on blur — leave the indicator parked on screen with
+	// nothing left to dismiss it. Treat losing the window as leaving the widget.
+	useEffect(() => {
+		const drop = () => setHovered(false);
+		window.addEventListener("blur", drop);
+		document.addEventListener("visibilitychange", drop);
+		return () => {
+			window.removeEventListener("blur", drop);
+			document.removeEventListener("visibilitychange", drop);
+		};
+	}, []);
+
 	if (!visible) return null;
 
 	// Always the live level: the gauge doubles as the control the user is steering,

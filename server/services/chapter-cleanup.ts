@@ -3,7 +3,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { and, asc, eq, inArray, ne } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, projects } from "../db/schema";
-import { chapterLock } from "../lib/async-mutex";
+import { chapterLock, worktreeLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -503,8 +503,19 @@ export const chapterCleanup = {
 			// When it fails, that snapshot is the ONLY copy.
 			let commitFailed = false;
 			let commitError: unknown = null;
+			// `worktreeLock` in addition to the `chapterLock` this method already holds. The two
+			// guard different things and neither implies the other: `chapterLock` keeps another
+			// *chapter* transition out, while a narrator's Bash tool or a merge targeting this
+			// worktree is keyed on the path, not the chapter. The commit and the merge-abort
+			// retry have to be one unit — an abort followed by someone else's write, then this
+			// auto-commit, would commit that write under this chapter's "auto-save" message.
+			//
+			// Ordering is chapter → worktree, matching the hierarchy in `lib/async-mutex`; the
+			// reverse nesting anywhere would make a cycle out of two locks that are each safe.
 			try {
-				await gitService.autoCommit(worktreePath, "auto-save before dormant");
+				await worktreeLock.acquire(worktreePath, () =>
+					gitService.autoCommitUnlocked(worktreePath, "auto-save before dormant"),
+				);
 			} catch (commitErr) {
 				// If worktree has merge conflicts, abort merge and retry
 				logger.warn("Auto-commit failed, attempting conflict recovery", {
@@ -512,8 +523,13 @@ export const chapterCleanup = {
 					error: String(commitErr),
 				});
 				try {
-					await gitService.mergeAbort(worktreePath);
-					await gitService.autoCommit(worktreePath, "auto-save before dormant (after merge abort)");
+					await worktreeLock.acquire(worktreePath, async () => {
+						await gitService.mergeAbort(worktreePath);
+						await gitService.autoCommitUnlocked(
+							worktreePath,
+							"auto-save before dormant (after merge abort)",
+						);
+					});
 				} catch (recoveryErr) {
 					logger.error("Conflict recovery failed during dormant", {
 						chapterId,
@@ -863,84 +879,100 @@ export const chapterCleanup = {
 
 		for (const chapterId of chapterIds) {
 			try {
-				const chapter = await db.query.chapters.findFirst({
-					where: eq(chapters.id, chapterId),
-				});
-				if (!chapter) {
-					report.errors.push({ chapterId, error: "Not found" });
-					continue;
-				}
-				if (chapter.isRoot) {
-					report.skipped.push(chapterId);
-					continue;
-				}
-				if (chapter.status === "merged" || chapter.status === "abandoned") {
-					report.skipped.push(chapterId);
-					continue;
-				}
-
-				if (chapter.worktreePath && !options.force) {
-					const status = await gitService.getStatus(chapter.worktreePath);
-					if (status) {
+				// One `chapterLock` per chapter, taken inside the loop rather than around it.
+				//
+				// Locking here at all is what `dormant` and `wake` already do, and this path
+				// makes the same class of transition: read the row, decide from its status and
+				// git state, then delete the worktree and rewrite the row. Without the lock a
+				// concurrent `dormant` on the same chapter interleaves — both observe `active`,
+				// `dormant` snapshots and auto-commits into a worktree this loop is deleting,
+				// and the two `UPDATE`s race to set contradictory statuses. The clean-status
+				// check at the top is the sharpest case: it gates an irreversible removal on an
+				// observation that nothing kept true.
+				//
+				// Around the loop would be wrong, not merely coarser: it would hold a lock keyed
+				// on one chapterId while operating on others, which protects none of them and
+				// blocks unrelated single-chapter operations for the duration of the batch.
+				await chapterLock.acquire(chapterId, async () => {
+					const chapter = await db.query.chapters.findFirst({
+						where: eq(chapters.id, chapterId),
+					});
+					if (!chapter) {
+						report.errors.push({ chapterId, error: "Not found" });
+						return;
+					}
+					if (chapter.isRoot) {
 						report.skipped.push(chapterId);
-						continue;
+						return;
 					}
-				}
-
-				await terminalService.cleanupForChapter(chapterId);
-
-				if (chapter.containerConfig) {
-					try {
-						await containerService.removeChapterContainers(chapterId, {
-							deleteVolumes: options.deleteBranch,
-						});
-					} catch (err) {
-						logger.warn("Failed to remove containers during cleanup", {
-							chapterId,
-							error: String(err),
-						});
+					if (chapter.status === "merged" || chapter.status === "abandoned") {
+						report.skipped.push(chapterId);
+						return;
 					}
-				}
 
-				const gitPath = await getProjectGitPath(chapter.projectId);
-
-				if (chapter.worktreePath && gitPath) {
-					try {
-						await gitService.removeWorktree(gitPath, chapter.worktreePath);
-					} catch (err) {
-						logger.warn("Failed to remove worktree during cleanup", {
-							chapterId,
-							error: String(err),
-						});
+					if (chapter.worktreePath && !options.force) {
+						const status = await gitService.getStatus(chapter.worktreePath);
+						if (status) {
+							report.skipped.push(chapterId);
+							return;
+						}
 					}
-				}
 
-				if (options.deleteBranch && gitPath) {
-					try {
-						await gitService.deleteBranch(gitPath, chapter.branch);
-					} catch (err) {
-						logger.warn("Failed to delete branch during cleanup", {
-							chapterId,
-							error: String(err),
-						});
+					await terminalService.cleanupForChapter(chapterId);
+
+					if (chapter.containerConfig) {
+						try {
+							await containerService.removeChapterContainers(chapterId, {
+								deleteVolumes: options.deleteBranch,
+							});
+						} catch (err) {
+							logger.warn("Failed to remove containers during cleanup", {
+								chapterId,
+								error: String(err),
+							});
+						}
 					}
-				}
 
-				// Abandoned is terminal: `wake` only accepts `dormant`, so nothing will ever
-				// consume this chapter's ignored-file archive again. Leaving it behind kept a
-				// plaintext copy of exactly the files git refuses to track (`secret.env` and
-				// friends) on disk forever, with no reader and no sweeper — for a chapter the
-				// user just cleaned up.
-				discardIgnoredArchive(chapterId);
+					const gitPath = await getProjectGitPath(chapter.projectId);
 
-				const now = new Date().toISOString();
-				await db
-					.update(chapters)
-					.set({ status: "abandoned", worktreePath: null, updatedAt: now })
-					.where(eq(chapters.id, chapterId));
+					if (chapter.worktreePath && gitPath) {
+						try {
+							await gitService.removeWorktree(gitPath, chapter.worktreePath);
+						} catch (err) {
+							logger.warn("Failed to remove worktree during cleanup", {
+								chapterId,
+								error: String(err),
+							});
+						}
+					}
 
-				eventBus.emit({ type: "chapter:abandoned", chapterId, projectId: chapter.projectId });
-				report.cleaned.push(chapterId);
+					if (options.deleteBranch && gitPath) {
+						try {
+							await gitService.deleteBranch(gitPath, chapter.branch);
+						} catch (err) {
+							logger.warn("Failed to delete branch during cleanup", {
+								chapterId,
+								error: String(err),
+							});
+						}
+					}
+
+					// Abandoned is terminal: `wake` only accepts `dormant`, so nothing will ever
+					// consume this chapter's ignored-file archive again. Leaving it behind kept a
+					// plaintext copy of exactly the files git refuses to track (`secret.env` and
+					// friends) on disk forever, with no reader and no sweeper — for a chapter the
+					// user just cleaned up.
+					discardIgnoredArchive(chapterId);
+
+					const now = new Date().toISOString();
+					await db
+						.update(chapters)
+						.set({ status: "abandoned", worktreePath: null, updatedAt: now })
+						.where(eq(chapters.id, chapterId));
+
+					eventBus.emit({ type: "chapter:abandoned", chapterId, projectId: chapter.projectId });
+					report.cleaned.push(chapterId);
+				});
 			} catch (err) {
 				report.errors.push({ chapterId, error: String(err) });
 			}

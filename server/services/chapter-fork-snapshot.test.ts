@@ -276,3 +276,48 @@ describe("forking from uncommitted state", () => {
 		expect(status.stdout).toContain("app.txt");
 	});
 });
+
+describe("graph slot allocation under concurrent forks", () => {
+	test("concurrent forks of one parent still get distinct, contiguous crossOffsets", async () => {
+		const parent = await createProjectWithChapter();
+
+		// The slot search is an unguarded read-then-write, so in principle two forks could
+		// pick the same slot. This documents the observed behaviour rather than a guarantee:
+		// six concurrent forks still come out distinct, because each does seconds of
+		// subprocess git work before reaching the query and they stagger past each other.
+		//
+		// Kept as a regression guard for the collision being *worse* than that — a change
+		// that made the git work cheap, or moved the query later, would show up here. It is
+		// deliberately not asserted as proof of mutual exclusion; see the note in
+		// `chapter-fork.ts` explaining why the fix, if needed, is a DB constraint.
+		const forks = await Promise.all(
+			Array.from({ length: 6 }, (_, i) => chapterFork.fork(parent.chapterId, { title: `F${i}` })),
+		);
+		const forkIds = new Set(forks.map((f) => f.id));
+
+		const rows = await db
+			.select({ id: chapters.id, crossOffset: chapters.crossOffset })
+			.from(chapters)
+			.where(eq(chapters.projectId, parent.projectId));
+		const forked = rows.filter((r) => forkIds.has(r.id));
+		expect(forked).toHaveLength(6);
+
+		const offsets = forked.map((r) => r.crossOffset ?? 0);
+		expect(new Set(offsets).size).toBe(6);
+		// Not merely distinct but contiguous from the ruler: the search must still return
+		// the lowest free slot, so a lock that serialized but recomputed wrongly is caught.
+		expect([...offsets].sort((x, y) => x - y)).toEqual([0, 100, 200, 300, 400, 500]);
+	});
+
+	test("an explicit crossOffset is honoured rather than reallocated", async () => {
+		const parent = await createProjectWithChapter();
+		// The client-chosen position must bypass the slot search entirely. Pins that the
+		// shared-insert refactor did not accidentally route it through the search.
+		const child = await chapterFork.fork(parent.chapterId, {
+			title: "Explicit",
+			crossOffset: 500,
+		});
+		const row = await db.query.chapters.findFirst({ where: eq(chapters.id, child.id) });
+		expect(row?.crossOffset).toBe(500);
+	});
+});

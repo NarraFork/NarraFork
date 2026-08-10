@@ -30,7 +30,7 @@
 	"goToFork": "前往分叉",
 	"splitHere": "在此拆分",
 	"splitChapterTitle": "按提交拆分章节",
-	"splitChapterDesc": "在此提交创建冻结前序，保留当前章节作为后续，并从拆分点创建一个新分叉。",
+	"splitChapterDesc": "创建一个持有此提交及之前历史的前序章节，保留当前章节作为后续，并从拆分点创建一个新分叉。",
 	"splitNewForkTitle": "新分叉标题",
 	"splitNewForkDescription": "新分叉描述",
 	"splitConfirm": "拆分章节",

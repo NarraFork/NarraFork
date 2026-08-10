@@ -147,6 +147,65 @@ describe("shouldRefreshProjectGraphForEvent", () => {
 		).toBe(false);
 	});
 
+	test("refreshes when another client forks or splits a chapter in this project", () => {
+		// Adding a node is the most common way the graph changes, and it used to reach only
+		// the client that performed it — everyone else waited for the 60 s poll.
+		expect(
+			shouldRefreshProjectGraphForEvent("project-1", {
+				type: "chapter:forked",
+				projectId: "project-1",
+				chapterId: "chapter-2",
+				parentId: "chapter-1",
+			}),
+		).toBe(true);
+		expect(
+			shouldRefreshProjectGraphForEvent("project-1", {
+				type: "chapter:split",
+				projectId: "project-1",
+				prefixChapterId: "prefix",
+				continuationChapterId: "chapter-1",
+				newForkChapterId: "fork",
+				commitSha: "abc1234",
+			}),
+		).toBe(true);
+	});
+
+	test("does not refresh for a fork or split in another project", () => {
+		// Why both events carry a required `projectId`: a missing one is read as "may
+		// concern me", so without it one project's fork would refetch every open graph.
+		expect(
+			shouldRefreshProjectGraphForEvent("project-1", {
+				type: "chapter:forked",
+				projectId: "project-2",
+				chapterId: "chapter-2",
+				parentId: "chapter-1",
+			}),
+		).toBe(false);
+		expect(
+			shouldRefreshProjectGraphForEvent("project-1", {
+				type: "chapter:split",
+				projectId: "project-2",
+				prefixChapterId: "prefix",
+				continuationChapterId: "chapter-1",
+				newForkChapterId: "fork",
+				commitSha: "abc1234",
+			}),
+		).toBe(false);
+	});
+
+	test("ignores commit count changes, which fire on agent activity and name no project", () => {
+		// `chapter:commits_updated` is broadcast by the worktree watcher whenever HEAD
+		// moves and carries no `projectId`, so subscribing would make every open graph
+		// refetch a git-spawning endpoint on any commit anywhere in the deployment.
+		expect(
+			shouldRefreshProjectGraphForEvent("project-1", {
+				type: "chapter:commits_updated",
+				chapterId: "chapter-1",
+				newCount: 3,
+			}),
+		).toBe(false);
+	});
+
 	test("ignores unrelated WS events", () => {
 		expect(
 			shouldRefreshProjectGraphForEvent("project-1", {

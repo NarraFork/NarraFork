@@ -19,7 +19,17 @@ import { getWorkspaceModificationView } from "../services/workspace-modification
 
 export const gitRoutes = new Hono();
 
-/** Resolve chapter → worktreePath, throwing if not available. */
+/**
+ * Resolve chapter → worktreePath, throwing if not available.
+ *
+ * Returns `rawPath`, not `workspacePath`, and deliberately does not expose both.
+ * Everything downstream — `gitService` write methods, `getStatusSummaryCached`,
+ * `invalidateStatus` — takes a raw path and derives its own normalized key
+ * internally, so a second field here would be unused at best and, at worst,
+ * would tempt a future caller into passing a case-folded path to git as a cwd.
+ * That breaks on case-sensitive filesystems, where `/srv/WT` and `/srv/wt` are
+ * different directories.
+ */
 async function resolveWorktree(chapterId: string) {
 	const ws = await resolveWorkspaceFromChapter(chapterId);
 	return { chapter: { id: chapterId }, worktreePath: ws.rawPath };

@@ -286,6 +286,25 @@ describe("LodSwitchToast", () => {
 		expect(byTestId("lod-indicator")).toBeNull();
 	});
 
+	test("a hover stranded by a window switch does not hold it open forever", async () => {
+		// alt+tab: the window loses focus with the pointer parked ON the indicator, so
+		// no mouseleave ever fires. The hold-open hover would then survive the switch
+		// and keep the widget on screen indefinitely (the reported bug).
+		await render({ lod: 5, pinned: true, onSelectLod: () => {} });
+		await render({ lod: 4, pinned: true, onSelectLod: () => {} });
+		await mouse(byTestId("lod-indicator"), "enter");
+
+		// Losing focus also drops `pinned` (the trigger hook resets on blur), so the
+		// only thing that could keep it alive here is the stale hover.
+		await act(async () => {
+			window.dispatchEvent(new Event("blur"));
+		});
+		await render({ lod: 4, pinned: false, onSelectLod: () => {} });
+
+		await waitPastHide();
+		expect(byTestId("lod-indicator")).toBeNull();
+	});
+
 	test("a gesture-driven indicator still hides on its own", async () => {
 		// The hold-open rules must not turn every level change into a permanent
 		// overlay parked over the middle of the message list.

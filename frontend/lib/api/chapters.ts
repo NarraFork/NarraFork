@@ -158,22 +158,15 @@ export const chaptersApi = {
 			body: JSON.stringify(data),
 		}),
 
-	// Batch fork
-	batchForkChapter: (
-		id: string,
-		data: {
-			forks: Array<{
-				title: string;
-				description?: string;
-				inheritMode?: string;
-				role?: string;
-			}>;
-		},
-	) =>
-		request<{ created: ApiEntity[]; failed: Array<{ input: unknown; error: string }> }>(
-			`/chapters/${id}/batch-fork`,
-			{ method: "POST", body: JSON.stringify(data) },
-		),
+	// Batch fork: not implemented.
+	//
+	// `batchForkChapter` used to live here, targeting `POST /chapters/:id/batch-fork`.
+	// No route was ever mounted and nothing called it. Removed for the same reason as
+	// the exploration-group clients below: a typed client for a route that answers 404
+	// reads as a working feature to anyone writing UI against it.
+	//
+	// The `batchFork` string in NarratorPanel is unrelated — it forks a narrator from
+	// several selected messages, and goes through `forkChapter`.
 
 	// Cherry-pick
 	cherryPickChapter: (id: string, data: { sourceChapterId: string; commitShas: string[] }) =>
@@ -217,33 +210,18 @@ export const chaptersApi = {
 	deleteChapterEdge: (id: string) =>
 		request<{ ok: boolean }>(`/chapter-edges/${id}`, { method: "DELETE" }),
 
-	// Exploration groups
-	listExplorationGroups: (projectId: string) =>
-		request<ApiEntity[]>(`/exploration-groups?projectId=${projectId}`),
-	getExplorationGroup: (id: string) => request<ApiEntity>(`/exploration-groups/${id}`),
-	createExplorationGroup: (data: {
-		projectId: string;
-		title: string;
-		description?: string;
-		baseChapterId: string;
-		branches: Array<{ title: string; description?: string; inheritMode?: string }>;
-	}) =>
-		request<ApiEntity>("/exploration-groups", {
-			method: "POST",
-			body: JSON.stringify(data),
-		}),
-	updateExplorationGroup: (id: string, data: { title?: string; description?: string }) =>
-		request<ApiEntity>(`/exploration-groups/${id}`, {
-			method: "PATCH",
-			body: JSON.stringify(data),
-		}),
-	decideExplorationGroup: (id: string, chapterId: string) =>
-		request<ApiEntity>(`/exploration-groups/${id}/decide`, {
-			method: "POST",
-			body: JSON.stringify({ chapterId }),
-		}),
-	abandonExplorationGroup: (id: string) =>
-		request<ApiEntity>(`/exploration-groups/${id}/abandon`, { method: "POST" }),
+	// Exploration groups: not implemented.
+	//
+	// Six client functions used to live here, targeting `/api/exploration-groups/*`.
+	// No route was ever mounted, and nothing in the app called them — no hook, no
+	// component, not even a translation lookup. They have been removed rather than
+	// left in place, because a typed client for a route that answers 404 reads as a
+	// working feature to anyone writing UI against it.
+	//
+	// What remains on the server is deliberate and harmless: the `exploration_groups`
+	// table, its validators, its project-database sync, and the `exploration:*` event
+	// types. Reviving the feature means adding a service plus routes, then a client
+	// again — see the notes in DESIGN.md.
 
 	// Reviews
 	createReview: (

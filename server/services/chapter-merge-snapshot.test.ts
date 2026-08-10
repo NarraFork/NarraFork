@@ -873,8 +873,13 @@ describe("commit-mode conflict cleanup", () => {
 		// the merge result. Simulated rather than constructed from git state: the natural
 		// shape for it (a staged-then-modified file) also makes git refuse to *start* the
 		// merge, so the two cannot be reproduced together through the public path.
-		const resetMerge = gitService.resetMerge;
-		gitService.resetMerge = async () => {
+		//
+		// Stubs the `*Unlocked` variant because that is what the cleanup path calls: it runs
+		// inside a `worktreeLock` block, so the locked wrapper would wait on its own caller.
+		// Stubbing the wrapper instead would silently stop intercepting and the rung under
+		// test would never be reached.
+		const resetMerge = gitService.resetMergeUnlocked;
+		gitService.resetMergeUnlocked = async () => {
 			throw new Error("Entry 'notes.txt' not uptodate. Cannot merge.");
 		};
 		let result: Awaited<ReturnType<typeof chapterMerge.merge>>;
@@ -885,7 +890,7 @@ describe("commit-mode conflict cleanup", () => {
 				mode: "commit",
 			});
 		} finally {
-			gitService.resetMerge = resetMerge;
+			gitService.resetMergeUnlocked = resetMerge;
 		}
 
 		expect(result.success).toBe(false);
@@ -1063,9 +1068,11 @@ describe("dormant and wake without a commit", () => {
 
 		// Reproduce the tolerated failure: `dormant` logs it and proceeds to delete the
 		// worktree anyway, which is what makes the snapshot the only remaining copy.
-		const autoCommit = gitService.autoCommit;
+		// `autoCommitUnlocked` is the seam: `dormant` holds `worktreeLock` around it, so the
+		// locked wrapper is never reached from that path.
+		const autoCommit = gitService.autoCommitUnlocked;
 		const mergeAbort = gitService.mergeAbort;
-		gitService.autoCommit = async () => {
+		gitService.autoCommitUnlocked = async () => {
 			throw new Error("simulated index lock");
 		};
 		gitService.mergeAbort = async () => {
@@ -1074,7 +1081,7 @@ describe("dormant and wake without a commit", () => {
 		try {
 			await chapterCleanup.dormant(env.source.id);
 		} finally {
-			gitService.autoCommit = autoCommit;
+			gitService.autoCommitUnlocked = autoCommit;
 			gitService.mergeAbort = mergeAbort;
 		}
 

@@ -5,9 +5,37 @@ import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 const CHAPTER_QUERY_GC_TIME_MS = 60_000;
 
+/**
+ * Server events that invalidate the project graph.
+ *
+ * The list is what a *different* client's action must do to this one's view. Anything
+ * the local user did is already handled by that mutation's own `onSuccess`; these
+ * exist because the story network is shared state.
+ *
+ * `chapter:forked` and `chapter:split` are here because they add nodes — a fork is the
+ * single most common way the graph changes, and it used to redraw only on the 60 s
+ * fallback poll for everyone but the client that made it.
+ *
+ * `chapter:commits_updated` is deliberately NOT here, even though the commit count it
+ * carries is rendered on the node. It is the one event in this family that fires on
+ * agent activity rather than user action — the worktree watcher emits it whenever HEAD
+ * moved — and it has no `projectId`, which `shouldRefreshProjectGraphForEvent` reads as
+ * "may concern me". Every client with a graph open would therefore refetch
+ * `GET /:id/graph` (which spawns git per active chapter) on every commit made anywhere
+ * in the deployment. A stale commit count until the next poll is the cheaper wrong
+ * answer.
+ *
+ * `chapter:updated` is deliberately absent: the server has no such event, and the only
+ * field `chapterService.update` touches that affects the graph — `role` — emits
+ * `chapter:role_changed` instead. Everything else it writes (title, color, panel
+ * geometry) is refreshed by the mutation's own `onSuccess`, so a coarse "updated"
+ * event would put two mechanisms in charge of one job and refetch the graph on every
+ * panel resize.
+ */
 export const CHAPTER_GRAPH_REFRESH_EVENTS = [
 	"chapter:created",
-	"chapter:updated",
+	"chapter:forked",
+	"chapter:split",
 	"chapter:abandoned",
 	"chapter:dormant",
 	"chapter:woken",

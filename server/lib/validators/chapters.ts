@@ -25,7 +25,8 @@ export const containerConfigSchema = z.object({
 export const updateChapterSchema = z.object({
 	title: z.string().min(1).max(200).optional(),
 	description: z.string().max(2000).optional(),
-	status: z.enum(["active", "dormant", "merged", "abandoned", "frozen"]).optional(),
+	// `frozen` is deliberately absent; see the note on `chapters.status` in schema.ts.
+	status: z.enum(["active", "dormant", "merged", "abandoned"]).optional(),
 	role: z.enum(["trunk", "branch", "exploration", "review"]).optional(),
 	color: z.string().max(20).nullable().optional(),
 	groupLabel: z.string().max(100).nullable().optional(),
@@ -141,21 +142,17 @@ export const splitChapterSchema = z.object({
 	}),
 });
 
-// === batch fork ===
-
-export const batchForkSchema = z.object({
-	forks: z
-		.array(
-			z.object({
-				title: z.string().min(1).max(200),
-				description: z.string().max(2000).optional(),
-				inheritMode: z.enum(["full", "compressed", "fresh"]).default("full"),
-				role: z.enum(["branch", "exploration"]).default("branch"),
-			}),
-		)
-		.min(1)
-		.max(10),
-});
+// === batch fork: not implemented ===
+//
+// `batchForkSchema` used to live here. There was never a `POST /chapters/:id/batch-fork`
+// route to parse with it, nor a `chapterFork` method behind one, and the frontend client
+// that named the endpoint has been removed too. A validator for a request nothing accepts
+// is indistinguishable from one for a request that works, which is how the whole feature
+// came to look implemented in DESIGN.md.
+//
+// Reviving it means a service method plus a route; write the schema then. Note the
+// per-fork `crossOffset` question in `chapter-fork.ts` — a batch is the one caller that
+// can assign slots up front and sidestep the unguarded slot search.
 
 // === cherry-pick ===
 

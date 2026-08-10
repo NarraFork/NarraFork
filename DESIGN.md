@@ -1660,8 +1660,8 @@ frontend/
 type NarraForkEvent =
   // Chapter 生命周期
   | { type: 'chapter:created'; chapterId: string; projectId: string }
-  | { type: 'chapter:forked'; chapterId: string; parentId: string }
-  | { type: 'chapter:split'; prefixChapterId: string; continuationChapterId: string; newForkChapterId: string; commitSha: string }
+  | { type: 'chapter:forked'; chapterId: string; parentId: string; projectId: string }
+  | { type: 'chapter:split'; prefixChapterId: string; continuationChapterId: string; newForkChapterId: string; commitSha: string; projectId: string }
   | { type: 'chapter:merged'; sourceId: string; targetId: string }
   | { type: 'chapter:conflict'; sourceId: string; targetId: string; files: string[] }
   | { type: 'chapter:cherry_picked'; sourceId: string; targetId: string; commits: string[] }
@@ -1710,6 +1710,19 @@ type NarraForkEvent =
 - 写入 JSONL 日志（可选持久化）
 
 事件消费者可通过 `eventBus.on(eventType, handler)` 订阅特定事件类型。
+
+**"广播到所有 WebSocket 客户端"不是无条件的。** `server/websocket/narrator-ws.ts` 按前缀
+（`chapter:` / `dependency:` / `exploration:` / `review:`）把故事网络事件桥接到 WS，前缀匹配
+的好处是新增生命周期事件无需再改一处，代价是新事件的 **payload 也默认外发**。而
+`broadcastToAll` 不按项目、章节或用户过滤——它遍历整个连接集合。因此：
+
+- 这些前缀下的事件，payload 必须对"所有已登录客户端"都是安全的，且不能是高频的。
+- 不满足的必须进 `GRAPH_TOPOLOGY_EXCLUDED`。当前成员：`chapter:files_changed`、
+  `chapter:external_change_recorded`（worktree watcher 每几秒一次，且携带宿主路径）、
+  `chapter:conflict`（携带某次合并的冲突文件名，无订阅者）。
+- 需要跨客户端刷新图的事件必须带 `projectId`：前端 `shouldRefreshProjectGraphForEvent` 把
+  **缺失** 的 projectId 当作"可能与我有关"，所以漏带会让一个项目的操作刷新所有项目的图。
+- 需要窄范围投递的用 `narrator:ws_broadcast`（按 narrator 定向），不要放进上述前缀。
 
 ---
 
@@ -1828,13 +1841,24 @@ interface NarraForkSettings {
 - 交互式画布：节点拖拽、右键菜单、侧边面板
 - 节点位置持久化（positionX/positionY + PATCH graph/positions）
 
-#### 6b: 角色系统 + 章节拆分 ✅
+#### 6b: 角色系统 + 章节拆分 ⚠️ 部分完成
 - role 字段（trunk/branch/exploration）+ 图上的视觉区分
 - groupLabel 分组 + 图上的分组框渲染
 - 章节卡片展开 commit 列表（CommitList 组件 + GET /api/chapters/:id/commits）
-- 章节拆分（split at commit）：splitAtCommit 服务 + ChapterSplitModal
-- frozen 状态 + 图上的 frozen 节点样式
-- 批量分叉（batchFork）+ BatchForkModal
+- 章节拆分（split at commit）：`chapter-split.ts` + `POST /api/chapters/:id/split` + ChapterSplitModal ✅
+  - **实现与本文档 4.2.1 的规格有一处故意偏离**：前序章节的消息截断用 `narrator_message_refs.seq`
+    而非"commit 时间戳与消息 createdAt 对比"。时间戳方案在 commit 时间被 rebase/`--date` 改写、
+    cherry-pick 后 authoredAt 早于实际、同毫秒碰撞、懒 fork 的 seq 稀疏而时间连续、compact 标记的
+    createdAt 是压缩时刻而非内容时刻等场景下都会选错截断点。全部既有 fork 代码同样用 seq。
+  - 前序章节状态用 `dormant` 而非 `frozen`（见下）。
+- ~~frozen 状态~~ **已移除**：它没有任何写入路径，且 fork/wake/dormant 全部拒绝它，
+  一旦进入就再也无法分叉、唤醒、合并或评审——一个没有出口的状态。"合并即冻结"的意图
+  由 `merged` 表达，后者本就是这个语义且有 `unmerge` 作为出口。前端保留其显示映射以兼容旧数据。
+- 批量分叉（batchFork）**未实现**，且残留已清理：原先存在的 `batchForkSchema` 与前端
+  `batchForkChapter` 客户端函数都已删除（无路由、无服务方法、零调用点）。为一个 404 路由保留
+  类型化客户端和 validator，会让后续开发者以为功能可用——这正是本节曾被标为"✅"的原因。
+  若要实现：先加服务方法与路由，再加客户端；批量场景可预先分配 `crossOffset`，绕开
+  `chapter-fork.ts` 中无锁的槽位搜索。
 
 #### 6c: 依赖关系 ✅
 - dependency 边的创建/删除（图上拖拽连接 + API）
@@ -1842,12 +1866,33 @@ interface NarraForkSettings {
 - 图上的依赖可视化（DependencyEdge 橙色虚线 + 更新徽章）
 - SyncUpstreamModal（选择 rebase/merge）
 
-#### 6d: 探索组 ✅
-- exploration_groups 表 + exploration-group-service
-- 创建探索组（ExplorationGroupModal，含批量 fork exploration 分支）
-- 图上的探索组渲染（ExplorationGroupNode 分组框）
-- 决策流程（选定方案合并 + 其余 abandoned）
-- ExplorationGroupPanel（侧边面板中显示）
+#### 6d: 探索组 ❌ 未实现
+本阶段整体未落地。已存在的只是**周边设施**，不构成可用功能：
+
+- ✅ `exploration_groups` 表、`chapters.explorationGroupId` 外键、覆盖索引
+- ✅ validators（`createExplorationGroupSchema` / `updateExplorationGroupSchema`）
+- ✅ 项目数据库同步（`syncExplorationGroups`）与导入白名单
+- ✅ `GET /:id/graph` 会返回 `explorationGroups`（但不含 `chapterIds`，前端接口声明了该字段）
+- ❌ **无 `exploration-group-service.ts`、无路由、`app.ts` 无挂载**
+- ❌ `explorationGroupId` 在整个 server 下**无写入点**
+- ❌ 四个 `exploration:*` 事件从未发射
+- ❌ 无 `ExplorationGroupNode`、无 `ExplorationGroupPanel`、无 `useExplorationGroups`
+- ❌ `zh-CN/explorations.json` 不存在；`en` 版仅 5 个 key 且无任何组件使用
+- ❌ 前端曾有 6 个 API 客户端函数，因零调用点已被移除（2026-08 决定）
+
+重启该特性需要先定三个决策（调研结论，供将来参考）：
+1. **decide 不应自动合并胜出分支**。本文档 4.4 说要合并，但同处也承认"可能触发冲突，
+   进入标准冲突处理流程"——那是交互式的，端点返回值无法表达"等待用户裁决"。应只做
+   标记 + 处理其余分支，合并交给现成的 merge 入口。
+2. **abandon 应把成员置 `dormant` 而非 `abandoned`**。`abandoned` 是真正的终态：不可 wake、
+   不可作为 fork 父、且 ignored 文件归档在置 abandoned 时已被丢弃，与"用户可随时查看代码和
+   对话作为参考"的设计意图矛盾。
+3. **create 部分失败应保留已成功的分支**并在响应中带 `failed`，与 batchFork 的非全有全无
+   语义一致（fork 的 rollback 栈本就不跨章节）。
+
+另注：create 依赖 `batchFork`，而后者同样未实现（见 6b）。若并发 fork 同一父章节，
+需注意 fork 全程无 `chapterLock` 且 `crossOffset` 槽位分配是 read-then-write 竞态——
+探索组可预先分配 `crossOffset` 规避。
 
 #### 6e: Cherry-pick + 参考式整合 ✅
 - chapter-cherry-pick-service + CherryPickModal（commit 选择器）
