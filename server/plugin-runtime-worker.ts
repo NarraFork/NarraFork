@@ -38,7 +38,17 @@ export async function runPluginRuntimeWorker(): Promise<never> {
 		console.error(error);
 		process.exit(1);
 	}
-	// The plugin entry owns the stdio RPC loop and keeps the process alive.
-	// If the entry returns without setting up a server loop, exit cleanly.
-	process.exit(0);
+	// Do NOT force-exit here. The plugin entry registers its stdio RPC listeners
+	// (process.stdin data handler) during import, which keeps the event loop
+	// alive; calling process.exit(0) unconditionally killed the plugin right
+	// after it sent its hello frame — the host then wrote the initialize request
+	// into a closed stdin pipe and saw "EPIPE: broken pipe, write", failing every
+	// activation in compiled builds (dev mode spawns `bun <entry>` directly and
+	// was unaffected). A plugin whose entry returns without registering anything
+	// exits naturally when the event loop drains (Bun exits with code 0).
+	await new Promise<void>(() => {});
+	// Unreachable: the plugin's stdio listeners (or their absence) decide when the
+	// process exits — a live plugin keeps the event loop busy, an idle one lets
+	// Bun exit naturally with code 0. Never force-exit here (see above).
+	throw new Error("unreachable");
 }
