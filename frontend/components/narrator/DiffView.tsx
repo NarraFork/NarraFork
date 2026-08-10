@@ -9,7 +9,7 @@ import {
 	MAX_DIFF_LINES,
 } from "@shared/pretext-layout/diff-core";
 import type { ParsedDiffHunk } from "@shared/pretext-layout/parse-unified-diff";
-import { Fragment, memo, useEffect, useMemo, useState } from "react";
+import { Fragment, memo, type UIEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { loadShiki } from "../../lib/shiki-loader";
 import { AutoFollowScroll } from "./AutoFollowScroll";
@@ -64,6 +64,12 @@ interface DiffViewProps {
 	autoFollowKey?: string | number | null;
 	/** During replacement streaming, follow the latest added line instead of the diff bottom. */
 	autoFollowTarget?: "bottom" | "latest-added";
+	/**
+	 * Called once when the user scrolls near the bottom. The latch resets only
+	 * after the viewport leaves that zone, so one wheel gesture cannot append
+	 * several 500-row segments at once.
+	 */
+	onNearBottom?: () => void;
 }
 
 // --- Styles (inline, Mantine dark-theme compatible) ---
@@ -367,11 +373,13 @@ export const DiffView = memo(function DiffView({
 	gutterMinWidth,
 	autoFollowKey,
 	autoFollowTarget = "bottom",
+	onNearBottom,
 }: DiffViewProps) {
 	const computedScheme = useComputedColorScheme("dark");
 	const isDark = computedScheme === "dark";
 	const theme = isDark ? "github-dark-default" : "github-light-default";
 	const diffStyles = getDiffStyles(isDark);
+	const nearBottomFired = useRef(false);
 	const lines = useMemo(
 		() => providedLines ?? computeDiff(oldStr ?? "", newStr ?? "", startLine),
 		[providedLines, oldStr, newStr, startLine],
@@ -395,6 +403,20 @@ export const DiffView = memo(function DiffView({
 		for (const hunk of hunks) map.set(hunk.rowIndex, hunk);
 		return map;
 	}, [hunks]);
+	const handleScroll = onNearBottom
+		? (event: UIEvent<HTMLDivElement>) => {
+				const viewport = event.currentTarget;
+				const isNearBottom =
+					viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 120;
+				if (!isNearBottom) {
+					nearBottomFired.current = false;
+					return;
+				}
+				if (nearBottomFired.current) return;
+				nearBottomFired.current = true;
+				onNearBottom();
+			}
+		: undefined;
 
 	if (lines.length === 0) return null;
 
@@ -419,7 +441,11 @@ export const DiffView = memo(function DiffView({
 					...wrapOverride,
 				};
 
-	const truncated = lines.length >= MAX_DIFF_LINES;
+	// A pre-computed array may intentionally contain exactly 500 visible rows while
+	// the git modal keeps the rest off-screen. Length alone therefore says nothing
+	// about truncation for that mode. Keep the legacy footer only for the two-text
+	// path, whose `computeDiff` still owns the 500-row safety ceiling.
+	const truncated = providedLines == null && lines.length >= MAX_DIFF_LINES;
 	const latestAddedIndex =
 		autoFollowTarget === "latest-added" ? lines.findLastIndex((line) => line.type === "added") : -1;
 
@@ -466,10 +492,16 @@ export const DiffView = memo(function DiffView({
 				deps={[oldStr, newStr, providedLines, tokenMap]}
 				followTo={autoFollowTarget === "latest-added" ? scrollToDiffTarget : undefined}
 			>
-				<Box style={style}>{content}</Box>
+				<Box data-diff-scroll-container="true" style={style} onScroll={handleScroll}>
+					{content}
+				</Box>
 			</AutoFollowScroll>
 		);
 	}
 
-	return <Box style={style}>{content}</Box>;
+	return (
+		<Box data-diff-scroll-container="true" style={style} onScroll={handleScroll}>
+			{content}
+		</Box>
+	);
 });

@@ -9,7 +9,6 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { MAX_DIFF_LINES } from "./diff-core";
 import { parseUnifiedDiff } from "./parse-unified-diff";
 
 const shape = (patch: string) => parseUnifiedDiff(patch).lines.map((l) => [l.type, l.content]);
@@ -244,12 +243,15 @@ describe("parseUnifiedDiff — bounds", () => {
 		expect(shape(patch)).toEqual([["removed", "one"]]);
 	});
 
-	it("caps rows at MAX_DIFF_LINES and reports truncation", () => {
-		const body = Array.from({ length: MAX_DIFF_LINES + 50 }, (_, i) => ` line${i}`);
+	it("parses every row past the old 500-line ceiling", () => {
+		const rowCount = 1_250;
+		const body = Array.from({ length: rowCount }, (_, i) => ` line${i}`);
 		const patch = [`@@ -1,${body.length} +1,${body.length} @@`, ...body].join("\n");
 		const result = parseUnifiedDiff(patch);
-		expect(result.lines).toHaveLength(MAX_DIFF_LINES);
-		expect(result.truncated).toBe(true);
+		expect(result.lines).toHaveLength(rowCount);
+		expect(result.lines[500]?.content).toBe("line500");
+		expect(result.lines.at(-1)?.content).toBe("line1249");
+		expect(result.truncated).toBe(false);
 	});
 
 	it("handles an empty patch and a metadata-only patch without throwing", () => {

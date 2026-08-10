@@ -33,6 +33,7 @@
 	"viewDiff": "查看差异",
 	"diffTitle": "差异：{{file}}",
 	"diffTruncated": "差异已截断（文件过大）",
+	"diffLoadMore": "已显示 {{shown}} / {{total}} 行 — 继续下拉加载更多",
 	"diffBinary": "二进制文件，无法逐行比较",
 	"noDiff": "无差异",
 	"fileStatus.M": "已修改",

@@ -17,11 +17,12 @@
  * PURE: no React, no Mantine, no DOM, no frontend imports — enforced by the
  * enumerating `shared-core.guard.test.ts` in this directory.
  *
- * Bounds and per-line clamping are reused from diff-core rather than redefined,
- * so both row producers answer to one set of limits.
+ * Per-line clamping is reused from diff-core rather than redefined. The parser
+ * deliberately has NO row ceiling: the git modal now decides how many already-
+ * parsed rows are visible and reveals the next 500 as the reader scrolls.
  */
 
-import { clampDiffLineContent, type DiffLine, MAX_DIFF_LINES, pairWordChanges } from "./diff-core";
+import { clampDiffLineContent, type DiffLine, pairWordChanges } from "./diff-core";
 
 /**
  * One hunk boundary, carried ALONGSIDE the rows rather than inside them.
@@ -57,7 +58,10 @@ export interface ParsedUnifiedDiff {
 	lines: DiffLine[];
 	/** Hunk boundaries in row order, for rendering separators. */
 	hunks: ParsedDiffHunk[];
-	/** Row count hit `MAX_DIFF_LINES` and parsing stopped early. */
+	/**
+	 * Compatibility field for existing callers. Always false now that row
+	 * visibility is controlled by the git modal instead of by parser truncation.
+	 */
 	truncated: boolean;
 	/** Patch declares a binary file; there are no text rows to render. */
 	binary: boolean;
@@ -123,7 +127,7 @@ function isBinaryMarker(line: string): boolean {
 export function parseUnifiedDiff(patch: string): ParsedUnifiedDiff {
 	const lines: DiffLine[] = [];
 	const hunks: ParsedDiffHunk[] = [];
-	let truncated = false;
+	const truncated = false;
 	let binary = false;
 	let multiFile = false;
 
@@ -140,14 +144,9 @@ export function parseUnifiedDiff(patch: string): ParsedUnifiedDiff {
 	let pendingRemoved: string[] = [];
 	let pendingAdded: string[] = [];
 
-	/** Emit one row; returns false once the row ceiling is reached. */
-	const push = (line: DiffLine): boolean => {
-		if (lines.length >= MAX_DIFF_LINES) {
-			truncated = true;
-			return false;
-		}
+	/** Emit one row. Visibility is paged by the modal, never by this parser. */
+	const push = (line: DiffLine): void => {
 		lines.push(line);
-		return true;
 	};
 
 	/**
@@ -157,8 +156,8 @@ export function parseUnifiedDiff(patch: string): ParsedUnifiedDiff {
 	 * while word changes still come from pairwise comparison, so a modified line
 	 * keeps its intra-line marking.
 	 */
-	const flush = (): boolean => {
-		if (pendingRemoved.length === 0 && pendingAdded.length === 0) return true;
+	const flush = (): void => {
+		if (pendingRemoved.length === 0 && pendingAdded.length === 0) return;
 
 		const paired = Math.min(pendingRemoved.length, pendingAdded.length);
 		const wordChanges = pendingRemoved.map((removed, i) =>
@@ -166,35 +165,26 @@ export function parseUnifiedDiff(patch: string): ParsedUnifiedDiff {
 		);
 
 		for (let i = 0; i < pendingRemoved.length; i++) {
-			if (
-				!push({
-					type: "removed",
-					content: pendingRemoved[i] ?? "",
-					wordChanges: wordChanges[i]?.removed,
-					oldLineNo: oldLineNo + i,
-				})
-			) {
-				return false;
-			}
+			push({
+				type: "removed",
+				content: pendingRemoved[i] ?? "",
+				wordChanges: wordChanges[i]?.removed,
+				oldLineNo: oldLineNo + i,
+			});
 		}
 		for (let i = 0; i < pendingAdded.length; i++) {
-			if (
-				!push({
-					type: "added",
-					content: pendingAdded[i] ?? "",
-					wordChanges: i < paired ? wordChanges[i]?.added : undefined,
-					newLineNo: newLineNo + i,
-				})
-			) {
-				return false;
-			}
+			push({
+				type: "added",
+				content: pendingAdded[i] ?? "",
+				wordChanges: i < paired ? wordChanges[i]?.added : undefined,
+				newLineNo: newLineNo + i,
+			});
 		}
 
 		oldLineNo += pendingRemoved.length;
 		newLineNo += pendingAdded.length;
 		pendingRemoved = [];
 		pendingAdded = [];
-		return true;
 	};
 
 	for (const raw of patch.split("\n")) {
@@ -221,14 +211,12 @@ export function parseUnifiedDiff(patch: string): ParsedUnifiedDiff {
 
 		const hunk = HUNK_HEADER.exec(raw);
 		if (hunk) {
-			if (!flush()) break;
+			flush();
 			oldLineNo = Number(hunk[2]);
 			newLineNo = Number(hunk[3]);
 			inHunk = true;
 			// `rowIndex` is the row this header sits ABOVE. Recorded before the hunk's
-			// rows exist, so it equals the current length; a header whose rows are all
-			// cut by the row cap is dropped after the loop rather than pointing past
-			// the end.
+			// rows exist, so it equals the current length.
 			hunks.push({
 				rowIndex: lines.length,
 				heading: (hunk[4] ?? "").trim(),
@@ -256,27 +244,22 @@ export function parseUnifiedDiff(patch: string): ParsedUnifiedDiff {
 
 		// Context row (leading space), or a bare empty line, which git emits for an
 		// unchanged blank line.
-		if (!flush()) break;
+		flush();
 		const content = raw.startsWith(" ") ? raw.slice(1) : raw;
-		if (
-			!push({
-				type: "context",
-				content: clampDiffLineContent(content),
-				oldLineNo,
-				newLineNo,
-			})
-		) {
-			break;
-		}
+		push({
+			type: "context",
+			content: clampDiffLineContent(content),
+			oldLineNo,
+			newLineNo,
+		});
 		oldLineNo++;
 		newLineNo++;
 	}
 
 	if (!binary) flush();
 
-	// A binary patch emits no rows, and a header whose rows were all cut by the row
-	// cap would point past the end — either would render as a separator with nothing
-	// under it.
+	// A binary patch emits no rows. Metadata-only hunks are also filtered so a
+	// separator is never rendered with nothing underneath it.
 	const anchored = binary ? [] : hunks.filter((h) => h.rowIndex < lines.length);
 
 	return { lines, hunks: anchored, truncated, binary, multiFile };

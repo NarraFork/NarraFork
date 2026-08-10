@@ -150,7 +150,7 @@ const LEAKY_PATCH = [
 	"",
 ].join("\n");
 
-function renderPatch(language?: string, patch: string = PATCH) {
+function renderPatch(language?: string, patch: string = PATCH, onNearBottom?: () => void) {
 	const parsed = parseUnifiedDiff(patch);
 	container = document.createElement("div");
 	document.body.appendChild(container);
@@ -163,6 +163,7 @@ function renderPatch(language?: string, patch: string = PATCH) {
 				maxHeight={400}
 				gutterMinWidth={1}
 				language={language}
+				onNearBottom={onNearBottom}
 			/>
 		</MantineProvider>,
 	);
@@ -305,5 +306,47 @@ describe("DiffView", () => {
 		// comment — the fix must not flatten both sides into the new file.
 		const removedRow = parsed.lines.findIndex((line) => line.type === "removed");
 		expect(rowIndexesColoured(rows, FAKE_COMMENT_COLOR)).toContain(removedRow);
+	});
+
+	test("does not call a pre-computed 500-row segment truncated", async () => {
+		const body = Array.from({ length: 500 }, (_, index) => ` line${index}`);
+		const patch = [`@@ -1,500 +1,500 @@`, ...body].join("\n");
+		renderPatch(undefined, patch);
+		await flushRender();
+
+		expect(container?.textContent).not.toContain("diff truncated at 500 lines");
+	});
+
+	test("fires near-bottom once until the reader leaves the bottom zone", async () => {
+		let calls = 0;
+		renderPatch(undefined, PATCH, () => {
+			calls++;
+		});
+		await flushRender();
+
+		const scroller = container?.querySelector<HTMLElement>('[data-diff-scroll-container="true"]');
+		expect(scroller).toBeTruthy();
+		if (!scroller) return;
+		Object.defineProperties(scroller, {
+			clientHeight: { configurable: true, value: 500 },
+			scrollHeight: { configurable: true, value: 2_000 },
+			scrollTop: { configurable: true, value: 1_300, writable: true },
+		});
+
+		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+		expect(calls).toBe(0);
+
+		scroller.scrollTop = 1_390;
+		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+		expect(calls).toBe(1);
+
+		// Leaving the 120px zone resets the latch. Returning to it represents the
+		// next deliberate downward scroll and may load one more segment.
+		scroller.scrollTop = 1_000;
+		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+		scroller.scrollTop = 1_400;
+		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+		expect(calls).toBe(2);
 	});
 });

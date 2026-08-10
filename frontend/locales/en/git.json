@@ -33,6 +33,7 @@
 	"viewDiff": "View Diff",
 	"diffTitle": "Diff: {{file}}",
 	"diffTruncated": "Diff truncated (file too large)",
+	"diffLoadMore": "Showing {{shown}} of {{total}} lines — scroll down to load more",
 	"diffBinary": "Binary file — no line diff available",
 	"noDiff": "No diff available",
 	"fileStatus.M": "Modified",
