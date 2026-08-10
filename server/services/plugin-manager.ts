@@ -435,7 +435,10 @@ async function resolveManagerToolPrincipal(
 	const diagnostics = runtime.getDiagnostics();
 	const state = await stateStore.getState(pluginId);
 	const packageVersion = diagnostics.pluginVersion ?? state?.current?.version;
-	const installationId = authorityInstallationId(state);
+	// Bindings use the stable UUID installation identity when available; older
+	// state files fall back through the authority generation and legacy package hash.
+	const installationId =
+		state?.installationId ?? authorityInstallationId(state) ?? state?.current?.hash;
 	if (!packageVersion || !installationId) return undefined;
 	return {
 		pluginId,
