@@ -51,6 +51,11 @@ interface PluginPrincipal {
   installationId: string;
 }
 
+// **[当前事实]** installationId 是插件安装实例的稳定 UUID（首次授权操作时
+// 生成并持久化于插件 state），**不是**包内容 hash——升级/重装不会改变身份，
+// 授权在升级后自动延续（旧 hash 身份的历史安装会惰性迁移到 UUID，并从
+// sourceInstallationId 继承授权）。包 hash 仅用于完整性校验。
+
 interface InvocationPrincipal {
   kind: "user" | "plugin_background" | "system";
   userId?: string;
