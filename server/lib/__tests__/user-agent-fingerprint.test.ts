@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, it, test } from "bun:test";
 import { deriveCodexWindowId } from "../agent/codex-request";
 import {
 	buildCodexEmulationHeaders,
 	getHttpUserAgent,
+	mergeExtraHeaders,
 	ORIGINATOR_CODEX,
 	RESPONSES_LITE_HEADER,
 	resolveClientFingerprint,
@@ -158,4 +159,61 @@ describe("resolveClientFingerprint", () => {
 		// The obsolete underscore variant is never present.
 		expect(headers.session_id).toBeUndefined();
 	});
+});
+
+/**
+ * A header object is case-sensitive; HTTP header names are not. The providers
+ * write opposite casings (`User-Agent` vs `user-agent`), so before this an
+ * override typed in the other casing left BOTH keys in the map and `fetch`
+ * comma-joined them into a UA matching no real client. Measured, not theorised.
+ */
+describe("mergeExtraHeaders — one User-Agent key, whatever the casing", () => {
+	const uaKeys = (headers: Record<string, string>) =>
+		Object.keys(headers).filter((k) => k.toLowerCase() === "user-agent");
+
+	for (const injected of ["user-agent", "User-Agent", "USER-AGENT"]) {
+		for (const own of ["User-Agent", "user-agent"]) {
+			it(`collapses ${injected} onto ${own}`, () => {
+				const headers: Record<string, string> = { [own]: "configured/1.0" };
+				mergeExtraHeaders(headers, { [injected]: "override/2.0" }, own);
+				expect(uaKeys(headers)).toEqual([own]);
+				expect(headers[own]).toBe("override/2.0");
+			});
+		}
+	}
+
+	it("leaves the configured UA alone when extraHeaders carries none", () => {
+		const headers: Record<string, string> = { "User-Agent": "configured/1.0" };
+		mergeExtraHeaders(headers, { "X-Other": "keep" }, "User-Agent");
+		expect(headers["User-Agent"]).toBe("configured/1.0");
+		expect(headers["X-Other"]).toBe("keep");
+	});
+
+	it("sanitizes an override instead of passing raw bytes to the wire", () => {
+		const headers: Record<string, string> = { "User-Agent": "configured/1.0" };
+		mergeExtraHeaders(headers, { "user-agent": "over/2.0中文" }, "User-Agent");
+		expect(headers["User-Agent"]).toBe("over/2.0__");
+	});
+
+	it("ignores a blank override rather than clearing the UA", () => {
+		const headers: Record<string, string> = { "User-Agent": "configured/1.0" };
+		mergeExtraHeaders(headers, { "user-agent": "" }, "User-Agent");
+		expect(headers["User-Agent"]).toBe("configured/1.0");
+	});
+});
+
+describe("resolveClientFingerprint UA override", () => {
+	for (const key of ["user-agent", "User-Agent", "USER-AGENT"]) {
+		it(`normalizes an extraHeaders ${key} to a single key`, () => {
+			const { headers } = resolveClientFingerprint({
+				mode: "custom",
+				custom: "NarraFork-Custom/7.7",
+				fallback: getHttpUserAgent(),
+				extraHeaders: { [key]: "override/2.0" },
+			});
+			const uaKeys = Object.keys(headers).filter((k) => k.toLowerCase() === "user-agent");
+			expect(uaKeys).toEqual(["User-Agent"]);
+			expect(headers["User-Agent"]).toBe("override/2.0");
+		});
+	}
 });

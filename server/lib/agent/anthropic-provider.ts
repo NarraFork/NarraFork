@@ -23,6 +23,7 @@ import {
 	CLAUDE_CLI_VERSION,
 	getHttpClaudeCliUserAgent,
 	getHttpUserAgent,
+	mergeExtraHeaders,
 	resolveHttpUserAgent,
 } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
@@ -1015,9 +1016,10 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	private applyExtraHeaders(headers: Record<string, string>): Record<string, string> {
-		for (const [key, value] of Object.entries(this.config.extraHeaders ?? {})) {
-			if (value) headers[key] = value;
-		}
+		// `"user-agent"` is the casing buildRequestHeaders writes above; passing it
+		// keeps an operator override on that one key instead of leaving a second
+		// differently-cased key that fetch would comma-join onto it.
+		mergeExtraHeaders(headers, this.config.extraHeaders, "user-agent");
 		return headers;
 	}
 
