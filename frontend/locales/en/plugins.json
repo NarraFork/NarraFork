@@ -168,7 +168,12 @@
 				"count": "Granted capabilities",
 				"updatedAt": "Last updated",
 				"capabilities": "Capabilities",
-				"empty": "No capabilities granted."
+				"empty": "No capabilities granted.",
+				"pendingTitle": "Pending permission requests",
+				"pendingEmpty": "No pending requests",
+				"approve": "Allow",
+				"deny": "Deny",
+				"pendingHint": "Plugins request capabilities here when they are not yet granted"
 			},
 			"diagnostics": {
 				"title": "Diagnostics",

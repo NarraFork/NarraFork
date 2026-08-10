@@ -6,19 +6,22 @@ import { dirname, join, resolve } from "node:path";
 import { db } from "@server/db";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
-import { eventBus } from "@server/lib/event-bus";
+import { eventBus, type NarraForkEvent } from "@server/lib/event-bus";
 import { generateShortId } from "@server/lib/id";
 import { adaptPluginCapability } from "@server/lib/integrations/capability-adapters";
 import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { type Manifest, pluginIdSchema, safeParseManifest } from "@server/lib/plugins/manifest";
-import type { PermissionGrant } from "@server/lib/plugins/permissions";
+import { permissionScopeSchema, type PermissionGrant, type PermissionScope } from "@server/lib/plugins/permissions";
 import { markExtraSearchChannelsReady } from "@server/lib/search/plugin-source";
 import { normalizeSearchSettings } from "@server/lib/search/settings";
 import { saveSettings, settings } from "@server/lib/settings";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
 import { PLUGIN_RUNTIME_WORKER_FLAG } from "../plugin-runtime-worker";
-import type { PluginPrincipal } from "./plugin-capability-broker";
+import type {
+	PluginPermissionRequestInput,
+	PluginPrincipal,
+} from "./plugin-capability-broker";
 import {
 	PluginCatalog,
 	type PluginCatalogPlugin,
@@ -46,6 +49,7 @@ import {
 	type PermissionGrantInput,
 	type PermissionMutationResult,
 	type PluginPermissionSet,
+	type PluginPermissionRequest,
 	PluginPermissionStore,
 	permissionSummary,
 } from "./plugin-permission-store";
@@ -242,6 +246,7 @@ export interface PluginPermissionRevokeInput {
 	grantedBy: string;
 }
 
+/** Input the capability broker passes when escalating a capability denial into a permission prompt. */
 export interface PluginPermissionMutationResult {
 	status: PluginManagerStatus;
 	permissions: PluginPermissionSet;
@@ -575,6 +580,15 @@ export class PluginManager {
 		this.removeInstalledPackage =
 			options.removeInstalledPackage ?? ((pluginId) => this.removePackageFromDisk(pluginId));
 		this.now = options.now ?? (() => new Date());
+
+		// Inject permission request handler into the capability broker so that
+		// unhandled capability denials can be escalated to an interactive prompt.
+		// The broker accepts onPermissionRequest in its constructor options but the
+		// default shared instance is created without one; we inject it here so the
+		// plugin-manager becomes the single owner of the permission-prompt flow.
+		this.hostServices.capabilityBroker.onPermissionRequest = (
+			input: PluginPermissionRequestInput,
+		) => this.handlePermissionRequest(input);
 	}
 
 	async initialize(): Promise<PluginManagerStatus[]> {
@@ -823,6 +837,104 @@ export class PluginManager {
 			);
 			return this.applyPermissionMutationLocked(pluginId, installationId, mutation);
 		});
+	}
+
+	async listPendingPermissionRequests(pluginId: string): Promise<PluginPermissionRequest[]> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		const installationId = await this.currentInstallationId(pluginId);
+		await this.requireState(pluginId);
+		return this.permissionStore.listPendingRequests(pluginId, installationId);
+	}
+
+	async approvePermissionRequest(
+		pluginId: string,
+		requestId: string,
+		grantedBy: string,
+	): Promise<PermissionMutationResult> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256) {
+			throw new ValidationError("Invalid permission request id");
+		}
+		if (
+			typeof grantedBy !== "string" ||
+			!grantedBy.trim() ||
+			grantedBy.length > 256 ||
+			/[\0\r\n]/u.test(grantedBy)
+		) {
+			throw new ValidationError("Invalid permission actor");
+		}
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			await this.requireState(pluginId);
+			const installationId = await this.currentInstallationId(pluginId);
+			const pending = await this.permissionStore.listPendingRequests(pluginId, installationId);
+			const request = pending.find((req) => req.requestId === requestId);
+			if (!request) throw new NotFoundError("PluginPermissionRequest", requestId);
+			if (request.status !== "pending") {
+				throw new ValidationError(
+					`Permission request ${requestId} has already been ${request.status}`,
+				);
+			}
+
+			const resolved = await this.permissionStore.resolvePendingRequest(
+				pluginId,
+				installationId,
+				requestId,
+				"granted",
+			);
+			if (!resolved) throw new NotFoundError("PluginPermissionRequest", requestId);
+
+			const current = await this.permissionStore.getSet(pluginId, installationId);
+			const mutation = await this.permissionStore.grant(
+				pluginId,
+				installationId,
+				{
+					capability: request.capability,
+					scope: request.scope,
+					grantId: generateShortId(),
+					grantedBy,
+				},
+				{ expectedRevision: current.revision, grantedBy },
+			);
+
+			await this.applyPermissionMutationLocked(pluginId, installationId, mutation);
+
+			eventBus.emit({
+				type: "plugin:permission_resolved",
+				pluginId,
+				requestId,
+				status: "granted",
+			} as NarraForkEvent);
+
+			return mutation;
+		});
+	}
+
+	async denyPermissionRequest(pluginId: string, requestId: string): Promise<boolean> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256) {
+			throw new ValidationError("Invalid permission request id");
+		}
+		const installationId = await this.currentInstallationId(pluginId);
+		await this.requireState(pluginId);
+		const resolved = await this.permissionStore.resolvePendingRequest(
+			pluginId,
+			installationId,
+			requestId,
+			"denied",
+		);
+		if (!resolved) throw new NotFoundError("PluginPermissionRequest", requestId);
+
+		eventBus.emit({
+			type: "plugin:permission_resolved",
+			pluginId,
+			requestId,
+			status: "denied",
+		} as Record<string, unknown> as NarraForkEvent);
+
+		return true;
 	}
 
 	/** Backwards-compatible summary API. New callers should use replacePermissions/revokePermissions. */
@@ -2392,6 +2504,47 @@ export class PluginManager {
 
 	private catalogPlugin(pluginId: string): PluginCatalogPlugin | undefined {
 		return this.catalogSnapshot?.plugins.find((plugin) => plugin.pluginId === pluginId);
+	}
+
+	/**
+	 * Callback injected into the capability broker. When the broker denies a capability
+	 * because no grant exists, it invokes this handler to create a permission prompt rather
+	 * than failing immediately. Returns the pending request id or undefined when the plugin
+	 * state does not permit prompting or the store rejects a duplicate.
+	 */
+	private async handlePermissionRequest(
+		input: PluginPermissionRequestInput,
+	): Promise<{ requestId: string } | undefined> {
+		try {
+			const state = await this.requireState(input.pluginId);
+			if (state.desiredState !== "enabled") return undefined;
+			if (state.runtimeState === "quarantine" || state.runtimeState === "failed") return undefined;
+
+			const parsedScope = permissionScopeSchema.safeParse(input.scope);
+			if (!parsedScope.success) return undefined;
+
+			const req = await this.permissionStore.addPendingRequest(
+				input.pluginId,
+				input.installationId,
+				{
+					capability: input.capability,
+					scope: parsedScope.data,
+					requestedByRuntimeId: input.runtimeId,
+				},
+			);
+
+			eventBus.emit({
+				type: "plugin:permission_request",
+				pluginId: input.pluginId,
+				requestId: req.requestId,
+				capability: input.capability,
+			} as NarraForkEvent);
+
+			return { requestId: req.requestId };
+		} catch (error) {
+			if (error instanceof ValidationError) return undefined;
+			throw error;
+		}
 	}
 
 	private async requireState(pluginId: string): Promise<PluginStateRecord> {

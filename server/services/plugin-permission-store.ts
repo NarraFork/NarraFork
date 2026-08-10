@@ -6,7 +6,7 @@ import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { pluginIdSchema } from "@server/lib/plugins/manifest";
-import { type PermissionGrant, permissionGrantSchema } from "@server/lib/plugins/permissions";
+import { capabilitySchema, type PermissionGrant, permissionGrantSchema, type PermissionScope, permissionScopeSchema } from "@server/lib/plugins/permissions";
 import { z } from "zod";
 import type {
 	PluginGrantSummary,
@@ -18,6 +18,7 @@ const PERMISSION_FILE_VERSION = 1;
 const DEFAULT_MAX_FILE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_GRANTS_PER_INSTALLATION = 512;
 const DEFAULT_MAX_INSTALLATIONS_PER_PLUGIN = 32;
+const DEFAULT_MAX_PENDING_REQUESTS = 20;
 const DEFAULT_MAX_JSON_DEPTH = 16;
 const DEFAULT_MAX_ARRAY_LENGTH = 2_048;
 const DEFAULT_MAX_OBJECT_KEYS = 8_192;
@@ -129,7 +130,20 @@ interface PermissionInstallationDocument {
 	installationId: string;
 	revision: number;
 	grants: StoredPermissionGrant[];
+	/** Runtime permission prompts awaiting user resolution (capability not yet granted). */
+	pendingRequests: PluginPermissionRequest[];
 	updatedAt: string;
+}
+
+/** A capability grant request raised at call time when the capability is not granted. */
+export interface PluginPermissionRequest {
+	requestId: string;
+	capability: string;
+	scope: PermissionScope;
+	requestedAt: string;
+	requestedByRuntimeId?: string;
+	status: "pending" | "granted" | "denied";
+	resolvedAt?: string;
 }
 
 interface PermissionFileDocument {
@@ -296,6 +310,37 @@ function parseStoredGrant(
 	};
 }
 
+function parsePendingRequest(value: unknown): PluginPermissionRequest {
+	if (!isRecord(value)) throw new ValidationError("Pending permission request is invalid");
+	const parsed = capabilitySchema.safeParse(value.capability);
+	if (!parsed.success) throw new ValidationError("Pending permission request capability is invalid");
+	const scopeParsed = permissionScopeSchema.safeParse(value.scope);
+	if (!scopeParsed.success) throw new ValidationError("Pending permission request scope is invalid");
+	if (typeof value.requestId !== "string" || !value.requestId || value.requestId.length > 256)
+		throw new ValidationError("Pending permission request id is invalid");
+	if (!isIsoDate(value.requestedAt))
+		throw new ValidationError("Pending permission request timestamp is invalid");
+	if (value.requestedByRuntimeId !== undefined && typeof value.requestedByRuntimeId !== "string")
+		throw new ValidationError("Pending permission request runtime id is invalid");
+	if (value.status !== "pending" && value.status !== "granted" && value.status !== "denied")
+		throw new ValidationError("Pending permission request status is invalid");
+	if (value.resolvedAt !== undefined) {
+		if (typeof value.resolvedAt !== "string" || !isIsoDate(value.resolvedAt))
+			throw new ValidationError("Pending permission request resolvedAt is invalid");
+	}
+	if (value.status === "pending" && value.resolvedAt !== undefined)
+		throw new ValidationError("Pending permission request cannot have resolvedAt while pending");
+	return {
+		requestId: value.requestId,
+		capability: parsed.data,
+		scope: scopeParsed.data,
+		requestedAt: value.requestedAt,
+		requestedByRuntimeId: value.requestedByRuntimeId,
+		status: value.status,
+		resolvedAt: value.resolvedAt,
+	};
+}
+
 function parseInstallation(
 	pluginId: string,
 	installationId: string,
@@ -321,11 +366,20 @@ function parseInstallation(
 	if (new Set(grants.map((grant) => grant.grantId)).size !== grants.length) {
 		throw new ValidationError("Stored plugin permission grant ids must be unique");
 	}
+	const rawPending = Array.isArray(value.pendingRequests) ? value.pendingRequests : [];
+	if (rawPending.length > limits.maxGrantsPerInstallation) {
+		throw new ValidationError("Stored plugin pending requests list is invalid");
+	}
+	const pendingRequests = rawPending.map((raw) => parsePendingRequest(raw));
+	if (new Set(pendingRequests.map((r) => r.requestId)).size !== pendingRequests.length) {
+		throw new ValidationError("Stored plugin pending request ids must be unique");
+	}
 	return {
 		pluginId,
 		installationId,
 		revision: parsedRevision.data,
 		grants,
+		pendingRequests,
 		updatedAt: value.updatedAt,
 	};
 }
@@ -526,6 +580,7 @@ export class PluginPermissionStore {
 					pluginId,
 					installationId,
 				})),
+				pendingRequests: clone(source?.pendingRequests ?? []),
 				updatedAt,
 			};
 			const candidate = clone(document);
@@ -612,6 +667,7 @@ export class PluginPermissionStore {
 				installationId,
 				revision: nextRevision,
 				grants: normalized.map((grant) => ({ ...grant, revision: nextRevision })),
+				pendingRequests: clone(current?.pendingRequests ?? []),
 				updatedAt: this.timestamp(),
 			};
 			const candidate = clone(this.requireDocument());
@@ -759,6 +815,130 @@ export class PluginPermissionStore {
 	async getDiagnostics(): Promise<PluginPermissionDiagnostic[]> {
 		await this.ensureLoaded();
 		return clone(this.document?.diagnostics ?? []);
+	}
+
+	async listPendingRequests(
+		pluginId: string,
+		installationId: string,
+	): Promise<PluginPermissionRequest[]> {
+		assertPluginIdentity(pluginId, installationId);
+		await this.ensureLoaded();
+		const doc = this.document?.plugins[pluginId]?.[installationId];
+		if (!doc) return [];
+		return clone((doc.pendingRequests ?? []).filter((r) => r.status === "pending"));
+	}
+
+	async addPendingRequest(
+		pluginId: string,
+		installationId: string,
+		input: { capability: string; scope: PermissionScope; requestedByRuntimeId?: string },
+	): Promise<PluginPermissionRequest> {
+		assertPluginIdentity(pluginId, installationId);
+		const capabilityResult = capabilitySchema.safeParse(input.capability);
+		if (!capabilityResult.success) throw new ValidationError("Invalid capability");
+		const scopeResult = permissionScopeSchema.safeParse(input.scope);
+		if (!scopeResult.success) throw new ValidationError("Invalid permission scope");
+
+		return this.mutex.acquire("permissions", async () => {
+			await this.ensureLoadedLocked();
+			const document = this.requireDocument();
+			const doc = document.plugins[pluginId]?.[installationId];
+			const existingRequests: PluginPermissionRequest[] = doc?.pendingRequests ?? [];
+
+			// Idempotent: same capability + scope with pending status → return existing
+			const existing = existingRequests.find(
+				(r) =>
+					r.capability === input.capability &&
+					JSON.stringify(r.scope) === JSON.stringify(input.scope) &&
+					r.status === "pending",
+			);
+			if (existing) return clone(existing);
+
+			// Max pending check
+			const pendingCount = existingRequests.filter((r) => r.status === "pending").length;
+			if (pendingCount >= DEFAULT_MAX_PENDING_REQUESTS) {
+				throw new ValidationError("Too many pending permission requests");
+			}
+
+			const request: PluginPermissionRequest = {
+				requestId: generateShortId(),
+				capability: input.capability,
+				scope: clone(input.scope),
+				requestedAt: this.timestamp(),
+				requestedByRuntimeId: input.requestedByRuntimeId,
+				status: "pending",
+			};
+
+			const candidate = clone(document);
+			candidate.plugins[pluginId] ??= {};
+			const current = candidate.plugins[pluginId]?.[installationId];
+			if (current) {
+				const updated: PermissionInstallationDocument = {
+					...clone(current),
+					pendingRequests: [...(current.pendingRequests ?? []), request],
+					updatedAt: this.timestamp(),
+				};
+				candidate.plugins[pluginId]![installationId] = updated;
+			} else {
+				const revision = this.pluginRevision(pluginId, document);
+				candidate.plugins[pluginId]![installationId] = {
+					pluginId,
+					installationId,
+					revision,
+					grants: [],
+					pendingRequests: [request],
+					updatedAt: this.timestamp(),
+				};
+			}
+			this.assertInstallationCount(candidate, pluginId);
+			candidate.updatedAt = this.timestamp();
+			await this.writeLocked(candidate);
+			this.document = candidate;
+			return clone(request);
+		});
+	}
+
+	async resolvePendingRequest(
+		pluginId: string,
+		installationId: string,
+		requestId: string,
+		status: "granted" | "denied",
+	): Promise<PluginPermissionRequest | undefined> {
+		assertPluginIdentity(pluginId, installationId);
+		if (!identifierSchema.safeParse(requestId).success) throw new ValidationError("Invalid requestId");
+		if (status !== "granted" && status !== "denied") throw new ValidationError("Invalid resolve status");
+
+		return this.mutex.acquire("permissions", async () => {
+			await this.ensureLoadedLocked();
+			const document = this.requireDocument();
+			const doc = document.plugins[pluginId]?.[installationId];
+			if (!doc) return undefined;
+			const requests: PluginPermissionRequest[] = doc.pendingRequests ?? [];
+			const index = requests.findIndex((r) => r.requestId === requestId);
+			if (index === -1) return undefined;
+
+			const resolved: PluginPermissionRequest = {
+				...clone(requests[index]!),
+				status,
+				resolvedAt: this.timestamp(),
+			};
+
+			const candidate = clone(document);
+			const current = candidate.plugins[pluginId]?.[installationId];
+			if (!current) return undefined;
+			const nextRequests = [...(current.pendingRequests ?? [])];
+			nextRequests[index] = resolved;
+			const updated: PermissionInstallationDocument = {
+				...clone(current),
+				pendingRequests: nextRequests,
+				updatedAt: this.timestamp(),
+			};
+			candidate.plugins[pluginId]![installationId] = updated;
+			candidate.updatedAt = this.timestamp();
+			await this.writeLocked(candidate);
+			this.document = candidate;
+			return clone(resolved);
+		});
 	}
 
 	private normalizeInput(

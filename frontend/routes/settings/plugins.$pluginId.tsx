@@ -17,11 +17,13 @@ import {
 import {
 	IconAlertCircle,
 	IconArrowLeft,
+	IconCheck,
 	IconPlayerPlay,
 	IconPlugConnected,
 	IconPlugConnectedX,
 	IconRefresh,
 	IconTrash,
+	IconX,
 } from "@tabler/icons-react";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
@@ -45,6 +47,7 @@ import {
 import type { PluginDetail, PluginPermissionSet } from "../../lib/api/plugins";
 import { pluginsApi } from "../../lib/api/plugins";
 import { formatLocaleDateTime } from "../../lib/intl-format";
+import { usePluginPermissionRequests } from "../../hooks/usePluginPermissionRequests";
 
 export const Route = createFileRoute("/settings/plugins/$pluginId")({
 	component: SettingsPluginDetailPage,
@@ -261,6 +264,38 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 		}
 	};
 
+	const {
+		requests: pendingRequests,
+		loading: pendingLoading,
+		refresh: refreshPending,
+	} = usePluginPermissionRequests(plugin.pluginId);
+
+	const approvePending = async (requestId: string) => {
+		setBusy(true);
+		try {
+			await pluginsApi.approveGrantRequest(plugin.pluginId, requestId);
+			await refreshPending();
+			await load();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
+	const denyPending = async (requestId: string) => {
+		setBusy(true);
+		try {
+			await pluginsApi.denyGrantRequest(plugin.pluginId, requestId);
+			await refreshPending();
+			await load();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
 	return (
 		<Stack gap="md">
 			{error && (
@@ -316,6 +351,60 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 						<Button size="xs" onClick={() => void addGrant()} disabled={busy || !newCapability.trim()}>
 							{t("admin.detail.grants.addSubmit")}
 						</Button>
+					</Stack>
+				</Paper>
+			)}
+			{pendingRequests.length > 0 && (
+				<Paper withBorder p="md" radius="md">
+					<Stack gap="xs">
+						<Group gap="xs" align="center">
+							<Text fw={600} size="sm">
+								{t("admin.detail.grants.pendingTitle")}
+							</Text>
+							<Badge color="orange" variant="filled" size="sm">
+								{pendingRequests.length}
+							</Badge>
+						</Group>
+						{pendingRequests.map((req) => (
+							<Paper key={req.requestId} withBorder p="xs" radius="md">
+								<Group justify="space-between" wrap="nowrap">
+									<Group gap="sm" wrap="wrap">
+										<Badge color="indigo" variant="light" size="sm">
+											{req.capability}
+										</Badge>
+										<Badge color="gray" variant="light" size="sm">
+											{req.scope.type}
+											{req.scope.id ? `:${req.scope.id}` : ""}
+										</Badge>
+										<Text size="xs" c="dimmed">
+											{formatLocaleDateTime(req.requestedAt)}
+										</Text>
+									</Group>
+									<Group gap="xs" wrap="nowrap">
+										<Button
+											size="compact-xs"
+											variant="light"
+											color="green"
+											leftSection={<IconCheck size={14} />}
+											onClick={() => void approvePending(req.requestId)}
+											disabled={busy}
+										>
+											{t("admin.detail.grants.approve")}
+										</Button>
+										<Button
+											size="compact-xs"
+											variant="light"
+											color="red"
+											leftSection={<IconX size={14} />}
+											onClick={() => void denyPending(req.requestId)}
+											disabled={busy}
+										>
+											{t("admin.detail.grants.deny")}
+										</Button>
+									</Group>
+								</Group>
+							</Paper>
+						))}
 					</Stack>
 				</Paper>
 			)}

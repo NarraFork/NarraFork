@@ -163,6 +163,13 @@ export type NarraForkEvent =
 	  }
 	| { type: "narrator:warning"; narratorId: string; message: string }
 	| { type: "narrator:permission_request"; narratorId: string; requestId: string }
+	| { type: "plugin:permission_request"; pluginId: string; requestId: string; capability: string }
+	| {
+			type: "plugin:permission_resolved";
+			pluginId: string;
+			requestId: string;
+			status: "granted" | "denied";
+	  }
 	/**
 	 * A tool call reached a terminal state. Carries only bounded metadata (never the tool input or
 	 * output), so it is safe to surface to external integrations that must show execution progress

@@ -105,6 +105,16 @@ export interface PluginPermissionMutationResponse {
 	permissions?: PluginPermissionSet;
 }
 
+export interface PluginPermissionRequestSummary {
+	requestId: string;
+	capability: string;
+	scope: { type: string; id?: string };
+	requestedAt: string;
+	requestedByRuntimeId?: string;
+	status: "pending" | "granted" | "denied";
+	resolvedAt?: string;
+}
+
 export interface PluginRuntimeDiagnostics {
 	runtimeId?: string;
 	generation?: number;
@@ -372,6 +382,23 @@ export const pluginsApi = {
 			method: "POST",
 			body: JSON.stringify(body),
 		}),
+	/** List pending runtime permission requests for a plugin (admin). */
+	listPendingGrants: (pluginId: string) =>
+		request<{ requests: PluginPermissionRequestSummary[] }>(
+			`${pluginPath(pluginId)}/grants/pending`,
+		),
+	/** Approve a pending runtime permission request (admin). */
+	approveGrantRequest: (pluginId: string, requestId: string) =>
+		request<unknown>(
+			`${pluginPath(pluginId)}/grants/requests/${encodeURIComponent(requestId)}/approve`,
+			{ method: "POST" },
+		),
+	/** Deny a pending runtime permission request (admin). */
+	denyGrantRequest: (pluginId: string, requestId: string) =>
+		request<{ denied: boolean }>(
+			`${pluginPath(pluginId)}/grants/requests/${encodeURIComponent(requestId)}/deny`,
+			{ method: "POST" },
+		),
 };
 
 /** Normalize the list payload (server may return a bare array or an envelope). */

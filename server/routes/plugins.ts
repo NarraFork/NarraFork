@@ -7,6 +7,7 @@ import { AppError, NotFoundError, ValidationError, zodValidationError } from "..
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { pluginIdSchema } from "../lib/plugins/manifest";
 import { permissionGrantSchema } from "../lib/plugins/permissions";
+import type { PluginPermissionRequest } from "../services/plugin-permission-store";
 import type { JsonValue } from "../lib/plugins/protocol";
 import { settings } from "../lib/settings";
 import type { ProxyOverride } from "../lib/settings/types";
@@ -32,6 +33,13 @@ export interface PluginManager {
 	getPermissions?(pluginId: string): Promise<unknown> | unknown;
 	replacePermissions?(pluginId: string, input: unknown): Promise<unknown> | unknown;
 	revokePermissions?(pluginId: string, input: unknown): Promise<unknown> | unknown;
+	listPendingPermissionRequests?(pluginId: string): Promise<PluginPermissionRequest[]>;
+	approvePermissionRequest?(
+		pluginId: string,
+		requestId: string,
+		grantedBy: string,
+	): Promise<unknown>;
+	denyPermissionRequest?(pluginId: string, requestId: string): Promise<boolean>;
 	install(source: string | File | Uint8Array): Promise<unknown>;
 	enable(pluginId: string): Promise<unknown>;
 	disable(pluginId: string): Promise<unknown>;
@@ -868,6 +876,80 @@ export function createPluginRoutes(
 				status: sanitizeSummary(result.status),
 				permissions: sanitizePermissionSet(result.permissions),
 			});
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.get("/:pluginId/grants/pending", admin, async (c) => {
+		try {
+			const pluginId = parsePluginId(c);
+			if (!manager.listPendingPermissionRequests) {
+				throw new AppError(
+					"Plugin permission management is unavailable",
+					501,
+					"NOT_IMPLEMENTED",
+				);
+			}
+			const requests = await manager.listPendingPermissionRequests(pluginId);
+			return c.json({ requests });
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.post("/:pluginId/grants/requests/:requestId/approve", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			if (!manager.approvePermissionRequest) {
+				throw new AppError(
+					"Plugin permission management is unavailable",
+					501,
+					"NOT_IMPLEMENTED",
+				);
+			}
+			const pluginId = parsePluginId(c);
+			const requestId = c.req.param("requestId");
+			const parsed = z.string().trim().min(1).max(256).safeParse(requestId);
+			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			const grantedBy = adminActor(c);
+			const mutation = await manager.approvePermissionRequest(
+				pluginId,
+				requestId,
+				grantedBy,
+			);
+			if (!mutation || typeof mutation !== "object" || Array.isArray(mutation)) {
+				return c.json(sanitizeSummary(mutation));
+			}
+			const result = mutation as Record<string, unknown>;
+			return c.json({
+				status: sanitizeSummary(result.status),
+				permissions: sanitizePermissionSet(result.permissions),
+			});
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.post("/:pluginId/grants/requests/:requestId/deny", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			if (!manager.denyPermissionRequest) {
+				throw new AppError(
+					"Plugin permission management is unavailable",
+					501,
+					"NOT_IMPLEMENTED",
+				);
+			}
+			const pluginId = parsePluginId(c);
+			const requestId = c.req.param("requestId");
+			const parsed = z.string().trim().min(1).max(256).safeParse(requestId);
+			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			const denied = await manager.denyPermissionRequest(pluginId, requestId);
+			if (!denied) {
+				throw new NotFoundError("Permission request", requestId);
+			}
+			return c.json({ denied: true });
 		} catch (error) {
 			return errorResponse(c, error);
 		}
