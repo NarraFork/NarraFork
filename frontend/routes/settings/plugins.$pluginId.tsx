@@ -21,6 +21,7 @@ import {
 	IconPlayerPlay,
 	IconPlugConnected,
 	IconPlugConnectedX,
+	IconPlus,
 	IconRefresh,
 	IconTrash,
 	IconX,
@@ -296,6 +297,33 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 		}
 	};
 
+	// Declared manifest capabilities that still lack a grant — the visible approval
+	// channel for "plugin needs this capability" without waiting for a runtime request.
+	const declared = plugin.manifest?.permissions?.host ?? [];
+	const ungranted = Array.from(
+		new Set(declared.filter((capability) => !set?.grants.some((g) => g.capability === capability))),
+	);
+
+	const grantDeclaredCapability = async (capability: string) => {
+		if (!set) return;
+		setBusy(true);
+		try {
+			const existing = set.grants.map((grant) => ({
+				capability: grant.capability,
+				scope: grant.scope,
+			}));
+			await pluginsApi.replaceGrants(plugin.pluginId, {
+				expectedRevision: set.revision,
+				grants: [...existing, { capability, scope: { type: "global" } }],
+			});
+			await load();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
 	return (
 		<Stack gap="md">
 			{error && (
@@ -474,6 +502,34 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 					</Stack>
 				)}
 			</div>
+			{ungranted.length > 0 && (
+				<div>
+					<Text fw={600} size="sm" mb="xs">
+						{t("admin.detail.grants.ungrantedTitle")}
+					</Text>
+					<Stack gap="xs">
+						{ungranted.map((capability) => (
+							<Paper key={capability} withBorder p="xs" radius="md">
+								<Group justify="space-between" wrap="nowrap">
+									<Badge color="orange" variant="light" size="sm">
+										{capability}
+									</Badge>
+									<Button
+										size="compact-xs"
+										variant="light"
+										color="green"
+										leftSection={<IconPlus size={14} />}
+										disabled={busy}
+										onClick={() => void grantDeclaredCapability(capability)}
+									>
+										{t("admin.detail.grants.ungrantedGrant")}
+									</Button>
+								</Group>
+							</Paper>
+						))}
+					</Stack>
+				</div>
+			)}
 		</Stack>
 	);
 }

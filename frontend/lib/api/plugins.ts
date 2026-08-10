@@ -163,6 +163,9 @@ export interface PluginDetail extends PluginSummary {
 	packages?: Array<PluginPackageRef & { status?: string; isCurrent?: boolean }>;
 	runtime?: PluginRuntimeDiagnostics;
 	generatedAt?: string;
+	/** Declared host capabilities (names only), used by the grants panel to show
+	 * which declared capabilities still lack a grant. */
+	manifest?: { permissions?: { host?: string[] } };
 }
 
 export interface PluginStatusEnvelope extends PluginDetail {

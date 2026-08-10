@@ -348,8 +348,11 @@ function effectiveGrants(
 	manifestRequested: readonly string[],
 	grants: readonly StoredPermissionGrant[],
 ): StoredPermissionGrant[] {
-	const requested = new Set(manifestRequested);
-	return grants.filter((grant) => requested.has(grant.capability));
+	// Kept as an explicit no-op passthrough: the manifest only *requests* capabilities;
+	// the grant list is the authoritative allow set. Admin-approved runtime grants must
+	// survive rebinding even when the manifest did not declare them.
+	void manifestRequested;
+	return [...grants];
 }
 
 function storageScopeFromParams(params: unknown): PluginStorageScope {
@@ -477,13 +480,23 @@ export class PluginHostServices {
 		const selectedGrants = effectiveGrants(input.manifestRequested, input.grants);
 		const capabilities = uniqueStrings(selectedGrants.map((grant) => grant.capability));
 		const brokerGrants = selectedGrants.map(baseGrant);
+		// `manifestRequested` is extended with the granted capability set: a capability the
+		// administrator approved at runtime (via the permission-request flow) may not be
+		// declared in the manifest, but it must still be visible to the broker's
+		// `effectiveCapabilities` reporting and to `capabilityDenialReason`. Filtering the
+		// grants by the manifest here would silently undo an approval — the plugin would
+		// keep getting CAPABILITY_NOT_GRANTED and keep re-raising the same pending request.
+		const manifestRequested = uniqueStrings([
+			...input.manifestRequested,
+			...capabilities,
+		]);
 		const binding: PluginCapabilityBindingInput = {
 			plugin,
 			desiredState: input.desiredState,
 			compatibilityState: input.compatibilityState,
 			runtimeState: input.runtimeState as never,
 			runtimeGeneration: input.runtimeGeneration,
-			manifestRequested: uniqueStrings(input.manifestRequested),
+			manifestRequested,
 			installationGrants: brokerGrants,
 			hostPolicy: capabilities,
 			currentUserAuthority: capabilities,

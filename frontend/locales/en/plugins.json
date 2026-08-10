@@ -173,7 +173,10 @@
 				"pendingEmpty": "No pending requests",
 				"approve": "Allow",
 				"deny": "Deny",
-				"pendingHint": "Plugins request capabilities here when they are not yet granted"
+				"pendingHint": "Plugins request capabilities here when they are not yet granted",
+				"ungrantedTitle": "Not granted yet",
+				"ungrantedEmpty": "All declared capabilities are granted.",
+				"ungrantedGrant": "Grant"
 			},
 			"diagnostics": {
 				"title": "Diagnostics",

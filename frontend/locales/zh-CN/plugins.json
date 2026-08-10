@@ -173,7 +173,10 @@
 				"pendingEmpty": "暂无待授权请求",
 				"approve": "允许",
 				"deny": "拒绝",
-				"pendingHint": "插件调用未授权能力时在此请求授权"
+				"pendingHint": "插件调用未授权能力时在此请求授权",
+				"ungrantedTitle": "尚未授权",
+				"ungrantedEmpty": "manifest 声明的能力均已授权。",
+				"ungrantedGrant": "授权"
 			},
 			"diagnostics": {
 				"title": "诊断",

@@ -452,6 +452,25 @@ function sanitizeSummary(value: unknown): RouteResult {
 		result.lastError = sanitizeDiagnostic(item.lastError);
 	if (item.stderr !== undefined) result.stderrSummary = sanitizeText(item.stderr);
 	if (item.stderrSummary !== undefined) result.stderrSummary = sanitizeText(item.stderrSummary);
+	// The manifest's *declared* host capabilities are exposed by name only (bounded,
+	// same sensitivity as the contribution list). The grants panel uses them to show
+	// which declared capabilities still lack a grant and offer a one-click approval.
+	if (item.manifest && typeof item.manifest === "object" && !Array.isArray(item.manifest)) {
+		const manifest = item.manifest as Record<string, unknown>;
+		const permissions = manifest.permissions;
+		if (permissions && typeof permissions === "object" && !Array.isArray(permissions)) {
+			const host = (permissions as Record<string, unknown>).host;
+			if (Array.isArray(host)) {
+				const names = host
+					.filter(
+						(name): name is string =>
+							typeof name === "string" && name.length > 0 && name.length <= 256,
+					)
+					.slice(0, 200);
+				if (names.length > 0) result.manifest = { permissions: { host: names } };
+			}
+		}
+	}
 	return result;
 }
 

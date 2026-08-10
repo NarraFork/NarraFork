@@ -237,9 +237,11 @@ function createUiCapabilityBinding(
 ): PluginCapabilityBindingInput {
 	const requested = [...(manifest.permissions?.host ?? [])];
 	const granted = new Set(permissions.grants.map((grant) => grant.capability));
-	const effective = requested.filter((capability): capability is Capability =>
-		granted.has(capability as Capability),
-	);
+	// UI sessions see every granted capability, including runtime-approved ones the
+	// manifest did not declare — consistent with `plugin-host-services.ts` binding.
+	const effective = permissions.grants
+		.map((grant) => grant.capability)
+		.filter((capability): capability is Capability => granted.has(capability));
 	return {
 		plugin: {
 			pluginId: principal.pluginId,
