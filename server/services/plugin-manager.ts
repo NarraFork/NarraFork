@@ -16,6 +16,7 @@ import { markExtraSearchChannelsReady } from "@server/lib/search/plugin-source";
 import { normalizeSearchSettings } from "@server/lib/search/settings";
 import { saveSettings, settings } from "@server/lib/settings";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
+import { PLUGIN_RUNTIME_WORKER_FLAG } from "../plugin-runtime-worker";
 import type { PluginPrincipal } from "./plugin-capability-broker";
 import {
 	PluginCatalog,
@@ -1775,9 +1776,27 @@ export class PluginManager {
 				allowUnboundedResourceUsage: process.platform === "win32",
 			});
 			switch (context.manifest.engine.runtime) {
-				case "bun":
-					command = [this.resolveBunExecutable(), entryPath, ...server.args];
+				case "bun": {
+					// Self-hosted plugin runtime: a compiled binary embeds the Bun
+					// runtime, so spawn *ourselves* in plugin-runtime-worker mode
+					// instead of requiring a system Bun (which is a recurring
+					// Windows pain point and previously fell back to spawning the
+					// host binary → instance lock conflict → QUARANTINED). Dev
+					// mode (host runs under Bun) keeps spawning bun directly.
+					const compiledBinary =
+						import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
+					if (compiledBinary) {
+						command = [
+							process.execPath,
+							PLUGIN_RUNTIME_WORKER_FLAG,
+							entryPath,
+							...server.args,
+						];
+					} else {
+						command = [this.resolveBunExecutable(), entryPath, ...server.args];
+					}
 					break;
+				}
 				case "node":
 					command = ["node", entryPath, ...server.args];
 					break;
