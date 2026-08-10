@@ -1083,4 +1083,71 @@ describe("PluginManager", () => {
 		expect(upgraded.installationId).toBe(migrated.installationId);
 		expect(upgraded.grants.map((g) => g.capability)).toContain("diagnostics.readOwnLogs");
 	});
+
+	test("re-seeds declared grants on enable when the persisted summary is empty", async () => {
+		const root = await makeTempRoot();
+		const storeRoot = join(root, "plugins");
+		const pluginId = "com.example.reseed-on-enable";
+		const supervisor = new FakeSupervisor();
+		const stateStore = new PluginStateStore(storeRoot);
+		const permissionStore = new PluginPermissionStore({ root: storeRoot, stateStore });
+		const capabilityBroker = new CapabilityBroker();
+		const hostServices = new PluginHostServices({ capabilityBroker, permissionStore });
+		const platform = createPluginPlatformServices({
+			runtimeSupervisor: supervisor as never,
+			stateStore,
+			permissionStore,
+			capabilityBroker,
+			hostServices,
+		});
+		const manager = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			stateStore,
+			permissionStore,
+			hostServices,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: async (context) => ({
+				pluginId: context.pluginId,
+				pluginVersion: context.manifest.version,
+				packageDigest: context.package.hash,
+				command: ["fake-runtime"],
+				cwd: context.packagePath,
+				dispatcher: new PluginHostDispatcher({
+					identity: {
+						pluginId,
+						runtimeId: "reseed-runtime",
+						runtimeGeneration: 0,
+					},
+					methods: {},
+				}),
+			}),
+			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
+			restorePluginLifecycle: platform.restorePlugin,
+		});
+		await manager.initialize();
+		const source = await makePackage(root, pluginId, (manifest) => {
+			(manifest.permissions as Record<string, unknown>).host = [
+				"diagnostics.readOwnLogs",
+				"query.read.projects",
+			];
+		});
+		await manager.install(source);
+
+		// Simulate a legacy/restored state whose grant summary was lost: the
+		// enable path must re-seed the manifest-declared capabilities instead of
+		// binding an empty permission set.
+		await stateStore.updateState(pluginId, (current) => ({
+			...current,
+			grants: { count: 0, capabilities: [], revision: 0 },
+		}));
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+
+		const permissions = await manager.getPermissions(pluginId);
+		expect(permissions.grants.map((grant) => grant.capability).sort()).toEqual([
+			"diagnostics.readOwnLogs",
+			"query.read.projects",
+		]);
+	});
 });

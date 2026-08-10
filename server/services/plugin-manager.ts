@@ -1590,7 +1590,9 @@ export class PluginManager {
 		const permissions = await this.integrationAuthorityService.ensureInstallation(
 			context.pluginId,
 			installationId,
-			context.state.grants,
+			seedGrantsFromManifest(context.state.grants, context.manifest.permissions.host, {
+				pluginId: context.pluginId,
+			}),
 		);
 		await this.syncPermissionSummary(context.pluginId, permissions);
 		const input: PluginHostRuntimeBindingInput = {
@@ -1632,7 +1634,7 @@ export class PluginManager {
 		const permissions = await this.integrationAuthorityService.ensureInstallation(
 			pluginId,
 			installationId,
-			state.grants,
+			seedGrantsFromManifest(state.grants, manifest.permissions.host, { pluginId }),
 		);
 		await this.syncPermissionSummary(pluginId, permissions);
 		return this.hostServices.bindRuntime({
