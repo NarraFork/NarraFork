@@ -327,6 +327,35 @@ function parsePorcelainStatusZ(
 	return entries;
 }
 
+/**
+ * `git status --porcelain` arguments that list untracked files INDIVIDUALLY.
+ *
+ * ── The bug this closes ──────────────────────────────────────────────────────
+ * By default git COLLAPSES an untracked directory into a single entry with a
+ * trailing slash: a brand-new `src/feature/` holding three files is reported as
+ * one line, `?? src/feature/`. That is a display convenience for the terminal,
+ * and it is actively wrong for every consumer we have:
+ *   - the panel's file tree splits on "/" and drops the trailing empty segment,
+ *     so `src/feature/` became a FILE row named `feature` wearing an `A` badge,
+ *     and the files inside it were nowhere at all;
+ *   - `copyDirtyFiles` called `Bun.file()` on that path, which cannot read a
+ *     directory, so a review worktree silently lost the whole new folder.
+ * Both are the same root cause: a directory entry pretending to be a file.
+ *
+ * `-uall` makes git do the expansion itself, which is the only place it can be
+ * done correctly — walking the directory in our own code would re-implement
+ * gitignore semantics, and getting those subtly wrong is how ignored build
+ * output ends up in a reviewer's diff.
+ *
+ * COST: on a repo with a huge untracked directory (a stray `node_modules`,
+ * a build output folder that is not ignored) this enumerates every file instead
+ * of one line. That is bounded where it matters — `files` is capped at
+ * `MAX_FILES`, and the untracked line-count scan has its own cap — and it is the
+ * honest number: those files ARE uncommitted, and the old single line simply hid
+ * how many.
+ */
+const PORCELAIN_UNTRACKED_ALL = ["status", "--porcelain", "-uall"];
+
 export const gitService = {
 	async getCurrentBranch(repoPath: string): Promise<string> {
 		const result = await execRead(["rev-parse", "--abbrev-ref", "HEAD"], repoPath);
@@ -689,7 +718,10 @@ export const gitService = {
 	},
 
 	async getStatus(worktreePath: string): Promise<string> {
-		const result = await execRead(["status", "--porcelain"], worktreePath);
+		// `-uall`: untracked directories are expanded to their files. A consumer
+		// that receives `?? newdir/` cannot tell a directory from a file, and every
+		// one of ours treats it as a file. See PORCELAIN_UNTRACKED_ALL.
+		const result = await execRead(PORCELAIN_UNTRACKED_ALL, worktreePath);
 		return result.stdout;
 	},
 
@@ -718,7 +750,7 @@ export const gitService = {
 			unstagedNumstat,
 			untrackedResult,
 		] = await Promise.all([
-			execRead(["status", "--porcelain", "-z"], worktreePath),
+			execRead([...PORCELAIN_UNTRACKED_ALL, "-z"], worktreePath),
 			execRead(["rev-parse", "HEAD"], worktreePath),
 			execRead(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath),
 			execRead(["diff", "--cached", "--numstat", "-z"], worktreePath, true),
@@ -1184,7 +1216,14 @@ export const gitService = {
 	async discardFiles(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
 		return withWorktreeLock(worktreePath, async () => {
-			const statusResult = await execRead(["status", "--porcelain", "--", ...files], worktreePath);
+			// `-uall` is a SAFETY requirement here, not just a display one. Collapsed
+			// output would report `?? newdir/` for a request to discard
+			// `newdir/one.txt`, and the `git clean` below would then delete the entire
+			// directory — every sibling the user never asked to touch.
+			const statusResult = await execRead(
+				[...PORCELAIN_UNTRACKED_ALL, "--", ...files],
+				worktreePath,
+			);
 			const tracked: string[] = [];
 			const untracked: string[] = [];
 			for (const line of statusResult.stdout.split("\n").filter(Boolean)) {
@@ -1272,9 +1311,10 @@ export const gitService = {
 		staged = false,
 		maxBytes = 200_000,
 	): Promise<{ diff: string; truncated: boolean }> {
-		// Check if file is untracked
+		// Check if file is untracked. `-uall` so a file inside a brand-new directory
+		// is reported as itself rather than as its collapsed parent directory.
 		const statusResult = await execRead(
-			["status", "--porcelain", "--", filePath],
+			[...PORCELAIN_UNTRACKED_ALL, "--", filePath],
 			worktreePath,
 			true,
 		);
