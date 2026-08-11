@@ -103,8 +103,11 @@ describe.each([
 		expect(req.headers["x-app"]).toBe("cli");
 		expect(req.headers["x-claude-code-session-id"]).toBeTruthy();
 		expect(req.headers["anthropic-dangerous-direct-browser-access"]).toBe("true");
-		// The CLI sends no per-request id header on these calls, so neither do we.
-		expect(req.headers["x-client-request-id"]).toBeUndefined();
+		// The CLI mints a UUID per official-API attempt and sends it here too — the
+		// side-query path goes through the same `ZGp` header builder as chat.
+		expect(req.headers["x-client-request-id"]).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+		);
 		expect(req.headers["user-agent"]).toContain("claude-cli/");
 
 		// Stainless SDK headers.

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
 	claudeVersionAtLeast,
@@ -64,20 +65,50 @@ const WEB_SEARCH_MAX_USES = 8;
 const WEB_SEARCH_MAX_TOKENS = 8192;
 
 /**
- * Official Claude Code chat beta flags, in the order the CLI sends them.
+ * Official Claude Code chat beta flags, in the order the CLI emits them.
  *
- * Transcribed from captured claude-cli traffic (2.1.193 and 2.1.220; the list is
- * identical across both apart from `fallback-credit`, added in 2.1.220).
+ * Derived from `claude-cli` 2.1.227's own beta assembly (`KHS` → `ehr` → the
+ * per-request pushes in the query builder), not from a single capture: the CLI
+ * decides each flag PER MODEL, so a fixed string necessarily claims betas the
+ * real client would not send for the model in hand. Each entry below repeats
+ * the upstream predicate it is gated on.
  *
- * Two flags the CLI sends are omitted deliberately, because they gate features
- * NarraFork never exercises and a strict relay should not be told about
- * capabilities we do not use:
- *   - `advisor-tool-2026-03-01`
- *   - `structured-outputs-2025-12-15` (the CLI itself only sends this one on
- *     requests that carry an `output_config.format` JSON schema)
+ * Flags the CLI can also send but NarraFork never earns are omitted, because a
+ * beta declares a capability the client must actually implement:
+ *   - `oauth-2025-04-20` — only for OAuth-token auth.
+ *   - `advanced-tool-use-2025-11-20` / `tool-search-tool-2025-10-19` — tool search.
+ *   - `structured-outputs-2025-12-15` — only with an `output_config.format` schema.
+ *   - `advisor-tool-2026-03-01`, `fast-mode-2026-02-01`, `afk-mode-2026-01-31`,
+ *     `extended-cache-ttl-2025-04-11`, `prompt-caching-evict-2026-05-12`,
+ *     `cache-diagnosis-2026-04-07`, `context-hint-2026-04-09`,
+ *     `task-budgets-2026-03-13`, `per-turn-control-2026-07-01` — feature-gated.
+ *   - `fallback-credit-2026-06-01` — upstream pushes it only once the
+ *     fallback-credit lane is armed (`Bqd`), i.e. after a server-side fallback
+ *     minted a credit token this client would have to echo back. NarraFork
+ *     never mints or echoes one, so declaring it described a lane we cannot use.
  */
-const ANTHROPIC_BETA_FLAGS =
-	"claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01";
+function buildAnthropicBetaFlags(model: string): string {
+	const flags: string[] = [];
+	// `!r.includes("haiku")` — upstream never claims the Claude Code beta on Haiku.
+	if (!/haiku/i.test(model)) flags.push("claude-code-20250219");
+	// `eE(e)` / `Xti(e)` — only for models whose 1M window NarraFork actually uses,
+	// so the declared beta and getAnthropicEffectiveContextWindow cannot disagree.
+	if (supportsAnthropic1mContext(model)) flags.push("context-1m-2025-08-07");
+	// `yRn(e)` / `VHS(e)` exclude only the Claude 3 family on a first-party
+	// backend, which is outside the supported version range.
+	flags.push("interleaved-thinking-2025-05-14");
+	flags.push("redact-thinking-2026-02-12");
+	flags.push("thinking-token-count-2026-05-13");
+	flags.push("context-management-2025-06-27");
+	// `_mr` — pushed for every first-party request.
+	flags.push("prompt-caching-scope-2026-01-05");
+	// `mRn(e)` — see supportsMidConversationSystem (Opus 4.7 is excluded).
+	if (supportsMidConversationSystem(model)) flags.push("mid-conversation-system-2026-04-07");
+	// `EZb` — pushed only for models that accept `output_config.effort`, which now
+	// means only the user's own blocklist can withhold it.
+	if (supportsEffort(model)) flags.push("effort-2025-11-24");
+	return flags.join(",");
+}
 
 /**
  * Minimal beta flags for non-official Anthropic-compatible relays.
@@ -153,18 +184,28 @@ const CC_CLI_VERSION = CLAUDE_CLI_VERSION;
 /**
  * Build the billing block that opens the official system array.
  *
- * Format (captured from claude-cli/2.1.193):
- *   `x-anthropic-billing-header: cc_version={version}.{fingerprint}; cc_entrypoint=cli;`
+ * Format, transcribed from `claude-cli` 2.1.227's `Oyo`:
+ *   `x-anthropic-billing-header: cc_version={version}.{fingerprint}; cc_entrypoint=cli; cch=00000;`
  *
  * The fingerprint is derived from the first *user-authored* text of the
  * conversation, so it is stable for a given conversation but differs between
- * conversations. Older Claude Code releases also appended `cch=` and
- * `cc_workload=`; 2.1.193 sends neither, and a `cch` that changes per request
- * would additionally invalidate the cached system prefix on every turn.
+ * conversations.
+ *
+ * `cch=00000;` is appended whenever the backend is first-party AND the base URL
+ * is `api.anthropic.com` — exactly the official-API case. It is a LITERAL, not a
+ * per-request hash, so it costs nothing in cache stability: the whole block stays
+ * byte-identical across every turn of a conversation. Earlier NarraFork releases
+ * dropped it on the theory that it varied per request; the upstream source shows
+ * the only value it ever takes is `00000`.
+ *
+ * Still omitted, because each is conditional on state NarraFork does not have:
+ * `cc_workload=` (a workload id), `cc_is_subagent=true` (upstream's own subagent
+ * context object), `cc_prev_req=` and `cc_prompt_id=` (upstream request/prompt
+ * ids from the previous turn).
  */
 function buildBillingBlock(messages: AnthropicMessage[]): string {
 	const fingerprint = computeFingerprint(firstUserAuthoredText(messages), CC_CLI_VERSION);
-	return `x-anthropic-billing-header: cc_version=${CC_CLI_VERSION}.${fingerprint}; cc_entrypoint=cli;`;
+	return `x-anthropic-billing-header: cc_version=${CC_CLI_VERSION}.${fingerprint}; cc_entrypoint=cli; cch=00000;`;
 }
 
 /**
@@ -348,15 +389,15 @@ const OFFICIAL_CONTEXT_MANAGEMENT: AnthropicContextManagement = {
 const atLeastVersion = claudeVersionAtLeast;
 
 /**
- * Whether a model supports extended thinking (Claude 3.7 Sonnet, Claude 4+
- * families including the 5 series, Fable/Mythos, DeepSeek).
+ * Whether a model supports extended thinking.
+ *
+ * Support scope starts at Claude 4.7, so the pre-4 generations are simply out:
+ * Claude 3.7's budgeted-thinking special case used to live here and is gone with
+ * the rest of the ≤4.6 compatibility surface.
  */
 export function supportsThinking(model: string): boolean {
 	// DeepSeek models support thinking mode via Anthropic-compatible API
 	if (isDeepSeekModel(model)) return true;
-	// Claude 3.7 Sonnet
-	const lower = model.toLowerCase();
-	if (lower.includes("3-7") || lower.includes("3.7")) return true;
 	const parsed = parseClaudeModel(model);
 	if (!parsed) return false;
 	// Fable/Mythos have no pre-4 generation, so any parsed version qualifies.
@@ -378,6 +419,42 @@ export function supportsThinking(model: string): boolean {
  */
 export function supportsEffort(model: string): boolean {
 	return modelAcceptsReasoningEffort(model, getReasoningEffortBlocklist());
+}
+
+/**
+ * Whether a model accepts a `temperature`.
+ *
+ * `claude-cli` 2.1.227's `wHo` lists the models that DO take it — `claude-3-*`
+ * and the 4.0–4.6 generations — and returns false for everything else. Every
+ * in-scope Claude (4.7 and newer, plus the Fable/Mythos series) is therefore on
+ * the rejecting side, so the parameter is never sent for a recognised Claude id.
+ *
+ * An unparseable id keeps the parameter: generic Anthropic-compatible relays
+ * (GLM, Kimi, ...) expect a normal Messages body, and dropping `temperature`
+ * there would change behaviour for models this rule says nothing about.
+ */
+function acceptsTemperature(model: string): boolean {
+	return parseClaudeModel(model) == null;
+}
+
+/**
+ * Whether a model accepts mid-conversation `role: "system"` messages, i.e.
+ * whether the `mid-conversation-system-2026-04-07` beta may be declared.
+ *
+ * Mirrors `claude-cli` 2.1.227's `qHS`, which leaves Opus 4.8+, Sonnet 5+,
+ * Haiku 5+ and Fable/Mythos on the supported side. Opus 4.7 is the one in-scope
+ * exclusion, so this gate cannot collapse into "is this a modern Claude".
+ *
+ * This is not just a header decision: when the beta is absent upstream stops
+ * emitting `api_system` turns altogether, so the caller must downgrade those
+ * messages instead (see `chat`).
+ */
+function supportsMidConversationSystem(model: string): boolean {
+	const parsed = parseClaudeModel(model);
+	if (!parsed) return false;
+	if (parsed.family === "fable" || parsed.family === "mythos") return true;
+	if (parsed.family === "opus") return atLeastVersion(parsed, 4, 8);
+	return atLeastVersion(parsed, 5, 0);
 }
 
 /**
@@ -415,6 +492,12 @@ const DEFAULT_MAX_TOKENS = 64_000;
 /** Default output token limit for lightweight Anthropic generation helpers. */
 const DEFAULT_GENERATE_MAX_TOKENS = 4_096;
 
+/** Floor the Anthropic API enforces on `thinking.budget_tokens`. */
+const MIN_THINKING_BUDGET = 1_024;
+
+/** Placeholder budget for DeepSeek, whose schema requires one but ignores it. */
+const DEEPSEEK_THINKING_BUDGET = 10_000;
+
 function resolveGenerateMaxTokens(options?: GenerateOptions): number {
 	const requested = options?.maxOutputTokens;
 	if (requested === undefined || !Number.isFinite(requested)) return DEFAULT_GENERATE_MAX_TOKENS;
@@ -424,22 +507,28 @@ function resolveGenerateMaxTokens(options?: GenerateOptions): number {
 /**
  * Map reasoning effort to Anthropic thinking configuration.
  *
- * Matching Claude Code behavior (v2.1.71):
- *   - All supported models use `{ type: "adaptive" }` by default
- *   - `reasoningEffort === "none"` → `{ type: "disabled" }` (thinking off)
- *   - Any other value (or undefined) → `{ type: "adaptive" }`
+ * Mirrors `claude-cli` 2.1.227's thinking assembly for the supported version
+ * range (Claude 4.7 and newer):
+ *   - `reasoningEffort === "none"` → `{ type: "disabled" }`, sent explicitly
+ *     rather than omitted (upstream emits it for every thinking-capable model on
+ *     a first-party backend).
+ *   - everything else → `{ type: "adaptive" }`. Upstream's budgeted branch
+ *     (`{ type: "enabled", budget_tokens }`) only exists for the 4.0–4.6
+ *     generations, which are out of scope.
  *
- * The old `{ type: "enabled", budget_tokens: N }` is deprecated by Anthropic
- * in favor of adaptive thinking for all models.
+ * DeepSeek (via an Anthropic-compatible API) is not a Claude version and does not
+ * implement `adaptive`, so it keeps the budgeted shape with a placeholder value it
+ * ignores; its intensity comes from `output_config.effort` instead (see `chat`).
  *
- * DeepSeek (via Anthropic-compatible API) does not support `adaptive` —
- * use `{ type: "enabled", budget_tokens: N }` instead (budget_tokens is
- * ignored by DeepSeek but required by the schema). Effort is controlled
- * via `output_config.effort` (see chat method).
+ * @param maxTokens The request's own output ceiling. Only used to keep the
+ *   DeepSeek placeholder legal — the API requires
+ *   `1024 <= budget_tokens < max_tokens`, and the one-shot helper paths run with
+ *   a ceiling well below the placeholder.
  */
 function buildThinkingConfig(
 	model: string,
 	reasoningEffort: string | undefined,
+	maxTokens: number,
 ):
 	| { type: "adaptive" }
 	| { type: "enabled"; budget_tokens: number }
@@ -452,14 +541,11 @@ function buildThinkingConfig(
 		return { type: "disabled" };
 	}
 
-	// DeepSeek doesn't support adaptive thinking — use enabled with a
-	// placeholder budget_tokens (DeepSeek ignores the value).
-	if (isDeepSeekModel(model)) {
-		return { type: "enabled", budget_tokens: 10000 };
-	}
+	if (!isDeepSeekModel(model)) return { type: "adaptive" };
 
-	// All supported models use adaptive thinking (matching Claude Code)
-	return { type: "adaptive" };
+	const budget = Math.min(DEEPSEEK_THINKING_BUDGET, maxTokens - 1);
+	if (budget < MIN_THINKING_BUDGET) return { type: "disabled" };
+	return { type: "enabled", budget_tokens: budget };
 }
 
 /** Effort tiers accepted by models that have the `xhigh` tier (Opus 4.7+). */
@@ -947,13 +1033,17 @@ export class AnthropicProvider implements ProviderAdapter {
 		};
 		if (isOfficial) {
 			headers.Authorization = `Bearer ${apiKey}`;
-			headers["anthropic-beta"] = ANTHROPIC_BETA_FLAGS;
+			headers["anthropic-beta"] = buildAnthropicBetaFlags(model);
 			headers["anthropic-dangerous-direct-browser-access"] = "true";
 			headers["user-agent"] = this.resolveUserAgent(true);
 			headers["x-app"] = "cli";
 			headers["X-Claude-Code-Session-Id"] = this.sessionId;
-			// Stainless SDK telemetry, matching the chat path. The CLI sends no
-			// per-request id header here, so neither do we.
+			// Fresh per attempt, matching `claude-cli`'s `ZGp`, which mints a UUID
+			// for every official-API attempt (`Gn() === "firstParty" && mf()`) and
+			// passes it as this header. It is request-scoped telemetry, so it lands
+			// outside the cached prefix and cannot affect cache hits.
+			headers["x-client-request-id"] = randomUUID();
+			// Stainless SDK telemetry, matching the chat path.
 			headers["X-Stainless-Arch"] = STAINLESS_ARCH;
 			headers["X-Stainless-Lang"] = "js";
 			headers["X-Stainless-OS"] = STAINLESS_OS;
@@ -1261,8 +1351,19 @@ export class AnthropicProvider implements ProviderAdapter {
 		}
 
 		const isOfficial = !!this.config.officialApi;
+		const model = parseModelId(params.model).model;
+		const isDeepSeek = isDeepSeekModel(model);
+		// A mid-conversation `role: "system"` turn is only legal while the
+		// `mid-conversation-system-2026-04-07` beta is declared, and that beta is
+		// itself model-gated (see supportsMidConversationSystem). Upstream handles
+		// the unsupported case by not emitting `api_system` turns at all; here the
+		// equivalent is the downgrade the compatible path already performs, so a
+		// model without the capability never receives a message role it will reject.
+		const midConversationSystem = isOfficial && supportsMidConversationSystem(model);
 		const history = (params.history as AnthropicMessage[]).map((message) =>
-			!isOfficial && message.role === "system" ? { ...message, role: "user" as const } : message,
+			!midConversationSystem && message.role === "system"
+				? { ...message, role: "user" as const }
+				: message,
 		);
 		const tools = params.tools as AnthropicTool[];
 
@@ -1338,14 +1439,21 @@ export class AnthropicProvider implements ProviderAdapter {
 			history.push({ role: "user", content: [{ type: "text", text: params.content }] });
 		}
 
-		// Normalize user/assistant alternation while preserving official mid-turn system messages.
-		const messages = ensureAlternating(history);
+		// Sanitize BEFORE normalizing. Every step from here to `ensureAlternating`
+		// can REMOVE a whole message, and the normalizer is what guarantees the two
+		// positional invariants the API enforces: user/assistant alternation, and a
+		// mid-conversation system turn sitting between a user turn and an assistant
+		// turn (or at the very end). Normalizing first and pruning afterwards broke
+		// both — dropping the assistant turn that followed a system entry left that
+		// entry in front of a user turn, which 400s at that index on every later
+		// request too.
+		const draft = history;
 
 		// Final safety net: drop any assistant messages with empty/null content
 		// before sending to the API. This catches edge cases where messages with
 		// empty contentJson (e.g. interrupted streaming) slip through buildHistory.
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const m = messages[i];
+		for (let i = draft.length - 1; i >= 0; i--) {
+			const m = draft[i];
 			if (m.role === "assistant") {
 				const c = m.content;
 				if (
@@ -1357,19 +1465,17 @@ export class AnthropicProvider implements ProviderAdapter {
 						index: i,
 						contentType: typeof c,
 					});
-					messages.splice(i, 1);
+					draft.splice(i, 1);
 				}
 			}
 		}
 
-		const model = parseModelId(params.model).model;
-		const isDeepSeek = isDeepSeekModel(model);
-
-		// Use the unified Anthropic Messages output token ceiling.
+		// Use the unified Anthropic Messages output token ceiling. Every model in
+		// the supported range caps at or above it.
 		const maxTokens = DEFAULT_MAX_TOKENS;
 
 		// Build thinking configuration
-		const thinkingConfig = buildThinkingConfig(model, params.reasoningEffort);
+		const thinkingConfig = buildThinkingConfig(model, params.reasoningEffort, maxTokens);
 		const thinkingEnabled = !!thinkingConfig && thinkingConfig.type !== "disabled";
 
 		// When thinking is not enabled, strip thinking/redacted_thinking blocks from
@@ -1378,7 +1484,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		// in subsequent turns. If the model isn't recognized as supporting thinking,
 		// sending these blocks back without a `thinking` config triggers a 400 error.
 		if (!thinkingEnabled) {
-			stripThinkingBlocks(messages);
+			stripThinkingBlocks(draft);
 		}
 
 		// Even when thinking IS enabled, we must sanitize the history:
@@ -1391,17 +1497,29 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (thinkingEnabled) {
 			// Runs first: removing an empty thinking block can leave a message
 			// thinking-only or empty, and the two filters below are what clean that up.
-			dropEmptyThinkingBlocks(messages);
-			filterThinkingOnlyAssistantMessages(messages);
-			stripTrailingThinkingFromLastAssistant(messages);
+			dropEmptyThinkingBlocks(draft);
+
+			// A thinking block that carries no signature we may replay cannot be sent
+			// at all — see dropUnreplayableThinkingBlocks. DeepSeek is exempt because
+			// it never mints signatures and has its own placeholder protocol below.
+			if (!isDeepSeek) {
+				dropUnreplayableThinkingBlocks(draft);
+			}
+
+			filterThinkingOnlyAssistantMessages(draft);
+			stripTrailingThinkingFromLastAssistant(draft);
 
 			// DeepSeek Anthropic-compatible API doesn't support redacted_thinking,
 			// and thinking mode requires thinking blocks on assistant messages.
 			// Sanitize replayed Claude/Anthropic history before sending it.
 			if (isDeepSeek) {
-				sanitizeDeepSeekThinkingBlocks(messages);
+				sanitizeDeepSeekThinkingBlocks(draft);
 			}
 		}
+
+		// Normalize alternation and place mid-conversation system turns legally, now
+		// that the final set of messages is known.
+		const messages = ensureAlternating(draft);
 
 		// Build system blocks — official API uses the stable Claude Code 3-block
 		// prefix, while proxy mode uses only the NarraFork system prompt.
@@ -1438,7 +1556,12 @@ export class AnthropicProvider implements ProviderAdapter {
 			max_tokens: maxTokens,
 			stream: true,
 		};
-		if (isOfficial) {
+		// `context_management` carries exactly one edit, `clear_thinking_20251015`,
+		// so upstream only builds it when thinking is on (`yGp({hasThinking})` and
+		// the `Wi.includes(R2t)` guard next to it). Sending a thinking edit on a
+		// request that produces no thinking describes work the server cannot do,
+		// and it requires the context-management beta this model may not declare.
+		if (isOfficial && thinkingEnabled) {
 			body.context_management = OFFICIAL_CONTEXT_MANAGEMENT;
 		}
 
@@ -1447,8 +1570,12 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.thinking = thinkingConfig;
 		}
 
-		// Temperature: only set when thinking is disabled (API requirement)
-		if (!thinkingEnabled) {
+		// Temperature: upstream sends it only when thinking is off AND the model
+		// still accepts the parameter (`!Za && wHo(d)`). Every Claude in the
+		// supported range rejects it, so the previous unconditional
+		// `temperature: 1` was a 400 on exactly the newest models. Only third-party
+		// relay ids, which `wHo` says nothing about, still receive it.
+		if (!thinkingEnabled && acceptsTemperature(model)) {
 			body.temperature = 1;
 		}
 
@@ -1788,13 +1915,17 @@ export class AnthropicProvider implements ProviderAdapter {
 		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
 		if (system) body.system = system;
 		if (options?.reasoningEffort !== undefined) {
-			const thinkingConfig = buildThinkingConfig(bareModel, options.reasoningEffort);
+			const thinkingConfig = buildThinkingConfig(
+				bareModel,
+				options.reasoningEffort,
+				body.max_tokens,
+			);
 			if (thinkingConfig) body.thinking = thinkingConfig;
 		}
 		const metadata = this.buildRequestMetadata(isOfficial);
 		if (metadata) body.metadata = metadata;
 
-		const headers = this.buildRequestHeaders(apiKey, isOfficial, model, "text/event-stream");
+		const headers = this.buildRequestHeaders(apiKey, isOfficial, bareModel, "text/event-stream");
 
 		const response = await this.fetchWithV1Fallback(
 			isOfficial ? "/messages?beta=true" : "/messages",
@@ -1871,13 +2002,17 @@ export class AnthropicProvider implements ProviderAdapter {
 		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
 		if (system) body.system = system;
 		if (options?.reasoningEffort !== undefined) {
-			const thinkingConfig = buildThinkingConfig(bareModel, options.reasoningEffort);
+			const thinkingConfig = buildThinkingConfig(
+				bareModel,
+				options.reasoningEffort,
+				body.max_tokens,
+			);
 			if (thinkingConfig) body.thinking = thinkingConfig;
 		}
 		const metadata = this.buildRequestMetadata(isOfficial);
 		if (metadata) body.metadata = metadata;
 
-		const genHeaders = this.buildRequestHeaders(apiKey, isOfficial, model, "text/event-stream");
+		const genHeaders = this.buildRequestHeaders(apiKey, isOfficial, bareModel, "text/event-stream");
 		const response = await this.fetchWithV1Fallback(
 			isOfficial ? "/messages?beta=true" : "/messages",
 			{
@@ -1948,7 +2083,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		const metadata = this.buildRequestMetadata(isOfficial);
 		if (metadata) body.metadata = metadata;
 
-		const headers = this.buildRequestHeaders(apiKey, isOfficial, params.model, "text/event-stream");
+		const headers = this.buildRequestHeaders(apiKey, isOfficial, bareModel, "text/event-stream");
 		const response = await this.fetchWithV1Fallback(
 			isOfficial ? "/messages?beta=true" : "/messages",
 			{
@@ -2876,8 +3011,44 @@ function buildAnthropicHistory(
 // === Helpers ===
 
 /**
+ * Flatten a mid-conversation system message down to its text.
+ *
+ * Wire messages fed back in (a caller replaying a previous request body) can
+ * carry the array shape `applyFinalCacheBreakpoint` produces, so both forms have
+ * to be readable here. Any `cache_control` marker is discarded — the request path
+ * re-derives breakpoints from scratch on every turn.
+ */
+function systemMessageText(message: AnthropicMessage): string {
+	if (typeof message.content === "string") return message.content;
+	return message.content
+		.filter((block): block is { type: "text"; text: string } => block.type === "text")
+		.map((block) => block.text)
+		.join("\n\n");
+}
+
+/**
  * Ensure user/assistant messages alternate while preserving official
  * mid-conversation system messages as independent entries.
+ *
+ * Mid-conversation system turns are buffered rather than emitted where they sit,
+ * because the API constrains their position:
+ *
+ *   `role 'system' must precede an 'assistant' message or end the array`
+ *
+ * NarraFork's `sys` rows are injected asynchronously from all over the product —
+ * container events, review feedback, merge summaries, session prompts — so their
+ * chronological position is arbitrary. Emitted verbatim they routinely land in
+ * front of a user turn (including the current one, which `chat` appends last),
+ * or back to back with another `sys` row, and the request 400s at that index for
+ * the rest of the conversation.
+ *
+ * `claude-cli` solves it with the same buffer: its `api_system` entries live in a
+ * pending list that is flushed immediately before it pushes an assistant turn and
+ * once more when the array ends, and a flush whose predecessor is not a user turn
+ * is emitted as a plain user message instead (`Aj`/`I` in 2.1.227). That yields
+ * exactly two legal shapes — `user, system, assistant` and `user, system` at the
+ * end — and never puts a system message after an assistant, which would also
+ * break user/assistant alternation. This mirrors it.
  */
 function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 	if (messages.length === 0) return messages;
@@ -2890,33 +3061,52 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 	}
 
 	const result: AnthropicMessage[] = [];
-	for (const msg of messages) {
-		// Keep mid-conversation system content in Claude Code's string wire shape.
-		const normalized: AnthropicMessage = {
-			role: msg.role,
-			content:
-				msg.role === "system"
-					? msg.content
-					: typeof msg.content === "string"
-						? [{ type: "text", text: msg.content }]
-						: msg.content,
-		};
+	/** Mid-conversation system text awaiting a legal position. */
+	const pendingSystem: string[] = [];
 
-		if (!hasContent(normalized)) continue;
-		if (normalized.role === "system") {
-			result.push(normalized);
+	const pushOrMerge = (message: AnthropicMessage): void => {
+		const last = result[result.length - 1];
+		if (last && last.role === message.role && last.role !== "system") {
+			last.content = [...toContentParts(last.content), ...toContentParts(message.content)];
+			return;
+		}
+		result.push(message);
+	};
+
+	const flushSystem = (): void => {
+		if (pendingSystem.length === 0) return;
+		const text = pendingSystem.join("\n\n");
+		pendingSystem.length = 0;
+		// Only a user turn may be followed by a system turn. Anywhere else the
+		// directive is delivered as user content, exactly as the CLI does.
+		if (result[result.length - 1]?.role === "user") {
+			result.push({ role: "system", content: text });
+			return;
+		}
+		pushOrMerge({ role: "user", content: [{ type: "text", text }] });
+	};
+
+	for (const msg of messages) {
+		if (msg.role === "system") {
+			const text = systemMessageText(msg);
+			if (text) pendingSystem.push(text);
 			continue;
 		}
 
-		const last = result[result.length - 1];
-		if (last && last.role === normalized.role) {
-			const prevParts = toContentParts(last.content);
-			const currParts = toContentParts(normalized.content);
-			last.content = [...prevParts, ...currParts];
-		} else {
-			result.push(normalized);
-		}
+		const normalized: AnthropicMessage = {
+			role: msg.role,
+			content:
+				typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content,
+		};
+		if (!hasContent(normalized)) continue;
+
+		// The buffer is released right before the assistant turn it precedes, so the
+		// message that follows a system entry is always that assistant turn.
+		if (normalized.role === "assistant") flushSystem();
+		pushOrMerge(normalized);
 	}
+	// Anything still buffered ends the array, the other legal position.
+	flushSystem();
 
 	const filtered = result.filter(hasContent);
 	if (filtered.length > 0 && filtered[0].role !== "user") {
@@ -3113,6 +3303,67 @@ function dropEmptyThinkingBlocks(messages: AnthropicMessage[]): void {
 			removed: content.length - kept.length,
 			remaining: kept.length,
 		});
+		msg.content = kept;
+	}
+}
+
+/**
+ * Drop `thinking` blocks that carry no signature this upstream would accept.
+ *
+ * A thinking signature is minted by one specific server and proves the block's
+ * text came from that server's model. There is no "unsigned thinking" wire form:
+ * the official API answers `messages.N.content.M: Invalid \`signature\` in
+ * \`thinking\` block` for an empty or foreign signature, and because the offending
+ * block lives in replayed history the failure repeats identically on every
+ * subsequent turn — the conversation is wedged permanently, not transiently.
+ *
+ * Two producers create such blocks, both deliberately:
+ *   - `buildAnthropicHistory` blanks the signature when the stored
+ *     `signatureSource` does not match this provider (a cross-provider fork, a
+ *     different NUG channel, a renamed provider prefix, or any message persisted
+ *     before `signatureSource` existed). Echoing a foreign signature would fail
+ *     verification, so blanking it was the safe half of the decision — but
+ *     keeping the text alongside a blank signature is not a legal request.
+ *   - `pushAssistantTurn` defaults the signature to `""` when a stream died
+ *     between `content_block_start` and `signature_delta`.
+ *
+ * Dropping is what Anthropic prescribes for exactly this case: thinking blocks are
+ * "passed back unchanged on the same model; other models drop them silently
+ * (unbilled — nothing to strip)". `claude-cli` never emits an unsigned block over
+ * the wire either — the one place it builds `{ thinking, signature: "" }`, the
+ * interrupt handler, marks the message virtual so the normalizer excludes it.
+ *
+ * The cost is reasoning continuity for that turn, and — when the dropped block
+ * belonged to the final assistant message before a `tool_result` — the loss of the
+ * thinking the API prefers to see there. Both are strictly better than a request
+ * that cannot succeed at all.
+ *
+ * `redacted_thinking` is not handled here: `buildAnthropicHistory` already drops
+ * it outright on a source mismatch, since its payload is opaque and carries no
+ * text worth preserving.
+ */
+function dropUnreplayableThinkingBlocks(messages: AnthropicMessage[]): void {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+		const content = msg.content as AnthropicContentPart[];
+		const kept = content.filter(
+			(b) => b.type !== "thinking" || (typeof b.signature === "string" && b.signature !== ""),
+		);
+		if (kept.length === content.length) continue;
+		logger.warn("Dropping unsignable thinking block before API call", {
+			index: i,
+			removed: content.length - kept.length,
+			remaining: kept.length,
+		});
+		// Nothing survived: the message was an interrupted-stream artifact that held
+		// only unusable thinking. Leaving `content: []` behind would trade the
+		// signature error for an empty-content one, and the filters that would
+		// normally clean this up both skip zero-length content.
+		if (kept.length === 0) {
+			messages.splice(i, 1);
+			continue;
+		}
 		msg.content = kept;
 	}
 }

@@ -10,7 +10,7 @@ const ORIGINATOR = "narrafork";
  * block (see CC_CLI_VERSION in agent/anthropic-provider.ts): a request whose
  * User-Agent and billing block disagree does not match any real CLI release.
  */
-export const CLAUDE_CLI_VERSION = "2.1.220";
+export const CLAUDE_CLI_VERSION = "2.1.227";
 // Managed Codex client version used only for outbound protocol emulation.
 // Keep the User-Agent prefix/suffix and originator aligned when updating it.
 const CODEX_CLI_VERSION = "0.146.0";
