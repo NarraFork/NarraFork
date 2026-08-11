@@ -2144,10 +2144,11 @@ export function classifyDanger(
 		);
 	}
 
-	// KnowledgeEdit: publish and direct global writes are high; personal edits/metadata are medium.
+	// KnowledgeEdit: publish and direct global writes are high; personal edits/metadata are
+	// medium; read actions (e.g. my_submissions) are not dangerous at all.
 	if (toolName === "KnowledgeEdit") {
 		const action = typeof input.action === "string" ? input.action : "";
-		if (!action) return null;
+		if (!action || isKnowledgeReadAction(action)) return null;
 		const writesGlobal = action === "publish" || (action === "save" && input.direct === true);
 		return danger(
 			`KnowledgeEdit performs a knowledge action: ${action}.`,

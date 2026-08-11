@@ -1,18 +1,27 @@
 /**
- * sidecar.ts — Pure, DOM-free sidecar vocabulary for the vlist layout kernel.
+ * sidecar.ts — Pure, DOM-free side-car vocabulary for the vlist layout kernel.
  *
- * A "sidecar" is a system-injected record attached to a narrator message or a
- * tool result (progress reminders, background-task notifications, group-chat
- * deliveries, spec injections…). The exact vlist renders each one as its own
- * small collapsible card, replacing the chunked path's aggregated SideCarNotice.
+ * A "side-car" is a system-injected record attached to a narrator message or a tool
+ * result (progress reminders, background-task notifications, spec injections, a
+ * message from a teammate). The exact vlist renders each one as a FOOTNOTE: an
+ * unadorned run of lines in the reader's column, at the same row height as a folded
+ * trace row — no card, no border, no background, no accent rail.
  *
- * This module holds only the parts the pure adapter + measure layers need:
- * the source→colour map, the record shape, the visible-filter and the preview
- * composer. i18n labels are NOT here — they flow through `ctx.labels` like every
- * other adapter string (the render layer paints them from the measured payload).
+ * ## What lives here vs. in `@shared/sidecar-body`
+ *
+ * `sidecar-body.ts` owns the injection's DATA: the structured `SideCarBody`, its
+ * projection to lines (`presentSideCarBody`), and the tone/form judgement. It is
+ * shared with the server, which produces those bodies.
+ *
+ * THIS module owns the vlist-specific glue: the record shape the adapter reads off a
+ * message, the visible-subset filter, and the geometry constants the footnote's
+ * measure/render pair agree on. i18n labels are NOT here — they flow through
+ * `ctx.labels` like every other adapter string.
  *
  * Zero DOM, zero React. Picked up automatically by shared-core.guard.test.ts.
  */
+
+import type { SideCarBody } from "../sidecar-body";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Record shape (structural minimum the adapter reads)
@@ -41,10 +50,17 @@ export type SidecarTarget = "tool_result" | "user_message";
 export interface AdapterSidecar {
 	/** Attachment point; drives whether it renders on a message or a tool card. */
 	target: SidecarTarget | string;
-	/** Free-form source tag (see SIDECAR_SOURCE_META for the known values). */
+	/** Free-form source tag (see `sideCarTone` for the known values). */
 	source: string;
-	/** The injected body. Empty/whitespace-only content is never rendered. */
+	/**
+	 * The model-facing text. Still the visibility gate (an injection with no text is
+	 * never rendered) and the fallback body for rows written before `body` existed.
+	 */
 	content: string;
+	/** Structured form (WS shape). Read via `readSideCarBody`, never directly. */
+	body?: SideCarBody;
+	/** Structured form as loaded from the DB row (`body_json`). See `body`. */
+	bodyJson?: SideCarBody | null;
 	/** Owning tool call when target === "tool_result". */
 	toolUseId?: string | null;
 	/** Ordering within one attachment point. */
@@ -52,58 +68,50 @@ export interface AdapterSidecar {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Source metadata (colour + i18n label key)
+// Footnote geometry (measure + render agree on these)
 // ─────────────────────────────────────────────────────────────────────────────
-
-export interface SidecarSourceMeta {
-	/** Mantine colour name for the accent rail + badge. */
-	color: string;
-	/**
-	 * Key into `ctx.labels` (the adapter's injected i18n map) AND into the
-	 * `SIDECAR_LABEL_FALLBACKS` table below. The shell maps these onto the
-	 * existing `sidecar.sources.*` narrator strings.
-	 */
-	labelKey: string;
-}
 
 /**
- * Known source tags → colour + label key. Mirrors the chunked SideCarNotice's
- * SOURCE_META; `living_work_spec` reuses the todo_reminder wording there, so it
- * maps to the same label key here too.
+ * Left inset of a footnote's body lines, relative to its header row.
+ *
+ * The body is indented rather than railed: an accent rail (the old 2px `borderLeft`)
+ * made the injection the heaviest thing on screen while carrying the least important
+ * content. Indentation says "this belongs to the row above" using nothing but space.
  */
-export const SIDECAR_SOURCE_META: Record<string, SidecarSourceMeta> = {
-	silent_progress: { color: "indigo", labelKey: "sidecarSourceSilentProgress" },
-	todo_reminder: { color: "gray", labelKey: "sidecarSourceTodoReminder" },
-	living_work_spec: { color: "indigo", labelKey: "sidecarSourceTodoReminder" },
-	relaxed_plan: { color: "gray", labelKey: "sidecarSourceRelaxedPlan" },
-	knowledge_base_hint: { color: "teal", labelKey: "sidecarSourceKnowledgeBaseHint" },
-	bg_agent: { color: "blue", labelKey: "sidecarSourceBgAgent" },
-	bg_bash: { color: "blue", labelKey: "sidecarSourceBgBash" },
-	team_message: { color: "grape", labelKey: "sidecarSourceTeamMessage" },
-	buffered_user: { color: "gray", labelKey: "sidecarSourceBufferedUser" },
-	group_message: { color: "grape", labelKey: "sidecarSourceGroupMessage" },
-	subagent_message: { color: "cyan", labelKey: "sidecarSourceSubagentMessage" },
-	spec_update: { color: "indigo", labelKey: "sidecarSourceSpecUpdate" },
-};
+export const SIDECAR_BODY_INDENT = 10;
 
-/** Accent colour for a source tag; unknown sources fall back to gray. */
-export function sidecarSourceColor(source: string): string {
-	return SIDECAR_SOURCE_META[source]?.color ?? "gray";
-}
+/**
+ * Width reserved for a bullet line's marker, left of its text.
+ *
+ * A bullet therefore wraps at a NARROWER width than a plain text line, which is why
+ * the measure layer prepares each line as its own block instead of measuring the
+ * whole body as one.
+ */
+export const SIDECAR_BULLET_LANE = 12;
 
-/** Label key for a source tag (undefined when the source is unknown). */
-export function sidecarSourceLabelKey(source: string): string | undefined {
-	return SIDECAR_SOURCE_META[source]?.labelKey;
-}
+/**
+ * How many body lines an `open` footnote shows before it needs asking.
+ *
+ * `open` exists so a message addressed to the reader is not hidden behind a click;
+ * it is not a licence to take over the viewport. Past this, the rest goes behind the
+ * fold with a "show all" row.
+ *
+ * ⚠️ Distinct in KIND from `SIDECAR_DETAIL_MAX_LINES` (in measure-sidecar): this one
+ * is a default the reader can pass, that one is a hard ceiling on measurement cost.
+ */
+export const SIDECAR_INLINE_MAX_LINES = 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Visibility filter + preview
+// Visibility filter
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * The visible subset of a sidecar list for one attachment target: non-empty
- * content, sorted by orderIndex (stable for entries without one). Mirrors the
- * chunked `hasVisibleSideCars` filter plus the target split its call sites do.
+ * content, sorted by orderIndex (stable for entries without one).
+ *
+ * `content` remains the emptiness test even for structured rows, because it is the
+ * one field every producer sets and an injection whose text is blank was never shown
+ * to the model either.
  */
 export function collectVisibleSidecars(
 	sideCars: readonly AdapterSidecar[] | null | undefined,
@@ -120,21 +128,16 @@ export function collectVisibleSidecars(
 	return out;
 }
 
-/** Max chars the expanded card measures/paints (mirrors the chunked detail cap). */
+/**
+ * Max chars of a RAW (unstructured) body the expanded footnote measures.
+ *
+ * Only the fallback path needs a char cap: a structured body is bounded by its own
+ * producer (task digests are ≤4 entries, previews are pre-truncated), while a raw
+ * row is an arbitrary historical string.
+ */
 export const SIDECAR_DETAIL_MAX_CHARS = 120_000;
 
-/**
- * Single-line collapsed preview: whitespace-collapsed, hard-truncated. The
- * collapsed card is a fixed single-line row, so the preview is height-neutral
- * chrome — the measured height never depends on its length.
- */
-export function sidecarPreviewText(content: string): string {
-	const compact = content.replace(/\s+/g, " ").trim();
-	if (!compact) return "";
-	return compact.length > 120 ? `${compact.slice(0, 120)}…` : compact;
-}
-
-/** Expanded body text, capped so a pathological record cannot blow up measure. */
+/** Cap a raw body, appending the localized truncation label as its last line. */
 export function sidecarDetailText(content: string, truncatedLabel: string): string {
 	if (content.length <= SIDECAR_DETAIL_MAX_CHARS) return content;
 	return `${content.slice(0, SIDECAR_DETAIL_MAX_CHARS)}\n\n${truncatedLabel}`;

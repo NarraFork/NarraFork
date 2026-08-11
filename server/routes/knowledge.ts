@@ -15,6 +15,7 @@ import {
 	knowledgeGraphQuerySchema,
 	knowledgeSearchQuerySchema,
 	listDraftSubmissionsQuerySchema,
+	listKnowledgeAclEventsQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
 	rebaseKnowledgeDraftQuerySchema,
@@ -37,6 +38,7 @@ import {
 } from "../lib/validators";
 import { requireAdmin } from "../middleware/auth";
 import { knowledgeAcl } from "../services/knowledge-acl";
+import { knowledgeAudit } from "../services/knowledge-audit";
 import { knowledgeBranchService } from "../services/knowledge-branch-service";
 import { knowledgeLinkService } from "../services/knowledge-link-service";
 import { knowledgeService } from "../services/knowledge-service";
@@ -45,6 +47,15 @@ export const knowledgeRoutes = new Hono();
 
 /** Build the Principal from the authed JWT context. */
 function principalOf(c: { get: (k: "user") => { sub: string; role: "admin" | "user" } }) {
+	const u = c.get("user");
+	return { userId: u.sub, role: u.role };
+}
+
+/**
+ * The acting identity for the ACL audit trail. Same data as {@link principalOf}, but named for its
+ * purpose: authorization uses a principal, the audit log records an actor.
+ */
+function actorOf(c: { get: (k: "user") => { sub: string; role: "admin" | "user" } }) {
 	const u = c.get("user");
 	return { userId: u.sub, role: u.role };
 }
@@ -66,17 +77,31 @@ knowledgeRoutes.post("/collections", async (c) => {
 	);
 });
 
-knowledgeRoutes.patch("/collections/:id", requireAdmin, async (c) => {
+// Rename / re-describe a collection — admin OR the collection owner.
+//
+// NOT requireAdmin: any authenticated user may CREATE a collection (and becomes its owner), so
+// gating edits on admin left owners unable to manage what they had just created. The service's
+// assertCanManageCollection is the real gate (owner-or-admin, unreadable → NotFound so a
+// collection's existence isn't leaked), mirroring transfer-owner right below.
+//
+// Note this covers name/description only. The ACL axes (defaultLevel / controlled tags / owner)
+// stay admin-only under /collections/:id/acl — letting an owner change their own classification
+// would let a non-admin declassify content.
+knowledgeRoutes.patch("/collections/:id", async (c) => {
 	const parsed = updateKnowledgeCollectionSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await knowledgeService.updateCollection(c.req.param("id") ?? "", parsed.data));
+	return c.json(
+		await knowledgeService.updateCollection(c.req.param("id") ?? "", parsed.data, principalOf(c)),
+	);
 });
 
 // Set collection ACL attributes (classification level, controlled tags, owner) — admin only.
 knowledgeRoutes.patch("/collections/:id/acl", requireAdmin, async (c) => {
 	const parsed = updateKnowledgeCollectionAclSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await knowledgeAcl.updateCollectionAcl(c.req.param("id") ?? "", parsed.data));
+	return c.json(
+		await knowledgeAcl.updateCollectionAcl(c.req.param("id") ?? "", parsed.data, actorOf(c)),
+	);
 });
 
 // Transfer collection ownership — admin OR current owner (enforced in the service; NOT requireAdmin).
@@ -92,8 +117,12 @@ knowledgeRoutes.post("/collections/:id/transfer-owner", async (c) => {
 	);
 });
 
-knowledgeRoutes.delete("/collections/:id", requireAdmin, async (c) => {
-	return c.json(await knowledgeService.deleteCollection(c.req.param("id") ?? ""));
+// Delete a collection — admin OR the collection owner (same gate as PATCH above).
+//
+// This CASCADES to the collection's entries, so it is destructive; the owner-or-admin check in
+// assertCanManageCollection is what stands between a reader and someone else's collection.
+knowledgeRoutes.delete("/collections/:id", async (c) => {
+	return c.json(await knowledgeService.deleteCollection(c.req.param("id") ?? "", principalOf(c)));
 });
 
 // ─── Entries ──────────────────────────────────────────────────────────
@@ -151,7 +180,7 @@ knowledgeRoutes.patch("/entries/:id/acl", requireAdmin, async (c) => {
 	const parsed = updateKnowledgeEntryAclSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const id = c.req.param("id") ?? "";
-	return c.json(await knowledgeService.updateEntryAcl(id, parsed.data));
+	return c.json(await knowledgeService.updateEntryAcl(id, parsed.data, actorOf(c)));
 });
 
 // Transfer entry ownership — admin OR current owner (enforced in the service; NOT requireAdmin).
@@ -241,13 +270,21 @@ knowledgeRoutes.delete("/links/:id", async (c) => {
 
 // ─── Personal library (standalone personal entries) ─────────────────────
 
+// List the caller's personal entries, each flagged with whether it has drifted behind main.
+//
+// Drift is resolved for the WHOLE page in one query (findDriftedDraftIds). Doing it here rather
+// than leaving it to the client is what removes the N+1: the drift endpoint returns three full
+// bodies per entry, so a list of N badges used to cost N×3 documents. It also makes drift visible
+// in the list itself instead of only inside each entry's draft tab.
 knowledgeRoutes.get("/personal-entries", async (c) => {
 	const parsed = listPersonalEntriesQuerySchema.safeParse({
 		status: c.req.query("status"),
 		limit: c.req.query("limit"),
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await knowledgeBranchService.listMine(principalOf(c), parsed.data));
+	const rows = await knowledgeBranchService.listMine(principalOf(c), parsed.data);
+	const driftedIds = await knowledgeBranchService.findDriftedDraftIds(rows);
+	return c.json(rows.map((r) => ({ ...r, drifted: driftedIds.has(r.id) })));
 });
 
 knowledgeRoutes.post("/personal-entries", async (c) => {
@@ -446,7 +483,9 @@ knowledgeRoutes.get("/users/:userId/acl", requireAdmin, async (c) =>
 knowledgeRoutes.put("/users/:userId/acl", requireAdmin, async (c) => {
 	const parsed = setUserAclSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await knowledgeAcl.setUserAcl(c.req.param("userId") ?? "", parsed.data));
+	return c.json(
+		await knowledgeAcl.setUserAcl(c.req.param("userId") ?? "", parsed.data, actorOf(c)),
+	);
 });
 
 knowledgeRoutes.get("/grants", requireAdmin, async (c) =>
@@ -460,11 +499,30 @@ knowledgeRoutes.get("/grants", requireAdmin, async (c) =>
 knowledgeRoutes.post("/grants", requireAdmin, async (c) => {
 	const parsed = createKnowledgeGrantSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await knowledgeAcl.createGrant(parsed.data), 201);
+	return c.json(await knowledgeAcl.createGrant(parsed.data, actorOf(c)), 201);
 });
 knowledgeRoutes.delete("/grants/:id", requireAdmin, async (c) =>
-	c.json(await knowledgeAcl.deleteGrant(c.req.param("id") ?? "")),
+	c.json(await knowledgeAcl.deleteGrant(c.req.param("id") ?? "", actorOf(c))),
 );
+
+// ─── ACL audit trail (admin only) ───
+//
+// Answers "who granted this account access, and when" — previously unanswerable, since every
+// authorization change was untraceable once made. Admin-only: the log names principals, levels and
+// tags, so it is itself security-relevant. Keyset-paginated (no OFFSET, no COUNT(*)).
+knowledgeRoutes.get("/acl-events", requireAdmin, async (c) => {
+	const parsed = listKnowledgeAclEventsQuerySchema.safeParse({
+		limit: c.req.query("limit"),
+		cursorCreatedAt: c.req.query("cursorCreatedAt"),
+		cursorId: c.req.query("cursorId"),
+		eventType: c.req.query("eventType"),
+		subjectId: c.req.query("subjectId"),
+		targetId: c.req.query("targetId"),
+		actorUserId: c.req.query("actorUserId"),
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await knowledgeAudit.listKnowledgeAclEvents(parsed.data));
+});
 
 // ─── Entry accessible users preview (admin only) ───
 knowledgeRoutes.get("/entries/:id/accessible-users", requireAdmin, async (c) =>
@@ -529,7 +587,7 @@ knowledgeRoutes.get("/my-open-submissions", async (c) => {
 knowledgeRoutes.post("/grants/bulk", requireAdmin, async (c) => {
 	const parsed = bulkKnowledgeGrantSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await knowledgeAcl.bulkGrant(parsed.data), 201);
+	return c.json(await knowledgeAcl.bulkGrant(parsed.data, actorOf(c)), 201);
 });
 
 // Read a collection's ACL attributes (level / controlled tags / owner) for admin UI echo-back.

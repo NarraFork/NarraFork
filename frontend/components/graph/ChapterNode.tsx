@@ -23,7 +23,6 @@ export interface ChapterNodeData {
 	hasContainers: boolean;
 	role?: string;
 	color?: string;
-	hasUpstreamUpdates?: boolean;
 	isRoot?: boolean;
 	commitCount?: number;
 	expanded?: boolean;
@@ -209,20 +208,6 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 					overflow: "hidden",
 				}}
 			>
-				{d.hasUpstreamUpdates && (
-					<div
-						style={{
-							position: "absolute",
-							top: 6,
-							right: hasNarrator ? 30 : 6,
-							width: 8,
-							height: 8,
-							borderRadius: "50%",
-							backgroundColor: statusRegistry.edgeType("dependency").color,
-							zIndex: 1,
-						}}
-					/>
-				)}
 				{/* Header — always visible, acts as drag handle when expanded */}
 				<div
 					className={expanded ? "chapter-node-drag-handle" : undefined}
@@ -355,7 +340,6 @@ function areChapterNodePropsEqual(prev: NodeProps, next: NodeProps) {
 		prevData.hasContainers === nextData.hasContainers &&
 		prevData.role === nextData.role &&
 		prevData.color === nextData.color &&
-		prevData.hasUpstreamUpdates === nextData.hasUpstreamUpdates &&
 		prevData.isRoot === nextData.isRoot &&
 		prevData.commitCount === nextData.commitCount &&
 		prevData.expanded === nextData.expanded &&

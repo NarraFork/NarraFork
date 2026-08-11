@@ -17,7 +17,6 @@ import {
 	projects,
 	remoteDevices,
 	terminals,
-	terminalTabs,
 	terminalViewState,
 } from "../db/schema";
 import { GitAuthError, NotFoundError, ValidationError } from "../lib/errors";
@@ -449,7 +448,6 @@ projectRoutes.delete("/:id", async (c) => {
 				tx.delete(terminalViewState)
 					.where(inArray(terminalViewState.narratorId, allNarratorIds))
 					.run();
-				tx.delete(terminalTabs).where(inArray(terminalTabs.narratorId, allNarratorIds)).run();
 				tx.delete(terminals).where(inArray(terminals.narratorId, allNarratorIds)).run();
 				tx.delete(narratorToolCalls)
 					.where(inArray(narratorToolCalls.narratorId, allNarratorIds))
@@ -467,7 +465,6 @@ projectRoutes.delete("/:id", async (c) => {
 			tx.delete(terminalViewState)
 				.where(inArray(terminalViewState.chapterId, remainingChapterIds))
 				.run();
-			tx.delete(terminalTabs).where(inArray(terminalTabs.chapterId, remainingChapterIds)).run();
 			tx.delete(terminals).where(inArray(terminals.chapterId, remainingChapterIds)).run();
 			tx.delete(containerInstances)
 				.where(inArray(containerInstances.chapterId, remainingChapterIds))

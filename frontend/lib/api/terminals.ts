@@ -42,27 +42,10 @@ export const terminalsApi = {
 			body: JSON.stringify(state),
 		}),
 
-	// Terminal Tabs
-	listTerminalTabs: (opts: { chapterId?: string; narratorId?: string }) => {
-		const params = new URLSearchParams();
-		if (opts.chapterId) params.set("chapterId", opts.chapterId);
-		if (opts.narratorId) params.set("narratorId", opts.narratorId);
-		return request<ApiEntity[]>(`/terminals/tabs?${params}`);
-	},
-	createTerminalTab: (data: { chapterId?: string; narratorId?: string; name: string }) =>
-		request<ApiEntity>("/terminals/tabs", { method: "POST", body: JSON.stringify(data) }),
-	updateTerminalTab: (id: string, data: { name?: string }) =>
-		request<ApiEntity>(`/terminals/tabs/${id}`, {
-			method: "PATCH",
-			body: JSON.stringify(data),
-		}),
-	deleteTerminalTab: (id: string) =>
-		request<ApiEntity>(`/terminals/tabs/${id}`, { method: "DELETE" }),
-	reorderTerminalTabs: (ids: string[]) =>
-		request<ApiEntity>("/terminals/tabs/reorder", {
-			method: "PUT",
-			body: JSON.stringify({ ids }),
-		}),
+	// Terminal Tabs: removed. Five clients (list/create/update/delete/reorder) named
+	// `/terminals/tabs`, all with zero call sites; the routes, service and `terminal_tabs`
+	// table are gone too. The live terminal UI derives tabs from running terminals and
+	// stores only their order in `terminal_view_state` (below, which is in use).
 
 	// Terminal View State
 	getTerminalViewState: (opts: { chapterId?: string; narratorId?: string }) => {

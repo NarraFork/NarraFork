@@ -44,7 +44,10 @@ export const knowledgeReviewTool: ToolDefinition = {
 		"users with review/write authority. " +
 		"Read actions (no approval): list_submissions, get_submission. " +
 		"Write actions (require approval): approve (publish the proposal into the global base), " +
-		"request_changes, comment, resolve_conflict (supply merged content for a conflicted publish). " +
+		"request_changes (bounce back for another round — the author may resubmit), " +
+		"reject (refuse for good; TERMINAL, not resubmittable — use request_changes if the author " +
+		"should try again), comment (leave findings without changing the request's state), " +
+		"resolve_conflict (supply merged content for a conflicted publish). " +
 		"Authority is enforced per request: for an edit to an existing entry you must hold its review " +
 		"tags; for a brand-new entry you must be able to write its target collection. " +
 		"Authoring and maintaining knowledge is done with KnowledgeCreate / KnowledgeEdit, not here.",
@@ -55,6 +58,7 @@ export const knowledgeReviewTool: ToolDefinition = {
 				"get_submission",
 				"approve",
 				"request_changes",
+				"reject",
 				"comment",
 				"resolve_conflict",
 			])
@@ -136,14 +140,14 @@ export const knowledgeReviewTool: ToolDefinition = {
 
 				case "approve":
 				case "request_changes":
+				case "reject":
 				case "comment": {
 					if (!a.submissionId) return deny(`${action} requires 'submissionId'.`);
+					// Action names map 1:1 to verdicts except `comment` → `comment_only`.
 					const verdict =
-						action === "approve"
-							? "approve"
-							: action === "request_changes"
-								? "request_changes"
-								: "comment_only";
+						action === "comment"
+							? "comment_only"
+							: (action as "approve" | "request_changes" | "reject");
 					const parsed = reviewKnowledgeSubmissionSchema.safeParse({
 						verdict,
 						findings: a.findings,

@@ -180,7 +180,7 @@ describe("deletePersonalEntry invalidates open publish requests", () => {
 		expect(row?.verdict).toBeNull();
 	});
 
-	test("an already-reviewed submission is left untouched", async () => {
+	test("a bounced (changes_requested) submission is withdrawn too — its path is now impossible", async () => {
 		const created = await knowledgeBranchService.createStandalone(author, {
 			title: `AlreadyReviewed ${TAG}`,
 			content: "proposed body\n",
@@ -188,16 +188,46 @@ describe("deletePersonalEntry invalidates open publish requests", () => {
 		});
 		const submission = await knowledgeBranchService.submitForReview(author, created.id, {});
 		const submissionId = submission?.id as string;
-		// Reviewer bounces it back — no longer an open request.
+		// Reviewer bounces it back: the ball is in the AUTHOR's court, and the only way forward
+		// is `resubmit` from this personal entry.
 		await knowledgeBranchService.review(admin, submissionId, { verdict: "request_changes" });
 
 		const res = await knowledgeBranchService.deletePersonalEntry(author, created.id);
-		expect(res.invalidatedSubmissionIds).toEqual([]);
+		// Retiring the entry makes the requested changes impossible to deliver, so leaving the
+		// request open would strand it forever as an orphan pointing at an archived draft.
+		expect(res.invalidatedSubmissionIds).toEqual([submissionId]);
 
 		const row = await db.query.knowledgeSubmissions.findFirst({
 			where: eq(knowledgeSubmissions.id, submissionId),
 		});
-		expect(row?.status).toBe("changes_requested");
+		expect(row?.status).toBe("withdrawn");
+		// Unlike the pending/conflict cases, the reviewer's verdict is KEPT: they really did ask
+		// for changes, and "changes were requested, then the author retired the entry" is the
+		// accurate history. Only the status reflects who closed it.
+		expect(row?.verdict).toBe("request_changes");
+		expect(row?.reviewerUserId).toBe(admin.userId);
+	});
+
+	test("a terminally-decided submission is left untouched", async () => {
+		const created = await knowledgeBranchService.createStandalone(author, {
+			title: `AlreadyApproved ${TAG}`,
+			content: "proposed body\n",
+			targetCollectionId: collectionId,
+		});
+		const submission = await knowledgeBranchService.submitForReview(author, created.id, {});
+		const submissionId = submission?.id as string;
+		// Approved = merged into the global base; nothing about it is retractable any more.
+		await knowledgeBranchService.review(admin, submissionId, { verdict: "approve" });
+
+		// The publish already archived the personal entry, so this delete is a no-op…
+		const res = await knowledgeBranchService.deletePersonalEntry(author, created.id);
+		expect(res.alreadyArchived).toBe(true);
+
+		// …and must not rewrite the merged request's terminal state.
+		const row = await db.query.knowledgeSubmissions.findFirst({
+			where: eq(knowledgeSubmissions.id, submissionId),
+		});
+		expect(row?.status).toBe("approved");
 	});
 });
 

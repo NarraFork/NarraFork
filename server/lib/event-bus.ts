@@ -54,7 +54,8 @@ export type NarraForkEvent =
 			projectId: string;
 	  }
 	| { type: "chapter:cherry_picked"; sourceId: string; targetId: string; commits: string[] } // TODO: not yet emitted
-	| { type: "chapter:frozen"; chapterId: string } // TODO: not yet emitted
+	// No `chapter:frozen`: the `frozen` chapter status it announced has been removed, so the
+	// transition it described can no longer happen.
 	| { type: "chapter:role_changed"; chapterId: string; role: string }
 	| { type: "chapter:files_changed"; chapterId: string; worktreePath: string }
 	| {
@@ -66,16 +67,8 @@ export type NarraForkEvent =
 			narratorId: string;
 	  }
 	| { type: "chapter:commits_updated"; chapterId: string; newCount: number }
-	// 依赖关系
-	| { type: "dependency:created"; edgeId: string; sourceId: string; targetId: string }
-	| { type: "dependency:removed"; edgeId: string; sourceId: string; targetId: string }
-	| {
-			type: "dependency:upstream_updated"; // TODO: not yet emitted
-			edgeId: string;
-			targetChapterId: string;
-			newCommitCount: number;
-	  }
-	| { type: "dependency:synced"; edgeId: string; targetChapterId: string; strategy: string } // TODO: not yet emitted
+	// 依赖关系：dependency 边已移除，四个事件（created/removed/upstream_updated/synced）随之删除。
+	// created/removed 曾真实发出但无人消费；后两个从未发出。详见 chapter-edge-service.ts。
 	// 探索组
 	| { type: "exploration:created"; groupId: string; chapterIds: string[] } // TODO: not yet emitted
 	| { type: "exploration:decided"; groupId: string; decidedChapterId: string } // TODO: not yet emitted
@@ -409,6 +402,43 @@ export type NarraForkEvent =
 			entryId: string;
 			submissionId: string;
 			submitterUserId: string;
+	  }
+	| {
+			/**
+			 * A global entry advanced, so every OTHER user holding an active personal version of
+			 * it is now based on a stale revision (drifted) and should rebase.
+			 *
+			 * Emitted on any main write (direct revision, approved publish, resolved conflict).
+			 * `driftedUserIds` is resolved by the emitter — bounded, and it never includes the
+			 * author of the change (their own draft was just rebased or archived).
+			 */
+			type: "knowledge:entry_drifted";
+			entryId: string;
+			driftedUserIds: string[];
+	  }
+	| {
+			/**
+			 * A principal's knowledge authorization changed (grant added/removed, ACL replaced).
+			 * The affected user must refetch: their readable set, review scope and badges may all
+			 * have moved. Carries no level/tag detail — the client re-reads through the
+			 * ACL-checked endpoints.
+			 */
+			type: "knowledge:acl_changed";
+			/** Users whose effective capabilities changed. */
+			userIds: string[];
+			reason: "grant_added" | "grant_removed" | "user_acl_replaced";
+	  }
+	| {
+			/**
+			 * Ownership of an entry or collection moved. Both the old and the new owner are
+			 * notified: ownership is an ACL short-circuit, so one of them just gained full
+			 * access and the other may have lost it.
+			 */
+			type: "knowledge:owner_transferred";
+			targetType: "entry" | "collection";
+			targetId: string;
+			previousOwnerUserId: string | null;
+			newOwnerUserId: string | null;
 	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];

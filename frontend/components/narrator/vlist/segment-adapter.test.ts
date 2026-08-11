@@ -2344,7 +2344,7 @@ describe("adaptSegment — per-turn usage rows", () => {
 	});
 });
 
-describe("adaptSegment — sidecar cards", () => {
+describe("adaptSegment — side-car footnotes", () => {
 	const sidecarMsg = (
 		role: string,
 		sideCars: Array<Record<string, unknown>>,
@@ -2361,7 +2361,7 @@ describe("adaptSegment — sidecar cards", () => {
 		},
 	});
 
-	it("assistant message: one sidecar card per visible user_message record, trailing the body", () => {
+	it("assistant message: one footnote per visible user_message record, trailing the body", () => {
 		const specs = adaptSegment(
 			sidecarMsg("assistant", [
 				{ target: "user_message", source: "silent_progress", content: "note one" },
@@ -2369,11 +2369,11 @@ describe("adaptSegment — sidecar cards", () => {
 			]),
 			CTX,
 		);
-		// markdown body + two sidecar cards.
 		expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar", "sidecar"]);
-		const card = specs[1]!.data as { source: string; previewText: string; fullText: string };
-		expect(card.source).toBe("silent_progress");
-		expect(card.fullText).toBe("note one");
+		const first = specs[1]!.data as { source: string; fullText: string };
+		expect(first.source).toBe("silent_progress");
+		// `fullText` is what the MODEL saw — the copy button's payload, never measured.
+		expect(first.fullText).toBe("note one");
 	});
 
 	it("filters out tool_result records and empty content", () => {
@@ -2388,7 +2388,7 @@ describe("adaptSegment — sidecar cards", () => {
 		expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar"]);
 	});
 
-	it("user bubble: sidecars trail the bubble", () => {
+	it("user bubble: footnotes trail the bubble", () => {
 		const specs = adaptSegment(
 			sidecarMsg("user", [{ target: "user_message", source: "group_message", content: "hi" }]),
 			CTX,
@@ -2396,7 +2396,7 @@ describe("adaptSegment — sidecar cards", () => {
 		expect(specs.map((s) => s.kind)).toEqual(["message-bubble", "sidecar"]);
 	});
 
-	it("origin_notice branch: sidecars still surface (chunk parity)", () => {
+	it("origin_notice branch: footnotes still surface (chunk parity)", () => {
 		const specs = adaptSegment(
 			sidecarMsg("user", [{ target: "user_message", source: "bg_bash", content: "done" }], {
 				origin: "system",
@@ -2406,7 +2406,7 @@ describe("adaptSegment — sidecar cards", () => {
 		expect(specs.map((s) => s.kind)).toEqual(["system-text", "sidecar"]);
 	});
 
-	it("sidecar opts carry the per-card fold state from ctx.isExpanded", () => {
+	it("opts carry the per-record fold state from ctx.isExpanded", () => {
 		const ctx: AdapterContext = { lod: 5, isExpanded: (key) => key === "m1-sc0" };
 		const specs = adaptSegment(
 			sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
@@ -2415,20 +2415,35 @@ describe("adaptSegment — sidecar cards", () => {
 		expect(specs[1]!.opts?.expanded).toBe(true);
 	});
 
-	it("measures through the registry: collapsed is the constant height", () => {
+	it("defaults the fold state to false, even for an `open` tone", () => {
+		// `open` is a SHAPE the measure layer draws, NOT a default fold. Defaulting the
+		// state to true would break the toggle for a tool card's footnotes, whose fold
+		// lives under a sub-key with no measured entry: the first click would compute
+		// `false` and write `true`, i.e. do nothing visible.
 		const specs = adaptSegment(
-			sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
-			CTX,
+			sidecarMsg("assistant", [
+				{
+					target: "user_message",
+					source: "subagent_message",
+					content: "peer text",
+					// A structured body is required to reach `open` at all: a raw row always
+					// folds (unknown shape, unknown length).
+					body: { kind: "messages", items: [{ fromId: "n1", text: "peer text" }] },
+				},
+			]),
+			{ lod: 5 },
 		);
-		const measured = VLIST_REGISTRY.sidecar.measure(specs[1]!.data, 600, 5, specs[1]!.opts);
-		expect(measured.height).toBeGreaterThan(0);
-		const open = VLIST_REGISTRY.sidecar.measure(specs[1]!.data, 600, 5, { expanded: true });
-		expect(open.height).toBeGreaterThan(measured.height);
+		expect((specs[1]!.data as { form: string }).form).toBe("open");
+		expect(specs[1]!.opts?.expanded).toBe(false);
 	});
 
-	// ── Low-LOD degraded form (one bare trace per record, no card skin) ────────
-	it("low LOD (<4): each record becomes a sidecar-trace, not a card", () => {
-		for (const lod of [1, 2, 3] as const) {
+	// ── ONE form at every LOD (the low-LOD trace variant is gone) ──────────────
+	it("produces the same `sidecar` kind at EVERY lod", () => {
+		// There used to be two forms — a bare trace below L4, a Paper card at/above it —
+		// which meant two measure paths, two render branches and two fold channels for
+		// one concept. The footnote is light enough everywhere that the split bought
+		// nothing, and it was a standing source of "the row does not open" bugs.
+		for (const lod of [1, 2, 3, 4, 5, 6] as const) {
 			const specs = adaptSegment(
 				sidecarMsg("assistant", [
 					{ target: "user_message", source: "silent_progress", content: "one" },
@@ -2436,51 +2451,126 @@ describe("adaptSegment — sidecar cards", () => {
 				]),
 				{ lod },
 			);
-			expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar-trace", "sidecar-trace"]);
+			expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar", "sidecar"]);
+			// And always on the key-addressed fold channel, never `expandedIndices`.
+			expect(specs[1]!.opts?.expandedIndices).toBeUndefined();
 		}
 	});
 
-	it("high LOD (>=4): each record stays a full sidecar card", () => {
-		for (const lod of [4, 5, 6] as const) {
-			const specs = adaptSegment(
-				sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
-				{ lod },
-			);
-			expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar"]);
-		}
+	// ── structured body vs. verbatim fallback ─────────────────────────────────
+	it("projects a STRUCTURED body into lines, dropping the model-facing text", () => {
+		const specs = adaptSegment(
+			sidecarMsg("assistant", [
+				{
+					target: "user_message",
+					source: "living_work_spec",
+					// What the model was shown: heading + task lines + instruction boilerplate.
+					content:
+						"Current Dynamic Spec reminder (compiled from spec://tasks.json):\n- doing: ship it\nDo not add IDs, timestamps, or notes fields to tasks.json.",
+					body: {
+						kind: "tasks",
+						variant: "current",
+						tasks: [{ role: "doing", text: "ship it" }],
+					},
+				},
+			]),
+			CTX,
+		);
+		const data = specs[1]!.data as {
+			isRaw: boolean;
+			lines: Array<{ kind: string; text: string }>;
+			fullText: string;
+		};
+		expect(data.isRaw).toBe(false);
+		expect(data.lines).toHaveLength(1);
+		expect(data.lines[0]!.kind).toBe("bullet");
+		expect(data.lines[0]!.text).toContain("ship it");
+		// The instruction boilerplate reaches the copy payload but never a drawn line.
+		expect(data.lines.map((l) => l.text).join("\n")).not.toContain("Do not add IDs");
+		expect(data.fullText).toContain("Do not add IDs");
 	});
 
-	it("low-LOD trace carries the same payload and reads expandedRows for its row fold", () => {
-		const ctx: AdapterContext = { lod: 2, expandedRows: (key) => (key === "m1-sc0" ? [0] : []) };
+	it("shows a row with NO body verbatim, with zero unwrapping", () => {
+		// The whole compatibility story for pre-structured rows: they look exactly as
+		// they always did. No XML unwrapping, no prefix stripping, no bullet detection.
 		const specs = adaptSegment(
-			sidecarMsg("assistant", [{ target: "user_message", source: "bg_agent", content: "full" }]),
-			ctx,
+			sidecarMsg("assistant", [
+				{
+					target: "user_message",
+					source: "silent_progress",
+					content:
+						"<progress_update_request>\nYou have completed 20 tool calls.\n</progress_update_request>",
+				},
+			]),
+			CTX,
 		);
-		const trace = specs[1]!;
-		expect(trace.kind).toBe("sidecar-trace");
-		const data = trace.data as { sourceLabel: string; previewText: string; fullText: string };
-		expect(data.sourceLabel).toBeTruthy();
-		expect(data.fullText).toBe("full");
-		expect(trace.opts?.expandedIndices).toEqual([0]);
+		const data = specs[1]!.data as { isRaw: boolean; lines: Array<{ text: string }>; form: string };
+		expect(data.isRaw).toBe(true);
+		expect(data.lines.map((l) => l.text)).toEqual([
+			"<progress_update_request>",
+			"You have completed 20 tool calls.",
+			"</progress_update_request>",
+		]);
+		// A raw body is of unknown shape and length, so it must not open unprompted.
+		expect(data.form).toBe("folded");
 	});
 
-	it("low-LOD sidecar-trace measures through the registry (header + one row)", () => {
+	it("reads a DB-shaped row's body from `bodyJson` as well as `body`", () => {
+		// HTTP-loaded rows carry the DB column name; WS payloads carry `body`.
 		const specs = adaptSegment(
-			sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
-			{ lod: 2 },
+			sidecarMsg("assistant", [
+				{
+					target: "user_message",
+					source: "behavior_fence",
+					content: "Behavior fence (…):\nNo force pushes.",
+					bodyJson: { kind: "prose", text: "No force pushes." },
+				},
+			]),
+			CTX,
 		);
-		const collapsed = VLIST_REGISTRY["sidecar-trace"].measure(
-			specs[1]!.data,
-			600,
-			2,
-			specs[1]!.opts,
+		const data = specs[1]!.data as { isRaw: boolean; lines: Array<{ text: string }> };
+		expect(data.isRaw).toBe(false);
+		expect(data.lines.map((l) => l.text)).toEqual(["No force pushes."]);
+	});
+
+	it("labels the two sources that were never mapped before", () => {
+		// The server has always pushed these, but neither SOURCE_META table listed them,
+		// so they rendered as raw snake_case tags.
+		const labels = { sidecarSourceBehaviorFence: "Behavior fence" };
+		const specs = adaptSegment(
+			sidecarMsg("assistant", [{ target: "user_message", source: "behavior_fence", content: "x" }]),
+			{ lod: 5, labels },
 		);
-		expect(collapsed.height).toBeGreaterThan(0);
-		// Expanding the single row reveals the body → taller.
-		const open = VLIST_REGISTRY["sidecar-trace"].measure(specs[1]!.data, 600, 2, {
-			expandedIndices: [0],
-		});
-		expect(open.height).toBeGreaterThan(collapsed.height);
+		expect((specs[1]!.data as { sourceLabel: string }).sourceLabel).toBe("Behavior fence");
+	});
+
+	it("falls back to the raw tag for a source nobody has mapped", () => {
+		const specs = adaptSegment(
+			sidecarMsg("assistant", [{ target: "user_message", source: "brand_new", content: "x" }]),
+			CTX,
+		);
+		const data = specs[1]!.data as { sourceLabel: string; tone: string; form: string };
+		expect(data.sourceLabel).toBe("brand_new");
+		expect(data.tone).toBe("neutral");
+		expect(data.form).toBe("folded");
+	});
+
+	it("measures through the registry: collapsed is the constant bare row", () => {
+		const specs = adaptSegment(
+			sidecarMsg("assistant", [
+				{
+					target: "user_message",
+					source: "silent_progress",
+					content: "note",
+					body: { kind: "prose", text: "line one\nline two" },
+				},
+			]),
+			CTX,
+		);
+		const measured = VLIST_REGISTRY.sidecar.measure(specs[1]!.data, 600, 5, specs[1]!.opts);
+		expect(measured.height).toBeGreaterThan(0);
+		const open = VLIST_REGISTRY.sidecar.measure(specs[1]!.data, 600, 5, { expanded: true });
+		expect(open.height).toBeGreaterThan(measured.height);
 	});
 });
 

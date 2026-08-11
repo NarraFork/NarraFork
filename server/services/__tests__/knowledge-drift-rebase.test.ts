@@ -267,3 +267,75 @@ describe("search flags drifted draft hits", () => {
 		expect(hit?.drifted).toBe(true);
 	});
 });
+
+/**
+ * Submitting from a stale base is ALLOWED (approve three-way-merges it and usually succeeds),
+ * but it must be reported: otherwise the conflict only surfaces when a reviewer clicks approve,
+ * by which time the author — the only person who knows what their edit meant — is out of the
+ * loop. The warning rides on the submit result so no extra round-trip is needed.
+ */
+describe("submitForReview reports a drifted base", () => {
+	test("a drifted linked entry submits successfully but carries driftWarning", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `SubmitDrift ${TAG}`,
+			content: "v1 body\n",
+		});
+		const draft = await knowledgeBranchService.createDraft(principal, entry.id, {});
+		await knowledgeBranchService.updateDraft(principal, draft.id, { content: "my edit\n" });
+		// Main advances twice AFTER the fork point → 2 versions behind.
+		await knowledgeService.addRevision(entry.id, { content: "v2 body\n" });
+		await knowledgeService.addRevision(entry.id, { content: "v3 body\n" });
+
+		const submission = await knowledgeBranchService.submitForReview(principal, draft.id, {});
+		// Still a normal pending request — the warning does not block the submit.
+		expect(submission?.status).toBe("pending");
+		expect(submission?.driftWarning).not.toBeNull();
+		expect(submission?.driftWarning?.versionsBehind).toBe(2);
+		expect(submission?.driftWarning?.currentRevisionId).not.toBe(
+			submission?.driftWarning?.baseRevisionId,
+		);
+	});
+
+	test("an up-to-date linked entry reports no drift", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `SubmitFresh ${TAG}`,
+			content: "v1 body\n",
+		});
+		const draft = await knowledgeBranchService.createDraft(principal, entry.id, {});
+		await knowledgeBranchService.updateDraft(principal, draft.id, { content: "my edit\n" });
+
+		const submission = await knowledgeBranchService.submitForReview(principal, draft.id, {});
+		expect(submission?.driftWarning).toBeNull();
+	});
+
+	test("a standalone entry never reports drift (it has no main to drift against)", async () => {
+		const created = await knowledgeBranchService.createStandalone(principal, {
+			title: `SubmitStandalone ${TAG}`,
+			content: "body\n",
+			targetCollectionId: collectionId,
+		});
+		const submission = await knowledgeBranchService.submitForReview(principal, created.id, {});
+		expect(submission?.driftWarning).toBeNull();
+	});
+
+	test("rebasing before submitting clears the warning", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `SubmitAfterRebase ${TAG}`,
+			content: "line one\n",
+		});
+		const draft = await knowledgeBranchService.createDraft(principal, entry.id, {});
+		await knowledgeBranchService.updateDraft(principal, draft.id, {
+			content: "line one\nmy addition\n",
+		});
+		// A non-overlapping main change, so the rebase merges cleanly.
+		await knowledgeService.addRevision(entry.id, { content: "line one\nmain addition\n" });
+		const rebase = await knowledgeBranchService.rebaseDraft(principal, draft.id);
+		expect(rebase.ok).toBe(true);
+
+		const submission = await knowledgeBranchService.submitForReview(principal, draft.id, {});
+		expect(submission?.driftWarning).toBeNull();
+	});
+});

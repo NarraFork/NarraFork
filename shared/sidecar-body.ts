@@ -1,0 +1,834 @@
+/**
+ * sidecar-body.ts — Structured payload for a system injection (side-car).
+ *
+ * ## Why this exists
+ *
+ * A side-car is a block the server injects into what the model reads: a progress
+ * reminder, a Dynamic Spec task digest, a background task's result, a message from
+ * a teammate. Historically each of the ~12 injection points assembled its own
+ * STRING (`content`) out of local variables it already had in structured form —
+ * XML wrappers, `[System]` prefixes, `- ` bullet markers, `join("\n")` — and that
+ * string was the only thing persisted.
+ *
+ * That made the UI's job impossible in the right way: to show anything better than
+ * a wall of pre-wrap text it had to parse the wall back apart with regexes, one
+ * per injection point, guessing at the structure the producer had just discarded.
+ *
+ * So the producers now ALSO emit a `SideCarBody`: the same information, still
+ * structured. `content` stays exactly as it was (the model-facing snapshot, still
+ * produced by each source's existing formatter — see the note below), and the UI
+ * reads `body` instead of parsing `content`.
+ *
+ * ## content vs body — two projections, one truth
+ *
+ *   `content`  the model-facing text. Frozen at write time, byte-for-byte what the
+ *              model saw. Read by `appendSideCarsForApi` and every provider's
+ *              buildHistory. NEVER re-derived at read time: re-rendering it later
+ *              would let a copy-tweak retroactively rewrite historical context.
+ *   `body`     the structured truth. Read by the UI, which projects it to lines via
+ *              `presentSideCarBody`.
+ *
+ * Both are produced at the SAME call site from the SAME locals, which is what keeps
+ * them consistent. `body` is optional: a row written before this existed (or by a
+ * source not yet structured) has `body === undefined`, and the UI falls back to
+ * showing `content` verbatim. There is deliberately NO compatibility parsing —
+ * old rows look exactly as they always did.
+ *
+ * ## What the two audiences get
+ *
+ * They are NOT the same text, and that is the point. A Dynamic Spec reminder tells
+ * the model "keep tasks.json to only text/status/protected, do not add IDs…" —
+ * prompt engineering the reader has no use for. So `presentSideCarBody` projects
+ * only the parts worth READING (the heading, the tasks, the sender, the result) and
+ * drops the model-facing boilerplate. That is why the body carries semantic
+ * discriminants (`variant`, `flavor`, `role`) rather than pre-worded strings: each
+ * side words it for its own audience, and no string needs duplicating across the
+ * server/frontend boundary.
+ *
+ * Zero DOM, zero React, no `server/` imports (this type is reachable from
+ */
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Body payloads
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** One open task in a Dynamic Spec digest. */
+export interface SideCarTaskEntry {
+	/** Why this task is in the digest (its position, not its raw status). */
+	role: "doing" | "next" | "todo" | "blocked";
+	text: string;
+	protected?: boolean;
+}
+
+/** One knowledge-base entry the injection surfaced. */
+export interface SideCarKnowledgeHit {
+	entryId: string;
+	title: string;
+	summary: string;
+}
+
+/** One finished background task (subagent or bash). */
+export interface SideCarDoneTask {
+	id: string;
+	/** Human-facing alias, when the task was launched with one (bash). */
+	alias?: string | null;
+	title: string;
+	status: string;
+	/** Short result/output preview (already capped by the producer). */
+	preview: string;
+	/** The producer clipped the preview. */
+	truncated?: boolean;
+}
+
+/** One message delivered from another narrator (subagent / team / buffered user). */
+export interface SideCarInboundMessage {
+	fromId?: string;
+	fromTitle?: string | null;
+	fromType?: string | null;
+	/** Team channel only: the message went to everyone. */
+	isBroadcast?: boolean;
+	text: string;
+}
+
+/** One spec file the user changed through the UI. */
+export interface SideCarSpecUpdate {
+	uri: string;
+	timestamp: string;
+	updatedBy: string;
+	/** tasks.json only: compiled digest of the open tasks after the save. */
+	taskSummary?: string | null;
+	/** Other files: short content preview. */
+	preview?: string | null;
+}
+
+/**
+ * The structured form of a side-car's content.
+ *
+ * A discriminated union so adding a shape is a compile error at every consumer
+ * (`presentSideCarBody` switches exhaustively) rather than a silent fallthrough.
+ */
+export type SideCarBody =
+	/**
+	 * A fixed reminder whose wording lives in each side's own copy tables, keyed by
+	 * the side-car's `source`. `params` carries the only variable parts.
+	 */
+	| { kind: "notice"; params?: Record<string, string | number> }
+	/** A block of prose the user or the system authored (behaviour fence, buffered message). */
+	| { kind: "prose"; text: string }
+	/**
+	 * A Dynamic Spec task digest. `variant` says WHICH digest this is, so each side
+	 * can word its own heading (the model gets instructions, the reader gets a
+	 * one-line summary).
+	 */
+	| {
+			kind: "tasks";
+			variant: "current" | "emptyNever" | "emptyDone" | "tooMany";
+			tasks?: SideCarTaskEntry[];
+			/** `tooMany` only: how many tasks tripped the threshold. */
+			taskCount?: number;
+			/** `tooMany` only: the threshold that was exceeded. */
+			threshold?: number;
+	  }
+	/** Knowledge-base entries matched against recent output. */
+	| { kind: "knowledge"; hits: SideCarKnowledgeHit[] }
+	/** Background tasks that finished while the narrator was working. */
+	| { kind: "tasksDone"; flavor: "agent" | "bash"; items: SideCarDoneTask[] }
+	/** Messages delivered from other narrators. */
+	| { kind: "messages"; items: SideCarInboundMessage[] }
+	/** Spec files the user edited through the UI. */
+	| { kind: "specUpdates"; items: SideCarSpecUpdate[] };
+
+/** Every `kind` value, for runtime validation of persisted JSON. */
+const SIDECAR_BODY_KINDS = new Set([
+	"notice",
+	"prose",
+	"tasks",
+	"knowledge",
+	"tasksDone",
+	"messages",
+	"specUpdates",
+]);
+
+/**
+ * Narrow a value read back from `body_json` (or a WS payload) to a `SideCarBody`.
+ *
+ * Structural, not exhaustive: it checks the discriminant and that the shape's
+ * collection field is an array. A row whose JSON predates a field simply projects
+ * fewer lines; the point is that a malformed / unknown payload falls back to the
+ * verbatim `content` path instead of throwing inside a render pass.
+ */
+export function coerceSideCarBody(value: unknown): SideCarBody | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const kind = (value as { kind?: unknown }).kind;
+	if (typeof kind !== "string" || !SIDECAR_BODY_KINDS.has(kind)) return undefined;
+	const body = value as SideCarBody;
+	switch (body.kind) {
+		case "prose":
+			return typeof body.text === "string" ? body : undefined;
+		case "knowledge":
+			return Array.isArray(body.hits) ? body : undefined;
+		case "tasksDone":
+		case "messages":
+		case "specUpdates":
+			return Array.isArray(body.items) ? body : undefined;
+		case "tasks":
+			// `tasks` is optional (the empty/tooMany variants carry none), so only its
+			// presence-as-a-non-array is disqualifying.
+			return body.tasks === undefined || Array.isArray(body.tasks) ? body : undefined;
+		case "notice":
+			return body;
+	}
+}
+
+/**
+ * Read the structured body off a side-car record, whichever shape it arrived in.
+ *
+ * Two wire shapes reach the frontend and neither is worth normalizing away at the
+ * source:
+ *   - `body`      — the WS event payload, which mirrors `AgentSideCar`.
+ *   - `bodyJson`  — an HTTP-loaded row, where the field is the DB column name and
+ *                   the whole row is spread through several passthrough layers
+ *                   (`hydrateToolUseSideCars`, `truncateToolIO`,
+ *                   `enrichToolUseBlocks`) that deliberately do not reshape rows.
+ *
+ * Renaming the column on the way out would mean teaching every one of those layers
+ * about this one field; reading both here costs one `??`.
+ */
+export function readSideCarBody(record: unknown): SideCarBody | undefined {
+	if (!record || typeof record !== "object") return undefined;
+	const row = record as { body?: unknown; bodyJson?: unknown };
+	return coerceSideCarBody(row.body ?? row.bodyJson);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tone + form (drives colour AND whether the body opens by default)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * What kind of thing this injection is, from the reader's point of view.
+ *
+ *   `peer`        someone is waiting on you (a teammate, a subagent, your own
+ *                 buffered message).
+ *   `background`  work you started finished and has a result.
+ *   `neutral`     a routine system reminder.
+ *
+ * Three groups, not twelve colours: the previous per-source palette put six hues on
+ * screen at once, which made a routine progress nudge shout as loudly as a message
+ * addressed to the reader.
+ */
+export type SideCarTone = "peer" | "background" | "neutral";
+
+/**
+ * Whether the body shows without being asked for.
+ *
+ *   `open`    the content IS the point — a message someone sent you, a finished
+ *             task's result. Hiding it behind a click is wrong.
+ *   `folded`  a routine reminder. One line is enough; the rest on demand.
+ *
+ * ⚠️ This is a SHAPE, not a default fold state. The measured element still starts
+ * with `expanded === false`; `open` only means the measure layer draws the body
+ * anyway (capped at `SIDECAR_INLINE_MAX_LINES`), and `expanded` then means "show
+ * past that cap". Defaulting the fold state to `true` instead would break the
+ * toggle for a tool card's mini-cards, whose fold lives under a sub-key with no
+ * measured entry and therefore resolves from interaction state alone — the first
+ * click would compute `false` and write `true`, i.e. do nothing visible.
+ */
+export type SideCarForm = "open" | "folded";
+
+const SIDECAR_TONE_BY_SOURCE: Record<string, SideCarTone> = {
+	// Someone is waiting on the reader.
+	team_message: "peer",
+	group_message: "peer",
+	subagent_message: "peer",
+	buffered_user: "peer",
+	// Work the reader started has a result.
+	bg_agent: "background",
+	bg_bash: "background",
+	// Routine system reminders.
+	silent_progress: "neutral",
+	living_work_spec: "neutral",
+	todo_reminder: "neutral",
+	relaxed_plan: "neutral",
+	knowledge_base_hint: "neutral",
+	spec_update: "neutral",
+	behavior_fence: "neutral",
+	pipeline_exit_confirmation: "neutral",
+};
+
+/** Tone for a source tag. Unknown sources are neutral (never shout for them). */
+export function sideCarTone(source: string): SideCarTone {
+	return SIDECAR_TONE_BY_SOURCE[source] ?? "neutral";
+}
+
+/**
+ * Form for a tone. `peer`/`background` open; `neutral` folds.
+ *
+ * Derived from tone rather than stored per source so the two can never disagree:
+ * "worth reading unprompted" and "worth a colour" are the same judgement.
+ */
+export function sideCarForm(tone: SideCarTone): SideCarForm {
+	return tone === "neutral" ? "folded" : "open";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UI projection
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A projected line's role. Drives weight/indent in the render layer; the measure
+ * layer only needs to know that `bullet` reserves a marker lane (so it wraps at a
+ * narrower width than a `text` line).
+ */
+export type SideCarLineKind = "heading" | "text" | "bullet" | "meta";
+
+export interface SideCarLine {
+	kind: SideCarLineKind;
+	text: string;
+	/** `bullet` only: dim the marker + text (a completed / secondary entry). */
+	dimmed?: boolean;
+}
+
+export interface SideCarPresentation {
+	/** The single line a folded card shows. Never empty (falls back to the source label). */
+	headline: string;
+	/** The body lines. Empty when the headline says everything. */
+	lines: SideCarLine[];
+	tone: SideCarTone;
+	form: SideCarForm;
+	/**
+	 * True when this came from the verbatim-`content` fallback rather than a
+	 * structured body. Nothing renders differently; it exists so tests and future
+	 * callers can tell "we have no structure here" from "the structure is empty".
+	 */
+	isRaw: boolean;
+}
+
+/**
+ * Copy the projection needs, injected the same way every other adapter string is
+ * (`ctx.labels`). Keys are resolved through {@link SIDECAR_PRESENTATION_FALLBACKS}
+ * when absent, so a hand-written fixture never renders blank.
+ */
+export type SideCarLabels = Readonly<Record<string, string>>;
+
+/**
+ * English fallbacks for the projection's copy.
+ *
+ * These are USER-FACING and deliberately short — the model-facing instruction
+ * boilerplate that shares an injection with them is not projected at all (see the
+ * module header on the two audiences), so it never needs an entry here.
+ *
+ * `{n}` / `{name}` / `{uri}` are interpolated by `fill` below.
+ */
+export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = {
+	// Per-source headline for the fixed reminders.
+	noticeSilentProgress: "You have made {count} tool calls without a visible reply",
+	noticeRelaxedPlan: "Still in plan mode — keep planning, do not implement yet",
+	noticePipelineExit: "Pipeline is still active — confirm whether it is still needed",
+	// Dynamic Spec digests.
+	tasksCurrent: "Dynamic Spec — {n} open task(s)",
+	tasksEmptyNever: "Dynamic Spec — no tasks created yet",
+	tasksEmptyDone: "Dynamic Spec — all tasks done, time to reorganize",
+	tasksTooMany: "Dynamic Spec — {n} tasks, over the reorganize threshold",
+	taskRoleDoing: "doing",
+	taskRoleNext: "next",
+	taskRoleTodo: "todo",
+	taskRoleBlocked: "blocked",
+	taskProtected: "protected",
+	// Knowledge base.
+	knowledgeHeading: "{n} relevant knowledge entr(y/ies)",
+	// Background tasks.
+	tasksDoneAgentHeading: "{n} background agent(s) finished",
+	tasksDoneBashHeading: "{n} background command(s) finished",
+	tasksDoneTruncated: "result truncated",
+	// Inbound messages.
+	messagesHeading: "{n} message(s)",
+	messageFromUnknown: "unknown sender",
+	messageBroadcast: "broadcast",
+	// Spec updates.
+	specUpdatesHeading: "{n} spec file(s) updated by you",
+	// Behaviour fence.
+	proseFenceHeading: "Behaviour fence",
+	// Generic.
+	empty: "(empty)",
+};
+
+function label(labels: SideCarLabels | undefined, key: string): string {
+	return labels?.[key] ?? SIDECAR_PRESENTATION_FALLBACKS[key] ?? key;
+}
+
+function fill(
+	template: string,
+	params: Readonly<Record<string, string | number>> | undefined,
+): string {
+	if (!params) return template;
+	let out = template;
+	for (const [k, v] of Object.entries(params)) out = out.replaceAll(`{${k}}`, String(v));
+	return out;
+}
+
+function labelWith(
+	labels: SideCarLabels | undefined,
+	key: string,
+	params: Readonly<Record<string, string | number>>,
+): string {
+	return fill(label(labels, key), params);
+}
+
+/**
+ * Collapse a value to one readable line (used for headlines derived from prose).
+ *
+ * The slice comes BEFORE the whitespace collapse on purpose. `replace(/\s+/g, " ")`
+ * over a multi-megabyte body would allocate a multi-megabyte intermediate string only
+ * to throw all but `max` chars of it away. A prefix of `max * 2` cannot change the
+ * result: collapsing only ever shortens, so any run of whitespace past that prefix
+ * lands beyond the cut anyway.
+ */
+function flatten(text: string, max = 160): string {
+	const cut = max * 2;
+	if (text.length <= cut) {
+		const compact = text.replace(/\s+/g, " ").trim();
+		return compact.length <= max ? compact : `${compact.slice(0, max)}…`;
+	}
+	const compact = text.slice(0, cut).replace(/\s+/g, " ").trim();
+	if (compact.length > max) return `${compact.slice(0, max)}…`;
+	// A whitespace-heavy prefix can collapse to under `max` even though the input was
+	// long, so the ellipsis has to be decided by whether real text survives past the
+	// cut. Probed with a sticky-start regex rather than `slice(cut).trim()` so the
+	// discarded tail is never materialized.
+	const probe = /\S/g;
+	probe.lastIndex = cut;
+	return probe.test(text) ? `${compact}…` : compact;
+}
+
+/**
+ * Hard ceiling on the lines ONE projection may emit.
+ *
+ * The measure layer already refuses to lay out more than `SIDECAR_DETAIL_MAX_LINES`
+ * (40) rows, but it reaches that decision AFTER this projection has built the whole
+ * array — so an item carrying a 200k-line preview used to cost a 200k-element array
+ * per measure pass to then draw 40 of them. Capping here keeps the cost proportional
+ * to what can ever be painted. Deliberately above the measure ceiling: `lines` also
+ * feeds `totalLineCount`, and a projection clipped at exactly 40 would report "40
+ * lines" for a body of thousands.
+ *
+ * `fullText` (the copy control) is unaffected — the complete text stays one click away.
+ */
+export const SIDECAR_PROJECTION_MAX_LINES = 200;
+
+/**
+ * Split prose into `text` lines, collapsing blank runs.
+ *
+ * Blank lines become nothing rather than an empty line: the render layer expresses
+ * the separation with block spacing, and an actually-painted blank line inside a
+ * fixed-height body lane is one measured row of nothing (the `spec_update`
+ * `header\n\nbody` shape used to draw exactly that).
+ *
+ * `budget` bounds how many lines this call may contribute, so a projection that
+ * concatenates several prose runs (messages, tasksDone, specUpdates) stays under
+ * `SIDECAR_PROJECTION_MAX_LINES` in total rather than per item.
+ */
+function proseLines(text: string, budget = SIDECAR_PROJECTION_MAX_LINES): SideCarLine[] {
+	const out: SideCarLine[] = [];
+	if (budget <= 0) return out;
+	for (const raw of text.split("\n")) {
+		if (out.length >= budget) break;
+		const line = raw.trimEnd();
+		if (!line.trim()) continue;
+		out.push({ kind: "text", text: line });
+	}
+	return out;
+}
+
+/** Remaining line budget for a projection that has already emitted `lines`. */
+function remainingBudget(lines: readonly SideCarLine[]): number {
+	return SIDECAR_PROJECTION_MAX_LINES - lines.length;
+}
+
+/** Headline for the fixed-copy reminders, keyed by side-car source. */
+function noticeHeadline(
+	source: string,
+	params: Readonly<Record<string, string | number>> | undefined,
+	labels: SideCarLabels | undefined,
+): string {
+	switch (source) {
+		case "silent_progress":
+			return labelWith(labels, "noticeSilentProgress", { count: params?.count ?? 0 });
+		case "relaxed_plan":
+			return label(labels, "noticeRelaxedPlan");
+		case "pipeline_exit_confirmation":
+			return label(labels, "noticePipelineExit");
+		default:
+			// An unmapped notice source: the caller's own source label is the best we
+			// can say, and it is already painted beside the headline.
+			return "";
+	}
+}
+
+/** Sender prefix for one inbound message. */
+function senderLabel(message: SideCarInboundMessage, labels: SideCarLabels | undefined): string {
+	const name = message.fromTitle?.trim() || message.fromId?.slice(0, 8) || "";
+	const base = name || label(labels, "messageFromUnknown");
+	const type = message.fromType?.trim();
+	const suffix = message.isBroadcast ? ` · ${label(labels, "messageBroadcast")}` : "";
+	return type ? `${base} (${type})${suffix}` : `${base}${suffix}`;
+}
+
+/**
+ * Project a structured body to the lines the reader sees.
+ *
+ * Exhaustive over `SideCarBody["kind"]` — adding a shape without teaching this
+ * function about it is a compile error, which is the whole reason the payload is a
+ * discriminated union.
+ */
+export function presentSideCarBody(
+	source: string,
+	body: SideCarBody,
+	labels?: SideCarLabels,
+): SideCarPresentation {
+	const tone = sideCarTone(source);
+	const base = { tone, form: sideCarForm(tone), isRaw: false } as const;
+
+	switch (body.kind) {
+		case "notice": {
+			// A fixed reminder is one sentence: it belongs entirely in the headline, so
+			// the folded row already shows everything and there is nothing to unfold.
+			return { ...base, headline: noticeHeadline(source, body.params, labels), lines: [] };
+		}
+
+		case "prose": {
+			// The fence is a named thing, so it gets a stable heading; any other prose
+			// (a buffered user message) has no name and its own first line is the best
+			// headline. Either way the full text stays in `lines`, because the headline
+			// is a one-line flattening and the reader must be able to see the rest.
+			const headline =
+				source === "behavior_fence" ? label(labels, "proseFenceHeading") : flatten(body.text);
+			return { ...base, headline, lines: proseLines(body.text) };
+		}
+
+		case "tasks": {
+			const tasks = body.tasks ?? [];
+			const headline =
+				body.variant === "current"
+					? labelWith(labels, "tasksCurrent", { n: tasks.length })
+					: body.variant === "emptyNever"
+						? label(labels, "tasksEmptyNever")
+						: body.variant === "emptyDone"
+							? label(labels, "tasksEmptyDone")
+							: labelWith(labels, "tasksTooMany", { n: body.taskCount ?? 0 });
+			// Only the tasks are projected. The digest's other half — "keep tasks.json to
+			// only text/status/protected", "do not add IDs" — is instruction aimed at the
+			// model; showing it to the reader is the noise this redesign removes.
+			const lines: SideCarLine[] = tasks.slice(0, SIDECAR_PROJECTION_MAX_LINES).map((task) => ({
+				kind: "bullet" as const,
+				text: `${label(labels, taskRoleKey(task.role))}: ${task.text}${
+					task.protected ? ` · ${label(labels, "taskProtected")}` : ""
+				}`,
+				...(task.role === "todo" ? { dimmed: true } : {}),
+			}));
+			return { ...base, headline, lines };
+		}
+
+		case "knowledge": {
+			return {
+				...base,
+				headline: labelWith(labels, "knowledgeHeading", { n: body.hits.length }),
+				lines: body.hits.slice(0, SIDECAR_PROJECTION_MAX_LINES).map((hit) => ({
+					kind: "bullet" as const,
+					text: hit.summary ? `${hit.title} — ${hit.summary}` : hit.title,
+				})),
+			};
+		}
+
+		case "tasksDone": {
+			const key = body.flavor === "bash" ? "tasksDoneBashHeading" : "tasksDoneAgentHeading";
+			const lines: SideCarLine[] = [];
+			for (const item of body.items) {
+				if (remainingBudget(lines) <= 0) break;
+				const name = item.title?.trim() || item.alias?.trim() || item.id;
+				lines.push({ kind: "heading", text: `${name} · ${item.status}` });
+				lines.push(...proseLines(item.preview || label(labels, "empty"), remainingBudget(lines)));
+				if (item.truncated) lines.push({ kind: "meta", text: label(labels, "tasksDoneTruncated") });
+			}
+			return {
+				...base,
+				headline: labelWith(labels, key, { n: body.items.length }),
+				lines,
+			};
+		}
+
+		case "messages": {
+			const lines: SideCarLine[] = [];
+			for (const message of body.items) {
+				if (remainingBudget(lines) <= 0) break;
+				const from = senderLabel(message, labels);
+				if (from) lines.push({ kind: "heading", text: from });
+				lines.push(...proseLines(message.text, remainingBudget(lines)));
+			}
+			// One message from a named sender reads better with the sender on the folded
+			// row than a bare "1 message".
+			const single = body.items.length === 1 ? body.items[0] : undefined;
+			const headline =
+				single && senderLabel(single, labels)
+					? senderLabel(single, labels)
+					: labelWith(labels, "messagesHeading", { n: body.items.length });
+			return { ...base, headline, lines };
+		}
+
+		case "specUpdates": {
+			const lines: SideCarLine[] = [];
+			for (const item of body.items) {
+				if (remainingBudget(lines) <= 0) break;
+				lines.push({ kind: "heading", text: item.uri });
+				const detail = item.taskSummary ?? item.preview;
+				if (detail) lines.push(...proseLines(detail, remainingBudget(lines)));
+			}
+			const single = body.items.length === 1 ? body.items[0] : undefined;
+			return {
+				...base,
+				headline: single
+					? single.uri
+					: labelWith(labels, "specUpdatesHeading", { n: body.items.length }),
+				lines,
+			};
+		}
+	}
+}
+
+function taskRoleKey(role: SideCarTaskEntry["role"]): string {
+	switch (role) {
+		case "doing":
+			return "taskRoleDoing";
+		case "next":
+			return "taskRoleNext";
+		case "blocked":
+			return "taskRoleBlocked";
+		case "todo":
+			return "taskRoleTodo";
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Model projection — the ONE place a body becomes model-facing text
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The model-facing copy a body needs, injected by the server.
+ *
+ * Every value is a TEMPLATE with `{placeholder}` slots, resolved from
+ * `server/lib/i18n.ts` (see `sideCarModelTemplates`). They live there rather than
+ * here because they are prompt copy — localized, versioned and edited alongside the
+ * rest of the model-facing strings — while this module owns only the assembly.
+ *
+ * Keys are grouped by body kind; each renderer below documents the ones it reads.
+ */
+export type SideCarModelTemplates = Readonly<Record<string, string>>;
+
+function tpl(
+	templates: SideCarModelTemplates,
+	key: string,
+	params?: Readonly<Record<string, string | number>>,
+): string {
+	return fill(templates[key] ?? "", params);
+}
+
+/**
+ * Assemble the model-facing text for a structured body.
+ *
+ * ## Byte-for-byte parity is the contract
+ *
+ * This replaces twelve hand-rolled `join("\n")` sites, and the text it produces goes
+ * straight into the model's context. So every branch below reproduces its
+ * predecessor's output EXACTLY — same wrappers, same prefixes, same blank lines,
+ * same trailing hints. `shared/__tests__/sidecar-body.test.ts` pins that against the
+ * original formatters, which are all still exported (they have non-side-car callers
+ * too, e.g. the compact-context builder).
+ *
+ * That is also why the shapes below look more verbose than the UI projection: the
+ * model gets the instruction boilerplate ("do not add IDs…", "Use Await(…)") that
+ * `presentSideCarBody` deliberately drops.
+ */
+export function renderSideCarBodyToText(
+	source: string,
+	body: SideCarBody,
+	templates: SideCarModelTemplates,
+): string {
+	switch (body.kind) {
+		case "notice":
+			// One fixed string per source, parameterized. `noticeKey` maps the source to
+			// its template so an unmapped source yields "" rather than a wrong reminder.
+			return tpl(templates, noticeModelKey(source), body.params);
+
+		case "prose":
+			// `proseHeading` is optional: the fence prefixes a heading line, a buffered
+			// user message is emitted bare (it is the user's own words).
+			return joinHeading(tpl(templates, `${source}Heading`), body.text);
+
+		case "tasks":
+			return renderTasksToText(body, templates);
+
+		case "knowledge": {
+			// `formatInjectionsBare`: heading, one `- [id] title: summary` per hit, then a
+			// blank line and the read-more hint.
+			const lines = body.hits.map((hit) => `- [${hit.entryId}] ${hit.title}: ${hit.summary}`);
+			return `${tpl(templates, "knowledgeHeading")}\n${lines.join("\n")}\n\n${tpl(
+				templates,
+				"knowledgeReadHint",
+			)}`;
+		}
+
+		case "tasksDone":
+			return body.items
+				.map((item) =>
+					body.flavor === "bash"
+						? // `[System] Background bash "title" (ID: alias) status.` + preview line.
+							tpl(templates, "bgBashEntry", {
+								title: item.title || item.id,
+								id: item.alias ?? item.id,
+								status: item.status,
+								preview: item.preview || tpl(templates, "emptyResult"),
+							})
+						: // Agent flavour additionally tells the model how to follow up.
+							tpl(templates, "bgAgentEntry", {
+								title: item.title,
+								id: item.id,
+								status: item.status,
+								preview: item.preview || tpl(templates, "emptyResult"),
+							}),
+				)
+				.join("\n\n");
+
+		case "messages":
+			return body.items
+				.map((message) => {
+					if (source === "buffered_user") return message.text;
+					const isTeam = source === "team_message";
+					// The two channels differ in how they name an untitled sender, and both
+					// forms are load-bearing for byte parity with their predecessors: the team
+					// template interpolated `fromTitle ?? fromId` (the FULL id), while the
+					// parent-report template used an 8-char prefix (`senderLabel` in
+					// parent-inbound-queue).
+					const name = isTeam
+						? (message.fromTitle ?? message.fromId ?? "")
+						: message.fromTitle?.trim() || message.fromId?.slice(0, 8) || "";
+					return tpl(templates, isTeam ? "teamMessageEntry" : "subagentMessageEntry", {
+						name,
+						type: message.fromType ?? "",
+						channel: tpl(templates, message.isBroadcast ? "teamBroadcast" : "teamDirect"),
+						text: message.text,
+					});
+				})
+				.join(source === "team_message" ? "\n" : "\n\n");
+
+		case "specUpdates": {
+			// `formatSpecUpdateSideCars`: one heading, a blank line, then per-file blocks.
+			const blocks = body.items.map((item) => {
+				const head = tpl(templates, "specUpdateEntry", {
+					uri: item.uri,
+					timestamp: item.timestamp,
+				});
+				if (item.taskSummary) return `${head}\n${item.taskSummary}`;
+				if (item.preview) return `${head}\n${tpl(templates, "specUpdatePreview")}\n${item.preview}`;
+				return head;
+			});
+			return `${tpl(templates, "specUpdateHeading")}\n\n${blocks.join("\n\n")}`;
+		}
+	}
+}
+
+/** Prefix `text` with `heading` when there is one (the fence shape). */
+function joinHeading(heading: string, text: string): string {
+	return heading ? `${heading}\n${text}` : text;
+}
+
+/** Model template key for a fixed reminder, by side-car source. */
+function noticeModelKey(source: string): string {
+	switch (source) {
+		case "silent_progress":
+			return "noticeSilentProgress";
+		case "relaxed_plan":
+			return "noticeRelaxedPlan";
+		case "pipeline_exit_confirmation":
+			return "noticePipelineExit";
+		default:
+			return "";
+	}
+}
+
+/**
+ * The Dynamic Spec digest, in its four variants.
+ *
+ * Mirrors `spec-reminder.ts`: a heading, the task lines (`- role: text [protected]`),
+ * then the fixed instruction notes. The notes differ per variant, and the `current`
+ * variant additionally appends the blocked-task action instruction — all of which
+ * arrive as templates so the wording stays in the server's i18n table.
+ */
+function renderTasksToText(
+	body: Extract<SideCarBody, { kind: "tasks" }>,
+	templates: SideCarModelTemplates,
+): string {
+	const lines: string[] = [];
+	switch (body.variant) {
+		case "current": {
+			lines.push(tpl(templates, "tasksCurrentHeading"));
+			for (const task of body.tasks ?? []) {
+				lines.push(`- ${task.role}: ${task.text}${task.protected ? " [protected]" : ""}`);
+			}
+			lines.push(tpl(templates, "tasksCurrentUpdateNote"));
+			lines.push(tpl(templates, "tasksSemanticsNote"));
+			lines.push(tpl(templates, "tasksBlockedActionNote"));
+			break;
+		}
+		case "emptyNever":
+			lines.push(
+				tpl(templates, "tasksEmptyHeading"),
+				tpl(templates, "tasksEmptyNeverCreate"),
+				tpl(templates, "tasksEmptyNeverSkip"),
+				tpl(templates, "tasksFieldsNote"),
+				tpl(templates, "tasksSemanticsNote"),
+			);
+			break;
+		case "emptyDone":
+			lines.push(
+				tpl(templates, "tasksEmptyHeading"),
+				tpl(templates, "tasksEmptyDoneReorganize"),
+				tpl(templates, "tasksEmptyDoneContinue"),
+				tpl(templates, "tasksFieldsNote"),
+				tpl(templates, "tasksSemanticsNote"),
+			);
+			break;
+		case "tooMany":
+			lines.push(
+				tpl(templates, "tasksTooManyHeading", {
+					count: body.taskCount ?? 0,
+					threshold: body.threshold ?? 0,
+				}),
+				tpl(templates, "tasksTooManyReorganize"),
+				tpl(templates, "tasksTooManyProtected"),
+				tpl(templates, "tasksFieldsNote"),
+				tpl(templates, "tasksSemanticsNote"),
+			);
+			break;
+	}
+	return lines.join("\n");
+}
+
+/**
+ * The projection for a side-car with NO structured body: show `content` verbatim.
+ *
+ * This is the entire compatibility story for rows written before `body` existed.
+ * There is deliberately no parsing — no XML unwrapping, no `[System]` stripping, no
+ * bullet detection. Those rows keep looking exactly as they always have, and the
+ * complexity of guessing at a producer's discarded structure never enters the code.
+ */
+export function presentRawSideCar(source: string, content: string): SideCarPresentation {
+	const tone = sideCarTone(source);
+	return {
+		headline: flatten(content, 120),
+		lines: proseLines(content),
+		tone,
+		// Raw rows always fold: their content is an unknown shape of unknown length,
+		// and opening it unprompted is how the old cards took over the screen.
+		form: "folded",
+		isRaw: true,
+	};
+}

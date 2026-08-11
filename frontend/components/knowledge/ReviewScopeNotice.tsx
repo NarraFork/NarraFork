@@ -22,7 +22,7 @@ export function ReviewScopeNotice() {
 	// Stay silent while loading or on error: this is an explainer, not a gate, and a failed
 	// fetch must not imply "you have no review rights".
 	if (!scope.data) return null;
-	const { isAdmin, reviewTags, collections, truncated } = scope.data;
+	const { isAdmin, reviewTags, collections, ownedEntryCount, truncated } = scope.data;
 
 	if (isAdmin) {
 		return (
@@ -38,7 +38,9 @@ export function ReviewScopeNotice() {
 		);
 	}
 
-	const hasNothing = reviewTags.length === 0 && collections.length === 0;
+	// Owning entries counts as review authority (canReview short-circuits on the owner), so it
+	// must not be reported as "you have no review rights".
+	const hasNothing = reviewTags.length === 0 && collections.length === 0 && ownedEntryCount === 0;
 
 	return (
 		<Alert
@@ -86,6 +88,11 @@ export function ReviewScopeNotice() {
 									{t("reviewScopeCollectionsHint")}
 								</Text>
 							</div>
+						) : null}
+						{ownedEntryCount > 0 ? (
+							<Text size="xs" c="dimmed">
+								{t("reviewScopeOwnedHint", { count: ownedEntryCount })}
+							</Text>
 						) : null}
 					</>
 				)}

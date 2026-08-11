@@ -24,12 +24,37 @@ export function setGlobalCloseSwipe(fn: (() => void) | null) {
 /** The blockId of the first swiped ContentViewer / ToolCallCard. */
 let globalSwipeAnchor: string | null = null;
 
+/**
+ * Listeners notified whenever the anchor changes.
+ *
+ * A VIRTUALIZED list has to react to this: it mounts only the rows near the
+ * viewport, so once the anchor's row scrolls past the overscan band it would be
+ * unmounted — and `useSwipeMenu`'s unmount cleanup clears both the anchor and the
+ * global close handler, which is exactly the pair `onTouchStart` requires to treat
+ * the next swipe as a range-select. The list therefore subscribes here and pins the
+ * anchor's row into its mounted window (see vlist-swipe-anchor.ts).
+ */
+const swipeAnchorListeners = new Set<() => void>();
+
 export function getGlobalSwipeAnchor() {
 	return globalSwipeAnchor;
 }
 
 export function setGlobalSwipeAnchor(blockId: string | null) {
+	// Equality short-circuit: `useSwipeMenu` re-asserts the same anchor on every
+	// reveal-effect run, and notifying on a no-op would re-render the subscriber
+	// (the whole message list) for nothing.
+	if (globalSwipeAnchor === blockId) return;
 	globalSwipeAnchor = blockId;
+	for (const listener of swipeAnchorListeners) listener();
+}
+
+/** Subscribe to anchor changes (useSyncExternalStore-shaped). */
+export function subscribeGlobalSwipeAnchor(listener: () => void): () => void {
+	swipeAnchorListeners.add(listener);
+	return () => {
+		swipeAnchorListeners.delete(listener);
+	};
 }
 
 // ---------------------------------------------------------------------------

@@ -22,7 +22,6 @@ import {
 	narratorWhitelistCmds,
 	narratorWhitelistDirs,
 	terminals,
-	terminalTabs,
 	terminalViewState,
 	users,
 } from "../db/schema";
@@ -1528,7 +1527,6 @@ export const narratorService = {
 				narratorId,
 			);
 			tx.delete(terminalViewState).where(eq(terminalViewState.narratorId, narratorId)).run();
-			tx.delete(terminalTabs).where(eq(terminalTabs.narratorId, narratorId)).run();
 			tx.delete(terminals).where(eq(terminals.narratorId, narratorId)).run();
 			tx.delete(narratorBufferedMessages)
 				.where(eq(narratorBufferedMessages.narratorId, narratorId))

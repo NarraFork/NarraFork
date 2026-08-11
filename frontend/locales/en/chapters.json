@@ -128,11 +128,5 @@
 	},
 	"status": {
 		"frozen": "Frozen"
-	},
-	"commitDetail": {
-		"noDiff": "No file changes in this commit.",
-		"diffPreviewTruncated": "Diff preview truncated to keep the UI responsive.",
-		"filesPreviewTruncated": "Showing the first 1,000 files. {{count}} more hidden.",
-		"messagePreviewTruncated": "Commit message preview truncated to keep the UI responsive."
 	}
 }

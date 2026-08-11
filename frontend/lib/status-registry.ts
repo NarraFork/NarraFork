@@ -338,7 +338,28 @@ const projectStatusMap: StatusMap<ProjectStatus> = {
 // Edge Type
 // ---------------------------------------------------------------------------
 
+/**
+ * Every edge type that can REACH the canvas, which is the full `chapter_edges.type` enum —
+ * including the two nothing creates any more.
+ *
+ * `dependency` edges were user-drawn and the feature was removed; `cherry_pick` edges were
+ * never created by anything. Both stay here because rows of either kind may still sit in an
+ * existing database, and a graph that cannot colour a row it loaded would render a default
+ * grey line instead of a labelled one.
+ *
+ * ⚠️ Wider than {@link QueryableEdgeType}: this is a DISPLAY vocabulary, not a request one.
+ */
 export type EdgeType = "fork" | "merge" | "dependency" | "cherry_pick" | "review";
+
+/**
+ * The subset `GET /api/chapter-edges?type=` accepts.
+ *
+ * The route validates against exactly these three (the types operations still produce) and
+ * answers anything else with a 400 — so passing a display-only type from {@link EdgeType} to
+ * a query is a request error, not an empty result. Kept as its own type so that mistake is a
+ * compile error at the call site rather than a runtime 400.
+ */
+export type QueryableEdgeType = "fork" | "merge" | "review";
 
 const edgeTypeMap: StatusMap<EdgeType> = {
 	fork: { color: "#4c6ef5", icon: "", i18nKey: "status.edgeFork" },

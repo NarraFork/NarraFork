@@ -30,6 +30,25 @@ async function principalOf(ctx: ToolContext): Promise<Principal> {
 const KNOWLEDGE_WRITE_TOOL_HINT =
 	"To write knowledge, use KnowledgeCreate / KnowledgeEdit — if they are not in your tool list, load them first (`/load KnowledgeCreate`, `/load KnowledgeEdit`).";
 
+/**
+ * Fuller tool map, appended to KnowledgeLibrary output only.
+ *
+ * KNOWLEDGE_WRITE_TOOL_HINT rides on every search/read result, so it has to stay one line and
+ * names only the two tools a contributor needs next. That left the remaining optional tools
+ * (review, ACL admin, packs) with NO discovery path at all: they are in OPTIONAL_TOOLS, absent
+ * from the tool list until loaded, and nothing ever mentioned them. KnowledgeLibrary is the
+ * orientation call ("what is in here, what is mine"), so the complete map belongs here — read
+ * once when getting your bearings, not on every single lookup.
+ *
+ * Same dual-audience wording as the short hint: correct whether or not the tools are loaded.
+ */
+const KNOWLEDGE_TOOL_MAP_HINT =
+	"Knowledge tools (load with `/load <name>` if absent from your tool list): " +
+	"KnowledgeCreate + KnowledgeEdit to author, publish, and track your own publish requests " +
+	"(KnowledgeEdit action 'my_submissions'); KnowledgeReview to review OTHERS' publish requests; " +
+	"KnowledgeAdmin for collections/levels/tags/grants (admin only); " +
+	"PackList / PackActivate / PackDeactivate for knowledge packs (file bundles attached to entries).";
+
 // ─── KnowledgeSearch ───
 export const knowledgeSearchTool: ToolDefinition = {
 	name: "KnowledgeSearch",
@@ -212,8 +231,14 @@ export const knowledgeReadTool: ToolDefinition = {
 				},
 			};
 		} catch {
+			// Deliberately does NOT distinguish "no such id" from "no permission" — telling the
+			// caller which one it is leaks the existence of entries they may not see. But name
+			// both possibilities and the way forward, or the agent has no next move.
 			return {
-				output: `Knowledge entry not found or not accessible: ${entryId}`,
+				output:
+					`Knowledge entry not found or not accessible: ${entryId}. ` +
+					`Either the id is wrong or your clearance/tags do not cover it. ` +
+					`Use KnowledgeSearch to get valid ids, or ask an admin for access.`,
 				isError: true,
 			};
 		}
@@ -298,7 +323,7 @@ export const knowledgeLibraryTool: ToolDefinition = {
 						`- [${c.id}] ${c.name} (slug: ${c.slug})${c.writable ? " — writable (direct create/save allowed)" : " — read-only (publish via KnowledgeEdit review)"}`,
 				);
 				return {
-					output: `${summaries.length} readable collection${summaries.length === 1 ? "" : "s"}${rows.length > summaries.length ? ` (of ${rows.length}; raise 'limit' for more)` : ""}:\n${lines.join("\n")}\n\n${KNOWLEDGE_WRITE_TOOL_HINT}`,
+					output: `${summaries.length} readable collection${summaries.length === 1 ? "" : "s"}${rows.length > summaries.length ? ` (of ${rows.length}; raise 'limit' for more)` : ""}:\n${lines.join("\n")}\n\n${KNOWLEDGE_TOOL_MAP_HINT}`,
 					title: "KnowledgeLibrary: list_collections",
 					metadata: {
 						tool: "KnowledgeLibrary",
@@ -319,7 +344,7 @@ export const knowledgeLibraryTool: ToolDefinition = {
 			const mine = await knowledgeBranchService.listMine(principal, { status, limit: max });
 			if (mine.length === 0) {
 				return {
-					output: `Your personal knowledge library is empty.\n\n${KNOWLEDGE_WRITE_TOOL_HINT}`,
+					output: `Your personal knowledge library is empty.\n\n${KNOWLEDGE_TOOL_MAP_HINT}`,
 					title: "KnowledgeLibrary: list_mine",
 					metadata: { tool: "KnowledgeLibrary", action, count: 0, personalEntries: [] },
 				};
@@ -349,7 +374,10 @@ export const knowledgeLibraryTool: ToolDefinition = {
 				return `- [${s.personalEntryId}] ${s.title ?? "(inherits global title)"} — ${kind}; status ${s.status}, ${s.contentLength} chars`;
 			});
 			return {
-				output: `${summaries.length} personal entr${summaries.length === 1 ? "y" : "ies"}:\n${lines.join("\n")}\n\nUse KnowledgeEdit (save / rebase / set_target / publish) to work on these.`,
+				output:
+					`${summaries.length} personal entr${summaries.length === 1 ? "y" : "ies"}:\n${lines.join("\n")}\n\n` +
+					`Use KnowledgeEdit to work on these (save / rebase / set_target / publish, then ` +
+					`my_submissions / withdraw / resubmit to follow a publish request through review).`,
 				title: "KnowledgeLibrary: list_mine",
 				metadata: {
 					tool: "KnowledgeLibrary",

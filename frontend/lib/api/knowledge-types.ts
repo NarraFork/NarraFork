@@ -18,7 +18,11 @@ export type KnowledgeSubmissionStatus =
 	// Auto-closed because the author edited/rebased the draft, so the proposed content
 	// no longer matches. NOT a reviewer verdict (that's `rejected`).
 	| "superseded";
-export type KnowledgeVerdict = "approve" | "request_changes" | "comment_only";
+/**
+ * Reviewer verdicts. `reject` is the terminal refusal (status → `rejected`, no resubmit);
+ * `request_changes` bounces the request back for another round.
+ */
+export type KnowledgeVerdict = "approve" | "request_changes" | "reject" | "comment_only";
 export type FindingSeverity = "critical" | "major" | "minor" | "suggestion";
 
 export interface KnowledgeCollection {
@@ -71,17 +75,31 @@ export interface KnowledgeSearchResult {
 	snippet: string;
 }
 
-export interface KnowledgeRevision {
+/**
+ * A revision's METADATA, as returned by the history list.
+ *
+ * The body is deliberately absent: a list of N versions of a large document would otherwise ship
+ * N full bodies. Use `getKnowledgeRevision(id)` for the content of the specific versions you need
+ * (e.g. the two sides of a diff).
+ */
+export interface KnowledgeRevisionSummary {
 	id: string;
 	entryId: string;
 	version: number;
 	format: KnowledgeFormat;
-	content: string;
 	contentHash: string;
 	changeNote: string | null;
 	authorUserId: string | null;
+	authorNarratorId?: string | null;
 	baseRevisionId: string | null;
 	createdAt: string;
+	/** Body size in characters — computed in SQL; the body itself is not included. */
+	contentLength: number;
+}
+
+/** A single revision WITH its body (single-revision fetch). */
+export interface KnowledgeRevision extends Omit<KnowledgeRevisionSummary, "contentLength"> {
+	content: string;
 }
 
 export interface KnowledgeDraft {
@@ -124,6 +142,12 @@ export interface KnowledgePersonalEntrySummary {
 	status: "active" | "archived";
 	createdAt: string;
 	updatedAt: string;
+	/**
+	 * True when this is a LINKED personal entry whose fork point is no longer main's current
+	 * revision — i.e. it needs a rebase. Resolved for the whole page in one query by the list
+	 * endpoint, so the badge costs nothing extra. Always false for standalone entries (no main).
+	 */
+	drifted?: boolean;
 }
 
 /**
@@ -186,6 +210,24 @@ export interface KnowledgeSubmission {
 /** getSubmission adds a unified diff string. */
 export interface KnowledgeSubmissionDetail extends KnowledgeSubmission {
 	diff: string;
+}
+
+/**
+ * Submitting reports back whether the proposal was built on a STALE main revision.
+ *
+ * Not an error: approve three-way-merges a drifted base and usually succeeds. But the author
+ * is the only one who knows what their edit meant, so they get told while they can still
+ * rebase cheaply — rather than the reviewer discovering the conflict at approve time.
+ * Absent (null) = the proposal is based on current main.
+ */
+export interface KnowledgeSubmitDriftWarning {
+	versionsBehind: number;
+	baseRevisionId: string;
+	currentRevisionId: string;
+}
+
+export interface KnowledgeSubmitResult extends KnowledgeSubmission {
+	driftWarning: KnowledgeSubmitDriftWarning | null;
 }
 
 /**
@@ -421,5 +463,10 @@ export interface KnowledgeReviewScope {
 	reviewTags: { id: string; name: string }[];
 	/** Readable collections the caller may write into (→ may approve standalone publishes). */
 	collections: { id: string; name: string; slug: string }[];
+	/**
+	 * Entries the caller OWNS. Ownership is a third review path (canReview short-circuits on it),
+	 * so someone with no grants at all may still review proposals on their own entries.
+	 */
+	ownedEntryCount: number;
 	truncated: boolean;
 }

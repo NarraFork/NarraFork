@@ -113,6 +113,7 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
@@ -307,6 +308,7 @@ import { compactProgressLabel } from "./progress-label";
 import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
 import { RevertScopeConfirmModal } from "./RevertScopeConfirmModal";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
+import { resolveSelectionOverlayBlockId } from "./selection-anchor-overlay";
 import {
 	getGlobalCloseSwipe,
 	type SwipeAnchorInfo,
@@ -5036,6 +5038,9 @@ export function NarratorPanel({
 	const [compactingMarkerOverlay, setCompactingMarkerOverlay] = useState<SwipeAnchorInfo | null>(
 		null,
 	);
+	const [selectionAnchorOverlay, setSelectionAnchorOverlay] = useState<SwipeAnchorInfo | null>(
+		null,
+	);
 
 	useEffect(() => {
 		setGlobalOnSwipeAnchorInfo(setSwipeAnchorOverlay);
@@ -5585,6 +5590,123 @@ export function NarratorPanel({
 			mutationObserver.disconnect();
 		};
 	}, [compactingMarkerKind, isWorkspacePreview, scrollToMessageTarget, t]);
+
+	/**
+	 * Desktop: keep a preview strip on the ONE selected block once it scrolls out of
+	 * the message area, so the reader retains a handle on where the selection is.
+	 *
+	 * Same strip and same producer contract as the touch swipe anchor and the
+	 * compaction marker (see `resolveSelectionOverlayBlockId` for why this producer
+	 * is limited to a single selected block on desktop only).
+	 *
+	 * Unlike the swipe path, this NEVER depends on the row staying mounted: the
+	 * selection lives in panel state keyed by blockId, so when the virtual list
+	 * unmounts the row the strip simply falls back to `scrollToMessageTarget`, which
+	 * can reach an unmounted row through the document index.
+	 */
+	const selectionOverlayBlockId = resolveSelectionOverlayBlockId({
+		selectedBlockIds,
+		isMobileViewport,
+		hasSwipeAnchor: swipeAnchorOverlay != null,
+	});
+	useEffect(() => {
+		if (!selectionOverlayBlockId || isWorkspacePreview) {
+			setSelectionAnchorOverlay((prev) => (prev ? null : prev));
+			return;
+		}
+		const scrollEl = viewportRef.current;
+		if (!scrollEl) {
+			setSelectionAnchorOverlay((prev) => (prev ? null : prev));
+			return;
+		}
+		const contentEl = contentRef.current ?? scrollEl;
+		const clearOverlay = () => setSelectionAnchorOverlay((prev) => (prev ? null : prev));
+
+		let rafId = 0;
+		// `CSS.escape` is unavailable here (the module-level `CSS` identifier is
+		// @dnd-kit's transform helper), and a block id can carry characters that are
+		// not selector-safe. Scanning attributes avoids building a selector entirely.
+		const findBlock = (): HTMLElement | null => {
+			for (const el of contentEl.querySelectorAll<HTMLElement>(`[${BLOCK_ID_ATTR}]`)) {
+				if (el.getAttribute(BLOCK_ID_ATTR) === selectionOverlayBlockId) return el;
+			}
+			return null;
+		};
+		const check = () => {
+			const block = findBlock();
+			// Row not mounted (virtual list scrolled past it). The strip stays as it is:
+			// re-deriving a direction without geometry would guess, and the reader's
+			// last-known direction is still the truthful one.
+			if (!block?.isConnected) return;
+			const offScreen = resolveSwipeAnchorOffScreen(
+				block.getBoundingClientRect(),
+				scrollEl.getBoundingClientRect(),
+			);
+			if (!offScreen) {
+				clearOverlay();
+				return;
+			}
+			const messageId = block.getAttribute("data-message-id") ?? "";
+			const previewText =
+				compactWhitespacePreview(collectElementTextPreview(block, 80)) || selectionOverlayBlockId;
+			setSelectionAnchorOverlay((prev) => {
+				if (
+					prev?.blockId === selectionOverlayBlockId &&
+					prev.offScreen === offScreen &&
+					prev.previewText === previewText
+				) {
+					return prev;
+				}
+				return {
+					blockId: selectionOverlayBlockId,
+					previewText,
+					previewColor: "indigo",
+					element: block,
+					scrollBack: () => {
+						const live = findBlock();
+						if (live?.isConnected) {
+							live.scrollIntoView({ behavior: "smooth", block: "center" });
+							return;
+						}
+						// Unmounted by virtualization — the list can still reach it by index.
+						if (messageId) {
+							void scrollToMessageTarget({
+								domIds: [`msg-${messageId}`],
+								targetIds: [messageId],
+								highlightId: messageId,
+							});
+						}
+					},
+					// Dismissing the strip must not clear the selection: it is a wayfinding
+					// aid, and losing a selection to a stray tap would be destructive.
+					close: clearOverlay,
+					offScreen,
+				};
+			});
+		};
+		const scheduleCheck = () => {
+			if (rafId) return;
+			rafId = window.requestAnimationFrame(() => {
+				rafId = 0;
+				check();
+			});
+		};
+
+		scheduleCheck();
+		scrollEl.addEventListener("scroll", scheduleCheck, { passive: true });
+		window.addEventListener("resize", scheduleCheck, { passive: true });
+		// The virtual list mounts / unmounts rows as it scrolls, so the strip has to
+		// re-check on structural changes too, not only on scroll events.
+		const mutationObserver = new MutationObserver(scheduleCheck);
+		mutationObserver.observe(contentEl, { childList: true, subtree: true });
+
+		return () => {
+			cancelAnimationFrame(rafId);
+			scrollEl.removeEventListener("scroll", scheduleCheck);
+			window.removeEventListener("resize", scheduleCheck);
+			mutationObserver.disconnect();
+		};
+	}, [selectionOverlayBlockId, isWorkspacePreview, scrollToMessageTarget]);
 
 	// --- Scroll to highlighted message ---
 	// Chunked path only. The virtual list owns this jump itself (it needs the
@@ -7756,10 +7878,17 @@ export function NarratorPanel({
 							</CompactSummaryModalCtx.Provider>
 						</Box>
 
-						{/* Off-screen swipe/compacting anchor overlay — cloned message preview */}
-						{(swipeAnchorOverlay ?? compactingMarkerOverlay) && (
+						{/* Off-screen anchor overlay — one strip, three producers in priority
+						    order: an active touch swipe, a running compaction, then the
+						    desktop single-block selection (the weakest claim: it is a passive
+						    wayfinding aid, the other two track a live operation). */}
+						{(swipeAnchorOverlay ?? compactingMarkerOverlay ?? selectionAnchorOverlay) && (
 							<SwipeAnchorOverlay
-								info={(swipeAnchorOverlay ?? compactingMarkerOverlay) as SwipeAnchorInfo}
+								info={
+									(swipeAnchorOverlay ??
+										compactingMarkerOverlay ??
+										selectionAnchorOverlay) as SwipeAnchorInfo
+								}
 							/>
 						)}
 

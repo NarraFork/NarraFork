@@ -47,6 +47,7 @@ import {
 	IconColumns,
 	IconExclamationMark,
 	IconFolder,
+	IconFolderPlus,
 	IconGitBranch,
 	IconMessageCircle,
 	IconMessageCircleFilled,
@@ -651,6 +652,8 @@ export function RecentTabList({
 
 	// Workspace "add narrator" modal state
 	const [wsCreateTarget, setWsCreateTarget] = useState<string | null>(null);
+	// "New narrator in this directory" modal state (cwd pre-filled from a tab)
+	const [newNarratorCwd, setNewNarratorCwd] = useState<string | null>(null);
 
 	// Drag state: the tab currently being dragged (for workspace, tracks the whole group)
 	const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
@@ -1084,6 +1087,58 @@ export function RecentTabList({
 		setCtxMenu(null);
 	}, [ctxMenu, removeTab, navigate, releaseWorkspace]);
 
+	/**
+	 * Resolve the on-disk directory a tab points at: a chapter's worktree, or a
+	 * narrator/subagent's cwd. Returns null when the tab has no directory
+	 * (workspace, project) or the lookup fails.
+	 */
+	const resolveTabDirectory = useCallback(async (tab: RecentTab): Promise<string | null> => {
+		try {
+			if (tab.type === "chapter") {
+				const chapter = await api.getChapter(tab.id);
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				return ((chapter as any)?.worktreePath as string | undefined) ?? null;
+			}
+			if (tab.type === "narrator" || tab.type === "subagent") {
+				const narrator = await api.getNarrator(tab.id);
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				return ((narrator as any)?.cwd as string | undefined) ?? null;
+			}
+		} catch {
+			return null;
+		}
+		return null;
+	}, []);
+
+	const handleNewNarratorHere = useCallback(async () => {
+		if (!ctxMenu) return;
+		const { tab } = ctxMenu;
+		setCtxMenu(null);
+		if (!requireSetup()) return;
+		const dir = await resolveTabDirectory(tab);
+		if (!dir) {
+			notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
+			return;
+		}
+		setNewNarratorCwd(dir);
+	}, [ctxMenu, requireSetup, resolveTabDirectory, t]);
+
+	const handleNewNarratorHereCreated = useCallback(
+		(data: CreateNarratorResult) => {
+			setNewNarratorCwd(null);
+			addRecentTab({
+				type: "narrator",
+				id: data.id,
+				title: data.title,
+				subtitle: data.cwd,
+				status: data.status,
+			});
+			navigate({ to: `/narrators/${data.id}` });
+			onNavigate?.();
+		},
+		[navigate, onNavigate],
+	);
+
 	const fsRevealCapability = useFsRevealCapability();
 
 	const handleReveal = useCallback(async () => {
@@ -1333,6 +1388,12 @@ export function RecentTabList({
 					onRemove={handleCtxClose}
 					onReveal={handleReveal}
 					canReveal={fsRevealCapability.supported && ctxMenu.tab.type !== "project"}
+					onNewNarratorHere={handleNewNarratorHere}
+					canNewNarratorHere={
+						ctxMenu.tab.type === "chapter" ||
+						ctxMenu.tab.type === "narrator" ||
+						ctxMenu.tab.type === "subagent"
+					}
 					isFirst={
 						topLevel.findIndex((t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id) === 0
 					}
@@ -1346,6 +1407,16 @@ export function RecentTabList({
 						opened={wsCreateTarget !== null}
 						onClose={() => setWsCreateTarget(null)}
 						onCreated={handleWsNarratorCreated}
+					/>
+				</React.Suspense>
+			)}
+			{newNarratorCwd !== null && (
+				<React.Suspense fallback={null}>
+					<CreateNarratorModal
+						opened={newNarratorCwd !== null}
+						initialCwd={newNarratorCwd}
+						onClose={() => setNewNarratorCwd(null)}
+						onCreated={handleNewNarratorHereCreated}
 					/>
 				</React.Suspense>
 			)}
@@ -2183,6 +2254,8 @@ interface TabContextMenuProps {
 	onRemove: () => void;
 	onReveal: () => void;
 	canReveal: boolean;
+	onNewNarratorHere: () => void;
+	canNewNarratorHere: boolean;
 	isFirst: boolean;
 	isWorkspace: boolean;
 	t: (key: string) => string;
@@ -2198,6 +2271,8 @@ function TabContextMenu({
 	onRemove,
 	onReveal,
 	canReveal,
+	onNewNarratorHere,
+	canNewNarratorHere,
 	isFirst,
 	isWorkspace,
 	t,
@@ -2253,6 +2328,14 @@ function TabContextMenu({
 							<Group gap={8} wrap="nowrap">
 								<IconFolder size={14} />
 								<Text size="sm">{t("revealInExplorer")}</Text>
+							</Group>
+						</UnstyledButton>
+					)}
+					{canNewNarratorHere && (
+						<UnstyledButton px="xs" py={4} onClick={onNewNarratorHere} style={{ borderRadius: 4 }}>
+							<Group gap={8} wrap="nowrap">
+								<IconFolderPlus size={14} />
+								<Text size="sm">{t("newNarratorHere")}</Text>
 							</Group>
 						</UnstyledButton>
 					)}

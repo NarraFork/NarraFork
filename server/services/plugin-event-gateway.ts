@@ -486,7 +486,6 @@ export const defaultPluginEventMapper: PluginEventMapper = (event, context) => {
 			"chapter:dormant",
 			"chapter:woken",
 			"chapter:abandoned",
-			"chapter:frozen",
 			"chapter:role_changed",
 		].includes(type)
 	) {
@@ -529,22 +528,8 @@ export const defaultPluginEventMapper: PluginEventMapper = (event, context) => {
 			{ resource: resource("chapter", value.chapterId) },
 		);
 	}
-	if (["dependency:created", "dependency:removed"].includes(type)) {
-		return baseMapping(
-			"narrafork.chapter.edge.changed",
-			"lifecycle",
-			{
-				edgeId: String(value.edgeId),
-				sourceId: String(value.sourceId),
-				targetId: String(value.targetId),
-				changeKind: type.slice("dependency:".length),
-				type: "dependency",
-			},
-			"user_scoped",
-			context,
-			{ resource: resource("chapter", value.targetId) },
-		);
-	}
+	// No `dependency:created`/`dependency:removed` mapping: the dependency edge type is gone,
+	// so `narrafork.chapter.edge.changed` had no remaining producer.
 	if (type.startsWith("review:")) {
 		const reviewChapterId = value.reviewChapterId;
 		return baseMapping(

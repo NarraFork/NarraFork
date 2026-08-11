@@ -115,7 +115,9 @@ const findingSchema = z.object({
 });
 
 export const reviewKnowledgeSubmissionSchema = z.object({
-	verdict: z.enum(["approve", "request_changes", "comment_only"]),
+	// `reject` is the terminal refusal (status → `rejected`, no resubmit); `request_changes`
+	// bounces back to the author for another round.
+	verdict: z.enum(["approve", "request_changes", "reject", "comment_only"]),
 	findings: z.array(findingSchema).max(100).optional(),
 });
 
@@ -291,4 +293,21 @@ export const resubmitKnowledgeSubmissionSchema = z.object({
  */
 export const rebaseKnowledgeDraftQuerySchema = z.object({
 	strategy: z.enum(["merge", "theirs"]).optional().default("merge"),
+});
+
+/**
+ * Query the knowledge ACL audit trail (admin only).
+ *
+ * Keyset pagination: `cursorCreatedAt` + `cursorId` come from the previous page's `nextCursor`.
+ * `limit` is coerced (query strings are text) and hard-capped in the service as well, so a client
+ * cannot ask for an unbounded page.
+ */
+export const listKnowledgeAclEventsQuerySchema = z.object({
+	limit: z.coerce.number().int().min(1).max(100).optional(),
+	cursorCreatedAt: z.string().max(64).optional(),
+	cursorId: z.string().max(64).optional(),
+	eventType: z.string().max(64).optional(),
+	subjectId: z.string().max(64).optional(),
+	targetId: z.string().max(64).optional(),
+	actorUserId: z.string().max(64).optional(),
 });

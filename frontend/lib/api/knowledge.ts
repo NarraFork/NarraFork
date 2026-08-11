@@ -24,9 +24,11 @@ import type {
 	KnowledgeReviewResult,
 	KnowledgeReviewScope,
 	KnowledgeRevision,
+	KnowledgeRevisionSummary,
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
 	KnowledgeSubmissionDetail,
+	KnowledgeSubmitResult,
 	KnowledgeTag,
 	KnowledgeTagType,
 	KnowledgeTransferOwnerResult,
@@ -145,8 +147,9 @@ export const knowledgeApi = {
 			`/knowledge/entries/${entryId}/revisions`,
 			{ method: "POST", body: JSON.stringify(data) },
 		),
+	/** Version history — metadata only. Fetch bodies per version with getKnowledgeRevision. */
 	listKnowledgeRevisions: (entryId: string) =>
-		request<KnowledgeRevision[]>(`/knowledge/entries/${entryId}/revisions`),
+		request<KnowledgeRevisionSummary[]>(`/knowledge/entries/${entryId}/revisions`),
 	getKnowledgeRevision: (id: string) => request<KnowledgeRevision>(`/knowledge/revisions/${id}`),
 
 	// ─── Entry links (entry-scope knowledge graph) ───
@@ -190,8 +193,13 @@ export const knowledgeApi = {
 			`/knowledge/drafts/${draftId}/rebase${qs({ strategy: strategy === "merge" ? undefined : strategy })}`,
 			{ method: "POST" },
 		),
+	/**
+	 * Submit a personal entry for publishing. The result carries `driftWarning` when the
+	 * proposal is based on a stale main revision — surface it so the author can rebase before
+	 * a reviewer runs into the conflict.
+	 */
 	submitKnowledgeDraft: (draftId: string, data: { changeNote?: string } = {}) =>
-		request<KnowledgeSubmission>(`/knowledge/drafts/${draftId}/submit`, {
+		request<KnowledgeSubmitResult>(`/knowledge/drafts/${draftId}/submit`, {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),

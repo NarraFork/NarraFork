@@ -110,19 +110,10 @@ describe("story-network graph event WS bridge", () => {
 		]);
 	});
 
-	it("forwards dependency, review, and exploration events", () => {
-		eventBus.emit({
-			type: "dependency:created",
-			edgeId: "edge-1",
-			sourceId: "chapter-1",
-			targetId: "chapter-2",
-		});
-		eventBus.emit({
-			type: "dependency:removed",
-			edgeId: "edge-1",
-			sourceId: "chapter-1",
-			targetId: "chapter-2",
-		});
+	it("forwards review and exploration events", () => {
+		// The dependency events that used to be asserted here are gone with the dependency
+		// edge type. `exploration:*` is still declared but has no emitter, so this only
+		// pins the forwarding path, not a working feature.
 		eventBus.emit({
 			type: "review:created",
 			reviewChapterId: "review-1",
@@ -136,8 +127,6 @@ describe("story-network graph event WS bridge", () => {
 		eventBus.emit({ type: "exploration:created", groupId: "group-1", chapterIds: ["chapter-1"] });
 
 		expect(client.sent.map((m) => m.type)).toEqual([
-			"dependency:created",
-			"dependency:removed",
 			"review:created",
 			"review:concluded",
 			"exploration:created",

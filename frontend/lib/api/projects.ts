@@ -33,14 +33,6 @@ export interface ProjectGraphFallback {
 	[key: string]: unknown;
 }
 
-export interface ProjectGraphCapabilities {
-	commitSync?: {
-		graphReadRefresh?: boolean;
-		[key: string]: unknown;
-	};
-	[key: string]: unknown;
-}
-
 /**
  * How a rebase's attempt to put parked work back on disk ended.
  *
@@ -93,9 +85,8 @@ export interface RulerRebaseParkedResponse extends ParkedWorkFields {
 export interface ProjectGraphResponse {
 	nodes: ApiEntity[];
 	edges: ApiEntity[];
-	explorationGroups?: ApiEntity[];
 	openedTerminals?: ApiEntity[];
-	capabilities?: ProjectGraphCapabilities;
+	// No `capabilities`: the graph route never sent one. `degraded`/`fallbacks` below are real.
 	degraded?: boolean;
 	fallbacks?: ProjectGraphFallback[];
 }

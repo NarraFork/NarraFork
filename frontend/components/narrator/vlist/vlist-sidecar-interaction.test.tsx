@@ -249,7 +249,11 @@ function toolRunWithSidecars(): AdapterSegment {
 function buildToolCard(state: VListInteractionState) {
 	const spec = adaptSegment(toolRunWithSidecars(), {
 		lod: 5,
-		isExpanded: (key) => state.expanded.get(key),
+		// The CARD itself must be open for its footnotes to exist at all: they are
+		// footnotes to the tool's output, so a folded card (which shows no output) draws
+		// none and reports them through `sidecarCount` instead. `?? true` opens it by
+		// default while still letting the fold state answer for the `-sc{i}` sub-keys.
+		isExpanded: (key) => (key === "tool-tu-bash" ? true : state.expanded.get(key)),
 	})[0];
 	if (!spec) throw new Error("no tool-call spec");
 	const measured = VLIST_REGISTRY["tool-call"].measure(
@@ -258,6 +262,7 @@ function buildToolCard(state: VListInteractionState) {
 		5,
 		spec.opts,
 	) as MeasuredToolCall;
+	if (!measured.effectiveOpened) throw new Error("expected an expanded tool card");
 	// EXACTLY what measuredByKeyRef holds: top-level spec keys only. A `-sc{i}`
 	// sub-key resolves to undefined here, which is the whole point.
 	const lookup = (key: string) => (key === spec.key ? (measured as unknown) : undefined);
@@ -384,11 +389,16 @@ function measureFixture(over: Partial<SidecarSpecData> = {}, expanded = false): 
 		payloadKind: "sidecar",
 		source: "bg_agent",
 		sourceLabel: "Background agent",
-		color: "blue",
-		target: "user_message",
-		previewText: "preview line",
+		tone: "background",
+		// `folded` so the header owns a real fold: an `open` footnote whose body fits
+		// declares no control at all (see the inert case below).
+		form: "folded",
+		headline: "preview line",
+		lines: BODY.split("\n").map((text) => ({ kind: "text" as const, text })),
 		fullText: BODY,
+		isRaw: false,
 		truncatedLabel: "[truncated]",
+		showAllLabel: "Show all",
 		...over,
 	};
 	return VLIST_REGISTRY.sidecar.measure(data, CONTENT_WIDTH, 5, {

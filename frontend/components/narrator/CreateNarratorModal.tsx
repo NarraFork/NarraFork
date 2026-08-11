@@ -57,6 +57,8 @@ interface CreateNarratorModalProps {
 	opened: boolean;
 	onClose: () => void;
 	onCreated?: (narrator: CreateNarratorResult) => void;
+	/** Pre-fill the working directory (e.g. "new narrator in this directory" entry points). */
+	initialCwd?: string;
 }
 
 function FavoriteItemContent({
@@ -138,7 +140,12 @@ function SortableFavoriteItem({
 	);
 }
 
-export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarratorModalProps) {
+export function CreateNarratorModal({
+	opened,
+	onClose,
+	onCreated,
+	initialCwd,
+}: CreateNarratorModalProps) {
 	const { t } = useTranslation("narrators");
 	const { t: tc } = useTranslation("common");
 	const createNarrator = useCreateNarrator();
@@ -154,7 +161,7 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 	const removeFavorite = useDeleteFavoriteDirectory();
 	const reorderFavorites = useReorderFavoriteDirectories();
 
-	const [cwd, setCwd] = useState("");
+	const [cwd, setCwd] = useState(initialCwd ?? "");
 	const [selectedModel, setSelectedModel] = useState("");
 	const [startInPlanMode, setStartInPlanMode] = useState(false);
 	const [makeNamed, setMakeNamed] = useState(false);
@@ -195,6 +202,12 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 
 	// Safety net: detach any dangling listeners if the modal unmounts mid-drag.
 	useEffect(() => () => resizeCleanupRef.current?.(), []);
+
+	// Callers may keep this modal mounted across opens (or swap the target directory
+	// while it is closed), so adopt `initialCwd` on every open rather than only at mount.
+	useEffect(() => {
+		if (opened && initialCwd) setCwd(initialCwd);
+	}, [opened, initialCwd]);
 
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 

@@ -4,8 +4,8 @@
  *
  * There are two channels, and the split is deliberate (see
  * `VListInteractionState.expandedTraceRows`): `activity-trace` / `tool-run-summary`
- * fold a live row list and are addressed by ROW KEY, while `reasoning-steps` and
- * `sidecar-trace` are append-only and stay on the row INDEX.
+ * fold a live row list and are addressed by ROW KEY, while `reasoning-steps` is
+ * append-only and stays on the row INDEX.
  *
  * The regression this pins: the render layer reports BOTH the index and the key for
  * every trace row, so a shell that stores a key unconditionally sends the
@@ -22,13 +22,8 @@
 import { describe, expect, it } from "bun:test";
 import { traceRowFoldChannel } from "./vlist-interaction-state";
 
-/** The four kinds bound to the trace row toggle in PretextExactMessageList. */
-const TRACE_KINDS = [
-	"activity-trace",
-	"tool-run-summary",
-	"reasoning-steps",
-	"sidecar-trace",
-] as const;
+/** The kinds bound to the trace row toggle in PretextExactMessageList. */
+const TRACE_KINDS = ["activity-trace", "tool-run-summary", "reasoning-steps"] as const;
 
 describe("traceRowFoldChannel", () => {
 	it("puts the two live-row-list traces on the KEY channel", () => {
@@ -38,11 +33,10 @@ describe("traceRowFoldChannel", () => {
 		expect(traceRowFoldChannel("tool-run-summary")).toBe("key");
 	});
 
-	it("keeps the append-only traces on the INDEX channel", () => {
+	it("keeps the append-only trace on the INDEX channel", () => {
 		// A reasoning-steps element numbers step N as row N however many steps follow,
-		// and a sidecar-trace has exactly one row — their ordinals are already stable.
+		// so its ordinals are already stable.
 		expect(traceRowFoldChannel("reasoning-steps")).toBe("index");
-		expect(traceRowFoldChannel("sidecar-trace")).toBe("index");
 	});
 
 	it("defaults an unknown kind to the INDEX channel", () => {
@@ -60,24 +54,6 @@ const reasoningMessage = {
 	contentJson: [{ type: "reasoning", text: "**A**\n\nfirst body\n\n**B**\n\nsecond body" }],
 	toolCalls: [],
 	children: [],
-};
-
-/** A message carrying one user_message sidecar (the low-LOD `sidecar-trace` form). */
-const sidecarMessage = {
-	id: "m2",
-	seq: 2,
-	role: "user",
-	contentJson: [{ type: "text", text: "hello" }],
-	toolCalls: [],
-	children: [],
-	sideCars: [
-		{
-			id: "sc-1",
-			source: "living_work_spec",
-			target: "user_message",
-			content: "a long sidecar body\nwith a second line",
-		},
-	],
 };
 
 /** A finished tool call, the row an `activity-trace` folds. */
@@ -122,7 +98,7 @@ async function indicesFor(
 				: adaptSegment(
 						{
 							kind: "message",
-							msg: (kind === "reasoning-steps" ? reasoningMessage : sidecarMessage) as never,
+							msg: reasoningMessage as never,
 							visibleBlockIndices: [0],
 						} as never,
 						ctx as never,

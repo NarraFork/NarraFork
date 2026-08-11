@@ -7,6 +7,7 @@
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
+import type { SideCarBody } from "@shared/sidecar-body";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
 import type { PublicCodexQuotaOverview } from "../lib/codex-manager";
@@ -313,6 +314,8 @@ export type NarratorServerMessage =
 				target: string;
 				source: string;
 				content: string;
+				/** Structured form for the UI; absent on pre-structured injections. */
+				body?: SideCarBody;
 				toolUseId?: string | null;
 				orderIndex?: number;
 			}>;
@@ -331,6 +334,8 @@ export type NarratorServerMessage =
 				target: string;
 				source: string;
 				content: string;
+				/** Structured form for the UI; absent on pre-structured injections. */
+				body?: SideCarBody;
 				toolUseId?: string | null;
 				orderIndex?: number;
 			}>;
@@ -901,4 +906,23 @@ export type NarratorServerMessage =
 			/** Submission status after the change (absent for `submission_created`). */
 			status?: string;
 			entryId?: string | null;
+	  }
+	| {
+			/**
+			 * Something outside the review queue changed for this user's knowledge view:
+			 *  - `entry_drifted`     — a global entry they hold a personal version of moved on,
+			 *                          so their copy needs a rebase.
+			 *  - `acl_changed`       — their knowledge authorization changed; the readable set,
+			 *                          review scope and badges may all differ now.
+			 *  - `owner_transferred` — they gained or lost ownership of an entry/collection.
+			 *
+			 * Same id-only discipline as `review_inbox_changed`: no titles or bodies cross this
+			 * channel, the client refetches through the ACL-checked HTTP endpoints.
+			 */
+			type: "knowledge:library_changed";
+			reason: "entry_drifted" | "acl_changed" | "owner_transferred";
+			/** Set for entry-scoped reasons (`entry_drifted`, entry owner transfer). */
+			entryId?: string | null;
+			/** Set for collection-scoped reasons (collection owner transfer). */
+			collectionId?: string | null;
 	  };

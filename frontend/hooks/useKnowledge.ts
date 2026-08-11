@@ -770,8 +770,38 @@ export function useKnowledgeNotifications(): void {
 	const qc = useQueryClient();
 	useEffect(() => {
 		const handle = narratorWSManager.addListener(
-			{ types: ["knowledge:review_inbox_changed"] },
+			{ types: ["knowledge:review_inbox_changed", "knowledge:library_changed"] },
 			(data) => {
+				// Library-side changes (drift / ACL / ownership) touch the reader's view rather
+				// than the review queue, so they invalidate a different set of keys.
+				if (data.type === "knowledge:library_changed") {
+					const changedEntryId = typeof data.entryId === "string" ? data.entryId : undefined;
+					if (data.reason === "entry_drifted") {
+						// The personal-library list carries the drift badges; the entry's own draft
+						// views hold the banner and the three-way diff.
+						qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] });
+						if (changedEntryId) {
+							qc.invalidateQueries({ queryKey: ["knowledge", "draft", changedEntryId] });
+							qc.invalidateQueries({ queryKey: ["knowledge", "draftDrift", changedEntryId] });
+							qc.invalidateQueries({ queryKey: ["knowledge", "entry", changedEntryId] });
+						}
+						return;
+					}
+					// acl_changed / owner_transferred: what the user may read, review or manage may
+					// all have moved, so drop the cached reads wholesale rather than guessing.
+					qc.invalidateQueries({ queryKey: ["knowledge", "entries"] });
+					qc.invalidateQueries({ queryKey: ["knowledge", "collections"] });
+					qc.invalidateQueries({ queryKey: ["knowledge", "myReviewScope"] });
+					qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
+					qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
+					if (changedEntryId) {
+						qc.invalidateQueries({ queryKey: ["knowledge", "entry", changedEntryId] });
+					}
+					if (typeof data.collectionId === "string") {
+						qc.invalidateQueries({ queryKey: ["knowledge", "collection", data.collectionId] });
+					}
+					return;
+				}
 				if (data.type !== "knowledge:review_inbox_changed") return;
 				qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
 				qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });

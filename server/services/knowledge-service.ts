@@ -4,6 +4,7 @@ import { db, sqlite } from "../db";
 import { knowledgeCollections, knowledgeEntries, knowledgeRevisions, users } from "../db/schema";
 import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
 import {
@@ -18,6 +19,8 @@ import {
 	type PrincipalCaps,
 	resolvePrincipalCaps,
 } from "./knowledge-acl";
+import { recordKnowledgeAclEvent } from "./knowledge-audit";
+import { emitEntryDrifted } from "./knowledge-notify";
 
 type Format = "markdown" | "text" | "json";
 
@@ -202,14 +205,26 @@ function escapeLike(s: string): string {
 // Collections
 // ═══════════════════════════════════════════════════════════════════════
 
+/**
+ * Hard cap on collections returned by one list call.
+ *
+ * A deployment has tens of collections, not thousands, so this ceiling is never reached in
+ * practice — it exists because an unbounded `findMany` on the main thread is the shape the
+ * performance rules forbid outright, not because the row count is expected to be large. The
+ * per-row ACL filter below makes the cost of a pathological table worse than a plain scan.
+ */
+const COLLECTION_LIST_MAX = 500;
+
 async function listCollections(projectId?: string, principal?: Principal) {
 	const rows = projectId
 		? await db.query.knowledgeCollections.findMany({
 				where: eq(knowledgeCollections.projectId, projectId),
 				orderBy: (c, { asc }) => [asc(c.name)],
+				limit: COLLECTION_LIST_MAX,
 			})
 		: await db.query.knowledgeCollections.findMany({
 				orderBy: (c, { asc }) => [asc(c.name)],
+				limit: COLLECTION_LIST_MAX,
 			});
 	// When a principal is supplied, hide collections they cannot read (don't leak
 	// existence of restricted collections). admin sees all.
@@ -312,9 +327,29 @@ async function updateCollection(
 }
 
 async function deleteCollection(id: string, principal?: Principal) {
-	if (principal) await assertCanManageCollection(id, principal);
-	else await getCollection(id);
+	// Load the row BEFORE deleting: the audit detail describes the gate that existed, and after
+	// the delete there is nothing left to read it from.
+	const collection = principal
+		? (await assertCanManageCollection(id, principal)).collection
+		: await getCollection(id);
 	await db.delete(knowledgeCollections).where(eq(knowledgeCollections.id, id));
+	// Deleting a collection cascades to every entry in it — the single most destructive act on this
+	// surface, and reachable by a collection owner rather than admin only. Redacted as everywhere
+	// else: the gate (level name, tag ids) and the owner, never entry titles or content.
+	recordKnowledgeAclEvent({
+		actorUserId: principal?.userId ?? null,
+		actorRole: principal?.role ?? null,
+		eventType: "collection_deleted",
+		targetType: "collection",
+		targetId: id,
+		detail: {
+			projectId: collection.projectId ?? null,
+			ownerUserId: collection.ownerUserId ?? null,
+			classificationLevel: collection.classificationLevel ?? null,
+			defaultLevel: collection.defaultLevel,
+			controlledTags: collection.controlledTagsJson ?? [],
+		},
+	});
 	return { ok: true as const };
 }
 
@@ -347,10 +382,29 @@ async function transferCollectionOwner(
 	} else {
 		await assertUserExists(newOwnerUserId);
 	}
+	const previousOwnerUserId = (await getCollection(id)).ownerUserId ?? null;
 	await db
 		.update(knowledgeCollections)
 		.set({ ownerUserId: newOwnerUserId, updatedAt: nowIso() })
 		.where(eq(knowledgeCollections.id, id));
+	// Ownership is an ACL short-circuit, so this silently changed what both parties can see.
+	eventBus.emit({
+		type: "knowledge:owner_transferred",
+		targetType: "collection",
+		targetId: id,
+		previousOwnerUserId,
+		newOwnerUserId,
+	});
+	recordKnowledgeAclEvent({
+		actorUserId: principal.userId ?? null,
+		actorRole: principal.role ?? null,
+		eventType: "collection_owner_transferred",
+		subjectType: newOwnerUserId ? "user" : null,
+		subjectId: newOwnerUserId,
+		targetType: "collection",
+		targetId: id,
+		detail: { previousOwnerUserId, newOwnerUserId },
+	});
 	return { ok: true as const, collectionId: id, ownerUserId: newOwnerUserId };
 }
 
@@ -360,6 +414,7 @@ async function transferCollectionOwner(
 
 /** Hard cap on rows returned by any single list query (main-thread safety). */
 const LIST_MAX_LIMIT = 200;
+
 const LIST_DEFAULT_LIMIT = 100;
 
 /** The only entry columns the dual-axis read gate needs (see `toAclEntry`). Narrower than
@@ -639,10 +694,35 @@ async function transferEntryOwner(id: string, newOwnerUserId: string | null, pri
 	} else {
 		await assertUserExists(newOwnerUserId);
 	}
+	const previousOwnerUserId =
+		(
+			await db.query.knowledgeEntries.findFirst({
+				where: eq(knowledgeEntries.id, id),
+				columns: { ownerUserId: true },
+			})
+		)?.ownerUserId ?? null;
 	await db
 		.update(knowledgeEntries)
 		.set({ ownerUserId: newOwnerUserId, updatedAt: nowIso() })
 		.where(eq(knowledgeEntries.id, id));
+	// Both parties' effective access just changed (owner is an ACL short-circuit).
+	eventBus.emit({
+		type: "knowledge:owner_transferred",
+		targetType: "entry",
+		targetId: id,
+		previousOwnerUserId,
+		newOwnerUserId,
+	});
+	recordKnowledgeAclEvent({
+		actorUserId: principal.userId ?? null,
+		actorRole: principal.role ?? null,
+		eventType: "entry_owner_transferred",
+		subjectType: newOwnerUserId ? "user" : null,
+		subjectId: newOwnerUserId,
+		targetType: "entry",
+		targetId: id,
+		detail: { previousOwnerUserId, newOwnerUserId },
+	});
 	return { ok: true as const, entryId: id, ownerUserId: newOwnerUserId };
 }
 
@@ -655,7 +735,20 @@ async function updateEntryAcl(
 		reviewTags?: string[];
 		ownerUserId?: string | null;
 	},
+	/** Who is making the change — recorded in the ACL audit trail. Optional so internal paths and
+	 *  tests can call this without inventing an actor. */
+	actor?: { userId?: string | null; role?: string | null },
 ) {
+	// BEFORE state for the audit diff. Classification + tags + owner only; no content.
+	const before = await db.query.knowledgeEntries.findFirst({
+		where: eq(knowledgeEntries.id, id),
+		columns: {
+			classificationLevel: true,
+			controlledTagsJson: true,
+			reviewTagsJson: true,
+			ownerUserId: true,
+		},
+	});
 	await getEntry(id);
 	await db
 		.update(knowledgeEntries)
@@ -669,6 +762,32 @@ async function updateEntryAcl(
 			updatedAt: nowIso(),
 		})
 		.where(eq(knowledgeEntries.id, id));
+	// Changing an entry's level or controlled tags changes who may read it — the single most
+	// audit-worthy operation in the knowledge base. Names/ids only, never the body.
+	recordKnowledgeAclEvent({
+		actorUserId: actor?.userId ?? null,
+		actorRole: actor?.role ?? null,
+		eventType: "entry_acl_updated",
+		targetType: "entry",
+		targetId: id,
+		detail: {
+			before: {
+				classificationLevel: before?.classificationLevel ?? null,
+				controlledTags: before?.controlledTagsJson ?? [],
+				reviewTags: before?.reviewTagsJson ?? [],
+				ownerUserId: before?.ownerUserId ?? null,
+			},
+			// Only the fields actually supplied were changed; the rest carry over.
+			changed: {
+				...(input.classificationLevel !== undefined
+					? { classificationLevel: input.classificationLevel }
+					: {}),
+				...(input.controlledTags !== undefined ? { controlledTags: input.controlledTags } : {}),
+				...(input.reviewTags !== undefined ? { reviewTags: input.reviewTags } : {}),
+				...(input.ownerUserId !== undefined ? { ownerUserId: input.ownerUserId } : {}),
+			},
+		},
+	});
 	return getEntry(id, { withContent: true });
 }
 
@@ -767,19 +886,45 @@ async function addRevision(
 		{ label: "knowledge.addRevision", maxRetries: 5 },
 	);
 
+	// Post-commit: main moved, so anyone else holding an active personal version of this entry is
+	// now based on a stale revision. They previously had no way to learn this without opening the
+	// entry's draft tab. Author excluded — they made the change.
+	//
+	// Only ids cross the bus; the listener resolves who is affected (see knowledge-notify).
+	emitEntryDrifted(entryId, input.authorUserId ?? null);
+
 	return { entryId, revisionId, version };
 }
 
+/**
+ * Version history for an entry — METADATA ONLY.
+ *
+ * `content` is deliberately projected away: a history list of N versions of a large document used
+ * to ship N full bodies in one response, which is exactly the "list endpoints must not read big
+ * fields" rule. `contentLength` is computed in SQL so the UI can still show size, and the diff
+ * view fetches the two versions it actually compares via `getRevision`.
+ */
 async function listRevisions(entryId: string, principal: Principal, opts: { limit?: number } = {}) {
 	// Enforces dual-axis read ACL on the parent entry (throws NotFound if unreadable).
 	await loadReadableEntry(entryId, principal);
 	const limit = Math.min(opts.limit ?? LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT);
-	// NOTE: `content` is still returned here because the frontend diff view reads
-	// it directly from the history list. Bounding the row count via LIMIT is the
-	// main-thread safeguard; moving to metadata-only + on-demand body fetch is a
-	// coordinated frontend change (tracked for the frontend phase).
 	return db.query.knowledgeRevisions.findMany({
 		where: eq(knowledgeRevisions.entryId, entryId),
+		columns: {
+			id: true,
+			entryId: true,
+			version: true,
+			format: true,
+			contentHash: true,
+			changeNote: true,
+			authorUserId: true,
+			authorNarratorId: true,
+			baseRevisionId: true,
+			createdAt: true,
+		},
+		extras: (r, { sql }) => ({
+			contentLength: sql<number>`length(${r.content})`.as("content_length"),
+		}),
 		orderBy: [desc(knowledgeRevisions.version)],
 		limit,
 	});

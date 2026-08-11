@@ -1,4 +1,5 @@
 import {
+	Alert,
 	Badge,
 	Button,
 	Divider,
@@ -11,7 +12,7 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
-import { IconUser, IconUserShield } from "@tabler/icons-react";
+import { IconInfoCircle, IconUser, IconUserShield } from "@tabler/icons-react";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -139,6 +140,14 @@ export function EntryAclPanel({ entry }: { entry: KnowledgeEntry }) {
 				<Text size="xs" c="dimmed" mb="xs">
 					{t("reviewTagsHint")}
 				</Text>
+				{/* canReview is fail-closed on an empty list: with NO review tags, only the entry
+				    owner and admins can review. That is intentional, but invisible — an admin who
+				    left it empty would otherwise wonder why nobody can review submissions here. */}
+				{review.length === 0 ? (
+					<Alert color="yellow" p="xs" mb="xs" icon={<IconInfoCircle size={14} />}>
+						<Text size="xs">{t("reviewTagsEmptyWarning")}</Text>
+					</Alert>
+				) : null}
 				{allTagOptions.length === 0 ? (
 					<Text size="xs" c="dimmed">
 						{t("noTags")}

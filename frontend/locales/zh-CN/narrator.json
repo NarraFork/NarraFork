@@ -233,8 +233,7 @@
 	"loadOlderCalls": "加载更早的工具调用",
 	"jumpTargetUnavailable": "该消息已不在此会话的历史记录中。",
 	"jumpTargetTooFar": "该消息距离当前位置过远，无法直接跳转。请向上滚动加载更多历史后重试。",
-	"switchToPixiRenderer": "切换到实验性 PixiJS 渲染器（只读）",
-	"switchToReactRenderer": "切换到 React 渲染器",
+
 	"archiveNarrator": "归档",
 	"permissionMode": "权限模式",
 	"permissionModesUnavailable": "权限模式不可用",
@@ -1068,11 +1067,9 @@
 		"reattachPartial": "当前后端运行时打开已分离的子代理会话后，不会重新阻塞原父级工具调用。"
 	},
 	"sidecar": {
-		"titleWithCount": "系统注入 ×{{count}}",
 		"unknownSource": "未知来源",
-		"copy": "复制 sidecar 内容",
+		"copy": "复制注入内容",
 		"copied": "已复制",
-		"empty": "无内容",
 		"truncated": "[预览已截断以保持界面流畅。如需完整内容，请使用复制。]",
 		"sources": {
 			"silent_progress": "进度提醒",
@@ -1085,7 +1082,35 @@
 			"buffered_user": "缓冲用户消息",
 			"group_message": "群聊消息",
 			"subagent_message": "子代理消息",
-			"spec_update": "大纲更新"
+			"spec_update": "大纲更新",
+			"behavior_fence": "行为护栏",
+			"pipeline_exit_confirmation": "Pipeline 确认"
+		},
+		"showAll": "展开全部",
+		"attachedCount": "附带 {{count}} 条系统注入",
+		"body": {
+			"noticeSilentProgress": "已连续 {{count}} 次工具调用未输出可见文本",
+			"noticeRelaxedPlan": "仍在规划中 — 暂不要开始实现",
+			"noticePipelineExit": "Pipeline 仍在活动 — 请确认是否仍需要",
+			"tasksCurrent": "Dynamic Spec — {{n}} 条开放任务",
+			"tasksEmptyNever": "Dynamic Spec — 尚未建立任务",
+			"tasksEmptyDone": "Dynamic Spec — 任务已全部完成，需要重新整理",
+			"tasksTooMany": "Dynamic Spec — {{n}} 条任务，已超过阈值",
+			"taskRoleDoing": "进行中",
+			"taskRoleNext": "下一步",
+			"taskRoleTodo": "待办",
+			"taskRoleBlocked": "受阻",
+			"taskProtected": "受保护",
+			"knowledgeHeading": "{{n}} 条相关知识库条目",
+			"tasksDoneAgentHeading": "{{n}} 个后台代理已完成",
+			"tasksDoneBashHeading": "{{n}} 个后台命令已完成",
+			"tasksDoneTruncated": "结果已截断",
+			"messagesHeading": "{{n}} 条消息",
+			"messageFromUnknown": "未知发送者",
+			"messageBroadcast": "广播",
+			"specUpdatesHeading": "你更新了 {{n}} 个 spec 文件",
+			"proseFenceHeading": "行为护栏",
+			"empty": "（空）"
 		}
 	},
 	"executionTarget": "执行目标",

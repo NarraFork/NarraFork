@@ -458,6 +458,47 @@ describe("子代理工具事件向父级携带输入摘要", () => {
 });
 
 describe("narrator event handler persistence", () => {
+	test("sidecar 的结构化 body 与模型向文本一起落库", async () => {
+		// `content` and `bodyJson` are two projections of ONE injection, written at the
+		// same call site. If the column stopped being persisted the UI would silently
+		// fall back to the verbatim-content path for every NEW row — looking exactly
+		// like the pre-refactor rendering, which is precisely why it needs pinning.
+		const narratorId = `sidecar-body-${Date.now()}`;
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
+		const ctx = makeSubagentContext();
+		(ctx as unknown as { narratorId: string }).narratorId = narratorId;
+		const body = {
+			kind: "tasks" as const,
+			variant: "current" as const,
+			tasks: [{ role: "doing" as const, text: "ship the footnote" }],
+		};
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: `sidecar-body-tool-${Date.now()}`,
+				toolName: "Read",
+				output: "ok",
+				isError: false,
+				sideCars: [
+					{
+						target: "tool_result",
+						source: "living_work_spec",
+						content: "Current Dynamic Spec reminder (compiled from spec://tasks.json):",
+						body,
+					},
+				],
+			},
+			ctx,
+		);
+		const rows = await db.query.narratorSidecars.findMany({
+			where: eq(narratorSidecars.narratorId, narratorId),
+		});
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.bodyJson).toEqual(body);
+		expect(rows[0]?.content).toContain("Dynamic Spec");
+	});
+
 	test("工具结果持久化后将结构化 metadata 交给 hook", async () => {
 		let observed: Record<string, unknown> | undefined;
 		await processEvent(

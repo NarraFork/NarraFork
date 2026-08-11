@@ -9,6 +9,7 @@ import { knowledgeAcl, type Principal } from "../../../services/knowledge-acl";
 import { knowledgeBranchService } from "../../../services/knowledge-branch-service";
 import { knowledgeService } from "../../../services/knowledge-service";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
+import { isKnowledgeReadAction } from "./knowledge-actions";
 
 /**
  * KnowledgeCreate / KnowledgeEdit — the contributor-facing knowledge tools.
@@ -241,6 +242,9 @@ export const knowledgeEditTool: ToolDefinition = {
 		"- save: write content to your personal entry (pass entryId for a linked entry, or personalEntryId for a standalone one). With direct:true AND write permission, writes the global main directly; direct:true WITHOUT permission fails explicitly and writes nothing (pass fallbackToPersonal:true to save to your personal entry instead, marked downgraded).\n" +
 		"- rebase: when your personal entry is based on an outdated main (drifted), three-way-merge the latest main into it. Conflict → returns both versions to redo manually.\n" +
 		"- publish: submit your personal entry to be published into the global base (review-gated).\n" +
+		"- my_submissions: list YOUR open publish requests and the next step for each (KnowledgeReview's list_submissions is the reviewer view and hides your own).\n" +
+		"- withdraw: retract one of your own unmerged publish requests (pending / conflict / changes_requested). Your personal entry is kept.\n" +
+		"- resubmit: after a reviewer requested changes, save your fixes first, then resubmit that request (content is taken from the personal entry's current state).\n" +
 		"- set_target: set the target collection for a standalone personal entry (required before publish).\n" +
 		"- update_meta: change a GLOBAL entry's title/tags/keywords/status (pass entryId; needs write permission) and — if you are admin or the entry owner — its classificationLevel/controlledTags/reviewTags; OR a standalone PERSONAL entry's title/keywords (pass personalEntryId).\n" +
 		"- transfer_owner / transfer_collection_owner: hand off ownership (admin or current owner).\n" +
@@ -251,6 +255,9 @@ export const knowledgeEditTool: ToolDefinition = {
 				"save",
 				"rebase",
 				"publish",
+				"my_submissions",
+				"withdraw",
+				"resubmit",
 				"set_target",
 				"update_meta",
 				"transfer_owner",
@@ -281,7 +288,13 @@ export const knowledgeEditTool: ToolDefinition = {
 			.describe(
 				"save + direct only: when true, a denied direct global write is downgraded to a personal-entry save (result marked downgraded:true) instead of erroring. Default false.",
 			),
-		changeNote: z.string().optional().describe("Change note for save / publish"),
+		changeNote: z.string().optional().describe("Change note for save / publish / resubmit"),
+		// Author-side submission lifecycle (withdraw / resubmit)
+		submissionId: z
+			.string()
+			.optional()
+			.describe("Publish-request id for withdraw / resubmit (get it from action 'my_submissions')"),
+		reason: z.string().optional().describe("withdraw: optional reason recorded on the request"),
 		// set_target
 		collectionId: z.string().optional().describe("set_target: target collection id"),
 		// update_meta
@@ -328,17 +341,21 @@ export const knowledgeEditTool: ToolDefinition = {
 	async execute(args, ctx): Promise<ToolResult> {
 		const a = args as Record<string, unknown>;
 		const action = a.action as string;
-		const decision = await ctx.requestPermission(
-			"KnowledgeEdit",
-			{ action, ...a },
-			ctx.currentToolUseId ?? "",
-		);
-		if (decision.behavior !== "allow") {
-			return deny(
-				decision.behavior === "deny" && decision.message
-					? decision.message
-					: "KnowledgeEdit action was denied by the user.",
+		// Write actions require user permission; read actions (my_submissions) run directly —
+		// mirroring KnowledgeReview, with the split owned by knowledge-actions.ts.
+		if (!isKnowledgeReadAction(action)) {
+			const decision = await ctx.requestPermission(
+				"KnowledgeEdit",
+				{ action, ...a },
+				ctx.currentToolUseId ?? "",
 			);
+			if (decision.behavior !== "allow") {
+				return deny(
+					decision.behavior === "deny" && decision.message
+						? decision.message
+						: "KnowledgeEdit action was denied by the user.",
+				);
+			}
 		}
 		try {
 			const principal = await principalOf(ctx);
@@ -352,6 +369,12 @@ export const knowledgeEditTool: ToolDefinition = {
 					return await editRebase(principal, a);
 				case "publish":
 					return await editPublish(principal, a);
+				case "my_submissions":
+					return await editMySubmissions(principal, a);
+				case "withdraw":
+					return await editWithdraw(principal, a);
+				case "resubmit":
+					return await editResubmit(principal, a);
 				case "set_target":
 					return await editSetTarget(principal, a);
 				case "update_meta":
@@ -491,18 +514,126 @@ async function editRebase(principal: Principal, a: Record<string, unknown>): Pro
 
 async function editPublish(principal: Principal, a: Record<string, unknown>): Promise<ToolResult> {
 	const draftId = (a.personalEntryId as string) || (await resolveLinkedDraftId(principal, a));
-	if (!draftId) return deny("publish requires 'personalEntryId' or 'entryId'.");
-	const submission = await knowledgeBranchService.submitForReview(principal, draftId, {
+	if (!draftId) {
+		return deny(
+			"publish requires 'personalEntryId' or 'entryId'. " +
+				"List your personal entries with KnowledgeLibrary (action 'list_mine') to find the id.",
+		);
+	}
+	const submission = (await knowledgeBranchService.submitForReview(principal, draftId, {
 		changeNote: a.changeNote as string | undefined,
-	});
+	})) as { id: string; driftWarning?: { versionsBehind: number } | null } | undefined;
+	if (!submission) return deny("publish did not produce a submission.");
+	// A stale base is not an error (approve three-way-merges it), but say so NOW: rebasing
+	// while the author is still in the loop is far cheaper than a conflict discovered by the
+	// reviewer at approve time.
+	const drift = submission.driftWarning
+		? `\n\n⚠ This proposal is based on a main revision that is ${submission.driftWarning.versionsBehind} version(s) behind. ` +
+			`The reviewer may hit a merge conflict. Consider action 'rebase' then publishing again.`
+		: "";
 	return {
-		output: `Submitted your personal entry for publishing (submission ${(submission as { id: string }).id}). A reviewer must approve before it enters the global base.`,
-		title: "KnowledgeEdit: publish",
+		output:
+			`Submitted your personal entry for publishing (submission ${submission.id}). ` +
+			`A reviewer must approve before it enters the global base.${drift}`,
+		title: submission.driftWarning
+			? "KnowledgeEdit: publish (drifted base)"
+			: "KnowledgeEdit: publish",
 		metadata: {
 			tool: "KnowledgeEdit",
 			action: "publish",
-			submissionId: (submission as { id: string }).id,
+			submissionId: submission.id,
+			...(submission.driftWarning ? { drifted: true } : {}),
 		},
+	};
+}
+
+/**
+ * Withdraw one of the caller's own unmerged publish requests.
+ *
+ * Exists because an agent could previously submit but never retract: the author-side exits
+ * (withdraw / resubmit) were HTTP- and UI-only, so an agent that published and then got
+ * `changes_requested` or `conflict` had no way to finish the job without a human.
+ */
+async function editWithdraw(principal: Principal, a: Record<string, unknown>): Promise<ToolResult> {
+	if (!a.submissionId) {
+		return deny(
+			"withdraw requires 'submissionId'. Use action 'my_submissions' to list your open requests.",
+		);
+	}
+	const res = await knowledgeBranchService.withdrawSubmission(principal, a.submissionId as string, {
+		reason: a.reason as string | undefined,
+	});
+	return {
+		output:
+			`Withdrew publish request ${res.submissionId}. Your personal entry is untouched — ` +
+			`edit it (action 'save') and publish again when ready.`,
+		title: "KnowledgeEdit: withdraw",
+		metadata: { tool: "KnowledgeEdit", action: "withdraw", submissionId: res.submissionId },
+	};
+}
+
+/**
+ * Re-submit after a reviewer requested changes. Content always comes from the CURRENT personal
+ * entry, so the flow is: save the fixes, then resubmit.
+ */
+async function editResubmit(principal: Principal, a: Record<string, unknown>): Promise<ToolResult> {
+	if (!a.submissionId) {
+		return deny(
+			"resubmit requires 'submissionId' (the request that got changes_requested). " +
+				"Use action 'my_submissions' to find it.",
+		);
+	}
+	const created = (await knowledgeBranchService.resubmit(principal, a.submissionId as string, {
+		changeNote: a.changeNote as string | undefined,
+	})) as { id: string; round?: number } | undefined;
+	if (!created) return deny("resubmit did not produce a submission.");
+	return {
+		output:
+			`Re-submitted as ${created.id} (round ${created.round ?? "?"}), built from your personal ` +
+			`entry's current content. Make sure you saved your fixes first.`,
+		title: "KnowledgeEdit: resubmit",
+		metadata: { tool: "KnowledgeEdit", action: "resubmit", submissionId: created.id },
+	};
+}
+
+/**
+ * The caller's OWN open publish requests. `KnowledgeReview action 'list_submissions'` is the
+ * REVIEWER view and deliberately excludes your own submissions, so without this an agent could
+ * not see what happened to anything it published.
+ */
+async function editMySubmissions(
+	principal: Principal,
+	_a: Record<string, unknown>,
+): Promise<ToolResult> {
+	const rows = (await knowledgeBranchService.listMyOpenSubmissions(principal, {})) as {
+		id: string;
+		status: string;
+		entryId: string | null;
+		draftId: string;
+		createdAt: string;
+	}[];
+	if (rows.length === 0) {
+		return {
+			output: "You have no open publish requests (nothing pending, in conflict, or bounced back).",
+			title: "KnowledgeEdit: my_submissions",
+			metadata: { tool: "KnowledgeEdit", action: "my_submissions", count: 0 },
+		};
+	}
+	// Each status implies exactly one author-side next step; spelling it out avoids a guess.
+	const nextStep: Record<string, string> = {
+		pending: "awaiting review — action 'withdraw' to retract",
+		conflict:
+			"reviewer hit a conflict — 'rebase' + 'withdraw' then publish again, or let them resolve it",
+		changes_requested: "changes requested — 'save' your fixes then action 'resubmit'",
+	};
+	const lines = rows.map(
+		(r) =>
+			`- [${r.id}] ${r.status}${r.entryId ? ` on entry ${r.entryId}` : " (new entry)"} — ${nextStep[r.status] ?? "no action available"}`,
+	);
+	return {
+		output: `Your open publish requests (${rows.length}):\n${lines.join("\n")}`,
+		title: "KnowledgeEdit: my_submissions",
+		metadata: { tool: "KnowledgeEdit", action: "my_submissions", count: rows.length },
 	};
 }
 

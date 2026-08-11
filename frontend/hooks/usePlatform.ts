@@ -1,7 +1,42 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
+/**
+ * Server platform and feature availability.
+ *
+ * This file used to host a `RuntimeCapabilities` negotiation layer: a 429-line interface
+ * describing what a backend supports, 43 `get*Capability` getters that read it, and 42
+ * matching hooks. It was built so a second, non-TypeScript backend could advertise a
+ * narrower feature set and the UI would fail closed against it.
+ *
+ * That backend never existed. `/api/health` has never sent a `capabilities` block, so
+ * `capabilities` was always `undefined`, every getter always took its `!capabilities`
+ * branch, and all 43 results were constants. The negotiation had exactly one possible
+ * outcome, which also made it unable to *start* negotiating: handing health a partial
+ * capabilities object would have flipped every other getter's absent-payload fallback
+ * off at once and turned 30+ working features unsupported.
+ *
+ * The inert structure was not free. `getChapterSplitCapability` deliberately failed closed
+ * while `POST /chapters/:id/split` was missing, which was correct at the time; once the
+ * route landed the fail-closed default kept the feature permanently unreachable, because
+ * no payload ever arrived to say otherwise. Split was the bug that got noticed. The
+ * compressed-summary warning in `ChapterSplitModal` was another: `compressedAISummary`
+ * had no absent-payload fallback, so it read `false` and the modal told users this
+ * backend cannot generate an AI summary for compressed splits, while `narrator-service`
+ * generates one via `narratorContext.generateContextSummary`.
+ *
+ * So the getters are gone and what they returned is stated directly. Hook names and
+ * return shapes are unchanged, so call sites still read `.supported` / `.reason` and can
+ * keep rendering their unsupported states — those branches are simply unreachable now.
+ *
+ * Adding a real capability means adding a real signal: have `/api/health` report the
+ * specific thing, read it here, and gate on it. Do not reintroduce a blanket
+ * "absent payload means legacy backend" fallback; that is what made the previous
+ * structure both inert and impossible to switch on.
+ */
+
 type Platform = "windows" | "macos" | "linux";
+
 export interface RuntimeEnvironmentInfo {
 	android: boolean;
 	proot: boolean;
@@ -9,6 +44,7 @@ export interface RuntimeEnvironmentInfo {
 	containerSupport: boolean;
 	containerUnsupportedReason?: string;
 }
+
 export type GatewayPlatform =
 	| "telegram"
 	| "discord"
@@ -18,16 +54,6 @@ export type GatewayPlatform =
 	| "weixin"
 	| "qqbot";
 
-interface FeatureCapability {
-	supported?: boolean;
-	fallback?: boolean;
-	code?: string;
-	reason?: string;
-	error?: string;
-	message?: string;
-	mode?: string;
-}
-
 export type ProviderCapabilityKey =
 	| "openai"
 	| "anthropic"
@@ -35,6 +61,7 @@ export type ProviderCapabilityKey =
 	| "codex"
 	| "cline"
 	| "gemini";
+
 type ChapterContainerRoute =
 	| "setup"
 	| "podmanStatus"
@@ -48,9 +75,23 @@ type ChapterContainerRoute =
 	| "logs"
 	| "remove";
 type ChapterContainerRoutes = Record<ChapterContainerRoute, boolean>;
-type StorageDatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "apiRequestDumps";
 
-interface ProviderManagerParityCapability {
+interface FeatureCapability {
+	supported?: boolean;
+	fallback?: boolean;
+	code?: string;
+	reason?: string;
+	error?: string;
+	message?: string;
+	mode?: string;
+}
+
+/**
+ * Shapes for the capabilities that have no signal at all and so resolve to `undefined`.
+ * They are kept as types (rather than dropping to `never`) because consumers optional-chain
+ * into them and render the fields when present.
+ */
+export interface ProviderManagerParityCapability {
 	tsCodexManagerEquivalent?: boolean;
 	usageQueueParity?: string;
 	usageQueueClearSupported?: boolean;
@@ -58,7 +99,7 @@ interface ProviderManagerParityCapability {
 	reason?: string;
 }
 
-interface ProviderRuntimeCapability {
+export interface ProviderRuntimeCapability {
 	auth?: FeatureCapability;
 	models?: {
 		supported?: boolean;
@@ -78,435 +119,29 @@ interface ProviderRuntimeCapability {
 	managerParity?: ProviderManagerParityCapability;
 }
 
-export interface RuntimeCapabilities {
-	database?: {
-		engine?: string;
-		mainSchemaOwner?: string;
-		ftsRepair?: boolean;
-		mode?: string;
-		searchMode?: string;
-		reason?: string;
-	};
-	frontend?: {
-		staticHosted?: boolean;
-		mode?: string;
-		directory?: string;
-	};
-	releasePackaging?: {
-		buildInfo?: string;
-		frontend?: string;
-		changelog?: string;
-		singleFileEmbedded?: boolean;
-	};
-	nativeExtensions?: {
-		defaultEnabled?: boolean;
-		scope?: string;
-		browserSessions?: {
-			defaultEnabled?: boolean;
-			storage?: string;
-			cutover?: string;
-			rollback?: string;
-			reason?: string;
-		};
-		containerBrowserToolAutoEnable?: {
-			defaultEnabled?: boolean;
-			cutover?: string;
-			rollback?: string;
-			reason?: string;
-		};
-	};
-	chapters?: {
-		batchMerge?: FeatureCapability & {
-			routes?: {
-				start?: boolean;
-				session?: boolean;
-			};
-			response?: {
-				mergeSessionId?: boolean;
-				targetChapterId?: boolean;
-				createdTarget?: boolean;
-				status?: boolean;
-			};
-			events?: string[];
-			decisionWs?: boolean;
-			staleSessionCleanup?: boolean;
-			createdTargetRollback?: boolean;
-			frontendCompletionMode?: string;
-		};
-		split?: FeatureCapability & {
-			routes?: {
-				splitAtCommit?: boolean;
-			};
-			partials?: {
-				compressedAISummary?: FeatureCapability;
-				containerAutostart?: FeatureCapability;
-			};
-		};
-		containers?: FeatureCapability & {
-			routes?: Partial<Record<ChapterContainerRoute, boolean>>;
-			runtime?: {
-				podmanCompose?: boolean;
-				podmanComposeFallbackCommand?: boolean;
-				boundedOutput?: boolean;
-				syncStartRequest?: boolean;
-				backgroundStart?: boolean;
-				backgroundStartReason?: string;
-				streamingLogs?: boolean;
-				perChapterLock?: boolean;
-			};
-			ports?: {
-				legacyHostPortAllocation?: boolean;
-				portRelease?: boolean;
-			};
-			proxy?: {
-				metadataSupported?: boolean;
-				requiresPastaPasst?: boolean;
-				overridePortsReset?: boolean;
-				reverseProxyServer?: boolean;
-				http?: boolean;
-				websocket?: boolean;
-				dynamicSettingsHook?: boolean;
-			};
-			lifecycle?: {
-				manualControls?: boolean;
-				autoStartOnFork?: boolean;
-				pauseOnDormant?: boolean;
-				unpauseOnWake?: boolean;
-				removeOnDelete?: boolean;
-				removeOnMergeCleanup?: boolean;
-				deleteVolumes?: boolean;
-			};
-			narratorIntegration?: {
-				statusChangedEvent?: boolean;
-				containerReadyMessage?: boolean;
-				browserToolAutoEnable?: boolean;
-				browserToolAutoEnableReason?: string;
-				defaultEnabled?: boolean;
-				cutover?: string;
-				rollback?: string;
-			};
-		};
-	};
-	narrator?: {
-		wsEvents?: {
-			p0?: FeatureCapability & { events?: string[] };
-			p1?: FeatureCapability & { mode?: string; events?: string[] };
-		};
-		messageHistory?: FeatureCapability & {
-			catchUp?: boolean;
-			messageVersion?: boolean;
-			childOrphans?: boolean;
-			toolCalls?: boolean;
-			compactMarkers?: boolean;
-			structuredContent?: boolean;
-		};
-		delete?: FeatureCapability & {
-			feature?: string;
-		};
-		browserSessions?: FeatureCapability & {
-			defaultEnabled?: boolean;
-			runtime?: string;
-			storage?: string;
-			cutover?: string;
-			rollback?: string;
-			narratorBound?: boolean;
-			lifecycleEvents?: boolean;
-			artifactPersistence?: boolean;
-			resourceLimits?: boolean;
-			requiresChrome?: boolean;
-		};
-		containerBrowserToolAutoEnable?: {
-			defaultEnabled?: boolean;
-			cutover?: string;
-			rollback?: string;
-			reason?: string;
-		};
-		planMode?: FeatureCapability & {
-			api?: boolean;
-			toolReflection?: boolean;
-			previousModeRestore?: boolean;
-		};
-		retryRecovery?: FeatureCapability & {
-			retry?: boolean;
-			continue?: boolean;
-			interrupt?: boolean;
-			manualOverride?: boolean;
-			rollback?: boolean;
-			editAndRegenerate?: boolean;
-		};
-		permissions?: FeatureCapability & {
-			modes?: string[];
-			approveDeny?: boolean;
-			updatedInput?: boolean;
-			pauseResume?: string;
-			reflections?: string[];
-		};
-		reviewTools?: FeatureCapability & {
-			concludeReview?: boolean;
-			feedbackInjection?: boolean;
-			promote?: boolean;
-			dismiss?: boolean;
-			convertToSubagent?: boolean;
-			staleMergeGuard?: boolean;
-		};
-		subagents?: FeatureCapability & {
-			foreground?: boolean;
-			background?: boolean;
-			awaitAgent?: boolean;
-			awaitBash?: boolean;
-			awaitBashWaitForText?: boolean;
-			awaitBashReason?: string;
-			send?: boolean;
-			teamStatus?: boolean;
-			detachAttach?: boolean;
-			detachUnblocksParent?: boolean;
-			reattachBlocksParent?: boolean;
-			reattachFallback?: boolean;
-			reattachReason?: string;
-			backgroundResultInjection?: boolean;
-			staleRecovery?: boolean;
-		};
-		rollbackEditRegenerate?: FeatureCapability & {
-			rollback?: boolean;
-			editAndRegenerate?: boolean;
-			copyOnWrite?: boolean;
-			messageRefTruncation?: boolean;
-			fileStateRebuild?: boolean;
-			toolCallInvalidation?: boolean;
-			agentRerun?: boolean;
-			optionalFileRevert?: boolean;
-			optionalAgentRerun?: boolean;
-			wsEvents?: boolean;
-		};
-		compact?: FeatureCapability & {
-			segmentCompact?: boolean;
-			contextClear?: boolean;
-			mode?: string;
-			fallbackSummary?: boolean;
-			fallbackReason?: string;
-		};
-		toolInventory?: {
-			supported?: boolean;
-			categories?: string[];
-			supportedOptionalTools?: string[];
-			unsupportedOptionalTools?: string[];
-			reason?: string;
-			webFetch?: FeatureCapability & {
-				parity?: string;
-				mode?: string;
-				defaultMode?: string;
-				supportedModes?: string[];
-				unsupportedModes?: string[];
-				protocols?: string[];
-				policy?: string;
-			};
-			browser?: FeatureCapability & {
-				parity?: string;
-				runtime?: string;
-				screenshotPreviewMode?: string;
-				sharePreview?: boolean;
-				imageContentBlock?: boolean;
-				fileOutput?: boolean;
-				traceFormat?: string;
-				traceShare?: boolean;
-				traceFileOutput?: boolean;
-				traceShareUrl?: string;
-			};
-			mcpExternalTools?: FeatureCapability & {
-				parity?: string;
-				transport?: string;
-				lifecycle?: string;
-			};
-		};
-	};
-	mcp?: {
-		builtinProtocol?: FeatureCapability & {
-			initialize?: boolean;
-			toolsList?: boolean;
-			toolsCall?: boolean;
-		};
-		serverSettingsStorage?: FeatureCapability & { storage?: string };
-		externalServerManagement?: FeatureCapability & {
-			storage?: string;
-			permissions?: boolean;
-			import?: boolean;
-		};
-		builtinTools?: FeatureCapability & {
-			parity?: string;
-			missing?: string[];
-		};
-		toolsList?: FeatureCapability & { source?: string };
-		toolsCall?: FeatureCapability & { scope?: string };
-		externalToolsInjection?: FeatureCapability & {
-			parity?: string;
-			transport?: string;
-			lifecycle?: string;
-		};
-		externalAgentInjection?: FeatureCapability & {
-			parity?: string;
-			transport?: string;
-			lifecycle?: string;
-		};
-		transports?: {
-			stdio?: FeatureCapability;
-			sse?: FeatureCapability;
-			streamableHttp?: FeatureCapability;
-		};
-	};
-	benchmark?: {
-		containerExecution?: FeatureCapability & {
-			runtime?: string;
-			resourceLimits?: boolean;
-			timeout?: boolean;
-			outputLimitBytes?: number;
-		};
-	};
-	content?: {
-		projectRoutines?: FeatureCapability & { storage?: string };
-		projectSkills?: FeatureCapability & { storage?: string };
-	};
-	fs?: {
-		browse?: FeatureCapability;
-		shortcuts?: FeatureCapability;
-		mkdir?: FeatureCapability;
-		preview?: FeatureCapability & {
-			maxTextBytes?: number;
-			maxBinaryBytes?: number;
-		};
-		reveal?: FeatureCapability;
-	};
-	providers?: Partial<Record<ProviderCapabilityKey, ProviderRuntimeCapability>>;
-	terminal?: {
-		supported?: boolean;
-		reason?: string;
-		directPty?: boolean;
-		windowsPty?: boolean;
-		dtachSupported?: boolean;
-		dtachAvailable?: boolean;
-		detachedReattach?: boolean;
-		orphanRecovery?: boolean;
-		scrollbackReplay?: boolean;
-		scrollbackReplayMode?: string;
-		bufferStateReplay?: boolean;
-		bufferStateMode?: string;
-		xtermSerializedReplay?: boolean;
-		xtermSerializedReplayReason?: string;
-		maxSnapshotBytes?: number;
-		multiClientResizeMode?: string;
-		ws?: {
-			subscribe?: boolean;
-			create?: boolean;
-			input?: boolean;
-			resize?: boolean;
-			kill?: boolean;
-			rename?: boolean;
-			scrollback?: boolean;
-			bufferState?: boolean;
-		};
-		processTree?: {
-			supported?: boolean;
-			platform?: string;
-		};
-	};
-	vnet?: {
-		supported?: boolean;
-		reason?: string;
-		mode?: string;
-		ws?: boolean;
-		peerCleanup?: boolean;
-		udpRendezvous?: boolean;
-		udpRendezvousReason?: string;
-	};
-	update?: {
-		selfUpdateAvailable?: boolean;
-		manualOnly?: boolean;
-		canAutoRestart?: boolean;
-		download?: FeatureCapability & {
-			sse?: boolean;
-			sha512?: boolean;
-			maxBytes?: number;
-			trustMode?: string;
-		};
-		apply?: FeatureCapability & {
-			handoff?: string;
-		};
-	};
-	settings?: {
-		storage?: FeatureCapability & { path?: string };
-		patch?: FeatureCapability;
-		validation?: {
-			tsZodParity?: boolean;
-			mode?: string;
-			reason?: string;
-		};
-		secretMasking?: boolean;
-		providerModelAugmentation?: boolean;
-		tlsGeneration?: boolean;
-		retryRules?: boolean;
-	};
-	gateway?: {
-		persistentRuntimes?: boolean;
-		mode?: string;
-		reason?: string;
-		supportedPlatforms?: GatewayPlatform[];
-		unsupportedPlatforms?: Partial<Record<GatewayPlatform, string>>;
-		webhook?: FeatureCapability;
-		weixinQr?: FeatureCapability;
-	};
-	runtime?: {
-		backend?: string;
-		buildChannel?: string;
-		scan?: FeatureCapability;
-		cached?: FeatureCapability;
-		cleanup?: Partial<
-			Record<
-				"terminals" | "containers" | "browsers" | "worktrees",
-				{
-					supported?: boolean;
-					reason?: string;
-					mode?: string;
-				}
-			>
-		>;
-	};
-	uploads?: {
-		serveNarratorImages?: FeatureCapability;
-		serveAvatars?: FeatureCapability;
-		cleanupPreservesMessageImageRefs?: FeatureCapability;
-	};
-	shares?: {
-		create?: FeatureCapability;
-		publicDownload?: FeatureCapability;
-		preview?: FeatureCapability & { htmlMode?: string; reason?: string };
-		ephemeralOnly?: FeatureCapability;
-	};
-	storage?: {
-		scan?: FeatureCapability & { sse?: boolean; cache?: boolean };
-		cached?: FeatureCapability & { cache?: boolean };
-		database?: {
-			preview?: boolean;
-			cleanup?: boolean;
-			cleanupTargets?: Partial<Record<StorageDatabaseCleanupTarget, FeatureCapability>>;
-		};
-		vacuum?: {
-			supported?: boolean;
-			reason?: string;
-		};
-		cleanup?: Partial<
-			Record<
-				"uploads" | "shares" | "worktrees" | "containers",
-				{
-					supported?: boolean;
-					fallback?: boolean;
-					reason?: string;
-					mode?: string;
-					alternative?: string;
-					preservesMessageImageRefs?: boolean;
-				}
-			>
-		>;
-	};
+export interface DatabaseCapability {
+	engine?: string;
+	mainSchemaOwner?: string;
+	ftsRepair?: boolean;
+	mode?: string;
+	searchMode?: string;
+	reason?: string;
 }
+
+export interface ContainerBrowserToolAutoEnableCapability {
+	defaultEnabled?: boolean;
+	cutover?: string;
+	rollback?: string;
+	reason?: string;
+}
+
+/**
+ * Every capability below is supported unless a live signal says otherwise, so most of
+ * these resolve to a frozen constant. `SUPPORTED` is the shared shape for the common
+ * `{ supported, reason? }` case; `reason` stays optional in the types because consumers
+ * render it when a capability is unsupported.
+ */
+const SUPPORTED: { supported: boolean; reason?: string } = Object.freeze({ supported: true });
 
 function useHealthQuery() {
 	return useQuery({
@@ -526,25 +161,23 @@ export function usePlatform(): Platform {
 	return data?.platform ?? "linux";
 }
 
-export function useRuntimeCapabilities(): RuntimeCapabilities | undefined {
-	const { data } = useHealthQuery();
-	return data?.capabilities;
-}
-
 export function useRuntimeEnvironment(): RuntimeEnvironmentInfo | undefined {
 	const { data } = useHealthQuery();
 	return data?.runtimeEnvironment;
 }
 
-export function getDatabaseCapability(
-	capabilities: RuntimeCapabilities | undefined,
-): RuntimeCapabilities["database"] | undefined {
-	return capabilities?.database;
+// === database ===
+
+/**
+ * Descriptive database metadata (engine, schema owner, FTS repair support). Health does
+ * not report it, so this is `undefined`; `StorageSection` renders its compatibility panel
+ * only when present.
+ */
+export function useDatabaseCapability(): DatabaseCapability | undefined {
+	return undefined;
 }
 
-export function useDatabaseCapability(): RuntimeCapabilities["database"] | undefined {
-	return getDatabaseCapability(useRuntimeCapabilities());
-}
+// === filesystem ===
 
 type FileSystemFeatureCapability = {
 	supported: boolean;
@@ -553,46 +186,31 @@ type FileSystemFeatureCapability = {
 	maxBinaryBytes?: number;
 };
 
-export function getFileSystemCapability(capabilities: RuntimeCapabilities | undefined): {
+const FILE_SYSTEM_CAPABILITY: {
 	browse: FileSystemFeatureCapability;
 	shortcuts: FileSystemFeatureCapability;
 	mkdir: FileSystemFeatureCapability;
 	preview: FileSystemFeatureCapability;
 	reveal: FileSystemFeatureCapability;
-} {
-	const fs = capabilities?.fs;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		browse: {
-			supported: assumeLegacyTSBackend ? true : fs?.browse?.supported === true,
-			reason: fs?.browse?.reason,
-		},
-		shortcuts: {
-			supported: assumeLegacyTSBackend ? true : fs?.shortcuts?.supported === true,
-			reason: fs?.shortcuts?.reason,
-		},
-		mkdir: {
-			supported: assumeLegacyTSBackend ? true : fs?.mkdir?.supported === true,
-			reason: fs?.mkdir?.reason,
-		},
-		preview: {
-			supported: assumeLegacyTSBackend ? true : fs?.preview?.supported === true,
-			reason: fs?.preview?.reason,
-			maxTextBytes: fs?.preview?.maxTextBytes,
-			maxBinaryBytes: fs?.preview?.maxBinaryBytes,
-		},
-		reveal: {
-			supported: assumeLegacyTSBackend ? true : fs?.reveal?.supported === true,
-			reason: fs?.reveal?.reason,
-		},
-	};
+} = Object.freeze({
+	browse: SUPPORTED,
+	shortcuts: SUPPORTED,
+	mkdir: SUPPORTED,
+	preview: SUPPORTED,
+	reveal: SUPPORTED,
+});
+
+export function useFileSystemCapability(): typeof FILE_SYSTEM_CAPABILITY {
+	return FILE_SYSTEM_CAPABILITY;
 }
 
-export function useFileSystemCapability(): ReturnType<typeof getFileSystemCapability> {
-	return getFileSystemCapability(useRuntimeCapabilities());
+export function useFsRevealCapability(): FileSystemFeatureCapability {
+	return FILE_SYSTEM_CAPABILITY.reveal;
 }
 
-export function getTerminalCapability(capabilities: RuntimeCapabilities | undefined): {
+// === terminal ===
+
+const TERMINAL_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	dtachSupported?: boolean;
@@ -607,32 +225,15 @@ export function getTerminalCapability(capabilities: RuntimeCapabilities | undefi
 	xtermSerializedReplayReason?: string;
 	multiClientResizeMode?: string;
 	processTree?: { supported?: boolean; platform?: string };
-} {
-	const terminal = capabilities?.terminal;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : terminal?.supported === true,
-		reason: terminal?.reason,
-		dtachSupported: terminal?.dtachSupported,
-		dtachAvailable: terminal?.dtachAvailable,
-		detachedReattach: terminal?.detachedReattach,
-		orphanRecovery: terminal?.orphanRecovery,
-		scrollbackReplay: terminal?.scrollbackReplay,
-		scrollbackReplayMode: terminal?.scrollbackReplayMode,
-		bufferStateReplay: terminal?.bufferStateReplay,
-		bufferStateMode: terminal?.bufferStateMode,
-		xtermSerializedReplay: terminal?.xtermSerializedReplay,
-		xtermSerializedReplayReason: terminal?.xtermSerializedReplayReason,
-		multiClientResizeMode: terminal?.multiClientResizeMode,
-		processTree: terminal?.processTree,
-	};
+} = Object.freeze({ supported: true });
+
+export function useTerminalCapability(): typeof TERMINAL_CAPABILITY {
+	return TERMINAL_CAPABILITY;
 }
 
-export function useTerminalCapability(): ReturnType<typeof getTerminalCapability> {
-	return getTerminalCapability(useRuntimeCapabilities());
-}
+// === update ===
 
-export function getUpdateCapability(capabilities: RuntimeCapabilities | undefined): {
+const UPDATE_CAPABILITY: {
 	selfUpdateAvailable: boolean;
 	manualOnly: boolean;
 	canAutoRestart: boolean;
@@ -649,44 +250,21 @@ export function getUpdateCapability(capabilities: RuntimeCapabilities | undefine
 		reason?: string;
 		handoff?: string;
 	};
-} {
-	const update = capabilities?.update;
-	const download = update?.download;
-	const apply = update?.apply;
-	const assumeLegacyTSBackend = !capabilities;
-	const manualOnly = update?.manualOnly === true;
-	const selfUpdateAvailable = assumeLegacyTSBackend
-		? true
-		: update?.selfUpdateAvailable === true && !manualOnly;
-	const canAutoRestart = assumeLegacyTSBackend
-		? true
-		: update?.canAutoRestart === true && !manualOnly;
-	const downloadSupported = assumeLegacyTSBackend ? true : download?.supported === true;
-	return {
-		selfUpdateAvailable,
-		manualOnly,
-		canAutoRestart,
-		download: {
-			supported: downloadSupported,
-			reason: download?.reason,
-			sse: assumeLegacyTSBackend ? true : downloadSupported && download?.sse === true,
-			sha512: assumeLegacyTSBackend ? true : downloadSupported && download?.sha512 === true,
-			maxBytes: download?.maxBytes,
-			trustMode: download?.trustMode,
-		},
-		apply: {
-			supported: assumeLegacyTSBackend ? true : apply?.supported === true && !manualOnly,
-			reason: apply?.reason,
-			handoff: apply?.handoff,
-		},
-	};
+} = Object.freeze({
+	selfUpdateAvailable: true,
+	manualOnly: false,
+	canAutoRestart: true,
+	download: Object.freeze({ supported: true, sse: true, sha512: true }),
+	apply: SUPPORTED,
+});
+
+export function useUpdateCapability(): typeof UPDATE_CAPABILITY {
+	return UPDATE_CAPABILITY;
 }
 
-export function useUpdateCapability(): ReturnType<typeof getUpdateCapability> {
-	return getUpdateCapability(useRuntimeCapabilities());
-}
+// === gateway ===
 
-export function getGatewayCapability(capabilities: RuntimeCapabilities | undefined): {
+const GATEWAY_CAPABILITY: {
 	weixinQrSupported: boolean;
 	weixinQrReason?: string;
 	webhookSupported: boolean;
@@ -697,52 +275,21 @@ export function getGatewayCapability(capabilities: RuntimeCapabilities | undefin
 	isPlatformSupported: (platform: GatewayPlatform) => boolean;
 	platformUnsupportedReason: (platform: GatewayPlatform) => string | undefined;
 	reason?: string;
-} {
-	const gateway = capabilities?.gateway;
-	const assumeLegacyTSBackend = !capabilities;
-	const persistentRuntimes = assumeLegacyTSBackend ? true : gateway?.persistentRuntimes === true;
-	const supportedPlatforms = gateway?.supportedPlatforms;
-	const unsupportedPlatforms = gateway?.unsupportedPlatforms;
-	const webhookSupported = assumeLegacyTSBackend ? true : gateway?.webhook?.supported === true;
-	const weixinQrSupported = assumeLegacyTSBackend ? true : gateway?.weixinQr?.supported === true;
-	const webhookReason =
-		gateway?.webhook?.reason ??
-		gateway?.webhook?.message ??
-		gateway?.webhook?.error ??
-		gateway?.webhook?.code;
-	const weixinQrReason =
-		gateway?.weixinQr?.reason ??
-		gateway?.weixinQr?.message ??
-		gateway?.weixinQr?.error ??
-		gateway?.weixinQr?.code;
-	return {
-		weixinQrSupported,
-		weixinQrReason,
-		webhookSupported,
-		webhookReason,
-		persistentRuntimes,
-		supportedPlatforms,
-		unsupportedPlatforms,
-		isPlatformSupported: (platform) => {
-			if (platform === "webhook" && !webhookSupported) return false;
-			if (platform === "weixin" && !weixinQrSupported) return false;
-			if (supportedPlatforms?.length) return supportedPlatforms.includes(platform);
-			return persistentRuntimes || platform === "webhook";
-		},
-		platformUnsupportedReason: (platform) => {
-			if (platform === "webhook") return unsupportedPlatforms?.[platform] ?? webhookReason;
-			if (platform === "weixin") return unsupportedPlatforms?.[platform] ?? weixinQrReason;
-			return unsupportedPlatforms?.[platform];
-		},
-		reason: gateway?.reason,
-	};
+} = Object.freeze({
+	weixinQrSupported: true,
+	webhookSupported: true,
+	persistentRuntimes: true,
+	isPlatformSupported: () => true,
+	platformUnsupportedReason: () => undefined,
+});
+
+export function useGatewayCapability(): typeof GATEWAY_CAPABILITY {
+	return GATEWAY_CAPABILITY;
 }
 
-export function useGatewayCapability(): ReturnType<typeof getGatewayCapability> {
-	return getGatewayCapability(useRuntimeCapabilities());
-}
+// === chapters: containers ===
 
-export function getChapterContainersCapability(capabilities: RuntimeCapabilities | undefined): {
+type ChapterContainersCapability = {
 	supported: boolean;
 	reason?: string;
 	routes: ChapterContainerRoutes;
@@ -769,55 +316,58 @@ export function getChapterContainersCapability(capabilities: RuntimeCapabilities
 		websocket?: boolean;
 		dynamicSettingsHook?: boolean;
 	};
-} {
-	const containers = capabilities?.chapters?.containers;
-	const assumeLegacyTSBackend = !capabilities;
-	const supported = assumeLegacyTSBackend ? true : containers?.supported === true;
-	const routeSupported = (route: ChapterContainerRoute) =>
-		assumeLegacyTSBackend ? true : supported && containers?.routes?.[route] === true;
+};
+
+function chapterContainerRoutes(supported: boolean): ChapterContainerRoutes {
 	return {
-		supported,
-		reason: containers?.reason,
-		routes: {
-			setup: routeSupported("setup"),
-			podmanStatus: routeSupported("podmanStatus"),
-			podmanInstall: routeSupported("podmanInstall"),
-			composeInfo: routeSupported("composeInfo"),
-			list: routeSupported("list"),
-			start: routeSupported("start"),
-			stop: routeSupported("stop"),
-			pause: routeSupported("pause"),
-			unpause: routeSupported("unpause"),
-			logs: routeSupported("logs"),
-			remove: routeSupported("remove"),
-		},
-		runtime: {
-			podmanCompose: containers?.runtime?.podmanCompose,
-			podmanComposeFallbackCommand: containers?.runtime?.podmanComposeFallbackCommand,
-			boundedOutput: containers?.runtime?.boundedOutput,
-			syncStartRequest: containers?.runtime?.syncStartRequest,
-			backgroundStart: containers?.runtime?.backgroundStart,
-			backgroundStartReason: containers?.runtime?.backgroundStartReason,
-			streamingLogs: containers?.runtime?.streamingLogs,
-			perChapterLock: containers?.runtime?.perChapterLock,
-		},
-		ports: {
-			legacyHostPortAllocation: containers?.ports?.legacyHostPortAllocation,
-			portRelease: containers?.ports?.portRelease,
-		},
-		proxy: {
-			metadataSupported: containers?.proxy?.metadataSupported,
-			requiresPastaPasst: containers?.proxy?.requiresPastaPasst,
-			overridePortsReset: containers?.proxy?.overridePortsReset,
-			reverseProxyServer: containers?.proxy?.reverseProxyServer,
-			http: containers?.proxy?.http,
-			websocket: containers?.proxy?.websocket,
-			dynamicSettingsHook: containers?.proxy?.dynamicSettingsHook,
-		},
+		setup: supported,
+		podmanStatus: supported,
+		podmanInstall: supported,
+		composeInfo: supported,
+		list: supported,
+		start: supported,
+		stop: supported,
+		pause: supported,
+		unpause: supported,
+		logs: supported,
+		remove: supported,
 	};
 }
 
-export function getChapterBatchMergeCapability(capabilities: RuntimeCapabilities | undefined): {
+const CHAPTER_CONTAINERS_SUPPORTED: ChapterContainersCapability = Object.freeze({
+	supported: true,
+	routes: Object.freeze(chapterContainerRoutes(true)),
+	runtime: Object.freeze({}),
+	ports: Object.freeze({}),
+	proxy: Object.freeze({}),
+});
+
+/**
+ * The one capability with a real runtime signal behind it: Android/proot/Termux hosts
+ * report `containerSupport: false` in `runtimeEnvironment`, and there is no local Podman
+ * to talk to there.
+ */
+export function useChapterContainersCapability(): ChapterContainersCapability {
+	const { data } = useHealthQuery();
+	const environment = data?.runtimeEnvironment;
+	if (environment && !environment.containerSupport) {
+		return {
+			supported: false,
+			reason:
+				environment.containerUnsupportedReason ??
+				"Local container management is unavailable in this runtime.",
+			routes: chapterContainerRoutes(false),
+			runtime: {},
+			ports: {},
+			proxy: {},
+		};
+	}
+	return CHAPTER_CONTAINERS_SUPPORTED;
+}
+
+// === chapters: batch merge ===
+
+const CHAPTER_BATCH_MERGE_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	mode?: string;
@@ -832,51 +382,34 @@ export function getChapterBatchMergeCapability(capabilities: RuntimeCapabilities
 	createdTargetRollback: boolean;
 	frontendCompletionMode?: string;
 	events: string[];
-} {
-	const batchMerge = capabilities?.chapters?.batchMerge;
-	const assumeLegacyTSBackend = !capabilities;
-	const supported = assumeLegacyTSBackend ? true : batchMerge?.supported === true;
-	return {
-		supported,
-		reason: batchMerge?.reason,
-		mode: batchMerge?.mode,
-		startRouteSupported: assumeLegacyTSBackend
-			? true
-			: supported && batchMerge?.routes?.start === true,
-		sessionRouteSupported: assumeLegacyTSBackend
-			? true
-			: supported && batchMerge?.routes?.session === true,
-		mergeSessionIdResponse: assumeLegacyTSBackend
-			? true
-			: supported && batchMerge?.response?.mergeSessionId === true,
-		targetChapterIdResponse: assumeLegacyTSBackend
-			? true
-			: supported && batchMerge?.response?.targetChapterId === true,
-		createdTargetResponse: assumeLegacyTSBackend
-			? true
-			: supported && batchMerge?.response?.createdTarget === true,
-		statusResponse: assumeLegacyTSBackend
-			? true
-			: supported && batchMerge?.response?.status === true,
-		decisionWs: assumeLegacyTSBackend ? true : supported && batchMerge?.decisionWs === true,
-		staleSessionCleanup: assumeLegacyTSBackend
-			? true
-			: supported && batchMerge?.staleSessionCleanup === true,
-		createdTargetRollback: assumeLegacyTSBackend
-			? true
-			: supported && batchMerge?.createdTargetRollback === true,
-		frontendCompletionMode: batchMerge?.frontendCompletionMode,
-		events: batchMerge?.events ?? [],
-	};
+} = Object.freeze({
+	supported: true,
+	startRouteSupported: true,
+	sessionRouteSupported: true,
+	mergeSessionIdResponse: true,
+	targetChapterIdResponse: true,
+	createdTargetResponse: true,
+	statusResponse: true,
+	decisionWs: true,
+	staleSessionCleanup: true,
+	createdTargetRollback: true,
+	events: [] as string[],
+});
+
+export function useChapterBatchMergeCapability(): typeof CHAPTER_BATCH_MERGE_CAPABILITY {
+	return CHAPTER_BATCH_MERGE_CAPABILITY;
 }
 
-export function useChapterBatchMergeCapability(): ReturnType<
-	typeof getChapterBatchMergeCapability
-> {
-	return getChapterBatchMergeCapability(useRuntimeCapabilities());
-}
+// === chapters: split ===
 
-export function getChapterSplitCapability(capabilities: RuntimeCapabilities | undefined): {
+/**
+ * `compressedAISummarySupported` is true because compressed splits do get an AI summary:
+ * `chapter-split` passes `inheritMode` through to `chapterFork.fork`, and
+ * `narrator-service` calls `narratorContext.generateContextSummary` for the compressed
+ * mode. The old getter had no fallback for this field so it read `false`, which made
+ * `ChapterSplitModal` warn about a fallback that was not in use.
+ */
+const CHAPTER_SPLIT_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	mode?: string;
@@ -884,82 +417,19 @@ export function getChapterSplitCapability(capabilities: RuntimeCapabilities | un
 	compressedAISummaryFallback: boolean;
 	compressedAISummaryMode?: string;
 	compressedAISummaryReason?: string;
-} {
-	const split = capabilities?.chapters?.split;
-	const compressedAISummary = split?.partials?.compressedAISummary;
-	/**
-	 * Same fallback the other 30+ getters in this file use: a backend that sends no
-	 * capabilities block at all is the TypeScript backend, which implements the
-	 * feature, so absence means "available" rather than "missing".
-	 *
-	 * This getter used to fail closed instead, and that was the right call while it
-	 * lasted: `POST /chapters/:id/split` did not exist, so enabling the UI would only
-	 * have produced a 404 the user could not act on. The route exists now, and since
-	 * `/api/health` has never sent a capabilities block, fail-closed made the feature
-	 * permanently unreachable. Fixing it by making health advertise capabilities is
-	 * not an option: a partial capabilities object flips every *other* getter's
-	 * `!capabilities` fallback off at once, turning 30+ working features unsupported.
-	 *
-	 * `routes.splitAtCommit` is checked only in the non-fallback branch, matching how
-	 * `getChapterBatchMergeCapability` treats its own route flags. A backend silent
-	 * about capabilities is equally silent about its routes, so requiring the flag on
-	 * both branches would leave the getter fail-closed for exactly the backend the
-	 * fallback exists to serve.
-	 */
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend
-			? true
-			: split?.supported === true && split.routes?.splitAtCommit === true,
-		reason: split?.reason,
-		mode: split?.mode,
-		compressedAISummarySupported: compressedAISummary?.supported === true,
-		compressedAISummaryFallback: compressedAISummary?.fallback === true,
-		compressedAISummaryMode: compressedAISummary?.mode,
-		compressedAISummaryReason: compressedAISummary?.reason,
-	};
+} = Object.freeze({
+	supported: true,
+	compressedAISummarySupported: true,
+	compressedAISummaryFallback: false,
+});
+
+export function useChapterSplitCapability(): typeof CHAPTER_SPLIT_CAPABILITY {
+	return CHAPTER_SPLIT_CAPABILITY;
 }
 
-export function useChapterSplitCapability(): ReturnType<typeof getChapterSplitCapability> {
-	return getChapterSplitCapability(useRuntimeCapabilities());
-}
+// === narrator ===
 
-export function useChapterContainersCapability(): ReturnType<
-	typeof getChapterContainersCapability
-> {
-	const { data } = useHealthQuery();
-	const environment = data?.runtimeEnvironment;
-	if (environment && !environment.containerSupport) {
-		const reason =
-			environment.containerUnsupportedReason ??
-			"Local container management is unavailable in this runtime.";
-		return {
-			supported: false,
-			reason,
-			routes: {
-				setup: false,
-				podmanStatus: false,
-				podmanInstall: false,
-				composeInfo: false,
-				list: false,
-				start: false,
-				stop: false,
-				pause: false,
-				unpause: false,
-				logs: false,
-				remove: false,
-			},
-			runtime: {},
-			ports: {},
-			proxy: {},
-		};
-	}
-	return getChapterContainersCapability(data?.capabilities);
-}
-
-export function getNarratorBrowserSessionsCapability(
-	capabilities: RuntimeCapabilities | undefined,
-): {
+const NARRATOR_BROWSER_SESSIONS_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	defaultEnabled?: boolean;
@@ -972,117 +442,58 @@ export function getNarratorBrowserSessionsCapability(
 	artifactPersistence?: boolean;
 	resourceLimits?: boolean;
 	requiresChrome?: boolean;
-} {
-	const narrator = capabilities?.narrator;
-	const browserSessions = narrator?.browserSessions;
-	const assumeLegacyTSBackend = !narrator;
-	return {
-		supported: assumeLegacyTSBackend ? true : browserSessions?.supported === true,
-		reason: browserSessions?.reason,
-		defaultEnabled: browserSessions?.defaultEnabled,
-		runtime: browserSessions?.runtime,
-		storage: browserSessions?.storage,
-		cutover: browserSessions?.cutover,
-		rollback: browserSessions?.rollback,
-		narratorBound: browserSessions?.narratorBound,
-		lifecycleEvents: browserSessions?.lifecycleEvents,
-		artifactPersistence: browserSessions?.artifactPersistence,
-		resourceLimits: browserSessions?.resourceLimits,
-		requiresChrome: browserSessions?.requiresChrome,
-	};
+} = Object.freeze({ supported: true });
+
+export function useNarratorBrowserSessionsCapability(): typeof NARRATOR_BROWSER_SESSIONS_CAPABILITY {
+	return NARRATOR_BROWSER_SESSIONS_CAPABILITY;
 }
 
-export function useNarratorBrowserSessionsCapability(): ReturnType<
-	typeof getNarratorBrowserSessionsCapability
-> {
-	return getNarratorBrowserSessionsCapability(useRuntimeCapabilities());
-}
-
-export function getNarratorContainerBrowserToolAutoEnableCapability(
-	capabilities: RuntimeCapabilities | undefined,
-):
-	| {
-			defaultEnabled?: boolean;
-			cutover?: string;
-			rollback?: string;
-			reason?: string;
-	  }
+/**
+ * Overrides for auto-enabling the browser tool in containers. Health does not report any,
+ * so this is `undefined` and `NarratorDetailsPanel` keeps its default behaviour.
+ */
+export function useNarratorContainerBrowserToolAutoEnableCapability():
+	| ContainerBrowserToolAutoEnableCapability
 	| undefined {
-	return capabilities?.narrator?.containerBrowserToolAutoEnable;
+	return undefined;
 }
 
-export function useNarratorContainerBrowserToolAutoEnableCapability(): ReturnType<
-	typeof getNarratorContainerBrowserToolAutoEnableCapability
-> {
-	return getNarratorContainerBrowserToolAutoEnableCapability(useRuntimeCapabilities());
-}
-
-export function getNarratorPlanModeCapability(capabilities: RuntimeCapabilities | undefined): {
+const NARRATOR_PLAN_MODE_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	api?: boolean;
 	toolReflection?: boolean;
 	previousModeRestore?: boolean;
-} {
-	const planMode = capabilities?.narrator?.planMode;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : planMode?.supported === true,
-		reason: planMode?.reason,
-		api: planMode?.api,
-		toolReflection: planMode?.toolReflection,
-		previousModeRestore: planMode?.previousModeRestore,
-	};
+} = Object.freeze({ supported: true });
+
+export function useNarratorPlanModeCapability(): typeof NARRATOR_PLAN_MODE_CAPABILITY {
+	return NARRATOR_PLAN_MODE_CAPABILITY;
 }
 
-export function useNarratorPlanModeCapability(): ReturnType<typeof getNarratorPlanModeCapability> {
-	return getNarratorPlanModeCapability(useRuntimeCapabilities());
-}
-
-export function getNarratorCompactCapability(capabilities: RuntimeCapabilities | undefined): {
+const NARRATOR_COMPACT_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	mode?: string;
 	fallbackSummary?: boolean;
 	fallbackReason?: string;
-} {
-	const compact = capabilities?.narrator?.compact;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : compact?.supported === true,
-		reason: compact?.reason,
-		mode: compact?.mode,
-		fallbackSummary: compact?.fallbackSummary,
-		fallbackReason: compact?.fallbackReason,
-	};
+} = Object.freeze({ supported: true });
+
+export function useNarratorCompactCapability(): typeof NARRATOR_COMPACT_CAPABILITY {
+	return NARRATOR_COMPACT_CAPABILITY;
 }
 
-export function useNarratorCompactCapability(): ReturnType<typeof getNarratorCompactCapability> {
-	return getNarratorCompactCapability(useRuntimeCapabilities());
-}
-
-export function getNarratorDeleteCapability(capabilities: RuntimeCapabilities | undefined): {
+const NARRATOR_DELETE_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	code?: string;
 	feature?: string;
-} {
-	const narrator = capabilities?.narrator;
-	const deleteCapability = narrator?.delete;
-	const assumeLegacyTSBackend = !narrator;
-	return {
-		supported: assumeLegacyTSBackend ? true : deleteCapability?.supported === true,
-		reason: deleteCapability?.reason,
-		code: deleteCapability?.code,
-		feature: deleteCapability?.feature,
-	};
+} = Object.freeze({ supported: true });
+
+export function useNarratorDeleteCapability(): typeof NARRATOR_DELETE_CAPABILITY {
+	return NARRATOR_DELETE_CAPABILITY;
 }
 
-export function useNarratorDeleteCapability(): ReturnType<typeof getNarratorDeleteCapability> {
-	return getNarratorDeleteCapability(useRuntimeCapabilities());
-}
-
-export function getNarratorRetryRecoveryCapability(capabilities: RuntimeCapabilities | undefined): {
+const NARRATOR_RETRY_RECOVERY_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	retry?: boolean;
@@ -1091,43 +502,21 @@ export function getNarratorRetryRecoveryCapability(capabilities: RuntimeCapabili
 	manualOverride?: boolean;
 	rollback?: boolean;
 	editAndRegenerate?: boolean;
-} {
-	const retryRecovery = capabilities?.narrator?.retryRecovery;
-	const assumeLegacyTSBackend = !capabilities;
-	const supported = assumeLegacyTSBackend ? true : retryRecovery?.supported === true;
-	return {
-		supported,
-		reason: retryRecovery?.reason,
-		retry: assumeLegacyTSBackend
-			? retryRecovery?.retry
-			: supported && retryRecovery?.retry === true,
-		continue: assumeLegacyTSBackend
-			? retryRecovery?.continue
-			: supported && retryRecovery?.continue === true,
-		interrupt: assumeLegacyTSBackend
-			? retryRecovery?.interrupt
-			: supported && retryRecovery?.interrupt === true,
-		manualOverride: assumeLegacyTSBackend
-			? retryRecovery?.manualOverride
-			: supported && retryRecovery?.manualOverride === true,
-		rollback: assumeLegacyTSBackend
-			? retryRecovery?.rollback
-			: supported && retryRecovery?.rollback === true,
-		editAndRegenerate: assumeLegacyTSBackend
-			? retryRecovery?.editAndRegenerate
-			: supported && retryRecovery?.editAndRegenerate === true,
-	};
+} = Object.freeze({
+	supported: true,
+	retry: true,
+	continue: true,
+	interrupt: true,
+	manualOverride: true,
+	rollback: true,
+	editAndRegenerate: true,
+});
+
+export function useNarratorRetryRecoveryCapability(): typeof NARRATOR_RETRY_RECOVERY_CAPABILITY {
+	return NARRATOR_RETRY_RECOVERY_CAPABILITY;
 }
 
-export function useNarratorRetryRecoveryCapability(): ReturnType<
-	typeof getNarratorRetryRecoveryCapability
-> {
-	return getNarratorRetryRecoveryCapability(useRuntimeCapabilities());
-}
-
-export function getNarratorRollbackEditRegenerateCapability(
-	capabilities: RuntimeCapabilities | undefined,
-): {
+const NARRATOR_ROLLBACK_EDIT_REGENERATE_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	rollback?: boolean;
@@ -1140,42 +529,13 @@ export function getNarratorRollbackEditRegenerateCapability(
 	optionalFileRevert?: boolean;
 	optionalAgentRerun?: boolean;
 	wsEvents?: boolean;
-} {
-	const narrator = capabilities?.narrator;
-	const capability = narrator?.rollbackEditRegenerate;
-	const assumeLegacyTSBackend = !narrator;
-	return {
-		supported: assumeLegacyTSBackend ? true : capability?.supported === true,
-		reason: capability?.reason,
-		rollback: capability?.rollback,
-		editAndRegenerate: capability?.editAndRegenerate,
-		copyOnWrite: capability?.copyOnWrite,
-		messageRefTruncation: capability?.messageRefTruncation,
-		fileStateRebuild: capability?.fileStateRebuild,
-		toolCallInvalidation: capability?.toolCallInvalidation,
-		agentRerun: capability?.agentRerun,
-		optionalFileRevert: capability?.optionalFileRevert,
-		optionalAgentRerun: capability?.optionalAgentRerun,
-		wsEvents: capability?.wsEvents,
-	};
+} = Object.freeze({ supported: true });
+
+export function useNarratorRollbackEditRegenerateCapability(): typeof NARRATOR_ROLLBACK_EDIT_REGENERATE_CAPABILITY {
+	return NARRATOR_ROLLBACK_EDIT_REGENERATE_CAPABILITY;
 }
 
-export function useNarratorRollbackEditRegenerateCapability(): ReturnType<
-	typeof getNarratorRollbackEditRegenerateCapability
-> {
-	return getNarratorRollbackEditRegenerateCapability(useRuntimeCapabilities());
-}
-
-const DEFAULT_NARRATOR_PERMISSION_MODES = [
-	"default",
-	"acceptEdits",
-	"bypassPermissions",
-	"readOnly",
-	"dontAsk",
-];
-const DEFAULT_NARRATOR_PERMISSION_REFLECTIONS = ["danger", "plan", "goal"];
-
-export function getNarratorPermissionsCapability(capabilities: RuntimeCapabilities | undefined): {
+const NARRATOR_PERMISSIONS_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	modes: string[];
@@ -1183,40 +543,19 @@ export function getNarratorPermissionsCapability(capabilities: RuntimeCapabiliti
 	updatedInput: boolean;
 	pauseResume?: string;
 	reflections: string[];
-} {
-	const permissions = capabilities?.narrator?.permissions;
-	const assumeLegacyTSBackend = !capabilities;
-	const supported = assumeLegacyTSBackend ? true : permissions?.supported === true;
-	return {
-		supported,
-		reason: permissions?.reason,
-		modes: Array.isArray(permissions?.modes)
-			? permissions.modes
-			: assumeLegacyTSBackend
-				? DEFAULT_NARRATOR_PERMISSION_MODES
-				: [],
-		approveDeny: assumeLegacyTSBackend
-			? permissions?.approveDeny !== false
-			: supported && permissions?.approveDeny === true,
-		updatedInput: assumeLegacyTSBackend
-			? permissions?.updatedInput !== false
-			: supported && permissions?.updatedInput === true,
-		pauseResume: permissions?.pauseResume,
-		reflections: Array.isArray(permissions?.reflections)
-			? permissions.reflections
-			: assumeLegacyTSBackend
-				? DEFAULT_NARRATOR_PERMISSION_REFLECTIONS
-				: [],
-	};
+} = Object.freeze({
+	supported: true,
+	modes: ["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"] as string[],
+	approveDeny: true,
+	updatedInput: true,
+	reflections: ["danger", "plan", "goal"] as string[],
+});
+
+export function useNarratorPermissionsCapability(): typeof NARRATOR_PERMISSIONS_CAPABILITY {
+	return NARRATOR_PERMISSIONS_CAPABILITY;
 }
 
-export function useNarratorPermissionsCapability(): ReturnType<
-	typeof getNarratorPermissionsCapability
-> {
-	return getNarratorPermissionsCapability(useRuntimeCapabilities());
-}
-
-export function getNarratorReviewToolsCapability(capabilities: RuntimeCapabilities | undefined): {
+const NARRATOR_REVIEW_TOOLS_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	concludeReview: boolean;
@@ -1225,41 +564,25 @@ export function getNarratorReviewToolsCapability(capabilities: RuntimeCapabiliti
 	dismiss: boolean;
 	convertToSubagent: boolean;
 	staleMergeGuard: boolean;
-} {
-	const reviewTools = capabilities?.narrator?.reviewTools;
-	const assumeLegacyTSBackend = !capabilities;
-	const supported = assumeLegacyTSBackend ? true : reviewTools?.supported === true;
-	return {
-		supported,
-		reason: reviewTools?.reason,
-		concludeReview: assumeLegacyTSBackend
-			? reviewTools?.concludeReview !== false
-			: supported && reviewTools?.concludeReview === true,
-		feedbackInjection: assumeLegacyTSBackend
-			? reviewTools?.feedbackInjection !== false
-			: supported && reviewTools?.feedbackInjection === true,
-		promote: assumeLegacyTSBackend
-			? reviewTools?.promote !== false
-			: supported && reviewTools?.promote === true,
-		dismiss: assumeLegacyTSBackend
-			? reviewTools?.dismiss !== false
-			: supported && reviewTools?.dismiss === true,
-		convertToSubagent: assumeLegacyTSBackend
-			? reviewTools?.convertToSubagent !== false
-			: supported && reviewTools?.convertToSubagent === true,
-		staleMergeGuard: assumeLegacyTSBackend
-			? reviewTools?.staleMergeGuard !== false
-			: supported && reviewTools?.staleMergeGuard === true,
-	};
+} = Object.freeze({
+	supported: true,
+	concludeReview: true,
+	feedbackInjection: true,
+	promote: true,
+	dismiss: true,
+	convertToSubagent: true,
+	staleMergeGuard: true,
+});
+
+export function useNarratorReviewToolsCapability(): typeof NARRATOR_REVIEW_TOOLS_CAPABILITY {
+	return NARRATOR_REVIEW_TOOLS_CAPABILITY;
 }
 
-export function useNarratorReviewToolsCapability(): ReturnType<
-	typeof getNarratorReviewToolsCapability
-> {
-	return getNarratorReviewToolsCapability(useRuntimeCapabilities());
-}
-
-export function getNarratorSubagentsCapability(capabilities: RuntimeCapabilities | undefined): {
+/**
+ * `reattachFallback` is false: reattaching a detached subagent blocks the parent for real
+ * rather than degrading to a substitute path.
+ */
+const NARRATOR_SUBAGENTS_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	foreground: boolean;
@@ -1277,60 +600,33 @@ export function getNarratorSubagentsCapability(capabilities: RuntimeCapabilities
 	reattachReason?: string;
 	backgroundResultInjection: boolean;
 	staleRecovery: boolean;
-} {
-	const subagents = capabilities?.narrator?.subagents;
-	const assumeLegacyTSBackend = !capabilities;
-	const supported = assumeLegacyTSBackend ? true : subagents?.supported === true;
-	return {
-		supported,
-		reason: subagents?.reason,
-		foreground: assumeLegacyTSBackend
-			? subagents?.foreground !== false
-			: supported && subagents?.foreground === true,
-		background: assumeLegacyTSBackend
-			? subagents?.background !== false
-			: supported && subagents?.background === true,
-		awaitAgent: assumeLegacyTSBackend
-			? subagents?.awaitAgent !== false
-			: supported && subagents?.awaitAgent === true,
-		awaitBash: assumeLegacyTSBackend
-			? subagents?.awaitBash !== false
-			: supported && subagents?.awaitBash === true,
-		awaitBashWaitForText: assumeLegacyTSBackend
-			? subagents?.awaitBashWaitForText !== false
-			: supported && subagents?.awaitBashWaitForText === true,
-		awaitBashReason: subagents?.awaitBashReason,
-		send: assumeLegacyTSBackend ? subagents?.send !== false : supported && subagents?.send === true,
-		teamStatus: assumeLegacyTSBackend
-			? subagents?.teamStatus !== false
-			: supported && subagents?.teamStatus === true,
-		detachAttach: assumeLegacyTSBackend
-			? subagents?.detachAttach !== false
-			: supported && subagents?.detachAttach === true,
-		detachUnblocksParent: assumeLegacyTSBackend
-			? subagents?.detachUnblocksParent !== false
-			: supported && subagents?.detachUnblocksParent === true,
-		reattachBlocksParent: assumeLegacyTSBackend
-			? subagents?.reattachBlocksParent !== false
-			: supported && subagents?.reattachBlocksParent === true,
-		reattachFallback: subagents?.reattachFallback === true,
-		reattachReason: subagents?.reattachReason,
-		backgroundResultInjection: assumeLegacyTSBackend
-			? subagents?.backgroundResultInjection !== false
-			: supported && subagents?.backgroundResultInjection === true,
-		staleRecovery: assumeLegacyTSBackend
-			? subagents?.staleRecovery !== false
-			: supported && subagents?.staleRecovery === true,
-	};
+} = Object.freeze({
+	supported: true,
+	foreground: true,
+	background: true,
+	awaitAgent: true,
+	awaitBash: true,
+	awaitBashWaitForText: true,
+	send: true,
+	teamStatus: true,
+	detachAttach: true,
+	detachUnblocksParent: true,
+	reattachBlocksParent: true,
+	reattachFallback: false,
+	backgroundResultInjection: true,
+	staleRecovery: true,
+});
+
+export function useNarratorSubagentsCapability(): typeof NARRATOR_SUBAGENTS_CAPABILITY {
+	return NARRATOR_SUBAGENTS_CAPABILITY;
 }
 
-export function useNarratorSubagentsCapability(): ReturnType<
-	typeof getNarratorSubagentsCapability
-> {
-	return getNarratorSubagentsCapability(useRuntimeCapabilities());
-}
-
-export function getNarratorToolInventoryCapability(capabilities: RuntimeCapabilities | undefined): {
+/**
+ * The optional-tool and web-fetch mode lists were only ever populated from a capabilities
+ * payload, so they stay empty: consumers treat empty as "nothing to single out" rather
+ * than "nothing supported".
+ */
+const NARRATOR_TOOL_INVENTORY_CAPABILITY: {
 	supported: boolean;
 	supportedOptionalTools: string[];
 	unsupportedOptionalTools: string[];
@@ -1360,68 +656,37 @@ export function getNarratorToolInventoryCapability(capabilities: RuntimeCapabili
 		traceFileOutput: boolean;
 		traceShareUrl?: string;
 	};
-} {
-	const inventory = capabilities?.narrator?.toolInventory;
-	const webFetch = inventory?.webFetch;
-	const browser = inventory?.browser;
-	const assumeLegacyTSBackend = !capabilities;
-	const supported = assumeLegacyTSBackend ? true : inventory?.supported === true;
-	const webFetchSupported = assumeLegacyTSBackend
-		? webFetch?.supported !== false
-		: supported && webFetch?.supported === true;
-	const browserSupported = assumeLegacyTSBackend
-		? browser?.supported !== false
-		: supported && browser?.supported === true;
-	return {
-		supported,
-		supportedOptionalTools: inventory?.supportedOptionalTools ?? [],
-		unsupportedOptionalTools: inventory?.unsupportedOptionalTools ?? [],
-		reason: inventory?.reason,
-		webFetch: {
-			supported: webFetchSupported,
-			reason: webFetch?.reason,
-			parity: webFetch?.parity,
-			mode: webFetch?.mode,
-			defaultMode: webFetch?.defaultMode,
-			supportedModes: webFetch?.supportedModes ?? [],
-			unsupportedModes: webFetch?.unsupportedModes ?? [],
-			protocols: webFetch?.protocols ?? [],
-			policy: webFetch?.policy,
-		},
-		browser: {
-			supported: browserSupported,
-			reason: browser?.reason,
-			parity: browser?.parity,
-			runtime: browser?.runtime,
-			screenshotPreviewMode: browser?.screenshotPreviewMode,
-			sharePreview: assumeLegacyTSBackend
-				? browser?.sharePreview !== false
-				: browserSupported && browser?.sharePreview === true,
-			imageContentBlock: assumeLegacyTSBackend
-				? browser?.imageContentBlock !== false
-				: browserSupported && browser?.imageContentBlock === true,
-			fileOutput: assumeLegacyTSBackend
-				? browser?.fileOutput !== false
-				: browserSupported && browser?.fileOutput === true,
-			traceFormat: browser?.traceFormat,
-			traceShare: assumeLegacyTSBackend
-				? browser?.traceShare !== false
-				: browserSupported && browser?.traceShare === true,
-			traceFileOutput: assumeLegacyTSBackend
-				? browser?.traceFileOutput !== false
-				: browserSupported && browser?.traceFileOutput === true,
-			traceShareUrl: browser?.traceShareUrl,
-		},
-	};
+} = Object.freeze({
+	supported: true,
+	supportedOptionalTools: [] as string[],
+	unsupportedOptionalTools: [] as string[],
+	webFetch: Object.freeze({
+		supported: true,
+		supportedModes: [] as string[],
+		unsupportedModes: [] as string[],
+		protocols: [] as string[],
+	}),
+	browser: Object.freeze({
+		supported: true,
+		sharePreview: true,
+		imageContentBlock: true,
+		fileOutput: true,
+		traceShare: true,
+		traceFileOutput: true,
+	}),
+});
+
+export function useNarratorToolInventoryCapability(): typeof NARRATOR_TOOL_INVENTORY_CAPABILITY {
+	return NARRATOR_TOOL_INVENTORY_CAPABILITY;
 }
 
-export function useNarratorToolInventoryCapability(): ReturnType<
-	typeof getNarratorToolInventoryCapability
-> {
-	return getNarratorToolInventoryCapability(useRuntimeCapabilities());
-}
+// === vnet ===
 
-export function getVNetCapability(capabilities: RuntimeCapabilities | undefined): {
+/**
+ * `udpRendezvous` is false: peer discovery runs over the WebSocket path, with no UDP
+ * rendezvous server in the picture.
+ */
+const VNET_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	mode?: string;
@@ -1429,46 +694,31 @@ export function getVNetCapability(capabilities: RuntimeCapabilities | undefined)
 	peerCleanup: boolean;
 	udpRendezvous: boolean;
 	udpRendezvousReason?: string;
-} {
-	const vnet = capabilities?.vnet;
-	const assumeLegacyTSBackend = !capabilities;
-	const supported = assumeLegacyTSBackend ? true : vnet?.supported === true;
-	return {
-		supported,
-		reason: vnet?.reason,
-		mode: vnet?.mode,
-		ws: assumeLegacyTSBackend ? true : supported && vnet?.ws === true,
-		peerCleanup: assumeLegacyTSBackend ? true : supported && vnet?.peerCleanup === true,
-		udpRendezvous: supported && vnet?.udpRendezvous === true,
-		udpRendezvousReason: vnet?.udpRendezvousReason,
-	};
+} = Object.freeze({
+	supported: true,
+	ws: true,
+	peerCleanup: true,
+	udpRendezvous: false,
+});
+
+export function useVNetCapability(): typeof VNET_CAPABILITY {
+	return VNET_CAPABILITY;
 }
 
-export function useVNetCapability(): ReturnType<typeof getVNetCapability> {
-	return getVNetCapability(useRuntimeCapabilities());
-}
+// === mcp ===
 
-export function getMcpBuiltinToolsCapability(capabilities: RuntimeCapabilities | undefined): {
+const MCP_BUILTIN_TOOLS_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	parity?: string;
 	missing: string[];
-} {
-	const builtinTools = capabilities?.mcp?.builtinTools;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : builtinTools?.supported === true,
-		reason: builtinTools?.reason,
-		parity: builtinTools?.parity,
-		missing: Array.isArray(builtinTools?.missing) ? builtinTools.missing : [],
-	};
+} = Object.freeze({ supported: true, missing: [] as string[] });
+
+export function useMcpBuiltinToolsCapability(): typeof MCP_BUILTIN_TOOLS_CAPABILITY {
+	return MCP_BUILTIN_TOOLS_CAPABILITY;
 }
 
-export function useMcpBuiltinToolsCapability(): ReturnType<typeof getMcpBuiltinToolsCapability> {
-	return getMcpBuiltinToolsCapability(useRuntimeCapabilities());
-}
-
-export function getMcpProtocolCapability(capabilities: RuntimeCapabilities | undefined): {
+const MCP_PROTOCOL_CAPABILITY: {
 	builtinProtocol: {
 		supported: boolean;
 		reason?: string;
@@ -1478,202 +728,83 @@ export function getMcpProtocolCapability(capabilities: RuntimeCapabilities | und
 	};
 	toolsList: { supported: boolean; reason?: string; source?: string };
 	toolsCall: { supported: boolean; reason?: string; scope?: string };
-} {
-	const mcp = capabilities?.mcp;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		builtinProtocol: {
-			supported: assumeLegacyTSBackend ? true : mcp?.builtinProtocol?.supported === true,
-			reason: mcp?.builtinProtocol?.reason,
-			initialize: mcp?.builtinProtocol?.initialize,
-			toolsList: mcp?.builtinProtocol?.toolsList,
-			toolsCall: mcp?.builtinProtocol?.toolsCall,
-		},
-		toolsList: {
-			supported: assumeLegacyTSBackend ? true : mcp?.toolsList?.supported === true,
-			reason: mcp?.toolsList?.reason,
-			source: mcp?.toolsList?.source,
-		},
-		toolsCall: {
-			supported: assumeLegacyTSBackend ? true : mcp?.toolsCall?.supported === true,
-			reason: mcp?.toolsCall?.reason,
-			scope: mcp?.toolsCall?.scope,
-		},
-	};
+} = Object.freeze({
+	builtinProtocol: SUPPORTED,
+	toolsList: SUPPORTED,
+	toolsCall: SUPPORTED,
+});
+
+export function useMcpProtocolCapability(): typeof MCP_PROTOCOL_CAPABILITY {
+	return MCP_PROTOCOL_CAPABILITY;
 }
 
-export function getMcpExternalToolsCapability(capabilities: RuntimeCapabilities | undefined): {
+const MCP_EXTERNAL_TOOLS_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
 	parity?: string;
 	transport?: string;
 	lifecycle?: string;
-} {
-	const externalTools = capabilities?.mcp?.externalToolsInjection;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : externalTools?.supported === true,
-		reason: externalTools?.reason,
-		parity: externalTools?.parity,
-		transport: externalTools?.transport,
-		lifecycle: externalTools?.lifecycle,
-	};
+} = Object.freeze({ supported: true });
+
+export function useMcpExternalToolsCapability(): typeof MCP_EXTERNAL_TOOLS_CAPABILITY {
+	return MCP_EXTERNAL_TOOLS_CAPABILITY;
 }
 
-export function useMcpExternalToolsCapability(): ReturnType<typeof getMcpExternalToolsCapability> {
-	return getMcpExternalToolsCapability(useRuntimeCapabilities());
+export function useMcpExternalAgentCapability(): typeof MCP_EXTERNAL_TOOLS_CAPABILITY {
+	return MCP_EXTERNAL_TOOLS_CAPABILITY;
 }
 
-export function getMcpExternalAgentCapability(capabilities: RuntimeCapabilities | undefined): {
+export function useMcpServerSettingsStorageCapability(): { supported: boolean; reason?: string } {
+	return SUPPORTED;
+}
+
+const MCP_EXTERNAL_SERVER_MANAGEMENT_CAPABILITY: {
 	supported: boolean;
 	reason?: string;
-	parity?: string;
-	transport?: string;
-	lifecycle?: string;
-} {
-	const externalAgent = capabilities?.mcp?.externalAgentInjection;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : externalAgent?.supported === true,
-		reason: externalAgent?.reason,
-		parity: externalAgent?.parity,
-		transport: externalAgent?.transport,
-		lifecycle: externalAgent?.lifecycle,
-	};
-}
-
-export function useMcpExternalAgentCapability(): ReturnType<typeof getMcpExternalAgentCapability> {
-	return getMcpExternalAgentCapability(useRuntimeCapabilities());
-}
-
-export function getMcpServerSettingsStorageCapability(
-	capabilities: RuntimeCapabilities | undefined,
-): {
-	supported: boolean;
-	reason?: string;
-} {
-	const storage = capabilities?.mcp?.serverSettingsStorage;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : storage?.supported === true,
-		reason: storage?.reason,
-	};
-}
-
-export function useMcpServerSettingsStorageCapability(): ReturnType<
-	typeof getMcpServerSettingsStorageCapability
-> {
-	return getMcpServerSettingsStorageCapability(useRuntimeCapabilities());
-}
-
-export function getMcpExternalServerManagementCapability(
-	capabilities: RuntimeCapabilities | undefined,
-): {
-	supported: boolean;
-	reason?: string;
-	storage?: string;
 	permissions: boolean;
 	import: boolean;
-} {
-	const management = capabilities?.mcp?.externalServerManagement;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : management?.supported === true,
-		reason: management?.reason,
-		storage: management?.storage,
-		permissions: assumeLegacyTSBackend ? true : management?.permissions === true,
-		import: assumeLegacyTSBackend ? true : management?.import === true,
-	};
+} = Object.freeze({ supported: true, permissions: true, import: true });
+
+export function useMcpExternalServerManagementCapability(): typeof MCP_EXTERNAL_SERVER_MANAGEMENT_CAPABILITY {
+	return MCP_EXTERNAL_SERVER_MANAGEMENT_CAPABILITY;
 }
 
-export function useMcpExternalServerManagementCapability(): ReturnType<
-	typeof getMcpExternalServerManagementCapability
-> {
-	return getMcpExternalServerManagementCapability(useRuntimeCapabilities());
-}
-
-export function getMcpTransportsCapability(capabilities: RuntimeCapabilities | undefined): {
+const MCP_TRANSPORTS_CAPABILITY: {
 	stdio: { supported: boolean; reason?: string };
 	sse: { supported: boolean; reason?: string };
 	streamableHttp: { supported: boolean; reason?: string };
-} {
-	const mcp = capabilities?.mcp;
-	const transports = mcp?.transports;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		stdio: {
-			supported: assumeLegacyTSBackend ? true : transports?.stdio?.supported === true,
-			reason: transports?.stdio?.reason,
-		},
-		sse: {
-			supported: assumeLegacyTSBackend ? true : transports?.sse?.supported === true,
-			reason: transports?.sse?.reason,
-		},
-		streamableHttp: {
-			supported: assumeLegacyTSBackend ? true : transports?.streamableHttp?.supported === true,
-			reason: transports?.streamableHttp?.reason,
-		},
-	};
+} = Object.freeze({ stdio: SUPPORTED, sse: SUPPORTED, streamableHttp: SUPPORTED });
+
+export function useMcpTransportsCapability(): typeof MCP_TRANSPORTS_CAPABILITY {
+	return MCP_TRANSPORTS_CAPABILITY;
 }
 
-export function useMcpTransportsCapability(): ReturnType<typeof getMcpTransportsCapability> {
-	return getMcpTransportsCapability(useRuntimeCapabilities());
-}
+// === content, uploads, shares ===
 
-export function getContentCapability(capabilities: RuntimeCapabilities | undefined): {
+const CONTENT_CAPABILITY: {
 	projectRoutines: { supported: boolean; reason?: string; storage?: string };
 	projectSkills: { supported: boolean; reason?: string; storage?: string };
-} {
-	const content = capabilities?.content;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		projectRoutines: {
-			supported: assumeLegacyTSBackend ? true : content?.projectRoutines?.supported === true,
-			reason: content?.projectRoutines?.reason,
-			storage: content?.projectRoutines?.storage,
-		},
-		projectSkills: {
-			supported: assumeLegacyTSBackend ? true : content?.projectSkills?.supported === true,
-			reason: content?.projectSkills?.reason,
-			storage: content?.projectSkills?.storage,
-		},
-	};
+} = Object.freeze({ projectRoutines: SUPPORTED, projectSkills: SUPPORTED });
+
+export function useContentCapability(): typeof CONTENT_CAPABILITY {
+	return CONTENT_CAPABILITY;
 }
 
-export function useContentCapability(): ReturnType<typeof getContentCapability> {
-	return getContentCapability(useRuntimeCapabilities());
-}
-
-export function getUploadCapability(capabilities: RuntimeCapabilities | undefined): {
+const UPLOAD_CAPABILITY: {
 	serveNarratorImages: { supported: boolean; reason?: string };
 	serveAvatars: { supported: boolean; reason?: string };
 	cleanupPreservesMessageImageRefs: { supported: boolean; reason?: string };
-} {
-	const uploads = capabilities?.uploads;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		serveNarratorImages: {
-			supported: assumeLegacyTSBackend ? true : uploads?.serveNarratorImages?.supported === true,
-			reason: uploads?.serveNarratorImages?.reason,
-		},
-		serveAvatars: {
-			supported: assumeLegacyTSBackend ? true : uploads?.serveAvatars?.supported === true,
-			reason: uploads?.serveAvatars?.reason,
-		},
-		cleanupPreservesMessageImageRefs: {
-			supported: assumeLegacyTSBackend
-				? true
-				: uploads?.cleanupPreservesMessageImageRefs?.supported === true,
-			reason: uploads?.cleanupPreservesMessageImageRefs?.reason,
-		},
-	};
+} = Object.freeze({
+	serveNarratorImages: SUPPORTED,
+	serveAvatars: SUPPORTED,
+	cleanupPreservesMessageImageRefs: SUPPORTED,
+});
+
+export function useUploadCapability(): typeof UPLOAD_CAPABILITY {
+	return UPLOAD_CAPABILITY;
 }
 
-export function useUploadCapability(): ReturnType<typeof getUploadCapability> {
-	return getUploadCapability(useRuntimeCapabilities());
-}
-
-export function getShareCapability(capabilities: RuntimeCapabilities | undefined): {
+const SHARE_CAPABILITY: {
 	createSupported: boolean;
 	publicDownloadSupported: boolean;
 	previewSupported: boolean;
@@ -1682,161 +813,81 @@ export function getShareCapability(capabilities: RuntimeCapabilities | undefined
 	ephemeralOnlySupported: boolean;
 	ephemeralOnlyFallback: boolean;
 	ephemeralOnlyReason?: string;
-} {
-	const shares = capabilities?.shares;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		createSupported: assumeLegacyTSBackend ? true : shares?.create?.supported === true,
-		publicDownloadSupported: assumeLegacyTSBackend
-			? true
-			: shares?.publicDownload?.supported === true,
-		previewSupported: assumeLegacyTSBackend ? true : shares?.preview?.supported === true,
-		previewHtmlMode: shares?.preview?.htmlMode,
-		previewReason: shares?.preview?.reason,
-		ephemeralOnlySupported: assumeLegacyTSBackend
-			? true
-			: shares?.ephemeralOnly?.supported === true,
-		ephemeralOnlyFallback: shares?.ephemeralOnly?.fallback === true,
-		ephemeralOnlyReason: shares?.ephemeralOnly?.reason,
-	};
+} = Object.freeze({
+	createSupported: true,
+	publicDownloadSupported: true,
+	previewSupported: true,
+	ephemeralOnlySupported: true,
+	ephemeralOnlyFallback: false,
+});
+
+export function useShareCapability(): typeof SHARE_CAPABILITY {
+	return SHARE_CAPABILITY;
 }
 
-export function useShareCapability(): ReturnType<typeof getShareCapability> {
-	return getShareCapability(useRuntimeCapabilities());
-}
+// === providers ===
 
-export function useFsRevealCapability(): ReturnType<typeof getFileSystemCapability>["reveal"] {
-	return getFileSystemCapability(useRuntimeCapabilities()).reveal;
-}
-
-export function getProviderRuntimeCapability(
-	capabilities: RuntimeCapabilities | undefined,
-	provider: ProviderCapabilityKey,
-): ProviderRuntimeCapability | undefined {
-	return capabilities?.providers?.[provider];
-}
-
+/**
+ * Per-provider runtime detail (auth/route/agent metadata) was only ever read from a
+ * capabilities payload, so there is nothing to report. Provider sections fall back to
+ * their own live probes and settings state.
+ */
 export function useProviderRuntimeCapability(
-	provider: ProviderCapabilityKey,
+	_provider: ProviderCapabilityKey,
 ): ProviderRuntimeCapability | undefined {
-	return getProviderRuntimeCapability(useRuntimeCapabilities(), provider);
-}
-
-export function getProviderRouteCapability(
-	capabilities: RuntimeCapabilities | undefined,
-	provider: ProviderCapabilityKey,
-	route: string,
-): { supported: boolean; reason?: string } {
-	const providerRuntime = getProviderRuntimeCapability(capabilities, provider);
-	const routes = providerRuntime?.routes;
-	const assumeLegacyTSBackend = !capabilities;
-	const supported = assumeLegacyTSBackend
-		? true
-		: routes?.supported !== false && routes?.[route] === true;
-	const routeReason = routes?.[`${route}Reason`];
-	return {
-		supported,
-		reason: supported ? undefined : typeof routeReason === "string" ? routeReason : routes?.reason,
-	};
+	return undefined;
 }
 
 export function useProviderRouteCapability(
-	provider: ProviderCapabilityKey,
-	route: string,
+	_provider: ProviderCapabilityKey,
+	_route: string,
 ): { supported: boolean; reason?: string } {
-	return getProviderRouteCapability(useRuntimeCapabilities(), provider, route);
-}
-
-export function getCodexManagerParityCapability(
-	capabilities: RuntimeCapabilities | undefined,
-): ProviderManagerParityCapability | undefined {
-	return getProviderRuntimeCapability(capabilities, "codex")?.managerParity;
+	return SUPPORTED;
 }
 
 export function useCodexManagerParityCapability(): ProviderManagerParityCapability | undefined {
-	return getCodexManagerParityCapability(useRuntimeCapabilities());
+	return undefined;
 }
 
-export function getProviderModelRefreshCapability(
-	capabilities: RuntimeCapabilities | undefined,
-	provider: ProviderCapabilityKey,
-): { supported: boolean; reason?: string } {
-	const models = capabilities?.providers?.[provider]?.models;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : models?.refreshSupported === true,
-		reason: models?.reason,
-	};
-}
-
-export function getProviderQuotaCapability(
-	capabilities: RuntimeCapabilities | undefined,
-	provider: ProviderCapabilityKey,
-): { supported: boolean; reason?: string } {
-	const quota = capabilities?.providers?.[provider]?.quota;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : quota?.supported === true,
-		reason: quota?.reason,
-	};
-}
-
-export function getProviderAgentModeCapability(
-	capabilities: RuntimeCapabilities | undefined,
-	provider: ProviderCapabilityKey,
-): { supported: boolean; reason?: string } {
-	const agentMode = capabilities?.providers?.[provider]?.agentMode;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : agentMode?.supported === true,
-		reason: agentMode?.reason,
-	};
-}
-
-export function useProviderModelRefreshCapability(provider: ProviderCapabilityKey): {
+export function useProviderModelRefreshCapability(_provider: ProviderCapabilityKey): {
 	supported: boolean;
 	reason?: string;
 } {
-	return getProviderModelRefreshCapability(useRuntimeCapabilities(), provider);
+	return SUPPORTED;
 }
 
-export function useProviderQuotaCapability(provider: ProviderCapabilityKey): {
+export function useProviderQuotaCapability(_provider: ProviderCapabilityKey): {
 	supported: boolean;
 	reason?: string;
 } {
-	return getProviderQuotaCapability(useRuntimeCapabilities(), provider);
+	return SUPPORTED;
 }
 
-export function useProviderAgentModeCapability(provider: ProviderCapabilityKey): {
+export function useProviderAgentModeCapability(_provider: ProviderCapabilityKey): {
 	supported: boolean;
 	reason?: string;
 } {
-	return getProviderAgentModeCapability(useRuntimeCapabilities(), provider);
+	return SUPPORTED;
 }
 
-export function getSettingsValidationCapability(capabilities: RuntimeCapabilities | undefined): {
+// === settings ===
+
+/**
+ * `looseValidation` is false: settings go through the Zod schemas in
+ * `server/lib/validators`, not a loose JSON-with-normalization path.
+ */
+const SETTINGS_VALIDATION_CAPABILITY: {
 	tsZodParity: boolean;
 	looseValidation: boolean;
 	mode?: string;
 	reason?: string;
-} {
-	const validation = capabilities?.settings?.validation;
-	return {
-		tsZodParity: validation?.tsZodParity !== false,
-		looseValidation:
-			validation?.mode === "loose-json-with-normalization" || validation?.tsZodParity === false,
-		mode: validation?.mode,
-		reason: validation?.reason,
-	};
+} = Object.freeze({ tsZodParity: true, looseValidation: false });
+
+export function useSettingsValidationCapability(): typeof SETTINGS_VALIDATION_CAPABILITY {
+	return SETTINGS_VALIDATION_CAPABILITY;
 }
 
-export function useSettingsValidationCapability(): ReturnType<
-	typeof getSettingsValidationCapability
-> {
-	return getSettingsValidationCapability(useRuntimeCapabilities());
-}
-
-export function getSettingsFeatureCapability(capabilities: RuntimeCapabilities | undefined): {
+const SETTINGS_FEATURE_CAPABILITY: {
 	storageSupported: boolean;
 	storagePath?: string;
 	patchSupported: boolean;
@@ -1844,46 +895,29 @@ export function getSettingsFeatureCapability(capabilities: RuntimeCapabilities |
 	providerModelAugmentation: boolean;
 	tlsGeneration: boolean;
 	retryRules: boolean;
-} {
-	const settings = capabilities?.settings;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		storageSupported: assumeLegacyTSBackend ? true : settings?.storage?.supported === true,
-		storagePath: settings?.storage?.path,
-		patchSupported: assumeLegacyTSBackend ? true : settings?.patch?.supported === true,
-		secretMasking: assumeLegacyTSBackend ? true : settings?.secretMasking === true,
-		providerModelAugmentation: assumeLegacyTSBackend
-			? true
-			: settings?.providerModelAugmentation === true,
-		tlsGeneration: assumeLegacyTSBackend ? true : settings?.tlsGeneration === true,
-		retryRules: assumeLegacyTSBackend ? true : settings?.retryRules === true,
-	};
+} = Object.freeze({
+	storageSupported: true,
+	patchSupported: true,
+	secretMasking: true,
+	providerModelAugmentation: true,
+	tlsGeneration: true,
+	retryRules: true,
+});
+
+export function useSettingsFeatureCapability(): typeof SETTINGS_FEATURE_CAPABILITY {
+	return SETTINGS_FEATURE_CAPABILITY;
 }
 
-export function useSettingsFeatureCapability(): ReturnType<typeof getSettingsFeatureCapability> {
-	return getSettingsFeatureCapability(useRuntimeCapabilities());
-}
+// === benchmark ===
 
-export function getBenchmarkContainerExecutionCapability(
-	capabilities: RuntimeCapabilities | undefined,
-): {
+export function useBenchmarkContainerExecutionCapability(): {
 	supported: boolean;
 	reason?: string;
 } {
-	const benchmark = capabilities?.benchmark;
-	const containerExecution = benchmark?.containerExecution;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : containerExecution?.supported === true,
-		reason: containerExecution?.reason,
-	};
+	return SUPPORTED;
 }
 
-export function useBenchmarkContainerExecutionCapability(): ReturnType<
-	typeof getBenchmarkContainerExecutionCapability
-> {
-	return getBenchmarkContainerExecutionCapability(useRuntimeCapabilities());
-}
+// === runtime maintenance ===
 
 type RuntimeCleanupTarget = "terminals" | "containers" | "browsers" | "worktrees";
 
@@ -1893,7 +927,7 @@ type RuntimeCleanupCapability = {
 	mode?: string;
 };
 
-export function getRuntimeMaintenanceCapability(capabilities: RuntimeCapabilities | undefined): {
+const RUNTIME_MAINTENANCE_CAPABILITY: {
 	backend?: string;
 	buildChannel?: string;
 	scanSupported: boolean;
@@ -1901,36 +935,22 @@ export function getRuntimeMaintenanceCapability(capabilities: RuntimeCapabilitie
 	cachedSupported: boolean;
 	cachedReason?: string;
 	cleanup: Record<RuntimeCleanupTarget, RuntimeCleanupCapability>;
-} {
-	const runtime = capabilities?.runtime;
-	const cleanup = runtime?.cleanup;
-	const assumeLegacyTSBackend = !capabilities;
-	const cleanupCapability = (target: RuntimeCleanupTarget): RuntimeCleanupCapability => ({
-		supported: assumeLegacyTSBackend ? true : cleanup?.[target]?.supported === true,
-		reason: cleanup?.[target]?.reason,
-		mode: cleanup?.[target]?.mode,
-	});
-	return {
-		backend: runtime?.backend,
-		buildChannel: runtime?.buildChannel,
-		scanSupported: assumeLegacyTSBackend ? true : runtime?.scan?.supported === true,
-		scanReason: runtime?.scan?.reason,
-		cachedSupported: assumeLegacyTSBackend ? true : runtime?.cached?.supported === true,
-		cachedReason: runtime?.cached?.reason,
-		cleanup: {
-			terminals: cleanupCapability("terminals"),
-			containers: cleanupCapability("containers"),
-			browsers: cleanupCapability("browsers"),
-			worktrees: cleanupCapability("worktrees"),
-		},
-	};
+} = Object.freeze({
+	scanSupported: true,
+	cachedSupported: true,
+	cleanup: Object.freeze({
+		terminals: SUPPORTED,
+		containers: SUPPORTED,
+		browsers: SUPPORTED,
+		worktrees: SUPPORTED,
+	}),
+});
+
+export function useRuntimeMaintenanceCapability(): typeof RUNTIME_MAINTENANCE_CAPABILITY {
+	return RUNTIME_MAINTENANCE_CAPABILITY;
 }
 
-export function useRuntimeMaintenanceCapability(): ReturnType<
-	typeof getRuntimeMaintenanceCapability
-> {
-	return getRuntimeMaintenanceCapability(useRuntimeCapabilities());
-}
+// === storage ===
 
 type StorageCleanupTarget = "uploads" | "shares" | "worktrees" | "containers";
 
@@ -1942,8 +962,13 @@ type StorageCleanupRuntimeCapability = {
 	preservesMessageImageRefs?: boolean;
 };
 
-export type StorageHealthQueryStatus = "loading" | "error" | "success";
-export type StorageCapabilityHealthState = "loading" | "error" | "legacy" | "capabilities";
+/**
+ * Load state of the health request itself. This is a genuine distinction — `StorageSection`
+ * shows a loader, an error with a retry, or the controls — unlike the old
+ * `StorageCapabilityHealthState`, which additionally split success into "legacy" (no
+ * capability payload) and "capabilities" (payload present). Only the former ever occurred.
+ */
+export type StorageHealthState = "loading" | "error" | "ready";
 
 export type StorageCapability = {
 	scanSupported: boolean;
@@ -1955,115 +980,52 @@ export type StorageCapability = {
 	cleanup: Record<StorageCleanupTarget, StorageCleanupRuntimeCapability>;
 };
 
-export function getStorageCapability(
-	capabilities: RuntimeCapabilities | undefined,
-): StorageCapability {
-	const storage = capabilities?.storage;
-	const scan = storage?.scan;
-	const cached = storage?.cached;
-	const vacuum = storage?.vacuum;
-	const cleanup = storage?.cleanup;
-	const assumeLegacyTSBackend = !capabilities;
-	const cleanupCapability = (target: StorageCleanupTarget): StorageCleanupRuntimeCapability => ({
-		supported: assumeLegacyTSBackend ? true : cleanup?.[target]?.supported === true,
-		reason: cleanup?.[target]?.reason,
-		mode: cleanup?.[target]?.mode,
-		alternative: cleanup?.[target]?.alternative,
-		preservesMessageImageRefs: cleanup?.[target]?.preservesMessageImageRefs,
-	});
-	return {
-		scanSupported: assumeLegacyTSBackend ? true : scan?.supported === true,
-		scanReason: scan?.reason,
-		cachedSupported: assumeLegacyTSBackend ? true : cached?.supported === true,
-		cachedReason: cached?.reason,
-		// VACUUM is an intentional, service-pausing maintenance window rather than an
-		// ordinary request-path CRUD operation. The route is requireAdmin-protected and
-		// the UI requires explicit confirmation, so keep it visible for the legacy TS
-		// backend whose health payload has no capability metadata. Other backends must
-		// explicitly advertise support and fail closed when they do not.
-		vacuumSupported: assumeLegacyTSBackend ? true : vacuum?.supported === true,
-		vacuumReason: vacuum?.reason,
-		cleanup: {
-			uploads: cleanupCapability("uploads"),
-			shares: cleanupCapability("shares"),
-			worktrees: cleanupCapability("worktrees"),
-			containers: cleanupCapability("containers"),
-		},
-	};
-}
-
 /**
- * Resolve storage capabilities only after the health request has succeeded.
- * An absent capability payload is the legacy TypeScript backend; an absent payload
- * during loading/error is unknown and must not enable destructive or expensive actions.
+ * Storage scan and VACUUM are expensive and service-pausing, so the UI still waits for
+ * `/api/health` to answer before enabling them — `healthReady` is a real load-state gate,
+ * not a capability check. VACUUM additionally stays behind `requireAdmin` and an explicit
+ * confirmation in `StorageSection`.
  */
-export function getStorageCapabilityForHealth(health: {
-	status: StorageHealthQueryStatus;
-	capabilities?: RuntimeCapabilities;
-}): StorageCapability & {
-	healthState: StorageCapabilityHealthState;
-	healthReady: boolean;
-} {
-	const healthState: StorageCapabilityHealthState =
-		health.status === "loading"
-			? "loading"
-			: health.status === "error"
-				? "error"
-				: health.capabilities
-					? "capabilities"
-					: "legacy";
-	const capability =
-		health.status === "success"
-			? getStorageCapability(health.capabilities)
-			: getStorageCapability({ storage: {} });
-	return {
-		...capability,
-		healthState,
-		healthReady: health.status === "success",
-	};
-}
+const STORAGE_CAPABILITY: StorageCapability = Object.freeze({
+	scanSupported: true,
+	cachedSupported: true,
+	vacuumSupported: true,
+	cleanup: Object.freeze({
+		uploads: SUPPORTED,
+		shares: SUPPORTED,
+		worktrees: SUPPORTED,
+		containers: SUPPORTED,
+	}),
+});
 
 export function useStorageCapability(): StorageCapability & {
-	healthState: StorageCapabilityHealthState;
+	healthState: StorageHealthState;
 	healthReady: boolean;
 	healthError: Error | null;
 	healthFetching: boolean;
 	refetchHealth: () => Promise<unknown>;
 } {
 	const health = useHealthQuery();
-	const status: StorageHealthQueryStatus = health.isError
+	const healthState: StorageHealthState = health.isError
 		? "error"
 		: health.status === "pending"
 			? "loading"
-			: "success";
+			: "ready";
 	return {
-		...getStorageCapabilityForHealth({
-			status,
-			capabilities: health.data?.capabilities,
-		}),
+		...STORAGE_CAPABILITY,
+		healthState,
+		healthReady: healthState === "ready",
 		healthError: health.error,
 		healthFetching: health.isFetching,
 		refetchHealth: health.refetch,
 	};
 }
 
-export function getStorageDatabasePreviewCapability(
-	capabilities: RuntimeCapabilities | undefined,
-): {
-	supported: boolean;
-} {
-	const database = capabilities?.storage?.database;
-	const assumeLegacyTSBackend = !capabilities;
-	return {
-		supported: assumeLegacyTSBackend ? true : database?.preview === true,
-	};
+export function useStorageDatabasePreviewCapability(): { supported: boolean; reason?: string } {
+	return SUPPORTED;
 }
 
-export function useStorageDatabasePreviewCapability(): ReturnType<
-	typeof getStorageDatabasePreviewCapability
-> {
-	return getStorageDatabasePreviewCapability(useRuntimeCapabilities());
-}
+type StorageDatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "apiRequestDumps";
 
 type StorageDatabaseCleanupCapability = {
 	supported: boolean;
@@ -2072,36 +1034,17 @@ type StorageDatabaseCleanupCapability = {
 	fallback?: boolean;
 };
 
-export function getStorageDatabaseCleanupCapabilities(
-	capabilities: RuntimeCapabilities | undefined,
-): Record<StorageDatabaseCleanupTarget, StorageDatabaseCleanupCapability> {
-	const database = capabilities?.storage?.database;
-	const assumeLegacyTSBackend = !capabilities;
-	const targetCapability = (
-		target: StorageDatabaseCleanupTarget,
-	): StorageDatabaseCleanupCapability => {
-		const capability = database?.cleanupTargets?.[target];
-		const cleanupSupported = assumeLegacyTSBackend
-			? database?.cleanup !== false && capability?.supported !== false
-			: database?.cleanup === true && capability?.supported === true;
-		return {
-			supported: cleanupSupported,
-			reason: capability?.reason,
-			code: capability?.code,
-			fallback: capability?.fallback,
-		};
-	};
-	return {
-		archivedSessions: targetCapability("archivedSessions"),
-		staleSessions: targetCapability("staleSessions"),
-		apiRequestDumps: targetCapability("apiRequestDumps"),
-	};
-}
+const STORAGE_DATABASE_CLEANUP_CAPABILITIES: Record<
+	StorageDatabaseCleanupTarget,
+	StorageDatabaseCleanupCapability
+> = Object.freeze({
+	archivedSessions: SUPPORTED,
+	staleSessions: SUPPORTED,
+	apiRequestDumps: SUPPORTED,
+});
 
-export function useStorageDatabaseCleanupCapabilities(): ReturnType<
-	typeof getStorageDatabaseCleanupCapabilities
-> {
-	return getStorageDatabaseCleanupCapabilities(useRuntimeCapabilities());
+export function useStorageDatabaseCleanupCapabilities(): typeof STORAGE_DATABASE_CLEANUP_CAPABILITIES {
+	return STORAGE_DATABASE_CLEANUP_CAPABILITIES;
 }
 
 type StorageCleanupOperationCapability = StorageCleanupRuntimeCapability & {
@@ -2109,32 +1052,21 @@ type StorageCleanupOperationCapability = StorageCleanupRuntimeCapability & {
 	runtimeTarget?: RuntimeCleanupTarget;
 };
 
-export function getStorageCleanupOperationCapabilities(
-	capabilities: RuntimeCapabilities | undefined,
-): Record<StorageCleanupTarget, StorageCleanupOperationCapability> {
-	const storageCleanup = getStorageCapability(capabilities).cleanup;
-	const runtimeCleanup = getRuntimeMaintenanceCapability(capabilities).cleanup;
-	const storageRoute = (target: StorageCleanupTarget): StorageCleanupOperationCapability => ({
-		...storageCleanup[target],
-		route: "storage",
-	});
-	return {
-		uploads: storageRoute("uploads"),
-		shares: storageRoute("shares"),
-		containers: storageRoute("containers"),
-		worktrees:
-			storageCleanup.worktrees.supported === false && runtimeCleanup.worktrees.supported
-				? {
-						...runtimeCleanup.worktrees,
-						route: "runtime",
-						runtimeTarget: "worktrees",
-					}
-				: storageRoute("worktrees"),
-	};
-}
+/**
+ * Every target is served by the storage route. The runtime-route branch existed to send
+ * worktree cleanup elsewhere when storage cleanup reported itself unsupported, which the
+ * storage capability never did.
+ */
+const STORAGE_CLEANUP_OPERATION_CAPABILITIES: Record<
+	StorageCleanupTarget,
+	StorageCleanupOperationCapability
+> = Object.freeze({
+	uploads: Object.freeze({ supported: true, route: "storage" }),
+	shares: Object.freeze({ supported: true, route: "storage" }),
+	containers: Object.freeze({ supported: true, route: "storage" }),
+	worktrees: Object.freeze({ supported: true, route: "storage" }),
+});
 
-export function useStorageCleanupOperationCapabilities(): ReturnType<
-	typeof getStorageCleanupOperationCapabilities
-> {
-	return getStorageCleanupOperationCapabilities(useRuntimeCapabilities());
+export function useStorageCleanupOperationCapabilities(): typeof STORAGE_CLEANUP_OPERATION_CAPABILITIES {
+	return STORAGE_CLEANUP_OPERATION_CAPABILITIES;
 }

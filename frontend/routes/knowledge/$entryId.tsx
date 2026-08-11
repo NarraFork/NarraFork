@@ -58,6 +58,7 @@ import {
 	useKnowledgeDraftDrift,
 	useKnowledgeEntries,
 	useKnowledgeEntry,
+	useKnowledgeRevision,
 	useKnowledgeRevisions,
 	useKnowledgeSubmission,
 	useKnowledgeSubmissions,
@@ -551,11 +552,17 @@ function HistoryTab({ entryId }: { entryId: string }) {
 	const revisions = useKnowledgeRevisions(entryId);
 	const [leftId, setLeftId] = useState<string | null>(null);
 	const [rightId, setRightId] = useState<string | null>(null);
+	// The history list is metadata-only (it would otherwise carry every version's full body), so
+	// the two sides of the diff are fetched on demand — and only once each, since both queries are
+	// cached by revision id.
+	const leftRev = useKnowledgeRevision(leftId ?? undefined);
+	const rightRev = useKnowledgeRevision(rightId ?? undefined);
 
 	const revs = revisions.data ?? [];
 	const options = useMemo(() => revs.map((r) => ({ value: r.id, label: `v${r.version}` })), [revs]);
-	const left = revs.find((r) => r.id === leftId);
-	const right = revs.find((r) => r.id === rightId);
+	const bothSelected = !!leftId && !!rightId;
+	const diffLoading = bothSelected && (leftRev.isLoading || rightRev.isLoading);
+	const diffReady = bothSelected && !!leftRev.data && !!rightRev.data;
 
 	if ((revs.length ?? 0) === 0) {
 		return (
@@ -579,10 +586,14 @@ function HistoryTab({ entryId }: { entryId: string }) {
 				/>
 			</Group>
 
-			{left && right ? (
+			{diffLoading ? (
+				<Text size="sm" c="dimmed">
+					{t("loading")}
+				</Text>
+			) : diffReady ? (
 				<DiffView
-					oldStr={left.content}
-					newStr={right.content}
+					oldStr={leftRev.data?.content ?? ""}
+					newStr={rightRev.data?.content ?? ""}
 					language="markdown"
 					maxHeight={400}
 					wordWrap
@@ -599,9 +610,16 @@ function HistoryTab({ entryId }: { entryId: string }) {
 									<Badge variant="light">v{r.version}</Badge>
 									{r.changeNote ? <Text size="sm">{r.changeNote}</Text> : null}
 								</Group>
-								<Text size="xs" c="dimmed">
-									{formatLocaleDateTime(r.createdAt)}
-								</Text>
+								<Group gap="xs">
+									{/* Size comes from the SQL projection, so the list still conveys how big
+									    each version is without shipping any bodies. */}
+									<Text size="xs" c="dimmed">
+										{t("revisionSize", { count: r.contentLength })}
+									</Text>
+									<Text size="xs" c="dimmed">
+										{formatLocaleDateTime(r.createdAt)}
+									</Text>
+								</Group>
 							</Group>
 						</Paper>
 					))}
@@ -624,6 +642,10 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 	const [conflict, setConflict] = useState<{ theirs: string; yours: string } | null>(null);
 	// "Take main" discards the author's edits irreversibly → always confirm first.
 	const [takeMainOpen, setTakeMainOpen] = useState(false);
+	// Set when a submit went through on a stale base. The drift banner above warns BEFORE
+	// submitting, but it is dismissible-by-scrolling and easy to walk past; this confirms
+	// after the fact that the reviewer may hit a conflict, while rebasing is still an option.
+	const [submittedDrift, setSubmittedDrift] = useState<number | null>(null);
 
 	const draft = myDraft.data;
 	useEffect(() => {
@@ -736,6 +758,18 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 				</Alert>
 			) : null}
 
+			{submittedDrift !== null ? (
+				<Alert
+					color="yellow"
+					title={t("submitDriftTitle")}
+					icon={<IconAlertTriangle size={16} />}
+					withCloseButton
+					onClose={() => setSubmittedDrift(null)}
+				>
+					<Text size="sm">{t("submitDriftDesc", { count: submittedDrift })}</Text>
+				</Alert>
+			) : null}
+
 			<Modal
 				opened={takeMainOpen}
 				onClose={() => setTakeMainOpen(false)}
@@ -817,7 +851,13 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 								await updateDraft.mutateAsync({ draftId: draft.id, entryId, content });
 								setDirty(false);
 							}
-							submitDraft.mutate({ draftId: draft.id, entryId });
+							setSubmittedDrift(null);
+							submitDraft.mutate(
+								{ draftId: draft.id, entryId },
+								{
+									onSuccess: (res) => setSubmittedDrift(res.driftWarning?.versionsBehind ?? null),
+								},
+							);
 						}}
 					>
 						{t("submitForReview")}

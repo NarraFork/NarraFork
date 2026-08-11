@@ -83,58 +83,12 @@ export const chaptersApi = {
 	wakeChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/wake`, { method: "POST" }),
 	unmergeChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/unmerge`, { method: "POST" }),
 
-	// Chapter commits
-	getChapterCommits: (id: string, params?: { limit?: number; since?: string }) => {
-		const searchParams = new URLSearchParams();
-		if (params?.limit) searchParams.set("limit", String(params.limit));
-		if (params?.since) searchParams.set("since", params.since);
-		const qs = searchParams.toString();
-		return request<
-			Array<{
-				id: string;
-				sha: string;
-				message: string;
-				authorName: string | null;
-				authorEmail: string | null;
-				authoredAt: string;
-				source: "manual" | "auto" | "merge" | "cherry_pick" | "initial";
-				narratorId: string | null;
-				narratorMessageId: string | null;
-				filesChanged: number | null;
-				linesAdded: number | null;
-				linesRemoved: number | null;
-			}>
-		>(`/chapters/${id}/commits${qs ? `?${qs}` : ""}`);
-	},
-	getChapterCommit: (chapterId: string, sha: string) =>
-		request<{
-			id: string;
-			sha: string;
-			message: string;
-			fullMessage: string | null;
-			authorName: string | null;
-			authorEmail: string | null;
-			authoredAt: string;
-			source: "manual" | "auto" | "merge" | "cherry_pick" | "initial";
-			narratorId: string | null;
-			narratorMessageId: string | null;
-			filesChanged: number | null;
-			linesAdded: number | null;
-			linesRemoved: number | null;
-			files: Array<{
-				path: string;
-				oldPath?: string;
-				status: string;
-				linesAdded: number;
-				linesRemoved: number;
-				diff?: string;
-			}>;
-			diffInlined: boolean;
-		}>(`/chapters/${chapterId}/commits/${sha}`),
-	getCommitFileDiff: (chapterId: string, sha: string, filePath: string) =>
-		request<{ diff: string; truncated: boolean }>(
-			`/chapters/${chapterId}/commits/${sha}/files/${filePath}`,
-		),
+	// Chapter commits: the `getChapterCommits` / `getChapterCommit` / `getCommitFileDiff`
+	// clients lived here and served `CommitList` + `CommitDetailModal`, both of which had
+	// lost their last importer and have been deleted. The routes they named still exist
+	// (`GET /chapters/:id/commits`, `/commits/:sha`, `/commits/:sha/files/*`); the live
+	// commit UI is `GitCommitsTab`, which reads git directly via `useGitLog`. Re-add a
+	// client here when something needs the persisted `chapter_commits` rows again.
 
 	// Chapter git status
 	getChapterGitStatus: (id: string) =>
@@ -168,47 +122,19 @@ export const chaptersApi = {
 	// The `batchFork` string in NarratorPanel is unrelated — it forks a narrator from
 	// several selected messages, and goes through `forkChapter`.
 
-	// Cherry-pick
-	cherryPickChapter: (id: string, data: { sourceChapterId: string; commitShas: string[] }) =>
-		request<ApiEntity>(`/chapters/${id}/cherry-pick`, {
-			method: "POST",
-			body: JSON.stringify(data),
-		}),
+	// `cherryPickChapter` is gone for the same reason: `POST /chapters/:id/cherry-pick`
+	// does not exist. Cherry-pick as a *merge strategy* does work and goes through
+	// `mergeChapter` with `strategy: "cherry-pick"`.
 
-	// Dependency status
-	getDependencyStatus: (id: string) =>
-		request<
-			Array<{
-				edgeId: string;
-				sourceChapterId: string;
-				hasUpdates: boolean;
-				newCommitCount: number;
-			}>
-		>(`/chapters/${id}/dependency-status`),
-
-	// Sync upstream
-	syncUpstream: (id: string, data: { edgeId: string; strategy: "rebase" | "merge" }) =>
-		request<ApiEntity>(`/chapters/${id}/sync-upstream`, {
-			method: "POST",
-			body: JSON.stringify(data),
-		}),
-
-	// Chapter edges
-	listChapterEdges: (params: { projectId?: string; chapterId?: string; type?: string }) => {
-		const searchParams = new URLSearchParams();
-		if (params.projectId) searchParams.set("projectId", params.projectId);
-		if (params.chapterId) searchParams.set("chapterId", params.chapterId);
-		if (params.type) searchParams.set("type", params.type);
-		return request<ApiEntity[]>(`/chapter-edges?${searchParams}`);
-	},
-	createChapterEdge: (data: {
-		sourceId: string;
-		targetId: string;
-		type: string;
-		metadata?: Record<string, unknown>;
-	}) => request<ApiEntity>("/chapter-edges", { method: "POST", body: JSON.stringify(data) }),
-	deleteChapterEdge: (id: string) =>
-		request<{ ok: boolean }>(`/chapter-edges/${id}`, { method: "DELETE" }),
+	// Dependency edges: removed. `getDependencyStatus` and `syncUpstream` named
+	// `/chapters/:id/dependency-status` and `/chapters/:id/sync-upstream`, neither of which
+	// was ever routed, and both had zero callers. The `dependency` edge type they belonged
+	// to is gone too — see `server/services/chapter-edge-service.ts`.
+	//
+	// `createChapterEdge`/`deleteChapterEdge` are gone with it: fork, merge and review edges
+	// are all created by the operation that owns them, so `/api/chapter-edges` is read-only.
+	// `listChapterEdges` went as well — the graph gets its edges from `GET /projects/:id/graph`
+	// and nothing else queried it.
 
 	// Exploration groups: not implemented.
 	//

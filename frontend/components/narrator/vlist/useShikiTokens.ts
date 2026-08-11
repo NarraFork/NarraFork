@@ -34,7 +34,7 @@ import {
 import { useComputedColorScheme } from "@mantine/core";
 import { useSyncExternalStore } from "react";
 
-/** Shiki theme ids, matching HighlightedCode / StreamingCode / the Pixi renderer. */
+/** Shiki theme ids, matching HighlightedCode / StreamingCode. */
 const DARK_THEME = "github-dark-default";
 const LIGHT_THEME = "github-light-default";
 

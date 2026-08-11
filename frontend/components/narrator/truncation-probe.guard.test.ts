@@ -11,7 +11,8 @@
  *   - `LazyDetailRenderer.hasTruncatedData` kept a root probe through the
  *     field-level migration, so `needsFetch` was permanently false: the chunked
  *     card offered "load full content" and clicking it did nothing.
- *   - `SubagentCard` and `pixi-message-model` had the same shape and were fixed.
+ *   - `SubagentCard` had the same shape and was fixed. (The Pixi renderer's
+ *     `pixi-message-model` carried it too, but that renderer has been deleted.)
  *
  * The right question is `hasTruncatedLeaf(payload)` (recursive). `isTruncated(x)`
  * remains correct for asking whether ONE value is a leaf.
@@ -28,7 +29,6 @@ const PAYLOAD_CONSUMERS = [
 	"ToolCallInspector.tsx",
 	"ChunkedMessageList.tsx",
 	"narrator-message-helpers.ts",
-	"pixi/pixi-message-model.ts",
 	"vlist/segment-adapter.ts",
 	"vlist/vlist-selection.ts",
 	"vlist/PretextExactMessageList.tsx",

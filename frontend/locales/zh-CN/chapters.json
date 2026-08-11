@@ -128,11 +128,5 @@
 	},
 	"status": {
 		"frozen": "已冻结"
-	},
-	"commitDetail": {
-		"noDiff": "此提交没有文件变更。",
-		"diffPreviewTruncated": "Diff 预览已截断以保持界面响应。",
-		"filesPreviewTruncated": "仅显示前 1,000 个文件。另有 {{count}} 个已隐藏。",
-		"messagePreviewTruncated": "提交消息预览已截断以保持界面响应。"
 	}
 }

@@ -10,7 +10,10 @@ import {
 	users,
 } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
+import { recordKnowledgeAclEvent } from "./knowledge-audit";
 
 /** A user's role as stored on the JWT/users table. */
 export type Role = "admin" | "user";
@@ -566,10 +569,19 @@ async function updateCollectionAcl(
 		controlledTags?: string[];
 		ownerUserId?: string | null;
 	},
+	/** Who is making the change — recorded in the ACL audit trail. Optional so internal/seed
+	 *  paths and tests can call this without inventing an actor. */
+	actor?: { userId?: string | null; role?: string | null },
 ) {
+	// Read the BEFORE state for the audit diff (small, ACL-only projection — no content).
 	const existing = await db.query.knowledgeCollections.findFirst({
 		where: eq(knowledgeCollections.id, id),
-		columns: { id: true },
+		columns: {
+			id: true,
+			classificationLevel: true,
+			controlledTagsJson: true,
+			ownerUserId: true,
+		},
 	});
 	if (!existing) throw new Error("Knowledge collection not found");
 	await db
@@ -583,6 +595,33 @@ async function updateCollectionAcl(
 			updatedAt: nowIso(),
 		})
 		.where(eq(knowledgeCollections.id, id));
+	// Post-write: this changed who can read a whole collection, so it is exactly the kind of
+	// change that must be answerable after the fact. Level names + tag ids only.
+	recordKnowledgeAclEvent({
+		actorUserId: actor?.userId ?? null,
+		actorRole: actor?.role ?? null,
+		eventType: "collection_acl_updated",
+		targetType: "collection",
+		targetId: id,
+		detail: {
+			before: {
+				classificationLevel: existing.classificationLevel,
+				controlledTags: existing.controlledTagsJson ?? [],
+				ownerUserId: existing.ownerUserId,
+			},
+			after: {
+				classificationLevel:
+					input.classificationLevel !== undefined
+						? input.classificationLevel
+						: existing.classificationLevel,
+				controlledTags:
+					input.controlledTags !== undefined
+						? input.controlledTags
+						: (existing.controlledTagsJson ?? []),
+				ownerUserId: input.ownerUserId !== undefined ? input.ownerUserId : existing.ownerUserId,
+			},
+		},
+	});
 	return db.query.knowledgeCollections.findFirst({ where: eq(knowledgeCollections.id, id) });
 }
 
@@ -696,15 +735,19 @@ function isUniqueConstraintError(error: unknown): boolean {
 	return /UNIQUE constraint failed/i.test(message);
 }
 
-async function createGrant(input: {
-	collectionId?: string;
-	principalType: "user" | "role";
-	principalId: string;
-	grantType: "clearance" | "tag" | "review";
-	clearanceLevel?: string;
-	tagId?: string;
-	canWrite?: boolean;
-}) {
+async function createGrant(
+	input: {
+		collectionId?: string;
+		principalType: "user" | "role";
+		principalId: string;
+		grantType: "clearance" | "tag" | "review";
+		clearanceLevel?: string;
+		tagId?: string;
+		canWrite?: boolean;
+	},
+	/** Who is granting — recorded in the ACL audit trail. */
+	actor?: { userId?: string | null; role?: string | null },
+) {
 	try {
 		const [row] = await db
 			.insert(knowledgeGrants)
@@ -720,6 +763,23 @@ async function createGrant(input: {
 				createdAt: nowIso(),
 			})
 			.returning();
+		emitAclChanged(input.principalType, input.principalId, "grant_added");
+		recordKnowledgeAclEvent({
+			actorUserId: actor?.userId ?? null,
+			actorRole: actor?.role ?? null,
+			eventType: "grant_added",
+			subjectType: input.principalType,
+			subjectId: input.principalId,
+			targetType: "grant",
+			targetId: row?.id ?? null,
+			detail: {
+				grantType: input.grantType,
+				clearanceLevel: input.clearanceLevel ?? null,
+				tagId: input.tagId ?? null,
+				collectionId: input.collectionId ?? null,
+				canWrite: input.canWrite ?? false,
+			},
+		});
 		return row;
 	} catch (error) {
 		// `idx_kgrant_unique_tuple` makes the (collection, principal, grantType, tag)
@@ -732,9 +792,85 @@ async function createGrant(input: {
 	}
 }
 
-async function deleteGrant(id: string) {
+async function deleteGrant(id: string, actor?: { userId?: string | null; role?: string | null }) {
+	// Read the row BEFORE deleting: afterwards there is nothing left to route the notification by
+	// or to describe in the audit entry, and a revocation is precisely what an audit trail is for.
+	const existing = await db.query.knowledgeGrants.findFirst({
+		where: eq(knowledgeGrants.id, id),
+		columns: {
+			principalType: true,
+			principalId: true,
+			grantType: true,
+			clearanceLevel: true,
+			tagId: true,
+			collectionId: true,
+		},
+	});
 	await db.delete(knowledgeGrants).where(eq(knowledgeGrants.id, id));
+	if (existing) {
+		emitAclChanged(existing.principalType, existing.principalId, "grant_removed");
+		recordKnowledgeAclEvent({
+			actorUserId: actor?.userId ?? null,
+			actorRole: actor?.role ?? null,
+			eventType: "grant_removed",
+			subjectType: existing.principalType,
+			subjectId: existing.principalId,
+			targetType: "grant",
+			targetId: id,
+			detail: {
+				grantType: existing.grantType,
+				clearanceLevel: existing.clearanceLevel,
+				tagId: existing.tagId,
+				collectionId: existing.collectionId,
+			},
+		});
+	}
 	return { ok: true as const };
+}
+
+/**
+ * Cap on users notified for a ROLE-scoped authorization change.
+ *
+ * A role grant affects everyone holding that role, so the fan-out is bounded the same way the
+ * drift notification is: past the cap some clients keep a stale badge until their next refetch,
+ * which is far better than an unbounded scan on every grant edit.
+ */
+const ACL_NOTIFY_MAX_USERS = 200;
+
+/**
+ * Announce that a principal's knowledge authorization changed.
+ *
+ * Only user ids and a coarse reason cross the bus — never level names or tag ids. The client
+ * refetches through the ACL-checked endpoints, so this cannot become a channel for learning which
+ * compartments exist. Failure is swallowed: a stale badge must never fail the grant edit itself.
+ */
+function emitAclChanged(
+	principalType: "user" | "role",
+	principalId: string,
+	reason: "grant_added" | "grant_removed" | "user_acl_replaced",
+): void {
+	void (async () => {
+		let userIds: string[];
+		if (principalType === "user") {
+			userIds = [principalId];
+		} else {
+			// Role grant → everyone with that role, bounded.
+			const rows = await db.query.users.findMany({
+				where: (u, { eq: e }) => e(u.role, principalId as "admin" | "user"),
+				columns: { id: true },
+				limit: ACL_NOTIFY_MAX_USERS,
+			});
+			userIds = rows.map((r) => r.id);
+		}
+		if (userIds.length === 0) return;
+		eventBus.emit({ type: "knowledge:acl_changed", userIds, reason });
+	})().catch((err) => {
+		logger.warn("knowledge ACL notification failed", {
+			principalType,
+			reason,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	});
 }
 
 /** Per-user outcome of a bulk grant. `skipped` = the identical grant already existed. */
@@ -758,14 +894,18 @@ export interface BulkGrantResult {
  * only an infrastructure error aborts and rolls back, so a partial half-state is impossible.
  * Callers are responsible for authorization (admin-only at the route layer).
  */
-async function bulkGrant(input: {
-	collectionId?: string;
-	userIds: string[];
-	grantType: "clearance" | "tag" | "review";
-	clearanceLevel?: string;
-	tagId?: string;
-	canWrite?: boolean;
-}): Promise<{
+async function bulkGrant(
+	input: {
+		collectionId?: string;
+		userIds: string[];
+		grantType: "clearance" | "tag" | "review";
+		clearanceLevel?: string;
+		tagId?: string;
+		canWrite?: boolean;
+	},
+	/** Who is granting — recorded as ONE audit row for the whole batch. */
+	actor?: { userId?: string | null; role?: string | null },
+): Promise<{
 	ok: true;
 	granted: number;
 	skipped: number;
@@ -860,6 +1000,30 @@ async function bulkGrant(input: {
 		db.transaction((tx) => {
 			for (const g of toInsert) tx.insert(knowledgeGrants).values(g).run();
 		});
+		// One event for the whole batch (all targets are users here) rather than N events.
+		const grantedUserIds = results.filter((r) => r.status === "granted").map((r) => r.userId);
+		if (grantedUserIds.length > 0) {
+			eventBus.emit({
+				type: "knowledge:acl_changed",
+				userIds: grantedUserIds.slice(0, ACL_NOTIFY_MAX_USERS),
+				reason: "grant_added",
+			});
+			// One audit row for the batch, listing the affected subjects. Recording N rows for one
+			// admin action would bury the actual event in noise.
+			recordKnowledgeAclEvent({
+				actorUserId: actor?.userId ?? null,
+				actorRole: actor?.role ?? null,
+				eventType: "grants_bulk_added",
+				detail: {
+					grantType: input.grantType,
+					clearanceLevel: input.clearanceLevel ?? null,
+					tagId: input.tagId ?? null,
+					collectionId: input.collectionId ?? null,
+					canWrite: input.canWrite ?? false,
+					grantedUserIds,
+				},
+			});
+		}
 	}
 
 	return {
@@ -966,6 +1130,8 @@ async function setUserAcl(
 		reviewTagIds?: string[];
 		canWrite?: boolean;
 	},
+	/** Who is replacing this user's ACL — recorded in the ACL audit trail. */
+	actor?: { userId?: string | null; role?: string | null },
 ): Promise<{ ok: true }> {
 	const now = nowIso();
 	const newGrants: (typeof knowledgeGrants.$inferInsert)[] = [];
@@ -1015,6 +1181,23 @@ async function setUserAcl(
 			)
 			.run();
 		for (const g of newGrants) tx.insert(knowledgeGrants).values(g).run();
+	});
+	// Replace-in-place: the user's whole credential set may have moved in either direction.
+	emitAclChanged("user", userId, "user_acl_replaced");
+	recordKnowledgeAclEvent({
+		actorUserId: actor?.userId ?? null,
+		actorRole: actor?.role ?? null,
+		eventType: "user_acl_replaced",
+		subjectType: "user",
+		subjectId: userId,
+		// This is a wholesale replacement, so record the resulting credential set rather than a
+		// diff — level names and tag ids only.
+		detail: {
+			clearanceLevel: input.clearanceLevel ?? null,
+			tagIds: input.tagIds ?? [],
+			reviewTagIds: input.reviewTagIds ?? [],
+			canWrite: input.canWrite ?? false,
+		},
 	});
 	return { ok: true };
 }

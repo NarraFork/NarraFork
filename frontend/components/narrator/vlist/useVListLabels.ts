@@ -144,8 +144,8 @@ export interface VListRenderLabels {
 			thinkingChars: (chars: number) => string;
 			outputChars: (chars: number) => string;
 		};
-		/** Tool-result sidecar mini-card chrome (copy tooltip). */
-		sidecar: { copy: string; copied: string };
+		/** Tool-result side-car footnote chrome (copy tooltip + folded-card marker). */
+		sidecar: { copy: string; copied: string; attachedCount: string };
 	};
 	toolCallGroup: { label: string; statusLabel: string };
 	trace: {
@@ -199,7 +199,7 @@ export interface VListRenderLabels {
 		cancel: string;
 		resolvedLabel: string;
 	};
-	/** Standalone sidecar card chrome (copy tooltip). */
+	/** Standalone side-car footnote chrome (copy tooltip). */
 	sidecar: { copy: string; copied: string };
 	planCard: string;
 	pruneDivider: string;
@@ -357,12 +357,42 @@ export function useVListLabels(): VListLabels {
 			// through the adapter rather than the render layer.
 			...reflectionTitleLabels(t),
 			reflectionNextSteps: t("reflectionNextSteps", { nextSteps: "{nextSteps}" }),
-			// ── sidecar cards (one collapsible card per system injection) ─────────
-			// The source badge text is composed during adaptation (it sits in the
-			// measured header row), so these flow through the adapter labels. They
-			// reuse the existing `sidecar.sources.*` narrator strings 1:1.
+			// ── side-car footnotes (one per system injection) ──────────────────────
+			// All of these are MEASURED text — the source name sits in the header row and
+			// the body lines are wrapped by the measure pass — so they flow through the
+			// adapter labels rather than the render bundle.
+			//
+			// The `presentation*` keys are the reader-facing wording of a structured
+			// body. They are deliberately NOT the model-facing copy (which lives in
+			// server/lib/i18n.ts): the model gets "keep tasks.json to only
+			// text/status/protected…", the reader gets "3 open tasks".
 			sidecarUnknown: t("sidecar.unknownSource"),
 			sidecarTruncated: t("sidecar.truncated"),
+			sidecarShowAll: t("sidecar.showAll"),
+			noticeSilentProgress: t("sidecar.body.noticeSilentProgress", { count: "{count}" }),
+			noticeRelaxedPlan: t("sidecar.body.noticeRelaxedPlan"),
+			noticePipelineExit: t("sidecar.body.noticePipelineExit"),
+			tasksCurrent: t("sidecar.body.tasksCurrent", { n: "{n}" }),
+			tasksEmptyNever: t("sidecar.body.tasksEmptyNever"),
+			tasksEmptyDone: t("sidecar.body.tasksEmptyDone"),
+			tasksTooMany: t("sidecar.body.tasksTooMany", { n: "{n}" }),
+			taskRoleDoing: t("sidecar.body.taskRoleDoing"),
+			taskRoleNext: t("sidecar.body.taskRoleNext"),
+			taskRoleTodo: t("sidecar.body.taskRoleTodo"),
+			taskRoleBlocked: t("sidecar.body.taskRoleBlocked"),
+			taskProtected: t("sidecar.body.taskProtected"),
+			knowledgeHeading: t("sidecar.body.knowledgeHeading", { n: "{n}" }),
+			tasksDoneAgentHeading: t("sidecar.body.tasksDoneAgentHeading", { n: "{n}" }),
+			tasksDoneBashHeading: t("sidecar.body.tasksDoneBashHeading", { n: "{n}" }),
+			tasksDoneTruncated: t("sidecar.body.tasksDoneTruncated"),
+			messagesHeading: t("sidecar.body.messagesHeading", { n: "{n}" }),
+			messageFromUnknown: t("sidecar.body.messageFromUnknown"),
+			messageBroadcast: t("sidecar.body.messageBroadcast"),
+			specUpdatesHeading: t("sidecar.body.specUpdatesHeading", { n: "{n}" }),
+			proseFenceHeading: t("sidecar.body.proseFenceHeading"),
+			empty: t("sidecar.body.empty"),
+			sidecarSourceBehaviorFence: t("sidecar.sources.behavior_fence"),
+			sidecarSourcePipelineExit: t("sidecar.sources.pipeline_exit_confirmation"),
 			sidecarSourceSilentProgress: t("sidecar.sources.silent_progress"),
 			sidecarSourceTodoReminder: t("sidecar.sources.todo_reminder"),
 			sidecarSourceRelaxedPlan: t("sidecar.sources.relaxed_plan"),
@@ -458,7 +488,11 @@ export function useVListLabels(): VListLabels {
 					thinkingChars: (chars: number) => t("reflectionThinkingChars", { count: chars }),
 					outputChars: (chars: number) => t("reflectionOutputChars", { count: chars }),
 				},
-				sidecar: { copy: t("sidecar.copy"), copied: t("sidecar.copied") },
+				sidecar: {
+					copy: t("sidecar.copy"),
+					copied: t("sidecar.copied"),
+					attachedCount: t("sidecar.attachedCount", { count: "{count}" }),
+				},
 			},
 			toolCallGroup: {
 				label: t("toolCalls"),
@@ -533,7 +567,6 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 		case "tool-run-summary":
 		case "activity-trace":
 		case "reasoning-steps":
-		case "sidecar-trace":
 			return labels.trace;
 		case "subagent-card":
 			return labels.subagent;

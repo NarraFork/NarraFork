@@ -34,6 +34,8 @@
 	"collapseSidebar": "Collapse sidebar",
 	"expandSidebar": "Expand sidebar",
 	"revealInExplorer": "Reveal in File Manager",
+	"newNarratorHere": "New narrator in this directory",
+	"newNarratorHereNoDir": "Could not resolve a directory for this tab",
 	"totalOutputChars": "Total AI output chars",
 	"feedback": "Feedback",
 	"requestDumpEnabledBadge": "Dump on",

@@ -228,21 +228,25 @@ function renderCard(measured: MeasuredSidecar): { container: Element; unmount: (
 	};
 }
 
-function measureBody(fullText: string, expanded: boolean): MeasuredSidecar {
+function measureBody(lineTexts: string[], expanded: boolean): MeasuredSidecar {
 	const data: SidecarSpecData = {
 		payloadKind: SIDECAR_PAYLOAD_KIND,
 		source: "bg_agent",
 		sourceLabel: "Background agent",
-		color: "blue",
-		target: "user_message",
-		previewText: "preview",
-		fullText,
+		tone: "background",
+		// `folded` so the collapsed case really draws no body — the `open` shape would
+		// draw a capped one, which is a different assertion (see measure-sidecar.test).
+		form: "folded",
+		headline: "preview",
+		lines: lineTexts.map((text) => ({ kind: "text" as const, text })),
+		fullText: lineTexts.join("\n"),
+		isRaw: false,
 		truncatedLabel: TRUNCATED,
 	};
 	return VLIST_REGISTRY.sidecar.measure(data, WIDTH, 5, { expanded }) as MeasuredSidecar;
 }
 
-const OVER_CAP = Array.from({ length: 500 }, (_, i) => `line ${i}`).join("\n");
+const OVER_CAP = Array.from({ length: 500 }, (_, i) => `line ${i}`);
 
 describe("RenderSidecar — the reader learns the body was clipped", () => {
 	it("paints the adapter's notice when the line cap hit", () => {
@@ -252,7 +256,7 @@ describe("RenderSidecar — the reader learns the body was clipped", () => {
 	});
 
 	it("paints nothing extra when the body fits", () => {
-		const card = renderCard(measureBody("one\ntwo\nthree", true));
+		const card = renderCard(measureBody(["one", "two", "three"], true));
 		expect(card.container.textContent).not.toContain(TRUNCATED);
 		card.unmount();
 	});
@@ -267,7 +271,7 @@ describe("RenderSidecar — the reader learns the body was clipped", () => {
 		// The notice tells the reader to copy; that has to actually yield everything
 		// the payload holds.
 		const measured = measureBody(OVER_CAP, true);
-		expect(measured.payload.fullText).toBe(OVER_CAP);
-		expect(measured.bodyTruncated).toBe(true);
+		expect(measured.payload.fullText).toBe(OVER_CAP.join("\n"));
+		expect(measured.extraRow).toBe("truncated");
 	});
 });

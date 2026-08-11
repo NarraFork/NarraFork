@@ -39,8 +39,14 @@ export interface SubmissionAuthorActionsProps {
 	size?: "compact-xs" | "xs";
 }
 
-/** Statuses the author may withdraw / re-submit — mirrors the service-side guards. */
-const WITHDRAWABLE: KnowledgeSubmissionStatus[] = ["pending", "conflict"];
+/**
+ * Statuses the author may withdraw — mirrors WITHDRAWABLE_STATUSES in knowledge-branch-service.
+ *
+ * `changes_requested` is included so "I'm dropping this" is expressible: re-submitting used to
+ * be its only transition, which left an author who decided against the requested changes with
+ * no way to close the request.
+ */
+const WITHDRAWABLE: KnowledgeSubmissionStatus[] = ["pending", "conflict", "changes_requested"];
 
 export function SubmissionAuthorActions({
 	submissionId,

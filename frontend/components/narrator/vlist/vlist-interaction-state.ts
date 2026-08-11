@@ -10,7 +10,7 @@ export interface VListInteractionState {
 	/**
 	 * INDEX-addressed per-row state, for lists whose row ORDINALS are stable:
 	 * the subagent-recovery card's checkboxes (where the set means "deselected"),
-	 * a `reasoning-steps` element's step rows, and a `sidecar-trace`'s single row.
+	 * and a `reasoning-steps` element's step rows.
 	 *
 	 * ⚠️ NOT for the two traces that fold a live row list. See `expandedTraceRows`
 	 * and `traceRowFoldChannel`.
@@ -212,7 +212,7 @@ export function toggleVListRow(
  * existing one mid-stream: they fold reasoning rows and tool rows into one list,
  * and a live reasoning run grows by a row per step. Every other trace appends
  * only — a `reasoning-steps` element numbers step N as row N however many steps
- * follow, and a `sidecar-trace` has exactly one row — so their ordinals are
+ * follow — so its ordinals are
  * already stable and they stay on the index channel their adapter reads.
  */
 const KEY_ADDRESSED_TRACE_KINDS = new Set(["activity-trace", "tool-run-summary"]);

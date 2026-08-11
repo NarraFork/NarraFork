@@ -36,13 +36,10 @@ export interface GraphEdge {
 	};
 }
 
-export interface ExplorationGroup {
-	id: string;
-	title: string;
-	status: string;
-	chapterIds: string[];
-	[key: string]: unknown;
-}
+// `ExplorationGroup` used to be exported here and populated from the graph response on
+// every fetch, but no component ever rendered it, and its `chapterIds` field was never
+// sent by the server — anyone writing UI against it would have read `undefined`. The
+// graph endpoint no longer returns the rows at all.
 
 function applyDagreLayout(nodes: GraphNode[], edges: GraphEdge[]): GraphNode[] {
 	const manualNodes: GraphNode[] = [];
@@ -166,9 +163,17 @@ export interface OpenedTerminal {
 
 const NARRA_FLOW_GC_TIME_MS = 60_000;
 
+/**
+ * `degraded` and `fallbackMessages` come from fields the graph route really sends
+ * (`degraded`, `fallbacks`) and drive the banner in `NarraFlow`.
+ *
+ * There used to be a third field, `graphReadRefresh`, read from
+ * `graph.capabilities.commitSync.graphReadRefresh`. The graph route sends no `capabilities`
+ * object at all, so it was always false, and no component consumed it either — a small
+ * replica of the health-capabilities layer removed from `usePlatform.ts`.
+ */
 export interface GraphRuntimeStatus {
 	degraded: boolean;
-	graphReadRefresh: boolean;
 	fallbackMessages: string[];
 }
 
@@ -196,10 +201,8 @@ function formatGraphFallbackMessage(fallback: ProjectGraphFallback): string {
 export function summarizeGraphRuntimeState(graph?: ProjectGraphResponse): GraphRuntimeStatus {
 	const fallbacks = Array.isArray(graph?.fallbacks) ? graph.fallbacks : [];
 	const fallbackMessages = fallbacks.map((fallback) => formatGraphFallbackMessage(fallback));
-	const graphReadRefresh = graph?.capabilities?.commitSync?.graphReadRefresh === true;
 	return {
 		degraded: graph?.degraded === true || fallbackMessages.length > 0,
-		graphReadRefresh,
 		fallbackMessages,
 	};
 }
@@ -218,7 +221,6 @@ export function useNarraFlow(projectId: string) {
 			return {
 				nodes: [] as GraphNode[],
 				edges: [] as GraphEdge[],
-				explorationGroups: [] as ExplorationGroup[],
 				openedTerminals: [] as OpenedTerminal[],
 			};
 		// Map server position format (anchorCommitSha/axisOffset/crossOffset) to React Flow x/y.
@@ -240,7 +242,6 @@ export function useNarraFlow(projectId: string) {
 		return {
 			nodes: layoutNodes,
 			edges: data.edges as GraphEdge[],
-			explorationGroups: (data.explorationGroups ?? []) as ExplorationGroup[],
 			openedTerminals: (data.openedTerminals ?? []) as OpenedTerminal[],
 		};
 	}, [data]);

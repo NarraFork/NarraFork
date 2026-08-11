@@ -8,7 +8,6 @@ export type VListElementKind =
 	| "system-simple"
 	| "system-text"
 	| "sidecar"
-	| "sidecar-trace"
 	| "knowledge-hint"
 	| "plan-card"
 	| "ask-in-passing"

@@ -2,15 +2,11 @@ import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
 import {
 	createTerminalSchema,
-	createTerminalTabSchema,
-	reorderTerminalTabsSchema,
 	updateTerminalGraphStateSchema,
-	updateTerminalTabSchema,
 	updateTerminalViewStateSchema,
 } from "../lib/validators";
 import { requireAuth } from "../middleware/auth";
 import { terminalService } from "../services/terminal-service";
-import { terminalTabService } from "../services/terminal-tab-service";
 import { terminalViewService } from "../services/terminal-view-service";
 
 export const terminalRoutes = new Hono();
@@ -44,49 +40,18 @@ terminalRoutes.post("/", async (c) => {
 	return c.json(terminal, 201);
 });
 
-// === Terminal Tabs ===
-
-terminalRoutes.get("/tabs", async (c) => {
-	const chapterId = c.req.query("chapterId");
-	const narratorId = c.req.query("narratorId");
-	if (!chapterId && !narratorId) {
-		throw new ValidationError("chapterId or narratorId query parameter is required");
-	}
-	const tabs = await terminalTabService.list({
-		chapterId: chapterId ?? undefined,
-		narratorId: narratorId ?? undefined,
-	});
-	return c.json(tabs);
-});
-
-terminalRoutes.post("/tabs", async (c) => {
-	const body = await c.req.json();
-	const parsed = createTerminalTabSchema.safeParse(body);
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const tab = await terminalTabService.create(parsed.data);
-	return c.json(tab, 201);
-});
-
-terminalRoutes.patch("/tabs/:id", async (c) => {
-	const body = await c.req.json();
-	const parsed = updateTerminalTabSchema.safeParse(body);
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const tab = await terminalTabService.update(c.req.param("id"), parsed.data);
-	return c.json(tab);
-});
-
-terminalRoutes.delete("/tabs/:id", async (c) => {
-	await terminalTabService.delete(c.req.param("id"));
-	return c.json({ ok: true });
-});
-
-terminalRoutes.put("/tabs/reorder", async (c) => {
-	const body = await c.req.json();
-	const parsed = reorderTerminalTabsSchema.safeParse(body);
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	await terminalTabService.reorder(parsed.data.ids);
-	return c.json({ ok: true });
-});
+/**
+ * === Terminal Tabs: removed ===
+ *
+ * `/tabs` had a full CRUD surface (GET/POST/PATCH/DELETE plus `PUT /tabs/reorder`) backed
+ * by a `terminal_tabs` table and `terminal-tab-service`. Nothing ever called it: all five
+ * frontend clients had zero call sites, and the hook and component built on them had zero
+ * importers.
+ *
+ * The live terminal UI (`NarratorTerminal.tsx`) derives its tabs from the *running
+ * terminals* and persists only their order, so a separate tab entity was never needed.
+ * `terminal_view_state` below is unrelated and very much in use.
+ */
 
 // === Terminal View State ===
 

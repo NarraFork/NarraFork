@@ -34,6 +34,8 @@
 	"collapseSidebar": "折叠侧栏",
 	"expandSidebar": "展开侧栏",
 	"revealInExplorer": "在资源管理器中打开",
+	"newNarratorHere": "在此目录新建叙述者",
+	"newNarratorHereNoDir": "无法确定该标签对应的目录",
 	"totalOutputChars": "AI 输出总字符数",
 	"feedback": "反馈问题",
 	"requestDumpEnabledBadge": "Dump 已开启",

@@ -132,25 +132,52 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 | tool_loaded/unloaded | Paper p=xs + 单行文本 pre-wrap🔴 | ≈37 |
 | bash_command | Paper p=xs + 命令 monospace pre-wrap🔴 | ≈37 |
 
-### sidecar 迷你卡（系统注入，`measure-sidecar` / `RenderSidecar`）
+### sidecar 尾注（系统注入，`measure-sidecar` / `RenderSidecar`）
 
-**每条注入一张卡**，不是 chunked 那个聚合的 `SideCarNotice`（后者是"×N"一行展开成列表）。这是刻意的重设计：一次 turn 可能同时注入进度提醒、后台任务完成、群聊投递、spec 更新几类互不相关的内容，聚合成一条会让读者只能整组展开、无法只留下自己关心的那一条。代价是每条各有自己的折叠状态，因此高度模型必须能表达"同一行内第 k 张卡展开"。
+**每条注入一条尾注**（footnote）：无 Paper、无边框、无底色、无 accent rail，header 行高就是 `@shared/pretext-layout/row-metrics` 的裸行高（与折叠 trace 行同一个 18.8px），正文缩进挂在它下面。这是刻意的重设计——旧形态是彩色 Paper + 2px 彩色左轨，即**全列表最重的皮肤裹着最不重要的内容**，而且 `SIDECAR_SOURCE_META` 有六种色相，一屏能同时出现四五种。
 
-| 形态 | 结构 | 高度 |
-|------|------|------|
-| 折叠 | Paper p=xs + 单行 header（accent rail 2 + info icon 14 + 来源 badge + target badge + 预览 lineClamp=1 + chevron + copy）🟢 | **恒定 37px**（`SIDECAR_COLLAPSED_HEIGHT`）|
-| 展开 | 同一 header + `HEADER_BODY_GAP` 6 + 正文 pre-wrap🔴（`SIDECAR_DETAIL_MAX_LINES`=40 封顶）+ 截断时 `NOTICE_GAP` 4 + 提示行 17 | 37 + 6 + 行数×17 [+ 4 + 17] |
+不聚合成一条（chunked 旧版是"×N"一行展开成列表）：一次 turn 可能同时注入进度提醒、后台任务完成、他人消息、spec 更新几类互不相关的内容，聚合会让读者只能整组展开。代价是每条各有自己的折叠状态，因此高度模型必须能表达"同一行内第 k 条展开"。
 
-- **折叠态高度与内容完全无关**：预览是 `lineClamp={1}`，所以它的长度不进高度（§3 的 truncate 规则）。这是为什么无论注入多大，折叠态都能不测量。
-- **正文走 `PreparedCodeBlock`**（同 `measure-system-text`）：渲染层用 measure 换行过的同一个 prepared + 同一个 `FONT_XS` 逐行还原，零漂移、零 DOM。高度**不读 `lod`** —— sidecar 从不因 LOD 折叠消失，它是"模型看到过什么"的证据，低 LOD 下把它藏掉会让读者以为没发生。
-- **两个上限，两种性质**：adapter 侧 `SIDECAR_DETAIL_MAX_CHARS`=120_000 截字符并把 `sidecarTruncated` 标签**追加进文本**（于是被当作普通正文行测量）；measure 侧 `SIDECAR_DETAIL_MAX_LINES`=40 截行数，用于给病态记录一个有界的测量成本和可预测的最大卡高。
-- **行数被截断必须给提示，且提示行的高度由 measure 保留**（`SIDECAR_TRUNCATION_NOTICE_HEIGHT` / `_GAP`）。正文盒是固定高 `overflow:hidden`、没有滚动条，所以渲染层自作主张多画一行只有两个结果：被裁掉，或把一行正文顶出盒子——两者都违反 §0 铁律 2。文案跟其它 adapter 字符串一样走 `ctx.labels` 注入（`sidecarTruncated`），渲染层只画 measure 交给它的 `noticeText`；没有 label 时 measure 不保留、渲染层不画，保证"保留的高度"和"画出来的行"永远一致。
-- **工具卡内的 sidecar 带（`measure-tool-call` 的 `sidecars` / `sidecarsTop`）在折叠态也算高度**：chunked 的 notice 画在 collapse 之外，所以一张带注入的折叠工具卡就是比不带的高一个 `SIDECAR_COLLAPSED_HEIGHT`。这些迷你卡的折叠态**不能**用工具卡自己的 `expanded` 表达（它们各自独立），所以按 index 存进 `opts.sidecarExpanded: number[]`，由 `digestOpts` 进缓存键。空数组时**省略该字段**，让没有 sidecar 的卡片缓存键与本功能之前 byte-identical —— 这是刻意保证的性质，有测试守着。
-- **折叠状态的 key 是 `${key}-sc${index}`**，adapter（`buildSidecarSpecs`）和工具卡（`opts.sidecarExpanded` 的探测）共用这一套编号。独立 sidecar 元件把这个后缀写在**自己的 spec.key** 里、走普通 `expanded` 通道；工具卡的迷你卡则是**子 key**，不是顶层布局项，所以 `measuredByKeyRef` 里永远没有它们。
-  - ⚠️ 由此得到一条易错点（已发生过）：shell 的折叠开关靠"从 measured 读当前是否已展开"再取反，而这两条路径都答不上来 —— 子 key 没有 measured 条目，`MeasuredSidecar` 又只有 `expanded`（没有 `form` / `effectiveOpened` / `effectiveExpanded`）。结果两条路径的每次点击都写 `expanded = true`：卡片能展开、永远关不掉。所以 `resolveRowOpenState` 显式列出每种 kind 的字段，并在**没有 measured 条目时回落到交互状态**（对子 key 而言状态就是权威，除了这个开关没人写它）。
-  - ⚠️ 同理，行签名（`rowInteractionSig`）必须按该行**实际的迷你卡数量**迭代 `-sc{i}`，不能"遇到缺失就 break"：读者完全可以只展开第 2 张，那时 `-sc0` 不存在，break 版本在 index 0 就停、`-sc1` 永远不进签名。这属于 §4.5 反复说的那类"靠别处兜底所以看不出来"的坏签名（这里恰好被 memo 的 `item.measured` 比较兜住）。
-- **`payloadKind` 是显式判别标记**：measure cache 必须区分"独立 sidecar 元件的 data"和"工具卡的 `sidecars` 数组"，两者的 revision 分支不同。用字段形状嗅探（有 `fullText` 且有 `source`）只是猜测，任何将来带这两个字段名的 payload 都会误入前一分支、拿到描述别的东西的 revision —— 也就是命中错误高度的缓存条目。
-- **交互**：header 整行是折叠热区，并且是**可键盘操作的**（`role="button"` + `tabIndex` + Enter/Space + `aria-expanded`），全部是属性和 handler，不动已测量的几何。内部的 copy 按钮是真 `<button>`，鼠标路径靠外层 `stopPropagation` 隔离、键盘路径靠 `event.target !== currentTarget` 提前返回 —— 否则一次 Enter 会同时复制并折叠。
+**数据来自源头结构化，不是解析出来的。** 服务端在注入点同时产出 `content`（模型向文本，冻结快照）和 `body`（`SideCarBody`，结构化真相），见 `@shared/sidecar-body`。UI 走 `presentSideCarBody` 投影出行结构，因此读者看到的是"3 条开放任务 + 任务列表"，而不是 `<progress_update_request>` 外壳、`[System]` 前缀和 `不要添加 ID、时间戳` 这类模型向 boilerplate。**没有 `body` 的历史行走 `presentRawSideCar` 原样显示**（`isRaw: true`），刻意不做任何剥离——猜测生产者丢弃的结构是这套设计移除的复杂度。
+
+#### 两种形态由 tone 派生（`form`，不是折叠默认值）
+
+| tone | source | 色 | form |
+|------|--------|-----|------|
+| `peer` | `team_message` `group_message` `subagent_message` `buffered_user` | grape | `open` |
+| `background` | `bg_agent` `bg_bash` | blue | `open` |
+| `neutral` | `silent_progress` `living_work_spec` `todo_reminder` `relaxed_plan` `knowledge_base_hint` `spec_update` `behavior_fence` `pipeline_exit_confirmation` | dimmed | `folded` |
+
+未知 source → neutral / folded。`behavior_fence` 与 `pipeline_exit_confirmation` 是新补的：服务端一直在推，但两张 SOURCE_META 表都没有条目，此前显示裸 snake_case 标签。
+
+⚠️ **`open` 是 measure 画出来的形状，不是 `expanded` 默认 true。** 折叠状态默认恒为 `false`；`open` 只表示"不用点就画正文（受 `SIDECAR_INLINE_MAX_LINES`=10 封顶）"，`expanded` 表示"越过那个上限"。若把默认改成 true，工具卡内的尾注会立刻坏掉：它们的折叠态存在子 key `-sc{i}`、没有 measured 条目，`resolveRowOpenState` 回落交互状态（默认 false），于是第一次点击算出 `current=false` 再写 `true` —— 点了没反应。
+
+#### 四种几何（`form` × `expanded`）
+
+| form | expanded | 结构 | 高度 |
+|------|----------|------|------|
+| folded | false | 仅 header 行（headline `lineClamp=1`）🟢 | **恒定 `SIDECAR_HEADER_ROW`**（= 裸行高 18.8）|
+| folded | true | header + 全部正文行🔴 | 行高 + `HEADER_BODY_GAP` 4 + Σ行 |
+| open | false | header + 正文行（截到 10 行）+ 越限时"展开全部"行 | 行高 + 4 + Σ截断行 [+ `EXTRA_ROW_GAP` 4 + 17] |
+| open | true | header + 全部正文行（仍受 40 行硬顶）| 行高 + 4 + Σ行 [+ 4 + 17] |
+
+- **folded 折叠态高度与内容完全无关**：headline 是 `lineClamp={1}`，长度不进高度（§3 truncate 规则）。这是为什么高频的 neutral 注入（进度提醒、Dynamic Spec 提醒每几次工具调用就来一条）折叠态完全不测量。
+- **每行独立 `prepareWithSegments`**：`bullet` 行要扣 `SIDECAR_BULLET_LANE`=12 给标记，所以它的换行宽度比 `text` 行**更窄**。一个整体 code block 只能按单一宽度测量，混合正文必然误判——这是 `blocks` 变成 `[header fixed, ...N 个 code block]`、每块自带 `contentLeft` 的原因。渲染层用同一批 prepared + 同一个 `FONT_XS` 逐行还原，零漂移、零 DOM。
+- 高度**不读 `lod`**，且**所有 LOD 同一形态**。此前 `lod < 4` 走 `sidecar-trace`（裸 trace）、`≥ 4` 走 Paper 卡，一个概念两套 measure、两套 render 分支、两个折叠通道（index vs key）——那正是 `traceRowFoldChannel` 存在的原因，也是"行点了没反应"一类 bug 的土壤。尾注形态在每个层级都足够轻，该区分没有收益，`sidecar-trace` 已整条删除。
+- **两个行上限，两种性质**（注释里写清，别被后人合并）：`SIDECAR_INLINE_MAX_LINES`=10 是 `open` 的**默认可见量**，读者点"展开全部"可越过；`SIDECAR_DETAIL_MAX_LINES`=40 是**病态记录的测量成本硬顶**，越不过，全文只能靠 copy。单行本身过长时也按剩余预算 clamp，一条巨型 bullet 不能突破硬顶。
+- **被截断必须给行，且高度由 measure 保留**（`SIDECAR_EXTRA_ROW_HEIGHT` / `_GAP`）。正文盒是固定高 `overflow:hidden`、无滚动条，渲染层自作主张多画一行只有两个结果：被裁掉，或把一行正文顶出盒子——都违反 §0 铁律 2。`extraRow` 显式区分 `showAll`（open 撞到内联上限，行本身是开关）与 `truncated`（撞到硬顶，只能指向 copy）；文案走 `ctx.labels`，**没有 label 时 measure 不保留、渲染层不画**，保证"保留的高度"和"画出来的行"永远一致。
+- **copy 给的是 `fullText`（模型看到的原文）**，不是这份投影：读者复制 sidecar 是为了粘到别处当上下文读。
+
+#### 工具卡内的 sidecar 带
+
+- **位置在 detail 之后、permission/reflection 之前**（`sidecarsTop = HEADER_ROW_HEIGHT + detail.height`）。注入在模型读到的文本里就是**追加在 tool_result 输出末尾**的（`appendSideCarsForApi`），画在输出上方是反的；permission 是"要你决策"的东西，必须留在最后最显眼处。
+- **折叠工具卡不再计入 sidecar 高度**，`sidecars` 为 null。⚠️ 这条**推翻了旧契约**（旧文写"折叠态也算高度，比不带的高一个 `SIDECAR_COLLAPSED_HEIGHT`"，并有断言守着）：那是照抄 chunked 把 notice 画在 collapse 之外的实现细节，而折叠卡根本没显示输出，尾注没有可附着的对象。折叠态改用 header 行里的 `+N` 标记（读 `sidecarCount`，落在已有固定行内 → height-neutral）表达"有注入"这件事，两条路径同步改，不产生新分裂。
+- 带内每条尾注的折叠态**不能**用工具卡自己的 `expanded` 表达（各自独立），所以按 index 存进 `opts.sidecarExpanded: number[]`，由 `digestOpts` 进缓存键。空数组时**省略该字段**，让没有 sidecar 的卡片缓存键与本功能之前 byte-identical —— 刻意保证的性质，有测试守着。
+- **折叠状态的 key 是 `${key}-sc${index}`**，adapter（`buildSidecarSpecs`）和工具卡（`opts.sidecarExpanded` 的探测）共用这一套编号。独立尾注把这个后缀写在**自己的 spec.key** 里、走普通 `expanded` 通道；工具卡带内的尾注是**子 key**，不是顶层布局项，所以 `measuredByKeyRef` 里永远没有它们。
+  - ⚠️ 由此得到一条易错点（已发生过）：shell 的折叠开关靠"从 measured 读当前是否已展开"再取反，而这两条路径都答不上来 —— 子 key 没有 measured 条目，`MeasuredSidecar` 又只有 `expanded`（没有 `form` / `effectiveOpened` / `effectiveExpanded`）。结果每次点击都写 `expanded = true`：能展开、永远关不掉。所以 `resolveRowOpenState` 显式列出每种 kind 的字段，并在**没有 measured 条目时回落到交互状态**（对子 key 而言状态就是权威，除了这个开关没人写它）。
+  - ⚠️ 同理，行签名（`rowInteractionSig`）必须按该行**实际的尾注数量**迭代 `-sc{i}`，不能"遇到缺失就 break"：读者完全可以只展开第 2 条，那时 `-sc0` 不存在，break 版本在 index 0 就停、`-sc1` 永远不进签名。这属于 §4.5 反复说的那类"靠别处兜底所以看不出来"的坏签名（这里恰好被 memo 的 `item.measured` 比较兜住）。
+- **`payloadKind` 是显式判别标记**：measure cache 必须区分"独立尾注的 data"和"工具卡的 `sidecars` 数组"，两者的 revision 分支不同。用字段形状嗅探（有 `fullText` 且有 `source`）只是猜测，任何将来带这两个字段名的 payload 都会误入前一分支、拿到描述别的东西的 revision —— 也就是命中错误高度的缓存条目。
+- **交互**：header 整行是折叠热区，并且是**可键盘操作的**（`role="button"` + `tabIndex` + Enter/Space + `aria-expanded`），全部是属性和 handler，不动已测量的几何。`open` 且未越限时**没有折叠可做，因此不声明 `role`/`tabIndex`**——不给读者一个点了没反应的死控件。内部 copy 按钮是真 `<button>`，鼠标路径靠外层 `stopPropagation` 隔离、键盘路径靠 `event.target !== currentTarget` 提前返回 —— 否则一次 Enter 会同时复制并折叠。bullet 标记必须 `aria-hidden` + `userSelect: "none"`：选区复制（`vlist-copy-text`）走全子树遍历，否则装饰符会被粘进剪贴板。
 
 > 注：`bash_command` / `tool_loaded` / `tool_unloaded` 三种块**由 role=user 的消息承载**（服务端为了让模型看到它们而存成 user 角色），但视觉上是 system 卡。adapter 的 user 分支必须先检测它们并路由到 system 卡，否则会画出一个只有头部的空气泡。
 
@@ -207,7 +234,9 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 
    派生字段尤其危险：patch 写的字段名和 measure 读的字段名往往不是同一个（`_subagentActivity` → `recentCallCount`），所以审计要顺着 **patch → adapter → measure** 整条链走，不能只看 patch 写了什么。
 
-   `appendMessageSidecars` 是这条链最长的一例，也正是本节警告的形态：它只往最新 assistant 消息的 `sideCars` 追加记录（`sidecars` WS 事件带来的 turn 间注入 —— 后台任务完成、群聊投递、spec 更新），既不新增消息也不动 `messageVersion`；但 adapter 会由这个字段**派生出全新的 sidecar 元件**（§4 的迷你卡），每一张都自带高度。`toolCompletedPatch` 写 `tc.sideCars` 是同一条链的工具卡版本，而且更隐蔽：一次已是终态的重放或同状态重投递会让 `status` 完全不动，sidecar 就是唯一的增量。两者都由 `sidecarRevision` 覆盖（独立元件按自身文本、工具卡按每条注入的文本），并且**靠 `payloadKind` 标记而不是字段形状**来选分支 —— 形状嗅探会让将来任何带 `fullText`+`source` 的 payload 误入独立元件分支、拿到错误的 revision，也就是错误的高度。
+   `appendMessageSidecars` 是这条链最长的一例，也正是本节警告的形态：它只往最新 assistant 消息的 `sideCars` 追加记录（`sidecars` WS 事件带来的 turn 间注入 —— 后台任务完成、他人消息、spec 更新），既不新增消息也不动 `messageVersion`；但 adapter 会由这个字段**派生出全新的 sidecar 元件**（§4 的尾注），每一条都自带高度。`toolCompletedPatch` 写 `tc.sideCars` 是同一条链的工具卡版本，而且更隐蔽：一次已是终态的重放或同状态重投递会让 `status` 完全不动，sidecar 就是唯一的增量。两者都由 `sidecarRevision` 覆盖，并且**靠 `payloadKind` 标记而不是字段形状**来选分支 —— 形状嗅探会让将来任何带 `fullText`+`source` 的 payload 误入独立元件分支、拿到错误的 revision，也就是错误的高度。
+
+   ⚠️ `sidecarRevision` 的签名口径是**源文本**（`content`）而不是投影出的 `lines`：结构化行是源文本的纯函数（同一个 `body` 必然产出同一批行），所以源文本签名已经覆盖它，而按 lines 遍历会让成本随内容规模增长 —— 本节开头那条 O(1) 要求不允许。
 
    revision 在**每次 measure 时都会调用**，所以必须保持 O(1)：只读基元字段，文本走 `textSignature`（长度 + 定量采样哈希），禁止 `JSON.stringify` 整个 payload、禁止随内容规模增长的遍历。
 

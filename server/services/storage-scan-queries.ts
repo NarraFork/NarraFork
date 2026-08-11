@@ -201,7 +201,6 @@ export function getDatabaseStorageCategory(tableName: string): DatabaseStorageCa
 	if (
 		[
 			"terminals",
-			"terminal_tabs",
 			"terminal_view_state",
 			"container_instances",
 			"port_allocations",

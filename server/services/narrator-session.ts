@@ -88,6 +88,7 @@ import {
 	usesCodexModel,
 	usesStatefulModel,
 } from "../lib/settings";
+import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import type { ImageRef, TextFileRef } from "../lib/uploads";
 import {
 	copyTextFileToWorktree,
@@ -167,9 +168,9 @@ import {
 } from "./parent-inbound-queue";
 import { reviewService } from "./review-service";
 import { broadcastSpecChanged } from "./spec-broadcast";
-import { buildBehaviorFenceReminder, buildSpecToolResultReminder } from "./spec-reminder";
+import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder";
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
-import { drainSpecUpdatesForNarrator, formatSpecUpdateSideCars } from "./spec-update-queue";
+import { drainSpecUpdatesForNarrator } from "./spec-update-queue";
 import { specVfsService } from "./spec-vfs-service";
 import {
 	deleteConclusionFileId,
@@ -2705,30 +2706,28 @@ export async function runAgentLoop(
 						// open tasks (reminder === null) the cadence would stay "due" and re-read
 						// the spec file from SQLite on every subsequent tool result.
 						if (atTasksCadence) active._lastTasksReminderCompletedToolCount = count;
-						const tasksReminder = atTasksCadence
-							? await buildSpecToolResultReminder(narratorId, locale)
-							: null;
-						if (tasksReminder) {
+						const tasksBody = atTasksCadence ? await buildSpecTaskDigestBody(narratorId) : null;
+						if (tasksBody) {
 							sideCars.push({
 								target: "tool_result",
 								source: "living_work_spec",
-								content: tasksReminder,
+								...sideCarBodyWithText("living_work_spec", tasksBody, locale),
 								toolUseId: request.toolUseId,
 							});
 						}
 						// Inject the behavior fence when its own cadence hits, or when it is
 						// attached to a tasks reminder that is being injected this cycle.
-						const wantFence = atFenceCadence || (!!active._fenceAttach && !!tasksReminder);
+						const wantFence = atFenceCadence || (!!active._fenceAttach && !!tasksBody);
 						if (wantFence) {
 							// Same rationale as tasks: advance on cadence hit even if the fence is
 							// empty, so an empty fence does not re-read the spec file every tool call.
 							if (atFenceCadence) active._lastFenceCompletedToolCount = count;
-							const fenceReminder = await buildBehaviorFenceReminder(narratorId, locale);
-							if (fenceReminder) {
+							const fenceBody = await buildBehaviorFenceBody(narratorId);
+							if (fenceBody) {
 								sideCars.push({
 									target: "tool_result",
 									source: "behavior_fence",
-									content: fenceReminder,
+									...sideCarBodyWithText("behavior_fence", fenceBody, locale),
 									orderIndex: 16,
 									toolUseId: request.toolUseId,
 								});
@@ -2745,22 +2744,47 @@ export async function runAgentLoop(
 						sideCars.push({
 							target: "user_message",
 							source: "bg_agent",
-							content: formatBackgroundCompletionNotifications(subDone),
+							...sideCarBodyWithText(
+								"bg_agent",
+								{
+									kind: "tasksDone",
+									flavor: "agent",
+									items: subDone.map((task) => ({
+										id: task.id,
+										title: task.title,
+										status: task.status,
+										// The sidecar carries the PREVIEW, matching what
+										// formatBackgroundCompletionNotifications emits without
+										// `includeResult` — the full result is fetched with Await.
+										preview: task.resultPreview ?? "",
+									})),
+								},
+								locale,
+							),
 						});
 					}
 
 					// Drain completed background bash tasks
 					const bashDone = backgroundTaskService.drainBashNotificationsSync(narratorId);
 					if (bashDone.length > 0) {
-						const lines = bashDone.map(
-							(t) =>
-								`[System] Background bash "${t.title || t.id}" (ID: ${t.alias ?? t.id}) ${t.status}.` +
-								`\nResult preview: ${t.outputPreview || "(empty)"}`,
-						);
 						sideCars.push({
 							target: "user_message",
 							source: "bg_bash",
-							content: lines.join("\n\n"),
+							...sideCarBodyWithText(
+								"bg_bash",
+								{
+									kind: "tasksDone",
+									flavor: "bash",
+									items: bashDone.map((t) => ({
+										id: t.id,
+										alias: t.alias ?? null,
+										title: t.title || t.id,
+										status: t.status,
+										preview: t.outputPreview ?? "",
+									})),
+								},
+								locale,
+							),
 						});
 					}
 
@@ -2770,7 +2794,19 @@ export async function runAgentLoop(
 						sideCars.push({
 							target: "user_message",
 							source: "subagent_message",
-							content: formatParentInboundMessages(parentInbound, locale),
+							...sideCarBodyWithText(
+								"subagent_message",
+								{
+									kind: "messages",
+									items: parentInbound.map((message) => ({
+										fromId: message.fromId,
+										fromTitle: message.fromTitle ?? null,
+										fromType: message.fromType ?? null,
+										text: message.text,
+									})),
+								},
+								locale,
+							),
 						});
 					}
 
@@ -2780,7 +2816,20 @@ export async function runAgentLoop(
 						sideCars.push({
 							target: "user_message",
 							source: "spec_update",
-							content: formatSpecUpdateSideCars(specUpdates, locale),
+							...sideCarBodyWithText(
+								"spec_update",
+								{
+									kind: "specUpdates",
+									items: specUpdates.map((update) => ({
+										uri: update.uri,
+										timestamp: update.timestamp,
+										updatedBy: update.updatedBy,
+										taskSummary: update.taskSummary,
+										preview: update.preview,
+									})),
+								},
+								locale,
+							),
 						});
 					}
 

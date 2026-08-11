@@ -30,6 +30,7 @@ import {
 	IconFileText,
 	IconFolder,
 	IconFolderOpen,
+	IconGitMerge,
 	IconGitPullRequest,
 	IconLock,
 	IconNotebook,
@@ -848,6 +849,21 @@ function MyLibraryTab() {
 												</Text>
 											</div>
 											<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
+												{/* Drift used to be visible only inside the entry's Draft tab, so a user
+												    had to open every entry to discover which copies had fallen behind.
+												    The list endpoint resolves it for the whole page in one query. */}
+												{p.drifted ? (
+													<Tooltip label={t("driftBadgeTooltip")} withArrow>
+														<Badge
+															size="xs"
+															variant="light"
+															color="orange"
+															leftSection={<IconGitMerge size={10} />}
+														>
+															{t("driftBadge")}
+														</Badge>
+													</Tooltip>
+												) : null}
 												{openStatus ? (
 													<Badge
 														size="xs"

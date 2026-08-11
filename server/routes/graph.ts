@@ -1,7 +1,7 @@
 import { and, eq, inArray, ne } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { chapterEdges, chapters, containerInstances, explorationGroups } from "../db/schema";
+import { chapterEdges, chapters, containerInstances } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
@@ -25,7 +25,6 @@ export interface GraphNode {
 		narratorStatus: string | null;
 		narratorSubstatus: string[] | null;
 		hasContainers: boolean;
-		hasUpstreamUpdates: boolean;
 		isRoot: boolean;
 		commitCount: number;
 		headCommitSha: string | null;
@@ -131,7 +130,6 @@ export function buildGraph(
 			narratorStatus: narratorStatuses.get(ch.id) ?? null,
 			narratorSubstatus: narratorSubstatuses.get(ch.id) ?? null,
 			hasContainers: containerPresence.has(ch.id),
-			hasUpstreamUpdates: false,
 			isRoot: !!ch.isRoot,
 			commitCount: ch.commitCount ?? 0,
 			headCommitSha: ch.headCommitSha ?? null,
@@ -276,7 +274,7 @@ graphRoutes.get("/:id/graph", async (c) => {
 
 	// Get graph metadata once chapter IDs are known.
 	const chapterIds = projectChapters.map((ch) => ch.id);
-	const [allNarrators, allContainers, edgeRows, groups, openedTerminals] = await Promise.all([
+	const [allNarrators, allContainers, edgeRows, openedTerminals] = await Promise.all([
 		chapterIds.length
 			? db.query.narrators.findMany({
 					where: (n, { inArray }) => inArray(n.chapterId, chapterIds),
@@ -297,7 +295,6 @@ graphRoutes.get("/:id/graph", async (c) => {
 					.all()
 			: Promise.resolve([]),
 		db.select().from(chapterEdges).where(eq(chapterEdges.projectId, projectId)).all(),
-		db.select().from(explorationGroups).where(eq(explorationGroups.projectId, projectId)).all(),
 		chapterIds.length
 			? db.query.terminals.findMany({
 					where: (t, { and, inArray, eq }) =>
@@ -347,10 +344,13 @@ graphRoutes.get("/:id/graph", async (c) => {
 		edgeRows,
 	);
 
+	// No `explorationGroups` here: the rows were queried on every graph request and
+	// returned, but nothing rendered them, and the frontend type even declared a
+	// `chapterIds` field this endpoint never sent. The table and its validators stay for
+	// the schema; reviving the feature means adding the query back next to a real reader.
 	return c.json({
 		nodes,
 		edges,
-		explorationGroups: groups,
 		openedTerminals,
 		degraded: fallbacks.length > 0,
 		fallbacks,

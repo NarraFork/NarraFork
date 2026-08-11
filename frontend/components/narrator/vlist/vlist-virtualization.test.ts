@@ -3,6 +3,7 @@ import {
 	findVisibleRange,
 	itemIndexAtOffset,
 	layoutItems,
+	mergePinnedRowIndices,
 	resolvePinnedRowIndices,
 	spacerHeights,
 } from "./vlist-virtualization";
@@ -114,5 +115,27 @@ describe("resolvePinnedRowIndices", () => {
 		expect(resolvePinnedRowIndices(window, -1)).toEqual([]);
 		expect(resolvePinnedRowIndices(window, 1.5)).toEqual([]);
 		expect(resolvePinnedRowIndices(window, Number.NaN)).toEqual([]);
+	});
+});
+
+describe("mergePinnedRowIndices", () => {
+	it("returns nothing when no group pins anything", () => {
+		expect(mergePinnedRowIndices([], [])).toEqual([]);
+		expect(mergePinnedRowIndices()).toEqual([]);
+	});
+
+	it("passes a single group through", () => {
+		expect(mergePinnedRowIndices([2], [])).toEqual([2]);
+		expect(mergePinnedRowIndices([], [9])).toEqual([9]);
+	});
+
+	it("deduplicates an index pinned for two different reasons", () => {
+		// The reader can swipe the very row they are editing; rendering that index
+		// twice would mint two children with one React key.
+		expect(mergePinnedRowIndices([4], [4])).toEqual([4]);
+	});
+
+	it("keeps distinct indices from every group", () => {
+		expect(mergePinnedRowIndices([4], [11])).toEqual([4, 11]);
 	});
 });

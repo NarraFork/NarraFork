@@ -268,4 +268,107 @@ describe("KnowledgeEdit", () => {
 		);
 		expect(res.isError).toBe(true);
 	});
+
+	test("publish on a drifted base warns in the tool output", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `ToolDrift ${TAG}`,
+			content: "v1\n",
+		});
+		await knowledgeEditTool.execute(
+			{ action: "save", entryId: entry.id, content: "my edit\n" },
+			ctxFor(plainId),
+		);
+		await knowledgeService.addRevision(entry.id, { content: "v2\n" });
+
+		const res = await knowledgeEditTool.execute(
+			{ action: "publish", entryId: entry.id },
+			ctxFor(plainId),
+		);
+		// Submitted (not blocked), but the agent is told to consider rebasing rather than
+		// leaving the reviewer to discover the conflict at approve time.
+		expect(res.isError).toBeUndefined();
+		expect(res.output).toContain("Submitted");
+		expect(res.output).toContain("rebase");
+		expect((res.metadata as { drifted?: boolean }).drifted).toBe(true);
+	});
+});
+
+/**
+ * Author-side lifecycle closure on the TOOL surface.
+ *
+ * These actions existed in the service and over HTTP but had no tool binding, so an agent could
+ * publish and then never see or act on the outcome: KnowledgeReview's list_submissions is the
+ * REVIEWER view and deliberately hides your own requests.
+ */
+describe("KnowledgeEdit author-side submission actions", () => {
+	/** A standalone personal entry with an open pending publish request, owned by plainId. */
+	async function publishedEntry(label: string) {
+		const created = await knowledgeBranchService.createStandalone(
+			{ userId: plainId, role: "user" },
+			{ title: `${label} ${TAG}`, content: "body\n", targetCollectionId: collectionId },
+		);
+		const submission = await knowledgeBranchService.submitForReview(
+			{ userId: plainId, role: "user" },
+			created.id,
+			{},
+		);
+		return { personalEntryId: created.id, submissionId: submission?.id as string };
+	}
+
+	test("my_submissions lists own open requests with the next step, and needs no permission", async () => {
+		const { submissionId } = await publishedEntry("ToolMine");
+		// A read action must not prompt: if it did, this context would deny it.
+		const res = await knowledgeEditTool.execute(
+			{ action: "my_submissions" },
+			ctxFor(plainId, async () => ({ behavior: "deny", message: "should not be asked" })),
+		);
+		expect(res.isError).toBeUndefined();
+		expect(res.output).toContain(submissionId);
+		expect(res.output).toContain("awaiting review");
+	});
+
+	test("withdraw closes an own request and keeps the personal entry", async () => {
+		const { personalEntryId, submissionId } = await publishedEntry("ToolWithdraw");
+		const res = await knowledgeEditTool.execute(
+			{ action: "withdraw", submissionId, reason: "changed my mind" },
+			ctxFor(plainId),
+		);
+		expect(res.isError).toBeUndefined();
+		const mine = await knowledgeBranchService.getMine(
+			{ userId: plainId, role: "user" },
+			personalEntryId,
+		);
+		expect(mine.status).toBe("active");
+		// Gone from the author's open list.
+		const after = await knowledgeEditTool.execute({ action: "my_submissions" }, ctxFor(plainId));
+		expect(after.output).not.toContain(submissionId);
+	});
+
+	test("resubmit re-proposes a bounced request from the entry's current content", async () => {
+		const { personalEntryId, submissionId } = await publishedEntry("ToolResubmit");
+		await knowledgeBranchService.review({ userId: ownerId, role: "admin" }, submissionId, {
+			verdict: "request_changes",
+		});
+		// The author fixes the body first — resubmit reads the SAVED entry, not the old proposal.
+		await knowledgeEditTool.execute(
+			{ action: "save", personalEntryId, content: "fixed body\n" },
+			ctxFor(plainId),
+		);
+
+		const res = await knowledgeEditTool.execute(
+			{ action: "resubmit", submissionId, changeNote: "addressed the feedback" },
+			ctxFor(plainId),
+		);
+		expect(res.isError).toBeUndefined();
+		const newId = (res.metadata as { submissionId?: string }).submissionId;
+		expect(newId).toBeTruthy();
+		expect(newId).not.toBe(submissionId);
+	});
+
+	test("withdraw without a submissionId points at my_submissions instead of failing bare", async () => {
+		const res = await knowledgeEditTool.execute({ action: "withdraw" }, ctxFor(plainId));
+		expect(res.isError).toBe(true);
+		expect(res.output).toContain("my_submissions");
+	});
 });

@@ -554,6 +554,160 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		en: "/deny [reason] — Deny pending permission request",
 		"zh-CN": "/deny [理由] — 拒绝待处理的权限请求",
 	},
+
+	// --- sidecar.* (model-facing templates for structured side-car bodies) ---
+	//
+	// `renderSideCarBodyToText` (@shared/sidecar-body) assembles a side-car's
+	// model-facing text from these. They live here, with the rest of the prompt copy,
+	// because they ARE prompt copy — the shared module owns only the assembly order.
+	//
+	// ⚠️ Every string below reproduces what its predecessor formatter emitted, byte
+	// for byte: this text goes into the model's context, and the migration to
+	// structured bodies must not change a single character of it.
+	// `shared/__tests__/sidecar-body.test.ts` pins that against the originals.
+
+	// notice — fixed reminders, one per source (was: getToolMessage in loop.ts).
+	// These intentionally duplicate `tool.*` keys rather than aliasing them: the
+	// `tool.*` entries have other callers, and a shared prompt string that two
+	// features edit for different reasons is how one feature's tweak silently
+	// changes another's behaviour.
+	"sidecar.noticeSilentProgress": {
+		en: `<progress_update_request>
+You have completed {count} tool call(s) since your last visible text reply. Before calling any more tools, briefly tell the user in one sentence what you are working on right now, then continue.
+</progress_update_request>`,
+		"zh-CN": `<progress_update_request>
+你已经连续 {count} 次工具调用没有向用户输出可见文本。继续调用更多工具前，请先用一句话简短告诉用户你当前正在做什么，然后继续。
+</progress_update_request>`,
+	},
+	"sidecar.noticeRelaxedPlan": {
+		en: `<relaxed_plan_reminder>
+You are still in relaxed plan mode. This non-read-only tool call was allowed only so planning can continue with full context. Do not start implementation work yet. Continue investigating or refining the plan, then call ExitPlanMode to submit the complete plan for approval.
+</relaxed_plan_reminder>`,
+		"zh-CN": `<relaxed_plan_reminder>
+你仍处于宽松计划模式。此次非只读工具调用只是为了让规划能带着完整上下文继续进行，并不表示可以开始实现。不要现在开始写实现代码；请继续调查或完善计划，然后调用 ExitPlanMode 提交完整计划供用户批准。
+</relaxed_plan_reminder>`,
+	},
+	"sidecar.noticePipelineExit": {
+		en: "[SYSTEM: Pipeline has already been used to extract captured output and is still active. Before making more tool calls, confirm whether you still need Pipeline. If not, stop using Pipeline so its captures can be cleaned up by the inactivity limit instead of continuing to accumulate.]",
+		"zh-CN":
+			"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
+	},
+
+	// prose — `{source}Heading` prefixes the text; absent ⇒ emitted bare.
+	// Only behavior_fence has one (was: buildBehaviorFenceReminder). A buffered user
+	// message is the user's own words and gets no prefix.
+	"sidecar.behavior_fenceHeading": {
+		en: "Behavior fence (durable behavior constraints set by the user — you must obey them):",
+		"zh-CN": "行为护栏（用户设定的行为约束，务必遵守）：",
+	},
+
+	// tasks — the Dynamic Spec digest (was: spec-reminder.ts).
+	"sidecar.tasksCurrentHeading": {
+		en: "Current Dynamic Spec reminder (compiled from spec://tasks.json):",
+		"zh-CN": "当前 Dynamic Spec 提醒（由 spec://tasks.json 编译生成）：",
+	},
+	"sidecar.tasksCurrentUpdateNote": {
+		en: "If task state changed, update spec://tasks.json with Read/Edit/Write. Do not add IDs, timestamps, or notes fields to tasks.json.",
+		"zh-CN":
+			"如任务状态已变化，请用 Read/Edit/Write 更新 spec://tasks.json；不要在 tasks.json 中添加 ID、时间戳或说明字段。",
+	},
+	"sidecar.tasksEmptyHeading": {
+		en: "Dynamic Spec reminder (spec://tasks.json has no active tasks):",
+		"zh-CN": "Dynamic Spec 提醒（spec://tasks.json 当前没有进行中的任务）：",
+	},
+	"sidecar.tasksEmptyNeverCreate": {
+		en: "- You have not created any task in spec://tasks.json yet. If this is multi-step or non-trivial work, use Write/Edit to build a task list to track progress, e.g. one doing plus a few todo.",
+		"zh-CN":
+			"- 你还没有在 spec://tasks.json 建立任何任务。如果当前是多步骤或较复杂的工作，请用 Write/Edit 建立任务清单来跟踪进度，例如一条 doing + 若干 todo。",
+	},
+	"sidecar.tasksEmptyNeverSkip": {
+		en: "- If the current work is genuinely simple and does not need to be broken down, you may ignore this reminder.",
+		"zh-CN": "- 如果当前工作确实简单、无需拆分，可以忽略本提醒。",
+	},
+	"sidecar.tasksEmptyDoneReorganize": {
+		en: "- The previous phase is complete. Before starting the next round of work, reassess the current goal and context, then reorganize spec://tasks.json: remove completed ordinary tasks, preserve protected-task intent, and keep only a concise set of necessary doing/todo/blocked tasks for the current phase.",
+		"zh-CN":
+			"- 上一阶段任务已全部完成。现在开始下一轮工作前，请先重新审视当前目标和上下文，整理 spec://tasks.json：清理已完成的普通任务，保留 protected task 的用户意图，并只保留当前阶段必要且精简的 doing/todo/blocked 任务。",
+	},
+	"sidecar.tasksEmptyDoneContinue": {
+		en: "- Continue the work only after the task list is refreshed; do not retain completed tasks merely as history.",
+		"zh-CN": "- 整理完成后再继续当前工作；不要为了保留历史而堆积已完成任务。",
+	},
+	"sidecar.tasksTooManyHeading": {
+		en: "Dynamic Spec reorganization reminder (spec://tasks.json has {count} tasks, exceeding {threshold}):",
+		"zh-CN": `Dynamic Spec 整理提醒（spec://tasks.json 当前有 {count} 条任务，超过 {threshold} 条）：`,
+	},
+	"sidecar.tasksTooManyReorganize": {
+		en: "- Reorganize the task list before continuing: merge duplicate or closely related tasks, remove obsolete ordinary tasks, split oversized tasks, and keep only the necessary doing/todo/blocked tasks for the current phase.",
+		"zh-CN":
+			"- 请先重新整理任务清单，再继续执行：合并重复或高度相关的任务，删除已过期的普通任务，拆分过大的任务，并确保当前阶段只有必要的 doing/todo/blocked 任务。",
+	},
+	"sidecar.tasksTooManyProtected": {
+		en: "- Preserve protected-task intent; do not rewrite, delete, or replace a protected task to bypass its goal.",
+		"zh-CN":
+			"- protected task 的用户意图必须保留；不要通过改写、删除或替换 protected task 来绕过目标。",
+	},
+	"sidecar.tasksFieldsNote": {
+		en: "- Keep tasks.json to only text/status/protected; do not add IDs, timestamps, summaries, or other fields.",
+		"zh-CN": "- tasks.json 只保留 text/status/protected，不要添加 ID、时间戳、摘要或其他字段。",
+	},
+	"sidecar.tasksSemanticsNote": {
+		en: "- Every open task must be finite, executable, and have a completion condition; an open protected task may trigger automatic continuation. Do not store standing behavior rules or constraints without a terminal state as tasks; those belong in spec://behavior_fence.",
+		"zh-CN":
+			"- 每条开放任务必须有限、可执行且有完成条件；protected task 未完成时可能触发自动续跑。不要把长期行为规则或无终点约束写成任务，这类内容属于 spec://behavior_fence。",
+	},
+
+	// knowledge — was: formatInjectionsBare (knowledge-injection.ts). The heading is
+	// English-only upstream (it is passed as a literal argument), so it stays so here.
+	"sidecar.knowledgeHeading": {
+		en: "Relevant knowledge-base entries were found based on the latest tool output:",
+	},
+	"sidecar.knowledgeReadHint": {
+		en: "(Use KnowledgeRead with an id for full content.)",
+	},
+
+	// tasksDone — was: formatBackgroundCompletionNotifications + the inline bash
+	// formatter in narrator-session.ts. Both are English-only upstream.
+	"sidecar.bgAgentEntry": {
+		en: `[System] Background agent "{title}" (ID: {id}) {status}.
+Result preview: {preview}
+Use Await({ type: "agent", id: "{id}" }) to see the full result, or Send({ id: "{id}", message }) to continue.`,
+	},
+	"sidecar.bgBashEntry": {
+		en: `[System] Background bash "{title}" (ID: {id}) {status}.
+Result preview: {preview}`,
+	},
+	"sidecar.emptyResult": {
+		en: "(empty)",
+	},
+
+	// messages — was: formatParentInboundMessage (parent-inbound-queue.ts) and the
+	// inline team formatter in subagent-executor.ts.
+	"sidecar.subagentMessageEntry": {
+		en: `[Progress report from subagent "{name}" ({type})]:
+{text}`,
+		"zh-CN": `[来自子代理"{name}"（{type}）的进展汇报]：
+{text}`,
+	},
+	"sidecar.teamMessageEntry": {
+		en: "[Team {channel} from {name} ({type})]: {text}",
+	},
+	"sidecar.teamBroadcast": { en: "broadcast" },
+	"sidecar.teamDirect": { en: "message" },
+
+	// specUpdates — was: formatSpecUpdateSideCars (spec-update-queue.ts).
+	"sidecar.specUpdateHeading": {
+		en: "[System] The user updated the following spec files via the Spec panel — align your plan accordingly:",
+		"zh-CN": "[系统] 用户通过 Spec 面板更新了以下文件，请注意同步你的工作计划：",
+	},
+	"sidecar.specUpdateEntry": {
+		en: "User updated {uri} via UI ({timestamp}).",
+		"zh-CN": "用户通过 UI 更新了 {uri}（{timestamp}）。",
+	},
+	"sidecar.specUpdatePreview": {
+		en: "Content preview:",
+		"zh-CN": "内容预览：",
+	},
 };
 
 // ---------------------------------------------------------------------------

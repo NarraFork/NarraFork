@@ -59,6 +59,16 @@
  * reasoning / measure-system-simple templates.
  */
 
+import {
+	BARE_ROW_CHEVRON,
+	BARE_ROW_CONTENT,
+	BARE_ROW_GAP,
+	BARE_ROW_HEIGHT,
+	BARE_ROW_ICON,
+	BARE_ROW_PADDING_Y,
+	BARE_ROW_STATUS,
+	BARE_XS_LINE,
+} from "@shared/pretext-layout/row-metrics";
 // Type-only: the row identity the adapter attaches and the renderer consumes.
 // A type import adds no runtime dependency and stays clear of the measure math.
 import type { AdapterTraceRowIdentity } from "@shared/pretext-layout/segment-adapter";
@@ -71,7 +81,7 @@ import {
 	type PreparedFixedBlock,
 	type RenderLod,
 } from "../prepared-block";
-import { FONT_SIZE, LINE_HEIGHT, SPACING } from "../pretext-fonts";
+import { SPACING } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 // The drill-down card. NOT a cycle: measure-tool-call depends on markdown /
 // media / permission / reflection / pretext-metrics and never on this module
@@ -85,26 +95,32 @@ import {
 } from "./measure-tool-call";
 
 // ── Chrome constants (px) — CONTRACT §3/§4 + CollapsibleTrace.tsx ─────────────
+//
+// The per-ROW numbers now live in `@shared/pretext-layout/row-metrics`, because a
+// side-car footnote's header row must measure the same as a trace row and cannot
+// import from here (measure-tool-run → measure-tool-call → measure-sidecar is an
+// existing chain, so reading upward would close a cycle). They keep their original
+// names below so every caller and test in this package is unaffected.
 
 /** Outer `<Box py={2}>` around the whole trace. */
 export const TRACE_OUTER_PADDING_Y = 2;
 /** Header `<Group py={2}>`. */
 export const TRACE_HEADER_PADDING_Y = 2;
 /** TraceRow / "show earlier" `<Group py={1}>`. */
-export const TRACE_ROW_PADDING_Y = 1;
+export const TRACE_ROW_PADDING_Y = BARE_ROW_PADDING_Y;
 /** Header ThemeIcon size={16}. */
 export const TRACE_HEADER_ICON = 16;
 /** Per-row ThemeIcon size={14}. */
-export const TRACE_ROW_ICON = 14;
+export const TRACE_ROW_ICON = BARE_ROW_ICON;
 /** Chevron / dot slot icon size (12). */
-export const TRACE_CHEVRON = 12;
+export const TRACE_CHEVRON = BARE_ROW_CHEVRON;
 
 /**
  * xs single-line box = 12 × 1.4 = 16.8px, kept UNROUNDED (see file header). JS
  * float gives 16.799999…; tests assert with toBeCloseTo. Browsers lay out this
  * fractional line box, so the raw value is the most faithful prediction.
  */
-export const TRACE_XS_LINE = FONT_SIZE.xs * LINE_HEIGHT.xs;
+export const TRACE_XS_LINE = BARE_XS_LINE;
 
 /** Header row content lane: max(icon 16, xs line 16.8) = 16.8. */
 export const TRACE_HEADER_CONTENT = Math.max(TRACE_HEADER_ICON, TRACE_XS_LINE);
@@ -114,7 +130,7 @@ export const TRACE_HEADER_GROUP_HEIGHT = TRACE_HEADER_PADDING_Y * 2 + TRACE_HEAD
 export const TRACE_HEADER_BAND_HEIGHT = TRACE_OUTER_PADDING_Y * 2 + TRACE_HEADER_GROUP_HEIGHT;
 
 /** Trailing status glyph size (12) — same slot the chunk path reserves. */
-export const TRACE_ROW_STATUS = 12;
+export const TRACE_ROW_STATUS = BARE_ROW_STATUS;
 /**
  * Gap between a trace row's cells (`<Group gap={6}>`).
  *
@@ -122,7 +138,7 @@ export const TRACE_ROW_STATUS = 12;
  * trace rows and the subagent card's recent-call rows — which are the same row —
  * read it from one place instead of both hard-coding `6`.
  */
-export const TRACE_ROW_GAP = 6;
+export const TRACE_ROW_GAP = BARE_ROW_GAP;
 /**
  * Row content lane: max(row icon 14, chevron 12, status 12, xs line 16.8) = 16.8.
  *
@@ -130,14 +146,9 @@ export const TRACE_ROW_GAP = 6;
  * trailing status + timing slots are height-neutral: adding them cannot raise this
  * max, so `TRACE_ROW_HEIGHT` is unchanged.
  */
-export const TRACE_ROW_CONTENT = Math.max(
-	TRACE_ROW_ICON,
-	TRACE_CHEVRON,
-	TRACE_ROW_STATUS,
-	TRACE_XS_LINE,
-);
+export const TRACE_ROW_CONTENT = BARE_ROW_CONTENT;
 /** Trace row height: py*2 + content = 2 + 16.8 = 18.8. Shared by rows + toggle. */
-export const TRACE_ROW_HEIGHT = TRACE_ROW_PADDING_Y * 2 + TRACE_ROW_CONTENT;
+export const TRACE_ROW_HEIGHT = BARE_ROW_HEIGHT;
 
 /**
  * Standalone count line (ToolRunCountLine / ReasoningCountLine): a single

@@ -95,14 +95,6 @@
 		"minimize": "最小化",
 		"close": "关闭终端"
 	},
-	"sidePanel": {
-		"upstreamUpdates": "上游有更新",
-		"recentCommits": "最近提交",
-		"noCommits": "暂无提交。",
-		"openDetails": "打开详情",
-		"commitSummary": "{{count}} 次提交",
-		"headLabel": "HEAD"
-	},
 	"ruler": {
 		"commitCount": "{{count}} 次提交",
 		"chapterCount": "{{count}} 个章节",

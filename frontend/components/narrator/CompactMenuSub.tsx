@@ -12,8 +12,9 @@ interface CompactMenuSubProps {
 	onManualSummarize?: () => void;
 	/** Called after any action runs (e.g. to close the swipe/context menu). */
 	onClose?: () => void;
-	/** When true, the whole entry is disabled (used by the pixi prop-based menu). */
-	disabled?: boolean;
+	// No `disabled`: it existed for the Pixi renderer's prop-based menu, which is gone.
+	// Every remaining caller (ToolCallCard, SubagentCard, MessageBubble) renders the entry
+	// enabled, so the prop had no live producer.
 }
 
 const ROW_HOVER_BG = "var(--mantine-color-default-hover)";
@@ -34,7 +35,6 @@ export function CompactMenuSub({
 	onClearContext,
 	onManualSummarize,
 	onClose,
-	disabled,
 }: CompactMenuSubProps) {
 	const { t } = useTranslation("narrator");
 	const [hoverLeft, setHoverLeft] = useState(false);
@@ -55,13 +55,12 @@ export function CompactMenuSub({
 	};
 
 	return (
-		<Box style={{ opacity: disabled ? 0.5 : 1, pointerEvents: disabled ? "none" : undefined }}>
+		<Box>
 			<Box style={{ display: "flex", alignItems: "stretch" }}>
 				<UnstyledButton
 					onClick={runCompact}
 					onMouseEnter={() => setHoverLeft(true)}
 					onMouseLeave={() => setHoverLeft(false)}
-					disabled={disabled}
 					style={{
 						flex: 1,
 						display: "flex",
@@ -83,7 +82,6 @@ export function CompactMenuSub({
 					onClick={() => setExpanded((o) => !o)}
 					onMouseEnter={() => setHoverRight(true)}
 					onMouseLeave={() => setHoverRight(false)}
-					disabled={disabled}
 					aria-label={t("contextMenu_clearContextBefore")}
 					aria-expanded={expanded}
 					style={{

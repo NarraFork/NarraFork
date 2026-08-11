@@ -22,9 +22,7 @@ export {
 export {
 	batchCleanupSchema,
 	batchMergeSchema,
-	cherryPickSchema,
 	containerConfigSchema,
-	createChapterEdgeSchema,
 	createChapterSchema,
 	createReviewSchema,
 	forkChapterSchema,
@@ -92,6 +90,7 @@ export {
 	knowledgeGraphQuerySchema,
 	knowledgeSearchQuerySchema,
 	listDraftSubmissionsQuerySchema,
+	listKnowledgeAclEventsQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
 	rebaseKnowledgeDraftQuerySchema,
@@ -199,10 +198,7 @@ export { createProjectSkillSchema, updateProjectSkillSchema } from "./skills";
 export { specFileQuerySchema, updateSpecFileSchema } from "./spec";
 export {
 	createTerminalSchema,
-	createTerminalTabSchema,
-	reorderTerminalTabsSchema,
 	updateTerminalGraphStateSchema,
-	updateTerminalTabSchema,
 	updateTerminalViewStateSchema,
 } from "./terminals";
 export { narratorWsMessageSchema, terminalWsMessageSchema } from "./websocket";

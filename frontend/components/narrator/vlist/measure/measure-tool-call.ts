@@ -986,13 +986,25 @@ export interface MeasuredToolCall extends MeasuredElement {
 	/** Reflection region top within the card content box. */
 	reflectionTop: number;
 	/**
-	 * Measured tool-result sidecar mini-cards (one per injection), else null. They
-	 * sit between the header and the detail region and — like the chunked card —
-	 * are visible whether or not the card body is expanded.
+	 * Measured tool-result side-car footnotes (one per injection), else null.
+	 *
+	 * Only present on an EXPANDED card: the injections are appended to the tool's
+	 * output text, so they are footnotes to the detail region and belong below it.
+	 * A folded card reports them through `sidecarCount` instead, which costs no
+	 * height (see `collapsedHeight`).
 	 */
 	sidecars: MeasuredSidecar[] | null;
-	/** Top of the first sidecar within the card content box (== headerHeight). */
+	/** Top of the first footnote within the card content box (below the detail). */
 	sidecarsTop: number;
+	/**
+	 * How many injections this tool result carries, WHATEVER the fold state.
+	 *
+	 * The folded card's header marker reads this. It is deliberately independent of
+	 * `sidecars` (which is null while folded) so "there are injections here" survives
+	 * collapsing — otherwise folding a card would silently erase the fact.
+	 * Height-neutral: the marker sits inside the existing fixed header row.
+	 */
+	sidecarCount: number;
 	/** Passthrough render metadata. */
 	category: ToolCategory;
 	status: ToolCallStatus;
@@ -2078,6 +2090,11 @@ export function measureToolDetail(
 // Single tool card.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Gap above the side-car band (separating it from the detail region / header). */
+export const SIDECAR_BAND_TOP_GAP = 6;
+/** Gap between two consecutive footnotes in the band. */
+export const SIDECAR_BAND_ROW_GAP = 2;
+
 /** Inner content width (px) inside the card padding + border. */
 export function toolCardInnerWidth(contentWidth: number, inRun: boolean): number {
 	const border = inRun ? 0 : CARD_BORDER * 2;
@@ -2137,11 +2154,13 @@ export function measureToolCall(
 	const frame = accumulateFrame(blocks, innerWidth, RESOLVER);
 
 	// ── Collapsed height ───────────────────────────────────────────────────────
-	// The sidecar band is part of the COLLAPSED card too (the chunked notice is
-	// outside the collapse), so a folded card with sidecars is taller than one
-	// without. The band's height is added below once it is measured; here we only
-	// reserve the header + chrome.
-	const baseCollapsedHeight = chromeY + HEADER_ROW_HEIGHT + dividerExtra;
+	// A folded card measures the SAME whether or not it carries injections. The
+	// chunked path put its notice outside the collapse, and the vlist copied that
+	// for parity — but the reasoning does not survive the footnote redesign: a
+	// side-car is appended to the END of the tool's OUTPUT text, so on a folded card
+	// (which shows no output at all) it is a footnote with nothing to be a footnote
+	// to. The count marker in the header row says it exists; that costs no height.
+	const collapsedHeight = chromeY + HEADER_ROW_HEIGHT + dividerExtra;
 
 	// ── Expanded regions ───────────────────────────────────────────────────────
 	let detail: MeasuredToolDetail | null = null;
@@ -2149,30 +2168,16 @@ export function measureToolCall(
 	let reflection: MeasuredReflectionNotice | null = null;
 	let innerContentH = HEADER_ROW_HEIGHT;
 
-	// ── Sidecar region (tool_result injections) ────────────────────────────────
-	// Mirrors the chunked ToolCallCard, whose SideCarNotice sits OUTSIDE the
-	// collapse: the mini-cards show whether or not the card body is expanded, so
-	// their height is added UNCONDITIONALLY (not gated on effectiveOpened). Each
-	// card keeps its own fold state (the vlist redesign folds per-record).
+	// The side-car band sits BELOW the detail region — where the injections actually
+	// are in the text the model read (`appendSideCarsForApi` appends them to the tool
+	// result) — and above the permission / reflection area, which must stay last
+	// because it is what asks the reader for a decision.
 	let sidecars: MeasuredSidecar[] | null = null;
-	const sidecarsTop = HEADER_ROW_HEIGHT;
+	let sidecarsTop = HEADER_ROW_HEIGHT;
 	let sidecarsHeight = 0;
-	if (data.sidecars && data.sidecars.length > 0) {
-		const expandedSet = new Set(opts.sidecarExpanded ?? []);
-		sidecars = data.sidecars.map((sc, index) =>
-			measureSidecar(sc, innerWidth, lod, { expanded: expandedSet.has(index) }),
-		);
-		sidecarsHeight = sidecars.reduce((sum, sc) => sum + sc.height, 0);
-		innerContentH += sidecarsHeight;
-	}
-	// The expanded regions begin BELOW the sidecar band.
-	const expandedRegionTop = HEADER_ROW_HEIGHT + sidecarsHeight;
-	const detailTop = expandedRegionTop;
-	let permissionTop = expandedRegionTop;
-	let reflectionTop = expandedRegionTop;
-	// Collapsed card = header + chrome + the sidecar band (chunk parity: the
-	// notice is outside the collapse). + the divider.
-	const collapsedHeight = baseCollapsedHeight + sidecarsHeight;
+	const detailTop = HEADER_ROW_HEIGHT;
+	let permissionTop = HEADER_ROW_HEIGHT;
+	let reflectionTop = HEADER_ROW_HEIGHT;
 
 	// A still-truncated payload costs NO geometry: a prefix body already reserves
 	// its full cap (see `cappedBodyHeight`), and the rest is fetched when the reader
@@ -2182,8 +2187,23 @@ export function measureToolCall(
 		if (data.detail) {
 			detail = measureToolDetail(data.detail, innerWidth, opts.viewportHeight);
 			innerContentH += detail.height;
-			permissionTop = expandedRegionTop + detail.height;
-			reflectionTop = permissionTop;
+		}
+		const belowDetail = HEADER_ROW_HEIGHT + (detail?.height ?? 0);
+		sidecarsTop = belowDetail;
+		permissionTop = belowDetail;
+		reflectionTop = belowDetail;
+		if (data.sidecars && data.sidecars.length > 0) {
+			const expandedSet = new Set(opts.sidecarExpanded ?? []);
+			sidecars = data.sidecars.map((sc, index) =>
+				measureSidecar(sc, innerWidth, lod, { expanded: expandedSet.has(index) }),
+			);
+			sidecarsHeight =
+				sidecars.reduce((sum, sc) => sum + sc.height, 0) +
+				SIDECAR_BAND_TOP_GAP +
+				SIDECAR_BAND_ROW_GAP * (sidecars.length - 1);
+			innerContentH += sidecarsHeight;
+			permissionTop += sidecarsHeight;
+			reflectionTop += sidecarsHeight;
 		}
 		// A reflection notice REPLACES the permission form, mirroring the chunked
 		// precedence (ToolCallCard.tsx:5419). Streaming cards show neither.
@@ -2228,6 +2248,7 @@ export function measureToolCall(
 		reflectionTop,
 		sidecars,
 		sidecarsTop,
+		sidecarCount: data.sidecars?.length ?? 0,
 		category: data.category,
 		status: data.status,
 		toolName: data.toolName,

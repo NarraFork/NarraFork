@@ -112,7 +112,7 @@ users ──1:N── user_favorite_directories
 > `users` 表用于 JWT 认证，与上述业务实体无直接关联。
 > 一个项目有且只有一个 Git 仓库，仓库信息直接存储在 `projects` 表中。
 > 权限审批直接在 `narrator_tool_calls` 表中处理（`permissionDecidedBy`/`permissionDecidedAt` 等字段），无独立的 `permission_requests` 表。
-> `chapter_edges` 显式建模章节间的所有关系（fork/merge/dependency/cherry_pick），`parentChapterId` 和 `mergedIntoChapterId` 作为冗余快捷字段保留。
+> `chapter_edges` 显式建模章节间的所有关系（实际在用：fork/merge/review），`parentChapterId` 和 `mergedIntoChapterId` 作为冗余快捷字段保留。
 
 ### 3.2 表定义
 
@@ -189,10 +189,11 @@ export const chapters = sqliteTable('chapters', {
   // 图可视化
   color: text('color'),                              // 用户自定义颜色（图上显示）
   groupLabel: text('group_label'),                   // 分组标签（如 "auth模块"、"v2.0"）
-  pinned: integer('pinned').default(0),              // 是否在图上固定位置
-  positionX: real('position_x'),                     // 图上手动定位 X（null = 自动布局）
-  positionY: real('position_y'),                     // 图上手动定位 Y
-  panelExpanded: integer('panel_expanded').default(0),  // 侧边面板是否展开
+  pinned: integer('pinned').default(0),              // 遗留列：章节代码从不读写它，勿据此写逻辑
+  anchorCommitSha: text('anchor_commit_sha'),        // 位置锚点 commit（ruler 模式沿轴定位用）
+  axisOffset: real('axis_offset').default(0),        // 沿主轴偏移（classic 模式映射为 x）
+  crossOffset: real('cross_offset').default(0),      // 垂直于主轴偏移（classic 模式映射为 y）
+  panelExpanded: integer('panel_expanded').default(0),  // 节点内嵌面板是否展开
   panelWidth: real('panel_width'),                   // 侧边面板宽度
   panelHeight: real('panel_height'),                 // 侧边面板高度
 
@@ -241,7 +242,8 @@ export const chapterEdges = sqliteTable('chapter_edges', {
   targetId: text('target_id').notNull()
     .references(() => chapters.id),
   type: text('type', {
-    enum: ['fork', 'merge', 'dependency', 'cherry_pick']
+    // dependency 已移除、cherry_pick 从未实现：枚举值保留但无写入路径
+    enum: ['fork', 'merge', 'dependency', 'cherry_pick', 'review']
   }).notNull(),
   metadata: text('metadata', { mode: 'json' }),      // 类型特定的元数据
   createdAt: text('created_at').notNull(),
@@ -256,10 +258,13 @@ export const chapterEdges = sqliteTable('chapter_edges', {
 **边类型与 metadata 结构：**
 - `fork`：sourceId fork 出 targetId。metadata: `{ commitSha: string, inheritMode: 'full' | 'compressed' | 'fresh', narratorMessageUuid?: string }`
 - `merge`：sourceId 合并到 targetId。metadata: `{ mergeCommitSha: string, strategy: 'merge' | 'squash' | 'cherry-pick' }`
-- `dependency`：targetId 依赖 sourceId（sourceId 是上游）。metadata: `{ description?: string, lastSyncedCommit?: string }`
-- `cherry_pick`：从 sourceId cherry-pick 到 targetId。metadata: `{ commits: string[], sourceRange?: string }`
+- `review`：sourceId 的评审章节是 targetId。由 `review-service` 创建
+- ~~`dependency`~~：**已移除**（见 6c）。枚举值保留以便历史行加载，无写入路径
+- ~~`cherry_pick`~~：**从未实现**（见 6e）。枚举值和 `CherryPickEdge` 组件都在，但没有任何代码创建这种边
 
-> fork 和 merge 边在创建章节/合并章节时自动创建，与 `parentChapterId`/`mergedIntoChapterId` 冗余字段同步维护。dependency 和 cherry_pick 边由用户手动创建。
+> 所有边都由创建它的操作自动维护：fork 边来自 chapter-fork/chapter-split，merge 边来自
+> chapter-merge（并与 `parentChapterId`/`mergedIntoChapterId` 冗余字段同步），review 边来自
+> review-service。**没有用户手动创建的边** —— 因此 `/api/chapter-edges` 是只读的。
 
 #### exploration_groups — 探索组
 
@@ -282,7 +287,12 @@ export const explorationGroups = sqliteTable('exploration_groups', {
 })
 ```
 
-> 探索组将多个 exploration 角色的章节组织为一个"实验组"。在图上渲染为可折叠的分组框（React Flow Group Node）。探索组有独立的生命周期：active → decided（选定方案）/ abandoned（放弃探索）。
+> 探索组原设计：将多个 exploration 角色的章节组织为一个"实验组"，在图上渲染为可折叠的分组框（React Flow Group Node），生命周期为 active → decided（选定方案）/ abandoned（放弃探索）。
+>
+> **⚠️ 未实现。** 表和 `chapters.explorationGroupId` 外键存在，`createExplorationGroupSchema`/
+> `updateExplorationGroupSchema` 也在，但没有 `exploration-group-service.ts`、没有
+> `/api/exploration-groups` 路由、图上也没有分组框组件。下文 4.2.8e 与 API 清单里的探索组
+> 条目都是设计意图而非现状。
 
 ```typescript
 export const narrators = sqliteTable('narrators', {
@@ -740,7 +750,7 @@ server/
     projects.ts               # 项目 CRUD
     chapters.ts               # 章节 CRUD + 分叉/合并 + 容器管理
     chapter-edges.ts          # 章节间关系（边）CRUD
-    exploration-groups.ts     # 探索组 CRUD
+    exploration-groups.ts     # ❌ 不存在（探索组未实现）
     narrators.ts              # 叙述者管理 + 消息流 + 权限审批 + 游离会话
     terminals.ts              # 终端管理
     auth.ts                   # 注册 / 登录 / 当前用户
@@ -771,8 +781,8 @@ server/
     chapter-cleanup.ts        # 批量清理 + 自动休眠/唤醒
     chapter-edge-service.ts   # 章节间关系（边）CRUD
     chapter-dependency-service.ts  # 依赖关系管理（上游变更检测 + 同步）（计划中）
-    chapter-cherry-pick-service.ts # Cherry-pick 操作（计划中）
-    exploration-group-service.ts   # 探索组生命周期（创建 + 决策 + 放弃）
+    chapter-cherry-pick-service.ts # ❌ 不存在（章节级 cherry-pick 未实现；合并策略走 git-service.cherryPick）
+    exploration-group-service.ts   # ❌ 不存在（探索组未实现）
     narrator-service.ts       # 叙述者生命周期
     narrator-session.ts       # AI 会话管理 + 权限审批
     narrator-executor.ts      # 自定义 Agent Loop 执行器
@@ -1047,14 +1057,20 @@ Compact 机制：
 职责：管理 `chapter_edges` 表的 CRUD，提供章节关系图的查询能力。
 
 核心功能：
-- `createEdge(input)` — 创建边，校验 sourceId/targetId 存在且属于同一项目。fork/merge 边由 chapter-fork/chapter-merge 服务自动创建，用户只能手动创建 dependency 边
-- `deleteEdge(id)` — 删除边（仅 dependency 类型可手动删除，fork/merge/cherry_pick 边不可删除）
+- `createForkEdge` / `createMergeEdge` — 由 chapter-fork/chapter-split/chapter-merge 内部调用，
+  幂等（同步事务防重，因为表上只有普通索引没有 UNIQUE 约束）
 - `getEdgesByChapter(chapterId)` — 获取章节的所有边（入边 + 出边）
 - `getEdgesByProject(projectId)` — 获取项目的所有边（用于图渲染）
-- `getUpstreamDependencies(chapterId)` — 获取上游依赖列表（type='dependency' 且 targetId=chapterId）
-- `getDownstreamDependents(chapterId)` — 获取下游依赖列表（type='dependency' 且 sourceId=chapterId）
+- `getEdgesByType(projectId, type)` — 按类型筛选（fork/merge/review）
+- `deleteMergeEdgesBySource(chapterId)` — 唤醒已合并章节时清理过期 merge 线
+- 无 `createEdge`/`deleteEdge` 公开入口：不存在用户手动创建的边（原先仅 dependency 可手动
+  创建/删除，该类型已移除，见 6c）
+- 无 `getUpstreamDependencies`/`getDownstreamDependents`：随 dependency 边一并移除
 
-#### 4.2.8c chapter-dependency-service.ts — 依赖关系管理
+#### 4.2.8c chapter-dependency-service.ts — ❌ 不存在（依赖关系已移除，以下为原设计）
+
+> 该文件从未存在。它服务的 dependency 边已整体移除，理由见 6c。注意不要与
+> `server/services/dependency-service.ts` 混淆 —— 后者是系统工具检测（git/rg/dtach）。
 
 职责：管理章节间的依赖关系，检测上游变更并提供同步操作。
 
@@ -1067,10 +1083,12 @@ Compact 机制：
   - 冲突时返回冲突信息，复用现有冲突处理流程
 - `initDependency(edgeId)` — 创建 dependency 边后初始化 `lastSyncedCommit` 为当前上游 HEAD
 
-关键设计：
+原设计的关键假设（也是它被移除的原因）：
 - 依赖检测是轻量级操作（只比较 commit SHA），不修改工作区
 - 同步操作本质上是 merge 或 rebase，复用现有基础设施
 - 通过 eventBus 广播 `dependency:upstream_updated` 事件，前端图上显示更新徽章
+- ⚠️ 手工维护的 `lastSyncedCommit` 是漂移源：任何绕过 API 的 rebase/reset/force-push 都会
+  让它说谎。"A 领先于 B" 本可由 `git log B..A` 直接算出，不需要记账字段
 
 #### 4.2.8d chapter-cherry-pick-service.ts — Cherry-pick 操作
 
@@ -1088,7 +1106,9 @@ Compact 机制：
 - 如果从同一 source 多次 cherry-pick，更新已有的 cherry_pick 边的 metadata（追加 commit SHA），而非创建新边
 - 通过 eventBus 广播 `chapter:cherry_picked` 事件
 
-#### 4.2.8e exploration-group-service.ts — 探索组管理
+#### 4.2.8e exploration-group-service.ts — 探索组管理（❌ 未实现，以下为设计意图）
+
+> 该文件不存在。它依赖的 `chapter-fork.batchFork` 同样未实现（见 6b）。保留本节作为设计参考。
 
 职责：管理探索组的生命周期，包括创建（含批量 fork）、决策和放弃。
 
@@ -1153,7 +1173,7 @@ DELETE /api/projects/:id                # 删除
 GET    /api/chapters                    # 列表（?projectId=&status=&type=&role=）
 POST   /api/chapters                    # 创建（直接创建，非分叉）
 GET    /api/chapters/:id                # 详情
-PATCH  /api/chapters/:id                # 更新（含 role、color、groupLabel、positionX/Y）
+PATCH  /api/chapters/:id                # 更新（含 role、color、groupLabel）；位置走 PATCH /api/projects/:id/graph/positions
 DELETE /api/chapters/:id                # 删除
 
 POST   /api/chapters/:id/fork           # 分叉（支持 role 参数）
@@ -1167,8 +1187,7 @@ POST   /api/chapters/:id/cherry-pick    # 从源章节 cherry-pick commits 到�
 POST   /api/chapters/:id/wake           # 唤醒 dormant chapter
 POST   /api/chapters/:id/dormant        # 手动休眠
 
-GET    /api/chapters/:id/dependency-status  # 检查上游依赖是否有更新
-POST   /api/chapters/:id/sync-upstream      # 同步上游变更（rebase/merge）
+# dependency-status / sync-upstream 两条路由从未实现，随 dependency 边一并移除（见 6c）
 
 POST   /api/chapters/cleanup            # 批量清理
 POST   /api/chapters/batch-merge        # 批量合并
@@ -1185,12 +1204,11 @@ POST   /api/chapters/:id/containers/remove          # 删除容器（可选删�
 
 #### Chapter Edges（章节间关系）
 ```
-GET    /api/chapter-edges                # 列表（?projectId=&chapterId=&type=）
-POST   /api/chapter-edges                # 创建边（仅 dependency 类型可手动创建）
-DELETE /api/chapter-edges/:id            # 删除边（仅 dependency 类型可手动删除）
+GET    /api/chapter-edges                # 列表（?projectId=&chapterId=&type=），只读
+# POST / DELETE 已移除：所有边都由创建它的操作维护，不存在用户手动创建的边（见 6c）
 ```
 
-#### Exploration Groups（探索组）
+#### Exploration Groups（探索组）— ❌ 未实现，以下路由均不存在
 ```
 GET    /api/exploration-groups           # 列表（?projectId=&status=）
 POST   /api/exploration-groups           # 创建探索组（含批量 fork 探索分支）
@@ -1204,7 +1222,7 @@ POST   /api/exploration-groups/:id/chapters  # 向探索组追加新的探索分
 
 #### Graph（故事网络图数据）
 ```
-GET    /api/projects/:id/graph           # 增强的图数据（含边类型、探索组、依赖状态）
+GET    /api/projects/:id/graph           # 增强的图数据（含边类型、依赖状态；不含探索组 —— 该字段无人渲染已移除）
 PATCH  /api/projects/:id/graph/positions # 批量更新节点位置
 ```
 
@@ -1462,9 +1480,9 @@ frontend/
       ChapterMergeModal.tsx   # 合并对话框
       ChapterCleanupModal.tsx # 批量清理对话框
       ChapterBatchMergeModal.tsx # 批量合并对话框
-      BatchForkModal.tsx      # 批量分叉对话框
-      CherryPickModal.tsx     # Cherry-pick commit 选择对话框
-      SyncUpstreamModal.tsx   # 同步上游变更对话框（选择 rebase/merge）
+      BatchForkModal.tsx      # ❌ 不存在（批量分叉未实现，见 6b）
+      CherryPickModal.tsx     # ❌ 不存在（章节级 cherry-pick 未实现，见 6e）
+      SyncUpstreamModal.tsx   # ❌ 不存在（依赖关系已移除，见 6c）
       CommitList.tsx          # 章节 commit 列表组件（可展开，支持选择 commit）
     common/                   # 通用组件（按钮、模态框、布局等）
     narrator/
@@ -1477,18 +1495,20 @@ frontend/
       DiffView.tsx            # Diff 查看器（行级 + 词级高亮）
       PermissionBanner.tsx    # 权限审批横幅（支持内联 per-tool-call 审批 + feedbackText）
       AskUserQuestionBanner.tsx # AskUserQuestion 工具调用的问答 UI
-    graph/
-      StoryNetworkCanvas.tsx  # 交互式 React Flow 画布（项目主界面核心组件）
+    graph/                    # 实际内容见 8.x「故事网络图组件」一节
+      NarraFlow.tsx           # 交互式 React Flow 画布（项目主界面核心组件）
       ChapterNode.tsx         # 自定义节点（显示 role 图标、颜色、状态徽章）
-      ExplorationGroupNode.tsx # 探索组分组节点（React Flow Group Node）
+      DraftNode.tsx           # 操作草稿节点（fork/merge/review 落库前的预览）
+      TerminalNode.tsx / ReviewNode.tsx
       ForkEdge.tsx            # 分叉边（实线蓝色）
       MergeEdge.tsx           # 合并边（虚线绿色）
-      DependencyEdge.tsx      # 依赖边（虚线橙色 + 动画）
-      CherryPickEdge.tsx      # Cherry-pick 边（点线紫色）
+      CherryPickEdge.tsx      # Cherry-pick 边（点线紫色）—— 已注册但无人创建此类边
+      TerminalEdge.tsx / ReviewEdge.tsx
       NodeContextMenu.tsx     # 节点右键菜单
-      EdgeContextMenu.tsx     # 边右键菜单
-      CanvasContextMenu.tsx   # 画布空白区域右键菜单
-      GraphSidePanel.tsx      # 侧边面板（章节摘要、快捷操作、依赖关系）
+      SelectionToolbar.tsx / LassoSelection.tsx  # 框选与批量操作
+      TerminalContextMenu.tsx
+      # 以下均不存在：StoryNetworkCanvas、ExplorationGroupNode、DependencyEdge（已移除）、
+      # EdgeContextMenu、CanvasContextMenu、GraphSidePanel（已移除）
     terminal/
       TerminalPanel.tsx       # 终端面板
       TerminalTabs.tsx        # 终端标签页
@@ -1536,36 +1556,39 @@ frontend/
 故事网络图是项目的主界面（`/projects/$projectId`），使用 React Flow (`@xyflow/react`) + Dagre (`@dagrejs/dagre`) 实现交互式画布。
 
 组件结构：
-- `StoryNetworkCanvas` — 交互式画布主容器，使用 `useStoryGraph(projectId)` 获取增强图数据。集成侧边面板、右键菜单、节点拖拽、边连接
+实际组件（`frontend/components/graph/`，宿主为 `NarraFlow`）：
+
+- `NarraFlow` — 交互式画布主容器，通过 `useNarraFlow(projectId)` 获取图数据并做 Dagre 混合布局
 - `ChapterNode` — 自定义节点，使用 Mantine Card 渲染，显示标题、role 图标、状态 Badge、narrator 数量、容器标记、上游更新徽章。trunk 节点较大尺寸 + 加粗边框，exploration 节点虚线边框
-- `ExplorationGroupNode` — 探索组分组节点（React Flow Group Node），可折叠，显示探索主题标题
+- `DraftNode` — 操作草稿节点：fork/merge/review 在落库前先以草稿节点 + 草稿边预览
+- `TerminalNode` / `ReviewNode` — 画布上的终端气泡与评审节点
 - `ForkEdge` — 分叉边（贝塞尔曲线样式，蓝色 `#4c6ef5`）
 - `MergeEdge` — 合并边（smoothstep 样式，绿色 `#40c057`，`strokeDasharray`）
-- `DependencyEdge` — 依赖边（虚线橙色 `#fd7e14`，animated）
-- `CherryPickEdge` — Cherry-pick 边（点线紫色 `#7950f2`）
-- `NodeContextMenu` — 节点右键菜单：Fork、批量 Fork、创建探索组、拆分（split）、合并到...、Cherry-pick to...、休眠/唤醒、设为 trunk/branch/exploration、设置颜色、设置分组标签
-- `EdgeContextMenu` — 边右键菜单：删除依赖关系（仅 dependency 边）
-- `CanvasContextMenu` — 画布空白区域右键菜单：创建新章节（选择基线分支）
-- `GraphSidePanel` — 右侧可收起的侧边面板，单击节点时显示：章节摘要（标题、状态、角色、分支名）、最近 3 条 commit、叙述者列表（可直接点击进入对话）、快捷操作按钮、依赖关系列表（上游/下游）、探索组信息
+
+- `TerminalEdge` / `ReviewEdge` — 终端与评审关系边
+- `NodeContextMenu` — 节点右键菜单：Fork、评审、设为 trunk/branch/exploration、休眠/唤醒、取消合并、删除、在文件管理器中显示、转为子代理、采纳/驳回评审
+- `SelectionToolbar` + `LassoSelection` — 框选与多选批量操作
+- `TerminalContextMenu` — 终端节点右键菜单
+
+未实现但曾在本文档中描述过的组件，勿据此写代码：`StoryNetworkCanvas`、`useStoryGraph`、`ExplorationGroupNode`（探索组没有图上渲染）、`EdgeContextMenu`、`CanvasContextMenu`（ruler 模式有画布右键处理，classic 模式没有独立组件）、`GraphSidePanel`（已删除，功能由 SelectionToolbar + NodeContextMenu 承担）。`CherryPickEdge` 组件存在且已注册为 `cherry_pick` 边类型，但没有任何代码创建该类型的边，因此永不渲染 —— 详见下方 6e。
 
 **节点交互：**
-- 单击节点 → 侧边面板显示章节摘要
 - 双击节点 → 导航到章节详情页 `/chapters/$chapterId`
 - 右键节点 → 上下文菜单
-- 拖拽节点 → 手动调整位置（防抖 500ms 保存到 positionX/positionY）
-- 从节点连接柄拖拽到另一个节点 → 创建 dependency 边（弹出确认对话框）
-- 框选多个节点 → 批量操作（批量合并、批量休眠、设置分组标签）
+- 拖拽节点 → 手动调整位置（防抖 500ms，`PATCH /api/projects/:id/graph/positions` 保存到 anchorCommitSha/axisOffset/crossOffset）
+- 框选多个节点 → SelectionToolbar 批量操作（fork、合并到新章节/已有章节、开终端）
+- 无「拖拽连接柄建边」交互：它原先用于创建 dependency 边，该边类型已移除（见 6c），
+  `nodesConnectable` 也随之关闭
 
-**章节卡片展开 commit 列表：**
-- 在侧边面板的章节摘要中，commit 列表默认显示最近 3 条，可展开查看完整列表
+**commit 列表：**
+- 由章节详情的 `GitCommitsTab` 和 `CommitDetailModal` 承担（不在图的侧边面板里 —— 该面板已删除）
 - 每个 commit 行显示：短 SHA、提交信息、时间
 - 每个 commit 行有"从此分叉"按钮，点击触发章节拆分（split at commit）操作
 - commit 列表通过 `GET /api/chapters/:id/commits` 获取
 
 **布局策略：**
-- 混合模式：有手动位置（positionX/positionY 非 null）的节点固定，其余使用 Dagre 自动布局
+- 混合模式：有手动位置（axisOffset/crossOffset）的节点固定，其余使用 Dagre 自动布局
 - Dagre 配置：`rankdir: 'TB'`，节点间距 80/120
-- 探索组内的节点使用独立的子布局
 
 **视觉设计：**
 - trunk 节点：较大尺寸（320×140），加粗边框（3px），显示 trunk 图标
@@ -1834,17 +1857,18 @@ interface NarraForkSettings {
 ### Phase 6: 章节系统重构 — 图即项目
 
 #### 6a: 数据模型 + 图主界面（基础） ✅
-- schema 变更：chapters 表新增 role/color/groupLabel/pinned/positionX/positionY/explorationGroupId/frozen 状态
+- schema 变更：chapters 表新增 role/color/groupLabel/explorationGroupId（`pinned` 也加了但从未被读写；`frozen` 状态后来移除，见 6b）
 - 新增 chapter_edges 表 + chapter-edge-service
 - 数据迁移：从 parentChapterId/mergedIntoChapterId 生成 fork/merge 边
 - 故事网络图作为项目主页面（替代章节卡片网格）
-- 交互式画布：节点拖拽、右键菜单、侧边面板
-- 节点位置持久化（positionX/positionY + PATCH graph/positions）
+- 交互式画布：节点拖拽、右键菜单、框选工具栏（侧边面板 `GraphSidePanel` 曾存在，后被工具栏 + 右键菜单取代并删除）
+- 节点位置持久化（anchorCommitSha/axisOffset/crossOffset + PATCH graph/positions；最初的 positionX/positionY 已被这三列取代）
 
 #### 6b: 角色系统 + 章节拆分 ⚠️ 部分完成
 - role 字段（trunk/branch/exploration）+ 图上的视觉区分
-- groupLabel 分组 + 图上的分组框渲染
-- 章节卡片展开 commit 列表（CommitList 组件 + GET /api/chapters/:id/commits）
+- groupLabel **只有存储没有渲染**：列、PATCH 校验、graph 响应字段都在，但前端只在 `useNarraFlow`
+  的类型声明里出现一次，没有任何分组框或标签 UI 消费它。要实现分组渲染需自己加 UI。
+- commit 列表（CommitList 组件 + GET /api/chapters/:id/commits）
 - 章节拆分（split at commit）：`chapter-split.ts` + `POST /api/chapters/:id/split` + ChapterSplitModal ✅
   - **实现与本文档 4.2.1 的规格有一处故意偏离**：前序章节的消息截断用 `narrator_message_refs.seq`
     而非"commit 时间戳与消息 createdAt 对比"。时间戳方案在 commit 时间被 rebase/`--date` 改写、
@@ -1860,11 +1884,40 @@ interface NarraForkSettings {
   若要实现：先加服务方法与路由，再加客户端；批量场景可预先分配 `crossOffset`，绕开
   `chapter-fork.ts` 中无锁的槽位搜索。
 
-#### 6c: 依赖关系 ✅
-- dependency 边的创建/删除（图上拖拽连接 + API）
-- chapter-dependency-service：上游变更检测 + 同步操作
-- 图上的依赖可视化（DependencyEdge 橙色虚线 + 更新徽章）
-- SyncUpstreamModal（选择 rebase/merge）
+#### 6c: 依赖关系 ❌ 已移除
+
+原设计：用户在图上拖拽连接两个节点声明 dependency 边，系统检测上游变更并提供 rebase/merge
+同步。**本阶段唯一落地的部分是"画一条橙色虚线"，其余从未存在。已整体移除。**
+
+移除前的实际状态：
+
+- 边能建（`onConnect` 直接落库，无确认对话框，与本文档原先描述不符），但**无法从 UI 删除**：
+  `NarraFlow` 没有 `onEdgesChange`/`onEdgesDelete`/`onEdgeContextMenu`，`useDeleteChapterEdge`
+  零调用点。误拖一条线即产生永久边。
+- 创建时只校验非自环、章节存在、同项目：**无环检测**（A→B→C→A 可建）、**无去重**
+  （`chapter_edges` 只有普通索引没有 UNIQUE 约束；`createForkEdge` 专门用同步事务防重，
+  dependency 路径没有）。
+- **对任何行为零影响**：`chapter-merge`/`chapter-fork`/`chapter-service` 从不读 dependency 边，
+  它不影响合并顺序、不阻止合并、不触发 rebase、不参与批量合并编排。
+- `metadata.lastSyncedCommit` 写入 `null` 后再无代码更新或读取。
+- 上游变更检测完全不存在：`hasUpstreamUpdates` 在 `graph.ts` **硬编码 `false`**（徽章永不亮），
+  `dependency:upstream_updated`/`dependency:synced` 从未发出，
+  `GET /chapters/:id/dependency-status` 与 `POST /chapters/:id/sync-upstream` 无路由
+  （前端客户端在、零调用），`chapter-dependency-service.ts` 与 `SyncUpstreamModal` 都不存在。
+  本文档原先所指的 "chapter-dependency-service" 实际被误认成了
+  `server/services/dependency-service.ts` —— 后者是**系统工具检测**（git/rg/dtach 装没装），
+  与章节依赖毫无关系。
+- Ruler 流程模式对 dependency 边完全无支持，连 `onConnect` 都没有。
+
+移除理由（不止是"没写完"）：它表达的关系 git 已经有了。"B 基于 A" 是 fork 边（自动维护）、
+"B 取了 A 的改动" 是 merge 边、"A 领先于 B" 是 `git log B..A`。用一张手工维护、无校验的边表
+复制这些信息，只会引入漂移源 —— 任何绕过 API 的 rebase/reset/force-push 都会让
+`lastSyncedCommit` 说谎。若只想标记"两个分支语义相关"，`groupLabel` 是更合适的字段，
+不需要一条有方向的图边。
+
+实践中从未创建过任何 dependency 边，因此无需数据迁移。`chapter_edges.type` 枚举保留
+`dependency` 值以便历史行（若有）仍可加载，但没有任何写入路径。`GET /api/chapter-edges`
+保留为只读（fork/merge/review 边仍需要）。
 
 #### 6d: 探索组 ❌ 未实现
 本阶段整体未落地。已存在的只是**周边设施**，不构成可用功能：
@@ -1894,10 +1947,25 @@ interface NarraForkSettings {
 需注意 fork 全程无 `chapterLock` 且 `crossOffset` 槽位分配是 read-then-write 竞态——
 探索组可预先分配 `crossOffset` 规避。
 
-#### 6e: Cherry-pick + 参考式整合 ✅
-- chapter-cherry-pick-service + CherryPickModal（commit 选择器）
-- cherry_pick 边 + CherryPickEdge 图上渲染
-- 参考式整合：叙述者对话中 @mention 其他章节，注入代码 diff 作为上下文（叙述者功能增强，优先级较低）
+#### 6e: Cherry-pick + 参考式整合 ❌ 未实现
+
+先分清两件事：**作为合并策略的 cherry-pick 是可用的** —— `gitService.cherryPick` 由
+`chapter-merge` 以 `strategy: "cherry-pick"` 正常调用，产生的 commit 记为
+`source: "cherry_pick"`。本节描述的是另一件事：从别的章节挑选特定 commit 过来，并在图上
+留一条 cherry_pick 边。这件事没有实现：
+
+- `chapter-cherry-pick-service` 与 `CherryPickModal` **都不存在**（只有一个
+  `chapter-cherry-pick-dirty.test.ts` 覆盖合并策略路径）
+- 没有 `POST /api/chapters/:id/cherry-pick` 路由。残留的 `cherryPickSchema` 与前端
+  `cherryPickChapter` 客户端已删除（与 6b 的 batchFork 残留同一类问题）
+- `chapter_edges.type` 枚举含 `cherry_pick`，`CherryPickEdge` 组件也注册了，但
+  **没有任何代码创建该类型的边**（`chapter-edge-service` 只有 createForkEdge /
+  createMergeEdge / createDependencyEdge），所以这条紫色点线边永不渲染
+- 参考式整合（@mention 其他章节并注入 diff）未实现。`NarratorPanel` 里的 @mention
+  是给具名叙述者用的，与章节 diff 无关
+
+若要实现：加服务方法 + 路由 + `chapterEdgeService.createCherryPickEdge`，再补回 validator
+和客户端。
 
 ---
 
@@ -1934,10 +2002,10 @@ interface NarraForkSettings {
 | 章节关系建模 | chapter_edges 显式边表 + parentChapterId/mergedIntoChapterId 冗余字段 | 边表支持 4 种关系类型（fork/merge/dependency/cherry_pick），冗余字段保留高频查询路径 |
 | 章节角色 | role 标签（trunk/branch/exploration）而非固定层级 | 动态涌现的层级关系，不预设固定结构，任何章节都可以成为基线 |
 | 项目主界面 | 故事网络图（交互式画布）替代章节卡片网格 | 图是理解章节关系的最直观方式，打开项目即看到全局视图 |
-| 节点位置持久化 | chapters 表 positionX/positionY 字段 | 混合布局：手动定位的节点固定，其余自动布局，反映用户心智模型 |
-| 探索组 | 独立 exploration_groups 表 | 探索组有独立生命周期（active/decided/abandoned），需要记录基准章节和最终决策，图上作为分组框渲染 |
+| 节点位置持久化 | chapters 表 anchorCommitSha/axisOffset/crossOffset 字段（取代最初的 positionX/positionY） | 混合布局：手动定位的节点固定，其余自动布局，反映用户心智模型 |
+| 探索组 | 独立 exploration_groups 表 | 曾按此设计建表并保留 validator，但**没有落地**：没有服务方法、没有路由、图上也没有分组框。graph 接口原先每次请求都查这张表并返回，却无人渲染，该查询已移除 |
 | 章节拆分 | split at commit = 创建前序章节 + 原章节变后续 + 新 fork | 比简单的"从历史 commit fork"更精确地表达语义：历史被拆分为两条独立的演进路径 |
-| frozen 状态 | 拆分后的前序章节（非 trunk）设为 frozen | 前序章节代表已确定的历史，不应再修改。trunk 例外（主线持续演进） |
+| ~~frozen 状态~~ | **已移除**，前序章节改用 dormant | 原设计让拆分后的前序章节进入 frozen，但该状态没有出口（fork/wake/dormant 全拒绝它），且从无写入路径。"已确定的历史"由 merged 表达，后者有 unmerge 作为出口 |
 | 子代理系统 | narrator.type='subagent' + subagentType(explore/plan/general) | 叙述者可派生子任务代理，通过 parentToolUseId 关联消息树 |
 | 技能系统 | 项目级技能库（skill-service.ts） | 为叙述者提供领域特定指令和知识，提升 AI 输出质量 |
 | 例程系统 | 内置 + 自定义例程（routine-service.ts） | 自动化重复性任务，支持内置和用户自定义例程 |

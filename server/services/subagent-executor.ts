@@ -26,6 +26,7 @@ import {
 	resolveProvider,
 	usesCodexModel,
 } from "../lib/settings";
+import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import { type ImageRef, saveTextFileToWorktree, type TextFileRef } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -58,7 +59,7 @@ import {
 	registerActiveSubagent,
 	unregisterActiveSubagent,
 } from "./narrator-session-state";
-import { buildSpecToolResultReminder } from "./spec-reminder";
+import { buildSpecTaskDigestBody } from "./spec-reminder";
 import {
 	deleteConclusionFileId,
 	resolveConclusionFilePath,
@@ -720,7 +721,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			resolvedFastMode && usesCodexModel(resolvedProvider, model) ? "priority" : undefined;
 		let todoReminderCompletedToolCount = 0;
 		// Completed-tool count when the spec reminder was last injected for this
-		// subagent loop. Gates buildSpecToolResultReminder to the same cadence the
+		// subagent loop. Gates buildSpecTaskDigestBody to the same cadence the
 		// agent loop used to enforce, so we don't hit the DB on every tool result.
 		let lastTasksReminderCount = 0;
 		const resetUpstreamSessionForThisLoop = resetUpstreamSessionOnNextRequest;
@@ -802,14 +803,14 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					// so the spec file is not re-read from SQLite on every tool result.
 					const count = request.completedToolCount ?? 0;
 					if (count - lastTasksReminderCount < TODO_REMINDER_TOOL_INTERVAL) return [];
-					const reminder = await buildSpecToolResultReminder(narratorId, locale as Locale);
-					if (!reminder) return [];
+					const tasksBody = await buildSpecTaskDigestBody(narratorId);
+					if (!tasksBody) return [];
 					lastTasksReminderCount = count;
 					return [
 						{
 							target: "tool_result" as const,
 							source: "living_work_spec",
-							content: reminder,
+							...sideCarBodyWithText("living_work_spec", tasksBody, locale as Locale),
 							toolUseId: request.toolUseId,
 						},
 					];
@@ -872,23 +873,39 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					sideCars.push({
 						target: "user_message",
 						source: "buffered_user",
-						content: buf.text,
+						// Emitted bare: this is the user's own text, and a `prose` body with no
+						// heading renders back to exactly it (byte parity is trivially held).
+						...sideCarBodyWithText(
+							"buffered_user",
+							{ kind: "prose", text: buf.text },
+							locale as Locale,
+						),
 					});
 				}
 
 				// 2. Drain team inbox and append as notifications
 				const teamMessages = drainTeamInbox(narratorId);
 				if (teamMessages.length > 0) {
-					const teamBlock = teamMessages
-						.map(
-							(m) =>
-								`[Team ${m.isBroadcast ? "broadcast" : "message"} from ${m.fromTitle ?? m.fromId} (${m.fromType})]: ${m.text}`,
-						)
-						.join("\n");
 					sideCars.push({
 						target: "user_message",
 						source: "team_message",
-						content: teamBlock,
+						...sideCarBodyWithText(
+							"team_message",
+							{
+								kind: "messages",
+								items: teamMessages.map((m) => ({
+									fromId: m.fromId,
+									// `fromTitle ?? fromId` was the old inline template's sender slot;
+									// the renderer applies the same fallback, so leaving the raw pair
+									// here keeps the text identical AND gives the UI both parts.
+									fromTitle: m.fromTitle ?? null,
+									fromType: m.fromType ?? null,
+									...(m.isBroadcast ? { isBroadcast: true } : {}),
+									text: m.text,
+								})),
+							},
+							locale as Locale,
+						),
 					});
 				}
 

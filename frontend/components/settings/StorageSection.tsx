@@ -182,12 +182,11 @@ export function StorageSection() {
 		vacuumSupported,
 		vacuumReason,
 		healthState: storageHealthState,
+		healthReady: storageHealthReady,
 		healthError: storageHealthError,
 		healthFetching: storageHealthFetching,
 		refetchHealth,
 	} = useStorageCapability();
-	const storageHealthReady =
-		storageHealthState === "legacy" || storageHealthState === "capabilities";
 	const storageHealthLoadingMessage = t("storageHealthLoading", {
 		defaultValue: "Loading storage capabilities…",
 	});
@@ -788,7 +787,7 @@ export function StorageSection() {
 					</Text>
 				)}
 
-				{storageHealthState === "capabilities" && !scanSupported && (
+				{storageHealthReady && !scanSupported && (
 					<Alert color="yellow" variant="light" title={t("storageScanUnsupportedTitle")}>
 						{scanDisabledReason}
 					</Alert>

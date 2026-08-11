@@ -1,7 +1,6 @@
 import { db } from "@server/db";
 import { chapterEdges, chapters } from "@server/db/schema";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
-import { eventBus } from "@server/lib/event-bus";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { and, eq, or } from "drizzle-orm";
@@ -11,62 +10,42 @@ import { and, eq, or } from "drizzle-orm";
 // keeping response time bounded.
 const EDGE_QUERY_LIMIT = 2000;
 
+/**
+ * === dependency edges: removed ===
+ *
+ * `createDependencyEdge` and the generic `deleteEdge` used to live here. The user drew a
+ * `dependency` edge by dragging from one node's handle to another, and the intent was
+ * "chapter B depends on chapter A, warn me when A moves ahead".
+ *
+ * Nothing consumed it. `chapter-merge`, `chapter-fork` and `chapter-service` never read
+ * dependency edges, so the edge changed no behaviour: it did not order merges, block them,
+ * trigger a rebase, or feed batch-merge planning. `getEdgesByType` was only reachable from
+ * `GET /api/chapter-edges`, i.e. "read back what you wrote". The promised upstream tracking
+ * was never built: `hasUpstreamUpdates` was hardcoded `false` in `graph.ts`, so the badge
+ * never lit; `dependency:upstream_updated` and `dependency:synced` were never emitted; and
+ * `GET /chapters/:id/dependency-status` plus `POST /chapters/:id/sync-upstream` never
+ * existed despite typed frontend clients naming them.
+ *
+ * It was also unsound as a feature. Creation checked only self-loop, existence and same
+ * project — no cycle detection and no dedupe (unlike `createForkEdge`, which uses a
+ * synchronous transaction precisely because the table has no UNIQUE constraint), so a
+ * user could build A→B→C→A or stack identical edges. `metadata.lastSyncedCommit` was
+ * written as `null` and never updated by anything. And the UI could create edges but not
+ * remove them: `NarraFlow` wired `onConnect` with no `onEdgesChange`/`onEdgesDelete`, and
+ * `useDeleteChapterEdge` had zero call sites, so one stray drag produced a permanent edge.
+ *
+ * The relationships it modelled are already available without hand-maintained bookkeeping:
+ * "B is based on A" is the fork edge (created automatically), "B took A's changes" is the
+ * merge edge, and "A is ahead of B" is `git log B..A`. A manually-curated
+ * `lastSyncedCommit` can only drift once anyone rebases or force-pushes outside the API.
+ * If purely semantic grouping is wanted later, `groupLabel` is the field for it, not a
+ * directed edge.
+ *
+ * No dependency edge was ever created in practice, so no data migration is needed. The
+ * `dependency` value stays in the `chapter_edges.type` enum so historical rows (if any)
+ * still load; nothing writes it.
+ */
 class ChapterEdgeService {
-	/**
-	 * Create a dependency edge (user-initiated).
-	 */
-	async createDependencyEdge(input: {
-		sourceId: string;
-		targetId: string;
-		metadata?: { description?: string };
-	}) {
-		if (input.sourceId === input.targetId) {
-			throw new ValidationError("Cannot create a dependency edge to itself");
-		}
-
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, input.sourceId),
-		});
-		if (!source) throw new NotFoundError("Chapter", input.sourceId);
-
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, input.targetId),
-		});
-		if (!target) throw new NotFoundError("Chapter", input.targetId);
-
-		if (source.projectId !== target.projectId) {
-			throw new ValidationError("Cannot create dependency between chapters of different projects");
-		}
-
-		const id = generateId();
-		const now = new Date().toISOString();
-
-		const [edge] = await db
-			.insert(chapterEdges)
-			.values({
-				id,
-				projectId: source.projectId,
-				sourceId: input.sourceId,
-				targetId: input.targetId,
-				type: "dependency",
-				metadata: {
-					description: input.metadata?.description,
-					lastSyncedCommit: null,
-				},
-				createdAt: now,
-			})
-			.returning();
-
-		eventBus.emit({
-			type: "dependency:created",
-			edgeId: id,
-			sourceId: input.sourceId,
-			targetId: input.targetId,
-		});
-
-		return edge;
-	}
-
 	/**
 	 * Internal: create a fork edge (called automatically during chapter fork).
 	 * Idempotent: if the same (source, target, "fork") edge already exists, update it in place.
@@ -237,29 +216,6 @@ class ChapterEdgeService {
 	}
 
 	/**
-	 * Delete an edge (only dependency type can be manually deleted).
-	 */
-	async deleteEdge(id: string) {
-		const edge = await db.query.chapterEdges.findFirst({
-			where: eq(chapterEdges.id, id),
-		});
-		if (!edge) throw new NotFoundError("ChapterEdge", id);
-
-		if (edge.type !== "dependency") {
-			throw new ValidationError("Only dependency edges can be manually deleted");
-		}
-
-		await db.delete(chapterEdges).where(eq(chapterEdges.id, id));
-
-		eventBus.emit({
-			type: "dependency:removed",
-			edgeId: id,
-			sourceId: edge.sourceId,
-			targetId: edge.targetId,
-		});
-	}
-
-	/**
 	 * Delete all merge edges where the given chapter is the source (the merged branch).
 	 * Called when waking a merged chapter to remove stale merge lines.
 	 */
@@ -310,7 +266,7 @@ class ChapterEdgeService {
 	/**
 	 * Get edges by type within a project.
 	 */
-	async getEdgesByType(projectId: string, type: "fork" | "merge" | "dependency" | "cherry_pick") {
+	async getEdgesByType(projectId: string, type: "fork" | "merge" | "review") {
 		const rows = await db
 			.select()
 			.from(chapterEdges)

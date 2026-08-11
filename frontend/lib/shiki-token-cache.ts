@@ -6,8 +6,8 @@
  * markup and layout). It needs raw TOKENS instead: pretext decides where lines
  * break, Shiki only says what colour each run of characters is.
  *
- * That is exactly the model the Pixi renderer already uses (pixi-shiki-highlight),
- * so this module mirrors its proven structure with two differences:
+ * The structure here was modelled on the deleted Pixi renderer's
+ * `pixi-shiki-highlight`, with two differences:
  *   - colours are CSS strings (`#rrggbb`) rather than Pixi's numeric form
  *   - a monotonic `version` counter is exposed so React's useSyncExternalStore has
  *     a reference-stable snapshot (the LRU's delete+set re-insertion reorders the

@@ -1,6 +1,8 @@
 # 知识库（Knowledge Base）设计
 
-状态：设计草案（未实现）
+状态：**大部分已实现**（集合/条目/版本/标签/密级/双轴授权/条目链接/FTS 检索/关键词注入/个人版本→提交→审核→合入/ACL 审计 均已落地）。
+两项**未实现、仅设计保留**：正文内联链接（3.8）与条件内容块 block（3.9）—— 两节顶部各有明确标注，请勿据其做任何假设。
+协作写入链路（个人版本、发布请求、状态机、通知、审计）见 **6.7**；已知缺口集中在 **第 10 节**。
 适用范围：NarraFork 通用能力
 
 > 知识库是 NarraFork 的**通用平台能力**，不是为某个具体业务（如机器人远程诊断）定制的功能。它让"可被 AI 叙述者按需检索、引用的结构化知识"成为项目/全局的一等资源。机器人诊断的经验库（错误码、FAQ、历史案例）只是它的**首批消费场景之一**，文档中相关示例仅作说明，不应让业务概念渗入通用设计。
@@ -830,6 +832,137 @@ principal P：clearance=secret，grantedTags={product:M20}
 
 ---
 
+## 6.7 个人版本 → 提交 → 审核 → 合入（已实现）
+
+> 本章描述**已落地**的协作写入链路。它是 1.2 节"写时复制 + 版本管理"在多用户下的具体形态：全局条目（main）始终是评审后的结果，个人可以自由编辑自己的副本，两者通过"发布请求（submission）"衔接。
+>
+> 相关实现：`server/services/knowledge-branch-service.ts`、表 `knowledge_drafts` / `knowledge_submissions`、路由 `server/routes/knowledge.ts`、agent 工具 `KnowledgeEdit` / `KnowledgeReview`。
+
+### 6.7.1 个人条目（personal entry）的两种形态
+
+个人条目存在 `knowledge_drafts`（表名保留了早期"draft"命名，实体语义是"我的个人版本"）：
+
+| 形态 | `entryId` | `baseRevisionId` | 标题/目标集合 | 发布语义 |
+|------|-----------|------------------|---------------|----------|
+| **linked（关联）** | 指向全局条目 | fork 时的 main 版本，作为三方合并基准 | 继承全局条目 | 合并进已有条目，产生新 revision |
+| **standalone（独立）** | NULL | NULL | 自带 `title` + `targetCollectionId`（发布前必填） | 批准时**新建**全局条目 |
+
+- linked 条目由 `createDraft(entryId)` 创建，**幂等**：同一用户对同一条目已有 active 副本时返回原副本。
+- standalone 条目由 `createStandalone()` 创建，**不做幂等**（同名可重复创建，属已知取舍）。
+- 个人条目自身只有 `active` / `archived` 两态；发布请求的生命周期完全在 `knowledge_submissions` 上，两者正交。
+- 个人版本参与**搜索遮蔽**：检索时（`draftUserId`）自己的 active 副本会遮蔽全局版本，命中标记 `(personal)`，落后时标记 `(personal ⚠ behind main)`。
+
+### 6.7.2 drift 与 rebase
+
+**drift（漂移）** ⟺ `draft.baseRevisionId !== entry.currentRevisionId`，即自你 fork 之后 main 又前进了。
+
+- 单条检测 `getDraftDrift(entryId)` 返回 `drifted` / `versionsBehind` 与三方内容（base / current / draft），供渲染 diff。
+- 批量检测 `findDriftedDraftIds(rows)` 一次查询判定一页，`GET /personal-entries` 用它给每行回填 `drifted`，避免逐条调用 drift 接口（那会返回 N×3 份正文）。
+- **rebase 策略**：`merge`（默认，三方合并；冲突则返回双方内容且**不写入**）、`theirs`（放弃本地改动、直接采用 main，永不冲突）。
+- rebase 成功会把 `pending` 提交置为 `superseded`（提案内容已变），但**不动 `conflict` 提交**（见 6.7.4）。
+- **提交时会检测 drift**：`submitForReview` 若发现基线过时，仍然提交成功，但在返回值上附 `driftWarning: { versionsBehind, baseRevisionId, currentRevisionId }`。设计取舍：不硬失败（过时基线多数可合并，硬失败会卡住 rebase 冲突的作者），但必须**当场告知作者**——否则冲突要等审核者点批准时才暴露，那时唯一知道改动意图的人已不在场。
+
+### 6.7.3 submission 状态机
+
+```
+                    submitForReview
+                          │
+                          ▼
+                     ┌─────────┐   review(approve) 且三方合并成功
+                     │ pending │ ─────────────────────────────▶ approved（终态，已合入 main）
+                     └─────────┘
+                       │  │  │  │
+     review(approve)   │  │  │  └── updateDraft / rebaseDraft ──▶ superseded（终态，非审核结论）
+     但合并失败         │  │  │
+                       ▼  │  └───── withdrawSubmission ────────▶ withdrawn（终态）
+                  ┌──────────┐
+                  │ conflict │ ── resolveConflict（审核者给出合并内容）──▶ approved
+                  └──────────┘ ── withdrawSubmission ─────────────────▶ withdrawn
+                       │
+     review(request_changes)
+                       ▼
+            ┌───────────────────┐ ── resubmit ──▶（新的 pending，带 round + previousSubmissionId）
+            │ changes_requested │ ── withdrawSubmission ──▶ withdrawn（作者决定放弃）
+            └───────────────────┘
+
+     review(reject) ──▶ rejected（终态；不接 resubmit，个人条目保留可另起新提交）
+```
+
+**verdict 与 status 的对应**：
+
+| verdict | 结果 status | 是否可再提交 | 语义 |
+|---------|-------------|--------------|------|
+| `approve` | `approved`（或合并失败 → `conflict`） | — | 合并/发布进 main |
+| `request_changes` | `changes_requested` | ✅ `resubmit` | 退回作者，期待修改后再来 |
+| `reject` | `rejected` | ❌ **终态** | 彻底拒绝该请求；**这正是它与 `request_changes` 的区别** |
+| `comment_only` | 不变 | — | 只记录审核意见，不改变状态 |
+
+**非审核结论的两种关闭**（不写 `verdict`，避免在作者的历史里显示成"被审核者拒绝"）：
+
+- `superseded` — 作者编辑/rebase 了个人条目，提案内容已不再描述任何东西（自动）。
+- `withdrawn` — 作者主动撤回，或作者删除了个人条目而顺带关闭（`CLOSED_ON_DELETE_STATUSES`）。
+
+**可撤回状态**：`pending` / `conflict` / `changes_requested`。把 `changes_requested` 纳入是因为它的唯一出口原本只有 `resubmit`——决定不改的作者会让请求永远挂在双方列表里。
+
+**删除个人条目时**会关闭上述三种未合入状态的提交（置 `withdrawn`）。注意 `changes_requested` 的关闭**保留** reviewer 的 `verdict` 与 reviewer id：审核者确实要求过修改，"要求修改后作者retire了条目"才是准确的历史，只有 status 反映是谁关闭的。
+
+### 6.7.4 冲突（conflict）的处理边界
+
+- **产生**：`approve` 时以 `sub.baseRevisionId` 为基准做三方合并（`createPatch` + `applyPatch`），patch 无法应用 → 转 `conflict`。若基准恰好等于当前 main，走快速路径直接采用提案。
+- **谁能解**：只有**审核者**（`resolveConflict` 提供最终合并正文）。作者本人被拒绝（admin 例外）。
+- **为何编辑不自动关闭 conflict**：`SUPERSEDABLE_STATUSES` 刻意只含 `pending`。冲突意味着 main 与提案真实分歧、需要人来决定合并结果，编辑就静默丢弃它会**隐藏未解决的分歧**。
+- **作者的出路**：撤回 → rebase → 重新编辑 → 重新提交。（`submitForReview` 遇到已有 conflict 提交时会在报错里指明这条路径。）
+
+### 6.7.5 审核授权
+
+`canReview(caps, entry)` 三条路径任一即可：
+
+1. **admin** — 短路放行。
+2. **entry owner** — 短路放行（这是第三条轴，`getMyReviewScope` 会以 `ownedEntryCount` 报告它）。
+3. **持有条目的全部 review tag** — `entry.reviewTagsJson ⊆ caps.reviewTagIds`（合取，与受控标签同样是"全部满足"）。
+
+标准链路的完整判定：
+
+- **linked 提交** → 目标条目的集合可读（`canReadCollection`）**且** `canReview(entry)`。
+- **standalone 提交** → 目标集合可读**且**可写（`canWriteCollection`）——因为批准会在该集合里新建条目。
+- **禁止自审**：`sub.submitterUserId === principal.userId` 一律拒绝（admin 例外）。`listSubmissions` 与 `countReviewInbox` 都据此排除自己的提交，所以作者要看自己的发布进度只能走 `listSubmissionsForDraft` / `listMyOpenSubmissions`。
+
+> ⚠️ **`reviewTags` 为空是 fail-closed**：条目没有任何 review tag 时 `canReview` 返回 false，即**只有 owner 与 admin 能审**。这是有意的安全默认（不设标签不等于人人可审），但对管理员不直观——前端 `EntryAclPanel` 会在 reviewTags 为空时给出提示。
+
+### 6.7.6 通知
+
+事件在**事务提交之后**发出（`at most once`：提交后进程崩溃会丢通知，对非关键提醒可接受），经 `knowledge-notify.ts` 转成按用户的 WS 推送。
+
+铁律：**推送只带 id，不带标题/正文**，客户端再走 ACL 检查过的 HTTP 端点回取。所以推送本身永远不可能把高密级条目泄露给无权用户。
+
+| 事件 | 通知对象 | 触发 |
+|------|----------|------|
+| `submission_created` | 候选审核者（排除提交者） | 提交发布请求 |
+| `submission_reviewed` | 提交者 + 候选审核者 | 任一 verdict |
+| `submission_invalidated` | 提交者 + 候选审核者 | superseded / withdrawn / 条目被删 |
+| `entry_published` | 提交者 | 批准并合入 |
+| `entry_drifted` | 持有该条目个人版本的**其他**用户 | 任何 main 写入（直接改 revision、批准发布、解决冲突） |
+| `acl_changed` | 授权发生变化的用户 | grant 增删、批量授权、`setUserAcl` |
+| `owner_transferred` | 原 owner + 新 owner | 条目/集合所有权转移 |
+
+后三类走 `knowledge:library_changed`（读者视角的变化，与审核队列无关）；前四类走 `knowledge:review_inbox_changed`。drift 与 ACL 的通知都有**上限**（各 200 用户），避免一次写入引发无界扇出。
+
+### 6.7.7 ACL 审计
+
+所有**授权变更**写入 append-only 的 `knowledge_acl_events`（`server/services/knowledge-audit.ts`），回答"谁在何时给谁授了什么权"：
+
+- 事件类型：`grant_added` / `grant_removed` / `grants_bulk_added` / `user_acl_replaced` / `entry_acl_updated` / `collection_acl_updated` / `entry_owner_transferred` / `collection_owner_transferred`。
+- 记录 actor（谁操作）+ subject（谁的权限变了）+ target（在什么对象上）+ `detailJson`。
+- **`detailJson` 按构造脱敏**：只存密级**名**、tag **id**、布尔标记与 before/after 快照，**绝不存条目标题或正文**——否则审计日志本身会变成绕过 ACL 读内容的通道。
+- 无外键：审计行必须在其描述的 user/entry/collection 被删除后继续存在。
+- 写入是 fire-and-forget 且吞掉异常：磁盘写满不应把一次授权编辑变成 500。取舍是显式的——**审计缺一条 优于 破坏 ACL 操作本身**。
+- 读取 `GET /api/knowledge/acl-events`（**仅 admin**，keyset 分页，无 OFFSET/COUNT(*)）。日志本身含密级与分区信息，所以它自己也是安全敏感资源。
+- 一次批量授权只写**一行**（列出受影响用户），而不是 N 行——否则真正的管理动作会被噪声淹没。
+
+> 注意：`block` 裁剪（3.9）不进审计，它不是授权决策（见 6.6）。
+
+---
+
 ## 7. 与 skills 的关系
 
 | 维度 | skills（现有） | 知识库（新增） |
@@ -905,6 +1038,13 @@ principal P：clearance=secret，grantedTags={product:M20}
 
 ### 10.3 审核状态机的其余边界
 
-已闭环：`withdrawn`（作者撤回）、`superseded`（编辑取代，区别于 `rejected`）、`changes_requested → resubmit`（带 `round` / `previousSubmissionId`）、`rebase?strategy=theirs`（放弃本地改动）。
+完整状态机见 **6.7.3**。已闭环：`withdrawn`（作者撤回，覆盖 `pending`/`conflict`/`changes_requested`）、`superseded`（编辑取代，非审核结论）、`changes_requested → resubmit`（带 `round` / `previousSubmissionId`）、`reject → rejected`（终态，不接 resubmit）、`rebase?strategy=theirs`（放弃本地改动）、提交时的 drift 警告。
 
-仍未做：`rejected` 之后没有作者侧出口（只能新建提交，不接 resubmit 链），以及 `conflict` 提交只能由**审核者** `resolve` 提供合并内容，作者无法自己就地编辑合并结果后交还 —— 作者当前的可行路径是撤回 + rebase + 重新提交。
+仍未做（有意保留的取舍）：`conflict` 提交只能由**审核者** `resolve` 提供合并内容，作者无法自己就地编辑合并结果后交还 —— 作者当前的可行路径是撤回 + rebase + 重新提交（`submitForReview` 的报错会指明这条路）。要让作者直接解冲突，需要新增"作者提交合并结果、审核者仅确认"的中间态，属独立立项。
+
+### 10.4 知识库前端的其余缺口
+
+- **知识图谱无可视化**：`useEntryGraph` hook 与 `GET /entries/:id/graph` 都已就绪，缺 React Flow 之类的图视图组件。
+- **条目筛选**：`GET /entries` 支持 `tag`，但前端无标签筛选控件；按密级筛选前后端都没有。
+- **ACL 审计无界面**：`GET /api/knowledge/acl-events`（6.7.7）目前只有 API，没有管理页。
+- **无应用内通知中心**：知识库通知走 WS 推送 + React Query 失效（6.7.6），没有落库的未读列表，也没有 toast。全库没有 `notifications` 表，`notification-service` 是钉钉/飞书 webhook——要做通知中心应作为**平台级能力**立项（不止知识库需要），并需先解决"通知带不带标题"的矛盾：带则可能泄露密级，不带则通知可读性差。

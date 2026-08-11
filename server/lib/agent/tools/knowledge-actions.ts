@@ -50,19 +50,38 @@ export const KNOWLEDGE_REVIEW_READ_ACTIONS = ["list_submissions", "get_submissio
 export const KNOWLEDGE_REVIEW_WRITE_ACTIONS = [
 	"approve",
 	"request_changes",
+	// Terminal refusal (status → `rejected`), as opposed to request_changes' invitation to retry.
+	"reject",
 	"comment",
 	"resolve_conflict",
 ] as const;
 
 // ─── KnowledgeEdit (edit/maintain knowledge via personal entries + publish) ───
-export const KNOWLEDGE_EDIT_ACTIONS = [
+
+/**
+ * Read-only KnowledgeEdit actions: no permission prompt, no danger reflection.
+ *
+ * `my_submissions` lives on KnowledgeEdit rather than KnowledgeReview because it is the
+ * AUTHOR's view of their own publish requests, and KnowledgeReview deliberately hides
+ * those (a reviewer may not review their own submission).
+ */
+export const KNOWLEDGE_EDIT_READ_ACTIONS = ["my_submissions"] as const;
+
+export const KNOWLEDGE_EDIT_WRITE_ACTIONS = [
 	"save", // write content to my personal entry (or, with direct + permission, to global main)
 	"rebase", // rebase my drifted personal entry onto current main
 	"publish", // submit my personal entry to be published into the global base
+	"withdraw", // retract one of my own unmerged publish requests
+	"resubmit", // re-propose after a reviewer requested changes
 	"set_target", // set a standalone personal entry's target collection
 	"update_meta", // update a global entry's title/tags/status (needs write permission)
 	"transfer_owner",
 	"transfer_collection_owner",
+] as const;
+
+export const KNOWLEDGE_EDIT_ACTIONS = [
+	...KNOWLEDGE_EDIT_READ_ACTIONS,
+	...KNOWLEDGE_EDIT_WRITE_ACTIONS,
 ] as const;
 
 /**
@@ -70,7 +89,7 @@ export const KNOWLEDGE_EDIT_ACTIONS = [
  * entry. Classified `high` for danger reflection; other writes are `medium`.
  *  - KnowledgeReview: approve / resolve_conflict (merge into main).
  *  - KnowledgeEdit: handled separately in classifyDanger (a `save` with `direct:true` writes
- *    main → high; everything else personal → medium/none).
+ *    main → high; everything else personal → medium; read actions → none).
  */
 export const KNOWLEDGE_MERGE_ACTIONS = ["approve", "resolve_conflict"] as const;
 
@@ -88,6 +107,7 @@ export type KnowledgeEditAction = (typeof KNOWLEDGE_EDIT_ACTIONS)[number];
 export const KNOWLEDGE_READ_ACTIONS: ReadonlySet<string> = new Set<string>([
 	...KNOWLEDGE_ADMIN_READ_ACTIONS,
 	...KNOWLEDGE_REVIEW_READ_ACTIONS,
+	...KNOWLEDGE_EDIT_READ_ACTIONS,
 ]);
 
 /** Merge/main-write actions → high danger severity. */

@@ -9,6 +9,7 @@ import {
 	setGlobalSwipeAnchor,
 } from "../components/narrator/swipeState";
 import { collectElementTextPreview, compactWhitespacePreview } from "../lib/dom-text";
+import { findVerticalScrollParent, resolveSwipeAnchorOffScreen } from "./scroll-parent";
 
 const DEFAULT_THRESHOLD = 60;
 const DEFAULT_REVEAL_WIDTH = 180;
@@ -456,11 +457,12 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			}
 			return;
 		}
-		// Find the nearest scrollable ancestor of the swipe target
-		let scrollParent: HTMLElement | null = swipeBoxRef.current?.parentElement ?? null;
-		while (scrollParent && scrollParent.scrollHeight <= scrollParent.clientHeight) {
-			scrollParent = scrollParent.parentElement;
-		}
+		// Nearest ancestor that ACTUALLY scrolls. Overflow is consulted (not just
+		// heights): a virtualized list's canvas is sized to the whole document with
+		// `overflow: hidden`, so a height-only walk stopped at a box that overflows
+		// but cannot scroll — and visibility was then measured against an area no row
+		// can ever leave, which is why the off-screen overlay never appeared there.
+		const scrollParent = findVerticalScrollParent(swipeBoxRef.current?.parentElement ?? null);
 		let rafId = 0;
 		const tick = () => {
 			// Throttle to one update per animation frame
@@ -468,7 +470,15 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			rafId = requestAnimationFrame(() => {
 				rafId = 0;
 				const box = swipeBoxRef.current;
-				// DOM node removed (e.g. virtualised list recycled it) — dismiss
+				// Node gone for good (document reloaded / paged away) — dismiss.
+				//
+				// In the VIRTUAL list this branch used to fire for an ordinary scroll:
+				// the canvas mounts only the rows near the viewport, so scrolling past
+				// the swiped row destroyed its node and the swipe was closed before the
+				// off-screen strip could ever be reported. The anchor's row is now pinned
+				// into the mounted window (vlist-swipe-anchor.ts), so a disconnected node
+				// again means what it says here — the row is genuinely gone, and leaving a
+				// strip pointing at nothing would be worse than dropping it.
 				if (!box?.isConnected) {
 					offScreenRef.current = null;
 					getGlobalOnSwipeAnchorInfo()?.(null);
@@ -485,8 +495,8 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 					visBottom = cr.bottom;
 				}
 				// Block has scrolled entirely out of the visible area
-				if (rect.bottom < visTop || rect.top > visBottom) {
-					const dir = rect.bottom < visTop ? "top" : "bottom";
+				const dir = resolveSwipeAnchorOffScreen(rect, { top: visTop, bottom: visBottom });
+				if (dir) {
 					if (offScreenRef.current !== dir) {
 						offScreenRef.current = dir;
 						const bid = effectiveAnchor;

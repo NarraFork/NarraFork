@@ -8,21 +8,15 @@ describe("summarizeGraphRuntimeState", () => {
 
 		expect(result).toEqual<GraphRuntimeStatus>({
 			degraded: false,
-			graphReadRefresh: false,
 			fallbackMessages: [],
 		});
 	});
 
-	test("surfaces commit sync refresh support and fallback diagnostics", () => {
+	test("surfaces fallback diagnostics with reason and error detail", () => {
 		const graph: ProjectGraphResponse = {
 			nodes: [],
 			edges: [],
 			degraded: false,
-			capabilities: {
-				commitSync: {
-					graphReadRefresh: true,
-				},
-			},
 			fallbacks: [
 				{
 					feature: "graph.gitMetadata",
@@ -34,7 +28,6 @@ describe("summarizeGraphRuntimeState", () => {
 
 		expect(summarizeGraphRuntimeState(graph)).toEqual<GraphRuntimeStatus>({
 			degraded: true,
-			graphReadRefresh: true,
 			fallbackMessages: ["graph.gitMetadata: git_metadata_refresh_failed — writeback failed"],
 		});
 	});

@@ -42,7 +42,6 @@ import {
 	specNamespaces,
 	specProtectedTasks,
 	terminals,
-	terminalTabs,
 	terminalViewState,
 	userFavoriteDirectories,
 	userPreferences,
@@ -294,11 +293,6 @@ export const remoteDevicesRelations = relations(remoteDevices, ({ one }) => ({
 export const terminalsRelations = relations(terminals, ({ one }) => ({
 	chapter: one(chapters, { fields: [terminals.chapterId], references: [chapters.id] }),
 	narrator: one(narrators, { fields: [terminals.narratorId], references: [narrators.id] }),
-}));
-
-export const terminalTabsRelations = relations(terminalTabs, ({ one }) => ({
-	chapter: one(chapters, { fields: [terminalTabs.chapterId], references: [chapters.id] }),
-	narrator: one(narrators, { fields: [terminalTabs.narratorId], references: [narrators.id] }),
 }));
 
 export const terminalViewStateRelations = relations(terminalViewState, ({ one }) => ({

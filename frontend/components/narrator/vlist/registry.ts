@@ -43,7 +43,6 @@ import {
 	measureActivityTrace,
 	measureReasoningCountLine,
 	measureReasoningStepsTrace,
-	measureSidecarTrace,
 	measureToolRunCountLine,
 	measureToolRunSummary,
 } from "./measure/measure-tool-run";
@@ -134,15 +133,6 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		label: "System injection (sidecar) card",
 		lodSensitive: false,
 		measure: (d, w, l, o) => measureSidecar(d as AnyData, w, l, o as AnyData),
-	},
-	"sidecar-trace": {
-		kind: "sidecar-trace",
-		label: "System injection (sidecar) trace row (low LOD)",
-		// The trace's own geometry is LOD-independent (the ADAPTER picks this kind
-		// only below the card threshold), but `lod` is forwarded so a drilled-in
-		// reasoning body measures like a reasoning step's at the same level.
-		lodSensitive: true,
-		measure: (d, w, l, o) => measureSidecarTrace(d as AnyData, w, o as AnyData, l),
 	},
 	"knowledge-hint": {
 		kind: "knowledge-hint",

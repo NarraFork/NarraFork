@@ -48,6 +48,7 @@ import {
 	useMemo,
 	useRef,
 	useState,
+	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
 import type { ChunkedMessageListHandle, ChunkTailMeta } from "../ChunkedMessageList";
@@ -64,6 +65,7 @@ import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import { useRenderLod } from "../RenderLodCtx";
 import { recentRunSegmentMessageIds } from "../run-segments";
+import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../swipeState";
 import { TraceRowInteraction } from "../TraceRowInteraction";
 import {
 	getCategory,
@@ -191,6 +193,7 @@ import {
 	resolveSpecCarryoverActions,
 	useSpecCarryoverActions,
 } from "./vlist-spec-carryover-actions";
+import { resolveSwipeAnchorRowIndex } from "./vlist-swipe-anchor";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
 import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
@@ -200,7 +203,7 @@ import {
 	resolveVListUserMarkerScrollTop,
 	type VListUserMarker,
 } from "./vlist-user-markers";
-import { resolvePinnedRowIndices } from "./vlist-virtualization";
+import { mergePinnedRowIndices, resolvePinnedRowIndices } from "./vlist-virtualization";
 import {
 	bucketViewportHeight,
 	isExternalGeometryChange,
@@ -679,12 +682,7 @@ const TOGGLEABLE_CARD_KINDS = new Set([
 	"sidecar",
 ]);
 /** Trace-family kinds with header/earlier/row toggles. */
-const TRACE_KINDS = new Set([
-	"activity-trace",
-	"tool-run-summary",
-	"reasoning-steps",
-	"sidecar-trace",
-]);
+const TRACE_KINDS = new Set(["activity-trace", "tool-run-summary", "reasoning-steps"]);
 /**
  * Folded traces whose individual ROWS get their own interaction surface.
  *
@@ -749,6 +747,43 @@ function resolveTraceRowIdentity(
 		};
 	}
 	return identity;
+}
+
+/**
+ * Every selection blockId one rendered row can answer for.
+ *
+ * Used only to locate the touch swipe ANCHOR's row so it can be pinned into the
+ * mounted window. A row is more than its own element id: a folded trace paints one
+ * independently-swipeable row per tool call / reasoning step, and any of those rows
+ * may be the anchor while the unit that must stay mounted is the trace ELEMENT.
+ *
+ * Tool rows are reported under BOTH aliases because the primary id the anchor
+ * carries (`tc-` vs `sa-`) is decided by child messages the trace row never sees —
+ * the same reason `resolveTraceRowIdentity` has to consult the selection index.
+ * Guessing wrong here would just fail to pin, so both are emitted.
+ *
+ * Returns null for rows with no interaction surface at all (chrome, aggregates
+ * without rows), so the anchor scan skips them without allocating.
+ */
+function rowSelectionBlockIds(
+	item: VListItem,
+	elementBlockId: string | undefined,
+): readonly string[] | null {
+	const rows = TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind)
+		? (item.measured as MeasuredCollapsibleTrace).rows
+		: undefined;
+	if (!rows || rows.length === 0) return elementBlockId ? [elementBlockId] : null;
+	const ids: string[] = elementBlockId ? [elementBlockId] : [];
+	for (const row of rows) {
+		const identity = row.identity;
+		if (!identity?.messageId) continue;
+		if (identity.toolUseId) {
+			ids.push(`tc-${identity.toolUseId}`, `sa-${identity.toolUseId}`);
+		} else {
+			ids.push(makeMessageBlockSelectionId(identity.messageId, identity.blockIndex));
+		}
+	}
+	return ids.length > 0 ? ids : null;
 }
 
 /**
@@ -1201,10 +1236,10 @@ const ExactRow = memo(
 			extra.onToggleEarlier = toggles.onToggleEarlier;
 			// Route the row fold to the channel THIS kind's adapter path actually
 			// reads. The render layer always reports both the index and the key, so
-			// without this every trace would write a key — and `reasoning-steps` /
-			// `sidecar-trace` (which resolve their `expandedIndices` from
-			// `ctx.expandedRows`) would store the reader's fold where nothing looks
-			// for it, leaving those rows silently unopenable.
+			// without this every trace would write a key — and `reasoning-steps`
+			// (which resolves its `expandedIndices` from `ctx.expandedRows`) would
+			// store the reader's fold where nothing looks for it, leaving those rows
+			// silently unopenable.
 			const foldByKey = traceRowFoldChannel(kind) === "key";
 			const toggleRow = foldByKey
 				? toggles.onToggleRow
@@ -3909,6 +3944,38 @@ export const PretextExactMessageList = forwardRef<
 		return index >= 0 ? index : null;
 	}, [editingRow, renderItems]);
 
+	/**
+	 * The row holding the touch swipe ANCHOR, so it too can be pinned.
+	 *
+	 * Touch range-selection spans two gestures: the first left-swipe reveals a row's
+	 * menu and registers it as the anchor, a left-swipe on another row then selects
+	 * everything between them. `useSwipeMenu` keeps that anchor (and its close
+	 * handler) alive only while the anchor's hook is MOUNTED — so in a virtualized
+	 * list scrolling the anchor past the overscan band unmounted it, silently
+	 * dropping the anchor and turning the second swipe into "open my own menu".
+	 *
+	 * Read through `useSyncExternalStore` because the anchor lives in a module-level
+	 * store that `useSwipeMenu` writes from a touch handler; without a subscription
+	 * this list would never re-render to pin the row. `null` for every non-touch
+	 * session, where the store is never written at all.
+	 */
+	const swipeAnchorBlockId = useSyncExternalStore(
+		subscribeGlobalSwipeAnchor,
+		getGlobalSwipeAnchor,
+		// SSR / hydration: no gesture can be in flight before the first paint.
+		() => null,
+	);
+	const swipeAnchorRowIndex = useMemo(() => {
+		// Scanning the document is gated on an anchor EXISTING, so a plain read /
+		// desktop session never walks the list at all.
+		if (!swipeAnchorBlockId) return null;
+		return resolveSwipeAnchorRowIndex(swipeAnchorBlockId, renderItems.length, (index) => {
+			const item = renderItems[index];
+			if (!item) return null;
+			return rowSelectionBlockIds(item, interactionsByKey.get(item.spec.key)?.blockId);
+		});
+	}, [swipeAnchorBlockId, renderItems, interactionsByKey]);
+
 	/** Mount the shared editor for the row currently in edit mode. */
 	const renderEditorSlot = useCallback(
 		(row: NonNullable<typeof editingRow>): ReactNode => {
@@ -4054,9 +4121,18 @@ export const PretextExactMessageList = forwardRef<
 						})}
 						{[
 							...range(visible.start, visible.end),
-							// The row being edited stays mounted even after scrolling out of
-							// the window — unmounting would destroy the draft.
-							...resolvePinnedRowIndices(visible, editingRowIndex),
+							// Rows that must survive scrolling out of the window. Merged (not
+							// spread back to back) because the two reasons can name the SAME
+							// index — the reader may swipe the row they are editing — and that
+							// would mint two children under one key.
+							...mergePinnedRowIndices(
+								// The row being edited: unmounting would destroy the draft.
+								resolvePinnedRowIndices(visible, editingRowIndex),
+								// The swipe anchor's row: unmounting drops the anchor and its
+								// close handler, which is what silently broke touch
+								// range-selection once the first swiped row scrolled away.
+								resolvePinnedRowIndices(visible, swipeAnchorRowIndex),
+							),
 						].map((itemIndex) => {
 							const item = renderItems[itemIndex];
 							const geometry = exactLayout.items[itemIndex];

@@ -100,18 +100,12 @@ export const createReviewSchema = z.object({
 	crossOffset: z.number().min(0).optional(),
 });
 
-// === chapter edges ===
-
-export const createChapterEdgeSchema = z.object({
-	sourceId: z.string().min(1),
-	targetId: z.string().min(1),
-	type: z.enum(["dependency"]),
-	metadata: z
-		.object({
-			description: z.string().max(500).optional(),
-		})
-		.optional(),
-});
+// === chapter edges: no user-authored edges ===
+//
+// `createChapterEdgeSchema` used to live here, accepting only `type: "dependency"`. Chapter
+// edges are now all derived from the operation that creates them (fork/split, merge,
+// review), so there is no create route left to validate. See `chapter-edge-service.ts` for
+// why the dependency edge went away.
 
 // === graph positions ===
 
@@ -154,9 +148,17 @@ export const splitChapterSchema = z.object({
 // per-fork `crossOffset` question in `chapter-fork.ts` — a batch is the one caller that
 // can assign slots up front and sidestep the unguarded slot search.
 
-// === cherry-pick ===
-
-export const cherryPickSchema = z.object({
-	sourceChapterId: z.string().min(1),
-	commitShas: z.array(z.string().min(1)).min(1),
-});
+// === chapter-level cherry-pick: not implemented ===
+//
+// `cherryPickSchema` used to live here, in the same shape as the batch-fork stub above:
+// no `POST /chapters/:id/cherry-pick` route parsed it and the frontend client naming that
+// endpoint has been removed.
+//
+// Do not confuse this with cherry-pick as a *merge strategy*, which does work: see
+// `gitService.cherryPick`, reached via `chapter-merge` with `strategy: "cherry-pick"`,
+// which records commits as `source: "cherry_pick"`. What is missing is the standalone
+// feature of picking commits off another chapter and drawing a `cherry_pick` edge for it.
+// Nothing creates edges of that type today, so `CherryPickEdge` never renders.
+//
+// Reviving it means a service method, a route, and a `chapterEdgeService.createCherryPickEdge`;
+// write the schema then.

@@ -866,7 +866,6 @@ async function handleEvent(event: NarraForkEvent): Promise<void> {
 		}
 		case "chapter:dormant":
 		case "chapter:woken":
-		case "chapter:frozen":
 		case "chapter:role_changed": {
 			await syncChapter(event.chapterId);
 			break;
@@ -889,13 +888,8 @@ async function handleEvent(event: NarraForkEvent): Promise<void> {
 			break;
 		}
 
-		// Dependencies
-		case "dependency:created":
-		case "dependency:removed": {
-			const pid4 = await projectIdForChapter(event.sourceId);
-			if (pid4) await syncChapterEdgesForProject(pid4);
-			break;
-		}
+		// Dependencies: the dependency edge type is gone, so there are no
+		// `dependency:created`/`dependency:removed` events left to sync.
 
 		// Exploration groups
 		case "exploration:created":

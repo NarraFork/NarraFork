@@ -95,14 +95,6 @@
 		"minimize": "Minimize",
 		"close": "Close Terminal"
 	},
-	"sidePanel": {
-		"upstreamUpdates": "Upstream updates",
-		"recentCommits": "Recent Commits",
-		"noCommits": "No commits yet.",
-		"openDetails": "Open Details",
-		"commitSummary": "{{count}} commits",
-		"headLabel": "HEAD"
-	},
 	"ruler": {
 		"commitCount": "{{count}} commits",
 		"chapterCount": "{{count}} chapter(s)",

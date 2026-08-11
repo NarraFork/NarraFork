@@ -226,8 +226,8 @@ function short(value: string, max: number): string {
 }
 
 /**
- * Header summary for the knowledge-base tool family. Shared by the DOM
- * (ToolCallCard) and pixi renderers so both show the same one-line label.
+ * Header summary for the knowledge-base tool family. Shared by every renderer
+ * (ToolCallCard and the vlist) so they show the same one-line label.
  * Reads from input first, then falls back to persisted metadata
  * (outputJson._metadata) for fields like the resolved entry title.
  */

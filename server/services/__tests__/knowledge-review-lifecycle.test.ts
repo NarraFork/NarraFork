@@ -188,12 +188,32 @@ describe("withdrawSubmission", () => {
 		expect(personal.status).toBe("archived");
 	});
 
-	test("a changes_requested request cannot be withdrawn (resubmit is its path)", async () => {
-		const { submissionId } = await makePendingSubmission("BouncedNoWithdraw");
+	test("a changes_requested request CAN be withdrawn (abandoning the changes is a valid choice)", async () => {
+		const { entry, submissionId } = await makePendingSubmission("BouncedWithdraw");
 		await knowledgeBranchService.review(admin, submissionId, { verdict: "request_changes" });
-
-		expect(knowledgeBranchService.withdrawSubmission(author, submissionId)).rejects.toThrow();
 		expect((await statusOf(submissionId))?.status).toBe("changes_requested");
+
+		// `resubmit` used to be the only transition out, so an author who decided NOT to make
+		// the requested changes had no exit at all and the request sat in both queues forever.
+		const res = await knowledgeBranchService.withdrawSubmission(author, submissionId, {
+			reason: "not worth pursuing",
+		});
+		expect(res.status).toBe("withdrawn");
+		expect((await statusOf(submissionId))?.status).toBe("withdrawn");
+
+		// Withdrawing only closes the REQUEST — the personal entry survives for a later attempt.
+		const personal = await knowledgeBranchService.getMine(author, entry.id);
+		expect(personal.status).toBe("active");
+	});
+
+	test("a withdrawn bounced request can no longer be resubmitted", async () => {
+		const { submissionId } = await makePendingSubmission("BouncedWithdrawThenResubmit");
+		await knowledgeBranchService.review(admin, submissionId, { verdict: "request_changes" });
+		await knowledgeBranchService.withdrawSubmission(author, submissionId);
+
+		// Withdraw is terminal for that row: the way back in is a fresh publish, not a resubmit
+		// chain hanging off a request the author already abandoned.
+		expect(knowledgeBranchService.resubmit(author, submissionId, {})).rejects.toThrow();
 	});
 });
 

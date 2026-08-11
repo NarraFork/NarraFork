@@ -60,6 +60,11 @@ const KNOWLEDGE_EVENT_TYPES = [
 	"knowledge:submission_reviewed",
 	"knowledge:submission_invalidated",
 	"knowledge:entry_published",
+	// Library-side signals (not tied to a submission): main moved under a personal version,
+	// authorization changed, ownership moved.
+	"knowledge:entry_drifted",
+	"knowledge:acl_changed",
+	"knowledge:owner_transferred",
 ] as const;
 
 const events: KnowledgeEvent[] = [];
@@ -470,5 +475,175 @@ describe("reviewer resolution is bounded and ACL-derived", () => {
 				submitterUserId: submitterId,
 			}),
 		).toEqual([]);
+	});
+});
+
+// ─── 5. Library-side signals (drift / ACL / ownership) ───────────────────
+
+/** Push targets for a `knowledge:library_changed` frame with the given reason. */
+function libraryTargets(reason: string): string[] {
+	return pushes
+		.filter((p) => p.message.type === "knowledge:library_changed" && p.message.reason === reason)
+		.map((p) => p.userId);
+}
+
+describe("entry drift notification", () => {
+	test("advancing main notifies OTHER holders of a personal version, not the author", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `DriftNotify ${TAG} ${generateId(4)}`,
+			content: "v1\n",
+		});
+		// Two users fork a personal version; a third has nothing to do with it.
+		await knowledgeBranchService.createDraft(P(submitterId), entry.id, {});
+		await knowledgeBranchService.createDraft(P(reviewerId), entry.id, {});
+		events.length = 0;
+		pushes.length = 0;
+
+		// A direct main write by the admin.
+		await knowledgeService.addRevision(entry.id, { content: "v2\n", authorUserId: adminId });
+		await settle();
+
+		const drift = eventsOfType("knowledge:entry_drifted");
+		expect(drift).toHaveLength(1);
+		expect([...drift[0].driftedUserIds].sort()).toEqual([submitterId, reviewerId].sort());
+		expect([...libraryTargets("entry_drifted")].sort()).toEqual([submitterId, reviewerId].sort());
+		// The uninvolved user is never told.
+		expect(libraryTargets("entry_drifted")).not.toContain(outsiderId);
+	});
+
+	test("the author of the main write is excluded from their own drift notification", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `DriftSelf ${TAG} ${generateId(4)}`,
+			content: "v1\n",
+		});
+		await knowledgeBranchService.createDraft(P(submitterId), entry.id, {});
+		events.length = 0;
+		pushes.length = 0;
+
+		// submitterId both holds a personal version AND makes the main write.
+		await knowledgeService.addRevision(entry.id, { content: "v2\n", authorUserId: submitterId });
+		await settle();
+
+		// Nobody else holds a copy, so there is nothing to announce at all.
+		expect(eventsOfType("knowledge:entry_drifted")).toHaveLength(0);
+		expect(libraryTargets("entry_drifted")).toEqual([]);
+	});
+
+	test("an entry nobody forked produces no drift event", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `DriftNone ${TAG} ${generateId(4)}`,
+			content: "v1\n",
+		});
+		events.length = 0;
+		pushes.length = 0;
+		await knowledgeService.addRevision(entry.id, { content: "v2\n", authorUserId: adminId });
+		await settle();
+		expect(eventsOfType("knowledge:entry_drifted")).toHaveLength(0);
+	});
+
+	test("an approved publish also drifts the other holders", async () => {
+		const entry = await makeReviewableEntry("DriftOnPublish");
+		// The submitter proposes a change; a bystander holds their own personal version.
+		await knowledgeBranchService.createDraft(P(submitterId), entry.id, {});
+		const myDraft = await knowledgeBranchService.getMyDraft(P(submitterId), entry.id);
+		await knowledgeBranchService.updateDraft(P(submitterId), myDraft?.id as string, {
+			content: "proposed body\n",
+		});
+		await knowledgeBranchService.createDraft(P(outsiderId), entry.id, {});
+		const submission = await knowledgeBranchService.submitForReview(
+			P(submitterId),
+			myDraft?.id as string,
+			{},
+		);
+		events.length = 0;
+		pushes.length = 0;
+
+		await knowledgeBranchService.review(P(reviewerId), submission?.id as string, {
+			verdict: "approve",
+		});
+		await settle();
+
+		// The bystander's copy is now behind; the submitter's was archived by the publish.
+		expect(libraryTargets("entry_drifted")).toEqual([outsiderId]);
+	});
+});
+
+describe("ACL change notification", () => {
+	test("granting and revoking notify the affected user, carrying no credential detail", async () => {
+		const target = await makeUser("user", "kn-aclnotify");
+		events.length = 0;
+		pushes.length = 0;
+
+		const grant = await knowledgeAcl.createGrant({
+			principalType: "user",
+			principalId: target,
+			grantType: "clearance",
+			clearanceLevel: "internal",
+		});
+		await settle();
+		expect(libraryTargets("acl_changed")).toEqual([target]);
+		// The push must not name the level/tag — that would leak the compartment layout.
+		const frame = pushes.find((p) => p.message.reason === "acl_changed");
+		expect(frame?.message.clearanceLevel).toBeUndefined();
+		expect(frame?.message.tagId).toBeUndefined();
+
+		pushes.length = 0;
+		await knowledgeAcl.deleteGrant((grant as { id: string }).id);
+		await settle();
+		// Revocation reaches the user too — resolved BEFORE the row is deleted.
+		expect(libraryTargets("acl_changed")).toEqual([target]);
+	});
+
+	test("replacing a user's ACL notifies them once", async () => {
+		const target = await makeUser("user", "kn-aclreplace");
+		events.length = 0;
+		pushes.length = 0;
+		await knowledgeAcl.setUserAcl(target, { clearanceLevel: "internal", tagIds: [] });
+		await settle();
+		expect(eventsOfType("knowledge:acl_changed")).toHaveLength(1);
+		expect(libraryTargets("acl_changed")).toEqual([target]);
+	});
+});
+
+describe("ownership transfer notification", () => {
+	test("transferring an entry notifies both the old and the new owner", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `OwnerXfer ${TAG} ${generateId(4)}`,
+			content: "body\n",
+			authorUserId: submitterId,
+		});
+		await knowledgeService.updateEntryAcl(entry.id, { ownerUserId: submitterId });
+		events.length = 0;
+		pushes.length = 0;
+
+		await knowledgeService.transferEntryOwner(entry.id, reviewerId, P(adminId, "admin"));
+		await settle();
+
+		// Ownership is an ACL short-circuit: one side gained access, the other may have lost it.
+		expect([...libraryTargets("owner_transferred")].sort()).toEqual(
+			[submitterId, reviewerId].sort(),
+		);
+	});
+
+	test("transferring a collection notifies both parties with the collection id", async () => {
+		const col = await knowledgeService.createCollection({
+			name: `xfer-${TAG}-${generateId(4)}`,
+			ownerUserId: submitterId,
+		});
+		events.length = 0;
+		pushes.length = 0;
+
+		await knowledgeService.transferCollectionOwner(col.id, reviewerId, P(adminId, "admin"));
+		await settle();
+
+		expect([...libraryTargets("owner_transferred")].sort()).toEqual(
+			[submitterId, reviewerId].sort(),
+		);
+		const frame = pushes.find((p) => p.message.reason === "owner_transferred");
+		expect(frame?.message.collectionId).toBe(col.id);
 	});
 });

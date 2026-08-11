@@ -9,7 +9,6 @@ import {
 	portAllocations,
 	projects,
 	terminals,
-	terminalTabs,
 	terminalViewState,
 } from "../db/schema";
 import { chapterLock } from "../lib/async-mutex";
@@ -364,7 +363,6 @@ export const chapterService = {
 			await terminalService.cleanupForChapter(id);
 
 			// Clean up tables that reference chapters without onDelete cascade
-			await db.delete(terminalTabs).where(eq(terminalTabs.chapterId, id));
 			await db.delete(terminalViewState).where(eq(terminalViewState.chapterId, id));
 			await db.delete(mergeSessions).where(eq(mergeSessions.targetChapterId, id));
 
@@ -457,7 +455,6 @@ export const chapterService = {
 			await terminalService.cleanupForChapter(id);
 
 			// Clean up tables that reference chapters without onDelete cascade
-			await db.delete(terminalTabs).where(eq(terminalTabs.chapterId, id));
 			await db.delete(terminalViewState).where(eq(terminalViewState.chapterId, id));
 			await db.delete(mergeSessions).where(eq(mergeSessions.targetChapterId, id));
 

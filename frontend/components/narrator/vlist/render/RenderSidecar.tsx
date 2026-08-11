@@ -1,63 +1,73 @@
 /**
- * RenderSidecar.tsx — Render copy for one system-injection (sidecar) card,
- * measured by measure-sidecar.ts.
+ * RenderSidecar.tsx — Paint one system injection as a FOOTNOTE, at the geometry
+ * `measure-sidecar.ts` resolved.
  *
- * This is the vlist REDESIGN of the chunked aggregate SideCarNotice: EVERY record
- * is its own collapsible card (the product decision), so there is no "×N" header
- * and no shared fold — each card carries its own chevron + fold state.
+ * ## What this is not, any more
  *
- * Geometry pairs with the measure layer exactly:
- *   collapsed : Paper p="xs" + one header row (accent rail + icon + source badge
- *               + target badge + clamped preview + chevron + copy). Constant
- *               height; the preview is truncated to a single line.
- *   expanded  : the same header row + the full body, materialized line-by-line
- *               from the SAME PreparedCodeBlock the measure pass wrapped (exact
- *               font, exact width — zero drift, zero DOM measurement), plus a
- *               truncation notice row when the measure pass clipped the body at
- *               its line cap (that row's height is RESERVED by the measure layer;
- *               see measure-sidecar's SIDECAR_TRUNCATION_NOTICE_*).
+ * It used to be a coloured `Paper` with a 2px accent rail, an info icon, a source
+ * badge, a raw `tool_result` / `user_message` badge and a one-line preview — the
+ * heaviest skin in the list, wrapped around its least important content, in one of
+ * six hues. Now it is a bare header row (source name + headline + chevron + copy) at
+ * the same height as a folded trace row, with indented body lines beneath it. No
+ * card, no border, no background, no rail.
  *
- * The copy button and the fold toggle are the only interactions. The toggle is
- * injected (`onToggle`) and lives on the header row, which is keyboard-operable
- * (role/tabIndex/Enter-Space) — attributes only, so the measured geometry holds.
- * Copy is a local clipboard write with a transient check. Both are height-neutral
- * (they sit inside the fixed header row). No bridge/target module is needed because
- * a sidecar carries no app-level mutation or route.
+ * Colour is down to three tones (`peer` / `background` / neutral) and lands only on
+ * the source NAME, so a message addressed to the reader is findable while a routine
+ * reminder stays quiet.
+ *
+ * ## Geometry pairs with the measure layer exactly
+ *
+ * Every body line is drawn from the SAME `PreparedCodeBlock` the measure pass
+ * wrapped, at the same font and the same width (`measured.lines[i]` carries its own
+ * `left` / `width`, because a bullet wraps narrower than a text line). The trailing
+ * "show all" / "truncated" row's height was RESERVED by the measure pass, so drawing
+ * it moves nothing. Zero DOM measurement.
+ *
+ * The copy button and the fold toggle are the only interactions, and both are
+ * height-neutral (they live in the fixed header row). The toggle is injected
+ * (`onToggle`); an `open` footnote that fits shows no chevron at all and does not
+ * advertise a control that would do nothing.
  */
 
 import { layoutWithLines } from "@chenglou/pretext";
-import { ActionIcon, Badge, Box, CopyButton, Group, Paper, Text, Tooltip } from "@mantine/core";
-import {
-	IconCheck,
-	IconChevronDown,
-	IconChevronRight,
-	IconCopy,
-	IconInfoCircle,
-} from "@tabler/icons-react";
+import { ActionIcon, Box, CopyButton, Group, Text, Tooltip } from "@mantine/core";
+import type { SideCarTone } from "@shared/sidecar-body";
+import { IconCheck, IconChevronDown, IconChevronRight, IconCopy } from "@tabler/icons-react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useMemo } from "react";
 import {
 	type MeasuredSidecar,
-	SIDECAR_CARD_PADDING,
-	SIDECAR_HEADER_BODY_GAP,
+	type MeasuredSidecarLine,
 	SIDECAR_HEADER_ROW,
-	SIDECAR_TRUNCATION_NOTICE_GAP,
-	SIDECAR_TRUNCATION_NOTICE_HEIGHT,
+	SIDECAR_LINE_HEIGHT,
 } from "../measure/measure-sidecar";
 import type { PreparedCodeBlock } from "../prepared-block";
 import { FONT_XS } from "../pretext-fonts";
 
-function cssColor(color: string, shade: number): string {
-	return `var(--mantine-color-${color}-${shade})`;
+/**
+ * Tone → the colour of the source NAME.
+ *
+ * Three groups, not one hue per source: a screen showing four injections used to show
+ * four different colours, which made a routine progress nudge shout as loudly as a
+ * teammate's message. Neutral injections take the ordinary dimmed text colour, so they
+ * recede into the column entirely.
+ */
+function toneColor(tone: SideCarTone): string {
+	switch (tone) {
+		case "peer":
+			return "var(--mantine-color-grape-text)";
+		case "background":
+			return "var(--mantine-color-blue-text)";
+		default:
+			return "var(--mantine-color-dimmed)";
+	}
 }
 
-function cssLight(color: string): string {
-	return `var(--mantine-color-${color}-light)`;
-}
+const DIMMED = "var(--mantine-color-dimmed)";
 
 export interface RenderSidecarProps {
 	measured: MeasuredSidecar;
-	/** Fold toggle (injected by the shell). Absent → the card renders inert. */
+	/** Fold toggle (injected by the shell). Absent → the footnote renders inert. */
 	onToggle?: () => void;
 	/** Localized chrome (copy tooltip etc.). Optional; English fallbacks inside. */
 	labels?: { copy?: string; copied?: string };
@@ -65,17 +75,17 @@ export interface RenderSidecarProps {
 
 /**
  * Enter / Space activation for the header row, whose only affordance is a click
- * handler on a `Group` (a div). Same helper shape RenderToolRun uses for its trace
- * folds: attributes and handlers only, so the measured geometry is untouched.
+ * handler on a `Group` (a div). Attributes and handlers only, so the measured
+ * geometry is untouched.
  *
  * Space is `preventDefault`ed because its default action on a focused element is to
- * scroll — which in a virtual list moves the very card being read.
+ * scroll — which in a virtual list moves the very row being read.
  *
  * The `target !== currentTarget` bail-out is what keeps the header from becoming a
  * nested-interactive trap: the copy control inside it is a real focusable button, so
  * a keyboard user pressing Enter on IT produces a keydown that bubbles up here.
- * Without the check that one keypress would both copy AND fold the card. (The mouse
- * path is already isolated by the copy box's `stopPropagation` on click.)
+ * Without the check that one keypress would both copy AND fold. (The mouse path is
+ * already isolated by the copy box's `stopPropagation` on click.)
  */
 function activateOnKey(activate: () => void) {
 	return (event: ReactKeyboardEvent) => {
@@ -87,72 +97,56 @@ function activateOnKey(activate: () => void) {
 	};
 }
 
-/**
- * Render one sidecar card at the measured geometry. The outer box height equals
- * `measured.height`; the expanded body is the pretext-measured code block.
- */
+/** Render one side-car footnote at the measured geometry. */
 export function RenderSidecar({ measured, onToggle, labels }: RenderSidecarProps) {
-	const { payload, expanded, bodyHeight, bodyWidth, height, bodyTruncated, noticeText } = measured;
-	const color = payload.color ?? "gray";
-	const copyLabel = labels?.copy ?? "Copy sidecar content";
+	const { payload, expanded, height, lines, extraRow, extraRowText, extraRowTop } = measured;
+	const copyLabel = labels?.copy ?? "Copy injected content";
 	const copiedLabel = labels?.copied ?? "Copied";
+	const nameColor = toneColor(payload.tone);
 
-	const bodyBlock = expanded ? (measured.blocks[1] as PreparedCodeBlock | undefined) : undefined;
+	// A chevron is only meaningful when there is something the toggle would change:
+	// a folded footnote with a body, or an `open` one whose body was capped (its
+	// "show all" row is the reserved affordance). An `open` footnote showing
+	// everything has no fold, so it advertises no control.
+	const hasBody = (payload.lines?.length ?? 0) > 0;
+	const foldable = hasBody && (payload.form === "folded" || expanded || extraRow === "showAll");
+	const interactive = foldable && !!onToggle;
 
 	return (
-		<Paper
-			p="xs"
-			radius="sm"
-			style={{
-				backgroundColor: cssLight(color),
-				borderLeft: `2px solid ${cssColor(color, 5)}`,
-				height,
-				boxSizing: "border-box",
-			}}
-		>
-			{/* Header row — the whole row is the fold affordance (chunked parity: the
-			    aggregate notice toggled on row click). */}
+		<div style={{ position: "relative", height, boxSizing: "border-box" }}>
+			{/* Header row — the whole row is the fold affordance. */}
 			<Group
 				gap={6}
 				wrap="nowrap"
 				align="center"
-				// Keyboard-operable fold: the row is a div, so it needs the role, a tab
-				// stop and Enter/Space explicitly. All attributes — the measured geometry
-				// is unchanged. Only declared when a toggle exists, so an inert card does
-				// not advertise a control that does nothing.
-				role={onToggle ? "button" : undefined}
-				tabIndex={onToggle ? 0 : undefined}
-				aria-expanded={onToggle ? expanded : undefined}
-				aria-label={onToggle ? payload.sourceLabel : undefined}
+				role={interactive ? "button" : undefined}
+				tabIndex={interactive ? 0 : undefined}
+				aria-expanded={interactive ? expanded : undefined}
+				aria-label={interactive ? payload.sourceLabel : undefined}
 				style={{
 					height: SIDECAR_HEADER_ROW,
-					cursor: onToggle ? "pointer" : undefined,
-					userSelect: onToggle ? "none" : undefined,
+					cursor: interactive ? "pointer" : undefined,
+					userSelect: interactive ? "none" : undefined,
 				}}
-				onClick={onToggle}
-				onKeyDown={onToggle ? activateOnKey(onToggle) : undefined}
+				onClick={interactive ? onToggle : undefined}
+				onKeyDown={interactive && onToggle ? activateOnKey(onToggle) : undefined}
 			>
-				<IconInfoCircle
-					size={14}
-					style={{ flexShrink: 0, color: cssColor(color, 7) }}
-					aria-hidden
-				/>
-				<Badge size="xs" variant="light" color={color} style={{ flexShrink: 0 }}>
+				{/* The source name carries the tone. No badge, no icon: the name IS the
+				    label, and a pill around it was pure weight. */}
+				<Text size="xs" fw={500} c={nameColor} style={{ flexShrink: 0 }}>
 					{payload.sourceLabel}
-				</Badge>
-				<Badge size="xs" variant="outline" color="gray" style={{ flexShrink: 0 }}>
-					{payload.target}
-				</Badge>
-				{/* Collapsed preview: single clamped line (height-neutral — the row is
-				    fixed). Hidden when expanded (the body below carries the full text). */}
-				{!expanded ? (
+				</Text>
+				{/* Headline: shown while the body is hidden (a folded footnote). An open
+				    one draws its body instead, so repeating the first line above it would
+				    be noise. Clamped to one line → height-neutral. */}
+				{!expanded && payload.form === "folded" ? (
 					<Text size="xs" c="dimmed" lineClamp={1} style={{ flex: 1, minWidth: 0 }}>
-						{payload.previewText}
+						{payload.headline}
 					</Text>
 				) : (
 					<span style={{ flex: 1, minWidth: 0 }} />
 				)}
-				{/* Copy is the only content action; it never moves the geometry. */}
+				{/* Copy yields what the MODEL saw, not this projection. */}
 				<Box onClick={(event) => event.stopPropagation()} style={{ flexShrink: 0 }}>
 					<CopyButton value={payload.fullText} timeout={1500}>
 						{({ copied, copy }) => (
@@ -164,78 +158,119 @@ export function RenderSidecar({ measured, onToggle, labels }: RenderSidecarProps
 									aria-label={copied ? copiedLabel : copyLabel}
 									onClick={copy}
 								>
-									{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+									{copied ? <IconCheck size={13} /> : <IconCopy size={13} />}
 								</ActionIcon>
 							</Tooltip>
 						)}
 					</CopyButton>
 				</Box>
-				{expanded ? (
-					<IconChevronDown size={13} style={{ flexShrink: 0, color: cssColor(color, 7) }} />
-				) : (
-					<IconChevronRight size={13} style={{ flexShrink: 0, color: cssColor(color, 7) }} />
-				)}
+				{foldable ? (
+					expanded ? (
+						<IconChevronDown size={12} style={{ flexShrink: 0, color: DIMMED }} />
+					) : (
+						<IconChevronRight size={12} style={{ flexShrink: 0, color: DIMMED }} />
+					)
+				) : null}
 			</Group>
 
-			{/* Expanded body — pretext-measured lines, painted with the exact font the
-			    measure pass used, at the reserved body height (cap already applied). */}
-			{expanded && bodyBlock ? (
-				<div style={{ marginTop: SIDECAR_HEADER_BODY_GAP }}>
-					<SidecarBody block={bodyBlock} width={bodyWidth} height={bodyHeight} />
-				</div>
-			) : null}
+			{/* Body lines — each drawn from the block the measure pass wrapped, at the
+			    width IT used (a bullet's is narrower by its marker lane). */}
+			{lines.map((line, index) => {
+				const block = measured.blocks[1 + index] as PreparedCodeBlock | undefined;
+				if (!block) return null;
+				return (
+					<SidecarBodyLine
+						// biome-ignore lint/suspicious/noArrayIndexKey: body lines are a stable ordered list produced by the measure pass
+						key={index}
+						block={block}
+						line={line}
+					/>
+				);
+			})}
 
-			{/* Line cap reached — say so. The body lane is a fixed-height clipped box
-			    with no scrollbar, so without this the text just stops and the reader
-			    cannot tell whether that was the end. The row's height was reserved by
-			    the measure pass (SIDECAR_TRUNCATION_NOTICE_*), so drawing it here does
-			    not move anything. */}
-			{expanded && bodyTruncated && noticeText ? (
+			{/* The reserved trailing row: either "show all N lines" (an open footnote hit
+			    its inline default) or the truncation notice (the hard ceiling bit, and
+			    copy holds the rest). Its height was reserved by the measure pass, so
+			    painting it here cannot move anything. */}
+			{extraRow !== "none" && extraRowText ? (
 				<Text
 					size="xs"
 					c="dimmed"
-					fs="italic"
+					fs={extraRow === "truncated" ? "italic" : undefined}
+					td={extraRow === "showAll" ? "underline" : undefined}
 					lineClamp={1}
+					role={extraRow === "showAll" && onToggle ? "button" : undefined}
+					tabIndex={extraRow === "showAll" && onToggle ? 0 : undefined}
+					onClick={extraRow === "showAll" ? onToggle : undefined}
+					onKeyDown={extraRow === "showAll" && onToggle ? activateOnKey(onToggle) : undefined}
 					style={{
-						marginTop: SIDECAR_TRUNCATION_NOTICE_GAP,
-						height: SIDECAR_TRUNCATION_NOTICE_HEIGHT,
-						width: bodyWidth,
+						position: "absolute",
+						top: extraRowTop,
+						left: measured.lines[0]?.left ?? 0,
+						height: SIDECAR_LINE_HEIGHT,
+						cursor: extraRow === "showAll" && onToggle ? "pointer" : undefined,
 					}}
 				>
-					{noticeText}
+					{extraRowText}
 				</Text>
 			) : null}
-		</Paper>
+		</div>
 	);
 }
 
 /**
- * The expanded body: materialize the PreparedCodeBlock's wrapped lines and paint
- * each absolutely-positioned with the measured font. The box is width×height the
- * measure layer reserved, so the painted wrap matches the predicted height.
+ * One body line: materialize the block's wrapped lines and paint each
+ * absolutely-positioned with the measured font, inside the box the measure layer
+ * reserved. `heading` lines take a slightly stronger weight; `meta` and `dimmed`
+ * lines recede — all colour/weight only, so nothing moves.
  */
-function SidecarBody({
-	block,
-	width,
-	height,
-}: {
-	block: PreparedCodeBlock;
-	width: number;
-	height: number;
-}) {
-	const lines = useMemo(
-		() => layoutWithLines(block.prepared, Math.max(1, width), block.lineHeight).lines,
-		[block, width],
+function SidecarBodyLine({ block, line }: { block: PreparedCodeBlock; line: MeasuredSidecarLine }) {
+	const wrapped = useMemo(
+		() => layoutWithLines(block.prepared, Math.max(1, line.width), block.lineHeight).lines,
+		[block, line.width],
 	);
-	// Clamp to the measured line budget (the measure pass capped at
-	// SIDECAR_DETAIL_MAX_LINES); the fixed-height box hides any overflow anyway.
-	const maxLines = Math.max(1, Math.floor(height / block.lineHeight));
-	const visible = lines.length > maxLines ? lines.slice(0, maxLines) : lines;
+	const visible = wrapped.length > line.lineCount ? wrapped.slice(0, line.lineCount) : wrapped;
+	const color =
+		line.kind === "heading"
+			? "var(--mantine-color-text)"
+			: line.dimmed || line.kind === "meta"
+				? DIMMED
+				: "var(--mantine-color-dimmed)";
 	return (
-		<div style={{ position: "relative", width, height, overflow: "hidden" }}>
-			{visible.map((line, i) => (
+		<div
+			style={{
+				position: "absolute",
+				top: line.top,
+				left: line.left,
+				width: line.width,
+				height: line.height,
+				overflow: "hidden",
+			}}
+		>
+			{/* A bullet's marker sits in the lane the measure layer reserved to the LEFT
+			    of this box. `aria-hidden` + `userSelect: none` are load-bearing: the
+			    selection-copy walker (vlist-copy-text) collects the whole subtree, so a
+			    decorative glyph would otherwise be pasted into the reader's clipboard. */}
+			{line.kind === "bullet" ? (
+				<span
+					aria-hidden
+					style={{
+						position: "absolute",
+						left: -10,
+						top: 0,
+						height: block.lineHeight,
+						font: FONT_XS,
+						color: DIMMED,
+						opacity: 0.6,
+						userSelect: "none",
+					}}
+				>
+					·
+				</span>
+			) : null}
+			{visible.map((wrappedLine, i) => (
 				<div
-					// biome-ignore lint/suspicious/noArrayIndexKey: body lines are a stable ordered list
+					// biome-ignore lint/suspicious/noArrayIndexKey: wrapped lines are a stable ordered list
 					key={i}
 					style={{
 						position: "absolute",
@@ -243,17 +278,18 @@ function SidecarBody({
 						left: 0,
 						height: block.lineHeight,
 						whiteSpace: "pre",
-						// The EXACT font the measure pass wrapped with (FONT_XS) — parity
-						// keeps the painted wrap identical to the predicted height.
+						// The EXACT font the measure pass wrapped with — parity keeps the
+						// painted wrap identical to the predicted height.
 						font: FONT_XS,
-						color: "var(--mantine-color-dimmed)",
+						fontWeight: line.kind === "heading" ? 500 : undefined,
+						color,
 					}}
 				>
-					{line.text}
+					{wrappedLine.text}
 				</div>
 			))}
 		</div>
 	);
 }
 
-export const RENDER_SIDECAR_CHROME = { SIDECAR_CARD_PADDING, SIDECAR_HEADER_ROW } as const;
+export const RENDER_SIDECAR_CHROME = { SIDECAR_HEADER_ROW, SIDECAR_LINE_HEIGHT } as const;

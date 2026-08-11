@@ -234,8 +234,7 @@
 	"loadOlderCalls": "Load earlier tool calls",
 	"jumpTargetUnavailable": "That message is no longer in this conversation's history.",
 	"jumpTargetTooFar": "That message is too far back to jump to. Scroll up to load more history, then try again.",
-	"switchToPixiRenderer": "Switch to experimental PixiJS renderer (read-only)",
-	"switchToReactRenderer": "Switch to React renderer",
+
 	"archiveNarrator": "Archive",
 	"permissionMode": "Permission Mode",
 	"permissionModesUnavailable": "Permission modes unavailable",
@@ -1069,12 +1068,10 @@
 		"reattachPartial": "Opening a detached subagent session will not re-block the original parent tool call in this backend runtime."
 	},
 	"sidecar": {
-		"titleWithCount": "System injection ×{{count}}",
 		"unknownSource": "unknown",
-		"copy": "Copy sidecar content",
+		"copy": "Copy injected content",
 		"copied": "Copied",
-		"empty": "No content",
-		"truncated": "[Preview truncated to keep the UI responsive. Use copy if you need the full content.]",
+		"truncated": "[Preview truncated to keep the UI responsive. Use copy for the full content.]",
 		"sources": {
 			"silent_progress": "Progress reminder",
 			"todo_reminder": "TODO reminder",
@@ -1086,7 +1083,35 @@
 			"buffered_user": "Buffered user message",
 			"group_message": "Group message",
 			"subagent_message": "Subagent message",
-			"spec_update": "Outline update"
+			"spec_update": "Outline update",
+			"behavior_fence": "Behavior fence",
+			"pipeline_exit_confirmation": "Pipeline check"
+		},
+		"showAll": "Show all",
+		"attachedCount": "{{count}} system injection(s) attached",
+		"body": {
+			"noticeSilentProgress": "{{count}} tool calls without a visible reply",
+			"noticeRelaxedPlan": "Still planning — do not implement yet",
+			"noticePipelineExit": "Pipeline still active — confirm it is still needed",
+			"tasksCurrent": "Dynamic Spec — {{n}} open task(s)",
+			"tasksEmptyNever": "Dynamic Spec — no tasks created yet",
+			"tasksEmptyDone": "Dynamic Spec — all tasks done, time to reorganize",
+			"tasksTooMany": "Dynamic Spec — {{n}} tasks, over the threshold",
+			"taskRoleDoing": "doing",
+			"taskRoleNext": "next",
+			"taskRoleTodo": "todo",
+			"taskRoleBlocked": "blocked",
+			"taskProtected": "protected",
+			"knowledgeHeading": "{{n}} relevant knowledge entries",
+			"tasksDoneAgentHeading": "{{n}} background agent(s) finished",
+			"tasksDoneBashHeading": "{{n}} background command(s) finished",
+			"tasksDoneTruncated": "result truncated",
+			"messagesHeading": "{{n}} message(s)",
+			"messageFromUnknown": "unknown sender",
+			"messageBroadcast": "broadcast",
+			"specUpdatesHeading": "{{n}} spec file(s) you updated",
+			"proseFenceHeading": "Behavior fence",
+			"empty": "(empty)"
 		}
 	},
 	"executionTarget": "Execution target",

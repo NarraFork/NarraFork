@@ -12,6 +12,7 @@ import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from
 import { shouldUseNativeSearch } from "../search/native";
 import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
+import { sideCarBodyWithText } from "../sidecar-templates";
 import { analyzeShellCommand } from "./bash-analyze";
 import { finalizeAssistantTextWithCitations, TextCitationAccumulator } from "./citation-stream";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
@@ -2333,7 +2334,7 @@ export async function* agentLoop(
 			sideCars.push({
 				target: "tool_result",
 				source: "pipeline_exit_confirmation",
-				content: getToolMessage("pipelineExitConfirmation", locale),
+				...sideCarBodyWithText("pipeline_exit_confirmation", { kind: "notice" }, locale),
 				orderIndex: 40,
 				toolUseId: tu.toolUseId,
 			});
@@ -2345,9 +2346,11 @@ export async function* agentLoop(
 				sideCars.push({
 					target: "tool_result",
 					source: "silent_progress",
-					content: getToolMessageWithParams("silentToolCallProgressReminder", locale, {
-						count: silentToolCallCount,
-					}),
+					...sideCarBodyWithText(
+						"silent_progress",
+						{ kind: "notice", params: { count: silentToolCallCount } },
+						locale,
+					),
 					orderIndex: 10,
 					toolUseId: tu.toolUseId,
 				});
@@ -2362,7 +2365,7 @@ export async function* agentLoop(
 			sideCars.push({
 				target: "tool_result",
 				source: "relaxed_plan",
-				content: getToolMessage("relaxedPlanToolReminder", locale),
+				...sideCarBodyWithText("relaxed_plan", { kind: "notice" }, locale),
 				orderIndex: 20,
 				toolUseId: tu.toolUseId,
 			});
@@ -2387,7 +2390,21 @@ export async function* agentLoop(
 					sideCars.push({
 						target: "tool_result",
 						source: "knowledge_base_hint",
-						content: scan.content,
+						// `scan.content` is the same text this body renders to (asserted in
+						// sidecar-body.test.ts against formatInjectionsBare), so the body is
+						// the authority and the text is derived from it — not both kept.
+						...sideCarBodyWithText(
+							"knowledge_base_hint",
+							{
+								kind: "knowledge",
+								hits: scan.hits.map((hit) => ({
+									entryId: hit.entryId,
+									title: hit.title,
+									summary: hit.summary,
+								})),
+							},
+							locale,
+						),
 						orderIndex: 30,
 						toolUseId: tu.toolUseId,
 						knowledgeInjection: {

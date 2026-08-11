@@ -6,8 +6,9 @@
  * visual lines (soft wraps). The vlist paints one absolutely-positioned row per
  * VISUAL line, so the token stream has to be cut the same way.
  *
- * This is the pure core of pixi-message-draw's splitTokensByPretextLines, lifted
- * into its own module so it can be unit-tested in isolation. The algorithm:
+ * This began as the pure core of the Pixi renderer's `splitTokensByPretextLines`,
+ * lifted into its own module so it could be unit-tested in isolation; that renderer
+ * has since been deleted and the vlist is the only caller. The algorithm:
  *
  *   1. Flatten Shiki's per-physical-line tokens into one stream, inserting an
  *      explicit `\n` token between physical lines.

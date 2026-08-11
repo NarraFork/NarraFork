@@ -946,7 +946,18 @@ export const narratorSidecars = sqliteTable(
 		toolUseId: text("tool_use_id"),
 		target: text("target", { enum: ["tool_result", "user_message"] }).notNull(),
 		source: text("source").notNull(),
+		/**
+		 * The model-facing text, frozen at write time. Never re-derived on read: it is
+		 * part of the model's historical context, and re-rendering it later would let a
+		 * copy tweak retroactively rewrite what the model was shown.
+		 */
 		content: text("content").notNull(),
+		/**
+		 * The same injection in structured form (`SideCarBody`), for the UI to render
+		 * without parsing `content`. Null on rows written before this column existed —
+		 * those are shown verbatim, deliberately without any compatibility parsing.
+		 */
+		bodyJson: text("body_json", { mode: "json" }),
 		orderIndex: integer("order_index").notNull().default(0),
 		createdAt: text("created_at").notNull(),
 	},
@@ -1163,23 +1174,15 @@ export const terminals = sqliteTable(
 	],
 );
 
-// === terminal_tabs ===
-export const terminalTabs = sqliteTable(
-	"terminal_tabs",
-	{
-		id: text("id").primaryKey(),
-		/** Cascaded for the same reason as `terminals.chapterId`; see there. */
-		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
-		narratorId: text("narrator_id").references(() => narrators.id),
-		name: text("name").notNull(),
-		sortOrder: integer("sort_order").notNull().default(0),
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		index("idx_terminal_tabs_chapter").on(table.chapterId, table.sortOrder),
-		index("idx_terminal_tabs_narrator").on(table.narratorId, table.sortOrder),
-	],
-);
+// === terminal_tabs: removed ===
+//
+// A `terminal_tabs` table used to sit here, with a service, five `/terminals/tabs` routes,
+// three validators, five API clients, a hook and a component. None of it had a consumer:
+// every client had zero call sites and the hook/component had zero importers, so no row was
+// ever written. The live terminal UI (`NarratorTerminal.tsx`) derives tabs from the running
+// terminals and persists only their order, which is why a separate tab entity was never
+// needed. Do not confuse it with `terminal_view_state` below, which is in active use — its
+// `activeTabId` holds a *terminal* id, not a tab id, and never referenced this table.
 
 // === terminal_view_state ===
 export const terminalViewState = sqliteTable(
@@ -2667,7 +2670,10 @@ export const knowledgeSubmissions = sqliteTable(
 		// Lifecycle:
 		//  - pending           → awaiting review
 		//  - approved          → merged / published
-		//  - rejected          → reviewer refused it
+		//  - rejected          → reviewer refused it for good (verdict `reject`). TERMINAL: no
+		//                        resubmit, which is exactly what separates it from
+		//                        changes_requested. The author's personal entry survives, so a
+		//                        fresh proposal is still possible.
 		//  - changes_requested → bounced back to the author (resubmit closes the loop)
 		//  - conflict          → approve hit an unmergeable three-way merge; needs resolve
 		//  - withdrawn         → the SUBMITTER pulled it back before a verdict
@@ -2687,7 +2693,9 @@ export const knowledgeSubmissions = sqliteTable(
 			.notNull()
 			.default("pending"),
 		reviewerUserId: text("reviewer_user_id").references(() => users.id, { onDelete: "set null" }),
-		verdict: text("verdict", { enum: ["approve", "request_changes", "comment_only"] }),
+		// `reject` is the terminal refusal, distinct from `request_changes` (which invites a
+		// resubmit). See the `rejected` status above.
+		verdict: text("verdict", { enum: ["approve", "request_changes", "reject", "comment_only"] }),
 		findingsJson: text("findings_json", { mode: "json" }),
 		reviewedAt: text("reviewed_at"),
 		// The main revision produced when this submission was merged.
@@ -2805,6 +2813,54 @@ export const knowledgeGrants = sqliteTable(
 		uniqueIndex("idx_kgrant_unique_global_untagged")
 			.on(table.principalType, table.principalId, table.grantType)
 			.where(sql`${table.collectionId} is null and ${table.tagId} is null`),
+	],
+);
+
+// === knowledge_acl_events ===
+// Append-only audit of knowledge AUTHORIZATION changes: who granted/revoked what, to whom, when.
+//
+// Why this exists: the knowledge base gates content by classification level + controlled tags, but
+// every mutation of that gate (grants, per-user ACL replacement, entry/collection ACL edits,
+// ownership transfers) used to leave no trace at all — "who gave this account access to the
+// confidential compartment?" was unanswerable after the fact.
+//
+// Shape follows oauth_grant_events (the existing security-audit precedent): actor + target +
+// event type + a small redacted detail blob. Deliberately NOT stored: entry titles, bodies, or
+// anything that would turn the audit log into a way to read content you cannot access.
+//
+// No foreign keys on the actor/target ids: audit rows must survive deletion of the user, entry or
+// collection they describe, which is the whole point of an audit trail.
+export const knowledgeAclEvents = sqliteTable(
+	"knowledge_acl_events",
+	{
+		id: text("id").primaryKey(),
+		// Who performed the change (null = system/automated path).
+		actorUserId: text("actor_user_id"),
+		actorRole: text("actor_role"),
+		// What kind of change. Kept as free text rather than an enum so a new ACL surface can be
+		// audited without a migration; the writers use a fixed vocabulary
+		// (grant_added / grant_removed / user_acl_replaced / entry_acl_updated /
+		//  collection_acl_updated / entry_owner_transferred / collection_owner_transferred).
+		eventType: text("event_type").notNull(),
+		// Whom the change was ABOUT (the principal whose authority moved), when applicable.
+		subjectType: text("subject_type", { enum: ["user", "role"] }),
+		subjectId: text("subject_id"),
+		// What the change was ON (an entry / collection / grant row), when applicable.
+		targetType: text("target_type", { enum: ["entry", "collection", "grant"] }),
+		targetId: text("target_id"),
+		// Redacted detail: level NAMES and tag IDS only, never content. e.g.
+		// { grantType, clearanceLevel, tagId, canWrite } or { before: {...}, after: {...} }.
+		detailJson: text("detail_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		// Primary read pattern: newest first, optionally filtered. `id` breaks createdAt ties so
+		// cursor pagination is stable.
+		index("idx_kacl_events_created").on(table.createdAt, table.id),
+		index("idx_kacl_events_subject").on(table.subjectType, table.subjectId, table.createdAt),
+		index("idx_kacl_events_target").on(table.targetType, table.targetId, table.createdAt),
+		index("idx_kacl_events_actor").on(table.actorUserId, table.createdAt),
+		index("idx_kacl_events_type").on(table.eventType, table.createdAt),
 	],
 );
 

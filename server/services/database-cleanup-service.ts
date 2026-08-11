@@ -62,7 +62,6 @@ const SESSION_OWNED_TABLES: SessionOwnedTableRelation[] = [
 	{ tableName: "narrator_sidecars", alias: "ns", narratorColumn: "narrator_id" },
 	{ tableName: "api_requests", alias: "ar", narratorColumn: "narrator_id", countAs: "apiRequests" },
 	{ tableName: "terminal_view_state", alias: "tvs", narratorColumn: "narrator_id" },
-	{ tableName: "terminal_tabs", alias: "tt", narratorColumn: "narrator_id" },
 	{ tableName: "terminals", alias: "t", narratorColumn: "narrator_id" },
 	{ tableName: "narrator_buffered_messages", alias: "nbm", narratorColumn: "narrator_id" },
 	{ tableName: "narrator_file_snapshots", alias: "nfs", narratorColumn: "narrator_id" },

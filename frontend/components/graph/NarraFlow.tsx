@@ -7,7 +7,6 @@ import {
 	type Node,
 	type NodeChange,
 	type NodeMouseHandler,
-	type OnConnect,
 	ReactFlow,
 	type ReactFlowInstance,
 	useReactFlow,
@@ -16,7 +15,6 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "@xyflow/react/dist/style.css";
 import "@frontend/styles/react-flow-controls.css";
-import { useCreateChapterEdge } from "@frontend/hooks/useChapterEdges";
 import { useDeleteChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useUpdateGraphPositions } from "@frontend/hooks/useGraphPositions";
 import { useNarraFlow } from "@frontend/hooks/useNarraFlow";
@@ -50,7 +48,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { ChapterNode } from "./ChapterNode";
 import { CherryPickEdge } from "./CherryPickEdge";
-import { DependencyEdge } from "./DependencyEdge";
+
 import type { DraftMode } from "./DraftNode";
 import { DRAFT_NODE_WIDTH, DraftNode } from "./DraftNode";
 import { ForkEdge } from "./ForkEdge";
@@ -74,7 +72,6 @@ const nodeTypes = {
 const edgeTypes = {
 	fork: ForkEdge,
 	merge: MergeEdge,
-	dependency: DependencyEdge,
 	cherry_pick: CherryPickEdge,
 	terminal: TerminalEdge,
 	review: ReviewEdge,
@@ -288,7 +285,6 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		openedTerminals,
 	} = useNarraFlow(projectId);
 	const { savePosition, savePanelState } = useUpdateGraphPositions(projectId);
-	const createEdge = useCreateChapterEdge();
 	const updateChapter = useUpdateChapter();
 
 	const dormantMutation = useMutation({
@@ -1283,19 +1279,10 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		});
 	}, []);
 
-	const onConnect: OnConnect = useCallback(
-		(params) => {
-			if (params.source && params.target) {
-				createEdge.mutate({
-					sourceId: params.source,
-					targetId: params.target,
-					type: "dependency",
-					projectId,
-				});
-			}
-		},
-		[createEdge, projectId],
-	);
+	// No `onConnect`: dragging between two node handles used to create a `dependency` edge.
+	// Nothing read those edges, and the canvas had no `onEdgesChange`/`onEdgesDelete`, so a
+	// stray drag left a permanent orange line the user could not remove. See
+	// `server/services/chapter-edge-service.ts` for why the edge type was dropped.
 
 	const onPaneClick = useCallback(() => {
 		setContextMenu(null);
@@ -2071,10 +2058,8 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					onNodeDragStop={onNodeDragStop}
 					onNodeDoubleClick={onNodeDoubleClick}
 					onNodeContextMenu={onNodeContextMenu}
-					onConnect={onConnect}
 					onPaneClick={onPaneClick}
 					nodesDraggable
-					nodesConnectable
 					elementsSelectable
 					onlyRenderVisibleElements
 					panOnDrag={pcDragMode === "pan" ? true : [1]}

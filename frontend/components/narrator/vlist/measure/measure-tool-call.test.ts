@@ -1040,45 +1040,97 @@ describe("measureToolCall — MeasuredElement shape", () => {
 	});
 });
 
-// ── Tool-result sidecar band (the mini-cards between header and detail) ──────
-describe("measureToolCall — tool-result sidecar band", () => {
+// ── Tool-result side-car band (footnotes BELOW the detail region) ────────────
+//
+// Two invariants flipped in the footnote redesign, and both are deliberate reversals
+// of what the chunked path did (which the vlist had copied for parity):
+//   - a FOLDED card no longer grows for its injections. A side-car is appended to the
+//     end of the tool's OUTPUT text, so on a card that shows no output it would be a
+//     footnote to nothing. The header's `+N` marker carries the fact instead, inside
+//     the existing fixed row.
+//   - the band sits BELOW the detail region, where the injections actually are in the
+//     text the model read — and above permission/reflection, which stay last as the
+//     thing asking the reader to decide.
+describe("measureToolCall — tool-result side-car band", () => {
 	const SIDECAR = {
+		payloadKind: "sidecar" as const,
 		source: "silent_progress",
 		sourceLabel: "Progress reminder",
-		color: "indigo",
-		target: "tool_result",
-		previewText: "note",
+		tone: "neutral" as const,
+		form: "folded" as const,
+		headline: "note",
+		lines: [{ kind: "text" as const, text: "note" }],
 		fullText: "note",
+		isRaw: false,
 	};
 
-	it("a sidecar grows BOTH the collapsed and the expanded card (chunk parity: outside the collapse)", async () => {
+	it("does NOT grow a folded card (nothing there for a footnote to attach to)", async () => {
 		const { measureToolCall } = await mod();
-		const { SIDECAR_COLLAPSED_HEIGHT } = await import("./measure-sidecar");
 		const base = baseCard();
 		const withSc = baseCard({ sidecars: [SIDECAR] });
-		// Collapsed (L4 collapses a success card): the band is still measured.
+		// L4 collapses a success card.
 		const collapsedBase = measureToolCall(base, 600, 4);
 		const collapsedSc = measureToolCall(withSc, 600, 4);
-		expect(collapsedSc.height).toBeGreaterThan(collapsedBase.height);
-		// Expanded too (the band sits above the detail).
-		const openBase = measureToolCall(base, 600, 6);
-		const openSc = measureToolCall(withSc, 600, 6);
+		expect(collapsedSc.effectiveOpened).toBe(false);
+		expect(collapsedSc.height).toBe(collapsedBase.height);
+		expect(collapsedSc.sidecars).toBeNull();
+		// …but the FACT of them survives collapsing, height-neutrally.
+		expect(collapsedSc.sidecarCount).toBe(1);
+	});
+
+	it("grows an expanded card, and reports the count there too", async () => {
+		const { measureToolCall } = await mod();
+		const openBase = measureToolCall(baseCard(), 600, 6);
+		const openSc = measureToolCall(baseCard({ sidecars: [SIDECAR] }), 600, 6);
 		expect(openSc.height).toBeGreaterThan(openBase.height);
-		// The collapsed delta is exactly one collapsed sidecar card.
-		expect(collapsedSc.height - collapsedBase.height).toBe(SIDECAR_COLLAPSED_HEIGHT);
+		expect(openSc.sidecars).toHaveLength(1);
+		expect(openSc.sidecarCount).toBe(1);
 	});
 
-	it("the band stacks one measured mini-card per record, top-aligned under the header", async () => {
+	it("places the band BELOW the detail region", async () => {
 		const { measureToolCall, HEADER_ROW_HEIGHT } = await mod();
-		const r = measureToolCall(baseCard({ sidecars: [SIDECAR, SIDECAR] }), 600, 6);
+		const r = measureToolCall(
+			baseCard({
+				detail: { kind: "capped", cap: "code", contentLines: 6 },
+				sidecars: [SIDECAR, SIDECAR],
+			}),
+			600,
+			6,
+		);
 		expect(r.sidecars).toHaveLength(2);
-		expect(r.sidecarsTop).toBe(HEADER_ROW_HEIGHT);
+		expect(r.detail).not.toBeNull();
+		// Strictly below the header, by exactly the detail's height — this is the
+		// reversal: the band used to sit between the header and the detail.
+		expect(r.sidecarsTop).toBe(HEADER_ROW_HEIGHT + r.detail!.height);
+		expect(r.sidecarsTop).toBeGreaterThan(HEADER_ROW_HEIGHT);
 	});
 
-	it("an expanded sidecar (via opts.sidecarExpanded) measures a taller band", async () => {
+	it("pushes the permission area below the band (permission stays last)", async () => {
+		const { measureToolCall } = await mod();
+		const pending = { hasExecutionTarget: true, feedbackRows: 1, buttonCount: 2 };
+		const withoutSc = measureToolCall(baseCard({ status: "pending" }), 600, 6, {
+			pendingPermission: pending,
+		});
+		const withSc = measureToolCall(baseCard({ status: "pending", sidecars: [SIDECAR] }), 600, 6, {
+			pendingPermission: pending,
+		});
+		expect(withSc.permissionTop).toBeGreaterThan(withoutSc.permissionTop);
+		expect(withSc.permissionTop).toBeGreaterThanOrEqual(withSc.sidecarsTop);
+	});
+
+	it("an expanded footnote (via opts.sidecarExpanded) measures a taller band", async () => {
 		const { measureToolCall } = await mod();
 		const data = baseCard({
-			sidecars: [{ ...SIDECAR, fullText: "one\ntwo\nthree" }],
+			sidecars: [
+				{
+					...SIDECAR,
+					lines: [
+						{ kind: "text" as const, text: "one" },
+						{ kind: "text" as const, text: "two" },
+						{ kind: "text" as const, text: "three" },
+					],
+				},
+			],
 		});
 		const collapsed = measureToolCall(data, 600, 6, { sidecarExpanded: [] });
 		const expanded = measureToolCall(data, 600, 6, { sidecarExpanded: [0] });
@@ -1086,10 +1138,11 @@ describe("measureToolCall — tool-result sidecar band", () => {
 		expect(expanded.sidecars?.[0]?.expanded).toBe(true);
 	});
 
-	it("no sidecars → null band, byte-identical geometry to before the feature", async () => {
+	it("no sidecars → null band and a zero count", async () => {
 		const { measureToolCall } = await mod();
 		const r = measureToolCall(baseCard(), 600, 6);
 		expect(r.sidecars).toBeNull();
+		expect(r.sidecarCount).toBe(0);
 		expect(r.sidecarsTop).toBeGreaterThanOrEqual(0);
 	});
 });

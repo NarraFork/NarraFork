@@ -24,6 +24,7 @@ import {
 	type Principal,
 	resolvePrincipalCaps,
 } from "./knowledge-acl";
+import { emitEntryDrifted } from "./knowledge-notify";
 
 function nowIso(): string {
 	return new Date().toISOString();
@@ -58,6 +59,18 @@ const OPEN_SUBMISSION_SCAN_LIMIT = 20;
  * author must withdraw it (or a reviewer must resolve it) explicitly.
  */
 const SUPERSEDABLE_STATUSES = ["pending"] as const;
+
+/**
+ * Statuses closed when the author RETIRES the personal entry itself ({@link deletePersonalEntry}).
+ *
+ * Broader than SUPERSEDABLE_STATUSES because the target is going away, not just changing:
+ * - `conflict` — there is nothing left to resolve the conflict against.
+ * - `changes_requested` — the author can no longer make the requested changes (the entry it
+ *   would have changed is retired), so leaving it open would strand a request whose only
+ *   transition (`resubmit`) has become impossible. Without this it became an orphan row
+ *   pointing at an archived draft, still listed as awaiting the author.
+ */
+const CLOSED_ON_DELETE_STATUSES = ["pending", "conflict", "changes_requested"] as const;
 
 /** Transaction handle type of `db.transaction((tx) => …)`, for shared transaction helpers. */
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -407,10 +420,10 @@ async function updateStandaloneMeta(
  * Authorization is the author-or-admin check in loadOwnDraft (an unauthorized caller gets
  * NotFound so entry existence isn't leaked).
  *
- * Any OPEN (pending/conflict) publish request for this entry is closed in the SAME
- * transaction: the author is retiring the entry, so a queued proposal must not stay
- * reviewable. Unlike `updateDraft`, this closes `conflict` too — the entry itself is
- * going away, so there is nothing left to resolve the conflict against.
+ * Every unmerged publish request for this entry is closed in the SAME transaction (see
+ * {@link CLOSED_ON_DELETE_STATUSES}): the author is retiring the entry, so a queued proposal
+ * must not stay reviewable and a bounced one must not stay waiting on the author. Wider than
+ * `updateDraft`, which only supersedes `pending` — here the entry itself is going away.
  *
  * The closing status is `withdrawn`, NOT `rejected`: no reviewer passed judgement here,
  * the author retired their own entry. Writing `rejected` (+ a `request_changes` verdict)
@@ -438,7 +451,7 @@ async function deletePersonalEntry(principal: Principal, draftId: string) {
 			.where(
 				and(
 					eq(knowledgeSubmissions.draftId, draftId),
-					inArray(knowledgeSubmissions.status, ["pending", "conflict"]),
+					inArray(knowledgeSubmissions.status, [...CLOSED_ON_DELETE_STATUSES]),
 				),
 			)
 			.limit(OPEN_SUBMISSION_SCAN_LIMIT)
@@ -452,7 +465,7 @@ async function deletePersonalEntry(principal: Principal, draftId: string) {
 			.where(
 				and(
 					eq(knowledgeSubmissions.draftId, draftId),
-					inArray(knowledgeSubmissions.status, ["pending", "conflict"]),
+					inArray(knowledgeSubmissions.status, [...CLOSED_ON_DELETE_STATUSES]),
 				),
 			)
 			.run();
@@ -778,6 +791,36 @@ async function submitForReview(
 			throw new ValidationError("This personal entry has no title; set one before publishing");
 		}
 	}
+	// Drift check BEFORE submitting (linked entries only; a standalone entry has no main).
+	//
+	// Submitting from a stale fork point is allowed — approve does a three-way merge and
+	// usually succeeds — but silently allowing it pushed the whole cost of a stale base onto
+	// the REVIEWER: the conflict only surfaced when they clicked approve, at which point the
+	// author (the only person who knows what their edit meant) is no longer in the loop.
+	// Reporting it here lets the author rebase first, while it is still cheap.
+	//
+	// Deliberately a warning, not a rejection: a drifted base is frequently mergeable, and
+	// hard-failing would strand an author whose rebase conflicts.
+	let driftWarning: {
+		versionsBehind: number;
+		baseRevisionId: string;
+		currentRevisionId: string;
+	} | null = null;
+	if (draft.entryId && draft.baseRevisionId) {
+		const entryRow = await db.query.knowledgeEntries.findFirst({
+			where: eq(knowledgeEntries.id, draft.entryId),
+			// Only the pointer that defines drift — never currentContent (large field).
+			columns: { currentRevisionId: true },
+		});
+		const currentRevisionId = entryRow?.currentRevisionId ?? null;
+		if (currentRevisionId && currentRevisionId !== draft.baseRevisionId) {
+			driftWarning = {
+				versionsBehind: await countVersionsBehind(draft.baseRevisionId, currentRevisionId),
+				baseRevisionId: draft.baseRevisionId,
+				currentRevisionId,
+			};
+		}
+	}
 	const id = generateId();
 	const now = nowIso();
 	let submission: typeof knowledgeSubmissions.$inferSelect | undefined;
@@ -846,7 +889,10 @@ async function submitForReview(
 			submitterUserId: submission.submitterUserId,
 		});
 	}
-	return submission;
+	// `driftWarning` is additive on the existing submission shape: present only when the
+	// proposal is based on a stale main, so callers can surface "rebase first" without a
+	// second round-trip. Absent (null) is the normal, up-to-date case.
+	return submission ? { ...submission, driftWarning } : submission;
 }
 
 async function loadSubmission(submissionId: string) {
@@ -864,10 +910,25 @@ interface Finding {
 }
 
 /** Review a submission. approve → merge; request_changes/reject → bounce draft. */
+/**
+ * Record a reviewer's verdict on a publish request.
+ *
+ * Verdicts and where they leave the request:
+ *  - `approve`         → merged/published (`approved`), or `conflict` if the merge failed.
+ *  - `request_changes` → back to the author (`changes_requested`), who may resubmit or withdraw.
+ *  - `reject`          → refused for good (`rejected`). TERMINAL: deliberately not resubmittable,
+ *                        which is what distinguishes it from `request_changes`. The author's
+ *                        personal entry is untouched, so they can still start a fresh proposal —
+ *                        rejection closes this REQUEST, it does not confiscate their work.
+ *  - `comment_only`    → status unchanged; findings recorded for the author to read.
+ */
 async function review(
 	principal: Principal,
 	submissionId: string,
-	input: { verdict: "approve" | "request_changes" | "comment_only"; findings?: Finding[] },
+	input: {
+		verdict: "approve" | "request_changes" | "reject" | "comment_only";
+		findings?: Finding[];
+	},
 ) {
 	const sub = await loadSubmission(submissionId);
 	if (sub.status !== "pending" && sub.status !== "conflict") {
@@ -910,10 +971,15 @@ async function review(
 			: approveStandalone(sub, principal.userId, findings, now);
 	}
 
-	// request_changes / comment_only update only the submission. The personal entry stays
-	// `active` (its lifecycle is independent of the publish request).
-	const isRequestChanges = input.verdict === "request_changes";
-	const newStatus = isRequestChanges ? "changes_requested" : sub.status;
+	// request_changes / reject / comment_only update only the submission. The personal entry
+	// stays `active` in every case (its lifecycle is independent of the publish request) — even
+	// a rejection leaves the author's own copy intact to build on.
+	const newStatus =
+		input.verdict === "request_changes"
+			? "changes_requested"
+			: input.verdict === "reject"
+				? "rejected"
+				: sub.status;
 	db.transaction((tx) => {
 		tx.update(knowledgeSubmissions)
 			.set({
@@ -1287,6 +1353,9 @@ async function commitMergedRevision(
 		submissionId: sub.id,
 		submitterUserId: sub.submitterUserId,
 	});
+	// A publish moves main just like a direct revision does, so OTHER holders of a personal
+	// version are now drifted. The submitter is excluded: their own draft was just archived.
+	emitEntryDrifted(targetEntryId, sub.submitterUserId);
 	return revisionId;
 }
 
@@ -1628,16 +1697,26 @@ async function listSubmissionsForDraft(
 
 // ─── Author-side state machine closure (withdraw / resubmit) ─────────────
 
-/** Statuses a submitter may withdraw: the request is still open, so nothing has been merged. */
-const WITHDRAWABLE_STATUSES = ["pending", "conflict"] as const;
+/**
+ * Statuses a submitter may withdraw. Nothing has been merged in any of them, so retracting is
+ * always safe:
+ *
+ * - `pending` / `conflict` — the request is still open and awaiting a reviewer.
+ * - `changes_requested` — the reviewer bounced it back, so the ball is in the AUTHOR's court.
+ *   Without this, an author who decides NOT to make the requested changes had no exit at all:
+ *   `resubmit` was the only transition out, so abandoning the idea left the request parked in
+ *   both the author's and the reviewer's lists forever. Withdrawing says "I'm dropping this",
+ *   which is exactly the author-side decision that was missing.
+ */
+const WITHDRAWABLE_STATUSES = ["pending", "conflict", "changes_requested"] as const;
 
 /**
- * Withdraw one of the caller's OWN open publish requests (`pending` or `conflict`) → `withdrawn`.
+ * Withdraw one of the caller's OWN unmerged publish requests → `withdrawn`.
  *
  * Why this exists: without it, the only way to retract a queued proposal was to edit the draft
  * and let the auto-invalidation close it — using a side effect as a feature, and impossible at
- * all for a `conflict` submission (which is deliberately NOT auto-closed). Withdrawing is the
- * explicit exit.
+ * all for a `conflict` submission (which is deliberately NOT auto-closed) or a
+ * `changes_requested` one (which nothing auto-closes). Withdrawing is the explicit exit.
  *
  * Authorization: the SUBMITTER (or an admin). Deliberately not the reviewer — a reviewer who
  * wants it gone uses `review` with `request_changes`/`reject`, which records a verdict.
@@ -1658,7 +1737,8 @@ async function withdrawSubmission(
 	}
 	if (!(WITHDRAWABLE_STATUSES as readonly string[]).includes(sub.status)) {
 		throw new ValidationError(
-			`Submission is ${sub.status} and can no longer be withdrawn (only pending or conflict requests can)`,
+			`Submission is ${sub.status} and can no longer be withdrawn ` +
+				`(only pending, conflict, or changes_requested requests can)`,
 		);
 	}
 	const now = nowIso();
@@ -1751,11 +1831,14 @@ const REVIEW_SCOPE_LIMIT = 100;
  * for tag X / collection Y" instead of leaving the user to infer it from which submissions
  * happen to appear.
  *
- * Two axes, mirroring the authorization split in `review`:
- *  - `reviewTags`  — review grants held (linked entries: `canReview` requires the caller to
- *                    hold a review grant for EVERY review tag of the entry).
- *  - `collections` — readable collections the caller may WRITE into (standalone publishes are
- *                    gated on write access to the target collection).
+ * Three axes, mirroring the authorization in `review` / `canReview`:
+ *  - `reviewTags`      — review grants held (linked entries: `canReview` requires the caller to
+ *                        hold a review grant for EVERY review tag of the entry).
+ *  - `collections`     — readable collections the caller may WRITE into (standalone publishes are
+ *                        gated on write access to the target collection).
+ *  - `ownedEntryCount` — entries the caller owns, which `canReview` short-circuits on. Without
+ *                        this, a user with no grants but several owned entries was told they had
+ *                        no review authority at all.
  *
  * Bounded: grants come from the caller's own (indexed) grant rows via `resolvePrincipalCaps`,
  * tag names from ONE `inArray` lookup over those ids, and collections from the already
@@ -1767,6 +1850,8 @@ async function getMyReviewScope(principal: Principal): Promise<{
 	isAdmin: boolean;
 	reviewTags: { id: string; name: string }[];
 	collections: { id: string; name: string; slug: string }[];
+	/** Entries the caller OWNS — reviewable via the owner short-circuit, with no grant needed. */
+	ownedEntryCount: number;
 	truncated: boolean;
 }> {
 	const caps = await resolvePrincipalCaps(principal);
@@ -1815,11 +1900,28 @@ async function getMyReviewScope(principal: Principal): Promise<{
 		}
 	}
 
+	// Entry ownership is the THIRD review path (canReview short-circuits on owner), and it is
+	// invisible in the two axes above: a user with no grants at all still reviews proposals on
+	// entries they own. Reported as a bounded count so the review tab can say "plus N entries you
+	// own" instead of implying "you have no review rights" to someone who does.
+	const ownedEntryRows = caps.isAdmin
+		? []
+		: await db.query.knowledgeEntries.findMany({
+				where: (e, { eq: eqOp }) => eqOp(e.ownerUserId, principal.userId),
+				columns: { id: true },
+				limit: REVIEW_SCOPE_LIMIT + 1,
+			});
+	const ownedEntryCount = Math.min(ownedEntryRows.length, REVIEW_SCOPE_LIMIT);
+
 	return {
 		isAdmin: caps.isAdmin,
 		reviewTags,
 		collections: writable,
-		truncated: tagIds.size > idList.length || cols.length > REVIEW_SCOPE_LIMIT,
+		ownedEntryCount,
+		truncated:
+			tagIds.size > idList.length ||
+			cols.length > REVIEW_SCOPE_LIMIT ||
+			ownedEntryRows.length > REVIEW_SCOPE_LIMIT,
 	};
 }
 

@@ -20,6 +20,14 @@
 import { resolveAssistantTextDisplay, type TextCitation } from "../citations";
 import { hasUsablePlanBody } from "../plan-reference";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
+import {
+	presentRawSideCar,
+	presentSideCarBody,
+	readSideCarBody,
+	type SideCarForm,
+	type SideCarLine,
+	type SideCarTone,
+} from "../sidecar-body";
 import type { VListElementKind } from "./element-kinds";
 import type { RenderLod } from "./prepared-block";
 import { type ReasoningLiveTail, resolveReasoningLiveTail } from "./reasoning-live-tail";
@@ -44,9 +52,7 @@ import {
 	adapterMessageHasVisibleContent,
 	collectVisibleSidecars,
 	SIDECAR_PAYLOAD_KIND,
-	SIDECAR_SOURCE_META,
 	sidecarDetailText,
-	sidecarPreviewText,
 } from "./sidecar";
 import {
 	isLiveStreamingBlock,
@@ -522,7 +528,7 @@ export interface AdapterContext {
 	 *
 	 * `expandedRows` stays for the append-only lists, whose ordinals are already
 	 * stable: a `reasoning-steps` element (step N stays row N however many steps
-	 * follow), a `sidecar-trace` (one row), and the subagent-recovery card's
+	 * follow) and the subagent-recovery card's
 	 * checkboxes. The shell routes by kind (`traceRowFoldChannel`); an element read
 	 * here must be written there, or the reader's fold lands in a channel nothing
 	 * reads and the row stops opening.
@@ -886,52 +892,55 @@ export interface SidecarSpecData {
 	 */
 	payloadKind?: typeof SIDECAR_PAYLOAD_KIND;
 	source: string;
-	/** Localized source label (badge text). */
+	/** Localized source label (the footnote's leading word). */
 	sourceLabel: string;
-	/** Mantine colour for the accent rail + badge. */
-	color: string;
-	/** "user_message" | "tool_result" (badge text is the raw target). */
-	target: string;
-	/** Collapsed single-line preview (height-neutral: the row is fixed). */
-	previewText: string;
-	/** Expanded body (MEASURED — the card's height comes from this). */
+	/** Semantic group — drives the label's tint and the default form. */
+	tone: SideCarTone;
+	/**
+	 * `open` draws the body without being asked; `folded` shows only the headline.
+	 * A SHAPE, not a fold state — see `SideCarForm`.
+	 */
+	form: SideCarForm;
+	/** The single line a folded footnote shows (clamped → height-neutral). */
+	headline: string;
+	/** The body lines (MEASURED — the footnote's expanded height comes from these). */
+	lines: SideCarLine[];
+	/** Whole injection as one string, for the copy control. Never measured. */
 	fullText: string;
+	/**
+	 * True when this came from the verbatim-`content` fallback (a row written before
+	 * structured bodies existed) rather than a `SideCarBody`.
+	 */
+	isRaw: boolean;
 	/**
 	 * Localized "you are not seeing all of it, use copy" notice.
 	 *
-	 * Composed here (like every other adapter string) and used by BOTH caps: the
-	 * char cap appends it as the last body line (`sidecarDetailText`), and the
-	 * measure layer reserves it as a notice row when the LINE cap clipped the body
-	 * — otherwise an expanded long sidecar just stops after 40 lines inside an
-	 * `overflow:hidden` box with nothing telling the reader why.
+	 * Used by both caps: the raw path's char cap appends it as the last body line
+	 * (`sidecarDetailText`), and the measure layer reserves it as a notice row when
+	 * the LINE cap clipped the body — otherwise a long expanded footnote just stops
+	 * inside an `overflow:hidden` box with nothing telling the reader why.
 	 *
 	 * Optional for the same reason as `payloadKind`: the adapter always sets it, but
 	 * measure fixtures may omit it (the notice row then reserves nothing).
 	 */
 	truncatedLabel?: string;
+	/** Localized "show all N lines" row label for a capped `open` footnote. */
+	showAllLabel?: string;
 }
-
-/**
- * LOD threshold for the sidecar's visual form. Below it every record renders as
- * a bare CollapsibleTrace (the low-LOD "bare row" paradigm, no card skin); at
- * and above it each record is the full collapsible card. The threshold matches
- * the tool-run fold boundary (L3 folds tools into traces, L4 keeps full cards),
- * so a sidecar never reads as heavier than the tool rows beside it.
- */
-export const SIDECAR_CARD_LOD_THRESHOLD: RenderLod = 4;
 
 /**
  * Build the sidecar specs for a list of records already filtered to one target.
  *
- * Two forms by LOD (the low-LOD redesign — one trace per record, not one card):
+ * ONE form at every LOD. There used to be two — a bare trace below L4 and a Paper
+ * card at/above it — which meant two measure paths, two render branches and two fold
+ * channels (index-addressed vs key-addressed) for one concept; that split is what
+ * made `traceRowFoldChannel` necessary and was a standing source of "the row does not
+ * open" bugs. The footnote form is light enough at every level that the distinction
+ * bought nothing.
  *
- *   - LOW LOD (< SIDECAR_CARD_LOD_THRESHOLD): one `sidecar-trace` spec per
- *     record — a bare CollapsibleTrace whose header shows the source label and
- *     whose single row carries the preview, expanding to the full text. This is
- *     the same bare-row paradigm the folded tool / reasoning traces use, so the
- *     sidecar stops standing out as the only coloured Paper card on screen.
- *   - HIGH LOD: one `sidecar` card per record, each with its own fold state
- *     (the per-card fold the redesign chose over the chunked aggregate notice).
+ * Each record keeps its OWN fold state (`${keyBase}-sc{i}`): one turn can inject a
+ * progress reminder, a finished background task and a teammate's message at once, and
+ * aggregating them would force the reader to open all three to read one.
  */
 function buildSidecarSpecs(
 	sideCars: readonly AdapterSidecar[],
@@ -939,44 +948,85 @@ function buildSidecarSpecs(
 	ctx: AdapterContext,
 ): ElementSpec[] {
 	const specs: ElementSpec[] = [];
-	const lowLod = ctx.lod < SIDECAR_CARD_LOD_THRESHOLD;
 	for (let i = 0; i < sideCars.length; i++) {
 		const sc = sideCars[i];
 		if (!sc) continue;
-		const meta = SIDECAR_SOURCE_META[sc.source];
 		const key = `${keyBase}-sc${i}`;
-		const truncatedLabel = sysLabel(ctx, "sidecarTruncated");
-		const sourceLabel = meta
-			? sysLabel(ctx, meta.labelKey)
-			: sc.source || sysLabel(ctx, "sidecarUnknown");
-		const data: SidecarSpecData = {
-			payloadKind: SIDECAR_PAYLOAD_KIND,
-			source: sc.source,
-			sourceLabel,
-			color: meta?.color ?? "gray",
-			target: sc.target,
-			previewText: sidecarPreviewText(sc.content),
-			fullText: sidecarDetailText(sc.content, truncatedLabel),
-			truncatedLabel,
-		};
-		if (lowLod) {
-			specs.push({
-				kind: "sidecar-trace",
-				key,
-				data,
-				opts: { expandedIndices: ctx.expandedRows?.(key) ?? [] },
-			});
-		} else {
-			specs.push({
-				kind: "sidecar",
-				key,
-				data,
-				opts: { expanded: ctx.isExpanded?.(key) ?? false },
-			});
-		}
+		specs.push({
+			kind: "sidecar",
+			key,
+			data: buildSidecarSpecData(sc, ctx),
+			opts: { expanded: ctx.isExpanded?.(key) ?? false },
+		});
 	}
 	return specs;
 }
+
+/**
+ * The measure/render payload for ONE side-car record.
+ *
+ * The single construction point for both surfaces (standalone footnotes and a tool
+ * card's band), so the two can never project the same record differently.
+ *
+ * A record with a structured `body` is projected by `presentSideCarBody`, which drops
+ * the model-facing instruction boilerplate and yields real line structure. A record
+ * without one — written before bodies existed — is shown VERBATIM by
+ * `presentRawSideCar`. There is deliberately no middle path that tries to parse an
+ * old string back into structure.
+ */
+function buildSidecarSpecData(sc: AdapterSidecar, ctx: AdapterContext): SidecarSpecData {
+	const truncatedLabel = sysLabel(ctx, "sidecarTruncated");
+	const body = readSideCarBody(sc);
+	const presentation = body
+		? presentSideCarBody(sc.source, body, ctx.labels)
+		: presentRawSideCar(sc.source, sidecarDetailText(sc.content, truncatedLabel));
+	return {
+		payloadKind: SIDECAR_PAYLOAD_KIND,
+		source: sc.source,
+		sourceLabel: sidecarSourceLabel(sc.source, ctx),
+		tone: presentation.tone,
+		form: presentation.form,
+		headline: presentation.headline,
+		lines: presentation.lines,
+		// The copy control yields what the MODEL saw, not the projection: the reader
+		// copies a side-car to paste it somewhere it will be read as context.
+		fullText: sc.content,
+		isRaw: presentation.isRaw,
+		truncatedLabel,
+		showAllLabel: sysLabel(ctx, "sidecarShowAll"),
+	};
+}
+
+/** Localized source name, falling back to the raw tag for an unmapped source. */
+function sidecarSourceLabel(source: string, ctx: AdapterContext): string {
+	const key = SIDECAR_SOURCE_LABEL_KEYS[source];
+	if (key) return sysLabel(ctx, key);
+	return source || sysLabel(ctx, "sidecarUnknown");
+}
+
+/**
+ * Source tag → label key in `ctx.labels`.
+ *
+ * `behavior_fence` and `pipeline_exit_confirmation` are new entries: the server has
+ * always pushed them, but neither SOURCE_META table listed them, so they rendered as
+ * their raw snake_case tags.
+ */
+const SIDECAR_SOURCE_LABEL_KEYS: Record<string, string> = {
+	silent_progress: "sidecarSourceSilentProgress",
+	todo_reminder: "sidecarSourceTodoReminder",
+	living_work_spec: "sidecarSourceTodoReminder",
+	relaxed_plan: "sidecarSourceRelaxedPlan",
+	knowledge_base_hint: "sidecarSourceKnowledgeBaseHint",
+	bg_agent: "sidecarSourceBgAgent",
+	bg_bash: "sidecarSourceBgBash",
+	team_message: "sidecarSourceTeamMessage",
+	buffered_user: "sidecarSourceBufferedUser",
+	group_message: "sidecarSourceGroupMessage",
+	subagent_message: "sidecarSourceSubagentMessage",
+	spec_update: "sidecarSourceSpecUpdate",
+	behavior_fence: "sidecarSourceBehaviorFence",
+	pipeline_exit_confirmation: "sidecarSourcePipelineExit",
+};
 
 /** The visible `user_message` sidecars of a message, as element specs. */
 function messageSidecarSpecs(
@@ -2195,22 +2245,8 @@ function buildToolSidecarData(
 	if (!Array.isArray(raw)) return null;
 	const visible = collectVisibleSidecars(raw as AdapterSidecar[], "tool_result");
 	if (visible.length === 0) return null;
-	const truncatedLabel = sysLabel(ctx, "sidecarTruncated");
-	return visible.map((sc) => {
-		const meta = SIDECAR_SOURCE_META[sc.source];
-		return {
-			payloadKind: SIDECAR_PAYLOAD_KIND,
-			source: sc.source,
-			sourceLabel: meta
-				? sysLabel(ctx, meta.labelKey)
-				: sc.source || sysLabel(ctx, "sidecarUnknown"),
-			color: meta?.color ?? "gray",
-			target: sc.target,
-			previewText: sidecarPreviewText(sc.content),
-			fullText: sidecarDetailText(sc.content, truncatedLabel),
-			truncatedLabel,
-		} satisfies SidecarSpecData;
-	});
+	// Same construction as a standalone footnote — see buildSidecarSpecData.
+	return visible.map((sc) => buildSidecarSpecData(sc, ctx));
 }
 
 /** Chunk parity: Bash falls back to a 120s deadline (ToolCallCard.tsx:1327). */

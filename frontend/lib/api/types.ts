@@ -6,6 +6,7 @@ export type {
 
 import type { TextCitation } from "@shared/citations";
 import type { LocalizedValue } from "@shared/i18n-locales";
+import type { SideCarBody } from "@shared/sidecar-body";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type { TextCitation } from "@shared/citations";
@@ -446,7 +447,16 @@ export interface SideCarRecord {
 	id?: string;
 	target: "tool_result" | "user_message";
 	source: string;
+	/** The model-facing text. Shown verbatim when there is no structured `body`. */
 	content: string;
+	/**
+	 * Structured form of the injection (WS shape). HTTP-loaded rows carry the same
+	 * value under `bodyJson` (the DB column name) — use `readSideCarBody` rather
+	 * than reading either field directly.
+	 */
+	body?: SideCarBody;
+	/** Structured form as loaded from the DB row. See `body`. */
+	bodyJson?: SideCarBody | null;
 	toolUseId?: string | null;
 	orderIndex?: number;
 }

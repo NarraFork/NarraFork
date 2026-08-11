@@ -21,25 +21,11 @@ export const updateTerminalGraphStateSchema = z.object({
 	graphHeight: z.number().finite().optional(),
 });
 
-// === Terminal Tabs ===
-
-export const createTerminalTabSchema = z
-	.object({
-		chapterId: z.string().min(1).optional(),
-		narratorId: z.string().min(1).optional(),
-		name: z.string().min(1).max(100),
-	})
-	.refine((d) => (d.chapterId || d.narratorId) && !(d.chapterId && d.narratorId), {
-		message: "Exactly one of chapterId or narratorId is required",
-	});
-
-export const updateTerminalTabSchema = z.object({
-	name: z.string().min(1).max(100).optional(),
-});
-
-export const reorderTerminalTabsSchema = z.object({
-	ids: z.array(z.string().min(1)).min(1),
-});
+// === Terminal Tabs: removed ===
+//
+// `createTerminalTabSchema` / `updateTerminalTabSchema` / `reorderTerminalTabsSchema` used
+// to live here, validating the `/terminals/tabs` routes. Those routes, their service and
+// the `terminal_tabs` table are gone — nothing ever called them. See `routes/terminals.ts`.
 
 // === Terminal View State ===
 

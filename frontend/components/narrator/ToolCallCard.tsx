@@ -2089,8 +2089,30 @@ const ToolHeader = memo(
 				: Number.NaN;
 		const showContextAskChars = Number.isFinite(contextAskLiveChars) && contextAskLiveChars > 0;
 
+		// System injections this FOLDED card is not drawing. The footnotes live inside
+		// the collapse (a folded card shows no output, so they would have nothing to be
+		// a footnote to), and this keeps the FACT of them visible. Sits in the existing
+		// header row, so it adds no height.
+		const foldedSidecarCount =
+			!opened && hasVisibleSideCars(toolCall.sideCars) ? (toolCall.sideCars?.length ?? 0) : 0;
+
 		const statusNode = (
 			<span className={toolCardClasses.headerStatusRow}>
+				{foldedSidecarCount > 0 && (
+					<Tooltip
+						label={t("sidecar.attachedCount", { count: foldedSidecarCount })}
+						position="top"
+						withArrow
+						fz="xs"
+					>
+						<span
+							className={`${toolCardClasses.headerText} ${toolCardClasses.dimmed}`}
+							style={{ opacity: 0.7, cursor: "help" }}
+						>
+							{`+${foldedSidecarCount}`}
+						</span>
+					</Tooltip>
+				)}
 				<span
 					className={toolCardClasses.headerStatusIcon}
 					style={{
@@ -5986,7 +6008,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 					</Badge>
 				</Tooltip>
 			)}
-			{hasVisibleSideCars(toolCall.sideCars) && <SideCarNotice sideCars={toolCall.sideCars} />}
 			{isStreaming ? (
 				hasStreamingDetail && <StreamingInputDetail toolCall={toolCall} maxHeight={vpHeight} />
 			) : (
@@ -5999,6 +6020,15 @@ export const ToolCallCard = memo(function ToolCallCard({
 							planPreviewOverride={effectivePlanPreviewOverride}
 						/>
 					</Box>
+					{/* System injections, as footnotes BELOW the output they are attached to
+					    (`appendSideCarsForApi` appends them to the tool result text) and
+					    above the permission UI, which stays last as the thing asking the
+					    reader to decide.
+
+					    Inside the collapse on purpose: a folded card shows no output, so a
+					    footnote there would have nothing to be a footnote to. The header's
+					    `+N` marker keeps the fact of them visible instead. */}
+					{hasVisibleSideCars(toolCall.sideCars) && <SideCarNotice sideCars={toolCall.sideCars} />}
 					{permissionUI}
 				</LazyCollapse>
 			)}
