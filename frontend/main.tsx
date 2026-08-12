@@ -13,7 +13,9 @@ import {
 	MantineProvider,
 	v8CssVariablesResolver,
 } from "@mantine/core";
+import { DatesProvider } from "@mantine/dates";
 import "@mantine/core/styles.css";
+import "@mantine/dates/styles.css";
 import "@mantine/notifications/styles.css";
 import "@mantine/tiptap/styles.css";
 import { AppNotifications } from "@frontend/components/AppNotifications";
@@ -335,25 +337,27 @@ async function bootstrap() {
 				defaultColorScheme="auto"
 				cssVariablesResolver={v8CssVariablesResolver}
 			>
-				<ConfirmDialogProvider>
-					<ImageViewerProvider>
-						<AppNotifications />
-						<QueryClientProvider client={queryClient}>
-							<PluginThemeInjector />
-							<PluginRuntimeShell>
-								<React.Suspense
-									fallback={
-										<Center h="100vh">
-											<Loader />
-										</Center>
-									}
-								>
-									<RouterProvider router={router} />
-								</React.Suspense>
-							</PluginRuntimeShell>
-						</QueryClientProvider>
-					</ImageViewerProvider>
-				</ConfirmDialogProvider>
+				<DatesProvider settings={{ firstDayOfWeek: 1 }}>
+					<ConfirmDialogProvider>
+						<ImageViewerProvider>
+							<AppNotifications />
+							<QueryClientProvider client={queryClient}>
+								<PluginThemeInjector />
+								<PluginRuntimeShell>
+									<React.Suspense
+										fallback={
+											<Center h="100vh">
+												<Loader />
+											</Center>
+										}
+									>
+										<RouterProvider router={router} />
+									</React.Suspense>
+								</PluginRuntimeShell>
+							</QueryClientProvider>
+						</ImageViewerProvider>
+					</ConfirmDialogProvider>
+				</DatesProvider>
 			</MantineProvider>
 		</React.StrictMode>,
 	);

@@ -26,3 +26,58 @@ export function parseModelId(raw?: string): { provider?: string; model: string }
 	}
 	return { model: raw };
 }
+
+/**
+ * Date-suffix patterns safe to strip for family grouping.
+ * Copied from model-pricing.ts to keep shared/ dependency-free.
+ */
+const FAMILY_DATE_SUFFIXES: readonly RegExp[] = [
+	/-\d{4}-(?:0[1-9]|1[0-2])-\d{2}$/, // 2026-06-01
+	/-20\d{2}(?:0[1-9]|1[0-2])\d{2}$/, // 20260601
+	/-\d{2}(?:0[1-9]|1[0-2])\d{2}$/, // 260601
+	/-latest$/,
+	/-preview$/,
+];
+
+/**
+ * Normalize a raw model identifier to a "family" key for grouping/clustering.
+ *
+ * Steps:
+ * 1. Strip all provider prefixes by taking the last colon-separated segment
+ * 2. Lower-case
+ * 3. Normalize version separators: dots between digits → dashes (`claude-opus-4.6` → `claude-opus-4-6`)
+ * 4. Strip volatile date suffixes (`claude-opus-4-6-20260514` → `claude-opus-4-6`)
+ *
+ */
+export function normalizeModelFamily(raw: string | null | undefined): string {
+	if (!raw) return "unknown";
+
+	// Step 1: strip all provider prefixes — take the segment after the last colon
+	// Model names themselves never contain colons; colons are always provider separators.
+	let model = raw.trim();
+	const lastColon = model.lastIndexOf(":");
+	if (lastColon > 0) {
+		model = model.slice(lastColon + 1);
+	}
+
+	// Step 2: lower-case
+	model = model.toLowerCase();
+
+	// Step 3: normalize dots between digits to dashes (4.6 → 4-6, 4.5 → 4-5)
+	model = model.replace(/(\d)\.(\d)/g, "$1-$2");
+
+	// Step 4: strip volatile date suffixes
+	for (let round = 0; round < 4; round++) {
+		let stripped = false;
+		for (const pattern of FAMILY_DATE_SUFFIXES) {
+			if (pattern.test(model)) {
+				model = model.replace(pattern, "");
+				stripped = true;
+				break;
+			}
+		}
+		if (!stripped) break;
+	}
+
+	return model || "unknown";
+}

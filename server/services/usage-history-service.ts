@@ -5,6 +5,7 @@ import {
 	encodeUsageHistoryCursor,
 	type UsageHistoryCursor,
 } from "@server/lib/usage-history-cursor";
+import { normalizeModelFamily } from "@shared/model-id";
 import { and, desc, eq, gte, lte, or, sql } from "drizzle-orm";
 
 export interface UsageHistoryFilters {
@@ -73,6 +74,44 @@ export interface UsageHistoryTimeSeriesResponse {
 export interface UsageHistoryTimeSeriesOptions {
 	granularity?: UsageHistoryGranularity;
 	now?: Date;
+}
+
+export type UsageBreakdownDimension = "provider" | "model" | "kind";
+export type UsageBreakdownMetric =
+	| "requests"
+	| "tokens"
+	| "cost"
+	| "inputTokens"
+	| "outputTokens"
+	| "reasoningTokens";
+
+export interface UsageBreakdownEntry {
+	label: string;
+	value: number;
+	percentage: number;
+	count: number;
+}
+
+export interface UsageBreakdownResponse {
+	dimension: UsageBreakdownDimension;
+	metric: UsageBreakdownMetric;
+	entries: UsageBreakdownEntry[];
+	total: number;
+}
+
+export interface UsageStackedTimeSeriesResponse {
+	granularity: UsageHistoryGranularity;
+	dimension: UsageBreakdownDimension;
+	metric: UsageBreakdownMetric;
+	series: Array<{
+		label: string;
+		color: string;
+		data: Array<{ timestamp: string; value: number }>;
+	}>;
+	timestamps: string[];
+	truncated: boolean;
+	effectiveStartDate: string;
+	effectiveEndDate: string;
 }
 
 const USAGE_TIME_SERIES_CONFIG = {
@@ -660,6 +699,259 @@ export class UsageHistoryService {
 			rawDump: this.parseRawDump(rawDumpJson),
 			errorMessage: record.errorMessage,
 		};
+	}
+
+	async getUsageBreakdown(
+		filters: UsageHistoryFilters,
+		options: {
+			dimension: UsageBreakdownDimension;
+			metric: UsageBreakdownMetric;
+			cluster?: boolean;
+		},
+	): Promise<UsageBreakdownResponse> {
+		const { dimension, metric, cluster = true } = options;
+		const conditions = this.buildWhereConditions(filters);
+
+		const dimensionColumn = this.getDimensionColumn(dimension);
+		const metricAgg = this.getMetricAggregation(metric);
+
+		// For model dimension with clustering, fetch more rows then cluster in JS
+		const shouldCluster = dimension === "model" && cluster;
+		const queryLimit = shouldCluster ? 200 : 20;
+
+		const rows = await this.database
+			.select({
+				label: dimensionColumn,
+				value: metricAgg,
+				count: sql<number>`count(*)`,
+			})
+			.from(apiRequests)
+			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
+			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.where(and(...conditions))
+			.groupBy(dimensionColumn)
+			.orderBy(sql`${metricAgg} DESC`)
+			.limit(queryLimit);
+
+		let entries: UsageBreakdownEntry[];
+
+		if (shouldCluster) {
+			// JS-layer clustering: normalize model names and merge
+			const clusterMap = new Map<string, { value: number; count: number }>();
+			for (const row of rows) {
+				const family = normalizeModelFamily(String(row.label ?? null));
+				const existing = clusterMap.get(family);
+				if (existing) {
+					existing.value += toNumber(row.value);
+					existing.count += toNumber(row.count);
+				} else {
+					clusterMap.set(family, {
+						value: toNumber(row.value),
+						count: toNumber(row.count),
+					});
+				}
+			}
+			// Sort by value desc, take top 20
+			entries = [...clusterMap.entries()]
+				.sort((a, b) => b[1].value - a[1].value)
+				.slice(0, 20)
+				.map(([label, data]) => ({ label, ...data, percentage: 0 }));
+		} else {
+			entries = rows.map((row) => ({
+				label: String(row.label ?? "unknown"),
+				value: toNumber(row.value),
+				count: toNumber(row.count),
+				percentage: 0,
+			}));
+		}
+
+		const total = entries.reduce((sum, e) => sum + e.value, 0);
+		for (const entry of entries) {
+			entry.percentage = total > 0 ? Math.round((entry.value / total) * 10000) / 100 : 0;
+		}
+
+		return { dimension, metric, entries, total };
+	}
+
+	async getUsageTimeSeriesStacked(
+		filters: UsageHistoryFilters,
+		options: {
+			dimension: UsageBreakdownDimension;
+			metric: UsageBreakdownMetric;
+			granularity?: UsageHistoryGranularity;
+			topN?: number;
+			cluster?: boolean;
+			now?: Date;
+		},
+	): Promise<UsageStackedTimeSeriesResponse> {
+		const granularity = options.granularity ?? "day";
+		const topN = Math.min(Math.max(options.topN ?? 5, 2), 10);
+		const { dimension, metric, cluster = true } = options;
+		const shouldCluster = dimension === "model" && cluster;
+		const range = resolveUsageTimeSeriesRange(filters, granularity, options.now ?? new Date());
+		const conditions = this.buildWhereConditions({
+			...filters,
+			startDate: range.effectiveStartDate,
+			endDate: range.effectiveEndDate,
+		});
+
+		const dimensionColumn = this.getDimensionColumn(dimension);
+		const metricAgg = this.getMetricAggregation(metric);
+
+		// Step 1: determine top N labels by total value
+		// For model dimension, fetch more rows then cluster in JS
+		const topQueryLimit = shouldCluster ? 200 : topN;
+		const topLabelsRaw = await this.database
+			.select({
+				label: dimensionColumn,
+				total: metricAgg,
+			})
+			.from(apiRequests)
+			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
+			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.where(and(...conditions))
+			.groupBy(dimensionColumn)
+			.orderBy(sql`${metricAgg} DESC`)
+			.limit(topQueryLimit);
+
+		let topLabelSet: Set<string>;
+		if (shouldCluster) {
+			// Cluster model families and pick top N
+			const familyTotals = new Map<string, number>();
+			for (const row of topLabelsRaw) {
+				const family = normalizeModelFamily(String(row.label ?? null));
+				familyTotals.set(family, (familyTotals.get(family) ?? 0) + toNumber(row.total));
+			}
+			topLabelSet = new Set(
+				[...familyTotals.entries()]
+					.sort((a, b) => b[1] - a[1])
+					.slice(0, topN)
+					.map(([label]) => label),
+			);
+		} else {
+			topLabelSet = new Set(topLabelsRaw.map((r) => String(r.label ?? "unknown")));
+		}
+
+		// Step 2: get time-bucketed data for top labels
+		const bucket = getBucketExpression(granularity);
+		const rows = await this.database
+			.select({
+				bucket,
+				label: dimensionColumn,
+				value: metricAgg,
+			})
+			.from(apiRequests)
+			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
+			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.where(and(...conditions))
+			.groupBy(bucket, dimensionColumn)
+			.orderBy(bucket);
+
+		// Step 3: build timestamps and series
+		const timestamps = buildBucketTimestamps(
+			range.startBucketDate,
+			range.endBucketDate,
+			granularity,
+		);
+
+		// Group data by label+bucket
+		const dataMap = new Map<string, Map<string, number>>();
+		const otherMap = new Map<string, number>();
+
+		for (const row of rows) {
+			const rawLabel = String(row.label ?? "unknown");
+			const label = shouldCluster ? normalizeModelFamily(rawLabel) : rawLabel;
+			const ts = row.bucket;
+			const value = toNumber(row.value);
+
+			if (topLabelSet.has(label)) {
+				let labelMap = dataMap.get(label);
+				if (!labelMap) {
+					labelMap = new Map();
+					dataMap.set(label, labelMap);
+				}
+				const existing = labelMap.get(ts) ?? 0;
+				labelMap.set(ts, existing + value);
+			} else {
+				const existing = otherMap.get(ts) ?? 0;
+				otherMap.set(ts, existing + value);
+			}
+		}
+
+		// Build series
+		const STACKED_COLORS = [
+			"var(--mantine-color-indigo-6)",
+			"var(--mantine-color-cyan-6)",
+			"var(--mantine-color-green-6)",
+			"var(--mantine-color-orange-6)",
+			"var(--mantine-color-violet-6)",
+			"var(--mantine-color-red-6)",
+			"var(--mantine-color-teal-6)",
+			"var(--mantine-color-yellow-6)",
+			"var(--mantine-color-pink-6)",
+			"var(--mantine-color-blue-6)",
+		];
+
+		const series: UsageStackedTimeSeriesResponse["series"] = [];
+		let colorIndex = 0;
+		for (const label of topLabelSet) {
+			const labelData = dataMap.get(label);
+			series.push({
+				label,
+				color: STACKED_COLORS[colorIndex % STACKED_COLORS.length],
+				data: timestamps.map((ts) => ({ timestamp: ts, value: labelData?.get(ts) ?? 0 })),
+			});
+			colorIndex++;
+		}
+
+		// Add "other" series if there's any data
+		const hasOtherData = otherMap.size > 0;
+		if (hasOtherData) {
+			series.push({
+				label: "other",
+				color: "var(--mantine-color-gray-6)",
+				data: timestamps.map((ts) => ({ timestamp: ts, value: otherMap.get(ts) ?? 0 })),
+			});
+		}
+
+		return {
+			granularity,
+			dimension,
+			metric,
+			series,
+			timestamps,
+			truncated: range.truncated,
+			effectiveStartDate: range.effectiveStartDate,
+			effectiveEndDate: range.effectiveEndDate,
+		};
+	}
+
+	private getDimensionColumn(dimension: UsageBreakdownDimension) {
+		switch (dimension) {
+			case "provider":
+				return sql<string>`coalesce(${apiRequests.provider}, 'unknown')`;
+			case "model":
+				return sql<string>`coalesce(${apiRequests.model}, 'unknown')`;
+			case "kind":
+				return sql<string>`${apiRequests.kind}`;
+		}
+	}
+
+	private getMetricAggregation(metric: UsageBreakdownMetric) {
+		switch (metric) {
+			case "requests":
+				return sql<number>`count(*)`;
+			case "tokens":
+				return sql<number>`coalesce(sum(${apiRequests.inputTokens}), 0) + coalesce(sum(${apiRequests.outputTokens}), 0) + coalesce(sum(${apiRequests.cachedInputTokens}), 0) + coalesce(sum(${apiRequests.cacheCreationInputTokens}), 0)`;
+			case "cost":
+				return sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)`;
+			case "inputTokens":
+				return sql<number>`coalesce(sum(${apiRequests.inputTokens}), 0)`;
+			case "outputTokens":
+				return sql<number>`coalesce(sum(${apiRequests.outputTokens}), 0)`;
+			case "reasoningTokens":
+				return sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`;
+		}
 	}
 
 	private buildWhereConditions(filters: UsageHistoryFilters) {

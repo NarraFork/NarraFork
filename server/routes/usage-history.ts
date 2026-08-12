@@ -20,6 +20,8 @@ export type UsageHistoryRouteService = Pick<
 	| "getUsageStats"
 	| "getUsageTimeSeries"
 	| "getUsageRecord"
+	| "getUsageBreakdown"
+	| "getUsageTimeSeriesStacked"
 >;
 
 interface UsageHistoryRouteOptions {
@@ -74,6 +76,26 @@ const timeSeriesQuerySchema = statsQuerySchema.extend({
 const credentialTotalsQuerySchema = z.object({
 	provider: z.string().min(1),
 	limit: z.coerce.number().int().positive().max(1000).default(200),
+});
+
+const breakdownQuerySchema = statsQuerySchema.extend({
+	dimension: z.enum(["provider", "model", "kind"]),
+	metric: z.enum(["requests", "tokens", "cost", "inputTokens", "outputTokens", "reasoningTokens"]),
+	cluster: z
+		.enum(["true", "false", "1", "0"])
+		.default("true")
+		.transform((v) => v === "true" || v === "1"),
+});
+
+const stackedTimeSeriesQuerySchema = statsQuerySchema.extend({
+	dimension: z.enum(["provider", "model", "kind"]),
+	metric: z.enum(["requests", "tokens", "cost", "inputTokens", "outputTokens", "reasoningTokens"]),
+	granularity: z.enum(["hour", "day", "month"]).default("day"),
+	topN: z.coerce.number().int().positive().max(10).default(5),
+	cluster: z
+		.enum(["true", "false", "1", "0"])
+		.default("true")
+		.transform((v) => v === "true" || v === "1"),
 });
 
 export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {}) {
@@ -175,6 +197,34 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 				listProviderCredentialTotals(query.provider, query.limit),
 			),
 		});
+	});
+
+	/**
+	 * GET /api/usage-history/breakdown
+	 * 按维度聚合统计数据
+	 */
+	routes.get("/breakdown", async (c) => {
+		const query = breakdownQuerySchema.parse(c.req.query());
+		const { dimension, metric, cluster, ...filters } = query;
+		const result = await service.getUsageBreakdown(filters, { dimension, metric, cluster });
+		return c.json(result);
+	});
+
+	/**
+	 * GET /api/usage-history/timeseries-stacked
+	 * 按维度+时间分组的堆叠时序数据
+	 */
+	routes.get("/timeseries-stacked", async (c) => {
+		const query = stackedTimeSeriesQuerySchema.parse(c.req.query());
+		const { dimension, metric, granularity, topN, cluster, ...filters } = query;
+		const result = await service.getUsageTimeSeriesStacked(filters, {
+			dimension,
+			metric,
+			granularity,
+			topN,
+			cluster,
+		});
+		return c.json(result);
 	});
 
 	/**
