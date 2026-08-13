@@ -3351,7 +3351,7 @@ function dropUnreplayableThinkingBlocks(messages: AnthropicMessage[]): void {
 			(b) => b.type !== "thinking" || (typeof b.signature === "string" && b.signature !== ""),
 		);
 		if (kept.length === content.length) continue;
-		logger.warn("Dropping unsignable thinking block before API call", {
+		logger.debug("Dropping unsignable thinking block before API call", {
 			index: i,
 			removed: content.length - kept.length,
 			remaining: kept.length,
