@@ -1,6 +1,19 @@
+import { getForkDefaults } from "@frontend/lib/chapter-fork-options";
+import type { ForkWorktreeSource } from "@shared/chapter-fork";
 import { Handle, type NodeProps, Position } from "@xyflow/react";
 import { memo, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+
+/**
+ * Defaults for a canvas-drawn fork.
+ *
+ * Taken from `getForkDefaults` rather than written out here so this entry point and
+ * `ChapterForkModal` cannot drift: both create a fork from a chapter's current
+ * position (not from a message), and one hardcoding "full" while the other computed
+ * "fresh" meant the same user action inherited history or not depending on which
+ * button was used.
+ */
+const DRAFT_FORK_DEFAULTS = getForkDefaults({ isMessageFork: false });
 
 export type DraftMode = "fork" | "merge";
 
@@ -20,6 +33,7 @@ export interface DraftNodeData {
 			title: string;
 			description: string;
 			inheritMode: string;
+			worktreeSource: ForkWorktreeSource;
 			mode: DraftMode;
 			parentChapterId?: string;
 			sourceChapterIds?: string[];
@@ -37,9 +51,13 @@ function DraftNodeInner({ id, data }: NodeProps) {
 	const d = data as DraftNodeData;
 	const mode = d.mode ?? "fork";
 	const { t } = useTranslation("graph");
+	const { t: tch } = useTranslation("chapters");
 	const [title, setTitle] = useState(d.defaultTitle ?? "");
 	const [description, setDescription] = useState("");
-	const [inheritMode, setInheritMode] = useState<string>("full");
+	const [inheritMode, setInheritMode] = useState<string>(DRAFT_FORK_DEFAULTS.inheritMode);
+	const [worktreeSource, setWorktreeSource] = useState<ForkWorktreeSource>(
+		DRAFT_FORK_DEFAULTS.worktreeSource,
+	);
 	const [loading, setLoading] = useState(false);
 	const inputRef = useRef<HTMLInputElement>(null);
 
@@ -55,12 +73,13 @@ function DraftNodeInner({ id, data }: NodeProps) {
 			title: title.trim(),
 			description: description.trim(),
 			inheritMode,
+			worktreeSource,
 			mode,
 			parentChapterId: d.parentChapterId,
 			sourceChapterIds: d.sourceChapterIds,
 			targetChapterId: d.targetChapterId,
 		});
-	}, [id, d, title, description, inheritMode, mode, loading]);
+	}, [id, d, title, description, inheritMode, worktreeSource, mode, loading]);
 
 	const handleCancel = useCallback(() => {
 		d.onCancel(id);
@@ -168,7 +187,43 @@ function DraftNodeInner({ id, data }: NodeProps) {
 					}}
 				/>
 
-				{/* Inherit mode pills — fork only */}
+				{/* File source + conversation inheritance — fork only */}
+				{isFork && (
+					<div className="nodrag" style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+						<span
+							style={{
+								fontSize: 11,
+								color: "var(--mantine-color-dimmed)",
+								lineHeight: "24px",
+								marginRight: 4,
+								whiteSpace: "nowrap",
+							}}
+						>
+							{tch("fileSource")}
+						</span>
+						{(["workspace", "commit"] as const).map((source) => (
+							<button
+								key={source}
+								type="button"
+								onClick={() => setWorktreeSource(source)}
+								style={{
+									padding: "2px 8px",
+									borderRadius: 12,
+									border:
+										worktreeSource === source
+											? `1px solid ${borderColor}`
+											: "1px solid var(--mantine-color-default-border)",
+									background: worktreeSource === source ? accentFilled : "transparent",
+									color: worktreeSource === source ? "white" : "var(--mantine-color-dimmed)",
+									fontSize: 11,
+									cursor: "pointer",
+								}}
+							>
+								{tch(source === "workspace" ? "sourceWorkspace" : "sourceLatestCommit")}
+							</button>
+						))}
+					</div>
+				)}
 				{isFork && (
 					<div className="nodrag" style={{ display: "flex", gap: 4 }}>
 						<span
@@ -180,7 +235,7 @@ function DraftNodeInner({ id, data }: NodeProps) {
 								whiteSpace: "nowrap",
 							}}
 						>
-							{t("forkDraft.contextInheritance")}
+							{tch("conversationInheritance")}
 						</span>
 						{inheritOptions.map((opt) => (
 							<button

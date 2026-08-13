@@ -148,6 +148,7 @@ const DATABASE_TARGET_DEFAULT_DAYS: Record<
 > = {
 	staleSessions: 90,
 	apiRequestDumps: 30,
+	toolCallPayloads: 180,
 };
 
 const DATABASE_TARGET_DAY_OPTIONS: Record<
@@ -156,6 +157,9 @@ const DATABASE_TARGET_DAY_OPTIONS: Record<
 > = {
 	staleSessions: ["30", "90", "180", "365"],
 	apiRequestDumps: ["7", "30", "90", "180"],
+	// No option below 90 days: these payloads are what the execution log shows, and a
+	// short window would erase the recent history an administrator actually consults.
+	toolCallPayloads: ["90", "180", "365", "730"],
 };
 
 interface CleanupTarget {
@@ -252,6 +256,11 @@ export function StorageSection() {
 				},
 				apiRequestDumps: {
 					...rawDatabaseCleanupCapabilities.apiRequestDumps,
+					supported: false,
+					reason: storageHealthDisabledReason,
+				},
+				toolCallPayloads: {
+					...rawDatabaseCleanupCapabilities.toolCallPayloads,
 					supported: false,
 					reason: storageHealthDisabledReason,
 				},
@@ -517,6 +526,8 @@ export function StorageSection() {
 			setDatabaseOlderThanDays(DATABASE_TARGET_DEFAULT_DAYS.staleSessions);
 		} else if (target === "apiRequestDumps") {
 			setDatabaseOlderThanDays(DATABASE_TARGET_DEFAULT_DAYS.apiRequestDumps);
+		} else if (target === "toolCallPayloads") {
+			setDatabaseOlderThanDays(DATABASE_TARGET_DEFAULT_DAYS.toolCallPayloads);
 		}
 	};
 
@@ -683,6 +694,13 @@ export function StorageSection() {
 					summary: databaseDetails.cleanupCandidates.apiRequestDumps,
 					description: t("storageDatabaseApiRequestDumpsDesc", {
 						days: databaseDetails.cleanupCandidates.apiRequestDumps.retentionDays ?? 30,
+					}),
+				},
+				{
+					target: "toolCallPayloads" as const,
+					summary: databaseDetails.cleanupCandidates.toolCallPayloads,
+					description: t("storageDatabaseToolCallPayloadsDesc", {
+						days: databaseDetails.cleanupCandidates.toolCallPayloads.retentionDays ?? 180,
 					}),
 				},
 			]
@@ -1031,9 +1049,13 @@ export function StorageSection() {
 																				? t("storageDatabaseSummaryRequests", {
 																						count: row.summary.count,
 																					})
-																				: t("storageDatabaseSummarySessions", {
-																						count: row.summary.count,
-																					})}
+																				: row.target === "toolCallPayloads"
+																					? t("storageDatabaseSummaryToolCalls", {
+																							count: row.summary.count,
+																						})
+																					: t("storageDatabaseSummarySessions", {
+																							count: row.summary.count,
+																						})}
 																		</Text>
 																		{row.summary.oldestAt && (
 																			<Text size="xs" c="dimmed">
@@ -1180,6 +1202,12 @@ export function StorageSection() {
 											count: databasePreview.counts.dumpsCleared,
 										})}
 									</Text>
+								) : databasePreview.target === "toolCallPayloads" ? (
+									<Text size="sm" c="dimmed">
+										{t("storageDatabaseCountsToolCallPayloads", {
+											count: databasePreview.counts.toolCalls,
+										})}
+									</Text>
 								) : (
 									<>
 										<Text size="sm" c="dimmed">
@@ -1225,7 +1253,9 @@ export function StorageSection() {
 									<Text fw={500} size="sm">
 										{databasePreview.target === "apiRequestDumps"
 											? t("storageDatabaseSampleRequests")
-											: t("storageDatabaseSampleSessions")}
+											: databasePreview.target === "toolCallPayloads"
+												? t("storageDatabaseSampleToolCalls")
+												: t("storageDatabaseSampleSessions")}
 									</Text>
 									<Stack gap="xs" style={{ maxHeight: 260, overflow: "auto" }}>
 										{databasePreview.samples.map((sample) =>
@@ -1362,9 +1392,12 @@ export function StorageSection() {
 	function getDatabaseCleanupCount(
 		result: DatabaseCleanupPreviewResult | DatabaseCleanupExecutionResult,
 	): number {
-		return result.target === "apiRequestDumps"
-			? result.counts.dumpsCleared
-			: result.counts.sessions;
+		if (result.target === "apiRequestDumps") return result.counts.dumpsCleared;
+		// Tool-call payloads are counted by ROW, not by session: the rows survive and only
+		// their payload columns are cleared, so `counts.sessions` would always be 0 and the
+		// confirm button would look like there was nothing to do.
+		if (result.target === "toolCallPayloads") return result.counts.toolCalls;
+		return result.counts.sessions;
 	}
 
 	function formatBlockedReason(item: DatabaseCleanupBlockedItem): string {

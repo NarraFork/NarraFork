@@ -21,7 +21,10 @@ import {
 import { buildHistory, type ReasoningEffort, resolveProviderAndModel } from "../lib/agent";
 import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
-import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
+import {
+	acknowledgePipelineExitConfirmation,
+	clearPipelineStateIfActive,
+} from "../lib/agent/pipeline-state";
 import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import {
 	clearBehaviorFenceEditGrant,
@@ -44,6 +47,7 @@ import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { resolveFastModeForUser } from "../lib/fast-mode";
 import { hotSafe } from "../lib/hot-safe";
+import { InjectionCadence } from "../lib/injection-cadence";
 import { logger } from "../lib/logger";
 import {
 	formatSubagentModelRestrictionDescription,
@@ -106,11 +110,7 @@ import {
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
-import {
-	type CompletedBgSubagentNotification,
-	drainCompletedBackgroundSubagents,
-	formatBackgroundCompletionNotifications,
-} from "./bg-completion-queue";
+import { formatBackgroundCompletionNotifications } from "./bg-completion-queue";
 import { gitService } from "./git-service";
 import { getStatusSummaryCached, invalidateStatus } from "./git-status-cache";
 import { knowledgeInjection } from "./knowledge-injection";
@@ -124,6 +124,7 @@ import {
 	type TokenUsageSnapshot,
 } from "./narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "./narrator-executor";
+import { deliverInjection } from "./narrator-injection";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import {
 	getContextOverflowFailureError,
@@ -161,11 +162,8 @@ import {
 	assertOAuthNarratorRuntimeActive,
 	type OAuthNarratorRuntimePolicy,
 } from "./oauth-narrator-runtime-policy";
-import {
-	drainParentInboundMessages,
-	formatParentInboundMessages,
-	type ParentInboundMessage,
-} from "./parent-inbound-queue";
+import { formatParentInboundMessages } from "./parent-inbound-queue";
+import { drainPendingInjections, type PendingInjection } from "./parent-injection-queue";
 import { reviewService } from "./review-service";
 import { broadcastSpecChanged } from "./spec-broadcast";
 import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder";
@@ -1097,7 +1095,7 @@ async function broadcastInterruptedPartialMessage(
 	try {
 		const fullMessage = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, partialId),
-			with: { toolCalls: true, sideCars: true },
+			with: { toolCalls: true },
 		});
 		if (!fullMessage) return;
 
@@ -1217,6 +1215,99 @@ async function finalizeInterruptedRun(
 			error: String(err),
 		});
 	}
+
+	// Interrupt task guard: when the user stops the narrator mid-flight it usually
+	// means the direction changed, yet any open Dynamic Spec task would still drive
+	// the next auto-continuation. Suppress exactly one continuation and leave a
+	// persisted system note so the model reconciles tasks against the user's next
+	// message instead of resuming the stale one.
+	await maybeDeliverInterruptTaskGuard(active, narratorId);
+}
+
+// === Interrupt task guard ===
+
+/**
+ * Dedupe key for the interrupt task guard: narratorId → tasks.json revisionId the
+ * guard last fired for. `hotSafe` so a dev hot-reload does not re-arm every guard.
+ * When the spec has not changed since the last injection there is nothing new to
+ * tell the model, so repeated interrupts stay quiet instead of stacking cards.
+ */
+const interruptTaskGuardRevisions = hotSafe<Map<string, string | null>>(
+	"narrafork.interruptTaskGuardRevisions",
+	() => new Map(),
+);
+
+/**
+ * Narrators whose NEXT spec continuation must be skipped once, after an interrupt.
+ *
+ * Deliberately NOT a field on `ActiveNarrator`: `createNarrator` throws the existing
+ * active object away and builds a fresh one whenever a message arrives for a narrator
+ * that already has a session. The user's message right after an interrupt is exactly
+ * that case, so a flag living on the old object is gone before the turn it was meant
+ * to suppress — the guard would appear to work while never actually firing.
+ *
+ * Keyed by narratorId in module state (`hotSafe`, so a dev reload does not silently
+ * re-arm every narrator) and consumed exactly once by `maybeStartSpecContinuation`.
+ */
+const suppressSpecContinuationOnce = hotSafe<Set<string>>(
+	"narrafork.suppressSpecContinuationOnce",
+	() => new Set(),
+);
+
+/**
+ * After an interrupt, if spec://tasks.json still has open tasks, suppress the next
+ * auto-continuation once and persist a system note telling the model to reconcile
+ * the open tasks against the user's next message before resuming anything.
+ *
+ * Best-effort: any failure is logged and swallowed so interrupt cleanup can never
+ * be blocked by a reminder. No-op when there is nothing open to guard against.
+ */
+async function maybeDeliverInterruptTaskGuard(
+	active: ActiveNarrator,
+	narratorId: string,
+): Promise<void> {
+	try {
+		const file = await specVfsService.readTasksFileForNarrator(narratorId);
+		const compiled = compileSpecTasks(parseSpecTasksDocument(file.content));
+		const openTasks = compiled.tasks.filter(
+			(task) => task.status === "doing" || task.status === "todo" || task.status === "blocked",
+		);
+		if (openTasks.length === 0) return;
+
+		// One-shot suppression: the user's next turn decides the direction; a stale
+		// doing task must not start an auto-continuation right after it. Stored per
+		// narratorId rather than on `active`, which does not survive the next message
+		// (see suppressSpecContinuationOnce).
+		suppressSpecContinuationOnce.add(narratorId);
+
+		const revisionId = file.revisionId ?? null;
+		if (interruptTaskGuardRevisions.get(narratorId) === revisionId) return;
+		interruptTaskGuardRevisions.set(narratorId, revisionId);
+
+		const isZh = active.locale === "zh-CN";
+		const taskLines = openTasks
+			.slice(0, 8)
+			.map((task) => `- [${task.status}] ${task.text}${task.protected ? " [protected]" : ""}`)
+			.join("\n");
+		const content = isZh
+			? `刚才的运行被用户中断，这通常意味着方向有变化。当前 spec://tasks.json 中仍有以下开放任务：\n\n${taskLines}\n\n这些任务可能已经过期或与用户最新意图不一致。回复用户的下一条消息时，以用户消息为准；如需调整计划，先更新/删除过期任务（protected 任务变更会触发 taskReflection），再继续执行。不要无视用户新指令而直接恢复旧任务。`
+			: `The run was just interrupted by the user, which usually means the direction changed. spec://tasks.json still has these open tasks:\n\n${taskLines}\n\nThey may be stale or no longer match the user's latest intent. When the user's next message arrives, treat it as the source of truth; update or remove outdated tasks first if the plan changed (protected task changes trigger taskReflection), then continue. Do not resume an old task over the user's new instruction.`;
+
+		// deliverInjection is statically imported at module top; the circularity with
+		// narrator-injection is already handled by that module's lazy scheduler seam.
+		await deliverInjection(narratorId, {
+			content,
+			source: "interrupt_task_guard",
+			// Persisted as a plain row; the next user turn reads it from history.
+			schedule: "none",
+			locale: active.locale,
+		});
+	} catch (err) {
+		logger.warn("Failed to deliver interrupt task guard", {
+			narratorId,
+			error: String(err),
+		});
+	}
 }
 
 // === Agent loop execution ===
@@ -1319,6 +1410,12 @@ async function maybeStartSpecContinuation(
 	options?: { explicitStart?: boolean },
 ): Promise<string | null> {
 	if (loopHadError || isPlanModeTrait(freshNarrator.traits) || active._continuationSuppressed) {
+		return null;
+	}
+	// One-shot interrupt guard: the turn right after a user interrupt belongs to the
+	// user's new message, not to whatever task was open before. Consume the flag so
+	// later turns resume normal continuation semantics.
+	if (suppressSpecContinuationOnce.delete(active.narratorId)) {
 		return null;
 	}
 	// Resolve the effective auto-continuation mode (narrator override → global default)
@@ -1475,67 +1572,390 @@ async function maybeStartContinuation(
 	return prompt;
 }
 
-async function persistAndBroadcastSystemMessage(
-	narratorId: string,
-	text: string,
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	contentBlocks?: any[],
-): Promise<typeof narratorMessages.$inferSelect & { seq: number }> {
-	const msg = await narratorService.persistSystemMessage(narratorId, text, contentBlocks);
-	broadcastToNarrator(narratorId, {
-		type: "message",
-		narratorId,
-		message: {
-			id: msg.id,
-			narratorId,
-			role: msg.role,
-			contentJson: msg.contentJson,
-			contentText: msg.contentText,
-			createdAt: msg.createdAt,
-			seq: msg.seq,
-			children: [],
+/** The ActiveNarrator fields holding a cadence's last-fired marker. */
+type CadenceMarkerField = "_lastTasksReminderCompletedToolCount" | "_lastFenceCompletedToolCount";
+
+/**
+ * Build an {@link InjectionCadence} whose marker lives on the ActiveNarrator.
+ *
+ * The marker has to survive across loop passes: a session runs many passes and each
+ * rebuilds its config, so a marker owned by the cadence object would restart the
+ * schedule every time. The field stays the single source of truth and the cadence
+ * object is disposable.
+ *
+ * Seeded from the persisted completed-tool count when unset, so a resumed session does
+ * not read its whole history as one overdue interval and fire on its first tool result.
+ */
+function resolveCadence(
+	active: ActiveNarrator,
+	field: CadenceMarkerField,
+	resolveInterval: () => number,
+): InjectionCadence {
+	if (active[field] === undefined) {
+		active[field] = active._todoReminderCompletedToolCount ?? 0;
+	}
+	return new InjectionCadence(resolveInterval, {
+		get: () => active[field] ?? 0,
+		set: (count) => {
+			active[field] = count;
 		},
 	});
-	return msg;
 }
 
-async function drainAndPersistBackgroundCompletionNotice(
-	active: ActiveNarrator,
+/**
+ * Deliver every queued injection for a narrator, in the order the events happened.
+ *
+ * ## The bug this replaces
+ *
+ * Background completions (agent + bash) and `Send({ id: "parent" })` reports used to sit
+ * in three unrelated queues, drained one after another in a hard-coded sequence
+ * (completions first, messages second). That sequence was not a policy — it is what you
+ * are forced to write when no order exists between the queues. The visible consequence
+ * was a causality inversion: a subagent that reports "ready" via Send and then finishes
+ * had its completion shown BEFORE the message that preceded it.
+ *
+ * They now share one queue that is ordered at enqueue (`parent-injection-queue`), and
+ * this function is the single consumer.
+ *
+ * ## Why ONE function serves both the busy and the idle path
+ *
+ * Each path previously drained only the queue it cared about. Against a shared queue
+ * that would be a silent data-loss bug: `startBackgroundCompletionContinuationIfPossible`
+ * would drain the whole bucket, deliver the completions and DROP any messages that had
+ * been queued alongside them. Having one consumer makes that impossible, and it means an
+ * idle parent woken by a completion also receives the message that arrived before it.
+ *
+ * The two modes differ only in what the caller needs afterwards:
+ *
+ *   `busy` — `schedule: "onNextTurn"`, so the running loop folds the text into the turn
+ *            it is about to send (its in-memory history was built at pass start).
+ *   `idle` — `schedule: "none"`, because the caller holds `continuationStartLock` and
+ *            starts the loop itself; asking `deliverInjection` to wake would re-enter
+ *            that lock and deadlock. Completions also carry their FULL result here, since
+ *            a turn is being started specifically to deal with them.
+ *
+ * Returns the concatenated model-facing text, or null when nothing was queued — the idle
+ * callers use that as their "is a turn worth starting" signal.
+ */
+async function deliverPendingInjectionsInOrder(
+	narratorId: string,
+	locale: Locale,
+	mode: "busy" | "idle",
 ): Promise<string | null> {
-	const completed = drainCompletedBackgroundSubagents(active.narratorId);
-	if (completed.length === 0) return null;
-	const prompt = formatBackgroundCompletionNotifications(completed, { includeResult: true });
-	await persistAndBroadcastSystemMessage(active.narratorId, prompt, [
-		{
-			type: "background_agents_completed",
-			tasks: completed.map((task: CompletedBgSubagentNotification) => ({
-				id: task.id,
-				title: task.title,
-				status: task.status,
-				resultPreview: task.resultPreview,
-				resultTruncated: task.resultTruncated ?? false,
-			})),
-		},
-	]);
-	return prompt;
+	const pending = drainPendingInjections(narratorId);
+	if (pending.length === 0) return null;
+	const schedule = mode === "busy" ? "onNextTurn" : "none";
+	const parts: string[] = [];
+
+	// One injection row PER entry. The queue's global arrival order is the truth, so we
+	// walk `pending` directly rather than grouping consecutive same-kind entries into a
+	// shared row: a row that fans out into N bubbles has no per-bubble address, which is
+	// what made delete/rollback impossible to aim at one of them. A single entry per row
+	// gives every bubble its own blockIndex and its own context-menu target.
+	//
+	// Each entry is delivered inside its own try/catch, matching `flushLoopInjections`.
+	// `drainPendingInjections` empties the bucket atomically, so an escaping throw here
+	// would discard every entry AFTER the failing one — they are no longer in the queue
+	// and nothing re-enqueues them. A single failed INSERT (SQLite busy, WAL full) would
+	// silently swallow a teammate's message or a background result. The batch is best
+	// effort by construction: the entries are independent, so one bad row must not decide
+	// the fate of the rest.
+	for (const entry of pending) {
+		try {
+			const text = await deliverPendingInjection(narratorId, locale, mode, schedule, entry);
+			if (text) parts.push(text);
+		} catch (err) {
+			logger.warn("Failed to deliver a pending injection row", {
+				narratorId,
+				kind: entry.kind,
+				mode,
+				error: String(err),
+			});
+		}
+	}
+
+	const joined = parts.filter((part) => part.trim().length > 0).join("\n\n");
+	return joined.length > 0 ? joined : null;
 }
 
-async function drainAndPersistParentInboundNotice(active: ActiveNarrator): Promise<string | null> {
-	const inbound = drainParentInboundMessages(active.narratorId);
-	if (inbound.length === 0) return null;
-	const prompt = formatParentInboundMessages(inbound, active.locale);
-	await persistAndBroadcastSystemMessage(active.narratorId, prompt, [
-		{
-			type: "subagent_messages",
-			messages: inbound.map((message: ParentInboundMessage) => ({
-				fromId: message.fromId,
-				fromTitle: message.fromTitle,
-				fromType: message.fromType,
-				timestamp: message.timestamp,
-			})),
-		},
-	]);
-	return prompt;
+/**
+ * Write ONE queued injection as its own row and return its model-facing text.
+ *
+ * Split out of {@link deliverPendingInjectionsInOrder} so each entry can fail in
+ * isolation: as a separate function the per-kind branches return instead of
+ * `continue`, which is what lets the caller wrap the whole body in one try/catch
+ * without swallowing the loop's control flow.
+ */
+async function deliverPendingInjection(
+	narratorId: string,
+	locale: Locale,
+	mode: "busy" | "idle",
+	schedule: "onNextTurn" | "none",
+	entry: PendingInjection,
+): Promise<string | null> {
+	{
+		const kind = entry.kind;
+
+		if (kind === "bg_agent") {
+			const task = entry.task;
+			const projected = sideCarBodyWithText(
+				"bg_agent",
+				{
+					kind: "tasksDone",
+					flavor: "agent",
+					items: [
+						{
+							id: task.id,
+							title: task.title,
+							status: task.status,
+							preview: task.resultPreview ?? "",
+							...(task.resultTruncated ? { truncated: true } : {}),
+						},
+					],
+				},
+				locale,
+			);
+			// The idle path keeps its own longer wording (full result + how to Await it),
+			// which is what that path has always sent and is asserted elsewhere; the
+			// structured body rides along either way for the reader.
+			const content =
+				mode === "idle"
+					? formatBackgroundCompletionNotifications([task], { includeResult: true })
+					: projected.content;
+			const { turnText } = await deliverInjection(narratorId, {
+				content,
+				body: projected.body,
+				source: "bg_agent",
+				schedule,
+				locale,
+				// Preserved so the reader keeps the richer card this producer already had.
+				extraBlocks: [
+					{
+						type: "background_agents_completed",
+						tasks: [
+							{
+								id: task.id,
+								title: task.title,
+								status: task.status,
+								resultPreview: task.resultPreview,
+								resultTruncated: task.resultTruncated ?? false,
+							},
+						],
+					},
+				],
+			});
+			return turnText ?? content;
+		}
+
+		if (kind === "bg_bash") {
+			const bashTask = entry.task;
+			const items = [
+				{
+					id: bashTask.id,
+					alias: bashTask.alias ?? null,
+					title: bashTask.title || bashTask.id,
+					status: bashTask.status,
+					preview: bashTask.outputPreview ?? "",
+				},
+			];
+			// `sideCarBodyWithText` renders the model-facing text from the SAME body in one
+			// call, which is what keeps the two projections from drifting apart.
+			const { body, content } = sideCarBodyWithText(
+				"bg_bash",
+				{ kind: "tasksDone", flavor: "bash", items },
+				locale,
+			);
+			const { turnText } = await deliverInjection(narratorId, {
+				content,
+				body,
+				source: "bg_bash",
+				schedule,
+				locale,
+			});
+			return turnText ?? content;
+		}
+
+		// Progress reports a child subagent sent with Send({ id: "parent" }). The queue
+		// caps itself at 20 messages per kind / 8000 chars per message, so no truncation
+		// is needed here.
+		const message = entry.message;
+		const projected = sideCarBodyWithText(
+			"subagent_message",
+			{
+				kind: "messages",
+				items: [
+					{
+						fromId: message.fromId,
+						fromTitle: message.fromTitle ?? null,
+						fromType: message.fromType ?? null,
+						text: message.text,
+					},
+				],
+			},
+			locale,
+		);
+		const content =
+			mode === "idle" ? formatParentInboundMessages([message], locale) : projected.content;
+		const { turnText } = await deliverInjection(narratorId, {
+			content,
+			body: projected.body,
+			source: "subagent_message",
+			schedule,
+			locale,
+			extraBlocks: [
+				{
+					type: "subagent_messages",
+					messages: [
+						{
+							fromId: message.fromId,
+							fromTitle: message.fromTitle,
+							fromType: message.fromType,
+							timestamp: message.timestamp,
+						},
+					],
+				},
+			],
+		});
+		return turnText ?? content;
+	}
+}
+
+/**
+ * Deliver everything queued to an IDLE narrator that is about to be woken.
+ *
+ * Both wake entry points (a finished background task, an inbound subagent message) route
+ * here, because they now share ONE queue. Draining only your own kind against a shared
+ * queue would silently discard the others: a completion-triggered wake would drop the
+ * message that had been queued beside it. As a bonus, a narrator woken by either event
+ * receives the whole batch in event order rather than just the trigger.
+ *
+ * `schedule: "none"` even though the point of this path IS to start a turn: the callers
+ * run inside `continuationStartLock` and start the loop themselves once this returns, so
+ * asking `deliverInjection` to wake would re-enter that same lock and deadlock.
+ */
+async function drainAndPersistPendingInjections(active: ActiveNarrator): Promise<string | null> {
+	return deliverPendingInjectionsInOrder(active.narratorId, active.locale, "idle");
+}
+
+/**
+ * Drain finished background work into the conversation, for a narrator that is BUSY.
+ *
+ * The counterpart to `drainAndPersistPendingInjections` (the idle path). Both
+ * now write a real message row through `deliverInjection`; they differ only in what
+ * happens next, which is the whole point of separating `role` from `schedule`:
+ *
+ *   idle → `wakeIfIdle`, because nothing is running to notice the row
+ *   busy → `onNextTurn`, because the loop is mid-flight and its in-memory history was
+ *          built at pass start, so the row alone would go unseen until the next pass
+ *
+ * The returned text is what the loop folds into the turn it is about to send. Nothing
+ * is yielded for persistence: the row is already written.
+ *
+ * `includeResult: false` keeps the busy path's existing economy — a preview here, the
+ * full output on demand via `Await`. The idle path passes `true` because it is
+ * starting a turn specifically to deal with the result.
+ */
+async function drainInjectionsIntoHistory(active: ActiveNarrator, locale: Locale): Promise<string> {
+	const narratorId = active.narratorId;
+	const parts: string[] = [];
+
+	// ── Cadence-driven reminders ────────────────────────────────────────────────
+	//
+	// These used to ride inside a tool result's string, which is why they carried a
+	// `toolUseId`. Neither is about a specific tool call — both are session-level
+	// ("here is your task list", "here are your standing constraints") — so they now
+	// land at the turn boundary as their own rows.
+	//
+	// The tick they are measured against is the completed-tool count the loop maintains
+	// (`active._todoReminderCompletedToolCount`), so the cadence is unchanged: still
+	// "every N completed tool calls", just delivered once per turn instead of once per
+	// tool result. A turn that ran several tools therefore produces at most one reminder
+	// rather than one per tool, which is strictly less repetition.
+	const count = active._todoReminderCompletedToolCount ?? 0;
+	// Both cadences read their interval live (a narrator override can change
+	// mid-session) and keep their marker on `active`, which is what makes them survive
+	// across loop passes. `InjectionCadence.due` spends the tick when asked — so an
+	// empty spec or a blank fence does not leave the cadence permanently due, re-reading
+	// the file from SQLite every time.
+	const atTasksCadence = resolveCadence(
+		active,
+		"_lastTasksReminderCompletedToolCount",
+		() => active._tasksReminderInterval ?? 15,
+	).due(count);
+	const atFenceCadence = resolveCadence(
+		active,
+		"_lastFenceCompletedToolCount",
+		() => active._fenceInterval ?? -1,
+	).due(count);
+
+	const tasksBody = atTasksCadence ? await buildSpecTaskDigestBody(narratorId) : null;
+	if (tasksBody) {
+		const { body, content } = sideCarBodyWithText("living_work_spec", tasksBody, locale);
+		const { turnText } = await deliverInjection(narratorId, {
+			content,
+			body,
+			source: "living_work_spec",
+			schedule: "onNextTurn",
+			locale,
+		});
+		if (turnText) parts.push(turnText);
+	}
+
+	// The fence goes out on its own cadence, or alongside a tasks reminder when the
+	// narrator is configured to attach the two.
+	if (atFenceCadence || (!!active._fenceAttach && !!tasksBody)) {
+		const fenceBody = await buildBehaviorFenceBody(narratorId);
+		if (fenceBody) {
+			const { body, content } = sideCarBodyWithText("behavior_fence", fenceBody, locale);
+			const { turnText } = await deliverInjection(narratorId, {
+				content,
+				body,
+				source: "behavior_fence",
+				schedule: "onNextTurn",
+				locale,
+			});
+			if (turnText) parts.push(turnText);
+		}
+	}
+
+	// Background completions + `Send({ id: "parent" })` reports, in the order they
+	// actually happened. See `deliverPendingInjectionsInOrder`.
+	const eventText = await deliverPendingInjectionsInOrder(narratorId, locale, "busy");
+	if (eventText) parts.push(eventText);
+
+	// Spec files the user edited through the UI.
+	//
+	// Only the IDLE fallback reaches here: while a loop runs, `spec-edit-interject`
+	// delivers the edit as a real cut-in user turn instead, because `taskReflection`
+	// reads the parent history and cannot recognize a task the user just asked for if it
+	// arrives as a system aside. The queue caps itself at 10 files / 2000-char previews.
+	const specUpdates = drainSpecUpdatesForNarrator(narratorId);
+	if (specUpdates.length > 0) {
+		const { body, content } = sideCarBodyWithText(
+			"spec_update",
+			{
+				kind: "specUpdates",
+				items: specUpdates.map((update) => ({
+					uri: update.uri,
+					timestamp: update.timestamp,
+					updatedBy: update.updatedBy,
+					taskSummary: update.taskSummary,
+					preview: update.preview,
+				})),
+			},
+			locale,
+		);
+		const { turnText } = await deliverInjection(narratorId, {
+			content,
+			body,
+			source: "spec_update",
+			schedule: "onNextTurn",
+			locale,
+		});
+		if (turnText) parts.push(turnText);
+	}
+
+	return parts.join("\n\n");
 }
 
 interface ContinuableTopLevelMessage {
@@ -2674,166 +3094,61 @@ export async function runAgentLoop(
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				getContextUsagePercentage: () => active._contextUsagePct,
 				onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
-				sideCarInitialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
-				onSideCarCompletedToolCount: (count) => {
+				initialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
+				onCompletedToolCount: (count: number) => {
 					active._todoReminderCompletedToolCount = count;
 					// The behavior-fence edit window only covers the first tool call of a user
 					// turn. Once any tool completes (counter advances past its initial value),
 					// close the window so later tool calls in the same turn cannot write the fence.
 					clearBehaviorFenceEditGrant(narratorId);
 				},
-				getSideCars: async (request) => {
-					if (request.phase === "tool_result") {
-						const sideCars: import("../lib/agent/types").AgentSideCar[] = [];
-						const count = request.completedToolCount ?? 0;
-						const tasksInterval = active._tasksReminderInterval ?? 15;
-						let lastTasksCount = active._lastTasksReminderCompletedToolCount;
-						if (lastTasksCount === undefined) {
-							lastTasksCount = active._todoReminderCompletedToolCount ?? 0;
-							active._lastTasksReminderCompletedToolCount = lastTasksCount;
-						}
-						const atTasksCadence = tasksInterval > 0 && count - lastTasksCount >= tasksInterval;
-
-						const fenceInterval = active._fenceInterval ?? -1;
-						let lastFenceCount = active._lastFenceCompletedToolCount;
-						if (lastFenceCount === undefined) {
-							lastFenceCount = active._todoReminderCompletedToolCount ?? 0;
-							active._lastFenceCompletedToolCount = lastFenceCount;
-						}
-						const atFenceCadence = fenceInterval > 0 && count - lastFenceCount >= fenceInterval;
-						// Advance the cadence markers whenever the cadence is hit, regardless of
-						// whether a reminder is actually produced. Otherwise, when there are no
-						// open tasks (reminder === null) the cadence would stay "due" and re-read
-						// the spec file from SQLite on every subsequent tool result.
-						if (atTasksCadence) active._lastTasksReminderCompletedToolCount = count;
-						const tasksBody = atTasksCadence ? await buildSpecTaskDigestBody(narratorId) : null;
-						if (tasksBody) {
-							sideCars.push({
-								target: "tool_result",
-								source: "living_work_spec",
-								...sideCarBodyWithText("living_work_spec", tasksBody, locale),
-								toolUseId: request.toolUseId,
+				getAfterToolsInjections: () => drainInjectionsIntoHistory(active, locale),
+				deliverInjectionRow: async (injection) => {
+					const { messageId, turnText } = await deliverInjection(narratorId, {
+						content: injection.content,
+						body: injection.body,
+						source: injection.source,
+						schedule: "onNextTurn",
+						locale,
+					});
+					// Knowledge injections are recorded only AFTER the row is durable. The
+					// de-dup key is `(narratorId, compactSeq, entryId)` and the in-memory set is
+					// reloaded from that table after a compact, so recording a hit whose content
+					// never landed would permanently suppress re-injecting that entry.
+					if (messageId && injection.knowledgeInjection) {
+						const record = injection.knowledgeInjection;
+						try {
+							knowledgeService.recordInjectionEvents({
+								narratorId: record.narratorId,
+								compactSeq: record.compactSeq,
+								source: "tool_output",
+								triggerToolCallId: record.triggerToolCallId,
+								hits: record.hits,
+							});
+						} catch (err) {
+							logger.warn("Failed to record knowledge injection events", {
+								narratorId,
+								error: String(err),
 							});
 						}
-						// Inject the behavior fence when its own cadence hits, or when it is
-						// attached to a tasks reminder that is being injected this cycle.
-						const wantFence = atFenceCadence || (!!active._fenceAttach && !!tasksBody);
-						if (wantFence) {
-							// Same rationale as tasks: advance on cadence hit even if the fence is
-							// empty, so an empty fence does not re-read the spec file every tool call.
-							if (atFenceCadence) active._lastFenceCompletedToolCount = count;
-							const fenceBody = await buildBehaviorFenceBody(narratorId);
-							if (fenceBody) {
-								sideCars.push({
-									target: "tool_result",
-									source: "behavior_fence",
-									...sideCarBodyWithText("behavior_fence", fenceBody, locale),
-									orderIndex: 16,
-									toolUseId: request.toolUseId,
-								});
-							}
+					}
+					// Same "only once it is durable" rule: clearing the pending flag for a
+					// warning the model never received would lose the warning entirely.
+					if (messageId && injection.pipelineExitConfirmationStateId) {
+						try {
+							await acknowledgePipelineExitConfirmation(
+								narratorId,
+								injection.pipelineExitConfirmationStateId,
+							);
+						} catch (err) {
+							logger.error("Failed to acknowledge Pipeline exit confirmation", {
+								narratorId,
+								pipelineStateId: injection.pipelineExitConfirmationStateId,
+								error: String(err),
+							});
 						}
-						return sideCars;
 					}
-					// phase === "after_tools"
-					const sideCars: import("../lib/agent/types").AgentSideCar[] = [];
-
-					// Drain completed background subagent tasks
-					const subDone = drainCompletedBackgroundSubagents(narratorId);
-					if (subDone.length > 0) {
-						sideCars.push({
-							target: "user_message",
-							source: "bg_agent",
-							...sideCarBodyWithText(
-								"bg_agent",
-								{
-									kind: "tasksDone",
-									flavor: "agent",
-									items: subDone.map((task) => ({
-										id: task.id,
-										title: task.title,
-										status: task.status,
-										// The sidecar carries the PREVIEW, matching what
-										// formatBackgroundCompletionNotifications emits without
-										// `includeResult` — the full result is fetched with Await.
-										preview: task.resultPreview ?? "",
-									})),
-								},
-								locale,
-							),
-						});
-					}
-
-					// Drain completed background bash tasks
-					const bashDone = backgroundTaskService.drainBashNotificationsSync(narratorId);
-					if (bashDone.length > 0) {
-						sideCars.push({
-							target: "user_message",
-							source: "bg_bash",
-							...sideCarBodyWithText(
-								"bg_bash",
-								{
-									kind: "tasksDone",
-									flavor: "bash",
-									items: bashDone.map((t) => ({
-										id: t.id,
-										alias: t.alias ?? null,
-										title: t.title || t.id,
-										status: t.status,
-										preview: t.outputPreview ?? "",
-									})),
-								},
-								locale,
-							),
-						});
-					}
-
-					// Drain progress reports sent by child subagents via Send({ id: "parent" }).
-					const parentInbound = drainParentInboundMessages(narratorId);
-					if (parentInbound.length > 0) {
-						sideCars.push({
-							target: "user_message",
-							source: "subagent_message",
-							...sideCarBodyWithText(
-								"subagent_message",
-								{
-									kind: "messages",
-									items: parentInbound.map((message) => ({
-										fromId: message.fromId,
-										fromTitle: message.fromTitle ?? null,
-										fromType: message.fromType ?? null,
-										text: message.text,
-									})),
-								},
-								locale,
-							),
-						});
-					}
-
-					// Drain pending spec updates from UI edits.
-					const specUpdates = drainSpecUpdatesForNarrator(narratorId);
-					if (specUpdates.length > 0) {
-						sideCars.push({
-							target: "user_message",
-							source: "spec_update",
-							...sideCarBodyWithText(
-								"spec_update",
-								{
-									kind: "specUpdates",
-									items: specUpdates.map((update) => ({
-										uri: update.uri,
-										timestamp: update.timestamp,
-										updatedBy: update.updatedBy,
-										taskSummary: update.taskSummary,
-										preview: update.preview,
-									})),
-								},
-								locale,
-							),
-						});
-					}
-
-					return sideCars;
+					return turnText ?? "";
 				},
 				getRuntimeSettingsOverride: () => {
 					// active.model/reasoningEffort are updated in real time by narrator routes.
@@ -3741,7 +4056,10 @@ export async function runAgentLoop(
 				}
 			}
 
-			const bgCompletionPrompt = await drainAndPersistBackgroundCompletionNotice(active);
+			// Anything queued during this turn (completions AND inbound messages) keeps the
+			// loop running instead of going idle. Previously only completions were checked
+			// here, so a message that arrived at this exact moment waited for the next wake.
+			const bgCompletionPrompt = await drainAndPersistPendingInjections(active);
 			if (bgCompletionPrompt) {
 				await narratorService.updateStatus(narratorId, "working");
 				currentText = "";
@@ -3924,12 +4242,12 @@ export async function runAgentLoop(
 
 			// No buffered messages — now transition to idle/unread (triggers notifications)
 			if (!loopHadError) {
-				// Drain any background-subagent completion notice FIRST, before flipping
-				// the DB status to idle. This closes the window where status is already
-				// idle (visible to clients / route admission) while this loop is still
-				// running and about to pick up more work. If a notice is queued, keep the
-				// status working and continue this loop instead of going idle at all.
-				const bgCompletionAfterIdle = await drainAndPersistBackgroundCompletionNotice(active);
+				// Drain any queued injection FIRST, before flipping the DB status to idle.
+				// This closes the window where status is already idle (visible to clients /
+				// route admission) while this loop is still running and about to pick up more
+				// work. If anything is queued, keep the status working and continue this loop
+				// instead of going idle at all.
+				const bgCompletionAfterIdle = await drainAndPersistPendingInjections(active);
 				if (bgCompletionAfterIdle) {
 					await narratorService.updateStatus(narratorId, "working");
 					currentText = "";
@@ -4811,11 +5129,17 @@ export async function startBackgroundCompletionContinuationIfPossible(
 
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle") return { started: false };
+		// Plan-mode narrators are not auto-woken, matching goal and inbound continuation.
+		// This check was missing here while the other three entries had it, so a finished
+		// background task could pull a narrator out of planning and into execution.
+		// Declining to wake loses nothing: the notification stays queued for the next
+		// drain (the queue is only emptied by a path that delivers it).
+		if (isPlanModeTrait(narrator.traits)) return { started: false };
 
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { started: false };
 
-		const prompt = await drainAndPersistBackgroundCompletionNotice(active);
+		const prompt = await drainAndPersistPendingInjections(active);
 		if (!prompt) return { started: false };
 
 		active._continuationSuppressed = false;
@@ -4828,6 +5152,69 @@ export async function startBackgroundCompletionContinuationIfPossible(
 		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 		runAgentLoop(active, "").catch(async (err) => {
 			logger.error("runAgentLoop unhandled error (background completion)", {
+				narratorId,
+				error: String(err),
+			});
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["error"],
+				errorMessage: String(err),
+			});
+			broadcastToNarrator(narratorId, {
+				type: "narrator_error",
+				narratorId,
+				error: String(err),
+			});
+		});
+		return { started: true };
+	});
+}
+
+/**
+ * Start a turn for content that has ALREADY been persisted as a message row.
+ *
+ * The wake half of `deliverInjection`'s `schedule: "wakeIfIdle"`. It exists so that
+ * module never holds its own copy of the gating rules, which the three older
+ * continuation entries above each spell out again:
+ *
+ *   - the continuation lock, so two producers cannot race a narrator into two loops
+ *   - idle in BOTH senses: no live in-memory loop and a persisted `idle` status
+ *   - not in plan mode
+ *
+ * That last check is the one `startBackgroundCompletionContinuationIfPossible` is
+ * missing while the other two have it. Fixing it there is a behaviour change and
+ * belongs with the background-completion migration, so this function simply starts out
+ * with the stricter rule that the majority already follow.
+ *
+ * `runAgentLoop(active, "")` is the established spelling for "the turn's content is
+ * already in the database, let buildHistory find it" — the same call the goal and
+ * inbound continuations make.
+ */
+export async function startInjectionContinuationIfPossible(
+	narratorId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+): Promise<{ started: boolean }> {
+	return continuationStartLock.acquire(narratorId, async () => {
+		const activeExisting = activeNarrators.get(narratorId);
+		if (activeExisting?.alive && activeExisting._loopRunning) return { started: false };
+
+		const narrator = await narratorService.getById(narratorId);
+		if (narrator.status !== "idle") return { started: false };
+		if (isPlanModeTrait(narrator.traits)) return { started: false };
+
+		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+		if (active._loopRunning) return { started: false };
+
+		active._continuationSuppressed = false;
+		active._continuationStallCount = 0;
+		active._continuationStallKey = undefined;
+		active._lastTokenUsage = undefined;
+		active._ttftMs = undefined;
+		active._turnStartedAt = new Date().toISOString();
+
+		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+		runAgentLoop(active, "").catch(async (err) => {
+			logger.error("runAgentLoop unhandled error (injection)", {
 				narratorId,
 				error: String(err),
 			});
@@ -4917,7 +5304,7 @@ export async function startParentInboundContinuationIfPossible(
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { started: false };
 
-		const delivered = await drainAndPersistParentInboundNotice(active);
+		const delivered = await drainAndPersistPendingInjections(active);
 		if (!delivered) return { started: false };
 
 		active._continuationSuppressed = false;

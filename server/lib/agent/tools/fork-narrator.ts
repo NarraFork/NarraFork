@@ -1,6 +1,12 @@
+import { FORK_WORKTREE_SOURCES, type ForkWorktreeSource } from "@shared/chapter-fork";
 import { formatOriginLabel } from "@shared/message-origin";
 import { z } from "zod/v4";
 import { getVisibleModels } from "../../settings";
+import {
+	exceedsForkDepthLimit,
+	FORK_NARRATOR_MAX_DEPTH,
+	resolveForkDepth,
+} from "../fork-narrator-depth";
 import type { ToolDefinition, ToolResult } from "../types";
 
 import baseDescription from "./fork-narrator.txt" with { type: "text" };
@@ -32,6 +38,19 @@ export const forkNarratorTool: ToolDefinition = {
 				.optional()
 				.describe(
 					'Only used when mode="fork". "full" = share message refs (default); "compressed" = AI-generated summary',
+				),
+			worktreeSource: z
+				.enum(FORK_WORKTREE_SOURCES)
+				.optional()
+				.describe(
+					'Chapter-bound only. "workspace" includes uncommitted files; "commit" uses committed history only. Independent of mode/inheritMode.',
+				),
+			commitSha: z
+				.string()
+				.min(1)
+				.optional()
+				.describe(
+					'Chapter-bound only. Fork from this commit in the parent branch history; requires worktreeSource="commit".',
 				),
 			model: z
 				.string()
@@ -65,6 +84,17 @@ export const forkNarratorTool: ToolDefinition = {
 					type: "string",
 					enum: ["full", "compressed"],
 				},
+				worktreeSource: {
+					description:
+						'Chapter-bound only. "workspace" includes uncommitted files; "commit" uses committed history only. Independent of mode/inheritMode.',
+					type: "string",
+					enum: [...FORK_WORKTREE_SOURCES],
+				},
+				commitSha: {
+					description:
+						'Chapter-bound only. Fork from this commit in the parent branch history; requires worktreeSource="commit".',
+					type: "string",
+				},
 				model: {
 					description: `Override the model for the new narrator. Available models: ${getAvailableModelsList()}`,
 					type: "string",
@@ -75,11 +105,13 @@ export const forkNarratorTool: ToolDefinition = {
 		};
 	},
 	async execute(args, ctx): Promise<ToolResult> {
-		const { mode, message, title, inheritMode, model } = args as {
+		const { mode, message, title, inheritMode, worktreeSource, commitSha, model } = args as {
 			mode: "fresh" | "fork";
 			message: string;
 			title?: string;
 			inheritMode?: "full" | "compressed";
+			worktreeSource?: ForkWorktreeSource;
+			commitSha?: string;
 			model?: string;
 		};
 
@@ -90,6 +122,23 @@ export const forkNarratorTool: ToolDefinition = {
 			const locale = (ctx.locale ?? "en") as import("@server/lib/prompt-i18n").Locale;
 
 			const parent = await narratorService.getById(ctx.narratorId);
+
+			// Refuse before creating anything. A forked narrator holds this same tool and
+			// its first message is written by the AI that forked it, so nothing else stops
+			// a chain — and every hop is a git worktree plus a running loop, not a row.
+			const parentDepth = await resolveForkDepth({
+				id: parent.id,
+				chapterId: parent.chapterId ?? null,
+			});
+			if (exceedsForkDepthLimit(parentDepth)) {
+				return {
+					output: getToolMessageWithParams("forkNarratorDepthExceeded", locale, {
+						depth: String(parentDepth),
+						limit: String(FORK_NARRATOR_MAX_DEPTH),
+					}),
+					isError: true,
+				};
+			}
 
 			let newNarratorId: string;
 			let newTitle: string;
@@ -116,7 +165,9 @@ export const forkNarratorTool: ToolDefinition = {
 				const newChapter = await chapterFork.fork(parent.chapterId, {
 					title,
 					inheritMode: chapterInherit,
-					forkAtMessageUuid,
+					worktreeSource,
+					startCommitSha: commitSha,
+					forkAtMessageUuid: commitSha ? undefined : forkAtMessageUuid,
 					locale,
 				});
 

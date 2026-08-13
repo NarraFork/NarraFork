@@ -9,12 +9,18 @@ import {
 	Textarea,
 	TextInput,
 } from "@mantine/core";
+import type { ForkWorktreeSource } from "@shared/chapter-fork";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
+import {
+	buildForkChapterRequest,
+	type ForkInheritMode,
+	getForkDefaults,
+} from "../../lib/chapter-fork-options";
 import { notifyResultWarnings } from "../../lib/operation-warnings";
 
 interface ChapterForkModalProps {
@@ -22,6 +28,11 @@ interface ChapterForkModalProps {
 	opened: boolean;
 	onClose: () => void;
 	forkAtMessageUuid?: string;
+	forkAtMessageId?: string;
+	chapterStatus?: string | null;
+	initialWorktreeSource?: ForkWorktreeSource;
+	initialCommitSha?: string;
+	initialInheritMode?: "fresh" | "compressed" | "full";
 	/** If provided, called on successful fork instead of showing the navigation prompt */
 	onForkSuccess?: (newChapterId: string) => void;
 }
@@ -31,11 +42,27 @@ export function ChapterForkModal({
 	opened,
 	onClose,
 	forkAtMessageUuid,
+	forkAtMessageId,
+	chapterStatus,
+	initialWorktreeSource,
+	initialCommitSha,
+	initialInheritMode,
 	onForkSuccess,
 }: ChapterForkModalProps) {
+	const isMessageFork = !!(forkAtMessageUuid || forkAtMessageId);
+	const isDormant = chapterStatus === "dormant";
+	const defaults = getForkDefaults({
+		isMessageFork,
+		chapterStatus,
+		initialWorktreeSource,
+		initialInheritMode,
+	});
+	const defaultInheritMode = defaults.inheritMode;
+	const defaultWorktreeSource = defaults.worktreeSource;
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
-	const [inheritMode, setInheritMode] = useState<string>("fresh");
+	const [inheritMode, setInheritMode] = useState<string>(defaultInheritMode);
+	const [worktreeSource, setWorktreeSource] = useState<ForkWorktreeSource>(defaultWorktreeSource);
 	const [forkedChapter, setForkedChapter] = useState<{
 		id: string;
 		title: string;
@@ -45,17 +72,17 @@ export function ChapterForkModal({
 	const { t } = useTranslation("chapters");
 	const { t: tc } = useTranslation("common");
 
-	// When forking from a specific message, default to full inheritance
 	useEffect(() => {
-		if (forkAtMessageUuid) {
-			setInheritMode("full");
-		}
-	}, [forkAtMessageUuid]);
+		if (!opened) return;
+		setInheritMode(defaultInheritMode);
+		setWorktreeSource(defaultWorktreeSource);
+	}, [opened, defaultInheritMode, defaultWorktreeSource]);
 
 	const resetState = () => {
 		setTitle("");
 		setDescription("");
-		setInheritMode("fresh");
+		setInheritMode(defaultInheritMode);
+		setWorktreeSource(defaultWorktreeSource);
 		setForkedChapter(null);
 	};
 
@@ -66,12 +93,18 @@ export function ChapterForkModal({
 
 	const fork = useMutation({
 		mutationFn: () =>
-			api.forkChapter(chapterId, {
-				title: title.trim(),
-				description: description.trim() || undefined,
-				inheritMode,
-				forkAtMessageUuid,
-			}),
+			api.forkChapter(
+				chapterId,
+				buildForkChapterRequest({
+					title,
+					description,
+					inheritMode: inheritMode as ForkInheritMode,
+					worktreeSource,
+					forkAtMessageUuid,
+					forkAtMessageId,
+					initialCommitSha,
+				}),
+			),
 		onSuccess: async (data) => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
@@ -146,9 +179,14 @@ export function ChapterForkModal({
 	return (
 		<Modal opened={opened} onClose={handleClose} title={t("forkChapter")}>
 			<Stack>
-				{forkAtMessageUuid && (
+				{isMessageFork && (
 					<Alert color="blue" variant="light">
 						{t("forkAtMessageAlert")}
+					</Alert>
+				)}
+				{isDormant && (
+					<Alert color="yellow" variant="light">
+						{t("sourceDormantCommitOnly")}
 					</Alert>
 				)}
 				<TextInput
@@ -165,14 +203,36 @@ export function ChapterForkModal({
 					onChange={(e) => setDescription(e.currentTarget.value)}
 				/>
 				<Select
-					label={t("contextInheritance")}
+					label={t("fileSource")}
+					data={[
+						{
+							value: "workspace",
+							label: t(isMessageFork ? "sourceMessageWorkspace" : "sourceWorkspace"),
+							disabled: isDormant,
+						},
+						{
+							value: "commit",
+							label: initialCommitSha
+								? `${t("sourceSpecificCommit")} (${initialCommitSha.slice(0, 8)})`
+								: t(isMessageFork ? "sourceMessageCommit" : "sourceLatestCommit"),
+						},
+					]}
+					value={worktreeSource}
+					onChange={(value) =>
+						setWorktreeSource((value as ForkWorktreeSource | null) ?? defaultWorktreeSource)
+					}
+					allowDeselect={false}
+				/>
+				<Select
+					label={t("conversationInheritance")}
 					data={[
 						{ value: "fresh", label: t("inheritFresh") },
 						{ value: "compressed", label: t("inheritCompressed") },
 						{ value: "full", label: t("inheritFull") },
 					]}
 					value={inheritMode}
-					onChange={(v) => setInheritMode(v ?? "fresh")}
+					onChange={(v) => setInheritMode(v ?? defaultInheritMode)}
+					allowDeselect={false}
 				/>
 				{fork.isError && (
 					<Alert color="red" title={t("forkFailed")}>

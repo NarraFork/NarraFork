@@ -132,56 +132,61 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 | tool_loaded/unloaded | Paper p=xs + 单行文本 pre-wrap🔴 | ≈37 |
 | bash_command | Paper p=xs + 命令 monospace pre-wrap🔴 | ≈37 |
 
-### sidecar 尾注（系统注入，`measure-sidecar` / `RenderSidecar`）
+### 注入气泡（服务端注入内容，`measure-injection-bubble` / `RenderInjectionBubble`）
 
-**每条注入一条尾注**（footnote）：无 Paper、无边框、无底色、无 accent rail，header 行高就是 `@shared/pretext-layout/row-metrics` 的裸行高（与折叠 trace 行同一个 18.8px），正文缩进挂在它下面。这是刻意的重设计——旧形态是彩色 Paper + 2px 彩色左轨，即**全列表最重的皮肤裹着最不重要的内容**，而且 `SIDECAR_SOURCE_META` 有六种色相，一屏能同时出现四五种。
+> 历史：本节此前描述的 sidecar 尾注（`measure-sidecar` / `RenderSidecar` / 工具卡内的 sidecar 带 / `payloadKind` / `sidecarRevision` / `appendMessageSidecars`）**已整条删除**，连同 `narrator_sidecars` 表与 WS `sidecars` 事件。注入内容现在拥有自己的消息行（`server/services/narrator-injection.ts`），不再挂在别人的消息或工具卡上。
 
-不聚合成一条（chunked 旧版是"×N"一行展开成列表）：一次 turn 可能同时注入进度提醒、后台任务完成、他人消息、spec 更新几类互不相关的内容，聚合会让读者只能整组展开。代价是每条各有自己的折叠状态，因此高度模型必须能表达"同一行内第 k 条展开"。
+**注入内容 → 左侧气泡。** 两个家族，区别只在**怎么拆**，不在有没有资格：
 
-**数据来自源头结构化，不是解析出来的。** 服务端在注入点同时产出 `content`（模型向文本，冻结快照）和 `body`（`SideCarBody`，结构化真相），见 `@shared/sidecar-body`。UI 走 `presentSideCarBody` 投影出行结构，因此读者看到的是"3 条开放任务 + 任务列表"，而不是 `<progress_update_request>` 外壳、`[System]` 前缀和 `不要添加 ID、时间戳` 这类模型向 boilerplate。**没有 `body` 的历史行走 `presentRawSideCar` 原样显示**（`isRaw: true`），刻意不做任何剥离——猜测生产者丢弃的结构是这套设计移除的复杂度。
+- **有具体说话人**（`SPOKEN_INJECTION_SOURCES`）：`messages` 按 sender 拆、`tasksDone` 按任务拆、`knowledge`（仅当全部 hits 有实质 summary）按条目拆。
+- **平台自己的例行提醒**（`PLATFORM_INJECTION_SOURCES`：任务表摘要、行为围栏、进度提醒、计划提醒、Pipeline 确认、spec 更新）：整条投递**一个**气泡，因为说话人每次都是同一个平台，没有可拆的维度。
 
-#### 两种形态由 tone 派生（`form`，不是折叠默认值）
+⚠️ 早期版本把平台提醒留成全宽 `origin_notice` 卡，理由是"例行提醒不该和队友消息等重"。那条理由**已被推翻**，两个原因：调度器说"你还有 3 条开放任务"本身就是有说话人的陈述，而且和 `spec_continuation`（当时已经是气泡）是同一个说话人同一类内容——一个做成气泡、一个留成卡是自相矛盾的；另外全宽让长任务文本远超舒适阅读宽度，气泡的宽度上限恰好修掉这点。"不该等重"现在由**更窄的宽度 + 中性配色**表达，而不是靠完全不同的形态。
 
-| tone | source | 色 | form |
-|------|--------|-----|------|
-| `peer` | `team_message` `group_message` `subagent_message` `buffered_user` | grape | `open` |
-| `background` | `bg_agent` `bg_bash` | blue | `open` |
-| `neutral` | `silent_progress` `living_work_spec` `todo_reminder` `relaxed_plan` `knowledge_base_hint` `spec_update` `behavior_fence` `pipeline_exit_confirmation` | dimmed | `folded` |
+没有结构化 body 的历史行仍走卡片：没有 body 就没有可拆的东西也没有可投影的东西。
 
-未知 source → neutral / folded。`behavior_fence` 与 `pipeline_exit_confirmation` 是新补的：服务端一直在推，但两张 SOURCE_META 表都没有条目，此前显示裸 snake_case 标签。
+**第三种气泡形态。** 此前只有两种：用户气泡（有框 + 纯 pre-wrap 文本）、assistant（markdown + 无框）。注入内容两半都要——框和 header 说明"谁"，markdown 承载投影已产出的结构（任务列表、子标题、bullet）。表面与用户气泡同族：同一个 8px 圆角、同一种 padding，差别只在**侧**（注入恒在左）与底色。
 
-⚠️ **`open` 是 measure 画出来的形状，不是 `expanded` 默认 true。** 折叠状态默认恒为 `false`；`open` 只表示"不用点就画正文（受 `SIDECAR_INLINE_MAX_LINES`=10 封顶）"，`expanded` 表示"越过那个上限"。若把默认改成 true，工具卡内的尾注会立刻坏掉：它们的折叠态存在子 key `-sc{i}`、没有 measured 条目，`resolveRowOpenState` 回落交互状态（默认 false），于是第一次点击算出 `current=false` 再写 `true` —— 点了没反应。
+- **不加 per-producer 色标／accent rail／底色分色。** 身份由"左侧 + header 里的说话人"承担，够了。上一次重设计删掉的正是"彩色 Paper + 2px 彩色左轨 + 六种色相"，理由是**全列表最重的皮肤裹着最不重要的内容**；在新气泡上加回来是同一个错误换个位置。除审美外还有两个硬问题：左轨会被圆角裁成上下两段弧；`border-box` 下它悄悄吃掉内容宽度，而 measure 只算了 `padding*2`，于是测量与绘制不一致。有守卫断言守着（不写任何 border、且各 producer 表面一致）。
 
-#### 四种几何（`form` × `expanded`）
+- **`usedWidth` 与 `contentWidth` 会不相等，正文必须画在后者上。** 测量顺序是：先在受 `INJECTION_BUBBLE_MAX_WIDTH_RATIO` 限制的 `innerWidth` 上测 markdown，再把**框**收缩到最宽行（`frame.usedWidth`，必然 ≤ `innerWidth`）与 header floor 的较大值。所以 shrink-wrap 后框内宽 < 换行宽。渲染层用 `usedWidth - padding*2` 会让正文在"按更宽盒子预测的高度"下重新换行、裁掉最后一行。`RenderMarkdown` 自己读 `measured.contentWidth`，两侧同源。
+- **note 行单向一致**：measure 保留（`hasNote`）⇒ 渲染层必画。缺 label 时画的是**等高的空行**，绝不是"少画一行"——正文盒是固定高 `overflow:hidden`，"保留了却不画"留洞、"画了却没保留"顶出盒子，两者都违反 §0 铁律 2。（与旧尾注相反的口径：旧尾注是"没 label 则 measure 不保留"，两种做法都单向一致，但不能混用。）
+- **正文有字符硬顶** `INJECTION_BODY_MAX_CHARS`。旧投影的 `SIDECAR_PROJECTION_MAX_LINES`=200 不在这条路上，而 `Send` 的消息文本一路到 `deliverInjection` 是**无界**的，所以上限必须落在这里。测量与绘制用同一个前缀。
+- **`spec.key` 用内容身份，不用数组位置**：`-m{i}-{fromId}` / `-t{i}-{task.id}` / `-k-{entryId}`。空消息/空条目会被跳过，用"已发出计数"做 key 会让后面的气泡继承邻居的缓存高度与展开态（§4.5.1：`spec.key` 同时是 measure cache key、折叠/选择 key、height-override key）。曾经的隐患：knowledge 分支用过滤后下标，只因上游"全有全无"门恰好保证等长同序才正确——那是**视觉策略与 key 正确性之间的隐式耦合**，已消除。
+- **`injection-bubble` 在 `UNKNOWN_HEIGHT_FORWARDING_KINDS` 里**。它的正文是别人写的 markdown，可以含 mermaid；渲染层转发了 `onUnknownHeight`，所以 shell 必须愿意为它保留 override。两者不一致的后果是渲染层走流式布局而行盒仍是固定裁剪 → 图被裁且无人能上报修正。这条一致性由源码级守卫断言守着（扫 render-registry 的转发点）。
+- **刻意没有块级菜单**：一个 `system_injection` block 扇出 N 个气泡，而选择索引是按 `contentJson` block 建的，无法表达"这一行的第 3 个气泡"。因此 `injection-bubble` **显式**列入 `NON_INTERACTIVE_KINDS`，不靠"三个清单都没提到"来生效。要恢复菜单需先解决子块寻址。
+#### 正文可以是 markdown，也可以是一张现成的系统卡（payload）
 
-| form | expanded | 结构 | 高度 |
-|------|----------|------|------|
-| folded | false | 仅 header 行（headline `lineClamp=1`）🟢 | **恒定 `SIDECAR_HEADER_ROW`**（= 裸行高 18.8）|
-| folded | true | header + 全部正文行🔴 | 行高 + `HEADER_BODY_GAP` 4 + Σ行 |
-| open | false | header + 正文行（截到 10 行）+ 越限时"展开全部"行 | 行高 + 4 + Σ截断行 [+ `EXTRA_ROW_GAP` 4 + 17] |
-| open | true | header + 全部正文行（仍受 40 行硬顶）| 行高 + 4 + Σ行 [+ 4 + 17] |
+`measured.bodyForm` 显式区分二者，渲染层**必须**按它分支——绝不能嗅探 `blocks` 形状：卡片正文是 `PreparedFixedBlock`、markdown 不是，形状嗅探今天能用，等哪天某个 payload 恰好长得像 markdown 就会静默走错分支（这正是已删除的 `payloadKind` 标记当初要解决的同一类问题）。
 
-- **folded 折叠态高度与内容完全无关**：headline 是 `lineClamp={1}`，长度不进高度（§3 truncate 规则）。这是为什么高频的 neutral 注入（进度提醒、Dynamic Spec 提醒每几次工具调用就来一条）折叠态完全不测量。
-- **每行独立 `prepareWithSegments`**：`bullet` 行要扣 `SIDECAR_BULLET_LANE`=12 给标记，所以它的换行宽度比 `text` 行**更窄**。一个整体 code block 只能按单一宽度测量，混合正文必然误判——这是 `blocks` 变成 `[header fixed, ...N 个 code block]`、每块自带 `contentLeft` 的原因。渲染层用同一批 prepared + 同一个 `FONT_XS` 逐行还原，零漂移、零 DOM。
-- 高度**不读 `lod`**，且**所有 LOD 同一形态**。此前 `lod < 4` 走 `sidecar-trace`（裸 trace）、`≥ 4` 走 Paper 卡，一个概念两套 measure、两套 render 分支、两个折叠通道（index vs key）——那正是 `traceRowFoldChannel` 存在的原因，也是"行点了没反应"一类 bug 的土壤。尾注形态在每个层级都足够轻，该区分没有收益，`sidecar-trace` 已整条删除。
-- **两个行上限，两种性质**（注释里写清，别被后人合并）：`SIDECAR_INLINE_MAX_LINES`=10 是 `open` 的**默认可见量**，读者点"展开全部"可越过；`SIDECAR_DETAIL_MAX_LINES`=40 是**病态记录的测量成本硬顶**，越不过，全文只能靠 copy。单行本身过长时也按剩余预算 clamp，一条巨型 bullet 不能突破硬顶。
-- **被截断必须给行，且高度由 measure 保留**（`SIDECAR_EXTRA_ROW_HEIGHT` / `_GAP`）。正文盒是固定高 `overflow:hidden`、无滚动条，渲染层自作主张多画一行只有两个结果：被裁掉，或把一行正文顶出盒子——都违反 §0 铁律 2。`extraRow` 显式区分 `showAll`（open 撞到内联上限，行本身是开关）与 `truncated`（撞到硬顶，只能指向 copy）；文案走 `ctx.labels`，**没有 label 时 measure 不保留、渲染层不画**，保证"保留的高度"和"画出来的行"永远一致。
-- **copy 给的是 `fullText`（模型看到的原文）**，不是这份投影：读者复制 sidecar 是为了粘到别处当上下文读。
+- **为什么框住卡片而不是投影成 markdown**：`merge_summary` 有两个分支名和 commit sha、`spec_continuation` 有 badge 和 protected 标记。压成散文会把可用结构变成文字，所以卡片原样保留、气泡只负责加框和说话人行。
+- **内层高度由卡片自己的 measure 决定**，气泡只加自己的 chrome。未识别的 payload kind 测成 0 高度而不是抛错——新生产者忘了登记应该退化成只有 header 的气泡，而不是把整个列表拖崩；`payloadKind` 让这个遗漏仍然可见。
+- ⚠️ **必须传 card-scoped 的 measured 给内层**（`{ ...measured, height: frame.contentHeight }`）。多个卡片会用 `measured.height` 画自己的盒子，而复合元素上那是**气泡总高**（chrome + 卡片）——直接透传会让卡片把自己画得比框给它留的空间更高，溢出裁剪盒。这条踩过。
 
-#### 工具卡内的 sidecar 带
+#### 哪些 system block 进气泡
 
-- **位置在 detail 之后、permission/reflection 之前**（`sidecarsTop = HEADER_ROW_HEIGHT + detail.height`）。注入在模型读到的文本里就是**追加在 tool_result 输出末尾**的（`appendSideCarsForApi`），画在输出上方是反的；permission 是"要你决策"的东西，必须留在最后最显眼处。
-- **折叠工具卡不再计入 sidecar 高度**，`sidecars` 为 null。⚠️ 这条**推翻了旧契约**（旧文写"折叠态也算高度，比不带的高一个 `SIDECAR_COLLAPSED_HEIGHT`"，并有断言守着）：那是照抄 chunked 把 notice 画在 collapse 之外的实现细节，而折叠卡根本没显示输出，尾注没有可附着的对象。折叠态改用 header 行里的 `+N` 标记（读 `sidecarCount`，落在已有固定行内 → height-neutral）表达"有注入"这件事，两条路径同步改，不产生新分裂。
-- 带内每条尾注的折叠态**不能**用工具卡自己的 `expanded` 表达（各自独立），所以按 index 存进 `opts.sidecarExpanded: number[]`，由 `digestOpts` 进缓存键。空数组时**省略该字段**，让没有 sidecar 的卡片缓存键与本功能之前 byte-identical —— 刻意保证的性质，有测试守着。
-- **折叠状态的 key 是 `${key}-sc${index}`**，adapter（`buildSidecarSpecs`）和工具卡（`opts.sidecarExpanded` 的探测）共用这一套编号。独立尾注把这个后缀写在**自己的 spec.key** 里、走普通 `expanded` 通道；工具卡带内的尾注是**子 key**，不是顶层布局项，所以 `measuredByKeyRef` 里永远没有它们。
-  - ⚠️ 由此得到一条易错点（已发生过）：shell 的折叠开关靠"从 measured 读当前是否已展开"再取反，而这两条路径都答不上来 —— 子 key 没有 measured 条目，`MeasuredSidecar` 又只有 `expanded`（没有 `form` / `effectiveOpened` / `effectiveExpanded`）。结果每次点击都写 `expanded = true`：能展开、永远关不掉。所以 `resolveRowOpenState` 显式列出每种 kind 的字段，并在**没有 measured 条目时回落到交互状态**（对子 key 而言状态就是权威，除了这个开关没人写它）。
-  - ⚠️ 同理，行签名（`rowInteractionSig`）必须按该行**实际的尾注数量**迭代 `-sc{i}`，不能"遇到缺失就 break"：读者完全可以只展开第 2 条，那时 `-sc0` 不存在，break 版本在 index 0 就停、`-sc1` 永远不进签名。这属于 §4.5 反复说的那类"靠别处兜底所以看不出来"的坏签名（这里恰好被 memo 的 `item.measured` 比较兜住）。
-- **`payloadKind` 是显式判别标记**：measure cache 必须区分"独立尾注的 data"和"工具卡的 `sidecars` 数组"，两者的 revision 分支不同。用字段形状嗅探（有 `fullText` 且有 `source`）只是猜测，任何将来带这两个字段名的 payload 都会误入前一分支、拿到描述别的东西的 revision —— 也就是命中错误高度的缓存条目。
-- **交互**：header 整行是折叠热区，并且是**可键盘操作的**（`role="button"` + `tabIndex` + Enter/Space + `aria-expanded`），全部是属性和 handler，不动已测量的几何。`open` 且未越限时**没有折叠可做，因此不声明 `role`/`tabIndex`**——不给读者一个点了没反应的死控件。内部 copy 按钮是真 `<button>`，鼠标路径靠外层 `stopPropagation` 隔离、键盘路径靠 `event.target !== currentTarget` 提前返回 —— 否则一次 Enter 会同时复制并折叠。bullet 标记必须 `aria-hidden` + `userSelect: "none"`：选区复制（`vlist-copy-text`）走全子树遍历，否则装饰符会被粘进剪贴板。
+判据不是"有没有主体"，而是**这是对话里的一次陈述，还是关于对话的一条元信息**。早期版本按前者判断，把 `container_ready` 归为"基础设施事件、没有主体"——但它的正文写着"**You can** use the Browser tool to test these services"，它在对模型说话、模型会回应它。
 
-> 注：`bash_command` / `tool_loaded` / `tool_unloaded` 三种块**由 role=user 的消息承载**（服务端为了让模型看到它们而存成 user 角色），但视觉上是 system 卡。adapter 的 user 分支必须先检测它们并路由到 system 卡，否则会画出一个只有头部的空气泡。
+进气泡（`FRAMED_SYSTEM_CARDS`）：`merge_summary`、`review_feedback`、`spec_continuation`、`spec_blocked_continuation`。
 
-> 注：`error` 卡是唯一 chrome 不完全由 kind 决定的 system 卡。它的右侧两个图标控件（标记可重试 / 关闭）恒定，但「关闭图像生成并重试」这个 provider 修复是**带文字的按钮**，占据正文下方独立一行，因此**会改变卡片高度**。是否显示由 adapter 通过 `ctx.canOfferProviderFix(errorText)` 在适配阶段决定并写入 `data.buttons`，measure 读同一个数组加上 `STACK_GAP + BUTTON_COMPACT_XS`。之所以不做成第三个图标：图标控件只能靠 hover tooltip 说明自己，触屏用户永远看不到，而这是唯一能真正解决该故障的操作。
+**刻意排除**，三类各有理由：
+- `compact` / `segment_compact` / prune 分隔线 —— 关于对话的元信息（"这里之后历史被截断"），不是谁说的话。
+- `spec_fork_carryover` / `spec_context_cleared` / `spec_goal_added` / `error` —— **带 live button**。shell 靠 `kind === "system-text"` 匹配来注入 `specCarryoverActions` / `errorNoticeActions`，改路由会让每个按钮静默失去 handler：照样画出来，点了没反应。**死按钮比缺一行说话人更糟**。要框它们得先让 action 注入能穿透到嵌套 payload。
+- `bash_command` / `tool_loaded` / `tool_unloaded` —— 用户**自己**动作的回执，归给另一个说话人是反的。
+- `ask_in_passing` / `subagent_recovery` / permission / question 表单 —— 是要**操作**的控件，不是读完的话；混成一个视觉语言会让"读消息"和"填表单"分不清。
+- `container_ready` / `browser_session_lost` —— 想框但**框不了**：这两个 block type 从来不被 `isRecognizedSystemBlockType` 识别（chunked 侧也没特判过），所以根本到不了路由，只会回落到自己的 text 块渲染成 `info` 卡。先把它们注册为已识别的系统卡才谈框。
+
+#### 说话人身份解析（集成层）
+
+优先级：**真实账号** → **平台** → **自称的 agent** → **未知**。
+
+- 真实账号（`merge_summary` 由按下合并的人产生，系统消息行本来就加载了 `creator`）用那个人的真名和**真头像**——给一个真账号画首字母占位，是"标成 System"那个 bug 的镜像错误。
+- 平台事件（容器起来、调度器推进任务、浏览器会话丢失）共用**一个** NarraFork 身份，不给每种事件编一个名字——那会暗示一群并不存在的角色。
+- 兜底是"未知发送者"，**绝不是 System**：气泡存在的唯一理由就是有别人说了话，标成系统恰好把这件事抹掉。
+- 头像色标（`speakerTint`）是"又是这个 agent"的记忆辅助，**不是身份**——固定 5 色下约 20% 的名字对必然撞色（鸽巢原理），身份由旁边的**名字**承担。
+
+- **header 是集成层注入的 slot**（`vlist-injection-header.tsx`）：纯 render 层不 import avatar / i18n。非账号说话人（子代理、后台任务）用名字生成确定性配色的首字母头像，不复用真人头像组件——那会声称一个不存在的账号。
+
 
 ### ToolCallCard（最复杂）
 - **折叠态整卡 ≈ 40-42px**（Paper p=xs + header 单行 ~18-20px + border 1px×2）。inRun 无边框 + Divider。
@@ -234,13 +239,47 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 
    派生字段尤其危险：patch 写的字段名和 measure 读的字段名往往不是同一个（`_subagentActivity` → `recentCallCount`），所以审计要顺着 **patch → adapter → measure** 整条链走，不能只看 patch 写了什么。
 
-   `appendMessageSidecars` 是这条链最长的一例，也正是本节警告的形态：它只往最新 assistant 消息的 `sideCars` 追加记录（`sidecars` WS 事件带来的 turn 间注入 —— 后台任务完成、他人消息、spec 更新），既不新增消息也不动 `messageVersion`；但 adapter 会由这个字段**派生出全新的 sidecar 元件**（§4 的尾注），每一条都自带高度。`toolCompletedPatch` 写 `tc.sideCars` 是同一条链的工具卡版本，而且更隐蔽：一次已是终态的重放或同状态重投递会让 `status` 完全不动，sidecar 就是唯一的增量。两者都由 `sidecarRevision` 覆盖，并且**靠 `payloadKind` 标记而不是字段形状**来选分支 —— 形状嗅探会让将来任何带 `fullText`+`source` 的 payload 误入独立元件分支、拿到错误的 revision，也就是错误的高度。
+   历史上这条链最长的一例是 sidecar 的 `appendMessageSidecars` / `toolCompletedPatch`（往别人消息或工具卡上追加注入记录，既不新增消息也不动 `messageVersion`，却让 adapter 派生出自带高度的新元件）。**那套机制已整条删除**，但它留下的教训仍然适用于任何"派生出新元件"的 patch：
 
-   ⚠️ `sidecarRevision` 的签名口径是**源文本**（`content`）而不是投影出的 `lines`：结构化行是源文本的纯函数（同一个 `body` 必然产出同一批行），所以源文本签名已经覆盖它，而按 lines 遍历会让成本随内容规模增长 —— 本节开头那条 O(1) 要求不允许。
+   - 判别 payload 要靠**显式标记**，不要嗅探字段形状（当年用"有 `fullText` 且有 `source`"来认，任何将来带这两个字段名的 payload 都会误入该分支、拿到描述别的东西的 revision）。
+   - revision 的签名口径取**源文本**而不是投影产物：投影是源文本的纯函数，源文本签名已经覆盖它，而遍历投影结果会让成本随内容规模增长，违反本节开头的 O(1) 要求。
 
    revision 在**每次 measure 时都会调用**，所以必须保持 O(1)：只读基元字段，文本走 `textSignature`（长度 + 定量采样哈希），禁止 `JSON.stringify` 整个 payload、禁止随内容规模增长的遍历。
 
 **回归防线：** `live-patch-measure-audit.test.ts` 的 EXHAUSTIVE 组对每个 patch 函数跑真实的 segmentMessages → adaptSegments → measure，断言"高度变了的行，缓存键必须也变"。新增 patch 时把它加进那份列表即可自动获得覆盖，不需要手工列字段。
+
+## 4.5.1 历史删改的就地通道（删除 / 尾部截断）
+
+§4.5 处理的是"服务端在已装载消息上原地改字段"。这一节处理另一件事：**服务端删掉了消息、或截短了某条消息的 block 列表**。它们是结构变化，本来只能走 `reload`。
+
+问题在于 `reload` 被 `pinnedToBottom` 门控（`vlist-reload-policy.ts`）：读者滚上去时重载被**无限期推迟**，只暴露为未读提示。这条门控对"被动到达的新内容"是对的（替换窗口会把读者拽回底部、丢掉 loadOlder 页面），但对**读者自己刚点的回退/删除**是错的——他右键点的就是历史里某条消息，因此按定义不在底部，然后界面看起来没反应。未读徽标也是错误的表达：读者没有未读，是他的操作没落地。
+
+因此新增两条就地通道，与 `appendMessage` 同构（`removeMessages` / `replaceMessage`）。判定是纯函数（`vlist-message-remove.ts` / `vlist-message-replace.ts`），**保守**：拿不准就返回同一数组引用，调用方按身份跳过重建并回落 `reload`。
+
+### 为什么不会命中错误高度
+
+两条通道都保持 `messageVersion` 不变（§4.5 约束 2：动它会让全窗口重测，而留存行内容一个字没变），于是 `documentRevision` 不动，缓存键的正确性只能由 **`spec.key`** 承担（`registry.ts` 的 `buildCacheKey`）。
+
+- **删除**：被删行的 key 直接不再出现，留存行的 key 与内容都没变 → 天然安全。
+- **尾部截断**：assistant block 的 key 是 `${msg.id}-b${bi}`，`bi` 是 block 在**原数组**中的索引。截掉尾部只让高索引 key 消失，留下的每个 `-b{bi}` 仍指向同一 block 同一内容 → 安全。
+
+⚠️ **这就是 `replaceMessage` 只接受"严格变短且是前缀"的原因，别放宽。** 正文被改写而 key 不变（`-b0` 还是 `-b0`）时，version 又没动，缓存键完全相同 ⇒ 新内容被塞进旧高度的盒子——正是 §4.5 约束 3 警告的形态。所以长度相等（编辑）、变长（追加）、中段删除（非前缀，`-b1` 会改指原来的 `-b2`）全部拒绝，交给 `reload`：那条路连同新 `messageVersion` 一起换掉整个窗口，永远正确。判定用显式字段清单（`type`/`id`/`name`/`text`/`thinking`/`summary`/`status`）而不是深比较——它每个事件只跑一次，不在 measure 热路径上。
+
+**已知残留（刻意）：** 非前缀的 `message_updated`（如手工编辑 assistant 文本）仍走 `reload`，因此非底部时仍会推迟。就地处理它需要让缓存键感知正文变化，而唯一能承载的就是 `documentRevision`（即 `messageVersion`），一动就是全窗口重测，等于放弃就地更新的全部收益。rollback 产生的恰好是前缀截断，不落在这个残留里。
+
+### rollback 会发出两个事件，必须都接
+
+`rollbackToBlock`（服务端）分两步：先删目标之后的所有消息（`messages_deleted`），再删**目标自己**边界之后的尾部 block（整条被删则 `messages_deleted`，否则 `message_updated` 带改写后的消息）。只接前者会让回退**看起来只做了一半**：下面的消息消失了，而读者点的那张卡的尾部 block 还在。两条通道必须同时存在。
+
+### `oldestLoadedSeq` / `hasPrev` 删除后绝不重算
+
+⚠️ 易错点。`oldestLoadedSeq` 描述的是**已取数窗口的上边界**（"我已经拿到 seq ≥ 这个值的数据"），不是"当前最老那条消息的 seq"。它唯一的消费者是 `loadPretextDocumentOlder` 的 `beforeSeq` 与重叠检查。删除不会让服务端凭空长出更老的历史，边界没有移动，保留原值继续正确。
+
+按剩余消息重算是**错的**：删掉最老一条后重算会把边界往新的方向推，下一次 loadOlder 就跳过中间那段永远取不回来，屏幕上留下一个静默的空洞。保留旧值最坏只是多取一页重叠数据，而 loader 的 `pageMaxSeq >= oldestLoadedSeq` 检查本来就会拒绝重叠页。
+
+### 与 reload 门的交接
+
+就地处理成功后必须同步推进 `appliedMessageRevisionRef`（与 `appendOrReload` 同一套），否则重载门仍把这次变更看作待处理：冒出一个假的"新消息"提示，然后 refetch 屏幕上已经正确的内容。
 
 ## 4.6 折叠过渡动画（FLIP，纯装饰层）
 

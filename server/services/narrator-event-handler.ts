@@ -4,22 +4,15 @@ import {
 	projectSubagentToolInputSummary,
 	type SubagentToolInputSummary,
 } from "@shared/subagent-tool-summary";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import {
-	apiRequests,
-	narratorMessageRefs,
-	narratorMessages,
-	narratorSidecars,
-	narratorToolCalls,
-} from "../db/schema";
+import { apiRequests, narratorMessageRefs, narratorMessages } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import {
 	cleanupPartialImageGenerationResults,
 	saveImageGenerationResult,
 } from "../lib/agent/image-generation";
-import { acknowledgePipelineExitConfirmation } from "../lib/agent/pipeline-state";
 import {
 	type ApiRequestHandle,
 	finishApiRequest,
@@ -28,12 +21,10 @@ import {
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
-import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "../lib/settings";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
-import { knowledgeService } from "./knowledge-service";
 import type { EnterPlanModeToolResultCommit } from "./narrator-plan-mode";
 import {
 	enrichToolUseBlocks,
@@ -505,30 +496,6 @@ function reorderPersistedToolUseBlocks(
 	return reordered;
 }
 
-async function getToolCallMessageId(narratorId: string, toolUseId: string): Promise<string | null> {
-	const row = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: { messageId: true },
-	});
-	return row?.messageId ?? null;
-}
-
-async function getLatestAssistantMessageId(narratorId: string): Promise<string | null> {
-	const [row] = await db
-		.select({ id: narratorMessages.id })
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(
-			and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessages.role, "assistant")),
-		)
-		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-		.limit(1);
-	return row?.id ?? null;
-}
-
 // === Reasoning translation ===
 
 const LOCALE_NAMES: Record<string, string> = {
@@ -649,7 +616,7 @@ function translateReasoningBlock(
 			// Broadcast updated message so frontend picks up the translation
 			const fullMessage = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, messageId),
-				with: { toolCalls: true, sideCars: true },
+				with: { toolCalls: true },
 			});
 			if (fullMessage) {
 				const ref = await db.query.narratorMessageRefs.findFirst({
@@ -1266,7 +1233,7 @@ export async function processEvent(
 			// Load full message with tool calls for broadcast and exact EnterPlanMode row identity.
 			let fullMessage = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, savedId),
-				with: { toolCalls: true, sideCars: true },
+				with: { toolCalls: true },
 			});
 
 			// Tool blocks may have been appended by block_complete in stop/completion order.
@@ -1595,71 +1562,10 @@ export async function processEvent(
 				durationMs: event.durationMs,
 				...(event.updatedInput && { updatedInput: event.updatedInput }),
 				...(event.metadata && { metadata: event.metadata }),
-				...(event.sideCars?.length && { sideCars: event.sideCars }),
 			});
 
 			if (hooks?.onToolResult) {
 				await hooks.onToolResult(event);
-			}
-
-			// Persist tool-result sidecars
-			if (event.sideCars?.length) {
-				const now = new Date().toISOString();
-				const partialId = ctx.getPartialMessageId();
-				const messageId = partialId ?? (await getToolCallMessageId(narratorId, event.toolUseId));
-				try {
-					await db.insert(narratorSidecars).values(
-						event.sideCars.map((sc, idx) => ({
-							id: generateId(),
-							narratorId,
-							messageId,
-							toolUseId: event.toolUseId,
-							target: sc.target,
-							source: sc.source,
-							content: sc.content,
-							bodyJson: sc.body ?? null,
-							orderIndex: sc.orderIndex ?? idx,
-							createdAt: now,
-						})),
-					);
-					for (const sc of event.sideCars) {
-						if (!sc.knowledgeInjection) continue;
-						knowledgeService.recordInjectionEvents({
-							narratorId: sc.knowledgeInjection.narratorId,
-							compactSeq: sc.knowledgeInjection.compactSeq,
-							source: "tool_output",
-							triggerToolCallId: sc.knowledgeInjection.triggerToolCallId,
-							hits: sc.knowledgeInjection.hits,
-						});
-					}
-
-					if (event.sideCars.some((sc) => sc.source === "pipeline_exit_confirmation")) {
-						const pipelineStateId = event.metadata?.pipelineExitConfirmationStateId;
-						if (typeof pipelineStateId !== "string" || !pipelineStateId) {
-							logger.error("Pipeline exit confirmation SideCar is missing its state id", {
-								narratorId,
-								toolUseId: event.toolUseId,
-							});
-						} else {
-							try {
-								await acknowledgePipelineExitConfirmation(narratorId, pipelineStateId);
-							} catch (ackError) {
-								logger.error("Failed to acknowledge persisted Pipeline exit confirmation", {
-									narratorId,
-									toolUseId: event.toolUseId,
-									pipelineStateId,
-									error: String(ackError),
-								});
-							}
-						}
-					}
-				} catch (err) {
-					logger.warn("Failed to persist tool-result sidecars", {
-						narratorId,
-						toolUseId: event.toolUseId,
-						error: String(err),
-					});
-				}
 			}
 
 			// Main narrator: git tracking
@@ -2373,53 +2279,6 @@ export async function processEvent(
 				// Clean up in-progress request info after persistence attempt.
 				ctx.apiRequestsMap?.delete(event.requestId);
 				ctx.pendingLeakedToolCalls?.delete(event.requestId);
-			}
-			return null;
-		}
-
-		case "sidecars": {
-			// Persist sidecars to DB and broadcast to frontend
-			const now = new Date().toISOString();
-			const partialId = ctx.getPartialMessageId();
-			if (event.sideCars.length > 0) {
-				const latestAssistantMessageId = partialId
-					? null
-					: await getLatestAssistantMessageId(narratorId);
-				try {
-					await db.insert(narratorSidecars).values(
-						event.sideCars.map((sc, idx) => ({
-							id: generateId(),
-							narratorId,
-							messageId: partialId ?? latestAssistantMessageId,
-							toolUseId: sc.toolUseId ?? null,
-							target: sc.target,
-							source: sc.source,
-							content: sc.content,
-							bodyJson: sc.body ?? null,
-							orderIndex: sc.orderIndex ?? idx,
-							createdAt: now,
-						})),
-					);
-				} catch (err) {
-					logger.warn("Failed to persist sidecars", {
-						narratorId,
-						count: event.sideCars.length,
-						error: String(err),
-					});
-				}
-				dualBroadcast(ctx, {
-					type: "sidecars",
-					narratorId: broadcastTargetId,
-					sideCars: event.sideCars.map((sc) => ({
-						target: sc.target,
-						source: sc.source,
-						content: sc.content,
-						...(sc.body ? { body: sc.body } : {}),
-						toolUseId: sc.toolUseId,
-						orderIndex: sc.orderIndex,
-					})),
-					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
-				});
 			}
 			return null;
 		}

@@ -1,11 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import {
-	narratorMessageRefs,
-	narratorMessages,
-	narratorSidecars,
-	narratorToolCalls,
-} from "../../db/schema";
+import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
 for (const statement of [
@@ -75,7 +70,7 @@ afterAll(() => {
 });
 
 describe("narrator model history projection", () => {
-	test("loads post-compact history with narrow fields and legacy sidecar fallback", async () => {
+	test("loads post-compact history with narrow fields", async () => {
 		await seedNarrator();
 		await seedMessage({
 			id: "m-before",
@@ -112,17 +107,6 @@ describe("narrator model history projection", () => {
 			status: "success",
 			createdAt: now,
 		});
-		await db.insert(narratorSidecars).values({
-			id: "sc-legacy",
-			narratorId: "n1",
-			messageId: null,
-			toolUseId: "tu-1",
-			target: "tool_result",
-			source: "legacy-provider",
-			content: JSON.stringify({ stdout: "/workspace" }),
-			createdAt: now,
-		});
-
 		const messages = await narratorService.getModelHistorySinceLastCompact("n1");
 
 		expect(messages.map((message) => message.id)).toEqual(["m-after"]);
@@ -143,14 +127,6 @@ describe("narrator model history projection", () => {
 				inputJson: { command: "pwd" },
 				outputJson: { stdout: "/workspace" },
 				status: "success",
-			}),
-		]);
-		expect(messages[0].sideCars).toEqual([
-			expect.objectContaining({
-				id: "sc-legacy",
-				messageId: null,
-				toolUseId: "tu-1",
-				target: "tool_result",
 			}),
 		]);
 	});

@@ -307,6 +307,27 @@ export const narratorsApi = {
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
 	getNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`),
+
+	/**
+	 * Upload a custom bitmap avatar for a narrator, replacing any previous one.
+	 * Without one the UI shows the identicon derived from the narrator id.
+	 */
+	uploadNarratorAvatar: async (id: string, file: File) => {
+		const formData = new FormData();
+		formData.append("file", file);
+		const res = await authorizedFetch(`${BASE}/narrators/${id}/avatar`, {
+			method: "PATCH",
+			body: formData,
+		});
+		if (!res.ok) {
+			const error = await readFetchError(res, "Upload failed");
+			throw new ApiError(error.message, res.status, error.data);
+		}
+		return res.json() as Promise<{ ok: boolean; avatarImageId: string }>;
+	},
+	/** Drop the custom avatar, falling back to the procedural identicon. */
+	deleteNarratorAvatar: (id: string) =>
+		request<{ ok: boolean }>(`/narrators/${id}/avatar`, { method: "DELETE" }),
 	getNarratorDraft: (id: string) =>
 		request<{
 			hasDraft: boolean;
@@ -416,8 +437,39 @@ export const narratorsApi = {
 		cwd?: string;
 		makeNamed?: boolean;
 		handle?: string;
-		kind?: "knowledge";
+		kind?: "knowledge" | "setup";
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
+	/**
+	 * Spawn a Setup Assistant narrator that installs the missing system
+	 * dependencies on this machine. Returns `created: false` when nothing
+	 * installable is missing, so callers can report "already good" instead of
+	 * opening an empty session. Admin-only on the server.
+	 *
+	 * `authorization` must reflect an explicit user choice: "full" grants
+	 * bypassPermissions (with strict danger reflection, i.e. a same-model review
+	 * turn for classifier-flagged calls), "default" keeps per-command approval
+	 * cards. Omitting it means "default" — never silently grant more.
+	 */
+	createSetupAssistantNarrator: (data?: { authorization?: "full" | "default" }) =>
+		request<{
+			created: boolean;
+			authorization?: "full" | "default";
+			narrator?: ApiEntity;
+			dependencies: {
+				platform: "windows" | "macos" | "linux";
+				packageManager?: string;
+				dependencies: Array<{
+					name: string;
+					required: boolean;
+					installed: boolean;
+					platformSupported: boolean;
+				}>;
+				allRequiredMet: boolean;
+			};
+		}>("/narrators/setup-assistant", {
+			method: "POST",
+			body: JSON.stringify({ authorization: data?.authorization ?? "default" }),
+		}),
 	// Named narrators (@handle mention targets)
 	listNamedNarrators: () => request<ApiEntity[]>("/narrators/named"),
 	getNarratorByHandle: (handle: string) =>
@@ -608,11 +660,49 @@ export const narratorsApi = {
 	leaveNarrator: (id: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/leave`, { method: "POST" }),
 	getBufferedMessages: (id: string) => request<BufferMessageSummary[]>(`/narrators/${id}/buffer`),
-	updateBufferedMessage: (narratorId: string, messageId: string, text: string) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/${messageId}`, {
-			method: "PATCH",
-			body: JSON.stringify({ text }),
-		}),
+	/**
+	 * Edit a queued message's text and/or its attachments.
+	 *
+	 * Omitting both keep lists means "keep every attachment", which is what a
+	 * text-only edit wants. Passing them replaces the set; new uploads switch the
+	 * request to multipart.
+	 */
+	updateBufferedMessage: async (
+		narratorId: string,
+		messageId: string,
+		text: string,
+		opts?: {
+			keepImageIds?: string[];
+			keepTextFiles?: { index: number; filename: string }[];
+			newImages?: File[];
+			newTextFiles?: File[];
+		},
+	) => {
+		const path = `/narrators/${narratorId}/buffer/${messageId}`;
+		if (!opts?.newImages?.length && !opts?.newTextFiles?.length) {
+			return request<{ ok: boolean }>(path, {
+				method: "PATCH",
+				body: JSON.stringify({
+					text,
+					...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
+					...(opts?.keepTextFiles ? { keepTextFiles: opts.keepTextFiles } : {}),
+				}),
+			});
+		}
+		const formData = new FormData();
+		formData.append("text", text);
+		if (opts.keepImageIds) formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
+		if (opts.keepTextFiles) formData.append("keepTextFiles", JSON.stringify(opts.keepTextFiles));
+		for (const img of opts.newImages ?? []) formData.append("images", img);
+		for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
+		// Content-Type is left unset so the browser adds the multipart boundary.
+		const res = await authorizedFetch(`${BASE}${path}`, { method: "PATCH", body: formData });
+		if (!res.ok) {
+			const error = await readFetchError(res, "Request failed");
+			throw new ApiError(error.message, res.status, error.data);
+		}
+		return (await res.json()) as { ok: boolean };
+	},
 	removeBufferedMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/${messageId}`, {
 			method: "DELETE",

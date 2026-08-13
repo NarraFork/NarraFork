@@ -144,8 +144,6 @@ export interface VListRenderLabels {
 			thinkingChars: (chars: number) => string;
 			outputChars: (chars: number) => string;
 		};
-		/** Tool-result side-car footnote chrome (copy tooltip + folded-card marker). */
-		sidecar: { copy: string; copied: string; attachedCount: string };
 	};
 	toolCallGroup: { label: string; statusLabel: string };
 	trace: {
@@ -199,8 +197,6 @@ export interface VListRenderLabels {
 		cancel: string;
 		resolvedLabel: string;
 	};
-	/** Standalone side-car footnote chrome (copy tooltip). */
-	sidecar: { copy: string; copied: string };
 	planCard: string;
 	pruneDivider: string;
 }
@@ -292,6 +288,10 @@ export function useVListLabels(): VListLabels {
 			imageGenerated: t("imageGenerated"),
 			imageGenerating: t("imageGenerating"),
 			imageGenerationPreparing: t("imageGenerationPreparing"),
+			// ── web_search header status ─────────────────────────────────────────────
+			webSearched: t("webSearched"),
+			webSearching: t("webSearching"),
+			webSearchPreparing: t("webSearchPreparing"),
 			// ── slash-command bubble fold control ───────────────────────────────────
 			// The control is a measured text row inside the bubble, so its wording
 			// belongs to the adapter labels (the render layer only paints it).
@@ -366,9 +366,6 @@ export function useVListLabels(): VListLabels {
 			// body. They are deliberately NOT the model-facing copy (which lives in
 			// server/lib/i18n.ts): the model gets "keep tasks.json to only
 			// text/status/protected…", the reader gets "3 open tasks".
-			sidecarUnknown: t("sidecar.unknownSource"),
-			sidecarTruncated: t("sidecar.truncated"),
-			sidecarShowAll: t("sidecar.showAll"),
 			noticeSilentProgress: t("sidecar.body.noticeSilentProgress", { count: "{count}" }),
 			noticeRelaxedPlan: t("sidecar.body.noticeRelaxedPlan"),
 			noticePipelineExit: t("sidecar.body.noticePipelineExit"),
@@ -401,7 +398,6 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceBgBash: t("sidecar.sources.bg_bash"),
 			sidecarSourceTeamMessage: t("sidecar.sources.team_message"),
 			sidecarSourceBufferedUser: t("sidecar.sources.buffered_user"),
-			sidecarSourceGroupMessage: t("sidecar.sources.group_message"),
 			sidecarSourceSubagentMessage: t("sidecar.sources.subagent_message"),
 			sidecarSourceSpecUpdate: t("sidecar.sources.spec_update"),
 		}),
@@ -488,11 +484,6 @@ export function useVListLabels(): VListLabels {
 					thinkingChars: (chars: number) => t("reflectionThinkingChars", { count: chars }),
 					outputChars: (chars: number) => t("reflectionOutputChars", { count: chars }),
 				},
-				sidecar: {
-					copy: t("sidecar.copy"),
-					copied: t("sidecar.copied"),
-					attachedCount: t("sidecar.attachedCount", { count: "{count}" }),
-				},
 			},
 			toolCallGroup: {
 				label: t("toolCalls"),
@@ -544,7 +535,6 @@ export function useVListLabels(): VListLabels {
 				cancel: t("askInPassing_cancel"),
 				resolvedLabel: t("askInPassing_resolvedLabel"),
 			},
-			sidecar: { copy: t("sidecar.copy"), copied: t("sidecar.copied") },
 			planCard: t("perm_plan"),
 			pruneDivider: t("pruneBoundaryLabel"),
 		};
@@ -576,8 +566,6 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 			return labels.askUserQuestion;
 		case "ask-in-passing":
 			return labels.askInPassing;
-		case "sidecar":
-			return labels.sidecar;
 		default:
 			return undefined;
 	}

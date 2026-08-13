@@ -24,12 +24,12 @@
  *
  * Renaming keeps the first occurrence untouched and rewrites later collisions, so the
  * model still sees a stable id for the older calls. Identifiers are opaque to the model,
- * and each rename rewrites the tool_use, its paired tool result, and its sidecars
- * together, so pairing is never broken.
+ * and each rename rewrites the tool_use together with its paired tool result, so pairing
+ * is never broken.
  */
 
 import { logger } from "../logger";
-import type { DbMessage, DbSideCar, DbToolCall } from "./provider";
+import type { DbMessage, DbToolCall } from "./provider";
 import type { AgentToolUse } from "./types";
 
 /**
@@ -134,27 +134,6 @@ function rewriteContentJsonToolUseIds(
 }
 
 /**
- * Rewrite sidecar → tool-result bindings. Sidecars are matched by `toolUseId` when a tool
- * result is assembled, so a rename must carry them along or the sidecar text is dropped.
- */
-function rewriteSideCarToolUseIds(
-	sideCars: DbMessage["sideCars"],
-	assignments: Map<string, string[]>,
-): DbMessage["sideCars"] {
-	if (!sideCars?.length) return sideCars;
-	let mutated = false;
-	const next = sideCars.map((sc) => {
-		if (!sc.toolUseId) return sc;
-		const list = assignments.get(sc.toolUseId);
-		const nextId = list?.[0];
-		if (!nextId || nextId === sc.toolUseId) return sc;
-		mutated = true;
-		return { ...sc, toolUseId: nextId } satisfies DbSideCar;
-	});
-	return mutated ? next : sideCars;
-}
-
-/**
  * Make every `tool_use` identifier unique across a rebuilt message list.
  *
  * Returns the original array untouched when there is nothing to fix (the normal case),
@@ -216,7 +195,6 @@ export function uniquifyDbMessageToolUseIds(
 			...msg,
 			toolCalls: nextToolCalls,
 			contentJson: rewriteContentJsonToolUseIds(msg.contentJson, assignments),
-			sideCars: rewriteSideCarToolUseIds(msg.sideCars, assignments),
 		});
 	}
 

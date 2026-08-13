@@ -29,6 +29,7 @@ import {
 	KNOWLEDGE_KIND_PRELOAD_TOOLS,
 	KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN,
 } from "../lib/agent/tools/knowledge-kind";
+import { SETUP_KIND_PRELOAD_TOOLS, SETUP_KIND_TRAIT } from "../lib/agent/tools/setup-kind";
 import { narratorHandleLock, narratorTraitsLock } from "../lib/async-mutex";
 import { buildAttachedFilesHint } from "../lib/attached-files";
 import {
@@ -70,6 +71,7 @@ import { getPacksExtractRoot } from "../lib/pack-archives";
 import { normalizeLegacyPermissionMode, resolveInitialRelaxedPlan } from "../lib/permission-modes";
 import {
 	buildKnowledgeStewardSystemPrompt,
+	buildSetupAssistantSystemPrompt,
 	getToolMessageWithParams,
 	type Locale,
 } from "../lib/prompt-i18n";
@@ -270,8 +272,12 @@ export interface CreateNarratorInput {
 	makeNamed?: boolean;
 	/** Globally-unique mention handle. Only used when makeNamed is true. */
 	handle?: string;
-	/** Specialized standalone narrator kind. "knowledge" → a Knowledge Steward (knowledge-base management). */
-	kind?: "knowledge";
+	/**
+	 * Specialized standalone narrator kind.
+	 * "knowledge" → a Knowledge Steward (knowledge-base management).
+	 * "setup" → a Setup Assistant (installs missing system dependencies).
+	 */
+	kind?: "knowledge" | "setup";
 	/** Whether the creating user is an admin (gates KnowledgeAdmin preinstall for kind="knowledge"). */
 	creatorIsAdmin?: boolean;
 	/** Locale for generating the default kind-specific system prompt. */
@@ -1139,6 +1145,22 @@ export async function prepareNarratorCreation(
 		if (input.creatorIsAdmin) enabledToolsSet.add(KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN);
 		if (!resolvedSystemPrompt) {
 			resolvedSystemPrompt = buildKnowledgeStewardSystemPrompt(input.locale ?? "en");
+		}
+	}
+
+	// Setup Assistant: a specialized standalone narrator that installs the system
+	// dependencies NarraFork needs (git / rg / dtach). It preinstalls Terminal
+	// because package managers often want a PTY. Its dependency briefing is
+	// rendered by the caller and passed in as `systemPrompt`; the fallback below
+	// only covers callers that supply none.
+	if (input.kind === "setup") {
+		if (chapterId !== null) {
+			throw new ValidationError("Setup Assistant narrators must be standalone (no chapterId)");
+		}
+		traits.push(SETUP_KIND_TRAIT);
+		for (const tool of SETUP_KIND_PRELOAD_TOOLS) enabledToolsSet.add(tool);
+		if (!resolvedSystemPrompt) {
+			resolvedSystemPrompt = buildSetupAssistantSystemPrompt(input.locale ?? "en");
 		}
 	}
 

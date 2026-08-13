@@ -48,6 +48,10 @@ const NON_INTERACTIVE_KINDS = new Set<VListElementKind>([
 	"reasoning-count",
 	"ask-user-question",
 	"inline-permission",
+	// `injection-bubble` was listed here while one block fanned out into N bubbles with
+	// no per-bubble address. Persistence now writes ONE injection per row, so the bubble
+	// IS the block and gets the full single-block menu (delete / rollback / fork /
+	// inspect), exactly like a user's own message. See resolveVListBlockTarget.
 ]);
 
 /** Single-message content kinds whose blockIndex is encoded as a `-b{n}` suffix. */
@@ -69,6 +73,19 @@ const BLOCK_INDEX_SUFFIX = /-b(\d+)$/;
 /** Extract the trailing `-b{n}` block index from a spec key, or null. */
 function blockIndexFromKey(key: string): number | null {
 	const match = BLOCK_INDEX_SUFFIX.exec(key);
+	if (!match) return null;
+	const n = Number(match[1]);
+	return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+/**
+ * An injection bubble's block index sits MID-key (`{msgId}-b{n}-m-sender`), not at the
+ * end, because the sender/source suffix is what keeps the key stable. Extract the
+ * `-b{n}-` segment rather than a trailing one.
+ */
+const INJECTION_BLOCK_INDEX = /-b(\d+)-/;
+function injectionBlockIndexFromKey(key: string): number | null {
+	const match = INJECTION_BLOCK_INDEX.exec(key);
 	if (!match) return null;
 	const n = Number(match[1]);
 	return Number.isInteger(n) && n >= 0 ? n : null;
@@ -107,6 +124,16 @@ export function resolveVListBlockTarget(
 
 	if (NON_INTERACTIVE_KINDS.has(kind)) return null;
 	if (AGGREGATE_KINDS.has(kind)) return null;
+
+	// An injection bubble is ONE content block per row now (the fan-out is gone). Its
+	// key carries the block index as `-b{n}-` before the speaker/source suffix, which is
+	// the row's address for delete / rollback / fork — the same operations a user's own
+	// message exposes.
+	if (kind === "injection-bubble") {
+		const blockIndex = injectionBlockIndexFromKey(key);
+		if (blockIndex == null) return null;
+		return { blockId: `msg-${messageId}-${blockIndex}`, messageId, blockIndex };
+	}
 
 	if (BLOCK_INDEXED_KINDS.has(kind)) {
 		const blockIndex = blockIndexFromKey(key);

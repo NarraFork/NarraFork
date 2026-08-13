@@ -73,8 +73,8 @@ export function toolStartedPatch(opts: {
 }
 
 /**
- * `tool_completed` → the terminal status, output, duration and any sidecars.
- * Mirrors useNarratorChunksWS.ts:1274-1312.
+ * `tool_completed` → the terminal status, output and duration.
+ * Mirrors useNarratorChunksWS.ts's onToolCompleted field merge.
  *
  * `outputJson` is written even when undefined-in-event is possible because
  * mergeToolFields preserves an existing output when the field is absent, so a
@@ -87,7 +87,6 @@ export function toolCompletedPatch(opts: {
 	durationMs?: number;
 	updatedInput?: Record<string, unknown>;
 	metadata?: Record<string, unknown>;
-	sideCars?: unknown[];
 }): LivePatch {
 	const fields: Record<string, unknown> = {
 		status: opts.status,
@@ -95,7 +94,6 @@ export function toolCompletedPatch(opts: {
 		...(opts.durationMs != null ? { durationMs: opts.durationMs } : {}),
 		...(opts.updatedInput ? { inputJson: opts.updatedInput } : {}),
 		...(opts.metadata ? { _metadata: opts.metadata } : {}),
-		...(opts.sideCars?.length ? { sideCars: opts.sideCars } : {}),
 	};
 	return (messages) => patchToolCallFields(messages, opts.toolUseId, fields);
 }

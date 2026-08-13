@@ -47,6 +47,14 @@ export { getDatabaseStorageCategory };
 
 export const DEFAULT_STALE_SESSION_DAYS = 90;
 export const DEFAULT_API_REQUEST_DUMP_DAYS = 30;
+/**
+ * Retention default for tool-call payloads.
+ *
+ * Longer than the API-dump window because these payloads are what the execution
+ * log shows; 180 days keeps a couple of release cycles of history readable while
+ * still bounding a table measured at 561k rows / 6.6 GB.
+ */
+export const DEFAULT_TOOL_CALL_PAYLOAD_DAYS = 180;
 const DEFAULT_PREVIEW_SAMPLE_LIMIT = 10;
 const DATABASE_MAINTENANCE_LOCK_KEY = "database-maintenance";
 const databaseMaintenanceLock = new AsyncMutex();
@@ -59,7 +67,6 @@ const SESSION_OWNED_TABLES: SessionOwnedTableRelation[] = [
 		narratorColumn: "narrator_id",
 		countAs: "toolCalls",
 	},
-	{ tableName: "narrator_sidecars", alias: "ns", narratorColumn: "narrator_id" },
 	{ tableName: "api_requests", alias: "ar", narratorColumn: "narrator_id", countAs: "apiRequests" },
 	{ tableName: "terminal_view_state", alias: "tvs", narratorColumn: "narrator_id" },
 	{ tableName: "terminals", alias: "t", narratorColumn: "narrator_id" },
@@ -105,6 +112,7 @@ export interface DatabaseStorageBreakdown {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;
 		apiRequestDumps: DatabaseCleanupCandidateSummary;
+		toolCallPayloads: DatabaseCleanupCandidateSummary;
 	};
 }
 
@@ -207,6 +215,7 @@ function minIso(values: Array<string | null | undefined>): string | null {
 function getDefaultOlderThanDays(target: DatabaseCleanupTarget): number | undefined {
 	if (target === "staleSessions") return DEFAULT_STALE_SESSION_DAYS;
 	if (target === "apiRequestDumps") return DEFAULT_API_REQUEST_DUMP_DAYS;
+	if (target === "toolCallPayloads") return DEFAULT_TOOL_CALL_PAYLOAD_DAYS;
 	return undefined;
 }
 
@@ -455,6 +464,104 @@ async function buildDumpPreview(
 	};
 }
 
+/**
+ * Preview for clearing aged tool-call PAYLOADS.
+ *
+ * ⚠️ Nulls `input_json` / `output_json` and leaves the ROW in place, exactly as the
+ * API-dump target does. The rows are load-bearing well beyond the execution log:
+ * `snapshot-revert` reads `tree_hash_before` off them to roll a workspace back, and
+ * `file-state-rebuild` replays recorded Write/Edit inputs from checkpoint rows.
+ * Deleting rows by age would silently disable file-history revert for older work —
+ * a much worse trade than losing the ability to re-read an old command's output.
+ *
+ * Checkpoint rows (`is_file_history_checkpoint = 1`) are excluded outright: their
+ * `input_json` IS the replay source, so clearing it destroys the reconstruction path
+ * rather than merely a log entry.
+ *
+ * `created_at` rather than the `started_at` generated column: this is an age policy
+ * about when the row was written, and `created_at` is non-null on every row
+ * including those predating the lifecycle timestamps.
+ */
+async function buildToolCallPayloadPreview(
+	olderThanDays = DEFAULT_TOOL_CALL_PAYLOAD_DAYS,
+	sampleLimit = DEFAULT_PREVIEW_SAMPLE_LIMIT,
+): Promise<DatabaseCleanupPreviewResult> {
+	const cutoffIso = getCutoffIso(olderThanDays);
+	const summary = sqlite
+		.prepare(
+			`SELECT
+			COUNT(*) AS count,
+			COALESCE(SUM(
+				length(CAST(coalesce(input_json, '') AS BLOB)) +
+				length(CAST(coalesce(output_json, '') AS BLOB))
+			), 0) AS approxBytes,
+			MIN(created_at) AS oldestAt
+		 FROM narrator_tool_calls
+		 WHERE created_at <= ?
+			 AND is_file_history_checkpoint = 0
+			 AND (input_json IS NOT NULL OR output_json IS NOT NULL)`,
+		)
+		.get(cutoffIso) as {
+		count: number | string | bigint;
+		approxBytes: number | string | bigint;
+		oldestAt: string | null;
+	};
+	const samples = sqlite
+		.prepare(
+			`SELECT
+			tc.id AS id,
+			tc.narrator_id AS narratorId,
+			n.title AS narratorTitle,
+			c.title AS chapterTitle,
+			tc.created_at AS createdAt,
+			length(CAST(coalesce(tc.input_json, '') AS BLOB)) +
+				length(CAST(coalesce(tc.output_json, '') AS BLOB)) AS approxBytes
+		 FROM narrator_tool_calls tc
+		 LEFT JOIN narrators n ON n.id = tc.narrator_id
+		 LEFT JOIN chapters c ON c.id = n.chapter_id
+		 WHERE tc.created_at <= ?
+			 AND tc.is_file_history_checkpoint = 0
+			 AND (tc.input_json IS NOT NULL OR tc.output_json IS NOT NULL)
+		 ORDER BY tc.created_at ASC
+		 LIMIT ?`,
+		)
+		.all(cutoffIso, Math.max(0, sampleLimit)) as Array<{
+		id: string;
+		narratorId: string | null;
+		narratorTitle: string | null;
+		chapterTitle: string | null;
+		createdAt: string;
+		approxBytes: number | string | bigint;
+	}>;
+	return {
+		target: "toolCallPayloads",
+		olderThanDays,
+		approxBytes: numberFromRow(summary?.approxBytes),
+		oldestAt: summary?.oldestAt ?? null,
+		counts: {
+			sessions: 0,
+			narrators: 0,
+			descendantNarrators: 0,
+			messages: 0,
+			toolCalls: numberFromRow(summary?.count),
+			apiRequests: 0,
+			dumpsCleared: numberFromRow(summary?.count),
+		},
+		blockedCount: 0,
+		warningCodes: [],
+		samples: samples.map((sample) => ({
+			type: "apiRequest",
+			id: sample.id,
+			narratorId: sample.narratorId,
+			narratorTitle: sample.narratorTitle,
+			chapterTitle: sample.chapterTitle,
+			createdAt: sample.createdAt,
+			approxBytes: numberFromRow(sample.approxBytes),
+		})),
+		blocked: [],
+	};
+}
+
 async function summarizeSessionTarget(
 	target: Extract<DatabaseCleanupTarget, "archivedSessions" | "staleSessions">,
 	context: CleanupNarratorContext,
@@ -476,6 +583,19 @@ async function summarizeDumpTarget(
 	const preview = await buildDumpPreview(olderThanDays, 0);
 	return {
 		count: preview.counts.dumpsCleared,
+		approxBytes: preview.approxBytes,
+		blockedCount: 0,
+		oldestAt: preview.oldestAt,
+		retentionDays: olderThanDays,
+	};
+}
+
+async function summarizeToolCallPayloadTarget(
+	olderThanDays = DEFAULT_TOOL_CALL_PAYLOAD_DAYS,
+): Promise<DatabaseCleanupCandidateSummary> {
+	const preview = await buildToolCallPayloadPreview(olderThanDays, 0);
+	return {
+		count: preview.counts.toolCalls,
 		approxBytes: preview.approxBytes,
 		blockedCount: 0,
 		oldestAt: preview.oldestAt,
@@ -547,18 +667,20 @@ export const databaseCleanupService = {
 				getDatabaseFileSizes(),
 				loadCleanupNarratorContext(),
 			]);
-			const [archivedSessions, staleSessions, apiRequestDumps, objectStorage] = await Promise.all([
-				summarizeSessionTarget("archivedSessions", cleanupContext),
-				summarizeSessionTarget("staleSessions", cleanupContext, DEFAULT_STALE_SESSION_DAYS),
-				summarizeDumpTarget(DEFAULT_API_REQUEST_DUMP_DAYS),
-				runParallelObjectStorageScan({
-					sqlite,
-					dbPath: getDbPath(),
-					mainBytes: fileSizes.mainBytes,
-					onProgress: options.onProgress,
-					signal: options.signal,
-				}),
-			]);
+			const [archivedSessions, staleSessions, apiRequestDumps, toolCallPayloads, objectStorage] =
+				await Promise.all([
+					summarizeSessionTarget("archivedSessions", cleanupContext),
+					summarizeSessionTarget("staleSessions", cleanupContext, DEFAULT_STALE_SESSION_DAYS),
+					summarizeDumpTarget(DEFAULT_API_REQUEST_DUMP_DAYS),
+					summarizeToolCallPayloadTarget(DEFAULT_TOOL_CALL_PAYLOAD_DAYS),
+					runParallelObjectStorageScan({
+						sqlite,
+						dbPath: getDbPath(),
+						mainBytes: fileSizes.mainBytes,
+						onProgress: options.onProgress,
+						signal: options.signal,
+					}),
+				]);
 			executedOn = objectStorage.executedOn;
 			const { executedOn: _executedOn, workerCount, durationMs, ...storage } = objectStorage;
 			logger.info("Database storage scan completed", {
@@ -574,6 +696,7 @@ export const databaseCleanupService = {
 					archivedSessions,
 					staleSessions,
 					apiRequestDumps,
+					toolCallPayloads,
 				},
 			};
 		} finally {
@@ -590,6 +713,12 @@ export const databaseCleanupService = {
 			const sampleLimit = options.sampleLimit ?? DEFAULT_PREVIEW_SAMPLE_LIMIT;
 			if (target === "apiRequestDumps") {
 				return buildDumpPreview(normalizePreviewDays(target, options.olderThanDays), sampleLimit);
+			}
+			if (target === "toolCallPayloads") {
+				return buildToolCallPayloadPreview(
+					normalizePreviewDays(target, options.olderThanDays),
+					sampleLimit,
+				);
 			}
 			const cleanupContext = await loadCleanupNarratorContext();
 			const { preview } = await buildSessionPreview(
@@ -625,6 +754,27 @@ export const databaseCleanupService = {
 								`UPDATE api_requests
 							 SET raw_dump_json = NULL
 							 WHERE raw_dump_json IS NOT NULL AND created_at <= ?`,
+							)
+							.run(cutoffIso);
+						changed = numberFromRow(result?.changes) > 0;
+					}
+				} else if (target === "toolCallPayloads") {
+					preview = await buildToolCallPayloadPreview(
+						normalizePreviewDays(target, options.olderThanDays),
+						0,
+					);
+					if (preview.counts.toolCalls > 0) {
+						const cutoffIso = getCutoffIso(preview.olderThanDays ?? DEFAULT_TOOL_CALL_PAYLOAD_DAYS);
+						// The WHERE clause mirrors the preview exactly, checkpoint exclusion
+						// included: a divergence here would clear rows the preview promised to
+						// keep, and the checkpoint rows are the file-history replay source.
+						const result = sqlite
+							.prepare(
+								`UPDATE narrator_tool_calls
+							 SET input_json = NULL, output_json = NULL
+							 WHERE created_at <= ?
+								 AND is_file_history_checkpoint = 0
+								 AND (input_json IS NOT NULL OR output_json IS NOT NULL)`,
 							)
 							.run(cutoffIso);
 						changed = numberFromRow(result?.changes) > 0;

@@ -60,6 +60,10 @@ const NO_LABELS_KINDS: Record<string, string> = {
 	"knowledge-hint": "entry titles come from measured content",
 	// Localized through a dedicated shell branch instead of a `labels` bundle.
 	"plan-card": "shell injects extra.label",
+	// Body is measured markdown (already projected + localized by the adapter); its
+	// only chrome is the speaker header node and the trailing note, both built by the
+	// integration layer — the render layer imports no avatar and no i18n.
+	"injection-bubble": "shell injects extra.header + extra.noteText",
 	"tool-call-group": "shell injects extra.label + extra.statusLabel",
 	"prune-divider": "shell injects extra.fallbackLabel",
 	// Count lines carry adapter-composed header text as DATA (it embeds the live

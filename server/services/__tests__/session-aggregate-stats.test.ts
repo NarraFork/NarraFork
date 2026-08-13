@@ -32,7 +32,6 @@ const RELATIONS: SessionOwnedTableRelation[] = [
 		narratorColumn: "narrator_id",
 		countAs: "toolCalls",
 	},
-	{ tableName: "narrator_sidecars", alias: "ns", narratorColumn: "narrator_id" },
 	{ tableName: "api_requests", alias: "ar", narratorColumn: "narrator_id", countAs: "apiRequests" },
 	{ tableName: "terminals", alias: "t", narratorColumn: "narrator_id" },
 	{ tableName: "narrator_file_snapshots", alias: "nfs", narratorColumn: "narrator_id" },
@@ -151,7 +150,6 @@ function createCleanupFixture(dbPath: string): void {
 		"CREATE TABLE narrator_message_refs (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, seq INTEGER)",
 	);
 	db.run("CREATE TABLE narrator_tool_calls (id TEXT PRIMARY KEY, narrator_id TEXT, name TEXT)");
-	db.run("CREATE TABLE narrator_sidecars (id TEXT PRIMARY KEY, narrator_id TEXT, payload TEXT)");
 	db.run(
 		"CREATE TABLE api_requests (id TEXT PRIMARY KEY, narrator_id TEXT, raw_dump_json TEXT, created_at TEXT)",
 	);
@@ -200,11 +198,6 @@ function createCleanupFixture(dbPath: string): void {
 				`tc-${i}`,
 				narratorId,
 				"bash",
-			);
-			db.prepare("INSERT INTO narrator_sidecars VALUES (?, ?, ?)").run(
-				`sc-${i}`,
-				narratorId,
-				"sidecar payload",
 			);
 			db.prepare("INSERT INTO api_requests VALUES (?, ?, ?, ?)").run(
 				`ar-${i}`,

@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, projects } from "../db/schema";
+import { chapterEdges, chapters, projects } from "../db/schema";
 import { generateId } from "../lib/id";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
@@ -143,6 +143,70 @@ describe("forking from uncommitted state", () => {
 		expect(readFileSync(join(childPath, "app.txt"), "utf-8")).toBe("uncommitted edit\n");
 		expect(existsSync(join(childPath, "added.txt"))).toBe(true);
 		expect(readFileSync(join(childPath, "added.txt"), "utf-8")).toBe("only in the workspace\n");
+	});
+
+	test("commit source excludes the parent's uncommitted changes and records metadata", async () => {
+		const parent = await createProjectWithChapter();
+		writeFileSync(join(parent.worktree, "app.txt"), "uncommitted edit\n");
+		writeFileSync(join(parent.worktree, "added.txt"), "workspace only\n");
+
+		const child = await chapterFork.fork(parent.chapterId, {
+			inheritMode: "fresh",
+			worktreeSource: "commit",
+		});
+		const childPath = child.worktreePath as string;
+		tempDirs.push(childPath);
+
+		expect(readFileSync(join(childPath, "app.txt"), "utf-8")).toBe("committed\n");
+		expect(existsSync(join(childPath, "added.txt"))).toBe(false);
+		expect((child.forkPoint as { worktreeSource?: string }).worktreeSource).toBe("commit");
+
+		const edge = await db.query.chapterEdges.findFirst({
+			where: eq(chapterEdges.targetId, child.id),
+		});
+		expect((edge?.metadata as { worktreeSource?: string })?.worktreeSource).toBe("commit");
+	});
+
+	test("historical startCommitSha does not layer the current workspace on top", async () => {
+		const parent = await createProjectWithChapter();
+		const historical = (
+			await safeSpawn({ cmd: ["git", "rev-parse", "HEAD"], cwd: parent.worktree, timeout: 15_000 })
+		).stdout.trim();
+
+		writeFileSync(join(parent.worktree, "app.txt"), "later committed\n");
+		await safeSpawn({ cmd: ["git", "add", "-A"], cwd: parent.worktree, timeout: 15_000 });
+		await safeSpawn({
+			cmd: ["git", "commit", "-m", "later"],
+			cwd: parent.worktree,
+			timeout: 15_000,
+		});
+		writeFileSync(join(parent.worktree, "app.txt"), "current workspace\n");
+
+		const child = await chapterFork.fork(parent.chapterId, {
+			inheritMode: "fresh",
+			worktreeSource: "commit",
+			startCommitSha: historical,
+		});
+		const childPath = child.worktreePath as string;
+		tempDirs.push(childPath);
+
+		expect(readFileSync(join(childPath, "app.txt"), "utf-8")).toBe("committed\n");
+		expect(child.startCommitSha).toBe(historical);
+	});
+
+	test("explicit workspace source rejects a dormant parent", async () => {
+		const parent = await createProjectWithChapter();
+		await db
+			.update(chapters)
+			.set({ status: "dormant", worktreePath: null })
+			.where(eq(chapters.id, parent.chapterId));
+
+		await expect(
+			chapterFork.fork(parent.chapterId, {
+				inheritMode: "fresh",
+				worktreeSource: "workspace",
+			}),
+		).rejects.toThrow("Cannot fork a dormant chapter from workspace state");
 	});
 
 	test("propagates a file the parent deleted without committing", async () => {

@@ -16,12 +16,6 @@ import type {
 } from "./provider";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
-import {
-	appendSideCarsForApi,
-	outputToText,
-	sideCarsForToolResult,
-	sideCarsForUserMessage,
-} from "./sidecar";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
@@ -606,7 +600,6 @@ export class GeminiProvider implements ProviderAdapter {
 	private buildGeminiHistory(dbMessages: DbMessage[]): {
 		history: GeminiHistoryItem[];
 		trailingToolResults: GeminiToolResult[];
-		trailingUserText?: string;
 	} {
 		const topLevel = dbMessages.filter(
 			(m) =>
@@ -620,7 +613,6 @@ export class GeminiProvider implements ProviderAdapter {
 
 		const history: GeminiHistoryItem[] = [];
 		let pendingToolResults: GeminiToolResult[] = [];
-		let pendingUserSideCars: NonNullable<DbMessage["sideCars"]> = [];
 
 		const flushToolResults = () => {
 			if (pendingToolResults.length > 0) {
@@ -637,11 +629,6 @@ export class GeminiProvider implements ProviderAdapter {
 		for (const msg of topLevel) {
 			if (msg.role === "assistant") {
 				flushToolResults();
-				const pendingSideCarText = appendSideCarsForApi("", pendingUserSideCars);
-				if (pendingSideCarText) {
-					history.push({ role: "user", parts: [{ text: pendingSideCarText }] });
-				}
-				pendingUserSideCars = [];
 
 				const content = Array.isArray(msg.contentJson)
 					? (msg.contentJson as Array<Record<string, unknown>>)
@@ -741,10 +728,7 @@ export class GeminiProvider implements ProviderAdapter {
 				if (msg.toolCalls) {
 					for (const tc of msg.toolCalls) {
 						if (tc.status === "success" || tc.status === "fail") {
-							const outputText = appendSideCarsForApi(
-								outputToText(tc.outputJson),
-								sideCarsForToolResult(msg.sideCars, tc.toolUseId),
-							);
+							const outputText = outputToText(tc.outputJson);
 							pendingToolResults.push({
 								name: tc.toolName,
 								response: tc.status === "fail" ? { error: outputText } : { output: outputText },
@@ -752,19 +736,12 @@ export class GeminiProvider implements ProviderAdapter {
 						}
 					}
 				}
-				pendingUserSideCars = sideCarsForUserMessage(msg.sideCars);
 			} else if (msg.role === "user") {
 				flushToolResults();
-				const text = appendSideCarsForApi(msg.contentText || "", pendingUserSideCars);
+				const text = msg.contentText || "";
 				if (text) history.push({ role: "user", parts: [{ text }] });
-				pendingUserSideCars = [];
 			} else if (msg.role === "sys") {
 				flushToolResults();
-				const pendingSideCarText = appendSideCarsForApi("", pendingUserSideCars);
-				if (pendingSideCarText) {
-					history.push({ role: "user", parts: [{ text: pendingSideCarText }] });
-				}
-				pendingUserSideCars = [];
 
 				const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 				const textParts = content
@@ -776,11 +753,7 @@ export class GeminiProvider implements ProviderAdapter {
 			}
 		}
 
-		return {
-			history,
-			trailingToolResults: pendingToolResults,
-			trailingUserText: appendSideCarsForApi("", pendingUserSideCars) || undefined,
-		};
+		return { history, trailingToolResults: pendingToolResults };
 	}
 
 	private async *parseSSEStream(

@@ -236,7 +236,6 @@ const REALTIME_HISTORY_EVENT_TYPES = new Set([
 	"message_updated",
 	"tool_started",
 	"tool_completed",
-	"sidecars",
 	"tool_long_running",
 	"timeout_updated",
 	"permission_request",

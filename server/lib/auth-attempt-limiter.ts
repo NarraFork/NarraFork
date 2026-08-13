@@ -59,6 +59,35 @@ const MFA_SOURCE_POLICY: BucketPolicy = {
 	maxInFlight: 4,
 };
 
+/**
+ * Instance-wide minimum gap between registration attempts.
+ *
+ * Registration is the one unauthenticated endpoint that both writes rows and runs
+ * bcrypt, and with invitation codes it also became a guessing target. A hard
+ * interval caps the whole instance's attempt rate no matter how many source
+ * addresses an attacker rotates through, which per-IP buckets alone cannot do.
+ */
+const REGISTRATION_MIN_INTERVAL_MS = 3 * SECOND;
+
+const REGISTRATION_SOURCE_POLICY: BucketPolicy = {
+	maxFailures: 10,
+	windowMs: 10 * MINUTE,
+	baseLockMs: MINUTE,
+	maxLockMs: 15 * MINUTE,
+	maxInFlight: 1,
+};
+
+const REGISTRATION_GLOBAL_POLICY: BucketPolicy = {
+	maxFailures: 30,
+	windowMs: 15 * MINUTE,
+	baseLockMs: MINUTE,
+	maxLockMs: 15 * MINUTE,
+	maxInFlight: 4,
+};
+
+/** Single key for the instance-wide registration bucket. */
+const REGISTRATION_GLOBAL_KEY = "\0registration-global";
+
 interface AttemptState {
 	failures: number[];
 	lockedUntil: number;
@@ -74,6 +103,10 @@ interface LimiterStore {
 	passwordSources: Map<string, AttemptState>;
 	mfaUsers: Map<string, AttemptState>;
 	mfaSources: Map<string, AttemptState>;
+	registrationSources: Map<string, AttemptState>;
+	registrationGlobal: Map<string, AttemptState>;
+	/** Timestamp of the last *completed* registration attempt (success or failure). */
+	lastRegistrationAt: number;
 	hashInFlight: number;
 }
 
@@ -84,8 +117,26 @@ function createStore(): LimiterStore {
 		passwordSources: new Map(),
 		mfaUsers: new Map(),
 		mfaSources: new Map(),
+		registrationSources: new Map(),
+		registrationGlobal: new Map(),
+		lastRegistrationAt: 0,
 		hashInFlight: 0,
 	};
+}
+
+/**
+ * Backfill fields a store created by an older module revision is missing.
+ *
+ * The store is pinned to globalThis under a fixed key so `--hot` reloads keep
+ * existing locks. That also means a reload can hand this module a store shaped by
+ * the previous version, so new fields have to be tolerated rather than assumed.
+ * Bumping the key instead would reset every active lock on each reload.
+ */
+function ensureStoreShape(store: LimiterStore): LimiterStore {
+	store.registrationSources ??= new Map();
+	store.registrationGlobal ??= new Map();
+	store.lastRegistrationAt ??= 0;
+	return store;
 }
 
 interface BucketReservation {
@@ -377,12 +428,17 @@ export class AuthAttemptLimiter {
 	private readonly passwordSources: FailureBucket;
 	private readonly mfaUsers: FailureBucket;
 	private readonly mfaSources: FailureBucket;
+	private readonly registrationSources: FailureBucket;
+	private readonly registrationGlobal: FailureBucket;
+	private readonly now: () => number;
 
 	constructor(
 		now: () => number = Date.now,
 		maxEntriesPerBucket = DEFAULT_MAX_ENTRIES_PER_BUCKET,
 		private readonly store: LimiterStore = createStore(),
 	) {
+		ensureStoreShape(store);
+		this.now = now;
 		this.passwordAccounts = new FailureBucket(
 			store.passwordAccounts,
 			PASSWORD_ACCOUNT_POLICY,
@@ -405,6 +461,18 @@ export class AuthAttemptLimiter {
 		this.mfaSources = new FailureBucket(
 			store.mfaSources,
 			MFA_SOURCE_POLICY,
+			now,
+			maxEntriesPerBucket,
+		);
+		this.registrationSources = new FailureBucket(
+			store.registrationSources,
+			REGISTRATION_SOURCE_POLICY,
+			now,
+			maxEntriesPerBucket,
+		);
+		this.registrationGlobal = new FailureBucket(
+			store.registrationGlobal,
+			REGISTRATION_GLOBAL_POLICY,
 			now,
 			maxEntriesPerBucket,
 		);
@@ -487,6 +555,95 @@ export class AuthAttemptLimiter {
 				this.passwordAccounts.cancel(accountReservation);
 				this.passwordPairs.cancel(pairReservation);
 				this.passwordSources.cancel(sourceReservation);
+			}
+			return emptyAttemptFailure();
+		};
+		return {
+			allowed: true,
+			failure: () => finish("failure"),
+			success: () => {
+				finish("success");
+			},
+			cancel: () => {
+				finish("cancel");
+			},
+		};
+	}
+
+	/**
+	 * Lease a registration attempt: instance-wide interval, per-source and global
+	 * failure budgets, plus a bcrypt concurrency slot.
+	 *
+	 * `skipGlobalInterval` waives only the 3s gap — the failure buckets and the hash
+	 * slot still apply. It exists for the bootstrap case (an instance with no users
+	 * yet), where a mistyped first password would otherwise force a 3s wait per retry
+	 * and there is no account to attack in the first place.
+	 *
+	 * The interval blocks with `reason: "locked"` so the route reports it as
+	 * throttling (with a retry countdown) rather than as transient busyness;
+	 * `"busy"` stays reserved for a saturated hash slot.
+	 */
+	beginRegistration(
+		sourceIp: string,
+		options?: { skipGlobalInterval?: boolean },
+	): AuthAttemptDecision {
+		const now = this.now();
+		if (!options?.skipGlobalInterval) {
+			const sinceLast = now - this.store.lastRegistrationAt;
+			if (this.store.lastRegistrationAt > 0 && sinceLast < REGISTRATION_MIN_INTERVAL_MS) {
+				return {
+					allowed: false,
+					retryAfterMs: Math.max(SECOND, REGISTRATION_MIN_INTERVAL_MS - sinceLast),
+					reason: "locked",
+					subjectLocked: false,
+					sourceLocked: false,
+				};
+			}
+		}
+
+		const sourceStatus = this.registrationSources.peek(sourceIp);
+		const globalStatus = this.registrationGlobal.peek(REGISTRATION_GLOBAL_KEY);
+		const precheck = maxBlocked([sourceStatus, globalStatus], [globalStatus], [sourceStatus]);
+		if (precheck) return precheck;
+
+		const releaseHash = this.reserveHashSlot();
+		if (typeof releaseHash !== "function") return releaseHash;
+
+		const sourceReservation = this.registrationSources.reserve(sourceIp);
+		if (!("key" in sourceReservation)) {
+			releaseHash();
+			return blockedFrom(sourceReservation, "source");
+		}
+		const globalReservation = this.registrationGlobal.reserve(REGISTRATION_GLOBAL_KEY);
+		if (!("key" in globalReservation)) {
+			this.registrationSources.cancel(sourceReservation);
+			releaseHash();
+			return blockedFrom(globalReservation, "subject");
+		}
+
+		let completed = false;
+		const finish = (outcome: "failure" | "success" | "cancel"): AuthAttemptFailure => {
+			if (completed) return emptyAttemptFailure();
+			completed = true;
+			releaseHash();
+			// Success and failure both advance the interval: it caps the attempt rate,
+			// and a failure storm has to be paced just as much as a success. Cancel
+			// does not, because no registration was actually attempted.
+			if (outcome !== "cancel") this.store.lastRegistrationAt = this.now();
+			if (outcome === "failure") {
+				const sourceStatus = this.registrationSources.finishFailure(sourceReservation);
+				const globalStatus = this.registrationGlobal.finishFailure(globalReservation);
+				return aggregateFailures([sourceStatus, globalStatus], [globalStatus], [sourceStatus]);
+			}
+			if (outcome === "success") {
+				// Neither bucket clears its history on success: a successful signup is not
+				// evidence that the preceding failures were benign, and clearing the shared
+				// global bucket would let one valid registration reset an ongoing attack.
+				this.registrationSources.finishSuccess(sourceReservation, false);
+				this.registrationGlobal.finishSuccess(globalReservation, false);
+			} else {
+				this.registrationSources.cancel(sourceReservation);
+				this.registrationGlobal.cancel(globalReservation);
 			}
 			return emptyAttemptFailure();
 		};
@@ -588,11 +745,14 @@ export class AuthAttemptLimiter {
 		this.passwordSources.clear();
 		this.mfaUsers.clear();
 		this.mfaSources.clear();
+		this.registrationSources.clear();
+		this.registrationGlobal.clear();
+		this.store.lastRegistrationAt = 0;
 		this.store.hashInFlight = 0;
 	}
 }
 
-const sharedStore = hotSafe("narrafork.authAttemptLimiter.v1", createStore);
+const sharedStore = ensureStoreShape(hotSafe("narrafork.authAttemptLimiter.v1", createStore));
 export const authAttemptLimiter = new AuthAttemptLimiter(
 	Date.now,
 	DEFAULT_MAX_ENTRIES_PER_BUCKET,

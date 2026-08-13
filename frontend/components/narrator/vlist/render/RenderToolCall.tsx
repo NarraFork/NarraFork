@@ -102,8 +102,6 @@ import {
 	type MeasuredToolDetail,
 	type MeasuredToolDetailSection,
 	SECTION_LABEL_HEIGHT,
-	SIDECAR_BAND_ROW_GAP,
-	SIDECAR_BAND_TOP_GAP,
 	SPEC_TASK_ICON,
 	SPEC_TASK_INDENT,
 	SPEC_TASK_LOCK,
@@ -130,7 +128,6 @@ import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
-import { RenderSidecar } from "./RenderSidecar";
 import { TokenFlowText, TokenText } from "./TokenLines";
 import { VListImage, type VListImageRef } from "./vlist-image";
 
@@ -181,11 +178,6 @@ export interface ToolCallLabels {
 	permission?: InlinePermissionLabels;
 	/** Reflection-notice labels forwarded to RenderReflectionNotice. */
 	reflection?: ReflectionNoticeLabels;
-	/**
-	 * Side-car footnote chrome: the copy tooltip, plus the `{count}` template for the
-	 * folded card's injection marker.
-	 */
-	sidecar?: { copy?: string; copied?: string; attachedCount?: string };
 }
 
 const DEFAULT_LABELS: Required<
@@ -450,14 +442,6 @@ interface ToolHeaderRowProps {
 	onTerminate?: () => void;
 	/** Localized terminate tooltip / aria label. */
 	terminateLabel: string;
-	/**
-	 * How many side-car injections this FOLDED card is not drawing (0 when expanded,
-	 * or when there are none). Rendered as a dimmed marker inside this fixed row, so
-	 * it is height-neutral — see the call site.
-	 */
-	sidecarCount?: number;
-	/** Localized `{count}` template for that marker's tooltip / aria label. */
-	sidecarCountLabel?: string;
 }
 
 function ToolHeaderRow({
@@ -478,8 +462,6 @@ function ToolHeaderRow({
 	onUpdateTimeout,
 	onTerminate,
 	terminateLabel,
-	sidecarCount = 0,
-	sidecarCountLabel,
 }: ToolHeaderRowProps) {
 	const color = CATEGORY_COLOR[category];
 	const statusColor = STATUS_COLOR[status];
@@ -549,24 +531,6 @@ function ToolHeaderRow({
 				>
 					{remoteLabel}
 				</Badge>
-			) : null}
-			{/* Folded-card marker for side-cars this row is not drawing. A plain dimmed
-			    "+N" rather than a badge: it is a footnote count, not a status, and it
-			    must not compete with the status glyph beside it. */}
-			{sidecarCount > 0 ? (
-				<Tooltip
-					label={(sidecarCountLabel ?? "{count} system injection(s)").replaceAll(
-						"{count}",
-						String(sidecarCount),
-					)}
-					position="top"
-					withArrow
-					fz="xs"
-				>
-					<Text size="xs" c="dimmed" style={{ flexShrink: 0, opacity: 0.7 }}>
-						{`+${sidecarCount}`}
-					</Text>
-				</Tooltip>
 			) : null}
 			<span
 				style={{
@@ -2615,13 +2579,6 @@ export interface RenderToolCallProps {
 	 */
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
-	/**
-	 * Fold toggle for ONE tool-result sidecar mini-card (index-addressed). The
-	 * shell owns the interaction state; absent → the sidecar cards render inert
-	 * (still fully visible, just not foldable). Height-affecting state is resolved
-	 * during measurement, so this only ever flips an already-measured card.
-	 */
-	onToggleSidecar?: (index: number) => void;
 }
 
 /** How long a one-shot outcome sweep stays mounted (600ms animation + a margin). */
@@ -2700,7 +2657,6 @@ export function RenderToolCall({
 	reflectionTakingOver,
 	viewTargets,
 	viewControls,
-	onToggleSidecar,
 }: RenderToolCallProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	const {
@@ -2709,7 +2665,6 @@ export function RenderToolCall({
 		detail,
 		permission,
 		reflection,
-		sidecars,
 		hasBorder,
 		inRun,
 		isLast,
@@ -2758,11 +2713,6 @@ export function RenderToolCall({
 				onUpdateTimeout={onUpdateTimeout}
 				onTerminate={onTerminate}
 				terminateLabel={merged.terminate}
-				// A folded card draws no output, so its side-car footnotes have nothing to
-				// be footnotes to and are not rendered. This marker keeps the FACT of them
-				// visible; it sits inside the fixed header row, so it costs no height.
-				sidecarCount={effectiveOpened ? 0 : measured.sidecarCount}
-				sidecarCountLabel={merged.sidecar?.attachedCount}
 			/>
 			{effectiveOpened ? (
 				<>
@@ -2781,25 +2731,6 @@ export function RenderToolCall({
 								/>
 							</div>
 						</Box>
-					) : null}
-					{/* Tool-result side-cars — the injections the model saw in this tool's
-					    output, drawn as footnotes BELOW the detail region because that is
-					    where they are in the text it read (`appendSideCarsForApi` appends
-					    them to the tool result). They sit above the permission /
-					    reflection area, which stays last as the thing asking the reader to
-					    decide. Each footnote folds independently. */}
-					{sidecars && sidecars.length > 0 ? (
-						<Stack gap={SIDECAR_BAND_ROW_GAP} mt={SIDECAR_BAND_TOP_GAP}>
-							{sidecars.map((sc, index) => (
-								<RenderSidecar
-									// biome-ignore lint/suspicious/noArrayIndexKey: sidecars are a stable ordered list — the measure pass derives them from this tool result's injections in emission order, and `onToggleSidecar` addresses them by that same index, so the index IS the identity
-									key={index}
-									measured={sc}
-									onToggle={onToggleSidecar ? () => onToggleSidecar(index) : undefined}
-									labels={merged.sidecar}
-								/>
-							))}
-						</Stack>
 					) : null}
 					{/* A reflection notice REPLACES the permission area (chunked precedence,
 					    ToolCallCard.tsx:5419). It is fully MEASURED, so it renders on the

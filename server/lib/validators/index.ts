@@ -2,6 +2,8 @@
 
 export {
 	adminAuthConfigSchema,
+	adminCreateRegistrationCodeSchema,
+	adminCreateUserSchema,
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 	loginSchema,
@@ -130,6 +132,7 @@ export {
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
 	createNarratorSchema,
+	createSetupAssistantSchema,
 	createWhitelistCmdSchema,
 	createWhitelistDirSchema,
 	editAndRegenerateJsonSchema,

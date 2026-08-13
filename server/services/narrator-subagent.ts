@@ -14,8 +14,12 @@
  * via the re-exports below.
  */
 
-// Background completion queue
-export { drainCompletedBackgroundSubagents } from "./bg-completion-queue";
+// Background completion queue.
+//
+// Enqueue only: completions now share the ordered `parent-injection-queue` with inbound
+// subagent messages, and `narrator-session.deliverPendingInjectionsInOrder` is its single
+// consumer — so there is no per-kind drain to re-export.
+export { pushBgCompletionNotification } from "./bg-completion-queue";
 
 // Alias registry
 export {

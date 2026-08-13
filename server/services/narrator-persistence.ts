@@ -8,12 +8,11 @@ import {
 	truncateCompactError,
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
-import { and, desc, eq, gte, inArray, isNull, like, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, like, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	narratorMessageRefs,
 	narratorMessages,
-	narratorSidecars,
 	narrators,
 	narratorToolCalls,
 	users,
@@ -304,34 +303,6 @@ function copyMessageForNarratorTx(
 					narratorId,
 					messageId: newMessageId,
 					createdAt: now,
-				})),
-			)
-			.run();
-	}
-
-	const originalToolUseIds = originalToolCalls.map((toolCall) => toolCall.toolUseId);
-	const originalSideCars = tx.query.narratorSidecars
-		.findMany({
-			where:
-				originalToolUseIds.length > 0
-					? or(
-							eq(narratorSidecars.messageId, messageId),
-							and(
-								eq(narratorSidecars.narratorId, original.narratorId),
-								inArray(narratorSidecars.toolUseId, originalToolUseIds),
-							),
-						)
-					: eq(narratorSidecars.messageId, messageId),
-		})
-		.sync();
-	if (originalSideCars.length > 0) {
-		tx.insert(narratorSidecars)
-			.values(
-				originalSideCars.map((sideCar) => ({
-					...sideCar,
-					id: generateId(),
-					narratorId,
-					messageId: newMessageId,
 				})),
 			)
 			.run();
@@ -655,7 +626,6 @@ export async function recoverStaleCompactingMessages(
 
 						if (refs.length === 0) {
 							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
-							tx.delete(narratorSidecars).where(eq(narratorSidecars.messageId, stale.id)).run();
 							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
 							return "deleted" as const;
 						}
@@ -672,7 +642,6 @@ export async function recoverStaleCompactingMessages(
 									.run();
 							}
 							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
-							tx.delete(narratorSidecars).where(eq(narratorSidecars.messageId, stale.id)).run();
 							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
 							return "deleted" as const;
 						}
@@ -730,7 +699,6 @@ export async function recoverStaleCompactingMessages(
 							.sync();
 						if (!remaining) {
 							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
-							tx.delete(narratorSidecars).where(eq(narratorSidecars.messageId, stale.id)).run();
 							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
 						}
 						return "preserved" as const;
@@ -2779,34 +2747,6 @@ export const narratorPersistence = {
 					.run();
 			}
 
-			const originalToolUseIds = originalToolCalls.map((tc) => tc.toolUseId);
-			const originalSideCars = tx.query.narratorSidecars
-				.findMany({
-					where:
-						originalToolUseIds.length > 0
-							? or(
-									eq(narratorSidecars.messageId, messageId),
-									and(
-										eq(narratorSidecars.narratorId, original.narratorId),
-										inArray(narratorSidecars.toolUseId, originalToolUseIds),
-									),
-								)
-							: eq(narratorSidecars.messageId, messageId),
-				})
-				.sync();
-			if (originalSideCars.length > 0) {
-				tx.insert(narratorSidecars)
-					.values(
-						originalSideCars.map((sideCar) => ({
-							...sideCar,
-							id: generateId(),
-							narratorId,
-							messageId: newMessageId,
-						})),
-					)
-					.run();
-			}
-
 			const narrator = tx.query.narrators
 				.findFirst({
 					where: eq(narrators.id, narratorId),
@@ -3000,7 +2940,7 @@ export const narratorPersistence = {
 		const ids = refs.map((r) => r.messageId);
 		const messages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true, sideCars: true },
+			with: { toolCalls: true },
 		});
 
 		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
@@ -3110,7 +3050,7 @@ export const narratorPersistence = {
 		const ids = refs.map((r) => r.messageId);
 		const messages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true, sideCars: true },
+			with: { toolCalls: true },
 		});
 
 		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));

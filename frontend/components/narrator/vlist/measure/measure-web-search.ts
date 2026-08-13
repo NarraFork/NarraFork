@@ -140,7 +140,7 @@ export function measureWebSearch(
 			text: query,
 			font: WEB_SEARCH_QUERY_FONT,
 			break: "normal",
-			extraWidth: WEB_SEARCH_QUERY_GAP,
+			extraWidth: 0,
 		});
 		classNames.push(WEB_SEARCH_QUERY_CLASS);
 		hrefs.push(null);

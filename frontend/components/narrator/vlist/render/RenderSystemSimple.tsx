@@ -12,13 +12,12 @@
  * Zero DOM measurement (heights come from the measure layer).
  */
 
-import { Badge, Group, Loader, Paper, Text } from "@mantine/core";
+import { Group, Loader, Paper, Text } from "@mantine/core";
 import {
 	IconAlertTriangle,
 	IconArrowsMinimize,
 	IconEyeCheck,
 	IconGitMerge,
-	IconLock,
 	IconX,
 } from "@tabler/icons-react";
 import {
@@ -97,9 +96,6 @@ export function RenderSystemSimple({
 			return <MergeSummaryRow data={data} height={height} avatarSlot={avatarSlot} />;
 		case "review_feedback":
 			return <ReviewFeedbackRow data={data} height={height} />;
-		case "spec_continuation":
-		case "spec_blocked_continuation":
-			return <SpecContinuationRow data={data} height={height} kind={kind} />;
 		default:
 			return null;
 	}
@@ -243,41 +239,9 @@ function ReviewFeedbackRow({ data, height }: { data: SystemSimpleData; height: n
 	);
 }
 
-// ── spec_continuation / spec_blocked_continuation: Paper p="xs" + truncate ───
-function SpecContinuationRow({
-	data,
-	height,
-	kind,
-}: {
-	data: SystemSimpleData;
-	height: number;
-	kind: "spec_continuation" | "spec_blocked_continuation";
-}) {
-	const color = data.color ?? (kind === "spec_blocked_continuation" ? "orange" : "indigo");
-	return (
-		<Paper
-			p="xs"
-			radius="sm"
-			style={{ backgroundColor: cssLight(color), height, boxSizing: "border-box" }}
-		>
-			<Group gap="xs" wrap="nowrap" h="100%" align="center">
-				{data.badgeLabel ? (
-					<Badge size="xs" color={color} variant="light">
-						{data.badgeLabel}
-					</Badge>
-				) : null}
-				{data.protected ? (
-					<Badge size="xs" color="yellow" variant="light" leftSection={<IconLock size={10} />}>
-						{"\u{1F512}"}
-					</Badge>
-				) : null}
-				<Text size="xs" c={color} truncate style={{ flex: 1 }}>
-					{data.text}
-				</Text>
-			</Group>
-		</Paper>
-	);
-}
+// ── spec_continuation / spec_blocked_continuation ────────────────────────────
+// Removed: the framed bubble now draws these as a task row itself (RenderSpecTask)
+// instead of nesting this full-width clamped band. The bubble path owns the row.
 
 /** Neutral 16px avatar placeholder (real UserAvatar lives outside vlist/). */
 function AvatarPlaceholder() {

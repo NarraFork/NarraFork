@@ -57,6 +57,14 @@ function mapAuthErrorCode(e: ApiError): string | null {
 		SSO_CODE_INVALID: "ssoCodeInvalid",
 		SSO_DOMAIN_DENIED: "ssoDomainDenied",
 		SSO_SIGNUP_DISABLED: "ssoSignupDisabled",
+		REGISTRATION_CLOSED: "registrationClosedError",
+		REGISTRATION_THROTTLED: retryAfter ? "registrationThrottledRetry" : "registrationThrottled",
+		USERNAME_TAKEN: "usernameTaken",
+		CODE_INVALID: "codeInvalid",
+		CODE_EXPIRED: "codeExpired",
+		CODE_ALREADY_USED: "codeAlreadyUsed",
+		CODE_REVOKED: "codeRevoked",
+		CODE_USERNAME_MISMATCH: "codeUsernameMismatch",
 	};
 	return mapping[code] ?? null;
 }
@@ -148,9 +156,13 @@ function LoginPage() {
 
 	const [username, setUsername] = useState("");
 	const [password, setPassword] = useState("");
+	const [registrationCode, setRegistrationCode] = useState("");
 	const [error, setError] = useState("");
 	const [loginRetrySeconds, startLoginRetry] = useRetryCountdown();
 	const [mfaRetrySeconds, startMfaRetry] = useRetryCountdown();
+	// Registration is throttled instance-wide, separately from login attempts, so
+	// it needs its own countdown rather than borrowing the login one.
+	const [registerRetrySeconds, startRegisterRetry] = useRetryCountdown();
 
 	// MFA second-step state
 	const [mfaToken, setMfaToken] = useState<string | null>(null);
@@ -218,7 +230,11 @@ function LoginPage() {
 	}
 
 	const needsSetup = authStatus && !authStatus.hasUsers;
-	const canRegister = authStatus?.registrationOpen || needsSetup;
+	// The register tab stays available even when public registration is closed:
+	// someone holding an invitation code needs somewhere to redeem it. The code
+	// field then becomes mandatory (see `codeRequired`).
+	const canRegister = !needsSetup;
+	const codeRequired = !needsSetup && authStatus?.registrationOpen === false;
 
 	const enterMfa = (challenge: MfaChallenge) => {
 		setMfaToken(challenge.mfaToken);
@@ -243,6 +259,8 @@ function LoginPage() {
 				(code === "AUTH_BUSY" && !!mfaToken)
 			) {
 				startMfaRetry(retryAfter);
+			} else if (code === "REGISTRATION_THROTTLED") {
+				startRegisterRetry(retryAfter);
 			} else if (code === "LOGIN_THROTTLED" || code === "AUTH_BUSY") {
 				startLoginRetry(retryAfter);
 			}
@@ -332,11 +350,17 @@ function LoginPage() {
 		if (u.length > 50) return t("usernameTooLong");
 		if (!/^[a-zA-Z0-9_-]+$/.test(u)) return t("usernameInvalidChars");
 		if (password.length < 8) return t("passwordTooShort");
-		if (password.length > 128) return t("passwordTooLong");
+		// Matches the server's bcrypt-bounded limit. Measured in BYTES, not characters:
+		// bcrypt hashes the first 72 bytes and discards the rest, which a CJK passphrase
+		// reaches at roughly 24 characters. Checked here so the user is told before the
+		// request instead of receiving a validation error back.
+		if (new TextEncoder().encode(password).byteLength > 72) return t("passwordTooLong");
+		if (codeRequired && !registrationCode.trim()) return t("registrationCodeRequired");
 		return null;
 	};
 
 	const handleRegister = async () => {
+		if (registerRetrySeconds > 0) return;
 		setError("");
 		const validationError = validateRegisterFields();
 		if (validationError) {
@@ -344,7 +368,12 @@ function LoginPage() {
 			return;
 		}
 		try {
-			await register.mutateAsync({ username, password, language: i18n.language });
+			await register.mutateAsync({
+				username,
+				password,
+				language: i18n.language,
+				code: registrationCode.trim() || undefined,
+			});
 			goToPostLogin();
 		} catch (e) {
 			handleError(e);
@@ -575,6 +604,11 @@ function LoginPage() {
 								{canRegister && (
 									<Tabs.Panel value="register" pt="sm">
 										<Stack>
+											{codeRequired && (
+												<Alert color="blue" variant="light">
+													<Text size="sm">{t("registrationClosedNeedsCode")}</Text>
+												</Alert>
+											)}
 											<TextInput
 												label={t("username")}
 												value={username}
@@ -587,12 +621,26 @@ function LoginPage() {
 												onChange={(e) => setPassword(e.currentTarget.value)}
 												onKeyDown={(e) => handleKeyDown(e, handleRegister)}
 											/>
+											<TextInput
+												label={codeRequired ? t("registrationCode") : t("registrationCodeOptional")}
+												description={codeRequired ? undefined : t("registrationCodeOptionalHint")}
+												value={registrationCode}
+												onChange={(e) => setRegistrationCode(e.currentTarget.value)}
+												onKeyDown={(e) => handleKeyDown(e, handleRegister)}
+											/>
 											<Button
 												onClick={handleRegister}
 												loading={register.isPending}
-												disabled={!username.trim() || !password}
+												disabled={
+													!username.trim() ||
+													!password ||
+													(codeRequired && !registrationCode.trim()) ||
+													registerRetrySeconds > 0
+												}
 											>
-												{t("register")}
+												{registerRetrySeconds > 0
+													? t("retryInSeconds", { seconds: registerRetrySeconds })
+													: t("register")}
 											</Button>
 										</Stack>
 									</Tabs.Panel>

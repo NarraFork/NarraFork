@@ -470,9 +470,12 @@ describe("agentLoop abort result draining", () => {
 			makeConfig(ac.signal, {
 				deferEagerToolsForSafeStop: true,
 				shouldStop: () => stopRequested,
-				getSideCars: async (request) => {
-					if (request.phase === "after_tools") stopRequested = true;
-					return [];
+				// The after-tools boundary is now reached through `getAfterToolsInjections`
+				// (the side-car phase of the same name is gone); the race this pins — user
+				// feedback landing between the last tool and the next request — is unchanged.
+				getAfterToolsInjections: () => {
+					stopRequested = true;
+					return "";
 				},
 			}),
 			"stop before the next provider turn",
@@ -678,14 +681,29 @@ describe("agentLoop abort result draining", () => {
 		expect(order).toEqual(["assistant_message", "permission"]);
 	});
 
-	test("宽松计划模式下非只读工具结果会注入计划提醒 sidecar", async () => {
+	test("宽松计划模式下的计划提醒不会污染工具输出，且被中断时不投递", async () => {
+		// The reminder used to be a side-car appended inside the tool result's string; it is
+		// now delivered as its own message row at the TURN BOUNDARY.
+		//
+		// That boundary is never reached when the user aborts mid-turn, so an aborted turn
+		// delivers nothing — which is the right outcome and self-correcting: the reminder is
+		// re-raised on the next non-read-only tool call, and nothing was persisted or
+		// acknowledged on the strength of a message the model never saw.
 		providerScenario = "abort";
 		providerAttempts = 0;
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
+		const delivered: string[] = [];
 
 		for await (const event of agentLoop(
-			makeConfig(ac.signal, { planMode: true, relaxedPlan: true }),
+			makeConfig(ac.signal, {
+				planMode: true,
+				relaxedPlan: true,
+				deliverInjectionRow: (injection) => {
+					delivered.push(injection.source);
+					return injection.content;
+				},
+			}),
 			"run tools while planning",
 			[],
 		)) {
@@ -699,11 +717,44 @@ describe("agentLoop abort result draining", () => {
 			(event): event is Extract<AgentEvent, { type: "tool_result" }> =>
 				event.type === "tool_result",
 		);
-		expect(toolResult?.sideCars?.some((sideCar) => sideCar.source === "relaxed_plan")).toBe(true);
-		expect(
-			toolResult?.sideCars?.some((sideCar) => sideCar.content.includes("<relaxed_plan_reminder>")),
-		).toBe(true);
+		// The invariant that matters either way: the reminder is never mixed into the tool
+		// output the reader sees. There is no longer any channel on the tool result that
+		// could carry it — `tool_result` has no injection field at all.
 		expect(toolResult?.output).not.toContain("<relaxed_plan_reminder>");
+		expect(delivered).not.toContain("relaxed_plan");
+	});
+
+	test("宽松计划模式下的计划提醒在回合边界作为独立消息行投递", async () => {
+		// The positive case: a turn that reaches its boundary hands the reminder to the host
+		// for persistence, and gets the text back to fold into the next request.
+		providerScenario = "soft_stop_serial";
+		providerAttempts = 0;
+		const ac = new AbortController();
+		const delivered: Array<{ source: string; content: string }> = [];
+		let stopAfterBoundary = false;
+
+		for await (const _event of agentLoop(
+			makeConfig(ac.signal, {
+				planMode: true,
+				relaxedPlan: true,
+				shouldStop: () => stopAfterBoundary,
+				deliverInjectionRow: (injection) => {
+					delivered.push({ source: injection.source, content: injection.content });
+					// Stop once the boundary has been reached, so the loop does not run on.
+					stopAfterBoundary = true;
+					return injection.content;
+				},
+			}),
+			"run tools while planning",
+			[],
+		)) {
+			// drain
+		}
+
+		expect(delivered.some((injection) => injection.source === "relaxed_plan")).toBe(true);
+		expect(
+			delivered.some((injection) => injection.content.includes("<relaxed_plan_reminder>")),
+		).toBe(true);
 	});
 
 	test("流式工具参数跨 chunk 的换行转义会被正确还原", async () => {

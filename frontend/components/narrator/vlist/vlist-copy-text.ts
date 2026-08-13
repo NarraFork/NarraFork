@@ -46,7 +46,7 @@
  * Only render/RenderMarkdown.tsx (with render/line-fragments.tsx) emits those
  * markers. Four other renderers paint prose as bare absolutely-positioned boxes:
  * `RenderMessageBubble` (user bubble body + slash-command expansion),
- * `RenderSystemText`, `RenderSidecar` and `RenderToolCall`'s detail bodies.
+ * `RenderSystemText`, `RenderInjectionBubble` and `RenderToolCall`'s detail bodies.
  *
  * Collecting ONLY marked nodes therefore silently DROPPED all of them the moment a
  * selection also touched one markdown line — a cross-message copy pasted the

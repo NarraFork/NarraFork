@@ -7,6 +7,7 @@ const persistedCalls: Array<Record<string, unknown>> = [];
 const conclusionCalls: Array<Record<string, unknown>> = [];
 const retriedToolCalls: Array<Record<string, unknown>> = [];
 const editedMessageCalls: Array<Record<string, unknown>> = [];
+const deleteMessagesAfterCalls: Array<Record<string, unknown>> = [];
 const foregroundResolvers = new Map<string, (output: string) => void>();
 const terminalResolvers = new Map<string, (output: string) => void>();
 let loadedTrailingToolResults: unknown[] = [];
@@ -115,10 +116,19 @@ beforeAll(async () => {
 						],
 			),
 			deleteMessagesAfter: mock(
-				(...args: Parameters<typeof realNarratorService.deleteMessagesAfter>) =>
-					isEditTestNarrator(args[0])
+				(...args: Parameters<typeof realNarratorService.deleteMessagesAfter>) => {
+					// Recorded because the rollback decision is invisible in the result:
+					// whether this truncation reverts files is carried entirely by the
+					// third argument, and dropping it silently reverts.
+					deleteMessagesAfterCalls.push({
+						narratorId: args[0],
+						messageId: args[1],
+						opts: args[2],
+					});
+					return isEditTestNarrator(args[0])
 						? realNarratorService.deleteMessagesAfter(...args)
-						: Promise.resolve({ deletedMessageIds: [] }),
+						: Promise.resolve({ deletedMessageIds: [] });
+				},
 			),
 			persistSubagentUserMessage: mock(
 				async (
@@ -306,6 +316,7 @@ afterEach(async () => {
 	conclusionCalls.length = 0;
 	retriedToolCalls.length = 0;
 	editedMessageCalls.length = 0;
+	deleteMessagesAfterCalls.length = 0;
 	loadedTrailingToolResults = [];
 	clearManualOverrideRuntimes();
 	foregroundResolvers.clear();
@@ -653,6 +664,55 @@ describe("resumeSubagent", () => {
 			revertFiles: false,
 			revertScope: "workspace",
 		});
+		await finishRun(subagentId);
+	});
+
+	// An edit resume rewrites its intent to `retry_last_input`, so the truncation the
+	// retry performs runs AFTER the edit already made (or deliberately skipped) the
+	// rollback. Reverting a second time would undo files the user asked to keep, and
+	// once the edit's regeneration is live it can fail on the workspace-write guard —
+	// surfacing as "something is writing to this workspace" for a rollback nobody
+	// asked for, with the edit already applied.
+	test("does not revert a second time when an edit resume becomes a retry", async () => {
+		const subagentId = "resume-edited-message-no-double-revert";
+
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "regenerate_edited_message",
+			actor: "user",
+			editMessageId: "user-message-to-edit",
+			editContent: "edited prompt",
+			editRevertFiles: false,
+			createdBy: "user-7",
+			locale: "en",
+		});
+
+		expect(result.started).toBe(true);
+		// The retry-side truncation must explicitly skip the rollback.
+		const retryTruncation = deleteMessagesAfterCalls.at(-1);
+		expect(retryTruncation?.narratorId).toBe(subagentId);
+		expect(retryTruncation?.opts).toMatchObject({ skipRevert: true });
+		await finishRun(subagentId);
+	});
+
+	// The default is load-bearing for the other callers of this intent (a plain
+	// retry, the Codex image-generation fix, recharge resume): they never edited
+	// anything, so their truncation must still roll files back.
+	test("a plain retry still reverts the truncated messages' file changes", async () => {
+		const subagentId = "resume-plain-retry-reverts";
+
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "retry_last_input",
+			actor: "user",
+			createdBy: "user-8",
+			locale: "en",
+		});
+
+		expect(result.started).toBe(true);
+		const truncation = deleteMessagesAfterCalls.at(-1);
+		expect(truncation?.narratorId).toBe(subagentId);
+		expect(truncation?.opts).toMatchObject({ skipRevert: false });
 		await finishRun(subagentId);
 	});
 

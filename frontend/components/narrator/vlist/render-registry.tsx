@@ -16,6 +16,7 @@
 import type { MeasuredElement } from "./prepared-block";
 import type { VListElementKind } from "./registry";
 import { RenderAskInPassing } from "./render/RenderAskInPassing";
+import { RenderInjectionBubble } from "./render/RenderInjectionBubble";
 import { RenderMarkdown } from "./render/RenderMarkdown";
 import { RenderMedia } from "./render/RenderMedia";
 import { RenderMessageBubble } from "./render/RenderMessageBubble";
@@ -23,7 +24,7 @@ import { RenderPruneDivider } from "./render/RenderMisc";
 import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPermission";
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
-import { RenderSidecar } from "./render/RenderSidecar";
+
 import { RenderSubagent } from "./render/RenderSubagent";
 import { RenderSubagentRecovery } from "./render/RenderSubagentRecovery";
 import { RenderSystemList } from "./render/RenderSystemList";
@@ -85,6 +86,26 @@ export function resolveRenderExtra(spec: {
 			// the integration layer wires onToggle (plain bubbles get no toggle).
 			if ("commandText" in data && data.commandText) extra.commandText = data.commandText;
 			break;
+		case "injection-bubble":
+			// Producer tag drives the accent rail; the speaker header is built by the
+			// integration layer (this layer imports no avatar), same as a user bubble.
+			if ("source" in data) extra.source = data.source;
+			if ("speaker" in data) extra.speaker = data.speaker;
+			// The real account behind the row, when there is one (a merge is authored by
+			// whoever pressed the button). Height-neutral: it only changes the avatar and
+			// name inside the already-reserved header row.
+			if ("creator" in data) extra.creator = data.creator;
+			if ("speakerKind" in data) extra.speakerKind = data.speakerKind;
+			if ("isBroadcast" in data) extra.isBroadcast = data.isBroadcast;
+			if ("hasNote" in data) extra.hasNote = data.hasNote;
+			// A framed payload's own data (a spec task's text/protected/blocked) is
+			// height-neutral: the measure pass already reserved its wrap. Forward it so
+			// the body renderer can paint the row without re-deriving the projection.
+			if ("payload" in data && data.payload && typeof data.payload === "object") {
+				const payloadData = (data.payload as { data?: unknown }).data;
+				if (payloadData && typeof payloadData === "object") extra.payloadData = payloadData;
+			}
+			break;
 		case "web-search":
 			// isSearching must be DERIVED from status (anything not "completed" is
 			// in-flight) — else a running search renders as done.
@@ -104,12 +125,6 @@ export function resolveRenderExtra(spec: {
 				extra.kind = data.kind;
 				extra.data = data;
 			}
-			break;
-		case "sidecar":
-			// The card's payload is fully composed by the adapter (source label /
-			// preview / full text); the fold toggle comes through opts and the copy
-			// tooltip through the standard render labels bundle (`extra.labels`).
-			extra.data = data;
 			break;
 		case "subagent-recovery":
 			// The measured block already carries the full payload; only the live
@@ -220,11 +235,22 @@ export function renderElement(
 					measured={m}
 					header={extra.header as React.ReactNode}
 					hasHeader={extra.hasHeader as boolean | undefined}
+					isSelf={extra.isSelf as boolean | undefined}
 					narratorId={extra.narratorId as string | undefined}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onOpenAttachment={extra.onOpenAttachment as ((filePath: string) => void) | undefined}
 					openAttachmentLabel={extra.openAttachmentLabel as string | undefined}
+				/>
+			);
+		case "injection-bubble":
+			return (
+				<RenderInjectionBubble
+					measured={m as never}
+					header={extra.header as React.ReactNode}
+					noteText={extra.noteText as string | undefined}
+					payloadData={extra.payloadData}
+					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 				/>
 			);
 		case "reasoning":
@@ -271,14 +297,6 @@ export function renderElement(
 					data={extra.data as never}
 					actions={extra.specCarryoverActions as never}
 					errorActions={extra.errorNoticeActions as never}
-				/>
-			);
-		case "sidecar":
-			return (
-				<RenderSidecar
-					measured={m}
-					onToggle={extra.onToggle as (() => void) | undefined}
-					labels={extra.labels as never}
 				/>
 			);
 		case "knowledge-hint":

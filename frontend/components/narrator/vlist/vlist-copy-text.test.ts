@@ -20,7 +20,7 @@
  * an `[data-vlist-inline-block]` per logical block with `[data-vlist-line]` per
  * VISUAL line inside it, `[data-vlist-caret-filler]` over blank strips, and
  * `[data-vlist-code-line]` for fenced code (whose newlines ARE in the source);
- * `RenderMessageBubble` / `RenderSystemText` / `RenderSidecar` paint one bare
+ * `RenderMessageBubble` / `RenderSystemText` / `RenderInjectionBubble` paint one bare
  * `position:absolute; white-space:pre` div per visual line; `RenderToolCall`'s
  * `CappedBodyBox` is ONE `white-space:pre-wrap` box whose newlines are real
  * characters.
@@ -61,8 +61,8 @@ const row = (inner: string, key = "r1") => `<div data-nf-row-key="${key}">${inne
 
 /**
  * One visual line of an UNMARKED body, exactly as RenderMessageBubble /
- * RenderSystemText / RenderSidecar paint it: absolutely positioned, `white-space:
- * pre`, no vlist marker of any kind.
+ * RenderSystemText / RenderInjectionBubble paint it: absolutely positioned,
+ * `white-space: pre`, no vlist marker of any kind.
  */
 const rawLine = (text: string) =>
 	`<div style="position:absolute;top:0;left:0;white-space:pre">${text}</div>`;
@@ -370,16 +370,15 @@ describe("a tool card's pre body keeps its own newlines and is not re-split", ()
 	});
 });
 
-describe("a sidecar body survives a mixed selection", () => {
-	it("copies the sidecar's positioned lines alongside markdown", async () => {
-		// RenderSidecar's SidecarBody paints one absolute div per pretext line with no
-		// marker, so the marker-only collector dropped the whole card whenever the
-		// selection also reached an assistant paragraph.
+describe("an injection body survives a mixed selection", () => {
+	it("copies the injection's positioned lines alongside markdown", async () => {
+		// RenderInjectionBubble paints one absolute div per pretext line with no marker,
+		// so the marker-only collector dropped the whole card whenever the selection also
+		// reached an assistant paragraph.
 		const root = mount(
-			row(block([line(["助手说明"])]), "a") +
-				row(bubbleBody(["sidecar 第一行", "sidecar 第二行"]), "sc"),
+			row(block([line(["助手说明"])]), "a") + row(bubbleBody(["注入第一行", "注入第二行"]), "sc"),
 		);
-		expect(await copyAll(root)).toBe("助手说明\nsidecar 第一行\nsidecar 第二行");
+		expect(await copyAll(root)).toBe("助手说明\n注入第一行\n注入第二行");
 	});
 
 	it("keeps the sidecar header chrome in reading order", async () => {

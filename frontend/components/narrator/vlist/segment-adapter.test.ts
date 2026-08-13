@@ -498,12 +498,27 @@ describe("adaptSegment — system message", () => {
 });
 
 describe("adaptSegment — system card body composition (height-critical)", () => {
+	/**
+	 * The card's own data projection.
+	 *
+	 * Some system cards are now WRAPPED in a speaker bubble (`injection-bubble`), which
+	 * carries the card's data untouched under `payload.data`. These assertions are about
+	 * the projection, not the wrapping, so unwrap one level when present — that keeps them
+	 * testing the same property before and after the framing change.
+	 */
 	const sysData = (
 		contentJson: Array<{ type: string; [key: string]: unknown }>,
 		ctx: AdapterContext = CTX,
 		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
-	): any =>
-		adaptSegment({ kind: "message", msg: { id: "s", role: "system", contentJson } }, ctx)[0]!.data;
+	): any => {
+		const spec = adaptSegment(
+			{ kind: "message", msg: { id: "s", role: "system", contentJson } },
+			ctx,
+		)[0]!;
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		const data = spec.data as any;
+		return spec.kind === "injection-bubble" ? data.payload.data : data;
+	};
 
 	it("info: reads block.message (not empty block.text) as the wrapping body", () => {
 		// persistDisplayMessage writes `[{ type: "info", message }]` with role=disp;
@@ -569,19 +584,44 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		expect(data.badges[1]).toBe("Already tracked");
 	});
 
-	it("spec_continuation: reads block.task + protected flag + badge label", () => {
-		const data = sysData([{ type: "spec_continuation", task: "Wire the flag", protected: true }]);
-		expect(data.kind).toBe("spec_continuation");
-		expect(data.text).toBe("Wire the flag");
-		expect(data.protected).toBe(true);
-		expect(data.badgeLabel).toBe("Task");
-		expect(data.color).toBe("indigo");
+	it("spec_continuation: framed as a bubble task row (glyph + lock + wrapping text)", () => {
+		// The Dynamic Spec continuation is a framed BUBBLE whose body is a task row the
+		// bubble draws itself — not the clamped single-line card it used to nest.
+		const spec = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "s",
+					role: "system",
+					contentJson: [{ type: "spec_continuation", task: "Wire the flag", protected: true }],
+				},
+			},
+			CTX,
+		)[0]!;
+		expect(spec.kind).toBe("injection-bubble");
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		const payload = (spec.data as any).payload;
+		expect(payload.kind).toBe("spec-task");
+		expect(payload.data).toEqual({ text: "Wire the flag", protected: true, blocked: false });
 	});
 
-	it("spec_blocked_continuation: orange color + blocked badge", () => {
-		const data = sysData([{ type: "spec_blocked_continuation", task: "Blocked task" }]);
-		expect(data.color).toBe("orange");
-		expect(data.badgeLabel).toBe("Blocked");
+	it("spec_blocked_continuation: blocked flag flips the task row's tone", () => {
+		const spec = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "s",
+					role: "system",
+					contentJson: [{ type: "spec_blocked_continuation", task: "Blocked task" }],
+				},
+			},
+			CTX,
+		)[0]!;
+		expect(spec.kind).toBe("injection-bubble");
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		const payload = (spec.data as any).payload;
+		expect(payload.kind).toBe("spec-task");
+		expect(payload.data).toEqual({ text: "Blocked task", protected: false, blocked: true });
 	});
 
 	it("spec_fork_carryover: composes a summary description from counts", () => {
@@ -968,6 +1008,89 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		});
 		expect("prompt" in data).toBe(false);
 		expect(data.isBackground).toBe(false);
+	});
+
+	// ── conclusion body (the shared extraction rule) ────────────────────────────
+	// This block used to accept ONLY a bare-string `outputJson`, so the ~43% of real
+	// rows whose output is the runner's `{_text, _metadata}` envelope produced a
+	// finished card with a blank conclusion — no result body expanded, no preview
+	// line collapsed.
+	it("extracts resultText from a bare-string output, stripping the addressing tag", () => {
+		const data = subagentData({
+			toolName: "Task",
+			status: "success",
+			inputJson: { description: "d" },
+			outputJson: "<subagent_id>abc</subagent_id>\n\nthe conclusion",
+		});
+		expect(data.resultText).toBe("the conclusion");
+		expect(data.resultPreview).toBe("the conclusion");
+	});
+
+	it("extracts resultText from the {_text, _metadata} envelope output", () => {
+		const data = subagentData({
+			toolName: "Task",
+			status: "success",
+			inputJson: { description: "d" },
+			outputJson: {
+				_text: "<subagent_id>abc</subagent_id>\n\n# 结论\n\n正文",
+				_metadata: { execDurationMs: 31 },
+			},
+		});
+		expect(data.resultText).toBe("# 结论\n\n正文");
+		expect(data.resultPreview).toBe("# 结论\n\n正文");
+	});
+
+	it("shows a truncated envelope body as its preview rather than a JSON dump", () => {
+		const data = subagentData({
+			toolName: "Task",
+			status: "success",
+			inputJson: { description: "d" },
+			outputJson: { _text: { _truncated: true, preview: "cut body", fullLength: 9000 } },
+		});
+		expect(data.resultText).toBe("cut body");
+	});
+
+	it("caps resultPreview at 120 chars while resultText keeps the full body", () => {
+		const body = "y".repeat(300);
+		const data = subagentData({
+			toolName: "Task",
+			status: "success",
+			inputJson: { description: "d" },
+			outputJson: { _text: body },
+		});
+		expect(data.resultText).toBe(body);
+		expect(data.resultPreview).toBe(body.slice(0, 120));
+	});
+
+	it("omits resultText when the output carries nothing readable (no fabrication)", () => {
+		for (const outputJson of [null, undefined, "<subagent_id>only-a-tag</subagent_id>"]) {
+			const data = subagentData({
+				toolName: "Task",
+				status: "success",
+				inputJson: { description: "d" },
+				outputJson,
+			});
+			expect(data.resultText).toBeUndefined();
+			expect(data.resultPreview).toBeUndefined();
+		}
+	});
+
+	it("substitutes the fetched full output once the shell resolved it", () => {
+		const ctx: AdapterContext = {
+			...CTX,
+			resolveFullToolOutput: () => ({ _text: "the complete conclusion" }),
+		};
+		const data = subagentData(
+			{
+				toolName: "Task",
+				status: "success",
+				toolUseId: "tu-full",
+				inputJson: { description: "d" },
+				outputJson: { _text: { _truncated: true, preview: "cut", fullLength: 9000 } },
+			},
+			ctx,
+		);
+		expect(data.resultText).toBe("the complete conclusion");
 	});
 
 	it("remains height-safe: measureSubagentCard consumes the enriched data", async () => {
@@ -2341,310 +2464,5 @@ describe("adaptSegment — per-turn usage rows", () => {
 		);
 		expect(short.height).toBe(long.height);
 		expect(short.height).toBeGreaterThan(0);
-	});
-});
-
-describe("adaptSegment — side-car footnotes", () => {
-	const sidecarMsg = (
-		role: string,
-		sideCars: Array<Record<string, unknown>>,
-		over: Record<string, unknown> = {},
-	): AdapterSegment => ({
-		kind: "message",
-		msg: {
-			id: "m1",
-			role,
-			contentJson: [{ type: "text", text: "body" }],
-			// The records are structurally AdapterSidecar; the test builds plain literals.
-			sideCars: sideCars as never,
-			...over,
-		},
-	});
-
-	it("assistant message: one footnote per visible user_message record, trailing the body", () => {
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [
-				{ target: "user_message", source: "silent_progress", content: "note one" },
-				{ target: "user_message", source: "bg_agent", content: "agent done" },
-			]),
-			CTX,
-		);
-		expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar", "sidecar"]);
-		const first = specs[1]!.data as { source: string; fullText: string };
-		expect(first.source).toBe("silent_progress");
-		// `fullText` is what the MODEL saw — the copy button's payload, never measured.
-		expect(first.fullText).toBe("note one");
-	});
-
-	it("filters out tool_result records and empty content", () => {
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [
-				{ target: "tool_result", source: "x", content: "goes on the tool card" },
-				{ target: "user_message", source: "y", content: "   " },
-				{ target: "user_message", source: "z", content: "kept" },
-			]),
-			CTX,
-		);
-		expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar"]);
-	});
-
-	it("user bubble: footnotes trail the bubble", () => {
-		const specs = adaptSegment(
-			sidecarMsg("user", [{ target: "user_message", source: "group_message", content: "hi" }]),
-			CTX,
-		);
-		expect(specs.map((s) => s.kind)).toEqual(["message-bubble", "sidecar"]);
-	});
-
-	it("origin_notice branch: footnotes still surface (chunk parity)", () => {
-		const specs = adaptSegment(
-			sidecarMsg("user", [{ target: "user_message", source: "bg_bash", content: "done" }], {
-				origin: "system",
-			}),
-			CTX,
-		);
-		expect(specs.map((s) => s.kind)).toEqual(["system-text", "sidecar"]);
-	});
-
-	it("opts carry the per-record fold state from ctx.isExpanded", () => {
-		const ctx: AdapterContext = { lod: 5, isExpanded: (key) => key === "m1-sc0" };
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
-			ctx,
-		);
-		expect(specs[1]!.opts?.expanded).toBe(true);
-	});
-
-	it("defaults the fold state to false, even for an `open` tone", () => {
-		// `open` is a SHAPE the measure layer draws, NOT a default fold. Defaulting the
-		// state to true would break the toggle for a tool card's footnotes, whose fold
-		// lives under a sub-key with no measured entry: the first click would compute
-		// `false` and write `true`, i.e. do nothing visible.
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [
-				{
-					target: "user_message",
-					source: "subagent_message",
-					content: "peer text",
-					// A structured body is required to reach `open` at all: a raw row always
-					// folds (unknown shape, unknown length).
-					body: { kind: "messages", items: [{ fromId: "n1", text: "peer text" }] },
-				},
-			]),
-			{ lod: 5 },
-		);
-		expect((specs[1]!.data as { form: string }).form).toBe("open");
-		expect(specs[1]!.opts?.expanded).toBe(false);
-	});
-
-	// ── ONE form at every LOD (the low-LOD trace variant is gone) ──────────────
-	it("produces the same `sidecar` kind at EVERY lod", () => {
-		// There used to be two forms — a bare trace below L4, a Paper card at/above it —
-		// which meant two measure paths, two render branches and two fold channels for
-		// one concept. The footnote is light enough everywhere that the split bought
-		// nothing, and it was a standing source of "the row does not open" bugs.
-		for (const lod of [1, 2, 3, 4, 5, 6] as const) {
-			const specs = adaptSegment(
-				sidecarMsg("assistant", [
-					{ target: "user_message", source: "silent_progress", content: "one" },
-					{ target: "user_message", source: "bg_agent", content: "two" },
-				]),
-				{ lod },
-			);
-			expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar", "sidecar"]);
-			// And always on the key-addressed fold channel, never `expandedIndices`.
-			expect(specs[1]!.opts?.expandedIndices).toBeUndefined();
-		}
-	});
-
-	// ── structured body vs. verbatim fallback ─────────────────────────────────
-	it("projects a STRUCTURED body into lines, dropping the model-facing text", () => {
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [
-				{
-					target: "user_message",
-					source: "living_work_spec",
-					// What the model was shown: heading + task lines + instruction boilerplate.
-					content:
-						"Current Dynamic Spec reminder (compiled from spec://tasks.json):\n- doing: ship it\nDo not add IDs, timestamps, or notes fields to tasks.json.",
-					body: {
-						kind: "tasks",
-						variant: "current",
-						tasks: [{ role: "doing", text: "ship it" }],
-					},
-				},
-			]),
-			CTX,
-		);
-		const data = specs[1]!.data as {
-			isRaw: boolean;
-			lines: Array<{ kind: string; text: string }>;
-			fullText: string;
-		};
-		expect(data.isRaw).toBe(false);
-		expect(data.lines).toHaveLength(1);
-		expect(data.lines[0]!.kind).toBe("bullet");
-		expect(data.lines[0]!.text).toContain("ship it");
-		// The instruction boilerplate reaches the copy payload but never a drawn line.
-		expect(data.lines.map((l) => l.text).join("\n")).not.toContain("Do not add IDs");
-		expect(data.fullText).toContain("Do not add IDs");
-	});
-
-	it("shows a row with NO body verbatim, with zero unwrapping", () => {
-		// The whole compatibility story for pre-structured rows: they look exactly as
-		// they always did. No XML unwrapping, no prefix stripping, no bullet detection.
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [
-				{
-					target: "user_message",
-					source: "silent_progress",
-					content:
-						"<progress_update_request>\nYou have completed 20 tool calls.\n</progress_update_request>",
-				},
-			]),
-			CTX,
-		);
-		const data = specs[1]!.data as { isRaw: boolean; lines: Array<{ text: string }>; form: string };
-		expect(data.isRaw).toBe(true);
-		expect(data.lines.map((l) => l.text)).toEqual([
-			"<progress_update_request>",
-			"You have completed 20 tool calls.",
-			"</progress_update_request>",
-		]);
-		// A raw body is of unknown shape and length, so it must not open unprompted.
-		expect(data.form).toBe("folded");
-	});
-
-	it("reads a DB-shaped row's body from `bodyJson` as well as `body`", () => {
-		// HTTP-loaded rows carry the DB column name; WS payloads carry `body`.
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [
-				{
-					target: "user_message",
-					source: "behavior_fence",
-					content: "Behavior fence (…):\nNo force pushes.",
-					bodyJson: { kind: "prose", text: "No force pushes." },
-				},
-			]),
-			CTX,
-		);
-		const data = specs[1]!.data as { isRaw: boolean; lines: Array<{ text: string }> };
-		expect(data.isRaw).toBe(false);
-		expect(data.lines.map((l) => l.text)).toEqual(["No force pushes."]);
-	});
-
-	it("labels the two sources that were never mapped before", () => {
-		// The server has always pushed these, but neither SOURCE_META table listed them,
-		// so they rendered as raw snake_case tags.
-		const labels = { sidecarSourceBehaviorFence: "Behavior fence" };
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [{ target: "user_message", source: "behavior_fence", content: "x" }]),
-			{ lod: 5, labels },
-		);
-		expect((specs[1]!.data as { sourceLabel: string }).sourceLabel).toBe("Behavior fence");
-	});
-
-	it("falls back to the raw tag for a source nobody has mapped", () => {
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [{ target: "user_message", source: "brand_new", content: "x" }]),
-			CTX,
-		);
-		const data = specs[1]!.data as { sourceLabel: string; tone: string; form: string };
-		expect(data.sourceLabel).toBe("brand_new");
-		expect(data.tone).toBe("neutral");
-		expect(data.form).toBe("folded");
-	});
-
-	it("measures through the registry: collapsed is the constant bare row", () => {
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [
-				{
-					target: "user_message",
-					source: "silent_progress",
-					content: "note",
-					body: { kind: "prose", text: "line one\nline two" },
-				},
-			]),
-			CTX,
-		);
-		const measured = VLIST_REGISTRY.sidecar.measure(specs[1]!.data, 600, 5, specs[1]!.opts);
-		expect(measured.height).toBeGreaterThan(0);
-		const open = VLIST_REGISTRY.sidecar.measure(specs[1]!.data, 600, 5, { expanded: true });
-		expect(open.height).toBeGreaterThan(measured.height);
-	});
-});
-
-describe("adaptToolRun — tool-result + tool-only-message sidecars", () => {
-	const toolItem = (
-		toolUseId: string,
-		sideCars: unknown[] | undefined,
-		msg?: { id?: string; contentJson?: unknown[]; sideCars?: unknown[] },
-	) =>
-		({
-			blockIndex: 0,
-			isSubagent: false,
-			tc: { toolName: "Bash", status: "success", toolUseId, sideCars },
-			...(msg ? { msg: { role: "assistant", ...msg } } : {}),
-		}) as never;
-
-	it("tool card data carries tool_result sidecars as mini-card payloads", () => {
-		const specs = adaptSegments(
-			[
-				{
-					kind: "tool-run",
-					sourceMessages: [],
-					items: [
-						toolItem("tu1", [
-							{ target: "tool_result", source: "silent_progress", content: "injected" },
-						]),
-					],
-				},
-			],
-			{ lod: 6 },
-		);
-		const card = specs[0]!.data as { sidecars?: { fullText: string }[] | null };
-		expect(card.sidecars).toHaveLength(1);
-		expect(card.sidecars?.[0]?.fullText).toBe("injected");
-	});
-
-	it("a tool-only source message's user_message sidecars trail the run", () => {
-		const specs = adaptSegments(
-			[
-				{
-					kind: "tool-run",
-					sourceMessages: [],
-					items: [
-						toolItem("tu1", undefined, {
-							id: "src1",
-							contentJson: [{ type: "tool_use" }],
-							sideCars: [{ target: "user_message", source: "bg_agent", content: "done" }],
-						}),
-					],
-				},
-			],
-			{ lod: 6 },
-		);
-		expect(specs.map((s) => s.kind)).toEqual(["tool-call", "sidecar"]);
-	});
-
-	it("a source message WITH visible content is NOT duplicated into the run", () => {
-		const specs = adaptSegments(
-			[
-				{
-					kind: "tool-run",
-					sourceMessages: [],
-					items: [
-						toolItem("tu1", undefined, {
-							id: "src1",
-							// visible text block → the bubble segment renders the sidecar instead.
-							contentJson: [{ type: "text", text: "answer" }, { type: "tool_use" }],
-							sideCars: [{ target: "user_message", source: "bg_agent", content: "done" }],
-						}),
-					],
-				},
-			],
-			{ lod: 6 },
-		);
-		expect(specs.map((s) => s.kind)).toEqual(["tool-call"]);
 	});
 });

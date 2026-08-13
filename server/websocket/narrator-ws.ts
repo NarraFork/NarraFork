@@ -1250,7 +1250,7 @@ export const handleNarratorWS = {
 					}
 				}
 				if (bufResult.ok) {
-					let messages: Array<{ id: string; text: string; bufferedAt: string }>;
+					let messages: ReturnType<typeof toBufferSummary>;
 					if (usedSubagent) {
 						const { getSubagentBufferedMessages } = await import("../services/narrator-subagent");
 						messages = toBufferSummary(getSubagentBufferedMessages(msg.narratorId));

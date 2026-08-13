@@ -3,6 +3,7 @@
 
 import { writeFile } from "node:fs/promises";
 import type { KeyInput, Page } from "puppeteer-core";
+import { logger } from "../logger";
 import { cleanHtml } from "../web-fetch/dom";
 import { serializeBrowserValue } from "./serialization";
 import type { BrowserConsoleMessage, BrowserNetworkRequest, BrowserSession } from "./session";
@@ -10,6 +11,14 @@ import { drainConsoleCaptures, touchSession, touchSessionVisual } from "./sessio
 
 const DEFAULT_MAX_LENGTH = 20_000;
 const DEFAULT_ACTION_TIMEOUT = 10_000;
+/**
+ * Per-attempt budget for `Page.captureScreenshot`. Chrome can wedge this command indefinitely
+ * (occluded/minimized headed window, lost GPU surface, crashed target). Without an explicit
+ * per-call budget the request only fails after puppeteer's 180s connection-wide protocolTimeout,
+ * which is long enough for the UI's auto-refresh to stack several doomed captures behind
+ * puppeteer's per-context screenshot mutex.
+ */
+const SCREENSHOT_ATTEMPT_TIMEOUT_MS = 15_000;
 
 /** Snapshot of page state returned after most actions. */
 export interface PageSnapshot {
@@ -270,24 +279,135 @@ export async function hover(
 	return { snapshot: await snapshot(session.page) };
 }
 
-/** Take a screenshot of the current page. */
+/** In-flight capture per session, so concurrent callers share one Chrome round-trip. */
+const inFlightScreenshots = new WeakMap<
+	BrowserSession,
+	{ key: string; promise: Promise<ScreenshotResult> }
+>();
+
+export interface ScreenshotResult {
+	base64: string;
+	width: number;
+	height: number;
+}
+
+function isRetryableScreenshotError(err: unknown): boolean {
+	const message = errorToMessage(err);
+	// "Internal error" is what Chrome reports when the compositor cannot produce a frame
+	// (occluded/minimized headed window, lost GPU surface). A surface-free capture usually works.
+	return /internal error|timed out|not in the main frame|unable to capture/i.test(message);
+}
+
+async function captureViaCdp(
+	session: BrowserSession,
+	opts: { fullPage: boolean; fromSurface?: boolean; bringToFront: boolean; timeout: number },
+): Promise<ScreenshotResult> {
+	const { page } = session;
+	const { timeout } = opts;
+	const viewport = page.viewport();
+	const fallbackWidth = viewport?.width ?? 1280;
+	const fallbackHeight = viewport?.height ?? 900;
+
+	const client = await runWithTimeout(page.createCDPSession(), {
+		timeout,
+		label: "Browser screenshot setup",
+	});
+
+	try {
+		if (opts.bringToFront) {
+			// A headed window that lost focus can refuse to produce frames; ignore failures.
+			await runWithTimeout(client.send("Page.bringToFront"), {
+				timeout,
+				label: "Browser bringToFront",
+			}).catch(() => {});
+		}
+
+		let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined;
+		let width = fallbackWidth;
+		let height = fallbackHeight;
+		if (opts.fullPage) {
+			const metrics = await client.send("Page.getLayoutMetrics", undefined, { timeout });
+			const content = metrics.cssContentSize ?? metrics.contentSize;
+			if (content) {
+				width = Math.max(1, Math.ceil(content.width));
+				height = Math.max(1, Math.ceil(content.height));
+				clip = { x: 0, y: 0, width, height, scale: 1 };
+			}
+		}
+
+		// `timeout` here is puppeteer's per-command budget; runWithTimeout guards the case where
+		// the callback never settles at all (e.g. a detached transport that swallows the reply).
+		const { data } = await runWithTimeout(
+			client.send(
+				"Page.captureScreenshot",
+				{
+					format: "png",
+					...(opts.fromSurface === undefined ? {} : { fromSurface: opts.fromSurface }),
+					...(clip ? { clip, captureBeyondViewport: true } : {}),
+				},
+				{ timeout },
+			),
+			{ timeout, label: "Browser screenshot" },
+		);
+
+		return { base64: data, width, height };
+	} finally {
+		// Detaching can itself hang if the target is wedged; never let cleanup block the caller.
+		void runWithTimeout(client.detach(), {
+			timeout,
+			label: "Browser screenshot teardown",
+		}).catch(() => {});
+	}
+}
+
+/**
+ * Take a screenshot of the current page.
+ *
+ * Uses a dedicated CDP session with a per-command timeout instead of `page.screenshot()`, which
+ * is only bounded by puppeteer's connection-wide 180s protocolTimeout and serializes every capture
+ * in a context behind one mutex. A wedged capture there stalls all later callers for minutes.
+ */
 export async function screenshot(
 	session: BrowserSession,
-	opts?: { fullPage?: boolean },
-): Promise<{ base64: string; width: number; height: number }> {
+	opts?: { fullPage?: boolean; timeout?: number },
+): Promise<ScreenshotResult> {
 	touchSession(session);
-	const { page } = session;
-	const viewport = page.viewport();
-	const buffer = await page.screenshot({
-		type: "png",
-		fullPage: opts?.fullPage ?? false,
-		encoding: "binary",
-	});
-	return {
-		base64: Buffer.from(buffer as Uint8Array).toString("base64"),
-		width: viewport?.width ?? 1280,
-		height: viewport?.height ?? 900,
-	};
+	const fullPage = opts?.fullPage ?? false;
+	const timeout = opts?.timeout && opts.timeout > 0 ? opts.timeout : SCREENSHOT_ATTEMPT_TIMEOUT_MS;
+	const key = fullPage ? "full" : "viewport";
+
+	// Repeated captures of the same page share one round-trip. The panel auto-refreshes on every
+	// visual-change event, and a client abort cannot cancel work already running inside Chrome.
+	const existing = inFlightScreenshots.get(session);
+	if (existing && existing.key === key) return existing.promise;
+
+	const promise = (async () => {
+		try {
+			return await captureViaCdp(session, { fullPage, bringToFront: false, timeout });
+		} catch (err) {
+			if (!isRetryableScreenshotError(err)) throw err;
+			logger.warn("Browser screenshot failed, retrying without surface capture", {
+				narratorId: session.narratorId,
+				sessionId: session.id,
+				error: errorToMessage(err).slice(0, 300),
+			});
+			return await captureViaCdp(session, {
+				fullPage,
+				fromSurface: false,
+				bringToFront: !session.headless,
+				timeout,
+			});
+		}
+	})();
+
+	inFlightScreenshots.set(session, { key, promise });
+	try {
+		return await promise;
+	} finally {
+		if (inFlightScreenshots.get(session)?.promise === promise) {
+			inFlightScreenshots.delete(session);
+		}
+	}
 }
 
 /** Get text content of an element. */

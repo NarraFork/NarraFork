@@ -5,6 +5,7 @@ import {
 	MIN_HANDLE_LENGTH,
 } from "@shared/narrator-handle";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
+import { MAX_EDIT_ATTACHMENTS_PER_TYPE } from "@shared/text-file-types";
 import { z } from "zod";
 import { permissionModeSchema } from "../permission-modes";
 import { legacyRuleDeviceScopeSchema, pathFlavorSchema, ruleTargetSelectorSchema } from "./common";
@@ -86,9 +87,25 @@ export const createNarratorSchema = z.object({
 	// mentionable via @handle in any session.
 	makeNamed: z.boolean().optional(),
 	handle: narratorHandleSchema.optional(),
-	// Specialized standalone narrator kind. "knowledge" → Knowledge Steward (knowledge-base mgmt):
-	// preinstalls the knowledge toolset and a steward system prompt. Must be standalone.
-	kind: z.enum(["knowledge"]).optional(),
+	// Specialized standalone narrator kind. Both must be standalone.
+	//   "knowledge" → Knowledge Steward (knowledge-base mgmt): preinstalls the knowledge
+	//                 toolset and a steward system prompt.
+	//   "setup"     → Setup Assistant (installs missing system dependencies): preinstalls
+	//                 Terminal and a setup-assistant system prompt.
+	kind: z.enum(["knowledge", "setup"]).optional(),
+});
+
+/**
+ * Spawn a Setup Assistant narrator.
+ *
+ * `authorization` is how much authority the user grants it:
+ *   "full"    → bypassPermissions + strict danger reflection (no approval cards,
+ *               but the agent must still justify non-read-only work)
+ *   "default" → normal permission mode; sudo/package commands ask each time
+ * Declining is not a value here — the client simply does not call this endpoint.
+ */
+export const createSetupAssistantSchema = z.object({
+	authorization: z.enum(["full", "default"]).default("default"),
 });
 
 /** Update a narrator's handle (rename / claim / clear a named narrator handle). */
@@ -239,8 +256,26 @@ export const updateBlacklistCmdSchema = z.object({
 
 // === Buffered messages ===
 
+/**
+ * Edit one queued message.
+ *
+ * `text` is optional because an attachment carries a message on its own: an edit
+ * may legitimately clear the wording while keeping the images. The route rejects
+ * the case where BOTH text and attachments end up empty.
+ *
+ * Both keep lists are "omitted = keep everything" (so existing text-only clients
+ * never lose attachments) and "given = keep exactly these". Text files are
+ * identified positionally, not by name: the primary queue persists with
+ * `basename` so names are unique there, but a taken-over subagent's queue holds
+ * the original File objects where two same-named files can coexist.
+ */
 export const updateBufferedMessageSchema = z.object({
-	text: z.string().min(1).max(100_000),
+	text: z.string().max(100_000).optional(),
+	keepImageIds: z.array(z.string().min(1)).max(MAX_EDIT_ATTACHMENTS_PER_TYPE).optional(),
+	keepTextFiles: z
+		.array(z.object({ index: z.number().int().min(0), filename: z.string().min(1) }))
+		.max(MAX_EDIT_ATTACHMENTS_PER_TYPE)
+		.optional(),
 });
 
 export const reorderBufferSchema = z.object({

@@ -12,6 +12,16 @@ mock.module("../../../server/db", () => ({ db, sqlite }));
 let mockCommits: Array<{ sha: string }> = [];
 let mockTotalCommitCount = 0;
 let getCommitCountCalls: string[] = [];
+/** Args the route passed to `getLog`, so the paging offset is observable. */
+let getLogCalls: Array<{ limit?: number; skip?: number; branch?: string }> = [];
+/**
+ * Cursor → log index, as `findCommitLogIndex` would answer it.
+ *
+ * Deliberately NOT derived from `getCommitCount`: conflating those two measurements is the
+ * bug this mock's shape exists to keep out. A cursor missing from the map answers null,
+ * which is the real "not in this walk" case.
+ */
+let mockLogIndexBySha: Map<string, number> = new Map();
 
 mock.module("../../../server/services/git-service", () => ({
 	gitService: {
@@ -19,7 +29,14 @@ mock.module("../../../server/services/git-service", () => ({
 			getCommitCountCalls.push(ref);
 			return mockTotalCommitCount;
 		},
-		getLog: async () => mockCommits,
+		getLog: async (
+			_gitPath: string,
+			opts: { limit?: number; skip?: number; branch?: string } = {},
+		) => {
+			getLogCalls.push(opts);
+			return mockCommits;
+		},
+		findCommitLogIndex: async (_gitPath: string, sha: string) => mockLogIndexBySha.get(sha) ?? null,
 	},
 }));
 
@@ -34,6 +51,8 @@ beforeEach(() => {
 	mockCommits = [{ sha: "sha-a" }, { sha: "sha-b" }, { sha: "sha-c" }];
 	mockTotalCommitCount = mockCommits.length;
 	getCommitCountCalls = [];
+	getLogCalls = [];
+	mockLogIndexBySha = new Map(mockCommits.map((c, i) => [c.sha, i]));
 });
 
 afterEach(() => cleanDb(sqlite));
@@ -162,6 +181,73 @@ describe("ruler routes", () => {
 		expect(body.mergedChapters).toEqual([
 			expect.objectContaining({ id: "ch-merged", narratorId: null, mergeCommitSha: "sha-merge" }),
 		]);
+	});
+
+	// ── Paging offsets ────────────────────────────────────────────────────────
+	//
+	// `git log` is newest-first: offset 0 is HEAD and grows towards OLDER history. The
+	// response used to name these ends backwards (`oldestLoadedIndex` for `skip`), and the
+	// client paged against those names — so the first page claimed there was nothing older
+	// and "load older commits" never appeared. On a repository longer than one page every
+	// chapter anchored past the window then lost its tick and was reported as being on
+	// another branch.
+
+	it("reports the first page's offsets as HEAD-ward, not oldest-ward", async () => {
+		seedProject();
+
+		const res = await app.request("/p1/ruler");
+		const body = (await res.json()) as { firstOffset: number; lastOffset: number };
+
+		// skip=0 fetched the NEWEST commits, so this page starts at offset 0 and its last
+		// commit is deeper in history — never the reverse.
+		expect(body.firstOffset).toBe(0);
+		expect(body.lastOffset).toBe(2);
+	});
+
+	it("an empty page past HEAD reports lastOffset below firstOffset", async () => {
+		// The degenerate end of the walk. `firstOffset - 1` is what makes the client's
+		// "no cursor → no further paging" guard reachable rather than theoretical.
+		seedProject();
+		mockCommits = [];
+
+		const res = await app.request("/p1/ruler?skip=500");
+		const body = (await res.json()) as { firstOffset: number; lastOffset: number };
+
+		expect(body.firstOffset).toBe(500);
+		expect(body.lastOffset).toBe(499);
+	});
+
+	it("[REGRESSION] resolves a cursor by log position, not by reachability count", async () => {
+		// `getCommitCount` is mocked to the TOTAL (3) here, which is precisely the value the
+		// old implementation would have used as the cursor's index. The log index of "sha-b"
+		// is 1, so a correct route pages from skip=2 and a regressed one from skip=4.
+		seedProject();
+
+		const res = await app.request("/p1/ruler?cursor=sha-b&direction=older");
+
+		expect(res.status).toBe(200);
+		expect(getLogCalls.at(-1)?.skip).toBe(2);
+		const body = (await res.json()) as { firstOffset: number };
+		expect(body.firstOffset).toBe(2);
+	});
+
+	it("pages towards newer history by stepping back a full page from the cursor", async () => {
+		seedProject();
+
+		await app.request("/p1/ruler?cursor=sha-c&direction=newer&limit=2");
+
+		// Cursor "sha-c" is at index 2; one page of 2 back is offset 0, clamped at zero.
+		expect(getLogCalls.at(-1)?.skip).toBe(0);
+	});
+
+	it("keeps the requested skip when the cursor is not in this walk", async () => {
+		// Rewritten history, another ref, a deleted branch. Guessing an offset from a
+		// position we do not have is how a page silently addresses the wrong commits.
+		seedProject();
+
+		await app.request("/p1/ruler?cursor=sha-unknown&direction=older&skip=7");
+
+		expect(getLogCalls.at(-1)?.skip).toBe(7);
 	});
 
 	it("loads full segment detail with parent-chain membership and edges", async () => {

@@ -26,7 +26,7 @@
  *              buildHistory. NEVER re-derived at read time: re-rendering it later
  *              would let a copy-tweak retroactively rewrite historical context.
  *   `body`     the structured truth. Read by the UI, which projects it to lines via
- *              `presentSideCarBody`.
+ *              `sideCarBodyToMarkdown`.
  *
  * Both are produced at the SAME call site from the SAME locals, which is what keeps
  * them consistent. `body` is optional: a row written before this existed (or by a
@@ -38,7 +38,7 @@
  *
  * They are NOT the same text, and that is the point. A Dynamic Spec reminder tells
  * the model "keep tasks.json to only text/status/protected, do not add IDs…" —
- * prompt engineering the reader has no use for. So `presentSideCarBody` projects
+ * prompt engineering the reader has no use for. So `sideCarBodyToMarkdown` projects
  * only the parts worth READING (the heading, the tasks, the sender, the result) and
  * drops the model-facing boilerplate. That is why the body carries semantic
  * discriminants (`variant`, `flavor`, `role`) rather than pre-worded strings: each
@@ -105,7 +105,7 @@ export interface SideCarSpecUpdate {
  * The structured form of a side-car's content.
  *
  * A discriminated union so adding a shape is a compile error at every consumer
- * (`presentSideCarBody` switches exhaustively) rather than a silent fallthrough.
+ * (`projectSideCarBody` switches exhaustively) rather than a silent fallthrough.
  */
 export type SideCarBody =
 	/**
@@ -201,106 +201,28 @@ export function readSideCarBody(record: unknown): SideCarBody | undefined {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tone + form (drives colour AND whether the body opens by default)
+// UI projection (an intermediate line form, consumed only by the Markdown pass)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * What kind of thing this injection is, from the reader's point of view.
+ * A projected line's role, mapped to Markdown by `presentationToMarkdown`.
  *
- *   `peer`        someone is waiting on you (a teammate, a subagent, your own
- *                 buffered message).
- *   `background`  work you started finished and has a result.
- *   `neutral`     a routine system reminder.
- *
- * Three groups, not twelve colours: the previous per-source palette put six hues on
- * screen at once, which made a routine progress nudge shout as loudly as a message
- * addressed to the reader.
+ * Deliberately NOT exported: it is a private staging vocabulary between the body
+ * switch and the Markdown emitter. The one thing outside this module ever sees is
+ * the Markdown string.
  */
-export type SideCarTone = "peer" | "background" | "neutral";
+type SideCarLineKind = "heading" | "text" | "bullet" | "meta";
 
-/**
- * Whether the body shows without being asked for.
- *
- *   `open`    the content IS the point — a message someone sent you, a finished
- *             task's result. Hiding it behind a click is wrong.
- *   `folded`  a routine reminder. One line is enough; the rest on demand.
- *
- * ⚠️ This is a SHAPE, not a default fold state. The measured element still starts
- * with `expanded === false`; `open` only means the measure layer draws the body
- * anyway (capped at `SIDECAR_INLINE_MAX_LINES`), and `expanded` then means "show
- * past that cap". Defaulting the fold state to `true` instead would break the
- * toggle for a tool card's mini-cards, whose fold lives under a sub-key with no
- * measured entry and therefore resolves from interaction state alone — the first
- * click would compute `false` and write `true`, i.e. do nothing visible.
- */
-export type SideCarForm = "open" | "folded";
-
-const SIDECAR_TONE_BY_SOURCE: Record<string, SideCarTone> = {
-	// Someone is waiting on the reader.
-	team_message: "peer",
-	group_message: "peer",
-	subagent_message: "peer",
-	buffered_user: "peer",
-	// Work the reader started has a result.
-	bg_agent: "background",
-	bg_bash: "background",
-	// Routine system reminders.
-	silent_progress: "neutral",
-	living_work_spec: "neutral",
-	todo_reminder: "neutral",
-	relaxed_plan: "neutral",
-	knowledge_base_hint: "neutral",
-	spec_update: "neutral",
-	behavior_fence: "neutral",
-	pipeline_exit_confirmation: "neutral",
-};
-
-/** Tone for a source tag. Unknown sources are neutral (never shout for them). */
-export function sideCarTone(source: string): SideCarTone {
-	return SIDECAR_TONE_BY_SOURCE[source] ?? "neutral";
-}
-
-/**
- * Form for a tone. `peer`/`background` open; `neutral` folds.
- *
- * Derived from tone rather than stored per source so the two can never disagree:
- * "worth reading unprompted" and "worth a colour" are the same judgement.
- */
-export function sideCarForm(tone: SideCarTone): SideCarForm {
-	return tone === "neutral" ? "folded" : "open";
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UI projection
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * A projected line's role. Drives weight/indent in the render layer; the measure
- * layer only needs to know that `bullet` reserves a marker lane (so it wraps at a
- * narrower width than a `text` line).
- */
-export type SideCarLineKind = "heading" | "text" | "bullet" | "meta";
-
-export interface SideCarLine {
+interface SideCarLine {
 	kind: SideCarLineKind;
 	text: string;
-	/** `bullet` only: dim the marker + text (a completed / secondary entry). */
-	dimmed?: boolean;
 }
 
-export interface SideCarPresentation {
-	/** The single line a folded card shows. Never empty (falls back to the source label). */
+interface SideCarPresentation {
+	/** The injection's title line. Never empty for a structured body. */
 	headline: string;
 	/** The body lines. Empty when the headline says everything. */
 	lines: SideCarLine[];
-	tone: SideCarTone;
-	form: SideCarForm;
-	/**
-	 * True when this came from the verbatim-`content` fallback rather than a
-	 * structured body. Nothing renders differently; it exists so tests and future
-	 * callers can tell "we have no structure here" from "the structure is empty".
-	 */
-	isRaw: boolean;
 }
 
 /**
@@ -479,20 +401,20 @@ function senderLabel(message: SideCarInboundMessage, labels: SideCarLabels | und
  * Exhaustive over `SideCarBody["kind"]` — adding a shape without teaching this
  * function about it is a compile error, which is the whole reason the payload is a
  * discriminated union.
+ *
+ * Private: the only consumer is {@link sideCarBodyToMarkdown}. The lines are a
+ * staging form, not an API.
  */
-export function presentSideCarBody(
+function projectSideCarBody(
 	source: string,
 	body: SideCarBody,
 	labels?: SideCarLabels,
 ): SideCarPresentation {
-	const tone = sideCarTone(source);
-	const base = { tone, form: sideCarForm(tone), isRaw: false } as const;
-
 	switch (body.kind) {
 		case "notice": {
 			// A fixed reminder is one sentence: it belongs entirely in the headline, so
 			// the folded row already shows everything and there is nothing to unfold.
-			return { ...base, headline: noticeHeadline(source, body.params, labels), lines: [] };
+			return { headline: noticeHeadline(source, body.params, labels), lines: [] };
 		}
 
 		case "prose": {
@@ -502,7 +424,7 @@ export function presentSideCarBody(
 			// is a one-line flattening and the reader must be able to see the rest.
 			const headline =
 				source === "behavior_fence" ? label(labels, "proseFenceHeading") : flatten(body.text);
-			return { ...base, headline, lines: proseLines(body.text) };
+			return { headline, lines: proseLines(body.text) };
 		}
 
 		case "tasks": {
@@ -525,12 +447,11 @@ export function presentSideCarBody(
 				}`,
 				...(task.role === "todo" ? { dimmed: true } : {}),
 			}));
-			return { ...base, headline, lines };
+			return { headline, lines };
 		}
 
 		case "knowledge": {
 			return {
-				...base,
 				headline: labelWith(labels, "knowledgeHeading", { n: body.hits.length }),
 				lines: body.hits.slice(0, SIDECAR_PROJECTION_MAX_LINES).map((hit) => ({
 					kind: "bullet" as const,
@@ -550,7 +471,6 @@ export function presentSideCarBody(
 				if (item.truncated) lines.push({ kind: "meta", text: label(labels, "tasksDoneTruncated") });
 			}
 			return {
-				...base,
 				headline: labelWith(labels, key, { n: body.items.length }),
 				lines,
 			};
@@ -571,7 +491,7 @@ export function presentSideCarBody(
 				single && senderLabel(single, labels)
 					? senderLabel(single, labels)
 					: labelWith(labels, "messagesHeading", { n: body.items.length });
-			return { ...base, headline, lines };
+			return { headline, lines };
 		}
 
 		case "specUpdates": {
@@ -584,7 +504,6 @@ export function presentSideCarBody(
 			}
 			const single = body.items.length === 1 ? body.items[0] : undefined;
 			return {
-				...base,
 				headline: single
 					? single.uri
 					: labelWith(labels, "specUpdatesHeading", { n: body.items.length }),
@@ -645,7 +564,7 @@ function tpl(
  *
  * That is also why the shapes below look more verbose than the UI projection: the
  * model gets the instruction boilerplate ("do not add IDs…", "Use Await(…)") that
- * `presentSideCarBody` deliberately drops.
+ * the reader-facing projection deliberately drops.
  */
 export function renderSideCarBodyToText(
 	source: string,
@@ -812,23 +731,182 @@ function renderTasksToText(
 	return lines.join("\n");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Markdown projection — the reader-facing form for a `system_injection` message
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * The projection for a side-car with NO structured body: show `content` verbatim.
+ * Project a body to Markdown — the reader-facing form of an injection.
  *
- * This is the entire compatibility story for rows written before `body` existed.
- * There is deliberately no parsing — no XML unwrapping, no `[System]` stripping, no
- * bullet detection. Those rows keep looking exactly as they always have, and the
- * complexity of guessing at a producer's discarded structure never enters the code.
+ * An injection lives on its own message row, and `heading` / `text` / `bullet` /
+ * `meta` are a strict subset of Markdown, so this targets Markdown and the row reuses
+ * the `markdown` element kind's existing measure/render machinery (headings, lists,
+ * wrapping, prepared-block cache) instead of carrying geometry of its own.
+ *
+ * ## The two projections of one body
+ *
+ *   `renderSideCarBodyToText`  → model-facing. Carries the instruction boilerplate.
+ *   `sideCarBodyToMarkdown`    → reader-facing, THIS one. Drops that boilerplate.
+ *
+ * Both read the SAME `SideCarBody`, so the reader and the model can never be shown
+ * contradictory facts — only differently edited ones.
+ *
+ * Returns `""` when there is nothing worth showing; the caller should then fall back
+ * to the verbatim `content` via {@link rawSideCarToMarkdown}.
  */
-export function presentRawSideCar(source: string, content: string): SideCarPresentation {
-	const tone = sideCarTone(source);
-	return {
-		headline: flatten(content, 120),
-		lines: proseLines(content),
-		tone,
-		// Raw rows always fold: their content is an unknown shape of unknown length,
-		// and opening it unprompted is how the old cards took over the screen.
-		form: "folded",
-		isRaw: true,
+export function sideCarBodyToMarkdown(
+	source: string,
+	body: SideCarBody,
+	labels?: SideCarLabels,
+): string {
+	const presentation = projectSideCarBody(source, body, labels);
+	return presentationToMarkdown(presentation);
+}
+
+/**
+ * Markdown for an injection with no structured body: the raw text, verbatim.
+ *
+ * Deliberately NOT parsed: no XML unwrapping, no `[System]` stripping, no bullet
+ * detection. Guessing at structure a producer discarded is complexity this design does
+ * not take on. The text is emitted inside a fenced block so that a
+ * historical `<side_car source="…">` wrapper renders as visible characters instead of
+ * being eaten by the Markdown renderer as an HTML tag.
+ */
+export function rawSideCarToMarkdown(content: string): string {
+	const trimmed = content.trim();
+	if (!trimmed) return "";
+	return looksLikeMarkup(trimmed) ? fence(trimmed) : trimmed;
+}
+
+/**
+ * Turn a projected presentation into Markdown.
+ *
+ * Kept separate from {@link sideCarBodyToMarkdown} so the mapping from line kinds to
+ * Markdown is testable on hand-built presentations.
+ */
+function presentationToMarkdown(presentation: SideCarPresentation): string {
+	const blocks: string[] = [];
+	const headline = presentation.headline.trim();
+	// `######`, i.e. the SMALLEST heading level, which is 14px bold — the same size as
+	// body text, differing only in weight (see `HEADING` in pretext-fonts).
+	//
+	// This started at `###` on the reasoning that an injection is a note rather than a
+	// document. Right direction, stopped too early: `###` is 22px against a 14px body, so
+	// in a bubble only a few lines tall the title took ~44% of the content height. Worse,
+	// it is largely REDUNDANT — the bubble's own header row already names the producer, so
+	// the big heading restated at display size what the chrome had just said.
+	//
+	// Weight, not size, is what separates a title from its body at this scale.
+	if (headline) blocks.push(`###### ${escapeMarkdown(headline)}`);
+
+	// Consecutive bullets must land in ONE block to form a single list; a blank line
+	// between them would make each its own one-item list.
+	let bullets: string[] = [];
+	const flushBullets = () => {
+		if (bullets.length === 0) return;
+		blocks.push(bullets.join("\n"));
+		bullets = [];
 	};
+
+	for (const line of presentation.lines) {
+		const text = line.text.trim();
+		if (!text) continue;
+		switch (line.kind) {
+			case "bullet":
+				// `dimmed` (a `todo` task, a secondary entry) has no Markdown equivalent
+				// worth inventing — italics would fight the surrounding text. The role
+				// prefix already in the text ("todo: …") carries that information.
+				bullets.push(`- ${escapeMarkdown(text)}`);
+				break;
+			case "heading":
+				flushBullets();
+				// Body headings (a finished task's name, an inbound sender) sit UNDER the
+				// headline, but there is no smaller level left than `######` — and none is
+				// needed: at 14px the distinction that matters is bold-vs-regular, which both
+				// already have. Keeping `####` (18px) here would reintroduce the same
+				// oversized-title problem one level down, and a background delivery with five
+				// tasks would carry five of them.
+				blocks.push(`###### ${escapeMarkdown(text)}`);
+				break;
+			case "meta":
+				flushBullets();
+				// Secondary annotation ("result truncated"). Italic is the lightest
+				// Markdown that reads as an aside.
+				blocks.push(`*${escapeMarkdown(text)}*`);
+				break;
+			case "text":
+				flushBullets();
+				blocks.push(looksLikeMarkup(text) ? fence(text) : escapeMarkdown(text));
+				break;
+		}
+	}
+	flushBullets();
+
+	return blocks.join("\n\n");
+}
+
+/** Wrap text in a fence wide enough that its own backticks cannot close it. */
+function fence(text: string): string {
+	let longest = 0;
+	// Scan for the longest backtick run so the fence can always outgrow it.
+	const runs = text.match(/`+/g);
+	if (runs) for (const run of runs) longest = Math.max(longest, run.length);
+	const ticks = "`".repeat(Math.max(3, longest + 1));
+	return `${ticks}\n${text}\n${ticks}`;
+}
+
+/**
+ * True when the text carries markup that a Markdown renderer would consume.
+ *
+ * Only an XML/HTML-ish tag qualifies. This is aimed at exactly one real case: the
+ * `<side_car>` / `<tasks_reminder>` / `<progress_update_request>` wrappers that the
+ * MODEL-facing copy uses. Those strings reach this projection whenever a producer
+ * puts pre-wrapped text into a `prose` body, and rendering them as tags would make
+ * the injection appear empty.
+ */
+function looksLikeMarkup(text: string): boolean {
+	return /<\/?[a-zA-Z][\w-]*(\s[^<>]*)?>/.test(text);
+}
+
+/**
+ * Escape the Markdown constructs that would misread injected text.
+ *
+ * Restricted on purpose to the leading markers that turn a line into a structure it
+ * was not meant to be (`- ` into a list, `#` into a heading, `>` into a quote, `1.`
+ * into an ordered list) plus the inline emphasis characters. Escaping every special
+ * character would litter ordinary prose — task texts and teammate messages are
+ * written by humans and read as prose, not as source.
+ */
+/**
+ * Escape the characters that would otherwise be parsed as Markdown syntax.
+ *
+ * ⚠️ Underscores are deliberately NOT escaped, and that is a fix rather than an
+ * oversight. Two independent reasons, both verified against the real parser:
+ *
+ *  1. It is unnecessary. CommonMark only opens emphasis at a word boundary, so an
+ *     in-word `_` never becomes emphasis: `marked.parse("ask_in_passing")` and
+ *     `marked.parse("ask\\_in\\_passing")` produce the identical `<p>ask_in_passing</p>`.
+ *  2. It actively leaked. `marked` turns `\_` into an `escape` token whose `text` is
+ *     `_`, but the list-item path here reads `item.text` — the RAW string, backslash
+ *     included — so every `snake_case` identifier inside a bullet rendered as
+ *     `ask\_in\_passing`. Task digests are almost entirely identifiers, so the
+ *     "protection" cost a screenful of stray backslashes and bought nothing.
+ *
+ * So underscores are escaped only where they can ACTUALLY open or close emphasis: at a
+ * word boundary (`_kwargs_` → escaped) but not between word characters
+ * (`ask_in_passing` → left alone). Verified against `marked`: `_kwargs_` yields `<em>`,
+ * while `snake_case_name`, `_leading` and `trailing_` all stay literal.
+ *
+ * The rest of the set genuinely changes the parse in every position: `*` (emphasis works
+ * mid-word), backticks, link brackets, and line-leading list / quote / heading markers.
+ */
+function escapeMarkdown(text: string): string {
+	return (
+		text
+			.replace(/([*`[\]])/g, "\\$1")
+			// A boundary underscore: not preceded by a word char, or not followed by one.
+			.replace(/(?<![0-9A-Za-z])_|_(?![0-9A-Za-z])/g, "\\_")
+			.replace(/^(\s*)([-+>#])/gm, "$1\\$2")
+			.replace(/^(\s*)(\d+)\./gm, "$1$2\\.")
+	);
 }

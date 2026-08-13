@@ -22,7 +22,6 @@ import {
 	narratorFileSnapshots,
 	narratorMessageRefs,
 	narratorMessages,
-	narratorSidecars,
 	narrators,
 	narratorToolCalls,
 	narratorWhitelistCmds,
@@ -35,6 +34,7 @@ import {
 	oauthGrants,
 	portAllocations,
 	projects,
+	registrationCodes,
 	remoteDevices,
 	reviewConclusions,
 	specFileRevisions,
@@ -149,7 +149,6 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	messageRefs: many(narratorMessageRefs),
 	messages: many(narratorMessages),
 	toolCalls: many(narratorToolCalls),
-	sideCars: many(narratorSidecars),
 	fileSnapshots: many(narratorFileSnapshots),
 	terminals: many(terminals),
 	commits: many(chapterCommits),
@@ -238,7 +237,6 @@ export const narratorMessagesRelations = relations(narratorMessages, ({ one, man
 	}),
 	messageRefs: many(narratorMessageRefs),
 	toolCalls: many(narratorToolCalls),
-	sideCars: many(narratorSidecars),
 }));
 
 export const narratorMessageRefsRelations = relations(narratorMessageRefs, ({ one }) => ({
@@ -259,17 +257,6 @@ export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one })
 	}),
 	message: one(narratorMessages, {
 		fields: [narratorToolCalls.messageId],
-		references: [narratorMessages.id],
-	}),
-}));
-
-export const narratorSidecarsRelations = relations(narratorSidecars, ({ one }) => ({
-	narrator: one(narrators, {
-		fields: [narratorSidecars.narratorId],
-		references: [narrators.id],
-	}),
-	message: one(narratorMessages, {
-		fields: [narratorSidecars.messageId],
 		references: [narratorMessages.id],
 	}),
 }));
@@ -338,6 +325,21 @@ export const usersRelations = relations(users, ({ many, one }) => ({
 	oauthAccessTokens: many(oauthAccessTokens, { relationName: "oauthAccessTokenUser" }),
 	oauthAccessTokensRevoked: many(oauthAccessTokens, {
 		relationName: "oauthAccessTokenRevoker",
+	}),
+	registrationCodesCreated: many(registrationCodes, { relationName: "registrationCodeCreator" }),
+	registrationCodesUsed: many(registrationCodes, { relationName: "registrationCodeRedeemer" }),
+}));
+
+export const registrationCodesRelations = relations(registrationCodes, ({ one }) => ({
+	createdBy: one(users, {
+		fields: [registrationCodes.createdByUserId],
+		references: [users.id],
+		relationName: "registrationCodeCreator",
+	}),
+	usedBy: one(users, {
+		fields: [registrationCodes.usedByUserId],
+		references: [users.id],
+		relationName: "registrationCodeRedeemer",
 	}),
 }));
 

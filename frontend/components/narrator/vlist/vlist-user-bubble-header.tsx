@@ -141,3 +141,51 @@ export function injectUserBubbleHeader(kind: VListElementKind, extra: RenderExtr
 		/>
 	);
 }
+
+/**
+ * Is this bubble's author the person reading it?
+ *
+ * NarraFork is a shared deployment: one narrator can be driven by several people, so
+ * `role: "user"` means "a human typed this", NOT "you typed this". The right-hand
+ * indigo bubble is a claim of authorship, and painting a teammate's turn there tells
+ * the reader they wrote something they did not.
+ *
+ * Two deliberate fallbacks to `true`, both preserving the historical rendering rather
+ * than guessing:
+ *
+ *   - viewer unknown (`useCurrentUser()` still loading, or no auth in a test): every
+ *     bubble would otherwise flip left for a frame and then flip back.
+ *   - author unknown (`creator` null / no id): pre-`created_by` rows. A row that a
+ *     non-human authored never reaches here — the adapter routes `origin: system` /
+ *     `assistant` to `origin_notice` before the bubble branch.
+ */
+export function resolveBubbleIsSelf(
+	creator: BubbleCreator | null | undefined,
+	currentUserId: string | null | undefined,
+): boolean {
+	if (!currentUserId) return true;
+	const authorId = creator?.id;
+	if (!authorId) return true;
+	return authorId === currentUserId;
+}
+
+/**
+ * Attach the authorship flag that decides a bubble's side and tint.
+ *
+ * Lives in the integration layer for the same reason as the header node, plus one
+ * specific to this flag: both sides measure IDENTICALLY, so folding viewer identity
+ * into the adapter's data would fork the measure cache per user for a purely cosmetic
+ * difference. `render-registry`'s `resolveRenderExtra` only forwards `creator`; the
+ * comparison happens here.
+ */
+export function injectUserBubbleIsSelf(
+	kind: VListElementKind,
+	extra: RenderExtra,
+	currentUserId: string | null | undefined,
+): void {
+	if (kind !== "message-bubble" || extra.role !== "user") return;
+	extra.isSelf = resolveBubbleIsSelf(
+		(extra.creator as BubbleCreator | null | undefined) ?? null,
+		currentUserId,
+	);
+}

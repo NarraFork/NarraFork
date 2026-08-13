@@ -23,15 +23,13 @@
 import { describe, expect, it } from "bun:test";
 import {
 	coerceSideCarBody,
-	presentRawSideCar,
-	presentSideCarBody,
+	rawSideCarToMarkdown,
 	readSideCarBody,
 	renderSideCarBodyToText,
 	SIDECAR_PROJECTION_MAX_LINES,
 	type SideCarBody,
 	type SideCarModelTemplates,
-	sideCarForm,
-	sideCarTone,
+	sideCarBodyToMarkdown,
 } from "../sidecar-body";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -431,213 +429,42 @@ also done`,
 		);
 	});
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tone / form
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("tone and form", () => {
-	it("groups the sources into peer / background / neutral", () => {
-		for (const source of ["team_message", "group_message", "subagent_message", "buffered_user"]) {
-			expect(sideCarTone(source)).toBe("peer");
-		}
-		for (const source of ["bg_agent", "bg_bash"]) {
-			expect(sideCarTone(source)).toBe("background");
-		}
-		for (const source of [
-			"silent_progress",
-			"living_work_spec",
-			"todo_reminder",
-			"relaxed_plan",
-			"knowledge_base_hint",
-			"spec_update",
-			"behavior_fence",
-			"pipeline_exit_confirmation",
-		]) {
-			expect(sideCarTone(source)).toBe("neutral");
-		}
-	});
-
-	it("defaults an unknown source to neutral (never shout for something we cannot name)", () => {
-		expect(sideCarTone("brand_new_source")).toBe("neutral");
-		expect(sideCarForm(sideCarTone("brand_new_source"))).toBe("folded");
-	});
-
-	it("opens the bodies worth reading unprompted and folds the routine ones", () => {
-		expect(sideCarForm("peer")).toBe("open");
-		expect(sideCarForm("background")).toBe("open");
-		expect(sideCarForm("neutral")).toBe("folded");
-	});
-
-	it("covers the two sources that were never mapped before", () => {
-		// behavior_fence and pipeline_exit_confirmation are pushed by the server but had
-		// no entry in either SOURCE_META table, so they rendered as raw source strings.
-		expect(sideCarTone("behavior_fence")).toBe("neutral");
-		expect(sideCarTone("pipeline_exit_confirmation")).toBe("neutral");
-	});
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UI projection
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("presentSideCarBody — the reader's projection", () => {
-	it("puts a fixed reminder entirely in the headline (nothing to unfold)", () => {
-		const p = presentSideCarBody("silent_progress", { kind: "notice", params: { count: 20 } });
-		expect(p.headline).toContain("20");
-		expect(p.lines).toEqual([]);
-		expect(p.form).toBe("folded");
-		expect(p.isRaw).toBe(false);
-	});
-
-	it("drops the model-facing instructions from a task digest", () => {
-		const p = presentSideCarBody("living_work_spec", {
-			kind: "tasks",
-			variant: "current",
-			tasks: [
-				{ role: "doing", text: "Implement the parser" },
-				{ role: "todo", text: "Write the tests" },
-			],
-		});
-		// The tasks survive…
-		expect(p.lines.map((l) => l.text).join("\n")).toContain("Implement the parser");
-		expect(p.lines.every((l) => l.kind === "bullet")).toBe(true);
-		// …the prompt engineering does not.
-		const all = `${p.headline}\n${p.lines.map((l) => l.text).join("\n")}`;
-		expect(all).not.toContain("do not add IDs");
-		expect(all).not.toContain("spec://behavior_fence");
-		expect(all).not.toContain("Blocked-task rule");
-	});
-
-	it("dims the not-yet-started tasks so the current one reads first", () => {
-		const p = presentSideCarBody("living_work_spec", {
-			kind: "tasks",
-			variant: "current",
-			tasks: [
-				{ role: "doing", text: "now" },
-				{ role: "todo", text: "later" },
-			],
-		});
-		expect(p.lines[0]?.dimmed).toBeUndefined();
-		expect(p.lines[1]?.dimmed).toBe(true);
-	});
-
-	it("marks a protected task without repeating the model's bracket syntax", () => {
-		const p = presentSideCarBody("living_work_spec", {
-			kind: "tasks",
-			variant: "current",
-			tasks: [{ role: "doing", text: "keep going", protected: true }],
-		});
-		expect(p.lines[0]?.text).not.toContain("[protected]");
-		expect(p.lines[0]?.text).toContain("protected");
-	});
-
-	it("names the sender of a single message on the folded row", () => {
-		const p = presentSideCarBody("subagent_message", {
-			kind: "messages",
-			items: [
-				{ fromId: "n1", fromTitle: "explore-run", fromType: "explore", text: "line one\nline two" },
-			],
-		});
-		expect(p.headline).toBe("explore-run (explore)");
-		expect(p.form).toBe("open");
-		// Heading + both text lines.
-		expect(p.lines.map((l) => l.kind)).toEqual(["heading", "text", "text"]);
-	});
-
-	it("counts multiple messages instead of naming one of them", () => {
-		const p = presentSideCarBody("team_message", {
-			kind: "messages",
-			items: [
-				{ fromId: "a", fromTitle: "one", text: "x" },
-				{ fromId: "b", fromTitle: "two", text: "y" },
-			],
-		});
-		expect(p.headline).toContain("2");
-	});
-
-	it("collapses blank runs instead of painting empty lines", () => {
-		// The spec_update shape (`header\n\nbody`) used to draw a measured row of nothing.
-		const p = presentSideCarBody("spec_update", {
-			kind: "specUpdates",
-			items: [{ uri: "spec://tasks.json", timestamp: "t", updatedBy: "user", preview: "a\n\n\nb" }],
-		});
-		expect(p.lines.map((l) => l.text)).toEqual(["spec://tasks.json", "a", "b"]);
-	});
-
-	it("flags a truncated background result as meta rather than body text", () => {
-		const p = presentSideCarBody("bg_agent", {
-			kind: "tasksDone",
-			flavor: "agent",
-			items: [{ id: "a1", title: "long one", status: "done", preview: "head", truncated: true }],
-		});
-		expect(p.lines.at(-1)?.kind).toBe("meta");
-		expect(p.form).toBe("open");
-	});
-
-	it("gives the behaviour fence a stable heading instead of its first line", () => {
-		const p = presentSideCarBody("behavior_fence", {
-			kind: "prose",
-			text: "Never touch auth without approval.",
-		});
-		expect(p.headline).toBe("Behaviour fence");
-		expect(p.lines.map((l) => l.text)).toEqual(["Never touch auth without approval."]);
-	});
-
-	it("uses injected labels over the built-in fallbacks", () => {
-		const p = presentSideCarBody(
-			"behavior_fence",
-			{ kind: "prose", text: "x" },
-			{ proseFenceHeading: "行为护栏" },
-		);
-		expect(p.headline).toBe("行为护栏");
-	});
-});
-
-describe("presentRawSideCar — the no-structure fallback", () => {
-	it("shows the content verbatim, with no unwrapping whatsoever", () => {
-		// Deliberately NOT parsed: the wrapper stays, because guessing at a producer's
-		// discarded structure is the complexity this design removed.
-		const content =
-			"<progress_update_request>\nYou have completed 20 tool call(s).\n</progress_update_request>";
-		const p = presentRawSideCar("silent_progress", content);
-		expect(p.isRaw).toBe(true);
-		expect(p.lines.map((l) => l.text)).toEqual([
-			"<progress_update_request>",
-			"You have completed 20 tool call(s).",
-			"</progress_update_request>",
-		]);
-	});
-
-	it("always folds, whatever the source's tone would say", () => {
-		// An unknown-shaped body of unknown length must not open unprompted.
-		const p = presentRawSideCar("bg_agent", "a\nb\nc");
-		expect(p.tone).toBe("background");
-		expect(p.form).toBe("folded");
-	});
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Bounded projection
 //
 // A projection's cost must be proportional to what can ever be PAINTED, not to the
-// size of the record. The measure layer stops at 40 rows, but it only gets to decide
-// that after this function has built the array — so an unbounded projection turns one
-// pathological row into a per-measure-pass cost of its full length.
+// size of the record. The measure layer caps what it draws, but it only gets to decide
+// that after the projection has built its output — so an unbounded projection turns
+// one pathological row into a per-measure-pass cost of its full length.
+//
+// Asserted through `sideCarBodyToMarkdown` (the only public entry point) by counting
+// emitted lines: the internal line array is a private staging form, and pinning the
+// bound on the public output is what actually protects the caller.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Non-blank lines of the emitted Markdown, excluding the `######` title row. */
+function bodyLineCount(md: string): number {
+	return md
+		.split("\n")
+		.filter((line) => line.trim() !== "")
+		.filter((line) => !line.startsWith("###### ")).length;
+}
 
 describe("projection is bounded", () => {
 	it("caps prose lines instead of emitting one per line of a huge body", () => {
 		const text = Array.from({ length: 50_000 }, (_, i) => `line ${i}`).join("\n");
-		const p = presentSideCarBody("buffered_user", { kind: "prose", text });
-		expect(p.lines.length).toBe(SIDECAR_PROJECTION_MAX_LINES);
+		const md = sideCarBodyToMarkdown("buffered_user", { kind: "prose", text });
+		expect(bodyLineCount(md)).toBe(SIDECAR_PROJECTION_MAX_LINES);
 		// The cap is a prefix, not a sample: the reader sees the start of the body.
-		expect(p.lines[0]?.text).toBe("line 0");
+		expect(md).toContain("line 0");
+		expect(md).not.toContain("line 49999");
 	});
 
 	it("caps a raw fallback body the same way", () => {
+		// The raw path is deliberately verbatim (no parsing), so its bound is the
+		// caller's: nothing is exploded into per-line structure at all.
 		const content = Array.from({ length: 10_000 }, () => "x").join("\n");
-		expect(presentRawSideCar("bg_bash", content).lines.length).toBe(SIDECAR_PROJECTION_MAX_LINES);
+		expect(rawSideCarToMarkdown(content)).toBe(content);
 	});
 
 	it("shares ONE budget across items rather than capping each item separately", () => {
@@ -649,21 +476,21 @@ describe("projection is bounded", () => {
 			status: "completed",
 			preview: Array.from({ length: 100 }, (_, j) => `out ${j}`).join("\n"),
 		}));
-		const p = presentSideCarBody("bg_agent", { kind: "tasksDone", flavor: "agent", items });
+		const md = sideCarBodyToMarkdown("bg_agent", { kind: "tasksDone", flavor: "agent", items });
 		// Headings can push one line past the budget (a heading is emitted before its
 		// prose run is budgeted), which is why this is <= budget + 1 rather than exact.
-		expect(p.lines.length).toBeLessThanOrEqual(SIDECAR_PROJECTION_MAX_LINES + 1);
+		expect(bodyLineCount(md)).toBeLessThanOrEqual(SIDECAR_PROJECTION_MAX_LINES + 1);
 	});
 
 	it("caps messages, spec updates, tasks and knowledge hits too", () => {
 		const longText = Array.from({ length: 500 }, (_, i) => `m ${i}`).join("\n");
-		const messages = presentSideCarBody("team_message", {
+		const messages = sideCarBodyToMarkdown("team_message", {
 			kind: "messages",
 			items: Array.from({ length: 30 }, (_, i) => ({ fromTitle: `u${i}`, text: longText })),
 		});
-		expect(messages.lines.length).toBeLessThanOrEqual(SIDECAR_PROJECTION_MAX_LINES + 1);
+		expect(bodyLineCount(messages)).toBeLessThanOrEqual(SIDECAR_PROJECTION_MAX_LINES + 1);
 
-		const specUpdates = presentSideCarBody("spec_update", {
+		const specUpdates = sideCarBodyToMarkdown("spec_update", {
 			kind: "specUpdates",
 			items: Array.from({ length: 30 }, (_, i) => ({
 				uri: `spec://f${i}`,
@@ -672,16 +499,16 @@ describe("projection is bounded", () => {
 				preview: longText,
 			})),
 		});
-		expect(specUpdates.lines.length).toBeLessThanOrEqual(SIDECAR_PROJECTION_MAX_LINES + 1);
+		expect(bodyLineCount(specUpdates)).toBeLessThanOrEqual(SIDECAR_PROJECTION_MAX_LINES + 1);
 
-		const tasks = presentSideCarBody("living_work_spec", {
+		const tasks = sideCarBodyToMarkdown("living_work_spec", {
 			kind: "tasks",
 			variant: "current",
 			tasks: Array.from({ length: 5_000 }, (_, i) => ({ role: "todo" as const, text: `t${i}` })),
 		});
-		expect(tasks.lines.length).toBe(SIDECAR_PROJECTION_MAX_LINES);
+		expect(bodyLineCount(tasks)).toBe(SIDECAR_PROJECTION_MAX_LINES);
 
-		const knowledge = presentSideCarBody("knowledge_base_hint", {
+		const knowledge = sideCarBodyToMarkdown("knowledge_base_hint", {
 			kind: "knowledge",
 			hits: Array.from({ length: 5_000 }, (_, i) => ({
 				entryId: `k${i}`,
@@ -689,13 +516,13 @@ describe("projection is bounded", () => {
 				summary: "",
 			})),
 		});
-		expect(knowledge.lines.length).toBe(SIDECAR_PROJECTION_MAX_LINES);
+		expect(bodyLineCount(knowledge)).toBe(SIDECAR_PROJECTION_MAX_LINES);
 	});
 
 	it("leaves a normal-sized body completely untouched", () => {
 		// The cap must be invisible at real sizes, or it is a behaviour change.
-		const p = presentSideCarBody("buffered_user", { kind: "prose", text: "a\nb\nc" });
-		expect(p.lines.map((l) => l.text)).toEqual(["a", "b", "c"]);
+		const md = sideCarBodyToMarkdown("buffered_user", { kind: "prose", text: "a\nb\nc" });
+		expect(md.split("\n\n").slice(1)).toEqual(["a", "b", "c"]);
 	});
 });
 
@@ -706,30 +533,36 @@ describe("headline flattening is bounded", () => {
 		// (and correctly) is the observable proxy for not materializing it.
 		const huge = `${"word ".repeat(800_000)}TAIL`;
 		const started = Date.now();
-		const p = presentSideCarBody("buffered_user", { kind: "prose", text: huge });
+		const md = sideCarBodyToMarkdown("buffered_user", { kind: "prose", text: huge });
 		expect(Date.now() - started).toBeLessThan(500);
-		expect(p.headline.length).toBeLessThanOrEqual(161); // 160 + the ellipsis
-		expect(p.headline.endsWith("…")).toBe(true);
-		expect(p.headline).not.toContain("TAIL");
+		const headline = md.split("\n")[0] ?? "";
+		expect(headline.startsWith("###### ")).toBe(true);
+		// Subtract the `"###### "` prefix (7 chars) to measure the text itself.
+		expect(headline.length - 7).toBeLessThanOrEqual(161); // 160 + the ellipsis
+		expect(headline.endsWith("…")).toBe(true);
+		expect(headline).not.toContain("TAIL");
 	});
 
 	it("still flattens and returns short text unchanged", () => {
-		const p = presentSideCarBody("buffered_user", { kind: "prose", text: "  hello \n  world  " });
-		expect(p.headline).toBe("hello world");
+		const md = sideCarBodyToMarkdown("buffered_user", {
+			kind: "prose",
+			text: "  hello \n  world  ",
+		});
+		expect(md.split("\n")[0]).toBe("###### hello world");
 	});
 
 	it("ellipsizes exactly when real text survives past the cut", () => {
 		// A body just over the flatten window whose tail is only whitespace collapses to
 		// something short — and must NOT claim there is more.
 		const padded = `${"a".repeat(10)}${" ".repeat(500)}`;
-		expect(presentSideCarBody("buffered_user", { kind: "prose", text: padded }).headline).toBe(
-			"a".repeat(10),
-		);
+		expect(
+			sideCarBodyToMarkdown("buffered_user", { kind: "prose", text: padded }).split("\n")[0],
+		).toBe(`###### ${"a".repeat(10)}`);
 		// The same length of padding followed by a real character does have more.
 		const withTail = `${"a".repeat(10)}${" ".repeat(500)}z`;
-		expect(presentSideCarBody("buffered_user", { kind: "prose", text: withTail }).headline).toBe(
-			`${"a".repeat(10)}…`,
-		);
+		expect(
+			sideCarBodyToMarkdown("buffered_user", { kind: "prose", text: withTail }).split("\n")[0],
+		).toBe(`###### ${"a".repeat(10)}…`);
 	});
 });
 

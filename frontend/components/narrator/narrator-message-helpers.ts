@@ -1,9 +1,4 @@
-import type {
-	SideCarRecord,
-	SubagentActivitySummary,
-	ToolCallRecord,
-	TreeMessage,
-} from "../../lib/api";
+import type { SubagentActivitySummary, TreeMessage } from "../../lib/api";
 import {
 	findMsgByToolUseIdInTree,
 	normalizeSubagentModel,
@@ -206,38 +201,6 @@ export function getStreamingFieldPreview(value: string): string {
 }
 
 /**
- * Append user-targeted side-car records to the latest assistant message (depth
- * first, deepest/last first) under the matching parentToolUseId scope. Returns
- * `{ changed: false }` when no assistant message matched (caller keeps refs).
- */
-export function appendSideCarsToLatestAssistant(
-	messages: NarratorMsg[],
-	sideCars: SideCarRecord[],
-	parentToolUseId?: string,
-): { messages: NarratorMsg[]; changed: boolean } {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.children?.length) {
-			const childResult = appendSideCarsToLatestAssistant(msg.children, sideCars, parentToolUseId);
-			if (childResult.changed) {
-				const updated = [...messages];
-				updated[i] = { ...msg, children: childResult.messages };
-				return { messages: updated, changed: true };
-			}
-		}
-		const matchesParent = parentToolUseId
-			? msg.parentToolUseId === parentToolUseId
-			: !msg.parentToolUseId;
-		if (msg.role === "assistant" && matchesParent) {
-			const updated = [...messages];
-			updated[i] = { ...msg, sideCars: mergeSideCarLists(sideCars, msg.sideCars) };
-			return { messages: updated, changed: true };
-		}
-	}
-	return { messages, changed: false };
-}
-
-/**
  * A top-level streaming-tool chunk accumulator entry. While a tool is streaming
  * its input we render a shimmer indicator; once promoted (`_started`) we render
  * a real tool-call card with the resolved input/status/output.
@@ -260,7 +223,6 @@ export interface TopLevelStreamingChunk {
 	_output?: unknown;
 	_durationMs?: number;
 	_metadata?: Record<string, unknown>;
-	_sideCars?: SideCarRecord[];
 	_longRunning?: boolean;
 	_streamedFullOutput?: boolean;
 	_streamingOutput?: string;
@@ -290,7 +252,6 @@ export function topLevelStreamingChunkToToolFields(
 			...((chunk._metadata ?? chunk.metadata)
 				? { _metadata: chunk._metadata ?? chunk.metadata }
 				: {}),
-			...(chunk._sideCars ? { sideCars: chunk._sideCars } : {}),
 			...(chunk._longRunning ? { _longRunning: true } : {}),
 			...(chunk._streamedFullOutput ? { _streamedFullOutput: true } : {}),
 			_streamingOutput: chunk._streamingOutput,
@@ -449,7 +410,6 @@ export function buildTopLevelStreamingChunksMsg(
 					...(chunk._startedAt && { startedAt: chunk._startedAt }),
 					...(chunk._output !== undefined && { outputJson: chunk._output }),
 					...(chunk._durationMs != null && { durationMs: chunk._durationMs }),
-					...(chunk._sideCars && { sideCars: chunk._sideCars }),
 					...(chunk._metadata && { _metadata: chunk._metadata }),
 					...(chunk.metadata && { _metadata: chunk.metadata }),
 					...(chunk._longRunning && { _longRunning: true }),
@@ -516,53 +476,6 @@ export function insertTopLevelMessageBySeq(
 	return updated;
 }
 
-function sideCarMergeKey(sideCar: SideCarRecord): string {
-	return [
-		sideCar.target,
-		sideCar.source,
-		sideCar.toolUseId ?? "",
-		sideCar.orderIndex ?? "",
-		sideCar.content,
-	].join("\u0000");
-}
-
-export function mergeSideCarLists(
-	incoming?: SideCarRecord[] | null,
-	existing?: SideCarRecord[] | null,
-): SideCarRecord[] | undefined {
-	const merged: SideCarRecord[] = [];
-	const seen = new Set<string>();
-	for (const list of [incoming, existing]) {
-		for (const sideCar of list ?? []) {
-			const key = sideCarMergeKey(sideCar);
-			if (seen.has(key)) continue;
-			seen.add(key);
-			merged.push(sideCar);
-		}
-	}
-	return merged.length > 0 ? merged : undefined;
-}
-
-function collectToolSideCars(message: NarratorMsg): Map<string, SideCarRecord[]> {
-	const result = new Map<string, SideCarRecord[]>();
-	const add = (toolUseId: unknown, sideCars: unknown) => {
-		if (typeof toolUseId !== "string" || !Array.isArray(sideCars) || sideCars.length === 0) {
-			return;
-		}
-		const previous = result.get(toolUseId);
-		result.set(toolUseId, mergeSideCarLists(sideCars as SideCarRecord[], previous) ?? []);
-	};
-	for (const toolCall of message.toolCalls ?? []) {
-		add(toolCall.toolUseId, toolCall.sideCars);
-	}
-	for (const block of message.contentJson ?? []) {
-		if (block.type === "tool_use") {
-			add(block.id, block.sideCars);
-		}
-	}
-	return result;
-}
-
 function mergeSubagentActivity(
 	existing: SubagentActivitySummary | undefined,
 	incoming: SubagentActivitySummary | undefined,
@@ -620,52 +533,6 @@ export function preserveLiveSubagentActivity(
 		return { ...block, _subagentActivity: activity };
 	});
 	return changed ? { ...incoming, toolCalls, contentJson } : incoming;
-}
-
-/**
- * Merge live side-car records from an existing cached message into an incoming
- * replacement so streamed side-cars survive a server-sent message refresh.
- * Returns `incoming` unchanged when nothing merged (preserves reference).
- */
-export function preserveLiveSideCars(
-	existing: NarratorMsg | undefined,
-	incoming: NarratorMsg,
-): NarratorMsg {
-	if (!existing) return incoming;
-
-	const sideCars = mergeSideCarLists(incoming.sideCars, existing.sideCars);
-	const existingToolSideCars = collectToolSideCars(existing);
-	let changed = sideCars !== incoming.sideCars;
-
-	const toolCalls = (incoming.toolCalls ?? []).map((toolCall) => {
-		const merged = mergeSideCarLists(
-			toolCall.sideCars,
-			existingToolSideCars.get(toolCall.toolUseId),
-		);
-		if (merged === toolCall.sideCars) return toolCall;
-		changed = true;
-		return { ...toolCall, sideCars: merged } as ToolCallRecord;
-	});
-
-	const toolCallSideCars = new Map<string, SideCarRecord[]>();
-	for (const toolCall of toolCalls) {
-		if (toolCall.toolUseId && toolCall.sideCars?.length) {
-			toolCallSideCars.set(toolCall.toolUseId, toolCall.sideCars);
-		}
-	}
-
-	const contentJson = (incoming.contentJson ?? []).map((block) => {
-		if (block.type !== "tool_use" || typeof block.id !== "string") return block;
-		const merged = mergeSideCarLists(
-			Array.isArray(block.sideCars) ? (block.sideCars as SideCarRecord[]) : undefined,
-			toolCallSideCars.get(block.id),
-		);
-		if (!merged || merged === block.sideCars) return block;
-		changed = true;
-		return { ...block, sideCars: merged };
-	});
-
-	return changed ? { ...incoming, sideCars, toolCalls, contentJson } : incoming;
 }
 
 /**

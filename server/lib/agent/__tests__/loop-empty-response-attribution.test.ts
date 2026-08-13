@@ -21,8 +21,11 @@ let providerScenario:
 	| "usage_only_forever"
 	| "no_events_forever"
 	| "stop_reason_without_content_forever"
-	| "truncated_tool_input_forever" = "error_then_usage_only";
+	| "truncated_tool_input_forever"
+	| "reasoning_then_truncated_tool_input" = "error_then_usage_only";
 let providerAttempts = 0;
+/** `content` (user-side turn text) seen by each provider.chat() call, in order. */
+let sentContents: string[] = [];
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
@@ -30,6 +33,7 @@ const testProvider: ProviderAdapter = {
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
+		sentContents.push(params.content ?? "");
 		params.onRequestStart?.();
 
 		if (providerScenario === "error_then_usage_only") {
@@ -78,6 +82,20 @@ const testProvider: ProviderAdapter = {
 			// A named tool call whose input stream is cut off before `stop`.
 			yield { toolUseChunk: { toolUseId: "tu-1", name: "Bash" } };
 			yield { toolUseChunk: { toolUseId: "tu-1", input: '{"command":"ec' } };
+			return;
+		}
+
+		if (providerScenario === "reasoning_then_truncated_tool_input") {
+			// The shape a model produces when it thinks, commits to a large write, and
+			// runs out of output budget mid-arguments. First attempt only; a follow-up
+			// attempt answers so the test can inspect what the loop asked next.
+			if (providerAttempts === 1) {
+				yield { reasoning: "I will write the entire file in one call" };
+				yield { toolUseChunk: { toolUseId: "tu-big", name: "Write" } };
+				yield { toolUseChunk: { toolUseId: "tu-big", input: '{"file_path":"/tmp/x.ts","cont' } };
+				return;
+			}
+			yield { text: "using a skeleton instead" };
 			return;
 		}
 	},
@@ -217,6 +235,7 @@ describe("空响应细分归因", () => {
 	test("工具输入被截断不归入空响应，而是走 broken-tool-call 恢复路径", async () => {
 		providerScenario = "truncated_tool_input_forever";
 		providerAttempts = 0;
+		sentContents = [];
 
 		// A named-but-truncated tool accumulator counts as persistable output, so this
 		// case must never be reported as an empty response. It has its own recovery
@@ -230,5 +249,41 @@ describe("空响应细分归因", () => {
 		).toBe(false);
 		// The turn still completes as an assistant message rather than a hard failure.
 		expect(events.some((e) => e.type === "assistant_message")).toBe(true);
+	});
+
+	/**
+	 * Regression: "reasoning + a tool call cut off mid-arguments" is the exact shape a
+	 * model produces when a single Write does not fit in one response. The
+	 * reasoning-only dead-turn guard used to claim it — it only inspected completed
+	 * `toolUses` — and discarded the turn to replay the identical request, which hit
+	 * the same ceiling every time. The model therefore never received the
+	 * skeleton-first instructions. A half-written tool input now counts as meaningful
+	 * output, so the turn survives and the reminder is injected.
+	 */
+	test("推理后工具输入被截断时，注入骨架优先提醒而非丢弃回合重发", async () => {
+		providerScenario = "reasoning_then_truncated_tool_input";
+		providerAttempts = 0;
+		sentContents = [];
+
+		const events = await runLoop({ maxTurns: 3 });
+
+		// Not treated as a dead turn: no reasoning-only discard, no in-place replay.
+		expect(events.some((e) => e.type === "stream_reset")).toBe(false);
+		expect(events.some((e) => e.type === "retrying")).toBe(false);
+		expect(
+			events.some(
+				(e) =>
+					e.type === "invalid_state" &&
+					(e as { reason: string }).reason.startsWith("reasoning_only"),
+			),
+		).toBe(false);
+
+		// The turn advanced, and the follow-up request carries the skeleton-first
+		// instructions naming the tool whose input was cut off.
+		expect(providerAttempts).toBe(2);
+		const followUp = sentContents[1];
+		expect(followUp).toContain("Write");
+		expect(followUp).toContain("SPLICE_1");
+		expect(followUp).toContain("10,000");
 	});
 });

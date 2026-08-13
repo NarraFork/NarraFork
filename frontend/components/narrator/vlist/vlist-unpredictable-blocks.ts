@@ -66,4 +66,11 @@ export const UNKNOWN_HEIGHT_FORWARDING_KINDS: ReadonlySet<string> = new Set([
 	"message-bubble",
 	"reasoning",
 	"plan-card",
+	// An injection bubble's body IS measured markdown, and its text is somebody else's
+	// (a teammate's message, a subagent's report), so it can legitimately contain a
+	// mermaid diagram. RenderInjectionBubble forwards the reporter to RenderMarkdown,
+	// so the shell must be willing to hold its override — otherwise the renderer takes
+	// the flowing path while the row stays a fixed clip box and the diagram is cut off
+	// with nobody able to report the correction.
+	"injection-bubble",
 ]);

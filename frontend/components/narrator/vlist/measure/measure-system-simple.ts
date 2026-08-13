@@ -33,13 +33,7 @@ import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts
 // ── Discriminant + payload ───────────────────────────────────────────────────
 
 /** The single-line / clamped system-card kinds covered by this module. */
-export type SystemSimpleKind =
-	| "compact"
-	| "segment_compact"
-	| "merge_summary"
-	| "review_feedback"
-	| "spec_continuation"
-	| "spec_blocked_continuation";
+export type SystemSimpleKind = "compact" | "segment_compact" | "merge_summary" | "review_feedback";
 
 /**
  * Render payload carried on the prepared block. Height is fully determined by
@@ -57,10 +51,6 @@ export interface SystemSimpleData {
 	interactive?: boolean;
 	/** merge_summary: reserve a leading creator-avatar slot. Height-neutral. */
 	hasAvatar?: boolean;
-	/** spec_*: show the extra protected (lock) badge. Height-neutral (same row). */
-	protected?: boolean;
-	/** spec_*: the leading status badge label. */
-	badgeLabel?: string;
 }
 
 // ── Chrome constants (px) — CONTRACT.md §3/§4 + pretext-fonts.ts ──────────────
@@ -88,8 +78,6 @@ export const SEGMENT_COMPACT_CARD_HEIGHT = CENTER_ROW_PADDING_Y * 2 + CENTER_ROW
 export const MERGE_SUMMARY_CARD_HEIGHT = CARD_PADDING * 2 + CARD_ROW_CONTENT; // 37
 /** review_feedback: Paper p="xs" + single lineClamp={1} row. ≈37px. */
 export const REVIEW_FEEDBACK_CARD_HEIGHT = CARD_PADDING * 2 + CARD_ROW_CONTENT; // 37
-/** spec_continuation / spec_blocked_continuation: Paper p="xs" + truncate row. ≈37px. */
-export const SPEC_CONTINUATION_CARD_HEIGHT = CARD_PADDING * 2 + CARD_ROW_CONTENT; // 37
 
 /** Central lookup: kind → fixed height (px). Used by tests + the registry. */
 export const SYSTEM_SIMPLE_CARD_HEIGHTS: Record<SystemSimpleKind, number> = {
@@ -97,8 +85,6 @@ export const SYSTEM_SIMPLE_CARD_HEIGHTS: Record<SystemSimpleKind, number> = {
 	segment_compact: SEGMENT_COMPACT_CARD_HEIGHT,
 	merge_summary: MERGE_SUMMARY_CARD_HEIGHT,
 	review_feedback: REVIEW_FEEDBACK_CARD_HEIGHT,
-	spec_continuation: SPEC_CONTINUATION_CARD_HEIGHT,
-	spec_blocked_continuation: SPEC_CONTINUATION_CARD_HEIGHT,
 };
 
 /**

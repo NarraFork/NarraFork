@@ -81,6 +81,9 @@ const ToolCallInspector = lazy(() =>
 const FilePreviewModal = lazy(() =>
 	import("../FilePreviewModal").then((m) => ({ default: m.FilePreviewModal })),
 );
+const ContentInspector = lazy(() =>
+	import("../ContentInspector").then((m) => ({ default: m.ContentInspector })),
+);
 
 const SWIPE_REVEAL_WIDTH = 180;
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
@@ -129,6 +132,13 @@ export interface VListRowInteractionProps {
 	 * traces, system cards and anything with no readable text).
 	 */
 	onOpenFullscreen?: () => void;
+	/**
+	 * Verbatim model-facing content for the "what the model saw" inspector, for rows
+	 * that speak FOR somebody (a system injection) rather than run a tool. Present →
+	 * an inspect item opens the generic ContentInspector with this exact text; absent
+	 * → the item is hidden. Independent of `toolUseId` (which drives the tool dump).
+	 */
+	inspectContent?: { title: string; text: string };
 	/** Row body (the pure renderer's output). */
 	children: ReactNode;
 }
@@ -150,6 +160,7 @@ export function VListRowInteraction({
 	toolActions,
 	onViewOriginal,
 	onOpenFullscreen,
+	inspectContent,
 	children,
 }: VListRowInteractionProps) {
 	const interactive = useRenderInteractive();
@@ -163,6 +174,7 @@ export function VListRowInteraction({
 	// on close), so an idle row carries no modal cost.
 	const [inspectorOpened, setInspectorOpened] = useState(false);
 	const [previewOpened, setPreviewOpened] = useState(false);
+	const [contentInspectorOpened, setContentInspectorOpened] = useState(false);
 
 	const isSelected = selection.selectedBlockIds.has(blockId);
 
@@ -336,7 +348,7 @@ export function VListRowInteraction({
 		</>
 	) : null;
 
-	const hasViewActions = copyText != null || onOpenFullscreen != null;
+	const hasViewActions = copyText != null || onOpenFullscreen != null || inspectContent != null;
 
 	const menuItemsNode = (
 		<>
@@ -360,6 +372,17 @@ export function VListRowInteraction({
 					}}
 				>
 					{t("copy")}
+				</Menu.Item>
+			)}
+			{inspectContent && (
+				<Menu.Item
+					leftSection={<IconInfoCircle size={14} />}
+					onClick={() => {
+						setContentInspectorOpened(true);
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("contentInspector.inspect")}
 				</Menu.Item>
 			)}
 			{hasViewActions && hasToolActions ? <Menu.Divider /> : null}
@@ -561,6 +584,18 @@ export function VListRowInteraction({
 						toolUseId={toolUseId}
 						opened={inspectorOpened}
 						onClose={() => setInspectorOpened(false)}
+					/>
+				</Suspense>
+			)}
+
+			{/* Model-facing content inspector (system injections) — lazy, open-only. */}
+			{contentInspectorOpened && inspectContent && (
+				<Suspense fallback={null}>
+					<ContentInspector
+						opened={contentInspectorOpened}
+						onClose={() => setContentInspectorOpened(false)}
+						title={inspectContent.title}
+						content={inspectContent.text}
 					/>
 				</Suspense>
 			)}

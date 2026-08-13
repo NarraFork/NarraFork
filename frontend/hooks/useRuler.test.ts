@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { flattenRulerPages, type RulerData } from "./useRuler";
+import {
+	flattenRulerPages,
+	type RulerData,
+	rulerNewerPageParam,
+	rulerOlderPageParam,
+} from "./useRuler";
+
+function commit(sha: string) {
+	return { sha, shortSha: sha, message: sha, author: "A", date: "d" };
+}
 
 function page(overrides: Partial<RulerData> = {}): RulerData {
 	return {
@@ -66,13 +75,13 @@ describe("flattenRulerPages", () => {
 					{ sha: "c2", shortSha: "c2", message: "older-newest", author: "A", date: "d" },
 					{ sha: "c3", shortSha: "c3", message: "oldest", author: "A", date: "d" },
 				],
-				oldestLoadedIndex: 1,
-				newestLoadedIndex: 2,
+				firstOffset: 1,
+				lastOffset: 2,
 			}),
 			page({
 				commits: [{ sha: "c1", shortSha: "c1", message: "head", author: "A", date: "d" }],
-				oldestLoadedIndex: 0,
-				newestLoadedIndex: 0,
+				firstOffset: 0,
+				lastOffset: 0,
 			}),
 		]);
 
@@ -88,16 +97,16 @@ describe("flattenRulerPages", () => {
 					{ sha: "a", shortSha: "a", message: "one", author: "A", date: "d" },
 					{ sha: "b", shortSha: "b", message: "two", author: "A", date: "d" },
 				],
-				oldestLoadedIndex: 0,
-				newestLoadedIndex: 1,
+				firstOffset: 0,
+				lastOffset: 1,
 			}),
 			page({
 				commits: [
 					{ sha: "b", shortSha: "b", message: "two", author: "A", date: "d" },
 					{ sha: "c", shortSha: "c", message: "three", author: "A", date: "d" },
 				],
-				oldestLoadedIndex: 1,
-				newestLoadedIndex: 2,
+				firstOffset: 1,
+				lastOffset: 2,
 			}),
 		]);
 
@@ -113,8 +122,8 @@ describe("flattenRulerPages", () => {
 					{ sha: "a", shortSha: "a", message: "one", author: "A", date: "d" },
 					{ sha: "b", shortSha: "b", message: "two", author: "A", date: "d" },
 				],
-				oldestLoadedIndex: 0,
-				newestLoadedIndex: 1,
+				firstOffset: 0,
+				lastOffset: 1,
 				segments: [
 					{
 						fromSha: "a",
@@ -130,8 +139,8 @@ describe("flattenRulerPages", () => {
 			}),
 			page({
 				commits: [{ sha: "c", shortSha: "c", message: "three", author: "A", date: "d" }],
-				oldestLoadedIndex: 2,
-				newestLoadedIndex: 2,
+				firstOffset: 2,
+				lastOffset: 2,
 				segments: [
 					{
 						fromSha: "c",
@@ -159,13 +168,13 @@ describe("flattenRulerPages", () => {
 		const merged = flattenRulerPages([
 			page({
 				commits: [{ sha: "a", shortSha: "a", message: "one", author: "A", date: "d" }],
-				oldestLoadedIndex: 0,
-				newestLoadedIndex: 0,
+				firstOffset: 0,
+				lastOffset: 0,
 			}),
 			page({
 				commits: [{ sha: "b", shortSha: "b", message: "two", author: "A", date: "d" }],
-				oldestLoadedIndex: 1,
-				newestLoadedIndex: 1,
+				firstOffset: 1,
+				lastOffset: 1,
 				segments: [
 					{
 						fromSha: "unloaded",
@@ -194,21 +203,21 @@ describe("flattenRulerPages", () => {
 		const merged = flattenRulerPages([
 			page({
 				commits: [{ sha: "c2", shortSha: "c2", message: "older", author: "A", date: "d" }],
-				oldestLoadedIndex: 1,
-				newestLoadedIndex: 1,
+				firstOffset: 1,
+				lastOffset: 1,
 				totalCommitCount: 2,
 			}),
 			page({
 				commits: [{ sha: "c1", shortSha: "c1", message: "head", author: "A", date: "d" }],
-				oldestLoadedIndex: 0,
-				newestLoadedIndex: 0,
+				firstOffset: 0,
+				lastOffset: 0,
 				totalCommitCount: 2,
 			}),
 		]);
 
 		expect(merged.totalCommitCount).toBe(2);
-		expect(merged.oldestLoadedIndex).toBe(0);
-		expect(merged.newestLoadedIndex).toBe(1);
+		expect(merged.firstOffset).toBe(0);
+		expect(merged.lastOffset).toBe(1);
 	});
 
 	test("carries each chapter's parked snapshot through the merge", () => {
@@ -218,8 +227,8 @@ describe("flattenRulerPages", () => {
 		const merged = flattenRulerPages([
 			page({
 				commits: [{ sha: "a", shortSha: "a", message: "one", author: "A", date: "d" }],
-				oldestLoadedIndex: 0,
-				newestLoadedIndex: 0,
+				firstOffset: 0,
+				lastOffset: 0,
 				activeChapters: [
 					{
 						id: "ch-a",
@@ -238,12 +247,25 @@ describe("flattenRulerPages", () => {
 			}),
 			page({
 				commits: [{ sha: "b", shortSha: "b", message: "two", author: "A", date: "d" }],
-				oldestLoadedIndex: 1,
-				newestLoadedIndex: 1,
+				firstOffset: 1,
+				lastOffset: 1,
 			}),
 		]);
 
 		expect(merged.activeChapters[0]?.parkedSnapshot).toBe("abcdef0123456789");
+	});
+
+	test("keeps the older end available after merging pages", () => {
+		// `rulerOlderPageParam` reads `lastOffset` off the MERGED result, so a max that
+		// picked the wrong end would strand paging after the first "load older" click.
+		const merged = flattenRulerPages([
+			page({ commits: [commit("c3")], firstOffset: 2, lastOffset: 3, totalCommitCount: 10 }),
+			page({ commits: [commit("c1")], firstOffset: 0, lastOffset: 1, totalCommitCount: 10 }),
+		]);
+
+		expect(merged.firstOffset).toBe(0);
+		expect(merged.lastOffset).toBe(3);
+		expect(rulerOlderPageParam(merged)).toEqual({ cursor: "c3", direction: "older" });
 	});
 
 	test("deduplicates identical fallbacks", () => {
@@ -257,5 +279,104 @@ describe("flattenRulerPages", () => {
 			feature: "ruler.gitLog",
 			reason: "git_log_failed",
 		});
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Paging direction
+//
+// `git log` is newest-first: offset 0 is HEAD and grows towards OLDER history. The
+// predicates used to be inline booleans written against field names that said the
+// opposite (`oldestLoadedIndex` for the offset of the page's first commit), so the very
+// first page — the one with all the older history still ahead of it — reported "nothing
+// older to load". On a repository longer than one page (200 commits) every chapter
+// anchored past the window then lost its tick, and the Ruler told the user the start
+// commit was not on this branch while offering no way to load it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("rulerOlderPageParam", () => {
+	test("[REGRESSION] the FIRST page can still page older", () => {
+		// The exact shape the server returns for a fresh load of a long repository, and
+		// the exact case the old `oldestLoadedIndex > 0` test answered `false` for.
+		const firstPage = page({
+			commits: [commit("head"), commit("older")],
+			firstOffset: 0,
+			lastOffset: 199,
+			totalCommitCount: 1058,
+		});
+
+		expect(rulerOlderPageParam(firstPage)).toEqual({ cursor: "older", direction: "older" });
+	});
+
+	test("cursors on the page's OLDEST commit, since the server counts forward from it", () => {
+		const p = page({
+			commits: [commit("newest"), commit("middle"), commit("oldest")],
+			firstOffset: 0,
+			lastOffset: 2,
+			totalCommitCount: 99,
+		});
+
+		expect(rulerOlderPageParam(p)?.cursor).toBe("oldest");
+	});
+
+	test("stops at the end of history rather than re-asking forever", () => {
+		const lastPage = page({
+			commits: [commit("a"), commit("b")],
+			firstOffset: 8,
+			lastOffset: 9,
+			totalCommitCount: 10,
+		});
+
+		expect(rulerOlderPageParam(lastPage)).toBeUndefined();
+	});
+
+	test("a single page covering the whole history offers nothing more", () => {
+		const whole = page({
+			commits: [commit("a"), commit("b")],
+			firstOffset: 0,
+			lastOffset: 1,
+			totalCommitCount: 2,
+		});
+
+		expect(rulerOlderPageParam(whole)).toBeUndefined();
+	});
+
+	test("an empty page yields no param: there is no cursor to count forward from", () => {
+		// `lastOffset` is `firstOffset - 1` here (an offset past HEAD). Without the cursor
+		// guard this would ask again with `cursor: undefined` and re-fetch offset 0 forever.
+		const empty = page({ commits: [], firstOffset: 500, lastOffset: 499, totalCommitCount: 10 });
+
+		expect(rulerOlderPageParam(empty)).toBeUndefined();
+	});
+
+	test("a response predating the offset fields pages nowhere (old server, no guessing)", () => {
+		const legacy = page({ commits: [commit("a")], totalCommitCount: 100 });
+
+		expect(rulerOlderPageParam(legacy)).toBeUndefined();
+		expect(rulerNewerPageParam(legacy)).toBeUndefined();
+	});
+});
+
+describe("rulerNewerPageParam", () => {
+	test("the first page has nothing newer: offset 0 IS HEAD", () => {
+		const firstPage = page({
+			commits: [commit("head")],
+			firstOffset: 0,
+			lastOffset: 199,
+			totalCommitCount: 1058,
+		});
+
+		expect(rulerNewerPageParam(firstPage)).toBeUndefined();
+	});
+
+	test("a page below HEAD cursors on its NEWEST commit", () => {
+		const deeper = page({
+			commits: [commit("newest"), commit("oldest")],
+			firstOffset: 200,
+			lastOffset: 399,
+			totalCommitCount: 1058,
+		});
+
+		expect(rulerNewerPageParam(deeper)).toEqual({ cursor: "newest", direction: "newer" });
 	});
 });

@@ -10,11 +10,18 @@
  *     content lane (relative, height = rowHeight):
  *       ThemeIcon size={18}            at left 0, vertically centred
  *       [Loader size={12}]             at left 24, vertically centred (searching)
- *       text lines                     at left chromeLeft, vertically centred
+ *       text lines                     at left chromeLeft, top of the lane
  *
  * CRITICAL: each text fragment is painted with the SAME font string that was
  * measured (block.fonts[itemIndex]); label vs query colour comes from the
  * fragment class the measure layer tagged.
+ *
+ * Vertical alignment: the 17px xs line box next to the 18px icon already looks
+ * a hair low, and an inherited body strut (16px × 1.55) makes it worse — the
+ * inline-block fragments sit on that strut's baseline, so the ink reads a few
+ * pixels below the icon. Kill the strut (`fontSize: 0` on the line) and paint
+ * fragments at `lineHeight: 1` so flex can centre the 12px em-box in the
+ * reserved line, matching RenderMedia's header row.
  */
 
 import {
@@ -47,14 +54,12 @@ const LABEL_COLOR = "var(--mantine-color-dimmed)";
 const QUERY_COLOR = "var(--mantine-color-teal-text)";
 
 export function RenderWebSearch({ measured, isSearching = false }: RenderWebSearchProps) {
-	const { blocks, frame, contentWidth } = measured;
+	const { blocks, contentWidth } = measured;
 	const textBlock = blocks[0] as PreparedInlineBlock | undefined;
-	const textFrame = frame.blocks[0];
 
 	const chromeLeft = webSearchChromeLeft(isSearching);
 	// Content-lane height inside the padding+border (== measured rowHeight).
 	const laneHeight = measured.height - WEB_SEARCH_PADDING * 2 - WEB_SEARCH_BORDER * 2;
-	const textHeight = textFrame?.height ?? WEB_SEARCH_ICON_SIZE;
 
 	const lines = useMemo(() => {
 		if (!textBlock || textBlock.kind !== "inline") return [];
@@ -77,10 +82,13 @@ export function RenderWebSearch({ measured, isSearching = false }: RenderWebSear
 	}, [textBlock, contentWidth, chromeLeft]);
 
 	const lineHeight = textBlock?.kind === "inline" ? textBlock.lineHeight : WEB_SEARCH_ICON_SIZE;
-	// Vertical centring offsets within the content lane (mirrors Group align=center).
+	// Icon (+ optional loader) is centred in the lane. Text starts at the top
+	// (`textTop` is always 0: the reserved row is max(icon, text), so there is
+	// never leftover vertical slack to split). Optical centring of the 12px
+	// glyphs against the 18px icon happens inside each 17px line — see the
+	// fontSize:0 / lineHeight:1 notes on the line box below.
 	const iconTop = Math.max(0, (laneHeight - WEB_SEARCH_ICON_SIZE) / 2);
 	const loaderTop = Math.max(0, (laneHeight - WEB_SEARCH_LOADER_SIZE) / 2);
-	const textTop = Math.max(0, (laneHeight - textHeight) / 2);
 
 	return (
 		<Paper
@@ -89,7 +97,7 @@ export function RenderWebSearch({ measured, isSearching = false }: RenderWebSear
 			p="xs"
 			style={{
 				position: "relative",
-				width: contentWidth,
+				width: "100%",
 				height: measured.height,
 				boxSizing: "border-box",
 			}}
@@ -115,11 +123,15 @@ export function RenderWebSearch({ measured, isSearching = false }: RenderWebSear
 						<Loader size={WEB_SEARCH_LOADER_SIZE} color="teal" type="dots" />
 					</div>
 				) : null}
-				<div style={{ position: "absolute", left: chromeLeft, top: textTop, right: 0 }}>
+				<div
+					data-vlist-ws-text=""
+					style={{ position: "absolute", left: chromeLeft, top: 0, right: 0 }}
+				>
 					{lines.map((line, lineIndex) => (
 						<div
 							// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
 							key={lineIndex}
+							data-vlist-ws-line=""
 							style={{
 								position: "absolute",
 								left: 0,
@@ -128,6 +140,11 @@ export function RenderWebSearch({ measured, isSearching = false }: RenderWebSear
 								display: "flex",
 								alignItems: "center",
 								width: "max-content",
+								// Kill the inherited body strut (16px × 1.55). Without this the
+								// inline-block fragments sit on that taller baseline and the
+								// 12px ink reads several pixels below the 18px icon.
+								fontSize: 0,
+								lineHeight: 1,
 							}}
 						>
 							<LineFragments>
@@ -140,6 +157,10 @@ export function RenderWebSearch({ measured, isSearching = false }: RenderWebSear
 										<span
 											style={{
 												font: frag.font,
+												// `font` restores the 12px size the parent zeroed out.
+												// lineHeight:1 shrinks the box to the em-square so flex
+												// can centre the glyphs in the reserved 17px line.
+												lineHeight: 1,
 												marginLeft: frag.gapBefore,
 												whiteSpace: "pre",
 												display: "inline-block",

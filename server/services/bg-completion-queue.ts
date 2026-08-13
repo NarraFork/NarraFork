@@ -1,9 +1,15 @@
 /**
- * Background task completion notification queue.
+ * Background AGENT completion notifications.
  *
  * Extracted into its own module (no db dependency) to avoid circular imports
  * between narrator-session and narrator-subagent.
+ *
+ * Ordering note: entries land in the shared `parent-injection-queue`, not in a queue of
+ * their own. This module keeps only what is specific to this producer — the result cap
+ * and the model-facing formatting.
  */
+
+import { pushPendingInjection } from "./parent-injection-queue";
 
 const MAX_BACKGROUND_RESULT_CHARS = 12_000;
 
@@ -27,39 +33,27 @@ function capResult(result: string | undefined): { result: string | undefined; tr
 	};
 }
 
-let _bgCompletionQueue: Map<string, CompletedBgSubagentNotification[]> | undefined;
-function getBgCompletionQueue() {
-	if (!_bgCompletionQueue) _bgCompletionQueue = new Map();
-	return _bgCompletionQueue;
-}
-
+/**
+ * Enqueue a finished background agent.
+ *
+ * The result capping stays here (it is this producer's concern); the ORDER lives in
+ * `parent-injection-queue`, which is shared with the bash and Send producers so that a
+ * report sent before a task finished cannot be shown after it. See that module's header
+ * for why ordering is established at enqueue rather than reconstructed from timestamps.
+ */
 export function pushBgCompletionNotification(
 	parentNarratorId: string,
 	notification: CompletedBgSubagentNotification,
 ) {
-	const queue = getBgCompletionQueue();
-	const list = queue.get(parentNarratorId) ?? [];
 	const capped = capResult(notification.result);
-	list.push({
-		...notification,
-		result: capped.result,
-		resultTruncated: notification.resultTruncated || capped.truncated,
+	pushPendingInjection(parentNarratorId, {
+		kind: "bg_agent",
+		task: {
+			...notification,
+			result: capped.result,
+			resultTruncated: notification.resultTruncated || capped.truncated,
+		},
 	});
-	queue.set(parentNarratorId, list);
-}
-
-/**
- * Drain completed background subagent notifications for a parent narrator.
- * Used by getInjectedUserText to inform the agent about completed background tasks.
- */
-export function drainCompletedBackgroundSubagents(
-	parentNarratorId: string,
-): CompletedBgSubagentNotification[] {
-	const queue = getBgCompletionQueue();
-	const list = queue.get(parentNarratorId);
-	if (!list || list.length === 0) return [];
-	queue.delete(parentNarratorId);
-	return list;
 }
 
 export function formatBackgroundCompletionNotifications(

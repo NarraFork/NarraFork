@@ -10,11 +10,7 @@ import {
 } from "../tool-use-id-dedup";
 import type { AgentToolUse } from "../types";
 
-function assistantMessage(
-	id: string,
-	toolUseIds: string[],
-	options: { sideCars?: DbMessage["sideCars"] } = {},
-): DbMessage {
+function assistantMessage(id: string, toolUseIds: string[]): DbMessage {
 	return {
 		id,
 		role: "assistant",
@@ -37,7 +33,6 @@ function assistantMessage(
 			outputJson: "ok",
 			status: "success",
 		})),
-		...(options.sideCars ? { sideCars: options.sideCars } : {}),
 	};
 }
 
@@ -100,22 +95,6 @@ describe("uniquifyDbMessageToolUseIds", () => {
 		const ids = toolUseIdsOf(result[0]);
 		expect(new Set(ids).size).toBe(3);
 		expect(contentToolUseIdsOf(result[0])).toEqual(ids);
-	});
-
-	test("sideCar 的 toolUseId 绑定随改名一起迁移", () => {
-		const messages = [
-			assistantMessage("m1", ["call_go_0"]),
-			assistantMessage("m2", ["call_go_0"], {
-				sideCars: [
-					{ target: "tool_result", toolUseId: "call_go_0", kind: "note", text: "extra" },
-				] as unknown as DbMessage["sideCars"],
-			}),
-		];
-		const result = uniquifyDbMessageToolUseIds(messages);
-
-		const renamed = toolUseIdsOf(result[1])[0];
-		expect(renamed).not.toBe("call_go_0");
-		expect(result[1].sideCars?.[0]?.toolUseId).toBe(renamed);
 	});
 
 	test("生成的 ID 保持可辨识且长度受限", () => {

@@ -33,6 +33,7 @@ import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
 
 const TOTAL_STEPS = 6;
+
 const SETUP_WIZARD_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 const MODEL_SELECT_OPTION_LIMIT = 100;
 
@@ -76,6 +77,49 @@ export function countConfiguredProviders(
 	addCredentialProviders("cline", settings.clineProviders ?? [], "accessToken", true);
 	if (settings.codexAvailable && !disabledPrefixes.has("codex")) configured.add("codex");
 	return configured.size;
+}
+
+/**
+ * Wizard step order. Providers come BEFORE dependencies on purpose: a provider
+ * key is the one thing the user must supply themselves, while missing system
+ * dependencies can be handed to a Setup Assistant narrator — which only works
+ * once a provider exists. Gating on deps first blocked first-time users on an
+ * install step they could have delegated.
+ */
+export const WIZARD_STEPS = [
+	"welcome",
+	"provider",
+	"deps",
+	"basic",
+	"network",
+	"complete",
+] as const;
+
+export type WizardStep = (typeof WIZARD_STEPS)[number];
+
+export function wizardStepIndex(step: WizardStep): number {
+	return WIZARD_STEPS.indexOf(step);
+}
+
+/**
+ * Which gate (if any) blocks "Next" on the current step.
+ *
+ * Providers are a hard gate: nothing downstream — including delegated dependency
+ * installation — works without one. Dependencies are deliberately NOT gated, so
+ * a user can move on and let the Setup Assistant finish the job later.
+ */
+export function wizardNextBlockedReasonKey(state: {
+	step: number;
+	providerCount: number;
+	basicStepValid: boolean;
+}): "wizardProviderRequired" | "wizardModelsRequired" | null {
+	if (state.step === wizardStepIndex("provider") && state.providerCount === 0) {
+		return "wizardProviderRequired";
+	}
+	if (state.step === wizardStepIndex("basic") && !state.basicStepValid) {
+		return "wizardModelsRequired";
+	}
+	return null;
 }
 
 export async function persistSetupWizardBeforeNetworkChange<T>(
@@ -157,19 +201,9 @@ export function SetupWizard({ initialStep, onClose }: SetupWizardProps) {
 	// Track whether both models are set in BasicSettingsStep
 	const [basicStepValid, setBasicStepValid] = useState(false);
 
-	// Determine if "Next" should be disabled for the current step
-	const isNextDisabled = () => {
-		if (step === 2) return providerCount === 0;
-		if (step === 3) return !basicStepValid;
-		return false;
-	};
-
-	// Tooltip for disabled next button
-	const nextDisabledReason = () => {
-		if (step === 2 && providerCount === 0) return t("wizardProviderRequired");
-		if (step === 3 && !basicStepValid) return t("wizardModelsRequired");
-		return undefined;
-	};
+	const blockedReasonKey = wizardNextBlockedReasonKey({ step, providerCount, basicStepValid });
+	const isNextDisabled = () => blockedReasonKey !== null;
+	const nextDisabledReason = () => (blockedReasonKey ? t(blockedReasonKey) : undefined);
 
 	const nextButton = (
 		<Button
@@ -196,14 +230,16 @@ export function SetupWizard({ initialStep, onClose }: SetupWizardProps) {
 
 			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
 				<Box p="md">
-					{step === 0 && <WelcomeStep />}
-					{step === 1 && <DepsStep />}
-					{step === 2 && <ProviderStep providerCount={providerCount} />}
-					{step === 3 && <BasicSettingsStep onValidChange={setBasicStepValid} />}
-					{step === 4 && (
+					{step === wizardStepIndex("welcome") && <WelcomeStep />}
+					{step === wizardStepIndex("provider") && <ProviderStep providerCount={providerCount} />}
+					{step === wizardStepIndex("deps") && <DepsStep onDelegated={onClose} />}
+					{step === wizardStepIndex("basic") && (
+						<BasicSettingsStep onValidChange={setBasicStepValid} />
+					)}
+					{step === wizardStepIndex("network") && (
 						<NetworkStep pendingHost={pendingNetworkHost} onHostChange={setPendingNetworkHost} />
 					)}
-					{step === 5 && <CompleteStep />}
+					{step === wizardStepIndex("complete") && <CompleteStep />}
 				</Box>
 			</ScrollArea>
 
@@ -249,13 +285,11 @@ export function SetupWizard({ initialStep, onClose }: SetupWizardProps) {
 	);
 }
 
-const STEP_KEYS = ["welcome", "deps", "provider", "basic", "network", "complete"];
-
 function StepIndicator({ current, total }: { current: number; total: number }) {
 	const { t } = useTranslation("settings");
 	return (
 		<Group justify="center" gap="xs">
-			{STEP_KEYS.map((key, i) => (
+			{WIZARD_STEPS.map((key, i) => (
 				<Box
 					key={key}
 					w={i === current ? 24 : 8}
@@ -294,14 +328,22 @@ function WelcomeStep() {
 	);
 }
 
-function DepsStep() {
+/**
+ * Dependency step. Intentionally not gated: the user may skip it and either
+ * install later or let a Setup Assistant narrator do it. `onDelegated` closes
+ * the wizard so the newly created narrator can be opened.
+ */
+function DepsStep({ onDelegated }: { onDelegated: () => void }) {
 	const { t } = useTranslation("settings");
 	return (
 		<Stack gap="sm">
 			<Text size="sm" c="dimmed">
 				{t("wizardDepsDesc")}
 			</Text>
-			<DependencyStatus />
+			<Text size="xs" c="dimmed">
+				{t("wizardDepsOptionalHint")}
+			</Text>
+			<DependencyStatus onDelegated={onDelegated} />
 		</Stack>
 	);
 }

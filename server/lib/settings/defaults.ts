@@ -684,7 +684,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── auth ────────────────────────────────────────────────────────────
 	"auth.registrationOpen": {
-		desc: "是否允许新用户注册。false 时禁用注册（首个注册的用户始终为管理员）。",
+		desc: "是否允许新用户注册。false 时禁用注册。首个注册的用户始终为管理员，且创建后会自动置为 false，需要时可由管理员重新开启。",
 		type: "boolean",
 	},
 	"auth.trustedProxyCidrs": {

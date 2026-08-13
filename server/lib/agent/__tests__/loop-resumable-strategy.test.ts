@@ -8,6 +8,8 @@ import type { AgentConfig, AgentEvent, ApiRequestDiagnostics } from "../types";
  *  - a complete tool call  → finish the turn normally so the tool runs and its
  *                            result is carried into the next turn
  *  - visible answer text   → flush it and let the caller append a continuation
+ *  - half-written tool input → finish the turn and inject the skeleton-first
+ *                            reminder; replaying would hit the same size ceiling
  *  - only reasoning        → drop the truncated reasoning and replay the request
  *
  * These tests drive the loop through a scripted provider adapter so each shape
@@ -38,6 +40,8 @@ function resumableErrorEvent(): ParsedStreamEvent {
 /** Scripted attempts: each entry is the event sequence for one provider.chat() call. */
 let attempts: ParsedStreamEvent[][] = [];
 let attemptCount = 0;
+/** `content` (the user-side turn text) seen by each provider.chat() call, in order. */
+let sentContents: string[] = [];
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
@@ -45,6 +49,7 @@ const testProvider: ProviderAdapter = {
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
+		sentContents.push(params.content ?? "");
 		const script = attempts[attemptCount++];
 		if (!script) throw new Error(`Unexpected provider.chat() call ${attemptCount}`);
 		for (const event of script) {
@@ -100,6 +105,7 @@ async function runLoop(
 ): Promise<AgentEvent[]> {
 	attempts = script;
 	attemptCount = 0;
+	sentContents = [];
 	const events: AgentEvent[] = [];
 	const controller = new AbortController();
 	for await (const event of agentLoop(
@@ -120,11 +126,13 @@ function providerCalls(): number {
 beforeEach(() => {
 	attempts = [];
 	attemptCount = 0;
+	sentContents = [];
 });
 
 afterEach(() => {
 	attempts = [];
 	attemptCount = 0;
+	sentContents = [];
 });
 
 afterAll(() => {
@@ -161,25 +169,6 @@ describe("resumable interruption: reasoning-only → drop and replay the request
 			type: "assistant_message",
 			text: "recovered answer",
 		});
-		expect(events.at(-1)).toEqual({ type: "done" });
-	});
-
-	test("a tool call with truncated input counts as reasoning-only (broken call, not a real tool)", async () => {
-		const events = await runLoop([
-			[
-				// toolUseChunk without a stop: the input was cut off mid-stream, so no
-				// complete tool call exists — replaying is safe (nothing executed).
-				{ toolUseChunk: { toolUseId: "tu_broken", name: "Bash", input: '{"comm' } },
-				resumableErrorEvent(),
-			],
-			[{ text: "recovered after broken tool input" }],
-		]);
-
-		expect(providerCalls()).toBe(2);
-		expect(events.some((event) => event.type === "resumable_error")).toBe(false);
-		expect(events.some((event) => event.type === "stream_reset")).toBe(true);
-		// No tool was ever executed.
-		expect(events.some((event) => event.type === "tool_result")).toBe(false);
 		expect(events.at(-1)).toEqual({ type: "done" });
 	});
 
@@ -273,6 +262,78 @@ describe("resumable interruption: complete tool call → run the tool and contin
 			strategy: "tool_continuation",
 		});
 		expect(events.some((event) => event.type === "tool_result")).toBe(true);
+	});
+});
+
+describe("resumable interruption: truncated tool input → skeleton-first reminder", () => {
+	/**
+	 * The regression this guards: a `toolUseChunk` with no stop signal used to be
+	 * classified as reasoning-only, so the loop discarded it and replayed the
+	 * identical request. When the cause was an oversized tool input (the common
+	 * case — a Write whose content did not fit in one response), the replay hit the
+	 * same ceiling, and the model was never told to switch to skeleton + splice.
+	 * It now finishes the turn so the orphaned-tool detector injects that reminder.
+	 */
+	test("does not replay the request, and injects the reminder into the next turn", async () => {
+		const events = await runLoop([
+			[
+				{ reasoning: "I will write the whole file at once" },
+				// No `stop: true`: the arguments were still streaming when the break hit.
+				{
+					toolUseChunk: {
+						toolUseId: "tu_cut",
+						name: "Write",
+						input: '{"file_path":"/tmp/big.ts","content":"export const a = 1;',
+					},
+				},
+				resumableErrorEvent(),
+			],
+			[{ text: "switched to a skeleton" }],
+		]);
+
+		// The identical request must NOT be replayed — that reproduces the truncation.
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
+		// Reported as an in-loop recovery naming the truncated-input strategy.
+		expect(events.find((event) => event.type === "resumable_recovered")).toMatchObject({
+			type: "resumable_recovered",
+			strategy: "truncated_tool_input",
+			diagnostics: { resumable: true },
+		});
+		// Not a hard failure and not a continuation-prompt handoff to the caller.
+		expect(events.some((event) => event.type === "invalid_state")).toBe(false);
+		expect(events.some((event) => event.type === "resumable_error")).toBe(false);
+		// Nothing executed: the half-written call has no usable input.
+		expect(events.some((event) => event.type === "tool_result")).toBe(false);
+
+		// The turn advanced instead of being retried in place...
+		expect(events.some((event) => event.type === "turn_complete")).toBe(true);
+		// ...and the follow-up request carries the skeleton-first instructions,
+		// naming the tool that was cut off.
+		expect(providerCalls()).toBe(2);
+		const followUp = sentContents[1];
+		expect(followUp).toContain("Write");
+		expect(followUp).toContain("10,000");
+		expect(followUp).toContain("SPLICE_1");
+	});
+
+	/**
+	 * The card published while the arguments streamed never reaches tool_result
+	 * (this id executes nothing), so it must be retired explicitly — otherwise it
+	 * stays on screen as a tool with a live elapsed timer, forever.
+	 */
+	test("retracts the streaming tool card so no ghost tool is left running", async () => {
+		const events = await runLoop([
+			[
+				{ toolUseChunk: { toolUseId: "tu_ghost", name: "Edit", input: '{"file_path":"/a' } },
+				resumableErrorEvent(),
+			],
+			[{ text: "recovered" }],
+		]);
+
+		expect(events.find((event) => event.type === "tool_use_discarded")).toMatchObject({
+			type: "tool_use_discarded",
+			toolUseIds: ["tu_ghost"],
+		});
 	});
 });
 

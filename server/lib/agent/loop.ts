@@ -36,7 +36,6 @@ import {
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
-import { appendSideCarsForApi } from "./sidecar";
 import {
 	groupToolExecutions,
 	isStrictSerialToolExecution,
@@ -90,7 +89,6 @@ import type {
 	AgentConfig,
 	AgentEvent,
 	AgentHistoryReplacement,
-	AgentSideCar,
 	AgentToolUse,
 	ApiRequestDiagnostics,
 	ContentBlock,
@@ -1296,7 +1294,13 @@ export async function runReflectionLoop(
 			maxTransientRetries: getAuxiliaryMaxRetries(parentConfig.maxTransientRetries),
 			onEvent: undefined,
 			onBeforeTurn: undefined,
-			getSideCars: undefined,
+			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
+			// injections: the reminders belong to the parent conversation, and writing rows
+			// from here would put them in the transcript twice (once now, once when the parent
+			// reaches its own boundary).
+			deliverInjectionRow: undefined,
+			getAfterToolsInjections: undefined,
+			onCompletedToolCount: undefined,
 			silentToolCallThreshold: -1,
 			shouldStop: undefined,
 			toolFilter: undefined,
@@ -2297,12 +2301,18 @@ export async function* agentLoop(
 	let tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
-	let completedToolCount = config.sideCarInitialCompletedToolCount ?? 0;
+	let completedToolCount = config.initialCompletedToolCount ?? 0;
 	const silentToolCallThreshold = normalizeSilentToolCallThreshold(config.silentToolCallThreshold);
 	let silentToolCallCount = 0;
-	const countedToolUseIds = new Set<string>();
-	const sideCarCheckedToolUseIds = new Set<string>();
-	const toolResultSideCarCache = new Map<string, AgentSideCar[]>();
+	/**
+	 * Tools whose settled result has already been processed for injections.
+	 *
+	 * One set, not the three it replaces: the old code kept a counted-ids set, a
+	 * sidecar-checked set and a result cache, each guarding a different slice of the same
+	 * function against the same re-entry (a result drained during streaming and again by
+	 * the execution-group loop). They could only ever hold the same ids.
+	 */
+	const processedToolUseIds = new Set<string>();
 	const pipelineExitConfirmationAttachedStateIds = new Set<string>();
 	// Knowledge-base entry ids already injected this compact cycle (point B de-dup; shared
 	// across tool outputs). Prefer the session-provided shared set so point A (user message)
@@ -2310,20 +2320,71 @@ export async function* agentLoop(
 	// a compact boundary clears it. Falls back to a local set for standalone/test callers.
 	const knowledgeInjectedEntryIds = config.knowledgeInjectedEntryIds ?? new Set<string>();
 
-	function cacheToolResultSideCars(toolUseId: string, sideCars: AgentSideCar[]): AgentSideCar[] {
-		toolResultSideCarCache.set(toolUseId, sideCars);
-		return sideCars;
+	/**
+	 * Reminders the loop itself raised, awaiting delivery at the turn boundary.
+	 *
+	 * These used to be appended INSIDE the tool result's string. They are now persisted
+	 * as their own message rows by the host (`config.deliverInjectionRow`) and folded into
+	 * the next turn's text, which is why they are queued rather than returned: a row must
+	 * be written once per reminder, not once per tool result that happened to be assembled.
+	 */
+	type LoopInjection = NonNullable<Parameters<NonNullable<typeof config.deliverInjectionRow>>[0]>;
+
+	const pendingLoopInjections: LoopInjection[] = [];
+
+	function queueLoopInjection(injection: LoopInjection): void {
+		if (!injection.content.trim()) return;
+		pendingLoopInjections.push(injection);
 	}
 
-	async function collectToolResultSideCars(
+	/**
+	 * Persist the queued reminders and return the text for the current turn.
+	 *
+	 * A host without the hook gets "" and the reminders are dropped rather than falling
+	 * back to a side-car: delivering both ways is how the same words end up in the
+	 * conversation twice.
+	 */
+	async function flushLoopInjections(): Promise<string> {
+		if (pendingLoopInjections.length === 0) return "";
+		const queued = pendingLoopInjections.splice(0, pendingLoopInjections.length);
+		if (!config.deliverInjectionRow) return "";
+		const parts: string[] = [];
+		for (const injection of queued) {
+			try {
+				const text = await config.deliverInjectionRow(injection);
+				if (text?.trim()) parts.push(text);
+			} catch (err) {
+				logger.warn("Failed to deliver loop injection row", {
+					narratorId: config.narratorId,
+					source: injection.source,
+					error: String(err),
+				});
+			}
+		}
+		return parts.join("\n\n");
+	}
+
+	/**
+	 * Raise the reminders a settled tool result warrants, and advance the tool counter.
+	 *
+	 * Formerly `collectToolResultSideCars`, which returned side-cars to be appended inside
+	 * the tool result's string. Every one of those reminders is now a message row (queued
+	 * here, persisted at the turn boundary by {@link flushLoopInjections}), so nothing is
+	 * returned — but the call sites are unchanged in one respect that matters:
+	 *
+	 * ⚠️ This is called MORE THAN ONCE for the same tool. A result can be drained during
+	 * streaming and again by the execution-group loop, so `processedToolUseIds` makes the
+	 * whole body idempotent. Without it a single silent-progress threshold crossing would
+	 * queue two rows, and the completed-tool count would double-advance — which would in
+	 * turn fire the cadence-driven reminders at twice their configured rate.
+	 */
+	async function processToolResultInjections(
 		tu: AgentToolUse,
 		result: ToolExecResult,
-	): Promise<AgentSideCar[]> {
-		if (toolResultSideCarCache.has(tu.toolUseId)) {
-			return toolResultSideCarCache.get(tu.toolUseId) ?? [];
-		}
+	): Promise<void> {
+		if (processedToolUseIds.has(tu.toolUseId)) return;
+		processedToolUseIds.add(tu.toolUseId);
 
-		const sideCars: AgentSideCar[] = [];
 		const pipelineStateId = result.pipelineExitConfirmationStateId;
 		if (pipelineStateId && !pipelineExitConfirmationAttachedStateIds.has(pipelineStateId)) {
 			pipelineExitConfirmationAttachedStateIds.add(pipelineStateId);
@@ -2331,42 +2392,42 @@ export async function* agentLoop(
 				...result.metadata,
 				pipelineExitConfirmationStateId: pipelineStateId,
 			};
-			sideCars.push({
-				target: "tool_result",
+			queueLoopInjection({
 				source: "pipeline_exit_confirmation",
 				...sideCarBodyWithText("pipeline_exit_confirmation", { kind: "notice" }, locale),
-				orderIndex: 40,
 				toolUseId: tu.toolUseId,
+				// The ack must happen only once the row is durable, which the host knows and
+				// this loop does not. Carrying the id here replaces the old detour through
+				// `result.metadata` and the event handler.
+				pipelineExitConfirmationStateId: pipelineStateId,
 			});
 		}
 
 		if (!result.broken && !result.fatal) {
 			silentToolCallCount++;
 			if (silentToolCallThreshold >= 0 && silentToolCallCount >= silentToolCallThreshold) {
-				sideCars.push({
-					target: "tool_result",
+				queueLoopInjection({
 					source: "silent_progress",
 					...sideCarBodyWithText(
 						"silent_progress",
 						{ kind: "notice", params: { count: silentToolCallCount } },
 						locale,
 					),
-					orderIndex: 10,
 					toolUseId: tu.toolUseId,
 				});
 				silentToolCallCount = 0;
 			}
 		}
 
-		if (result.broken || result.fatal) {
-			return cacheToolResultSideCars(tu.toolUseId, sideCars);
-		}
+		// A broken or fatal result gets no further reminders: the model needs to see the
+		// failure, not advice about planning or the knowledge base. It also must not count
+		// toward the completed-tool cadence, which measures productive work.
+		if (result.broken || result.fatal) return;
+
 		if (await shouldInjectRelaxedPlanToolReminder(tu, config)) {
-			sideCars.push({
-				target: "tool_result",
+			queueLoopInjection({
 				source: "relaxed_plan",
 				...sideCarBodyWithText("relaxed_plan", { kind: "notice" }, locale),
-				orderIndex: 20,
 				toolUseId: tu.toolUseId,
 			});
 		}
@@ -2387,8 +2448,7 @@ export async function* agentLoop(
 					},
 				);
 				if (scan) {
-					sideCars.push({
-						target: "tool_result",
+					queueLoopInjection({
 						source: "knowledge_base_hint",
 						// `scan.content` is the same text this body renders to (asserted in
 						// sidecar-body.test.ts against formatInjectionsBare), so the body is
@@ -2405,7 +2465,6 @@ export async function* agentLoop(
 							},
 							locale,
 						),
-						orderIndex: 30,
 						toolUseId: tu.toolUseId,
 						knowledgeInjection: {
 							narratorId: config.narratorId,
@@ -2423,45 +2482,35 @@ export async function* agentLoop(
 				});
 			}
 		}
-		if (!countedToolUseIds.has(tu.toolUseId)) {
-			countedToolUseIds.add(tu.toolUseId);
-			completedToolCount++;
-			config.onSideCarCompletedToolCount?.(completedToolCount);
-		}
-		if (!config.getSideCars || sideCarCheckedToolUseIds.has(tu.toolUseId)) {
-			return cacheToolResultSideCars(tu.toolUseId, sideCars);
-		}
-		sideCarCheckedToolUseIds.add(tu.toolUseId);
-		try {
-			const collected = await config.getSideCars({
-				phase: "tool_result",
-				toolName: tu.name,
-				toolUseId: tu.toolUseId,
-				completedToolCount,
-			});
-			sideCars.push(...collected.filter((sc) => sc.target === "tool_result"));
-		} catch (err) {
-			logger.warn("Failed to collect tool result sidecars", {
-				narratorId: config.narratorId,
-				toolUseId: tu.toolUseId,
-				error: String(err),
-			});
-		}
-		return cacheToolResultSideCars(tu.toolUseId, sideCars);
+		completedToolCount++;
+		config.onCompletedToolCount?.(completedToolCount);
 	}
 
-	async function collectAfterToolsSideCars(): Promise<AgentSideCar[]> {
-		if (!config.getSideCars) return [];
+	/**
+	 * Text to fold into the next turn from producers that persist their OWN message row.
+	 *
+	 * The successor to the `after_tools` side-car phase, and it differs in the one way
+	 * that matters: nothing is yielded for persistence. A producer calling
+	 * `deliverInjection` has already written a row, so emitting a side-car here as well
+	 * would put the same words into the conversation twice — once as a row and once as an
+	 * attachment on somebody else's message.
+	 *
+	 * The text is still needed because this loop rebuilds its in-memory history only at
+	 * pass start: a row written mid-turn is invisible until the next pass, and a
+	 * finished background task should not have to wait that long to be mentioned.
+	 */
+	async function collectAfterToolsInjectionText(): Promise<string> {
+		if (!config.getAfterToolsInjections) return "";
 		try {
-			const sideCars = await config.getSideCars({ phase: "after_tools" });
-			return sideCars.filter((sc) => sc.target === "user_message");
+			const text = await config.getAfterToolsInjections();
+			return text?.trim() ?? "";
 		} catch (err) {
-			logger.warn("Failed to collect after-tools sidecars", {
+			logger.warn("Failed to collect after-tools injections", {
 				narratorId: config.narratorId,
 				error: String(err),
 			});
+			return "";
 		}
-		return [];
 	}
 
 	// Shallow-copy to avoid mutating the caller's array
@@ -2805,7 +2854,7 @@ export async function* agentLoop(
 					const brokenOverride = settled.broken
 						? sanitizeBrokenInput(tu.name, tu.input, locale)
 						: undefined;
-					const toolSideCars = await collectToolResultSideCars(tu, settled);
+					await processToolResultInjections(tu, settled);
 					const baseOutput = settled.broken
 						? getToolMessage("brokenToolCallResult", locale)
 						: settled.output;
@@ -2822,7 +2871,6 @@ export async function* agentLoop(
 						brokenInputOverride: brokenOverride,
 						updatedInput: brokenOverride ?? settled.updatedInput,
 						metadata: settled.metadata,
-						sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 					};
 				}
 			}
@@ -3037,12 +3085,29 @@ export async function* agentLoop(
 			 * there is actually partial output to continue from — otherwise it
 			 * degrades to an ordinary retryable/non-retryable error.
 			 */
+			/**
+			 * Names of tool calls the model had STARTED writing arguments for when the
+			 * stream ended, but which never received a stop signal — the accumulator
+			 * still holds a half-written input.
+			 *
+			 * This is the single source of truth for "the model was cut off mid tool
+			 * input". It is deliberately distinct from "only reasoning was produced":
+			 * a truncated tool input proves the model committed to a tool call whose
+			 * arguments did not fit, so the recovery is to tell it to write smaller
+			 * calls (the skeleton-first reminder), NOT to replay the identical request
+			 * and hit the same ceiling again.
+			 *
+			 * Entries without a name are ignored: a `toolUseChunk` carrying only an id
+			 * never creates a real accumulator entry and represents no output.
+			 */
+			const orphanedToolInputNames = (): string[] =>
+				[...toolUseAccum.values()].map((acc) => acc.name).filter((name): name is string => !!name);
+
 			const hasAnyPersistableOutput = (): boolean => {
-				const hasOrphanedToolAccum = [...toolUseAccum.values()].some((acc) => !!acc.name);
 				return (
 					!!assistantText ||
 					toolUses.length > 0 ||
-					hasOrphanedToolAccum ||
+					orphanedToolInputNames().length > 0 ||
 					!!collectReasoningBlocks(reasoningBlockMap) ||
 					!!collectCompletedWebSearches(webSearchAccum) ||
 					!!collectCompletedImageGenerations(imageGenAccum)
@@ -3063,17 +3128,24 @@ export async function* agentLoop(
 			 * - `text_continuation`: visible answer text (or a completed web
 			 *   search / image generation) exists. Flush it and let the caller append
 			 *   a continuation user turn.
-			 * - `reasoning_only_retry`: only reasoning (or a tool call whose input was
-			 *   cut off mid-stream) exists. Nothing client-facing was committed and no
-			 *   side effect occurred, so the safest recovery is to DROP the partial
-			 *   reasoning and re-send the identical request in place. Keeping truncated
-			 *   reasoning would pollute the history and degrade the continuation.
+			 * - `truncated_tool_input`: no tool call completed, but the model was cut off
+			 *   while writing one's arguments. Replaying the identical request is the
+			 *   WRONG recovery here: the most common cause is a tool input that does not
+			 *   fit in one response, so an identical replay reproduces the same
+			 *   truncation until the retry budget dies. Finish the turn through the
+			 *   normal path instead, where the orphaned-tool detector injects the
+			 *   skeleton-first reminder and the model can switch to smaller calls.
+			 * - `reasoning_only_retry`: only reasoning exists. Nothing client-facing was
+			 *   committed and no side effect occurred, so the safest recovery is to DROP
+			 *   the partial reasoning and re-send the identical request in place. Keeping
+			 *   truncated reasoning would pollute the history and degrade the continuation.
 			 * - `none`: nothing to resume from; fall through to ordinary
 			 *   retryable/terminal error handling.
 			 */
 			const classifyResumeStrategy = ():
 				| "tool_continuation"
 				| "text_continuation"
+				| "truncated_tool_input"
 				| "reasoning_only_retry"
 				| "none" => {
 				if (toolUses.length > 0) return "tool_continuation";
@@ -3084,10 +3156,10 @@ export async function* agentLoop(
 				) {
 					return "text_continuation";
 				}
-				const hasOrphanedToolAccum = [...toolUseAccum.values()].some((acc) => !!acc.name);
-				if (!!collectReasoningBlocks(reasoningBlockMap) || hasOrphanedToolAccum) {
-					return "reasoning_only_retry";
-				}
+				// Ranked above reasoning: a model that thinks and THEN gets cut off writing
+				// a tool call must be told to write smaller calls, not asked to try again.
+				if (orphanedToolInputNames().length > 0) return "truncated_tool_input";
+				if (collectReasoningBlocks(reasoningBlockMap)) return "reasoning_only_retry";
 				return "none";
 			};
 
@@ -3827,7 +3899,7 @@ export async function* agentLoop(
 											const brokenOverride = sr.broken
 												? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
 												: undefined;
-											const toolSideCars = await collectToolResultSideCars(prevTu, sr);
+											await processToolResultInjections(prevTu, sr);
 											const baseOutput = sr.broken
 												? getToolMessage("brokenToolCallResult", locale)
 												: sr.output;
@@ -3844,7 +3916,6 @@ export async function* agentLoop(
 												brokenInputOverride: brokenOverride,
 												updatedInput: brokenOverride ?? sr.updatedInput,
 												metadata: sr.metadata,
-												sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 											};
 											if (sr.fatal) {
 												yield* finishRequest(sr.output);
@@ -4290,10 +4361,30 @@ export async function* agentLoop(
 									};
 									break;
 								}
+								if (strategy === "truncated_tool_input") {
+									// The model was cut off while writing a tool's arguments. Finish the
+									// turn through the normal path so the orphaned-tool detector injects
+									// the skeleton-first reminder; an identical replay would just hit the
+									// same output ceiling again.
+									logger.warn("Resumable stream interruption mid tool input", {
+										narratorId: config.narratorId,
+										provider: effectiveProvider,
+										model: effectiveModel,
+										requestId,
+										reason,
+										orphanedTools: orphanedToolInputNames(),
+									});
+									yield {
+										type: "resumable_recovered",
+										strategy: "truncated_tool_input",
+										message,
+										diagnostics: requestDiagnostics,
+									};
+									break;
+								}
 								if (strategy === "reasoning_only_retry" && !hasStartedEarlyToolExecution()) {
-									// Only reasoning (or a tool call with truncated input) was produced.
-									// Drop it and re-send the identical request instead of continuing
-									// from a truncated thought.
+									// Only reasoning was produced. Drop it and re-send the identical
+									// request instead of continuing from a truncated thought.
 									if (
 										(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 										!config.signal.aborted
@@ -4670,6 +4761,25 @@ export async function* agentLoop(
 							// path so tools execute and their results reach the next turn.
 							// `sawErrorEvent` stays unset on purpose (see the invalidState
 							// branch above) so the turn is not cut short.
+							break;
+						}
+						if (strategy === "truncated_tool_input") {
+							// Cut off mid tool input: leave the retry loop so the orphaned-tool
+							// detector can inject the skeleton-first reminder. Replaying the same
+							// request would reproduce the same truncation.
+							logger.warn("Resumable stream interruption mid tool input", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								requestId,
+								orphanedTools: orphanedToolInputNames(),
+							});
+							yield {
+								type: "resumable_recovered",
+								strategy: "truncated_tool_input",
+								message: msg,
+								diagnostics: requestDiagnostics,
+							};
 							break;
 						}
 						if (strategy === "reasoning_only_retry" && !hasStartedEarlyToolExecution()) {
@@ -5064,9 +5174,17 @@ export async function* agentLoop(
 				// assistant message (content:null) that breaks history replay.
 				// We drop the reasoning (do NOT flush it to the DB), reset the frontend's
 				// streaming snapshot, and recover based on what the previous block was.
+				//
+				// A half-written tool input is deliberately counted as meaningful output
+				// here. It is not a dead turn: the model committed to a tool call whose
+				// arguments were cut off, which the orphaned-tool detector below turns
+				// into the skeleton-first reminder. Treating it as reasoning-only would
+				// discard that evidence and replay the identical request, reproducing the
+				// same truncation until the retry budget is exhausted.
 				const hasMeaningfulOutput =
 					assistantText.trim().length > 0 ||
 					toolUses.length > 0 ||
+					orphanedToolInputNames().length > 0 ||
 					!!collectCompletedWebSearches(webSearchAccum) ||
 					!!collectCompletedImageGenerations(imageGenAccum);
 				const hasReasoning = !!collectReasoningBlocks(reasoningBlockMap);
@@ -5403,9 +5521,15 @@ export async function* agentLoop(
 			// Detect orphaned tool uses — tool calls whose streaming input was cut off
 			// before receiving a stop signal (typically due to API max_tokens truncation).
 			// These are silently dropped by the accumulator, so we must detect and handle them.
-			const orphanedToolNames = [...toolUseAccum.values()].map((acc) => acc.name).filter(Boolean);
+			const orphanedToolNames = orphanedToolInputNames();
 			const hasOrphanedToolUses = orphanedToolNames.length > 0;
-			if (hasOrphanedToolUses) toolUseAccum.clear();
+			if (hasOrphanedToolUses) {
+				// The cards published while the arguments were streaming will never reach
+				// tool_result (these ids execute nothing), so retire them explicitly —
+				// otherwise each truncated call leaves a ghost tool running forever.
+				yield* retractStreamingToolCards();
+				toolUseAccum.clear();
+			}
 
 			// Yield accumulated content before assistant_message so partial-block
 			// persistence is finalized for both normal and truncated turns.
@@ -5427,7 +5551,7 @@ export async function* agentLoop(
 				const brokenOverride = sr.broken
 					? sanitizeBrokenInput(tu.name, tu.input, locale)
 					: undefined;
-				const toolSideCars = await collectToolResultSideCars(tu, sr);
+				await processToolResultInjections(tu, sr);
 				const baseOutput = sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output;
 				yield {
 					type: "tool_result",
@@ -5442,7 +5566,6 @@ export async function* agentLoop(
 					brokenInputOverride: brokenOverride,
 					updatedInput: brokenOverride ?? sr.updatedInput,
 					metadata: sr.metadata,
-					sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 				};
 				if (sr.fatal) {
 					yield { type: "error", message: sr.output };
@@ -5555,14 +5678,13 @@ export async function* agentLoop(
 					// update the in-memory tool_use so pushAssistantTurn writes the correct
 					// input into history — otherwise the model sees the original (wrong) path.
 					if (result.updatedInput) tu.input = result.updatedInput;
-					const toolSideCars = await collectToolResultSideCars(tu, result);
+					await processToolResultInjections(tu, result);
 					const isLastTool = toolIndex === toolUses.length - 1;
-					const outputWithReminder =
-						toolSideCars.length > 0
-							? appendSideCarsForApi(result.output, toolSideCars)
-							: result.output;
+					// The turn nudge is still appended inline: it is about THIS being the last
+					// tool of a nearly-exhausted turn, so it has to travel with that result
+					// rather than wait for a boundary the loop may not reach.
 					const outputForModel =
-						isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
+						isLastTool && shouldNudge ? result.output + nudgeText : result.output;
 
 					pendingToolResults.push(
 						provider.formatToolResult(
@@ -5625,7 +5747,6 @@ export async function* agentLoop(
 								durationMs !== result.durationMs
 									? { ...result.metadata, execDurationMs: result.durationMs }
 									: result.metadata,
-							sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 						};
 						toolIndex++;
 
@@ -5667,7 +5788,6 @@ export async function* agentLoop(
 					const indexed = execEntries.map((e, i) => e.promise.then((result) => ({ i, result })));
 
 					const settled = new Array<ToolExecResult | undefined>(group.length);
-					const parallelSideCarsByIndex = new Array<AgentSideCar[] | undefined>(group.length);
 					const formattedResults = new Array<unknown>(group.length);
 					const groupStartToolIndex = toolIndex;
 					let remaining = new Set(indexed);
@@ -5686,8 +5806,7 @@ export async function* agentLoop(
 						const effectiveResult = result;
 						if (effectiveResult.broken) brokenToolUseIds.add(tu.toolUseId);
 						if (effectiveResult.updatedInput) tu.input = effectiveResult.updatedInput;
-						const parallelSideCars = await collectToolResultSideCars(tu, effectiveResult);
-						parallelSideCarsByIndex[i] = parallelSideCars;
+						await processToolResultInjections(tu, effectiveResult);
 
 						// Persist and broadcast every completed result immediately in completion order.
 						// Model-facing formatting still happens below in the original call order.
@@ -5715,7 +5834,6 @@ export async function* agentLoop(
 								brokenInputOverride,
 								updatedInput: brokenInputOverride ?? effectiveResult.updatedInput,
 								metadata: effectiveResult.metadata,
-								sideCars: parallelSideCars.length > 0 ? parallelSideCars : undefined,
 							};
 						}
 						if (effectiveResult.durationMs > maxParallelMs)
@@ -5728,14 +5846,11 @@ export async function* agentLoop(
 						const tu = group[i];
 						const effectiveResult = settled[i];
 						if (!effectiveResult) continue;
-						const parallelSideCars = parallelSideCarsByIndex[i] ?? [];
-						const outputWithReminder =
-							parallelSideCars.length > 0
-								? appendSideCarsForApi(effectiveResult.output, parallelSideCars)
-								: effectiveResult.output;
 						const isLastTool = groupStartToolIndex + i === toolUses.length - 1;
 						const outputForModel =
-							isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
+							isLastTool && shouldNudge
+								? effectiveResult.output + nudgeText
+								: effectiveResult.output;
 						formattedResults[i] = provider.formatToolResult(
 							tu.toolUseId,
 							outputForModel,
@@ -5795,15 +5910,11 @@ export async function* agentLoop(
 						const result = await earlyPromise;
 						if (result.broken) brokenToolUseIds.add(remainingTool.toolUseId);
 						if (result.updatedInput) remainingTool.input = result.updatedInput;
-						const toolSideCars = await collectToolResultSideCars(remainingTool, result);
-						const outputWithSideCars =
-							toolSideCars.length > 0
-								? appendSideCarsForApi(result.output, toolSideCars)
-								: result.output;
+						await processToolResultInjections(remainingTool, result);
 						pendingToolResults.push(
 							provider.formatToolResult(
 								remainingTool.toolUseId,
-								outputWithSideCars,
+								result.output,
 								result.isError ?? false,
 								result.images,
 								remainingTool.name,
@@ -5830,7 +5941,6 @@ export async function* agentLoop(
 								brokenInputOverride,
 								updatedInput: brokenInputOverride ?? result.updatedInput,
 								metadata: result.metadata,
-								sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 							};
 						}
 						if (result.fatal && !fatalOutput) fatalOutput = result.output;
@@ -5911,19 +6021,22 @@ export async function* agentLoop(
 			// tool_use with no matching result (and an orphaned result for the old id).
 			remapToolResultIds(pendingToolResults, turnToolUseIdRemap);
 
-			// Collect after-tools sidecars (replaces getInjectedUserText).
-			// These are assembled into the next user turn's text portion.
-			const afterToolsSideCars = await collectAfterToolsSideCars();
-			if (afterToolsSideCars.length > 0) {
-				const injected = appendSideCarsForApi("", afterToolsSideCars);
-				if (injected) {
-					nextTurnContent = nextTurnContent ? `${nextTurnContent}\n\n${injected}` : injected;
-				}
-				yield { type: "sidecars", sideCars: afterToolsSideCars };
+			// Producers that persist their own message row contribute text only — see
+			// `collectAfterToolsInjectionText` on why nothing is yielded for them.
+			// Loop-raised reminders are flushed first so they read in the order they were
+			// raised, before anything the host drained at this same boundary.
+			for (const injectionText of [
+				await flushLoopInjections(),
+				await collectAfterToolsInjectionText(),
+			]) {
+				if (!injectionText) continue;
+				nextTurnContent = nextTurnContent
+					? `${nextTurnContent}\n\n${injectionText}`
+					: injectionText;
 			}
 
 			// Close the small race between the final group boundary and the next provider
-			// request: direct user feedback may arrive while after-tools sidecars are collected.
+			// request: direct user feedback may arrive while after-tools injections are drained.
 			if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
 			if (gracefulStopRequested) {
 				yield { type: "turn_complete", turnIndex };

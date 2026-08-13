@@ -1,5 +1,5 @@
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
-import { eq } from "drizzle-orm";
+import { count, eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import QRCode from "qrcode";
 import { db } from "../db";
@@ -72,14 +72,36 @@ async function verifyRateLimitedMfaToken(
 }
 
 authRoutes.post("/register", async (c) => {
+	// Validate before taking a lease so malformed bodies don't consume the
+	// instance's registration budget or the shared bcrypt slot.
 	const parsed = registerSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
-	const { user, token, language } = await registerUser(
-		parsed.data.username,
-		parsed.data.password,
-		parsed.data.language,
-	);
-	return c.json({ user, token, language }, 201);
+
+	// An instance with no users yet is exempt from the instance-wide interval: the
+	// bootstrap admin is often created after a couple of validation failures, and
+	// there is no account to attack (and no code to guess) before it exists.
+	const [{ value: userCount }] = await db.select({ value: count() }).from(users);
+	const lease = authAttemptLimiter.beginRegistration(getClientIp(c), {
+		skipGlobalInterval: userCount === 0,
+	});
+	if (!lease.allowed) {
+		throw new RateLimitError(
+			lease.reason === "busy" ? "AUTH_BUSY" : "REGISTRATION_THROTTLED",
+			lease.retryAfterMs,
+		);
+	}
+
+	try {
+		const { user, token, language } = await registerUser(parsed.data);
+		lease.success();
+		return c.json({ user, token, language }, 201);
+	} catch (error) {
+		// Every rejection here — taken username, closed registration, a bad or spent
+		// code — counts as a failed attempt. Only guessing a code is an attack, but
+		// the endpoint cannot tell attacks from mistakes, and pacing both is cheap.
+		lease.failure();
+		throw error;
+	}
 });
 
 authRoutes.post("/login", async (c) => {

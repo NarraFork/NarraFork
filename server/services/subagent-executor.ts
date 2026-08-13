@@ -13,6 +13,7 @@ import { normalizeBooleanOverride } from "../lib/boolean-override";
 import { eventBus } from "../lib/event-bus";
 import { resolveFastModeForUser, resolveSubagentActingUserId } from "../lib/fast-mode";
 import { generateShortId } from "../lib/id";
+import { InjectionCadence } from "../lib/injection-cadence";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
@@ -33,6 +34,7 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { CustomSubagentDef } from "./custom-subagent-service";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "./narrator-executor";
+import { deliverInjection } from "./narrator-injection";
 import {
 	getContextOverflowFailureError,
 	getFirstTokenTimeoutMs,
@@ -316,11 +318,21 @@ export function updateSubagentBufferedMessage(
 	subagentId: string,
 	messageId: string,
 	text: string,
+	opts?: { images?: ImageRef[]; textFiles?: File[] },
 ): boolean {
 	const queue = getSubagentBufferedMessagesMap().get(subagentId);
 	const message = queue?.find((queued) => queued.id === messageId);
 	if (!message) return false;
 	message.text = text;
+	// `undefined` means "leave this alone" so text-only callers are unaffected.
+	// This queue is purely in-memory: there is no DB row to sync and no persisted
+	// file to remove, so replacing the arrays is the whole update.
+	if (opts?.images !== undefined) {
+		message.images = opts.images.length ? opts.images : undefined;
+	}
+	if (opts?.textFiles !== undefined) {
+		message.textFiles = opts.textFiles.length ? opts.textFiles : undefined;
+	}
 	message.bufferedAt = new Date().toISOString();
 	return true;
 }
@@ -720,10 +732,13 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		const resolvedServiceTier =
 			resolvedFastMode && usesCodexModel(resolvedProvider, model) ? "priority" : undefined;
 		let todoReminderCompletedToolCount = 0;
-		// Completed-tool count when the spec reminder was last injected for this
-		// subagent loop. Gates buildSpecTaskDigestBody to the same cadence the
-		// agent loop used to enforce, so we don't hit the DB on every tool result.
-		let lastTasksReminderCount = 0;
+		// Gates buildSpecTaskDigestBody to a fixed cadence so we don't hit SQLite on
+		// every tool result. Shared helper rather than a local counter: the previous
+		// inline version advanced its marker only after a SUCCESSFUL build, so a
+		// subagent whose spec had no open tasks stayed permanently due and re-read the
+		// spec file on every subsequent tool call. `InjectionCadence.due` spends the
+		// tick when asked, which is the behaviour narrator-session already had.
+		const tasksCadence = new InjectionCadence(() => TODO_REMINDER_TOOL_INTERVAL);
 		const resetUpstreamSessionForThisLoop = resetUpstreamSessionOnNextRequest;
 		resetUpstreamSessionOnNextRequest = false;
 		const config: AgentConfig = {
@@ -793,41 +808,64 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				}
 				return Object.keys(override).length > 0 ? override : null;
 			},
-			sideCarInitialCompletedToolCount: todoReminderCompletedToolCount,
-			onSideCarCompletedToolCount: (count) => {
+			initialCompletedToolCount: todoReminderCompletedToolCount,
+			onCompletedToolCount: (count: number) => {
 				todoReminderCompletedToolCount = count;
 			},
-			getSideCars: async (request) => {
-				if (request.phase === "tool_result") {
-					// Throttle to every TODO_REMINDER_TOOL_INTERVAL completed tool calls
-					// so the spec file is not re-read from SQLite on every tool result.
-					const count = request.completedToolCount ?? 0;
-					if (count - lastTasksReminderCount < TODO_REMINDER_TOOL_INTERVAL) return [];
-					const tasksBody = await buildSpecTaskDigestBody(narratorId);
-					if (!tasksBody) return [];
-					lastTasksReminderCount = count;
-					return [
-						{
-							target: "tool_result" as const,
-							source: "living_work_spec",
-							...sideCarBodyWithText("living_work_spec", tasksBody, locale as Locale),
-							toolUseId: request.toolUseId,
-						},
-					];
-				}
-				// phase === "after_tools"
-				const sideCars: import("../lib/agent/types").AgentSideCar[] = [];
+			deliverInjectionRow: async (injection) => {
+				const { turnText } = await deliverInjection(narratorId, {
+					content: injection.content,
+					body: injection.body,
+					source: injection.source,
+					schedule: "onNextTurn",
+					locale: locale as Locale,
+				});
+				return turnText ?? "";
+			},
+			getAfterToolsInjections: async () => {
+				const parts: string[] = [];
 
-				// 1. Check for buffered user messages
+				// 0. The Dynamic Spec digest, on its cadence.
+				//
+				// Previously appended inside a tool result's string (hence the `toolUseId`);
+				// it is session-level information, not about any one call, so it now lands at
+				// the turn boundary as its own row. The tick is still the loop's completed-tool
+				// count, so the cadence is unchanged — a turn that ran several tools now yields
+				// at most one reminder instead of one per tool.
+				if (tasksCadence.due(todoReminderCompletedToolCount)) {
+					const tasksBody = await buildSpecTaskDigestBody(narratorId);
+					if (tasksBody) {
+						const { body, content } = sideCarBodyWithText(
+							"living_work_spec",
+							tasksBody,
+							locale as Locale,
+						);
+						const { turnText } = await deliverInjection(narratorId, {
+							content,
+							body,
+							source: "living_work_spec",
+							schedule: "onNextTurn",
+							locale: locale as Locale,
+						});
+						if (turnText) parts.push(turnText);
+					}
+				}
+
+				// 1. A user message queued for this subagent.
+				//
+				// Text only, no `deliverInjection`: the row is written just below by
+				// `persistSubagentUserMessage` as a real `role: "user"` turn (which is what
+				// it is — the user typed it). Injecting again would duplicate it. The text is
+				// still needed because the loop built its in-memory history at pass start.
 				const queue = getSubagentBufferedMessagesMap().get(narratorId);
 				const buf = queue?.[0];
-				const canInjectAsTextSidecar =
+				const canInjectAsText =
 					!!buf &&
 					!buf.images?.length &&
 					!buf.textFiles?.length &&
 					!buf.createdBy &&
 					!buf.prePromptBashCommand;
-				if (buf && canInjectAsTextSidecar) {
+				if (buf && canInjectAsText) {
 					queue?.shift();
 					if (queue?.length === 0) {
 						getSubagentBufferedMessagesMap().delete(narratorId);
@@ -870,46 +908,53 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 						messageId: buf.id,
 						remaining,
 					});
-					sideCars.push({
-						target: "user_message",
-						source: "buffered_user",
-						// Emitted bare: this is the user's own text, and a `prose` body with no
-						// heading renders back to exactly it (byte parity is trivially held).
-						...sideCarBodyWithText(
-							"buffered_user",
-							{ kind: "prose", text: buf.text },
-							locale as Locale,
-						),
-					});
+					parts.push(buf.text);
 				}
 
-				// 2. Drain team inbox and append as notifications
+				// 2. Messages a sibling sent through TeamStatus, delivered as this subagent's
+				// own message row rather than as a side-car attached to somebody else's: a
+				// teammate's words belong in the transcript on their own line.
+				//
+				// One injection row PER message: a row that fans out into N bubbles has no
+				// per-bubble address, which is what made delete/rollback impossible to aim
+				// at one of them. A single message per row gives every bubble its own
+				// blockIndex and its own context-menu target.
+				//
+				// Undelivered mail is still dropped when the subagent finishes
+				// (`clearTeamInbox` in finalizeSubagent) — that is unchanged, and correct: a
+				// message that never reached a turn was never part of the conversation.
 				const teamMessages = drainTeamInbox(narratorId);
-				if (teamMessages.length > 0) {
-					sideCars.push({
-						target: "user_message",
-						source: "team_message",
-						...sideCarBodyWithText(
-							"team_message",
-							{
-								kind: "messages",
-								items: teamMessages.map((m) => ({
+				for (const m of teamMessages) {
+					const { body, content } = sideCarBodyWithText(
+						"team_message",
+						{
+							kind: "messages",
+							items: [
+								{
 									fromId: m.fromId,
-									// `fromTitle ?? fromId` was the old inline template's sender slot;
-									// the renderer applies the same fallback, so leaving the raw pair
-									// here keeps the text identical AND gives the UI both parts.
+									// `fromTitle ?? fromId` was the old inline template's sender slot; the
+									// renderer applies the same fallback, so keeping the raw pair holds the
+									// text identical AND gives the UI both parts.
 									fromTitle: m.fromTitle ?? null,
 									fromType: m.fromType ?? null,
 									...(m.isBroadcast ? { isBroadcast: true } : {}),
 									text: m.text,
-								})),
-							},
-							locale as Locale,
-						),
+								},
+							],
+						},
+						locale as Locale,
+					);
+					const { turnText } = await deliverInjection(narratorId, {
+						content,
+						body,
+						source: "team_message",
+						schedule: "onNextTurn",
+						locale: locale as Locale,
 					});
+					if (turnText) parts.push(turnText);
 				}
 
-				return sideCars;
+				return parts.join("\n\n");
 			},
 		};
 

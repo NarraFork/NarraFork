@@ -546,6 +546,13 @@ export const narrators = sqliteTable(
 		oauthPolicySnapshotJson: text("oauth_policy_snapshot_json", { mode: "json" }).$type<
 			Record<string, unknown>
 		>(),
+		/**
+		 * Custom bitmap avatar for this narrator, keyed into the avatars upload dir by
+		 * narrator id (same scheme as users.avatarImageId). Null → the UI falls back to
+		 * the deterministic identicon derived from the narrator id. Only a custom upload
+		 * is stored; the procedural glyph needs no column.
+		 */
+		avatarImageId: text("avatar_image_id"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -932,47 +939,6 @@ export const narratorMessageRefs = sqliteTable(
 	],
 );
 
-// === narrator_sidecars ===
-export const narratorSidecars = sqliteTable(
-	"narrator_sidecars",
-	{
-		id: text("id").primaryKey(),
-		narratorId: text("narrator_id")
-			.notNull()
-			.references(() => narrators.id, { onDelete: "cascade" }),
-		messageId: text("message_id").references(() => narratorMessages.id, {
-			onDelete: "cascade",
-		}),
-		toolUseId: text("tool_use_id"),
-		target: text("target", { enum: ["tool_result", "user_message"] }).notNull(),
-		source: text("source").notNull(),
-		/**
-		 * The model-facing text, frozen at write time. Never re-derived on read: it is
-		 * part of the model's historical context, and re-rendering it later would let a
-		 * copy tweak retroactively rewrite what the model was shown.
-		 */
-		content: text("content").notNull(),
-		/**
-		 * The same injection in structured form (`SideCarBody`), for the UI to render
-		 * without parsing `content`. Null on rows written before this column existed —
-		 * those are shown verbatim, deliberately without any compatibility parsing.
-		 */
-		bodyJson: text("body_json", { mode: "json" }),
-		orderIndex: integer("order_index").notNull().default(0),
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		index("idx_sidecars_message").on(table.messageId, table.target, table.orderIndex),
-		index("idx_sidecars_tool_use").on(
-			table.toolUseId,
-			table.target,
-			table.orderIndex,
-			table.createdAt,
-		),
-		index("idx_sidecars_narrator").on(table.narratorId, table.createdAt),
-	],
-);
-
 // === narrator_tool_calls ===
 export const narratorToolCalls = sqliteTable(
 	"narrator_tool_calls",
@@ -1024,6 +990,25 @@ export const narratorToolCalls = sqliteTable(
 		permissionStartedAt: text("permission_started_at"),
 		executionStartedAt: text("execution_started_at"),
 		completedAt: text("completed_at"),
+		/**
+		 * Wall-clock moment this call actually began, as ONE indexable value.
+		 *
+		 * The four timestamps above are written by different lifecycle stages, so no
+		 * single one of them can order a global execution log: on a production database
+		 * only ~38% of recent rows carry `execution_started_at`, and every row older than
+		 * migration 0034 has all four NULL. This mirrors the fallback chain
+		 * `subagent-activity.selectActivityTimestamp` already uses for display.
+		 *
+		 * VIRTUAL rather than STORED for two reasons: SQLite outright refuses
+		 * `ALTER TABLE ... ADD` of a stored column, and a virtual one needs no table
+		 * rewrite over the existing rows (measured: 561k rows, 6.6 GB database).
+		 * Generated columns are omitted from every INSERT/UPDATE Drizzle builds, so no
+		 * write path changes; `idx_toolcalls_started_at` is what makes it cheap to read.
+		 */
+		startedAt: text("started_at").generatedAlwaysAs(
+			sql`coalesce("execution_started_at", "permission_started_at", "stream_started_at", "created_at")`,
+			{ mode: "virtual" },
+		),
 		errorMessage: text("error_message"),
 		permissionDecidedBy: text("permission_decided_by"),
 		permissionDecidedAt: text("permission_decided_at"),
@@ -1089,6 +1074,12 @@ export const narratorToolCalls = sqliteTable(
 			table.createdAt,
 		),
 		index("idx_toolcalls_created").on(table.narratorId, table.createdAt),
+		/**
+		 * Global execution-log ordering. `(startedAt, id)` so the admin page can seek a
+		 * keyset cursor with a row-value comparison — measured 0.07ms per page against
+		 * 3.8s for an unindexed `ORDER BY ... LIMIT 51` on the same data.
+		 */
+		index("idx_toolcalls_started_at").on(table.startedAt, table.id),
 	],
 );
 
@@ -1469,6 +1460,49 @@ export const userRecentTabsMeta = sqliteTable("user_recent_tabs_meta", {
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
+
+// === registration_codes ===
+// Single-use invitations an administrator hands out so someone can self-register
+// while public registration stays closed.
+//
+// Only the SHA-256 hash of a code is stored: the plaintext exists once, in the
+// creation response. That means a database read (backup, support dump) cannot be
+// turned into a usable invitation, and lookup stays an indexed hash probe rather
+// than a scan-and-compare.
+//
+// Rows are kept after redemption instead of being deleted so an administrator can
+// answer "who used which invitation, and who issued it". `used_by_user_id` /
+// `created_by_user_id` are SET NULL rather than CASCADE for the same reason: the
+// audit line must survive the account being removed.
+export const registrationCodes = sqliteTable(
+	"registration_codes",
+	{
+		id: text("id").primaryKey(),
+		codeHash: text("code_hash").notNull(),
+		/** Free-form administrator label, e.g. the name of the intended recipient. */
+		note: text("note"),
+		/** Role granted to the account created with this code. */
+		role: text("role", { enum: ["admin", "user"] })
+			.notNull()
+			.default("user"),
+		/** When set, the code only works for this exact username. */
+		boundUsername: text("bound_username"),
+		/** Mandatory expiry: an invitation that never dies is a standing signup hole. */
+		expiresAt: text("expires_at").notNull(),
+		createdByUserId: text("created_by_user_id").references(() => users.id, {
+			onDelete: "set null",
+		}),
+		usedAt: text("used_at"),
+		usedByUserId: text("used_by_user_id").references(() => users.id, { onDelete: "set null" }),
+		revokedAt: text("revoked_at"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_registration_codes_code_hash").on(table.codeHash),
+		index("idx_registration_codes_created_by").on(table.createdByUserId),
+		index("idx_registration_codes_used_by").on(table.usedByUserId),
+	],
+);
 
 // === narrator_drafts ===
 // Private per-user composer state. Empty text rows are retained as clear tombstones so

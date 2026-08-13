@@ -40,12 +40,48 @@ import { TextFileRow } from "./vlist-text-file-row";
 
 const USER_BODY_FONT = `400 ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 
+/**
+ * Bubble side + tint for a human-authored message.
+ *
+ * NarraFork is a shared deployment: one narrator can be driven by several people, so
+ * "a user typed this" and "YOU typed this" are different facts. The right-hand indigo
+ * bubble is a claim of authorship — painting a teammate's turn there tells the reader
+ * they wrote something they did not.
+ *
+ * `isSelf` is resolved by the INTEGRATION layer (it compares `creator.id` against the
+ * signed-in user), never by the adapter: both sides are the same height, so folding
+ * viewer identity into the measured data would fork the measure cache per user for a
+ * purely cosmetic difference. Same seam the header node already uses.
+ */
+function bubbleSurface(isSelf: boolean): {
+	justifyContent: "flex-end" | "flex-start";
+	background: string;
+} {
+	return isSelf
+		? { justifyContent: "flex-end", background: "var(--mantine-color-indigo-light)" }
+		: {
+				justifyContent: "flex-start",
+				// Neutral, but more solid than a system notice card so the three tiers stay
+				// distinguishable: right indigo = you, left tinted = another person,
+				// unframed grey = a system note.
+				background: "light-dark(var(--mantine-color-gray-2), var(--mantine-color-dark-5))",
+			};
+}
+
 interface RenderMessageBubbleProps {
 	role: "assistant" | "user";
 	measured: MeasuredElement;
 	/** Optional header content for user messages (username + timestamp). */
 	header?: React.ReactNode;
 	hasHeader?: boolean;
+	/**
+	 * Did the signed-in user author this turn? Drives side + tint only.
+	 *
+	 * Defaults to `true` so a caller that has not resolved identity yet keeps the
+	 * historical right-hand rendering instead of flipping every bubble to the left
+	 * for one frame while `useCurrentUser()` resolves.
+	 */
+	isSelf?: boolean;
 	/** Panel narrator id — lets user-bubble image attachments resolve their blob. */
 	narratorId?: string;
 	/** Forwarded for mermaid/katex local-measure refinement. */
@@ -67,6 +103,7 @@ export function RenderMessageBubble({
 	measured,
 	header,
 	hasHeader = true,
+	isSelf = true,
 	narratorId,
 	onUnknownHeight,
 	onToggle,
@@ -92,6 +129,7 @@ export function RenderMessageBubble({
 				measured={measured}
 				header={header}
 				hasHeader={hasHeader}
+				isSelf={isSelf}
 				onToggle={onToggle}
 			/>
 		);
@@ -101,6 +139,7 @@ export function RenderMessageBubble({
 			measured={measured}
 			header={header}
 			hasHeader={hasHeader}
+			isSelf={isSelf}
 			narratorId={narratorId}
 			onOpenAttachment={onOpenAttachment}
 			openAttachmentLabel={openAttachmentLabel}
@@ -121,11 +160,13 @@ function CommandBubble({
 	measured,
 	header,
 	hasHeader,
+	isSelf,
 	onToggle,
 }: {
 	measured: MeasuredCommandBubble;
 	header?: React.ReactNode;
 	hasHeader: boolean;
+	isSelf: boolean;
 	onToggle?: () => void;
 }) {
 	const bodyBlock = measured.blocks.find((block) => block.kind === "code") as
@@ -143,8 +184,10 @@ function CommandBubble({
 	const headerBlock = hasHeader ? USER_HEADER_HEIGHT + USER_HEADER_BODY_GAP : 0;
 	const contentTop = USER_BUBBLE_PADDING + headerBlock;
 
+	const surface = bubbleSurface(isSelf);
+
 	return (
-		<div style={{ display: "flex", justifyContent: "flex-end" }}>
+		<div style={{ display: "flex", justifyContent: surface.justifyContent }}>
 			<div
 				style={{
 					position: "relative",
@@ -152,7 +195,7 @@ function CommandBubble({
 					height: measured.height,
 					padding: USER_BUBBLE_PADDING,
 					borderRadius: 8,
-					background: "var(--mantine-color-indigo-light)",
+					background: surface.background,
 					boxSizing: "border-box",
 				}}
 			>
@@ -276,6 +319,7 @@ function UserBubble({
 	measured,
 	header,
 	hasHeader,
+	isSelf,
 	narratorId,
 	onOpenAttachment,
 	openAttachmentLabel,
@@ -283,6 +327,7 @@ function UserBubble({
 	measured: MeasuredElement;
 	header?: React.ReactNode;
 	hasHeader: boolean;
+	isSelf: boolean;
 	narratorId?: string;
 	onOpenAttachment?: (filePath: string) => void;
 	openAttachmentLabel?: string;
@@ -301,8 +346,10 @@ function UserBubble({
 	const contentTop = USER_BUBBLE_PADDING + headerBlock;
 	const lineHeight = bodyBlock?.lineHeight ?? 20;
 
+	const surface = bubbleSurface(isSelf);
+
 	return (
-		<div style={{ display: "flex", justifyContent: "flex-end" }}>
+		<div style={{ display: "flex", justifyContent: surface.justifyContent }}>
 			<div
 				style={{
 					position: "relative",
@@ -310,7 +357,7 @@ function UserBubble({
 					height: measured.height,
 					padding: USER_BUBBLE_PADDING,
 					borderRadius: 8,
-					background: "var(--mantine-color-indigo-light)",
+					background: surface.background,
 					boxSizing: "border-box",
 				}}
 			>

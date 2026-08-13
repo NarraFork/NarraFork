@@ -10,6 +10,7 @@ import {
 	Collapse,
 	Divider,
 	Drawer,
+	FileButton,
 	Group,
 	MultiSelect,
 	Paper,
@@ -34,11 +35,14 @@ import {
 	IconInfoCircle,
 	IconRefresh,
 	IconSearch,
+	IconTrash,
+	IconUpload,
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { invalidateAvatarCache } from "../../hooks/useAvatarBlobUrl";
 import { useBrowserSessions } from "../../hooks/useBrowserSessions";
 import { useChapter } from "../../hooks/useChapters";
 import {
@@ -102,6 +106,7 @@ import {
 	shouldRenderAdvancedSubsection,
 } from "./details-panel-sections";
 import { localizeNarratorError } from "./error-localization";
+import { NarratorAvatar } from "./NarratorAvatar";
 import type { ViewerInfo } from "./useNarratorPanelWS";
 
 export interface NarratorDetailsPanelProps {
@@ -415,6 +420,27 @@ export function NarratorDetailsPanel({
 		mutationFn: api.updateSettings,
 		onSuccess: (data) => {
 			qc.setQueryData(["settings"], data);
+		},
+	});
+	// Custom narrator avatar. Without one the UI falls back to the identicon derived
+	// from the narrator id, so deleting is a real "revert to procedural" action rather
+	// than leaving the narrator with no visual identity.
+	const uploadAvatarMutation = useMutation({
+		mutationFn: (file: File) => api.uploadNarratorAvatar(narratorId, file),
+		onSuccess: (data) => {
+			// The blob cache is keyed by id+imageId; the previous image id is now stale.
+			invalidateAvatarCache(narratorId, data.avatarImageId);
+			qc.invalidateQueries({ queryKey: ["narrator", narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+	const deleteAvatarMutation = useMutation({
+		mutationFn: () => api.deleteNarratorAvatar(narratorId),
+		onSuccess: () => {
+			const previous = typeof narrator?.avatarImageId === "string" ? narrator.avatarImageId : null;
+			if (previous) invalidateAvatarCache(narratorId, previous);
+			qc.invalidateQueries({ queryKey: ["narrator", narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},
 	});
 	const updateCwdMutation = useUpdateCwd();
@@ -898,6 +924,50 @@ export function NarratorDetailsPanel({
 	const content = (
 		<DetailsFilterCtx.Provider value={{ query: filterQuery }}>
 			<Stack gap="md">
+				{/* Identity: the procedural identicon, overridable by a custom bitmap. */}
+				<Group gap="md" wrap="nowrap">
+					<NarratorAvatar
+						narratorId={narratorId}
+						avatarImageId={
+							typeof narrator?.avatarImageId === "string" ? narrator.avatarImageId : null
+						}
+						title={typeof narrator?.title === "string" ? narrator.title : null}
+						size={64}
+						showTooltip={false}
+					/>
+					<Stack gap="xs">
+						<FileButton
+							onChange={(file) => {
+								if (file) uploadAvatarMutation.mutate(file);
+							}}
+							accept="image/png,image/jpeg,image/webp"
+						>
+							{(props) => (
+								<Button
+									{...props}
+									variant="light"
+									size="xs"
+									leftSection={<IconUpload size={14} />}
+									loading={uploadAvatarMutation.isPending}
+								>
+									{t("details.avatarUpload")}
+								</Button>
+							)}
+						</FileButton>
+						{typeof narrator?.avatarImageId === "string" && narrator.avatarImageId && (
+							<Button
+								variant="subtle"
+								color="red"
+								size="xs"
+								leftSection={<IconTrash size={14} />}
+								onClick={() => deleteAvatarMutation.mutate()}
+								loading={deleteAvatarMutation.isPending}
+							>
+								{t("details.avatarReset")}
+							</Button>
+						)}
+					</Stack>
+				</Group>
 				<TextInput
 					size="xs"
 					placeholder={t("details.filterPlaceholder")}

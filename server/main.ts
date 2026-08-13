@@ -49,6 +49,13 @@ import {
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
 import { clearInheritableHandlesAfterServerBind } from "./lib/win-handle-guard";
+import {
+	findExcludingRange,
+	formatPortRanges,
+	NETSH_EXCLUDED_PORT_COMMAND,
+	nextAllowedPort,
+	readWindowsExcludedPortRanges,
+} from "./lib/windows-excluded-ports";
 import { pluginManager } from "./services/plugin-manager";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
@@ -870,11 +877,39 @@ function startServer(listenPort: number) {
 let actualPort = port;
 let _server: ReturnType<typeof startServer>;
 
-// On Windows, try to reclaim the port from stale bun processes before binding.
-tryReclaimPort(port);
+// Windows reserves blocks of TCP ports (Hyper-V / WSL / WinNAT) that bind() rejects with
+// EADDRINUSE even though no process is listening, and it re-picks those blocks on every boot.
+// Reading them first is what makes the difference between a useful startup and a dead one: the
+// blocks are ~100 ports wide, so probing consecutive ports can never escape one.
+const excludedPortRanges = readWindowsExcludedPortRanges();
+const excludedRangeForPort = findExcludingRange(port, excludedPortRanges);
+
+// Only meaningful when a real process holds the port; a reserved range has no owner to kill.
+if (!excludedRangeForPort) {
+	tryReclaimPort(port);
+}
 
 if (portExplicit) {
-	// User explicitly specified a port — fail hard if it's busy
+	// User explicitly specified a port — fail hard rather than silently moving it.
+	if (excludedRangeForPort) {
+		// Bun surfaces this bind failure asynchronously on Windows, where the catch below never
+		// runs and the process dies on an "Is port in use?" uncaught exception that points at the
+		// wrong cause. Report the real reason before touching Bun.serve().
+		const reserved = `${excludedRangeForPort.start}-${excludedRangeForPort.end}`;
+		logger.error(`Port ${port} is inside a Windows reserved TCP port range. Cannot start server.`, {
+			port,
+			reservedRange: reserved,
+			excludedRanges: formatPortRanges(excludedPortRanges),
+		});
+		console.error(
+			`\x1b[31mError: Port ${port} is reserved by Windows (excluded range ${reserved}).\x1b[0m\n` +
+				"No process is using it — the Windows TCP stack has reserved the range, and the reserved\n" +
+				"ranges change on every reboot. Inspect them with:\n" +
+				`  ${NETSH_EXCLUDED_PORT_COMMAND}\n` +
+				"Choose a port outside every listed range with --port=XXXX.",
+		);
+		process.exit(1);
+	}
 	try {
 		_server = startServer(port);
 	} catch (err) {
@@ -889,31 +924,55 @@ if (portExplicit) {
 		throw err;
 	}
 } else {
-	// Default port — try fallback ports if busy
+	// Default port — try fallback ports if busy, skipping whole reserved ranges.
 	let started = false;
-	for (let attempt = 0; attempt <= MAX_PORT_RETRIES; attempt++) {
-		const tryPort = port + attempt;
+	let candidate: number | null = nextAllowedPort(port, excludedPortRanges);
+	const attemptedPorts: number[] = [];
+	for (let attempt = 0; attempt <= MAX_PORT_RETRIES && candidate !== null; attempt++) {
+		const tryPort: number = candidate;
+		attemptedPorts.push(tryPort);
 		try {
 			_server = startServer(tryPort);
 			actualPort = tryPort;
 			started = true;
-			if (attempt > 0) {
-				logger.warn(`Default port ${port} was in use, automatically switched to port ${tryPort}`);
-				console.warn(`\x1b[33m⚠ Port ${port} is in use. Using port ${tryPort} instead.\x1b[0m`);
+			if (tryPort !== port) {
+				if (excludedRangeForPort) {
+					const reserved = `${excludedRangeForPort.start}-${excludedRangeForPort.end}`;
+					logger.warn(
+						`Port ${port} is reserved by Windows (${reserved}), automatically switched to port ${tryPort}`,
+						{ excludedRanges: formatPortRanges(excludedPortRanges) },
+					);
+					console.warn(
+						`\x1b[33m⚠ Port ${port} is reserved by Windows (excluded range ${reserved}), not used by any process.\x1b[0m\n` +
+							`  Using port ${tryPort} instead. Reserved ranges change on reboot; list them with:\n` +
+							`  ${NETSH_EXCLUDED_PORT_COMMAND}`,
+					);
+				} else {
+					logger.warn(`Default port ${port} was in use, automatically switched to port ${tryPort}`);
+					console.warn(`\x1b[33m⚠ Port ${port} is in use. Using port ${tryPort} instead.\x1b[0m`);
+				}
 			}
 			break;
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
+				candidate = nextAllowedPort(tryPort + 1, excludedPortRanges);
 				continue;
 			}
 			throw err;
 		}
 	}
 	if (!started) {
-		logger.error(`Could not find an available port (tried ${port}–${port + MAX_PORT_RETRIES}).`);
+		const attempted = attemptedPorts.length > 0 ? attemptedPorts.join(", ") : String(port);
+		logger.error(`Could not find an available port (tried ${attempted}).`, {
+			excludedRanges: formatPortRanges(excludedPortRanges),
+		});
+		const reservedHint =
+			excludedPortRanges.length > 0
+				? `\nWindows reserved TCP ranges: ${formatPortRanges(excludedPortRanges)} (list them with ${NETSH_EXCLUDED_PORT_COMMAND}).`
+				: "";
 		console.error(
-			`\x1b[31mError: Could not find an available port (tried ${port}–${port + MAX_PORT_RETRIES}).\x1b[0m\nPlease specify a port with --port=XXXX.`,
+			`\x1b[31mError: Could not find an available port (tried ${attempted}).\x1b[0m${reservedHint}\nPlease specify a port with --port=XXXX.`,
 		);
 		process.exit(1);
 	}

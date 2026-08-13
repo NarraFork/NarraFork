@@ -19,39 +19,29 @@ import { MAX_IMAGE_CLIPBOARD_BLOB_BYTES } from "./image-clipboard";
 const MAX_MESSAGE_IMAGE_PREVIEW_BLOB_BYTES = MAX_IMAGE_CLIPBOARD_BLOB_BYTES;
 
 /**
- * Compact 60×60 thumbnail of an already-persisted image, used inside the user
- * message edit mode so the editor can see (and remove) existing attachments.
- * Reuses the same `/api/uploads/:narratorId/:imageId` blob fetch as ImageBlock.
+ * Object URL for an image already persisted under `/api/uploads/:narratorId/:imageId`.
+ *
+ * Shared by the message editor's thumbnails and the queued-message row so both
+ * fetch through the same bounded, token-aware path. Returns null while loading,
+ * or when the platform does not serve narrator images at all.
  */
-export function EditExistingImageThumb({
-	block,
-	imageNarratorId,
-	onRemove,
-	disabled = false,
-}: {
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
-	block: any;
-	imageNarratorId?: string;
-	onRemove: () => void;
-	disabled?: boolean;
-}) {
-	const { t } = useTranslation("narrator");
-	const openImageViewer = useImageViewer();
+function useUploadedImageBlobUrl(
+	uploadNarratorId: string | undefined,
+	imageId: string | undefined,
+	enabled: boolean,
+): string | null {
 	const uploadCapability = useUploadCapability();
-	const narratorImageServing = uploadCapability.serveNarratorImages;
+	const supported = uploadCapability.serveNarratorImages.supported;
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
-	const uploadNarratorId =
-		typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : imageNarratorId;
 
 	useEffect(() => {
-		if (block.previewUrl || !narratorImageServing.supported || !uploadNarratorId || !block.imageId)
-			return;
+		if (!enabled || !supported || !uploadNarratorId || !imageId) return;
 		const token = getToken();
 		const headers: Record<string, string> = {};
 		if (token) headers.Authorization = `Bearer ${token}`;
 		let cancelled = false;
 		let objectUrl: string | null = null;
-		fetch(`/api/uploads/${uploadNarratorId}/${block.imageId}`, { headers })
+		fetch(`/api/uploads/${uploadNarratorId}/${imageId}`, { headers })
 			.then(async (res) => {
 				absorbRenewedToken(res, token);
 				if (!res.ok) {
@@ -71,7 +61,74 @@ export function EditExistingImageThumb({
 			cancelled = true;
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [uploadNarratorId, block.imageId, block.previewUrl, narratorImageServing.supported]);
+	}, [uploadNarratorId, imageId, enabled, supported]);
+
+	return blobUrl;
+}
+
+/**
+ * Read-only thumbnail of a queued message's image attachment.
+ *
+ * The queue row shows what is actually attached instead of a bare count, so the
+ * user can tell two pending messages apart before either one runs. Click opens
+ * the shared full-size viewer.
+ */
+export function QueuedImageThumb({
+	imageId,
+	filename,
+	uploadNarratorId,
+	size = 20,
+}: {
+	imageId: string;
+	filename?: string | null;
+	uploadNarratorId?: string;
+	size?: number;
+}) {
+	const openImageViewer = useImageViewer();
+	const src = useUploadedImageBlobUrl(uploadNarratorId, imageId, true);
+	const alt = filename ?? "image";
+
+	if (!src) return <Skeleton h={size} w={size} radius="sm" />;
+	return (
+		<Image
+			src={src}
+			alt={alt}
+			radius="sm"
+			h={size}
+			w={size}
+			fit="cover"
+			style={{ cursor: "pointer", flexShrink: 0 }}
+			onClick={(event) => {
+				// The row itself is a drag handle / expand target.
+				event.stopPropagation();
+				openImageViewer({ src, filename: alt, alt });
+			}}
+		/>
+	);
+}
+
+/**
+ * Compact 60×60 thumbnail of an already-persisted image, used inside the user
+ * message edit mode so the editor can see (and remove) existing attachments.
+ * Reuses the same `/api/uploads/:narratorId/:imageId` blob fetch as ImageBlock.
+ */
+export function EditExistingImageThumb({
+	block,
+	imageNarratorId,
+	onRemove,
+	disabled = false,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
+	block: any;
+	imageNarratorId?: string;
+	onRemove: () => void;
+	disabled?: boolean;
+}) {
+	const { t } = useTranslation("narrator");
+	const openImageViewer = useImageViewer();
+	const uploadNarratorId =
+		typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : imageNarratorId;
+	const blobUrl = useUploadedImageBlobUrl(uploadNarratorId, block.imageId, !block.previewUrl);
 
 	const src = block.previewUrl ?? blobUrl;
 

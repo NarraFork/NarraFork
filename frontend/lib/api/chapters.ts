@@ -1,5 +1,25 @@
+import type { ForkWorktreeSource } from "@shared/chapter-fork";
 import { request } from "./client";
 import type { ApiEntity } from "./types";
+
+export interface ForkChapterRequest {
+	title?: string;
+	description?: string;
+	inheritMode?: "fresh" | "compressed" | "full";
+	worktreeSource?: ForkWorktreeSource;
+	/** Fork point by SDK message uuid (assistant messages only). */
+	forkAtMessageUuid?: string;
+	/** Fork point by local narrator message id (any role) — preferred for UI forks. */
+	forkAtMessageId?: string;
+	/** Explicit commit SHA to fork from. Only valid with commit worktree source. */
+	startCommitSha?: string;
+	/** Explicit parent chapter ID (ruler mode). Defaults to root chapter. */
+	parentChapterId?: string;
+	role?: string;
+	anchorCommitSha?: string;
+	axisOffset?: number;
+	crossOffset?: number;
+}
 
 export interface ChapterSplitResult {
 	prefixChapter: ApiEntity;
@@ -21,26 +41,7 @@ export const chaptersApi = {
 	deleteChapter: (id: string) => request<ApiEntity>(`/chapters/${id}`, { method: "DELETE" }),
 
 	// Chapter operations (fork/merge/cleanup)
-	forkChapter: (
-		id: string,
-		data: {
-			title?: string;
-			description?: string;
-			inheritMode?: string;
-			/** Fork point by SDK message uuid (assistant messages only). */
-			forkAtMessageUuid?: string;
-			/** Fork point by local narrator message id (any role) — preferred for UI forks. */
-			forkAtMessageId?: string;
-			/** Explicit commit SHA to fork from (ruler mode). Overrides the fork point. */
-			startCommitSha?: string;
-			/** Explicit parent chapter ID (ruler mode). Defaults to root chapter. */
-			parentChapterId?: string;
-			role?: string;
-			anchorCommitSha?: string;
-			axisOffset?: number;
-			crossOffset?: number;
-		},
-	) =>
+	forkChapter: (id: string, data: ForkChapterRequest) =>
 		request<ApiEntity>(`/chapters/${id}/fork`, {
 			method: "POST",
 			body: JSON.stringify(data),

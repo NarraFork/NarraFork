@@ -61,7 +61,6 @@ const TABLE_COST_WEIGHTS: Record<string, number> = {
 	narrator_file_snapshots: 175,
 	narrator_message_refs: 175,
 	narrator_patches: 100,
-	narrator_sidecars: 100,
 };
 
 function estimateTableCost(tableName: string): number {

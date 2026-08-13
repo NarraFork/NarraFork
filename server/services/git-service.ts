@@ -56,6 +56,28 @@ const READ_TIMEOUT_MS = 60_000;
 const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 /**
+ * Default depth for {@link gitService.findCommitLogIndex}.
+ *
+ * A cursor deeper than this means the client is asking for a position no user
+ * scrolled to, and the caller already has a correct fallback (skip-based paging).
+ */
+const COMMIT_LOG_INDEX_SEARCH_LIMIT = 50_000;
+
+/**
+ * Bytes to retain for a `--format=%H` walk of `n` commits.
+ *
+ * One line is 41 bytes (40 hex + newline). The default `READ_MAX_OUTPUT_BYTES`
+ * (1 MB) holds only ~25k of them, so a 50k-line request silently lost half its
+ * depth: git walked the history, safeSpawn discarded the tail, and the scan
+ * reported "not found" for commits that were in range. Sized from the line count
+ * so the two budgets cannot drift apart again, plus a small slack for a trailing
+ * newline and any truncation marker.
+ */
+function commitLogIndexMaxOutputBytes(searchLimit: number): number {
+	return Math.max(READ_MAX_OUTPUT_BYTES, searchLimit * 41 + 1024);
+}
+
+/**
  * Serialize git write operations for one worktree.
  *
  * Read-only operations (status, diff, log, etc.) usually don't need this
@@ -1632,6 +1654,68 @@ export const gitService = {
 			throw new GitError(`Unexpected commit count output for ${ref}: ${result.stdout.trim()}`);
 		}
 		return count;
+	},
+
+	/**
+	 * Position of `sha` in `git log <branch>` order, or null when it is not in that walk.
+	 *
+	 * Exists because "how many commits are reachable from main but not from X"
+	 * (`rev-list --count X..main`) is NOT X's index in `git log main`, and the two differ by
+	 * exactly the commits that are ordered before X by DATE while not being its ancestors —
+	 * i.e. anything that arrived through a merge. `git log` sorts by commit date by default;
+	 * `rev-list --count A..B` measures a reachability set. On this repository the 200th
+	 * commit sits at log index 199 while the range count says 202, so paging that trusted
+	 * the count skipped three commits per page — and a chapter anchored to one of them lost
+	 * its tick and was reported as "not on this branch".
+	 *
+	 * Implemented with the same `log` walk the pages come from, so the answer is in the same
+	 * order by construction rather than by an assumed correspondence between two orders.
+	 * `--format=%H` + a line scan rather than `--pretty=%H | grep -n`: the position must
+	 * come from the array the caller pages against, and shelling out to grep would add a
+	 * second process and a locale-dependent match for something this is already reading.
+	 *
+	 * Bounded by `searchLimit` (default {@link COMMIT_LOG_INDEX_SEARCH_LIMIT}): an unbounded
+	 * scan on a huge repository is a main-thread cost with no ceiling, and a cursor that far
+	 * back means the client is asking for something no user scrolled to. Returns null past
+	 * the limit, which callers treat as "cursor not usable" and fall back to skip-based
+	 * paging.
+	 *
+	 * The line budget and the byte budget are raised TOGETHER (see the constant): the
+	 * capture ceiling is the real constraint, so a `--max-count` that exceeds what
+	 * `maxOutputBytes` can retain just makes git walk history whose output is then thrown
+	 * away, and silently halves the effective search depth.
+	 */
+	async findCommitLogIndex(
+		worktreePath: string,
+		sha: string,
+		opts: { branch?: string; searchLimit?: number } = {},
+	): Promise<number | null> {
+		if (!sha) return null;
+		const searchLimit = opts.searchLimit ?? COMMIT_LOG_INDEX_SEARCH_LIMIT;
+		const args = ["log", `--max-count=${searchLimit}`, "--format=%H"];
+		if (opts.branch) args.push(opts.branch);
+		const result = await execRead(args, worktreePath, true, {
+			maxOutputBytes: commitLogIndexMaxOutputBytes(searchLimit),
+		});
+		if (result.exitCode !== 0 || !result.stdout.trim()) return null;
+		if (result.truncated) {
+			// Not fatal — the scan below still answers for anything inside the retained
+			// prefix — but it means the effective depth was smaller than requested, and a
+			// null result may be "capture ran out" rather than "not on this branch".
+			logger.warn("Commit log index scan hit its capture ceiling", {
+				worktreePath,
+				searchLimit,
+			});
+		}
+		const lines = result.stdout.trim().split("\n");
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i]?.trim();
+			if (!line) continue;
+			// Accept an abbreviated cursor too: the ruler carries full SHAs, but a caller
+			// passing `shortSha` would otherwise silently never match and page from 0.
+			if (line === sha || (sha.length >= 7 && line.startsWith(sha))) return i;
+		}
+		return null;
 	},
 
 	// === Reset ===

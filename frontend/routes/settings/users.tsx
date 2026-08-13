@@ -13,13 +13,15 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
-import { IconLock, IconPencil, IconTrash } from "@tabler/icons-react";
+import { IconLock, IconPencil, IconPlus, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { UserAclModal } from "../../components/knowledge/UserAclModal";
+import { CreateUserModal } from "../../components/settings/CreateUserModal";
+import { RegistrationCodesSection } from "../../components/settings/RegistrationCodesSection";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
 import { formatLocaleDate } from "../../lib/intl-format";
@@ -41,6 +43,7 @@ function SettingsUsersPage() {
 	const [editUsername, setEditUsername] = useState("");
 	const [editPassword, setEditPassword] = useState("");
 	const [aclUser, setAclUser] = useState<{ id: string; username: string } | null>(null);
+	const [createOpen, setCreateOpen] = useState(false);
 
 	const { data: users, isLoading: usersLoading } = useQuery({
 		queryKey: ["admin", "users"],
@@ -109,6 +112,7 @@ function SettingsUsersPage() {
 					<Title order={4}>{t("registrationSettings")}</Title>
 					<Switch
 						label={t("registrationOpen")}
+						description={t("registrationOpenDescription")}
 						checked={settings?.auth?.registrationOpen ?? true}
 						onChange={(e) =>
 							updateAdminSettings.mutate({
@@ -119,9 +123,20 @@ function SettingsUsersPage() {
 				</Stack>
 			</Paper>
 
+			<RegistrationCodesSection />
+
 			<Paper withBorder p="md">
 				<Stack>
-					<Title order={4}>{t("userManagement")}</Title>
+					<Group justify="space-between">
+						<Title order={4}>{t("userManagement")}</Title>
+						<Button
+							size="compact-sm"
+							leftSection={<IconPlus size={14} />}
+							onClick={() => setCreateOpen(true)}
+						>
+							{t("createUser")}
+						</Button>
+					</Group>
 					{!users?.length ? (
 						<Text c="dimmed">{t("noUsers")}</Text>
 					) : (
@@ -204,6 +219,8 @@ function SettingsUsersPage() {
 					)}
 				</Stack>
 			</Paper>
+
+			<CreateUserModal opened={createOpen} onClose={() => setCreateOpen(false)} />
 
 			<Modal opened={!!editingUser} onClose={() => setEditingUser(null)} title={t("editUser")}>
 				<Stack>

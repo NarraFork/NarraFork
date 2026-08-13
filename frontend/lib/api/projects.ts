@@ -1,3 +1,4 @@
+import type { ForkWorktreeSource } from "@shared/chapter-fork";
 import {
 	ApiError,
 	authorizedFetch,
@@ -275,8 +276,9 @@ export const projectsApi = {
 		projectId: string,
 		data: {
 			startCommitSha: string;
+			worktreeSource: Extract<ForkWorktreeSource, "commit">;
 			title?: string;
-			inheritMode?: string;
+			inheritMode?: "fresh" | "compressed" | "full";
 			parentChapterId?: string;
 		},
 	) =>

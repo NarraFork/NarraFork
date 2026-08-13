@@ -22,7 +22,6 @@ import { useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorReviewToolsCapability } from "../../hooks/usePlatform";
-import { addRecentTab } from "../../hooks/useRecentTabs";
 import {
 	flattenRulerPages,
 	type RulerData,
@@ -33,7 +32,9 @@ import { useRulerChapterActivity } from "../../hooks/useRulerChapterActivity";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { ApiError, api } from "../../lib/api";
 import type { ParkedWorkFields, ParkedWorkStatus } from "../../lib/api/projects";
+import { buildRulerCommitForkRequest } from "../../lib/chapter-fork-options";
 import { Z } from "../../lib/z-index";
+import { ChapterForkModal } from "../chapter/ChapterForkModal";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { NarratorPanel } from "../narrator/NarratorPanel";
 import { resolveChapterAnchors } from "./chapter-anchoring";
@@ -798,6 +799,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	} | null>(null);
 
 	const [chapterMenu, setChapterMenu] = useState<ChapterContextMenuState | null>(null);
+	const [forkChapter, setForkChapter] = useState<ChapterContextMenuState["chapter"] | null>(null);
 
 	const [rebaseConflict, setRebaseConflict] = useState<{
 		chapterId: string;
@@ -1009,7 +1011,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const handleForkFromCommit = useCallback(
 		async (commitSha: string) => {
 			try {
-				await api.rulerFork(projectId, { startCommitSha: commitSha });
+				await api.rulerFork(projectId, buildRulerCommitForkRequest(commitSha));
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
 				queryClient.invalidateQueries({
 					queryKey: ["rulerSegment", projectId, commitSha],
@@ -1022,33 +1024,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	);
 
 	const handleChapterFork = useCallback(
-		async (chapterId: string) => {
-			try {
-				const data = await api.forkChapter(chapterId, {});
-				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
-				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
-
-				// Add the forked chapter to recent tabs immediately
-				if (data?.id) {
-					const narrators = await api.listNarrators({ chapterId: data.id });
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
-					const primary = narrators?.find((n: any) => n.variant === "primary");
-					if (primary?.id) {
-						addRecentTab({
-							type: "chapter",
-							id: data.id,
-							narratorId: primary.id,
-							title: data.title ?? "Fork",
-							subtitle: data.title,
-							status: primary.status,
-						});
-					}
-				}
-			} catch {
-				/* global handler */
-			}
+		(chapterId: string) => {
+			const chapter = chapterMenu?.chapter;
+			if (chapter?.id === chapterId) setForkChapter(chapter);
+			setChapterMenu(null);
 		},
-		[projectId, queryClient],
+		[chapterMenu],
 	);
 
 	const handleChapterMerge = useCallback(
@@ -3428,6 +3409,19 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					onClose={() => setTickMenu(null)}
 					onFork={handleForkFromCommit}
 					forkDisabled={rulerMutationDisabled.fork}
+				/>
+			)}
+
+			{forkChapter && (
+				<ChapterForkModal
+					chapterId={forkChapter.id}
+					chapterStatus={forkChapter.status}
+					opened
+					onClose={() => setForkChapter(null)}
+					onForkSuccess={() => {
+						void queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
+						void queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
+					}}
 				/>
 			)}
 

@@ -7,8 +7,7 @@ import {
 	useSensor,
 	useSensors,
 } from "@dnd-kit/core";
-import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
+import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
@@ -77,14 +76,12 @@ import {
 	IconFolderPlus,
 	IconGitBranch,
 	IconGitFork,
-	IconGripVertical,
 	IconInfoCircle,
 	IconLock,
 	IconLockOpen,
 	IconNotebook,
 	IconPaperclip,
 	IconPencil,
-	IconPhoto,
 	IconPlayerPlay,
 	IconPlayerTrackNext,
 	IconPuzzle,
@@ -211,6 +208,7 @@ import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { useImageViewer } from "../common/ImageViewerProvider";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
+import { TruncatedText } from "../common/TruncatedText";
 import { PermissionRuleEditor } from "../permissions/PermissionRuleEditor";
 import {
 	buildPluginDockPanelOpenRequest,
@@ -305,6 +303,7 @@ import {
 } from "./narrator-panel-types";
 import { getNarratorStatusBarDisplay } from "./narrator-status-bar";
 import { compactProgressLabel } from "./progress-label";
+import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
 import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
 import { RevertScopeConfirmModal } from "./RevertScopeConfirmModal";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
@@ -1716,167 +1715,6 @@ function ReasoningEffortMenuItems({
 	);
 }
 
-function SortableQueuedMessageItem({
-	msg,
-	index,
-	isEditing,
-	editingText,
-	onEditTextChange,
-	onSaveEdit,
-	onCancelEdit,
-	onStartEdit,
-	onRemove,
-	cancelBufferLabel,
-	editLabel,
-	priorityLabel,
-	priorityNextRequestLabel,
-}: {
-	msg: BufferMessageSummary;
-	index: number;
-	isEditing: boolean;
-	editingText: string;
-	onEditTextChange: (text: string) => void;
-	onSaveEdit: () => void;
-	onCancelEdit: () => void;
-	onStartEdit: (msg: { id: string; text: string }) => void;
-	onRemove: (id: string) => void;
-	cancelBufferLabel: string;
-	editLabel: string;
-	priorityLabel: string;
-	priorityNextRequestLabel: string;
-}) {
-	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-		id: msg.id,
-	});
-	const style = {
-		transform: CSS.Transform.toString(transform),
-		transition,
-		opacity: isDragging ? 0.5 : 1,
-	};
-	const priorityText = index === 0 ? priorityNextRequestLabel : priorityLabel;
-
-	return (
-		<Group
-			ref={setNodeRef}
-			style={style}
-			px="md"
-			py={4}
-			gap="xs"
-			wrap="nowrap"
-			bg="var(--mantine-color-blue-light)"
-		>
-			{isEditing ? (
-				<>
-					<div
-						{...attributes}
-						{...listeners}
-						style={{
-							cursor: "grab",
-							display: "flex",
-							alignItems: "center",
-							flexShrink: 0,
-							touchAction: "none",
-							minWidth: 24,
-							minHeight: 24,
-							justifyContent: "center",
-						}}
-					>
-						<Text size="xs" c="dimmed" w={16} ta="center">
-							{index + 1}
-						</Text>
-					</div>
-					<Textarea
-						size="xs"
-						value={editingText}
-						onChange={(e) => onEditTextChange(e.currentTarget.value)}
-						onKeyDown={(e) => {
-							if (e.key === "Enter" && !e.shiftKey) {
-								e.preventDefault();
-								onSaveEdit();
-							}
-							if (e.key === "Escape") onCancelEdit();
-						}}
-						autosize
-						minRows={1}
-						maxRows={4}
-						style={{ flex: 1 }}
-						autoFocus
-					/>
-					<ActionIcon size="xs" variant="subtle" color="green" onClick={onSaveEdit}>
-						<IconCheck size={12} />
-					</ActionIcon>
-					<ActionIcon size="xs" variant="subtle" color="gray" onClick={onCancelEdit}>
-						<IconX size={12} />
-					</ActionIcon>
-				</>
-			) : (
-				<>
-					<div
-						{...attributes}
-						{...listeners}
-						style={{
-							cursor: "grab",
-							display: "flex",
-							alignItems: "center",
-							flexShrink: 0,
-							touchAction: "none",
-							minWidth: 24,
-							minHeight: 24,
-							justifyContent: "center",
-						}}
-					>
-						<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />
-					</div>
-					{msg.creator ? (
-						<UserAvatar
-							username={msg.creator.username}
-							avatarColor={msg.creator.avatarColor}
-							avatarImageId={msg.creator.avatarImageId}
-							userId={msg.creator.id}
-							size={16}
-							showTooltip={false}
-						/>
-					) : (
-						<Box w={16} h={16} style={{ flexShrink: 0 }} />
-					)}
-					{msg.imageCount > 0 && (
-						<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
-							<IconPhoto size={14} color="var(--mantine-color-blue-5)" />
-							<Text size="xs" c="blue">
-								{msg.imageCount}
-							</Text>
-						</Group>
-					)}
-					{msg.priority && (
-						<Badge
-							size="xs"
-							color="orange"
-							variant="light"
-							leftSection={<IconBolt size={10} />}
-							style={{ flexShrink: 0 }}
-						>
-							{priorityText}
-						</Badge>
-					)}
-					<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
-						{msg.text}
-					</Text>
-					<ActionIcon
-						size="xs"
-						variant="subtle"
-						color="blue"
-						onClick={() => onStartEdit(msg)}
-						title={editLabel}
-					>
-						<IconPencil size={12} />
-					</ActionIcon>
-					<CloseButton size="xs" onClick={() => onRemove(msg.id)} title={cancelBufferLabel} />
-				</>
-			)}
-		</Group>
-	);
-}
-
 /**
  * Confirmation modal for rollback-to-block.
  *
@@ -2104,13 +1942,18 @@ function TurnElapsedTime({
 	}, [cancelClose]);
 	useEffect(() => () => cancelClose(), [cancelClose]);
 
+	// Without a popover the row has nothing else to reveal the clipped tail, so
+	// the text carries its own overflow tooltip. With a popover the full string
+	// goes into the dropdown instead — nesting a tooltip inside a popover target
+	// would open two overlapping bubbles for the same gesture.
+	if (!startedAtLabel)
+		return <TruncatedText size="xs" c="dimmed" text={text} style={{ maxWidth: "100%" }} />;
+
 	const elapsedText = (
-		<Text size="xs" c="dimmed" truncate title={text} style={{ minWidth: 0, maxWidth: "100%" }}>
+		<Text size="xs" c="dimmed" truncate style={{ minWidth: 0, maxWidth: "100%" }}>
 			{text}
 		</Text>
 	);
-
-	if (!startedAtLabel) return elapsedText;
 
 	return (
 		<Popover opened={opened} onChange={setOpened} position="top" withArrow withinPortal shadow="md">
@@ -2146,7 +1989,16 @@ function TurnElapsedTime({
 					if (!isMobile) scheduleClose();
 				}}
 			>
-				<Text size="xs">{startedAtLabel}</Text>
+				{/* The inline label is the part the row clips, so repeat it in full here:
+				    the popover is the only reveal affordance this control has. */}
+				<Stack gap={2}>
+					<Text size="xs" style={{ overflowWrap: "anywhere" }}>
+						{text}
+					</Text>
+					<Text size="xs" c="dimmed">
+						{startedAtLabel}
+					</Text>
+				</Stack>
 			</Popover.Dropdown>
 		</Popover>
 	);
@@ -5623,9 +5475,8 @@ export function NarratorPanel({
 		const clearOverlay = () => setSelectionAnchorOverlay((prev) => (prev ? null : prev));
 
 		let rafId = 0;
-		// `CSS.escape` is unavailable here (the module-level `CSS` identifier is
-		// @dnd-kit's transform helper), and a block id can carry characters that are
-		// not selector-safe. Scanning attributes avoids building a selector entirely.
+		// A block id can carry characters that are not selector-safe, so scanning
+		// attributes avoids building a selector (and needing to escape one) at all.
 		const findBlock = (): HTMLElement | null => {
 			for (const el of contentEl.querySelectorAll<HTMLElement>(`[${BLOCK_ID_ATTR}]`)) {
 				if (el.getAttribute(BLOCK_ID_ATTR) === selectionOverlayBlockId) return el;
@@ -6249,7 +6100,6 @@ export function NarratorPanel({
 	);
 
 	const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
-	const [editingQueuedText, setEditingQueuedText] = useState("");
 	const [queueExpanded, setQueueExpanded] = useState(false);
 
 	// Auto-reset expanded state when queue shrinks to ≤2
@@ -6257,34 +6107,57 @@ export function NarratorPanel({
 		if (queuedMessages.length <= QUEUE_COLLAPSE_THRESHOLD) setQueueExpanded(false);
 	}, [queuedMessages.length]);
 
-	const handleStartEditQueued = (msg: { id: string; text: string }) => {
+	const handleStartEditQueued = useCallback((msg: { id: string }) => {
 		setEditingQueuedId(msg.id);
-		setEditingQueuedText(msg.text);
-	};
+	}, []);
 
-	const handleSaveEditQueued = () => {
-		if (!editingQueuedId || !editingQueuedText.trim()) return;
-		const trimmed = editingQueuedText.trim();
-		const snapshot = queuedMessages;
-		setQueuedMessages((prev) =>
-			prev.map((m) =>
-				m.id === editingQueuedId
-					? { ...m, text: trimmed, bufferedAt: new Date().toISOString() }
-					: m,
-			),
-		);
+	const handleCancelEditQueued = useCallback(() => {
 		setEditingQueuedId(null);
-		setEditingQueuedText("");
-		api.updateBufferedMessage(narratorId, editingQueuedId, trimmed).catch(() => {
-			// Rollback on failure
-			setQueuedMessages(snapshot);
-		});
-	};
+	}, []);
 
-	const handleCancelEditQueued = () => {
-		setEditingQueuedId(null);
-		setEditingQueuedText("");
-	};
+	/**
+	 * Persist an edited queued message.
+	 *
+	 * Only the text is updated optimistically. Attachments are not: the client
+	 * cannot invent the imageId of an upload the server has not accepted yet, and
+	 * a wrong guess would render a broken thumbnail. The authoritative
+	 * `buffer_set` broadcast that follows a successful edit carries the real set.
+	 *
+	 * Returns false on failure so the row keeps the draft open with the user's
+	 * selected files intact.
+	 */
+	const handleSaveEditQueued = useCallback(
+		async (
+			msg: BufferMessageSummary,
+			text: string,
+			payload: {
+				keepImageIds: string[];
+				keepTextFiles: { index: number; filename: string }[];
+				newImages: File[];
+				newTextFiles: File[];
+			},
+		): Promise<boolean> => {
+			const snapshot = queuedMessages;
+			setQueuedMessages((prev) =>
+				prev.map((m) =>
+					m.id === msg.id ? { ...m, text, bufferedAt: new Date().toISOString() } : m,
+				),
+			);
+			try {
+				await api.updateBufferedMessage(narratorId, msg.id, text, payload);
+				return true;
+			} catch (err) {
+				setQueuedMessages(snapshot);
+				notifications.show({
+					color: "red",
+					title: t("editQueuedFailed"),
+					message: err instanceof Error ? err.message : String(err),
+				});
+				return false;
+			}
+		},
+		[queuedMessages, setQueuedMessages, narratorId, t],
+	);
 
 	const addImages = async (files: File[]) => {
 		const valid = files.filter((f) => {
@@ -6525,6 +6398,33 @@ export function NarratorPanel({
 		narrator,
 		liveSubstatus: substatus,
 	});
+
+	// The single line the work indicator shows. Kept as a string (not inline JSX)
+	// so the status bar can hand the exact same text to the overflow tooltip.
+	const workIndicatorText = isRetrying
+		? retryCountdown > 0
+			? t("retryingCountdown", {
+					count: retryInfo?.retryCount,
+					max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
+					seconds: retryCountdown,
+				})
+			: t("retryingNow", {
+					count: retryInfo?.retryCount,
+					max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
+				})
+		: isBlockingCompacting
+			? `${t("compacting")} · ${compactProgressText}`
+			: isWaitingForModel
+				? t("status_model_unavailable")
+				: currentSpecTask
+					? currentSpecTask.text
+					: isWaiting
+						? t("status_waiting")
+						: isPlanning
+							? t("planning")
+							: isBackgroundCompacting
+								? `${t("backgroundCompacting")} · ${compactProgressText}`
+								: t("thinking");
 
 	const hasContextData = contextPercent != null;
 	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
@@ -8174,14 +8074,10 @@ export function NarratorPanel({
 									<Text size="xs" c="blue" fw={500} style={{ flexShrink: 0 }}>
 										{t("queuedCount", { count: queuedMessages.length })}
 									</Text>
-									{queuedMessages[0].imageCount > 0 && (
-										<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
-											<IconPhoto size={14} color="var(--mantine-color-blue-5)" />
-											<Text size="xs" c="blue">
-												{queuedMessages[0].imageCount}
-											</Text>
-										</Group>
-									)}
+									<QueuedAttachmentPreview
+										images={queuedMessages[0].images ?? []}
+										textFiles={queuedMessages[0].textFiles ?? []}
+									/>
 									{queuedMessages[0].priority && (
 										<Badge
 											size="xs"
@@ -8221,13 +8117,11 @@ export function NarratorPanel({
 											strategy={verticalListSortingStrategy}
 										>
 											{queuedMessages.map((msg, index) => (
-												<SortableQueuedMessageItem
+												<QueuedMessageRow
 													key={msg.id}
 													msg={msg}
 													index={index}
 													isEditing={editingQueuedId === msg.id}
-													editingText={editingQueuedText}
-													onEditTextChange={setEditingQueuedText}
 													onSaveEdit={handleSaveEditQueued}
 													onCancelEdit={handleCancelEditQueued}
 													onStartEdit={handleStartEditQueued}
@@ -8310,32 +8204,9 @@ export function NarratorPanel({
 							>
 								<Group gap={6} wrap="nowrap">
 									<Loader size={14} color={workIndicatorColor} style={{ flexShrink: 0 }} />
-									<Text size="xs" c={workIndicatorColor} truncate>
-										{isRetrying
-											? retryCountdown > 0
-												? t("retryingCountdown", {
-														count: retryInfo?.retryCount,
-														max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
-														seconds: retryCountdown,
-													})
-												: t("retryingNow", {
-														count: retryInfo?.retryCount,
-														max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
-													})
-											: isBlockingCompacting
-												? `${t("compacting")} · ${compactProgressText}`
-												: isWaitingForModel
-													? t("status_model_unavailable")
-													: currentSpecTask
-														? currentSpecTask.text
-														: isWaiting
-															? t("status_waiting")
-															: isPlanning
-																? t("planning")
-																: isBackgroundCompacting
-																	? `${t("backgroundCompacting")} · ${compactProgressText}`
-																	: t("thinking")}
-									</Text>
+									{/* The current task text can be long (spec task titles especially), so
+									    reveal the full string on hover/tap when the row clips it. */}
+									<TruncatedText size="xs" c={workIndicatorColor} text={workIndicatorText} />
 									{(queuePosition != null || queueMessageValue) && (
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 											·{" "}
@@ -8366,9 +8237,7 @@ export function NarratorPanel({
 										flexShrink: 0,
 									}}
 								/>
-								<Text size="xs" c="dimmed" truncate>
-									{t(statusBarDisplay.labelKey)}
-								</Text>
+								<TruncatedText size="xs" c="dimmed" text={t(statusBarDisplay.labelKey)} />
 								{turnElapsedText && !isWorkspacePreview && (
 									<TurnElapsedTime
 										text={`· ${t("lastTurnDuration", { duration: turnElapsedText })}`}
@@ -8503,20 +8372,14 @@ export function NarratorPanel({
 												</Popover.Dropdown>
 											</Popover>
 										) : (
-											<Text
+											// No details popover here, so the clipped balance needs its own
+											// hover/tap reveal.
+											<TruncatedText
 												size="xs"
 												c="dimmed"
-												style={{
-													flexShrink: 0,
-													cursor: "default",
-													maxWidth: 120,
-													overflow: "hidden",
-													textOverflow: "ellipsis",
-													whiteSpace: "nowrap",
-												}}
-											>
-												{quotaBalance}
-											</Text>
+												text={quotaBalance}
+												style={{ flexShrink: 0, maxWidth: 120 }}
+											/>
 										))}
 									{shouldShowNugRechargeButton && (
 										<Button size="compact-xs" variant="subtle" onClick={openNugRecharge}>

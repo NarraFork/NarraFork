@@ -56,7 +56,6 @@ const {
 	integrationResourceBindings,
 	narratorMessageRefs,
 	narratorMessages,
-	narratorSidecars,
 	narrators,
 	narratorToolCalls,
 	oauthAccessTokens,
@@ -2289,7 +2288,6 @@ afterAll(async () => {
 	}
 	if (narratorIds.length > 0) {
 		await db.delete(narratorToolCalls).where(inArray(narratorToolCalls.narratorId, narratorIds));
-		await db.delete(narratorSidecars).where(inArray(narratorSidecars.narratorId, narratorIds));
 		await db
 			.delete(narratorMessageRefs)
 			.where(inArray(narratorMessageRefs.narratorId, narratorIds));

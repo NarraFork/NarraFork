@@ -1,20 +1,23 @@
 /**
  * row-metrics.ts — Geometry of a BARE list row, in one place.
  *
- * A "bare row" is the unadorned single-line row the folded surfaces are built from:
- * a folded trace's item row, and (since the side-car redesign) a side-car footnote's
- * header row. They must be the same height — that is the whole point of the footnote
- * form, which exists so a system injection reads as one more line in the column
- * rather than as a coloured card shouting beside it.
+ * A "bare row" is the unadorned single-line row the folded surfaces are built from,
+ * such as a folded trace's item row. Every surface that uses one must render it at
+ * the same height — that is what makes a folded row read as one more line in the
+ * column rather than as a card shouting beside it.
  *
  * ## Why this file rather than an import
  *
- * `measure-tool-run.ts` owned these constants first. `measure-sidecar.ts` cannot
- * import them from there: `measure-tool-run → measure-tool-call → measure-sidecar`
- * is an existing dependency chain (the trace layer measures drill-down cards, which
- * measure their own side-car band), so reading upward would close a cycle. Hoisting
- * the numbers into a leaf module gives both sides one source without one depending
- * on the other.
+ * `measure-tool-run.ts` owned these constants first, and hoisting them here kept
+ * them reachable by measure modules that `measure-tool-run` itself depends on:
+ * reading them back upward from a module in its own dependency chain
+ * (`measure-tool-run → measure-tool-call → …`) would close a cycle. A leaf module
+ * gives every side one source without any of them depending on another.
+ *
+ * (The original second consumer was `measure-sidecar.ts`, removed when side-car
+ * footnotes were replaced by injection message rows. The leaf placement is kept: the
+ * cycle argument applies to any future consumer inside that chain, and moving the
+ * numbers back would be a change with no benefit.)
  *
  * `measure-tool-run.ts` re-exports these under its established names
  * (`TRACE_ROW_HEIGHT` etc.) so its many callers and tests are untouched.

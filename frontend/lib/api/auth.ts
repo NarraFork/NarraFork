@@ -87,6 +87,26 @@ export interface AdminAuthConfig {
 	webauthn: AdminWebauthnConfig | null;
 }
 
+/** A single-use registration code as shown in the admin list (never the plaintext). */
+export interface RegistrationCode {
+	id: string;
+	note: string | null;
+	role: "admin" | "user";
+	boundUsername: string | null;
+	expiresAt: string;
+	usedAt: string | null;
+	revokedAt: string | null;
+	createdAt: string;
+	createdByUsername: string | null;
+	usedByUsername: string | null;
+	status: "active" | "used" | "revoked" | "expired";
+}
+
+/** Creation response: `code` is the plaintext, shown once and never retrievable again. */
+export interface CreatedRegistrationCode extends RegistrationCode {
+	code: string;
+}
+
 /** True when the browser exposes the WebAuthn API (secure context required). */
 export function isPasskeySupported(): boolean {
 	return (
@@ -109,7 +129,13 @@ export function isUserCancelledWebAuthn(e: unknown): boolean {
 
 export const authApi = {
 	authStatus: () => request<{ hasUsers: boolean; registrationOpen: boolean }>("/auth/status"),
-	register: (data: { username: string; password: string; language?: string }) =>
+	register: (data: {
+		username: string;
+		password: string;
+		language?: string;
+		/** Single-use invitation; required when public registration is closed. */
+		code?: string;
+	}) =>
 		request<LoginSession>("/auth/register", {
 			method: "POST",
 			body: JSON.stringify(data),
@@ -271,8 +297,31 @@ export const authApi = {
 		id: string,
 		data: { username?: string; password?: string; role?: "admin" | "user" },
 	) => request<ApiEntity>(`/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+	createUser: (data: {
+		username: string;
+		password: string;
+		role?: "admin" | "user";
+		language?: string;
+	}) => request<ApiEntity>("/admin/users", { method: "POST", body: JSON.stringify(data) }),
 	updateAdminSettings: (data: { registrationOpen: boolean }) =>
 		request<ApiEntity>("/admin/settings", { method: "PATCH", body: JSON.stringify(data) }),
+
+	// Registration codes
+	listRegistrationCodes: () => request<{ codes: RegistrationCode[] }>("/admin/registration-codes"),
+	createRegistrationCode: (data: {
+		note?: string;
+		role?: "admin" | "user";
+		username?: string;
+		expiresInHours?: number;
+	}) =>
+		request<CreatedRegistrationCode>("/admin/registration-codes", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	revokeRegistrationCode: (id: string) =>
+		request<RegistrationCode>(`/admin/registration-codes/${id}/revoke`, { method: "POST" }),
+	deleteRegistrationCode: (id: string) =>
+		request<{ ok: boolean }>(`/admin/registration-codes/${id}`, { method: "DELETE" }),
 	listAdminTerminals: () =>
 		request<{
 			terminals: ApiEntity[];

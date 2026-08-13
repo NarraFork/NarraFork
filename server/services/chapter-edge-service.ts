@@ -3,6 +3,7 @@ import { chapterEdges, chapters } from "@server/db/schema";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
+import type { ForkWorktreeSource } from "@shared/chapter-fork";
 import { and, eq, or } from "drizzle-orm";
 
 // Safety cap: prevent unbounded result sets from blocking the main thread
@@ -63,6 +64,7 @@ class ChapterEdgeService {
 		targetId: string,
 		metadata: {
 			commitSha: string;
+			worktreeSource: ForkWorktreeSource;
 			inheritMode: string;
 			narratorMessageUuid?: string;
 			narratorMessageId?: string;
@@ -112,6 +114,13 @@ class ChapterEdgeService {
 
 	/**
 	 * Internal: create a merge edge (called automatically during chapter merge).
+	 *
+	 * Upserted inside ONE synchronous `bun:sqlite` transaction, for the same reason
+	 * `createForkEdge` is: a sync transaction has no await point, so two concurrent
+	 * merges cannot both observe "no edge" and both insert. Reading with `await` first
+	 * and then inserting leaves exactly that window — a double-clicked merge button, or
+	 * two batch-merge passes touching the same pair, produced duplicate merge edges,
+	 * which the graph then draws twice.
 	 */
 	async createMergeEdge(
 		projectId: string,
@@ -128,39 +137,46 @@ class ChapterEdgeService {
 			status?: "pending" | "completed";
 		},
 	) {
-		const existing = await db.query.chapterEdges.findFirst({
-			where: and(
-				eq(chapterEdges.sourceId, sourceId),
-				eq(chapterEdges.targetId, targetId),
-				eq(chapterEdges.type, "merge"),
-			),
-		});
-		if (existing) {
-			const [edge] = await db
-				.update(chapterEdges)
-				.set({ metadata })
-				.where(eq(chapterEdges.id, existing.id))
-				.returning();
-			return edge;
-		}
-
 		const id = generateId();
 		const now = new Date().toISOString();
 
-		const [edge] = await db
-			.insert(chapterEdges)
-			.values({
-				id,
-				projectId,
-				sourceId,
-				targetId,
-				type: "merge",
-				metadata,
-				createdAt: now,
-			})
-			.returning();
+		return db.transaction((tx) => {
+			const existing = tx
+				.select({ id: chapterEdges.id })
+				.from(chapterEdges)
+				.where(
+					and(
+						eq(chapterEdges.sourceId, sourceId),
+						eq(chapterEdges.targetId, targetId),
+						eq(chapterEdges.type, "merge"),
+					),
+				)
+				.limit(1)
+				.get();
 
-		return edge;
+			if (existing) {
+				return tx
+					.update(chapterEdges)
+					.set({ metadata })
+					.where(eq(chapterEdges.id, existing.id))
+					.returning()
+					.get();
+			}
+
+			return tx
+				.insert(chapterEdges)
+				.values({
+					id,
+					projectId,
+					sourceId,
+					targetId,
+					type: "merge",
+					metadata,
+					createdAt: now,
+				})
+				.returning()
+				.get();
+		});
 	}
 
 	/**

@@ -16,12 +16,6 @@ import type {
 } from "./provider";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
-import {
-	appendSideCarsForApi,
-	outputToText,
-	sideCarsForToolResult,
-	sideCarsForUserMessage,
-} from "./sidecar";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
@@ -628,7 +622,6 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 
 		const history: GeminiHistoryItem[] = [];
 		let pendingToolResults: GeminiFunctionResultStep[] = [];
-		let pendingUserSideCars: NonNullable<DbMessage["sideCars"]> = [];
 		const flushToolResults = () => {
 			if (pendingToolResults.length > 0) {
 				history.push(...pendingToolResults);
@@ -639,9 +632,6 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		for (const message of topLevel) {
 			if (message.role === "assistant") {
 				flushToolResults();
-				const sideCarText = appendSideCarsForApi("", pendingUserSideCars);
-				if (sideCarText) history.push({ type: "user_input", content: sideCarText });
-				pendingUserSideCars = [];
 
 				const content = Array.isArray(message.contentJson)
 					? (message.contentJson as Array<Record<string, unknown>>)
@@ -734,10 +724,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 							arguments: args,
 						},
 					});
-					const output = appendSideCarsForApi(
-						outputToText(call.outputJson),
-						sideCarsForToolResult(message.sideCars, call.toolUseId),
-					);
+					const output = outputToText(call.outputJson);
 					pendingToolResults.push({
 						type: "function_result",
 						call_id: call.toolUseId,
@@ -747,17 +734,12 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 				}
 				ordered.sort((a, b) => a.index - b.index || a.sequence - b.sequence);
 				history.push(...ordered.map((item) => item.step));
-				pendingUserSideCars = sideCarsForUserMessage(message.sideCars);
 			} else if (message.role === "user") {
 				flushToolResults();
-				const text = appendSideCarsForApi(message.contentText || "", pendingUserSideCars);
+				const text = message.contentText || "";
 				if (text) history.push({ type: "user_input", content: text });
-				pendingUserSideCars = [];
 			} else {
 				flushToolResults();
-				const sideCarText = appendSideCarsForApi("", pendingUserSideCars);
-				if (sideCarText) history.push({ type: "user_input", content: sideCarText });
-				pendingUserSideCars = [];
 				const blocks = Array.isArray(message.contentJson)
 					? (message.contentJson as Array<{ type?: string; text?: string }>)
 					: [];
@@ -772,11 +754,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			}
 		}
 
-		return {
-			history,
-			trailingToolResults: pendingToolResults,
-			trailingUserText: appendSideCarsForApi("", pendingUserSideCars) || undefined,
-		};
+		return { history, trailingToolResults: pendingToolResults };
 	}
 
 	private async *parseSSEStream(

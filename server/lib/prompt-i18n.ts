@@ -20,6 +20,21 @@ export {
 	buildReviewSystemPrompt,
 	getReviewStartMessage,
 } from "./prompts/review";
+export type {
+	SetupAuthorization,
+	SetupAuthorizationResolution,
+	SetupBriefingDependency,
+	SetupBriefingInput,
+} from "./prompts/setup-assistant";
+export {
+	buildSetupAssistantSystemPrompt,
+	formatDependencyBriefing,
+	getSetupAssistantStartMessage,
+	getSetupAssistantTitle,
+	resolveSetupAuthorization,
+	SETUP_AUTHORIZATION_VALUES,
+	selectActionableDependencies,
+} from "./prompts/setup-assistant";
 export type { BuiltinSubagentType, SubagentType } from "./prompts/subagents";
 export {
 	getSubagentParentReportingHint,

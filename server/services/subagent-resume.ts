@@ -46,6 +46,15 @@ export interface ResumeSubagentInput {
 	retryToolUseId?: string;
 	editMessageId?: string;
 	editContent?: string;
+	/**
+	 * Roll back the file changes truncated by a `retry_last_input` resume; defaults
+	 * to true, which is what every retry did before this was expressible.
+	 *
+	 * Distinct from `editRevertFiles`: an edit resume rewrites the intent to
+	 * `retry_last_input` after its own rollback has already run, and that second
+	 * truncation must not revert again.
+	 */
+	retryRevertFiles?: boolean;
 	/** Roll back the truncated messages' file changes; defaults to true. */
 	editRevertFiles?: boolean;
 	/** How wide that rollback reaches; omitted means the server default. */
@@ -161,9 +170,16 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 		if (!lastUserMessage)
 			throw new ValidationError("No subagent user message is available to retry");
 		prompt = extractPromptText(lastUserMessage.contentText);
+		// `skipRevert` must be forwarded, not defaulted. `deleteMessagesAfter` rolls the
+		// workspace back unless told otherwise, so omitting it here reverts files that
+		// the caller may have explicitly asked to keep — and a `regenerate_edited_message`
+		// resume arrives here having ALREADY performed (or deliberately skipped) exactly
+		// that rollback, so a second one is both unrequested and, once its own
+		// regeneration is live, liable to fail on the workspace-write guard.
 		const { deletedMessageIds } = await narratorService.deleteMessagesAfter(
 			input.subagentId,
 			lastUserMessage.id,
+			{ skipRevert: input.retryRevertFiles === false },
 		);
 		if (deletedMessageIds.length > 0) {
 			broadcastToNarrator(input.subagentId, {
@@ -389,7 +405,17 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 			// the chosen scope, and the user has to hear about it here exactly as they
 			// would for a primary narrator.
 			editRevertWarnings = edited.warnings;
-			effectiveInput = { ...effectiveInput, intent: "retry_last_input" };
+			// The edit above owns the rollback decision and has already carried it out.
+			// The retry this becomes truncates history a second time, so it must be told
+			// NOT to revert again: repeating it would undo file changes the user asked to
+			// keep, and — because the edit may have already started regenerating into the
+			// same worktree — can fail outright on the workspace-write guard, surfacing as
+			// "something is writing to this workspace" on a rollback nobody requested.
+			effectiveInput = {
+				...effectiveInput,
+				intent: "retry_last_input",
+				retryRevertFiles: false,
+			};
 		}
 		const manualClaim = manualOverride ? claimManualOverride(input.subagentId, "resume") : null;
 		if (manualOverride && !manualClaim) {

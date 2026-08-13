@@ -56,9 +56,32 @@ describe("NarratorPanel status layout contract", () => {
 		const source = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
 
 		expect(source).toContain('style={{ flex: 1, minWidth: 0, overflow: "hidden" }}');
-		expect(source).toContain("title={text}");
 		expect(source).toMatch(/aria-label=\{`\$\{text\}, \$\{startedAtLabel\}`\}/);
 		expect(source).toContain('maxWidth: "100%"');
+	});
+
+	test("every clipped status-bar label has a reveal affordance", async () => {
+		const source = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
+
+		// The three labels the status row can clip route through TruncatedText, which
+		// only arms its tooltip while the text is really cut off. A native `title`
+		// would not work on touch, which is why it is no longer the mechanism here.
+		expect(source).toContain('import { TruncatedText } from "../common/TruncatedText";');
+		expect(source).toContain('<TruncatedText size="xs" c={workIndicatorColor}');
+		expect(source).toContain(
+			'<TruncatedText size="xs" c="dimmed" text={t(statusBarDisplay.labelKey)} />',
+		);
+		expect(source).toContain("text={quotaBalance}");
+
+		// TurnElapsedTime has two shapes: with a start-time popover the full elapsed
+		// text must be repeated inside the dropdown (a nested tooltip would double up
+		// on the same gesture); without one it falls back to TruncatedText.
+		const elapsed = source.slice(
+			source.indexOf("function TurnElapsedTime("),
+			source.indexOf("export function NarratorPanel("),
+		);
+		expect(elapsed).toContain("<TruncatedText");
+		expect(elapsed).toMatch(/Popover\.Dropdown[\s\S]*\{text\}[\s\S]*\{startedAtLabel\}/);
 	});
 
 	test("icon-only status actions expose stable accessible names", async () => {

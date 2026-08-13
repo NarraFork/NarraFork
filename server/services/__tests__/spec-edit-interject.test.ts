@@ -1,8 +1,8 @@
 /**
  * Delivery contract for UI spec edits.
  *
- * The bug this pins: a spec edit reached the model only as an `after_tools`
- * sidecar, i.e. a `<side_car>` aside appended to the next turn's text. Because
+ * The bug this pins: a spec edit reached the model only as a low-weight aside
+ * appended to the next turn's text (historically a `<side_car>` block). Because
  * `taskReflection` reads the parent history, it could not distinguish a task the
  * user had just added from noise the assistant injected itself, and rejected
  * such tasks as "off the main line". A working narrator must instead receive the
@@ -92,12 +92,12 @@ mock.module("../narrator-session", () => ({
 
 // ── Sidecar queue double ──────────────────────────────────────────────────────
 
-const sidecarQueued: PendingSpecUpdate[] = [];
+const idleQueued: PendingSpecUpdate[] = [];
 const realSpecUpdateQueue = { ...(await import("../spec-update-queue")) };
 mock.module("../spec-update-queue", () => ({
 	...realSpecUpdateQueue,
 	pushSpecUpdateForNarrator: (_narratorId: string, update: PendingSpecUpdate) => {
-		sidecarQueued.push(update);
+		idleQueued.push(update);
 	},
 }));
 
@@ -143,7 +143,7 @@ beforeEach(() => {
 	pushRejects = null;
 	loopRunning = true;
 	softStopRequests.length = 0;
-	sidecarQueued.length = 0;
+	idleQueued.length = 0;
 	broadcasts.length = 0;
 });
 
@@ -165,8 +165,8 @@ describe("interjectSpecEditAsUserMessage — working narrator", () => {
 		expect(queue[0].priority).toBe(true);
 		expect(queue[0].text).toContain("Ship the parser");
 		expect(softStopRequests).toEqual([NARRATOR_ID]);
-		// Must NOT also go down the low-weight sidecar path.
-		expect(sidecarQueued).toHaveLength(0);
+		// Must NOT also go down the low-weight queued path.
+		expect(idleQueued).toHaveLength(0);
 	});
 
 	test("broadcasts the queue snapshot so the panel shows the queued message", async () => {
@@ -230,17 +230,17 @@ describe("interjectSpecEditAsUserMessage — rapid saves", () => {
 	});
 });
 
-describe("interjectSpecEditAsUserMessage — sidecar fallback", () => {
-	test("an idle narrator is not woken and keeps the sidecar path", async () => {
+describe("interjectSpecEditAsUserMessage — idle queue fallback", () => {
+	test("an idle narrator is not woken and stays on the queued path", async () => {
 		loopRunning = false;
 
 		const result = await save(tasksUpdate("- [todo] Later work"));
 
-		expect(result.delivered).toBe("sidecar");
+		expect(result.delivered).toBe("queued");
 		expect(queue).toHaveLength(0);
 		expect(softStopRequests).toHaveLength(0);
-		expect(sidecarQueued).toHaveLength(1);
-		expect(sidecarQueued[0].taskSummary).toContain("Later work");
+		expect(idleQueued).toHaveLength(1);
+		expect(idleQueued[0].taskSummary).toContain("Later work");
 	});
 
 	test("a full queue falls back instead of dropping the notification", async () => {
@@ -248,8 +248,8 @@ describe("interjectSpecEditAsUserMessage — sidecar fallback", () => {
 
 		const result = await save(tasksUpdate("- [todo] Overflow work"));
 
-		expect(result.delivered).toBe("sidecar");
-		expect(sidecarQueued).toHaveLength(1);
+		expect(result.delivered).toBe("queued");
+		expect(idleQueued).toHaveLength(1);
 	});
 
 	test("an inactive narrator (e.g. a subagent) falls back safely", async () => {
@@ -259,8 +259,8 @@ describe("interjectSpecEditAsUserMessage — sidecar fallback", () => {
 
 		const result = await save(tasksUpdate("- [todo] Subagent work"));
 
-		expect(result.delivered).toBe("sidecar");
-		expect(sidecarQueued).toHaveLength(1);
+		expect(result.delivered).toBe("queued");
+		expect(idleQueued).toHaveLength(1);
 	});
 });
 
@@ -270,7 +270,7 @@ describe("formatSpecEditInterjection", () => {
 		expect(en).toContain("I updated spec://tasks.json via the Spec panel");
 		expect(en).toContain("Open tasks:");
 		expect(en).toContain("- [doing] Build the thing");
-		// The sidecar's third-person framing is exactly what diluted its weight.
+		// The aside's third-person framing is exactly what diluted its weight.
 		expect(en).not.toContain("[System]");
 		expect(en).not.toContain("The user updated");
 
@@ -292,8 +292,50 @@ describe("formatSpecEditInterjection", () => {
 		};
 
 		const en = formatSpecEditInterjection(update, "en");
-		expect(en).toContain("spec://behavior_fence");
 		expect(en).toContain("Content preview:");
 		expect(en).toContain("Never touch auth without approval.");
+	});
+
+	test("a cleared task list tells the model to stop resurrecting old tasks", () => {
+		const update: PendingSpecUpdate = {
+			uri: "spec://tasks.json",
+			path: "tasks.json",
+			revisionId: "rev-3",
+			updatedBy: "user",
+			preview: null,
+			taskSummary: null,
+			cleared: true,
+			timestamp: new Date().toISOString(),
+		};
+
+		const en = formatSpecEditInterjection(update, "en");
+		expect(en).toContain("cleared the task list");
+		expect(en).toContain("wait for my next instruction");
+		// The whole point of the flag: no stale task summary may ride along.
+		expect(en).not.toContain("Open tasks:");
+
+		const zh = formatSpecEditInterjection(update, "zh-CN");
+		expect(zh).toContain("清空了任务列表");
+		expect(zh).toContain("等待我的下一条指令");
+	});
+
+	test("a namespace reset tells the model to drop the earlier plan", () => {
+		const update: PendingSpecUpdate = {
+			uri: "spec://",
+			path: "",
+			revisionId: null,
+			updatedBy: "user",
+			preview: null,
+			taskSummary: null,
+			reset: true,
+			timestamp: new Date().toISOString(),
+		};
+
+		const en = formatSpecEditInterjection(update, "en");
+		expect(en).toContain("reset the entire Dynamic Spec");
+		expect(en).toContain("Drop the earlier plan");
+
+		const zh = formatSpecEditInterjection(update, "zh-CN");
+		expect(zh).toContain("重置了整个 Dynamic Spec");
 	});
 });

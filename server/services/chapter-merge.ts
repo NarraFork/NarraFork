@@ -2420,6 +2420,7 @@ export const chapterMerge = {
 			tempChapter = await chapterFork.fork(targetChapterId, {
 				title: tempTitle,
 				inheritMode: "fresh",
+				worktreeSource: "workspace",
 			});
 		} catch (err) {
 			logger.error("Failed to fork temporary chapter for ruler AI resolve", {

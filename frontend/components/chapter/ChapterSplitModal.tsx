@@ -147,10 +147,15 @@ export function ChapterSplitModal({
 					{t("splitChapterDesc")}
 				</Text>
 				{commitSha && (
-					<Text size="xs" c="dimmed" ff="monospace">
-						{commitShortSha}
-						{messagePreview ? ` · ${messagePreview}` : ""}
-					</Text>
+					<>
+						<Text size="xs" c="dimmed" ff="monospace">
+							{commitShortSha}
+							{messagePreview ? ` · ${messagePreview}` : ""}
+						</Text>
+						<Alert color="blue" variant="light" title={t("fileSource")}>
+							{t("sourceSplitCommitFixed", { sha: commitShortSha })}
+						</Alert>
+					</>
 				)}
 
 				{splitUnsupportedReason && (
@@ -178,7 +183,7 @@ export function ChapterSplitModal({
 					maxRows={5}
 				/>
 				<Select
-					label={t("contextInheritance")}
+					label={t("conversationInheritance")}
 					value={inheritMode}
 					onChange={(value) => setInheritMode((value as SplitInheritMode | null) ?? "fresh")}
 					data={[

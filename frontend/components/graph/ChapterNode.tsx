@@ -1,14 +1,10 @@
 import { ActionIcon, Badge, Card, Group, Text, Tooltip } from "@mantine/core";
-import { notifications } from "@mantine/notifications";
 import { IconGitCommit, IconMessage, IconMinimize } from "@tabler/icons-react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
 import { memo, Suspense, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { addRecentTab } from "../../hooks/useRecentTabs";
-import { api } from "../../lib/api";
 import { CHAPTER_ROLE_ICONS, CHAPTER_STATUS_COLORS, statusRegistry } from "../../lib/constants";
-import { notifyResultWarnings } from "../../lib/operation-warnings";
+import { ChapterForkModal } from "../chapter/ChapterForkModal";
 import { NarratorPanel } from "../narrator/NarratorPanel";
 import { NarratorPanelSkeleton } from "../narrator/NarratorPanelSkeleton";
 
@@ -51,68 +47,14 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 	const d = data as ChapterNodeData;
 	const { t } = useTranslation("graph");
 	const { t: tc } = useTranslation("common");
-	const { t: tch } = useTranslation("chapters");
-	const queryClient = useQueryClient();
 	const narratorDisplay = d.narratorStatus
 		? statusRegistry.narratorEffective(d.narratorStatus, d.narratorSubstatus ?? undefined)
 		: null;
 
-	// Fork-from-message: directly fork without modal
-	const forkFromMessage = useMutation({
-		mutationFn: (messageId: string) =>
-			api.forkChapter(id, {
-				inheritMode: "full",
-				forkAtMessageId: messageId,
-			}),
-		onSuccess: async (data) => {
-			queryClient.invalidateQueries({ queryKey: ["chapters"] });
-			queryClient.invalidateQueries({ queryKey: ["graph"] });
-			queryClient.invalidateQueries({ queryKey: ["narrators"] });
-			queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
-			// Same reconstruction warnings as ChapterForkModal: a fork from a past
-			// message may be rebuilt from recorded file edits, without Bash or
-			// external-editor changes. Dropping them here made a lossy fork look clean.
-			notifyResultWarnings(tch("forkWarning"), data);
-			if (data?.id) {
-				// Add the forked chapter to recent tabs immediately
-				const narrators = await api.listNarrators({ chapterId: data.id });
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
-				const primary = narrators?.find((n: any) => n.variant === "primary");
-				if (primary?.id) {
-					addRecentTab({
-						type: "chapter",
-						id: data.id,
-						narratorId: primary.id,
-						title: data.title ?? "Fork",
-						subtitle: data.title,
-						status: primary.status,
-					});
-				}
-
-				notifications.show({
-					title: tch("forkSuccess"),
-					message: tch("forkCreatedClick", {
-						title: clampChapterNodeText(data.title ?? "Fork"),
-					}),
-					color: "green",
-					autoClose: 6000,
-				});
-			}
-		},
-		onError: (err) => {
-			notifications.show({
-				title: tch("forkFailed"),
-				message: err instanceof Error ? err.message : "Unknown error",
-				color: "red",
-			});
-		},
-	});
-	const handleForkFromMessage = useCallback(
-		(messageId: string) => {
-			forkFromMessage.mutate(messageId);
-		},
-		[forkFromMessage],
-	);
+	const [forkMessageId, setForkMessageId] = useState<string | null>(null);
+	const handleForkFromMessage = useCallback((messageId: string) => {
+		setForkMessageId(messageId);
+	}, []);
 
 	const role = d.role ?? "branch";
 	const isRoot = !!d.isRoot;
@@ -313,6 +255,15 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 					</div>
 				)}
 			</Card>
+			{forkMessageId && (
+				<ChapterForkModal
+					chapterId={id}
+					chapterStatus={d.status}
+					forkAtMessageId={forkMessageId}
+					opened
+					onClose={() => setForkMessageId(null)}
+				/>
+			)}
 		</>
 	);
 }

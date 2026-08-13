@@ -23,6 +23,10 @@ export interface PendingSpecUpdate {
 	preview: string | null;
 	/** For tasks.json: compiled summary of open tasks after save. */
 	taskSummary: string | null;
+	/** True when the user emptied tasks.json — the update IS "all tasks are gone". */
+	cleared?: boolean;
+	/** True when the user reset the whole Dynamic Spec namespace to defaults. */
+	reset?: boolean;
 	timestamp: string;
 }
 
@@ -66,6 +70,22 @@ export function hasQueuedSpecUpdates(narratorId: string): boolean {
 
 function formatSingleUpdate(update: PendingSpecUpdate, isZh: boolean): string {
 	const lines: string[] = [];
+	if (update.reset) {
+		lines.push(
+			isZh
+				? `用户通过 UI 重置了整个 Dynamic Spec（${update.timestamp}）：所有任务、笔记与 behavior_fence 均已恢复默认/清空。不要再依据早先上下文重建旧任务，等待用户的新指令。`
+				: `User reset the entire Dynamic Spec via UI (${update.timestamp}): all tasks, notes and the behavior fence are back to defaults/empty. Do not reconstruct old tasks from earlier context — wait for the user's next instruction.`,
+		);
+		return lines.join("\n");
+	}
+	if (update.cleared) {
+		lines.push(
+			isZh
+				? `用户通过 UI 清空了 ${update.uri}（${update.timestamp}）：任务列表现在为空，此前的开放任务已全部移除。停止继续之前的任务，不要凭记忆恢复它们；等待用户的下一条指令。`
+				: `User emptied ${update.uri} via UI (${update.timestamp}): the task list is now empty and every previously open task was removed. Stop pursuing earlier tasks and do not resurrect them from memory — wait for the user's next instruction.`,
+		);
+		return lines.join("\n");
+	}
 	if (isZh) {
 		lines.push(`用户通过 UI 更新了 ${update.uri}（${update.timestamp}）。`);
 	} else {

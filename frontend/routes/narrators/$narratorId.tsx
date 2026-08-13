@@ -1,8 +1,6 @@
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Box, Center, Drawer, Group, Loader, Text } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
-import { notifications } from "@mantine/notifications";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
 	createFileRoute,
 	useLocation,
@@ -14,6 +12,7 @@ import type { Direction } from "dockview-react";
 import type React from "react";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { clearHighlightCache } from "../../components/narrator/highlight-cache";
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
@@ -51,7 +50,6 @@ import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/use
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../lib/history-state";
-import { notifyResultWarnings } from "../../lib/operation-warnings";
 import {
 	isNarratorSubject,
 	onPanelDragEnd,
@@ -208,8 +206,6 @@ function NarratorDetailPage() {
 		userPrefsLoading,
 	]);
 
-	const qc = useQueryClient();
-
 	// Notify backend when leaving this narrator page so interrupted status resets to idle
 	useEffect(() => {
 		return () => {
@@ -274,8 +270,6 @@ function NarratorDetailPage() {
 		writeToTerminalRef.current = fn;
 	}, []);
 
-	const { t: tc } = useTranslation("chapters");
-	const { t: tCommon } = useTranslation("common");
 	const { t: tn } = useTranslation("narrator");
 	const { t: tt } = useTranslation("terminal");
 	const navigate = useNavigate();
@@ -315,79 +309,12 @@ function NarratorDetailPage() {
 		}
 	}, [isSubagent, from, parentProjectId, parentChapterId, parentNarratorId, navigate]);
 
-	// Fork-from-message: directly fork without modal
-	const forkFromMessage = useMutation({
-		mutationFn: (messageId: string) => {
-			if (!chapterId) throw new Error("No chapter");
-			return api.forkChapter(chapterId, {
-				inheritMode: "full",
-				forkAtMessageId: messageId,
-			});
-		},
-		onSuccess: async (data) => {
-			qc.invalidateQueries({ queryKey: ["chapters"] });
-			qc.invalidateQueries({ queryKey: ["graph"] });
-			qc.invalidateQueries({ queryKey: ["narrators"] });
-			qc.invalidateQueries({ queryKey: ["narraFlow"] });
-			// A fork from a past message is reconstructed, and the server says how: the
-			// parent's exact workspace may not have been copyable, in which case the new
-			// worktree was rebuilt from recorded Write/Edit inputs and changes made by
-			// shell commands or outside the narrator are absent. Shown before the success
-			// toast so the ordering matches ChapterForkModal.
-			notifyResultWarnings(tc("forkWarning"), data);
-			if (data?.id) {
-				const narrators = await api.listNarrators({ chapterId: data.id });
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
-				const primary = narrators?.find((n: any) => n.variant === "primary");
-
-				// Add the forked chapter to recent tabs immediately
-				if (primary?.id) {
-					addRecentTab({
-						type: "chapter",
-						id: data.id,
-						narratorId: primary.id,
-						title: data.title ?? "Fork",
-						subtitle: data.title,
-						status: primary.status,
-					});
-				}
-
-				notifications.show({
-					title: tc("forkSuccess"),
-					message: tc("forkCreatedClick", { title: data.title ?? "Fork" }),
-					color: "green",
-					autoClose: 6000,
-					onClick: () => {
-						if (primary?.id) {
-							navigate({
-								to: "/narrators/$narratorId",
-								params: { narratorId: primary.id },
-							});
-						} else {
-							navigate({
-								to: "/chapters/$chapterId",
-								params: { chapterId: data.id },
-							});
-						}
-					},
-					style: { cursor: "pointer" },
-				});
-			}
-		},
-		onError: (err) => {
-			notifications.show({
-				title: tc("forkFailed"),
-				message: err instanceof Error ? err.message : tCommon("unknownError"),
-				color: "red",
-			});
-		},
-	});
+	const [forkMessageId, setForkMessageId] = useState<string | null>(null);
 	const handleForkFromMessage = useCallback(
 		(messageId: string) => {
-			if (!chapterId) return;
-			forkFromMessage.mutate(messageId);
+			if (chapterId) setForkMessageId(messageId);
 		},
-		[chapterId, forkFromMessage],
+		[chapterId],
 	);
 
 	// Mobile drawer: auto-close when the last terminal exits
@@ -540,6 +467,16 @@ function NarratorDetailPage() {
 					</Suspense>
 				</Box>
 
+				{chapterId && forkMessageId && (
+					<ChapterForkModal
+						chapterId={chapterId}
+						chapterStatus={(chapter as { status?: string } | undefined)?.status}
+						forkAtMessageId={forkMessageId}
+						opened
+						onClose={() => setForkMessageId(null)}
+					/>
+				)}
+
 				{/* Mobile terminal drawer */}
 				<Drawer
 					opened={drawerOpened}
@@ -626,6 +563,16 @@ function NarratorDetailPage() {
 			</NarratorDockProvider>
 
 			{/* Drop zone overlay for drag-to-split (drag another narrator here) */}
+			{chapterId && forkMessageId && (
+				<ChapterForkModal
+					chapterId={chapterId}
+					chapterStatus={(chapter as { status?: string } | undefined)?.status}
+					forkAtMessageId={forkMessageId}
+					opened
+					onClose={() => setForkMessageId(null)}
+				/>
+			)}
+
 			{dropSide && (
 				<Box
 					style={{

@@ -220,6 +220,20 @@ export interface UsePretextDocumentResult {
 	 * marker, duplicate), so the caller falls back to a structural reload.
 	 */
 	appendMessage: (message: TreeMessage) => boolean;
+	/**
+	 * Drop deleted messages from the loaded window in place. Returns false when the
+	 * deletion cannot be applied locally (nothing loaded matches, or it would empty
+	 * the document), so the caller falls back to a structural reload.
+	 */
+	removeMessages: (deletedIds: readonly string[]) => boolean;
+	/**
+	 * Apply an updated message in place when it is a trailing-block truncation (the
+	 * second half of a rollback). Returns false for any other update, so the caller
+	 * falls back to a structural reload — which is the only correct answer for an
+	 * edit, since a version-neutral rebuild would serve the surviving blocks' cached
+	 * heights.
+	 */
+	replaceMessage: (message: TreeMessage) => boolean;
 }
 
 const EMPTY_MESSAGES: readonly TreeMessage[] = [];
@@ -611,6 +625,33 @@ export function usePretextDocument(
 			}) ?? false,
 		[coordinator, options.getCurrentView, options.isSubagent],
 	);
+	// Both in-place history mutations read the view LIVE at patch time, the same
+	// contract as loadOlder / applyLivePatch / appendMessage: a scroll in flight must
+	// not desync the captured anchor from the correction that follows it.
+	const removeMessages = useCallback(
+		(deletedIds: readonly string[]) =>
+			coordinator?.removeMessages(deletedIds, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? false,
+		[coordinator, options.getCurrentView],
+	);
+	const replaceMessage = useCallback(
+		(message: TreeMessage) =>
+			coordinator?.replaceMessage(message, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? false,
+		[coordinator, options.getCurrentView],
+	);
 	// Same live-view contract as loadOlder / applyLivePatch: the anchor is captured
 	// from the CURRENT scroll position at publish time, so a scroll in flight cannot
 	// desync it from the correction that follows.
@@ -652,6 +693,8 @@ export function usePretextDocument(
 		applyLivePatch,
 		setStreamingMessage,
 		appendMessage,
+		removeMessages,
+		replaceMessage,
 	};
 }
 

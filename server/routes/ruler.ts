@@ -124,8 +124,8 @@ const MAX_COMMIT_LIMIT = 1000;
  * a negative, and `?limit=50.9` a fraction. These reach a git subprocess and the
  * response's index arithmetic, where each fails differently: `--max-count=NaN` aborts
  * `git log` outright ("not an integer"), while a negative `--skip` is quietly ACCEPTED
- * by git and instead corrupts the `oldestLoadedIndex`/`newestLoadedIndex` the client
- * pages against. Coerce, then clamp, so neither path can see a bad value.
+ * by git and instead corrupts the `firstOffset`/`lastOffset` the client pages against.
+ * Coerce, then clamp, so neither path can see a bad value.
  */
 function parseBoundedInt(raw: string | undefined, fallback: number, min: number, max: number) {
 	if (raw === undefined || raw === "") return fallback;
@@ -148,7 +148,7 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 	const limit = parseBoundedInt(c.req.query("limit"), DEFAULT_COMMIT_LIMIT, 1, MAX_COMMIT_LIMIT);
 	// `skip` needs no upper bound — an offset past HEAD is a legitimately empty page, and
 	// git does the walking — but it must not go negative: git accepts that silently and
-	// the reported `oldestLoadedIndex`/`newestLoadedIndex` would then be wrong.
+	// the reported `firstOffset`/`lastOffset` would then be wrong.
 	// MAX_SAFE_INTEGER only keeps the arithmetic below exact.
 	let skip = parseBoundedInt(c.req.query("skip"), 0, 0, Number.MAX_SAFE_INTEGER);
 
@@ -162,22 +162,32 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 	const branch = project.defaultBranch ?? "main";
 	const totalCommitCountPromise = gitService.getCommitCount(project.gitPath, branch);
 
-	// Cursor-based pagination: use git rev-list to find cursor's absolute position
+	// Cursor-based pagination: locate the cursor in the SAME walk the pages come from.
+	//
+	// This used to read `rev-list --count <cursor>..<branch>` and treat the result as the
+	// cursor's index in `git log`. Those are different measurements: `git log` sorts by
+	// commit DATE, while the range count measures a REACHABILITY set, and they diverge by
+	// every commit that is dated before the cursor without being its ancestor — which is
+	// what a merge produces. On this repository the first page's last commit is at log
+	// index 199 while the count says 202, so `skip = 203` began the next page three commits
+	// too far in and those three were never returned by any page. A chapter anchored to one
+	// of them had no tick, and the Ruler reported its start commit as "not on this branch".
 	if (cursor) {
 		try {
-			// Count commits between cursor and branch HEAD to get cursor's position
-			const countAfterCursor = await gitService.getCommitCount(
-				project.gitPath,
-				`${cursor}..${branch}`,
-			);
-			// In git log order (newest first), cursor is at index = countAfterCursor
-			const cursorIndex = countAfterCursor;
-			if (direction === "older") {
-				skip = cursorIndex + 1;
-			} else if (direction === "newer") {
-				skip = Math.max(0, cursorIndex - limit);
-			} else {
-				skip = cursorIndex;
+			const cursorIndex = await gitService.findCommitLogIndex(project.gitPath, cursor, {
+				branch,
+			});
+			// null = the cursor is not in this walk (rewritten history, a deleted branch, a
+			// commit from another ref). Keep the requested `skip` rather than guessing an
+			// offset from a position we do not have.
+			if (cursorIndex != null) {
+				if (direction === "older") {
+					skip = cursorIndex + 1;
+				} else if (direction === "newer") {
+					skip = Math.max(0, cursorIndex - limit);
+				} else {
+					skip = cursorIndex;
+				}
 			}
 		} catch {
 			// If cursor SHA is invalid or not reachable, fall back to skip-based loading
@@ -377,8 +387,25 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 		activeChapters,
 		mergedChapters,
 		totalCommitCount,
-		oldestLoadedIndex: skip,
-		newestLoadedIndex: skip + commits.length - 1,
+		/**
+		 * Absolute `git log` offsets of this page's first and last commit.
+		 *
+		 * Named after the WALK, not after time, because `git log` is newest-first: offset 0
+		 * is HEAD and the offset GROWS towards older history. The previous names said the
+		 * opposite (`oldestLoadedIndex` for `skip`, `newestLoadedIndex` for the far end),
+		 * and the client paged against those names rather than against the walk — so the
+		 * first page reported "oldest = 0", `getPreviousPageParam` asked `0 > 0`, and
+		 * "load older commits" was permanently unavailable. On a repository longer than one
+		 * page every chapter anchored past the window then had no tick, and the Ruler told
+		 * the user their start commit was "not on this branch" while offering no way to
+		 * load it.
+		 *
+		 * `firstOffset` is what `skip` produced; `lastOffset` addresses the final commit in
+		 * `commits` (equal to `firstOffset` for a single-commit page, and `firstOffset - 1`
+		 * for an empty one — an offset past HEAD is a legitimately empty page).
+		 */
+		firstOffset: skip,
+		lastOffset: skip + commits.length - 1,
 	});
 });
 
@@ -612,6 +639,7 @@ rulerRoutes.post("/:id/ruler/fork", async (c) => {
 
 	const result = await chapterFork.fork(parentId, {
 		...body,
+		worktreeSource: "commit",
 		inheritMode: body.inheritMode ?? "fresh",
 	});
 

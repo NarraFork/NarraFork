@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { narratorBufferedMessages } from "../db/schema";
@@ -46,20 +46,37 @@ function getBufferedFilesDir(): string {
 	return getNarraforkPath("buffered-files");
 }
 
-/** Save text files to a temp directory so they survive restarts. Returns metadata for DB. */
+/**
+ * Save text files to a temp directory so they survive restarts. Returns metadata for DB.
+ *
+ * Names are made unique within the message's directory. Two same-named files
+ * used to write to the same path, so one silently replaced the other's content
+ * while both stayed listed — and once editing can add a file alongside kept
+ * ones, a new upload could overwrite an attachment the user chose to keep.
+ * `reserved` carries the names the message already holds on disk.
+ */
 async function persistBufferedTextFiles(
 	messageId: string,
 	files: File[],
+	reserved: Iterable<string> = [],
 ): Promise<SavedBufferedFile[]> {
 	if (files.length === 0) return [];
 	const dir = join(getBufferedFilesDir(), messageId);
 	mkdirSync(dir, { recursive: true });
+	const taken = new Set(reserved);
 	const result: SavedBufferedFile[] = [];
 	for (const file of files) {
 		const safeName = basename(file.name) || "unnamed";
-		const filePath = join(dir, safeName);
+		let uniqueName = safeName;
+		if (taken.has(uniqueName)) {
+			const ext = extname(safeName);
+			const stem = ext ? safeName.slice(0, -ext.length) : safeName;
+			uniqueName = `${stem}_${generateShortId()}${ext}`;
+		}
+		taken.add(uniqueName);
+		const filePath = join(dir, uniqueName);
 		await Bun.write(filePath, file);
-		result.push({ filename: safeName, path: filePath, size: file.size });
+		result.push({ filename: uniqueName, path: filePath, size: file.size });
 	}
 	return result;
 }
@@ -68,6 +85,32 @@ async function persistBufferedTextFiles(
 export function cleanupBufferedTextFiles(messageId: string): void {
 	const dir = join(getBufferedFilesDir(), messageId);
 	rmSync(dir, { recursive: true, force: true });
+}
+
+/**
+ * Save additional text files onto an already-queued message.
+ *
+ * Exposed for the attachment-editing route: new files land in the SAME
+ * `<messageId>/` directory as the ones the message already holds, so the
+ * existing cleanup paths (`cleanupBufferedTextFiles`) keep covering them.
+ */
+export function persistAdditionalBufferedTextFiles(
+	messageId: string,
+	files: File[],
+	reservedFilenames: Iterable<string>,
+): Promise<SavedBufferedFile[]> {
+	return persistBufferedTextFiles(messageId, files, reservedFilenames);
+}
+
+/**
+ * Delete ONE persisted text file that an edit removed.
+ *
+ * Deliberately not `cleanupBufferedTextFiles`: the message keeps living with its
+ * remaining attachments, so removing the whole directory would take the kept
+ * files down with it.
+ */
+export function deleteBufferedTextFile(saved: SavedBufferedFile): void {
+	rmSync(saved.path, { force: true });
 }
 
 /** Reconstruct File objects from persisted paths. */
@@ -212,19 +255,37 @@ export async function pushBufferedMessage(
 	return { ok: true, bufferedAt, id };
 }
 
-/** Edit a queued message in-place. */
+/**
+ * Attachment replacement for an in-place queue edit.
+ *
+ * Every field is optional and `undefined` means "leave this alone", so the
+ * long-standing text-only callers keep their exact behaviour. `textFiles` and
+ * `savedFiles` are two halves of the same change (the reconstructed File objects
+ * the consumer will feed to the worktree, and the on-disk metadata the DB row
+ * carries across a restart) and must be passed together.
+ */
+export interface BufferedMessageAttachmentUpdate {
+	images?: ImageRef[];
+	textFiles?: File[];
+	savedFiles?: SavedBufferedFile[];
+}
+
+/** Edit a queued message in-place (text and/or attachments). */
 export function updateBufferedMessage(
 	narratorId: string,
 	messageId: string,
 	text: string,
-	images?: ImageRef[],
+	opts?: BufferedMessageAttachmentUpdate,
 ): boolean {
 	const queue = bufferedMessages.get(narratorId);
 	if (!queue) return false;
 	const msg = queue.find((m) => m.id === messageId);
 	if (!msg) return false;
+	const { images, textFiles, savedFiles } = opts ?? {};
 	msg.text = text;
-	if (images !== undefined) msg.images = images;
+	if (images !== undefined) msg.images = images.length ? images : undefined;
+	if (textFiles !== undefined) msg.textFiles = textFiles.length ? textFiles : undefined;
+	if (savedFiles !== undefined) msg._savedFiles = savedFiles.length ? savedFiles : undefined;
 	msg.bufferedAt = new Date().toISOString();
 	db.update(narratorBufferedMessages)
 		.set({
@@ -232,6 +293,9 @@ export function updateBufferedMessage(
 			bufferedAt: msg.bufferedAt,
 			...(images !== undefined
 				? { imagesJson: images.length ? JSON.stringify(images) : null }
+				: {}),
+			...(savedFiles !== undefined
+				? { textFilePathsJson: savedFiles.length ? JSON.stringify(savedFiles) : null }
 				: {}),
 		})
 		.where(eq(narratorBufferedMessages.id, messageId))
@@ -306,25 +370,89 @@ export function getBufferedMessages(narratorId: string): BufferedMessage[] {
 	return bufferedMessages.get(narratorId) ?? [];
 }
 
-/** Project a buffer queue to the minimal shape needed for WS broadcast / REST responses. */
-export function toBufferSummary(
-	msgs: readonly Pick<
-		BufferedMessage,
-		"id" | "text" | "bufferedAt" | "images" | "creator" | "priority"
-	>[],
-): Array<{
+/** Image attachment of a queued message, as shown to clients. */
+export interface BufferedImageSummary {
+	imageId: string;
+	filename: string;
+	mediaType: string;
+	width?: number;
+	height?: number;
+	/** Narrator that owns the uploaded file, for `/api/uploads/:narratorId/:imageId`. */
+	uploadNarratorId?: string;
+}
+
+/**
+ * Text-file attachment of a queued message, as shown to clients.
+ *
+ * `index` — not the filename — is the identity a client sends back when editing.
+ * The primary queue persists files with `basename`, so a filename is unique
+ * there, but a taken-over subagent's queue holds the original `File` objects and
+ * two same-named files can coexist. Positional identity is exact for both.
+ */
+export interface BufferedTextFileSummary {
+	index: number;
+	filename: string;
+	size: number;
+}
+
+export interface BufferMessageSummary {
 	id: string;
 	text: string;
 	bufferedAt: string;
 	imageCount: number;
+	images: BufferedImageSummary[];
+	textFiles: BufferedTextFileSummary[];
 	creator?: BufferCreator | null;
 	priority?: boolean;
-}> {
+}
+
+/**
+ * Project the text-file attachments of a queued message.
+ *
+ * `_savedFiles` is preferred because it carries the on-disk size; a subagent
+ * queue has no persisted metadata, so its `File` objects are read directly.
+ */
+function toTextFileSummaries(
+	msg: Pick<BufferedMessage, "textFiles" | "_savedFiles">,
+): BufferedTextFileSummary[] {
+	if (msg._savedFiles?.length) {
+		return msg._savedFiles.map((file, index) => ({
+			index,
+			filename: file.filename,
+			size: file.size,
+		}));
+	}
+	if (msg.textFiles?.length) {
+		return msg.textFiles.map((file, index) => ({
+			index,
+			filename: file.name,
+			size: file.size,
+		}));
+	}
+	return [];
+}
+
+/** Project a buffer queue to the shape needed for WS broadcast / REST responses. */
+export function toBufferSummary(
+	msgs: readonly Pick<
+		BufferedMessage,
+		"id" | "text" | "bufferedAt" | "images" | "textFiles" | "_savedFiles" | "creator" | "priority"
+	>[],
+): BufferMessageSummary[] {
 	return msgs.map((m) => ({
 		id: m.id,
 		text: m.text,
 		bufferedAt: m.bufferedAt,
 		imageCount: m.images?.length ?? 0,
+		images: (m.images ?? []).map((image) => ({
+			imageId: image.imageId,
+			filename: image.filename,
+			mediaType: image.mediaType,
+			...(image.width !== undefined ? { width: image.width } : {}),
+			...(image.height !== undefined ? { height: image.height } : {}),
+			...(image.uploadNarratorId !== undefined ? { uploadNarratorId: image.uploadNarratorId } : {}),
+		})),
+		textFiles: toTextFileSummaries(m),
 		creator: m.creator ?? null,
 		priority: m.priority || undefined,
 	}));

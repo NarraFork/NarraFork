@@ -114,6 +114,7 @@ export const chapterBatchMerge = {
 				title: input.title,
 				description: input.description,
 				inheritMode: "fresh",
+				worktreeSource: "workspace",
 			});
 			targetChapterId = forkedChapter.id;
 		}

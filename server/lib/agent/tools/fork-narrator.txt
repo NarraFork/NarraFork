@@ -2,11 +2,18 @@ Fork a new independent narrator from the current narrator session.
 
 This tool creates a new narrator that runs independently — the parent narrator does NOT wait for it to finish. The new narrator immediately starts processing the message you provide.
 
-Two modes are available:
+Two conversation modes are available:
 
 - "fresh": Create a brand-new narrator with no conversation history. Your message becomes its first input. Use this when the new narrator needs a clean slate for a different task.
 
 - "fork": Fork from the current conversation position, inheriting the message history. Your message is sent as a follow-up in the forked context. Use this when the new narrator should continue from where you are but take a different direction.
+
+For chapter-bound narrators, `worktreeSource` independently controls files:
+
+- "workspace": include workspace state (including uncommitted changes). With mode="fork", this uses the current conversation position's workspace snapshot.
+- "commit": use committed history only. Optional `commitSha` selects a commit in the parent chapter's branch history.
+
+`mode`/`inheritMode` control conversation history only; `worktreeSource` controls filesystem state. Omission keeps legacy-compatible defaults.
 
 Behavior depends on the parent narrator type:
 
@@ -18,3 +25,4 @@ Important notes:
 - Use this when you want to delegate a long-running or divergent task to a separate narrator that the user can monitor independently.
 - Do NOT use this as a substitute for the Agent tool (subagents). Use Agent when you need the result back in your current conversation.
 - This tool is best for spawning parallel workstreams that the user will interact with directly.
+- Fork DEPTH is capped: the new narrator can fork again, so a chain of forks-of-forks is refused past a fixed limit (each hop creates a chapter, a git worktree and a running narrator). Breadth is not capped — several forks from the same parent are fine. If you are refused, do the work in the current narrator instead of trying to route around it.

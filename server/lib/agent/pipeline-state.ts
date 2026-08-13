@@ -192,7 +192,7 @@ export async function getPipelineStateForToolCall(
 
 /**
  * Complete the second phase of Pipeline exit-confirmation delivery. Lookup only
- * observes the pending flag; the event handler calls this after the SideCar row
+ * observes the pending flag; the host calls this after the injection row
  * has been persisted. A stale state id cannot clear a newer Pipeline session.
  */
 export async function acknowledgePipelineExitConfirmation(

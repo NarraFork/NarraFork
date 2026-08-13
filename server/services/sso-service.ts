@@ -9,30 +9,12 @@
 import { randomBytes } from "node:crypto";
 import { db } from "@server/db";
 import { userIdentities, userPreferences, users } from "@server/db/schema";
+import { randomAvatarColor } from "@server/lib/avatar-colors";
 import { AppError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
 import type { OidcClaims } from "@server/lib/oidc";
 import type { OidcProviderConfig } from "@server/lib/settings/types";
 import { and, eq } from "drizzle-orm";
-
-const AVATAR_COLORS = [
-	"#4C6EF5",
-	"#7950F2",
-	"#BE4BDB",
-	"#E64980",
-	"#FA5252",
-	"#FD7E14",
-	"#FAB005",
-	"#40C057",
-	"#12B886",
-	"#15AABF",
-	"#228BE6",
-	"#845EF7",
-];
-
-function randomAvatarColor(): string {
-	return AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)];
-}
 
 /** Derive a valid, available username from OIDC claims. */
 async function deriveUniqueUsername(claims: OidcClaims): Promise<string> {
@@ -170,6 +152,16 @@ export const ssoService = {
 		}
 
 		// Provision a new local user + default preferences + link the identity.
+		//
+		// ⚠️ This path is NOT gated by `settings.auth.registrationOpen` and needs no
+		// registration code, and it does not consume the registration attempt limiter.
+		// That is intended, not an oversight: the provider has already authenticated the
+		// person, so the admission decision belongs to `allowSignup` plus
+		// `allowedEmailDomains` (checked above) rather than to controls designed for
+		// anonymous password signup. The consequence an operator must know is that
+		// `allowSignup` grants accounts even while registration is closed — the admin UI's
+		// switch description says so explicitly. Role is always the ordinary `user`
+		// (see the insert below); SSO can never mint an administrator.
 		const now = new Date().toISOString();
 		const username = await deriveUniqueUsername(claims);
 		const userId = generateId();

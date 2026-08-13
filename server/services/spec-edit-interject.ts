@@ -34,8 +34,16 @@ import { isLoopRunning, requestBufferedMessageSoftStop } from "./narrator-sessio
 import type { BufferCreator } from "./narrator-session-state";
 import { type PendingSpecUpdate, pushSpecUpdateForNarrator } from "./spec-update-queue";
 
-/** How the notification actually reached the narrator. */
-export type SpecEditDelivery = "interjected" | "sidecar";
+/**
+ * How the notification actually reached the narrator.
+ *
+ * `interjected` — delivered as a cut-in user turn against a RUNNING loop.
+ * `queued`      — parked in the idle spec-update queue, to be picked up at the next
+ *                 turn boundary. (Formerly spelled `"sidecar"`, from a delivery
+ *                 mechanism that no longer exists; the name described the old
+ *                 transport rather than what happens, which is simply queueing.)
+ */
+export type SpecEditDelivery = "interjected" | "queued";
 
 /**
  * The still-unconsumed cut-in message per narrator.
@@ -58,6 +66,22 @@ const specEditInterjectIds = hotSafe<Map<string, string>>(
 export function formatSpecEditInterjection(update: PendingSpecUpdate, locale: Locale): string {
 	const isZh = locale === "zh-CN";
 	const lines: string[] = [];
+	if (update.reset) {
+		lines.push(
+			isZh
+				? "我通过 Spec 面板重置了整个 Dynamic Spec：所有任务、笔记与 behavior_fence 均已恢复默认/清空。请丢弃早先的计划，等待我的下一条指令。"
+				: "I reset the entire Dynamic Spec via the Spec panel: all tasks, notes and the behavior fence are back to defaults/empty. Drop the earlier plan and wait for my next instruction.",
+		);
+		return lines.join("\n");
+	}
+	if (update.cleared) {
+		lines.push(
+			isZh
+				? "我通过 Spec 面板清空了任务列表，此前的开放任务已全部移除。停止继续之前的任务，等待我的下一条指令。"
+				: "I cleared the task list via the Spec panel — every previously open task is gone. Stop pursuing earlier tasks and wait for my next instruction.",
+		);
+		return lines.join("\n");
+	}
 	if (isZh) {
 		lines.push(`我通过 Spec 面板更新了 ${update.uri}，请同步你的工作计划。`);
 	} else {
@@ -124,7 +148,7 @@ export async function interjectSpecEditAsUserMessage(
 	// whatever the user does next instead of costing a model request now.
 	if (!isLoopRunning(narratorId)) {
 		pushSpecUpdateForNarrator(narratorId, update);
-		return { delivered: "sidecar" };
+		return { delivered: "queued" };
 	}
 
 	const text = formatSpecEditInterjection(update, locale);
@@ -156,7 +180,7 @@ export async function interjectSpecEditAsUserMessage(
 		// whose queue lives in a separate map). Fall back so nothing is lost.
 		specEditInterjectIds.delete(narratorId);
 		pushSpecUpdateForNarrator(narratorId, update);
-		return { delivered: "sidecar" };
+		return { delivered: "queued" };
 	}
 
 	specEditInterjectIds.set(narratorId, result.id);

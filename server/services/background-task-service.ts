@@ -5,6 +5,7 @@ import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
+import { pushPendingInjection } from "./parent-injection-queue";
 
 // === Types ===
 
@@ -156,8 +157,6 @@ class BackgroundTaskService {
 	private outputChunks: Map<string, string[]>;
 	/** Accumulated byte length per task (for enforcing MAX_MEMORY_OUTPUT_BYTES) */
 	private outputByteCounts: Map<string, number>;
-	/** In-memory sync notification queue for completed bash tasks (keyed by parentNarratorId) */
-	private bashNotificationQueue: Map<string, CompletedNotification[]>;
 	/** Cached parentNarratorId per task (avoids DB lookup in appendOutput) */
 	private parentNarratorCache: Map<string, string>;
 	/** Last time cleanupCompleted was run */
@@ -187,10 +186,6 @@ class BackgroundTaskService {
 		this.outputByteCounts = hotSafe(
 			"narrafork:bg-task:outputByteCounts",
 			() => new Map<string, number>(),
-		);
-		this.bashNotificationQueue = hotSafe(
-			"narrafork:bg-task:bashNotificationQueue",
-			() => new Map<string, CompletedNotification[]>(),
 		);
 		this.parentNarratorCache = hotSafe(
 			"narrafork:bg-task:parentNarratorCache",
@@ -1260,24 +1255,18 @@ class BackgroundTaskService {
 	// ── Synchronous bash notification drain ─────────────────────────────
 
 	/**
-	 * Drain completed bash task notifications synchronously from the in-memory queue.
-	 * Used by getInjectedUserText (a sync callback) in the agent loop.
+	 * Enqueue a finished bash task.
+	 *
+	 * Writes to the shared `parent-injection-queue` rather than a queue of its own: the
+	 * turn boundary needs ONE order across bash completions, agent completions and
+	 * `Send` reports, otherwise the drain has to invent a sequence (which is how a
+	 * subagent's completion came to be shown before the message that preceded it).
 	 */
-	drainBashNotificationsSync(parentNarratorId: string): CompletedNotification[] {
-		const queue = this.bashNotificationQueue.get(parentNarratorId);
-		if (!queue || queue.length === 0) return [];
-		this.bashNotificationQueue.delete(parentNarratorId);
-		return queue;
-	}
-
-	/** Push a bash task completion notification to the in-memory sync queue. */
 	private pushBashNotification(
 		parentNarratorId: string,
 		notification: CompletedNotification,
 	): void {
-		const queue = this.bashNotificationQueue.get(parentNarratorId) ?? [];
-		queue.push(notification);
-		this.bashNotificationQueue.set(parentNarratorId, queue);
+		pushPendingInjection(parentNarratorId, { kind: "bg_bash", task: notification });
 	}
 
 	// ── Recovery / continuation guards ──────────────────────────────────

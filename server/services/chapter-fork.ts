@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
+import type { ForkWorktreeSource } from "@shared/chapter-fork";
 import { and, desc, eq, isNotNull, lte, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narratorMessageRefs, narratorMessages, narrators, projects } from "../db/schema";
@@ -41,7 +42,9 @@ export interface ForkChapterInput {
 	forkAtMessageUuid?: string;
 	/** Fork point identified by the local `narrator_messages.id` (any role). */
 	forkAtMessageId?: string;
-	/** Explicit commit SHA to fork from (ruler mode). Overrides the fork point. */
+	/** Whether files come from workspace state or committed history. */
+	worktreeSource?: ForkWorktreeSource;
+	/** Explicit commit SHA to fork from. Only valid with commit source. */
 	startCommitSha?: string;
 	/** Chapter role: branch or exploration (trunk is reserved for the root chapter). */
 	role?: "branch" | "exploration";
@@ -181,6 +184,29 @@ export const chapterFork = {
 		if (parent.status !== "active" && parent.status !== "dormant") {
 			throw new ValidationError("Can only fork active or dormant chapters");
 		}
+		if (input.forkAtMessageId && input.forkAtMessageUuid) {
+			throw new ValidationError("forkAtMessageId and forkAtMessageUuid are mutually exclusive");
+		}
+		if (input.startCommitSha && (input.forkAtMessageId || input.forkAtMessageUuid)) {
+			throw new ValidationError(
+				"Message fork coordinates and startCommitSha are mutually exclusive",
+			);
+		}
+		if (input.startCommitSha && input.worktreeSource === "workspace") {
+			throw new ValidationError("startCommitSha requires worktreeSource=commit");
+		}
+
+		const worktreeSource: ForkWorktreeSource =
+			input.worktreeSource ??
+			(input.startCommitSha || parent.status === "dormant" ? "commit" : "workspace");
+		const explicitCurrentWorkspace =
+			input.worktreeSource === "workspace" && !input.forkAtMessageId && !input.forkAtMessageUuid;
+		if (parent.status === "dormant" && input.worktreeSource === "workspace") {
+			throw new ValidationError(
+				"Cannot fork a dormant chapter from workspace state because it has no worktree. " +
+					'Use worktreeSource="commit" or wake the chapter first.',
+			);
+		}
 
 		const project = await db.query.projects.findFirst({
 			where: eq(projects.id, parent.projectId),
@@ -204,11 +230,24 @@ export const chapterFork = {
 		// narrator fork) works off the local row id.
 		const forkMessage = await resolveForkPointMessage(parentChapterId, input);
 
-		// Resolve the commit SHA for the fork point.
-		// Priority: startCommitSha (ruler mode) > fork point message > parent HEAD
+		// Resolve the commit SHA for the fork point. Message coordinates select the
+		// nearest preceding commit in both modes; workspace mode may then restore the
+		// message's recorded filesystem state on top of it.
 		let commitSha: string;
 		if (input.startCommitSha) {
-			commitSha = input.startCommitSha;
+			try {
+				commitSha = await gitService.getRefCommit(gitPath, `${input.startCommitSha}^{commit}`);
+			} catch {
+				throw new ValidationError(
+					`startCommitSha is not a resolvable commit: ${input.startCommitSha}`,
+				);
+			}
+			const parentTip = await gitService.getRefCommit(gitPath, parent.branch);
+			if (!(await gitService.isAncestor(gitPath, commitSha, parentTip))) {
+				throw new ValidationError(
+					"startCommitSha must belong to the parent chapter branch history",
+				);
+			}
 		} else if (forkMessage) {
 			commitSha = await this.resolveCommitForMessage(
 				parentChapterId,
@@ -218,11 +257,6 @@ export const chapterFork = {
 				parent.branch,
 			);
 		} else {
-			// With no worktree the fork point is the parent's *branch* tip, resolved by
-			// name. `getHeadCommit(gitPath)` reads the main repository's checkout instead —
-			// usually trunk — so a dormant parent would be forked from a commit that has
-			// nothing to do with it, silently producing a child that is missing all of the
-			// parent's work rather than continuing from it.
 			commitSha = parent.worktreePath
 				? await gitService.getHeadCommit(parent.worktreePath)
 				: await gitService.getRefCommit(gitPath, parent.branch);
@@ -230,9 +264,10 @@ export const chapterFork = {
 
 		const forkPoint: {
 			commitSha: string;
+			worktreeSource: ForkWorktreeSource;
 			narratorMessageUuid?: string;
 			narratorMessageId?: string;
-		} = { commitSha };
+		} = { commitSha, worktreeSource };
 		if (forkMessage) {
 			forkPoint.narratorMessageId = forkMessage.id;
 			if (forkMessage.messageUuid) forkPoint.narratorMessageUuid = forkMessage.messageUuid;
@@ -255,9 +290,11 @@ export const chapterFork = {
 			// repo exists, so it covers every later step regardless of where the failure
 			// happens; `destroy` on a non-existent directory is a no-op. `force` is required
 			// because the chapter row (if it got as far as being inserted) claims this key.
-			rollback.push(async () => {
-				await worktreeTreeSnapshot.destroy(worktreePath, undefined, { force: true });
-			});
+			if (worktreeSource === "workspace") {
+				rollback.push(async () => {
+					await worktreeTreeSnapshot.destroy(worktreePath, undefined, { force: true });
+				});
+			}
 
 			// Step 1.5: Put the new worktree into the state the fork point actually
 			// describes.
@@ -284,10 +321,16 @@ export const chapterFork = {
 			 * has to be told that what they got is an approximation.
 			 */
 			let snapshotRestoreError: string | null = null;
-			if (parent.worktreePath) {
+			if (worktreeSource === "workspace" && parent.worktreePath) {
 				const snapshot = forkMessage
 					? await this.resolveSnapshotForMessage(parentChapterId, forkMessage.id)
 					: await this.resolveCurrentSnapshot(parent.worktreePath);
+				if (!snapshot && explicitCurrentWorkspace) {
+					throw new ValidationError(
+						"Could not capture the parent workspace for this fork. Retry after checking that " +
+							"the worktree and git repository are accessible, or use worktreeSource=commit.",
+					);
+				}
 				if (snapshot) {
 					try {
 						await worktreeTreeSnapshot.restoreInto(
@@ -316,6 +359,12 @@ export const chapterFork = {
 							forkedFromMessage: forkMessage != null,
 						});
 					} catch (err) {
+						if (explicitCurrentWorkspace) {
+							throw new ValidationError(
+								"The parent workspace was captured but could not be restored into the fork. " +
+									`Retry, or use worktreeSource=commit. Details: ${String(err)}`,
+							);
+						}
 						// Remembered so the fallback below can say the state it produces is
 						// weaker than the one that was available. Replay reconstructs files from
 						// recorded Write/Edit inputs, so anything written by Bash, a build step
@@ -333,7 +382,7 @@ export const chapterFork = {
 				}
 			}
 
-			if (forkMessage && !restoredFromTree) {
+			if (worktreeSource === "workspace" && forkMessage && !restoredFromTree) {
 				// A snapshot existed for this fork point but could not be applied, so what
 				// follows is a reconstruction from recorded tool inputs rather than the exact
 				// state. Said once here, before the replay's own outcome is known, because
@@ -428,7 +477,7 @@ export const chapterFork = {
 			// replay path's own warning only fires when a restore was *attempted and
 			// failed*. The parent's whole uncommitted workspace could therefore be absent
 			// from the fork with no output whatsoever.
-			if (!restoredFromTree && parent.worktreePath) {
+			if (worktreeSource === "workspace" && !restoredFromTree && parent.worktreePath) {
 				const status = await gitService
 					.getStatus(parent.worktreePath)
 					.then((out) => ({ ok: true as const, out }))
@@ -545,7 +594,8 @@ export const chapterFork = {
 					// a chapter made dormant before running anything would otherwise have its
 					// shadow repository swept as an orphan.
 					snapshotCommitSha: baseSnapshotCommit,
-					snapshotShadowKey: treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath),
+					snapshotShadowKey:
+						worktreeSource === "workspace" ? treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath) : null,
 					anchorCommitSha,
 					axisOffset,
 					crossOffset,
@@ -561,6 +611,7 @@ export const chapterFork = {
 			// Create fork edge in chapter_edges
 			await chapterEdgeService.createForkEdge(parent.projectId, parentChapterId, chapter.id, {
 				commitSha: forkPoint.commitSha,
+				worktreeSource,
 				inheritMode: inheritMode,
 				narratorMessageUuid: forkPoint.narratorMessageUuid,
 				narratorMessageId: forkPoint.narratorMessageId,
@@ -582,8 +633,13 @@ export const chapterFork = {
 				});
 			}
 
-			// Step 3: Copy project-configured files
-			if (project.copyFiles && parent.worktreePath) {
+			// Step 3: Copy project-configured files only for the parent's current workspace.
+			if (
+				worktreeSource === "workspace" &&
+				!forkMessage &&
+				project.copyFiles &&
+				parent.worktreePath
+			) {
 				const files = JSON.parse(project.copyFiles) as string[];
 				if (files.length > 0) {
 					await gitService.copyFiles(parent.worktreePath, worktreePath, files);

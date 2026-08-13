@@ -104,8 +104,18 @@ export interface RulerData {
 	activeChapters: RulerActiveChapter[];
 	mergedChapters?: RulerActiveChapter[];
 	totalCommitCount?: number;
-	oldestLoadedIndex?: number;
-	newestLoadedIndex?: number;
+	/**
+	 * Absolute `git log` offsets of this page's first / last commit (see the server's
+	 * `GET /:id/ruler`). Offset 0 is HEAD and grows towards OLDER history, because git
+	 * walks newest-first.
+	 *
+	 * Named after the walk on purpose. They were `oldestLoadedIndex` / `newestLoadedIndex`,
+	 * which named the opposite ends, and the paging predicates below were written against
+	 * those names — `hasPreviousPage` therefore asked "is the first page's offset > 0",
+	 * which is false for the very page that has all the older history still ahead of it.
+	 */
+	firstOffset?: number;
+	lastOffset?: number;
 	/** Optional and not yet emitted by the server — see `RulerFallback`. */
 	degraded?: boolean;
 	fallback?: boolean;
@@ -122,6 +132,45 @@ export function useRulerData(projectId: string) {
 	});
 }
 
+export interface RulerPageParam {
+	cursor?: string;
+	direction: "older" | "newer";
+}
+
+/**
+ * Is there OLDER history past this page, and how do we ask for it?
+ *
+ * React Query's `previousPage` is this query's older direction (`flattenRulerPages`
+ * relies on those pages being prepended). "Older" means a LARGER absolute offset, so the
+ * question is whether the page's last commit is short of the final one — not whether its
+ * first offset is above zero, which is what the old `oldestLoadedIndex > 0` test asked and
+ * why paging older was dead on the first page.
+ *
+ * The cursor is the page's LAST (oldest) commit: the server counts forward from it.
+ *
+ * Pure and exported so the predicate is testable without a query client — the bug it
+ * replaces was a boolean that no test could reach.
+ */
+export function rulerOlderPageParam(page: RulerData): RulerPageParam | undefined {
+	const { lastOffset, totalCommitCount } = page;
+	if (lastOffset == null || totalCommitCount == null) return undefined;
+	if (lastOffset >= totalCommitCount - 1) return undefined;
+	const cursor = page.commits.at(-1)?.sha;
+	// No cursor means an empty page: there is nothing to count forward from, and asking
+	// again without one would re-fetch offset 0 forever.
+	if (!cursor) return undefined;
+	return { cursor, direction: "older" };
+}
+
+/** Is there NEWER history before this page? Mirror of {@link rulerOlderPageParam}. */
+export function rulerNewerPageParam(page: RulerData): RulerPageParam | undefined {
+	const { firstOffset } = page;
+	if (firstOffset == null || firstOffset <= 0) return undefined;
+	const cursor = page.commits[0]?.sha;
+	if (!cursor) return undefined;
+	return { cursor, direction: "newer" };
+}
+
 export function useRulerInfinite(projectId: string) {
 	return useInfiniteQuery({
 		queryKey: ["ruler", projectId],
@@ -131,20 +180,12 @@ export function useRulerInfinite(projectId: string) {
 				cursor: pageParam?.cursor,
 				direction: pageParam?.direction,
 			}) as Promise<RulerData>,
-		initialPageParam: undefined as { cursor?: string; direction: "older" | "newer" } | undefined,
-		getNextPageParam: (lastPage) =>
-			lastPage.newestLoadedIndex != null &&
-			lastPage.totalCommitCount != null &&
-			lastPage.newestLoadedIndex < lastPage.totalCommitCount - 1
-				? { cursor: lastPage.commits[0]?.sha, direction: "newer" as const }
-				: undefined,
-		getPreviousPageParam: (firstPage) =>
-			firstPage.oldestLoadedIndex != null && firstPage.oldestLoadedIndex > 0
-				? {
-						cursor: firstPage.commits.at(-1)?.sha,
-						direction: "older" as const,
-					}
-				: undefined,
+		initialPageParam: undefined as RulerPageParam | undefined,
+		// `next` walks towards NEWER commits and `previous` towards OLDER ones, matching
+		// `flattenRulerPages`: it documents that React Query prepends previous-pages, and
+		// the ruler needs the older batch prepended to keep one newest-first run.
+		getNextPageParam: rulerNewerPageParam,
+		getPreviousPageParam: rulerOlderPageParam,
 		staleTime: 5 * 60 * 1000,
 		gcTime: RULER_QUERY_GC_TIME_MS,
 		maxPages: MAX_RULER_PAGES,
@@ -181,14 +222,13 @@ export function flattenRulerPages(pages: RulerData[]): RulerData {
 	// `fetchPreviousPage` (the "older" direction), so `pages` runs oldest-batch-first
 	// while each batch runs newest-first. Concatenating that yields a list that is
 	// neither newest- nor oldest-first, and the ruler derives tick order — hence every
-	// chapter's position — from this array. `oldestLoadedIndex` is the absolute index of
-	// each page's FIRST commit, so ascending by it restores a single newest-first run.
+	// chapter's position — from this array. `firstOffset` is the absolute git-log offset
+	// of each page's FIRST commit and grows towards older history, so ascending by it
+	// restores a single newest-first run.
 	//
-	// Pages that predate the index fields sort as 0 and keep their relative order,
+	// Pages that predate the offset fields sort as 0 and keep their relative order,
 	// which is the single-page behaviour they had before.
-	const ordered = [...pages].sort(
-		(a, b) => (a.oldestLoadedIndex ?? 0) - (b.oldestLoadedIndex ?? 0),
-	);
+	const ordered = [...pages].sort((a, b) => (a.firstOffset ?? 0) - (b.firstOffset ?? 0));
 
 	// Deduplicate commits by sha: the "newer" cursor direction computes its offset as
 	// `cursorIndex - limit`, which deliberately overlaps the page it pages towards.
@@ -239,8 +279,11 @@ export function flattenRulerPages(pages: RulerData[]): RulerData {
 		// happens to be identical on every page today, so this is about keeping the
 		// invariant locally legible rather than fixing a live bug.
 		totalCommitCount: ordered[0].totalCommitCount,
-		oldestLoadedIndex: Math.min(...ordered.map((p) => p.oldestLoadedIndex ?? 0)),
-		newestLoadedIndex: Math.max(...ordered.map((p) => p.newestLoadedIndex ?? 0)),
+		// The window the merged pages span: nearest-to-HEAD offset and farthest-into-history
+		// offset. `rulerOlderPageParam` reads `lastOffset` off the merged result too, so this
+		// max is what decides whether "load older commits" stays available after a page lands.
+		firstOffset: Math.min(...ordered.map((p) => p.firstOffset ?? 0)),
+		lastOffset: Math.max(...ordered.map((p) => p.lastOffset ?? 0)),
 		degraded: ordered.some((p) => p.degraded === true) || undefined,
 		fallback: ordered.some((p) => p.fallback === true) || undefined,
 		fallbacks: mergeRulerFallbacks(ordered),

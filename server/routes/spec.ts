@@ -72,7 +72,31 @@ specRoutes.post("/:id/spec/tasks/clear", async (c) => {
 		updatedBy: "user",
 		source: "ui",
 	});
-	return c.json({ ok: true, revisionId: written.revisionId ?? null });
+	// Tell the model too: without a row in history the narrator only knows the old
+	// task text from earlier context and may keep pushing it. Reuses the spec-edit
+	// delivery path (cut-in user message when busy, sidecar when idle).
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const { delivered } = await interjectSpecEditAsUserMessage(
+		narratorId,
+		{
+			uri: written.uri,
+			path: "tasks.json",
+			revisionId: written.revisionId ?? null,
+			updatedBy: "user",
+			preview: null,
+			taskSummary: null,
+			cleared: true,
+			timestamp: new Date().toISOString(),
+		},
+		locale,
+		userId,
+	);
+	return c.json({
+		ok: true,
+		revisionId: written.revisionId ?? null,
+		interjected: delivered === "interjected",
+	});
 });
 
 /** POST /:id/spec/reset — reset the entire Dynamic Spec namespace to defaults. */
@@ -88,6 +112,25 @@ specRoutes.post("/:id/spec/reset", async (c) => {
 		updatedBy: "user",
 		source: "reset",
 	});
+	// Same reasoning as tasks/clear: the model must see the reset in its history,
+	// or it will reconstruct the wiped tasks from conversational memory.
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	await interjectSpecEditAsUserMessage(
+		narratorId,
+		{
+			uri: "spec://",
+			path: "",
+			revisionId: null,
+			updatedBy: "user",
+			preview: null,
+			taskSummary: null,
+			reset: true,
+			timestamp: new Date().toISOString(),
+		},
+		locale,
+		userId,
+	);
 	return c.json({ ok: true });
 });
 

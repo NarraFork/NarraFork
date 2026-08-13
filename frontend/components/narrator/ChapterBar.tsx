@@ -350,6 +350,7 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 				<Suspense fallback={null}>
 					<ChapterForkModal
 						chapterId={chapterId}
+						chapterStatus={chapter.status}
 						opened={forkModalOpen}
 						onClose={() => setForkModalOpen(false)}
 					/>

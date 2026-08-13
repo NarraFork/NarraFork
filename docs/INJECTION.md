@@ -1,0 +1,293 @@
+# Injection 机制解析
+
+> 服务端把自己的话放进叙述者对话的唯一通道。本文档梳理截至当前代码状态的全部使用点。
+>
+> 核心实现：`server/services/narrator-injection.ts`
+
+---
+
+## 1. 这个机制解决什么问题
+
+注入内容历史上走两条互不相干的路：
+
+1. **side-car**（`narrator_sidecars` 表）—— 一行挂在**别人**的消息上的记录，在 API 调用时由七份 `buildHistory` 各自的手写状态机重新拼进 `tool_result` 输出或下一个 user turn。
+2. **消息行**（`persistSystemMessage`）—— 一条普通 `role: "sys"` 行，每个 provider 本来就知道怎么回放。
+
+路 1 解决的问题路 2 也能解决。NarraFork 每次请求都发送**完整历史**（`store: false`，见 `openai-provider.ts` 的注释），所以模型收到什么是消息行的纯函数——同样字节的 side-car 和 `sys` 行在线上是一样的，side-car 只是为此额外付出了一张表、一个 `body_json` 列、七份 flush 状态机和一层 `<side_car>` 包装。
+
+**路 1 已完全移除**（表、列、状态机、包装全部删除）。下文描述的是唯一剩下的路。
+
+---
+
+## 2. 两个正交的轴
+
+旧设计把这两件事混在一起：`role` 既决定协议角色，又（通过每个 provider 的"末尾 user 行就是当前 turn"规则）决定这行会不会被当成需要回答的东西。这正是"注入但不排 turn"没有干净写法的原因，也是 side-car 被发明出来绕开 `role` 的原因。
+
+### 2.1 `role` —— 这内容**是**什么
+
+| 值 | 语义 | provider 映射 |
+|---|---|---|
+| `sys`（默认） | 系统事实（容器起来了、任务完成了） | Anthropic 官方 API 和 Cline 上是**真正的**对话中 `system` 消息；其他 provider 映射成 `user` |
+| `user` | 代表用户说话 | 权重更高，而且理应如此 |
+
+`user` 的存在有具体理由：`taskReflection` 读父历史，只有当请求以 user turn 形式到达时，它才能识别出这是用户真正要求的任务。这是 `spec-edit-interject.ts` 存在的全部原因。
+
+### 2.2 `schedule` —— 因此**应该发生**什么
+
+| 值 | 行为 | 典型用途 |
+|---|---|---|
+| `none`（默认） | 只写行，别的什么都不改。下次请求碰巧读到就读到，可能几秒后、也可能永远不会 | 容器就绪、评审反馈、合并摘要、浏览器会话丢失 |
+| `onNextTurn` | 写行**并且**把内容送进**正在运行**的 loop 的下一个 turn | loop 只在 pass 开始时重建内存历史，turn 中途写的行在下一 pass 前是不可见的 |
+| `interject` | 写行并请求运行中的 loop 在下一个工具边界停下，让内容被及时取用 | 内容改变了叙述者**该做什么**（计划编辑），而不只是它知道什么 |
+| `wakeIfIdle` | 写行，如果叙述者空闲就起一个 turn；忙时退化为 `none` | 行已就位，运行中的 loop 下一 pass 会取到 |
+
+**`onNextTurn` 不是双份投递**：当前 pass 读内存副本，之后的 pass 读那一行，两者永不作用于同一个请求。调用方拿到 `turnText` 追加进 loop 的 next-turn 缓冲；**无条件追加会导致重复投递**。
+
+### 2.3 为什么 `schedule` 是参数而不是列
+
+它在投递这个动作里被消费掉了。持久化它会让 fork 或历史回放**重新触发几个月前就已发生的唤醒**。行是永久的，意图不是。
+
+> 遗留：这没有动 provider 的"末尾 `user` 行即当前 turn"规则——`buildHistory` 仍从行的形状推断调度。去掉这层推断需要一个持久化标记，刻意留在范围外。
+
+---
+
+## 3. 数据形状：一行两个投影
+
+注入行的 `contentJson` 是 `[{ type: "text", text }, injectionBlock, ...extraBlocks]`：
+
+| block | 给谁看 | 内容 |
+|---|---|---|
+| `text` | **模型** | 模型向文案原样保留，指令 boilerplate 全在里面（"tasks.json 只保留 text/status/protected"、"不要添加 ID"） |
+| `system_injection` | **读者** | 刻意携带**结构化 body**（`SideCarBody`），而非预先措辞好的文本 |
+
+这个拆分是承重的。provider 只投影 text block，所以第一块必须是模型向原文。
+
+### 3.1 为什么 block 存 `body` 而不是 Markdown
+
+读者向措辞活在**前端**的消息表里（各 locale 的 `narrator.json` 中 `sidecar.body.*`，22 个键），通过 `ctx.labels` 取用；服务端的 `sidecar.*` 表只有模型向文案。在写入时投影意味着把 ~22 个读者向字符串复制进服务端，并且**把它们冻结在写入时刻**——以后修翻译永远到不了已存在的行。
+
+`sideCarBodyToMarkdown` 因此跑在 UI。两个投影不会漂移，因为都从同一份载荷派生，而载荷只在一处写入。
+
+### 3.2 `SideCarBody` 的 7 种 kind
+
+| kind | 载荷 | 读者看到的 |
+|---|---|---|
+| `notice` | `params?` | 一句话提醒，全在标题里，没有正文可展开 |
+| `prose` | `text` | 行为围栏用固定标题；其他散文用自己第一行做标题 |
+| `tasks` | `variant` + `tasks[]` | `### 3 条开放任务` + Markdown 列表，`protected` 标注 |
+| `knowledge` | `hits[]` | `### N 条知识库条目` + 每条一个 bullet（标题 — 摘要） |
+| `tasksDone` | `flavor` + `items[]` | 每个任务一个 `####` 子标题 + 输出预览 + 截断说明 |
+| `messages` | `items[]` | 单条时发送者名做标题；多条时计数标题 + 每人子标题 |
+| `specUpdates` | `items[]` | 单文件时 uri 做标题，摘要做正文 |
+
+投影**有界**：`SIDECAR_PROJECTION_MAX_LINES = 200`，且预算**跨 item 共享**（不是每 item 各自封顶，否则总量仍随 N 增长）。原因是测量层要等投影постро完数组后才能决定截断，无界投影会把一条病态记录变成每次测量 pass 的全长开销。
+
+### 3.3 无结构化 body 的行
+
+走 `rawSideCarToMarkdown`：原文照搬，**刻意不做任何解析**——不拆 XML 包装、不剥 `[System]` 前缀、不做 bullet 检测。像 `<side_car source="…">` 这类标记会被套进代码围栏，作为可见字符显示，而不是被 Markdown 渲染器当 HTML 标签吃掉。猜测生产者丢弃的结构是这套设计移除的复杂度。
+
+---
+
+## 4. API
+
+```ts
+// server/services/narrator-injection.ts
+
+deliverInjection(narratorId, {
+  content: string,              // 模型向文本，原样存为首个 text block
+  source: string,               // 生产者标签
+  body?: SideCarBody,           // 结构化载荷，为读者投影成 Markdown
+  role?: "sys" | "user",        // 默认 sys
+  schedule?: InjectionSchedule, // 默认 none
+  locale?: Locale,
+  originSource?: MessageOriginSource,  // 归属标签（review、autoContinuation…）
+  originDetail?: string | null,
+  createdBy?: string | null,
+  extraBlocks?: any[],          // 已有富卡片的生产者保留其 UI
+}): Promise<{
+  messageId: string | null,     // 没写行时为 null
+  turnText: string | null,      // 仅 onNextTurn 非 null
+  started: boolean,             // wakeIfIdle 在空闲叙述者上起了 turn
+  interjected: boolean,         // interject 在运行中叙述者上请求了软停
+}>
+```
+
+**空内容不产生行**：调用方会 drain 空队列、碰到空 cadence，空行对读者是张白卡、对模型是一次浪费的 turn。
+
+`buildSystemInjectionBlock(source, body)` 单独导出，便于生产者构造 block 并断言而不碰数据库。
+
+### 4.1 调度接缝
+
+```ts
+setInjectionScheduler({ requestSoftStop, wakeIfIdle })
+```
+
+一个显式可替换接缝，而非 `mock.module` 目标。两个理由：
+
+- `narrator-session` 既是本模块的协作者也是消费者，静态 import 会在模块初始化时形成循环，所以必须懒加载。
+- **`mock.module` 在 Bun 里是进程级的。** 为一个测试文件替换 `narrator-session`，会把替换品交给同一次运行里后续的每个文件；由于若干兄弟服务持有模块级懒加载 map，这会静默重置其他套件依赖的状态（它曾弄坏 9 个 narrator-buffer 断言）。测试自己设置并还原的接缝把影响半径关在测试内部。
+
+---
+
+## 5. 生产者全表
+
+### 5.1 会话层（`narrator-session.ts`）
+
+`drainInjectionsIntoHistory()` 在**忙**叙述者的 turn 边界排空各队列：
+
+| source | body kind | schedule | 触发 |
+|---|---|---|---|
+| `living_work_spec` | `tasks` | `onNextTurn` | cadence（默认每 15 个完成工具调用） |
+| `behavior_fence` | `prose` | `onNextTurn` | cadence（默认关闭，`-1`） |
+| `bg_agent` | `tasksDone` (agent) | `onNextTurn` | 后台子代理完成 + `background_agents_completed` extraBlock |
+| `bg_bash` | `tasksDone` (bash) | `onNextTurn` | 后台 bash 任务完成 |
+| `subagent_message` | `messages` | `onNextTurn` | 子代理 `Send({ id: "parent" })` + `subagent_messages` extraBlock |
+| `spec_update` | `specUpdates` | `onNextTurn` | 用户在 UI 编辑 spec 文件（仅空闲回退路径） |
+
+**空闲**路径是分开的函数，`schedule: "none"`：
+
+| 函数 | source | 为什么 none |
+|---|---|---|
+| `drainAndPersistBackgroundCompletionNotice` | `bg_agent` | 调用方持有 `continuationStartLock` 并自己起 loop，让 `deliverInjection` 唤醒会重入同一把锁并死锁 |
+| `drainAndPersistParentInboundNotice` | `subagent_message` | 同上 |
+
+这两条空闲路径的**文本**仍来自各自原有的格式化函数（那套措辞是它们一直发送的、且在别处被断言），body 只是随行给读者。
+
+### 5.2 Agent Loop（`server/lib/agent/loop.ts`）
+
+loop 自己抬起的提醒进 `pendingLoopInjections` 队列，在 turn 边界由 `flushLoopInjections()` 经宿主的 `deliverInjectionRow` 钩子落库：
+
+| source | body kind | 触发 |
+|---|---|---|
+| `pipeline_exit_confirmation` | `notice` | Pipeline 退出确认待处理 |
+| `silent_progress` | `notice` | 连续 N 次工具调用无可见文本输出 |
+| `relaxed_plan` | `notice` | 宽松计划模式提醒 |
+| `knowledge_base_hint` | `knowledge` | 工具输出扫中知识库条目（point B） |
+
+两个关键性质：
+
+- **队列而非返回值**：一条提醒要写一行，不是每个碰巧拼装了它的 tool result 写一行。
+- **幂等**：`processTooResult` 会对同一个工具**被调用多次**（结果可能在流式期间被 drain、又被执行组循环 drain 一次），`processedToolUseIds` 让整个函数体幂等。没有它，一次 silent-progress 阈值跨越会重复投递。
+- 宿主**没有**提供这个钩子时返回 `""` 且提醒被丢弃，**不回退到 side-car**——两条路都投递就是同样的话在对话里出现两次。
+
+### 5.3 子代理执行器（`subagent-executor.ts`）
+
+| source | body kind | schedule |
+|---|---|---|
+| （转发 loop 的）`injection.source` | 透传 | `onNextTurn` |
+| `living_work_spec` | `tasks` | `onNextTurn` |
+| `team_message` | `messages` | `onNextTurn` |
+
+子代理的排队用户消息**不走** `deliverInjection`：行由 `persistSubagentUserMessage` 作为真正的 `role: "user"` turn 写入（它本来就是——用户打的字），再注入一次会重复。文本仍需要，因为 loop 在 pass 开始时就建好了内存历史。
+
+### 5.4 cadence 抽象（`server/lib/injection-cadence.ts`）
+
+`InjectionCadence` 把"每 N 个完成工具调用做一次"独立出来。原先有三份各自长起来的计数器（`narrator-session` 两份、`subagent-executor` 一份），在一个要紧的细节上不一致：
+
+**空情况。** cadence 可能到期然后什么都没产出（`spec://tasks.json` 可能没有开放任务，行为围栏可能是空的）。`due()` 刻意**不是**纯谓词——**问它是否到期就是消费掉这个 tick**。产出为空的调用方也花掉了这一 tick。否则 cadence 永久处于到期状态，之后**每个** tool result 都会从 SQLite 重读 spec 文件，即一次同步主线程读取 per 工具调用，只要会话还活着就一直如此。`subagent-executor` 原来只在成功时推进，正好有这个问题。
+
+interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每次都触发"没人想要，而配置错误能产生它）。interval **每次检查都重读**而不是捕获，这样叙述者的 override 改了能在下一个边界生效。
+
+标记存储通过访问器间接化，让标记能**活得比** cadence 对象长：`narrator-session` 的标记放在 ActiveNarrator 上，因为一个会话跑很多 loop pass 且每次重建 config，cadence 自己持有标记会在每个 pass 重启日程。
+
+---
+
+## 6. 渲染：两条路径
+
+| 路径 | 有 body 的注入 | 无 body 的历史行 |
+|---|---|---|
+| chunked（准备删除） | `SystemInjectionNotice.tsx` 单卡片承载整个 delivery | 同左 |
+| vlist 精确布局 | `injection-bubble`：每说话人一个**左侧带框气泡**（`measure-injection-bubble` / `RenderInjectionBubble`） | 复用 `origin_notice`：标题行 + 折行正文 |
+
+**有主体 / 无主体的划分**（`adaptSpokenInjection`，`shared/pretext-layout/segment-adapter.ts`）：
+
+| body kind | 来源 | 拆法 | speaker |
+|---|---|---|---|
+| `messages` | `subagent_message` / `team_message` / `group_message` | 每 sender 一个 | `fromTitle` → `fromId` 前 8 位 → 未知发送者 |
+| `tasksDone` | `bg_agent` / `bg_bash` | 每任务一个 | `alias` → `title` → `id` |
+| `knowledge` | `knowledge_base_hint` | **仅当全部 hits 都有实质 summary** 时每条一个 | `title` → `entryId` |
+| `tasks` / `prose` / `notice` / `specUpdates` | 平台例行提醒（`living_work_spec`、`behavior_fence`、`relaxed_plan`、`silent_progress`、`pipeline_exit_confirmation`、`spec_update`） | 整条投递一个气泡 | 统一平台身份（不给每种事件编名字） |
+| 无结构化 body 的历史行 | 任意 | 不拆 | —（走原样 verbatim 卡片） |
+
+`knowledge` 的形态跟着**数据**走而非跟着 tag 走：`summary` 常为空串，那时气泡正文只剩标题、与自己的 header 重复，是一叠空壳。全空或混合批次整批退回紧凑列表。
+
+气泡侧的承重不变量（详见 `frontend/components/narrator/vlist/CONTRACT.md` §4「注入气泡」）：正文画在 `measured.contentWidth` 而非框内宽、note 行 measure/render 单向一致、`spec.key` 用内容身份而非数组位置、`injection-bubble` 必须在 `UNKNOWN_HEIGHT_FORWARDING_KINDS` 里、正文有 `INJECTION_BODY_MAX_CHARS` 硬顶。
+
+另外，用户自己的消息与**队友**的消息现在也分侧：`isSelf`（`creator.id` vs 登录用户）决定右侧 indigo 或左侧中性。该判断在集成层解析，不进 adapter——两侧高度相同，让观看者身份进入 measure 数据会按用户分叉缓存。
+
+`MessageBubble` 在纯文本分支**之前**先查 `system_injection` 块——顺序是承重的：那行也带 text block（模型向文案，boilerplate 齐全），fall through 到文本分支就会把 prompt 工程显示给读者。
+
+两条路径视觉上刻意与 `SystemOriginNotice` 一致（低对比度小字灰卡），语义是：注入内容是对话里的一条注记，不是对话的参与者。
+
+未映射的生产者标签回退到通用 system 标签，而不是泄露内部 tag——表里没有的新生产者是命名缺口，不是该给读者看的东西。
+
+### 6.1 12 个来源标签
+
+`silent_progress`、`todo_reminder`（`living_work_spec` 映射到它）、`relaxed_plan`、`knowledge_base_hint`、`bg_agent`、`bg_bash`、`team_message`、`buffered_user`、`subagent_message`、`spec_update`、`behavior_fence`、`pipeline_exit_confirmation`。
+
+---
+
+## 7. 两阶段落库约束
+
+有两类副作用**必须在行持久化之后**才能执行，宿主（而非 loop）负责：
+
+| 副作用 | 为什么必须后置 |
+|---|---|
+| `knowledgeInjection`（`KnowledgeInjectionRecord`） | 去重键 `(narratorId, compactSeq, entryId)` 在数据库里，且内存集合在 compact 后从该表重载。内容还没落库就记账，会**永久压制**这些条目在 compact 后重新注入 |
+| `pipelineExitConfirmationStateId` | 提醒还没存下来就清 pending 标记，等于**丢掉一个模型从未收到的警告** |
+
+两者都通过 `deliverInjectionRow` 的返回值确认行已 durable（`messageId` 非 null）后才执行。
+
+---
+
+## 8. 尚未迁移到这个机制的生产者
+
+以下仍直接调 `narratorService.persistSystemMessage`。它们**不是 bug**——都是带自己结构化卡片 block 的 `schedule: "none"` 等价物，只是没有走统一入口，因此不享有 `role`/`schedule` 分离和读者向 body 投影：
+
+| 位置 | block 类型 |
+|---|---|
+| `review-event-handler.ts` | `review_feedback` |
+| `merge-summary-service.ts` | `merge_summary` |
+| `container-event-handler.ts` | `container_ready` |
+| `browser-session-recovery.ts` | `browser_session_lost` |
+| `narrator-session.ts`（两处） | `spec_blocked_continuation`、`spec_continuation` |
+| `routes/narrators.ts`（三处） | 纯文本（浏览器 trace 被用户中止等） |
+| `narrator-session.ts`（知识注入 point A） | `knowledge_hint` |
+
+**知识注入 point A** 值得单独说：用户消息触发的知识注入走 `persistSystemMessage` + 自己的 `createKnowledgeHintBlock`，而 point B（工具输出触发）走 `queueLoopInjection` + `deliverInjection`。同一个概念两条路，是当前最值得收敛的一处不一致。
+
+---
+
+## 9. 命名现状（诚实说明）
+
+投递机制叫 **injection**，载荷类型仍叫 **SideCar**：
+
+- 新机制层：`system_injection`、`SystemInjectionBlock`、`deliverInjection`、`deliverInjectionRow`、`InjectionSchedule`、`InjectionScheduler`、`SystemInjectionNotice`、`InjectionCadence`
+- 载荷层（沿用旧名）：`SideCarBody` 及其 5 个子接口、`coerceSideCarBody`、`readSideCarBody`、`renderSideCarBodyToText`、`sideCarBodyToMarkdown`、`rawSideCarToMarkdown`、`sideCarBodyWithText`、`SideCarLabels`、`SideCarModelTemplates`，以及 i18n 的 `sidecar.body.*`（22 键）和 `sidecar.sources.*`（12 键）
+
+保留旧名不是漏改：被删的是"挂载到别人消息上"的投递与渲染机制，而 `SideCarBody` 描述的是**注入内容的结构化载荷**，这个概念没变、依然是唯一真相来源。改名要动两份 locale 的 34 个键、服务端 `sidecar.*` 模板表，以及 `sidecar-body.test.ts` 里按键名比对的字节级 parity 断言——大量改动换零行为变化。
+
+但这留下认知负担：读代码的人会看到 `deliverInjection` 里传 `SideCarBody`，而 sidecar 已不存在。若要清理，正确做法是一次纯机械重命名（`SideCarBody` → `InjectionBody`、`sidecar.*` → `injection.*`）单独成 commit，不混功能改动。
+
+### 9.1 已知死代码
+
+- `frontend/locales/{en,zh-CN}/narrator.json` 中 `sidecar.*` 下 6 个键引用数为 0：`unknownSource`、`copy`、`copied`、`truncated`、`showAll`、`attachedCount`（全是被删尾注卡片的 UI chrome）。⚠️ 注意 `sidecar.truncated` 与仍在使用的 `sidecar.body.tasksDoneTruncated` 是**两个不同的键**，前者是尾注的"预览被截断"、后者是后台任务输出被裁的说明，删前者不影响后者
+- `SIDECAR_PRESENTATION_FALLBACKS` 现在只被 `sidecar-body.ts` 内部的 `label()` 使用，不再是跨层契约，可降为模块私有
+- `spec-edit-interject.ts` 的 `SpecEditDelivery = "interjected" | "sidecar"`：`"sidecar"` 这个字面量现在名不副实，实际含义是"进了空闲队列等下次读取"
+
+---
+
+## 10. 测试覆盖
+
+| 文件 | 覆盖 |
+|---|---|
+| `server/services/__tests__/narrator-injection.test.ts` | 持久化行、`role`、`schedule`、`role × schedule` 正交性、`buildSystemInjectionBlock` |
+| `server/services/__tests__/background-completion-delivery.test.ts` | 忙/空闲两条路径的差异 |
+| `server/lib/__tests__/injection-cadence.test.ts` | cadence 的 tick 消费语义、interval 归一化 |
+| `frontend/components/narrator/vlist/system-injection-adapter.test.ts` | 路由（`origin_notice` vs `injection-bubble`）、拆气泡与 key 稳定性、读者向 body、标题标签回退 |
+| `frontend/components/narrator/vlist/measure/measure-injection-bubble.test.ts` | 气泡几何：shrink-wrap 宽度纪律、header/note 固定行、字符硬顶 |
+| `frontend/components/narrator/vlist/render/RenderInjectionBubble.test.tsx` | measure/render parity：画在测量宽度上、header/note 只在预留时画 |
+| `frontend/components/narrator/vlist/render/RenderMessageBubble.side.test.tsx` | 本人/队友分侧，且两侧共用同一份测量几何 |
+| `shared/__tests__/sidecar-body.test.ts` | 模型向文本的字节级 parity、有界投影、wire 强制转换 |
+| `shared/__tests__/sidecar-body-markdown.test.ts` | 7 种 kind 的 Markdown 投影、boilerplate 剥离、转义 |
+| `server/lib/agent/__tests__/loop-abort.test.ts` | 提醒在 turn 边界作为独立行投递、不混进 tool 输出 |

@@ -620,7 +620,7 @@ async function handleSessionAction(
 		}
 
 		case "screenshot": {
-			const result = await actions.screenshot(session);
+			const result = await actions.screenshot(session, { timeout: opts.timeout });
 			const buffer = Buffer.from(result.base64, "base64");
 			let savedFilePath: string | undefined;
 

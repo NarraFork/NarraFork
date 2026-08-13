@@ -108,6 +108,7 @@ describe("hostsUnpredictableBlock", () => {
 
 	it("keeps the forwarding-kind set minimal and explicit", () => {
 		expect([...UNKNOWN_HEIGHT_FORWARDING_KINDS].sort()).toEqual([
+			"injection-bubble",
 			"markdown",
 			"message-bubble",
 			"plan-card",
@@ -143,6 +144,34 @@ describe("wiring: both halves of the controlled exception use ONE rule", () => {
 		// measured?" would eventually disagree, and either half disagreeing leaves a
 		// row clipped or its height unrecorded.
 		expect(render).not.toContain("function isExactlyMeasured(");
+	});
+
+	/**
+	 * The gap that actually shipped: `injection-bubble` forwarded `onUnknownHeight` in
+	 * render-registry but was missing from the forwarding set, so a bubble holding a
+	 * mermaid diagram took the renderer's flowing path while the shell kept it a fixed
+	 * clip box — the diagram was cut off and nobody could report the correction.
+	 *
+	 * Derived from the source rather than hand-listed, because a hand-listed copy is
+	 * exactly what drifted: adding a kind to the registry is the easy half to remember,
+	 * declaring it here is the half that gets forgotten.
+	 */
+	it("every kind that forwards onUnknownHeight is declared in the set", () => {
+		const registry = read("render-registry.tsx");
+		const dispatch = registry.slice(registry.indexOf("switch (spec.kind)"));
+		const forwarding = new Set<string>();
+		let currentKind: string | null = null;
+		for (const line of dispatch.split("\n")) {
+			const caseMatch = /^\s*case "([a-z-]+)":/.exec(line);
+			if (caseMatch) currentKind = caseMatch[1] ?? null;
+			if (line.includes("onUnknownHeight={") && currentKind) forwarding.add(currentKind);
+		}
+		// Sanity: the scan must actually find the known forwarders, or it is vacuous.
+		expect(forwarding.has("markdown")).toBe(true);
+		expect(forwarding.size).toBeGreaterThanOrEqual(4);
+		for (const kind of forwarding) {
+			expect(UNKNOWN_HEIGHT_FORWARDING_KINDS.has(kind)).toBe(true);
+		}
 	});
 
 	it("the row's reporter comes from the dynamic set itself", () => {

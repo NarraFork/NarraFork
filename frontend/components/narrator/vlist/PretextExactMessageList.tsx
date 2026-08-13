@@ -11,6 +11,7 @@
  * completed. The existing PretextMessageList remains the default Virtual route.
  */
 
+import { useCurrentUser } from "@frontend/hooks/useAuth";
 import { useLocalPref } from "@frontend/hooks/useLocalPref";
 import { useInterruptNarrator, useResumeRecoverySubagents } from "@frontend/hooks/useNarrator";
 import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
@@ -129,6 +130,7 @@ import {
 	pruneHeightOverrides,
 } from "./vlist-height-overrides";
 import { createHighlightController } from "./vlist-highlight";
+import { injectInjectionBubbleChrome } from "./vlist-injection-header";
 import {
 	createVListInteractionState,
 	isFullPayloadRequestedRow,
@@ -197,7 +199,11 @@ import { resolveSwipeAnchorRowIndex } from "./vlist-swipe-anchor";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
 import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
-import { injectUserBubbleAttachmentOpen, injectUserBubbleHeader } from "./vlist-user-bubble-header";
+import {
+	injectUserBubbleAttachmentOpen,
+	injectUserBubbleHeader,
+	injectUserBubbleIsSelf,
+} from "./vlist-user-bubble-header";
 import {
 	collectVListUserMarkers,
 	resolveVListUserMarkerScrollTop,
@@ -678,8 +684,6 @@ const TOGGLEABLE_CARD_KINDS = new Set([
 	// Slash-command bubbles fold their expanded prompt behind a toggle. Plain user
 	// bubbles carry no `commandText`, so the render layer ignores the callback.
 	"message-bubble",
-	// A sidecar card folds/expands on its own header row (per-record fold).
-	"sidecar",
 ]);
 /** Trace-family kinds with header/earlier/row toggles. */
 const TRACE_KINDS = new Set(["activity-trace", "tool-run-summary", "reasoning-steps"]);
@@ -800,15 +804,9 @@ function rowSelectionBlockIds(
  *   message-bubble → `form === "command"` + `expanded` (a slash-command bubble's
  *                    `form` is the literal "command", so the generic checks above
  *                    cannot see its fold; plain bubbles have no fold at all)
- *   sidecar        → `expanded` (a per-record card, no LOD involvement)
  *
- * The `state` fallback exists for the keys that have NO measured entry: a tool
- * card's sidecar mini-cards fold under `${rowKey}-sc${index}`, which is not a
- * top-level layout item and therefore never appears in `measuredByKeyRef`. With
- * `undefined` for both measured and fallback the expression collapsed to `false`
- * every time, so each click wrote `expanded = true` and the card could be opened
- * but never closed. The state map IS authoritative for those keys — nothing but
- * this toggle writes them.
+ * The `state` fallback exists for keys that have NO measured entry at all; the
+ * state map is authoritative for those, since nothing but this toggle writes them.
  */
 export function resolveRowOpenState(
 	measuredElement: VListItem["measured"] | undefined,
@@ -830,64 +828,9 @@ export function resolveRowOpenState(
 		if (measured.effectiveOpened !== undefined) return measured.effectiveOpened;
 		if (measured.effectiveExpanded !== undefined) return measured.effectiveExpanded;
 		if (measured.form !== undefined) return measured.form === "expanded";
-		// A standalone sidecar card: no `form`, no LOD-effective flag — just its own
-		// measured fold state.
 		if (measured.expanded !== undefined) return measured.expanded;
 	}
-	// No measured element for this key (a tool card's `-sc{i}` mini-card).
 	return state.expanded.get(key) === true;
-}
-
-/**
- * The fold key of ONE sidecar mini-card inside a row, matching the adapter's own
- * scheme (`${keyBase}-sc${index}` — see segment-adapter's buildSidecarSpecs).
- */
-export function sidecarFoldKey(rowKey: string, index: number): string {
-	return `${rowKey}-sc${index}`;
-}
-
-/** Row key → its stable per-index sidecar fold dispatcher. */
-export type SidecarToggleCache = Map<string, (index: number) => void>;
-
-/**
- * The row's sidecar fold dispatcher, memoized BY ROW KEY.
- *
- * Referential stability is a hard requirement, not an optimization: this is handed
- * to every mounted tool card and the ExactRow memo compares it identity-wise, so a
- * fresh arrow per render re-renders the whole window on every document rebuild (the
- * measured 22.3ms/frame the comparator exists to avoid). Same discipline as
- * `getRowToggles` / `getLoadFullPayload` / `terminateRunningTool`.
- *
- * One dispatcher per ROW rather than per (row, index): the index arrives as an
- * argument, so a single function covers all of that card's mini-cards.
- *
- * Extracted from the component so the stability property can be asserted against
- * the real implementation instead of a re-implementation in a test.
- */
-export function resolveSidecarToggle(
-	cache: SidecarToggleCache,
-	rowKey: string,
-	toggleFold: (foldKey: string) => void,
-): (index: number) => void {
-	const cached = cache.get(rowKey);
-	if (cached) return cached;
-	const toggle = (index: number) => toggleFold(sidecarFoldKey(rowKey, index));
-	cache.set(rowKey, toggle);
-	return toggle;
-}
-
-/**
- * How many sidecar mini-cards this row owns, i.e. how many `-sc{i}` fold keys can
- * exist under it. Read from the MEASURED card, which is where the count is already
- * resolved (the adapter filtered the invisible records out).
- *
- * Only tool cards host mini-cards. A STANDALONE sidecar element carries its own
- * `-sc{i}` suffix in its own spec key and folds through the ordinary `expanded`
- * channel, so it owns no sub-keys of its own.
- */
-export function rowSidecarCount(item: VListItem): number {
-	if (item.spec.kind !== "tool-call") return 0;
-	return (item.measured as MeasuredToolCall).sidecars?.length ?? 0;
 }
 
 /**
@@ -895,11 +838,7 @@ export function rowSidecarCount(item: VListItem): number {
  * single row's height/appearance. Rows whose signature is unchanged (and whose
  * item + geometry are unchanged) can skip re-rendering entirely during scroll.
  */
-export function rowInteractionSig(
-	state: VListInteractionState,
-	key: string,
-	sidecarCount: number,
-): string {
+export function rowInteractionSig(state: VListInteractionState, key: string): string {
 	const expanded = state.expanded.get(key);
 	const lodOverride = state.lodUserOverrides.has(key) ? 1 : 0;
 	const showEarlier = state.showEarlier.has(key) ? 1 : 0;
@@ -912,24 +851,7 @@ export function rowInteractionSig(
 	const traceRows = state.expandedTraceRows.get(key);
 	const traceRowsSig = traceRows && traceRows.size > 0 ? [...traceRows].sort().join(",") : "";
 	const promptOpen = state.promptOpen.has(key) ? 1 : 0;
-	// Tool-result sidecar fold states live under `${key}-sc${index}`. A tool card
-	// can carry several; fold each into the row's signature so expanding one
-	// re-renders the card (its measured height changes).
-	//
-	// Iterated over the row's ACTUAL mini-card count, not "until a key is missing".
-	// The reader is free to expand only the SECOND card, in which case `-sc0` has no
-	// entry at all and a break-on-missing loop stops before ever reading `-sc1` —
-	// leaving that fold out of the signature entirely. It happened not to show,
-	// because the memo's `item.measured` comparison catches the height change
-	// anyway; a signature that silently omits state is still wrong, and relying on
-	// another term to cover for it is exactly how the live-tail bug slipped through.
-	// The count is tiny (injections per tool result), so this stays O(small).
-	let sidecarSig = "";
-	for (let i = 0; i < sidecarCount; i++) {
-		const v = state.expanded.get(sidecarFoldKey(key, i));
-		if (v !== undefined) sidecarSig += `${i}${v ? "1" : "0"}`;
-	}
-	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}:${sidecarSig}`;
+	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}`;
 }
 
 /**
@@ -966,7 +888,11 @@ export function sameRowInteraction(a: RowInteraction, b: RowInteraction): boolea
 			b.actions as unknown as Record<string, unknown>,
 		) &&
 		// Presence only: the callback closes over `messageId`, already compared above.
-		!!a.onViewOriginal === !!b.onViewOriginal
+		!!a.onViewOriginal === !!b.onViewOriginal &&
+		// The inspector's content is derived from the spec; a different injection body
+		// must not inherit a neighbour's "what the model saw" text.
+		a.inspectContent?.text === b.inspectContent?.text &&
+		a.inspectContent?.title === b.inspectContent?.title
 	);
 }
 
@@ -1034,6 +960,12 @@ interface RowInteraction {
 	 * carries `editedAt`; the modal itself is a single shell-level instance.
 	 */
 	onViewOriginal?: () => void;
+	/**
+	 * Verbatim model-facing content for the "what the model saw" inspector, carried
+	 * by injection-bubble rows (which speak FOR somebody). Read off `spec.data`'s
+	 * `modelFacing`, with the speaker/source label as the inspector's title.
+	 */
+	inspectContent?: { title: string; text: string };
 }
 
 /**
@@ -1083,6 +1015,15 @@ interface ExactRowProps {
 	onOpenFilePanel?: (filePath: string) => void;
 	/** Localized label for a clickable attachment row (tooltip / aria). */
 	openAttachmentLabel?: string;
+	/** Localized "was truncated" note painted inside an injection bubble. */
+	injectionNoteLabel?: string;
+	/**
+	 * The signed-in user, for deciding whether a user bubble is the reader's own turn
+	 * (right + indigo) or a teammate's (left + neutral). HEIGHT-NEUTRAL: both sides
+	 * measure identically, which is why this is a render-layer prop rather than
+	 * adapter data that would fork the measure cache per viewer.
+	 */
+	currentUserId?: string | null;
 	/**
 	 * Live permission form node for a pending-permission tool/subagent card. When
 	 * present, the row hosts a real interactive component whose height is measured
@@ -1159,12 +1100,6 @@ interface ExactRowProps {
 	 * the fade-in on already-settled text.
 	 */
 	animateStreaming?: boolean;
-	/**
-	 * Fold toggle for a tool card's tool-result sidecar mini-card (index-addressed).
-	 * The shell resolves it through the memoized getRowToggles so a sidecar fold
-	 * re-renders exactly like any other row fold. Absent → sidecars render inert.
-	 */
-	onToggleSidecar?: (index: number) => void;
 }
 
 /**
@@ -1187,6 +1122,8 @@ const ExactRow = memo(
 		rowInteraction,
 		onOpenFilePanel,
 		openAttachmentLabel,
+		injectionNoteLabel,
+		currentUserId,
 		narratorId,
 		permissionSlot,
 		editorSlot,
@@ -1203,13 +1140,19 @@ const ExactRow = memo(
 		onOpenAskInPassingTarget,
 		viewControls,
 		animateStreaming,
-		onToggleSidecar,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
 		// User bubbles: build the avatar/name/time header node from the forwarded
 		// creator data (the pure render layer cannot construct it itself).
 		injectUserBubbleHeader(kind, extra);
+		// Which side the bubble sits on + its tint. Resolved here, not in the adapter:
+		// a teammate's turn and your own are the same height, so viewer identity must
+		// not reach the measured data (it would fork the cache per user).
+		injectUserBubbleIsSelf(kind, extra, currentUserId);
+		// Injection bubbles: speaker row + the localized trailing note. Both are chrome
+		// the measure pass already reserved space for, so this only fills it in.
+		injectInjectionBubbleChrome(kind, extra, injectionNoteLabel);
 		// User bubbles: make a text-file attachment clickable when the host owns a
 		// dockview surface. The path itself already rode along as height-neutral
 		// measure data, so this only binds the handler.
@@ -1223,13 +1166,6 @@ const ExactRow = memo(
 		// on click — the render layer only draws what it is handed.
 		if (kind === "reasoning") {
 			extra.onToggleTranslation = toggles.onToggleTranslation;
-		}
-		// A tool card's tool-result sidecars fold independently of the card body.
-		// Their fold state is keyed `${spec.key}-sc${index}` (the adapter's own
-		// scheme); the per-index toggle is resolved by the shell (which owns the
-		// memoized getRowToggles) and handed in as a plain callback.
-		if (kind === "tool-call" && onToggleSidecar) {
-			extra.onToggleSidecar = onToggleSidecar;
 		}
 		if (TRACE_KINDS.has(kind)) {
 			extra.onToggleItems = toggles.onToggleItems;
@@ -1457,6 +1393,7 @@ const ExactRow = memo(
 						toolMeta={interaction.toolMeta}
 						toolActions={interaction.toolActions}
 						onViewOriginal={interaction.onViewOriginal}
+						inspectContent={interaction.inspectContent}
 						onOpenFullscreen={
 							menuViewTarget && viewControls
 								? () => viewControls.openFullscreen(menuViewTarget)
@@ -1575,6 +1512,9 @@ const ExactRow = memo(
 		prev.narratorId === next.narratorId &&
 		prev.onOpenFilePanel === next.onOpenFilePanel &&
 		prev.openAttachmentLabel === next.openAttachmentLabel &&
+		prev.injectionNoteLabel === next.injectionNoteLabel &&
+		// Authorship decides the bubble's side; a row must repaint if the viewer changes.
+		prev.currentUserId === next.currentUserId &&
 		prev.permissionSlot === next.permissionSlot &&
 		prev.editorSlot === next.editorSlot &&
 		prev.onUnknownHeight === next.onUnknownHeight &&
@@ -1588,13 +1528,7 @@ const ExactRow = memo(
 		prev.compactCancelTitle === next.compactCancelTitle &&
 		prev.askInPassingFormSlot === next.askInPassingFormSlot &&
 		prev.onOpenAskInPassingTarget === next.onOpenAskInPassingTarget &&
-		prev.viewControls === next.viewControls &&
-		// The sidecar fold dispatcher IS a prop the row renders from, so it belongs
-		// here like every other callback. It is cached by row key (getSidecarToggle),
-		// so an unchanged row keeps the same identity across document rebuilds and
-		// this term is a hit — the point of comparing it is that a future change to
-		// its construction cannot silently start feeding rows a stale handler.
-		prev.onToggleSidecar === next.onToggleSidecar,
+		prev.viewControls === next.viewControls,
 );
 
 /**
@@ -2118,19 +2052,6 @@ export const PretextExactMessageList = forwardRef<
 		[captureFoldBefore],
 	);
 
-	// Per-index sidecar fold dispatcher, cached by row key (see resolveSidecarToggle
-	// for why the identity must be stable). It previously escaped notice as a fresh
-	// arrow per render only because the prop was absent from the ExactRow comparator
-	// — a memo hit that depended on the comparator not looking.
-	const sidecarTogglesCacheRef = useRef<SidecarToggleCache>(new Map());
-	const getSidecarToggle = useCallback(
-		(rowKey: string) =>
-			resolveSidecarToggle(sidecarTogglesCacheRef.current, rowKey, (foldKey) =>
-				getRowToggles(foldKey).onToggle(),
-			),
-		[getRowToggles],
-	);
-
 	// Subagent-recovery card submit. The card's row set tracks DESELECTED indices
 	// (it starts fully selected), so the payload is derived by subtracting them
 	// from the measured row list.
@@ -2193,6 +2114,14 @@ export const PretextExactMessageList = forwardRef<
 	// Tooltip / aria label for a clickable text-file attachment. Height-neutral
 	// chrome, so it does NOT participate in the measurement cache key.
 	const openAttachmentLabel = t("contextMenu_openFilePanel");
+	// "…was truncated" note inside an injection bubble. Height-neutral: the measure
+	// pass reserves a fixed line whenever `hasNote` holds, whatever the wording.
+	const injectionNoteLabel = t("sidecar.body.tasksDoneTruncated");
+	// Who is reading. Decides whether a user bubble is drawn as the reader's own turn
+	// or a teammate's — this is a shared deployment, so `role: "user"` alone does not
+	// mean "you". Height-neutral, so it stays out of the measurement cache key.
+	const { data: currentUser } = useCurrentUser();
+	const currentUserId = currentUser?.id ?? null;
 	// Language identity for the measurement cache: localized text is baked into
 	// measured content, so a switch must invalidate cached heights (see
 	// buildPretextDocumentLayout's labelsRevision).
@@ -2318,6 +2247,10 @@ export const PretextExactMessageList = forwardRef<
 	// once, so they must not close over one render's callback. Declared before
 	// usePretextDocument because the assignment reads that hook's result.
 	const appendMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
+	// Same latest-value contract as appendMessageRef, for the two in-place history
+	// mutations (delete / trailing-block truncation).
+	const removeMessagesRef = useRef<(deletedIds: readonly string[]) => boolean>(() => false);
+	const replaceMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
 	const getReflectionTakeOver = useCallback(
 		(key: string, kind: string | undefined, requestId: string): (() => void) => {
 			const cacheKey = `${key}|${kind ?? ""}|${requestId}`;
@@ -2394,6 +2327,8 @@ export const PretextExactMessageList = forwardRef<
 		isSubagent,
 	});
 	appendMessageRef.current = pretextDocument.appendMessage;
+	removeMessagesRef.current = pretextDocument.removeMessages;
+	replaceMessageRef.current = pretextDocument.replaceMessage;
 	// Read by the jump loop, which spans awaits and must see the CURRENT document
 	// (its `readWindow` reads the coordinator snapshot synchronously, so it is also
 	// correct between a commit and the React re-render it triggers).
@@ -2488,6 +2423,44 @@ export const PretextExactMessageList = forwardRef<
 		[bumpMessageRevision],
 	);
 
+	// A deletion is applied to the loaded window IN PLACE for the same reason an
+	// append is — the ids arrive in the event, so a refetch buys nothing — but here
+	// the deferral was the actual bug rather than just latency. A structural reload
+	// waits for the reader to be at the bottom, and a reader who right-clicked a
+	// message in history never is, so their rollback appeared not to happen until
+	// they scrolled back down. `removeMessages` returning false means the removal was
+	// declined (nothing loaded matched, or it would empty the document), which falls
+	// through to the reload exactly as an unappendable message does.
+	const removeOrReload = useCallback(
+		(deletedMessageIds: string[]) => {
+			if (removeMessagesRef.current(deletedMessageIds)) {
+				// Keep the applied revision in step so the reload gate does not treat this
+				// as still pending — that would surface a false "new messages" affordance
+				// and then refetch what is already correct on screen.
+				appliedMessageRevisionRef.current += 1;
+			}
+			bumpMessageRevision();
+		},
+		[bumpMessageRevision],
+	);
+
+	// The other half of a rollback: the boundary message keeps its blocks up to the
+	// rollback point and loses the rest, arriving as `message_updated`. Applying that
+	// truncation in place is what stops a rollback from looking half-done (messages
+	// below gone, the clicked card's tail blocks still there). Anything that is NOT a
+	// trailing truncation is declined by `replaceMessage` and reloads instead —
+	// necessarily so, since a version-neutral rebuild would serve the surviving
+	// blocks' cached heights for changed content.
+	const replaceOrReload = useCallback(
+		(message: TreeMessage | undefined) => {
+			if (message && replaceMessageRef.current(message)) {
+				appliedMessageRevisionRef.current += 1;
+			}
+			bumpMessageRevision();
+		},
+		[bumpMessageRevision],
+	);
+
 	// The exact shell is stable-state only. Subscribe to the existing message
 	// control stream once a complete document exists. Realtime mutations reload
 	// the full exact input; reconnect catch-up reloads only when it reports data.
@@ -2498,8 +2471,8 @@ export const PretextExactMessageList = forwardRef<
 				appendOrReload(wsData.message),
 			onUserMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
 				appendOrReload(wsData.message),
-			onMessageUpdated: bumpMessageRevision,
-			onMessagesDeleted: bumpMessageRevision,
+			onMessageUpdated: replaceOrReload,
+			onMessagesDeleted: removeOrReload,
 			onPruneBoundary: bumpMessageRevision,
 			onFullReload: bumpMessageRevision,
 			// Live compact-progress ticks patch the loaded compact marker in place
@@ -3815,6 +3788,29 @@ export const PretextExactMessageList = forwardRef<
 			// An edited message offers "view original"; the modal is a single
 			// shell-level instance, so the row only carries the open callback.
 			const editedMeta = resolveVListEditedMeta(msg);
+			// An injection bubble speaks FOR somebody; its spec carries the verbatim
+			// model-facing copy (`modelFacing`) plus the speaker/source label, which the
+			// inspector shows so the reader can audit what the agent actually received.
+			const injectionData =
+				item.spec.kind === "injection-bubble"
+					? (item.spec.data as {
+							modelFacing?: unknown;
+							speaker?: unknown;
+							source?: unknown;
+						} | null)
+					: null;
+			const modelFacing =
+				typeof injectionData?.modelFacing === "string" ? injectionData.modelFacing : "";
+			const inspectContent =
+				modelFacing.trim().length > 0
+					? {
+							text: modelFacing,
+							title:
+								(typeof injectionData?.speaker === "string" && injectionData.speaker.trim()) ||
+								(typeof injectionData?.source === "string" && injectionData.source) ||
+								"injection",
+						}
+					: undefined;
 			const next: RowInteraction = {
 				blockId: target.blockId,
 				messageId,
@@ -3826,6 +3822,7 @@ export const PretextExactMessageList = forwardRef<
 				toolMeta,
 				toolActions,
 				...(editedMeta ? { onViewOriginal: () => setOriginalModalMessageId(messageId) } : {}),
+				...(inspectContent ? { inspectContent } : {}),
 			};
 			map.set(item.spec.key, reuseRowPayload(previous, item.spec.key, next, sameRowInteraction));
 		}
@@ -4173,15 +4170,16 @@ export const PretextExactMessageList = forwardRef<
 									// the tail is height-neutral. Without this term the memo skips the
 									// re-render and the newest characters never reach the DOM. Empty string
 									// for every settled row, so scroll-time memo hits are unaffected.
-									interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key, rowSidecarCount(item))}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}`}
+									interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}`}
 									toggles={getRowToggles(item.spec.key)}
 									renderLabels={renderLabels}
 									interaction={interactionsByKey.get(item.spec.key)}
 									rowInteraction={resolveRowInteraction(item)}
 									narratorId={narratorId}
-									onToggleSidecar={getSidecarToggle(item.spec.key)}
 									onOpenFilePanel={rowHandlers?.onOpenFilePanel}
 									openAttachmentLabel={openAttachmentLabel}
+									injectionNoteLabel={injectionNoteLabel}
+									currentUserId={currentUserId}
 									permissionSlot={permissionSlot}
 									editorSlot={editorSlot}
 									onTerminate={terminateRunningTool}

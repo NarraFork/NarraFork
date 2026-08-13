@@ -4,7 +4,6 @@ import {
 	formatTurnUsageParts,
 	getPromptTokenFootprint,
 } from "@shared/pretext-layout/turn-usage";
-import type { SideCarRecord } from "../../lib/api";
 import type { RevertScope } from "../../lib/api/narrators";
 import { formatLocaleNumber } from "../../lib/intl-format";
 import { ActivityTrace } from "./ActivityTrace";
@@ -15,7 +14,6 @@ import { MessageBubble } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
 import {
 	collectSegmentTargetIds,
-	messageHasVisibleContentBlock,
 	type RenderSegment,
 	segmentMessages,
 	type ToolRunItem,
@@ -25,7 +23,6 @@ import type { NarratorMsg, PermissionCallbacks } from "./narrator-panel-types";
 import { useRenderLod } from "./RenderLodCtx";
 import { groupRenderUnits, groupToolRunItemsForLod } from "./render-units";
 import { recentRunSegmentMessageIds } from "./run-segments";
-import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import { SubagentCard } from "./SubagentCard";
 import type { ToolCallData } from "./ToolCallCard";
 import { TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
@@ -224,38 +221,14 @@ export function renderToolRun(
 
 	const isMultiRun = items.length >= 2;
 
-	// Surface user_message side-cars (bg_agent / bg_bash / group_message /
-	// subagent_message / goal_update) attached to pure-tool source messages.
-	// Such messages have no visible content block, so they never produce a
-	// separate message segment for MessageBubble to render their side-cars.
-	// Messages that also carry visible content are rendered by MessageBubble,
-	// which already shows their user_message side-cars — skip them here to
-	// avoid duplication. Derive the unique source messages from the run items.
-	const seenSourceMsgIds = new Set<string>();
-	const userSideCars: SideCarRecord[] = [];
-	for (const item of items) {
-		const srcMsg = item.msg;
-		if (srcMsg.id && seenSourceMsgIds.has(srcMsg.id)) continue;
-		if (srcMsg.id) seenSourceMsgIds.add(srcMsg.id);
-		if (messageHasVisibleContentBlock(srcMsg)) continue;
-		for (const sc of srcMsg.sideCars ?? []) {
-			if (sc.target === "user_message") userSideCars.push(sc);
-		}
-	}
-
 	// The full per-card list (current L6 rendering). Reused as the fallback when
 	// the user expands a summary, or when the run contains active tools that must
 	// stay visible regardless of LOD.
-	const fullListNode = (
-		<>
-			{items.map((item, idx) => renderItem(item, idx, items.length))}
-			{hasVisibleSideCars(userSideCars) ? (
-				<div style={isMultiRun ? { padding: "var(--mantine-spacing-xs)" } : undefined}>
-					<SideCarNotice sideCars={userSideCars} />
-				</div>
-			) : null}
-		</>
-	);
+	//
+	// No injection hosting here any more: server-authored content now owns its own
+	// message row (see `narrator-injection.ts`), so a pure-tool message no longer has
+	// to act as a host for injections that had nowhere else to render.
+	const fullListNode = <>{items.map((item, idx) => renderItem(item, idx, items.length))}</>;
 
 	return (
 		<ToolRunFrame
@@ -268,7 +241,6 @@ export function renderToolRun(
 				items={items}
 				runKey={runKey}
 				narratorId={narratorId}
-				userSideCars={userSideCars}
 				renderItem={renderItem}
 				rowHandlers={{
 					onForkFromMessage,
@@ -355,7 +327,6 @@ function ToolRunLodGate({
 	items,
 	runKey,
 	narratorId,
-	userSideCars,
 	renderItem,
 	rowHandlers,
 	subagentHandlers,
@@ -364,9 +335,6 @@ function ToolRunLodGate({
 	items: ToolRunItem[];
 	runKey: string;
 	narratorId?: string;
-	/** user_message side-cars (bg_agent / group_message / etc.) that must stay
-	 * visible even when the run is folded into a summary / count line. */
-	userSideCars?: SideCarRecord[];
 	/** Renders one full tool card; used to keep active tools visible at low LOD. */
 	renderItem: (item: ToolRunItem, idx: number, total: number) => React.ReactNode;
 	/** Panel handlers behind each folded row's message menu (L3 summary rows). */
@@ -376,13 +344,6 @@ function ToolRunLodGate({
 	children: React.ReactNode;
 }) {
 	const lod = useRenderLod();
-
-	// Side-car notices stay visible under every folded level.
-	const sideCarsNode = hasVisibleSideCars(userSideCars ?? []) ? (
-		<div style={{ padding: "var(--mantine-spacing-xs)" }}>
-			<SideCarNotice sideCars={userSideCars ?? []} />
-		</div>
-	) : null;
 
 	// Full detail levels render the whole per-card list. L5's recency scoping is
 	// applied per-card inside ToolCallCard (earlier segments collapse to headers
@@ -417,7 +378,6 @@ function ToolRunLodGate({
 						/>
 					);
 				})}
-				{sideCarsNode}
 			</>
 		);
 	}
@@ -433,7 +393,6 @@ function ToolRunLodGate({
 					<ToolRunCountLine key={`folded-${group.startIndex}`} items={group.items} />
 				),
 			)}
-			{sideCarsNode}
 		</>
 	);
 }

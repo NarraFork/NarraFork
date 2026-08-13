@@ -21,6 +21,7 @@
 
 import type { VListElementKind } from "@shared/pretext-layout/element-kinds";
 import { measureAskInPassing } from "./measure/measure-ask-in-passing";
+import { measureInjectionBubble } from "./measure/measure-injection-bubble";
 import { measureMarkdown } from "./measure/measure-markdown";
 import { measureMedia } from "./measure/measure-media";
 import { measureMessageBubble } from "./measure/measure-message-bubble";
@@ -32,7 +33,6 @@ import {
 	resolveReasoningDisplayText,
 	resolveReasoningForm,
 } from "./measure/measure-reasoning";
-import { measureSidecar } from "./measure/measure-sidecar";
 import { measureSubagentCard } from "./measure/measure-subagent";
 import { measureSubagentRecovery } from "./measure/measure-subagent-recovery";
 import { measureKnowledgeHint } from "./measure/measure-system-list";
@@ -92,6 +92,12 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		// plain bubbles pass no opts and are unaffected.
 		measure: (d, w, l, o) => measureMessageBubble(d as AnyData, w, l, o as AnyData),
 	},
+	"injection-bubble": {
+		kind: "injection-bubble",
+		label: "Injected content bubble (framed markdown)",
+		lodSensitive: false,
+		measure: (d, w, l) => measureInjectionBubble(d as AnyData, w, l),
+	},
 	markdown: {
 		kind: "markdown",
 		label: "Markdown body",
@@ -127,12 +133,6 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		label: "System card (multi-line text)",
 		lodSensitive: false,
 		measure: (d, w, l) => measureSystemTextCard((d as AnyData).kind, d as AnyData, w, l),
-	},
-	sidecar: {
-		kind: "sidecar",
-		label: "System injection (sidecar) card",
-		lodSensitive: false,
-		measure: (d, w, l, o) => measureSidecar(d as AnyData, w, l, o as AnyData),
 	},
 	"knowledge-hint": {
 		kind: "knowledge-hint",

@@ -1,11 +1,25 @@
+import { useSetupAssistant } from "@frontend/hooks/useSetupAssistant";
 import { api } from "@frontend/lib/api";
-import { Badge, Button, Code, Group, Loader, Modal, Stack, Text, ThemeIcon } from "@mantine/core";
+import {
+	Alert,
+	Badge,
+	Button,
+	Code,
+	Group,
+	Loader,
+	Modal,
+	Stack,
+	Text,
+	ThemeIcon,
+} from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconCheck, IconMinus, IconTerminal2, IconX } from "@tabler/icons-react";
+import { IconCheck, IconMinus, IconRobot, IconTerminal2, IconX } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
+
+import { SetupAssistantAuthorizationModal } from "./SetupAssistantAuthorizationModal";
 
 const DependencyInstallTerminal = lazy(() =>
 	import("./DependencyInstallTerminal").then((m) => ({ default: m.DependencyInstallTerminal })),
@@ -17,9 +31,20 @@ const DESC_KEYS: Record<string, string> = {
 	dtach: "depsDtachDesc",
 };
 
-export function DependencyStatus() {
+interface DependencyStatusProps {
+	/**
+	 * Called after a Setup Assistant narrator was created, before navigating to
+	 * it. Hosts that render inside an overlay (the setup wizard) use this to close
+	 * themselves so the narrator is actually visible.
+	 */
+	onDelegated?: () => void;
+}
+
+export function DependencyStatus({ onDelegated }: DependencyStatusProps = {}) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
+	const { delegate, isDelegating, canDelegate } = useSetupAssistant({ onCreated: onDelegated });
+	const [authorizeOpened, { open: openAuthorize, close: closeAuthorize }] = useDisclosure(false);
 	const [confirmOpened, { open: openConfirm, close: closeConfirm }] = useDisclosure(false);
 	const [terminalOpened, { open: openTerminal, close: closeTerminal }] = useDisclosure(false);
 	const [selectedDep, setSelectedDep] = useState<{
@@ -71,6 +96,10 @@ export function DependencyStatus() {
 	if (!data) return null;
 
 	const pm = data.packageManager;
+	// Only dependencies that are both missing and installable on this platform are
+	// actionable; a platform-unsupported optional (dtach on Windows) is not a gap.
+	const actionableMissing = data.dependencies.filter((d) => !d.installed && d.platformSupported);
+	const showDelegate = actionableMissing.length > 0 && canDelegate;
 
 	const handleInstallClick = (depName: string, command: string) => {
 		setSelectedDep({ name: depName, command });
@@ -83,6 +112,25 @@ export function DependencyStatus() {
 				<Text size="xs" c="dimmed">
 					{pm ? t("depsPackageManager", { pm }) : t("depsNoPackageManager")}
 				</Text>
+
+				{/* Delegating to an agent adapts to distros and package managers the
+				    hard-coded command matrix above does not cover — especially when no
+				    package manager was detected at all. */}
+				{showDelegate && (
+					<Alert variant="light" color="indigo" icon={<IconRobot size={16} />}>
+						<Stack gap="xs" align="flex-start">
+							<Text size="sm">{t("depsDelegateHint")}</Text>
+							<Button
+								size="compact-sm"
+								leftSection={<IconRobot size={14} />}
+								onClick={openAuthorize}
+								loading={isDelegating}
+							>
+								{isDelegating ? t("depsDelegateCreating") : t("depsDelegateToNarrator")}
+							</Button>
+						</Stack>
+					</Alert>
+				)}
 
 				{data.dependencies.map((dep) => {
 					const unsupported = !dep.platformSupported;
@@ -249,6 +297,16 @@ export function DependencyStatus() {
 					</Suspense>
 				)}
 			</Modal>
+
+			<SetupAssistantAuthorizationModal
+				opened={authorizeOpened}
+				onClose={closeAuthorize}
+				loading={isDelegating}
+				onConfirm={(authorization) => {
+					closeAuthorize();
+					delegate(authorization);
+				}}
+			/>
 		</>
 	);
 }

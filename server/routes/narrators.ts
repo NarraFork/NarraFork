@@ -63,6 +63,7 @@ import {
 	type as browserType,
 } from "../lib/browser/actions";
 import { DEFAULT_VIEWPORT } from "../lib/browser/pool";
+import type { BrowserSession as BrowserSessionType } from "../lib/browser/session";
 import {
 	closeSession as closeBrowserSession,
 	getSession as getBrowserSession,
@@ -101,18 +102,27 @@ import {
 	removeTrait,
 } from "../lib/narrator-utils";
 import { isPermissionMode, PERMISSION_MODES } from "../lib/permission-modes";
+import { getHome } from "../lib/platform";
 import { isInsidePath } from "../lib/platform-path";
 import {
+	buildSetupAssistantSystemPrompt,
+	formatDependencyBriefing,
+	getSetupAssistantStartMessage,
+	getSetupAssistantTitle,
 	getToolMessage,
 	getToolMessageWithParams,
 	getUserLanguage,
 	getUserReplyInLanguage,
 	type Locale,
+	resolveSetupAuthorization,
+	selectActionableDependencies,
 } from "../lib/prompt-i18n";
 import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction } from "../lib/settings";
 import {
+	deleteAvatarImage,
 	deleteUploadedImage,
 	type ImageRef,
+	saveAvatarImage,
 	saveUploadedImage,
 	validateTextFile,
 	validateUploadedImage,
@@ -124,6 +134,7 @@ import {
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
 	createNarratorSchema,
+	createSetupAssistantSchema,
 	createWhitelistCmdSchema,
 	createWhitelistDirSchema,
 	deviceBrowseQuerySchema,
@@ -177,6 +188,7 @@ import type {
 	UnloadToolResult,
 } from "../services/command-service";
 import { getSlashMenuItems, resolveCommand } from "../services/command-service";
+import { dependencyService } from "../services/dependency-service";
 import {
 	browseRemoteDirectory,
 	resolveRemoteBrowseTarget,
@@ -199,6 +211,11 @@ import {
 	rebuildDeviceFileStatesExcluding,
 	rebuildDeviceFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
+import {
+	deleteBufferedTextFile,
+	loadBufferedTextFiles,
+	persistAdditionalBufferedTextFiles,
+} from "../services/narrator-buffer";
 import {
 	getNarratorDraft,
 	getNarratorIdsWithDraft,
@@ -281,12 +298,15 @@ import {
 } from "../services/narrator-session";
 import {
 	activeNarrators,
+	type BufferedMessage,
 	getNarratorRuntimeModel,
 	isNarratorRuntimeBusy,
 	isWorkspaceBeingWritten,
 	planModeAskedOnce,
 	resetActiveUpstreamSession,
+	type SavedBufferedFile,
 } from "../services/narrator-session-state";
+import type { SubagentBufferedMessage } from "../services/narrator-subagent";
 import {
 	buildRecoveryNotifyPrompt,
 	markRecoveryCardResolved,
@@ -726,6 +746,81 @@ narratorRoutes.post("/", async (c) => {
 	return c.json(publicNarratorResponse(narrator), 201);
 });
 
+// Create a Setup Assistant narrator that installs the missing system dependencies.
+//
+// Rationale: a hard-coded install-command matrix cannot cover every distro,
+// package manager and permission model, but an agent with Bash can probe the
+// machine and adapt. Installing system software is an instance-wide operation,
+// so this mirrors POST /api/dependencies/:name/install and stays admin-only.
+//
+// How much authority the narrator gets is the USER's call, never a default we
+// pick for them: "default" keeps per-command approval cards, "full" grants
+// bypassPermissions and pins strict danger reflection (a same-model review turn
+// for classifier-flagged calls — not human review, and not a sandbox). A user who
+// wants neither simply never calls this endpoint and installs the deps themselves.
+//
+// Registered before "/:id" so the literal path is not captured as an id.
+narratorRoutes.post("/setup-assistant", requireAdmin, async (c) => {
+	// Body is optional: an empty POST means "use the standard authorization".
+	const rawBody = await c.req.json().catch(() => ({}));
+	const parsed = createSetupAssistantSchema.safeParse(rawBody ?? {});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { authorization } = parsed.data;
+
+	const check = dependencyService.checkAll();
+	const missing = selectActionableDependencies(check.dependencies);
+	if (missing.length === 0) {
+		// Nothing installable is missing (everything present, or only
+		// platform-unsupported optionals remain) — don't spawn a narrator with no job.
+		return c.json({ created: false, dependencies: check });
+	}
+
+	const user = c.get("user");
+	const locale = await getUserLanguage(user.sub);
+	const replyInUserLanguage = await getUserReplyInLanguage(user.sub);
+	const briefing = formatDependencyBriefing(check);
+	const { permissionMode, dangerReflectionOverride } = resolveSetupAuthorization(authorization);
+
+	const narrator = await narratorService.create({
+		kind: "setup",
+		locale,
+		creatorIsAdmin: user.role === "admin",
+		systemPrompt: buildSetupAssistantSystemPrompt(locale, briefing, authorization),
+		permissionMode,
+		dangerReflectionOverride,
+		// Dependency installation is machine-scoped, not project-scoped, so the
+		// home directory is the only sensible cwd for a standalone narrator here.
+		cwd: getHome(),
+		title: getSetupAssistantTitle(
+			locale,
+			missing.map((dep) => dep.name),
+		),
+	});
+
+	await sendMessage(
+		narrator.id,
+		getSetupAssistantStartMessage(
+			locale,
+			missing.map((dep) => dep.name),
+		),
+		[],
+		locale,
+		replyInUserLanguage,
+		null,
+		user.sub,
+	);
+
+	return c.json(
+		{
+			created: true,
+			authorization,
+			narrator: publicNarratorResponse(narrator),
+			dependencies: check,
+		},
+		201,
+	);
+});
+
 // Resolve a named narrator by its handle (case-insensitive). Used by @mention.
 // Must be registered before "/:id" so "by-handle" is not captured as an id.
 narratorRoutes.get("/by-handle/:handle", async (c) => {
@@ -975,6 +1070,45 @@ narratorRoutes.put("/:id/custom-traits/subagent-model-restriction", async (c) =>
 		traits: publicTraitsResponse(traits),
 		customTraits: customTraitsResponse(traits),
 	});
+});
+
+// === Narrator avatar ===
+//
+// A custom bitmap overrides the procedural identicon (which is derived from the
+// narrator id and needs no storage). Reuses the user-avatar pipeline: the narrator
+// id is the directory key, one file per narrator, replaced on each upload.
+
+narratorRoutes.patch("/:id/avatar", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	if (!narrator) throw new NotFoundError("Narrator", id);
+
+	const formData = await c.req.formData();
+	const file = formData.get("file");
+	if (!file || !(file instanceof File)) {
+		throw new ValidationError("No file provided");
+	}
+
+	const { imageId } = await saveAvatarImage(id, file);
+	await db
+		.update(narrators)
+		.set({ avatarImageId: imageId, updatedAt: new Date().toISOString() })
+		.where(eq(narrators.id, id));
+
+	return c.json({ ok: true, avatarImageId: imageId });
+});
+
+narratorRoutes.delete("/:id/avatar", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	if (!narrator) throw new NotFoundError("Narrator", id);
+
+	deleteAvatarImage(id);
+	await db
+		.update(narrators)
+		.set({ avatarImageId: null, updatedAt: new Date().toISOString() })
+		.where(eq(narrators.id, id));
+	return c.json({ ok: true });
 });
 
 narratorRoutes.delete("/:id/custom-traits/subagent-model-restriction", async (c) => {
@@ -1935,22 +2069,247 @@ narratorRoutes.get("/:id/buffer", async (c) => {
 	return c.json(await resolveBufferQueue(id));
 });
 
-// Edit a queued buffered message
+/** One queued message plus which of the two queues it lives in. */
+interface LocatedBufferedMessage {
+	message: BufferedMessage | SubagentBufferedMessage;
+	/** True when it came from the taken-over-subagent map (in-memory, no DB). */
+	fromSubagentQueue: boolean;
+}
+
+/** Find a queued message by id, checking the primary queue then the subagent queue. */
+async function locateBufferedMessage(
+	narratorId: string,
+	messageId: string,
+): Promise<LocatedBufferedMessage | null> {
+	const primary = getBufferedMessages(narratorId).find((m) => m.id === messageId);
+	if (primary) return { message: primary, fromSubagentQueue: false };
+	const { getSubagentBufferedMessages } = await import("../services/narrator-subagent");
+	const subagent = getSubagentBufferedMessages(narratorId).find((m) => m.id === messageId);
+	if (subagent) return { message: subagent, fromSubagentQueue: true };
+	return null;
+}
+
+/**
+ * The attachments a queue edit intends to keep, resolved against what the message
+ * currently holds.
+ *
+ * `undefined` keep lists mean "keep everything" so a text-only client (including
+ * the WS `update_buffer` path) never silently drops attachments.
+ *
+ * Text files are matched positionally with the filename as a consistency check.
+ * A mismatch means the client is looking at a stale queue — the message may have
+ * been edited from another device — so the edit is refused rather than guessing
+ * which file the user meant to drop.
+ */
+function resolveKeptBufferAttachments(
+	located: LocatedBufferedMessage,
+	keepImageIds: string[] | undefined,
+	keepTextFiles: Array<{ index: number; filename: string }> | undefined,
+): { keptImages: ImageRef[]; keptTextFileIndexes: number[] } {
+	const currentImages = located.message.images ?? [];
+	const keptImages =
+		keepImageIds === undefined
+			? [...currentImages]
+			: currentImages.filter((image) => keepImageIds.includes(image.imageId));
+
+	const currentNames = bufferedTextFileNames(located);
+	let keptTextFileIndexes: number[];
+	if (keepTextFiles === undefined) {
+		keptTextFileIndexes = currentNames.map((_, index) => index);
+	} else {
+		keptTextFileIndexes = [];
+		for (const entry of keepTextFiles) {
+			if (currentNames[entry.index] !== entry.filename) {
+				throw new ValidationError(
+					"Queued attachments changed since this edit started; reload and try again",
+				);
+			}
+			keptTextFileIndexes.push(entry.index);
+		}
+	}
+	return { keptImages, keptTextFileIndexes };
+}
+
+/**
+ * Filenames of a queued message's text files, in the order the summary reports.
+ *
+ * Mirrors `toBufferSummary`: persisted metadata first (it is what the primary
+ * queue's DB row carries), then the in-memory File objects a subagent queue holds.
+ */
+function bufferedTextFileNames(located: LocatedBufferedMessage): string[] {
+	if (!located.fromSubagentQueue) {
+		const saved = (located.message as BufferedMessage)._savedFiles;
+		if (saved?.length) return saved.map((file) => file.filename);
+	}
+	return (located.message.textFiles ?? []).map((file) => file.name);
+}
+
+/** Parse a form field that carries a JSON array of strings/objects. */
+function parseJsonArrayField(raw: FormDataEntryValue | null, field: string): unknown[] | undefined {
+	if (typeof raw !== "string") return undefined;
+	try {
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) throw new Error("not an array");
+		return parsed;
+	} catch {
+		throw new ValidationError(`${field} must be a JSON array`);
+	}
+}
+
+/**
+ * Edit a queued buffered message.
+ *
+ * JSON handles text-only edits and keep-subset edits; multipart is used when the
+ * edit uploads new attachments. Files are only validated and written here — the
+ * buffer service owns the queue mutation, and every file this request created is
+ * removed again if that mutation does not land.
+ */
 narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	const id = c.req.param("id");
 	const mid = c.req.param("mid");
-	const body = await c.req.json();
-	const parsed = updateBufferedMessageSchema.safeParse(body);
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const text = parsed.data.text.trim();
-	let ok = updateBufferedMessage(id, mid, text);
-	// Fallback: subagents keep their queue in a separate map (mirrors GET /buffer).
-	// Without this, editing a queued message on a taken-over subagent 404s.
-	if (!ok) {
-		const { updateSubagentBufferedMessage } = await import("../services/narrator-subagent");
-		ok = updateSubagentBufferedMessage(id, mid, text);
+
+	let rawText: string | undefined;
+	let keepImageIds: string[] | undefined;
+	let keepTextFiles: Array<{ index: number; filename: string }> | undefined;
+	const newImageFiles: File[] = [];
+	const newTextFiles: File[] = [];
+
+	const contentType = c.req.header("content-type") ?? "";
+	if (contentType.includes("multipart/form-data")) {
+		const formData = await c.req.formData();
+		const rawTextField = formData.get("text");
+		if (typeof rawTextField === "string") rawText = rawTextField;
+		const parsed = updateBufferedMessageSchema.safeParse({
+			...(rawText !== undefined ? { text: rawText } : {}),
+			...(formData.has("keepImageIds")
+				? { keepImageIds: parseJsonArrayField(formData.get("keepImageIds"), "keepImageIds") }
+				: {}),
+			...(formData.has("keepTextFiles")
+				? { keepTextFiles: parseJsonArrayField(formData.get("keepTextFiles"), "keepTextFiles") }
+				: {}),
+		});
+		if (!parsed.success) throw new ValidationError(parsed.error.message);
+		keepImageIds = parsed.data.keepImageIds;
+		keepTextFiles = parsed.data.keepTextFiles;
+
+		for (const file of formData.getAll("images") as File[]) {
+			validateUploadedImage(file);
+			newImageFiles.push(file);
+		}
+		for (const file of formData.getAll("textFiles") as File[]) {
+			validateTextFile(file);
+			newTextFiles.push(file);
+		}
+		const uploadBytes = [...newImageFiles, ...newTextFiles].reduce(
+			(total, file) => total + file.size,
+			0,
+		);
+		if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+		}
+	} else {
+		const parsed = updateBufferedMessageSchema.safeParse(await c.req.json());
+		if (!parsed.success) throw new ValidationError(parsed.error.message);
+		rawText = parsed.data.text;
+		keepImageIds = parsed.data.keepImageIds;
+		keepTextFiles = parsed.data.keepTextFiles;
 	}
-	if (!ok) throw new NotFoundError("Buffered message", mid);
+
+	const located = await locateBufferedMessage(id, mid);
+	if (!located) throw new NotFoundError("Buffered message", mid);
+
+	// Omitted text keeps the current wording, so a client that only manages
+	// attachments does not have to echo the message body back.
+	const text = (rawText ?? located.message.text).trim();
+	const { keptImages, keptTextFileIndexes } = resolveKeptBufferAttachments(
+		located,
+		keepImageIds,
+		keepTextFiles,
+	);
+
+	if (keptImages.length + newImageFiles.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
+		throw new ValidationError("Maximum 10 images per message");
+	}
+	if (keptTextFileIndexes.length + newTextFiles.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
+		throw new ValidationError("Maximum 10 text files per message");
+	}
+	const finalImageCount = keptImages.length + newImageFiles.length;
+	const finalTextFileCount = keptTextFileIndexes.length + newTextFiles.length;
+	if (!text && finalImageCount === 0 && finalTextFileCount === 0) {
+		throw new ValidationError("Message cannot be empty");
+	}
+
+	// The kept halves, resolved before anything is written so the compensating
+	// deletes below know exactly which old files this edit orphans.
+	const currentSavedFiles = located.fromSubagentQueue
+		? []
+		: ((located.message as BufferedMessage)._savedFiles ?? []);
+	const currentTextFiles = located.message.textFiles ?? [];
+	const keptSavedFiles = currentSavedFiles.filter((_, index) =>
+		keptTextFileIndexes.includes(index),
+	);
+	const keptTextFileObjects = located.fromSubagentQueue
+		? currentTextFiles.filter((_, index) => keptTextFileIndexes.includes(index))
+		: loadBufferedTextFiles(keptSavedFiles);
+	const droppedSavedFiles = currentSavedFiles.filter(
+		(_, index) => !keptTextFileIndexes.includes(index),
+	);
+	const droppedImages = (located.message.images ?? []).filter(
+		(image) => !keptImages.some((kept) => kept.imageId === image.imageId),
+	);
+
+	// Everything this request writes to disk, so a failure leaves nothing behind.
+	const createdImageIds: string[] = [];
+	let createdSavedFiles: SavedBufferedFile[] = [];
+	let committed = false;
+	try {
+		const newImages: ImageRef[] = [];
+		for (const file of newImageFiles) {
+			const saved = await saveUploadedImage(id, file);
+			createdImageIds.push(saved.imageId);
+			newImages.push(saved);
+		}
+
+		let ok: boolean;
+		if (located.fromSubagentQueue) {
+			const { updateSubagentBufferedMessage } = await import("../services/narrator-subagent");
+			ok = updateSubagentBufferedMessage(id, mid, text, {
+				images: [...keptImages, ...newImages],
+				textFiles: [...keptTextFileObjects, ...newTextFiles],
+			});
+		} else {
+			// New files join the message's existing directory; reserving the kept
+			// names stops an upload from overwriting an attachment being kept.
+			createdSavedFiles = newTextFiles.length
+				? await persistAdditionalBufferedTextFiles(
+						mid,
+						newTextFiles,
+						keptSavedFiles.map((file) => file.filename),
+					)
+				: [];
+			const savedFiles = [...keptSavedFiles, ...createdSavedFiles];
+			ok = updateBufferedMessage(id, mid, text, {
+				images: [...keptImages, ...newImages],
+				textFiles: loadBufferedTextFiles(savedFiles),
+				savedFiles,
+			});
+		}
+		if (!ok) throw new NotFoundError("Buffered message", mid);
+		committed = true;
+	} finally {
+		if (!committed) {
+			for (const imageId of createdImageIds) deleteUploadedImage(id, imageId);
+			for (const file of createdSavedFiles) deleteBufferedTextFile(file);
+		}
+	}
+
+	// Only now that the queue holds the new set: these files are referenced by
+	// nothing else, since an unconsumed queued message owns its uploads outright.
+	for (const image of droppedImages) {
+		deleteUploadedImage(image.uploadNarratorId ?? id, image.imageId);
+	}
+	for (const file of droppedSavedFiles) deleteBufferedTextFile(file);
+
 	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
 });
@@ -3923,6 +4282,7 @@ narratorRoutes.post("/:id/promote", async (c) => {
 	// Chapter-bound narrator: fork a new chapter
 	const chapter = await chapterFork.fork(narrator.chapterId, {
 		inheritMode: "full",
+		worktreeSource: "workspace",
 	});
 
 	// Mark the original ask-in-passing narrator as promoted so the UI
@@ -5498,12 +5858,29 @@ narratorRoutes.delete("/:id/browser-sessions/:sessionId", async (c) => {
 	return c.json({ ok: true });
 });
 
-narratorRoutes.get("/:id/browser-sessions/:sessionId/screenshot", async (c) => {
-	const narratorId = c.req.param("id");
-	const sessionId = c.req.param("sessionId");
-	const session = getBrowserSession(narratorId, sessionId);
-	if (!session) throw new NotFoundError("BrowserSession", sessionId);
-	const result = await browserScreenshot(session);
+/**
+ * Capture a screenshot as a PNG response.
+ *
+ * Chrome can refuse to produce a frame (occluded headed window, lost GPU surface, wedged target).
+ * That is an upstream browser condition, not a server bug, so it is reported as 502 with a readable
+ * message instead of bubbling up as an anonymous 500 plus a stack trace in the logs.
+ */
+async function browserScreenshotResponse(session: BrowserSessionType): Promise<Response> {
+	let result: Awaited<ReturnType<typeof browserScreenshot>>;
+	try {
+		result = await browserScreenshot(session);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		logger.warn("Browser screenshot capture failed", {
+			narratorId: session.narratorId,
+			sessionId: session.id,
+			error: message.slice(0, 300),
+		});
+		return Response.json(
+			{ error: `Browser screenshot failed: ${message}`, code: "BROWSER_SCREENSHOT_FAILED" },
+			{ status: 502 },
+		);
+	}
 	const buffer = Buffer.from(result.base64, "base64");
 	return new Response(buffer, {
 		headers: {
@@ -5511,6 +5888,14 @@ narratorRoutes.get("/:id/browser-sessions/:sessionId/screenshot", async (c) => {
 			"Cache-Control": "no-store",
 		},
 	});
+}
+
+narratorRoutes.get("/:id/browser-sessions/:sessionId/screenshot", async (c) => {
+	const narratorId = c.req.param("id");
+	const sessionId = c.req.param("sessionId");
+	const session = getBrowserSession(narratorId, sessionId);
+	if (!session) throw new NotFoundError("BrowserSession", sessionId);
+	return browserScreenshotResponse(session);
 });
 
 narratorRoutes.post("/:id/browser-sessions/:sessionId/interact", async (c) => {
@@ -5570,14 +5955,7 @@ narratorRoutes.post("/:id/browser-sessions/:sessionId/interact", async (c) => {
 	}
 
 	// Return fresh screenshot after the interaction
-	const result = await browserScreenshot(session);
-	const buffer = Buffer.from(result.base64, "base64");
-	return new Response(buffer, {
-		headers: {
-			"Content-Type": "image/png",
-			"Cache-Control": "no-store",
-		},
-	});
+	return browserScreenshotResponse(session);
 });
 
 narratorRoutes.post("/:id/browser-sessions/:sessionId/stop-tracing", async (c) => {

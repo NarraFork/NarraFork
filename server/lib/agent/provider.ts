@@ -1,12 +1,9 @@
 import type {
-	AgentSideCar,
-	AgentSideCarTarget,
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
 	ApiRequestDiagnostics,
 	BuiltHistory,
 	DbMessage,
-	DbSideCar,
 	DbToolCall,
 	ParsedStreamEvent,
 	ProviderTextCitation,
@@ -42,14 +39,11 @@ import type { ApiRequestDumpCollector } from "./request-dump";
 // `server/`. Re-exported here to keep existing host import paths working.
 
 export type {
-	AgentSideCar,
-	AgentSideCarTarget,
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
 	ApiRequestDiagnostics,
 	BuiltHistory,
 	DbMessage,
-	DbSideCar,
 	DbToolCall,
 	ParsedStreamEvent,
 	ProviderTextCitation,

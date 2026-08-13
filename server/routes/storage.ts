@@ -92,6 +92,7 @@ const databaseCleanupTargetSchema = z.enum([
 	"archivedSessions",
 	"staleSessions",
 	"apiRequestDumps",
+	"toolCallPayloads",
 ]);
 
 const databasePreviewSchema = z.object({

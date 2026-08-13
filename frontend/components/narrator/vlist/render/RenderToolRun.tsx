@@ -47,7 +47,6 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconDots,
-	IconInfoCircle,
 	IconTool,
 } from "@tabler/icons-react";
 import { useEffect, useRef, useState } from "react";
@@ -93,12 +92,10 @@ function categoryColor(category: string | undefined): string {
 /** Header visual per variant (icon + tint). Tool traces gray, reasoning grape. */
 function variantHeaderColor(variant: TraceVariant): string {
 	if (variant === "reasoning-steps") return "grape";
-	if (variant === "sidecar") return "indigo";
 	return "gray";
 }
 function VariantHeaderIcon({ variant }: { variant: TraceVariant }) {
 	if (variant === "reasoning-steps") return <IconBrain size={HEADER_INNER_ICON} />;
-	if (variant === "sidecar") return <IconInfoCircle size={HEADER_INNER_ICON} />;
 	return <IconTool size={HEADER_INNER_ICON} />;
 }
 

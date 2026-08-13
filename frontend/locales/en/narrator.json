@@ -422,6 +422,9 @@
 	"cancelBuffer": "Remove",
 	"clearAllQueued": "Clear all queued",
 	"queuedCount": "{{count}} queued",
+	"queuedMoreImages": "+{{count}}",
+	"queuedEditEmptyHint": "Add text or an attachment",
+	"editQueuedFailed": "Failed to update queued message",
 	"expandQueue": "Expand",
 	"collapseQueue": "Collapse",
 	"specContinuation": "Task",
@@ -984,6 +987,8 @@
 	"details.cmdBlacklist": "Command blacklist",
 	"details.emptyRules": "No rules",
 	"details.filterPlaceholder": "Filter settings and details",
+	"details.avatarUpload": "Upload avatar",
+	"details.avatarReset": "Reset to generated glyph",
 	"details.filterNoResults": "Nothing matches \"{{query}}\".",
 	"details.sessionAdvanced": "Advanced ({{count}} at default)",
 	"details.export": "Export transcript",
@@ -1121,6 +1126,12 @@
 	"executionTargetDevice": "Device: {{device}}",
 	"executionTargetCwd": "Working directory: {{cwd}}",
 	"executionTargetPath": "Resolved path: {{path}}",
+	"contentInspector": {
+		"title": "What the model saw",
+		"inspect": "Inspect what the model saw",
+		"copy": "Copy",
+		"copied": "Copied"
+	},
 	"toolCallInspector": {
 		"title": "Tool Call Inspector",
 		"inspect": "Inspect tool call",

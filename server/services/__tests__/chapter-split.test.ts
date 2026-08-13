@@ -442,7 +442,7 @@ describe("splitting a chapter", () => {
 			sourceId: upstreamId,
 			targetId: env.chapterId,
 			type: "fork",
-			metadata: { commitSha: env.commits[0], inheritMode: "full" },
+			metadata: { commitSha: env.commits[0], worktreeSource: "commit", inheritMode: "full" },
 			createdAt: now,
 		});
 
@@ -621,7 +621,7 @@ describe("rolling back a failed split", () => {
 			sourceId: upstreamId,
 			targetId: env.chapterId,
 			type: "fork",
-			metadata: { commitSha: env.commits[0], inheritMode: "full" },
+			metadata: { commitSha: env.commits[0], worktreeSource: "commit", inheritMode: "full" },
 			createdAt: now,
 		});
 		const before = await chapterRow(env.chapterId);

@@ -14,11 +14,8 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
-import {
-	hasTruncatedLeaf,
-	readLeafText,
-	stringifyForDisplay,
-} from "@shared/pretext-layout/tool-io-projection";
+import { hasTruncatedLeaf } from "@shared/pretext-layout/tool-io-projection";
+import { subagentResultText } from "@shared/subagent-result-text";
 import { isTerminalToolRowStatus } from "@shared/tool-row-status";
 import {
 	IconArrowBackUp,
@@ -67,6 +64,7 @@ import {
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
 } from "./MessageSelectionCtx";
+import { NarratorAvatar } from "./NarratorAvatar";
 import { resolvePendingPerm } from "./narrator-message-helpers";
 import type { PermissionCallbacks } from "./narrator-panel-types";
 import { useRenderLod } from "./RenderLodCtx";
@@ -177,8 +175,6 @@ function categoryGlyph(toolName: string) {
  */
 export const SUBAGENT_STATUS_ROW_MIN_HEIGHT = "calc(1rem * var(--mantine-line-height))";
 
-const SUBAGENT_ID_RE = /<subagent_id>[^<]*<\/subagent_id>/g;
-const MAX_SUBAGENT_RESULT_PREVIEW_CHARS = 120_000;
 const MAX_SUBAGENT_PROMPT_INLINE_CHARS = 120_000;
 const MAX_SUBAGENT_DESCRIPTION_CHARS = 4_000;
 const SWIPE_REVEAL_WIDTH = 180;
@@ -188,6 +184,9 @@ interface SubagentNarratorData {
 	substatus?: string | string[];
 	model?: string | null;
 	reasoningEffort?: string | null;
+	title?: string | null;
+	/** Custom avatar image id; absent → the identicon derived from the narrator id. */
+	avatarImageId?: string | null;
 	_retryInfo?: {
 		message: string;
 		retryCount?: number;
@@ -229,10 +228,6 @@ export function resolveSubagentReasoningEffort(
 	);
 }
 
-function stripSubagentId(text: string): string {
-	return text.replace(SUBAGENT_ID_RE, "").trim();
-}
-
 /**
  * Whether a tool status means "no longer running".
  *
@@ -244,35 +239,6 @@ function stripSubagentId(text: string): string {
  */
 function isTerminalToolStatus(status: string | undefined): boolean {
 	return isTerminalToolRowStatus(status);
-}
-
-function parseOutputJson(output: unknown): string {
-	if (typeof output === "string") return capText(output, MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
-	if (!output || typeof output !== "object") return "";
-	const record = output as Record<string, unknown>;
-	// `_text` is checked FIRST (and unwrapped if it is itself a truncated leaf), so a
-	// `{_text, _metadata}` output whose text was cut shows the text rather than the
-	// literal `{"_text":"…` the old ordering produced.
-	const textField = readLeafText(record._text);
-	if (textField !== undefined) return capText(textField, MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
-	const leaf = readLeafText(record);
-	if (leaf !== undefined) return capText(leaf, MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
-	if (Array.isArray(output)) {
-		return capText(
-			output
-				.map((block) =>
-					block &&
-					typeof block === "object" &&
-					typeof (block as { text?: unknown }).text === "string"
-						? ((block as { text: string }).text ?? "")
-						: "",
-				)
-				.filter(Boolean)
-				.join("\n"),
-			MAX_SUBAGENT_RESULT_PREVIEW_CHARS,
-		);
-	}
-	return capText(stringifyForDisplay(output), MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
 }
 
 /**
@@ -539,10 +505,7 @@ export const SubagentCard = memo(function SubagentCard({
 		String(rawDescription ?? t("subagentBadge")),
 		MAX_SUBAGENT_DESCRIPTION_CHARS,
 	);
-	const resultText = useMemo(
-		() => stripSubagentId(parseOutputJson(toolCall.outputJson)),
-		[toolCall.outputJson],
-	);
+	const resultText = useMemo(() => subagentResultText(toolCall.outputJson), [toolCall.outputJson]);
 	// Recursive probe: after field-level projection the ROOT of an object output is a
 	// plain object, so a root-level `_truncated` check would report "complete" for a
 	// payload whose body is still a preview.
@@ -555,7 +518,7 @@ export const SubagentCard = memo(function SubagentCard({
 	const fullResultText = useMemo(
 		() =>
 			fullToolCall?.outputJson
-				? stripSubagentId(parseOutputJson(fullToolCall.outputJson)) || undefined
+				? subagentResultText(fullToolCall.outputJson) || undefined
 				: undefined,
 		[fullToolCall?.outputJson],
 	);
@@ -843,9 +806,19 @@ export const SubagentCard = memo(function SubagentCard({
 								wrap="wrap"
 								style={{ flex: 1, minWidth: 0, flexWrap: "wrap" }}
 							>
-								<ThemeIcon size={16} variant="light" color="indigo" radius="sm">
-									<IconRobot size={10} />
-								</ThemeIcon>
+								{subagentNarratorId ? (
+									<NarratorAvatar
+										narratorId={subagentNarratorId}
+										avatarImageId={narratorData?.avatarImageId}
+										title={narratorData?.title ?? agentType}
+										size={16}
+										showTooltip={false}
+									/>
+								) : (
+									<ThemeIcon size={16} variant="light" color="indigo" radius="sm">
+										<IconRobot size={10} />
+									</ThemeIcon>
+								)}
 								<Badge size="xs" variant="light" color={agentBadgeColor}>
 									{agentType}
 								</Badge>

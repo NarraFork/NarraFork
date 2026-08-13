@@ -5,7 +5,6 @@ import {
 	measureSystemSimpleCard,
 	REVIEW_FEEDBACK_CARD_HEIGHT,
 	SEGMENT_COMPACT_CARD_HEIGHT,
-	SPEC_CONTINUATION_CARD_HEIGHT,
 	SYSTEM_SIMPLE_CARD_HEIGHTS,
 	type SystemSimpleData,
 	type SystemSimpleKind,
@@ -42,26 +41,12 @@ describe("measureSystemSimpleCard — fixed per-kind heights", () => {
 		expect(r.height).toBe(37);
 	});
 
-	it("spec_continuation = 37px (Paper p=xs + truncate)", () => {
-		expect(SPEC_CONTINUATION_CARD_HEIGHT).toBe(37);
-		const r = measureSystemSimpleCard("spec_continuation", D(), 800);
-		expect(r.height).toBe(37);
-	});
-
-	it("spec_blocked_continuation = 37px (same as spec_continuation)", () => {
-		const r = measureSystemSimpleCard("spec_blocked_continuation", D(), 800);
-		expect(r.height).toBe(37);
-		expect(r.height).toBe(SPEC_CONTINUATION_CARD_HEIGHT);
-	});
-
 	it("SYSTEM_SIMPLE_CARD_HEIGHTS lookup matches the measured height for every kind", () => {
 		const kinds: SystemSimpleKind[] = [
 			"compact",
 			"segment_compact",
 			"merge_summary",
 			"review_feedback",
-			"spec_continuation",
-			"spec_blocked_continuation",
 		];
 		for (const kind of kinds) {
 			const r = measureSystemSimpleCard(kind, D(), 640);
@@ -89,8 +74,8 @@ describe("measureSystemSimpleCard — height is independent of content", () => {
 	});
 
 	it("height does NOT change with contentWidth (full-line clamp, width-free)", () => {
-		const wide = measureSystemSimpleCard("spec_continuation", D({ text: "task text" }), 2000);
-		const narrow = measureSystemSimpleCard("spec_continuation", D({ text: "task text" }), 60);
+		const wide = measureSystemSimpleCard("merge_summary", D({ text: "task text" }), 2000);
+		const narrow = measureSystemSimpleCard("merge_summary", D({ text: "task text" }), 60);
 		expect(narrow.height).toBe(wide.height);
 	});
 
@@ -102,11 +87,11 @@ describe("measureSystemSimpleCard — height is independent of content", () => {
 		expect(heights[0]).toBe(37);
 	});
 
-	it("optional flags (protected / hasAvatar / badgeLabel / status) are height-neutral", () => {
-		const plain = measureSystemSimpleCard("spec_blocked_continuation", D(), 800);
+	it("optional flags (hasAvatar / status) are height-neutral", () => {
+		const plain = measureSystemSimpleCard("merge_summary", D(), 800);
 		const decorated = measureSystemSimpleCard(
-			"spec_blocked_continuation",
-			D({ protected: true, badgeLabel: "Blocked", color: "orange" }),
+			"merge_summary",
+			D({ hasAvatar: true, color: "indigo" }),
 			800,
 		);
 		expect(decorated.height).toBe(plain.height);
@@ -138,16 +123,15 @@ describe("measureSystemSimpleCard — block/frame shape", () => {
 
 	it("carries the render payload on the block for the renderer", () => {
 		const r = measureSystemSimpleCard(
-			"spec_continuation",
-			D({ text: "do X", badgeLabel: "Continue", protected: true, color: "indigo" }),
+			"merge_summary",
+			D({ text: "do X", hasAvatar: true, color: "indigo" }),
 			800,
 		);
 		const [block] = r.blocks;
 		if (block?.kind === "fixed") {
 			expect(block.data).toMatchObject({
 				text: "do X",
-				badgeLabel: "Continue",
-				protected: true,
+				hasAvatar: true,
 				color: "indigo",
 			});
 		}

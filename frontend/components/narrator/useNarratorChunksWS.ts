@@ -7,7 +7,6 @@ import { useTranslation } from "react-i18next";
 import { type SubagentToolEventMeta, useNarratorWS } from "../../hooks/useNarratorWS";
 import type {
 	ChunkManifestEntry,
-	SideCarRecord,
 	SubagentActivitySummary,
 	SubagentToolCallHeader,
 	TreeMessage,
@@ -35,14 +34,12 @@ import {
 	upsertSubagentToolCallHeader,
 } from "./message-tree-utils";
 import {
-	appendSideCarsToLatestAssistant,
 	buildTopLevelStreamingChunksMsg,
 	getStreamingFieldPreview,
 	getSyntheticTopLevelStreamingChunks,
 	getToolOutputPreview,
 	insertTopLevelMessageBySeq,
 	preserveCompleteStreamedOutput,
-	preserveLiveSideCars,
 	preserveLiveSubagentActivity,
 	splitTopLevelStreamingChunksByPersistedToolUse,
 	type TopLevelStreamingChunk,
@@ -466,13 +463,12 @@ function applyTopLevelMessage(
 ): ChunkMutState {
 	const { loaded, manifest } = state;
 
-	// 1. De-dupe by id across every loaded chunk; merge live side-cars in place.
+	// 1. De-dupe by id across every loaded chunk, keeping live-only state in place.
 	for (const [chunkId, msgs] of loaded) {
 		const idx = msgs.findIndex((m) => m.id === newMsg.id);
 		if (idx !== -1) {
 			const updated = [...msgs];
-			const withLiveSideCars = preserveLiveSideCars(updated[idx], newMsg);
-			updated[idx] = preserveLiveSubagentActivity(updated[idx], withLiveSideCars);
+			updated[idx] = preserveLiveSubagentActivity(updated[idx], newMsg);
 			const nextLoaded = new Map(loaded);
 			nextLoaded.set(chunkId, updated);
 			return { ...state, loaded: nextLoaded };
@@ -1216,7 +1212,6 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				updatedInput?: Record<string, unknown>,
 				metadata?: Record<string, unknown>,
 				rawParentToolUseId?: string,
-				sideCars?: SideCarRecord[],
 				activityMeta?: SubagentToolEventMeta,
 			) => {
 				// On a subagent's own page, its tools are top-level (no parent here).
@@ -1264,7 +1259,6 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 							_output: completedOutput.output,
 							_durationMs: durationMs,
 							_metadata: metadata,
-							_sideCars: sideCars,
 							_streamingOutput: undefined,
 							_streamedFullOutput: completedOutput.preserved || undefined,
 						});
@@ -1305,9 +1299,6 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						if (metadata) {
 							result = mergeFieldsByIndex(result, toolUseId, { _metadata: metadata }, EMPTY_INDEX);
 						}
-						if (sideCars?.length) {
-							result = mergeFieldsByIndex(result, toolUseId, { sideCars }, EMPTY_INDEX);
-						}
 						return result;
 					}),
 				);
@@ -1315,22 +1306,6 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					flushChunkUpdatesSync();
 					discardTopLevelStreamingChunks([toolUseId]);
 				}
-			},
-			onSideCars: (sideCars: SideCarRecord[], rawParentToolUseId?: string) => {
-				const parentToolUseId = isSubagent ? undefined : rawParentToolUseId;
-				const userSideCars = sideCars.filter((sc) => sc.target === "user_message");
-				if (userSideCars.length === 0) return;
-				scheduleChunkUpdate((state) => {
-					for (const [chunkId, msgs] of state.loaded) {
-						const result = appendSideCarsToLatestAssistant(msgs, userSideCars, parentToolUseId);
-						if (result.changed) {
-							const loaded = new Map(state.loaded);
-							loaded.set(chunkId, result.messages);
-							return { ...state, loaded };
-						}
-					}
-					return state;
-				});
 			},
 			/**
 			 * Execution actually began (permission granted + final admission).

@@ -29,6 +29,8 @@ import {
 	type PretextDocumentLoadOptions,
 } from "./pretext-document-loader";
 import { appendLoadedMessage } from "./vlist-message-append";
+import { removeLoadedMessages } from "./vlist-message-remove";
+import { replaceLoadedMessage } from "./vlist-message-replace";
 import type { VListItem } from "./vlist-pipeline";
 
 export type PretextLayoutCoordinatorStatus = "idle" | "loading" | "computing" | "ready" | "error";
@@ -479,6 +481,93 @@ export class PretextLayoutCoordinator {
 		if (!this.input || !this.lastBuildOptions) return false;
 		const result = appendLoadedMessage(this.input.messages, message, isSubagent);
 		if (!result.appended) return false;
+		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
+		const view = getView?.();
+		const anchor =
+			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
+		const generation = ++this.generation;
+		this.commitLayout(
+			this.input,
+			this.lastBuildOptions,
+			anchor,
+			view?.viewportHeight ?? this.lastViewportHeight,
+			generation,
+		);
+		return true;
+	}
+
+	/**
+	 * Drop deleted messages from the loaded window IN PLACE.
+	 *
+	 * The counterpart to `appendMessage`, and for the same reason: the event carries
+	 * everything needed (the ids), so answering a deletion with a tail refetch bought
+	 * nothing — and worse, a structural reload is DEFERRED while the reader is
+	 * scrolled up (`vlist-reload-policy.ts`), which is precisely where a reader who
+	 * right-clicked a message in history always is. That deferral is what made a
+	 * rollback appear not to happen until the reader scrolled back to the bottom.
+	 *
+	 * `removeLoadedMessages` owns the judgement of what may be dropped locally;
+	 * anything it declines still falls back to the reload, which is always correct.
+	 *
+	 * Like every in-place path this keeps `messageVersion` fixed — it is the measure
+	 * cache generation for the rows on screen, and the surviving rows' content did
+	 * not change — and anchors the rebuild so nobody is scrolled around. Cache
+	 * correctness rests on `spec.key`: removed rows' keys simply stop appearing.
+	 *
+	 * Returns false when nothing was removed, so the caller can decide to reload.
+	 */
+	removeMessages(deletedIds: readonly string[], getView?: () => PrependView): boolean {
+		if (!this.input || !this.lastBuildOptions) return false;
+		const result = removeLoadedMessages(this.input.messages, deletedIds);
+		if (!result.removed) return false;
+		// `oldestLoadedSeq` and `hasPrev` are deliberately NOT recomputed. They
+		// describe the upper bound of what has been FETCHED ("I hold seq >= this"),
+		// not the oldest message currently held, and their only consumer is
+		// loadPretextDocumentOlder's `beforeSeq` + overlap check. Deleting rows does
+		// not make the server grow older history, so the bound has not moved.
+		// Recomputing it from the survivors would push the bound forward after the
+		// oldest loaded message is deleted, and the next upward page would then skip
+		// the span in between — a silent hole in history. Keeping the old value costs
+		// at most one overlapping page, which the loader already rejects.
+		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
+		const view = getView?.();
+		const anchor =
+			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
+		const generation = ++this.generation;
+		this.commitLayout(
+			this.input,
+			this.lastBuildOptions,
+			anchor,
+			view?.viewportHeight ?? this.lastViewportHeight,
+			generation,
+		);
+		return true;
+	}
+
+	/**
+	 * Apply a `message_updated` event IN PLACE when it is a trailing-block
+	 * truncation.
+	 *
+	 * This is the second half of a rollback: after deleting the messages below the
+	 * target, the server drops the target's own blocks past the rollback point and
+	 * broadcasts the rewritten message. Without this path those blocks stay on screen
+	 * until a structural reload — deferred, again, exactly when the reader is
+	 * scrolled up — so the rollback looked half-applied.
+	 *
+	 * Only a truncation is accepted, and `replaceLoadedMessage` owns that judgement:
+	 * because `messageVersion` stays fixed, a surviving block keeping its
+	 * `${msg.id}-b${bi}` key while its content changed would be served the height
+	 * measured from the OLD content (CONTRACT.md §4.5 constraint 3). Truncation is
+	 * the one shape where every surviving key still denotes the same block. Every
+	 * other update keeps the reload, which replaces the window and its version
+	 * together.
+	 *
+	 * Returns false when nothing was replaced, so the caller can decide to reload.
+	 */
+	replaceMessage(message: TreeMessage, getView?: () => PrependView): boolean {
+		if (!this.input || !this.lastBuildOptions) return false;
+		const result = replaceLoadedMessage(this.input.messages, message);
+		if (!result.replaced) return false;
 		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
 		const view = getView?.();
 		const anchor =

@@ -1,11 +1,14 @@
+import { normalizeLocale } from "@shared/i18n-locales";
 import { count, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { narrators, users } from "../db/schema";
+import { narrators, userPreferences, users } from "../db/schema";
 import { revokeUserSessions } from "../lib/auth";
 import { isMaskedSecret, maskAuthSettings } from "../lib/auth-settings";
+import { randomAvatarColor } from "../lib/avatar-colors";
 import { AppError, formatZodError } from "../lib/errors";
 import { getEventLoopLagSnapshot } from "../lib/event-loop-monitor";
+import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getOAuthRateLimitSnapshot } from "../lib/oauth-rate-limit";
 import { getOAuthSecurityObservabilitySnapshot } from "../lib/oauth-security-observability";
@@ -13,12 +16,15 @@ import { saveSettings, settings } from "../lib/settings";
 import type { OidcProviderConfig } from "../lib/settings/types";
 import {
 	adminAuthConfigSchema,
+	adminCreateRegistrationCodeSchema,
+	adminCreateUserSchema,
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 } from "../lib/validators";
 import { invalidateUserCache, requireAdmin, requireAuth } from "../middleware/auth";
 import { knowledgeAcl } from "../services/knowledge-acl";
 import { prepareOAuthUserHardDeletion } from "../services/oauth-runtime-revocation";
+import { registrationCodeService } from "../services/registration-code-service";
 import { terminalService } from "../services/terminal-service";
 import { worktreeWatcher } from "../services/worktree-watcher";
 import { ProcessSnapshot } from "../terminal/dtach-service";
@@ -42,6 +48,69 @@ adminRoutes.get("/users", async (c) => {
 	return c.json(allUsers);
 });
 
+/**
+ * Create an account directly, with an initial password the administrator sets.
+ *
+ * No session token is returned: this endpoint provisions someone else's account,
+ * so the caller must never end up holding credentials for it. The recipient logs
+ * in with the password they were given (and can change it afterwards).
+ */
+adminRoutes.post("/users", async (c) => {
+	const parsed = adminCreateUserSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new AppError(formatZodError(parsed.error), 400, "VALIDATION_ERROR");
+	const { username, password, role, language } = parsed.data;
+
+	const existing = await db.query.users.findFirst({
+		where: eq(users.username, username),
+		columns: { id: true },
+	});
+	if (existing) throw new AppError("Username already taken", 409, "USERNAME_TAKEN");
+
+	// Hash outside the transaction: sync transactions cannot await.
+	const passwordHash = await Bun.password.hash(password, { algorithm: "bcrypt", cost: 10 });
+	const now = new Date().toISOString();
+	const id = generateId();
+	const resolvedLang = normalizeLocale(language);
+
+	const [created] = db.transaction((tx) => {
+		const rows = tx
+			.insert(users)
+			.values({
+				id,
+				username,
+				passwordHash,
+				role: role ?? "user",
+				avatarColor: randomAvatarColor(),
+				createdAt: now,
+			})
+			.returning({
+				id: users.id,
+				username: users.username,
+				role: users.role,
+				avatarColor: users.avatarColor,
+				createdAt: users.createdAt,
+			})
+			.all();
+		tx.insert(userPreferences)
+			.values({
+				id: generateId(),
+				userId: rows[0].id,
+				language: resolvedLang,
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		return rows;
+	});
+
+	logger.info("Administrator created a user", {
+		userId: created.id,
+		role: created.role,
+		actorUserId: c.get("user").sub,
+	});
+	return c.json(created, 201);
+});
+
 adminRoutes.patch("/users/:id", async (c) => {
 	const id = c.req.param("id");
 	const caller = c.get("user");
@@ -57,20 +126,21 @@ adminRoutes.patch("/users/:id", async (c) => {
 		throw new AppError("Cannot demote yourself", 400, "SELF_DEMOTE");
 	}
 
+	// Read the live role once: it decides both the last-administrator guard below and
+	// whether this request is a DEMOTION, which has to end the target's sessions.
+	const targetBefore = role
+		? await db.query.users.findFirst({ where: eq(users.id, id), columns: { role: true } })
+		: undefined;
+	const isDemotion = role === "user" && targetBefore?.role === "admin";
+
 	// Prevent demoting the last administrator
-	if (role === "user" && id !== caller.sub) {
-		const target = await db.query.users.findFirst({
-			where: eq(users.id, id),
-			columns: { role: true },
-		});
-		if (target?.role === "admin") {
-			const [{ value: adminCount }] = await db
-				.select({ value: count() })
-				.from(users)
-				.where(eq(users.role, "admin"));
-			if (adminCount <= 1) {
-				throw new AppError("Cannot demote the last administrator", 400, "LAST_ADMIN");
-			}
+	if (role === "user" && id !== caller.sub && targetBefore?.role === "admin") {
+		const [{ value: adminCount }] = await db
+			.select({ value: count() })
+			.from(users)
+			.where(eq(users.role, "admin"));
+		if (adminCount <= 1) {
+			throw new AppError("Cannot demote the last administrator", 400, "LAST_ADMIN");
 		}
 	}
 
@@ -107,7 +177,14 @@ adminRoutes.patch("/users/:id", async (c) => {
 	// sessions opened with it must die too. Session JWTs are self-contained, so only bumping the
 	// token generation can end them — a new password alone would leave a stolen token valid for
 	// up to its remaining lifetime.
-	if (password) {
+	//
+	// A DEMOTION needs the same treatment, for the same reason: the presented JWT carries its
+	// own `role`, and `assertAdmin` reads that claim. Clearing the existence cache alone is not
+	// enough — the version check the cache serves compares `tokenVersion`, not the role — so a
+	// just-demoted user's existing token would keep passing `requireAdmin` until it expired
+	// (up to 7 days). Sliding renewal does re-read the live role, but only for tokens that
+	// happen to be inside the renewal window, so it cannot be relied on as the boundary.
+	if (password || isDemotion) {
 		await revokeUserSessions(id);
 	}
 	// A role or password change must take effect on the next request rather than
@@ -183,6 +260,56 @@ adminRoutes.patch("/settings", async (c) => {
 	current.auth.registrationOpen = parsed.data.registrationOpen;
 	saveSettings(current);
 	return c.json({ registrationOpen: current.auth.registrationOpen });
+});
+
+// === Registration codes ===
+// Single-use invitations that let one person self-register while public
+// registration stays closed.
+
+adminRoutes.get("/registration-codes", async (c) => {
+	return c.json({ codes: await registrationCodeService.listCodes() });
+});
+
+/**
+ * Mint a code. The response is the ONLY place the plaintext appears — it is not
+ * stored (only its hash is) and not logged, so a lost code must be revoked and
+ * reissued rather than looked up.
+ */
+adminRoutes.post("/registration-codes", async (c) => {
+	const parsed = adminCreateRegistrationCodeSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new AppError(formatZodError(parsed.error), 400, "VALIDATION_ERROR");
+	const actorUserId = c.get("user").sub;
+	const { code, summary } = await registrationCodeService.createCode({
+		note: parsed.data.note,
+		role: parsed.data.role,
+		boundUsername: parsed.data.username,
+		expiresInHours: parsed.data.expiresInHours,
+		createdByUserId: actorUserId,
+	});
+	logger.info("Administrator issued a registration code", {
+		codeId: summary.id,
+		role: summary.role,
+		boundUsername: summary.boundUsername,
+		expiresAt: summary.expiresAt,
+		actorUserId,
+	});
+	return c.json({ code, ...summary }, 201);
+});
+
+adminRoutes.post("/registration-codes/:id/revoke", async (c) => {
+	const id = c.req.param("id");
+	const summary = await registrationCodeService.revokeCode(id);
+	logger.info("Administrator revoked a registration code", {
+		codeId: id,
+		actorUserId: c.get("user").sub,
+	});
+	return c.json(summary);
+});
+
+adminRoutes.delete("/registration-codes/:id", async (c) => {
+	const id = c.req.param("id");
+	await registrationCodeService.deleteCode(id);
+	return c.json({ ok: true });
 });
 
 // === Instance auth configuration (OIDC providers + WebAuthn) ===

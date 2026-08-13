@@ -190,17 +190,15 @@ export function RootLayout() {
 		location.pathname === "/changelog" ||
 		(import.meta.env.DEV && location.pathname === "/dev-vlist-harness");
 
-	return (
-		<>
-			<GitMissingAlert />
-			{isLoginPage || isOAuthConsentPage ? (
-				<Outlet />
-			) : isPublicPage && !getToken() ? (
-				<Outlet />
-			) : (
-				<AuthenticatedLayout />
-			)}
-		</>
+	// GitMissingAlert used to render here as a full-screen overlay outside the
+	// AppShell. It is now an in-flow banner inside AppShell.Main (see below), so
+	// it no longer needs to escape the layout — and no longer hides it.
+	return isLoginPage || isOAuthConsentPage ? (
+		<Outlet />
+	) : isPublicPage && !getToken() ? (
+		<Outlet />
+	) : (
+		<AuthenticatedLayout />
 	);
 }
 
@@ -1035,6 +1033,7 @@ function AuthenticatedLayout() {
 				className={APP_SHELL_MAIN_CLASSNAME}
 				style={{ paddingBottom: APP_SHELL_MAIN_PADDING_BOTTOM }}
 			>
+				<GitMissingAlert />
 				<Outlet />
 			</AppShell.Main>
 

@@ -4,7 +4,6 @@ import { getTestDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
-	narratorSidecars,
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
@@ -31,9 +30,6 @@ const {
 	getStreamingSnapshot,
 	processEvent,
 } = await import("../narrator-event-handler");
-const { getPipelineState, markPipelineUsed, startPipelineState } = await import(
-	"../../lib/agent/pipeline-state"
-);
 
 type EventHandlerContext = import("../narrator-event-handler").EventHandlerContext;
 
@@ -241,7 +237,7 @@ describe("narrator event handler streaming snapshot", () => {
 		});
 	});
 
-	test("子代理 tool_completed 向父级隐藏 output/metadata/sidecars，self 保持完整", async () => {
+	test("子代理 tool_completed 向父级隐藏 output/metadata，self 保持完整", async () => {
 		const ctx = makeSubagentContext();
 		ctx.toolCallIdsMap?.set("completed-tool", "tc-completed");
 		await processEvent(
@@ -252,7 +248,6 @@ describe("narrator event handler streaming snapshot", () => {
 				output: "sensitive output",
 				isError: false,
 				metadata: { secret: true },
-				sideCars: [{ target: "tool_result", source: "test", content: "sensitive sidecar" }],
 			},
 			ctx,
 		);
@@ -272,10 +267,8 @@ describe("narrator event handler streaming snapshot", () => {
 		});
 		expect(parent).not.toHaveProperty("output");
 		expect(parent).not.toHaveProperty("metadata");
-		expect(parent).not.toHaveProperty("sideCars");
 		expect(self?.output).toBe("sensitive output");
 		expect(self?.metadata).toEqual({ secret: true });
-		expect(self?.sideCars).toHaveLength(1);
 	});
 });
 
@@ -458,47 +451,6 @@ describe("子代理工具事件向父级携带输入摘要", () => {
 });
 
 describe("narrator event handler persistence", () => {
-	test("sidecar 的结构化 body 与模型向文本一起落库", async () => {
-		// `content` and `bodyJson` are two projections of ONE injection, written at the
-		// same call site. If the column stopped being persisted the UI would silently
-		// fall back to the verbatim-content path for every NEW row — looking exactly
-		// like the pre-refactor rendering, which is precisely why it needs pinning.
-		const narratorId = `sidecar-body-${Date.now()}`;
-		const now = new Date().toISOString();
-		await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
-		const ctx = makeSubagentContext();
-		(ctx as unknown as { narratorId: string }).narratorId = narratorId;
-		const body = {
-			kind: "tasks" as const,
-			variant: "current" as const,
-			tasks: [{ role: "doing" as const, text: "ship the footnote" }],
-		};
-		await processEvent(
-			{
-				type: "tool_result",
-				toolUseId: `sidecar-body-tool-${Date.now()}`,
-				toolName: "Read",
-				output: "ok",
-				isError: false,
-				sideCars: [
-					{
-						target: "tool_result",
-						source: "living_work_spec",
-						content: "Current Dynamic Spec reminder (compiled from spec://tasks.json):",
-						body,
-					},
-				],
-			},
-			ctx,
-		);
-		const rows = await db.query.narratorSidecars.findMany({
-			where: eq(narratorSidecars.narratorId, narratorId),
-		});
-		expect(rows).toHaveLength(1);
-		expect(rows[0]?.bodyJson).toEqual(body);
-		expect(rows[0]?.content).toContain("Dynamic Spec");
-	});
-
 	test("工具结果持久化后将结构化 metadata 交给 hook", async () => {
 		let observed: Record<string, unknown> | undefined;
 		await processEvent(
@@ -608,7 +560,6 @@ describe("narrator event handler persistence", () => {
 			sqlite.run("PRAGMA foreign_keys = OFF");
 			try {
 				if (savedMessageId) {
-					await db.delete(narratorSidecars).where(eq(narratorSidecars.messageId, savedMessageId));
 					await db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, savedMessageId));
 					await db
 						.delete(narratorMessageRefs)
@@ -619,43 +570,6 @@ describe("narrator event handler persistence", () => {
 			} finally {
 				sqlite.run("PRAGMA foreign_keys = ON");
 			}
-		}
-	});
-
-	test("Pipeline exit confirmation 仅在 SideCar 成功持久化后确认消费", async () => {
-		const narratorId = `pipeline-sidecar-${Date.now()}`;
-		const now = new Date().toISOString();
-		await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
-		try {
-			const state = await startPipelineState(narratorId);
-			await markPipelineUsed(narratorId, state.id);
-			expect((await getPipelineState(narratorId))?.exitConfirmationPending).toBe(true);
-
-			const ctx = makeSubagentContext();
-			ctx.narratorId = narratorId;
-			await processEvent(
-				{
-					type: "tool_result",
-					toolUseId: "pipeline-confirmation-result",
-					toolName: "Read",
-					output: "captured",
-					isError: false,
-					metadata: { pipelineExitConfirmationStateId: state.id },
-					sideCars: [
-						{
-							target: "tool_result",
-							source: "pipeline_exit_confirmation",
-							content: "confirm pipeline exit",
-							toolUseId: "pipeline-confirmation-result",
-						},
-					],
-				},
-				ctx,
-			);
-
-			expect((await getPipelineState(narratorId))?.exitConfirmationPending).toBe(false);
-		} finally {
-			await db.delete(narrators).where(eq(narrators.id, narratorId));
 		}
 	});
 

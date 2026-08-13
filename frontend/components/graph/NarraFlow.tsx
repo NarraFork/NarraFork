@@ -28,6 +28,7 @@ import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
 import { useCreateTerminal, useDeleteTerminal, useTerminals } from "@frontend/hooks/useTerminals";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { api } from "@frontend/lib/api";
+import { buildDraftForkRequest } from "@frontend/lib/chapter-fork-options";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import { notifyResultWarnings } from "@frontend/lib/operation-warnings";
 import {
@@ -1540,6 +1541,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				title: string;
 				description: string;
 				inheritMode: string;
+				worktreeSource: "workspace" | "commit";
 				mode: DraftMode;
 				parentChapterId?: string;
 				sourceChapterIds?: string[];
@@ -1552,13 +1554,17 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				const draftY = Math.max(0, draftNode?.position?.y ?? 0);
 
 				api
-					.forkChapter(payload.parentChapterId, {
-						title: payload.title,
-						description: payload.description || undefined,
-						inheritMode: payload.inheritMode,
-						axisOffset: draftX,
-						crossOffset: draftY,
-					})
+					.forkChapter(
+						payload.parentChapterId,
+						buildDraftForkRequest({
+							title: payload.title,
+							description: payload.description,
+							inheritMode: payload.inheritMode as "fresh" | "compressed" | "full",
+							worktreeSource: payload.worktreeSource,
+							axisOffset: draftX,
+							crossOffset: draftY,
+						}),
+					)
 					.then(() => {
 						removeDraft(draftNodeId);
 						queryClient.invalidateQueries({ queryKey: ["narraFlow"] });

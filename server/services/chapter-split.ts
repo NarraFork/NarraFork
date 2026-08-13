@@ -563,6 +563,7 @@ export const chapterSplit = {
 					title: input.newFork.title,
 					description: input.newFork.description,
 					inheritMode: input.newFork.inheritMode,
+					worktreeSource: "commit",
 					startCommitSha: commitSha,
 					anchorCommitSha: commitSha,
 					locale: input.locale,
@@ -600,6 +601,7 @@ export const chapterSplit = {
 				// endpoints cascade, so deleting the prefix row removes it.
 				await chapterEdgeService.createForkEdge(original.projectId, prefixId, chapterId, {
 					commitSha,
+					worktreeSource: "commit",
 					inheritMode: "full",
 					narratorMessageId: truncation?.messageId,
 				});

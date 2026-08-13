@@ -35,7 +35,9 @@ mock.module("@frontend/hooks/usePlatform", () => ({
 	useUploadCapability: () => ({ serveAvatars: { supported: false } }),
 }));
 
-const { injectUserBubbleHeader } = await import("./vlist-user-bubble-header");
+const { injectUserBubbleHeader, injectUserBubbleIsSelf, resolveBubbleIsSelf } = await import(
+	"./vlist-user-bubble-header"
+);
 
 const CREATOR = { id: "u1", username: "alice", avatarColor: "#f00", avatarImageId: null };
 
@@ -74,6 +76,72 @@ describe("injectUserBubbleHeader — injection contract", () => {
 		const extra = userExtra({ creator: undefined });
 		injectUserBubbleHeader("message-bubble", extra);
 		expect(extra.header).toBeDefined();
+	});
+});
+
+// ── Authorship: which side the bubble sits on ────────────────────────────────
+//
+// The bug this locks down: the right-hand indigo bubble was hard-coded, so in a
+// shared deployment EVERY human turn claimed to be the reader's own. `role: "user"`
+// means "a person typed this", not "you typed this".
+//
+// Both sides measure identically, which is why this is resolved here and not in the
+// adapter — viewer identity in measured data would fork the measure cache per user.
+
+describe("resolveBubbleIsSelf", () => {
+	test("the reader's own turn stays on the right", () => {
+		expect(resolveBubbleIsSelf(CREATOR, "u1")).toBe(true);
+	});
+
+	test("a teammate's turn moves to the left", () => {
+		expect(resolveBubbleIsSelf(CREATOR, "u2")).toBe(false);
+	});
+
+	test("an unknown viewer keeps the historical right-hand rendering", () => {
+		// `useCurrentUser()` is still loading (or there is no auth at all). Returning
+		// false here would flip every bubble left for a frame and then flip it back.
+		for (const viewer of [null, undefined, ""]) {
+			expect(resolveBubbleIsSelf(CREATOR, viewer)).toBe(true);
+		}
+	});
+
+	test("an unknown author keeps the right-hand rendering", () => {
+		// Rows written before `created_by` existed. A row authored by a NON-human never
+		// reaches this path: the adapter routes origin system/assistant to origin_notice
+		// before the bubble branch.
+		expect(resolveBubbleIsSelf(null, "u1")).toBe(true);
+		expect(resolveBubbleIsSelf(undefined, "u1")).toBe(true);
+		expect(resolveBubbleIsSelf({ username: "ghost" }, "u1")).toBe(true);
+	});
+});
+
+describe("injectUserBubbleIsSelf — injection contract", () => {
+	test("marks the reader's own bubble and a teammate's differently", () => {
+		const own = userExtra();
+		injectUserBubbleIsSelf("message-bubble", own, "u1");
+		expect(own.isSelf).toBe(true);
+
+		const other = userExtra();
+		injectUserBubbleIsSelf("message-bubble", other, "u2");
+		expect(other.isSelf).toBe(false);
+	});
+
+	test("leaves the flag unset for assistant bubbles and other kinds", () => {
+		const assistant: RenderExtra = { role: "assistant" };
+		injectUserBubbleIsSelf("message-bubble", assistant, "u2");
+		expect(assistant.isSelf).toBeUndefined();
+
+		for (const kind of ["markdown", "tool-call", "subagent-card"] as VListElementKind[]) {
+			const extra = userExtra();
+			injectUserBubbleIsSelf(kind, extra, "u2");
+			expect(extra.isSelf).toBeUndefined();
+		}
+	});
+
+	test("applies to a header-less bubble too (the side is independent of the header)", () => {
+		const extra = userExtra({ hasHeader: false });
+		injectUserBubbleIsSelf("message-bubble", extra, "u2");
+		expect(extra.isSelf).toBe(false);
 	});
 });
 

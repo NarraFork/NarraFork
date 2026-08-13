@@ -349,6 +349,11 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		en: "Failed to fork narrator: {error}",
 		"zh-CN": "分叉叙述者失败：{error}",
 	},
+	"tool.forkNarratorDepthExceeded": {
+		en: "Refused: this narrator is already {depth} forks deep, and the limit is {limit}. Each fork creates a chapter, a git worktree and a narrator that can fork again, so the chain is capped. Do the work here, or ask the user to start a new branch.",
+		"zh-CN":
+			"已拒绝：当前叙述者已处于第 {depth} 层分叉，上限是 {limit} 层。每次分叉都会创建章节、git worktree 和一个还能继续分叉的叙述者，因此链条有上限。请在当前叙述者内完成工作，或请用户另起一个分支。",
+	},
 	// --- merge.* (migrated from prompt-i18n.ts mergeSummaryLabels) ---
 	"merge.branch": { en: "Branch", "zh-CN": "分支" },
 	"merge.mergedInto": { en: "Merged into", "zh-CN": "合并到" },
@@ -842,7 +847,8 @@ export type ToolMessageKey =
 	| "toolUnloaded"
 	| "forkNarratorSuccess"
 	| "forkNarratorChapterInfo"
-	| "forkNarratorError";
+	| "forkNarratorError"
+	| "forkNarratorDepthExceeded";
 
 export function getToolMessage(key: ToolMessageKey, locale: Locale = DEFAULT_LOCALE): string {
 	return t(`tool.${key}`, locale);

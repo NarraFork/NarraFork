@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { countConfiguredProviders, persistSetupWizardBeforeNetworkChange } from "./SetupWizard";
+import {
+	countConfiguredProviders,
+	persistSetupWizardBeforeNetworkChange,
+	WIZARD_STEPS,
+	wizardNextBlockedReasonKey,
+	wizardStepIndex,
+} from "./SetupWizard";
 
 describe("setup wizard completion", () => {
 	test("persists completion before applying a network change", async () => {
@@ -17,6 +23,62 @@ describe("setup wizard completion", () => {
 
 		expect(calls).toEqual(["completion", "network:0.0.0.0"]);
 		expect(response).toEqual({ serverRestarting: true });
+	});
+});
+
+describe("setup wizard step order and gating", () => {
+	test("providers come before dependencies", () => {
+		// Order matters: dependency installation can be delegated to a Setup
+		// Assistant narrator, which needs a configured provider to exist first.
+		expect(wizardStepIndex("provider")).toBeLessThan(wizardStepIndex("deps"));
+		expect(WIZARD_STEPS[0]).toBe("welcome");
+		expect(WIZARD_STEPS.at(-1)).toBe("complete");
+	});
+
+	test("the provider step is a hard gate", () => {
+		expect(
+			wizardNextBlockedReasonKey({
+				step: wizardStepIndex("provider"),
+				providerCount: 0,
+				basicStepValid: true,
+			}),
+		).toBe("wizardProviderRequired");
+		expect(
+			wizardNextBlockedReasonKey({
+				step: wizardStepIndex("provider"),
+				providerCount: 1,
+				basicStepValid: true,
+			}),
+		).toBeNull();
+	});
+
+	test("the dependency step never blocks Next", () => {
+		// Missing system dependencies must not trap a first-time user: git only
+		// gates project features, and a narrator can install it later.
+		expect(
+			wizardNextBlockedReasonKey({
+				step: wizardStepIndex("deps"),
+				providerCount: 0,
+				basicStepValid: false,
+			}),
+		).toBeNull();
+	});
+
+	test("the basic step still requires both models", () => {
+		expect(
+			wizardNextBlockedReasonKey({
+				step: wizardStepIndex("basic"),
+				providerCount: 1,
+				basicStepValid: false,
+			}),
+		).toBe("wizardModelsRequired");
+		expect(
+			wizardNextBlockedReasonKey({
+				step: wizardStepIndex("basic"),
+				providerCount: 1,
+				basicStepValid: true,
+			}),
+		).toBeNull();
 	});
 });
 

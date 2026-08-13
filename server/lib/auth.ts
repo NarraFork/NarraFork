@@ -8,12 +8,14 @@ import { count, eq, sql } from "drizzle-orm";
 import { sign, verify } from "hono/jwt";
 import { db } from "../db";
 import { userPreferences, users } from "../db/schema";
+import { registrationCodeService } from "../services/registration-code-service";
 import { authAttemptLimiter, fingerprintAuthIdentifier } from "./auth-attempt-limiter";
+import { randomAvatarColor } from "./avatar-colors";
 import { AppError, RateLimitError } from "./errors";
 import { generateId } from "./id";
 import { logger } from "./logger";
 import { issueMfaToken } from "./mfa";
-import { settings } from "./settings";
+import { saveSettings, settings } from "./settings";
 
 /** Read JWT secret lazily so it picks up the auto-generated value even when
  *  the module is imported before settings finishes initialization. */
@@ -27,26 +29,6 @@ const TOKEN_EXPIRY_SECONDS = SESSION_TOKEN_TTL_SECONDS;
 // a normal password failure. The plaintext is intentionally public and is not
 // an account credential.
 const INVALID_LOGIN_PADDING_HASH = "$2b$10$aF/evsAjCJZn2KANblVddeLsw19IUoALQbTSxTaCJeNxztOQHrWWm";
-
-// Mantine-friendly avatar color palette
-const AVATAR_COLORS = [
-	"#4C6EF5", // indigo
-	"#7950F2", // violet
-	"#BE4BDB", // grape
-	"#E64980", // pink
-	"#FA5252", // red
-	"#FD7E14", // orange
-	"#FAB005", // yellow
-	"#40C057", // green
-	"#12B886", // teal
-	"#15AABF", // cyan
-	"#228BE6", // blue
-	"#845EF7", // violet-light
-];
-
-function randomAvatarColor(): string {
-	return AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)];
-}
 
 export interface JwtPayload {
 	sub: string;
@@ -177,11 +159,26 @@ export async function isAuthenticSessionTokenIgnoringExpiry(token: string): Prom
 	}
 }
 
-export async function registerUser(username: string, password: string, language?: string) {
+export interface RegisterUserInput {
+	username: string;
+	password: string;
+	language?: string;
+	/**
+	 * A single-use registration code. When present it authorizes the signup on its
+	 * own, independently of `auth.registrationOpen`, and decides the new account's
+	 * role. That is the whole point of issuing one: an administrator can keep public
+	 * registration closed and still let a specific person create their own account.
+	 */
+	code?: string;
+}
+
+export async function registerUser(input: RegisterUserInput) {
+	const { username, password, language } = input;
+	const code = input.code?.trim() || undefined;
 	const [{ value: userCount }] = await db.select({ value: count() }).from(users);
 	const isFirstUser = userCount === 0;
 
-	if (!isFirstUser && !settings.auth.registrationOpen) {
+	if (!isFirstUser && !code && !settings.auth.registrationOpen) {
 		throw new AppError("Registration is closed", 403, "REGISTRATION_CLOSED");
 	}
 
@@ -192,7 +189,6 @@ export async function registerUser(username: string, password: string, language?
 		throw new AppError("Username already taken", 409, "USERNAME_TAKEN");
 	}
 
-	const role = isFirstUser ? "admin" : "user";
 	const id = generateId();
 	const passwordHash = await Bun.password.hash(password, {
 		algorithm: "bcrypt",
@@ -203,7 +199,23 @@ export async function registerUser(username: string, password: string, language?
 	const avatarColor = randomAvatarColor();
 	const resolvedLang = normalizeLocale(language);
 
+	// The code is redeemed in the SAME transaction that inserts the account. Split
+	// across two writes it would either burn an invitation on a signup that then
+	// failed, or create the account while leaving the code reusable.
+	//
+	// The first user is always an administrator regardless of any code: the
+	// bootstrap account has to be able to administer the instance.
 	const [user] = db.transaction((tx) => {
+		const usableCode =
+			!isFirstUser && code
+				? registrationCodeService.resolveUsableCodeInTransaction(tx, {
+						code,
+						username,
+						nowIso: now,
+					})
+				: null;
+		const role: "admin" | "user" = isFirstUser ? "admin" : (usableCode?.role ?? "user");
+
 		const created = tx
 			.insert(users)
 			.values({ id, username, passwordHash, role, avatarColor, createdAt: now })
@@ -227,11 +239,49 @@ export async function registerUser(username: string, password: string, language?
 			})
 			.run();
 
+		// After the insert: `registration_codes.used_by_user_id` references `users`,
+		// and SQLite enforces that the moment the row is written.
+		if (usableCode) {
+			registrationCodeService.claimCodeInTransaction(tx, {
+				codeId: usableCode.id,
+				userId: created[0].id,
+				nowIso: now,
+			});
+		}
+
 		return created;
 	});
 
+	// The first account is the instance administrator, created through an
+	// unauthenticated endpoint that has to stay open while no user exists. Once it
+	// does exist that endpoint is a standing signup hole, so close registration
+	// immediately instead of relying on the admin to flip the switch later. An
+	// admin can reopen it from settings.
+	if (isFirstUser) {
+		closeRegistrationAfterFirstAdmin();
+	}
+
 	const token = await createToken(user.id, user.role);
 	return { user, token, language: resolvedLang };
+}
+
+/**
+ * Persist `auth.registrationOpen = false` right after the bootstrap admin exists.
+ *
+ * Failures are logged, not thrown: the account is already committed, and failing
+ * the request would leave the caller without the token for an account that does
+ * exist. The in-memory flag is flipped first so a failed write still denies
+ * registration for the life of the process (it reverts on restart).
+ */
+function closeRegistrationAfterFirstAdmin(): void {
+	if (!settings.auth.registrationOpen) return;
+	try {
+		settings.auth.registrationOpen = false;
+		saveSettings(settings);
+		logger.info("Registration closed automatically after the first administrator was created");
+	} catch (error) {
+		logger.error("Failed to close registration after first administrator", { error });
+	}
 }
 
 export interface LoginSuccess {

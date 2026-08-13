@@ -657,12 +657,8 @@ const HARNESS_CASES: HarnessCase[] = [
 		text: "Review complete · 3 comments · 1 blocking",
 		color: "gray",
 	}),
-	...systemSimpleCase("spec_continuation", "System · spec continuation", {
-		text: "Continuing task: wire PretextMessageList behind the flag",
-		badgeLabel: "Task",
-		protected: true,
-		color: "indigo",
-	}),
+	// spec_continuation / spec_blocked_continuation are no longer system-simple cards:
+	// the framed bubble draws them as a task row (RenderSpecTask). See measure-spec-task.
 
 	// ── System-text (info / error / bash / spec_goal_added / carryover) ──────
 	...systemTextCase("info", "System-text · info (multi-line)", {

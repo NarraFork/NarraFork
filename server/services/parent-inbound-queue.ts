@@ -5,17 +5,19 @@
  * narrator-session and agent-communication — mirrors bg-completion-queue.
  *
  * When a subagent uses `Send({ id: "parent", message })` to report progress to
- * the narrator that launched it, the message is queued here keyed by the parent
- * narrator id. A working parent drains it at the next `after_tools` sidecar
- * boundary; an idle parent is woken to consume it (see
+ * the narrator that launched it, the message is enqueued in the shared
+ * `parent-injection-queue` keyed by the parent narrator id. A working parent drains it
+ * at the next `after_tools` boundary; an idle parent is woken to consume it (see
  * startParentInboundContinuationIfPossible). The parent is always a primary
  * narrator (subagents cannot spawn nested subagents).
+ *
+ * This module now owns only the message SHAPE, its character cap, and the model-facing
+ * formatting — ordering is shared with the background-completion producers.
  */
 
 import type { Locale } from "../lib/prompt-i18n";
+import { pushPendingInjection } from "./parent-injection-queue";
 
-/** Hard cap so a flood of subagent reports can't blow up a parent's context. */
-const MAX_PARENT_INBOUND_MESSAGES = 20;
 /** Per-message content cap (defensive; progress reports should be concise). */
 const MAX_PARENT_INBOUND_CHARS = 8_000;
 
@@ -31,44 +33,29 @@ export interface ParentInboundMessage {
 	timestamp: string;
 }
 
-// In-memory only — intentionally not persisted. Subagent lifetimes are short
-// (bounded by the parent narrator session) so messages don't need to survive
-// server restarts. Working-parent messages land in narrator_sidecars and
-// idle-parent wakes persist a system message, so durable records still exist.
-let _parentInboundQueue: Map<string, ParentInboundMessage[]> | undefined;
-function getParentInboundQueue() {
-	if (!_parentInboundQueue) _parentInboundQueue = new Map();
-	return _parentInboundQueue;
-}
-
-/** Queue a subagent → parent message. Drops the oldest entries on overflow. */
+/**
+ * Queue a subagent → parent message.
+ *
+ * The per-message character cap stays here (this producer's concern). The ORDER lives in
+ * the shared `parent-injection-queue`, together with the two background-completion
+ * producers: a report sent BEFORE a task finished must not be shown after it. The count
+ * cap (20) now lives there too, applied per kind so a burst of completions cannot evict
+ * messages. See that module's header.
+ */
 export function pushParentInboundMessage(
 	parentNarratorId: string,
 	message: ParentInboundMessage,
 ): void {
-	const queue = getParentInboundQueue();
-	const list = queue.get(parentNarratorId) ?? [];
-	list.push({
-		...message,
-		text:
-			message.text.length > MAX_PARENT_INBOUND_CHARS
-				? `${message.text.slice(0, MAX_PARENT_INBOUND_CHARS)}…[truncated]`
-				: message.text,
+	pushPendingInjection(parentNarratorId, {
+		kind: "subagent_message",
+		message: {
+			...message,
+			text:
+				message.text.length > MAX_PARENT_INBOUND_CHARS
+					? `${message.text.slice(0, MAX_PARENT_INBOUND_CHARS)}…[truncated]`
+					: message.text,
+		},
 	});
-	// Keep only the most recent messages if the queue overflows.
-	if (list.length > MAX_PARENT_INBOUND_MESSAGES) {
-		list.splice(0, list.length - MAX_PARENT_INBOUND_MESSAGES);
-	}
-	queue.set(parentNarratorId, list);
-}
-
-/** Drain all pending inbound messages for a parent narrator. */
-export function drainParentInboundMessages(parentNarratorId: string): ParentInboundMessage[] {
-	const queue = getParentInboundQueue();
-	const list = queue.get(parentNarratorId);
-	if (!list || list.length === 0) return [];
-	queue.delete(parentNarratorId);
-	return list;
 }
 
 function senderLabel(message: ParentInboundMessage, isZh: boolean): string {

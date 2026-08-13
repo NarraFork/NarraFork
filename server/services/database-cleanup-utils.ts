@@ -2,7 +2,11 @@
 // in databases not yet migrated to the new status+substatus model.
 export const STALE_SESSION_STATUSES = new Set(["idle", "done", "error", "interrupted"]);
 
-export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "apiRequestDumps";
+export type DatabaseCleanupTarget =
+	| "archivedSessions"
+	| "staleSessions"
+	| "apiRequestDumps"
+	| "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
 	| "chapterBound"

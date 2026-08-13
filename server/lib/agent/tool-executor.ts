@@ -66,9 +66,9 @@ export interface ToolExecResult {
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
 	 *  this holds the effective input that was actually executed. */
 	updatedInput?: Record<string, unknown>;
-	/** One-shot Pipeline exit confirmation to be injected by the Agent Loop as a SideCar. */
+	/** One-shot Pipeline exit confirmation, delivered by the Agent Loop as its own row. */
 	pipelineExitConfirmation?: boolean;
-	/** Pipeline state identity used for two-phase SideCar delivery acknowledgement. */
+	/** Pipeline state identity used for two-phase delivery acknowledgement. */
 	pipelineExitConfirmationStateId?: string;
 }
 

@@ -19,6 +19,7 @@ import {
 	IconCpu,
 	IconDatabase,
 	IconDeviceLaptop,
+	IconHistory,
 	IconInfoCircle,
 	IconKey,
 	IconMessageCircle,
@@ -78,6 +79,7 @@ const ADMIN_PATHS = new Set([
 	"/settings/storage",
 	"/settings/runtime",
 	"/settings/usage",
+	"/settings/execution-log",
 	"/settings/plugins",
 ]);
 
@@ -166,6 +168,11 @@ function SettingsLayout() {
 		{ to: "/settings/runtime", label: t("runtimeSection"), icon: <IconPlayerPlay size={18} /> },
 		{ to: "/settings/plugins", label: t("pluginsSection"), icon: <IconPuzzle size={18} /> },
 		{ to: "/settings/usage", label: t("usageSection"), icon: <IconReceipt2 size={18} /> },
+		{
+			to: "/settings/execution-log",
+			label: t("executionLogSection"),
+			icon: <IconHistory size={18} />,
+		},
 		{ to: "/settings/about", label: t("versionSection"), icon: <IconInfoCircle size={18} /> },
 	];
 

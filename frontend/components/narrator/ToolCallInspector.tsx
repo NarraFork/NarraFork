@@ -16,11 +16,9 @@ import { IconCheck, IconCopy } from "@tabler/icons-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
-import type { SideCarRecord } from "../../lib/api";
 import type { ExecutionTargetIdentity } from "../../lib/api/types";
 import { formatDurationText, formatFullLocaleDateTime } from "../../lib/format";
 import { ContentViewer } from "./ContentViewer";
-import { SideCarNotice } from "./SideCarNotice";
 
 const MAX_JSON_PREVIEW_CHARS = 80_000;
 
@@ -46,7 +44,6 @@ interface ToolCallLike {
 	inputJson?: any;
 	// biome-ignore lint/suspicious/noExplicitAny: tool call JSON is dynamic by design
 	outputJson?: any;
-	sideCars?: SideCarRecord[];
 }
 
 interface ToolCallInspectorProps {
@@ -55,6 +52,19 @@ interface ToolCallInspectorProps {
 	opened: boolean;
 	onClose: () => void;
 	initialToolCall?: ToolCallLike | null;
+	/**
+	 * Skip the built-in fetch and render this detail instead.
+	 *
+	 * The default fetch resolves a call through the narrator's message refs, which
+	 * is right for the session views but wrong for callers that already hold the
+	 * row: the admin execution log reads `narrator_tool_calls` directly, so a call
+	 * whose message has left that narrator's view would 404 here even though the
+	 * caller can see it. Supplying the detail (with `detailLoading`) keeps one
+	 * inspector for both instead of forking the presentation.
+	 */
+	detail?: ToolCallLike | null;
+	detailLoading?: boolean;
+	detailError?: boolean;
 }
 
 function stringifyJson(value: unknown): string {
@@ -334,10 +344,24 @@ export function ToolCallInspector({
 	opened,
 	onClose,
 	initialToolCall,
+	detail,
+	detailLoading,
+	detailError,
 }: ToolCallInspectorProps) {
 	const { t } = useTranslation("narrator");
-	const enabled = opened && !!narratorId && !!toolUseId;
-	const { data, isLoading, isError } = useToolCallDetail(narratorId, toolUseId ?? "", enabled);
+	// `detail !== undefined` — not truthiness — marks an externally-fed inspector:
+	// a caller that is still loading passes `null`, and must not silently fall back
+	// to the ref-scoped fetch for the same call.
+	const externallyFed = detail !== undefined;
+	const enabled = opened && !externallyFed && !!narratorId && !!toolUseId;
+	const {
+		data: fetched,
+		isLoading: fetchLoading,
+		isError: fetchError,
+	} = useToolCallDetail(narratorId, toolUseId ?? "", enabled);
+	const data = externallyFed ? detail : fetched;
+	const isLoading = externallyFed ? !!detailLoading : fetchLoading;
+	const isError = externallyFed ? !!detailError : fetchError;
 
 	const toolCall = useMemo<ToolCallLike | null>(() => {
 		if (!data) return initialToolCall ?? null;
@@ -493,7 +517,6 @@ export function ToolCallInspector({
 
 				<JsonSection title={t("toolCallInspector.input")} value={toolCall?.inputJson} />
 				<JsonSection title={t("toolCallInspector.output")} value={toolCall?.outputJson} />
-				<SideCarNotice sideCars={toolCall?.sideCars} mode="detail" />
 
 				<Group gap="xs" justify="flex-end">
 					<LazyCopyJsonIconButton

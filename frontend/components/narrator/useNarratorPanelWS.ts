@@ -34,7 +34,6 @@ const PANEL_EXCLUDED_EVENT_TYPES = [
 	"message_updated",
 	"tool_use_chunk",
 	"tool_completed",
-	"sidecars",
 	"tool_long_running",
 	"timeout_updated",
 	"tool_output",

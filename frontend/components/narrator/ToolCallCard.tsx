@@ -109,7 +109,6 @@ import {
 	api,
 	authorizedFetch,
 	readFetchError,
-	type SideCarRecord,
 	type SubagentActivitySummary,
 } from "../../lib/api";
 import type { ExecutionTargetIdentity } from "../../lib/api/types";
@@ -148,7 +147,6 @@ import {
 import { reflectionProgressLabel } from "./progress-label";
 import { useRenderInteractive, useRenderLod } from "./RenderLodCtx";
 import { useReflectionProgress } from "./reflection-progress-store";
-import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import toolCardClasses from "./ToolCallCard.module.css";
 import { ToolCallInspector } from "./ToolCallInspector";
 import { isSpecTasksToolUse, knowledgeSummary } from "./tool-display";
@@ -328,8 +326,6 @@ export interface ToolCallData {
 	_streamedFullOutput?: boolean;
 	/** Current timeout in ms (set from inputJson.timeout or updated via WS timeout_updated) */
 	_timeoutMs?: number;
-	/** Sidecar system injections attached to this tool result */
-	sideCars?: SideCarRecord[];
 	/** Subagent assistant message ID that produced the result (for scroll-to navigation) */
 	resultMessageId?: string;
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
@@ -2089,30 +2085,8 @@ const ToolHeader = memo(
 				: Number.NaN;
 		const showContextAskChars = Number.isFinite(contextAskLiveChars) && contextAskLiveChars > 0;
 
-		// System injections this FOLDED card is not drawing. The footnotes live inside
-		// the collapse (a folded card shows no output, so they would have nothing to be
-		// a footnote to), and this keeps the FACT of them visible. Sits in the existing
-		// header row, so it adds no height.
-		const foldedSidecarCount =
-			!opened && hasVisibleSideCars(toolCall.sideCars) ? (toolCall.sideCars?.length ?? 0) : 0;
-
 		const statusNode = (
 			<span className={toolCardClasses.headerStatusRow}>
-				{foldedSidecarCount > 0 && (
-					<Tooltip
-						label={t("sidecar.attachedCount", { count: foldedSidecarCount })}
-						position="top"
-						withArrow
-						fz="xs"
-					>
-						<span
-							className={`${toolCardClasses.headerText} ${toolCardClasses.dimmed}`}
-							style={{ opacity: 0.7, cursor: "help" }}
-						>
-							{`+${foldedSidecarCount}`}
-						</span>
-					</Tooltip>
-				)}
 				<span
 					className={toolCardClasses.headerStatusIcon}
 					style={{
@@ -5399,7 +5373,6 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		p.executionCwd !== n.executionCwd ||
 		p.resolvedFilePath !== n.resolvedFilePath ||
 		p.deviceSelectionSource !== n.deviceSelectionSource ||
-		p.sideCars !== n.sideCars ||
 		p.startedAt !== n.startedAt ||
 		p.streamStartedAt !== n.streamStartedAt ||
 		p.permissionStartedAt !== n.permissionStartedAt ||
@@ -6020,15 +5993,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 							planPreviewOverride={effectivePlanPreviewOverride}
 						/>
 					</Box>
-					{/* System injections, as footnotes BELOW the output they are attached to
-					    (`appendSideCarsForApi` appends them to the tool result text) and
-					    above the permission UI, which stays last as the thing asking the
-					    reader to decide.
-
-					    Inside the collapse on purpose: a folded card shows no output, so a
-					    footnote there would have nothing to be a footnote to. The header's
-					    `+N` marker keeps the fact of them visible instead. */}
-					{hasVisibleSideCars(toolCall.sideCars) && <SideCarNotice sideCars={toolCall.sideCars} />}
 					{permissionUI}
 				</LazyCollapse>
 			)}

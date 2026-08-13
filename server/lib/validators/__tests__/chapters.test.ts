@@ -24,12 +24,12 @@ describe("forkChapterSchema rejects empty-string optional ID/SHA fields", () => 
 
 	test("valid non-empty strings pass", () => {
 		const result = forkChapterSchema.parse({
-			forkAtMessageUuid: "abc123",
 			startCommitSha: "deadbeef",
+			worktreeSource: "commit",
 			parentChapterId: "ch_xyz",
 		});
-		expect(result.forkAtMessageUuid).toBe("abc123");
 		expect(result.startCommitSha).toBe("deadbeef");
+		expect(result.worktreeSource).toBe("commit");
 		expect(result.parentChapterId).toBe("ch_xyz");
 	});
 
@@ -38,6 +38,37 @@ describe("forkChapterSchema rejects empty-string optional ID/SHA fields", () => 
 		expect(result.forkAtMessageUuid).toBeUndefined();
 		expect(result.forkAtMessageId).toBeUndefined();
 		expect(result.startCommitSha).toBeUndefined();
+		expect(result.worktreeSource).toBeUndefined();
 		expect(result.parentChapterId).toBeUndefined();
+	});
+});
+
+describe("forkChapterSchema coordinate conflicts", () => {
+	test("rejects both message coordinates", () => {
+		expect(
+			forkChapterSchema.safeParse({
+				forkAtMessageId: "msg-1",
+				forkAtMessageUuid: "uuid-1",
+			}).success,
+		).toBe(false);
+	});
+
+	test("rejects a message coordinate with startCommitSha", () => {
+		expect(
+			forkChapterSchema.safeParse({
+				forkAtMessageId: "msg-1",
+				startCommitSha: "deadbeef",
+				worktreeSource: "commit",
+			}).success,
+		).toBe(false);
+	});
+
+	test("rejects workspace with startCommitSha", () => {
+		expect(
+			forkChapterSchema.safeParse({
+				startCommitSha: "deadbeef",
+				worktreeSource: "workspace",
+			}).success,
+		).toBe(false);
 	});
 });

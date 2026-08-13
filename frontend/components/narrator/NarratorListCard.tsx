@@ -24,6 +24,7 @@ import { formatSmartTime } from "../../lib/format";
 import { highlightSearchText } from "../../lib/search-utils";
 import { getEffectiveNarratorDisplay, statusAccentColor } from "../../lib/status-registry";
 import { UserAvatar } from "../UserAvatar";
+import { NarratorAvatar } from "./NarratorAvatar";
 
 const ATTENTION_TAG_PRIORITY = [
 	"error",
@@ -86,6 +87,8 @@ export interface NarratorListItem {
 	substatus?: string[] | null;
 	cwd?: string | null;
 	messageCount?: number | null;
+	/** Custom avatar image id; absent → the identicon derived from the narrator id. */
+	avatarImageId?: string | null;
 	createdAt: string;
 	lastMessageAt?: string | null;
 	activeTerminalCount?: number | null;
@@ -319,6 +322,13 @@ function ActiveNarratorCard({
 			<Stack gap={4} visibleFrom="sm">
 				<Group justify="space-between" wrap="nowrap">
 					<Group gap="xs" style={{ minWidth: 0 }}>
+						<NarratorAvatar
+							narratorId={narrator.id}
+							avatarImageId={narrator.avatarImageId}
+							title={narrator.title}
+							size={20}
+							showTooltip={false}
+						/>
 						{narrator.status === "working" && (
 							<Loader size={14} color={substatus.includes("planning") ? "green" : undefined} />
 						)}
@@ -365,6 +375,13 @@ function ActiveNarratorCard({
 			<Stack gap={4} hiddenFrom="sm">
 				<Group gap={6} wrap="nowrap" justify="space-between">
 					<Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
+						<NarratorAvatar
+							narratorId={narrator.id}
+							avatarImageId={narrator.avatarImageId}
+							title={narrator.title}
+							size={18}
+							showTooltip={false}
+						/>
 						{narrator.status === "working" && (
 							<Loader size={12} color={substatus.includes("planning") ? "green" : undefined} />
 						)}
@@ -440,6 +457,13 @@ function ArchivedNarratorCard({
 				<Group justify="space-between" wrap="nowrap" align="flex-start">
 					<Stack gap={4} style={{ minWidth: 0, flex: 1 }}>
 						<Group gap="xs" wrap="nowrap">
+							<NarratorAvatar
+								narratorId={narrator.id}
+								avatarImageId={narrator.avatarImageId}
+								title={narrator.title}
+								size={20}
+								showTooltip={false}
+							/>
 							<Text fw={500} truncate>
 								<NarratorTitle narrator={narrator} localQuery={localQuery} />
 							</Text>

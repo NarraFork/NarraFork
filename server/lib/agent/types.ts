@@ -1,9 +1,8 @@
 import type {
-	AgentSideCar,
-	AgentSideCarTarget,
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
 	ApiRequestDiagnostics,
+	KnowledgeInjectionRecord,
 	ReasoningProviderMetadata,
 import type { z } from "zod/v4";
 import type { PathFlavor } from "./execution/backend";
@@ -15,8 +14,6 @@ import type { PathFlavor } from "./execution/backend";
  * paths keep working.
  */
 export type {
-	AgentSideCar,
-	AgentSideCarTarget,
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
 	ApiRequestDiagnostics,
@@ -334,13 +331,6 @@ export type AllowPermissionResult = Extract<PermissionResult, { behavior: "allow
 
 // === Agent events (yielded by the loop) ===
 
-export interface AgentSideCarRequest {
-	phase: "tool_result" | "after_tools";
-	toolName?: string;
-	toolUseId?: string;
-	completedToolCount?: number;
-}
-
 export type AgentEvent =
 	| {
 			type: "assistant_message";
@@ -372,7 +362,6 @@ export type AgentEvent =
 			brokenInputOverride?: Record<string, unknown>;
 			updatedInput?: Record<string, unknown>;
 			metadata?: Record<string, unknown>;
-			sideCars?: AgentSideCar[];
 	  }
 	/**
 	 * The tool passed its permission gate and final admission — execution begins NOW.
@@ -409,7 +398,6 @@ export type AgentEvent =
 			type: "block_complete";
 			block: ContentBlock;
 	  }
-	| { type: "sidecars"; sideCars: AgentSideCar[] }
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "max_turns_exceeded"; maxTurns: number }
 	| { type: "stream_reset" }
@@ -481,9 +469,14 @@ export type AgentEvent =
 			 *   already been produced. The turn finishes normally — tools execute and
 			 *   their results are carried into the next turn — so no continuation
 			 *   prompt and no request replay is needed.
+			 * - `truncated_tool_input`: the stream broke while the model was still
+			 *   writing a tool call's arguments, so no tool completed. The turn finishes
+			 *   normally too, but nothing executes: the loop injects the skeleton-first
+			 *   reminder instead, because an identical replay would most likely hit the
+			 *   same output-size ceiling again.
 			 */
 			type: "resumable_recovered";
-			strategy: "tool_continuation";
+			strategy: "tool_continuation" | "truncated_tool_input";
 			message: string;
 			diagnostics?: ApiRequestDiagnostics;
 	  }
@@ -866,14 +859,61 @@ export interface AgentConfig {
 		signal: AbortSignal,
 	) => Promise<AgentHistoryReplacement | null>;
 	/**
-	 * Unified sidecar channel. SideCars are stored separately and assembled into
-	 * either tool_result output or the next user message only when calling the API.
+	 * Text to fold into the next turn from producers that persist their own message row.
+	 *
+	 * The successor to the retired side-car channel. A producer using this has ALREADY
+	 * written what it has to say into the conversation (see `narrator-injection.ts`), so
+	 * the loop only needs the words for the turn that is about to be sent — it must not
+	 * persist anything, or the same content would appear twice.
+	 *
+	 * Called once per turn, after tool results are settled.
 	 */
-	getSideCars?: (request: AgentSideCarRequest) => Promise<AgentSideCar[]> | AgentSideCar[];
-	/** Initial completed-tool count for sidecar cadence, persisted by caller across loop runs. */
-	sideCarInitialCompletedToolCount?: number;
-	/** Called whenever the sidecar cadence counter advances. */
-	onSideCarCompletedToolCount?: (completedToolCount: number) => void;
+	getAfterToolsInjections?: () => Promise<string> | string;
+	/**
+	 * Persist a reminder the LOOP itself produced as its own message row.
+	 *
+	 * The loop cannot reach `narrator-injection` directly — it sits under `lib/` and must
+	 * not depend on `services/` — so the host injects this. Reminders raised here
+	 * (silent-progress, plan-mode, knowledge hints, pipeline checks) are the last
+	 * producers that still appended their text INSIDE a tool result's string; with this
+	 * they become rows like every other injection.
+	 *
+	 * Returns the text to fold into the current turn, or "" when the host declined
+	 * (missing hook, write failure). Callers must treat a failure as "not delivered"
+	 * rather than falling back to a side-car, or the content would arrive twice.
+	 */
+	deliverInjectionRow?: (injection: {
+		source: string;
+		content: string;
+		body?: import("@shared/sidecar-body").SideCarBody;
+		/** Tool call this reminder was raised about, when it was about one. */
+		toolUseId?: string;
+		/**
+		 * Knowledge-base hits to record once the row is durable.
+		 *
+		 * Recorded by the host rather than here because the de-dup key lives in the
+		 * database: writing the record before the content lands would permanently suppress
+		 * re-injecting those entries after a compact reloads the set from that table.
+		 */
+		knowledgeInjection?: KnowledgeInjectionRecord;
+		/**
+		 * Pipeline state to acknowledge once the row is durable.
+		 *
+		 * Same ordering requirement as `knowledgeInjection`, and the same reason it is the
+		 * host's job: acknowledging before the reminder is stored would clear the pending
+		 * flag for a warning the model never received.
+		 */
+		pipelineExitConfirmationStateId?: string;
+	}) => Promise<string> | string;
+	/**
+	 * Completed-tool count to resume from, persisted by the caller across loop runs.
+	 *
+	 * Cadence-driven injections are measured against this counter, so starting from zero on
+	 * a resumed session would read its whole history as one overdue interval.
+	 */
+	initialCompletedToolCount?: number;
+	/** Called whenever the completed-tool counter advances, so the caller can persist it. */
+	onCompletedToolCount?: (completedToolCount: number) => void;
 	/**
 	 * Called before each non-first turn/retry to check if runtime settings should be switched.
 	 * Changes are applied at the safe point before the next provider API request, so running

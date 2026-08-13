@@ -6,7 +6,6 @@ export type {
 
 import type { TextCitation } from "@shared/citations";
 import type { LocalizedValue } from "@shared/i18n-locales";
-import type { SideCarBody } from "@shared/sidecar-body";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type { TextCitation } from "@shared/citations";
@@ -169,10 +168,19 @@ export interface DatabaseStorageBreakdown {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;
 		apiRequestDumps: DatabaseCleanupCandidateSummary;
+		/**
+		 * Aged tool-call input/output payloads. Clears the columns and KEEPS the rows —
+		 * they carry the tree hashes that file-history revert depends on.
+		 */
+		toolCallPayloads: DatabaseCleanupCandidateSummary;
 	};
 }
 
-export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "apiRequestDumps";
+export type DatabaseCleanupTarget =
+	| "archivedSessions"
+	| "staleSessions"
+	| "apiRequestDumps"
+	| "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
 	| "chapterBound"
@@ -438,27 +446,8 @@ export interface ToolCallRecord {
 	permissionSuggestions?: unknown[] | null;
 	resultMessageId?: string | null;
 	createdAt?: string | number | null;
-	sideCars?: SideCarRecord[];
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
 	_subagentActivity?: SubagentActivitySummary;
-}
-
-export interface SideCarRecord {
-	id?: string;
-	target: "tool_result" | "user_message";
-	source: string;
-	/** The model-facing text. Shown verbatim when there is no structured `body`. */
-	content: string;
-	/**
-	 * Structured form of the injection (WS shape). HTTP-loaded rows carry the same
-	 * value under `bodyJson` (the DB column name) — use `readSideCarBody` rather
-	 * than reading either field directly.
-	 */
-	body?: SideCarBody;
-	/** Structured form as loaded from the DB row. See `body`. */
-	bodyJson?: SideCarBody | null;
-	toolUseId?: string | null;
-	orderIndex?: number;
 }
 
 export type PathFlavor = "posix" | "windows";
@@ -628,11 +617,36 @@ export interface BufferCreator {
 	avatarImageId?: string | null;
 }
 
+export interface BufferedImageSummary {
+	imageId: string;
+	filename: string;
+	mediaType: string;
+	width?: number;
+	height?: number;
+	/** Narrator that owns the file, for `/api/uploads/:narratorId/:imageId`. */
+	uploadNarratorId?: string;
+}
+
+/**
+ * Text-file attachment of a queued message.
+ *
+ * `index` is the identity to send back when editing: a taken-over subagent's
+ * queue can hold two files with the same name, so filenames are not unique.
+ */
+export interface BufferedTextFileSummary {
+	index: number;
+	filename: string;
+	size: number;
+}
+
 export interface BufferMessageSummary {
 	id: string;
 	text: string;
 	bufferedAt: string;
 	imageCount: number;
+	/** Optional so a snapshot from an older server still parses. */
+	images?: BufferedImageSummary[];
+	textFiles?: BufferedTextFileSummary[];
 	creator?: BufferCreator | null;
 	priority?: boolean;
 }
@@ -646,7 +660,6 @@ export interface TreeMessage {
 	contentJson: ContentBlock[];
 	contentText: string | null;
 	toolCalls: ToolCallRecord[];
-	sideCars?: SideCarRecord[];
 	tokensIn?: number | null;
 	costUsd?: number | null;
 	turnUsageJson?: {

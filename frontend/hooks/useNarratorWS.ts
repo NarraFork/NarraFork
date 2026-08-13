@@ -8,7 +8,6 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
 	BufferMessageSummary,
-	SideCarRecord,
 	SubagentActivityCatchUp,
 	SubagentActivitySummary,
 	SubagentToolCallHeader,
@@ -416,10 +415,8 @@ interface NarratorWSCallbacks {
 		updatedInput?: Record<string, unknown>,
 		metadata?: Record<string, unknown>,
 		parentToolUseId?: string,
-		sideCars?: SideCarRecord[],
 		meta?: SubagentToolEventMeta,
 	) => void;
-	onSideCars?: (sideCars: SideCarRecord[], parentToolUseId?: string) => void;
 	/**
 	 * The tool passed its permission gate and began executing.
 	 *
@@ -948,14 +945,7 @@ export function useNarratorWS(
 							data.updatedInput as Record<string, unknown> | undefined,
 							data.metadata as Record<string, unknown> | undefined,
 							data.parentToolUseId as string | undefined,
-							data.sideCars as SideCarRecord[] | undefined,
 							subagentToolEventMeta(data),
-						);
-						break;
-					case "sidecars":
-						callbackOwner.callbacks.onSideCars?.(
-							data.sideCars as SideCarRecord[],
-							data.parentToolUseId as string | undefined,
 						);
 						break;
 					case "tool_executing":

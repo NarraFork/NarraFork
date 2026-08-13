@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { FORK_WORKTREE_SOURCES } from "@shared/chapter-fork";
 import { Hono } from "hono";
 import { z } from "zod";
 import { gitAvailable, recheckGit } from "../lib/git-status";
@@ -64,19 +65,37 @@ function createMcpServer(): McpServer {
 
 	server.tool(
 		"narrafork_fork_chapter",
-		"Fork an existing chapter into a new branch",
+		"Fork a chapter, independently choosing conversation inheritance and filesystem source",
 		{
 			chapterId: z.string().describe("Source chapter ID to fork from"),
 			title: z.string().describe("Title for the new chapter"),
 			inheritMode: z
 				.enum(["full", "compressed", "fresh"])
 				.optional()
-				.describe("Narrator context inheritance mode"),
+				.describe("Conversation inheritance only; does not choose which files are forked"),
+			worktreeSource: z
+				.enum(FORK_WORKTREE_SOURCES)
+				.optional()
+				.describe(
+					'Filesystem source: "workspace" includes current uncommitted files; "commit" uses committed history only. Legacy omission remains supported.',
+				),
+			commitSha: z
+				.string()
+				.min(1)
+				.optional()
+				.describe(
+					'Optional commit in the parent branch history. Maps to startCommitSha and requires worktreeSource="commit".',
+				),
 		},
-		async ({ chapterId, title, inheritMode }) => {
+		async ({ chapterId, title, inheritMode, worktreeSource, commitSha }) => {
 			try {
 				assertGitAvailableForMcp();
-				const chapter = await chapterFork.fork(chapterId, { title, inheritMode });
+				const chapter = await chapterFork.fork(chapterId, {
+					title,
+					inheritMode,
+					worktreeSource,
+					startCommitSha: commitSha,
+				});
 				return {
 					content: [{ type: "text", text: JSON.stringify(chapter, null, 2) }],
 				};
