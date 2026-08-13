@@ -186,6 +186,277 @@ describe("resolveExitPlanModeInput — path-reference rejection", async () => {
 	});
 });
 
+/**
+ * Once plan content exists in the designated plan file, an inline submission is
+ * refused instead of quietly winning.
+ *
+ * The plan file is not a convenience copy: it is where the model's planning work
+ * was actually recorded, and in strict plan mode it is the only path Write/Edit
+ * are allowed to touch. Letting an inline body through would present the user one
+ * artifact while discarding the other, and the discarded one is usually the more
+ * complete of the two.
+ *
+ * The probe is advisory: it may only refuse by PROVING a conflict. An unreadable
+ * or oversized file proves nothing, and failing there would be worse than
+ * allowing the inline plan — file mode already rejects legacy executors, so
+ * inline has to remain usable on them.
+ */
+describe("resolveExitPlanModeInput — inline blocked by a written plan file", async () => {
+	function writeDesignatedPlan(planFileId: string, body: string) {
+		mkdirSync(join(cwd, ".narrafork"), { recursive: true });
+		writeFileSync(join(cwd, ".narrafork", `plan-${planFileId}.md`), body, "utf-8");
+	}
+
+	const INLINE = "## Inline plan\n\nA complete inline body.";
+
+	it("refuses an inline plan and names the file mode to use instead", async () => {
+		const planFileId = "conflict-written";
+		setActive(planFileId);
+		writeDesignatedPlan(planFileId, "## File plan\n\nThe work actually recorded.");
+
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, { inline_plan: INLINE });
+
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.message).toContain('mode="file"');
+			expect(result.message).toContain(`.narrafork/plan-${planFileId}.md`);
+		}
+		// Neither body is submitted — the file content must not be silently
+		// substituted for the inline declaration either.
+		expect(result.input.plan).toBeUndefined();
+		expect(result.resolvedFromFile).toBe(false);
+	});
+
+	it('refuses an explicitly declared mode="inline" the same way', async () => {
+		const planFileId = "conflict-declared";
+		setActive(planFileId);
+		writeDesignatedPlan(planFileId, "## File plan\n\nAlready written.");
+
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, {
+			mode: "inline",
+			inline_plan: INLINE,
+		});
+
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.message).toContain('mode="file"');
+	});
+
+	it('still submits the file plan for mode="file"', async () => {
+		const planFileId = "conflict-file-mode";
+		setActive(planFileId);
+		const body = "## File plan\n\nSubmitted as declared.";
+		writeDesignatedPlan(planFileId, body);
+
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, {
+			mode: "file",
+			inline_plan: INLINE,
+		});
+
+		expect(result.ok).toBe(true);
+		expect(result.resolvedFromFile).toBe(true);
+		expect(result.input.plan).toBe(body);
+	});
+
+	it("allows an inline plan when no plan file was written", async () => {
+		setActive("conflict-absent");
+
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, { inline_plan: INLINE });
+
+		expect(result.ok).toBe(true);
+		expect(result.input.plan).toBe(INLINE);
+		expect(result.resolvedFromFile).toBe(false);
+	});
+
+	it("allows an inline plan when the plan file exists but is blank", async () => {
+		// A file the model created and never filled is not planning work.
+		const planFileId = "conflict-blank";
+		setActive(planFileId);
+		writeDesignatedPlan(planFileId, "   \n\n");
+
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, { inline_plan: INLINE });
+
+		expect(result.ok).toBe(true);
+		expect(result.input.plan).toBe(INLINE);
+	});
+
+	it("does not apply in relaxed plan mode, where the plan path is model-chosen", async () => {
+		const planFileId = "conflict-relaxed";
+		setActive(planFileId);
+		writeDesignatedPlan(planFileId, "## Some markdown the model wrote earlier.");
+
+		const result = await resolveExitPlanModeInput(
+			NARRATOR_ID,
+			cwd,
+			{ inline_plan: INLINE },
+			"en",
+			true,
+		);
+
+		expect(result.ok).toBe(true);
+		expect(result.input.plan).toBe(INLINE);
+	});
+
+	it("allows an inline plan when the plan file cannot be read at all", async () => {
+		// A legacy executor rejects file-mode submission outright, so a probe failure
+		// must not also close the inline path — that would strand the narrator.
+		setActive("conflict-legacy");
+		const remotePath = "/remote/work/.narrafork/plan-conflict-legacy.md";
+		const { backend, calls } = makeFakeBackend(
+			{
+				[remotePath]: {
+					stat: { isFile: true, isDirectory: false, size: 20 },
+					read: {
+						bytes: new TextEncoder().encode("# file plan"),
+						truncated: false,
+						totalSize: 20,
+					},
+				},
+			},
+			{
+				supportsFsStatResolvedPath: false,
+				supportsFsReadAtomicResolvedPath: false,
+				includeResolvedPath: false,
+			},
+		);
+
+		const result = await resolveExitPlanModeInput(
+			NARRATOR_ID,
+			cwd,
+			{ inline_plan: INLINE },
+			"en",
+			false,
+			backend,
+			{
+				deviceId: backend.deviceId,
+				backendKind: "remote",
+				cwd: "/remote/work",
+				resolvedFilePath: remotePath,
+				selectionSource: "explicit",
+			},
+			".narrafork/plan-conflict-legacy.md",
+		);
+
+		expect(result.ok).toBe(true);
+		expect(result.input.plan).toBe(INLINE);
+		expect(calls.read).toEqual([]);
+	});
+
+	it("keeps the plan-identity boundary fatal even during the advisory probe", async () => {
+		// A malformed plan identity is a boundary violation, not an unreadable file,
+		// so the probe's tolerance must not downgrade it.
+		setActive("../escape");
+
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, { inline_plan: INLINE });
+
+		expect(result.ok).toBe(false);
+		expect(result.input.plan).toBeUndefined();
+	});
+});
+
+/**
+ * `mode` declares where the plan comes from and is VERIFIED, not reinterpreted.
+ *
+ * Without it the source was inferred purely from which optional fields were
+ * present, so a model that declared an inline plan but forgot the body silently
+ * had a previous cycle's plan file submitted under its name.
+ */
+describe("resolveExitPlanModeInput — declared mode", async () => {
+	/** Write the designated plan file so a wrong fallback would be observable. */
+	function writeDesignatedPlan(planFileId: string, body: string) {
+		mkdirSync(join(cwd, ".narrafork"), { recursive: true });
+		writeFileSync(join(cwd, ".narrafork", `plan-${planFileId}.md`), body, "utf-8");
+	}
+
+	it('rejects mode="inline" with no plan body instead of reading the plan file', async () => {
+		const planFileId = "declared-inline";
+		setActive(planFileId);
+		writeDesignatedPlan(planFileId, "## Stale file plan\n\nFrom a previous cycle.");
+
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, { mode: "inline" });
+
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.message).toContain("inline_plan");
+		// The stale file must NOT be submitted under the model's inline declaration.
+		expect(result.input.plan).toBeUndefined();
+		expect(result.resolvedFromFile).toBe(false);
+	});
+
+	it('accepts mode="inline" with a real body', async () => {
+		setActive(undefined);
+		const plan = "## Inline Plan\n\nDo the declared work.";
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, { mode: "inline", plan });
+
+		expect(result.ok).toBe(true);
+		expect(result.input.plan).toBe(plan);
+		expect(result.resolvedFromFile).toBe(false);
+	});
+
+	it('reads the plan file for mode="file" and ignores a stray inline_plan', async () => {
+		const planFileId = "declared-file";
+		setActive(planFileId);
+		const fileContent = "## File Plan\n\nThe authoritative plan.";
+		writeDesignatedPlan(planFileId, fileContent);
+
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, {
+			mode: "file",
+			inline_plan: "## Contradictory inline plan",
+		});
+
+		expect(result.ok).toBe(true);
+		expect(result.resolvedFromFile).toBe(true);
+		expect(result.input.plan).toBe(fileContent);
+	});
+
+	it('does not fall back to inline_plan when a declared mode="file" plan is missing', async () => {
+		setActive(undefined);
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, {
+			mode: "file",
+			inline_plan: "## Inline body that must not rescue a declared file plan",
+		});
+
+		expect(result.ok).toBe(false);
+		expect(result.input.plan).toBeUndefined();
+	});
+
+	it('rejects mode="inline" when the instance disables inline plans', async () => {
+		settings.agent.planModeAllowInlinePlan = false;
+		setActive(undefined);
+
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, {
+			mode: "inline",
+			inline_plan: "## Inline Plan\n\nShould be refused.",
+		});
+
+		expect(result.ok).toBe(false);
+		expect(result.input.plan).toBeUndefined();
+	});
+
+	it("still infers the source when mode is absent or unrecognized", async () => {
+		// Required in the model-facing schema, but a dropped field must not make
+		// the tool unusable — inference remains the fallback.
+		setActive(undefined);
+		const plan = "## Inline Plan\n\nNo mode declared.";
+
+		const missing = await resolveExitPlanModeInput(NARRATOR_ID, cwd, { plan });
+		expect(missing.ok).toBe(true);
+		expect(missing.input.plan).toBe(plan);
+
+		const garbage = await resolveExitPlanModeInput(NARRATOR_ID, cwd, { mode: "nonsense", plan });
+		expect(garbage.ok).toBe(true);
+		expect(garbage.input.plan).toBe(plan);
+	});
+
+	it("accepts a declared mode case-insensitively", async () => {
+		setActive(undefined);
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, {
+			mode: " INLINE ",
+			plan: "## Inline Plan\n\nDeclared loudly.",
+		});
+
+		expect(result.ok).toBe(true);
+	});
+});
+
 describe("resolveExitPlanModeInput — file resolution precedence", async () => {
 	it("prefers the designated plan file and ignores inline junk", async () => {
 		const planFileId = "happy-cat";
@@ -206,7 +477,10 @@ describe("resolveExitPlanModeInput — file resolution precedence", async () => 
 		expect("inline_plan" in result.input).toBe(false);
 	});
 
-	it("uses a complete inline plan without probing the designated remote file", async () => {
+	it("refuses an inline plan once the designated remote file holds plan content", async () => {
+		// A written plan file IS the artifact the user must review. Accepting an
+		// inline body alongside it would show one artifact and silently discard the
+		// other, so the inline submission is refused rather than either one winning.
 		const remotePath = "/remote/work/.narrafork/plan-inline-choice.md";
 		setActive("inline-choice");
 		const { backend, calls } = makeFakeBackend({
@@ -238,11 +512,14 @@ describe("resolveExitPlanModeInput — file resolution precedence", async () => 
 			".narrafork/plan-inline-choice.md",
 		);
 
-		expect(result.ok).toBe(true);
-		expect(result.input.plan).toBe(inlinePlan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.message).toContain('mode="file"');
+		// Neither body is submitted: the file content must not be swapped in under
+		// the model's inline declaration either.
+		expect(result.input.plan).toBeUndefined();
 		expect(result.resolvedFromFile).toBe(false);
-		expect(calls.stat).toEqual([]);
-		expect(calls.read).toEqual([]);
+		// The conflict can only be proven by actually reading the file.
+		expect(calls.read).toEqual([remotePath]);
 	});
 
 	it("does not read a residual plan file from a previous identity", async () => {

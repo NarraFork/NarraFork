@@ -616,7 +616,7 @@ function* flushPartialContent(
 // Cadence (in completed tool calls) for the periodic spec (tasks.json) reminder.
 // Named for the legacy todo reminder it replaced; still the spec-reminder interval.
 export const TODO_REMINDER_TOOL_INTERVAL = 15;
-const DEFAULT_SILENT_TOOL_CALL_THRESHOLD = 20;
+const DEFAULT_SILENT_TOOL_CALL_THRESHOLD = 50;
 
 const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"Read",
@@ -985,18 +985,6 @@ export function buildDangerReflectionPrompt(
 	return `${basePrompt}\n\n${heading}\n${appendPrompt}`;
 }
 
-function formatAllowedPrompts(value: unknown): string {
-	if (!Array.isArray(value) || value.length === 0) return "- (none)";
-	const items = value.flatMap((entry) => {
-		if (!entry || typeof entry !== "object") return [];
-		const tool = (entry as { tool?: unknown }).tool;
-		const prompt = (entry as { prompt?: unknown }).prompt;
-		if (typeof prompt !== "string" || !prompt.trim()) return [];
-		return [`- ${typeof tool === "string" && tool ? `${tool}: ` : ""}${prompt.trim()}`];
-	});
-	return items.length > 0 ? items.join("\n") : "- (none)";
-}
-
 type ExitPlanReflectionAutoCompactConfig = Pick<AgentConfig, "planReflectionAllowAutoCompact">;
 
 export function shouldAllowExitPlanReflectionAutoCompact(
@@ -1025,8 +1013,7 @@ export function buildExitPlanReflectionPrompt(
 	const basePrompt = getPrompt("exitPlanReflection", locale)
 		.replaceAll("{requestId}", requestId)
 		.replaceAll("{inputJson}", JSON.stringify(input, null, 2))
-		.replaceAll("{planText}", planText)
-		.replaceAll("{allowedPromptsList}", formatAllowedPrompts(input.allowedPrompts));
+		.replaceAll("{planText}", planText);
 	if (!shouldAllowExitPlanReflectionAutoCompact(config)) return basePrompt;
 	return `${basePrompt}\n\n${getPrompt("exitPlanReflectionAutoCompact", locale)}`;
 }

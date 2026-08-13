@@ -393,7 +393,7 @@ export function AgentSection(props: AgentSectionProps) {
 				label={t("silentToolCallThreshold")}
 				description={t("silentToolCallThresholdDesc")}
 				value={props.silentToolCallThreshold}
-				onChange={(v) => props.setSilentToolCallThreshold(typeof v === "number" ? v : 20)}
+				onChange={(v) => props.setSilentToolCallThreshold(typeof v === "number" ? v : 50)}
 				min={-1}
 				max={1000}
 				step={1}

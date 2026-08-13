@@ -228,35 +228,49 @@ function convertNumber(schema: z.ZodNumber): Record<string, unknown> {
 
 /**
  * Ensure a JSON Schema has at least one required property.
- * parameters, so we inject a dummy `confirm` property when needed.
+ *
+ * parameter, so a schema of all-optional fields needs SOMETHING marked required.
+ *
+ * That "something" is always an injected dummy `confirm`, never an existing
+ * field. The previous implementation promoted `Object.keys(props)[0]` instead,
+ * which lies to the model about the tool's contract — and the lie lands on
+ * whichever property happens to be declared first:
+ *
+ *   - ExitPlanMode advertised `allowedPrompts` (an advisory note field) as its
+ *     ONLY required parameter while `inline_plan`, the parameter that actually
+ *     carries the plan, stayed optional. Models dutifully invented permission
+ *     declarations they had no basis for, and that fabricated list is what
+ *     users saw in the tool-call inspector.
+ *   - EnterPlanMode advertised `plan_name` as required even though its own
+ *     description promises a generated name when omitted.
+ *   - Agent advertised `description` as required, which is wrong for `stop`.
+ *
+ * A `const: true` dummy leaves the model no room to invent anything, and no
+ * real field's optionality is misrepresented. Zod schemas strip unknown keys,
+ * so an actually-passed `confirm` is dropped before `execute()` and never
+ * trips tool-executor's `safeParse`.
+ *
+ * copy for the plugin bundle (it cannot import zod); the two are pinned
  */
 export function ensureNonEmptySchema(schema: Record<string, unknown>): Record<string, unknown> {
-	const props = schema.properties as Record<string, unknown> | undefined;
 	const required = schema.required as string[] | undefined;
 
 	// Already has required params — nothing to do
 	if (required && required.length > 0) return schema;
 
-	// Has no properties at all — inject a dummy
-	if (!props || Object.keys(props).length === 0) {
-		return {
-			...schema,
-			properties: {
-				confirm: {
-					type: "boolean",
-					description: "Dummy parameter (always pass true)",
-					const: true,
-					default: true,
-				},
-			},
-			required: ["confirm"],
-		};
-	}
-
-	// Has properties but none required — pick the first one and make it required
+	const props = schema.properties as Record<string, unknown> | undefined;
 	return {
 		...schema,
-		required: [Object.keys(props)[0]],
+		properties: {
+			...(props ?? {}),
+			confirm: {
+				type: "boolean",
+				description: "Dummy parameter (always pass true)",
+				const: true,
+				default: true,
+			},
+		},
+		required: ["confirm"],
 	};
 }
 

@@ -1390,6 +1390,26 @@ describe("ExitPlanMode reflection gate", () => {
 			EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
 		);
 	});
+
+	// `allowedPrompts` never granted a permission — its only consumer was a
+	// section of this prompt. It is retired, so neither the section nor an
+	// unreplaced placeholder may survive in either locale.
+	test("no retired allowedPrompts section or leftover placeholder", () => {
+		setPlanReflectionAllowAutoCompact(false);
+		const input = {
+			plan: "Implement the approved change.",
+			allowedPrompts: [{ tool: "Bash", prompt: "install dependencies" }],
+		};
+
+		for (const locale of ["en", "zh-CN"] as const) {
+			const prompt = buildExitPlanReflectionPrompt("req-1", input, locale);
+			expect(prompt).not.toContain("{allowedPromptsList}");
+			expect(prompt).not.toContain("Prompt-based permissions requested");
+			expect(prompt).not.toContain("可选的实现权限说明");
+			// The plan itself still reaches the reflection loop.
+			expect(prompt).toContain("Implement the approved change.");
+		}
+	});
 });
 
 describe("taskReflection protected-task repair guidance", () => {

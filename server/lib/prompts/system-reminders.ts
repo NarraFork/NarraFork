@@ -145,7 +145,9 @@ const planFileStateSection: LocalizedValue<(planFile: string, bytes: number) => 
 This OVERRIDES the "use Write for the first section" step above:
 1. Read \`${planFile}\` first to recover what you already planned.
 2. Use Edit to patch or append. Write on this path REPLACES the entire file and would destroy the existing plan.
-3. Use Write only when you deliberately intend to discard the existing draft and restart the plan from scratch.`,
+3. Use Write only when you deliberately intend to discard the existing draft and restart the plan from scratch.
+
+It also NARROWS your submission choice: because this file holds plan content, \`mode: "inline"\` is refused and only \`mode: "file"\` is accepted. Submitting inline would show the user a fresh body while the plan recorded here is ignored. If this file is stale or wrong, fix the file and submit it — do not route around it with an inline plan.`,
 	"zh-CN": (planFile, bytes) => `## 指定计划文件 — 当前状态
 
 \`${planFile}\` 已存在，其中有 ${bytes} 字节的计划内容，是你在本轮计划周期中先前写入的。此后对话历史可能已被压缩，因此不要假设你还记得里面的内容。
@@ -153,7 +155,9 @@ This OVERRIDES the "use Write for the first section" step above:
 这条覆盖上面「用 Write 写首段」的步骤：
 1. 先 Read \`${planFile}\`，恢复你已经写好的计划。
 2. 用 Edit 修补或追加。对该路径使用 Write 会整体替换文件，销毁已有计划。
-3. 只有当你确实打算废弃现有草稿、从零重写计划时，才使用 Write。`,
+3. 只有当你确实打算废弃现有草稿、从零重写计划时，才使用 Write。
+
+它同时收窄了你的提交方式：由于该文件已有计划内容，\`mode: "inline"\` 会被拒绝，只接受 \`mode: "file"\`。内联提交会让用户看到一份新写的正文，而这里记录的计划被忽略。如果该文件已过时或有误，请修正文件后提交 — 不要用内联计划绕过它。`,
 };
 
 const planModeSystemReminder: LocalizedValue<
@@ -184,19 +188,19 @@ ${
 	allowInline
 		? `## Plan Submission — Two Modes
 
-You have two ways to submit your plan (choose ONE):
+ExitPlanMode requires a \`mode\` parameter declaring where your plan comes from. It is a declaration the system verifies, not a hint — a mismatch is rejected rather than silently reinterpreted.
 
-### Mode A: Inline (for short/medium plans)
-Call ExitPlanMode with the \`inline_plan\` parameter containing your complete plan text itself. This must be the ACTUAL plan content — never a file path or a reference like \`plan_path: ...\`.
+### \`mode: "inline"\` (for short/medium plans)
+Call ExitPlanMode with \`mode: "inline"\` and the \`inline_plan\` parameter containing your complete plan text itself. This must be the ACTUAL plan content — never a file path or a reference like \`plan_path: ...\`. Declaring \`"inline"\` without a real plan body is an error; it will NOT fall back to reading the plan file.
 
-### Mode B: File-based (for complex/long plans — RECOMMENDED for large plans)
+### \`mode: "file"\` (for complex/long plans — RECOMMENDED for large plans)
 1. Write your plan incrementally to \`${planFile}\` using the Write tool (first section) and Edit tool (append subsequent sections). You MUST use the exact path \`${planFile}\` — writes to other paths will be rejected.
-2. When done, call ExitPlanMode WITHOUT the \`inline_plan\` parameter. The system will automatically read \`${planFile}\` and present its content to the user.`
+2. When done, call ExitPlanMode with \`mode: "file"\` and no \`inline_plan\`. The system will automatically read \`${planFile}\` and present its content to the user.`
 		: `## Plan Submission — File-based only
 
-Inline plans are disabled in this instance. You MUST submit your plan via the designated plan file:
+Inline plans are disabled in this instance, so ExitPlanMode's required \`mode\` parameter accepts only \`"file"\`. You MUST submit your plan via the designated plan file:
 1. Write your plan incrementally to \`${planFile}\` using the Write tool (first section) and Edit tool (append subsequent sections). You MUST use the exact path \`${planFile}\` — writes to other paths will be rejected.
-2. When done, call ExitPlanMode (it takes no plan parameter). The system will automatically read \`${planFile}\` and present its content to the user.`
+2. When done, call ExitPlanMode with \`mode: "file"\`. The system will automatically read \`${planFile}\` and present its content to the user.`
 }
 ${planFileState}
 ## Revising a Rejected File-based Plan
@@ -234,19 +238,19 @@ ${
 	allowInline
 		? `## 计划提交 — 两种模式
 
-你有两种方式提交计划（选择其一）：
+ExitPlanMode 有一个必填的 \`mode\` 参数，用于声明计划的来源。它是系统会校验的声明，不是提示 — 声明与实际不一致会被拒绝，而不会被静默改判。
 
-### 模式 A：内联（适用于短/中等长度的计划）
-调用 ExitPlanMode，在 \`inline_plan\` 参数中填入完整的计划正文本身。这里必须是真正的计划内容 — 绝不能是文件路径或类似 \`plan_path: ...\` 的引用。
+### \`mode: "inline"\`（适用于短/中等长度的计划）
+调用 ExitPlanMode，传 \`mode: "inline"\`，并在 \`inline_plan\` 参数中填入完整的计划正文本身。这里必须是真正的计划内容 — 绝不能是文件路径或类似 \`plan_path: ...\` 的引用。声明了 \`"inline"\` 却没有提供计划正文会直接报错，不会回退去读计划文件。
 
-### 模式 B：文件模式（适用于复杂/长计划 — 推荐用于大型计划）
+### \`mode: "file"\`（适用于复杂/长计划 — 推荐用于大型计划）
 1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。你必须使用准确的路径 \`${planFile}\` — 写入其他路径将被拒绝。
-2. 完成后，直接调用 ExitPlanMode，不需要传 \`inline_plan\` 参数。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
+2. 完成后，调用 ExitPlanMode 并传 \`mode: "file"\`，不要传 \`inline_plan\`。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
 		: `## 计划提交 — 仅支持文件模式
 
-本实例已禁用内联计划。你必须通过指定的计划文件提交计划：
+本实例已禁用内联计划，因此 ExitPlanMode 必填的 \`mode\` 参数只接受 \`"file"\`。你必须通过指定的计划文件提交计划：
 1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。你必须使用准确的路径 \`${planFile}\` — 写入其他路径将被拒绝。
-2. 完成后，直接调用 ExitPlanMode（它不接受 plan 参数）。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
+2. 完成后，调用 ExitPlanMode 并传 \`mode: "file"\`。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
 }
 ${planFileState}
 ## 修改被拒绝的文件模式计划

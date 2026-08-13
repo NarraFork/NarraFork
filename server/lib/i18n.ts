@@ -154,24 +154,28 @@ In plan mode, Write/Edit operations are restricted to the plan file only.`,
 			"[计划模式] 用户拒绝了你的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改你的计划，然后再次调用 ExitPlanMode 提交。不要尝试写代码或做任何修改——你必须先退出计划模式。",
 	},
 	"tool.exitPlanModeDeniedFile": {
-		en: "[PLAN MODE] The user rejected your file-based plan. You are STILL in plan mode. Revise the designated plan file, then call ExitPlanMode again without the 'inline_plan' parameter so the system rereads it. If the feedback only requires a small change, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.",
+		en: '[PLAN MODE] The user rejected your file-based plan. You are STILL in plan mode. Revise the designated plan file, then call ExitPlanMode again with mode="file" so the system rereads it. If the feedback only requires a small change, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.',
 		"zh-CN":
-			"[计划模式] 用户拒绝了你通过计划文件提交的计划。你仍然处于计划模式中。请修改指定的计划文件，然后再次调用 ExitPlanMode（不传 'inline_plan' 参数），让系统重新读取该文件。若反馈只需要小幅调整，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。",
+			'[计划模式] 用户拒绝了你通过计划文件提交的计划。你仍然处于计划模式中。请修改指定的计划文件，然后以 mode="file" 再次调用 ExitPlanMode，让系统重新读取该文件。若反馈只需要小幅调整，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。',
 	},
 	"tool.exitPlanModeDeniedFileWithMessage": {
-		en: "[PLAN MODE] The user rejected your file-based plan with the following feedback: {message}\n\nYou are STILL in plan mode. Revise the designated plan file based on this feedback, then call ExitPlanMode again without the 'inline_plan' parameter so the system rereads it. If the requested change is small, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.",
+		en: '[PLAN MODE] The user rejected your file-based plan with the following feedback: {message}\n\nYou are STILL in plan mode. Revise the designated plan file based on this feedback, then call ExitPlanMode again with mode="file" so the system rereads it. If the requested change is small, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.',
 		"zh-CN":
-			"[计划模式] 用户拒绝了你通过计划文件提交的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改指定的计划文件，然后再次调用 ExitPlanMode（不传 'inline_plan' 参数），让系统重新读取该文件。若请求的改动较小，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。",
+			'[计划模式] 用户拒绝了你通过计划文件提交的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改指定的计划文件，然后以 mode="file" 再次调用 ExitPlanMode，让系统重新读取该文件。若请求的改动较小，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。',
 	},
+	// Reached only when NO plan content was obtained from either source. Both routes
+	// are offered without preference: naming one as "the" fix would be wrong for the
+	// case the model actually hit (a declared `file` plan whose file is empty must not
+	// be told to retry inline, since inline fallback is refused under that declaration).
 	"tool.exitPlanModeEmptyPlan": {
-		en: "Error: The plan content is empty. Either provide a non-empty plan in the 'inline_plan' parameter, or write your plan to the designated plan file ({planFile}) first — the system will read it automatically when you call ExitPlanMode without the 'inline_plan' parameter.",
+		en: 'Error: The plan content is empty — neither an inline plan body nor the designated plan file ({planFile}) produced any plan. Pick one and make it real: put the COMPLETE plan text in \'inline_plan\' and call ExitPlanMode with mode="inline", or write the plan into {planFile} and call ExitPlanMode with mode="file". A declared mode is verified, so it must match the source you actually filled in.',
 		"zh-CN":
-			"错误：计划内容为空。请在 'inline_plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件（{planFile}）— 当你不传 'inline_plan' 参数调用 ExitPlanMode 时，系统会自动读取该文件。",
+			'错误：计划内容为空 — 内联计划正文和指定的计划文件（{planFile}）都没有提供任何计划。请选定其中一条并落实：把完整的计划正文放入 \'inline_plan\' 并以 mode="inline" 调用 ExitPlanMode，或把计划写入 {planFile} 并以 mode="file" 调用 ExitPlanMode。声明的 mode 会被校验，因此必须与你实际填写的来源一致。',
 	},
 	"tool.exitPlanModeEmptyPlanFallback": {
-		en: "Error: The plan content is empty. Provide a non-empty plan in the 'inline_plan' parameter or write it to the designated plan file first.",
+		en: 'Error: The plan content is empty. Provide the complete plan in \'inline_plan\' with mode="inline", or write it to the designated plan file and submit with mode="file".',
 		"zh-CN":
-			"错误：计划内容为空。请在 'inline_plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件。",
+			'错误：计划内容为空。请在 \'inline_plan\' 中提供完整计划并以 mode="inline" 提交，或将其写入指定的计划文件后以 mode="file" 提交。',
 	},
 	"tool.exitPlanModeCustomFileNotFound": {
 		en: "Error: The specified plan file \"{planFile}\" does not exist or is empty. Please write your plan to this file first, or omit the 'plan_file_path' parameter to use the default designated plan file.",
@@ -187,10 +191,25 @@ In plan mode, Write/Edit operations are restricted to the plan file only.`,
 		"zh-CN":
 			'错误：计划文件 "{planFile}" 超过最大支持大小 {maxBytes} 字节。请将计划拆分到更小的文件中。',
 	},
-	"tool.exitPlanModePathReference": {
-		en: "Error: The 'inline_plan' parameter looks like a file path or location reference, not the actual plan. The 'inline_plan' parameter must contain the COMPLETE plan text itself (all steps, file changes, reasoning) — this is what the user reviews. Do NOT pass a path like 'plan_path: ...' or a file reference. Either paste the full plan body into 'inline_plan', or write your plan to the designated plan file ({planFile}) and call ExitPlanMode WITHOUT the 'inline_plan' parameter so the system reads it automatically.",
+	"tool.exitPlanModeInlineWithExistingPlanFile": {
+		en: 'Error: You already wrote {bytes} bytes of plan content to the designated plan file ({planFile}), so an inline submission is refused: the user would review the inline text while the file that recorded your actual planning work is ignored. Call ExitPlanMode with mode="file" to submit what you wrote. If the plan file is stale or wrong, use Read to check it and Write to replace its content, then submit it with mode="file".',
 		"zh-CN":
-			"错误：'inline_plan' 参数看起来是一个文件路径或位置引用，而不是真正的计划内容。'inline_plan' 参数必须包含完整的计划正文本身（所有步骤、文件改动、推理）— 这是用户要审阅的内容。不要传入类似 'plan_path: ...' 的路径或文件引用。请将完整的计划正文粘贴到 'inline_plan' 中，或将计划写入指定的计划文件（{planFile}）后不带 'inline_plan' 参数调用 ExitPlanMode，让系统自动读取。",
+			'错误：你已经向指定的计划文件（{planFile}）写入了 {bytes} 字节的计划内容，因此内联提交被拒绝：那会让用户审阅内联文本，而记录了你实际规划工作的文件被忽略。请以 mode="file" 调用 ExitPlanMode 来提交你写好的内容。如果计划文件已过时或有误，请用 Read 检查、用 Write 替换其内容，然后以 mode="file" 提交。',
+	},
+	"tool.exitPlanModeInlineModeDisabled": {
+		en: 'Error: mode="inline" is disabled in this instance. Write your complete plan to the designated plan file ({planFile}), then call ExitPlanMode with mode="file".',
+		"zh-CN":
+			'错误：本实例已禁用 mode="inline"。请将完整计划写入指定的计划文件（{planFile}），然后以 mode="file" 调用 ExitPlanMode。',
+	},
+	"tool.exitPlanModeInlineWithoutBody": {
+		en: "Error: You declared mode=\"inline\" but did not provide a plan body in 'inline_plan'. This is not treated as a request to read the plan file — a declared inline plan must carry its own content. Either put the COMPLETE plan text in 'inline_plan', or declare mode=\"file\" to submit the plan you wrote to {planFile}.",
+		"zh-CN":
+			"错误：你声明了 mode=\"inline\"，但没有在 'inline_plan' 中提供计划正文。这不会被当作读取计划文件的请求 — 声明为内联的计划必须自带内容。请把完整的计划正文放入 'inline_plan'，或改为声明 mode=\"file\" 来提交你写入 {planFile} 的计划。",
+	},
+	"tool.exitPlanModePathReference": {
+		en: "Error: The 'inline_plan' parameter looks like a file path or location reference, not the actual plan. The 'inline_plan' parameter must contain the COMPLETE plan text itself (all steps, file changes, reasoning) — this is what the user reviews. Do NOT pass a path like 'plan_path: ...' or a file reference. Either paste the full plan body into 'inline_plan' and submit with mode=\"inline\", or write your plan to the designated plan file ({planFile}) and call ExitPlanMode with mode=\"file\" so the system reads it.",
+		"zh-CN":
+			"错误：'inline_plan' 参数看起来是一个文件路径或位置引用，而不是真正的计划内容。'inline_plan' 参数必须包含完整的计划正文本身（所有步骤、文件改动、推理）— 这是用户要审阅的内容。不要传入类似 'plan_path: ...' 的路径或文件引用。请将完整的计划正文粘贴到 'inline_plan' 并以 mode=\"inline\" 提交，或将计划写入指定的计划文件（{planFile}）后以 mode=\"file\" 调用 ExitPlanMode，让系统读取。",
 	},
 	"tool.planModeSoftDenyAskReason": {
 		en: "[Plan Mode] This operation is blocked by plan mode restrictions. Allow to enable relaxed plan mode (tools remain available during planning).",
@@ -823,6 +842,9 @@ export type ToolMessageKey =
 	| "exitPlanModeCustomFileNotFound"
 	| "exitPlanModePlanFileInvalid"
 	| "exitPlanModePlanFileTooLarge"
+	| "exitPlanModeInlineWithExistingPlanFile"
+	| "exitPlanModeInlineModeDisabled"
+	| "exitPlanModeInlineWithoutBody"
 	| "exitPlanModePathReference"
 	| "planModeSoftDenyAskReason"
 	| "planModeToolDisabled"

@@ -253,9 +253,6 @@ Original ExitPlanMode input:
 Resolved plan:
 {planText}
 
-Prompt-based permissions requested:
-{allowedPromptsList}
-
 Review the plan for readiness before it reaches the user. Check that it is specific, actionable, scoped to the request, and does not contain unresolved choices that should have been clarified first.
 
 You have exactly one response, and you MUST call exactly one allowed tool:
@@ -271,9 +268,6 @@ Do not call ExitPlanMode from this reflection loop.`,
 
 已解析计划：
 {planText}
-
-可选的实现权限说明（仅用于就绪度检查，不授予权限）：
-{allowedPromptsList}
 
 请在计划触达用户前检查其是否已准备好：是否具体、可执行、范围匹配用户请求，并且没有本应提前澄清的未决选择。
 

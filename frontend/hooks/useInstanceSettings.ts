@@ -172,7 +172,7 @@ function makeDefaults(): InstanceSettingsState {
 		dangerSkipReadOnlyConfirmations: false,
 		autoContinuationMode: "protectedOnly",
 		maxTransientRetries: 10,
-		silentToolCallThreshold: 20,
+		silentToolCallThreshold: 50,
 		pipelineUnusedToolCallThreshold: 10,
 		behaviorFenceInterval: -1,
 		tasksReminderInterval: 15,
@@ -279,7 +279,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					(settings.agent?.autoContinuationMode as AutoContinuationMode | undefined) ??
 					"protectedOnly",
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
-				silentToolCallThreshold: settings.agent?.silentToolCallThreshold ?? 20,
+				silentToolCallThreshold: settings.agent?.silentToolCallThreshold ?? 50,
 				pipelineUnusedToolCallThreshold: settings.agent?.pipelineUnusedToolCallThreshold ?? 10,
 				behaviorFenceInterval: settings.agent?.behaviorFenceInterval ?? -1,
 				tasksReminderInterval: settings.agent?.tasksReminderInterval ?? 15,

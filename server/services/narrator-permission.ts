@@ -32,6 +32,11 @@ import {
 	isKnowledgeReadAction,
 	KNOWLEDGE_MERGE_ACTION_SET,
 } from "../lib/agent/tools/knowledge-actions";
+import {
+	EXIT_PLAN_MODE_FILE,
+	EXIT_PLAN_MODE_INLINE,
+	readDeclaredExitPlanMode,
+} from "../lib/agent/tools/plan-mode";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import type { ToolExecutionTarget } from "../lib/agent/types";
 import {
@@ -2592,9 +2597,66 @@ export async function resolveExitPlanModeInputWithBackend(
 		active?._planFilePath ??
 		(planFileId ? `.narrafork/plan-${planFileId}.md` : null);
 	const planFileName = customPlanFilePath ?? defaultPlanFilePath;
+
+	// `mode` is a DECLARATION of where the plan comes from, verified rather than
+	// reinterpreted. Its whole purpose is to stop the source from being guessed
+	// from which optional fields happen to be present: under pure inference, a
+	// model that declared an inline plan but forgot the body silently got a
+	// previous cycle's plan file submitted under its name.
+	//
+	// A missing `mode` still falls back to inference. It is required in the
+	// model-facing schema, so a compliant model always sends it; erroring here
+	// instead would make ExitPlanMode unusable for any model or gateway that
+	// drops the field, turning a corrective nudge into a dead tool.
+	const declaredMode = readDeclaredExitPlanMode(input);
+
+	if (declaredMode === EXIT_PLAN_MODE_INLINE && !allowInlinePlan) {
+		return {
+			ok: false,
+			input: stripPlanFileInput(effectiveInput),
+			resolvedFromFile: false,
+			message: getToolMessageWithParams("exitPlanModeInlineModeDisabled", locale, {
+				planFile: planFileName ?? ".narrafork/plan-<id>.md",
+			}),
+		};
+	}
+
+	// Declared inline with nothing in `inline_plan`: report the contradiction
+	// instead of quietly reading a file the model did not point at.
+	if (declaredMode === EXIT_PLAN_MODE_INLINE && !normalizedInlinePlan) {
+		return {
+			ok: false,
+			input: stripPlanFileInput(effectiveInput),
+			resolvedFromFile: false,
+			message: getToolMessageWithParams("exitPlanModeInlineWithoutBody", locale, {
+				planFile: planFileName ?? ".narrafork/plan-<id>.md",
+			}),
+		};
+	}
+
+	// Strict plan mode: an inline submission is still checked against the designated
+	// plan file. Once the model has written a plan there, that file IS the work the
+	// user has to review — accepting an inline body instead would show the user one
+	// artifact while silently discarding the other. Relaxed plan mode is excluded:
+	// its plan path is model-chosen, so "a file exists" proves nothing about intent.
+	//
+	// This probe is advisory: it may only REFUSE an inline plan by proving a
+	// conflicting file exists, never fail one because the file could not be read.
+	const inlineConflictProbeOnly =
+		!isRelaxedPlan && hasCompleteInlinePlan && declaredMode !== EXIT_PLAN_MODE_FILE;
+
 	const shouldResolveFilePlan =
-		!!planFileName && (!!suppliedPlanFilePath || !hasCompleteInlinePlan);
+		!!planFileName &&
+		(declaredMode === EXIT_PLAN_MODE_FILE ||
+			inlineConflictProbeOnly ||
+			// Declared inline never reads a file to SUBSTITUTE a plan: a bad inline
+			// body must surface as an inline error, not be papered over by whatever
+			// the plan file holds.
+			(declaredMode !== EXIT_PLAN_MODE_INLINE &&
+				(!!suppliedPlanFilePath || !hasCompleteInlinePlan)));
 	let planFileError: PlanFileResolutionError | undefined;
+	/** Bytes of plan content proven to be on disk, for the inline-conflict refusal. */
+	let planFileContentBytes: number | undefined;
 	const baseCwd = executionTarget?.cwd ?? toolBaseCwd(backend, cwd);
 
 	if (
@@ -2620,6 +2682,10 @@ export async function resolveExitPlanModeInputWithBackend(
 	) {
 		planFileError = "invalid";
 	}
+	// Errors found by the identity/path pre-validation above stay fatal even for the
+	// advisory conflict probe: they mean the narrator's plan identity or the supplied
+	// path is malformed, which is a boundary violation rather than an unreadable file.
+	const preReadPlanFileError = planFileError;
 	if (shouldResolveFilePlan && planFileName && !planFileError) {
 		const requestedPath = resolveBackendPath(backend, baseCwd, planFileName);
 		const frozenLexicalPath = executionTarget?.lexicalPath ?? executionTarget?.resolvedFilePath;
@@ -2718,23 +2784,30 @@ export async function resolveExitPlanModeInputWithBackend(
 								} else {
 									const content = new TextDecoder().decode(file.bytes);
 									if (content.trim()) {
-										const {
-											inline_plan: _inlineIgnored,
-											plan_file_path: _pathIgnored,
-											...restForFile
-										} = effectiveInput;
-										effectiveInput = {
-											...restForFile,
-											plan: content,
-											_planFile: planFileName,
-										};
-										resolvedFromFile = true;
-										planSource = {
-											kind: "file",
-											path: requestedPath,
-											resolvedPath: canonicalPath,
-											custom: !!customPlanFilePath,
-										};
+										if (inlineConflictProbeOnly) {
+											// Only record the conflict. Substituting this content for the
+											// model's inline body would swap the artifact under review;
+											// the refusal below sends the model back to declare `file`.
+											planFileContentBytes = file.bytes.byteLength;
+										} else {
+											const {
+												inline_plan: _inlineIgnored,
+												plan_file_path: _pathIgnored,
+												...restForFile
+											} = effectiveInput;
+											effectiveInput = {
+												...restForFile,
+												plan: content,
+												_planFile: planFileName,
+											};
+											resolvedFromFile = true;
+											planSource = {
+												kind: "file",
+												path: requestedPath,
+												resolvedPath: canonicalPath,
+												custom: !!customPlanFilePath,
+											};
+										}
 									}
 								}
 							}
@@ -2746,6 +2819,28 @@ export async function resolveExitPlanModeInputWithBackend(
 				planFileError = "invalid";
 			}
 		}
+	}
+
+	// The conflict probe must not be able to fail a submission. A plan file that is
+	// unreadable, oversized, or on a legacy executor proves nothing about a conflict,
+	// and treating it as fatal would leave no usable way out of plan mode: file mode
+	// already rejects those executors, so inline has to stay available.
+	if (inlineConflictProbeOnly && planFileError && !preReadPlanFileError) {
+		planFileError = undefined;
+		planFileContentBytes = undefined;
+	}
+
+	// Proven conflict: plan content is on disk AND the model tried to submit inline.
+	if (planFileContentBytes !== undefined && planFileName) {
+		return {
+			ok: false,
+			input: stripPlanFileInput(effectiveInput),
+			resolvedFromFile: false,
+			message: getToolMessageWithParams("exitPlanModeInlineWithExistingPlanFile", locale, {
+				planFile: planFileName,
+				bytes: planFileContentBytes,
+			}),
+		};
 	}
 
 	if (planFileError) {
@@ -2778,7 +2873,12 @@ export async function resolveExitPlanModeInputWithBackend(
 		};
 	}
 
-	if (!resolvedFromFile && allowInlinePlan) {
+	// A declared `file` plan that produced no content must NOT silently fall back
+	// to `inline_plan`: the model said the plan lives in a file, so the failure
+	// belongs to that file and is reported below as an empty plan.
+	const inlineFallbackAllowed = declaredMode !== EXIT_PLAN_MODE_FILE;
+
+	if (!resolvedFromFile && allowInlinePlan && inlineFallbackAllowed) {
 		const inlinePlan = normalizedInlinePlan;
 		if (inlinePlan) {
 			if (looksLikePathReference(inlinePlan)) {
@@ -2807,7 +2907,7 @@ export async function resolveExitPlanModeInputWithBackend(
 			const { inline_plan: _inlineIgnored, plan_file_path: _pathIgnored, ...rest } = effectiveInput;
 			effectiveInput = rest;
 		}
-	} else if (!allowInlinePlan && !resolvedFromFile) {
+	} else if ((!allowInlinePlan || !inlineFallbackAllowed) && !resolvedFromFile) {
 		const {
 			plan: _ignored,
 			inline_plan: _inlineIgnored,

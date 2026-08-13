@@ -113,9 +113,9 @@ const EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION =
 	"The COMPLETE implementation plan text itself, in markdown format. " +
 	"This must be the ACTUAL plan content (all steps, file changes, and reasoning) — " +
 	"NOT a file path, a location, or a reference like 'plan_path: ...' or 'see FILE.md'. " +
-	"The verbatim text you put here is what the user reviews and approves. Cannot be empty. " +
-	"Omit this parameter entirely if you already wrote the plan to the designated plan file — " +
-	"the system will read that file automatically. Do not put the file path here.";
+	"The verbatim text you put here is what the user reviews and approves. " +
+	'Required when you declare mode="inline", and cannot be empty. ' +
+	'Ignored when you declare mode="file" — do not put a file path here.';
 
 const EXIT_PLAN_FILE_PATH_PARAM_DESCRIPTION =
 	"Path to a custom plan file (relative to cwd or absolute). " +
@@ -123,31 +123,73 @@ const EXIT_PLAN_FILE_PATH_PARAM_DESCRIPTION =
 	"If provided, the system reads the plan content from this file instead of the default designated plan file. " +
 	"The file must exist and contain the complete plan in markdown format.";
 
-const EXIT_PLAN_ALLOWED_PROMPTS_SCHEMA = {
-	description:
-		"Optional notes for the ExitPlanMode readiness self-check about command categories the plan may require. These do not grant permissions after approval.",
-	type: "array",
-	items: {
-		type: "object",
-		properties: {
-			tool: {
-				description: "The tool this prompt applies to",
-				type: "string",
-				enum: ["Bash"],
-			},
-			prompt: {
-				description: 'Semantic description of the action, e.g. "run tests", "install dependencies"',
-				type: "string",
-			},
-		},
-		required: ["tool", "prompt"],
-		additionalProperties: false,
-	},
-} as const;
+/**
+ * Retired parameter, kept only on the Zod side for backward compatibility.
+ *
+ * `allowedPrompts` was copied from an upstream design where approving a plan
+ * also pre-authorized a set of commands. NarraFork never implemented that: the
+ * only consumer was a line in the exitPlanMode reflection prompt, and no
+ * permission was ever granted from it. Worse, being the first declared property
+ * so models fabricated permission declarations to satisfy a field that did
+ * nothing. It is no longer advertised to models; the Zod field remains optional
+ * so historical `inputJson` and any model still sending it keep parsing.
+ */
+const EXIT_PLAN_ALLOWED_PROMPTS_DEPRECATED_DESCRIPTION =
+	"Deprecated and ignored. Retained only so historical tool calls keep parsing; " +
+	"it grants no permissions and is not read by anything.";
+
+/**
+ * The two plan sources a model can declare via ExitPlanMode's required `mode`.
+ *
+ * `mode` is a DECLARATION the resolution layer verifies, not a hint it may
+ * reinterpret: declaring `inline` without a plan body is an error rather than a
+ * silent fallback to reading the plan file. Before `mode` existed the source was
+ * inferred purely from which optional fields were present, so a model that
+ * forgot the body got a stale file's plan submitted under its name.
+ */
+export const EXIT_PLAN_MODE_INLINE = "inline";
+export const EXIT_PLAN_MODE_FILE = "file";
+export type ExitPlanModeSource = typeof EXIT_PLAN_MODE_INLINE | typeof EXIT_PLAN_MODE_FILE;
+
+/** Read the declared mode off a raw tool input, if it is one of the known values. */
+export function readDeclaredExitPlanMode(input: {
+	mode?: unknown;
+}): ExitPlanModeSource | undefined {
+	const mode = typeof input.mode === "string" ? input.mode.trim().toLowerCase() : "";
+	if (mode === EXIT_PLAN_MODE_INLINE) return EXIT_PLAN_MODE_INLINE;
+	if (mode === EXIT_PLAN_MODE_FILE) return EXIT_PLAN_MODE_FILE;
+	return undefined;
+}
 
 /** Inline plan is allowed unless the instance setting explicitly disables it. */
 function isInlinePlanAllowed(config?: AgentConfig): boolean {
 	return config?.planAllowInlinePlan !== false;
+}
+
+/**
+ * The `mode` values this instance accepts.
+ *
+ * Narrowed to `["file"]` when inline plans are disabled: offering `"inline"`
+ * there would advertise a choice the resolution layer is guaranteed to reject.
+ */
+function exitPlanModeValues(allowInline: boolean): readonly string[] {
+	return allowInline ? [EXIT_PLAN_MODE_INLINE, EXIT_PLAN_MODE_FILE] : [EXIT_PLAN_MODE_FILE];
+}
+
+function buildExitPlanModeParamDescription(allowInline: boolean): string {
+	if (!allowInline) {
+		return (
+			'Where the plan comes from. This instance only accepts "file": write the plan to the ' +
+			"designated plan file, then declare this mode so the system reads it."
+		);
+	}
+	return (
+		"Where the plan comes from, declared explicitly. " +
+		'"inline" means the complete plan body is in `inline_plan` — declaring it without a real ' +
+		"plan body is an error, not a request to read a file. " +
+		'"file" means the plan was written to a plan file and the system should read it; ' +
+		"`inline_plan` is ignored."
+	);
 }
 
 function buildExitPlanModeDescription(config?: AgentConfig): string {
@@ -162,33 +204,36 @@ function buildExitPlanModeDescription(config?: AgentConfig): string {
 		// Relaxed plan mode: support custom file path
 		howItWorks =
 			"## How This Tool Works (Relaxed Plan Mode)\n\n" +
-			"In relaxed plan mode, you have two ways to submit your plan:\n\n" +
-			"### Mode A: Inline plan\n" +
+			"The required `mode` parameter declares where your plan is coming from. " +
+			"It is a declaration, not a hint: the system verifies it and rejects the call if it does not match what you actually supplied.\n\n" +
+			'### `mode: "inline"`\n' +
 			"Pass the complete plan text in the `inline_plan` parameter. " +
-			"This must be the actual plan content, NOT a file path or a reference to one.\n\n" +
-			"### Mode B: File-based plan with custom path\n" +
-			"Write your plan to any `.md` file using Write/Edit tools, then call ExitPlanMode with the `plan_file_path` parameter pointing to that file. " +
-			"The system will read the plan content from your specified file.\n\n" +
-			"### Mode C: Default designated plan file\n" +
-			"If you wrote your plan to the default designated plan file (shown when you entered plan mode), " +
-			"you can omit both `inline_plan` and `plan_file_path` — the system will read that file automatically.\n\n";
+			"This must be the actual plan content, NOT a file path or a reference to one. " +
+			'Declaring `mode: "inline"` without a real `inline_plan` is an error — the system will NOT silently fall back to reading a file.\n\n' +
+			'### `mode: "file"`\n' +
+			'Write your plan to a `.md` file using Write/Edit tools, then call ExitPlanMode with `mode: "file"`. ' +
+			"Set `plan_file_path` to point at a custom file, or omit it to use the default designated plan file (shown when you entered plan mode). " +
+			"`inline_plan` is ignored in this mode.\n\n";
 	} else if (allowInline) {
 		howItWorks =
 			"## How This Tool Works\n\n" +
-			"You have two ways to submit your plan:\n\n" +
-			"### Mode A: Inline plan (for short/medium plans)\n" +
+			"The required `mode` parameter declares where your plan is coming from. " +
+			"It is a declaration, not a hint: the system verifies it and rejects the call if it does not match what you actually supplied.\n\n" +
+			'### `mode: "inline"` (for short/medium plans)\n' +
 			"Pass the complete plan text in the `inline_plan` parameter. " +
-			"This must be the actual plan content, NOT a file path or a reference to one.\n\n" +
-			"### Mode B: File-based plan (for long/complex plans)\n" +
-			"Write your plan to the designated plan file using Write/Edit tools, then call ExitPlanMode WITHOUT the `inline_plan` parameter. " +
+			"This must be the actual plan content, NOT a file path or a reference to one. " +
+			'Declaring `mode: "inline"` without a real `inline_plan` is an error — the system will NOT silently fall back to reading the plan file.\n\n' +
+			'### `mode: "file"` (for long/complex plans)\n' +
+			'Write your plan to the designated plan file using Write/Edit tools, then call ExitPlanMode with `mode: "file"` and no `inline_plan`. ' +
 			"The system will automatically read the plan file content and present it to the user.\n" +
-			"Do NOT put a file reference like 'Plan written to xxx' in the `inline_plan` parameter — just omit it entirely and the system handles the rest.\n\n";
+			"Do NOT put a file reference like 'Plan written to xxx' in the `inline_plan` parameter — declare `mode: \"file\"` and the system handles the rest.\n\n";
 	} else {
 		howItWorks =
 			"## How This Tool Works\n\n" +
-			"Inline plans are disabled in this instance — only the file-based plan flow is supported.\n\n" +
-			"### File-based plan (the only supported mode)\n" +
-			"Write your complete plan to the designated plan file using Write/Edit tools, then call ExitPlanMode (this tool takes no plan parameter). " +
+			"Inline plans are disabled in this instance — only the file-based plan flow is supported, " +
+			'so the required `mode` parameter accepts only `"file"`.\n\n' +
+			'### `mode: "file"` (the only supported mode)\n' +
+			'Write your complete plan to the designated plan file using Write/Edit tools, then call ExitPlanMode with `mode: "file"`. ' +
 			"The system will automatically read the plan file content and present it to the user.\n\n";
 	}
 
@@ -212,7 +257,13 @@ function buildExitPlanModeSchema(config?: AgentConfig): Record<string, unknown> 
 	const isRelaxedPlan = config?.relaxedPlan === true;
 
 	const properties: Record<string, unknown> = {
-		allowedPrompts: EXIT_PLAN_ALLOWED_PROMPTS_SCHEMA,
+		mode: {
+			description: buildExitPlanModeParamDescription(allowInline),
+			type: "string",
+			// Narrowed to the modes this instance actually accepts, so a model is
+			// never offered a value that is guaranteed to be rejected downstream.
+			enum: exitPlanModeValues(allowInline),
+		},
 	};
 
 	if (allowInline) {
@@ -238,6 +289,9 @@ function buildExitPlanModeSchema(config?: AgentConfig): Record<string, unknown> 
 	return {
 		type: "object",
 		properties,
+		// `mode` is the tool's one genuinely required parameter. Declaring it also
+		// having to inject a dummy here.
+		required: ["mode"],
 		additionalProperties: {},
 	};
 }
@@ -269,6 +323,11 @@ export const exitPlanModeTool: ToolDefinition = {
 	// Static fallback schema (inline allowed) for contexts without a resolved config.
 	rawJsonSchema: buildExitPlanModeSchema(),
 	parameters: z.object({
+		// Required in the MODEL-FACING schema, optional here on purpose: the
+		// resolution layer validates `mode` itself so it can return a precise,
+		// localized correction, and historical tool calls predating `mode` must
+		// still parse when replayed.
+		mode: z.string().optional().describe(buildExitPlanModeParamDescription(true)),
 		// `plan` is the canonical field: the resolution layer (resolveExitPlanModeInput)
 		// writes the resolved plan body here before tool-executor's safeParse runs, so it
 		// must be accepted. `inline_plan` is what the model actually fills; it is normalized
@@ -277,17 +336,16 @@ export const exitPlanModeTool: ToolDefinition = {
 		plan: z.string().optional().describe(EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION),
 		inline_plan: z.string().optional().describe(EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION),
 		plan_file_path: z.string().optional().describe(EXIT_PLAN_FILE_PATH_PARAM_DESCRIPTION),
+		// Retired: no longer advertised to models. See the constant's doc comment.
 		allowedPrompts: z
 			.array(
 				z.object({
-					tool: z.string().describe("The tool this prompt applies to"),
-					prompt: z.string().describe("Semantic description of the action"),
+					tool: z.string().optional(),
+					prompt: z.string().optional(),
 				}),
 			)
 			.optional()
-			.describe(
-				"Optional notes for the ExitPlanMode readiness self-check. These do not grant permissions after approval.",
-			),
+			.describe(EXIT_PLAN_ALLOWED_PROMPTS_DEPRECATED_DESCRIPTION),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		// The session layer (narrator-permission.ts resolveExitPlanModeInput) resolves the
