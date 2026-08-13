@@ -495,14 +495,18 @@ function projectSideCarBody(
 		}
 
 		case "specUpdates": {
+			const single = body.items.length === 1 ? body.items[0] : undefined;
 			const lines: SideCarLine[] = [];
 			for (const item of body.items) {
 				if (remainingBudget(lines) <= 0) break;
-				lines.push({ kind: "heading", text: item.uri });
+				// A SINGLE update already names the file in the headline, so repeating the
+				// uri as a body heading printed `spec://tasks.json` twice — once as the
+				// title and once as the only body line. Only a multi-file delivery needs
+				// per-item headings to tell the entries apart.
+				if (!single) lines.push({ kind: "heading", text: item.uri });
 				const detail = item.taskSummary ?? item.preview;
 				if (detail) lines.push(...proseLines(detail, remainingBudget(lines)));
 			}
-			const single = body.items.length === 1 ? body.items[0] : undefined;
 			return {
 				headline: single
 					? single.uri

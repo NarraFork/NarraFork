@@ -1,11 +1,15 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { flush, resetSessionStoreForTest, writeSession } from "@frontend/lib/session-store";
 import { getDraftImageAttachmentKey } from "./draft-image-attachments";
 import {
 	classifyDraftRevisionConflict,
 	cleanupLegacyNarratorInputStorage,
+	getNarratorDraftStorageId,
 	getNarratorInputDraftKey,
 	getNarratorInputHistoryKey,
+	MAX_LOCAL_DRAFT_MIRROR_CHARS,
 	persistNarratorInputDraft,
+	purgeLegacyNarratorInputStorage,
 	readNarratorInputDraft,
 	resolveHydratedNarratorDraft,
 } from "./narrator-draft-storage";
@@ -29,6 +33,7 @@ beforeEach(() => {
 			setItem: (key: string, value: string) => values.set(key, value),
 		} satisfies Storage,
 	});
+	resetSessionStoreForTest();
 });
 
 afterAll(() => {
@@ -71,12 +76,113 @@ describe("narrator draft browser isolation", () => {
 		});
 	});
 
-	test("removes legacy narrator-only text and history keys", () => {
+	test("removes legacy narrator-only and pre-facade user-scoped keys", () => {
 		values.set("narrafork_draft_narrator-1", "legacy text");
 		values.set("narrafork_input_history_narrator-1", '["legacy history"]');
-		cleanupLegacyNarratorInputStorage("narrator-1");
+		values.set(getNarratorInputDraftKey("user-a", "narrator-1"), "pre-facade text");
+		values.set(getNarratorInputHistoryKey("user-a", "narrator-1"), '["pre-facade"]');
+		cleanupLegacyNarratorInputStorage("user-a", "narrator-1");
 		expect(values.has("narrafork_draft_narrator-1")).toBe(false);
 		expect(values.has("narrafork_input_history_narrator-1")).toBe(false);
+		expect(values.has(getNarratorInputDraftKey("user-a", "narrator-1"))).toBe(false);
+		expect(values.has(getNarratorInputHistoryKey("user-a", "narrator-1"))).toBe(false);
+	});
+});
+
+describe("legacy key purge", () => {
+	test("sweeps every accumulated pre-facade draft and history key", () => {
+		// The reported hang came from exactly this shape: one draft plus one history
+		// entry per narrator the tab had ever opened, with nothing able to expire them.
+		for (let i = 0; i < 30; i++) {
+			values.set(getNarratorInputDraftKey("user-a", `narrator-${i}`), "x".repeat(1_000));
+			values.set(getNarratorInputHistoryKey("user-a", `narrator-${i}`), '["entry"]');
+		}
+		expect(purgeLegacyNarratorInputStorage()).toBe(60);
+		expect(values.size).toBe(0);
+	});
+
+	test("leaves unrelated keys alone", () => {
+		values.set("narrafork_token", "auth");
+		values.set(getNarratorInputDraftKey("user-a", "narrator-1"), "draft");
+		purgeLegacyNarratorInputStorage();
+		expect(values.get("narrafork_token")).toBe("auth");
+	});
+
+	test("MIGRATES input history instead of dropping it", () => {
+		// A draft has a server copy (hydration restores it); history does not, so a
+		// plain sweep would silently cost the user their up-arrow recall.
+		values.set(getNarratorInputHistoryKey("user-a", "narrator-1"), '["second","first"]');
+		const migrated: Array<{ storageId: string; entries: string[] }> = [];
+		purgeLegacyNarratorInputStorage((storageId, entries) => migrated.push({ storageId, entries }));
+		expect(migrated).toEqual([
+			{
+				storageId: getNarratorDraftStorageId("user-a", "narrator-1"),
+				entries: ["second", "first"],
+			},
+		]);
+		// The legacy key is still reclaimed — migration is not a reason to keep it.
+		expect(values.has(getNarratorInputHistoryKey("user-a", "narrator-1"))).toBe(false);
+	});
+
+	test("does not migrate a DRAFT key, only history", () => {
+		values.set(getNarratorInputDraftKey("user-a", "narrator-1"), '{"text":"draft"}');
+		const migrated: string[] = [];
+		purgeLegacyNarratorInputStorage((storageId) => migrated.push(storageId));
+		expect(migrated).toEqual([]);
+	});
+
+	test("cannot migrate a pre-user-scoped key: it names no owner", () => {
+		// `narrafork_input_history_<narratorId>` has no user in it, so adopting it
+		// would file one account's text under an id that means something else.
+		values.set("narrafork_input_history_narrator-1", '["orphan"]');
+		const migrated: string[] = [];
+		expect(purgeLegacyNarratorInputStorage((storageId) => migrated.push(storageId))).toBe(1);
+		expect(migrated).toEqual([]);
+		expect(values.size).toBe(0);
+	});
+
+	test("an unreadable legacy list still frees the quota", () => {
+		values.set(getNarratorInputHistoryKey("user-a", "narrator-1"), "not json");
+		const migrated: string[] = [];
+		expect(purgeLegacyNarratorInputStorage((storageId) => migrated.push(storageId))).toBe(1);
+		expect(migrated).toEqual([]);
+		expect(values.size).toBe(0);
+	});
+});
+
+describe("local mirror size limit", () => {
+	test("mirrors a draft within the local limit", () => {
+		const text = "y".repeat(MAX_LOCAL_DRAFT_MIRROR_CHARS);
+		expect(persistNarratorInputDraft("user-a", "narrator-1", text, 1, null)).toBe(true);
+		expect(readNarratorInputDraft("user-a", "narrator-1").text).toBe(text);
+	});
+
+	test("refuses to mirror a draft past the local limit", () => {
+		// The server sync path still carries it; only the browser copy is skipped.
+		// Writing bodies this large per keystroke is what saturated the main thread.
+		const text = "y".repeat(MAX_LOCAL_DRAFT_MIRROR_CHARS + 1);
+		expect(persistNarratorInputDraft("user-a", "narrator-1", text, 1, null)).toBe(false);
+	});
+
+	test("clears a smaller stored copy when the draft outgrows the limit", () => {
+		persistNarratorInputDraft("user-a", "narrator-1", "short", 1, null);
+		flush();
+		persistNarratorInputDraft(
+			"user-a",
+			"narrator-1",
+			"y".repeat(MAX_LOCAL_DRAFT_MIRROR_CHARS + 1),
+			1,
+			null,
+		);
+		flush();
+		// A stale prefix would be restored on reload and silently lose the rest.
+		expect(readNarratorInputDraft("user-a", "narrator-1").text).toBe("");
+	});
+});
+
+describe("storage id scoping", () => {
+	test("cannot collide across user/narrator boundaries", () => {
+		expect(getNarratorDraftStorageId("a_b", "c")).not.toBe(getNarratorDraftStorageId("a", "b_c"));
 	});
 });
 
@@ -157,10 +263,15 @@ describe("narrator draft hydration conflict resolution", () => {
 	});
 
 	test("preserves a version-1 local draft for an explicit conflict decision", () => {
-		values.set(
-			getNarratorInputDraftKey("user-a", "narrator-1"),
+		// A v1 envelope can still be present under the CURRENT storage id: the
+		// envelope version and the key shape moved independently, so the reader must
+		// keep honouring version 1 rather than assuming the id implies version 2.
+		writeSession(
+			"narrator-draft",
+			getNarratorDraftStorageId("user-a", "narrator-1"),
 			JSON.stringify({ version: 1, text: "legacy local", serverUpdatedAt: "old" }),
 		);
+		flush();
 		const local = readNarratorInputDraft("user-a", "narrator-1");
 		expect(local).toEqual({
 			text: "legacy local",

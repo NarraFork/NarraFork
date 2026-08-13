@@ -420,6 +420,36 @@ export type AgentEvent =
 	  }
 	| {
 			/**
+			 * An attempt is being abandoned and the identical request replayed in place.
+			 *
+			 * Blocks are persisted the moment they complete (`block_complete` writes into
+			 * the partial assistant message and inserts a `narrator_tool_calls` row), so an
+			 * abandoned attempt leaves its reasoning/text/tool_use behind. Without this
+			 * signal those remnants accumulate across every replay: one assistant message
+			 * ends up carrying several attempts' worth of near-identical reasoning and tool
+			 * calls, which is exactly the "the transcript keeps growing but the request
+			 * never changes" symptom.
+			 *
+			 * Consumers must drop everything this attempt persisted, back to the state at
+			 * the matching `api_request_start`. Emitted immediately before the request
+			 * teardown of every in-place replay.
+			 */
+			type: "attempt_discarded";
+			/**
+			 * The attempt being discarded, matching its `api_request_start`.
+			 *
+			 * Consumers key their truncation baseline on this rather than on "whatever
+			 * the last api_request_start set", because `api_request_start` is emitted
+			 * LAZILY: the loop only flushes it once the provider stream yields its first
+			 * event, or during request teardown. An attempt that dies before producing
+			 * anything therefore emits `attempt_discarded` first and `api_request_start`
+			 * second, so an order-dependent baseline would be stale on exactly the paths
+			 * that need it. A baseline recorded per requestId cannot be mismatched.
+			 */
+			requestId: string;
+	  }
+	| {
+			/**
 			 * - `stream_captured`: the streaming accumulator lifted a `<invoke>` block out of
 			 * - `recovered`: the streaming layer missed it, but the post-turn stateless safety
 			 *   net extracted a complete block from the finished assistant text.

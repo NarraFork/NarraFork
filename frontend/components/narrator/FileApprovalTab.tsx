@@ -1,5 +1,6 @@
 import { usePermissionFilePreview } from "@frontend/hooks/useNarrator";
 import { toRelativePath } from "@frontend/lib/format";
+import { readSession, removeSession, writeSession } from "@frontend/lib/session-store";
 import { Box, Button, Center, Group, Loader, Tabs, Text, Textarea } from "@mantine/core";
 import { useCallback, useContext, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -9,17 +10,20 @@ import type { PendingPermission } from "./narrator-panel-types";
 import { PermEnterHintCtx } from "./ToolCallCard";
 
 const MAX_FULL_FILE_PREVIEW_CHARS = 120_000;
-const FILE_APPROVAL_DRAFT_STORAGE_MAX_CHARS = 160_000;
-const FILE_APPROVAL_FEEDBACK_MAX_CHARS = 120_000;
+/**
+ * Longest approval note mirrored into browser storage.
+ *
+ * Was 120k. This is a reviewer's note attached to one permission decision, and it
+ * is keyed by permission id — an id space that grows with every prompt that never
+ * reached a decision. A large ceiling on an unbounded key space is what let these
+ * drafts consume the `sessionStorage` quota.
+ */
+const FILE_APPROVAL_FEEDBACK_MAX_CHARS = 8_000;
 
-function readFileApprovalDraft(draftKey: string): string {
+function readFileApprovalDraft(draftId: string): string {
 	try {
-		const raw = sessionStorage.getItem(draftKey);
+		const raw = readSession("permission-draft", draftId);
 		if (!raw) return "";
-		if (raw.length > FILE_APPROVAL_DRAFT_STORAGE_MAX_CHARS) {
-			sessionStorage.removeItem(draftKey);
-			return "";
-		}
 		const feedback = JSON.parse(raw).feedback;
 		return typeof feedback === "string" && feedback.length <= FILE_APPROVAL_FEEDBACK_MAX_CHARS
 			? feedback
@@ -29,19 +33,11 @@ function readFileApprovalDraft(draftKey: string): string {
 	}
 }
 
-function persistFileApprovalDraft(draftKey: string, feedback: string) {
-	try {
-		if (feedback && feedback.length <= FILE_APPROVAL_FEEDBACK_MAX_CHARS) {
-			sessionStorage.setItem(draftKey, JSON.stringify({ feedback }));
-		} else {
-			sessionStorage.removeItem(draftKey);
-		}
-	} catch {
-		try {
-			sessionStorage.removeItem(draftKey);
-		} catch {
-			// ignore storage cleanup failures
-		}
+function persistFileApprovalDraft(draftId: string, feedback: string) {
+	if (feedback && feedback.length <= FILE_APPROVAL_FEEDBACK_MAX_CHARS) {
+		writeSession("permission-draft", draftId, JSON.stringify({ feedback }));
+	} else {
+		removeSession("permission-draft", draftId);
 	}
 }
 
@@ -66,7 +62,7 @@ export function FileApprovalTab({
 	const toolUseId = permission.toolUseId ?? null;
 	const { data, isLoading } = usePermissionFilePreview(narratorId, toolUseId, !!toolUseId);
 
-	const draftKey = `narrafork_perm_draft_${permission.id}`;
+	const draftKey = permission.id;
 	const [feedback, setFeedback] = useState(() => readFileApprovalDraft(draftKey));
 
 	useEffect(() => {
@@ -79,12 +75,12 @@ export function FileApprovalTab({
 	}, [feedback, setHasFeedback, isActivePermission]);
 
 	const handleAllow = useCallback(() => {
-		sessionStorage.removeItem(draftKey);
+		removeSession("permission-draft", draftKey);
 		onDecision?.(permission.id, "allow", feedback || undefined);
 	}, [draftKey, onDecision, permission.id, feedback]);
 
 	const handleDeny = useCallback(() => {
-		sessionStorage.removeItem(draftKey);
+		removeSession("permission-draft", draftKey);
 		onDecision?.(permission.id, "deny", feedback || undefined);
 	}, [draftKey, onDecision, permission.id, feedback]);
 

@@ -1078,6 +1078,7 @@
 		"truncated": "[预览已截断以保持界面流畅。如需完整内容，请使用复制。]",
 		"sources": {
 			"silent_progress": "进度提醒",
+			"living_work_spec": "任务摘要",
 			"todo_reminder": "TODO 提醒",
 			"relaxed_plan": "计划模式提醒",
 			"knowledge_base_hint": "知识库提示",

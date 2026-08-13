@@ -797,12 +797,19 @@ describe("agentLoop abort result draining", () => {
 		expect(toolResults).toHaveLength(2);
 		expect(toolResults.map((event) => event.output)).toEqual(["completed:one", "completed:two"]);
 
+		// Ended as RESUMABLE, not as a hard failure. The tools above already ran and had
+		// side effects, so a terminal event would strand them: both executors turn
+		// `invalid_state` into an error state, whereas `resumable_error` is an interrupted
+		// pass whose continuation is capped by the caller's interruption budget.
 		const lastEvent = events.at(-1);
 		expect(lastEvent).toMatchObject({
-			type: "invalid_state",
-			reason: "stream_closed_before_response_completed",
+			type: "resumable_error",
 			message: "Responses API stream closed before response.completed.",
 		});
+		// The originating reason still travels with the event for diagnostics.
+		expect(
+			(lastEvent as Extract<AgentEvent, { type: "resumable_error" }>).diagnostics,
+		).toMatchObject({ reason: "stream_closed_before_response_completed" });
 	});
 
 	test("Codex 切号重试前保留已输出文本并要求外层重建 history", async () => {

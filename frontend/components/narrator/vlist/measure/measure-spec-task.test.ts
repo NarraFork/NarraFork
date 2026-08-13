@@ -16,6 +16,36 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+/**
+ * The regression this pins: `measureInjectionBubble` overwrites the composite's
+ * `contentWidth` with its own INNER width, so a render copy that used
+ * `measured.contentWidth` as the text-column width and then placed the glyph/lock
+ * lanes beside it produced a row `chromeWidth` wider than the frame — the task text
+ * spilled past the bubble's right edge. The render layer must re-derive the text
+ * column with `specTaskChromeWidth`, which is exactly what this asserts.
+ */
+describe("spec task row fits inside the bubble's inner width", () => {
+	for (const isProtected of [false, true]) {
+		it(`chrome + text column never exceeds the inner width (protected=${isProtected})`, () => {
+			const innerWidth = 420;
+			const data = { text: "a reasonably long continuation task text", protected: isProtected };
+			const chrome = specTaskChromeWidth(data);
+			// What the render layer computes for the text column.
+			const renderTextWidth = Math.max(1, innerWidth - chrome);
+			expect(chrome + renderTextWidth).toBeLessThanOrEqual(innerWidth);
+			// And it agrees with what the measure pass wrapped the text at.
+			expect(measureSpecTask(data, innerWidth).contentWidth).toBe(renderTextWidth);
+		});
+	}
+
+	it("degenerate widths still leave a positive text column", () => {
+		const data = { text: "x", protected: true };
+		// Narrower than the chrome itself: the column floors at 1px rather than going
+		// negative, which would make the flex child collapse or overflow.
+		expect(measureSpecTask(data, 4).contentWidth).toBeGreaterThan(0);
+	});
+});
+
 describe("measureSpecTask — glyph + lock + wrapping text", () => {
 	it("a short task fits a single line", () => {
 		const m = measureSpecTask({ text: "short", protected: false }, 600);

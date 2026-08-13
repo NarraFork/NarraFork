@@ -209,7 +209,10 @@ describe("sideCarBodyToMarkdown — the 7 body kinds", () => {
 		expect(out).toContain("two");
 	});
 
-	it("specUpdates: a single file's uri is the heading, the digest its body", () => {
+	it("specUpdates: a single file's uri is the heading, and is NOT repeated in the body", () => {
+		// The regression this pins: the loop pushed a per-item heading unconditionally, so
+		// a single-file update printed `spec://tasks.json` twice — once as the headline and
+		// again as the first body line.
 		const body: SideCarBody = {
 			kind: "specUpdates",
 			items: [
@@ -221,9 +224,22 @@ describe("sideCarBodyToMarkdown — the 7 body kinds", () => {
 				},
 			],
 		};
-		expect(md("spec_update", body)).toBe(
-			"###### spec://tasks.json\n\n###### spec://tasks.json\n\n1 open task",
-		);
+		expect(md("spec_update", body)).toBe("###### spec://tasks.json\n\n1 open task");
+	});
+
+	it("specUpdates: SEVERAL files keep per-item headings to tell them apart", () => {
+		const body: SideCarBody = {
+			kind: "specUpdates",
+			items: [
+				{ uri: "spec://tasks.json", timestamp: "t", updatedBy: "alice", taskSummary: "2 open" },
+				{ uri: "spec://index.md", timestamp: "t", updatedBy: "alice", taskSummary: "notes" },
+			],
+		};
+		const out = md("spec_update", body);
+		expect(out).toContain("spec://tasks.json");
+		expect(out).toContain("spec://index.md");
+		expect(out).toContain("2 open");
+		expect(out).toContain("notes");
 	});
 });
 

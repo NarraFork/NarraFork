@@ -4,6 +4,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import { readSession, writeSession } from "../../lib/session-store";
 
 interface BaseUrlFixDetail {
 	providerId: string;
@@ -13,12 +14,12 @@ interface BaseUrlFixDetail {
 	suggestedBaseUrl: string;
 }
 
-/** sessionStorage key for provider IDs the user already dismissed this session. */
-const DISMISSED_KEY = "narrafork_baseurl_fix_dismissed";
+/** Session-store id for provider IDs the user already dismissed this session. */
+const DISMISSED_ID = "baseurl-fix-dismissed";
 
 function readDismissed(): Set<string> {
 	try {
-		const raw = sessionStorage.getItem(DISMISSED_KEY);
+		const raw = readSession("ui-flag", DISMISSED_ID);
 		return new Set(raw ? (JSON.parse(raw) as string[]) : []);
 	} catch {
 		return new Set();
@@ -26,11 +27,7 @@ function readDismissed(): Set<string> {
 }
 
 function persistDismissed(ids: Set<string>): void {
-	try {
-		sessionStorage.setItem(DISMISSED_KEY, JSON.stringify([...ids]));
-	} catch {
-		// ignore storage errors
-	}
+	writeSession("ui-flag", DISMISSED_ID, JSON.stringify([...ids]));
 }
 
 /**

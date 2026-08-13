@@ -19,6 +19,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import { readSession, removeSession, writeSession } from "../../lib/session-store";
 import {
 	coerceQuestions,
 	formatHMS,
@@ -31,9 +32,17 @@ import {
 
 export { coerceQuestions, formatHMS } from "./ask-user-question-utils";
 
-const DRAFT_KEY_PREFIX = "narrafork_ask_draft_";
-const ASK_DRAFT_STORAGE_MAX_CHARS = 256_000;
-const ASK_DRAFT_FIELD_MAX_CHARS = 120_000;
+/**
+ * Ceilings for one stored ask-question draft.
+ *
+ * Was 256k envelope / 120k per field. Keyed by REQUEST ID, so the id space grows
+ * with every question that was never answered — a generous per-entry ceiling on an
+ * unbounded key space is what pushed `sessionStorage` toward its quota. These
+ * fields hold option selections and short free-text answers; anything larger stays
+ * in component state and is simply not mirrored.
+ */
+const ASK_DRAFT_STORAGE_MAX_CHARS = 32_000;
+const ASK_DRAFT_FIELD_MAX_CHARS = 24_000;
 
 type AskDraft = {
 	selections?: Record<string, string>;
@@ -51,14 +60,10 @@ function sanitizeDraftRecord(value: unknown): Record<string, string> {
 	return result;
 }
 
-function readAskDraft(draftKey: string): AskDraft | null {
+function readAskDraft(draftId: string): AskDraft | null {
 	try {
-		const raw = sessionStorage.getItem(draftKey);
+		const raw = readSession("ask-draft", draftId);
 		if (!raw) return null;
-		if (raw.length > ASK_DRAFT_STORAGE_MAX_CHARS) {
-			sessionStorage.removeItem(draftKey);
-			return null;
-		}
 		const parsed = JSON.parse(raw) as AskDraft;
 		return {
 			selections: sanitizeDraftRecord(parsed.selections),
@@ -70,7 +75,7 @@ function readAskDraft(draftKey: string): AskDraft | null {
 }
 
 function persistAskDraft(
-	draftKey: string,
+	draftId: string,
 	selections: Record<string, string>,
 	customInputs: Record<string, string>,
 ) {
@@ -80,7 +85,7 @@ function persistAskDraft(
 		const hasPersistableContent =
 			Object.values(safeSelections).some(Boolean) || Object.values(safeCustomInputs).some(Boolean);
 		if (!hasPersistableContent) {
-			sessionStorage.removeItem(draftKey);
+			removeSession("ask-draft", draftId);
 			return;
 		}
 		const serialized = JSON.stringify({
@@ -88,13 +93,13 @@ function persistAskDraft(
 			customInputs: safeCustomInputs,
 		});
 		if (serialized.length <= ASK_DRAFT_STORAGE_MAX_CHARS) {
-			sessionStorage.setItem(draftKey, serialized);
+			writeSession("ask-draft", draftId, serialized);
 		} else {
-			sessionStorage.removeItem(draftKey);
+			removeSession("ask-draft", draftId);
 		}
 	} catch {
 		try {
-			sessionStorage.removeItem(draftKey);
+			removeSession("ask-draft", draftId);
 		} catch {
 			// ignore storage cleanup failures
 		}
@@ -158,7 +163,7 @@ export function AskUserQuestionBanner({
 	};
 	// Defensive: questions may come from untyped JSON or as a stringified array
 	const questions = coerceQuestions(rawQuestions);
-	const draftKey = `${DRAFT_KEY_PREFIX}${requestId}`;
+	const draftKey = requestId;
 	const storedDraftRef = useRef<AskDraft | null | undefined>(undefined);
 	const getStoredDraft = () => {
 		if (storedDraftRef.current === undefined) {
@@ -220,7 +225,7 @@ export function AskUserQuestionBanner({
 		if (hasContent) {
 			persistAskDraft(draftKey, selections, customInputs);
 		} else {
-			sessionStorage.removeItem(draftKey);
+			removeSession("ask-draft", draftKey);
 		}
 	}, [readOnly, draftKey, selections, customInputs]);
 
@@ -254,7 +259,7 @@ export function AskUserQuestionBanner({
 		for (const q of questions) {
 			answers[q.question] = getAnswer(q.question);
 		}
-		sessionStorage.removeItem(draftKey);
+		removeSession("ask-draft", draftKey);
 		onSubmit?.(requestId, answers);
 	};
 
@@ -263,7 +268,7 @@ export function AskUserQuestionBanner({
 		setReflecting(true);
 		try {
 			await onReflect(requestId);
-			sessionStorage.removeItem(draftKey);
+			removeSession("ask-draft", draftKey);
 		} finally {
 			setReflecting(false);
 		}
@@ -406,7 +411,7 @@ export function AskUserQuestionBanner({
 								color="red"
 								variant="light"
 								onClick={() => {
-									sessionStorage.removeItem(draftKey);
+									removeSession("ask-draft", draftKey);
 									onDeny?.(requestId);
 								}}
 							>

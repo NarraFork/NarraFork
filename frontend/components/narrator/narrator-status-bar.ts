@@ -29,6 +29,83 @@ function stringArray(value: unknown): string[] {
 		: [];
 }
 
+/**
+ * What the work indicator's single text slot is currently about.
+ *
+ * The status row has exactly two places that can talk about compaction: this
+ * primary slot and an appended "· background compact · N chars" suffix. Keeping
+ * the choice in one pure function is what makes them mutually exclusive; when
+ * the decision lived in two independent JSX conditions the row could render the
+ * same phrase (and the same progress fragment) twice.
+ */
+export type NarratorWorkIndicatorPrimary =
+	| "retrying"
+	| "blocking_compact"
+	| "model_unavailable"
+	| "spec_task"
+	| "waiting"
+	| "planning"
+	| "background_compact"
+	| "thinking";
+
+export type NarratorWorkIndicatorPlan = {
+	primary: NarratorWorkIndicatorPrimary;
+	/**
+	 * Whether to append the short background-compact suffix. Guaranteed never to
+	 * be true while `primary` is already `"background_compact"`, so the phrase and
+	 * its progress fragment appear at most once per row.
+	 */
+	showBackgroundCompactSuffix: boolean;
+};
+
+/**
+ * Decide what the work indicator says and whether the background-compact suffix
+ * is needed.
+ *
+ * The `primary` order mirrors the label chain the status bar has always used, so
+ * this function only removes the duplicate — it does not re-rank any state.
+ *
+ * The suffix exists for "the primary slot is busy describing something else
+ * while a background compaction keeps running". That is independent of whether
+ * the turn is still active: a finished turn with a current spec task must still
+ * report the compaction somewhere, which is why `isWorking` is deliberately not
+ * an input here.
+ */
+export function planNarratorWorkIndicator(input: {
+	isRetrying: boolean;
+	isBlockingCompacting: boolean;
+	isBackgroundCompacting: boolean;
+	isWaitingForModel: boolean;
+	hasSpecTask: boolean;
+	isWaiting: boolean;
+	isPlanning: boolean;
+}): NarratorWorkIndicatorPlan {
+	const primary: NarratorWorkIndicatorPrimary = input.isRetrying
+		? "retrying"
+		: input.isBlockingCompacting
+			? "blocking_compact"
+			: input.isWaitingForModel
+				? "model_unavailable"
+				: input.hasSpecTask
+					? "spec_task"
+					: input.isWaiting
+						? "waiting"
+						: input.isPlanning
+							? "planning"
+							: input.isBackgroundCompacting
+								? "background_compact"
+								: "thinking";
+	return {
+		primary,
+		showBackgroundCompactSuffix:
+			input.isBackgroundCompacting &&
+			// Blocking compaction owns the primary slot and is the thing actually
+			// holding the turn up; a second compact line would just compete with it.
+			!input.isBlockingCompacting &&
+			primary !== "background_compact",
+	};
+}
+
 export function getNarratorStatusBarDisplay(options: {
 	panelNarratorId: string;
 	narrator: NarratorStatusBarSource;

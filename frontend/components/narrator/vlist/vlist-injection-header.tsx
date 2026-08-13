@@ -15,9 +15,11 @@
  * avatar component for both would claim an account that does not exist.
  */
 
+import { NarratorAvatar } from "@frontend/components/narrator/NarratorAvatar";
 import { UserAvatar } from "@frontend/components/UserAvatar";
-import { Badge, Group, Text } from "@mantine/core";
+import { Badge, Group, Text, ThemeIcon } from "@mantine/core";
 import { PLATFORM_INJECTION_SOURCES as ADAPTER_PLATFORM_SOURCES } from "@shared/pretext-layout/segment-adapter";
+import { IconChecklist, IconSparkles, IconTerminal2 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import type { VListElementKind } from "./registry";
 import type { RenderExtra } from "./render-registry";
@@ -85,14 +87,41 @@ export function isPlatformSource(source: string | null | undefined): boolean {
 	return !!source && PLATFORM_SOURCES.has(source);
 }
 
+/**
+ * Producers that speak FOR the Dynamic Spec, so they can wear the spec panel's own
+ * icon and accent instead of the generic platform sparkle. The reader should see the
+ * same object language in the row as in the panel it refers to.
+ */
+const SPEC_SOURCES = new Set([
+	"spec_update",
+	"living_work_spec",
+	"todo_reminder",
+	"spec_continuation",
+	"spec_blocked_continuation",
+	"spec_goal_added",
+	"spec_fork_carryover",
+	"spec_context_cleared",
+]);
+
+export function isSpecSource(source: string | null | undefined): boolean {
+	return !!source && SPEC_SOURCES.has(source);
+}
+
 export function InjectionSpeakerHeader({
 	speaker,
+	speakerId,
 	speakerKind,
 	isBroadcast,
 	creator,
 	source,
 }: {
 	speaker?: string | null;
+	/**
+	 * The speaker's own id (a subagent narrator id, a background task id, a knowledge
+	 * entry id) — the identicon seed. Absent for the platform and for real accounts,
+	 * which have their own avatar treatments.
+	 */
+	speakerId?: string | null;
 	/**
 	 * Secondary descriptor beside the name. Carries a participant TYPE for inbound
 	 * messages (`primary` / `subagent`) and a task STATUS for background completions —
@@ -120,21 +149,86 @@ export function InjectionSpeakerHeader({
 	//      somebody other than the reader spoke, and calling that the system would erase
 	//      it and blur into the neutral notice cards.
 	const platform = isPlatformSource(source);
+	/**
+	 * A platform row names its PRODUCER, not the platform.
+	 *
+	 * This used to collapse every platform source to one literal "System", so a task
+	 * digest, a behaviour fence and a progress nudge — three different things the reader
+	 * reacts to differently — were indistinguishable in the header. `sidecar.sources.*`
+	 * already carries a name per producer ("任务摘要", "行为护栏", "进度提醒"); only fall
+	 * back to the generic label when a producer has none, which is now a missing-key
+	 * signal rather than the normal case.
+	 */
+	const sourceName = (() => {
+		if (!source) return null;
+		const key = `sidecar.sources.${source}`;
+		const label = t(key);
+		// i18next returns the key itself when the translation is missing.
+		return label && label !== key ? label : null;
+	})();
 	const name = creator?.username?.trim()
 		? creator.username
 		: platform
-			? t("origin.kind.system")
-			: speaker?.trim() || t("sidecar.body.messageFromUnknown");
+			? // A platform row names its producer; the generic label is the missing-key path.
+				(sourceName ?? t("origin.kind.system"))
+			: // A non-platform producer normally names its speaker (a subagent title, a bash
+				// alias). With no speaker, its SOURCE name still says what spoke — better than
+				// "unknown sender", which is only right when nothing identifies the row at all.
+				speaker?.trim() || sourceName || t("sidecar.body.messageFromUnknown");
 	return (
 		<Group gap={6} wrap="nowrap" h="100%" align="center">
-			<UserAvatar
-				username={name}
-				avatarColor={creator?.avatarColor ?? speakerTint(name)}
-				avatarImageId={creator?.avatarImageId ?? null}
-				userId={creator?.id}
-				size={20}
-				showTooltip={false}
-			/>
+			{/*
+			 * Four kinds of speaker, four kinds of avatar. All of them used to funnel into
+			 * UserAvatar, which renders the first two characters of the name — so the
+			 * platform's avatar literally read "系"/"Sy" next to the word "系统", and two
+			 * subagents called "explore-1" / "explore-2" got the SAME glyph.
+			 */}
+			{creator?.id ? (
+				// A real account (a person pressed merge): their actual avatar.
+				<UserAvatar
+					username={name}
+					avatarColor={creator.avatarColor ?? speakerTint(name)}
+					avatarImageId={creator.avatarImageId ?? null}
+					userId={creator.id}
+					size={20}
+					showTooltip={false}
+				/>
+			) : platform ? (
+				/*
+				 * The platform itself: a glyph, not initials of the word "System".
+				 *
+				 * Spec-family producers borrow the Dynamic Spec panel's OWN icon and accent
+				 * (see SpecPanel's IconChecklist / indigo). A generic sparkle here made the
+				 * row look unrelated to the panel the reader had just been editing, even
+				 * though it is reporting exactly that file.
+				 */
+				<ThemeIcon
+					size={20}
+					radius="xl"
+					variant="light"
+					color={isSpecSource(source) ? "indigo" : "gray"}
+				>
+					{isSpecSource(source) ? <IconChecklist size={12} /> : <IconSparkles size={12} />}
+				</ThemeIcon>
+			) : source === "bg_bash" ? (
+				/*
+				 * A finished background command is TOOL OUTPUT, not a participant. Giving it
+				 * an identicon claimed an identity it does not have — `run-tests` is a shell
+				 * invocation, not somebody in the conversation. It gets the same terminal
+				 * glyph the Bash tool card uses, so the reader reads "this is a command's
+				 * result" rather than "this is a new speaker".
+				 */
+				<ThemeIcon size={20} radius="sm" variant="light" color="gray">
+					<IconTerminal2 size={12} />
+				</ThemeIcon>
+			) : speakerId ? (
+				// An agent / task / entry that has its own id: the deterministic identicon,
+				// which stays distinct where initials collide.
+				<NarratorAvatar narratorId={speakerId} title={name} size={20} showTooltip={false} />
+			) : (
+				// No id to key a glyph on: fall back to initials rather than inventing one.
+				<UserAvatar username={name} avatarColor={speakerTint(name)} size={20} showTooltip={false} />
+			)}
 			<Text size="xs" c="dimmed" fw={600} truncate>
 				{name}
 			</Text>
@@ -170,6 +264,7 @@ export function injectInjectionBubbleChrome(
 	extra.header = (
 		<InjectionSpeakerHeader
 			speaker={(extra.speaker as string | null | undefined) ?? null}
+			speakerId={(extra.speakerId as string | null | undefined) ?? null}
 			speakerKind={(extra.speakerKind as string | null | undefined) ?? null}
 			isBroadcast={extra.isBroadcast === true}
 			creator={(extra.creator as BubbleCreator | null | undefined) ?? null}

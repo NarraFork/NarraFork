@@ -450,6 +450,25 @@ function emptyResponseEvidence(signals: EmptyResponseSignals): string {
 /** Max retries specifically for empty responses (request succeeded but no content). */
 const MAX_EMPTY_RESPONSE_RETRIES = 3;
 
+/**
+ * Replay budget for an empty turn the upstream demonstrably SERVED.
+ *
+ * `usage_only` / `stop_without_content` mean the request reached the model, was
+ * accounted for, and came back with a stop signal but no content. Replaying the
+ * identical request has a poor success rate in practice — production logs show
+ * these failing identically on every attempt — while each replay pays the full
+ * prompt again. One retry covers a genuine one-off; beyond that the turn is
+ * handed back so the caller can rebuild history and issue a fresh request.
+ */
+const MAX_EMPTY_RESPONSE_RETRIES_SERVED = 1;
+
+/** Replay budget for one empty-turn kind. */
+function maxEmptyResponseRetriesFor(kind: EmptyResponseKind): number {
+	return kind === "empty_response_usage_only" || kind === "empty_response_stop_without_content"
+		? MAX_EMPTY_RESPONSE_RETRIES_SERVED
+		: MAX_EMPTY_RESPONSE_RETRIES;
+}
+
 /** Reasoning-only responses above this occupancy trigger one blocking compact attempt. */
 const REASONING_ONLY_COMPACT_THRESHOLD = 95;
 
@@ -3115,6 +3134,38 @@ export async function* agentLoop(
 			};
 
 			/**
+			 * Whether this attempt produced progress that an in-place replay would DESTROY.
+			 *
+			 * Distinct from {@link hasAnyPersistableOutput}, which answers "is there
+			 * anything worth persisting". This answers the question the retry paths
+			 * actually need: would re-sending the identical request lose information the
+			 * model must see?
+			 *
+			 * A completed tool call is the decisive case. Every in-place replay resets the
+			 * per-attempt accumulators (`toolUses`, `settledResults`, `earlyExecMap`), so a
+			 * tool that already ran has its result dropped on the floor while the request
+			 * that goes out is byte-identical to the one before it. The model then asks for
+			 * the same tool again, lands in the same branch, and the loop burns its whole
+			 * budget re-sending the first request — with the transcript growing all the
+			 * while, because each abandoned attempt still persisted its blocks.
+			 *
+			 * When this is true the turn must instead finish (or be handed back to the
+			 * caller), so the completed tool results reach history and the NEXT request
+			 * carries them.
+			 */
+			const hasIrreplaceableProgress = (): boolean =>
+				toolUses.length > 0 ||
+				settledResults.size > 0 ||
+				yieldedToolResults.size > 0 ||
+				hasStartedEarlyToolExecution();
+
+			/**
+			 * Guard for every in-place replay site: replaying is only safe when the
+			 * abandoned attempt left nothing behind that the replay would lose.
+			 */
+			const canReplayInPlace = (): boolean => !hasIrreplaceableProgress();
+
+			/**
 			 * Pick the recovery strategy for a resumable interruption (a transient
 			 * upstream failure that hit AFTER partial output was already produced,
 			 * e.g. the NUG gateway reporting `diagnostics.resumable`).
@@ -3233,6 +3284,36 @@ export async function* agentLoop(
 				);
 				if (abandoned.length === 0) return;
 				yield { type: "tool_use_discarded", toolUseIds: abandoned };
+			}
+
+			/**
+			 * Close out an attempt that is about to be replayed in place.
+			 *
+			 * Every replay site must go through here rather than calling `finishRequest`
+			 * directly. `block_complete` persists as it streams, so an abandoned attempt
+			 * has already written its reasoning/text/tool_use rows; `attempt_discarded`
+			 * is what tells the host to drop them. Without it each replay leaves another
+			 * copy behind and the transcript grows while the outgoing request never
+			 * changes.
+			 *
+			 * Ordering matters: the discard has to reach the consumer BEFORE the request
+			 * teardown, mirroring `tool_use_discarded` (which `finishRequest` also emits
+			 * ahead of `api_request_end`).
+			 *
+			 * `requestId` identifies which attempt is being dropped. The consumer needs it
+			 * because `api_request_start` is flushed lazily (first stream event, or request
+			 * teardown), so an attempt that failed before producing anything emits this
+			 * event BEFORE its own `api_request_start`. Keying the truncation baseline on
+			 * the requestId keeps the two correlated regardless of arrival order.
+			 */
+			function* discardAttemptPersistence(): Generator<AgentEvent> {
+				yield { type: "attempt_discarded", requestId };
+			}
+
+			/** Replay teardown: discard what this attempt persisted, then end its request. */
+			function* abandonAttemptForReplay(errorMessage?: string): Generator<AgentEvent> {
+				yield* discardAttemptPersistence();
+				yield* finishRequest(errorMessage);
 			}
 
 			/**
@@ -4315,7 +4396,7 @@ export async function* agentLoop(
 										delayMs,
 										diagnostics: requestDiagnostics,
 									};
-									yield* finishRequest(message);
+									yield* abandonAttemptForReplay(message);
 									await abortableSleep(delayMs, config.signal);
 									if (config.signal.aborted) {
 										yield { type: "error", message: "Aborted" };
@@ -4382,7 +4463,7 @@ export async function* agentLoop(
 									};
 									break;
 								}
-								if (strategy === "reasoning_only_retry" && !hasStartedEarlyToolExecution()) {
+								if (strategy === "reasoning_only_retry" && canReplayInPlace()) {
 									// Only reasoning was produced. Drop it and re-send the identical
 									// request instead of continuing from a truncated thought.
 									if (
@@ -4414,7 +4495,7 @@ export async function* agentLoop(
 											delayMs,
 											diagnostics: requestDiagnostics,
 										};
-										yield* finishRequest(message);
+										yield* abandonAttemptForReplay(message);
 										await abortableSleep(delayMs, config.signal);
 										if (config.signal.aborted) {
 											yield { type: "error", message: "Aborted" };
@@ -4431,24 +4512,42 @@ export async function* agentLoop(
 								return;
 							}
 							if (classification.retryable) {
-								if (hasStartedEarlyToolExecution()) {
-									logger.warn("Retryable provider stream error after tool execution started", {
+								// A completed tool call must never be replayed away: the replay resets
+								// `toolUses`/`settledResults`, so the model would ask for the same tool
+								// again while the result it already produced is lost.
+								//
+								// Widened from `hasStartedEarlyToolExecution()`: a tool whose input closed
+								// but which was deferred (strict-serial, or an eager-disabled tool such as
+								// Bash/Write/Edit) has no entry in `earlyExecMap`, yet replaying it is just
+								// as lossy.
+								if (hasIrreplaceableProgress()) {
+									logger.warn("Retryable provider stream error after tool progress landed", {
 										narratorId: config.narratorId,
 										provider: effectiveProvider,
 										model: effectiveModel,
 										reason,
 										toolCount: toolUses.length,
 										startedToolCount: earlyExecMap.size,
+										settledToolCount: settledResults.size,
 									});
+									// Drain and persist the completed work, then end the turn as
+									// RESUMABLE rather than as a hard failure.
+									//
+									// `resumable_error` is the only exit that both preserves the work and
+									// stays bounded. `invalid_state` / `retryable_error` end the run for a
+									// stateless provider (narrator-executor sets hasError; narrator-session
+									// gives up once in-loop retries are exhausted), stranding tool calls
+									// that already had side effects behind a hard failure. Simply breaking
+									// out of the retry loop to "finish normally" is worse: the upstream is
+									// still failing, so the turn loop would immediately try again with no
+									// budget of its own and spin. Both executors treat `resumable_error` as
+									// an interrupted pass and cap the continuations
+									// (MAX_INTERRUPTION_RETRIES), so the completed tool results reach
+									// history and the retry count is finite.
 									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 									yield* drainStartedEarlyToolResults();
 									yield* finishRequest(message);
-									yield {
-										type: "invalid_state",
-										reason,
-										message,
-										diagnostics: requestDiagnostics,
-									};
+									yield { type: "resumable_error", message, diagnostics: requestDiagnostics };
 									return;
 								}
 								// In-loop retry: skip block_complete persistence and retry
@@ -4473,7 +4572,7 @@ export async function* agentLoop(
 										delayMs,
 										diagnostics: requestDiagnostics,
 									};
-									yield* finishRequest(message);
+									yield* abandonAttemptForReplay(message);
 									await abortableSleep(delayMs, config.signal);
 									if (config.signal.aborted) {
 										yield { type: "error", message: "Aborted" };
@@ -4485,6 +4584,11 @@ export async function* agentLoop(
 									yield* finishRequest(message);
 									const switchEvent = await applyPendingRuntimeSettings("retry");
 									if (switchEvent) {
+										// Only now is this a replay: discard what the abandoned attempt
+										// persisted. Emitted after the switch is confirmed, because
+										// without one the turn ends here and its partial content must
+										// be kept for the caller.
+										yield* discardAttemptPersistence();
 										yield switchEvent;
 										resetRetryStateAfterModelSwitch();
 										continue chatRetryLoop;
@@ -4568,7 +4672,7 @@ export async function* agentLoop(
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
-							yield* finishRequest(firstTokenTimeoutMessage);
+							yield* abandonAttemptForReplay(firstTokenTimeoutMessage);
 							await abortableSleep(delayMs, config.signal);
 							if (config.signal.aborted) {
 								yield { type: "error", message: "Aborted" };
@@ -4580,6 +4684,7 @@ export async function* agentLoop(
 							yield* finishRequest(firstTokenTimeoutMessage);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
+								yield* discardAttemptPersistence();
 								yield switchEvent;
 								resetRetryStateAfterModelSwitch();
 								continue;
@@ -4726,7 +4831,7 @@ export async function* agentLoop(
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
-							yield* finishRequest(msg);
+							yield* abandonAttemptForReplay(msg);
 							await abortableSleep(delayMs, config.signal);
 							if (config.signal.aborted) {
 								yield { type: "error", message: "Aborted" };
@@ -4782,7 +4887,7 @@ export async function* agentLoop(
 							};
 							break;
 						}
-						if (strategy === "reasoning_only_retry" && !hasStartedEarlyToolExecution()) {
+						if (strategy === "reasoning_only_retry" && canReplayInPlace()) {
 							if (
 								(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 								!config.signal.aborted
@@ -4811,7 +4916,7 @@ export async function* agentLoop(
 									delayMs,
 									diagnostics: requestDiagnostics,
 								};
-								yield* finishRequest(msg);
+								yield* abandonAttemptForReplay(msg);
 								await abortableSleep(delayMs, config.signal);
 								if (config.signal.aborted) {
 									yield { type: "error", message: "Aborted" };
@@ -4830,6 +4935,33 @@ export async function* agentLoop(
 					// Detect transient/retryable API errors (e.g. MODEL_TEMPORARILY_UNAVAILABLE,
 					// throttling, 429/529 overloaded)
 					if (isRetryableError(err)) {
+						// A transient fault can land AFTER the model already produced complete
+						// tool calls (a 429/529 on the tail of the stream, a mid-turn socket
+						// reset). Replaying then destroys those calls and their results while
+						// sending a byte-identical request, so the model reproduces them and the
+						// loop spins until the budget dies.
+						if (hasIrreplaceableProgress()) {
+							logger.warn("Retryable provider error after tool progress landed", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								requestId,
+								toolCount: toolUses.length,
+								startedToolCount: earlyExecMap.size,
+								settledToolCount: settledResults.size,
+							});
+							// Same exit as the matching invalidState branch above: drain and persist
+							// the completed work, then end the turn as RESUMABLE. Keeps the tool
+							// results (a hard failure would strand side effects that already
+							// happened) while staying bounded — both executors cap resumable
+							// continuations, whereas finishing "normally" against a still-failing
+							// upstream would let the turn loop spin without a budget.
+							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+							yield* drainStartedEarlyToolResults();
+							yield* finishRequest(msg);
+							yield { type: "resumable_error", message: msg, diagnostics: requestDiagnostics };
+							return;
+						}
 						// In-loop retry for stateless providers
 						// -1 means infinite retries (consistent with handleTransientError)
 						if (
@@ -4851,7 +4983,7 @@ export async function* agentLoop(
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
-							yield* finishRequest(msg);
+							yield* abandonAttemptForReplay(msg);
 							await abortableSleep(delayMs, config.signal);
 							if (config.signal.aborted) {
 								yield { type: "error", message: "Aborted" };
@@ -4863,6 +4995,7 @@ export async function* agentLoop(
 							yield* finishRequest(msg);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
+								yield* discardAttemptPersistence();
 								yield switchEvent;
 								resetRetryStateAfterModelSwitch();
 								continue;
@@ -4913,7 +5046,7 @@ export async function* agentLoop(
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};
-						yield* finishRequest(firstTokenTimeoutMessage);
+						yield* abandonAttemptForReplay(firstTokenTimeoutMessage);
 						await abortableSleep(delayMs, config.signal);
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
@@ -4925,6 +5058,7 @@ export async function* agentLoop(
 						yield* finishRequest(firstTokenTimeoutMessage);
 						const switchEvent = await applyPendingRuntimeSettings("retry");
 						if (switchEvent) {
+							yield* discardAttemptPersistence();
 							yield switchEvent;
 							resetRetryStateAfterModelSwitch();
 							continue;
@@ -4941,7 +5075,11 @@ export async function* agentLoop(
 
 				// ── Mimo ellipsis retry ──
 				// If a mimo model returned "..." as reasoning, discard and retry.
-				if (mimoEllipsisRetry && completionLimitMessage == null) {
+				//
+				// Skipped once tool progress exists: the ellipsis reasoning is degenerate but a
+				// completed tool call is not, and replaying would throw the call (and any result
+				// it already produced) away. The turn then finishes normally instead.
+				if (mimoEllipsisRetry && completionLimitMessage == null && canReplayInPlace()) {
 					chatRetryCount++;
 					const delayMs = Math.min(
 						TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
@@ -4955,7 +5093,7 @@ export async function* agentLoop(
 						delayMs,
 						diagnostics: requestDiagnostics,
 					};
-					yield* finishRequest("mimo ellipsis reasoning");
+					yield* abandonAttemptForReplay("mimo ellipsis reasoning");
 					await abortableSleep(delayMs, config.signal);
 					if (config.signal.aborted) {
 						yield { type: "error", message: "Aborted" };
@@ -4980,7 +5118,23 @@ export async function* agentLoop(
 				// In those cases the optimistic flag would suppress the empty-response guard and
 				// the turn would silently persist an empty assistant message and go idle. Compute
 				// the real picture from the accumulators instead so the guard still fires.
-				if (!sawErrorEvent && completionLimitMessage == null && !hasAnyPersistableOutput()) {
+				//
+				// `hasIrreplaceableProgress()` is checked as defence in depth, not because a
+				// currently-reachable state needs it: within one attempt `toolUses` and
+				// `settledResults` are cleared together at the top of the retry loop, so
+				// `hasAnyPersistableOutput()` (which tests `toolUses`) already covers every
+				// path that exists today. It is stated explicitly because this guard is the
+				// one place that decides "replay the identical request", and the cost of the
+				// two predicates drifting apart is the whole retry budget spent re-sending a
+				// request whose tool results were thrown away. Keeping the strong condition
+				// here means a future path that settles a result without leaving a `toolUses`
+				// entry cannot silently reintroduce that bug.
+				if (
+					!sawErrorEvent &&
+					completionLimitMessage == null &&
+					!hasAnyPersistableOutput() &&
+					!hasIrreplaceableProgress()
+				) {
 					// Evidence collected while consuming this attempt's stream. It turns the
 					// single generic "empty response" message into a specific sub-reason, so
 					// an upstream fault is no longer reported as a local misconfiguration.
@@ -5066,7 +5220,7 @@ export async function* agentLoop(
 								delayMs,
 								diagnostics: lastRetryDiagnostics,
 							};
-							yield* finishRequest(lastRetryErrorMessage);
+							yield* abandonAttemptForReplay(lastRetryErrorMessage);
 							await abortableSleep(delayMs, config.signal);
 							if (config.signal.aborted) {
 								yield { type: "error", message: "Aborted" };
@@ -5078,6 +5232,7 @@ export async function* agentLoop(
 							yield* finishRequest(lastRetryErrorMessage);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
+								yield* discardAttemptPersistence();
 								yield switchEvent;
 								resetRetryStateAfterModelSwitch();
 								continue;
@@ -5093,10 +5248,19 @@ export async function* agentLoop(
 						return;
 					}
 
-					// Genuine empty response (no prior error).  Use a dedicated
-					// counter (max 3 retries) separate from transient error retries.
+					// Genuine empty response (no prior error). Uses a dedicated counter,
+					// separate from transient error retries.
+					//
+					// The budget depends on what the upstream actually did. When it reported
+					// usage or a stop reason, the request demonstrably reached the model and
+					// came back deliberately empty — replaying the identical bytes rarely
+					// changes that (production logs show these failing the same way on every
+					// attempt) while each replay pays the full prompt again. Kinds that
+					// indicate a transport/protocol fault keep the full budget, because for
+					// those a replay genuinely does tend to succeed.
+					const maxEmptyRetries = maxEmptyResponseRetriesFor(emptyKind);
 					emptyResponseRetries++;
-					if (emptyResponseRetries <= MAX_EMPTY_RESPONSE_RETRIES && !config.signal.aborted) {
+					if (emptyResponseRetries <= maxEmptyRetries && !config.signal.aborted) {
 						const delayMs = Math.min(
 							TRANSIENT_RETRY_BASE_MS * 2 ** (emptyResponseRetries - 1),
 							backoffCeil,
@@ -5110,7 +5274,7 @@ export async function* agentLoop(
 							model: effectiveModel,
 							requestId,
 							attempt: emptyResponseRetries,
-							maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+							maxRetries: maxEmptyRetries,
 							emptyResponseKind: emptyKind,
 							evidence: emptyEvidence,
 						});
@@ -5118,11 +5282,11 @@ export async function* agentLoop(
 							type: "retrying",
 							message,
 							attempt: emptyResponseRetries,
-							maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+							maxRetries: maxEmptyRetries,
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};
-						yield* finishRequest(message);
+						yield* abandonAttemptForReplay(message);
 						await abortableSleep(delayMs, config.signal);
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
@@ -5136,6 +5300,7 @@ export async function* agentLoop(
 						yield* finishRequest(emptyResponseMessage);
 						const switchEvent = await applyPendingRuntimeSettings("retry");
 						if (switchEvent) {
+							yield* discardAttemptPersistence();
 							yield switchEvent;
 							resetRetryStateAfterModelSwitch();
 							continue;
@@ -5147,6 +5312,8 @@ export async function* agentLoop(
 						provider: effectiveProvider,
 						model: effectiveModel,
 						requestId,
+						attempts: emptyResponseRetries,
+						maxRetries: maxEmptyRetries,
 						emptyResponseKind: emptyKind,
 						evidence: emptyEvidence,
 					});
@@ -5188,13 +5355,23 @@ export async function* agentLoop(
 					!!collectCompletedWebSearches(webSearchAccum) ||
 					!!collectCompletedImageGenerations(imageGenAccum);
 				const hasReasoning = !!collectReasoningBlocks(reasoningBlockMap);
-				if (completionLimitMessage == null && !hasMeaningfulOutput && hasReasoning) {
+				if (
+					completionLimitMessage == null &&
+					!hasMeaningfulOutput &&
+					hasReasoning &&
+					// A tool that already ran makes this not a dead turn: discarding the
+					// attempt would throw its result away and re-send the same request.
+					canReplayInPlace()
+				) {
 					// Drop accumulated reasoning so flushPartialContent won't persist it.
 					reasoningBlockMap.clear();
 					redactedThinkingBlocks.length = 0;
 					// Tell the frontend to discard the live streaming reasoning it is showing.
 					yield { type: "stream_reset" };
-					yield* finishRequest(REASONING_ONLY_MESSAGE);
+					// The reasoning blocks were already persisted as they streamed, so the
+					// in-memory clear above is not enough on its own — without this the
+					// discarded thinking stays in the transcript and stacks up on every retry.
+					yield* abandonAttemptForReplay(REASONING_ONLY_MESSAGE);
 					if (config.signal.aborted) {
 						yield { type: "error", message: "Aborted" };
 						return;

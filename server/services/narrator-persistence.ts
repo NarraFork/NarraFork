@@ -406,6 +406,19 @@ export async function bumpParentNarratorMessageVersion(
 	await bumpNarratorMessageVersions([parentToolCall.narratorId]);
 }
 
+/**
+ * Bump one narrator's message version after its messages were mutated outside the
+ * ordinary insert/append paths.
+ *
+ * Every other mutation in this file bumps the version inline; a mutation that skips it
+ * stays invisible to incremental sync, so a client that reconnects keeps its stale copy.
+ * Exposed for in-place content edits such as discarding the blocks of a replayed
+ * provider attempt.
+ */
+export async function bumpNarratorMessageVersion(narratorId: string): Promise<void> {
+	await bumpNarratorMessageVersions([narratorId]);
+}
+
 /** Insert a message into narrator_message_refs junction table */
 async function insertMessageRef(
 	narratorId: string,

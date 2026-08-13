@@ -4,9 +4,14 @@ import {
 	projectSubagentToolInputSummary,
 	type SubagentToolInputSummary,
 } from "@shared/subagent-tool-summary";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { apiRequests, narratorMessageRefs, narratorMessages } from "../db/schema";
+import {
+	apiRequests,
+	narratorMessageRefs,
+	narratorMessages,
+	narratorToolCalls,
+} from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import {
@@ -25,6 +30,7 @@ import { logger } from "../lib/logger";
 import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "../lib/settings";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
+import { bumpNarratorMessageVersion } from "./narrator-persistence";
 import type { EnterPlanModeToolResultCommit } from "./narrator-plan-mode";
 import {
 	enrichToolUseBlocks,
@@ -109,6 +115,24 @@ export interface EventHandlerContext {
 	toolCallIdsMap?: Map<string, string>;
 	/** Tracks API requests in progress (requestId → request info) */
 	apiRequestsMap?: Map<string, ApiRequestHandle>;
+	/**
+	 * Per-attempt block baselines: requestId → how many blocks the partial assistant
+	 * message held when that attempt started writing. `attempt_discarded` truncates
+	 * back to its own entry.
+	 *
+	 * Keyed by requestId rather than kept as a single "current" value because
+	 * `api_request_start` is emitted LAZILY by the loop (on the first stream event,
+	 * or during request teardown). An attempt that dies before producing anything
+	 * therefore emits `attempt_discarded` BEFORE its own `api_request_start`, so a
+	 * single mutable baseline would be the previous attempt's — and truncating to it
+	 * could delete blocks an earlier, successful attempt committed. Recording the
+	 * baseline the first time this attempt is seen (whichever of the two events
+	 * arrives first) makes the pairing order-independent.
+	 *
+	 * Holding it here rather than in the loop keeps the loop free of any knowledge
+	 * of how blocks are stored.
+	 */
+	attemptBlockBaselines?: Map<string, number>;
 	/** API requests inserted during this turn and awaiting assistant-message binding */
 	pendingApiRequestIds?: string[];
 	/** Exact persisted tool-call row ids prepared for EnterPlanMode in this turn. */
@@ -496,6 +520,202 @@ function reorderPersistedToolUseBlocks(
 	return reordered;
 }
 
+// === Discarded attempt cleanup ===
+
+/** Block count of a partial assistant message, or 0 when there is no partial row yet. */
+async function countPersistedBlocks(partialMessageId: string | undefined): Promise<number> {
+	if (!partialMessageId) return 0;
+	const row = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, partialMessageId),
+		columns: { contentJson: true },
+	});
+	return Array.isArray(row?.contentJson) ? row.contentJson.length : 0;
+}
+
+/**
+ * Record where `requestId` starts writing into the partial assistant message, and
+ * return that baseline.
+ *
+ * Idempotent per requestId, which is what makes the pairing order-independent: both
+ * `api_request_start` and `attempt_discarded` call this, and whichever arrives first
+ * establishes the baseline. The loop flushes `api_request_start` lazily, so for an
+ * attempt that failed before producing any stream event the discard genuinely comes
+ * first — and at that moment the block count still reflects the state before this
+ * attempt wrote anything, so it is the correct baseline either way.
+ *
+ * Entries are dropped once consumed (or when the turn's message is finalized), so the
+ * map cannot grow past the attempts of the current turn.
+ */
+async function recordAttemptBlockBaseline(
+	ctx: EventHandlerContext,
+	requestId: string,
+): Promise<number> {
+	ctx.attemptBlockBaselines ??= new Map();
+	const existing = ctx.attemptBlockBaselines.get(requestId);
+	if (existing != null) return existing;
+	const baseline = await countPersistedBlocks(ctx.getPartialMessageId());
+	ctx.attemptBlockBaselines.set(requestId, baseline);
+	return baseline;
+}
+
+/**
+ * Undo everything a discarded provider attempt wrote into the partial assistant message.
+ *
+ * Blocks are persisted the moment they complete, so an attempt that is replayed leaves
+ * its reasoning/text/tool_use behind. Repeated replays therefore stack several copies of
+ * near-identical content onto one message — the visible half of "history keeps growing
+ * while the request never changes".
+ *
+ * Truncation is anchored to the baseline recorded for THIS attempt's requestId, so only
+ * blocks this attempt appended are removed and anything committed by an earlier,
+ * successful attempt in the same turn survives.
+ *
+ * Tool-call rows are deleted only when the tool never executed (`initializing`/`pending`).
+ * A tool that reached `running`/`success`/`fail` has real side effects and its row must be
+ * kept, matching `finalizeOrCleanupPartialMessage`. In that case its `tool_use` block is
+ * kept as well: dropping the block while keeping the row would leave a result with no call.
+ */
+async function discardAttemptPersistedBlocks(
+	ctx: EventHandlerContext,
+	narratorId: string,
+	broadcastTargetId: string,
+	requestId: string,
+): Promise<void> {
+	// The live view is showing content that is about to be deleted, so it has to be
+	// told — clearing only the server-side reconnect snapshot would leave an attached
+	// client rendering blocks that no longer exist until something else happens to
+	// retire them. Done regardless of whether a partial row exists: the streaming
+	// blocks are client state and are not conditional on persistence.
+	clearStreamingSnapshot(broadcastTargetId);
+	dualBroadcast(ctx, {
+		type: "streaming_reset",
+		narratorId: broadcastTargetId,
+		...(ctx.parentToolUseId ? { parentToolUseId: ctx.parentToolUseId } : {}),
+	});
+	ctx.sseEmitter?.emit("event", { type: "streaming_reset" });
+
+	const partialId = ctx.getPartialMessageId();
+	// Correlated by requestId, not by "the most recent api_request_start": that event
+	// is flushed lazily, so an attempt that produced nothing emits its discard first.
+	// Recording here (idempotently) yields this attempt's own starting block count.
+	// Deliberately NOT deleted afterwards: this attempt's `api_request_start` may still
+	// be flushed after the discard, and finding its entry already present is what stops
+	// it from re-recording a baseline against the ALREADY-truncated message. The map is
+	// cleared when the turn's assistant message is finalized.
+	const baseline = await recordAttemptBlockBaseline(ctx, requestId);
+	if (!partialId) return;
+
+	try {
+		const message = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, partialId),
+			columns: { contentJson: true },
+		});
+		const blocks = Array.isArray(message?.contentJson)
+			? (message.contentJson as Array<Record<string, unknown>>)
+			: [];
+		if (blocks.length <= baseline) return;
+
+		const discarded = blocks.slice(baseline);
+		const discardedToolUseIds = discarded.flatMap((block) =>
+			block.type === "tool_use" && typeof block.id === "string" ? [block.id] : [],
+		);
+
+		// Which of those tool calls never ran — only these may be removed.
+		const executedToolUseIds = new Set<string>();
+		if (discardedToolUseIds.length > 0) {
+			const rows = await db.query.narratorToolCalls.findMany({
+				where: and(
+					eq(narratorToolCalls.messageId, partialId),
+					inArray(narratorToolCalls.toolUseId, discardedToolUseIds),
+				),
+				columns: { id: true, toolUseId: true, status: true },
+			});
+			const removableRowIds: string[] = [];
+			for (const row of rows) {
+				if (row.status === "initializing" || row.status === "pending") {
+					removableRowIds.push(row.id);
+				} else {
+					executedToolUseIds.add(row.toolUseId);
+				}
+			}
+			if (removableRowIds.length > 0) {
+				await db.delete(narratorToolCalls).where(inArray(narratorToolCalls.id, removableRowIds));
+				for (const toolUseId of discardedToolUseIds) {
+					if (!executedToolUseIds.has(toolUseId)) ctx.toolCallIdsMap?.delete(toolUseId);
+				}
+			}
+		}
+
+		// Keep the blocks of tools that actually executed, drop the rest. Order is
+		// preserved by filtering the whole array rather than concatenating the survivors
+		// after the baseline slice: `appendBlockToMessage` maintains blocks in
+		// `outputIndex` order, and `reorderPersistedToolUseBlocks` (run at
+		// `assistant_message`) reads tool positions, so both rely on that invariant.
+		const isRetainedBlock = (block: Record<string, unknown>, index: number): boolean =>
+			index < baseline ||
+			(block.type === "tool_use" &&
+				typeof block.id === "string" &&
+				executedToolUseIds.has(block.id));
+		const nextBlocks = blocks.filter(isRetainedBlock);
+		const retainedFromAttempt = nextBlocks.length - baseline;
+		const contentText = nextBlocks
+			.flatMap((block) =>
+				block.type === "text" && typeof block.text === "string" ? [block.text] : [],
+			)
+			.join("\n");
+
+		await db
+			.update(narratorMessages)
+			.set({ contentJson: nextBlocks, contentText: contentText || null })
+			.where(eq(narratorMessages.id, partialId));
+
+		logger.info("Discarded persisted blocks of a replayed attempt", {
+			narratorId,
+			partialId,
+			baseline,
+			discardedBlocks: discarded.length - retainedFromAttempt,
+			retainedExecutedToolCalls: retainedFromAttempt,
+		});
+
+		// `streaming_reset` above only drops LIVE streaming blocks. Blocks that already
+		// completed were served to clients from this partial row, so they sit in the
+		// message cache and nothing else would retire them until the turn's
+		// `assistant_message` arrives — which is many seconds and several retries away.
+		// Publish the truncated row (and bump the sync version, mirroring every other
+		// message mutation) so an attached client and a reconnecting one agree.
+		await bumpNarratorMessageVersion(narratorId);
+		const updated = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, partialId),
+			with: { toolCalls: true },
+		});
+		if (updated) {
+			const ref = await db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, partialId),
+				),
+				columns: { seq: true },
+			});
+			const processed = enrichToolUseBlocks(truncateToolIO([{ ...updated, seq: ref?.seq }]))[0];
+			dualBroadcast(ctx, {
+				type: "message_updated",
+				narratorId: broadcastTargetId,
+				message: processed,
+			});
+			ctx.sseEmitter?.emit("event", { type: "message_updated", data: processed });
+		}
+	} catch (err) {
+		// Cleanup is best-effort: failing it must not abort the replay. The remnants are
+		// invisible to the model (an unexecuted tool call is never replayed into history),
+		// so the cost of a miss is a longer transcript, not a corrupted one.
+		logger.warn("Failed to discard persisted blocks of a replayed attempt", {
+			narratorId,
+			partialId,
+			error: String(err),
+		});
+	}
+}
+
 // === Reasoning translation ===
 
 const LOCALE_NAMES: Record<string, string> = {
@@ -564,6 +784,25 @@ function findReasoningBlockIndex(
 }
 
 /**
+ * Whether a resolved reasoning index still points at the block that was translated.
+ *
+ * Translation is fire-and-forget and settles long after the request that produced
+ * the block, so in between the attempt can be discarded and replayed
+ * (`attempt_discarded` truncates the blocks that attempt persisted). Neither
+ * locator key is attempt-scoped: `outputIndex` in particular is reproduced by the
+ * replay, so the index can resolve to the NEW attempt's reasoning — a different
+ * thought wearing the same coordinates.
+ *
+ * The text is the discriminator: `appendBlockToMessage` stores it verbatim and
+ * `patchReasoningTranslation` only ever adds `translatedText`, so an exact match
+ * means the target is still the same block.
+ */
+export function isSameReasoningBlock(block: unknown, reasoningText: string): boolean {
+	const candidate = block as PersistedReasoningBlock | undefined;
+	return candidate?.type === "reasoning" && candidate.text === reasoningText;
+}
+
+/**
  * Translate a reasoning block's text via the summary model, then patch the
  * message in DB and broadcast the updated message to connected clients.
  * Runs as fire-and-forget — errors are logged but never propagate.
@@ -610,6 +849,10 @@ function translateReasoningBlock(
 				outputIndex: locator?.outputIndex,
 			});
 			if (targetIdx === -1) return;
+			// The resolved block must still BE the one that was translated: a discarded
+			// and replayed attempt can put different reasoning at the same coordinates.
+			// See isSameReasoningBlock.
+			if (!isSameReasoningBlock(blocks[targetIdx], reasoningText)) return;
 
 			await narratorService.patchReasoningTranslation(messageId, targetIdx, translated);
 
@@ -1116,6 +1359,10 @@ export async function processEvent(
 		case "assistant_message": {
 			// Snapshot: clear streaming state — this turn's text + tools are done
 			clearStreamingSnapshot(broadcastTargetId);
+			// The turn is settled, so no attempt of it can be discarded any more. Drop the
+			// per-attempt baselines rather than letting them accumulate across a long
+			// session (each retry adds one entry).
+			ctx.attemptBlockBaselines?.clear();
 
 			const tokenUsage = ctx.getTokenUsage();
 			const turnUsage = tokenUsage
@@ -2188,6 +2435,21 @@ export async function processEvent(
 					kind: "narrator",
 				}),
 			);
+			// Mark where this attempt starts writing, keyed by its requestId. Idempotent:
+			// if the attempt was already discarded (this event is flushed lazily and can
+			// arrive after that), the existing baseline is kept rather than re-measured
+			// against the already-truncated message.
+			await recordAttemptBlockBaseline(ctx, event.requestId);
+			return null;
+		}
+
+		case "attempt_discarded": {
+			// The loop is about to replay the identical request. Everything this attempt
+			// persisted must go: blocks are written as they complete, so leaving them
+			// would stack a near-identical copy of the reasoning and tool calls onto the
+			// same assistant message on every replay — the transcript grows while the
+			// outgoing request never changes.
+			await discardAttemptPersistedBlocks(ctx, narratorId, broadcastTargetId, event.requestId);
 			return null;
 		}
 

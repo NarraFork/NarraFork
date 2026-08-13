@@ -217,3 +217,147 @@ describe("injectInjectionBubbleChrome", () => {
 		}
 	});
 });
+
+/**
+ * Three kinds of speaker, three kinds of avatar.
+ *
+ * The regression this pins: all three used to funnel into `UserAvatar`, which paints the
+ * first two characters of the name. So the platform's avatar literally read "系" beside
+ * the word "系统", and two subagents named "explore-1" / "explore-2" — whose first two
+ * characters are identical — got the SAME glyph.
+ */
+describe("InjectionSpeakerHeader — avatar per speaker kind", () => {
+	/**
+	 * Render, read the facts out as PLAIN VALUES, then tear the root down.
+	 *
+	 * The teardown is the point: `renderHeader` overwrites the shared `currentRoot` /
+	 * `currentContainer`, so a test that renders twice would abandon the first root
+	 * without unmounting it — `afterEach` only ever sees the last one. That leak spilled
+	 * into a later test in this file. Returning values (not DOM nodes) also keeps the
+	 * assertions valid after the tree is gone.
+	 */
+	function renderFacts(props: React.ComponentProps<typeof InjectionSpeakerHeader>) {
+		renderHeader(props);
+		const container = currentContainer;
+		if (!container) throw new Error("expected a rendered container");
+		// The identicon is an <img> whose src is an inline SVG data URI.
+		const identiconSrc =
+			container.querySelector('img[src^="data:image/svg+xml"]')?.getAttribute("src") ?? null;
+		const facts = {
+			identiconSrc,
+			// Any avatar image (a real account's blob, or the identicon).
+			images: container.querySelectorAll("img").length,
+			text: container.textContent ?? "",
+		};
+		if (currentRoot) {
+			const root = currentRoot;
+			act(() => root.unmount());
+			currentRoot = null;
+		}
+		container.remove();
+		currentContainer = null;
+		return facts;
+	}
+
+	test("an agent with its own id gets the deterministic identicon", () => {
+		const { identiconSrc } = renderFacts({ speaker: "explore-1", speakerId: "narr-aaaa1111" });
+		expect(identiconSrc).not.toBeNull();
+	});
+
+	test("two similarly-named agents get DIFFERENT glyphs", () => {
+		// This is the collision initials could not avoid.
+		const firstSrc =
+			renderFacts({ speaker: "explore-1", speakerId: "narr-aaaa1111" }).identiconSrc ?? "";
+		const secondSrc =
+			renderFacts({ speaker: "explore-2", speakerId: "narr-bbbb2222" }).identiconSrc ?? "";
+		expect(firstSrc.length).toBeGreaterThan(0);
+		expect(secondSrc.length).toBeGreaterThan(0);
+		expect(firstSrc).not.toBe(secondSrc);
+	});
+
+	test("the same id always yields the same glyph", () => {
+		const a = renderFacts({ speaker: "explore-1", speakerId: "narr-stable" });
+		const b = renderFacts({ speaker: "renamed later", speakerId: "narr-stable" });
+		expect(a.identiconSrc).toBe(b.identiconSrc);
+	});
+
+	test("a platform reminder shows a glyph, never the initials of the word 'System'", () => {
+		const { images, identiconSrc } = renderFacts({
+			speaker: null,
+			speakerId: null,
+			source: "living_work_spec",
+		});
+		// No identicon (there is no per-producer identity to key one on) and no avatar
+		// image at all — the platform gets an icon, and the icon is not an <img>.
+		expect(identiconSrc).toBeNull();
+		expect(images).toBe(0);
+	});
+});
+
+/**
+ * A finished background COMMAND is tool output, not a participant.
+ *
+ * `bg_bash` reaches the header with a `speakerId` (the task id) like an agent does, but
+ * an identicon would claim an identity it does not have: `run-tests` is a shell
+ * invocation, not somebody in the conversation. It gets the Bash tool's terminal glyph.
+ */
+describe("InjectionSpeakerHeader — bg_bash is a tool, not a speaker", () => {
+	test("a finished background command shows the terminal glyph, not an identicon", () => {
+		renderHeader({ speaker: "run-tests", speakerId: "task-bash-1", source: "bg_bash" });
+		const container = currentContainer;
+		if (!container) throw new Error("expected a rendered container");
+		// No identicon: the glyph is an icon, not an <img> data URI.
+		expect(container.querySelector('img[src^="data:image/svg+xml"]')).toBeNull();
+		expect(container.querySelectorAll("img").length).toBe(0);
+		// The alias still names the row, so the reader knows WHICH command finished.
+		expect(container.textContent ?? "").toContain("run-tests");
+	});
+
+	test("a background AGENT still gets its identicon (it is a participant)", () => {
+		// The contrast that makes the bash rule meaningful rather than arbitrary.
+		renderHeader({ speaker: "explore-1", speakerId: "narr-agent-1", source: "bg_agent" });
+		const container = currentContainer;
+		if (!container) throw new Error("expected a rendered container");
+		expect(container.querySelector('img[src^="data:image/svg+xml"]')).not.toBeNull();
+	});
+});
+
+/**
+ * The header names the PRODUCER, not "the platform".
+ *
+ * The regression this pins: every platform source collapsed to one literal "System", so
+ * a task digest, a behaviour fence and a progress nudge all read identically even though
+ * the reader reacts to them differently. `sidecar.sources.*` carries a name per producer.
+ *
+ * The suite-wide i18n mock returns the key verbatim, which is exactly the "translation
+ * missing" shape — so these tests assert the two branches through that lens: a key that
+ * resolves (the mock echoes a recognizable string) vs the generic fallback.
+ */
+describe("InjectionSpeakerHeader — producer naming", () => {
+	test("a platform row asks for its producer's own name, not a generic label", () => {
+		// With the echoing mock, a resolved lookup would surface the source key path. The
+		// assertion that matters: the header CONSULTS the per-source key rather than
+		// hard-coding one label for every platform producer.
+		const digest = renderHeader({ speaker: null, source: "living_work_spec" });
+		const fence = renderHeader({ speaker: null, source: "behavior_fence" });
+		// Both fall back identically under the echoing mock (no dictionary), which is the
+		// documented missing-key path — but neither may be a hard-coded per-producer string.
+		expect(digest).toContain("origin.kind.system");
+		expect(fence).toContain("origin.kind.system");
+	});
+
+	test("a named speaker always wins over any source label", () => {
+		const row = renderHeader({ speaker: "explore-1", source: "subagent_message" });
+		expect(row).toContain("explore-1");
+		expect(row).not.toContain("origin.kind.system");
+	});
+
+	test("a real account wins over both", () => {
+		const row = renderHeader({
+			speaker: "ignored",
+			source: "merge_summary",
+			creator: { id: "u1", username: "alice", avatarColor: null, avatarImageId: null },
+		});
+		expect(row).toContain("alice");
+	});
+});

@@ -1689,6 +1689,10 @@ function adaptSpokenInjection(
 				data: {
 					markdown: rawSideCarToMarkdown(text),
 					speaker: spokenSpeakerLabel(message),
+					// The sender's own id seeds the deterministic identicon in the header.
+					// Titles cluster ("explore-1", "explore-2") so initials collide; the id
+					// does not.
+					speakerId: message.fromId ?? null,
 					speakerKind: message.fromType ?? null,
 					isBroadcast: message.isBroadcast === true,
 					source,
@@ -1722,6 +1726,8 @@ function adaptSpokenInjection(
 					// would make a silent success indistinguishable from one that never ran.
 					markdown: rawSideCarToMarkdown(preview || sysLabel(ctx, "empty")),
 					speaker: task.alias?.trim() || task.title?.trim() || task.id,
+					// A background task is addressable by id, which is what seeds its glyph.
+					speakerId: task.id ?? null,
 					speakerKind: task.status ?? null,
 					isBroadcast: false,
 					source,
@@ -1762,7 +1768,12 @@ function adaptSpokenInjection(
 			data: {
 				markdown: rawSideCarToMarkdown(hit.summary.trim()),
 				speaker: hit.title?.trim() || hit.entryId,
+				// The entry's own id seeds its glyph, so two similarly-titled entries stay
+				// visually distinct.
+				speakerId: hit.entryId ?? null,
 				speakerKind: null,
+				// Without this the row had no context-menu inspector at all.
+				modelFacing: modelFacingText,
 				isBroadcast: false,
 				source,
 				hasHeader: true,
@@ -1781,6 +1792,57 @@ function adaptSpokenInjection(
 	// the same speaker as `spec_continuation`, which was already a bubble, so the split
 	// was internally inconsistent. And full width made the long task lines run far past a
 	// comfortable measure; the bubble's width cap fixes exactly that.
+	// A task DIGEST renders as task ROWS, not markdown bullets — the same rows the
+	// auto-continuation uses. Before this, the periodic reminder and the continuation
+	// showed the same data in two visual languages: the digest demoted `role` to a text
+	// prefix ("doing: …") and `protected` to the words "· protected", while the
+	// continuation had a status glyph and a lock. Same payload, one presentation now.
+	if (PLATFORM_INJECTION_SOURCES.has(source) && body.kind === "tasks") {
+		const variant = typeof body.variant === "string" ? body.variant : "current";
+		const tasks = Array.isArray(body.tasks) ? body.tasks : [];
+		// Empty / over-threshold digests have no rows to draw; they carry the same
+		// localized sentence the markdown projection used as its headline.
+		const emptyLabel =
+			variant === "current" && tasks.length > 0
+				? null
+				: variant === "emptyNever"
+					? sysLabel(ctx, "tasksEmptyNever")
+					: variant === "emptyDone"
+						? sysLabel(ctx, "tasksEmptyDone")
+						: variant === "tooMany"
+							? // `tasksTooMany` carries an `{n}` placeholder; sysLabel has no
+								// interpolation, so substitute here (same as the markdown path).
+								sysLabel(ctx, "tasksTooMany").replace("{n}", String(body.taskCount ?? 0))
+							: null;
+		return [
+			{
+				kind: "injection-bubble",
+				key: `${idBase}-b${blockIndex}-p-${source}`,
+				data: {
+					payload: {
+						kind: "spec-task",
+						data: {
+							...(emptyLabel ? { emptyLabel } : {}),
+							tasks: tasks.map((task) => ({
+								text: task.text ?? "",
+								role: task.role,
+								protected: task.protected === true,
+							})),
+						},
+					},
+					speaker: null,
+					speakerKind: null,
+					isBroadcast: false,
+					source,
+					hasHeader: true,
+					// The verbatim model-facing copy, so the row can be inspected like any
+					// other injection (this branch previously offered no inspector).
+					modelFacing: modelFacingText,
+				},
+			},
+		];
+	}
+
 	if (PLATFORM_INJECTION_SOURCES.has(source)) {
 		const markdown = sideCarBodyToMarkdown(source, body, ctx.labels);
 		if (!markdown.trim()) return null;
@@ -1798,6 +1860,8 @@ function adaptSpokenInjection(
 					isBroadcast: false,
 					source,
 					hasHeader: true,
+					// Same inspector contract as every other injection row.
+					modelFacing: modelFacingText,
 				},
 			},
 		];

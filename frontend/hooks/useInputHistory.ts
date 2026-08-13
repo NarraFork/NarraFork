@@ -1,15 +1,61 @@
+import { readSession, removeSession, writeSession } from "@frontend/lib/session-store";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 
 const MAX_HISTORY = 50;
-const MAX_HISTORY_MESSAGE_CHARS = 20_000;
-const MAX_HISTORY_STORAGE_CHARS = 512_000;
+/**
+ * Longest single entry kept for recall.
+ *
+ * Was 20k. Recall exists so the user can re-send something they just typed; a
+ * multi-thousand-character body is retrieved from the transcript, not with the up
+ * arrow. The old ceiling let 50 entries reach 1M characters for ONE narrator,
+ * against a ~5MB area shared by every narrator the tab ever opened.
+ */
+export const MAX_HISTORY_MESSAGE_CHARS = 2_000;
+/** Whole-list ceiling, enforced on write so the list is trimmed rather than dropped. */
+const MAX_HISTORY_STORAGE_CHARS = 24_000;
+
+/**
+ * Write a history list under the CURRENT limits.
+ *
+ * Exported so the legacy-key sweep can adopt a pre-facade list without copying
+ * the trimming rules: entries past the per-message ceiling are dropped, then the
+ * list is trimmed from the oldest end until it fits. A second implementation
+ * would be the thing that lets the two drift.
+ */
+export function writeInputHistoryEntries(storageId: string, entries: string[]): void {
+	const kept = entries
+		.filter((entry) => entry.length <= MAX_HISTORY_MESSAGE_CHARS)
+		.slice(0, MAX_HISTORY);
+	if (kept.length === 0) {
+		removeSession("narrator-history", storageId);
+		return;
+	}
+	let list = kept;
+	let serialized = JSON.stringify(list);
+	while (list.length > 1 && serialized.length > MAX_HISTORY_STORAGE_CHARS) {
+		list = list.slice(0, -1);
+		serialized = JSON.stringify(list);
+	}
+	if (serialized.length > MAX_HISTORY_STORAGE_CHARS) {
+		removeSession("narrator-history", storageId);
+		return;
+	}
+	writeSession("narrator-history", storageId, serialized);
+}
 
 /**
  * 消息输入历史记录 hook。
  * 记录用户发送的消息，支持上下箭头翻阅。
  * 历史按 sessionStorage 持久化（页面刷新后保留，关闭标签页后清空）。
+ *
+ * 写入经由 `lib/session-store`：带合并写入、命名空间条目上限和 LRU 淘汰，
+ * 因此"标签页访问过的每个叙述者"不会无上限累积。
+ *
+ * `storageKey` 传 null 表示"尚不知道该写到哪里"（例如当前用户还没加载完）：
+ * 此时读写都不落盘。历史 key 按 `(user, narrator)` 划分，用一个占位 key 顶替
+ * 会占掉命名空间配额，并让登录态就绪前后各留一份互不相干的历史。
  */
-export function useInputHistory(storageKey: string) {
+export function useInputHistory(storageKey: string | null) {
 	const indexRef = useRef(-1);
 	const draftRef = useRef("");
 	const storageKeyRef = useRef(storageKey);
@@ -38,13 +84,10 @@ export function useInputHistory(storageKey: string) {
 	}, [storageKey, notify]);
 
 	const getHistory = useCallback((): string[] => {
+		if (storageKey == null) return [];
 		try {
-			const raw = sessionStorage.getItem(storageKey);
+			const raw = readSession("narrator-history", storageKey);
 			if (!raw) return [];
-			if (raw.length > MAX_HISTORY_STORAGE_CHARS) {
-				sessionStorage.removeItem(storageKey);
-				return [];
-			}
 			const parsed: unknown = JSON.parse(raw);
 			if (!Array.isArray(parsed)) return [];
 			return parsed
@@ -58,11 +101,10 @@ export function useInputHistory(storageKey: string) {
 
 	const setHistory = useCallback(
 		(history: string[]) => {
-			try {
-				sessionStorage.setItem(storageKey, JSON.stringify(history.slice(0, MAX_HISTORY)));
-			} catch {
-				// Ignore storage quota/private mode errors. Chat content itself is already persisted server-side.
-			}
+			if (storageKey == null) return;
+			// Trimming (oldest end first, so recent entries survive an overflow) lives in
+			// writeInputHistoryEntries, shared with the legacy-key migration.
+			writeInputHistoryEntries(storageKey, history);
 		},
 		[storageKey],
 	);

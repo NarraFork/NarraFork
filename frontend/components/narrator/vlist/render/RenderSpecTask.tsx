@@ -1,21 +1,33 @@
 /**
- * RenderSpecTask.tsx — the framed Dynamic Spec task row inside an injection bubble.
+ * RenderSpecTask.tsx — Dynamic Spec task rows inside an injection bubble.
  *
- * Paints what measure-spec-task reserved: a status glyph, an optional protected lock,
- * and the task text wrapped over however many lines the measure pass counted. No
- * tinted band, no single-line clamp, no nested card — that was the card-in-a-card
- * (and the doubled lock) this replaces.
+ * Paints exactly what measure-spec-task reserved: per row a status glyph, an optional
+ * protected lock, and the task text wrapped over however many lines the measure pass
+ * counted. No tinted band, no single-line clamp, no nested card.
  *
- * The text is painted at the SAME font and width the measure pass wrapped it at
- * (`measured.contentWidth`), so the on-screen line breaks match the predicted height
- * instead of drifting from them. The glyph echoes the tool card's task language: a
- * continuation is the scheduler telling the model to keep GOING, so it reads as
- * `doing` (a spinning play glyph); a blocked continuation flips to the orange ban.
- * The lock is the same yellow the tool card uses for a protected task.
+ * ## Why both producers land here
+ *
+ * The auto-continuation (`spec_continuation`) carries ONE task; the periodic digest
+ * (`living_work_spec`) carries the whole open list. They used to render as different
+ * species of object — a task row vs markdown bullets whose status was a text prefix
+ * ("doing: …") and whose protected flag was the words "· protected". Same data, two
+ * visual languages. Both now come through this renderer, so a continuation row and a
+ * digest row are the same object at the same metrics.
+ *
+ * Each row re-derives its own text column with `specTaskChromeWidth`, mirroring the
+ * measure pass: a protected row's lock lane makes its column narrower, and painting
+ * every row at one shared width would re-wrap the locked ones.
  */
 
-import { Group, ThemeIcon } from "@mantine/core";
-import { IconBan, IconLock, IconPlayerPlay } from "@tabler/icons-react";
+import { Group, Text, ThemeIcon } from "@mantine/core";
+import {
+	IconBan,
+	IconCheck,
+	IconChevronRight,
+	IconLock,
+	IconPlayerPlay,
+} from "@tabler/icons-react";
+import type { ComponentType } from "react";
 import {
 	SPEC_TASK_FONT,
 	SPEC_TASK_GLYPH,
@@ -23,9 +35,28 @@ import {
 	SPEC_TASK_LINE_HEIGHT,
 	SPEC_TASK_LOCK,
 	SPEC_TASK_LOCK_GAP,
+	SPEC_TASK_ROW_GAP,
 	type SpecTaskData,
+	type SpecTaskRow,
+	specTaskChromeWidth,
+	specTaskRows,
 } from "../measure/measure-spec-task";
 import type { MeasuredElement } from "../prepared-block";
+
+/**
+ * Glyph per Dynamic Spec role, matching the tool card's task list so the two read as
+ * one vocabulary. A continuation has no role and is `doing` by definition.
+ */
+const ROLE_GLYPH: Record<
+	string,
+	{ Icon: ComponentType<{ size?: number; className?: string }>; color: string }
+> = {
+	doing: { Icon: IconPlayerPlay, color: "blue" },
+	next: { Icon: IconChevronRight, color: "indigo" },
+	todo: { Icon: IconChevronRight, color: "yellow" },
+	blocked: { Icon: IconBan, color: "orange" },
+	done: { Icon: IconCheck, color: "green" },
+};
 
 export function RenderSpecTask({
 	measured,
@@ -34,25 +65,67 @@ export function RenderSpecTask({
 	measured: MeasuredElement;
 	data: SpecTaskData;
 }) {
-	const blocked = data.blocked === true;
-	const isProtected = data.protected === true;
-	const Icon = blocked ? IconBan : IconPlayerPlay;
-	const glyphColor = blocked ? "orange" : "blue";
+	const emptyLabel = data.emptyLabel?.trim();
+	if (emptyLabel) {
+		// A digest with nothing to list: one dimmed line at the full inner width, so an
+		// empty spec still says so instead of leaving a header-only bubble.
+		return (
+			<Text
+				size="xs"
+				c="dimmed"
+				style={{
+					width: measured.contentWidth,
+					lineHeight: `${SPEC_TASK_LINE_HEIGHT}px`,
+					whiteSpace: "pre-wrap",
+					overflowWrap: "anywhere",
+				}}
+			>
+				{emptyLabel}
+			</Text>
+		);
+	}
+
+	const rows = specTaskRows(data);
+	// The bubble overwrites `measured.contentWidth` with its own inner width, so the
+	// per-row column has to be re-derived here (this is the overflow bug's fix: reading
+	// contentWidth directly gave the text the full inner width and then placed the
+	// glyph/lock lanes beside it, pushing the text past the bubble's right edge).
+	const innerWidth = measured.contentWidth;
 	return (
-		<Group
-			gap={SPEC_TASK_GLYPH_GAP}
-			wrap="nowrap"
-			align="flex-start"
-			style={{ height: measured.height, boxSizing: "border-box" }}
+		<div
+			style={{
+				display: "flex",
+				flexDirection: "column",
+				gap: SPEC_TASK_ROW_GAP,
+				boxSizing: "border-box",
+			}}
 		>
+			{rows.map((row, index) => (
+				// biome-ignore lint/suspicious/noArrayIndexKey: rows are a stable ordered list
+				<SpecTaskRowView key={index} row={row} innerWidth={innerWidth} />
+			))}
+		</div>
+	);
+}
+
+function SpecTaskRowView({ row, innerWidth }: { row: SpecTaskRow; innerWidth: number }) {
+	const blocked = row.blocked === true || row.role === "blocked";
+	const isProtected = row.protected === true;
+	const entry = ROLE_GLYPH[blocked ? "blocked" : (row.role ?? "doing")] ?? ROLE_GLYPH.doing;
+	const { Icon, color } = entry;
+	// `doing` is the only live state, so it is the only one that spins.
+	const spinning = !blocked && (row.role ?? "doing") === "doing";
+	const textWidth = Math.max(1, innerWidth - specTaskChromeWidth(row));
+	return (
+		<Group gap={SPEC_TASK_GLYPH_GAP} wrap="nowrap" align="flex-start">
 			<Group
 				gap={SPEC_TASK_LOCK_GAP}
 				wrap="nowrap"
 				align="center"
 				style={{ flexShrink: 0, height: SPEC_TASK_LINE_HEIGHT }}
 			>
-				<ThemeIcon size={SPEC_TASK_GLYPH} variant="light" color={glyphColor} radius="xl">
-					<Icon size={10} className={blocked ? undefined : "vlist-spin"} />
+				<ThemeIcon size={SPEC_TASK_GLYPH} variant="light" color={color} radius="xl">
+					<Icon size={10} className={spinning ? "vlist-spin" : undefined} />
 				</ThemeIcon>
 				{isProtected ? (
 					<IconLock
@@ -64,15 +137,11 @@ export function RenderSpecTask({
 			</Group>
 			<div
 				style={{
-					// `flex: 0 0 auto`, NOT `flex: 1`: the width must be exactly the one the
-					// measure pass wrapped the text at. With `flex: 1` (plus `minWidth: 0`)
-					// a frame narrower than chrome + contentWidth would let the browser
-					// shrink this column, wrapping into more lines than were measured —
-					// while the outer frame's height is already pinned to `measured.height`,
-					// so the extra lines would be clipped. Growing is equally wrong: it
-					// would wrap at a width the measurement never saw.
+					// `flex: 0 0 auto` with the measured width: letting flex shrink or grow
+					// this column would re-wrap the text at a width the measure pass never
+					// saw, while the frame's height is already pinned.
 					flex: "0 0 auto",
-					width: measured.contentWidth,
+					width: textWidth,
 					font: SPEC_TASK_FONT,
 					lineHeight: `${SPEC_TASK_LINE_HEIGHT}px`,
 					whiteSpace: "pre-wrap",
@@ -80,7 +149,7 @@ export function RenderSpecTask({
 					color: blocked ? "var(--mantine-color-orange-6)" : undefined,
 				}}
 			>
-				{data.text ?? ""}
+				{row.text ?? ""}
 			</div>
 		</Group>
 	);

@@ -1079,6 +1079,7 @@
 		"truncated": "[Preview truncated to keep the UI responsive. Use copy for the full content.]",
 		"sources": {
 			"silent_progress": "Progress reminder",
+			"living_work_spec": "Task digest",
 			"todo_reminder": "TODO reminder",
 			"relaxed_plan": "Plan mode reminder",
 			"knowledge_base_hint": "Knowledge base hint",

@@ -91,6 +91,9 @@ export function resolveRenderExtra(spec: {
 			// integration layer (this layer imports no avatar), same as a user bubble.
 			if ("source" in data) extra.source = data.source;
 			if ("speaker" in data) extra.speaker = data.speaker;
+			// Identicon seed for the header's avatar (a sender / task / entry id).
+			// Height-neutral: the header row is a fixed single line either way.
+			if ("speakerId" in data) extra.speakerId = data.speakerId;
 			// The real account behind the row, when there is one (a merge is authored by
 			// whoever pressed the button). Height-neutral: it only changes the avatar and
 			// name inside the already-reserved header row.

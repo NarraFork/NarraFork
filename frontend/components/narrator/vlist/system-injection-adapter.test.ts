@@ -314,6 +314,108 @@ describe("spoken injections — one bubble per message row", () => {
 });
 
 describe("spoken injections — which producers qualify", () => {
+	it("every bubble carries the model-facing copy, so every row can be inspected", () => {
+		// The regression this pins: the platform and knowledge branches shipped without
+		// `modelFacing`, so those rows had no "what the model saw" item in their context
+		// menu while message / task rows did — the same object type, inconsistently
+		// inspectable.
+		const cases: Array<{ source: string; body: SideCarBody }> = [
+			{
+				source: "spec_update",
+				body: {
+					kind: "specUpdates",
+					items: [
+						{
+							uri: "spec://tasks.json",
+							timestamp: "2026-01-01T00:00:00Z",
+							updatedBy: "alice",
+							taskSummary: "1 open task",
+						},
+					],
+				},
+			},
+			{ source: "living_work_spec", body: TASKS_BODY },
+			{
+				source: "knowledge_base_hint",
+				body: {
+					kind: "knowledge",
+					hits: [{ entryId: "k1", title: "Deploys", summary: "how deploys work" }],
+				},
+			},
+		];
+		for (const { source, body } of cases) {
+			const specs = adaptSegment(injectionSegment({ type: "system_injection", source, body }), CTX);
+			expect(specs[0]?.kind).toBe("injection-bubble");
+			// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+			const data = specs[0]?.data as any;
+			expect(typeof data.modelFacing).toBe("string");
+			expect(data.modelFacing.length).toBeGreaterThan(0);
+		}
+	});
+
+	it("a task digest and a continuation share ONE presentation", () => {
+		// The regression this pins: the periodic `living_work_spec` digest used to render
+		// as markdown bullets (status demoted to a "doing: " text prefix, protected to the
+		// words "· protected") while `spec_continuation` rendered as a glyph+lock task
+		// row. Same data, two visual languages. Both must resolve to the spec-task payload.
+		const digest = adaptSegment(
+			injectionSegment({
+				type: "system_injection",
+				source: "living_work_spec",
+				body: {
+					kind: "tasks",
+					variant: "current",
+					tasks: [
+						{ role: "doing", text: "wire the flag", protected: true },
+						{ role: "todo", text: "write the tests" },
+					],
+				},
+			}),
+			CTX,
+		);
+		const continuation = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "m1",
+					role: "system",
+					contentJson: [{ type: "spec_continuation", task: "wire the flag", protected: true }],
+				},
+			},
+			CTX,
+		);
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		const digestPayload = (digest[0]?.data as any).payload;
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		const continuationPayload = (continuation[0]?.data as any).payload;
+		expect(digest[0]?.kind).toBe("injection-bubble");
+		expect(continuation[0]?.kind).toBe("injection-bubble");
+		// The shared contract: one payload kind, therefore one renderer.
+		expect(digestPayload.kind).toBe("spec-task");
+		expect(continuationPayload.kind).toBe("spec-task");
+		// The digest keeps every row's role and protected flag as STRUCTURE, not prose.
+		expect(digestPayload.data.tasks).toEqual([
+			{ text: "wire the flag", role: "doing", protected: true },
+			{ text: "write the tests", role: "todo", protected: false },
+		]);
+	});
+
+	it("an empty task digest says so instead of drawing no rows", () => {
+		const specs = adaptSegment(
+			injectionSegment({
+				type: "system_injection",
+				source: "living_work_spec",
+				body: { kind: "tasks", variant: "emptyNever", tasks: [] },
+			}),
+			CTX,
+		);
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		const payload = (specs[0]?.data as any).payload;
+		expect(payload.kind).toBe("spec-task");
+		expect(typeof payload.data.emptyLabel).toBe("string");
+		expect(payload.data.emptyLabel.length).toBeGreaterThan(0);
+	});
+
 	it("gives routine platform reminders a bubble too, as ONE statement", () => {
 		// Reversed deliberately. The earlier rule kept these full-width on the theory that a
 		// routine reminder must not carry a teammate's visual weight, but the scheduler

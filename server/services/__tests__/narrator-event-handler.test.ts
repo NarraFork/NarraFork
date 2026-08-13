@@ -28,6 +28,7 @@ const {
 	clearStreamingSnapshot,
 	CriticalEventPersistenceError,
 	getStreamingSnapshot,
+	isSameReasoningBlock,
 	processEvent,
 } = await import("../narrator-event-handler");
 
@@ -688,5 +689,37 @@ describe("narrator event handler persistence", () => {
 		expect(attempts).toBe(2);
 		expect(discards).toEqual(["tool-row-atomic-failure"]);
 		expect(ctx.preparedPlanModeToolCalls.size).toBe(0);
+	});
+});
+
+/**
+ * Reasoning translation lands asynchronously, and an attempt can be discarded and
+ * replayed while it is in flight (`attempt_discarded` truncates that attempt's
+ * blocks). Neither locator key is attempt-scoped — a replay reproduces the same
+ * `outputIndex` — so without a check the translation of a thrown-away thought can be
+ * pasted onto the new attempt's reasoning.
+ */
+describe("isSameReasoningBlock — the translation write-back guard", () => {
+	test("accepts the block whose text is exactly what was translated", () => {
+		expect(isSameReasoningBlock({ type: "reasoning", text: "分析中" }, "分析中")).toBe(true);
+	});
+
+	test("rejects a DIFFERENT reasoning at the same coordinates (the replay case)", () => {
+		// Same outputIndex, different thought: the attempt that produced the original
+		// was discarded and replayed.
+		expect(
+			isSameReasoningBlock({ type: "reasoning", text: "另一段推理", outputIndex: 0 }, "分析中"),
+		).toBe(false);
+	});
+
+	test("rejects a non-reasoning block, and a missing one", () => {
+		expect(isSameReasoningBlock({ type: "text", text: "分析中" }, "分析中")).toBe(false);
+		expect(isSameReasoningBlock(undefined, "分析中")).toBe(false);
+		expect(isSameReasoningBlock(null, "分析中")).toBe(false);
+	});
+
+	test("an empty translated text is still matched exactly, not treated as absent", () => {
+		expect(isSameReasoningBlock({ type: "reasoning", text: "" }, "")).toBe(true);
+		expect(isSameReasoningBlock({ type: "reasoning" }, "")).toBe(false);
 	});
 });

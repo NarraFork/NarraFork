@@ -114,7 +114,7 @@ import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
-import { useInputHistory } from "../../hooks/useInputHistory";
+import { useInputHistory, writeInputHistoryEntries } from "../../hooks/useInputHistory";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useAllModels } from "../../hooks/useModels";
@@ -278,8 +278,9 @@ import { NugRechargeDialog } from "./NugRechargeDialog";
 import {
 	classifyDraftRevisionConflict,
 	cleanupLegacyNarratorInputStorage,
-	getNarratorInputHistoryKey,
+	getNarratorDraftStorageId,
 	persistNarratorInputDraft,
+	purgeLegacyNarratorInputStorage,
 	readNarratorInputDraft,
 	resolveHydratedNarratorDraft,
 } from "./narrator-draft-storage";
@@ -301,7 +302,7 @@ import {
 	PERM_MODES,
 	resizeImageIfNeeded,
 } from "./narrator-panel-types";
-import { getNarratorStatusBarDisplay } from "./narrator-status-bar";
+import { getNarratorStatusBarDisplay, planNarratorWorkIndicator } from "./narrator-status-bar";
 import { compactProgressLabel } from "./progress-label";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
 import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
@@ -2870,10 +2871,11 @@ export function NarratorPanel({
 	} | null>(null);
 	const draftSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const draftSyncSeqRef = useRef(0);
+	// null until the user is known: recall is keyed per `(user, narrator)`, and a
+	// placeholder key would both consume a slot in the bounded history namespace and
+	// strand whatever was typed before hydration in a list nothing reads again.
 	const inputHistory = useInputHistory(
-		currentUserId
-			? getNarratorInputHistoryKey(currentUserId, narratorId)
-			: `narrafork_input_history_pending_${narratorId}`,
+		currentUserId ? getNarratorDraftStorageId(currentUserId, narratorId) : null,
 	);
 	useEffect(() => {
 		if (!currentUserId || !draftHydrated || sendingRef.current) return;
@@ -2981,6 +2983,20 @@ export function NarratorPanel({
 		setInput("");
 	}, []);
 
+	// Reclaim pre-facade draft/history keys once per tab.
+	//
+	// Those keys were unbounded in count and up to 512k characters each, and
+	// nothing ever enumerated the area to expire them — so a tab that already
+	// accumulated dozens carries their quota cost until it is closed, which is the
+	// state that made typing (and the desktop) stutter. The per-narrator cleanup in
+	// the hydration effect below only reaches ids this tab happens to reopen, so a
+	// sweep is what actually frees an already-degraded session.
+	// Input history is MIGRATED rather than dropped: unlike a draft it has no server
+	// copy, so deleting it would silently cost the user their up-arrow recall.
+	useEffect(() => {
+		purgeLegacyNarratorInputStorage(writeInputHistoryEntries);
+	}, []);
+
 	useEffect(() => {
 		void draftLoadAttempt;
 		if (!currentUserId) {
@@ -2998,7 +3014,7 @@ export function NarratorPanel({
 			clearTimeout(draftSyncTimerRef.current);
 			draftSyncTimerRef.current = null;
 		}
-		cleanupLegacyNarratorInputStorage(narratorId);
+		cleanupLegacyNarratorInputStorage(currentUserId, narratorId);
 		const localDraft = readNarratorInputDraft(currentUserId, narratorId);
 		lastDraftRevisionRef.current = localDraft.serverRevision;
 		lastDraftUpdatedAtRef.current = localDraft.serverUpdatedAt;
@@ -6399,32 +6415,55 @@ export function NarratorPanel({
 		liveSubstatus: substatus,
 	});
 
+	/*
+	 * One decision for both compaction slots on the status row (the primary label
+	 * and the appended short suffix), so the row can never say the same thing
+	 * twice. See planNarratorWorkIndicator for the invariant.
+	 */
+	const workIndicatorPlan = planNarratorWorkIndicator({
+		isRetrying,
+		isBlockingCompacting,
+		isBackgroundCompacting,
+		isWaitingForModel,
+		hasSpecTask: !!currentSpecTask,
+		isWaiting,
+		isPlanning,
+	});
+	// `compactProgressText` is non-null whenever either compact flag is set; the
+	// fallback only keeps the template from interpolating "null".
+	const compactProgressFragment = compactProgressText ?? "";
+
 	// The single line the work indicator shows. Kept as a string (not inline JSX)
 	// so the status bar can hand the exact same text to the overflow tooltip.
-	const workIndicatorText = isRetrying
-		? retryCountdown > 0
-			? t("retryingCountdown", {
-					count: retryInfo?.retryCount,
-					max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
-					seconds: retryCountdown,
-				})
-			: t("retryingNow", {
-					count: retryInfo?.retryCount,
-					max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
-				})
-		: isBlockingCompacting
-			? `${t("compacting")} · ${compactProgressText}`
-			: isWaitingForModel
-				? t("status_model_unavailable")
-				: currentSpecTask
-					? currentSpecTask.text
-					: isWaiting
-						? t("status_waiting")
-						: isPlanning
-							? t("planning")
-							: isBackgroundCompacting
-								? `${t("backgroundCompacting")} · ${compactProgressText}`
-								: t("thinking");
+	const workIndicatorText = ((): string => {
+		switch (workIndicatorPlan.primary) {
+			case "retrying":
+				return retryCountdown > 0
+					? t("retryingCountdown", {
+							count: retryInfo?.retryCount,
+							max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
+							seconds: retryCountdown,
+						})
+					: t("retryingNow", {
+							count: retryInfo?.retryCount,
+							max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
+						});
+			case "blocking_compact":
+				return `${t("compacting")} · ${compactProgressFragment}`;
+			case "model_unavailable":
+				return t("status_model_unavailable");
+			case "spec_task":
+				return currentSpecTask?.text ?? t("thinking");
+			case "waiting":
+				return t("status_waiting");
+			case "planning":
+				return t("planning");
+			case "background_compact":
+				return `${t("backgroundCompacting")} · ${compactProgressFragment}`;
+			default:
+				return t("thinking");
+		}
+	})();
 
 	const hasContextData = contextPercent != null;
 	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
@@ -8219,9 +8258,9 @@ export function NarratorPanel({
 												)}
 										</Text>
 									)}
-									{isBackgroundCompacting && isWorking && !isBlockingCompacting && (
+									{workIndicatorPlan.showBackgroundCompactSuffix && (
 										<Text size="xs" c="orange" style={{ flexShrink: 0 }}>
-											· {t("backgroundCompactingShort")} · {compactProgressText}
+											· {t("backgroundCompactingShort")} · {compactProgressFragment}
 										</Text>
 									)}
 								</Group>
