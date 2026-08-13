@@ -24,6 +24,8 @@ const service: UsageHistoryRouteService = {
 	getUsageStats: unexpectedServiceCall,
 	getUsageTimeSeries: unexpectedServiceCall,
 	getUsageRecord: unexpectedServiceCall,
+	getUsageBreakdown: unexpectedServiceCall,
+	getUsageTimeSeriesStacked: unexpectedServiceCall,
 };
 
 const usageHistoryRoutes = createUsageHistoryRoutes({

@@ -36,7 +36,10 @@ export function formatCompactNumber(
 
 	let scaledValue = safeValue;
 	let suffix = "";
-	if (absoluteValue >= 1_000_000) {
+	if (absoluteValue >= 1_000_000_000) {
+		scaledValue = safeValue / 1_000_000_000;
+		suffix = "B";
+	} else if (absoluteValue >= 1_000_000) {
 		scaledValue = safeValue / 1_000_000;
 		suffix = "M";
 	} else if (absoluteValue >= 1_000) {

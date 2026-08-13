@@ -143,6 +143,7 @@ export function UsageHistoryChart({
 	const { t } = useTranslation("common");
 	const svgRef = useRef<SVGSVGElement>(null);
 	const [metric, setMetric] = useState<UsageMetricKey>("totalTokens");
+	const [compareMetric, setCompareMetric] = useState<UsageMetricKey | "">("");
 	const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
 	const points = data?.points ?? [];
 	const hasUsageData = points.some((point) => point.requestCount > 0);
@@ -240,6 +241,11 @@ export function UsageHistoryChart({
 		metricOptions.find((option) => option.value === metric) ?? metricOptions[0];
 	const values = points.map((point) => selectedMetric.getValue(point));
 	const maxValue = Math.max(1, ...values);
+	const isIntegerMetric =
+		metric !== "totalCost" &&
+		metric !== "averageTtftMs" &&
+		metric !== "averageDurationMs" &&
+		metric !== "meterUsage";
 	const xFor = (index: number) => {
 		if (points.length <= 1) return PADDING.left + CHART_INNER_WIDTH / 2;
 		return PADDING.left + (index / (points.length - 1)) * CHART_INNER_WIDTH;
@@ -252,6 +258,26 @@ export function UsageHistoryChart({
 			return `${command} ${xFor(index)} ${yFor(selectedMetric.getValue(point))}`;
 		})
 		.join(" ");
+
+	// Compare metric (second line)
+	const selectedCompareMetric = compareMetric
+		? metricOptions.find((option) => option.value === compareMetric)
+		: null;
+	const compareValues = selectedCompareMetric
+		? points.map((point) => selectedCompareMetric.getValue(point))
+		: [];
+	const compareMaxValue = selectedCompareMetric ? Math.max(1, ...compareValues) : 1;
+	const yForCompare = (value: number) =>
+		PADDING.top + CHART_INNER_HEIGHT - (value / compareMaxValue) * CHART_INNER_HEIGHT;
+	const comparePath = selectedCompareMetric
+		? points
+				.map((point, index) => {
+					const command = index === 0 ? "M" : "L";
+					return `${command} ${xFor(index)} ${yForCompare(selectedCompareMetric.getValue(point))}`;
+				})
+				.join(" ")
+		: "";
+
 	const tickIndexes = getTickIndexes(points.length);
 	const gridRatios = [0, 0.25, 0.5, 0.75, 1];
 	const hoveredPoint = hoveredIndex == null ? null : points[hoveredIndex];
@@ -327,6 +353,20 @@ export function UsageHistoryChart({
 							}))}
 							onChange={(value) => value && setMetric(value as UsageMetricKey)}
 						/>
+						<Select
+							size="xs"
+							w={180}
+							placeholder={t("usageHistoryCompareMetric")}
+							clearable
+							value={compareMetric || null}
+							data={metricOptions
+								.filter((option) => option.value !== metric)
+								.map((option) => ({
+									value: option.value,
+									label: option.label,
+								}))}
+							onChange={(value) => setCompareMetric((value as UsageMetricKey) || "")}
+						/>
 					</Group>
 				</Group>
 
@@ -358,7 +398,9 @@ export function UsageHistoryChart({
 						>
 							{gridRatios.map((ratio) => {
 								const y = PADDING.top + CHART_INNER_HEIGHT - ratio * CHART_INNER_HEIGHT;
-								const gridValue = maxValue * ratio;
+								let gridValue = maxValue * ratio;
+								// Round to integers for count/token metrics to avoid "0.3", "0.5" labels
+								if (isIntegerMetric) gridValue = Math.round(gridValue);
 								const display = formatMetricValue(metric, gridValue, meterUnit);
 								return (
 									<g key={ratio}>
@@ -416,6 +458,38 @@ export function UsageHistoryChart({
 								strokeLinejoin="round"
 								strokeLinecap="round"
 							/>
+							{/* Single-point marker: path has no line, just show a dot */}
+							{points.length === 1 && (
+								<circle
+									cx={xFor(0)}
+									cy={yFor(selectedMetric.getValue(points[0]))}
+									r={5}
+									fill={selectedMetric.stroke}
+								/>
+							)}
+							{/* Compare metric line */}
+							{selectedCompareMetric && comparePath && (
+								<>
+									<path
+										d={comparePath}
+										fill="none"
+										stroke={selectedCompareMetric.stroke}
+										strokeWidth={2}
+										strokeLinejoin="round"
+										strokeLinecap="round"
+										strokeDasharray="6 3"
+										opacity={0.75}
+									/>
+									{points.length === 1 && (
+										<circle
+											cx={xFor(0)}
+											cy={yForCompare(selectedCompareMetric.getValue(points[0]))}
+											r={4}
+											fill={selectedCompareMetric.stroke}
+										/>
+									)}
+								</>
+							)}
 							{hoveredPoint ? (
 								<>
 									<line
@@ -435,6 +509,16 @@ export function UsageHistoryChart({
 										stroke={selectedMetric.stroke}
 										strokeWidth={2}
 									/>
+									{selectedCompareMetric && hoveredPoint && (
+										<circle
+											cx={hoveredSvgX}
+											cy={yForCompare(selectedCompareMetric.getValue(hoveredPoint))}
+											r={3.5}
+											fill="var(--mantine-color-body)"
+											stroke={selectedCompareMetric.stroke}
+											strokeWidth={2}
+										/>
+									)}
 								</>
 							) : null}
 						</svg>
@@ -470,6 +554,31 @@ export function UsageHistoryChart({
 									<Text size="xs" c="dimmed">
 										{t("usageHistoryExactValue", { value: hoveredDisplay.exact })}
 									</Text>
+									{selectedCompareMetric &&
+										hoveredPoint &&
+										(() => {
+											const compareValue = selectedCompareMetric.getValue(hoveredPoint);
+											const compareDisplay = formatMetricValue(
+												compareMetric as UsageMetricKey,
+												compareValue,
+												hoveredPoint.meterUnit ?? meterUnit,
+											);
+											return (
+												<>
+													<Group justify="space-between" gap="md" wrap="nowrap">
+														<Text size="xs" c="dimmed">
+															{selectedCompareMetric.label}
+														</Text>
+														<Text size="sm" fw={700} c={selectedCompareMetric.stroke}>
+															{compareDisplay.compact}
+														</Text>
+													</Group>
+													<Text size="xs" c="dimmed">
+														{t("usageHistoryExactValue", { value: compareDisplay.exact })}
+													</Text>
+												</>
+											);
+										})()}
 								</Stack>
 							</Paper>
 						) : null}

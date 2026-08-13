@@ -174,3 +174,41 @@ export interface UsageHistoryCursorListResponse {
 export interface UsageHistoryProvidersResponse {
 	providers: string[];
 }
+
+export type UsageBreakdownDimension = "provider" | "model" | "kind";
+export type UsageBreakdownMetric =
+	| "requests"
+	| "tokens"
+	| "cost"
+	| "inputTokens"
+	| "outputTokens"
+	| "reasoningTokens";
+
+export interface UsageBreakdownEntry {
+	label: string;
+	value: number;
+	percentage: number;
+	count: number;
+}
+
+export interface UsageBreakdownResponse {
+	dimension: UsageBreakdownDimension;
+	metric: UsageBreakdownMetric;
+	entries: UsageBreakdownEntry[];
+	total: number;
+}
+
+export interface UsageStackedTimeSeriesResponse {
+	granularity: UsageHistoryGranularity;
+	dimension: UsageBreakdownDimension;
+	metric: UsageBreakdownMetric;
+	series: Array<{
+		label: string;
+		color: string;
+		data: Array<{ timestamp: string; value: number }>;
+	}>;
+	timestamps: string[];
+	truncated: boolean;
+	effectiveStartDate: string;
+	effectiveEndDate: string;
+}

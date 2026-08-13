@@ -461,6 +461,39 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 	const [showCredentialId, setShowCredentialId] = useState(false);
 	const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
 	const [downloadingRecordId, setDownloadingRecordId] = useState<string | null>(null);
+	const [sortField, setSortField] = useState<string | null>(null);
+	const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+	const sortedRecords = useMemo(() => {
+		if (!sortField) return records;
+		const getValue = (r: UsageHistoryRecord): number => {
+			switch (sortField) {
+				case "tokens":
+					return r.inputTokens + r.outputTokens;
+				case "cost":
+					return r.costUsd ?? 0;
+				case "ttft":
+					return r.ttftMs ?? 0;
+				case "duration":
+					return r.durationMs ?? 0;
+				default:
+					return 0;
+			}
+		};
+		return [...records].sort((a, b) => {
+			const diff = getValue(a) - getValue(b);
+			return sortDir === "asc" ? diff : -diff;
+		});
+	}, [records, sortField, sortDir]);
+
+	const toggleSort = (field: string) => {
+		if (sortField === field) {
+			setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+		} else {
+			setSortField(field);
+			setSortDir("desc");
+		}
+	};
 
 	const { data: selectedRecord, isLoading: isLoadingRawDump } = useQuery({
 		queryKey: ["usage-history", "detail", selectedRecordId],
@@ -520,7 +553,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 						</Button>
 					</Group>
 
-					{records.map((record) => (
+					{sortedRecords.map((record) => (
 						<Card key={record.id} withBorder radius="sm" padding="xs">
 							<Stack gap="xs">
 								<Group justify="space-between" align="start" wrap="nowrap" gap="xs">
@@ -691,15 +724,39 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 									</Group>
 								</Table.Th>
 								<Table.Th>{t("usageHistoryTableModel")}</Table.Th>
-								<Table.Th>{t("usageHistoryTableTokens")}</Table.Th>
-								<Table.Th>{t("usageHistoryTableTTFT")}</Table.Th>
-								<Table.Th>{t("usageHistoryTableDuration")}</Table.Th>
-								<Table.Th>{t("usageHistoryTableCost")}</Table.Th>
+								<Table.Th
+									style={{ cursor: "pointer", userSelect: "none" }}
+									onClick={() => toggleSort("tokens")}
+								>
+									{t("usageHistoryTableTokens")}
+									{sortField === "tokens" ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
+								</Table.Th>
+								<Table.Th
+									style={{ cursor: "pointer", userSelect: "none" }}
+									onClick={() => toggleSort("ttft")}
+								>
+									{t("usageHistoryTableTTFT")}
+									{sortField === "ttft" ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
+								</Table.Th>
+								<Table.Th
+									style={{ cursor: "pointer", userSelect: "none" }}
+									onClick={() => toggleSort("duration")}
+								>
+									{t("usageHistoryTableDuration")}
+									{sortField === "duration" ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
+								</Table.Th>
+								<Table.Th
+									style={{ cursor: "pointer", userSelect: "none" }}
+									onClick={() => toggleSort("cost")}
+								>
+									{t("usageHistoryTableCost")}
+									{sortField === "cost" ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
+								</Table.Th>
 								<Table.Th>{t("usageHistoryTableActions")}</Table.Th>
 							</Table.Tr>
 						</Table.Thead>
 						<Table.Tbody>
-							{records.map((record) => (
+							{sortedRecords.map((record) => (
 								<Table.Tr key={record.id}>
 									<Table.Td>
 										<Stack gap={2}>

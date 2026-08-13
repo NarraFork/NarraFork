@@ -1,5 +1,8 @@
 import type {
 	CredentialTotalsResponse,
+	UsageBreakdownDimension,
+	UsageBreakdownMetric,
+	UsageBreakdownResponse,
 	UsageHistoryCursorListResponse,
 	UsageHistoryFilters,
 	UsageHistoryGranularity,
@@ -8,6 +11,7 @@ import type {
 	UsageHistoryRecord,
 	UsageHistoryStats,
 	UsageHistoryTimeSeriesResponse,
+	UsageStackedTimeSeriesResponse,
 } from "@frontend/types/usage-history";
 
 import { ApiError, authorizedFetch, readFetchError } from "./api/client";
@@ -115,5 +119,47 @@ export const usageHistoryApi = {
 	 */
 	async getRecord(id: string): Promise<UsageHistoryRecord> {
 		return fetchJson(`/api/usage-history/${id}`);
+	},
+
+	/**
+	 * 按维度聚合统计数据（环形图用）
+	 */
+	async getBreakdown(
+		filters: UsageHistoryFilters,
+		options: {
+			dimension: UsageBreakdownDimension;
+			metric: UsageBreakdownMetric;
+			cluster?: boolean;
+		},
+	): Promise<UsageBreakdownResponse> {
+		const params = new URLSearchParams();
+		appendUsageHistoryFilters(params, filters);
+		params.append("dimension", options.dimension);
+		params.append("metric", options.metric);
+		if (options.cluster != null) params.append("cluster", options.cluster ? "true" : "false");
+		return fetchJson(`/api/usage-history/breakdown?${params.toString()}`);
+	},
+
+	/**
+	 * 按维度+时间的堆叠时序数据（堆叠图用）
+	 */
+	async getTimeSeriesStacked(
+		filters: UsageHistoryFilters,
+		options: {
+			dimension: UsageBreakdownDimension;
+			metric: UsageBreakdownMetric;
+			granularity?: UsageHistoryGranularity;
+			topN?: number;
+			cluster?: boolean;
+		},
+	): Promise<UsageStackedTimeSeriesResponse> {
+		const params = new URLSearchParams();
+		appendUsageHistoryFilters(params, filters);
+		params.append("dimension", options.dimension);
+		params.append("metric", options.metric);
+		if (options.granularity) params.append("granularity", options.granularity);
+		if (options.topN) params.append("topN", options.topN.toString());
+		if (options.cluster != null) params.append("cluster", options.cluster ? "true" : "false");
+		return fetchJson(`/api/usage-history/timeseries-stacked?${params.toString()}`);
 	},
 };
