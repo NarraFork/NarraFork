@@ -3,7 +3,7 @@ import { basename, join, relative, resolve, sep } from "node:path";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import {
-	collectThemeImages,
+	collectThemeAssets,
 	type Manifest,
 	manifestPathSchema,
 	pluginIdSchema,
@@ -81,6 +81,16 @@ function contentType(path: string): string {
 	);
 }
 
+function hasWoff2Magic(bytes: Uint8Array): boolean {
+	return (
+		bytes.byteLength >= 4 &&
+		bytes[0] === 0x77 &&
+		bytes[1] === 0x4f &&
+		bytes[2] === 0x46 &&
+		bytes[3] === 0x32
+	);
+}
+
 function escapeAttribute(value: string): string {
 	return value.replace(/[&<>"']/g, (character) => {
 		const entities: Record<string, string> = {
@@ -151,10 +161,10 @@ export class PluginUiAssetService {
 			throw new AppError("Plugin manifest identity is invalid", 422, "PLUGIN_IDENTITY_MISMATCH");
 		}
 		// A package may serve assets if it has a UI contribution (views) OR a
-		// theme that declares images (region backgrounds / nine-slice frames).
-		// Theme-only plugins have no `ui` but still need those images served.
+		// theme that declares controlled image/font assets. Theme-only plugins have
+		// no `ui`, so their explicit theme asset declarations are the capability.
 		const hasThemeAssets = parsed.data.contributes.themes.some(
-			(theme) => collectThemeImages(theme).length > 0,
+			(theme) => collectThemeAssets(theme).length > 0,
 		);
 		if (!parsed.data.ui && !hasThemeAssets) {
 			throw new AppError("Plugin has no UI contribution", 404, "PLUGIN_UI_UNAVAILABLE");
@@ -177,10 +187,9 @@ export class PluginUiAssetService {
 			declaredAssets.add(view.entry);
 			if (view.style) declaredAssets.add(view.style);
 		}
-		// Theme images (backgrounds and nine-slice frames) are served the same way:
-		// only paths a theme contribution explicitly declares become fetchable.
+		// Only assets a theme contribution explicitly declares become fetchable.
 		for (const theme of pkg.manifest.contributes.themes) {
-			for (const image of collectThemeImages(theme)) declaredAssets.add(image);
+			for (const asset of collectThemeAssets(theme)) declaredAssets.add(asset);
 		}
 		if (!declaredAssets.has(safePath)) throw new NotFoundError("Plugin UI asset", safePath);
 		const filePath = resolve(pkg.packagePath, ...safePath.split("/"));
@@ -198,6 +207,12 @@ export class PluginUiAssetService {
 		const bytes = await readFile(filePath);
 		if (bytes.byteLength > this.maxAssetBytes)
 			throw new AppError("Plugin UI asset exceeds size limit", 413, "PLUGIN_UI_ASSET_TOO_LARGE");
+		// A font is served straight to the platform text engine, so verify the bytes
+		// really are WOFF2 rather than trusting the extension. Every other declared
+		// asset type is inert or already guarded by the route's content-type allowlist.
+		if (safePath.toLowerCase().endsWith(".woff2") && !hasWoff2Magic(bytes)) {
+			throw new AppError("Plugin theme font is not valid WOFF2", 422, "PLUGIN_THEME_FONT_INVALID");
+		}
 		return { pluginId, version, hash, path: safePath, bytes, contentType: contentType(safePath) };
 	}
 

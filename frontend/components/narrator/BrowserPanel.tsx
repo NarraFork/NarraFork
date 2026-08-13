@@ -1,5 +1,6 @@
 import {
 	ActionIcon,
+	Anchor,
 	Badge,
 	Box,
 	Button,
@@ -7,6 +8,7 @@ import {
 	Group,
 	Loader,
 	Menu,
+	Modal,
 	Stack,
 	Text,
 	Tooltip,
@@ -14,6 +16,7 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
+	IconArrowsMaximize,
 	IconChevronDown,
 	IconChevronRight,
 	IconClock,
@@ -24,6 +27,7 @@ import {
 	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -37,6 +41,18 @@ import {
 } from "../../hooks/useBrowserSessions";
 import { useNarratorBrowserSessionsCapability } from "../../hooks/usePlatform";
 import { ApiError, authorizedFetch, getToken, readFetchError } from "../../lib/api";
+import {
+	SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE,
+	SAFE_AREA_FULLSCREEN_MODAL_HEADER_STYLE,
+	safeAreaFullscreenModalBodyStyle,
+} from "../../lib/safe-area";
+import {
+	type BrowserPreviewViewport,
+	getBrowserPreviewExpandedWidth,
+	getBrowserPreviewNavigationUrl,
+	openBrowserPreviewNavigation,
+	translateBrowserPreviewCoordinate,
+} from "./browser-preview";
 
 interface BrowserPanelProps {
 	narratorId: string;
@@ -234,6 +250,8 @@ function formatSize(bytes: number): string {
 
 const TRACE_RATE_BYTES_PER_MS = 2000;
 const MAX_SCREENSHOT_BLOB_BYTES = 20 * 1024 * 1024;
+const BROWSER_PREVIEW_DRAG_THRESHOLD_PX = 4;
+const BROWSER_POST_CLICK_REFRESH_DELAY_MS = 750;
 
 interface SessionInfo {
 	id: string;
@@ -245,7 +263,216 @@ interface SessionInfo {
 	tracing: { active: boolean; startedAt: number } | null;
 	networkRequestCount?: number;
 	networkCaptureEnabled?: boolean;
-	viewport: { width: number; height: number };
+	viewport: BrowserPreviewViewport;
+}
+
+interface BrowserInteractionParams {
+	action: "click" | "scroll" | "drag" | "type";
+	coordinate?: { x: number; y: number };
+	endCoordinate?: { x: number; y: number };
+	direction?: "up" | "down";
+	amount?: number;
+	text?: string;
+	key?: string;
+	keys?: Array<{ text?: string; key?: string }>;
+}
+
+interface BrowserPreviewSurfaceProps {
+	blobUrl: string | null;
+	loading: boolean;
+	error: boolean;
+	viewport: BrowserPreviewViewport;
+	interactionPending: boolean;
+	expanded?: boolean;
+	onRetry: () => void;
+	onRemoteClick: (coordinate: { x: number; y: number }) => void;
+	onRemoteScroll: (
+		coordinate: { x: number; y: number },
+		direction: "up" | "down",
+		amount: number,
+	) => void;
+	onRemoteDrag: (
+		coordinate: { x: number; y: number },
+		endCoordinate: { x: number; y: number },
+	) => void;
+	onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => void;
+}
+
+function BrowserPreviewSurface({
+	blobUrl,
+	loading,
+	error,
+	viewport,
+	interactionPending,
+	expanded = false,
+	onRetry,
+	onRemoteClick,
+	onRemoteScroll,
+	onRemoteDrag,
+	onKeyDown,
+}: BrowserPreviewSurfaceProps) {
+	const { t } = useTranslation("narrator");
+	const imgRef = useRef<HTMLImageElement | null>(null);
+	const containerRef = useRef<HTMLDivElement | null>(null);
+	const dragStartRef = useRef<{
+		coordinate: { x: number; y: number };
+		clientX: number;
+		clientY: number;
+	} | null>(null);
+	const isDraggingRef = useRef(false);
+	const suppressNextClickRef = useRef(false);
+
+	const translateCoordinate = useCallback(
+		(clientX: number, clientY: number): { x: number; y: number } | null => {
+			const rect = imgRef.current?.getBoundingClientRect();
+			if (!rect) return null;
+			return translateBrowserPreviewCoordinate(rect, viewport, clientX, clientY);
+		},
+		[viewport],
+	);
+
+	const handleClick = useCallback(
+		(event: React.MouseEvent<HTMLImageElement>) => {
+			if (suppressNextClickRef.current) {
+				suppressNextClickRef.current = false;
+				return;
+			}
+			if (isDraggingRef.current || interactionPending) return;
+			containerRef.current?.focus();
+			const coordinate = translateCoordinate(event.clientX, event.clientY);
+			if (coordinate) onRemoteClick(coordinate);
+		},
+		[interactionPending, onRemoteClick, translateCoordinate],
+	);
+
+	const handleWheel = useCallback(
+		(event: React.WheelEvent<HTMLDivElement>) => {
+			if (event.deltaY === 0) return;
+			event.preventDefault();
+			event.stopPropagation();
+			if (interactionPending) return;
+			const coordinate = translateCoordinate(event.clientX, event.clientY);
+			if (!coordinate) return;
+			onRemoteScroll(
+				coordinate,
+				event.deltaY > 0 ? "down" : "up",
+				Math.min(Math.abs(event.deltaY) * 2, 1000),
+			);
+		},
+		[interactionPending, onRemoteScroll, translateCoordinate],
+	);
+
+	const handlePointerDown = useCallback(
+		(event: React.PointerEvent<HTMLImageElement>) => {
+			if (interactionPending) return;
+			const coordinate = translateCoordinate(event.clientX, event.clientY);
+			if (!coordinate) return;
+			dragStartRef.current = {
+				coordinate,
+				clientX: event.clientX,
+				clientY: event.clientY,
+			};
+			isDraggingRef.current = false;
+			event.currentTarget.setPointerCapture(event.pointerId);
+		},
+		[interactionPending, translateCoordinate],
+	);
+
+	const handlePointerMove = useCallback((event: React.PointerEvent<HTMLImageElement>) => {
+		const start = dragStartRef.current;
+		if (!start || isDraggingRef.current) return;
+		const distance = Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY);
+		if (distance >= BROWSER_PREVIEW_DRAG_THRESHOLD_PX) isDraggingRef.current = true;
+	}, []);
+
+	const resetPointerGesture = useCallback(() => {
+		dragStartRef.current = null;
+		isDraggingRef.current = false;
+	}, []);
+
+	const handlePointerUp = useCallback(
+		(event: React.PointerEvent<HTMLImageElement>) => {
+			const start = dragStartRef.current;
+			if (!start) return;
+			if (!isDraggingRef.current) {
+				resetPointerGesture();
+				return;
+			}
+			const endCoordinate = translateCoordinate(event.clientX, event.clientY);
+			if (!endCoordinate) {
+				resetPointerGesture();
+				return;
+			}
+			suppressNextClickRef.current = true;
+			onRemoteDrag(start.coordinate, endCoordinate);
+			resetPointerGesture();
+		},
+		[onRemoteDrag, resetPointerGesture, translateCoordinate],
+	);
+
+	return (
+		<Box
+			ref={containerRef}
+			tabIndex={0}
+			onKeyDown={onKeyDown}
+			onWheel={handleWheel}
+			style={{
+				position: "relative",
+				width: expanded ? getBrowserPreviewExpandedWidth(viewport.width) : undefined,
+				marginInline: expanded ? "auto" : undefined,
+				borderRadius: "var(--mantine-radius-sm)",
+				overflow: expanded ? "visible" : "hidden",
+				backgroundColor: "var(--mantine-color-dark-8)",
+				minHeight: expanded ? undefined : 120,
+				outline: "none",
+			}}
+		>
+			{loading && !blobUrl ? (
+				<Group gap={6} justify="center" py="xl">
+					<Loader size="xs" />
+					<Text size="xs" c="dimmed">
+						{t("browser.refreshScreenshot")}
+					</Text>
+				</Group>
+			) : error && !blobUrl ? (
+				<Group gap={6} justify="center" py="xl">
+					<Text size="xs" c="red">
+						{t("browser.screenshotFailed")}
+					</Text>
+					<ActionIcon variant="subtle" size="sm" color="gray" onClick={onRetry}>
+						<IconRefresh size={12} />
+					</ActionIcon>
+				</Group>
+			) : blobUrl ? (
+				<>
+					{/* biome-ignore lint/a11y/useKeyWithClickEvents: interactive remote browser canvas */}
+					<img
+						ref={imgRef}
+						src={blobUrl}
+						alt={t("browser.screenshotAlt")}
+						onClick={handleClick}
+						onPointerDown={handlePointerDown}
+						onPointerMove={handlePointerMove}
+						onPointerUp={handlePointerUp}
+						onPointerCancel={resetPointerGesture}
+						style={{
+							width: "100%",
+							display: "block",
+							cursor: interactionPending ? "wait" : "crosshair",
+							userSelect: "none",
+							touchAction: "none",
+						}}
+						draggable={false}
+					/>
+				</>
+			) : null}
+			{interactionPending && (
+				<Box style={{ position: "absolute", top: 4, right: 4, zIndex: 3 }}>
+					<Loader size="xs" color="teal" />
+				</Box>
+			)}
+		</Box>
+	);
 }
 
 function BrowserSessionCard({
@@ -258,6 +485,7 @@ function BrowserSessionCard({
 	visualChange?: { sessionId: string; seq: number } | null;
 }) {
 	const { t } = useTranslation("narrator");
+	const queryClient = useQueryClient();
 	const closeMutation = useCloseBrowserSession();
 	const setTtlMutation = useSetBrowserSessionTtl();
 	const stopTracingMutation = useStopBrowserTracing();
@@ -266,15 +494,12 @@ function BrowserSessionCard({
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState(false);
+	const [expanded, setExpanded] = useState(false);
 	const revokedRef = useRef<string | null>(null);
 	const screenshotAbortRef = useRef<AbortController | null>(null);
-	const imgRef = useRef<HTMLImageElement | null>(null);
-	const containerRef = useRef<HTMLDivElement | null>(null);
-	const dragStartRef = useRef<{ x: number; y: number } | null>(null);
-	const isDraggingRef = useRef(false);
-	// Set when a drag completes so the synthetic `click` that the browser fires
-	// right after `pointerup` is swallowed instead of sent as a second action.
-	const suppressNextClickRef = useRef(false);
+	const previewRequestSeqRef = useRef(0);
+	const localInteractionPendingRef = useRef(false);
+	const postClickRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 	// Auto-fetch screenshot on mount
 	const [screenshotKey, setScreenshotKey] = useState(1);
@@ -299,14 +524,30 @@ function BrowserSessionCard({
 	// Keyed on `seq` so consecutive changes to the same session each re-run.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: seq intentionally re-triggers refresh for repeated changes to the same session
 	useEffect(() => {
-		if (visualChange?.sessionId === session.id) {
-			setScreenshotKey((k) => k + 1);
+		if (visualChange?.sessionId === session.id && !localInteractionPendingRef.current) {
+			setScreenshotKey((key) => key + 1);
 		}
 	}, [visualChange?.sessionId, visualChange?.seq, session.id]);
 
+	const applyPreviewBlob = useCallback((blob: Blob, requestSeq: number) => {
+		if (blob.size > MAX_SCREENSHOT_BLOB_BYTES) {
+			if (previewRequestSeqRef.current === requestSeq) setError(true);
+			return;
+		}
+		if (previewRequestSeqRef.current !== requestSeq) return;
+
+		const url = URL.createObjectURL(blob);
+		if (revokedRef.current) URL.revokeObjectURL(revokedRef.current);
+		revokedRef.current = url;
+		setBlobUrl(url);
+		setError(false);
+	}, []);
+
 	const fetchScreenshot = useCallback(async () => {
+		if (localInteractionPendingRef.current) return;
 		const token = getToken();
 		if (!token) return;
+		const requestSeq = ++previewRequestSeqRef.current;
 		screenshotAbortRef.current?.abort();
 		const controller = new AbortController();
 		screenshotAbortRef.current = controller;
@@ -322,22 +563,19 @@ function BrowserSessionCard({
 				throw new ApiError(err.message, res.status, err.data);
 			}
 			const blob = await res.blob();
-			if (blob.size > MAX_SCREENSHOT_BLOB_BYTES) throw new Error("Screenshot too large");
-			const url = URL.createObjectURL(blob);
-			if (controller.signal.aborted) {
-				URL.revokeObjectURL(url);
-				return;
-			}
-			if (revokedRef.current) URL.revokeObjectURL(revokedRef.current);
-			revokedRef.current = url;
-			setBlobUrl(url);
+			if (controller.signal.aborted || previewRequestSeqRef.current !== requestSeq) return;
+			applyPreviewBlob(blob, requestSeq);
 		} catch (_err) {
-			if (!controller.signal.aborted) setError(true);
+			if (!controller.signal.aborted && previewRequestSeqRef.current === requestSeq) {
+				setError(true);
+			}
 		} finally {
 			if (screenshotAbortRef.current === controller) screenshotAbortRef.current = null;
-			if (!controller.signal.aborted) setLoading(false);
+			if (!controller.signal.aborted && previewRequestSeqRef.current === requestSeq) {
+				setLoading(false);
+			}
 		}
-	}, [narratorId, session.id]);
+	}, [applyPreviewBlob, narratorId, session.id]);
 
 	useEffect(() => {
 		if (screenshotKey > 0) fetchScreenshot();
@@ -347,6 +585,8 @@ function BrowserSessionCard({
 	useEffect(() => {
 		return () => {
 			screenshotAbortRef.current?.abort();
+			previewRequestSeqRef.current++;
+			if (postClickRefreshTimerRef.current) clearTimeout(postClickRefreshTimerRef.current);
 			if (revokedRef.current) {
 				URL.revokeObjectURL(revokedRef.current);
 				revokedRef.current = null;
@@ -354,124 +594,66 @@ function BrowserSessionCard({
 		};
 	}, []);
 
-	// Coordinate translation helper
-	const translateCoordinate = useCallback(
-		(clientX: number, clientY: number): { x: number; y: number } | null => {
-			const img = imgRef.current;
-			if (!img) return null;
-			const rect = img.getBoundingClientRect();
-			const relX = clientX - rect.left;
-			const relY = clientY - rect.top;
-			const scaleX = session.viewport.width / rect.width;
-			const scaleY = session.viewport.height / rect.height;
-			return {
-				x: Math.round(relX * scaleX),
-				y: Math.round(relY * scaleY),
-			};
-		},
-		[session.viewport.width, session.viewport.height],
-	);
-
-	// Update blob from interact response
-	const updateBlobFromResponse = useCallback((blob: Blob) => {
-		const url = URL.createObjectURL(blob);
-		if (revokedRef.current) URL.revokeObjectURL(revokedRef.current);
-		revokedRef.current = url;
-		setBlobUrl(url);
-	}, []);
-
-	// Click handler
-	const handleClick = useCallback(
-		(e: React.MouseEvent<HTMLImageElement>) => {
-			if (suppressNextClickRef.current) {
-				suppressNextClickRef.current = false;
-				return;
+	const executeInteraction = useCallback(
+		(params: BrowserInteractionParams) => {
+			if (localInteractionPendingRef.current) return;
+			if (postClickRefreshTimerRef.current) {
+				clearTimeout(postClickRefreshTimerRef.current);
+				postClickRefreshTimerRef.current = null;
 			}
-			if (isDraggingRef.current) return;
-			// Focus the container so keyboard events are captured
-			containerRef.current?.focus();
-			const coord = translateCoordinate(e.clientX, e.clientY);
-			if (!coord) return;
+			const requestSeq = ++previewRequestSeqRef.current;
+			localInteractionPendingRef.current = true;
+			screenshotAbortRef.current?.abort();
+			setLoading(false);
 			interactMutation.mutate(
+				{ narratorId, sessionId: session.id, params },
 				{
-					narratorId,
-					sessionId: session.id,
-					params: { action: "click", coordinate: coord },
-				},
-				{ onSuccess: (blob) => updateBlobFromResponse(blob) },
-			);
-		},
-		[narratorId, session.id, translateCoordinate, interactMutation, updateBlobFromResponse],
-	);
-
-	// Scroll handler
-	const handleWheel = useCallback(
-		(e: React.WheelEvent<HTMLImageElement>) => {
-			e.preventDefault();
-			const coord = translateCoordinate(e.clientX, e.clientY);
-			if (!coord) return;
-			const direction = e.deltaY > 0 ? "down" : "up";
-			const amount = Math.min(Math.abs(e.deltaY) * 2, 1000);
-			interactMutation.mutate(
-				{
-					narratorId,
-					sessionId: session.id,
-					params: { action: "scroll", coordinate: coord, direction, amount },
-				},
-				{ onSuccess: (blob) => updateBlobFromResponse(blob) },
-			);
-		},
-		[narratorId, session.id, translateCoordinate, interactMutation, updateBlobFromResponse],
-	);
-
-	// Drag handlers
-	const handlePointerDown = useCallback(
-		(e: React.PointerEvent<HTMLImageElement>) => {
-			const coord = translateCoordinate(e.clientX, e.clientY);
-			if (!coord) return;
-			dragStartRef.current = coord;
-			isDraggingRef.current = false;
-			(e.target as HTMLElement).setPointerCapture(e.pointerId);
-		},
-		[translateCoordinate],
-	);
-
-	const handlePointerMove = useCallback((_e: React.PointerEvent<HTMLImageElement>) => {
-		if (!dragStartRef.current) return;
-		isDraggingRef.current = true;
-	}, []);
-
-	const handlePointerUp = useCallback(
-		(e: React.PointerEvent<HTMLImageElement>) => {
-			if (!dragStartRef.current) return;
-			if (!isDraggingRef.current) {
-				dragStartRef.current = null;
-				return;
-			}
-			const endCoord = translateCoordinate(e.clientX, e.clientY);
-			if (!endCoord) {
-				dragStartRef.current = null;
-				isDraggingRef.current = false;
-				return;
-			}
-			// A real drag happened — swallow the browser's trailing click.
-			suppressNextClickRef.current = true;
-			interactMutation.mutate(
-				{
-					narratorId,
-					sessionId: session.id,
-					params: {
-						action: "drag",
-						coordinate: dragStartRef.current,
-						endCoordinate: endCoord,
+					onSuccess: (blob) => {
+						applyPreviewBlob(blob, requestSeq);
+						if (params.action === "click") {
+							if (postClickRefreshTimerRef.current) {
+								clearTimeout(postClickRefreshTimerRef.current);
+							}
+							postClickRefreshTimerRef.current = setTimeout(() => {
+								postClickRefreshTimerRef.current = null;
+								setScreenshotKey((key) => key + 1);
+								void queryClient.invalidateQueries({
+									queryKey: ["browser-sessions", narratorId],
+								});
+							}, BROWSER_POST_CLICK_REFRESH_DELAY_MS);
+						}
+					},
+					onError: () => {
+						if (previewRequestSeqRef.current === requestSeq) setError(true);
+					},
+					onSettled: () => {
+						localInteractionPendingRef.current = false;
 					},
 				},
-				{ onSuccess: (blob) => updateBlobFromResponse(blob) },
 			);
-			dragStartRef.current = null;
-			isDraggingRef.current = false;
 		},
-		[narratorId, session.id, translateCoordinate, interactMutation, updateBlobFromResponse],
+		[applyPreviewBlob, interactMutation, narratorId, queryClient, session.id],
+	);
+
+	const handleRemoteClick = useCallback(
+		(coordinate: { x: number; y: number }) => {
+			executeInteraction({ action: "click", coordinate });
+		},
+		[executeInteraction],
+	);
+
+	const handleRemoteScroll = useCallback(
+		(coordinate: { x: number; y: number }, direction: "up" | "down", amount: number) => {
+			executeInteraction({ action: "scroll", coordinate, direction, amount });
+		},
+		[executeInteraction],
+	);
+
+	const handleRemoteDrag = useCallback(
+		(coordinate: { x: number; y: number }, endCoordinate: { x: number; y: number }) => {
+			executeInteraction({ action: "drag", coordinate, endCoordinate });
+		},
+		[executeInteraction],
 	);
 
 	// Keyboard input batching — all keystrokes go into a queue, flushed after 150ms of inactivity.
@@ -488,15 +670,8 @@ function BrowserSessionCard({
 		const queue = keyQueueRef.current;
 		if (queue.length === 0) return;
 		keyQueueRef.current = [];
-		interactMutation.mutate(
-			{
-				narratorId,
-				sessionId: session.id,
-				params: { action: "type", keys: queue },
-			},
-			{ onSuccess: (blob) => updateBlobFromResponse(blob) },
-		);
-	}, [narratorId, session.id, interactMutation, updateBlobFromResponse]);
+		executeInteraction({ action: "type", keys: queue });
+	}, [executeInteraction]);
 
 	// Cleanup flush timer on unmount
 	useEffect(() => {
@@ -511,9 +686,7 @@ function BrowserSessionCard({
 			// Don't capture if user is typing in an input/textarea within the panel
 			const tag = (e.target as HTMLElement).tagName;
 			if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-
-			e.preventDefault();
-			e.stopPropagation();
+			if (localInteractionPendingRef.current) return;
 
 			// Map special keys
 			const specialKeys: Record<string, string> = {
@@ -559,9 +732,12 @@ function BrowserSessionCard({
 					queue.push({ text: e.key });
 				}
 			} else {
-				// Unhandled key (Shift, Ctrl alone, etc.) — ignore
+				// Unhandled key (Shift, Ctrl alone, etc.) — leave it to the local UI.
 				return;
 			}
+
+			e.preventDefault();
+			e.stopPropagation();
 
 			// Reset the debounce timer
 			if (keyTimerRef.current) clearTimeout(keyTimerRef.current);
@@ -575,6 +751,17 @@ function BrowserSessionCard({
 	const networkCaptureEnabled = session.networkCaptureEnabled ?? false;
 	const expiresInLabel = formatCompactDuration(session.expiresAt - Date.now());
 	const ttlLabel = formatCompactDuration(session.ttlMs);
+	const currentUrl = session.url;
+	const navigationUrl = getBrowserPreviewNavigationUrl(currentUrl);
+	const previewViewport = session.viewport;
+	const handleNavigationClick = useCallback(
+		(event: React.MouseEvent<HTMLAnchorElement>) => {
+			event.preventDefault();
+			event.stopPropagation();
+			if (navigationUrl) openBrowserPreviewNavigation(navigationUrl);
+		},
+		[navigationUrl],
+	);
 
 	return (
 		<Box
@@ -589,9 +776,25 @@ function BrowserSessionCard({
 			{/* Header */}
 			<Group justify="space-between" wrap="nowrap" gap={6} mb={4}>
 				<Box style={{ flex: 1, minWidth: 0 }}>
-					<Text size="xs" ff="monospace" truncate title={session.url}>
-						{session.url}
-					</Text>
+					{navigationUrl ? (
+						<Anchor
+							href={navigationUrl}
+							target="_blank"
+							rel="noopener noreferrer"
+							onClick={handleNavigationClick}
+							size="xs"
+							ff="monospace"
+							truncate
+							title={currentUrl}
+							style={{ display: "block" }}
+						>
+							{currentUrl}
+						</Anchor>
+					) : (
+						<Text size="xs" ff="monospace" truncate title={currentUrl}>
+							{currentUrl}
+						</Text>
+					)}
 					<Group gap={6} mt={2}>
 						<Badge size="xs" variant="outline" color="dimmed">
 							{session.id.slice(0, 8)}
@@ -657,12 +860,24 @@ function BrowserSessionCard({
 							</ActionIcon>
 						</Tooltip>
 					)}
+					<Tooltip label={t("browser.expandPreview")} fz="xs">
+						<ActionIcon
+							variant="subtle"
+							size="sm"
+							color="gray"
+							aria-label={t("browser.expandPreview")}
+							onClick={() => setExpanded(true)}
+						>
+							<IconArrowsMaximize size={14} />
+						</ActionIcon>
+					</Tooltip>
 					<Tooltip label={t("browser.refreshScreenshot")} fz="xs">
 						<ActionIcon
 							variant="subtle"
 							size="sm"
 							color="gray"
-							onClick={() => setScreenshotKey((k) => k + 1)}
+							aria-label={t("browser.refreshScreenshot")}
+							onClick={() => setScreenshotKey((key) => key + 1)}
 						>
 							<IconRefresh size={14} />
 						</ActionIcon>
@@ -712,73 +927,86 @@ function BrowserSessionCard({
 			</Group>
 
 			{/* Screenshot area */}
-			<Box
-				ref={containerRef}
-				tabIndex={0}
-				onKeyDown={handleKeyDown}
-				style={{
-					position: "relative",
-					borderRadius: "var(--mantine-radius-sm)",
-					overflow: "hidden",
-					backgroundColor: "var(--mantine-color-dark-8)",
-					minHeight: 120,
-					outline: "none",
+			{!expanded && (
+				<BrowserPreviewSurface
+					blobUrl={blobUrl}
+					loading={loading}
+					error={error}
+					viewport={previewViewport}
+					interactionPending={interactMutation.isPending}
+					onRetry={() => setScreenshotKey((key) => key + 1)}
+					onRemoteClick={handleRemoteClick}
+					onRemoteScroll={handleRemoteScroll}
+					onRemoteDrag={handleRemoteDrag}
+					onKeyDown={handleKeyDown}
+				/>
+			)}
+
+			<Modal
+				opened={expanded}
+				onClose={() => setExpanded(false)}
+				fullScreen
+				title={
+					<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+						{navigationUrl ? (
+							<Anchor
+								href={navigationUrl}
+								target="_blank"
+								rel="noopener noreferrer"
+								onClick={handleNavigationClick}
+								size="sm"
+								ff="monospace"
+								truncate
+								title={currentUrl}
+								style={{ flex: 1, minWidth: 0, display: "block" }}
+							>
+								{currentUrl}
+							</Anchor>
+						) : (
+							<Text size="sm" ff="monospace" truncate title={currentUrl} style={{ flex: 1 }}>
+								{currentUrl}
+							</Text>
+						)}
+						<Tooltip label={t("browser.refreshScreenshot")} fz="xs">
+							<ActionIcon
+								variant="subtle"
+								size="sm"
+								color="gray"
+								onClick={() => setScreenshotKey((key) => key + 1)}
+							>
+								<IconRefresh size={14} />
+							</ActionIcon>
+						</Tooltip>
+					</Group>
+				}
+				closeButtonProps={{ "aria-label": t("browser.closeExpandedPreview") }}
+				styles={{
+					content: SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE,
+					header: SAFE_AREA_FULLSCREEN_MODAL_HEADER_STYLE,
+					body: {
+						display: "flex",
+						flexDirection: "column",
+						minHeight: 0,
+						overflow: "auto",
+						padding: 8,
+						...safeAreaFullscreenModalBodyStyle(8),
+					},
 				}}
 			>
-				{loading && !blobUrl ? (
-					<Group gap={6} justify="center" py="xl">
-						<Loader size="xs" />
-						<Text size="xs" c="dimmed">
-							{t("browser.refreshScreenshot")}
-						</Text>
-					</Group>
-				) : error && !blobUrl ? (
-					<Group gap={6} justify="center" py="xl">
-						<Text size="xs" c="red">
-							{t("browser.screenshotFailed")}
-						</Text>
-						<ActionIcon
-							variant="subtle"
-							size="sm"
-							color="gray"
-							onClick={() => setScreenshotKey((k) => k + 1)}
-						>
-							<IconRefresh size={12} />
-						</ActionIcon>
-					</Group>
-				) : blobUrl ? (
-					// biome-ignore lint/a11y/useKeyWithClickEvents: interactive screenshot canvas, keyboard not applicable
-					<img
-						ref={imgRef}
-						src={blobUrl}
-						alt={t("browser.screenshotAlt")}
-						onClick={handleClick}
-						onWheel={handleWheel}
-						onPointerDown={handlePointerDown}
-						onPointerMove={handlePointerMove}
-						onPointerUp={handlePointerUp}
-						style={{
-							width: "100%",
-							display: "block",
-							cursor: interactMutation.isPending ? "wait" : "crosshair",
-							userSelect: "none",
-							touchAction: "none",
-						}}
-						draggable={false}
-					/>
-				) : null}
-				{interactMutation.isPending && (
-					<Box
-						style={{
-							position: "absolute",
-							top: 4,
-							right: 4,
-						}}
-					>
-						<Loader size="xs" color="teal" />
-					</Box>
-				)}
-			</Box>
+				<BrowserPreviewSurface
+					blobUrl={blobUrl}
+					loading={loading}
+					error={error}
+					viewport={previewViewport}
+					interactionPending={interactMutation.isPending}
+					expanded
+					onRetry={() => setScreenshotKey((key) => key + 1)}
+					onRemoteClick={handleRemoteClick}
+					onRemoteScroll={handleRemoteScroll}
+					onRemoteDrag={handleRemoteDrag}
+					onKeyDown={handleKeyDown}
+				/>
+			</Modal>
 		</Box>
 	);
 }

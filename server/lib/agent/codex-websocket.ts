@@ -5,7 +5,12 @@ import type WebSocket from "ws";
 import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages } from "../../db/schema";
 import { logger } from "../logger";
-import { getHttpCodexUserAgent, ORIGINATOR_CODEX, stripResponsesLiteHeader } from "../user-agent";
+import {
+	getHttpCodexUserAgent,
+	mergeExtraHeaders,
+	ORIGINATOR_CODEX,
+	stripResponsesLiteHeader,
+} from "../user-agent";
 import { deriveCodexWindowId } from "./codex-request";
 import { parseGatewayDataEvent } from "./gateway-events";
 import {
@@ -411,9 +416,11 @@ export function buildHandshakeHeaders(
 	// user-configured headers) applied last so it overrides built-in defaults such as
 	// originator. The session-id/thread-id pair (matching the real Codex CLI's hyphenated
 	// header names) is supplied here rather than hardcoded above.
-	for (const [key, value] of Object.entries(options.extraHeaders ?? {})) {
-		if (value) headers[key] = value;
-	}
+	//
+	// `"User-Agent"` matches the casing written above, so an operator UA override
+	// replaces that key rather than adding a second differently-cased one that the
+	// handshake would send alongside it.
+	mergeExtraHeaders(headers, options.extraHeaders, "User-Agent");
 	// extraHeaders is merged last, so it is also the one place that could put the
 	// lite opt-in back on the wire. Strip it for the same reason it is not set above.
 	stripResponsesLiteHeader(headers);

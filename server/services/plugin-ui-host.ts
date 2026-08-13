@@ -40,7 +40,7 @@ import {
 } from "./plugin-storage";
 import type { PluginUiSession } from "./plugin-ui-session";
 
-export const PLUGIN_UI_HOST_REQUEST_MAX_BYTES = 256 * 1024;
+export const PLUGIN_UI_HOST_REQUEST_MAX_BYTES = 5 * 1024 * 1024;
 export const PLUGIN_UI_HOST_RESPONSE_MAX_BYTES = 1024 * 1024;
 export const PLUGIN_UI_HOST_TIMEOUT_MS = 10_000;
 
@@ -515,7 +515,7 @@ export class PluginUiHost {
 			runtimeId: `ui:${input.session.sessionId}`,
 			runtimeGeneration: input.session.generation,
 			contributionId: input.session.contributionId,
-			installationId: input.session.hash,
+			installationId: input.session.authorityInstallationId,
 		};
 		const contextInput = {
 			requestId: input.request.id,
@@ -689,7 +689,7 @@ export class PluginUiHost {
 			throw new PluginUiHostError("INVALID_PARAMS", "Invalid event subscription parameters");
 		const principal: PluginEventPrincipal = {
 			pluginId: input.session.pluginId,
-			installationId: input.session.hash,
+			installationId: input.session.authorityInstallationId,
 			packageVersion: input.session.version,
 			runtimeId: `ui:${input.session.sessionId}`,
 			generation: input.session.generation,

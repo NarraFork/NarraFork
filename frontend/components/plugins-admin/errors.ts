@@ -3,16 +3,24 @@ import { ApiError } from "../../lib/api";
 
 /**
  * Map a plugin API error to a localized message.
- * Never surfaces raw server `Error.message` for known codes; falls back to a
- * generic localized string for unknown failures.
+ *
+ * Validation errors are deliberately client-facing: the server supplies the
+ * rejected field/path so an administrator can fix the package or request.
+ * Unknown and internal codes still use generic localized text and never expose
+ * their raw messages.
  */
 export function localizePluginError(error: unknown, t: TFunction<"plugins">): string {
 	if (error instanceof ApiError) {
 		const code = typeof error.data?.code === "string" ? error.data.code : undefined;
 		if (code) {
-			return t(`admin.errors.${code}`, {
+			const summary = t(`admin.errors.${code}`, {
 				defaultValue: t("admin.errors.UNKNOWN"),
 			});
+			if (code === "VALIDATION_ERROR") {
+				const detail = error.message.trim();
+				if (detail && detail !== code && detail !== summary) return `${summary} ${detail}`;
+			}
+			return summary;
 		}
 		if (error.status === 503) return t("admin.errors.PLUGINS_DISABLED");
 		if (error.status === 404) return t("admin.errors.NOT_FOUND");

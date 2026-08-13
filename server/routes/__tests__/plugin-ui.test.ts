@@ -12,7 +12,7 @@ import { CapabilityBroker, capabilityBroker } from "../../services/plugin-capabi
 import { PluginHealthRegistry } from "../../services/plugin-health";
 import { pluginInstallationAuthorityId } from "../../services/plugin-integration-authority-service";
 import { PluginUiAssetService } from "../../services/plugin-ui-assets";
-import { PluginUiHost } from "../../services/plugin-ui-host";
+import { PLUGIN_UI_HOST_REQUEST_MAX_BYTES, PluginUiHost } from "../../services/plugin-ui-host";
 import { PluginUiSessionService } from "../../services/plugin-ui-session";
 import { createPluginUiRoutes } from "../plugin-ui";
 
@@ -28,6 +28,7 @@ const expectedGrant = {
 	grantedBy: "admin-1",
 };
 const defaultPermissionSet = {
+	installationId: hash,
 	revision: 7,
 	grants: [
 		{
@@ -575,7 +576,7 @@ describe("plugin UI routes", () => {
 
 	test("rejects oversized JSON before route parsing", async () => {
 		const routes = await makeRoutes();
-		const body = JSON.stringify({ padding: "x".repeat(256 * 1024) });
+		const body = JSON.stringify({ padding: "x".repeat(PLUGIN_UI_HOST_REQUEST_MAX_BYTES) });
 		for (const headers of [
 			new Headers({ "content-type": "application/json" }),
 			new Headers({ "content-type": "application/json", "content-length": "1" }),
@@ -588,6 +589,16 @@ describe("plugin UI routes", () => {
 			expect(response.status).toBe(413);
 			expect(await response.json()).toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
 		}
+	});
+
+	test("does not apply the UI body cap to sibling plugin routes", async () => {
+		const routes = await makeRoutes();
+		const response = await routes.request("http://localhost/install", {
+			method: "POST",
+			headers: { "content-type": "application/octet-stream" },
+			body: "x".repeat(PLUGIN_UI_HOST_REQUEST_MAX_BYTES + 1),
+		});
+		expect(response.status).toBe(404);
 	});
 
 	test("replaces the route removal cascade when a factory is recreated", () => {
@@ -616,6 +627,7 @@ describe("plugin UI routes", () => {
 			pluginId,
 			version,
 			hash,
+			authorityInstallationId: hash,
 			principalId: "user-1",
 			contributionId: "panel",
 			panelInstanceId: "listener-test",
@@ -815,7 +827,19 @@ describe("plugin UI theme-asset endpoint", () => {
 						id: "scenic",
 						title: "Scenic",
 						colorScheme: "both",
-						tokens: { backgrounds: { main: { image: "assets/bg.png" } } },
+						fonts: [
+							{
+								id: "brand",
+								source: "assets/brand.woff2",
+								weight: { min: 100, max: 900 },
+								style: "normal",
+								display: "swap",
+							},
+						],
+						tokens: {
+							fontFamily: { font: "brand", fallback: "system-ui" },
+							backgrounds: { main: { image: "assets/bg.png" } },
+						},
 					},
 				],
 			},
@@ -829,6 +853,10 @@ describe("plugin UI theme-asset endpoint", () => {
 		await writeFile(join(pkgDir, "manifest.json"), JSON.stringify(manifest));
 		// A 1x1 PNG (bytes are irrelevant to the route; declaredAssets + path matter).
 		await writeFile(join(pkgDir, "assets", "bg.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+		await writeFile(
+			join(pkgDir, "assets", "brand.woff2"),
+			Buffer.from([0x77, 0x4f, 0x46, 0x32, 1, 2, 3]),
+		);
 		await writeFile(join(pkgDir, "assets", "secret.png"), Buffer.from([0x89, 0x50]));
 		const auth: MiddlewareHandler = async (c, next) => {
 			c.set("user", { sub: "u1", role: "user", iat: 0, exp: 9_999_999_999 });
@@ -859,6 +887,19 @@ describe("plugin UI theme-asset endpoint", () => {
 		expect(res.headers.get("content-type")).toBe("image/png");
 		expect(res.headers.get("x-content-type-options")).toBe("nosniff");
 		expect(res.headers.get("cross-origin-resource-policy")).toBe("same-origin");
+	});
+
+	test("serves a declared WOFF2 theme font without a session", async () => {
+		const routes = await makeThemeAssetRoutes();
+		const res = await routes.request(assetUrl("assets/brand.woff2"));
+		expect(res.status).toBe(200);
+		expect(res.headers.get("content-type")).toBe("font/woff2");
+		expect(res.headers.get("cache-control")).toContain("immutable");
+		expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+		expect(res.headers.get("cross-origin-resource-policy")).toBe("same-origin");
+		expect([...new Uint8Array(await res.arrayBuffer()).slice(0, 4)]).toEqual([
+			0x77, 0x4f, 0x46, 0x32,
+		]);
 	});
 
 	test("refuses an undeclared file in the same package", async () => {

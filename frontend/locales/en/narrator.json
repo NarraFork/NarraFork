@@ -776,6 +776,8 @@
 	"browser.title": "Browser",
 	"browser.closeSession": "Close session",
 	"browser.refreshScreenshot": "Refresh",
+	"browser.expandPreview": "Expand preview",
+	"browser.closeExpandedPreview": "Close expanded preview",
 	"browser.lastActive": "active {{time}} ago",
 	"browser.expiresIn": "closes in {{time}}",
 	"browser.autoClose": "Auto-close",

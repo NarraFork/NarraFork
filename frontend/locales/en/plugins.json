@@ -210,6 +210,7 @@
 			"PLUGIN_RETRY_REQUIRES_RESTART": "This plugin is quarantined and requires a server restart or reinstall before retrying.",
 			"PLUGIN_REQUIRES_ADMIN": "This plugin needs an administrator. Only theme-only plugins can be installed or managed by non-admin users.",
 			"PLUGIN_THEME_NOT_FOUND": "That theme is not available.",
+			"INTEGRATION_AUTHORITY_CONFLICT": "The plugin authorization state conflicts with this installation.",
 			"NOT_FOUND": "The requested plugin resource was not found.",
 			"VALIDATION_ERROR": "The request was rejected by server-side validation.",
 			"UNKNOWN": "An unexpected plugin error occurred."

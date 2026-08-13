@@ -378,6 +378,8 @@ export type GitFileStatus =
 	| "A"
 	| "D"
 	| "R"
+	| "C"
+	| "U"
 	| "??"
 	| "added"
 	| "deleted"
@@ -389,6 +391,10 @@ const gitFileStatusMap: StatusMap<GitFileStatus> = {
 	A: { color: "green", icon: "+", i18nKey: "status.gitAdded" },
 	D: { color: "red", icon: "-", i18nKey: "status.gitDeleted" },
 	R: { color: "blue", icon: "→", i18nKey: "status.gitRenamed" },
+	C: { color: "blue", icon: "⧉", i18nKey: "status.gitCopied" },
+	// A merge conflict needs its own colour: it is the one status that blocks a
+	// commit, so it must not read as an ordinary edit.
+	U: { color: "orange", icon: "!", i18nKey: "status.gitUnmerged" },
 	"??": { color: "gray", icon: "?", i18nKey: "status.gitUntracked" },
 	added: { color: "green", icon: "+", i18nKey: "status.gitAdded" },
 	deleted: { color: "red", icon: "-", i18nKey: "status.gitDeleted" },

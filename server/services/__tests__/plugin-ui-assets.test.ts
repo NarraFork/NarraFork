@@ -62,6 +62,50 @@ async function setup(options: { asset?: string; includeQuiet?: boolean } = {}) {
 	return { root, packagePath };
 }
 
+async function setupThemeFont(options: { invalidMagic?: boolean } = {}) {
+	const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-font-"));
+	const packagePath = join(root, "packages", pluginId, version, hash);
+	await mkdir(join(packagePath, "assets"), { recursive: true });
+	const fonts = [
+		{
+			id: "brand",
+			source: "assets/brand.woff2",
+			weight: { min: 100, max: 900 },
+			style: "normal",
+			display: "swap",
+		},
+	];
+	const manifest = {
+		schemaVersion: 1,
+		pluginId,
+		version,
+		displayName: "Theme Font",
+		engine: { runtime: "bun", hostApi: ">=1.0 <2", rpc: "narrafork.rpc/1" },
+		activationEvents: [],
+		contributes: {
+			themes: [
+				{
+					id: "font-theme",
+					title: "Font Theme",
+					colorScheme: "both",
+					fonts,
+					tokens: { fontFamily: { font: "brand", fallback: "system-ui" } },
+				},
+			],
+		},
+		permissions: {
+			host: ["ui.theme"],
+			network: { mode: "none", allow: [] },
+			filesystem: { package: "readOnly", pluginData: "none", workspace: "none" },
+			process: { spawn: "none" },
+		},
+	};
+	await writeFile(join(packagePath, "manifest.json"), JSON.stringify(manifest));
+	const magic = options.invalidMagic ? [0x62, 0x61, 0x64, 0x21] : [0x77, 0x4f, 0x46, 0x32];
+	await writeFile(join(packagePath, "assets/brand.woff2"), Uint8Array.from([...magic, 1, 2, 3]));
+	return { root, packagePath };
+}
+
 describe("PluginUiAssetService", () => {
 	test("serves declared assets and creates a host-controlled shell", async () => {
 		const { root } = await setup();
@@ -96,7 +140,60 @@ describe("PluginUiAssetService", () => {
 		await expect(service.readAsset(pluginId, version, hash, "ui/index.js")).rejects.toMatchObject({
 			code: "PLUGIN_UI_ASSET_TOO_LARGE",
 		});
-		await symlink(join(packagePath, "ui/index.js"), join(packagePath, "ui/link.js"));
-		await expect(service.readAsset(pluginId, version, hash, "ui/link.js")).rejects.toThrow();
+		try {
+			await symlink(join(packagePath, "ui/index.js"), join(packagePath, "ui/link.js"));
+			await expect(service.readAsset(pluginId, version, hash, "ui/link.js")).rejects.toThrow();
+		} catch (error) {
+			if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") {
+				throw error;
+			}
+		}
+	});
+
+	test("serves a declared WOFF2 font from a theme-only package", async () => {
+		const { root } = await setupThemeFont();
+		const service = new PluginUiAssetService({ root });
+		const asset = await service.readAsset(pluginId, version, hash, "assets/brand.woff2");
+		expect(asset.contentType).toBe("font/woff2");
+		expect([...asset.bytes.slice(0, 4)]).toEqual([0x77, 0x4f, 0x46, 0x32]);
+	});
+
+	/**
+	 * A `.woff2` extension decides the served Content-Type and hands the bytes to
+	 * the platform text engine, so the magic number is verified rather than trusted.
+	 */
+	test("refuses a declared font whose bytes are not WOFF2", async () => {
+		const { root } = await setupThemeFont({ invalidMagic: true });
+		await expect(
+			new PluginUiAssetService({ root }).readAsset(pluginId, version, hash, "assets/brand.woff2"),
+		).rejects.toMatchObject({ code: "PLUGIN_THEME_FONT_INVALID" });
+	});
+
+	test("applies the shared asset size limit to fonts", async () => {
+		const { root } = await setupThemeFont();
+		await expect(
+			new PluginUiAssetService({ root, maxAssetBytes: 4 }).readAsset(
+				pluginId,
+				version,
+				hash,
+				"assets/brand.woff2",
+			),
+		).rejects.toMatchObject({ code: "PLUGIN_UI_ASSET_TOO_LARGE" });
+	});
+
+	test("refuses an undeclared font in the same package", async () => {
+		const { root, packagePath } = await setupThemeFont();
+		await writeFile(
+			join(packagePath, "assets/undeclared.woff2"),
+			Uint8Array.from([0x77, 0x4f, 0x46, 0x32, 9]),
+		);
+		await expect(
+			new PluginUiAssetService({ root }).readAsset(
+				pluginId,
+				version,
+				hash,
+				"assets/undeclared.woff2",
+			),
+		).rejects.toThrow();
 	});
 });

@@ -286,8 +286,8 @@ describe("classifyToolDetail — file", () => {
 			["removed", 43, undefined],
 			["added", undefined, 43],
 		]);
-		// One column is 3 chars wide at minimum, so both columns align.
-		expect(body.diffLineNoWidth).toBe(3);
+		// One column is 2 chars wide at minimum, so both columns align.
+		expect(body.diffLineNoWidth).toBe(2);
 	});
 	it("carries word-level changes for a modified line pair", () => {
 		const d = classifyToolDetail({
@@ -1351,7 +1351,7 @@ describe("classifyToolDetail — streaming input", () => {
 		]);
 		// new_string is arriving → the replacing phase, so positions are real.
 		expect(body.diffLineNumberPrefix).toBeUndefined();
-		expect(body.diffLineNoWidth).toBe(3);
+		expect(body.diffLineNoWidth).toBe(2);
 	});
 	it("shows provisional line numbers while a streaming Edit is still matching", () => {
 		const d = classifyToolDetail({

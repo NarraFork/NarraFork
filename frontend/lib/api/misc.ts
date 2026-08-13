@@ -242,6 +242,24 @@ export const miscApi = {
 			method: "DELETE",
 		}),
 
+		paidPage?: number;
+		enterprisePage?: number;
+		freePage?: number;
+		pageSize?: number;
+	}) => {
+		const qs = new URLSearchParams();
+		if (params?.paidPage) qs.set("paidPage", String(params.paidPage));
+		if (params?.enterprisePage) qs.set("enterprisePage", String(params.enterprisePage));
+		if (params?.freePage) qs.set("freePage", String(params.freePage));
+		if (params?.pageSize) qs.set("pageSize", String(params.pageSize));
+		const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
+	},
+			method: "DELETE",
+			body: JSON.stringify({ ids }),
+		}),
+		request<{
+			removed: string[];
+			reasons: Array<"too_many_failures" | "account_suspended">;
 			method: "POST",
 			body: JSON.stringify({ priority }),
 		}),

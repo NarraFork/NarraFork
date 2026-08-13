@@ -24,6 +24,9 @@ import {
 	THEME_GRADIENT_SURFACES,
 	THEME_TEXT_SURFACES,
 	type ThemeContribution,
+	type ThemeFontFace,
+	type ThemeFontReference,
+	type ThemeFontValue,
 	type ThemeTokens,
 } from "./manifest";
 
@@ -274,9 +277,9 @@ interface SchemeTokens {
 	gradients?: Record<string, SurfaceGradient>;
 	textColors?: Record<string, string>;
 	borders?: Record<string, SurfaceBorder>;
-	fontFamily?: string;
-	fontFamilyHeadings?: string;
-	fontFamilyMonospace?: string;
+	fontFamily?: ThemeFontValue;
+	fontFamilyHeadings?: ThemeFontValue;
+	fontFamilyMonospace?: ThemeFontValue;
 	shadow?: number;
 }
 
@@ -284,6 +287,68 @@ interface SchemeTokens {
 export interface ThemeAssetContext {
 	version: string;
 	hash: string;
+}
+
+interface CompiledThemeFonts {
+	css: string;
+	families: ReadonlyMap<string, string>;
+}
+
+function isThemeFontReference(value: ThemeFontValue): value is ThemeFontReference {
+	return typeof value === "object" && value !== null;
+}
+
+function themeFontFamilyName(themeId: string, fontId: string, hash: string): string | null {
+	if (!/^[a-f0-9]{64}$/.test(hash)) return null;
+	if (!/^[A-Za-z0-9._-]+$/.test(themeId) || !/^[A-Za-z0-9._-]+$/.test(fontId)) return null;
+	return `nf-theme-${hash.slice(0, 16)}-${themeId}-${fontId}`;
+}
+
+function compileThemeFonts(
+	fonts: readonly ThemeFontFace[],
+	pluginId: string,
+	themeId: string,
+	assetContext: ThemeAssetContext | undefined,
+): CompiledThemeFonts | null {
+	if (fonts.length === 0) return { css: "", families: new Map() };
+	if (!assetContext || fonts.length > 4) return null;
+	const families = new Map<string, string>();
+	const rules: string[] = [];
+	for (const font of fonts) {
+		if (families.has(font.id) || !font.source.toLowerCase().endsWith(".woff2")) return null;
+		if (
+			font.weight.min < 100 ||
+			font.weight.max > 900 ||
+			font.weight.min > font.weight.max ||
+			!Number.isInteger(font.weight.min) ||
+			!Number.isInteger(font.weight.max)
+		) {
+			return null;
+		}
+		if (font.style !== "normal" && font.style !== "italic") return null;
+		if (font.display !== "swap" && font.display !== "fallback" && font.display !== "optional") {
+			return null;
+		}
+		const url = themeAssetUrl(pluginId, assetContext, font.source);
+		const family = themeFontFamilyName(themeId, font.id, assetContext.hash);
+		if (!url || !family) return null;
+		families.set(font.id, `"${family}"`);
+		rules.push(
+			`@font-face{font-family:"${family}";src:url("${url}") format("woff2");font-style:${font.style};font-weight:${font.weight.min} ${font.weight.max};font-display:${font.display};}`,
+		);
+	}
+	return { css: rules.join(""), families };
+}
+
+function resolveFontFamily(
+	value: ThemeFontValue | undefined,
+	families: ReadonlyMap<string, string>,
+): string | null {
+	if (!value) return null;
+	if (typeof value === "string") return FONT_FAMILIES.has(value) ? value : null;
+	if (!isThemeFontReference(value) || !FONT_FAMILIES.has(value.fallback)) return null;
+	const family = families.get(value.font);
+	return family ? `${family}, ${value.fallback}` : null;
 }
 
 /**
@@ -743,7 +808,10 @@ function buildFrameRules(
  * Build the CSS-variable declaration lines for one token set. Every value is
  * re-asserted here (defense in depth); unsafe/out-of-range values are dropped.
  */
-function buildDeclarations(tokens: SchemeTokens): string[] {
+function buildDeclarations(
+	tokens: SchemeTokens,
+	fontFamilies: ReadonlyMap<string, string> = new Map(),
+): string[] {
 	const declarations: string[] = [];
 
 	// Named custom color scales.
@@ -784,17 +852,14 @@ function buildDeclarations(tokens: SchemeTokens): string[] {
 	appendDimensionLadder(declarations, "fontSize", tokens.fontSize, "font-size");
 	appendDimensionLadder(declarations, "radius", tokens.radius, "radius");
 
-	// Font families: generic CSS keywords only. Never a font name (fingerprinting)
-	// and never a packaged font file (binary parsed by the text engine).
-	if (tokens.fontFamily && FONT_FAMILIES.has(tokens.fontFamily)) {
-		declarations.push(`--mantine-font-family: ${tokens.fontFamily};`);
-	}
-	if (tokens.fontFamilyHeadings && FONT_FAMILIES.has(tokens.fontFamilyHeadings)) {
-		declarations.push(`--mantine-font-family-headings: ${tokens.fontFamilyHeadings};`);
-	}
-	if (tokens.fontFamilyMonospace && FONT_FAMILIES.has(tokens.fontFamilyMonospace)) {
-		declarations.push(`--mantine-font-family-monospace: ${tokens.fontFamilyMonospace};`);
-	}
+	// Font families are either generic CSS keywords or references to package-declared
+	// WOFF2 faces. The plugin never supplies a CSS family name or a URL directly.
+	const bodyFont = resolveFontFamily(tokens.fontFamily, fontFamilies);
+	if (bodyFont) declarations.push(`--mantine-font-family: ${bodyFont};`);
+	const headingFont = resolveFontFamily(tokens.fontFamilyHeadings, fontFamilies);
+	if (headingFont) declarations.push(`--mantine-font-family-headings: ${headingFont};`);
+	const monoFont = resolveFontFamily(tokens.fontFamilyMonospace, fontFamilies);
+	if (monoFont) declarations.push(`--mantine-font-family-monospace: ${monoFont};`);
 
 	appendShadowLadder(declarations, tokens.shadow);
 
@@ -843,6 +908,7 @@ export function compileThemeTokens(
 	themeId: string,
 	colorScheme: "light" | "dark" | "both",
 	assetContext?: ThemeAssetContext,
+	fontFamilies: ReadonlyMap<string, string> = new Map(),
 ): string {
 	const { light, dark, ...base } = tokens as ThemeTokens & {
 		light?: SchemeTokens;
@@ -854,7 +920,7 @@ export function compileThemeTokens(
 		// Original single-rule path (also covers "both" with a single palette).
 		const selector = buildSelector(pluginId, themeId, colorScheme);
 		const css =
-			ruleFrom(selector, buildDeclarations(base)) +
+			ruleFrom(selector, buildDeclarations(base, fontFamilies)) +
 			buildSurfacePaintRules(base.backgrounds, base.gradients, selector, pluginId, assetContext) +
 			buildFrameRules(base.frames, selector, pluginId, assetContext) +
 			buildTextColorRules(base.textColors, selector) +
@@ -868,14 +934,14 @@ export function compileThemeTokens(
 	const lightSel = buildSelector(pluginId, themeId, "light");
 	const darkSel = buildSelector(pluginId, themeId, "dark");
 	const parts: string[] = [
-		ruleFrom(baseSel, buildDeclarations(base)),
+		ruleFrom(baseSel, buildDeclarations(base, fontFamilies)),
 		buildSurfacePaintRules(base.backgrounds, base.gradients, baseSel, pluginId, assetContext),
 		buildFrameRules(base.frames, baseSel, pluginId, assetContext),
 		buildTextColorRules(base.textColors, baseSel),
 		buildBorderRules(base.borders, baseSel),
 	];
 	if (light) {
-		parts.push(ruleFrom(lightSel, buildDeclarations(light)));
+		parts.push(ruleFrom(lightSel, buildDeclarations(light, fontFamilies)));
 		parts.push(
 			buildSurfacePaintRules(light.backgrounds, light.gradients, lightSel, pluginId, assetContext),
 		);
@@ -884,7 +950,7 @@ export function compileThemeTokens(
 		parts.push(buildBorderRules(light.borders, lightSel));
 	}
 	if (dark) {
-		parts.push(ruleFrom(darkSel, buildDeclarations(dark)));
+		parts.push(ruleFrom(darkSel, buildDeclarations(dark, fontFamilies)));
 		parts.push(
 			buildSurfacePaintRules(dark.backgrounds, dark.gradients, darkSel, pluginId, assetContext),
 		);
@@ -944,11 +1010,22 @@ export function compileThemeContribution(
 	pluginId: string,
 	assetContext?: ThemeAssetContext,
 ): string {
-	return compileThemeTokens(
+	const fonts = compileThemeFonts(
+		contribution.fonts ?? [],
+		pluginId,
+		contribution.id,
+		assetContext,
+	);
+	if (!fonts) return "";
+	const tokenCss = compileThemeTokens(
 		contribution.tokens,
 		pluginId,
 		contribution.id,
 		contribution.colorScheme,
 		assetContext,
+		fonts.families,
 	);
+	if (!tokenCss) return "";
+	const css = `${fonts.css}${tokenCss}`;
+	return css.length <= MAX_COMPILED_THEME_CSS_LENGTH ? css : "";
 }

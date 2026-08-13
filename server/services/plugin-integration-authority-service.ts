@@ -51,12 +51,21 @@ export interface PluginIntegrationAuthorityServiceOptions {
 	permissionStore: PluginPermissionStore;
 }
 
+export interface EnsurePluginInstallationOptions {
+	/** Explicit reinstall only: preserve the revoked tombstone and issue a fresh authority identity. */
+	replaceRevoked?: boolean;
+}
+
 function hash(value: string): string {
 	return createHash("sha256").update(value).digest("base64url");
 }
 
 export function pluginInstallationAuthorityId(pluginId: string, installationId: string): string {
 	return `${AUTHORITY_PREFIX}${hash(`${pluginId}\0${installationId}`)}`;
+}
+
+function replacementInstallationId(): string {
+	return `installation_${generateShortId(24)}`;
 }
 
 function grantRowPrefix(authorityId: string): string {
@@ -152,32 +161,64 @@ export class PluginIntegrationAuthorityService {
 		installationId: string,
 		legacySummary: PluginGrantSummary,
 		sourceInstallationId?: string,
+		options: EnsurePluginInstallationOptions = {},
 	): Promise<PluginPermissionSet> {
-		const authorityId = pluginInstallationAuthorityId(pluginId, installationId);
-		const existing = await this.authorityService.getSnapshot(authorityId, {
+		let targetInstallationId = installationId;
+		let authorityId = pluginInstallationAuthorityId(pluginId, targetInstallationId);
+		let existing = await this.authorityService.getSnapshot(authorityId, {
 			includeExpired: true,
 		});
-		if (existing) return this.toPermissionSet(existing, pluginId, installationId);
-
-		if (sourceInstallationId) {
-			await this.permissionStore.ensureInstallation(pluginId, installationId, sourceInstallationId);
+		if (existing) {
+			if (existing.authority.state !== "revoked" || !options.replaceRevoked) {
+				return this.toPermissionSet(existing, pluginId, targetInstallationId);
+			}
+			// Reinstall never reactivates a revoked authority. It receives a fresh internal
+			// generation while the old authority remains an immutable audit tombstone.
+			for (let attempt = 0; attempt < 5; attempt += 1) {
+				const candidateInstallationId = replacementInstallationId();
+				const candidateAuthorityId = pluginInstallationAuthorityId(
+					pluginId,
+					candidateInstallationId,
+				);
+				const candidate = await this.authorityService.getSnapshot(candidateAuthorityId, {
+					includeExpired: true,
+				});
+				if (candidate) continue;
+				targetInstallationId = candidateInstallationId;
+				authorityId = candidateAuthorityId;
+				existing = null;
+				break;
+			}
+			if (existing) {
+				throw new IntegrationAuthorityConflictError(
+					"Unable to allocate a fresh plugin authority generation",
+				);
+			}
 		}
-		await this.permissionStore.ensureLegacySummary(pluginId, installationId, legacySummary);
-		const legacy = await this.permissionStore.getSet(pluginId, installationId);
+
+		if (sourceInstallationId && sourceInstallationId !== targetInstallationId) {
+			await this.permissionStore.ensureInstallation(
+				pluginId,
+				targetInstallationId,
+				sourceInstallationId,
+			);
+		}
+		await this.permissionStore.ensureLegacySummary(pluginId, targetInstallationId, legacySummary);
+		const legacy = await this.permissionStore.getSet(pluginId, targetInstallationId);
 		const initialRevision = Math.max(1, legacy.revision);
 		try {
 			await this.authorityService.create({
 				id: authorityId,
 				kind: "plugin_installation",
 				integrationId: pluginId,
-				metadataJson: authorityMetadata(installationId),
+				metadataJson: authorityMetadata(targetInstallationId),
 				initialRevision,
 				grants: this.toAuthorityGrants(authorityId, initialRevision, legacy.grants, "migration"),
 			});
 			const created = await this.authorityService.requireSnapshot(authorityId, {
 				includeExpired: true,
 			});
-			const set = this.toPermissionSet(created, pluginId, installationId);
+			const set = this.toPermissionSet(created, pluginId, targetInstallationId);
 			await this.mirrorPermissionSet(set);
 			return set;
 		} catch (error) {
@@ -186,7 +227,7 @@ export class PluginIntegrationAuthorityService {
 				includeExpired: true,
 			});
 			if (!raced) throw error;
-			return this.toPermissionSet(raced, pluginId, installationId);
+			return this.toPermissionSet(raced, pluginId, targetInstallationId);
 		}
 	}
 

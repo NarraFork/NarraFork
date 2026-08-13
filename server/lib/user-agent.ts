@@ -10,7 +10,7 @@ const ORIGINATOR = "narrafork";
  * block (see CC_CLI_VERSION in agent/anthropic-provider.ts): a request whose
  * User-Agent and billing block disagree does not match any real CLI release.
  */
-export const CLAUDE_CLI_VERSION = "2.1.220";
+export const CLAUDE_CLI_VERSION = "2.1.227";
 // Managed Codex client version used only for outbound protocol emulation.
 // Keep the User-Agent prefix/suffix and originator aligned when updating it.
 const CODEX_CLI_VERSION = "0.146.0";
@@ -197,6 +197,40 @@ export function sanitizeUserAgent(userAgent: string): string {
 }
 
 /**
+ * Merge `extraHeaders` into `headers`, keeping the User-Agent to ONE key.
+ *
+ * WHY: a plain header object is case-SENSITIVE, HTTP header names are not. The
+ * providers write opposite casings (`openai-provider` → `"User-Agent"`,
+ * `anthropic-provider` → `"user-agent"`), so an operator whose `extraHeaders`
+ * used the other casing did not override the UA — both keys survived and `fetch`
+ * COMMA-JOINED them:
+ *
+ *   user-agent: NarraFork-Custom/7.7, injected/1.0
+ *
+ * which is neither value and matches no real client. Measured, not theorised.
+ *
+ * Precedence is unchanged from before: `extraHeaders` still wins, because it is
+ * the operator typing a literal string. Only the casing dependence is removed.
+ *
+ * @param userAgentKey The casing the calling provider uses for its own UA key,
+ *   so an override lands on that key instead of creating a second one.
+ */
+export function mergeExtraHeaders(
+	headers: Record<string, string>,
+	extraHeaders: Record<string, string> | undefined,
+	userAgentKey: string,
+): void {
+	for (const [key, value] of Object.entries(extraHeaders ?? {})) {
+		if (!value) continue;
+		if (key.toLowerCase() === "user-agent") {
+			headers[userAgentKey] = sanitizeUserAgent(value);
+			continue;
+		}
+		headers[key] = value;
+	}
+}
+
+/**
  * Get sanitized User-Agent string ready for HTTP headers.
  */
 export function getHttpUserAgent(): string {
@@ -355,9 +389,9 @@ export function resolveClientFingerprint(options: {
 			}),
 		);
 	}
-	for (const [key, value] of Object.entries(options.extraHeaders ?? {})) {
-		if (value) headers[key] = value;
-	}
+	// `"User-Agent"` is the casing openai-provider writes its own UA with, so an
+	// operator override replaces that key instead of adding a second one.
+	mergeExtraHeaders(headers, options.extraHeaders, "User-Agent");
 	stripResponsesLiteHeader(headers);
 	return { userAgent, headers };
 }

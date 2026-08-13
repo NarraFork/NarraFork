@@ -15,6 +15,7 @@
 
 import { beforeEach, describe, expect, it } from "bun:test";
 import {
+	buildDiffHighlightPlan,
 	buildDiffHighlightSource,
 	computeDiff,
 	computeDiffCached,
@@ -220,7 +221,7 @@ describe("gutter formatting", () => {
 	});
 
 	it("widens the columns for large line numbers and honours the minimum", () => {
-		expect(diffLineNoWidth([{ type: "context", content: "", oldLineNo: 5, newLineNo: 5 }])).toBe(3);
+		expect(diffLineNoWidth([{ type: "context", content: "", oldLineNo: 5, newLineNo: 5 }])).toBe(2);
 		expect(
 			diffLineNoWidth([{ type: "context", content: "", oldLineNo: 12345, newLineNo: 12345 }]),
 		).toBe(5);
@@ -242,6 +243,90 @@ describe("buildDiffHighlightSource", () => {
 			content: "x".repeat(1_000),
 		}));
 		expect(buildDiffHighlightSource(huge)).toBeNull();
+	});
+});
+
+describe("buildDiffHighlightPlan", () => {
+	/** Read back what a row would be tokenized as, following its own row ref. */
+	function resolve(plan: NonNullable<ReturnType<typeof buildDiffHighlightPlan>>, row: number) {
+		const ref = plan.rows[row];
+		if (!ref) throw new Error(`no row ref at ${row}`);
+		return plan.sources[ref.source]?.split("\n")[ref.line];
+	}
+
+	it("keeps one source when the diff touches a single side", () => {
+		const added = buildDiffHighlightPlan([
+			{ type: "context", content: "a" },
+			{ type: "added", content: "b" },
+		]);
+		expect(added?.sources).toEqual(["a\nb"]);
+		expect(added?.rows).toEqual([
+			{ source: 0, line: 0 },
+			{ source: 0, line: 1 },
+		]);
+
+		const removed = buildDiffHighlightPlan([
+			{ type: "context", content: "a" },
+			{ type: "removed", content: "b" },
+		]);
+		expect(removed?.sources).toEqual(["a\nb"]);
+	});
+
+	it("splits the sides so a removed construct cannot leak into context", () => {
+		// The real-world shape: the old side opens a block comment that the new side
+		// replaced with a line comment. Merged into one document, the untouched
+		// `const value = 1;` sits inside the still-open comment.
+		const plan = buildDiffHighlightPlan([
+			{ type: "removed", content: "/* legacy note" },
+			{ type: "added", content: "// short note" },
+			{ type: "context", content: "const value = 1;" },
+			{ type: "removed", content: "*/" },
+			{ type: "added", content: "const kept = 2;" },
+		]);
+
+		expect(plan?.sources).toEqual([
+			"/* legacy note\nconst value = 1;\n*/",
+			"// short note\nconst value = 1;\nconst kept = 2;",
+		]);
+		// Removed rows read the old file; context and added rows read the new file.
+		expect(plan?.rows).toEqual([
+			{ source: 0, line: 0 },
+			{ source: 1, line: 0 },
+			{ source: 1, line: 1 },
+			{ source: 0, line: 2 },
+			{ source: 1, line: 2 },
+		]);
+	});
+
+	it("points every row at its own content, whichever side it came from", () => {
+		const lines: DiffLine[] = [
+			{ type: "context", content: "head" },
+			{ type: "removed", content: "gone" },
+			{ type: "added", content: "fresh" },
+			{ type: "context", content: "tail" },
+		];
+		const plan = buildDiffHighlightPlan(lines);
+		if (!plan) throw new Error("expected a plan");
+
+		// The row → (source, line) mapping is the whole contract: a drift here would
+		// paint a row with another row's colours.
+		for (const [index, line] of lines.entries()) {
+			expect(resolve(plan, index)).toBe(line.content);
+		}
+	});
+
+	it("charges both sides to one budget instead of doubling the work ceiling", () => {
+		// Context is written to BOTH sides, so 60 x 1000 chars of context bills ~120k
+		// against the 80k ceiling even though the interleaved string would have fit.
+		const wide: DiffLine[] = [
+			{ type: "removed", content: "x" },
+			{ type: "added", content: "y" },
+			...Array.from({ length: 60 }, () => ({
+				type: "context" as const,
+				content: "z".repeat(1_000),
+			})),
+		];
+		expect(buildDiffHighlightPlan(wide)).toBeNull();
 	});
 });
 

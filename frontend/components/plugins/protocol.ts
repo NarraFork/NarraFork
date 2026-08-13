@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const PLUGIN_UI_PROTOCOL = "narrafork.ui/1" as const;
 export const PLUGIN_UI_PROTOCOL_MAJOR = 1 as const;
-export const PLUGIN_UI_REQUEST_MAX_BYTES = 256 * 1024;
+export const PLUGIN_UI_REQUEST_MAX_BYTES = 5 * 1024 * 1024;
 export const PLUGIN_UI_RESPONSE_MAX_BYTES = 1024 * 1024;
 export const PLUGIN_UI_DEFAULT_TIMEOUT_MS = 10_000;
 export const PLUGIN_UI_MAX_VIEW_STATE_BYTES = 16 * 1024;

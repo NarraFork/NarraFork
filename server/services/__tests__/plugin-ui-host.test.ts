@@ -2,13 +2,17 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { JsonValue, UiRpcRequest } from "../../../frontend/components/plugins/protocol";
+import {
+	type JsonValue,
+	PLUGIN_UI_REQUEST_MAX_BYTES,
+	type UiRpcRequest,
+} from "../../../frontend/components/plugins/protocol";
 import { CapabilityBroker } from "../plugin-capability-broker";
 import { PluginEventGateway, type SubscribeEventsResult } from "../plugin-event-gateway";
 import { PluginHostServices } from "../plugin-host-services";
 import type { StoredPermissionGrant } from "../plugin-permission-store";
 import { PluginStorage, PluginStorageFactory } from "../plugin-storage";
-import { PluginUiHost } from "../plugin-ui-host";
+import { PLUGIN_UI_HOST_REQUEST_MAX_BYTES, PluginUiHost } from "../plugin-ui-host";
 import type { PluginUiSession } from "../plugin-ui-session";
 
 const roots: string[] = [];
@@ -18,6 +22,7 @@ function makeSession(): PluginUiSession {
 		pluginId: "com.example.host",
 		version: "1.0.0",
 		hash: "c".repeat(64),
+		authorityInstallationId: "installation-ui-host",
 		principalId: "user-1",
 		contributionId: "panel",
 		panelInstanceId: "panel-1",
@@ -113,7 +118,7 @@ describe("PluginUiHost", () => {
 		const hostServices = new PluginHostServices({ capabilityBroker, storageFactory });
 		const session = makeSession();
 		const runtimeId = "runtime-shared-storage";
-		const installationId = session.hash;
+		const installationId = session.authorityInstallationId;
 		const capabilities: StoredPermissionGrant["capability"][] = [
 			"storage.read_self",
 			"storage.write_self",
@@ -726,6 +731,7 @@ describe("PluginUiHost", () => {
 	});
 
 	test("rejects malformed and oversized host requests with structured errors", async () => {
+		expect(PLUGIN_UI_HOST_REQUEST_MAX_BYTES).toBe(PLUGIN_UI_REQUEST_MAX_BYTES);
 		const host = allowedHost();
 		const malformed = await host.dispatch({
 			session: makeSession(),
@@ -739,7 +745,9 @@ describe("PluginUiHost", () => {
 			session: makeSession(),
 			principalId: "user-1",
 			userRole: "user",
-			request: request("large", "context.get", { value: "x".repeat(300_000) }),
+			request: request("large", "context.get", {
+				value: "x".repeat(PLUGIN_UI_HOST_REQUEST_MAX_BYTES),
+			}),
 		});
 		expect(oversized).toMatchObject({ error: { code: "PAYLOAD_TOO_LARGE" } });
 	});

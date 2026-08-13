@@ -30,6 +30,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import { DiffWordTokens } from "@frontend/components/narrator/DiffWordTokens";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import type { ShikiToken } from "@frontend/lib/shiki-token-cache";
@@ -50,7 +51,7 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import {
-	buildDiffHighlightSource,
+	buildDiffHighlightPlan,
 	type DiffLine,
 	diffLineMarker,
 	formatDiffGutter,
@@ -1504,10 +1505,20 @@ function DiffBody({
 	const hidden = lines.length - painted.length;
 	// Shiki sees the row CONTENT only (no markers, no gutter), so the grammar gets
 	// plausible source. Only the painted rows are highlighted — tokens for rows
-	// that are never drawn are pure waste, and `tokens[i]` stays aligned because
-	// the slice keeps the original order from index 0.
-	const source = useMemo(() => buildDiffHighlightSource(painted), [painted]);
-	const tokens = useShikiTokens(source ?? "", lang);
+	// that are never drawn are pure waste.
+	//
+	// The two sides are tokenized separately so a multi-line construct (block
+	// comment, unterminated template literal) on one side cannot leak its state into
+	// the other side's rows; `plan.rows[i]` then says where row `i` reads from. A
+	// single-sided diff yields one source, so the second call is a no-op miss.
+	const plan = useMemo(() => buildDiffHighlightPlan(painted), [painted]);
+	const oldTokens = useShikiTokens(plan?.sources[0] ?? "", lang);
+	const newTokens = useShikiTokens(plan?.sources[1] ?? "", lang);
+	const tokensForRow = (row: number): readonly ShikiToken[] | undefined => {
+		const ref = plan?.rows[row];
+		if (!ref) return undefined;
+		return (ref.source === 0 ? oldTokens : newTokens)?.[ref.line];
+	};
 
 	return (
 		<>
@@ -1546,9 +1557,9 @@ function DiffBody({
 						</span>
 						<DiffRowContent
 							line={line}
-							tokens={tokens?.[i]}
+							tokens={tokensForRow(i)}
 							colors={colors}
-							hasHighlight={source != null}
+							hasHighlight={plan != null}
 						/>
 					</div>
 				);
@@ -1573,24 +1584,17 @@ function DiffRowContent({
 	hasHighlight: boolean;
 }) {
 	if (line.wordChanges && line.wordChanges.length > 0) {
+		// Chunk tint outside, Shiki colour inside. Imported from OUTSIDE vlist/ so
+		// DiffView can share it — the isolation guard only forbids the reverse.
 		return (
-			<>
-				{line.wordChanges.map((change, j) => (
-					<span
-						// biome-ignore lint/suspicious/noArrayIndexKey: word chunks have no stable id
-						key={j}
-						style={
-							change.removed
-								? { background: colors.removedWord, borderRadius: 2 }
-								: change.added
-									? { background: colors.addedWord, borderRadius: 2 }
-									: undefined
-						}
-					>
-						{change.value}
-					</span>
-				))}
-			</>
+			<DiffWordTokens
+				wordChanges={line.wordChanges}
+				tokens={tokens}
+				styles={{
+					removedWord: { background: colors.removedWord, borderRadius: 2 },
+					addedWord: { background: colors.addedWord, borderRadius: 2 },
+				}}
+			/>
 		);
 	}
 	if (hasHighlight) return <TokenText text={line.content} tokens={tokens} />;

@@ -11,7 +11,16 @@ import {
 	TextInput,
 	Tooltip,
 } from "@mantine/core";
-import { IconCheck, IconMinus, IconPlus, IconSparkles } from "@tabler/icons-react";
+import {
+	IconCheck,
+	IconChevronDown,
+	IconChevronRight,
+	IconFolder,
+	IconFolderOpen,
+	IconMinus,
+	IconPlus,
+	IconSparkles,
+} from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -24,18 +33,72 @@ import {
 	useGitStatus,
 	useGitUnstage,
 } from "../../hooks/useGit";
+import { useGitFolderPrefs } from "../../hooks/useGitFolderPrefs";
 import { useNarrators } from "../../hooks/useNarrator";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { GitFileDiff } from "./GitFileDiff";
+import { type GitFileSection, gitFileBadgeChar } from "./git-file-status";
+import { buildGitFileTree, compactGitFileTree, type GitFileTreeNode } from "./git-file-tree";
 
 /** Max files to render per section to avoid UI freeze. */
 const MAX_DISPLAY_FILES = 80;
 const MAX_GIT_FILE_PATH_CHARS = 1_000;
+/** Indent per tree level, in px. Small so deep paths still fit a narrow panel. */
+const TREE_INDENT_PX = 12;
+/**
+ * Width of a row's leading slot: the file status badge, and the folder row's
+ * chevron+glyph pair.
+ *
+ * Shared so the two stay locked together — the names after them only line up
+ * while both leading slots are the same width, and that alignment is the whole
+ * reason the folder row reserves this much space.
+ */
+const STATUS_BADGE_WIDTH = 28;
 
 function clampGitFilePath(path: string): string {
 	return path.length > MAX_GIT_FILE_PATH_CHARS
 		? `${path.slice(0, MAX_GIT_FILE_PATH_CHARS)}…`
 		: path;
+}
+
+type Translate = (key: string, opts?: Record<string, unknown>) => string;
+
+interface DisplayFile {
+	status: string;
+	path: string;
+	displayLinesAdded: number;
+	displayLinesRemoved: number;
+}
+
+/** Everything a tree row needs that does not change per node. */
+interface TreeContext {
+	keyPrefix: string;
+	action: "stage" | "unstage";
+	/**
+	 * Which half of the porcelain status these rows report. Carried explicitly
+	 * rather than derived from `action`: the badge letter depends on it, and
+	 * inferring "staged" from the verb "unstage" is the kind of double negative
+	 * that reads wrong at the call site.
+	 */
+	section: GitFileSection;
+	/**
+	 * Folder paths the user has opened. Folders default to CLOSED, so this is the
+	 * exception list rather than a collapsed list — an unseen path is collapsed
+	 * without anyone having to enumerate the tree.
+	 */
+	expandedFolders: Set<string>;
+	onToggle: (path: string) => void;
+	onAction: (files: string[]) => void;
+	onOpenFile: (path: string) => void;
+	attrByPath: Map<string, FileAttributionSummary>;
+	narratorLabel: Map<string, string>;
+	t: Translate;
+}
+
+/** Flatten a subtree back to Git paths so folder rows can act on their files. */
+function collectFiles(node: GitFileTreeNode<DisplayFile>): DisplayFile[] {
+	if (node.type === "file") return [node.file];
+	return node.children.flatMap(collectFiles);
 }
 
 export function GitChangesTab({ chapterId }: { chapterId: string }) {
@@ -53,6 +116,11 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	const [message, setMessage] = useState("");
 	const [diffFile, setDiffFile] = useState<string | null>(null);
 	const [diffStaged, setDiffStaged] = useState(false);
+	// Folders start COLLAPSED and remember what the user opened across reloads.
+	// Keyed per chapter and per section, because `src/` under Staged and under
+	// Changes are independent rows.
+	const stagedFolders = useGitFolderPrefs(chapterId, "staged");
+	const unstagedFolders = useGitFolderPrefs(chapterId, "unstaged");
 
 	// path → attribution summary, and narratorId → display label.
 	const attrByPath = new Map((attributions ?? []).map((a) => [a.filePath, a]));
@@ -72,17 +140,19 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 		);
 	}
 
-	const stagedFiles = status.files
+	const stagedFiles: DisplayFile[] = status.files
 		.filter((f) => !f.status.startsWith("?") && isStagedFile(f.status))
 		.map((f) => ({
-			...f,
+			status: f.status,
+			path: f.path,
 			displayLinesAdded: f.stagedLinesAdded,
 			displayLinesRemoved: f.stagedLinesRemoved,
 		}));
-	const unstagedFiles = status.files
+	const unstagedFiles: DisplayFile[] = status.files
 		.filter((f) => f.status.startsWith("?") || isUnstagedFile(f.status))
 		.map((f) => ({
-			...f,
+			status: f.status,
+			path: f.path,
 			displayLinesAdded: f.unstagedLinesAdded,
 			displayLinesRemoved: f.unstagedLinesRemoved,
 		}));
@@ -95,6 +165,9 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	// Server may have capped the files array too
 	const totalFiles = status.totalFiles ?? status.files.length;
 	const serverCapped = totalFiles > status.files.length;
+
+	const stagedTree = compactGitFileTree(buildGitFileTree(displayStaged));
+	const unstagedTree = compactGitFileTree(buildGitFileTree(displayUnstaged));
 
 	/** Porcelain status XY: X is index status, Y is worktree status.
 	 *  A file is staged if X is one of M/A/D/R/C (not space or ?). */
@@ -150,21 +223,25 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 								{t("unstageAll")}
 							</Button>
 						</Group>
-						{displayStaged.map((f) => (
-							<FileRow
-								key={`s-${f.path}`}
-								file={f}
-								action="unstage"
-								onAction={() => unstage.mutate({ files: [f.path] })}
-								onClick={() => {
-									setDiffFile(f.path);
+						<TreeNodes
+							nodes={stagedTree}
+							depth={0}
+							ctx={{
+								keyPrefix: "s",
+								action: "unstage",
+								section: "staged",
+								expandedFolders: stagedFolders.expanded,
+								onToggle: stagedFolders.toggle,
+								onAction: (files) => unstage.mutate({ files }),
+								onOpenFile: (path) => {
+									setDiffFile(path);
 									setDiffStaged(true);
-								}}
-								attribution={attrByPath.get(f.path)}
-								narratorLabel={narratorLabel}
-								t={t}
-							/>
-						))}
+								},
+								attrByPath,
+								narratorLabel,
+								t,
+							}}
+						/>
 						{hiddenStaged > 0 && (
 							<Text size="xs" c="dimmed" ta="center">
 								+{hiddenStaged} more
@@ -200,21 +277,25 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 								</Button>
 							</Group>
 						</Group>
-						{displayUnstaged.map((f) => (
-							<FileRow
-								key={`u-${f.path}`}
-								file={f}
-								action="stage"
-								onAction={() => stage.mutate({ files: [f.path] })}
-								onClick={() => {
-									setDiffFile(f.path);
+						<TreeNodes
+							nodes={unstagedTree}
+							depth={0}
+							ctx={{
+								keyPrefix: "u",
+								action: "stage",
+								section: "unstaged",
+								expandedFolders: unstagedFolders.expanded,
+								onToggle: unstagedFolders.toggle,
+								onAction: (files) => stage.mutate({ files }),
+								onOpenFile: (path) => {
+									setDiffFile(path);
 									setDiffStaged(false);
-								}}
-								attribution={attrByPath.get(f.path)}
-								narratorLabel={narratorLabel}
-								t={t}
-							/>
-						))}
+								},
+								attrByPath,
+								narratorLabel,
+								t,
+							}}
+						/>
 						{(hiddenUnstaged > 0 || serverCapped) && (
 							<Text size="xs" c="dimmed" ta="center">
 								+{serverCapped ? totalFiles - status.files.length : hiddenUnstaged} more
@@ -268,74 +349,235 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	);
 }
 
-function FileRow({
-	file,
-	action,
-	onAction,
-	onClick,
-	attribution,
-	narratorLabel,
-	t,
+/** Recursive tree body: folders first, then files, both already sorted. */
+function TreeNodes({
+	nodes,
+	depth,
+	ctx,
 }: {
-	file: {
-		status: string;
-		path: string;
-		displayLinesAdded: number;
-		displayLinesRemoved: number;
-	};
-	action: "stage" | "unstage";
-	onAction: () => void;
-	onClick: () => void;
-	attribution?: FileAttributionSummary;
-	narratorLabel: Map<string, string>;
-	t: (key: string, opts?: Record<string, unknown>) => string;
+	nodes: readonly GitFileTreeNode<DisplayFile>[];
+	depth: number;
+	ctx: TreeContext;
 }) {
-	const statusChar = file.status.replace(/\s/g, "") || "M";
-	const color = statusRegistry.gitFileStatus(statusChar).color;
+	return (
+		<>
+			{nodes.map((node) =>
+				node.type === "directory" ? (
+					<DirectoryRow
+						key={`${ctx.keyPrefix}d-${node.path}`}
+						node={node}
+						depth={depth}
+						ctx={ctx}
+					/>
+				) : (
+					<FileRow key={`${ctx.keyPrefix}f-${node.path}`} file={node.file} depth={depth} ctx={ctx}>
+						{node.name}
+					</FileRow>
+				),
+			)}
+		</>
+	);
+}
 
+/** Shared row chrome: click/keyboard activation plus depth indent. */
+function TreeRow({
+	depth,
+	label,
+	expanded,
+	onActivate,
+	children,
+}: {
+	depth: number;
+	label: string;
+	expanded?: boolean;
+	onActivate: () => void;
+	children: React.ReactNode;
+}) {
 	return (
 		<Group
 			gap={4}
 			wrap="nowrap"
 			py={2}
-			px={4}
+			pr={4}
+			pl={depth * TREE_INDENT_PX + 4}
 			style={{ borderRadius: 4, cursor: "pointer" }}
-			onClick={onClick}
+			role="button"
+			tabIndex={0}
+			aria-label={label}
+			aria-expanded={expanded}
+			onClick={onActivate}
+			onKeyDown={(e) => {
+				if (e.key !== "Enter" && e.key !== " ") return;
+				e.preventDefault();
+				onActivate();
+			}}
 		>
-			<Badge size="xs" color={color} variant="filled" w={28} style={{ flexShrink: 0 }}>
-				{statusChar}
-			</Badge>
-			<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }} ff="monospace">
-				{clampGitFilePath(file.path)}
-			</Text>
-			<AttributionBadge attribution={attribution} narratorLabel={narratorLabel} t={t} />
-			{(file.displayLinesAdded > 0 || file.displayLinesRemoved > 0) && (
-				<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
-					{file.displayLinesAdded > 0 && (
-						<Text size="xs" c="green" ff="monospace">
-							+{file.displayLinesAdded}
-						</Text>
+			{children}
+		</Group>
+	);
+}
+
+/** Aggregated +/- counts, rendered for both folder and file rows. */
+function LineStats({ added, removed }: { added: number; removed: number }) {
+	if (added <= 0 && removed <= 0) return null;
+	return (
+		<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
+			{added > 0 && (
+				<Text size="xs" c="green" ff="monospace">
+					+{added}
+				</Text>
+			)}
+			{removed > 0 && (
+				<Text size="xs" c="red" ff="monospace">
+					-{removed}
+				</Text>
+			)}
+		</Group>
+	);
+}
+
+function DirectoryRow({
+	node,
+	depth,
+	ctx,
+}: {
+	node: Extract<GitFileTreeNode<DisplayFile>, { type: "directory" }>;
+	depth: number;
+	ctx: TreeContext;
+}) {
+	const expanded = ctx.expandedFolders.has(node.path);
+	const files = collectFiles(node);
+	const added = files.reduce((sum, f) => sum + f.displayLinesAdded, 0);
+	const removed = files.reduce((sum, f) => sum + f.displayLinesRemoved, 0);
+	// Folder rows reuse the file wording: the action is the same, only the scope differs.
+	const actionLabel = ctx.action === "stage" ? ctx.t("stageFile") : ctx.t("unstageFile");
+
+	return (
+		<>
+			<TreeRow
+				depth={depth}
+				expanded={expanded}
+				label={
+					expanded
+						? ctx.t("collapseFolder", { path: node.path })
+						: ctx.t("expandFolder", { path: node.path })
+				}
+				onActivate={() => ctx.onToggle(node.path)}
+			>
+				{/*
+				 * Same footprint as a file row's status badge (STATUS_BADGE_WIDTH), so
+				 * folder and file names start at one column instead of a ragged edge —
+				 * a bare chevron is much narrower than the badge and left folder rows
+				 * looking unanchored. The folder glyph is what carries the "this is a
+				 * directory" signal; the chevron only carries open/closed.
+				 */}
+				<Group gap={2} wrap="nowrap" w={STATUS_BADGE_WIDTH} style={{ flexShrink: 0 }}>
+					{expanded ? (
+						<IconChevronDown size={12} style={{ flexShrink: 0 }} />
+					) : (
+						<IconChevronRight size={12} style={{ flexShrink: 0 }} />
 					)}
-					{file.displayLinesRemoved > 0 && (
-						<Text size="xs" c="red" ff="monospace">
-							-{file.displayLinesRemoved}
-						</Text>
+					{expanded ? (
+						<IconFolderOpen size={14} style={{ flexShrink: 0, opacity: 0.75 }} />
+					) : (
+						<IconFolder size={14} style={{ flexShrink: 0, opacity: 0.75 }} />
 					)}
 				</Group>
-			)}
-			<Tooltip label={action === "stage" ? t("stageFile") : t("unstageFile")}>
+				<Text
+					size="xs"
+					fw={600}
+					lineClamp={1}
+					style={{ flex: 1, minWidth: 0 }}
+					ff="monospace"
+					title={node.path}
+				>
+					{clampGitFilePath(node.name)}
+				</Text>
+				<Badge size="xs" variant="light" color="gray" style={{ flexShrink: 0 }}>
+					{node.fileCount}
+				</Badge>
+				<LineStats added={added} removed={removed} />
+				<Tooltip label={actionLabel}>
+					<ActionIcon
+						size="xs"
+						variant="subtle"
+						aria-label={actionLabel}
+						onClick={(e) => {
+							e.stopPropagation();
+							ctx.onAction(files.map((f) => f.path));
+						}}
+					>
+						{ctx.action === "stage" ? <IconPlus size={12} /> : <IconMinus size={12} />}
+					</ActionIcon>
+				</Tooltip>
+			</TreeRow>
+			{expanded && <TreeNodes nodes={node.children} depth={depth + 1} ctx={ctx} />}
+		</>
+	);
+}
+
+function FileRow({
+	file,
+	depth,
+	ctx,
+	children,
+}: {
+	file: DisplayFile;
+	depth: number;
+	ctx: TreeContext;
+	children: string;
+}) {
+	// The badge shows what KIND of change this is; which SECTION the row is in
+	// already carries the staged/unstaged axis. Passing the section is what keeps
+	// `AM` from rendering as a two-letter gray blob.
+	const statusChar = gitFileBadgeChar(file.status, ctx.section);
+	const color = statusRegistry.gitFileStatus(statusChar).color;
+	const actionLabel = ctx.action === "stage" ? ctx.t("stageFile") : ctx.t("unstageFile");
+
+	return (
+		<TreeRow
+			depth={depth}
+			label={ctx.t("viewDiffOf", { path: file.path })}
+			onActivate={() => ctx.onOpenFile(file.path)}
+		>
+			<Badge
+				size="xs"
+				color={color}
+				variant="filled"
+				w={STATUS_BADGE_WIDTH}
+				style={{ flexShrink: 0 }}
+			>
+				{statusChar}
+			</Badge>
+			<Text
+				size="xs"
+				lineClamp={1}
+				style={{ flex: 1, minWidth: 0 }}
+				ff="monospace"
+				title={file.path}
+			>
+				{clampGitFilePath(children)}
+			</Text>
+			<AttributionBadge
+				attribution={ctx.attrByPath.get(file.path)}
+				narratorLabel={ctx.narratorLabel}
+				t={ctx.t}
+			/>
+			<LineStats added={file.displayLinesAdded} removed={file.displayLinesRemoved} />
+			<Tooltip label={actionLabel}>
 				<ActionIcon
 					size="xs"
 					variant="subtle"
+					aria-label={actionLabel}
 					onClick={(e) => {
 						e.stopPropagation();
-						onAction();
+						ctx.onAction([file.path]);
 					}}
 				>
-					{action === "stage" ? <IconPlus size={12} /> : <IconMinus size={12} />}
+					{ctx.action === "stage" ? <IconPlus size={12} /> : <IconMinus size={12} />}
 				</ActionIcon>
 			</Tooltip>
-		</Group>
+		</TreeRow>
 	);
 }
 
@@ -347,7 +589,7 @@ function AttributionBadge({
 }: {
 	attribution?: FileAttributionSummary;
 	narratorLabel: Map<string, string>;
-	t: (key: string, opts?: Record<string, unknown>) => string;
+	t: Translate;
 }) {
 	if (!attribution) return null;
 

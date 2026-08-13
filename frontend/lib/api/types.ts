@@ -869,6 +869,51 @@ export interface CodexCredentialEntry {
 	usage?: CodexUsageData;
 }
 
+
+	id: string;
+	priority: number;
+	disabled: boolean;
+	disabledReason?: string;
+	failureCount: number;
+	successCount: number;
+	lastUsedAt?: string;
+	email?: string;
+	displayName?: string;
+	hasProfileArn: boolean;
+	hasStartUrl?: boolean;
+	expiresAt?: string;
+	authMethod?: string;
+	isApiKey?: boolean;
+	subscriptionTitle?: string;
+	region?: string;
+	authRegion?: string;
+	apiRegion?: string;
+	startUrl?: string;
+	machineId?: string;
+	hasClientId?: boolean;
+	hasClientSecret?: boolean;
+	proxyUrl?: string;
+	proxyUsername?: string;
+	hasProxyPassword?: boolean;
+	meterUsage?: number;
+	availableModels?: string[];
+}
+
+	paidTotal?: number;
+	enterpriseTotal?: number;
+	freeTotal?: number;
+	unhealthyTotal?: number;
+	currentId: string;
+	loadBalancingMode: "priority" | "balanced";
+	total: number;
+	available: number;
+}
+
+	available: boolean;
+	usageCache?: Record<string, ApiEntity>;
+	globalProxy?: string;
+}
+
 /**
  *
  * Text fields clear when sent as an empty string. Secrets (`refreshToken`,

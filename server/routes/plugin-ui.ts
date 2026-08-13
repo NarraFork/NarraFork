@@ -39,6 +39,7 @@ interface PluginUiManagerLike {
 		| undefined
 	>;
 	getPermissions?(pluginId: string): Promise<{
+		installationId: string;
 		revision: number;
 		grants: readonly unknown[];
 	}>;
@@ -72,9 +73,9 @@ const sessionInputSchema = z
 const themeToggleSchema = z.object({ enabled: z.boolean() }).strict();
 
 /**
- * Content types the unauthenticated theme-asset route may return. Kept in lockstep
- * with the manifest's background-image extension allowlist; SVG is excluded
- * because it can carry script.
+ * Passive content types the unauthenticated theme-asset route may return. Images
+ * and WOFF2 fonts are explicitly declared in the manifest; active types remain
+ * forbidden because the route is same-origin and sessionless.
  */
 const THEME_ASSET_ALLOWED_CONTENT_TYPES = new Set([
 	"image/png",
@@ -82,6 +83,7 @@ const THEME_ASSET_ALLOWED_CONTENT_TYPES = new Set([
 	"image/webp",
 	"image/gif",
 	"image/avif",
+	"font/woff2",
 ]);
 
 function errorResponse(c: Parameters<MiddlewareHandler>[0], error: unknown): Response {
@@ -156,7 +158,7 @@ function permissionGrantFromDetails(value: unknown): PermissionGrant {
 async function getUiPermissions(
 	manager: PluginUiManagerLike,
 	pluginId: string,
-): Promise<{ revision: number; grants: PermissionGrant[] }> {
+): Promise<{ installationId: string; revision: number; grants: PermissionGrant[] }> {
 	if (!manager.getPermissions) {
 		throw new AppError(
 			"Plugin permission details are unavailable",
@@ -176,6 +178,9 @@ async function getUiPermissions(
 	}
 	if (
 		!details ||
+		typeof details.installationId !== "string" ||
+		!details.installationId ||
+		details.installationId.length > 128 ||
 		!Number.isSafeInteger(details.revision) ||
 		details.revision < 0 ||
 		!Array.isArray(details.grants)
@@ -187,6 +192,7 @@ async function getUiPermissions(
 		);
 	}
 	return {
+		installationId: details.installationId,
 		revision: details.revision,
 		grants: details.grants.map(permissionGrantFromDetails),
 	};
@@ -210,7 +216,7 @@ function assertSurfaceScope(
 interface UiCapabilityPrincipalInput {
 	pluginId: string;
 	version: string;
-	hash: string;
+	authorityInstallationId: string;
 	contributionId: string;
 	runtimeId: string;
 	generation: number;
@@ -240,7 +246,7 @@ function createUiCapabilityBinding(
 			runtimeId: principal.runtimeId,
 			runtimeGeneration: principal.generation,
 			contributionId: principal.contributionId,
-			installationId: principal.hash,
+			installationId: principal.authorityInstallationId,
 		},
 		desiredState: "enabled",
 		compatibilityState: "compatible",
@@ -276,7 +282,7 @@ function uiScopeResourceId(input: z.infer<typeof sessionInputSchema>): string | 
  * is the grant, not the lifecycle.
  */
 async function assertUsableUiPanelGrant(
-	permissions: { revision: number; grants: PermissionGrant[] },
+	permissions: { installationId: string; revision: number; grants: PermissionGrant[] },
 	input: z.infer<typeof sessionInputSchema>,
 	manifest: { permissions?: { host?: string[] } },
 	principalId: string,
@@ -285,7 +291,7 @@ async function assertUsableUiPanelGrant(
 	const principal: UiCapabilityPrincipalInput = {
 		pluginId: input.pluginId,
 		version: input.version,
-		hash: input.hash,
+		authorityInstallationId: permissions.installationId,
 		contributionId: input.contributionId,
 		runtimeId: "ui:preflight",
 		generation: 1,
@@ -342,6 +348,7 @@ function bindUiCapability(
 		pluginId: string;
 		version: string;
 		hash: string;
+		authorityInstallationId: string;
 		sessionId: string;
 		generation: number;
 		contributionId: string;
@@ -355,7 +362,7 @@ function bindUiCapability(
 			{
 				pluginId: session.pluginId,
 				version: session.version,
-				hash: session.hash,
+				authorityInstallationId: session.authorityInstallationId,
 				contributionId: session.contributionId,
 				runtimeId: `ui:${session.sessionId}`,
 				generation: session.generation,
@@ -430,13 +437,16 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 	const payloadTooLarge = (c: Parameters<MiddlewareHandler>[0]) =>
 		c.json(
 			{
-				error: "Plugin UI request exceeds the 256 KiB limit",
+				error: `Plugin UI request exceeds the ${PLUGIN_UI_HOST_REQUEST_MAX_BYTES / (1024 * 1024)} MiB limit`,
 				code: "PAYLOAD_TOO_LARGE",
 			},
 			413,
 		);
+	// This router shares the /api/plugins mount with package-management routes. Keep the
+	// iframe RPC body cap under /ui/* so large /install multipart uploads can reach the
+	// package route's independent 100 MB limit instead of being rejected by the UI cap.
 	app.use(
-		"*",
+		"/ui/*",
 		bodyLimit({
 			maxSize: PLUGIN_UI_HOST_REQUEST_MAX_BYTES,
 			onError: payloadTooLarge,
@@ -674,7 +684,11 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const user = c.get("user");
 			const principalId = user.sub;
 			await assertUsableUiPanelGrant(permissions, body.data, pkg.manifest, principalId, user.role);
-			const created = sessions.create({ ...body.data, principalId });
+			const created = sessions.create({
+				...body.data,
+				authorityInstallationId: permissions.installationId,
+				principalId,
+			});
 			try {
 				bindUiCapability(broker, permissions, created.session, pkg.manifest);
 			} catch (error) {
@@ -817,12 +831,11 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 		}
 	});
 
-	// Theme background asset. Unlike the view asset route this is NOT bound to a UI
-	// session (theme-only plugins have none): the capability is the exact package
-	// hash (content-bound sha256) plus the plugin being enabled + current, and
-	// readAsset only serves paths a theme contribution explicitly declared. No
-	// auth middleware, because CSS `url()` requests from the host document carry
-	// no Authorization header. The image is same-origin and contains no user data.
+	// Controlled theme asset (raster image or WOFF2 font). Unlike the view asset
+	// route this is NOT bound to a UI session (theme-only plugins have none): the
+	// capability is the exact package hash plus the plugin being enabled + current,
+	// and readAsset only serves paths a theme contribution explicitly declared. No
+	// auth middleware, because CSS resource requests carry no Authorization header.
 	app.get("/ui/:pluginId/:version/:hash/theme-asset/:assetPath{.+}", async (c) => {
 		try {
 			const pluginId = c.req.param("pluginId");
@@ -830,12 +843,10 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const hash = c.req.param("hash");
 			await assertEnabled(manager, pluginId, version, hash);
 			const asset = await assets.readAsset(pluginId, version, hash, c.req.param("assetPath"));
-			// This route is unauthenticated (CSS `url()` carries no Authorization
-			// header) and same-origin, so the served Content-Type must never be an
-			// active type: an `.html`/`.js`/`.svg` "background" would otherwise be
-			// same-origin script delivery. The manifest schema already restricts
-			// backgrounds to raster images; re-assert it here (defense in depth) so a
-			// schema regression cannot reopen the hole.
+			// This route is unauthenticated and same-origin, so the served Content-Type
+			// must remain passive. The manifest restricts assets to raster images and
+			// WOFF2; re-assert that allowlist here so a schema regression cannot turn
+			// the endpoint into same-origin active content delivery.
 			if (!THEME_ASSET_ALLOWED_CONTENT_TYPES.has(asset.contentType)) {
 				throw new NotFoundError("Plugin theme asset", asset.path);
 			}
@@ -846,8 +857,10 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 					ETag: `"${hash}-${asset.path}"`,
 					"X-Content-Type-Options": "nosniff",
 					"Cross-Origin-Resource-Policy": "same-origin",
-					// Belt-and-braces for direct navigation: render inline as an image
-					// and forbid every subresource/script in that document.
+					// Belt-and-braces for direct navigation: render an image inline and forbid
+					// every other subresource/script. Fonts need no directive of their own —
+					// they are fetched as a subresource of the host document, never navigated
+					// to as a document that loads anything.
 					"Content-Disposition": "inline",
 					"Content-Security-Policy": "default-src 'none'; img-src 'self'; sandbox",
 				},

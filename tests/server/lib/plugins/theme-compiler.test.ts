@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	collectThemeAssets,
 	collectThemeImages,
 	safeParseManifest,
 	THEME_BACKGROUND_REGIONS,
@@ -10,6 +11,7 @@ import {
 } from "@server/lib/plugins/manifest";
 import {
 	buildThemeKey,
+	compileThemeContribution,
 	compileThemeTokens,
 	generateShades,
 	MAX_COMPILED_THEME_CSS_LENGTH,
@@ -806,7 +808,7 @@ describe("compileThemeTokens - gradient security / defense in depth", () => {
 	});
 
 	describe("manifest validation", () => {
-		function manifestWithTokens(tokens: unknown) {
+		function manifestWithTokens(tokens: unknown, fonts: readonly unknown[] = []) {
 			return {
 				schemaVersion: 1,
 				pluginId: "com.example.chrome",
@@ -815,7 +817,7 @@ describe("compileThemeTokens - gradient security / defense in depth", () => {
 				engine: { runtime: "bun", hostApi: ">=1.0 <2", rpc: "narrafork.rpc/1" },
 				activationEvents: [],
 				contributes: {
-					themes: [{ id: "chrome", title: "Chrome", colorScheme: "both", tokens }],
+					themes: [{ id: "chrome", title: "Chrome", colorScheme: "both", fonts, tokens }],
 				},
 				permissions: {
 					host: ["ui.theme"],
@@ -865,6 +867,62 @@ describe("compileThemeTokens - gradient security / defense in depth", () => {
 				).success,
 			).toBe(false);
 		});
+
+		test("accepts declared WOFF2 fonts and collects them as theme assets", () => {
+			const parsed = safeParseManifest(
+				manifestWithTokens(
+					{
+						fontFamily: { font: "brand", fallback: "system-ui" },
+						fontFamilyMonospace: { font: "mono", fallback: "monospace" },
+					},
+					[
+						{
+							id: "brand",
+							source: "assets/brand.woff2",
+							weight: { min: 100, max: 900 },
+						},
+						{ id: "mono", source: "assets/mono.woff2" },
+					],
+				),
+			);
+			expect(parsed.success).toBe(true);
+			if (!parsed.success) return;
+			const theme = parsed.data.contributes.themes[0];
+			// One collector covers every asset kind, so fonts land in the same
+			// whitelist the asset route already enforces for images.
+			expect(collectThemeAssets(theme)).toEqual(["assets/brand.woff2", "assets/mono.woff2"]);
+			expect(collectThemeImages(theme)).toEqual([]);
+		});
+
+		test.each([
+			{ fonts: [{ id: "brand", source: "https://example.com/font.woff2" }] },
+			{ fonts: [{ id: "brand", source: "assets/font.ttf" }] },
+			{ fonts: [{ id: "brand", source: "../font.woff2" }] },
+			{
+				fonts: [{ id: "brand", source: "assets/font.woff2", weight: { min: 900, max: 100 } }],
+			},
+		])("rejects an unsafe theme font declaration %p", ({ fonts }) => {
+			expect(safeParseManifest(manifestWithTokens({}, fonts)).success).toBe(false);
+		});
+
+		test("rejects duplicate font IDs and missing font references", () => {
+			expect(
+				safeParseManifest(
+					manifestWithTokens({ fontFamily: { font: "missing", fallback: "system-ui" } }, [
+						{ id: "brand", source: "assets/brand.woff2" },
+						{ id: "brand", source: "assets/brand-2.woff2" },
+					]),
+				).success,
+			).toBe(false);
+		});
+
+		test("rejects more than four font faces per theme", () => {
+			const fonts = Array.from({ length: 5 }, (_, index) => ({
+				id: `font-${index}`,
+				source: `assets/font-${index}.woff2`,
+			}));
+			expect(safeParseManifest(manifestWithTokens({}, fonts)).success).toBe(false);
+		});
 	});
 });
 
@@ -882,6 +940,40 @@ describe("compileThemeTokens - fonts, shadows and per-surface text colors", () =
 		expect(css).toContain("--mantine-font-family: serif;");
 		expect(css).toContain("--mantine-font-family-headings: system-ui;");
 		expect(css).toContain("--mantine-font-family-monospace: monospace;");
+	});
+
+	test("compiles package-declared WOFF2 faces into generated family names", () => {
+		const hash = "a".repeat(64);
+		const contribution = {
+			id: tid,
+			title: "Chrome",
+			colorScheme: "both" as const,
+			fonts: [
+				{
+					id: "brand-sans",
+					source: "assets/brand.woff2",
+					weight: { min: 100, max: 900 },
+					style: "normal" as const,
+					display: "swap" as const,
+				},
+			],
+			tokens: {
+				fontFamily: { font: "brand-sans", fallback: "system-ui" as const },
+				fontFamilyHeadings: { font: "brand-sans", fallback: "sans-serif" as const },
+			},
+		};
+		const css = compileThemeContribution(contribution, pid, { version: "1.1.0", hash });
+		expect(css).toContain('@font-face{font-family:"nf-theme-aaaaaaaaaaaaaaaa-chrome-brand-sans";');
+		expect(css).toContain(
+			`src:url("/api/plugins/ui/${pid}/1.1.0/${hash}/theme-asset/assets/brand.woff2") format("woff2")`,
+		);
+		expect(css).toContain("font-weight:100 900;font-display:swap;");
+		expect(css).toContain(
+			'--mantine-font-family: "nf-theme-aaaaaaaaaaaaaaaa-chrome-brand-sans", system-ui;',
+		);
+		expect(css).toContain(
+			'--mantine-font-family-headings: "nf-theme-aaaaaaaaaaaaaaaa-chrome-brand-sans", sans-serif;',
+		);
 	});
 
 	/**

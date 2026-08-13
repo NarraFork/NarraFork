@@ -15,9 +15,12 @@ function createT() {
 				plugins: {
 					admin: {
 						errors: {
+							INTEGRATION_AUTHORITY_CONFLICT:
+								"The plugin authorization state conflicts with this installation.",
 							PLUGINS_DISABLED: "The plugin system is disabled on this server.",
 							PLUGIN_OPERATION_FAILED: "The plugin operation failed.",
 							NOT_FOUND: "The requested plugin resource was not found.",
+							VALIDATION_ERROR: "The request was rejected by server-side validation.",
 							UNKNOWN: "An unexpected plugin error occurred.",
 						},
 					},
@@ -38,6 +41,40 @@ describe("plugin error localization", () => {
 			code: "PLUGINS_DISABLED",
 		});
 		expect(localizePluginError(error, t)).toBe("The plugin system is disabled on this server.");
+	});
+
+	test("maps integration authority conflicts to a known plugin error", () => {
+		const t = createT();
+		const error = new ApiError("Revoked plugin authorities cannot be reactivated", 409, {
+			error: "Revoked plugin authorities cannot be reactivated",
+			code: "INTEGRATION_AUTHORITY_CONFLICT",
+		});
+		expect(localizePluginError(error, t)).toBe(
+			"The plugin authorization state conflicts with this installation.",
+		);
+	});
+
+	test("includes the server-provided reason for validation errors", () => {
+		const t = createT();
+		const error = new ApiError(
+			"Invalid plugin manifest: contributes.themes.0.tokens: unrecognized key",
+			400,
+			{
+				error: "Invalid plugin manifest: contributes.themes.0.tokens: unrecognized key",
+				code: "VALIDATION_ERROR",
+			},
+		);
+		expect(localizePluginError(error, t)).toBe(
+			"The request was rejected by server-side validation. Invalid plugin manifest: contributes.themes.0.tokens: unrecognized key",
+		);
+	});
+
+	test("does not duplicate a validation summary when no detail is available", () => {
+		const t = createT();
+		const summary = "The request was rejected by server-side validation.";
+		expect(localizePluginError(new ApiError(summary, 400, { code: "VALIDATION_ERROR" }), t)).toBe(
+			summary,
+		);
 	});
 
 	test("never leaks raw Error.message for unknown codes", () => {

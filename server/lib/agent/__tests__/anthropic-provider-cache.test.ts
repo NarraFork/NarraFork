@@ -12,7 +12,7 @@ const ORIGINAL_FETCH = globalThis.fetch;
 
 /** Fingerprint of the first user-authored text in makeHistory(), per the CLI algorithm. */
 const EXPECTED_FINGERPRINT = computeFingerprint("stable prior user message", CLAUDE_CLI_VERSION);
-const BILLING_BLOCK = `x-anthropic-billing-header: cc_version=${CLAUDE_CLI_VERSION}.${EXPECTED_FINGERPRINT}; cc_entrypoint=cli;`;
+const BILLING_BLOCK = `x-anthropic-billing-header: cc_version=${CLAUDE_CLI_VERSION}.${EXPECTED_FINGERPRINT}; cc_entrypoint=cli; cch=00000;`;
 
 interface CapturedRequest {
 	url: string;
@@ -85,6 +85,9 @@ function makeHistory(provider: AnthropicProvider): unknown[] {
 				},
 			],
 		},
+		{ role: "user", content: [{ type: "text", text: "second prior user message" }] },
+		// A `sys` row injected after a user turn: the only position the API accepts a
+		// mid-conversation system message in (it must precede an assistant turn).
 		{ role: "system", content: MID_CONVERSATION_SYSTEM },
 		{ role: "assistant", content: [{ type: "text", text: "assistant after system" }] },
 	];
@@ -140,6 +143,21 @@ async function sendAndCapture(
 	return capturedRequests[before];
 }
 
+/** Same as sendAndCapture, but overrides the reasoning-effort tier. */
+async function sendWithEffort(
+	provider: AnthropicProvider,
+	content: string,
+	reasoningEffort: ChatParams["reasoningEffort"],
+): Promise<CapturedRequest> {
+	const before = capturedRequests.length;
+	const params: ChatParams = { ...chatParams(provider, content), reasoningEffort };
+	for await (const _event of provider.chat(params)) {
+		// Exhaust the response so the provider completes the real request path.
+	}
+	expect(capturedRequests).toHaveLength(before + 1);
+	return capturedRequests[before];
+}
+
 function collectCacheControlPaths(value: unknown, path = "$", output: string[] = []): string[] {
 	if (!value || typeof value !== "object") return output;
 	if (Array.isArray(value)) {
@@ -189,7 +207,7 @@ describe("AnthropicProvider final wire-body cache construction", () => {
 		expect(request.url).toEndWith("/messages?beta=true");
 		expect(body.max_tokens).toBe(64_000);
 		expect(collectCacheControlPaths(body).sort()).toEqual([
-			"$.messages[4].content[0].cache_control",
+			"$.messages[5].content[0].cache_control",
 			"$.system[1].cache_control",
 			"$.system[2].cache_control",
 		]);
@@ -208,7 +226,10 @@ describe("AnthropicProvider final wire-body cache construction", () => {
 		});
 
 		const messages = messagesFrom(body);
-		expect(messages[2]).toEqual({ role: "system", content: MID_CONVERSATION_SYSTEM });
+		expect(messages[3]).toEqual({ role: "system", content: MID_CONVERSATION_SYSTEM });
+		// Legal placement: preceded by a user turn, followed by an assistant turn.
+		expect(messages[2].role).toBe("user");
+		expect(messages[4].role).toBe("assistant");
 		expect(messages.at(-1)).toEqual({
 			role: "user",
 			content: [
@@ -226,16 +247,37 @@ describe("AnthropicProvider final wire-body cache construction", () => {
 			expect(tool.cache_control).toBeUndefined();
 		}
 
-		expect(body.context_management).toEqual({
-			edits: [{ type: "clear_thinking_20251015", keep: "all" }],
-		});
-		expect(JSON.stringify(body)).not.toContain("cch=");
+		expect(body.context_management).toBeUndefined();
 		expect(JSON.stringify(body)).not.toContain('"scope"');
 		expect(JSON.stringify(body)).not.toContain("cc_workload");
 		const beta = request.headers.get("anthropic-beta") ?? "";
 		expect(beta).toContain("prompt-caching-scope-2026-01-05");
 		expect(beta).toContain("mid-conversation-system-2026-04-07");
 		expect(beta).toContain("context-management-2025-06-27");
+		// The fallback-credit lane is never armed here, so upstream would not
+		// declare its beta either.
+		expect(beta).not.toContain("fallback-credit-2026-06-01");
+	});
+
+	test("sends context_management only while thinking is enabled", async () => {
+		installFetchCapture();
+		const provider = new AnthropicProvider(config(true));
+
+		// `clear_thinking_20251015` is the only edit in the block, so upstream
+		// builds it from `hasThinking` — a thinking edit on a non-thinking request
+		// describes work the server cannot perform.
+		const thinking = await sendWithEffort(provider, "thinking tail", "high");
+		expect(thinking.body.thinking).toEqual({ type: "adaptive" });
+		expect(thinking.body.context_management).toEqual({
+			edits: [{ type: "clear_thinking_20251015", keep: "all" }],
+		});
+		// Opus 5 rejects `temperature`, so it must be absent in both shapes.
+		expect(thinking.body.temperature).toBeUndefined();
+
+		const disabled = await sendWithEffort(provider, "no thinking tail", "none");
+		expect(disabled.body.thinking).toEqual({ type: "disabled" });
+		expect(disabled.body.context_management).toBeUndefined();
+		expect(disabled.body.temperature).toBeUndefined();
 	});
 
 	test("reports one CLI version across the billing block and User-Agent", async () => {
@@ -251,8 +293,10 @@ describe("AnthropicProvider final wire-body cache construction", () => {
 		expect(request.headers.get("x-stainless-package-version")).toBe("0.94.0");
 		expect(request.headers.get("x-stainless-runtime-version")).toBe("v26.3.0");
 		expect(request.headers.get("x-app")).toBe("cli");
-		// The real CLI sends no per-request id header on this path.
-		expect(request.headers.get("x-client-request-id")).toBeNull();
+		// The CLI mints a fresh UUID per official-API attempt and sends it here.
+		expect(request.headers.get("x-client-request-id")).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+		);
 	});
 
 	test("skips harness system reminders when deriving the billing fingerprint", async () => {
@@ -280,7 +324,7 @@ describe("AnthropicProvider final wire-body cache construction", () => {
 		);
 
 		expect(systemFrom(request.body)[0].text).toBe(
-			`x-anthropic-billing-header: cc_version=${CLAUDE_CLI_VERSION}.${expected}; cc_entrypoint=cli;`,
+			`x-anthropic-billing-header: cc_version=${CLAUDE_CLI_VERSION}.${expected}; cc_entrypoint=cli; cch=00000;`,
 		);
 		// Guard against regressing to "first text block wins".
 		expect(expected).not.toBe(reminderDerived);
@@ -378,18 +422,18 @@ describe("AnthropicProvider final wire-body cache construction", () => {
 			withoutCacheControl(firstMessages),
 		);
 		expect(collectCacheControlPaths(first.body).sort()).toEqual([
-			"$.messages[4].content[0].cache_control",
+			"$.messages[5].content[0].cache_control",
 			"$.system[1].cache_control",
 			"$.system[2].cache_control",
 		]);
 		expect(collectCacheControlPaths(second.body).sort()).toEqual([
-			"$.messages[6].content[0].cache_control",
+			"$.messages[7].content[0].cache_control",
 			"$.system[1].cache_control",
 			"$.system[2].cache_control",
 		]);
-		expect(collectCacheControlPaths(secondMessages[4])).toEqual([]);
 		expect(collectCacheControlPaths(secondMessages[5])).toEqual([]);
-		expect(secondMessages[6]).toEqual({
+		expect(collectCacheControlPaths(secondMessages[6])).toEqual([]);
+		expect(secondMessages[7]).toEqual({
 			role: "user",
 			content: [
 				{

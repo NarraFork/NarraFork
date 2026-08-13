@@ -5,6 +5,7 @@ import {
 	BASE,
 	getToken,
 	postFormDataWithProgress,
+	readFetchError,
 	request,
 } from "./client";
 
@@ -226,18 +227,11 @@ export const pluginsApi = {
 		});
 		// XHR upload cannot go through authorizedFetch, so absorb explicitly.
 		absorbRenewedToken(res, token);
-		const text = await res.text();
-		const data = text ? JSON.parse(text) : undefined;
 		if (!res.ok) {
-			throw new ApiError(
-				(data && typeof data === "object" && "message" in data
-					? String((data as { message: unknown }).message)
-					: undefined) ?? `Upload failed (${res.status})`,
-				res.status,
-				data,
-			);
+			const { message, data } = await readFetchError(res, `Upload failed (${res.status})`);
+			throw new ApiError(message, res.status, data);
 		}
-		return data as PluginDetail;
+		return (await res.json()) as PluginDetail;
 	},
 	enable: (pluginId: string) =>
 		request<PluginStatusEnvelope>(`${pluginPath(pluginId)}/enable`, { method: "POST" }),
