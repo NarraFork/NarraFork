@@ -1691,7 +1691,7 @@ export class PluginManager {
 			const installationId = previousInstallationId ?? randomUUID();
 			const permissions = await this.integrationAuthorityService.ensureInstallation(
 				installed.pluginId,
-				installationId
+				installationId,
 				seedGrantsFromManifest(
 					previousState?.grants ??
 						createPluginStateRecord(installed.pluginId, this.timestamp()).grants,
@@ -1707,7 +1707,7 @@ export class PluginManager {
 				// Legacy states predate the stable UUID: inherit the old hash's
 				// grants. First installs have no legacy record at all.
 				previousState?.current?.hash,
-				{ replaceRevoked: true, mergeMissingCapabilities: true }
+				{ replaceRevoked: true, mergeMissingCapabilities: true },
 			);
 			if (!previousInstallationId) {
 				await this.stateStore.setInstallationId(installed.pluginId, installationId);
@@ -2615,6 +2615,13 @@ export class PluginManager {
 				state.grants,
 			);
 			return { installationId, permissions };
+		}
+		if (state.current && authorities.some((authority) => authority.state === "revoked")) {
+			throw new PluginManagerError(
+				`Plugin authorization is revoked for ${pluginId}; explicit reinstall or reset is required`,
+				"INTEGRATION_AUTHORITY_CONFLICT",
+				409,
+			);
 		}
 		const installationId = randomUUID();
 		const legacyInstallationId =

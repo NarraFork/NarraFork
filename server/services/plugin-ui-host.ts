@@ -343,19 +343,9 @@ export class PluginUiHost {
 		const fence = this.trackSessionRequest(input.session.sessionId);
 		try {
 			// SIZE FIRST, then shape — the same order `validateUiEnvelope` uses on the client.
-			//
-			// The reverse order made the size limit unreportable in its own terms. The
-			// envelope schema bounds any single string at `MAX_JSON_STRING_LENGTH` (1 MB),
-			// which is well below this 5 MB envelope ceiling, so a genuinely oversized payload
-			// failed `safeParse` first and came back as `INVALID_PARAMS` — telling the caller
-			// its message was malformed when the actual problem was that it was too big, and
-			// leaving `PAYLOAD_TOO_LARGE` reachable only by a payload assembled from many
-			// individually-legal strings.
-			//
-			// Judging size first is also the cheaper rejection: it is one `JSON.stringify` on
-			// a payload that is about to be refused, instead of a full recursive schema walk
-			// (node counting, cycle detection, prototype checks) over something oversized.
-			if (jsonBytes(input.request) > PLUGIN_UI_HOST_REQUEST_MAX_BYTES) {
+			// Judging size first also avoids a recursive schema walk over an oversized request.
+			const rawRequestBytes = jsonBytes(input.request);
+			if (rawRequestBytes > PLUGIN_UI_HOST_REQUEST_MAX_BYTES) {
 				return makeResponse(
 					isRecord(input.request) && typeof input.request.id === "string"
 						? input.request.id

@@ -25,7 +25,7 @@ export interface PluginUiSessionBinding {
 	pluginId: string;
 	version: string;
 	hash: string;
-/** Internal authority generation; hash remains the package/asset identity. */
+	/** Internal authority generation; hash remains the package/asset identity. */
 	authorityInstallationId: string;
 	/** Stable installation identity (UUID) used for capability authorization. */
 	installationId: string;

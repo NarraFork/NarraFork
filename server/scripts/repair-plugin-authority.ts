@@ -239,6 +239,8 @@ function executePlan(home: string, plan: Plan, dryRun: boolean): void {
 	if (!plan.installationId || !plan.authorityId) {
 		throw new Error("Plugin has no canonical installation id — nothing to repair");
 	}
+	const installationId = plan.installationId;
+	const authorityId = plan.authorityId;
 	if (plan.authorityExists && plan.authorityState !== "active") {
 		throw new Error(
 			`Canonical authority is ${plan.authorityState}, not active. This needs a full authorization reset, not a repair.`,
@@ -253,22 +255,22 @@ function executePlan(home: string, plan: Plan, dryRun: boolean): void {
 			db.query(
 				"INSERT INTO integration_authorities (id, kind, integration_type, integration_id, state, revision, policy_json, metadata_json, expires_at, created_at, updated_at) VALUES (?, 'plugin_installation', 'plugin', ?, 'active', ?, NULL, ?, NULL, ?, ?)",
 			).run(
-				plan.authorityId,
+				authorityId,
 				plan.pluginId,
 				nextRevision,
-				JSON.stringify({ installationId: plan.installationId }),
+				JSON.stringify({ installationId }),
 				now,
 				now,
 			);
 		} else {
 			db.query(
 				"UPDATE integration_authorities SET revision=?, updated_at=? WHERE id=? AND revision=?",
-			).run(nextRevision, now, plan.authorityId, plan.authorityRevision);
+			).run(nextRevision, now, authorityId, plan.authorityRevision);
 		}
 		// 2. Soft-revoke the old grant rows of the canonical authority.
 		db.query(
 			"UPDATE integration_capability_grants SET revoked_at=?, updated_at=? WHERE authority_id=? AND revoked_at IS NULL",
-		).run(now, now, plan.authorityId);
+		).run(now, now, authorityId);
 		// 3. Insert the rebuilt grant rows (un-revoked).
 		for (const grant of plan.grantsToWrite) {
 			const adapted = adaptPluginCapability(grant.capability);
@@ -281,8 +283,8 @@ function executePlan(home: string, plan: Plan, dryRun: boolean): void {
 			db.query(
 				"INSERT INTO integration_capability_grants (id, authority_id, capability_id, scope_type, scope_id, scope_key, constraints_json, expires_at, revoked_at, created_by_type, created_by_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
 			).run(
-				pluginGrantRowId(plan.authorityId, nextRevision, grantId),
-				plan.authorityId,
+				pluginGrantRowId(authorityId, nextRevision, grantId),
+				authorityId,
 				adapted.id,
 				grant.scope.type,
 				grant.scope.type === "global" ? null : (grant.scope.id ?? null),
