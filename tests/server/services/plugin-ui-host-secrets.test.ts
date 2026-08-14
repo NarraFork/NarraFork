@@ -27,6 +27,7 @@ function makeSession(overrides: Partial<PluginUiSession> = {}): PluginUiSession 
 		pluginId,
 		version: "1.0.0",
 		hash: "s".repeat(64),
+		authorityInstallationId: "installation-ui-secret",
 		principalId: "user-1",
 		contributionId: "settings",
 		panelInstanceId: "panel-1",
@@ -39,7 +40,7 @@ function makeSession(overrides: Partial<PluginUiSession> = {}): PluginUiSession 
 		createdAt: "2026-07-16T12:00:00.000Z",
 		expiresAt: "2026-07-16T13:00:00.000Z",
 		...overrides,
-	} as PluginUiSession;
+	};
 }
 
 interface HostOptions {

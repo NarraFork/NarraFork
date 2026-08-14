@@ -113,10 +113,11 @@ describe("Anthropic effort capability detection", () => {
 		]) {
 			expect(supportsThinking(model)).toBe(true);
 		}
-		// Claude 3.7 Sonnet and DeepSeek keep their existing support.
-		expect(supportsThinking("claude-3-7-sonnet-20250219")).toBe(true);
+		// DeepSeek keeps its own support via the Anthropic-compatible relay.
 		expect(supportsThinking("deepseek-v4-pro")).toBe(true);
-		// Claude 3.5 has no extended thinking.
+		// Pre-4 Claude is out: 3.7's budgeted-thinking special case went away with the
+		// rest of the <=4.6 compatibility surface, so 3.7 and 3.5 are both false now.
+		expect(supportsThinking("claude-3-7-sonnet-20250219")).toBe(false);
 		expect(supportsThinking("claude-3-5-haiku-20241022")).toBe(false);
 	});
 });

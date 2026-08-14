@@ -18,6 +18,7 @@ import type { MiddlewareHandler } from "hono";
 const pluginId = "com.example.provider-surface";
 const version = "1.0.0";
 const hash = "a".repeat(64);
+const installationId = "installation-provider-surface";
 
 const allowAuth: MiddlewareHandler = async (c, next) => {
 	c.set("user", { sub: "user-1", role: "admin", iat: 0, exp: Number.MAX_SAFE_INTEGER });
@@ -74,13 +75,15 @@ function routes(views: Array<Record<string, unknown>>) {
 				current: { version, hash },
 			}),
 			getPermissions: async () => ({
+				installationId,
 				revision: 1,
 				grants: [
 					{
 						pluginId,
-						// The capability binding is keyed by installation, so this must match the
-						// package hash or the grant does not apply to the session being opened.
-						installationId: hash,
+						// The capability binding is keyed by the authority installation id, not the
+						// package hash, so this must match what `getPermissions` reports or the grant
+						// does not apply to the session being opened.
+						installationId,
 						grantId: "g1",
 						capability: "ui.panel",
 						scope: { type: "global" },
