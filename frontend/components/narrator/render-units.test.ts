@@ -92,6 +92,28 @@ describe("groupToolRunItemsForLod", () => {
 			),
 		).toEqual(["tool-0", "tool-1", "tool-2", "tool-3", "tool-4"]);
 	});
+
+	test("a pinned latest-tasks card stays a standalone card, in position", () => {
+		// tool-2 is a COMPLETED call — only the pin keeps it out of the fold.
+		const groups = groupToolRunItemsForLod(
+			toolRunItems(["success", "success", "success", "success"]),
+			"tool-2",
+		);
+
+		expect(groups.map((group) => group.kind)).toEqual(["folded", "active", "folded"]);
+		expect(groups[1]).toMatchObject({
+			kind: "active",
+			index: 2,
+			item: { tc: { status: "success" } },
+		});
+		expect(groups[0]).toMatchObject({ kind: "folded", items: [{}, {}] });
+		expect(groups[2]).toMatchObject({ kind: "folded", items: [{}] });
+	});
+
+	test("an unknown pinned id changes nothing (fold behaves as before)", () => {
+		const groups = groupToolRunItemsForLod(toolRunItems(["success", "success"]), "tool-missing");
+		expect(groups.map((group) => group.kind)).toEqual(["folded"]);
+	});
 });
 
 describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
@@ -330,5 +352,44 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 		if (units[0].kind === "activity") {
 			expect(units[0].items.map((i) => i.kind)).toEqual(["reasoning"]);
 		}
+	});
+
+	test("keepToolRunMessageIds keeps a segment out of the fold, neighbours still fold", () => {
+		// Three tool segments: only the middle one's message id is in the keep set.
+		// It must stay a plain segment (its card renders in full) while the two
+		// neighbours fold into their own activity units on either side.
+		const segments = segmentMessages([
+			toolMessage("message-1", "tool-1", "thought one"),
+			toolMessage("message-2", "tool-2", "thought two"),
+			toolMessage("message-3", "tool-3", "thought three"),
+		]);
+		const units = groupRenderUnits(segments, true, {
+			keepToolRunMessageIds: new Set(["message-2"]),
+		});
+
+		expect(units.map((u) => u.kind)).toEqual(["activity", "segment", "activity"]);
+		const kept = units[1];
+		if (kept.kind !== "segment" || kept.seg.kind !== "tool-run")
+			throw new Error("expected tool-run segment");
+		expect(kept.seg.items.map((i) => i.tc.toolUseId)).toEqual(["tool-2"]);
+		// The kept segment's tool must not also appear inside a folded unit.
+		for (const unit of units) {
+			if (unit.kind !== "activity") continue;
+			expect(unit.items.some((i) => i.kind === "tool" && i.tc.toolUseId === "tool-2")).toBe(false);
+		}
+	});
+
+	test("an empty / absent keep set changes nothing about the fold", () => {
+		const segments = segmentMessages([
+			toolMessage("message-1", "tool-1", "thought one"),
+			toolMessage("message-2", "tool-2", "thought two"),
+		]);
+		const baseline = groupRenderUnits(segments, true);
+		const withEmpty = groupRenderUnits(segments, true, { keepToolRunMessageIds: new Set() });
+		const withUnknown = groupRenderUnits(segments, true, {
+			keepToolRunMessageIds: new Set(["message-missing"]),
+		});
+		expect(withEmpty.map((u) => u.kind)).toEqual(baseline.map((u) => u.kind));
+		expect(withUnknown.map((u) => u.kind)).toEqual(baseline.map((u) => u.kind));
 	});
 });

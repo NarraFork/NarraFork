@@ -15,7 +15,8 @@
 			"chatGroup": "群聊",
 			"gateway": "IM 网关",
 			"oauth": "外部应用",
-			"recovery": "会话恢复"
+			"recovery": "会话恢复",
+			"planReflection": "计划反思"
 		}
 	},
 	"narrator": "叙述者",
@@ -1092,7 +1093,15 @@
 			"subagent_message": "子代理消息",
 			"spec_update": "大纲更新",
 			"behavior_fence": "行为护栏",
-			"pipeline_exit_confirmation": "Pipeline 确认"
+			"pipeline_exit_confirmation": "Pipeline 确认",
+			"spec_continuation": "自动续跑",
+			"spec_blocked_continuation": "阻塞续跑",
+			"spec_goal_added": "目标登记",
+			"spec_fork_carryover": "大纲继承",
+			"spec_context_cleared": "上下文已清空"
+		},
+		"cadence": {
+			"everyNTools": "每 {{n}} 次工具调用"
 		},
 		"showAll": "展开全部",
 		"attachedCount": "附带 {{count}} 条系统注入",

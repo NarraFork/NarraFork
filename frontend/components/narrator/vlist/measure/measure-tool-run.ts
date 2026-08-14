@@ -87,6 +87,9 @@ import { measureMarkdown } from "./measure-markdown";
 // media / permission / reflection / pretext-metrics and never on this module
 // (measure-subagent's dependency on it is one-way for the same reason).
 import {
+	CARD_BORDER,
+	CARD_PADDING,
+	HEADER_ROW_HEIGHT,
 	type MeasuredToolCall,
 	measureToolCall,
 	resolveToolTimingStamps,
@@ -374,6 +377,27 @@ export interface MeasuredTraceRow {
 	bodyTop: number;
 	/** Left offset (px) of the body content (pl + border). */
 	bodyLeft: number;
+	/**
+	 * Drill-down header morph target: the nested card's HEADER row rect in the
+	 * row-block coordinate system (drilled-in rows only, else null).
+	 *
+	 * The drilled-in card fills the row block from its top (the summary row is not
+	 * rendered — the card's header visually takes its place). This is the pure
+	 * arithmetic the header-morph controller needs to place the outgoing summary
+	 * row over the incoming card header, so neither the render nor the motion
+	 * layer re-derives it (and no DOM is ever read). Height-neutral: it only
+	 * restates geometry `cardMeasured` + the chrome constants already decided.
+	 */
+	drillHeader: {
+		/** Header row-box top within the row block (border + card padding). */
+		top: number;
+		/** Header row-box left within the row block (border + card padding). */
+		left: number;
+		/** Header row-box width (card inner width). */
+		width: number;
+		/** Header row-box height (`HEADER_ROW_HEIGHT`). */
+		height: number;
+	} | null;
 	/** Selection / context-menu coordinates (renderer only; height-neutral). */
 	identity?: AdapterTraceRowIdentity;
 	/**
@@ -544,17 +568,22 @@ export function measureCollapsibleTrace(
 		let body: MeasuredElement | null = null;
 		let card: MeasuredToolCall | null = null;
 		if (expanded) {
-			const inner = traceBodyInnerWidth(contentWidth);
 			if (item.card) {
 				// Drill-down: a standalone (bordered) card, exactly like a grouped card's
 				// child. `lodUserOverride` is what opens it — see the fn doc.
-				card = measureToolCall({ ...item.card, inRun: false }, inner, lod, {
+				//
+				// The card fills the WHOLE row block (full row width, from the block's
+				// top): the summary title row is NOT painted for a drilled-in row — the
+				// card's own header morphs into its place, so the row block IS the card
+				// (`blockHeight === card.height`). No `traceBodyInnerWidth`, no indent.
+				card = measureToolCall({ ...item.card, inRun: false }, contentWidth, lod, {
 					lodUserOverride: true,
 					isRecent: true,
 					viewportHeight: expandState.viewportHeight,
 				});
-				blockHeight += TRACE_BODY_PADDING_Y * 2 + card.height;
+				blockHeight = card.height;
 			} else if (typeof item.bodyText === "string" && item.bodyText.trim().length > 0) {
+				const inner = traceBodyInnerWidth(contentWidth);
 				body = measureMarkdown(item.bodyText, inner);
 				blockHeight += TRACE_BODY_PADDING_Y * 2 + body.frame.contentHeight;
 			}
@@ -607,6 +636,20 @@ export function measureCollapsibleTrace(
 		// A drilled-in row reports `expanded` too, so the renderer draws the open
 		// chevron and paints the body box for either kind of revealed content.
 		const expanded = body != null || cardMeasured != null;
+		// Header morph target (drilled-in rows only). The card is drawn at the row
+		// block's origin across the FULL row width, so its header row sits at
+		// `border + padding` inside the block. Pure restatement of the card chrome —
+		// the morph controller animates the outgoing summary row toward this rect.
+		const drillBorder = cardMeasured?.hasBorder ? CARD_BORDER : 0;
+		const drillHeader =
+			cardMeasured != null
+				? {
+						top: drillBorder + CARD_PADDING,
+						left: drillBorder + CARD_PADDING,
+						width: Math.max(1, contentWidth - 2 * (drillBorder + CARD_PADDING)),
+						height: HEADER_ROW_HEIGHT,
+					}
+				: null;
 		return {
 			itemIndex,
 			key: item.key ?? `row-${itemIndex}`,
@@ -631,10 +674,16 @@ export function measureCollapsibleTrace(
 			body,
 			cardMeasured,
 			canDrillDown: item.canDrillDown === true,
-			bodyTop: expanded
-				? bf.top + TRACE_ROW_HEIGHT + TRACE_BODY_PADDING_Y
-				: bf.top + TRACE_ROW_HEIGHT,
-			bodyLeft: TRACE_BODY_PADDING_LEFT + TRACE_BODY_BORDER_LEFT,
+			// A drilled-in card starts at the row block's top (no summary row above
+			// it); a markdown body still sits below the 18.8px row it belongs to.
+			bodyTop:
+				cardMeasured != null
+					? bf.top
+					: expanded
+						? bf.top + TRACE_ROW_HEIGHT + TRACE_BODY_PADDING_Y
+						: bf.top + TRACE_ROW_HEIGHT,
+			bodyLeft: cardMeasured != null ? 0 : TRACE_BODY_PADDING_LEFT + TRACE_BODY_BORDER_LEFT,
+			drillHeader,
 			// Passthrough only — never used above in any height computation.
 			identity: item.identity,
 			unitId: item.unitId,

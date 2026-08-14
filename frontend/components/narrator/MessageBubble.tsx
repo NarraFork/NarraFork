@@ -119,6 +119,7 @@ import { MessageEditorPanel } from "./MessageEditorPanel";
 import { EditedBadge } from "./MessageOriginalContent";
 import {
 	MessageOriginBadge,
+	OriginAvatar,
 	resolveUserBubbleName,
 	SystemOriginNotice,
 } from "./MessageOriginBadge";
@@ -4820,7 +4821,7 @@ export const MessageBubble = memo(function MessageBubble({
 					>
 						<Stack gap={4}>
 							<Group gap={6}>
-								{message.creator && (
+								{message.creator ? (
 									<UserAvatar
 										username={message.creator.username}
 										avatarColor={message.creator.avatarColor}
@@ -4829,6 +4830,8 @@ export const MessageBubble = memo(function MessageBubble({
 										size={20}
 										showTooltip={false}
 									/>
+								) : (
+									<OriginAvatar originLabel={message.originLabel} size={20} />
 								)}
 								<Text size="xs" fw={600} c="indigo">
 									{resolveUserBubbleName(message, t)}

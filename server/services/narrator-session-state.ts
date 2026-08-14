@@ -594,6 +594,18 @@ export const pendingPlanApprover = hotSafe<Map<string, string>>(
 	() => new Map(),
 );
 
+/**
+ * Who approved an ExitPlanMode plan: a real user ("user") or the plan reflection
+ * ("reflection"). Set alongside `pendingPlanApprover` (user path) or by the
+ * reflection confirmation path, read once by the `_planApprovedContinue`
+ * persistence branch, then cleared. Separate from `pendingPlanApprover` so a
+ * sentinel user id never leaks into the real user-id space.
+ */
+export const pendingPlanApproverSource = hotSafe<Map<string, "user" | "reflection">>(
+	"narrafork.pendingPlanApproverSource",
+	() => new Map(),
+);
+
 export const pendingPlanDiff = hotSafe<Map<string, string>>(
 	"narrafork.pendingPlanDiff",
 	() => new Map(),

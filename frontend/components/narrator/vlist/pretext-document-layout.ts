@@ -12,6 +12,7 @@ import type {
 	ElementSpec,
 } from "./segment-adapter";
 import type { VListItem } from "./vlist-pipeline";
+import { findLatestSpecTasksToolUseIdInMessages } from "./vlist-spec-tasks-pin";
 
 export interface BuildPretextDocumentLayoutOptions {
 	layoutRevision: string;
@@ -63,6 +64,13 @@ export interface BuildPretextDocumentLayoutOptions {
 	/** Whether an error card may offer the provider fix (a measured button row). */
 	canOfferProviderFix?: (errorText: string) => boolean;
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	/**
+	 * Pinned-card resolver forwarded to the adapter. Built locally by
+	 * `buildPretextDocumentLayout` over the id it derives from the messages being
+	 * laid out; callers do not pass one (and there is no option to override it —
+	 * a caller-supplied id could not correct itself once stale).
+	 */
+	resolveLatestSpecTasksToolUseId?: () => string | null;
 	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
 	/** Full (un-truncated) tool payloads once the shell has fetched them. */
 	resolveFullToolInput?: (toolUseId: string | undefined) => unknown;
@@ -200,7 +208,39 @@ export function buildPretextDocumentLayout(
 		pruneBoundaryMessageId: options.pruneBoundaryMessageId,
 		pruneDividerLabel: options.pruneDividerLabel,
 	});
-	const renderUnits = groupRenderUnits(segments, options.lod <= 2);
+	// The pinned tasks card: one id, derived HERE — once per build, over the SAME
+	// message list being laid out (persisted window + live streaming row). It drives
+	// both fold gates below and the adapter's per-card forceExpanded flag, so the
+	// three decisions can never pin two different cards.
+	//
+	// Deliberately not a caller-supplied option. The shell tracks its own copy for
+	// the task-board spinner, but that one is scanned over a different list, so the
+	// two can disagree; deriving locally means the pin is always consistent with the
+	// document it belongs to and can never go stale.
+	const latestSpecTasksToolUseId = findLatestSpecTasksToolUseIdInMessages(
+		messages as NarratorMsg[],
+	);
+	// A tool-run segment containing the pinned card must not fold into an activity
+	// unit at L1/L2 (its card would vanish into a trace row). The fold operates on
+	// whole segments, so the keep set is expressed in MESSAGE ids: any segment whose
+	// items touch one of these messages stays a plain segment. Same "whole segment"
+	// precedent as the permission gate — splitting a segment here would reorder the
+	// run.
+	const pinnedSpecTasksMessageIds = new Set<string>();
+	if (latestSpecTasksToolUseId != null) {
+		for (const seg of segments) {
+			if (seg.kind !== "tool-run") continue;
+			if (!seg.items.some((item) => item.tc.toolUseId === latestSpecTasksToolUseId)) continue;
+			for (const source of seg.sourceMessages) {
+				if (typeof source.id === "string" && source.id.length > 0) {
+					pinnedSpecTasksMessageIds.add(source.id);
+				}
+			}
+		}
+	}
+	const renderUnits = groupRenderUnits(segments, options.lod <= 2, {
+		keepToolRunMessageIds: pinnedSpecTasksMessageIds,
+	});
 	const adapterUnits: AdapterRenderUnit[] = renderUnits.map((unit, index) =>
 		unit.kind === "activity"
 			? {
@@ -227,6 +267,9 @@ export function buildPretextDocumentLayout(
 			...options,
 			documentRevision,
 			recentMessageIds,
+			// Frozen per build: the fold gates above already consumed this same id,
+			// so the adapter's per-card flag always agrees with the grouping.
+			resolveLatestSpecTasksToolUseId: () => latestSpecTasksToolUseId,
 			renderUnits: adapterUnits,
 			resolveSource,
 		}),

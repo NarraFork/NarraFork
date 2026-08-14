@@ -164,6 +164,7 @@ import {
 } from "./oauth-narrator-runtime-policy";
 import { formatParentInboundMessages } from "./parent-inbound-queue";
 import { drainPendingInjections, type PendingInjection } from "./parent-injection-queue";
+import { resolvePlanApprovalAttribution } from "./plan-approval-attribution";
 import { reviewService } from "./review-service";
 import { broadcastSpecChanged } from "./spec-broadcast";
 import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder";
@@ -215,6 +216,7 @@ import {
 	pendingFeedback,
 	pendingPermissions,
 	pendingPlanApprover,
+	pendingPlanApproverSource,
 	pendingPlanCompact,
 	pendingPlanDiff,
 	planModeAskedOnce,
@@ -1890,6 +1892,12 @@ async function drainInjectionsIntoHistory(active: ActiveNarrator, locale: Locale
 
 	const tasksBody = atTasksCadence ? await buildSpecTaskDigestBody(narratorId) : null;
 	if (tasksBody) {
+		// Stamp the cadence that raised this digest so the reader-facing header can say
+		// "每 N 次工具调用", distinguishing a routine digest from a turn-end
+		// continuation (which lists the same tasks but for a different reason).
+		if (tasksBody.kind === "tasks") {
+			tasksBody.cadenceInterval = active._tasksReminderInterval ?? 15;
+		}
 		const { body, content } = sideCarBodyWithText("living_work_spec", tasksBody, locale);
 		const { turnText } = await deliverInjection(narratorId, {
 			content,
@@ -3857,23 +3865,29 @@ export async function runAgentLoop(
 						: fb.feedbackText
 					: basePrompt;
 
-				// Retrieve the approver userId so the message shows their avatar
+				// Retrieve the approver identity (userId + whether a human or the plan
+				// reflection approved) so the injected turn is attributed correctly.
 				const approverId = pendingPlanApprover.get(narratorId);
 				if (approverId) pendingPlanApprover.delete(narratorId);
+				const approverSource = pendingPlanApproverSource.get(narratorId);
+				if (approverSource) pendingPlanApproverSource.delete(narratorId);
 
-				// With chained feedback the body is text the approver actually wrote;
-				// without it the body is the synthesized "plan approved, continue"
-				// prompt. Both are triggered by a human, so keep `createdBy`, but only
-				// the former is authored by one.
+				// Attribution lives in its own pure module (precedence documented there):
+				// chained feedback → the typist, else a recorded human approver, else the
+				// plan reflection's "计划反思" identity, else the auto-continuation card.
+				const { originOptions, createdBy } = resolvePlanApprovalAttribution({
+					hasFeedback: !!fb,
+					feedbackUserId: fb?.userId ?? null,
+					approverId,
+					approverSource,
+				});
 				const userMsg = await narratorService.persistUserMessage(
 					narratorId,
 					promptText,
 					[{ type: "text", text: promptText }],
 					undefined,
-					approverId ?? fb?.userId ?? undefined,
-					fb
-						? { origin: "user" }
-						: { origin: "system", originLabel: formatOriginLabel("autoContinuation") },
+					createdBy,
+					originOptions,
 				);
 				broadcastToNarrator(narratorId, {
 					type: "user_message",
@@ -4549,6 +4563,7 @@ export async function runAgentLoop(
 		pendingFeedback.delete(narratorId);
 		pendingPlanCompact.delete(narratorId);
 		pendingPlanApprover.delete(narratorId);
+		pendingPlanApproverSource.delete(narratorId);
 		pendingPlanDiff.delete(narratorId);
 		// Soft-stop bookkeeping never survives the loop that owns it.
 		active._bufferSoftStop = false;
@@ -5676,6 +5691,7 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 	pendingFeedback.delete(narratorId);
 	pendingPlanCompact.delete(narratorId);
 	pendingPlanApprover.delete(narratorId);
+	pendingPlanApproverSource.delete(narratorId);
 	pendingPlanDiff.delete(narratorId);
 	active._bashBeforeStatus?.clear();
 }

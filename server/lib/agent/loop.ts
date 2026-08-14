@@ -2126,15 +2126,26 @@ async function executeToolAfterReflections(
 				pendingPlanCompact.add(config.narratorId);
 			}
 
+			// Mark the plan-approval source so the `_planApprovedContinue` persistence
+			// branch attributes the injected "plan approved, begin execution" turn to
+			// the plan reflection (left bubble, "计划反思") instead of a generic
+			// auto-continuation system card or a human user.
+			const { pendingPlanApproverSource } = await import("@server/services/narrator-session-state");
+			pendingPlanApproverSource.set(config.narratorId, "reflection");
+
 			// Reflection confirmed — skip user approval and execute directly. Keep tu.input as the
 			// original model input so executeTool emits updatedInput and the event handler persists
 			// the resolved plan before onExitPlanMode reads it for optional plan compact.
 			const result = await executeAfterPreAdmission({
 				preGrantedPermission: { behavior: "allow", updatedInput: { ...reflected.input } },
 			});
-			if (shouldCompact && result.isError) {
+			if (result.isError) {
+				// The plan was never approved-and-continued, so both markers are stale. Left
+				// behind, `pendingPlanApproverSource` would attribute the NEXT approval in
+				// this same loop — possibly a real person's — to the reflection.
 				const { pendingPlanCompact } = await import("@server/services/narrator-session-state");
-				pendingPlanCompact.delete(config.narratorId);
+				if (shouldCompact) pendingPlanCompact.delete(config.narratorId);
+				pendingPlanApproverSource.delete(config.narratorId);
 			}
 			return result;
 		}

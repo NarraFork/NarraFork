@@ -282,6 +282,11 @@ export function useVListLabels(): VListLabels {
 			originSourceGateway: t("origin.source.gateway"),
 			originSourceOauth: t("origin.source.oauth"),
 			originSourceRecovery: t("origin.source.recovery"),
+			originSourcePlanReflection: t("origin.source.planReflection"),
+			// Periodic task-digest header subtitle ("every N tool calls"). The label
+			// keeps a literal `{n}` placeholder (same convention as tasksCurrent /
+			// tasksTooMany) that the adapter substitutes with the cadence interval.
+			cadenceEveryNTools: t("sidecar.cadence.everyNTools", { n: "{n}" }),
 			// ── image_generation header status ───────────────────────────────────────
 			// The status line wraps together with the revised prompt, so it is MEASURED
 			// and belongs to the adapter labels (the render layer only paints it).

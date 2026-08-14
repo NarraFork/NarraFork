@@ -1,0 +1,152 @@
+/**
+ * vlist-drill-morph.ts — The PURE arithmetic behind drill-down header morphs,
+ * driven by a DECLARATIVE row-level diff rather than a click capture.
+ *
+ * ## Why a diff, not a capture
+ *
+ * A folded trace's drill-down state (`expandedTraceRows`) is a Set of row keys —
+ * any number of rows can be drilled in at once, and a live stream can flip them in
+ * any combination. The earlier capture-based design stored ONE pending morph in a
+ * single-slot ref at click time; a second toggle overwrote the first, so stacked
+ * activity silently dropped morphs, and the geometry was derived in scattered
+ * places (committed state for expand, captured state for collapse), which is where
+ * the "wrong position" bugs came from.
+ *
+ * This module takes the fold animation's own paradigm — compare a before/after
+ * geometry pair — and sinks it to the trace's ROW level. After every committed
+ * rebuild the shell snapshots every visible trace row's drill state and header-line
+ * viewport position, then diffs the new snapshot against the previous frame's. Any
+ * row whose `drilled` flag flipped between the two frames gets a morph; N flips in
+ * one frame produce N plans, so stacked activity is handled natively.
+ *
+ * Everything here is computed from the layout's own numbers (`exactLayout` trace
+ * tops, the measured `rows[]` of each trace, `scrollTop`) — NO DOM measurement, and
+ * no React state. The committed DOM is the truth; the snapshot is pure data.
+ */
+
+import { FOLD_DURATION_MS } from "./vlist-fold-animation";
+
+/** How long a header morph lasts. Matches the fold transition (Mantine Collapse). */
+export const HEADER_MORPH_DURATION_MS = FOLD_DURATION_MS;
+
+/** The folded summary row's height (the morph's collapsed-state line). */
+export const DRILL_ROW_HEIGHT = 18.8;
+
+/** Which way one row's morph runs. */
+export type DrillMorphKind = "expand" | "collapse";
+
+/**
+ * One trace row's drill state at a committed frame.
+ *
+ * `rowUid` is globally unique across the document: `${traceKey}::${rowKey}`. The
+ * trace key alone cannot address a row (a trace has many), and the row key alone is
+ * only unique within its trace.
+ *
+ * `headerViewportTop` is the vertical CENTRE of the line the reader perceives as
+ * this row's "title", in viewport px:
+ *   - drilled (card shown)  → the card's own header centre;
+ *   - folded (summary row)  → the summary line centre.
+ * Storing the CENTRE lets one pair of snapshots yield both morph directions with
+ * pixel symmetry (see `diffDrillSnapshots`).
+ */
+export interface DrillRowSnapshot {
+	readonly rowUid: string;
+	readonly drilled: boolean;
+	readonly headerViewportTop: number;
+}
+
+/** The minimal shape the snapshot builder needs from a measured trace row. */
+export interface DrillMeasuredRow {
+	readonly key: string;
+	readonly top: number;
+	readonly drilled: boolean;
+	/** Card header rect within the row block (drilled rows only), else null. */
+	readonly drillHeader: { readonly top: number; readonly height: number } | null;
+}
+
+/** The minimal shape the snapshot builder needs from one visible trace element. */
+export interface DrillTraceSource {
+	readonly traceKey: string;
+	/** Trace element's top in DOCUMENT px (from the exact layout). */
+	readonly top: number;
+	readonly rows: readonly DrillMeasuredRow[];
+}
+
+/** What `diffDrillSnapshots` produces for one flipped row. */
+export interface DrillMorphPlan {
+	readonly rowUid: string;
+	readonly kind: DrillMorphKind;
+	/**
+	 * Vertical distance the incoming line travels, in px. Positive drifts DOWN
+	 * (expand: summary → card header); negative drifts UP (collapse). The DOM edge
+	 * starts the incoming line at `translateY(-driftY)` and settles it at 0.
+	 */
+	readonly driftY: number;
+	readonly durationMs: number;
+}
+
+/**
+ * Snapshot every visible trace's rows.
+ *
+ * `scrollTop` converts the document-space layout offsets into the viewport space the
+ * reader actually sees, so a morph anchored to a row tracks it even when the
+ * anchored rebuild rewrote scrollTop.
+ */
+export function buildDrillSnapshots(
+	traces: readonly DrillTraceSource[],
+	scrollTop: number,
+): Map<string, DrillRowSnapshot> {
+	const out = new Map<string, DrillRowSnapshot>();
+	for (const trace of traces) {
+		for (const row of trace.rows) {
+			const rowBlockTop = trace.top + row.top;
+			const headerViewportTop = row.drilled
+				? // Drilled: the card header's centre is the perceived title line. The card
+					// fills the row block from its top, so the header sits at drillHeader.top.
+					rowBlockTop + (row.drillHeader?.top ?? 0) + (row.drillHeader?.height ?? 0) / 2
+				: // Folded: the summary line's own centre.
+					rowBlockTop + DRILL_ROW_HEIGHT / 2;
+			out.set(`${trace.traceKey}::${row.key}`, {
+				rowUid: `${trace.traceKey}::${row.key}`,
+				drilled: row.drilled,
+				headerViewportTop: headerViewportTop - scrollTop,
+			});
+		}
+	}
+	return out;
+}
+
+/**
+ * Diff two committed snapshots into per-row morph plans.
+ *
+ * A row morphs only when its `drilled` flag FLIPPED between the two frames AND it
+ * exists in both. A row present in only one frame (freshly mounted, or unmounted by
+ * the rebuild) has no counterpart to morph from/to — the same rule the fold applies
+ * ("only rows present in BOTH maps are animated").
+ *
+ * Expand and collapse read the SAME two endpoints in opposite directions:
+ *   - folded-centre  = the row's own summary line;
+ *   - drilled-centre = the card header.
+ * Expand's incoming line (the card header) starts at the folded centre and travels
+ * DOWN to its committed spot; collapse's incoming line (the summary row) starts at
+ * the drilled centre and travels UP. Because both snapshots store viewport tops,
+ * `driftY` is just the difference of the two perceived title lines.
+ */
+export function diffDrillSnapshots(
+	prev: ReadonlyMap<string, DrillRowSnapshot>,
+	next: ReadonlyMap<string, DrillRowSnapshot>,
+): DrillMorphPlan[] {
+	const out: DrillMorphPlan[] = [];
+	for (const [rowUid, after] of next) {
+		const before = prev.get(rowUid);
+		if (!before) continue;
+		if (before.drilled === after.drilled) continue;
+		const kind: DrillMorphKind = after.drilled ? "expand" : "collapse";
+		// The incoming line travels from where the OUTGOING line was to where it now
+		// is. Expand: incoming = card header (after), outgoing = summary (before).
+		// Collapse: incoming = summary (after), outgoing = card header (before).
+		const driftY = after.headerViewportTop - before.headerViewportTop;
+		out.push({ rowUid, kind, driftY, durationMs: HEADER_MORPH_DURATION_MS });
+	}
+	return out;
+}

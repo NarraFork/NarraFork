@@ -400,6 +400,45 @@ describe("spoken injections — which producers qualify", () => {
 		]);
 	});
 
+	it("names a periodic digest's cadence in the header subtitle (not on a continuation)", () => {
+		// The distinction this feature exists for: the routine `living_work_spec` digest
+		// (every N tool calls) and the turn-end `spec_continuation` list the SAME tasks,
+		// so without a marker they read identically. The digest's `cadenceInterval` is
+		// projected into the header's `speakerKind` slot ("every N tool calls"), while a
+		// continuation carries no cadence and therefore no subtitle.
+		const digest = adaptSegment(
+			injectionSegment({
+				type: "system_injection",
+				source: "living_work_spec",
+				body: {
+					kind: "tasks",
+					variant: "current",
+					cadenceInterval: 15,
+					tasks: [{ role: "doing", text: "wire the flag" }],
+				},
+			}),
+			CTX,
+		);
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		const digestData = digest[0]?.data as any;
+		expect(digestData.speakerKind).toBe("every 15 tool calls");
+
+		const noCadence = adaptSegment(
+			injectionSegment({
+				type: "system_injection",
+				source: "living_work_spec",
+				body: {
+					kind: "tasks",
+					variant: "current",
+					tasks: [{ role: "doing", text: "wire the flag" }],
+				},
+			}),
+			CTX,
+		);
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		expect((noCadence[0]?.data as any).speakerKind).toBeNull();
+	});
+
 	it("an empty task digest says so instead of drawing no rows", () => {
 		const specs = adaptSegment(
 			injectionSegment({

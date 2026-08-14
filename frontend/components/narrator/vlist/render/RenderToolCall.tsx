@@ -125,6 +125,7 @@ import {
 	type VListViewTarget,
 } from "../vlist-content-view-target";
 import { categoryIcon } from "./category-icons";
+import { activateOnKey } from "./key-activate";
 import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
@@ -469,15 +470,25 @@ function ToolHeaderRow({
 	const running = isRunningStatus(status);
 	return (
 		<Group
+			data-nf-card-header
 			gap={4}
 			wrap="nowrap"
 			align="center"
+			// A keyboard and a screen reader cannot use a bare `onClick` on a div. That
+			// matters most for a DRILLED-IN trace row: its summary line (which did carry
+			// these attributes) is not painted, so this header is the ONLY control that
+			// can close the card again. ATTRIBUTES ONLY — the measured header height is
+			// `HEADER_ROW_HEIGHT` either way.
+			role={onToggle ? "button" : undefined}
+			tabIndex={onToggle ? 0 : undefined}
+			aria-expanded={onToggle ? opened : undefined}
 			style={{
 				height: HEADER_ROW_HEIGHT,
 				cursor: onToggle ? "pointer" : "default",
 				userSelect: "none",
 			}}
 			onClick={onToggle}
+			onKeyDown={onToggle ? activateOnKey(onToggle) : undefined}
 		>
 			<span
 				style={{

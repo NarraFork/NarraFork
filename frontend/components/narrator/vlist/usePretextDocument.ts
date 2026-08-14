@@ -321,6 +321,11 @@ export function usePretextDocument(
 			resolveSubagentRecentSummary: options.resolveSubagentRecentSummary,
 			canOfferProviderFix: options.canOfferProviderFix,
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
+			// ⚠️ No `latestSpecTasksToolUseId` here, deliberately. The pinned tasks card
+			// is resolved by `buildPretextDocumentLayout` from the exact message list it
+			// lays out, so it needs no build option and cannot go stale: every event that
+			// moves the pin (a new tasks write landing) arrives as a message change, which
+			// already rebuilds through the in-place channels.
 			resolvePendingPlan: options.resolvePendingPlan,
 			resolveFullToolInput: options.resolveFullToolInput,
 			resolveFullToolOutput: options.resolveFullToolOutput,

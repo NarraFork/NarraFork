@@ -68,10 +68,12 @@ const PURE_PATH_FILES = [
 	"vlist-live-patch.ts",
 	"vlist-live-events.ts",
 	// Pure decisions consumed by the shell (streaming hand-off, reload
-	// classification) and the incremental streaming markdown preparation.
+	// classification), the incremental streaming markdown preparation, and the
+	// "latest spec://tasks.json call" identification the pin exemption is keyed on.
 	"streaming-handoff.ts",
 	"streaming-block-cache.ts",
 	"vlist-reload-policy.ts",
+	"vlist-spec-tasks-pin.ts",
 	// Content-viewer geometry: the body-extraction rules, and the arithmetic that
 	// floats a body's action bar with the viewport. The bar's offset is derived from
 	// rectangles the RENDER layer reads and passes in; doing the reading here would

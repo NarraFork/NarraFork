@@ -608,10 +608,8 @@ describe("trace row drill-down", () => {
 		expect(r.rows[1]?.blockHeight).toBeCloseTo(TRACE_ROW_HEIGHT, 5);
 	});
 
-	it("expanding a tool row adds bodyPadding*2 + the nested card height", async () => {
-		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT, TRACE_BODY_PADDING_Y } = await import(
-			"./measure-tool-run"
-		);
+	it("expanding a tool row makes the row block exactly the nested card", async () => {
+		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
 		const items = drillRows(3, [1]);
 		const collapsed = measureCollapsibleTrace({ items, maxVisible: 10 }, 600);
 		const expanded = measureCollapsibleTrace({ items, maxVisible: 10 }, 600, {
@@ -620,29 +618,47 @@ describe("trace row drill-down", () => {
 		const card = expanded.rows[1]?.cardMeasured;
 		expect(card).not.toBeNull();
 		expect(card?.effectiveOpened).toBe(true);
-		expect(expanded.rows[1]?.blockHeight).toBeCloseTo(
-			TRACE_ROW_HEIGHT + TRACE_BODY_PADDING_Y * 2 + (card?.height ?? 0),
-			5,
-		);
+		// The drilled-in row block IS the card: the summary row is not painted, so no
+		// TRACE_ROW_HEIGHT / body padding is added on top of the card's own height.
+		expect(expanded.rows[1]?.blockHeight).toBeCloseTo(card?.height ?? 0, 5);
 		expect(expanded.height).toBeCloseTo(
-			collapsed.height + TRACE_BODY_PADDING_Y * 2 + (card?.height ?? 0),
+			collapsed.height - TRACE_ROW_HEIGHT + (card?.height ?? 0),
 			5,
 		);
-		// Rows after the expanded one shift down by exactly that amount.
+		// Rows after the expanded one shift down by exactly the net growth.
 		expect(expanded.rows[2]?.top).toBeCloseTo(
-			(collapsed.rows[2]?.top ?? 0) + TRACE_BODY_PADDING_Y * 2 + (card?.height ?? 0),
+			(collapsed.rows[2]?.top ?? 0) - TRACE_ROW_HEIGHT + (card?.height ?? 0),
 			5,
 		);
 	});
 
-	it("the nested card is measured at the indented body width", async () => {
-		const { measureCollapsibleTrace, traceBodyInnerWidth } = await import("./measure-tool-run");
+	it("the nested card fills the full row width (no indented body lane)", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
 		const r = measureCollapsibleTrace({ items: drillRows(2, [0]), maxVisible: 10 }, 600, {
 			expandedIndices: [0],
 		});
-		// A standalone card reports its INNER width; the outer box it was measured
-		// against is the row's indented body lane.
-		expect(r.rows[0]?.cardMeasured?.usedWidth).toBeCloseTo(traceBodyInnerWidth(600), 5);
+		// The card is measured against the row's FULL content width (it replaces the
+		// summary row instead of nesting under it), so there is no pl/border to deduct.
+		expect(r.rows[0]?.cardMeasured?.usedWidth).toBeCloseTo(600, 5);
+	});
+
+	it("exposes the card header rect for the drill-down header morph", async () => {
+		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
+		const { CARD_BORDER, CARD_PADDING, HEADER_ROW_HEIGHT } = await import("./measure-tool-call");
+		const r = measureCollapsibleTrace({ items: drillRows(2, [0]), maxVisible: 10 }, 600, {
+			expandedIndices: [0],
+		});
+		const row = r.rows[0];
+		// Drilled-in row: the header morph target is the card's header, sitting at
+		// border + padding inside the row block (which starts at the card's top).
+		expect(row?.drillHeader).not.toBeNull();
+		expect(row?.drillHeader?.top).toBeCloseTo(CARD_BORDER + CARD_PADDING, 5);
+		expect(row?.drillHeader?.left).toBeCloseTo(CARD_BORDER + CARD_PADDING, 5);
+		expect(row?.drillHeader?.height).toBeCloseTo(HEADER_ROW_HEIGHT, 5);
+		expect(row?.drillHeader?.width).toBeCloseTo(600 - 2 * (CARD_BORDER + CARD_PADDING), 5);
+		// A folded row has no card and therefore no morph target.
+		expect(r.rows[1]?.drillHeader).toBeNull();
+		expect(r.rows[1]?.blockHeight).toBeCloseTo(TRACE_ROW_HEIGHT, 5);
 	});
 
 	it("opens at every LOD a fold exists at (L1-L4 collapse a standalone card)", async () => {

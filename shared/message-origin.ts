@@ -39,7 +39,8 @@ export type MessageOriginSource =
 	| "chatGroup"
 	| "gateway"
 	| "oauth"
-	| "recovery";
+	| "recovery"
+	| "planReflection";
 
 /**
  * Build an `originLabel`. The stored format is `sourceKey` or
@@ -72,6 +73,7 @@ const ORIGIN_SOURCES = new Set<string>([
 	"gateway",
 	"oauth",
 	"recovery",
+	"planReflection",
 ]);
 
 /**

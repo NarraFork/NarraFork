@@ -72,12 +72,33 @@ export function isActiveToolItem(item: ToolRunItem): boolean {
 }
 
 /**
+ * True when a tool item IS the most recent spec://tasks.json call, identified by
+ * the shared `latestSpecTasksToolUseId` rule (the same id the task-board spinner
+ * keys on). Such a card is kept fully expanded at every LOD — see
+ * `groupToolRunItemsForLod`'s second parameter.
+ */
+export function isLatestSpecTasksToolItem(
+	item: ToolRunItem,
+	latestSpecTasksToolUseId: string | null | undefined,
+): boolean {
+	return latestSpecTasksToolUseId != null && item.tc.toolUseId === latestSpecTasksToolUseId;
+}
+
+/**
  * Split a mixed tool run into chronological low-LOD groups. Completed tools are
  * folded in contiguous batches, while active tools remain standalone at their
  * original positions. This prevents the live card from jumping above earlier
  * completed calls when the run is partially folded.
+ *
+ * `latestSpecTasksToolUseId` (optional) keeps the latest tasks.json call's card
+ * out of the fold exactly like an active tool: it stays a standalone full card at
+ * its original position. Omitted by the chunked path, which folds every completed
+ * call as before.
  */
-export function groupToolRunItemsForLod(items: ToolRunItem[]): ToolRunLodGroup[] {
+export function groupToolRunItemsForLod(
+	items: ToolRunItem[],
+	latestSpecTasksToolUseId?: string | null,
+): ToolRunLodGroup[] {
 	const groups: ToolRunLodGroup[] = [];
 	let pendingFolded: ToolRunItem[] = [];
 	let pendingStartIndex = 0;
@@ -90,7 +111,7 @@ export function groupToolRunItemsForLod(items: ToolRunItem[]): ToolRunLodGroup[]
 
 	for (let index = 0; index < items.length; index++) {
 		const item = items[index];
-		if (isActiveToolItem(item)) {
+		if (isActiveToolItem(item) || isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)) {
 			flushFolded();
 			groups.push({ kind: "active", item, index });
 			continue;
@@ -165,12 +186,27 @@ function splitMessageSegmentForActivity(
  * True when a tool-run segment may fold into the activity trace.
  *
  * Running / streaming tools DO fold (that is what makes the hand-off invisible —
- * see the module header). Only a tool blocked on a permission decision keeps its
- * card, and it takes the whole segment with it: the segment is the unit the
- * renderer draws, so splitting it here would reorder the run.
+ * see the module header). Only two kinds keep their cards, and each takes the
+ * whole segment with it (the segment is the unit the renderer draws, so splitting
+ * it here would reorder the run):
+ *  - a tool blocked on a permission decision (its approve/deny form has nowhere
+ *    else to live — see `isPermissionAwaitingToolItem`);
+ *  - the most recent spec://tasks.json call, when the caller passes its message
+ *    ids via `keepToolRunMessageIds` (the vlist pins that card expanded at every
+ *    LOD — the task board is the narrator's live working state).
  */
-function isFoldableToolRunSegment(seg: Extract<RenderSegment, { kind: "tool-run" }>): boolean {
-	return !seg.items.some((it) => isPermissionAwaitingToolItem(it));
+function isFoldableToolRunSegment(
+	seg: Extract<RenderSegment, { kind: "tool-run" }>,
+	keepToolRunMessageIds?: ReadonlySet<string>,
+): boolean {
+	if (seg.items.some((it) => isPermissionAwaitingToolItem(it))) return false;
+	if (keepToolRunMessageIds && keepToolRunMessageIds.size > 0) {
+		for (const item of seg.items) {
+			const messageId = item.msg?.id;
+			if (messageId && keepToolRunMessageIds.has(messageId)) return false;
+		}
+	}
+	return true;
 }
 
 /**
@@ -218,7 +254,11 @@ function toolItemsFromToolRunSegment(
  * settled — and what a future animated LOD transition needs to pair rows against
  * their full-card counterparts.
  */
-export function groupRenderUnits(segments: RenderSegment[], enabled: boolean): RenderUnit[] {
+export function groupRenderUnits(
+	segments: RenderSegment[],
+	enabled: boolean,
+	opts?: { keepToolRunMessageIds?: ReadonlySet<string> },
+): RenderUnit[] {
 	if (!enabled) return segments.map((seg) => ({ kind: "segment", seg }));
 
 	// Tool-use ids that a PERSISTED message already owns, collected over the whole
@@ -337,7 +377,7 @@ export function groupRenderUnits(segments: RenderSegment[], enabled: boolean): R
 				continue;
 			}
 		}
-		if (seg.kind === "tool-run" && isFoldableToolRunSegment(seg)) {
+		if (seg.kind === "tool-run" && isFoldableToolRunSegment(seg, opts?.keepToolRunMessageIds)) {
 			absorb(toolItemsFromToolRunSegment(seg), seg.sourceMessages, seg);
 			continue;
 		}

@@ -213,11 +213,12 @@ describe("RenderToolRun — the drilled-in card joins the row's interaction surf
 		expect(declaresHeight(withSurface, openedHeight)).toBe(true);
 	});
 
-	it("still starts the revealed body at the row's fixed title height", () => {
-		// The revealed bodies are absolutely positioned at TRACE_ROW_HEIGHT. Grouping
-		// them with the title line means they now resolve against the grouping box, so
-		// this pins that the box is a positioned ancestor of the same height/offset —
-		// otherwise the card would slide up over its own title row.
+	it("starts the drilled-in card at the row block's top (the card replaces the title row)", () => {
+		// A drilled-in row does NOT paint its summary title row: the nested card fills
+		// the whole block from top:0, its own header morphing into the slot the title
+		// row used to occupy. Grouping the card with the (absent) title line means the
+		// grouping box is a positioned ancestor of the same height — so the card sits
+		// flush at the block's top instead of sliding under a row that is not there.
 		const measured = measureActivityTrace(traceRows(1), WIDTH, { expandedIndices: [1] }, {}, 2);
 		const root = render(
 			<RenderToolRun measured={measured} rowCard={rowCard} rowInteraction={rowInteraction} />,
@@ -227,14 +228,74 @@ describe("RenderToolRun — the drilled-in card joins the row's interaction surf
 		const groupingStyle = String(grouping?.getAttribute("style") ?? "").replace(/\s+/g, "");
 		expect(groupingStyle).toContain("position:relative");
 		expect(groupingStyle).toContain(`height:${measured.rows[1]?.blockHeight}px`);
+		// No summary title row is painted for the drilled-in row…
+		expect(surface.querySelector("[data-nf-trace-titlerow]")).toBeNull();
+		// …and the card's box starts at the block's top (top:0), full width, no indent.
 		const bodyBox = Array.from(surface.querySelectorAll("div")).find((el) => {
 			const style = String((el as unknown as HTMLElement).getAttribute("style") ?? "").replace(
 				/\s+/g,
 				"",
 			);
-			return style.includes("position:absolute") && style.includes(`top:${TRACE_ROW_HEIGHT}px`);
+			return (
+				style.includes("position:absolute") &&
+				(style.includes("top:0px") || style.includes("top:0;"))
+			);
 		});
 		expect(bodyBox).toBeDefined();
 		expect(bodyBox?.textContent).toContain("src/index.ts");
+	});
+
+	it("keeps the drilled-in card's header keyboard-reachable (the ONLY way back out)", () => {
+		// The summary title row carried role/tabIndex/onKeyDown, and a drilled-in row no
+		// longer paints it — so the card's own header is the only remaining control that
+		// can collapse the row. Without these attributes the drill-down became a one-way
+		// door for keyboard and screen-reader readers.
+		const measured = measureActivityTrace(traceRows(1), WIDTH, { expandedIndices: [1] }, {}, 2);
+		const root = render(
+			<RenderToolRun
+				measured={measured}
+				rowCard={(row) =>
+					row.cardMeasured ? (
+						<RenderToolCall measured={row.cardMeasured} onToggle={() => {}} />
+					) : null
+				}
+			/>,
+		);
+		const header = root.querySelector("[data-nf-card-header]");
+		expect(header).not.toBeNull();
+		expect(header?.getAttribute("role")).toBe("button");
+		expect(header?.getAttribute("tabindex")).toBe("0");
+		// The card is measured force-open, so the header announces itself as expanded.
+		expect(header?.getAttribute("aria-expanded")).toBe("true");
+	});
+
+	it("leaves a non-toggleable card header out of the tab order", () => {
+		// No `onToggle` → nothing to activate, so claiming `role="button"` would put a
+		// dead stop in the tab order of a list that already has many.
+		const measured = measureActivityTrace(traceRows(1), WIDTH, { expandedIndices: [1] }, {}, 2);
+		const root = render(<RenderToolRun measured={measured} rowCard={rowCard} />);
+		const header = root.querySelector("[data-nf-card-header]");
+		expect(header).not.toBeNull();
+		expect(header?.getAttribute("role")).toBeNull();
+		expect(header?.getAttribute("tabindex")).toBeNull();
+	});
+
+	it("tags every row with its own key so the header morph finds THIS row, not the first", () => {
+		// The collapse morph locates the remounted title line by
+		// `[data-nf-trace-row="<rowKey>"] [data-nf-trace-titlerow]`. If the per-row tag
+		// were missing (or every row shared one value), a trace-level querySelector
+		// returns the FIRST row's line — the animation then plays on the row ABOVE the
+		// one being collapsed. These two rows carry keys `t-0` / `t-1`; pin that each
+		// resolves to its own title line.
+		const measured = measureActivityTrace(traceRows(), WIDTH, {}, {}, 2);
+		const root = render(<RenderToolRun measured={measured} rowCard={rowCard} />);
+		const tagged = Array.from(root.querySelectorAll("[data-nf-trace-row]"));
+		expect(tagged.map((el) => el.getAttribute("data-nf-trace-row"))).toEqual(["t-0", "t-1"]);
+		// Each tagged row's own title line is reachable within it — and is that row's.
+		for (const key of ["t-0", "t-1"]) {
+			const row = root.querySelector(`[data-nf-trace-row="${key}"]`);
+			const title = row?.querySelector("[data-nf-trace-titlerow]");
+			expect(title?.textContent).toContain(`file${key === "t-0" ? 0 : 1}.ts`);
+		}
 	});
 });

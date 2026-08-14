@@ -113,6 +113,22 @@ describe("resolveBubbleIsSelf", () => {
 		expect(resolveBubbleIsSelf(undefined, "u1")).toBe(true);
 		expect(resolveBubbleIsSelf({ username: "ghost" }, "u1")).toBe(true);
 	});
+
+	test("a plan-reflection-approved turn paints on the left despite having no creator", () => {
+		// The plan reflection approves without any human, so the turn carries
+		// `originLabel: "planReflection"` and no `creator`. Without the special case it
+		// would fall through to `true` (the unknown-author fallback) and claim the
+		// reader approved their own plan.
+		expect(resolveBubbleIsSelf(null, "u1", "planReflection")).toBe(false);
+		expect(resolveBubbleIsSelf(undefined, "u1", "planReflection")).toBe(false);
+	});
+
+	test("a plan-reflection label does not override a real author's side", () => {
+		// Defensive: a real creator always wins the side; the reflection label only
+		// applies when there is no account to attribute.
+		expect(resolveBubbleIsSelf(CREATOR, "u1", "planReflection")).toBe(true);
+		expect(resolveBubbleIsSelf(CREATOR, "u2", "planReflection")).toBe(false);
+	});
 });
 
 describe("injectUserBubbleIsSelf — injection contract", () => {
@@ -141,6 +157,12 @@ describe("injectUserBubbleIsSelf — injection contract", () => {
 	test("applies to a header-less bubble too (the side is independent of the header)", () => {
 		const extra = userExtra({ hasHeader: false });
 		injectUserBubbleIsSelf("message-bubble", extra, "u2");
+		expect(extra.isSelf).toBe(false);
+	});
+
+	test("marks a plan-reflection-approved bubble as not-self (left)", () => {
+		const extra = userExtra({ creator: undefined, originLabel: "planReflection" });
+		injectUserBubbleIsSelf("message-bubble", extra, "u1");
 		expect(extra.isSelf).toBe(false);
 	});
 });
@@ -293,5 +315,11 @@ describe("injectUserBubbleHeader — origin attribution", () => {
 	test("surfaces an unrecognized label rather than dropping the attribution", () => {
 		const text = renderHeader(userExtra({ creator: undefined, originLabel: "futureSource:x" }));
 		expect(text).toContain("futureSource:x");
+	});
+
+	test("names a plan-reflection-approved turn 'planReflection' instead of 'you'", () => {
+		const text = renderHeader(userExtra({ creator: undefined, originLabel: "planReflection" }));
+		expect(text).toContain("origin.source.planReflection");
+		expect(text).not.toContain("you");
 	});
 });

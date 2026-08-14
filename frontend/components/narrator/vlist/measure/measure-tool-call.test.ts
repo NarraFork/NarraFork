@@ -816,6 +816,45 @@ describe("measureToolCall — running/pending cards are lodExempt", () => {
 	});
 });
 
+describe("measureToolCall — the pinned latest-tasks card is forceExpanded", () => {
+	it("a completed tasks card stays expanded at L4 (a level that collapses all)", async () => {
+		const { measureToolCall } = await mod();
+		const r = measureToolCall(
+			baseCard({
+				category: "tasks",
+				toolName: "Write",
+				status: "success",
+				detail: {
+					kind: "spec-tasks",
+					tasks: [{ text: "do the thing", status: "doing", protected: false }],
+				},
+			}),
+			600,
+			4,
+			{ forceExpanded: true },
+		);
+		expect(r.lodExempt).toBe(true);
+		expect(r.effectiveOpened).toBe(true);
+		expect(r.detail).not.toBeNull();
+		expect(r.height).toBeGreaterThan(r.collapsedHeight);
+	});
+
+	it("…and at L1, where the run gate would normally own the card", async () => {
+		const { measureToolCall } = await mod();
+		const r = measureToolCall(baseCard({ category: "tasks", toolName: "Write" }), 600, 1, {
+			forceExpanded: true,
+		});
+		expect(r.effectiveOpened).toBe(true);
+	});
+
+	it("an unpinned completed card is untouched by the flag's absence", async () => {
+		const { measureToolCall } = await mod();
+		const r = measureToolCall(baseCard({ status: "success" }), 600, 4);
+		expect(r.lodExempt).toBe(false);
+		expect(r.effectiveOpened).toBe(false);
+	});
+});
+
 // ── Pending permission ────────────────────────────────────────────────────────
 describe("measureToolCall — pendingPermission adds the InlinePermission UI", () => {
 	it("pending card is lodExempt, expanded, and includes the permission region", async () => {

@@ -96,6 +96,7 @@ import {
 	pendingFeedback,
 	pendingPermissions,
 	pendingPlanApprover,
+	pendingPlanApproverSource,
 	pendingPlanCompact,
 	pendingPlanDiff,
 	planModeAskedOnce,
@@ -4516,6 +4517,7 @@ export async function resolvePermission(
 
 		if (pending.toolName === "ExitPlanMode" && userId) {
 			pendingPlanApprover.set(pending.narratorId, userId);
+			pendingPlanApproverSource.set(pending.narratorId, "user");
 		}
 
 		if (updatedPlan !== undefined && pending.toolName === "ExitPlanMode") {

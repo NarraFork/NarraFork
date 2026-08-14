@@ -75,6 +75,13 @@ const PLATFORM_SOURCES = new Set([
 	"browser_session_lost",
 	"spec_continuation",
 	"spec_blocked_continuation",
+	// ⚠️ These three do NOT reach this header yet, and their `sidecar.sources.*` keys are
+	// therefore unused TODAY — do not delete either as orphans. The adapter deliberately
+	// keeps them as standalone `system-text` cards because their buttons are wired by
+	// matching that kind (see segment-adapter's FRAMED_SPEC_TASK_CARDS note); routing them
+	// through `injection-bubble` before the action-injection seam reaches a nested payload
+	// would silently unwire every button. Listed here so that when the seam lands, the
+	// header names its producer instead of falling back to the generic "System".
 	"spec_goal_added",
 	"spec_fork_carryover",
 	"spec_context_cleared",

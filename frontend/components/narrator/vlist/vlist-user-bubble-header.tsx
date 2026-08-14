@@ -18,11 +18,13 @@
 
 import {
 	MessageOriginBadge,
+	OriginAvatar,
 	resolveUserBubbleName,
 } from "@frontend/components/narrator/MessageOriginBadge";
 import { UserAvatar } from "@frontend/components/UserAvatar";
 import { formatLocaleDateTime, formatLocaleTime } from "@frontend/lib/intl-format";
 import { Group, Text } from "@mantine/core";
+import { parseOriginLabel } from "@shared/message-origin";
 import { useTranslation } from "react-i18next";
 import type { VListElementKind } from "./registry";
 import type { RenderExtra } from "./render-registry";
@@ -73,7 +75,7 @@ export function UserBubbleHeader({
 	const { t } = useTranslation("narrator");
 	return (
 		<Group gap={6} wrap="nowrap" h="100%" align="center">
-			{creator && (
+			{creator ? (
 				<UserAvatar
 					username={creator.username}
 					avatarColor={creator.avatarColor}
@@ -82,6 +84,8 @@ export function UserBubbleHeader({
 					size={20}
 					showTooltip={false}
 				/>
+			) : (
+				<OriginAvatar originLabel={originLabel} size={20} />
 			)}
 			<Text size="xs" fw={600} c="indigo" style={{ whiteSpace: "nowrap" }}>
 				{resolveUserBubbleName({ creator, origin, originLabel }, t)}
@@ -162,7 +166,12 @@ export function injectUserBubbleHeader(kind: VListElementKind, extra: RenderExtr
 export function resolveBubbleIsSelf(
 	creator: BubbleCreator | null | undefined,
 	currentUserId: string | null | undefined,
+	originLabel?: string | null,
 ): boolean {
+	// A turn authored by the plan reflection (a plan auto-approved without a human)
+	// never belongs to the reader, so it always paints on the left even though it
+	// carries no `creator` (which would otherwise fall through to `true`).
+	if (!creator?.id && parseOriginLabel(originLabel)?.source === "planReflection") return false;
 	if (!currentUserId) return true;
 	const authorId = creator?.id;
 	if (!authorId) return true;
@@ -187,5 +196,6 @@ export function injectUserBubbleIsSelf(
 	extra.isSelf = resolveBubbleIsSelf(
 		(extra.creator as BubbleCreator | null | undefined) ?? null,
 		currentUserId,
+		(extra.originLabel as string | null | undefined) ?? null,
 	);
 }

@@ -14,7 +14,7 @@
  * borderless icon rather than a labelled badge.
  */
 
-import { Group, Paper, Text, Tooltip } from "@mantine/core";
+import { Avatar, Group, Paper, Text, Tooltip } from "@mantine/core";
 import {
 	type MessageOrigin,
 	type MessageOriginSource,
@@ -23,6 +23,7 @@ import {
 } from "@shared/message-origin";
 import {
 	IconApi,
+	IconBrain,
 	IconClock,
 	IconEye,
 	IconGitBranch,
@@ -48,6 +49,7 @@ const SOURCE_ICONS: Record<MessageOriginSource, typeof IconRobot> = {
 	gateway: IconPlugConnected,
 	oauth: IconApi,
 	recovery: IconRepeat,
+	planReflection: IconBrain,
 };
 
 const ORIGIN_FALLBACK_ICONS: Record<Exclude<MessageOrigin, "user">, typeof IconRobot> = {
@@ -207,5 +209,28 @@ export function SystemOriginNotice({
 				</Text>
 			) : null}
 		</Paper>
+	);
+}
+
+/**
+ * Avatar for a bubble authored by a non-human source that still speaks as a
+ * "user" turn (e.g. a plan approved by the plan reflection). Used when there
+ * is no real `creator` account to render — `UserAvatar` needs a username, so a
+ * source like `planReflection` gets a fixed icon avatar instead. Unknown
+ * sources render nothing so callers fall back to their existing behavior.
+ */
+export function OriginAvatar({
+	originLabel,
+	size = 20,
+}: {
+	originLabel?: string | null;
+	size?: number;
+}) {
+	const parsed = parseOriginLabel(originLabel);
+	if (parsed?.source !== "planReflection") return null;
+	return (
+		<Avatar size={size} radius="xl" color="grape" styles={{ placeholder: { lineHeight: 1 } }}>
+			<IconBrain size={Math.round(size * 0.7)} stroke={1.6} />
+		</Avatar>
 	);
 }

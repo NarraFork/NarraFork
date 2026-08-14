@@ -205,6 +205,94 @@ describe("buildPretextDocumentLayout", () => {
 			expect(item.sourceMessageIds.some((id) => id.startsWith("layout:"))).toBe(false);
 		}
 	});
+
+	// ── The pinned latest-tasks card ──────────────────────────────────────────
+	//
+	// The pin is derived HERE, from the messages being laid out — never accepted as a
+	// build option. The shell tracks its own copy for the task-board spinner, but that
+	// one is scanned over a different list, so a caller-supplied id could disagree with
+	// the document AND (being deliberately kept out of the build deps) never correct
+	// itself. These tests pin the derivation, not a passed-in value.
+	function tasksToolMessage(id: string, seq: number, toolUseId: string): NarratorMsg {
+		return {
+			...message(id, seq, "assistant", ""),
+			contentJson: [
+				{
+					type: "tool_use",
+					id: toolUseId,
+					name: "Write",
+					input: { file_path: "spec://tasks.json" },
+					status: "completed",
+				},
+			],
+			contentText: null,
+			toolCalls: [
+				{
+					toolUseId,
+					toolName: "Write",
+					inputJson: { file_path: "spec://tasks.json" },
+					status: "completed",
+				},
+			],
+		} as unknown as NarratorMsg;
+	}
+
+	const PIN_OPTIONS = {
+		layoutRevision: "layout-pin",
+		documentRevision: "pin",
+		widthBucket: "860",
+		contentWidth: 860,
+		topPadding: 16,
+		bottomPadding: 16,
+		gap: 4,
+	};
+
+	it("keeps the LATEST tasks card out of the low-LOD fold, deriving the id itself", () => {
+		// Two completed tasks writes: only the second may escape the fold. At L2 every
+		// completed call folds into a trace/count, so a standalone `tool-` item can only
+		// come from the pin.
+		const built = buildPretextDocumentLayout(
+			[
+				message("m0", 0, "user", "hello"),
+				tasksToolMessage("m1", 1, "tu-old"),
+				tasksToolMessage("m2", 2, "tu-new"),
+			],
+			{ ...PIN_OPTIONS, lod: 2 as const },
+		);
+		const keys = built.manifest.items.map((item) => item.itemKey);
+		expect(keys.some((key) => key.includes("tu-new"))).toBe(true);
+		// The superseded card is NOT pinned — it folds like any other completed call, so
+		// no standalone item carries its id.
+		expect(keys.some((key) => key.startsWith("tool-tu-old"))).toBe(false);
+	});
+
+	it("moves the pin when a newer tasks write lands (no stale id can persist)", () => {
+		const before = buildPretextDocumentLayout([tasksToolMessage("m1", 1, "tu-a")], {
+			...PIN_OPTIONS,
+			lod: 2 as const,
+		});
+		const after = buildPretextDocumentLayout(
+			[tasksToolMessage("m1", 1, "tu-a"), tasksToolMessage("m2", 2, "tu-b")],
+			{ ...PIN_OPTIONS, lod: 2 as const },
+		);
+		expect(before.manifest.items.some((i) => i.itemKey.includes("tu-a"))).toBe(true);
+		const afterKeys = after.manifest.items.map((item) => item.itemKey);
+		expect(afterKeys.some((key) => key.includes("tu-b"))).toBe(true);
+		expect(afterKeys.some((key) => key.startsWith("tool-tu-a"))).toBe(false);
+	});
+
+	it("leaves a document with no tasks write untouched (nothing pinned)", () => {
+		// The fold gate must be a no-op when the derivation finds nothing: a plain tool
+		// run at L2 keeps folding exactly as before.
+		const built = buildPretextDocumentLayout(historyFixture(40), {
+			...PIN_OPTIONS,
+			lod: 2 as const,
+		});
+		expect(built.manifest.items.length).toBeGreaterThan(0);
+		expect(built.manifest.items.some((item) => item.itemKey.startsWith("tool-tool-use-"))).toBe(
+			false,
+		);
+	});
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

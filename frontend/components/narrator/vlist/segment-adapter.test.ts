@@ -879,6 +879,72 @@ describe("adaptSegment — tool run", () => {
 		expect((specs[0]!.data as { count: number }).count).toBe(3);
 	});
 
+	it("the pinned latest-tasks card stays a full card while neighbours fold", () => {
+		const seg: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolUseId: "t-old", toolName: "Read", status: "completed" },
+				},
+				{
+					blockIndex: 1,
+					isSubagent: false,
+					tc: { toolUseId: "t-tasks", toolName: "Write", status: "completed" },
+				},
+				{
+					blockIndex: 2,
+					isSubagent: false,
+					tc: { toolUseId: "t-new", toolName: "Bash", status: "completed" },
+				},
+			],
+		};
+		const pin = { resolveLatestSpecTasksToolUseId: () => "t-tasks" };
+
+		// L2: the pinned call escapes the count fold; the rest still fold.
+		const l2 = adaptSegment(seg, { lod: 2, ...pin });
+		expect(l2.map((s) => s.kind)).toEqual(["tool-run-count", "tool-call", "tool-run-count"]);
+		expect(l2[1]!.key).toBe("tool-t-tasks");
+		expect(l2[1]!.opts?.forceExpanded).toBe(true);
+
+		// L3: same card escapes the summary fold.
+		const l3 = adaptSegment(seg, { lod: 3, ...pin });
+		expect(l3.map((s) => s.kind)).toEqual(["tool-run-summary", "tool-call", "tool-run-summary"]);
+
+		// No resolver → everything folds exactly as before.
+		const unpinned = adaptSegment(seg, { lod: 2 });
+		expect(unpinned).toHaveLength(1);
+		expect(unpinned[0]!.kind).toBe("tool-run-count");
+	});
+
+	it("L4 keeps every card full but still flags the pinned card forceExpanded", () => {
+		const seg: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolUseId: "t-tasks", toolName: "Write", status: "completed" },
+				},
+				{
+					blockIndex: 1,
+					isSubagent: false,
+					tc: { toolUseId: "t-other", toolName: "Bash", status: "completed" },
+				},
+			],
+		};
+		const specs = adaptSegment(seg, {
+			lod: 4,
+			resolveLatestSpecTasksToolUseId: () => "t-tasks",
+		});
+		expect(specs.map((s) => s.kind)).toEqual(["tool-call", "tool-call"]);
+		expect(specs[0]!.opts?.forceExpanded).toBe(true);
+		expect(specs[1]!.opts?.forceExpanded).toBeUndefined();
+	});
+
 	it("keeps active tools as standalone full cards even at low LOD", () => {
 		const seg: AdapterSegment = {
 			kind: "tool-run",

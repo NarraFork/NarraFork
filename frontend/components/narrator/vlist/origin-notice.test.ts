@@ -67,6 +67,21 @@ describe("adapter routing by origin", () => {
 		expect((specs[0]?.data as { kind: string }).kind).toBe("origin_notice");
 	});
 
+	test("a plan-reflection-approved turn stays a bubble (origin user + planReflection label)", () => {
+		// The plan reflection approves without a human, but the turn is persisted as
+		// `origin: "user"` so it still routes to the bubble branch — the
+		// `planReflection` label only drives the header identity / side, not the
+		// system-card routing. Painting it as an origin_notice would drop the
+		// "计划反思" header this feature exists to show.
+		const specs = adapt({ origin: "user", originLabel: "planReflection" });
+		expect(specs[0]?.kind).toBe("message-bubble");
+		// The adapter forwards origin/originLabel so the header can resolve the
+		// "计划反思" identity and the left-hand side (see segment-adapter).
+		const data = specs[0]?.data as { origin?: string; originLabel?: string };
+		expect(data.origin).toBe("user");
+		expect(data.originLabel).toBe("planReflection");
+	});
+
 	test("the heading is localizable through ctx.labels", () => {
 		const specs = adaptSegment(userMessage({ origin: "system", originLabel: "review" }), {
 			...CTX,

@@ -128,6 +128,13 @@ export type SideCarBody =
 			taskCount?: number;
 			/** `tooMany` only: the threshold that was exceeded. */
 			threshold?: number;
+			/**
+			 * Periodic digests only: the cadence (in completed tool calls) that raised
+			 * this reminder. Lets the reader-facing header say "每 N 次工具调用" so a
+			 * routine digest is distinguishable from a turn-end continuation at a
+			 * glance. Persisted with the block; absent on continuation/task rows.
+			 */
+			cadenceInterval?: number;
 	  }
 	/** Knowledge-base entries matched against recent output. */
 	| { kind: "knowledge"; hits: SideCarKnowledgeHit[] }

@@ -810,6 +810,14 @@ export interface MeasureToolCallOpts {
 	 * permission height is baked in here.
 	 */
 	hasPendingPermission?: boolean;
+	/**
+	 * True when the card is the pinned latest spec://tasks.json call (injected by
+	 * the adapter from the shell's resolver). Forces the card expanded at every
+	 * LOD — the task board is the narrator's live working state, which a reader at
+	 * a low LOD still wants on screen. The boolean folds into the measure cache
+	 * key via digestOpts, so the two geometries never share an entry.
+	 */
+	forceExpanded?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1066,6 +1074,9 @@ export function isRunningStatus(status: ToolCallStatus): boolean {
  * Derive the default expand state (mirrors ToolCallCard defaultOpen :5483). Used
  * only when `opts.opened` is undefined. Truncation nuances are omitted — this is
  * a best-effort default the caller can override.
+ *
+ * `pendingPermission` here is the merged force-expand flag: a live permission OR
+ * the pinned latest-tasks card (`opts.forceExpanded`) both arrive through it.
  */
 export function computeDefaultOpen(data: ToolCallData, pendingPermission: boolean): boolean {
 	if (pendingPermission) return true;
@@ -2083,7 +2094,7 @@ export function measureToolCall(
 	// a slot). Distinct from `pending` (the zero-DOM measure copy); either one
 	// forces the card expanded so the permission area shows.
 	const hasPendingPermission = opts.hasPendingPermission === true;
-	const forceExpanded = hasPending || hasPendingPermission;
+	const forceExpanded = hasPending || hasPendingPermission || opts.forceExpanded === true;
 
 	const innerWidth = toolCardInnerWidth(contentWidth, inRun);
 

@@ -69,6 +69,7 @@ import {
 	type TraceVariant,
 } from "../measure/measure-tool-run";
 import { categoryIcon } from "./category-icons";
+import { activateOnKey } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
 import {
@@ -343,26 +344,6 @@ const chevronSlotStyle: React.CSSProperties = {
 	flexShrink: 0,
 };
 
-/**
- * Enter / Space handler for a row whose only affordance is an `onClick` on a div.
- *
- * Every fold in this module is a plain `Group` with a click handler, which a keyboard
- * cannot reach and a screen reader does not announce. Paired with
- * `role="button" tabIndex={0}` at each call site; all of that is attributes only, so
- * the measured geometry is untouched.
- *
- * Space is `preventDefault`ed because its default action on a focused element is to
- * scroll the page — which in a virtual list moves the very rows being read.
- */
-function activateOnKey(activate: () => void) {
-	return (e: React.KeyboardEvent) => {
-		if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
-		e.preventDefault();
-		e.stopPropagation();
-		activate();
-	};
-}
-
 /** How long a one-shot outcome sweep stays on a row (600ms animation + a margin). */
 const ROW_FLASH_MS = 650;
 
@@ -587,6 +568,7 @@ function TraceRowView({
 		: undefined;
 	const titleRow = (
 		<Group
+			data-nf-trace-titlerow
 			gap={TRACE_ROW_GAP}
 			wrap="nowrap"
 			align="center"
@@ -700,7 +682,11 @@ function TraceRowView({
 	 */
 	const rowBody = (
 		<div style={{ position: "relative", height: row.blockHeight }}>
-			{titleRow}
+			{/* The summary title row is the card-header's morph SOURCE on drill-down:
+			    once the card is in, its own header occupies the same visual slot, so
+			    painting both would double the Name · summary line. Markdown bodies
+			    (reasoning steps) keep the row — there is no card to take it over. */}
+			{row.cardMeasured ? null : titleRow}
 
 			{/* Expanded markdown body (left-bordered, indented). */}
 			{row.expanded && row.body ? (
@@ -720,20 +706,17 @@ function TraceRowView({
 				</Box>
 			) : null}
 
-			{/* Drilled-in tool card. Same indented body box as the markdown branch, but
-			    the rail is neutral (grape is the reasoning lane's colour) and there is
-			    no dimming — this is the payload the reader explicitly asked for, and the
-			    card draws its own border + status tint. */}
+			{/* Drilled-in tool card. The card fills the WHOLE row block from its top
+			    (full row width, no indent rail): the summary row above is gone, and
+			    the card's own header morphs into its place. The measure layer reserved
+			    `blockHeight === card.height` for exactly this box. */}
 			{row.expanded && row.cardMeasured ? (
 				<Box
-					py={TRACE_BODY_PADDING_Y}
 					style={{
 						position: "absolute",
-						top: TRACE_ROW_HEIGHT,
+						top: 0,
 						left: 0,
 						right: 0,
-						paddingLeft: TRACE_BODY_PADDING_LEFT,
-						borderLeft: `${TRACE_BODY_BORDER_LEFT}px solid var(--mantine-color-dark-4)`,
 					}}
 				>
 					{rowCard?.(row) ?? null}
@@ -748,6 +731,10 @@ function TraceRowView({
 			// card carries at L3+, so the two renderings of one tool call can be paired
 			// across a level change. Height-neutral (a data attribute).
 			data-nf-unit={row.unitId}
+			// Per-ROW key so the header-morph controller can find THIS row's title line
+			// among the trace's many rows (a trace-level querySelector would return the
+			// first row's, which is the collapse-morph-wrong-row bug). Height-neutral.
+			data-nf-trace-row={row.key}
 			style={{
 				position: "absolute",
 				top: row.top,

@@ -15,7 +15,8 @@
 			"chatGroup": "Group chat",
 			"gateway": "IM gateway",
 			"oauth": "External app",
-			"recovery": "Session recovery"
+			"recovery": "Session recovery",
+			"planReflection": "Plan reflection"
 		}
 	},
 	"narrator": "Narrator",
@@ -1093,7 +1094,15 @@
 			"subagent_message": "Subagent message",
 			"spec_update": "Outline update",
 			"behavior_fence": "Behavior fence",
-			"pipeline_exit_confirmation": "Pipeline check"
+			"pipeline_exit_confirmation": "Pipeline check",
+			"spec_continuation": "Auto-continuation",
+			"spec_blocked_continuation": "Blocked continuation",
+			"spec_goal_added": "Goal added",
+			"spec_fork_carryover": "Outline carried over",
+			"spec_context_cleared": "Context cleared"
+		},
+		"cadence": {
+			"everyNTools": "every {{n}} tool calls"
 		},
 		"showAll": "Show all",
 		"attachedCount": "{{count}} system injection(s) attached",

@@ -587,6 +587,20 @@ export interface AdapterContext {
 	 */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
 	/**
+	 * The tool-use id of the MOST RECENT spec://tasks.json operation in the loaded
+	 * window (the same identity the chunked path's task-board spinner keys on).
+	 * That one card keeps its full expanded task board at every LOD — it never
+	 * folds into a summary/count batch and never collapses to a bare header at
+	 * L4 / old-L5.
+	 *
+	 * A resolver (not a snapshot) so the identity the shell tracks can move with
+	 * each rebuild without the adapter caching a stale value; the shell's closure
+	 * reads the current id at adapt time. Height-affecting (the card's expanded
+	 * geometry replaces a folded row's), resolved during adaptation like every
+	 * other interaction state.
+	 */
+	resolveLatestSpecTasksToolUseId?: () => string | null;
+	/**
 	 * Full (un-truncated) tool input / output for a tool use, once the shell has
 	 * fetched it.
 	 *
@@ -951,6 +965,13 @@ function adaptMessage(
 					hasHeader: true,
 					creator: msg.creator ?? null,
 					createdAt: msg.createdAt ?? null,
+					// Height-neutral attribution: the bubble header already reserves its
+					// row, so origin/originLabel only change what the header paints
+					// (name / avatar / badge), never the measured height or cache key.
+					// Forwarding these is what lets a plan-reflection-approved turn show
+					// the "计划反思" identity instead of falling back to "you" on the right.
+					origin: msg.origin ?? null,
+					originLabel: msg.originLabel ?? null,
 					...(commandText ? { commandText } : {}),
 					...(attachments.length > 0 ? { attachments } : {}),
 				},
@@ -1268,6 +1289,9 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceBufferedUser: "Buffered user message",
 	sidecarSourceSubagentMessage: "Subagent message",
 	sidecarSourceSpecUpdate: "Outline update",
+	// Periodic task-digest subtitle: carries the cadence ("every N tool calls") so a
+	// routine digest reads differently from a turn-end continuation in the header.
+	cadenceEveryNTools: "every {n} tool calls",
 };
 
 /** Resolve a system-card chrome label (injected i18n → English fallback). */
@@ -1814,6 +1838,17 @@ function adaptSpokenInjection(
 								// interpolation, so substitute here (same as the markdown path).
 								sysLabel(ctx, "tasksTooMany").replace("{n}", String(body.taskCount ?? 0))
 							: null;
+		// A periodic digest names its cadence in the header's subtitle slot, so the
+		// reader can tell "this is the routine every-N-tool-calls summary" apart from
+		// a turn-end continuation listing the same tasks. Height-neutral: the header
+		// row is a fixed single line either way.
+		const cadenceInterval =
+			typeof body.cadenceInterval === "number" && body.cadenceInterval > 0
+				? body.cadenceInterval
+				: null;
+		const speakerKind = cadenceInterval
+			? sysLabel(ctx, "cadenceEveryNTools").replace("{n}", String(cadenceInterval))
+			: null;
 		return [
 			{
 				kind: "injection-bubble",
@@ -1831,7 +1866,7 @@ function adaptSpokenInjection(
 						},
 					},
 					speaker: null,
-					speakerKind: null,
+					speakerKind,
 					isBroadcast: false,
 					source,
 					hasHeader: true,
@@ -2250,9 +2285,22 @@ type ToolLodGroup =
 	| { kind: "active"; item: AdapterToolItem; index: number }
 	| { kind: "folded"; items: AdapterToolItem[]; startIndex: number };
 
+/** True when an item is the pinned latest spec://tasks.json call (see AdapterContext). */
+function isLatestSpecTasksToolItem(
+	item: AdapterToolItem,
+	latestSpecTasksToolUseId: string | null | undefined,
+): boolean {
+	return latestSpecTasksToolUseId != null && item.tc.toolUseId === latestSpecTasksToolUseId;
+}
+
 /** Split a tool run into chronological groups: active items stay standalone,
- * completed items fold in contiguous batches. Mirrors groupToolRunItemsForLod. */
-export function groupToolItemsForLod(items: AdapterToolItem[]): ToolLodGroup[] {
+ * completed items fold in contiguous batches. Mirrors groupToolRunItemsForLod —
+ * including its second argument: the latest tasks.json call keeps its full card
+ * out of the fold at every LOD. */
+export function groupToolItemsForLod(
+	items: AdapterToolItem[],
+	latestSpecTasksToolUseId?: string | null,
+): ToolLodGroup[] {
 	const groups: ToolLodGroup[] = [];
 	let pending: AdapterToolItem[] = [];
 	let pendingStart = 0;
@@ -2264,7 +2312,7 @@ export function groupToolItemsForLod(items: AdapterToolItem[]): ToolLodGroup[] {
 	for (let i = 0; i < items.length; i++) {
 		const item = items[i];
 		if (!item) continue;
-		if (isActiveToolItem(item)) {
+		if (isActiveToolItem(item) || isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)) {
 			flush();
 			groups.push({ kind: "active", item, index: i });
 			continue;
@@ -2304,6 +2352,13 @@ function adaptToolItemFull(
 		opened === undefined && item.isSubagent && runContext.isSoleSubagent ? true : opened;
 	const lodUserOverride = ctx.isLodUserOverride?.(key) ?? false;
 	const hasPendingPermission = ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false;
+	// The latest tasks.json call stays expanded at every LOD (the task board is the
+	// narrator's live working state). Like the permission flag it folds into the
+	// card's opts, so the measure cache keys the two geometries apart.
+	const isPinnedSpecTasks = isLatestSpecTasksToolItem(
+		item,
+		ctx.resolveLatestSpecTasksToolUseId?.(),
+	);
 	const opts = {
 		isRecent: isRecentToolItem(item, ctx),
 		...(defaultOpened === undefined ? {} : { opened: defaultOpened }),
@@ -2314,6 +2369,9 @@ function adaptToolItemFull(
 		// Pending-permission cards stay expanded and re-measure when the request
 		// appears/disappears (the boolean folds into the measure cache key).
 		...(hasPendingPermission ? { hasPendingPermission: true } : {}),
+		// Same contract for the pinned tasks card: it never collapses to a header,
+		// even at L4 or as an older card at L5.
+		...(isPinnedSpecTasks ? { forceExpanded: true } : {}),
 		collapsesByLod:
 			!hasPendingPermission &&
 			!isActiveToolItem(item) &&
@@ -2914,6 +2972,9 @@ function foldedToolItems(
  *   - L≤2: completed batches fold into `tool-run-count`; active stay standalone.
  * (The cross-segment reasoning+tool→activity fold is applied earlier by the
  * caller's groupRenderUnits, producing an "activity" unit — see adaptActivityUnit.)
+ *
+ * The pinned latest tasks.json call counts as "active" for the grouping: it keeps
+ * its full expanded card at its original position at every LOD.
  */
 function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpec[] {
 	const isMultiRun = items.length >= 2;
@@ -2927,7 +2988,9 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 			}),
 		);
 	}
-	const groups = groupToolItemsForLod(items);
+	// Resolved once per run: the resolver is a shell closure over the latest id,
+	// and the grouping below only ever compares against it.
+	const groups = groupToolItemsForLod(items, ctx.resolveLatestSpecTasksToolUseId?.());
 	const specs: ElementSpec[] = [];
 	for (const group of groups) {
 		if (group.kind === "active") {

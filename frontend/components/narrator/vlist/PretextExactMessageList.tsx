@@ -111,6 +111,15 @@ import {
 } from "./vlist-content-view-target";
 import { installVListCopyHandler } from "./vlist-copy-text";
 import {
+	buildDrillSnapshots,
+	type DrillRowSnapshot,
+	diffDrillSnapshots,
+} from "./vlist-drill-morph";
+import {
+	createDrillMorphController,
+	prefersReducedMotion as prefersReducedMotionDrill,
+} from "./vlist-drill-morph-motion";
+import {
 	hasEditableTextBlock,
 	resolveVListEditedMeta,
 	resolveVListEditorWidth,
@@ -160,6 +169,11 @@ import {
 	resolvePinchLodStep,
 	resolveWheelLodStep,
 } from "./vlist-lod-gesture";
+import { buildLodSnapshots, diffLodSnapshots, type LodElementSnapshot } from "./vlist-lod-morph";
+import {
+	createLodMorphController,
+	prefersReducedMotion as prefersReducedMotionLod,
+} from "./vlist-lod-morph-motion";
 import { usePermissionSlots } from "./vlist-permission-bridge";
 import type { VListItem } from "./vlist-pipeline";
 import { createPointerDragTracker } from "./vlist-pointer-drag";
@@ -1969,6 +1983,35 @@ export const PretextExactMessageList = forwardRef<
 		(() => { geometry: Map<string, FoldRowGeometry>; documentRevision: number }) | null
 	>(null);
 	/**
+	 * Drill-down header morph (see vlist-drill-morph.ts).
+	 *
+	 * DECLARATIVE and diff-driven, not a click capture: after every committed rebuild
+	 * the layout effect below snapshots every visible trace row's drill state, diffs
+	 * it against the previous frame, and morphs each row whose drill flag flipped.
+	 * Any number of rows can flip in one frame (stacked activity), so the controller
+	 * is keyed per-row — there is no single-slot capture to overwrite. Pure data in
+	 * the ref, never React state, never the measure cache.
+	 */
+	const drillMorphRef = useRef(createDrillMorphController());
+	const drillMorphPrevRef = useRef<Map<string, DrillRowSnapshot>>(new Map());
+	/**
+	 * The document revision the last snapshot was taken under. A morph only plays when
+	 * two consecutive snapshots share a revision — a revision move means a live patch
+	 * / page / reload rebuilt the window, and diffing across it would animate a change
+	 * the reader did not make. The snapshot still rolls forward (see the effect).
+	 */
+	const drillMorphRevisionRef = useRef<number>(-1);
+	/**
+	 * LOD-switch morph (see vlist-lod-morph.ts). Diff-driven off the committed layout,
+	 * keyed by `unitId` — the one identity that survives a level switch. The snapshot
+	 * rolls forward every commit so the next diff has a clean baseline; a morph only
+	 * plays when the document revision is unchanged AND the lod moved (pure re-theme).
+	 */
+	const lodMorphRef = useRef(createLodMorphController());
+	const lodMorphPrevRef = useRef<Map<string, LodElementSnapshot> | null>(null);
+	const lodMorphLodRef = useRef<number>(-1);
+	const lodMorphDocRevRef = useRef<number>(-1);
+	/**
 	 * Snapshot the mounted rows' current geometry so the commit this click produces
 	 * can be animated from it.
 	 *
@@ -2034,6 +2077,10 @@ export const PretextExactMessageList = forwardRef<
 					// A key means the element folds a LIVE row list, where a reasoning step
 					// arriving above the reader's row makes the index they clicked address a
 					// different tool one frame later (see expandedTraceRows).
+					//
+					// No morph capture here: the drill-down header morph is diff-driven off
+					// the committed rebuild (see the drill-morph layout effect), so this
+					// handler only flips the interaction state — nothing to record.
 					if (rowKey !== undefined) {
 						setInteraction((prev) => toggleVListTraceRow(prev, key, rowKey));
 						return;
@@ -2141,6 +2188,16 @@ export const PretextExactMessageList = forwardRef<
 			toolUseId ? pendingPermissionToolUseIds.has(toolUseId) : false,
 		[pendingPermissionToolUseIds],
 	);
+	// ⚠️ The pinned latest-tasks card is NOT resolved here.
+	//
+	// The shell tracks its own `latestSpecTasksToolUseId` (the `LatestTodosToolUseIdCtx`
+	// value the chunked path's task-board spinner keys on), and passing it down as a
+	// build option was tempting. It would be wrong: the shell's value is derived from a
+	// DIFFERENT message list (the tail-meta scan) than the one the layout builds over
+	// (persisted window + live streaming row), so the two can disagree — and a value
+	// deliberately kept out of the build deps could never correct itself once stale.
+	// `buildPretextDocumentLayout` therefore derives the id itself, from exactly the
+	// messages it is laying out, using the same rule (`vlist-spec-tasks-pin.ts`).
 	// Plan bodies carried by pending ExitPlanMode permissions. A file-based plan is
 	// resolved server-side into the permission payload and never enters the streamed
 	// tool_use input, so the card's own inputJson stays empty until a reload. The Map
@@ -2895,6 +2952,163 @@ export const PretextExactMessageList = forwardRef<
 	// narrator mid-transition), so the controller is stopped explicitly on unmount.
 	useEffect(() => {
 		const controller = foldMotionRef.current;
+		return () => controller.cancel();
+	}, []);
+
+	/**
+	 * Play drill-down header morphs, driven by a row-level diff of the committed
+	 * rebuild.
+	 *
+	 * DECLARATIVE, not a click capture: every commit rebuilds a snapshot of each
+	 * visible trace row's drill state, diffs it against the previous frame, and
+	 * morphs each row whose drill flag flipped. Any number of rows can flip in one
+	 * frame (stacked activity), and the per-row controller plays them all without one
+	 * overwriting another — the failure mode of the old single-slot capture.
+	 *
+	 * A LAYOUT effect (same discipline as the fold above): it must run in the same
+	 * frame the rebuild commits, before paint. All geometry is pure layout/measured
+	 * arithmetic — no DOM measurement, no React state.
+	 */
+	useLayoutEffect(() => {
+		const node = viewportRef.current;
+		const layout = exactLayoutRef.current;
+		if (!node || !layout) return;
+		// Assemble the visible traces' row-level sources from the layout + measured
+		// payloads. Only kinds that actually nest a drill-down card can flip.
+		const items = renderItemsRef.current;
+		const window = visibleRef.current;
+		const traces: {
+			traceKey: string;
+			top: number;
+			rows: {
+				key: string;
+				top: number;
+				drilled: boolean;
+				drillHeader: { top: number; height: number } | null;
+			}[];
+		}[] = [];
+		for (let index = window.start; index < window.end; index++) {
+			const item = items[index];
+			const geo = layout.items[index];
+			if (!item || !geo) continue;
+			const measured = measuredByKeyRef.current.get(item.spec.key) as
+				| {
+						rows?: {
+							key: string;
+							top: number;
+							cardMeasured: unknown | null;
+							drillHeader: { top: number; height: number } | null;
+						}[];
+				  }
+				| undefined;
+			if (!measured?.rows) continue;
+			traces.push({
+				traceKey: item.spec.key,
+				top: geo.top,
+				rows: measured.rows.map((r) => ({
+					key: r.key,
+					top: r.top,
+					drilled: r.cardMeasured != null,
+					drillHeader: r.drillHeader,
+				})),
+			});
+		}
+		const next = buildDrillSnapshots(traces, node.scrollTop);
+		const prev = drillMorphPrevRef.current;
+		// Only morph across a USER-driven fold: if the document revision moved, a live
+		// patch / page / reload rebuilt the window and the diff would mix the reader's
+		// toggle with a change they did not make. The snapshot still rolls forward so
+		// the NEXT diff has a clean baseline.
+		const revisionUnchanged =
+			foldRevisionOf(foldDocumentRevision) === drillMorphRevisionRef.current;
+		drillMorphRevisionRef.current = foldRevisionOf(foldDocumentRevision);
+		drillMorphPrevRef.current = next;
+		if (!revisionUnchanged || prefersReducedMotionDrill()) return;
+		const plans = diffDrillSnapshots(prev, next);
+		if (plans.length === 0) return;
+		drillMorphRef.current.playAll(plans, (rowUid) => {
+			const sep = rowUid.indexOf("::");
+			const traceKey = rowUid.slice(0, sep);
+			const rowKey = rowUid.slice(sep + 2);
+			const plan = plans.find((p) => p.rowUid === rowUid);
+			const rowNode = node.querySelector<HTMLElement>(
+				`[data-nf-row-key="${cssAttrEscape(traceKey)}"]`,
+			);
+			const toggled = rowNode?.querySelector<HTMLElement>(
+				`[data-nf-trace-row="${cssAttrEscape(rowKey)}"]`,
+			);
+			return toggled?.querySelector<HTMLElement>(
+				plan?.kind === "collapse" ? "[data-nf-trace-titlerow]" : "[data-nf-card-header]",
+			);
+		});
+	});
+
+	// The morph outlives the click for the same reason the fold does; stop it on
+	// unmount so no animation outlives the list.
+	useEffect(() => {
+		const controller = drillMorphRef.current;
+		return () => controller.cancel();
+	}, []);
+
+	/**
+	 * Play LOD-switch morphs, driven by an element-level diff keyed by `unitId`.
+	 *
+	 * An LOD switch re-themes every element into a different component (a card folds
+	 * into a trace row, a row expands into a card), minting new spec keys/kinds — so
+	 * neither the fold (`spec.key`) nor the drill morph (`traceKey::rowKey`) can pair
+	 * across it. What survives is `unitId`. This effect snapshots every unitId-bearing
+	 * element in the viewport×3 window, diffs against the previous commit, and morphs
+	 * each pair from its old screen position to its new one — all in one frame.
+	 *
+	 * Gate: the morph only plays when the document revision is UNCHANGED and the lod
+	 * MOVED (a pure re-theme). A revision move means a live patch / page / reload
+	 * rebuilt the window; diffing across it would animate a change the reader did not
+	 * make. The snapshot rolls forward either way so the next diff has a clean
+	 * baseline. Pure layout arithmetic throughout — no DOM measurement, no React state.
+	 */
+	useLayoutEffect(() => {
+		const node = viewportRef.current;
+		const layout = exactLayoutRef.current;
+		if (!node || !layout) return;
+		const items = renderItemsRef.current;
+		const scrollTop = node.scrollTop;
+		const vh = viewportHeightRef.current;
+		// Assemble the unitId-bearing elements straight from the layout + specs. The
+		// whole committed document is read here (geometry is O(n) plain numbers, cheap);
+		// the viewport×3 crop happens inside buildLodSnapshots.
+		const elements: { unitId: string | null | undefined; top: number; height: number }[] = [];
+		for (let index = 0; index < items.length; index++) {
+			const item = items[index];
+			const geo = layout.items[index];
+			if (!item || !geo) continue;
+			elements.push({ unitId: item.spec.unitId, top: geo.top, height: geo.height });
+		}
+		const next = buildLodSnapshots(elements, scrollTop, vh);
+		const prev = lodMorphPrevRef.current;
+		const docRev = foldRevisionOf(foldDocumentRevision);
+		const lod = pretextDocument.manifest?.lod ?? -1;
+		const isLodSwitch =
+			prev != null &&
+			lodMorphDocRevRef.current === docRev &&
+			lodMorphLodRef.current !== -1 &&
+			lodMorphLodRef.current !== lod;
+		// Roll forward BEFORE the early returns, so the next diff compares against this
+		// frame even when the morph is skipped (non-LOD rebuild, reduced motion, first
+		// paint).
+		lodMorphPrevRef.current = next;
+		lodMorphDocRevRef.current = docRev;
+		lodMorphLodRef.current = lod;
+		if (!isLodSwitch || prefersReducedMotionLod()) return;
+		const plans = diffLodSnapshots(prev, next);
+		if (plans.length === 0) return;
+		lodMorphRef.current.playAll(plans, (unitId) =>
+			node.querySelector<HTMLElement>(`[data-nf-unit="${cssAttrEscape(unitId)}"]`),
+		);
+	});
+
+	// Stop LOD morphs on unmount, same discipline as the other controllers.
+	useEffect(() => {
+		const controller = lodMorphRef.current;
 		return () => controller.cancel();
 	}, []);
 
