@@ -1839,7 +1839,12 @@ export class AnthropicProvider implements ProviderAdapter {
 			}
 		}
 
-		if (text) {
+		// Whitespace-only text is rejected upstream ("text content blocks must
+		// contain non-whitespace text"), and because the block lands in replayed
+		// history every later turn fails at the same index — the conversation is
+		// permanently wedged, exactly like the empty-thinking case above. A plain
+		// truthiness check is not enough: it stops "" but passes " " and "\n".
+		if (text?.trim()) {
 			// Use the real textOutputIndex when available; otherwise place text
 			// after reasoning blocks but before tool_use blocks.
 			const fallbackIdx = indexed.length;
