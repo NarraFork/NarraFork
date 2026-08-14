@@ -331,6 +331,33 @@ describe("LocalProcessRunner", () => {
 		await handle.exited;
 	});
 
+	it("delivers buffered stdout frames before notifying process exit", async () => {
+		const raw = makeRawProcess();
+		const events: string[] = [];
+		const runner = new LocalProcessRunner({
+			spawn: () => raw.process,
+			allowUnboundedResourceUsage: true,
+		});
+		const handle = await runner.start({ command: ["fixture"], cwd: fixtureCwd });
+		handle.onMessage((message) => {
+			if ("id" in message) events.push(`message:${String(message.id)}`);
+		});
+		handle.onExit((exitCode) => events.push(`exit:${exitCode}`));
+
+		raw.pushStdout(
+			encodeContentLengthFrame({
+				jsonrpc: "2.0",
+				id: "tail",
+				result: { ok: true },
+			}),
+		);
+		raw.finish(0);
+
+		await handle.exited;
+		await eventually(() => events.length === 2);
+		expect(events).toEqual(["message:tail", "exit:0"]);
+	});
+
 	it("keeps stderr in a bounded ring and kills on stdout output limit", async () => {
 		const raw = makeRawProcess();
 		const errors: Error[] = [];

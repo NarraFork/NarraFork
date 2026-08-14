@@ -141,6 +141,7 @@ type PermissionSeed = {
 	input: Record<string, unknown>;
 	permissionMode?: "default" | "bypassPermissions";
 	relaxedPlan?: boolean;
+	variant?: string;
 	traits?: string[];
 	planFileId?: string;
 	executionDeviceId?: string;
@@ -156,6 +157,7 @@ async function seedPermissionRequest(seed: PermissionSeed): Promise<void> {
 		id: seed.narratorId,
 		permissionMode: seed.permissionMode ?? "default",
 		relaxedPlan: seed.relaxedPlan ?? false,
+		variant: seed.variant,
 		traits: seed.traits,
 		planFileId: seed.planFileId,
 		parentNarratorId: seed.parentNarratorId,
@@ -1563,6 +1565,68 @@ describe("OAuth remote runtime permission constraints", () => {
 });
 
 describe("subagent permission routing identity", () => {
+	test.each([
+		"subagent:explore",
+		"subagent:plan",
+	])("%s fails closed for stale Write/Edit calls without redirecting the path", async (variant) => {
+		const backend = makeRemoteRuntimeBackend({
+			deviceId: `readonly-${variant.split(":")[1]}`,
+			defaultCwd: "/workspace",
+		});
+		for (const toolName of ["Write", "Edit"] as const) {
+			const suffix = `${variant.split(":")[1]}-${toolName.toLowerCase()}`;
+			const readOnlyNarratorId = `readonly-${suffix}`;
+			const readOnlyToolUseId = `readonly-tool-use-${suffix}`;
+			const input =
+				toolName === "Write"
+					? { file_path: "/workspace/source.ts", content: "changed" }
+					: {
+							file_path: "/workspace/source.ts",
+							old_string: "before",
+							new_string: "after",
+						};
+			await seedPermissionRequest({
+				narratorId: readOnlyNarratorId,
+				messageId: `readonly-message-${suffix}`,
+				toolCallId: `readonly-call-${suffix}`,
+				toolUseId: readOnlyToolUseId,
+				toolName,
+				input,
+				permissionMode: "bypassPermissions",
+				variant,
+			});
+
+			let resolvedInput: Record<string, unknown> | undefined;
+			const result = await handlePermission(
+				readOnlyNarratorId,
+				new AbortController().signal,
+				toolName,
+				input,
+				readOnlyToolUseId,
+				"/workspace",
+				"en",
+				undefined,
+				{
+					executionBackend: backend,
+					executionTarget: frozenTarget(backend, {
+						cwd: "/workspace",
+						path: "/workspace/source.ts",
+					}),
+					onInputResolved: async (value) => {
+						resolvedInput = value;
+					},
+				},
+			);
+
+			expect(result).toMatchObject({
+				behavior: "deny",
+				message: expect.stringContaining("Read-only explore/plan subagents"),
+			});
+			expect(resolvedInput).toBeUndefined();
+			expect(pendingPermissions.size).toBe(0);
+		}
+	});
+
 	test("permission request/resolved 和 pending state 携带 owner/subagent/parentToolUseId", async () => {
 		const parentNarratorId = "permission-parent";
 		const subagentNarratorId = "permission-subagent";

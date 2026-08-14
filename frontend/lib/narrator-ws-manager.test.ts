@@ -405,6 +405,103 @@ describe("message version tracking", () => {
 });
 
 describe("structural catch-up state", () => {
+	test("keeps the first REST snapshot coordinate isolated from newer shared state", () => {
+		const manager = new NarratorWSManager();
+		manager.updateCatchUpCursor("n1", { parentLastMessageId: "shared-new" });
+		manager.updateMessageVersion("n1", 9);
+		const handle = manager.subscribe(["n1"], {
+			kind: "messages",
+			initialMessageSnapshot: {
+				cursor: { parentLastMessageId: "snapshot-old" },
+				messageVersion: 7,
+			},
+		});
+		const sent: Array<Record<string, unknown>> = [];
+		const internals = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			_sendSubscribe: (subscription: typeof handle, narratorIds: string[]) => void;
+		};
+		internals.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+
+		internals._sendSubscribe(handle, ["n1"]);
+		internals._sendSubscribe(handle, ["n1"]);
+
+		expect(sent[0]).toMatchObject({
+			catchUpCursor: { parentLastMessageId: "snapshot-old" },
+			version: 7,
+		});
+		expect(sent[1]).toMatchObject({
+			catchUpCursor: { parentLastMessageId: "shared-new" },
+			version: 9,
+		});
+	});
+
+	test("does not fill a missing snapshot half from shared state", () => {
+		const manager = new NarratorWSManager();
+		manager.updateCatchUpCursor("n1", { parentLastMessageId: "shared" });
+		manager.updateMessageVersion("n1", 9);
+		const cursorOnly = manager.subscribe(["n1"], {
+			kind: "messages",
+			initialMessageSnapshot: { cursor: { parentLastMessageId: "snapshot" } },
+		});
+		const versionOnly = manager.subscribe(["n1"], {
+			kind: "messages",
+			initialMessageSnapshot: { messageVersion: 7 },
+		});
+		const sent: Array<Record<string, unknown>> = [];
+		const internals = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			_sendSubscribe: (
+				subscription: typeof cursorOnly | typeof versionOnly,
+				narratorIds: string[],
+			) => void;
+		};
+		internals.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+
+		internals._sendSubscribe(cursorOnly, ["n1"]);
+		internals._sendSubscribe(versionOnly, ["n1"]);
+
+		expect(sent[0].catchUpCursor).toEqual({ parentLastMessageId: "snapshot" });
+		expect(sent[0]).not.toHaveProperty("version");
+		expect(sent[1].version).toBe(7);
+		expect(sent[1]).not.toHaveProperty("catchUpCursor");
+	});
+
+	test("retains the initial snapshot until an OPEN socket actually sends it", () => {
+		const manager = new NarratorWSManager();
+		const handle = manager.subscribe(["n1"], {
+			kind: "messages",
+			initialMessageSnapshot: {
+				cursor: { parentLastMessageId: "snapshot" },
+				messageVersion: 3,
+			},
+		});
+		const sent: Array<Record<string, unknown>> = [];
+		const internals = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			_sendSubscribe: (subscription: typeof handle, narratorIds: string[]) => void;
+		};
+		internals.ws = { readyState: WebSocket.CLOSED, send: () => {} };
+		internals._sendSubscribe(handle, ["n1"]);
+		internals.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+		internals._sendSubscribe(handle, ["n1"]);
+
+		expect(sent).toHaveLength(1);
+		expect(sent[0]).toMatchObject({
+			catchUpCursor: { parentLastMessageId: "snapshot" },
+			version: 3,
+		});
+	});
+
 	test("seeds subscribe and sync_check with only the canonical catch-up cursor", () => {
 		const manager = new NarratorWSManager();
 		const cursor = {

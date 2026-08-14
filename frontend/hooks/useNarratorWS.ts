@@ -17,6 +17,7 @@ import type {
 } from "../lib/api";
 import {
 	type ListenerHandle,
+	type NarratorMessageSnapshot,
 	type NarratorSubscriptionKind,
 	narratorWSManager,
 	type SubscriptionHandle,
@@ -711,7 +712,7 @@ interface NarratorWSCallbacks {
 export function useNarratorWS(
 	narratorId: string | undefined,
 	callbacks: NarratorWSCallbacks,
-	initialCatchUpCursor?: CatchUpCursor,
+	initialMessageSnapshot?: NarratorMessageSnapshot,
 	options?: {
 		kind?: NarratorSubscriptionKind;
 		excludeTypes?: readonly string[];
@@ -728,24 +729,24 @@ export function useNarratorWS(
 		callbacksOwnerRef.current.callbacks = callbacks;
 	}
 	const subscriptionKind = options?.kind ?? "messages";
-	const initialCatchUpCursorRef = useRef<{
+	const initialMessageSnapshotRef = useRef<{
 		narratorId: string | undefined;
-		cursor: CatchUpCursor | undefined;
-	}>({ narratorId, cursor: initialCatchUpCursor });
-	if (initialCatchUpCursorRef.current.narratorId !== narratorId) {
+		snapshot: NarratorMessageSnapshot | undefined;
+	}>({ narratorId, snapshot: initialMessageSnapshot });
+	if (initialMessageSnapshotRef.current.narratorId !== narratorId) {
 		// Reset synchronously so the first subscription frame for a new narrator can
-		// never inherit the previous narrator's cursor.
-		initialCatchUpCursorRef.current = { narratorId, cursor: initialCatchUpCursor };
-	} else if (initialCatchUpCursor !== undefined) {
-		initialCatchUpCursorRef.current.cursor = initialCatchUpCursor;
+		// never inherit either half of the previous narrator's snapshot coordinate.
+		initialMessageSnapshotRef.current = { narratorId, snapshot: initialMessageSnapshot };
+	} else if (initialMessageSnapshot !== undefined) {
+		initialMessageSnapshotRef.current.snapshot = initialMessageSnapshot;
 	}
 	useEffect(() => {
-		if (narratorId && initialCatchUpCursor !== undefined) {
+		if (narratorId && initialMessageSnapshot?.cursor !== undefined) {
 			// Tail content commonly arrives after the subscription effect. Seed the
 			// manager for reconnect/sync frames without restarting the subscription.
-			narratorWSManager.seedCatchUpCursor(narratorId, initialCatchUpCursor);
+			narratorWSManager.seedCatchUpCursor(narratorId, initialMessageSnapshot.cursor);
 		}
-	}, [initialCatchUpCursor, narratorId]);
+	}, [initialMessageSnapshot, narratorId]);
 
 	const [connected, setConnected] = useState(narratorWSManager.connected);
 	const [disconnected, setDisconnected] = useState(narratorWSManager.disconnected);
@@ -756,11 +757,13 @@ export function useNarratorWS(
 		const subscribedId = narratorId;
 		const callbackOwner = callbacksOwnerRef.current;
 
+		const initialSnapshot =
+			initialMessageSnapshotRef.current.narratorId === subscribedId
+				? initialMessageSnapshotRef.current.snapshot
+				: undefined;
 		const subHandle: SubscriptionHandle = narratorWSManager.subscribe([subscribedId], {
-			catchUpCursor:
-				initialCatchUpCursorRef.current.narratorId === subscribedId
-					? initialCatchUpCursorRef.current.cursor
-					: undefined,
+			catchUpCursor: initialSnapshot?.cursor,
+			initialMessageSnapshot: initialSnapshot,
 			kind: subscriptionKind,
 		});
 

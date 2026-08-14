@@ -1008,6 +1008,35 @@ export class PluginToolRegistry {
 					diagnosticId: (denied as { diagnosticId?: unknown } | undefined)?.diagnosticId,
 					contextKeys: host ? Object.keys(host) : undefined,
 				});
+				// CONTEXT_UNAVAILABLE / INVALID_CONTEXT means the broker could not
+				// resolve a runtime binding — the plugin process is not running
+				// (or its binding was torn down), NOT that a permission was
+				// denied. Reporting it as "capability denied" sends the user
+				// chasing grants that are perfectly fine. Surface the real cause
+				// and mark it retryable so the caller can re-activate and retry.
+				const contextUnavailable =
+					denied?.code === "CONTEXT_UNAVAILABLE" ||
+					(denied as { reason?: unknown } | undefined)?.reason === "INVALID_CONTEXT";
+				if (contextUnavailable) {
+					const runtime = this.resolveRuntime?.(
+						entry.descriptor.pluginId,
+						entry.descriptor.contributionId,
+					);
+					if (!runtime) {
+						throw new PluginToolRegistryError(
+							"HOST_UNAVAILABLE",
+							`Plugin runtime is not active for ${entry.descriptor.pluginId}; ` +
+								"the tool call was not authorized because no runtime binding exists",
+							true,
+						);
+					}
+					throw new PluginToolRegistryError(
+						"HOST_UNAVAILABLE",
+						`Plugin runtime binding is missing for ${entry.descriptor.pluginId} ` +
+							"even though the runtime is reported active; retry after re-activation",
+						true,
+					);
+				}
 				throw new PluginToolRegistryError(
 					authorization.error?.code ?? "PERMISSION_DENIED",
 					"Capability broker denied the plugin tool call",

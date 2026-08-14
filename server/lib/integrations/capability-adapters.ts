@@ -132,6 +132,18 @@ export const PLUGIN_CAPABILITY_ADAPTER = {
 		descriptorId: "narrator.spec_task.add",
 		visibility: "integration",
 	},
+	"command.narrator.spec_behavior_fence_update": {
+		descriptorId: "narrator.spec_behavior_fence.update",
+		visibility: "integration",
+	},
+	"command.narrator.update_profile": {
+		descriptorId: "narrator.update_profile",
+		visibility: "integration",
+	},
+	"command.narrator.spec_write": {
+		descriptorId: "narrator.spec_write",
+		visibility: "integration",
+	},
 	"command.narrator.interrupt": {
 		descriptorId: "narrator.interrupt",
 		visibility: "integration",

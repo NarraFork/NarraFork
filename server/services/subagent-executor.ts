@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters } from "../db/schema";
@@ -30,7 +29,6 @@ import {
 } from "../lib/settings";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import { type ImageRef, saveTextFileToWorktree, type TextFileRef } from "../lib/uploads";
-import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { CustomSubagentDef } from "./custom-subagent-service";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
@@ -63,11 +61,6 @@ import {
 	unregisterActiveSubagent,
 } from "./narrator-session-state";
 import { buildSpecTaskDigestBody } from "./spec-reminder";
-import {
-	deleteConclusionFileId,
-	resolveConclusionFilePath,
-	setConclusionFileId,
-} from "./subagent-conclusion";
 import { clearTeamInbox, drainTeamInbox } from "./subagent-team";
 import { resolveToolFilter } from "./subagent-tools";
 import { resolveEffectiveTraits } from "./trait-layer-service";
@@ -699,14 +692,6 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	let transientRetries = 0;
 	// Consecutive completion-limit / resumable-error continuations.
 	let interruptionRetries = 0;
-
-	// Conclusion file for explore/plan subagents — Write/Edit are restricted to this file.
-	// The file content is read after the loop finishes and used as finalText.
-	const isReadOnlySubagent = subagentType === "explore" || subagentType === "plan";
-	const conclusionFileId = isReadOnlySubagent ? generateWordSlug() : undefined;
-	if (conclusionFileId) {
-		setConclusionFileId(narratorId, conclusionFileId, cwd);
-	}
 
 	// Compact-done flag: set by onCompactDone, consumed by onBeforeTurn to
 	// rebuild history/systemPrompt within the same agent loop (inner path).
@@ -1479,29 +1464,6 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		const rebuilt = await loadSubagentHistory(narratorId, model, resolvedProvider, null);
 		history = rebuilt.history;
 		trailingToolResults = rebuilt.trailingToolResults;
-	}
-
-	// Read conclusion file for explore/plan subagents.
-	// If the subagent wrote to the designated conclusion file, use its content as finalText.
-	if (conclusionFileId) {
-		const conclusionPath = resolveConclusionFilePath(cwd, conclusionFileId);
-		deleteConclusionFileId(narratorId);
-		try {
-			if (existsSync(conclusionPath)) {
-				const content = readFileSync(conclusionPath, "utf-8").trim();
-				if (content && !hasError) {
-					finalText = content;
-				}
-				// Clean up the temporary conclusion file
-				rmSync(conclusionPath, { force: true });
-			}
-		} catch (err) {
-			logger.warn("Failed to read/cleanup conclusion file", {
-				narratorId,
-				conclusionPath,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
 	}
 
 	// Backfill an empty result when the run ended cleanly but left no in-memory

@@ -10,7 +10,7 @@ import { settings } from "@server/lib/settings";
 import { type CustomSubagentDef, customSubagentService } from "./custom-subagent-service";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 
-/** Tools available to explore/plan subagents (read + search + shell + conclusion file write) */
+/** Tools available to explore/plan subagents (strictly read-only). */
 const EXPLORE_PLAN_TOOLS = new Set([
 	"Read",
 	"Glob",
@@ -18,8 +18,6 @@ const EXPLORE_PLAN_TOOLS = new Set([
 	"WebSearch",
 	"WebFetch",
 	SHELL_TOOL_NAME,
-	"Write",
-	"Edit",
 	"TeamStatus",
 	"Await",
 	"ContextAsk",
@@ -45,8 +43,8 @@ const REVIEW_TOOLS = new Set([
 /** Tools that are never available inside subagents. */
 const DISALLOWED_SUBAGENT_TOOLS = new Set(["AskUserQuestion"]);
 
-/** Tools available to general subagents (EXPLORE_PLAN_TOOLS + non-interactive helpers, no nesting/plan/forking) */
-const GENERAL_TOOLS = new Set([...EXPLORE_PLAN_TOOLS, "Skill"]);
+/** Tools available to general subagents (read/write + non-interactive helpers, no nesting/plan/forking). */
+const GENERAL_TOOLS = new Set([...EXPLORE_PLAN_TOOLS, "Write", "Edit", "Skill"]);
 
 function isBuiltinToolAllowedForSubagent(toolName: string): boolean {
 	return !DISALLOWED_SUBAGENT_TOOLS.has(toolName);

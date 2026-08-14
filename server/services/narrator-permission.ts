@@ -47,7 +47,11 @@ import {
 } from "../lib/boolean-override";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
+import {
+	isPlanModeTrait,
+	isReadOnlySubagentVariant,
+	isSubagentVariant,
+} from "../lib/narrator-utils";
 import type { DeviceAccessPolicy } from "../lib/oauth-client-policy";
 import { resolveEffectiveRelaxedPlan } from "../lib/permission-modes";
 import {
@@ -113,11 +117,6 @@ import { broadcastReflectionFrame } from "./reflection-broadcast";
 import { SPEC_TASKS_PATH } from "./spec-task-service";
 import { specVfsService } from "./spec-vfs-service";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
-import {
-	getConclusionEntry,
-	getConclusionFileId,
-	resolveConclusionFilePath,
-} from "./subagent-conclusion";
 
 // === Permission handling ===
 
@@ -444,7 +443,6 @@ export function resolvePermissionDecision(
 		isChapter = false,
 		planFileId,
 		planFilePath: designatedPlanFilePath,
-		conclusionFileId,
 		relaxedPlan = false,
 		planMode = false,
 		meta,
@@ -643,24 +641,6 @@ export function resolvePermissionDecision(
 	if (toolName === "Recall") {
 		if (input.all_narrators !== true) return "allow";
 		return "ask";
-	}
-
-	// Conclusion file: always allow Write/Edit targeting the designated conclusion file,
-	// regardless of permission mode. This handles the fallback case where the conclusion
-	// file lives outside cwd (e.g. ~/.narrafork/conclusions/) because cwd is read-only.
-	if (conclusionFileId && (toolName === "Write" || toolName === "Edit")) {
-		const filePath = typeof input.file_path === "string" ? input.file_path : "";
-		if (filePath) {
-			const absPath =
-				(context && executionTargetPolicyPath(context)) ??
-				resolveDecisionPath(cwd, filePath, context);
-			const conclusionPath = resolveDecisionPath(
-				cwd,
-				resolveConclusionFilePath(cwd, conclusionFileId),
-				context,
-			);
-			if (decisionPaths(context).equals(absPath, conclusionPath)) return "allow";
-		}
 	}
 
 	// readOnly mode
@@ -940,7 +920,6 @@ export interface PermissionDecisionOpts {
 	 */
 	planFilePath?: string;
 	planMode?: boolean;
-	conclusionFileId?: string;
 	whitelistDirs?: WhitelistDir[];
 	blacklistDirs?: BlacklistDir[];
 	commandWhitelist?: CommandWhitelistEntry[];
@@ -3482,6 +3461,20 @@ export async function handlePermission(
 	const isPlanMode = runtimeConstraint ? false : isPlanModeTrait(narrator?.traits);
 	const isChapter = !!narrator?.chapterId;
 
+	// Explore/plan subagents are a hard read-only boundary. Fail closed even if a stale
+	// provider tool schema or forged tool call bypasses the subagent tool filter.
+	if (
+		typeof narrator?.variant === "string" &&
+		isReadOnlySubagentVariant(narrator.variant) &&
+		(toolName === "Write" || toolName === "Edit")
+	) {
+		return {
+			behavior: "deny",
+			message:
+				"Read-only explore/plan subagents cannot write or edit files. Return findings in the final response so the caller can perform any requested file changes.",
+		};
+	}
+
 	let effectiveInput = input;
 	let exitPlanResolvedFromFile = false;
 	let exitPlanSource: PendingPlanSource | undefined;
@@ -3641,6 +3634,7 @@ export async function handlePermission(
 		}
 	}
 
+<<<<<<< HEAD
 	// Conclusion file redirect
 	let conclusionRedirectNotice: string | undefined;
 	const subagentConcEntry = getConclusionEntry(narratorId);
@@ -3752,7 +3746,6 @@ export async function handlePermission(
 	await options?.onInputResolved?.(effectiveInput);
 
 	const permMeta: PermissionDecisionMeta = {};
-	const conclusionFileId = getConclusionFileId(narratorId);
 
 	// Bash await/stop are pure control operations — skip full permission analysis
 	if (isBashControlOp) {
@@ -3794,7 +3787,6 @@ export async function handlePermission(
 					planFileId,
 					planFilePath: designatedPlanFilePath,
 					planMode: isPlanMode,
-					conclusionFileId,
 					compiledPolicy,
 					executionContext,
 					relaxedPlan: isRelaxedPlan,
@@ -4082,11 +4074,7 @@ export async function handlePermission(
 		return {
 			behavior: "allow",
 			updatedInput: effectiveInput,
-			...(planRedirectNotice
-				? { notice: planRedirectNotice }
-				: conclusionRedirectNotice
-					? { notice: conclusionRedirectNotice }
-					: {}),
+			...(planRedirectNotice ? { notice: planRedirectNotice } : {}),
 		};
 	}
 	// Plan mode soft deny → ask the user once before falling back to auto-deny.

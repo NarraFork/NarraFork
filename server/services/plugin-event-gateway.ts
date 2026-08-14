@@ -418,6 +418,12 @@ function matchesScope(event: PublicEvent, scope: InvocationScope): boolean {
 	for (const key of Object.keys(scope) as Array<keyof InvocationScope>) {
 		const expected = scopeValue(scope, key);
 		if (expected === undefined) continue;
+		// Events carry no actor identity (the host's internal bus has no
+		// "acting user" for most lifecycle events, and baseMapping never fills
+		// actor), so a userId-scoped subscription can never match on actor.
+		// Scope enforcement for those events is done through the subscription's
+		// narratorIds filter (matchesFilter), which is what UI panels use.
+		if (key === "userId" && !event.actor) continue;
 		if (eventScopeValue(event, key) !== expected) return false;
 	}
 	return true;
@@ -903,19 +909,27 @@ export class PluginEventGateway {
 		if (!isScopeNarrower(baseScope, scope) || !filterWithinScope(filter, scope)) {
 			throw new Error("PERMISSION_DENIED");
 		}
+		const explicitAuthorityId = value.authorityId ?? principalInput?.authorityId;
 		const installationId = value.installationId ?? principalInput?.installationId;
 		const authorityId =
-			value.authorityId ??
-			principalInput?.authorityId ??
+			explicitAuthorityId ??
 			(installationId ? pluginInstallationAuthorityId(pluginId, installationId) : undefined) ??
 			(this.capabilityBroker ? `legacy-plugin:${pluginId}` : undefined);
-		let authorityRevision =
-			value.grantRevision ??
-			principalInput?.grantRevision ??
-			(this.capabilityBroker ? 0 : undefined);
+		let authorityRevision = value.grantRevision ?? principalInput?.grantRevision;
+		// A revision supplied inline is trusted; otherwise it must be resolvable
+		// from the authority record. When an installation identity IS present,
+		// an unresolvable revision is fail-closed (PERMISSION_DENIED): a
+		// subscription against a pseudo-identity that no authority record backs
+		// must not register. Legacy callers that carry NO identity at all keep a
+		// revision-0 placeholder registration, but every delivery is still
+		// re-authorized against the DB and rejected there (the
+		// `legacy-plugin:<id>` authority does not exist).
 		if (authorityId && authorityRevision === undefined) {
 			authorityRevision = (await integrationAuthorityService.getSnapshot(authorityId))?.authority
 				.revision;
+		}
+		if (authorityRevision === undefined && !explicitAuthorityId && !installationId) {
+			authorityRevision = this.capabilityBroker ? 0 : undefined;
 		}
 		if (!authorityId || authorityRevision === undefined) {
 			throw new Error("PERMISSION_DENIED");

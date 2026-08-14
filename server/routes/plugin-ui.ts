@@ -1,5 +1,6 @@
 import { AppError, NotFoundError, ValidationError, zodValidationError } from "@server/lib/errors";
 import { requireNarratorAccess } from "@server/lib/narrator-access";
+import { logger } from "@server/lib/logger";
 import {
 	type Capability,
 	invocationScopeSchema,
@@ -13,6 +14,7 @@ import {
 } from "@server/services/plugin-capability-broker";
 import { type PluginHealthRegistry, pluginHealthRegistry } from "@server/services/plugin-health";
 import { pluginManager as defaultPluginManager } from "@server/services/plugin-manager";
+import { permissionGrantPayload } from "@server/services/plugin-permission-store";
 import { pluginPlatformServices } from "@server/services/plugin-platform-services";
 import {
 	pluginUiAssetService as defaultAssetService,
@@ -44,6 +46,8 @@ interface PluginUiManagerLike {
 		revision: number;
 		grants: readonly unknown[];
 	}>;
+	/** Stable installation identity (UUID) for the plugin's current package. */
+	getCurrentInstallationId?(pluginId: string): Promise<string>;
 }
 
 export interface PluginUiRouteOptions {
@@ -221,6 +225,7 @@ interface UiCapabilityPrincipalInput {
 	contributionId: string;
 	runtimeId: string;
 	generation: number;
+	installationId: string;
 }
 
 /**
@@ -236,10 +241,15 @@ function createUiCapabilityBinding(
 	manifest: { permissions?: { host?: string[] } },
 ): PluginCapabilityBindingInput {
 	const requested = [...(manifest.permissions?.host ?? [])];
-	const granted = new Set(permissions.grants.map((grant) => grant.capability));
+	// Strip storage metadata (pluginId/installationId/revision) the authority
+	// record attaches to each grant: the broker's `permissionGrantSchema` is
+	// strict and would reject the whole binding otherwise (UI sessions then
+	// fail with "Plugin UI capability is not granted for this scope").
+	const payloadGrants = permissions.grants.map((grant) => permissionGrantPayload(grant));
+	const granted = new Set(payloadGrants.map((grant) => grant.capability));
 	// UI sessions see every granted capability, including runtime-approved ones the
 	// manifest did not declare — consistent with `plugin-host-services.ts` binding.
-	const effective = permissions.grants
+	const effective = payloadGrants
 		.map((grant) => grant.capability)
 		.filter((capability): capability is Capability => granted.has(capability));
 	return {
@@ -249,14 +259,14 @@ function createUiCapabilityBinding(
 			runtimeId: principal.runtimeId,
 			runtimeGeneration: principal.generation,
 			contributionId: principal.contributionId,
-			installationId: principal.authorityInstallationId,
+			installationId: principal.installationId || principal.authorityInstallationId,
 		},
 		desiredState: "enabled",
 		compatibilityState: "compatible",
 		runtimeState: "active",
 		runtimeGeneration: principal.generation,
 		manifestRequested: requested,
-		installationGrants: permissions.grants,
+		installationGrants: payloadGrants,
 		hostPolicy: effective,
 		currentUserAuthority: effective,
 		contributionPolicy: effective,
@@ -279,6 +289,68 @@ function uiScopeResourceId(input: z.infer<typeof sessionInputSchema>): string | 
 }
 
 /**
+ * Map a broker denial reason onto a stable, sanitized UI error code.
+ *
+ * The raw broker reasons (and the diagnosticId) stay in the logs; the caller
+ * only sees a categorized code plus the diagnosticId reference, so operators
+ * can correlate a reported panel failure with the authority/grant/scope root
+ * cause without exposing sensitive grant details.
+ */
+function uiDenialCode(reason: string | undefined): {
+	code: string;
+	message: string;
+} {
+	switch (reason) {
+		case "INVALID_CONTEXT":
+		case "PLUGIN_IDENTITY_MISMATCH":
+		case "RUNTIME_IDENTITY_MISMATCH":
+		case "RUNTIME_GENERATION_MISMATCH":
+			return {
+				code: "PLUGIN_IDENTITY_MISMATCH",
+				message: "Plugin UI identity does not match the installation authority",
+			};
+		case "MISSING_SOURCE":
+			return {
+				code: "PLUGIN_AUTHORITY_NOT_FOUND",
+				message: "Plugin UI authorization record is missing for this installation",
+			};
+		case "GRANT_EXPIRED":
+			return {
+				code: "PLUGIN_GRANT_EXPIRED",
+				message: "Plugin UI capability grant has expired",
+			};
+		case "GRANT_REVOKED":
+		case "INVALID_GRANT":
+		case "CAPABILITY_NOT_REQUESTED":
+		case "CAPABILITY_NOT_GRANTED":
+		case "HOST_POLICY_DENIED":
+		case "USER_AUTHORITY_DENIED":
+		case "CONTRIBUTION_POLICY_DENIED":
+		case "RUNNER_DENIED":
+			return {
+				code: "PLUGIN_CAPABILITY_NOT_GRANTED",
+				message: "Plugin UI capability is not granted for this scope",
+			};
+		case "MISSING_SCOPE":
+		case "SCOPE_ESCALATION":
+			return {
+				code: "PLUGIN_SCOPE_MISMATCH",
+				message: "Plugin UI scope is not covered by the granted capability",
+			};
+		case "CONSTRAINT_MISMATCH":
+			return {
+				code: "PLUGIN_CONSTRAINT_MISMATCH",
+				message: "Plugin UI request violates a grant constraint",
+			};
+		default:
+			return {
+				code: "PLUGIN_UI_PERMISSION_DENIED",
+				message: "Plugin UI capability is not granted for this scope",
+			};
+	}
+}
+
+/**
  * Reject a UI session before it is created when the `ui.panel` grant does not cover it.
  *
  * Takes no plugin status: the caller has already run `assertEnabled`, and what is checked here
@@ -290,6 +362,7 @@ async function assertUsableUiPanelGrant(
 	manifest: { permissions?: { host?: string[] } },
 	principalId: string,
 	userRole: "admin" | "user",
+	installationId: string,
 ): Promise<void> {
 	const principal: UiCapabilityPrincipalInput = {
 		pluginId: input.pluginId,
@@ -298,6 +371,7 @@ async function assertUsableUiPanelGrant(
 		contributionId: input.contributionId,
 		runtimeId: "ui:preflight",
 		generation: 1,
+		installationId,
 	};
 	const binding = createUiCapabilityBinding(permissions, principal, manifest);
 	const broker = new CapabilityBroker({
@@ -330,10 +404,23 @@ async function assertUsableUiPanelGrant(
 		responseBytes: 0,
 	});
 	if (!decision.allowed) {
+		const reason = decision.error?.reason;
+		const diagnosticId = decision.error?.diagnosticId;
+		const mapped = uiDenialCode(reason);
+		logger.warn("Plugin UI panel grant denied", {
+			pluginId: input.pluginId,
+			installationId,
+			surface: input.surface,
+			surfaceScope: input.surfaceScope,
+			grantRevision: permissions.revision,
+			brokerReason: reason,
+			brokerCode: decision.error?.code,
+			diagnosticId,
+		});
 		throw new AppError(
-			"Plugin UI capability is not granted for this scope",
+			diagnosticId ? `${mapped.message} (diagnostic ${diagnosticId})` : mapped.message,
 			403,
-			"PLUGIN_UI_PERMISSION_DENIED",
+			mapped.code,
 		);
 	}
 }
@@ -355,6 +442,7 @@ function bindUiCapability(
 		sessionId: string;
 		generation: number;
 		contributionId: string;
+		installationId: string;
 	},
 	manifest: { permissions?: { host?: string[] } },
 ): void {
@@ -369,6 +457,7 @@ function bindUiCapability(
 				contributionId: session.contributionId,
 				runtimeId: `ui:${session.sessionId}`,
 				generation: session.generation,
+				installationId: session.installationId,
 			},
 			manifest,
 		),
@@ -721,10 +810,24 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const contribution = assertUiContribution(pkg.manifest, body.data);
 			const user = c.get("user");
 			const principalId = user.sub;
-			await assertUsableUiPanelGrant(permissions, body.data, pkg.manifest, principalId, user.role);
+			// Authorization is keyed by the stable installation identity (UUID), the
+			// same id the permission/authority system maintains — NOT the package
+			// hash, which would hit a stale hash-keyed authority record.
+			const installationId = manager.getCurrentInstallationId
+				? await manager.getCurrentInstallationId(body.data.pluginId)
+				: permissions.installationId;
+			await assertUsableUiPanelGrant(
+				permissions,
+				body.data,
+				pkg.manifest,
+				principalId,
+				user.role,
+				installationId,
+			);
 			const created = sessions.create({
 				...body.data,
 				authorityInstallationId: permissions.installationId,
+				installationId,
 				principalId,
 			});
 			try {

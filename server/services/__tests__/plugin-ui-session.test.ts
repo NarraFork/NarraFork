@@ -7,6 +7,7 @@ const binding = {
 	version: "1.0.0",
 	hash: "a".repeat(64),
 	authorityInstallationId: "installation-ui-authority",
+	installationId: "installation-1",
 	principalId: "user-1",
 	contributionId: "panel",
 	panelInstanceId: "panel-1",

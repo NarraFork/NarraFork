@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, readFileSync, rmSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
@@ -60,7 +59,6 @@ import {
 	addTrait,
 	isKnowledgeStewardNarrator,
 	isPlanModeTrait,
-	isReadOnlySubagentVariant,
 	isSubagentVariant,
 	parseSubstatus,
 	parseTraits,
@@ -4655,31 +4653,7 @@ export async function runAgentLoop(
 				columns: { variant: true, parentNarratorId: true },
 			});
 			if (narr && isSubagentVariant(narr.variant)) {
-				// For explore/plan subagents with a conclusion file, prefer reading
-				// the file content over extracting from the last assistant message.
-				let lastFinalText: string | undefined;
-				const concEntry = getConclusionEntry(narratorId);
-				if (concEntry) {
-					try {
-						if (existsSync(concEntry.absPath)) {
-							const content = readFileSync(concEntry.absPath, "utf-8").trim();
-							if (content && !loopHadError) {
-								lastFinalText = content;
-							}
-							rmSync(concEntry.absPath, { force: true });
-						}
-					} catch (err) {
-						logger.warn("Failed to read/cleanup takeover conclusion file", {
-							narratorId,
-							path: concEntry.absPath,
-							error: err instanceof Error ? err.message : String(err),
-						});
-					}
-					deleteConclusionFileId(narratorId);
-				}
-				if (!lastFinalText) {
-					lastFinalText = await getSubagentFinalText(narratorId);
-				}
+				const lastFinalText = await getSubagentFinalText(narratorId);
 
 				// --- Takeover handoff ---
 				// While the subagent is taken over, the parent stays blocked in
@@ -5051,27 +5025,17 @@ async function feedMessage(
 	// EXCEPTION — explicit takeover: while taken over, the parent intentionally
 	// stays blocked for the entire takeover. The user can send/interrupt/continue
 	// freely; the result is only handed back when the user stops takeover. So we
-	// do NOT resolve the override or register a watcher here. We still set up the
-	// conclusion file for explore/plan subagents so Write/Edit redirect works.
+	// do NOT resolve the override or register a watcher here.
 	const narrator = await narratorService.getById(narratorId);
 	if (isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
 		const currentSubstatus = parseSubstatus(narrator.substatus);
 		const takenOver = isTakenOver(narratorId);
 		if (takenOver) {
-			if (isReadOnlySubagentVariant(narrator.variant)) {
-				setConclusionFileId(narratorId, generateWordSlug(), active.cwd);
-			}
 			// Parent stays blocked — do not resolve, do not register a watcher.
 		} else if (currentSubstatus.includes("manual_override")) {
 			const overrideEntry = getManualOverrideMap().get(narratorId);
 			if (overrideEntry) {
 				const currentFinalText = await getSubagentFinalText(narratorId);
-
-				// Set up conclusion file for explore/plan subagents so that
-				// Write/Edit are properly redirected during the takeover run.
-				if (isReadOnlySubagentVariant(narrator.variant)) {
-					setConclusionFileId(narratorId, generateWordSlug(), active.cwd);
-				}
 
 				registerConclusionWatcher(
 					narratorId,
@@ -5548,6 +5512,119 @@ export async function addSpecTaskForPlugin(
 	return {
 		added,
 		taskText: objective,
+		revisionId: written.revisionId ?? null,
+	};
+}
+
+/** Marker that scopes plugin-written team-SOP sections inside spec://behavior_fence. */
+const TEAM_SOP_MARKER = "team-sop:com.whisent.narrator-team";
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Upsert or clear a plugin-managed team-SOP section inside a narrator's
+ * `spec://behavior_fence`.
+ *
+ * The host merges the SOP section into the existing fence so the user's own
+ * behavior constraints are preserved; `clear` removes only the plugin's marked
+ * section. The fence is periodically injected by the host (`buildBehaviorFence
+ * Reminder` at the fence cadence), which is what keeps the SOP visible to a
+ * worker even after long runs / context compacts — the "remember to report
+ * back" problem this solves.
+ */
+export async function setSpecBehaviorFenceForPlugin(
+	narratorId: string,
+	text: string,
+	mode: "upsert" | "clear",
+): Promise<{ updated: boolean; revisionId: string | null }> {
+	const { readSpecFile, writeSpecFile } = await import("./spec-vfs-service");
+	let current = "";
+	try {
+		const file = await readSpecFile(narratorId, "spec://behavior_fence");
+		current = file.content ?? "";
+	} catch {
+		// Fence may not exist yet; treat as empty.
+	}
+	const openTag = `<!-- ${TEAM_SOP_MARKER} -->`;
+	const closeTag = `<!-- /${TEAM_SOP_MARKER} -->`;
+	const sopPattern = new RegExp(`\\s*${escapeRegExp(openTag)}[\\s\\S]*?${escapeRegExp(closeTag)}\\s*`);
+	const withoutSop = current.replace(sopPattern, "").trim();
+	const body = text.trim();
+	let next: string;
+	if (mode === "clear" || !body) {
+		next = withoutSop;
+	} else {
+		const section = `${openTag}\n${body}\n${closeTag}`;
+		next = withoutSop ? `${withoutSop}\n\n${section}` : section;
+	}
+	const written = await writeSpecFile(narratorId, "spec://behavior_fence", next, {
+		actor: "agent",
+		allowFenceMutation: true,
+		createdBy: "assistant",
+	});
+	return { updated: true, revisionId: written.revisionId ?? null };
+}
+
+/**
+ * Update a narrator's title / model / reasoning effort from a plugin (team
+ * leader managing its members). Persists each provided field and applies the
+ * runtime sync so an already-running narrator picks the change up at its next
+ * model request. At least one field must be provided.
+ *
+ * @returns {Promise<{ updated: string[] }>} — the field names that were changed
+ */
+export async function updateNarratorProfileForPlugin(
+	narratorId: string,
+	input: {
+		title?: string;
+		model?: string;
+		reasoningEffort?: ReasoningEffort | null;
+	},
+): Promise<{ updated: string[] }> {
+	const { persistTitle } = await import("./narrator-title");
+	const updated: string[] = [];
+	if (input.title !== undefined) {
+		const title = input.title.trim();
+		if (!title) throw new ValidationError("title must not be empty");
+		if (title.length > 200) throw new ValidationError("title must be at most 200 characters");
+		await persistTitle(narratorId, title);
+		updated.push("title");
+	}
+	if (input.model !== undefined) {
+		const model = input.model;
+		await narratorService.updateModel(narratorId, model);
+		updateNarratorModel(narratorId, model);
+		updated.push("model");
+	}
+	if (input.reasoningEffort !== undefined) {
+		await narratorService.updateReasoningEffort(narratorId, input.reasoningEffort);
+		updateNarratorReasoningEffort(narratorId, input.reasoningEffort);
+		updated.push("reasoningEffort");
+	}
+	return { updated };
+}
+
+/**
+ * Write (or replace) a whitelisted Dynamic Spec file for a narrator on behalf
+ * of a plugin (team leader managing its members). Only non-readonly spec files
+ * (currently `tasks.json` and `index.md`) are allowed; `behavior_fence` stays
+ * exclusive to the user / the dedicated team-SOP fence command.
+ */
+export async function writeSpecForPlugin(
+	narratorId: string,
+	uri: string,
+	content: string,
+): Promise<{ path: string; uri: string; revisionId: string | null }> {
+	const { writeSpecFile } = await import("./spec-vfs-service");
+	const written = await writeSpecFile(narratorId, uri, content, {
+		actor: "agent",
+		createdBy: "assistant",
+	});
+	return {
+		path: written.path,
+		uri: written.uri,
 		revisionId: written.revisionId ?? null,
 	};
 }

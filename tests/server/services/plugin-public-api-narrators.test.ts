@@ -13,7 +13,7 @@ import {
 	type PluginPublicApiAdapters,
 	PluginPublicApiError,
 } from "@server/services/plugin-public-api";
-import { chapters, narrators, projects } from "../../../server/db/schema";
+import { chapters, narratorMessages, narrators, projects } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
 const CURSOR_SECRET = "public-api-narrator-test-cursor-secret-32-bytes";
@@ -153,6 +153,9 @@ describe("narrafork.narrators.list (public API surface)", () => {
 						.filter((row) => afterUpdatedAt(row, input.after))
 						.slice(0, input.limit);
 				},
+				async listMessages() {
+					return [];
+				},
 			},
 		};
 		const { api } = buildApi({ adapters });
@@ -195,6 +198,9 @@ describe("narrafork.narrators.list (public API surface)", () => {
 						status: input.status,
 					});
 					return [narratorRow("n1", { projectId: input.projectId })];
+				},
+				async listMessages() {
+					return [];
 				},
 			},
 		};
@@ -287,6 +293,15 @@ describe("narrafork.narrator.send_message (public API surface)", () => {
 				async specTaskAdd() {
 					return { added: false, taskText: "", revisionId: null };
 				},
+				async specBehaviorFenceUpdate() {
+					return { updated: false, revisionId: null };
+				},
+				async updateProfile() {
+					return { updated: [] };
+				},
+				async specWrite() {
+					return { path: "tasks.json", uri: "spec://tasks.json", revisionId: null };
+				},
 			},
 		};
 		const { api, broker } = buildApi({ adapters });
@@ -353,6 +368,15 @@ describe("narrafork.narrator.send_message (public API surface)", () => {
 				async specTaskAdd() {
 					return { added: false, taskText: "", revisionId: null };
 				},
+				async specBehaviorFenceUpdate() {
+					return { updated: false, revisionId: null };
+				},
+				async updateProfile() {
+					return { updated: [] };
+				},
+				async specWrite() {
+					return { path: "tasks.json", uri: "spec://tasks.json", revisionId: null };
+				},
 			},
 		};
 		const broker = new FakeBroker();
@@ -413,6 +437,15 @@ describe("narrafork.narrator.send_message (public API surface)", () => {
 				async specTaskAdd() {
 					return { added: false, taskText: "", revisionId: null };
 				},
+				async specBehaviorFenceUpdate() {
+					return { updated: false, revisionId: null };
+				},
+				async updateProfile() {
+					return { updated: [] };
+				},
+				async specWrite() {
+					return { path: "tasks.json", uri: "spec://tasks.json", revisionId: null };
+				},
 			},
 		};
 		const { api } = buildApi({ adapters });
@@ -470,6 +503,15 @@ describe("narrafork.narrator.interrupt (public API surface)", () => {
 				},
 				async specTaskAdd() {
 					return { added: false, taskText: "", revisionId: null };
+				},
+				async specBehaviorFenceUpdate() {
+					return { updated: false, revisionId: null };
+				},
+				async updateProfile() {
+					return { updated: [] };
+				},
+				async specWrite() {
+					return { path: "tasks.json", uri: "spec://tasks.json", revisionId: null };
 				},
 			},
 		};
@@ -644,6 +686,15 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			async specTaskAdd() {
 				return { added: false, taskText: "", revisionId: null };
 			},
+			async specBehaviorFenceUpdate() {
+				return { updated: false, revisionId: null };
+			},
+			async updateProfile() {
+				return { updated: [] };
+			},
+			async specWrite() {
+				return { path: "tasks.json", uri: "spec://tasks.json", revisionId: null };
+			},
 			async sendMessage(
 				narratorId,
 				message,
@@ -724,6 +775,15 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			async specTaskAdd() {
 				return { added: false, taskText: "", revisionId: null };
 			},
+			async specBehaviorFenceUpdate() {
+				return { updated: false, revisionId: null };
+			},
+			async updateProfile() {
+				return { updated: [] };
+			},
+			async specWrite() {
+				return { path: "tasks.json", uri: "spec://tasks.json", revisionId: null };
+			},
 			async sendMessage() {
 				throw new ValidationError("Narrator is already running");
 			},
@@ -783,6 +843,15 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			},
 			async specTaskAdd() {
 				return { added: false, taskText: "", revisionId: null };
+			},
+			async specBehaviorFenceUpdate() {
+				return { updated: false, revisionId: null };
+			},
+			async updateProfile() {
+				return { updated: [] };
+			},
+			async specWrite() {
+				return { path: "tasks.json", uri: "spec://tasks.json", revisionId: null };
 			},
 			async sendMessage() {
 				throw new ValidationError("Subagent messages must be sent through resumeSubagent");
@@ -844,6 +913,15 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			async specTaskAdd() {
 				return { added: false, taskText: "", revisionId: null };
 			},
+			async specBehaviorFenceUpdate() {
+				return { updated: false, revisionId: null };
+			},
+			async updateProfile() {
+				return { updated: [] };
+			},
+			async specWrite() {
+				return { path: "tasks.json", uri: "spec://tasks.json", revisionId: null };
+			},
 			async sendMessage() {
 				throw new Error("not used");
 			},
@@ -900,6 +978,15 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			async specTaskAdd() {
 				return { added: false, taskText: "", revisionId: null };
 			},
+			async specBehaviorFenceUpdate() {
+				return { updated: false, revisionId: null };
+			},
+			async updateProfile() {
+				return { updated: [] };
+			},
+			async specWrite() {
+				return { path: "tasks.json", uri: "spec://tasks.json", revisionId: null };
+			},
 			async sendMessage() {
 				throw new Error("not used");
 			},
@@ -938,5 +1025,77 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 		).rejects.toMatchObject({
 			code: "NOT_FOUND",
 		});
+	});
+
+	test("lists a narrator's recent messages newest-first with bounded text", async () => {
+		seedNarrator("n1", null, { title: "Worker" });
+		const insertMessages = async (narratorId: string, texts: string[]) => {
+			for (let i = 0; i < texts.length; i++) {
+				db.insert(narratorMessages)
+					.values({
+						id: `m-${narratorId}-${i}`,
+						narratorId,
+						role: i % 2 === 0 ? "user" : "assistant",
+						contentJson: { type: "text", text: texts[i] },
+						contentText: texts[i],
+						createdAt: new Date(Date.parse(now) + i * 60_000).toISOString(),
+					})
+					.run();
+			}
+		};
+		await insertMessages("n1", ["task start", "reply one", "follow up", "reply two"]);
+		seedNarrator("n2", null, { title: "Other" });
+		await insertMessages("n2", ["unrelated"]);
+
+		const adapters = createCorePluginPublicApiAdapters({
+			db,
+			pluginManager: {
+				async list() {
+					return [];
+				},
+				async getStatus() {
+					return undefined;
+				},
+				async enable() {
+					throw new Error("not used");
+				},
+				async disable() {
+					throw new Error("not used");
+				},
+			},
+		});
+
+		// Default limit, newest first, only the target narrator's messages.
+		const rows = await adapters.narrators?.listMessages({
+			narratorId: "n1",
+			limit: 10,
+			context: context(),
+			signal: new AbortController().signal,
+		});
+		expect(rows?.map((row) => row.text)).toEqual([
+			"reply two",
+			"follow up",
+			"reply one",
+			"task start",
+		]);
+		expect(rows?.map((row) => row.role)).toEqual(["assistant", "user", "assistant", "user"]);
+
+		// limit applies
+		const limited = await adapters.narrators?.listMessages({
+			narratorId: "n1",
+			limit: 2,
+			context: context(),
+			signal: new AbortController().signal,
+		});
+		expect(limited?.length).toBe(2);
+
+		// narrator isolation
+		const other = await adapters.narrators?.listMessages({
+			narratorId: "n2",
+			limit: 10,
+			context: context(),
+			signal: new AbortController().signal,
+		});
+		expect(other?.map((row) => row.text)).toEqual(["unrelated"]);
 	});
 });

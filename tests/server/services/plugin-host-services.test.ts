@@ -406,8 +406,11 @@ describe("PluginHostServices", () => {
 		]);
 		expect(hostServices.hasRuntimeBinding(pluginId, runtimeId)).toBe(false);
 		expect(capabilityBroker.hasBinding(pluginId, runtimeId)).toBe(false);
+		// runtime_generation is a no-op for the ui_session layer (UI sessions are
+		// bound to the stable installation UUID, not the runtime generation), and
+		// the capability_broker layer revokes through the real broker (no
+		// recorder). The observed order therefore starts at the event gateway.
 		expect(observed).toEqual([
-			{ layer: "ui_session", bindingPresent: true },
 			{ layer: "event_gateway", bindingPresent: false },
 			{ layer: "scheduler", bindingPresent: false },
 			{ layer: "secret_broker", bindingPresent: false },

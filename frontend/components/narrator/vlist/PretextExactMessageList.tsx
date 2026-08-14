@@ -1953,6 +1953,14 @@ export function buildExactCatchUpCursor(
 	return undefined;
 }
 
+export function buildExactMessageSnapshot(
+	messages: readonly { id?: unknown }[],
+	messageVersion: number | undefined,
+) {
+	if (messageVersion == null) return undefined;
+	return { cursor: buildExactCatchUpCursor(messages), messageVersion };
+}
+
 export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExactMessageListProps>(
 	function PretextExactMessageList(props, ref) {
 		const {

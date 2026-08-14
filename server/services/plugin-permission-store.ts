@@ -6,7 +6,13 @@ import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { pluginIdSchema } from "@server/lib/plugins/manifest";
-import { capabilitySchema, type PermissionGrant, permissionGrantSchema, type PermissionScope, permissionScopeSchema } from "@server/lib/plugins/permissions";
+import {
+	capabilitySchema,
+	type PermissionGrant,
+	type PermissionScope,
+	permissionGrantSchema,
+	permissionScopeSchema,
+} from "@server/lib/plugins/permissions";
 import { z } from "zod";
 import type {
 	PluginGrantSummary,
@@ -313,9 +319,11 @@ function parseStoredGrant(
 function parsePendingRequest(value: unknown): PluginPermissionRequest {
 	if (!isRecord(value)) throw new ValidationError("Pending permission request is invalid");
 	const parsed = capabilitySchema.safeParse(value.capability);
-	if (!parsed.success) throw new ValidationError("Pending permission request capability is invalid");
+	if (!parsed.success)
+		throw new ValidationError("Pending permission request capability is invalid");
 	const scopeParsed = permissionScopeSchema.safeParse(value.scope);
-	if (!scopeParsed.success) throw new ValidationError("Pending permission request scope is invalid");
+	if (!scopeParsed.success)
+		throw new ValidationError("Pending permission request scope is invalid");
 	if (typeof value.requestId !== "string" || !value.requestId || value.requestId.length > 256)
 		throw new ValidationError("Pending permission request id is invalid");
 	if (!isIsoDate(value.requestedAt))
@@ -905,8 +913,10 @@ export class PluginPermissionStore {
 		status: "granted" | "denied",
 	): Promise<PluginPermissionRequest | undefined> {
 		assertPluginIdentity(pluginId, installationId);
-		if (!identifierSchema.safeParse(requestId).success) throw new ValidationError("Invalid requestId");
-		if (status !== "granted" && status !== "denied") throw new ValidationError("Invalid resolve status");
+		if (!identifierSchema.safeParse(requestId).success)
+			throw new ValidationError("Invalid requestId");
+		if (status !== "granted" && status !== "denied")
+			throw new ValidationError("Invalid resolve status");
 
 		return this.mutex.acquire("permissions", async () => {
 			await this.ensureLoadedLocked();
@@ -1026,7 +1036,11 @@ export class PluginPermissionStore {
 		if (!this.stateStore) return;
 		const state = await this.stateStore.getState(pluginId);
 		if (!state) return;
-		const installationId = state.authorityInstallationId ?? state.current?.hash;
+		// The state summary mirrors the canonical authority, keyed by the stable
+		// installation UUID. Fall back through the authority generation and package
+		// hash only for legacy states that predate the UUID migration.
+		const installationId =
+			state.installationId ?? state.authorityInstallationId ?? state.current?.hash;
 		const set = installationId
 			? this.document?.plugins[pluginId]?.[installationId]
 			: Object.values(this.document?.plugins[pluginId] ?? {}).sort((a, b) =>
@@ -1157,7 +1171,9 @@ export class PluginPermissionStore {
 
 export const pluginPermissionStore = new PluginPermissionStore();
 
-export function permissionGrantPayload(grant: StoredPermissionGrant): PermissionGrant {
+export function permissionGrantPayload(
+	grant: StoredPermissionGrant | PermissionGrant,
+): PermissionGrant {
 	return baseGrant(grant) as PermissionGrant;
 }
 

@@ -530,7 +530,10 @@ export class PluginUiHost {
 			runtimeId: `ui:${input.session.sessionId}`,
 			runtimeGeneration: input.session.generation,
 			contributionId: input.session.contributionId,
-			installationId: input.session.authorityInstallationId,
+			// Stable installation identity, matching the authority record the
+			// permission system keys grants by. Fall back to the legacy authority
+			// field for sessions created before UUID migration completed.
+			installationId: input.session.installationId ?? input.session.authorityInstallationId,
 		};
 		const contextInput = {
 			requestId: input.request.id,
@@ -704,7 +707,7 @@ export class PluginUiHost {
 			throw new PluginUiHostError("INVALID_PARAMS", "Invalid event subscription parameters");
 		const principal: PluginEventPrincipal = {
 			pluginId: input.session.pluginId,
-			installationId: input.session.authorityInstallationId,
+			installationId: input.session.installationId ?? input.session.authorityInstallationId,
 			packageVersion: input.session.version,
 			runtimeId: `ui:${input.session.sessionId}`,
 			generation: input.session.generation,
@@ -721,6 +724,24 @@ export class PluginUiHost {
 		delete params.contributionId;
 		delete params.packageVersion;
 		delete params.currentScope;
+		// Normalize delivery to the gateway schema. The UI shell passes the
+		// transport (`poll`) which is part of the UI protocol but NOT part of
+		// the backend subscribe schema — passing it through would make the
+		// strict schema reject the whole subscription (INVALID_SUBSCRIPTION)
+		// and the panel would silently never receive events.
+		if (isRecord(params.delivery)) {
+			const delivery = params.delivery as Record<string, unknown>;
+			params.delivery = {
+				...(typeof delivery.maxRatePerSecond === "number"
+					? { maxRatePerSecond: delivery.maxRatePerSecond }
+					: {}),
+				...(typeof delivery.queueEvents === "number" ? { queueEvents: delivery.queueEvents } : {}),
+				...(typeof delivery.queueBytes === "number" ? { queueBytes: delivery.queueBytes } : {}),
+				...(typeof delivery.includeInitialState === "boolean"
+					? { includeInitialState: delivery.includeInitialState }
+					: {}),
+			};
+		}
 		this.assertSessionRequestActive(fence);
 		const subscribe = this.eventGateway.subscribe as unknown as (
 			request: Parameters<PluginEventGateway["subscribe"]>[0],

@@ -529,6 +529,8 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	private readonly exitHandlers = new Set<(exitCode: number) => void>();
 	private readonly queuedMessages: JsonRpcEnvelope[] = [];
 	private readonly queuedErrors: Error[] = [];
+	private readonly stdoutDrained: Promise<void>;
+	private resolveStdoutDrained!: () => void;
 	private exitCode: number | undefined;
 	private writeQueue: Promise<void> = Promise.resolve();
 	private stdoutBytes = 0;
@@ -548,6 +550,9 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 			maxHeaderBytes: options.maxHeaderBytes,
 			maxBodyBytes: options.maxBodyBytes,
 		});
+		this.stdoutDrained = new Promise<void>((resolve) => {
+			this.resolveStdoutDrained = resolve;
+		});
 		if (!Number.isSafeInteger(options.maxStderrBytes) || options.maxStderrBytes <= 0)
 			throw new RangeError("maxStderrBytes must be a positive safe integer");
 		if (
@@ -557,15 +562,14 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 			throw new RangeError("maxStderrBytesPerSecond must be a positive safe integer");
 		this.stderrRing = new ByteRingBuffer(options.stderrRingBytes);
 		this.exited = process.exited.then((exitCode) => {
-			this.clearTimers();
-			this.closed = true;
-			this.exitCode = exitCode;
-			for (const handler of this.exitHandlers) handler(exitCode);
-			options.onExit?.(exitCode);
+			void this.finalizeExit(exitCode);
 			return exitCode;
 		});
 
-		void this.readStdout();
+		void this.readStdout().then(
+			() => this.resolveStdoutDrained(),
+			() => this.resolveStdoutDrained(),
+		);
 		void this.readStderr();
 		if (options.idleTimeoutMs && options.idleTimeoutMs > 0) this.resetIdleTimer();
 		if (options.totalTimeoutMs && options.totalTimeoutMs > 0) {
@@ -667,12 +671,21 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 		}
 	}
 
+	private async finalizeExit(exitCode: number): Promise<void> {
+		await this.stdoutDrained;
+		this.clearTimers();
+		this.closed = true;
+		this.exitCode = exitCode;
+		for (const handler of this.exitHandlers) handler(exitCode);
+		this.options.onExit?.(exitCode);
+	}
+
 	private async readStdout(): Promise<void> {
 		const reader = this.process.stdout.getReader();
 		try {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) {
 					this.parser.end();
 					return;
 				}
@@ -685,7 +698,8 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 					});
 				}
 				this.touchActivity();
-				for (const message of this.parser.feed(value)) this.emitMessage(message);
+				const parsedMessages = this.parser.feed(value);
+				for (const message of parsedMessages) this.emitMessage(message);
 			}
 		} catch (error) {
 			this.emitError(asError(error));
@@ -1779,6 +1793,19 @@ interface RuntimeRecord {
 }
 
 /**
+ * Runtime records are keyed by pluginId only; two options sets with different
+ * commands are different packages and must not share a runtime record.
+ */
+function sameRuntimeCommand(
+	left: readonly string[] | undefined,
+	right: readonly string[] | undefined,
+): boolean {
+	if (left === right) return true;
+	if (!left || !right || left.length !== right.length) return false;
+	return left.every((value, index) => value === right[index]);
+}
+
+/**
  * Supervises one or more PluginRuntime instances. It owns restart budgets and
  * quarantine policy; it does not grant capabilities or execute public APIs.
  */
@@ -1804,7 +1831,18 @@ export class RuntimeSupervisor {
 
 	register(options: PluginRuntimeOptions): PluginRuntime {
 		const existing = this.records.get(options.pluginId);
-		if (existing) return existing.runtime;
+		if (existing) {
+			// Same package (command) → reuse the live runtime so idle restarts and
+			// generation bookkeeping keep working on the same object. A different
+			// command means the package was upgraded/installed: the old record must
+			// be replaced, otherwise activate() would restart the stale package
+			// binary while the manager reports the new version as active.
+			if (sameRuntimeCommand(existing.options.command, options.command)) {
+				return existing.runtime;
+			}
+			void existing.runtime.shutdown().catch(() => undefined);
+			this.records.delete(options.pluginId);
+		}
 		const runtime = this.createRuntime(options);
 		this.records.set(options.pluginId, {
 			options,
@@ -1825,7 +1863,9 @@ export class RuntimeSupervisor {
 		const pluginId =
 			typeof optionsOrPluginId === "string" ? optionsOrPluginId : optionsOrPluginId.pluginId;
 		let record = this.records.get(pluginId);
-		if (!record && typeof optionsOrPluginId !== "string") {
+		if (typeof optionsOrPluginId !== "string") {
+			// register() replaces an existing record whose command differs
+			// (upgrade), and reuses the live runtime otherwise.
 			this.register(optionsOrPluginId);
 			record = this.records.get(pluginId);
 		}

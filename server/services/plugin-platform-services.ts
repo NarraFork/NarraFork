@@ -143,6 +143,11 @@ function revokeOrClearUiSession(
 	services: Pick<PluginPlatformServices, "uiSession">,
 	context: PluginLifecycleRevokeContext,
 ): void {
+	// runtime_generation events carry no authorization change for the UI: the
+	// installation identity, authority and grants are unchanged, so UI sessions
+	// (bound to the stable UUID, not the runtime generation) survive an idle
+	// backend runtime restart. Only revoke/clear wipe them.
+	if (context.action === "invalidate") return;
 	services.uiSession.clearForPlugin(context.event.pluginId, lifecycleReason(context));
 }
 

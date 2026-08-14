@@ -368,7 +368,14 @@ function formatAvailableOptionalToolIds(): string {
  * reviewers need not be admins, and per-action authority is enforced by the service
  * layer (canReview / canWriteMain) at execution time.
  */
-const ADMIN_ONLY_LOAD_TOOLS = new Set(["NarraForkAdmin", "KnowledgeAdmin"]);
+const ADMIN_ONLY_LOAD_TOOLS = new Set([
+	"NarraForkAdmin",
+	"KnowledgeAdmin",
+	"PluginInstall",
+	"McpAdmin",
+	"HookAdmin",
+	"ScheduledTaskAdmin",
+]);
 
 /**
  * Resolve a narrator's traits across the user/project/narrator layers.

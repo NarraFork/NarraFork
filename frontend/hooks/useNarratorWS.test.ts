@@ -133,7 +133,11 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			});
 		}
 
-		const subscribeCalls: Array<{ narratorId: string; cursor: CatchUpCursor | undefined }> = [];
+		const subscribeCalls: Array<{
+			narratorId: string;
+			cursor: CatchUpCursor | undefined;
+			messageVersion: number | undefined;
+		}> = [];
 		const seedCalls: Array<{ narratorId: string; cursor: CatchUpCursor | undefined }> = [];
 		const originals = {
 			subscribe: narratorWSManager.subscribe,
@@ -147,7 +151,11 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		};
 		let nextHandleId = 1;
 		narratorWSManager.subscribe = ((narratorIds, options) => {
-			subscribeCalls.push({ narratorId: narratorIds[0], cursor: options?.catchUpCursor });
+			subscribeCalls.push({
+				narratorId: narratorIds[0],
+				cursor: options?.initialMessageSnapshot?.cursor,
+				messageVersion: options?.initialMessageSnapshot?.messageVersion,
+			});
 			return {
 				_id: nextHandleId++,
 				_narratorIds: [...narratorIds],
@@ -168,12 +176,20 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			return true;
 		}) as typeof narratorWSManager.seedCatchUpCursor;
 
-		let props: { narratorId: string; cursor?: CatchUpCursor } = {
+		let props: { narratorId: string; cursor?: CatchUpCursor; messageVersion?: number } = {
 			narratorId: "n1",
 			cursor: { parentLastMessageId: "n1-tail" },
+			messageVersion: 4,
 		};
 		function Harness(): ReactNode {
-			useNarratorWS(props.narratorId, {}, props.cursor, { kind: "messages" });
+			useNarratorWS(
+				props.narratorId,
+				{},
+				props.cursor || props.messageVersion != null
+					? { cursor: props.cursor, messageVersion: props.messageVersion }
+					: undefined,
+				{ kind: "messages" },
+			);
 			return null;
 		}
 		const container = document.createElement("div");
@@ -192,13 +208,21 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			props = { narratorId: "n2" };
 			root.render(createElement(Harness));
 			await settle();
-			props = { narratorId: "n2", cursor: { parentLastMessageId: "n2-tail" } };
+			props = {
+				narratorId: "n2",
+				cursor: { parentLastMessageId: "n2-tail" },
+				messageVersion: 7,
+			};
 			root.render(createElement(Harness));
 			await settle();
 
 			expect(subscribeCalls).toEqual([
-				{ narratorId: "n1", cursor: { parentLastMessageId: "n1-tail" } },
-				{ narratorId: "n2", cursor: undefined },
+				{
+					narratorId: "n1",
+					cursor: { parentLastMessageId: "n1-tail" },
+					messageVersion: 4,
+				},
+				{ narratorId: "n2", cursor: undefined, messageVersion: undefined },
 			]);
 			expect(seedCalls).toEqual([
 				{ narratorId: "n1", cursor: { parentLastMessageId: "n1-tail" } },

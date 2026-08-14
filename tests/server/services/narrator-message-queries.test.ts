@@ -27,6 +27,7 @@ const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
 const { narratorService } = await import("../../../server/services/narrator-service");
+const { narratorMessageQueries } = await import("../../../server/services/narrator-messages");
 const { narratorContext } = await import("../../../server/services/narrator-context");
 const { recoverStaleCompactingMessages } = await import(
 	"../../../server/services/narrator-persistence"
@@ -502,6 +503,28 @@ describe("narratorService message query regressions", () => {
 		expect(readBlock?.outputJson?.blob?._truncated).toBe(true);
 		expect(readBlock?.outputJson?.blob?.fullLength).toBe(TOOL_IO_BUDGETS.leaf + 100);
 		expect(readBlock?.status).toBe("success");
+	});
+
+	it("getChunksByRange 在正文读取期间版本变化时拒绝不一致快照", async () => {
+		seedBase();
+		insertMessage({
+			id: "m-race",
+			seq: 0,
+			contentJson: [{ type: "text", text: "snapshot body" }],
+			contentText: "snapshot body",
+		});
+
+		const originalGetMessageVersion = narratorMessageQueries.getMessageVersion;
+		let versionRead = 0;
+		narratorMessageQueries.getMessageVersion = async () => (versionRead++ === 0 ? 4 : 5);
+		try {
+			await expect(narratorService.getChunksByRange("n1", { count: 1 })).rejects.toMatchObject({
+				statusCode: 409,
+				code: "NARRATOR_CHUNKS_CHANGED",
+			});
+		} finally {
+			narratorMessageQueries.getMessageVersion = originalGetMessageVersion;
+		}
 	});
 
 	it("getPretextDocumentPage 对子代理只返回有界 latest-3 activity，不返回 child 正文", async () => {

@@ -18,6 +18,7 @@ import {
 	IntegrationAuthorityConflictError,
 	type IntegrationAuthorityService,
 	type IntegrationAuthoritySnapshot,
+	type IntegrationAuthorityState,
 	type IntegrationCapabilityGrant,
 	type IntegrationCapabilityGrantInput,
 	type IntegrationGrantConstraints,
@@ -54,6 +55,8 @@ export interface PluginIntegrationAuthorityServiceOptions {
 export interface EnsurePluginInstallationOptions {
 	/** Explicit reinstall only: preserve the revoked tombstone and issue a fresh authority identity. */
 	replaceRevoked?: boolean;
+	/** Upgrade path: append newly declared capabilities without resurrecting revoked grants. */
+	mergeMissingCapabilities?: boolean;
 }
 
 function hash(value: string): string {
@@ -147,6 +150,53 @@ function grantsFingerprint(
 	return JSON.stringify(grants.map(grantFingerprint).sort());
 }
 
+export interface PluginAuthorityCandidate {
+	authorityId: string;
+	installationId?: string;
+	revision: number;
+	state: IntegrationAuthorityState;
+	createdAt: string;
+}
+
+/**
+ * Matches a stable plugin installation UUID (v4). Legacy state files predating
+ * the UUID carry the package hash as installation id; distinguishing the two
+ * forms is what lets migration keep exactly one canonical authority.
+ */
+export function isStableInstallationId(value: string): boolean {
+	return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+export interface PluginAuthorizationInspection {
+	pluginId: string;
+	packageHash?: string;
+	stateInstallationId?: string | null;
+	canonicalInstallationId?: string;
+	canonicalAuthorityId?: string;
+	canonicalRevision?: number;
+	ambiguous: boolean;
+	authorities: Array<{
+		authorityId: string;
+		installationId?: string;
+		revision: number;
+		state: IntegrationAuthorityState;
+		createdAt: string;
+		grants: string[];
+	}>;
+	mirror: {
+		installationId?: string;
+		revision: number;
+		grants: string[];
+	};
+	drift: {
+		mirrorRevision: number;
+		authorityRevision: number;
+		mirrorOnlyGrants: string[];
+		authorityOnlyGrants: string[];
+		identityDrift: boolean;
+	};
+}
+
 export class PluginIntegrationAuthorityService {
 	readonly authorityService: IntegrationAuthorityService;
 	readonly permissionStore: PluginPermissionStore;
@@ -169,30 +219,129 @@ export class PluginIntegrationAuthorityService {
 			includeExpired: true,
 		});
 		if (existing) {
-			if (existing.authority.state !== "revoked" || !options.replaceRevoked) {
-				return this.toPermissionSet(existing, pluginId, targetInstallationId);
-			}
-			// Reinstall never reactivates a revoked authority. It receives a fresh internal
-			// generation while the old authority remains an immutable audit tombstone.
-			for (let attempt = 0; attempt < 5; attempt += 1) {
-				const candidateInstallationId = replacementInstallationId();
-				const candidateAuthorityId = pluginInstallationAuthorityId(
-					pluginId,
-					candidateInstallationId,
-				);
-				const candidate = await this.authorityService.getSnapshot(candidateAuthorityId, {
-					includeExpired: true,
-				});
-				if (candidate) continue;
-				targetInstallationId = candidateInstallationId;
-				authorityId = candidateAuthorityId;
-				existing = null;
-				break;
-			}
-			if (existing) {
-				throw new IntegrationAuthorityConflictError(
-					"Unable to allocate a fresh plugin authority generation",
-				);
+			if (existing.authority.state === "revoked") {
+				if (!options.replaceRevoked) {
+					return this.toPermissionSet(existing, pluginId, targetInstallationId);
+				}
+				// Reinstall never reactivates a revoked authority. It receives a fresh internal
+				// generation while the old authority remains an immutable audit tombstone.
+				for (let attempt = 0; attempt < 5; attempt += 1) {
+					const candidateInstallationId = replacementInstallationId();
+					const candidateAuthorityId = pluginInstallationAuthorityId(
+						pluginId,
+						candidateInstallationId,
+					);
+					const candidate = await this.authorityService.getSnapshot(candidateAuthorityId, {
+						includeExpired: true,
+					});
+					if (candidate) continue;
+					targetInstallationId = candidateInstallationId;
+					authorityId = candidateAuthorityId;
+					existing = null;
+					break;
+				}
+				if (existing) {
+					throw new IntegrationAuthorityConflictError(
+						"Unable to allocate a fresh plugin authority generation",
+					);
+				}
+			} else {
+				const set = this.toPermissionSet(existing, pluginId, targetInstallationId);
+				// Self-healing: an authority that exists but carries NO grants while
+				// the compatibility mirror still has them (a crash or partial
+				// migration can leave an empty authority row) would otherwise deny
+				// every capability forever — the authority short-circuit below would
+				// return an empty grant set. Rebuild the authority from the mirror so
+				// existing approvals keep working. Mirror grants preserve scope,
+				// constraints, expiry, grantId and grantor, so nothing is flattened.
+				if (set.grants.length === 0) {
+					try {
+						const mirror = await this.permissionStore.getSet(pluginId, targetInstallationId);
+						if (mirror.grants.length > 0) {
+							logger.warn("Rebuilding empty plugin authority from compatibility mirror", {
+								pluginId,
+								installationId: targetInstallationId,
+								authorityRevision: set.revision,
+								mirrorRevision: mirror.revision,
+								restored: mirror.grants.length,
+							});
+							const repaired = await this.replace(
+								pluginId,
+								targetInstallationId,
+								mirror.grants.map(
+									(grant): PermissionGrantInput => ({
+										capability: grant.capability,
+										scope: grant.scope,
+										...(grant.constraints === undefined ? {} : { constraints: grant.constraints }),
+										...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }),
+										grantId: grant.grantId,
+										grantedBy: grant.grantedBy,
+									}),
+								),
+								{ expectedRevision: set.revision, grantedBy: "authority-repair" },
+							);
+							return repaired.set;
+						}
+					} catch (error) {
+						logger.warn("Unable to rebuild empty plugin authority from mirror", {
+							pluginId,
+							installationId: targetInstallationId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+				// Upgrade path: the caller's `legacySummary` already includes capabilities
+				// the new manifest declares that were never granted (seedGrantsFromManifest
+				// merge mode). The existing authority record short-circuits normal seeding,
+				// so without this merge the new capabilities would never reach the
+				// runtime authority record and every call against them would be denied.
+				// Append-only: existing grants are preserved verbatim (revocations stay
+				// revoked), only the missing declared capabilities are added.
+				if (options.mergeMissingCapabilities) {
+					const missing = (legacySummary.capabilities ?? []).filter((capability) => {
+						const adapted = adaptPluginCapability(capability);
+						const canonical = adapted?.id;
+						return !set.grants.some(
+							(grant) =>
+								grant.capability === capability ||
+								(canonical !== undefined && grant.capability === canonical),
+						);
+					});
+					if (missing.length > 0) {
+						logger.info("Merging newly-declared plugin capabilities into existing grant set", {
+							pluginId,
+							installationId: targetInstallationId,
+							added: missing,
+						});
+						// Append-only: existing grants are preserved VERBATIM (including
+						// constraints, expiry and the original grantor), only the missing
+						// declared capabilities are added. Dropping those fields would
+						// silently widen or rewrite old grants on every upgrade.
+						const merged = await this.replace(
+							pluginId,
+							targetInstallationId,
+							[
+								...set.grants.map(
+									(grant): PermissionGrantInput => ({
+										capability: grant.capability,
+										scope: grant.scope,
+										...(grant.constraints === undefined ? {} : { constraints: grant.constraints }),
+										...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }),
+										grantId: grant.grantId,
+										grantedBy: grant.grantedBy,
+									}),
+								),
+								...missing.map((capability) => ({
+									capability,
+									scope: { type: "global" } as const,
+								})),
+							],
+							{ expectedRevision: set.revision, grantedBy: "system" },
+						);
+						return merged.set;
+					}
+				}
+				return set;
 			}
 		}
 
@@ -234,6 +383,138 @@ export class PluginIntegrationAuthorityService {
 	async get(pluginId: string, installationId: string): Promise<PluginPermissionSet> {
 		const snapshot = await this.requireActiveSnapshot(pluginId, installationId);
 		return this.toPermissionSet(snapshot, pluginId, installationId);
+	}
+
+	/**
+	 * Produce a sanitized authorization health report for diagnostics: every
+	 * authority row for the plugin, the canonical one, and drift between the
+	 * DB authority (source of truth) and the compatibility mirror. Never
+	 * exposes token/sensitive data — only capability names, identities and
+	 * revisions.
+	 */
+	async inspectAuthorization(
+		pluginId: string,
+		options: { installationId?: string; packageHash?: string } = {},
+	): Promise<PluginAuthorizationInspection> {
+		const snapshots = await this.authorityService.listForIntegration({
+			kind: "plugin_installation",
+			integrationId: pluginId,
+			includeRevoked: true,
+			includeExpired: true,
+		});
+		const authorities = snapshots.map((snapshot) => ({
+			authorityId: snapshot.authority.id,
+			installationId: metadataInstallationId(snapshot),
+			revision: snapshot.authority.revision,
+			state: snapshot.authority.state,
+			createdAt: snapshot.authority.createdAt,
+			grants: snapshot.grants
+				.filter((grant) => !grant.revokedAt)
+				.map((grant) => grant.capabilityId),
+		}));
+		const active = authorities.filter((authority) => authority.state === "active");
+		const uuidActive = active.filter(
+			(authority) =>
+				authority.installationId !== undefined && isStableInstallationId(authority.installationId),
+		);
+		const canonical = uuidActive.length === 1 ? uuidActive[0] : undefined;
+
+		let mirror: PluginPermissionSet | undefined;
+		if (options.installationId) {
+			try {
+				mirror = await this.permissionStore.getSet(pluginId, options.installationId);
+			} catch {
+				mirror = undefined;
+			}
+		}
+		const authorityCapabilities = new Set(canonical?.grants ?? []);
+		const mirrorGrants = mirror?.grants ?? [];
+		return {
+			pluginId,
+			packageHash: options.packageHash,
+			stateInstallationId: options.installationId ?? null,
+			canonicalInstallationId: canonical?.installationId,
+			canonicalAuthorityId: canonical?.authorityId,
+			canonicalRevision: canonical?.revision,
+			ambiguous: uuidActive.length > 1,
+			authorities,
+			mirror: {
+				installationId: mirror?.installationId,
+				revision: mirror?.revision ?? 0,
+				grants: mirrorGrants.map((grant) => grant.capability),
+			},
+			drift: {
+				mirrorRevision: mirror?.revision ?? 0,
+				authorityRevision: canonical?.revision ?? 0,
+				mirrorOnlyGrants: mirrorGrants
+					.filter((grant) => !authorityCapabilities.has(grant.capability))
+					.map((grant) => grant.capability),
+				authorityOnlyGrants: [...authorityCapabilities].filter(
+					(capability) => !mirrorGrants.some((grant) => grant.capability === capability),
+				),
+				identityDrift:
+					!!mirror &&
+					options.installationId !== undefined &&
+					mirror.installationId !== options.installationId,
+			},
+		};
+	}
+
+	/**
+	 * List every authority row ever created for a plugin, including revoked and
+	 * expired ones. Used by the identity resolver to recover a stable UUID after
+	 * a host restart or to detect legacy hash-keyed authorities that must be
+	 * migrated away.
+	 */
+	async listAuthorities(pluginId: string): Promise<PluginAuthorityCandidate[]> {
+		const snapshots = await this.authorityService.listForIntegration({
+			kind: "plugin_installation",
+			integrationId: pluginId,
+			includeRevoked: true,
+			includeExpired: true,
+		});
+		return snapshots.map((snapshot) => ({
+			authorityId: snapshot.authority.id,
+			installationId: metadataInstallationId(snapshot),
+			revision: snapshot.authority.revision,
+			state: snapshot.authority.state,
+			createdAt: snapshot.authority.createdAt,
+		}));
+	}
+
+	/**
+	 * Revoke a single plugin authority (used to retire legacy hash-keyed
+	 * authorities once their grants have been migrated to a stable UUID).
+	 * Returns false when the authority was already revoked or no longer exists.
+	 */
+	async revokeAuthority(authorityId: string, reason: string): Promise<boolean> {
+		let current: IntegrationAuthoritySnapshot | null = null;
+		try {
+			current = await this.authorityService.getSnapshot(authorityId, { includeExpired: true });
+		} catch {
+			return false;
+		}
+		if (!current || current.authority.state === "revoked") return false;
+		try {
+			await this.authorityService.revoke({
+				authorityId,
+				expectedRevision: current.authority.revision,
+				reason,
+			});
+			return true;
+		} catch (error) {
+			if (!(error instanceof IntegrationAuthorityConflictError)) throw error;
+			const latest = await this.authorityService.getSnapshot(authorityId, {
+				includeExpired: true,
+			});
+			if (!latest || latest.authority.state === "revoked") return false;
+			await this.authorityService.revoke({
+				authorityId,
+				expectedRevision: latest.authority.revision,
+				reason,
+			});
+			return true;
+		}
 	}
 
 	async replace(
@@ -489,7 +770,10 @@ export class PluginIntegrationAuthorityService {
 				scope: toCanonicalScope(grant.scope),
 				constraints: toCanonicalConstraints(grant.constraints),
 				expiresAt: grant.expiresAt,
-				createdBy: { type: "user", id: grantedBy },
+				// Preserve the original grantor: system actor stays a system grant so
+				// round-trips back to `grantedBy: "system"` instead of a fake user id.
+				createdBy:
+					grantedBy === "system" ? { type: "system" } : ({ type: "user", id: grantedBy } as const),
 			};
 		});
 	}
@@ -521,15 +805,12 @@ export class PluginIntegrationAuthorityService {
 		try {
 			const current = await this.permissionStore.getSet(set.pluginId, set.installationId);
 			if (grantsFingerprint(current.grants) === grantsFingerprint(set.grants)) return;
-			if (current.revision >= set.revision) {
-				logger.warn("Skipping stale plugin permission compatibility mirror", {
-					pluginId: set.pluginId,
-					installationId: set.installationId,
-					legacyRevision: current.revision,
-					authorityRevision: set.revision,
-				});
-				return;
-			}
+			// The DB authority is the single source of truth. The compatibility
+			// mirror is rebuilt from it unconditionally — even when the mirror's
+			// stale revision is numerically higher (e.g. grants that were written
+			// only to the mirror by an older buggy approval path). Those grants
+			// never existed in the authority and are not enforceable, so the
+			// mirror must converge onto the authority instead of the reverse.
 			await this.permissionStore.replace(
 				set.pluginId,
 				set.installationId,

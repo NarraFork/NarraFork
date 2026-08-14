@@ -79,6 +79,8 @@ describe("resolveToolFilter", () => {
 
 			expect(filter(mcpReadTool)).toBe(true);
 			expect(filter(contextAskTool)).toBe(true);
+			expect(filter(makeTool("Write"))).toBe(false);
+			expect(filter(makeTool("Edit"))).toBe(false);
 			expect(filter(askUserQuestionTool)).toBe(false);
 			expect(filter(mcpWriteTool)).toBe(false);
 			expect(filter(mcpAskTool)).toBe(false);
@@ -105,9 +107,11 @@ describe("resolveToolFilter", () => {
 		expect(filter(makeTool("Write"))).toBe(false);
 	});
 
-	test("general subagents include all non-denied MCP tools", () => {
+	test("general subagents retain file write tools and include all non-denied MCP tools", () => {
 		const filter = getFilter("general");
 
+		expect(filter(makeTool("Write"))).toBe(true);
+		expect(filter(makeTool("Edit"))).toBe(true);
 		expect(filter(mcpReadTool)).toBe(true);
 		expect(filter(contextAskTool)).toBe(true);
 		expect(filter(askUserQuestionTool)).toBe(false);

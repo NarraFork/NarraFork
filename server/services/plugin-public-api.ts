@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { and, desc, eq, inArray, lt, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
-import { chapters, narrators } from "../db/schema";
+import { chapters, narratorMessages, narrators } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { RESOURCE_SCOPE_FIELD_BY_TYPE, scopeContains } from "../lib/integrations/resource-scope";
 import { pluginIdSchema } from "../lib/plugins/manifest";
@@ -11,13 +11,16 @@ import { EXTERNAL_V1_MAX_MESSAGE_CHARS } from "../lib/validators/external";
 import { listIntegrationProjects } from "./integration-resource-service";
 import { narratorService } from "./narrator-service";
 import {
+	addSpecTaskForPlugin as addSpecTaskForPluginSession,
 	createNarratorForPlugin as createNarratorForPluginSession,
 	deleteNarratorForPlugin as deleteNarratorForPluginSession,
 	interruptNarrator as interruptNarratorSession,
 	readSpecTasksForPlugin as readSpecTasksForPluginSession,
-	addSpecTaskForPlugin as addSpecTaskForPluginSession,
 	sendMessage as sendNarratorMessage,
 	sendSubagentMessage as sendSubagentMessageToSession,
+	setSpecBehaviorFenceForPlugin as setSpecBehaviorFenceForPluginSession,
+	updateNarratorProfileForPlugin as updateNarratorProfileForPluginSession,
+	writeSpecForPlugin as writeSpecForPluginSession,
 } from "./narrator-session";
 import {
 	type CapabilityAuthorizationRequest as BrokerAuthorizationRequest,
@@ -1243,6 +1246,12 @@ export interface NarratorQueryAdapter {
 		context: HostCallContext;
 		signal: AbortSignal;
 	}): Promise<NarratorListSource[]>;
+	listMessages(input: {
+		narratorId: string;
+		limit: number;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<Array<{ id: string; role: string; text: string | null; createdAt: string }>>;
 }
 
 export interface NarratorCommandAdapter {
@@ -1317,6 +1326,31 @@ export interface NarratorCommandAdapter {
 		context: HostCallContext;
 		signal: AbortSignal;
 	}): Promise<{ added: boolean; taskText: string; revisionId: string | null }>;
+	specBehaviorFenceUpdate(input: {
+		narratorId: string;
+		mode: "upsert" | "clear";
+		text?: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ updated: boolean; revisionId: string | null }>;
+	updateProfile(input: {
+		narratorId: string;
+		title?: string;
+		model?: string;
+		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ updated: string[] }>;
+	specWrite(input: {
+		narratorId: string;
+		uri: string;
+		content: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ path: string; uri: string; revisionId: string | null }>;
 	interrupt(input: {
 		narratorId: string;
 		context: HostCallContext;
@@ -1410,6 +1444,12 @@ export const narratorCreateInputSchema = z
 	})
 	.strict();
 export const narratorDeleteInputSchema = z.object({ narratorId: idSchema }).strict();
+export const narratorMessagesListInputSchema = z
+	.object({
+		narratorId: idSchema,
+		limit: z.number().int().min(1).max(50).optional(),
+	})
+	.strict();
 export const narratorSpecTasksGetInputSchema = z.object({ narratorId: idSchema }).strict();
 export const narratorSpecTaskAddInputSchema = z
 	.object({
@@ -1417,7 +1457,48 @@ export const narratorSpecTaskAddInputSchema = z
 		text: z.string().trim().min(1).max(1000),
 	})
 	.strict();
+export const narratorSpecBehaviorFenceUpdateInputSchema = z
+	.object({
+		narratorId: idSchema,
+		mode: z.enum(["upsert", "clear"]),
+		text: z.string().trim().max(2000).optional(),
+	})
+	.strict();
 export const narratorInterruptInputSchema = z.object({ narratorId: idSchema }).strict();
+
+/** Reasoning effort values accepted for narrator profile updates. */
+const narratorReasoningEffortSchema = z
+	.enum(["none", "low", "medium", "high", "xhigh", "max"])
+	.nullable()
+	.optional();
+
+/** Update a narrator's title / model / reasoning effort (at least one field). */
+export const narratorUpdateProfileInputSchema = z
+	.object({
+		narratorId: idSchema,
+		title: z.string().trim().min(1).max(200).optional(),
+		model: z.union([z.literal("__default__"), z.string().trim().min(1).max(200)]).optional(),
+		reasoningEffort: narratorReasoningEffortSchema,
+	})
+	.strict()
+	.refine((data) => data.title !== undefined || data.model !== undefined || data.reasoningEffort !== undefined, {
+		message: "At least one of title, model or reasoningEffort must be provided",
+	});
+
+/** Spec files a plugin may write through the public API (safety allowlist). */
+const SPEC_WRITE_WHITELIST = new Set(["tasks.json", "index.md"]);
+
+/** Write (or replace) a plugin-managed Dynamic Spec file for a narrator. */
+export const narratorSpecWriteInputSchema = z
+	.object({
+		narratorId: idSchema,
+		uri: z.string().trim().min(1).max(256),
+		content: z.string().max(256 * 1024),
+	})
+	.strict()
+	.refine((data) => SPEC_WRITE_WHITELIST.has(data.uri), {
+		message: `uri must be one of: ${[...SPEC_WRITE_WHITELIST].join(", ")}`,
+	});
 
 const pluginCursorSchema = z.object({ pluginId: pluginIdSchema }).strict();
 const timestampCursorSchema = z.object({ updatedAt: deadlineSchema, id: idSchema }).strict();
@@ -1810,154 +1891,261 @@ export class PluginPublicApi {
 				},
 			});
 		}
-	if (!this.commands.has("narrafork.narrator.send_message")) {
-		this.commands.register({
-			commandId: "narrafork.narrator.send_message",
-			capability: "command.narrator.send_message",
-			inputSchema: narratorSendMessageInputSchema,
-			redaction: "user_scoped",
-			sideEffect: "non_idempotent",
-			idempotency: "optional",
-			resource: (input) => ({ type: "narrator", id: input.narratorId }),
-			handler: async (input, call) => {
-				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
-				const sent = await adapter.sendMessage({
-					narratorId: input.narratorId,
-					message: input.message,
-					locale: input.locale,
-					replyInUserLanguage: input.replyInUserLanguage,
-					pluginId: call.host.plugin.pluginId,
-					context: call.host,
-					signal: call.signal,
-				});
-				return { data: { accepted: true, messageId: sent.messageId } };
-			},
-		});
-	}
-	if (!this.commands.has("narrafork.narrator.send_subagent_message")) {
-		this.commands.register({
-			commandId: "narrafork.narrator.send_subagent_message",
-			capability: "command.narrator.send_subagent_message",
-			inputSchema: narratorSendSubagentMessageInputSchema,
-			redaction: "user_scoped",
-			sideEffect: "non_idempotent",
-			idempotency: "optional",
-			resource: (input) => ({ type: "narrator", id: input.narratorId }),
-			handler: async (input, call) => {
-				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
-				const sent = await adapter.sendSubagentMessage({
-					narratorId: input.narratorId,
-					message: input.message,
-					priority: input.priority,
-					locale: input.locale,
-					pluginId: call.host.plugin.pluginId,
-					context: call.host,
-					signal: call.signal,
-				});
-				return {
-					data: {
-						delivered: sent.delivered,
-						...(sent.messageId ? { messageId: sent.messageId } : {}),
-						...(sent.bufferedAt ? { bufferedAt: sent.bufferedAt } : {}),
-						...(typeof sent.started === "boolean" ? { started: sent.started } : {}),
-					},
-				};
-			},
-		});
-	}
-	if (!this.commands.has("narrafork.narrator.create")) {
-		this.commands.register({
-			commandId: "narrafork.narrator.create",
-			capability: "command.narrator.create",
-			inputSchema: narratorCreateInputSchema,
-			redaction: "user_scoped",
-			sideEffect: "non_idempotent",
-			idempotency: "optional",
-			// The narrator does not exist yet; the capability grant is the gate.
-			resource: () => undefined,
-			handler: async (input, call) => {
-				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
-				const created = await adapter.createNarrator({
-					title: input.title,
-					model: input.model,
-					cwd: input.cwd,
-					chapterId: input.chapterId,
-					permissionMode: input.permissionMode,
-					type: input.type,
-					subagentType: input.subagentType,
-					parentNarratorId: input.parentNarratorId,
-					pluginId: call.host.plugin.pluginId,
-					context: call.host,
-					signal: call.signal,
-				});
-				return { data: created };
-			},
-		});
-	}
-	if (!this.commands.has("narrafork.narrator.delete")) {
-		this.commands.register({
-			commandId: "narrafork.narrator.delete",
-			capability: "command.narrator.delete",
-			inputSchema: narratorDeleteInputSchema,
-			redaction: "user_scoped",
-			sideEffect: "non_idempotent",
-			idempotency: "optional",
-			resource: (input) => ({ type: "narrator", id: input.narratorId }),
-			handler: async (input, call) => {
-				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
-				await adapter.deleteNarrator({
-					narratorId: input.narratorId,
-					pluginId: call.host.plugin.pluginId,
-					context: call.host,
-					signal: call.signal,
-				});
-				return { data: { deleted: true } };
-			},
-		});
-	}
-	if (!this.commands.has("narrafork.narrator.spec_tasks_get")) {
-		this.commands.register({
-			commandId: "narrafork.narrator.spec_tasks_get",
-			capability: "command.narrator.spec_tasks_get",
-			inputSchema: narratorSpecTasksGetInputSchema,
-			redaction: "user_scoped",
-			sideEffect: "non_idempotent",
-			idempotency: "optional",
-			resource: (input) => ({ type: "narrator", id: input.narratorId }),
-			handler: async (input, call) => {
-				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
-				const result = await adapter.specTasksGet({
-					narratorId: input.narratorId,
-					pluginId: call.host.plugin.pluginId,
-					context: call.host,
-					signal: call.signal,
-				});
-				return { data: result };
-			},
-		});
-	}
-	if (!this.commands.has("narrafork.narrator.spec_task_add")) {
-		this.commands.register({
-			commandId: "narrafork.narrator.spec_task_add",
-			capability: "command.narrator.spec_task_add",
-			inputSchema: narratorSpecTaskAddInputSchema,
-			redaction: "user_scoped",
-			sideEffect: "non_idempotent",
-			idempotency: "optional",
-			resource: (input) => ({ type: "narrator", id: input.narratorId }),
-			handler: async (input, call) => {
-				const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
-				const result = await adapter.specTaskAdd({
-					narratorId: input.narratorId,
-					text: input.text,
-					pluginId: call.host.plugin.pluginId,
-					context: call.host,
-					signal: call.signal,
-				});
-				return { data: result };
-			},
-		});
-	}
+		if (!this.queries.has("narrafork.narrator.messages.list")) {
+			this.queries.register({
+				queryId: "narrafork.narrator.messages.list",
+				capability: "query.read.narrators",
+				inputSchema: narratorMessagesListInputSchema,
+				redaction: "user_scoped",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					// Reads back the narrator's recent messages (text + role only —
+					// no tool payloads / tokens / cost). Used by team plugins to show
+					// a member's latest replies to the leader without opening the
+					// chat page. Bounded text per message keeps responses small.
+					const adapter = requireAdapter(this.adapters.narrators, "Narrator query");
+					const limit = input.limit ?? 10;
+					const rows = await adapter.listMessages({
+						narratorId: input.narratorId,
+						limit,
+						context: call.host,
+						signal: call.signal,
+					});
+					return {
+						data: {
+							narratorId: input.narratorId,
+							items: rows.map((row) => ({
+								id: row.id,
+								role: row.role,
+								text:
+									row.text === null || row.text === undefined
+										? null
+										: (boundedSummaryText(row.text, 1000) ?? null),
+								createdAt: row.createdAt,
+							})),
+						},
+					};
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.send_message")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.send_message",
+				capability: "command.narrator.send_message",
+				inputSchema: narratorSendMessageInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const sent = await adapter.sendMessage({
+						narratorId: input.narratorId,
+						message: input.message,
+						locale: input.locale,
+						replyInUserLanguage: input.replyInUserLanguage,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: { accepted: true, messageId: sent.messageId } };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.send_subagent_message")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.send_subagent_message",
+				capability: "command.narrator.send_subagent_message",
+				inputSchema: narratorSendSubagentMessageInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const sent = await adapter.sendSubagentMessage({
+						narratorId: input.narratorId,
+						message: input.message,
+						priority: input.priority,
+						locale: input.locale,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return {
+						data: {
+							delivered: sent.delivered,
+							...(sent.messageId ? { messageId: sent.messageId } : {}),
+							...(sent.bufferedAt ? { bufferedAt: sent.bufferedAt } : {}),
+							...(typeof sent.started === "boolean" ? { started: sent.started } : {}),
+						},
+					};
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.create")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.create",
+				capability: "command.narrator.create",
+				inputSchema: narratorCreateInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				// The narrator does not exist yet; the capability grant is the gate.
+				resource: () => undefined,
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const created = await adapter.createNarrator({
+						title: input.title,
+						model: input.model,
+						cwd: input.cwd,
+						chapterId: input.chapterId,
+						permissionMode: input.permissionMode,
+						type: input.type,
+						subagentType: input.subagentType,
+						parentNarratorId: input.parentNarratorId,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: created };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.delete")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.delete",
+				capability: "command.narrator.delete",
+				inputSchema: narratorDeleteInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					await adapter.deleteNarrator({
+						narratorId: input.narratorId,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: { deleted: true } };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.spec_tasks_get")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.spec_tasks_get",
+				capability: "command.narrator.spec_tasks_get",
+				inputSchema: narratorSpecTasksGetInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.specTasksGet({
+						narratorId: input.narratorId,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.spec_task_add")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.spec_task_add",
+				capability: "command.narrator.spec_task_add",
+				inputSchema: narratorSpecTaskAddInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.specTaskAdd({
+						narratorId: input.narratorId,
+						text: input.text,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.spec_behavior_fence_update")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.spec_behavior_fence_update",
+				capability: "command.narrator.spec_behavior_fence_update",
+				inputSchema: narratorSpecBehaviorFenceUpdateInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.specBehaviorFenceUpdate({
+						narratorId: input.narratorId,
+						mode: input.mode,
+						text: input.text,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.spec_write")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.spec_write",
+				capability: "command.narrator.spec_write",
+				inputSchema: narratorSpecWriteInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.specWrite({
+						narratorId: input.narratorId,
+						uri: input.uri,
+						content: input.content,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.update_profile")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.update_profile",
+				capability: "command.narrator.update_profile",
+				inputSchema: narratorUpdateProfileInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.updateProfile({
+						narratorId: input.narratorId,
+						...(input.title !== undefined ? { title: input.title } : {}),
+						...(input.model !== undefined ? { model: input.model } : {}),
+						...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
 		if (!this.commands.has("narrafork.narrator.interrupt")) {
 			this.commands.register({
 				commandId: "narrafork.narrator.interrupt",
@@ -2795,6 +2983,9 @@ export type NarratorSessionFacade = {
 	deleteNarrator: typeof deleteNarratorForPluginSession;
 	specTasksGet: typeof readSpecTasksForPluginSession;
 	specTaskAdd: typeof addSpecTaskForPluginSession;
+	specBehaviorFenceUpdate: typeof setSpecBehaviorFenceForPluginSession;
+	updateProfile: typeof updateNarratorProfileForPluginSession;
+	specWrite: typeof writeSpecForPluginSession;
 	interruptNarrator: typeof interruptNarratorSession;
 	getById: typeof narratorService.getById;
 };
@@ -2846,6 +3037,9 @@ export function createCorePluginPublicApiAdapters(options: {
 		deleteNarrator: deleteNarratorForPluginSession,
 		specTasksGet: readSpecTasksForPluginSession,
 		specTaskAdd: addSpecTaskForPluginSession,
+		specBehaviorFenceUpdate: setSpecBehaviorFenceForPluginSession,
+		updateProfile: updateNarratorProfileForPluginSession,
+		specWrite: writeSpecForPluginSession,
 		interruptNarrator: interruptNarratorSession,
 		getById: narratorService.getById,
 	};
@@ -2981,9 +3175,10 @@ export function createCorePluginPublicApiAdapters(options: {
 						type: narrators.type,
 						status: narrators.status,
 						substatus: narrators.substatus,
-						model: narrators.model,
-						permissionMode: narrators.permissionMode,
-						messageCount: narrators.messageCount,
+					model: narrators.model,
+					permissionMode: narrators.permissionMode,
+					reasoningEffort: narrators.reasoningEffort,
+					messageCount: narrators.messageCount,
 						lastMessageAt: narrators.lastMessageAt,
 						createdAt: narrators.createdAt,
 						updatedAt: narrators.updatedAt,
@@ -3005,10 +3200,32 @@ export function createCorePluginPublicApiAdapters(options: {
 					substatus: parseNarratorSubstatus(row.substatus),
 					model: row.model,
 					permissionMode: row.permissionMode,
+					reasoningEffort: row.reasoningEffort,
 					messageCount: row.messageCount ?? 0,
 					lastMessageAt: row.lastMessageAt,
 					createdAt: row.createdAt,
 					updatedAt: row.updatedAt,
+				}));
+			},
+			async listMessages(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
+				const rows = await db
+					.select({
+						id: narratorMessages.id,
+						role: narratorMessages.role,
+						contentText: narratorMessages.contentText,
+						createdAt: narratorMessages.createdAt,
+					})
+					.from(narratorMessages)
+					.where(eq(narratorMessages.narratorId, input.narratorId))
+					.orderBy(desc(narratorMessages.createdAt))
+					.limit(input.limit);
+				return rows.map((row) => ({
+					id: row.id,
+					role: row.role,
+					text: row.contentText ?? null,
+					createdAt: row.createdAt,
 				}));
 			},
 		},
@@ -3029,84 +3246,84 @@ export function createCorePluginPublicApiAdapters(options: {
 						null,
 						{ origin: "user", originLabel: `plugin:${input.pluginId}` },
 					);
-				return { messageId: sent.id };
-			} catch (error) {
-				throw mapNarratorCommandError(error);
-			}
-		},
-		async sendSubagentMessage(input) {
-			if (input.signal.aborted)
-				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
-			try {
-				const result = await session.sendSubagentMessage({
-					subagentId: input.narratorId,
-					message: input.message,
-					priority: input.priority,
-					locale: input.locale,
-					createdBy: null,
-					signal: input.signal,
-				});
-				return {
-					delivered: result.delivered,
-					...(result.messageId ? { messageId: result.messageId } : {}),
-					...(result.bufferedAt ? { bufferedAt: result.bufferedAt } : {}),
-					...(typeof result.started === "boolean" ? { started: result.started } : {}),
-				};
-			} catch (error) {
-				throw mapNarratorCommandError(error);
-			}
-		},
-		async createNarrator(input) {
-			if (input.signal.aborted)
-				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
-			try {
-				const result = await session.createNarrator({
-					title: input.title,
-					model: input.model,
-					cwd: input.cwd,
-					chapterId: input.chapterId,
-					permissionMode: input.permissionMode,
-					type: input.type,
-					subagentType: input.subagentType,
-					parentNarratorId: input.parentNarratorId,
-				});
-				return result;
-			} catch (error) {
-				throw mapNarratorCommandError(error);
-			}
-		},
-		async deleteNarrator(input) {
-			if (input.signal.aborted)
-				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
-			try {
-				await session.deleteNarrator(input.narratorId);
-				return { deleted: true };
-			} catch (error) {
-				throw mapNarratorCommandError(error);
-			}
-		},
-		async specTasksGet(input) {
-			if (input.signal.aborted)
-				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
-			try {
-				const result = await session.specTasksGet(input.narratorId);
-				return {
-					content: result.content,
-					revisionId: result.revisionId,
-				compiled: {
-					tasks: result.compiled.tasks.map((task) => ({
-						text: task.text,
-						status: task.status,
-						protected: task.protected ?? false,
-					})),
-					openCount: result.compiled.tasks.filter((task) => task.status !== "done").length,
-					protectedOpenCount: result.compiled.protectedOpenCount,
-				},
-				};
-			} catch (error) {
-				throw mapNarratorCommandError(error);
-			}
-		},
+					return { messageId: sent.id };
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async sendSubagentMessage(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const result = await session.sendSubagentMessage({
+						subagentId: input.narratorId,
+						message: input.message,
+						priority: input.priority,
+						locale: input.locale,
+						createdBy: null,
+						signal: input.signal,
+					});
+					return {
+						delivered: result.delivered,
+						...(result.messageId ? { messageId: result.messageId } : {}),
+						...(result.bufferedAt ? { bufferedAt: result.bufferedAt } : {}),
+						...(typeof result.started === "boolean" ? { started: result.started } : {}),
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async createNarrator(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const result = await session.createNarrator({
+						title: input.title,
+						model: input.model,
+						cwd: input.cwd,
+						chapterId: input.chapterId,
+						permissionMode: input.permissionMode,
+						type: input.type,
+						subagentType: input.subagentType,
+						parentNarratorId: input.parentNarratorId,
+					});
+					return result;
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async deleteNarrator(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					await session.deleteNarrator(input.narratorId);
+					return { deleted: true };
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async specTasksGet(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const result = await session.specTasksGet(input.narratorId);
+					return {
+						content: result.content,
+						revisionId: result.revisionId,
+						compiled: {
+							tasks: result.compiled.tasks.map((task) => ({
+								text: task.text,
+								status: task.status,
+								protected: task.protected ?? false,
+							})),
+							openCount: result.compiled.tasks.filter((task) => task.status !== "done").length,
+							protectedOpenCount: result.compiled.protectedOpenCount,
+						},
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
 		async specTaskAdd(input) {
 			if (input.signal.aborted)
 				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
@@ -3115,6 +3332,57 @@ export function createCorePluginPublicApiAdapters(options: {
 				return {
 					added: result.added,
 					taskText: result.taskText,
+					revisionId: result.revisionId,
+				};
+			} catch (error) {
+				throw mapNarratorCommandError(error);
+			}
+		},
+		async specBehaviorFenceUpdate(input) {
+			if (input.signal.aborted)
+				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+			try {
+				const result = await session.specBehaviorFenceUpdate(
+					input.narratorId,
+					input.text ?? "",
+					input.mode,
+				);
+				return {
+					updated: result.updated,
+					revisionId: result.revisionId,
+				};
+			} catch (error) {
+				throw mapNarratorCommandError(error);
+			}
+		},
+		async updateProfile(input) {
+			if (input.signal.aborted)
+				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+			try {
+				// Resolve existence first so the caller gets a stable NOT_FOUND.
+				await session.getById(input.narratorId);
+				const result = await session.updateProfile(input.narratorId, {
+					...(input.title !== undefined ? { title: input.title } : {}),
+					...(input.model !== undefined ? { model: input.model } : {}),
+					...(input.reasoningEffort !== undefined
+						? { reasoningEffort: input.reasoningEffort }
+						: {}),
+				});
+				return { updated: result.updated };
+			} catch (error) {
+				throw mapNarratorCommandError(error);
+			}
+		},
+		async specWrite(input) {
+			if (input.signal.aborted)
+				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+			try {
+				// Resolve existence first so the caller gets a stable NOT_FOUND.
+				await session.getById(input.narratorId);
+				const result = await session.specWrite(input.narratorId, input.uri, input.content);
+				return {
+					path: result.path,
+					uri: result.uri,
 					revisionId: result.revisionId,
 				};
 			} catch (error) {
@@ -3156,6 +3424,9 @@ export const PUBLIC_COMMAND_IDS = [
 	"narrafork.narrator.delete",
 	"narrafork.narrator.spec_tasks_get",
 	"narrafork.narrator.spec_task_add",
+	"narrafork.narrator.spec_behavior_fence_update",
+	"narrafork.narrator.update_profile",
+	"narrafork.narrator.spec_write",
 ] as const;
 
 export type PublicQueryId = (typeof PUBLIC_QUERY_IDS)[number];

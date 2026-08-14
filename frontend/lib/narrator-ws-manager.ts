@@ -33,6 +33,12 @@ export type NarratorSubscriptionKind = "list" | "panel" | "messages";
  */
 export const CHAT_ROOM_SUBSCRIBE_BATCH_SIZE = 50;
 
+/** REST-derived message coordinate used only by a subscription's first actual send. */
+export interface NarratorMessageSnapshot {
+	cursor?: CatchUpCursor;
+	messageVersion?: number;
+}
+
 /** Opaque handle returned by `subscribe()` — pass to `unsubscribe()`. */
 export interface SubscriptionHandle {
 	/** @internal */ _id: number;
@@ -65,6 +71,8 @@ interface SubscriptionRecord {
 	narratorIds: string[];
 	kind: NarratorSubscriptionKind;
 	activeRequestIds: Set<string>;
+	/** Consumed only after the first messages subscribe frame is actually sent. */
+	initialMessageSnapshot?: NarratorMessageSnapshot;
 }
 
 interface RequestMessageVersionSnapshot {
@@ -503,7 +511,11 @@ export class NarratorWSManager {
 	 */
 	subscribe(
 		narratorIds: string[],
-		opts?: { catchUpCursor?: CatchUpCursor; kind?: NarratorSubscriptionKind },
+		opts?: {
+			catchUpCursor?: CatchUpCursor;
+			kind?: NarratorSubscriptionKind;
+			initialMessageSnapshot?: NarratorMessageSnapshot;
+		},
 	): SubscriptionHandle {
 		const id = this.nextId++;
 		const kind = opts?.kind ?? "list";
@@ -522,6 +534,9 @@ export class NarratorWSManager {
 			narratorIds: accepted,
 			kind,
 			activeRequestIds: new Set(),
+			...(kind === "messages" && accepted.length === 1 && opts?.initialMessageSnapshot
+				? { initialMessageSnapshot: { ...opts.initialMessageSnapshot } }
+				: {}),
 		});
 
 		for (const nId of accepted) {
@@ -1835,8 +1850,14 @@ export class NarratorWSManager {
 
 		if (kind === "messages" && activeNarratorIds.length === 1) {
 			const narratorId = activeNarratorIds[0];
-			const cursor = this.catchUpCursors.get(narratorId);
-			const version = this.messageVersions.get(narratorId);
+			const initialSnapshot = record.initialMessageSnapshot;
+			// The first subscribe frame must report one REST snapshot coordinate. Never
+			// fill a missing half from the shared manager: a sibling subscription may
+			// already have advanced its optimistic cursor/version beyond this document.
+			const cursor = initialSnapshot ? initialSnapshot.cursor : this.catchUpCursors.get(narratorId);
+			const version = initialSnapshot
+				? initialSnapshot.messageVersion
+				: this.messageVersions.get(narratorId);
 			const msg: Record<string, unknown> = {
 				type: "subscribe",
 				narratorIds: activeNarratorIds,
@@ -1848,6 +1869,9 @@ export class NarratorWSManager {
 			// sync_ok when nothing changed since we last synced (skips catch-up).
 			if (version != null) msg.version = version;
 			ws.send(JSON.stringify(msg));
+			// Consume only after an OPEN socket accepted the frame. If subscribe was
+			// created while disconnected, reconnect's first restore still uses it.
+			if (initialSnapshot) record.initialMessageSnapshot = undefined;
 			return;
 		}
 
