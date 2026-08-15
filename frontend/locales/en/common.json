@@ -566,6 +566,8 @@
 	"usageHistoryRawDumpIncompleteKept": "Kept on the server: {{size}}",
 	"usageHistoryRawDumpDisplayCapNote": "Separately, the preview below stops early to keep this dialog responsive — that limit only affects what is rendered here, not what is stored.",
 	"usageHistorySystemRequest": "System internal request",
+	"usageHistoryDshExternalRequest": "DeepSeek Harness external request",
+	"usageHistoryKind_dsh": "Narrator",
 	"usageHistoryKind_narrator": "Narrator",
 	"usageHistoryKind_compact": "Compact",
 	"usageHistoryKind_context_ask": "Context ask",

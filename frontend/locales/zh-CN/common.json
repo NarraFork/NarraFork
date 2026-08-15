@@ -566,6 +566,8 @@
 	"usageHistoryRawDumpIncompleteKept": "服务器上实际保留：{{size}}",
 	"usageHistoryRawDumpDisplayCapNote": "另外，下方预览为保持本对话框响应会提前截止 —— 这个上限只影响这里的显示，不影响已存储的内容。",
 	"usageHistorySystemRequest": "系统内部请求",
+	"usageHistoryDshExternalRequest": "DeepSeek Harness外部请求",
+	"usageHistoryKind_dsh": "叙述者",
 	"usageHistoryKind_narrator": "叙述者",
 	"usageHistoryKind_compact": "压缩",
 	"usageHistoryKind_context_ask": "上下文问答",

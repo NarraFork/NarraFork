@@ -41,6 +41,7 @@ import {
 	IconToggleRight,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
+import type { TFunction } from "i18next";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { CopyButton } from "../common/CopyButton";
@@ -187,7 +188,20 @@ function getKindLabel(
 	t: (key: string, options: { defaultValue: string }) => string,
 	kind: string,
 ): string {
-	return t(`usageHistoryKind_${kind}`, { defaultValue: kind });
+	const normalizedKind = kind.trim().toLowerCase() === "dsh" ? "narrator" : kind;
+	return t(`usageHistoryKind_${normalizedKind}`, { defaultValue: normalizedKind });
+}
+
+/**
+ * Narrator-cell label for a request with no narrator association. DSH-imported
+ * requests are identified by their provider because their kind is normalized to
+ * `narrator`; everything else falls back to the generic system-request label.
+ */
+function getNarratorLabel(t: TFunction, record: UsageHistoryRecord): string {
+	if (record.provider?.trim().toLowerCase() === "dsh") {
+		return t("usageHistoryDshExternalRequest");
+	}
+	return t("usageHistorySystemRequest");
 }
 
 function TokenAmount({
@@ -688,7 +702,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 											</Text>
 										) : (
 											<Text size="10px" c="dimmed">
-												{t("usageHistorySystemRequest")}
+												{getNarratorLabel(t, record)}
 											</Text>
 										)}
 									</Stack>
@@ -728,9 +742,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 										value={
 											showNarratorId
 												? (record.narratorId ?? "-")
-												: (record.narratorTitle ??
-													record.narratorId ??
-													t("usageHistorySystemRequest"))
+												: (record.narratorTitle ?? record.narratorId ?? getNarratorLabel(t, record))
 										}
 										monospace={showNarratorId}
 										compact
@@ -893,7 +905,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 												</Text>
 											) : (
 												<Text size="xs" c="dimmed">
-													{t("usageHistorySystemRequest")}
+													{getNarratorLabel(t, record)}
 												</Text>
 											)}
 										</Stack>
@@ -904,7 +916,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 												? (record.narratorId ?? "-")
 												: (record.narratorTitle ??
 													record.narratorId ??
-													t("usageHistorySystemRequest"))}
+													getNarratorLabel(t, record))}
 										</Text>
 									</Table.Td>
 									<Table.Td>
