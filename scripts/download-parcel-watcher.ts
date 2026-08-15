@@ -165,7 +165,7 @@ const loaderCode = `// @ts-nocheck — generated file with Bun-specific import a
 // At runtime, extracts the correct binary to disk and loads it via process.dlopen.
 
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 // Embed all platform binaries via Bun's file embedding
@@ -236,8 +236,13 @@ export function loadParcelNativeBinding(): Record<string, (...args: unknown[]) =
 \t\tif (!existsSync(cacheDir)) {
 \t\t\tmkdirSync(cacheDir, { recursive: true });
 \t\t}
-\t\t// Read from $bunfs embedded path and write to disk
-\t\tconst data = readFileSync(embeddedPath);
+\t\t// The asset specifier is absolute under \`bun run\` and under \`bun build --compile\`
+\t\t// (a virtual $bunfs path), but Electrobun's bundler emits it relative to the bundled
+\t\t// entrypoint. Anchor relative specifiers to this module so the read works in a package.
+\t\tconst sourcePath = isAbsolute(embeddedPath)
+\t\t\t? embeddedPath
+\t\t\t: resolve(import.meta.dir, embeddedPath);
+\t\tconst data = readFileSync(sourcePath);
 \t\twriteFileSync(cachePath, data);
 \t}
 

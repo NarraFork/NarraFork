@@ -110,6 +110,9 @@
 	},
 	"scripts": {
 		"approve": "bun server/scripts/approve-all.ts",
+		"postinstall": "bun scripts/patch-cottontail-modules.ts",
+		"patch:cottontail": "bun scripts/patch-cottontail-modules.ts",
+		"patch:cottontail:check": "bun scripts/patch-cottontail-modules.ts --check",
 		"build": "rm -f server/generated/embedded-frontend.ts && bunx vite build --config frontend/vite.config.ts",
 		"build:cross": "bun scripts/build-cross-platform.ts",
 		"build:update-server": "bun scripts/build-update-server.ts",

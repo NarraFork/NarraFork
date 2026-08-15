@@ -5,17 +5,13 @@
  * 并根据白名单 + 危险模式检测判断是否可以自动放行。
  */
 
-// Embed the bash grammar for compiled single-executable mode. `import ... with
-// { type: "file" }` gives Bun an explicit asset edge so the WASM is available both
-// in dev and in packaged binaries. The core engine wasm is embedded the same way,
-// inside tree-sitter-runtime.ts.
-import embeddedBashWasm from "tree-sitter-bash/tree-sitter-bash.wasm" with { type: "file" };
+// The bash grammar wasm is loaded via the dynamic `resolveEmbeddedBashWasm()` helper below
+// (not a static `import ... with { type: "file" }`): nested static imports drop the `with`
+// attribute under Cottontail, and Electrobun's bundler returns a bundle-relative path that
+// must be resolved against `import.meta.dir`. See `importAssetPath`.
 import { toForwardSlash } from "../platform-path";
 import { localPathSemantics, type TargetPathSemantics } from "./execution/path-semantics";
-import {
-	createTreeSitterParser,
-	loadTreeSitterLanguage,
-} from "./structural/tree-sitter-runtime";
+import { createTreeSitterParser, loadTreeSitterLanguage } from "./structural/tree-sitter-runtime";
 
 // ── 类型定义 ──────────────────────────────────────────────
 
@@ -1612,6 +1608,58 @@ type TreeSitterNode = {
 	descendantsOfType(type: string): TreeSitterNode[];
 };
 
+/**
+ * Resolve the WASM assets this module needs, keeping them embedded in compiled binaries.
+ *
+ * `import ... with { type: "file" }` declares an explicit asset edge so `bun build --compile`
+ * embeds the file and hands back a path (a real path in dev, a virtual `$bunfs` path when
+ * packaged). We need that edge, but it MUST be expressed as a dynamic `import()` rather than a
+ * static one.
+ *
+ * Reason: Cottontail 0.2.3 — Electrobun's main-process runtime — only honours the `with`
+ * attribute when the importing module is the top-level entrypoint. Reached through any nested
+ * `import()` (which is how the server boots: index.ts → import("./main") → app.ts → here) it
+ * drops the attribute and falls back to `require(spec)`. The import then silently resolves to a
+ * module *object* instead of a path string, and the failure surfaces much later as an
+ * unreadable error. Dynamic `import()` forwards the attribute correctly on both runtimes, and
+ * verifying that was the point: real Bun and Cottontail both return a path string this way.
+ *
+ * Resolved once and cached, since these are immutable build assets.
+ */
+let bashWasmPromise: Promise<string> | null = null;
+
+/**
+ * Unwrap the default export and make it usable as a filesystem path.
+ *
+ * The returned specifier is absolute under `bun run` (a real path) and under `bun build
+ * --compile` (a virtual `$bunfs` path), but Electrobun's bundler emits the asset next to the
+ * bundled entrypoint and hands back a bundle-relative path like `./tree-sitter-<hash>.wasm`.
+ * Reading that verbatim fails with ENOENT whenever the process cwd is not the bundle directory,
+ * which is exactly the case in a packaged desktop app.
+ *
+ * Resolving against `import.meta.dir` fixes the packaged case and is a no-op for the two
+ * absolute forms, so all three runtimes end up with a readable absolute path.
+ */
+async function importAssetPath(load: () => Promise<unknown>): Promise<string> {
+	const mod = (await load()) as { default?: unknown } | string;
+	const value = typeof mod === "string" ? mod : mod?.default;
+	if (typeof value !== "string") {
+		throw new Error(
+			`Embedded WASM asset did not resolve to a path (got ${typeof value}). ` +
+				'The runtime likely ignored the `with { type: "file" }` import attribute.',
+		);
+	}
+	const { isAbsolute, resolve } = await import("node:path");
+	return isAbsolute(value) ? value : resolve(import.meta.dir, value);
+}
+
+function resolveEmbeddedBashWasm(): Promise<string> {
+	bashWasmPromise ??= importAssetPath(
+		() => import("tree-sitter-bash/tree-sitter-bash.wasm", { with: { type: "file" } }),
+	);
+	return bashWasmPromise;
+}
+
 let parserPromise: Promise<TreeSitterParser> | null = null;
 
 async function getParser(): Promise<TreeSitterParser> {
@@ -1626,7 +1674,7 @@ async function initParser(): Promise<TreeSitterParser> {
 	// process-wide singleton with an unguarded init check: two callers racing it
 	// would each build an Emscripten module, and languages loaded against the
 	// losing one would hold pointers into an abandoned heap.
-	const bashBuf = await Bun.file(embeddedBashWasm).arrayBuffer();
+	const bashBuf = await Bun.file(await resolveEmbeddedBashWasm()).arrayBuffer();
 	const bashLanguage = await loadTreeSitterLanguage(new Uint8Array(bashBuf));
 	const parser = await createTreeSitterParser(bashLanguage);
 	return parser as unknown as TreeSitterParser;

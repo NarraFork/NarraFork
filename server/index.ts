@@ -2,6 +2,7 @@ import { DB_INTEGRITY_WORKER_FLAG } from "./db/integrity-protocol";
 import { neutralizeAmbientProxyEnv } from "./lib/net/proxy-env";
 import { waitForPreviousServerShutdown } from "./lib/restart-handoff";
 import { WATCHER_WORKER_FLAG } from "./lib/watcher/worker-protocol";
+import { installWebCryptoGlobals } from "./lib/webcrypto-globals";
 import { PLUGIN_RUNTIME_WORKER_FLAG } from "./plugin-runtime-worker";
 
 // Must run before ANY outbound fetch. Bun's fetch honours ambient HTTP(S)_PROXY
@@ -9,6 +10,12 @@ import { PLUGIN_RUNTIME_WORKER_FLAG } from "./plugin-runtime-worker";
 // values are snapshotted and blanked here to make the configured proxy policy
 // the single authority. See lib/net/proxy-env.ts.
 neutralizeAmbientProxyEnv();
+
+// Runtimes that omit the WebCrypto interface objects (notably Cottontail, Electrobun's
+// main-process runtime) break every `instanceof CryptoKey` guard, including the one inside
+// hono/jwt that all authentication depends on. Install them before anything imports a
+// WebCrypto consumer. See lib/webcrypto-globals.ts for the full explanation.
+await installWebCryptoGlobals();
 
 if (process.argv.includes(DB_INTEGRITY_WORKER_FLAG)) {
 	// Read-only integrity probe subprocess. Must be checked before anything else: importing ./main

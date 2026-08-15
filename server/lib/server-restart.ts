@@ -77,6 +77,17 @@ export function registerRuntimeAddressGetter(fn: RuntimeAddressGetter): void {
 	_runtimeAddressGetter = fn;
 }
 
+/**
+ * The address the server is currently bound to, or null before it has bound.
+ *
+ * The port is not known ahead of time: `server/main.ts` retries on conflict, so the configured
+ * port may not be the one in use. Embedders (the Electrobun desktop shell) need the actual
+ * address to point a window at, and polling this is how they learn the server is up.
+ */
+export function getRuntimeAddress(): RuntimeAddress | null {
+	return _runtimeAddressGetter?.() ?? null;
+}
+
 /** Called by server/main.ts to register the graceful shutdown implementation. */
 export function registerGracefulShutdownHandler(fn: GracefulShutdownFn): void {
 	_gracefulShutdownFn = fn;

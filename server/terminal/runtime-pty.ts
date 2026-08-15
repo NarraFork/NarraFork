@@ -6,11 +6,33 @@
  * is unavailable.
  */
 
-import { spawn as ptySpawn } from "bun-pty";
 import { clearInheritableHandlesBeforeSpawn } from "../lib/win-handle-guard";
 import type { TerminalRuntime, TerminalSpawnOptions } from "./runtime";
 
+/**
+ * bun-pty resolves its Rust shared library (`librust_pty`) at import time via FFI, and throws
+ * when the library is absent. Importing it eagerly therefore turns an optional terminal backend
+ * into a hard startup requirement — including on Linux/macOS, where `Bun.Terminal` is used and
+ * this module is never called. A bundler that cannot follow the FFI/dlopen edge (Electrobun's,
+ * for instance) then breaks server startup entirely.
+ *
+ * Requiring it lazily keeps the failure where it belongs: at the point a portable PTY is
+ * actually requested, reported to the caller that asked for one.
+ */
+type PtySpawn = typeof import("bun-pty").spawn;
+
+let ptySpawnFn: PtySpawn | null = null;
+
+function loadPtySpawn(): PtySpawn {
+	if (ptySpawnFn) return ptySpawnFn;
+	// Synchronous require: callers are synchronous, and this must throw in their call frame.
+	const mod = require("bun-pty") as { spawn: PtySpawn };
+	ptySpawnFn = mod.spawn;
+	return ptySpawnFn;
+}
+
 export function spawnPortablePty(opts: TerminalSpawnOptions): TerminalRuntime {
+	const ptySpawn = loadPtySpawn();
 	const env: Record<string, string> = {};
 	for (const [k, v] of Object.entries(opts.env)) {
 		if (v !== undefined) env[k] = v;

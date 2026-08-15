@@ -20,9 +20,39 @@
  * cached promise here rather than calling `Parser.init` itself.
  */
 
-// `import ... with { type: "file" }` gives Bun an explicit asset edge so the wasm
-// is present both in dev and in packaged binaries.
-import embeddedTreeSitterWasm from "web-tree-sitter/tree-sitter.wasm" with { type: "file" };
+/**
+ * Resolve the core engine wasm, keeping it embedded in compiled binaries.
+ *
+ * `import ... with { type: "file" }` declares an explicit asset edge so `bun build --compile`
+ * embeds the file and hands back a path. It MUST be expressed as a dynamic `import()` rather
+ * than a static one: Cottontail (Electrobun's alternate main-process runtime) only honours the
+ * `with` attribute on the top-level entrypoint and drops it on nested imports, silently
+ * resolving to a module object instead of a path string. Dynamic `import()` forwards the
+ * attribute correctly on both runtimes.
+ *
+ * The returned specifier is absolute under `bun run` / `bun build --compile`, but Electrobun's
+ * bundler emits a bundle-relative path like `./tree-sitter-<hash>.wasm`. Resolving against
+ * `import.meta.dir` fixes the packaged case and is a no-op for the two absolute forms.
+ */
+let treeSitterWasmPromise: Promise<string> | null = null;
+
+async function resolveEmbeddedTreeSitterWasm(): Promise<string> {
+	treeSitterWasmPromise ??= (async () => {
+		const mod = (await import("web-tree-sitter/tree-sitter.wasm", {
+			with: { type: "file" },
+		})) as { default?: unknown } | string;
+		const value = typeof mod === "string" ? mod : mod?.default;
+		if (typeof value !== "string") {
+			throw new Error(
+				`Embedded WASM asset did not resolve to a path (got ${typeof value}). ` +
+					'The runtime likely ignored the `with { type: "file" }` import attribute.',
+			);
+		}
+		const { isAbsolute, resolve } = await import("node:path");
+		return isAbsolute(value) ? value : resolve(import.meta.dir, value);
+	})();
+	return treeSitterWasmPromise;
+}
 
 export interface TreeSitterNodeLike {
 	type: string;
@@ -90,7 +120,7 @@ async function initRuntime(): Promise<TreeSitterRuntime> {
 	const { join } = await import("node:path");
 	const tmpDir = mkdtempSync(join(tmpdir(), "narrafork-wasm-"));
 
-	const coreBuf = await Bun.file(embeddedTreeSitterWasm).arrayBuffer();
+	const coreBuf = await Bun.file(await resolveEmbeddedTreeSitterWasm()).arrayBuffer();
 	const corePath = join(tmpDir, "tree-sitter.wasm");
 	writeFileSync(corePath, new Uint8Array(coreBuf));
 
