@@ -57,6 +57,8 @@ export interface UsageHistoryRawDump {
 export interface UsageHistoryRecord {
 	id: string;
 	narratorId: string | null;
+	/** 外部 Agent 写入时自带的叙述者文本（无 narrator 关联时用于占位显示）。 */
+	agentLabel?: string | null;
 	kind: string;
 	provider: string | null;
 	credentialId: string | null;

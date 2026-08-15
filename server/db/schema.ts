@@ -2789,9 +2789,11 @@ export const apiRequests = sqliteTable(
 	{
 		id: text("id").primaryKey(),
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
+		// 外部 Agent 写入时可自带的叙述者文本（无 narrator 关联时用于占位显示）
+		agentLabel: text("agent_label"),
 		// 关联的 assistant message ID（一个请求可能产生一个 assistant message）
 		messageId: text("message_id").references(() => narratorMessages.id, { onDelete: "set null" }),
-		// 请求用途：narrator / compact / title / internal 等
+		// 请求用途：narrator / compact / title / external / internal 等
 		kind: text("kind").notNull().default("narrator"),
 		// 提供商和模型信息
 		provider: text("provider"),

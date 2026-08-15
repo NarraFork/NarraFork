@@ -184,22 +184,34 @@ function getProviderColor(provider: string | null) {
 	}
 }
 
+/**
+ * Whether a request record originates from an external agent (kind=external,
+ * or legacy rows written by external harnesses with kind=narrator but no
+ * narrator association, e.g. provider=dsh).
+ */
+function isExternalRequest(record: UsageHistoryRecord): boolean {
+	const kind = record.kind?.trim().toLowerCase();
+	return kind === "external" || kind === "dsh" || record.provider?.trim().toLowerCase() === "dsh";
+}
+
 function getKindLabel(
 	t: (key: string, options: { defaultValue: string }) => string,
 	kind: string,
 ): string {
-	const normalizedKind = kind.trim().toLowerCase() === "dsh" ? "narrator" : kind;
+	const normalizedKind = kind.trim().toLowerCase() === "dsh" ? "external" : kind;
 	return t(`usageHistoryKind_${normalizedKind}`, { defaultValue: normalizedKind });
 }
 
 /**
- * Narrator-cell label for a request with no narrator association. DSH-imported
- * requests are identified by their provider because their kind is normalized to
- * `narrator`; everything else falls back to the generic system-request label.
+ * Narrator-cell label for a request with no narrator association. External
+ * agent requests (kind=external, or legacy dsh rows) default to
+ * "外部Agent请求" but prefer the agent-supplied label when the writing agent
+ * attached its own text; everything else falls back to the generic
+ * system-request label.
  */
 function getNarratorLabel(t: TFunction, record: UsageHistoryRecord): string {
-	if (record.provider?.trim().toLowerCase() === "dsh") {
-		return t("usageHistoryDshExternalRequest");
+	if (isExternalRequest(record)) {
+		return record.agentLabel?.trim() || t("usageHistoryExternalAgent");
 	}
 	return t("usageHistorySystemRequest");
 }
