@@ -5354,8 +5354,14 @@ export async function sendSubagentMessage(
 	if (narrator.status === "archived") {
 		throw new ValidationError("Archived subagents cannot receive messages");
 	}
+	const { resumeSubagent, resolveSubagentOriginToolUseId } = await import("./subagent-resume");
+	// Never-started subagents (e.g. a team temp worker recruited directly through
+	// the plugin API) carry a stale "working" status but have no real runner —
+	// buffering would strand the message forever. Route them to resume instead,
+	// which synthesizes a standalone origin tool-use id and starts them in place.
+	const neverStarted = !(await resolveSubagentOriginToolUseId(input.subagentId).catch(() => null));
 	const running = narrator.status === "working" || narrator.status === "waiting";
-	if (running) {
+	if (running && !neverStarted) {
 		const { bufferSubagentUserMessage } = await import("./subagent-executor");
 		const { isTakenOver } = await import("./subagent-takeover");
 		const result = bufferSubagentUserMessage(input.subagentId, input.message, {
@@ -5373,11 +5379,10 @@ export async function sendSubagentMessage(
 			bufferedAt: result.bufferedAt,
 		};
 	}
-	// Idle subagent: resume in-place with a follow-up turn. This requires the
-	// subagent to have been started at least once by its parent narrator (the
-	// originating Agent tool call is resolved internally); subagents that have
-	// never run report a clear ValidationError instead.
-	const { resumeSubagent } = await import("./subagent-resume");
+	// Idle (or never-started) subagent: resume in-place with a follow-up turn.
+	// This requires the subagent to have been started at least once by its parent
+	// narrator (the originating Agent tool call is resolved internally); subagents
+	// that have never run get a standalone origin synthesized and still start.
 	const resumed = await resumeSubagent({
 		subagentId: input.subagentId,
 		intent: "follow_up",

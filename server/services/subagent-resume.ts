@@ -352,8 +352,15 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 		if (await reconcileRunningStatus(input.subagentId)) {
 			original.status = (await narratorService.getById(input.subagentId)).status;
 		}
+		// A subagent that was never started by its parent (e.g. a team temp worker
+		// recruited directly through the plugin API) has no real runner, so its
+		// "working" status is stale — treating it as running would either buffer the
+		// message forever or reject the resume. Let the standalone start path
+		// below (which synthesizes an origin tool-use id) actually run it.
+		const neverStarted = !(await resolveSubagentOriginToolUseId(input.subagentId).catch(() => null));
 		if (
 			!manualOverride &&
+			!neverStarted &&
 			(original.status === "working" || original.status === "waiting") &&
 			!input.allowRunningRestart
 		) {
@@ -551,7 +558,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				persistPrompt: prepared.persistPrompt,
 				initialHistory: prepared.initialHistory,
 				initialTrailingToolResults: prepared.initialTrailingToolResults,
-				allowRunningRestart: input.allowRunningRestart,
+				allowRunningRestart: input.allowRunningRestart || neverStarted,
 				skipStaleAttach: input.skipStaleAttach,
 				preserveBackground: input.preserveBackground,
 				resumableUpdateLease: input.resumableUpdateLease,
