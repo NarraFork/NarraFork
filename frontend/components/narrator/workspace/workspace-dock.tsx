@@ -74,6 +74,13 @@ interface NarratorDockBridges {
 	appendChatInput: ((text: string) => void) | null;
 	writeTerminalStdin: ((text: string) => void) | null;
 	scrollToMessage: ((messageId: string) => void) | null;
+	/**
+	 * Submit text as a real user message through the narrator's own composer path
+	 * (used by the user-chat panel's "send to narrator"). See the note on the same
+	 * field in `dock/NarratorDockContext.tsx`: going through the composer is what
+	 * preserves busy-narrator buffering and slash-command handling.
+	 */
+	submitToNarrator: ((text: string) => void) | null;
 }
 
 /** Stable dockview panel id for a narrator-scoped tool panel. */
@@ -188,7 +195,12 @@ class WorkspaceDockStore {
 	private getBridges(narratorId: string): NarratorDockBridges {
 		let b = this.bridges.get(narratorId);
 		if (!b) {
-			b = { appendChatInput: null, writeTerminalStdin: null, scrollToMessage: null };
+			b = {
+				appendChatInput: null,
+				writeTerminalStdin: null,
+				scrollToMessage: null,
+				submitToNarrator: null,
+			};
 			this.bridges.set(narratorId, b);
 		}
 		return b;
@@ -224,6 +236,18 @@ class WorkspaceDockStore {
 		return () => {
 			if (b.scrollToMessage === fn) b.scrollToMessage = null;
 		};
+	}
+
+	registerSubmitToNarrator(narratorId: string, fn: (text: string) => void): () => void {
+		const b = this.getBridges(narratorId);
+		b.submitToNarrator = fn;
+		return () => {
+			if (b.submitToNarrator === fn) b.submitToNarrator = null;
+		};
+	}
+
+	submitToNarrator(narratorId: string, text: string) {
+		this.getBridges(narratorId).submitToNarrator?.(text);
 	}
 
 	scrollToMessage(narratorId: string, messageId: string) {
@@ -610,6 +634,9 @@ export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockC
 			registerScrollToMessage: (fn: (messageId: string) => void) =>
 				store.registerScrollToMessage(narratorId, fn),
 			scrollToMessage: (messageId: string) => store.scrollToMessage(narratorId, messageId),
+			registerSubmitToNarrator: (fn: (text: string) => void) =>
+				store.registerSubmitToNarrator(narratorId, fn),
+			submitToNarrator: (text: string) => store.submitToNarrator(narratorId, text),
 			refreshOpenToolTypes: () => {
 				const api = store.apiRef.current;
 				if (api) store.refreshOpenToolTypes(api);

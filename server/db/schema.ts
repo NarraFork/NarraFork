@@ -21,6 +21,38 @@ export const projects = sqliteTable("projects", {
 	copyFiles: text("copy_files"),
 	chapterSettings: text("chapter_settings", { mode: "json" }),
 	proxyDomain: text("proxy_domain"),
+	/**
+	 * Project layer of the layered trait system, same encoding as
+	 * `narrators.traits` so one encode/decode implementation serves both.
+	 * Resolution order is user → project → narrator (see lib/trait-layers.ts).
+	 */
+	traits: text("traits", { mode: "json" }).$type<string[]>().notNull().default([]),
+	/**
+	 * The user who created the project, and the only non-admin principal that may
+	 * change its membership without holding an explicit `manage` grant.
+	 *
+	 * `set null` rather than cascade: deleting an account must never delete the
+	 * project (and, through it, every chapter, worktree and conversation). A null
+	 * owner is therefore a real, permanent state — it also covers every project that
+	 * predates project ACLs, which the migration marks `public`. Those are
+	 * admin-managed until someone is handed ownership.
+	 */
+	// biome-ignore lint/suspicious/noExplicitAny: forward reference to users
+	ownerUserId: text("owner_user_id").references((): any => users.id, { onDelete: "set null" }),
+	/**
+	 * Who may reach the project at all — the outermost gate in the ACL chain.
+	 *
+	 * - "private" — owner, admins, and principals holding an `acl_grants` row
+	 * - "public"  — every signed-in user. What the migration assigns to existing
+	 *               projects so an upgrade hides nothing.
+	 *
+	 * Passing this gate is necessary, never sufficient: a narrator or knowledge
+	 * entry inside a reachable project is still governed by its own ACL, which is
+	 * why a private session stays invisible to project members.
+	 */
+	visibility: text("visibility", { enum: ["private", "public"] })
+		.notNull()
+		.default("private"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -387,7 +419,7 @@ export const narrators = sqliteTable(
 			enum: ["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"],
 		}).default("default"),
 		previousPermissionMode: text("previous_permission_mode"),
-		/** Persistent ID for the designated .narrafork/plan-{id}.md file while in plan mode. */
+		/** Persistent ID for the designated .narrafork/plans/plan-{id}.md file while in plan mode. */
 		planFileId: text("plan_file_id"),
 		reasoningEffort: text("reasoning_effort", {
 			enum: ["none", "low", "medium", "high", "xhigh", "max"],
@@ -553,12 +585,50 @@ export const narrators = sqliteTable(
 		 * is stored; the procedural glyph needs no column.
 		 */
 		avatarImageId: text("avatar_image_id"),
+		/**
+		 * The user who created this narrator, and the only non-admin principal that may
+		 * change its visibility or share it (see `canManageNarratorAcl`).
+		 *
+		 * `set null` rather than `cascade`: deleting a user must never take an entire
+		 * conversation history with it. A null owner is therefore a real, permanent state
+		 * — it also covers every row that predates this column, which the one-time
+		 * backfill marks `public`. Such rows are manageable by admins only, who can hand
+		 * one over with `POST /api/narrators/:id/transfer-owner`.
+		 */
+		// biome-ignore lint/suspicious/noExplicitAny: forward reference to users
+		ownerUserId: text("owner_user_id").references((): any => users.id, {
+			onDelete: "set null",
+		}),
+		/**
+		 * Who may READ this narrator. Write access never comes from here — it requires
+		 * ownership, admin, or an explicit `narrator_grants` row with access="write".
+		 *
+		 * - "private" — owner (+ granted users) only. Default for standalone narrators.
+		 * - "project" — visible to the members of the owning chapter's project. Default
+		 *               for chapter-bound narrators, so forking or merging someone else's
+		 *               chapter does not leave an unopenable node on the story graph.
+		 * - "public"  — every authenticated user. Also what the one-time backfill assigns
+		 *               to pre-ACL rows so an upgrade never silently hides existing work.
+		 *
+		 * NOTE: "project" currently resolves to the same audience as "public", because
+		 * there is no project membership table yet — every authenticated user can already
+		 * reach every project. The distinction is recorded here deliberately: when
+		 * membership lands, only the one branch in `narrator-acl.ts` has to change
+		 * instead of every call site.
+		 */
+		visibility: text("visibility", { enum: ["private", "project", "public"] })
+			.notNull()
+			.default("private"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
 	(table) => [
 		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
+		// FK covering index for user deletion, and the lookup behind "my narrators".
+		index("idx_narrators_owner").on(table.ownerUserId),
+		// Leads the visibility predicate pushed down into the paginated list query.
+		index("idx_narrators_visibility").on(table.visibility),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
@@ -579,6 +649,224 @@ export const narrators = sqliteTable(
 		index("idx_narrators_refs_inherited_from")
 			.on(table.refsInheritedFrom)
 			.where(sql`"refs_inherited_from" IS NOT NULL`),
+	],
+);
+
+// === narrator_grants ===
+/**
+ * Explicit per-user share list for a narrator, the "shared with specific people"
+ * half of narrator access control. The other half lives on the narrator itself:
+ * `owner_user_id` (always allowed) and `visibility` (the broad audience).
+ *
+ * Deliberately NOT folded into `knowledge_grants`: that table's FKs point at
+ * knowledge collections/tags and its two-axis clearance+compartment semantics do
+ * not apply here. Deliberately NOT folded into `integration_resource_bindings`
+ * either — that table answers "which integration may drive this narrator", is
+ * unique per resource, and so cannot express a list of N human viewers.
+ *
+ * All three identity columns are NOT NULL, so a single composite unique index is
+ * enough; the four-partial-index dance in `knowledge_grants` exists only because
+ * SQLite treats NULLs as distinct.
+ */
+export const narratorGrants = sqliteTable(
+	"narrator_grants",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			// biome-ignore lint/suspicious/noExplicitAny: self-module forward reference
+			.references((): any => narrators.id, { onDelete: "cascade" }),
+		/**
+		 * "user" — principalId is a users.id.
+		 * "role" — principalId is a role name. Reserved: "everyone" is expressed by
+		 *          `narrators.visibility = 'public'`, which needs no join.
+		 */
+		principalType: text("principal_type", { enum: ["user", "role"] }).notNull(),
+		principalId: text("principal_id").notNull(),
+		/**
+		 * "read"  — view the timeline, tool calls and the discussion room.
+		 * "write" — additionally send messages, decide permission requests and change
+		 *           session settings. Never implies the right to re-share: that stays
+		 *           with the owner and admins (see `canManageNarratorAcl`).
+		 */
+		access: text("access", { enum: ["read", "write"] })
+			.notNull()
+			.default("read"),
+		/** Who issued the grant. `set null` keeps the row auditable after user deletion. */
+		// biome-ignore lint/suspicious/noExplicitAny: forward reference to users
+		grantedBy: text("granted_by").references((): any => users.id, { onDelete: "set null" }),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_narrator_grant_unique").on(
+			table.narratorId,
+			table.principalType,
+			table.principalId,
+		),
+		// The hot path: "does this user hold a grant on this narrator" (point lookup),
+		// and the EXISTS subquery in the list predicate.
+		index("idx_narrator_grant_principal").on(table.principalType, table.principalId),
+		// FK covering index for narrator deletion (ON DELETE CASCADE).
+		index("idx_narrator_grant_narrator").on(table.narratorId),
+		// FK covering index for user deletion.
+		index("idx_narrator_grant_granted_by").on(table.grantedBy),
+	],
+);
+
+// === acl_grants ===
+/**
+ * The unified grant table: one shape for project, chapter, narrator and knowledge
+ * authorization.
+ *
+ * Supersedes `knowledge_grants` and `narrator_grants`, which expressed the same
+ * idea three different ways. Those tables are kept (deprecated, unread) for one
+ * release so a bad migration can be rolled back as code rather than as data.
+ *
+ * A row is one of exactly two shapes, never both:
+ *
+ *  A. CAPABILITY row — `capability` set, `domain_kind`/`domain_value` NULL.
+ *     "This principal may read / write / manage this scope." Projects and
+ *     narrators only ever produce these.
+ *
+ *  B. DOMAIN CREDENTIAL row — `domain_kind` + `domain_value` set, `capability`
+ *     pinned to 'read'. "This principal holds a clearance / compartment tag /
+ *     review tag." The pinned capability is a placeholder that keeps the unique
+ *     index single-valued; it does NOT mean the principal can read anything. The
+ *     knowledge layer still decides readability by comparing rank and tag sets.
+ *     Reading shape B as an authorization would promote a holder of one low
+ *     clearance into "can read everything" — an escalation, which is why the
+ *     kernel only ever unions these into an uninterpreted credential set.
+ *
+ * `scope_id` is NULL only for `scope_type = 'global'` (an instance-wide grant,
+ * which is how a collection-less clearance used to be expressed).
+ */
+export const aclGrants = sqliteTable(
+	"acl_grants",
+	{
+		id: text("id").primaryKey(),
+		/**
+		 * What the grant is attached to. Intentionally not a foreign key: the column is
+		 * polymorphic, and a grant row surviving its resource is preferable to a
+		 * cascade that quietly widens someone's access by deleting a narrowing scope.
+		 * Orphans are cleaned up by the same paths that delete the resource.
+		 */
+		scopeType: text("scope_type", {
+			enum: ["global", "project", "chapter", "narrator", "knowledge_collection", "knowledge_entry"],
+		}).notNull(),
+		scopeId: text("scope_id"),
+		/** "user" → users.id; "role" → a users.role value ("admin" | "user"). */
+		principalType: text("principal_type", { enum: ["user", "role"] }).notNull(),
+		principalId: text("principal_id").notNull(),
+		/**
+		 * read   — see it
+		 * write  — act in/on it
+		 * manage — change who else may. Never implied by write, and never inherited
+		 *          from an ancestor scope.
+		 * On shape B rows this is pinned to 'read' as a placeholder (see above).
+		 */
+		capability: text("capability", { enum: ["read", "write", "manage"] }).notNull(),
+		/** Shape B only. NULL on capability rows. */
+		domainKind: text("domain_kind", { enum: ["clearance", "tag", "review"] }),
+		/** Shape B only: a clearance level name or a tag id. NULL on capability rows. */
+		domainValue: text("domain_value"),
+		/** Who issued it. `set null` keeps the row auditable after user deletion. */
+		// biome-ignore lint/suspicious/noExplicitAny: forward reference to users
+		grantedBy: text("granted_by").references((): any => users.id, { onDelete: "set null" }),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		// Business uniqueness, split across four partial indexes because SQLite treats
+		// NULLs as distinct (so one composite index would admit duplicates for every
+		// NULL combination) and drizzle-kit mis-generates COALESCE expression indexes.
+		// Same technique as knowledge_grants; see its comment for the history.
+		//
+		// 1. scoped domain credential (e.g. a tag on one collection)
+		uniqueIndex("idx_acl_grant_unique_scoped_domain")
+			.on(
+				table.scopeType,
+				table.scopeId,
+				table.principalType,
+				table.principalId,
+				table.capability,
+				table.domainKind,
+				table.domainValue,
+			)
+			.where(sql`${table.scopeId} is not null and ${table.domainValue} is not null`),
+		// 2. scoped capability row — the common case (project / narrator grants)
+		uniqueIndex("idx_acl_grant_unique_scoped_capability")
+			.on(table.scopeType, table.scopeId, table.principalType, table.principalId, table.capability)
+			.where(sql`${table.scopeId} is not null and ${table.domainValue} is null`),
+		// 3. global domain credential (a clearance with no collection scope)
+		uniqueIndex("idx_acl_grant_unique_global_domain")
+			.on(
+				table.scopeType,
+				table.principalType,
+				table.principalId,
+				table.capability,
+				table.domainKind,
+				table.domainValue,
+			)
+			.where(sql`${table.scopeId} is null and ${table.domainValue} is not null`),
+		// 4. global capability row
+		uniqueIndex("idx_acl_grant_unique_global_capability")
+			.on(table.scopeType, table.principalType, table.principalId, table.capability)
+			.where(sql`${table.scopeId} is null and ${table.domainValue} is null`),
+		// The judgement hot path: "what does this principal hold" across a scope chain.
+		index("idx_acl_grant_principal").on(table.principalType, table.principalId),
+		// Reverse lookup: "who can reach this resource", and the EXISTS push-down.
+		index("idx_acl_grant_scope").on(table.scopeType, table.scopeId),
+		// FK covering index for user deletion.
+		index("idx_acl_grant_granted_by").on(table.grantedBy),
+	],
+);
+
+// === acl_events ===
+/**
+ * Append-only audit of AUTHORIZATION changes across every resource type.
+ *
+ * Unifies `knowledge_acl_events` and follows the wider shape of
+ * `integration_audit_events` (principal × resource × scope × outcome), so the two
+ * can eventually be read together.
+ *
+ * Deliberately has NO foreign keys: an audit row must outlive the grant, user and
+ * resource it describes, otherwise the record of "who removed whose access" is
+ * destroyed by the very deletion it documents.
+ *
+ * `detailJson` is redacted by construction — ids, booleans and level names only,
+ * never titles or content. An audit log that carried content would become a way to
+ * read what the reader was never allowed to see.
+ */
+export const aclEvents = sqliteTable(
+	"acl_events",
+	{
+		id: text("id").primaryKey(),
+		/** Who performed the change. Null for system-initiated changes (migrations). */
+		actorUserId: text("actor_user_id"),
+		actorRole: text("actor_role"),
+		/**
+		 * Free text rather than an enum on purpose: a new surface must be able to record
+		 * its own event kind without a schema migration. Known values are listed in
+		 * `acl-audit.ts`.
+		 */
+		eventType: text("event_type").notNull(),
+		/** Whose access changed. */
+		subjectType: text("subject_type", { enum: ["user", "role"] }),
+		subjectId: text("subject_id"),
+		/** What the change applied to. */
+		scopeType: text("scope_type").notNull(),
+		scopeId: text("scope_id"),
+		outcome: text("outcome", {
+			enum: ["granted", "revoked", "replaced", "transferred", "updated"],
+		}).notNull(),
+		detailJson: text("detail_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		// Keyset pagination reads newest-first over (createdAt, id).
+		index("idx_acl_event_created").on(table.createdAt, table.id),
+		index("idx_acl_event_scope").on(table.scopeType, table.scopeId),
+		index("idx_acl_event_subject").on(table.subjectType, table.subjectId),
+		index("idx_acl_event_actor").on(table.actorUserId),
 	],
 );
 
@@ -624,6 +912,16 @@ export const remoteDevices = sqliteTable(
 		/** JSON: { git, ripgrep, pty, ... } capability flags reported at handshake. */
 		capabilitiesJson: text("capabilities_json", { mode: "json" }).$type<Record<string, unknown>>(),
 		// ── Authorization scope ──
+		//
+		// Two independent axes. `scope`/`projectId` is the project axis and keeps its
+		// original meaning. `ownerScope` is the user axis: "private" restricts the
+		// device to its `createdBy` user (a personal dev box), "shared" leaves it
+		// available to everyone the project axis allows (a project deploy target or a
+		// communal build machine). Defaults to "shared" so existing rows behave
+		// exactly as before.
+		ownerScope: text("owner_scope", { enum: ["private", "shared"] })
+			.notNull()
+			.default("shared"),
 		scope: text("scope", { enum: ["global", "project"] })
 			.notNull()
 			.default("global"),
@@ -1339,6 +1637,14 @@ export const userPreferences = sqliteTable("user_preferences", {
 	// Sidebar navigation layout (JSON: { items: [{ id, hidden }] } — order = display order,
 	// hidden:true items live in the "More" overflow menu)
 	navLayout: text("nav_layout").notNull().default("{}"),
+	/**
+	 * User layer of the layered trait system — the lowest-priority layer, applied
+	 * to every narrator the user acts on. Same encoding as `narrators.traits`.
+	 * Resolved per acting user at request time, mirroring how `fastModeDefault`
+	 * feeds `narrators.fastModeOverride: "inherit"`, so narrators need no owner
+	 * column for this to work.
+	 */
+	traits: text("traits", { mode: "json" }).$type<string[]>().notNull().default([]),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -1501,6 +1807,112 @@ export const registrationCodes = sqliteTable(
 		uniqueIndex("idx_registration_codes_code_hash").on(table.codeHash),
 		index("idx_registration_codes_created_by").on(table.createdByUserId),
 		index("idx_registration_codes_used_by").on(table.usedByUserId),
+	],
+);
+
+// === chat_rooms ===
+// Human-to-human conversation, deliberately disjoint from `narrator_messages`:
+// nothing written here ever reaches a model's context unless a person explicitly
+// forwards it (see `submitToNarrator` on the client).
+//
+// Two kinds, and they differ in what membership MEANS:
+//   - `dm`       — a closed 1:1 conversation. `chat_room_members` is the ACCESS
+//                  CONTROL list: not a member ⇒ cannot read.
+//   - `narrator` — the discussion room beside one narrator. Membership is NOT
+//                  access control (read access follows narrator visibility, see
+//                  `assertCanRead` in chat-service); the row only holds that
+//                  user's read watermark and is created lazily on first visit.
+export const chatRooms = sqliteTable(
+	"chat_rooms",
+	{
+		id: text("id").primaryKey(),
+		kind: text("kind", { enum: ["dm", "narrator"] }).notNull(),
+		/**
+		 * Canonical identity of a DM: both user ids sorted ascending and joined
+		 * with ":". The unique index makes (A,B) and (B,A) collapse onto one row,
+		 * so two people opening the conversation simultaneously cannot create two
+		 * rooms. Null for narrator rooms.
+		 */
+		dmKey: text("dm_key"),
+		/** The narrator this room belongs to; null for DMs. Unique. */
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
+		/**
+		 * Per-room sequence allocator. `postMessage` claims a number inside the
+		 * write transaction (`next_seq = next_seq + 1`) rather than reading
+		 * `MAX(seq)`: that would be a scan that grows with the room, and two
+		 * concurrent senders would claim the same number.
+		 */
+		nextSeq: integer("next_seq").notNull().default(1),
+		/** Room-list ordering, and a cheap "is there anything new" probe. */
+		lastMessageAt: text("last_message_at"),
+		/**
+		 * Server-truncated summary for the room list (CHAT_PREVIEW_MAX_CHARS).
+		 * Exists so the list endpoint never reads `chat_messages.content_text`.
+		 */
+		lastMessagePreview: text("last_message_preview"),
+		lastMessageSenderId: text("last_message_sender_id"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_chat_rooms_dm_key").on(table.dmKey),
+		uniqueIndex("idx_chat_rooms_narrator").on(table.narratorId),
+		index("idx_chat_rooms_kind_last").on(table.kind, table.lastMessageAt),
+	],
+);
+
+// === chat_room_members ===
+// See the note on `chat_rooms.kind`: for a DM this row grants access, for a
+// narrator room it only stores the read watermark.
+export const chatRoomMembers = sqliteTable(
+	"chat_room_members",
+	{
+		id: text("id").primaryKey(),
+		roomId: text("room_id")
+			.notNull()
+			.references(() => chatRooms.id, { onDelete: "cascade" }),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		/** Highest seq this user has read (inclusive). Unread = count(seq > this). */
+		lastReadSeq: integer("last_read_seq").notNull().default(0),
+		lastReadAt: text("last_read_at"),
+		muted: integer("muted", { mode: "boolean" }).notNull().default(false),
+		joinedAt: text("joined_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_chat_room_members_room_user").on(table.roomId, table.userId),
+		index("idx_chat_room_members_user_room").on(table.userId, table.roomId),
+	],
+);
+
+// === chat_messages ===
+// `seq` is the pagination cursor, so numbers are never recycled: a deletion is a
+// soft delete (`deleted_at` set, body emptied) and the row stays to keep the
+// cursor sequence contiguous.
+export const chatMessages = sqliteTable(
+	"chat_messages",
+	{
+		id: text("id").primaryKey(),
+		roomId: text("room_id")
+			.notNull()
+			.references(() => chatRooms.id, { onDelete: "cascade" }),
+		/** Monotonic within the room, claimed from `chat_rooms.next_seq`. */
+		seq: integer("seq").notNull(),
+		senderUserId: text("sender_user_id").references(() => users.id, { onDelete: "set null" }),
+		/** `text` = written by a person; `system` = a room event (e.g. DM created). */
+		kind: text("kind", { enum: ["text", "system"] })
+			.notNull()
+			.default("text"),
+		contentText: text("content_text").notNull(),
+		/** Quoted message in the same room. */
+		replyToMessageId: text("reply_to_message_id"),
+		editedAt: text("edited_at"),
+		deletedAt: text("deleted_at"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_chat_messages_room_seq").on(table.roomId, table.seq),
+		index("idx_chat_messages_sender").on(table.senderUserId),
 	],
 );
 
@@ -2468,6 +2880,19 @@ export const knowledgeCollections = sqliteTable(
 		slug: text("slug").notNull(),
 		description: text("description"),
 		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
+		/**
+		 * Whether reaching this collection additionally requires membership of its
+		 * project.
+		 *
+		 * Opt-in, and false for every collection that predates project ACLs: those were
+		 * created when any signed-in user could reach any project, so switching the gate
+		 * on during a migration would silently hide readable content — and "content
+		 * stopped appearing" is the hardest kind of regression to notice. New
+		 * project-scoped collections default to true. Meaningless when projectId is null.
+		 */
+		inheritProjectGate: integer("inherit_project_gate", { mode: "boolean" })
+			.notNull()
+			.default(true),
 		// Default classification level (knowledge_levels.name) inherited by entries; public = no clearance gate.
 		defaultLevel: text("default_level").notNull().default("public"),
 		// Classification level (knowledge_levels.name) gating access to the COLLECTION itself;

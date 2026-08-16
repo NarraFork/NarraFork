@@ -6,6 +6,7 @@ import {
 	normalizeLocale,
 	pickLocalizedValue,
 } from "@shared/i18n-locales";
+import { buildPlanFileRelPath, PLAN_DIR_REL } from "../plan-file-path";
 import { IS_WINDOWS } from "../platform";
 
 const sh = IS_WINDOWS ? "shell" : "bash";
@@ -68,17 +69,21 @@ Core files:
 {
 	"tasks": [
 		{ "text": "Do the current thing", "status": "doing" },
-		{ "text": "Run the relevant tests and record passing results", "status": "todo", "protected": true }
+		{ "text": "Run the relevant tests and record passing results", "status": "todo" }
 	]
 }
 \`\`\`
 Allowed statuses: \`todo\`, \`doing\`, \`done\`, \`blocked\`. Do not add IDs, timestamps, summaries, evidence, or runtime metadata to \`tasks.json\`.
 
-Every open task must be finite, executable, and have an observable completion condition. \`protected: true\` is an auto-continuation commitment: while it remains open, NarraFork may start another turn automatically. Never store standing behavior rules, prohibitions, safety guardrails, or constraints with no terminal state in \`tasks.json\`; those belong in \`spec://behavior_fence\`, and may only be recorded there when the user explicitly asks.
+Every open task must be finite, executable, and have an observable completion condition — you must be able to state what would make it done. Two shapes are NOT tasks and must never go in \`tasks.json\`:
+- Standing behavior rules, prohibitions, and guardrails ("never touch X", "must not break Y"). These have no terminal state, so the scheduler will nudge them forever. They belong in \`spec://behavior_fence\`, and only when the user explicitly asks.
+- Open-ended acceptance ("full verification", "ensure quality", "finish everything"). Split these into concretely checkable steps instead; otherwise no amount of evidence can ever close them.
+
+\`protected: true\` records a user commitment and may trigger auto-continuation while it stays open. Set it ONLY when the user explicitly demanded that a task's completion be guaranteed (for example "make sure this gets done"). Otherwise leave it off, however important the task feels: requirements change, and a task you protected yourself becomes a commitment you cannot retract. Ordinary tasks already drive reminders and continuation.
 
 ${blockedTaskActionInstructions.en}
 
-Protected tasks are commitments. Only mark them done, delete them, or replace them when you have concrete evidence; the system will run taskReflection for protected-task changes. If you accidentally created a protected non-task constraint, do not mark it done. Correct the task entry while preserving the underlying user intent; taskReflection will review that repair.
+Every protected-task change runs taskReflection, so mark one done, delete it, or replace it only with concrete evidence. If you protected something you should not have, do not mark it done to escape it — remove the protected flag while preserving the underlying user intent.
 
 Do not use Bash or Glob for \`spec://\` virtual files.
 </system-reminder>`,
@@ -102,17 +107,21 @@ NarraFork 为每个叙述者维护一个 Dynamic Spec：它是一个虚拟的 \`
 {
 	"tasks": [
 		{ "text": "执行当前事项", "status": "doing" },
-		{ "text": "运行相关测试并记录通过结果", "status": "todo", "protected": true }
+		{ "text": "运行相关测试并记录通过结果", "status": "todo" }
 	]
 }
 \`\`\`
 允许的状态只有：\`todo\`、\`doing\`、\`done\`、\`blocked\`。不要向 \`tasks.json\` 添加 ID、时间戳、摘要、证据或运行时元数据。
 
-每条开放任务都必须是有限、可执行且有可观察完成条件的工作项。\`protected: true\` 是自动续跑承诺：只要它仍未完成，NarraFork 就可能在回合结束后自动开始下一轮。绝不能把长期行为规则、禁止事项、安全护栏或没有完成终点的约束写入 \`tasks.json\`；这类内容属于 \`spec://behavior_fence\`，且只有用户明确要求记录时才能写入。
+每条开放任务都必须是有限、可执行且有可观察完成条件的工作项 — 你必须能说出"做到什么就算完成"。以下两种形态不是任务，绝不能写入 \`tasks.json\`：
+- 长期行为规则、禁止事项、安全护栏（"不得改动 X"、"不能破坏 Y"）。它们没有完成终点，调度器会无限续跑它们。这类内容属于 \`spec://behavior_fence\`，且只有用户明确要求时才能写入。
+- 范围无界的验收（"全量验收"、"确保质量"、"把所有事情做完"）。应拆成可逐条核验的具体步骤；否则无论补多少证据都无法关闭。
+
+\`protected: true\` 记录的是用户承诺，未完成时可能触发自动续跑。只有当用户明确要求确保某个任务完成时才可设置（例如"务必完成"）。其他情况一律不设，无论任务看起来多重要：需求随时会变，你自行设置的 protected 会变成无法撤回的承诺。普通任务同样会触发提醒和续跑。
 
 ${blockedTaskActionInstructions["zh-CN"]}
 
-protected task 是承诺。只有在有具体证据时才能标记 done、删除或替换；系统会对 protected task 变更触发 taskReflection。如果误建了 protected 的非任务约束，不要把它标记为 done；应在保留底层用户意图的前提下纠正任务条目，并交由 taskReflection 审查。
+每次 protected task 变更都会触发 taskReflection，因此只有在有具体证据时才能标记 done、删除或替换。如果你设置了本不该设置的 protected，不要靠标记 done 来摆脱它 — 应在保留底层用户意图的前提下移除 protected 标记。
 
 不要用 Bash 或 Glob 访问 \`spec://\` 虚拟文件。
 </system-reminder>`,
@@ -172,6 +181,8 @@ STRICTLY FORBIDDEN: ANY project file edits, modifications, or system changes. Do
 
 **Exception**: You may ONLY write to the designated plan file: \`${planFile}\`. Write/Edit calls targeting any other file will be REJECTED. You must explicitly use the correct plan file path.
 
+Plan files always live under \`${PLAN_DIR_REL}/\` in the working directory. Even when a session permits other file writes, the plan itself must stay in that directory — a plan file outside it is refused at submission.
+
 ## Your Responsibility
 
 Think, read, search, and construct a well-formed plan that accomplishes the user's goal. Your plan should be comprehensive yet concise, detailed enough to execute effectively while avoiding unnecessary verbosity.
@@ -222,6 +233,8 @@ Your turn should only end with either asking the user a question or calling Exit
 
 **例外**：你唯一可以写入的文件是指定的计划文件：\`${planFile}\`。Write/Edit 调用如果目标不是此文件将被拒绝。你必须显式使用正确的计划文件路径。
 
+计划文件始终位于工作目录下的 \`${PLAN_DIR_REL}/\` 中。即使当前会话允许修改其他文件，计划本身也必须留在该目录内 — 目录之外的计划文件在提交时会被拒绝。
+
 ## 你的职责
 
 思考、阅读、搜索，并构建一个完善的计划来实现用户的目标。计划应全面而简洁，足够详细以有效执行，同时避免不必要的冗长。
@@ -266,18 +279,22 @@ ${planFileState}
 };
 
 /**
+ * @param planFilePath   Resolved relative path of the designated plan file. It is
+ *   passed in rather than rebuilt from the plan identity because during the move
+ *   to `.narrafork/plans/` one identity can still map to a legacy path: the
+ *   reminder, the write gate and ExitPlanMode resolution must all name the SAME
+ *   file, or the model is told to write somewhere the gate will reject.
  * @param planFileBytes  Size of the designated plan file on disk, when it already
  *   has content. Pass `undefined`/0 for a fresh plan cycle so the reminder keeps
  *   its original "write the first section" flow.
  */
 export function getPlanModeSystemReminder(
 	locale: Locale = DEFAULT_LOCALE,
-	planFileId?: string,
+	planFilePath?: string,
 	allowInline = true,
 	planFileBytes?: number,
 ): string {
-	const fileId = planFileId ?? "unknown";
-	const planFile = `.narrafork/plan-${fileId}.md`;
+	const planFile = planFilePath?.trim() || buildPlanFileRelPath("unknown");
 	const planFileState =
 		planFileBytes && planFileBytes > 0
 			? `\n${pickLocalizedValue(planFileStateSection, locale)(planFile, planFileBytes)}\n`

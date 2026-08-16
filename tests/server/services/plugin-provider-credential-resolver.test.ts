@@ -239,3 +239,112 @@ describe("plugin provider credential resolver", () => {
 		}
 	});
 });
+
+/**
+ * Config size must not scale with how many credentials a plugin stores.
+ *
+ * The resolver injects exactly the secret fields a provider *declared*, so a plugin that keeps
+ * its credentials under runtime-generated vault keys receives none of them here — it reads them
+ * itself. That is what makes hundreds of credentials expressible: the old design put the whole
+ * set into one declared field, so credential count inflated the injected config and ran into
+ * both the vault's per-value limit and the provider's own `maxConfigBytes`.
+ *
+ * These tests pin the *host-side* half of that arrangement. Raising a byte ceiling would not
+ * have achieved it; the coupling had to be removed.
+ */
+describe("config size is independent of credential count", () => {
+	const sentinelSchema = {
+		type: "object",
+		properties: {
+			loadBalancingMode: { type: "string" },
+			credentialsIndex: { type: "string", writeOnly: true },
+		},
+		additionalProperties: false,
+	} as unknown as Record<string, JsonValue>;
+
+	test("undeclared per-credential keys are never injected", async () => {
+		// Three credentials in the vault under runtime-generated keys, plus the sentinel.
+		const { resolver } = resolverFor(
+			{
+				[providerSecretKey("demo", "credentialsIndex")]: JSON.stringify({
+					revision: 7,
+					count: 3,
+				}),
+				[providerSecretKey("demo", "cred.aaa")]: JSON.stringify({ id: "aaa" }),
+				[providerSecretKey("demo", "cred.bbb")]: JSON.stringify({ id: "bbb" }),
+				[providerSecretKey("demo", "cred.ccc")]: JSON.stringify({ id: "ccc" }),
+			},
+			{ configSchema: sentinelSchema, config: { loadBalancingMode: "priority" } },
+		);
+
+		const resolved = await resolver.resolve("inst-demo");
+		expect(Object.keys(resolved).sort()).toEqual(["credentialsIndex", "loadBalancingMode"]);
+	});
+
+	test("injected config stays the same size as credentials are added", async () => {
+		const secrets: Record<string, string> = {
+			[providerSecretKey("demo", "credentialsIndex")]: JSON.stringify({
+				revision: 1,
+				count: 1,
+			}),
+			[providerSecretKey("demo", "cred.one")]: JSON.stringify({ id: "one" }),
+		};
+		const small = resolverFor(secrets, {
+			configSchema: sentinelSchema,
+			config: { loadBalancingMode: "priority" },
+		});
+		const withOne = JSON.stringify(await small.resolver.resolve("inst-demo")).length;
+
+		// 400 more credentials, each carrying JWT-sized tokens: over 1 MB of stored material.
+		const jwt = `eyJ${"A".repeat(1_000)}`;
+		for (let index = 0; index < 400; index += 1) {
+			secrets[providerSecretKey("demo", `cred.gen-${index}`)] = JSON.stringify({
+				id: `gen-${index}`,
+				refreshToken: jwt,
+				accessToken: jwt,
+			});
+		}
+		const large = resolverFor(secrets, {
+			configSchema: sentinelSchema,
+			config: { loadBalancingMode: "priority" },
+		});
+		const withManyConfig = await large.resolver.resolve("inst-demo");
+		const withMany = JSON.stringify(withManyConfig).length;
+
+		// Only the sentinel's own `count` differs, so the payload does not grow with the set.
+		expect(withMany).toBeLessThan(withOne + 16);
+		// single-field design would have exceeded at roughly six credentials.
+		expect(withMany).toBeLessThan(16_384);
+	});
+
+	test("the sentinel still reaches the plugin, so it can tell configured from empty", async () => {
+		// The sentinel is the one credential-related value that must be injected: it is what
+		// `requiresConfig` and `secretsSet` inspect, and a per-credential key cannot be
+		// declared statically because its id is generated at runtime.
+		const { resolver } = resolverFor(
+			{
+				[providerSecretKey("demo", "credentialsIndex")]: JSON.stringify({
+					revision: 7,
+					count: 3,
+				}),
+			},
+			{ configSchema: sentinelSchema, config: {} },
+		);
+
+		expect(await resolver.resolve("inst-demo")).toEqual({
+			credentialsIndex: JSON.stringify({ revision: 7, count: 3 }),
+		});
+	});
+
+	test("no sentinel means the field is absent, not empty", async () => {
+		// Absent is how the plugin tells "never configured" from "configured as empty", and it
+		// is why zero credentials must delete the key rather than store a count of zero.
+		const { resolver } = resolverFor(
+			{ [providerSecretKey("demo", "cred.orphan")]: JSON.stringify({ id: "orphan" }) },
+			{ configSchema: sentinelSchema, config: {} },
+		);
+
+		const resolved = await resolver.resolve("inst-demo");
+		expect("credentialsIndex" in resolved).toBe(false);
+	});
+});

@@ -228,7 +228,7 @@ describe("computeToolRunFrames", () => {
 
 	it("groups a run of 3 consecutive in-run tool cards into one frame", () => {
 		const items = [toolCallInRun("t1"), toolCallInRun("t2"), toolCallInRun("t3")];
-		expect(computeToolRunFrames(items)).toEqual([{ start: 0, end: 2 }]);
+		expect(computeToolRunFrames(items)).toEqual([{ key: "run:t1", start: 0, end: 2 }]);
 	});
 
 	it("produces separate frames for two runs split by a message bubble", () => {
@@ -240,9 +240,28 @@ describe("computeToolRunFrames", () => {
 			toolCallInRun("t4"),
 		];
 		expect(computeToolRunFrames(items)).toEqual([
-			{ start: 0, end: 1 },
-			{ start: 3, end: 4 },
+			{ key: "run:t1", start: 0, end: 1 },
+			{ key: "run:t3", start: 3, end: 4 },
 		]);
+	});
+
+	it("keys each frame by its first member, not by its index", () => {
+		// The fold transition pairs a frame's before/after geometry by this key. An
+		// index-keyed frame would be paired with a DIFFERENT run's box whenever a fold
+		// earlier in the document renumbered the items, which is precisely the rebuild
+		// the transition has to diff across.
+		const before = [stubItem("markdown", "m", {}), toolCallInRun("t1"), toolCallInRun("t2")];
+		// Same run, one extra element inserted above it: every index shifted by one.
+		const after = [
+			stubItem("markdown", "m", {}),
+			stubItem("markdown", "n", {}),
+			toolCallInRun("t1"),
+			toolCallInRun("t2"),
+		];
+		const [beforeFrame] = computeToolRunFrames(before);
+		const [afterFrame] = computeToolRunFrames(after);
+		expect(beforeFrame?.start).not.toBe(afterFrame?.start);
+		expect(beforeFrame?.key).toBe(afterFrame?.key);
 	});
 
 	it("never frames a lone in-run item (≥2 guard)", () => {
@@ -261,7 +280,7 @@ describe("computeToolRunFrames", () => {
 
 	it("merges a mixed tool-call + subagent-card run into one frame", () => {
 		const items = [toolCallInRun("t1"), subagentInRun("s1"), toolCallInRun("t2")];
-		expect(computeToolRunFrames(items)).toEqual([{ start: 0, end: 2 }]);
+		expect(computeToolRunFrames(items)).toEqual([{ key: "run:t1", start: 0, end: 2 }]);
 	});
 
 	it("does not extend a run through a standalone subagent card", () => {

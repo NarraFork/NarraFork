@@ -1279,46 +1279,87 @@ class BackgroundTaskService {
 		this.activeAgentContinuations.delete(taskId);
 	}
 
-	/** Cancel Agent task rows whose in-memory executor was lost in an unclean restart. */
-	async recoverStaleAgentTasksAfterRestart(
+	/**
+	 * Cancel background task rows whose in-memory executor was lost in an unclean
+	 * restart.
+	 *
+	 * ## Why BOTH types, and why bash used to leak
+	 *
+	 * A `running` row only means something while the process/executor that owns it is
+	 * alive in THIS process: the row is the durable half, the executor is the half that
+	 * actually reports the terminal state. An unclean exit destroys the second half and
+	 * leaves the first, so every surviving `running` row is a lie that nothing else will
+	 * ever correct.
+	 *
+	 * This used to filter `type = "agent"`, which left `type = "bash"` rows pinned at
+	 * `running` forever: the child process is gone, so no `markCompleted` will ever fire;
+	 * `Await` waits out its full timeout on an event that cannot arrive; and
+	 * `cleanupCompleted`'s `ne(status, "running")` refuses to reap them, so they
+	 * accumulate for the lifetime of the database. (`killAll` only runs on the graceful
+	 * shutdown path, which is exactly the path that does NOT leave stale rows.)
+	 *
+	 * Bash rows are unconditionally stale, never protected: `narrator_tool_continuations`
+	 * has no `background_bash` kind, so a background command has no resume path — nothing
+	 * can re-adopt a dead child process. Only agent rows can appear in
+	 * `protectedTaskIds` (from `background_agent` continuations), because a subagent CAN
+	 * be resumed from persisted state.
+	 *
+	 * ## Why this cancels rather than delivering a completion
+	 *
+	 * A restart is an environment event, not a result the model asked for, so this
+	 * deliberately does NOT push an injection — it mirrors `markCancelled`, which also
+	 * only emits and broadcasts. The row reaching a terminal state is what unblocks
+	 * `Await` (via the `cancelled` event) and what makes the row reapable; the parent's
+	 * timeline is not owed a bubble for a server bounce.
+	 */
+	async recoverStaleTasksAfterRestart(
 		protectedTaskIds: ReadonlySet<string> = new Set(),
 	): Promise<number> {
 		const staleTasks = (
 			await db
 				.select({
 					id: backgroundTasks.id,
+					type: backgroundTasks.type,
 					parentNarratorId: backgroundTasks.parentNarratorId,
 					subagentNarratorId: backgroundTasks.subagentNarratorId,
 				})
 				.from(backgroundTasks)
-				.where(and(eq(backgroundTasks.type, "agent"), eq(backgroundTasks.status, "running")))
+				.where(eq(backgroundTasks.status, "running"))
 				.all()
-		).filter((task) => !protectedTaskIds.has(task.id));
+		)
+			// Only an agent row can be protected — see the note above on why a bash row
+			// has no resume path to protect.
+			.filter((task) => task.type === "bash" || !protectedTaskIds.has(task.id));
 		if (staleTasks.length === 0) return 0;
 
 		const now = new Date().toISOString();
 		const taskIds = staleTasks.map((task) => task.id);
-		const narratorIds = [...new Set(staleTasks.map((task) => task.subagentNarratorId ?? task.id))];
 		await db
 			.update(backgroundTasks)
 			.set({ status: "cancelled", completedAt: now, updatedAt: now })
-			.where(
-				and(
-					inArray(backgroundTasks.id, taskIds),
-					eq(backgroundTasks.type, "agent"),
-					eq(backgroundTasks.status, "running"),
-				),
-			);
-		await db
-			.update(narrators)
-			.set({
-				isBackground: false,
-				backgroundStatus: "cancelled",
-				backgroundResult: "Background task was interrupted by a server restart.",
-				backgroundCompletedAt: now,
-				updatedAt: now,
-			})
-			.where(inArray(narrators.id, narratorIds));
+			.where(and(inArray(backgroundTasks.id, taskIds), eq(backgroundTasks.status, "running")));
+
+		// Only agent tasks carry a subagent narrator whose background fields describe the
+		// run; a bash task has no narrator row of its own to reset.
+		const narratorIds = [
+			...new Set(
+				staleTasks
+					.filter((task) => task.type === "agent")
+					.map((task) => task.subagentNarratorId ?? task.id),
+			),
+		];
+		if (narratorIds.length > 0) {
+			await db
+				.update(narrators)
+				.set({
+					isBackground: false,
+					backgroundStatus: "cancelled",
+					backgroundResult: "Background task was interrupted by a server restart.",
+					backgroundCompletedAt: now,
+					updatedAt: now,
+				})
+				.where(inArray(narrators.id, narratorIds));
+		}
 
 		for (const task of staleTasks) {
 			this.cleanupRuntime(task.id);
@@ -1326,13 +1367,28 @@ class BackgroundTaskService {
 				type: "background_task:cancelled",
 				taskId: task.id,
 				parentNarratorId: task.parentNarratorId,
-				taskType: "agent",
+				taskType: task.type,
 			});
 		}
-		logger.info("Recovered stale background Agent tasks after restart", {
+		let bashCount = 0;
+		for (const task of staleTasks) if (task.type === "bash") bashCount++;
+		logger.info("Recovered stale background tasks after restart", {
 			count: staleTasks.length,
+			bash: bashCount,
+			agent: staleTasks.length - bashCount,
 		});
 		return staleTasks.length;
+	}
+
+	/**
+	 * @deprecated Use {@link recoverStaleTasksAfterRestart}, which also reaps stale
+	 * `bash` rows. Kept as a thin alias so an out-of-tree caller does not silently lose
+	 * the agent cleanup it already depends on.
+	 */
+	async recoverStaleAgentTasksAfterRestart(
+		protectedTaskIds: ReadonlySet<string> = new Set(),
+	): Promise<number> {
+		return this.recoverStaleTasksAfterRestart(protectedTaskIds);
 	}
 
 	// ── Cleanup ─────────────────────────────────────────────────────────

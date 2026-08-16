@@ -50,5 +50,11 @@
 	"attributionHasExternal": "另有外部/终端改动",
 	"attributionExternal": "外部",
 	"attributionUnknown": "未知",
-	"attributionUnnamed": "未命名会话"
+	"attributionUnnamed": "未命名会话",
+	"attributionDeletedSession": "已删除的会话",
+	"attributionSubagentUnnamed": "未命名 {{type}} 子代理",
+	"attributionSubagentDetail": "{{name}}（{{type}} 子代理）",
+	"attributionSubagentDetailWithParent": "{{name}}（{{parent}} 的 {{type}} 子代理）",
+	"attributionImprecise": "含作用范围未经验证的 shell 改动，归因可能不完整",
+	"attributionWindowTruncated": "归因未完全加载 —— 更早的改动超出了查询窗口"
 }

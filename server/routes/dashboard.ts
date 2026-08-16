@@ -9,7 +9,11 @@ import {
 	scheduledTasks,
 	terminals,
 } from "../db/schema";
+import { narratorPrincipalOf } from "../lib/narrator-access";
+import { projectPrincipalOf } from "../lib/project-access";
+import { narratorReadableWhere } from "../services/narrator-acl";
 import { narratorService } from "../services/narrator-service";
+import { projectReadableWhere } from "../services/project-acl";
 
 export const dashboardRoutes = new Hono();
 
@@ -20,19 +24,30 @@ export const dashboardRoutes = new Hono();
  */
 dashboardRoutes.get("/summary", async (c) => {
 	// ── Projects ──────────────────────────────────────────────────────────
+	// Counted over the projects this user may read. A total that included projects they
+	// cannot open would be both misleading and a disclosure of how much other work
+	// exists on the instance.
+	const projectReadable = projectReadableWhere(projectPrincipalOf(c));
 	const [activeProjectResult] = await db
 		.select({ c: count() })
 		.from(projects)
-		.where(eq(projects.status, "active"));
+		.where(and(eq(projects.status, "active"), projectReadable));
 	const activeProjectCount = activeProjectResult?.c ?? 0;
 
-	const [totalProjectResult] = await db.select({ c: count() }).from(projects);
+	const [totalProjectResult] = await db
+		.select({ c: count() })
+		.from(projects)
+		.where(projectReadable);
 	const totalProjectCount = totalProjectResult?.c ?? 0;
 
 	// ── Narrators (primary variant only, exclude archived) ────────────────
+	// Every narrator aggregate below is scoped to what this user may read. Counting
+	// sessions they cannot open would both mislead ("3 waiting" with nothing to act
+	// on) and leak activity from private work.
 	const narratorBaseCondition = and(
 		eq(narrators.variant, "primary"),
 		ne(narrators.status, "archived"),
+		narratorReadableWhere(narratorPrincipalOf(c)),
 	);
 
 	const [workingResult] = await db

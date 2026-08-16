@@ -87,7 +87,9 @@ Latest TODO list from narrator state:
 3. **Write your complete plan to the plan file above** using the Write tool
 4. Call ExitPlanMode when ready for user approval
 
-In plan mode, Write/Edit operations are restricted to the plan file only.`,
+In plan mode, Write/Edit operations are restricted to the plan file only.
+
+**Plan file location:** plan files always live under \`.narrafork/plans/\` in the working directory. Even in relaxed plan mode — where you may write other files while planning — the plan itself must stay in that directory. A \`plan_file_path\` resolving outside \`.narrafork/plans/\` is refused at submission, including via a symlink.`,
 		"zh-CN": `已进入计划模式。你的指定计划文件是：
 
 \`{planFilePath}\`
@@ -98,7 +100,9 @@ In plan mode, Write/Edit operations are restricted to the plan file only.`,
 3. **将完整计划写入上述计划文件**（使用 Write 工具）
 4. 准备好后调用 ExitPlanMode 提交用户批准
 
-在计划模式下，Write/Edit 操作被限制为只能写入计划文件。`,
+在计划模式下，Write/Edit 操作被限制为只能写入计划文件。
+
+**计划文件位置：** 计划文件始终位于工作目录下的 \`.narrafork/plans/\` 中。即使处于宽松计划模式（规划期间允许修改其他文件），计划本身也必须留在该目录内。\`plan_file_path\` 解析结果落在 \`.narrafork/plans/\` 之外（包括通过符号链接）会在提交时被拒绝。`,
 	},
 	"tool.exitPlanModeOutput": {
 		en: "Plan approved.",
@@ -185,6 +189,11 @@ In plan mode, Write/Edit operations are restricted to the plan file only.`,
 	"tool.exitPlanModePlanFileInvalid": {
 		en: 'Error: The plan file "{planFile}" must be a regular Markdown file (.md or .markdown).',
 		"zh-CN": '错误：计划文件 "{planFile}" 必须是普通 Markdown 文件（.md 或 .markdown）。',
+	},
+	"tool.exitPlanModePlanFileOutsidePlansDir": {
+		en: 'Error: The plan file "{planFile}" is outside "{plansDir}/". Plan files must live in that directory of the working directory, even when this session permits writing other files. Move the plan into "{plansDir}/" (or use the designated plan file "{defaultPlanFile}") and submit again.',
+		"zh-CN":
+			'错误：计划文件 "{planFile}" 不在 "{plansDir}/" 目录内。即使当前会话允许修改其他文件，计划文件也必须位于工作目录下的该目录中。请把计划移入 "{plansDir}/"（或直接使用指定计划文件 "{defaultPlanFile}"）后重新提交。',
 	},
 	"tool.exitPlanModePlanFileTooLarge": {
 		en: 'Error: The plan file "{planFile}" exceeds the maximum supported size of {maxBytes} bytes. Please split the plan into a smaller file.',
@@ -680,6 +689,10 @@ You are still in relaxed plan mode. This non-read-only tool call was allowed onl
 		"zh-CN":
 			"- 每条开放任务必须有限、可执行且有完成条件；protected task 未完成时可能触发自动续跑。不要把长期行为规则或无终点约束写成任务，这类内容属于 spec://behavior_fence。",
 	},
+	"sidecar.tasksProtectedOnlyOnUserDemand": {
+		en: "- Do not add protected yourself. It is only for tasks whose completion the user explicitly demanded be guaranteed.",
+		"zh-CN": "- 不要自行添加 protected。它只用于用户明确要求确保完成的任务。",
+	},
 
 	// knowledge — was: formatInjectionsBare (knowledge-injection.ts). The heading is
 	// English-only upstream (it is passed as a literal argument), so it stays so here.
@@ -841,6 +854,7 @@ export type ToolMessageKey =
 	| "exitPlanModeEmptyPlanFallback"
 	| "exitPlanModeCustomFileNotFound"
 	| "exitPlanModePlanFileInvalid"
+	| "exitPlanModePlanFileOutsidePlansDir"
 	| "exitPlanModePlanFileTooLarge"
 	| "exitPlanModeInlineWithExistingPlanFile"
 	| "exitPlanModeInlineModeDisabled"

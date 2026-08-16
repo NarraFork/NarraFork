@@ -1,4 +1,4 @@
-import { Button, Modal, Stack, Switch, Text, TextInput, Title } from "@mantine/core";
+import { Button, Divider, Modal, Stack, Switch, Text, TextInput, Title } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -14,6 +14,8 @@ import type {
 } from "../../lib/api/types";
 import { normalizeRuleTargetSelector } from "../../lib/api/types";
 import { PermissionRuleEditor } from "../permissions/PermissionRuleEditor";
+import { TraitLayerEditor } from "../settings/TraitLayerEditor";
+import { ProjectAccessPanel } from "./ProjectAccessPanel";
 
 interface ProjectSettingsModalProps {
 	projectId: string;
@@ -272,6 +274,24 @@ export function ProjectSettingsModal({
 				<Button onClick={handleSave} loading={update.isPending} disabled={!!domainError}>
 					{tc("save")}
 				</Button>
+
+				<Divider />
+
+				{/* Membership. Like the trait layer below, it applies its own changes
+				    immediately rather than through the modal's Save: revoking access is not
+				    something to leave staged and ambiguous. */}
+				<Title order={5}>{t("access.membersTitle")}</Title>
+				<ProjectAccessPanel projectId={projectId} />
+
+				<Divider />
+
+				{/* Project trait layer. It has its own per-trait save buttons, so it sits
+				    below the modal's main Save rather than being folded into it. */}
+				<Title order={5}>{ts("traitLayerProjectTitle")}</Title>
+				<Text size="sm" c="dimmed">
+					{ts("traitLayerProjectDesc")}
+				</Text>
+				<TraitLayerEditor layer="project" ownerId={projectId} />
 			</Stack>
 		</Modal>
 	);

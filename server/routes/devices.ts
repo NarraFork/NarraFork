@@ -1,8 +1,14 @@
+import { listExecutorPlatformInfo } from "@shared/remote-executor";
 import { Hono } from "hono";
+import { DEVICE_PROTOCOL_VERSION } from "../lib/agent/execution/rpc-types";
 import { ValidationError } from "../lib/errors";
+import { getExecutorManifest } from "../lib/executor-binaries";
+import { issueExecutorTicket } from "../lib/executor-bootstrap-ticket";
+import { buildExecutorInstallScript } from "../lib/executor-install-script";
 import {
 	createRemoteDeviceSchema,
 	deviceBrowseQuerySchema,
+	deviceInstallScriptSchema,
 	deviceStatQuerySchema,
 	deviceTransferSchema,
 	updateRemoteDeviceSchema,
@@ -48,6 +54,20 @@ deviceRoutes.get("/", async (c) => {
 	return c.json(devices);
 });
 
+// Published executor release info, for the install wizard and version badges.
+// Registered before /:id so "executor" is not parsed as a device id.
+deviceRoutes.get("/executor/manifest", async (c) => {
+	const manifest = await getExecutorManifest({
+		forceRefresh: c.req.query("refresh") === "1",
+	});
+	return c.json({
+		manifest,
+		/** Protocol version this server speaks; a mismatch requires an upgrade. */
+		expectedProtocolVersion: DEVICE_PROTOCOL_VERSION,
+		platforms: listExecutorPlatformInfo(),
+	});
+});
+
 // Get a single device.
 deviceRoutes.get("/:id", async (c) => {
 	const device = await getDevice(c.req.param("id"));
@@ -75,6 +95,7 @@ deviceRoutes.post("/", async (c) => {
 		description: data.description,
 		connectionMode: data.connectionMode,
 		directUrl: data.directUrl,
+		ownerScope: data.ownerScope,
 		scope: data.scope,
 		projectId: data.projectId,
 		createdBy: userId,
@@ -119,6 +140,63 @@ deviceRoutes.delete("/:id", async (c) => {
 	const ok = await revokeDevice(c.req.param("id"));
 	if (!ok) throw new ValidationError("Device not found");
 	return c.json({ success: true });
+});
+
+// Generate a ready-to-run install script for one device and platform, along with
+// the single-use ticket its download step will spend.
+deviceRoutes.post("/:id/install-script", async (c) => {
+	const device = await getDevice(c.req.param("id"));
+	if (!device) throw new ValidationError("Device not found");
+	const parsed = deviceInstallScriptSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { platform, mode, allowRoot, disableShell, serverBaseUrl } = parsed.data;
+
+	const manifest = await getExecutorManifest();
+	if (!manifest) {
+		throw new ValidationError(
+			"No published executor release is available. Check the update server URL in settings.",
+		);
+	}
+	const artifact = manifest.platforms[platform];
+	if (!artifact) {
+		throw new ValidationError(
+			`Executor v${manifest.version} does not publish a build for ${platform}`,
+		);
+	}
+
+	// Prefer an explicit base URL: the target machine may reach this server on a
+	// different host than the admin's browser did.
+	const baseUrl = (serverBaseUrl ?? new URL(c.req.url).origin).replace(/\/+$/, "");
+	const deviceWsUrl =
+		device.connectionMode === "direct" && device.directUrl
+			? device.directUrl
+			: `${baseUrl.replace(/^http/, "ws")}/ws/device`;
+
+	const ticket = issueExecutorTicket(platform, { deviceId: device.id });
+	const generated = buildExecutorInstallScript({
+		platform,
+		mode,
+		serverBaseUrl: baseUrl,
+		deviceWsUrl,
+		deviceSlug: device.slug,
+		deviceName: device.name,
+		connectionMode: device.connectionMode,
+		allowRoot,
+		disableShell,
+		artifactFilename: artifact.filename,
+		expectedSha256: artifact.sha256,
+		executorVersion: manifest.version,
+		ticket: ticket.ticket,
+	});
+
+	return c.json({
+		script: generated.script,
+		filename: generated.filename,
+		shell: generated.shell,
+		executorVersion: manifest.version,
+		platform,
+		expiresAt: new Date(ticket.expiresAt).toISOString(),
+	});
 });
 
 // Browse a remote path (file/dir metadata; recursive lists a directory tree).

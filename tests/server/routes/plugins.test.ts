@@ -3,9 +3,11 @@ import type { MiddlewareHandler } from "hono";
 import {
 	createPluginRoutes,
 	type PluginManager,
+	type ProviderCatalogRouteRefresher,
 	type ProviderConfigRouteService,
 } from "../../../server/routes/plugins";
 import { PluginPermissionConflictError } from "../../../server/services/plugin-permission-store";
+import { PluginProviderCatalogRefresher } from "../../../server/services/plugin-provider-catalog-refresh";
 import { PluginProviderConfigService } from "../../../server/services/plugin-provider-config-service";
 
 const allowAdmin: MiddlewareHandler = async (_c, next) => {
@@ -794,6 +796,245 @@ describe("plugin provider prefix route", () => {
 	});
 });
 
+/**
+ * Catalog refresh is the only way to make a plugin provider's new models visible: the host
+ * pulls the catalog after activation and never again, and the plugin's own panel cannot reach
+ * this endpoint (its iframe has `connect-src 'none'`).
+ *
+ * The ownership check carries the weight here. The refresher addresses a provider *instance*
+ * globally, so without it an admin on one plugin's path could refresh — and thereby start —
+ * another plugin's provider.
+ */
+describe("plugin provider catalog refresh route", () => {
+	function catalogApp(
+		options: {
+			owned?: boolean;
+			refresh?: (instanceId: string, opts?: { force?: boolean }) => unknown;
+			adminMiddleware?: MiddlewareHandler;
+		} = {},
+	) {
+		const calls: Array<{ instanceId: string; force?: boolean }> = [];
+		const refresher = {
+			refresh: (instanceId: string, opts?: { force?: boolean }) => {
+				calls.push({ instanceId, ...(opts?.force ? { force: true } : {}) });
+				return Promise.resolve(
+					options.refresh?.(instanceId, opts) ?? { modelCount: 3, stale: false },
+				);
+			},
+		};
+		const app = createPluginRoutes(new MockPluginManager(), {
+			enabled: true,
+			adminMiddleware: options.adminMiddleware ?? allowAdmin,
+			installRoots: ["/safe/plugin-imports"],
+			authMiddleware: allowNamedAdmin,
+			providerConfigService: {
+				list: () =>
+					options.owned === false
+						? []
+						: [
+								{
+									providerInstanceId: "com.example.demo/p@1.0.0:hash",
+									contributionId: "p",
+									config: {},
+									secretFields: [],
+									secretsSet: [],
+								},
+							],
+				update: () => ({}),
+				updatePrefix: () => ({}),
+			} as never,
+			providerCatalogRefresher: refresher as never,
+		});
+		return { app, calls };
+	}
+
+	async function refreshRequest(
+		app: ReturnType<typeof createPluginRoutes>,
+		providerInstanceId = "com.example.demo/p@1.0.0:hash",
+	) {
+		return app.request("/com.example.demo/providers/catalog/refresh", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ providerInstanceId }),
+		});
+	}
+
+	it("forces a refresh and reports the new model count", async () => {
+		const { app, calls } = catalogApp();
+		const response = await refreshRequest(app);
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as Record<string, unknown>;
+		expect(body.modelCount).toBe(3);
+		// Forced on purpose: the user asked, so skipping a catalog the host still believes is
+		// fresh would make the button silently do nothing.
+		expect(calls).toEqual([{ instanceId: "com.example.demo/p@1.0.0:hash", force: true }]);
+	});
+
+	it("refuses a provider instance the plugin does not own", async () => {
+		const { app, calls } = catalogApp({ owned: false });
+		const response = await refreshRequest(app);
+		expect(response.status).toBe(404);
+		expect(calls).toHaveLength(0);
+	});
+
+	it("reports an upstream failure instead of claiming success", async () => {
+		// The refresher returns errors rather than throwing, because a stale catalog is still
+		// a usable registration. A caller must be able to tell the two apart.
+		const { app } = catalogApp({
+			refresh: () => ({ modelCount: 0, stale: true, error: new Error("upstream refused") }),
+		});
+		const response = await refreshRequest(app);
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as Record<string, unknown>;
+		expect(body.error).toBe("upstream refused");
+		expect(body.stale).toBe(true);
+	});
+
+	it("reports a skipped refresh for a provider without listModels", async () => {
+		const { app } = catalogApp({
+			refresh: () => ({ modelCount: 2, stale: false, skipped: true }),
+		});
+		const body = (await (await refreshRequest(app)).json()) as Record<string, unknown>;
+		expect(body.skipped).toBe(true);
+	});
+
+	it("rejects a body with unknown fields", async () => {
+		const { app } = catalogApp();
+		const response = await app.request("/com.example.demo/providers/catalog/refresh", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ providerInstanceId: "x", force: true }),
+		});
+		expect(response.status).toBeGreaterThanOrEqual(400);
+	});
+
+	it("requires admin", async () => {
+		const denyAdmin: MiddlewareHandler = async (c) => c.json({ error: "forbidden" }, 403);
+		const { app } = catalogApp({ adminMiddleware: denyAdmin });
+		expect((await refreshRequest(app)).status).toBe(403);
+	});
+});
+
+describe("plugin provider proxy route", () => {
+	function proxyApp(
+		updateProxy: (pluginId: string, instanceId: string, proxy: unknown) => unknown,
+		adminMiddleware = allowAdmin,
+	) {
+		return createPluginRoutes(new MockPluginManager(), {
+			enabled: true,
+			adminMiddleware,
+			installRoots: ["/safe/plugin-imports"],
+			authMiddleware: allowNamedAdmin,
+			providerConfigService: {
+				list: () => [],
+				update: () => ({}),
+				updatePrefix: () => ({}),
+				updateProxy,
+			} as never,
+		});
+	}
+
+	async function put(app: ReturnType<typeof createPluginRoutes>, body: unknown) {
+		return app.request("/com.example.demo/providers/proxy", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	}
+
+	it("forwards a custom proxy to the service", async () => {
+		const calls: unknown[] = [];
+		const app = proxyApp((_pluginId, _instanceId, proxy) => {
+			calls.push(proxy);
+			return {};
+		});
+		const response = await put(app, {
+			providerInstanceId: "com.example.demo/p@1.0.0:hash",
+			proxy: { mode: "custom", url: "http://127.0.0.1:7890" },
+		});
+		expect(response.status).toBe(200);
+		expect(calls).toEqual([{ mode: "custom", url: "http://127.0.0.1:7890" }]);
+	});
+
+	it("forwards null to clear the override", async () => {
+		const calls: unknown[] = [];
+		const app = proxyApp((_pluginId, _instanceId, proxy) => {
+			calls.push(proxy);
+			return {};
+		});
+		await put(app, { providerInstanceId: "x", proxy: null });
+		expect(calls).toEqual([null]);
+	});
+
+	it("rejects an unknown proxy mode", async () => {
+		const app = proxyApp(() => ({}));
+		const response = await put(app, {
+			providerInstanceId: "x",
+			proxy: { mode: "tunnel" },
+		});
+		expect(response.status).toBeGreaterThanOrEqual(400);
+	});
+
+	it("rejects unknown fields in the proxy object", async () => {
+		const app = proxyApp(() => ({}));
+		const response = await put(app, {
+			providerInstanceId: "x",
+			proxy: { mode: "custom", url: "http://p", extra: true },
+		});
+		expect(response.status).toBeGreaterThanOrEqual(400);
+	});
+
+	it("echoes the stored override back so the form can show it", async () => {
+		// Admin-only, and the value is what this admin just supplied; without echoing it the
+		// field could not display the current setting.
+		const app = proxyApp(() => ({
+			providerInstanceId: "com.example.demo/p@1.0.0:hash",
+			providerTypeId: "com.example.demo/p",
+			pluginId: "com.example.demo",
+			contributionId: "p",
+			providerPrefix: "p",
+			displayName: "P",
+			configSchema: true,
+			config: {},
+			secretFields: [],
+			secretsSet: [],
+			proxy: { mode: "custom", url: "http://127.0.0.1:7890" },
+		}));
+		const response = await put(app, {
+			providerInstanceId: "com.example.demo/p@1.0.0:hash",
+			proxy: { mode: "custom", url: "http://127.0.0.1:7890" },
+		});
+		const body = (await response.json()) as { provider?: { proxy?: unknown } };
+		expect(body.provider?.proxy).toEqual({ mode: "custom", url: "http://127.0.0.1:7890" });
+	});
+
+	it("omits proxy from the response when none is set", async () => {
+		const app = proxyApp(() => ({
+			providerInstanceId: "x",
+			providerTypeId: "t",
+			pluginId: "com.example.demo",
+			contributionId: "p",
+			providerPrefix: "p",
+			displayName: "P",
+			configSchema: true,
+			config: {},
+			secretFields: [],
+			secretsSet: [],
+		}));
+		const body = (await (await put(app, { providerInstanceId: "x", proxy: null })).json()) as {
+			provider?: Record<string, unknown>;
+		};
+		expect(body.provider && "proxy" in body.provider).toBe(false);
+	});
+
+	it("requires admin", async () => {
+		const denyAdmin: MiddlewareHandler = async (c) => c.json({ error: "forbidden" }, 403);
+		const app = proxyApp(() => ({}), denyAdmin);
+		const response = await put(app, { providerInstanceId: "x", proxy: null });
+		expect(response.status).toBe(403);
+	});
+});
+
 describe("plugin provider config route contract", () => {
 	it("keeps the route service interface satisfiable by the real service", () => {
 		// The route tests inject mocks with `as never`, which would hide a drift between
@@ -804,8 +1045,18 @@ describe("plugin provider config route contract", () => {
 			service;
 		expect(typeof assertAssignable).toBe("function");
 		// Method names the routes call, pinned so a rename cannot pass unnoticed.
-		for (const method of ["list", "update", "updatePrefix"] as const) {
+		for (const method of ["list", "update", "updatePrefix", "updateProxy"] as const) {
 			expect(typeof PluginProviderConfigService.prototype[method]).toBe("function");
 		}
+	});
+
+	it("keeps the catalog refresher interface satisfiable by the real refresher", () => {
+		// Same reasoning as above: the catalog route test injects a mock with `as never`, which
+		// would hide a drift between the narrow route interface and the real refresher.
+		const assertAssignable = (
+			refresher: PluginProviderCatalogRefresher,
+		): ProviderCatalogRouteRefresher => refresher;
+		expect(typeof assertAssignable).toBe("function");
+		expect(typeof PluginProviderCatalogRefresher.prototype.refresh).toBe("function");
 	});
 });

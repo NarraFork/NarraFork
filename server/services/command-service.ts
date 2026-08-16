@@ -6,6 +6,7 @@ import { logger } from "../lib/logger";
 import { getBlockedSkills, isSkillBlocked } from "../lib/narrator-custom-traits";
 import type { Command, CommandModelOverride, CommandParam } from "./chapter-service";
 import { loadSkillSummariesForContext, resolveSkillContextForNarrator } from "./skill-service";
+import { resolveEffectiveTraits, resolveNarratorProjectId } from "./trait-layer-service";
 
 /** Safely extract commands array from a chapterSettings value. */
 function parseChapterSettingsCommands(raw: unknown): Command[] {
@@ -458,10 +459,19 @@ export async function getSlashMenuItems(
 		resolveSkillContextForNarrator(narratorId),
 		db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
-			columns: { traits: true },
+			columns: { traits: true, chapterId: true, contextProjectId: true },
 		}),
 	]);
-	const blockedSkills = getBlockedSkills(narrator?.traits);
+	// The slash menu must hide anything the layered traits block, otherwise a
+	// project-enforced block would still be offered and only fail on use.
+	const layeredTraits = narrator
+		? await resolveEffectiveTraits({
+				narratorTraits: narrator.traits,
+				projectId: await resolveNarratorProjectId(narrator),
+				actingUserId: userId,
+			})
+		: null;
+	const blockedSkills = getBlockedSkills(layeredTraits?.traits ?? narrator?.traits);
 	const commands: ResolvedCommand[] = [
 		{
 			name: "goal",

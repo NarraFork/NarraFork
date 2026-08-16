@@ -21,7 +21,9 @@ import { slugify } from "../lib/slug";
 import { chapterCleanup, discardIgnoredArchive } from "./chapter-cleanup";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
+import { dropRecentlyAttributed } from "./file-attribution-service";
 import { gitService } from "./git-service";
+import { dropStatus } from "./git-status-cache";
 import { narratorService } from "./narrator-service";
 import { interruptNarrator } from "./narrator-session";
 import { terminalService } from "./terminal-service";
@@ -72,6 +74,12 @@ interface CreateChapterInput {
 	title: string;
 	description?: string;
 	baseBranch?: string;
+	/**
+	 * The user creating the chapter, used as the owner of the narrator this may
+	 * auto-create. Optional because non-request callers exist; when absent the
+	 * narrator lands ownerless (admin-managed) rather than mis-attributed.
+	 */
+	createdByUserId?: string | null;
 }
 
 interface CreateRootChapterInput {
@@ -79,6 +87,8 @@ interface CreateRootChapterInput {
 	title: string;
 	gitPath: string;
 	defaultBranch: string;
+	/** See CreateChapterInput.createdByUserId. */
+	createdByUserId?: string | null;
 }
 
 export const chapterService = {
@@ -120,6 +130,10 @@ export const chapterService = {
 					type: "primary",
 					model: settings.agent.defaultModel,
 					title: input.title,
+					ownerUserId: input.createdByUserId ?? null,
+					// Chapter-bound narrators are project-visible by default (the service
+					// resolves this), so a teammate who forks or reviews the chapter can
+					// open its session instead of hitting an unopenable graph node.
 				});
 			} catch (err) {
 				logger.warn("Failed to auto-create primary narrator for root chapter", {
@@ -204,6 +218,7 @@ export const chapterService = {
 						type: "primary",
 						model: settings.agent.defaultModel,
 						title: input.title,
+						ownerUserId: input.createdByUserId ?? null,
 					});
 				} catch (err) {
 					logger.warn("Failed to auto-create primary narrator", {
@@ -403,6 +418,11 @@ export const chapterService = {
 							error: String(err),
 						}),
 					);
+				// Same reason, for the in-memory caches keyed by that path: the directory is
+				// gone, so the entries can never be read again. `invalidateStatus` would keep
+				// the keys (it assumes the path returns), which is what leaks here.
+				dropStatus(chapter.worktreePath);
+				dropRecentlyAttributed(chapter.worktreePath);
 			}
 
 			// Ignored-file archive from any dormant cycle. Not covered by the worktree
@@ -509,6 +529,11 @@ export const chapterService = {
 							error: String(err),
 						}),
 					);
+				// Same reason, for the in-memory caches keyed by that path: the directory is
+				// gone, so the entries can never be read again. `invalidateStatus` would keep
+				// the keys (it assumes the path returns), which is what leaks here.
+				dropStatus(chapter.worktreePath);
+				dropRecentlyAttributed(chapter.worktreePath);
 			}
 
 			// Same for the ignored-file archive a dormant cycle may have left in

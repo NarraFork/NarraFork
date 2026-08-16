@@ -333,6 +333,11 @@ export type NarraForkEvent =
 	  }
 	// Remote executor device lifecycle
 	| { type: "device:changed"; deviceId: string }
+	/**
+	 * A project- or user-level trait layer changed. Consumers that cache resolved
+	 * traits use this to drop their entries; resolution itself re-reads on demand.
+	 */
+	| { type: "trait-layer:changed"; layer: "user" | "project"; ownerId: string }
 	| { type: "device:status"; deviceId: string; status: "online" | "offline" }
 	| { type: "device:token-rotated"; deviceId: string }
 	| { type: "device:revoked"; deviceId: string }
@@ -426,7 +431,12 @@ export type NarraForkEvent =
 			type: "knowledge:acl_changed";
 			/** Users whose effective capabilities changed. */
 			userIds: string[];
-			reason: "grant_added" | "grant_removed" | "user_acl_replaced";
+			/**
+			 * `project_gate_changed` covers the indirect case: no knowledge grant moved, but a
+			 * project membership change opened or closed the ancestor gate for collections that
+			 * inherit it, so the readable set differs anyway.
+			 */
+			reason: "grant_added" | "grant_removed" | "user_acl_replaced" | "project_gate_changed";
 	  }
 	| {
 			/**
@@ -439,6 +449,27 @@ export type NarraForkEvent =
 			targetId: string;
 			previousOwnerUserId: string | null;
 			newOwnerUserId: string | null;
+	  }
+	// Human-to-human chat. Ids and scalars only — never message bodies — so a
+	// listener (WS fan-out today, an IM bridge later) can route without holding a
+	// copy of content it has no authorization story for.
+	| {
+			/** A person posted in a chat room. */
+			type: "chat:message_created";
+			roomId: string;
+			messageId: string;
+			seq: number;
+			senderUserId: string;
+			roomKind: "dm" | "narrator";
+			/** Set for a narrator room, so a consumer can scope by narrator. */
+			narratorId: string | null;
+	  }
+	| {
+			/** A member advanced their read watermark (read receipts, badge refresh). */
+			type: "chat:room_read";
+			roomId: string;
+			userId: string;
+			lastReadSeq: number;
 	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];

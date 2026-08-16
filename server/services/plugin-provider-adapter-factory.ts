@@ -61,11 +61,22 @@ export interface PluginProviderAdapterFactoryOptions {
 	 * Called per-request so that settings changes take effect immediately. Returns
 	 * undefined when there is nothing to communicate; an empty object is never sent.
 	 *
+	 * Receives the provider instance the call belongs to, so a per-provider policy can be
+	 * applied. Without it the host could only offer one global proxy for every plugin
+	 * provider at once — the built-in providers each have their own `settings.<provider>.proxy`
+	 * override, and a plugin provider had no equivalent.
+	 *
 	 * SECURITY: The returned `outbound.proxyUrl` may contain credentials. The caller
 	 * (PooledProviderRpcClient) injects it into RPC params which cross a process boundary
 	 * but are NOT logged, NOT sent to diagnostics, NOT echoed to WebSocket/SSE.
 	 */
-	resolveHostHints?: () => ProviderHostHints | undefined;
+	resolveHostHints?: (context: ProviderHostHintsContext) => ProviderHostHints | undefined;
+}
+
+/** Which provider a hints lookup is for. */
+export interface ProviderHostHintsContext {
+	pluginId: string;
+	providerInstanceId: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -98,7 +109,11 @@ const DEFAULT_PROVIDER_LIMITS = {
 class PooledProviderRpcClient implements RemoteProviderRpcClient {
 	constructor(
 		private readonly deferred: DeferredProviderClient,
-		private readonly resolveHostHints?: () => ProviderHostHints | undefined,
+		private readonly resolveHostHints?: (
+			context: ProviderHostHintsContext,
+		) => ProviderHostHints | undefined,
+		/** Identity passed to the hints resolver so it can apply a per-provider policy. */
+		private readonly hintsContext?: ProviderHostHintsContext,
 	) {}
 
 	async chat(
@@ -123,8 +138,8 @@ class PooledProviderRpcClient implements RemoteProviderRpcClient {
 	 * do not expect it.
 	 */
 	private injectHints<T extends { hostHints?: ProviderHostHints }>(params: T): T {
-		if (!this.resolveHostHints) return params;
-		const hints = this.resolveHostHints();
+		if (!this.resolveHostHints || !this.hintsContext) return params;
+		const hints = this.resolveHostHints(this.hintsContext);
 		if (!hints) return params;
 		// Only attach if there is at least one meaningful hint
 		if (!hints.outbound?.proxyUrl && !hints.concurrency?.maxConcurrentUpstream) return params;
@@ -163,6 +178,7 @@ export function createPluginProviderAdapterFactory(
 				providerInstanceId: entry.providerInstanceId,
 			}),
 			options.resolveHostHints,
+			{ pluginId: entry.pluginId, providerInstanceId: entry.providerInstanceId },
 		);
 		logger.debug("plugin provider adapter created", {
 			pluginId: entry.pluginId,

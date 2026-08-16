@@ -31,6 +31,32 @@ const HANDOFF_REQUEST_TIMEOUT_MS = 30_000;
 /** Upper bound on the buffered handoff reply; the real one is a small JSON object. */
 const HANDOFF_RESPONSE_LIMIT_BYTES = 64 * 1024;
 
+/**
+ * Identity of the handoff that started THIS process, captured before the environment is cleared.
+ *
+ * The planned-update recovery manifest is a one-shot handover note owned by exactly one update
+ * attempt. Recovery therefore needs to know whether this startup is the replacement that attempt
+ * spawned — an ordinary manual restart must never inherit a leftover manifest and resume the
+ * narrators it lists. `waitForPreviousServerShutdown` deletes the handoff environment variables
+ * before `./main` is imported, so the value is latched here while it is still observable.
+ */
+export interface ObservedRestartHandoff {
+	/** Marker nonce of the spawning update attempt; absent when spawned by a pre-nonce binary. */
+	markerNonce?: string;
+}
+
+let observedRestartHandoff: ObservedRestartHandoff | null = null;
+
+/** Handoff that spawned this process, or null for an ordinary (non-update) startup. */
+export function getObservedRestartHandoff(): ObservedRestartHandoff | null {
+	return observedRestartHandoff;
+}
+
+/** @internal Test-only hook; production code latches this from the environment. */
+export function setObservedRestartHandoffForTests(handoff: ObservedRestartHandoff | null): void {
+	observedRestartHandoff = handoff;
+}
+
 type HandoffAttemptResult =
 	| { ok: true }
 	| { ok: false; kind: "http"; message: string }
@@ -264,6 +290,11 @@ export async function waitForPreviousServerShutdown(): Promise<boolean> {
 	const markerPath = process.env[HANDOFF_MARKER_PATH_ENV];
 	const markerNonce = process.env[HANDOFF_MARKER_NONCE_ENV];
 	if (!handoffUrl || !token) return true;
+
+	// Latch the handoff identity now: the `finally` block below deletes these variables, and
+	// planned-update recovery (which runs much later, inside ./main) must still be able to prove
+	// that this process is the replacement a specific update attempt spawned.
+	observedRestartHandoff = markerNonce ? { markerNonce } : {};
 
 	console.log("Waiting for previous NarraFork server to shut down gracefully...");
 	logger.info("Waiting for previous NarraFork server shutdown", { handoffUrl, markerPath });

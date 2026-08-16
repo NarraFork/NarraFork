@@ -1,9 +1,10 @@
-import { and, eq, ne } from "drizzle-orm";
+import { and, eq, isNull, ne, or } from "drizzle-orm";
 import { db } from "../db";
 import {
+	aclGrants,
 	knowledgeCollections,
 	knowledgeEntries,
-	knowledgeGrants,
+	type knowledgeGrants,
 	knowledgeLevels,
 	knowledgeTags,
 	knowledgeTagTypes,
@@ -172,18 +173,198 @@ export async function resolvePrincipalCaps(principal: Principal): Promise<Princi
 		return caps;
 	}
 
-	// Grants targeting this user or their role.
-	const grants = await db.query.knowledgeGrants.findMany({
-		where: (g, { or, eq: e, and: a }) =>
-			or(
-				a(e(g.principalType, "user"), e(g.principalId, principal.userId)),
-				a(e(g.principalType, "role"), e(g.principalId, principal.role)),
-			),
-	});
-
+	// Grants come from the shared kernel now, so "which grants apply to whom"
+	// (user ∪ role, no deny rules, no precedence) has one implementation across
+	// projects, narrators and knowledge. The kernel returns domain credentials
+	// verbatim without interpreting them: rank comparison and compartment
+	// containment stay here, in the domain layer, precisely because those are the
+	// rules whose fail-closed behaviour must not be rewritten.
+	//
+	// Read at global scope: knowledge grants are stored either globally or scoped to a
+	// collection, and `resolveCaps` on a single scope cannot see the collection-scoped
+	// ones. The per-collection buckets are filled below from the same table.
 	const levels = await levelRankMap();
+	const grants = await loadKnowledgeGrantRows(principal);
 	for (const grant of grants) applyGrantToCaps(caps, grant, levels);
 	return caps;
+}
+
+/**
+ * Every knowledge grant row this principal holds, in one query.
+ *
+ * Delegates to {@link selectKnowledgeGrants} so reads and writes share one mapping
+ * between the knowledge vocabulary and `acl_grants`.
+ */
+async function loadKnowledgeGrantRows(
+	principal: Principal,
+): Promise<(typeof knowledgeGrants.$inferSelect)[]> {
+	const rows = await db
+		.select({
+			id: aclGrants.id,
+			scopeType: aclGrants.scopeType,
+			scopeId: aclGrants.scopeId,
+			principalType: aclGrants.principalType,
+			principalId: aclGrants.principalId,
+			capability: aclGrants.capability,
+			domainKind: aclGrants.domainKind,
+			domainValue: aclGrants.domainValue,
+			createdAt: aclGrants.createdAt,
+		})
+		.from(aclGrants)
+		.where(
+			and(
+				knowledgeGrantWhere(),
+				or(
+					and(eq(aclGrants.principalType, "user"), eq(aclGrants.principalId, principal.userId)),
+					and(eq(aclGrants.principalType, "role"), eq(aclGrants.principalId, principal.role)),
+				),
+			),
+		);
+	return rows.map(toKnowledgeGrantRow);
+}
+
+/**
+ * Storage mapping between the knowledge base's grant vocabulary and `acl_grants`.
+ *
+ * The knowledge layer thinks in credentials (a clearance, a compartment tag, a review
+ * tag) plus a `canWrite` flag. The unified table stores each of those as its own row:
+ * credentials as domain rows, `canWrite` as a plain `write` capability row. These
+ * helpers are the only place that translation lives, so the rest of this file keeps
+ * working in its own vocabulary and the two-axis rules are untouched.
+ */
+const KNOWLEDGE_SCOPE_TYPES = ["global", "knowledge_collection"] as const;
+
+/** The `acl_grants` scope for a (possibly absent) collection id. */
+function knowledgeScopeOf(collectionId: string | null | undefined): {
+	scopeType: "global" | "knowledge_collection";
+	scopeId: string | null;
+} {
+	return collectionId
+		? { scopeType: "knowledge_collection", scopeId: collectionId }
+		: { scopeType: "global", scopeId: null };
+}
+
+/** Match every knowledge-scoped grant row, optionally narrowed to one principal. */
+function knowledgeGrantWhere(principal?: { principalType: string; principalId: string }) {
+	const scope = or(
+		eq(aclGrants.scopeType, KNOWLEDGE_SCOPE_TYPES[0]),
+		eq(aclGrants.scopeType, KNOWLEDGE_SCOPE_TYPES[1]),
+	);
+	if (!principal) return scope;
+	return and(
+		scope,
+		eq(aclGrants.principalType, principal.principalType as "user"),
+		eq(aclGrants.principalId, principal.principalId),
+	);
+}
+
+/**
+ * Project an `acl_grants` row back into the legacy grant shape the folding and
+ * reporting code understands.
+ *
+ * `id` is preserved so the grant CRUD endpoints keep addressing rows by id.
+ */
+function toKnowledgeGrantRow(row: {
+	id: string;
+	scopeType: string;
+	scopeId: string | null;
+	principalType: string;
+	principalId: string;
+	capability: string;
+	domainKind: string | null;
+	domainValue: string | null;
+	createdAt: string;
+}): typeof knowledgeGrants.$inferSelect {
+	const isDomain = row.domainKind !== null && row.domainValue !== null;
+	return {
+		id: row.id,
+		collectionId: row.scopeType === "knowledge_collection" ? row.scopeId : null,
+		principalType: row.principalType as "user" | "role",
+		principalId: row.principalId,
+		grantType: (isDomain ? row.domainKind : "clearance") as "clearance" | "tag" | "review",
+		clearanceLevel: row.domainKind === "clearance" ? row.domainValue : null,
+		tagId: isDomain && row.domainKind !== "clearance" ? row.domainValue : null,
+		canWrite: !isDomain && row.capability === "write",
+		createdAt: row.createdAt,
+	};
+}
+
+/** Read knowledge grants from the unified table, in the legacy shape. */
+async function selectKnowledgeGrants(principal?: {
+	principalType: string;
+	principalId: string;
+}): Promise<(typeof knowledgeGrants.$inferSelect)[]> {
+	const rows = await db
+		.select({
+			id: aclGrants.id,
+			scopeType: aclGrants.scopeType,
+			scopeId: aclGrants.scopeId,
+			principalType: aclGrants.principalType,
+			principalId: aclGrants.principalId,
+			capability: aclGrants.capability,
+			domainKind: aclGrants.domainKind,
+			domainValue: aclGrants.domainValue,
+			createdAt: aclGrants.createdAt,
+		})
+		.from(aclGrants)
+		.where(knowledgeGrantWhere(principal));
+	return rows.map(toKnowledgeGrantRow);
+}
+
+/**
+ * The `acl_grants` rows one logical knowledge grant becomes.
+ *
+ * A credential grant that also carries `canWrite` produces TWO rows, because the
+ * unified table keeps capabilities and credentials in separate rows. `INSERT OR
+ * IGNORE` semantics are the caller's business; the unique index collapses a repeated
+ * write row for the same principal and scope.
+ */
+function knowledgeGrantRowsFor(input: {
+	collectionId?: string | null;
+	principalType: "user" | "role";
+	principalId: string;
+	grantType: "clearance" | "tag" | "review";
+	clearanceLevel?: string | null;
+	tagId?: string | null;
+	canWrite?: boolean;
+	grantedBy?: string | null;
+	id?: string;
+	createdAt?: string;
+}): (typeof aclGrants.$inferInsert)[] {
+	const scope = knowledgeScopeOf(input.collectionId);
+	const createdAt = input.createdAt ?? nowIso();
+	const domainValue =
+		input.grantType === "clearance" ? (input.clearanceLevel ?? null) : (input.tagId ?? null);
+	const rows: (typeof aclGrants.$inferInsert)[] = [];
+	if (domainValue) {
+		rows.push({
+			id: input.id ?? generateId(),
+			...scope,
+			principalType: input.principalType,
+			principalId: input.principalId,
+			// Placeholder capability: see the acl_grants comment in schema.ts. It is NOT a
+			// read authorization — knowledge readability comes from the two axes.
+			capability: "read",
+			domainKind: input.grantType,
+			domainValue,
+			grantedBy: input.grantedBy ?? null,
+			createdAt,
+		});
+	}
+	if (input.canWrite) {
+		rows.push({
+			id: generateId(),
+			...scope,
+			principalType: input.principalType,
+			principalId: input.principalId,
+			capability: "write",
+			domainKind: null,
+			domainValue: null,
+			grantedBy: input.grantedBy ?? null,
+			createdAt,
+		});
+	}
+	return rows;
 }
 
 /** Hard cap on users considered by {@link resolveCapsForAllUsers}. */
@@ -229,7 +410,9 @@ export async function resolveCapsForAllUsers(
 	});
 	let truncated = rows.length > cap;
 
-	const grants = await db.query.knowledgeGrants.findMany({ limit: BATCH_CAPS_GRANT_LIMIT + 1 });
+	// Read from the unified table via the shared projection; the limit still guards the
+	// main thread against aggregating an unbounded number of rows.
+	const grants = (await selectKnowledgeGrants()).slice(0, BATCH_CAPS_GRANT_LIMIT + 1);
 	if (grants.length > BATCH_CAPS_GRANT_LIMIT) truncated = true;
 
 	if (truncated) {
@@ -503,9 +686,13 @@ async function updateLevel(
 				.set({ classificationLevel: newName })
 				.where(eq(knowledgeCollections.classificationLevel, existing.name))
 				.run();
-			tx.update(knowledgeGrants)
-				.set({ clearanceLevel: newName })
-				.where(eq(knowledgeGrants.clearanceLevel, existing.name))
+			// Clearance levels are referenced by NAME, so a rename has to rewrite every
+			// credential row in the same transaction. Missing one would make `rankOf` fail
+			// closed on it and lock the content to admins — which is why this stays inside
+			// the rename transaction rather than becoming a follow-up job.
+			tx.update(aclGrants)
+				.set({ domainValue: newName })
+				.where(and(eq(aclGrants.domainKind, "clearance"), eq(aclGrants.domainValue, existing.name)))
 				.run();
 		}
 		tx.update(knowledgeLevels).set(updates).where(eq(knowledgeLevels.id, id)).run();
@@ -543,8 +730,8 @@ async function deleteLevel(
 			where: eq(knowledgeCollections.classificationLevel, level.name),
 			columns: { id: true },
 		}),
-		db.query.knowledgeGrants.findFirst({
-			where: eq(knowledgeGrants.clearanceLevel, level.name),
+		db.query.aclGrants.findFirst({
+			where: and(eq(aclGrants.domainKind, "clearance"), eq(aclGrants.domainValue, level.name)),
 			columns: { id: true },
 		}),
 	]);
@@ -719,14 +906,12 @@ async function deleteTagType(id: string): Promise<{ ok: true } | { ok: false; re
 
 async function listGrants(opts: { principalType?: string; principalId?: string } = {}) {
 	const ptype = opts.principalType as "user" | "role" | undefined;
-	return db.query.knowledgeGrants.findMany({
-		where: (g, { and: a, eq: e }) => {
-			const conds = [];
-			if (ptype) conds.push(e(g.principalType, ptype));
-			if (opts.principalId) conds.push(e(g.principalId, opts.principalId));
-			return conds.length ? a(...conds) : undefined;
-		},
-	});
+	const all = await selectKnowledgeGrants();
+	return all.filter(
+		(g) =>
+			(!ptype || g.principalType === ptype) &&
+			(!opts.principalId || g.principalId === opts.principalId),
+	);
 }
 
 /** Detect a SQLite UNIQUE-index violation without depending on the driver's error class. */
@@ -749,20 +934,34 @@ async function createGrant(
 	actor?: { userId?: string | null; role?: string | null },
 ) {
 	try {
-		const [row] = await db
-			.insert(knowledgeGrants)
-			.values({
-				id: generateId(),
-				collectionId: input.collectionId ?? null,
-				principalType: input.principalType,
-				principalId: input.principalId,
-				grantType: input.grantType,
-				clearanceLevel: input.clearanceLevel ?? null,
-				tagId: input.tagId ?? null,
-				canWrite: input.canWrite ?? false,
-				createdAt: nowIso(),
-			})
-			.returning();
+		// One logical grant can be two rows in the unified table (a credential plus a
+		// write capability), so the credential row is treated as "the grant" for
+		// reporting and addressing, and the write row rides along.
+		const rows = knowledgeGrantRowsFor({
+			collectionId: input.collectionId ?? null,
+			principalType: input.principalType,
+			principalId: input.principalId,
+			grantType: input.grantType,
+			clearanceLevel: input.clearanceLevel ?? null,
+			tagId: input.tagId ?? null,
+			canWrite: input.canWrite ?? false,
+			grantedBy: actor?.userId ?? null,
+		});
+		if (rows.length === 0) {
+			throw new ValidationError("Grant must specify a clearance level or a tag");
+		}
+		await db.insert(aclGrants).values(rows);
+		const row = toKnowledgeGrantRow({
+			id: rows[0].id as string,
+			scopeType: rows[0].scopeType as string,
+			scopeId: (rows[0].scopeId ?? null) as string | null,
+			principalType: rows[0].principalType as string,
+			principalId: rows[0].principalId as string,
+			capability: rows[0].capability as string,
+			domainKind: (rows[0].domainKind ?? null) as string | null,
+			domainValue: (rows[0].domainValue ?? null) as string | null,
+			createdAt: rows[0].createdAt as string,
+		});
 		emitAclChanged(input.principalType, input.principalId, "grant_added");
 		recordKnowledgeAclEvent({
 			actorUserId: actor?.userId ?? null,
@@ -795,18 +994,41 @@ async function createGrant(
 async function deleteGrant(id: string, actor?: { userId?: string | null; role?: string | null }) {
 	// Read the row BEFORE deleting: afterwards there is nothing left to route the notification by
 	// or to describe in the audit entry, and a revocation is precisely what an audit trail is for.
-	const existing = await db.query.knowledgeGrants.findFirst({
-		where: eq(knowledgeGrants.id, id),
+	const existing = await db.query.aclGrants.findFirst({
+		where: eq(aclGrants.id, id),
 		columns: {
+			id: true,
+			scopeType: true,
+			scopeId: true,
 			principalType: true,
 			principalId: true,
-			grantType: true,
-			clearanceLevel: true,
-			tagId: true,
-			collectionId: true,
+			capability: true,
+			domainKind: true,
+			domainValue: true,
+			createdAt: true,
 		},
 	});
-	await db.delete(knowledgeGrants).where(eq(knowledgeGrants.id, id));
+	// Deleting the credential row also drops the sibling write row for the same
+	// principal and scope: they represented one grant in the knowledge vocabulary, and
+	// leaving a stray write behind would keep authority the admin just revoked.
+	const existingRow = existing ? toKnowledgeGrantRow(existing) : null;
+	await db.delete(aclGrants).where(eq(aclGrants.id, id));
+	if (existing && existingRow && !existingRow.canWrite) {
+		await db
+			.delete(aclGrants)
+			.where(
+				and(
+					eq(aclGrants.scopeType, existing.scopeType),
+					existing.scopeId === null
+						? isNull(aclGrants.scopeId)
+						: eq(aclGrants.scopeId, existing.scopeId),
+					eq(aclGrants.principalType, existing.principalType),
+					eq(aclGrants.principalId, existing.principalId),
+					eq(aclGrants.capability, "write"),
+					isNull(aclGrants.domainKind),
+				),
+			);
+	}
 	if (existing) {
 		emitAclChanged(existing.principalType, existing.principalId, "grant_removed");
 		recordKnowledgeAclEvent({
@@ -818,10 +1040,12 @@ async function deleteGrant(id: string, actor?: { userId?: string | null; role?: 
 			targetType: "grant",
 			targetId: id,
 			detail: {
-				grantType: existing.grantType,
-				clearanceLevel: existing.clearanceLevel,
-				tagId: existing.tagId,
-				collectionId: existing.collectionId,
+				// Reported through the legacy-shaped projection, so the audit vocabulary is
+				// unchanged by the storage move.
+				grantType: existingRow?.grantType ?? null,
+				clearanceLevel: existingRow?.clearanceLevel ?? null,
+				tagId: existingRow?.tagId ?? null,
+				collectionId: existingRow?.collectionId ?? null,
 			},
 		});
 	}
@@ -947,14 +1171,13 @@ async function bulkGrant(
 
 	// Already-held identical grants → reported as skipped instead of duplicated. Scoped to the
 	// candidate users so this stays a bounded read (index: idx_kgrant_principal).
-	const heldGrants = await db.query.knowledgeGrants.findMany({
-		where: (g, { and: a, eq: e, inArray }) =>
-			a(
-				e(g.principalType, "user"),
-				inArray(g.principalId, userIds),
-				e(g.grantType, input.grantType),
-			),
-	});
+	const candidateSet = new Set(userIds);
+	const heldGrants = (await selectKnowledgeGrants()).filter(
+		(g) =>
+			g.principalType === "user" &&
+			candidateSet.has(g.principalId) &&
+			g.grantType === input.grantType,
+	);
 	const alreadyHeld = new Set(
 		heldGrants
 			.filter(
@@ -998,7 +1221,9 @@ async function bulkGrant(
 	// Single transaction: either every row lands or none does.
 	if (toInsert.length > 0) {
 		db.transaction((tx) => {
-			for (const g of toInsert) tx.insert(knowledgeGrants).values(g).run();
+			for (const g of toInsert) {
+				for (const row of knowledgeGrantRowsFor(g)) tx.insert(aclGrants).values(row).run();
+			}
 		});
 		// One event for the whole batch (all targets are users here) rather than N events.
 		const grantedUserIds = results.filter((r) => r.status === "granted").map((r) => r.userId);
@@ -1092,9 +1317,7 @@ async function getUserAcl(userId: string): Promise<{
 	reviewTagIds: string[];
 	canWrite: boolean;
 }> {
-	const grants = await db.query.knowledgeGrants.findMany({
-		where: and(eq(knowledgeGrants.principalType, "user"), eq(knowledgeGrants.principalId, userId)),
-	});
+	const grants = await selectKnowledgeGrants({ principalType: "user", principalId: userId });
 	const levels = await levelRankMap();
 	let clearanceLevel: string | null = null;
 	let bestRank = -1;
@@ -1175,12 +1398,15 @@ async function setUserAcl(
 		});
 	}
 	db.transaction((tx) => {
-		tx.delete(knowledgeGrants)
-			.where(
-				and(eq(knowledgeGrants.principalType, "user"), eq(knowledgeGrants.principalId, userId)),
-			)
+		// Scoped to knowledge grants: the unified table also holds this user's project and
+		// narrator memberships, and replacing their knowledge ACL must not silently evict
+		// them from projects.
+		tx.delete(aclGrants)
+			.where(and(knowledgeGrantWhere({ principalType: "user", principalId: userId })))
 			.run();
-		for (const g of newGrants) tx.insert(knowledgeGrants).values(g).run();
+		for (const g of newGrants) {
+			for (const row of knowledgeGrantRowsFor(g)) tx.insert(aclGrants).values(row).run();
+		}
 	});
 	// Replace-in-place: the user's whole credential set may have moved in either direction.
 	emitAclChanged("user", userId, "user_acl_replaced");
@@ -1205,8 +1431,9 @@ async function setUserAcl(
 /** Remove ALL grants for a user (called when the user is deleted). */
 async function purgeUserGrants(userId: string): Promise<void> {
 	await db
-		.delete(knowledgeGrants)
-		.where(and(eq(knowledgeGrants.principalType, "user"), eq(knowledgeGrants.principalId, userId)));
+		.delete(aclGrants)
+		// Knowledge scope only — see the note in setUserAcl.
+		.where(knowledgeGrantWhere({ principalType: "user", principalId: userId }));
 }
 
 /**
@@ -1273,7 +1500,7 @@ async function getEntryAccessibleUsers(entryId: string): Promise<
 
 	// Load ALL grants once and aggregate caps in memory, instead of calling
 	// resolvePrincipalCaps per user (which issues one grants query each → N+1).
-	const allGrants = await db.query.knowledgeGrants.findMany();
+	const allGrants = await selectKnowledgeGrants();
 	const levels = await levelRankMap();
 	const userGrants = new Map<string, typeof allGrants>();
 	const roleGrants = new Map<string, typeof allGrants>();

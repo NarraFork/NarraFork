@@ -74,6 +74,11 @@ describe("notification recent-tabs consumer", () => {
 				id: "narrator-notify",
 				title: "Indexed narrator",
 				status: "idle",
+				// This test is about which users the recent-tab index yields, not about who
+				// may see the narrator. Notification fan-out now also drops recipients who
+				// cannot read it (see filterUsersWhoCanRead), so a default-private fixture
+				// would make the assertion fail for an unrelated reason.
+				visibility: "public",
 				createdAt: NOW,
 				updatedAt: NOW,
 			})
@@ -116,5 +121,52 @@ describe("notification recent-tabs consumer", () => {
 				.where(eq(userPreferences.userId, "relevant-user"))
 				.get()?.recentTabs,
 		).toBe("[]");
+	});
+
+	it("does not notify a user who can no longer read the narrator", async () => {
+		// A recent tab records that someone opened the narrator once. Access can be
+		// revoked afterwards, and a webhook carrying its title and status would keep
+		// delivering to them — a notification must not outlive the permission.
+		seedUser("evicted-user", true);
+		db.insert(narrators)
+			.values({
+				id: "narrator-private",
+				title: "Private narrator",
+				status: "idle",
+				ownerUserId: null,
+				visibility: "private",
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		db.insert(userRecentTabsMeta)
+			.values({
+				userId: "evicted-user",
+				revision: 1,
+				migratedAt: NOW,
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		db.insert(userRecentTabs)
+			.values({
+				id: "recent-private",
+				userId: "evicted-user",
+				tabKey: "narrator:narrator-private",
+				section: "work",
+				type: "narrator",
+				entityId: "narrator-private",
+				representedNarratorId: "narrator-private",
+				title: "Private narrator",
+				lastVisitedAt: 1,
+				sortOrder: 0,
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+
+		await handleAttention("narrator-private", "done");
+
+		expect(requests).toHaveLength(0);
 	});
 });

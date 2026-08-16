@@ -104,10 +104,11 @@ describe("getPlanModeSystemReminder inline-plan toggle", () => {
 	});
 
 	it("renders only the file-based section when inline is disabled", () => {
-		const en = getPlanModeSystemReminder("en", "abc", false);
+		// The reminder is handed the resolved plan path, not a plan identity.
+		const en = getPlanModeSystemReminder("en", ".narrafork/plans/plan-abc.md", false);
 		expect(en).not.toContain('`mode: "inline"`');
 		expect(en).toContain("File-based only");
-		expect(en).toContain(".narrafork/plan-abc.md");
+		expect(en).toContain(".narrafork/plans/plan-abc.md");
 
 		const zh = getPlanModeSystemReminder("zh-CN", "abc", false);
 		expect(zh).not.toContain('`mode: "inline"`');

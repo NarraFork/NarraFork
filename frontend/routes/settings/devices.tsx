@@ -27,6 +27,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { CopyButton } from "../../components/common/CopyButton";
+import { ExecutorInstallModal } from "../../components/settings/ExecutorInstallModal";
 import { api } from "../../lib/api";
 import type {
 	CreateDeviceInput,
@@ -67,12 +68,19 @@ function SettingsDevicesPage() {
 	const [issuedToken, setIssuedToken] = useState<IssuedToken | null>(null);
 	const [transferDevice, setTransferDevice] = useState<RemoteDevice | null>(null);
 	const [diagnosticDevice, setDiagnosticDevice] = useState<RemoteDevice | null>(null);
+	const [installDevice, setInstallDevice] = useState<RemoteDevice | null>(null);
 	const [testResults, setTestResults] = useState<Record<string, TestConnectionResult>>({});
 
 	const { data: devices, isLoading } = useQuery({
 		queryKey: ["devices"],
 		queryFn: () => api.listDevices(),
 		refetchInterval: 10_000,
+	});
+	// Drives the "up to date / upgrade available" badge on each device card.
+	const { data: executorInfo } = useQuery({
+		queryKey: ["executorManifest"],
+		queryFn: () => api.getExecutorManifest(),
+		staleTime: 5 * 60_000,
 	});
 	const { data: projectRows } = useQuery({
 		queryKey: ["projects", "device-scope"],
@@ -155,10 +163,12 @@ function SettingsDevicesPage() {
 							projectName={device.projectId ? projectNames.get(device.projectId) : undefined}
 							testResult={testResults[device.id]}
 							testing={testMut.isPending && testMut.variables === device.id}
+							latestExecutorVersion={executorInfo?.manifest?.version}
 							onTest={() => openAndTest(device)}
 							onDiagnostics={() => setDiagnosticDevice(device)}
 							onEdit={() => setEditingDevice(device)}
 							onTransfer={() => setTransferDevice(device)}
+							onInstall={() => setInstallDevice(device)}
 							onRotate={() => rotateMut.mutate(device.id)}
 							onDelete={async () => {
 								const ok = await confirm({
@@ -190,7 +200,17 @@ function SettingsDevicesPage() {
 				loading={updateMut.isPending}
 				projects={projects}
 			/>
-			<TokenModal issued={issuedToken} onClose={() => setIssuedToken(null)} />
+			<TokenModal
+				issued={issuedToken}
+				onInstall={() => {
+					if (!issuedToken) return;
+					const device = issuedToken.device;
+					setIssuedToken(null);
+					setInstallDevice(device);
+				}}
+				onClose={() => setIssuedToken(null)}
+			/>
+			<ExecutorInstallModal device={installDevice} onClose={() => setInstallDevice(null)} />
 			<TransferModal device={transferDevice} onClose={() => setTransferDevice(null)} />
 			<DeviceDiagnosticsModal
 				device={diagnosticDevice}
@@ -217,23 +237,27 @@ function DeviceCard({
 	projectName,
 	testResult,
 	testing,
+	latestExecutorVersion,
 	onTest,
 	onDiagnostics,
 	onEdit,
 	onRotate,
 	onDelete,
 	onTransfer,
+	onInstall,
 }: {
 	device: RemoteDevice;
 	projectName?: string;
 	testResult?: TestConnectionResult;
 	testing: boolean;
+	latestExecutorVersion?: string;
 	onTest: () => void;
 	onDiagnostics: () => void;
 	onEdit: () => void;
 	onRotate: () => void;
 	onDelete: () => void;
 	onTransfer: () => void;
+	onInstall: () => void;
 }) {
 	const { t } = useTranslation("settings");
 	const platform =
@@ -260,6 +284,7 @@ function DeviceCard({
 							<Badge color={device.scope === "project" ? "violet" : "blue"} variant="outline">
 								{scopeLabel}
 							</Badge>
+							{executorVersionBadge(t, device.agentVersion, latestExecutorVersion)}
 						</Group>
 						{device.description ? (
 							<Text size="sm" c="dimmed">
@@ -297,6 +322,9 @@ function DeviceCard({
 								{t("deviceTransferButton")}
 							</Button>
 						) : null}
+						<Button size="xs" variant="subtle" onClick={onInstall}>
+							{t("executorInstallButton")}
+						</Button>
 						<Button size="xs" variant="subtle" onClick={onEdit}>
 							{t("deviceEditButton")}
 						</Button>
@@ -948,10 +976,23 @@ function TransferModal({ device, onClose }: { device: RemoteDevice | null; onClo
 	);
 }
 
-function TokenModal({ issued, onClose }: { issued: IssuedToken | null; onClose: () => void }) {
+function TokenModal({
+	issued,
+	onInstall,
+	onClose,
+}: {
+	issued: IssuedToken | null;
+	onInstall: () => void;
+	onClose: () => void;
+}) {
 	const { t } = useTranslation("settings");
+	const [manualOpen, setManualOpen] = useState(false);
+	// The generated installer is the primary path; the raw command is kept behind a
+	// disclosure for operators who install by hand.
 	const command = issued
-		? buildDeviceRunCommand(issued.device.connectionMode, issued.device.slug)
+		? buildDeviceRunCommand(issued.device.connectionMode, issued.device.slug, "file", {
+				serverBaseUrl: window.location.origin,
+			})
 		: "";
 	return (
 		<Modal opened={!!issued} onClose={onClose} title={t("deviceTokenModalTitle")} size="lg">
@@ -968,20 +1009,31 @@ function TokenModal({ issued, onClose }: { issued: IssuedToken | null; onClose: 
 						)}
 					</CopyButton>
 					<Divider />
-					<Text size="xs" c="dimmed">
-						{t("deviceRunHint")}
-					</Text>
-					<Code block>{command}</Code>
-					<CopyButton value={command}>
-						{({ copied, copy }) => (
-							<Button onClick={copy} variant="default">
-								{copied ? t("copied") : t("deviceCopyCommand")}
-							</Button>
-						)}
-					</CopyButton>
-					<Text size="xs" c="dimmed">
-						{t("deviceTokenFileHint")}
-					</Text>
+					<Text size="sm">{t("deviceTokenNextStep")}</Text>
+					<Group>
+						<Button onClick={onInstall}>{t("executorInstallGenerate")}</Button>
+						<Button variant="subtle" onClick={() => setManualOpen((open) => !open)}>
+							{manualOpen ? t("deviceManualInstallHide") : t("deviceManualInstallShow")}
+						</Button>
+					</Group>
+					{manualOpen ? (
+						<Stack gap="xs">
+							<Text size="xs" c="dimmed">
+								{t("deviceRunHint")}
+							</Text>
+							<Code block>{command}</Code>
+							<CopyButton value={command}>
+								{({ copied, copy }) => (
+									<Button onClick={copy} variant="default">
+										{copied ? t("copied") : t("deviceCopyCommand")}
+									</Button>
+								)}
+							</CopyButton>
+							<Text size="xs" c="dimmed">
+								{t("deviceTokenFileHint")}
+							</Text>
+						</Stack>
+					) : null}
 				</Stack>
 			) : null}
 		</Modal>
@@ -999,6 +1051,31 @@ function projectSelectOptions(
 				? t("deviceProjectArchivedValue", { project: project.name })
 				: project.name,
 	}));
+}
+
+/**
+ * Compare the version a device reported at handshake against the latest published
+ * release. Rendered as a badge so version skew is visible without opening
+ * diagnostics.
+ */
+function executorVersionBadge(
+	t: (key: string, values?: Record<string, unknown>) => string,
+	agentVersion: string | null,
+	latestVersion: string | undefined,
+) {
+	if (!agentVersion || !latestVersion) return null;
+	if (agentVersion === latestVersion) {
+		return (
+			<Badge color="green" variant="light">
+				{t("executorVersionCurrent")}
+			</Badge>
+		);
+	}
+	return (
+		<Badge color="orange" variant="light">
+			{t("executorVersionUpgradeAvailable", { version: latestVersion })}
+		</Badge>
+	);
 }
 
 function diagnosticStageLabel(

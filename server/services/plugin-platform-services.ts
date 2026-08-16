@@ -1,14 +1,16 @@
 import { logger } from "@server/lib/logger";
-import { getOutboundProxy } from "@server/lib/net/proxy";
+import { getOutboundProxy, resolveOverride } from "@server/lib/net/proxy";
 import type { JsonValue } from "@server/lib/plugins/protocol";
 import { registerExtraSearchChannelSource } from "@server/lib/search/plugin-source";
 import { registerExtraModelSource } from "@server/lib/settings";
+import type { ProxyOverride } from "@server/lib/settings/types";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
 import {
 	type CapabilityBroker,
 	capabilityBroker as defaultCapabilityBroker,
 	type PluginPrincipal,
 } from "./plugin-capability-broker";
+import { applyCommandConfigWrites } from "./plugin-command-config-writes";
 import { PluginCommandRegistry } from "./plugin-command-registry";
 import { applyCommandSecretWrites } from "./plugin-command-secret-writes";
 import { PluginContributionCoordinator } from "./plugin-contribution-coordinator";
@@ -22,7 +24,10 @@ import {
 } from "./plugin-lifecycle-revoke-coordinator";
 import { PluginMcpAdapter } from "./plugin-mcp-adapter";
 import { PluginPermissionStore } from "./plugin-permission-store";
-import { createPluginProviderAdapterFactory } from "./plugin-provider-adapter-factory";
+import {
+	createPluginProviderAdapterFactory,
+	type ProviderHostHintsContext,
+} from "./plugin-provider-adapter-factory";
 import { PluginProviderCatalogRefresher } from "./plugin-provider-catalog-refresh";
 import { PluginProviderClientPool, type ProviderRuntimeLike } from "./plugin-provider-client";
 import { PluginProviderConfigService } from "./plugin-provider-config-service";
@@ -31,6 +36,7 @@ import {
 	findPluginProviderForModel,
 	listPluginProviderModelValues,
 } from "./plugin-provider-model-source";
+import { decideProviderProxy } from "./plugin-provider-proxy-policy";
 import {
 	pluginProviderRegistry as defaultPluginProviderRegistry,
 	type PluginProviderRegistry,
@@ -456,6 +462,19 @@ export function createPluginPlatformServices(
 					sink: secretVault,
 				});
 			}
+			// Non-secret provider settings. Applied after secrets so a config write cannot land
+			// while the credential it describes failed to store, and routed through
+			// `providerConfigService` so it gets the same schema validation as the host's own
+			// config form. `providerConfigService` is declared further down, hence the lazy read
+			// inside `invoke` — same reason `providerRegistry` is read here rather than captured.
+			if (result.configWrites.length > 0) {
+				await applyCommandConfigWrites({
+					pluginId,
+					writes: result.configWrites,
+					registry: providerRegistry,
+					sink: providerConfigService,
+				});
+			}
 			// Only `output` crosses back; the writes were consumed above.
 			return { output: result.output };
 		},
@@ -535,19 +554,57 @@ export function createPluginPlatformServices(
 	});
 	const resolveProviderConfig = (providerInstanceId: string) =>
 		providerCredentialResolver.resolve(providerInstanceId);
-	// Resolve host-provided hints (proxy, concurrency budget) for plugin provider requests.
-	// reflected immediately without restarting plugins.
-	//
-	// Concurrency budget is intentionally not populated: the only value the host could send
-	// is the plugin's own declared maxConcurrentChat, which is noise. Real cross-path budget
-	const resolveProviderHostHints = (): ProviderHostHints | undefined => {
-		const proxyUrl = getOutboundProxy();
-		// Only build hints when there is at least one piece of information to deliver.
-		// An empty object would be harmless but noisy on the wire.
-		if (!proxyUrl) return undefined;
-		return {
-			outbound: { proxyUrl },
-		};
+	/**
+	 * Resolve host-provided hints (proxy, concurrency budget) for plugin provider requests.
+	 *
+	 * Read per-call so a settings or override change takes effect without restarting plugins.
+	 *
+	 * The per-provider override is consulted first and the global policy is the fallback,
+	 * which mirrors how the built-in providers resolve `settings.<provider>.proxy` through
+	 * `resolveOverride`. Before this existed a plugin provider could only follow the global
+	 * proxy: there was no way to send one plugin provider through a proxy and another direct,
+	 * which every built-in provider has supported.
+	 *
+	 * `mode: "direct"` deliberately yields no proxy *and* no fallback — that is the point of
+	 * the mode, and treating an empty result as "nothing to say" would silently restore the
+	 * global proxy the user explicitly opted out of. So the hints object is still sent in that
+	 * case, carrying an absent proxy, which `applyHostHints` on the plugin side reads as
+	 * "clear it".
+	 *
+	 * Concurrency budget is intentionally not populated: the only value the host could send
+	 * is the plugin's own declared maxConcurrentChat, which is noise. Real cross-path budget
+	 */
+	const resolveProviderHostHints = (
+		context?: ProviderHostHintsContext,
+	): ProviderHostHints | undefined => {
+		// The decision itself lives in `plugin-provider-proxy-policy.ts` as a pure function;
+		// this only supplies the inputs.
+		const decision = decideProviderProxy({
+			...(context ? { override: resolveProviderProxyOverride(context) } : {}),
+			resolveOverride,
+			...(getOutboundProxy() ? { globalProxyUrl: getOutboundProxy() } : {}),
+		});
+		return decision as ProviderHostHints | undefined;
+	};
+
+	/**
+	 * The stored proxy override for a provider instance, if any.
+	 *
+	 * Synchronous because it runs on the request path: `getCachedState` reads the already-loaded
+	 * document, and awaiting a load here would put file I/O in front of every chat call. A miss
+	 * (before the first load) is treated as "no override", which falls back to the global proxy
+	 * — the behaviour that existed before per-provider overrides.
+	 *
+	 * Keyed by `localId` because that is the contribution id the override is stored under;
+	 * `providerInstanceId` carries version and hash and would change on every upgrade.
+	 */
+	const resolveProviderProxyOverride = (
+		context: ProviderHostHintsContext,
+	): ProxyOverride | undefined => {
+		const entry = providerRegistry.get(context.providerInstanceId);
+		if (!entry || entry.kind !== "executable-plugin") return undefined;
+		const record = stateStore.getCachedState(context.pluginId);
+		return record?.providerProxies?.[entry.localId];
 	};
 	// Give registered providers a working `createAdapter()`. The runtime is resolved
 	// (and started if needed) on first chat/generate rather than at registration, so

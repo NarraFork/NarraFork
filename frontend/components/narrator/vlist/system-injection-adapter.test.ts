@@ -583,6 +583,44 @@ describe("background completions — one bubble per task row", () => {
 		expect((specs[0]?.data as { markdown: string }).markdown).toBe("first output");
 	});
 
+	// A bash task's preview is verbatim stdout/stderr; an agent task's is a report the
+	// subagent WROTE as Markdown. The two therefore project differently, and the split
+	// follows the producer's intent rather than a guess about the bytes.
+	it("fences a bash result so tool output keeps its own formatting", () => {
+		// The shape that shipped broken: `bunx biome check` prints a `!` diagnostic line
+		// followed by two-space-indented source excerpts with a `│` gutter. As prose,
+		// Markdown turned the indented lines into their own code block and left the
+		// diagnostic as a paragraph — one message drawn as two unrelated cards.
+		const output = [
+			"! This variable measureWebSearch is unused.",
+			"",
+			'  55 │   it("reserves an extra loader lane", async () => {',
+		].join("\n");
+		const specs = taskBubbleSpecs("bg_bash", "bash", [
+			{ id: "b1", alias: "run-biome", title: "biome", status: "success", preview: output },
+		]);
+		const data = specs[0]?.data;
+		const markdown = (data as { markdown: string }).markdown;
+		expect(markdown.startsWith("```")).toBe(true);
+		// Verbatim: the gutter and the indentation are the content.
+		expect(markdown).toContain('  55 │   it("reserves an extra loader lane", async () => {');
+
+		// And it must actually MEASURE as a code block rather than as paragraphs, which
+		// is the property the reader sees. `parse-markdown` tags a fenced block "code".
+		const measured = VLIST_REGISTRY["injection-bubble"].measure(data, 600, 5, undefined);
+		expect(measured.blocks.some((b) => b.kind === "code")).toBe(true);
+	});
+
+	it("leaves an agent report as prose, since a subagent authors Markdown", () => {
+		const specs = taskBubbleSpecs("bg_agent", "agent", [
+			{ id: "t1", title: "explore", status: "success", preview: "- found it\n- and this" },
+		]);
+		const data = specs[0]?.data;
+		expect((data as { markdown: string }).markdown.startsWith("```")).toBe(false);
+		const measured = VLIST_REGISTRY["injection-bubble"].measure(data, 600, 5, undefined);
+		expect(measured.blocks.some((b) => b.kind === "code")).toBe(false);
+	});
+
 	it("keeps a bubble for a task that produced no output, and SAYS it is empty", () => {
 		// "It finished, with nothing to show" IS the result, and the status is in the
 		// header. Dropping the row would make a silent success look like it never ran.
@@ -703,6 +741,50 @@ describe("knowledge hits — bubbles only when there is an excerpt", () => {
 	it("falls back to the entry id when a hit has no title", () => {
 		const specs = knowledgeSpecs([{ entryId: "k-42", title: "", summary: "body text" }]);
 		expect((specs[0]?.data as { speaker: string }).speaker).toBe("k-42");
+	});
+
+	it("reduces a raw-Markdown summary to prose instead of painting a giant heading", () => {
+		/*
+		 * The reported bug. `summary` is a FLATTENED slice of the entry's Markdown body
+		 * (`\s+ → " "`), which does not neutralize Markdown — it weaponizes it: the body
+		 * opens with `# Title`, so the whole excerpt ended up behind that one `#` and the
+		 * bubble painted ~300 characters at display size, with the surviving `>` and
+		 * backticks as debris.
+		 *
+		 * Rows stored BEFORE the server started stripping still hold that text, so the
+		 * cleanup has to happen on the display path too (it is idempotent).
+		 */
+		const specs = knowledgeSpecs([
+			{
+				entryId: "k1",
+				title: "PocketJS 在 Kindle PW5 实机部署踩坑",
+				summary:
+					"# PocketJS 在 Kindle PW5 实机部署踩坑 > 2026-08-10；fork 修复分支：`AndrewZhuCC/pocketjs` ## 1. fork 情况 - 完整 fork",
+			},
+		]);
+		const data = specs[0]?.data as { markdown: string; speaker: string };
+		// The header already names the entry, so the excerpt drops the repeated title and
+		// leads with the first line that actually says something.
+		expect(data.speaker).toBe("PocketJS 在 Kindle PW5 实机部署踩坑");
+		expect(data.markdown).toContain("2026-08-10");
+		expect(data.markdown).toContain("AndrewZhuCC/pocketjs");
+		expect(data.markdown).toContain("fork 情况");
+		// Nothing that a Markdown renderer would turn back into a heading or a quote:
+		// escaped where a marker survives, removed where it was structure.
+		expect(data.markdown).not.toMatch(/(^|\s)#/);
+		expect(data.markdown).not.toMatch(/(^|\s)>/);
+		expect(data.markdown).not.toContain("`");
+	});
+
+	it("keeps a hit whose summary is nothing but Markdown structure off the bubble path", () => {
+		// A body of pure structure (a lone heading repeating the title, a fence) leaves no
+		// excerpt, which is the empty-shell case the all-or-nothing gate exists for.
+		const data = injectionData({
+			type: "system_injection",
+			source: "knowledge_base_hint",
+			body: KNOWLEDGE_BODY([{ entryId: "k1", title: "Only a title", summary: "# Only a title" }]),
+		});
+		expect(data.kind).toBe("origin_notice");
 	});
 
 	it("keeps an empty hit list on the card path", () => {

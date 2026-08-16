@@ -1159,6 +1159,14 @@ export async function runMigrations(sqlite: Database): Promise<{
 	// database. Captured before migrations run.
 	const hadMfaEnabledColumn = usersHasColumn(sqlite, "mfa_enabled");
 	const hadFastModeOverrideColumn = tableHasColumn(sqlite, "narrators", "fast_mode_override");
+	const hadNarratorVisibilityColumn = tableHasColumn(sqlite, "narrators", "visibility");
+	const hadProjectVisibilityColumn = tableHasColumn(sqlite, "projects", "visibility");
+	const hadCollectionProjectGateColumn = tableHasColumn(
+		sqlite,
+		"knowledge_collections",
+		"inherit_project_gate",
+	);
+	const hadAclGrantsTable = tableExists(sqlite, "acl_grants");
 
 	const resolved = await resolveMigrationsFolder();
 	try {
@@ -1176,6 +1184,18 @@ export async function runMigrations(sqlite: Database): Promise<{
 		}
 		if (!hadFastModeOverrideColumn) {
 			backfillFastModeOverride(sqlite);
+		}
+		if (!hadNarratorVisibilityColumn) {
+			backfillNarratorVisibility(sqlite);
+		}
+		if (!hadProjectVisibilityColumn) {
+			backfillProjectVisibility(sqlite);
+		}
+		if (!hadCollectionProjectGateColumn) {
+			backfillCollectionProjectGate(sqlite);
+		}
+		if (!hadAclGrantsTable) {
+			migrateGrantsToUnifiedAcl(sqlite);
 		}
 		return { source: resolved.source, folder: resolved.folder };
 	} finally {
@@ -1226,6 +1246,218 @@ function backfillFastModeOverride(sqlite: Database): void {
 	} catch (err) {
 		// Non-fatal: never block startup on an optional backfill.
 		logger.warn("fast_mode_override backfill failed (non-fatal)", { error: String(err) });
+	}
+}
+
+/**
+ * One-time backfill: every narrator that predates access control is made
+ * `public`, so upgrading never hides work that the whole team could already see.
+ *
+ * Gated on the pre-migration absence of `narrators.visibility`, exactly like the
+ * backfills above, which makes it run at most once. That gate is the whole point:
+ * a heuristic such as "owner IS NULL AND created_at < cutover" would re-run on
+ * every startup and keep flipping rows back to `public` after an admin had
+ * deliberately made an old narrator private again.
+ *
+ * These rows keep `owner_user_id = NULL` on purpose — there is no trustworthy
+ * creator to infer. A null owner means only admins can change the sharing
+ * settings, and an admin hands one over with `transfer-owner`.
+ */
+function backfillNarratorVisibility(sqlite: Database): void {
+	try {
+		const result = sqlite
+			.prepare("UPDATE narrators SET visibility = 'public' WHERE owner_user_id IS NULL")
+			.run();
+		if (result.changes > 0) {
+			logger.info("Backfilled visibility=public for pre-ACL narrators", {
+				count: result.changes,
+			});
+		}
+	} catch (err) {
+		// Non-fatal: never block startup on an optional backfill.
+		logger.warn("narrator visibility backfill failed (non-fatal)", { error: String(err) });
+	}
+}
+
+/**
+ * One-time backfill: every project that predates project-level access control
+ * becomes `public`, so upgrading never hides work the whole team could already see.
+ *
+ * Owners are deliberately NOT invented: there is no trustworthy creator to infer
+ * (the table never had one). A null owner means only admins can change the
+ * project's membership until one of them hands it over.
+ *
+ * Gated on the pre-migration absence of `projects.visibility`, exactly like the
+ * narrator backfill above, which makes it run at most once — an admin who later
+ * makes a project private must not have it flipped back on the next restart.
+ */
+function backfillProjectVisibility(sqlite: Database): void {
+	try {
+		const result = sqlite
+			.prepare("UPDATE projects SET visibility = 'public' WHERE owner_user_id IS NULL")
+			.run();
+		if (result.changes > 0) {
+			logger.info("Backfilled visibility=public for pre-ACL projects", {
+				count: result.changes,
+			});
+		}
+	} catch (err) {
+		// Non-fatal: never block startup on an optional backfill.
+		logger.warn("project visibility backfill failed (non-fatal)", { error: String(err) });
+	}
+}
+
+/**
+ * One-time backfill: existing knowledge collections do NOT inherit their project's
+ * membership gate.
+ *
+ * The column defaults to true so newly created project-scoped collections are
+ * gated, but every collection that already exists was created when any signed-in
+ * user could reach any project. Turning the gate on for those during an upgrade
+ * would hide content that was readable a minute earlier, and the symptom — entries
+ * simply stop appearing — gives no hint of the cause. Enabling the gate is left as
+ * an explicit choice by the collection's owner.
+ */
+function backfillCollectionProjectGate(sqlite: Database): void {
+	try {
+		const result = sqlite
+			.prepare("UPDATE knowledge_collections SET inherit_project_gate = 0")
+			.run();
+		if (result.changes > 0) {
+			logger.info("Backfilled inherit_project_gate=false for pre-ACL knowledge collections", {
+				count: result.changes,
+			});
+		}
+	} catch (err) {
+		// Non-fatal: never block startup on an optional backfill.
+		logger.warn("collection project-gate backfill failed (non-fatal)", { error: String(err) });
+	}
+}
+
+/**
+ * One-time migration: fold `knowledge_grants` and `narrator_grants` into the
+ * unified `acl_grants` table.
+ *
+ * Runs once, gated on `acl_grants` having been absent before this migration pass.
+ * The source tables are left intact and unread afterwards, so a bad migration can
+ * be rolled back as code rather than as data.
+ *
+ * The mapping is the delicate part, and one rule dominates it: a knowledge grant is
+ * NOT converted into a plain `read` capability. Knowledge readability was never
+ * "holds a grant" — it is the result of comparing clearance rank and compartment
+ * tags. Emitting an unconditional `capability='read'` row for a user who merely
+ * holds one low clearance would promote them to "can read everything", which is
+ * privilege escalation. Domain credentials therefore migrate as credential rows
+ * whose `capability` column is only an index placeholder (see the `acl_grants`
+ * comment in schema.ts), and the knowledge layer keeps deciding readability itself.
+ *
+ * `canWrite` is the one part that IS a plain capability: it was a boolean riding on
+ * an arbitrary grant row, so it becomes its own `write` row. Several source rows
+ * carrying canWrite for the same principal and scope collapse onto one row, which
+ * the unique index enforces — hence `INSERT OR IGNORE`.
+ */
+function migrateGrantsToUnifiedAcl(sqlite: Database): void {
+	try {
+		if (!tableExists(sqlite, "acl_grants")) return;
+
+		let knowledgeCredentials = 0;
+		let knowledgeWrites = 0;
+		let narratorCapabilities = 0;
+
+		sqlite.transaction(() => {
+			if (tableExists(sqlite, "knowledge_grants")) {
+				// Shape B — domain credentials. `capability` is pinned to 'read' as a
+				// placeholder; it does not authorize reading.
+				knowledgeCredentials = sqlite
+					.prepare(
+						`INSERT OR IGNORE INTO acl_grants
+						   (id, scope_type, scope_id, principal_type, principal_id,
+						    capability, domain_kind, domain_value, granted_by, created_at)
+						 SELECT
+						   'aclg_kc_' || g.id,
+						   CASE WHEN g.collection_id IS NULL THEN 'global' ELSE 'knowledge_collection' END,
+						   g.collection_id,
+						   g.principal_type,
+						   g.principal_id,
+						   'read',
+						   g.grant_type,
+						   CASE g.grant_type
+						     WHEN 'clearance' THEN g.clearance_level
+						     ELSE g.tag_id
+						   END,
+						   NULL,
+						   g.created_at
+						 FROM knowledge_grants g
+						 WHERE g.grant_type IN ('clearance','tag','review')
+						   AND COALESCE(
+						         CASE g.grant_type
+						           WHEN 'clearance' THEN g.clearance_level
+						           ELSE g.tag_id
+						         END, '') <> ''`,
+					)
+					.run().changes;
+
+				// Shape A — the canWrite boolean becomes a real capability row.
+				knowledgeWrites = sqlite
+					.prepare(
+						`INSERT OR IGNORE INTO acl_grants
+						   (id, scope_type, scope_id, principal_type, principal_id,
+						    capability, domain_kind, domain_value, granted_by, created_at)
+						 SELECT
+						   'aclg_kw_' || g.id,
+						   CASE WHEN g.collection_id IS NULL THEN 'global' ELSE 'knowledge_collection' END,
+						   g.collection_id,
+						   g.principal_type,
+						   g.principal_id,
+						   'write',
+						   NULL,
+						   NULL,
+						   NULL,
+						   g.created_at
+						 FROM knowledge_grants g
+						 WHERE g.can_write = 1`,
+					)
+					.run().changes;
+			}
+
+			if (tableExists(sqlite, "narrator_grants")) {
+				// Narrator grants were already plain capabilities: a straight mapping.
+				narratorCapabilities = sqlite
+					.prepare(
+						`INSERT OR IGNORE INTO acl_grants
+						   (id, scope_type, scope_id, principal_type, principal_id,
+						    capability, domain_kind, domain_value, granted_by, created_at)
+						 SELECT
+						   'aclg_n_' || g.id,
+						   'narrator',
+						   g.narrator_id,
+						   g.principal_type,
+						   g.principal_id,
+						   g.access,
+						   NULL,
+						   NULL,
+						   g.granted_by,
+						   g.created_at
+						 FROM narrator_grants g
+						 WHERE g.access IN ('read','write')`,
+					)
+					.run().changes;
+			}
+		})();
+
+		const total = knowledgeCredentials + knowledgeWrites + narratorCapabilities;
+		if (total > 0) {
+			logger.info("Migrated grants into unified acl_grants", {
+				knowledgeCredentials,
+				knowledgeWrites,
+				narratorCapabilities,
+			});
+		}
+	} catch (err) {
+		// Non-fatal by the same rule as the backfills above: a failed migration leaves
+		// the legacy tables authoritative, and the domain layers still read them until
+		// their own cut-over step. Logged loudly because it needs attention.
+		logger.error("unified ACL grant migration failed (non-fatal)", { error: String(err) });
 	}
 }
 

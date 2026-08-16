@@ -1,7 +1,9 @@
-import { readFile, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { stat } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
+import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
+import { getGlobalPromptCandidates, PROJECT_PROMPT_FILENAMES } from "../lib/global-prompt-paths";
+import { buildPlanFileRelPath, isSafePlanFileIdForPath } from "../lib/plan-file-path";
 import { IS_WINDOWS, isWslAllowed } from "../lib/platform";
 import {
 	getDynamicSpecSystemReminder,
@@ -9,11 +11,12 @@ import {
 	getReplyLanguageInstruction,
 	type Locale,
 } from "../lib/prompt-i18n";
+import { MAX_PROJECT_INSTRUCTIONS_BYTES, readFileCapped } from "../lib/read-file-capped";
 
 export interface BuildPromptOptions {
 	/** Base system prompt (narrator's custom prompt or subagent type prompt) */
 	basePrompt: string | null;
-	/** Working directory for CWD injection and AGENT.md lookup */
+	/** Working directory for CWD injection and AGENTS.md lookup */
 	cwd: string;
 	/** Locale for language instruction */
 	locale: Locale;
@@ -21,8 +24,15 @@ export interface BuildPromptOptions {
 	contextSummary?: string | null;
 	/** Whether plan mode is active */
 	planMode?: boolean;
-	/** Plan file ID for plan mode (locks Write/Edit to .narrafork/plan-{id}.md) */
+	/** Plan file ID for plan mode (locks Write/Edit to the designated plan file) */
 	planFileId?: string;
+	/**
+	 * Resolved relative path of the designated plan file. Passed in rather than
+	 * rebuilt from `planFileId` so the reminder names the same file the write gate
+	 * and ExitPlanMode use — during the move to `.narrafork/plans/` an in-flight
+	 * cycle can still be anchored to its legacy path.
+	 */
+	planFilePath?: string;
 	/** Whether plan mode accepts inline plans. When false, only the file-based flow is shown. */
 	planAllowInlinePlan?: boolean;
 	/** Whether to force language instruction even for English locale */
@@ -57,16 +67,15 @@ export interface BuildPromptResult {
  * iteration, so it stays a single bounded `stat` — never a read. The plan file
  * content itself is only read when ExitPlanMode resolves it.
  */
-async function statPlanFileBytes(cwd: string, planFileId?: string): Promise<number | undefined> {
-	if (!planFileId) return undefined;
-	// planFileId is generated/validated server-side, but this path is also used
-	// for restored narrators, so refuse anything that could escape the worktree.
-	if (planFileId.includes("/") || planFileId.includes("\\") || planFileId.includes("..")) {
-		return undefined;
-	}
+async function statPlanFileBytes(cwd: string, planFilePath?: string): Promise<number | undefined> {
+	if (!planFilePath) return undefined;
 	if (!isAbsolute(cwd)) return undefined;
+	// The path is built server-side, but restored narrators carry whatever is in
+	// the DB, so confirm it still resolves inside the working directory.
+	const resolved = resolve(cwd, planFilePath);
+	if (!localPathSemantics.contains(cwd, resolved)) return undefined;
 	try {
-		const stats = await stat(join(cwd, ".narrafork", `plan-${planFileId}.md`));
+		const stats = await stat(resolved);
 		if (!stats.isFile() || stats.size <= 0) return undefined;
 		return stats.size;
 	} catch {
@@ -77,8 +86,9 @@ async function statPlanFileBytes(cwd: string, planFileId?: string): Promise<numb
 
 /**
  * Build the effective system prompt by appending standard sections:
- * context summary → CWD → Dynamic Spec → AGENT.md/CLAUDE.md →
- * ~/.agents/AGENT.md|~/.claude/CLAUDE.md → language → plan mode.
+ * context summary → CWD → Dynamic Spec → project instructions
+ * (AGENTS.override.md/AGENTS.md/AGENT.md/CLAUDE.md) → global instructions
+ * (~/.agents, $CODEX_HOME, ~/.claude) → language → plan mode.
  *
  * Used by both main narrators and subagents. Subagents simply omit the
  * optional fields (contextSummary, planMode) to get a minimal prompt.
@@ -93,6 +103,7 @@ export async function buildEffectiveSystemPrompt(
 		contextSummary,
 		planMode,
 		planFileId,
+		planFilePath,
 		planAllowInlinePlan,
 		replyInUserLanguage,
 		defaultSystemPrompt,
@@ -221,46 +232,41 @@ export async function buildEffectiveSystemPrompt(
 		prompt = `${base}${sep}${getDynamicSpecSystemReminder(locale)}`;
 	}
 
-	// 3. Inject AGENT.md (fallback to CLAUDE.md) if present
+	// 3. Inject project instructions. AGENTS.override.md is a local-only override
+	// (Codex convention), then the AGENTS.md standard, then legacy fallbacks.
+	// Byte-level capped read (same discipline as global MD) so a huge AGENTS.md
+	// cannot inflate the system prompt allocation unboundedly.
 	{
-		let agentMdContent: string | null = null;
-		for (const filename of ["AGENT.md", "CLAUDE.md"]) {
-			try {
-				agentMdContent = await readFile(join(cwd, filename), "utf-8");
-				break;
-			} catch {
-				// file not found, try next
-			}
+		let result: { content: string; truncated: boolean } | null = null;
+		for (const filename of PROJECT_PROMPT_FILENAMES) {
+			result = await readFileCapped(join(cwd, filename), MAX_PROJECT_INSTRUCTIONS_BYTES);
+			if (result) break;
 		}
-		if (agentMdContent) {
+		if (result) {
+			const suffix = result.truncated
+				? "\n\n[... project instructions truncated due to size limit]"
+				: "";
 			const base = prompt ?? "";
 			const sep = base ? "\n\n" : "";
-			prompt = `${base}${sep}## Project Instructions\n\n${agentMdContent}`;
+			prompt = `${base}${sep}## Project Instructions\n\n${result.content}${suffix}`;
 		}
 	}
-	// 3b. Inject global AGENT.md (fallback to CLAUDE.md): ~/.agents/AGENT.md > ~/.claude/CLAUDE.md
+	// 3b. Inject global instructions (see getGlobalPromptCandidates for the order).
+	// Also byte-level capped to bound the allocation and avoid reading the whole
+	// file into JS heap before truncating.
 	{
-		let globalMd: string | null = null;
-		const globalCandidates = [
-			join(homedir(), ".agents", "AGENT.md"),
-			join(homedir(), ".claude", "CLAUDE.md"),
-		];
-		for (const candidate of globalCandidates) {
-			try {
-				globalMd = await readFile(candidate, "utf-8");
-				break;
-			} catch {
-				// file not found, try next
-			}
+		let result: { content: string; truncated: boolean } | null = null;
+		for (const candidate of getGlobalPromptCandidates()) {
+			result = await readFileCapped(candidate, MAX_PROJECT_INSTRUCTIONS_BYTES);
+			if (result) break;
 		}
-		if (globalMd) {
-			const MAX_GLOBAL_MD = 50_000;
-			if (globalMd.length > MAX_GLOBAL_MD) {
-				globalMd = globalMd.slice(0, MAX_GLOBAL_MD);
-			}
+		if (result) {
+			const suffix = result.truncated
+				? "\n\n[... global instructions truncated due to size limit]"
+				: "";
 			const base = prompt ?? "";
 			const sep = base ? "\n\n" : "";
-			prompt = `${base}${sep}## Global Instructions\n\n${globalMd}`;
+			prompt = `${base}${sep}## Global Instructions\n\n${result.content}${suffix}`;
 		}
 	}
 
@@ -280,10 +286,13 @@ export async function buildEffectiveSystemPrompt(
 		// planFileId every turn), but the record of having written to it does not.
 		// Stat the file so the reminder can tell the model to Read + Edit instead
 		// of Write-truncating a half-finished plan it no longer remembers.
-		const planFileBytes = await statPlanFileBytes(cwd, planFileId);
+		const effectivePlanFilePath =
+			planFilePath ??
+			(isSafePlanFileIdForPath(planFileId) ? buildPlanFileRelPath(planFileId) : undefined);
+		const planFileBytes = await statPlanFileBytes(cwd, effectivePlanFilePath);
 		prompt = `${base}${sep}${getPlanModeSystemReminder(
 			locale,
-			planFileId,
+			effectivePlanFilePath,
 			planAllowInlinePlan !== false,
 			planFileBytes,
 		)}`;

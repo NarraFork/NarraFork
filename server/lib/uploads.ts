@@ -14,7 +14,6 @@ import { generateShortId } from "./id";
 import { logger } from "./logger";
 import { getNarraforkPath } from "./narrafork-home";
 
-const DEFAULT_UPLOADS_DIR = getNarraforkPath("uploads");
 let uploadsDirTestOverride: string | null = null;
 
 function isWithinDir(root: string, target: string): boolean {
@@ -27,8 +26,25 @@ export function setUploadsDirForTests(dir?: string | null): void {
 	uploadsDirTestOverride = dir ? resolve(dir) : null;
 }
 
+/**
+ * The uploads root.
+ *
+ * Resolved per call, not captured at module load. `getNarraforkPath` reads
+ * `NARRAFORK_HOME` lazily on purpose — "so test preloads and embedded runtimes can set the
+ * override before application modules are imported" — and freezing its answer in a
+ * module-level constant defeated exactly that, because the constant is evaluated whenever
+ * this module happens to be imported first.
+ *
+ * The visible symptom was a test that failed only in combination: a suite that sets
+ * `NARRAFORK_HOME` at module scope changes what the default SHOULD be, but a module already
+ * imported by an earlier suite had baked in the previous value. Resolving here makes the
+ * default a function of the environment at the moment it is read, which is what every other
+ * consumer of `getNarraforkPath` already assumes.
+ *
+ * Cost is a `resolve()` per call; callers that touch the filesystem afterwards dwarf it.
+ */
 export function getUploadsDir(): string {
-	return uploadsDirTestOverride ?? DEFAULT_UPLOADS_DIR;
+	return uploadsDirTestOverride ?? getNarraforkPath("uploads");
 }
 
 function getAvatarsDir(): string {

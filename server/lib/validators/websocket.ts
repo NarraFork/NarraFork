@@ -83,6 +83,16 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		type: z.literal("presence_leave"),
 		narratorId: z.string().min(1),
 	}),
+	// Chat room subscriptions ride the narrator socket (see narrator-ws.ts). The
+	// batch cap mirrors the per-connection subscription ceiling enforced there.
+	z.object({
+		type: z.literal("chat_subscribe"),
+		roomIds: z.array(z.string().min(1)).max(50),
+	}),
+	z.object({
+		type: z.literal("chat_unsubscribe"),
+		roomIds: z.array(z.string().min(1)).max(50),
+	}),
 	z.object({ type: z.literal("subscribe_stats") }),
 	z.object({ type: z.literal("unsubscribe_stats") }),
 	z

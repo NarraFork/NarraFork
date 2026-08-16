@@ -67,7 +67,7 @@ export interface ActiveNarrator {
 	_narratorKind?: "knowledge";
 	/** Cached worktree path (set when narrator is bound to an active chapter with a worktree) */
 	_worktreePath?: string;
-	/** Plan file ID — set when entering plan mode, used to lock Write/Edit to .narrafork/plan-{id}.md */
+	/** Plan file ID — set when entering plan mode, used to lock Write/Edit to .narrafork/plans/plan-{id}.md */
 	_planFileId?: string;
 	/** Plan file path — set when entering plan mode, passed to EnterPlanMode tool for the prompt */
 	_planFilePath?: string;

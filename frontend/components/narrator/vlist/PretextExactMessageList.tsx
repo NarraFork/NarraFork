@@ -127,8 +127,14 @@ import {
 	type VListEditRole,
 } from "./vlist-edit-target";
 import { resolveErrorNoticeActions, useVListErrorNoticeActions } from "./vlist-error-actions";
-import { type FoldRowGeometry, isFoldCaptureUsable, planFoldMotion } from "./vlist-fold-animation";
 import {
+	type FoldRowGeometry,
+	isFoldCaptureUsable,
+	planFoldFrameMotion,
+	planFoldMotion,
+} from "./vlist-fold-animation";
+import {
+	captureFoldFrameGeometry,
 	captureFoldGeometry,
 	createFoldMotionController,
 	prefersReducedMotion,
@@ -492,14 +498,20 @@ export function isFramedRunItem(item: VListItem | undefined): boolean {
  */
 export function computeToolRunFrames(
 	items: readonly (VListItem | undefined)[],
-): Array<{ start: number; end: number }> {
-	const runs: Array<{ start: number; end: number }> = [];
+): Array<{ key: string; start: number; end: number }> {
+	const runs: Array<{ key: string; start: number; end: number }> = [];
 	let i = 0;
 	while (i < items.length) {
 		if (isFramedRunItem(items[i])) {
 			let j = i;
 			while (j + 1 < items.length && isFramedRunItem(items[j + 1])) j++;
-			if (j > i) runs.push({ start: i, end: j });
+			// Keyed by the FIRST member's spec key, not by the index. The index is not an
+			// identity: a fold anywhere earlier in the document renumbers every run after
+			// it, so an index-keyed frame would be paired with a different run's geometry
+			// across the very rebuild the fold transition has to diff. The first member's
+			// spec key survives a fold (only the toggled element's own key can change),
+			// which is exactly the pairing the FLIP needs.
+			if (j > i) runs.push({ key: `run:${items[i]?.spec.key ?? i}`, start: i, end: j });
 			i = j + 1;
 		} else {
 			i++;
@@ -1970,6 +1982,14 @@ export const PretextExactMessageList = forwardRef<
 		capturedAt: number;
 		scrollTop: number;
 		geometry: Map<string, FoldRowGeometry>;
+		/**
+		 * Boxes of the decorative tool-run frames, captured in the same breath as the
+		 * rows. A frame's border is only correct while it agrees with the cards inside
+		 * it, so the two geometries must come from ONE snapshot — capturing them at
+		 * different moments is how a border ends up animating from a box its contents
+		 * never occupied.
+		 */
+		frames: Map<string, FoldRowGeometry>;
 	} | null>(null);
 	/**
 	 * Reads the geometry of the CURRENTLY mounted rows.
@@ -1980,8 +2000,19 @@ export const PretextExactMessageList = forwardRef<
 	 * capture reading the committed values instead of a stale copy.
 	 */
 	const readFoldGeometryRef = useRef<
-		(() => { geometry: Map<string, FoldRowGeometry>; documentRevision: number }) | null
+		| (() => {
+				geometry: Map<string, FoldRowGeometry>;
+				frames: Map<string, FoldRowGeometry>;
+				documentRevision: number;
+		  })
+		| null
 	>(null);
+	/**
+	 * The committed grouping frames, for the two consumers that run OUTSIDE render: the
+	 * click-time capture and the play effect. Assigned during render further down, where
+	 * the runs are actually computed.
+	 */
+	const toolRunFramesRef = useRef<ReturnType<typeof computeToolRunFrames>>([]);
 	/**
 	 * Drill-down header morph (see vlist-drill-morph.ts).
 	 *
@@ -2034,6 +2065,7 @@ export const PretextExactMessageList = forwardRef<
 			capturedAt: Date.now(),
 			scrollTop: scrollTopRef.current,
 			geometry: read.geometry,
+			frames: read.frames,
 		};
 	}, []);
 	// Stable RowToggles per key (memoized) so unchanged rows keep referential props
@@ -2051,6 +2083,26 @@ export const PretextExactMessageList = forwardRef<
 						key,
 					);
 					captureFoldBefore(key);
+					// A per-key OVERRIDE of the level's default fold — NOT an LOD step, and the
+					// distinction is load-bearing.
+					//
+					// Three controllers animate this canvas and two of them write `transform`
+					// on the SAME element: the fold resolves a row through `data-nf-row-key`
+					// and the LOD morph through `data-nf-unit`, which ride on one node. They
+					// have independent cancel boundaries, so if both ever planned in one commit
+					// the two animations would fight over that property.
+					//
+					// They cannot, because the LOD morph only admits a commit where the
+					// effective `lod` MOVED (with the document revision unchanged), and nothing
+					// here moves it: `toggleVListLodUserOverride` adds/removes one key in
+					// `lodUserOverrides`, which reaches the build as a per-card opt
+					// (`isLodUserOverride`), while `manifest.lod` comes from `useRenderLod()`
+					// and only a zoom step / pinch changes that. So this rebuild is a
+					// fold-shaped one: the fold plays, the LOD morph returns early.
+					//
+					// Which means this branch must NOT be turned into a real level step (nor
+					// gain one alongside the override) without giving the two controllers a
+					// shared cancel boundary. Pinned by vlist-fold-wiring.test.ts.
 					if (collapsesByLodByKeyRef.current.get(key) === true) {
 						setInteraction((prev) => toggleVListLodUserOverride(prev, key));
 					} else {
@@ -2335,6 +2387,15 @@ export const PretextExactMessageList = forwardRef<
 	// Height as the LAYOUT sees it (see the buildOptions comment below). Derived here
 	// so the value handed to the document hook only changes at bucket boundaries.
 	const layoutViewportHeight = bucketViewportHeight(viewportHeight);
+	// FOLD-ORDER MARKER — must stay ABOVE the fold-play layout effect.
+	//
+	// This hook owns the anchored rebuild's scroll correction, and it applies it in a
+	// LAYOUT effect. The fold play below reads the resulting scrollTop as its
+	// `afterScrollTop`, so it is only correct while that correction has already run —
+	// which within one component is decided purely by DECLARATION ORDER. Moving this
+	// call below the fold effect would silently plan every fold from an uncorrected
+	// scroll position (rows sliding by the anchor's own Δ), with nothing throwing.
+	// vlist-fold-wiring.test.ts asserts this marker precedes the play effect.
 	const pretextDocument = usePretextDocument(narratorId, {
 		lod,
 		labels: vlistLabels,
@@ -2550,6 +2611,14 @@ export const PretextExactMessageList = forwardRef<
 			},
 			onSyncOk: () => {
 				initialRevisionSyncRef.current = false;
+			},
+			// Access was refused or revoked: no snapshot or catch-up is coming. Clear the
+			// pending initial sync so the view stops waiting on a stream it will never
+			// receive, and refetch — the REST call now answers 404 and the surrounding
+			// route renders its "not found" state instead of an endless spinner.
+			onSubscribeDenied: () => {
+				initialRevisionSyncRef.current = false;
+				bumpMessageRevision();
 			},
 		},
 		exactCatchUpCursor,
@@ -2876,7 +2945,11 @@ export const PretextExactMessageList = forwardRef<
 		const window = visibleRef.current;
 		const revision = foldRevisionOf(foldDocumentRevision);
 		if (!layout)
-			return { geometry: new Map<string, FoldRowGeometry>(), documentRevision: revision };
+			return {
+				geometry: new Map<string, FoldRowGeometry>(),
+				frames: new Map<string, FoldRowGeometry>(),
+				documentRevision: revision,
+			};
 		// Only the MOUNTED rows: an unmounted row has no node to animate, and bounding
 		// the map here is what keeps a fold O(window) rather than O(history).
 		const keys: string[] = [];
@@ -2892,6 +2965,11 @@ export const PretextExactMessageList = forwardRef<
 				const index = indices[position];
 				return index === undefined ? undefined : layout.items[index];
 			}),
+			// The grouping frames, derived from the SAME layout in the same snapshot, so
+			// a border and the cards it wraps can never be planned from disagreeing
+			// geometry. Not window-bounded: a frame can span the whole window and still
+			// be mounted (see captureFoldFrameGeometry).
+			frames: captureFoldFrameGeometry(toolRunFramesRef.current, (index) => layout.items[index]),
 			documentRevision: revision,
 		};
 	};
@@ -2907,7 +2985,32 @@ export const PretextExactMessageList = forwardRef<
 	 * `afterScrollTop` is read from the container rather than from state because the
 	 * anchored rebuild's scroll correction is itself applied in a layout effect; the
 	 * live value is what the reader will actually see (see planFoldMotion's note on
-	 * viewport coordinates).
+	 * viewport coordinates). That correction runs BEFORE this effect only because
+	 * `usePretextDocument` is called earlier in this component — an ordering guarded
+	 * at the source level by vlist-fold-wiring.test.ts.
+	 *
+	 * ## Why the pinned case PREDICTS its scrollTop instead of reading it
+	 *
+	 * While pinned to the bottom, `node.scrollTop` in this layout phase is not yet the
+	 * value the reader will see. Two writers push the viewport back to the end of the
+	 * content — the anchored "bottom" correction (a layout effect, keyed on the
+	 * coordinator's computed scrollTop) and the geometry-revision pin effect (a passive
+	 * effect writing in the NEXT frame) — and neither is guaranteed to have landed here:
+	 * the correction is skipped when its computed value did not change, and the pin is a
+	 * frame late by construction. Reading the raw value in either case plans the FLIP
+	 * from a position that is about to be corrected, so expanding a card at the bottom
+	 * started the animation off by the growth it was answering.
+	 *
+	 * `getScrollBottomTarget` is the exact value both writers converge on, and it is
+	 * already correct in this phase: React has committed the canvas's new
+	 * `height: totalHeight` and the tail footer, so `scrollHeight - clientHeight` is the
+	 * post-correction bottom. Predicting it makes the plan agree with the frame the
+	 * reader actually sees, whichever writer gets there.
+	 *
+	 * `pinnedToBottom` is render state, read from THIS commit's scope: the commit whose
+	 * geometry is being animated. A fold cannot unpin (our own scroll writes are
+	 * recognised as echoes, see writeScrollTop), so this is still the reader's state at
+	 * click time — which is the state the correction will be applied under.
 	 */
 	useLayoutEffect(() => {
 		const capture = foldCaptureRef.current;
@@ -2922,14 +3025,30 @@ export const PretextExactMessageList = forwardRef<
 			foldCaptureRef.current = null;
 			return;
 		}
-		const after = readFoldGeometryRef.current?.().geometry;
-		if (!after) return;
+		const read = readFoldGeometryRef.current?.();
+		if (!read) return;
+		// PREDICTED while pinned, live otherwise (see the note above). One value serves
+		// both plans so a border can never be planned against a different scroll pair
+		// than the cards inside it.
+		const afterScrollTop = pinnedToBottom ? getScrollBottomTarget(node) : node.scrollTop;
 		const motions = planFoldMotion({
 			before: capture.geometry,
-			after,
+			after: read.geometry,
 			toggledKey: capture.toggledKey,
 			beforeScrollTop: capture.scrollTop,
-			afterScrollTop: node.scrollTop,
+			afterScrollTop,
+		});
+		// The decorative grouping borders, planned from the same before/after snapshot
+		// and the same scroll pair as the rows. Without this the frame was written at
+		// its final box on the commit frame while the cards inside it were still 200ms
+		// from arriving, so the border visibly detached from its own contents.
+		const frameMotions = planFoldFrameMotion({
+			before: capture.frames,
+			after: read.frames,
+			beforeScrollTop: capture.scrollTop,
+			// Same predicted value as the rows: two scroll pairs would let a border
+			// animate from a box its own contents never occupied.
+			afterScrollTop,
 		});
 		// NOTHING TO PLAY IS NOT THE SAME AS DONE, and conflating the two is why an
 		// earlier version of this never animated at all. `setInteraction` re-renders
@@ -2941,10 +3060,18 @@ export const PretextExactMessageList = forwardRef<
 		// Keeping it costs nothing and is bounded from both ends: the revision check
 		// above rejects a capture whose document changed underneath it, and the age
 		// bound expires one whose rebuild never arrived.
-		if (motions.length === 0) return;
+		//
+		// Both plans are consulted: a frame is derived from its rows, so in practice it
+		// cannot move alone — but gating on the rows only would make that an assumption
+		// this effect silently depends on.
+		if (motions.length === 0 && frameMotions.length === 0) return;
 		foldCaptureRef.current = null;
-		foldMotionRef.current.play(motions, (key) =>
-			node.querySelector<HTMLElement>(`[data-nf-row-key="${cssAttrEscape(key)}"]`),
+		foldMotionRef.current.play(
+			motions,
+			(key) => node.querySelector<HTMLElement>(`[data-nf-row-key="${cssAttrEscape(key)}"]`),
+			undefined,
+			frameMotions,
+			(key) => node.querySelector<HTMLElement>(`[data-tool-run-frame="${cssAttrEscape(key)}"]`),
 		);
 	});
 
@@ -3864,6 +3991,8 @@ export const PretextExactMessageList = forwardRef<
 	// Rebuilt only when the document items change (not on scroll); drawn as
 	// absolute overlays under the rows so the grouped run reads as one container.
 	const toolRunFrames = useMemo(() => computeToolRunFrames(renderItems), [renderItems]);
+	// Read by the fold capture and its play effect, both of which run outside render.
+	toolRunFramesRef.current = toolRunFrames;
 
 	// Refresh the per-key measured lookup used by the stable toggle callbacks.
 	// Rebuilt only when the document items change (not on scroll).
@@ -4310,8 +4439,12 @@ export const PretextExactMessageList = forwardRef<
 							if (!topGeom || !bottomGeom) return null;
 							return (
 								<div
-									key={`tool-run-frame-${run.start}`}
-									data-tool-run-frame
+									key={run.key}
+									// Addressable so the fold transition can animate this border in step
+									// with the cards it wraps. A data attribute, like data-nf-row-key:
+									// it cannot affect layout and never reaches spec.opts (the measure
+									// cache key).
+									data-tool-run-frame={run.key}
 									style={{
 										position: "absolute",
 										top: topGeom.top,

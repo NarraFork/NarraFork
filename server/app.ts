@@ -21,6 +21,7 @@ import { benchmarkRoutes } from "./routes/benchmarks";
 import changelogRoutes from "./routes/changelog";
 import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
+import { chatRoutes } from "./routes/chat";
 import { clineRoutes } from "./routes/cline";
 import { codexRoutes } from "./routes/codex";
 import { customSubagentRoutes } from "./routes/custom-subagents";
@@ -28,6 +29,7 @@ import { dashboardRoutes } from "./routes/dashboard";
 import { dependencyRoutes } from "./routes/dependencies";
 import { deviceRoutes } from "./routes/devices";
 import executionLogRoutes from "./routes/execution-log";
+import { executorBootstrapRoutes } from "./routes/executor-bootstrap";
 import { externalV1Routes } from "./routes/external-v1";
 import { favoriteRoutes } from "./routes/favorites";
 import { fsRoutes } from "./routes/fs";
@@ -66,6 +68,7 @@ import { specRoutes } from "./routes/spec";
 import { handleSsoCallback, ssoRoutes } from "./routes/sso";
 import { storageRoutes } from "./routes/storage";
 import { terminalRoutes } from "./routes/terminals";
+import { traitLayerRoutes } from "./routes/trait-layers";
 import { updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
 import usageHistoryRoutes from "./routes/usage-history";
@@ -182,6 +185,11 @@ app.route("/api/shares", shareRoutes);
 // Public: changelog (no sensitive data)
 app.route("/api/changelog", changelogRoutes);
 
+// Public: remote executor binary download. A machine being enrolled has no
+// session yet, so this authorizes with a single-use, platform-bound ticket
+// issued from the admin-only device settings page.
+app.route("/api/executor", executorBootstrapRoutes);
+
 // Public: gateway webhook endpoint (HMAC-verified, no JWT needed)
 app.post("/api/gateway/webhook", async (c) => {
 	return handleWebhookRequest(c);
@@ -268,6 +276,7 @@ app.route("/api/projects", projectRoutes);
 app.route("/api/chapters", chapterRoutes);
 app.route("/api/chapters", gitRoutes);
 app.route("/api/chapter-edges", chapterEdgeRoutes);
+app.route("/api/chat", chatRoutes);
 app.route("/api/narrators", narratorRoutes);
 app.route("/api/narrators", specRoutes);
 app.route("/api/terminals", terminalRoutes);
@@ -280,6 +289,8 @@ app.route("/api/plugins", pluginRoutes);
 app.route("/api/uploads", uploadRoutes);
 app.route("/api/favorites", favoriteRoutes);
 app.route("/api/devices", deviceRoutes);
+// Project/user trait layers. Narrator-level traits live under /api/narrators.
+app.route("/api/trait-layers", traitLayerRoutes);
 app.route("/api/integrations", integrationRoutes);
 app.route("/api/oauth-apps", oauthAppRoutes);
 app.route("/api/oauth/grants", oauthGrantRoutes);

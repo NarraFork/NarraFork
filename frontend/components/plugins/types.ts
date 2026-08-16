@@ -47,9 +47,18 @@ export interface PluginUiContribution {
 	scope?: "workspace" | "narrator" | "project" | "global";
 	/** Surfaces this view may mount on; the session route re-checks them server-side. */
 	surfaces?: PluginViewSurface[];
+	/**
+	 * Set when the view opted into the host's shared UI runtime (React + Mantine). The shell
+	 * then injects the runtime before the view's entry; absent means the view ships its own
+	 * DOM code and the shell is unchanged.
+	 */
+	runtime?: PluginUiRuntimeKind;
 	status?: PluginUiStatus;
 	unavailableReason?: string;
 }
+
+/** Shared UI runtimes the host can inject into a plugin iframe. */
+export type PluginUiRuntimeKind = "host-react";
 
 /**
  * Session-identity fields for a contribution. When any of these values change,
@@ -69,6 +78,8 @@ export interface PluginContributionRecord extends PluginContributionIdentity {
 	scope?: "workspace" | "narrator" | "project" | "global";
 	/** Surfaces this view may mount on; used to filter per-surface, never to authorize. */
 	surfaces?: PluginViewSurface[];
+	/** Shared host runtime this view opted into, if any. */
+	runtime?: PluginUiRuntimeKind;
 	title: string;
 	pluginName?: string;
 	availability: PluginContributionAvailability;

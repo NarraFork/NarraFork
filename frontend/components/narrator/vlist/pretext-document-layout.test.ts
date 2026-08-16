@@ -293,6 +293,75 @@ describe("buildPretextDocumentLayout", () => {
 			false,
 		);
 	});
+
+	/**
+	 * ⚠️ Reported as "a low LOD swallowed a tool call".
+	 *
+	 * The pin used to leave the WHOLE tool-run out of the activity fold (the keep set
+	 * was expressed in message ids). That run then reached the adapter as a plain
+	 * tool-run, where L1/L2 collapse completed calls into a `tool-run-count` — a bare
+	 * "tool calls ×N" line naming nothing. So a run of Write(tasks.json) + ShareFile
+	 * showed the pinned task board plus an anonymous "×2", and the ShareFile call had
+	 * no row anywhere: at L1/L2 it was unreachable, while the same document with no
+	 * pin listed it as a named trace row.
+	 *
+	 * The invariant: at EVERY level, every call is addressable — as its own card, or
+	 * as a named row inside a trace. A count line has no rows, so it may never be the
+	 * only home of a call.
+	 */
+	it("keeps every sibling call addressable at low LOD when one is pinned", () => {
+		// One run: Write(spec://tasks.json) then ShareFile — the reported shape.
+		const runMessage = {
+			...message("m-run", 1, "assistant", ""),
+			contentJson: [
+				{
+					type: "tool_use",
+					id: "tu-tasks",
+					name: "Write",
+					input: { file_path: "spec://tasks.json" },
+				},
+				{
+					type: "tool_use",
+					id: "tu-share",
+					name: "ShareFile",
+					input: { path: "dist/app.exe" },
+				},
+			],
+			contentText: null,
+			toolCalls: [
+				{
+					toolUseId: "tu-tasks",
+					toolName: "Write",
+					inputJson: { file_path: "spec://tasks.json" },
+					status: "success",
+				},
+				{
+					toolUseId: "tu-share",
+					toolName: "ShareFile",
+					inputJson: { path: "dist/app.exe" },
+					status: "success",
+				},
+			],
+		} as unknown as NarratorMsg;
+
+		for (const lod of [1, 2, 3] as const) {
+			const built = buildPretextDocumentLayout([runMessage], { ...PIN_OPTIONS, lod });
+			// Every place a call can be named: a standalone card's key, or a trace row.
+			const named = new Set<string>();
+			for (const item of built.items) {
+				named.add(item.spec.key);
+				const rows = (item.spec.data as { items?: { key?: unknown }[] }).items ?? [];
+				for (const row of rows) {
+					if (typeof row?.key === "string") named.add(row.key);
+				}
+			}
+			expect(named.has("tool-tu-tasks")).toBe(true);
+			// The one that used to disappear behind the count line.
+			expect(named.has("tool-tu-share")).toBe(true);
+			// And no count line may stand in for it: a `tool-run-count` carries no rows.
+			expect(built.items.some((item) => item.spec.kind === "tool-run-count")).toBe(false);
+		}
+	});
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -19,10 +19,12 @@ import {
 import { and, asc, eq, gt, inArray, isNull, ne, or } from "drizzle-orm";
 import { db } from "../db";
 import {
+	chapters,
 	narrators,
 	userPreferences,
 	userRecentTabs,
 	userRecentTabsMeta,
+	users,
 	workspaces,
 } from "../db/schema";
 import { userPreferencesLock } from "../lib/async-mutex";
@@ -1477,6 +1479,75 @@ export async function syncNarratorTitleToRecentTabs(
 			),
 		}));
 	}
+}
+
+/**
+ * Drop the recent tabs a user may no longer open, after losing access to a project.
+ *
+ * Recent tabs are persisted server-side, so revoking membership otherwise leaves the
+ * removed member staring at tabs for that project's chapters and sessions, each of
+ * which 404s when clicked. The tab list is the one place where a stale entry survives
+ * the authorization change.
+ *
+ * Deliberately re-checks the ACL per tab instead of matching on `projectId`:
+ *   - project tabs carry the id directly, but chapter/narrator/subagent/group tabs do
+ *     not, and reimplementing that resolution here would duplicate the ancestor chain;
+ *   - a user removed from a project may still legitimately reach a chapter inside it
+ *     (an explicit narrator grant, or a public project), and matching on the id alone
+ *     would wrongly delete tabs that still work.
+ *
+ * Asking the gate answers "can this user still open this?", which is the actual
+ * question, and stays correct as the gate gains rules. Tabs whose target has vanished
+ * are left alone: that is the pre-existing dead-tab case, not this cleanup's business.
+ */
+export async function pruneUnreadableProjectTabs(userId: string, projectId: string): Promise<void> {
+	const { resolveProjectGate } = await import("./project-acl");
+	const { resolveNarratorProjectId } = await import("./narrator-project");
+
+	const user = await db.query.users.findFirst({
+		where: eq(users.id, userId),
+		columns: { id: true, role: true },
+	});
+	// No user row → nothing to prune (the cascade already removed their tabs).
+	if (!user) return;
+	const principal = { userId: user.id, isAdmin: user.role === "admin" };
+
+	// Cache per project so a user with many tabs in one project costs one gate check.
+	const gateByProject = new Map<string, boolean>();
+	const canStillRead = async (target: string | null): Promise<boolean> => {
+		if (!target) return true;
+		const cached = gateByProject.get(target);
+		if (cached !== undefined) return cached;
+		const gate = await resolveProjectGate(target, principal);
+		gateByProject.set(target, gate.read);
+		return gate.read;
+	};
+
+	const rows = readRows(userId).map(rowToTab);
+	const doomed: { type: RecentTabType; id: string }[] = [];
+	for (const tab of rows) {
+		let owningProject: string | null = null;
+		if (tab.type === "project") {
+			owningProject = tab.id;
+		} else if (tab.type === "chapter") {
+			const chapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, tab.id),
+				columns: { projectId: true },
+			});
+			owningProject = chapter?.projectId ?? null;
+		} else if (tab.type === "narrator" || tab.type === "subagent") {
+			const narrator = await db.query.narrators.findFirst({
+				where: eq(narrators.id, tab.id),
+				columns: { chapterId: true, contextProjectId: true },
+			});
+			owningProject = narrator ? await resolveNarratorProjectId(narrator) : null;
+		}
+		// `workspace` / `group` tabs are user-scoped containers, not project resources.
+		if (owningProject !== projectId) continue;
+		if (!(await canStillRead(owningProject))) doomed.push({ type: tab.type, id: tab.id });
+	}
+
+	for (const tab of doomed) await removeRecentTab(userId, tab.type, tab.id);
 }
 
 /** Remove an entity only from users selected by the authoritative membership index. */

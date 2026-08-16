@@ -6,6 +6,7 @@
 	"narrators": "Narrators",
 	"settings": "Settings",
 	"admin": "Admin",
+	"messages": "People",
 	"routines": "Routines",
 	"scheduledTasks": "Scheduled Tasks",
 	"learning": "Learning",
@@ -57,7 +58,6 @@
 	"navSectionMore": "Tucked away",
 	"emptyVisibleZone": "Drag here to show",
 	"loadMoreRecentTabs": "Load more",
-	"allRecentTabsLoaded": "All loaded",
 	"retryRecentTabs": "Retry",
 	"recentTabsSyncError": "Recent tabs could not be synced"
 }

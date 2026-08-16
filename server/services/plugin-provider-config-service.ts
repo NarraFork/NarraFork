@@ -14,6 +14,7 @@
 
 import { ValidationError } from "@server/lib/errors";
 import type { JsonValue } from "@server/lib/plugins/protocol";
+import type { ProxyOverride } from "@server/lib/settings/types";
 import type { PluginProviderRegistry, ProviderRegistryEntry } from "./plugin-provider-registry";
 import type { PluginStateStore } from "./plugin-state-store";
 
@@ -35,6 +36,14 @@ export interface ProviderConfigView {
 	secretFields: string[];
 	/** Secret fields that currently have a stored value. */
 	secretsSet: string[];
+	/**
+	 * Outbound proxy override for this provider, when one is set.
+	 *
+	 * Host policy rather than plugin config: it is not part of `configSchema`, is never sent to
+	 * the plugin as config, and is not readable through `config.get`. The plugin only ever sees
+	 * the *resolved* proxy URL in `hostHints`.
+	 */
+	proxy?: ProxyOverride;
 }
 
 export interface ProviderSecretStore {
@@ -46,7 +55,10 @@ export interface ProviderSecretStore {
 
 export interface PluginProviderConfigServiceOptions {
 	registry: PluginProviderRegistry;
-	stateStore: Pick<PluginStateStore, "setProviderConfig" | "setProviderPrefix" | "getCachedState">;
+	stateStore: Pick<
+		PluginStateStore,
+		"setProviderConfig" | "setProviderPrefix" | "setProviderProxy" | "getCachedState"
+	>;
 	/** Optional secret sink; without it, secret fields cannot be stored. */
 	secretStore?: ProviderSecretStore;
 }
@@ -283,6 +295,7 @@ export class PluginProviderConfigService {
 		const config: Record<string, JsonValue> = { ...stored };
 		// Never echo a secret back, even to an admin UI.
 		for (const field of secretsSet) config[field] = SECRET_PLACEHOLDER;
+		const proxy = this.stateStore.getCachedState(pluginId)?.providerProxies?.[entry.localId];
 		return {
 			providerInstanceId: entry.providerInstanceId,
 			providerTypeId: entry.providerTypeId,
@@ -294,6 +307,31 @@ export class PluginProviderConfigService {
 			config,
 			secretFields,
 			secretsSet,
+			...(proxy ? { proxy } : {}),
 		};
+	}
+
+	/**
+	 * Set or clear this provider's outbound proxy override.
+	 *
+	 * Separate from `update()` because it is not part of the plugin's config: it must not be
+	 * schema-validated against `configSchema`, must not be persisted into `providerConfigs`,
+	 * and must not reach the plugin as a config field. Only the resolved URL does, via
+	 * `hostHints`.
+	 */
+	async updateProxy(
+		pluginId: string,
+		providerInstanceId: string,
+		proxy: ProxyOverride | null,
+	): Promise<ProviderConfigView> {
+		const entry = this.registry.get(providerInstanceId);
+		if (!entry || entry.pluginId !== pluginId) {
+			throw new ValidationError(
+				`Provider is not registered for this plugin: ${providerInstanceId}`,
+			);
+		}
+		// The store validates mode and URL, so an invalid value never reaches disk.
+		await this.stateStore.setProviderProxy(pluginId, entry.localId, proxy);
+		return this.viewFor(entry);
 	}
 }

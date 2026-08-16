@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { requireProjectAccess } from "../lib/project-access";
 import {
 	applyVolumeSnapshotSchema,
 	createVolumeSnapshotSchema,
@@ -11,6 +12,7 @@ export const volumeSnapshotRoutes = new Hono();
 // GET /api/projects/:projectId/volume-snapshots
 volumeSnapshotRoutes.get("/:projectId/volume-snapshots", async (c) => {
 	const projectId = c.req.param("projectId");
+	await requireProjectAccess(c, projectId, "read");
 	const serviceName = c.req.query("serviceName");
 	const containerPath = c.req.query("containerPath");
 	const snapshots = await volumeSnapshotService.listSnapshots(projectId, {
@@ -23,6 +25,8 @@ volumeSnapshotRoutes.get("/:projectId/volume-snapshots", async (c) => {
 // POST /api/projects/:projectId/volume-snapshots
 volumeSnapshotRoutes.post("/:projectId/volume-snapshots", async (c) => {
 	const projectId = c.req.param("projectId");
+	// Capturing a container volume writes into the project's storage.
+	await requireProjectAccess(c, projectId, "write");
 	const body = createVolumeSnapshotSchema.parse(await c.req.json());
 	const userId = c.get("user").sub;
 	const snapshot = await volumeSnapshotService.createSnapshot({

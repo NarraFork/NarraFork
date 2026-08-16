@@ -34,6 +34,7 @@ export const namespaces = [
 	"knowledge",
 	"scheduledTasks",
 	"plugins",
+	"chat",
 ] as const;
 export type Namespace = (typeof namespaces)[number];
 
@@ -102,15 +103,27 @@ function getRouteNamespaces(path: string): Namespace[] {
 			"settings",
 			"terminal",
 			"git",
+			"chat",
 		];
 	}
-	if (path === "/narrators") return ["common", "nav", "narrators", "narrator"];
+	if (path === "/messages") return ["common", "nav", "chat"];
+	if (path === "/narrators") return ["common", "nav", "narrators", "narrator", "chat"];
 	if (path === "/narrators/archived") return ["common", "nav", "narrators"];
 	if (path.startsWith("/narrators/workspace/")) {
-		return ["common", "nav", "narrators", "narrator", "terminal", "git"];
+		return ["common", "nav", "narrators", "narrator", "terminal", "git", "chat"];
 	}
 	if (path.startsWith("/narrators/")) {
-		return ["common", "nav", "narrators", "narrator", "chapters", "settings", "terminal", "git"];
+		return [
+			"common",
+			"nav",
+			"narrators",
+			"narrator",
+			"chapters",
+			"settings",
+			"terminal",
+			"git",
+			"chat",
+		];
 	}
 	if (path === "/settings/providers" || path === "/settings/models" || path === "/settings/agent") {
 		return ["common", "nav", "settings", "narrator"];

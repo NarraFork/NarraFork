@@ -2,6 +2,7 @@
 	"title": "叙事线",
 	"newProject": "新建叙事线",
 	"noProjects": "暂无叙事线，创建一个以开始。",
+	"noProjectsVisible": "还没有项目与你共享。请让项目所有者或管理员把你添加进来。",
 	"noProjectMatches": "没有匹配搜索条件的叙事线。",
 	"projectSearchPlaceholder": "搜索叙事线...",
 	"projectListTruncated": "已显示 {{shown}} 条叙事线；另有 {{hidden}} 条已隐藏。请搜索以缩小列表。",
@@ -12,7 +13,6 @@
 	"repositoryPathDescription": "本地已有的 Git 仓库路径",
 	"projectNotFound": "叙事线未找到",
 	"repoMode": "仓库",
-
 	"repoModeExisting": "已有仓库",
 	"repoModeInit": "新建仓库",
 	"repoModeClone": "克隆远程仓库",
@@ -96,5 +96,31 @@
 	"authUsernamePlaceholder": "用户名或邮箱",
 	"authPassword": "密码 / Token",
 	"authPasswordPlaceholder": "密码或个人访问令牌",
-	"authRetry": "使用凭据重试"
+	"authRetry": "使用凭据重试",
+	"access": {
+		"visibilityTitle": "可见性",
+		"visibilityPrivate": "私有",
+		"visibilityPublic": "公开",
+		"visibilityHint": {
+			"private": "仅所有者和受邀成员可以访问此项目。",
+			"public": "任何已登录用户都可以访问此项目。"
+		},
+		"membersTitle": "成员",
+		"noMembers": "暂无成员，目前仅所有者可以访问此项目。",
+		"ownerLabel": "{{username}}（所有者）",
+		"noOwner": "此项目没有所有者，因此只有管理员可以更改访问权限。",
+		"roleRead": "只读",
+		"roleWrite": "可写",
+		"roleManage": "可管理",
+		"removeMember": "移出项目",
+		"removeUser": "将 {{username}} 移出项目",
+		"roleForUser": "{{username}} 的项目角色",
+		"panelLabel": "项目访问权限",
+		"addTitle": "添加成员",
+		"searchUsers": "搜索用户",
+		"add": "添加",
+		"noUsersFound": "没有匹配的用户",
+		"readOnlyNotice": "只有所有者、管理者或管理员可以更改项目访问权限。",
+		"unavailable": "无法获取访问信息。"
+	}
 }

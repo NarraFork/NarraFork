@@ -11,12 +11,13 @@
  *      bun test server/services/__tests__/knowledge-agent-tools.test.ts
  */
 import { beforeAll, describe, expect, test } from "bun:test";
+import { knowledgeGrantRows } from "../../../tests/fixtures/knowledge-grants";
 import { db } from "../../db";
 import {
+	aclGrants,
 	knowledgeCollections,
 	knowledgeDrafts,
 	knowledgeEntries,
-	knowledgeGrants,
 	knowledgeRevisions,
 	knowledgeSubmissions,
 	knowledgeTags,
@@ -29,6 +30,24 @@ import { knowledgeReviewTool } from "../../lib/agent/tools/knowledge-review";
 import type { ToolContext } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
 import { classifyDanger } from "../narrator-permission";
+
+/**
+ * Seed knowledge grants into the unified `acl_grants` table.
+ *
+ * Knowledge authorization no longer reads `knowledge_grants`, so a fixture writing
+ * there would grant nothing. Input stays in the knowledge vocabulary; the shared
+ * fixture translates it (a credential row, plus a separate write row for canWrite).
+ */
+async function seedKnowledgeGrants(
+	seeds: Parameters<typeof knowledgeGrantRows>[0] | Parameters<typeof knowledgeGrantRows>[0][],
+): Promise<void> {
+	const list = Array.isArray(seeds) ? seeds : [seeds];
+	for (const seed of list) {
+		for (const row of knowledgeGrantRows(seed)) {
+			await db.insert(aclGrants).values(row as never);
+		}
+	}
+}
 
 const TAG = Date.now();
 
@@ -174,7 +193,7 @@ beforeAll(async () => {
 		createdAt: nowIso(),
 	});
 	// Grant the reviewer review authority over the review tag.
-	await db.insert(knowledgeGrants).values({
+	await seedKnowledgeGrants({
 		id: generateId(),
 		principalType: "user",
 		principalId: reviewerUserId,
@@ -184,7 +203,7 @@ beforeAll(async () => {
 		createdAt: nowIso(),
 	});
 	// Give writerUserId a plain write grant (content authority, no ownership).
-	await db.insert(knowledgeGrants).values({
+	await seedKnowledgeGrants({
 		id: generateId(),
 		principalType: "user",
 		principalId: writerUserId,

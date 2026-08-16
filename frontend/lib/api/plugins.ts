@@ -186,6 +186,8 @@ export interface PluginProviderConfigView {
 	config: Record<string, unknown>;
 	secretFields: string[];
 	secretsSet: string[];
+	/** Outbound proxy override, absent when the provider follows the global policy. */
+	proxy?: { mode: string; url?: string };
 }
 
 export interface PluginProviderConfigListResponse {
@@ -196,6 +198,21 @@ export interface PluginProviderConfigListResponse {
 export interface PluginProviderConfigUpdateResponse {
 	pluginId: string;
 	provider: PluginProviderConfigView | null;
+}
+
+export interface PluginProviderCatalogRefreshResponse {
+	pluginId: string;
+	providerInstanceId: string;
+	modelCount: number;
+	stale: boolean;
+	/** Set when the provider declares no `listModels`, so there was nothing to pull. */
+	skipped?: boolean;
+	/**
+	 * Set when the upstream call failed. The request still succeeds: a stale catalog is a
+	 * usable registration, so this is reported rather than thrown, and the caller should say
+	 * why nothing changed instead of claiming success.
+	 */
+	error?: string;
 }
 
 export const pluginsApi = {
@@ -274,6 +291,33 @@ export const pluginsApi = {
 		request<PluginProviderConfigUpdateResponse>(`${pluginPath(pluginId)}/providers/prefix`, {
 			method: "PUT",
 			body: JSON.stringify({ providerInstanceId, providerPrefix }),
+		}),
+	/**
+	 * Re-pull a plugin provider's model catalog.
+	 *
+	 * Needed because the catalog is otherwise only refreshed after activation, so new models
+	 * a plugin gained access to stayed invisible until it restarted. The plugin's own panel
+	 * cannot do this — its iframe has no network access.
+	 */
+	refreshProviderCatalog: (pluginId: string, providerInstanceId: string) =>
+		request<PluginProviderCatalogRefreshResponse>(
+			`${pluginPath(pluginId)}/providers/catalog/refresh`,
+			{ method: "POST", body: JSON.stringify({ providerInstanceId }) },
+		),
+	/**
+	 * Set or clear a plugin provider's outbound proxy. `null` returns it to the global policy.
+	 *
+	 * Separate from `updateProviderConfig` because the proxy is host policy, not plugin config:
+	 * it is not part of the plugin's `configSchema` and the plugin cannot read it back.
+	 */
+	updateProviderProxy: (
+		pluginId: string,
+		providerInstanceId: string,
+		proxy: { mode: string; url?: string } | null,
+	) =>
+		request<PluginProviderConfigUpdateResponse>(`${pluginPath(pluginId)}/providers/proxy`, {
+			method: "PUT",
+			body: JSON.stringify({ providerInstanceId, proxy }),
 		}),
 };
 

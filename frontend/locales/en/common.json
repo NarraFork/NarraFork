@@ -532,6 +532,7 @@
 	"usageHistoryKind_reasoning_translation": "Reasoning translation",
 	"usageHistoryKind_settings_test": "Settings test",
 	"usageHistoryKind_git_summary": "Git summary",
+	"usageHistoryKind_chat_summarize": "Chat summary",
 	"usageHistoryKind_internal": "Internal",
 	"usageHistoryError": "Error",
 	"usageHistoryCopyError": "Copy error message",

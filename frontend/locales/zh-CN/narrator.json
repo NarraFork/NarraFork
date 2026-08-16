@@ -234,7 +234,6 @@
 	"loadOlderCalls": "加载更早的工具调用",
 	"jumpTargetUnavailable": "该消息已不在此会话的历史记录中。",
 	"jumpTargetTooFar": "该消息距离当前位置过远，无法直接跳转。请向上滚动加载更多历史后重试。",
-
 	"archiveNarrator": "归档",
 	"permissionMode": "权限模式",
 	"permissionModesUnavailable": "权限模式不可用",
@@ -1257,5 +1256,33 @@
 		"role_user": "你",
 		"role_assistant": "助手",
 		"role_system": "系统"
+	},
+	"access": {
+		"visibilityTitle": "谁可以看到这个会话",
+		"visibilityPrivate": "仅自己",
+		"visibilityProject": "项目内",
+		"visibilityPublic": "所有人",
+		"visibilityHint": {
+			"private": "只有你和你共享给的人可以打开这个会话。",
+			"project": "参与这个项目的人都可以查看。",
+			"public": "任何已登录用户都可以打开这个会话。"
+		},
+		"peopleTitle": "有权访问的人",
+		"ownerLabel": "所有者：{{username}}",
+		"noOwner": "这个会话早于权限机制存在，没有所有者，因此只有管理员能修改共享设置。可以请管理员把它转交给你。",
+		"noGrants": "尚未共享给任何人。",
+		"shareTitle": "共享给他人",
+		"searchUsers": "搜索用户",
+		"share": "共享",
+		"levelRead": "可查看",
+		"levelWrite": "可操作",
+		"revoke": "移除访问权",
+		"revokeUser": "移除 {{username}} 的访问权",
+		"roleForUser": "{{username}} 的权限级别",
+		"panelLabel": "会话访问权限",
+		"noUsersFound": "没有匹配的用户。",
+		"readOnlyNotice": "只有所有者或管理员可以修改共享设置。",
+		"unavailable": "该会话暂时无法读取共享设置。",
+		"denied": "你已不再有权访问这个会话。"
 	}
 }

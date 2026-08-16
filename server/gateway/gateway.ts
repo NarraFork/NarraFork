@@ -667,6 +667,14 @@ class Gateway {
 			variant: "primary",
 			traits: chapterId ? [] : ["standalone"],
 			messageVersion: 0,
+			// Access control: the auto-resolved deployment user owns the session, the
+			// same id already used for attribution and knowledge-base reads below. It
+			// can be null on a brand-new install with no users yet, which leaves the
+			// narrator admin-managed until someone is handed ownership.
+			ownerUserId: appUserId,
+			// IM sessions are unattended and shared by nature — an operator other than
+			// the resolved owner must be able to follow what the bot is doing.
+			visibility: "public",
 			createdAt: now,
 			updatedAt: now,
 		});
@@ -1612,10 +1620,15 @@ class Gateway {
 		}
 
 		const { searchService } = await import("../services/search-service");
+		// The IM session acts as its bound NarraFork user, so `/search` from chat sees
+		// exactly what that user would see in the web UI — never more. With no
+		// resolvable user (fresh install), the empty id matches nothing private.
+		const appUserId = await this.resolveAppUserId();
 		const results = searchService.search({
 			query,
 			entities: ["narrators"],
 			limit: 10,
+			principal: { userId: appUserId ?? "", isAdmin: false },
 		});
 
 		if (results.length === 0) {

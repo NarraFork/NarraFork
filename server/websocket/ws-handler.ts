@@ -105,6 +105,8 @@ export function resolveWSData(
 		username: string;
 		avatarColor: string | null;
 		avatarImageId: string | null;
+		/** Live role, used by the narrator subscribe path's admin short-circuit. */
+		role?: string;
 	},
 	vnetAuth?: VNetWSData["auth"],
 	sessionAuth?: SessionWSAuth,
@@ -117,10 +119,12 @@ export function resolveWSData(
 			subscribedNarrators: new Set(),
 			catchingUpNarrators: new Map(),
 			catchUpBuffers: new Map(),
+			subscribedChatRooms: new Set(),
 			userId: userInfo?.userId,
 			username: userInfo?.username,
 			avatarColor: userInfo?.avatarColor,
 			avatarImageId: userInfo?.avatarImageId,
+			userRole: userInfo?.role,
 			sessionExp: sessionAuth?.sessionExp,
 			sessionUserId: sessionAuth?.sessionUserId,
 		};

@@ -108,6 +108,10 @@ export function parsePluginContributionItems(
 					? item.scope
 					: undefined,
 			surfaces: readSurfaces(item.surfaces),
+			// Only the one known literal is accepted. An unrecognized value means a newer
+			// backend offering a runtime this client cannot inject, and treating it as absent
+			// leaves the view on its own bundle rather than half-loading.
+			...(item.runtime === "host-react" ? { runtime: item.runtime } : {}),
 			entryUrl: readString(item.entryUrl),
 			styleUrl: readString(item.styleUrl),
 			availability,

@@ -237,6 +237,29 @@ describe("plugin search availability", () => {
 		expect(registry.isUsable(entry)).toBe(false);
 	});
 
+	test("a plugin storing credentials under runtime keys needs a declared sentinel", () => {
+		// A plugin that keeps one vault entry per credential cannot name those keys in
+		// `requiresConfig`: their ids are generated at runtime. So `requiresConfig` names a
+		// fixed bookkeeping key instead, and this pins both halves of why that is necessary.
+		//
+		// Runtime-generated keys alone do not satisfy the requirement — the match is exact, so
+		// a channel relying on them would report unconfigured forever even with credentials
+		// stored.
+		const credentialsOnly = makeRegistry({
+			registration: { requiresConfig: ["credentialsIndex"] },
+			secretKeys: [`provider.${PROVIDER_ID}.cred.aaa`, `provider.${PROVIDER_ID}.cred.bbb`],
+		});
+		expect(credentialsOnly.registry.isUsable(credentialsOnly.entry)).toBe(false);
+
+		// With the sentinel present the channel is usable, and it stays a single fixed key no
+		// matter how many credentials exist.
+		const withSentinel = makeRegistry({
+			registration: { requiresConfig: ["credentialsIndex"] },
+			secretKeys: [`provider.${PROVIDER_ID}.credentialsIndex`, `provider.${PROVIDER_ID}.cred.aaa`],
+		});
+		expect(withSentinel.registry.isUsable(withSentinel.entry)).toBe(true);
+	});
+
 	test("a disabled plugin makes its channels unusable but keeps them registered", () => {
 		const { registry, entry } = makeRegistry({});
 		registry.setPluginEnabled(PLUGIN_ID, false);

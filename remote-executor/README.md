@@ -22,7 +22,27 @@ Manual static build:
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o narrafork-executor ./cmd/narrafork-executor
 ```
 
-## Register a device
+## Install (recommended: generated script)
+
+You do not need to build or fetch the binary yourself. NarraFork mirrors published
+executor releases and generates a ready-to-run installer:
+
+1. In NarraFork: **Settings → Remote Devices → Add device**. Choose the
+   *reverse dial* connection mode (recommended; works behind NAT).
+2. Pick the target platform and whether to install a machine-wide service or a
+   user-level one, then copy the generated script.
+3. Run it on the target machine. It downloads the matching binary from your
+   NarraFork instance, verifies its SHA-256, prompts for the registration key
+   (input hidden, stored mode 0600), writes the config, and installs the service.
+
+The script never contains the registration key, and the key is never passed as a
+command-line argument. Because the target machine only has to reach NarraFork
+itself, this also works on hosts with no route to the public update server.
+
+Everything below documents the manual path: building from source and wiring up
+the flags yourself.
+
+## Register a device manually
 
 1. In NarraFork: **Settings → Remote Devices → Add device**. Choose the
    *reverse dial* connection mode (recommended; works behind NAT).
@@ -139,6 +159,30 @@ overrides the JSON config file.
   hashed at rest on the server and can be rotated or revoked from the UI.
 - Revoking a device (or rotating its token) immediately drops the live
   connection.
+
+## Service templates
+
+`deploy/` holds templates for running the executor as a managed service. The
+generated installer produces equivalent units automatically; these are for manual
+installs and for reviewing what the installer will do.
+
+| File | Platform | Scope |
+|------|----------|-------|
+| `narrafork-executor.service` | Linux (systemd) | machine-wide, dedicated account |
+| `narrafork-executor.user.service` | Linux (systemd) | per-user (`systemctl --user`) |
+| `com.narrafork.executor.plist` | macOS (launchd) | LaunchDaemon or LaunchAgent |
+
+On Windows, install as a service with `sc.exe`/`New-Service`, or register a
+scheduled task at logon for a user-level install.
+
+## Releasing
+
+`bun scripts/release-executor.ts <version>` cross-compiles all six targets,
+computes each binary's SHA-256, and publishes them plus a manifest
+(`narrafork-executor-manifest.json`) to the update server's public tools channel.
+Binaries upload before the manifest, so a manifest never references an artifact
+that is not yet present. Use `--dry-run` to build and digest without uploading, or
+`--platform=<os>-<arch>` to publish a single target.
 
 ## Capabilities
 

@@ -353,6 +353,11 @@ async function executeTask(
 			systemPrompt: run.systemPrompt ?? undefined,
 			permissionMode: run.permissionMode ?? "bypassPermissions",
 			cwd: workDir,
+			// Benchmark runs are admin-triggered and the run row records no user, so
+			// there is no owner to attribute. Public visibility is deliberate: a
+			// benchmark result is only useful if the team can inspect the transcript
+			// that produced it, and the run itself is already admin-gated.
+			visibility: "public",
 		});
 
 		// Update task result with narrator ID

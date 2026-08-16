@@ -35,6 +35,14 @@ export {
 	updateGraphPositionsSchema,
 } from "./chapters";
 export {
+	chatDirectoryQuerySchema,
+	chatMessagesQuerySchema,
+	createDmRoomSchema,
+	markChatReadSchema,
+	postChatMessageSchema,
+	summarizeChatSchema,
+} from "./chat";
+export {
 	blacklistDirEntrySchema,
 	commandBlacklistEntrySchema,
 	commandSchema,
@@ -56,6 +64,7 @@ export {
 export {
 	createRemoteDeviceSchema,
 	deviceBrowseQuerySchema,
+	deviceInstallScriptSchema,
 	deviceSlugSchema,
 	deviceStatQuerySchema,
 	deviceTransferSchema,
@@ -70,6 +79,7 @@ export {
 	gitDiffQuerySchema,
 	gitDiscardSchema,
 	gitLogQuerySchema,
+	gitModificationsQuerySchema,
 	gitResetSchema,
 	gitStageSchema,
 	gitStashSchema,
@@ -141,7 +151,11 @@ export {
 	forkNarratorSchema,
 	migrateBrokenModelNarratorsSchema,
 	narratorExportQuerySchema,
+	narratorGrantCreateSchema,
+	narratorGrantUpdateSchema,
 	narratorHandleSchema,
+	narratorTransferOwnerSchema,
+	narratorVisibilitySchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
 	retryFailedCompactSchema,
@@ -167,6 +181,9 @@ export {
 export {
 	createProjectSchema,
 	projectChapterSettingsSchema,
+	projectMembersSchema,
+	projectTransferOwnerSchema,
+	projectVisibilitySchema,
 	updateProjectSchema,
 } from "./projects";
 export {

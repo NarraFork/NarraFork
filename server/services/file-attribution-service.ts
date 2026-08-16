@@ -8,7 +8,7 @@
  * Writes are fire-and-forget and fully fault-tolerant: a failure here must
  * never block tool execution (same philosophy as file-snapshot-service).
  */
-import { and, desc, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { fileAttributions, narrators } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -34,35 +34,6 @@ export interface RecordAttributionInput {
 	toolUseId?: string | null;
 }
 
-/** One modification event for a file. */
-export interface AttributionEvent {
-	id: string;
-	narratorId: string | null;
-	subagentType: string | null;
-	action: AttributionAction;
-	toolName: string | null;
-	toolUseId: string | null;
-	changedAt: string;
-}
-
-/** Aggregated attribution for a single file. */
-export interface FileAttributionSummary {
-	filePath: string;
-	/** Most recent modifier (narratorId), or null if only external. */
-	lastNarratorId: string | null;
-	lastAction: AttributionAction;
-	lastChangedAt: string;
-	/** Distinct narratorIds that have touched this file. */
-	contributorNarratorIds: string[];
-	/** Whether any external (non-narrator) change was recorded. */
-	hasExternal: boolean;
-	/** Full timeline, newest first (capped). */
-	timeline: AttributionEvent[];
-}
-
-/** Max timeline events returned per file to keep payloads bounded. */
-const MAX_TIMELINE_PER_FILE = 50;
-
 // ── Recently AI-attributed paths (in-memory) ─────────────────────────────────
 //
 // The worktree watcher fires on ANY file change, including terminal / external
@@ -85,6 +56,41 @@ function attributionWorkspaceKey(deviceId: string, workspacePath: string): strin
 /** How long an AI attribution "shadows" a path from external classification. */
 const RECENT_ATTRIBUTION_TTL_MS = 15_000;
 
+/**
+ * Writes between full sweeps.
+ *
+ * Entries expired lazily on READ only, which cleaned up whatever the watcher happened to
+ * ask about and nothing else: a path written once and never looked at again, or a whole
+ * workspace that went away, stayed for the process's lifetime. Every tool call that touches
+ * a file adds to this, so over a long-running server it is a slow leak of dead path strings.
+ *
+ * A sweep is O(tracked paths) and the TTL is 15 s, so amortizing it over this many writes
+ * keeps it off the hot path while ensuring it happens often enough that nothing accumulates
+ * far beyond one window's worth of real activity. The count is a cheap proxy for "enough has
+ * happened to be worth looking"; correctness never depends on when a sweep runs, because
+ * {@link wasRecentlyAttributed} re-checks the timestamp regardless.
+ */
+const ATTRIBUTION_SWEEP_INTERVAL_WRITES = 512;
+
+let writesSinceSweep = 0;
+
+/**
+ * Drop every expired entry, and every workspace left holding none.
+ *
+ * The inner maps are removed too, not just emptied: the outer key is
+ * `deviceId + workspacePath`, so a destroyed worktree leaves a map that will never be read
+ * again, and an empty `Map` object per dead workspace is exactly the kind of residue the
+ * lazy path could not reach.
+ */
+function sweepRecentlyAttributed(now: number): void {
+	for (const [key, map] of recentlyAttributed) {
+		for (const [filePath, ts] of map) {
+			if (now - ts > RECENT_ATTRIBUTION_TTL_MS) map.delete(filePath);
+		}
+		if (map.size === 0) recentlyAttributed.delete(key);
+	}
+}
+
 /** Mark file paths as recently attributed to an AI tool for `workspacePath`. */
 export function markRecentlyAttributed(
 	workspacePath: string,
@@ -101,7 +107,64 @@ export function markRecentlyAttributed(
 	for (const fp of filePaths) {
 		map.set(fp, now);
 	}
+
+	// Swept here rather than on a timer: a timer would keep the process's event loop busy
+	// for a structure that only grows when something writes to it, and would go on firing
+	// long after the last tool call.
+	writesSinceSweep += filePaths.length;
+	if (writesSinceSweep >= ATTRIBUTION_SWEEP_INTERVAL_WRITES) {
+		writesSinceSweep = 0;
+		sweepRecentlyAttributed(now);
+	}
 }
+
+/**
+ * Forget every recorded path for a workspace.
+ *
+ * Called when a worktree is destroyed, for the same reason `dropStatus` is: once the
+ * directory is gone nothing will ever query these paths, so keeping them is pure residue.
+ * Cheap and exact, where the periodic sweep is amortized and TTL-driven.
+ */
+export function dropRecentlyAttributed(workspacePath: string, deviceId = LOCAL_DEVICE_ID): void {
+	recentlyAttributed.delete(attributionWorkspaceKey(deviceId, workspacePath));
+}
+
+/** Tracked (workspace, path) pair count. Tests assert the sweep actually reclaims. */
+export function recentlyAttributedSize(): { workspaces: number; paths: number } {
+	let paths = 0;
+	for (const map of recentlyAttributed.values()) paths += map.size;
+	return { workspaces: recentlyAttributed.size, paths };
+}
+
+/**
+ * Reset the in-memory shadow map, and optionally back-date every entry (tests only).
+ *
+ * `ageBy` exists so the reclaim behaviour can be tested without sleeping out a 15 s TTL.
+ * Shifting the stored timestamps into the past is equivalent to time passing, from the
+ * point of view of every reader — both the lazy check and the sweep compare against
+ * `Date.now()` — while keeping the test instant.
+ */
+export const recentlyAttributedTesting = {
+	clear(): void {
+		recentlyAttributed.clear();
+		writesSinceSweep = 0;
+	},
+	/** Move every recorded timestamp `ms` further into the past. */
+	ageBy(ms: number): void {
+		for (const map of recentlyAttributed.values()) {
+			for (const [filePath, ts] of map) map.set(filePath, ts - ms);
+		}
+	},
+	/** Writes still needed to trip the next sweep. */
+	writesUntilSweep(): number {
+		return ATTRIBUTION_SWEEP_INTERVAL_WRITES - writesSinceSweep;
+	},
+};
+
+/** The sweep interval, exported so a test cannot drift from the value it drives. */
+export const RECENT_ATTRIBUTION_SWEEP_WRITES = ATTRIBUTION_SWEEP_INTERVAL_WRITES;
+/** The TTL, exported for the same reason. */
+export const RECENT_ATTRIBUTION_WINDOW_MS = RECENT_ATTRIBUTION_TTL_MS;
 
 /**
  * Return true if `filePath` was attributed to an AI tool within the TTL window.
@@ -170,92 +233,64 @@ export async function recordAttribution(input: RecordAttributionInput): Promise<
 	}
 }
 
-/** Record attributions for multiple files (e.g. Bash touched several). */
+/** Record attributions for multiple files (e.g. Bash touched several).
+ *
+ * Batched into a single INSERT for efficiency: a Bash command touching 50+ files
+ * used to produce 50 sequential round-trips. The semantics are identical to calling
+ * recordAttribution per file — every call is an unconditional insert (no first-write
+ * dedup), and the subagentType lookup only needs to happen once since the narrator
+ * is the same across all paths.
+ */
 export async function recordAttributions(
 	base: Omit<RecordAttributionInput, "filePath">,
 	filePaths: string[],
 ): Promise<void> {
-	for (const filePath of filePaths) {
-		await recordAttribution({ ...base, filePath });
-	}
-}
+	if (filePaths.length === 0) return;
+	try {
+		const deviceId = base.deviceId ?? LOCAL_DEVICE_ID;
+		const workspacePath = normalizeAttributionWorkspace(deviceId, base.workspacePath);
 
-/**
- * Get aggregated attribution summaries for a workspace.
- *
- * @param workspacePath  Raw or normalized path; normalized internally.
- * @param filePath       Optional: restrict to a single file.
- * @param limit          Max attribution rows scanned (bounded). Default 2000.
- */
-export async function getAttributions(
-	workspacePath: string,
-	filePath?: string,
-	limit = 2000,
-	deviceId = LOCAL_DEVICE_ID,
-): Promise<FileAttributionSummary[]> {
-	const key = normalizeAttributionWorkspace(deviceId, workspacePath);
-
-	const where = filePath
-		? and(
-				eq(fileAttributions.deviceId, deviceId),
-				eq(fileAttributions.workspacePath, key),
-				eq(fileAttributions.filePath, filePath),
-			)
-		: and(eq(fileAttributions.deviceId, deviceId), eq(fileAttributions.workspacePath, key));
-
-	const rows = await db
-		.select({
-			id: fileAttributions.id,
-			filePath: fileAttributions.filePath,
-			narratorId: fileAttributions.narratorId,
-			subagentType: fileAttributions.subagentType,
-			action: fileAttributions.action,
-			toolName: fileAttributions.toolName,
-			toolUseId: fileAttributions.toolUseId,
-			changedAt: fileAttributions.changedAt,
-		})
-		.from(fileAttributions)
-		.where(where)
-		.orderBy(desc(fileAttributions.changedAt))
-		.limit(limit);
-
-	// Group by file, newest first (already sorted desc).
-	const byFile = new Map<string, FileAttributionSummary>();
-	for (const row of rows) {
-		let summary = byFile.get(row.filePath);
-		if (!summary) {
-			summary = {
-				filePath: row.filePath,
-				lastNarratorId: row.narratorId,
-				lastAction: row.action as AttributionAction,
-				lastChangedAt: row.changedAt,
-				contributorNarratorIds: [],
-				hasExternal: false,
-				timeline: [],
-			};
-			byFile.set(row.filePath, summary);
-		}
-
-		if (summary.timeline.length < MAX_TIMELINE_PER_FILE) {
-			summary.timeline.push({
-				id: row.id,
-				narratorId: row.narratorId,
-				subagentType: row.subagentType as string | null,
-				action: row.action as AttributionAction,
-				toolName: row.toolName,
-				toolUseId: row.toolUseId,
-				changedAt: row.changedAt,
+		// Resolve subagentType once for the shared narrator.
+		let subagentType = base.subagentType ?? null;
+		if (base.narratorId && subagentType == null) {
+			const n = await db.query.narrators.findFirst({
+				where: eq(narrators.id, base.narratorId),
+				columns: { type: true, subagentType: true },
 			});
-		}
-
-		if (row.narratorId) {
-			if (!summary.contributorNarratorIds.includes(row.narratorId)) {
-				summary.contributorNarratorIds.push(row.narratorId);
+			if (n?.type === "subagent") {
+				subagentType = n.subagentType ?? "subagent";
 			}
-		} else if (row.action === "external") {
-			summary.hasExternal = true;
 		}
-	}
 
-	return [...byFile.values()];
+		const now = new Date().toISOString();
+		const values = filePaths.map((filePath) => ({
+			id: generateId(),
+			deviceId,
+			workspacePath,
+			filePath,
+			narratorId: base.narratorId ?? null,
+			subagentType,
+			action: base.action,
+			toolName: base.toolName ?? null,
+			toolUseId: base.toolUseId ?? null,
+			changedAt: now,
+		}));
+
+		await db.insert(fileAttributions).values(values);
+
+		// Shadow all paths from external classification by the watcher.
+		if (base.action !== "external") {
+			markRecentlyAttributed(workspacePath, filePaths, deviceId);
+		}
+	} catch (err) {
+		logger.debug("Failed to record batch file attributions", {
+			workspacePath: base.workspacePath,
+			fileCount: filePaths.length,
+			error: String(err),
+		});
+	}
 }
+
+// Reading attributions back lives in `attribution-actors.ts` (actor resolution) and
+// `workspace-modification-view.ts` (the queries that consume it). This module is the write
+// path only: the tool chain and the worktree watcher record here.

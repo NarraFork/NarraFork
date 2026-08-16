@@ -42,6 +42,10 @@ export interface RemoteDeviceView {
 	tokenPrefix: string;
 	connectionMode: "reverse" | "direct";
 	directUrl: string | null;
+	/** Owner axis: "private" restricts the device to its creator. */
+	ownerScope: "private" | "shared";
+	/** User who registered the device; the owner for `ownerScope: "private"`. */
+	createdBy: string;
 	status: "online" | "offline";
 	lastSeenAt: string | null;
 	platformOs: string | null;
@@ -59,13 +63,63 @@ export interface RemoteDeviceView {
 
 type DeviceScopeRecord = Pick<RemoteDeviceView, "scope" | "projectId">;
 
-/** Global devices are universally available; project devices require an exact project match. */
+/** Adds the user axis. `createdBy` is what makes a "private" device personal. */
+type DeviceAuthorizationRecord = DeviceScopeRecord &
+	Partial<Pick<RemoteDeviceView, "ownerScope" | "createdBy">>;
+
+export interface DeviceAuthorizationContext {
+	projectId?: string | null;
+	/** Acting user, for the owner axis. Absent means "no user context". */
+	userId?: string | null;
+}
+
+/**
+ * Project axis only. Global devices are universally available; project devices
+ * require an exact project match.
+ *
+ * Kept as its own function because several callers legitimately have no user
+ * context (unattended recovery, snapshot revert). Prefer `isDeviceAuthorized`
+ * where an acting user is known.
+ */
 export function isDeviceAuthorizedForProject(
 	device: DeviceScopeRecord,
 	projectId: string | null | undefined,
 ): boolean {
 	if (device.scope === "global") return true;
 	return !!projectId && !!device.projectId && device.projectId === projectId;
+}
+
+/**
+ * Full two-axis authorization.
+ *
+ * The axes are independent and both must pass:
+ *
+ * - **project axis** (`scope`/`projectId`): which projects may use the device.
+ * - **owner axis** (`ownerScope`/`createdBy`): "shared" is available to everyone
+ *   the project axis allows; "private" is restricted to the user who registered
+ *   it, which is what makes a personal dev box personal.
+ *
+ * Together they express the four real deployments: a personal machine that
+ * follows its owner across projects (private + global), a project deploy target
+ * (shared + project), a communal build machine (shared + global), and a
+ * project-scoped personal box (private + project).
+ *
+ * A private device with no acting user in context is refused: an unattended path
+ * has no way to prove it is the owner, and silently treating that as "allowed"
+ * would make `private` meaningless on exactly the paths that need it most.
+ */
+export function isDeviceAuthorized(
+	device: DeviceAuthorizationRecord,
+	context: DeviceAuthorizationContext = {},
+): boolean {
+	if (!isDeviceAuthorizedForProject(device, context.projectId)) return false;
+	// Rows predating the owner axis default to "shared" in the schema; treat a
+	// missing value the same way so older callers keep working.
+	const ownerScope = device.ownerScope ?? "shared";
+	if (ownerScope === "shared") return true;
+	const owner = device.createdBy;
+	if (!owner) return false;
+	return !!context.userId && context.userId === owner;
 }
 
 export function deviceHasFeature(
@@ -89,6 +143,8 @@ export function toDeviceView(row: RemoteDeviceRow): RemoteDeviceView {
 		tokenPrefix: row.tokenPrefix,
 		connectionMode: row.connectionMode,
 		directUrl: row.directUrl,
+		ownerScope: row.ownerScope,
+		createdBy: row.createdBy,
 		status: row.status,
 		lastSeenAt: row.lastSeenAt,
 		platformOs: row.platformOs,
@@ -150,6 +206,8 @@ export interface CreateDeviceInput {
 	description?: string;
 	connectionMode: "reverse" | "direct";
 	directUrl?: string;
+	/** Owner axis; defaults to "shared" to match the pre-existing behaviour. */
+	ownerScope?: "private" | "shared";
 	scope: "global" | "project";
 	projectId?: string | null;
 	createdBy: string;
@@ -231,6 +289,7 @@ export async function prepareDeviceCreation(
 			tokenPrefix: prefix,
 			connectionMode: input.connectionMode,
 			directUrl,
+			ownerScope: input.ownerScope ?? "shared",
 			status: "offline",
 			scope: input.scope,
 			projectId,
@@ -283,9 +342,22 @@ export async function getDevice(id: string): Promise<RemoteDeviceView | null> {
 export async function requireAuthorizedDeviceForProject(
 	deviceId: string,
 	projectId: string | null | undefined,
+	/** Acting user, for the owner axis. Omit only where no user context exists. */
+	actingUserId?: string | null,
 ): Promise<RemoteDeviceView> {
 	const device = await getDevice(deviceId);
 	if (!device) throw new NotFoundError("Remote device", deviceId);
+	// Owner axis first so a private device reports the more specific reason rather
+	// than a confusing project-scope message.
+	if (!isDeviceAuthorized(device, { projectId, userId: actingUserId })) {
+		if (isDeviceAuthorizedForProject(device, projectId)) {
+			throw new DeviceScopeError(
+				`Remote device "${deviceId}" is private to the user who registered it`,
+				"DEVICE_SCOPE_FORBIDDEN",
+				403,
+			);
+		}
+	}
 	if (!isDeviceAuthorizedForProject(device, projectId)) {
 		throw new DeviceScopeError(
 			projectId
@@ -311,6 +383,7 @@ export interface UpdateDeviceInput {
 	description?: string | null;
 	connectionMode?: "reverse" | "direct";
 	directUrl?: string | null;
+	ownerScope?: "private" | "shared";
 	scope?: "global" | "project";
 	projectId?: string | null;
 }
@@ -340,6 +413,7 @@ export async function updateDevice(
 		directUrl,
 		scope,
 		projectId,
+		ownerScope: input.ownerScope ?? existing.ownerScope,
 	};
 	if (input.name !== undefined) {
 		const name = input.name.trim();

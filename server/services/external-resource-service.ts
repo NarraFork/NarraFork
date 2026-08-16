@@ -1073,6 +1073,11 @@ export async function provisionExternalNarrator(
 					deviceIds,
 				),
 				defaultDeviceId: defaultDevice.id,
+				// The user who consented to the OAuth grant owns the provisioned narrator,
+				// so it appears in their UI like any other session of theirs. The external
+				// surface itself keeps authorizing purely on the integration binding —
+				// `requireOwnedExternalNarrator` is unchanged and does not consult this.
+				ownerUserId: ctx.userId,
 			});
 			const committed = db.transaction((tx) => {
 				const narrator = createPreparedNarratorInTransaction(tx, prepared);

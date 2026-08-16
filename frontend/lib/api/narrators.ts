@@ -22,7 +22,12 @@ import type {
 	DirectoryBlacklistRuleInput,
 	DirectoryWhitelistRuleInput,
 	MessageLocationResult,
+	NarratorAccess,
+	NarratorGrant,
+	NarratorGrantAccess,
+	NarratorGrantBatchResult,
 	NarratorMessageSearchResponse,
+	NarratorVisibility,
 	PaginatedNarrators,
 	PretextDocumentPageResult,
 	RuleTargetSelector,
@@ -1585,4 +1590,37 @@ export const narratorsApi = {
 			errorMessage: string | null;
 			rawDump: unknown;
 		}>(`/narrators/${narratorId}/leaked-tool-dump/${apiRequestId}`),
+
+	// ── Access control (sharing) ───────────────────────────────────────────────
+
+	getNarratorAccess: (narratorId: string) =>
+		request<NarratorAccess>(`/narrators/${narratorId}/access`),
+
+	setNarratorVisibility: (narratorId: string, visibility: NarratorVisibility) =>
+		request<NarratorAccess>(`/narrators/${narratorId}/visibility`, {
+			method: "PATCH",
+			body: JSON.stringify({ visibility }),
+		}),
+
+	/** Share with several users at once; the response reports each user's outcome. */
+	grantNarratorAccess: (narratorId: string, userIds: string[], access: NarratorGrantAccess) =>
+		request<NarratorGrantBatchResult>(`/narrators/${narratorId}/grants`, {
+			method: "POST",
+			body: JSON.stringify({ userIds, access }),
+		}),
+
+	updateNarratorGrant: (narratorId: string, grantId: string, access: NarratorGrantAccess) =>
+		request<{ grants: NarratorGrant[] }>(`/narrators/${narratorId}/grants/${grantId}`, {
+			method: "PATCH",
+			body: JSON.stringify({ access }),
+		}),
+
+	revokeNarratorGrant: (narratorId: string, grantId: string) =>
+		request<{ ok: true }>(`/narrators/${narratorId}/grants/${grantId}`, { method: "DELETE" }),
+
+	transferNarratorOwner: (narratorId: string, userId: string | null) =>
+		request<NarratorAccess>(`/narrators/${narratorId}/transfer-owner`, {
+			method: "POST",
+			body: JSON.stringify({ userId }),
+		}),
 };

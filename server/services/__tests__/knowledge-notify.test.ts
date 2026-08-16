@@ -23,8 +23,9 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
+import { knowledgeGrantRows } from "../../../tests/fixtures/knowledge-grants";
 import { db } from "../../db";
-import { knowledgeGrants, knowledgeTags, users } from "../../db/schema";
+import { aclGrants, knowledgeTags, users } from "../../db/schema";
 import { eventBus, type NarraForkEvent } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
 import {
@@ -40,6 +41,24 @@ import {
 	setKnowledgeNotifyPush,
 } from "../knowledge-notify";
 import { knowledgeService } from "../knowledge-service";
+
+/**
+ * Seed knowledge grants into the unified `acl_grants` table.
+ *
+ * Knowledge authorization no longer reads `knowledge_grants`, so a fixture writing
+ * there would grant nothing. Input stays in the knowledge vocabulary; the shared
+ * fixture translates it (a credential row, plus a separate write row for canWrite).
+ */
+async function seedKnowledgeGrants(
+	seeds: Parameters<typeof knowledgeGrantRows>[0] | Parameters<typeof knowledgeGrantRows>[0][],
+): Promise<void> {
+	const list = Array.isArray(seeds) ? seeds : [seeds];
+	for (const seed of list) {
+		for (const row of knowledgeGrantRows(seed)) {
+			await db.insert(aclGrants).values(row as never);
+		}
+	}
+}
 
 const TAG = Date.now();
 const P = (id: string, role: "admin" | "user" = "user"): Principal => ({ userId: id, role });
@@ -120,7 +139,7 @@ beforeAll(async () => {
 		controlled: false,
 		createdAt: new Date().toISOString(),
 	});
-	await db.insert(knowledgeGrants).values({
+	await seedKnowledgeGrants({
 		id: generateId(),
 		collectionId: null,
 		principalType: "user",

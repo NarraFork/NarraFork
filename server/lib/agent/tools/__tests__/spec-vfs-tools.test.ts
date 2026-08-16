@@ -120,12 +120,16 @@ describe("spec:// Read/Write/Edit/Grep", () => {
 		expect(writeTool.description).toContain("spec://tasks.json");
 		expect(writeTool.description).toContain("spec://behavior_fence");
 		expect(writeTool.description).toContain("Every open task must be finite and executable");
-		expect(writeTool.description).toContain("may trigger automatic continuation");
+		// The `protected` guidance must stay in the description, whatever its wording:
+		// a protected task is a commitment the model cannot retract, so it must not be
+		// set casually. Asserted by the flag name rather than a full sentence so
+		// rephrasing does not fail the test, but silently dropping it does.
+		expect(writeTool.description).toContain("protected:true");
 		expect(writeSchema.properties.file_path.description).toContain("spec://");
 
 		expect(editTool.description).toContain("spec://tasks.json");
 		expect(editTool.description).toContain("Every open task must be finite and executable");
-		expect(editTool.description).toContain("may trigger automatic continuation");
+		expect(editTool.description).toContain("protected:true");
 		expect(editTool.description).not.toContain("spec://HOW_TO_USE_SPEC.md");
 		expect(editSchema.properties.file_path.description).toContain("spec://");
 

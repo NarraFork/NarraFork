@@ -1,4 +1,5 @@
 import { AppError, formatZodError, NotFoundError, ValidationError } from "@server/lib/errors";
+import { requireNarratorAccess } from "@server/lib/narrator-access";
 import {
 	type Capability,
 	invocationScopeSchema,
@@ -644,15 +645,26 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 										? contribution.style
 										: undefined,
 							scope: typeof contribution.scope === "string" ? contribution.scope : undefined,
+							// Opt-in shared UI runtime. Narrowed to the known literal for the same
+							// reason `surfaces` is bounded below: the client routes on this value, and
+							// silently dropping it would leave a view that declared the runtime
+							// rendering unstyled with nothing to explain why.
+							runtime: contribution.runtime === "host-react" ? contribution.runtime : undefined,
 							// Bounded to the known surface names so a hostile manifest cannot inflate
 							// the response or smuggle arbitrary strings into host routing logic.
+							//
+							// `provider-settings` must be included: `PluginProviderSection` decides
+							// whether to mount a plugin's own credential UI by looking for it here, so
+							// dropping it silently forced every provider plugin onto the host's
+							// generated config form no matter what its manifest declared.
 							surfaces: Array.isArray(contribution.surfaces)
 								? contribution.surfaces.filter(
 										(surface): surface is string =>
 											surface === "workspace" ||
 											surface === "director" ||
 											surface === "focus" ||
-											surface === "settings",
+											surface === "settings" ||
+											surface === "provider-settings",
 									)
 								: undefined,
 							status: status.desiredState === "enabled" ? "available" : "disabled",
@@ -671,6 +683,12 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const body = sessionInputSchema.safeParse(await c.req.json().catch(() => undefined));
 			if (!body.success) throw new ValidationError(formatZodError(body.error));
 			assertSurfaceScope(body.data);
+			// A narrator-scoped panel reads that narrator's context through the UI host,
+			// so the session may only be created by someone who can read the narrator.
+			// Checked at creation rather than per dispatch: the session is the capability.
+			if (body.data.surfaceScope === "narrator" && body.data.scope?.narratorId) {
+				await requireNarratorAccess(c, body.data.scope.narratorId, "read");
+			}
 			// Called for its lifecycle gate, not its value: a session must not be created for a
 			// plugin that is disabled, uninstalled or superseded.
 			await assertEnabled(manager, body.data.pluginId, body.data.version, body.data.hash);

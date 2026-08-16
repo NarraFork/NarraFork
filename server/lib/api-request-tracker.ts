@@ -20,6 +20,8 @@ export type ApiRequestKind =
 	| "reasoning_translation"
 	| "settings_test"
 	| "git_summary"
+	/** Summarizing a selection of human chat messages before forwarding it. */
+	| "chat_summarize"
 	| "internal";
 
 export interface ApiRequestStartOptions {

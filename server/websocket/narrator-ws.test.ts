@@ -17,7 +17,9 @@ type FakeNarratorWS = Parameters<typeof handleNarratorWS.open>[0];
 
 const openedConnections: FakeNarratorWS[] = [];
 
-function createFakeWs(options: { userId?: string; subscribedNarrators?: Set<string> } = {}) {
+function createFakeWs(
+	options: { userId?: string; subscribedNarrators?: Set<string>; userRole?: string } = {},
+) {
 	const sent: SentMessage[] = [];
 	let throwOnSend = false;
 	const ws = {
@@ -28,7 +30,11 @@ function createFakeWs(options: { userId?: string; subscribedNarrators?: Set<stri
 			subscribedNarrators: options.subscribedNarrators ?? new Set<string>(),
 			catchingUpNarrators: new Map(),
 			catchUpBuffers: new Map(),
-			userId: options.userId,
+			// Narrator subscribe/presence frames are authorized against this identity, so
+			// a connection with no user is (correctly) refused everything. Default to a
+			// real id here and gate visibility through the seeded rows instead.
+			userId: options.userId ?? "ws-test-user",
+			userRole: options.userRole,
 		},
 		send(payload: string) {
 			if (throwOnSend) throw new Error("socket closed");
@@ -44,7 +50,9 @@ function createFakeWs(options: { userId?: string; subscribedNarrators?: Set<stri
 	};
 }
 
-function openFakeWs(options: { userId?: string; subscribedNarrators?: Set<string> } = {}) {
+function openFakeWs(
+	options: { userId?: string; subscribedNarrators?: Set<string>; userRole?: string } = {},
+) {
 	const connection = createFakeWs(options);
 	handleNarratorWS.open(connection.ws);
 	openedConnections.push(connection.ws);
@@ -81,6 +89,9 @@ function seedNarrators() {
 				status: "working",
 				substatus: '["reasoning"]',
 				turnStartedAt: now,
+				// These fixtures exercise subscription/presence plumbing, not access control
+				// (narrator-acl.test.ts owns that), so they are readable on purpose.
+				visibility: "public",
 				createdAt: now,
 				updatedAt: now,
 			},
@@ -89,10 +100,26 @@ function seedNarrators() {
 				chapterId: "chapter-ws",
 				status: "idle",
 				substatus: "[]",
+				visibility: "public",
 				createdAt: now,
 				updatedAt: now,
 			},
 		])
+		.run();
+}
+
+/** A readable standalone narrator, for frames that need an existing row. */
+function seedReadableNarrator(id: string) {
+	const now = "2026-07-19T00:00:00.000Z";
+	db.insert(narrators)
+		.values({
+			id,
+			status: "idle",
+			substatus: "[]",
+			visibility: "public",
+			createdAt: now,
+			updatedAt: now,
+		})
 		.run();
 }
 
@@ -169,6 +196,7 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 
 	it("broadcasts an empty presence update when the last viewer explicitly leaves", async () => {
 		const narratorId = "presence-leave-narrator";
+		seedReadableNarrator(narratorId);
 		const observer = openFakeWs({ subscribedNarrators: new Set([narratorId]) });
 		const viewer = openFakeWs({
 			userId: "viewer-leave",
@@ -184,6 +212,7 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 
 	it("broadcasts an empty presence update when the last viewer connection closes", async () => {
 		const narratorId = "presence-close-narrator";
+		seedReadableNarrator(narratorId);
 		const observer = openFakeWs({ subscribedNarrators: new Set([narratorId]) });
 		const viewer = openFakeWs({
 			userId: "viewer-close",

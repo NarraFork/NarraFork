@@ -7,6 +7,7 @@ import {
 	beginUpdatePreAdmissionActivity,
 	cancelScheduledUpdate,
 	capturePlannedUpdateRecoverySnapshot,
+	classifyRecoveryManifestOwnership,
 	consumePlannedUpdateRecoverySnapshot,
 	convertToolStartGrantToExecution,
 	failScheduledUpdate,
@@ -663,5 +664,65 @@ describe("recovery manifest epoch guard", () => {
 		expect(consumePlannedUpdateRecoverySnapshot()).toMatchObject({
 			updateEpoch: "epoch-current",
 		});
+	});
+
+	test("a guarded rewrite binds the manifest to the spawned replacement's nonce", () => {
+		writePlannedUpdateRecoverySnapshot(manifest("epoch-a", "1.0.0"));
+		expect(consumePlannedUpdateRecoverySnapshot()?.handoffMarkerNonce).toBeUndefined();
+
+		// The manifest is written before the handoff session exists, then bound once the nonce is known.
+		writePlannedUpdateRecoverySnapshot(manifest("epoch-a", "1.0.0"), {
+			expectedEpoch: "epoch-a",
+			handoffMarkerNonce: "nonce-a",
+		});
+
+		expect(consumePlannedUpdateRecoverySnapshot()?.handoffMarkerNonce).toBe("nonce-a");
+	});
+});
+
+describe("recovery manifest ownership", () => {
+	test("only the replacement process carrying the bound nonce owns the manifest", () => {
+		expect(
+			classifyRecoveryManifestOwnership(
+				{ handoffMarkerNonce: "nonce-a" },
+				{ markerNonce: "nonce-a" },
+			),
+		).toEqual({ owned: true });
+	});
+
+	test("an ordinary restart never owns a leftover manifest", () => {
+		// The abandoned-narrator regression: without a handoff there is no update to resume for.
+		expect(classifyRecoveryManifestOwnership({ handoffMarkerNonce: "nonce-a" }, null)).toEqual({
+			owned: false,
+			reason: "not_a_replacement_process",
+		});
+		expect(classifyRecoveryManifestOwnership({}, null)).toEqual({
+			owned: false,
+			reason: "not_a_replacement_process",
+		});
+	});
+
+	test("a manifest from a different update attempt is not owned", () => {
+		expect(
+			classifyRecoveryManifestOwnership(
+				{ handoffMarkerNonce: "nonce-a" },
+				{ markerNonce: "nonce-b" },
+			),
+		).toEqual({ owned: false, reason: "handoff_nonce_mismatch" });
+	});
+
+	test("an evidence-only manifest is never owned, even by a real replacement", () => {
+		expect(
+			classifyRecoveryManifestOwnership({ evidenceOnly: true }, { markerNonce: "nonce-a" }),
+		).toEqual({ owned: false, reason: "evidence_only" });
+	});
+
+	test("a nonce-less manifest stays claimable by a handoff-spawned process", () => {
+		// Written either before the replacement was spawned, or by a pre-nonce binary. Rejecting it
+		// would silently drop the one legitimate resume during the upgrade that introduces binding.
+		expect(classifyRecoveryManifestOwnership({}, { markerNonce: "nonce-a" })).toEqual({
+			owned: true,
+		});
+		expect(classifyRecoveryManifestOwnership({}, {})).toEqual({ owned: true });
 	});
 });

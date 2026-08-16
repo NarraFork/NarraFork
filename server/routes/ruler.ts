@@ -8,6 +8,7 @@ import { worktreeLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
+import { requireProjectAccess } from "../lib/project-access";
 import { getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
 
 /**
@@ -68,6 +69,10 @@ import { commitSyncService } from "../services/commit-sync-service";
 import { gitService } from "../services/git-service";
 import { narratorService } from "../services/narrator-service";
 import { sendMessage } from "../services/narrator-session";
+import {
+	MAX_ANCHOR_FALLBACK_LOOKUPS,
+	resolveAnchorFallbacks,
+} from "../services/ruler-anchor-fallback";
 import {
 	type ParkedWork,
 	parkUncommittedWork,
@@ -137,6 +142,28 @@ function parseBoundedInt(raw: string | undefined, fallback: number, min: number,
 }
 
 export const rulerRoutes = new Hono();
+
+/**
+ * Access gate for the ruler (linear timeline) surface.
+ *
+ * Every endpoint is `/:id/ruler/...` where `:id` is a project id, so one middleware
+ * covers all nine — including the rebase/merge/fork/abandon operations, which rewrite
+ * branches and worktrees and therefore need project write.
+ */
+rulerRoutes.use("/:id/ruler/*", async (c, next) => {
+	const projectId = c.req.param("id");
+	if (!projectId) return next();
+	await requireProjectAccess(c, projectId, c.req.method === "GET" ? "read" : "write");
+	return next();
+});
+
+// `GET /:id/ruler` itself is not matched by the `/ruler/*` pattern above.
+rulerRoutes.use("/:id/ruler", async (c, next) => {
+	const projectId = c.req.param("id");
+	if (!projectId) return next();
+	await requireProjectAccess(c, projectId, c.req.method === "GET" ? "read" : "write");
+	return next();
+});
 
 // GET /:id/ruler — Main ruler data (commit backbone + segments + active chapters)
 rulerRoutes.get("/:id/ruler", async (c) => {
@@ -280,6 +307,105 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 		return null;
 	}
 
+	/**
+	 * Trunk fork points for chapters the walk above could not place.
+	 *
+	 * Two different situations reach here, and the client has to tell them apart:
+	 * a start commit that is on the branch but not in this page (paging fixes it), and one
+	 * that is no longer reachable from the branch at all because history was rewritten
+	 * under the chapter — a rebase, a squash-merge, an amend. The second case is
+	 * unfixable by paging, and it used to end with the Ruler dropping the chapter while
+	 * advising the user to open it from the story network view, which anchors on the same
+	 * sha and fails the same way.
+	 *
+	 * `merge-base` answers both at once: it returns the start commit itself when that
+	 * commit is an ancestor of the branch, and the divergence point when it is not. See
+	 * `resolveAnchorFallbacks`. Only chapters with no resolvable placement are asked
+	 * about, so a healthy project spawns no git here.
+	 *
+	 * ## Why this is asked in two rounds
+	 *
+	 * `resolveAnchorFallbacks` has a hard per-request spawn budget and, past it, simply
+	 * stops answering. Collecting every unplaced chapter's whole parent chain into one
+	 * set made the set O(chapters × chain depth) and let the budget be consumed in Set
+	 * insertion order — so a deep chain belonging to the first chapter could eat the
+	 * whole allowance before a later chapter's OWN start commit was ever asked about,
+	 * even though `resolveAnchorFallback` below searches bottom-up and would have
+	 * answered it immediately.
+	 *
+	 * Round 1 therefore asks about exactly one sha per unplaced chapter: its own start
+	 * commit, which is both the cheapest and the most accurate position available. Round
+	 * 2 walks the parent chains, but only for the chapters round 1 could not place, and
+	 * spends what is left of the SAME allowance — a total spawn count still capped at
+	 * `MAX_ANCHOR_FALLBACK_LOOKUPS`, now distributed per chapter instead of per sha.
+	 */
+	const unplacedChapters = projectChapters.filter((ch) => !resolveEffectiveSha(ch));
+
+	const ownStartShas = new Set<string>();
+	for (const ch of unplacedChapters) {
+		if (ch.startCommitSha) ownStartShas.add(ch.startCommitSha);
+	}
+
+	const anchorFallbackBySha = new Map<string, string>();
+	let anchorLookupBudget = MAX_ANCHOR_FALLBACK_LOOKUPS;
+	if (ownStartShas.size > 0) {
+		const round = await resolveAnchorFallbacks(project.gitPath, branch, [...ownStartShas], {
+			budget: anchorLookupBudget,
+		});
+		for (const [sha, base] of round.resolved) anchorFallbackBySha.set(sha, base);
+		anchorLookupBudget -= round.spent;
+	}
+
+	// Round 2: only the chapters still unplaced need their ancestors looked at. A child
+	// whose own start commit was rewritten often hangs off a parent that can still be
+	// located, and the parent's fork point is a better position than none.
+	if (anchorLookupBudget > 0) {
+		const ancestorShas = new Set<string>();
+		for (const ch of unplacedChapters) {
+			if (ch.startCommitSha && anchorFallbackBySha.has(ch.startCommitSha)) continue;
+			const visited = new Set<string>([ch.id]);
+			let cur = ch.parentChapterId ? chapterById.get(ch.parentChapterId) : undefined;
+			while (cur && !visited.has(cur.id)) {
+				visited.add(cur.id);
+				// Already answered (possibly as another chapter's own start commit) — asking
+				// again would only spend budget to re-learn it.
+				if (cur.startCommitSha && !anchorFallbackBySha.has(cur.startCommitSha)) {
+					ancestorShas.add(cur.startCommitSha);
+				}
+				cur = cur.parentChapterId ? chapterById.get(cur.parentChapterId) : undefined;
+			}
+		}
+		if (ancestorShas.size > 0) {
+			const round = await resolveAnchorFallbacks(project.gitPath, branch, [...ancestorShas], {
+				budget: anchorLookupBudget,
+			});
+			for (const [sha, base] of round.resolved) anchorFallbackBySha.set(sha, base);
+		}
+	}
+
+	/**
+	 * Where an unplaceable chapter should be drawn, and whether paging can fix it.
+	 *
+	 * `onBranch` distinguishes the two cases the client renders differently: true means
+	 * the commit is still an ancestor of the branch and simply outside the loaded window,
+	 * false means history moved and no amount of paging will produce a tick for it.
+	 */
+	function resolveAnchorFallback(
+		ch: (typeof projectChapters)[number],
+	): { sha: string; onBranch: boolean } | null {
+		const visited = new Set<string>();
+		let cur: (typeof projectChapters)[number] | undefined = ch;
+		while (cur && !visited.has(cur.id)) {
+			visited.add(cur.id);
+			if (cur.startCommitSha) {
+				const base = anchorFallbackBySha.get(cur.startCommitSha);
+				if (base) return { sha: base, onBranch: base === cur.startCommitSha };
+			}
+			cur = cur.parentChapterId ? chapterById.get(cur.parentChapterId) : undefined;
+		}
+		return null;
+	}
+
 	// Compute segments: find commit ranges that have chapters
 	// A chapter belongs to the segment containing its effective startCommitSha
 	const chaptersByStartSha = new Map<string, typeof projectChapters>();
@@ -333,6 +459,7 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 		.filter((ch) => ch.status === "active")
 		.map((ch) => {
 			const narrator = narratorMap.get(ch.id);
+			const fallback = resolveAnchorFallback(ch);
 			return {
 				id: ch.id,
 				title: ch.title,
@@ -347,6 +474,12 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 				// panel reads one shape regardless of whether it learned about the debt from
 				// a rebase response or from a page load.
 				parkedSnapshot: ch.parkedSnapshotCommitSha ?? null,
+				// Only set when nothing on the loaded backbone could place this chapter. See
+				// `resolveAnchorFallback`: `startCommitOnBranch: false` means history was
+				// rewritten and paging will never produce a tick, so the client must draw the
+				// chapter at the fork point instead of hiding it.
+				anchorFallbackSha: fallback?.sha ?? null,
+				startCommitOnBranch: fallback ? fallback.onBranch : null,
 				axisOffset: ch.axisOffset ?? 0,
 				crossOffset: ch.crossOffset ?? 0,
 			};
@@ -356,30 +489,37 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 	// for SegmentCanvas async loads — fixes disappearing merged chapters on re-mount)
 	const mergedChapters = projectChapters
 		.filter((ch) => ch.status === "merged")
-		.map((ch) => ({
-			id: ch.id,
-			title: ch.title,
-			branch: ch.branch,
-			role: ch.role,
-			parentChapterId: ch.parentChapterId ?? null,
-			startCommitSha: ch.startCommitSha,
-			mergeCommitSha: ch.mergeCommitSha,
-			// A commit-free merge produces no merge commit, so the ruler has nothing on
-			// the backbone to anchor its connector to. The target's HEAD at merge time is
-			// on the backbone and is the closest honest position for "this is where the
-			// chapter rejoined"; without it a snapshot-merged chapter draws no connector
-			// at all and reads as never merged.
-			mergeAnchorCommitSha: ch.mergeCommitSha ?? ch.preMergeTargetSha ?? null,
-			// Carried for every chapter the endpoint returns, not just the active ones: the
-			// field is what the recovery panel keys on, and a chapter that was merged while
-			// still owing a parked reapply would otherwise present as debt-free.
-			parkedSnapshot: ch.parkedSnapshotCommitSha ?? null,
-			narratorId: null as string | null,
-			narratorStatus: null as string | null,
-			narratorModelUnavailable: false,
-			axisOffset: ch.axisOffset ?? 0,
-			crossOffset: ch.crossOffset ?? 0,
-		}));
+		.map((ch) => {
+			const fallback = resolveAnchorFallback(ch);
+			return {
+				id: ch.id,
+				title: ch.title,
+				branch: ch.branch,
+				role: ch.role,
+				parentChapterId: ch.parentChapterId ?? null,
+				startCommitSha: ch.startCommitSha,
+				mergeCommitSha: ch.mergeCommitSha,
+				// A commit-free merge produces no merge commit, so the ruler has nothing on
+				// the backbone to anchor its connector to. The target's HEAD at merge time is
+				// on the backbone and is the closest honest position for "this is where the
+				// chapter rejoined"; without it a snapshot-merged chapter draws no connector
+				// at all and reads as never merged.
+				mergeAnchorCommitSha: ch.mergeCommitSha ?? ch.preMergeTargetSha ?? null,
+				// Carried for every chapter the endpoint returns, not just the active ones: the
+				// field is what the recovery panel keys on, and a chapter that was merged while
+				// still owing a parked reapply would otherwise present as debt-free.
+				parkedSnapshot: ch.parkedSnapshotCommitSha ?? null,
+				narratorId: null as string | null,
+				narratorStatus: null as string | null,
+				narratorModelUnavailable: false,
+				// See the active summary: a merged chapter whose fork point was rewritten is
+				// just as unplaceable, and hiding it reads as "the merge never happened".
+				anchorFallbackSha: fallback?.sha ?? null,
+				startCommitOnBranch: fallback ? fallback.onBranch : null,
+				axisOffset: ch.axisOffset ?? 0,
+				crossOffset: ch.crossOffset ?? 0,
+			};
+		});
 
 	return c.json({
 		commits,
@@ -1454,6 +1594,8 @@ rulerRoutes.post("/:id/ruler/rebase-resolve", async (c) => {
 		narrator = await narratorService.create({
 			chapterId,
 			permissionMode: "default",
+			// The user resolving the rebase conflict owns the session created for it.
+			ownerUserId: c.get("user").sub,
 		});
 	}
 

@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
+import { requireNarratorAccess } from "../lib/narrator-access";
 import {
 	createTerminalSchema,
 	updateTerminalGraphStateSchema,
@@ -19,6 +20,10 @@ terminalRoutes.get("/", async (c) => {
 	if (!chapterId && !narratorId) {
 		throw new ValidationError("chapterId or narratorId query parameter is required");
 	}
+	// Listing a narrator's terminals reveals what it is running, so it follows the
+	// narrator's read access. The chapter branch is unchanged: chapters have no
+	// per-user ACL of their own.
+	if (narratorId) await requireNarratorAccess(c, narratorId, "read");
 	const list = chapterId
 		? await terminalService.listByChapter(chapterId)
 		: await terminalService.listByNarrator(narratorId ?? "");
@@ -29,6 +34,11 @@ terminalRoutes.post("/", async (c) => {
 	const body = await c.req.json();
 	const parsed = createTerminalSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	// A terminal attached to a narrator executes commands in its workspace, which is
+	// exactly the authority `write` denotes — read-only viewers must not get a shell.
+	if (parsed.data.narratorId) {
+		await requireNarratorAccess(c, parsed.data.narratorId, "write");
+	}
 	const terminal = await terminalService.create({
 		chapterId: parsed.data.chapterId,
 		narratorId: parsed.data.narratorId,

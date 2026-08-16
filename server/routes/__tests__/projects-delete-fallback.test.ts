@@ -24,7 +24,20 @@ import { containerService } from "../../services/container-service";
 import { terminalService } from "../../services/terminal-service";
 import { projectRoutes } from "../projects";
 
-const app = new Hono().route("/projects", projectRoutes);
+// Deleting a project now requires project `manage`. These tests are about what the
+// deletion CLEANS UP (containers, terminals, host state), not about who may trigger
+// it — project-acl.test.ts owns that — so the request runs as an admin.
+const app = new Hono()
+	.use("*", async (c, next) => {
+		c.set("user", {
+			sub: "delete-fallback-admin",
+			role: "admin",
+			iat: 0,
+			exp: Number.MAX_SAFE_INTEGER,
+		});
+		await next();
+	})
+	.route("/projects", projectRoutes);
 
 interface Fixture {
 	projectId: string;

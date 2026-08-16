@@ -158,6 +158,13 @@ effectiveCapabilities =
 
 ## 6. 网络权限
 
+### 6.0 当前实现状态
+
+>
+> 强制 allowlist 需要 Linux network namespace（netns + iptables owner-match）或 Podman runner 的 `--network` 隔离。这是独立的大型工程，不应依赖当前字段的存在而假设已有强制。
+>
+> 代理 URL 的 SSRF 缓解已在 `plugin-provider-proxy-policy.ts` 中实现（拒绝私有/保留地址，可通过 `settings.plugins.allowPrivateProxyTarget` 放行），但这只覆盖宿主主动推送给插件的代理配置，不限制插件自身的出站能力。
+
 ### 6.1 默认策略
 
 **[设计建议]** 后端插件和 UI iframe 的默认网络策略都是 `none`：

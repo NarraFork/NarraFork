@@ -18,10 +18,13 @@
  *      bun test server/services/__tests__/knowledge-collection-acl.test.ts
  */
 import { beforeAll, describe, expect, test } from "bun:test";
+import { eq, sql } from "drizzle-orm";
+import { knowledgeGrantRows } from "../../../tests/fixtures/knowledge-grants";
 import { db } from "../../db";
 import {
+	aclGrants,
 	knowledgeDrafts,
-	knowledgeGrants,
+	knowledgeEntries,
 	knowledgeSubmissions,
 	knowledgeTags,
 	users,
@@ -36,6 +39,24 @@ import {
 import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeLinkService } from "../knowledge-link-service";
 import { knowledgeService } from "../knowledge-service";
+
+/**
+ * Seed knowledge grants into the unified `acl_grants` table.
+ *
+ * Knowledge authorization no longer reads `knowledge_grants`, so a fixture writing
+ * there would grant nothing. Input stays in the knowledge vocabulary; the shared
+ * fixture translates it (a credential row, plus a separate write row for canWrite).
+ */
+async function seedKnowledgeGrants(
+	seeds: Parameters<typeof knowledgeGrantRows>[0] | Parameters<typeof knowledgeGrantRows>[0][],
+): Promise<void> {
+	const list = Array.isArray(seeds) ? seeds : [seeds];
+	for (const seed of list) {
+		for (const row of knowledgeGrantRows(seed)) {
+			await db.insert(aclGrants).values(row as never);
+		}
+	}
+}
 
 const TAG = Date.now();
 
@@ -79,7 +100,7 @@ beforeAll(async () => {
 	});
 
 	// writer: confidential clearance + the secret tag + a global write grant.
-	await db.insert(knowledgeGrants).values([
+	await seedKnowledgeGrants([
 		{
 			id: generateId(),
 			principalType: "user",
@@ -207,7 +228,7 @@ describe("collection-scoped grants", () => {
 		const scopedUserId = await makeUser("user", "collection-scoped");
 		const first = await makeCollections();
 		const second = await makeCollections();
-		await db.insert(knowledgeGrants).values([
+		await seedKnowledgeGrants([
 			{
 				id: generateId(),
 				principalType: "user",
@@ -329,7 +350,7 @@ describe("addRevision / write_main collection gate (pinned gap)", () => {
 		});
 		// A user with a global write grant but NO clearance/tag for this collection.
 		const blockedWriter = await makeUser("user", "cblocked");
-		await db.insert(knowledgeGrants).values({
+		await seedKnowledgeGrants({
 			id: generateId(),
 			principalType: "user",
 			principalId: blockedWriter,
@@ -415,7 +436,7 @@ describe("review path collection gate (pinned gap)", () => {
 
 		// reviewerNoCollection: holds the review grant but NOT the collection's clearance/tag.
 		const reviewerNoCollection = await makeUser("user", "crev");
-		await db.insert(knowledgeGrants).values({
+		await seedKnowledgeGrants({
 			id: generateId(),
 			principalType: "user",
 			principalId: reviewerNoCollection,
@@ -554,5 +575,62 @@ describe("backward compatibility", () => {
 		expect(got.id).toBe(entry.id);
 		const list = await knowledgeService.listCollections(undefined, P(lowId));
 		expect(list.map((c) => c.id)).toContain(col.id);
+	});
+});
+
+describe("authorization fails closed, never open", () => {
+	test("filterReadable with NO principal yields the anonymous view, not everything", async () => {
+		const { restrictedId, publicId } = await makeCollections();
+		const secret = await knowledgeService.createEntry({
+			collectionId: restrictedId,
+			title: `noprincipal-secret-${TAG}`,
+			content: "body",
+		});
+		const open = await knowledgeService.createEntry({
+			collectionId: publicId,
+			title: `noprincipal-open-${TAG}`,
+			content: "body",
+		});
+
+		// This used to return `rows` untouched: a caller that forgot to resolve a principal
+		// disclosed every classified entry it had matched.
+		const kept = await knowledgeService.filterReadable(undefined, [
+			{ id: secret.id },
+			{ id: open.id },
+		]);
+		const keptIds = new Set(kept.map((r) => r.id));
+		expect(keptIds.has(secret.id)).toBe(false);
+		// The public entry still passes, so this is the anonymous baseline rather than a
+		// blanket denial that would have broken unauthenticated reads.
+		expect(keptIds.has(open.id)).toBe(true);
+	});
+
+	test("an entry whose collection row is gone is hidden, not treated as public", async () => {
+		const { publicId } = await makeCollections();
+		const entry = await knowledgeService.createEntry({
+			collectionId: publicId,
+			title: `orphan-${TAG}`,
+			content: "body",
+		});
+		// Simulate the anomaly the old fallback silently absorbed: the entry survives while
+		// its collection row does not. A cascading FK means this should be impossible, which
+		// is exactly why assuming "public" was the wrong reaction to seeing it. Foreign keys
+		// are enforced, so the dangling reference is written with them briefly disabled
+		// rather than by corrupting the schema.
+		await db.run(sql`PRAGMA foreign_keys = OFF`);
+		try {
+			await db
+				.update(knowledgeEntries)
+				.set({ collectionId: `missing-${generateId(8)}` })
+				.where(eq(knowledgeEntries.id, entry.id));
+		} finally {
+			await db.run(sql`PRAGMA foreign_keys = ON`);
+		}
+
+		// Readable-set filtering drops it...
+		const kept = await knowledgeService.filterReadable(P(writerId), [{ id: entry.id }]);
+		expect(kept.length).toBe(0);
+		// ...and the single-entry path reports not-found rather than serving it ungated.
+		await expect(knowledgeService.getEntry(entry.id, { principal: P(writerId) })).rejects.toThrow();
 	});
 });

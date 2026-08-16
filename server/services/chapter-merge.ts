@@ -2464,6 +2464,8 @@ export const chapterMerge = {
 			const narrator = await narratorService.create({
 				chapterId: tempChapter.id,
 				permissionMode: "default",
+				// The user who started the merge owns the conflict-resolution session.
+				ownerUserId: options.userId ?? null,
 			});
 
 			const prompt = buildConflictResolutionPrompt(

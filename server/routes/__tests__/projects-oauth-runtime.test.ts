@@ -14,7 +14,19 @@ import {
 import { generateId } from "../../lib/id";
 import { projectRoutes } from "../projects";
 
-const app = new Hono().route("/projects", projectRoutes);
+// Project deletion requires `manage`; this test covers the OAuth runtime cleanup it
+// triggers, not the authorization, so it runs as an admin.
+const app = new Hono()
+	.use("*", async (c, next) => {
+		c.set("user", {
+			sub: "oauth-runtime-admin",
+			role: "admin",
+			iat: 0,
+			exp: Number.MAX_SAFE_INTEGER,
+		});
+		await next();
+	})
+	.route("/projects", projectRoutes);
 const ids = {
 	user: generateId(),
 	project: generateId(),

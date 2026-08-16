@@ -1,23 +1,42 @@
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
+import { requireChapterAccess } from "../lib/project-access";
 import {
 	gitCommitSchema,
 	gitDiffQuerySchema,
 	gitDiscardSchema,
 	gitLogQuerySchema,
+	gitModificationsQuerySchema,
 	gitResetSchema,
 	gitStageSchema,
 	gitStashSchema,
 	gitUnstageSchema,
 } from "../lib/validators";
 import { commitSyncService } from "../services/commit-sync-service";
-import { getAttributions } from "../services/file-attribution-service";
+import { getCommitBoundariesCached } from "../services/git-commit-boundary-cache";
 import { gitService } from "../services/git-service";
 import { getStatusSummaryCached, invalidateStatus } from "../services/git-status-cache";
 import { resolveWorkspaceFromChapter } from "../services/git-workspace";
 import { getWorkspaceModificationView } from "../services/workspace-modification-view";
 
 export const gitRoutes = new Hono();
+
+/**
+ * Access gate for every git endpoint.
+ *
+ * All twelve are `/:chapterId/git/...`, and a chapter inherits its project's verdict
+ * (the worktrees share one repository, so chapter-level isolation is not real). One
+ * middleware therefore covers the whole surface, including endpoints added later.
+ *
+ * GET is read; the mutating ones stage, commit, discard, stash and reset — they
+ * rewrite the shared repository, so they need project write.
+ */
+gitRoutes.use("/:chapterId/git/*", async (c, next) => {
+	const chapterId = c.req.param("chapterId");
+	if (!chapterId) return next();
+	await requireChapterAccess(c, chapterId, c.req.method === "GET" ? "read" : "write");
+	return next();
+});
 
 /**
  * Resolve chapter → worktreePath, throwing if not available.
@@ -44,10 +63,33 @@ function statusSummary(worktreePath: string) {
 	return getStatusSummaryCached(worktreePath);
 }
 
-/** Validate file paths to prevent path traversal attacks. */
-function validateFilePaths(files: string[]): void {
+/**
+ * Reject paths that could act outside the worktree.
+ *
+ * Traversal is judged per SEGMENT, not by substring. `f.includes("..")` also rejected
+ * `some..file.ts` and `v1..v2/notes.md` — ordinary filenames that contain two dots without
+ * naming a parent directory — so staging or discarding them was impossible. Only a segment
+ * that IS `..` climbs, which is what this checks.
+ *
+ * A leading `/` or `\` is refused separately: those are absolute (or, doubled, a UNC path)
+ * and would escape without any `..` at all. Both separators are treated as such regardless
+ * of platform, because git accepts `/` everywhere and a Windows client may send `\`.
+ *
+ * NUL is refused because it terminates a C string: a path that git or the filesystem reads
+ * as a prefix of what was validated is a different path than the one that was checked.
+ *
+ * Exported for tests: it guards every mutating git route, so the boundary deserves direct
+ * cases rather than being exercised only through a route's happy path.
+ */
+export function validateFilePaths(files: string[]): void {
 	for (const f of files) {
-		if (f.includes("..") || f.startsWith("/") || f.startsWith("\\")) {
+		const segments = f.split(/[\\/]/);
+		if (
+			segments.some((segment) => segment === "..") ||
+			f.startsWith("/") ||
+			f.startsWith("\\") ||
+			f.includes("\0")
+		) {
 			throw new ValidationError(`Invalid file path: ${f}`);
 		}
 	}
@@ -61,15 +103,6 @@ gitRoutes.get("/:chapterId/git/status", async (c) => {
 	return c.json(summary);
 });
 
-// --- Attributions: who/which session changed each file ---
-
-gitRoutes.get("/:chapterId/git/attributions", async (c) => {
-	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const file = c.req.query("file");
-	const attributions = await getAttributions(worktreePath, file || undefined);
-	return c.json(attributions);
-});
-
 /**
  * Unified modification view for the whole worktree.
  *
@@ -80,16 +113,106 @@ gitRoutes.get("/:chapterId/git/attributions", async (c) => {
  */
 gitRoutes.get("/:chapterId/git/modifications", async (c) => {
 	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const limitParam = Number(c.req.query("limit"));
-	const narratorId = c.req.query("narratorId");
+	// Parsed rather than forwarded raw: `since`/`until` are compared as STRINGS against
+	// `file_attributions.changed_at`, so an unparseable value is not rejected by SQLite —
+	// it just compares as text and silently returns an empty window. Same for `narratorId`,
+	// where a malformed id matches no row. Both used to look like "this file has no
+	// attribution", which is the failure mode this endpoint exists to remove.
+	const query = gitModificationsQuerySchema.parse(c.req.query());
+
+	// `scope=uncommitted` answers the question the Git panel actually asks: who caused the
+	// changes that are sitting in the working tree right now. Without it the view spans the
+	// workspace's entire recorded history, which for a long-lived worktree credits a file's
+	// current diff to every session that ever touched it (measured here: a median of 7
+	// contributors per file, up to 157, where the real answer was 1).
+	const scope = query.scope === "uncommitted" ? await resolveUncommittedScope(worktreePath) : null;
+
 	const view = await getWorkspaceModificationView(worktreePath, {
-		...(Number.isFinite(limitParam) && limitParam > 0 ? { limit: limitParam } : {}),
-		...(c.req.query("since") ? { since: c.req.query("since") as string } : {}),
-		...(c.req.query("until") ? { until: c.req.query("until") as string } : {}),
-		...(narratorId ? { narratorId: narratorId as string | "external" } : {}),
+		...(query.limit !== undefined ? { limit: query.limit } : {}),
+		...(query.since ? { since: query.since } : {}),
+		...(query.until ? { until: query.until } : {}),
+		...(query.narratorId ? { narratorId: query.narratorId } : {}),
+		// `projection` is opt-in so an existing client keeps receiving the timeline.
+		...(query.projection ? { projection: query.projection } : {}),
+		...(scope ?? {}),
 	});
 	return c.json(view);
 });
+
+/**
+ * Scope options describing "the current uncommitted change".
+ *
+ * Three pieces: the paths git reports as changed, where each one's current change begins,
+ * and how a renamed file's two names relate.
+ *
+ * The boundary must be per path — a single repository-wide HEAD timestamp is not it,
+ * because a file's last commit is usually older than HEAD (in this repository, 90 of 127
+ * changed files, by a median of 164 hours), and using HEAD dropped real contributors.
+ *
+ * Paths with no boundary are left unbounded, which is correct for a file that has never
+ * been committed. Paths the walk did not reach fall back to its oldest commit: being newer
+ * than the true boundary, that can only under-count, and over-crediting a file with
+ * unrelated history is the failure that matters here.
+ *
+ * Renames are queried under BOTH names. Attribution rows carry the path that was written
+ * at the time, so everything a session did before the rename lives under the old path —
+ * which is not in the current diff. Asking for the new path only meant a renamed file's
+ * whole history was missing from the window and the row fell through to the
+ * `oldestInWindow` fallback: the "Unknown" badge, one shape removed. The alias map tells
+ * the view to fold those rows into the current path's group.
+ *
+ * Exported for tests only. Its behaviour depends on real porcelain output (rename
+ * detection, untracked reporting) and on the boundary walk, so the only honest test runs
+ * it against a throwaway repository rather than a hand-built status object.
+ */
+export async function resolveUncommittedScope(worktreePath: string): Promise<{
+	filePaths: string[];
+	sinceByPath: Map<string, string>;
+	pathAliases: Map<string, string>;
+}> {
+	const status = await getStatusSummaryCached(worktreePath);
+	// Old paths participate in the query; only the current path is ever displayed.
+	const pathAliases = new Map<string, string>();
+	for (const file of status.files) {
+		if (file.oldPath && file.oldPath !== file.path) pathAliases.set(file.oldPath, file.path);
+	}
+	const filePaths = [...status.files.map((file) => file.path), ...pathAliases.keys()];
+	if (filePaths.length === 0) {
+		return { filePaths, sinceByPath: new Map(), pathAliases };
+	}
+
+	const { byPath, oldestInWindow } = await getCommitBoundariesCached(
+		worktreePath,
+		status.headSha,
+		filePaths,
+	);
+
+	// Boundaries are keyed by DISPLAY path, matching how the view looks them up: a rename's
+	// pre-rename rows are folded onto the current path and must be judged against the
+	// window git resolved for the file as a whole. Taking the older of the two names' own
+	// boundaries keeps that window from cutting off history the rename carried over.
+	const sinceByPath = new Map<string, string>();
+	for (const [path, boundary] of byPath) {
+		const displayPath = pathAliases.get(path) ?? path;
+		const existing = sinceByPath.get(displayPath);
+		if (existing === undefined || boundary < existing) sinceByPath.set(displayPath, boundary);
+	}
+
+	if (oldestInWindow) {
+		const untracked = new Set(
+			status.files.filter((file) => file.status.startsWith("?")).map((file) => file.path),
+		);
+		for (const file of status.files) {
+			// An untracked file has no commit to bound it, so it must stay unbounded rather
+			// than inherit the window fallback.
+			if (!sinceByPath.has(file.path) && !untracked.has(file.path)) {
+				sinceByPath.set(file.path, oldestInWindow);
+			}
+		}
+	}
+
+	return { filePaths, sinceByPath, pathAliases };
+}
 
 // --- Stage ---
 

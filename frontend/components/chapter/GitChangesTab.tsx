@@ -17,25 +17,26 @@ import {
 	IconChevronRight,
 	IconFolder,
 	IconFolderOpen,
+	IconHelpCircle,
 	IconMinus,
 	IconPlus,
 	IconSparkles,
 } from "@tabler/icons-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
-	type FileAttributionSummary,
+	type FileModificationGroup,
 	useGitAiCommitMessage,
-	useGitAttributions,
 	useGitCommit,
 	useGitDiscard,
+	useGitModifications,
 	useGitStage,
 	useGitStatus,
 	useGitUnstage,
 } from "../../hooks/useGit";
 import { useGitFolderPrefs } from "../../hooks/useGitFolderPrefs";
-import { useNarrators } from "../../hooks/useNarrator";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { buildAttributionBadge } from "./attribution-label";
 import { GitFileDiff } from "./GitFileDiff";
 import { type GitFileSection, gitFileBadgeChar } from "./git-file-status";
 import { buildGitFileTree, compactGitFileTree, type GitFileTreeNode } from "./git-file-tree";
@@ -90,8 +91,7 @@ interface TreeContext {
 	onToggle: (path: string) => void;
 	onAction: (files: string[]) => void;
 	onOpenFile: (path: string) => void;
-	attrByPath: Map<string, FileAttributionSummary>;
-	narratorLabel: Map<string, string>;
+	attrByPath: Map<string, FileModificationGroup>;
 	t: Translate;
 }
 
@@ -105,8 +105,7 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	const { t } = useTranslation("git");
 	const confirm = useConfirmDialog();
 	const { data: status, isLoading } = useGitStatus(chapterId);
-	const { data: attributions } = useGitAttributions(chapterId);
-	const { data: narrators } = useNarrators({ chapterId });
+	const { data: modifications } = useGitModifications(chapterId);
 	const stage = useGitStage(chapterId);
 	const unstage = useGitUnstage(chapterId);
 	const commit = useGitCommit(chapterId);
@@ -122,11 +121,19 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	const stagedFolders = useGitFolderPrefs(chapterId, "staged");
 	const unstagedFolders = useGitFolderPrefs(chapterId, "unstaged");
 
-	// path → attribution summary, and narratorId → display label.
-	const attrByPath = new Map((attributions ?? []).map((a) => [a.filePath, a]));
-	const narratorLabel = new Map(
-		(narrators ?? []).map((n) => [n.id, n.title || t("attributionUnnamed")]),
+	// path → who changed it in the current uncommitted change. A path absent from this map
+	// has no attributable session, which the badge reports by not rendering. Memoized
+	// because every file row reads it: rebuilding per render also handed each row a new
+	// `ctx` object, defeating any downstream memoization on the tree.
+	const attrByPath = useMemo(
+		() => new Map((modifications?.byFile ?? []).map((g) => [g.filePath, g])),
+		[modifications?.byFile],
 	);
+	// A truncated row window means an absent path proves nothing: its changes may simply
+	// lie beyond the window. `windowCount === 0` with `hasMore` is the clear case — the cap
+	// was spent entirely on rows outside the per-file boundary — so the panel says the
+	// attribution is incomplete instead of implying nobody wrote these files.
+	const attributionTruncated = !!modifications?.hasMore && (modifications.windowCount ?? 1) === 0;
 
 	if (isLoading) {
 		return <Loader size="sm" />;
@@ -207,6 +214,17 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	return (
 		<ScrollArea.Autosize mah={300}>
 			<Stack gap="xs">
+				{/*
+				 * Stated once for the whole list rather than per row: the shortfall is a
+				 * property of the query window, not of any one file, and a missing badge on
+				 * its own would read as "nobody wrote this".
+				 */}
+				{attributionTruncated && (
+					<Text size="xs" c="dimmed">
+						{t("attributionWindowTruncated")}
+					</Text>
+				)}
+
 				{/* Staged section */}
 				{stagedFiles.length > 0 && (
 					<Stack gap={4}>
@@ -238,7 +256,6 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 									setDiffStaged(true);
 								},
 								attrByPath,
-								narratorLabel,
 								t,
 							}}
 						/>
@@ -292,7 +309,6 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 									setDiffStaged(false);
 								},
 								attrByPath,
-								narratorLabel,
 								t,
 							}}
 						/>
@@ -558,11 +574,7 @@ function FileRow({
 			>
 				{clampGitFilePath(children)}
 			</Text>
-			<AttributionBadge
-				attribution={ctx.attrByPath.get(file.path)}
-				narratorLabel={ctx.narratorLabel}
-				t={ctx.t}
-			/>
+			<AttributionBadge attribution={ctx.attrByPath.get(file.path)} t={ctx.t} />
 			<LineStats added={file.displayLinesAdded} removed={file.displayLinesRemoved} />
 			<Tooltip label={actionLabel}>
 				<ActionIcon
@@ -581,54 +593,50 @@ function FileRow({
 	);
 }
 
-/** Compact badge showing who last changed a file, with a contributor tooltip. */
+/**
+ * Compact badge naming who caused a file's current uncommitted change.
+ *
+ * Scoped to this round of edits, not the file's history: a long-lived worktree has been
+ * touched by dozens of sessions, and listing them all here answered a question nobody
+ * asked while looking authoritative. A file with no attributable session in scope renders
+ * nothing at all — "no session wrote this" is the honest answer, and inventing a
+ * contributor is worse than showing none.
+ *
+ * Labels come from the API because attribution spans subagents and sessions outside this
+ * chapter, which a chapter-scoped narrator list cannot name.
+ */
 function AttributionBadge({
 	attribution,
-	narratorLabel,
 	t,
 }: {
-	attribution?: FileAttributionSummary;
-	narratorLabel: Map<string, string>;
+	attribution?: FileModificationGroup;
 	t: Translate;
 }) {
 	if (!attribution) return null;
 
-	const labelFor = (id: string | null): string =>
-		id ? (narratorLabel.get(id) ?? t("attributionUnknown")) : t("attributionExternal");
-
-	const lastLabel = attribution.lastNarratorId
-		? labelFor(attribution.lastNarratorId)
-		: attribution.hasExternal
-			? t("attributionExternal")
-			: t("attributionUnknown");
-
-	// Contributors other than the last modifier.
-	const others = attribution.contributorNarratorIds.filter(
-		(id) => id !== attribution.lastNarratorId,
-	);
-
-	const tooltipLines: string[] = [
-		t("attributionLastModified", { name: lastLabel }),
-		...others.map((id) => t("attributionAlsoModified", { name: labelFor(id) })),
-	];
-	if (attribution.hasExternal && attribution.lastNarratorId) {
-		tooltipLines.push(t("attributionHasExternal"));
-	}
-
-	const extraCount = others.length + (attribution.hasExternal ? 1 : 0);
+	// Caption, "+N" and tooltip are one decision, made in the pure module: computing them
+	// separately here is what let a lone external contributor render as "External +1".
+	const badge = buildAttributionBadge(attribution, t);
+	const tooltip = badge.tooltipLines.join("\n");
 
 	return (
-		<Tooltip label={tooltipLines.join("\n")} multiline withinPortal>
+		<Tooltip label={tooltip} multiline withinPortal>
 			<Badge
 				size="xs"
 				variant="light"
-				color={attribution.lastNarratorId ? "indigo" : "gray"}
+				color={badge.hasNarrator ? "indigo" : "gray"}
+				// The tooltip is hover-only, so its contributor list would otherwise be
+				// unreachable by a screen reader — and by a test — while closed.
+				aria-label={tooltip}
+				// Uncertainty is carried by an icon rather than by colour alone, which
+				// would not survive a colour-blind or high-contrast viewer.
+				leftSection={attribution.hasImpreciseAttribution ? <IconHelpCircle size={10} /> : undefined}
 				style={{ flexShrink: 0, maxWidth: 110, cursor: "default", textTransform: "none" }}
 				onClick={(e) => e.stopPropagation()}
 			>
 				<Text size="xs" lineClamp={1} component="span">
-					{lastLabel}
-					{extraCount > 0 ? ` +${extraCount}` : ""}
+					{badge.label}
+					{badge.extraCount > 0 ? ` +${badge.extraCount}` : ""}
 				</Text>
 			</Badge>
 		</Tooltip>

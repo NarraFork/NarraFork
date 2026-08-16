@@ -9,8 +9,17 @@ const realSubagentResumeModule = { ...(await import("../subagent-resume")) };
 const realAgentCommunicationModule = { ...(await import("../agent-communication")) };
 const realAgentReplyWaiterModule = { ...(await import("../agent-reply-waiter")) };
 const updateCoordinator = await import("../update-coordinator");
+const { setObservedRestartHandoffForTests } = await import("../../lib/restart-handoff");
 
-let loadMode: "missing" | "transient" | "idle" | "working" = "transient";
+/** Marker nonce every test manifest is bound to unless it is exercising a mismatch. */
+const HANDOFF_NONCE = "test-handoff-nonce";
+
+/** Present this process as the replacement spawned by the manifest's update attempt. */
+function actAsReplacementProcess(markerNonce: string | undefined = HANDOFF_NONCE): void {
+	setObservedRestartHandoffForTests(markerNonce ? { markerNonce } : {});
+}
+
+let loadMode: "missing" | "transient" | "idle" | "working" | "archived" = "transient";
 let requestedProtectionEpoch: string | null = null;
 let renewCalls = 0;
 let renewClaimSucceeds = true;
@@ -81,7 +90,7 @@ mock.module("../narrator-service", () => ({
 			return {
 				id,
 				variant: "primary",
-				status: loadMode === "working" ? "working" : "idle",
+				status: loadMode === "working" ? "working" : loadMode === "archived" ? "archived" : "idle",
 			} as never;
 		},
 		updateStatus: async () => {},
@@ -415,6 +424,7 @@ afterEach(() => {
 	});
 	recoveryQueue = [];
 	continuationRows = [];
+	setObservedRestartHandoffForTests(null);
 	updateCoordinator.resetUpdateCoordinationForTests();
 });
 
@@ -482,8 +492,10 @@ async function prepareRecovery() {
 		updateEpoch: "epoch",
 		targetVersion: "4.0.0",
 		capturedAt: new Date().toISOString(),
+		handoffMarkerNonce: HANDOFF_NONCE,
 		narrators: [],
 	});
+	actAsReplacementProcess();
 	return getPlannedUpdateStartupProtection();
 }
 
@@ -522,8 +534,10 @@ describe("planned update recovery snapshot", () => {
 			updateEpoch: "update-protection-epoch",
 			targetVersion: "4.0.0",
 			capturedAt: new Date().toISOString(),
+			handoffMarkerNonce: HANDOFF_NONCE,
 			narrators: [],
 		});
+		actAsReplacementProcess();
 
 		const startup = await getPlannedUpdateStartupProtection();
 
@@ -532,21 +546,43 @@ describe("planned update recovery snapshot", () => {
 		expect(startup.protection).toBe(startupProtection);
 	});
 
-	test("retains transiently failed targets for the next startup", async () => {
-		loadMode = "transient";
+	test("reports a failed legacy resume without writing the target back to the manifest", async () => {
+		// A retry entry could only ever be claimed by a startup that does not own this manifest,
+		// which is exactly how abandoned narrators were resumed on every later boot.
+		loadMode = "working";
+		continueNarratorImpl = async () => {
+			throw new Error("temporary database failure");
+		};
 		updateCoordinator.writePlannedUpdateRecoverySnapshot({
-			version: 1,
+			version: 2,
+			updateEpoch: "epoch",
 			targetVersion: "4.0.0",
 			capturedAt: new Date().toISOString(),
+			handoffMarkerNonce: HANDOFF_NONCE,
 			narrators: [{ narratorId: "n1", locale: "en" }],
 		});
+		actAsReplacementProcess();
 
 		const recovery = await restoreNarratorsAfterPlannedUpdate();
 		await expect(recovery?.completion).rejects.toThrow("Failed to mount 1 legacy narrator");
 
-		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()?.narrators).toEqual([
-			{ narratorId: "n1", locale: "en" },
-		]);
+		expect(continueNarratorCalls).toBe(1);
+		// The failure is reported, not converted into a standing retry instruction: the manifest is
+		// left exactly as written (for diagnosis) and still carries the consumed handoff nonce.
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toMatchObject({
+			updateEpoch: "epoch",
+			handoffMarkerNonce: HANDOFF_NONCE,
+			narrators: [{ narratorId: "n1", locale: "en" }],
+		});
+
+		// The next startup is not this update's replacement, so the leftover cannot resume anything.
+		setObservedRestartHandoffForTests(null);
+		continueNarratorCalls = 0;
+		const nextStartup = await getPlannedUpdateStartupProtection();
+		expect(nextStartup.snapshot).toBeNull();
+		expect(await restoreNarratorsAfterPlannedUpdate(nextStartup)).toBeNull();
+		expect(continueNarratorCalls).toBe(0);
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
 	});
 
 	test("drops targets whose narrators were deleted", async () => {
@@ -557,10 +593,134 @@ describe("planned update recovery snapshot", () => {
 			capturedAt: new Date().toISOString(),
 			narrators: [{ narratorId: "deleted", locale: "en" }],
 		});
+		actAsReplacementProcess();
 
 		const recovery = await restoreNarratorsAfterPlannedUpdate();
 		await recovery?.completion;
 
+		expect(continueNarratorCalls).toBe(0);
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+	});
+
+	test("discards a manifest when this process was not spawned by an update handoff", async () => {
+		// The abandoned-narrator regression: a manifest left behind by a failed update (or an
+		// unfinished recovery pass) must not be re-consumed by an ordinary manual restart.
+		loadMode = "working";
+		updateCoordinator.writePlannedUpdateRecoverySnapshot({
+			version: 2,
+			updateEpoch: "orphan-epoch",
+			targetVersion: "4.0.0",
+			capturedAt: new Date().toISOString(),
+			handoffMarkerNonce: HANDOFF_NONCE,
+			narrators: [{ narratorId: "abandoned", locale: "en" }],
+		});
+		setObservedRestartHandoffForTests(null);
+
+		const startup = await getPlannedUpdateStartupProtection();
+		expect(startup.snapshot).toBeNull();
+		expect(await restoreNarratorsAfterPlannedUpdate(startup)).toBeNull();
+
+		expect(continueNarratorCalls).toBe(0);
+		expect(requestedProtectionEpoch).toBeNull();
+		// Removed rather than left behind: keeping it is what made it fire again on the next boot.
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+	});
+
+	test("discards a manifest belonging to a different update attempt", async () => {
+		loadMode = "working";
+		updateCoordinator.writePlannedUpdateRecoverySnapshot({
+			version: 2,
+			updateEpoch: "other-epoch",
+			targetVersion: "4.0.0",
+			capturedAt: new Date().toISOString(),
+			handoffMarkerNonce: "nonce-from-an-earlier-attempt",
+			narrators: [{ narratorId: "abandoned", locale: "en" }],
+		});
+		actAsReplacementProcess("nonce-of-this-attempt");
+
+		const startup = await getPlannedUpdateStartupProtection();
+
+		expect(startup.snapshot).toBeNull();
+		expect(continueNarratorCalls).toBe(0);
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+	});
+
+	test("discards an evidence-only manifest written by a failed update attempt", async () => {
+		loadMode = "working";
+		updateCoordinator.writePlannedUpdateRecoverySnapshot({
+			version: 2,
+			updateEpoch: "failed-epoch",
+			targetVersion: "4.0.0",
+			capturedAt: new Date().toISOString(),
+			evidenceOnly: true,
+			narrators: [{ narratorId: "abandoned", locale: "en" }],
+		});
+		// Even a genuine replacement process must not act on a failure record.
+		actAsReplacementProcess();
+
+		const startup = await getPlannedUpdateStartupProtection();
+
+		expect(startup.snapshot).toBeNull();
+		expect(continueNarratorCalls).toBe(0);
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+	});
+
+	test("accepts a nonce-less manifest written by an older binary", async () => {
+		loadMode = "working";
+		updateCoordinator.writePlannedUpdateRecoverySnapshot({
+			version: 1,
+			targetVersion: "4.0.0",
+			capturedAt: new Date().toISOString(),
+			narrators: [{ narratorId: "n1", locale: "en" }],
+		});
+		actAsReplacementProcess();
+
+		const recovery = await restoreNarratorsAfterPlannedUpdate();
+		await recovery?.completion;
+
+		expect(continueNarratorCalls).toBe(1);
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+	});
+
+	for (const status of ["idle", "archived"] as const) {
+		test(`does not resume a manifest narrator that is already ${status}`, async () => {
+			// A user interrupt, an error, and a normal finish all persist a terminal row before
+			// shutdown. Resuming those feeds a "Continue." turn into an abandoned session.
+			loadMode = status === "idle" ? "idle" : "archived";
+			updateCoordinator.writePlannedUpdateRecoverySnapshot({
+				version: 2,
+				updateEpoch: "epoch",
+				targetVersion: "4.0.0",
+				capturedAt: new Date().toISOString(),
+				handoffMarkerNonce: HANDOFF_NONCE,
+				narrators: [{ narratorId: "abandoned", locale: "en" }],
+			});
+			actAsReplacementProcess();
+
+			const recovery = await restoreNarratorsAfterPlannedUpdate();
+			await recovery?.completion;
+
+			expect(continueNarratorCalls).toBe(0);
+			expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+		});
+	}
+
+	test("resumes a manifest narrator that was still mid-turn when the update replaced the process", async () => {
+		loadMode = "working";
+		updateCoordinator.writePlannedUpdateRecoverySnapshot({
+			version: 2,
+			updateEpoch: "epoch",
+			targetVersion: "4.0.0",
+			capturedAt: new Date().toISOString(),
+			handoffMarkerNonce: HANDOFF_NONCE,
+			narrators: [{ narratorId: "severed", locale: "en" }],
+		});
+		actAsReplacementProcess();
+
+		const recovery = await restoreNarratorsAfterPlannedUpdate();
+		await recovery?.completion;
+
+		expect(continueNarratorCalls).toBe(1);
 		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
 	});
 });

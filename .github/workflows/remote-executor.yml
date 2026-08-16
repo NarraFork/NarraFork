@@ -18,6 +18,16 @@ on:
       - "frontend/lib/api/devices.ts"
       - "frontend/routes/settings/devices.tsx"
       - "frontend/locales/*/settings.json"
+      - "shared/remote-executor.ts"
+      - "shared/remote-executor-manifest.ts"
+      - "server/lib/executor-*.ts"
+      - "server/routes/executor-bootstrap.ts"
+      - "frontend/components/settings/ExecutorInstallModal.tsx"
+      - "frontend/lib/device-config.ts"
+      - "scripts/release-executor.ts"
+      - "scripts/lib/executor-manifest.ts"
+      - "update-server/routes/tools.ts"
+      - "update-server-go/internal/updateserver/tools_routes.go"
       - "package.json"
       - "bun.lock"
       - ".github/workflows/remote-executor.yml"
@@ -36,6 +46,16 @@ on:
       - "frontend/lib/api/devices.ts"
       - "frontend/routes/settings/devices.tsx"
       - "frontend/locales/*/settings.json"
+      - "shared/remote-executor.ts"
+      - "shared/remote-executor-manifest.ts"
+      - "server/lib/executor-*.ts"
+      - "server/routes/executor-bootstrap.ts"
+      - "frontend/components/settings/ExecutorInstallModal.tsx"
+      - "frontend/lib/device-config.ts"
+      - "scripts/release-executor.ts"
+      - "scripts/lib/executor-manifest.ts"
+      - "update-server/routes/tools.ts"
+      - "update-server-go/internal/updateserver/tools_routes.go"
       - "package.json"
       - "bun.lock"
       - ".github/workflows/remote-executor.yml"
@@ -80,6 +100,25 @@ jobs:
             *) echo "version metadata was not injected"; exit 1 ;;
           esac
 
+      # The distribution pipeline is only exercised on real artifacts, so build the
+      # publishable set here (dry run: digests and manifest only, no upload).
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Verify executor release pipeline
+        run: bun scripts/release-executor.ts 0.0.0-ci --dry-run
+
+      - name: Upload executor binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: narrafork-executor-${{ github.sha }}
+          path: |
+            remote-executor/dist/narrafork-executor-*
+          retention-days: 14
+          if-no-files-found: error
+
   integration-typescript:
     name: TypeScript, Bun tests, and production build
     runs-on: ubuntu-latest
@@ -117,6 +156,14 @@ jobs:
           bun test
           server/terminal/runtime-remote.test.ts
           server/services/__tests__/device-transfer-tasks.test.ts
+          server/lib/__tests__/executor-binaries.test.ts
+          server/lib/__tests__/executor-bootstrap-ticket.test.ts
+          server/lib/__tests__/executor-install-script.test.ts
+          server/routes/__tests__/executor-bootstrap.test.ts
+          scripts/lib/__tests__/executor-manifest.test.ts
+          tests/update-server-tools-route.test.ts
+          tests/executor-bootstrap-e2e.test.ts
+          frontend/lib/device-config.test.ts
 
       - name: Build frontend
         run: bun run build

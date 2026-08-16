@@ -6,6 +6,7 @@ import {
 	getDynamicSpecSystemReminder,
 	getSubagentParentReportingHint,
 } from "../../lib/prompt-i18n";
+import { MAX_PROJECT_INSTRUCTIONS_BYTES } from "../../lib/read-file-capped";
 import { buildEffectiveSystemPrompt } from "../narrator-prompt";
 
 describe("narrator prompt Dynamic Spec guidance", () => {
@@ -31,19 +32,36 @@ describe("narrator prompt Dynamic Spec guidance", () => {
 		expect(en).toContain("`Read`, `Write`, `Edit`, and `Grep`");
 		expect(en).toContain("Allowed statuses: `todo`, `doing`, `done`, `blocked`");
 		expect(en).toContain("Every open task must be finite, executable");
-		expect(en).toContain("may start another turn automatically");
-		expect(en).toContain("Never store standing behavior rules");
+		expect(en).toContain("may trigger auto-continuation while it stays open");
+		expect(en).toContain("Standing behavior rules, prohibitions, and guardrails");
 		expect(en).not.toContain("Do not bypass this requirement");
 		expect(en).toContain("add a concrete actionable unblock task");
 		expect(en).toContain("do not end the turn by merely explaining the blocker");
 		expect(zh).toContain("直接用 `Read`、`Write`、`Edit`、`Grep`");
 		expect(zh).toContain("允许的状态只有：`todo`、`doing`、`done`、`blocked`");
 		expect(zh).toContain("每条开放任务都必须是有限、可执行");
-		expect(zh).toContain("可能在回合结束后自动开始下一轮");
-		expect(zh).toContain("绝不能把长期行为规则");
+		expect(zh).toContain("未完成时可能触发自动续跑");
+		expect(zh).toContain("长期行为规则、禁止事项、安全护栏");
 		expect(zh).not.toContain("不能绕过的要求");
 		expect(zh).toContain("新增一个具体、可执行的解阻任务");
 		expect(zh).toContain("不能只解释阻塞");
+	});
+
+	test("restricts protected to tasks the user demanded be guaranteed", () => {
+		const en = getDynamicSpecSystemReminder("en");
+		const zh = getDynamicSpecSystemReminder("zh-CN");
+
+		expect(en).toContain("Set it ONLY when the user explicitly demanded");
+		expect(en).toContain("a task you protected yourself becomes a commitment you cannot retract");
+		expect(zh).toContain("只有当用户明确要求确保某个任务完成时才可设置");
+		expect(zh).toContain("你自行设置的 protected 会变成无法撤回的承诺");
+		// /goal is resolved server-side as a user write; the model must not be told
+		// about it as a path it can take.
+		expect(en).not.toContain("/goal");
+		expect(zh).not.toContain("/goal");
+		// The example shape must not model a self-set protected flag.
+		expect(en).not.toContain('"protected": true');
+		expect(zh).not.toContain('"protected": true');
 	});
 });
 
@@ -63,7 +81,7 @@ describe("plan mode designated plan file state", () => {
 				planFileId: "fresh-plan--0000000000000000",
 			});
 
-			expect(prompt).toContain(".narrafork/plan-fresh-plan--0000000000000000.md");
+			expect(prompt).toContain(".narrafork/plans/plan-fresh-plan--0000000000000000.md");
 			expect(prompt).not.toContain("Designated Plan File — Current State");
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
@@ -74,8 +92,11 @@ describe("plan mode designated plan file state", () => {
 		const cwd = makeWorkdir();
 		const planFileId = "resumed-plan--0000000000000000";
 		try {
-			mkdirSync(join(cwd, ".narrafork"), { recursive: true });
-			writeFileSync(join(cwd, ".narrafork", `plan-${planFileId}.md`), "# Plan\n\nStep one.\n");
+			mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+			writeFileSync(
+				join(cwd, ".narrafork", "plans", `plan-${planFileId}.md`),
+				"# Plan\n\nStep one.\n",
+			);
 
 			const { prompt } = await buildEffectiveSystemPrompt({
 				basePrompt: null,
@@ -97,8 +118,8 @@ describe("plan mode designated plan file state", () => {
 		const cwd = makeWorkdir();
 		const planFileId = "zh-plan--0000000000000000";
 		try {
-			mkdirSync(join(cwd, ".narrafork"), { recursive: true });
-			writeFileSync(join(cwd, ".narrafork", `plan-${planFileId}.md`), "# 计划\n");
+			mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+			writeFileSync(join(cwd, ".narrafork", "plans", `plan-${planFileId}.md`), "# 计划\n");
 
 			const { prompt } = await buildEffectiveSystemPrompt({
 				basePrompt: null,
@@ -229,5 +250,77 @@ describe("narrator prompt execution device guidance", () => {
 
 		expect(prompt).toContain("deleted-device (remote, unavailable)");
 		expect(prompt).toContain("Available remote devices: none currently online.");
+	});
+});
+
+describe("project instructions truncation", () => {
+	function makeWorkdir(): string {
+		return mkdtempSync(join(tmpdir(), "narrafork-prompt-trunc-"));
+	}
+
+	test("large AGENTS.md is truncated and the prompt length stays bounded", async () => {
+		const cwd = makeWorkdir();
+		try {
+			// Create a file larger than the cap
+			const bigContent = "x".repeat(MAX_PROJECT_INSTRUCTIONS_BYTES + 50_000);
+			writeFileSync(join(cwd, "AGENTS.md"), bigContent);
+
+			const { prompt } = await buildEffectiveSystemPrompt({
+				basePrompt: null,
+				cwd,
+				locale: "en",
+			});
+
+			expect(prompt).toContain("## Project Instructions");
+			expect(prompt).toContain("[... project instructions truncated due to size limit]");
+			// The prompt must be shorter than the raw file content
+			expect(prompt?.length).toBeLessThan(bigContent.length);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("truncation of Chinese text produces valid UTF-8 without U+FFFD", async () => {
+		const cwd = makeWorkdir();
+		try {
+			// Create content that, when truncated at a byte boundary, could split a
+			// multi-byte character. Each Chinese character is 3 bytes in UTF-8.
+			const chineseChars = "你好世界测试中文".repeat(
+				Math.ceil(MAX_PROJECT_INSTRUCTIONS_BYTES / 24) + 1000,
+			);
+			writeFileSync(join(cwd, "AGENTS.md"), chineseChars);
+
+			const { prompt } = await buildEffectiveSystemPrompt({
+				basePrompt: null,
+				cwd,
+				locale: "en",
+			});
+
+			// No replacement character should appear at the boundary
+			expect(prompt).not.toContain("\uFFFD");
+			expect(prompt).toContain("## Project Instructions");
+			expect(prompt).toContain("[... project instructions truncated due to size limit]");
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("small AGENTS.md is not truncated", async () => {
+		const cwd = makeWorkdir();
+		try {
+			writeFileSync(join(cwd, "AGENTS.md"), "# Small project\n\nJust a small file.");
+
+			const { prompt } = await buildEffectiveSystemPrompt({
+				basePrompt: null,
+				cwd,
+				locale: "en",
+			});
+
+			expect(prompt).toContain("## Project Instructions");
+			expect(prompt).toContain("Just a small file.");
+			expect(prompt).not.toContain("[... project instructions truncated");
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
 	});
 });

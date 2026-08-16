@@ -32,6 +32,7 @@
 import { type Manifest, safeParseManifest } from "@server/lib/plugins/manifest";
 import {
 	COMMANDS_INVOKE_METHOD,
+	type CommandConfigWrite,
 	type CommandSecretWrite,
 	commandsInvokeResultSchema,
 	type JsonValue,
@@ -74,6 +75,8 @@ export interface PluginCommandInvokeResult {
 	output: JsonValue | undefined;
 	/** Requested secret mutations, still unvalidated against the key whitelist. */
 	secretWrites: CommandSecretWrite[];
+	/** Requested non-secret config mutations, likewise still unvalidated. */
+	configWrites: CommandConfigWrite[];
 }
 
 export class PluginCommandRegistryError extends Error {
@@ -269,6 +272,7 @@ export class PluginCommandRegistry {
 		return {
 			output: result.data.output,
 			secretWrites: result.data.secretWrites ?? [],
+			configWrites: result.data.configWrites ?? [],
 		};
 	}
 }

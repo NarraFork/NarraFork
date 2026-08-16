@@ -11,6 +11,13 @@ import {
 	extractEmittedHtml,
 	filterAppShellManifest,
 } from "./build/app-shell-precache";
+import {
+	buildPluginUiRuntime,
+	isMainApplicationBuild as isMainPluginRuntimeBuild,
+	PLUGIN_UI_RUNTIME_CSS_PATH,
+	PLUGIN_UI_RUNTIME_JS_PATH,
+	type PluginUiRuntimeBundle,
+} from "./build/plugin-ui-runtime";
 import { createShikiLanguageAliasMap } from "./build/shiki-language-aliases";
 
 const vitePort = Number(process.env.VITE_PORT) || 7778;
@@ -254,6 +261,93 @@ function captureFinalAppShellHtml(setHtml: (html: string | null) => void): Plugi
  * outside Rollup's module graph prevents route-level modulepreload from seeing
  * every language while still allowing the highlighter to import one on demand.
  */
+/**
+ * Serve and emit the shared plugin UI runtime (React + Mantine) that plugin panels load.
+ *
+ * Modelled on `shikiRuntimeAssets()` below: one plugin covers the dev server (middleware)
+ * and the production build (`emitFile`) so there is no path where the runtime exists in one
+ * mode and not the other. A plugin panel with a missing runtime renders unstyled rather than
+ * erroring, which is exactly the kind of failure that survives review.
+ *
+ * The two files land at fixed, unhashed paths because the iframe shell references them by
+ * constant. Content changes are handled by `Cache-Control: no-cache` plus revalidation
+ * instead of by the filename — with a hashed name the shell would need a lookup table, and
+ * with a hashed name *and* long caching a host upgrade would keep serving a stale runtime.
+ *
+ * These paths are outside `assets/`, which keeps them out of the PWA precache globs in
+ * `VitePWA` below. That is intended: 1.2 MB should not be fetched by users who never open a
+ * plugin panel.
+ */
+function pluginUiRuntimeAssets(): Plugin {
+	// Built lazily and cached: in dev the middleware would otherwise rebundle React and
+	// Mantine on every request.
+	let cached: Promise<PluginUiRuntimeBundle> | undefined;
+	const bundle = () => {
+		cached ??= buildPluginUiRuntime();
+		return cached;
+	};
+	let isMainApplicationBuild = false;
+
+	return {
+		name: "narrafork-plugin-ui-runtime",
+		configResolved(config) {
+			// Same guard as `captureFinalAppShellHtml` above, for the same reason: PWA's
+			// injectManifest starts a nested Vite library build for src-sw.ts that writes into
+			// the same outDir with `emptyOutDir: false`. Emitting from there would re-run the
+			// ~800 KB React + Mantine bundle only to overwrite identical files. See the
+			// predicate's own comment for why this is kept even though the pinned PWA version
+			// does not currently hand this plugin to that build.
+			isMainApplicationBuild = isMainPluginRuntimeBuild(config);
+		},
+		configureServer(server) {
+			// Editing the runtime entry (or the shared theme it imports) must invalidate the
+			// cache; otherwise a dev session keeps serving the first build forever.
+			server.watcher.add(resolve(__dirname, "plugin-runtime"));
+			server.watcher.on("all", (_event, file) => {
+				const normalized = normalizeModulePath(file);
+				if (
+					normalized.includes("/frontend/plugin-runtime/") ||
+					normalized.endsWith("/frontend/lib/mantine-theme.ts")
+				) {
+					cached = undefined;
+				}
+			});
+
+			server.middlewares.use((req, res, next) => {
+				const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+				const isJs = pathname === `/${PLUGIN_UI_RUNTIME_JS_PATH}`;
+				const isCss = pathname === `/${PLUGIN_UI_RUNTIME_CSS_PATH}`;
+				if (!isJs && !isCss) {
+					next();
+					return;
+				}
+				bundle()
+					.then((built) => {
+						res.statusCode = 200;
+						res.setHeader(
+							"Content-Type",
+							isJs ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8",
+						);
+						// Fixed filenames, so correctness depends on revalidation rather than the URL.
+						res.setHeader("Cache-Control", "no-cache");
+						res.end(isJs ? built.js : built.css);
+					})
+					.catch((error: unknown) => {
+						res.statusCode = 500;
+						res.setHeader("Content-Type", "text/plain; charset=utf-8");
+						res.end(`Plugin UI runtime build failed: ${String(error)}`);
+					});
+			});
+		},
+		async generateBundle() {
+			if (!isMainApplicationBuild) return;
+			const built = await bundle();
+			this.emitFile({ type: "asset", fileName: PLUGIN_UI_RUNTIME_JS_PATH, source: built.js });
+			this.emitFile({ type: "asset", fileName: PLUGIN_UI_RUNTIME_CSS_PATH, source: built.css });
+		},
+	} satisfies Plugin;
+}
+
 function shikiRuntimeAssets(): Plugin {
 	const packageRoots = {
 		langs: resolve(__dirname, "..", "node_modules/@shikijs/langs/dist"),
@@ -333,6 +427,7 @@ export default defineConfig(({ mode, command }) => {
 			watchSharedDirectory(),
 			shikiLanguageAliases(),
 			shikiRuntimeAssets(),
+			pluginUiRuntimeAssets(),
 			TanStackRouterVite({
 				target: "react",
 				autoCodeSplitting: true,

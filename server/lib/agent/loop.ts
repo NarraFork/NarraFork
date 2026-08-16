@@ -1018,6 +1018,20 @@ export function buildExitPlanReflectionPrompt(
 	return `${basePrompt}\n\n${getPrompt("exitPlanReflectionAutoCompact", locale)}`;
 }
 
+/**
+ * The reviewer prompt for a protected-task change.
+ *
+ * ⚠️ It asks about INTENT, not about evidence sufficiency. The wording it replaced led
+ * with "is there concrete evidence that the task is complete", which has no upper bound —
+ * a reviewer can always name one more unproven thing. One session lost 1.5 hours to five
+ * consecutive denials of a task titled "阶段 0-4 全量验收" (full acceptance of phases 0-4);
+ * by the last round the entire 3067-test suite passed and it was still denied for lacking
+ * a standalone benchmark. Each denial was individually reasonable, and together they were
+ * a loop, because the task itself had no decidable completion condition.
+ *
+ * Hence evidence serves the intent judgement rather than being the bar, and rewriting an
+ * unbounded entry into a decidable one is an allowed repair instead of a violation.
+ */
 export function buildTaskReflectionPrompt(
 	requestId: string,
 	input: Record<string, unknown>,
@@ -1025,9 +1039,9 @@ export function buildTaskReflectionPrompt(
 	locale: Locale,
 ): string {
 	if (locale === "zh-CN") {
-		return `你正在进行 taskReflection。主叙述者准备修改 spec://tasks.json 中的 protected task。\n\n请求 ID：${requestId}\n\n工具输入：\n${JSON.stringify(input, null, 2)}\n\n受影响的 protected task：\n${JSON.stringify(mutations, null, 2)}\n\n请只调用一个工具：\n- 如果有具体证据证明这些 protected task 已完成，或删除/替换不会削弱用户意图，调用 TaskReflectConfirm。\n- 如果证据不足、任务未完成，或变更会削弱用户意图，调用 TaskReflectRevise。\n\n来源与误建纠正规则：\n- createdBy=user、system 或 unknown 时，按用户承诺保守处理，不能因为任务麻烦就完成、删除或改写。\n- createdBy=assistant 也不代表可以随意绕过一个有限、可执行的真实任务。\n- 但如果 assistant 创建的条目实际上是长期行为规则、禁止事项或没有完成终点的约束，它不是合法的调度任务。不能把这种条目标记 done 来假装完成。\n- 对这类误建条目的 done 变更应调用 TaskReflectRevise，并在 nextSteps 中明确要求删除 protected 标记、删除错误条目，或替换为有限可执行任务。\n- 如果候选变更正是在纠正这类 assistant 误建条目，且底层用户意图仍由系统/项目指令、behavior_fence 或等价的有限替代任务保留，可调用 TaskReflectConfirm。`;
+		return `你正在进行 taskReflection。主叙述者准备修改 spec://tasks.json 中的 protected task。\n\n请求 ID：${requestId}\n\n工具输入：\n${JSON.stringify(input, null, 2)}\n\n受影响的 protected task：\n${JSON.stringify(mutations, null, 2)}\n\n只需回答一个问题：这次修改是否违背了用户真正要求的东西？\n\n- 没有违背 → TaskReflectConfirm。\n- 违背（用户明确要求保证完成的事会被放弃、缩水，或未做完却标记为完成）→ TaskReflectRevise。\n\n证据用来帮你判断意图，不是审核标准本身。任何工作都能被要求更多证据，把"还能想出一件未被证明的事"当作驳回理由会产生无法通过的死循环。已有证据足以说明用户的实际诉求已满足时就确认，即使还能设想更完备的验收。\n\n如果该条目没有可判定的完成条件（"全量验收"、"确保质量"、"不得影响某处"这类无终点表述），它作为调度任务本身有缺陷，继续要证据只是浪费时间。此时把它改写成有明确完成条件的有限任务、或移除 protected 标记，都是合法纠正：只要用户的原始诉求仍以某种形式保留（改写后的任务、behavior_fence 或系统/项目指令）就确认。用户从未要求保证完成时同理。只有当改动实质上是在放弃用户要求的工作时才驳回。\n\ncreatedBy 字段影响保守程度，不替代上面的判断：createdBy=user、system 或 unknown 时要更保守，不能因为任务麻烦就完成、删除或改写；createdBy=assistant 仍不允许绕过真实的有限任务，但纠正它自己误建的条目门槛更低。\n\n驳回时 nextSteps 必须给出具体可完成的下一步。如果写不出"做完这一步就能通过"的指示，说明问题在任务的形式而非证据，应要求把它改写成有限任务。`;
 	}
-	return `You are running taskReflection. The main narrator is about to change protected task(s) in spec://tasks.json.\n\nRequest ID: ${requestId}\n\nTool input:\n${JSON.stringify(input, null, 2)}\n\nAffected protected task mutations:\n${JSON.stringify(mutations, null, 2)}\n\nCall exactly one tool:\n- TaskReflectConfirm only if there is concrete evidence that the protected task is complete, or that the delete/replacement is necessary and does not weaken user intent.\n- TaskReflectRevise if evidence is missing, the task is not complete, or the change weakens user intent.\n\nOrigin and malformed-task rules:\n- Treat createdBy=user, system, or unknown as a user commitment and remain conservative; inconvenience never justifies completion, deletion, or rewriting.\n- createdBy=assistant does not permit bypassing a real finite, executable task.\n- However, an assistant-created standing behavior rule, prohibition, or constraint with no terminal state is malformed scheduler state, not an endlessly incomplete task. It must not be marked done merely to escape continuation.\n- Reject attempts to mark such a malformed constraint done, and use nextSteps to tell the main narrator to remove the protected flag, delete the malformed entry, or replace it with a finite executable task.\n- Confirm a candidate that repairs such an assistant-created malformed entry only when the underlying user intent remains enforced by system/project instructions, behavior_fence, or an equivalent finite replacement task.`;
+	return `You are running taskReflection. The main narrator is about to change protected task(s) in spec://tasks.json.\n\nRequest ID: ${requestId}\n\nTool input:\n${JSON.stringify(input, null, 2)}\n\nAffected protected task mutations:\n${JSON.stringify(mutations, null, 2)}\n\nAnswer one question: does this change betray what the user actually asked for?\n\n- It does not → TaskReflectConfirm.\n- It does (work the user demanded be guaranteed would be dropped, watered down, or marked finished while incomplete) → TaskReflectRevise.\n\nEvidence helps you judge intent; it is not the standard itself. Any body of work admits a further demand for proof, so treating "one more thing could be proven" as grounds for denial produces a loop no change can pass. When the evidence already shows the user's real requirement is met, confirm — even if a more exhaustive acceptance is imaginable.\n\nIf the entry has no decidable completion condition ("full acceptance", "ensure quality", "must not affect X" — phrasings with no terminal state), it is malformed as a scheduler entry and demanding more evidence only burns time. Rewriting it into a finite task with an explicit completion condition, or removing the protected flag, is then a legitimate repair: confirm as long as the user's original requirement survives somewhere (the rewritten task, behavior_fence, or system/project instructions). The same holds when the user never demanded that guarantee. Deny only when the change amounts to abandoning work the user asked for.\n\nThe \`createdBy\` field weights how conservative to be; it does not replace the judgement above. For createdBy=user, system, or unknown, be more conservative — inconvenience never justifies completion, deletion, or rewriting. For createdBy=assistant, there is still no licence to bypass a real finite task, but repairing an entry it malformed itself carries a lower bar.\n\nWhen denying, nextSteps must name a concrete, completable action. If you cannot write an instruction of the form "do this and it passes", the problem is the task's shape rather than the evidence — require a rewrite into a finite task.`;
 }
 
 export interface ReflectionLoopRunOptions {

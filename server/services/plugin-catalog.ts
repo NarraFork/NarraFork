@@ -56,6 +56,11 @@ export interface PluginContributionSummary {
 	style?: string;
 	/** View binding scope used by the UI picker to choose a compatible host surface. */
 	scope?: "workspace" | "narrator" | "project" | "global";
+	/**
+	 * Set when a view opts into the host's shared UI runtime, so the client's iframe shell
+	 * knows to inject it before the view's entry. Absent for views that ship their own DOM.
+	 */
+	runtime?: "host-react";
 	/** Tool metadata used by host-side registries and diagnostics. */
 	inputSchema?: Readonly<Record<string, unknown>>;
 	execution?: "server" | "ui";
@@ -208,6 +213,9 @@ function contributionSummaries(
 					item.scope === "global")
 					? item.scope
 					: undefined;
+			// Opt-in shared UI runtime. Narrowed to the one known literal rather than passed
+			// through, for the same reason `surfaces` is: the client acts on this value.
+			const runtime = kind === "view" && item.runtime === "host-react" ? item.runtime : undefined;
 			const hasSchema =
 				inputSchema !== undefined ||
 				(typeof item.configSchema === "object" && item.configSchema !== null) ||
@@ -225,6 +233,7 @@ function contributionSummaries(
 				...(entryPath ? { entryPath, entry: entryPath } : {}),
 				...(stylePath ? { stylePath, style: stylePath } : {}),
 				...(scope ? { scope } : {}),
+				...(runtime ? { runtime } : {}),
 				...(surfaces && surfaces.length > 0 ? { surfaces } : {}),
 				...(inputSchema ? { inputSchema } : {}),
 				...(execution ? { execution } : {}),

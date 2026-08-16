@@ -22,6 +22,7 @@ import {
 	IconFlask,
 	IconGitBranch,
 	IconInfoCircle,
+	IconMessages,
 	IconNotebook,
 	IconRobot,
 	IconSearch,
@@ -68,6 +69,9 @@ const FileModificationsPanel = lazy(() =>
 const SpecPanel = lazy(() => import("../SpecPanel").then((m) => ({ default: m.SpecPanel })));
 const NarratorSearchPanel = lazy(() =>
 	import("../NarratorSearchPanel").then((m) => ({ default: m.NarratorSearchPanel })),
+);
+const NarratorUserChatPanel = lazy(() =>
+	import("../../chat/NarratorUserChatPanel").then((m) => ({ default: m.NarratorUserChatPanel })),
 );
 const GitPanel = lazy(() =>
 	import("../../chapter/GitPanel").then((m) => ({ default: m.GitPanel })),
@@ -677,6 +681,32 @@ export function SearchDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPar
 	);
 }
 
+// ── User chat (human discussion room beside this narrator) ──
+export function UserChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const { t } = useTranslation("chat");
+	const dock = useNarratorDockContext();
+	// Live context is the source of truth (see ChatDockPanel note).
+	const narratorId = dock?.narratorId ?? props.params.narratorId;
+
+	useLayoutEffect(() => {
+		const title = t("panelTitle");
+		if (title && title !== props.api.title) props.api.setTitle(title);
+	}, [t, props.api]);
+
+	return (
+		<ToolPanelShell
+			title={t("panelTitle")}
+			icon={<IconMessages size={16} color="var(--mantine-color-blue-4)" />}
+			props={props}
+			subjectId="__userchat__"
+		>
+			<LazyPanelBoundary>
+				<NarratorUserChatPanel narratorId={narratorId} />
+			</LazyPanelBoundary>
+		</ToolPanelShell>
+	);
+}
+
 // ── Mock stream harness (TEMPORARY, see ../mock/README-REMOVAL.md) ──
 export function MockDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const dock = useNarratorDockContext();
@@ -760,6 +790,7 @@ export const narratorDockComponents: Record<
 	browser: BrowserDockPanel,
 	tasks: TasksDockPanel,
 	search: SearchDockPanel,
+	userchat: UserChatDockPanel,
 	subagent: SubagentDockPanel,
 	file: FileDockPanel,
 	plugin: PluginDockPanel,

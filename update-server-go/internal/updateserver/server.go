@@ -35,6 +35,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v2/products/{product}/releases/{version}/zstd-patch-meta/{filename}", a.downloadZstdPatchMeta)
 	mux.HandleFunc("GET /api/v2/tools/{filename}", a.downloadTool)
 
+	mux.Handle("PUT /api/v2/tools/{filename}", a.requireAuth(TokenRoleUpload, http.HandlerFunc(a.uploadTool)))
 	mux.Handle("POST /api/v2/products/{product}/releases", a.requireAuth(TokenRoleUpload, http.HandlerFunc(a.uploadRelease)))
 	mux.Handle("GET /api/v2/products/{product}/releases", a.requireAuth(TokenRoleUpload, http.HandlerFunc(a.listReleases)))
 	mux.Handle("POST /api/v2/products/{product}/releases/{version}/promote", a.requireAuth(TokenRoleUpload, http.HandlerFunc(a.promoteRelease)))
@@ -69,7 +70,7 @@ func (a *App) withCORS(next http.Handler) http.Handler {
 			if origin == "" && originWildcardAllowed(cfg.CORS.Origins) {
 				w.Header().Set("Access-Control-Allow-Origin", "*")
 			}
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusNoContent)

@@ -103,6 +103,9 @@ async function resolvePackAcl(
 			controlledTagsJson: pack.controlledTagsJson,
 			reviewTagsJson: null,
 		},
+		// Unlike the entry paths, this `public` is not a degraded fallback: a standalone
+		// pack has no collection row by design, and its own classification/tags above
+		// carry the whole gate. The synthetic id exists only to satisfy the ACL shape.
 		aclCollection: { id: `pack:${pack.id}`, defaultLevel: "public" },
 	};
 }

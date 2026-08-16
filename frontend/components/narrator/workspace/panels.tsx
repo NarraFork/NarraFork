@@ -26,6 +26,7 @@ import {
 	SubagentSessionPanelContent,
 	TasksDockPanel as TasksToolAdapter,
 	TerminalDockPanel as TerminalToolAdapter,
+	UserChatDockPanel as UserChatToolAdapter,
 } from "../dock/panels";
 import { NarratorPanel } from "../NarratorPanel";
 import type { FilePanelParams, NarratorBoundPanelParams } from "../panels/panel-kind";
@@ -191,6 +192,9 @@ function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParam
 			break;
 		case "search":
 			inner = <SearchToolAdapter {...toolProps} />;
+			break;
+		case "userchat":
+			inner = <UserChatToolAdapter {...toolProps} />;
 			break;
 		default:
 			inner = null;

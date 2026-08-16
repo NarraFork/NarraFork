@@ -18,9 +18,16 @@
  */
 
 import { resolveAssistantTextDisplay, type TextCitation } from "../citations";
+import { knowledgeExcerpt } from "../knowledge-excerpt";
 import { hasUsablePlanBody } from "../plan-reference";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
-import { rawSideCarToMarkdown, readSideCarBody, sideCarBodyToMarkdown } from "../sidecar-body";
+import {
+	escapeMarkdown,
+	rawSideCarToMarkdown,
+	readSideCarBody,
+	sideCarBodyToMarkdown,
+	verbatimOutputToMarkdown,
+} from "../sidecar-body";
 import { subagentResultText } from "../subagent-result-text";
 import type { VListElementKind } from "./element-kinds";
 import type { RenderLod } from "./prepared-block";
@@ -1740,15 +1747,35 @@ function adaptSpokenInjection(
 		const task = Array.isArray(body.items) ? body.items[0] : undefined;
 		if (!task) return null;
 		const preview = (task.preview ?? "").trim();
+		// A bash task's preview is VERBATIM stdout/stderr, so it is fenced unconditionally
+		// (`verbatimOutputToMarkdown`) rather than handed to the Markdown parser. Linter
+		// and compiler output is preformatted text whose indentation and column rules ARE
+		// the content: `bunx biome check` emits `! message` lines followed by
+		// two-space-indented source excerpts, which Markdown reads as a heading-ish
+		// paragraph followed by an INDENTED CODE block — so one diagnostic rendered as
+		// prose and its own excerpt as a separate card, alignment lost. `|`-tables and
+		// `#`/`>` lines in test output fail the same way.
+		//
+		// An agent task's preview is the subagent's own written report, which is authored
+		// AS Markdown, so that flavor keeps the prose path. The distinction is the
+		// producer's intent, not a guess about the bytes.
+		const isVerbatim = body.flavor === "bash";
+		// An empty preview still gets a bubble: "it finished, with no output" is itself
+		// the result, and the status lives in the header. Dropping the row would make a
+		// silent success indistinguishable from one that never ran. The empty LABEL is
+		// prose either way — fencing "(empty)" would dress a localized sentence up as
+		// machine output.
+		const markdown = preview
+			? isVerbatim
+				? verbatimOutputToMarkdown(preview)
+				: rawSideCarToMarkdown(preview)
+			: rawSideCarToMarkdown(sysLabel(ctx, "empty"));
 		return [
 			{
 				kind: "injection-bubble",
 				key: `${idBase}-b${blockIndex}-t-${task.id}`,
 				data: {
-					// An empty preview still gets a bubble: "it finished, with no output" is
-					// itself the result, and the status lives in the header. Dropping the row
-					// would make a silent success indistinguishable from one that never ran.
-					markdown: rawSideCarToMarkdown(preview || sysLabel(ctx, "empty")),
+					markdown,
 					speaker: task.alias?.trim() || task.title?.trim() || task.id,
 					// A background task is addressable by id, which is what seeds its glyph.
 					speakerId: task.id ?? null,
@@ -1775,7 +1802,24 @@ function adaptSpokenInjection(
 	// for strictly less information. The shape therefore follows the DATA, not the tag.
 	if (body.kind === "knowledge") {
 		const hits = Array.isArray(body.hits) ? body.hits : [];
-		const substantive = hits.filter((hit) => (hit?.summary ?? "").trim().length > 0);
+		/*
+		 * ⚠️ The excerpt is re-derived HERE, not read as stored.
+		 *
+		 * `summary` is a FLATTENED slice of the entry's Markdown body, and rows written
+		 * before the server started stripping it still hold raw Markdown. Painting that as
+		 * Markdown is what produced the wall of display-size heading in the report: an entry
+		 * body opens with `# Title`, so the whole flattened excerpt sat behind that `#`.
+		 *
+		 * `knowledgeExcerpt` is idempotent, so running it over an already-clean excerpt is a
+		 * no-op and the two paths agree. The `title` argument drops a leading line that
+		 * merely repeats the entry title — which is exactly what this bubble's own header
+		 * shows, so keeping it cost the excerpt its most useful line.
+		 */
+		const excerpted = hits.map((hit) => ({
+			hit,
+			excerpt: knowledgeExcerpt(hit?.summary ?? "", { title: hit?.title ?? undefined }),
+		}));
+		const substantive = excerpted.filter((e) => e.excerpt.length > 0);
 		// All-or-nothing: a mixed batch stays a list rather than splitting one delivery
 		// across two visual languages.
 		if (substantive.length === 0 || substantive.length !== hits.length) return null;
@@ -1786,11 +1830,14 @@ function adaptSpokenInjection(
 		// safe here only as long as the all-or-nothing gate above guaranteed
 		// `substantive === hits`; that is an invisible coupling between a VISUAL policy
 		// and key correctness, and relaxing the policy later would silently break it.
-		return substantive.map((hit) => ({
+		return substantive.map(({ hit, excerpt }) => ({
 			kind: "injection-bubble" as const,
 			key: `${idBase}-b${blockIndex}-k-${hit.entryId}`,
 			data: {
-				markdown: rawSideCarToMarkdown(hit.summary.trim()),
+				// PLAIN text, escaped rather than parsed: the excerpt is prose by
+				// construction now, and any `#`/`>`/`-` still in it is debris from the
+				// flattening, not authored structure.
+				markdown: escapeMarkdown(excerpt),
 				speaker: hit.title?.trim() || hit.entryId,
 				// The entry's own id seeds its glyph, so two similarly-titled entries stay
 				// visually distinct.

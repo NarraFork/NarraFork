@@ -220,26 +220,15 @@ export function buildPretextDocumentLayout(
 	const latestSpecTasksToolUseId = findLatestSpecTasksToolUseIdInMessages(
 		messages as NarratorMsg[],
 	);
-	// A tool-run segment containing the pinned card must not fold into an activity
-	// unit at L1/L2 (its card would vanish into a trace row). The fold operates on
-	// whole segments, so the keep set is expressed in MESSAGE ids: any segment whose
-	// items touch one of these messages stays a plain segment. Same "whole segment"
-	// precedent as the permission gate — splitting a segment here would reorder the
-	// run.
-	const pinnedSpecTasksMessageIds = new Set<string>();
-	if (latestSpecTasksToolUseId != null) {
-		for (const seg of segments) {
-			if (seg.kind !== "tool-run") continue;
-			if (!seg.items.some((item) => item.tc.toolUseId === latestSpecTasksToolUseId)) continue;
-			for (const source of seg.sourceMessages) {
-				if (typeof source.id === "string" && source.id.length > 0) {
-					pinnedSpecTasksMessageIds.add(source.id);
-				}
-			}
-		}
-	}
+	// The pinned card must not fold into an activity unit at L1/L2 (its task board
+	// would vanish into a trace row). The keep set is expressed in TOOL-USE ids, so
+	// only THAT call leaves the fold: keeping the whole segment out — as this once
+	// did, via message ids — pushed its sibling calls into a `tool-run-count`, i.e.
+	// a bare "tool calls ×N" line that names none of them. Their named rows are
+	// exactly what a reader at a low LOD still has (see splitToolRunForActivity).
 	const renderUnits = groupRenderUnits(segments, options.lod <= 2, {
-		keepToolRunMessageIds: pinnedSpecTasksMessageIds,
+		keepToolUseIds:
+			latestSpecTasksToolUseId != null ? new Set([latestSpecTasksToolUseId]) : undefined,
 	});
 	const adapterUnits: AdapterRenderUnit[] = renderUnits.map((unit, index) =>
 		unit.kind === "activity"

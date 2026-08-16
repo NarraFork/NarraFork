@@ -3,6 +3,7 @@ import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { invalidateWorkspaceQueries } from "../../hooks/useGit";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
@@ -1153,11 +1154,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					linesAdded: data.linesAdded,
 					linesRemoved: data.linesRemoved,
 				});
-				qc.invalidateQueries({ queryKey: ["gitStatus", data.chapterId] });
+				// Attribution moves with status: a commit pushed by the narrator resets each
+				// file's per-path boundary, so the badges must refetch alongside the diff.
+				invalidateWorkspaceQueries(qc, data.chapterId);
 			},
 			onCommitSyncError: (event) => {
 				qc.invalidateQueries({ queryKey: ["chapterGitStatus", event.chapterId] });
-				qc.invalidateQueries({ queryKey: ["gitStatus", event.chapterId] });
+				invalidateWorkspaceQueries(qc, event.chapterId);
 				notifications.show({
 					title: t("commitSyncErrorTitle"),
 					message:

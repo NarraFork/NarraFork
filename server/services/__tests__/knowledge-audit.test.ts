@@ -17,7 +17,7 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
 import { db } from "../../db";
-import { knowledgeTags, users } from "../../db/schema";
+import { aclEvents, knowledgeTags, users } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { knowledgeRoutes } from "../../routes/knowledge";
@@ -369,5 +369,65 @@ describe("audit reads", () => {
 		const { events } = await listKnowledgeAclEvents({ actorUserId: adminId, limit: 100 });
 		expect(events.length).toBeGreaterThan(0);
 		expect(events.every((e) => e.actorUserId === adminId)).toBe(true);
+	});
+});
+
+describe("audit rows live in the unified acl_events table", () => {
+	test("a knowledge grant event is physically written to acl_events, prefixed and scoped", async () => {
+		// A fresh subject: the (principal, grantType, scope) tuple is unique, and earlier
+		// tests already hold a confidential clearance for the shared one.
+		const freshSubject = await makeUser("user", "audit-unified");
+		const grant = await knowledgeAcl.createGrant(
+			{
+				principalType: "user",
+				principalId: freshSubject,
+				grantType: "clearance",
+				clearanceLevel: "confidential",
+			},
+			{ userId: adminId, role: "admin" },
+		);
+		await settle();
+
+		// Read the raw table, not the service: the point is WHERE the row landed.
+		const row = await db.query.aclEvents.findFirst({
+			where: (e, { eq: eqq }) => eqq(e.scopeId, grant.id),
+		});
+		expect(row).toBeDefined();
+		// Stored with the domain prefix so one table can hold every domain's events...
+		expect(row?.eventType).toBe("knowledge_grant_added");
+		expect(row?.scopeType).toBe("knowledge_grant");
+		expect(row?.actorUserId).toBe(adminId);
+		expect(row?.actorRole).toBe("admin");
+		expect(row?.subjectId).toBe(freshSubject);
+		// ...while the knowledge-facing API keeps reporting the unprefixed vocabulary.
+		const reported = await latestFor(grant.id);
+		expect(reported?.eventType).toBe("grant_added");
+		expect(reported?.targetType).toBe("grant");
+		expect(reported?.targetId).toBe(grant.id);
+	});
+
+	test("events from other ACL domains never surface in the knowledge audit view", async () => {
+		// A project membership change writes to the same table now. Leaking it into the
+		// knowledge audit page would disclose project structure to a knowledge admin.
+		const foreignId = generateId();
+		await db.insert(aclEvents).values({
+			id: foreignId,
+			actorUserId: adminId,
+			actorRole: "admin",
+			eventType: "project_members_changed",
+			subjectType: "user",
+			subjectId: subjectId,
+			scopeType: "project",
+			scopeId: generateId(),
+			outcome: "granted",
+			detailJson: null,
+			createdAt: new Date().toISOString(),
+		});
+
+		const { events } = await listKnowledgeAclEvents({ limit: 100 });
+		expect(events.some((e) => e.id === foreignId)).toBe(false);
+		// And filtering by that actor still excludes it, so the filter is not the only guard.
+		const byActor = await listKnowledgeAclEvents({ actorUserId: adminId, limit: 100 });
+		expect(byActor.events.some((e) => e.id === foreignId)).toBe(false);
 	});
 });

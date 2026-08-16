@@ -276,12 +276,18 @@ describe("explicit Dynamic Spec goal continuation", () => {
 			),
 		);
 		expect(blockedContinuationMessages).toHaveLength(1);
-		expect(blockedContinuationMessages[0]?.contentText).toContain(
-			"add a concrete actionable unblock task",
-		);
-		expect(blockedContinuationMessages[0]?.contentText).toContain(
-			"do not end the turn with another blocker explanation",
-		);
+		const blockedText = blockedContinuationMessages[0]?.contentText ?? "";
+		// The self-clearable path is carried by the shared blocked-task rule, which this
+		// prompt embeds rather than restating.
+		expect(blockedText).toContain("add a concrete actionable unblock task");
+		// It must ALSO name asking the user as a legitimate way to end the turn. Without
+		// this, a task blocked ON THE USER has no legal exit and the model loops: one real
+		// session was nudged 37 times over three hours on a task whose title said the user
+		// had to run it.
+		expect(blockedText).toContain("AskUserQuestion");
+		// And it must identify itself as system-generated rather than the user speaking, so
+		// a restated task is not read as the user insisting the work is unfinished.
+		expect(blockedText).toContain("not the user speaking");
 		expect(providerCalls).toHaveLength(1);
 
 		closeNarrator(narratorId);

@@ -160,6 +160,8 @@
 		"offRulerChaptersDesc": "Their starting commit is outside the loaded part of the timeline, so there is no tick to place them on.",
 		"loadOlderCommits": "Load older commits",
 		"loadingOlderCommits": "Loading older commits…",
-		"offRulerChaptersExhausted": "The whole timeline is loaded, so these chapters start from commits that are not on this branch. Open them from the story network view instead."
+		"offRulerChaptersExhausted": "The whole timeline is loaded and their starting commits still could not be located. Open these chapters from the chapter list or search.",
+		"rewrittenAnchorChapters": "{{count}} chapter(s) shown at their fork point: {{titles}}",
+		"rewrittenAnchorChaptersDesc": "A rebase or squash-merge rewrote the commit they record as their start, so it is no longer on this branch. They are drawn where they diverged from trunk, which is an approximate position."
 	}
 }

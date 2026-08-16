@@ -38,6 +38,7 @@ import { logger } from "@server/lib/logger";
 import type { JsonValue } from "@server/lib/plugins/protocol";
 import { pluginSearchChannelId } from "@server/lib/search/settings";
 import type { SearchChannelResult, SearchRequest } from "@server/lib/search/types";
+import type { ProviderHostHintsContext } from "./plugin-provider-adapter-factory";
 import { providerSecretKey } from "./plugin-provider-config-service";
 import type { PluginProviderRegistry } from "./plugin-provider-registry";
 import type { ProviderHostHints, ProviderSearchResult } from "./plugin-provider-rpc";
@@ -122,9 +123,10 @@ export interface PluginSearchRegistryOptions {
 	}) => Promise<SearchRpcClientLike>;
 	/**
 	 * Resolve host-provided hints (proxy URL, concurrency budget) for search requests.
-	 * Uses the same resolver as the adapter factory so all plugin paths share one policy.
+	 * Uses the same resolver as the adapter factory so all plugin paths share one policy,
+	 * including the per-provider proxy override.
 	 */
-	resolveHostHints?: () => ProviderHostHints | undefined;
+	resolveHostHints?: (context: ProviderHostHintsContext) => ProviderHostHints | undefined;
 }
 
 export class PluginSearchRegistryError extends Error {
@@ -248,7 +250,12 @@ export class PluginSearchRegistry {
 			providerTypeId: provider.providerTypeId,
 			providerInstanceId: provider.providerInstanceId,
 		});
-		const hostHints = this.options.resolveHostHints?.();
+		// A search source authenticates as its bound provider, so it must also route through
+		// that provider's proxy — otherwise search would bypass a policy chat obeys.
+		const hostHints = this.options.resolveHostHints?.({
+			pluginId: entry.pluginId,
+			providerInstanceId: provider.providerInstanceId,
+		});
 		const result = await client.search(
 			{
 				providerTypeId: provider.providerTypeId,

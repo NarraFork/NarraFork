@@ -56,7 +56,8 @@ import {
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
-import { useKnowledgeNotifications, useReviewInboxCount } from "../hooks/useKnowledge";
+import { useChatUnreadLive } from "../hooks/useChat";
+import { useKnowledgeNotifications } from "../hooks/useKnowledge";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useNavLayout } from "../hooks/useNavLayout";
 import { useOutputStats } from "../hooks/useOutputStats";
@@ -100,6 +101,7 @@ import { NavOverflowMenu } from "./nav/NavOverflowMenu";
 import { NavUserMenu } from "./nav/NavUserMenu";
 import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
+import { useNavBadges } from "./nav/use-nav-badges";
 import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
@@ -344,11 +346,13 @@ function AuthenticatedLayout() {
 	// count stays live on every page; kept fresh by the WS listener below rather than
 	// by polling.
 	useKnowledgeNotifications();
-	const knowledgeInbox = useReviewInboxCount();
-	const knowledgeInboxCount = knowledgeInbox.data?.count ?? 0;
-	const knowledgeInboxLabel = knowledgeInbox.data?.capped
-		? `${knowledgeInboxCount}+`
-		: String(knowledgeInboxCount);
+	// Keeps the chat badge live: the per-user `chat:unread_changed` push reaches this
+	// client even for rooms it has not subscribed to, so the count is correct without
+	// polling and without opening the conversation.
+	useChatUnreadLive();
+	// Every nav badge is resolved by one shared hook so a new badge key cannot be
+	// silently ignored by one of the two surfaces that paint the nav.
+	const resolveNavBadge = useNavBadges();
 	const legacyFastModeDefaultMigrationRef = useRef(false);
 
 	useEffect(() => {
@@ -934,8 +938,7 @@ function AuthenticatedLayout() {
 								const def = secondaryNavDefs.get(item.id);
 								if (!def) return null;
 								const Icon = def.icon;
-								const badgeCount = def.badge === "knowledgeReviewInbox" ? knowledgeInboxCount : 0;
-								const badgeLabel = def.badge === "knowledgeReviewInbox" ? knowledgeInboxLabel : "";
+								const { count: badgeCount, label: badgeLabel } = resolveNavBadge(def.badge);
 								return (
 									<Tooltip
 										key={item.id}

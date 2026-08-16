@@ -361,7 +361,7 @@ function onEntryDrifted(event: { entryId: string; driftedUserIds: string[] }): v
  */
 function onAclChanged(event: {
 	userIds: string[];
-	reason: "grant_added" | "grant_removed" | "user_acl_replaced";
+	reason: "grant_added" | "grant_removed" | "user_acl_replaced" | "project_gate_changed";
 }): void {
 	for (const userId of event.userIds) {
 		deliver(userId, { type: "knowledge:library_changed", reason: "acl_changed" });

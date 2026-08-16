@@ -50,5 +50,11 @@
 	"attributionHasExternal": "Also has external/terminal changes",
 	"attributionExternal": "External",
 	"attributionUnknown": "Unknown",
-	"attributionUnnamed": "Untitled session"
+	"attributionUnnamed": "Untitled session",
+	"attributionDeletedSession": "Deleted session",
+	"attributionSubagentUnnamed": "Untitled {{type}} subagent",
+	"attributionSubagentDetail": "{{name}} ({{type}} subagent)",
+	"attributionSubagentDetailWithParent": "{{name}} ({{type}} subagent of {{parent}})",
+	"attributionImprecise": "Includes shell changes whose scope was not verified; attribution may be incomplete",
+	"attributionWindowTruncated": "Attribution not fully loaded — older changes fall outside the query window"
 }

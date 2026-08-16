@@ -167,10 +167,29 @@ describe("resolveExitPlanModeInput — path-reference rejection", async () => {
 		expect(result.ok).toBe(false);
 	});
 
-	it("rejects a `.narrafork/plan-*.md` short reference", async () => {
+	it("rejects a legacy `.narrafork/plan-*.md` short reference", async () => {
 		setActive(undefined);
 		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, {
 			inline_plan: ".narrafork/plan-happy-cat.md",
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	it("rejects a `.narrafork/plans/plan-*.md` short reference", async () => {
+		// The detector's `plan-` prefix no longer sits directly under `.narrafork/`;
+		// without the optional `plans/` segment the current path slipped through and
+		// a bare path was accepted as the plan body.
+		setActive(undefined);
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, {
+			inline_plan: ".narrafork/plans/plan-happy-cat.md",
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	it("rejects a Windows-separated plans reference", async () => {
+		setActive(undefined);
+		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, {
+			inline_plan: ".narrafork\\plans\\plan-happy-cat.md",
 		});
 		expect(result.ok).toBe(false);
 	});
@@ -203,8 +222,8 @@ describe("resolveExitPlanModeInput — path-reference rejection", async () => {
  */
 describe("resolveExitPlanModeInput — inline blocked by a written plan file", async () => {
 	function writeDesignatedPlan(planFileId: string, body: string) {
-		mkdirSync(join(cwd, ".narrafork"), { recursive: true });
-		writeFileSync(join(cwd, ".narrafork", `plan-${planFileId}.md`), body, "utf-8");
+		mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+		writeFileSync(join(cwd, ".narrafork", "plans", `plan-${planFileId}.md`), body, "utf-8");
 	}
 
 	const INLINE = "## Inline plan\n\nA complete inline body.";
@@ -219,7 +238,7 @@ describe("resolveExitPlanModeInput — inline blocked by a written plan file", a
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
 			expect(result.message).toContain('mode="file"');
-			expect(result.message).toContain(`.narrafork/plan-${planFileId}.md`);
+			expect(result.message).toContain(`.narrafork/plans/plan-${planFileId}.md`);
 		}
 		// Neither body is submitted — the file content must not be silently
 		// substituted for the inline declaration either.
@@ -300,7 +319,7 @@ describe("resolveExitPlanModeInput — inline blocked by a written plan file", a
 		// A legacy executor rejects file-mode submission outright, so a probe failure
 		// must not also close the inline path — that would strand the narrator.
 		setActive("conflict-legacy");
-		const remotePath = "/remote/work/.narrafork/plan-conflict-legacy.md";
+		const remotePath = "/remote/work/.narrafork/plans/plan-conflict-legacy.md";
 		const { backend, calls } = makeFakeBackend(
 			{
 				[remotePath]: {
@@ -333,7 +352,7 @@ describe("resolveExitPlanModeInput — inline blocked by a written plan file", a
 				resolvedFilePath: remotePath,
 				selectionSource: "explicit",
 			},
-			".narrafork/plan-conflict-legacy.md",
+			".narrafork/plans/plan-conflict-legacy.md",
 		);
 
 		expect(result.ok).toBe(true);
@@ -363,8 +382,8 @@ describe("resolveExitPlanModeInput — inline blocked by a written plan file", a
 describe("resolveExitPlanModeInput — declared mode", async () => {
 	/** Write the designated plan file so a wrong fallback would be observable. */
 	function writeDesignatedPlan(planFileId: string, body: string) {
-		mkdirSync(join(cwd, ".narrafork"), { recursive: true });
-		writeFileSync(join(cwd, ".narrafork", `plan-${planFileId}.md`), body, "utf-8");
+		mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+		writeFileSync(join(cwd, ".narrafork", "plans", `plan-${planFileId}.md`), body, "utf-8");
 	}
 
 	it('rejects mode="inline" with no plan body instead of reading the plan file', async () => {
@@ -462,8 +481,8 @@ describe("resolveExitPlanModeInput — file resolution precedence", async () => 
 		const planFileId = "happy-cat";
 		setActive(planFileId);
 		const fileContent = "## File Plan\n\nThis is the real plan from disk.";
-		mkdirSync(join(cwd, ".narrafork"), { recursive: true });
-		writeFileSync(join(cwd, ".narrafork", `plan-${planFileId}.md`), fileContent, "utf-8");
+		mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+		writeFileSync(join(cwd, ".narrafork", "plans", `plan-${planFileId}.md`), fileContent, "utf-8");
 
 		const result = await resolveExitPlanModeInput(NARRATOR_ID, cwd, {
 			inline_plan: "plan_path: E:/whatever.md",
@@ -472,7 +491,7 @@ describe("resolveExitPlanModeInput — file resolution precedence", async () => 
 		expect(result.ok).toBe(true);
 		expect(result.resolvedFromFile).toBe(true);
 		expect(result.input.plan).toBe(fileContent);
-		expect(result.input._planFile).toBe(`.narrafork/plan-${planFileId}.md`);
+		expect(result.input._planFile).toBe(`.narrafork/plans/plan-${planFileId}.md`);
 		// Inline field dropped in favor of the file body.
 		expect("inline_plan" in result.input).toBe(false);
 	});
@@ -481,7 +500,7 @@ describe("resolveExitPlanModeInput — file resolution precedence", async () => 
 		// A written plan file IS the artifact the user must review. Accepting an
 		// inline body alongside it would show one artifact and silently discard the
 		// other, so the inline submission is refused rather than either one winning.
-		const remotePath = "/remote/work/.narrafork/plan-inline-choice.md";
+		const remotePath = "/remote/work/.narrafork/plans/plan-inline-choice.md";
 		setActive("inline-choice");
 		const { backend, calls } = makeFakeBackend({
 			[remotePath]: {
@@ -509,7 +528,7 @@ describe("resolveExitPlanModeInput — file resolution precedence", async () => 
 				resolvedFilePath: remotePath,
 				selectionSource: "explicit",
 			},
-			".narrafork/plan-inline-choice.md",
+			".narrafork/plans/plan-inline-choice.md",
 		);
 
 		expect(result.ok).toBe(false);
@@ -523,8 +542,8 @@ describe("resolveExitPlanModeInput — file resolution precedence", async () => 
 	});
 
 	it("does not read a residual plan file from a previous identity", async () => {
-		const oldPath = "/remote/work/.narrafork/plan-same-prefix--old.md";
-		const newPath = "/remote/work/.narrafork/plan-same-prefix--new.md";
+		const oldPath = "/remote/work/.narrafork/plans/plan-same-prefix--old.md";
+		const newPath = "/remote/work/.narrafork/plans/plan-same-prefix--new.md";
 		setActive("same-prefix--new");
 		const { backend, calls } = makeFakeBackend({
 			[oldPath]: {
@@ -551,7 +570,7 @@ describe("resolveExitPlanModeInput — file resolution precedence", async () => 
 				resolvedFilePath: newPath,
 				selectionSource: "explicit",
 			},
-			`.narrafork/plan-same-prefix--new.md`,
+			`.narrafork/plans/plan-same-prefix--new.md`,
 		);
 
 		expect(result.ok).toBe(true);
@@ -563,8 +582,8 @@ describe("resolveExitPlanModeInput — file resolution precedence", async () => 
 describe("resolveExitPlanModeInput — strict designated path", async () => {
 	it("rejects a hidden custom plan_file_path in strict mode", async () => {
 		setActive("strict-plan");
-		mkdirSync(join(cwd, ".narrafork"), { recursive: true });
-		writeFileSync(join(cwd, ".narrafork", "plan-strict-plan.md"), "# Designated plan");
+		mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+		writeFileSync(join(cwd, ".narrafork", "plans", "plan-strict-plan.md"), "# Designated plan");
 		writeFileSync(join(cwd, "alternate.md"), "# Alternate plan");
 
 		const result = await resolveExitPlanModeInput(
@@ -575,7 +594,7 @@ describe("resolveExitPlanModeInput — strict designated path", async () => {
 			false,
 			undefined,
 			undefined,
-			".narrafork/plan-strict-plan.md",
+			".narrafork/plans/plan-strict-plan.md",
 		);
 
 		expect(result.ok).toBe(false);
@@ -584,18 +603,18 @@ describe("resolveExitPlanModeInput — strict designated path", async () => {
 
 	it("accepts the hidden path only when it names the designated strict plan file", async () => {
 		setActive("strict-plan");
-		mkdirSync(join(cwd, ".narrafork"), { recursive: true });
-		writeFileSync(join(cwd, ".narrafork", "plan-strict-plan.md"), "# Designated plan");
+		mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+		writeFileSync(join(cwd, ".narrafork", "plans", "plan-strict-plan.md"), "# Designated plan");
 
 		const result = await resolveExitPlanModeInput(
 			NARRATOR_ID,
 			cwd,
-			{ plan_file_path: ".narrafork/plan-strict-plan.md" },
+			{ plan_file_path: ".narrafork/plans/plan-strict-plan.md" },
 			"en",
 			false,
 			undefined,
 			undefined,
-			".narrafork/plan-strict-plan.md",
+			".narrafork/plans/plan-strict-plan.md",
 		);
 
 		expect(result.ok).toBe(true);
@@ -636,13 +655,13 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 		deviceId: "remote-plan-test",
 		backendKind: "remote",
 		cwd: "/remote/work",
-		resolvedFilePath: "/remote/work/.narrafork/plan-remote-plan.md",
+		resolvedFilePath: "/remote/work/.narrafork/plans/plan-remote-plan.md",
 		selectionSource: "explicit",
 	};
 
 	it("reads the designated plan from the frozen remote backend", async () => {
 		setActive("remote-plan");
-		const remotePath = "/remote/work/.narrafork/plan-remote-plan.md";
+		const remotePath = "/remote/work/.narrafork/plans/plan-remote-plan.md";
 		const { backend, calls } = makeFakeBackend({
 			[remotePath]: {
 				stat: { isFile: true, isDirectory: false, size: 22 },
@@ -662,13 +681,13 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 			false,
 			backend,
 			remoteTarget,
-			".narrafork/plan-remote-plan.md",
+			".narrafork/plans/plan-remote-plan.md",
 		);
 
 		expect(result.ok).toBe(true);
 		if (result.ok) {
 			expect(result.input.plan).toBe("# Remote plan\n\nShip it.");
-			expect(result.input._planFile).toBe(".narrafork/plan-remote-plan.md");
+			expect(result.input._planFile).toBe(".narrafork/plans/plan-remote-plan.md");
 		}
 		expect(calls.stat).toEqual([remotePath]);
 		expect(calls.read).toEqual([remotePath]);
@@ -677,7 +696,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 
 	it("requires an executor upgrade for a legacy file-based plan", async () => {
 		setActive("legacy-remote-plan");
-		const remotePath = "/remote/work/.narrafork/plan-legacy-remote-plan.md";
+		const remotePath = "/remote/work/.narrafork/plans/plan-legacy-remote-plan.md";
 		const { backend, calls } = makeFakeBackend(
 			{
 				[remotePath]: {
@@ -704,7 +723,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 			false,
 			backend,
 			{ ...remoteTarget, resolvedFilePath: remotePath },
-			`.narrafork/plan-legacy-remote-plan.md`,
+			`.narrafork/plans/plan-legacy-remote-plan.md`,
 		);
 
 		expect(result.ok).toBe(false);
@@ -717,7 +736,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 
 	it("allows a complete inline plan on a legacy executor without filesystem RPCs", async () => {
 		setActive("legacy-inline-plan");
-		const remotePath = "/remote/work/.narrafork/plan-legacy-inline-plan.md";
+		const remotePath = "/remote/work/.narrafork/plans/plan-legacy-inline-plan.md";
 		const { backend, calls } = makeFakeBackend(
 			{},
 			{
@@ -736,7 +755,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 			false,
 			backend,
 			{ ...remoteTarget, resolvedFilePath: remotePath },
-			".narrafork/plan-legacy-inline-plan.md",
+			".narrafork/plans/plan-legacy-inline-plan.md",
 		);
 
 		expect(result.ok).toBe(true);
@@ -748,7 +767,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 
 	it("requires atomic-read support even when canonical fs.stat is available", async () => {
 		setActive("stat-only-plan");
-		const remotePath = "/remote/work/.narrafork/plan-stat-only-plan.md";
+		const remotePath = "/remote/work/.narrafork/plans/plan-stat-only-plan.md";
 		const { backend, calls } = makeFakeBackend(
 			{
 				[remotePath]: {
@@ -771,7 +790,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 			false,
 			backend,
 			{ ...remoteTarget, resolvedFilePath: remotePath },
-			".narrafork/plan-stat-only-plan.md",
+			".narrafork/plans/plan-stat-only-plan.md",
 		);
 
 		expect(result.ok).toBe(false);
@@ -780,7 +799,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 		expect(calls.read).toEqual([]);
 	});
 
-	it("fails closed before reading an external path without a whitelist", async () => {
+	it("refuses a custom path outside the plan directory before touching the filesystem", async () => {
 		setActive("remote-plan");
 		const { backend, calls } = makeFakeBackend({
 			"/remote/outside/plan.md": {
@@ -806,11 +825,13 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 		);
 
 		expect(result.ok).toBe(false);
-		expect(calls.stat).toEqual(["/remote/outside/plan.md"]);
+		if (!result.ok) expect(result.message).toContain(".narrafork/plans");
+		// The lexical directory check runs before any target metadata is observed.
+		expect(calls.stat).toEqual([]);
 		expect(calls.read).toEqual([]);
 	});
 
-	it("allows an external Markdown plan only through a read whitelist", async () => {
+	it("keeps refusing an external plan path even when a read whitelist allows it", async () => {
 		setActive("remote-plan");
 		const remotePath = "/remote/outside/plan.md";
 		const { backend, calls } = makeFakeBackend({
@@ -840,15 +861,82 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 			},
 		);
 
+		// A read whitelist governs WHAT may be read, not where a plan may live: the
+		// plan directory constraint is independent and still applies.
+		expect(result.ok).toBe(false);
+		expect(calls.stat).toEqual([]);
+		expect(calls.read).toEqual([]);
+	});
+
+	it("accepts a custom plan file inside the plan directory", async () => {
+		setActive("remote-plan");
+		const remotePath = "/remote/work/.narrafork/plans/design.md";
+		const { backend, calls } = makeFakeBackend({
+			[remotePath]: {
+				stat: { isFile: true, isDirectory: false, size: 6 },
+				read: {
+					bytes: new TextEncoder().encode("# plan"),
+					truncated: false,
+					totalSize: 6,
+				},
+			},
+		});
+		const target = { ...remoteTarget, resolvedFilePath: remotePath };
+
+		const result = await resolveExitPlanModeInput(
+			NARRATOR_ID,
+			cwd,
+			{ plan_file_path: remotePath },
+			"en",
+			true,
+			backend,
+			target,
+			undefined,
+		);
+
 		expect(result.ok).toBe(true);
-		expect(calls.stat).toEqual([remotePath]);
+		if (result.ok) expect(result.input.plan).toBe("# plan");
 		expect(calls.read).toEqual([remotePath]);
-		expect(calls.expectedResolvedPath).toEqual([remotePath]);
+	});
+
+	it("refuses a plan-directory path whose canonical target escapes the directory", async () => {
+		setActive("remote-plan");
+		const linkedPath = "/remote/work/.narrafork/plans/linked.md";
+		const canonicalPath = "/remote/work/docs/plan.md";
+		const { backend, calls } = makeFakeBackend({
+			[linkedPath]: {
+				stat: { isFile: true, isDirectory: false, size: 6, resolvedPath: canonicalPath },
+			},
+			[canonicalPath]: {
+				stat: { isFile: true, isDirectory: false, size: 6 },
+				read: {
+					bytes: new TextEncoder().encode("# plan"),
+					truncated: false,
+					totalSize: 6,
+				},
+			},
+		});
+
+		const result = await resolveExitPlanModeInput(
+			NARRATOR_ID,
+			cwd,
+			{ plan_file_path: linkedPath },
+			"en",
+			true,
+			backend,
+			{ ...remoteTarget, resolvedFilePath: linkedPath },
+			undefined,
+		);
+
+		// The lexical check passed; only the canonical path exposes the escape.
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.message).toContain(".narrafork/plans");
+		expect(calls.read).toEqual([]);
 	});
 
 	it("rejects blacklist, directories, and truncated files before exposing content", async () => {
 		setActive("remote-plan");
-		const remotePath = "/remote/outside/plan.md";
+		const remotePath = "/remote/work/.narrafork/plans/plan.md";
 		const { backend, calls } = makeFakeBackend({
 			[remotePath]: {
 				stat: { isFile: false, isDirectory: true, size: 0 },
@@ -865,14 +953,16 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 			target,
 			undefined,
 			{
-				whitelistDirs: [{ path: "/remote/outside", accessLevel: "readOnly", enabled: true }],
-				blacklistDirs: [{ path: "/remote/outside", denyLevel: "denyAll", enabled: true }],
+				whitelistDirs: [],
+				blacklistDirs: [
+					{ path: "/remote/work/.narrafork/plans", denyLevel: "denyAll", enabled: true },
+				],
 			},
 		);
 		expect(denied.ok).toBe(false);
 		expect(calls.read).toEqual([]);
 
-		const truncatedPath = "/remote/work/plan.md";
+		const truncatedPath = "/remote/work/.narrafork/plans/truncated.md";
 		const truncated = makeFakeBackend({
 			[truncatedPath]: {
 				stat: { isFile: true, isDirectory: false, size: 4 },
@@ -897,7 +987,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 	it("rejects a custom path that disagrees with the frozen execution target", async () => {
 		setActive("remote-plan");
 		const { backend, calls } = makeFakeBackend({
-			"/remote/outside/other.md": {
+			"/remote/work/.narrafork/plans/other.md": {
 				stat: { isFile: true, isDirectory: false, size: 6 },
 			},
 		});
@@ -905,16 +995,13 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 		const result = await resolveExitPlanModeInput(
 			NARRATOR_ID,
 			cwd,
-			{ plan_file_path: "/remote/outside/other.md" },
+			{ plan_file_path: "/remote/work/.narrafork/plans/other.md" },
 			"en",
 			true,
 			backend,
 			remoteTarget,
 			undefined,
-			{
-				whitelistDirs: [{ path: "/remote/outside", accessLevel: "readOnly", enabled: true }],
-				blacklistDirs: [],
-			},
+			{ whitelistDirs: [], blacklistDirs: [] },
 		);
 
 		expect(result.ok).toBe(false);
@@ -923,8 +1010,8 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 	});
 
 	it("re-authorizes a remote symlink against its canonical target", async () => {
-		const linkedPath = "/remote/work/linked-plan.md";
-		const canonicalPath = "/remote/outside/secret/plan.md";
+		const linkedPath = "/remote/work/.narrafork/plans/linked-plan.md";
+		const canonicalPath = "/remote/work/.narrafork/plans/secret/plan.md";
 		const { backend, calls } = makeFakeBackend({
 			[linkedPath]: {
 				stat: {
@@ -954,8 +1041,10 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 			{ ...remoteTarget, resolvedFilePath: linkedPath },
 			undefined,
 			{
-				whitelistDirs: [{ path: "/remote/outside", accessLevel: "readOnly", enabled: true }],
-				blacklistDirs: [{ path: "/remote/outside/secret", denyLevel: "denyAll", enabled: true }],
+				whitelistDirs: [],
+				blacklistDirs: [
+					{ path: "/remote/work/.narrafork/plans/secret", denyLevel: "denyAll", enabled: true },
+				],
 			},
 		);
 
@@ -968,13 +1057,14 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 		try {
 			const secretDir = join(outside, "secret");
 			mkdirSync(secretDir, { recursive: true });
+			mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
 			writeFileSync(join(secretDir, "plan.md"), "# Escaped plan");
-			symlinkSync(join(secretDir, "plan.md"), join(cwd, "linked-plan.md"));
+			symlinkSync(join(secretDir, "plan.md"), join(cwd, ".narrafork", "plans", "linked-plan.md"));
 
 			const result = await resolveExitPlanModeInput(
 				NARRATOR_ID,
 				cwd,
-				{ plan_file_path: "linked-plan.md" },
+				{ plan_file_path: ".narrafork/plans/linked-plan.md" },
 				"en",
 				true,
 				undefined,

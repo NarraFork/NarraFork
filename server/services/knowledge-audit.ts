@@ -18,11 +18,12 @@
  *  - **Bounded reads.** Listing is admin-only and cursor-paginated; `detailJson` is small by
  *    construction so there is no large-field concern.
  */
-import { and, desc, eq, lt, or } from "drizzle-orm";
+import { and, eq, lt, or, sql } from "drizzle-orm";
 import { db } from "../db";
-import { knowledgeAclEvents } from "../db/schema";
-import { generateId } from "../lib/id";
-import { logger } from "../lib/logger";
+import { aclEvents, type knowledgeAclEvents } from "../db/schema";
+// Row generation, fire-and-forget semantics and failure logging now live in the shared
+// audit implementation; this module only translates the knowledge vocabulary.
+import { recordAclEvent } from "./acl/acl-audit";
 
 /**
  * The fixed vocabulary used by the writers. The column is free text so a new ACL surface can be
@@ -68,27 +69,73 @@ export interface KnowledgeAclAuditInput {
  * make the audited operation wait on the audit write.
  */
 export function recordKnowledgeAclEvent(input: KnowledgeAclAuditInput): void {
-	void db
-		.insert(knowledgeAclEvents)
-		.values({
-			id: generateId(),
-			actorUserId: input.actorUserId ?? null,
-			actorRole: input.actorRole ?? null,
-			eventType: input.eventType,
-			subjectType: input.subjectType ?? null,
-			subjectId: input.subjectId ?? null,
-			targetType: input.targetType ?? null,
-			targetId: input.targetId ?? null,
-			detailJson: input.detail ?? null,
-			createdAt: new Date().toISOString(),
-		})
-		.then(undefined, (err: unknown) => {
-			// Log loudly (an audit gap matters) but never propagate.
-			logger.error("Failed to record knowledge ACL audit event", {
-				eventType: input.eventType,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		});
+	// Writes to the unified `acl_events` table so project, narrator and knowledge
+	// authorization changes are one auditable stream — "who granted whom what, and
+	// when" is asked across resources, not per resource.
+	//
+	// The signature is unchanged, and the knowledge vocabulary is preserved: the
+	// event type keeps a `knowledge_` prefix and the old `targetType`/`targetId` pair
+	// maps onto the generic `scopeType`/`scopeId`. Fire-and-forget and the redaction
+	// rules come from the shared implementation.
+	recordAclEvent({
+		actor: input.actorUserId
+			? { userId: input.actorUserId, isAdmin: input.actorRole === "admin" }
+			: null,
+		eventType: prefixKnowledgeEventType(input.eventType),
+		subject:
+			input.subjectType && input.subjectId
+				? { type: input.subjectType, id: input.subjectId }
+				: undefined,
+		scopeType: mapTargetToScopeType(input.targetType),
+		scopeId: input.targetId ?? null,
+		outcome: outcomeOf(input.eventType),
+		detail: input.detail ?? undefined,
+	});
+}
+
+/**
+ * Keep knowledge event types distinguishable now that one table holds every domain's
+ * events. Already-prefixed values pass through so callers can migrate gradually.
+ */
+function prefixKnowledgeEventType(eventType: string): string {
+	return eventType.startsWith("knowledge_") ? eventType : `knowledge_${eventType}`;
+}
+
+/**
+ * Map the knowledge target vocabulary onto generic scopes.
+ *
+ * `grant` has no scope of its own in the unified model — a grant IS the thing being
+ * recorded — so it is filed under the knowledge collection space, which is where
+ * knowledge grants live. The grant id remains in `scopeId`, so nothing is lost.
+ */
+function mapTargetToScopeType(targetType: string | null | undefined): string {
+	switch (targetType) {
+		case "entry":
+			return "knowledge_entry";
+		case "collection":
+			return "knowledge_collection";
+		case "grant":
+			return "knowledge_grant";
+		default:
+			return "knowledge";
+	}
+}
+
+/**
+ * Derive the generic outcome from the knowledge event type.
+ *
+ * The unified table records an outcome so events from every domain can be filtered
+ * the same way ("show me everything revoked last week"). Unknown types report
+ * `updated`, the least specific value, rather than guessing at a grant or a revoke.
+ */
+function outcomeOf(
+	eventType: string,
+): "granted" | "revoked" | "replaced" | "transferred" | "updated" {
+	if (eventType.includes("removed") || eventType.includes("deleted")) return "revoked";
+	if (eventType.includes("bulk_added") || eventType.includes("added")) return "granted";
+	if (eventType.includes("replaced")) return "replaced";
+	if (eventType.includes("transferred")) return "transferred";
+	return "updated";
 }
 
 /** Page size cap for the audit list. */
@@ -118,37 +165,71 @@ export async function listKnowledgeAclEvents(opts: ListKnowledgeAclEventsOptions
 	nextCursor: { createdAt: string; id: string } | null;
 }> {
 	const limit = Math.min(Math.max(opts.limit ?? 50, 1), AUDIT_LIST_MAX);
-	const conds = [];
-	if (opts.eventType) conds.push(eq(knowledgeAclEvents.eventType, opts.eventType));
-	if (opts.subjectId) conds.push(eq(knowledgeAclEvents.subjectId, opts.subjectId));
-	if (opts.targetId) conds.push(eq(knowledgeAclEvents.targetId, opts.targetId));
-	if (opts.actorUserId) conds.push(eq(knowledgeAclEvents.actorUserId, opts.actorUserId));
+	// Reads the unified table but keeps returning the knowledge-shaped rows the admin
+	// UI already renders, so the storage move is invisible to callers. Only knowledge
+	// scopes are considered: this endpoint is the knowledge audit view, and leaking
+	// project membership changes into it would be a disclosure, not a feature.
+	const conds = [sql`${aclEvents.scopeType} LIKE 'knowledge%'`];
+	if (opts.eventType) {
+		conds.push(eq(aclEvents.eventType, prefixKnowledgeEventType(opts.eventType)));
+	}
+	if (opts.subjectId) conds.push(eq(aclEvents.subjectId, opts.subjectId));
+	if (opts.targetId) conds.push(eq(aclEvents.scopeId, opts.targetId));
+	if (opts.actorUserId) conds.push(eq(aclEvents.actorUserId, opts.actorUserId));
 	if (opts.cursorCreatedAt && opts.cursorId) {
-		// Strictly "older than the cursor": either an earlier timestamp, or the same timestamp with
-		// a smaller id (the tie-breaker that makes the order total).
+		// Strictly "older than the cursor": either an earlier timestamp, or the same
+		// timestamp with a smaller id (the tie-breaker that makes the order total).
 		conds.push(
 			or(
-				lt(knowledgeAclEvents.createdAt, opts.cursorCreatedAt),
-				and(
-					eq(knowledgeAclEvents.createdAt, opts.cursorCreatedAt),
-					lt(knowledgeAclEvents.id, opts.cursorId),
-				),
-			),
+				lt(aclEvents.createdAt, opts.cursorCreatedAt),
+				and(eq(aclEvents.createdAt, opts.cursorCreatedAt), lt(aclEvents.id, opts.cursorId)),
+			) as never,
 		);
 	}
-	const rows = await db.query.knowledgeAclEvents.findMany({
-		where: conds.length > 0 ? and(...conds) : undefined,
-		orderBy: [desc(knowledgeAclEvents.createdAt), desc(knowledgeAclEvents.id)],
+
+	const rows = await db.query.aclEvents.findMany({
+		where: and(...conds),
+		orderBy: (e, { desc }) => [desc(e.createdAt), desc(e.id)],
 		limit: limit + 1,
 	});
+
 	const hasMore = rows.length > limit;
-	const events = hasMore ? rows.slice(0, limit) : rows;
-	const last = events[events.length - 1];
+	const page = hasMore ? rows.slice(0, limit) : rows;
+	const last = page.at(-1);
 	return {
-		events,
+		events: page.map(
+			(row) =>
+				({
+					id: row.id,
+					actorUserId: row.actorUserId,
+					actorRole: row.actorRole,
+					// Reported without the storage prefix, so the UI's vocabulary is unchanged.
+					eventType: row.eventType.replace(/^knowledge_/, ""),
+					subjectType: row.subjectType,
+					subjectId: row.subjectId,
+					targetType: scopeTypeToTarget(row.scopeType),
+					targetId: row.scopeId,
+					detailJson: row.detailJson,
+					createdAt: row.createdAt,
+				}) as typeof knowledgeAclEvents.$inferSelect,
+		),
 		hasMore,
 		nextCursor: hasMore && last ? { createdAt: last.createdAt, id: last.id } : null,
 	};
+}
+
+/** Inverse of {@link mapTargetToScopeType}, for reporting. */
+function scopeTypeToTarget(scopeType: string): "entry" | "collection" | "grant" | null {
+	switch (scopeType) {
+		case "knowledge_entry":
+			return "entry";
+		case "knowledge_collection":
+			return "collection";
+		case "knowledge_grant":
+			return "grant";
+		default:
+			return null;
+	}
 }
 
 export const knowledgeAudit = {

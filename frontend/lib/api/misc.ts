@@ -989,6 +989,14 @@ export const miscApi = {
 			content: string | null;
 			filePath: string | null;
 			candidates: Array<{ path: string; exists: boolean }>;
+			/**
+			 * `content` is a byte-capped prefix, not the whole file. Saving it would write
+			 * the prefix over the original and destroy everything past the cut, so the
+			 * editor must refuse to save while this is true.
+			 */
+			truncated?: boolean;
+			/** Real size on disk, for telling the reader what they are not seeing. */
+			totalBytes?: number;
 		}>("/routines/global-prompt"),
 	updateGlobalPrompt: (data: { content: string; filePath?: string }) =>
 		request<{ ok: boolean; filePath: string }>("/routines/global-prompt", {

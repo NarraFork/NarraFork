@@ -60,6 +60,15 @@
  * stays fixed and the gap it left closes over 200ms. So collapse emits shifts only,
  * and this asymmetry is deliberate rather than an omission.
  *
+ * ## Rows are not the only thing on the canvas
+ *
+ * The decorative tool-run frames are absolutely positioned SIBLINGS of the rows, sized
+ * from the span of the rows they group. They are keyless and never enter the mounted-row
+ * window, so the row plan cannot see them — and a frame left at its committed size while
+ * its contents animate reads as a border detached from its own content. They get their
+ * own plan (`planFoldFrameMotion`) with the same admission rules and a different
+ * property set; see `FoldFrameMotion` for why that one is allowed to animate layout.
+ *
  * DOM-free by design so it is unit-testable: this module computes WHAT to animate,
  * `vlist-fold-motion.ts` performs it.
  */
@@ -88,6 +97,17 @@ export interface FoldRowGeometry {
 }
 
 /**
+ * Geometry of one absolutely positioned box on the canvas.
+ *
+ * Structurally identical to a row's, and deliberately the same type: the decorative
+ * tool-run frames are laid out from the very same `PretextLayoutIndex` offsets (a
+ * frame's box is `items[first].top → items[last].bottom`), so there is nothing for a
+ * separate shape to express. The alias exists only so a frame plan does not have to
+ * be read as if it described a row.
+ */
+export type FoldBoxGeometry = FoldRowGeometry;
+
+/**
  * The visual instruction for one row, in the frame right after React committed the
  * new geometry.
  *
@@ -101,6 +121,47 @@ export interface FoldRowGeometry {
 export type FoldRowMotion =
 	| { readonly key: string; readonly kind: "shift"; readonly fromOffset: number }
 	| { readonly key: string; readonly kind: "reveal"; readonly fromInsetBottom: number };
+
+/**
+ * The visual instruction for one decorative TOOL-RUN FRAME.
+ *
+ * ## Why frames need their own plan
+ *
+ * A grouping frame is not a row. It is a sibling box on the canvas whose geometry is
+ * derived from the rows it spans (`items[first].top → items[last].bottom`), it carries
+ * no `spec.key`, and it is never part of the mounted-row window. So the row plan above
+ * cannot reach it: `planFoldMotion` only emits motions for keys present in both row
+ * maps, and the controller resolves those keys through `[data-nf-row-key]`. The result
+ * before this existed was the artifact this type fixes — expanding a card inside a run
+ * left the border AT ITS FINAL SIZE from the first frame while the cards inside it were
+ * still 200ms away from arriving, so the frame visibly detached from its contents.
+ *
+ * ## Why this one animates LAYOUT properties, unlike every row motion
+ *
+ * A row's motion is `transform` / `clip-path` on purpose: dozens of rows animate at
+ * once, and a `height` animation on a row could feed back into the measured height
+ * model (CONTRACT §0 rule 2). Neither concern applies here, and the composited
+ * alternative is actively wrong:
+ *
+ *  - `scaleY` on a box whose visible substance IS a 1px border scales that border too,
+ *    so the frame's edges thicken and its radius smears during the transition. That is
+ *    a worse artifact than the jump it would replace.
+ *  - The frame is `position: absolute` + `pointer-events: none` pure decoration. It has
+ *    no in-flow siblings (every row is absolutely positioned too), so animating its
+ *    `top`/`height` cannot reflow anything else and cannot perturb any measured height.
+ *    Nothing reads its box back — `computeToolRunFrames` derives the geometry from the
+ *    layout index, never from the DOM.
+ *  - There are at most a handful of frames in the mounted window, versus ~40 rows.
+ *
+ * `from`/`to` are absolute pixel values rather than deltas so the player stays a dumb
+ * WAAPI edge, and so the final keyframe restates the COMMITTED geometry — meaning a
+ * cancelled animation lands exactly where React already put the element.
+ */
+export interface FoldFrameMotion {
+	readonly key: string;
+	readonly from: FoldBoxGeometry;
+	readonly to: FoldBoxGeometry;
+}
 
 /** What `planFoldMotion` needs to know about the interaction that caused the change. */
 export interface FoldMotionPlanInput {
@@ -161,6 +222,77 @@ export function planFoldMotion(input: FoldMotionPlanInput): FoldRowMotion[] {
 		out.push({ key, kind: "shift", fromOffset: delta });
 	}
 	return out;
+}
+
+/**
+ * Turn a before/after geometry pair into per-FRAME instructions (see FoldFrameMotion).
+ *
+ * Mirrors `planFoldMotion`'s admission rules so a frame can never animate under
+ * conditions its rows would not:
+ *
+ *  - present in BOTH maps, or there is no "from" box to travel from;
+ *  - at least one edge visibly moved, where "visibly" is again VIEWPORT-relative, so
+ *    an anchored rebuild that held the run still on screen animates nothing;
+ *  - both movements within the readable bound, so a frame never slides across a
+ *    distance its own rows refused to.
+ *
+ * Both edges are handled independently because a fold moves them independently: a fold
+ * ABOVE the run moves the whole frame with its size unchanged (top moves, height does
+ * not), while a fold INSIDE it grows only the bottom edge (height moves, top does not).
+ * Gating on either alone would silently drop the other case, so each edge is
+ * normalized on its own and the frame animates when at least one of them survived.
+ *
+ * The `to` box is in DOCUMENT coordinates — that is what the element's committed `top`
+ * actually is — while the decision to animate at all is made in VIEWPORT coordinates.
+ * `from` is then derived by walking the visible displacement back from `to`, so the
+ * animation starts where the reader last saw the frame rather than where the document
+ * used to have it. Without that correction, a run whose document offset shifted while
+ * the anchor held it still on screen would animate from an offset the reader never saw.
+ */
+export function planFoldFrameMotion(input: {
+	readonly before: ReadonlyMap<string, FoldBoxGeometry>;
+	readonly after: ReadonlyMap<string, FoldBoxGeometry>;
+	readonly beforeScrollTop: number;
+	readonly afterScrollTop: number;
+}): FoldFrameMotion[] {
+	const { before, after, beforeScrollTop, afterScrollTop } = input;
+	const scrollDelta = afterScrollTop - beforeScrollTop;
+	const out: FoldFrameMotion[] = [];
+	for (const [key, next] of after) {
+		const prev = before.get(key);
+		if (!prev) continue;
+		// Visible (not document) displacement of the top edge, and the size change.
+		const topDelta = animatableEdgeDelta(visualShift(prev.top, next.top, scrollDelta));
+		const heightDelta = animatableEdgeDelta(prev.height - next.height);
+		// Either edge being unreadable disqualifies the whole frame: animating one edge
+		// while the other teleports would deform the box mid-flight.
+		if (topDelta === null || heightDelta === null) continue;
+		if (topDelta === 0 && heightDelta === 0) continue;
+		out.push({
+			key,
+			from: { top: next.top + topDelta, height: next.height + heightDelta },
+			to: { top: next.top, height: next.height },
+		});
+	}
+	return out;
+}
+
+/**
+ * Normalize one edge's displacement for a frame plan.
+ *
+ * `0` — the edge held still, or drifted by a sub-pixel amount no reader can see. It
+ * still animates (from its own committed value) so the OTHER edge can travel while
+ * this one stays put.
+ *
+ * `null` — unreadable: non-finite, or past the distance bound rows also refuse. The
+ * caller drops the whole frame, matching what its rows will do.
+ */
+function animatableEdgeDelta(delta: number): number | null {
+	if (!Number.isFinite(delta)) return null;
+	const magnitude = Math.abs(delta);
+	if (magnitude < FOLD_MIN_SHIFT_PX) return 0;
+	if (magnitude > FOLD_MAX_SHIFT_PX) return null;
+	return delta;
 }
 
 /**

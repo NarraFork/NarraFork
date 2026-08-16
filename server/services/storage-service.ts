@@ -10,7 +10,9 @@ import { getNarraforkHome, getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
 import { databaseCleanupService } from "./database-cleanup-service";
+import { dropRecentlyAttributed } from "./file-attribution-service";
 import { gitService } from "./git-service";
+import { dropStatus } from "./git-status-cache";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -794,6 +796,10 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 							error: String(err),
 						}),
 					);
+					// Same reason, for the status/boundary caches keyed by that path: the
+					// directory is gone, so nothing can read those entries again.
+					dropStatus(fullPath);
+					dropRecentlyAttributed(fullPath);
 					removed++;
 					freedBytes += size;
 					logger.info("Removed orphaned worktree", { path: fullPath, size });

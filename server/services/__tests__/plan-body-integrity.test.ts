@@ -61,8 +61,8 @@ describe("resolveExitPlanModeInputWithBackend — model plan reference", () => {
 	/** A cwd containing the designated plan file with the genuine plan body. */
 	function makePlanWorkspace(planFileId: string, body = PLAN_BODY) {
 		const root = mkdtempSync(join(tmpdir(), "nf-plan-integrity-"));
-		mkdirSync(join(root, ".narrafork"), { recursive: true });
-		writeFileSync(join(root, ".narrafork", `plan-${planFileId}.md`), body, "utf-8");
+		mkdirSync(join(root, ".narrafork", "plans"), { recursive: true });
+		writeFileSync(join(root, ".narrafork", "plans", `plan-${planFileId}.md`), body, "utf-8");
 		return root;
 	}
 

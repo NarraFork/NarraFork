@@ -97,6 +97,11 @@ import type {
 } from "./command-service";
 import { getAvailableOptionalToolIds } from "./command-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
+import {
+	assertNarratorAccess,
+	defaultVisibilityForNarrator,
+	type NarratorAccessNeed,
+} from "./narrator-acl";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
 import {
 	appendMessageRef,
@@ -290,6 +295,17 @@ export interface CreateNarratorInput {
 	oauthPolicySnapshotJson?: Record<string, unknown> | null;
 	/** Initial default execution device, written atomically with external ownership. */
 	defaultDeviceId?: string | null;
+	/**
+	 * The user this narrator belongs to. Every request-initiated path must pass it,
+	 * or the narrator lands ownerless and only admins can ever share it. Left null
+	 * only where there genuinely is no human initiator.
+	 */
+	ownerUserId?: string | null;
+	/**
+	 * Read audience. Omitted means the default for the kind of narrator being
+	 * created: private for standalone, project for chapter-bound.
+	 */
+	visibility?: "private" | "project" | "public";
 }
 
 interface CreateSubagentInput {
@@ -318,6 +334,34 @@ function formatAvailableOptionalToolIds(): string {
 const ADMIN_ONLY_LOAD_TOOLS = new Set(["NarraForkAdmin", "KnowledgeAdmin"]);
 
 /**
+ * Resolve a narrator's traits across the user/project/narrator layers.
+ *
+ * Local helper so the several command handlers below share one lazy import; the
+ * trait layer service is imported dynamically to avoid a cycle
+ * (trait-layer-service → db → … → narrator-service).
+ */
+async function resolveLayeredTraitsFor(
+	narrator: { traits: unknown; chapterId?: string | null; contextProjectId?: string | null },
+	userId: string | undefined,
+): Promise<string[]> {
+	try {
+		const { resolveEffectiveTraits, resolveNarratorProjectId } = await import(
+			"./trait-layer-service"
+		);
+		const resolved = await resolveEffectiveTraits({
+			narratorTraits: narrator.traits,
+			projectId: await resolveNarratorProjectId(narrator),
+			actingUserId: userId ?? null,
+		});
+		return resolved.traits;
+	} catch {
+		// Degrade to narrator-only traits rather than failing the command.
+		const { parseTraits } = await import("../lib/narrator-utils");
+		return parseTraits(narrator.traits);
+	}
+}
+
+/**
  * Shared handler for `/load <tool>` commands.
  */
 export async function handleLoadToolCommand(
@@ -339,7 +383,9 @@ export async function handleLoadToolCommand(
 	const toolNames = cmdResult.loadTools ?? [cmdResult.loadTool];
 	const displayToolName = cmdResult.loadToolId ?? cmdResult.loadTool;
 	const currentNarrator = await narratorService.getById(narratorId);
-	const disabledTools = getDisabledToolSet(currentNarrator.traits);
+	// Layered: a project/user-level deny must also block a manual `/load`.
+	const loadTraits = await resolveLayeredTraitsFor(currentNarrator, userId);
+	const disabledTools = getDisabledToolSet(loadTraits);
 	const disabledTool = toolNames.find((name) => disabledTools.has(name));
 	if (disabledTool) {
 		const infoText =
@@ -527,8 +573,10 @@ export async function handleLoadSkillCommand(
 	}
 
 	// Respect the blocked-skills trait: a blocked skill cannot be manually injected.
+	// Resolved across layers so a project-level block also applies. No acting user
+	// is threaded into this command, so only the project layer contributes.
 	const narratorForBlock = await narratorService.getById(narratorId);
-	const blocked = getBlockedSkills(narratorForBlock.traits);
+	const blocked = getBlockedSkills(await resolveLayeredTraitsFor(narratorForBlock, undefined));
 	if (isSkillBlocked(blocked, found.name)) {
 		const infoText = blocked.all
 			? `⛔ Skills are disabled for this narrator. Use "/load all_skills" to re-enable them.`
@@ -584,7 +632,16 @@ async function mutateBlockedSkillsTrait(
 			.where(eq(narrators.id, narratorId));
 		return { traits, next };
 	});
-	updateActiveBlockedSkills(narratorId, { all: next.all, names: next.names });
+	// Sync the live session from the *resolved* traits: an edit here must not
+	// appear to lift a block that the project/user layer enforces.
+	const narratorRow = await narratorService.getById(narratorId);
+	const effectiveBlocked = getBlockedSkills(
+		await resolveLayeredTraitsFor({ ...narratorRow, traits }, undefined),
+	);
+	updateActiveBlockedSkills(narratorId, {
+		all: effectiveBlocked.all,
+		names: effectiveBlocked.names,
+	});
 	broadcastToNarrator(narratorId, {
 		type: "custom_traits_changed",
 		narratorId,
@@ -1222,6 +1279,8 @@ export async function prepareNarratorCreation(
 			contextProjectId: input.contextProjectId ?? null,
 			oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
 			defaultDeviceId: input.defaultDeviceId ?? null,
+			ownerUserId: input.ownerUserId ?? null,
+			visibility: input.visibility ?? defaultVisibilityForNarrator(chapterId),
 			inheritMode: "fresh",
 			status: "idle",
 			title: input.title ?? null,
@@ -1338,6 +1397,11 @@ export const narratorService = {
 				parentNarratorId: input.parentNarratorId,
 				cwd: input.cwd,
 				defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
+				// A subagent is part of its parent's work, so it inherits both halves of
+				// access control verbatim. Anything else would either hide a subagent from
+				// the person driving the parent, or expose a private session's subtasks.
+				ownerUserId: parent.ownerUserId,
+				visibility: parent.visibility,
 				inheritMode: "fresh",
 				status: "working",
 				createdAt: now,
@@ -1434,11 +1498,31 @@ export const narratorService = {
 		return { ...msg, seq, creator };
 	},
 
-	async getById(id: string) {
+	/**
+	 * Load a narrator, optionally enforcing that a user may reach it.
+	 *
+	 * `acl` is optional on purpose. Internal callers — the agent loop, background
+	 * jobs, event handlers, cascade deletes — act on behalf of the system and have
+	 * no requesting user, so demanding one would either be a lie or force every
+	 * such path to invent an identity. Anything serving an HTTP/WS request passes
+	 * `acl` (routes normally go through `requireNarratorAccess`, which does it for
+	 * them).
+	 *
+	 * A denied access reports NotFoundError, identical to a missing row, so no
+	 * caller can distinguish "exists but not yours" from "does not exist".
+	 */
+	async getById(id: string, acl?: { userId: string; isAdmin: boolean; need?: NarratorAccessNeed }) {
 		const narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, id),
 		});
 		if (!narrator) throw new NotFoundError("Narrator", id);
+		if (acl) {
+			await assertNarratorAccess(
+				narrator,
+				{ userId: acl.userId, isAdmin: acl.isAdmin },
+				acl.need ?? "read",
+			);
+		}
 		return narrator;
 	},
 
@@ -1757,6 +1841,10 @@ export const narratorService = {
 					behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 					behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 					parentNarratorId,
+					// A fork carries the parent's history, so it must not be reachable by a
+					// wider audience than the parent was.
+					ownerUserId: parent.ownerUserId,
+					visibility: parent.visibility,
 					inheritMode: "full",
 					status: "idle",
 					title: opts?.title ?? null,
@@ -1945,6 +2033,11 @@ export const narratorService = {
 					behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 					parentNarratorId,
 					forkMessageId: null,
+					// Same rule as forkFromMessages: inherited history keeps the parent's
+					// audience. When the fork lands in a chapter it is at least
+					// project-visible anyway, so inheriting can only narrow, never widen.
+					ownerUserId: parent.ownerUserId,
+					visibility: parent.visibility,
 					inheritMode,
 					apiConversationId,
 					contextSummary,
@@ -2425,6 +2518,10 @@ export const narratorService = {
 				behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 				behaviorFenceAttachOverride: normalizeBooleanOverride(parent.behaviorFenceAttachOverride),
 				title: opts?.title ?? undefined,
+				// A tool-initiated fork belongs to whoever owns the session that spawned
+				// it — the model has no identity of its own to attribute it to.
+				ownerUserId: parent.ownerUserId,
+				visibility: parent.visibility,
 			});
 			eventBus.emit({
 				type: "narrator:forked",
@@ -2483,6 +2580,8 @@ export const narratorService = {
 	getCompactSummary: narratorMessageQueries.getCompactSummary.bind(narratorMessageQueries),
 	deleteCompactMessage: narratorMessageQueries.deleteCompactMessage.bind(narratorMessageQueries),
 	deleteMessage: narratorMessageQueries.deleteMessage.bind(narratorMessageQueries),
+	deleteDanglingReasoningMessage:
+		narratorMessageQueries.deleteDanglingReasoningMessage.bind(narratorMessageQueries),
 	dismissSpecCarryoverMessage:
 		narratorMessageQueries.dismissSpecCarryoverMessage.bind(narratorMessageQueries),
 	dismissCwdRecoveryMessage:

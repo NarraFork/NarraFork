@@ -79,6 +79,7 @@ import {
 	IconInfoCircle,
 	IconLock,
 	IconLockOpen,
+	IconMessages,
 	IconNotebook,
 	IconPaperclip,
 	IconPencil,
@@ -113,6 +114,7 @@ import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
+import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory, writeInputHistoryEntries } from "../../hooks/useInputHistory";
 import { useLocalPref } from "../../hooks/useLocalPref";
@@ -2196,6 +2198,14 @@ export function NarratorPanel({
 	const browserSessionsCapability = useNarratorBrowserSessionsCapability();
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
+	const { t: tChat } = useTranslation("chat");
+	// Unread count for the discussion-room toolbar entry. The room is resolved only
+	// in dock mode (that is the only surface with a panel to open), and the count
+	// comes from the shared unread summary rather than a per-narrator request.
+	const userChatRoomQuery = useNarratorChatRoom(narratorId, !!dock && !isWorkspacePreview);
+	const chatUnreadQuery = useChatUnread();
+	const userChatRoomId = userChatRoomQuery.data?.id;
+	const userChatUnread = userChatRoomId ? (chatUnreadQuery.data?.byRoom[userChatRoomId] ?? 0) : 0;
 	const qc = useQueryClient();
 	const executionDevicesQuery = useQuery({
 		queryKey: ["narratorExecutionDevices", narratorId],
@@ -3292,6 +3302,11 @@ export function NarratorPanel({
 	const imageDraftSaveSeqRef = useRef(0);
 	const imageDraftLocalVersionRef = useRef(0);
 	const [attachedTextFiles, setAttachedTextFiles] = useState<File[]>([]);
+	// Mirrors `attachedTextFiles` for the same reason `attachedImagesRef` exists:
+	// callers registered once (the user-chat forward bridge) must read the CURRENT
+	// attachments without re-registering on every change.
+	const attachedTextFilesRef = useRef<File[]>(attachedTextFiles);
+	attachedTextFilesRef.current = attachedTextFiles;
 	const [isDragging, setIsDragging] = useState(false);
 	const dragCounterRef = useRef(0);
 	const warnDraftImagesPersistenceFailure = useCallback((action: string, err: unknown) => {
@@ -5782,6 +5797,16 @@ export function NarratorPanel({
 	};
 
 	/**
+	 * Latest `doSendBuffered`, for callers registered once with the dock bridge.
+	 *
+	 * `doSendBuffered` is redefined every render (it closes over the live input and
+	 * attachments), so a bridge that captured it directly would keep calling a
+	 * stale closure with stale attachment state.
+	 */
+	const doSendBufferedRef = useRef(doSendBuffered);
+	doSendBufferedRef.current = doSendBuffered;
+
+	/**
 	 * Core send handler. When the narrator is active, `mode` selects the queue
 	 * behavior:
 	 *   - "turn": normal queue — wait for the current turn to finish
@@ -5949,6 +5974,49 @@ export function NarratorPanel({
 	};
 	const handleSendRef = useRef(handleSend);
 	handleSendRef.current = handleSend;
+
+	/**
+	 * Submit externally-supplied text as a user message (the user-chat panel's
+	 * "send to narrator").
+	 *
+	 * Routed through `doSendBuffered` — the composer's own send path — rather than
+	 * calling the REST endpoint directly, so a forward that lands mid-turn is
+	 * QUEUED exactly like anything typed here, and the draft / attachment
+	 * bookkeeping stays consistent. The current draft is deliberately preserved:
+	 * the forwarded text is its own message, not an edit of what the user was
+	 * composing.
+	 */
+	useEffect(() => {
+		const register = dock?.registerSubmitToNarrator;
+		if (!register) return;
+		return register((text: string) => {
+			const trimmed = text.trim();
+			if (!trimmed) return;
+			void (async () => {
+				const preservedDraft = inputRef.current;
+				const preservedImages = attachedImagesRef.current;
+				const preservedTextFiles = attachedTextFilesRef.current;
+				try {
+					// Forward-only send: no attachments, and the in-progress draft is put
+					// back afterwards so the operator does not lose what they were typing.
+					setInput(trimmed);
+					updateAttachedImages([]);
+					setAttachedTextFiles([]);
+					await doSendBufferedRef.current(trimmed, false);
+				} catch (err) {
+					notifications.show({
+						color: "red",
+						title: t("sendFailed", "Failed to send"),
+						message: err instanceof Error ? err.message : "",
+					});
+				} finally {
+					setInput(preservedDraft);
+					if (preservedImages.length > 0) updateAttachedImages(preservedImages);
+					if (preservedTextFiles.length > 0) setAttachedTextFiles(preservedTextFiles);
+				}
+			})();
+		});
+	}, [dock, t, updateAttachedImages]);
 
 	// The active queue button mirrors the keyboard shortcuts: a short press uses
 	// Enter's mode, while a long press uses Ctrl/Cmd+Enter's mode.
@@ -7294,6 +7362,27 @@ export function NarratorPanel({
 												onClick={() => dock.toggleToolPanel("browser")}
 											>
 												<IconWorldWww size={16} />
+											</ActionIcon>
+										</Indicator>
+									</Tooltip>
+								)}
+								{dock && (
+									<Tooltip label={tChat("panelTitle")}>
+										<Indicator
+											size={14}
+											offset={4}
+											label={userChatUnread > 99 ? "99+" : userChatUnread}
+											color="blue"
+											disabled={userChatUnread === 0}
+											style={{ display: "flex", alignItems: "center" }}
+										>
+											<ActionIcon
+												size="sm"
+												variant={dock.openToolTypes.has("userchat") ? "light" : "subtle"}
+												color={dock.openToolTypes.has("userchat") ? "indigo" : "gray"}
+												onClick={() => dock.toggleToolPanel("userchat")}
+											>
+												<IconMessages size={16} />
 											</ActionIcon>
 										</Indicator>
 									</Tooltip>

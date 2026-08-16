@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
-import { chapterEdges, chapters, narrators, projects } from "../../../server/db/schema";
+import { chapterEdges, chapters, narrators, projects, users } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
@@ -42,7 +42,17 @@ mock.module("../../../server/services/git-service", () => ({
 
 const { rulerRoutes } = await import("../../../server/routes/ruler");
 
+/** The project owner these tests act as, so the write endpoints pass the project gate. */
+const TEST_USER_ID = "ruler-test-owner";
+
 const app = new Hono();
+// The ruler routes are mounted behind the project gate, which reads the authenticated
+// principal from context. In the real app that is set by requireAuth; here it is stubbed
+// so these pagination tests exercise ruler logic rather than re-testing authentication.
+app.use("*", async (c, next) => {
+	c.set("user", { sub: TEST_USER_ID, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+	await next();
+});
 app.route("/", rulerRoutes);
 
 const NOW = "2025-01-01T00:00:00.000Z";
@@ -66,12 +76,31 @@ afterAll(() => {
 });
 
 function seedProject() {
+	// The owner row must exist before the project references it (FK).
+	db.insert(users)
+		.values({
+			id: TEST_USER_ID,
+			username: `ruler-owner-${TEST_USER_ID}`,
+			passwordHash: "x",
+			role: "user",
+			createdAt: NOW,
+		})
+		.onConflictDoNothing()
+		.run();
 	db.insert(projects)
 		.values({
 			id: "p1",
 			name: "Project",
 			gitPath: "/repo",
 			defaultBranch: "main",
+			// Ruler routes sit behind the project gate. `public` alone is not enough: the
+			// write endpoints (positions, rebase, merge) require project WRITE, and public
+			// visibility deliberately grants only read — otherwise any signed-in user could
+			// rewrite branches in any public project. So the suite authenticates as this
+			// owner (see the middleware below). Authorization itself is covered by
+			// project-acl-gate.test.ts; these tests are about ruler pagination.
+			visibility: "public",
+			ownerUserId: TEST_USER_ID,
 			createdAt: NOW,
 			updatedAt: NOW,
 		})

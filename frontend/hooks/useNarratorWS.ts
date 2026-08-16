@@ -549,6 +549,14 @@ interface NarratorWSCallbacks {
 	) => boolean | undefined;
 	onFullReload?: () => void;
 	onSyncOk?: () => void;
+	/**
+	 * The server refused this subscription: the narrator is not shared with this
+	 * user, or does not exist (deliberately the same answer). Without handling it the
+	 * UI would wait for events that will never arrive.
+	 */
+	onSubscribeDenied?: () => void;
+	/** Sharing settings changed; anything showing access state should re-read it. */
+	onAccessChanged?: (reason: string) => void;
 	onCommitsUpdated?: (chapterId: string, newCount: number) => void;
 	onCommitSyncError?: (event: CommitSyncErrorEvent) => void;
 	onBackgroundTaskStarted?: (
@@ -1251,6 +1259,16 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onFullReload?.();
 						break;
 					}
+					case "subscribe_denied":
+						// Stop waiting: no snapshot or catch-up is coming for this narrator.
+						narratorWSManager.clearCatchUpState(subscribedId);
+						callbackOwner.callbacks.onSubscribeDenied?.();
+						break;
+					case "narrator_access_changed":
+						callbackOwner.callbacks.onAccessChanged?.(
+							typeof data.reason === "string" ? data.reason : "unknown",
+						);
+						break;
 					case "sync_ok":
 						// While a manifest reconcile is open, stage the authoritative version
 						// instead of publishing it over a separately staged realtime cursor.

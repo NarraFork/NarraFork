@@ -32,6 +32,8 @@ export interface CreateReviewInput {
 	anchorCommitSha?: string;
 	axisOffset?: number;
 	crossOffset?: number;
+	/** The user requesting the review; becomes the owner of the review narrator. */
+	createdByUserId?: string | null;
 }
 
 export const reviewService = {
@@ -195,6 +197,7 @@ export const reviewService = {
 				type: "primary",
 				cwd: worktreePath,
 				systemPrompt,
+				ownerUserId: input.createdByUserId ?? null,
 				...(reviewModel ? { model: reviewModel } : {}),
 			});
 			rollback.push(async () => {

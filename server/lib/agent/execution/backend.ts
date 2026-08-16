@@ -45,6 +45,12 @@ export interface DeviceSummary {
 	platform?: DevicePlatform;
 	/** Default working directory on the device, when known. */
 	defaultCwd?: string | null;
+	/**
+	 * True when the device is private to the acting user. Drives the default
+	 * injection mode ("my own machine should just be there") without granting any
+	 * additional access — authorization already happened upstream.
+	 */
+	ownedByActingUser?: boolean;
 }
 
 /** Platform descriptor a backend reports (used for prompt injection + path handling). */

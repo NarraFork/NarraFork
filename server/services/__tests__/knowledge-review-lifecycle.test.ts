@@ -21,14 +21,33 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { knowledgeGrantRows } from "../../../tests/fixtures/knowledge-grants";
 import { db } from "../../db";
-import { knowledgeGrants, knowledgeSubmissions, knowledgeTags, users } from "../../db/schema";
+import { aclGrants, knowledgeSubmissions, knowledgeTags, users } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 import { eventBus, type NarraForkEvent } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
 import { knowledgeRoutes } from "../../routes/knowledge";
 import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeService } from "../knowledge-service";
+
+/**
+ * Seed knowledge grants into the unified `acl_grants` table.
+ *
+ * Knowledge authorization no longer reads `knowledge_grants`, so a fixture writing
+ * there would grant nothing. Input stays in the knowledge vocabulary; the shared
+ * fixture translates it (a credential row, plus a separate write row for canWrite).
+ */
+async function seedKnowledgeGrants(
+	seeds: Parameters<typeof knowledgeGrantRows>[0] | Parameters<typeof knowledgeGrantRows>[0][],
+): Promise<void> {
+	const list = Array.isArray(seeds) ? seeds : [seeds];
+	for (const seed of list) {
+		for (const row of knowledgeGrantRows(seed)) {
+			await db.insert(aclGrants).values(row as never);
+		}
+	}
+}
 
 type InvalidatedEvent = Extract<NarraForkEvent, { type: "knowledge:submission_invalidated" }>;
 
@@ -519,7 +538,7 @@ describe("getMyReviewScope", () => {
 			role: "user",
 			createdAt: new Date().toISOString(),
 		});
-		await db.insert(knowledgeGrants).values({
+		await seedKnowledgeGrants({
 			id: generateId(),
 			collectionId: null,
 			principalType: "user",
@@ -550,7 +569,7 @@ describe("getMyReviewScope", () => {
 			role: "user",
 			createdAt: new Date().toISOString(),
 		});
-		await db.insert(knowledgeGrants).values({
+		await seedKnowledgeGrants({
 			id: generateId(),
 			collectionId,
 			principalType: "user",
@@ -677,7 +696,7 @@ describe("resolveConflict self-review guard", () => {
 			controlled: true,
 			createdAt: new Date().toISOString(),
 		});
-		await db.insert(knowledgeGrants).values({
+		await seedKnowledgeGrants({
 			id: generateId(),
 			collectionId: null,
 			principalType: "user",

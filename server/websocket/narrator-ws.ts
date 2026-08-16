@@ -12,7 +12,15 @@ export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
 
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { containerInstances, narrators, narratorToolCalls, terminals } from "../db/schema";
+import {
+	chapters,
+	containerInstances,
+	mergeSessions,
+	narrators,
+	narratorToolCalls,
+	projects,
+	terminals,
+} from "../db/schema";
 import { updateAwaitTimeout } from "../lib/agent/tools/await";
 import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
@@ -36,6 +44,7 @@ import type {
 	UnloadToolResult,
 } from "../services/command-service";
 import { resolveCommand } from "../services/command-service";
+import { canReadNarrator, canWriteNarrator } from "../services/narrator-acl";
 import { getStreamingSnapshot } from "../services/narrator-event-handler";
 import {
 	handleBlockAllSkillsCommand,
@@ -52,11 +61,13 @@ import {
 	getBufferedMessages,
 	pushBufferedMessage,
 	removeBufferedMessage,
+	resolveDecisionNarratorId,
 	resolvePermissionOrDangerReflection,
 	toBufferSummary,
 	updateBufferedMessage,
 } from "../services/narrator-session";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
+import { assertChapterProjectAccess, canReadProject } from "../services/project-acl";
 import {
 	bufferRealtimeMessage,
 	type CatchUpBuffer,
@@ -84,10 +95,24 @@ export interface NarratorWSData {
 	/** narratorId → number of in-flight catch-up queries buffering realtime frames. */
 	catchingUpNarrators: Map<string, number>;
 	catchUpBuffers: Map<string, CatchUpBuffer>;
+	/**
+	 * Chat rooms this connection receives live messages for.
+	 *
+	 * Kept on the narrator channel rather than a new endpoint: this socket already
+	 * carries the user identity, heartbeat and session-expiry eviction that a chat
+	 * channel would otherwise have to reimplement.
+	 */
+	subscribedChatRooms: Set<string>;
 	userId?: string;
 	username?: string;
 	avatarColor?: string | null;
 	avatarImageId?: string | null;
+	/**
+	 * Live role captured at upgrade time, for the admin short-circuit in narrator
+	 * authorization. Absent on connections whose user row could not be resolved,
+	 * which are treated as non-admin.
+	 */
+	userRole?: string;
 }
 
 type NarratorSubscriptionKind = "list" | "panel" | "messages";
@@ -125,6 +150,8 @@ export type NarratorClientMessage =
 	| { type: "remove_buffer"; narratorId: string; messageId: string }
 	| { type: "presence_join"; narratorId: string }
 	| { type: "presence_leave"; narratorId: string }
+	| { type: "chat_subscribe"; roomIds: string[] }
+	| { type: "chat_unsubscribe"; roomIds: string[] }
 	| { type: "subscribe_stats" }
 	| { type: "unsubscribe_stats" }
 	| {
@@ -171,6 +198,75 @@ function removeConnection(ws: NarratorWS): void {
 	if (!userConnections) return;
 	userConnections.delete(ws);
 	if (userConnections.size === 0) connectionsByUserId.delete(userId);
+}
+
+// === Chat room subscriptions ===
+//
+// A reverse index so delivering one chat message walks only that room's
+// subscribers instead of the whole connection set (which is what
+// `broadcastToNarrator` has to do, and what makes `broadcastToAll` expensive).
+//
+// Authorization happens exactly once, at subscribe time (`assertCanRead`). That
+// is sufficient because neither room kind's readable set changes over time: a DM's
+// two members are fixed at creation, and a narrator room follows the narrator's
+// visibility. ⚠️ If leaving/kicking is ever added, that path MUST also evict the
+// user's sockets from this index.
+const chatRoomSubscribers = new Map<string, Set<NarratorWS>>();
+
+/** Per-connection ceiling, mirroring the narrator subscription cap's intent. */
+export const MAX_CHAT_ROOM_SUBSCRIPTIONS_PER_CONNECTION = 50;
+
+function addChatSubscription(ws: NarratorWS, roomId: string): void {
+	ws.data.subscribedChatRooms.add(roomId);
+	let subscribers = chatRoomSubscribers.get(roomId);
+	if (!subscribers) {
+		subscribers = new Set();
+		chatRoomSubscribers.set(roomId, subscribers);
+	}
+	subscribers.add(ws);
+}
+
+function removeChatSubscription(ws: NarratorWS, roomId: string): void {
+	ws.data.subscribedChatRooms.delete(roomId);
+	const subscribers = chatRoomSubscribers.get(roomId);
+	if (!subscribers) return;
+	subscribers.delete(ws);
+	if (subscribers.size === 0) chatRoomSubscribers.delete(roomId);
+}
+
+function removeAllChatSubscriptions(ws: NarratorWS): void {
+	for (const roomId of ws.data.subscribedChatRooms ?? []) {
+		const subscribers = chatRoomSubscribers.get(roomId);
+		if (!subscribers) continue;
+		subscribers.delete(ws);
+		if (subscribers.size === 0) chatRoomSubscribers.delete(roomId);
+	}
+	ws.data.subscribedChatRooms?.clear();
+}
+
+/** Deliver a chat frame to every connection subscribed to that room. */
+export function broadcastToChatRoom(roomId: string, message: NarratorServerMessage): void {
+	const subscribers = chatRoomSubscribers.get(roomId);
+	if (!subscribers || subscribers.size === 0) return;
+	const payload = JSON.stringify(message);
+	for (const ws of subscribers) {
+		try {
+			ws.send(payload);
+		} catch {
+			removeConnection(ws);
+		}
+	}
+}
+
+/** User ids that currently have this room open (used to skip redundant badge pushes). */
+export function getChatRoomSubscriberUserIds(roomId: string): Set<string> {
+	const result = new Set<string>();
+	const subscribers = chatRoomSubscribers.get(roomId);
+	if (!subscribers) return result;
+	for (const ws of subscribers) {
+		if (ws.data.userId) result.add(ws.data.userId);
+	}
+	return result;
 }
 
 // === Presence tracking ===
@@ -312,6 +408,191 @@ async function broadcastBufferQueueForNarrator(
 		messages = toBufferSummary(getBufferedMessages(narratorId));
 	}
 	broadcastToNarrator(narratorId, { type: "buffer_set", narratorId, messages });
+}
+
+/**
+ * The subset of `narratorIds` this connection's user may read, telling the client
+ * about each rejection.
+ *
+ * Already-subscribed ids are re-checked rather than trusted: a share can be
+ * revoked while the socket is open, and this is the cheapest point to notice.
+ * Ids the user cannot see are reported as `subscribe_denied` — the same shape
+ * whether the narrator is private or absent, so the frame cannot be used to test
+ * for existence.
+ *
+ * A lookup failure denies. Errors here are database problems, and answering "sure,
+ * subscribe" on a failed authorization check is the one outcome that must never
+ * happen.
+ */
+async function authorizeReadableNarrators(
+	ws: NarratorWS,
+	narratorIds: string[],
+	requestId?: string,
+): Promise<string[]> {
+	const userId = ws.data.userId;
+	if (!userId) {
+		for (const narratorId of narratorIds) {
+			safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
+		}
+		return [];
+	}
+	const principal = { userId, isAdmin: ws.data.userRole === "admin" };
+	const allowed: string[] = [];
+	for (const narratorId of new Set(narratorIds)) {
+		let ok = false;
+		try {
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { id: true, ownerUserId: true, visibility: true, chapterId: true },
+			});
+			ok = row ? await canReadNarrator(row, principal) : false;
+		} catch (err) {
+			logger.warn("Narrator subscribe authorization failed", {
+				narratorId,
+				error: String(err),
+			});
+			ok = false;
+		}
+		if (ok) {
+			allowed.push(narratorId);
+		} else {
+			ws.data.subscribedNarrators.delete(narratorId);
+			safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
+		}
+	}
+	return allowed;
+}
+
+/**
+ * Per-frame authorization for the single-narrator client messages.
+ *
+ * Returns false when the frame must be dropped. Silent on refusal: unlike
+ * `subscribe`, these frames have no UI state waiting on an answer, and a reply
+ * would only tell a prober which ids exist.
+ */
+const NARRATOR_FRAME_WRITE_TYPES = new Set([
+	"buffer_message",
+	"cancel_buffer",
+	"update_buffer",
+	"remove_buffer",
+	// Changing a running tool's timeout alters how another user's session behaves and
+	// echoes a `timeout_updated` frame to its subscribers, so it is a write.
+	"update_timeout",
+]);
+const NARRATOR_FRAME_READ_TYPES = new Set(["presence_join", "presence_leave"]);
+
+/**
+ * Frames that act on a narrator without naming it: the owner is found by looking the
+ * request id up in the pending-decision registries.
+ *
+ * These cannot be authorized by `narratorId` because they deliberately carry none —
+ * the client answers a request it was told about, not a session it names. Skipping
+ * the lookup left them authorized by nothing but knowledge of the request id, which
+ * is broadcast to every reader of the session: a user holding read-only access
+ * through `visibility = 'public'` could approve someone else's tool call.
+ */
+const NARRATOR_FRAME_INDIRECT_WRITE_TYPES = new Set(["permission_decision"]);
+
+async function authorizeNarratorFrame(
+	ws: NarratorWS,
+	msg: NarratorClientMessage,
+): Promise<boolean> {
+	const needsWrite = NARRATOR_FRAME_WRITE_TYPES.has(msg.type);
+	const needsRead = NARRATOR_FRAME_READ_TYPES.has(msg.type);
+	const needsIndirectWrite = NARRATOR_FRAME_INDIRECT_WRITE_TYPES.has(msg.type);
+	if (msg.type === "merge_decision") {
+		return await authorizeMergeDecisionFrame(ws, msg.mergeSessionId);
+	}
+	if (!needsWrite && !needsRead && !needsIndirectWrite) return true;
+
+	const userId = ws.data.userId;
+	if (!userId) return false;
+	const principal = { userId, isAdmin: ws.data.userRole === "admin" };
+
+	if (needsIndirectWrite) {
+		const requestId = (msg as { requestId?: string }).requestId;
+		if (!requestId) return false;
+		try {
+			const ownerNarratorId = await resolveDecisionNarratorId(requestId);
+			// An unknown request id is refused rather than passed through: the handler
+			// would only report "not found", and returning true here would mean a future
+			// registry that this resolver does not know about is silently unauthorized.
+			if (!ownerNarratorId) return false;
+			return await authorizeNarratorId(ownerNarratorId, principal, "write");
+		} catch (err) {
+			logger.warn("Narrator WS decision frame authorization failed", {
+				requestId,
+				frame: msg.type,
+				error: String(err),
+			});
+			return false;
+		}
+	}
+
+	const narratorId = (msg as { narratorId?: string }).narratorId;
+	if (!narratorId) return true;
+
+	try {
+		return await authorizeNarratorId(narratorId, principal, needsWrite ? "write" : "read");
+	} catch (err) {
+		// Fail closed: a failed check must never be read as approval.
+		logger.warn("Narrator WS frame authorization failed", {
+			narratorId,
+			frame: msg.type,
+			error: String(err),
+		});
+		return false;
+	}
+}
+
+/**
+ * Authorize a merge decision, which is scoped to a project rather than a narrator.
+ *
+ * Continuing or cancelling a conflicted merge commits to (or rolls back) the target
+ * chapter's worktree, so it needs write access on the owning project — the same
+ * verdict the HTTP merge routes require. Like `permission_decision` the frame names
+ * only a session id, and that id is visible to everyone watching the merge, so
+ * without this lookup any observer could decide someone else's merge.
+ */
+async function authorizeMergeDecisionFrame(
+	ws: NarratorWS,
+	mergeSessionId: string,
+): Promise<boolean> {
+	const userId = ws.data.userId;
+	if (!userId) return false;
+	const principal = { userId, isAdmin: ws.data.userRole === "admin" };
+	try {
+		const session = await db.query.mergeSessions.findFirst({
+			where: eq(mergeSessions.id, mergeSessionId),
+			columns: { targetChapterId: true },
+		});
+		if (!session?.targetChapterId) return false;
+		// Throws NotFoundError when the caller may not reach the project.
+		await assertChapterProjectAccess(session.targetChapterId, principal, "write");
+		return true;
+	} catch (err) {
+		logger.warn("Merge decision frame authorization failed", {
+			mergeSessionId,
+			error: String(err),
+		});
+		return false;
+	}
+}
+
+/** Load the ACL columns for one narrator and apply the read or write verdict. */
+async function authorizeNarratorId(
+	narratorId: string,
+	principal: { userId: string; isAdmin: boolean },
+	need: "read" | "write",
+): Promise<boolean> {
+	const row = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { id: true, ownerUserId: true, visibility: true, chapterId: true },
+	});
+	if (!row) return false;
+	return need === "write"
+		? await canWriteNarrator(row, principal)
+		: await canReadNarrator(row, principal);
 }
 
 function canAddSubscriptions(ws: NarratorWS, narratorIds: string[]): boolean {
@@ -623,6 +904,45 @@ async function sendCatchUpForAnchor(
 }
 
 /** Broadcast a typed message to every narrator WS connection belonging to one user. */
+/**
+ * Drop live subscriptions to one narrator from every connection whose user may no
+ * longer read it.
+ *
+ * Subscriptions are authorized once, at subscribe time, so un-sharing alone would
+ * leave the previous viewer receiving events until they reconnected. Called after
+ * any sharing change; each evicted connection also gets `subscribe_denied` so its
+ * UI can stop rendering a session it no longer has.
+ *
+ * Iterates connections rather than querying: the set is small (one per open tab),
+ * and only the distinct users actually subscribed are checked.
+ */
+export async function dropNarratorSubscriptionsForUnauthorizedUsers(
+	narratorId: string,
+): Promise<void> {
+	const row = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { id: true, ownerUserId: true, visibility: true, chapterId: true },
+	});
+
+	const verdicts = new Map<string, boolean>();
+	for (const ws of connections) {
+		if (!ws.data.subscribedNarrators.has(narratorId)) continue;
+		const userId = ws.data.userId;
+		const cacheKey = `${userId ?? ""}:${ws.data.userRole ?? ""}`;
+		let allowed = verdicts.get(cacheKey);
+		if (allowed === undefined) {
+			allowed =
+				row !== undefined &&
+				userId !== undefined &&
+				(await canReadNarrator(row, { userId, isAdmin: ws.data.userRole === "admin" }));
+			verdicts.set(cacheKey, allowed);
+		}
+		if (allowed) continue;
+		ws.data.subscribedNarrators.delete(narratorId);
+		safeSend(ws, { type: "subscribe_denied", narratorId });
+	}
+}
+
 export function broadcastToUser(userId: string, data: NarratorServerMessage): void {
 	const userConnections = connectionsByUserId.get(userId);
 	if (!userConnections) return;
@@ -646,6 +966,109 @@ export function broadcastToAll(message: Record<string, unknown>): void {
 			removeConnection(ws);
 		}
 	}
+}
+
+/**
+ * Broadcast to the connections whose user may read one project.
+ *
+ * For the frames whose payload is narrower than "the whole deployment": container
+ * build logs (a chapter's raw build output, line by line) and merge progress
+ * (conflicting file paths). `broadcastToAll` walks every connection, so those were
+ * shipping one project's filenames and build output to every open session — cost
+ * with no reader, and a payload that contradicted the "safe for every logged-in
+ * client" rule that the graph-topology bridge is documented against.
+ *
+ * Resolution is per distinct user rather than per connection, and the verdict is
+ * cached for the duration of one broadcast, so N connections of one user cost one
+ * check. Serialization happens once regardless of recipient count.
+ *
+ * Fails closed: a user whose check throws is skipped rather than included.
+ */
+async function broadcastToProjectReaders(
+	projectId: string,
+	message: Record<string, unknown>,
+): Promise<void> {
+	const payload = JSON.stringify(message);
+	const verdicts = new Map<string, boolean>();
+	for (const [userId, userConnections] of connectionsByUserId) {
+		if (userConnections.size === 0) continue;
+		let allowed = verdicts.get(userId);
+		if (allowed === undefined) {
+			const role = [...userConnections][0]?.data.userRole;
+			try {
+				const row = await db.query.projects.findFirst({
+					where: eq(projects.id, projectId),
+					columns: { id: true, ownerUserId: true, visibility: true },
+				});
+				allowed = row ? await canReadProject(row, { userId, isAdmin: role === "admin" }) : false;
+			} catch (err) {
+				logger.warn("Project-scoped broadcast authorization failed", {
+					projectId,
+					error: String(err),
+				});
+				allowed = false;
+			}
+			verdicts.set(userId, allowed);
+		}
+		if (!allowed) continue;
+		for (const ws of userConnections) {
+			try {
+				ws.send(payload);
+			} catch {
+				removeConnection(ws);
+			}
+		}
+	}
+}
+
+/**
+ * The project a chapter belongs to, for the chapter-keyed container events.
+ *
+ * Cached because container build logs arrive line by line: without it every line of
+ * a Docker build would be one SQLite lookup on the main thread. Bounded, and keyed
+ * by chapter id — a chapter never changes project, so entries cannot go stale.
+ */
+const CHAPTER_PROJECT_CACHE_MAX = 256;
+const chapterProjectCache = new Map<string, string | null>();
+
+async function resolveChapterProjectId(chapterId: string): Promise<string | null> {
+	const cached = chapterProjectCache.get(chapterId);
+	if (cached !== undefined) return cached;
+	let projectId: string | null = null;
+	try {
+		const row = await db.query.chapters.findFirst({
+			where: eq(chapters.id, chapterId),
+			columns: { projectId: true },
+		});
+		projectId = row?.projectId ?? null;
+	} catch (err) {
+		logger.warn("Chapter project lookup failed for scoped broadcast", {
+			chapterId,
+			error: String(err),
+		});
+		return null;
+	}
+	if (chapterProjectCache.size >= CHAPTER_PROJECT_CACHE_MAX) {
+		const oldest = chapterProjectCache.keys().next().value;
+		if (oldest !== undefined) chapterProjectCache.delete(oldest);
+	}
+	chapterProjectCache.set(chapterId, projectId);
+	return projectId;
+}
+
+/**
+ * Broadcast a chapter-scoped frame to the readers of its project.
+ *
+ * A chapter with no resolvable project is dropped rather than fanned out: an
+ * unknown owner must not mean "everyone".
+ */
+async function broadcastToChapterProjectReaders(
+	chapterId: string,
+	message: Record<string, unknown>,
+): Promise<void> {
+	const projectId = await resolveChapterProjectId(chapterId);
+	if (!projectId) return;
+	await broadcastToProjectReaders(projectId, message);
 }
 
 // === Terminal count change listener ===
@@ -910,8 +1333,12 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 		broadcastToAll({ type: "container:starting", chapterId: event.chapterId });
 	});
 
+	// Raw build/start output of one chapter's container, line by line. The only
+	// container frame carrying content rather than an id, and the densest: a Docker
+	// build emits hundreds of lines. Scoped to the project's readers so one team's
+	// build output does not stream to every open session in the deployment.
 	eventBus.on("container:log", (event) => {
-		broadcastToAll({
+		void broadcastToChapterProjectReaders(event.chapterId, {
 			type: "container:log",
 			chapterId: event.chapterId,
 			line: event.line,
@@ -940,9 +1367,19 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	});
 
 	// === Batch merge progress broadcast ===
+	// Scoped to the project's readers rather than fanned out: `merge:conflict` carries
+	// `conflictFiles`, the conflicting paths of one project's merge, and the rest name
+	// its chapters. Every `merge:*` event carries `projectId`, so the scope is already
+	// in the payload — an event that ever omits it is dropped rather than broadcast,
+	// which is the fail-closed direction.
 	eventBus.onAny((event) => {
 		if (!event.type.startsWith("merge:")) return;
-		broadcastToAll(event as unknown as Record<string, unknown>);
+		const projectId = (event as { projectId?: string }).projectId;
+		if (!projectId) {
+			logger.warn("Dropped merge event with no projectId", { type: event.type });
+			return;
+		}
+		void broadcastToProjectReaders(projectId, event as unknown as Record<string, unknown>);
 	});
 
 	// === Story-network graph topology broadcast ===
@@ -1023,6 +1460,16 @@ export const handleNarratorWS = {
 		// Update heartbeat timestamp on any valid message
 		ws.data.lastPongAt = Date.now();
 
+		// Frames that act on one narrator are authorized here, once, instead of in each
+		// case. Queueing or editing buffered input is indistinguishable from sending a
+		// message, so it needs write access; presence announces "I am looking at this",
+		// so read is enough. Decision frames (`permission_decision`, `merge_decision`)
+		// name only a request/session id, so their owner is resolved first — see
+		// `authorizeNarratorFrame`. `subscribe` authorizes itself (it takes a list, and
+		// reports per-id denials), and `sync_check` is covered transitively because it
+		// requires an already-authorized subscription.
+		if (!(await authorizeNarratorFrame(ws, msg))) return;
+
 		switch (msg.type) {
 			case "pong":
 				// Heartbeat response — lastPongAt already updated above
@@ -1031,23 +1478,32 @@ export const handleNarratorWS = {
 				const kind = msg.kind ?? "messages";
 				const requestId = msg.requestId;
 				if (!canAddSubscriptions(ws, msg.narratorIds)) break;
+
+				// Authorize BEFORE anything is added to the subscription set. This socket
+				// carries a user identity but the ids come from the client, so without this
+				// any authenticated user could stream a private narrator's whole timeline by
+				// guessing (or observing) its id — the catch-up path below happily replays
+				// history to whoever is subscribed.
+				const allowedIds = await authorizeReadableNarrators(ws, msg.narratorIds, requestId);
+				if (allowedIds.length === 0) break;
+
 				const catchUpAnchor =
-					kind === "messages" && msg.narratorIds.length === 1 ? msg.catchUpCursor : undefined;
-				const catchUpNarratorId = catchUpAnchor ? msg.narratorIds[0] : undefined;
+					kind === "messages" && allowedIds.length === 1 ? msg.catchUpCursor : undefined;
+				const catchUpNarratorId = catchUpAnchor ? allowedIds[0] : undefined;
 
 				// Reserve the full accepted set before any async snapshot/version work so
 				// concurrent subscribe frames cannot race past the per-connection limit.
-				for (const id of msg.narratorIds) ws.data.subscribedNarrators.add(id);
+				for (const id of allowedIds) ws.data.subscribedNarrators.add(id);
 
 				if (kind === "list") {
-					await sendListStateSnapshot(ws, msg.narratorIds);
+					await sendListStateSnapshot(ws, allowedIds);
 				}
 				if (kind === "panel") {
-					await sendStatusSnapshot(ws, msg.narratorIds);
-					sendRuntimeSnapshot(ws, msg.narratorIds, requestId);
+					await sendStatusSnapshot(ws, allowedIds);
+					sendRuntimeSnapshot(ws, allowedIds, requestId);
 				}
 				if (kind === "messages") {
-					sendStreamingSnapshot(ws, msg.narratorIds, requestId);
+					sendStreamingSnapshot(ws, allowedIds, requestId);
 				}
 
 				if (catchUpNarratorId && catchUpAnchor) {
@@ -1337,6 +1793,35 @@ export const handleNarratorWS = {
 				removePresence(ws, msg.narratorId);
 				break;
 			}
+			case "chat_subscribe": {
+				const userId = ws.data.userId;
+				if (!userId) break;
+				const { assertCanRead } = await import("../services/chat-service");
+				for (const roomId of msg.roomIds) {
+					if (ws.data.subscribedChatRooms.has(roomId)) continue;
+					if (ws.data.subscribedChatRooms.size >= MAX_CHAT_ROOM_SUBSCRIPTIONS_PER_CONNECTION) {
+						safeSend(ws, {
+							type: "error",
+							message: "Too many chat room subscriptions on one connection",
+						});
+						break;
+					}
+					// The single delivery-side authorization point. A room the caller
+					// cannot read never enters the index, so it can never be delivered.
+					try {
+						await assertCanRead(roomId, userId);
+					} catch {
+						logger.debug("Chat subscribe denied", { roomId, userId });
+						continue;
+					}
+					addChatSubscription(ws, roomId);
+				}
+				break;
+			}
+			case "chat_unsubscribe": {
+				for (const roomId of msg.roomIds) removeChatSubscription(ws, roomId);
+				break;
+			}
 			case "subscribe_stats": {
 				if (!ws.data.subscribedStats) {
 					ws.data.subscribedStats = true;
@@ -1435,6 +1920,7 @@ export const handleNarratorWS = {
 			removeStatsSubscriber();
 		}
 		removeAllPresence(ws);
+		removeAllChatSubscriptions(ws);
 		ws.data.catchingUpNarrators?.clear();
 		ws.data.catchUpBuffers?.clear();
 		removeConnection(ws);

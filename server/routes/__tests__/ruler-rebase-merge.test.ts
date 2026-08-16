@@ -53,7 +53,9 @@ const BASE = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
  */
 const app = new Hono();
 app.use("*", async (c, next) => {
-	c.set("user", { sub: "ruler-test-user", role: "user", iat: 0, exp: 0 });
+	// Admin: the ruler endpoints now require project write, and these tests are about
+	// rebase/merge concurrency and dirty-workspace handling, not authorization.
+	c.set("user", { sub: "ruler-test-user", role: "admin", iat: 0, exp: Number.MAX_SAFE_INTEGER });
 	await next();
 });
 app.route("/api/projects", rulerRoutes);

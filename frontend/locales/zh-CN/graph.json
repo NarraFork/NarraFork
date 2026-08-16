@@ -160,6 +160,8 @@
 		"offRulerChaptersDesc": "它们的起始提交不在已加载的时间线范围内，因此没有可以定位的刻度。",
 		"loadOlderCommits": "加载更早的提交",
 		"loadingOlderCommits": "正在加载更早的提交……",
-		"offRulerChaptersExhausted": "整条时间线已加载完毕，说明这些章节的起始提交不在当前分支上。请改从叙事线视图打开它们。"
+		"offRulerChaptersExhausted": "整条时间线已加载完毕，仍找不到它们起始提交的位置。可以从章节列表或搜索直接打开这些章节。",
+		"rewrittenAnchorChapters": "有 {{count}} 个章节按分叉点就近显示：{{titles}}",
+		"rewrittenAnchorChaptersDesc": "它们记录的起始提交已被变基或压缩合并改写，不在当前分支上，因此画在与主线的分叉点处，位置为近似值。"
 	}
 }

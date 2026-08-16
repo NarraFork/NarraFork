@@ -3,10 +3,29 @@ import type { ApiEntity } from "./types";
 
 export const gitApi = {
 	getGitStatus: (chapterId: string) => request<ApiEntity>(`/chapters/${chapterId}/git/status`),
-	getGitAttributions: (chapterId: string, file?: string) =>
-		request<ApiEntity[]>(
-			`/chapters/${chapterId}/git/attributions${file ? `?file=${encodeURIComponent(file)}` : ""}`,
-		),
+	getGitModifications: (
+		chapterId: string,
+		opts?: {
+			scope?: "uncommitted";
+			limit?: number;
+			/**
+			 * `"byFile"` drops the per-event timeline from the response; no caller renders it.
+			 * `"all"` keeps it, and is what the server assumes when the parameter is absent.
+			 *
+			 * These are the server's spellings (`gitModificationsQuerySchema`), not a
+			 * client-side vocabulary: the value is forwarded verbatim as a query parameter, so
+			 * a name the enum does not list is rejected as a 400 rather than degrading.
+			 */
+			projection?: "byFile" | "all";
+		},
+	) => {
+		const params = new URLSearchParams();
+		if (opts?.scope) params.set("scope", opts.scope);
+		if (opts?.limit) params.set("limit", String(opts.limit));
+		if (opts?.projection) params.set("projection", opts.projection);
+		const qs = params.toString();
+		return request<ApiEntity>(`/chapters/${chapterId}/git/modifications${qs ? `?${qs}` : ""}`);
+	},
 	gitStage: (chapterId: string, body: { files?: string[]; all?: boolean }) =>
 		request<ApiEntity>(`/chapters/${chapterId}/git/stage`, {
 			method: "POST",

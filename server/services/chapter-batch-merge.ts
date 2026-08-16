@@ -347,6 +347,8 @@ export const chapterBatchMerge = {
 				type: "primary",
 				cwd: target.worktreePath,
 				permissionMode: "default",
+				// The user who started the batch merge owns the session it needs.
+				ownerUserId: userId ?? null,
 			});
 		}
 

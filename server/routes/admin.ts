@@ -23,7 +23,9 @@ import {
 } from "../lib/validators";
 import { invalidateUserCache, requireAdmin, requireAuth } from "../middleware/auth";
 import { knowledgeAcl } from "../services/knowledge-acl";
+import { purgeNarratorGrantsForUser } from "../services/narrator-sharing";
 import { prepareOAuthUserHardDeletion } from "../services/oauth-runtime-revocation";
+import { purgeProjectGrantsForUser } from "../services/project-membership";
 import { registrationCodeService } from "../services/registration-code-service";
 import { terminalService } from "../services/terminal-service";
 import { worktreeWatcher } from "../services/worktree-watcher";
@@ -249,6 +251,17 @@ adminRoutes.delete("/users/:id", async (c) => {
 	invalidateUserCache(id);
 	// Cascade: remove this user's knowledge-base grants (clearance/tags/review).
 	await knowledgeAcl.purgeUserGrants(id);
+	// Cascade: remove narrator shares held by this user. `principal_id` is not a
+	// foreign key (it also carries role names), so the database does not do this for
+	// us, and a stale row would re-grant access if the id were ever reissued.
+	//
+	// Narrators they OWNED are handled by the schema: `owner_user_id` is ON DELETE SET
+	// NULL, so those sessions survive with no owner and become admin-managed rather
+	// than being deleted along with the account.
+	await purgeNarratorGrantsForUser(id);
+	// Cascade: and their project memberships. Each domain purges its own scope, so
+	// deleting a user cannot quietly widen into dropping grants nobody asked about.
+	await purgeProjectGrantsForUser(id);
 	return c.json({ ok: true });
 });
 

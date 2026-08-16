@@ -929,6 +929,87 @@ describe("fast_mode_override backfill (real migration replay)", () => {
 	});
 });
 
+describe("narrator visibility backfill (real migration replay)", () => {
+	// folderMillis of 0125_salty_iron_fist, the migration that adds narrators.visibility.
+	const NARRATOR_VISIBILITY_WHEN = 1786791964480;
+
+	function visibilityOf(database: Database, narratorId: string): string {
+		return (
+			database.prepare("SELECT visibility AS v FROM narrators WHERE id = ?").get(narratorId) as {
+				v: string;
+			}
+		).v;
+	}
+
+	/**
+	 * A database migrated to just before 0125: the access-control columns absent and
+	 * legacy narrator rows that nobody owns, exactly as they exist on every install
+	 * that predates narrator ACLs.
+	 */
+	async function databaseBeforeNarratorVisibility(): Promise<Database> {
+		const database = new Database(":memory:");
+		await runMigrations(database);
+		database.run("DROP INDEX IF EXISTS idx_narrators_visibility");
+		database.run("DROP INDEX IF EXISTS idx_narrators_owner");
+		database.run("ALTER TABLE narrators DROP COLUMN visibility");
+		database.run("ALTER TABLE narrators DROP COLUMN owner_user_id");
+		database.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [
+			NARRATOR_VISIBILITY_WHEN,
+		]);
+		database.run("INSERT INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)", [
+			"narrator-legacy",
+			"now",
+			"now",
+		]);
+		return database;
+	}
+
+	test("publishes pre-ACL narrators so an upgrade never hides existing work", async () => {
+		sqlite = await databaseBeforeNarratorVisibility();
+
+		await runMigrations(sqlite);
+
+		expect(visibilityOf(sqlite, "narrator-legacy")).toBe("public");
+	});
+
+	test("leaves the owner null so only admins can re-home a legacy narrator", async () => {
+		sqlite = await databaseBeforeNarratorVisibility();
+
+		await runMigrations(sqlite);
+
+		const row = sqlite
+			.prepare("SELECT owner_user_id AS owner FROM narrators WHERE id = ?")
+			.get("narrator-legacy") as { owner: string | null };
+		expect(row.owner).toBeNull();
+	});
+
+	test("does not re-publish a legacy narrator an admin later made private", async () => {
+		// The whole reason the backfill is gated on the column's prior absence: a
+		// heuristic re-run would keep undoing a deliberate "make this private again".
+		sqlite = await databaseBeforeNarratorVisibility();
+		await runMigrations(sqlite);
+		sqlite.run("UPDATE narrators SET visibility = 'private' WHERE id = ?", ["narrator-legacy"]);
+
+		await runMigrations(sqlite);
+
+		expect(visibilityOf(sqlite, "narrator-legacy")).toBe("private");
+	});
+
+	test("leaves narrators created after the upgrade private by default", async () => {
+		sqlite = await databaseBeforeNarratorVisibility();
+		await runMigrations(sqlite);
+		sqlite.run("INSERT INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)", [
+			"narrator-new",
+			"later",
+			"later",
+		]);
+
+		await runMigrations(sqlite);
+
+		expect(visibilityOf(sqlite, "narrator-new")).toBe("private");
+	});
+});
+
 /**
  * A machine that developed NarraFork from source and then upgraded to a release binary carries
  * a database whose schema already advanced past migrations whose hashes were never recorded

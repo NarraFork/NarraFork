@@ -1,3 +1,4 @@
+import { EXECUTOR_PLATFORMS } from "@shared/remote-executor";
 import { z } from "zod";
 import { isSecureDirectDeviceUrl } from "../device-url";
 
@@ -21,6 +22,12 @@ export const createRemoteDeviceSchema = z
 		connectionMode: z.enum(["reverse", "direct"]).default("reverse"),
 		/** Required when connectionMode === "direct". */
 		directUrl: directDeviceUrlSchema.optional(),
+		/**
+		 * Owner axis. "private" confines the device to the registering user (a
+		 * personal machine); "shared" leaves it open to everyone the project axis
+		 * allows. Defaults to "shared", matching the pre-existing behaviour.
+		 */
+		ownerScope: z.enum(["private", "shared"]).default("shared"),
 		scope: z.enum(["global", "project"]).default("global"),
 		/** Required when scope === "project". */
 		projectId: z.string().trim().min(1).optional(),
@@ -47,6 +54,7 @@ export const updateRemoteDeviceSchema = z.object({
 	description: z.string().trim().max(2000).nullable().optional(),
 	connectionMode: z.enum(["reverse", "direct"]).optional(),
 	directUrl: directDeviceUrlSchema.nullable().optional(),
+	ownerScope: z.enum(["private", "shared"]).optional(),
 	scope: z.enum(["global", "project"]).optional(),
 	projectId: z.string().trim().min(1).nullable().optional(),
 });
@@ -72,4 +80,29 @@ export const deviceStatQuerySchema = z.object({
 export const deviceBrowseQuerySchema = z.object({
 	path: z.string().min(1).max(4096).optional(),
 	showHidden: z.boolean().optional(),
+});
+
+/**
+ * Install-script generation request. The script generator validates path shape
+ * and escaping itself; this layer only bounds the inputs and rejects the control
+ * characters that must never reach a generated shell script.
+ */
+export const deviceInstallScriptSchema = z.object({
+	platform: z.enum(EXECUTOR_PLATFORMS),
+	mode: z.enum(["system", "user"]).default("system"),
+	allowRoot: z
+		.string()
+		.trim()
+		.min(1)
+		.max(4096)
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the intent
+		.refine((value) => !/[\u0000-\u001f\u007f]/.test(value), {
+			message: "Path may not contain control characters or newlines",
+		}),
+	disableShell: z.boolean().default(false),
+	/**
+	 * Absolute base URL the target machine uses to reach NarraFork. Optional: the
+	 * server derives it from the request when omitted.
+	 */
+	serverBaseUrl: z.string().url().max(2000).optional(),
 });

@@ -4,10 +4,13 @@ import { db } from "../db";
 import { chapterEdges, chapters, containerInstances } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { narratorPrincipalOf } from "../lib/narrator-access";
 import { parseSubstatus } from "../lib/narrator-utils";
+import { requireProjectAccess } from "../lib/project-access";
 import { updateGraphPositionsSchema } from "../lib/validators";
 import { commitSyncService } from "../services/commit-sync-service";
 import { gitService } from "../services/git-service";
+import { narratorReadableWhere } from "../services/narrator-acl";
 
 export interface GraphNode {
 	id: string;
@@ -161,6 +164,9 @@ export function buildGraph(
 export const graphRoutes = new Hono();
 
 graphRoutes.get("/:id/graph", async (c) => {
+	// The story graph is the project's whole structure in one payload, so it needs the
+	// same read access as the project itself.
+	await requireProjectAccess(c, c.req.param("id"), "read");
 	const projectId = c.req.param("id");
 
 	const projectChapters = await db.query.chapters.findMany({
@@ -277,8 +283,19 @@ graphRoutes.get("/:id/graph", async (c) => {
 	const [allNarrators, allContainers, edgeRows, openedTerminals] = await Promise.all([
 		chapterIds.length
 			? db.query.narrators.findMany({
-					where: (n, { inArray }) => inArray(n.chapterId, chapterIds),
-					columns: { id: true, chapterId: true, status: true, substatus: true },
+					// Restricted to the narrators this user may read, so the graph never
+					// offers a node that opens into a 404. Chapter nodes themselves are
+					// unaffected — only the narrator badge/id attached to them.
+					where: (n, { inArray, and }) =>
+						and(inArray(n.chapterId, chapterIds), narratorReadableWhere(narratorPrincipalOf(c))),
+					columns: {
+						id: true,
+						chapterId: true,
+						status: true,
+						substatus: true,
+						ownerUserId: true,
+						visibility: true,
+					},
 				})
 			: Promise.resolve([]),
 		chapterIds.length
@@ -358,6 +375,8 @@ graphRoutes.get("/:id/graph", async (c) => {
 });
 
 graphRoutes.patch("/:id/graph/positions", async (c) => {
+	// Node positions are shared project state: everyone sees the same layout.
+	await requireProjectAccess(c, c.req.param("id"), "write");
 	const projectId = c.req.param("id");
 	const body = await c.req.json();
 	const parsed = updateGraphPositionsSchema.safeParse(body);

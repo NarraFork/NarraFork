@@ -19,6 +19,7 @@
 
 import { logger } from "@server/lib/logger";
 import type { JsonValue } from "@server/lib/plugins/protocol";
+import type { ProviderHostHintsContext } from "./plugin-provider-adapter-factory";
 import type { PluginProviderClientPool } from "./plugin-provider-client";
 import type {
 	PluginProviderRegistry,
@@ -67,8 +68,10 @@ export interface PluginProviderCatalogRefresherOptions {
 	 * Without this, model discovery in proxy-required environments fails even when chat
 	 * works fine — the adapter factory has its own resolver but this code path is separate.
 	 * Returns undefined when there is nothing to communicate.
+	 *
+	 * Takes the provider identity so a per-provider proxy applies to discovery too.
 	 */
-	resolveHostHints?: () => ProviderHostHints | undefined;
+	resolveHostHints?: (context: ProviderHostHintsContext) => ProviderHostHints | undefined;
 }
 
 /**
@@ -120,7 +123,9 @@ export class PluginProviderCatalogRefresher {
 	private readonly resolveConfig?: (
 		providerInstanceId: string,
 	) => Promise<Record<string, JsonValue>>;
-	private readonly resolveHostHints?: () => ProviderHostHints | undefined;
+	private readonly resolveHostHints?: (
+		context: ProviderHostHintsContext,
+	) => ProviderHostHints | undefined;
 	private readonly inFlight = new Map<string, Promise<ProviderCatalogRefreshResult>>();
 
 	constructor(options: PluginProviderCatalogRefresherOptions) {
@@ -229,7 +234,13 @@ export class PluginProviderCatalogRefresher {
 				: this.registry.getConfig(entry.providerInstanceId);
 
 			// Resolve once per refresh — same proxy applies to all pages of one logical operation.
-			const hostHints = this.resolveHostHints?.();
+			// Passing the provider identity matters here for the same reason it does on the chat
+			// path: model discovery has to go through the same proxy the provider is configured
+			// to use, or a provider only reachable via proxy would show an empty catalog.
+			const hostHints = this.resolveHostHints?.({
+				pluginId: entry.pluginId ?? "",
+				providerInstanceId: entry.providerInstanceId,
+			});
 
 			for (let page = 0; page < this.maxPages; page += 1) {
 				const catalog = await client.listModels(

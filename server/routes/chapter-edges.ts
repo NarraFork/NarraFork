@@ -1,4 +1,5 @@
 import { ValidationError } from "@server/lib/errors";
+import { requireChapterAccess, requireProjectAccess } from "@server/lib/project-access";
 import { chapterEdgeService } from "@server/services/chapter-edge-service";
 import { Hono } from "hono";
 
@@ -21,11 +22,15 @@ app.get("/", async (c) => {
 	const chapterId = c.req.query("chapterId");
 	const type = c.req.query("type");
 
+	// Both branches expose the shape of a project's story network, so both need read
+	// access on the owning project. The chapter branch resolves it through the chapter.
 	if (chapterId) {
+		await requireChapterAccess(c, chapterId, "read");
 		const edges = await chapterEdgeService.getEdgesByChapter(chapterId);
 		return c.json(edges);
 	}
 	if (projectId) {
+		await requireProjectAccess(c, projectId, "read");
 		if (type) {
 			const validTypes = ["fork", "merge", "review"] as const;
 			if (!validTypes.includes(type as (typeof validTypes)[number])) {

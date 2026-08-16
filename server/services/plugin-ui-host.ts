@@ -342,6 +342,28 @@ export class PluginUiHost {
 	async dispatch(input: PluginUiHostRequest): Promise<UiRpcResponse> {
 		const fence = this.trackSessionRequest(input.session.sessionId);
 		try {
+			// SIZE FIRST, then shape — the same order `validateUiEnvelope` uses on the client.
+			//
+			// The reverse order made the size limit unreportable in its own terms. The
+			// envelope schema bounds any single string at `MAX_JSON_STRING_LENGTH` (1 MB),
+			// which is well below this 5 MB envelope ceiling, so a genuinely oversized payload
+			// failed `safeParse` first and came back as `INVALID_PARAMS` — telling the caller
+			// its message was malformed when the actual problem was that it was too big, and
+			// leaving `PAYLOAD_TOO_LARGE` reachable only by a payload assembled from many
+			// individually-legal strings.
+			//
+			// Judging size first is also the cheaper rejection: it is one `JSON.stringify` on
+			// a payload that is about to be refused, instead of a full recursive schema walk
+			// (node counting, cycle detection, prototype checks) over something oversized.
+			if (jsonBytes(input.request) > PLUGIN_UI_HOST_REQUEST_MAX_BYTES) {
+				return makeResponse(
+					isRecord(input.request) && typeof input.request.id === "string"
+						? input.request.id
+						: "invalid-request",
+					undefined,
+					new PluginUiHostError("PAYLOAD_TOO_LARGE", "Plugin UI request exceeds the byte limit"),
+				);
+			}
 			const request = uiRpcRequestSchema.safeParse(input.request);
 			if (!request.success) {
 				return makeResponse(
@@ -350,13 +372,6 @@ export class PluginUiHost {
 						: "invalid-request",
 					undefined,
 					new PluginUiHostError("INVALID_PARAMS", "Invalid Plugin UI request envelope"),
-				);
-			}
-			if (jsonBytes(request.data) > PLUGIN_UI_HOST_REQUEST_MAX_BYTES) {
-				return makeResponse(
-					request.data.id,
-					undefined,
-					new PluginUiHostError("PAYLOAD_TOO_LARGE", "Plugin UI request exceeds the byte limit"),
 				);
 			}
 			try {

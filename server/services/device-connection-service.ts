@@ -42,7 +42,7 @@ import { settings } from "../lib/settings";
 import { createRemoteBackend } from "./device-remote-backend";
 import {
 	deviceHasFeature,
-	isDeviceAuthorizedForProject,
+	isDeviceAuthorized,
 	type RemoteDeviceRow,
 	verifyDeviceToken,
 } from "./device-service";
@@ -186,13 +186,19 @@ async function handleBinaryFrame(deviceId: string, bytes: Uint8Array): Promise<v
  */
 export async function getSessionDevices(
 	projectId: string | null | undefined,
+	/**
+	 * Acting user, for the device owner axis. Without it, `private` devices are
+	 * excluded — a session that cannot prove who is driving it must not be handed
+	 * someone's personal machine.
+	 */
+	actingUserId?: string | null,
 ): Promise<import("../lib/agent/execution/backend").DeviceSummary[]> {
 	const rows = await db.query.remoteDevices.findMany({
 		where: isNull(remoteDevices.revokedAt),
 	});
 	const summaries: import("../lib/agent/execution/backend").DeviceSummary[] = [];
 	for (const row of rows) {
-		if (!isDeviceAuthorizedForProject(row, projectId)) continue;
+		if (!isDeviceAuthorized(row, { projectId, userId: actingUserId })) continue;
 		const authorization = await resolveOAuthDeviceRuntimeAuthorization(row).catch(() => ({
 			oauthOwned: true,
 			allowed: false,
@@ -212,6 +218,9 @@ export async function getSessionDevices(
 					}
 				: undefined,
 			defaultCwd: row.defaultCwd,
+			// "private" means the row is scoped to its creator, and authorization
+			// above already proved the acting user is that creator.
+			ownedByActingUser: row.ownerScope === "private" && !!actingUserId,
 		});
 	}
 	return summaries;

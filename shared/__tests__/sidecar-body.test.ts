@@ -75,6 +75,8 @@ You are still in relaxed plan mode. This non-read-only tool call was allowed onl
 		"- Keep tasks.json to only text/status/protected; do not add IDs, timestamps, summaries, or other fields.",
 	tasksSemanticsNote:
 		"- Every open task must be finite, executable, and have a completion condition; an open protected task may trigger automatic continuation. Do not store standing behavior rules or constraints without a terminal state as tasks; those belong in spec://behavior_fence.",
+	tasksProtectedOnlyOnUserDemand:
+		"- Do not add protected yourself. It is only for tasks whose completion the user explicitly demanded be guaranteed.",
 	tasksBlockedActionNote: `Blocked-task rule:
 - A blocked task means the task itself cannot currently finish; it does not automatically mean work should stop.
 - If progress requires user-only information, permission, or a product/strategy decision, finish all independent work first, then ask exactly one targeted question.
@@ -130,6 +132,7 @@ const ZH: SideCarModelTemplates = {
 		"- tasks.json 只保留 text/status/protected，不要添加 ID、时间戳、摘要或其他字段。",
 	tasksSemanticsNote:
 		"- 每条开放任务必须有限、可执行且有完成条件；protected task 未完成时可能触发自动续跑。不要把长期行为规则或无终点约束写成任务，这类内容属于 spec://behavior_fence。",
+	tasksProtectedOnlyOnUserDemand: "- 不要自行添加 protected。它只用于用户明确要求确保完成的任务。",
 	tasksBlockedActionNote: `blocked 任务处理规则：
 - blocked 表示该任务本身暂时不能完成，不自动等于停止工作。
 - 如果推进需要用户独有的信息、权限或产品/方案决策，先完成所有不受阻工作，再只提出一个精确问题。
@@ -243,6 +246,7 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 				EN.tasksEmptyNeverSkip,
 				EN.tasksFieldsNote,
 				EN.tasksSemanticsNote,
+				EN.tasksProtectedOnlyOnUserDemand,
 			].join("\n"),
 		);
 		expect(
@@ -254,6 +258,7 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 				EN.tasksEmptyDoneContinue,
 				EN.tasksFieldsNote,
 				EN.tasksSemanticsNote,
+				EN.tasksProtectedOnlyOnUserDemand,
 			].join("\n"),
 		);
 		// The all-done branch must not reuse the never-created phrasing (asserted
@@ -277,6 +282,7 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 				EN.tasksTooManyProtected,
 				EN.tasksFieldsNote,
 				EN.tasksSemanticsNote,
+				EN.tasksProtectedOnlyOnUserDemand,
 			].join("\n"),
 		);
 		expect(renderSideCarBodyToText("living_work_spec", body, ZH)).toContain(`超过 ${THRESHOLD} 条`);

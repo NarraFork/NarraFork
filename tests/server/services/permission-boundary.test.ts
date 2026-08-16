@@ -809,13 +809,42 @@ describe("resolvePermissionDecision", () => {
 		expect(
 			resolvePermissionDecision({
 				toolName: "Write",
-				input: { file_path: ".narrafork/plan-abc.md", content: "plan" },
+				input: { file_path: ".narrafork/plans/plan-abc.md", content: "plan" },
 				permMode: "acceptEdits",
 				cwd: CWD,
 				planMode: true,
 				planFileId: "abc",
 			}),
 		).toBe("allow");
+	});
+
+	test("plan trait still allows a cycle anchored to the pre-plans layout", () => {
+		// A cycle that started before plan files moved into `.narrafork/plans/` keeps
+		// writing where its plan already is; redirecting it would orphan that content.
+		expect(
+			resolvePermissionDecision({
+				toolName: "Write",
+				input: { file_path: ".narrafork/plan-abc.md", content: "plan" },
+				permMode: "acceptEdits",
+				cwd: CWD,
+				planMode: true,
+				planFileId: "abc",
+				planFilePath: ".narrafork/plan-abc.md",
+			}),
+		).toBe("allow");
+	});
+
+	test("plan trait denies a Markdown write outside the plan file", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Write",
+				input: { file_path: "docs/plan.md", content: "plan" },
+				permMode: "acceptEdits",
+				cwd: CWD,
+				planMode: true,
+				planFileId: "abc",
+			}),
+		).toBe("deny");
 	});
 
 	test("relaxed plan uses current permission mode", () => {

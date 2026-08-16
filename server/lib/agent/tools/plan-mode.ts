@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { PLAN_DIR_REL } from "../../plan-file-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../../prompt-i18n";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
@@ -44,6 +45,7 @@ export const enterPlanModeTool: ToolDefinition = {
 		"5. Use AskUserQuestion if you need to clarify approaches\n" +
 		"6. Exit plan mode with ExitPlanMode when ready to implement\n\n" +
 		"## Plan File Naming\n\n" +
+		`Plan files always live under \`${PLAN_DIR_REL}/\` in the working directory. ` +
 		"Optionally, you can provide a `plan_name` parameter as a readable prefix for your plan file. " +
 		"The prefix is sanitized and conservatively limited to 48 UTF-8 bytes; the system always appends a fresh random unique suffix, even when the name is unused. " +
 		"If omitted, a random readable prefix and unique suffix will be generated.\n\n" +
@@ -118,8 +120,10 @@ const EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION =
 	'Ignored when you declare mode="file" — do not put a file path here.';
 
 const EXIT_PLAN_FILE_PATH_PARAM_DESCRIPTION =
-	"Path to a custom plan file (relative to cwd or absolute). " +
-	"Only used in relaxed plan mode where you can write plans to any location. " +
+	"Path to a custom plan file (relative to cwd or absolute). Only used in relaxed plan mode. " +
+	`It MUST resolve inside \`${PLAN_DIR_REL}/\` of the working directory — relaxed plan mode lets you ` +
+	"write other files while planning, but the plan itself always stays in that directory, and a path " +
+	"resolving outside it (including through a symlink) is refused. " +
 	"If provided, the system reads the plan content from this file instead of the default designated plan file. " +
 	"The file must exist and contain the complete plan in markdown format.";
 
@@ -213,6 +217,8 @@ function buildExitPlanModeDescription(config?: AgentConfig): string {
 			'### `mode: "file"`\n' +
 			'Write your plan to a `.md` file using Write/Edit tools, then call ExitPlanMode with `mode: "file"`. ' +
 			"Set `plan_file_path` to point at a custom file, or omit it to use the default designated plan file (shown when you entered plan mode). " +
+			`A custom path must resolve inside \`${PLAN_DIR_REL}/\`: relaxed plan mode permits writing other files, ` +
+			"but the plan file itself must stay in the plan directory. " +
 			"`inline_plan` is ignored in this mode.\n\n";
 	} else if (allowInline) {
 		howItWorks =

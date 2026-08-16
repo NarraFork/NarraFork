@@ -25,6 +25,7 @@ import {
 	type SideCarBody,
 	type SideCarLabels,
 	sideCarBodyToMarkdown,
+	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 
 /**
@@ -180,7 +181,43 @@ describe("sideCarBodyToMarkdown — the 7 body kinds", () => {
 			flavor: "bash",
 			items: [{ id: "b1", alias: "run-tests", title: "", status: "failed", preview: "" }],
 		};
-		expect(md("bg_bash", body)).toContain("(empty)");
+		const out = md("bg_bash", body);
+		expect(out).toContain("(empty)");
+		// The placeholder is a localized SENTENCE, so it stays prose — fencing it would
+		// dress the UI's own copy up as command output.
+		expect(out).not.toContain("```");
+	});
+
+	it("tasksDone: a bash preview is fenced whole, keeping its column alignment", () => {
+		// Verbatim `bunx @biomejs/biome check` output. Line-by-line prose escaping keeps
+		// the characters but not the layout: the two-space-indented excerpt below the `!`
+		// diagnostic became its own indented-code block, so one message rendered as a
+		// paragraph plus an unrelated code card with the `│` gutter knocked out of line.
+		const preview = [
+			"! This variable measureWebSearch is unused.",
+			"",
+			'  55 │   it("reserves an extra loader lane", async () => {',
+			"  56 │     const { measureWebSearch } = …",
+		].join("\n");
+		const out = md("bg_bash", {
+			kind: "tasksDone",
+			flavor: "bash",
+			items: [{ id: "b1", alias: "run-biome", title: "biome", status: "success", preview }],
+		});
+		// One fenced block holding the output byte-for-byte, indentation included.
+		expect(out).toContain(`\`\`\`\n${preview}\n\`\`\``);
+		// And no escaping leaked into it (the prose path would have written `\!`).
+		expect(out).not.toContain("\\!");
+	});
+
+	it("tasksDone: an agent preview stays prose, since a subagent writes Markdown", () => {
+		const out = md("bg_agent", {
+			kind: "tasksDone",
+			flavor: "agent",
+			items: [{ id: "t1", title: "explore", status: "success", preview: "found the caller" }],
+		});
+		expect(out).toContain("found the caller");
+		expect(out).not.toContain("```");
 	});
 
 	it("messages: a single named sender becomes the heading", () => {
@@ -271,6 +308,30 @@ describe("sideCarBodyToMarkdown — drops model-facing boilerplate", () => {
 		expect(out).not.toContain("e-secret-id");
 		expect(out).not.toContain("KnowledgeRead");
 	});
+
+	it("a knowledge summary holding raw Markdown is reduced to prose", () => {
+		// The regression: `summary` is a FLATTENED slice of the entry body, so a row
+		// written before the server stripped it holds `# Title > quoted …` on one line.
+		// Rendered as Markdown that becomes one display-size heading swallowing the whole
+		// excerpt — and the title it repeats is already this bullet's own label.
+		const out = md("knowledge_base_hint", {
+			kind: "knowledge",
+			hits: [
+				{
+					entryId: "e1",
+					title: "Podman networking",
+					summary: "# Podman networking > the port pool starts at `10000`",
+				},
+			],
+		});
+		expect(out).toContain("- Podman networking — the port pool starts at 10000");
+		// No heading marker survives inside the bullet (the `######` headline is its own
+		// block, which is why the assertion targets the bullet line).
+		const bullet = out.split("\n").find((line) => line.startsWith("- ")) ?? "";
+		expect(bullet).not.toContain("#");
+		expect(bullet).not.toContain(">");
+		expect(bullet).not.toContain("`");
+	});
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -352,5 +413,56 @@ describe("rawSideCarToMarkdown", () => {
 		const out = rawSideCarToMarkdown("<todo_reminder>\nold shape\n</todo_reminder>");
 		expect(out).toContain("<todo_reminder>");
 		expect(out).toContain("old shape");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// verbatimOutputToMarkdown — machine output is preformatted, never prose
+//
+// The counterpart to `rawSideCarToMarkdown`: that one only fences text that looks
+// like a TAG, which is the wrong default for a command's stdout. This one fences
+// unconditionally, because a linter's alignment is the content.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("verbatimOutputToMarkdown", () => {
+	it("fences plain output that carries no Markdown-looking characters", () => {
+		// Even innocuous output is fenced: the point is that the projection does not
+		// SNIFF, so a later line full of pipes cannot change how the earlier ones render.
+		const out = verbatimOutputToMarkdown("ok");
+		expect(out).toBe("```\nok\n```");
+	});
+
+	it("keeps real linter output intact instead of splitting it into prose and a code card", () => {
+		// Verbatim shape of `bunx @biomejs/biome check` output. Under the prose path the
+		// `!` line rendered as a paragraph and the two-space-indented excerpt below it
+		// became a separate INDENTED CODE block — one diagnostic drawn as two unrelated
+		// things, with the `│` gutter alignment broken.
+		const output = [
+			"! This variable measureWebSearch is unused.",
+			"",
+			'  55 │   it("reserves an extra loader lane", async () => {',
+			"  56 │     const { measureWebSearch, webSearchChromeL…",
+		].join("\n");
+		const out = verbatimOutputToMarkdown(output);
+		expect(out.startsWith("```\n")).toBe(true);
+		expect(out.endsWith("\n```")).toBe(true);
+		// The body survives byte-for-byte: no escaping, no re-indentation, gutter kept.
+		expect(out.slice(4, -4)).toBe(output);
+	});
+
+	it("grows the fence past backtick runs in the output so it cannot close early", () => {
+		// Test runners print fenced snippets of the source they failed on, so a triple
+		// backtick inside the output is ordinary, not adversarial.
+		const out = verbatimOutputToMarkdown("before\n```\ninner fence\n```\nafter");
+		const opening = out.slice(0, out.indexOf("\n"));
+		expect(opening.length).toBeGreaterThan(3);
+		expect(out.endsWith(opening)).toBe(true);
+		expect(out).toContain("inner fence");
+	});
+
+	it("returns empty for blank output so the caller can word its own placeholder", () => {
+		// An empty fence would be a hollow card; the caller substitutes a localized
+		// "(empty)" sentence instead, which is prose and not machine output.
+		expect(verbatimOutputToMarkdown("   \n\t\n")).toBe("");
 	});
 });

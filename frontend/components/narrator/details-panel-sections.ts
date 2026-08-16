@@ -47,6 +47,7 @@ export function normalizeBooleanOverride(value: unknown): BooleanOverride {
  */
 export const DETAILS_SECTION_IDS = [
 	"basic",
+	"access",
 	"groups",
 	"skills",
 	"session",
@@ -69,6 +70,9 @@ export type DetailsSectionId = (typeof DETAILS_SECTION_IDS)[number];
  */
 const DEFAULT_OPEN: Record<DetailsSectionId, boolean> = {
 	basic: true,
+	// Closed by default: sharing is deliberate and occasional, and the panel already
+	// shows the current audience as a badge on the collapsed header.
+	access: false,
 	session: true,
 	groups: false,
 	skills: false,

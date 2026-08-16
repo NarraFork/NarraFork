@@ -532,6 +532,7 @@
 	"usageHistoryKind_reasoning_translation": "推理翻译",
 	"usageHistoryKind_settings_test": "设置测试",
 	"usageHistoryKind_git_summary": "Git 摘要",
+	"usageHistoryKind_chat_summarize": "聊天摘要",
 	"usageHistoryKind_internal": "内部",
 	"usageHistoryError": "错误",
 	"usageHistoryCopyError": "复制错误信息",

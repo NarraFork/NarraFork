@@ -1371,11 +1371,7 @@ export function RecentTabList({
 				>
 					{t("loadMoreRecentTabs")}
 				</Button>
-			) : (
-				<Text size="xs" c="dimmed" ta="center" py={4}>
-					{t("allRecentTabsLoaded")}
-				</Text>
-			)}
+			) : null}
 
 			{ctxMenu && (
 				<TabContextMenu

@@ -23,7 +23,12 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { lazy, Suspense, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
-import { useCreateProject, useCreateProjectStream, useProjects } from "../../hooks/useProjects";
+import {
+	useCreateProject,
+	useCreateProjectStream,
+	useHiddenProjectExistence,
+	useProjects,
+} from "../../hooks/useProjects";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 import { normalizeUrlProtocol } from "../../lib/url";
 
@@ -40,6 +45,9 @@ export const Route = createFileRoute("/projects/")({
 
 function ProjectListPage() {
 	const { data: projects, isLoading } = useProjects();
+	// Only probed when the list is empty: it exists purely to tell "no projects yet"
+	// apart from "none of them are yours".
+	const hiddenProjects = useHiddenProjectExistence(!isLoading && !projects?.length);
 	const createProject = useCreateProject();
 	const createProjectStream = useCreateProjectStream();
 	const [opened, { open, close }] = useDisclosure(false);
@@ -203,7 +211,11 @@ function ProjectListPage() {
 			</Group>
 
 			{!projects?.length ? (
-				<Text c="dimmed">{t("noProjects")}</Text>
+				// Two different empty states: telling a user who simply has not been added to
+				// any project to "create one" sends them down the wrong path.
+				<Text c="dimmed">
+					{hiddenProjects.data?.hasHidden ? t("noProjectsVisible") : t("noProjects")}
+				</Text>
 			) : (
 				<Stack gap="sm">
 					{showProjectFilter && (

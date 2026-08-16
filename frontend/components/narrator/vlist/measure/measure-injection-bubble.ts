@@ -221,6 +221,25 @@ const SYSTEM_TEXT_KINDS = new Set([
 	"spec_context_cleared",
 ]);
 
+/**
+ * True when a body contains a block the render layer paints EDGE TO EDGE.
+ *
+ * Only fenced code qualifies today: `CodeBlockView` draws a background, a border and
+ * a copy button spanning the content width it is handed, so unlike text it does not
+ * "simply not fill" a box wider than its content — it fills all of it, and overflows
+ * a frame that shrank below that width.
+ *
+ * A table is deliberately NOT here: `accumulateFrame`'s table arm already clamps its
+ * reported width to the box, and the render layer scrolls it internally, so its
+ * measured and painted widths cannot diverge the way a code panel's do.
+ */
+function hasFullBleedBlock(blocks: readonly { kind: string }[]): boolean {
+	for (const block of blocks) {
+		if (block.kind === "code") return true;
+	}
+	return false;
+}
+
 /** A body that reserves nothing (unrecognized payload kind). */
 const EMPTY_BODY: MeasuredElement = {
 	height: 0,
@@ -271,13 +290,47 @@ export function measureInjectionBubble(
 			: rawMarkdown.length > INJECTION_BODY_MAX_CHARS
 				? rawMarkdown.slice(0, INJECTION_BODY_MAX_CHARS)
 				: rawMarkdown;
-	const body = payload
+	const firstPass = payload
 		? measureInnerCard(payload.kind, payload.data, innerWidth, _lod)
 		: measureMarkdown(bodyText, innerWidth);
+
+	// ── Second pass, only for a body that contains a FULL-BLEED block ────────────
+	//
+	// The shrink-wrap contract (see the module header) is that the frame narrows to
+	// `frame.usedWidth` while the body is painted at the width it was MEASURED at.
+	// That is safe for text — short lines simply do not fill the box — but a fenced
+	// code panel is full-bleed: `CodeBlockView` paints its background, border and
+	// copy button across the whole content width it is handed, not across its widest
+	// line. So a narrow-code bubble shrank its frame while the panel inside kept
+	// painting at the wider measured width, and the panel spilled out of the bubble.
+	//
+	// Rather than making a code block report the full width (which would force every
+	// bubble containing one to span the row, and would widen the USER bubble too —
+	// it reuses `kind: "code"` for its plain pre-wrap body), re-measure the body at
+	// the width the frame actually settled on. One extra pass, only when a full-bleed
+	// block is present, and it converges: the second pass is given exactly the width
+	// the first pass asked for, so the panel now fills a box the frame committed to.
+	// The header floor is folded in, because it is part of the width the frame will
+	// settle on: re-measuring at a width the floor then widens past would leave the
+	// panel narrower than the bubble it sits in — a gap rather than an overflow, but
+	// still the two sides disagreeing about one number.
+	const shrinkTo = Math.max(
+		1,
+		Math.min(
+			innerWidth,
+			Math.max(firstPass.frame.usedWidth, hasHeader ? INJECTION_HEADER_MIN_CONTENT_WIDTH : 0),
+		),
+	);
+	const body =
+		!payload && shrinkTo < innerWidth && hasFullBleedBlock(firstPass.blocks)
+			? measureMarkdown(bodyText, shrinkTo)
+			: firstPass;
 	// The markdown frame is reused verbatim: its per-block `top` values are relative
 	// to the body's own origin, and the render copy offsets the whole body by
 	// `bodyTop`. Rewriting the tops here would duplicate that offset.
 	const frame = body.frame;
+	// What the body was actually wrapped at, which the render copy must paint at.
+	const bodyWidth = body.contentWidth;
 
 	const headerBlock = hasHeader ? INJECTION_HEADER_HEIGHT + INJECTION_HEADER_BODY_GAP : 0;
 	const noteBlock = hasNote ? INJECTION_NOTE_GAP + INJECTION_NOTE_HEIGHT : 0;
@@ -305,8 +358,10 @@ export function measureInjectionBubble(
 		// The width the body was WRAPPED at, which the render copy must paint at.
 		// Deliberately not the frame's inner width: those differ whenever the bubble
 		// shrink-wrapped, and painting at the narrower one would re-wrap the text
-		// under a height that was predicted for the wider one.
-		contentWidth: innerWidth,
+		// under a height that was predicted for the wider one. When the body was
+		// re-measured for a full-bleed block this is the SECOND pass's width, which is
+		// the one its frame belongs to.
+		contentWidth: bodyWidth,
 		usedWidth,
 		bodyTop,
 		hasHeader,

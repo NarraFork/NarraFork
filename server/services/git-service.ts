@@ -56,6 +56,60 @@ const READ_TIMEOUT_MS = 60_000;
 const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 /**
+ * Depth of the walk behind {@link gitService.getLastCommitTimes}.
+ *
+ * Measured on this repository: 200 commits resolved 90 of 127 changed paths, and 400
+ * and 800 resolved the same 90 — the walk stops finding new paths well before it stops
+ * producing output (40 KB at 200, 88 KB at 800). Anything unresolved falls back to the
+ * window boundary, which is safe by construction, so extra depth buys nothing.
+ */
+const COMMIT_BOUNDARY_MAX_COMMITS = 200;
+
+/**
+ * Path ceiling for one boundary walk.
+ *
+ * Matched to the 200-entry cap on `getStatusSummary().files`: the caller cannot show
+ * more changed files than that, so a larger pathspec would describe rows nobody
+ * renders. Also keeps the argument vector far below ARG_MAX (128 paths measured at
+ * 5 KB here, against a 2 MB limit).
+ */
+const COMMIT_BOUNDARY_MAX_PATHS = 200;
+
+/**
+ * Prefix marking a commit line in the boundary walk.
+ *
+ * `--name-only` prints paths bare on their own lines, so commit lines need a sentinel
+ * that cannot occur at the start of a repo-relative path. NUL is the one byte git
+ * forbids in a path, which makes misparsing impossible rather than merely unlikely.
+ *
+ * It cannot be written literally in the format argument — spawn rejects an argv entry
+ * containing NUL (`ERR_INVALID_ARG_VALUE`) — so the format uses git's `%x00` escape and
+ * git emits the byte itself. Note that `String.prototype.trim` does NOT strip NUL, so
+ * the marker survives line trimming.
+ */
+const COMMIT_BOUNDARY_MARKER = "\0";
+/** The `%x00` escape that makes git print {@link COMMIT_BOUNDARY_MARKER}. */
+const COMMIT_BOUNDARY_MARKER_FORMAT = "%x00";
+
+/**
+ * Convert a git ISO-8601 timestamp to the UTC `...Z` form.
+ *
+ * `%cI` carries the committer's local offset (`2026-08-14T18:19:20+08:00`) while
+ * `file_attributions.changedAt` is stored as UTC with a `Z` suffix. These boundaries are
+ * compared against that column as STRINGS, and lexicographic order across different
+ * offsets is meaningless: the example above sorts after `2026-08-14T11:00:00Z` despite
+ * being two hours earlier. Normalizing here keeps every consumer on one representation.
+ *
+ * Returns null for an unparseable value rather than a wrong instant, so a caller can
+ * skip the boundary instead of silently filtering on garbage.
+ */
+function toUtcIso(raw: string): string | null {
+	const ms = Date.parse(raw);
+	if (Number.isNaN(ms)) return null;
+	return new Date(ms).toISOString();
+}
+
+/**
  * Default depth for {@link gitService.findCommitLogIndex}.
  *
  * A cursor deeper than this means the client is asking for a position no user
@@ -137,6 +191,16 @@ export interface GitStatusFile {
 	/** Two-character porcelain status, e.g. "M ", " M", "MM", "??". */
 	status: string;
 	path: string;
+	/**
+	 * Pre-rename path, for an `R`/`C` entry. Undefined for every other status.
+	 *
+	 * Porcelain already reports it (`R  old\0new`) and the parser already extracts it; it
+	 * is surfaced here because consumers keyed on `path` alone cannot find anything
+	 * recorded before the rename. File attribution is the concrete case: rows are written
+	 * under the path that existed at the time, so a renamed file's entire history sits
+	 * under a path that no longer appears in the diff.
+	 */
+	oldPath?: string;
 	linesAdded: number;
 	linesRemoved: number;
 	stagedLinesAdded: number;
@@ -688,8 +752,20 @@ export const gitService = {
 		return { added, removed };
 	},
 
-	async getMergeBase(repoPath: string, branchA: string, branchB: string): Promise<string> {
-		const result = await execRead(["merge-base", branchA, branchB], repoPath);
+	/**
+	 * `silent` is for callers that ASK about revisions which may legitimately not relate.
+	 * Unrelated histories and a pruned sha both exit non-zero here, and for the Ruler's
+	 * anchor fallback that is an expected answer ("no position for this chapter"), not a
+	 * fault — logging it at error level put routine lines in the log that read as a broken
+	 * repository. The throw is unchanged either way, so merge paths keep their diagnostics.
+	 */
+	async getMergeBase(
+		repoPath: string,
+		branchA: string,
+		branchB: string,
+		opts: { silent?: boolean } = {},
+	): Promise<string> {
+		const result = await execRead(["merge-base", branchA, branchB], repoPath, opts.silent ?? false);
 		if (result.exitCode !== 0) throw new GitError(`Failed to get merge base: ${result.stderr}`);
 		return result.stdout;
 	},
@@ -1052,6 +1128,10 @@ export const gitService = {
 				files.push({
 					status: entry.status,
 					path: entry.path,
+					// Only `R`/`C` entries carry one; `parsePorcelainStatusZ` leaves it
+					// undefined otherwise, and the field is omitted rather than sent as
+					// null so a JSON consumer sees the same shape it always did.
+					...(entry.oldPath ? { oldPath: entry.oldPath } : {}),
 					linesAdded: stagedStats.added + unstagedStats.added,
 					linesRemoved: stagedStats.removed + unstagedStats.removed,
 					stagedLinesAdded: stagedStats.added,
@@ -1619,6 +1699,89 @@ export const gitService = {
 		return { diff, truncated };
 	},
 
+	// === Commit boundaries ===
+
+	/**
+	 * When each of `paths` was last committed, plus the walk's oldest boundary.
+	 *
+	 * This answers "where does the current uncommitted change to this file begin",
+	 * which is what separates *this* round of edits from the file's whole history. A
+	 * single repository-wide HEAD timestamp cannot answer it: in this repository 90 of
+	 * 127 changed files were last committed BEFORE HEAD, by a median of 164 hours, so a
+	 * global boundary silently discards real attributions.
+	 *
+	 * One bounded walk serves every path. `--max-count` caps the work: beyond a few
+	 * hundred commits the walk stops finding new paths (200 and 800 both resolved the
+	 * same 90 files here) while output keeps growing.
+	 *
+	 * A path absent from `byPath` has no commit in the window. That is either a file
+	 * that was never committed (untracked — every attribution belongs to the current
+	 * change) or one whose last commit is older than the window. The two are
+	 * indistinguishable from the walk alone, so callers use `oldestInWindow` for
+	 * tracked paths: being NEWER than the true boundary, it can only under-count, and
+	 * over-crediting a file with unrelated history is the failure that matters.
+	 *
+	 * Precision caveat: `%cI` is second-resolution, so a change recorded in the SAME
+	 * second as the commit cannot be placed on either side of it and will be counted as
+	 * part of the current round. The error is bounded by one second and errs toward
+	 * showing a contributor rather than hiding one, which is the safer direction for a
+	 * display that answers "who touched this".
+	 *
+	 * @param paths  Repo-relative paths. Capped at {@link COMMIT_BOUNDARY_MAX_PATHS};
+	 *               the excess simply falls back to `oldestInWindow`.
+	 */
+	async getLastCommitTimes(
+		worktreePath: string,
+		paths: string[],
+	): Promise<{ byPath: Map<string, string>; oldestInWindow: string | null }> {
+		const byPath = new Map<string, string>();
+		if (paths.length === 0) return { byPath, oldestInWindow: null };
+		// An unborn HEAD has nothing to walk, and `git log` would fail rather than
+		// report zero commits.
+		if (await hasNoCommits(worktreePath)) return { byPath, oldestInWindow: null };
+
+		const capped = paths.slice(0, COMMIT_BOUNDARY_MAX_PATHS);
+		const result = await execRead(
+			[
+				// Prevent git from quoting non-ASCII paths as octal escape sequences
+				// (e.g. "\344\270\255..."). Without this, CJK and other non-ASCII filenames
+				// won't match the bare path strings callers pass in, causing boundary misses
+				// that fall back to the less precise `oldestInWindow`.
+				"-c",
+				"core.quotePath=false",
+				"log",
+				"HEAD",
+				`--max-count=${COMMIT_BOUNDARY_MAX_COMMITS}`,
+				// A commit line is prefixed so it cannot be confused with a file path;
+				// `--name-only` prints paths bare.
+				`--format=${COMMIT_BOUNDARY_MARKER_FORMAT}%cI`,
+				"--name-only",
+				"--",
+				...capped,
+			],
+			worktreePath,
+			true,
+		);
+		if (result.exitCode !== 0) return { byPath, oldestInWindow: null };
+
+		let current: string | null = null;
+		let oldestInWindow: string | null = null;
+		for (const rawLine of result.stdout.split("\n")) {
+			const line = rawLine.trim();
+			if (!line) continue;
+			if (line.startsWith(COMMIT_BOUNDARY_MARKER)) {
+				current = toUtcIso(line.slice(COMMIT_BOUNDARY_MARKER.length));
+				// Walk order is newest-first, so the last commit seen is the oldest.
+				if (current) oldestInWindow = current;
+				continue;
+			}
+			// First sighting wins: the newest commit that touched this path.
+			if (current && !byPath.has(line)) byPath.set(line, current);
+		}
+
+		return { byPath, oldestInWindow };
+	},
+
 	// === Log ===
 
 	async getLog(
@@ -1745,14 +1908,36 @@ export const gitService = {
 			});
 		}
 		const lines = result.stdout.trim().split("\n");
+		// An exact hit is unambiguous and wins immediately. An abbreviated sha is only
+		// answered once the whole walk has been scanned, because a prefix that matches
+		// two commits names neither: at 7 hex chars the birthday bound is roughly
+		// 1/2000 over 50k commits, and this index drives Ruler's cursor pagination, so
+		// a wrong hit silently shifts a page and drops the commits in between.
+		//
+		// Rejecting ambiguity rather than imposing a minimum prefix length: a length
+		// floor is a guess about collision odds that still answers wrongly when the
+		// collision does happen, and it breaks the legitimate short-sha callers this
+		// method has always supported. Scanning to the end costs one extra pass over an
+		// already-materialized, `--max-count`-bounded array.
+		let prefixIndex: number | null = null;
+		let prefixAmbiguous = false;
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i]?.trim();
 			if (!line) continue;
-			// Accept an abbreviated cursor too: the ruler carries full SHAs, but a caller
-			// passing `shortSha` would otherwise silently never match and page from 0.
-			if (line === sha || (sha.length >= 7 && line.startsWith(sha))) return i;
+			if (line === sha) return i;
+			if (line.startsWith(sha)) {
+				if (prefixIndex !== null) prefixAmbiguous = true;
+				else prefixIndex = i;
+			}
 		}
-		return null;
+		if (prefixAmbiguous) {
+			logger.warn("Ambiguous abbreviated sha in commit log index scan", {
+				worktreePath,
+				shaLength: sha.length,
+			});
+			return null;
+		}
+		return prefixIndex;
 	},
 
 	// === Reset ===

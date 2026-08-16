@@ -27,7 +27,11 @@ describe("model prompt modules", () => {
 
 	test("preserves dynamic prompt interpolation", () => {
 		expect(buildReviewSystemPrompt("example diff", "en")).toContain("example diff");
-		expect(getPlanModeSystemReminder("en", "abc123", false)).toContain(".narrafork/plan-abc123.md");
+		// The reminder is handed a resolved path, not a plan identity: the write gate
+		// and ExitPlanMode must name the same file it tells the model to write.
+		expect(getPlanModeSystemReminder("en", ".narrafork/plans/plan-abc123.md", false)).toContain(
+			".narrafork/plans/plan-abc123.md",
+		);
 	});
 
 	test("provides explicit search and read-only review follow-up prompts", () => {

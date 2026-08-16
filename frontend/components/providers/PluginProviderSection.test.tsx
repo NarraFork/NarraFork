@@ -172,7 +172,10 @@ function configView(overrides: Record<string, unknown> = {}) {
 	};
 }
 
-async function renderSection(contributionId = "demo") {
+async function renderSection(
+	contributionId = "demo",
+	models?: Parameters<typeof PluginProviderSection>[0]["models"],
+) {
 	const queryClient = new QueryClient({
 		defaultOptions: {
 			queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
@@ -183,7 +186,11 @@ async function renderSection(contributionId = "demo") {
 		root?.render(
 			<QueryClientProvider client={queryClient}>
 				<MantineProvider>
-					<PluginProviderSection pluginId="com.example.demo" contributionId={contributionId} />
+					<PluginProviderSection
+						pluginId="com.example.demo"
+						contributionId={contributionId}
+						{...(models ? { models } : {})}
+					/>
 				</MantineProvider>
 			</QueryClientProvider>,
 		);
@@ -209,9 +216,24 @@ describe("PluginProviderSection rendering choice", () => {
 		// renders its runtime placeholder, which is proof the iframe path was taken rather
 		// than the generated form.
 		expect(text()).toContain("runtimeUnavailable");
+		// The generated form itself must not appear, which is the actual guarantee: the plugin
+		// owns the configuration area.
+		//
+		// The provider-config payload *is* fetched either way, and has to be: the proxy control
+		// and the catalog refresh both address a provider *instance* id that only that payload
+		// carries, and both are host concerns that exist regardless of who renders the config
+		// area. An earlier version of this test asserted the request never happened, which
+		// described the implementation at the time rather than the behaviour worth protecting.
 		expect(text()).not.toContain("pluginProviderNoCustomUi");
-		// The generated form must not even be fetched when the plugin owns the area.
-		expect(configCalls).toEqual([]);
+	});
+
+	test("issues one provider-config request for the whole section", async () => {
+		// The section has three consumers of that payload (the fallback form, the proxy control,
+		// the model refresh). Querying per consumer would multiply the request; the shared React
+		// Query key plus a single call site keeps it to one.
+		applyView();
+		await renderSection();
+		expect(configCalls.length).toBeLessThanOrEqual(1);
 	});
 
 	test("shows a switcher only when several provider-settings views exist", async () => {
@@ -282,5 +304,71 @@ describe("PluginProviderSection rendering choice", () => {
 		};
 		await renderSection("demo");
 		expect(text()).toContain("admin.detail.config.empty");
+	});
+});
+
+/**
+ * The model area is host-rendered on purpose.
+ *
+ * Model visibility, context-window overrides and the model tester all live behind
+ * `/api/settings`, which a sandboxed plugin iframe cannot reach (`connect-src 'none'`). So a
+ * plugin provider can only have these controls if the host renders them outside the frame —
+ * before this existed, a plugin provider had no model controls at all while every builtin
+ * provider did.
+ */
+describe("PluginProviderSection model area", () => {
+	const modelControls = (overrides: Record<string, unknown> = {}) =>
+		({
+			prefix: "demo",
+			models: [
+				{ value: "demo:fast", label: "Fast", provider: "demo", bareModel: "fast" },
+				{
+					value: "demo:big",
+					label: "Big",
+					provider: "demo",
+					bareModel: "big",
+					contextWindow: 200_000,
+				},
+			],
+			hiddenModels: new Set<string>(),
+			onToggleHidden: () => {},
+			modelContextWindows: {},
+			onContextWindowChange: () => {},
+			customModels: [],
+			onCustomModelsChange: () => {},
+			...overrides,
+		}) as Parameters<typeof PluginProviderSection>[0]["models"];
+
+	test("lists the provider's models alongside its own settings view", async () => {
+		// Both areas render: the plugin owns configuration, the host owns models.
+		applyView();
+		await renderSection("demo", modelControls());
+		expect(text()).toContain("Fast");
+		expect(text()).toContain("Big");
+		expect(text()).toContain("modelsSection");
+	});
+
+	test("lists models alongside the generated fallback form too", async () => {
+		// A plugin without its own UI must still get model controls.
+		configResponse = { pluginId: "com.example.demo", providers: [configView()] };
+		await renderSection("demo", modelControls());
+		expect(text()).toContain("pluginProviderNoCustomUi");
+		expect(text()).toContain("Fast");
+	});
+
+	test("renders no model area when the caller supplies none", async () => {
+		// Keeps the component usable from a surface that only configures credentials.
+		applyView();
+		await renderSection("demo");
+		expect(text()).not.toContain("modelsSection");
+	});
+
+	test("reports hidden models through the host state it was given", async () => {
+		// The set is the host's `settings.agent.hiddenModels`; a plugin model hidden here is
+		// hidden by the same mechanism as a builtin one.
+		applyView();
+		await renderSection("demo", modelControls({ hiddenModels: new Set(["demo:fast"]) }));
+		// Still listed — hiding affects model *selection*, not this management list.
+		expect(text()).toContain("Fast");
 	});
 });

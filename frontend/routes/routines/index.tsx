@@ -1166,12 +1166,30 @@ function GlobalPromptTab() {
 	const { t } = useTranslation("routines");
 	const contentCapability = useContentCapability();
 	const routinesCapability = contentCapability.projectRoutines;
+	const { data: currentUser } = useCurrentUser();
 	const globalPromptUnsupportedReason = routinesCapability.supported
 		? undefined
 		: (routinesCapability.reason ?? t("globalPromptUnsupportedDesc"));
-	const canManageGlobalPrompt = routinesCapability.supported;
-	const { data, isLoading } = useGlobalPrompt(canManageGlobalPrompt);
+	// Writing requires admin because the content reaches every narrator's system prompt
+	// (mirrors `defaultSystemPrompt` in settings). Reading stays open: the same text is
+	// already visible by asking any narrator, so gating it here would only break the
+	// read-only view. Anyone can look; only an admin can change it.
+	const isAdmin = currentUser?.role === "admin";
+	const canManageGlobalPrompt = routinesCapability.supported && isAdmin;
+	const { data, isLoading } = useGlobalPrompt(routinesCapability.supported);
 	const updateMutation = useUpdateGlobalPrompt();
+
+	// A byte-capped prefix must never be saved back: PUT writes what it is given, so
+	// submitting the visible part would silently discard everything past the cut.
+	const truncated = data?.truncated === true;
+	const canSaveGlobalPrompt = canManageGlobalPrompt && !truncated;
+	const saveBlockedReason = !routinesCapability.supported
+		? globalPromptUnsupportedReason
+		: !isAdmin
+			? t("globalPromptAdminOnly")
+			: truncated
+				? t("globalPromptTruncatedTitle")
+				: undefined;
 
 	const [content, setContent] = useState("");
 	const [dirty, setDirty] = useState(false);
@@ -1192,7 +1210,7 @@ function GlobalPromptTab() {
 
 	const handleSave = useCallback(
 		(filePath?: string) => {
-			if (!canManageGlobalPrompt) return;
+			if (!canSaveGlobalPrompt) return;
 			updateMutation.mutate(
 				{ content, filePath },
 				{
@@ -1203,7 +1221,7 @@ function GlobalPromptTab() {
 				},
 			);
 		},
-		[canManageGlobalPrompt, content, updateMutation],
+		[canSaveGlobalPrompt, content, updateMutation],
 	);
 
 	if (isLoading) {
@@ -1225,6 +1243,19 @@ function GlobalPromptTab() {
 			{globalPromptUnsupportedReason && (
 				<Alert color="yellow" variant="light" title={t("globalPromptUnsupportedTitle")}>
 					{globalPromptUnsupportedReason}
+				</Alert>
+			)}
+			{routinesCapability.supported && !isAdmin && (
+				<Alert color="gray" variant="light" title={t("globalPromptAdminOnly")}>
+					{t("globalPromptAdminOnlyDesc")}
+				</Alert>
+			)}
+			{truncated && (
+				<Alert color="orange" variant="light" title={t("globalPromptTruncatedTitle")}>
+					{t("globalPromptTruncatedDesc", {
+						shown: content.length,
+						total: data?.totalBytes ?? 0,
+					})}
 				</Alert>
 			)}
 
@@ -1268,7 +1299,9 @@ function GlobalPromptTab() {
 				minRows={10}
 				maxRows={30}
 				styles={{ input: { fontFamily: "monospace", fontSize: 13 } }}
-				disabled={!canManageGlobalPrompt}
+				// Read-only rather than disabled for non-admins and truncated files: the text
+				// stays selectable and copyable, which is the whole value of the read path.
+				readOnly={!canSaveGlobalPrompt}
 			/>
 
 			<Group justify="flex-end" gap="xs">
@@ -1286,8 +1319,8 @@ function GlobalPromptTab() {
 							variant="light"
 							onClick={() => handleSave(c.path)}
 							loading={updateMutation.isPending}
-							disabled={!canManageGlobalPrompt || !content.trim()}
-							title={!canManageGlobalPrompt ? globalPromptUnsupportedReason : undefined}
+							disabled={!canSaveGlobalPrompt || !content.trim()}
+							title={saveBlockedReason}
 						>
 							{t("globalPromptSaveTo")} {c.path.split("/").pop()}
 						</Button>
@@ -1297,8 +1330,8 @@ function GlobalPromptTab() {
 						size="xs"
 						onClick={() => handleSave()}
 						loading={updateMutation.isPending}
-						disabled={!canManageGlobalPrompt || !dirty}
-						title={!canManageGlobalPrompt ? globalPromptUnsupportedReason : undefined}
+						disabled={!canSaveGlobalPrompt || !dirty}
+						title={saveBlockedReason}
 					>
 						{t("globalPromptSave")}
 					</Button>
@@ -1729,14 +1762,16 @@ function ProjectSkillsTab() {
 				data={projectOptions}
 				value={selectedProjectId}
 				onChange={setSelectedProjectId}
-				disabled={!skillsCapability.supported}
+				// Also disabled with nothing to choose: an enabled but empty dropdown reads as
+				// a loading bug rather than as missing project access.
+				disabled={!skillsCapability.supported || projectOptions.length === 0}
 				searchable
 				clearable
 			/>
 
 			{!selectedProjectId && (
 				<Text size="sm" c="dimmed">
-					{t("noProjectSelected")}
+					{projectOptions.length === 0 ? t("noProjectsAvailable") : t("noProjectSelected")}
 				</Text>
 			)}
 

@@ -9,6 +9,7 @@ import { pluginIdSchema } from "../lib/plugins/manifest";
 import { permissionGrantSchema } from "../lib/plugins/permissions";
 import type { JsonValue } from "../lib/plugins/protocol";
 import { settings } from "../lib/settings";
+import type { ProxyOverride } from "../lib/settings/types";
 import { assertAdmin } from "../middleware/auth";
 import { pluginManager as corePluginManager } from "../services/plugin-manager";
 import { pluginPlatformServices } from "../services/plugin-platform-services";
@@ -57,6 +58,24 @@ export interface PluginRouteOptions {
 	 * the whole platform-services graph; defaults to the shared instance.
 	 */
 	providerConfigService?: ProviderConfigRouteService;
+	/**
+	 * Model-catalog refresher. Injectable for the same reason as the config service; the
+	 * platform always provides one, so this only ever overrides it.
+	 */
+	providerCatalogRefresher?: ProviderCatalogRouteRefresher;
+}
+
+/**
+ * The catalog refresh this route needs.
+ *
+ * Narrowed to one method so a route test does not have to build a client pool, a credential
+ * resolver and a registry to exercise it.
+ */
+export interface ProviderCatalogRouteRefresher {
+	refresh(
+		providerInstanceId: string,
+		options?: { force?: boolean; signal?: AbortSignal },
+	): Promise<{ modelCount: number; stale: boolean; skipped?: boolean; error?: unknown }>;
 }
 
 /**
@@ -74,6 +93,11 @@ export interface ProviderConfigRouteService {
 		pluginId: string,
 		providerInstanceId: string,
 		prefix: string,
+	): Promise<unknown> | unknown;
+	updateProxy(
+		pluginId: string,
+		providerInstanceId: string,
+		proxy: ProxyOverride | null,
 	): Promise<unknown> | unknown;
 }
 
@@ -125,6 +149,34 @@ const providerPrefixUpdateSchema = z
 	})
 	.strict();
 
+/** Which provider's catalog to re-pull. The refresh is always forced, so there is no flag. */
+const providerCatalogRefreshSchema = z
+	.object({
+		providerInstanceId: z.string().trim().min(1).max(256),
+	})
+	.strict();
+
+/**
+ * Outbound proxy override for one provider.
+ *
+ * Shape-checked here; the state store owns the authoritative validation (URL parsing and
+ * scheme allowlist) so a value can never reach disk that a later load would discard.
+ *
+ * `proxy: null` clears the override and returns the provider to the global policy.
+ */
+const providerProxyUpdateSchema = z
+	.object({
+		providerInstanceId: z.string().trim().min(1).max(256),
+		proxy: z
+			.object({
+				mode: z.enum(["default", "direct", "system", "custom"]),
+				url: z.string().trim().max(2048).optional(),
+			})
+			.strict()
+			.nullable(),
+	})
+	.strict();
+
 const installSchema = z
 	.object({
 		path: z
@@ -163,11 +215,23 @@ function isContained(root: string, candidate: string): boolean {
 	return remainder === "" || (remainder !== ".." && !remainder.startsWith(`..${sep}`));
 }
 
+/**
+ * Strip credential-shaped substrings out of plugin-supplied text.
+ *
+ * The field NAME is captured and kept, so the reader can still see which setting was
+ * redacted — `token=<redacted>` rather than an anonymous placeholder. It was previously a
+ * non-capturing group paired with a `$1` replacement, which emitted the literal text
+ * `$1=<redacted>`: no credential leaked (the whole match was replaced either way), but the
+ * one piece of diagnostic value the redaction was supposed to preserve was lost.
+ *
+ * `slice(-max)` keeps the TAIL, because a plugin's error text is most informative at the
+ * end (the innermost failure), not at the start.
+ */
 function sanitizeText(value: unknown, max = MAX_DIAGNOSTIC_TEXT): string | undefined {
 	if (typeof value !== "string") return undefined;
 	return value
 		.replace(/(?:Bearer\s+)[A-Za-z0-9._~-]+/gi, "Bearer <redacted>")
-		.replace(/(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+/gi, "$1=<redacted>")
+		.replace(/(api[_-]?key|token|secret|password)(\s*[:=]\s*)[^\s,;]+/gi, "$1$2<redacted>")
 		.slice(-max);
 }
 
@@ -213,7 +277,8 @@ function sanitizeContribution(value: unknown): Record<string, unknown> {
 				surface === "workspace" ||
 				surface === "director" ||
 				surface === "focus" ||
-				surface === "settings",
+				surface === "settings" ||
+				surface === "provider-settings",
 		);
 		if (surfaces.length > 0) result.surfaces = surfaces;
 	}
@@ -271,6 +336,10 @@ function sanitizeList(value: unknown): RouteResult {
  * service already replaced secret values with a placeholder; this only pins the wire
  * shape and caps the free-form parts so a hostile manifest cannot inflate a response.
  */
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function sanitizeProviderConfigView(value: unknown): RouteResult {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const view = value as Record<string, unknown>;
@@ -291,6 +360,22 @@ function sanitizeProviderConfigView(value: unknown): RouteResult {
 		config: view.config && typeof view.config === "object" ? view.config : {},
 		secretFields: stringArray(view.secretFields, 64),
 		secretsSet: stringArray(view.secretsSet, 64),
+		// Proxy override, projected explicitly so only the two known fields cross.
+		//
+		// SECURITY: a custom proxy URL may carry credentials in its userinfo component. This is
+		// an admin-only response for the value that admin just supplied, so echoing it back is
+		// what lets the form show the current setting — but it must never be widened to a
+		// non-admin route or logged.
+		...(isRecord(view.proxy)
+			? {
+					proxy: {
+						mode: sanitizeText(view.proxy.mode, 16),
+						...(typeof view.proxy.url === "string"
+							? { url: sanitizeText(view.proxy.url, 2048) }
+							: {}),
+					},
+				}
+			: {}),
 	} as RouteResult;
 }
 
@@ -523,6 +608,8 @@ export function createPluginRoutes(
 	const installRoots = options.installRoots ?? [getNarraforkPath("plugin-imports")];
 	const providerConfig =
 		options.providerConfigService ?? pluginPlatformServices.providerConfigService;
+	const catalogRefresher =
+		options.providerCatalogRefresher ?? pluginPlatformServices.providerCatalogRefresher;
 
 	const requirePluginsEnabled = (): void => {
 		if (!enabled) throw new AppError("Plugin system is disabled", 503, "PLUGINS_DISABLED");
@@ -633,6 +720,97 @@ export function createPluginRoutes(
 				pluginId,
 				parsed.data.providerInstanceId,
 				parsed.data.config as Record<string, JsonValue>,
+			);
+			return c.json({ pluginId, provider: sanitizeProviderConfigView(updated) });
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	/**
+	 * Re-pull a plugin provider's model catalog.
+	 *
+	 * The host's model list for a plugin provider comes from this catalog, which is otherwise
+	 * only refreshed after activation. So a plugin that gained access to new models — a
+	 * credential added, a subscription upgraded — kept showing the old list until the plugin
+	 * was restarted, and nothing in the UI could fix it: the plugin's own panel runs in an
+	 * iframe with `connect-src 'none'` and cannot reach this endpoint, while its backend
+	 * commands can refresh only the plugin's private cache, not the host registry.
+	 *
+	 * `force` is implied: the caller asked for a refresh, so skipping a catalog the host still
+	 * considers fresh would make the button do nothing.
+	 */
+	app.post("/:pluginId/providers/catalog/refresh", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			const pluginId = parsePluginId(c);
+			let rawBody: unknown;
+			try {
+				rawBody = await c.req.json();
+			} catch (error) {
+				throw parseBodyError(error);
+			}
+			const parsed = providerCatalogRefreshSchema.safeParse(rawBody);
+			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			// Ownership check: the refresher addresses a provider instance globally, so without
+			// this an admin could refresh another plugin's catalog through this plugin's path.
+			const views = await providerConfig.list(pluginId);
+			const owned = Array.isArray(views)
+				? views.some((view) => view.providerInstanceId === parsed.data.providerInstanceId)
+				: false;
+			if (!owned) {
+				throw new NotFoundError("Plugin provider", parsed.data.providerInstanceId);
+			}
+			const result = await catalogRefresher.refresh(parsed.data.providerInstanceId, {
+				force: true,
+			});
+			return c.json({
+				pluginId,
+				providerInstanceId: parsed.data.providerInstanceId,
+				modelCount: result.modelCount,
+				stale: result.stale,
+				...(result.skipped ? { skipped: true } : {}),
+				// The refresher reports an unreachable upstream as a result rather than throwing,
+				// because a stale catalog is still a usable registration. Surfaced as a string so
+				// the caller can show why nothing changed instead of reporting a false success.
+				...(result.error
+					? {
+							error: result.error instanceof Error ? result.error.message : String(result.error),
+						}
+					: {}),
+			});
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	/**
+	 * Set or clear a plugin provider's outbound proxy.
+	 *
+	 * Its own route rather than a field on `providers/config` because it is host policy, not
+	 * plugin config: it must not be schema-validated against the plugin's `configSchema`, must
+	 * not be persisted with the config, and must never be readable by the plugin through
+	 * `config.get`. Only the resolved URL reaches the plugin, in `hostHints`.
+	 *
+	 * This is what gives a plugin provider the per-provider proxy control every built-in
+	 * provider already had through `settings.<provider>.proxy`.
+	 */
+	app.put("/:pluginId/providers/proxy", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			const pluginId = parsePluginId(c);
+			let rawBody: unknown;
+			try {
+				rawBody = await c.req.json();
+			} catch (error) {
+				throw parseBodyError(error);
+			}
+			const parsed = providerProxyUpdateSchema.safeParse(rawBody);
+			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			const updated = await providerConfig.updateProxy(
+				pluginId,
+				parsed.data.providerInstanceId,
+				parsed.data.proxy,
 			);
 			return c.json({ pluginId, provider: sanitizeProviderConfigView(updated) });
 		} catch (error) {

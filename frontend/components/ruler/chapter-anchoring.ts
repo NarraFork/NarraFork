@@ -17,6 +17,23 @@ export interface AnchorableChapter {
 	title: string;
 	parentChapterId?: string | null;
 	startCommitSha?: string | null;
+	/**
+	 * Trunk commit the server found for a chapter its own start commit cannot place —
+	 * `merge-base <startCommitSha> <branch>`. See the server's `resolveAnchorFallbacks`.
+	 *
+	 * Used only after the parent-chain walk fails, so a chapter that can be placed
+	 * exactly is never moved to an approximate position.
+	 */
+	anchorFallbackSha?: string | null;
+	/**
+	 * Whether `startCommitSha` is still reachable from the trunk.
+	 *
+	 * `false` means history was rewritten under the chapter (rebase, squash-merge,
+	 * amend) and its start commit will never appear on the timeline no matter how much
+	 * is paged in — the difference between "load older commits" being the fix and being
+	 * a dead end. Only sent when the server had to fall back.
+	 */
+	startCommitOnBranch?: boolean | null;
 }
 
 export interface AnchorResolution<T extends AnchorableChapter> {
@@ -24,6 +41,13 @@ export interface AnchorResolution<T extends AnchorableChapter> {
 	byStartSha: Map<string, T[]>;
 	/** Chapters with no reachable backbone anchor — these cannot be drawn. */
 	unanchored: T[];
+	/**
+	 * Chapters drawn at an approximate position because their real start commit is gone
+	 * from the trunk. They ARE in `byStartSha` and do render; this list exists so the view
+	 * can say the position is the fork point rather than the commit, instead of silently
+	 * implying the chapter started somewhere it did not.
+	 */
+	rewrittenAnchors: T[];
 }
 
 /**
@@ -39,7 +63,8 @@ export function resolveChapterAnchors<T extends AnchorableChapter>(
 ): AnchorResolution<T> {
 	const byStartSha = new Map<string, T[]>();
 	const unanchored: T[] = [];
-	if (chapters.length === 0) return { byStartSha, unanchored };
+	const rewrittenAnchors: T[] = [];
+	if (chapters.length === 0) return { byStartSha, unanchored, rewrittenAnchors };
 
 	const chapterById = new Map<string, T>();
 	for (const chapter of chapters) chapterById.set(chapter.id, chapter);
@@ -62,14 +87,30 @@ export function resolveChapterAnchors<T extends AnchorableChapter>(
 
 	for (const chapter of chapters) {
 		const sha = resolve(chapter);
-		if (!sha) {
-			unanchored.push(chapter);
+		if (sha) {
+			const list = byStartSha.get(sha) ?? [];
+			list.push(chapter);
+			byStartSha.set(sha, list);
 			continue;
 		}
-		const list = byStartSha.get(sha) ?? [];
-		list.push(chapter);
-		byStartSha.set(sha, list);
+
+		// Nothing on the loaded backbone places this chapter. Before reporting it as
+		// undrawable, try the server's fork-point fallback: for a chapter whose start
+		// commit was rewritten out of the trunk, this is the ONLY position it will ever
+		// have, and the alternative is a card that never appears again.
+		const fallback = chapter.anchorFallbackSha;
+		if (fallback && hasTick(fallback)) {
+			const list = byStartSha.get(fallback) ?? [];
+			list.push(chapter);
+			byStartSha.set(fallback, list);
+			// `startCommitOnBranch === false` is the rewritten case. When it is true the
+			// fallback equals the start commit, which means the commit is a legitimate
+			// ancestor that just happened to page in — an exact position, not an approximation.
+			if (chapter.startCommitOnBranch === false) rewrittenAnchors.push(chapter);
+			continue;
+		}
+		unanchored.push(chapter);
 	}
 
-	return { byStartSha, unanchored };
+	return { byStartSha, unanchored, rewrittenAnchors };
 }

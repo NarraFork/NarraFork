@@ -1,8 +1,10 @@
-import { Stack, Title } from "@mantine/core";
+import { Card, Divider, Stack, Text, Title } from "@mantine/core";
 import { createFileRoute, useRouterState } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { AgentSection } from "../../components/settings/AgentSection";
+import { TraitLayerEditor } from "../../components/settings/TraitLayerEditor";
+import { useCurrentUser } from "../../hooks/useAuth";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 
@@ -14,6 +16,7 @@ function SettingsAgentPage() {
 	const { t } = useTranslation("settings");
 	const is = useInstanceSettingsContext();
 	const { data: userPrefs } = useUserPreferences();
+	const { data: currentUser } = useCurrentUser();
 	const updateUserPref = useUpdateUserPreferences();
 	const hash = useRouterState({ select: (s) => s.location.hash });
 
@@ -108,6 +111,20 @@ function SettingsAgentPage() {
 				userPrefs={userPrefs}
 				updateUserPref={updateUserPref}
 			/>
+			{currentUser?.id ? (
+				<>
+					<Divider />
+					<Stack gap="xs">
+						<Title order={4}>{t("traitLayerUserTitle")}</Title>
+						<Text size="sm" c="dimmed">
+							{t("traitLayerUserDesc")}
+						</Text>
+						<Card withBorder padding="md">
+							<TraitLayerEditor layer="user" ownerId={currentUser.id} />
+						</Card>
+					</Stack>
+				</>
+			) : null}
 		</Stack>
 	);
 }

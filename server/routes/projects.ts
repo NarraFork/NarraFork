@@ -1,6 +1,6 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { db } from "../db";
@@ -23,15 +23,30 @@ import { GitAuthError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
+import { projectPrincipalOf, requireProjectAccess } from "../lib/project-access";
 import { projectDbManager } from "../lib/project-db";
-import { createProjectSchema, updateProjectSchema } from "../lib/validators";
+import {
+	createProjectSchema,
+	projectMembersSchema,
+	projectTransferOwnerSchema,
+	projectVisibilitySchema,
+	updateProjectSchema,
+} from "../lib/validators";
 import { chapterService } from "../services/chapter-service";
 import { refreshCache as refreshContainerProxyCache } from "../services/container-proxy";
 import { containerService } from "../services/container-service";
 import { gitService } from "../services/git-service";
 import { integrationResourceBindingService } from "../services/integration-resource-binding-service";
 import { propagateOAuthProjectRemoval } from "../services/oauth-runtime-revocation";
+import { projectReadableWhere } from "../services/project-acl";
 import { ensureGitignoreEntry } from "../services/project-db-sync";
+import {
+	getProjectAccess,
+	removeProjectMember,
+	setProjectMembers,
+	setProjectVisibility,
+	transferProjectOwner,
+} from "../services/project-membership";
 import { terminalService } from "../services/terminal-service";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
 
@@ -46,11 +61,42 @@ projectRoutes.get("/", async (c) => {
 		status && validStatuses.includes(status as any)
 			? eq(projects.status, status as (typeof validStatuses)[number])
 			: undefined;
+	// The visibility predicate is pushed into SQL rather than applied afterwards, so
+	// this stays one indexed query no matter how many projects exist. Returns
+	// undefined for admins, which `and(...)` treats as no extra restriction.
 	const result = await db.query.projects.findMany({
-		where,
+		where: and(where, projectReadableWhere(projectPrincipalOf(c))),
 		orderBy: (projects, { desc }) => [desc(projects.updatedAt)],
 	});
 	return c.json(result);
+});
+
+/**
+ * Whether any project exists that the caller cannot see.
+ *
+ * An empty project list became ambiguous once it was ACL-filtered: "nothing exists
+ * yet" and "projects exist but none are yours" look identical to the client, yet they
+ * call for opposite advice — "create one" versus "ask to be added". A new member
+ * otherwise gets told to create a project when they simply have not been invited.
+ *
+ * Deliberately a separate, bare-boolean endpoint rather than a field on the list
+ * response or a header: the list returns an array, and the shared fetch helper
+ * discards headers, so both alternatives would distort a widely used shape. Discloses
+ * only existence — never a name, id or count — and is a bounded probe (`limit 1`, one
+ * column), fetched by the client only when the visible list is empty.
+ */
+projectRoutes.get("/hidden-existence", async (c) => {
+	const principal = projectPrincipalOf(c);
+	// Admins see everything, so nothing can be hidden from them.
+	if (principal.isAdmin) return c.json({ hasHidden: false });
+	const visible = await db.query.projects.findFirst({
+		where: projectReadableWhere(principal),
+		columns: { id: true },
+	});
+	// Only meaningful when the caller sees nothing; a non-empty list needs no hint.
+	if (visible) return c.json({ hasHidden: false });
+	const any = await db.query.projects.findFirst({ columns: { id: true } });
+	return c.json({ hasHidden: !!any });
 });
 
 projectRoutes.post("/", async (c) => {
@@ -60,6 +106,8 @@ projectRoutes.post("/", async (c) => {
 
 	const now = new Date().toISOString();
 	const projectId = generateId();
+	// Owner of any narrator auto-created alongside the root chapter below.
+	const createdByUserId = c.get("user").sub;
 
 	let gitPath = body.gitPath.trim();
 	// Expand ~ and resolve to absolute path so worktreePath / terminal cwd are correct
@@ -117,6 +165,10 @@ projectRoutes.post("/", async (c) => {
 						gitPath,
 						remoteUrl,
 						defaultBranch,
+						// Ownership always comes from the session, never the body: a client must
+						// not be able to create a project on someone else's behalf. The creator
+						// becomes its first manager, so they can invite others without an admin.
+						ownerUserId: createdByUserId,
 						createdAt: now,
 						updatedAt: now,
 					})
@@ -137,6 +189,7 @@ projectRoutes.post("/", async (c) => {
 						title: body.name,
 						gitPath,
 						defaultBranch,
+						createdByUserId,
 					});
 				} catch (err) {
 					console.warn("Failed to create root chapter:", err);
@@ -211,6 +264,8 @@ projectRoutes.post("/", async (c) => {
 			gitPath,
 			remoteUrl,
 			defaultBranch,
+			// See the sibling insert above: the session user owns what they create.
+			ownerUserId: createdByUserId,
 			createdAt: now,
 			updatedAt: now,
 		})
@@ -232,6 +287,7 @@ projectRoutes.post("/", async (c) => {
 			title: body.name,
 			gitPath,
 			defaultBranch,
+			createdByUserId,
 		});
 	} catch (err) {
 		// Non-fatal — project is still usable without root chapter
@@ -253,17 +309,68 @@ projectRoutes.post("/", async (c) => {
 	return c.json(project, 201);
 });
 
+// ─── Access control (membership) ─────────────────────────────────────────────
+//
+// Registered before the `/:id` routes so these literal paths are not captured as
+// project ids. Reading the panel needs project read; every mutation additionally
+// requires owner/manage/admin, enforced in the service layer — a write member works
+// in the project but does not decide who else may.
+
+projectRoutes.get("/:id/access", async (c) => {
+	const id = c.req.param("id");
+	await requireProjectAccess(c, id, "read");
+	return c.json(await getProjectAccess(id, projectPrincipalOf(c)));
+});
+
+projectRoutes.patch("/:id/visibility", async (c) => {
+	const id = c.req.param("id");
+	await requireProjectAccess(c, id, "read");
+	const parsed = projectVisibilitySchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await setProjectVisibility(id, parsed.data.visibility, projectPrincipalOf(c)));
+});
+
+projectRoutes.post("/:id/members", async (c) => {
+	const id = c.req.param("id");
+	await requireProjectAccess(c, id, "read");
+	const parsed = projectMembersSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const principal = projectPrincipalOf(c);
+	const outcome = await setProjectMembers(id, parsed.data.userIds, parsed.data.role, principal);
+	// The resulting state travels with the per-user outcome so the panel needs no second
+	// round trip, and so a partially successful batch is visible rather than implied.
+	return c.json({ ...outcome, access: await getProjectAccess(id, principal) });
+});
+
+projectRoutes.delete("/:id/members/:userId", async (c) => {
+	const id = c.req.param("id");
+	await requireProjectAccess(c, id, "read");
+	await removeProjectMember(id, c.req.param("userId"), projectPrincipalOf(c));
+	return c.json({ ok: true });
+});
+
+projectRoutes.post("/:id/transfer-owner", async (c) => {
+	const id = c.req.param("id");
+	await requireProjectAccess(c, id, "read");
+	const parsed = projectTransferOwnerSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await transferProjectOwner(id, parsed.data.userId, projectPrincipalOf(c)));
+});
+
 projectRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, id),
-	});
-	if (!project) throw new NotFoundError("Project", id);
+	// Denial and absence are both NotFoundError, so this cannot be used to discover
+	// which project ids exist.
+	const project = await requireProjectAccess(c, id, "read");
 	return c.json(project);
 });
 
 projectRoutes.patch("/:id", async (c) => {
 	const id = c.req.param("id");
+	// Project settings (git path, proxy domain, chapter defaults) shape how everyone
+	// in the project works, so editing them is a management action rather than a
+	// write one.
+	await requireProjectAccess(c, id, "manage");
 	const parsed = updateProjectSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const { chapterSettings: incomingSettings, ...rest } = parsed.data;
@@ -316,10 +423,9 @@ projectRoutes.patch("/:id", async (c) => {
 
 projectRoutes.delete("/:id", async (c) => {
 	const id = c.req.param("id");
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, id),
-	});
-	if (!project) throw new NotFoundError("Project", id);
+	// Deletion cascades through every chapter, worktree, container, port allocation
+	// and conversation, so it sits in the management tier rather than write.
+	const project = await requireProjectAccess(c, id, "manage");
 
 	await propagateOAuthProjectRemoval(id);
 

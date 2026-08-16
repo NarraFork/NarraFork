@@ -52,6 +52,7 @@ const MESSAGE_TABLE_KEYS = [
 	"tasksTooManyProtected",
 	"tasksFieldsNote",
 	"tasksSemanticsNote",
+	"tasksProtectedOnlyOnUserDemand",
 	// knowledge
 	"knowledgeHeading",
 	"knowledgeReadHint",

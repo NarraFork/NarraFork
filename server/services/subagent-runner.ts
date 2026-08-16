@@ -67,6 +67,7 @@ import {
 } from "./subagent-takeover";
 import { clearTeamInbox } from "./subagent-team";
 import { buildSubagentSystemPrompt } from "./subagent-tools";
+import { resolveEffectiveTraits, resolveNarratorProjectId } from "./trait-layer-service";
 import { tryAcquireFinalUpdateExecution, type UpdateExecutionLease } from "./update-coordinator";
 
 /** Default wall-clock execution time for background Agent tasks (5 hours). */
@@ -1490,7 +1491,14 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	// Apply effective per-narrator subagent model policy. Custom narrator traits override
 	// global settings.agent.subagentAllowedModels.
 	const parent = await narratorService.getById(parentNarratorId);
-	const modelPolicy = resolveEffectiveSubagentModelPolicy(parent.traits, subagentType);
+	// Model pools are a grant, so layering can only narrow them: a narrator cannot
+	// widen its subagent pool past what the project/user layers allow.
+	const parentTraits = await resolveEffectiveTraits({
+		narratorTraits: parent.traits,
+		projectId: await resolveNarratorProjectId(parent),
+		actingUserId: userId ?? null,
+	});
+	const modelPolicy = resolveEffectiveSubagentModelPolicy(parentTraits.traits, subagentType);
 	const candidateModels = [
 		subagentPref,
 		parent.model ?? FOLLOW_DEFAULT_MODEL,

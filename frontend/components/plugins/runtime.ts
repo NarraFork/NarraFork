@@ -1,3 +1,4 @@
+import { PLUGIN_UI_RUNTIME_CSS_URL, PLUGIN_UI_RUNTIME_JS_URL } from "../../plugin-runtime/paths";
 import { createPluginAssetShell, createPluginNonce } from "./asset-shell";
 import type {
 	JsonValue,
@@ -278,6 +279,9 @@ export class PluginUiSession {
 	}
 
 	private createShell(): string {
+		// The runtime URLs are host constants, not manifest values: a view can only ask for
+		// the shared runtime, never point at a different bundle.
+		const usesHostRuntime = this.contribution.runtime === "host-react";
 		return createPluginAssetShell({
 			nonce: this.nonce,
 			pluginId: this.params.pluginId,
@@ -285,6 +289,12 @@ export class PluginUiSession {
 			panelInstanceId: this.params.panelInstanceId,
 			entryUrl: this.contribution.entryUrl,
 			styleUrl: this.contribution.styleUrl,
+			...(usesHostRuntime
+				? {
+						runtimeUrl: PLUGIN_UI_RUNTIME_JS_URL,
+						runtimeStyleUrl: PLUGIN_UI_RUNTIME_CSS_URL,
+					}
+				: {}),
 			defaultTimeoutMs: this.options.defaultTimeoutMs,
 		});
 	}

@@ -15,6 +15,7 @@ import {
 	type RuntimeState,
 } from "@server/lib/plugins/permissions";
 import type { JsonValue } from "@server/lib/plugins/protocol";
+import type { ProxyOverride } from "@server/lib/settings/types";
 
 const STATE_FILE_VERSION = 1;
 const JOURNAL_FILE_VERSION = 1;
@@ -99,6 +100,21 @@ export type PluginProviderConfigMap = Record<string, Record<string, JsonValue>>;
  */
 export type PluginProviderPrefixMap = Record<string, string>;
 
+/**
+ * Per-provider outbound proxy overrides, by contribution id.
+ *
+ * Stored here rather than in `settings.<provider>.proxy` (where the built-in providers keep
+ * theirs) because a plugin provider is not a known key in the settings schema — its
+ * contribution id only exists once the plugin is installed. Keying by contribution id, next
+ * to config and prefix, means the override survives restarts and package upgrades the same
+ * way those do, and is pruned by the same mechanism when a contribution disappears.
+ *
+ * Deliberately not part of the provider's `configSchema`: this is host policy about how the
+ * host reaches upstream, not something the plugin declares or should be able to read back
+ * through `config.get`.
+ */
+export type PluginProviderProxyMap = Record<string, ProxyOverride>;
+
 export interface PluginStateRecord {
 	pluginId: string;
 	current: PluginPackageReference | null;
@@ -112,6 +128,8 @@ export interface PluginStateRecord {
 	providerConfigs: PluginProviderConfigMap;
 	/** Prefix overrides by contribution id; absent entries use the manifest prefix. */
 	providerPrefixes: PluginProviderPrefixMap;
+	/** Proxy overrides by contribution id; absent entries follow the global proxy policy. */
+	providerProxies: PluginProviderProxyMap;
 	crashCount: number;
 	restartCount: number;
 	consecutiveFailures: number;
@@ -426,6 +444,7 @@ function parseStateRecord(
 		grants: parseGrantSummary(value.grants),
 		providerConfigs: parseProviderConfigs(value.providerConfigs, pluginId, limits),
 		providerPrefixes: parseProviderPrefixes(value.providerPrefixes, pluginId),
+		providerProxies: parseProviderProxies(value.providerProxies, pluginId),
 		crashCount,
 		restartCount,
 		consecutiveFailures,
@@ -471,6 +490,45 @@ function parseProviderPrefixes(value: unknown, pluginId: string): PluginProvider
 			continue;
 		}
 		result[contributionId] = prefix;
+	}
+	return result;
+}
+
+/**
+ * Read proxy overrides from persisted state.
+ *
+ * A malformed entry is dropped rather than repaired: an override that cannot be understood
+ * must fall back to the global policy, because guessing at it could silently route upstream
+ * traffic somewhere the user did not choose.
+ */
+function parseProviderProxies(value: unknown, pluginId: string): PluginProviderProxyMap {
+	if (value === undefined || value === null) return {};
+	if (!isRecord(value)) {
+		logger.warn("Ignoring malformed plugin providerProxies", { pluginId });
+		return {};
+	}
+	const result: PluginProviderProxyMap = {};
+	for (const [contributionId, override] of Object.entries(value)) {
+		if (!contributionId || contributionId.length > 256 || !isRecord(override)) {
+			logger.warn("Ignoring malformed plugin provider proxy entry", { pluginId, contributionId });
+			continue;
+		}
+		const mode = override.mode;
+		if (mode !== "default" && mode !== "direct" && mode !== "system" && mode !== "custom") {
+			logger.warn("Ignoring plugin provider proxy with unknown mode", { pluginId, contributionId });
+			continue;
+		}
+		// The URL is only meaningful for `custom`; for the other modes it would be dead state
+		// that reappears if the user switches back, which is confusing rather than helpful.
+		const url = mode === "custom" && typeof override.url === "string" ? override.url : undefined;
+		if (mode === "custom" && !url) {
+			logger.warn("Ignoring custom plugin provider proxy without a url", {
+				pluginId,
+				contributionId,
+			});
+			continue;
+		}
+		result[contributionId] = { mode, ...(url ? { url } : {}) };
 	}
 	return result;
 }
@@ -687,6 +745,7 @@ export function createPluginStateRecord(
 		grants: { count: 0, capabilities: [], revision: 0 },
 		providerConfigs: {},
 		providerPrefixes: {},
+		providerProxies: {},
 		crashCount: 0,
 		restartCount: 0,
 		consecutiveFailures: 0,
@@ -891,6 +950,60 @@ export class PluginStateStore {
 		});
 	}
 
+	/**
+	 * Set or clear a provider's outbound proxy override.
+	 *
+	 * Validated here rather than only at the route, for the same reason the prefix is: this is
+	 * the last point before disk, and a value a later load would discard should never be
+	 * written in the first place.
+	 */
+	async setProviderProxy(
+		pluginId: string,
+		contributionId: string,
+		proxy: ProxyOverride | null,
+	): Promise<PluginStateRecord> {
+		if (!contributionId || contributionId.length > 256) {
+			throw new ValidationError("Provider contribution id is invalid");
+		}
+		if (proxy !== null) {
+			const { mode } = proxy;
+			if (mode !== "default" && mode !== "direct" && mode !== "system" && mode !== "custom") {
+				throw new ValidationError("Proxy mode must be default, direct, system or custom");
+			}
+			if (mode === "custom") {
+				const url = proxy.url?.trim();
+				if (!url) throw new ValidationError("A custom proxy requires a url");
+				if (url.length > 2048) throw new ValidationError("Proxy url is too long");
+				// Parsed rather than pattern-matched: the value is handed to an HTTP agent, and a
+				// string that fails to parse there would surface as an opaque request failure.
+				let parsed: URL;
+				try {
+					parsed = new URL(url);
+				} catch {
+					throw new ValidationError("Proxy url is not a valid URL");
+				}
+				if (
+					!["http:", "https:", "socks:", "socks4:", "socks5:", "socks5h:"].includes(parsed.protocol)
+				) {
+					throw new ValidationError("Proxy url must use an http, https or socks scheme");
+				}
+			}
+		}
+		return this.updateState(pluginId, (current) => {
+			const providerProxies = { ...current.providerProxies };
+			// `default` is the absence of an override, so storing it would only add a row that
+			// behaves exactly like no row.
+			if (proxy === null || proxy.mode === "default") delete providerProxies[contributionId];
+			else {
+				providerProxies[contributionId] = {
+					mode: proxy.mode,
+					...(proxy.mode === "custom" && proxy.url ? { url: proxy.url.trim() } : {}),
+				};
+			}
+			return { ...current, providerProxies };
+		});
+	}
+
 	/** Drop stored config for provider contributions the plugin no longer declares. */
 	async pruneProviderConfigs(
 		pluginId: string,
@@ -906,7 +1019,13 @@ export class PluginStateStore {
 			for (const [contributionId, prefix] of Object.entries(current.providerPrefixes)) {
 				if (keep.has(contributionId)) providerPrefixes[contributionId] = prefix;
 			}
-			return { ...current, providerConfigs, providerPrefixes };
+			// Pruned alongside the other two: a proxy left behind for a contribution the plugin
+			// no longer declares would silently reapply if that id ever came back.
+			const providerProxies: PluginProviderProxyMap = {};
+			for (const [contributionId, proxy] of Object.entries(current.providerProxies)) {
+				if (keep.has(contributionId)) providerProxies[contributionId] = proxy;
+			}
+			return { ...current, providerConfigs, providerPrefixes, providerProxies };
 		});
 	}
 

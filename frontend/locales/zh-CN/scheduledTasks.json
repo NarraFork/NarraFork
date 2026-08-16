@@ -41,6 +41,7 @@
 	"project": "项目",
 	"chapter": "章节",
 	"selectProject": "选择项目",
+	"noProjectsAvailable": "你当前没有可用的项目。请让项目所有者或管理员把你添加进来。",
 	"selectChapter": "选择章节",
 	"narratorMode": "叙述者",
 	"narratorModeDesc": "每次新建一个会话，还是复用同一个。",

@@ -21,7 +21,7 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
-import { knowledgeGrants, knowledgeTags, users } from "../../db/schema";
+import { aclGrants, knowledgeTags, users } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { bulkKnowledgeGrantSchema } from "../../lib/validators";
@@ -80,9 +80,11 @@ async function countUserGrants(
 	userIds: string[],
 	grantType: "clearance" | "tag" | "review",
 ): Promise<number> {
-	const rows = await db.query.knowledgeGrants.findMany({
+	// Knowledge credentials now live in acl_grants as domain rows: `domain_kind` carries
+	// what used to be `grant_type`.
+	const rows = await db.query.aclGrants.findMany({
 		where: (g, { and: a, eq: e, inArray }) =>
-			a(e(g.principalType, "user"), inArray(g.principalId, userIds), e(g.grantType, grantType)),
+			a(e(g.principalType, "user"), inArray(g.principalId, userIds), e(g.domainKind, grantType)),
 	});
 	return rows.length;
 }
@@ -227,10 +229,12 @@ describe("bulkGrant service semantics", () => {
 			grantType: "tag",
 			tagId: secretTagId,
 		});
-		const row = await db.query.knowledgeGrants.findFirst({
-			where: and(eq(knowledgeGrants.principalId, id), eq(knowledgeGrants.grantType, "tag")),
+		const row = await db.query.aclGrants.findFirst({
+			where: and(eq(aclGrants.principalId, id), eq(aclGrants.domainKind, "tag")),
 		});
-		expect(row?.collectionId).toBe(col.id);
+		// The collection scope is expressed as scopeType/scopeId now.
+		expect(row?.scopeType).toBe("knowledge_collection");
+		expect(row?.scopeId).toBe(col.id);
 	});
 });
 

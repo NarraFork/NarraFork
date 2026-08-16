@@ -37,6 +37,22 @@ export interface RulerActiveChapter {
 	 */
 	mergeAnchorCommitSha?: string | null;
 	/**
+	 * Trunk commit to draw this chapter at when its own start commit cannot place it —
+	 * `merge-base <startCommitSha> <trunk>`, computed server-side and sent only for
+	 * chapters the backbone could not position.
+	 *
+	 * Exists because a rewritten trunk (rebase, squash-merge, amend) leaves a real
+	 * chapter pointing at a commit that is no longer reachable from the branch. Without
+	 * this the chapter had no position and was dropped from the view entirely.
+	 */
+	anchorFallbackSha?: string | null;
+	/**
+	 * Whether `startCommitSha` is still an ancestor of the trunk. `false` means paging in
+	 * more commits will never produce a tick for it; `true` means it is simply outside the
+	 * loaded window. Only sent alongside `anchorFallbackSha`.
+	 */
+	startCommitOnBranch?: boolean | null;
+	/**
 	 * Snapshot of uncommitted work an earlier rebase parked and could not reapply, while
 	 * the server is still tracking it (`chapters.parkedSnapshotCommitSha`).
 	 *

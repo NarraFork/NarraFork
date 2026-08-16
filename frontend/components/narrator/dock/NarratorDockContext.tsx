@@ -58,6 +58,16 @@ interface NarratorDockBridges {
 	writeTerminalStdin: ((text: string) => void) | null;
 	/** Registered by the chat panel; called by the search panel to jump to a message. */
 	scrollToMessage: ((messageId: string) => void) | null;
+	/**
+	 * Registered by the chat panel; called by the user-chat panel to SUBMIT text as
+	 * a real user message.
+	 *
+	 * Deliberately the composer's own submit path rather than a direct REST call:
+	 * that is where busy-narrator buffering, slash-command resolution and draft /
+	 * attachment state live. Bypassing it would make a forward sent mid-turn start a
+	 * new turn instead of queueing behind the current one.
+	 */
+	submitToNarrator: ((text: string) => void) | null;
 }
 
 export interface NarratorDockContextValue {
@@ -113,6 +123,11 @@ export interface NarratorDockContextValue {
 	registerScrollToMessage: (fn: (messageId: string) => void) => () => void;
 	/** Scroll to + highlight a message in the chat panel, if mounted. */
 	scrollToMessage: (messageId: string) => void;
+
+	/** Register the user-message submitter (returns an unregister fn). */
+	registerSubmitToNarrator: (fn: (text: string) => void) => () => void;
+	/** Submit text as a user message through the chat panel's composer path. */
+	submitToNarrator: (text: string) => void;
 
 	/** Tool panel types currently present in the layout (for toolbar active state). */
 	openToolTypes: ReadonlySet<NarratorToolPanelType>;
@@ -175,6 +190,7 @@ export function NarratorDockProvider({
 		appendChatInput: null,
 		writeTerminalStdin: null,
 		scrollToMessage: null,
+		submitToNarrator: null,
 	});
 
 	// Keep chapterId in a ref so openToolPanel always uses the latest without
@@ -382,6 +398,12 @@ export function NarratorDockProvider({
 		[openToolPanel, closeToolPanel],
 	);
 
+	// These callback props (onForkFromMessage, onBack, onMinimize) MUST keep stable
+	// references across parent renders. The sole call site in
+	// routes/narrators/$narratorId.tsx wraps each with useCallback, ensuring the
+	// context value below only rebuilds when truly necessary (narratorId/chapterId
+	// change, or local state changes). If a new call site is added without
+	// useCallback, the entire context will re-create on every parent render.
 	const value = useMemo<NarratorDockContextValue>(() => {
 		return {
 			narratorId,
@@ -424,6 +446,15 @@ export function NarratorDockProvider({
 				};
 			},
 			scrollToMessage: (messageId) => bridgesRef.current.scrollToMessage?.(messageId),
+			registerSubmitToNarrator: (fn) => {
+				bridgesRef.current.submitToNarrator = fn;
+				return () => {
+					if (bridgesRef.current.submitToNarrator === fn) {
+						bridgesRef.current.submitToNarrator = null;
+					}
+				};
+			},
+			submitToNarrator: (text) => bridgesRef.current.submitToNarrator?.(text),
 			openToolTypes,
 			refreshOpenToolTypes,
 			openToolPanel,

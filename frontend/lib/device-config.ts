@@ -25,15 +25,38 @@ function isLoopbackIpLiteral(hostname: string): boolean {
 	);
 }
 
+/**
+ * Derive the device WebSocket URL from the URL the browser is currently using.
+ *
+ * The admin's browser reached this server somehow, so its origin is a far better
+ * default than a placeholder. Falls back to the placeholder when no origin is
+ * available (non-browser callers, tests).
+ */
+export function deviceWsUrlFromOrigin(serverBaseUrl?: string): string {
+	if (!serverBaseUrl) return "wss://<narrafork-host>/ws/device";
+	try {
+		const url = new URL(serverBaseUrl);
+		if (url.protocol !== "http:" && url.protocol !== "https:") {
+			return "wss://<narrafork-host>/ws/device";
+		}
+		const scheme = url.protocol === "https:" ? "wss:" : "ws:";
+		return `${scheme}//${url.host}/ws/device`;
+	} catch {
+		return "wss://<narrafork-host>/ws/device";
+	}
+}
+
 export function buildDeviceRunCommand(
 	connectionMode: DeviceConnectionMode,
 	slug: string,
 	tokenInput: DeviceTokenInput = "file",
+	options: { serverBaseUrl?: string } = {},
 ): string {
 	const tokenArgument =
 		tokenInput === "stdin" ? "--token-stdin" : "--token-file /path/to/device-token";
 	if (connectionMode === "direct") {
 		return `narrafork-executor \\\n  --listen 0.0.0.0:7900 \\\n  --tls-cert /path/to/executor.crt \\\n  --tls-key /path/to/executor.key \\\n  --device ${slug} \\\n  ${tokenArgument} \\\n  --allow-root /path/to/workspace`;
 	}
-	return `narrafork-executor \\\n  --server wss://<narrafork-host>/ws/device \\\n  --device ${slug} \\\n  ${tokenArgument} \\\n  --allow-root /path/to/workspace`;
+	const serverUrl = deviceWsUrlFromOrigin(options.serverBaseUrl);
+	return `narrafork-executor \\\n  --server ${serverUrl} \\\n  --device ${slug} \\\n  ${tokenArgument} \\\n  --allow-root /path/to/workspace`;
 }

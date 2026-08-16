@@ -54,6 +54,21 @@ export function useProjects(status?: string) {
 	});
 }
 
+/**
+ * Whether projects exist that this user cannot see — used to pick the right empty state.
+ *
+ * Gated on `enabled` so it only runs when the visible list is actually empty: on a
+ * populated dashboard the answer is irrelevant, and the probe should not be paid for.
+ */
+export function useHiddenProjectExistence(enabled: boolean) {
+	return useQuery({
+		queryKey: ["projects", "hidden-existence"],
+		queryFn: () => api.getHiddenProjectExistence(),
+		enabled,
+		gcTime: PROJECT_QUERY_GC_TIME_MS,
+	});
+}
+
 export function useProject(id: string) {
 	return useQuery({
 		queryKey: ["projects", id],

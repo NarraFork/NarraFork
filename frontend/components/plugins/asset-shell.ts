@@ -21,6 +21,18 @@ export interface PluginAssetShellOptions {
 	entryUrl: string;
 	styleUrl?: string;
 	defaultTimeoutMs?: number;
+	/**
+	 * Shared host runtime (React + Mantine) to load before the plugin entry.
+	 *
+	 * Only set when the view declared `runtime: "host-react"`. Views that draw their own DOM
+	 * must not pay for a ~1.2 MB download they never use, so the default stays absent and
+	 * their shell is byte-for-byte what it was before this existed.
+	 *
+	 * The host supplies these URLs; a manifest cannot name them. They go through
+	 * `isAllowedPluginAssetUrl` like every other asset.
+	 */
+	runtimeUrl?: string;
+	runtimeStyleUrl?: string;
 }
 
 function escapeAttribute(value: string): string {
@@ -58,6 +70,8 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
 		protocolVersion: PLUGIN_UI_PROTOCOL_MAJOR,
 		entryUrl: options.entryUrl,
 		styleUrl: options.styleUrl,
+		runtimeUrl: options.runtimeUrl,
+		runtimeStyleUrl: options.runtimeStyleUrl,
 		timeout,
 	};
 	return `
@@ -174,20 +188,37 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
     for (const listener of notificationListeners) listener(message);
   };
   let handshakeId = "";
-  const loadPlugin = () => {
-    if (loaded) return;
-    loaded = true;
-    if (config.styleUrl) {
-      const style = document.createElement("link");
-      style.rel = "stylesheet";
-      style.href = config.styleUrl;
-      document.head.appendChild(style);
-    }
+  const addStylesheet = (href) => {
+    const style = document.createElement("link");
+    style.rel = "stylesheet";
+    style.href = href;
+    document.head.appendChild(style);
+  };
+  const loadEntry = () => {
+    if (config.styleUrl) addStylesheet(config.styleUrl);
     const script = document.createElement("script");
     script.src = config.entryUrl;
     script.async = false;
     script.onerror = () => notify("plugin.lifecycle", { state: "crashed", reason: "asset-load-failed" });
     document.head.appendChild(script);
+  };
+  const loadPlugin = () => {
+    if (loaded) return;
+    loaded = true;
+    // Without a shared runtime the plugin owns its whole bundle, so load it directly.
+    if (!config.runtimeUrl) { loadEntry(); return; }
+    // With one, the entry reads React/Mantine off a global the runtime installs, so it
+    // must not execute until the runtime has finished. Chaining on the load event rather
+    // than relying on document order is what makes that ordering real: two non-async
+    // scripts do execute in order, but a runtime failure would otherwise be invisible and
+    // the plugin would fail on a missing global instead of reporting the actual cause.
+    if (config.runtimeStyleUrl) addStylesheet(config.runtimeStyleUrl);
+    const runtime = document.createElement("script");
+    runtime.src = config.runtimeUrl;
+    runtime.async = false;
+    runtime.onload = () => loadEntry();
+    runtime.onerror = () => notify("plugin.lifecycle", { state: "crashed", reason: "runtime-load-failed" });
+    document.head.appendChild(runtime);
   };
   const onConnect = (event) => {
     if (connected || event.source !== window.parent || !event.ports || event.ports.length !== 1) return;
@@ -240,7 +271,12 @@ export function createPluginAssetShell(options: PluginAssetShellOptions): string
 	}
 	if (
 		!isAllowedPluginAssetUrl(options.entryUrl) ||
-		(options.styleUrl && !isAllowedPluginAssetUrl(options.styleUrl))
+		(options.styleUrl && !isAllowedPluginAssetUrl(options.styleUrl)) ||
+		// Host-supplied, but validated on the same terms: the CSP below only grants the
+		// asset origin, so an off-origin runtime URL would be blocked at load time with a
+		// far less obvious error than this one.
+		(options.runtimeUrl && !isAllowedPluginAssetUrl(options.runtimeUrl)) ||
+		(options.runtimeStyleUrl && !isAllowedPluginAssetUrl(options.runtimeStyleUrl))
 	) {
 		throw new Error("Plugin UI assets must use same-origin HTTP(S) URLs");
 	}

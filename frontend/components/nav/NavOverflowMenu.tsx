@@ -18,9 +18,9 @@ import { IconDots, IconGripVertical } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useReviewInboxCount } from "../../hooks/useKnowledge";
 import { NAV_DIVIDER_ID, type NavLayoutEntry } from "../../hooks/useNavLayout";
 import { CUSTOMIZABLE_NAV_ITEMS, type NavItemDef } from "./nav-items";
+import { useNavBadges } from "./use-nav-badges";
 
 interface NavOverflowMenuProps {
 	/** Flat ordered layout including the divider entry. */
@@ -142,11 +142,7 @@ export function NavOverflowMenu({ entries, onSaveLayout, navCollapsed }: NavOver
 	const navigate = useNavigate();
 	const [menuOpen, setMenuOpen] = useState(false);
 	// Reads the same cached query the sidebar badge uses — no extra request.
-	const knowledgeInbox = useReviewInboxCount();
-	const knowledgeInboxCount = knowledgeInbox.data?.count ?? 0;
-	const knowledgeInboxLabel = knowledgeInbox.data?.capped
-		? `${knowledgeInboxCount}+`
-		: String(knowledgeInboxCount);
+	const resolveBadge = useNavBadges();
 	// Distance constraint: a press must move ≥6px to become a drag, so plain
 	// clicks still work (navigation) and never accidentally start a drag.
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
@@ -225,12 +221,7 @@ export function NavOverflowMenu({ entries, onSaveLayout, navCollapsed }: NavOver
 									id={entry.id}
 									hidden={hidden}
 									onNavigate={() => handleNavigate(entry.id)}
-									badgeLabel={
-										ITEM_DEF_MAP.get(entry.id)?.badge === "knowledgeReviewInbox" &&
-										knowledgeInboxCount > 0
-											? knowledgeInboxLabel
-											: undefined
-									}
+									badgeLabel={resolveBadge(ITEM_DEF_MAP.get(entry.id)?.badge).label || undefined}
 								/>
 							);
 						})}

@@ -575,6 +575,76 @@ describe("RulerFlow", () => {
 		expect(notice?.textContent).toContain("Unreachable Work");
 		expect(notice?.textContent).toContain("whole timeline is loaded");
 		expect(notice?.textContent).not.toContain("Load older commits");
+		// It must not send the user to the story network view: that view resolves the same
+		// start commit and fails identically, so the advice was a dead end.
+		expect(notice?.textContent).not.toContain("story network");
+	});
+
+	test("draws a chapter whose start commit was rewritten off the trunk", async () => {
+		// A rebase or squash-merge leaves `startCommitSha` naming a commit that still exists
+		// but is unreachable from the branch. It has no tick and never will, and the view
+		// used to drop the card while telling the user to open it from the story network
+		// view — which anchors on the same sha. The server's `merge-base` fork point is the
+		// only position it can have, so the chapter renders there and the notice says the
+		// position is approximate instead of claiming the chapter is missing.
+		rulerPages = () => [
+			{
+				...rulerData,
+				activeChapters: [
+					{
+						id: "chapter-rewritten",
+						title: "Rewritten Work",
+						branch: "chapter/rewritten",
+						role: "branch",
+						parentChapterId: null,
+						startCommitSha: "commit-rewritten-away",
+						mergeCommitSha: null,
+						anchorFallbackSha: rulerData.commits[1].sha,
+						startCommitOnBranch: false,
+						narratorId: "narrator-two",
+						narratorStatus: "idle",
+						axisOffset: 0,
+						crossOffset: 0,
+					},
+				],
+			},
+		];
+		rulerHasPreviousPage = false;
+
+		renderRulerFlow(root, queryClient);
+		await flushRender();
+
+		// Placed, therefore NOT reported as unplaceable.
+		expect(document.querySelector('[data-testid="ruler-off-backbone-notice"]')).toBeNull();
+
+		const notice = document.querySelector('[data-testid="ruler-rewritten-anchor-notice"]');
+		expect(notice).not.toBeNull();
+		expect(notice?.textContent).toContain("Rewritten Work");
+		expect(notice?.textContent).toContain("fork point");
+	});
+
+	test("keeps quiet when the fallback anchor is the start commit itself", async () => {
+		// `startCommitOnBranch: true` means `merge-base` returned the commit unchanged: it is
+		// a real ancestor that simply paged in. The position is exact, so an "approximate
+		// position" notice would be false.
+		rulerPages = () => [
+			{
+				...rulerData,
+				activeChapters: [
+					{
+						...rulerData.activeChapters[0],
+						anchorFallbackSha: rulerData.activeChapters[0].startCommitSha,
+						startCommitOnBranch: true,
+					},
+				],
+			},
+		];
+
+		renderRulerFlow(root, queryClient);
+		await flushRender();
+
+		expect(document.querySelector('[data-testid="ruler-rewritten-anchor-notice"]')).toBeNull();
+		expect(document.querySelector('[data-testid="ruler-off-backbone-notice"]')).toBeNull();
 	});
 
 	test("restores the parked-work panel from the chapter's persisted snapshot", async () => {

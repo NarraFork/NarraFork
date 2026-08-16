@@ -2776,10 +2776,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const {
 		anchoredChapters: alwaysVisibleChapters,
 		missingTickChapters,
+		rewrittenAnchorChapters,
 		anchorByChapter: liveAnchorByChapter,
 	} = useMemo<{
 		anchoredChapters: PixiChapterInfo[];
 		missingTickChapters: Array<{ id: string; title: string }>;
+		rewrittenAnchorChapters: Array<{ id: string; title: string }>;
 		anchorByChapter: Map<string, string>;
 	}>(() => {
 		const activeChapters = rulerData.activeChapters ?? [];
@@ -2789,6 +2791,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			return {
 				anchoredChapters: [],
 				missingTickChapters: [],
+				rewrittenAnchorChapters: [],
 				anchorByChapter: new Map<string, string>(),
 			};
 		const result: PixiChapterInfo[] = [];
@@ -2798,7 +2801,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		// separately instead of being dropped — that silent drop is what made chapters
 		// anchored to commits outside the loaded window look deleted.
 		const activeIdSet = new Set(activeChapters.map((ch) => ch.id));
-		const { byStartSha, unanchored } = resolveChapterAnchors(allChapters, (sha) =>
+		const { byStartSha, unanchored, rewrittenAnchors } = resolveChapterAnchors(allChapters, (sha) =>
 			tickPositions.has(sha),
 		);
 		const anchorByChapter = new Map<string, string>();
@@ -2844,6 +2847,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		return {
 			anchoredChapters: result,
 			missingTickChapters: unanchored.map((ch) => ({ id: ch.id, title: ch.title })),
+			rewrittenAnchorChapters: rewrittenAnchors.map((ch) => ({ id: ch.id, title: ch.title })),
 			anchorByChapter,
 		};
 	}, [
@@ -3000,7 +3004,14 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			{/* Chapters that could not be placed on the backbone.
 			    Without this they were dropped from the layout in silence, which reads as
 			    "my chapter was deleted". Offers the action that usually fixes it — paging
-			    in older commits — and says so plainly when there is nothing left to load. */}
+			    in older commits — and says so plainly when there is nothing left to load.
+
+			    This only fires for chapters with no position at all. A chapter whose start
+			    commit was rewritten off the trunk is now DRAWN at its fork point and reported
+			    by the separate notice below: it is present, just not exactly where its
+			    recorded commit says, and the old copy here told the user to open it from the
+			    story network view — which anchors on the same missing sha and fails
+			    identically. */}
 			{missingTickChapters.length > 0 && (
 				<Card
 					withBorder
@@ -3048,6 +3059,39 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								</Button>
 							</Group>
 						)}
+					</Stack>
+				</Card>
+			)}
+
+			{/* Chapters drawn at their fork point because the trunk was rewritten under them.
+			    Informational, not an error: the cards are on screen and fully usable. Said
+			    out loud anyway because the position is approximate, and a card sitting at a
+			    commit that is not the one the chapter records is otherwise a quiet lie. */}
+			{rewrittenAnchorChapters.length > 0 && (
+				<Card
+					withBorder
+					padding="xs"
+					data-testid="ruler-rewritten-anchor-notice"
+					style={{
+						position: "absolute",
+						top: (rulerFallbackMessage ? 68 : 12) + (missingTickChapters.length > 0 ? 92 : 0),
+						left: 12,
+						zIndex: 50,
+						maxWidth: 520,
+					}}
+				>
+					<Stack gap={4}>
+						<Text size="xs" c="yellow">
+							{t("ruler.rewrittenAnchorChapters", {
+								count: rewrittenAnchorChapters.length,
+								titles: formatNotificationList(
+									rewrittenAnchorChapters.map((ch) => clampChapterTitle(ch.title)),
+								),
+							})}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("ruler.rewrittenAnchorChaptersDesc")}
+						</Text>
 					</Stack>
 				</Card>
 			)}

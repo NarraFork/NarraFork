@@ -983,3 +983,96 @@ export interface CodexUsageSchedulerSnapshot {
 	dueCredentialCount: number;
 	started: boolean;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Narrator access control (sharing)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Read audience of a narrator.
+ * - private: owner + explicitly granted users
+ * - project: everyone working on the owning chapter's project
+ * - public:  every signed-in user (also what pre-ACL narrators were migrated to)
+ */
+export type NarratorVisibility = "private" | "project" | "public";
+
+/** read = follow along; write = also send messages, decide permissions, change settings. */
+export type NarratorGrantAccess = "read" | "write";
+
+export interface NarratorGrant {
+	id: string;
+	userId: string;
+	username: string | null;
+	avatarColor: string | null;
+	avatarImageId: string | null;
+	access: NarratorGrantAccess;
+	createdAt: string;
+}
+
+export interface NarratorAccess {
+	narratorId: string;
+	visibility: NarratorVisibility;
+	/** null for narrators created before access control; only admins can manage those. */
+	owner: {
+		userId: string;
+		username: string | null;
+		avatarColor: string | null;
+		avatarImageId: string | null;
+	} | null;
+	grants: NarratorGrant[];
+	/** Whether the current user may change visibility, grants or ownership. */
+	canManage: boolean;
+}
+
+/** A project's three membership tiers. Ordered by increasing authority. */
+export type ProjectRole = "read" | "write" | "manage";
+
+export type ProjectVisibility = "private" | "public";
+
+export interface ProjectMember {
+	grantId: string;
+	userId: string;
+	username: string | null;
+	avatarColor: string | null;
+	avatarImageId: string | null;
+	role: ProjectRole;
+	createdAt: string;
+}
+
+export interface ProjectAccess {
+	projectId: string;
+	visibility: ProjectVisibility;
+	/** null for projects created before project ACLs; only admins can manage those. */
+	owner: {
+		userId: string;
+		username: string | null;
+		avatarColor: string | null;
+		avatarImageId: string | null;
+	} | null;
+	members: ProjectMember[];
+	/** Whether the current user may change visibility, members or ownership. */
+	canManage: boolean;
+}
+
+/**
+ * Per-user outcome of a batch member add, plus the resulting state.
+ *
+ * A batch can partly succeed (an unknown user id, or the owner, is refused while the
+ * rest are added), so the panel reports what actually happened instead of assuming
+ * the whole request applied.
+ */
+export interface ProjectMemberBatchResult {
+	added: string[];
+	skipped: string[];
+	failed: string[];
+	access: ProjectAccess;
+}
+
+export interface NarratorGrantBatchResult {
+	granted: string[];
+	/** Already had this exact access. */
+	skipped: string[];
+	/** Unknown user, or the owner (who needs no grant). */
+	failed: string[];
+	access: NarratorAccess;
+}

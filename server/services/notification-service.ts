@@ -1,9 +1,10 @@
 import { createHmac } from "node:crypto";
 import { db } from "@server/db";
-import { chapters, narrators, userPreferences } from "@server/db/schema";
+import { chapters, narrators, userPreferences, users } from "@server/db/schema";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
+import { listNarratorAudience } from "./narrator-acl";
 import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
 
 // --- DingTalk helpers ---
@@ -98,6 +99,33 @@ export async function sendTestFeishu(webhook: string, secret: string): Promise<v
 
 type AttentionReason = "waiting_permission" | "done" | "error";
 
+/**
+ * Narrow a candidate recipient list to the users who may still read the narrator.
+ *
+ * Short-circuits on a broadly visible narrator so the common case costs nothing.
+ * Otherwise the audience is resolved once (owner + grants) and intersected, rather
+ * than running one authorization check per candidate.
+ */
+async function filterUsersWhoCanRead(
+	narrator: {
+		id: string;
+		ownerUserId: string | null;
+		visibility: string;
+		chapterId: string | null;
+	},
+	candidateUserIds: string[],
+): Promise<string[]> {
+	const audience = await listNarratorAudience(narrator);
+	if (audience.everyone) return candidateUserIds;
+	const allowed = new Set(audience.userIds);
+	const admins = await db
+		.select({ id: users.id })
+		.from(users)
+		.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds)));
+	for (const admin of admins) allowed.add(admin.id);
+	return candidateUserIds.filter((userId) => allowed.has(userId));
+}
+
 export async function handleAttention(narratorId: string, reason: AttentionReason): Promise<void> {
 	// Server-side IM only alerts on done / waiting-for-permission. Errors are
 	// surfaced elsewhere (in-app + gateway); keep behavior as before and skip.
@@ -122,7 +150,13 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 	const displayStatus = reason === "done" ? "done" : "waiting";
 	const markdownText = `**${narratorTitle}** status: **${displayStatus}**${chapterLine}`;
 
-	const relevantUserIds = await getRecentTabUserIdsForNarrator(narratorId);
+	// Recipients are everyone with this narrator in a recent tab, minus anyone who
+	// may no longer read it. Access can be revoked after a tab was opened, and a
+	// webhook carrying the narrator's title and status would otherwise keep
+	// delivering to them — a notification must never outlive the permission.
+	const recentTabUserIds = await getRecentTabUserIdsForNarrator(narratorId);
+	if (recentTabUserIds.length === 0) return;
+	const relevantUserIds = await filterUsersWhoCanRead(narrator, recentTabUserIds);
 	if (relevantUserIds.length === 0) return;
 
 	const notificationPrefs: Array<{

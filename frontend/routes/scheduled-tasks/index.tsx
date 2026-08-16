@@ -651,6 +651,11 @@ function TaskFormModal({
 								value={draft.projectId || null}
 								onChange={(v) => patch({ projectId: v ?? "", chapterId: "" })}
 								searchable
+								// With no readable project, a chapter-scoped task cannot be built at
+								// all. Disabling with a reason beats an empty dropdown that looks
+								// broken — the user needs project access, not a retry.
+								disabled={projects.length === 0}
+								description={projects.length === 0 ? t("noProjectsAvailable") : undefined}
 							/>
 							<Select
 								label={t("chapter")}

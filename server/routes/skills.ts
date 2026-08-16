@@ -1,8 +1,9 @@
 import { eq } from "drizzle-orm";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { db } from "../db";
 import { projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { requireProjectAccess } from "../lib/project-access";
 import { createProjectSkillSchema, updateProjectSkillSchema } from "../lib/validators";
 import { requireAuth } from "../middleware/auth";
 import { skillService } from "../services/skill-service";
@@ -11,13 +12,26 @@ export const skillRoutes = new Hono();
 
 skillRoutes.use("/*", requireAuth);
 
-async function getProjectGitPath(projectId: string | undefined): Promise<string> {
+/**
+ * Resolve a project's git path, authorizing the caller first.
+ *
+ * The single choke point for every project-scoped skill endpoint, which is why the
+ * access check lives here rather than in six handlers. It matters more than most:
+ * the return value is a filesystem path that the skill service reads and writes
+ * under, so a missing check would leak (and let someone modify) files rather than
+ * just rows.
+ *
+ * `need` is "read" for listing/reading skills and "write" for creating, editing or
+ * deleting them.
+ */
+async function getProjectGitPath(
+	c: Context,
+	projectId: string | undefined,
+	need: "read" | "write",
+): Promise<string> {
 	if (!projectId) throw new ValidationError("projectId is required");
 
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-	});
-	if (!project) throw new NotFoundError("Project", projectId);
+	const project = await requireProjectAccess(c, projectId, need);
 	if (!project.gitPath) throw new ValidationError("Project has no git path");
 	return project.gitPath;
 }
@@ -121,7 +135,7 @@ skillRoutes.post("/global/:name/toggle", async (c) => {
  * List all skills available for a project (scanned from project directory).
  */
 skillRoutes.get("/", async (c) => {
-	const projectGitPath = await getProjectGitPath(c.req.query("projectId"));
+	const projectGitPath = await getProjectGitPath(c, c.req.query("projectId"), "read");
 	const skills = await skillService.loadProjectSkills(projectGitPath);
 	return c.json(
 		skills.map((s) => ({
@@ -139,7 +153,7 @@ skillRoutes.get("/", async (c) => {
  * Create a project-level skill in <project>/.narrafork/skills/<name>/SKILL.md.
  */
 skillRoutes.post("/", async (c) => {
-	const projectGitPath = await getProjectGitPath(c.req.query("projectId"));
+	const projectGitPath = await getProjectGitPath(c, c.req.query("projectId"), "write");
 	const parsed = createProjectSkillSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const name = parsed.data.name.trim();
@@ -157,7 +171,7 @@ skillRoutes.post("/", async (c) => {
  * Get a single skill's full content by name.
  */
 skillRoutes.get("/:name", async (c) => {
-	const projectGitPath = await getProjectGitPath(c.req.query("projectId"));
+	const projectGitPath = await getProjectGitPath(c, c.req.query("projectId"), "read");
 	const name = c.req.param("name");
 
 	const skill = await skillService.loadSkillByName(projectGitPath, name);
@@ -171,7 +185,7 @@ skillRoutes.get("/:name", async (c) => {
  * Update a project-level skill.
  */
 skillRoutes.put("/:name", async (c) => {
-	const projectGitPath = await getProjectGitPath(c.req.query("projectId"));
+	const projectGitPath = await getProjectGitPath(c, c.req.query("projectId"), "write");
 	const currentName = c.req.param("name");
 	const parsed = updateProjectSkillSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -195,7 +209,7 @@ skillRoutes.put("/:name", async (c) => {
  * Delete a project-level skill directory.
  */
 skillRoutes.delete("/:name", async (c) => {
-	const projectGitPath = await getProjectGitPath(c.req.query("projectId"));
+	const projectGitPath = await getProjectGitPath(c, c.req.query("projectId"), "write");
 	const name = c.req.param("name");
 	await skillService.deleteProjectSkill(projectGitPath, name);
 	return c.json({ ok: true });
@@ -206,7 +220,7 @@ skillRoutes.delete("/:name", async (c) => {
  * Read a companion file from a skill directory.
  */
 skillRoutes.get("/:name/files/:filePath{.+}", async (c) => {
-	const projectGitPath = await getProjectGitPath(c.req.query("projectId"));
+	const projectGitPath = await getProjectGitPath(c, c.req.query("projectId"), "read");
 	const name = c.req.param("name");
 	const filePath = c.req.param("filePath");
 

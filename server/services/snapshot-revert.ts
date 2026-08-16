@@ -26,6 +26,7 @@ import {
 	ReplayDivergedError,
 	rebuildDeviceFileStatesExcluding,
 } from "./file-state-rebuild";
+import { resolveProjectIdForNarratorId as resolveNarratorProjectId } from "./narrator-project";
 import { invalidateWorkspaceTreeCache } from "./narrator-session-state";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
@@ -233,18 +234,9 @@ export async function resolveNarratorCwd(narratorId: string): Promise<string | n
 	return null;
 }
 
-async function resolveNarratorProjectId(narratorId: string): Promise<string | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true },
-	});
-	if (!narrator?.chapterId) return null;
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { projectId: true },
-	});
-	return chapter?.projectId ?? null;
-}
+// Project resolution moved to `narrator-project.ts`. The copy that used to live
+// here only looked at `chapterId`, so a standalone externally provisioned narrator
+// always resolved to "no project" — which reads as "nothing to enforce".
 
 function displayFile(identity: DeviceFileIdentity): string {
 	return identity.deviceId === LOCAL_DEVICE_ID

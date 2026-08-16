@@ -61,6 +61,25 @@ describe("plugin UI contributions surfaces", () => {
 		expect(item.scope).toBe("global");
 	});
 
+	/**
+	 * `provider-settings` was missing from the allowlist, so a provider plugin's own
+	 * credential UI could never mount: `PluginProviderSection` looks for exactly this
+	 * value and silently fell back to the host's generated config form instead.
+	 */
+	it("reports provider-settings so a provider plugin's own UI can mount", async () => {
+		const [item] = await fetchContributions(
+			pluginStatus([view({ surfaces: ["provider-settings"] })]),
+		);
+		expect(item.surfaces).toEqual(["provider-settings"]);
+	});
+
+	it("keeps provider-settings alongside the other surfaces", async () => {
+		const [item] = await fetchContributions(
+			pluginStatus([view({ surfaces: ["provider-settings", "settings"] })]),
+		);
+		expect(item.surfaces).toEqual(["provider-settings", "settings"]);
+	});
+
 	it("drops surface names the host does not know", async () => {
 		// `manager.list()` is untyped, so this projection cannot assume a validated shape.
 		const [item] = await fetchContributions(

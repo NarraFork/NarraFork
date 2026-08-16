@@ -6,6 +6,7 @@
 	"narrators": "叙述者",
 	"settings": "设置",
 	"admin": "管理",
+	"messages": "其他人",
 	"routines": "套路",
 	"scheduledTasks": "定时任务",
 	"learning": "学习",
@@ -57,7 +58,6 @@
 	"navSectionMore": "已收纳",
 	"emptyVisibleZone": "拖拽到此处显示",
 	"loadMoreRecentTabs": "加载更多",
-	"allRecentTabsLoaded": "已全部加载",
 	"retryRecentTabs": "重试",
 	"recentTabsSyncError": "最近标签同步失败"
 }

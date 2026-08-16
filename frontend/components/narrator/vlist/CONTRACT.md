@@ -210,7 +210,8 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
   - **布局**：标题用 `flex: 0 1 auto`（可收缩以便 truncate，但不吸收剩余宽度），状态与耗时紧贴标题；行尾一个 `flex: 1` 的空 spacer 吃掉剩余宽度。耗时右对齐时读者需要横向跨过空隙回找本行，容易看成邻行的数字。
 - **ToolRunSummary**（L3）：表头 + min(N,10)×18.8🟢。
 - **ToolRunCountLine**（L2）：单行 ≈20.8px🟢。
-- **Pinned tasks 卡不折叠**：L1–L3 的分组折叠把"最近一次 `spec://tasks.json` 调用"的卡与 active 工具同组处理（保持完整展开卡、留在原时间位置），与 `groupRenderUnits` 的 `keepToolRunMessageIds` 段级豁免（含该卡的 tool-run 段不折进 activity unit）是同一根 pin——判定复用 spinner 的 `latestSpecTasksToolUseId` 规则（`vlist-spec-tasks-pin.ts`）。该卡仍计入 fold 数量（不从前缀 trace 的 items 移除，计数与 chunked 一致）。
+- **Pinned tasks 卡不折叠**：L1–L3 的分组折叠把"最近一次 `spec://tasks.json` 调用"的卡与 active 工具同组处理（保持完整展开卡、留在原时间位置），与 `groupRenderUnits` 的 `keepToolUseIds` 豁免是同一根 pin——判定复用 spinner 的 `latestSpecTasksToolUseId` 规则（`vlist-spec-tasks-pin.ts`）。该卡仍计入 fold 数量（不从前缀 trace 的 items 移除，计数与 chunked 一致）。
+  - **⚠️ 豁免按"工具条目"而非"整段 tool-run"**：`keepToolUseIds` 只把被 pin 的那一次调用拆出去，同段的其他调用照常折进 activity unit。早先按 message id 做段级豁免，整段 tool-run 会以普通 segment 抵达 adapter，L1/L2 于是把它的其他已完成调用压成 `tool-run-count`——一条不含任何行、只有"工具调用 ×N"的计数行，那些调用在低档位下彻底不可寻址（现象：低 LOD "吞掉"了一次工具调用）。不变量：**任何档位下每次调用都必须可寻址**（自己的卡，或某个 trace 里的具名行）；计数行没有行，因此不得成为某次调用的唯一落点。permission 阻塞的调用同理只豁免自己。
   - **pin 的 id 只由 `buildPretextDocumentLayout` 推导，不接受 build option**：shell 另有一份（`LatestTodosToolUseIdCtx`，供 chunked 任务板 spinner 用），但那份扫的是 tail-meta 的消息列表，与 layout 实际布局的列表（persisted window + live streaming row）可能不一致；而一个"故意不进 build deps"的外部值一旦陈旧就永远无法自纠。就地推导保证 pin 始终与它所属的文档一致。
 - **ActivityTrace**（L1/L2）：表头 + min(N,10)×18.8🟢；collapsed(L1) → 仅表头 ≈24.8px。
 - **ReasoningCountLine**（L1/L2）：单行 ≈20.8px🟢。

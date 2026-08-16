@@ -1,0 +1,16 @@
+{
+	// Type-checks the example plugins, which the root tsconfig deliberately does not include:
+	// plugins are separate build targets, bundled by `scripts/build-plugin.ts`.
+	//
+	// This file exists because that exclusion had teeth. `Bun.build` strips types without
+	// checking them, so nothing verified plugin sources unless a test happened to import the
+	// module. `src/server.ts` is imported by no test, so when `resolveManager` became async,
+	// five call sites kept using its result as a value — including `try { resolveManager() }`
+	// blocks that could no longer catch the rejection they existed to handle — and the build
+	// still succeeded.
+	//
+	// Run with: bunx tsgo --noEmit -p examples/plugins/tsconfig.json
+	"extends": "../../tsconfig.json",
+	"include": ["**/src/**/*.ts", "**/src/**/*.tsx"],
+	"exclude": ["node_modules", "**/dist"]
+}

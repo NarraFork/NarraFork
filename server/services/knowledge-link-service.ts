@@ -200,10 +200,14 @@ class ReadResolver {
 			return false;
 		}
 		const col = this.collectionById.get(entry.collectionId);
-		const aclCol: AclCollection = col
-			? toAclCollection(col)
-			: { id: entry.collectionId, defaultLevel: "public" };
-		const ok = await canRead(this.caps, toAclEntry(entry), aclCol);
+		// Fail closed when the collection is absent from the preloaded batch: a NOT NULL FK
+		// makes that an anomaly, and a public default would expose links into collections
+		// whose gate we could not read.
+		if (!col) {
+			this.readableCache.set(entryId, false);
+			return false;
+		}
+		const ok = await canRead(this.caps, toAclEntry(entry), toAclCollection(col));
 		this.readableCache.set(entryId, ok);
 		return ok;
 	}
@@ -218,10 +222,9 @@ async function assertReadableEntry(caps: PrincipalCaps, entryId: string): Promis
 	const collection = await db.query.knowledgeCollections.findFirst({
 		where: eq(knowledgeCollections.id, entry.collectionId),
 	});
-	const aclCol: AclCollection = collection
-		? toAclCollection(collection)
-		: { id: entry.collectionId, defaultLevel: "public" };
-	const ok = await canRead(caps, toAclEntry(entry), aclCol);
+	// Fail closed on a missing collection row rather than assuming a public gate.
+	if (!collection) throw new NotFoundError("Knowledge entry", entryId);
+	const ok = await canRead(caps, toAclEntry(entry), toAclCollection(collection));
 	if (!ok) throw new NotFoundError("Knowledge entry", entryId);
 	return entry;
 }

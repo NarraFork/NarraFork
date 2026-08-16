@@ -2,7 +2,10 @@ import { parseCompactMessageBlock } from "@shared/compact-message";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import { projectToolIO, TOOL_IO_BUDGETS } from "@shared/pretext-layout/tool-io-projection";
-import { isMetadataOnlyEmptyReasoningAssistantMessage } from "@shared/reasoning-content";
+import {
+	isDanglingReasoningOnlyAssistantMessage,
+	isMetadataOnlyEmptyReasoningAssistantMessage,
+} from "@shared/reasoning-content";
 import {
 	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
 	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
@@ -3138,6 +3141,63 @@ export const narratorMessageQueries = {
 				.where(eq(narrators.id, narratorId))
 				.run();
 		});
+	},
+
+	/**
+	 * Drop a single reasoning-only assistant record left behind by a turn that died
+	 * after streaming its thinking.
+	 *
+	 * Deliberately narrow, in three ways:
+	 *  - only this one ref is removed, unlike `deleteMessage`, which also removes
+	 *    everything at a higher seq (background subagent traffic that landed after
+	 *    the dead turn must survive)
+	 *  - the caller's classification is re-verified here against the stored row, so a
+	 *    stale id can never take out a real reply
+	 *  - no workspace revert: the record has no tool call, so it changed no files
+	 *
+	 * Returns true when a row was removed, false when the ref is already gone.
+	 * Throws when the target turns out not to be reasoning-only.
+	 */
+	async deleteDanglingReasoningMessage(narratorId: string, messageId: string): Promise<boolean> {
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!ref) return false;
+
+		const msg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { role: true, contentJson: true, contentText: true },
+			with: { toolCalls: { columns: { id: true } } },
+		});
+		if (!msg) return false;
+		if (!isDanglingReasoningOnlyAssistantMessage(msg)) {
+			throw new ValidationError("Message is not a reasoning-only assistant record");
+		}
+
+		db.transaction((tx) => {
+			assertNoRunningCompactRefsTx(tx, narratorId, [ref.id]);
+			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, ref.id)).run();
+			const otherRef = tx.query.narratorMessageRefs
+				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
+				.sync();
+			if (!otherRef) {
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+			}
+			tx.update(narrators)
+				.set({
+					// The provider-side conversation no longer matches the stored history.
+					apiConversationId: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					messageStructureVersion: sql`${narrators.messageStructureVersion} + 1`,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+		});
+		return true;
 	},
 
 	async dismissCwdRecoveryMessage(narratorId: string, messageId: string) {

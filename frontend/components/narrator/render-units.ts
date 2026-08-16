@@ -183,30 +183,83 @@ function splitMessageSegmentForActivity(
 }
 
 /**
- * True when a tool-run segment may fold into the activity trace.
+ * True when ONE tool item must keep its full card instead of folding into the
+ * activity trace.
  *
  * Running / streaming tools DO fold (that is what makes the hand-off invisible —
- * see the module header). Only two kinds keep their cards, and each takes the
- * whole segment with it (the segment is the unit the renderer draws, so splitting
- * it here would reorder the run):
+ * see the module header). Only two kinds keep their cards:
  *  - a tool blocked on a permission decision (its approve/deny form has nowhere
  *    else to live — see `isPermissionAwaitingToolItem`);
- *  - the most recent spec://tasks.json call, when the caller passes its message
- *    ids via `keepToolRunMessageIds` (the vlist pins that card expanded at every
- *    LOD — the task board is the narrator's live working state).
+ *  - the most recent spec://tasks.json call, when the caller passes its tool-use
+ *    id via `keepToolUseIds` (the vlist pins that card expanded at every LOD —
+ *    the task board is the narrator's live working state).
  */
-function isFoldableToolRunSegment(
-	seg: Extract<RenderSegment, { kind: "tool-run" }>,
-	keepToolRunMessageIds?: ReadonlySet<string>,
-): boolean {
-	if (seg.items.some((it) => isPermissionAwaitingToolItem(it))) return false;
-	if (keepToolRunMessageIds && keepToolRunMessageIds.size > 0) {
-		for (const item of seg.items) {
-			const messageId = item.msg?.id;
-			if (messageId && keepToolRunMessageIds.has(messageId)) return false;
-		}
+function isKeptToolItem(item: ToolRunItem, keepToolUseIds?: ReadonlySet<string>): boolean {
+	if (isPermissionAwaitingToolItem(item)) return true;
+	const toolUseId = item.tc.toolUseId;
+	return !!toolUseId && keepToolUseIds != null && keepToolUseIds.has(toolUseId);
+}
+
+type ToolRunActivityPart = {
+	/** `keep` renders as its own tool-run segment; `fold` joins the activity trace. */
+	kind: "fold" | "keep";
+	items: ToolRunItem[];
+};
+
+/**
+ * Split a tool-run into chronological foldable / kept stretches.
+ *
+ * ⚠️ Per ITEM, not per segment. Excluding the whole run because ONE of its calls
+ * must keep its card is what made a low LOD look like it had swallowed a tool: the
+ * excluded run then reached the adapter as a plain tool-run, where L1/L2 collapse
+ * its remaining completed calls into a `tool-run-count` — a bare "tool calls ×2"
+ * line that names nothing. The same calls fold into the activity trace as NAMED
+ * rows when no sibling is pinned, so the pin was silently downgrading its
+ * neighbours from readable rows to an anonymous number.
+ *
+ * Source order survives the split: the caller emits the parts in sequence and
+ * flushes the pending trace before a kept part, so a kept card stays exactly
+ * between the calls that preceded and followed it.
+ */
+function splitToolRunForActivity(
+	items: ToolRunItem[],
+	keepToolUseIds?: ReadonlySet<string>,
+): ToolRunActivityPart[] {
+	const parts: ToolRunActivityPart[] = [];
+	for (const item of items) {
+		const kind: ToolRunActivityPart["kind"] = isKeptToolItem(item, keepToolUseIds)
+			? "keep"
+			: "fold";
+		const last = parts[parts.length - 1];
+		// Contiguous items of the same fate share one part, so a kept batch renders as
+		// one run (keeping its in-run frame) and a foldable batch is absorbed at once.
+		if (last && last.kind === kind) last.items.push(item);
+		else parts.push({ kind, items: [item] });
 	}
-	return true;
+	return parts;
+}
+
+/**
+ * The segment's own `sourceMessages`, narrowed to the messages a PART's items
+ * belong to, in the segment's original order.
+ *
+ * Order matters: the activity unit's key and the L5 recency window are both read
+ * off this list, and the renderer addresses a unit by its first message id.
+ */
+function sourceMessagesForPart(
+	part: ToolRunActivityPart,
+	sourceMessages: NarratorMsg[],
+): NarratorMsg[] {
+	const owners = new Set(part.items.map((item) => item.msg));
+	const narrowed = sourceMessages.filter((msg) => owners.has(msg));
+	// A part whose messages are not listed on the segment (defensive: the segmenter
+	// always lists them) still reports its own owners rather than an empty list.
+	if (narrowed.length > 0) return narrowed;
+	const fallback: NarratorMsg[] = [];
+	for (const msg of owners) {
+		if (msg) fallback.push(msg);
+	}
+	return fallback;
 }
 
 /**
@@ -243,8 +296,13 @@ function toolItemsFromToolRunSegment(
 /**
  * Group segments into render-units. At L1/L2 (`enabled`), reasoning runs and
  * adjacent tool-run segments — INCLUDING live ones — merge into activity units.
- * Visible answer content, user messages, and permission-blocked tools remain
- * plain segment units and preserve their chronological positions.
+ * Visible answer content and user messages remain plain segment units and preserve
+ * their chronological positions.
+ *
+ * A tool that must keep its full card (permission-blocked, or named in
+ * `keepToolUseIds`) is split out ON ITS OWN, as a one-item tool-run segment at its
+ * original position; its siblings still fold. See `splitToolRunForActivity` for why
+ * excluding the whole run instead made a low LOD lose a call entirely.
  *
  * Item order is preserved and item-level keys are stable ACROSS THE HAND-OFF:
  * tools key on `toolUseId` (identical live and persisted), reasoning on its
@@ -257,7 +315,7 @@ function toolItemsFromToolRunSegment(
 export function groupRenderUnits(
 	segments: RenderSegment[],
 	enabled: boolean,
-	opts?: { keepToolRunMessageIds?: ReadonlySet<string> },
+	opts?: { keepToolUseIds?: ReadonlySet<string> },
 ): RenderUnit[] {
 	if (!enabled) return segments.map((seg) => ({ kind: "segment", seg }));
 
@@ -377,8 +435,29 @@ export function groupRenderUnits(
 				continue;
 			}
 		}
-		if (seg.kind === "tool-run" && isFoldableToolRunSegment(seg, opts?.keepToolRunMessageIds)) {
-			absorb(toolItemsFromToolRunSegment(seg), seg.sourceMessages, seg);
+		if (seg.kind === "tool-run") {
+			// Split PER ITEM: a call that must keep its card takes only itself out of
+			// the fold, and its foldable neighbours still become named trace rows
+			// instead of collapsing to an anonymous count line (see
+			// splitToolRunForActivity).
+			for (const part of splitToolRunForActivity(seg.items, opts?.keepToolUseIds)) {
+				const partMessages = sourceMessagesForPart(part, seg.sourceMessages);
+				if (part.kind === "fold") {
+					absorb(toolItemsFromToolRunSegment({ ...seg, items: part.items }), partMessages, {
+						...seg,
+						items: part.items,
+						sourceMessages: partMessages,
+					});
+					continue;
+				}
+				// A kept batch renders as its own tool-run segment, at its original
+				// position between the folded stretches around it.
+				flush();
+				units.push({
+					kind: "segment",
+					seg: { ...seg, items: part.items, sourceMessages: partMessages },
+				});
+			}
 			continue;
 		}
 		// Boundary: flush the pending activity group, then render this segment.

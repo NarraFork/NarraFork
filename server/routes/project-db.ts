@@ -6,6 +6,7 @@ import { db } from "../db";
 import { projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { getHome } from "../lib/platform";
+import { requireProjectAccess } from "../lib/project-access";
 import { getProjectDbPath } from "../lib/project-db";
 import { importProjectSchema } from "../lib/validators";
 import { fullSync } from "../services/project-db-sync";
@@ -15,6 +16,9 @@ export const projectDbRoutes = new Hono();
 
 /** POST /api/projects/:id/backup/sync — Trigger full sync to project DB. */
 projectDbRoutes.post("/:id/backup/sync", async (c) => {
+	// Backing up a project's database is a project-management operation: the dump
+	// contains everything in it.
+	await requireProjectAccess(c, c.req.param("id"), "manage");
 	const id = c.req.param("id");
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, id),
@@ -29,6 +33,7 @@ projectDbRoutes.post("/:id/backup/sync", async (c) => {
 
 /** GET /api/projects/:id/backup/status — Check backup status. */
 projectDbRoutes.get("/:id/backup/status", async (c) => {
+	await requireProjectAccess(c, c.req.param("id"), "read");
 	const id = c.req.param("id");
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, id),

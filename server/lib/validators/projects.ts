@@ -48,3 +48,30 @@ export const updateProjectSchema = z.object({
 	proxyDomain: z.string().max(200).nullable().optional(),
 	chapterSettings: projectChapterSettingsSchema.optional(),
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Project access control (membership)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Who may reach the project at all. Write access never comes from here. */
+export const projectVisibilitySchema = z.object({
+	visibility: z.enum(["private", "public"]),
+});
+
+/**
+ * Add or change members.
+ *
+ * Bounded at 50 per call: inviting people is a deliberate act on a handful of
+ * colleagues, and an unbounded list would turn one request into an arbitrarily large
+ * write on the main thread.
+ */
+export const projectMembersSchema = z.object({
+	userIds: z.array(z.string().min(1).max(128)).min(1).max(50),
+	/** read = follow along; write = work here; manage = also decide who else may. */
+	role: z.enum(["read", "write", "manage"]).default("read"),
+});
+
+export const projectTransferOwnerSchema = z.object({
+	/** null hands the project back to "no owner" (admin-managed). */
+	userId: z.string().min(1).max(128).nullable(),
+});

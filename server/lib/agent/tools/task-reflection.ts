@@ -312,6 +312,17 @@ export function hasPendingTaskReflection(requestId: string): boolean {
 	return pendingTaskReflections.has(requestId);
 }
 
+/**
+ * The narrator owning a pending task reflection, for authorizing a user decision.
+ *
+ * The decision surfaces are keyed by request id alone, so they cannot tell whose
+ * session they are about to act on without asking each registry. See
+ * `resolveDecisionNarratorId` in narrator-permission.ts.
+ */
+export function getTaskReflectionNarratorId(requestId: string): string | null {
+	return pendingTaskReflections.get(requestId)?.narratorId ?? null;
+}
+
 export async function confirmTaskReflection(
 	requestId: string,
 	evidence: string,
@@ -367,7 +378,7 @@ export const taskReflectConfirmTool: ToolDefinition = {
 	name: TASK_REFLECT_CONFIRM_TOOL_NAME,
 	reflectionOnly: true,
 	description:
-		"Confirm that a protected task change is justified. Use this when the task is actually complete, or when deleting/unprotecting/replacing an assistant-created malformed non-task constraint is necessary and the underlying user intent remains enforced. User-created or unknown-origin commitments remain conservative.",
+		"Confirm that a protected task change does not betray what the user asked for: their real requirement is satisfied, or the change repairs an entry with no decidable completion condition while keeping that requirement enforced. Do not withhold confirmation merely because a more exhaustive acceptance is imaginable.",
 	parameters: z.object({
 		confirm: z.literal(true).describe("Must be true to confirm the protected task change."),
 		evidence: z
@@ -404,7 +415,7 @@ export const taskReflectReviseTool: ToolDefinition = {
 	name: TASK_REFLECT_REVISE_TOOL_NAME,
 	reflectionOnly: true,
 	description:
-		"Reject a protected task change when evidence is missing, the task is incomplete, or user intent would be weakened. If an assistant-created protected entry is actually a standing behavior constraint with no terminal state, reject marking it done and direct the narrator to delete/unprotect it or replace it with a finite executable task instead.",
+		"Reject a protected task change only when it would betray what the user asked for — work they demanded be guaranteed would be dropped, watered down, or passed off as finished. Not for 'one more thing could still be proven': that bar produces a loop no change can pass. nextSteps must name a concrete action that would let the change pass; if none exists, require the entry to be rewritten as a finite task instead.",
 	parameters: z.object({
 		confirm: z.literal(true).describe("Must be true to reject the protected task change."),
 		feedback: z.string().min(1).describe("Why the protected task change cannot proceed."),

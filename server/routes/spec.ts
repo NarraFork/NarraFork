@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
+import { requireNarratorAccess } from "../lib/narrator-access";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { specFileQuerySchema, updateSpecFileSchema } from "../lib/validators";
 import { interjectSpecEditAsUserMessage } from "../services/spec-edit-interject";
@@ -8,6 +9,22 @@ import { specVfsService } from "../services/spec-vfs-service";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 export const specRoutes = new Hono();
+
+/**
+ * Access gate for the spec surface.
+ *
+ * Mounted under `/api/narrators` but living in its own file, so it does NOT
+ * inherit the gate in `routes/narrators.ts` — spec files are narrator context and
+ * would otherwise stay world-readable and world-writable after access control
+ * landed everywhere else. Every route here is `/:id/spec/...`, so one guard covers
+ * the file: GET inspects, anything else edits the narrator's working spec.
+ */
+specRoutes.use("/:id/spec/*", async (c, next) => {
+	const id = c.req.param("id");
+	if (!id) return next();
+	await requireNarratorAccess(c, id, c.req.method === "GET" ? "read" : "write");
+	return next();
+});
 
 /** GET /:id/spec/files — list spec file metadata (no content). */
 specRoutes.get("/:id/spec/files", async (c) => {

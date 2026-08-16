@@ -52,7 +52,10 @@ export const PLUGIN_BUILDS: Record<string, PluginBuildConfig> = {
 		targets: [
 			{ entry: "src/server.ts", outfile: "server/index.js", target: "bun", format: "esm" },
 			{
-				entry: "src/ui/provider-settings.ts",
+				// `.tsx`: the panel renders with the host's shared React/Mantine runtime, which it
+				// reads off a global rather than importing. React itself is therefore *not* in
+				// this bundle — see `src/ui/host-runtime.ts`.
+				entry: "src/ui/provider-settings.tsx",
 				outfile: "ui/provider-settings.iife.js",
 				target: "browser",
 				format: "iife",

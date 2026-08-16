@@ -1488,6 +1488,10 @@ function preserveFailedUpdateRecoveryEvidence(options: {
 				updateEpoch: options.updateEpoch,
 				targetVersion: options.targetVersion,
 				capturedAt: new Date().toISOString(),
+				// This attempt failed, so no replacement process exists to claim this manifest.
+				// Marking it evidence-only keeps it readable for diagnosis while ensuring no later
+				// startup treats it as an instruction to resume these narrators.
+				evidenceOnly: true,
 			},
 			// Never clobber a manifest that a newer update epoch already owns.
 			{ expectedEpoch: options.updateEpoch },
@@ -1729,6 +1733,15 @@ async function drainAndSpawnPreparedUpdate(options: {
 	} catch (error) {
 		throw new Error(`Failed to prepare graceful restart handoff: ${error}`);
 	}
+
+	// Bind the manifest to the process about to be spawned. The manifest had to exist before the
+	// handoff session (so a crash between the two still leaves recovery evidence), so the nonce is
+	// stamped in now that it is known. Only the replacement receiving this same nonce may act on
+	// the manifest; any other startup discards it instead of resuming its narrators.
+	writePlannedUpdateRecoverySnapshot(recoverySnapshot, {
+		expectedEpoch: options.updateEpoch,
+		handoffMarkerNonce: session.markerNonce,
+	});
 
 	try {
 		// The ambient proxy variables are blanked in THIS process (see

@@ -5,6 +5,7 @@ import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import { generateId } from "../lib/id";
 import { addTrait, parseTraits, removeTrait } from "../lib/narrator-utils";
 import { forcesRelaxedPlan, resolveEffectiveRelaxedPlan } from "../lib/permission-modes";
+import { buildPlanFileRelPath } from "../lib/plan-file-path";
 import { generateWordSlug } from "../lib/words";
 import type { PreparedPlanMode } from "./narrator-session-state";
 
@@ -230,7 +231,7 @@ export async function prepareNarratorPlanMode(
 			toolCallId,
 			toolUseId,
 			planFileId,
-			planFilePath: `.narrafork/plan-${planFileId}.md`,
+			planFilePath: buildPlanFileRelPath(planFileId),
 			previousPermissionMode:
 				current?.previousPermissionMode ?? current?.permissionMode ?? "default",
 		};
@@ -345,7 +346,7 @@ export async function commitPreparedEnterPlanModeResult(
 			return {
 				traits: nextTraits,
 				planFileId,
-				planFilePath: `.narrafork/plan-${planFileId}.md`,
+				planFilePath: buildPlanFileRelPath(planFileId),
 				previousPermissionMode,
 				wasPlanMode,
 				changed,
@@ -419,7 +420,7 @@ export async function enterNarratorPlanMode(
 				.where(eq(narrators.id, narratorId));
 		}
 
-		const planFilePath = `.narrafork/plan-${planFileId}.md`;
+		const planFilePath = buildPlanFileRelPath(planFileId);
 
 		return {
 			traits: nextTraits,

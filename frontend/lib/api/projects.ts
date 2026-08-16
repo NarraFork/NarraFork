@@ -7,7 +7,13 @@ import {
 	readFetchError,
 	request,
 } from "./client";
-import type { ApiEntity } from "./types";
+import type {
+	ApiEntity,
+	ProjectAccess,
+	ProjectMemberBatchResult,
+	ProjectRole,
+	ProjectVisibility,
+} from "./types";
 
 /**
  * One degraded aspect of a graph response.
@@ -374,4 +380,38 @@ export const projectsApi = {
 		}),
 	getSnapshotApplications: (snapshotId: string) =>
 		request<ApiEntity[]>(`/volume-snapshots/${snapshotId}/applications`),
+
+	// ── Access control (membership) ────────────────────────────────────────────
+
+	/**
+	 * Whether projects exist that this user cannot see.
+	 *
+	 * Only worth calling when the visible list is empty — it exists solely to tell
+	 * "create your first project" apart from "you have not been added to any".
+	 */
+	getHiddenProjectExistence: () => request<{ hasHidden: boolean }>("/projects/hidden-existence"),
+
+	getProjectAccess: (projectId: string) => request<ProjectAccess>(`/projects/${projectId}/access`),
+
+	setProjectVisibility: (projectId: string, visibility: ProjectVisibility) =>
+		request<ProjectAccess>(`/projects/${projectId}/visibility`, {
+			method: "PATCH",
+			body: JSON.stringify({ visibility }),
+		}),
+
+	/** Add several members at one tier; the response reports each user's outcome. */
+	addProjectMembers: (projectId: string, userIds: string[], role: ProjectRole) =>
+		request<ProjectMemberBatchResult>(`/projects/${projectId}/members`, {
+			method: "POST",
+			body: JSON.stringify({ userIds, role }),
+		}),
+
+	removeProjectMember: (projectId: string, userId: string) =>
+		request<{ ok: true }>(`/projects/${projectId}/members/${userId}`, { method: "DELETE" }),
+
+	transferProjectOwner: (projectId: string, userId: string) =>
+		request<ProjectAccess>(`/projects/${projectId}/transfer-owner`, {
+			method: "POST",
+			body: JSON.stringify({ userId }),
+		}),
 };

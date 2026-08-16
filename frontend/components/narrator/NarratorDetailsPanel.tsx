@@ -106,6 +106,7 @@ import {
 	shouldRenderAdvancedSubsection,
 } from "./details-panel-sections";
 import { localizeNarratorError } from "./error-localization";
+import { NarratorAccessPanel } from "./NarratorAccessPanel";
 import { NarratorAvatar } from "./NarratorAvatar";
 import type { ViewerInfo } from "./useNarratorPanelWS";
 
@@ -1145,6 +1146,23 @@ export function NarratorDetailsPanel({
 						/>
 					) : null}
 				</DetailsPanelSection>
+
+				{/* Sharing. Kept next to the identity section because "who is this session
+				    for" belongs with "what is this session", and deliberately not inside
+				    Advanced: it is the answer to a question users ask about their own work,
+				    not a tuning knob. */}
+				{narratorId ? (
+					<DetailsPanelSection
+						id="access"
+						title={t("access.visibilityTitle", { ns: "narrator" })}
+						searchableText={[
+							t("access.peopleTitle", { ns: "narrator" }),
+							t("access.shareTitle", { ns: "narrator" }),
+						]}
+					>
+						<NarratorAccessPanel narratorId={narratorId} />
+					</DetailsPanelSection>
+				) : null}
 
 				<DetailsPanelSection
 					id="skills"

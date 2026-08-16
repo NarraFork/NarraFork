@@ -751,4 +751,63 @@ describe("PluginUiHost", () => {
 		});
 		expect(oversized).toMatchObject({ error: { code: "PAYLOAD_TOO_LARGE" } });
 	});
+
+	/*
+	 * Size is judged BEFORE shape, matching `validateUiEnvelope` on the client.
+	 *
+	 * These two cases are what the ordering is for, and the first one is why the check
+	 * above was passing for the wrong reason: the envelope schema caps any single string at
+	 * 1 MB, well under the 5 MB envelope ceiling, so an oversized payload used to fail
+	 * `safeParse` first and be reported as INVALID_PARAMS — a "your message is malformed"
+	 * answer to "your message is too big".
+	 */
+	test("an oversized payload is reported as too large, not as malformed", async () => {
+		const host = allowedHost();
+		// One string past the envelope ceiling: too big AND (by the per-string cap) not
+		// schema-valid. The size verdict has to win, or the limit is unreportable.
+		const response = await host.dispatch({
+			session: makeSession(),
+			principalId: "user-1",
+			userRole: "user",
+			request: request("single-huge-string", "context.get", {
+				value: "x".repeat(PLUGIN_UI_HOST_REQUEST_MAX_BYTES + 1),
+			}),
+		});
+		expect(response).toMatchObject({ error: { code: "PAYLOAD_TOO_LARGE" } });
+		// The request's own id is preserved, so the caller can settle the right pending call
+		// rather than seeing an "invalid-request" it never sent.
+		expect(response).toMatchObject({ id: "single-huge-string" });
+	});
+
+	test("an oversized payload built from individually-legal strings is also refused", async () => {
+		// The case that DID reach the size check before: every string is under the per-string
+		// cap, so only the envelope total is out of bounds. It must still be refused, and
+		// with the same code as the single-string case.
+		const host = allowedHost();
+		const chunk = "y".repeat(500_000);
+		const values: Record<string, JsonValue> = {};
+		for (let i = 0; i < 12; i++) values[`chunk-${i}`] = chunk;
+
+		const response = await host.dispatch({
+			session: makeSession(),
+			principalId: "user-1",
+			userRole: "user",
+			request: request("many-legal-strings", "context.get", values),
+		});
+		expect(response).toMatchObject({ error: { code: "PAYLOAD_TOO_LARGE" } });
+	});
+
+	test("a request just under the ceiling is not refused for size", async () => {
+		// The other side of the bound: the limit must not reject a legitimate payload. This
+		// one is schema-valid and inside the ceiling, so whatever comes back is a verdict on
+		// the METHOD, never PAYLOAD_TOO_LARGE.
+		const host = allowedHost();
+		const response = await host.dispatch({
+			session: makeSession(),
+			principalId: "user-1",
+			userRole: "user",
+			request: request("comfortable", "context.get", { value: "z".repeat(900_000) }),
+		});
+		expect(response).not.toMatchObject({ error: { code: "PAYLOAD_TOO_LARGE" } });
+	});
 });

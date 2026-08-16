@@ -354,8 +354,8 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 		}
 	});
 
-	test("keepToolRunMessageIds keeps a segment out of the fold, neighbours still fold", () => {
-		// Three tool segments: only the middle one's message id is in the keep set.
+	test("keepToolUseIds keeps ONE call out of the fold, neighbours still fold", () => {
+		// Three tool segments: only the middle call's tool-use id is in the keep set.
 		// It must stay a plain segment (its card renders in full) while the two
 		// neighbours fold into their own activity units on either side.
 		const segments = segmentMessages([
@@ -364,7 +364,7 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 			toolMessage("message-3", "tool-3", "thought three"),
 		]);
 		const units = groupRenderUnits(segments, true, {
-			keepToolRunMessageIds: new Set(["message-2"]),
+			keepToolUseIds: new Set(["tool-2"]),
 		});
 
 		expect(units.map((u) => u.kind)).toEqual(["activity", "segment", "activity"]);
@@ -372,11 +372,96 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 		if (kept.kind !== "segment" || kept.seg.kind !== "tool-run")
 			throw new Error("expected tool-run segment");
 		expect(kept.seg.items.map((i) => i.tc.toolUseId)).toEqual(["tool-2"]);
-		// The kept segment's tool must not also appear inside a folded unit.
+		// The kept call must not also appear inside a folded unit.
 		for (const unit of units) {
 			if (unit.kind !== "activity") continue;
 			expect(unit.items.some((i) => i.kind === "tool" && i.tc.toolUseId === "tool-2")).toBe(false);
 		}
+	});
+
+	/**
+	 * ⚠️ The bug this pins down: a kept call used to take its WHOLE tool-run out of
+	 * the fold, so its siblings never became trace rows. Downstream, a plain
+	 * tool-run at L1/L2 collapses to a `tool-run-count` — an anonymous "tool calls
+	 * ×N" line — so pinning one call silently erased the identity of every call
+	 * beside it. Splitting per item keeps the neighbours as named rows.
+	 */
+	test("a kept call does NOT drag its sibling calls out of the fold", () => {
+		// One message issuing three calls in a single run; only the middle is kept.
+		const runMessage: NarratorMsg = {
+			id: "message-run",
+			narratorId: "narrator-1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentJson: [
+				{ type: "tool_use", id: "tool-a", name: "Read", input: { file_path: "a.ts" } },
+				{ type: "tool_use", id: "tool-pinned", name: "Write", input: { file_path: "b.ts" } },
+				{ type: "tool_use", id: "tool-c", name: "Bash", input: { command: "ls" } },
+			],
+			contentText: null,
+			toolCalls: [
+				{ id: "call-a", toolUseId: "tool-a", toolName: "Read", status: "success" },
+				{ id: "call-pinned", toolUseId: "tool-pinned", toolName: "Write", status: "success" },
+				{ id: "call-c", toolUseId: "tool-c", toolName: "Bash", status: "success" },
+			],
+			children: [],
+			createdAt: "2026-07-19T00:00:00.000Z",
+		} as NarratorMsg;
+
+		const units = groupRenderUnits(segmentMessages([runMessage]), true, {
+			keepToolUseIds: new Set(["tool-pinned"]),
+		});
+
+		// Source order survives: folded before, kept card, folded after.
+		expect(units.map((u) => u.kind)).toEqual(["activity", "segment", "activity"]);
+		const foldedIds = units.flatMap((unit) =>
+			unit.kind === "activity"
+				? unit.items.flatMap((item) => (item.kind === "tool" ? [item.tc.toolUseId] : []))
+				: [],
+		);
+		expect(foldedIds).toEqual(["tool-a", "tool-c"]);
+		const kept = units[1];
+		if (kept.kind !== "segment" || kept.seg.kind !== "tool-run")
+			throw new Error("expected tool-run segment");
+		expect(kept.seg.items.map((i) => i.tc.toolUseId)).toEqual(["tool-pinned"]);
+		// Every folded unit reports the message it came from, so its key and the L5
+		// recency window still resolve.
+		for (const unit of units) {
+			if (unit.kind !== "activity") continue;
+			expect(unit.sourceMessages.map((m) => m.id)).toEqual(["message-run"]);
+		}
+	});
+
+	test("a permission-blocked call keeps only ITS card, siblings still fold", () => {
+		const runMessage: NarratorMsg = {
+			id: "message-perm",
+			narratorId: "narrator-1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentJson: [
+				{ type: "tool_use", id: "tool-done", name: "Read", input: { file_path: "a.ts" } },
+				{ type: "tool_use", id: "tool-blocked", name: "Bash", input: { command: "rm -rf x" } },
+			],
+			contentText: null,
+			toolCalls: [
+				{ id: "call-done", toolUseId: "tool-done", toolName: "Read", status: "success" },
+				{ id: "call-blocked", toolUseId: "tool-blocked", toolName: "Bash", status: "pending" },
+			],
+			children: [],
+			createdAt: "2026-07-19T00:00:00.000Z",
+		} as NarratorMsg;
+
+		const units = groupRenderUnits(segmentMessages([runMessage]), true);
+		expect(units.map((u) => u.kind)).toEqual(["activity", "segment"]);
+		const folded = units[0];
+		if (folded.kind !== "activity") throw new Error("expected activity unit");
+		expect(
+			folded.items.flatMap((item) => (item.kind === "tool" ? [item.tc.toolUseId] : [])),
+		).toEqual(["tool-done"]);
+		const kept = units[1];
+		if (kept.kind !== "segment" || kept.seg.kind !== "tool-run")
+			throw new Error("expected tool-run segment");
+		expect(kept.seg.items.map((i) => i.tc.toolUseId)).toEqual(["tool-blocked"]);
 	});
 
 	test("an empty / absent keep set changes nothing about the fold", () => {
@@ -385,9 +470,9 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 			toolMessage("message-2", "tool-2", "thought two"),
 		]);
 		const baseline = groupRenderUnits(segments, true);
-		const withEmpty = groupRenderUnits(segments, true, { keepToolRunMessageIds: new Set() });
+		const withEmpty = groupRenderUnits(segments, true, { keepToolUseIds: new Set() });
 		const withUnknown = groupRenderUnits(segments, true, {
-			keepToolRunMessageIds: new Set(["message-missing"]),
+			keepToolUseIds: new Set(["tool-missing"]),
 		});
 		expect(withEmpty.map((u) => u.kind)).toEqual(baseline.map((u) => u.kind));
 		expect(withUnknown.map((u) => u.kind)).toEqual(baseline.map((u) => u.kind));

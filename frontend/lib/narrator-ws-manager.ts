@@ -26,6 +26,12 @@ import { removeWSStatus, setWSStatus } from "./ws-status";
 
 export type NarratorSubscriptionKind = "list" | "panel" | "messages";
 
+/**
+ * Max chat room ids per `chat_subscribe` frame. Matches the server-side Zod cap
+ * in `validators/websocket.ts`, which is also the per-connection ceiling.
+ */
+export const CHAT_ROOM_SUBSCRIBE_BATCH_SIZE = 50;
+
 /** Opaque handle returned by `subscribe()` — pass to `unsubscribe()`. */
 export interface SubscriptionHandle {
 	/** @internal */ _id: number;
@@ -348,6 +354,9 @@ export class NarratorWSManager {
 	// narratorId → Set of handle IDs that requested presence
 	private presenceRefCounts = new Map<string, Set<number>>();
 
+	/** roomId → handle ids watching it. Same ref-counting shape as presence. */
+	private chatRoomRefCounts = new Map<string, Set<number>>();
+
 	// --- Stats ---
 	private statsRefCount = 0;
 
@@ -624,6 +633,41 @@ export class NarratorWSManager {
 			this.presenceRefCounts.delete(narratorId);
 			if (this.ws?.readyState === WebSocket.OPEN) {
 				this.ws.send(JSON.stringify({ type: "presence_leave", narratorId }));
+			}
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Chat rooms (ref-counted, same shape as presence)
+	// -----------------------------------------------------------------------
+
+	/**
+	 * Subscribe this connection to a chat room's live messages.
+	 *
+	 * Ref-counted per room so several panels (the dock panel and the /messages
+	 * page can both show the same narrator room) share one server subscription,
+	 * and replayed on reconnect by `_restoreSubscriptions`.
+	 */
+	joinChatRoom(roomId: string, handleId: number): void {
+		let refs = this.chatRoomRefCounts.get(roomId);
+		if (!refs) {
+			refs = new Set();
+			this.chatRoomRefCounts.set(roomId, refs);
+			if (this.ws?.readyState === WebSocket.OPEN) {
+				this.ws.send(JSON.stringify({ type: "chat_subscribe", roomIds: [roomId] }));
+			}
+		}
+		refs.add(handleId);
+	}
+
+	leaveChatRoom(roomId: string, handleId: number): void {
+		const refs = this.chatRoomRefCounts.get(roomId);
+		if (!refs) return;
+		refs.delete(handleId);
+		if (refs.size === 0) {
+			this.chatRoomRefCounts.delete(roomId);
+			if (this.ws?.readyState === WebSocket.OPEN) {
+				this.ws.send(JSON.stringify({ type: "chat_unsubscribe", roomIds: [roomId] }));
 			}
 		}
 	}
@@ -1474,6 +1518,19 @@ export class NarratorWSManager {
 		// Presence
 		for (const narratorId of this.presenceRefCounts.keys()) {
 			ws.send(JSON.stringify({ type: "presence_join", narratorId }));
+		}
+
+		// Chat rooms. The server re-authorizes each room on subscribe, so a room the
+		// user lost access to while offline simply never re-enters the index. Chunked
+		// to the server's per-frame cap.
+		const chatRoomIds = [...this.chatRoomRefCounts.keys()];
+		for (let i = 0; i < chatRoomIds.length; i += CHAT_ROOM_SUBSCRIBE_BATCH_SIZE) {
+			ws.send(
+				JSON.stringify({
+					type: "chat_subscribe",
+					roomIds: chatRoomIds.slice(i, i + CHAT_ROOM_SUBSCRIBE_BATCH_SIZE),
+				}),
+			);
 		}
 
 		// Stats

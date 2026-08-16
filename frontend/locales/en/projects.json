@@ -2,6 +2,7 @@
 	"title": "NarraFlow",
 	"newProject": "New NarraFlow",
 	"noProjects": "No narraflows yet. Create one to get started.",
+	"noProjectsVisible": "No projects are shared with you yet. Ask a project owner or admin to add you.",
 	"noProjectMatches": "No narraflows match your search.",
 	"projectSearchPlaceholder": "Search narraflows...",
 	"projectListTruncated": "Showing {{shown}} narraflows; {{hidden}} more hidden. Search to narrow the list.",
@@ -12,7 +13,6 @@
 	"repositoryPathDescription": "Local path to an existing git repository",
 	"projectNotFound": "NarraFlow not found",
 	"repoMode": "Repository",
-
 	"repoModeExisting": "Existing repository",
 	"repoModeInit": "Initialize new",
 	"repoModeClone": "Clone from URL",
@@ -96,5 +96,31 @@
 	"authUsernamePlaceholder": "Username or email",
 	"authPassword": "Password / Token",
 	"authPasswordPlaceholder": "Password or personal access token",
-	"authRetry": "Retry with credentials"
+	"authRetry": "Retry with credentials",
+	"access": {
+		"visibilityTitle": "Visibility",
+		"visibilityPrivate": "Private",
+		"visibilityPublic": "Public",
+		"visibilityHint": {
+			"private": "Only the owner and invited members can reach this project.",
+			"public": "Any signed-in user can reach this project."
+		},
+		"membersTitle": "Members",
+		"noMembers": "No members yet. Only the owner can reach this project.",
+		"ownerLabel": "{{username}} (owner)",
+		"noOwner": "This project has no owner, so only admins can change access.",
+		"roleRead": "Read",
+		"roleWrite": "Write",
+		"roleManage": "Manage",
+		"removeMember": "Remove from project",
+		"removeUser": "Remove {{username}} from project",
+		"roleForUser": "Project role for {{username}}",
+		"panelLabel": "Project access",
+		"addTitle": "Add members",
+		"searchUsers": "Search users",
+		"add": "Add",
+		"noUsersFound": "No matching users",
+		"readOnlyNotice": "Only the owner, a manager or an admin can change project access.",
+		"unavailable": "Access information is unavailable."
+	}
 }

@@ -1,3 +1,8 @@
+import type {
+	ExecutorManifest,
+	ExecutorPlatform,
+	ExecutorPlatformInfo,
+} from "@shared/remote-executor";
 import { request } from "./client";
 
 export interface RemoteDevice {
@@ -135,6 +140,33 @@ export interface UpdateDeviceInput {
 	projectId?: string | null;
 }
 
+export interface ExecutorManifestResponse {
+	/** Null when no executor release has been published or the server is offline. */
+	manifest: ExecutorManifest | null;
+	/** Device RPC protocol version this server speaks. */
+	expectedProtocolVersion: number;
+	platforms: ExecutorPlatformInfo[];
+}
+
+export interface InstallScriptInput {
+	platform: ExecutorPlatform;
+	mode: "system" | "user";
+	allowRoot: string;
+	disableShell?: boolean;
+	/** Override the base URL baked into the script (defaults to this server). */
+	serverBaseUrl?: string;
+}
+
+export interface InstallScriptResult {
+	script: string;
+	filename: string;
+	shell: "sh" | "powershell";
+	executorVersion: string;
+	platform: ExecutorPlatform;
+	/** The embedded download ticket stops working after this time. */
+	expiresAt: string;
+}
+
 export const devicesApi = {
 	listDevices: () => request<RemoteDevice[]>("/devices"),
 	getDevice: (id: string) => request<RemoteDevice>(`/devices/${id}`),
@@ -209,4 +241,13 @@ export const devicesApi = {
 		request<DeviceConnectionDiagnostics>(`/devices/${id}/diagnostics`),
 	testDevice: (id: string) =>
 		request<TestConnectionResult>(`/devices/${id}/test`, { method: "POST" }),
+	getExecutorManifest: (opts?: { refresh?: boolean }) =>
+		request<ExecutorManifestResponse>(
+			`/devices/executor/manifest${opts?.refresh ? "?refresh=1" : ""}`,
+		),
+	createInstallScript: (id: string, data: InstallScriptInput) =>
+		request<InstallScriptResult>(`/devices/${id}/install-script`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
 };

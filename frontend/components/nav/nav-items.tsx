@@ -1,4 +1,11 @@
-import { IconBook2, IconClock, IconDatabase, IconFolders, IconWand } from "@tabler/icons-react";
+import {
+	IconBook2,
+	IconClock,
+	IconDatabase,
+	IconFolders,
+	IconMessages,
+	IconWand,
+} from "@tabler/icons-react";
 import type { ComponentType } from "react";
 
 /**
@@ -27,7 +34,7 @@ export interface NavItemDef {
 	 * data structure — the count itself is resolved by the rendering component through
 	 * the matching hook, so this is only the wiring key.
 	 */
-	badge?: "knowledgeReviewInbox";
+	badge?: "knowledgeReviewInbox" | "chatUnread";
 }
 
 export const CUSTOMIZABLE_NAV_ITEMS: readonly NavItemDef[] = [
@@ -36,6 +43,14 @@ export const CUSTOMIZABLE_NAV_ITEMS: readonly NavItemDef[] = [
 		labelKey: "projects",
 		to: "/projects",
 		icon: IconFolders,
+	},
+	{
+		id: "messages",
+		labelKey: "messages",
+		to: "/messages",
+		icon: IconMessages,
+		activePrefix: "/messages",
+		badge: "chatUnread",
 	},
 	{
 		id: "routines",

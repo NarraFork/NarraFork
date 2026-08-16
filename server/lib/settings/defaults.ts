@@ -24,6 +24,7 @@ export const DEFAULTS: NarraForkSettings = {
 	},
 	plugins: {
 		enabled: true,
+		allowPrivateProxyTarget: false,
 	},
 	agent: {
 		defaultPermissionMode: "acceptEdits",
@@ -289,6 +290,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	// ── plugins ─────────────────────────────────────────────────────────
 	"plugins.enabled": {
 		desc: "是否启用插件子系统（默认启用）。环境变量 NF_PLUGINS_ENABLED / NARRAFORK_PLUGINS_ENABLED 若设置则优先，可作为应急关闭开关。",
+		type: "boolean",
+	},
+	"plugins.allowPrivateProxyTarget": {
+		desc: "允许代理 URL 指向私有/保留 IP 地址（127.x、10.x、172.16-31.x、192.168.x、169.254.x、::1 等）并传递给插件。默认 false 以阻止 SSRF；私有化部署使用内网代理时需显式开启。",
 		type: "boolean",
 	},
 

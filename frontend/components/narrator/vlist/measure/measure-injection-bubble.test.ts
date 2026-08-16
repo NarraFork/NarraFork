@@ -122,6 +122,44 @@ describe("measureInjectionBubble — width discipline", () => {
 		expect(r.frame.usedWidth).toBeLessThanOrEqual(r.contentWidth);
 	});
 
+	it("keeps a full-bleed code panel inside the frame it shrank to", async () => {
+		// The bug this pins, reported from a background command's fenced output: the
+		// bubble narrowed its frame to `frame.usedWidth` while the body kept its
+		// first-pass width, and a code panel — which paints its background and border
+		// across the WHOLE width it is handed, unlike text — ran straight out of the
+		// bubble's right edge.
+		//
+		// The property is one number agreeing with itself: the width the body is painted
+		// at must fit inside the frame that was committed.
+		const { measureInjectionBubble, INJECTION_BUBBLE_PADDING } = await mod();
+		const r = measureInjectionBubble(
+			{ markdown: "```\nshort\nlines\n```", hasHeader: false },
+			WIDTH,
+		);
+		expect(r.blocks.some((b) => b.kind === "code")).toBe(true);
+		expect(r.contentWidth).toBeLessThanOrEqual(r.usedWidth - INJECTION_BUBBLE_PADDING * 2);
+		// And it genuinely shrank rather than reaching agreement by going full width.
+		expect(r.usedWidth).toBeLessThan(WIDTH / 2);
+	});
+
+	it("keeps the panel inside the frame even when the header floor widens it", async () => {
+		// The floor is applied AFTER the shrink, so a body re-measured at the pre-floor
+		// width would end up narrower than its own bubble — a gap instead of an
+		// overflow, but the same two-sides-disagree bug.
+		const { measureInjectionBubble, INJECTION_BUBBLE_PADDING } = await mod();
+		const r = measureInjectionBubble({ markdown: "```\nx\n```", speaker: "run-biome" }, WIDTH);
+		expect(r.contentWidth).toBe(r.usedWidth - INJECTION_BUBBLE_PADDING * 2);
+	});
+
+	it("leaves a text-only body on the single-pass path", async () => {
+		// The re-measure exists for full-bleed blocks only. Prose keeps the documented
+		// asymmetry (frame narrower than the measured wrap width), because re-wrapping
+		// it would change its line count and therefore the committed height.
+		const { measureInjectionBubble, INJECTION_BUBBLE_PADDING } = await mod();
+		const r = measureInjectionBubble({ markdown: "ok", hasHeader: false }, WIDTH);
+		expect(r.contentWidth).toBeGreaterThan(r.usedWidth - INJECTION_BUBBLE_PADDING * 2);
+	});
+
 	it("floors the frame at the header minimum so a short speaker row is not clipped", async () => {
 		const { measureInjectionBubble, INJECTION_BUBBLE_PADDING, INJECTION_HEADER_MIN_CONTENT_WIDTH } =
 			await mod();

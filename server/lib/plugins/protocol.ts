@@ -834,6 +834,36 @@ export const commandsInvokeParamsSchema = z
 	})
 	.strict();
 
+/**
+ * Max bytes for a single non-secret config value.
+ *
+ * Smaller than the secret ceiling on purpose: config is persisted through the provider config
+ * service, which validates the whole object against the contribution's `configSchema` on every
+ * write. These are settings — a mode, a region, a URL — not credential blobs.
+ */
+export const MAX_COMMAND_CONFIG_VALUE_BYTES = 16 * 1024;
+
+/**
+ * One requested non-secret config mutation returned by a plugin command.
+ *
+ * Exists because `secretWrites` cannot carry it: the vault and the config store are different
+ * places, and a value written to the vault would never reach `configSchema` validation or the
+ * config the host passes back into `provider.chat`. Without this, a command could change a
+ * setting on the live provider instance but not persist it, so the change silently reverted on
+ * the next restart.
+ *
+ * `value: null` clears the field, matching the config form.
+ *
+ * The host derives the writable namespace from what the plugin contributed and refuses keys
+ * that name a *secret* field, so the two channels stay disjoint rather than overlapping.
+ */
+export const commandConfigWriteSchema = z
+	.object({
+		key: z.string().trim().min(1).max(256),
+		value: jsonValueSchema.nullable(),
+	})
+	.strict();
+
 export const commandsInvokeResultSchema = z
 	.object({
 		/** Payload returned to the caller. Never includes secret values. */
@@ -845,10 +875,19 @@ export const commandsInvokeResultSchema = z
 		 * this is an event-loop guard, not a policy on how many credentials a plugin may own.
 		 */
 		secretWrites: z.array(commandSecretWriteSchema).max(1_000).optional(),
+		/**
+		 * Non-secret config mutations. Also consumed by the host and never echoed back.
+		 *
+		 * Capped far lower than `secretWrites`: a config write goes through schema validation
+		 * and rewrites the provider's stored config, so a large batch is a sign of misuse
+		 * rather than a legitimate credential set.
+		 */
+		configWrites: z.array(commandConfigWriteSchema).max(64).optional(),
 	})
 	.strict();
 
 export type CommandSecretWrite = z.infer<typeof commandSecretWriteSchema>;
+export type CommandConfigWrite = z.infer<typeof commandConfigWriteSchema>;
 export type CommandsInvokeParams = z.infer<typeof commandsInvokeParamsSchema>;
 export type CommandsInvokeResult = z.infer<typeof commandsInvokeResultSchema>;
 

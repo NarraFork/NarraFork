@@ -473,11 +473,11 @@ describe("danger fingerprint execution identity", () => {
 describe("pending permission execution identity", () => {
 	test("reprocesses a remote ExitPlanMode only through its frozen remote backend", async () => {
 		const localRoot = mkdtempSync(join(tmpdir(), "narrafork-permission-reprocess-"));
-		const remotePath = "/remote/work/.narrafork/plan-remote-cycle.md";
+		const remotePath = "/remote/work/.narrafork/plans/plan-remote-cycle.md";
 		const remoteContent = "# Remote plan\n\nRead from the executor.";
 		const localContent = "# LOCAL FALLBACK MUST NOT BE READ";
-		const localPlanPath = join(localRoot, ".narrafork", "plan-remote-cycle.md");
-		mkdirSync(join(localRoot, ".narrafork"), { recursive: true });
+		const localPlanPath = join(localRoot, ".narrafork", "plans", "plan-remote-cycle.md");
+		mkdirSync(join(localRoot, ".narrafork", "plans"), { recursive: true });
 		writeFileSync(localPlanPath, localContent, "utf8");
 		const { backend, calls } = makeRemotePlanBackend(remotePath, remoteContent);
 		const id = "remote-reprocess-narrator";
@@ -548,8 +548,8 @@ describe("pending permission execution identity", () => {
 	});
 
 	test("reprocesses a relaxed custom plan path with the same frozen provenance", async () => {
-		const customInputPath = "plans/custom-plan.md";
-		const customPath = "/remote/work/plans/custom-plan.md";
+		const customInputPath = ".narrafork/plans/custom-plan.md";
+		const customPath = "/remote/work/.narrafork/plans/custom-plan.md";
 		const customContent = "# Custom remote plan\n\nKeep this source.";
 		const { backend, calls } = makeRemotePlanBackend(customPath, customContent);
 		const id = "remote-custom-reprocess-narrator";
@@ -627,7 +627,7 @@ describe("pending permission execution identity", () => {
 	});
 
 	test("fails a pending remote plan closed when its device goes offline", async () => {
-		const remotePath = "/remote/work/.narrafork/plan-offline-cycle.md";
+		const remotePath = "/remote/work/.narrafork/plans/plan-offline-cycle.md";
 		const { backend, calls } = makeRemotePlanBackend(remotePath, "# Remote plan");
 		const id = "remote-offline-narrator";
 		const message = "remote-offline-message";
@@ -697,7 +697,7 @@ describe("pending permission execution identity", () => {
 
 	test("fails closed when a reconnected target changes generation or path flavor", async () => {
 		for (const drift of ["generation", "pathFlavor"] as const) {
-			const remotePath = `/remote/work/.narrafork/plan-${drift}-drift.md`;
+			const remotePath = `/remote/work/.narrafork/plans/plan-${drift}-drift.md`;
 			const { backend } = makeRemotePlanBackend(remotePath, `# ${drift} drift`);
 			const id = `remote-${drift}-drift-narrator`;
 			const message = `remote-${drift}-drift-message`;

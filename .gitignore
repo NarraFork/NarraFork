@@ -34,9 +34,15 @@ scripts/lib/*
 # Imported by scripts/release.ts and tests/scripts/stable-baseline-patch*.test.ts, so it has
 # to be in the repo or both the release script and `bun test` break in a fresh clone.
 !scripts/lib/stable-baseline-patch.ts
+# The remote executor release pipeline: the script is the only way to publish the
+# executor, and its manifest builder is imported by scripts/lib/__tests__ and by
+# tests/executor-bootstrap-e2e.test.ts, so both must be in the repo.
+!scripts/release-executor.ts
+!scripts/lib/executor-manifest.ts
 !scripts/lib/__tests__/
 scripts/lib/__tests__/*
 !scripts/lib/__tests__/latest-yml.test.ts
+!scripts/lib/__tests__/executor-manifest.test.ts
 !scripts/validate-plugin-release.ts
 # Imported by tests/scripts/build-plugin.test.ts, so it has to be in the repo or
 # `bun test` fails on a missing module in a fresh clone.

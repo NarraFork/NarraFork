@@ -57,6 +57,24 @@ export interface PlannedUpdateRecoverySnapshot {
 	updateEpoch: string;
 	targetVersion?: string;
 	capturedAt: string;
+	/**
+	 * Marker nonce handed to the replacement process this manifest was written for.
+	 *
+	 * The manifest is a one-shot handover note: only the process that update attempt spawned may
+	 * act on it. Startup compares this against the nonce it received through the handoff
+	 * environment, so an ordinary manual restart — or a later, different update — can never
+	 * inherit a leftover manifest and resume the narrators it lists. Absent on manifests written
+	 * before the replacement was spawned, and on those written by older binaries.
+	 */
+	handoffMarkerNonce?: string;
+	/**
+	 * Written by a FAILED update attempt purely to preserve diagnostics.
+	 *
+	 * No replacement process was ever spawned for such an attempt, so no future startup can
+	 * legitimately claim it. It must never authorize resuming narrators — otherwise the failure
+	 * record itself becomes a standing instruction to restart that work on a later boot.
+	 */
+	evidenceOnly?: boolean;
 	narrators: NarratorRecoveryTarget[];
 }
 
@@ -65,6 +83,8 @@ interface WritablePlannedUpdateRecoverySnapshot {
 	updateEpoch?: string;
 	targetVersion?: string;
 	capturedAt: string;
+	handoffMarkerNonce?: string;
+	evidenceOnly?: boolean;
 	narrators: NarratorRecoveryTarget[];
 }
 
@@ -913,6 +933,10 @@ export function parsePlannedUpdateRecoverySnapshot(
 				: `legacy_${capturedAt.replace(/[^a-zA-Z0-9]/g, "_")}`,
 		targetVersion: typeof parsed.targetVersion === "string" ? parsed.targetVersion : undefined,
 		capturedAt,
+		...(typeof parsed.handoffMarkerNonce === "string" && parsed.handoffMarkerNonce
+			? { handoffMarkerNonce: parsed.handoffMarkerNonce }
+			: {}),
+		...(parsed.evidenceOnly === true ? { evidenceOnly: true } : {}),
 		narrators,
 	};
 }
@@ -937,6 +961,13 @@ function readExistingRecoverySnapshotEpoch(): string | undefined {
  */
 export interface RecoveryManifestEpochGuard {
 	expectedEpoch: string;
+	/**
+	 * Marker nonce of the replacement process this manifest authorizes.
+	 *
+	 * Set by the restart orchestration once the handoff session exists, so the manifest becomes
+	 * actionable by exactly one spawned process instead of by whichever server starts next.
+	 */
+	handoffMarkerNonce?: string;
 }
 
 export class RecoveryManifestEpochConflictError extends Error {
@@ -959,6 +990,7 @@ export function writePlannedUpdateRecoverySnapshot(
 		...snapshot,
 		version: 2,
 		updateEpoch: snapshot.updateEpoch ?? state.updateEpoch ?? generateUpdateEpoch(),
+		handoffMarkerNonce: guard.handoffMarkerNonce ?? snapshot.handoffMarkerNonce,
 	});
 	if (!normalized) throw new Error("Invalid planned update recovery snapshot");
 
@@ -1004,6 +1036,38 @@ export function consumePlannedUpdateRecoverySnapshot(): PlannedUpdateRecoverySna
 		});
 		return null;
 	}
+}
+
+export type RecoveryManifestRejection =
+	| "not_a_replacement_process"
+	| "handoff_nonce_mismatch"
+	| "evidence_only";
+
+/**
+ * Decide whether the manifest found on disk authorizes THIS process to resume its narrators.
+ *
+ * The manifest is a one-shot handover note from a single update attempt to the single replacement
+ * process it spawned. Ownership is proven by identity, not by age: an ordinary manual restart
+ * receives no handoff at all, and a different update attempt carries a different marker nonce.
+ * Without this check a manifest left behind by a failed update (or by a recovery pass that could
+ * not finish) is re-consumed by every subsequent startup, which resumes long-abandoned narrators
+ * again and again.
+ *
+ * A manifest with no nonce is accepted for any handoff-spawned process: it was written either
+ * before the replacement was spawned, or by a binary that predates nonce binding. Requiring a
+ * nonce there would silently drop the one legitimate resume during the upgrade that introduces it.
+ */
+export function classifyRecoveryManifestOwnership(
+	snapshot: Pick<PlannedUpdateRecoverySnapshot, "handoffMarkerNonce" | "evidenceOnly">,
+	handoff: { markerNonce?: string } | null,
+): { owned: true } | { owned: false; reason: RecoveryManifestRejection } {
+	if (snapshot.evidenceOnly) return { owned: false, reason: "evidence_only" };
+	if (!handoff) return { owned: false, reason: "not_a_replacement_process" };
+	if (!snapshot.handoffMarkerNonce) return { owned: true };
+	if (snapshot.handoffMarkerNonce !== handoff.markerNonce) {
+		return { owned: false, reason: "handoff_nonce_mismatch" };
+	}
+	return { owned: true };
 }
 
 export function removePlannedUpdateRecoverySnapshot(guard: RecoveryManifestEpochGuard): void {

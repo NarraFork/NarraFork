@@ -1,3 +1,4 @@
+import { KNOWLEDGE_EXCERPT_MAX_CHARS, knowledgeExcerpt } from "@shared/knowledge-excerpt";
 import { settings } from "../lib/settings";
 import { knowledgeAcl } from "./knowledge-acl";
 import { knowledgeService } from "./knowledge-service";
@@ -24,13 +25,25 @@ export interface ToolOutputKnowledgeScanResult {
 /** De-dup set of entry ids already injected this turn (caller owns the set). */
 export type InjectedSet = Set<string>;
 
-const MAX_SUMMARY_CHARS = 320;
+const MAX_SUMMARY_CHARS = KNOWLEDGE_EXCERPT_MAX_CHARS;
 const CJK_RE = /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/;
 const WORD_RE = /[\p{L}\p{N}_]/u;
 
-function summarize(text: string): string {
-	const t = text.trim().replace(/\s+/g, " ");
-	return t.length > MAX_SUMMARY_CHARS ? `${t.slice(0, MAX_SUMMARY_CHARS)}…` : t;
+/**
+ * One-line excerpt of an entry body, for the hit's `summary`.
+ *
+ * ⚠️ This used to be `text.replace(/\s+/g, " ")` and nothing else, which is where the
+ * "giant heading" rendering came from: an entry body opens with `# Title`, so collapsing
+ * it to one line put the WHOLE excerpt behind that `#` and the reader-facing Markdown
+ * projection painted 300 characters at display size, with the body's surviving `>` and
+ * backtick markers strewn through it. Markdown has to be stripped, not merely flattened
+ * — see `@shared/knowledge-excerpt`.
+ *
+ * `title` is passed so a body whose first line just repeats the entry title contributes
+ * its SECOND line instead; the injection bubble's header already shows the title.
+ */
+function summarize(text: string, title?: string): string {
+	return knowledgeExcerpt(text, { title, maxChars: MAX_SUMMARY_CHARS });
 }
 
 type KeywordCandidate = ReturnType<typeof knowledgeService.listKeywordInjectionCandidates>[number];
@@ -276,7 +289,7 @@ export async function resolveInjections(
 		entryId: r.id,
 		entryRevisionId: r.entryRevisionId,
 		title: r.title,
-		summary: summarize(snippets.get(r.id) ?? ""),
+		summary: summarize(snippets.get(r.id) ?? "", r.title),
 	}));
 }
 

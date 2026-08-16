@@ -42,6 +42,7 @@ export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
 	browser: PANEL_COMPONENT.browser,
 	tasks: PANEL_COMPONENT.tasks,
 	search: PANEL_COMPONENT.search,
+	userchat: PANEL_COMPONENT.userchat,
 	subagent: PANEL_COMPONENT.subagent,
 	file: PANEL_COMPONENT.file,
 	plugin: PANEL_COMPONENT.plugin,
@@ -96,6 +97,7 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 	browser: PANEL_DEFAULT_TITLE.browser,
 	tasks: PANEL_DEFAULT_TITLE.tasks,
 	search: PANEL_DEFAULT_TITLE.search,
+	userchat: PANEL_DEFAULT_TITLE.userchat,
 	subagent: PANEL_DEFAULT_TITLE.subagent,
 	file: PANEL_DEFAULT_TITLE.file,
 	plugin: PANEL_DEFAULT_TITLE.plugin,
@@ -111,6 +113,7 @@ const NARRATOR_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set([
 	"browser",
 	"tasks",
 	"search",
+	"userchat",
 	// TEMPORARY: the streaming harness participates in the toolbar's
 	// open/close/toggle vocabulary so its button can show active state.
 	// Removed together with `../mock/` (see its README-REMOVAL.md).

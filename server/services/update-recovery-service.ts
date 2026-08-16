@@ -11,6 +11,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
+import { getObservedRestartHandoff } from "../lib/restart-handoff";
 import {
 	type AgentReplyWaitRunSnapshot,
 	getRunningAgentReplyWaitRunSnapshot,
@@ -26,10 +27,10 @@ import {
 } from "./tool-continuation-service";
 import {
 	capturePlannedUpdateRecoverySnapshot,
+	classifyRecoveryManifestOwnership,
 	consumePlannedUpdateRecoverySnapshot,
 	type PlannedUpdateRecoverySnapshot,
 	removePlannedUpdateRecoverySnapshot,
-	writePlannedUpdateRecoverySnapshot,
 } from "./update-coordinator";
 
 export const CLAIM_LEASE_MS = 5 * 60_000;
@@ -507,16 +508,78 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 	return snapshot;
 }
 
+/**
+ * Statuses that prove a narrator was cut off mid-turn rather than stopped deliberately.
+ *
+ * A user interrupt, an error, and a normal completion all persist a terminal `idle` row before the
+ * process goes away (`["interrupted"]`, `["error"]`, `["unread"]`). Only work that was still
+ * running when the process was replaced remains `working`/`waiting`. Reading this BEFORE generic
+ * startup recovery is essential: `recoverOnStartup` rewrites every `working`/`waiting` row to
+ * `idle ["interrupted"]`, after which an update-severed turn is indistinguishable from a turn the
+ * user stopped on purpose.
+ */
+const UPDATE_SEVERED_STATUSES = new Set(["working", "waiting"]);
+
+/**
+ * Narrators from the manifest that were still mid-turn when this process took over.
+ *
+ * Absent from the map means "do not resume": either the row is already terminal (the user stopped
+ * it, it failed, or it finished) or its status could not be read. Missing evidence is never
+ * treated as permission to resume.
+ */
+async function loadUpdateSeveredNarrators(
+	snapshot: PlannedUpdateRecoverySnapshot,
+): Promise<Set<string>> {
+	const severed = new Set<string>();
+	if (snapshot.narrators.length === 0) return severed;
+	const { narratorService } = await import("./narrator-service");
+	for (const target of snapshot.narrators) {
+		try {
+			const narrator = await narratorService.getById(target.narratorId);
+			if (UPDATE_SEVERED_STATUSES.has(narrator.status)) severed.add(target.narratorId);
+		} catch (error) {
+			if (error instanceof NotFoundError) continue;
+			logger.warn("Could not classify a planned-update narrator before generic recovery", {
+				narratorId: target.narratorId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	return severed;
+}
+
 /** Read the manifest epoch before generic startup cleanup mutates any protected row. */
 export async function getPlannedUpdateStartupProtection(): Promise<{
 	snapshot: PlannedUpdateRecoverySnapshot | null;
 	protection: ToolContinuationProtectionSets;
+	/** Manifest narrators observed mid-turn before generic recovery rewrote their status. */
+	severedNarratorIds: ReadonlySet<string>;
 }> {
 	const snapshot = consumePlannedUpdateRecoverySnapshot();
-	if (!snapshot) return { snapshot: null, protection: EMPTY_PROTECTION };
+	if (!snapshot) {
+		return { snapshot: null, protection: EMPTY_PROTECTION, severedNarratorIds: new Set() };
+	}
+
+	// Ownership is decided before anything is resumed. A manifest this process does not own is
+	// removed rather than left in place: keeping it is exactly what made abandoned narrators
+	// restart on every subsequent boot.
+	const ownership = classifyRecoveryManifestOwnership(snapshot, getObservedRestartHandoff());
+	if (!ownership.owned) {
+		logger.warn("Discarding a planned-update recovery manifest this process does not own", {
+			reason: ownership.reason,
+			updateEpoch: snapshot.updateEpoch,
+			targetVersion: snapshot.targetVersion ?? null,
+			capturedAt: snapshot.capturedAt,
+			narratorCount: snapshot.narrators.length,
+		});
+		removePlannedUpdateRecoverySnapshot({ expectedEpoch: snapshot.updateEpoch });
+		return { snapshot: null, protection: EMPTY_PROTECTION, severedNarratorIds: new Set() };
+	}
+
 	return {
 		snapshot,
 		protection: await toolContinuationService.getProtectionSets(snapshot.updateEpoch),
+		severedNarratorIds: await loadUpdateSeveredNarrators(snapshot),
 	};
 }
 
@@ -1456,14 +1519,33 @@ function restoreRecoveryQueue(
 	};
 }
 
+/**
+ * Resume manifest narrators that have no durable tool continuation to drive them.
+ *
+ * Two rules keep this from reviving abandoned work:
+ *
+ *  - Only narrators observed mid-turn before generic recovery ran are resumed. `continueNarrator`
+ *    feeds a "Continue." turn when there is no tool-result packet to replay, so resuming a session
+ *    the user interrupted (or one that already failed) makes an old plan act on current code.
+ *  - A failure here is never written back to the manifest. The manifest is owned by one spawned
+ *    replacement process, so a retry entry could only ever be consumed by a startup that does not
+ *    own it — which is precisely how abandoned narrators came back on every boot. The failure is
+ *    reported (and logged) instead, and the manifest is dropped with the rest of this epoch.
+ */
 async function restoreLegacyNarrators(
 	snapshot: PlannedUpdateRecoverySnapshot,
 	protection: ToolContinuationProtectionSets,
+	severedNarratorIds: ReadonlySet<string>,
 ): Promise<void> {
 	const { narratorService } = await import("./narrator-service");
-	const retryTargets: typeof snapshot.narrators = [];
+	const failures: string[] = [];
+	let skipped = 0;
 	for (const target of snapshot.narrators) {
 		if (protection.narratorIds.has(target.narratorId)) continue;
+		if (!severedNarratorIds.has(target.narratorId)) {
+			skipped++;
+			continue;
+		}
 		try {
 			const narrator = await narratorService.getById(target.narratorId);
 			if (isSubagentVariant(narrator.variant)) continue;
@@ -1482,27 +1564,23 @@ async function restoreLegacyNarrators(
 			}
 		} catch (error) {
 			if (error instanceof NotFoundError) continue;
-			retryTargets.push(target);
+			failures.push(target.narratorId);
 			logger.warn("Failed to resume legacy planned-update narrator", {
 				narratorId: target.narratorId,
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
 	}
-	if (retryTargets.length > 0) {
-		writePlannedUpdateRecoverySnapshot(
-			{
-				version: 2,
-				updateEpoch: snapshot.updateEpoch,
-				targetVersion: snapshot.targetVersion,
-				capturedAt: new Date().toISOString(),
-				narrators: retryTargets,
-			},
-			// Background recovery may still be running when a fresh update takes over the manifest;
-			// never overwrite a manifest that now belongs to a different epoch.
-			{ expectedEpoch: snapshot.updateEpoch },
+	if (skipped > 0) {
+		logger.info("Skipped planned-update narrators that were not severed by the update", {
+			updateEpoch: snapshot.updateEpoch,
+			skipped,
+		});
+	}
+	if (failures.length > 0) {
+		throw new Error(
+			`Failed to mount ${failures.length} legacy narrator continuations: ${failures.join(", ")}`,
 		);
-		throw new Error(`Failed to mount ${retryTargets.length} legacy narrator continuations`);
 	}
 }
 
@@ -1553,9 +1631,11 @@ export interface PlannedUpdateRecoveryHandle {
 export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 	snapshot: PlannedUpdateRecoverySnapshot | null;
 	protection: ToolContinuationProtectionSets;
+	severedNarratorIds?: ReadonlySet<string>;
 }): Promise<PlannedUpdateRecoveryHandle | null> {
 	const startup = prepared ?? (await getPlannedUpdateStartupProtection());
 	const { snapshot, protection } = startup;
+	const severedNarratorIds = startup.severedNarratorIds ?? new Set<string>();
 	if (!snapshot) return null;
 	const queue = (
 		await toolContinuationService.listRecoveryQueueByEpoch(snapshot.updateEpoch)
@@ -1629,7 +1709,7 @@ export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 			if (unfinished.length > 0) {
 				throw new Error(`${unfinished.length} continuation owner deliveries remain unfinished`);
 			}
-			await restoreLegacyNarrators(snapshot, protection);
+			await restoreLegacyNarrators(snapshot, protection, severedNarratorIds);
 			// Only clear the manifest this recovery pass owns. If a newer update already replaced it,
 			// the epoch guard keeps the newer manifest intact.
 			removePlannedUpdateRecoverySnapshot({ expectedEpoch: snapshot.updateEpoch });

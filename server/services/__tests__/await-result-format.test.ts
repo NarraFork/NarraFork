@@ -626,6 +626,99 @@ describe("background agent task lifecycle", () => {
 		await expect(backgroundTaskService.readOutputTail("no-such-task")).resolves.toBeNull();
 	});
 
+	test("reaps stale running bash rows after an unclean restart", async () => {
+		// The leak this closes: recovery filtered `type = "agent"`, so a bash row stayed at
+		// `running` forever after an unclean exit. Its child process is gone, so no
+		// markCompleted can ever fire; `Await` would wait out its whole timeout on an
+		// event that cannot arrive; and `cleanupCompleted`'s `ne(status,"running")` refuses
+		// to reap it, so the row outlives the database's usefulness.
+		const { parentNarratorId } = await seedAgentTaskEntities("bash-restart");
+		const taskId = "bash-stale-task";
+		await backgroundTaskService.createBashTask({
+			id: taskId,
+			parentNarratorId,
+			command: "sleep 100",
+			title: "orphan probe",
+		});
+
+		expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
+		await expect(backgroundTaskService.getById(taskId)).resolves.toMatchObject({
+			status: "cancelled",
+			type: "bash",
+		});
+	});
+
+	test("reaps a stale bash row even when the protection set names it", async () => {
+		// `narrator_tool_continuations` has no `background_bash` kind, so a background
+		// command has no resume path — nothing can re-adopt a dead child process. A bash id
+		// appearing in the protected set can therefore only be stale bookkeeping, and
+		// honouring it would reintroduce exactly the permanent `running` leak.
+		const { parentNarratorId } = await seedAgentTaskEntities("bash-protected");
+		const taskId = "bash-protected-task";
+		await backgroundTaskService.createBashTask({
+			id: taskId,
+			parentNarratorId,
+			command: "sleep 100",
+			title: "protected probe",
+		});
+
+		expect(await backgroundTaskService.recoverStaleTasksAfterRestart(new Set([taskId]))).toBe(1);
+		await expect(backgroundTaskService.getById(taskId)).resolves.toMatchObject({
+			status: "cancelled",
+		});
+	});
+
+	test("a reaped bash row unblocks Await instead of stranding it", async () => {
+		// The property that matters to the model: reaching a terminal state is what lets a
+		// pending `Await` return. Before the fix the row stayed `running`, so this wait
+		// could only end by timing out.
+		const { parentNarratorId } = await seedAgentTaskEntities("bash-await");
+		const taskId = "bash-await-task";
+		await backgroundTaskService.createBashTask({
+			id: taskId,
+			parentNarratorId,
+			command: "sleep 100",
+			title: "await probe",
+		});
+
+		const waiting = backgroundTaskService.waitForCompletion(taskId, 5_000);
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		await expect(waiting).resolves.toMatchObject({ status: "cancelled" });
+	});
+
+	test("a reaped bash row satisfies the predicate cleanupCompleted reaps on", async () => {
+		// The second half of the leak: `cleanupCompleted` deletes only rows that are BOTH
+		// non-running and older than the retention cutoff, so a permanently-running row was
+		// also permanently un-reapable — the table grew without bound.
+		//
+		// This asserts the row's own reapability (terminal status + a completedAt to compare
+		// against) rather than calling `cleanupCompleted`, deliberately:
+		//   - that function is global, so invoking it here would delete OTHER tests' rows
+		//     from the shared database and make this suite order-dependent;
+		//   - its `completedAt < cutoff` is a STRICT comparison, so a just-reaped row is
+		//     never old enough at `olderThanMs: 0` — asserting through it would be a race on
+		//     clock resolution, not a statement about recovery.
+		const { parentNarratorId } = await seedAgentTaskEntities("bash-cleanup");
+		const taskId = "bash-cleanup-task";
+		await backgroundTaskService.createBashTask({
+			id: taskId,
+			parentNarratorId,
+			command: "sleep 100",
+			title: "cleanup probe",
+		});
+
+		// While running it fails the predicate on both counts — this is the leak.
+		const running = await backgroundTaskService.getById(taskId);
+		expect(running).toMatchObject({ status: "running", completedAt: null });
+
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+
+		const reaped = await backgroundTaskService.getById(taskId);
+		expect(reaped?.status).not.toBe("running");
+		// A timestamp to compare against, which a running row never had.
+		expect(typeof reaped?.completedAt).toBe("string");
+	});
+
 	test("recovers stale running Agent rows after an unclean restart", async () => {
 		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("restart");
 		await db

@@ -3,11 +3,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import {
+	getObservedRestartHandoff,
 	HANDOFF_MARKER_NONCE_ENV,
 	HANDOFF_MARKER_PATH_ENV,
 	HANDOFF_TOKEN_ENV,
 	HANDOFF_URL_ENV,
 	postHandoffRequest,
+	setObservedRestartHandoffForTests,
 	waitForPreviousServerShutdown,
 } from "../restart-handoff";
 
@@ -226,12 +228,17 @@ describe("waitForPreviousServerShutdown", () => {
 	test("proceeds without a handoff when no restart env is present", async () => {
 		cleanups.push(snapshotEnv(HANDOFF_ENV_KEYS));
 		for (const key of HANDOFF_ENV_KEYS) delete process.env[key];
+		setObservedRestartHandoffForTests(null);
 
 		expect(await waitForPreviousServerShutdown()).toBe(true);
+		// An ordinary startup must not look like a replacement process, or planned-update recovery
+		// would claim a leftover manifest and resume narrators nobody asked to continue.
+		expect(getObservedRestartHandoff()).toBeNull();
 	});
 
 	test("accepts a successful handoff response and consumes the marker", async () => {
 		cleanups.push(snapshotEnv(HANDOFF_ENV_KEYS));
+		cleanups.push(() => setObservedRestartHandoffForTests(null));
 		const dir = tempMarkerDir();
 		const markerPath = resolve(dir, "marker.json");
 		const nonce = "nonce-success";
@@ -253,6 +260,9 @@ describe("waitForPreviousServerShutdown", () => {
 		expect(await waitForPreviousServerShutdown()).toBe(true);
 		// Handoff env is one-shot: it must never leak into a later in-process restart.
 		for (const key of HANDOFF_ENV_KEYS) expect(process.env[key]).toBeUndefined();
+		// The nonce is latched before that cleanup, because planned-update recovery runs later and
+		// must still be able to prove which update attempt spawned this process.
+		expect(getObservedRestartHandoff()).toEqual({ markerNonce: nonce });
 	});
 
 	test("treats a marker written after an HTTP error response as success", async () => {

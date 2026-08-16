@@ -145,6 +145,7 @@ export async function broadcastTabsSnapshot(
 }
 
 export {
+	pruneUnreadableProjectTabs,
 	removeTabFromAllUsers,
 	syncNarratorDraftToRecentTabs,
 	syncNarratorTitleToRecentTabs,

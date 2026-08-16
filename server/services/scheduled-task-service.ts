@@ -10,6 +10,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
 import { chapterCleanup } from "./chapter-cleanup";
+import { canWriteNarrator } from "./narrator-acl";
 import { narratorService } from "./narrator-service";
 import { isLoopRunning, sendMessage } from "./narrator-session";
 
@@ -42,6 +43,21 @@ export type UpdateScheduledTaskInput = Partial<Omit<CreateScheduledTaskInput, "c
 
 // Per-task mutex prevents a slow run from overlapping with the next tick.
 const runLock = new AsyncMutex();
+
+/**
+ * In-memory consecutive failure counter per task, for circuit-breaking.
+ *
+ * After {@link CIRCUIT_BREAKER_THRESHOLD} consecutive failures a task is
+ * automatically disabled to prevent infinite retry noise (e.g. deleted
+ * chapter, broken config). The counter resets on success or process restart.
+ * An in-memory approach was chosen over a schema column because:
+ *  - no migration required for a defensive heuristic,
+ *  - a process restart naturally resets the breaker (giving the task another
+ *    chance after a deployment/fix), and
+ *  - the counter is never exposed to clients — only the `enabled` flag matters.
+ */
+const consecutiveFailures = new Map<string, number>();
+const CIRCUIT_BREAKER_THRESHOLD = 5;
 
 function now(): string {
 	return new Date().toISOString();
@@ -274,6 +290,28 @@ export const scheduledTaskService = {
 					error: err instanceof Error ? err.message : String(err),
 				});
 			}
+
+			// Circuit breaker: auto-disable after repeated consecutive failures.
+			// Prevents infinite retry noise from permanently broken tasks (e.g.
+			// deleted chapter, invalid config). Success resets the counter.
+			if (status === "failed") {
+				const count = (consecutiveFailures.get(id) ?? 0) + 1;
+				consecutiveFailures.set(id, count);
+				if (count >= CIRCUIT_BREAKER_THRESHOLD) {
+					logger.warn("Scheduled task auto-disabled after consecutive failures", {
+						taskId: id,
+						name: task.name,
+						consecutiveFailures: count,
+					});
+					await db
+						.update(scheduledTasks)
+						.set({ enabled: false, nextRunAt: null, updatedAt: now() })
+						.where(eq(scheduledTasks.id, id));
+					consecutiveFailures.delete(id);
+				}
+			} else if (status === "success") {
+				consecutiveFailures.delete(id);
+			}
 		});
 	},
 
@@ -349,10 +387,24 @@ export const scheduledTaskService = {
 					error: `Chapter is ${chapter.status}, cannot run`,
 				};
 			}
-			// Reuse the chapter's existing primary narrator if present.
+			// Reuse the chapter's existing primary narrator if present — but only if the
+			// task's creator may actually drive it. Otherwise a scheduled task would be a
+			// way to inject messages into someone else's private session.
 			const existing = await narratorService.listByChapter(task.chapterId);
-			if (existing.length > 0) {
+			const reusable = existing[0]
+				? await canWriteNarrator(existing[0], {
+						userId: task.createdBy ?? "",
+						isAdmin: false,
+					})
+				: false;
+			if (existing.length > 0 && reusable) {
 				narratorId = existing[0].id;
+			} else if (existing.length > 0) {
+				return {
+					status: "skipped",
+					narratorId: null,
+					error: "Task creator no longer has write access to this chapter's narrator",
+				};
 			} else {
 				const created = await narratorService.create({
 					chapterId: task.chapterId,
@@ -362,6 +414,9 @@ export const scheduledTaskService = {
 					startInPlanMode: false,
 					title: task.name,
 					extraTraits: ["scheduled"],
+					// Whoever configured the task owns the sessions it spawns — the same id
+					// already used as the run's message author and ACL principal.
+					ownerUserId: task.createdBy ?? null,
 				});
 				narratorId = created.id;
 			}
@@ -372,7 +427,13 @@ export const scheduledTaskService = {
 				// swallow it so we fall back to creating a fresh narrator below instead
 				// of failing the run permanently.
 				const existing = await narratorService.getById(task.reuseNarratorId).catch(() => null);
-				if (existing && existing.status !== "archived") {
+				// Same guard as the chapter branch: the remembered narrator may since have
+				// been transferred or un-shared, and a task must not keep writing to a
+				// session its creator can no longer reach. Falls through to a fresh one.
+				const mayReuse =
+					existing !== null &&
+					(await canWriteNarrator(existing, { userId: task.createdBy ?? "", isAdmin: false }));
+				if (existing && mayReuse && existing.status !== "archived") {
 					narratorId = existing.id;
 				}
 			}
@@ -386,6 +447,7 @@ export const scheduledTaskService = {
 					cwd: task.cwd ?? getHome(),
 					title: task.name,
 					extraTraits: ["scheduled"],
+					ownerUserId: task.createdBy ?? null,
 				});
 				narratorId = created.id;
 				if (task.narratorMode === "reuse") newReuseId = created.id;

@@ -25,7 +25,15 @@ import { commitSyncService } from "../../services/commit-sync-service";
 import { gitService } from "../../services/git-service";
 import { graphRoutes } from "../graph";
 
-const app = new Hono().route("/projects", graphRoutes);
+// The graph endpoint now requires project read. These tests cover how git degradation
+// is REPORTED, not who may look — project-acl.test.ts owns authorization — so the
+// request runs as an admin.
+const app = new Hono()
+	.use("*", async (c, next) => {
+		c.set("user", { sub: "graph-test-admin", role: "admin", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		await next();
+	})
+	.route("/projects", graphRoutes);
 
 interface GraphResponse {
 	nodes: Array<{ id: string; data: { commitCount: number; headCommitSha: string | null } }>;

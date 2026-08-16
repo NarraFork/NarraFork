@@ -17,6 +17,7 @@ import {
 	isCollectionOwnerOrAdmin,
 	type Principal,
 	type PrincipalCaps,
+	resolveCapsByUserId,
 	resolvePrincipalCaps,
 } from "./knowledge-acl";
 import { recordKnowledgeAclEvent } from "./knowledge-audit";
@@ -92,10 +93,12 @@ async function loadReadableEntry(
 		where: eq(knowledgeCollections.id, entry.collectionId),
 	});
 	const caps = await resolvePrincipalCaps(principal);
-	const aclCol: AclCollection = collection
-		? toAclCollection(collection)
-		: { id: entry.collectionId, defaultLevel: "public" };
-	if (!(await canRead(caps, toAclEntry(entry), aclCol))) {
+	// Same fail-closed rule as `filterReadable`: `collectionId` is NOT NULL behind a
+	// cascading FK, so a missing collection row is an anomaly, not an unclassified entry.
+	// Defaulting to a public gate here would disclose the entry exactly when its
+	// collection's classification cannot be read.
+	if (!collection) throw new NotFoundError("Knowledge entry", entryId);
+	if (!(await canRead(caps, toAclEntry(entry), toAclCollection(collection)))) {
 		throw new NotFoundError("Knowledge entry", entryId);
 	}
 	return { entry, caps };
@@ -496,10 +499,11 @@ async function getEntry(
 	// Unauthorized → treat as not found (don't leak existence).
 	if (opts.principal) {
 		const caps = await resolvePrincipalCaps(opts.principal);
-		const aclCol: AclCollection = collection
-			? toAclCollection(collection)
-			: { id: entry.collectionId, defaultLevel: "public" };
-		if (!(await canRead(caps, toAclEntry(entry), aclCol))) {
+		// Fail closed on a missing collection row: it cannot mean "unclassified" for a
+		// NOT NULL FK, so a public default would disclose the entry precisely when its
+		// gate is unverifiable.
+		if (!collection) throw new NotFoundError("Knowledge entry", id);
+		if (!(await canRead(caps, toAclEntry(entry), toAclCollection(collection)))) {
 			throw new NotFoundError("Knowledge entry", id);
 		}
 	}
@@ -662,9 +666,10 @@ async function assertCanManageEntry(
 	const collection = await db.query.knowledgeCollections.findFirst({
 		where: eq(knowledgeCollections.id, entry.collectionId),
 	});
-	const aclCol: AclCollection = collection
-		? toAclCollection(collection)
-		: { id: entry.collectionId, defaultLevel: "public" };
+	// Fail closed on a missing collection row (see getEntry): unverifiable gate, not a
+	// public one.
+	if (!collection) throw new NotFoundError("Knowledge entry", id);
+	const aclCol = toAclCollection(collection);
 	// Collection gate first: someone locked out of the collection cannot manage entries in it,
 	// even if they happen to be the entry owner (collection is the access boundary).
 	if (!(await canReadCollection(caps, aclCol))) {
@@ -823,9 +828,9 @@ async function addRevision(
 		const collection = await db.query.knowledgeCollections.findFirst({
 			where: eq(knowledgeCollections.id, entryRow.collectionId),
 		});
-		const aclCol: AclCollection = collection
-			? toAclCollection(collection)
-			: { id: entryRow.collectionId, defaultLevel: "public" };
+		// Fail closed on a missing collection row (see getEntry).
+		if (!collection) throw new NotFoundError("Knowledge entry", entryId);
+		const aclCol = toAclCollection(collection);
 		// Collection unreadable → NotFound (don't leak existence of restricted collections).
 		if (!(await canReadCollection(caps, aclCol))) {
 			throw new NotFoundError("Knowledge entry", entryId);
@@ -1270,6 +1275,16 @@ function keywordInjectionCandidatesSignature(
 
 /** Fetch bounded snippets only for final injected hits, avoiding large-field reads in the scan. */
 const SNIPPETS_LOOKUP_MAX = 100;
+/**
+ * Prefix of the body read per hit.
+ *
+ * Sized above the ~320-char excerpt on purpose: the consumer STRIPS Markdown
+ * (`knowledgeExcerpt`), so a heading line, a frontmatter block or an opening code fence
+ * can consume much of the prefix without contributing a single displayed character. At
+ * 512 an entry whose body opened with a fenced snippet produced an empty excerpt. Still
+ * a small, indexed, bounded read — at most `maxInjectedEntries` (3) rows per turn.
+ */
+const SNIPPET_SOURCE_CHARS = 1536;
 function snippetsByEntryIds(entryIds: string[]): Map<string, string> {
 	const out = new Map<string, string>();
 	const ids = entryIds.slice(0, SNIPPETS_LOOKUP_MAX);
@@ -1277,7 +1292,7 @@ function snippetsByEntryIds(entryIds: string[]): Map<string, string> {
 	const placeholders = ids.map(() => "?").join(",");
 	const rows = sqlite
 		.prepare(
-			`SELECT id, substr(COALESCE(current_content, title), 1, 512) as snippet
+			`SELECT id, substr(COALESCE(current_content, title), 1, ${SNIPPET_SOURCE_CHARS}) as snippet
 			 FROM knowledge_entries WHERE id IN (${placeholders})`,
 		)
 		.all(...ids) as { id: string; snippet: string | null }[];
@@ -1399,8 +1414,13 @@ async function filterReadable<T extends { id: string; collectionId?: string }>(
 	rows: T[],
 	opts: { caps?: PrincipalCaps } = {},
 ): Promise<T[]> {
-	if (!principal) return rows;
-	const caps = opts.caps ?? (await resolvePrincipalCaps(principal));
+	// No identity → the anonymous baseline (public only), NOT an unfiltered pass-through.
+	// This used to return `rows`, which meant a caller that forgot to resolve a principal
+	// silently disclosed every classified entry it had matched. Anonymous callers now see
+	// exactly what a logged-out reader may see, and a wiring mistake fails closed.
+	const caps =
+		opts.caps ??
+		(principal ? await resolvePrincipalCaps(principal) : await resolveCapsByUserId(null));
 	if (caps.isAdmin) return rows;
 
 	// Batch-load the entries (with ACL fields) + their collections' default levels.
@@ -1428,10 +1448,12 @@ async function filterReadable<T extends { id: string; collectionId?: string }>(
 		const e = entryById.get(r.id);
 		if (!e) continue;
 		const col = colById.get(e.collectionId);
-		const aclCol: AclCollection = col
-			? toAclCollection(col)
-			: { id: e.collectionId, defaultLevel: "public" };
-		if (await canRead(caps, toAclEntry(e), aclCol)) out.push(r);
+		// A missing collection row must NOT degrade to a public gate. `collectionId` is
+		// NOT NULL with a cascading FK, so an absent row means the batch read failed or
+		// raced a delete — never "this entry is unclassified". Treating it as public would
+		// hand out the collection's contents precisely when we cannot verify its gate.
+		if (!col) continue;
+		if (await canRead(caps, toAclEntry(e), toAclCollection(col))) out.push(r);
 	}
 	return out;
 }

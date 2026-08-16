@@ -156,6 +156,11 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 			variant: "primary",
 			traits: ["standalone"],
 			messageVersion: 0,
+			// Access control: same reasoning as the IM gateway — the auto-resolved
+			// deployment user owns it, and the session stays readable to the team because
+			// a webhook bot is unattended infrastructure, not private work.
+			ownerUserId: appUserId,
+			visibility: "public",
 			createdAt: now,
 			updatedAt: now,
 		});

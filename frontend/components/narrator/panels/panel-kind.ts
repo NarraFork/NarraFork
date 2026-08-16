@@ -25,6 +25,9 @@ import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
  * - `chat`     — the primary narrator panel (a cluster's protagonist).
  * - `terminal` — a terminal; narrator-bound in the dock, config-bound in a workspace.
  * - `details` / `filemod` / `spec` / `git` / `browser` / `tasks` / `search` — singleton narrator resources.
+ * - `userchat` — the human discussion room beside this narrator (people talking to
+ *   each other; its content never enters the narrator's context unless someone
+ *   forwards it explicitly).
  * - `subagent` — a multi-instance child-narrator session in the cluster's secondary area.
  * - `file`     — a multi-instance read-only file viewer in the secondary area.
  * - `webview`  — a standalone webview (workspace only).
@@ -40,6 +43,7 @@ export type PanelKind =
 	| "browser"
 	| "tasks"
 	| "search"
+	| "userchat"
 	| "subagent"
 	| "file"
 	| "webview"
@@ -139,6 +143,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	browser: "browser",
 	tasks: "tasks",
 	search: "search",
+	userchat: "userchat",
 	subagent: "subagent",
 	file: "file",
 	webview: "webview",
@@ -163,6 +168,7 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	browser: "Browser",
 	tasks: "Tasks",
 	search: "Search",
+	userchat: "Discussion",
 	subagent: "Subagent",
 	file: "File",
 	webview: "Webview",

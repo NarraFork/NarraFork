@@ -11,18 +11,43 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import type { StorageBackend } from "./types";
 
+/** Thrown when a storage path would escape the configured base directory. */
+export class UnsafeStoragePathError extends Error {
+	constructor(path: string) {
+		super(`Unsafe storage path: ${path}`);
+		this.name = "UnsafeStoragePathError";
+	}
+}
+
 export class LocalStorage implements StorageBackend {
+	private readonly resolvedBaseDir: string;
+
 	constructor(private readonly baseDir: string) {
 		if (!existsSync(baseDir)) {
 			mkdirSync(baseDir, { recursive: true });
 		}
+		this.resolvedBaseDir = resolvePath(baseDir);
 	}
 
+	/**
+	 * Join a storage-relative path against the base directory, refusing anything
+	 * that escapes it. Route handlers interpolate request parameters into storage
+	 * paths, so containment is enforced here rather than trusting every caller.
+	 */
 	private resolve(path: string): string {
-		return join(this.baseDir, path);
+		if (!path || isAbsolute(path)) throw new UnsafeStoragePathError(path);
+		if (path.includes("\0")) throw new UnsafeStoragePathError(path);
+		const full = resolvePath(join(this.resolvedBaseDir, path));
+		const rel = relative(this.resolvedBaseDir, full);
+		if (rel === "" || rel === ".." || rel.startsWith(`..${"/"}`) || isAbsolute(rel)) {
+			throw new UnsafeStoragePathError(path);
+		}
+		// On Windows, relative() may use backslashes for the traversal prefix.
+		if (rel.startsWith("..\\")) throw new UnsafeStoragePathError(path);
+		return full;
 	}
 
 	async saveFile(path: string, data: Buffer | ReadableStream): Promise<void> {

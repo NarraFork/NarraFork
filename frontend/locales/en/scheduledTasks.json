@@ -41,6 +41,7 @@
 	"project": "Project",
 	"chapter": "Chapter",
 	"selectProject": "Select a project",
+	"noProjectsAvailable": "No projects are available to you. Ask a project owner or admin to add you.",
 	"selectChapter": "Select a chapter",
 	"narratorMode": "Narrator",
 	"narratorModeDesc": "Spawn a fresh session each run, or reuse the same one.",

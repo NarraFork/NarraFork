@@ -492,3 +492,33 @@ export const editAndRegenerateJsonSchema = z.object({
 	scope: revertScopeSchema,
 	rollback: z.boolean().optional(),
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Access control (sharing)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Read audience of a narrator. Write access never comes from here. */
+export const narratorVisibilitySchema = z.object({
+	visibility: z.enum(["private", "project", "public"]),
+});
+
+/**
+ * Share with specific users.
+ *
+ * Bounded at 50 per call: sharing is a deliberate act on a handful of colleagues,
+ * and an unbounded list would turn one request into an arbitrarily large write
+ * transaction on the main thread.
+ */
+export const narratorGrantCreateSchema = z.object({
+	userIds: z.array(z.string().min(1).max(128)).min(1).max(50),
+	access: z.enum(["read", "write"]).default("read"),
+});
+
+export const narratorGrantUpdateSchema = z.object({
+	access: z.enum(["read", "write"]),
+});
+
+export const narratorTransferOwnerSchema = z.object({
+	/** null hands the narrator back to "no owner" (admin-managed). */
+	userId: z.string().min(1).max(128).nullable(),
+});

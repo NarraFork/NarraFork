@@ -10,6 +10,7 @@ import { createDownloadRoutes } from "./routes/download";
 import { healthRoutes } from "./routes/health";
 import { createReleaseRoutes } from "./routes/releases";
 import { tokenRoutes } from "./routes/tokens";
+import { createToolRoutes } from "./routes/tools";
 import type { StorageBackend } from "./storage/types";
 
 export function createApp(storage: StorageBackend): Hono {
@@ -22,7 +23,7 @@ export function createApp(storage: StorageBackend): Hono {
 			"*",
 			cors({
 				origin: config.cors.origins,
-				allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
+				allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 				allowHeaders: ["Authorization", "Content-Type"],
 			}),
 		);
@@ -43,20 +44,9 @@ export function createApp(storage: StorageBackend): Hono {
 	app.route("/api/v2/products", createCheckRoutes(storage));
 	app.route("/api/v2/products", createDownloadRoutes(storage));
 
-	// Tools endpoint — serves helper binaries (e.g. zstd.exe for Windows)
-	app.get("/api/v2/tools/:filename", async (c) => {
-		const filename = c.req.param("filename");
-		const path = `tools/${filename}`;
-		const file = await storage.getFile(path);
-		if (!file) return c.json({ error: "Tool not found" }, 404);
-		return new Response(new Uint8Array(file), {
-			headers: {
-				"Content-Type": "application/octet-stream",
-				"Content-Disposition": `attachment; filename="${filename}"`,
-				"Content-Length": String(file.length),
-			},
-		});
-	});
+	// Tools endpoints — public download plus authenticated publish for helper
+	// binaries (zstd, ripgrep, the remote executor and its manifest).
+	app.route("/api/v2/tools", createToolRoutes(storage));
 
 	// Authenticated endpoints
 	app.route("/api/v2/products", createReleaseRoutes(storage));

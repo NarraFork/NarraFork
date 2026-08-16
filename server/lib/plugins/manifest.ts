@@ -400,6 +400,17 @@ const viewContributionSchema = contributionBaseSchema
 		 * install time which provider a view belongs to instead of guessing at runtime.
 		 */
 		providerId: contributionIdSchema.optional(),
+		/**
+		 * Opt in to the host's shared UI runtime (React + Mantine), which the iframe shell
+		 * injects before this view's entry.
+		 *
+		 * Absent means the view brings its own DOM code and the shell is unchanged — the
+		 * runtime is ~1.2 MB, so it must never be forced on a view that draws plain DOM.
+		 *
+		 * A literal rather than a boolean because the host may later offer a second runtime;
+		 * `runtime: "host-react"` stays meaningful in a way `runtime: true` would not.
+		 */
+		runtime: z.literal("host-react").optional(),
 		instance: z.enum([
 			"singleton",
 			"singleton-per-workspace",
@@ -946,11 +957,17 @@ const MAX_UNINSPECTED_PERMISSION_JSON_CHARS = 8 * 1024;
 /**
  * `network` / `filesystem` / `process` declarations: optional, uninspected, size-capped.
  *
- * These are **documentation, not enforcement**. A search of the host finds no reader of
- * `permissions.network`, `permissions.filesystem` or `permissions.process` — a plugin
- * process gets its network access from the OS and its filesystem access from the runner,
- * neither of which consults these fields. Validating their contents therefore only rejected
- * manifests; it never restricted a running plugin.
+ * These are **declaration and audit only, NOT a runtime-enforced sandbox boundary**.
+ *
+ * A search of the host finds no reader of `permissions.network`, `permissions.filesystem`
+ * or `permissions.process` — a plugin process gets its network access from the OS and its
+ * filesystem access from the runner, neither of which consults these fields. Validating
+ * their contents therefore only rejected manifests; it never restricted a running plugin.
+ *
+ * Specifically for `permissions.network`: the `local-process` runner inherits the host's
+ * full network stack. A manifest may declare a strict domain allowlist (e.g. the
+ * filters outbound connections against it. Enforcement requires network namespace isolation
+ * (Linux netns, iptables owner-match, or the Podman runner), which is a separate feature.
  *
  * So the shape is kept loose enough to describe intent (and to keep old manifests parsing)
  * without pretending to be a sandbox. Cross-field consistency rules are gone: refusing

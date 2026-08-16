@@ -235,7 +235,6 @@
 	"loadOlderCalls": "Load earlier tool calls",
 	"jumpTargetUnavailable": "That message is no longer in this conversation's history.",
 	"jumpTargetTooFar": "That message is too far back to jump to. Scroll up to load more history, then try again.",
-
 	"archiveNarrator": "Archive",
 	"permissionMode": "Permission Mode",
 	"permissionModesUnavailable": "Permission modes unavailable",
@@ -1258,5 +1257,33 @@
 		"role_user": "You",
 		"role_assistant": "Assistant",
 		"role_system": "System"
+	},
+	"access": {
+		"visibilityTitle": "Who can see this session",
+		"visibilityPrivate": "Only me",
+		"visibilityProject": "Project",
+		"visibilityPublic": "Everyone",
+		"visibilityHint": {
+			"private": "Only you and the people you share it with can open this session.",
+			"project": "Anyone working on this project can follow along.",
+			"public": "Any signed-in user can open this session."
+		},
+		"peopleTitle": "People with access",
+		"ownerLabel": "Owner: {{username}}",
+		"noOwner": "This session predates access control and has no owner, so only an administrator can change its sharing. Ask one to transfer it to you.",
+		"noGrants": "Not shared with anyone yet.",
+		"shareTitle": "Share with someone",
+		"searchUsers": "Search users",
+		"share": "Share",
+		"levelRead": "Can view",
+		"levelWrite": "Can work",
+		"revoke": "Remove access",
+		"revokeUser": "Remove access for {{username}}",
+		"roleForUser": "Access level for {{username}}",
+		"panelLabel": "Session access",
+		"noUsersFound": "No matching users.",
+		"readOnlyNotice": "Only the owner or an administrator can change sharing.",
+		"unavailable": "Sharing settings are unavailable for this session.",
+		"denied": "You no longer have access to this session."
 	}
 }
