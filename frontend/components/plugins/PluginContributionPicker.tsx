@@ -243,7 +243,11 @@ export function buildPluginDockPanelOpenRequest<TGroup>(input: {
 	const panelInstanceId = nextPluginPanelInstanceId(input.pick.pluginId, input.pick.contributionId);
 	const binding: import("./protocol").PluginPanelBinding = (() => {
 		const host = input.hostContext;
-		if (host?.surface === "focus" && host.narratorId) {
+		// Both focus-family surfaces (the focus page and a chapter node's embedded
+		// dock) host exactly one narrator, so both bind to "the current narrator".
+		// This is also why `host-surface` never carries "graph": a node dock only
+		// exists for a chapter that HAS a narrator, so this branch always wins.
+		if ((host?.surface === "focus" || host?.surface === "graph") && host.narratorId) {
 			return { kind: "focus-current-narrator" };
 		}
 		if (

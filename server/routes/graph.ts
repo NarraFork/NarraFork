@@ -36,10 +36,18 @@ export interface GraphNode {
 		panelHeight: number | null;
 		worktreePath: string | null;
 	};
+	/**
+	 * Classic canvas coordinates. `null` means this chapter has never been placed by
+	 * hand there, so the client should auto-layout it.
+	 *
+	 * Deliberately NOT the ruler columns (`axisOffset`/`crossOffset`): those are
+	 * offsets relative to a commit tick and are meaningless as world coordinates —
+	 * reading them here is what threw classic's nodes tens of thousands of pixels
+	 * away in ruler-arranged projects. See `chapters.graphX` in the schema.
+	 */
 	position: {
-		anchorCommitSha: string | null;
-		axisOffset: number;
-		crossOffset: number;
+		x: number | null;
+		y: number | null;
 	};
 }
 
@@ -92,9 +100,14 @@ export function buildGraph(
 		groupLabel: string | null;
 		explorationGroupId: string | null;
 		isRoot: number | null;
-		anchorCommitSha: string | null;
-		axisOffset: number | null;
-		crossOffset: number | null;
+		/**
+		 * Classic canvas coordinates; null when never placed by hand there.
+		 *
+		 * The ruler columns are deliberately absent from this input type, so a caller
+		 * cannot accidentally feed tick-relative offsets in as world coordinates.
+		 */
+		graphX: number | null;
+		graphY: number | null;
 		commitCount: number | null;
 		headCommitSha: string | null;
 		panelExpanded: number | null;
@@ -143,10 +156,12 @@ export function buildGraph(
 			reviewSourceChapterId: ch.reviewSourceChapterId ?? null,
 			reviewStatus: ch.reviewStatus ?? null,
 		},
+		// `?? null` rather than `?? 0`: null and 0 mean different things here. 0 is a
+		// position the user can actually drag a node to, so collapsing "unplaced" into
+		// it would make any node near the origin get auto-laid-out away on next load.
 		position: {
-			anchorCommitSha: ch.anchorCommitSha ?? null,
-			axisOffset: ch.axisOffset ?? 0,
-			crossOffset: ch.crossOffset ?? 0,
+			x: ch.graphX ?? null,
+			y: ch.graphY ?? null,
 		},
 	}));
 
@@ -181,9 +196,11 @@ graphRoutes.get("/:id/graph", async (c) => {
 			groupLabel: true,
 			explorationGroupId: true,
 			isRoot: true,
-			anchorCommitSha: true,
-			axisOffset: true,
-			crossOffset: true,
+			// Classic-only coordinates. The ruler columns (anchorCommitSha/axisOffset/
+			// crossOffset) are intentionally NOT selected: this endpoint feeds the
+			// classic canvas, and ruler reads its own positions via /api/ruler.
+			graphX: true,
+			graphY: true,
 			createdAt: true,
 			commitCount: true,
 			headCommitSha: true,
@@ -280,7 +297,7 @@ graphRoutes.get("/:id/graph", async (c) => {
 
 	// Get graph metadata once chapter IDs are known.
 	const chapterIds = projectChapters.map((ch) => ch.id);
-	const [allNarrators, allContainers, edgeRows, openedTerminals] = await Promise.all([
+	const [allNarrators, allContainers, edgeRows, detachedPanelRows] = await Promise.all([
 		chapterIds.length
 			? db.query.narrators.findMany({
 					// Restricted to the narrators this user may read, so the graph never
@@ -312,19 +329,18 @@ graphRoutes.get("/:id/graph", async (c) => {
 					.all()
 			: Promise.resolve([]),
 		db.select().from(chapterEdges).where(eq(chapterEdges.projectId, projectId)).all(),
+		// Panels torn out of chapter docks onto the canvas. Fetched here because the
+		// canvas renders every chapter's detached panels at once — a per-chapter
+		// endpoint would mean one request per node.
+		//
+		// Reads ONLY this column and only rows that actually have one, so the graph
+		// response does not grow for the (common) case of a project with none. The
+		// chapter query's own column whitelist above still excludes it.
 		chapterIds.length
-			? db.query.terminals.findMany({
-					where: (t, { and, inArray, eq }) =>
-						and(inArray(t.chapterId, chapterIds), eq(t.graphOpened, 1), eq(t.status, "running")),
-					columns: {
-						id: true,
-						chapterId: true,
-						name: true,
-						graphX: true,
-						graphY: true,
-						graphWidth: true,
-						graphHeight: true,
-					},
+			? db.query.chapters.findMany({
+					where: (ch, { and, inArray, isNotNull }) =>
+						and(inArray(ch.id, chapterIds), isNotNull(ch.detachedPanelsJson)),
+					columns: { id: true, detachedPanelsJson: true },
 				})
 			: Promise.resolve([]),
 	]);
@@ -368,7 +384,15 @@ graphRoutes.get("/:id/graph", async (c) => {
 	return c.json({
 		nodes,
 		edges,
-		openedTerminals,
+		/**
+		 * Per-chapter serialized detached-panel envelopes, for the chapters that have
+		 * any. The client parses each with `parseDetachedPanels`; keeping the raw
+		 * string here means the wire format has exactly one parser.
+		 */
+		detachedPanels: detachedPanelRows.map((row) => ({
+			chapterId: row.id,
+			panels: row.detachedPanelsJson,
+		})),
 		degraded: fallbacks.length > 0,
 		fallbacks,
 	});
@@ -398,10 +422,13 @@ graphRoutes.patch("/:id/graph/positions", async (c) => {
 
 	db.transaction((tx) => {
 		for (const pos of parsed.data.positions) {
+			// Writes ONLY the classic columns. It must not touch anchorCommitSha /
+			// axisOffset / crossOffset: those belong to ruler, and having this route
+			// overwrite them meant simply opening a project in classic destroyed the
+			// ruler layout (and vice versa, since both canvases wrote the same pair).
 			const updates: Record<string, unknown> = {
-				anchorCommitSha: pos.anchorCommitSha ?? null,
-				axisOffset: pos.axisOffset,
-				crossOffset: pos.crossOffset,
+				graphX: pos.x,
+				graphY: pos.y,
 			};
 			if (pos.panelExpanded !== undefined) updates.panelExpanded = pos.panelExpanded ? 1 : 0;
 			if (pos.panelWidth !== undefined) updates.panelWidth = pos.panelWidth;

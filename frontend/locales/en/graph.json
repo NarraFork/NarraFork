@@ -15,6 +15,18 @@
 	"root": "Root",
 	"expandNarrator": "Expand conversation",
 	"collapseNarrator": "Collapse conversation",
+	"nodeDock": {
+		"expandLimitReached": "Up to {{limit}} nodes can be expanded at once. Collapse one first.",
+		"layoutLoadFailed": "Could not load this node's panel layout.",
+		"retry": "Retry",
+		"releaseToDetach": "Release to detach as its own node",
+		"detachLimitReached": "Up to {{limit}} panels can be detached from one chapter. Close one first.",
+		"detachDuplicate": "That panel is already detached on the canvas.",
+		"mergeForeignChapter": "Only panels from the same chapter can be merged.",
+		"closeDetachedNode": "Close this node",
+		"noNarrator": "This chapter has no narrator.",
+		"zoomToInteract": "Zoom in to use this node's panels"
+	},
 	"contextMenu": {
 		"fork": "Fork",
 		"review": "Request Review",
@@ -62,8 +74,7 @@
 		"mergeDecisionCancelSent": "Merge flow cancellation sent; the chapter is preserved",
 		"mergeDecisionFailed": "Unable to send merge decision; WebSocket is disconnected.",
 		"mergeAiResolving": "Conflict resolution narrator started in the merge chapter",
-		"mergeFailed": "Merge failed: {{message}}",
-		"newTerminal": "New Terminal"
+		"mergeFailed": "Merge failed: {{message}}"
 	},
 	"forkDraft": {
 		"titlePlaceholder": "New branch title",
@@ -89,11 +100,6 @@
 		"closeConfirmMessage": "This terminal has running processes. Are you sure you want to close it?",
 		"cancel": "Cancel",
 		"confirmClose": "Close"
-	},
-	"terminalContextMenu": {
-		"rename": "Rename",
-		"minimize": "Minimize",
-		"close": "Close Terminal"
 	},
 	"ruler": {
 		"commitCount": "{{count}} commits",
@@ -162,6 +168,8 @@
 		"loadingOlderCommits": "Loading older commits…",
 		"offRulerChaptersExhausted": "The whole timeline is loaded and their starting commits still could not be located. Open these chapters from the chapter list or search.",
 		"rewrittenAnchorChapters": "{{count}} chapter(s) shown at their fork point: {{titles}}",
-		"rewrittenAnchorChaptersDesc": "A rebase or squash-merge rewrote the commit they record as their start, so it is no longer on this branch. They are drawn where they diverged from trunk, which is an approximate position."
+		"rewrittenAnchorChaptersDesc": "A rebase or squash-merge rewrote the commit they record as their start, so it is no longer on this branch. They are drawn where they diverged from trunk, which is an approximate position.",
+		"anchorNoticesShow": "Show placement notices",
+		"anchorNoticesHide": "Hide placement notices"
 	}
 }

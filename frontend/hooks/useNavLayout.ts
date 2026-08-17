@@ -1,10 +1,7 @@
+import { type CustomizableNavId, isCustomizableNavId, NAV_DIVIDER_ID } from "@shared/nav-layout";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
-import {
-	CUSTOMIZABLE_NAV_ITEMS,
-	type CustomizableNavId,
-	isCustomizableNavId,
-} from "../components/nav/nav-items";
+import { CUSTOMIZABLE_NAV_ITEMS } from "../components/nav/nav-items";
 import type { api } from "../lib/api";
 import { useUpdateUserPreferences, useUserPreferences } from "./useUserPreferences";
 
@@ -14,7 +11,7 @@ import { useUpdateUserPreferences, useUserPreferences } from "./useUserPreferenc
  * "More" menu, every id before it is shown in the sidebar. Visibility is
  * derived from position, never stored separately.
  */
-export const NAV_DIVIDER_ID = "__divider__";
+export { NAV_DIVIDER_ID };
 
 /** One entry in the flat layout list. */
 export type NavLayoutEntry = { kind: "item"; id: CustomizableNavId } | { kind: "divider" };

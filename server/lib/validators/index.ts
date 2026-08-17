@@ -31,6 +31,8 @@ export {
 	mergeChapterSchema,
 	mergeCheckSchema,
 	splitChapterSchema,
+	updateChapterDetachedPanelsSchema,
+	updateChapterDockLayoutSchema,
 	updateChapterSchema,
 	updateGraphPositionsSchema,
 } from "./chapters";
@@ -39,6 +41,7 @@ export {
 	chatMessagesQuerySchema,
 	createDmRoomSchema,
 	markChatReadSchema,
+	materializeChatAttachmentsSchema,
 	postChatMessageSchema,
 	summarizeChatSchema,
 } from "./chat";
@@ -62,12 +65,15 @@ export {
 	updateVolumeSnapshotSchema,
 } from "./containers";
 export {
+	buildPathRulesConfigSnippet,
 	createRemoteDeviceSchema,
 	deviceBrowseQuerySchema,
 	deviceInstallScriptSchema,
 	deviceSlugSchema,
 	deviceStatQuerySchema,
 	deviceTransferSchema,
+	executorPathRuleSchema,
+	updateDevicePathRulesSchema,
 	updateRemoteDeviceSchema,
 } from "./devices";
 export {
@@ -202,6 +208,7 @@ export {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
 	createFavoriteDirectorySchema,
+	modelCardSchema,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	recentTabSchema,
@@ -216,11 +223,7 @@ export {
 } from "./settings";
 export { createProjectSkillSchema, updateProjectSkillSchema } from "./skills";
 export { specFileQuerySchema, updateSpecFileSchema } from "./spec";
-export {
-	createTerminalSchema,
-	updateTerminalGraphStateSchema,
-	updateTerminalViewStateSchema,
-} from "./terminals";
+export { createTerminalSchema, updateTerminalViewStateSchema } from "./terminals";
 export { narratorWsMessageSchema, terminalWsMessageSchema } from "./websocket";
 
 export { createWorkspaceSchema, importProjectSchema, updateWorkspaceSchema } from "./workspaces";

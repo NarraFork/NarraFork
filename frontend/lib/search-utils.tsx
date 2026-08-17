@@ -2,7 +2,7 @@ import { Mark } from "@mantine/core";
 import type { ReactNode } from "react";
 import type { SearchFallback, SearchResponse } from "./api";
 
-export type SearchResultType = "all" | "chapter" | "narrator" | "message";
+export type SearchResultType = "all" | "chapter" | "narrator" | "message" | "knowledge";
 
 export function normalizeSearchType(value: unknown): SearchResultType {
 	switch (value) {
@@ -15,12 +15,38 @@ export function normalizeSearchType(value: unknown): SearchResultType {
 		case "message":
 		case "messages":
 			return "message";
+		case "knowledge":
+			return "knowledge";
 		case "all":
 		case undefined:
 		case null:
 			return "all";
 		default:
 			return "all";
+	}
+}
+
+/** Sort modes the search page offers. `time` (newest first) is the default. */
+export type SearchSortMode = "time" | "relevance" | "type" | "title";
+
+/**
+ * Default sort for the global search page: newest first.
+ *
+ * Relevance ranking on a trigram index puts short-but-old matches ahead of the
+ * work in front of you, so recency is the better default and relevance stays one
+ * click away.
+ */
+export const DEFAULT_SEARCH_SORT: SearchSortMode = "time";
+
+export function normalizeSearchSort(value: unknown): SearchSortMode {
+	switch (value) {
+		case "relevance":
+		case "type":
+		case "title":
+		case "time":
+			return value;
+		default:
+			return DEFAULT_SEARCH_SORT;
 	}
 }
 

@@ -24,9 +24,34 @@ export const chatMessagesQuerySchema = z.object({
 	limit: z.coerce.number().int().min(1).max(100).optional(),
 });
 
+/**
+ * Per-message attachment ceiling, duplicated from `CHAT_ATTACHMENTS_PER_MESSAGE_MAX`
+ * for the same reason the body cap is: validators must not import services.
+ */
+const CHAT_ATTACHMENTS_PER_MESSAGE_MAX = 10;
+
+/**
+ * `text` is OPTIONAL because an attachment carries a message on its own.
+ *
+ * "text and attachments cannot both be empty" is deliberately NOT expressed here:
+ * the schema can see that `attachmentIds` is an empty array but not whether the ids
+ * in a non-empty one refer to attachments that exist, belong to this room and are
+ * still unclaimed. Splitting the rule across two layers would let a request pass
+ * validation and then fail differently, so the whole emptiness decision lives in
+ * `postMessage` next to the ownership checks.
+ */
 export const postChatMessageSchema = z.object({
-	text: z.string().min(1).max(CHAT_MESSAGE_MAX_CHARS),
+	text: z.string().max(CHAT_MESSAGE_MAX_CHARS).optional(),
 	replyToMessageId: z.string().min(1).max(64).nullable().optional(),
+	attachmentIds: z
+		.array(z.string().min(1).max(64))
+		.max(CHAT_ATTACHMENTS_PER_MESSAGE_MAX)
+		.optional(),
+});
+
+export const materializeChatAttachmentsSchema = z.object({
+	narratorId: z.string().min(1).max(64),
+	attachmentIds: z.array(z.string().min(1).max(64)).max(CHAT_ATTACHMENTS_PER_MESSAGE_MAX),
 });
 
 /**

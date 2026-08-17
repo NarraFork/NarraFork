@@ -45,6 +45,8 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { tailRoleAllowsContinue } from "@shared/continue-tail";
+import { cardEffortLevels, lookupModelCard } from "@shared/model-card";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
@@ -119,6 +121,7 @@ import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory, writeInputHistoryEntries } from "../../hooks/useInputHistory";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
+import { useModelCardIndex } from "../../hooks/useModelCards";
 import { useAllModels } from "../../hooks/useModels";
 import { useNamedNarrators } from "../../hooks/useNamedNarrator";
 import {
@@ -311,6 +314,7 @@ import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
 import { RevertScopeConfirmModal } from "./RevertScopeConfirmModal";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./selection-anchor-overlay";
+import { revealSpecFile } from "./spec-file-reveal";
 import {
 	getGlobalCloseSwipe,
 	type SwipeAnchorInfo,
@@ -461,6 +465,14 @@ const SpecPanel = lazy(() =>
 const FileModificationsDrawer = lazy(() =>
 	import("./FileModificationsDrawer").then((module) => ({
 		default: module.FileModificationsDrawer,
+	})),
+);
+// Body of the read-only file viewer. Shared with the `file` dock panel — the
+// drawer below is just the off-dock (mobile) host for the same content, so both
+// surfaces show the same viewer instead of the drawer growing its own.
+const FileViewerContent = lazy(() =>
+	import("./file-viewer/FileViewerContent").then((module) => ({
+		default: module.FileViewerContent,
 	})),
 );
 
@@ -2129,6 +2141,7 @@ export function NarratorPanel({
 		providerLabels,
 		nugProviderIdByPrefix,
 	} = useAllModels();
+	const modelCardIndex = useModelCardIndex();
 	const { data: currentUser } = useCurrentUser();
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
 	const { data: userPrefs } = useUserPreferences();
@@ -2386,6 +2399,17 @@ export function NarratorPanel({
 	}, [promoteMutation, narratorId, t, navigate]);
 
 	const displayTitle = narrator?.title || t("untitled");
+	/**
+	 * A chapter node's header already shows this title and owns the edit / generate
+	 * actions, so drawing them again here is not just redundant — this header's dozen
+	 * tool buttons squeezed the title to zero width, leaving the node with a header
+	 * full of icons and no readable title at all. The whole title block is dropped in
+	 * that case, which also hands its width to the tool row.
+	 *
+	 * The editing state below stays wired up: every other surface (focus page,
+	 * workspace, detached subagent panel) still renders this block.
+	 */
+	const hostOwnsTitle = dock?.hostOwnsTitle === true;
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
 	// concrete member so capability/context-window lookups work (the backend
@@ -2524,6 +2548,23 @@ export function NarratorPanel({
 		if (!resolvedModel) return GENERIC_REASONING_EFFORT_TIERS;
 		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
 		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
+		// Ahead of cards on purpose — a gateway is first-hand authoritative about
+		// the tiers its own channel accepts.
+		}
+		// Model cards: the editable replacement for the hardcoded per-model tables.
+		// `none` is appended here rather than stored on the card, because on a card
+		// it would become a clamp target able to silently turn a requested `low`
+		// into thinking switched off.
+		const cardTiers = modelCardIndex
+			? cardEffortLevels(
+					lookupModelCard(
+						getBareModelForReasoning(resolvedModel, resolvedModelOption),
+						modelCardIndex,
+					)?.card,
+				)
+			: undefined;
+		if (cardTiers?.length) {
+			return ["none", ...cardTiers] as readonly ReasoningEffortValue[];
 		}
 		const providerPrefix = resolvedModel.split(":")[0];
 		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {
@@ -2561,6 +2602,7 @@ export function NarratorPanel({
 	}, [
 		codexCapableProviders,
 		isCodexChannelModel,
+		modelCardIndex,
 		resolvedModel,
 		resolvedModelOption,
 		settingsData?.anthropicProviders,
@@ -4696,9 +4738,15 @@ export function NarratorPanel({
 		narratorIsIdle &&
 		retryRecoveryAllowsRetry;
 
+	// A trailing injection (`role: "sys"`) is continuable for the same reason a stalled
+	// assistant turn is: it is content the narrator has been handed and has not answered.
+	// Requiring `assistant` here left an injection-terminated conversation with no primary
+	// action at all — Retry wants a `user` tail, so the reader got a disabled send button
+	// and no way to say "go on". `tailRoleAllowsContinue` is the shared rule the server's
+	// continue path reads too.
 	const canContinueNarrator =
 		!!effectiveLastMessage &&
-		effectiveLastMessage.role === "assistant" &&
+		tailRoleAllowsContinue(effectiveLastMessage.role) &&
 		!String(effectiveLastMessage.id).startsWith("optimistic-") &&
 		narratorIsIdle &&
 		retryRecoveryAllowsContinue;
@@ -5171,27 +5219,100 @@ export function NarratorPanel({
 	const canCancelSubagentBackground =
 		subagentsCapability.supported && subagentsCapability.background;
 
-	// Open a file path in a read-only dock panel. Only available when this panel is
-	// hosted by a dockview surface (focus page / workspace); a graph embed or a
-	// standalone render has no surface to open into, so the handler stays undefined
-	// and every "open in panel" affordance hides itself.
+	// Open a file path in a read-only viewer. Two routes, in precedence order —
+	// mirroring the spec panel's dock/drawer split:
+	//  1. dock file panel — a dockview surface can host a real tab beside the chat.
+	//  2. internal drawer — off-dock surfaces (the mobile narrator page, which
+	//     renders NarratorPanel directly with no dock) get the same viewer inside a
+	//     Drawer. Without this the swipe/context menu silently dropped "open in
+	//     panel" on mobile, which is the one surface where a swipe menu is the
+	//     ONLY way to reach it.
+	// Workspace previews stay lightweight and get neither (same rule as the spec
+	// drawer), so their rows leave the affordance hidden rather than dead.
+	const [internalFileViewerPath, setInternalFileViewerPath] = useState<string | null>(null);
 	const dockOpenFilePanel = dock?.openFilePanel;
-	const handleOpenFilePanel = useMemo(
-		() => (dockOpenFilePanel ? (filePath: string) => dockOpenFilePanel(filePath) : undefined),
-		[dockOpenFilePanel],
-	);
+	const useInternalFileViewer = !dockOpenFilePanel && !isWorkspacePreview;
+	const handleOpenFilePanel = useMemo(() => {
+		if (dockOpenFilePanel) return (filePath: string) => dockOpenFilePanel(filePath);
+		if (useInternalFileViewer) return (filePath: string) => setInternalFileViewerPath(filePath);
+		return undefined;
+	}, [dockOpenFilePanel, useInternalFileViewer]);
 
 	// Opening a child session prefers the host-provided handler (dock/workspace
 	// aware); standalone panels fall back to routing, like SubagentCard does.
 	const handleVlistViewSubagentSession = useCallback(
-		(subagentNarratorId: string) => {
+		(subagentNarratorId: string, messageId?: string) => {
 			if (onViewSubagentSession) {
-				onViewSubagentSession(subagentNarratorId);
+				onViewSubagentSession(subagentNarratorId, messageId);
 				return;
 			}
-			navigate({ to: "/narrators/$narratorId", params: { narratorId: subagentNarratorId } });
+			// Standalone fallback: the narrator page reads `?scrollTo=` as its
+			// highlight target, which is the same jump the dock performs in-place.
+			navigate({
+				to: "/narrators/$narratorId",
+				params: { narratorId: subagentNarratorId },
+				search: messageId ? { scrollTo: messageId } : undefined,
+			});
 		},
 		[onViewSubagentSession, navigate],
+	);
+
+	/**
+	 * Open the Dynamic Spec panel with one file selected.
+	 *
+	 * Reuses `openSpecTool` (which opens rather than toggles — a click from a row that
+	 * points at a file must reveal it, never close an open panel) and then asks the
+	 * panel to select the uri. Only bound when this surface HAS a spec panel to open,
+	 * so a row on a surface without one stays inert.
+	 */
+	/**
+	 * Open a knowledge entry a hint row points at.
+	 *
+	 * Prefers the dock panel (staying beside the conversation the hint belongs to) and
+	 * falls back to the route on surfaces without one — the same in-surface-first rule
+	 * `handleVlistViewSubagentSession` follows.
+	 */
+	const dockOpenKnowledgePanel = dock?.openKnowledgePanel;
+	const handleOpenKnowledgeEntry = useCallback(
+		(entryId: string, scope: "global" | "personal") => {
+			if (dockOpenKnowledgePanel) {
+				dockOpenKnowledgePanel(entryId, scope);
+				return;
+			}
+			if (scope === "personal") {
+				navigate({
+					to: "/knowledge/personal/$personalEntryId",
+					params: { personalEntryId: entryId },
+				});
+				return;
+			}
+			navigate({ to: "/knowledge/$entryId", params: { entryId } });
+		},
+		[dockOpenKnowledgePanel, navigate],
+	);
+
+	const handleOpenSpecFile = useCallback(
+		(uri: string) => {
+			openSpecTool();
+			// The panel usually does not exist yet at this point — opening it IS this
+			// click's first effect — so the selection is applied through the registry,
+			// which waits briefly for the panel to mount. See `spec-file-reveal`.
+			revealSpecFile(narratorId, uri);
+		},
+		[openSpecTool, narratorId],
+	);
+
+	/**
+	 * Open a chapter referenced by a review-feedback / merge-summary row.
+	 *
+	 * Always a route: a chapter is not a panel kind, so there is no in-surface
+	 * destination to prefer over navigation.
+	 */
+	const handleOpenChapter = useCallback(
+		(chapterId: string) => {
+			navigate({ to: "/chapters/$chapterId", params: { chapterId } });
+		},
+		[navigate],
 	);
 
 	const handleDetachSubagent = useCallback(async (subagentNarratorId: string) => {
@@ -5239,6 +5360,11 @@ export function NarratorPanel({
 				? handleCancelSubagentBackground
 				: undefined,
 			onOpenFilePanel: handleOpenFilePanel,
+			// Injection-bubble navigation. Each is undefined on surfaces that cannot reach
+			// the destination, which leaves those rows inert rather than dead-clickable.
+			onOpenKnowledgeEntry: handleOpenKnowledgeEntry,
+			onOpenSpecFile: handleOpenSpecFile,
+			onOpenChapter: handleOpenChapter,
 		}),
 		[
 			forkHandler,
@@ -5259,6 +5385,9 @@ export function NarratorPanel({
 			canCancelSubagentBackground,
 			handleCancelSubagentBackground,
 			handleOpenFilePanel,
+			handleOpenKnowledgeEntry,
+			handleOpenSpecFile,
+			handleOpenChapter,
 		],
 	);
 
@@ -6857,7 +6986,10 @@ export function NarratorPanel({
 		{
 			key: "path-rules",
 			collapsePriority: 10,
-			visualOverflow: { blockStart: 2, inlineEnd: 4 },
+			// Inline reserve only. A vertical reserve cannot protect this badge: it is
+			// painted inside the ActionIcon, which clips its own overflow, so padding
+			// on the wrapper would only push the button off the row's centre line.
+			visualOverflow: { inlineEnd: 4 },
 			render: (mode) => (
 				<PathRulesPopover
 					narratorId={narratorId}
@@ -6954,7 +7086,9 @@ export function NarratorPanel({
 					{
 						key: "terminal",
 						collapsePriority: 40,
-						visualOverflow: { blockStart: 5, inlineEnd: 5 },
+						// The Indicator paints outside the button but inside the toolbar's
+						// `overflow: visible` box, so it needs no vertical reserve either.
+						visualOverflow: { inlineEnd: 5 },
 						render: (mode: "inline" | "menu") =>
 							mode === "menu" ? (
 								<Menu.Item
@@ -6971,12 +7105,24 @@ export function NarratorPanel({
 								</Menu.Item>
 							) : (
 								<Tooltip label={terminalActionLabel}>
+									{/*
+									 * A default (block) Indicator wraps the button in a line box sized by
+									 * the inherited line-height, which is taller than the 22px button and
+									 * silently stretches the whole status row. Pinning it to the button's
+									 * own height keeps the row height a function of the controls.
+									 */}
 									<Indicator
+										inline
 										label={activeTerminalCount}
 										size={14}
 										disabled={activeTerminalCount === 0}
 										offset={2}
 										color="blue"
+										style={{
+											height: "var(--ai-size-sm)",
+											display: "flex",
+											alignItems: "center",
+										}}
 									>
 										<ActionIcon
 											variant="subtle"
@@ -7115,8 +7261,11 @@ export function NarratorPanel({
 										<IconArrowLeft size={16} />
 									</ActionIcon>
 								))}
+							{/* `flex: 1` even when the title is suppressed: it is what pushes the
+							    tool row to the right edge, and it hands the freed width to those
+							    buttons instead of leaving a gap where the title used to be. */}
 							<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="nowrap">
-								{editingTitle && !isWorkspacePreview ? (
+								{hostOwnsTitle ? null : editingTitle && !isWorkspacePreview ? (
 									<TextInput
 										ref={titleInputRef}
 										value={titleValue}
@@ -7143,7 +7292,7 @@ export function NarratorPanel({
 										{displayTitle}
 									</Text>
 								)}
-								{!isWorkspacePreview && (
+								{!isWorkspacePreview && !hostOwnsTitle && (
 									<>
 										<ActionIcon
 											size="xs"
@@ -9442,6 +9591,47 @@ export function NarratorPanel({
 									onClose={() => setInternalSpecOpen(false)}
 									chromeless
 								/>
+							</Suspense>
+						</Drawer>
+					)}
+
+					{/* Internal file viewer drawer — the off-dock host for "open in panel".
+					    Mounted only while a path is selected (and torn down on close), so a
+					    session that never opens a file pays nothing. Same viewer body the
+					    dock's `file` panel renders. */}
+					{internalFileViewerPath && (
+						<Drawer
+							opened
+							onClose={() => setInternalFileViewerPath(null)}
+							position="right"
+							size={isMobileViewport ? "100%" : 600}
+							// The viewer body already shows the base name; the title carries the
+							// full path so the drawer adds information rather than repeating it.
+							title={
+								<Text size="sm" fw={600} truncate>
+									{internalFileViewerPath}
+								</Text>
+							}
+							closeButtonProps={{ size: "sm" }}
+							styles={{
+								header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
+								body: {
+									height: safeAreaDrawerBodyHeight(60),
+									padding: 0,
+									display: "flex",
+									flexDirection: "column",
+									...SAFE_AREA_DRAWER_BODY_STYLE,
+								},
+							}}
+						>
+							<Suspense
+								fallback={
+									<Center h="100%">
+										<Loader size="sm" />
+									</Center>
+								}
+							>
+								<FileViewerContent key={internalFileViewerPath} filePath={internalFileViewerPath} />
 							</Suspense>
 						</Drawer>
 					)}

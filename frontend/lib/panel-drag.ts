@@ -48,6 +48,36 @@ export interface PanelDragState {
 	panelId?: string;
 	/** The dockview group id the dragged panel currently belongs to. */
 	sourceGroupId?: string;
+	/**
+	 * Which dockview surface this drag started on.
+	 *
+	 * Load-bearing once several surfaces coexist (one per expanded graph node):
+	 * every surface subscribes to this singleton, and panel ids are GLOBAL
+	 * (`ndock-terminal` and friends). Without this field a surface receiving a
+	 * drop would look up `panelId` in its OWN api and move an unrelated panel of
+	 * the same kind. Consumers must only treat a drag as an in-surface panel move
+	 * when this matches their own surface id (see `useDockviewDnd`).
+	 *
+	 * Absent for drags that have no live panel at all (sidebar tabs, detached
+	 * canvas panels), and for surfaces that opt out of passing an id — those keep
+	 * the historical behaviour.
+	 */
+	surfaceId?: string;
+	/**
+	 * The panel kind being dragged (`terminal`, `browser`, …), when known.
+	 *
+	 * Supplied so consumers never have to parse `panelId`: its `ndock-<kind>`
+	 * shape is an implementation detail of `dockPanelId()`, and reading it here
+	 * would turn that string format into an implicit cross-module contract that
+	 * breaks silently if the prefix ever changes.
+	 */
+	toolKind?: string;
+	/**
+	 * Resource identity for multi-instance panels — a subagent's narrator id, a
+	 * file viewer's path. Needed to rebuild the same panel elsewhere; singleton
+	 * panels leave it unset.
+	 */
+	resourceId?: string;
 }
 
 type MoveListener = (state: PanelDragState) => void;
@@ -172,6 +202,10 @@ export function startPanelDrag(args: {
 	title: string;
 	sourceGroupId?: string;
 	subjectKind?: PanelDragSubjectKind;
+	/** The surface this panel lives on; see `PanelDragState.surfaceId`. */
+	surfaceId?: string;
+	toolKind?: string;
+	resourceId?: string;
 	x: number;
 	y: number;
 }) {
@@ -182,8 +216,51 @@ export function startPanelDrag(args: {
 		y: args.y,
 		panelId: args.panelId,
 		sourceGroupId: args.sourceGroupId,
+		...(args.surfaceId ? { surfaceId: args.surfaceId } : {}),
+		...(args.toolKind ? { toolKind: args.toolKind } : {}),
+		...(args.resourceId ? { resourceId: args.resourceId } : {}),
 		// Fall back to id-shape inference when the caller didn't classify.
 		subjectKind: args.subjectKind ?? (isSyntheticSubjectId(args.id) ? "tool" : "narrator"),
+	});
+}
+
+/**
+ * Start dragging a panel that is NOT a live dockview panel — a tool panel that
+ * has been torn out onto the story-network canvas as its own node.
+ *
+ * Deliberately sets no `panelId` and no `surfaceId`. `useDockviewDnd` routes a
+ * drag with a `panelId` to `dropExistingPanel` (an in-surface move), so a
+ * detached panel dragged back into a dock MUST arrive without one or it would be
+ * mistaken for a rearrangement of a same-kind panel already there, and the merge
+ * would silently do nothing.
+ *
+ * `subjectKind` is pinned to `"tool"` so the consumers that only act on real
+ * narrators (the narrator page's create-workspace drop zone, the workspace's
+ * narrator materialisation) keep ignoring it.
+ */
+export function startDetachedPanelDrag(args: {
+	/** The detached canvas node's id; used to remove it once it lands in a dock. */
+	id: string;
+	title: string;
+	/**
+	 * The panel kind, when the drag denotes ONE panel. Omitted when the whole node
+	 * is being dragged: a node may hold several panels, so no single kind describes
+	 * it. Receiving surfaces bail on a missing/unknown kind, which is what leaves
+	 * whole-node drops to the canvas — the only consumer that can move every panel.
+	 */
+	toolKind?: string;
+	resourceId?: string;
+	x: number;
+	y: number;
+}) {
+	beginPointerDrag({
+		id: args.id,
+		title: args.title,
+		x: args.x,
+		y: args.y,
+		...(args.toolKind ? { toolKind: args.toolKind } : {}),
+		...(args.resourceId ? { resourceId: args.resourceId } : {}),
+		subjectKind: "tool",
 	});
 }
 

@@ -29,9 +29,17 @@ import {
 export interface CreateReviewInput {
 	title?: string;
 	locale?: Locale;
+	/** Ruler position: offsets relative to `anchorCommitSha`'s tick. */
 	anchorCommitSha?: string;
 	axisOffset?: number;
 	crossOffset?: number;
+	/**
+	 * Classic canvas position: absolute React Flow world coordinates. Omitted leaves
+	 * the review node unplaced there, so the canvas auto-lays it out — see
+	 * `chapters.graphX` for why these cannot share the ruler columns.
+	 */
+	graphX?: number;
+	graphY?: number;
 	/** The user requesting the review; becomes the owner of the review narrator. */
 	createdByUserId?: string | null;
 }
@@ -152,6 +160,8 @@ export const reviewService = {
 					anchorCommitSha,
 					axisOffset,
 					crossOffset,
+					graphX: input.graphX ?? null,
+					graphY: input.graphY ?? null,
 					lastAccessedAt: now,
 					createdAt: now,
 					updatedAt: now,

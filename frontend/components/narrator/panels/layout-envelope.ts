@@ -17,7 +17,58 @@
  * director state) stays in each surface's own module.
  */
 
-import type { Direction } from "dockview-react";
+import type { Direction, SerializedDockview } from "dockview-react";
+
+/**
+ * Remove narrator/chapter identity from every panel's serialized params.
+ *
+ * Panels derive their host identity from the live page context (the focus page's
+ * `NarratorDockProvider`, a workspace shard, a graph node's provider), NOT from
+ * serialized params, so persisting `narratorId`/`chapterId` is (a) useless and
+ * (b) the source of the "open A, see B" bug: a baked id could resurface on a
+ * different narrator's surface.
+ *
+ * Only HOST identity is removed. Resource identity — a subagent panel's
+ * `subagentNarratorId`, a file panel's `filePath` — must survive serialization
+ * or the panel would come back pointing at nothing.
+ *
+ * One-shot REQUESTS are removed for the opposite reason: a subagent panel's
+ * `highlightMessageId` / `highlightRequestId` record that the reader just clicked a
+ * row pointing at one message. That is true at click time only. Persisting it would
+ * make every later restore of the layout re-run a jump from a previous visit, yanking
+ * the reader away from wherever they had actually left the session.
+ *
+ * Operates on a `structuredClone`, never the live layout.
+ *
+ * Shared by every surface that persists a layout so the strip rule cannot drift
+ * between them.
+ */
+export function stripIdentityFromLayout(layout: SerializedDockview): SerializedDockview {
+	const clone = structuredClone(layout) as SerializedDockview;
+	const panels = (clone as { panels?: Record<string, { params?: Record<string, unknown> }> })
+		.panels;
+	if (panels) {
+		for (const panel of Object.values(panels)) {
+			if (panel?.params) {
+				delete panel.params.narratorId;
+				delete panel.params.chapterId;
+				delete panel.params.highlightMessageId;
+				delete panel.params.highlightRequestId;
+			}
+		}
+	}
+	return clone;
+}
+
+/**
+ * A serialized layout looks usable if it has at least one panel. An empty
+ * envelope would restore a blank surface with no way back to the chat panel.
+ */
+export function isRestorableLayout(layout: SerializedDockview | undefined | null): boolean {
+	if (!layout || typeof layout !== "object") return false;
+	const panels = layout.panels as Record<string, unknown> | undefined;
+	return !!panels && Object.keys(panels).length > 0;
+}
 
 /** A panel to (re)create when building a layout imperatively (no live api). */
 export interface PanelSpec<P> {

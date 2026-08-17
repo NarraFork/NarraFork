@@ -41,23 +41,42 @@ afterEach(() => {
 });
 
 const AGENT_ID = "-tLSXSnYCPV_Z9m6gyRgX";
+/** What the model actually sees: the readable alias, not the nanoid. */
+const AGENT_LABEL = "map-the-providers";
 const TASK_ID = "bg-task-123";
 
 describe("Await agent result wording", () => {
 	test("aborted wait makes clear the subagent is still running and can be awaited again", () => {
-		const text = formatAgentAwaitResult(AGENT_ID, "aborted", null);
+		const text = formatAgentAwaitResult(AGENT_LABEL, "aborted", null);
 		// Must not look like the subagent itself was killed.
 		expect(text).not.toMatch(/status: aborted/);
 		expect(text).not.toMatch(/\(no output\)/);
 		expect(text.toLowerCase()).toContain("still running");
 		expect(text.toLowerCase()).toContain("await again");
-		// Subagent id tag is preserved so the frontend can still resolve it.
-		expect(text).toContain(`<subagent_id>${AGENT_ID}</subagent_id>`);
+		// The tag carries the label: it is the selector the model is told to reuse.
+		expect(text).toContain(`<subagent_id>${AGENT_LABEL}</subagent_id>`);
+	});
+
+	// The whole point of the alias plumbing: a raw nanoid must never reach the
+	// model, because whatever it reads here is what it passes back to Await/Send.
+	test("no status prints the raw narrator id anywhere", () => {
+		for (const status of [
+			"aborted",
+			"timeout",
+			"running",
+			"timed_out",
+			"taken_over",
+			"completed",
+		]) {
+			const text = formatAgentAwaitResult(AGENT_LABEL, status, "some output");
+			expect(text).not.toContain(AGENT_ID);
+			expect(text).toContain(AGENT_LABEL);
+		}
 	});
 
 	test("timeout/running wait reminds the caller to await again rather than implying failure", () => {
 		for (const status of ["timeout", "running"]) {
-			const text = formatAgentAwaitResult(AGENT_ID, status, null);
+			const text = formatAgentAwaitResult(AGENT_LABEL, status, null);
 			expect(text.toLowerCase()).toContain("still running");
 			expect(text.toLowerCase()).toContain("await again");
 			expect(text).not.toMatch(/\(no output\)/);
@@ -65,12 +84,12 @@ describe("Await agent result wording", () => {
 	});
 
 	test("aborted wait surfaces real partial output but drops empty placeholders", () => {
-		const withPartial = formatAgentAwaitResult(AGENT_ID, "aborted", "halfway through the task");
+		const withPartial = formatAgentAwaitResult(AGENT_LABEL, "aborted", "halfway through the task");
 		expect(withPartial).toContain("Partial output so far:");
 		expect(withPartial).toContain("halfway through the task");
 
 		// Placeholder stand-ins must not be shown as if they were real output.
-		const withPlaceholder = formatAgentAwaitResult(AGENT_ID, "aborted", "Await aborted.");
+		const withPlaceholder = formatAgentAwaitResult(AGENT_LABEL, "aborted", "Await aborted.");
 		expect(withPlaceholder).not.toContain("Partial output so far:");
 	});
 
@@ -92,7 +111,7 @@ describe("Await agent result wording", () => {
 			],
 			Date.parse("2026-04-23T12:35:00.000Z"),
 		);
-		const text = formatAgentAwaitResult(AGENT_ID, "timeout", null, activity);
+		const text = formatAgentAwaitResult(AGENT_LABEL, "timeout", null, activity);
 
 		expect(text).toContain("Recent subagent activity (UTC):");
 		expect(text).toContain("2026-04-23T12:34:48.000Z (12s ago)");
@@ -121,16 +140,16 @@ describe("Await agent result wording", () => {
 	});
 
 	test("terminal statuses keep the explicit result wording", () => {
-		const completed = formatAgentAwaitResult(AGENT_ID, "completed", "done");
-		expect(completed).toContain(`Agent ${AGENT_ID} status: completed`);
+		const completed = formatAgentAwaitResult(AGENT_LABEL, "completed", "done");
+		expect(completed).toContain(`Agent ${AGENT_LABEL} status: completed`);
 		expect(completed).toContain("done");
 
-		const failed = formatAgentAwaitResult(AGENT_ID, "failed", "boom");
-		expect(failed).toContain(`Agent ${AGENT_ID} status: failed`);
+		const failed = formatAgentAwaitResult(AGENT_LABEL, "failed", "boom");
+		expect(failed).toContain(`Agent ${AGENT_LABEL} status: failed`);
 	});
 
 	test("execution timeout is terminal and does not suggest awaiting again", () => {
-		const text = formatAgentAwaitResult(AGENT_ID, "timed_out", "30 minute limit reached");
+		const text = formatAgentAwaitResult(AGENT_LABEL, "timed_out", "30 minute limit reached");
 		expect(text).toContain("execution time limit");
 		expect(text).toContain("was stopped");
 		expect(text).not.toContain("Await again");

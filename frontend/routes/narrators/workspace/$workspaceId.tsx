@@ -108,8 +108,8 @@ function WorkspacePage() {
 	}, []);
 
 	const handleViewSubagentSession = useCallback(
-		(hostNarratorId: string, subagentNarratorId: string) => {
-			directorControlRef.current?.openSubagentPanel(hostNarratorId, subagentNarratorId);
+		(hostNarratorId: string, subagentNarratorId: string, messageId?: string) => {
+			directorControlRef.current?.openSubagentPanel(hostNarratorId, subagentNarratorId, messageId);
 			setDirectorMode(false);
 		},
 		[],

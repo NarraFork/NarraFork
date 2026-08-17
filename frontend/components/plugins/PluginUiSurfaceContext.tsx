@@ -11,6 +11,13 @@ import type { PluginDockPanelParams } from "./protocol";
 
 export type PluginUiHostSurface =
 	| "focus"
+	/**
+	 * A chapter node's embedded dock on the story-network canvas. Same shape as
+	 * `focus` (one surface, one narrator) but reported distinctly so a plugin can
+	 * adapt to the much smaller viewport. Treated as part of the focus family by
+	 * {@link sameSurfaceFamily}, so contributions declaring only `focus` still work.
+	 */
+	| "graph"
 	| "workspace"
 	| "director"
 	| "settings"
@@ -44,9 +51,27 @@ interface PluginUiSurfaceContextValue {
 
 const PluginUiSurfaceContext = createContext<PluginUiSurfaceContextValue | null>(null);
 
+/**
+ * Surfaces that are interchangeable for binding purposes.
+ *
+ * Two families exist:
+ *  - `workspace` / `director` — the same workspace seen as a grid or as an overlay.
+ *  - `focus` / `graph` — a single narrator's dock, either full-page or embedded in
+ *    a canvas node. A panel bound on one must resolve on the other, otherwise
+ *    every plugin declaring `focus` would be rejected inside a graph node.
+ */
+function isFocusFamily(surface: PluginUiHostSurface): boolean {
+	return surface === "focus" || surface === "graph";
+}
+
+function isWorkspaceFamily(surface: PluginUiHostSurface): boolean {
+	return surface === "workspace" || surface === "director";
+}
+
 function sameSurfaceFamily(a: PluginUiHostSurface, b: PluginUiHostSurface): boolean {
 	if (a === b) return true;
-	return (a === "workspace" || a === "director") && (b === "workspace" || b === "director");
+	if (isWorkspaceFamily(a) && isWorkspaceFamily(b)) return true;
+	return isFocusFamily(a) && isFocusFamily(b);
 }
 
 export function resolvePluginUiOwnerNarratorId(
@@ -55,7 +80,9 @@ export function resolvePluginUiOwnerNarratorId(
 ): string | undefined {
 	switch (params.binding.kind) {
 		case "focus-current-narrator":
-			return hostContext.surface === "focus" ? hostContext.narratorId : undefined;
+			// Both focus-family surfaces host exactly one narrator, so a panel bound
+			// to "the current narrator" resolves on either.
+			return isFocusFamily(hostContext.surface) ? hostContext.narratorId : undefined;
 		case "workspace-narrator":
 			return (hostContext.surface === "workspace" || hostContext.surface === "director") &&
 				hostContext.workspaceId === params.binding.workspaceId

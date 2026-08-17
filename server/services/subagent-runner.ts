@@ -56,6 +56,7 @@ import {
 	loadSubagentHistory,
 	type SubagentExecOptions,
 } from "./subagent-executor";
+import { agentLabelFromNarrator, agentResultTag, resolveAgentLabel } from "./subagent-label";
 import { resumeManualOverride, waitForManualOverride } from "./subagent-manual-override";
 import {
 	clearTakenOver,
@@ -282,8 +283,19 @@ async function finalizeBackgroundCompletion(
 		})
 		.where(eq(narrators.id, narratorId));
 
-	const title = (await narratorService.getById(narratorId).catch(() => null))?.title ?? narratorId;
+	const subNarrator = await narratorService.getById(narratorId).catch(() => null);
+	const title = subNarrator?.title ?? narratorId;
+	// The notification tells the model how to Await/Send this agent, so it carries
+	// the readable alias rather than the raw nanoid.
+	const alias = subNarrator
+		? agentLabelFromNarrator(subNarrator, parentNarratorId)
+		: await resolveAgentLabel(parentNarratorId, narratorId);
 	const resultPreview = storedText.slice(0, 500);
+	// Where in the AGENT's own session this result was produced, so the reader can
+	// jump there from the completion bubble. Best-effort by design: a run that
+	// produced no assistant text has nothing to point at, and the notification is
+	// worth delivering regardless — the panel then opens at the session tail.
+	const resultMessageId = await getSubagentResultMessageId(narratorId).catch(() => undefined);
 
 	if (outcome !== "completed") {
 		eventBus.emit({
@@ -305,10 +317,12 @@ async function finalizeBackgroundCompletion(
 		}
 		pushBgCompletionNotification(parentNarratorId, {
 			id: narratorId,
+			alias,
 			title,
 			status: outcome === "timeout" ? "timed out" : "failed",
 			resultPreview,
 			result: storedText,
+			resultMessageId,
 		});
 	} else {
 		eventBus.emit({
@@ -330,10 +344,12 @@ async function finalizeBackgroundCompletion(
 		}
 		pushBgCompletionNotification(parentNarratorId, {
 			id: narratorId,
+			alias,
 			title,
 			status: "completed",
 			resultPreview,
 			result: storedText,
+			resultMessageId,
 		});
 	}
 
@@ -383,8 +399,14 @@ export async function finalizeTakenOverBackgroundSubagent(
 	// instead of a stale cancellation. The task id equals the subagent narrator id.
 	await backgroundTaskService.finalizeTakenOver(narratorId, hasError, finalText || "(no output)");
 
-	const title = (await narratorService.getById(narratorId).catch(() => null))?.title ?? narratorId;
+	const subNarrator = await narratorService.getById(narratorId).catch(() => null);
+	const title = subNarrator?.title ?? narratorId;
+	const alias = subNarrator
+		? agentLabelFromNarrator(subNarrator, parentNarratorId)
+		: await resolveAgentLabel(parentNarratorId, narratorId);
 	const resultPreview = (finalText || "").slice(0, 500);
+	// Same navigation target as the ordinary completion path; see that call site.
+	const resultMessageId = await getSubagentResultMessageId(narratorId).catch(() => undefined);
 
 	if (hasError) {
 		eventBus.emit({
@@ -404,10 +426,12 @@ export async function finalizeTakenOverBackgroundSubagent(
 		});
 		pushBgCompletionNotification(parentNarratorId, {
 			id: narratorId,
+			alias,
 			title,
 			status: "failed",
 			resultPreview,
 			result: finalText,
+			resultMessageId,
 		});
 	} else {
 		eventBus.emit({
@@ -427,10 +451,12 @@ export async function finalizeTakenOverBackgroundSubagent(
 		});
 		pushBgCompletionNotification(parentNarratorId, {
 			id: narratorId,
+			alias,
 			title,
 			status: "completed",
 			resultPreview,
 			result: finalText,
+			resultMessageId,
 		});
 	}
 
@@ -1366,9 +1392,10 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 			updateLease?.release();
 			executionTimeout?.dispose();
 			unregisterRunningExecution();
-			const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
 			publishTerminal({
-				output: resultPrefix + (finalText || "(no output)"),
+				output:
+					agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId)) +
+					(finalText || "(no output)"),
 				finalText: finalText || "(no output)",
 				hasError,
 				interrupted: wasInterrupted,
@@ -1379,10 +1406,10 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 
 	// Start the loop without awaiting: foreground may publish a detach handoff first,
 	// while terminal remains pending until all finalization is complete.
-	runLoop().catch((err) => {
+	runLoop().catch(async (err) => {
 		const finalText = `Subagent error: ${err instanceof Error ? err.message : String(err)}`;
 		publishTerminal({
-			output: `<subagent_id>${subagentId}</subagent_id>\n\n${finalText}`,
+			output: agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId)) + finalText,
 			finalText,
 			hasError: true,
 			interrupted: false,
@@ -1682,7 +1709,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			});
 		});
 
-		let output = buildBackgroundAgentStartOutput(subagentId);
+		let output = buildBackgroundAgentStartOutput(aliasRegistration.alias);
 		if (aliasRegistration.conflicted) {
 			output +=
 				`\n\nNote: The requested alias "${alias || title}" was already taken. ` +
@@ -1808,7 +1835,7 @@ export async function startContinuedSubagent(
 		original.isBackground &&
 		(original.backgroundStatus === "completed" || original.backgroundStatus === "failed")
 	) {
-		const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
+		const resultPrefix = agentResultTag(agentLabelFromNarrator(original, parentNarratorId));
 		const completion = Promise.resolve(resultPrefix + (original.backgroundResult ?? "(no output)"));
 		return { runId: generateId(), completion, terminalCompletion: completion };
 	}

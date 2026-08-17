@@ -33,5 +33,19 @@
 	"loadOlder": "Load older messages",
 	"historyStart": "Beginning of the conversation",
 	"newMessages": "{{count}} new message(s)",
-	"toBottom": "Jump to latest"
+	"toBottom": "Jump to latest",
+	"replyUnavailable": "Quoted message unavailable",
+	"jumpToReply": "Jump to the quoted message",
+	"jumpToReplyOf": "Jump to {{name}}'s quoted message",
+	"jumpTargetUnavailable": "The quoted message cannot be located",
+	"jumpTargetTooFar": "The quoted message is too far back in this conversation",
+	"attachFiles": "Attach images or files",
+	"removeAttachment": "Remove",
+	"downloadAttachment": "Download",
+	"attachmentUploadFailed": "Upload failed",
+	"attachmentPreviewFailed": "Preview unavailable",
+	"attachmentLimitTitle": "Too many attachments",
+	"attachmentLimit": "At most {{count}} attachments per message",
+	"attachmentForwardFailed": "Some attachments could not be sent to the narrator",
+	"attachmentDownloadFailed": "Download failed"
 }

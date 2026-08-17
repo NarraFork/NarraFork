@@ -19,6 +19,13 @@
  *    clamped rather than trusted.
  * 8. **Directory search treats LIKE wildcards as literals**, or `%` would be a
  *    "list everyone" query wearing a search's clothes.
+ * 9. **A reply's quote is SNAPSHOTTED at post time.** The strip has to render for a
+ *    target outside the loaded page window, and it must keep saying what the quoted
+ *    message said even after that message is edited or deleted.
+ * 10. **Attachment claiming is atomic and ownership-checked.** Claiming across
+ *    rooms, claiming someone else's draft and double-claiming are each refused, and
+ *    a refusal rolls the whole message write back rather than leaving a half-posted
+ *    message.
  *
  * Runs against an isolated DB under a temp NARRAFORK_HOME (same convention as the
  * knowledge-*.test.ts files).
@@ -31,6 +38,7 @@ import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
 import {
 	aclGrants,
+	chatAttachments,
 	chatMessages,
 	chatRoomMembers,
 	chatRooms,
@@ -42,15 +50,20 @@ import { generateId } from "../../lib/id";
 import {
 	assertCanRead,
 	buildDmKey,
+	buildRoomPreview,
 	CHAT_ROOM_SCAN_LIMIT,
 	CHAT_SUMMARIZE_BURST,
 	CHAT_SUMMARIZE_REFILL_PER_SECOND,
 	CHAT_UNREAD_PROBE_LIMIT,
 	chatSummarizeRateLimitTesting,
+	createChatAttachment,
+	discardChatAttachment,
 	getUnreadSummary,
+	hydrateMessageForBroadcast,
 	listDirectory,
 	listDmRooms,
 	listMessages,
+	loadChatAttachmentForRead,
 	markRead,
 	postMessage,
 	probeRoomUnreadForUser,
@@ -634,6 +647,447 @@ describe("listDirectory", () => {
 		const name = (await db.query.users.findFirst({ where: eq(users.id, viewer) }))?.username;
 		const rows = await listDirectory(viewer, name);
 		expect(rows.some((row) => row.id === viewer)).toBe(false);
+	});
+});
+
+// ─── 9. Reply snapshots ──────────────────────────────────────────────────
+
+describe("reply snapshots", () => {
+	test("a reply freezes the quoted author, seq and text at post time", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const target = await postMessage({
+			roomId: room.id,
+			senderUserId: alice,
+			text: "the original point",
+		});
+		const reply = await postMessage({
+			roomId: room.id,
+			senderUserId: bob,
+			text: "answering that",
+			replyToMessageId: target.id,
+		});
+
+		expect(reply.replyToMessageId).toBe(target.id);
+		expect(reply.replyToSeq).toBe(target.seq);
+		expect(reply.replyToSender?.id).toBe(alice);
+		expect(reply.replyToPreview).toBe("the original point");
+	});
+
+	test("the snapshot survives the quoted message being deleted", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const target = await postMessage({
+			roomId: room.id,
+			senderUserId: alice,
+			text: "quote me then remove me",
+		});
+		const reply = await postMessage({
+			roomId: room.id,
+			senderUserId: bob,
+			text: "quoting",
+			replyToMessageId: target.id,
+		});
+		await softDeleteMessage(room.id, target.id, alice, false);
+
+		// This is the whole reason the snapshot is denormalized: the target's body is
+		// gone from the DB, so any read that resolved through the target row would now
+		// show an empty quote.
+		const page = await listMessages({ roomId: room.id, userId: bob });
+		const stored = page.messages.find((message) => message.id === reply.id);
+		expect(stored?.replyToPreview).toBe("quote me then remove me");
+		expect(stored?.replyToSeq).toBe(target.seq);
+	});
+
+	test("replying to an already-deleted message records an EMPTY preview, not null", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const target = await postMessage({ roomId: room.id, senderUserId: alice, text: "doomed" });
+		await softDeleteMessage(room.id, target.id, alice, false);
+		const reply = await postMessage({
+			roomId: room.id,
+			senderUserId: bob,
+			text: "replying to a ghost",
+			replyToMessageId: target.id,
+		});
+
+		// Empty and null are DIFFERENT states downstream: empty means "we know it is
+		// deleted", null means "no snapshot exists, resolve locally". Collapsing them
+		// would send the client back to window resolution for a message we know is gone.
+		expect(reply.replyToPreview).toBe("");
+		expect(reply.replyToPreview).not.toBeNull();
+	});
+
+	test("the quoted author is resolved live, so a rename is reflected", async () => {
+		const renamer = await makeUser("chat-renamer");
+		const room = await resolveDmRoom(renamer, bob);
+		const target = await postMessage({ roomId: room.id, senderUserId: renamer, text: "before" });
+		const reply = await postMessage({
+			roomId: room.id,
+			senderUserId: bob,
+			text: "quoting",
+			replyToMessageId: target.id,
+		});
+		expect(reply.replyToSender?.id).toBe(renamer);
+
+		const newName = `renamed-${TAG}-${generateId(6)}`;
+		await db.update(users).set({ username: newName }).where(eq(users.id, renamer));
+
+		// Stored as an id precisely so this works: a frozen username would leave the
+		// old name in every quote forever.
+		const page = await listMessages({ roomId: room.id, userId: bob });
+		const stored = page.messages.find((message) => message.id === reply.id);
+		expect(stored?.replyToSender?.username).toBe(newName);
+	});
+
+	test("a non-reply carries no snapshot at all", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const plain = await postMessage({ roomId: room.id, senderUserId: alice, text: "standalone" });
+		expect(plain.replyToMessageId).toBeNull();
+		expect(plain.replyToSeq).toBeNull();
+		expect(plain.replyToSender).toBeNull();
+		expect(plain.replyToPreview).toBeNull();
+	});
+
+	test("the WS frame carries the same snapshot the page does", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const target = await postMessage({ roomId: room.id, senderUserId: alice, text: "source" });
+		const reply = await postMessage({
+			roomId: room.id,
+			senderUserId: bob,
+			text: "echo",
+			replyToMessageId: target.id,
+		});
+
+		const row = await db.query.chatMessages.findFirst({ where: eq(chatMessages.id, reply.id) });
+		if (!row) throw new Error("reply row missing");
+		const frame = await hydrateMessageForBroadcast(row);
+
+		// The live path and the paginated path are assembled by different functions, so
+		// this is what stops a field from being delivered on refetch but missing live.
+		const page = await listMessages({ roomId: room.id, userId: bob });
+		const fromPage = page.messages.find((message) => message.id === reply.id);
+		expect(frame.replyToSeq).toBe(fromPage?.replyToSeq ?? null);
+		expect(frame.replyToPreview).toBe(fromPage?.replyToPreview ?? null);
+		expect(frame.replyToSender?.id).toBe(fromPage?.replyToSender?.id);
+	});
+});
+
+// ─── 10. Attachments ─────────────────────────────────────────────────────
+
+/**
+ * Smallest byte sequence that passes PNG magic-byte + IHDR dimension parsing.
+ *
+ * Synthesized rather than a fixed 1×1 fixture so the DIMENSIONS can vary: one test
+ * asserts the parsed width/height reach the stored row, which a constant-size
+ * fixture could not tell apart from a hardcoded default.
+ *
+ * Built over an explicit `ArrayBuffer` because that is what `BlobPart` requires —
+ * `Buffer.alloc` types its backing store as `ArrayBufferLike`, which includes
+ * `SharedArrayBuffer` and so is not assignable to a `File` constructor argument.
+ */
+function pngBytes(width = 4, height = 3): Uint8Array<ArrayBuffer> {
+	const out = new Uint8Array(new ArrayBuffer(24));
+	out.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+	out.set([0x49, 0x48, 0x44, 0x52], 12); // "IHDR"
+	const view = new DataView(out.buffer);
+	view.setUint32(16, width, false);
+	view.setUint32(20, height, false);
+	return out;
+}
+
+/** `BlobPart`-safe byte literal (see the note on `pngBytes`). */
+function rawBytes(values: number[]): Uint8Array<ArrayBuffer> {
+	const out = new Uint8Array(new ArrayBuffer(values.length));
+	out.set(values);
+	return out;
+}
+
+function pngFile(name = "shot.png", width = 4, height = 3): File {
+	return new File([pngBytes(width, height)], name, { type: "image/png" });
+}
+
+function textFile(name = "notes.md", body = "# hello"): File {
+	return new File([body], name, { type: "text/markdown" });
+}
+
+describe("attachments", () => {
+	test("an image upload records its parsed dimensions", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const attachment = await createChatAttachment(room.id, alice, pngFile("dims.png", 12, 7));
+		expect(attachment.kind).toBe("image");
+		expect(attachment.width).toBe(12);
+		expect(attachment.height).toBe(7);
+		// Dimensions exist so the client can reserve a thumbnail box with pure
+		// arithmetic; without them the zero-DOM height contract cannot hold.
+		expect(attachment.mediaType).toBe("image/png");
+	});
+
+	test("a file whose bytes are not a real image is refused", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const spoofed = new File([rawBytes([1, 2, 3, 4, 5, 6, 7, 8])], "fake.png", {
+			type: "image/png",
+		});
+		// Fail-closed matters more here than for narrator uploads: this file would be
+		// served back to other members of the room under an image content type.
+		await expect(createChatAttachment(room.id, alice, spoofed)).rejects.toThrow();
+	});
+
+	test("a non-image is stored as an opaque file, never under an image type", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		// Deliberately NOT asserting a rejection: `isTextFile` accepts everything by
+		// design, and the narrator composer relies on that, so gating chat by extension
+		// would make it arbitrarily stricter than the surface beside it. The real
+		// mitigation is that a non-image is served as an octet-stream download.
+		const stored = await createChatAttachment(
+			room.id,
+			alice,
+			new File([rawBytes([0, 1, 2])], "payload.bin", { type: "application/octet-stream" }),
+		);
+		expect(stored.kind).toBe("file");
+		expect(stored.mediaType).not.toStartWith("image/");
+
+		// An SVG is an `image/*` type the thumbnail pipeline cannot parse. It must be
+		// STORED (as an opaque download) rather than rejected — a prefix-based image
+		// test would reject it, leaving the user unable to attach an SVG at all — and it
+		// must lose the image media type, or serving it back would let it execute in the
+		// app's origin.
+		const svg = await createChatAttachment(
+			room.id,
+			alice,
+			new File(["<svg onload=alert(1)>"], "sneaky.svg", { type: "image/svg+xml" }),
+		);
+		expect(svg.kind).toBe("file");
+		expect(svg.mediaType).not.toStartWith("image/");
+	});
+
+	test("a declared PNG whose bytes are not a PNG is refused, not demoted", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		// Inside the SUPPORTED image set the pipeline fails closed: the user's intent
+		// was "an image", so silently storing it as a download would hide a corrupt or
+		// deliberately disguised file.
+		await expect(
+			createChatAttachment(
+				room.id,
+				alice,
+				new File([rawBytes([1, 2, 3, 4, 5, 6, 7, 8])], "not-really.png", {
+					type: "image/png",
+				}),
+			),
+		).rejects.toThrow();
+	});
+
+	test("a non-member cannot upload into a DM", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		// Checked BEFORE the disk write, so an unauthorized upload cannot consume
+		// storage on its way to being rejected.
+		await expect(createChatAttachment(room.id, carol, pngFile())).rejects.toThrow();
+	});
+
+	test("posting claims the attachment and returns it with the message", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const attachment = await createChatAttachment(room.id, alice, pngFile("claimed.png"));
+		const message = await postMessage({
+			roomId: room.id,
+			senderUserId: alice,
+			text: "look",
+			attachmentIds: [attachment.id],
+		});
+
+		expect(message.attachments.map((a) => a.id)).toEqual([attachment.id]);
+		const row = await db.query.chatAttachments.findFirst({
+			where: eq(chatAttachments.id, attachment.id),
+		});
+		expect(row?.messageId).toBe(message.id);
+		expect(row?.claimedAt).not.toBeNull();
+	});
+
+	test("an attachment-only message is allowed", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const attachment = await createChatAttachment(room.id, alice, pngFile("wordless.png"));
+		const message = await postMessage({
+			roomId: room.id,
+			senderUserId: alice,
+			text: "",
+			attachmentIds: [attachment.id],
+		});
+		// An attachment carries the turn on its own, matching the narrator composer.
+		expect(message.contentText).toBe("");
+		expect(message.attachments).toHaveLength(1);
+	});
+
+	test("a message with neither text nor attachments is refused", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		await expect(
+			postMessage({ roomId: room.id, senderUserId: alice, text: "  ", attachmentIds: [] }),
+		).rejects.toThrow();
+	});
+
+	test("claiming someone else's draft is refused and posts nothing", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const draft = await createChatAttachment(room.id, alice, pngFile("alices.png"));
+		const before = await listMessages({ roomId: room.id, userId: bob });
+
+		await expect(
+			postMessage({
+				roomId: room.id,
+				senderUserId: bob,
+				text: "stealing",
+				attachmentIds: [draft.id],
+			}),
+		).rejects.toThrow();
+
+		// The whole write is rolled back, not just the claim: a message that posted
+		// without its attachments would be worse than a failed send.
+		const after = await listMessages({ roomId: room.id, userId: bob });
+		expect(after.messages.length).toBe(before.messages.length);
+		const row = await db.query.chatAttachments.findFirst({
+			where: eq(chatAttachments.id, draft.id),
+		});
+		expect(row?.messageId).toBeNull();
+	});
+
+	test("claiming an attachment from another room is refused", async () => {
+		const roomA = await resolveDmRoom(alice, bob);
+		const roomB = await resolveDmRoom(alice, carol);
+		const foreign = await createChatAttachment(roomB.id, alice, pngFile("elsewhere.png"));
+
+		// Without the room predicate this would smuggle content from a conversation
+		// `bob` cannot read into one he can.
+		await expect(
+			postMessage({
+				roomId: roomA.id,
+				senderUserId: alice,
+				text: "cross-room",
+				attachmentIds: [foreign.id],
+			}),
+		).rejects.toThrow();
+	});
+
+	test("an attachment cannot be claimed twice", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const attachment = await createChatAttachment(room.id, alice, pngFile("once.png"));
+		await postMessage({
+			roomId: room.id,
+			senderUserId: alice,
+			text: "first",
+			attachmentIds: [attachment.id],
+		});
+		await expect(
+			postMessage({
+				roomId: room.id,
+				senderUserId: alice,
+				text: "second",
+				attachmentIds: [attachment.id],
+			}),
+		).rejects.toThrow();
+	});
+
+	test("a soft delete removes the attachment rows and the files", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const attachment = await createChatAttachment(room.id, alice, pngFile("regret.png"));
+		const message = await postMessage({
+			roomId: room.id,
+			senderUserId: alice,
+			text: "oops",
+			attachmentIds: [attachment.id],
+		});
+		// Readable while the message stands.
+		expect((await loadChatAttachmentForRead(attachment.id, bob)).size).toBeGreaterThan(0);
+
+		await softDeleteMessage(room.id, message.id, alice, false);
+
+		// A delete that emptied the text but kept serving the image would be cosmetic.
+		const row = await db.query.chatAttachments.findFirst({
+			where: eq(chatAttachments.id, attachment.id),
+		});
+		expect(row).toBeUndefined();
+		await expect(loadChatAttachmentForRead(attachment.id, bob)).rejects.toThrow();
+	});
+
+	test("a soft-deleted message reports no attachments", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const attachment = await createChatAttachment(room.id, alice, pngFile("hidden.png"));
+		const message = await postMessage({
+			roomId: room.id,
+			senderUserId: alice,
+			text: "temporary",
+			attachmentIds: [attachment.id],
+		});
+		await softDeleteMessage(room.id, message.id, alice, false);
+
+		const page = await listMessages({ roomId: room.id, userId: bob });
+		const stored = page.messages.find((m) => m.id === message.id);
+		expect(stored?.attachments).toEqual([]);
+	});
+
+	test("reading an attachment follows the ROOM's access rule", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const attachment = await createChatAttachment(room.id, alice, pngFile("private.png"));
+		await postMessage({
+			roomId: room.id,
+			senderUserId: alice,
+			text: "for us",
+			attachmentIds: [attachment.id],
+		});
+
+		// The DM's other member may read it.
+		expect((await loadChatAttachmentForRead(attachment.id, bob)).filename).toBe("private.png");
+		// An outsider may not — and is told "not found", not "forbidden", which would
+		// confirm the attachment (and thus the conversation) exists.
+		await expect(loadChatAttachmentForRead(attachment.id, carol)).rejects.toThrow();
+	});
+
+	test("only the uploader can discard a draft, and only before it is claimed", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const draft = await createChatAttachment(room.id, alice, pngFile("draft.png"));
+		await expect(discardChatAttachment(draft.id, bob)).rejects.toBeInstanceOf(ForbiddenError);
+		await discardChatAttachment(draft.id, alice);
+		expect(
+			await db.query.chatAttachments.findFirst({ where: eq(chatAttachments.id, draft.id) }),
+		).toBeUndefined();
+
+		const claimed = await createChatAttachment(room.id, alice, pngFile("sent.png"));
+		await postMessage({
+			roomId: room.id,
+			senderUserId: alice,
+			text: "sent",
+			attachmentIds: [claimed.id],
+		});
+		// Once a message owns it, removal is that message's delete — not a separate
+		// operation that would leave the message referencing a missing file.
+		await expect(discardChatAttachment(claimed.id, alice)).rejects.toThrow();
+	});
+
+	test("two files with the same name do not overwrite each other", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const first = await createChatAttachment(room.id, alice, textFile("same.md", "first body"));
+		const second = await createChatAttachment(room.id, alice, textFile("same.md", "second body"));
+
+		const firstTarget = await loadChatAttachmentForRead(first.id, alice);
+		const secondTarget = await loadChatAttachmentForRead(second.id, alice);
+		expect(firstTarget.filePath).not.toBe(secondTarget.filePath);
+		expect(await Bun.file(firstTarget.filePath).text()).toBe("first body");
+		expect(await Bun.file(secondTarget.filePath).text()).toBe("second body");
+	});
+
+	test("the room preview falls back to attachment filenames", async () => {
+		// Pure-function check of the rule the client mirrors in `chatPreviewFromMessage`.
+		expect(buildRoomPreview("hello", [{ filename: "a.png" }])).toBe("hello");
+		expect(buildRoomPreview("   ", [{ filename: "a.png" }, { filename: "b.md" }])).toBe(
+			"a.png, b.md",
+		);
+		expect(buildRoomPreview("", [])).toBe("");
+	});
+
+	test("an attachment-only message's room preview names the file", async () => {
+		const room = await resolveDmRoom(alice, bob);
+		const attachment = await createChatAttachment(room.id, alice, pngFile("preview-me.png"));
+		await postMessage({
+			roomId: room.id,
+			senderUserId: alice,
+			text: "",
+			attachmentIds: [attachment.id],
+		});
+		const rooms = await listDmRooms(alice);
+		expect(rooms.find((r) => r.id === room.id)?.lastMessagePreview).toBe("preview-me.png");
 	});
 });
 

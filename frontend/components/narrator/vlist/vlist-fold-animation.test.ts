@@ -407,22 +407,42 @@ describe("isAnimatableShift", () => {
 });
 
 describe("isFoldCaptureUsable", () => {
+	/** A capture taken at revision 7, level 4, t=1000. */
+	const capture = (over: Partial<{ documentRevision: number; capturedAt: number; lod: number }>) =>
+		({ documentRevision: 7, capturedAt: 1000, lod: 4, ...over }) as {
+			documentRevision: number;
+			capturedAt: number;
+			lod: number;
+		};
+
 	it("requires a capture", () => {
-		expect(isFoldCaptureUsable(null, 7, 1000)).toBe(false);
+		expect(isFoldCaptureUsable(null, 7, 1000, 4)).toBe(false);
 	});
 
 	it("rejects a capture taken against a different document revision", () => {
 		// A live WS patch / older page landed between the click and the commit: the
 		// delta would mix the user's fold with a change they did not make.
-		expect(isFoldCaptureUsable({ documentRevision: 6, capturedAt: 1000 }, 7, 1010)).toBe(false);
+		expect(isFoldCaptureUsable(capture({ documentRevision: 6 }), 7, 1010, 4)).toBe(false);
 	});
 
-	it("accepts a fresh capture on the same revision", () => {
-		expect(isFoldCaptureUsable({ documentRevision: 7, capturedAt: 1000 }, 7, 1010)).toBe(true);
+	it("accepts a fresh capture on the same revision and level", () => {
+		expect(isFoldCaptureUsable(capture({}), 7, 1010, 4)).toBe(true);
 	});
 
 	it("expires a stale capture so an unrelated later commit cannot consume it", () => {
-		expect(isFoldCaptureUsable({ documentRevision: 7, capturedAt: 1000 }, 7, 2000)).toBe(false);
-		expect(isFoldCaptureUsable({ documentRevision: 7, capturedAt: 1000 }, 7, 1400)).toBe(true);
+		expect(isFoldCaptureUsable(capture({}), 7, 2000, 4)).toBe(false);
+		expect(isFoldCaptureUsable(capture({}), 7, 1400, 4)).toBe(true);
+	});
+
+	/**
+	 * The LOD check is the one no other discriminator can stand in for: an LOD switch
+	 * advances NO document revision (it is a build option, exactly like a fold), so a
+	 * fold followed by a pinch inside the age bound passes both other checks. Consuming
+	 * the capture there puts the fold controller and the LOD morph controller on the
+	 * same node's `transform` in one frame, with an undefined winner.
+	 */
+	it("rejects a capture whose level moved (a pinch right after a fold)", () => {
+		expect(isFoldCaptureUsable(capture({ lod: 4 }), 7, 1010, 3)).toBe(false);
+		expect(isFoldCaptureUsable(capture({ lod: 4 }), 7, 1010, 5)).toBe(false);
 	});
 });

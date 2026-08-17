@@ -11,6 +11,7 @@ import { IconMessagePlus } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import type { ChatRoomSummary } from "../../lib/api/chat";
 import { UserAvatar } from "../UserAvatar";
+import { CHAT_HEADER_HEIGHT } from "./chat-header";
 
 /** Above this the badge reads "99+" rather than an exact number. */
 const UNREAD_DISPLAY_MAX = 99;
@@ -42,7 +43,7 @@ export function ChatRoomList({
 			<Group
 				gap="xs"
 				px="md"
-				py="xs"
+				h={CHAT_HEADER_HEIGHT}
 				wrap="nowrap"
 				style={{ flexShrink: 0, borderBottom: "1px solid var(--mantine-color-default-border)" }}
 			>

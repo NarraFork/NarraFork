@@ -186,7 +186,13 @@ server/
 - **容器管理**通过 Podman compose 实现，端口从可配置池中分配（默认 10000–20000）。
 - **终端管理**通过平台特定的 PTY 实现（`server/terminal/`）：Unix 系统使用 `Bun.Terminal`，Windows 使用 `bun-pty`（Rust portable-pty）。两者实现统一的 `TerminalRuntime` 接口。可选支持 dtach 分离会话模式。终端生命周期与服务器进程绑定，重启后标记为已退出。
 - **批量合并**编排多章节合并，支持冲突检测、WebSocket 交互式决策和 AI 辅助冲突解决。
-- **故事网络图**是项目的主界面（`/projects/$projectId`），支持两种流程模式：classic（交互式 React Flow 画布，支持节点拖拽、右键菜单、侧边面板、边连接）和 ruler（线性时间轴视图）。
+- **故事网络图**是项目的主界面（`/projects/$projectId`），支持两种流程模式：classic（交互式 React Flow 画布，支持节点拖拽、右键菜单、侧边面板、边连接）和 ruler（线性时间轴视图，**已弃用**）。流程模式存于 `projects.flowMode`，可通过项目页工具栏的视图切换随时更改（`PATCH /api/projects/:id` 的 `flowMode` 字段），切换只改视图偏好，不影响章节/分支/worktree 数据。
+
+**Ruler 模式已弃用（deprecated）：**
+- Ruler（`frontend/components/ruler/`、`server/routes/ruler.ts`、`/api/ruler`）**不再继续开发**。已知问题不再修复，也不再为其做优化或新增功能。
+- 保留原因是不让已有 ruler 项目失效，而非继续投入。新建项目默认且推荐 classic。
+- 已知未修复缺陷（不要再投入修复）：Ruler 没有任何滚动驱动的自动分页，`fetchPreviousPage` 唯一入口是画布左上角定位提示里的「加载更早的提交」按钮；对 dependency 边无支持。
+- 涉及 Ruler 的改动应限于「不破坏现状」的必要维护；新功能只加在 classic 侧。
 - **评审系统**（`server/services/review-service.ts`）：章节级代码评审，支持 review 角色章节和 review 子代理。
 - **快照系统**（两条路径，回退时优先 tree、缺失才回落重放）：
   - **工作区 tree 快照（首选）**：`server/services/worktree-tree-snapshot.ts` 在 `~/.narrafork/tree-snapshots/<path-hash>` 维护每个 worktree 的影子裸仓库，用 `git add -A` + `git write-tree` 只写 tree 对象（不产生 commit/分支，不动用户索引）。`narrator-tree-snapshot-hooks.ts` 在每个文件修改工具前后各捕获一次，写入 `narrator_tool_calls.treeHashBefore/After` 与 `narrator_messages.treeHashAfter`（表 `worktree_tree_snapshots` 记录 path+hash）。因为哈希基于真实字节，它能捕获 Bash、外部编辑器、构建脚本的改动，天然二进制安全与编码无关，回退是一次 `read-tree` + `checkout-index`，不存在半应用状态。gitignore 规则通过影子仓库自己的 `info/exclude` 生效，被忽略的文件不进快照也不会被回退动到。
@@ -259,6 +265,54 @@ frontend/
 - `/api/git`、`/api/graph` — Git 操作和图数据
 
 **WebSocket：** `/ws/narrator?token=`（订阅/取消订阅模型），`/ws/terminal?terminalId=&token=`（stdin/stdout 管道）
+
+
+
+
+### 端点选择：靠网关自报能力，不靠探测
+
+
+三条方向性约定，每条错了都不会报错、只会静默走另一条链：
+
+- **字段缺失 = 老网关 = 走原生路径。** 这是唯一安全的零值方向：猜「支持」会打到一个不存在的端点。
+- **每次拉取目录都会写入 capabilities，包括字段缺失时**（此时清空缓存）。这样把网关镜像回滚后，客户端会停止认为它有该端点。
+
+### 404 回落：复用 Codex 的 rebuild-history 重试
+
+
+做法是撤回该能力（后续每轮都走原生路径），然后抛 `CodexRebuildHistoryRetryError` 让外层从数据库重建历史再重试——与 Codex 配额切换复用同一机制，理由相同。
+
+
+### 两处必须在本侧补齐的缺口（不在 wire 上加字段）
+
+选 Anthropic 格式的代价是它并未解决 canonical 方案的前两个缺口，二者都在 `buildAnthropicHistory` 里补：
+
+1. **尾部 `sys` 行必须提到当前轮**（`trailingUserText`）。Dynamic Spec 提醒、目标续跑这类注入若留在历史末尾，模型会当作背景而非「刚被问到的事」。两条路径都会送达该文本，所以做错**只表现为模型重视程度下降**，没有任何错误信号。
+   **只在 `officialApi: false` 时提取**：官方 API 路径把 `sys` 映射为 `role:"system"`（Claude Code 的刻意行为，本身已表达「常驻指令」），不可改写。NUG delegate 恒为 `officialApi: false`，正好落在需要提取的一侧。
+
+2. **历史图片的 `imageId` 必须从磁盘还原。** 存储的消息只有 imageId，字节在上传者的目录下。`buildAnthropicHistory` 原本只读 text 块，**历史里的图片全部丢失**——追问一张早前的截图时，模型收到的请求里什么都没有。这是 anthropic 路径的既有缺陷（`openai-provider.ts:2928` 是另一条做对了的路径），修它顺带修好了直连 Anthropic 渠道，所以带了直连回归测试。
+   失败一律跳过并记 WARN（文件被清理、读不出、owner 未知）：丢一张图不好，但为一张被清理的旧图让整轮失败更糟。
+
+### 图片去重的形状按 delegate 判定，不按渠道名
+
+
+### 会话身份必须靠 `X-Conversation-ID` 头带过去
+
+
+该头默认关闭，因为它是 NUG 私有头，对官方 Anthropic API 和第三方兼容端点都无意义。
+
+**漏掉它不会报错**：网关侧会 fallback 生成一个 UUID，请求照样成功（完整历史每轮都在 body 里，不丢上下文），代价只是失去凭据粘性——同一会话的每一轮可能落到不同上游凭据。这种损失没有任何信号，所以测试断言的是**真实 outgoing 请求的头**，而不是 provider 上的标志位；后者被设置但没序列化时，弱断言仍会通过。
+
+### gateway 事件
+
+
+`AnthropicProvider` 的 SSE 循环**已有泛化的 gateway 事件短路**（走 `isGatewayEventType`），因此新增两个名字无需改动它；`anthropic-nug-gateway-events.test.ts` 用真实混流验证了这一点，而不是假定。
+
+
+### 尚未做的事（删除 AWS 代码的两个阻塞前置）
+
+
+
 
 ## 代码风格
 

@@ -111,6 +111,16 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// PathRuleFrame reports one enforced path guard rule to the server.
+//
+// Reporting only: the server never sends rules back. The executor's own config is
+// the authority, and this exists so the UI can show the operator when a saved rule
+// set has not been applied on the machine yet.
+type PathRuleFrame struct {
+	Action string `json:"action"`
+	Path   string `json:"path"`
+}
+
 type HelloFrame struct {
 	Type            string       `json:"type"` // "hello"
 	ProtocolVersion int          `json:"protocolVersion"`
@@ -120,6 +130,14 @@ type HelloFrame struct {
 	Platform        Platform     `json:"platform"`
 	DefaultCwd      string       `json:"defaultCwd,omitempty"`
 	Capabilities    Capabilities `json:"capabilities"`
+	// PathRules is the ordered guard list in force. Optional and additive, so an
+	// older server simply ignores it and no protocol bump is required. Always
+	// non-nil when omitted is ambiguous: absent means "not reported", while an
+	// empty array means "reported as unrestricted".
+	PathRules []PathRuleFrame `json:"pathRules,omitempty"`
+	// PathRulesUnrestricted distinguishes "no rules configured" from "did not
+	// report", which an empty/omitted array alone cannot express.
+	PathRulesUnrestricted bool `json:"pathRulesUnrestricted,omitempty"`
 }
 
 type HelloAckFrame struct {

@@ -41,10 +41,25 @@ function setRegistryAlias(reg: AliasRegistry, realId: string, alias: string): vo
 	reg.idToAlias.set(realId, alias);
 }
 
-function uniqueAliasFrom(base: string, isTaken: (alias: string) => boolean) {
+/**
+ * Highest `-N` suffix tried before giving up on a readable alias.
+ *
+ * Reaching this means hundreds of same-named agents under one parent, which no
+ * real workflow produces. The bound exists so a pathological `isTaken` (one that
+ * answers true for everything) cannot spin the main thread forever; callers get a
+ * still-unique, still-resolvable id-based alias instead of a hang.
+ */
+const MAX_ALIAS_SUFFIX = 1000;
+
+function uniqueAliasFrom(base: string, isTaken: (alias: string) => boolean, fallbackSeed: string) {
 	let alias = base;
 	let suffix = 2;
 	while (isTaken(alias)) {
+		if (suffix > MAX_ALIAS_SUFFIX) {
+			// Fall back to something unique by construction rather than keep counting.
+			// The seed is the real narrator id, so the result stays a valid selector.
+			return { alias: `${base}-${shortAgentId(fallbackSeed)}`, conflicted: true };
+		}
 		alias = `${base}-${suffix}`;
 		suffix++;
 	}
@@ -53,6 +68,41 @@ function uniqueAliasFrom(base: string, isTaken: (alias: string) => boolean) {
 
 /** Slugify a string for use as an alias. */
 export const SUBAGENT_ALIAS_TRAIT_PREFIX = "subagent-alias:";
+
+/**
+ * How much of a narrator id to keep when no readable name is available.
+ *
+ * Defined here rather than in `subagent-label` because the alias fallback below
+ * needs it and this is the lower-level module (`subagent-label` imports from
+ * here, so the dependency cannot go the other way).
+ */
+const SHORT_ID_CHARS = 8;
+
+/**
+ * A short, still-resolvable stand-in for a narrator id.
+ *
+ * A prefix is deliberate: `subagentMatchesSelector` accepts `id.startsWith(...)`,
+ * so this remains a valid Await/Send selector. The previous fallback slugified the
+ * WHOLE id, which both leaked 21 opaque characters into the prompt and — being
+ * lowercased — no longer matched the id it came from.
+ */
+export function shortAgentId(subagentId: string): string {
+	return subagentId.slice(0, SHORT_ID_CHARS);
+}
+
+/**
+ * Base name for an alias: the caller's desired name when it is a real name, else
+ * a short id. `desiredAlias` is often defaulted to the narrator id by callers
+ * (recovery does `title || subagentId`), so an id passed here is treated as "no
+ * name given" rather than slugified into prompt-visible gibberish.
+ */
+function aliasBaseFor(subagentId: string, desiredAlias?: string): string {
+	if (desiredAlias && desiredAlias !== subagentId) {
+		const slug = slugifyTaskAlias(desiredAlias);
+		if (slug) return slug;
+	}
+	return shortAgentId(subagentId) || "task";
+}
 
 export function slugifyTaskAlias(text: string): string {
 	return text
@@ -189,7 +239,7 @@ export async function registerAndPersistSubagentAlias(
 	return subagentAliasRegistrationLock.acquire(parentNarratorId, async () => {
 		const reg = getOrCreateRegistry(parentNarratorId);
 		const existing = reg.idToAlias.get(subagentId);
-		const base = existing || slugifyTaskAlias(desiredAlias || subagentId) || "task";
+		const base = existing || aliasBaseFor(subagentId, desiredAlias);
 		const persistedTaken = await subagentAliasPersistenceAdapter.getTakenAliases(
 			parentNarratorId,
 			subagentId,
@@ -203,7 +253,7 @@ export async function registerAndPersistSubagentAlias(
 		const { alias, conflicted } =
 			existing && !isTaken(existing)
 				? { alias: existing, conflicted: false }
-				: uniqueAliasFrom(base, isTaken);
+				: uniqueAliasFrom(base, isTaken, subagentId);
 
 		setRegistryAlias(reg, subagentId, alias);
 		await subagentAliasPersistenceAdapter.persistAlias(parentNarratorId, subagentId, alias);
@@ -227,10 +277,12 @@ export function registerTaskAlias(
 	const existing = reg.idToAlias.get(realId);
 	if (existing) return { alias: existing, conflicted: false };
 
-	let base = desiredAlias ? slugifyTaskAlias(desiredAlias) : slugifyTaskAlias(realId);
-	if (!base) base = "task";
-
-	const { alias, conflicted } = uniqueAliasFrom(base, (candidate) => reg.aliasToId.has(candidate));
+	const base = aliasBaseFor(realId, desiredAlias);
+	const { alias, conflicted } = uniqueAliasFrom(
+		base,
+		(candidate) => reg.aliasToId.has(candidate),
+		realId,
+	);
 	setRegistryAlias(reg, realId, alias);
 	return { alias, conflicted };
 }

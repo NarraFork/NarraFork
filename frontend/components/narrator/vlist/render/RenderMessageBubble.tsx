@@ -17,6 +17,7 @@
 import { layoutWithLines } from "@chenglou/pretext";
 import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
 import { useId, useMemo } from "react";
+import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
 import {
 	ASSISTANT_PAD_X,
 	ASSISTANT_PAD_Y,
@@ -34,6 +35,7 @@ import {
 } from "../measure/measure-message-bubble";
 import type { MeasuredElement, PreparedCodeBlock, PreparedFixedBlock } from "../prepared-block";
 import { FONT_SIZE, SANS_FAMILY } from "../pretext-fonts";
+import { swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { VListImage } from "./vlist-image";
 import { TextFileRow } from "./vlist-text-file-row";
@@ -277,7 +279,11 @@ function CommandBubble({
 				{measured.toggleTop >= 0 ? (
 					<button
 						type="button"
-						onClick={onToggle}
+						// Selectable surface: a native <button> would be excluded from block
+						// selection, and an unguarded toggle would collapse the bubble under
+						// the user's Ctrl/Cmd/Shift+Click — guard both.
+						{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
+						onClick={onToggle ? swallowSelectionClick(onToggle) : undefined}
 						// Without a handler the control cannot do anything, so it must not
 						// be focusable / clickable either (it used to accept both and do
 						// nothing).

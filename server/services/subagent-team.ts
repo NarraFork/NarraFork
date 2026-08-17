@@ -45,7 +45,20 @@ export function clearTeamFileChanges(parentNarratorId: string): void {
 export interface TeamMessage {
 	fromId: string;
 	fromTitle: string | null;
+	/**
+	 * Readable alias of the sender, used to name it when it has no title. Without
+	 * this the fallback was the sender's raw nanoid, injected verbatim into the
+	 * recipient's prompt.
+	 */
+	fromLabel?: string | null;
 	fromType: string;
+	/**
+	 * Where the sender was in its OWN session when it sent this — the recipient's
+	 * navigation target (see `SideCarInboundMessage.fromMessageId`).
+	 *
+	 * Reader-only: it never reaches the model-facing text.
+	 */
+	fromMessageId?: string | null;
 	text: string;
 	timestamp: string;
 	isBroadcast: boolean;

@@ -483,7 +483,7 @@ describe("measureToolCall — sectioned detail", () => {
 				},
 			},
 			WIDTH,
-			6,
+			5,
 		);
 	}
 
@@ -521,7 +521,7 @@ describe("measureToolCall — sectioned detail", () => {
 				},
 			},
 			WIDTH,
-			4,
+			3,
 		);
 		expect(collapsed.detail).toBeNull();
 		expect(collapsed.height).toBe(collapsed.collapsedHeight);

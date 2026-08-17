@@ -1,6 +1,7 @@
 import dagre from "@dagrejs/dagre";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
+import { type DetachedNode, parseDetachedNodes } from "../components/graph/dock/detached-panels";
 import { api } from "../lib/api";
 import type { ProjectGraphResponse } from "../lib/api/projects";
 
@@ -20,6 +21,19 @@ export interface GraphNode {
 		hasUpstreamUpdates?: boolean;
 		[key: string]: unknown;
 	};
+	/**
+	 * Nullable until laid out: the server sends null for a chapter never placed by
+	 * hand on the classic canvas, and `applyDagreLayout` fills those in.
+	 *
+	 * `useNarraFlow` only ever returns {@link PositionedGraphNode}, so consumers see
+	 * concrete numbers as React Flow requires; the nulls exist strictly between the
+	 * fetch and the layout pass.
+	 */
+	position: { x: number | null; y: number | null };
+}
+
+/** A {@link GraphNode} after layout, with both coordinates resolved. */
+export interface PositionedGraphNode extends GraphNode {
 	position: { x: number; y: number };
 }
 
@@ -41,19 +55,31 @@ export interface GraphEdge {
 // sent by the server — anyone writing UI against it would have read `undefined`. The
 // graph endpoint no longer returns the rows at all.
 
-function applyDagreLayout(nodes: GraphNode[], edges: GraphEdge[]): GraphNode[] {
-	const manualNodes: GraphNode[] = [];
+/**
+ * A node the user has positioned by hand, and which dagre must therefore leave alone.
+ *
+ * Keyed off an explicit null check rather than "not at the origin". The server sends
+ * null for a chapter never placed on THIS canvas, so 0,0 is now a real, respected
+ * position instead of a sentinel — dragging a node to the origin used to make the
+ * next load treat it as unplaced and auto-lay it out somewhere else.
+ */
+function isManuallyPlaced(node: GraphNode): boolean {
+	return node.position != null && node.position.x != null && node.position.y != null;
+}
+
+export function applyDagreLayout(nodes: GraphNode[], edges: GraphEdge[]): PositionedGraphNode[] {
+	const manualNodes: PositionedGraphNode[] = [];
 	const autoNodes: GraphNode[] = [];
 
 	for (const node of nodes) {
-		if (node.position && (node.position.x !== 0 || node.position.y !== 0)) {
-			manualNodes.push(node);
+		if (isManuallyPlaced(node)) {
+			manualNodes.push(node as PositionedGraphNode);
 		} else {
 			autoNodes.push(node);
 		}
 	}
 
-	if (autoNodes.length === 0) return nodes;
+	if (autoNodes.length === 0) return manualNodes;
 
 	const g = new dagre.graphlib.Graph();
 	g.setDefaultEdgeLabel(() => ({}));
@@ -77,7 +103,7 @@ function applyDagreLayout(nodes: GraphNode[], edges: GraphEdge[]): GraphNode[] {
 
 	dagre.layout(g);
 
-	const layoutAutoNodes = autoNodes.map((node) => {
+	const layoutAutoNodes: PositionedGraphNode[] = autoNodes.map((node) => {
 		const pos = g.node(node.id);
 		return {
 			...node,
@@ -93,8 +119,8 @@ function applyDagreLayout(nodes: GraphNode[], edges: GraphEdge[]): GraphNode[] {
 
 function assignAdaptiveHandles(
 	edge: GraphEdge,
-	sourceNode: GraphNode,
-	targetNode: GraphNode,
+	sourceNode: PositionedGraphNode,
+	targetNode: PositionedGraphNode,
 ): GraphEdge {
 	const dx = targetNode.position.x - sourceNode.position.x;
 	const dy = targetNode.position.y - sourceNode.position.y;
@@ -114,8 +140,8 @@ function assignAdaptiveHandles(
 	return { ...edge, sourceHandle: "top-src", targetHandle: "bottom" };
 }
 
-export function assignEdgeHandles(nodes: GraphNode[], edges: GraphEdge[]): GraphEdge[] {
-	const nodeMap = new Map<string, GraphNode>();
+export function assignEdgeHandles(nodes: PositionedGraphNode[], edges: GraphEdge[]): GraphEdge[] {
+	const nodeMap = new Map<string, PositionedGraphNode>();
 	for (const node of nodes) {
 		nodeMap.set(node.id, node);
 	}
@@ -151,14 +177,13 @@ export function assignEdgeHandles(nodes: GraphNode[], edges: GraphEdge[]): Graph
 	});
 }
 
-export interface OpenedTerminal {
-	id: string;
+/**
+ * One chapter's detached canvas nodes, parsed from the graph response. Each node
+ * hosts one or more tool panels (several once nodes have been merged).
+ */
+export interface ChapterDetachedPanels {
 	chapterId: string;
-	name: string;
-	graphX: number | null;
-	graphY: number | null;
-	graphWidth: number | null;
-	graphHeight: number | null;
+	nodes: DetachedNode[];
 }
 
 const NARRA_FLOW_GC_TIME_MS = 60_000;
@@ -219,30 +244,40 @@ export function useNarraFlow(projectId: string) {
 	const layoutData = useMemo(() => {
 		if (!data)
 			return {
-				nodes: [] as GraphNode[],
+				nodes: [] as PositionedGraphNode[],
 				edges: [] as GraphEdge[],
-				openedTerminals: [] as OpenedTerminal[],
+				detachedPanels: [] as ChapterDetachedPanels[],
 			};
-		// Map server position format (anchorCommitSha/axisOffset/crossOffset) to React Flow x/y.
-		// In classic mode, axisOffset → x, crossOffset → y.
+		// The graph endpoint sends classic's own coordinates (chapters.graphX/graphY),
+		// already in React Flow's world space, with null meaning "never placed here".
+		//
+		// It used to send ruler's anchorCommitSha/axisOffset/crossOffset and this mapped
+		// axisOffset → x, crossOffset → y while dropping the anchor. Those offsets are
+		// relative to a commit tick (240px apart), so a chapter deep in history carried
+		// a five-figure offset: read as world coordinates the nodes landed far off
+		// screen, fitView zoomed out to near-nothing, and the canvas looked blank.
 		const mappedNodes = (
 			data.nodes as Array<
 				Omit<GraphNode, "position"> & {
-					position: { anchorCommitSha?: string | null; axisOffset: number; crossOffset: number };
+					position: { x: number | null; y: number | null };
 				}
 			>
 		).map((n) => ({
 			...n,
-			position: {
-				x: n.position.axisOffset ?? 0,
-				y: n.position.crossOffset ?? 0,
-			},
+			position: { x: n.position.x, y: n.position.y },
 		}));
 		const layoutNodes = applyDagreLayout(mappedNodes, data.edges as GraphEdge[]);
 		return {
 			nodes: layoutNodes,
 			edges: data.edges as GraphEdge[],
-			openedTerminals: (data.openedTerminals ?? []) as OpenedTerminal[],
+			// Parsed here so the raw envelope format has a single parser, and entries
+			// that survive validation are the only ones the canvas ever sees. Chapters
+			// whose list is empty after validation are dropped entirely.
+			detachedPanels: (data.detachedPanels ?? []).reduce<ChapterDetachedPanels[]>((acc, entry) => {
+				const nodes = parseDetachedNodes(entry.panels);
+				if (nodes.length > 0) acc.push({ chapterId: entry.chapterId, nodes });
+				return acc;
+			}, []),
 		};
 	}, [data]);
 

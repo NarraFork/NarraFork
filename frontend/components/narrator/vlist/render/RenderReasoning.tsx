@@ -35,6 +35,7 @@ import {
 	REASONING_XS_LINE_HEIGHT,
 } from "../measure/measure-reasoning";
 import type { MeasuredElement } from "../prepared-block";
+import { swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 
 /**
@@ -163,7 +164,8 @@ function CountLine({
 			py={REASONING_ROW_PADDING_Y}
 			wrap="nowrap"
 			style={{ height: REASONING_HEADER_ROW_HEIGHT, cursor: onExpand ? "pointer" : undefined }}
-			onClick={onExpand}
+			// A modified click selects the block; only a plain click expands.
+			onClick={onExpand ? swallowSelectionClick(onExpand) : undefined}
 		>
 			<BrainBadge />
 			<Text size="xs" c="dimmed" style={{ lineHeight: `${REASONING_XS_LINE_HEIGHT}px` }}>
@@ -220,7 +222,8 @@ function ReasoningHeaderRow({
 				height: REASONING_HEADER_ROW_HEIGHT,
 				cursor: onToggle ? "pointer" : undefined,
 			}}
-			onClick={onToggle}
+			// A modified click selects the block; only a plain click toggles.
+			onClick={onToggle ? swallowSelectionClick(onToggle) : undefined}
 		>
 			{onToggle ? (
 				<Chevron size={REASONING_CHEVRON_SIZE} style={{ flexShrink: 0, opacity: 0.7 }} />

@@ -267,7 +267,7 @@ export const agentTool: ToolDefinition = {
 		}
 
 		// Lazy import to avoid circular dependency at module load time
-		const { runSubagent, registerTaskAlias } = await import("@server/services/narrator-subagent");
+		const { runSubagent } = await import("@server/services/narrator-subagent");
 
 		if (!prompt) {
 			return {
@@ -297,44 +297,9 @@ export const agentTool: ToolDefinition = {
 				userId: ctx.userId ?? null,
 			});
 
-			// Register alias for ALL subagents (foreground and background)
-			// Extract the real subagent ID from the result
-			const bgMatch = result.match(/<background_task_id>([^<]+)<\/background_task_id>/);
-			const fgMatch = result.match(/<subagent_id>([^<]+)<\/subagent_id>/);
-			const realId = bgMatch?.[1] ?? fgMatch?.[1];
-
-			if (realId) {
-				const { alias: registeredAlias, conflicted } = registerTaskAlias(
-					ctx.narratorId,
-					realId,
-					alias || description,
-				);
-
-				// Replace the raw ID with the alias in the output
-				let output = result;
-				if (bgMatch) {
-					output = output.replace(
-						`<background_task_id>${realId}</background_task_id>`,
-						`<background_task_id>${registeredAlias}</background_task_id>`,
-					);
-				}
-				if (fgMatch) {
-					output = output.replace(
-						`<subagent_id>${realId}</subagent_id>`,
-						`<subagent_id>${registeredAlias}</subagent_id>`,
-					);
-				}
-
-				if (conflicted) {
-					output +=
-						`\n\nNote: The requested alias "${alias || description}" was already taken. ` +
-						`This agent was assigned "${registeredAlias}" instead. ` +
-						`Use this alias with Await or Send to reference this agent.`;
-				}
-
-				return { output };
-			}
-
+			// The runner already writes the alias into the `<subagent_id>` /
+			// `<background_task_id>` tag and registers it, so no string surgery is
+			// needed here. Conflicts are reported by the runner too.
 			return { output: result };
 		} catch (err) {
 			return {

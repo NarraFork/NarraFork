@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	DEFAULT_DEVICE_INJECTION_MODE,
+	DEVICE_INJECTION_MODES,
 	DEVICE_INJECTION_TRAIT_PREFIX,
 	type DeviceInjectionTrait,
 	encodeDeviceInjectionTrait,
@@ -22,27 +23,36 @@ function trait(overrides: Partial<DeviceInjectionTrait> = {}): DeviceInjectionTr
 
 function device(
 	id: string,
-	options: { online?: boolean; owned?: boolean } = {},
+	options: {
+		online?: boolean;
+		owned?: boolean;
+		scope?: "global" | "project";
+	} = {},
 ): InjectionCandidate {
 	return {
 		id,
 		online: options.online ?? true,
 		ownedByActingUser: options.owned ?? false,
+		// Project-scoped by default: that is the shape any user can register, so it
+		// is the case the default tier has to get right.
+		scope: options.scope ?? "project",
 	};
 }
 
 describe("normalization", () => {
-	test("defaults to injecting everything, matching pre-trait behaviour", () => {
-		// Deliberate: an existing deployment must not silently lose the devices its
-		// narrators were already using. Trimming context is opt-in.
-		expect(DEFAULT_DEVICE_INJECTION_MODE).toBe("all");
-		expect(normalizeDeviceInjectionTrait({}).defaultMode).toBe("all");
+	test("defaults to injecting only admin-blessed global devices", () => {
+		// Any authenticated user may register a device, so "shows up in every
+		// session unasked" must stay an administrative act (registering it global).
+		// Availability and injection are separate levels: being allowed to use a
+		// device does not mean it should announce itself in everyone's context.
+		expect(DEFAULT_DEVICE_INJECTION_MODE).toBe("global");
+		expect(normalizeDeviceInjectionTrait({}).defaultMode).toBe("global");
 	});
 
 	test("unknown modes fall back to the default rather than throwing", () => {
-		expect(normalizeDeviceInjectionMode("everything")).toBe("all");
-		expect(normalizeDeviceInjectionMode(null)).toBe("all");
-		expect(normalizeDeviceInjectionMode(7)).toBe("all");
+		expect(normalizeDeviceInjectionMode("everything")).toBe("global");
+		expect(normalizeDeviceInjectionMode(null)).toBe("global");
+		expect(normalizeDeviceInjectionMode(7)).toBe("global");
 	});
 
 	test("inherit overrides are dropped because they carry no information", () => {
@@ -169,23 +179,54 @@ describe("resolveInjectedDevices", () => {
 	});
 });
 
-describe("no regression for deployments with no injection trait", () => {
-	test("with no trait at all, every authorized online device is still injected", () => {
-		// This is the upgrade path: nobody has configured injection yet, so the set
-		// must be identical to what the old "inject every online device" code did.
-		const authorized = [device("communal-a"), device("communal-b"), device("own", { owned: true })];
+describe("default tier: only global devices inject", () => {
+	test("with no trait at all, global devices inject and project devices do not", () => {
+		const authorized = [
+			device("admin-global", { scope: "global" }),
+			device("someones-project-box"),
+			device("own-project-box", { owned: true }),
+		];
 		const injection = mergeDeviceInjection({});
+		// The project-scoped boxes remain *usable* — they are in the authorized set
+		// passed in — they just are not announced to the model unasked.
 		expect(resolveInjectedDevices(authorized, injection).map((d) => d.id)).toEqual([
-			"communal-a",
-			"communal-b",
-			"own",
+			"admin-global",
 		]);
 	});
 
+	test("a device with no scope is treated as project-scoped, not global", () => {
+		// Rows predating the project axis must fall to the safer branch rather than
+		// being injected everywhere by accident.
+		const legacy: InjectionCandidate = { id: "legacy", online: true };
+		expect(resolveInjectedDevices([legacy], mergeDeviceInjection({}))).toEqual([]);
+	});
+
+	test("an explicit per-device override still wins over the default tier", () => {
+		const authorized = [device("project-box")];
+		const injection = mergeDeviceInjection({
+			user: { version: 1, defaultMode: "global", devices: { "project-box": "on" } },
+		});
+		expect(resolveInjectedDevices(authorized, injection).map((d) => d.id)).toEqual(["project-box"]);
+	});
+
 	test("offline devices were excluded before and still are", () => {
-		const authorized = [device("online-one"), device("offline-one", { online: false })];
+		const authorized = [
+			device("online-one", { scope: "global" }),
+			device("offline-one", { online: false, scope: "global" }),
+		];
 		expect(resolveInjectedDevices(authorized, mergeDeviceInjection({})).map((d) => d.id)).toEqual([
 			"online-one",
+		]);
+	});
+
+	test('mode "all" still means literally all, including project devices', () => {
+		const authorized = [device("global-one", { scope: "global" }), device("project-one")];
+		const injection = mergeDeviceInjection({
+			user: { version: 1, defaultMode: "all", devices: {} },
+		});
+		expect(resolveInjectedDevices(authorized, injection).map((d) => d.id)).toEqual([
+			"global-one",
+			"project-one",
 		]);
 	});
 });
@@ -194,7 +235,8 @@ describe("injection ⊆ authorization invariant", () => {
 	test("the result is always a subset of the input", () => {
 		const authorized = [device("a", { owned: true }), device("b"), device("c", { online: false })];
 		const authorizedIds = new Set(authorized.map((d) => d.id));
-		const modes = ["none", "private", "all"] as const;
+		// Every mode, so a newly added tier cannot skip the subset guarantee.
+		const modes = DEVICE_INJECTION_MODES;
 		const toggles = ["on", "off"] as const;
 
 		for (const mode of modes) {

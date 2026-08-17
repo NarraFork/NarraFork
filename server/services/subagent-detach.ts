@@ -9,6 +9,7 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
+import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import {
 	abandonManualOverride,
 	claimManualOverride,
@@ -458,8 +459,9 @@ export async function detachSubagent(subagentId: string): Promise<boolean> {
 
 	// Immediately publish a foreground handoff (unblocks parent narrator) while the
 	// terminal promise remains pending until the detached run truly completes.
-	// Use raw subagentId in the tag — the Agent tool will replace it with the alias.
-	const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
+	// The tag holds the alias: it is the selector the following sentence tells the
+	// model to use, and a raw nanoid here is what it would otherwise memorize.
+	const resultPrefix = `<background_task_id>${setup.alias}</background_task_id>\n\n`;
 	entry.publishHandoff(
 		resultPrefix +
 			`Subagent detached to background. Use Await({ type: "agent", id: "${setup.alias}" }) to get results, or Send({ id: "${setup.alias}", message }) to continue.`,
@@ -555,13 +557,14 @@ export async function attachSubagent(
 				toolUseId,
 			});
 		}
-		const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
+		const label = await resolveAgentLabel(parentNarratorId, subagentId);
 		return (
-			resultPrefix +
-			"Attach interrupted. The subagent is still running in background. Use Await to get results or Send to continue it."
+			`<background_task_id>${label}</background_task_id>\n\n` +
+			`Attach interrupted. The subagent is still running in background. Use Await({ type: "agent", ` +
+			`id: "${label}" }) to get results or Send({ id: "${label}", message }) to continue it.`
 		);
 	}
 
-	const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
+	const resultPrefix = agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId));
 	return resultPrefix + (result.finalText || "(no output)");
 }

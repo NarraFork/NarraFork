@@ -15,6 +15,18 @@
 	"root": "根目录",
 	"expandNarrator": "展开对话",
 	"collapseNarrator": "收起对话",
+	"nodeDock": {
+		"expandLimitReached": "最多同时展开 {{limit}} 个节点，请先收起一个。",
+		"layoutLoadFailed": "无法加载该节点的面板布局。",
+		"retry": "重试",
+		"releaseToDetach": "松开即分离为独立节点",
+		"detachLimitReached": "同一章节最多分离 {{limit}} 个面板，请先关闭一个。",
+		"detachDuplicate": "该面板已经分离到画布上了。",
+		"mergeForeignChapter": "只能合并同一章节的面板。",
+		"closeDetachedNode": "关闭该节点",
+		"noNarrator": "该章节没有叙述者。",
+		"zoomToInteract": "放大画布以使用该节点的面板"
+	},
 	"contextMenu": {
 		"fork": "分叉",
 		"review": "请求审查",
@@ -62,8 +74,7 @@
 		"mergeDecisionCancelSent": "已发送取消批量流程决策；章节会保留",
 		"mergeDecisionFailed": "无法发送合并决策；WebSocket 已断开。",
 		"mergeAiResolving": "冲突解决叙述者已在合并章节中启动",
-		"mergeFailed": "合并失败：{{message}}",
-		"newTerminal": "新建终端"
+		"mergeFailed": "合并失败：{{message}}"
 	},
 	"forkDraft": {
 		"titlePlaceholder": "新分支标题",
@@ -89,11 +100,6 @@
 		"closeConfirmMessage": "该终端中有正在运行的进程，确定要关闭吗？",
 		"cancel": "取消",
 		"confirmClose": "关闭"
-	},
-	"terminalContextMenu": {
-		"rename": "重命名",
-		"minimize": "最小化",
-		"close": "关闭终端"
 	},
 	"ruler": {
 		"commitCount": "{{count}} 次提交",
@@ -162,6 +168,8 @@
 		"loadingOlderCommits": "正在加载更早的提交……",
 		"offRulerChaptersExhausted": "整条时间线已加载完毕，仍找不到它们起始提交的位置。可以从章节列表或搜索直接打开这些章节。",
 		"rewrittenAnchorChapters": "有 {{count}} 个章节按分叉点就近显示：{{titles}}",
-		"rewrittenAnchorChaptersDesc": "它们记录的起始提交已被变基或压缩合并改写，不在当前分支上，因此画在与主线的分叉点处，位置为近似值。"
+		"rewrittenAnchorChaptersDesc": "它们记录的起始提交已被变基或压缩合并改写，不在当前分支上，因此画在与主线的分叉点处，位置为近似值。",
+		"anchorNoticesShow": "展开定位提示",
+		"anchorNoticesHide": "收起定位提示"
 	}
 }

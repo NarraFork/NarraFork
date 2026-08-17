@@ -85,7 +85,7 @@ storageRoutes.get("/cached", requireAdmin, (c) => {
 });
 
 const cleanupTargetSchema = z.object({
-	target: z.enum(["uploads", "shares", "worktrees", "containers"]),
+	target: z.enum(["uploads", "chatAttachments", "shares", "worktrees", "containers"]),
 });
 
 const databaseCleanupTargetSchema = z.enum([
@@ -121,6 +121,10 @@ storageRoutes.post("/cleanup", requireAdmin, async (c) => {
 	switch (target) {
 		case "uploads": {
 			const result = await storageService.cleanupOrphanedUploads();
+			return c.json({ ok: true, ...result });
+		}
+		case "chatAttachments": {
+			const result = await storageService.cleanupOrphanedChatAttachments();
 			return c.json({ ok: true, ...result });
 		}
 		case "shares": {

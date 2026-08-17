@@ -131,7 +131,7 @@ export const SUBAGENT_STATUS_SLOT_STYLE = {
 /**
  * Glyph size inside a trace row's 14px category chip.
  *
- * Matches what `ActivityTrace` / `ToolRunSummary` pass (`<Icon size={9} />`): the
+ * Matches what `ActivityTrace` passes (`<Icon size={9} />`): the
  * inset is what makes the tint read as a chip rather than a box drawn tight around
  * the icon.
  */
@@ -532,8 +532,8 @@ export const SubagentCard = memo(function SubagentCard({
 		if (selfPermission || pendingPermissions.length > 0) setExpanded(true);
 	}, [selfPermission, pendingPermissions.length]);
 
-	// Render LOD layering (mirrors ToolCallCard): L6 always expanded; L5 expands
-	// only recent cards; L4 collapses all to headers; L3-L1 are handled upstream
+	// Render LOD layering (mirrors ToolCallCard): L5 always expanded; L4 expands
+	// only recent cards; L3 collapses all to headers; L2/L1 are handled upstream
 	// by the tool-run gate. Active / permission cards stay expanded (exempt).
 	const renderLod = useRenderLod();
 	const isActive = !isTerminal;
@@ -545,17 +545,17 @@ export const SubagentCard = memo(function SubagentCard({
 		setPrevRenderLod(renderLod);
 		setLodUserOverride(false);
 	}
-	const collapsesByLod = !lodExempt && (renderLod === 4 || (renderLod === 5 && !isRecent));
+	const collapsesByLod = !lodExempt && (renderLod === 3 || (renderLod === 4 && !isRecent));
 	const effectiveExpanded =
 		lodExempt || lodUserOverride
 			? true
-			: renderLod >= 6
+			: renderLod >= 5
 				? true
-				: renderLod === 5
+				: renderLod === 4
 					? isRecent
 						? expanded
 						: false
-					: renderLod === 4
+					: renderLod === 3
 						? false
 						: expanded;
 	const handleHeaderToggle = collapsesByLod

@@ -27,20 +27,6 @@ export const terminalsApi = {
 			method: "PATCH",
 			body: JSON.stringify({ name }),
 		}),
-	updateTerminalGraphState: (
-		id: string,
-		state: {
-			graphOpened?: boolean;
-			graphX?: number;
-			graphY?: number;
-			graphWidth?: number;
-			graphHeight?: number;
-		},
-	) =>
-		request<ApiEntity>(`/terminals/${id}`, {
-			method: "PATCH",
-			body: JSON.stringify(state),
-		}),
 
 	// Terminal Tabs: removed. Five clients (list/create/update/delete/reorder) named
 	// `/terminals/tabs`, all with zero call sites; the routes, service and `terminal_tabs`

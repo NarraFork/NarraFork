@@ -1,0 +1,23 @@
+/* The whole chapter-info strip is the Git panel affordance. It carries no
+   button chrome (it must read as the bar's own text), so cursor + a hover
+   tint are the only signals that it is clickable — the `:enabled` guard keeps
+   both off when no dock surface is available to open the panel in. */
+
+.gitTrigger {
+	flex: 1;
+	min-width: 0;
+	border-radius: var(--mantine-radius-sm);
+	/* Bleed the hover surface slightly past the text without shifting layout. */
+	margin-inline: -4px;
+	padding-inline: 4px;
+	transition: background-color 120ms ease;
+}
+
+.gitTrigger:enabled {
+	cursor: pointer;
+}
+
+.gitTrigger:enabled:hover,
+.gitTrigger:enabled:focus-visible {
+	background-color: light-dark(var(--mantine-color-gray-2), var(--mantine-color-dark-5));
+}

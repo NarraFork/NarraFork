@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
 	claudeVersionAtLeast,
@@ -19,6 +20,7 @@ import {
 	settings,
 } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
+import { getImagePath, imageToBase64 } from "../uploads";
 import { extractAnthropicUsage } from "../usage-tracking";
 import {
 	CLAUDE_CLI_VERSION,
@@ -388,11 +390,17 @@ const atLeastVersion = claudeVersionAtLeast;
  * Support scope starts at Claude 4.7, so the pre-4 generations are simply out:
  * Claude 3.7's budgeted-thinking special case used to live here and is gone with
  * the rest of the ≤4.6 compatibility surface.
+ *
+ * Every credential-free relay model (DeepSeek, GLM, Kimi, MiniMax, ...) speaks
+ * the classic `enabled` + `budget_tokens` thinking shape on an
+ * Anthropic-compatible gateway — reasoning retention for those models is the
+ * rule, not a per-vendor exemption, so they all qualify here too.
  */
 export function supportsThinking(model: string): boolean {
-	// DeepSeek models support thinking mode via Anthropic-compatible API
-	if (isDeepSeekModel(model)) return true;
+	if (!hasCredentialBoundReasoning(model)) return true;
 	const parsed = parseClaudeModel(model);
+	// A strict non-Claude id (gpt/o-series) should never reach an Anthropic
+	// endpoint; treat it as thinking-incapable rather than guessing.
 	if (!parsed) return false;
 	// Fable/Mythos have no pre-4 generation, so any parsed version qualifies.
 	if (parsed.family === "fable" || parsed.family === "mythos") return true;
@@ -489,8 +497,12 @@ const DEFAULT_GENERATE_MAX_TOKENS = 4_096;
 /** Floor the Anthropic API enforces on `thinking.budget_tokens`. */
 const MIN_THINKING_BUDGET = 1_024;
 
-/** Placeholder budget for DeepSeek, whose schema requires one but ignores it. */
-const DEEPSEEK_THINKING_BUDGET = 10_000;
+/**
+ * Placeholder budget for relay models, whose gateways require the
+ * `budget_tokens` field but ignore its value (intensity comes from
+ * `output_config.effort`).
+ */
+const RELAY_THINKING_BUDGET = 10_000;
 
 function resolveGenerateMaxTokens(options?: GenerateOptions): number {
 	const requested = options?.maxOutputTokens;
@@ -510,12 +522,13 @@ function resolveGenerateMaxTokens(options?: GenerateOptions): number {
  *     (`{ type: "enabled", budget_tokens }`) only exists for the 4.0–4.6
  *     generations, which are out of scope.
  *
- * DeepSeek (via an Anthropic-compatible API) is not a Claude version and does not
- * implement `adaptive`, so it keeps the budgeted shape with a placeholder value it
- * ignores; its intensity comes from `output_config.effort` instead (see `chat`).
+ * Relay models behind an Anthropic-compatible gateway (DeepSeek, GLM, Kimi, ...)
+ * are not Claude versions and generally do not implement `adaptive`, so they get
+ * the classic budgeted shape with a placeholder value the gateway ignores; their
+ * intensity comes from `output_config.effort` instead (see `chat`).
  *
  * @param maxTokens The request's own output ceiling. Only used to keep the
- *   DeepSeek placeholder legal — the API requires
+ *   relay placeholder legal — the API requires
  *   `1024 <= budget_tokens < max_tokens`, and the one-shot helper paths run with
  *   a ceiling well below the placeholder.
  */
@@ -535,9 +548,9 @@ function buildThinkingConfig(
 		return { type: "disabled" };
 	}
 
-	if (!isDeepSeekModel(model)) return { type: "adaptive" };
+	if (hasCredentialBoundReasoning(model)) return { type: "adaptive" };
 
-	const budget = Math.min(DEEPSEEK_THINKING_BUDGET, maxTokens - 1);
+	const budget = Math.min(RELAY_THINKING_BUDGET, maxTokens - 1);
 	if (budget < MIN_THINKING_BUDGET) return { type: "disabled" };
 	return { type: "enabled", budget_tokens: budget };
 }
@@ -987,6 +1000,11 @@ export class AnthropicProvider implements ProviderAdapter {
 	 * `nug:anthropic`) rather than a bare `anthropic`.
 	 */
 	private reasoningSourceOverride?: string;
+	/**
+	 * Whether to send the NUG-specific `X-Conversation-ID` header on chat
+	 * requests. See setSendConversationIdHeader.
+	 */
+	private sendConversationIdHeader = false;
 
 	constructor(config: AnthropicProviderConfig) {
 		this.config = config;
@@ -996,6 +1014,23 @@ export class AnthropicProvider implements ProviderAdapter {
 	/** Override the reasoning-signature source identity (used by NUG delegates). */
 	setReasoningSourceOverride(source: string | undefined): void {
 		this.reasoningSourceOverride = source;
+	}
+
+	/**
+	 * Send `X-Conversation-ID` on chat requests.
+	 *
+	 * Off by default and opt-in per delegate, because this is a NUG gateway
+	 * header with no meaning to the Anthropic API or to third-party
+	 * Anthropic-compatible endpoints, and sending unknown headers to an
+	 * arbitrary upstream is a risk taken for no benefit.
+	 *
+	 * no conversation identity, so without this header the gateway has nothing
+	 * to key credential affinity on and mints a fresh id per request. Requests
+	 * still succeed (the whole history travels in the body every turn), but each
+	 * turn of one conversation may land on a different upstream credential.
+	 */
+	setSendConversationIdHeader(enabled: boolean): void {
+		this.sendConversationIdHeader = enabled;
 	}
 
 	/**
@@ -1304,13 +1339,19 @@ export class AnthropicProvider implements ProviderAdapter {
 
 	async buildHistory(
 		dbMessages: DbMessage[],
-		_model: string,
-		_narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
+		model: string,
+		narratorId?: string,
+	): Promise<{ history: unknown[]; trailingToolResults: unknown[]; trailingUserText?: string }> {
+		// narratorId is required to resolve history images: an uploaded image is
+		// stored per narrator and the row only carries its id, so without the owner
+		// the bytes cannot be found. It used to be ignored here, which silently
+		// dropped every image from replayed history.
 		return buildAnthropicHistory(
 			dbMessages,
 			this.getActiveReasoningSource(),
 			!!this.config.officialApi,
+			narratorId,
+			hasCredentialBoundReasoning(parseModelId(model).model),
 		);
 	}
 
@@ -1347,6 +1388,11 @@ export class AnthropicProvider implements ProviderAdapter {
 		const isOfficial = !!this.config.officialApi;
 		const model = parseModelId(params.model).model;
 		const isDeepSeek = isDeepSeekModel(model);
+		// Strict models (Claude families, gpt/o-series) mint server-bound reasoning
+		// credentials; an uncredentialed thinking block must be dropped for them.
+		// Every relay model keeps its plain-text reasoning instead — with an empty
+		// signature where the wire schema demands one.
+		const strictReasoning = hasCredentialBoundReasoning(model);
 		// A mid-conversation `role: "system"` turn is only legal while the
 		// `mid-conversation-system-2026-04-07` beta is declared, and that beta is
 		// itself model-gated (see supportsMidConversationSystem). Upstream handles
@@ -1493,21 +1539,22 @@ export class AnthropicProvider implements ProviderAdapter {
 			// thinking-only or empty, and the two filters below are what clean that up.
 			dropEmptyThinkingBlocks(draft);
 
-			// A thinking block that carries no signature we may replay cannot be sent
-			// at all — see dropUnreplayableThinkingBlocks. DeepSeek is exempt because
-			// it never mints signatures and has its own placeholder protocol below.
-			if (!isDeepSeek) {
+			// A thinking block that carries no signature the strict upstream would
+			// accept cannot be sent at all — see dropUnreplayableThinkingBlocks.
+			// Relay models are exempt: their gateways mint no signatures, so the
+			// relay sanitizer below echoes the text with an empty signature instead.
+			if (strictReasoning) {
 				dropUnreplayableThinkingBlocks(draft);
 			}
 
 			filterThinkingOnlyAssistantMessages(draft);
 			stripTrailingThinkingFromLastAssistant(draft);
 
-			// DeepSeek Anthropic-compatible API doesn't support redacted_thinking,
-			// and thinking mode requires thinking blocks on assistant messages.
-			// Sanitize replayed Claude/Anthropic history before sending it.
-			if (isDeepSeek) {
-				sanitizeDeepSeekThinkingBlocks(draft);
+			// Relay gateways (generalized from the DeepSeek case) don't support
+			// redacted_thinking, and their thinking mode requires thinking blocks
+			// on assistant messages. Sanitize replayed history before sending it.
+			if (!strictReasoning) {
+				sanitizeRelayThinkingBlocks(draft);
 			}
 		}
 
@@ -1624,6 +1671,11 @@ export class AnthropicProvider implements ProviderAdapter {
 		const reqPath = isOfficial ? "/messages?beta=true" : "/messages";
 
 		const reqHeaders = this.buildRequestHeaders(apiKey, isOfficial, model);
+		// Only on the chat path: the utility/generate paths are one-shot calls with
+		// no conversation identity to report.
+		if (this.sendConversationIdHeader && params.conversationId) {
+			reqHeaders["X-Conversation-ID"] = params.conversationId;
+		}
 
 		params.requestDump?.setRequest({
 			transport: "http",
@@ -2737,19 +2789,47 @@ export function parseAnthropicEvent(
 
 // === History builder ===
 
-function buildAnthropicHistory(
+async function buildAnthropicHistory(
 	dbMessages: DbMessage[],
 	currentReasoningSource?: string,
 	useMidConversationSystemRole = false,
-): {
+	narratorId?: string,
+	strictReasoning = false,
+): Promise<{
 	history: AnthropicMessage[];
 	trailingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }>;
-} {
+	trailingUserText?: string;
+}> {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
 	const topLevel = dbMessages.filter(
 		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
 	);
+
+	// Trailing `sys` rows are fresh model-visible context (a Dynamic Spec reminder,
+	// a goal continuation). They are lifted out of history and returned so the
+	// caller can send them as the CURRENT turn.
+	//
+	// Position is the whole point: left in history they become the last thing
+	// before the current turn, so the model reads them as background rather than as
+	// what it was just asked. The injection still arrives either way, which is why
+	// getting this wrong is invisible — the model simply weights it lower.
+	//
+	// Only when the mid-conversation system role is unavailable. With
+	// `officialApi` the row stays in history as `role:"system"`, which already
+	// marks it as standing instruction — that is deliberate Claude Code behaviour
+	// and must not be rewritten.
+	const trailingSysMessages: DbMessage[] = [];
+	if (!useMidConversationSystemRole) {
+		while (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "sys") {
+			const message = topLevel.pop();
+			if (message) trailingSysMessages.unshift(message);
+		}
+	}
+	const trailingSysText = trailingSysMessages
+		.map((message) => dbMessageVisibleText(message))
+		.filter(Boolean)
+		.join("\n\n");
 
 	// Drop the last user message — it's sent as the current message
 	if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
@@ -2832,14 +2912,18 @@ function buildAnthropicHistory(
 				};
 				if (block.type === "thinking" && block.thinking) {
 					// Legacy shape: signature stored on the block directly, with the
-					// source (if any) on providerMetadata. Only echo the signature
-					// back when it was minted by the current upstream.
-					const sig = signatureSourcesCompatible(
-						block.providerMetadata?.signatureSource,
-						currentReasoningSource,
-					)
-						? (block.signature ?? "")
-						: "";
+					// source (if any) on providerMetadata. Strict models only echo the
+					// signature back when it was minted by the current upstream; relay
+					// models mint no signatures, so their text is always preserved and
+					// an absent signature stays empty.
+					const sig = strictReasoning
+						? signatureSourcesCompatible(
+								block.providerMetadata?.signatureSource,
+								currentReasoningSource,
+							)
+							? (block.signature ?? "")
+							: ""
+						: (block.signature ?? "");
 					parts.push({
 						type: "thinking",
 						thinking: block.thinking,
@@ -2847,15 +2931,18 @@ function buildAnthropicHistory(
 					});
 				} else if (block.type === "reasoning" && block.text) {
 					// DB stores thinking as "reasoning" blocks with signature in providerMetadata.
-					// Drop the signature when it belongs to a different upstream server
-					// (e.g. a different NUG channel), since replaying it would fail
-					// signature verification. The thinking text is still preserved.
-					const sig = signatureSourcesCompatible(
-						block.providerMetadata?.signatureSource,
-						currentReasoningSource,
-					)
-						? (block.providerMetadata?.anthropic?.signature ?? "")
-						: "";
+					// Strict models drop the signature when it belongs to a different
+					// upstream server (e.g. a different NUG channel), since replaying it
+					// would fail signature verification. Relay models skip the source
+					// check entirely — their reasoning text crosses upstreams freely.
+					const sig = strictReasoning
+						? signatureSourcesCompatible(
+								block.providerMetadata?.signatureSource,
+								currentReasoningSource,
+							)
+							? (block.providerMetadata?.anthropic?.signature ?? "")
+							: ""
+						: (block.providerMetadata?.anthropic?.signature ?? "");
 					parts.push({
 						type: "thinking",
 						thinking: block.text,
@@ -2865,8 +2952,13 @@ function buildAnthropicHistory(
 					// Encrypted thinking is server-specific — only replay it to the
 					// upstream that produced it. When the source does not match (or is
 					// unknown on legacy messages), drop the block entirely rather than
-					// echo an opaque payload the current server cannot validate.
-					if (signatureSourcesCompatible(block.signatureSource, currentReasoningSource)) {
+					// echo an opaque payload the current server cannot validate. Relay
+					// models never validate it either, and the block carries no text
+					// worth preserving, so it is dropped for them unconditionally.
+					if (
+						strictReasoning &&
+						signatureSourcesCompatible(block.signatureSource, currentReasoningSource)
+					) {
 						parts.push({ type: "redacted_thinking", data: block.data });
 					}
 				} else if (block.type === "text" && block.text) {
@@ -2970,16 +3062,116 @@ function buildAnthropicHistory(
 				.filter((b: { type: string }) => b.type === "text")
 				.map((b: { text: string }) => b.text);
 			const text = textParts.join("\n") || msg.contentText || "";
-			if (text) {
-				history.push({
-					role: msg.role === "sys" && useMidConversationSystemRole ? "system" : "user",
-					content: text,
-				});
+
+			// Images attached to a past user turn have to be rebuilt from disk: the
+			// row stores an imageId, not the bytes. This branch previously read text
+			// only, so every history image was dropped and a follow-up question
+			// about an earlier screenshot reached the model with nothing to look at.
+			const images = await resolveHistoryImages(msg, narratorId);
+
+			const role = msg.role === "sys" && useMidConversationSystemRole ? "system" : "user";
+			if (images.length > 0) {
+				// A mid-conversation system message cannot carry image parts, so an
+				// image forces the user role. That only affects `sys` rows, which do
+				// not carry uploads in practice.
+				const parts: AnthropicContentPart[] = [...images];
+				if (text) parts.unshift({ type: "text", text });
+				history.push({ role: "user", content: parts });
+			} else if (text) {
+				history.push({ role, content: text });
 			}
 		}
 	}
 
-	return { history, trailingToolResults: pendingToolResults };
+	return {
+		history,
+		trailingToolResults: pendingToolResults,
+		trailingUserText: trailingSysText || undefined,
+	};
+}
+
+/**
+ * Text of a stored message as the model would see it.
+ *
+ * Reads the structured blocks first and falls back to the flat column, matching
+ * how the other history builders read a row: `contentText` is not always populated
+ * for rows written through the block path.
+ */
+function dbMessageVisibleText(msg: DbMessage): string {
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const texts = blocks
+		.filter((block): block is { type: string; text: string } => {
+			if (!block || typeof block !== "object") return false;
+			const candidate = block as { type?: unknown; text?: unknown };
+			return candidate.type === "text" && typeof candidate.text === "string";
+		})
+		.map((block) => block.text);
+	return texts.join("\n") || msg.contentText || "";
+}
+
+/**
+ * Rebuild the image parts of a past user message from disk.
+ *
+ * Returns an empty array when there is nothing to replay, which covers the common
+ * case (no images) as well as every failure: a missing file, an unreadable file, or
+ * a message whose owning narrator is unknown. Failures are logged and skipped
+ * rather than thrown — losing one image from replayed history is bad, but failing
+ * the whole turn because an old upload was cleaned up is worse.
+ *
+ * Mirrors the Responses-API implementation in `openai-provider.ts`; the two differ
+ * only in the content-part shape each protocol expects.
+ */
+async function resolveHistoryImages(
+	msg: DbMessage,
+	narratorId?: string,
+): Promise<Array<{ type: "image"; source: { type: "base64"; media_type: string; data: string } }>> {
+	const ownerNarratorId = msg.narratorId ?? narratorId;
+	if (!ownerNarratorId || !Array.isArray(msg.contentJson)) return [];
+
+	const blocks = (msg.contentJson as Array<Record<string, unknown>>).filter(
+		(block) => block.type === "image" && typeof block.imageId === "string",
+	);
+	if (blocks.length === 0) return [];
+
+	const parts: Array<{
+		type: "image";
+		source: { type: "base64"; media_type: string; data: string };
+	}> = [];
+	for (const block of blocks) {
+		const imageId = block.imageId as string;
+		const uploadNarratorId =
+			typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : ownerNarratorId;
+		const filePath = getImagePath(uploadNarratorId, imageId);
+		if (!filePath) {
+			logger.warn("Anthropic history image missing on disk; skipping replay", {
+				messageId: msg.id,
+				uploadNarratorId,
+				imageId,
+			});
+			continue;
+		}
+		try {
+			const result = await imageToBase64(filePath);
+			// The detected type wins over the stored one: a file renamed or saved
+			// with the wrong extension would otherwise be declared as a media type
+			// its bytes contradict, which the API rejects.
+			const mediaType =
+				result.detectedMediaType ??
+				(typeof block.mediaType === "string" ? block.mediaType : "image/png");
+			parts.push({
+				type: "image",
+				source: { type: "base64", media_type: mediaType, data: result.base64 },
+			});
+		} catch (error) {
+			logger.warn("Failed to rebuild Anthropic history image; skipping replay", {
+				messageId: msg.id,
+				uploadNarratorId,
+				imageId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	return parts;
 }
 
 // === Helpers ===
@@ -3120,16 +3312,17 @@ function stripThinkingBlocks(messages: AnthropicMessage[]): void {
 	}
 }
 
-const DEEPSEEK_SYNTHETIC_THINKING = " ";
-const DEEPSEEK_SYNTHETIC_SIGNATURE = "narrafork-deepseek-compat";
+const RELAY_SYNTHETIC_THINKING = " ";
 
 /**
- * DeepSeek's Anthropic-compatible API doesn't support redacted_thinking blocks.
- * Some relays omit signatures in responses but still require a non-empty signature
- * when that thinking is replayed. Preserve authentic signatures and use a clearly
- * marked compatibility value only when the upstream supplied none.
+ * Sanitize thinking blocks for relay models behind Anthropic-compatible gateways
+ * (generalized from the DeepSeek case). Those gateways don't support
+ * redacted_thinking, so it is dropped; thinking text is always preserved and
+ * replayed with an empty signature when the upstream supplied none — relay
+ * models mint no signatures at all, and echoing the text back is what keeps
+ * their reasoning continuity intact.
  */
-function sanitizeDeepSeekThinkingBlocks(messages: AnthropicMessage[]): void {
+function sanitizeRelayThinkingBlocks(messages: AnthropicMessage[]): void {
 	for (const msg of messages) {
 		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
 		const parts = msg.content as AnthropicContentPart[];
@@ -3141,9 +3334,7 @@ function sanitizeDeepSeekThinkingBlocks(messages: AnthropicMessage[]): void {
 				continue;
 			}
 
-			filtered.push(
-				block.signature?.trim() ? block : { ...block, signature: DEEPSEEK_SYNTHETIC_SIGNATURE },
-			);
+			filtered.push(block.signature?.trim() ? block : { ...block, signature: "" });
 		}
 
 		if (
@@ -3157,9 +3348,9 @@ function sanitizeDeepSeekThinkingBlocks(messages: AnthropicMessage[]): void {
 }
 
 /**
- * DeepSeek requires thinking on historical assistant messages. When authentic
- * reasoning is unavailable, use a single-space placeholder plus the compatibility
- * signature required by strict Anthropic relays. Neither value is persisted.
+ * Relay gateways in thinking mode require thinking blocks on historical
+ * assistant messages. When authentic reasoning is unavailable, use a
+ * single-space placeholder with an empty signature. Neither value is persisted.
  */
 function patchMissingThinkingBlocks(messages: AnthropicMessage[]): void {
 	for (const msg of messages) {
@@ -3169,8 +3360,8 @@ function patchMissingThinkingBlocks(messages: AnthropicMessage[]): void {
 		if (hasThinking) continue;
 		parts.unshift({
 			type: "thinking",
-			thinking: DEEPSEEK_SYNTHETIC_THINKING,
-			signature: DEEPSEEK_SYNTHETIC_SIGNATURE,
+			thinking: RELAY_SYNTHETIC_THINKING,
+			signature: "",
 		});
 	}
 }

@@ -38,9 +38,14 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 
-	guard := handlers.NewPathGuard(cfg.AllowRoots)
+	guard := handlers.NewPathGuardWithRules(toGuardRules(cfg.EffectivePathRules()))
 	if guard.Unrestricted() {
-		log.Printf("WARNING: no --allow-root set; structured path RPCs may access any path the OS user can access")
+		log.Printf("WARNING: no path rules set; structured path RPCs may access any path the OS user can access")
+	}
+	// An unresolved deny still blocks its literal subtree, but a symlink or a
+	// later-created directory can sidestep it, so it must not stay silent.
+	for _, path := range guard.UnresolvedDenyRules() {
+		log.Printf("WARNING: deny rule %q could not be resolved (missing path?); it blocks that literal path only", path)
 	}
 	if !cfg.DisableShell {
 		log.Printf("WARNING: shell/PTY execution is enabled; --allow-root validates command cwd only and does not sandbox command text (use --disable-shell and OS isolation for a hard boundary)")
@@ -94,6 +99,20 @@ func main() {
 		}
 	}
 	log.Printf("shutting down")
+}
+
+// toGuardRules converts validated config rules into guard rules. Config already
+// rejected unknown actions, so anything not "deny" is an allow.
+func toGuardRules(rules []config.PathRule) []handlers.PathRule {
+	out := make([]handlers.PathRule, 0, len(rules))
+	for _, rule := range rules {
+		action := handlers.RuleAllow
+		if rule.Action == "deny" {
+			action = handlers.RuleDeny
+		}
+		out = append(out, handlers.PathRule{Action: action, Path: rule.Path})
+	}
+	return out
 }
 
 func hasBinary(name string) bool {

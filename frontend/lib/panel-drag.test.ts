@@ -5,6 +5,7 @@ import {
 	onPanelDragEnd,
 	onPanelDragMove,
 	type PanelDragState,
+	startDetachedPanelDrag,
 	startPanelDrag,
 } from "./panel-drag";
 
@@ -140,6 +141,90 @@ describe("startPanelDrag subject classification", () => {
 		dispatch("pointermove", 40, 0);
 		dispatch("pointerup", 40, 0);
 		expect(final).toMatchObject({ subjectKind: "narrator" });
+		offEnd();
+	});
+
+	test("surfaceId / toolKind / resourceId are carried through", () => {
+		let final: PanelDragState | null = null;
+		const offEnd = onPanelDragEnd((s) => {
+			final = s;
+		});
+		startPanelDrag({
+			panelId: "ndock-file",
+			id: "__file__",
+			title: "a.ts",
+			subjectKind: "tool",
+			surfaceId: "chap_1",
+			toolKind: "file",
+			resourceId: "/repo/a.ts",
+			x: 0,
+			y: 0,
+		});
+		dispatch("pointermove", 40, 0);
+		dispatch("pointerup", 40, 0);
+		expect(final).toMatchObject({
+			surfaceId: "chap_1",
+			toolKind: "file",
+			resourceId: "/repo/a.ts",
+		});
+		offEnd();
+	});
+
+	/**
+	 * A detached canvas panel dragged back into a dock.
+	 *
+	 * It must arrive WITHOUT a panelId: `useDockviewDnd` routes any drag carrying
+	 * one to `dropExistingPanel` (an in-surface rearrangement), so a detached panel
+	 * with a panelId would be mistaken for a same-kind panel already in the target
+	 * dock and the merge would silently do nothing.
+	 */
+	test("startDetachedPanelDrag carries no panelId and no surfaceId", () => {
+		let final: PanelDragState | null = null;
+		const offEnd = onPanelDragEnd((s) => {
+			final = s;
+		});
+		startDetachedPanelDrag({
+			id: "detached_1",
+			title: "Terminal",
+			toolKind: "terminal",
+			x: 0,
+			y: 0,
+		});
+		dispatch("pointermove", 40, 0);
+		dispatch("pointerup", 40, 0);
+		expect(final).not.toBeNull();
+		expect(final).toMatchObject({
+			id: "detached_1",
+			toolKind: "terminal",
+			subjectKind: "tool",
+		});
+		// The absence of these two is the whole point: a panelId would route the drag
+		// back into `dropExistingPanel` and the merge would silently do nothing.
+		expect(final).not.toHaveProperty("panelId");
+		expect(final).not.toHaveProperty("surfaceId");
+		offEnd();
+	});
+
+	test("a detached panel is not mistaken for a narrator subject", () => {
+		// Guards the consumers that only act on real narrators: the narrator page's
+		// create-workspace drop zone and the workspace's narrator materialisation
+		// both gate on isNarratorSubject. A detached panel id is a plain nanoid
+		// (not a `__marker__`), so only the explicit subjectKind keeps them out.
+		let final: PanelDragState | null = null;
+		const offEnd = onPanelDragEnd((s) => {
+			final = s;
+		});
+		startDetachedPanelDrag({
+			id: "MDxNbNyf9Ni04Fj-hSZek",
+			title: "Browser",
+			toolKind: "browser",
+			x: 0,
+			y: 0,
+		});
+		dispatch("pointermove", 40, 0);
+		dispatch("pointerup", 40, 0);
+		expect(final).not.toBeNull();
+		if (final) expect(isNarratorSubject(final)).toBe(false);
 		offEnd();
 	});
 });

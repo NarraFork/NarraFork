@@ -76,9 +76,7 @@ import {
 	measureReasoningCountLine,
 	measureReasoningStepsTrace,
 	measureToolRunCountLine,
-	measureToolRunSummary,
 	type ReasoningStepItem,
-	type ToolRunSummaryItem,
 } from "./measure/measure-tool-run";
 import { measureWebSearch } from "./measure/measure-web-search";
 import { RenderAskInPassing } from "./render/RenderAskInPassing";
@@ -387,7 +385,7 @@ const TOOL_CALL_GROUP: ToolCallData[] = [
 	{ toolName: "read", summary: "measure-subagent.ts", category: "read", status: "success" },
 ];
 
-const TOOL_RUN_ITEMS: ToolRunSummaryItem[] = [
+const ACTIVITY_ITEMS: ActivityTraceItem[] = [
 	{ title: "read registry.ts", hasIcon: true, iconColor: "lime" },
 	{ title: "read measure-markdown.ts", hasIcon: true, iconColor: "lime" },
 	{ title: "grep measureElement", hasIcon: true, iconColor: "cyan" },
@@ -395,7 +393,6 @@ const TOOL_RUN_ITEMS: ToolRunSummaryItem[] = [
 	{ title: "bash bun test", hasIcon: true, iconColor: "orange" },
 	{ title: "bash bunx tsgo --noEmit", hasIcon: true, iconColor: "orange" },
 ];
-const ACTIVITY_ITEMS: ActivityTraceItem[] = TOOL_RUN_ITEMS.map((it) => ({ ...it }));
 const REASONING_STEPS: ReasoningStepItem[] = [
 	{
 		title: "Inspect the measure signatures",
@@ -583,13 +580,13 @@ const HARNESS_CASES: HarnessCase[] = [
 
 	// ── Reasoning (collapsed / expanded / low-LOD count) ─────────────────────
 	preview(
-		{ id: "reasoning-collapsed", label: "Reasoning · collapsed (L5) @600", width: 600 },
-		(w) => measureReasoning(REASONING_DATA, w, 5, {}),
+		{ id: "reasoning-collapsed", label: "Reasoning · collapsed (L4) @600", width: 600 },
+		(w) => measureReasoning(REASONING_DATA, w, 4, {}),
 		(m) => <RenderReasoning measured={m} />,
 	),
 	preview(
-		{ id: "reasoning-expanded", label: "Reasoning · expanded (L5) @600", width: 600 },
-		(w) => measureReasoning(REASONING_DATA, w, 5, { expanded: true }),
+		{ id: "reasoning-expanded", label: "Reasoning · expanded (L4) @600", width: 600 },
+		(w) => measureReasoning(REASONING_DATA, w, 4, { expanded: true }),
 		(m) => <RenderReasoning measured={m} />,
 	),
 	preview(
@@ -720,8 +717,8 @@ const HARNESS_CASES: HarnessCase[] = [
 
 	// ── Tool call (collapsed / expanded spec-tasks / expanded generic) ───────
 	preview(
-		{ id: "tool-call-collapsed", label: "Tool call · collapsed (L5) @600", width: 600 },
-		(w) => measureToolCall(TOOL_CALL_READ, w, 5, { opened: false, isRecent: true }),
+		{ id: "tool-call-collapsed", label: "Tool call · collapsed (L4) @600", width: 600 },
+		(w) => measureToolCall(TOOL_CALL_READ, w, 4, { opened: false, isRecent: true }),
 		(m) => <RenderToolCall measured={m} />,
 	),
 	preview(
@@ -751,12 +748,7 @@ const HARNESS_CASES: HarnessCase[] = [
 
 	// ── Tool-run trace family ─────────────────────────────────────────────────
 	preview(
-		{ id: "tool-run-summary", label: "Tool run summary (L3) @600", width: 600 },
-		(w) => measureToolRunSummary(TOOL_RUN_ITEMS, w, {}, { label: "Tool calls", count: "6" }),
-		(m) => <RenderToolRun measured={m} />,
-	),
-	preview(
-		{ id: "tool-run-count", label: "Tool run count line (L2) @600", width: 600 },
+		{ id: "tool-run-count", label: "Tool run count line (L1/L2) @600", width: 600 },
 		(w) => measureToolRunCountLine(12, w, { label: "Tool calls", count: "12 calls" }),
 		(m) => <RenderTraceCountLine measured={m} />,
 	),
@@ -819,8 +811,8 @@ const HARNESS_CASES: HarnessCase[] = [
 
 	// ── Subagent card (collapsed / expanded) ─────────────────────────────────
 	preview(
-		{ id: "subagent-collapsed", label: "Subagent card · collapsed (L5) @600", width: 600 },
-		(w) => measureSubagentCard(SUBAGENT_DATA, w, 5, { opened: false, isRecent: true }),
+		{ id: "subagent-collapsed", label: "Subagent card · collapsed (L4) @600", width: 600 },
+		(w) => measureSubagentCard(SUBAGENT_DATA, w, 4, { opened: false, isRecent: true }),
 		(m) => (
 			<RenderSubagent
 				measured={m}
@@ -835,8 +827,8 @@ const HARNESS_CASES: HarnessCase[] = [
 		),
 	),
 	preview(
-		{ id: "subagent-expanded", label: "Subagent card · expanded (L5) @600", width: 600 },
-		(w) => measureSubagentCard(SUBAGENT_DATA, w, 5, { opened: true, isRecent: true }),
+		{ id: "subagent-expanded", label: "Subagent card · expanded (L4) @600", width: 600 },
+		(w) => measureSubagentCard(SUBAGENT_DATA, w, 4, { opened: true, isRecent: true }),
 		(m) => (
 			<RenderSubagent
 				measured={m}

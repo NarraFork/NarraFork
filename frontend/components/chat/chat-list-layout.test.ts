@@ -18,6 +18,7 @@ import {
 	CHAT_REPLY_PREVIEW_MAX_CHARS,
 	isGroupedWith,
 	isPinnedToBottom,
+	resolveReplyInfo,
 	resolveReplyPreview,
 	toMeasureIdentity,
 } from "./chat-list-layout";
@@ -32,6 +33,12 @@ function msg(overrides: Partial<ChatMessage> & { id: string }): ChatMessage {
 		kind: overrides.kind ?? "text",
 		contentText: overrides.contentText ?? "body",
 		replyToMessageId: overrides.replyToMessageId ?? null,
+		// Defaults to "legacy row, no snapshot" so the existing window-resolution
+		// cases keep exercising that path; snapshot cases set these explicitly.
+		replyToSeq: overrides.replyToSeq ?? null,
+		replyToSender: overrides.replyToSender ?? null,
+		replyToPreview: overrides.replyToPreview ?? null,
+		attachments: overrides.attachments ?? [],
 		editedAt: null,
 		deletedAt: overrides.deletedAt ?? null,
 		createdAt: overrides.createdAt ?? new Date(T0).toISOString(),
@@ -133,6 +140,140 @@ describe("reply previews", () => {
 
 	test("a message with no reply has no preview", () => {
 		expect(resolveReplyPreview(msg({ id: "a" }), new Map())).toBeNull();
+	});
+});
+
+describe("reply info states", () => {
+	test("the stored snapshot wins over the loaded window", () => {
+		// The window holds an EDITED version of the target; the snapshot holds what it
+		// said when it was quoted. The snapshot is what the strip must show, otherwise
+		// a later edit silently rewrites history in every quote of it.
+		const target = msg({ id: "a", contentText: "edited afterwards" });
+		const reply = msg({
+			id: "b",
+			seq: 2,
+			replyToMessageId: "a",
+			replyToSeq: 1,
+			replyToPreview: "what it said when quoted",
+			replyToSender: { id: "zoe", username: "zoe", avatarColor: null, avatarImageId: null },
+		});
+		const info = resolveReplyInfo(reply, new Map([[target.id, target]]));
+		expect(info?.state).toBe("quoted");
+		expect(info?.preview).toBe("what it said when quoted");
+		expect(info?.authorName).toBe("zoe");
+		expect(info?.targetSeq).toBe(1);
+	});
+
+	test("a snapshot resolves even when the target is NOT loaded", () => {
+		// The whole point of the snapshot: quoting something 300 messages back used to
+		// render as "this message was deleted".
+		const reply = msg({
+			id: "b",
+			seq: 400,
+			replyToMessageId: "far-away",
+			replyToSeq: 7,
+			replyToPreview: "an old decision",
+			replyToSender: { id: "zoe", username: "zoe", avatarColor: null, avatarImageId: null },
+		});
+		const info = resolveReplyInfo(reply, new Map());
+		expect(info?.state).toBe("quoted");
+		expect(info?.preview).toBe("an old decision");
+		expect(info?.targetSeq).toBe(7);
+	});
+
+	test("an EMPTY snapshot preview means deleted, not unavailable", () => {
+		const reply = msg({
+			id: "b",
+			seq: 2,
+			replyToMessageId: "a",
+			replyToSeq: 1,
+			replyToPreview: "",
+		});
+		expect(resolveReplyInfo(reply, new Map())?.state).toBe("deleted");
+	});
+
+	test("a legacy row with an unloaded target is 'unavailable', not 'deleted'", () => {
+		// Three distinct truths, and reporting the wrong one is the original defect:
+		// "we cannot see it from here" is not "it was deleted".
+		const reply = msg({ id: "b", seq: 2, replyToMessageId: "gone" });
+		expect(resolveReplyInfo(reply, new Map())?.state).toBe("unavailable");
+	});
+
+	test("a legacy row resolves from the window, author included", () => {
+		const target = msg({
+			id: "a",
+			contentText: "legacy body",
+			sender: { id: "zoe", username: "zoe", avatarColor: null, avatarImageId: null },
+		});
+		const reply = msg({ id: "b", seq: 2, replyToMessageId: "a" });
+		const info = resolveReplyInfo(reply, new Map([[target.id, target]]));
+		expect(info?.state).toBe("quoted");
+		expect(info?.preview).toBe("legacy body");
+		expect(info?.authorName).toBe("zoe");
+		// Taken from the resolved target, so a jump still knows where to go.
+		expect(info?.targetSeq).toBe(1);
+	});
+
+	test("a non-reply has no reply info at all", () => {
+		expect(resolveReplyInfo(msg({ id: "a" }), new Map())).toBeNull();
+	});
+
+	test("buildChatRows only feeds the measure layer a preview for a real quote", () => {
+		const rows = buildChatRows([
+			msg({ id: "a", seq: 1 }),
+			msg({ id: "b", seq: 2, replyToMessageId: "a", replyToSeq: 1, replyToPreview: "" }),
+			msg({ id: "c", seq: 3, replyToMessageId: "a", replyToSeq: 1, replyToPreview: "quoted" }),
+		]);
+		// A deleted/unavailable target draws a fixed label whose width cannot change the
+		// single-line strip height, so it contributes no preview string.
+		expect(rows[1].replyPreview).toBe("");
+		expect(rows[1].reply?.state).toBe("deleted");
+		expect(rows[2].replyPreview).toBe("quoted");
+		// Not a reply at all → null, which is how the measure layer tells the two apart.
+		expect(rows[0].replyPreview).toBeNull();
+		expect(rows[0].reply).toBeNull();
+	});
+
+	test("hasReply reaches the measure identity for every reply state", () => {
+		const rows = buildChatRows([
+			msg({ id: "a", seq: 1 }),
+			msg({ id: "b", seq: 2, replyToMessageId: "a", replyToSeq: 1, replyToPreview: "" }),
+		]);
+		expect(toMeasureIdentity(rows[0]).hasReply).toBe(false);
+		// Without this the strip would be dropped for exactly the rows that need a label.
+		expect(toMeasureIdentity(rows[1]).hasReply).toBe(true);
+	});
+});
+
+describe("attachments in rows", () => {
+	const attachment = {
+		id: "att1",
+		kind: "image" as const,
+		filename: "shot.png",
+		mediaType: "image/png",
+		sizeBytes: 10,
+		width: 100,
+		height: 50,
+	};
+
+	test("attachments reach the measure identity", () => {
+		const row = buildChatRows([msg({ id: "a", attachments: [attachment] })])[0];
+		expect(toMeasureIdentity(row).attachments).toHaveLength(1);
+	});
+
+	test("an attachment opens a new visual group", () => {
+		// A headerless bubble containing only a thumbnail gives the reader no author and
+		// no timestamp for content they may well want to attribute.
+		const rows = buildChatRows([
+			msg({ id: "a", seq: 1 }),
+			msg({
+				id: "b",
+				seq: 2,
+				createdAt: new Date(T0 + 1_000).toISOString(),
+				attachments: [attachment],
+			}),
+		]);
+		expect(rows[1].grouped).toBe(false);
 	});
 });
 

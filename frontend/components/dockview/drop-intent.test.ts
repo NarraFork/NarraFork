@@ -47,6 +47,116 @@ function apiWithGroup(opts: {
 	return { groups: [group] } as unknown as DockviewApi;
 }
 
+/**
+ * A group inside an ancestor `transform: scale(zoom)`, modelled the way a browser
+ * reports one: `getBoundingClientRect()` and dockview's own `boundingBox` (which it
+ * derives from client-rect deltas) are both MAGNIFIED by the zoom, while
+ * `offsetWidth` stays the element's unscaled layout width.
+ *
+ * `layoutWidth`/`layoutHeight` are the group's size in the surface's own pixels.
+ */
+function apiWithScaledGroup(opts: {
+	layoutWidth: number;
+	layoutHeight: number;
+	zoom: number;
+	/** Where the scaled box lands in the viewport. */
+	screenLeft?: number;
+	screenTop?: number;
+	activePanelId?: string;
+}): DockviewApi {
+	const {
+		layoutWidth,
+		layoutHeight,
+		zoom,
+		screenLeft = 0,
+		screenTop = 0,
+		activePanelId = "target",
+	} = opts;
+	const width = layoutWidth * zoom;
+	const height = layoutHeight * zoom;
+	const rect = {
+		left: screenLeft,
+		top: screenTop,
+		right: screenLeft + width,
+		bottom: screenTop + height,
+		width,
+		height,
+		x: screenLeft,
+		y: screenTop,
+		toJSON: () => ({}),
+	} as DOMRect;
+	const group = {
+		id: "g1",
+		element: {
+			getBoundingClientRect: () => rect,
+			offsetWidth: layoutWidth,
+		} as unknown as HTMLElement,
+		// Root-relative and scaled, exactly like dockview computes it.
+		api: { boundingBox: { left: 0, top: 0, width, height } },
+		activePanel: { id: activePanelId },
+	};
+	return { groups: [group] } as unknown as DockviewApi;
+}
+
+/**
+ * Regression: the overlay rectangle used to be reported in SCALED pixels while
+ * being applied as CSS inside the already-scaled dockview root, so the canvas zoom
+ * was multiplied in twice — the highlight covered a fraction of the group and sat
+ * at the wrong offset. The box must come back in the root's own layout pixels.
+ */
+describe("hitTestGroups — ancestor scale (graph node dock)", () => {
+	test("box is reported in layout pixels, not the scaled screen size", () => {
+		const api = apiWithScaledGroup({ layoutWidth: 800, layoutHeight: 600, zoom: 0.5 });
+		// Pointer in the middle of the SCALED box (400x300 on screen).
+		const hit = hitTestGroups(api, 200, 150, "dragged");
+		expect(hit).not.toBeNull();
+		expect(hit?.box).toEqual({ left: 0, top: 0, width: 800, height: 600 });
+	});
+
+	test("zoom > 1 shrinks the reported box back to layout size", () => {
+		const api = apiWithScaledGroup({ layoutWidth: 800, layoutHeight: 600, zoom: 2 });
+		const hit = hitTestGroups(api, 800, 600, "dragged");
+		expect(hit?.box).toEqual({ left: 0, top: 0, width: 800, height: 600 });
+	});
+
+	test("a merge overlay covers the whole group in layout pixels at any zoom", () => {
+		for (const zoom of [0.5, 1, 1.75, 3]) {
+			const api = apiWithScaledGroup({ layoutWidth: 800, layoutHeight: 600, zoom });
+			// Just inside the top-left corner → merge (not a split band) is irrelevant
+			// here; we only assert the geometry the overlay is drawn from.
+			const hit = hitTestGroups(api, 400 * zoom, 300 * zoom, "dragged");
+			expect(hit).not.toBeNull();
+			const indicator = toIndicator({ ...(hit as GroupHit), intent: "merge" });
+			expect(indicator.width).toBeCloseTo(800, 6);
+			expect(indicator.height).toBeCloseTo(600, 6);
+		}
+	});
+
+	// Intent comes from RATIOS, so it was always zoom-correct; pin it so a future
+	// change to the unscaling cannot quietly break hit-testing itself.
+	test("intent zones still resolve against the on-screen box", () => {
+		const api = apiWithScaledGroup({ layoutWidth: 1000, layoutHeight: 1000, zoom: 0.5 });
+		// Scaled box is 500x500. Left edge band is the first 20%.
+		expect(hitTestGroups(api, 10, 250, "dragged")?.intent).toBe("left");
+		expect(hitTestGroups(api, 250, 250, "dragged")?.intent).toBe("swap");
+		expect(hitTestGroups(api, 250, 490, "dragged")?.intent).toBe("below");
+	});
+
+	test("an offset scaled box still hit-tests and reports layout-sized geometry", () => {
+		const api = apiWithScaledGroup({
+			layoutWidth: 800,
+			layoutHeight: 600,
+			zoom: 0.5,
+			screenLeft: 300,
+			screenTop: 100,
+		});
+		expect(hitTestGroups(api, 100, 50, "dragged")).toBeNull();
+		const hit = hitTestGroups(api, 500, 250, "dragged");
+		expect(hit?.box.width).toBeCloseTo(800, 6);
+		expect(hit?.box.height).toBeCloseTo(600, 6);
+	});
+});
+
 describe("hitTestGroups — three-zone intent", () => {
 	const api = apiWithGroup({ width: 1000, height: 1000, activePanelId: "target" });
 

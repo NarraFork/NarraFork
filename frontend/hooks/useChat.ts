@@ -8,6 +8,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { api } from "../lib/api";
 import type {
+	ChatAttachment,
 	ChatMessage,
 	ChatMessagePage,
 	ChatRoomSummary,
@@ -149,8 +150,11 @@ export function useFlatChatMessages(
 export function useSendChatMessage(roomId: string | undefined) {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: (input: { text: string; replyToMessageId?: string | null }) =>
-			api.postChatMessage(roomId as string, input),
+		mutationFn: (input: {
+			text: string;
+			replyToMessageId?: string | null;
+			attachmentIds?: string[];
+		}) => api.postChatMessage(roomId as string, input),
 		onSuccess: (message) => {
 			if (!roomId) return;
 			appendChatMessageToCache(qc, roomId, message);
@@ -206,6 +210,40 @@ export function useSummarizeChat(roomId: string | undefined) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Attachments
+//
+// Uploads are NOT part of the send mutation: the composer shows a thumbnail before
+// the message exists, so each file is uploaded as it is picked and the ids are
+// handed to the send. That also means a failed upload is visible (and retryable)
+// on its own chip instead of failing the whole message.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function useUploadChatAttachment(roomId: string | undefined) {
+	return useMutation({
+		mutationFn: (file: File) => api.uploadChatAttachment(roomId as string, file),
+	});
+}
+
+/**
+ * Discard a draft attachment.
+ *
+ * No cache invalidation: drafts live in composer state, never in a query — they are
+ * not part of any message yet, so nothing cached refers to them.
+ */
+export function useDiscardChatAttachment() {
+	return useMutation({
+		mutationFn: (attachmentId: string) => api.deleteChatAttachment(attachmentId),
+	});
+}
+
+export function useMaterializeChatAttachments(roomId: string | undefined) {
+	return useMutation({
+		mutationFn: (input: { narratorId: string; attachmentIds: string[] }) =>
+			api.materializeChatAttachments(roomId as string, input.narratorId, input.attachmentIds),
+	});
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pure cache transforms
 //
 // Every live chat frame already carries what the summary queries display, so the
@@ -235,6 +273,28 @@ export function chatPreviewFromText(text: string): string {
 }
 
 /**
+ * Room-list preview for a whole message, attachments included.
+ *
+ * ⚠️ Mirrors the server's `buildRoomPreview` (chat-service.ts) — the attachment-only
+ * fallback lists FILENAMES rather than a localized `[image]` marker, because the
+ * server writes this string once at post time for readers in every language. If the
+ * two diverge, an attachment-only message's preview changes visibly the first time
+ * the room list refetches.
+ */
+export function chatPreviewFromMessage(
+	message: Pick<ChatMessage, "contentText" | "deletedAt"> & {
+		attachments?: ReadonlyArray<{ filename: string }>;
+	},
+): string {
+	if (message.deletedAt) return "";
+	const body = message.contentText.trim();
+	if (body) return chatPreviewFromText(body);
+	const attachments = message.attachments ?? [];
+	if (attachments.length === 0) return "";
+	return chatPreviewFromText(attachments.map((attachment) => attachment.filename).join(", "));
+}
+
+/**
  * Fold a live message into the room list: preview, timestamp, sender, order.
  *
  * Returns `null` when the room is not in the list — a first message in a DM the
@@ -250,6 +310,7 @@ export function applyChatMessageToRooms(
 	roomId: string,
 	message: Pick<ChatMessage, "contentText" | "createdAt" | "deletedAt"> & {
 		sender: { id: string } | null;
+		attachments?: ReadonlyArray<{ filename: string }>;
 	},
 ): ChatRoomSummary[] | null {
 	if (!rooms) return null;
@@ -258,7 +319,9 @@ export function applyChatMessageToRooms(
 	const patched: ChatRoomSummary = {
 		...rooms[index],
 		lastMessageAt: message.createdAt,
-		lastMessagePreview: message.deletedAt ? "" : chatPreviewFromText(message.contentText),
+		// Via the message-level builder so an attachment-only post shows its filenames
+		// rather than an empty preview until the next refetch.
+		lastMessagePreview: chatPreviewFromMessage(message),
 		lastMessageSenderId: message.sender?.id ?? null,
 	};
 	const next = [...rooms];
@@ -472,7 +535,17 @@ export function markChatMessageDeletedInCache(
 				...page,
 				messages: page.messages.map((message) =>
 					message.id === messageId
-						? { ...message, contentText: "", deletedAt: new Date().toISOString() }
+						? {
+								...message,
+								contentText: "",
+								// Attachments must go with the body: the server drops them from
+								// both `listMessages` and the broadcast payload for a deleted
+								// message, so keeping them here would leave the deleter looking
+								// at thumbnails of a message everyone else sees as removed until
+								// the next refetch.
+								attachments: [],
+								deletedAt: new Date().toISOString(),
+							}
 						: message,
 				),
 			})),
@@ -583,4 +656,4 @@ export function useChatUnreadLive(): void {
 	}, [qc]);
 }
 
-export type { ChatMessage, ChatMessagePage, ChatRoomSummary, ChatUnreadSummary };
+export type { ChatAttachment, ChatMessage, ChatMessagePage, ChatRoomSummary, ChatUnreadSummary };

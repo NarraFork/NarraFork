@@ -174,7 +174,7 @@ async function resolveBlockToolUses(
  * A running compact is deliberately NOT checked here: it is enforced inside each
  * transaction by `assertNoRunningCompactRefsTx`, and a compact that starts between this
  * check and the write would slip past anything checked out here anyway. Callers already
- * gate on `assertIdleForBlockDeletion` before reaching this path.
+ * gate on `prepareHistoryRewrite` before reaching this path.
  */
 function assertBlocksDeletable(narratorId: string, grouped: Map<string, number[]>): void {
 	// Kept synchronous-per-message rather than one big query: the batch is small (it comes

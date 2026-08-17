@@ -49,9 +49,9 @@ beforeAll(() => {
 
 const CONTENT_WIDTH = 800;
 
-/** LOD 6 expands every card, so the detail region (and its image) is painted. */
+/** LOD 5 expands every card, so the detail region (and its image) is painted. */
 const CTX: AdapterContext = {
-	lod: 6,
+	lod: 5,
 	resolveToolCategory: (toolName: string) => (toolName === "Browser" ? "browser" : "webFetch"),
 };
 
@@ -119,7 +119,7 @@ function renderScreenshot(msg: NarratorMsg): Element {
 	const specs = adaptSegments(segments, CTX);
 	const spec = specs.find((s) => s.kind === "tool-call" || s.kind === "tool-call-group");
 	if (!spec) throw new Error(`no tool-call spec, got: ${specs.map((s) => s.kind).join(",")}`);
-	const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, CONTENT_WIDTH, 6, spec.opts);
+	const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, CONTENT_WIDTH, 5, spec.opts);
 	const extra = resolveRenderExtra(spec);
 	extra.narratorId = "n1";
 	return renderWithProviders(renderElement(spec.kind, measured, extra));

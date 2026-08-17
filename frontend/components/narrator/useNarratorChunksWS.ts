@@ -294,6 +294,28 @@ export function getCatchUpStructuralMode(
 	return mode;
 }
 
+/**
+ * Mirror of applyTopLevelMessage's silent-drop paths, evaluated synchronously
+ * BEFORE queueing the updater. A tail-append (3b: seq beyond the tail, or the
+ * 3d no-seq fallback) while the tail chunk is not loaded returns the state
+ * unchanged — and unlike a mid-manifest seq (3c), which ensureLoaded backfills
+ * on demand, nothing ever retries the append. The frame is still counted by
+ * the WS manager's messageVersion, so without a reconcile the message stays
+ * invisible until some unrelated structural event happens to force one.
+ */
+export function willDropTopLevelMessage(
+	msg: Pick<TreeMessage, "seq">,
+	loaded: Map<string, TreeMessage[]>,
+	manifest: ChunkManifestEntry[],
+): boolean {
+	if (manifest.length === 0) return false; // 3a seeds a fresh first chunk
+	const tail = manifest[manifest.length - 1];
+	if (loaded.has(tail.id)) return false; // tail resident: every append branch lands
+	const seq = typeof msg.seq === "number" && Number.isFinite(msg.seq) ? msg.seq : undefined;
+	if (seq == null) return true; // 3d fallback appends to the tail
+	return seq > tail.lastSeq; // 3b appends to / extends the tail
+}
+
 function mergeUpdatedMessageById(
 	messages: TreeMessage[],
 	updatedMsg: TreeMessage,
@@ -641,6 +663,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 		loadedRef,
 		loadedOwnerNarratorId,
 		loaded,
+		manifestRef,
 		isAtBottomRef,
 		onUnread,
 		onStructuralDirty,
@@ -996,6 +1019,15 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				// so React batches it into one render (no frame where streaming text
 				// and the real message both show).
 				const isAssistant = newMsg.role === "assistant";
+				// A tail-append that lands while the tail chunk is not loaded is silently
+				// dropped by applyTopLevelMessage with no retry. The frame already advanced
+				// the manager's messageVersion, so repair it with an authoritative manifest
+				// reconcile instead of waiting for an unrelated structural event.
+				const droppedByTail = willDropTopLevelMessage(
+					newMsg,
+					loadedRef.current,
+					manifestRef.current,
+				);
 				if (isAssistant) {
 					streamingBlocksRef.current = [];
 					liveBlockIndexRef.current = -1;
@@ -1016,6 +1048,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					bumpStreamingVersion();
 					bumpTopLevelChunksVersion();
 				}
+				if (droppedByTail) onStructuralDirty("diff");
 				if (isAtBottomRef.current) onTailFollow();
 			},
 			onUserMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
@@ -1039,6 +1072,13 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 							!!newMsg.contentText?.startsWith(m.contentText) &&
 							newMsg.contentText.includes("<attached_files>")));
 
+				// Same tail-drop guard as onMessage: the version is already counted, so
+				// a silently dropped append must be repaired by an authoritative reconcile.
+				const droppedByTail = willDropTopLevelMessage(
+					newMsg,
+					loadedRef.current,
+					manifestRef.current,
+				);
 				scheduleChunkUpdate((state) =>
 					applyTopLevelMessage(
 						state,
@@ -1048,12 +1088,27 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						matchOptimistic,
 					),
 				);
+				if (droppedByTail) onStructuralDirty("diff");
 				if (isAtBottomRef.current) onTailFollow();
 			},
 			onCatchUp: (_orphanChildren, topLevel, subagentActivities) => {
 				// Compute the structural result synchronously, before queueing any updater.
 				// Reading a flag written inside scheduleChunkUpdate() races with the flush.
 				const structuralMode = getCatchUpStructuralMode(topLevel, loadedRef.current);
+				// The replayed top-level messages go through the same applyTopLevelMessage
+				// tail-drop paths as realtime frames. A catch-up usually arrives right after
+				// a (re)subscribe — exactly when the tail chunk may still be loading — so
+				// detect the drop synchronously and repair via the same reconcile gate.
+				let tailDropped = false;
+				for (const raw of topLevel) {
+					if (!raw?.id || !raw?.createdAt) continue;
+					if (!isSubagent && raw.parentToolUseId) continue;
+					if (isStructuralInsert(raw as NarratorMsg)) continue;
+					if (willDropTopLevelMessage(raw, loadedRef.current, manifestRef.current)) {
+						tailDropped = true;
+						break;
+					}
+				}
 
 				// Persisted top-level messages supersede any restored streaming text.
 				if (topLevel.length > 0) {
@@ -1108,8 +1163,12 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				}
 
 				if (structuralMode) onStructuralDirty(structuralMode);
+				else if (tailDropped) onStructuralDirty("diff");
 				if (isAtBottomRef.current) onTailFollow();
-				return structuralMode !== undefined;
+				// Defer the coordinate commit whenever a reconcile gate was opened above,
+				// so the staged cursor/version publish atomically with the authoritative
+				// manifest that re-fetches the dropped messages.
+				return structuralMode !== undefined || tailDropped;
 			},
 			onFullReload: () => {
 				streamingBlocksRef.current = [];

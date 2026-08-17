@@ -290,6 +290,10 @@ export const chapterService = {
 				: eq(chapters.projectId, projectId);
 		return db.query.chapters.findMany({
 			where,
+			// Exclude the node dock layout and its detached-panel list: both are
+			// per-chapter blobs, and this listing returns every chapter in the project.
+			// They are read only by their own `/chapters/:id/...` endpoints.
+			columns: { dockLayoutJson: false, detachedPanelsJson: false },
 			orderBy: (chapters, { desc }) => [desc(chapters.updatedAt)],
 		});
 	},

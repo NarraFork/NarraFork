@@ -341,8 +341,15 @@ export function BackgroundTasksPanel({
 		(subagentNarratorId: string) => {
 			if (!canOpenSubagentSessions) return;
 			onOpenSubagent?.();
-			if (dock) {
-				dock.openSubagentPanel(subagentNarratorId);
+			// Gate on the bridge, not on `dock`: a tool panel torn out onto the
+			// story-network canvas HAS a dock context but no secondary area to put a
+			// session in, so the bridge is absent while its source node is collapsed.
+			// Falling through to the standalone page is a real answer there — unlike
+			// `dock.openSubagentPanel(...)` through a `?.`, which would look like it
+			// worked and do nothing.
+			const openInDock = dock?.openSubagentPanel;
+			if (openInDock) {
+				openInDock(subagentNarratorId);
 			} else {
 				navigate({ to: "/narrators/$narratorId", params: { narratorId: subagentNarratorId } });
 			}

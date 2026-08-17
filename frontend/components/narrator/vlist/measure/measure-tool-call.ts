@@ -1107,10 +1107,10 @@ export function resolveToolCallOpened(
 	opts: { lodExempt: boolean; isRecent: boolean; opened: boolean; lodUserOverride?: boolean },
 ): boolean {
 	if (opts.lodExempt || opts.lodUserOverride) return true;
-	if (lod >= 6) return true;
-	if (lod === 5) return opts.isRecent ? opts.opened : false;
-	if (lod === 4) return false;
-	// L1-L3: the upstream tool-run gate owns these levels; a card shown here is
+	if (lod >= 5) return true;
+	if (lod === 4) return opts.isRecent ? opts.opened : false;
+	if (lod === 3) return false;
+	// L1/L2: the upstream tool-run gate owns these levels; a card shown here is
 	// treated as collapsed (its content lives in the folded trace instead).
 	return false;
 }

@@ -6,7 +6,11 @@
  */
 
 export type { DockviewSurfaceProps } from "./DockviewSurface";
-export { DOCKVIEW_THEME_CLASS, DockviewSurface } from "./DockviewSurface";
+export {
+	DOCKVIEW_THEME_CLASS,
+	DockviewSurface,
+	useDockviewSurfaceId,
+} from "./DockviewSurface";
 export {
 	DEFAULT_THRESHOLDS,
 	type DropIndicator,
@@ -23,6 +27,7 @@ export {
 export { swapPanels } from "./panel-swap";
 export {
 	type DockviewDropTarget,
+	isLocalPanelDrag,
 	type UseDockviewDndOptions,
 	type UseDockviewDndResult,
 	useDockviewDnd,

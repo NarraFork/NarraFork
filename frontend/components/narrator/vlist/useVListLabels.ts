@@ -372,7 +372,7 @@ export function useVListLabels(): VListLabels {
 			// server/lib/i18n.ts): the model gets "keep tasks.json to only
 			// text/status/protected…", the reader gets "3 open tasks".
 			noticeSilentProgress: t("sidecar.body.noticeSilentProgress", { count: "{count}" }),
-			noticeRelaxedPlan: t("sidecar.body.noticeRelaxedPlan"),
+			noticeRelaxedPlan: t("sidecar.body.noticeRelaxedPlan", { planFile: "{planFile}" }),
 			noticePipelineExit: t("sidecar.body.noticePipelineExit"),
 			tasksCurrent: t("sidecar.body.tasksCurrent", { n: "{n}" }),
 			tasksEmptyNever: t("sidecar.body.tasksEmptyNever"),
@@ -559,7 +559,6 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 			return labels.reasoning;
 		case "tool-call":
 			return labels.toolCall;
-		case "tool-run-summary":
 		case "activity-trace":
 		case "reasoning-steps":
 			return labels.trace;

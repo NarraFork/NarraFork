@@ -271,14 +271,6 @@ Target file: \`{conclusionFile}\``,
 
 目标文件：\`{conclusionFile}\``,
 	},
-	"tool.relaxedPlanToolReminder": {
-		en: `<relaxed_plan_reminder>
-You are still in relaxed plan mode. This non-read-only tool call was allowed only so planning can continue with full context. Do not start implementation work yet. Continue investigating or refining the plan, then call ExitPlanMode to submit the complete plan for approval.
-</relaxed_plan_reminder>`,
-		"zh-CN": `<relaxed_plan_reminder>
-你仍处于宽松计划模式。此次非只读工具调用只是为了让规划能带着完整上下文继续进行，并不表示可以开始实现。不要现在开始写实现代码；请继续调查或完善计划，然后调用 ExitPlanMode 提交完整计划供用户批准。
-</relaxed_plan_reminder>`,
-	},
 	"tool.planModeCancelled": {
 		en: "Plan mode was cancelled by the user. Do not submit or execute this plan unless the user asks you to plan again.",
 		"zh-CN": "计划模式已被用户取消。除非用户再次要求规划，否则不要提交或执行此计划。",
@@ -614,10 +606,14 @@ You have completed {count} tool call(s) since your last visible text reply. Befo
 	},
 	"sidecar.noticeRelaxedPlan": {
 		en: `<relaxed_plan_reminder>
-You are still in relaxed plan mode. This non-read-only tool call was allowed only so planning can continue with full context. Do not start implementation work yet. Continue investigating or refining the plan, then call ExitPlanMode to submit the complete plan for approval.
+You are still in relaxed plan mode, and this tool call modified something outside your plan file. Non-read-only tools are available only so planning can continue with full context — they are not permission to start implementing. Do not write or change implementation code yet.
+Your plan belongs in: {planFile}
+Continue investigating or refining the plan there, then call ExitPlanMode to submit the complete plan for approval.
 </relaxed_plan_reminder>`,
 		"zh-CN": `<relaxed_plan_reminder>
-你仍处于宽松计划模式。此次非只读工具调用只是为了让规划能带着完整上下文继续进行，并不表示可以开始实现。不要现在开始写实现代码；请继续调查或完善计划，然后调用 ExitPlanMode 提交完整计划供用户批准。
+你仍处于宽松计划模式，而这次工具调用改动了计划文件以外的内容。非只读工具只是为了让规划能带着完整上下文继续进行，并不表示可以开始实现。现在不要编写或修改实现代码。
+你的计划应写入：{planFile}
+请继续在该文件中调查或完善计划，然后调用 ExitPlanMode 提交完整计划供用户批准。
 </relaxed_plan_reminder>`,
 	},
 	"sidecar.noticePipelineExit": {
@@ -635,63 +631,52 @@ You are still in relaxed plan mode. This non-read-only tool call was allowed onl
 	},
 
 	// tasks — the Dynamic Spec digest (was: spec-reminder.ts).
+	//
+	// ⚠️ These strings are injected MID-TURN on a tool-call cadence, so every word is
+	// paid again and again inside ONE piece of work. Keep them to the live task state
+	// plus one action line. The rules about `tasks.json`'s shape, what makes a task
+	// finite, when `protected` is allowed and how to handle a blocked entry all live in
+	// the system prompt (`getDynamicSpecSystemReminder`, which embeds the blocked-task
+	// rule verbatim) — the model read them at position zero and will read them again on
+	// the next request, so restating them here is pure repetition. The turn-end
+	// continuation prompts are a separate, rarer surface and may be as long as needed.
 	"sidecar.tasksCurrentHeading": {
-		en: "Current Dynamic Spec reminder (compiled from spec://tasks.json):",
-		"zh-CN": "当前 Dynamic Spec 提醒（由 spec://tasks.json 编译生成）：",
+		en: "Dynamic Spec — open tasks (spec://tasks.json):",
+		"zh-CN": "Dynamic Spec 当前任务（spec://tasks.json）：",
 	},
 	"sidecar.tasksCurrentUpdateNote": {
-		en: "If task state changed, update spec://tasks.json with Read/Edit/Write. Do not add IDs, timestamps, or notes fields to tasks.json.",
-		"zh-CN":
-			"如任务状态已变化，请用 Read/Edit/Write 更新 spec://tasks.json；不要在 tasks.json 中添加 ID、时间戳或说明字段。",
+		en: "Update spec://tasks.json if any state changed.",
+		"zh-CN": "状态有变化就更新 spec://tasks.json。",
 	},
 	"sidecar.tasksEmptyHeading": {
-		en: "Dynamic Spec reminder (spec://tasks.json has no active tasks):",
-		"zh-CN": "Dynamic Spec 提醒（spec://tasks.json 当前没有进行中的任务）：",
+		en: "Dynamic Spec — no open tasks.",
+		"zh-CN": "Dynamic Spec 当前没有开放任务。",
 	},
 	"sidecar.tasksEmptyNeverCreate": {
-		en: "- You have not created any task in spec://tasks.json yet. If this is multi-step or non-trivial work, use Write/Edit to build a task list to track progress, e.g. one doing plus a few todo.",
-		"zh-CN":
-			"- 你还没有在 spec://tasks.json 建立任何任务。如果当前是多步骤或较复杂的工作，请用 Write/Edit 建立任务清单来跟踪进度，例如一条 doing + 若干 todo。",
+		en: "- Multi-step work? Write a task list to spec://tasks.json (one doing plus a few todo).",
+		"zh-CN": "- 如果是多步骤工作，请在 spec://tasks.json 建立任务清单（一条 doing + 若干 todo）。",
 	},
 	"sidecar.tasksEmptyNeverSkip": {
-		en: "- If the current work is genuinely simple and does not need to be broken down, you may ignore this reminder.",
-		"zh-CN": "- 如果当前工作确实简单、无需拆分，可以忽略本提醒。",
+		en: "- Simple work needs no list; ignore this if so.",
+		"zh-CN": "- 工作简单则无需拆分，可忽略本提醒。",
 	},
 	"sidecar.tasksEmptyDoneReorganize": {
-		en: "- The previous phase is complete. Before starting the next round of work, reassess the current goal and context, then reorganize spec://tasks.json: remove completed ordinary tasks, preserve protected-task intent, and keep only a concise set of necessary doing/todo/blocked tasks for the current phase.",
+		en: "- Previous phase is done. Reorganize spec://tasks.json for the next one: drop completed ordinary tasks, keep a concise doing/todo/blocked set, preserve protected-task intent.",
 		"zh-CN":
-			"- 上一阶段任务已全部完成。现在开始下一轮工作前，请先重新审视当前目标和上下文，整理 spec://tasks.json：清理已完成的普通任务，保留 protected task 的用户意图，并只保留当前阶段必要且精简的 doing/todo/blocked 任务。",
+			"- 上一阶段已完成。请为下一阶段整理 spec://tasks.json：清理已完成的普通任务，只保留精简的 doing/todo/blocked，并保留 protected task 的用户意图。",
 	},
 	"sidecar.tasksEmptyDoneContinue": {
-		en: "- Continue the work only after the task list is refreshed; do not retain completed tasks merely as history.",
-		"zh-CN": "- 整理完成后再继续当前工作；不要为了保留历史而堆积已完成任务。",
+		en: "- Refresh the list before continuing.",
+		"zh-CN": "- 整理完再继续。",
 	},
 	"sidecar.tasksTooManyHeading": {
-		en: "Dynamic Spec reorganization reminder (spec://tasks.json has {count} tasks, exceeding {threshold}):",
-		"zh-CN": `Dynamic Spec 整理提醒（spec://tasks.json 当前有 {count} 条任务，超过 {threshold} 条）：`,
+		en: "Dynamic Spec — {count} tasks in spec://tasks.json, over the {threshold} threshold.",
+		"zh-CN": `Dynamic Spec 当前有 {count} 条任务（spec://tasks.json），超过 {threshold} 条。`,
 	},
 	"sidecar.tasksTooManyReorganize": {
-		en: "- Reorganize the task list before continuing: merge duplicate or closely related tasks, remove obsolete ordinary tasks, split oversized tasks, and keep only the necessary doing/todo/blocked tasks for the current phase.",
+		en: "- Reorganize before continuing: merge duplicates, drop obsolete ordinary tasks, split oversized ones, keep only this phase's doing/todo/blocked. Preserve protected-task intent.",
 		"zh-CN":
-			"- 请先重新整理任务清单，再继续执行：合并重复或高度相关的任务，删除已过期的普通任务，拆分过大的任务，并确保当前阶段只有必要的 doing/todo/blocked 任务。",
-	},
-	"sidecar.tasksTooManyProtected": {
-		en: "- Preserve protected-task intent; do not rewrite, delete, or replace a protected task to bypass its goal.",
-		"zh-CN":
-			"- protected task 的用户意图必须保留；不要通过改写、删除或替换 protected task 来绕过目标。",
-	},
-	"sidecar.tasksFieldsNote": {
-		en: "- Keep tasks.json to only text/status/protected; do not add IDs, timestamps, summaries, or other fields.",
-		"zh-CN": "- tasks.json 只保留 text/status/protected，不要添加 ID、时间戳、摘要或其他字段。",
-	},
-	"sidecar.tasksSemanticsNote": {
-		en: "- Every open task must be finite, executable, and have a completion condition; an open protected task may trigger automatic continuation. Do not store standing behavior rules or constraints without a terminal state as tasks; those belong in spec://behavior_fence.",
-		"zh-CN":
-			"- 每条开放任务必须有限、可执行且有完成条件；protected task 未完成时可能触发自动续跑。不要把长期行为规则或无终点约束写成任务，这类内容属于 spec://behavior_fence。",
-	},
-	"sidecar.tasksProtectedOnlyOnUserDemand": {
-		en: "- Do not add protected yourself. It is only for tasks whose completion the user explicitly demanded be guaranteed.",
-		"zh-CN": "- 不要自行添加 protected。它只用于用户明确要求确保完成的任务。",
+			"- 请先整理再继续：合并重复项，删除过期的普通任务，拆分过大的任务，只保留当前阶段的 doing/todo/blocked。protected task 的用户意图必须保留。",
 	},
 
 	// knowledge — was: formatInjectionsBare (knowledge-injection.ts). The heading is
@@ -865,7 +850,6 @@ export type ToolMessageKey =
 	| "planModeFileRedirected"
 	| "subagentConclusionRedirected"
 	| "subagentConclusionRedirectedFileNotFound"
-	| "relaxedPlanToolReminder"
 	| "planModeCancelled"
 	| "suggestAnswerSystem"
 	| "questionReflectionSystem"

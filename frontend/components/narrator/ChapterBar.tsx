@@ -16,38 +16,23 @@ import {
 } from "@mantine/core";
 import {
 	IconGitCommit,
-	IconGitFork,
-	IconGitMerge,
 	IconGraph,
 	IconMoon,
 	IconPackage,
 	IconSettings,
-	IconSourceCode,
 	IconSun,
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { LazyCollapse } from "./LazyCollapse";
+import classes from "./ChapterBar.module.css";
+import { useNarratorDockContext } from "./dock/NarratorDockContext";
 
 // Lazy-loaded heavy panels and modals — only needed when user opens them
-const GitPanel = lazy(() =>
-	import("@frontend/components/chapter/GitPanel").then((m) => ({ default: m.GitPanel })),
-);
 const ContainerPanel = lazy(() =>
 	import("@frontend/components/container/ContainerPanel").then((m) => ({
 		default: m.ContainerPanel,
-	})),
-);
-const ChapterForkModal = lazy(() =>
-	import("@frontend/components/chapter/ChapterForkModal").then((m) => ({
-		default: m.ChapterForkModal,
-	})),
-);
-const ChapterMergeModal = lazy(() =>
-	import("@frontend/components/chapter/ChapterMergeModal").then((m) => ({
-		default: m.ChapterMergeModal,
 	})),
 );
 const ContainerConfigModal = lazy(() =>
@@ -72,6 +57,11 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 	const navigate = useNavigate();
 	const { data: chapter } = useChapter(chapterId);
 	const { data: gitStatus } = useChapterGitStatus(chapterId);
+	// Git lives in the dockview surface (right side), not in a collapse below this
+	// bar. Null when this bar is rendered outside any dock surface (e.g. the mobile
+	// page or a ruler card) — then the git affordances are simply inert labels.
+	const dock = useNarratorDockContext();
+	const openGitPanel = dock ? () => dock.openToolPanel("git") : undefined;
 	const containerCapability = useChapterContainersCapability();
 	const containerUnsupportedReason =
 		containerCapability.reason ?? tn("chapterBar.containersUnsupported");
@@ -92,12 +82,9 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 		},
 	});
 
-	const [forkModalOpen, setForkModalOpen] = useState(false);
-	const [mergeModalOpen, setMergeModalOpen] = useState(false);
 	const [containerConfigOpen, setContainerConfigOpen] = useState(false);
 	const [podmanInstallOpen, setPodmanInstallOpen] = useState(false);
 	const [containerPanelOpen, setContainerPanelOpen] = useState(false);
-	const [gitPanelOpen, setGitPanelOpen] = useState(false);
 
 	const handleContainerError = useCallback((err: Error) => {
 		if ((err as ApiError).message?.includes("podman is not installed")) {
@@ -126,23 +113,31 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 					backgroundColor: "light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-7))",
 				}}
 			>
-				{/* Left: chapter info */}
-				<Group gap={6} wrap="nowrap" style={{ flex: 1, minWidth: 0 }}>
-					{roleIcon && <Text size="xs">{roleIcon}</Text>}
-					<Text size="xs" fw={500} truncate>
-						{chapter.title}
-					</Text>
-					<Text size="xs" c="dimmed">
-						·
-					</Text>
-					<Text size="xs" c="dimmed" ff="monospace" truncate>
-						{chapter.branch}
-					</Text>
-					{gitStatus &&
-						(gitStatus.commitsAhead > 0 ||
-							gitStatus.linesAdded > 0 ||
-							gitStatus.linesRemoved > 0) && (
-							<UnstyledButton onClick={() => setGitPanelOpen(!gitPanelOpen)}>
+				{/* Left: chapter info — the whole strip is the Git panel affordance, so it
+				    is one button that stretches to the action icons. Cursor + hover tint
+				    are what tell the reader this text is clickable at all; without them
+				    the click target is invisible. */}
+				<UnstyledButton
+					onClick={openGitPanel}
+					disabled={!openGitPanel}
+					title={openGitPanel ? tn("chapterBar.git") : undefined}
+					className={classes.gitTrigger}
+				>
+					<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+						{roleIcon && <Text size="xs">{roleIcon}</Text>}
+						<Text size="xs" fw={500} truncate>
+							{chapter.title}
+						</Text>
+						<Text size="xs" c="dimmed">
+							·
+						</Text>
+						<Text size="xs" c="dimmed" ff="monospace" truncate>
+							{chapter.branch}
+						</Text>
+						{gitStatus &&
+							(gitStatus.commitsAhead > 0 ||
+								gitStatus.linesAdded > 0 ||
+								gitStatus.linesRemoved > 0) && (
 								<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
 									{gitStatus.commitsAhead > 0 && (
 										<Tooltip
@@ -179,62 +174,21 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 										</Tooltip>
 									)}
 								</Group>
-							</UnstyledButton>
+							)}
+						{chapter.status !== "active" && (
+							<Badge
+								size="xs"
+								variant="light"
+								color={statusRegistry.chapterStatus(chapter.status).color}
+							>
+								{tc(statusRegistry.chapterStatus(chapter.status).i18nKey)}
+							</Badge>
 						)}
-					{chapter.status !== "active" && (
-						<Badge
-							size="xs"
-							variant="light"
-							color={statusRegistry.chapterStatus(chapter.status).color}
-						>
-							{tc(statusRegistry.chapterStatus(chapter.status).i18nKey)}
-						</Badge>
-					)}
-				</Group>
+					</Group>
+				</UnstyledButton>
 
 				{/* Right: action menus */}
 				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-					{/* Git panel toggle */}
-					{chapter.status === "active" && (
-						<Tooltip label={tn("chapterBar.git")}>
-							<ActionIcon
-								variant={gitPanelOpen ? "light" : "subtle"}
-								color={gitPanelOpen ? "indigo" : "gray"}
-								size="sm"
-								onClick={() => setGitPanelOpen(!gitPanelOpen)}
-							>
-								<IconSourceCode size={15} />
-							</ActionIcon>
-						</Tooltip>
-					)}
-
-					{/* Git menu */}
-					<Menu position="top-end" withinPortal>
-						<Menu.Target>
-							<Tooltip label={tn("chapterBar.git")}>
-								<ActionIcon variant="subtle" color="gray" size="sm">
-									<IconGitFork size={15} />
-								</ActionIcon>
-							</Tooltip>
-						</Menu.Target>
-						<Menu.Dropdown>
-							<Menu.Label>{tn("chapterBar.git")}</Menu.Label>
-							<Menu.Item
-								leftSection={<IconGitFork size={14} />}
-								onClick={() => setForkModalOpen(true)}
-							>
-								{t("fork")}
-							</Menu.Item>
-							<Menu.Divider />
-							<Menu.Item
-								leftSection={<IconGitMerge size={14} />}
-								onClick={() => setMergeModalOpen(true)}
-							>
-								{t("merge")}
-							</Menu.Item>
-						</Menu.Dropdown>
-					</Menu>
-
 					{/* Container toggle + menu */}
 					<Tooltip
 						label={
@@ -332,40 +286,7 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 				</div>
 			</Collapse>
 
-			{/* Git panel collapse */}
-			<LazyCollapse in={gitPanelOpen}>
-				<div
-					style={{
-						borderBottom: "1px solid var(--mantine-color-default-border)",
-					}}
-				>
-					<Suspense fallback={null}>
-						<GitPanel chapterId={chapterId} />
-					</Suspense>
-				</div>
-			</LazyCollapse>
-
 			{/* Modals */}
-			{forkModalOpen && (
-				<Suspense fallback={null}>
-					<ChapterForkModal
-						chapterId={chapterId}
-						chapterStatus={chapter.status}
-						opened={forkModalOpen}
-						onClose={() => setForkModalOpen(false)}
-					/>
-				</Suspense>
-			)}
-			{mergeModalOpen && (
-				<Suspense fallback={null}>
-					<ChapterMergeModal
-						chapterId={chapterId}
-						projectId={chapter.projectId}
-						opened={mergeModalOpen}
-						onClose={() => setMergeModalOpen(false)}
-					/>
-				</Suspense>
-			)}
 			{containerCapability.supported && containerConfigOpen && (
 				<Suspense fallback={null}>
 					<ContainerConfigModal

@@ -23,13 +23,14 @@ import {
 	IconGitBranch,
 	IconInfoCircle,
 	IconLock,
+	IconPaperclip,
 	IconPhoto,
 	IconRefresh,
 	IconShare,
 	IconTrash,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useDatabaseCapability,
@@ -106,6 +107,7 @@ function isApiRequestSample(
 const CATEGORY_ICONS: Record<string, React.ReactNode> = {
 	database: <IconDatabase size={18} />,
 	uploads: <IconPhoto size={18} />,
+	chatAttachments: <IconPaperclip size={18} />,
 	shares: <IconShare size={18} />,
 	worktrees: <IconGitBranch size={18} />,
 	treeSnapshots: <IconCamera size={18} />,
@@ -116,6 +118,7 @@ const CATEGORY_ICONS: Record<string, React.ReactNode> = {
 const CATEGORY_COLORS: Record<string, string> = {
 	database: "blue",
 	uploads: "grape",
+	chatAttachments: "pink",
 	shares: "teal",
 	worktrees: "orange",
 	treeSnapshots: "violet",
@@ -130,6 +133,7 @@ const CATEGORY_COLORS: Record<string, string> = {
 const DISPLAYED_CATEGORY_KEYS = [
 	"database",
 	"uploads",
+	"chatAttachments",
 	"shares",
 	"worktrees",
 	"treeSnapshots",
@@ -164,12 +168,17 @@ const DATABASE_TARGET_DAY_OPTIONS: Record<
 
 interface CleanupTarget {
 	key: string;
-	target: "uploads" | "shares" | "worktrees" | "containers";
+	target: "uploads" | "chatAttachments" | "shares" | "worktrees" | "containers";
 	labelKey: string;
 }
 
 const CLEANUP_TARGETS: CleanupTarget[] = [
 	{ key: "uploads", target: "uploads", labelKey: "storageCleanupUploads" },
+	{
+		key: "chatAttachments",
+		target: "chatAttachments",
+		labelKey: "storageCleanupChatAttachments",
+	},
 	{ key: "shares", target: "shares", labelKey: "storageCleanupShares" },
 	{ key: "worktrees", target: "worktrees", labelKey: "storageCleanupWorktrees" },
 	{ key: "containers", target: "containers", labelKey: "storageCleanupContainers" },
@@ -216,30 +225,23 @@ export function StorageSection() {
 	const databasePreviewDisabledReason =
 		storageHealthDisabledReason ?? t("storageDatabasePreviewUnsupported");
 	const rawCleanupOperationCapabilities = useStorageCleanupOperationCapabilities();
-	const cleanupOperationCapabilities = storageHealthReady
-		? rawCleanupOperationCapabilities
-		: {
-				uploads: {
-					...rawCleanupOperationCapabilities.uploads,
-					supported: false,
-					reason: storageHealthDisabledReason,
-				},
-				shares: {
-					...rawCleanupOperationCapabilities.shares,
-					supported: false,
-					reason: storageHealthDisabledReason,
-				},
-				worktrees: {
-					...rawCleanupOperationCapabilities.worktrees,
-					supported: false,
-					reason: storageHealthDisabledReason,
-				},
-				containers: {
-					...rawCleanupOperationCapabilities.containers,
-					supported: false,
-					reason: storageHealthDisabledReason,
-				},
-			};
+	// Derived from the capability map rather than hand-enumerated. The previous
+	// literal listed each target explicitly, which means a newly added target keeps
+	// `supported: true` while health is still loading — i.e. its cleanup button is
+	// live before the backend has confirmed anything, and nothing fails to compile to
+	// say so.
+	const cleanupOperationCapabilities = useMemo(
+		() =>
+			storageHealthReady
+				? rawCleanupOperationCapabilities
+				: (Object.fromEntries(
+						Object.entries(rawCleanupOperationCapabilities).map(([key, capability]) => [
+							key,
+							{ ...capability, supported: false, reason: storageHealthDisabledReason },
+						]),
+					) as typeof rawCleanupOperationCapabilities),
+		[rawCleanupOperationCapabilities, storageHealthDisabledReason, storageHealthReady],
+	);
 	const rawDatabaseCleanupCapabilities = useStorageDatabaseCleanupCapabilities();
 	const databaseCleanupCapabilities = storageHealthReady
 		? rawDatabaseCleanupCapabilities
@@ -611,6 +613,8 @@ export function StorageSection() {
 					size: formatBytes(avatarBytes),
 				})}`;
 			}
+			case "chatAttachments":
+				return t("storageChatAttachmentRoomCount", { count: Number(d.roomDirs ?? 0) });
 			case "shares":
 				return t("storageShareCount", { count: Number(d.shareCount ?? 0) });
 			case "worktrees":

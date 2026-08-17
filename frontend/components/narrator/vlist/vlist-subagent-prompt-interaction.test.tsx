@@ -181,7 +181,7 @@ describe("promptOpen is its own interaction channel", () => {
 
 	it("survives an LOD change like every other content preference", () => {
 		const opened = toggleVListPromptOpen(createVListInteractionState(5), "tool-tu-agent");
-		const afterZoom = resetVListInteractionStateForLod(opened, 6);
+		const afterZoom = resetVListInteractionStateForLod(opened, 5);
 		// Re-folding a prompt the reader deliberately opened (and, for a truncated
 		// one, already paid a fetch for) on every zoom step would be a regression.
 		expect(isPromptOpenRow(afterZoom, "tool-tu-agent")).toBe(true);

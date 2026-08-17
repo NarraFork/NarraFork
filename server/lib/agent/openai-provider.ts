@@ -1,8 +1,10 @@
 import { readFileSync } from "node:fs";
+import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import { mapGenericReasoningEffort } from "@shared/reasoning-effort-support";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
+import { modelCardEffortLevels } from "../model-cards";
 import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
@@ -227,10 +229,17 @@ export function normalizeCodexReasoningEffort(
 	reasoningEffort: string | undefined,
 ): string | undefined {
 	if (!reasoningEffort) return undefined;
-	// "none" disables reasoning entirely and bypasses the tier table.
+	// "none" disables reasoning entirely and bypasses the tier table. Checked
+	// before any lookup, which is also why a card's tiers never include "none":
+	// as a clamp target it could turn a requested "low" into reasoning off.
 	if (reasoningEffort === "none") return "none";
 	const bareModel = parseModelId(model).model;
-	const supported = CODEX_MODEL_REASONING_LEVELS[bareModel] ?? DEFAULT_CODEX_REASONING_LEVELS;
+	// Model cards first — they are what the hardcoded table became, and a user can
+	// correct a model's tiers there without waiting for a release.
+	const supported =
+		modelCardEffortLevels(bareModel, settings.agent.modelCards ?? []) ??
+		CODEX_MODEL_REASONING_LEVELS[bareModel] ??
+		DEFAULT_CODEX_REASONING_LEVELS;
 	return clampReasoningEffort(reasoningEffort as ReasoningEffort, supported);
 }
 
@@ -543,11 +552,41 @@ export class OpenAIProvider implements ProviderAdapter {
 	/** Whether to use Responses WebSocket for codex mode (experimental). */
 	private useWebSocket: boolean;
 
+	/**
+	 * The model the current chat() run targets. Remembered so the synchronous
+	 * pushAssistantTurn — which has no model parameter — can classify reasoning
+	 * blocks the same way (strict credential handling vs plain-text relay).
+	 */
+	private activeModel?: string;
+
+	/** Reasoning-source identity override (NUG injects its channel identity). */
+	private reasoningSourceOverride?: string;
+
 	constructor(config: OpenAIProviderConfig, proxy?: string) {
 		this.config = config;
 		this.apiMode = resolveApiMode(config);
 		this.proxy = proxy;
 		this.useWebSocket = !!(config.codexWebSocket && this.apiMode === "codex");
+		this.activeModel = config.defaultModel;
+	}
+
+	/** Remember the model a chat() run targets (see {@link activeModel}). */
+	noteActiveModel(model: string): void {
+		this.activeModel = model;
+	}
+
+	/**
+	 * The upstream identity reasoning credentials should be attributed to. A
+	 * direct provider is its own prefix; a NUG delegate overrides it with the
+	 * NUG channel identity so encrypted content minted by one channel is never
+	 * replayed to another.
+	 */
+	getActiveReasoningSource(): string | undefined {
+		return this.reasoningSourceOverride ?? this.config.prefix;
+	}
+
+	setReasoningSourceOverride(source: string | undefined): void {
+		this.reasoningSourceOverride = source;
 	}
 
 	/** Convenience: does the current mode use Responses API message format? */
@@ -608,17 +647,26 @@ export class OpenAIProvider implements ProviderAdapter {
 		narratorId?: string,
 	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
 		if (this.responsesFormat) {
-			return await buildResponsesHistory(dbMessages, narratorId);
+			return await buildResponsesHistory(dbMessages, narratorId, {
+				strict: hasCredentialBoundReasoning(model),
+				currentSource: this.getActiveReasoningSource(),
+			});
 		}
 		const result = buildOAIHistory(dbMessages);
-		// Chat Completions path: convert _reasoningBlocks to reasoning_content
-		// for models that require reasoning_content to be passed back (e.g. DeepSeek, QwQ).
-		const isDeepSeek = isDeepSeekModel(model);
+		// Chat Completions path: reasoning replay policy is inverted from a
+		// DeepSeek exemption to a credential-strictness split:
+		//   - Non-strict relay models (GLM, Kimi, MiniMax, QwQ, DeepSeek…) treat
+		//     reasoning as plain text: merge `_reasoningBlocks` back into
+		//     `reasoning_content` so the model sees its own prior thoughts.
+		//   - Credential-strict models (Claude-family ids, official OpenAI ids)
+		//     never send `reasoning_content`: the official API rejects the field,
+		//     and without valid encrypted credentials the reasoning is dropped.
+		const strict = hasCredentialBoundReasoning(model);
 		for (const msg of result.history) {
 			// biome-ignore lint/suspicious/noExplicitAny: OAIMessage has _reasoningBlocks
 			const m = msg as any;
 			if (m._reasoningBlocks) {
-				if (!m.reasoning_content) {
+				if (!strict && !m.reasoning_content) {
 					const reasoningText = m._reasoningBlocks
 						.map((b: { text: string }) => b.text)
 						.join("\n\n");
@@ -631,11 +679,11 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (m._reasoningTextFallback !== undefined) {
 				delete m._reasoningTextFallback;
 			}
-			// DeepSeek thinking mode requires reasoning_content on ALL assistant
+			// Relay thinking models require reasoning_content on ALL assistant
 			// messages (not just those with tool_calls). When switching from a
 			// non-thinking model, historical messages lack this field — patch
 			// with empty string so the API doesn't reject the request.
-			if (isDeepSeek && m.role === "assistant" && m.reasoning_content == null) {
+			if (!strict && m.role === "assistant" && m.reasoning_content == null) {
 				m.reasoning_content = "";
 			}
 		}
@@ -709,6 +757,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		// ── Build request body & endpoint based on apiMode ──
 		const model = parseModelId(params.model).model;
+		this.noteActiveModel(model);
 		let endpoint: string;
 		let body: Record<string, unknown>;
 
@@ -742,7 +791,10 @@ export class OpenAIProvider implements ProviderAdapter {
 				if (Array.isArray(msg.content)) return msg.content.length > 0;
 				return false;
 			});
-			const responsesInput = convertHistoryToResponsesApi(sanitizedInputMessages);
+			const responsesInput = convertHistoryToResponsesApi(sanitizedInputMessages, {
+				strict: hasCredentialBoundReasoning(model),
+				currentSource: this.getActiveReasoningSource(),
+			});
 
 			// Codex CLI sets store based on endpoint: false for standard OpenAI/ChatGPT
 			// endpoints, true only for Azure OpenAI. Since we use the ChatGPT backend
@@ -858,7 +910,9 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		if (usesResponsesEndpoint(this.apiMode)) {
 			// Responses API & Codex both use the native Responses SSE format
-			yield* _parseResponsesAPIStream(response.body);
+			for await (const evt of _parseResponsesAPIStream(response.body)) {
+				yield stampReasoningSource(evt, this.getActiveReasoningSource());
+			}
 		} else {
 			yield* this.parseSSEStreamWithDetection(response.body);
 		}
@@ -868,6 +922,16 @@ export class OpenAIProvider implements ProviderAdapter {
 			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;
 			params.requestDump?.setResponseBodyTextWithLimit(bodyText, maxSize);
 		}
+	}
+
+	/**
+	 * Whether the model a chat() run targets (falling back to the configured
+	 * default) treats reasoning as credential-bound. Drives the retention
+	 * split: strict models drop uncredentialed reasoning, relay models echo
+	 * the plain text back.
+	 */
+	private isCredentialStrict(): boolean {
+		return hasCredentialBoundReasoning(this.activeModel ?? this.config.defaultModel ?? "");
 	}
 
 	/**
@@ -956,6 +1020,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				messageId,
 				imageGenerations,
 				textOutputIndex,
+				this.isCredentialStrict(),
 			);
 			for (const item of items) {
 				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
@@ -974,8 +1039,10 @@ export class OpenAIProvider implements ProviderAdapter {
 					function: { name: tu.name, arguments: JSON.stringify(tu.input) },
 				}));
 			}
-			// Pass reasoning_content back for models that require it (e.g. DeepSeek, QwQ)
-			if (reasoningBlocks?.length) {
+			// Pass reasoning_content back for relay models that replay reasoning as
+			// plain text (DeepSeek, QwQ, GLM, Kimi…). Credential-strict models must
+			// not receive the field at all — the official API rejects it.
+			if (!this.isCredentialStrict() && reasoningBlocks?.length) {
 				const reasoningText = reasoningBlocks.map((b) => b.text).join("\n\n");
 				if (reasoningText) {
 					msg.reasoning_content = reasoningText;
@@ -1362,7 +1429,7 @@ export class OpenAIProvider implements ProviderAdapter {
 						body,
 					}),
 			})) {
-				yield event;
+				yield stampReasoningSource(event, this.getActiveReasoningSource());
 			}
 		} catch (err) {
 			if (params.signal.aborted) throw err;
@@ -1438,7 +1505,10 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		const request: CodexResponsesRequestBody = {
 			model,
-			input: convertHistoryToResponsesApi(sanitizedInputMessages),
+			input: convertHistoryToResponsesApi(sanitizedInputMessages, {
+				strict: hasCredentialBoundReasoning(model),
+				currentSource: this.getActiveReasoningSource(),
+			}),
 			stream: true,
 			store: false,
 		};
@@ -1574,6 +1644,26 @@ function isParsableJson(s: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * Tag a reasoning event that carries OpenAI-shaped metadata (item id +
+ * encrypted_content) with the upstream identity that minted it, so later
+ * replay can verify ownership before echoing the credential back (see
+ * `signatureSourcesCompatible`). Applied at chat() yield boundaries —
+ * `parseResponsesAPIEvent` stays a pure function, keeping its exported tests
+ * independent of provider state. Exported for CodexProvider, whose WebSocket
+ * path parses the same events without going through OpenAIProvider.chat().
+ */
+export function stampReasoningSource(
+	evt: ParsedStreamEvent,
+	source: string | undefined,
+): ParsedStreamEvent {
+	const meta = evt.reasoningMetadata;
+	if (meta?.openai && source) {
+		meta.signatureSource = source;
+	}
+	return evt;
 }
 
 // === Responses API SSE stream parser ===
@@ -2983,6 +3073,7 @@ function buildResponsesPreludeItems(
 	text?: string,
 	messageId?: string,
 	textOutputIndex?: number,
+	strict = true,
 ): { items: OAIMessage[] } {
 	const entries: Array<{ item: OAIMessage; outputIndex?: number; sourceIndex: number }> = [];
 	const fallbackParts: string[] = [];
@@ -2990,7 +3081,10 @@ function buildResponsesPreludeItems(
 	for (const block of reasoningBlocks ?? []) {
 		const text = block.text?.trim() ?? "";
 		const metadata = block.providerMetadata?.openai;
-		if (metadata?.reasoningEncryptedContent) {
+		if (strict && metadata?.reasoningEncryptedContent) {
+			// Credential-strict model: replay the reasoning item verbatim. These
+			// blocks come from the current in-memory turn, so the credential was
+			// minted by this same upstream — no source check is needed.
 			entries.push({
 				item: {
 					type: "reasoning",
@@ -3001,9 +3095,13 @@ function buildResponsesPreludeItems(
 				outputIndex: block.outputIndex,
 				sourceIndex: sourceIndex++,
 			});
-		} else if (text) {
+		} else if (!strict && text) {
+			// Relay model: encrypted_content is meaningless payload for a
+			// non-OpenAI upstream — degrade every block to plain text.
 			fallbackParts.push(text);
 		}
+		// Strict + no credential: dropped entirely (the official API rejects
+		// unsigned reasoning replay).
 	}
 	for (const block of webSearchBlocks ?? []) {
 		// Use the stored action if available; fall back to building a search action from query/queries.
@@ -3077,6 +3175,7 @@ function buildResponsesAssistantTurnItems(
 	messageId?: string,
 	imageGenerations?: ResponsesImageGenerationBlock[],
 	textOutputIndex?: number,
+	strict = true,
 ): OAIMessage[] {
 	const items: OAIMessage[] = [];
 	const prelude = buildResponsesPreludeItems(
@@ -3086,6 +3185,7 @@ function buildResponsesAssistantTurnItems(
 		text,
 		messageId,
 		textOutputIndex,
+		strict,
 	);
 	items.push(...prelude.items);
 	for (const tu of toolUses) {
@@ -3109,7 +3209,25 @@ function buildResponsesAssistantMessageItem(text: string, messageId?: string): O
 	} as unknown as OAIMessage;
 }
 
-function buildResponsesAssistantItemsFromStoredContent(msg: DbMessage): OAIMessage[] {
+/**
+ * Reasoning replay policy for Responses-format history construction.
+ *
+ * `strict` — the target model is credential-bound (Claude family / official
+ * OpenAI ids): reasoning items replay only when their `encrypted_content`
+ * carries a source identity matching `currentSource` (`signatureSourcesCompatible`);
+ * everything else is dropped. `strict: false` — relay models never send
+ * `encrypted_content` (meaningless payload for a non-OpenAI upstream) and
+ * degrade reasoning text into assistant messages instead.
+ */
+interface ReasoningReplayOptions {
+	strict: boolean;
+	currentSource?: string;
+}
+
+function buildResponsesAssistantItemsFromStoredContent(
+	msg: DbMessage,
+	options: ReasoningReplayOptions,
+): OAIMessage[] {
 	type StoredAssistantBlock =
 		| { type: "text"; text?: string; outputIndex?: number }
 		| {
@@ -3172,14 +3290,36 @@ function buildResponsesAssistantItemsFromStoredContent(msg: DbMessage): OAIMessa
 			const reasoningBlock = block as Extract<StoredAssistantBlock, { type: "reasoning" }>;
 			const text = typeof reasoningBlock.text === "string" ? reasoningBlock.text.trim() : "";
 			const metadata = reasoningBlock.providerMetadata?.openai;
-			if (metadata?.reasoningEncryptedContent) {
-				items.push({
-					type: "reasoning",
-					id: metadata.itemId,
-					summary: text ? [{ type: "summary_text", text }] : [],
-					encrypted_content: metadata.reasoningEncryptedContent,
-				} as unknown as OAIMessage);
+			if (options.strict) {
+				// Credential-bound model: replay the encrypted item only when we can
+				// prove the credential was minted by the upstream handling this
+				// request. Anything else is dropped — the official API rejects
+				// unsigned/foreign reasoning replay, and the block would wedge the
+				// conversation if echoed with a blanked credential.
+				if (
+					metadata?.reasoningEncryptedContent &&
+					signatureSourcesCompatible(
+						reasoningBlock.providerMetadata?.signatureSource,
+						options.currentSource,
+					)
+				) {
+					items.push({
+						type: "reasoning",
+						id: metadata.itemId,
+						summary: text ? [{ type: "summary_text", text }] : [],
+						encrypted_content: metadata.reasoningEncryptedContent,
+					} as unknown as OAIMessage);
+				} else {
+					logger.debug("Dropping unreplayable reasoning item (strict model)", {
+						itemId: metadata?.itemId,
+						hasEncrypted: !!metadata?.reasoningEncryptedContent,
+						hasSource: !!reasoningBlock.providerMetadata?.signatureSource,
+					});
+				}
 			} else if (text) {
+				// Relay model: the reasoning is plain text; encrypted_content is dead
+				// weight for a non-OpenAI upstream — degrade it to an assistant
+				// message so the model still sees its own prior thoughts.
 				const item = buildResponsesAssistantMessageItem(text, messageIdAvailable);
 				if (item) {
 					items.push(item);
@@ -3296,6 +3436,7 @@ function compareOptionalOutputIndex(
 async function buildResponsesHistory(
 	dbMessages: DbMessage[],
 	narratorId?: string,
+	options: ReasoningReplayOptions = { strict: true },
 ): Promise<{
 	history: OAIMessage[];
 	trailingToolResults: ResponsesFunctionCallOutputMessage[];
@@ -3318,7 +3459,7 @@ async function buildResponsesHistory(
 			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
 
-			const assistantItems = buildResponsesAssistantItemsFromStoredContent(msg);
+			const assistantItems = buildResponsesAssistantItemsFromStoredContent(msg, options);
 			if (assistantItems.length === 0) {
 				continue;
 			}
@@ -3530,6 +3671,31 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 }
 
 /**
+ * Plain-text degradation of an OAI assistant message's reasoning blocks, for
+ * relay (non credential-strict) models on the Responses path. Unlike
+ * {@link buildReasoningTextFallback} this includes blocks that DO carry
+ * `encrypted_content`: the credential is meaningless to a non-OpenAI upstream,
+ * so the text is all we keep.
+ */
+function relayReasoningText(
+	m:
+		| {
+				_reasoningBlocks?: Array<{
+					text: string;
+					providerMetadata?: import("./types").ReasoningProviderMetadata;
+				}>;
+		  }
+		| null
+		| undefined,
+): string {
+	if (!m?._reasoningBlocks?.length) return "";
+	return m._reasoningBlocks
+		.map((rb) => rb.text?.trim() ?? "")
+		.filter((text) => text.length > 0)
+		.join("\n");
+}
+
+/**
  * Build a plain-text reasoning fallback for blocks that cannot be replayed as
  * Responses API reasoning items (for example because encrypted_content is absent).
  */
@@ -3570,8 +3736,42 @@ function buildReasoningTextFallback(
  *   - { role: "system" }  → { role: "developer" }
  *   - { role: "tool" }    → { type: "function_call_output", call_id, output }
  *   - { role: "assistant", tool_calls } → separate { type: "function_call" } items + text
+ *
+ * `options` carries the reasoning replay policy (see {@link ReasoningReplayOptions}).
+ * Strict models replay only source-matching `encrypted_content` items and drop the
+ * rest; relay models never send `encrypted_content` and fold the reasoning text
+ * into the assistant message instead.
  */
-export function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
+export function convertHistoryToResponsesApi(
+	messages: OAIMessage[],
+	options: ReasoningReplayOptions = { strict: true },
+): OAIMessage[] {
+	/** Replay reasoning items whose encrypted_content was minted by the current upstream. */
+	const pushStrictReasoningItems = (m: {
+		_reasoningBlocks?: Array<{
+			text: string;
+			providerMetadata?: import("./types").ReasoningProviderMetadata;
+		}>;
+	}) => {
+		if (!m._reasoningBlocks?.length) return;
+		for (const rb of m._reasoningBlocks) {
+			const metadata = rb.providerMetadata?.openai;
+			if (
+				metadata?.reasoningEncryptedContent &&
+				signatureSourcesCompatible(rb.providerMetadata?.signatureSource, options.currentSource)
+			) {
+				result.push({
+					type: "reasoning",
+					id: metadata.itemId,
+					summary: [{ type: "summary_text", text: rb.text }],
+					encrypted_content: metadata.reasoningEncryptedContent,
+				} as unknown as OAIMessage);
+			}
+			// No credential or a foreign one: dropped — echoing it would fail
+			// verification upstream and wedge the conversation.
+		}
+	};
+
 	const result: OAIMessage[] = [];
 	for (const msg of messages) {
 		// biome-ignore lint/suspicious/noExplicitAny: Responses API uses different message shapes
@@ -3608,26 +3808,26 @@ export function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage
 			} as unknown as OAIMessage);
 		} else if (m.role === "assistant" && m.tool_calls?.length) {
 			// Split assistant message with tool_calls into:
-			// 1. reasoning items (if any, with encrypted_content)
+			// 1. strict models: reasoning items carrying a source-matching
+			//    encrypted_content; relay models: the reasoning text degrades to a
+			//    leading assistant message (encrypted_content never crosses to a
+			//    non-OpenAI upstream)
 			// 2. assistant text
 			// 3. separate function_call items
 
-			// 1. Output reasoning items with encrypted_content for continuation
-			if (m._reasoningBlocks?.length) {
-				for (const rb of m._reasoningBlocks) {
-					const metadata = rb.providerMetadata?.openai;
-					if (metadata?.reasoningEncryptedContent) {
-						result.push({
-							type: "reasoning",
-							id: metadata.itemId,
-							summary: [{ type: "summary_text", text: rb.text }],
-							encrypted_content: metadata.reasoningEncryptedContent,
-						} as unknown as OAIMessage);
-					}
+			if (options.strict) {
+				pushStrictReasoningItems(m);
+			} else {
+				const fallback = relayReasoningText(m);
+				if (fallback) {
+					result.push({
+						role: "assistant",
+						content: [{ type: "output_text", text: fallback }],
+					} as unknown as OAIMessage);
 				}
 			}
 
-			// 2. Output assistant text (without reasoning fallback, since we sent reasoning items above)
+			// 2. Output assistant text
 			const content =
 				typeof m.content === "string" ? [{ type: "output_text", text: m.content }] : m.content;
 			if (content) {
@@ -3648,33 +3848,29 @@ export function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage
 			// Skip null/empty content because Responses API rejects role messages
 			// whose content is null.
 
-			// 1. Output reasoning items with encrypted_content for continuation
-			if (m._reasoningBlocks?.length) {
-				for (const rb of m._reasoningBlocks) {
-					const metadata = rb.providerMetadata?.openai;
-					if (metadata?.reasoningEncryptedContent) {
-						result.push({
-							type: "reasoning",
-							id: metadata.itemId,
-							summary: [{ type: "summary_text", text: rb.text }],
-							encrypted_content: metadata.reasoningEncryptedContent,
-						} as unknown as OAIMessage);
-					}
-				}
+			if (options.strict) {
+				pushStrictReasoningItems(m);
 			}
+			// Relay models fold their reasoning text into the assistant message.
+			const fallback = options.strict ? "" : relayReasoningText(m);
 
-			// 2. Output assistant text (without reasoning fallback, since we sent reasoning items above)
 			const content = m.content;
 			if (typeof content === "string") {
-				if (!content) continue;
+				const merged = mergeAssistantText(content, fallback);
+				if (!merged) continue;
 				result.push({
 					role: "assistant",
-					content: [{ type: "output_text", text: content }],
+					content: [{ type: "output_text", text: merged }],
 				} as unknown as OAIMessage);
 				continue;
 			}
 			if (Array.isArray(content) && content.length > 0) {
 				result.push({ role: "assistant", content } as unknown as OAIMessage);
+			} else if (fallback) {
+				result.push({
+					role: "assistant",
+					content: [{ type: "output_text", text: fallback }],
+				} as unknown as OAIMessage);
 			}
 		} else if (
 			m.type === "function_call_output" ||

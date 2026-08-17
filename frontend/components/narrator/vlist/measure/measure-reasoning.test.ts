@@ -30,7 +30,7 @@ describe("resolveReasoningDisplayText / resolveReasoningForm", () => {
 		expect(resolveReasoningForm(data, 2)).toBe("count");
 		expect(resolveReasoningForm(data, 3)).toBe("collapsed");
 		expect(resolveReasoningForm(data, 5)).toBe("collapsed");
-		expect(resolveReasoningForm(data, 6)).toBe("collapsed");
+		expect(resolveReasoningForm(data, 5)).toBe("collapsed");
 		// Explicit expand overrides the LOD-driven collapse.
 		expect(resolveReasoningForm(data, 5, { expanded: true })).toBe("expanded");
 		expect(resolveReasoningForm(data, 1, { expanded: true })).toBe("expanded");

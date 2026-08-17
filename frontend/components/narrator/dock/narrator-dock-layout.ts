@@ -9,6 +9,7 @@
  */
 
 import type { DockviewApi, SerializedDockview } from "dockview-react";
+import { isRestorableLayout, stripIdentityFromLayout } from "../panels/layout-envelope";
 import { dockPanelId, NARRATOR_DOCK_COMPONENT } from "./dock-panel-types";
 
 /** Device class — desktop and mobile keep independent layouts. */
@@ -36,31 +37,6 @@ interface NarratorDockEnvelope {
 
 function storageKey(narratorId: string, device: DockDevice): string {
 	return `${STORAGE_KEY_PREFIX}${narratorId}_${device}`;
-}
-
-/**
- * Remove narrator/chapter identity from every panel's serialized params.
- *
- * Panels derive their identity from the live page context (NarratorDockProvider),
- * NOT from serialized params, so persisting narratorId/chapterId is (a) useless
- * and (b) the source of the "open A, see B" bug: a baked id could resurface on a
- * different narrator's page. We remove only host identity; resource identity
- * such as `subagentNarratorId` remains persisted. Mutates a structuredClone,
- * never the live layout.
- */
-function stripIdentityFromLayout(layout: SerializedDockview): SerializedDockview {
-	const clone = structuredClone(layout) as SerializedDockview;
-	const panels = (clone as { panels?: Record<string, { params?: Record<string, unknown> }> })
-		.panels;
-	if (panels) {
-		for (const panel of Object.values(panels)) {
-			if (panel?.params) {
-				delete panel.params.narratorId;
-				delete panel.params.chapterId;
-			}
-		}
-	}
-	return clone;
 }
 
 /** Persist the current dockview layout to localStorage (best-effort). */
@@ -94,13 +70,6 @@ function isEnvelope(value: unknown): value is NarratorDockEnvelope {
 	if (!value || typeof value !== "object") return false;
 	const v = value as Record<string, unknown>;
 	return !!v.layout && typeof v.layout === "object";
-}
-
-/** A serialized layout looks usable if it has a grid with at least one panel. */
-function isRestorableLayout(layout: SerializedDockview | undefined): boolean {
-	if (!layout || typeof layout !== "object") return false;
-	const panels = layout.panels as Record<string, unknown> | undefined;
-	return !!panels && Object.keys(panels).length > 0;
 }
 
 /** Read a persisted layout, or null when none / invalid. */

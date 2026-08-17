@@ -14,6 +14,9 @@ type Key =
 	| "narrafork_expand_reasoning"
 	| "narrafork_narrator_virtual_list"
 	| "narrafork_narrator_centered_column"
+	// Ruler's deprecation notice has been acknowledged. Not per-project: the fact that
+	// the view is deprecated is global, so being told once is enough.
+	| "narrafork_ruler_deprecation_ack"
 	// TEMPORARY debug surface — see components/narrator/mock/README-REMOVAL.md.
 	| "narrafork_mock_stream";
 

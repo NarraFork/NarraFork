@@ -221,6 +221,37 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 
 未映射的生产者标签回退到通用 system 标签，而不是泄露内部 tag——表里没有的新生产者是命名缺口，不是该给读者看的东西。
 
+### 6.0 点击气泡 header 跳转到它所指的地方
+
+说话人的 header 行本身是可点区域，点击去它这条气泡真正指向的那个东西。
+
+**目标是一个带 tag 的值，不是一堆平铺字段**（`shared/pretext-layout/injection-target.ts`）。第一版只有 `sessionNarratorId` + `sessionMessageId` 两个平铺字段；随后又来了三种目标，平铺形状的问题不只是"字段变多"，而是**它无法表达互斥**——没有任何东西阻止一行同时带叙述者 id 和 spec uri，集成层就会静默地按检查顺序挑一个。一个 tagged union 让互斥变成结构性的，新增一种目标是一个 variant + 一个编译器强制的 `switch` 分支。
+
+| 行 | 目标 | id 来源 |
+|---|---|---|
+| `subagent_message` / `team_message` | `narrator`（+ 消息） | `message.fromId` / `SideCarInboundMessage.fromMessageId` |
+| `bg_agent`（`flavor === "agent"`） | `narrator`（+ 消息） | `task.id`（后台代理的任务 id **就是**其叙述者 id）/ `SideCarDoneTask.resultMessageId` |
+| `knowledge_base_hint` | `knowledge` | `hit.entryId`，scope 恒为 global（注入命中来自全局集合） |
+| `spec_update`（**仅单文件**） | `spec` | `item.uri` |
+| `review_feedback` | `chapter` | `block.reviewChapterId`（producer 早已写入） |
+| `merge_summary` | `chapter` | `block.sourceChapterId`（producer 早已写入） |
+| `bg_bash` / 任务摘要 / 多文件 spec 保存 | — 不可点 | — |
+
+三条刻意的"不给目标"：
+- **`bg_bash`**：`speakerId` 有值（它是 identicon 种子，**每种说话人都有**），但 bash 任务 id 指的是一次 shell 调用。用 identicon 种子导航就会去打开一个不存在的叙述者——这是分开两个字段要防的唯一 bug。
+- **多文件 spec 保存**：没有诚实的单一目的地，静默取第一个会把读者带到这行从未承诺的地方。
+- **任务摘要（`living_work_spec`）**：它是**关于** spec 的，不是某个文件变更的报告。
+
+**知识库命中是唯一"正文本身不完整"的气泡**：excerpt 是条目正文的扁平化切片，所以"读全文"是它的自然下一步——这也是它值得可点的理由，而不只是因为它有个 id。
+
+**消息 id 是纯读者向，绝不进模型向文本。** 服务端在 `getSubagentResultMessageId` 上取：`bg_agent` 取产出结论的那条 assistant 消息；`Send`/`TeamStatus` 因为「发消息」本身不是发送方历史里的一条消息，取的是发送方**刚写完的**那条（"它说这句话时在哪"最接近的真相）。取不到就省略字段（不写 null），此时打开会话停在末尾——`sidecar-body.test.ts` 有断言确保这些 id 不出现在模型向字节里，理由与 alias 化同一条：让模型看见内部 id 会教它把 id 反引回来。
+
+**能力按种类分别 gate**（`InjectionNavigation`）：每个 opener 独立可选，宿主够不到某种目标就让那些行保持惰性，而不是回落到另一种 opener——把 spec 行交给叙述者 opener 会路由到错误的地方。`coerceInjectionTarget` 还会拒收畸形目标（缺 id、未知 kind），因为**缺 id 的目标正是那种"画出一个看起来能点、点了跳到 undefined"的形状**。
+
+**Spec 文件的跳转走一个小注册表**（`frontend/components/narrator/spec-file-reveal.ts`），不是 dock context 也不是冒泡事件：点击时 Spec 面板通常还不存在（打开它正是这次点击的第一个效果），所以 dock context 无法承载第二步；而 dock 面板不是 chat viewport 的 DOM 后代，`spec-open-tasks` 那种冒泡事件到不了它。注册表带**有界**重试（面板挂载需要一两帧），到期安静放弃——真正的失败模式是"这个 surface 没有 Spec 面板"。选择走 `handleSelectFile` 而非裸 `setSelectedUri`，因为未保存编辑的确认对话框在那个 handler 里，绕过它会静默丢弃读者正在打的字。
+
+**跳转请求是请求，不是状态。** `SubagentPanelParams.highlightMessageId` 走 panel **参数**而非 `scrollToMessage` 桥，因为点击时面板通常还不存在、没有注册者可调。它与 `highlightRequestId` 一起被 `stripIdentityFromLayout` 剥掉：恢复布局必须把会话停在读者上次离开的位置，而不是重放上一次访问的跳转。`highlightRequestId` 的存在是因为 `NarratorPanel` 按 (narrator, target) latch 一次跳转（刻意如此，否则会跟读者自己的滚动打架）——没有这个变化的 token，读者滚开后再点同一行会静默无反应。
+
 ### 6.1 12 个来源标签
 
 `silent_progress`、`todo_reminder`（`living_work_spec` 映射到它）、`relaxed_plan`、`knowledge_base_hint`、`bg_agent`、`bg_bash`、`team_message`、`buffered_user`、`subagent_message`、`spec_update`、`behavior_fence`、`pipeline_exit_confirmation`。
@@ -284,7 +315,11 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 | `server/services/__tests__/narrator-injection.test.ts` | 持久化行、`role`、`schedule`、`role × schedule` 正交性、`buildSystemInjectionBlock` |
 | `server/services/__tests__/background-completion-delivery.test.ts` | 忙/空闲两条路径的差异 |
 | `server/lib/__tests__/injection-cadence.test.ts` | cadence 的 tick 消费语义、interval 归一化 |
-| `frontend/components/narrator/vlist/system-injection-adapter.test.ts` | 路由（`origin_notice` vs `injection-bubble`）、拆气泡与 key 稳定性、读者向 body、标题标签回退 |
+| `frontend/components/narrator/vlist/system-injection-adapter.test.ts` | 路由（`origin_notice` vs `injection-bubble`）、拆气泡与 key 稳定性、读者向 body、标题标签回退、六种导航目标 + 三种刻意不给（`bg_bash` / 多文件 spec / 任务摘要）、缺 message id 仍可开、高度中性 |
+| `frontend/components/narrator/vlist/vlist-injection-header.test.tsx` | 说话人身份/头像分型，以及可点 header：四种目标各自透传、**每种只用自己的 opener**、**不按 identicon 种子导航**、畸形目标被拒、按种类取 label |
+| `shared/pretext-layout/__tests__/injection-target.test.ts` | `coerceInjectionTarget`：接受合法目标、null/空串 message id 归一、scope 兜底 global、拒收缺 id / 未知 kind / 非对象 |
+| `frontend/components/narrator/spec-file-reveal.test.ts` | 面板已挂载即同步选中、点击后才挂载的等待、可取消、到期放弃、remount 的 last-write-wins 与**陈旧 unregister 不清活跃 selector** |
+| `frontend/components/narrator/dock/narrator-dock-layout.test.ts` | 布局持久化剥掉一次性跳转请求，保留 subagent 资源身份 |
 | `frontend/components/narrator/vlist/measure/measure-injection-bubble.test.ts` | 气泡几何：shrink-wrap 宽度纪律、header/note 固定行、字符硬顶 |
 | `frontend/components/narrator/vlist/render/RenderInjectionBubble.test.tsx` | measure/render parity：画在测量宽度上、header/note 只在预留时画 |
 | `frontend/components/narrator/vlist/render/RenderMessageBubble.side.test.tsx` | 本人/队友分侧，且两侧共用同一份测量几何 |

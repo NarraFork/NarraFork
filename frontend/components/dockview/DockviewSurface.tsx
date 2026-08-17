@@ -24,7 +24,7 @@ import {
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import "./theme.css";
-import { type RefObject, useCallback, useEffect, useRef } from "react";
+import { createContext, type RefObject, useCallback, useContext, useEffect, useRef } from "react";
 import type { PanelDragState } from "../../lib/panel-drag";
 import type { DropZoneThresholds } from "./drop-intent";
 import { swapPanels } from "./panel-swap";
@@ -97,6 +97,31 @@ export interface DockviewSurfaceProps {
 	 * cluster protagonist can never be closed.
 	 */
 	tabComponents?: Record<string, React.FunctionComponent<IDockviewPanelHeaderProps>>;
+	/**
+	 * Stable identity for this surface, stamped onto panel-header drags and matched
+	 * on drop.
+	 *
+	 * Needed wherever more than one surface can be mounted at once (one per
+	 * expanded graph node): panel ids are global (`ndock-terminal`), so a surface
+	 * receiving a foreign panel's drop would otherwise resolve that id against its
+	 * own api and move an unrelated same-kind panel. Omit it for a lone surface to
+	 * keep the previous behaviour.
+	 */
+	surfaceId?: string;
+}
+
+/**
+ * The id of the nearest enclosing DockviewSurface.
+ *
+ * Panel headers sit deep inside dockview's own render tree, so the id cannot be
+ * prop-drilled to them; `usePanelHeaderDrag` reads it from here when starting a
+ * drag.
+ */
+const DockviewSurfaceIdContext = createContext<string | undefined>(undefined);
+
+/** Read the enclosing surface's id, or undefined outside a DockviewSurface. */
+export function useDockviewSurfaceId(): string | undefined {
+	return useContext(DockviewSurfaceIdContext);
 }
 
 export function DockviewSurface({
@@ -111,6 +136,7 @@ export function DockviewSurface({
 	apiRef: externalApiRef,
 	defaultRenderer,
 	tabComponents,
+	surfaceId,
 }: DockviewSurfaceProps) {
 	const internalApiRef = useRef<DockviewApi | null>(null);
 	const apiRef = externalApiRef ?? internalApiRef;
@@ -206,57 +232,60 @@ export function DockviewSurface({
 		rootRef,
 		onDropSubject: onDropSubject ? handleDropSubject : undefined,
 		thresholds,
+		surfaceId,
 	});
 
 	const surfaceClass = [themeless ? "" : DOCKVIEW_THEME_CLASS, className].filter(Boolean).join(" ");
 
 	return (
-		<Box ref={rootRef} style={{ height: "100%", width: "100%", position: "relative" }}>
-			<DockviewReact
-				className={surfaceClass || undefined}
-				// Supply our own theme so dockview stamps OUR class on the internal
-				// shell instead of defaulting to the dark `abyss` theme (which would
-				// shadow our CSS variables from inside the wrapper). Skipped when the
-				// caller opts out of theming.
-				theme={themeless ? undefined : NARRAFORK_DOCKVIEW_THEME}
-				components={components}
-				tabComponents={tabComponents}
-				// dockview-core's vanilla default tab only closes on the close-button
-				// click; dockview-react's DockviewDefaultTab additionally closes on a
-				// middle-click (mouse button 1) and honours `hideClose`. Registering it
-				// as the default gives every ordinary panel middle-click-to-close, while
-				// panels that opt into a custom `tabComponent` (e.g. the close-less chat
-				// protagonist on the single-narrator page) are unaffected.
-				defaultTabComponent={DockviewDefaultTab}
-				onReady={handleReady}
-				onDidDrop={handleDidDrop}
-				onWillDrop={handleWillDrop}
-				defaultRenderer={defaultRenderer}
-			/>
-			{dropIndicator && (
-				<Box
-					style={{
-						position: "absolute",
-						left: dropIndicator.left,
-						top: dropIndicator.top,
-						width: dropIndicator.width,
-						height: dropIndicator.height,
-						backgroundColor:
-							dropIndicator.variant === "swap"
-								? "var(--mantine-color-teal-8)"
-								: "var(--mantine-color-indigo-9)",
-						opacity: dropIndicator.variant === "swap" ? 0.35 : 0.25,
-						border:
-							dropIndicator.variant === "swap"
-								? "2px dashed var(--mantine-color-teal-4)"
-								: undefined,
-						borderRadius: 4,
-						pointerEvents: "none",
-						transition: "all 80ms ease",
-						zIndex: 5,
-					}}
+		<DockviewSurfaceIdContext.Provider value={surfaceId}>
+			<Box ref={rootRef} style={{ height: "100%", width: "100%", position: "relative" }}>
+				<DockviewReact
+					className={surfaceClass || undefined}
+					// Supply our own theme so dockview stamps OUR class on the internal
+					// shell instead of defaulting to the dark `abyss` theme (which would
+					// shadow our CSS variables from inside the wrapper). Skipped when the
+					// caller opts out of theming.
+					theme={themeless ? undefined : NARRAFORK_DOCKVIEW_THEME}
+					components={components}
+					tabComponents={tabComponents}
+					// dockview-core's vanilla default tab only closes on the close-button
+					// click; dockview-react's DockviewDefaultTab additionally closes on a
+					// middle-click (mouse button 1) and honours `hideClose`. Registering it
+					// as the default gives every ordinary panel middle-click-to-close, while
+					// panels that opt into a custom `tabComponent` (e.g. the close-less chat
+					// protagonist on the single-narrator page) are unaffected.
+					defaultTabComponent={DockviewDefaultTab}
+					onReady={handleReady}
+					onDidDrop={handleDidDrop}
+					onWillDrop={handleWillDrop}
+					defaultRenderer={defaultRenderer}
 				/>
-			)}
-		</Box>
+				{dropIndicator && (
+					<Box
+						style={{
+							position: "absolute",
+							left: dropIndicator.left,
+							top: dropIndicator.top,
+							width: dropIndicator.width,
+							height: dropIndicator.height,
+							backgroundColor:
+								dropIndicator.variant === "swap"
+									? "var(--mantine-color-teal-8)"
+									: "var(--mantine-color-indigo-9)",
+							opacity: dropIndicator.variant === "swap" ? 0.35 : 0.25,
+							border:
+								dropIndicator.variant === "swap"
+									? "2px dashed var(--mantine-color-teal-4)"
+									: undefined,
+							borderRadius: 4,
+							pointerEvents: "none",
+							transition: "all 80ms ease",
+							zIndex: 5,
+						}}
+					/>
+				)}
+			</Box>
+		</DockviewSurfaceIdContext.Provider>
 	);
 }

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { TreeMessage } from "../../lib/api";
+import type { ChunkManifestEntry, TreeMessage } from "../../lib/api";
 import {
 	applyChunkUpdaters,
 	chunkRangeVersionMatchesManifest,
@@ -14,6 +14,7 @@ import {
 	getCatchUpStructuralMode,
 	isStructuralInsert,
 	shouldIgnoreParentChildMessage,
+	willDropTopLevelMessage,
 } from "./useNarratorChunksWS";
 
 function displayMessage(type: string, extra: Record<string, unknown> = {}) {
@@ -322,5 +323,44 @@ describe("structural reconcile invariants", () => {
 		timers.tick(10_000);
 		expect(attempts).toBe(4);
 		expect(timers.pending()).toBe(0);
+	});
+});
+
+describe("willDropTopLevelMessage", () => {
+	const manifest: ChunkManifestEntry[] = [
+		{ id: "chunk-1", firstSeq: 1, lastSeq: 20, count: 20 },
+		{ id: "chunk-2", firstSeq: 21, lastSeq: 40, count: 20 },
+	];
+	const loadedWith = (...chunkIds: string[]) =>
+		new Map<string, TreeMessage[]>(chunkIds.map((id) => [id, []]));
+
+	test("empty manifest never drops: 3a seeds a fresh first chunk", () => {
+		expect(willDropTopLevelMessage({ seq: 5 }, new Map(), [])).toBe(false);
+		expect(willDropTopLevelMessage({}, new Map(), [])).toBe(false);
+	});
+
+	test("tail resident: every append branch lands", () => {
+		const loaded = loadedWith("chunk-2");
+		expect(willDropTopLevelMessage({ seq: 41 }, loaded, manifest)).toBe(false);
+		expect(willDropTopLevelMessage({ seq: 30 }, loaded, manifest)).toBe(false);
+		expect(willDropTopLevelMessage({}, loaded, manifest)).toBe(false);
+	});
+
+	test("tail not loaded: a seq beyond the tail drops (3b)", () => {
+		expect(willDropTopLevelMessage({ seq: 41 }, loadedWith("chunk-1"), manifest)).toBe(true);
+		expect(willDropTopLevelMessage({ seq: 41 }, new Map(), manifest)).toBe(true);
+	});
+
+	test("tail not loaded: a missing seq drops (3d tail fallback)", () => {
+		expect(willDropTopLevelMessage({}, loadedWith("chunk-1"), manifest)).toBe(true);
+		expect(willDropTopLevelMessage({ seq: Number.NaN }, loadedWith("chunk-1"), manifest)).toBe(
+			true,
+		);
+	});
+
+	test("tail not loaded: a mid-manifest seq is backfilled by ensureLoaded (3c)", () => {
+		expect(willDropTopLevelMessage({ seq: 10 }, new Map(), manifest)).toBe(false);
+		// seq == tail.lastSeq falls inside the tail chunk's range, not the 3b append path.
+		expect(willDropTopLevelMessage({ seq: 40 }, new Map(), manifest)).toBe(false);
 	});
 });

@@ -49,7 +49,6 @@ describe("resolveVListEditTarget", () => {
 			"ask-in-passing",
 			"web-search",
 			"media",
-			"tool-run-summary",
 			"tool-run-count",
 			"activity-trace",
 			"reasoning-count",

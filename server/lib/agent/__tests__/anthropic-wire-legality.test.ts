@@ -275,10 +275,11 @@ describe("thinking blocks must carry a replayable signature", () => {
 		expect(blocks.some((block) => block.tool_use_id === "toolu_1")).toBe(true);
 	});
 
-	test("DeepSeek keeps its placeholder signature instead of losing the reasoning", async () => {
+	test("DeepSeek keeps its reasoning with an empty signature", async () => {
 		// DeepSeek never mints signatures and requires thinking on assistant turns,
-		// so the drop must not apply there — its own compatibility path fills the
-		// signature in and the real reasoning text is preserved.
+		// so the drop must not apply there — its relay path echoes the text with an
+		// empty signature instead (the placeholder-signature compat value is gone:
+		// strict relays that reject an empty string are a documented tradeoff).
 		const messages = await wireMessages({
 			history: [
 				USER("first"),
@@ -301,7 +302,66 @@ describe("thinking blocks must carry a replayable signature", () => {
 		expect(thinking[0]).toEqual({
 			type: "thinking",
 			thinking: "real reasoning",
-			signature: "narrafork-deepseek-compat",
+			signature: "",
 		});
+	});
+
+	test("relay models keep unsigned thinking across upstream switches", async () => {
+		// A GLM-class relay mints no signatures at all, so there is no ownership to
+		// prove: the reasoning text crosses providers and is echoed back verbatim.
+		const messages = await wireMessages({
+			history: [
+				USER("first"),
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "glm reasoning", signature: "" },
+						{ type: "text", text: "answer" },
+					],
+				},
+				USER("second"),
+			],
+			model: "GLM-5.1",
+			officialApi: false,
+		});
+
+		const thinking = messages
+			.flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+			.filter((block) => block.type === "thinking");
+		expect(thinking[0]).toEqual({
+			type: "thinking",
+			thinking: "glm reasoning",
+			signature: "",
+		});
+		expect(JSON.stringify(messages)).toContain("answer");
+	});
+
+	test("relay models drop redacted_thinking and patch missing thinking blocks", async () => {
+		const messages = await wireMessages({
+			history: [
+				USER("first"),
+				{
+					role: "assistant",
+					content: [
+						{ type: "redacted_thinking", data: "b3BhcXVl" },
+						{ type: "text", text: "opaque answer" },
+					],
+				},
+				// A thinking-less assistant turn: relay gateways in thinking mode
+				// require one, so the sanitizer patches a single-space placeholder.
+				{ role: "assistant", content: [{ type: "text", text: "plain answer" }] },
+				USER("second"),
+			],
+			model: "kimi-k2.6",
+			officialApi: false,
+		});
+
+		const blocks = messages.flatMap((message) =>
+			Array.isArray(message.content) ? message.content : [],
+		);
+		expect(blocks.some((block) => block.type === "redacted_thinking")).toBe(false);
+		expect(JSON.stringify(messages)).toContain("opaque answer");
+		const patched = blocks.find((block) => block.type === "thinking" && block.thinking === " ");
+		expect(patched).toEqual({ type: "thinking", thinking: " ", signature: "" });
 	});
 });

@@ -165,10 +165,40 @@ mock.module("@server/services/narrator-subagent", () => ({
 	},
 }));
 
+// --- Selector resolution stub ---
+// TeamStatus prints each member's ALIAS, so `target_id` is very likely an alias.
+// `file_changes`/`send` index by real narrator id, so the tool resolves selectors
+// through the same resolver Send/Await use. Mirror its selector grammar here
+// (exact id, id prefix, title, title slug) so these tests exercise the real
+// alias→id hop rather than a pass-through.
+const realAgentCommunicationModule = {
+	...(await import("@server/services/agent-communication")),
+};
+
+mock.module("@server/services/agent-communication", () => ({
+	...realAgentCommunicationModule,
+	async resolveSubagentTargets({ callerNarratorId, id }: { callerNarratorId: string; id: string }) {
+		const caller = narrators.get(callerNarratorId);
+		const teamParentId = caller?.parentNarratorId ?? callerNarratorId;
+		const slug = (text: string) => text.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+		const matches = [...narrators.values()].filter(
+			(n) =>
+				n.parentNarratorId === teamParentId &&
+				(n.id === id ||
+					n.id.startsWith(id) ||
+					n.title === id ||
+					(n.title ? slug(n.title) === id : false)),
+		);
+		if (matches.length !== 1) throw new Error(`No accessible subagent found for "${id}"`);
+		return matches;
+	},
+}));
+
 afterAll(() => {
 	mock.module("@server/services/background-task-service", () => realBackgroundTaskServiceModule);
 	mock.module("@server/services/narrator-service", () => realNarratorServiceModule);
 	mock.module("@server/services/narrator-subagent", () => realNarratorSubagentModule);
+	mock.module("@server/services/agent-communication", () => realAgentCommunicationModule);
 	mock.restore();
 });
 
@@ -506,7 +536,10 @@ describe("TeamStatus actions", () => {
 		);
 
 		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("sub-1");
+		// Targets are named by their readable label ("Worker" → `worker`), not by the
+		// raw narrator id — that id is what the model would otherwise copy back.
+		expect(result.output).toContain("worker");
+		expect(result.output).not.toContain("sub-1");
 		expect(result.output).not.toContain("foreign");
 		expect(deliveredMessages).toHaveLength(1);
 		expect(deliveredMessages[0]).toMatchObject({
@@ -545,7 +578,8 @@ describe("TeamStatus actions", () => {
 			makeCtx("primary"),
 		);
 		expect(sent.isError).toBeFalsy();
-		expect(sent.output).toContain("sub-1");
+		// Confirmation names the target readably ("Explorer" → `explorer`).
+		expect(sent.output).toContain("explorer");
 		expect(deliveredMessages[0]).toMatchObject({
 			targetId: "sub-1",
 			message: { fromType: "primary", isBroadcast: false },
@@ -557,5 +591,103 @@ describe("TeamStatus actions", () => {
 		);
 		expect(rejected.isError).toBe(true);
 		expect(rejected.output).toContain("not a direct subagent");
+	});
+});
+
+/**
+ * `list`/`list_agents` name each member by ALIAS, so an alias is what a model
+ * naturally passes to `file_changes`/`send`. Both index by real narrator id, so
+ * without selector resolution the tool would reject the exact name it printed —
+ * reporting "no file changes" or "not a direct subagent" for an agent that exists.
+ */
+describe("TeamStatus accepts the aliases it printed", () => {
+	test("file_changes resolves an alias to the tracked narrator id", async () => {
+		seed();
+		narrators.set("primary", {
+			id: "primary",
+			parentNarratorId: null,
+			variant: "primary",
+			status: "working",
+			title: "Main",
+		});
+		narrators.set("UscgG1vLFnxzyKyaUOIfR", {
+			id: "UscgG1vLFnxzyKyaUOIfR",
+			parentNarratorId: "primary",
+			variant: "subagent:general",
+			status: "working",
+			title: "Map The Providers",
+		});
+		// The change map is keyed by the REAL narrator id.
+		teamFileChanges.set(
+			"primary",
+			new Map([["UscgG1vLFnxzyKyaUOIfR", new Set(["src/worker.ts"])]]),
+		);
+
+		const result = await teamStatusTool.execute(
+			{ action: "file_changes", target_id: "map-the-providers" },
+			makeCtx("primary"),
+		);
+
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("src/worker.ts");
+		expect(result.output).not.toContain("No file changes recorded");
+	});
+
+	test("send delivers to the real id when addressed by alias", async () => {
+		seed();
+		deliveredMessages.length = 0;
+		narrators.set("primary", {
+			id: "primary",
+			parentNarratorId: null,
+			variant: "primary",
+			status: "working",
+			title: "Main",
+		});
+		narrators.set("AbcdEfghIjklMnopQrstU", {
+			id: "AbcdEfghIjklMnopQrstU",
+			parentNarratorId: "primary",
+			variant: "subagent:explore",
+			status: "working",
+			title: "Trace Providers",
+		});
+
+		const sent = await teamStatusTool.execute(
+			{ action: "send", target_id: "trace-providers", message: "Narrow the scope." },
+			makeCtx("primary"),
+		);
+
+		expect(sent.isError).toBeFalsy();
+		// Delivery must use the real id — an inbox keyed by alias is drained by nobody.
+		expect(deliveredMessages).toHaveLength(1);
+		expect(deliveredMessages[0].targetId).toBe("AbcdEfghIjklMnopQrstU");
+	});
+
+	test("an untitled member is reachable by the short-id label it was listed under", async () => {
+		seed();
+		deliveredMessages.length = 0;
+		narrators.set("primary", {
+			id: "primary",
+			parentNarratorId: null,
+			variant: "primary",
+			status: "working",
+			title: "Main",
+		});
+		narrators.set("ZyxwVutsRqpoNmlkJihgF", {
+			id: "ZyxwVutsRqpoNmlkJihgF",
+			parentNarratorId: "primary",
+			variant: "subagent:general",
+			status: "working",
+			title: null,
+		});
+
+		// `agentLabelFromNarrator` falls back to the first 8 chars for an untitled
+		// member, which resolves only because prefix matching is supported.
+		const sent = await teamStatusTool.execute(
+			{ action: "send", target_id: "ZyxwVuts", message: "Continue." },
+			makeCtx("primary"),
+		);
+
+		expect(sent.isError).toBeFalsy();
+		expect(deliveredMessages[0]?.targetId).toBe("ZyxwVutsRqpoNmlkJihgF");
 	});
 });

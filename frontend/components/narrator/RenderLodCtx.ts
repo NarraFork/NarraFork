@@ -4,18 +4,23 @@ import { createContext, useContext } from "react";
  * Render detail level for the narrator message list.
  * Higher number = more detail. Internal/design use only — never shown in the UI.
  *
- *  L6 (most detailed): all tool cards expanded, reasoning expanded, full text
- *  L5 (default): only the most recent two assistant run-segments expanded; earlier collapsed to headers
- *  L4: all tool cards collapsed to headers; reasoning as title list
- *  L3: a tool-run folds into a "tool calls ×N" summary block (like the reasoning trace)
+ *  L5 (most detailed): all tool cards expanded, full text
+ *  L4 (default): only the most recent two assistant run-segments expanded; earlier collapsed to headers
+ *  L3: all tool cards collapsed to headers
  *  L2: reasoning and completed tool calls merge into a visible activity trace; full text
  *  L1 (simplest): the merged activity trace starts collapsed; long assistant text is clamped
+ *
+ * Reasoning is level-INDEPENDENT in shape: a structured reasoning run is always a
+ * step trace whose rows expand to that step's markdown on click (at L1/L2 those
+ * rows live inside the merged activity trace, at L3+ in their own trace). There is
+ * no "titles only, body never expands" level — a reader who sees a step title can
+ * always open it.
  */
-export type RenderLod = 1 | 2 | 3 | 4 | 5 | 6;
+export type RenderLod = 1 | 2 | 3 | 4 | 5;
 
 export const MIN_RENDER_LOD: RenderLod = 1;
-export const MAX_RENDER_LOD: RenderLod = 6;
-export const DEFAULT_RENDER_LOD: RenderLod = 5;
+export const MAX_RENDER_LOD: RenderLod = 5;
+export const DEFAULT_RENDER_LOD: RenderLod = 4;
 
 export interface RenderLodValue {
 	lod: RenderLod;
@@ -39,7 +44,7 @@ export function clampRenderLod(value: number): RenderLod {
 	return rounded as RenderLod;
 }
 
-/** Current detail level (1 = simplest, 6 = most detailed). */
+/** Current detail level (1 = simplest, 5 = most detailed). */
 export function useRenderLod(): RenderLod {
 	return useContext(RenderLodCtx).lod;
 }

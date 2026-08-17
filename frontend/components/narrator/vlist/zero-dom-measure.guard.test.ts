@@ -74,6 +74,9 @@ const PURE_PATH_FILES = [
 	"streaming-block-cache.ts",
 	"vlist-reload-policy.ts",
 	"vlist-spec-tasks-pin.ts",
+	// The "which task row is actually live" decision (the spinner gate). Pure sibling
+	// of the pin above: a status glyph must never be chosen by measuring the DOM.
+	"vlist-spec-task-live.ts",
 	// Content-viewer geometry: the body-extraction rules, and the arithmetic that
 	// floats a body's action bar with the viewport. The bar's offset is derived from
 	// rectangles the RENDER layer reads and passes in; doing the reading here would

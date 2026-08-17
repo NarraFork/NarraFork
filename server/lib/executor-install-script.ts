@@ -35,8 +35,6 @@ export interface ExecutorInstallScriptInput {
 	deviceSlug: string;
 	deviceName: string;
 	connectionMode: "reverse" | "direct";
-	/** Directory the executor is allowed to touch (--allow-root). */
-	allowRoot: string;
 	/** Remove the Bash/PTY surfaces (--disable-shell). */
 	disableShell: boolean;
 	/** Published artifact filename, used for the download URL path. */
@@ -102,20 +100,6 @@ function validateSlug(value: string): string {
 	return value;
 }
 
-function validateAllowRoot(platform: ExecutorPlatform, value: string): string {
-	const trimmed = value.trim();
-	assertEmbeddable("Allow-root path", trimmed);
-	if (!trimmed) throw new ValidationError("An allow-root directory is required");
-	const isWindows = getExecutorPlatformInfo(platform).os === "windows";
-	const looksAbsolute = isWindows
-		? /^[A-Za-z]:[\\/]/.test(trimmed) || trimmed.startsWith("\\\\")
-		: trimmed.startsWith("/");
-	if (!looksAbsolute) {
-		throw new ValidationError("The allow-root directory must be an absolute path");
-	}
-	return trimmed;
-}
-
 function validateSha256(value: string): string {
 	if (!/^[0-9a-f]{64}$/.test(value)) {
 		throw new ValidationError("Expected SHA-256 digest is malformed");
@@ -152,7 +136,6 @@ function resolvePaths(input: ExecutorInstallScriptInput): ResolvedInput {
 	const serverBaseUrl = validateUrl("Server URL", input.serverBaseUrl, ["http:", "https:"]);
 	const deviceWsUrl = validateUrl("Device WebSocket URL", input.deviceWsUrl, ["ws:", "wss:"]);
 	const deviceSlug = validateSlug(input.deviceSlug);
-	const allowRoot = validateAllowRoot(input.platform, input.allowRoot);
 	const expectedSha256 = validateSha256(input.expectedSha256);
 	const ticket = validateTicket(input.ticket);
 	const artifactFilename = validateArtifactFilename(input.artifactFilename);
@@ -183,7 +166,6 @@ function resolvePaths(input: ExecutorInstallScriptInput): ResolvedInput {
 		serverBaseUrl,
 		deviceWsUrl,
 		deviceSlug,
-		allowRoot,
 		expectedSha256,
 		ticket,
 		artifactFilename,
@@ -440,13 +422,15 @@ function buildUnixScript(input: ResolvedInput): string {
 		'umask "$UMASK_OLD"',
 		'echo "Key stored at $TOKEN_FILE (mode 600)"',
 		"",
-		// Quoted delimiter: the body is already fully literal, and the allow-root
-		// path is operator input, so no parameter or command substitution may run.
+		// Quoted delimiter: the body is already fully literal, so no parameter or
+		// command substitution may run even as values change.
 		`${sudo}tee "$CONFIG_FILE" >/dev/null <<'CONFEOF'`,
 		"{",
 		`  "serverUrl": ${JSON.stringify(input.deviceWsUrl)},`,
 		`  "deviceRef": ${JSON.stringify(input.deviceSlug)},`,
-		`  "allowRoots": [${JSON.stringify(input.allowRoot)}],`,
+		// Empty = unrestricted. Path rules are configured after install, from the
+		// device page, where the operator can browse the machine's real directories.
+		`  "pathRules": [],`,
 		`  "disableShell": ${input.disableShell ? "true" : "false"}`,
 		"}",
 		"CONFEOF",
@@ -552,7 +536,8 @@ function buildWindowsScript(input: ResolvedInput): string {
 		"$config = [ordered]@{",
 		`  serverUrl = ${q(input.deviceWsUrl)}`,
 		`  deviceRef = ${q(input.deviceSlug)}`,
-		`  allowRoots = @(${q(input.allowRoot)})`,
+		// Empty = unrestricted; configured after install from the device page.
+		"  pathRules = @()",
 		`  disableShell = $${input.disableShell ? "true" : "false"}`,
 		"}",
 		"$config | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $configFile -Encoding utf8",

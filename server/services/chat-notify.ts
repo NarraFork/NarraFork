@@ -20,12 +20,12 @@
  */
 
 import { db } from "@server/db";
-import { chatMessages, users } from "@server/db/schema";
+import { chatMessages } from "@server/db/schema";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { eq } from "drizzle-orm";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
-import { listRoomUnreadForFanout } from "./chat-service";
+import { hydrateMessageForBroadcast, listRoomUnreadForFanout } from "./chat-service";
 
 /** Injectable so tests can assert routing without a live WebSocket server. */
 interface ChatNotifyChannel {
@@ -76,37 +76,18 @@ async function onMessageCreated(
 	});
 	if (!row) return;
 
-	const sender = row.senderUserId
-		? await db.query.users.findFirst({
-				where: eq(users.id, row.senderUserId),
-				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-			})
-		: undefined;
+	// Assembled by chat-service rather than field-by-field here. The frame and the
+	// REST page must carry the same shape, and hand-rolling it in two places is how
+	// a newly added field ends up present on one path and missing on the other —
+	// which shows up only as "it works after a refresh".
+	const message = await hydrateMessageForBroadcast(row);
 
 	const target = await resolveChannel();
 
 	target.broadcastToChatRoom(event.roomId, {
 		type: "chat:message",
 		roomId: event.roomId,
-		message: {
-			id: row.id,
-			roomId: row.roomId,
-			seq: row.seq,
-			kind: row.kind,
-			contentText: row.deletedAt ? "" : row.contentText,
-			replyToMessageId: row.replyToMessageId,
-			editedAt: row.editedAt,
-			deletedAt: row.deletedAt,
-			createdAt: row.createdAt,
-			sender: sender
-				? {
-						id: sender.id,
-						username: sender.username,
-						avatarColor: sender.avatarColor,
-						avatarImageId: sender.avatarImageId,
-					}
-				: null,
-		},
+		message,
 	});
 
 	// Badge refresh for members who do not have the room open. The sender and anyone

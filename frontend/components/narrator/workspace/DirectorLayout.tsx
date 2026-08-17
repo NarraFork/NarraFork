@@ -61,7 +61,11 @@ export interface DirectorLayoutProps {
 	/** Commit the ratio when the drag ends (persisted). */
 	onCommitRatio: (ratio: number) => void;
 	/** Open a child session in the narrator's secondary area and return to grid. */
-	onViewSubagentSession: (hostNarratorId: string, subagentNarratorId: string) => void;
+	onViewSubagentSession: (
+		hostNarratorId: string,
+		subagentNarratorId: string,
+		messageId?: string,
+	) => void;
 	/** Close a panel (only offered on the primary). */
 	onClosePanel: (leafId: string) => void;
 	/** Persist an edited webview config back onto the dockview panel params. */
@@ -118,7 +122,11 @@ function DirectorPanelContent({
 	isPrimary: boolean;
 	onClose?: () => void;
 	onActivate: (leafId: string) => void;
-	onViewSubagentSession: (hostNarratorId: string, subagentNarratorId: string) => void;
+	onViewSubagentSession: (
+		hostNarratorId: string,
+		subagentNarratorId: string,
+		messageId?: string,
+	) => void;
 	onUpdateWebviewConfig: (leafId: string, config: WebviewLeafConfig) => void;
 	onUpdatePluginParams: (leafId: string, params: PluginDockPanelParams) => void;
 	onSetPanelTitle: (leafId: string, title: string) => void;
@@ -179,8 +187,8 @@ function DirectorPanelContent({
 				narratorId={narratorId}
 				compact={compact}
 				onClose={onClose}
-				onViewSubagentSession={(subagentNarratorId) =>
-					onViewSubagentSession(narratorId, subagentNarratorId)
+				onViewSubagentSession={(subagentNarratorId, messageId) =>
+					onViewSubagentSession(narratorId, subagentNarratorId, messageId)
 				}
 				workspacePreview={!isPrimary}
 			/>
@@ -205,7 +213,11 @@ function DirectorLeafHost({
 	isPrimary: boolean;
 	onActivate: (leafId: string) => void;
 	onClose: (leafId: string) => void;
-	onViewSubagentSession: (hostNarratorId: string, subagentNarratorId: string) => void;
+	onViewSubagentSession: (
+		hostNarratorId: string,
+		subagentNarratorId: string,
+		messageId?: string,
+	) => void;
 	onUpdateWebviewConfig: (leafId: string, config: WebviewLeafConfig) => void;
 	onUpdatePluginParams: (leafId: string, params: PluginDockPanelParams) => void;
 	onSetPanelTitle: (leafId: string, title: string) => void;

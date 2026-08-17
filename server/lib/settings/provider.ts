@@ -3,8 +3,10 @@
  * Extracted from the monolithic settings/index.ts.
  */
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
+import type { ModelCard } from "@shared/model-card";
 import { parseModelId } from "@shared/model-id";
 import { getCodexManager } from "../codex-manager";
+import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
 import { resolveNugModelMeta } from "../nug-model-cache";
 import type {
 	AnthropicProviderConfig,
@@ -881,113 +883,45 @@ function resolveMetaModelForLookup(model: string, seen = new Set<string>()): str
 	return resolveMetaModelForLookup(first, seen);
 }
 
-interface ModelContextConfig {
-	contextLength: number;
-	maxCompletionTokens?: number;
+/**
+ * Model-card lookups, wrapped so this module reads the effective card set
+ * (builtin seed data overlaid with the user's edits) with a single memoized
+ * index rather than rebuilding one per call.
+ *
+ * `settingsRevision` keys the memo: it already increments on every save and
+ * reload, which is exactly when the card set can change.
+ */
+function userModelCards(): readonly ModelCard[] {
+	return s().agent.modelCards ?? [];
 }
 
-const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
-	// OpenAI models
-	"gpt-4o": 128_000,
-	"gpt-4o-mini": 128_000,
-	"gpt-4-turbo": 128_000,
-	"gpt-4": 8_192,
-	"gpt-3.5-turbo": 16_385,
-	o1: 200_000,
-	"o1-mini": 128_000,
-	"o3-mini": 200_000,
-	// Codex models
-	"gpt-5.6-sol": { contextLength: 372_000, maxCompletionTokens: 128_000 },
-	"gpt-5.6-terra": { contextLength: 372_000, maxCompletionTokens: 128_000 },
-	"gpt-5.6-luna": { contextLength: 372_000, maxCompletionTokens: 128_000 },
-	"gpt-5-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
-	"gpt-5.1-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.1-codex-max": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.1-codex-mini": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.2-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.2": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.5": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.4": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.4-mini": { contextLength: 400_000, maxCompletionTokens: 128_000 },
-	"gpt-5.3-codex-spark": { contextLength: 128_000, maxCompletionTokens: 128_000 },
-	"gpt-5.3-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	// Common third-party models
-	"deepseek-chat": 64_000,
-	"deepseek-reasoner": 64_000,
-	// Claude models (via OpenAI-compatible gateways)
-	"claude-3-5-sonnet": 200_000,
-	"claude-3-opus": 200_000,
-	"claude-sonnet-4": 200_000,
-	"claude-opus-4": 200_000,
-	// Claude 4.6+ / 5 series and Fable/Mythos — 1M context by default.
-	// Longer patterns win the fuzzy startsWith match, so "claude-opus-4-8"
-	// takes precedence over the 200k "claude-opus-4" entry above.
-	"claude-sonnet-4-6": 1_000_000,
-	"claude-opus-4-6": 1_000_000,
-	"claude-sonnet-4.6": 1_000_000,
-	"claude-opus-4.6": 1_000_000,
-	"claude-sonnet-4-7": 1_000_000,
-	"claude-opus-4-7": 1_000_000,
-	"claude-sonnet-4.7": 1_000_000,
-	"claude-opus-4.7": 1_000_000,
-	"claude-sonnet-4-8": 1_000_000,
-	"claude-opus-4-8": 1_000_000,
-	"claude-sonnet-4.8": 1_000_000,
-	"claude-opus-4.8": 1_000_000,
-	"claude-sonnet-5": 1_000_000,
-	"claude-opus-5": 1_000_000,
-	"claude-fable-5": 1_000_000,
-	"claude-mythos-5": 1_000_000,
-	"claude-mythos-preview": 1_000_000,
-	// Anthropic native API models
-	"claude-sonnet-4-20250514": 200_000,
-	"claude-opus-4-20250514": 200_000,
-	"claude-haiku-4-20250414": 200_000,
-	"claude-3-5-sonnet-20241022": 200_000,
-	"claude-3-5-haiku-20241022": 200_000,
-	"claude-3-opus-20240229": 200_000,
-	// Google Gemini models
-	"gemini-2.5-pro": { contextLength: 1_048_576, maxCompletionTokens: 65_536 },
-	"gemini-2.5-flash": { contextLength: 1_048_576, maxCompletionTokens: 65_536 },
-	"gemini-2.5-flash-lite": { contextLength: 1_048_576, maxCompletionTokens: 65_536 },
-	"gemini-2.0-flash": { contextLength: 1_048_576, maxCompletionTokens: 8_192 },
-	"gemini-2.0-flash-lite": { contextLength: 1_048_576, maxCompletionTokens: 8_192 },
-	"gemini-1.5-pro": 2_097_152,
-	"gemini-1.5-flash": 1_048_576,
-	"gemini-3-pro-preview": { contextLength: 1_048_576, maxCompletionTokens: 65_536 },
-	"gemini-3-flash-preview": { contextLength: 1_048_576, maxCompletionTokens: 65_536 },
-};
-
-function getBuiltinModelContextWindow(model: string): number | null {
-	const bareModel = parseModelId(model).model;
-	const candidateModels = [bareModel];
-	const channelIdx = bareModel.indexOf(":");
-	if (channelIdx > 0 && channelIdx < bareModel.length - 1) {
-		candidateModels.push(bareModel.slice(channelIdx + 1));
-	}
-
-	for (const candidate of candidateModels) {
-		// Check built-in table (exact match)
-		const builtinConfig = BUILTIN_CONTEXT_WINDOWS[candidate];
-		if (builtinConfig !== undefined) {
-			return typeof builtinConfig === "number" ? builtinConfig : builtinConfig.contextLength;
-		}
-	}
-
-	// Fuzzy match
-	const sortedEntries = Object.entries(BUILTIN_CONTEXT_WINDOWS).sort(
-		(a, b) => b[0].length - a[0].length,
+function getModelCardContextWindow(
+	model: string,
+	_provider: string,
+): { contextWindow: number; userSet: boolean } | null {
+	// Two shapes are probed, mirroring what the pre-card lookup did: the bare
+	// model id, and the id with a leading channel segment removed. A
+	// gateway-routed id keeps that segment (`anthropic:GLM-5.1`) after the
+	// provider prefix is stripped, and only the second form matches a card key.
+	const bare = parseModelId(model).model;
+	const cards = userModelCards();
+	const stripped = stripChannelSegment(bare);
+	return (
+		modelCardContextWindow(bare, cards) ??
+		(stripped === bare ? null : modelCardContextWindow(stripped, cards))
 	);
-	for (const candidate of candidateModels) {
-		const normalizedBare = candidate.toLowerCase();
-		for (const [pattern, config] of sortedEntries) {
-			if (normalizedBare.startsWith(pattern)) {
-				return typeof config === "number" ? config : config.contextLength;
-			}
-		}
-	}
+}
 
-	return null;
+/**
+ * Drop a leading channel segment from an id (`anthropic:GLM-5.1` → `GLM-5.1`).
+ *
+ * The pre-card lookup did the same thing by probing the substring after the
+ * first colon, which is how gateway-routed ids ever matched the table.
+ */
+function stripChannelSegment(model: string): string {
+	const idx = model.indexOf(":");
+	if (idx > 0 && idx < model.length - 1) return model.slice(idx + 1);
+	return model;
 }
 
 function getNugModelContextWindow(model: string, provider: string): number | null {
@@ -995,19 +929,30 @@ function getNugModelContextWindow(model: string, provider: string): number | nul
 	if (!config) return null;
 	try {
 		const meta = resolveNugModelMeta(config.id, config.prefix, model);
-		return meta.contextWindow ?? getBuiltinModelContextWindow(meta.bareModel);
+		// The gateway's own number wins; a card is the fallback for a catalog that
+		// reports no window (several channels never do).
+		return (
+			meta.contextWindow ?? getModelCardContextWindow(meta.bareModel, "")?.contextWindow ?? null
+		);
 	} catch {
 		return null;
 	}
 }
 
+/**
+ * Seed windows for a list of models, used to prefill the per-model override
+ * inputs in the provider settings UI.
+ *
+ * Reads card data, which is what the hardcoded builtin table became. The name is
+ * kept because several call sites and the settings API response field use it.
+ */
 export function getBuiltinModelContextWindows(
 	models: string[],
 	provider: string,
 ): Record<string, number> {
 	const result: Record<string, number> = {};
 	for (const model of models) {
-		const contextWindow = getBuiltinModelContextWindow(model);
+		const contextWindow = getModelCardContextWindow(model, "")?.contextWindow;
 		if (contextWindow) {
 			const bareModel = parseModelId(model).model;
 			result[provider ? `${provider}:${bareModel}` : model] = contextWindow;
@@ -1020,16 +965,30 @@ export function getBuiltinModelContextWindows(
  * Where an effective context window came from, in descending priority.
  *
  * - `user`: a per-model override typed in settings (agent.modelContextWindows)
+ * - `card`: a model card field the USER set (an edited or newly created card)
  * - `provider`: the provider's own `defaultContextWindow` field
  * - `catalog`: model metadata reported by a gateway (NUG model catalog)
- * - `builtin`: NarraFork's built-in model table (exact or fuzzy match)
+ * - `builtin`: a model card field seeded by NarraFork and left untouched
  * - `fallback`: nothing matched, the 128k default
  *
  * Callers that apply a capability floor (e.g. Anthropic's 1M official-API
- * window) must skip the floor for `user` / `provider` so an explicitly
+ * window) must skip the floor for `user` / `provider` / `card` so an explicitly
  * configured smaller window is not silently overridden.
+ *
+ * `card` and `builtin` both come from the card layer and differ ONLY in who set
+ * the value — and that difference is load-bearing, not cosmetic. The floor
+ * applies to `builtin`, which is why `claude-sonnet-4-5` (a 200k card row, but a
+ * member of the Sonnet 4 family whose official path sends the 1M beta header)
+ * still reports 1M exactly as it did before cards existed. Reporting `card` for
+ * builtin values would skip the floor and silently drop those models to 200k.
  */
-export type ModelContextWindowSource = "user" | "provider" | "catalog" | "builtin" | "fallback";
+export type ModelContextWindowSource =
+	| "user"
+	| "card"
+	| "provider"
+	| "catalog"
+	| "builtin"
+	| "fallback";
 
 export interface ModelContextWindowResolution {
 	contextWindow: number;
@@ -1074,13 +1033,20 @@ export function resolveModelContextWindow(
 		return { contextWindow: userOverrides[model], source: "user" };
 	}
 
-	// 1. Check NUG model-catalog metadata. NUG model ids often include a
+	// 1. Check model cards the user edited. Ranked above the gateway catalog
+	// because an edited card is a deliberate local decision, while the catalog is
+	// whatever the gateway reported. Untouched builtin cards are consulted later,
+	// at step 4, so they keep losing to the catalog as the old builtin table did.
+	const card = getModelCardContextWindow(model, provider);
+	if (card?.userSet) return { contextWindow: card.contextWindow, source: "card" };
+
+	// 2. Check NUG model-catalog metadata. NUG model ids often include a
 	// channel prefix (e.g. antigravity:claude-opus-4-6-thinking), so the
-	// built-in model table alone would otherwise miss them and fall back to 128k.
+	// card table alone would otherwise miss them and fall back to 128k.
 	const nugContextWindow = getNugModelContextWindow(model, provider);
 	if (nugContextWindow) return { contextWindow: nugContextWindow, source: "catalog" };
 
-	// 2. Check provider configuration
+	// 3. Check provider configuration
 		const oaiConfig = getOpenaiProviderConfig(provider);
 		if (oaiConfig?.defaultContextWindow) {
 			return { contextWindow: oaiConfig.defaultContextWindow, source: "provider" };
@@ -1095,9 +1061,10 @@ export function resolveModelContextWindow(
 		}
 	}
 
-	// 3. Check built-in table and fuzzy matches
-	const builtin = getBuiltinModelContextWindow(model);
-	if (builtin) return { contextWindow: builtin, source: "builtin" };
+	// 4. Fall back to builtin card data (what the hardcoded table used to be).
+	// Reported as `builtin` rather than `card` so the Anthropic 1M floor keeps
+	// applying to it exactly as before.
+	if (card) return { contextWindow: card.contextWindow, source: "builtin" };
 	return { contextWindow: 128_000, source: "fallback" };
 }
 
@@ -1178,21 +1145,12 @@ export function getQueueDuringCompaction(): boolean {
 
 export function getModelMaxCompletionTokens(model: string, _provider: string): number | null {
 	const bareModel = parseModelId(model).model;
-
-	const builtinConfig = BUILTIN_CONTEXT_WINDOWS[bareModel];
-	if (builtinConfig !== undefined) {
-		if (typeof builtinConfig === "object") {
-			return builtinConfig.maxCompletionTokens ?? null;
-		}
-		return null;
-	}
-
-	const normalizedBare = bareModel.toLowerCase();
-	for (const [pattern, config] of Object.entries(BUILTIN_CONTEXT_WINDOWS)) {
-		if (normalizedBare.startsWith(pattern) && typeof config === "object") {
-			return config.maxCompletionTokens ?? null;
-		}
-	}
+	const cards = userModelCards();
+	const stripped = stripChannelSegment(bareModel);
+	const fromCard =
+		modelCardMaxCompletionTokens(bareModel, cards) ??
+		(stripped === bareModel ? null : modelCardMaxCompletionTokens(stripped, cards));
+	if (fromCard != null) return fromCard;
 
 	return null;
 }

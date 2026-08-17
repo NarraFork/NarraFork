@@ -14,6 +14,8 @@ export type PluginViewSurface =
 	| "workspace"
 	| "director"
 	| "focus"
+	/** A chapter node's embedded dock; part of the `focus` family (one narrator). */
+	| "graph"
 	| "settings"
 	| "provider-settings";
 

@@ -13,6 +13,10 @@ import { chapterFork } from "../services/chapter-fork";
 import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
 import { narratorContext } from "../services/narrator-context";
+import {
+	countNarratorMessageRefs,
+	countNarratorMessageRefsBatch,
+} from "../services/narrator-message-count";
 import { narratorService } from "../services/narrator-service";
 
 function assertGitAvailableForMcp(): void {
@@ -189,6 +193,9 @@ function createMcpServer(): McpServer {
 		async ({ chapterId }) => {
 			try {
 				const list = await narratorService.listByChapter(chapterId);
+				// The stored column is an insert-only upper bound; count for real so an
+				// agent reading this tool's output is not told a stale number.
+				const messageCounts = await countNarratorMessageRefsBatch(list.map((n) => n.id));
 				return {
 					content: [
 						{
@@ -199,7 +206,7 @@ function createMcpServer(): McpServer {
 									type: n.type,
 									status: n.status,
 									model: n.model,
-									messageCount: n.messageCount,
+									messageCount: messageCounts.get(n.id) ?? 0,
 								})),
 								null,
 								2,
@@ -226,12 +233,13 @@ function createMcpServer(): McpServer {
 			try {
 				const narrator = await narratorService.getById(narratorId);
 				const summary = await narratorContext.generateContextSummary(narratorId);
+				const messageCount = await countNarratorMessageRefs(narratorId);
 
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Narrator: ${narrator.type} (${narrator.model})\nStatus: ${narrator.status}\nMessages: ${narrator.messageCount}\n\nContext summary:\n${summary}`,
+							text: `Narrator: ${narrator.type} (${narrator.model})\nStatus: ${narrator.status}\nMessages: ${messageCount}\n\nContext summary:\n${summary}`,
 						},
 					],
 				};

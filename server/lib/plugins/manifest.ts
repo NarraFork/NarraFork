@@ -389,9 +389,9 @@ const viewContributionSchema = contributionBaseSchema
 		entry: manifestPathSchema,
 		style: manifestPathSchema.optional(),
 		surfaces: z
-			.array(z.enum(["workspace", "director", "focus", "settings", "provider-settings"]))
+			.array(z.enum(["workspace", "director", "focus", "graph", "settings", "provider-settings"]))
 			.min(1)
-			.max(5),
+			.max(6),
 		scope: z.enum(["workspace", "narrator", "project", "global"]),
 		/**
 		 * Provider this view configures. Required for (and only meaningful on) the

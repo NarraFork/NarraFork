@@ -7,6 +7,7 @@
 import type { IDockviewPanelProps } from "dockview-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type PanelDragSubjectKind, startPanelDrag } from "../../../lib/panel-drag";
+import { useDockviewSurfaceId } from "../../dockview";
 
 /** Width (px) below which a chat panel should use its compact toolbar layout. */
 export const COMPACT_WIDTH_THRESHOLD = 640;
@@ -40,13 +41,32 @@ export function usePanelCompact(): {
  * performs swap / merge / split on drop. `subjectId` is the real narrator id
  * for narrator panels, or a synthetic marker (e.g. `__terminal__`) otherwise so
  * consumers can key off `panelId` for move/swap.
+ *
+ * Every panel this runs in is a real dockview panel, including inside a detached
+ * canvas node (which hosts its own surface). So there is one path: always a
+ * `panelId`-bearing drag, with `surfaceId` naming the surface it began on. A
+ * detached node is dragged by its own grip bar instead, never through a panel
+ * header — otherwise "rearrange this panel" and "move the whole node" would be the
+ * same gesture.
  */
 export function usePanelHeaderDrag(
 	// biome-ignore lint/suspicious/noExplicitAny: header drag is params-agnostic
 	props: IDockviewPanelProps<any>,
 	subjectId: string,
 	subjectKind: PanelDragSubjectKind = "narrator",
+	/**
+	 * The panel's kind + resource identity, forwarded so a consumer can rebuild
+	 * this panel elsewhere (e.g. tear it out onto the story-network canvas) without
+	 * parsing `panelId`'s `ndock-<kind>` shape.
+	 */
+	detach?: { toolKind: string; resourceId?: string },
 ): (e: React.PointerEvent) => void {
+	// Stamped onto the drag so a surface receiving the drop can tell "my own panel
+	// being rearranged" from "a panel belonging to another surface" — panel ids are
+	// global, so without it a foreign id would resolve against the wrong api.
+	const surfaceId = useDockviewSurfaceId();
+	const toolKind = detach?.toolKind;
+	const resourceId = detach?.resourceId;
 	return useCallback(
 		(e: React.PointerEvent) => {
 			startPanelDrag({
@@ -55,10 +75,13 @@ export function usePanelHeaderDrag(
 				title: props.api.title || subjectId,
 				sourceGroupId: props.api.group?.id,
 				subjectKind,
+				...(surfaceId ? { surfaceId } : {}),
+				...(toolKind ? { toolKind } : {}),
+				...(resourceId ? { resourceId } : {}),
 				x: e.clientX,
 				y: e.clientY,
 			});
 		},
-		[props.api, subjectId, subjectKind],
+		[props.api, subjectId, subjectKind, surfaceId, toolKind, resourceId],
 	);
 }

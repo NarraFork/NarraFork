@@ -89,7 +89,7 @@ function bashCard() {
 			},
 		},
 		WIDTH,
-		6,
+		5,
 		{ opened: true },
 	);
 }
@@ -191,7 +191,7 @@ describe("markdown bodies can show their source", () => {
 				},
 			},
 			WIDTH,
-			6,
+			5,
 			{ opened: true, viewportHeight: 900 },
 		);
 		const targets = resolveToolDetailViewTargets("tool-tu_2", measured);

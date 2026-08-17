@@ -88,7 +88,11 @@ export const contextAskTool: ToolDefinition = {
 					? { onProgress: (totalOutputChars: number) => emitOutput(String(totalOutputChars)) }
 					: {}),
 			});
-			const targetLabel = result.target.title?.trim() || result.target.id;
+			const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
+			// `target` is the resolved narrator row, so the alias fallback is free.
+			const targetLabel =
+				result.target.title?.trim() ||
+				agentLabelFromNarrator(target, ctx.parentNarratorId ?? ctx.narratorId);
 			const heading =
 				ctx.locale === "zh-CN"
 					? `ContextAsk（${targetLabel}）结果：`

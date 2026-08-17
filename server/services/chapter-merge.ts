@@ -5,6 +5,7 @@ import { chapters, narrators, projects, reviewConclusions } from "../db/schema";
 import { worktreeLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
@@ -131,10 +132,12 @@ function buildPreMergeAutoCommitMessage(source: ChapterRow, target: ChapterRow):
 async function autoCommitSourceBeforeMerge(
 	source: ChapterRow,
 	target: ChapterRow,
+	userId?: string,
 ): Promise<string | null> {
 	const sourceWorktree = source.worktreePath;
 	if (!sourceWorktree) return null;
 
+	const identity = await resolveUserGitIdentityEnv(userId);
 	const message = buildPreMergeAutoCommitMessage(source, target);
 	return worktreeLock.acquire(sourceWorktree, async () => {
 		const currentBranch = (await gitService.getCurrentBranch(sourceWorktree)).trim();
@@ -147,7 +150,7 @@ async function autoCommitSourceBeforeMerge(
 		// Unlocked: this block holds `worktreeLock` for `sourceWorktree`, and the locked
 		// `autoCommit` would queue behind its own caller. See the note on the unlocked
 		// variants in git-service.
-		const commitSha = await gitService.autoCommitUnlocked(sourceWorktree, message);
+		const commitSha = await gitService.autoCommitUnlocked(sourceWorktree, message, identity);
 		if (!commitSha) return null;
 
 		const normalizedSha = commitSha.trim();
@@ -234,6 +237,7 @@ async function prepareSourceBeforeMerge(
 	target: ChapterRow,
 	gitPath: string,
 	requireReviewBeforeMerge: boolean,
+	userId?: string,
 ): Promise<void> {
 	if (requireReviewBeforeMerge) {
 		await ensureSourceReadyForRequiredReview(source, gitPath);
@@ -243,7 +247,7 @@ async function prepareSourceBeforeMerge(
 	// If the source chapter still has uncommitted worktree changes, persist them
 	// to its branch before computing merge context / fast-forward state. Otherwise
 	// git merge only sees the old branch tip and silently drops those changes.
-	await autoCommitSourceBeforeMerge(source, target);
+	await autoCommitSourceBeforeMerge(source, target, userId);
 }
 
 /**
@@ -915,7 +919,10 @@ export const chapterMerge = {
 			return this.mergeViaSnapshot(source, target, strategy, message, userId);
 		}
 
-		await prepareSourceBeforeMerge(source, target, gitPath, requireReview);
+		await prepareSourceBeforeMerge(source, target, gitPath, requireReview, userId);
+
+		// The merge commit is authored by whoever asked for the merge, not by the host.
+		const identity = await resolveUserGitIdentityEnv(userId);
 
 		// Check if fast-forward is possible (only for "merge" strategy)
 		const canFastForward =
@@ -958,7 +965,13 @@ export const chapterMerge = {
 				if (parked) await persistParkedWork(input.targetChapterId, parked);
 				const baseSha = await gitService.getMergeBase(gitPath, target.branch, source.branch);
 				try {
-					result = await gitService.cherryPick(targetWorktree, gitPath, source.branch, baseSha);
+					result = await gitService.cherryPick(
+						targetWorktree,
+						gitPath,
+						source.branch,
+						baseSha,
+						identity,
+					);
 				} catch (err) {
 					if (parked) {
 						await restoreParkedWork(targetWorktree, parked);
@@ -1000,6 +1013,7 @@ export const chapterMerge = {
 			} else {
 				result = await gitService.merge(targetWorktree, source.branch, strategy, message, {
 					fastForward: canFastForward,
+					identity,
 				});
 			}
 
@@ -1382,7 +1396,9 @@ export const chapterMerge = {
 			return this.startInteractiveSnapshotMerge(source, target, strategy, message, locale, userId);
 		}
 
-		await prepareSourceBeforeMerge(source, target, gitPath, requireReview);
+		await prepareSourceBeforeMerge(source, target, gitPath, requireReview, userId);
+
+		const identity = await resolveUserGitIdentityEnv(userId);
 
 		const mergeContext = await collectMergeContext(gitPath, source.branch, source.baseBranch).catch(
 			(err) => {
@@ -1400,7 +1416,7 @@ export const chapterMerge = {
 			const mergeResult = await gitService.mergeNoCommit(targetWorktree, source.branch, strategy);
 			if (!mergeResult.hasConflicts) {
 				// Unlocked: inside this method's `worktreeLock` block for `targetWorktree`.
-				const commitSha = await gitService.autoCommitUnlocked(targetWorktree, message);
+				const commitSha = await gitService.autoCommitUnlocked(targetWorktree, message, identity);
 				const resolved = await this.markMergedResult(
 					sourceChapterId,
 					input.targetChapterId,
@@ -1505,7 +1521,11 @@ export const chapterMerge = {
 
 			let preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			// Unlocked: inside this method's `worktreeLock` block for `targetWorktree`.
-			let commitSha = await gitService.autoCommitUnlocked(targetWorktree, message);
+			let commitSha = await gitService.autoCommitUnlocked(
+				targetWorktree,
+				message,
+				await resolveUserGitIdentityEnv(userId),
+			);
 			if (!commitSha) {
 				const status = await gitService.getStatus(targetWorktree);
 				if (status.trim()) {
@@ -1714,7 +1734,9 @@ export const chapterMerge = {
 			return this.aiResolveViaSnapshot(source, target, strategy, message, locale, userId);
 		}
 
-		await prepareSourceBeforeMerge(source, target, gitPath, requireReview);
+		await prepareSourceBeforeMerge(source, target, gitPath, requireReview, userId);
+
+		const identity = await resolveUserGitIdentityEnv(userId);
 
 		// Collect commit messages and diff stat BEFORE the merge — this is a
 		// read-only operation so it's safe (and desirable) to run outside the lock.
@@ -1771,6 +1793,7 @@ export const chapterMerge = {
 					gitPath,
 					source.branch,
 					baseSha,
+					identity,
 				);
 				if (cpResult.success) {
 					return this.markMergedResult(
@@ -1788,7 +1811,7 @@ export const chapterMerge = {
 				const mergeResult = await gitService.mergeNoCommit(targetWorktree, source.branch, strategy);
 				if (!mergeResult.hasConflicts) {
 					// Unlocked: inside this method's `worktreeLock` block for `targetWorktree`.
-					const commitSha = await gitService.autoCommitUnlocked(targetWorktree, message);
+					const commitSha = await gitService.autoCommitUnlocked(targetWorktree, message, identity);
 					return this.markMergedResult(
 						sourceChapterId,
 						input.targetChapterId,
@@ -1833,7 +1856,7 @@ export const chapterMerge = {
 				}
 
 				// Unlocked: inside this method's `worktreeLock` block for `targetWorktree`.
-				const commitSha = await gitService.autoCommitUnlocked(targetWorktree, message);
+				const commitSha = await gitService.autoCommitUnlocked(targetWorktree, message, identity);
 				return this.markMergedResult(
 					sourceChapterId,
 					input.targetChapterId,
@@ -2024,7 +2047,7 @@ export const chapterMerge = {
 	 * chapter unmerged — the source's work is silently in the target with nothing left
 	 * pointing at it. See {@link isMultiCommitMerge} for how that shape is recognised.
 	 */
-	async unmerge(sourceChapterId: string): Promise<{ ok: true; warning?: string }> {
+	async unmerge(sourceChapterId: string, userId?: string): Promise<{ ok: true; warning?: string }> {
 		const source = await db.query.chapters.findFirst({
 			where: eq(chapters.id, sourceChapterId),
 		});
@@ -2101,10 +2124,12 @@ export const chapterMerge = {
 			} else {
 				// Target has new commits — revert instead to preserve them
 				const isMerge = await gitService.isMergeCommit(targetWorktree, mergeCommitSha);
+				// The revert is a new commit, authored by whoever asked for the unmerge.
+				const identity = await resolveUserGitIdentityEnv(userId);
 				try {
 					const revertSha = isMerge
-						? await gitService.revertMergeCommitUnlocked(targetWorktree, mergeCommitSha)
-						: await gitService.revertCommitUnlocked(targetWorktree, mergeCommitSha);
+						? await gitService.revertMergeCommitUnlocked(targetWorktree, mergeCommitSha, identity)
+						: await gitService.revertCommitUnlocked(targetWorktree, mergeCommitSha, identity);
 					logger.info("Reverted merge commit on target (target had advanced)", {
 						sourceChapterId,
 						targetChapterId: target.id,
@@ -2402,6 +2427,8 @@ export const chapterMerge = {
 		const message = options.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const locale = options.locale ?? "en";
 
+		const identity = await resolveUserGitIdentityEnv(options.userId);
+
 		// Collect merge context before any merge operation
 		const mergeContext = await collectMergeContext(gitPath, source.branch, source.baseBranch).catch(
 			(err) => {
@@ -2443,7 +2470,7 @@ export const chapterMerge = {
 
 			if (!mergeResult.hasConflicts) {
 				// No conflicts (race condition) — commit and merge back to trunk
-				const commitSha = await gitService.autoCommit(tempWorktree, message);
+				const commitSha = await gitService.autoCommit(tempWorktree, message, identity);
 				return await this.finalizeTempMerge(
 					sourceChapterId,
 					targetChapterId,
@@ -2514,7 +2541,7 @@ export const chapterMerge = {
 			}
 
 			// All conflicts resolved — commit
-			const commitSha = await gitService.autoCommit(tempWorktree, message);
+			const commitSha = await gitService.autoCommit(tempWorktree, message, identity);
 
 			// Step 5: Merge temp branch back into trunk
 			return await this.finalizeTempMerge(
@@ -2578,6 +2605,7 @@ export const chapterMerge = {
 			tempChapter.branch,
 			"merge",
 			message,
+			{ identity: await resolveUserGitIdentityEnv(userId) },
 		);
 
 		if (!trunkMerge.success) {

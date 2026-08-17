@@ -128,6 +128,7 @@ import {
 } from "./narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "./narrator-executor";
 import { deliverInjection } from "./narrator-injection";
+import { isFirstUserTurn } from "./narrator-message-count";
 import { resolveNarratorProjectId as resolveSharedNarratorProjectId } from "./narrator-project";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import {
@@ -180,6 +181,7 @@ import {
 	getConclusionEntry,
 	setConclusionFileId,
 } from "./subagent-conclusion";
+import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import {
 	getConclusionWatcher,
 	getManualOverrideMap,
@@ -364,7 +366,7 @@ import {
 	shouldFinalizeAbortBeforeRecovery,
 	triggerMidTurnCompact,
 } from "./narrator-compact";
-import { handlePermission } from "./narrator-permission";
+import { handlePermission, resolvePermissionOrDangerReflection } from "./narrator-permission";
 import {
 	reconstructToolExecutionTarget,
 	recoverStaleCompactingMessages,
@@ -380,6 +382,17 @@ import type { RevertScope, RevertWarning } from "./snapshot-revert";
 // Tools that may modify files on disk — git status is tracked after these complete
 const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
 const MAX_CONTINUATION_STALL_TURNS = 3;
+
+/**
+ * How long `interruptAndWaitForIdle` waits for an aborted loop to actually leave.
+ *
+ * An abort lands at the loop's next await point, so the wait covers whatever is
+ * currently in flight: a model request being cancelled, a tool being torn down, and
+ * the loop's own `finally` cleanup. Kept well under the HTTP request budget so a
+ * stuck loop degrades into a reported warning rather than a hanging request.
+ */
+const INTERRUPT_IDLE_TIMEOUT_MS = 15_000;
+const INTERRUPT_IDLE_POLL_MS = 50;
 
 export interface ContinuationStallState {
 	count: number;
@@ -1763,10 +1776,16 @@ async function deliverPendingInjection(
 					items: [
 						{
 							id: task.id,
+							alias: task.alias ?? null,
 							title: task.title,
 							status: task.status,
 							preview: task.resultPreview ?? "",
 							...(task.resultTruncated ? { truncated: true } : {}),
+							// Reader-only navigation target (the agent's own message that produced
+							// this result). Omitted rather than stored as null when absent, so a
+							// row written before this existed and a run with no assistant text are
+							// the same shape to every consumer.
+							...(task.resultMessageId ? { resultMessageId: task.resultMessageId } : {}),
 						},
 					],
 				},
@@ -1844,7 +1863,11 @@ async function deliverPendingInjection(
 					{
 						fromId: message.fromId,
 						fromTitle: message.fromTitle ?? null,
+						fromLabel: message.fromLabel ?? null,
 						fromType: message.fromType ?? null,
+						// Reader-only navigation target, omitted when the sender had written
+						// nothing yet (see the field's own doc).
+						...(message.fromMessageId ? { fromMessageId: message.fromMessageId } : {}),
 						text: message.text,
 					},
 				],
@@ -2069,6 +2092,33 @@ function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefine
 		Array.isArray(msg.toolCalls) &&
 		msg.toolCalls.some((tc) => Boolean(tc?.toolUseId) && Boolean(tc?.toolName))
 	);
+}
+
+/**
+ * Does model-visible history end on a server-authored injection?
+ *
+ * `resolveContinuationTail` walks PAST `sys` rows by design — it answers "what turn can
+ * a continuation build on", and an injection is not a turn. But its absence from that
+ * answer must not be read as "history ends on the row underneath": an injection sitting
+ * last is the freshest thing the narrator was handed, and every provider's history
+ * builder already sends a trailing `sys` run as the CURRENT turn
+ * (`buildAnthropicHistory`'s `trailingUserText`).
+ *
+ * So a continuation whose tail is an injection has its content already in place and needs
+ * nothing but a loop — the same `runAgentLoop(active, "")` that
+ * `startInjectionContinuationIfPossible` uses. Appending a synthetic "please continue"
+ * user row instead would be actively wrong, not merely redundant: it displaces the
+ * injection from the trailing position, so the builder stops lifting it and the model
+ * reads it as background while being asked to continue something unnamed.
+ */
+export function hasTrailingInjectionRow(messages: ContinuableTopLevelMessage[]): boolean {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (!msg || msg.parentToolUseId) continue;
+		if (msg.role === "sys") return true;
+		if (msg.role === "user" || msg.role === "assistant") return false;
+	}
+	return false;
 }
 
 async function getLatestSubagentParentToolUseId(narratorId: string): Promise<string | undefined> {
@@ -2746,13 +2796,14 @@ export async function runAgentLoop(
 				onTitleCheck: async (_savedId) => {
 					const n = await db.query.narrators.findFirst({
 						where: eq(narrators.id, narratorId),
-						columns: { messageCount: true, title: true },
+						columns: { title: true },
 					});
-					const hasOnlyInitialUserMessage = (n?.messageCount ?? 0) <= 1;
+					// `messageCount` is the real message count, not a turn count, so it is
+					// already > 1 mid-first-turn. Ask the actual question instead.
 					const titleUpdate = !!(
 						n &&
-						hasOnlyInitialUserMessage &&
-						(!n.title || (active._provisionalTitle && n.title === active._provisionalTitle))
+						(!n.title || (active._provisionalTitle && n.title === active._provisionalTitle)) &&
+						(await isFirstUserTurn(narratorId))
 					);
 					return { titleUpdate };
 				},
@@ -4917,7 +4968,10 @@ async function feedMessage(
 				}
 			: { setTurnStart: true },
 	);
-	if ((narrator.messageCount ?? 0) <= 1 && !narrator.title) {
+	// The user message above is already persisted, so "first turn" means exactly one
+	// user message exists. `messageCount` cannot answer this any more — it now counts
+	// every message, not finished turns.
+	if (!narrator.title && (await isFirstUserTurn(narratorId))) {
 		active._provisionalTitle =
 			(await setProvisionalTitleFromUserMessage(narratorId, prompt)) ?? undefined;
 		generateQuickTitle(narratorId, prompt, locale).catch(() => {});
@@ -5089,7 +5143,7 @@ export async function updateToolCallConclusion(opts: {
 		resultMessageId,
 		refreshTiming = false,
 	} = opts;
-	const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
+	const resultPrefix = agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId));
 	const output = resultPrefix + (finalText || "(no output)");
 	const timing = refreshTiming
 		? resolveToolCallConclusionTiming(await narratorService.getToolCallByToolUseId(toolUseId))
@@ -5703,8 +5757,14 @@ export async function continueNarrator(
 		}
 	}
 
-	if (!shouldReplayToolResults) {
-		// No pending tool calls — send a simple "continue" user message.
+	// A trailing injection already IS the turn's content (see hasTrailingInjectionRow), so
+	// it is continued by starting a loop with empty text — exactly like a tool-result
+	// replay, and unlike the synthetic "continue" row below, which would push the
+	// injection out of the trailing position the history builders depend on.
+	const trailingInjection = !shouldReplayToolResults && hasTrailingInjectionRow(rawMsgs);
+
+	if (!shouldReplayToolResults && !trailingInjection) {
+		// No pending tool calls and no fresh injection — send a simple "continue" user message.
 		const continueText = getToolMessage("userContinue", locale);
 		const { userMsg } = await feedMessage(
 			narratorId,
@@ -5748,8 +5808,9 @@ export async function continueNarrator(
 			: { setTurnStart: true },
 	);
 
-	// Pass empty text — buildHistory will reconstruct the trailing tool-result
-	// packet so the provider sees the same follow-up turn again.
+	// Pass empty text — buildHistory reconstructs the turn's content itself: the trailing
+	// tool-result packet, or (for an injection tail) the trailing `sys` run lifted into
+	// the current turn.
 	runAgentLoop(active, "", undefined).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
 		await narratorService.updateStatus(narratorId, "idle", {
@@ -6886,11 +6947,15 @@ async function editAndRegenerateUnlocked(
 			!newContent.trim() && existingImages.length > 0 ? "[user sent image(s)]" : newContent;
 		effectivePrompt = effectiveText + buildAttachedFilesHint(existingTextFiles);
 
-		// A loop may have started while the files were being materialized. Abort before
-		// copy-on-write and let the catch block remove every file created by this attempt.
-		if (isLoopRunning(narratorId)) {
-			await reconcileRunningStatus(narratorId);
-			throw new ValidationError("Cannot edit while narrator is running");
+		// A loop may have started while the files were being materialized (the route
+		// already cleared the way once, but that was several awaits ago). Stop it the
+		// same way the route did rather than failing the edit the user asked for; only
+		// a loop that will not stop aborts here, before copy-on-write, so the catch
+		// block can remove every file created by this attempt.
+		if (isLoopRunning(narratorId) && !(await interruptAndWaitForIdle(narratorId))) {
+			throw new ValidationError(
+				"This narrator did not stop after being interrupted; try again in a moment",
+			);
 		}
 		privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
 			contentText: effectivePrompt,
@@ -7565,6 +7630,72 @@ export function isNarratorActive(narratorId: string): boolean {
 export function isLoopRunning(narratorId: string): boolean {
 	const active = activeNarrators.get(narratorId);
 	return active?.alive === true && active._loopRunning === true;
+}
+
+/**
+ * Interrupt whatever this narrator is doing and wait until it has actually stopped.
+ *
+ * `interruptNarrator` only aborts the AbortController and returns immediately; the
+ * loop notices the abort at its next await point and then runs its own cleanup
+ * (status write, tool-call sealing, snapshot claim release) in a `finally`. So a
+ * caller that wants to *replace* the narrator's history or its workspace cannot act
+ * on the synchronous return value — it has to wait for the loop to leave.
+ *
+ * That waiting is why this exists rather than each caller polling: the authoritative
+ * signal is the in-memory `_loopRunning`/`alive` pair, plus the runtime-claim
+ * registry for parent-side work that runs with no loop at all
+ * (`isNarratorRuntimeBusy`). A caller reading DB `status` instead would see idle
+ * while the loop is still draining.
+ *
+ * Returns whether the narrator is idle now. `false` means it was still busy when
+ * the budget ran out — the caller decides whether to refuse or proceed anyway; this
+ * function deliberately does not throw, so a caller can treat a stubborn loop as a
+ * warning rather than a hard failure.
+ *
+ * A pending permission is resolved as a denial first: that pause keeps the turn
+ * alive with nobody driving it, so aborting alone would leave the loop parked on a
+ * promise that no longer has a decider.
+ */
+export async function interruptAndWaitForIdle(
+	narratorId: string,
+	opts?: { timeoutMs?: number },
+): Promise<boolean> {
+	const busy = () => isLoopRunning(narratorId) || isNarratorRuntimeBusy(narratorId);
+	if (!busy()) return true;
+
+	// A suspended permission request is not something an abort can reach: the loop is
+	// parked awaiting a decision, so denying the pending ones is what lets the turn
+	// unwind. Keyed by requestId, and only the entries this narrator owns are touched
+	// (an entry may merely be broadcast here on behalf of a subagent).
+	for (const [requestId, pending] of [...pendingPermissions.entries()]) {
+		if (pending.narratorId !== narratorId) continue;
+		try {
+			await resolvePermissionOrDangerReflection(requestId, "deny", {
+				denyMessage: "Interrupted: the user is editing this session's history",
+			});
+		} catch (error) {
+			logger.warn("Failed to deny pending permission while interrupting", {
+				narratorId,
+				requestId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	interruptNarrator(narratorId);
+
+	const deadline = Date.now() + (opts?.timeoutMs ?? INTERRUPT_IDLE_TIMEOUT_MS);
+	while (busy()) {
+		if (Date.now() >= deadline) {
+			logger.warn("Narrator did not go idle after an interrupt", { narratorId });
+			return false;
+		}
+		await new Promise((resolve) => setTimeout(resolve, INTERRUPT_IDLE_POLL_MS));
+	}
+	// The loop's own `finally` writes its terminal status, but a runtime claim that
+	// simply expired leaves the DB row behind; repair it so the UI is not stuck busy.
+	await reconcileRunningStatus(narratorId);
+	return true;
 }
 
 /**

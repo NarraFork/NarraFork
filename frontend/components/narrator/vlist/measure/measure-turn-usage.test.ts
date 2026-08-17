@@ -94,7 +94,7 @@ describe("measureTurnUsage — height determinism", () => {
 	it("is independent of LOD", async () => {
 		const { measureTurnUsage } = await import("./measure-turn-usage");
 		const low = measureTurnUsage({ placement: "trailing", text: "Σ 1" }, 600, 1);
-		const high = measureTurnUsage({ placement: "trailing", text: "Σ 1" }, 600, 6);
+		const high = measureTurnUsage({ placement: "trailing", text: "Σ 1" }, 600, 5);
 		expect(low.height).toBe(high.height);
 	});
 

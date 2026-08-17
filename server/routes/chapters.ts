@@ -19,6 +19,8 @@ import {
 	listCommitsSchema,
 	mergeChapterSchema,
 	splitChapterSchema,
+	updateChapterDetachedPanelsSchema,
+	updateChapterDockLayoutSchema,
 	updateChapterSchema,
 } from "../lib/validators";
 import { requireAdmin } from "../middleware/auth";
@@ -157,6 +159,71 @@ chapterRoutes.delete("/:id", async (c) => {
 	return c.json({ ok: true });
 });
 
+// === Graph node dock layout ===
+//
+// The dockview layout of a chapter node's embedded surface (which tool panels are
+// open, how they are split). Its own endpoint rather than a field on the chapter
+// or on `PATCH /graph/positions`: it is a multi-KB blob that must never ride
+// along with a node drag or appear in the project graph's per-chapter payload.
+// Access is already gated by the `/:id` middleware above (GET → read, PUT → write).
+
+chapterRoutes.get("/:id/dock-layout", async (c) => {
+	const id = c.req.param("id");
+	const row = await db.query.chapters.findFirst({
+		where: eq(chapters.id, id),
+		columns: { dockLayoutJson: true },
+	});
+	if (!row) throw new NotFoundError("Chapter", id);
+	return c.json({ layout: row.dockLayoutJson ?? null });
+});
+
+chapterRoutes.put("/:id/dock-layout", async (c) => {
+	const id = c.req.param("id");
+	const parsed = updateChapterDockLayoutSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	// Existence is checked before writing so a stale client (node deleted in
+	// another tab) gets a 404 instead of a silent no-op update.
+	const row = await db.query.chapters.findFirst({
+		where: eq(chapters.id, id),
+		columns: { id: true },
+	});
+	if (!row) throw new NotFoundError("Chapter", id);
+	await db.update(chapters).set({ dockLayoutJson: parsed.data.layout }).where(eq(chapters.id, id));
+	return c.json({ ok: true });
+});
+
+// === Detached panels ===
+//
+// Tool panels torn out of this chapter's node dock, now standing as their own
+// canvas nodes. Separate from the dock layout because that column holds dockview's
+// own serialized grid; custom entries there would break its `fromJSON`.
+
+chapterRoutes.get("/:id/detached-panels", async (c) => {
+	const id = c.req.param("id");
+	const row = await db.query.chapters.findFirst({
+		where: eq(chapters.id, id),
+		columns: { detachedPanelsJson: true },
+	});
+	if (!row) throw new NotFoundError("Chapter", id);
+	return c.json({ panels: row.detachedPanelsJson ?? null });
+});
+
+chapterRoutes.put("/:id/detached-panels", async (c) => {
+	const id = c.req.param("id");
+	const parsed = updateChapterDetachedPanelsSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const row = await db.query.chapters.findFirst({
+		where: eq(chapters.id, id),
+		columns: { id: true },
+	});
+	if (!row) throw new NotFoundError("Chapter", id);
+	await db
+		.update(chapters)
+		.set({ detachedPanelsJson: parsed.data.panels })
+		.where(eq(chapters.id, id));
+	return c.json({ ok: true });
+});
+
 // === Fork ===
 
 chapterRoutes.post("/:id/fork", async (c) => {
@@ -265,7 +332,7 @@ chapterRoutes.post("/:id/ai-resolve", async (c) => {
 
 chapterRoutes.post("/:id/unmerge", async (c) => {
 	const id = c.req.param("id");
-	const result = await chapterMerge.unmerge(id);
+	const result = await chapterMerge.unmerge(id, c.get("user").sub);
 	return c.json(result);
 });
 
@@ -273,7 +340,7 @@ chapterRoutes.post("/:id/unmerge", async (c) => {
 
 chapterRoutes.post("/:id/dormant", async (c) => {
 	const id = c.req.param("id");
-	await chapterCleanup.dormant(id);
+	await chapterCleanup.dormant(id, c.get("user").sub);
 	return c.json({ ok: true });
 });
 

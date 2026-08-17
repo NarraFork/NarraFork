@@ -17,6 +17,19 @@
  * Each row re-derives its own text column with `specTaskChromeWidth`, mirroring the
  * measure pass: a protected row's lock lane makes its column narrower, and painting
  * every row at one shared width would re-wrap the locked ones.
+ *
+ * ## Why a `doing` row does not animate by itself
+ *
+ * `role: "doing"` is a RECORDED status, not a live one: every digest ever injected
+ * carries the task that was in progress when it was written. Spinning on the status
+ * alone therefore set the whole scrollback spinning — a reader scrolling through
+ * history saw a dozen bubbles all claiming to be working right now.
+ *
+ * So animation is gated on `live`, which the integration layer sets for the NEWEST
+ * spec-task bubble and only while the narrator is actually running (same rule the
+ * chunked SpecTasksDetail uses: `isThinking && isLatestTasksCard`). A live row also
+ * swaps its glyph for a LOADER: a spinning "play" triangle reads as a control being
+ * operated, not as work in flight.
  */
 
 import { Group, Text, ThemeIcon } from "@mantine/core";
@@ -24,6 +37,7 @@ import {
 	IconBan,
 	IconCheck,
 	IconChevronRight,
+	IconLoader2,
 	IconLock,
 	IconPlayerPlay,
 } from "@tabler/icons-react";
@@ -61,9 +75,16 @@ const ROLE_GLYPH: Record<
 export function RenderSpecTask({
 	measured,
 	data,
+	live = false,
 }: {
 	measured: MeasuredElement;
 	data: SpecTaskData;
+	/**
+	 * This bubble is the NEWEST spec-task injection AND the narrator is running, so
+	 * a `doing` row is describing work happening right now. Height-neutral: it only
+	 * swaps the glyph inside the already-reserved 16px lane.
+	 */
+	live?: boolean;
 }) {
 	const emptyLabel = data.emptyLabel?.trim();
 	if (emptyLabel) {
@@ -102,19 +123,31 @@ export function RenderSpecTask({
 		>
 			{rows.map((row, index) => (
 				// biome-ignore lint/suspicious/noArrayIndexKey: rows are a stable ordered list
-				<SpecTaskRowView key={index} row={row} innerWidth={innerWidth} />
+				<SpecTaskRowView key={index} row={row} innerWidth={innerWidth} live={live} />
 			))}
 		</div>
 	);
 }
 
-function SpecTaskRowView({ row, innerWidth }: { row: SpecTaskRow; innerWidth: number }) {
+function SpecTaskRowView({
+	row,
+	innerWidth,
+	live,
+}: {
+	row: SpecTaskRow;
+	innerWidth: number;
+	live: boolean;
+}) {
 	const blocked = row.blocked === true || row.role === "blocked";
 	const isProtected = row.protected === true;
 	const entry = ROLE_GLYPH[blocked ? "blocked" : (row.role ?? "doing")] ?? ROLE_GLYPH.doing;
-	const { Icon, color } = entry;
-	// `doing` is the only live state, so it is the only one that spins.
-	const spinning = !blocked && (row.role ?? "doing") === "doing";
+	const { color } = entry;
+	// Only the LIVE bubble's in-progress row animates (see the module header): a
+	// recorded `doing` is history, and a whole scrollback of spinners claims work
+	// that finished long ago. A live row also becomes a LOADER rather than a
+	// spinning play triangle.
+	const spinning = live && !blocked && (row.role ?? "doing") === "doing";
+	const Icon = spinning ? IconLoader2 : entry.Icon;
 	const textWidth = Math.max(1, innerWidth - specTaskChromeWidth(row));
 	return (
 		<Group gap={SPEC_TASK_GLYPH_GAP} wrap="nowrap" align="flex-start">

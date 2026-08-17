@@ -61,7 +61,7 @@ export interface UsePretextDocumentOptions {
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
 	/**
-	 * Row-KEY addressed expansion for `activity-trace` / `tool-run-summary` (see
+	 * Row-KEY addressed expansion for `activity-trace` (see
 	 * `AdapterContext.isRowExpanded`). Its identity moves with the expanded-row
 	 * state, so folding it into `buildOptions` is what rebuilds the document when
 	 * the reader drills into a row.
@@ -234,6 +234,15 @@ export interface UsePretextDocumentResult {
 	 * heights.
 	 */
 	replaceMessage: (message: TreeMessage) => boolean;
+	/**
+	 * Drop the oldest `dropCount` loaded messages so a long session's window stays
+	 * bounded. The caller must obtain `dropCount` from `resolveHeadTrim`, which owns
+	 * the safety rules (notably: never while a streaming row is live). Returns true
+	 * when the window actually shrank, so the caller can sweep its per-row caches.
+	 */
+	trimHead: (dropCount: number) => boolean;
+	/** Timestamp of the last trim, for the fill loop's cooldown. 0 when never. */
+	getLastTrimAt: () => number;
 }
 
 const EMPTY_MESSAGES: readonly TreeMessage[] = [];
@@ -657,6 +666,19 @@ export function usePretextDocument(
 			}) ?? false,
 		[coordinator, options.getCurrentView],
 	);
+	const trimHead = useCallback(
+		(dropCount: number) =>
+			coordinator?.trimHead(dropCount, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? false,
+		[coordinator, options.getCurrentView],
+	);
+	const getLastTrimAt = useCallback(() => coordinator?.getLastTrimAt() ?? 0, [coordinator]);
 	// Same live-view contract as loadOlder / applyLivePatch: the anchor is captured
 	// from the CURRENT scroll position at publish time, so a scroll in flight cannot
 	// desync it from the correction that follows.
@@ -700,6 +722,8 @@ export function usePretextDocument(
 		appendMessage,
 		removeMessages,
 		replaceMessage,
+		trimHead,
+		getLastTrimAt,
 	};
 }
 

@@ -209,6 +209,67 @@ describe("AnthropicProvider thinking continuation", () => {
 		]);
 	});
 
+	it("relay models skip the signature-source check and drop redacted thinking", async () => {
+		// A relay model mints no credentials: reasoning text crosses upstreams
+		// freely, a foreign signature is echoed verbatim (nothing verifies it),
+		// and redacted_thinking — an Anthropic-specific opaque payload — is
+		// dropped because no relay gateway understands it.
+		const provider = new AnthropicProvider({
+			id: "test",
+			name: "Test",
+			prefix: "relay",
+			apiKey: "test-key",
+			baseUrl: "https://relay.invalid/v1",
+			defaultModel: "GLM-5.1",
+		});
+		const dbMessages: DbMessage[] = [
+			{
+				id: "u1",
+				role: "user",
+				contentJson: [{ type: "text", text: "run" }],
+				contentText: "run",
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+			{
+				id: "a1",
+				role: "assistant",
+				contentJson: [
+					{
+						type: "reasoning",
+						text: "cross-provider",
+						providerMetadata: {
+							anthropic: { blockIndex: 0, signature: "sig-foreign" },
+							signatureSource: "some-other-upstream",
+						},
+					},
+					{
+						type: "reasoning",
+						text: "unsigned",
+						providerMetadata: { anthropic: { blockIndex: 1 } },
+					},
+					{ type: "redacted_thinking", data: "opaque", signatureSource: "some-other-upstream" },
+					{ type: "text", text: "answer" },
+				],
+				contentText: "answer",
+				parentToolUseId: null,
+				messageUuid: null,
+				toolCalls: [],
+			},
+		];
+
+		const { history } = await provider.buildHistory(dbMessages, "GLM-5.1");
+		const assistant = (history as Array<{ role: string; content: unknown }>).find(
+			(message) => message.role === "assistant",
+		);
+
+		expect(assistant?.content).toEqual([
+			{ type: "thinking", thinking: "cross-provider", signature: "sig-foreign" },
+			{ type: "thinking", thinking: "unsigned", signature: "" },
+			{ type: "text", text: "answer" },
+		]);
+	});
+
 	it("preserves redacted thinking blocks from SSE for replay", async () => {
 		const events = await Array.fromAsync(
 			parseAnthropicSSEStream(

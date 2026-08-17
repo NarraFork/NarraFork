@@ -75,7 +75,9 @@ const ADMIN_PATHS = new Set([
 	"/settings/oauth-apps",
 	"/settings/users",
 	"/settings/terminals",
-	"/settings/devices",
+	// NOT admin-only: any user may register and manage their own remote devices.
+	// The page hides the admin-only actions (transfers, global scope) itself, and
+	// the API enforces the same boundary per endpoint.
 	"/settings/storage",
 	"/settings/runtime",
 	"/settings/usage",
@@ -129,6 +131,9 @@ function SettingsLayout() {
 			label: t("gatewaySection"),
 			icon: <IconMessageCircle size={18} />,
 		},
+		// Personal, not instance-wide: a user registers their own machines here and
+		// sees only the devices they registered. Admins still get the full list.
+		{ to: "/settings/devices", label: t("devicesSection"), icon: <IconDeviceLaptop size={18} /> },
 	];
 
 	const instanceItems: NavItem[] = [
@@ -163,7 +168,6 @@ function SettingsLayout() {
 			label: t("terminalsSection"),
 			icon: <IconTerminal2 size={18} />,
 		},
-		{ to: "/settings/devices", label: t("devicesSection"), icon: <IconDeviceLaptop size={18} /> },
 		{ to: "/settings/storage", label: t("storageSection"), icon: <IconDatabase size={18} /> },
 		{ to: "/settings/runtime", label: t("runtimeSection"), icon: <IconPlayerPlay size={18} /> },
 		{ to: "/settings/plugins", label: t("pluginsSection"), icon: <IconPuzzle size={18} /> },

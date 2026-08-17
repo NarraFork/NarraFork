@@ -612,6 +612,11 @@
 	"segmentCompactConfirm": "压缩选中的 {{count}} 条消息？原始消息将被隐藏并替换为摘要。",
 	"viewSubagentSession": "查看会话",
 	"openFullSubagentSession": "打开完整会话",
+	"injectionTarget": {
+		"openKnowledge": "打开知识库条目",
+		"openSpecFile": "打开该大纲文件",
+		"openChapter": "打开章节"
+	},
 	"subagentRecentCalls": "最近调用",
 	"subagentWaitingPermission": "等待权限（{{count}}）",
 	"subagentWaitingPermissionTitle": "等待权限",
@@ -1024,8 +1029,8 @@
 	"details.clearTrait": "清除 trait",
 	"details.customTraitsSaved": "自定义 trait 已保存",
 	"details.customTraitsCleared": "自定义 trait 已清除",
+	"details.stats.title": "统计",
 	"details.stats.messages": "消息",
-	"details.stats.cost": "成本",
 	"details.stats.inputTokens": "总输入",
 	"details.stats.outputTokens": "总输出",
 	"details.stats.cacheReadTokens": "缓存读取",
@@ -1106,7 +1111,7 @@
 		"attachedCount": "附带 {{count}} 条系统注入",
 		"body": {
 			"noticeSilentProgress": "已连续 {{count}} 次工具调用未输出可见文本",
-			"noticeRelaxedPlan": "仍在规划中 — 暂不要开始实现",
+			"noticeRelaxedPlan": "仍在规划中 — 计划写入 {{planFile}}，暂不要开始实现",
 			"noticePipelineExit": "Pipeline 仍在活动 — 请确认是否仍需要",
 			"tasksCurrent": "Dynamic Spec — {{n}} 条开放任务",
 			"tasksEmptyNever": "Dynamic Spec — 尚未建立任务",
@@ -1255,7 +1260,8 @@
 		"resultCount_other": "{{count}} 条结果",
 		"role_user": "你",
 		"role_assistant": "助手",
-		"role_system": "系统"
+		"role_system": "系统",
+		"jumpUnavailable": "在画布上展开该章节的节点后即可跳转到消息。"
 	},
 	"access": {
 		"visibilityTitle": "谁可以看到这个会话",

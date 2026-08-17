@@ -158,6 +158,8 @@ export const sendTool: ToolDefinition = {
 				output: result.output,
 				metadata: {
 					kind: "send",
+					// Each entry carries both the real id (for the card's session link)
+					// and a readable label (for what the reader actually sees).
 					targets: result.targets,
 					doInterrupt: raw.doInterrupt ?? false,
 					await: raw.await ?? false,

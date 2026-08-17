@@ -93,6 +93,12 @@ export interface ProjectGraphResponse {
 	nodes: ApiEntity[];
 	edges: ApiEntity[];
 	openedTerminals?: ApiEntity[];
+	/**
+	 * Serialized detached-panel envelopes for the chapters that have any (tool
+	 * panels torn out of a node's dock onto the canvas). Sent with the graph rather
+	 * than fetched per chapter because the canvas renders all of them at once.
+	 */
+	detachedPanels?: Array<{ chapterId: string; panels: string | null }>;
 	// No `capabilities`: the graph route never sent one. `degraded`/`fallbacks` below are real.
 	degraded?: boolean;
 	fallbacks?: ProjectGraphFallback[];
@@ -216,14 +222,18 @@ export const projectsApi = {
 	getProjectGraph: (projectId: string) =>
 		request<ProjectGraphResponse>(`/projects/${projectId}/graph`),
 
-	// Graph positions
+	// Graph positions (classic canvas)
+	//
+	// `x`/`y` are absolute React Flow world coordinates, stored in classic's own
+	// columns. Ruler has a SEPARATE endpoint (`updateRulerPositions` below) writing
+	// tick-relative offsets — the two coordinate systems are not interchangeable and
+	// must never share a column, or switching canvas destroys the other's layout.
 	updateGraphPositions: (
 		projectId: string,
 		positions: Array<{
 			chapterId: string;
-			anchorCommitSha?: string;
-			axisOffset: number;
-			crossOffset: number;
+			x: number;
+			y: number;
 			panelExpanded?: boolean;
 			panelWidth?: number;
 			panelHeight?: number;

@@ -75,7 +75,6 @@ describe("resolveVListBlockTarget", () => {
 	});
 
 	it("returns null for aggregate kinds", () => {
-		expect(target("tool-run-summary", "toolrun-summary-tool-tu_1", ["m1", "m2"])).toBeNull();
 		expect(target("tool-run-count", "toolrun-count-tool-tu_1", ["m1"])).toBeNull();
 		expect(target("activity-trace", "activity-m1-0", ["m1", "m2"])).toBeNull();
 	});

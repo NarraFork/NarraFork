@@ -44,20 +44,29 @@ export function buildRulerCommitForkRequest(commitSha: string) {
 	return { startCommitSha: commitSha, worktreeSource: "commit" as const };
 }
 
+/**
+ * Fork request for a draft node placed on the CLASSIC canvas.
+ *
+ * `x`/`y` are the draft node's absolute React Flow coordinates and travel as
+ * `graphX`/`graphY` so the new chapter appears exactly where the draft sat. They
+ * used to be sent as `axisOffset`/`crossOffset` — ruler's tick-relative pair —
+ * which stored a classic world coordinate in a column ruler interprets against a
+ * commit tick.
+ */
 export function buildDraftForkRequest(options: {
 	title: string;
 	description: string;
 	inheritMode: ForkInheritMode;
 	worktreeSource: ForkWorktreeSource;
-	axisOffset: number;
-	crossOffset: number;
+	x: number;
+	y: number;
 }): ForkChapterRequest {
 	return {
 		title: options.title,
 		description: options.description || undefined,
 		inheritMode: options.inheritMode,
 		worktreeSource: options.worktreeSource,
-		axisOffset: options.axisOffset,
-		crossOffset: options.crossOffset,
+		graphX: options.x,
+		graphY: options.y,
 	};
 }

@@ -47,12 +47,15 @@ export interface NugModelCacheEntry {
 	modelHash?: string;
 	fetchedAt?: number;
 	usdRate?: number;
+	/** Optional protocols this gateway serves; see {@link getNugCachedCapabilities}. */
+	capabilities?: string[];
 }
 
 const cachedModelsByProvider = new Map<string, NugModelInfo[]>();
 const cachedModelHashByProvider = new Map<string, string>();
 const cachedModelsFetchedAtByProvider = new Map<string, number>();
 const cachedUsdRateByProvider = new Map<string, number>();
+const cachedCapabilitiesByProvider = new Map<string, string[]>();
 
 
 function numericModelField(raw: Record<string, unknown>, keys: string[]): number | undefined {
@@ -144,6 +147,30 @@ function loadProviderCacheEntry(providerId: string, value: unknown): void {
 	if (fetchedAt != null) cachedModelsFetchedAtByProvider.set(providerId, fetchedAt);
 	const usdRate = typeof value.usdRate === "number" ? value.usdRate : undefined;
 	if (usdRate != null) cachedUsdRateByProvider.set(providerId, usdRate);
+	const capabilities = normalizeCapabilities(value.capabilities);
+	if (capabilities) cachedCapabilitiesByProvider.set(providerId, capabilities);
+}
+
+/**
+ * Coerce a capability list, dropping anything that is not a non-empty string.
+ *
+ * Three inputs are distinguished, and the difference is diagnostic rather than
+ * behavioural — `nugSupportsCapability` answers false for the last two alike:
+ *
+ * - absent or not an array → `undefined`, "the gateway said nothing". An older
+ *   build omits the field, so the caller must fall back to the legacy endpoint.
+ * - an empty array → `[]`, "the gateway says it serves no optional protocol".
+ *   Kept distinct from the above so a support question about a gateway that
+ *   advertises nothing can be told apart from one running an old image.
+ * - a non-empty array whose entries are all unusable → `undefined`, because that
+ *   is a malformed payload rather than a deliberate empty list. Reporting it as
+ *   an empty list would hide the malformation behind a legitimate-looking value.
+ */
+function normalizeCapabilities(value: unknown): string[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	if (value.length === 0) return [];
+	const list = value.filter((entry): entry is string => typeof entry === "string" && entry !== "");
+	return list.length > 0 ? list : undefined;
 }
 
 export function loadAllCachedNugModels(): void {
@@ -154,6 +181,7 @@ export function loadAllCachedNugModels(): void {
 		cachedModelHashByProvider.clear();
 		cachedModelsFetchedAtByProvider.clear();
 		cachedUsdRateByProvider.clear();
+		cachedCapabilitiesByProvider.clear();
 		const providers = isRecord(data) && isRecord(data.providers) ? data.providers : data;
 		if (!isRecord(providers)) return;
 		for (const [id, value] of Object.entries(providers)) {
@@ -174,6 +202,7 @@ export function saveAllCachedNugModels(): void {
 				modelHash: cachedModelHashByProvider.get(id),
 				fetchedAt: cachedModelsFetchedAtByProvider.get(id),
 				usdRate: cachedUsdRateByProvider.get(id),
+				capabilities: cachedCapabilitiesByProvider.get(id),
 			};
 		}
 		writeFileSync(cachePath, JSON.stringify({ version: 1, providers }));
@@ -202,6 +231,70 @@ export function setNugCachedModels(
 		cachedUsdRateByProvider.set(providerId, usdRate);
 	}
 	return normalized;
+}
+
+/**
+ * Record the optional protocols a gateway reports serving.
+ *
+ * An absent list clears the entry rather than leaving the previous one: a gateway
+ * that was rolled back to an older build must stop being treated as capable, or
+ * every request keeps targeting an endpoint that now returns 404.
+ */
+export function setNugCachedCapabilities(
+	providerId: string,
+	capabilities: unknown,
+): string[] | undefined {
+	const normalized = normalizeCapabilities(capabilities);
+	// Compared against undefined rather than tested for truthiness: an empty array
+	// is a real answer ("serves no optional protocol") and must be stored, while a
+	// truthiness test would route it to the delete branch and make it
+	// indistinguishable from an older gateway that said nothing.
+	if (normalized !== undefined) {
+		cachedCapabilitiesByProvider.set(providerId, normalized);
+	} else {
+		cachedCapabilitiesByProvider.delete(providerId);
+	}
+	return normalized;
+}
+
+/**
+ * The protocols this gateway reported serving, or undefined when it reported none.
+ *
+ * Undefined means "unknown, assume legacy": an older gateway omits the field
+ * entirely, so a caller must fall back to the endpoint that has always existed
+ * rather than probing the new one.
+ */
+export function getNugCachedCapabilities(providerId: string): string[] | undefined {
+	return cachedCapabilitiesByProvider.get(providerId);
+}
+
+/**
+ * Whether the gateway advertises one specific capability.
+ *
+ * Also consulted after a 404 marks the capability withdrawn, so a rolled-back
+ * gateway stops being retried on an endpoint it no longer has.
+ */
+export function nugSupportsCapability(providerId: string, capability: string): boolean {
+	return cachedCapabilitiesByProvider.get(providerId)?.includes(capability) ?? false;
+}
+
+/**
+ * Forget one capability after the gateway proved it absent (a 404 on its endpoint).
+ *
+ * Needed because the model catalog and the served endpoints can disagree: a user
+ * who rolls the gateway image back keeps a cached catalog from the newer build, so
+ * the advertisement outlives the endpoint. Returns whether anything changed.
+ */
+export function dropNugCachedCapability(providerId: string, capability: string): boolean {
+	const current = cachedCapabilitiesByProvider.get(providerId);
+	if (!current?.includes(capability)) return false;
+	const next = current.filter((entry) => entry !== capability);
+	if (next.length > 0) {
+		cachedCapabilitiesByProvider.set(providerId, next);
+	} else {
+		cachedCapabilitiesByProvider.delete(providerId);
+	}
+	return true;
 }
 
 /**

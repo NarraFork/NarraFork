@@ -48,9 +48,9 @@ describe("commitNarratorDefaultDevice", () => {
 
 describe("OAuth narrator device routing", () => {
 	const devices = [
-		{ id: "device-a", slug: "a", name: "Device A", online: true },
-		{ id: "device-b", slug: "b", name: "Device B", online: true },
-		{ id: "device-c", slug: "c", name: "Device C", online: true },
+		{ id: "device-a", slug: "a", name: "Device A", online: true, scope: "global" as const },
+		{ id: "device-b", slug: "b", name: "Device B", online: true, scope: "global" as const },
+		{ id: "device-c", slug: "c", name: "Device C", online: true, scope: "global" as const },
 	];
 
 	test("intersects project devices with the provisioned authorization set", () => {

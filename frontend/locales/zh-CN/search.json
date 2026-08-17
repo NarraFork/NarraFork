@@ -13,6 +13,7 @@
 	"typeChapter": "章节 {{count}}",
 	"typeNarrator": "叙述者 {{count}}",
 	"typeMessage": "消息 {{count}}",
+	"typeKnowledge": "知识库 {{count}}",
 	"sortRelevance": "相关度",
 	"sortTime": "最新",
 	"sortType": "类型",
@@ -21,6 +22,7 @@
 	"label_chapter": "章节",
 	"label_narrator": "叙述者",
 	"label_message": "消息",
+	"label_knowledge": "知识库",
 	"score": "相关度 {{score}}",
 	"matchField": "匹配{{field}}",
 	"status_chapter_active": "活跃",
@@ -32,6 +34,8 @@
 	"status_narrator_working": "工作中",
 	"status_narrator_waiting": "等待中",
 	"status_narrator_archived": "已归档",
+	"status_knowledge_active": "生效",
+	"status_knowledge_archived": "已归档",
 	"messageRole_user": "用户",
 	"messageRole_assistant": "助手",
 	"messageRole_system": "系统",
@@ -39,5 +43,6 @@
 	"messageRole_disp": "展示",
 	"matchField_title": "标题",
 	"matchField_description": "描述",
-	"matchField_message": "消息"
+	"matchField_message": "消息",
+	"matchField_content": "正文"
 }

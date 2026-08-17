@@ -25,12 +25,14 @@ import {
 	useNarratorReviewToolsCapability,
 } from "@frontend/hooks/usePlatform";
 import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
-import { useCreateTerminal, useDeleteTerminal, useTerminals } from "@frontend/hooks/useTerminals";
+
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { api } from "@frontend/lib/api";
 import { buildDraftForkRequest } from "@frontend/lib/chapter-fork-options";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import { notifyResultWarnings } from "@frontend/lib/operation-warnings";
+import { onPanelDragEnd, onPanelDragMove, type PanelDragState } from "@frontend/lib/panel-drag";
+import { Z } from "@frontend/lib/z-index";
 import {
 	Alert,
 	Box,
@@ -46,29 +48,43 @@ import { notifications } from "@mantine/notifications";
 import { IconHandGrab, IconPointer } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
+// Re-exported by dockview-react from dockview-core; publishes the panel behind an
+// in-flight tab drag (native DnD gives us no other way to identify it).
+import { getPanelData, type SerializedDockview } from "dockview-react";
 import { useTranslation } from "react-i18next";
-import { ChapterNode } from "./ChapterNode";
+import { ChapterNode, MIN_RESIZE_WIDTH as MIN_EXPANDED_NODE_WIDTH } from "./ChapterNode";
 import { CherryPickEdge } from "./CherryPickEdge";
-
-import type { DraftMode } from "./DraftNode";
-import { DRAFT_NODE_WIDTH, DraftNode } from "./DraftNode";
+import { DRAFT_NODE_WIDTH, type DraftMode, DraftNode } from "./DraftNode";
+import { DETACHED_GRIP_CLASS, DetachedPanelNode } from "./dock/DetachedPanelNode";
+import { resolveCanvasDropTarget, toRect } from "./dock/detach-hit-test";
+import { isDetachablePanelKind } from "./dock/detachable";
+import {
+	addDetachedNode,
+	type DetachedNode,
+	type DetachedPanelEntry,
+	generateDetachedPanelId,
+	makePanelEntry,
+	removeDetachedNode,
+	serializeDetachedNodes,
+	setDetachedLayout,
+} from "./dock/detached-panels";
+import { getChapterDock } from "./dock/dock-registry";
+import { resolveExpandRequest } from "./dock/expand-limit";
+import { resolveTabDetachSubject } from "./dock/tab-detach";
 import { ForkEdge } from "./ForkEdge";
 import { LassoSelection } from "./LassoSelection";
 import { MergeEdge } from "./MergeEdge";
 import { NodeContextMenu } from "./NodeContextMenu";
 import { ReviewEdge } from "./ReviewEdge";
 import { ReviewNode } from "./ReviewNode";
-import type { TerminalBubble } from "./SelectionToolbar";
 import { SelectionToolbar } from "./SelectionToolbar";
-import { TerminalContextMenu } from "./TerminalContextMenu";
 import { TerminalEdge } from "./TerminalEdge";
-import { TerminalNode } from "./TerminalNode";
 
 const nodeTypes = {
 	chapterNode: ChapterNode,
 	draftNode: DraftNode,
-	terminalNode: TerminalNode,
 	reviewNode: ReviewNode,
+	detachedPanelNode: DetachedPanelNode,
 };
 const edgeTypes = {
 	fork: ForkEdge,
@@ -77,6 +93,36 @@ const edgeTypes = {
 	terminal: TerminalEdge,
 	review: ReviewEdge,
 };
+
+/**
+ * Build the React Flow node for a detached panel node.
+ *
+ * `dragHandle` is the node's own grip bar, and only that: the dockview surface
+ * below owns its whole tab strip (including the blank area, which dockview uses to
+ * drag a group), so pointing the handle at anything inside it would stack two drag
+ * mechanisms on one element.
+ *
+ * `previous` carries over the live React Flow state (selection, measured size) when
+ * the node already existed.
+ */
+function detachedNodeToFlowNode(entry: DetachedNode, chapterId: string, previous?: Node): Node {
+	return {
+		...(previous ?? {}),
+		id: entry.id,
+		type: "detachedPanelNode",
+		position: previous?.position ?? { x: entry.x, y: entry.y },
+		dragHandle: `.${DETACHED_GRIP_CLASS}`,
+		style: previous?.style ?? { width: entry.w, height: entry.h },
+		data: {
+			...((previous?.data as Record<string, unknown>) ?? {}),
+			panelId: entry.id,
+			chapterId,
+			...(entry.layout ? { layout: entry.layout } : {}),
+			...(entry.pendingPanels ? { pendingPanels: entry.pendingPanels } : {}),
+		},
+		selected: previous?.selected ?? false,
+	};
+}
 
 function areStringArraysEqual(a?: readonly string[] | null, b?: readonly string[] | null): boolean {
 	const left = a ?? [];
@@ -123,14 +169,6 @@ interface ContextMenuState {
 		worktreePath?: string | null;
 		reviewStatus?: string | null;
 	};
-}
-
-interface TerminalContextMenuState {
-	x: number;
-	y: number;
-	nodeId: string;
-	terminalId: string;
-	terminalName: string;
 }
 
 const PAN_SPEED = 1.5;
@@ -196,7 +234,7 @@ type HandleableEdge = Pick<Edge, "id" | "source" | "target" | "type" | "data"> &
 	Partial<Pick<Edge, "sourceHandle" | "targetHandle">>;
 
 const DRAFT_EDGE_PREFIX = "__draft_edge_";
-const TERMINAL_EDGE_PREFIX = "__terminal_edge_";
+const DETACHED_PANEL_EDGE_PREFIX = "__detached_panel_edge_";
 
 function assignEdgeHandlesForNodeMap<T extends HandleableEdge>(
 	edge: T,
@@ -244,7 +282,7 @@ function assignEdgeHandlesForNodeMap<T extends HandleableEdge>(
 }
 
 function isLocalEdgeId(edgeId: string) {
-	return edgeId.startsWith(DRAFT_EDGE_PREFIX) || edgeId.startsWith(TERMINAL_EDGE_PREFIX);
+	return edgeId.startsWith(DRAFT_EDGE_PREFIX) || edgeId.startsWith(DETACHED_PANEL_EDGE_PREFIX);
 }
 
 interface NarraFlowProps {
@@ -283,7 +321,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		graphRuntimeStatus,
 		isLoading,
 		error,
-		openedTerminals,
+		detachedPanels: detachedPanelGroups,
 	} = useNarraFlow(projectId);
 	const { savePosition, savePanelState } = useUpdateGraphPositions(projectId);
 	const updateChapter = useUpdateChapter();
@@ -313,9 +351,6 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const { removeTab } = useRecentTabs();
 
 	const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
-	const [terminalContextMenu, setTerminalContextMenu] = useState<TerminalContextMenuState | null>(
-		null,
-	);
 	// `hasWorktree` decides which confirmation text is shown. The server only reaches its
 	// `deleteBranch` call inside an `if (chapter.worktreePath)` block, so a chapter
 	// without one — every snapshot-merged chapter, whose worktreePath is cleared on
@@ -485,7 +520,14 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			if (d?.panelExpanded) {
 				restored.add(node.id);
 				if (d.panelWidth && d.panelHeight) {
-					panelSizesRef.current.set(node.id, { w: d.panelWidth, h: d.panelHeight });
+					// Sizes persisted before the node hosted a dockview can be narrower
+					// than a cluster needs (the old minimum was 280px). Restoring one
+					// verbatim would show a squeezed surface whose split tool panel is
+					// unusable, so widen it to the current minimum.
+					panelSizesRef.current.set(node.id, {
+						w: Math.max(d.panelWidth, MIN_EXPANDED_NODE_WIDTH),
+						h: d.panelHeight,
+					});
 				}
 			}
 		}
@@ -522,9 +564,21 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 
 	const handleToggleExpand = useCallback(
 		(chapterId: string) => {
+			// Each expanded node hosts a live dockview surface (its own ResizeObserver,
+			// splitview, and every open panel's WebSocket / xterm session), so the
+			// number of them is capped. Collapsing is always permitted.
+			const request = resolveExpandRequest(expandedNodesRef.current, chapterId);
+			if (request.action === "refuse") {
+				notifications.show({
+					message: t("nodeDock.expandLimitReached", { limit: request.limit }),
+					color: "yellow",
+				});
+				return;
+			}
+
 			setExpandedNodes((prev) => {
 				const next = new Set(prev);
-				const willExpand = !next.has(chapterId);
+				const willExpand = request.action === "expand";
 				if (willExpand) {
 					next.add(chapterId);
 				} else {
@@ -540,7 +594,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				return next;
 			});
 		},
-		[savePanelState],
+		[savePanelState, t],
 	);
 
 	const edgeIdsByNodeId = useMemo(() => {
@@ -621,15 +675,18 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				}
 			}
 
-			// Terminal edges
-			if (n.type === "terminalNode") {
-				const termData = n.data as { chapterId?: string };
-				if (termData.chapterId && nodeMap.has(termData.chapterId)) {
+			// Detached tool panels link back to the chapter they were torn out of.
+			// `type: "terminal"` is the ATTACHMENT edge style (dashed, teal): it denotes
+			// "a thing belonging to this chapter" rather than a fork/merge relationship
+			// in the story. The name is historical — it once served terminal nodes too.
+			if (n.type === "detachedPanelNode") {
+				const panelData = n.data as { chapterId?: string };
+				if (panelData.chapterId && nodeMap.has(panelData.chapterId)) {
 					localEdges.push(
 						assignEdgeHandlesForNodeMap(
 							{
-								id: `${TERMINAL_EDGE_PREFIX}${n.id}`,
-								source: termData.chapterId,
+								id: `${DETACHED_PANEL_EDGE_PREFIX}${n.id}`,
+								source: panelData.chapterId,
 								target: n.id,
 								type: "terminal",
 							} as Edge,
@@ -676,10 +733,12 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			const shouldRecomputeLocalEdges =
 				!affectedNodeIds ||
 				nextNodes.some((node) => {
-					if (node.type === "terminalNode") {
+					// An attachment node's edge depends on BOTH ends, so a change to either
+					// the node or its chapter has to rebuild it.
+					if (node.type === "detachedPanelNode") {
 						if (affectedNodeIds.has(node.id)) return true;
-						const termData = node.data as { chapterId?: string };
-						return !!termData.chapterId && affectedNodeIds.has(termData.chapterId);
+						const panelData = node.data as { chapterId?: string };
+						return !!panelData.chapterId && affectedNodeIds.has(panelData.chapterId);
 					}
 					if (node.type !== "draftNode") return false;
 					if (affectedNodeIds.has(node.id)) return true;
@@ -705,6 +764,170 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		},
 		[buildLocalEdges, edgeIdsByNodeId, edges],
 	);
+
+	// ── Detached tool panels ──
+	//
+	// The nodes live in `nodes` state (like terminal nodes) because React Flow applies
+	// drag and resize changes there. `nodes` is therefore the single source of truth
+	// while mounted; the server column is written from it, per chapter.
+
+	/** Read a detached React Flow node back into its stored shape. */
+	const readDetachedNode = useCallback((node: Node): DetachedNode | null => {
+		const d = node.data as {
+			panelId?: string;
+			layout?: SerializedDockview;
+			pendingPanels?: DetachedPanelEntry[];
+		};
+		// Neither a layout nor a pending list means nothing to render or restore.
+		if (!d.panelId || (!d.layout && !d.pendingPanels?.length)) return null;
+		const size = detachedSizesRef.current.get(node.id);
+		return {
+			id: d.panelId,
+			x: node.position.x,
+			y: node.position.y,
+			w: size?.w ?? (node.style?.width as number) ?? 480,
+			h: size?.h ?? (node.style?.height as number) ?? 360,
+			...(d.layout ? { layout: d.layout } : {}),
+			...(d.pendingPanels ? { pendingPanels: d.pendingPanels } : {}),
+		};
+	}, []);
+
+	/** Rebuild one chapter's stored list from the live nodes and persist it. */
+	const persistDetachedForChapter = useCallback(
+		(chapterId: string, allNodes: Node[]) => {
+			const detached: DetachedNode[] = [];
+			for (const node of allNodes) {
+				if (node.type !== "detachedPanelNode") continue;
+				if ((node.data as { chapterId?: string }).chapterId !== chapterId) continue;
+				const entry = readDetachedNode(node);
+				if (entry) detached.push(entry);
+			}
+			const serialized = serializeDetachedNodes(detached);
+			// null means over the size cap; the request would be rejected, so skip it
+			// rather than fire a doomed write.
+			if (serialized === null) return;
+			api.updateChapterDetachedPanels(chapterId, serialized).catch(() => {});
+		},
+		[readDetachedNode],
+	);
+
+	/** Live sizes of detached nodes, tracked from resize changes (like terminals). */
+	const detachedSizesRef = useRef<Map<string, { w: number; h: number }>>(new Map());
+
+	/**
+	 * Apply a change to the detached nodes of ONE chapter: swap in the new list,
+	 * rebuild the React Flow nodes from it, and persist.
+	 *
+	 * Every mutation (a layout change, a node added or removed) goes through here so
+	 * the live nodes and the stored column cannot drift apart.
+	 */
+	const applyDetachedChange = useCallback(
+		(chapterId: string, mutate: (current: DetachedNode[]) => DetachedNode[] | null) => {
+			const current: DetachedNode[] = [];
+			for (const node of nodesRef.current) {
+				if (node.type !== "detachedPanelNode") continue;
+				if ((node.data as { chapterId?: string }).chapterId !== chapterId) continue;
+				const entry = readDetachedNode(node);
+				if (entry) current.push(entry);
+			}
+			const next = mutate(current);
+			if (!next) return;
+
+			const byId = new Map(next.map((n) => [n.id, n]));
+			const seen = new Set<string>();
+			const rebuilt: Node[] = [];
+			for (const node of nodesRef.current) {
+				const isDetachedHere =
+					node.type === "detachedPanelNode" &&
+					(node.data as { chapterId?: string }).chapterId === chapterId;
+				if (!isDetachedHere) {
+					rebuilt.push(node);
+					continue;
+				}
+				const entry = byId.get(node.id);
+				// Absent from the new list: merged away or closed.
+				if (!entry) {
+					detachedSizesRef.current.delete(node.id);
+					continue;
+				}
+				seen.add(entry.id);
+				rebuilt.push(detachedNodeToFlowNode(entry, chapterId, node));
+			}
+			// Nodes the mutation created (a tab split out into its own node).
+			for (const entry of next) {
+				if (seen.has(entry.id)) continue;
+				detachedSizesRef.current.set(entry.id, { w: entry.w, h: entry.h });
+				rebuilt.push(detachedNodeToFlowNode(entry, chapterId));
+			}
+
+			nodesRef.current = rebuilt;
+			setNodes(rebuilt);
+			recomputeEdges(rebuilt, { full: true });
+			persistDetachedForChapter(chapterId, rebuilt);
+		},
+		[persistDetachedForChapter, readDetachedNode, recomputeEdges],
+	);
+
+	/** Chapter owning a live detached node, or undefined when it is not one. */
+	const chapterOfDetachedNode = useCallback((nodeId: string): string | undefined => {
+		const node = nodesRef.current.find((n) => n.id === nodeId);
+		if (node?.type !== "detachedPanelNode") return undefined;
+		return (node.data as { chapterId?: string }).chapterId;
+	}, []);
+
+	/**
+	 * Store a detached node's dockview layout.
+	 *
+	 * This is the ONLY writer of a node's contents now: everything that used to be a
+	 * separate operation (merge, split, close a tab, activate a tab) happens inside
+	 * dockview and arrives here as "the layout changed".
+	 */
+	const saveDetachedLayout = useCallback(
+		(nodeId: string, layout: SerializedDockview) => {
+			const chapterId = chapterOfDetachedNode(nodeId);
+			if (!chapterId) return;
+			applyDetachedChange(chapterId, (current) => {
+				const next = setDetachedLayout(current, nodeId, layout);
+				// Same reference means the node is gone from the list; nothing to write.
+				return next === current ? null : next;
+			});
+		},
+		[applyDetachedChange, chapterOfDetachedNode],
+	);
+
+	/**
+	 * Remove a whole detached node — its surface ran empty, the user closed it, or
+	 * another surface took its panels.
+	 */
+	const removeDetachedPanelNode = useCallback(
+		(nodeId: string) => {
+			const chapterId = chapterOfDetachedNode(nodeId);
+			if (!chapterId) return;
+			applyDetachedChange(chapterId, (current) => removeDetachedNode(current, nodeId));
+		},
+		[applyDetachedChange, chapterOfDetachedNode],
+	);
+
+	/** Materialise the chapters' stored detached panels once, on first graph load. */
+	const restoredDetachedRef = useRef(false);
+	useEffect(() => {
+		if (restoredDetachedRef.current || detachedPanelGroups.length === 0) return;
+		restoredDetachedRef.current = true;
+		const spawned: Node[] = [];
+		for (const group of detachedPanelGroups) {
+			for (const entry of group.nodes) {
+				// `narratorId` is left out here and injected by `nodesForFlow` from live
+				// graph data, so a fork or split cannot leave a stale id behind.
+				spawned.push(detachedNodeToFlowNode(entry, group.chapterId));
+				detachedSizesRef.current.set(entry.id, { w: entry.w, h: entry.h });
+			}
+		}
+		if (spawned.length === 0) return;
+		const nextNodes = [...nodesRef.current, ...spawned];
+		nodesRef.current = nextNodes;
+		setNodes(nextNodes);
+		recomputeEdges(nextNodes, { full: true });
+	}, [detachedPanelGroups, recomputeEdges]);
 
 	// Subscribe to narrator status changes via WebSocket
 	const narratorIdMap = useMemo(() => {
@@ -1034,6 +1257,55 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		return renderedNodes;
 	}, [nodes, expandedNodes, liveStatuses, handleToggleExpand]);
 
+	/**
+	 * Inject the live narrator id (and the close handler) into detached panel nodes.
+	 *
+	 * The nodes themselves live in `nodes` state like terminal nodes do — React Flow
+	 * applies drag/resize changes there, so a derived list could not be moved. Only
+	 * the narrator id is injected here, resolved from the same graph data the chapter
+	 * node uses: that is why a fork or split which changes a chapter's primary
+	 * narrator needs no rewrite of the stored entries.
+	 */
+	const nodesForFlow = useMemo(() => {
+		const narratorByChapter = new Map<string, string | null>();
+		for (const node of graphNodes) {
+			// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
+			narratorByChapter.set(node.id, ((node as any).data?.narratorId as string) ?? null);
+		}
+		let touched = false;
+		const next = nodesWithExpand.map((node) => {
+			if (node.type !== "detachedPanelNode") return node;
+			const data = node.data as { chapterId?: string; narratorId?: string | null };
+			const narratorId = narratorByChapter.get(data.chapterId ?? "") ?? null;
+			if (
+				data.narratorId === narratorId &&
+				node.data.onLayoutChange === saveDetachedLayout &&
+				node.data.onCloseNode === removeDetachedPanelNode
+			) {
+				return node;
+			}
+			touched = true;
+			return {
+				...node,
+				data: {
+					...node.data,
+					narratorId,
+					onLayoutChange: saveDetachedLayout,
+					// Also how a source node disappears after its last panel is dragged
+					// away: the surface reports itself empty and this removes it.
+					onCloseNode: removeDetachedPanelNode,
+				},
+			};
+		});
+		return touched ? next : nodesWithExpand;
+	}, [nodesWithExpand, graphNodes, saveDetachedLayout, removeDetachedPanelNode]);
+
+	/** Whether any detached panel node is currently on the canvas. */
+	const hasDetachedPanels = useMemo(
+		() => nodesForFlow.some((n) => n.type === "detachedPanelNode"),
+		[nodesForFlow],
+	);
+
 	// Sync local nodes state when upstream graph data changes.
 	// Incrementally merge: preserve positions of nodes the user has dragged,
 	// keep local-only draft/terminal nodes, and only update nodes whose data
@@ -1044,8 +1316,11 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		const prev = prevGraphNodesRef.current;
 		prevGraphNodesRef.current = graphNodes;
 
+		// Client-owned nodes that must survive a graph refetch: drafts, plus detached
+		// tool panels (their positions live in the chapter's own `detachedPanelsJson`,
+		// not in the graph node payload).
 		const localOnly = nodesRef.current.filter(
-			(n) => n.type === "draftNode" || n.type === "terminalNode",
+			(n) => n.type === "draftNode" || n.type === "detachedPanelNode",
 		);
 
 		// Fast path: if the upstream array reference is the same, nothing changed.
@@ -1107,38 +1382,21 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	}, [graphNodes, recomputeEdges]);
 
 	const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const terminalSizesRef = useRef<Map<string, { w: number; h: number }>>(new Map());
-	const terminalResizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	/** Chapters whose detached panels were resized, pending a debounced write. */
+	const detachedResizeChaptersRef = useRef<Set<string>>(new Set());
+	const detachedResizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 	// Cleanup timers on unmount
 	useEffect(() => {
 		return () => {
 			if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
-			if (terminalResizeTimerRef.current) clearTimeout(terminalResizeTimerRef.current);
+			if (detachedResizeTimerRef.current) clearTimeout(detachedResizeTimerRef.current);
 		};
 	}, []);
-
-	/** Persist terminal graph state (fire-and-forget) */
-	const persistTerminalGraph = useCallback(
-		(
-			terminalId: string,
-			state: {
-				graphOpened?: boolean;
-				graphX?: number;
-				graphY?: number;
-				graphWidth?: number;
-				graphHeight?: number;
-			},
-		) => {
-			api.updateTerminalGraphState(terminalId, state).catch(() => {});
-		},
-		[],
-	);
 
 	const onNodesChange = useCallback(
 		(changes: NodeChange[]) => {
 			let hasResize = false;
-			let hasTerminalResize = false;
 			const movedNodeIds = new Set<string>();
 			for (const change of changes) {
 				if (change.type === "position" && "id" in change) {
@@ -1153,14 +1411,15 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						});
 						hasResize = true;
 					}
-					// Track terminal node resize
+					// Track detached panel resize (persisted per owning chapter below).
 					const node = nodesRef.current.find((n) => n.id === change.id);
-					if (node?.type === "terminalNode") {
-						terminalSizesRef.current.set(change.id, {
+					if (node?.type === "detachedPanelNode") {
+						detachedSizesRef.current.set(change.id, {
 							w: change.dimensions.width,
 							h: change.dimensions.height,
 						});
-						hasTerminalResize = true;
+						const chapterId = (node.data as { chapterId?: string }).chapterId;
+						if (chapterId) detachedResizeChaptersRef.current.add(chapterId);
 					}
 				}
 			}
@@ -1185,22 +1444,17 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					}
 				}, 800);
 			}
-			if (hasTerminalResize) {
-				if (terminalResizeTimerRef.current) clearTimeout(terminalResizeTimerRef.current);
-				terminalResizeTimerRef.current = setTimeout(() => {
-					for (const [nodeId, size] of terminalSizesRef.current) {
-						const node = nodesRef.current.find((n) => n.id === nodeId);
-						if (!node || node.type !== "terminalNode") continue;
-						const tid = (node.data as { terminalId?: string }).terminalId;
-						if (tid) {
-							persistTerminalGraph(tid, { graphWidth: size.w, graphHeight: size.h });
-						}
+			if (detachedResizeChaptersRef.current.size > 0) {
+				if (detachedResizeTimerRef.current) clearTimeout(detachedResizeTimerRef.current);
+				detachedResizeTimerRef.current = setTimeout(() => {
+					for (const chapterId of detachedResizeChaptersRef.current) {
+						persistDetachedForChapter(chapterId, nodesRef.current);
 					}
-					terminalSizesRef.current.clear();
+					detachedResizeChaptersRef.current.clear();
 				}, 800);
 			}
 		},
-		[savePanelState, persistTerminalGraph],
+		[savePanelState, persistDetachedForChapter],
 	);
 
 	const onNodeDragStop: NodeMouseHandler = useCallback(
@@ -1209,28 +1463,30 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			affectedNodeIds.add(node.id);
 			movedNodeIdsRef.current.clear();
 			recomputeEdges(nodesRef.current, { affectedNodeIds });
+			// Collected so one write covers every panel moved in this gesture.
+			const movedDetachedChapters = new Set<string>();
 			for (const nodeId of affectedNodeIds) {
 				const movedNode = nodesRef.current.find((n) => n.id === nodeId);
 				if (!movedNode || movedNode.type === "draftNode") continue;
-				if (movedNode.type === "terminalNode") {
-					const tid = (movedNode.data as { terminalId?: string }).terminalId;
-					if (tid) {
-						persistTerminalGraph(tid, {
-							graphX: movedNode.position.x,
-							graphY: movedNode.position.y,
-						});
-					}
+				if (movedNode.type === "detachedPanelNode") {
+					// Detached panels are stored per chapter, not as graph node positions.
+					const chapterId = (movedNode.data as { chapterId?: string }).chapterId;
+					if (chapterId) movedDetachedChapters.add(chapterId);
 					continue;
 				}
 				savePosition(movedNode.id, movedNode.position.x, movedNode.position.y);
 			}
+			for (const chapterId of movedDetachedChapters) {
+				persistDetachedForChapter(chapterId, nodesRef.current);
+			}
 		},
-		[recomputeEdges, savePosition, persistTerminalGraph],
+		[recomputeEdges, savePosition, persistDetachedForChapter],
 	);
 
 	const onNodeDoubleClick: NodeMouseHandler = useCallback(
 		(_event, node) => {
-			if (node.type === "draftNode" || node.type === "terminalNode") return;
+			// Only chapter-like nodes expand or navigate; the rest are attachments.
+			if (node.type === "draftNode" || node.type === "detachedPanelNode") return;
 			// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
 			const d = node.data as any;
 			if (d.narratorId) {
@@ -1247,24 +1503,12 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	);
 
 	const onNodeContextMenu: NodeMouseHandler = useCallback((event, node) => {
-		if (node.type === "draftNode") return;
+		// Drafts have no menu; a detached tool panel is not a chapter, so the chapter
+		// menu (fork / review / dormant / delete) would act on a non-existent chapter.
+		if (node.type === "draftNode" || node.type === "detachedPanelNode") return;
 		event.preventDefault();
-		if (node.type === "terminalNode") {
-			// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
-			const d = node.data as any;
-			setContextMenu(null);
-			setTerminalContextMenu({
-				x: event.clientX,
-				y: event.clientY,
-				nodeId: node.id,
-				terminalId: d.terminalId ?? "",
-				terminalName: d.terminalName ?? "",
-			});
-			return;
-		}
 		// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
 		const d = node.data as any;
-		setTerminalContextMenu(null);
 		setContextMenu({
 			x: event.clientX,
 			y: event.clientY,
@@ -1287,7 +1531,6 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 
 	const onPaneClick = useCallback(() => {
 		setContextMenu(null);
-		setTerminalContextMenu(null);
 		// Clear lasso selection when clicking blank canvas
 		setNodes((nds) => {
 			if (nds.every((n) => !n.selected)) return nds;
@@ -1304,221 +1547,314 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		);
 	}, []);
 
-	// Derive selected node IDs from nodes state (exclude draft and terminal nodes)
+	// Derive selected node IDs from nodes state. Only chapter-like nodes count: the
+	// selection toolbar offers fork/merge, which are meaningless for an attachment
+	// (draft, terminal, detached tool panel) and whose ids are not chapter ids.
 	const selectedNodeIds = useMemo(
 		() =>
 			nodes
-				.filter((n) => n.selected && n.type !== "draftNode" && n.type !== "terminalNode")
+				.filter((n) => n.selected && n.type !== "draftNode" && n.type !== "detachedPanelNode")
 				.map((n) => n.id),
 		[nodes],
 	);
 
-	// --- Terminal bubbles for selected chapter ---
-	const selectedChapterId = selectedNodeIds.length === 1 ? selectedNodeIds[0] : "";
-	const { data: chapterTerminals } = useTerminals(selectedChapterId);
-	const createTerminalMut = useCreateTerminal(selectedChapterId);
-	const deleteTerminalMut = useDeleteTerminal(selectedChapterId);
+	// ── Tear a dock panel out onto the canvas ──
+	//
+	// The panel-drag singleton is shared by every dockview surface, so this listener
+	// sees tool-panel header drags from any node's dock. Releasing over blank canvas
+	// detaches; releasing over a dock is that dock's business (its own onDropSubject).
+	const detachHintRef = useRef<{ x: number; y: number } | null>(null);
+	const [detachHint, setDetachHint] = useState<{ x: number; y: number } | null>(null);
 
-	// Collect terminal IDs already opened as nodes
-	const openedTerminalIds = useMemo(() => {
-		const ids = new Set<string>();
-		for (const n of nodes) {
-			if (n.type === "terminalNode") {
-				const tid = (n.data as { terminalId?: string }).terminalId;
-				if (tid) ids.add(tid);
-			}
+	/** Screen rects of every mounted node dock, in node render order. */
+	const collectDockRects = useCallback(() => {
+		const rects: Array<{ surfaceId: string; rect: ReturnType<typeof toRect> }> = [];
+		for (const el of document.querySelectorAll<HTMLElement>("[data-chapter-node-dock]")) {
+			const surfaceId = el.dataset.chapterNodeDock;
+			if (!surfaceId) continue;
+			rects.push({ surfaceId, rect: toRect(el.getBoundingClientRect()) });
 		}
-		return ids;
-	}, [nodes]);
+		return rects;
+	}, []);
 
-	const terminalBubbles: TerminalBubble[] = useMemo(
-		() =>
-			(chapterTerminals ?? [])
-				.filter(
-					(t: { id: string; status?: string }) =>
-						t.status === "running" && !openedTerminalIds.has(t.id),
-				)
-				.map((t: { id: string; name?: string }) => ({
-					id: t.id,
-					name: t.name ?? "Terminal",
-				})),
-		[chapterTerminals, openedTerminalIds],
-	);
+	/** Screen rects of every standalone panel node, in node render order. */
+	const collectDetachedRects = useCallback(() => {
+		const rects: Array<{ nodeId: string; rect: ReturnType<typeof toRect> }> = [];
+		for (const el of document.querySelectorAll<HTMLElement>("[data-detached-node]")) {
+			const nodeId = el.dataset.detachedNode;
+			if (!nodeId) continue;
+			rects.push({ nodeId, rect: toRect(el.getBoundingClientRect()) });
+		}
+		return rects;
+	}, []);
 
-	const terminalNodeIdCounter = useRef(0);
-
-	/** Minimize: remove the node from the graph (terminal keeps running) */
-	const minimizeTerminalNode = useCallback(
-		(nodeId: string) => {
-			const node = nodesRef.current.find((n) => n.id === nodeId);
-			const terminalId = (node?.data as { terminalId?: string })?.terminalId;
-			if (terminalId) persistTerminalGraph(terminalId, { graphOpened: false });
-			const nextNodes = nodesRef.current.filter((n) => n.id !== nodeId);
-			nodesRef.current = nextNodes;
-			setNodes(nextNodes);
-			recomputeEdges(nextNodes, { full: true });
+	/**
+	 * Classify a viewport point as blank canvas (`detach`), over some node's dock
+	 * (`dock`, that dock's business), over a standalone panel node (`detachedNode`,
+	 * a merge target), or off-canvas (`outside`).
+	 */
+	const resolveDropPoint = useCallback(
+		(x: number, y: number) => {
+			const wrapper = flowWrapperRef.current;
+			return resolveCanvasDropTarget(
+				wrapper ? toRect(wrapper.getBoundingClientRect()) : null,
+				collectDockRects(),
+				x,
+				y,
+				collectDetachedRects(),
+			);
 		},
-		[recomputeEdges, persistTerminalGraph],
+		[collectDockRects, collectDetachedRects],
 	);
 
-	/** Close: kill the terminal process and remove the node */
-	const closeTerminalNode = useCallback(
-		(nodeId: string, terminalId: string) => {
-			persistTerminalGraph(terminalId, { graphOpened: false });
-			deleteTerminalMut.mutate(terminalId);
-			const nextNodes = nodesRef.current.filter((n) => n.id !== nodeId);
-			nodesRef.current = nextNodes;
-			setNodes(nextNodes);
-			recomputeEdges(nextNodes, { full: true });
-		},
-		[recomputeEdges, deleteTerminalMut, persistTerminalGraph],
-	);
-
-	/** Rename: update name on server and in the node data */
-	const renameTerminalNode = useCallback((terminalId: string, name: string) => {
-		api.renameTerminal(terminalId, name).catch(() => {});
-		// Update node data in-place so the name reflects immediately
-		setNodes((nds) =>
-			nds.map((n) => {
-				if (
-					n.type !== "terminalNode" ||
-					(n.data as { terminalId?: string }).terminalId !== terminalId
-				)
-					return n;
-				return { ...n, data: { ...n.data, terminalName: name } };
-			}),
+	/** Whether this drag is a tool panel that may be torn out. */
+	const isDetachableDrag = useCallback((state: PanelDragState) => {
+		return (
+			state.subjectKind === "tool" &&
+			!!state.panelId && // a live dock panel (a detached one has none)
+			isDetachablePanelKind(state.toolKind)
 		);
 	}, []);
 
-	const spawnTerminalNode = useCallback(
-		(
-			terminalId: string,
-			terminalName: string,
-			chapterId: string,
-			position: { x: number; y: number },
-			size?: { w: number; h: number },
-		) => {
-			// Don't add duplicate terminal nodes
-			if (
-				nodesRef.current.some(
-					(n) =>
-						n.type === "terminalNode" &&
-						(n.data as { terminalId?: string }).terminalId === terminalId,
-				)
-			) {
+	/**
+	 * Guard a whole-node drag that started on a detached node's grip bar.
+	 *
+	 * Very little happens here, because each release point already has an owner:
+	 *
+	 *  - over another surface (detached node or chapter dock) → that surface's
+	 *    `onDropSubject` takes the panel and releases the source node
+	 *  - over blank canvas → React Flow already moved the node and
+	 *    `onNodeDragStop` persisted it
+	 *  - outside the canvas → cancelled
+	 *
+	 * The one thing this must still do is refuse a cross-chapter drop: detached nodes
+	 * are persisted per chapter, so a surface cannot hold panels from two chapters —
+	 * there would be no column to store the result in. Without this the drop would
+	 * appear to work and then vanish on reload.
+	 */
+	const guardDetachedNodeDrop = useCallback(
+		(final: PanelDragState) => {
+			const chapterId = chapterOfDetachedNode(final.id);
+			if (!chapterId) return;
+			const target = resolveDropPoint(final.x, final.y);
+			const targetChapter =
+				target.kind === "detachedNode"
+					? chapterOfDetachedNode(target.nodeId)
+					: target.kind === "dock"
+						? target.surfaceId
+						: undefined;
+			if (targetChapter && targetChapter !== chapterId) {
+				notifications.show({ message: t("nodeDock.mergeForeignChapter"), color: "yellow" });
+			}
+		},
+		[chapterOfDetachedNode, resolveDropPoint, t],
+	);
+
+	/**
+	 * Move a live dock panel onto the canvas as its own node.
+	 *
+	 * Shared by BOTH tear-out routes — a panel header drag (pointer-driven, via the
+	 * panel-drag singleton) and a dockview tab drag (HTML5 native DnD) — because the
+	 * ordering here is a correctness requirement, not a preference: the source panel
+	 * must be closed BEFORE the node is placed, or a failure in between leaves the
+	 * same panel living in two places at once. Two copies of that would drift.
+	 *
+	 * `screenX/screenY` are viewport coordinates of the release point.
+	 */
+	const detachPanelToCanvas = useCallback(
+		(input: {
+			chapterId: string;
+			panelId: string;
+			kind: string | undefined;
+			resourceId?: string;
+			screenX: number;
+			screenY: number;
+		}) => {
+			const { chapterId, panelId, kind, resourceId } = input;
+			if (!isDetachablePanelKind(kind)) return;
+
+			// The canvas holds no DockviewApi of its own, so it reaches the originating
+			// dock through the registry. If that lookup fails — node collapsed mid-drag,
+			// panel already closed — abandon the tear-out entirely: placing the node
+			// anyway would leave the same panel both on the canvas and in the dock.
+			const sourceApi = getChapterDock(chapterId)?.apiRef.current;
+			const sourcePanel = sourceApi?.getPanel(panelId);
+			if (!sourcePanel) return;
+
+			const position = reactFlowRef.current?.screenToFlowPosition({
+				x: input.screenX,
+				y: input.screenY,
+			}) ?? { x: 0, y: 0 };
+
+			let refusal: "limit" | "duplicate" | null = null;
+			let limit = 0;
+			applyDetachedChange(chapterId, (current) => {
+				const result = addDetachedNode(current, {
+					id: generateDetachedPanelId(),
+					x: position.x,
+					y: position.y,
+					w: 480,
+					h: 360,
+					// No layout yet: the surface builds one on first mount and persists it.
+					pendingPanels: [makePanelEntry(kind, resourceId)],
+				});
+				if (!result.ok) {
+					refusal = result.reason;
+					if (result.reason === "limit") limit = result.limit;
+					return null;
+				}
+				// Close the dock panel BEFORE the node is placed. If this order were
+				// reversed and the close failed, the same panel would exist in both
+				// places. Inside the mutator so it only runs once the rules passed.
+				sourcePanel.api.close();
+				return result.nodes;
+			});
+
+			if (refusal) {
+				notifications.show({
+					message:
+						refusal === "limit"
+							? t("nodeDock.detachLimitReached", { limit })
+							: t("nodeDock.detachDuplicate"),
+					color: "yellow",
+				});
+			}
+		},
+		[applyDetachedChange, t],
+	);
+
+	useEffect(() => {
+		const clearHint = () => {
+			if (detachHintRef.current) {
+				detachHintRef.current = null;
+				setDetachHint(null);
+			}
+		};
+
+		const unsubMove = onPanelDragMove((state) => {
+			// Only a tear-out gets a hint. An already-detached panel being moved needs
+			// none: the node itself follows the pointer, so a label trailing it would
+			// just be noise restating what is already visible.
+			if (!isDetachableDrag(state)) {
+				clearHint();
 				return;
 			}
-			const w = size?.w ?? 480;
-			const h = size?.h ?? 360;
-			const nodeId = `__terminal_${++terminalNodeIdCounter.current}`;
-			const termNode: Node = {
-				id: nodeId,
-				type: "terminalNode",
-				position,
-				dragHandle: ".terminal-node-drag-handle",
-				style: { width: w, height: h },
-				data: {
-					terminalId,
-					terminalName,
-					chapterId,
-					onMinimize: minimizeTerminalNode,
-					onClose: closeTerminalNode,
-					onRename: renameTerminalNode,
-				},
-				selected: false,
-			};
-			const nextNodes = [...nodesRef.current, termNode];
-			nodesRef.current = nextNodes;
-			setNodes(nextNodes);
-			recomputeEdges(nextNodes, { full: true });
-			// Persist opened state
-			persistTerminalGraph(terminalId, {
-				graphOpened: true,
-				graphX: position.x,
-				graphY: position.y,
-				graphWidth: w,
-				graphHeight: h,
-			});
-		},
-		[
-			recomputeEdges,
-			minimizeTerminalNode,
-			closeTerminalNode,
-			renameTerminalNode,
-			persistTerminalGraph,
-		],
-	);
-
-	// Restore terminal nodes from persisted openedTerminals on first load
-	const restoredTerminalsRef = useRef(false);
-	useEffect(() => {
-		if (restoredTerminalsRef.current || openedTerminals.length === 0) return;
-		restoredTerminalsRef.current = true;
-		for (const t of openedTerminals) {
-			if (!t.chapterId) continue;
-			const chapterNode = nodesRef.current.find((n) => n.id === t.chapterId);
-			const x = t.graphX ?? (chapterNode?.position?.x ?? 0) + 320;
-			const y = t.graphY ?? chapterNode?.position?.y ?? 0;
-			spawnTerminalNode(
-				t.id,
-				t.name,
-				t.chapterId,
-				{ x, y },
-				{
-					w: t.graphWidth ?? 480,
-					h: t.graphHeight ?? 360,
-				},
-			);
-		}
-	}, [openedTerminals, spawnTerminalNode]);
-
-	const handleOpenTerminal = useCallback(
-		(chapterId: string, terminalId: string, terminalName: string) => {
-			// Place to the right of the chapter node
-			const chapterNode = nodesRef.current.find((n) => n.id === chapterId);
-			const x = (chapterNode?.position?.x ?? 0) + (chapterNode?.measured?.width ?? 280) + 40;
-			const y = chapterNode?.position?.y ?? 0;
-			spawnTerminalNode(terminalId, terminalName, chapterId, { x, y });
-		},
-		[spawnTerminalNode],
-	);
-
-	const handleCreateTerminal = useCallback(
-		(chapterId: string) => {
-			createTerminalMut.mutate(undefined, {
-				onSuccess: (data: { id: string; name?: string }) => {
-					const chapterNode = nodesRef.current.find((n) => n.id === chapterId);
-					const x = (chapterNode?.position?.x ?? 0) + (chapterNode?.measured?.width ?? 280) + 40;
-					const y = chapterNode?.position?.y ?? 0;
-					spawnTerminalNode(data.id, data.name ?? "Terminal", chapterId, { x, y });
-				},
-			});
-		},
-		[createTerminalMut, spawnTerminalNode],
-	);
-
-	const handleDragTerminal = useCallback(
-		(
-			chapterId: string,
-			terminal: { id: string; name: string } | "new",
-			screenX: number,
-			screenY: number,
-		) => {
-			const rfInstance = reactFlowRef.current;
-			if (!rfInstance) return;
-			const flowPos = rfInstance.screenToFlowPosition({ x: screenX, y: screenY });
-
-			if (terminal === "new") {
-				createTerminalMut.mutate(undefined, {
-					onSuccess: (data: { id: string; name?: string }) => {
-						spawnTerminalNode(data.id, data.name ?? "Terminal", chapterId, flowPos);
-					},
-				});
+			const target = resolveDropPoint(state.x, state.y);
+			if (target.kind === "detach") {
+				detachHintRef.current = { x: state.x, y: state.y };
+				setDetachHint({ x: state.x, y: state.y });
 			} else {
-				spawnTerminalNode(terminal.id, terminal.name, chapterId, flowPos);
+				clearHint();
 			}
+		});
+
+		const unsubEnd = onPanelDragEnd((final) => {
+			const hint = detachHintRef.current;
+			clearHint();
+			if (!final) return;
+
+			// A whole-node drag from a grip bar: no `panelId` (it denotes no single
+			// panel) and no `toolKind` (a node may hold several kinds).
+			if (final.subjectKind === "tool" && !final.panelId && !final.toolKind) {
+				guardDetachedNodeDrop(final);
+				return;
+			}
+
+			// Otherwise a tear-out from a dock. Dragging INTO a dock is that dock's
+			// onDropSubject, so only a release over blank canvas reaches here.
+			if (!hint || !isDetachableDrag(final)) return;
+			// `surfaceId` is the chapter id for a header drag (stamped at drag start).
+			const chapterId = final.surfaceId;
+			const panelId = final.panelId;
+			if (!chapterId || !panelId) return;
+			detachPanelToCanvas({
+				chapterId,
+				panelId,
+				kind: final.toolKind,
+				...(final.resourceId ? { resourceId: final.resourceId } : {}),
+				screenX: hint.x,
+				screenY: hint.y,
+			});
+		});
+
+		return () => {
+			unsubMove();
+			unsubEnd();
+		};
+	}, [detachPanelToCanvas, guardDetachedNodeDrop, isDetachableDrag, resolveDropPoint]);
+
+	// ── Tear a dock panel out by dragging its TAB (HTML5 native DnD) ──
+	//
+	// A tab drag never reaches the pointer-driven listeners above, so the canvas has
+	// to be a real native drop target. Dockview publishes the dragged panel through
+	// `getPanelData()` for the duration of the drag; `resolveTabDetachSubject` turns
+	// that into a chapter + kind. See `./dock/tab-detach` for why the hooks dockview
+	// appears to offer are unusable.
+
+	/** The in-flight tab drag, when it is one we would accept. */
+	const tabDragSubject = useCallback(() => {
+		return resolveTabDetachSubject(getPanelData()?.panelId);
+	}, []);
+
+	const handleCanvasDragOver = useCallback(
+		(e: React.DragEvent) => {
+			const subject = tabDragSubject();
+			// Not a droppable tab (chat, details, a foreign drag): do NOT preventDefault,
+			// so the browser keeps showing the "cannot drop" cursor rather than inviting
+			// a release that would silently do nothing.
+			if (!subject) return;
+			const target = resolveDropPoint(e.clientX, e.clientY);
+			if (target.kind !== "detach") {
+				// Over a dock: that dock handles the drop natively. Leaving it
+				// un-prevented here keeps this from competing with it.
+				if (detachHintRef.current) {
+					detachHintRef.current = null;
+					setDetachHint(null);
+				}
+				return;
+			}
+			// Required by native DnD: without preventDefault on dragover/dragenter the
+			// drop event never fires at all.
+			e.preventDefault();
+			detachHintRef.current = { x: e.clientX, y: e.clientY };
+			setDetachHint({ x: e.clientX, y: e.clientY });
 		},
-		[createTerminalMut, spawnTerminalNode],
+		[resolveDropPoint, tabDragSubject],
+	);
+
+	const handleCanvasDragLeave = useCallback((e: React.DragEvent) => {
+		// Native dragleave also fires when moving BETWEEN descendants, so clearing
+		// unconditionally would make the hint flicker while crossing nodes. Only a
+		// pointer that left the wrapper entirely counts.
+		const next = e.relatedTarget as globalThis.Node | null;
+		if (next && flowWrapperRef.current?.contains(next)) return;
+		detachHintRef.current = null;
+		setDetachHint(null);
+	}, []);
+
+	const handleCanvasDrop = useCallback(
+		(e: React.DragEvent) => {
+			detachHintRef.current = null;
+			setDetachHint(null);
+			const subject = tabDragSubject();
+			if (!subject) return;
+			// Re-check the drop point rather than trusting that dockview stopped the
+			// event: its droptarget only calls stopPropagation when it actually took
+			// the drop (i.e. when it had shown an overlay), and it bails out earlier in
+			// several cases — locked group, no quadrant, overlay suppressed. Without
+			// this guard a drop over a dock could both merge AND detach the panel.
+			if (resolveDropPoint(e.clientX, e.clientY).kind !== "detach") return;
+			e.preventDefault();
+			detachPanelToCanvas({
+				chapterId: subject.chapterId,
+				panelId: subject.panelId,
+				kind: subject.kind,
+				...(subject.resourceId ? { resourceId: subject.resourceId } : {}),
+				screenX: e.clientX,
+				screenY: e.clientY,
+			});
+		},
+		[detachPanelToCanvas, resolveDropPoint, tabDragSubject],
 	);
 
 	// --- Unified draft node logic (fork + merge) ---
@@ -1550,8 +1886,11 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		) => {
 			if (payload.mode === "fork" && payload.parentChapterId) {
 				const draftNode = nodesRef.current.find((n) => n.id === draftNodeId);
+				// No `Math.max(0, …)` on y: these are React Flow world coordinates, where
+				// negative is simply above the origin. Clamping moved a fork created from a
+				// draft dragged above y=0 down onto the axis.
 				const draftX = draftNode?.position?.x ?? 0;
-				const draftY = Math.max(0, draftNode?.position?.y ?? 0);
+				const draftY = draftNode?.position?.y ?? 0;
 
 				api
 					.forkChapter(
@@ -1561,8 +1900,8 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 							description: payload.description,
 							inheritMode: payload.inheritMode as "fresh" | "compressed" | "full",
 							worktreeSource: payload.worktreeSource,
-							axisOffset: draftX,
-							crossOffset: draftY,
+							x: draftX,
+							y: draftY,
 						}),
 					)
 					.then(() => {
@@ -1734,9 +2073,11 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			if (!reviewActions.request) return;
 			try {
 				const sourceNode = nodesRef.current.find((n) => n.id === nodeId);
+				// Classic world coordinates, so no clamp on y (negative is above the
+				// origin) and they go in the classic fields rather than ruler's offsets.
 				const posX = (sourceNode?.position?.x ?? 0) + 380;
-				const posY = Math.max(0, sourceNode?.position?.y ?? 0);
-				await api.createReview(nodeId, { axisOffset: posX, crossOffset: posY });
+				const posY = sourceNode?.position?.y ?? 0;
+				await api.createReview(nodeId, { graphX: posX, graphY: posY });
 				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 				queryClient.invalidateQueries({ queryKey: ["graph"] });
 			} catch (err) {
@@ -1951,37 +2292,6 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		[fsRevealCapability.supported, nodes],
 	);
 
-	const handleTerminalRename = useCallback((nodeId: string) => {
-		setTerminalContextMenu(null);
-		// Trigger inline edit mode on the TerminalNode by bumping requestEdit
-		setNodes((nds) =>
-			nds.map((n) => {
-				if (n.id !== nodeId || n.type !== "terminalNode") return n;
-				const prev = (n.data as { requestEdit?: number }).requestEdit ?? 0;
-				return { ...n, data: { ...n.data, requestEdit: prev + 1 } };
-			}),
-		);
-	}, []);
-
-	const handleTerminalMinimize = useCallback(
-		(nodeId: string) => {
-			setTerminalContextMenu(null);
-			minimizeTerminalNode(nodeId);
-		},
-		[minimizeTerminalNode],
-	);
-
-	const handleTerminalClose = useCallback(
-		(nodeId: string) => {
-			setTerminalContextMenu(null);
-			const node = nodesRef.current.find((n) => n.id === nodeId);
-			if (!node || node.type !== "terminalNode") return;
-			const d = node.data as { terminalId?: string };
-			closeTerminalNode(nodeId, d.terminalId ?? "");
-		},
-		[closeTerminalNode],
-	);
-
 	const confirmDelete = useCallback(() => {
 		if (!deleteTarget) return;
 		deleteChapter.mutate(deleteTarget.id, {
@@ -2051,12 +2361,22 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					</Alert>
 				</Stack>
 			)}
-			<Box ref={flowWrapperRef} style={{ flex: 1, position: "relative", minHeight: 0 }}>
+			{/* Native DnD handlers, for tearing a panel out by its dockview TAB. dragEnter
+			    shares dragOver's logic because native DnD requires preventDefault on both
+			    before it will deliver a drop. */}
+			<Box
+				ref={flowWrapperRef}
+				onDragEnter={handleCanvasDragOver}
+				onDragOver={handleCanvasDragOver}
+				onDragLeave={handleCanvasDragLeave}
+				onDrop={handleCanvasDrop}
+				style={{ flex: 1, position: "relative", minHeight: 0 }}
+			>
 				<ReactFlow
 					onInit={handleInit}
 					onMoveEnd={handleMoveEnd}
 					colorMode={colorScheme === "auto" ? "system" : colorScheme}
-					nodes={nodesWithExpand}
+					nodes={nodesForFlow}
 					edges={computedEdges}
 					nodeTypes={nodeTypes}
 					edgeTypes={edgeTypes}
@@ -2067,7 +2387,14 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					onPaneClick={onPaneClick}
 					nodesDraggable
 					elementsSelectable
-					onlyRenderVisibleElements
+					// Culling off-screen nodes unmounts them, which for an EXPANDED node means
+					// tearing down a whole dockview surface: its terminals lose their xterm,
+					// its chat loses its WebSocket, every panel rebuilds on the way back. A
+					// DETACHED panel node holds the same kind of live session on its own. So
+					// the optimization is disabled while either exists. A collapsed node is
+					// just a Card, so rendering all of them costs far less than destroying one
+					// live session; with nothing expanded or detached, culling returns.
+					onlyRenderVisibleElements={expandedNodes.size === 0 && !hasDetachedPanels}
 					panOnDrag={pcDragMode === "pan" ? true : [1]}
 					selectionOnDrag={false}
 					panOnScroll={false}
@@ -2083,10 +2410,6 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						onFork={handleFork}
 						onMergeNew={handleMergeNew}
 						onMergeInto={handleMergeInto}
-						terminals={terminalBubbles}
-						onOpenTerminal={handleOpenTerminal}
-						onCreateTerminal={handleCreateTerminal}
-						onDragTerminal={handleDragTerminal}
 					/>
 					<Background />
 					<Controls>
@@ -2119,17 +2442,28 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						onDismissReview={handleDismissReview}
 					/>
 				)}
-				{terminalContextMenu && (
-					<TerminalContextMenu
-						x={terminalContextMenu.x}
-						y={terminalContextMenu.y}
-						nodeId={terminalContextMenu.nodeId}
-						terminalName={terminalContextMenu.terminalName}
-						onClose={() => setTerminalContextMenu(null)}
-						onRename={handleTerminalRename}
-						onMinimize={handleTerminalMinimize}
-						onCloseTerminal={handleTerminalClose}
-					/>
+				{/* Tear-out hint: shown while a dock tool panel is dragged over blank
+				    canvas, so "release here to detach" is discoverable rather than
+				    something the user has to guess. */}
+				{detachHint && (
+					<Box
+						style={{
+							position: "fixed",
+							left: detachHint.x + 14,
+							top: detachHint.y + 14,
+							zIndex: Z.graphOverlay,
+							pointerEvents: "none",
+							padding: "4px 10px",
+							borderRadius: "var(--mantine-radius-sm)",
+							border: "1px dashed var(--mantine-color-indigo-5)",
+							background: "var(--mantine-color-body)",
+							whiteSpace: "nowrap",
+						}}
+					>
+						<Text size="xs" c="dimmed">
+							{t("nodeDock.releaseToDetach")}
+						</Text>
+					</Box>
 				)}
 			</Box>
 			<Modal

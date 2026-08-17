@@ -58,8 +58,29 @@ export interface VListRowHandlers {
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
 	/** Restore an edited assistant message to its original text. */
 	onRestoreAssistantMessage?: (messageId: string) => void;
-	/** Open a child narrator's full session (subagent card / Await-agent card). */
-	onViewSubagentSession?: (narratorId: string) => void;
+	/**
+	 * Open a child narrator's full session (subagent card / Await-agent card /
+	 * injection speaker row).
+	 *
+	 * `messageId` asks the opened session to scroll to and flash that message. It is
+	 * OPTIONAL because most callers only know which child to open: a subagent card
+	 * addresses the whole run, whereas an injection bubble reports one specific thing
+	 * the child said and can name it. Omitting it opens the session at its tail, the
+	 * behaviour every existing caller already has.
+	 */
+	onViewSubagentSession?: (narratorId: string, messageId?: string) => void;
+	/**
+	 * Open a knowledge-base entry (an injection bubble reporting a knowledge hint).
+	 *
+	 * `scope` is explicit rather than probed: global and personal entries are different
+	 * routes with different hooks, so guessing would fire a wasted request on the normal
+	 * path and leave the loading state unable to decide what to render.
+	 */
+	onOpenKnowledgeEntry?: (entryId: string, scope: "global" | "personal") => void;
+	/** Open the Dynamic Spec panel with one `spec://` file selected. */
+	onOpenSpecFile?: (uri: string) => void;
+	/** Open a chapter (a review's own chapter, a merge's source chapter). */
+	onOpenChapter?: (chapterId: string) => void;
 	/** Detach a running subagent to a background task; absent → item hidden. */
 	onDetachSubagent?: (narratorId: string) => void;
 	/** Cancel a background subagent task; absent → item hidden. */

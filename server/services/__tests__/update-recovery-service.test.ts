@@ -1419,7 +1419,10 @@ describe("planned update continuation scheduling", () => {
 		).toMatchObject({ matched: true });
 
 		const result = await waiting;
-		expect(result.targets.map((target) => target.id)).toEqual(["target-1", "target-2"]);
+		// `id` is the real responder narrator id (the frontend links to it); `label`
+		// is the readable name shown to the model. Order must follow the snapshot.
+		expect(result.targets.map((target) => target.id)).toEqual(["responder-a", "responder-b"]);
+		expect(result.targets.map((target) => target.label)).toEqual(["target-1", "target-2"]);
 		expect(result.output.indexOf("first target replied second")).toBeLessThan(
 			result.output.indexOf("second target replied first"),
 		);
@@ -1446,7 +1449,12 @@ describe("planned update continuation scheduling", () => {
 		);
 
 		expect(result.targets).toEqual([
-			expect.objectContaining({ id: "target-1", status: "timeout", awaited: true }),
+			expect.objectContaining({
+				id: "deadline-target",
+				label: "target-1",
+				status: "timeout",
+				awaited: true,
+			}),
 		]);
 		expect(result.output).toContain("Timed out waiting for a Send reply");
 		// Recovery consumes only the restored waiter. A late reply sees an expired request,
@@ -1700,7 +1708,12 @@ describe("planned update continuation scheduling", () => {
 			.map(({ args }) => args[1] as { output?: { _metadata?: { targets?: unknown[] } } })
 			.filter((result) => result.output?._metadata?.targets);
 		expect(sendWrites.at(-1)?.output?._metadata?.targets).toEqual([
-			expect.objectContaining({ id: "target-1", status: "aborted", awaited: true }),
+			expect.objectContaining({
+				id: "still-running-target",
+				label: "target-1",
+				status: "aborted",
+				awaited: true,
+			}),
 		]);
 		expect(resumedAgentCalls).toHaveLength(0);
 	});

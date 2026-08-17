@@ -510,26 +510,6 @@ export const terminalService = {
 		await db.update(terminals).set({ name }).where(eq(terminals.id, terminalId));
 	},
 
-	async updateGraphState(
-		terminalId: string,
-		state: {
-			graphOpened?: boolean;
-			graphX?: number;
-			graphY?: number;
-			graphWidth?: number;
-			graphHeight?: number;
-		},
-	) {
-		const updates: Record<string, unknown> = {};
-		if (state.graphOpened !== undefined) updates.graphOpened = state.graphOpened ? 1 : 0;
-		if (state.graphX !== undefined) updates.graphX = state.graphX;
-		if (state.graphY !== undefined) updates.graphY = state.graphY;
-		if (state.graphWidth !== undefined) updates.graphWidth = state.graphWidth;
-		if (state.graphHeight !== undefined) updates.graphHeight = state.graphHeight;
-		if (Object.keys(updates).length === 0) return;
-		await db.update(terminals).set(updates).where(eq(terminals.id, terminalId));
-	},
-
 	async getById(id: string) {
 		const terminal = await db.query.terminals.findFirst({
 			where: eq(terminals.id, id),

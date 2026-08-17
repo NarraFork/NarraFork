@@ -33,7 +33,7 @@ export interface BuildPretextDocumentLayoutOptions {
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
 	/**
-	 * Row-KEY addressed expansion for `activity-trace` / `tool-run-summary`. See
+	 * Row-KEY addressed expansion for `activity-trace`. See
 	 * `AdapterContext.isRowExpanded`: those rows' ordinals are not stable while a
 	 * turn streams, so the reader's intent is stored against the row's key.
 	 */
@@ -123,7 +123,7 @@ function sourceForMessages(messages: readonly SourceMessage[], fallbackSeq: numb
  * Longest-registered-prefix lookup over a set of owner keys.
  *
  * A derived spec key always EXTENDS its owner's key (`<msgId>-b3`,
- * `tool-<id>#dup1`, `toolrun-summary-tool-<id>`), so the owner is the longest
+ * `tool-<id>#dup1`, `toolrun-count-tool-<id>`), so the owner is the longest
  * registered key that prefixes it.
  *
  * The obvious implementation — scan every registered key for each item — was the
@@ -176,7 +176,6 @@ function buildSourceResolver(
 				if (!item.tc.toolUseId) continue;
 				const toolKey = `tool-${item.tc.toolUseId}`;
 				exact.set(toolKey, sources);
-				exact.set(`toolrun-summary-${toolKey}`, sources);
 				exact.set(`toolrun-count-${toolKey}`, sources);
 			}
 		}

@@ -26,8 +26,21 @@ export interface ParentInboundMessage {
 	fromId: string;
 	/** Subagent title (may be null when untitled). */
 	fromTitle: string | null;
+	/**
+	 * Readable alias of the sender, used when it has no title. The previous
+	 * fallback was an 8-char slice of the nanoid — recognizable only by accident.
+	 */
+	fromLabel?: string | null;
 	/** Subagent type (explore/plan/general/review/custom). */
 	fromType: string;
+	/**
+	 * Where the sender was in its OWN session when it sent this — the reader's
+	 * navigation target (see `SideCarInboundMessage.fromMessageId`).
+	 *
+	 * Reader-only: `formatParentInboundMessages` never prints it. The model names
+	 * agents by alias and has no use for a message id.
+	 */
+	fromMessageId?: string | null;
 	/** Message text (already capped). */
 	text: string;
 	timestamp: string;
@@ -59,7 +72,7 @@ export function pushParentInboundMessage(
 }
 
 function senderLabel(message: ParentInboundMessage, isZh: boolean): string {
-	const name = message.fromTitle?.trim() || message.fromId.slice(0, 8);
+	const name = message.fromTitle?.trim() || message.fromLabel?.trim() || message.fromId.slice(0, 8);
 	return isZh
 		? `子代理"${name}"（${message.fromType}）`
 		: `subagent "${name}" (${message.fromType})`;

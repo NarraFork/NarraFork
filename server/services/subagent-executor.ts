@@ -960,11 +960,15 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 							items: [
 								{
 									fromId: m.fromId,
-									// `fromTitle ?? fromId` was the old inline template's sender slot; the
-									// renderer applies the same fallback, so keeping the raw pair holds the
-									// text identical AND gives the UI both parts.
+									// The renderer applies the `fromTitle → fromLabel → fromId` fallback, so
+									// passing all three keeps the text right AND gives the UI every part. The
+									// label matters because an untitled sender used to be named by its nanoid.
 									fromTitle: m.fromTitle ?? null,
+									fromLabel: m.fromLabel ?? null,
 									fromType: m.fromType ?? null,
+									// Reader-only navigation target into the sender's own session;
+									// omitted when the sender had written nothing yet.
+									...(m.fromMessageId ? { fromMessageId: m.fromMessageId } : {}),
 									...(m.isBroadcast ? { isBroadcast: true } : {}),
 									text: m.text,
 								},

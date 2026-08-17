@@ -1,10 +1,17 @@
 import { Badge, Card, Group, Text } from "@mantine/core";
 import { IconEye } from "@tabler/icons-react";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
-import { memo, useCallback, useRef, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { statusRegistry } from "../../lib/constants";
-import { NarratorPanel } from "../narrator/NarratorPanel";
+import { NarratorPanelSkeleton } from "../narrator/NarratorPanelSkeleton";
+import { NodeTitleEditor } from "./NodeTitleEditor";
+
+// Lazy for the same reason as ChapterNode: dockview and its panels are a large
+// chunk that only an expanded node needs.
+const ChapterNodeDock = lazy(() =>
+	import("./dock/ChapterNodeDock").then((m) => ({ default: m.ChapterNodeDock })),
+);
 
 export interface ReviewNodeData {
 	title: string;
@@ -23,7 +30,8 @@ export interface ReviewNodeData {
 
 const NODE_WIDTH = 260;
 const NODE_HEIGHT = 100;
-const MIN_RESIZE_WIDTH = 260;
+/** Matches ChapterNode: narrower than this a split-right tool panel is unusable. */
+const MIN_RESIZE_WIDTH = 480;
 const MIN_RESIZE_HEIGHT = 300;
 const MAX_REVIEW_NODE_TITLE_CHARS = 500;
 
@@ -60,12 +68,10 @@ function ReviewNodeInner({ data, id }: NodeProps) {
 
 	const handleStyle = { opacity: 0, width: 8, height: 8 };
 
-	// Track node resize to show skeleton overlay in NarratorPanel
-	const [isResizing, setIsResizing] = useState(false);
-	const onResizeStart = useCallback(() => setIsResizing(true), []);
-	const onResizeEnd = useCallback(() => setIsResizing(false), []);
+	// See ChapterNode: the resize-tracking state existed only for NarratorPanel's
+	// skeleton overlay, which the dock's CSS-driven panel layout makes unnecessary.
 
-	// Allow Ctrl+wheel to pass through to ReactFlow for zoom even when over NarratorPanel
+	// Allow Ctrl+wheel to pass through to ReactFlow for zoom even when over the dock
 	// (handled by NowheelPassthrough in NarraFlow — no per-node listener needed)
 	const panelWheelRef = useRef<HTMLDivElement>(null);
 
@@ -76,8 +82,6 @@ function ReviewNodeInner({ data, id }: NodeProps) {
 					minWidth={MIN_RESIZE_WIDTH}
 					minHeight={MIN_RESIZE_HEIGHT}
 					position="bottom-right"
-					onResizeStart={onResizeStart}
-					onResizeEnd={onResizeEnd}
 					style={{
 						background: "transparent",
 						border: "none",
@@ -138,9 +142,16 @@ function ReviewNodeInner({ data, id }: NodeProps) {
 					}}
 				>
 					<IconEye size={14} color="#fab005" />
-					<Text size="xs" fw={600} truncate style={{ flex: 1 }}>
-						{displayTitle}
-					</Text>
+					{/* Same reason as ChapterNode: expanded, the embedded panel hides its own
+					    title row, so this is the copy the reader actually sees. */}
+					<NodeTitleEditor
+						chapterId={id}
+						narratorId={d.narratorId ?? null}
+						title={displayTitle}
+						showActions={expanded}
+						size="xs"
+						textStyle={{ flex: 1 }}
+					/>
 					<Badge size="xs" color={statusColor} variant="light">
 						{t(`reviewStatus.${reviewStatus}`, reviewStatus)}
 					</Badge>
@@ -163,26 +174,26 @@ function ReviewNodeInner({ data, id }: NodeProps) {
 					</Group>
 				)}
 
-				{/* Expanded: show narrator panel */}
+				{/* Expanded: a full dockview surface (chat + stackable tool panels).
+				    `position: relative` gives the dock its containing block — see ChapterNode. */}
 				{expanded && hasNarrator && d.narratorId && (
 					// biome-ignore lint/a11y/noStaticElementInteractions: stopPropagation only
 					<div
 						className="nopan nodrag nowheel"
 						ref={panelWheelRef}
+						data-review-node-dock={d.narratorId}
 						onContextMenu={(e) => e.stopPropagation()}
 						style={{
 							flex: 1,
 							minHeight: 0,
+							position: "relative",
 							overflow: "hidden",
 							borderTop: "1px solid var(--mantine-color-dark-4)",
 						}}
 					>
-						<NarratorPanel
-							key={d.narratorId}
-							narratorId={d.narratorId}
-							compact
-							isResizing={isResizing}
-						/>
+						<Suspense fallback={<NarratorPanelSkeleton />}>
+							<ChapterNodeDock key={d.narratorId} chapterId={id} narratorId={d.narratorId} />
+						</Suspense>
 					</div>
 				)}
 			</Card>

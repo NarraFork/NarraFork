@@ -63,17 +63,38 @@ describe("chapter fork options", () => {
 				description: "desc",
 				inheritMode: "full",
 				worktreeSource: "commit",
-				axisOffset: 12,
-				crossOffset: 34,
+				x: 12,
+				y: 34,
 			}),
 		).toEqual({
 			title: "Draft",
 			description: "desc",
 			inheritMode: "full",
 			worktreeSource: "commit",
-			axisOffset: 12,
-			crossOffset: 34,
+			graphX: 12,
+			graphY: 34,
 		});
+	});
+
+	test("sends a draft's canvas position as classic coordinates, not ruler offsets", () => {
+		// The draft node's coordinates are absolute React Flow world coordinates. Sending
+		// them as axisOffset/crossOffset stored a classic position in the columns ruler
+		// reads as offsets from a commit tick, which is what made a ruler-arranged project
+		// unusable after switching to classic.
+		const request = buildDraftForkRequest({
+			title: "Draft",
+			description: "",
+			inheritMode: "fresh",
+			worktreeSource: "workspace",
+			x: -120,
+			y: -40,
+		});
+		expect(request).not.toHaveProperty("axisOffset");
+		expect(request).not.toHaveProperty("crossOffset");
+		expect(request).not.toHaveProperty("anchorCommitSha");
+		// Negative coordinates survive: a canvas has no origin the user is confined to.
+		expect(request.graphX).toBe(-120);
+		expect(request.graphY).toBe(-40);
 	});
 
 	test("provides the fixed commit source copy used by chapter split", () => {

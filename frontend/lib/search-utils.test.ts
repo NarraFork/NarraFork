@@ -1,5 +1,42 @@
 import { describe, expect, test } from "bun:test";
-import { summarizeSearchRuntimeState } from "./search-utils";
+import {
+	DEFAULT_SEARCH_SORT,
+	normalizeSearchSort,
+	normalizeSearchType,
+	summarizeSearchRuntimeState,
+} from "./search-utils";
+
+describe("search sort defaults", () => {
+	// The global search page defaults to newest-first. This is the assertion that stops
+	// it drifting back to relevance: the page reads the default through this constant,
+	// and a silent switch back would only show up as "the ordering feels wrong".
+	test("defaults to newest first", () => {
+		expect(DEFAULT_SEARCH_SORT).toBe("time");
+		expect(normalizeSearchSort(undefined)).toBe("time");
+		expect(normalizeSearchSort("nonsense")).toBe("time");
+	});
+
+	test("keeps every explicitly chosen sort mode", () => {
+		expect(normalizeSearchSort("relevance")).toBe("relevance");
+		expect(normalizeSearchSort("type")).toBe("type");
+		expect(normalizeSearchSort("title")).toBe("title");
+		expect(normalizeSearchSort("time")).toBe("time");
+	});
+});
+
+describe("normalizeSearchType", () => {
+	test("accepts knowledge as a result type", () => {
+		expect(normalizeSearchType("knowledge")).toBe("knowledge");
+	});
+
+	test("still normalizes the plural entity names and unknown input", () => {
+		expect(normalizeSearchType("chapters")).toBe("chapter");
+		expect(normalizeSearchType("narrators")).toBe("narrator");
+		expect(normalizeSearchType("messages")).toBe("message");
+		expect(normalizeSearchType(undefined)).toBe("all");
+		expect(normalizeSearchType("nonsense")).toBe("all");
+	});
+});
 
 describe("summarizeSearchRuntimeState", () => {
 	test("summarizes degraded search metadata and deduplicates fallbacks", () => {

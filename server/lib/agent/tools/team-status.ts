@@ -13,6 +13,27 @@ function bashLabel(title: string | null, command: string | null): string {
 	return raw.length > 80 ? `${raw.slice(0, 80)}…` : raw;
 }
 
+/**
+ * Resolve a `target_id` to a real narrator id.
+ *
+ * `list`/`list_agents` print each member's alias, so an alias is what a model
+ * naturally passes back — but `file_changes` and `send` index structures keyed by
+ * the real narrator id. Without this, naming a member exactly as it was listed
+ * would report "no file changes" or "not a direct subagent".
+ *
+ * Accepts real ids, id prefixes, titles, title slugs and persisted aliases (the
+ * same selector grammar Send/Await honour). Returns the input unchanged when
+ * nothing matches, so the caller's own validation produces the error.
+ */
+async function resolveTeamMemberId(callerNarratorId: string, selector: string): Promise<string> {
+	const { resolveSubagentTargets } = await import("@server/services/agent-communication");
+	const targets = await resolveSubagentTargets({
+		callerNarratorId,
+		id: selector,
+	}).catch(() => []);
+	return targets.length === 1 ? targets[0].id : selector;
+}
+
 export const teamStatusTool: ToolDefinition = {
 	name: "TeamStatus",
 	description:
@@ -77,13 +98,16 @@ export const teamStatusTool: ToolDefinition = {
 			const wantAgents = action !== "list_bash";
 			const wantBash = action !== "list_agents";
 
+			const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
 			const lines: string[] = [];
 			if (wantAgents) {
 				for (const s of siblings) {
 					const isSelf = s.id === ctx.narratorId ? " (you)" : "";
 					const sType = s.variant.startsWith("subagent:") ? s.variant.slice(9) : "unknown";
+					// Lead with the alias, like the bash rows below, so the model addresses
+					// agents by a readable handle instead of copying the nanoid back.
 					lines.push(
-						`- kind=agent | id=${s.id}${isSelf} | type=${sType} | status=${s.status} | title=${s.title ?? "(untitled)"}`,
+						`- kind=agent | alias=${agentLabelFromNarrator(s, scopeId)}${isSelf} | id=${s.id} | type=${sType} | status=${s.status} | title=${s.title ?? "(untitled)"}`,
 					);
 				}
 			}
@@ -132,20 +156,27 @@ export const teamStatusTool: ToolDefinition = {
 				if (changes.size === 0) {
 					return { output: "No file changes recorded by any team member." };
 				}
+				// Only ids are tracked here, so labels need the async resolver.
+				const { resolveAgentLabel } = await import("@server/services/subagent-label");
 				if (target_id) {
-					const files = changes.get(target_id);
+					// The listing above prints aliases, so `target_id` is very likely one.
+					// The change map is keyed by real narrator id, so resolve first.
+					const resolvedId = await resolveTeamMemberId(ctx.narratorId, target_id);
+					const files = changes.get(resolvedId);
+					const label = await resolveAgentLabel(scopeId, resolvedId);
 					if (!files?.size) {
-						return { output: `No file changes recorded for ${target_id}.` };
+						return { output: `No file changes recorded for ${label}.` };
 					}
 					return {
-						output: `Files modified by ${target_id} (${files.size}):\n${[...files].join("\n")}`,
+						output: `Files modified by ${label} (${files.size}):\n${[...files].join("\n")}`,
 					};
 				}
 				const sections: string[] = [];
 				for (const [subId, files] of changes) {
 					const isSelf = subId === ctx.narratorId ? " (you)" : "";
+					const label = await resolveAgentLabel(scopeId, subId);
 					sections.push(
-						`${subId}${isSelf} (${files.size} files):\n${[...files].map((f) => `  ${f}`).join("\n")}`,
+						`${label}${isSelf} (${files.size} files):\n${[...files].map((f) => `  ${f}`).join("\n")}`,
 					);
 				}
 				return { output: sections.join("\n\n") };
@@ -156,6 +187,7 @@ export const teamStatusTool: ToolDefinition = {
 					return { output: "Message text is required for broadcast.", isError: true };
 				}
 				const { narratorService } = await import("@server/services/narrator-service");
+				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
 				const sender = await narratorService.getById(ctx.narratorId);
 				const siblings = await narratorService.listSubagentsByParent(parentNarratorId);
 				const targets = siblings.filter(
@@ -168,10 +200,19 @@ export const teamStatusTool: ToolDefinition = {
 				}
 				const senderType = teamMemberType(sender.variant);
 				const now = new Date().toISOString();
+				// Reader-only navigation target: where the sender was in its own session
+				// when it broadcast this. Best-effort — a sender that has written nothing
+				// has nothing to point at, and that must not fail the broadcast.
+				const { getSubagentResultMessageId } = await import("@server/services/narrator-session");
+				const fromMessageId = await getSubagentResultMessageId(ctx.narratorId).catch(
+					() => undefined,
+				);
 				const msg: TeamMessage = {
 					fromId: ctx.narratorId,
 					fromTitle: sender.title,
+					fromLabel: agentLabelFromNarrator(sender, parentNarratorId),
 					fromType: senderType,
+					...(fromMessageId ? { fromMessageId } : {}),
 					text: message,
 					timestamp: now,
 					isBroadcast: true,
@@ -183,7 +224,9 @@ export const teamStatusTool: ToolDefinition = {
 					(t: { id: string; status: string }) => t.status !== "working",
 				);
 				const targetKind = ctx.parentNarratorId ? "sibling(s)" : "child subagent(s)";
-				let output = `Broadcast sent to ${targets.length} ${targetKind}: ${targets.map((t: { id: string }) => t.id).join(", ")}`;
+				let output = `Broadcast sent to ${targets.length} ${targetKind}: ${targets
+					.map((t) => agentLabelFromNarrator(t, parentNarratorId))
+					.join(", ")}`;
 				if (nonWorking.length > 0) {
 					output += `\n(warning: ${nonWorking.length} target(s) not currently working — messages may not be received)`;
 				}
@@ -198,11 +241,14 @@ export const teamStatusTool: ToolDefinition = {
 					return { output: "Message text is required for 'send' action.", isError: true };
 				}
 				const { narratorService } = await import("@server/services/narrator-service");
+				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
 				const sender = await narratorService.getById(ctx.narratorId);
-				// Validate target belongs to this narrator's direct subagent team
-				const target = await narratorService.getById(target_id);
+				// `list` prints aliases, so an alias is the likely input here. Resolve it to
+				// a real id before the lookup — `getById` alone would throw NotFound.
+				const resolvedTargetId = await resolveTeamMemberId(ctx.narratorId, target_id);
+				const target = await narratorService.getById(resolvedTargetId).catch(() => null);
 				if (
-					!target.variant?.startsWith("subagent:") ||
+					!target?.variant?.startsWith("subagent:") ||
 					target.parentNarratorId !== parentNarratorId
 				) {
 					return {
@@ -212,20 +258,33 @@ export const teamStatusTool: ToolDefinition = {
 				}
 				const sendSenderType = teamMemberType(sender.variant);
 				const now = new Date().toISOString();
+				// See the broadcast branch: reader-only navigation target, best-effort.
+				const { getSubagentResultMessageId: resolveSenderMessageId } = await import(
+					"@server/services/narrator-session"
+				);
+				const sendFromMessageId = await resolveSenderMessageId(ctx.narratorId).catch(
+					() => undefined,
+				);
 				const msg: TeamMessage = {
 					fromId: ctx.narratorId,
 					fromTitle: sender.title,
+					fromLabel: agentLabelFromNarrator(sender, parentNarratorId),
 					fromType: sendSenderType,
+					...(sendFromMessageId ? { fromMessageId: sendFromMessageId } : {}),
 					text: message,
 					timestamp: now,
 					isBroadcast: false,
 				};
-				deliverTeamMessage(target_id, msg, parentNarratorId);
+				// Inbox keys are real narrator ids; delivering under an alias would drop the
+				// message into an inbox nobody drains.
+				deliverTeamMessage(resolvedTargetId, msg, parentNarratorId);
 				const warning =
 					target.status !== "working"
 						? ` (warning: target is ${target.status}, message may not be received)`
 						: "";
-				return { output: `Message sent to ${target_id}.${warning}` };
+				return {
+					output: `Message sent to ${agentLabelFromNarrator(target, parentNarratorId)}.${warning}`,
+				};
 			}
 
 			default:

@@ -1,10 +1,25 @@
-import { request } from "./client";
+import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
 
 export interface ChatUserSnapshot {
 	id: string;
 	username: string;
 	avatarColor: string | null;
 	avatarImageId: string | null;
+}
+
+/**
+ * One attachment's metadata. Bytes are fetched from
+ * `GET /api/chat/attachments/:id`, which re-checks room access.
+ */
+export interface ChatAttachment {
+	id: string;
+	kind: "image" | "file";
+	filename: string;
+	mediaType: string;
+	sizeBytes: number;
+	/** Images only. Present so the list can reserve height without loading it. */
+	width: number | null;
+	height: number | null;
 }
 
 export interface ChatMessage {
@@ -15,6 +30,18 @@ export interface ChatMessage {
 	kind: "text" | "system";
 	contentText: string;
 	replyToMessageId: string | null;
+	/**
+	 * Quote snapshot captured server-side at post time.
+	 *
+	 * `replyToPreview` distinguishes three states that matter to the UI:
+	 * a non-empty string is the quoted text, `""` means the target was already
+	 * deleted, and `null` means this row predates snapshots (resolve locally).
+	 * `replyToSeq` is what a jump needs to know whether to keep loading older pages.
+	 */
+	replyToSeq: number | null;
+	replyToSender: ChatUserSnapshot | null;
+	replyToPreview: string | null;
+	attachments: ChatAttachment[];
 	editedAt: string | null;
 	deletedAt: string | null;
 	createdAt: string;
@@ -79,10 +106,54 @@ export const chatApi = {
 		);
 	},
 
-	postChatMessage: (roomId: string, data: { text: string; replyToMessageId?: string | null }) =>
+	postChatMessage: (
+		roomId: string,
+		data: { text: string; replyToMessageId?: string | null; attachmentIds?: string[] },
+	) =>
 		request<ChatMessage>(`/chat/rooms/${roomId}/messages`, {
 			method: "POST",
 			body: JSON.stringify(data),
+		}),
+
+	/**
+	 * Upload one attachment as a draft.
+	 *
+	 * Goes through `authorizedFetch` rather than `request`, matching every other
+	 * upload in this layer: `request` sets `Content-Type: application/json` on any
+	 * body, which would overwrite the multipart boundary the browser generates and
+	 * make the server's `formData()` parse fail.
+	 */
+	uploadChatAttachment: async (roomId: string, file: File): Promise<ChatAttachment> => {
+		const formData = new FormData();
+		formData.append("file", file);
+		const res = await authorizedFetch(`${BASE}/chat/rooms/${roomId}/attachments`, {
+			method: "POST",
+			body: formData,
+		});
+		if (!res.ok) {
+			const { message, data } = await readFetchError(res, "Attachment upload failed");
+			throw new ApiError(message, res.status, data);
+		}
+		return (await res.json()) as ChatAttachment;
+	},
+
+	/** Discard a draft attachment the composer removed before sending. */
+	deleteChatAttachment: (attachmentId: string) =>
+		request<{ ok: boolean }>(`/chat/attachments/${attachmentId}`, { method: "DELETE" }),
+
+	/**
+	 * Copy attachments into a narrator's worktree ahead of a forward.
+	 *
+	 * Returns the `<attached_files>` hint to append to the forwarded text, produced
+	 * by the same builder the narrator's own attachment path uses.
+	 */
+	materializeChatAttachments: (roomId: string, narratorId: string, attachmentIds: string[]) =>
+		request<{
+			hint: string;
+			files: Array<{ filename: string; filePath: string; size: number }>;
+		}>(`/chat/rooms/${roomId}/materialize-attachments`, {
+			method: "POST",
+			body: JSON.stringify({ narratorId, attachmentIds }),
 		}),
 
 	markChatRead: (roomId: string, seq: number) =>

@@ -85,6 +85,7 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 						type: "reasoning",
 						text: "Earlier hidden reasoning summary",
 						providerMetadata: {
+							signatureSource: "openai",
 							openai: {
 								itemId: "rs_123",
 								reasoningEncryptedContent: "enc_123",
@@ -120,6 +121,49 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(assistantMsg).toBeDefined();
 	});
 
+	test("buildHistory drops encrypted reasoning without a matching signature source on strict models", async () => {
+		// gpt-5 is credential-bound: an encrypted item whose source identity is
+		// missing (legacy data) or foreign (another provider) must not be echoed.
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const dbMessages: DbMessage[] = [
+			makeAssistantMessage({
+				contentJson: [
+					{
+						type: "reasoning",
+						text: "Legacy untagged reasoning",
+						providerMetadata: {
+							openai: {
+								itemId: "rs_untagged",
+								reasoningEncryptedContent: "enc_untagged",
+							},
+						},
+					},
+					{
+						type: "reasoning",
+						text: "Foreign reasoning",
+						providerMetadata: {
+							signatureSource: "nug:other",
+							openai: {
+								itemId: "rs_foreign",
+								reasoningEncryptedContent: "enc_foreign",
+							},
+						},
+					},
+					{ type: "text", text: "Visible assistant reply" },
+				],
+				contentText: "Visible assistant reply",
+			}),
+		];
+
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
+		const historyJson = JSON.stringify(result.history);
+
+		expect(historyJson).not.toContain('"type":"reasoning"');
+		expect(historyJson).not.toContain('"encrypted_content"');
+		// The visible text survives untouched.
+		expect(historyJson).toContain("Visible assistant reply");
+	});
+
 	test("buildHistory handles assistant message with reasoning but no text", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
 		const dbMessages: DbMessage[] = [
@@ -129,6 +173,7 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 						type: "reasoning",
 						text: "Pure reasoning turn",
 						providerMetadata: {
+							signatureSource: "openai",
 							openai: {
 								itemId: "rs_456",
 								reasoningEncryptedContent: "enc_456",
@@ -352,8 +397,23 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(skippedDoneEvents.some((event) => event.reasoning)).toBe(false);
 	});
 
-	test("pushAssistantTurn keeps non-replayable reasoning as assistant text fallback", () => {
+	test("pushAssistantTurn drops non-replayable reasoning on credential-bound models", () => {
+		// gpt-5 is credential-bound: reasoning without an encrypted credential has
+		// nothing to replay — echoing the plain text would fail upstream.
 		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const history: unknown[] = [];
+
+		provider.pushAssistantTurn(history, "Visible reply", [], [{ text: "Fallback reasoning" }]);
+
+		expect(history).toHaveLength(1);
+		expect(JSON.stringify(history[0])).toContain("Visible reply");
+		expect(JSON.stringify(history[0])).not.toContain("Fallback reasoning");
+		expect(JSON.stringify(history[0])).not.toContain('"type":"reasoning"');
+	});
+
+	test("pushAssistantTurn keeps non-replayable reasoning as assistant text fallback on relay models", () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		provider.noteActiveModel("openai:deepseek-chat");
 		const history: unknown[] = [];
 
 		provider.pushAssistantTurn(history, "Visible reply", [], [{ text: "Fallback reasoning" }]);
@@ -487,6 +547,7 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 						type: "reasoning",
 						text: "Reasoning summary",
 						providerMetadata: {
+							signatureSource: "openai",
 							openai: {
 								itemId: "rs_sync",
 								reasoningEncryptedContent: "enc_sync",

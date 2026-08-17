@@ -1,9 +1,12 @@
+import type { ExecutorPathRule } from "@shared/executor-path-rules";
 import type {
 	ExecutorManifest,
 	ExecutorPlatform,
 	ExecutorPlatformInfo,
 } from "@shared/remote-executor";
 import { request } from "./client";
+
+export type { ExecutorPathRule };
 
 export interface RemoteDevice {
 	id: string;
@@ -21,11 +24,23 @@ export interface RemoteDevice {
 	defaultCwd: string | null;
 	agentVersion: string | null;
 	capabilities: Record<string, unknown> | null;
+	/** Ordered path guard rules recorded here (desired state). */
+	pathRules: ExecutorPathRule[] | null;
+	/** Ordered rules the device reported enforcing at its last handshake. */
+	reportedPathRules: ExecutorPathRule[] | null;
 	scope: "global" | "project";
 	projectId: string | null;
 	createdAt: string;
 	updatedAt: string;
 	revokedAt: string | null;
+}
+
+export interface DevicePathRulesResponse {
+	rules: ExecutorPathRule[];
+	/** Null until the device has completed a handshake that reports its rules. */
+	reportedRules: ExecutorPathRule[] | null;
+	/** Ready-to-paste `pathRules` fragment for the device's config file. */
+	configSnippet: string;
 }
 
 export interface CreateDeviceInput {
@@ -151,7 +166,6 @@ export interface ExecutorManifestResponse {
 export interface InstallScriptInput {
 	platform: ExecutorPlatform;
 	mode: "system" | "user";
-	allowRoot: string;
 	disableShell?: boolean;
 	/** Override the base URL baked into the script (defaults to this server). */
 	serverBaseUrl?: string;
@@ -170,6 +184,17 @@ export interface InstallScriptResult {
 export const devicesApi = {
 	listDevices: () => request<RemoteDevice[]>("/devices"),
 	getDevice: (id: string) => request<RemoteDevice>(`/devices/${id}`),
+	getDevicePathRules: (id: string) =>
+		request<DevicePathRulesResponse>(`/devices/${encodeURIComponent(id)}/path-rules`),
+	/**
+	 * Records desired rules. Does not change what the device enforces: the operator
+	 * must still apply the returned snippet on the machine and restart the service.
+	 */
+	updateDevicePathRules: (id: string, rules: ExecutorPathRule[]) =>
+		request<DevicePathRulesResponse>(`/devices/${encodeURIComponent(id)}/path-rules`, {
+			method: "PUT",
+			body: JSON.stringify({ rules }),
+		}),
 	statDevicePath: (id: string, path: string, recursive = false) => {
 		const params = new URLSearchParams({ path, recursive: String(recursive) });
 		return request<RemoteStatResult>(`/devices/${id}/fs?${params}`);

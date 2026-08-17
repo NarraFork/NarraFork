@@ -975,3 +975,239 @@ describe("dispatchLocalFrame (synthetic frames)", () => {
 		expect(reached).toEqual(["streaming_reset"]);
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Reconnect resilience + listener-failure recovery
+// ---------------------------------------------------------------------------
+
+class MockWebSocket {
+	static readonly CONNECTING = 0;
+	static readonly OPEN = 1;
+	static readonly CLOSING = 2;
+	static readonly CLOSED = 3;
+	static instances: MockWebSocket[] = [];
+	readonly url: string;
+	readyState = MockWebSocket.CONNECTING;
+	onopen: (() => void) | null = null;
+	onclose: ((ev: { code: number; reason?: string }) => void) | null = null;
+	onmessage: ((ev: { data: string }) => void) | null = null;
+	onerror: (() => void) | null = null;
+	readonly sent: string[] = [];
+	constructor(url: string) {
+		this.url = url;
+		MockWebSocket.instances.push(this);
+	}
+	send(payload: string): void {
+		this.sent.push(payload);
+	}
+	close(code = 1000): void {
+		if (this.readyState === MockWebSocket.CLOSED) return;
+		this.readyState = MockWebSocket.CLOSED;
+		this.onclose?.({ code });
+	}
+}
+
+interface ManagerReconnectInternals {
+	reconnectAttempts: number;
+	reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+	_scheduleReconnect: () => void;
+}
+
+function reconnectInternals(manager: NarratorWSManager): ManagerReconnectInternals {
+	return manager as unknown as ManagerReconnectInternals;
+}
+
+interface GlobalPatch {
+	key: string;
+	had: boolean;
+	previous: unknown;
+}
+
+function patchGlobal(key: string, value: unknown): GlobalPatch {
+	const g = globalThis as Record<string, unknown>;
+	const patch = { key, had: Object.hasOwn(g, key), previous: g[key] };
+	g[key] = value;
+	return patch;
+}
+
+function restoreGlobal(patch: GlobalPatch): void {
+	const g = globalThis as Record<string, unknown>;
+	if (patch.had) g[patch.key] = patch.previous;
+	else delete g[patch.key];
+}
+
+/** Swap in the minimal browser surface the manager's connect path touches. */
+function withMockBrowserGlobals(fn: () => void): void {
+	const patches = [
+		patchGlobal("WebSocket", MockWebSocket),
+		patchGlobal("window", {
+			addEventListener: () => {},
+			removeEventListener: () => {},
+			location: {
+				protocol: "http:",
+				hostname: "localhost",
+				host: "localhost:3000",
+				port: "3000",
+			},
+		}),
+		patchGlobal("document", {
+			addEventListener: () => {},
+			removeEventListener: () => {},
+			visibilityState: "visible",
+		}),
+		patchGlobal("localStorage", {
+			getItem: (key: string) => (key === "narrafork_token" ? "test-token" : null),
+			setItem: () => {},
+			removeItem: () => {},
+		}),
+	];
+	MockWebSocket.instances = [];
+	try {
+		fn();
+	} finally {
+		for (const patch of patches.reverse()) restoreGlobal(patch);
+		MockWebSocket.instances = [];
+	}
+}
+
+function withSilencedWarn(fn: () => void): void {
+	const original = console.warn;
+	console.warn = () => {};
+	try {
+		fn();
+	} finally {
+		console.warn = original;
+	}
+}
+
+describe("reconnect resilience", () => {
+	test("reconnects after a graceful server shutdown (1001) instead of never retrying", () => {
+		withMockBrowserGlobals(() => {
+			const manager = new NarratorWSManager();
+			try {
+				manager.connect();
+				const ws = MockWebSocket.instances.at(-1);
+				expect(ws).toBeDefined();
+				if (!ws) return;
+				ws.readyState = MockWebSocket.OPEN;
+				ws.onopen?.();
+				expect(manager.connected).toBe(true);
+
+				// The server closed every connection gracefully (restart / auto-update).
+				// Previously this returned early and the client only recovered when a
+				// visibility or network event happened to fire — a foreground tab waiting
+				// for output simply went stale forever.
+				ws.readyState = MockWebSocket.CLOSED;
+				ws.onclose?.({ code: 1001 });
+
+				expect(manager.connected).toBe(false);
+				const internals = reconnectInternals(manager);
+				expect(internals.reconnectTimer).toBeDefined();
+				// A graceful shutdown starts a FRESH backoff cycle: a restart is usually
+				// back within seconds, so the first probe fires after the 1s base delay.
+				expect(internals.reconnectAttempts).toBe(1);
+			} finally {
+				manager.disconnect();
+			}
+		});
+	});
+
+	test("an abnormal close keeps the existing backoff position", () => {
+		withMockBrowserGlobals(() => {
+			const manager = new NarratorWSManager();
+			try {
+				manager.connect();
+				const ws = MockWebSocket.instances.at(-1);
+				if (!ws) return;
+				ws.readyState = MockWebSocket.OPEN;
+				ws.onopen?.();
+				const internals = reconnectInternals(manager);
+				internals.reconnectAttempts = 5;
+
+				ws.readyState = MockWebSocket.CLOSED;
+				ws.onclose?.({ code: 1006 });
+
+				expect(internals.reconnectTimer).toBeDefined();
+				expect(internals.reconnectAttempts).toBe(6);
+			} finally {
+				manager.disconnect();
+			}
+		});
+	});
+
+	test("keeps a capped reconnect timer running past the old give-up limit", () => {
+		withMockBrowserGlobals(() => {
+			const manager = new NarratorWSManager();
+			try {
+				const internals = reconnectInternals(manager);
+				// Beyond the removed MAX_RECONNECT_ATTEMPTS=50 give-up: the client must
+				// keep probing (delay saturated at the 30s cap) so a long server outage
+				// still recovers unattended instead of stranding the message stream.
+				internals.reconnectAttempts = 500;
+				internals._scheduleReconnect();
+				expect(internals.reconnectTimer).toBeDefined();
+				expect(internals.reconnectAttempts).toBe(501);
+			} finally {
+				manager.disconnect();
+			}
+		});
+	});
+});
+
+describe("listener failure recovery", () => {
+	test("a listener failure on a persisted-history frame resets committed sync anchors", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 7);
+		manager.updateCatchUpCursor("n1", { parentLastMessageId: "m7" });
+		manager.addListener({ narratorIds: ["n1"] }, () => {
+			throw new Error("listener boom");
+		});
+
+		// The frame bumps the optimistic version BEFORE the fan-out runs, so a failed
+		// consume would otherwise leave version==server while content is missing: the
+		// next sync_check compares equal and the server never replays the lost frame.
+		withSilencedWarn(() => {
+			dispatch(manager, { type: "message", narratorId: "n1", message: { id: "m8" } });
+		});
+
+		// Dropping every committed anchor makes the next sync_check report version 0
+		// with no cursor, which the server answers with a full reload.
+		expect(manager.getMessageVersion("n1")).toBeUndefined();
+		const internals = catchUpInternals(manager);
+		expect(internals.catchUpCursors.has("n1")).toBe(false);
+		expect(internals.authoritativeMessageVersions.has("n1")).toBe(false);
+	});
+
+	test("a listener failure on a non-history frame keeps the committed anchors", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 7);
+		manager.updateCatchUpCursor("n1", { parentLastMessageId: "m7" });
+		manager.addListener({ narratorIds: ["n1"] }, () => {
+			throw new Error("listener boom");
+		});
+
+		withSilencedWarn(() => {
+			dispatch(manager, { type: "status_change", narratorId: "n1", status: "working" });
+		});
+
+		expect(manager.getMessageVersion("n1")).toBe(7);
+		expect(catchUpInternals(manager).catchUpCursors.has("n1")).toBe(true);
+	});
+
+	test("a throwing listener does not prevent delivery to the remaining listeners", () => {
+		const manager = new NarratorWSManager();
+		const reached: string[] = [];
+		manager.addListener({ narratorIds: ["n1"] }, () => {
+			throw new Error("listener boom");
+		});
+		manager.addListener({ narratorIds: ["n1"] }, (frame) => {
+			reached.push(frame.type as string);
+		});
+
+		withSilencedWarn(() => {
+			dispatch(manager, { type: "message", narratorId: "n1", message: { id: "m9" } });
+		});
+
+		expect(reached).toEqual(["message"]);
+	});
+});

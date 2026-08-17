@@ -598,11 +598,11 @@ describe("low-LOD folds: a fold that grows must re-key", () => {
 		expect(afterFold?.cacheKey).not.toBe(beforeFold?.cacheKey);
 	});
 
-	it("L3 tool-run summary: a second folded call re-keys the summary", async () => {
-		const one = await probeFolds([readToolMsg("m1", 1, "tu-1")], 3);
-		const two = await probeFolds([readToolMsg("m1", 1, "tu-1"), readToolMsg("m2", 2, "tu-2")], 3);
-		const first = one.find((item) => item.kind === "tool-run-summary");
-		const second = two.find((item) => item.kind === "tool-run-summary");
+	it("L2 activity trace: a second folded call re-keys the trace", async () => {
+		const one = await probeFolds([readToolMsg("m1", 1, "tu-1")], 2);
+		const two = await probeFolds([readToolMsg("m1", 1, "tu-1"), readToolMsg("m2", 2, "tu-2")], 2);
+		const first = one.find((item) => item.kind === "activity-trace");
+		const second = two.find((item) => item.kind === "activity-trace");
 		expect(first).toBeDefined();
 		expect(second).toBeDefined();
 		expect(second?.key).toBe(first?.key);

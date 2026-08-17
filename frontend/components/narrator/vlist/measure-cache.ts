@@ -176,20 +176,20 @@ export function extractDataRevision(data: unknown): string | undefined {
 }
 
 /**
- * Revision of a FOLDED TRACE payload (`activity-trace`, `tool-run-summary`,
- * `tool-run-count`, `reasoning-steps`).
+ * Revision of a FOLDED TRACE payload (`activity-trace`, `tool-run-count`,
+ * `reasoning-steps`).
  *
  * Why these need their own revision
  * ---------------------------------
  * A trace's spec.key is minted from its FIRST member — `activity-<firstMsgId>-<i>`
- * for the cross-segment activity fold, `toolrun-summary-tool-<firstToolUseId>` /
- * `toolrun-count-tool-<...>` for a folded batch — while its height is
+ * for the cross-segment activity fold, `toolrun-count-tool-<firstToolUseId>` for a
+ * folded batch — while its height is
  * `header + rows(N) + …`, i.e. driven by the members that come AFTER the first.
  * So a fold that GROWS keeps its key, and none of the other key components move
  * either: the append/live-patch paths deliberately hold `messageVersion` fixed
  * (CONTRACT.md §4.5) and the trace's `opts` only carry fold/expand state.
  *
- * That made every low-LOD fold (L1-L3, where the folds exist at all) serve the
+ * That made every low-LOD fold (L1/L2, where the folds exist at all) serve the
  * height AND the measured row list captured when it had one member. The visible
  * symptom: an activity trace stuck on "0 tools · 1 reasoning" with the tool rows
  * clipped away, which only "fixed itself" after an alt+wheel LOD change re-keyed
@@ -214,6 +214,12 @@ function traceRevision(d: Record<string, unknown>): string {
 		const r = row as Record<string, unknown>;
 		// Row identity + painted content. Titles are already length-capped upstream.
 		if (typeof r.key === "string") rev += `|tk:${r.key}`;
+		// PAINTED as `data-nf-unit` (the LOD morph's pairing identity) and height-neutral,
+		// so it needs keying for the same reason `status` does: it can move while `key`
+		// and every height-bearing field stay put — a reasoning run gains a cross-level
+		// identity the moment its turn persists, and a stale entry would serve rows with
+		// no `data-nf-unit`, silently costing exactly the morph it exists to enable.
+		if (typeof r.unitId === "string") rev += `|tu:${r.unitId}`;
 		if (typeof r.title === "string") rev += `|tt:${textSignature(r.title)}`;
 		if (typeof r.status === "string") rev += `|ts:${r.status}`;
 		// A gate's status is height-neutral but PAINTED from the cached payload (it picks

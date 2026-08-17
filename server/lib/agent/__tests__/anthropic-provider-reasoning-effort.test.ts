@@ -81,13 +81,13 @@ describe("AnthropicProvider effort on third-party models", () => {
 		expect(body.output_config).toEqual({ effort: "high" });
 	});
 
-	test("does not gate effort on the Claude-only thinking block", async () => {
-		// A non-Claude id gets no `thinking` config, which is exactly why the old
-		// `thinkingEnabled` guard silently dropped its effort.
+	test("does not gate effort on the Claude-only adaptive thinking block", async () => {
+		// A non-Claude id gets the classic relay thinking shape (enabled + budget),
+		// never Claude's `adaptive` — and effort is sent regardless of thinking.
 		mockFetchCapturingRequest();
 		const provider = new AnthropicProvider(config());
 		const body = await sendAndCapture(provider, chatParams({ reasoningEffort: "max" }));
-		expect(body.thinking).toBeUndefined();
+		expect(body.thinking).toEqual({ type: "enabled", budget_tokens: 10_000 });
 		expect(body.output_config).toEqual({ effort: "max" });
 	});
 
@@ -254,7 +254,7 @@ describe("AnthropicProvider thinking request sanitization", () => {
 		]);
 	});
 
-	test("uses non-empty thinking and signature placeholders for DeepSeek history", async () => {
+	test("uses non-empty thinking with empty signatures for DeepSeek history", async () => {
 		mockFetchCapturingRequest();
 		const provider = new AnthropicProvider(config({ defaultModel: "deepseek-v4-flash-0731" }));
 		const body = await sendAndCapture(
@@ -302,12 +302,12 @@ describe("AnthropicProvider thinking request sanitization", () => {
 		expect(assistants[0].content[0]).toEqual({
 			type: "thinking",
 			thinking: " ",
-			signature: "narrafork-deepseek-compat",
+			signature: "",
 		});
 		expect(assistants[1].content[0]).toEqual({
 			type: "thinking",
 			thinking: "real reasoning",
-			signature: "narrafork-deepseek-compat",
+			signature: "",
 		});
 		expect(assistants[2].content[0]).toEqual({
 			type: "thinking",
@@ -319,7 +319,9 @@ describe("AnthropicProvider thinking request sanitization", () => {
 				.flatMap((message) => message.content)
 				.every((block) => {
 					if (block.type !== "thinking") return true;
-					return (block.thinking?.length ?? 0) > 0 && (block.signature?.length ?? 0) > 0;
+					// Empty thinking text is always padded away; the signature may be
+					// empty (relay models mint none), but must never be undefined.
+					return (block.thinking?.length ?? 0) > 0 && typeof block.signature === "string";
 				}),
 		).toBe(true);
 	});

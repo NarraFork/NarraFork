@@ -23,7 +23,7 @@
  * Zero DOM. Body wrapping comes from pretext arithmetic inside measureMarkdown.
  */
 
-import type { MeasuredElement, RenderLod } from "../prepared-block";
+import { DEFAULT_RENDER_LOD, type MeasuredElement, type RenderLod } from "../prepared-block";
 import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 
@@ -73,7 +73,7 @@ export interface MeasurePlanCardInput {
 export function measurePlanCard(
 	data: MeasurePlanCardInput,
 	contentWidth: number,
-	_lod: RenderLod = 5,
+	_lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredElement {
 	const chrome = planCardChrome(data.hasActions ?? false);
 	const innerWidth = Math.max(1, contentWidth - PLAN_CARD_PADDING * 2 - PLAN_CARD_BORDER * 2);

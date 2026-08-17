@@ -36,7 +36,7 @@
  * Zero DOM: heights come from pretext line metrics exactly like every other measure.
  */
 
-import type { MeasuredElement, RenderLod } from "../prepared-block";
+import { DEFAULT_RENDER_LOD, type MeasuredElement, type RenderLod } from "../prepared-block";
 import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 import { isSpecTaskPayload, measureSpecTask, type SpecTaskData } from "./measure-spec-task";
@@ -266,7 +266,7 @@ export function isMeasuredInjectionBubble(
 export function measureInjectionBubble(
 	input: MeasureInjectionBubbleInput,
 	contentWidth: number,
-	_lod: RenderLod = 5,
+	_lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredInjectionBubble {
 	const hasHeader = input.hasHeader !== false;
 	const hasNote = input.hasNote === true;

@@ -5,6 +5,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ModelAggregationsSection } from "../../components/settings/ModelAggregationsSection";
+import { ModelCardsSection } from "../../components/settings/ModelCardsSection";
 import { ModelsSection } from "../../components/settings/ModelsSection";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
 import { useAllModels } from "../../hooks/useModels";
@@ -133,6 +134,8 @@ function SettingsModelsPage() {
 				providerLabels={providerLabels}
 				generateId={generateShortId}
 			/>
+			<Divider />
+			<ModelCardsSection />
 		</Stack>
 	);
 }

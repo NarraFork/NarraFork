@@ -125,6 +125,7 @@ import { Z } from "../../lib/z-index";
 import { useImageViewer } from "../common/ImageViewerProvider";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
 import { AutoFollowScroll } from "./AutoFollowScroll";
+import { agentTargetDisplay, formatAgentIdForDisplay } from "./agent-id-display";
 import { CompactMenuSub } from "./CompactMenuSub";
 import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
@@ -1061,13 +1062,18 @@ export function getSummary(
 		}
 		case "await": {
 			const awaitType = extractField(input, "type") || "task";
-			const id = extractField(input, "id") || "unknown";
+			// Mirrors tool-display.ts's await branch: alias first, raw nanoid truncated.
+			const id =
+				agentTargetDisplay(
+					metadata?.targetLabel as string | undefined,
+					extractField(input, "id"),
+				) || "unknown";
 			const waitForText = extractField(input, "wait_for_text");
 			const base = `${awaitType}: ${id}`;
 			return waitForText ? `${base} · wait "${waitForText.slice(0, 24)}"` : base;
 		}
 		case "send": {
-			const targets = getSendTargetLabels(input);
+			const targets = getSendTargetLabels(input).map((target) => formatAgentIdForDisplay(target));
 			const targetLabel = targets.length === 1 ? targets[0] : `${targets.length} targets`;
 			const flags = [];
 			if (!isTruncated(input) && input?.doInterrupt) flags.push("interrupt");
@@ -3691,6 +3697,7 @@ function AwaitDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const awaitType =
 		extractField(input, "type") || (metadata?.awaitType as string | undefined) || "task";
 	const targetId = extractField(input, "id") || (metadata?.targetId as string | undefined) || "";
+	const targetLabel = metadata?.targetLabel as string | undefined;
 	const resolvedId = metadata?.resolvedId as string | undefined;
 	const status = (metadata?.status as string | undefined) ?? toolCall.status;
 	const waitForText =
@@ -3709,13 +3716,13 @@ function AwaitDetail({ toolCall }: { toolCall: ToolCallData }) {
 					{awaitType}
 				</Badge>
 				{targetId && (
-					<Badge size="xs" color="gray" variant="outline">
-						{targetId}
+					<Badge size="xs" color="gray" variant="outline" title={targetId}>
+						{agentTargetDisplay(targetLabel, targetId)}
 					</Badge>
 				)}
-				{resolvedId && resolvedId !== targetId && (
-					<Badge size="xs" color="gray" variant="outline">
-						→ {resolvedId}
+				{resolvedId && resolvedId !== targetId && resolvedId !== targetLabel && (
+					<Badge size="xs" color="gray" variant="outline" title={resolvedId}>
+						→ {formatAgentIdForDisplay(resolvedId)}
 					</Badge>
 				)}
 				<Badge size="xs" color={STATUS_COLORS[status] ?? "gray"} variant="light">
@@ -3733,8 +3740,8 @@ function AwaitDetail({ toolCall }: { toolCall: ToolCallData }) {
 				</Text>
 			)}
 			{effectiveSubagentId && awaitType === "agent" && (
-				<Text size="xs" c="dimmed" mb={4} ff="monospace">
-					Subagent: {effectiveSubagentId}
+				<Text size="xs" c="dimmed" mb={4} ff="monospace" title={effectiveSubagentId}>
+					Subagent: {agentTargetDisplay(targetLabel, effectiveSubagentId)}
 				</Text>
 			)}
 			{toolCall.outputJson && (
@@ -3766,6 +3773,8 @@ function AwaitDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 interface SendTargetMeta {
 	id?: string;
+	/** Server-resolved readable label (alias → title slug → short id). */
+	label?: string;
 	title?: string | null;
 	status?: string;
 	interrupted?: boolean;
@@ -3780,6 +3789,11 @@ function SendDetail({ toolCall }: { toolCall: ToolCallData }) {
 		| undefined;
 	const targets = getSendTargetLabels(input);
 	const message = isTruncated(input) ? input.preview : (input?.message ?? "");
+	const metaLabelById = new Map(
+		(Array.isArray(metadata?.targets) ? metadata.targets : [])
+			.filter((target): target is SendTargetMeta & { id: string } => !!target.id)
+			.map((target) => [target.id, target.label]),
+	);
 	const rawOutput = resolveDisplayText(toolCall.outputJson);
 	const rawFullOutput = resolveFullDisplayText(toolCall.outputJson);
 	const isAwait = !isTruncated(input) ? !!input?.await : !!metadata?.await;
@@ -3791,8 +3805,8 @@ function SendDetail({ toolCall }: { toolCall: ToolCallData }) {
 			<Group gap={6} mb={6} wrap="wrap">
 				{targets.length > 0 ? (
 					targets.map((target) => (
-						<Badge key={target} size="xs" color="blue" variant="light">
-							→ {target}
+						<Badge key={target} size="xs" color="blue" variant="light" title={target}>
+							→ {agentTargetDisplay(metaLabelById.get(target), target)}
 						</Badge>
 					))
 				) : (
@@ -3828,7 +3842,7 @@ function SendDetail({ toolCall }: { toolCall: ToolCallData }) {
 								{target.status ?? "sent"}
 							</Badge>
 							<Text size="xs" truncate title={target.error ?? target.id ?? target.title ?? ""}>
-								{target.title || target.id || "target"}
+								{target.label || target.title || formatAgentIdForDisplay(target.id) || "target"}
 								{target.interrupted ? " · interrupted" : ""}
 								{target.error ? ` · ${target.error}` : ""}
 							</Text>
@@ -5605,10 +5619,10 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const renderLod = useRenderLod();
 	// Effective expanded state, layering the render LOD over the user's own
 	// toggle preference (`opened`). Rules:
-	//   L6      → always expanded.
-	//   L5      → recent cards follow `opened`; older cards collapse to headers.
-	//   L4      → all collapse to headers.
-	//   L3-L1   → handled upstream by the tool-run gate (this card is not shown).
+	//   L5      → always expanded.
+	//   L4      → recent cards follow `opened`; older cards collapse to headers.
+	//   L3      → all collapse to headers.
+	//   L2/L1   → handled upstream by the tool-run gate (this card is not shown).
 	// In-progress / streaming / permission cards are exempt — always expanded so
 	// actionable content stays visible at every level.
 	const lodExempt = isRunning || isStreaming || !!pendingPermission;
@@ -5624,13 +5638,13 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const lodBaseOpened =
 		lodExempt || lodUserOverride
 			? true
-			: renderLod >= 6
+			: renderLod >= 5
 				? true
-				: renderLod === 5
+				: renderLod === 4
 					? isRecent
 						? opened
 						: false
-					: renderLod === 4
+					: renderLod === 3
 						? false
 						: opened;
 	const effectiveOpened = lodBaseOpened;
@@ -5686,7 +5700,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// Toggling at a level that collapses this card goes through the LOD override
 	// so the user's explicit expand survives the level; toggling inside the
 	// level's normal expanded window flips the underlying preference instead.
-	const collapsesByLod = !lodExempt && (renderLod === 4 || (renderLod === 5 && !isRecent));
+	const collapsesByLod = !lodExempt && (renderLod === 3 || (renderLod === 4 && !isRecent));
 	const handleToggle =
 		isStreaming || !interactionEnabled
 			? undefined

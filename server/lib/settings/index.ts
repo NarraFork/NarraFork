@@ -9,7 +9,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { resolve } from "node:path";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { logger } from "../logger";
-import { setModelPricingOverrides } from "../model-pricing";
+import { invalidateModelCardCache } from "../model-cards";
+import { type ModelPricing, setModelPricingOverrides } from "../model-pricing";
 import { getNarraforkHome } from "../narrafork-home";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
 import { normalizeSearchSettings } from "../search/settings";
@@ -406,9 +407,40 @@ function loadSettingsFromDisk(): NarraForkSettings {
 
 	// Pricing lives in its own module so cost attribution does not have to pull in
 	// the settings module graph; push the operator overrides into it on load.
-	setModelPricingOverrides(merged.pricing?.overrides);
+	applyPricingOverridesFromSettings(merged);
 
 	return merged;
+}
+
+/**
+ * Feed price overrides into the pricing module from both sources.
+ *
+ * Two of them exist because `pricing.overrides` predates model cards and had no
+ * UI at all — it could only be hand-edited into settings.json. Model cards are
+ * that UI, so their `officialPricing` is the way forward, but existing
+ * hand-written overrides must keep working.
+ *
+ * Cards are applied first and `pricing.overrides` second, so a legacy entry
+ * still wins. That ordering is deliberate: someone who hand-edited a price did
+ * so to correct a specific model, and having a card silently outrank it would
+ * revert a correction they cannot see being reverted. New edits go through cards
+ * and land in the same place.
+ */
+function applyPricingOverridesFromSettings(current: NarraForkSettings): void {
+	const fromCards: Record<string, Partial<ModelPricing>> = {};
+	for (const card of current.agent.modelCards ?? []) {
+		const pricing = card.officialPricing;
+		if (!card.modelKey || !pricing || card.deleted) continue;
+		const entry: Partial<ModelPricing> = {};
+		// 0 means "not set" here as everywhere else on a card, so it must not be
+		// forwarded: an override of 0 would price real usage as free.
+		if ((pricing.input ?? 0) > 0) entry.input = pricing.input;
+		if ((pricing.output ?? 0) > 0) entry.output = pricing.output;
+		if ((pricing.cacheRead ?? 0) > 0) entry.cacheRead = pricing.cacheRead;
+		if ((pricing.cacheWrite ?? 0) > 0) entry.cacheWrite = pricing.cacheWrite;
+		if (Object.keys(entry).length > 0) fromCards[card.modelKey] = entry;
+	}
+	setModelPricingOverrides({ ...fromCards, ...(current.pricing?.overrides ?? {}) });
 }
 
 /** Simple 8-char random ID for migration (avoids importing nanoid at this level). */
@@ -646,7 +678,11 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 		throw error;
 	}
 	settingsRevision++;
-	setModelPricingOverrides(newSettings.pricing?.overrides);
+	applyPricingOverridesFromSettings(newSettings);
+	// The card index is memoized on the identity of the cards array. A save that
+	// mutated the existing array in place would keep that identity, so the cache
+	// is dropped explicitly rather than relying on a new reference arriving.
+	invalidateModelCardCache();
 	if (_cache.current) {
 		stripObsoleteSettingsKeys(_cache.current as unknown as Record<string, unknown>);
 		for (const key of Object.keys(_cache.current) as Array<keyof NarraForkSettings>) {

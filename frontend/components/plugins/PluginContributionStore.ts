@@ -47,6 +47,7 @@ const KNOWN_VIEW_SURFACES: readonly PluginViewSurface[] = [
 	"workspace",
 	"director",
 	"focus",
+	"graph",
 	"settings",
 	"provider-settings",
 ];

@@ -1,3 +1,4 @@
+import { PERSISTED_NAV_IDS } from "@shared/nav-layout";
 import {
 	RECENT_TABS_LIVE_LIMIT,
 	RECENT_TABS_PAGE_SIZE,
@@ -7,6 +8,49 @@ import {
 import { z } from "zod";
 import { legacyPermissionModeSchema } from "../permission-modes";
 import { commandSchema, localeSchema } from "./common";
+
+/**
+ * One model card delta, as persisted in `agent.modelCards`.
+ *
+ * Every field except `modelKey` is optional, because a stored entry is the
+ * DIFFERENCE from the builtin card, not a whole card: absence means "inherit".
+ *
+ * `effortLevels` excludes `none` at the schema level rather than silently
+ * dropping it later. `none` means "reasoning off", and storing it would make it
+ * a clamp target — a requested `low` on a model whose lowest real tier is
+ * `medium` could then clamp to thinking being switched off, with nothing said.
+ * Rejecting it tells the caller instead of quietly changing behaviour.
+ *
+ * Prices are capped well above any published rate: the bound exists to reject
+ * a stray unit error (a per-1k price typed into a per-1M field), not to predict
+ * vendor pricing.
+ */
+const modelCardPricingSchema = z.object({
+	input: z.number().min(0).max(100_000).optional(),
+	output: z.number().min(0).max(100_000).optional(),
+	cacheRead: z.number().min(0).max(100_000).optional(),
+	cacheWrite: z.number().min(0).max(100_000).optional(),
+});
+
+export const modelCardSchema = z.object({
+	modelKey: z.string().min(1).max(200),
+	displayName: z.string().max(200).optional(),
+	family: z.string().max(100).optional(),
+	notes: z.string().max(2000).optional(),
+	aliases: z.array(z.string().min(1).max(200)).max(50).optional(),
+	matchPrefixes: z.array(z.string().min(1).max(200)).max(50).optional(),
+	// 0 is accepted and means "not set" — the card editor's default for a field
+	// the user is not filling in.
+	contextWindow: z.number().int().min(0).max(100_000_000).optional(),
+	maxCompletionTokens: z.number().int().min(0).max(100_000_000).optional(),
+	effortLevels: z
+		.array(z.enum(["low", "medium", "high", "xhigh", "max"]))
+		.max(10)
+		.optional(),
+	officialPricing: modelCardPricingSchema.optional(),
+	/** Tombstone marking a builtin card the user deleted. */
+	deleted: z.boolean().optional(),
+});
 
 /** Per-location proxy override: default (inherit global) / direct / system / custom. */
 const proxyOverrideSchema = z
@@ -70,15 +114,9 @@ const navLayoutSchema = z.object({
 			z.object({
 				// Customizable nav ids, plus the "__divider__" boundary marker: every
 				// id after the divider is tucked into the "More" overflow menu.
-				id: z.enum([
-					"projects",
-					"groups",
-					"routines",
-					"scheduled-tasks",
-					"learn",
-					"knowledge",
-					"__divider__",
-				]),
+				// Sourced from @shared/nav-layout so this list cannot drift behind the
+				// frontend registry (a missing id makes the layout unsavable).
+				id: z.enum(PERSISTED_NAV_IDS),
 				// Legacy optional flag — position relative to the divider is authoritative.
 				hidden: z.boolean().optional(),
 			}),

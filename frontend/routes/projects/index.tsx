@@ -322,16 +322,25 @@ function ProjectListPage() {
 						<Text size="sm" fw={500} mb={4}>
 							{t("flowMode", "Flow Mode")}
 						</Text>
+						{/* Ruler stays selectable so nothing that already uses it becomes
+						    unreachable, but it is deprecated: labelled as such here, and the
+						    hint only appears once it is actually picked so the common path
+						    stays quiet. The view is switchable after creation either way. */}
 						<SegmentedControl
 							fullWidth
 							value={flowMode}
 							onChange={setFlowMode}
 							data={[
-								{ value: "classic", label: t("flowModeClassic", "Classic") },
-								{ value: "ruler", label: t("flowModeRuler", "Ruler") },
+								{ value: "classic", label: t("flowModeClassic", "NarraFlow") },
+								{ value: "ruler", label: t("flowModeRulerDeprecated", "Ruler (deprecated)") },
 							]}
 							disabled={isCloning}
 						/>
+						{flowMode === "ruler" && (
+							<Text size="xs" c="yellow" mt={4}>
+								{t("flowModeRulerDeprecatedHint")}
+							</Text>
+						)}
 					</div>
 					{repoMode === "clone" && (
 						<>

@@ -2,7 +2,6 @@
  * trace-row-identity.ts — Pure, DOM-free identity for ONE folded trace row.
  *
  * At low LOD a tool-run collapses into a trace (a list of single-line rows):
- *   L3      → ToolRunSummary  / `tool-run-summary`  (one row per tool call)
  *   L1 / L2 → ActivityTrace   / `activity-trace`    (reasoning + tool rows merged)
  *
  * Those rows carry no interaction surface of their own, so this module resolves
@@ -11,7 +10,7 @@
  * rows — the tool-specific menu facts.
  *
  * Shared by BOTH render paths on purpose:
- *   - chunked : CollapsibleTrace rows (ActivityTrace / ToolRunSummary)
+ *   - chunked : CollapsibleTrace rows (ActivityTrace)
  *   - vlist   : RenderToolRun rows (via the height-neutral identity passthrough)
  * It therefore lives OUTSIDE vlist/ — the isolation guard forbids non-vlist files
  * from statically importing vlist/, but the reverse direction is allowed.

@@ -41,7 +41,8 @@ function notification(
 	over: Partial<CompletedBgSubagentNotification> = {},
 ): CompletedBgSubagentNotification {
 	return {
-		id: "task-1",
+		id: "UscgG1vLFnxzyKyaUOIfR",
+		alias: "map-the-providers",
 		title: "Map the providers",
 		status: "completed",
 		resultPreview: "found 7 buildHistory sites",
@@ -95,7 +96,27 @@ describe("the two paths differ only in how much result they include", () => {
 		expect(text).not.toContain("listed with line numbers");
 		// The follow-up instruction is present either way; it is how the model gets the
 		// rest without another injection.
-		expect(text).toContain('Await({ type: "agent", id: "task-1" })');
+		expect(text).toContain('Await({ type: "agent", id: "map-the-providers" })');
+	});
+
+	// The id slot is a selector the model is told to reuse, so it must be the
+	// alias. Printing the nanoid here is what taught the model to address agents
+	// by gibberish for the rest of the session.
+	it("names the agent by alias and never by its raw narrator id", () => {
+		const text = formatBackgroundCompletionNotifications([notification()], {
+			includeResult: true,
+		});
+		expect(text).toContain("(ID: map-the-providers)");
+		expect(text).not.toContain("UscgG1vLFnxzyKyaUOIfR");
+		expect(text).toContain('Send({ id: "map-the-providers", message })');
+	});
+
+	it("falls back to the id when a completion carries no alias", () => {
+		const text = formatBackgroundCompletionNotifications(
+			[notification({ alias: null, id: "legacy-task" })],
+			{ includeResult: false },
+		);
+		expect(text).toContain("(ID: legacy-task)");
 	});
 
 	it("idle: the full result, because a turn is being started to deal with it", () => {
@@ -111,7 +132,7 @@ describe("the two paths differ only in how much result they include", () => {
 			{ includeResult: true },
 		);
 		expect(text).toContain("truncated");
-		expect(text).toContain('Await({ type: "agent", id: "task-1" })');
+		expect(text).toContain('Await({ type: "agent", id: "map-the-providers" })');
 	});
 
 	it("an empty result is stated rather than left blank", () => {

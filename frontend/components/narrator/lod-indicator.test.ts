@@ -86,7 +86,7 @@ describe("resolveLodStepTarget", () => {
 
 describe("scale", () => {
 	it("offers every level as a target, in ascending order", () => {
-		expect(LOD_LEVELS).toEqual([1, 2, 3, 4, 5, 6]);
+		expect(LOD_LEVELS).toEqual([1, 2, 3, 4, 5]);
 		expect(LOD_LEVELS[0]).toBe(MIN_RENDER_LOD);
 		expect(LOD_LEVELS[LOD_LEVELS.length - 1]).toBe(MAX_RENDER_LOD);
 	});

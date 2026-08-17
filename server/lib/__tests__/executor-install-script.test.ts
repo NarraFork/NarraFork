@@ -13,11 +13,6 @@ const TICKET = "b".repeat(64);
 
 function input(overrides: Partial<ExecutorInstallScriptInput> = {}): ExecutorInstallScriptInput {
 	const platform: ExecutorPlatform = overrides.platform ?? "linux-amd64";
-	// Windows targets require a Windows-shaped absolute path, so the default has to
-	// follow the platform unless a test overrides it explicitly.
-	const defaultAllowRoot = platform.startsWith("windows-")
-		? "C:\\work\\projects"
-		: "/home/dev/projects";
 	return {
 		platform,
 		mode: "system",
@@ -26,7 +21,6 @@ function input(overrides: Partial<ExecutorInstallScriptInput> = {}): ExecutorIns
 		deviceSlug: "build-server",
 		deviceName: "Build Server",
 		connectionMode: "reverse",
-		allowRoot: defaultAllowRoot,
 		disableShell: false,
 		artifactFilename: "narrafork-executor-0.5.24-linux-amd64",
 		expectedSha256: SHA256,
@@ -180,75 +174,83 @@ describe("install locations and service wiring", () => {
 	});
 });
 
-describe("injection resistance", () => {
-	test("shell metacharacters in the allow-root path stay a single literal argument", () => {
-		const evil = "/home/dev/'; rm -rf / #";
-		const { script } = buildExecutorInstallScript(input({ allowRoot: evil }));
-		// Inside a quoted heredoc the text is inert data, and it is JSON-escaped so
-		// it cannot break out of the config value either.
+describe("path guard defaults", () => {
+	test("the generated config leaves path rules empty so the guard starts unrestricted", () => {
+		// Path rules are configured after install, from the device page, where the
+		// operator can browse the machine's real directories. Emitting a guessed
+		// path here would bake in a value nobody could verify at install time.
+		const { script } = buildExecutorInstallScript(input());
 		const configLine = script
 			.split("\n")
-			.find((line) => line.includes("allowRoots"))
+			.find((line) => line.includes("pathRules"))
 			?.trim();
-		expect(configLine).toBe(`"allowRoots": ["/home/dev/'; rm -rf / #"],`);
-		// The heredoc delimiter must be quoted, otherwise $(…) in a path would run.
+		expect(configLine).toBe(`"pathRules": [],`);
+	});
+
+	test("the windows config also starts with an empty rule list", () => {
+		const { script } = buildExecutorInstallScript(input({ platform: "windows-amd64" }));
+		expect(script).toContain("pathRules = @()");
+	});
+
+	test("no script asks for or embeds an allow-root", () => {
+		for (const platform of EXECUTOR_PLATFORMS) {
+			const { script } = buildExecutorInstallScript(input({ platform }));
+			expect(script).not.toContain("--allow-root");
+			expect(script).not.toContain("allowRoots");
+		}
+	});
+});
+
+describe("injection resistance", () => {
+	test("shell metacharacters in the device name stay inert", () => {
+		// deviceName is operator input that lands in both script bodies, so it is
+		// the surface these escaping guarantees now have to hold for.
+		const { script } = buildExecutorInstallScript(input({ deviceName: "'; rm -rf / #" }));
+		expect(script).toContain("# Device: '; rm -rf / # (build-server)");
+		// The comment is the only place it appears, and a comment cannot execute.
+		const executable = script
+			.split("\n")
+			.filter((line) => !line.trimStart().startsWith("#"))
+			.join("\n");
+		expect(executable).not.toContain("rm -rf /");
+	});
+
+	test("command substitution in the device name cannot execute", () => {
+		const { script } = buildExecutorInstallScript(input({ deviceName: "$(id > /tmp/pwned)" }));
+		// Present only on a comment line; nothing outside comments may carry it.
+		const executable = script
+			.split("\n")
+			.filter((line) => !line.trimStart().startsWith("#"))
+			.join("\n");
+		expect(executable).not.toContain("$(id");
+	});
+
+	test("the config heredoc delimiter is quoted so config values never expand", () => {
+		// Even with no operator-supplied paths left in the config body, the quoted
+		// delimiter is what keeps future additions inert by default.
+		const { script } = buildExecutorInstallScript(input());
 		expect(script).toContain(`<<'CONFEOF'`);
 	});
 
-	test("command substitution in the allow-root path cannot execute", () => {
+	test("single quotes in a windows device name are doubled for PowerShell", () => {
 		const { script } = buildExecutorInstallScript(
-			input({ allowRoot: "/home/dev/$(id > /tmp/pwned)" }),
+			input({ platform: "windows-amd64", deviceName: "dev's box" }),
 		);
-		const heredocStart = script.indexOf("<<'CONFEOF'");
-		const heredocEnd = script.indexOf("\nCONFEOF", heredocStart);
-		expect(heredocStart).toBeGreaterThan(-1);
-		const body = script.slice(heredocStart, heredocEnd);
-		// Present as literal text, but only inside a quoted heredoc where the shell
-		// performs no substitution at all.
-		expect(body).toContain("$(id > /tmp/pwned)");
-		expect(script.slice(0, heredocStart)).not.toContain("$(id");
-	});
-
-	test("double quotes and backslashes in the allow-root path are JSON-escaped", () => {
-		const { script } = buildExecutorInstallScript(
-			input({ platform: "windows-amd64", allowRoot: "C:\\work\\proj" }),
-		);
-		expect(script).toContain("@('C:\\work\\proj')");
-	});
-
-	test("single quotes in a windows path are doubled for PowerShell", () => {
-		const { script } = buildExecutorInstallScript(
-			input({ platform: "windows-amd64", allowRoot: "C:\\dev's box\\code" }),
-		);
-		expect(script).toContain("'C:\\dev''s box\\code'");
+		// Appears in a comment here, but the quoting helper is the shared guarantee.
+		expect(powershellSingleQuote("C:\\dev's box\\code")).toBe("'C:\\dev''s box\\code'");
+		expect(script).toContain("dev's box");
 	});
 
 	test("newlines and control characters are rejected rather than escaped", () => {
-		expect(() => buildExecutorInstallScript(input({ allowRoot: "/tmp\nrm -rf /" }))).toThrow(
-			ValidationError,
-		);
 		expect(() => buildExecutorInstallScript(input({ deviceName: "evil\nname" }))).toThrow(
 			ValidationError,
 		);
-		expect(() => buildExecutorInstallScript(input({ allowRoot: "/tmp\u0000/x" }))).toThrow(
+		expect(() => buildExecutorInstallScript(input({ deviceName: "evil\u0000name" }))).toThrow(
 			ValidationError,
 		);
-	});
-
-	test("relative allow-root paths are rejected", () => {
-		expect(() => buildExecutorInstallScript(input({ allowRoot: "projects" }))).toThrow(
-			/absolute path/,
-		);
-		expect(() => buildExecutorInstallScript(input({ allowRoot: "" }))).toThrow(ValidationError);
 		expect(() =>
-			buildExecutorInstallScript(input({ platform: "windows-amd64", allowRoot: "/home/dev" })),
-		).toThrow(/absolute path/);
-		// UNC paths are legitimate absolute Windows paths.
-		expect(() =>
-			buildExecutorInstallScript(
-				input({ platform: "windows-amd64", allowRoot: "\\\\fileserver\\share" }),
-			),
-		).not.toThrow();
+			buildExecutorInstallScript(input({ executorVersion: "0.5.24\nrm -rf /" })),
+		).toThrow(ValidationError);
 	});
 
 	test("malformed slugs, digests, tickets and URLs are rejected", () => {

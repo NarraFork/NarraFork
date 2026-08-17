@@ -4,7 +4,7 @@
  *
  * Visual parity targets (do NOT import them — this is a zero-DOM measure copy):
  *   - CollapsibleTrace.tsx      — the content-agnostic header + row list + fold.
- *   - ToolRunSummary.tsx        — ToolRunSummary (L3) + ToolRunCountLine (L2).
+ *   - ToolRunSummary.tsx        — ToolRunCountLine (L1/L2).
  *   - ActivityTrace.tsx         — the unified L1/L2 activity fold.
  *   - ReasoningCountLine.tsx    — the L1/L2 single "reasoning ×N" line.
  *   - ReasoningStepsTrace.tsx   — reasoning trace whose steps expand to markdown.
@@ -47,7 +47,7 @@
  *   trace row                            = 2 + max(14,12,16.8)     ≈ 18.8
  *   count line (Group py=2, no outer box)= 4 + max(16,16.8)        ≈ 20.8
  *
- * ── Expandable body (ReasoningStepsTrace only) ───────────────────────────────
+ * ── Expandable body (reasoning-step rows: standalone trace + activity fold) ──
  * A row's body is `Box pl="lg"(20) py={2} borderLeft:2px` wrapping MarkdownContent.
  * Like reasoning, the body renders at markdown `sm` (MarkdownContent.module.css
  * hard-codes p/li/… to sm), so we reuse measureMarkdown as-is (no xs variant).
@@ -168,8 +168,6 @@ export const TRACE_BODY_BORDER_LEFT = 2;
 // ── Default maxVisible per variant ───────────────────────────────────────────
 /** Generic default (reasoning-style). */
 export const TRACE_DEFAULT_MAX_VISIBLE = 5;
-/** ToolRunSummary rows visible before the fold. */
-export const TOOL_RUN_MAX_VISIBLE = 10;
 /** ActivityTrace rows visible before the fold. */
 export const ACTIVITY_MAX_VISIBLE = 10;
 /** ReasoningStepsTrace step titles visible before the fold. */
@@ -183,7 +181,7 @@ export function traceBodyInnerWidth(contentWidth: number): number {
 // ── Data types ───────────────────────────────────────────────────────────────
 
 /** Which concrete trace this is (renderer picks header icon / colour / label). */
-export type TraceVariant = "collapsible" | "tool-run-summary" | "activity" | "reasoning-steps";
+export type TraceVariant = "collapsible" | "activity" | "reasoning-steps";
 
 /** One trace row. Title is single-line/truncated → height-neutral. */
 export interface TraceItemData {
@@ -709,29 +707,6 @@ export function measureCollapsibleTrace(
 
 // ── Variant wrappers ─────────────────────────────────────────────────────────
 
-/**
- * ToolRunSummary row input. No markdown bodies — L3 is titles-only — but a row
- * may still DRILL DOWN into its tool card, which is a different reveal channel
- * (`card`, not `bodyText`).
- */
-export interface ToolRunSummaryItem {
-	title: string;
-	hasIcon?: boolean;
-	iconColor?: string;
-	shimmer?: boolean;
-	/** Live reflection-gate status for the shimmer colour (renderer; height-neutral). */
-	reflectionStatus?: string;
-	key?: string;
-	/** Trailing status glyph (renderer only; height-neutral). */
-	status?: string | null;
-	/** Trailing timing text (renderer only; height-neutral). */
-	timing?: Partial<ToolTimingStamps> | null;
-	/** Row offers a drill-down chevron (height-neutral while collapsed). */
-	canDrillDown?: boolean;
-	/** Nested tool card, present only on a drilled-in row. */
-	card?: ToolCallData;
-}
-
 /** Optional header labels for a trace (height-neutral). */
 export interface TraceHeaderLabels {
 	label?: string;
@@ -739,31 +714,13 @@ export interface TraceHeaderLabels {
 }
 
 /**
- * L3 — ToolRunSummary: a frameless CollapsibleTrace, maxVisible=10, no markdown
- * bodies → header + min(N,10) rows (+ toggle when N>10), plus any drilled-in card.
+ * ActivityTrace row input.
+ *
+ * Two independent reveal channels, mutually exclusive per row: a tool row DRILLS
+ * DOWN into its card (`card`), a reasoning-step row EXPANDS its markdown
+ * (`bodyText`). Both make the row `expandable`, i.e. give it a chevron instead of
+ * the "•" dot, at the same collapsed height.
  */
-export function measureToolRunSummary(
-	items: ToolRunSummaryItem[],
-	contentWidth: number,
-	expandState: TraceExpandState = {},
-	labels: TraceHeaderLabels = {},
-	lod: RenderLod = DEFAULT_RENDER_LOD,
-): MeasuredCollapsibleTrace {
-	return measureCollapsibleTrace(
-		{
-			items: items.map((it) => ({ ...it, bodyText: null })),
-			maxVisible: TOOL_RUN_MAX_VISIBLE,
-			variant: "tool-run-summary",
-			headerLabel: labels.label,
-			headerCount: labels.count,
-		},
-		contentWidth,
-		expandState,
-		lod,
-	);
-}
-
-/** ActivityTrace row input (no markdown bodies; tool rows may drill down). */
 export interface ActivityTraceItem {
 	title: string;
 	hasIcon?: boolean;
@@ -780,11 +737,25 @@ export interface ActivityTraceItem {
 	canDrillDown?: boolean;
 	/** Nested tool card, present only on a drilled-in row. */
 	card?: ToolCallData;
+	/**
+	 * Markdown body for a REASONING-STEP row; null/absent → no body to reveal.
+	 *
+	 * Height-bearing when its row is expanded, exactly like the step rows of a
+	 * standalone reasoning trace: the row grows by `2*bodyPadY + markdownHeight`.
+	 * The adapter supplies it only for a settled step with real content — a live
+	 * step's body is truncated to one line for cost reasons, so a live row carries
+	 * none and stays non-expandable.
+	 */
+	bodyText?: string | null;
 }
 
 /**
- * L1/L2 — ActivityTrace: maxVisible=10, no markdown bodies. `collapsed` (L1) folds
- * the whole list behind the header (→ header only, 24.8px); L2 shows its rows.
+ * L1/L2 — ActivityTrace: maxVisible=10. `collapsed` (L1) folds the whole list
+ * behind the header (→ header only, 24.8px); L2 shows its rows.
+ *
+ * Row bodies are passed THROUGH (not nulled): a reasoning-step row carries the
+ * step's markdown so the reader can open one step of a folded run. Tool rows carry
+ * no `bodyText` and reveal their card via `card` instead.
  */
 export function measureActivityTrace(
 	items: ActivityTraceItem[],
@@ -797,7 +768,7 @@ export function measureActivityTrace(
 	const collapseItems = expandState.collapseItems ?? expandState.collapsed;
 	return measureCollapsibleTrace(
 		{
-			items: items.map((it) => ({ ...it, bodyText: null })),
+			items: items.map((it) => ({ ...it, bodyText: it.bodyText ?? null })),
 			maxVisible: ACTIVITY_MAX_VISIBLE,
 			variant: "activity",
 			headerLabel: labels.label,
@@ -816,28 +787,39 @@ export interface ReasoningStepItem {
 	body?: string | null;
 	shimmer?: boolean;
 	key?: string;
+	/**
+	 * LOD-independent identity of this step, matching the `unitId` of the folded
+	 * `activity-trace` row the same step becomes at L1/L2 (see `TraceItemData.unitId`).
+	 * Render-only passthrough; never read for layout.
+	 */
+	unitId?: string;
 }
 
 /**
- * ReasoningStepsTrace: maxVisible=5, each step's body is markdown. `titlesOnly`
- * drops all bodies (→ pure title rows). Expanded steps add
- * `2*bodyPadY + markdownHeight` under their 18.8px row.
+ * ReasoningStepsTrace: maxVisible=5, each step's body is markdown. Expanded steps
+ * add `2*bodyPadY + markdownHeight` under their 18.8px row.
+ *
+ * LOD-independent by design: there is no level at which a visible step title has
+ * an unopenable body (the former `titlesOnly` mode). The trace looks the same at
+ * every level; only which steps the reader opened varies.
  */
 export function measureReasoningStepsTrace(
 	steps: ReasoningStepItem[],
 	contentWidth: number,
-	expandState: TraceExpandState & { titlesOnly?: boolean } = {},
+	expandState: TraceExpandState = {},
 	labels: TraceHeaderLabels = {},
 ): MeasuredCollapsibleTrace {
-	const titlesOnly = !!expandState.titlesOnly;
 	return measureCollapsibleTrace(
 		{
 			items: steps.map((s) => ({
 				title: s.title,
 				hasIcon: false,
-				bodyText: titlesOnly ? null : (s.body ?? null),
+				bodyText: s.body ?? null,
 				shimmer: s.shimmer,
 				key: s.key,
+				// Passthrough so the step row paints `data-nf-unit` and can be paired with
+				// its folded counterpart across an LOD switch. Height-neutral.
+				unitId: s.unitId,
 			})),
 			maxVisible: REASONING_STEPS_MAX_VISIBLE,
 			variant: "reasoning-steps",
@@ -925,7 +907,6 @@ export const MEASURE_TOOL_RUN_CONSTANTS = {
 	TRACE_BODY_PADDING_Y,
 	TRACE_BODY_PADDING_LEFT,
 	TRACE_BODY_BORDER_LEFT,
-	TOOL_RUN_MAX_VISIBLE,
 	ACTIVITY_MAX_VISIBLE,
 	REASONING_STEPS_MAX_VISIBLE,
 } as const;

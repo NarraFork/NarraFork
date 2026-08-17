@@ -892,6 +892,9 @@ describe("executeTool execution target freeze", () => {
 		name: "Remote",
 		slug: "remote",
 		online: true,
+		// These tests cover tool routing, not injection tiers; "global" preserves
+		// the pre-change behaviour.
+		scope: "global" as const,
 	};
 
 	test("persists the resolved remote target before permission handling", async () => {
@@ -960,6 +963,7 @@ describe("executeTool execution target freeze", () => {
 						name: "Secondary",
 						slug: "secondary",
 						online: true,
+						scope: "global" as const,
 					},
 				],
 				onExecutionTargetResolved: async (_toolUseId, target) => {
@@ -1155,7 +1159,15 @@ describe("executeTool execution target freeze", () => {
 					return { behavior: "allow" };
 				}),
 				defaultDeviceId: remoteBackend.deviceId,
-				availableDevices: [{ id: "other-device", name: "Other", slug: "other", online: true }],
+				availableDevices: [
+					{
+						id: "other-device",
+						name: "Other",
+						slug: "other",
+						online: true,
+						scope: "global" as const,
+					},
+				],
 			},
 		);
 
@@ -1177,7 +1189,15 @@ describe("executeTool execution target freeze", () => {
 				return { behavior: "allow" };
 			}),
 			defaultDeviceId: "offline-device",
-			availableDevices: [{ id: "offline-device", name: "Offline", slug: "offline", online: false }],
+			availableDevices: [
+				{
+					id: "offline-device",
+					name: "Offline",
+					slug: "offline",
+					online: false,
+					scope: "global" as const,
+				},
+			],
 			onExecutionTargetResolved: async () => {
 				persisted = true;
 			},
@@ -1530,10 +1550,81 @@ describe("relaxed plan reminder classifier", () => {
 		).resolves.toBe(false);
 	});
 
+	test("ignores writes to the plan file itself", async () => {
+		// The reminder exists to say "you are planning, not implementing". Attaching it to
+		// the ONE write plan mode asked for tells the model its correct action was suspect,
+		// which is the opposite of the intent.
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-plan-write",
+					name: "Write",
+					input: { file_path: ".narrafork/plans/plan-abc.md", content: "# Plan" },
+				},
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+		// Relaxed plan mode lets the model pick its own file inside the plan directory.
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-plan-write-custom",
+					name: "Write",
+					input: { file_path: "/tmp/.narrafork/plans/my-plan.md", content: "# Plan" },
+				},
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-plan-edit",
+					name: "Edit",
+					input: {
+						file_path: ".narrafork/plans/plan-abc.md",
+						old_string: "a",
+						new_string: "b",
+					},
+				},
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+		// A cycle anchored to the pre-`plans/` layout writes outside the directory, and
+		// that file is just as much the plan.
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-legacy-plan-write",
+					name: "Write",
+					input: { file_path: ".narrafork/plan-abc.md", content: "# Plan" },
+				},
+				{ ...relaxedPlanConfig, planFilePath: ".narrafork/plan-abc.md" },
+			),
+		).resolves.toBe(false);
+	});
+
 	test("flags mutating tools and write-capable subagents", async () => {
 		await expect(
 			shouldInjectRelaxedPlanToolReminder(
 				{ toolUseId: "tu-write", name: "Write", input: { file_path: "x.ts" } },
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(true);
+		// A `.md` outside the plan directory is documentation, not the plan.
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{ toolUseId: "tu-doc-write", name: "Write", input: { file_path: "docs/NOTES.md" } },
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(true);
+		// The legacy plan path only counts when the cycle is actually anchored to it.
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-legacy-unanchored",
+					name: "Write",
+					input: { file_path: ".narrafork/plan-abc.md" },
+				},
 				relaxedPlanConfig,
 			),
 		).resolves.toBe(true);

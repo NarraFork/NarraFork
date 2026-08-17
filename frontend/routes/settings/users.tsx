@@ -12,8 +12,9 @@ import {
 	Text,
 	TextInput,
 	Title,
+	Tooltip,
 } from "@mantine/core";
-import { IconLock, IconPencil, IconPlus, IconTrash } from "@tabler/icons-react";
+import { IconLock, IconPencil, IconPlus, IconSelector, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
@@ -156,24 +157,31 @@ function SettingsUsersPage() {
 										<Table.Td>{u.username}</Table.Td>
 										<Table.Td>
 											{u.id === user?.id ? (
-												<Badge color="indigo">{u.role}</Badge>
+												<Tooltip label={t("ownRoleHint")}>
+													<Badge color="indigo">{u.role}</Badge>
+												</Tooltip>
 											) : (
-												<Badge
-													color={u.role === "admin" ? "indigo" : "gray"}
-													style={{ cursor: "pointer" }}
-													onClick={async () => {
-														const newRole = u.role === "admin" ? "user" : "admin";
-														const msg =
-															newRole === "admin"
-																? t("confirmPromoteAdmin", { username: u.username })
-																: t("confirmDemoteAdmin", { username: u.username });
-														if (await confirm({ message: msg })) {
-															updateUser.mutate({ id: u.id, data: { role: newRole } });
-														}
-													}}
+												<Tooltip
+													label={u.role === "admin" ? t("demoteAdminHint") : t("promoteAdminHint")}
 												>
-													{u.role}
-												</Badge>
+													<Badge
+														color={u.role === "admin" ? "indigo" : "gray"}
+														rightSection={<IconSelector size={12} />}
+														style={{ cursor: "pointer" }}
+														onClick={async () => {
+															const newRole = u.role === "admin" ? "user" : "admin";
+															const msg =
+																newRole === "admin"
+																	? t("confirmPromoteAdmin", { username: u.username })
+																	: t("confirmDemoteAdmin", { username: u.username });
+															if (await confirm({ message: msg })) {
+																updateUser.mutate({ id: u.id, data: { role: newRole } });
+															}
+														}}
+													>
+														{u.role}
+													</Badge>
+												</Tooltip>
 											)}
 										</Table.Td>
 										<Table.Td>

@@ -16,13 +16,20 @@ const { installCanvasStub } = await import("../narrator/vlist/measure/test-canva
 installCanvasStub();
 
 const {
+	attachmentsSignature,
 	boundChatBody,
+	CHAT_ATTACHMENT_BLOCK_GAP,
+	CHAT_ATTACHMENT_GAP,
 	CHAT_BODY_MAX_CHARS,
 	CHAT_BUBBLE_PADDING_X,
 	CHAT_BUBBLE_PADDING_Y,
 	CHAT_DELETED_BODY_HEIGHT,
+	CHAT_FILE_CHIP_HEIGHT,
 	CHAT_HEADER_GAP,
 	CHAT_HEADER_HEIGHT,
+	CHAT_IMAGE_FALLBACK_HEIGHT,
+	CHAT_IMAGE_MAX_HEIGHT,
+	CHAT_IMAGE_MAX_WIDTH,
 	CHAT_REPLY_GAP,
 	CHAT_REPLY_LINE_HEIGHT,
 	measureChatMessage,
@@ -237,5 +244,141 @@ describe("prepared reuse", () => {
 		const reused = measureChatMessage(data, WIDTH, { preparedBlocks: direct.blocks });
 		expect(reused.height).toBe(direct.height);
 		expect(reused.bodyHeight).toBe(direct.bodyHeight);
+	});
+});
+
+describe("reply strip", () => {
+	test("an explicit hasReply reserves the strip even with no quoted text", () => {
+		// This is the case the old preview-derived rule silently dropped: a reply to a
+		// deleted message has an empty preview but still needs the strip, or the row
+		// reads as an ordinary message answering nothing.
+		const withStrip = measureChatMessage({ text: "answering", hasReply: true }, WIDTH);
+		const without = measureChatMessage({ text: "answering" }, WIDTH);
+		expect(withStrip.hasReply).toBe(true);
+		expect(withStrip.height - without.height).toBe(CHAT_REPLY_LINE_HEIGHT + CHAT_REPLY_GAP);
+	});
+
+	test("hasReply: false wins over a non-empty preview", () => {
+		const measured = measureChatMessage(
+			{ text: "body", hasReply: false, replyPreview: "stale preview" },
+			WIDTH,
+		);
+		expect(measured.hasReply).toBe(false);
+	});
+});
+
+describe("attachments", () => {
+	const image = (width: number, height: number) => ({ kind: "image" as const, width, height });
+	const file = { kind: "file" as const };
+
+	test("an image reserves an aspect-preserved box inside the max bounds", () => {
+		const measured = measureChatMessage({ text: "", attachments: [image(800, 400)] }, WIDTH);
+		const box = measured.attachments[0];
+		expect(box.width).toBeLessThanOrEqual(CHAT_IMAGE_MAX_WIDTH);
+		expect(box.height).toBeLessThanOrEqual(CHAT_IMAGE_MAX_HEIGHT);
+		// 2:1 in, 2:1 out.
+		expect(box.width / box.height).toBeCloseTo(2, 1);
+	});
+
+	test("a very tall image is bounded by the height, not just the width", () => {
+		const measured = measureChatMessage({ text: "", attachments: [image(200, 2000)] }, WIDTH);
+		const box = measured.attachments[0];
+		expect(box.height).toBeLessThanOrEqual(CHAT_IMAGE_MAX_HEIGHT);
+		// Without the height constraint the width cap alone would leave this 1800px tall.
+		expect(box.width).toBeLessThan(CHAT_IMAGE_MAX_WIDTH);
+	});
+
+	test("a small image is never upscaled", () => {
+		const measured = measureChatMessage({ text: "", attachments: [image(40, 30)] }, WIDTH);
+		expect(measured.attachments[0]).toMatchObject({ width: 40, height: 30 });
+	});
+
+	test("an image with unknown dimensions falls back to a fixed height", () => {
+		const measured = measureChatMessage(
+			{ text: "", attachments: [{ kind: "image", width: null, height: null }] },
+			WIDTH,
+		);
+		expect(measured.attachments[0].height).toBe(CHAT_IMAGE_FALLBACK_HEIGHT);
+	});
+
+	test("attachments stack, and the total is the sum plus the gaps", () => {
+		const measured = measureChatMessage(
+			{ text: "caption", attachments: [image(100, 50), image(100, 50), file] },
+			WIDTH,
+		);
+		const [a, b, c] = measured.attachments;
+		expect(b.top).toBe(a.top + a.height + CHAT_ATTACHMENT_GAP);
+		expect(c.top).toBe(b.top + b.height + CHAT_ATTACHMENT_GAP);
+		expect(c.height).toBe(CHAT_FILE_CHIP_HEIGHT);
+		// Stacking (rather than wrapping) is what makes the height a plain sum instead
+		// of a second wrap calculation the measure layer would have to reproduce.
+		expect(measured.attachmentsHeight).toBe(
+			a.height + b.height + c.height + CHAT_ATTACHMENT_GAP * 2 + CHAT_ATTACHMENT_BLOCK_GAP,
+		);
+	});
+
+	test("the block gap is only charged when there is a body to separate from", () => {
+		const withBody = measureChatMessage({ text: "caption", attachments: [file] }, WIDTH);
+		const without = measureChatMessage({ text: "", attachments: [file] }, WIDTH);
+		expect(withBody.attachmentsHeight - without.attachmentsHeight).toBe(CHAT_ATTACHMENT_BLOCK_GAP);
+	});
+
+	test("attachments add their height to the bubble", () => {
+		const bare = measureChatMessage({ text: "caption" }, WIDTH);
+		const withImage = measureChatMessage({ text: "caption", attachments: [image(100, 60)] }, WIDTH);
+		expect(withImage.height - bare.height).toBe(withImage.attachmentsHeight);
+	});
+
+	test("an attachment-only message is NOT the deleted placeholder", () => {
+		const measured = measureChatMessage({ text: "", attachments: [image(100, 60)] }, WIDTH);
+		// Rendering it as "this message was deleted" would mislabel an image-only post.
+		expect(measured.isDeletedPlaceholder).toBe(false);
+		expect(measured.attachments).toHaveLength(1);
+	});
+
+	test("a deleted message reserves no attachment space even if rows are passed", () => {
+		const measured = measureChatMessage(
+			{ text: "", deleted: true, attachments: [image(100, 60)] },
+			WIDTH,
+		);
+		expect(measured.isDeletedPlaceholder).toBe(true);
+		expect(measured.attachments).toEqual([]);
+		expect(measured.attachmentsHeight).toBe(0);
+	});
+
+	test("the bubble is at least as wide as its widest attachment", () => {
+		// Without this floor a one-word caption would shrink-wrap the bubble narrower
+		// than the thumbnail, which the bubble's own `overflow: hidden` would clip.
+		const measured = measureChatMessage({ text: "hi", attachments: [image(240, 120)] }, WIDTH);
+		const widest = Math.max(...measured.attachments.map((box) => box.width));
+		expect(measured.usedWidth).toBeGreaterThanOrEqual(widest + CHAT_BUBBLE_PADDING_X * 2);
+	});
+
+	test("a narrow bubble never reserves a box wider than its content width", () => {
+		const narrow = 160;
+		const measured = measureChatMessage({ text: "", attachments: [image(2000, 1000)] }, narrow);
+		expect(measured.attachments[0].width).toBeLessThanOrEqual(measured.contentWidth);
+	});
+});
+
+describe("attachments signature", () => {
+	test("distinguishes count, kind and dimensions", () => {
+		const base = attachmentsSignature([{ kind: "image", width: 10, height: 10 }]);
+		// Each of these changes the reserved box, so each must change the key — a
+		// collision means new content drawn into a stale box.
+		expect(base).not.toBe(attachmentsSignature([{ kind: "image", width: 20, height: 10 }]));
+		expect(base).not.toBe(attachmentsSignature([{ kind: "image", width: 10, height: 20 }]));
+		expect(base).not.toBe(attachmentsSignature([{ kind: "file" }]));
+		expect(base).not.toBe(
+			attachmentsSignature([
+				{ kind: "image", width: 10, height: 10 },
+				{ kind: "image", width: 10, height: 10 },
+			]),
+		);
+	});
+
+	test("no attachments and an empty list are the same empty signature", () => {
+		expect(attachmentsSignature(undefined)).toBe("");
+		expect(attachmentsSignature([])).toBe("");
 	});
 });

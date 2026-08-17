@@ -20,6 +20,7 @@ import {
 	terminalViewState,
 } from "../db/schema";
 import { GitAuthError, NotFoundError, ValidationError } from "../lib/errors";
+import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
@@ -108,6 +109,9 @@ projectRoutes.post("/", async (c) => {
 	const projectId = generateId();
 	// Owner of any narrator auto-created alongside the root chapter below.
 	const createdByUserId = c.get("user").sub;
+	// The setup commits below (initial commit, .gitignore) are authored by whoever
+	// created the project rather than by the host machine's global git config.
+	const gitIdentity = await resolveUserGitIdentityEnv(createdByUserId);
 
 	let gitPath = body.gitPath.trim();
 	// Expand ~ and resolve to absolute path so worktreePath / terminal cwd are correct
@@ -198,7 +202,7 @@ projectRoutes.post("/", async (c) => {
 				try {
 					projectDbManager.openForGitPath(projectId, gitPath);
 					ensureGitignoreEntry(gitPath);
-					await gitService.commitGitignoreIfDirty(gitPath);
+					await gitService.commitGitignoreIfDirty(gitPath, gitIdentity);
 				} catch (err) {
 					logger.warn("Failed to initialize project backup DB", {
 						projectId,
@@ -245,13 +249,13 @@ projectRoutes.post("/", async (c) => {
 		const detectedBranch = await gitService.getCurrentBranch(gitPath);
 		defaultBranch = detectedBranch ?? "main";
 	} else if (mode === "init") {
-		await gitService.initRepo(gitPath);
+		await gitService.initRepo(gitPath, gitIdentity);
 		const detectedBranch = await gitService.getCurrentBranch(gitPath);
 		defaultBranch = detectedBranch ?? "main";
 
 		// Commit .gitignore as part of initial repo setup so fork branches inherit it
 		ensureGitignoreEntry(gitPath);
-		await gitService.stageAndCommit(gitPath, [".gitignore"], "Add .gitignore");
+		await gitService.stageAndCommit(gitPath, [".gitignore"], "Add .gitignore", gitIdentity);
 	}
 
 	const [project] = await db
@@ -298,7 +302,7 @@ projectRoutes.post("/", async (c) => {
 	try {
 		projectDbManager.openForGitPath(projectId, gitPath);
 		ensureGitignoreEntry(gitPath);
-		await gitService.commitGitignoreIfDirty(gitPath);
+		await gitService.commitGitignoreIfDirty(gitPath, gitIdentity);
 	} catch (err) {
 		logger.warn("Failed to initialize project backup DB", {
 			projectId,
@@ -431,6 +435,8 @@ projectRoutes.delete("/:id", async (c) => {
 
 	const projectChapters = await db.query.chapters.findMany({
 		where: eq(chapters.projectId, id),
+		// Loads every chapter in the project, so skip the per-node UI blobs.
+		columns: { dockLayoutJson: false, detachedPanelsJson: false },
 	});
 
 	// Remove non-root chapters first, then root chapters — full resource cleanup for all

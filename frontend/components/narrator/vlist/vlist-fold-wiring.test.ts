@@ -133,6 +133,27 @@ describe("fold transition: play happens before paint", () => {
 		expect(body).toContain("foldRevisionOf(foldDocumentRevision)");
 	});
 
+	/**
+	 * The revision cannot catch a level switch: like a fold it is a build option, so a
+	 * fold followed by a pinch inside the age bound passes both the revision and the age
+	 * check. Consuming the capture on THAT commit puts this controller and the LOD morph
+	 * on the same node's `transform` in one frame.
+	 */
+	it("validates the capture against the committed level too", () => {
+		expect(playEffect()).toContain("pretextDocument.manifest?.lod");
+	});
+
+	it("stamps the capture with the level its geometry came from", () => {
+		// Read through the geometry channel, so the capture's revision and level can
+		// never be taken from different frames.
+		const capture = SHELL.slice(
+			SHELL.indexOf("const captureFoldBefore = useCallback("),
+			SHELL.indexOf("const togglesCacheRef = useRef<Map<string, RowToggles>>"),
+		);
+		expect(capture.length).toBeGreaterThan(0);
+		expect(capture).toContain("lod: read.lod");
+	});
+
 	it("plans in viewport coordinates, using the LIVE scrollTop", () => {
 		// The anchored rebuild may have absorbed the whole document shift into
 		// scrollTop, in which case nothing moved on screen and nothing should animate.
@@ -350,6 +371,9 @@ describe("fold transition: stays out of the height model", () => {
  * self-evident is the `collapsesByLod` branch of `onToggle`, which both captures a
  * fold AND dispatches `toggleVListLodUserOverride`. Its name suggests a level change;
  * these tests establish that it is not one.
+ *
+ * The other half — a fold whose capture is still alive when a LATER commit does move
+ * the level — is closed by `isFoldCaptureUsable`'s lod check, asserted above.
  */
 describe("fold vs LOD morph: the toggle path cannot move the effective LOD", () => {
 	function toolMessage(id: string, seq: number): NarratorMsg {

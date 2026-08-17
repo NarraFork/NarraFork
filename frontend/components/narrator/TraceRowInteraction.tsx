@@ -1,8 +1,8 @@
 /**
  * TraceRowInteraction.tsx — Interaction surface for ONE folded trace row.
  *
- * At low LOD a tool-run collapses into a trace of single-line rows (L3
- * ToolRunSummary, L1/L2 ActivityTrace). Those rows had no interaction surface,
+ * At low LOD a tool-run collapses into a trace of single-line rows (the L1/L2
+ * ActivityTrace). Those rows had no interaction surface,
  * so this wrapper gives each one the same affordances an expanded card has:
  *   - desktop right-click context menu
  *   - touch left-swipe reveal menu (+ swipe range-select, right-swipe deselect)

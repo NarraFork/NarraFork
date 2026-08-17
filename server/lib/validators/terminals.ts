@@ -13,14 +13,6 @@ export const createTerminalSchema = z
 		message: "Only one of chapterId or narratorId may be provided",
 	});
 
-export const updateTerminalGraphStateSchema = z.object({
-	graphOpened: z.boolean().optional(),
-	graphX: z.number().finite().optional(),
-	graphY: z.number().finite().optional(),
-	graphWidth: z.number().finite().optional(),
-	graphHeight: z.number().finite().optional(),
-});
-
 // === Terminal Tabs: removed ===
 //
 // `createTerminalTabSchema` / `updateTerminalTabSchema` / `reorderTerminalTabsSchema` used

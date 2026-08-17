@@ -28,11 +28,19 @@ export interface PluginDiagnostic {
 	path?: string;
 }
 
-/** Host surfaces a plugin view may be mounted on. */
+/**
+ * Host surfaces a plugin view may be mounted on.
+ *
+ * `graph` is a chapter node's embedded dock on the story-network canvas. It forms
+ * a "focus family" with `focus` (both host exactly one narrator), so a view
+ * declaring only `focus` is still admitted there — see `isSurfaceAllowedForView`
+ * in `routes/plugin-ui.ts`.
+ */
 export type PluginViewSurface =
 	| "workspace"
 	| "director"
 	| "focus"
+	| "graph"
 	| "settings"
 	| "provider-settings";
 

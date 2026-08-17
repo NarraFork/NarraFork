@@ -10,7 +10,6 @@ import {
 	Select,
 	Stack,
 	Text,
-	TextInput,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { ExecutorPlatform } from "@shared/remote-executor";
@@ -39,7 +38,6 @@ export function ExecutorInstallModal({
 	const { t } = useTranslation("settings");
 	const [platform, setPlatform] = useState<ExecutorPlatform | null>(null);
 	const [mode, setMode] = useState<"system" | "user">("system");
-	const [allowRoot, setAllowRoot] = useState("");
 	const [disableShell, setDisableShell] = useState(false);
 	const [result, setResult] = useState<InstallScriptResult | null>(null);
 
@@ -62,7 +60,6 @@ export function ExecutorInstallModal({
 		setResult(null);
 		setPlatform(null);
 		setMode("system");
-		setAllowRoot(device.defaultCwd ?? "");
 		setDisableShell(false);
 	}, [device]);
 
@@ -81,7 +78,6 @@ export function ExecutorInstallModal({
 			return api.createInstallScript(device.id, {
 				platform,
 				mode,
-				allowRoot: allowRoot.trim(),
 				disableShell,
 			});
 		},
@@ -143,18 +139,9 @@ export function ExecutorInstallModal({
 						allowDeselect={false}
 					/>
 
-					<TextInput
-						label={t("executorInstallAllowRoot")}
-						description={t("executorInstallAllowRootHelp")}
-						placeholder={
-							selectedInfo?.os === "windows" ? "C:\\work\\projects" : "/home/you/projects"
-						}
-						value={allowRoot}
-						onChange={(event) => {
-							setAllowRoot(event.currentTarget.value);
-							setResult(null);
-						}}
-					/>
+					<Alert color="blue" variant="light">
+						{t("executorInstallPathGuardLater")}
+					</Alert>
 
 					<Checkbox
 						label={t("executorInstallDisableShell")}
@@ -169,7 +156,7 @@ export function ExecutorInstallModal({
 					<Group justify="flex-end">
 						<Button
 							loading={generateMut.isPending}
-							disabled={!platform || !allowRoot.trim()}
+							disabled={!platform}
 							onClick={() => generateMut.mutate()}
 						>
 							{t("executorInstallGenerate")}

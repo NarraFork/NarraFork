@@ -867,11 +867,9 @@ type GeminiThinkingTiers = "minimal-only" | "all" | "low-medium-high" | "low-hig
 function getThinkingTiers(model: string): GeminiThinkingTiers | undefined {
 	const lower = model.toLowerCase();
 	if (!lower.includes("gemini-")) return undefined;
-	if (lower.includes("gemini-2.0-flash")) return "minimal-only";
 	if (lower.includes("gemini-3.1-flash-lite-image")) return "minimal-high";
 	if (lower.includes("gemini-3.1-pro")) return "low-medium-high";
 	if (/(?:^|[-_.])gemini-3(?:\.0)?-pro(?:[-_.]|$)/.test(lower)) return "low-high";
-	if (lower.includes("gemini-2.5")) return "low-medium-high";
 	if (/gemini-3(?:\.[15])?(?:[-_.]|$)/.test(lower)) return "all";
 	return undefined;
 }

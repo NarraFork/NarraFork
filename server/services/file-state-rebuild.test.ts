@@ -1325,7 +1325,9 @@ describe("tool execution target persistence", () => {
 			cwd,
 			signal: new AbortController().signal,
 			defaultDeviceId: deviceId,
-			availableDevices: [{ id: deviceId, name: deviceId, slug: deviceId, online: true }],
+			availableDevices: [
+				{ id: deviceId, name: deviceId, slug: deviceId, online: true, scope: "global" as const },
+			],
 			permissionHandler: async () => ({ behavior: "allow" }),
 			onExecutionTargetResolved: (resolvedToolUseId, target) =>
 				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
@@ -1413,7 +1415,9 @@ describe("tool execution target persistence", () => {
 			cwd,
 			signal: new AbortController().signal,
 			defaultDeviceId: deviceId,
-			availableDevices: [{ id: deviceId, name: deviceId, slug: deviceId, online: true }],
+			availableDevices: [
+				{ id: deviceId, name: deviceId, slug: deviceId, online: true, scope: "global" as const },
+			],
 			permissionHandler: async () => ({ behavior: "allow" }),
 			onExecutionTargetResolved: (resolvedToolUseId, target) =>
 				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),

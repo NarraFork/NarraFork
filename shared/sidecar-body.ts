@@ -80,13 +80,41 @@ export interface SideCarDoneTask {
 	preview: string;
 	/** The producer clipped the preview. */
 	truncated?: boolean;
+	/**
+	 * The message INSIDE the agent's own session that produced this result — the
+	 * navigation target when the reader opens that session from this row.
+	 *
+	 * Agent flavour only, and only when one could be resolved: a `bash` task has no
+	 * session to open, and an agent that produced no assistant text has no message
+	 * to aim at (see `getSubagentResultMessageId`). Absent means "open the session
+	 * at its tail", never "jump somewhere arbitrary".
+	 *
+	 * NOT model-facing: the projections ignore it (a message id is meaningless to
+	 * the model, which addresses agents by alias).
+	 */
+	resultMessageId?: string | null;
 }
 
 /** One message delivered from another narrator (subagent / team / buffered user). */
 export interface SideCarInboundMessage {
 	fromId?: string;
 	fromTitle?: string | null;
+	/** Readable alias of the sender, preferred over the id when untitled. */
+	fromLabel?: string | null;
 	fromType?: string | null;
+	/**
+	 * Where this message sits in the SENDER's own session — the navigation target
+	 * when the reader opens that session from this row.
+	 *
+	 * Recorded at send time as the sender's latest message, because a `Send` is not
+	 * itself a message in the sender's history: the closest thing to "where the
+	 * sender was when it said this" is what it had just written. Absent when the
+	 * sender had written nothing yet, or for senders that are not narrators —
+	 * absence means "open at the tail", never "jump somewhere arbitrary".
+	 *
+	 * NOT model-facing: the projections ignore it.
+	 */
+	fromMessageId?: string | null;
 	/** Team channel only: the message went to everyone. */
 	isBroadcast?: boolean;
 	text: string;
@@ -259,7 +287,7 @@ export type SideCarLabels = Readonly<Record<string, string>>;
 export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = {
 	// Per-source headline for the fixed reminders.
 	noticeSilentProgress: "You have made {count} tool calls without a visible reply",
-	noticeRelaxedPlan: "Still in plan mode — keep planning, do not implement yet",
+	noticeRelaxedPlan: "Still planning — write the plan to {planFile}, do not implement yet",
 	noticePipelineExit: "Pipeline is still active — confirm whether it is still needed",
 	// Dynamic Spec digests.
 	tasksCurrent: "Dynamic Spec — {n} open task(s)",
@@ -393,7 +421,12 @@ function noticeHeadline(
 		case "silent_progress":
 			return labelWith(labels, "noticeSilentProgress", { count: params?.count ?? 0 });
 		case "relaxed_plan":
-			return label(labels, "noticeRelaxedPlan");
+			// A row written before the reminder named the plan file has no `planFile`
+			// param, so the placeholder would render literally. Fall back to the
+			// directory, which is where every plan file lives anyway.
+			return labelWith(labels, "noticeRelaxedPlan", {
+				planFile: params?.planFile ?? ".narrafork/plans/",
+			});
 		case "pipeline_exit_confirmation":
 			return label(labels, "noticePipelineExit");
 		default:
@@ -650,10 +683,11 @@ export function renderSideCarBodyToText(
 								status: item.status,
 								preview: item.preview || tpl(templates, "emptyResult"),
 							})
-						: // Agent flavour additionally tells the model how to follow up.
+						: // Agent flavour additionally tells the model how to follow up, so its
+							// id slot is an Await/Send selector — the alias, like bash above.
 							tpl(templates, "bgAgentEntry", {
 								title: item.title,
-								id: item.id,
+								id: item.alias ?? item.id,
 								status: item.status,
 								preview: item.preview || tpl(templates, "emptyResult"),
 							}),
@@ -665,14 +699,16 @@ export function renderSideCarBodyToText(
 				.map((message) => {
 					if (source === "buffered_user") return message.text;
 					const isTeam = source === "team_message";
-					// The two channels differ in how they name an untitled sender, and both
-					// forms are load-bearing for byte parity with their predecessors: the team
-					// template interpolated `fromTitle ?? fromId` (the FULL id), while the
-					// parent-report template used an 8-char prefix (`senderLabel` in
-					// parent-inbound-queue).
+					// An untitled sender is named by its readable alias when the producer
+					// supplied one. The id fallbacks behind it are what the two channels
+					// historically used (team: the FULL id; parent report: an 8-char prefix)
+					// and are kept for rows persisted before `fromLabel` existed.
 					const name = isTeam
-						? (message.fromTitle ?? message.fromId ?? "")
-						: message.fromTitle?.trim() || message.fromId?.slice(0, 8) || "";
+						? (message.fromTitle ?? message.fromLabel ?? message.fromId ?? "")
+						: message.fromTitle?.trim() ||
+							message.fromLabel?.trim() ||
+							message.fromId?.slice(0, 8) ||
+							"";
 					return tpl(templates, isTeam ? "teamMessageEntry" : "subagentMessageEntry", {
 						name,
 						type: message.fromType ?? "",
@@ -720,10 +756,24 @@ function noticeModelKey(source: string): string {
 /**
  * The Dynamic Spec digest, in its four variants.
  *
- * Mirrors `spec-reminder.ts`: a heading, the task lines (`- role: text [protected]`),
- * then the fixed instruction notes. The notes differ per variant, and the `current`
- * variant additionally appends the blocked-task action instruction — all of which
- * arrive as templates so the wording stays in the server's i18n table.
+ * A heading, the task lines (`- role: text [protected]`), then ONE situation-specific
+ * instruction line. The wording arrives as templates so it stays in the server's i18n
+ * table.
+ *
+ * ## Why this is deliberately short
+ *
+ * This digest is injected MID-TURN, on a tool-call cadence (every 15 by default), so
+ * its cost is paid over and over inside a single piece of work. The rules that used to
+ * ride along with it — how `tasks.json` may be shaped, what makes a task finite, when
+ * `protected` is allowed, what to do about a blocked entry — are all already in the
+ * system prompt (`getDynamicSpecSystemReminder`, which embeds
+ * `blockedTaskActionInstructions` verbatim). Repeating them here bought nothing: the
+ * model had read them at position zero and would read them again on the next request.
+ *
+ * So each variant now carries only what the SYSTEM PROMPT CANNOT say — the live task
+ * state and the one action this particular situation calls for. The turn-end
+ * continuation prompts (`maybeStartSpecContinuation`) are a separate, rarer surface and
+ * stay as verbose as they need to be.
  */
 function renderTasksToText(
 	body: Extract<SideCarBody, { kind: "tasks" }>,
@@ -737,8 +787,6 @@ function renderTasksToText(
 				lines.push(`- ${task.role}: ${task.text}${task.protected ? " [protected]" : ""}`);
 			}
 			lines.push(tpl(templates, "tasksCurrentUpdateNote"));
-			lines.push(tpl(templates, "tasksSemanticsNote"));
-			lines.push(tpl(templates, "tasksBlockedActionNote"));
 			break;
 		}
 		case "emptyNever":
@@ -746,9 +794,6 @@ function renderTasksToText(
 				tpl(templates, "tasksEmptyHeading"),
 				tpl(templates, "tasksEmptyNeverCreate"),
 				tpl(templates, "tasksEmptyNeverSkip"),
-				tpl(templates, "tasksFieldsNote"),
-				tpl(templates, "tasksSemanticsNote"),
-				tpl(templates, "tasksProtectedOnlyOnUserDemand"),
 			);
 			break;
 		case "emptyDone":
@@ -756,9 +801,6 @@ function renderTasksToText(
 				tpl(templates, "tasksEmptyHeading"),
 				tpl(templates, "tasksEmptyDoneReorganize"),
 				tpl(templates, "tasksEmptyDoneContinue"),
-				tpl(templates, "tasksFieldsNote"),
-				tpl(templates, "tasksSemanticsNote"),
-				tpl(templates, "tasksProtectedOnlyOnUserDemand"),
 			);
 			break;
 		case "tooMany":
@@ -768,10 +810,6 @@ function renderTasksToText(
 					threshold: body.threshold ?? 0,
 				}),
 				tpl(templates, "tasksTooManyReorganize"),
-				tpl(templates, "tasksTooManyProtected"),
-				tpl(templates, "tasksFieldsNote"),
-				tpl(templates, "tasksSemanticsNote"),
-				tpl(templates, "tasksProtectedOnlyOnUserDemand"),
 			);
 			break;
 	}

@@ -35,7 +35,15 @@ describe("SwitchDevice", () => {
 
 	test("hides and rejects local execution when the runtime forbids it", async () => {
 		const schema = switchDeviceTool.getRawJsonSchema?.({
-			availableDevices: [{ id: "device-1", slug: "device-1", name: "Device One", online: true }],
+			availableDevices: [
+				{
+					id: "device-1",
+					slug: "device-1",
+					name: "Device One",
+					online: true,
+					scope: "global" as const,
+				},
+			],
 			allowLocalExecution: false,
 		} as never) as { properties: { device: { enum: string[] } } };
 		expect(schema.properties.device.enum).toEqual(["device-1"]);
@@ -45,7 +53,15 @@ describe("SwitchDevice", () => {
 			{ device: "local" },
 			makeContext({
 				allowLocalExecution: false,
-				availableDevices: [{ id: "device-1", slug: "device-1", name: "Device One", online: true }],
+				availableDevices: [
+					{
+						id: "device-1",
+						slug: "device-1",
+						name: "Device One",
+						online: true,
+						scope: "global" as const,
+					},
+				],
 				setDefaultDevice: async () => {
 					applied = true;
 					return true;
@@ -61,7 +77,15 @@ describe("SwitchDevice", () => {
 		const result = await switchDeviceTool.execute(
 			{ device: "device-1" },
 			makeContext({
-				availableDevices: [{ id: "device-1", slug: "device-1", name: "Device One", online: false }],
+				availableDevices: [
+					{
+						id: "device-1",
+						slug: "device-1",
+						name: "Device One",
+						online: false,
+						scope: "global" as const,
+					},
+				],
 			}),
 		);
 

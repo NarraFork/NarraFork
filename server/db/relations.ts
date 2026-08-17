@@ -9,6 +9,7 @@ import {
 	chapterCommits,
 	chapterEdges,
 	chapters,
+	chatAttachments,
 	chatMessages,
 	chatRoomMembers,
 	chatRooms,
@@ -379,6 +380,7 @@ export const chatRoomsRelations = relations(chatRooms, ({ one, many }) => ({
 	}),
 	members: many(chatRoomMembers),
 	messages: many(chatMessages),
+	attachments: many(chatAttachments),
 }));
 
 export const chatRoomMembersRelations = relations(chatRoomMembers, ({ one }) => ({
@@ -392,13 +394,34 @@ export const chatRoomMembersRelations = relations(chatRoomMembers, ({ one }) => 
 	}),
 }));
 
-export const chatMessagesRelations = relations(chatMessages, ({ one }) => ({
+export const chatMessagesRelations = relations(chatMessages, ({ one, many }) => ({
 	room: one(chatRooms, {
 		fields: [chatMessages.roomId],
 		references: [chatRooms.id],
 	}),
 	sender: one(users, {
 		fields: [chatMessages.senderUserId],
+		references: [users.id],
+	}),
+	// The reply snapshot columns are deliberately NOT modelled as a relation: the
+	// point of the snapshot is that the quote renders without reading the target
+	// row, and a declared relation invites exactly the join it exists to avoid.
+	attachments: many(chatAttachments),
+}));
+
+export const chatAttachmentsRelations = relations(chatAttachments, ({ one }) => ({
+	room: one(chatRooms, {
+		fields: [chatAttachments.roomId],
+		references: [chatRooms.id],
+	}),
+	// `messageId` has no FK (the row predates its message), so this is a plain
+	// field mapping rather than a constrained reference.
+	message: one(chatMessages, {
+		fields: [chatAttachments.messageId],
+		references: [chatMessages.id],
+	}),
+	uploader: one(users, {
+		fields: [chatAttachments.uploaderUserId],
 		references: [users.id],
 	}),
 }));

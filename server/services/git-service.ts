@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { worktreeLock } from "../lib/async-mutex";
 import { GitAuthError, GitError } from "../lib/errors";
+import type { GitIdentityEnv } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL } from "../lib/platform";
@@ -34,7 +35,20 @@ interface ExecOptions {
 	 */
 	timeout?: number;
 	maxOutputBytes?: number;
+	/**
+	 * `GIT_AUTHOR_*`/`GIT_COMMITTER_*` overrides that attribute a commit to the
+	 * acting person instead of the host machine's global git config.
+	 *
+	 * Only meaningful for commands that write commit objects. Null/undefined is the
+	 * documented "inherit the host identity" case and must remain byte-for-byte
+	 * identical to the historical behaviour, so no env is passed at all in that case
+	 * — see the note in {@link exec}.
+	 */
+	identity?: GitIdentityEnv | null;
 }
+
+/** Commit-writing methods take this to attribute the commit to a real person. */
+export type GitCommitIdentity = GitIdentityEnv | null | undefined;
 
 /**
  * Ceiling for read-only git commands.
@@ -259,6 +273,7 @@ function normalizeExecOptions(options: boolean | ExecOptions = {}): ExecOptions 
 		optionalLocks: options.optionalLocks ?? true,
 		timeout: options.timeout,
 		maxOutputBytes: options.maxOutputBytes,
+		identity: options.identity,
 	};
 }
 
@@ -282,10 +297,22 @@ async function exec(
 	cwd: string,
 	options: boolean | ExecOptions = {},
 ): Promise<ExecResult> {
-	const { silent, optionalLocks, timeout, maxOutputBytes } = normalizeExecOptions(options);
+	const { silent, optionalLocks, timeout, maxOutputBytes, identity } =
+		normalizeExecOptions(options);
 	const cmd = optionalLocks ? ["git", ...args] : ["git", "--no-optional-locks", ...args];
 	try {
-		const result = await safeSpawn({ cmd, cwd, timeout, maxOutputBytes });
+		const result = await safeSpawn({
+			cmd,
+			cwd,
+			timeout,
+			maxOutputBytes,
+			// `Bun.spawn`'s `env` REPLACES the environment rather than merging into it,
+			// so an identity has to be layered over `process.env` explicitly — passing
+			// the four `GIT_*` variables alone would strip PATH/HOME and break git.
+			// Omitted entirely when there is no identity: that keeps the no-identity
+			// path byte-for-byte identical to the behaviour before this existed.
+			env: identity ? { ...process.env, ...identity } : undefined,
+		});
 		const truncated = result.stdoutTruncated === true || result.stderrTruncated === true;
 		const trimmedStdout = stripTrailingLineBreaks(
 			result.stdoutTruncated ? stripTruncationMarker(result.stdout) : result.stdout,
@@ -846,13 +873,14 @@ export const gitService = {
 		sourceBranch: string,
 		strategy: "merge" | "squash",
 		message: string,
-		options?: { fastForward?: boolean },
+		options?: { fastForward?: boolean; identity?: GitCommitIdentity },
 	): Promise<{
 		success: boolean;
 		commitSha?: string;
 		conflictFiles?: string[];
 		isFastForward?: boolean;
 	}> {
+		const identity = options?.identity ?? null;
 		let args: string[];
 		if (strategy === "squash") {
 			args = ["merge", "--squash", sourceBranch];
@@ -862,12 +890,12 @@ export const gitService = {
 			args = ["merge", "--no-ff", "-m", message, sourceBranch];
 		}
 
-		const result = await exec(args, worktreePath);
+		const result = await exec(args, worktreePath, { identity });
 		if (result.exitCode !== 0) {
 			if (options?.fastForward) {
 				// ff-only failed — fall back to --no-ff
 				const fallbackArgs = ["merge", "--no-ff", "-m", message, sourceBranch];
-				const fallbackResult = await exec(fallbackArgs, worktreePath);
+				const fallbackResult = await exec(fallbackArgs, worktreePath, { identity });
 				if (fallbackResult.exitCode !== 0) {
 					const conflictFiles = await detectConflictFilesAfterFailedGitCommand(
 						worktreePath,
@@ -877,7 +905,7 @@ export const gitService = {
 					throw new GitError(gitFailureMessage("Merge failed", fallbackResult));
 				}
 				if (strategy === "squash") {
-					const commitResult = await exec(["commit", "-m", message], worktreePath);
+					const commitResult = await exec(["commit", "-m", message], worktreePath, { identity });
 					if (commitResult.exitCode !== 0)
 						throw new GitError(gitFailureMessage("Squash commit failed", commitResult));
 				}
@@ -890,7 +918,7 @@ export const gitService = {
 		}
 
 		if (strategy === "squash") {
-			const commitResult = await exec(["commit", "-m", message], worktreePath);
+			const commitResult = await exec(["commit", "-m", message], worktreePath, { identity });
 			if (commitResult.exitCode !== 0)
 				throw new GitError(gitFailureMessage("Squash commit failed", commitResult));
 		}
@@ -899,12 +927,19 @@ export const gitService = {
 		return { success: true, commitSha: sha, isFastForward: !!options?.fastForward };
 	},
 
-	/** Cherry-pick commits from source branch onto current branch */
+	/**
+	 * Cherry-pick commits from source branch onto current branch.
+	 *
+	 * `identity` sets the COMMITTER only in practice: git preserves each picked
+	 * commit's original author, which is the correct semantics — the acting user
+	 * transplanted the change, they did not write it.
+	 */
 	async cherryPick(
 		worktreePath: string,
 		repoPath: string,
 		sourceBranch: string,
 		baseSha: string,
+		identity?: GitCommitIdentity,
 	): Promise<{ success: boolean; commitSha?: string; conflictFiles?: string[] }> {
 		const logResult = await execRead(
 			["rev-list", "--reverse", `${baseSha}..${sourceBranch}`],
@@ -916,7 +951,9 @@ export const gitService = {
 		if (commits.length === 0) return { success: true };
 
 		for (const commit of commits) {
-			const result = await exec(["cherry-pick", commit], worktreePath);
+			const result = await exec(["cherry-pick", commit], worktreePath, {
+				identity: identity ?? null,
+			});
 			if (result.exitCode !== 0) {
 				const conflictFiles = await detectConflictFilesAfterFailedGitCommand(worktreePath, result);
 				if (conflictFiles) {
@@ -936,16 +973,22 @@ export const gitService = {
 	},
 
 	/** Rebase current branch onto another branch. On conflict the worktree is left
-	 *  in the middle of a rebase so the caller can decide to abort or resolve. */
+	 *  in the middle of a rebase so the caller can decide to abort or resolve.
+	 *
+	 *  `identity` becomes the committer of every rewritten commit; git preserves the
+	 *  original authors, same as cherry-pick. */
 	async rebase(
 		worktreePath: string,
 		ontoBranch: string,
+		identity?: GitCommitIdentity,
 	): Promise<{
 		success: boolean;
 		commitSha?: string;
 		conflictFiles?: Array<{ file: string; conflictLines: number }>;
 	}> {
-		const result = await exec(["rebase", ontoBranch], worktreePath);
+		const result = await exec(["rebase", ontoBranch], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (result.exitCode !== 0) {
 			const conflictFiles = await detectConflictFilesAfterFailedGitCommand(worktreePath, result);
 			if (conflictFiles) {
@@ -964,14 +1007,19 @@ export const gitService = {
 		await exec(["rebase", "--abort"], worktreePath);
 	},
 
-	async rebaseContinue(worktreePath: string): Promise<{
+	async rebaseContinue(
+		worktreePath: string,
+		identity?: GitCommitIdentity,
+	): Promise<{
 		success: boolean;
 		commitSha?: string;
 		conflictFiles?: Array<{ file: string; conflictLines: number }>;
 	}> {
 		// Stage all resolved files then continue
 		await exec(["add", "-A"], worktreePath);
-		const result = await exec(["-c", "core.editor=true", "rebase", "--continue"], worktreePath);
+		const result = await exec(["-c", "core.editor=true", "rebase", "--continue"], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (result.exitCode !== 0) {
 			const conflictFiles = await detectConflictFilesAfterFailedGitCommand(worktreePath, result);
 			if (conflictFiles) {
@@ -1051,12 +1099,22 @@ export const gitService = {
 	 * autoCommit failure as "fall back to a snapshot", and it gives them a reason to
 	 * show the user.
 	 */
-	async autoCommit(worktreePath: string, message: string): Promise<string | null> {
-		return withWorktreeLock(worktreePath, () => this.autoCommitUnlocked(worktreePath, message));
+	async autoCommit(
+		worktreePath: string,
+		message: string,
+		identity?: GitCommitIdentity,
+	): Promise<string | null> {
+		return withWorktreeLock(worktreePath, () =>
+			this.autoCommitUnlocked(worktreePath, message, identity),
+		);
 	},
 
 	/** {@link autoCommit} for callers already holding the worktree lock. */
-	async autoCommitUnlocked(worktreePath: string, message: string): Promise<string | null> {
+	async autoCommitUnlocked(
+		worktreePath: string,
+		message: string,
+		identity?: GitCommitIdentity,
+	): Promise<string | null> {
 		const status = await this.getStatus(worktreePath);
 		if (!status) return null;
 
@@ -1072,7 +1130,9 @@ export const gitService = {
 		const addResult = await exec(["add", "-A"], worktreePath);
 		if (addResult.exitCode !== 0) throw new GitError(`git add failed: ${addResult.stderr}`);
 
-		const commitResult = await exec(["commit", "-m", message], worktreePath);
+		const commitResult = await exec(["commit", "-m", message], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (commitResult.exitCode !== 0)
 			throw new GitError(`git commit failed: ${commitResult.stderr}`);
 
@@ -1347,32 +1407,46 @@ export const gitService = {
 		}
 	},
 
-	async initRepo(repoPath: string): Promise<void> {
+	async initRepo(repoPath: string, identity?: GitCommitIdentity): Promise<void> {
 		mkdirSync(repoPath, { recursive: true });
 		const result = await exec(["init"], repoPath);
 		if (result.exitCode !== 0) throw new GitError(`Failed to init repo: ${result.stderr}`);
 		// Create initial empty commit so branches can be created
-		const commitResult = await exec(["commit", "--allow-empty", "-m", "Initial commit"], repoPath);
+		const commitResult = await exec(["commit", "--allow-empty", "-m", "Initial commit"], repoPath, {
+			identity: identity ?? null,
+		});
 		if (commitResult.exitCode !== 0) {
 			throw new GitError(`Failed to create initial commit: ${commitResult.stderr}`);
 		}
 	},
 
-	async stageAndCommit(repoPath: string, files: string[], message: string): Promise<void> {
+	async stageAndCommit(
+		repoPath: string,
+		files: string[],
+		message: string,
+		identity?: GitCommitIdentity,
+	): Promise<void> {
 		const addResult = await exec(["add", ...files], repoPath);
 		if (addResult.exitCode !== 0) {
 			throw new GitError(`Failed to stage files: ${addResult.stderr}`);
 		}
-		const commitResult = await exec(["commit", "-m", message], repoPath);
+		const commitResult = await exec(["commit", "-m", message], repoPath, {
+			identity: identity ?? null,
+		});
 		if (commitResult.exitCode !== 0) {
 			throw new GitError(`Failed to commit: ${commitResult.stderr}`);
 		}
 	},
 
-	async commitGitignoreIfDirty(repoPath: string): Promise<void> {
+	async commitGitignoreIfDirty(repoPath: string, identity?: GitCommitIdentity): Promise<void> {
 		const statusResult = await execRead(["status", "--porcelain", ".gitignore"], repoPath);
 		if (statusResult.stdout.trim()) {
-			await this.stageAndCommit(repoPath, [".gitignore"], "Update .gitignore for NarraFork");
+			await this.stageAndCommit(
+				repoPath,
+				[".gitignore"],
+				"Update .gitignore for NarraFork",
+				identity,
+			);
 		}
 	},
 
@@ -1547,13 +1621,25 @@ export const gitService = {
 		if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
 	},
 
-	async commit(worktreePath: string, message: string): Promise<string> {
-		return withWorktreeLock(worktreePath, () => this.commitUnlocked(worktreePath, message));
+	async commit(
+		worktreePath: string,
+		message: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
+		return withWorktreeLock(worktreePath, () =>
+			this.commitUnlocked(worktreePath, message, identity),
+		);
 	},
 
 	/** {@link commit} for callers already holding the worktree lock. */
-	async commitUnlocked(worktreePath: string, message: string): Promise<string> {
-		const result = await exec(["commit", "-m", message], worktreePath);
+	async commitUnlocked(
+		worktreePath: string,
+		message: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
+		const result = await exec(["commit", "-m", message], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (result.exitCode !== 0) throw new GitError(`git commit failed: ${result.stderr}`);
 		return this.getHeadCommit(worktreePath);
 	},
@@ -1603,15 +1689,22 @@ export const gitService = {
 		if (r2.exitCode !== 0) throw new GitError(`git clean failed: ${r2.stderr}`);
 	},
 
-	async stash(worktreePath: string, message?: string): Promise<void> {
-		return withWorktreeLock(worktreePath, () => this.stashUnlocked(worktreePath, message));
+	/** Stash the working tree. `identity` authors the underlying stash commit objects. */
+	async stash(worktreePath: string, message?: string, identity?: GitCommitIdentity): Promise<void> {
+		return withWorktreeLock(worktreePath, () =>
+			this.stashUnlocked(worktreePath, message, identity),
+		);
 	},
 
 	/** {@link stash} for callers already holding the worktree lock. */
-	async stashUnlocked(worktreePath: string, message?: string): Promise<void> {
+	async stashUnlocked(
+		worktreePath: string,
+		message?: string,
+		identity?: GitCommitIdentity,
+	): Promise<void> {
 		const args = ["stash", "push", "--include-untracked"];
 		if (message) args.push("-m", message);
-		const result = await exec(args, worktreePath);
+		const result = await exec(args, worktreePath, { identity: identity ?? null });
 		if (result.exitCode !== 0) throw new GitError(`git stash failed: ${result.stderr}`);
 	},
 
@@ -2038,15 +2131,25 @@ export const gitService = {
 	},
 
 	/** Revert a merge commit (using -m 1 to specify the mainline parent) */
-	async revertMergeCommit(worktreePath: string, commitSha: string): Promise<string> {
+	async revertMergeCommit(
+		worktreePath: string,
+		commitSha: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
 		return withWorktreeLock(worktreePath, () =>
-			this.revertMergeCommitUnlocked(worktreePath, commitSha),
+			this.revertMergeCommitUnlocked(worktreePath, commitSha, identity),
 		);
 	},
 
 	/** {@link revertMergeCommit} for callers already holding the worktree lock. */
-	async revertMergeCommitUnlocked(worktreePath: string, commitSha: string): Promise<string> {
-		const result = await exec(["revert", "-m", "1", "--no-edit", commitSha], worktreePath);
+	async revertMergeCommitUnlocked(
+		worktreePath: string,
+		commitSha: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
+		const result = await exec(["revert", "-m", "1", "--no-edit", commitSha], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (result.exitCode !== 0) {
 			// Abort the failed revert to leave worktree clean
 			await exec(["revert", "--abort"], worktreePath);
@@ -2060,13 +2163,25 @@ export const gitService = {
 	},
 
 	/** Revert a regular (non-merge) commit */
-	async revertCommit(worktreePath: string, commitSha: string): Promise<string> {
-		return withWorktreeLock(worktreePath, () => this.revertCommitUnlocked(worktreePath, commitSha));
+	async revertCommit(
+		worktreePath: string,
+		commitSha: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
+		return withWorktreeLock(worktreePath, () =>
+			this.revertCommitUnlocked(worktreePath, commitSha, identity),
+		);
 	},
 
 	/** {@link revertCommit} for callers already holding the worktree lock. */
-	async revertCommitUnlocked(worktreePath: string, commitSha: string): Promise<string> {
-		const result = await exec(["revert", "--no-edit", commitSha], worktreePath);
+	async revertCommitUnlocked(
+		worktreePath: string,
+		commitSha: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
+		const result = await exec(["revert", "--no-edit", commitSha], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (result.exitCode !== 0) {
 			await exec(["revert", "--abort"], worktreePath);
 			throw new GitError(

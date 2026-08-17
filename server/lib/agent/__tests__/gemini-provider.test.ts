@@ -694,7 +694,7 @@ describe("Gemini Interactions API provider", () => {
 
 		const result = await makeProvider().generateWithMeta(
 			"hello",
-			"gemini-test:gemini-2.5-flash",
+			"gemini-test:gemini-3-flash-preview",
 			undefined,
 			{
 				reasoningEffort: "none",
@@ -709,8 +709,11 @@ describe("Gemini Interactions API provider", () => {
 		expect(requestHeaders.get("Accept")).toBe("text/event-stream");
 		expect(requestBody.stream).toBe(true);
 		expect(requestBody.store).toBe(false);
+		// `none` lands on `minimal` for a Gemini 3 model: that family exposes the
+		// full ladder including `minimal`, so the lowest real tier is used. (The
+		// retired 2.5 family had no `minimal`, so the same request clamped to `low`.)
 		expect(requestBody.generation_config).toEqual({
-			thinking_level: "low",
+			thinking_level: "minimal",
 			thinking_summaries: "auto",
 		});
 		expect(deltas).toEqual(["Hello", " world"]);
@@ -745,9 +748,14 @@ describe("Gemini Interactions API provider", () => {
 		});
 		let thrown: Error | undefined;
 		try {
-			await makeProvider().generateWithMeta("hello", "gemini-test:gemini-2.5-flash", undefined, {
-				reasoningEffort: "none",
-			});
+			await makeProvider().generateWithMeta(
+				"hello",
+				"gemini-test:gemini-3-flash-preview",
+				undefined,
+				{
+					reasoningEffort: "none",
+				},
+			);
 		} catch (error) {
 			thrown = error as Error;
 		}
@@ -769,15 +777,6 @@ describe("Gemini Interactions API provider", () => {
 		});
 
 		const provider = makeProvider();
-		await provider.generateWithMeta("hello", "gemini-test:gemini-2.0-flash-001", undefined, {
-			reasoningEffort: "high",
-		});
-		await provider.generateWithMeta("hello", "gemini-test:gemini-2.5-flash", undefined, {
-			reasoningEffort: "medium",
-		});
-		await provider.generateWithMeta("hello", "gemini-test:gemini-2.5-pro", undefined, {
-			reasoningEffort: "high",
-		});
 		await provider.generateWithMeta("hello", "gemini-test:gemini-3.1-pro-preview", undefined, {
 			reasoningEffort: "medium",
 		});
@@ -795,12 +794,13 @@ describe("Gemini Interactions API provider", () => {
 		});
 
 		expect(bodies.map((body) => body.generation_config)).toEqual([
-			{ thinking_level: "minimal", thinking_summaries: "auto" },
+			// 3.1-pro: low/medium/high ladder, so medium passes through.
 			{ thinking_level: "medium", thinking_summaries: "auto" },
+			// 3-pro: low/high only, so medium clamps up to high.
 			{ thinking_level: "high", thinking_summaries: "auto" },
-			{ thinking_level: "medium", thinking_summaries: "auto" },
+			// 3.1-flash-lite-image: minimal/high only, so medium clamps up to high.
 			{ thinking_level: "high", thinking_summaries: "auto" },
-			{ thinking_level: "high", thinking_summaries: "auto" },
+			// gemma is not a thinking model: no generation_config at all.
 			undefined,
 		]);
 	});

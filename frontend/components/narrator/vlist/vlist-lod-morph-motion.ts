@@ -7,17 +7,26 @@
  *
  * ## How an LOD morph reads
  *
- * An LOD switch re-themes an element into a DIFFERENT component (a card collapses
+ * An LOD switch can re-theme an element into a DIFFERENT component (a card collapses
  * into a trace row, a row expands into a card), so there is no single node to FLIP.
  * Instead the NEW node — already committed at its final geometry — starts from the
- * OLD element's screen position and slides + fades home:
+ * OLD element's screen position and slides home:
  *
- *   translateY(deltaY) → translateY(0),   opacity 0 → 1
+ *   translateY(deltaY) → translateY(0)          [every morph]
+ *   opacity 0 → 1                               [only when `plan.fade`]
  *
- * The fade masks the component swap; the slide carries the reader's eye from where
- * the content was to where it went. It touches ONLY the committed new node — no
- * detached ghost of the old (unmounted) element is re-homed, so there is nothing to
- * clean up and nothing to measure.
+ * The slide carries the reader's eye from where the content was to where it went. It
+ * touches ONLY the committed new node — no detached ghost of the old (unmounted)
+ * element is re-homed, so there is nothing to clean up and nothing to measure.
+ *
+ * ## The fade is conditional, and that is not a detail
+ *
+ * The cross-fade exists to MASK A COMPONENT SWAP, so it is played only for a morph
+ * whose `kind` changed. Most of what a level switch moves is not swapped at all —
+ * markdown bodies, user bubbles, system cards keep their component and their content
+ * and merely end up somewhere else. Fading those makes unchanged prose blink once per
+ * zoom step, which reads as a glitch rather than as a transition. See
+ * `LodMorphPlan.fade`.
  *
  * ## Multi-activity controller
  *
@@ -45,8 +54,30 @@ export interface LodMorphHandle {
 	cancel: () => void;
 }
 
-/** Keyframes: appear at the OLD position (`deltaY`), slide + fade to the committed spot. */
-function morphKeyframes(deltaY: number): Keyframe[] {
+/**
+ * Keyframes: appear at the OLD position (`deltaY`) and slide to the committed spot,
+ * cross-fading only when the component itself was swapped (see the module note).
+ *
+ * Each property is OMITTED rather than pinned to its resting value when it is not
+ * animating: writing it hands the property to the animation for the duration, and with
+ * `fill: "none"` that is a needless composited layer on a node where it never changes.
+ * So there are three real shapes — slide only, slide + fade, and fade in place
+ * (`deltaY: 0`, which the planner emits for a re-theme whose travel was dropped).
+ */
+function morphKeyframes(deltaY: number, fade: boolean): Keyframe[] {
+	const slides = deltaY !== 0;
+	if (!fade) {
+		return [
+			{ offset: 0, transform: `translateY(${deltaY}px)` },
+			{ offset: 1, transform: "translateY(0px)" },
+		];
+	}
+	if (!slides) {
+		return [
+			{ offset: 0, opacity: 0 },
+			{ offset: 1, opacity: 1 },
+		];
+	}
 	return [
 		{ offset: 0, opacity: 0, transform: `translateY(${deltaY}px)` },
 		{ offset: 1, opacity: 1, transform: "translateY(0px)" },
@@ -64,7 +95,7 @@ export function playLodMorph(
 ): LodMorphHandle | null {
 	if (!node || typeof node.animate !== "function") return null;
 	try {
-		const animation = node.animate(morphKeyframes(plan.deltaY), {
+		const animation = node.animate(morphKeyframes(plan.deltaY, plan.fade), {
 			duration: plan.durationMs,
 			easing: MORPH_EASING,
 			fill: "none",

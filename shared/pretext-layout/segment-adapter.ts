@@ -25,11 +25,13 @@ import {
 	escapeMarkdown,
 	rawSideCarToMarkdown,
 	readSideCarBody,
+	type SideCarBody,
 	sideCarBodyToMarkdown,
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { subagentResultText } from "../subagent-result-text";
 import type { VListElementKind } from "./element-kinds";
+import type { InjectionTarget } from "./injection-target";
 import type { RenderLod } from "./prepared-block";
 import { type ReasoningLiveTail, resolveReasoningLiveTail } from "./reasoning-live-tail";
 import {
@@ -426,7 +428,7 @@ interface AdapterTraceItem {
 	 * height-neutral).
 	 *
 	 * The same tool call is a full `tool-call` card at L3+ and a folded trace row at
-	 * L1/L2, and until now nothing tied those two renderings together. `unitId` is
+	 * L1/L2, and nothing else tied those two renderings together. `unitId` is
 	 * that link: both carry `tool-<toolUseId>` (reasoning uses
 	 * `reason-<stableKeyBase>-<step>`), so a future animated LOD transition can pair
 	 * a card with the row it becomes instead of cross-fading unrelated boxes. Emitted
@@ -480,7 +482,7 @@ export interface ElementSpec {
 	 * LOD-INDEPENDENT identity of the content this element shows.
 	 *
 	 * `key` cannot serve this purpose: a folded batch mints keys like
-	 * `toolrun-summary-tool-<id>` from its first member, so the same tool has a
+	 * `toolrun-count-tool-<id>` from its first member, so the same tool has a
 	 * different key at every level. `unitId` is the same string wherever the content
 	 * appears — a `tool-call` card at L3+ and the trace row it folds into at L1/L2
 	 * both carry `tool-<toolUseId>` — which is what a future animated LOD transition
@@ -493,32 +495,32 @@ export interface AdapterContext {
 	lod: RenderLod;
 	/** Explicit interaction override; undefined preserves the measure's default. */
 	isExpanded?: (key: string) => boolean | undefined;
-	/** L4 / old-L5 explicit click override, separate from normal opened state. */
+	/** L3 / L4 explicit click override, separate from normal opened state. */
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
 	/**
 	 * Row-KEY addressed expansion, resolved as `(traceKey, rowKey) => boolean`.
 	 *
-	 * ⚠️ The channel `activity-trace` and `tool-run-summary` must use — and the ONLY
-	 * two that must, because only they can gain a row ABOVE an existing one while a
-	 * turn streams. The activity fold expands one live reasoning block into one row
-	 * PER STEP, so the moment the model emits another `**title**` every row after it
-	 * shifts down by one. An index recorded at click time then addresses a different
-	 * row: the tool the reader opened silently folds shut, and the row that inherited
-	 * the index opens instead — the same click producing a different card mid-stream,
-	 * plus a height change with no user action behind it (the very thing CONTRACT §0
-	 * forbids).
+	 * ⚠️ The channel `activity-trace` must use — and the ONLY kind that must, because
+	 * only it can gain a row ABOVE an existing one while a turn streams. The activity
+	 * fold expands one live reasoning block into one row PER STEP, so the moment the
+	 * model emits another `**title**` every row after it shifts down by one. An index
+	 * recorded at click time then addresses a different row: the tool the reader
+	 * opened silently folds shut, and the row that inherited the index opens instead
+	 * — the same click producing a different card mid-stream, plus a height change
+	 * with no user action behind it (the very thing CONTRACT §0 forbids).
 	 *
 	 * Row keys are hand-off stable by construction: a tool row is `tool-<toolUseId>`
 	 * live and persisted alike, and a reasoning row keys on its run ordinal within
 	 * the unit (`stableKeyBase`). So a key survives exactly the frames an index does
-	 * not.
+	 * not. Both kinds of row read this channel — a tool row to drill into its card, a
+	 * reasoning-step row to expand its markdown body.
 	 *
 	 * `expandedRows` stays for the append-only lists, whose ordinals are already
 	 * stable: a `reasoning-steps` element (step N stays row N however many steps
-	 * follow) and the subagent-recovery card's
-	 * checkboxes. The shell routes by kind (`traceRowFoldChannel`); an element read
+	 * follow) and the subagent-recovery card's checkboxes. The shell routes by kind
+	 * (`traceRowFoldChannel`); an element read
 	 * here must be written there, or the reader's fold lands in a channel nothing
 	 * reads and the row stops opening.
 	 */
@@ -540,7 +542,7 @@ export interface AdapterContext {
 	 * resolved here like every other interaction state.
 	 */
 	isPromptOpen?: (key: string) => boolean;
-	/** L5 recency window. Undefined preserves the old "all recent" fallback. */
+	/** L4 recency window. Undefined preserves the old "all recent" fallback. */
 	recentMessageIds?: ReadonlySet<string>;
 	/** Viewport height for isPlan tool-call cap (0.85×). */
 	viewportHeight?: number;
@@ -597,8 +599,7 @@ export interface AdapterContext {
 	 * The tool-use id of the MOST RECENT spec://tasks.json operation in the loaded
 	 * window (the same identity the chunked path's task-board spinner keys on).
 	 * That one card keeps its full expanded task board at every LOD — it never
-	 * folds into a summary/count batch and never collapses to a bare header at
-	 * L4 / old-L5.
+	 * folds into a count batch and never collapses to a bare header at L3 / L4.
 	 *
 	 * A resolver (not a snapshot) so the identity the shell tracks can move with
 	 * each rebuild without the adapter caching a stale value; the shell's closure
@@ -694,14 +695,39 @@ const SYSTEM_TEXT_SUBTYPES = new Set([
 const SYSTEM_OTHER_TYPES = new Set(["knowledge_hint", "ask_in_passing", "subagent_recovery"]);
 /**
  * Block types that make a role=user message render as a SYSTEM card rather than a
- * chat bubble (parity with MessageBubble's user branch, which checks these before
- * building a bubble).
+ * chat bubble.
  *
- * `/bash` (bash_command) and the tool load/unload notices are persisted with
- * role=user so the model sees them, but they carry no text block — the bubble
- * branch would paint an empty indigo box with just a header.
+ * `role` is a PROTOCOL field, not an authorship one: several server-authored cards
+ * are persisted as role=user precisely so the provider includes them in history.
+ * MessageBubble matches all of these BEFORE it ever reaches its `isUser` branch,
+ * so the role they were stored under never reaches its rendering decision. The
+ * vlist adapter dispatches on role first, so it needs this explicit allow-list to
+ * reach the same cards.
+ *
+ * Each entry carries no text block of its own, so the bubble branch paints an
+ * empty indigo box with just a header:
+ *   - `bash_command`, `tool_loaded`, `tool_unloaded` — `/bash` + tool load notices.
+ *   - `segment_compact` — `persistSegmentCompactMarker` inserts role=user, and the
+ *     block holds only `{status, messageCount, summary}`. Missing it also stripped
+ *     the row of its summary-modal affordance, since the compact interaction is
+ *     resolved from a `system-simple` payload (see vlist-compact-target).
+ *
+ * Deliberately NOT listed, even though MessageBubble also matches them ahead of
+ * its `isUser` branch:
+ *   - `merge_summary` / `review_feedback` — persisted via persistSystemMessage
+ *     (role=sys), so they never arrive here as role=user. Listing them anyway
+ *     would hijack role=user INJECTION rows that carry one as an extra block,
+ *     whose leading `system_injection` block owns the row.
+ *   - `ask_in_passing` — inserted as role=system.
+ *   - `compact` — MessageBubble matches it INSIDE its role system/sys/disp branch,
+ *     so a role=user `compact` block is not a marker.
  */
-const USER_SYSTEM_CARD_TYPES = new Set(["bash_command", "tool_loaded", "tool_unloaded"]);
+const USER_SYSTEM_CARD_TYPES = new Set([
+	"bash_command",
+	"tool_loaded",
+	"tool_unloaded",
+	"segment_compact",
+]);
 
 /** True when a block type is a recognized system-card block (used to locate the
  * meaningful block within a system message, which may not be blocks[0]). */
@@ -778,8 +804,11 @@ function reasoningData(blocks: AdapterContentBlock[], isStreaming: boolean) {
 	};
 }
 
+/** Longest title a trace row shows before `truncateTitle` clips it. */
+const TITLE_MAX_CHARS = 80;
+
 function truncateTitle(raw: string): string {
-	return raw.length > 80 ? `${raw.slice(0, 77)}…` : raw;
+	return raw.length > TITLE_MAX_CHARS ? `${raw.slice(0, 77)}…` : raw;
 }
 
 function reasoningStepTitle(segment: ReasoningSegment): string {
@@ -788,10 +817,43 @@ function reasoningStepTitle(segment: ReasoningSegment): string {
 	return truncateTitle(firstLine.trim());
 }
 
+/**
+ * A reasoning step's revealable markdown body, or null when there is nothing to
+ * reveal (an empty step, or one that is nothing but its own title).
+ *
+ * Null matters rather than an empty string: `isExpandable` in the measure layer
+ * treats a blank body as non-expandable, so a title-only step keeps the "•" dot
+ * and cannot be clicked into an empty box.
+ */
+function reasoningStepBody(segment: ReasoningSegment): string | null {
+	if (segment.isEmpty) return null;
+	const trimmed = segment.body.trim();
+	if (trimmed.length === 0) return null;
+	// An untitled step's title IS its first body line, so a body that is that ONE
+	// line has nothing more to show — unless the title had to be truncated, in
+	// which case expanding reveals the rest of it.
+	if (!segment.title && !trimmed.includes("\n") && trimmed.length <= TITLE_MAX_CHARS) return null;
+	return segment.body;
+}
+
+/**
+ * `unitId` provenance for the steps of ONE reasoning run at L3+.
+ *
+ * Absent → the steps get no cross-level identity, which is the correct outcome whenever
+ * the L1/L2 side could not agree on one either: a streaming message (its id changes at
+ * the hand-off) or a multi-block run (the two levels parse different text — see
+ * `reasoningStepUnitId`).
+ */
+interface ReasoningStepUnitSource {
+	messageId: string;
+	runStartBlockIndex: number;
+}
+
 function reasoningStepsData(
 	segments: ReasoningSegment[],
 	isStreaming: boolean,
 	ctx: AdapterContext,
+	unitSource?: ReasoningStepUnitSource,
 ) {
 	return {
 		steps: segments.map((segment, index) => ({
@@ -799,6 +861,13 @@ function reasoningStepsData(
 			body: segment.isEmpty ? null : segment.body,
 			shimmer: isStreaming && index === segments.length - 1,
 			key: `seg${index}`,
+			// Same string the folded row of this step carries at L1/L2, so the two
+			// renderings pair across the level switch. Height-neutral passthrough.
+			...(unitSource
+				? {
+						unitId: reasoningStepUnitId(unitSource.messageId, unitSource.runStartBlockIndex, index),
+					}
+				: {}),
 		})),
 		headerLabel: sysLabel(ctx, "reasoning"),
 		headerCount: countLabel(ctx, "reasoningSteps", segments.length),
@@ -917,9 +986,10 @@ function adaptMessage(
 	// sent silently disappear in the virtual list.
 	if (msg.role === "user") {
 		// Some user-role messages are not chat bubbles at all: `/bash`, tool load /
-		// unload notices are persisted with role=user but carry ONLY a system block
-		// and no text, so the bubble branch would paint an empty indigo box. Route
-		// them to the same system card the classic renderer uses.
+		// unload notices and the segment-compact marker are persisted with role=user
+		// but carry ONLY a system block and no text, so the bubble branch would paint
+		// an empty indigo box. Route them to the same system card the classic
+		// renderer uses (which matches these before it looks at the role at all).
 		const systemCardBlock = blocks.find((b) => USER_SYSTEM_CARD_TYPES.has(b.type));
 		if (systemCardBlock) {
 			return [adaptSystemBlock(systemCardBlock.type, systemCardBlock, idBase, msg, ctx)];
@@ -1097,9 +1167,23 @@ function adaptMessage(
 				specs.push({
 					kind: "reasoning-steps",
 					key,
-					data: reasoningStepsData(parsed, streaming, ctx),
+					data: reasoningStepsData(
+						parsed,
+						streaming,
+						ctx,
+						// Cross-level step identity, on the SAME two conditions the L1/L2 side
+						// applies: a persisted message (a streaming id changes at the hand-off)
+						// and a single-block run (the activity fold parses each block alone,
+						// so a multi-block run's step boundaries need not line up). `bi` is the
+						// run's first block index — the loop advances `position` past the rest.
+						msg.id && msg.id !== STREAMING_MESSAGE_ID && reasoningBlocks.length === 1
+							? { messageId: msg.id, runStartBlockIndex: bi }
+							: undefined,
+					),
+					// No LOD input: a step trace has ONE shape at every level — titles
+					// visible, each step's body openable. A level that showed titles whose
+					// bodies could not be opened gave the reader a list of promises.
 					opts: {
-						titlesOnly: !streaming && (ctx.lod === 3 || ctx.lod === 4),
 						showEarlier: ctx.showEarlier?.(key) ?? false,
 						expandedIndices: ctx.expandedRows?.(key) ?? [],
 					},
@@ -1592,8 +1676,36 @@ function adaptFramedSystemCard(
 			hasHeader: true,
 			// The verbatim model-facing copy for the context-menu inspector.
 			modelFacing: modelFacingText,
+			// Both of these rows are ABOUT another chapter, and each already carries its
+			// id: a review's feedback names the review chapter it came from, a merge
+			// summary names the source chapter that was merged in. Read off the raw block
+			// rather than the projected card data, because the projection keeps only what
+			// the card paints.
+			target: framedCardTarget(kind, block),
 		},
 	};
+}
+
+/**
+ * The chapter a framed system card refers to, when it names one.
+ *
+ * `review_feedback` carries `reviewChapterId` (the chapter that produced the review)
+ * and `merge_summary` carries `sourceChapterId` (the chapter that was merged in) —
+ * both written by their producers today, so neither needs a new field.
+ *
+ * Returns null when the id is absent, which is the shape of rows written before those
+ * producers recorded it. An inert header is the correct outcome there; a link built on
+ * a missing id would 404.
+ */
+function framedCardTarget(kind: string, block: AdapterContentBlock): InjectionTarget | null {
+	const raw = block as unknown as Record<string, unknown>;
+	const id =
+		kind === "review_feedback"
+			? raw.reviewChapterId
+			: kind === "merge_summary"
+				? raw.sourceChapterId
+				: undefined;
+	return typeof id === "string" && id.trim().length > 0 ? { kind: "chapter", chapterId: id } : null;
 }
 
 /**
@@ -1725,6 +1837,18 @@ function adaptSpokenInjection(
 					// does not.
 					speakerId: message.fromId ?? null,
 					speakerKind: message.fromType ?? null,
+					// The sender IS a narrator, so its session can be opened from this row.
+					// Deliberately NOT derived from `speakerId`: that field seeds the identicon
+					// and is set for every speaker kind (a bash task, a knowledge entry), so
+					// navigating by it would make a `bg_bash` row offer to open a narrator that
+					// does not exist. See `injection-target.ts`.
+					target: message.fromId
+						? ({
+								kind: "narrator",
+								narratorId: message.fromId,
+								messageId: message.fromMessageId ?? null,
+							} satisfies InjectionTarget)
+						: null,
 					isBroadcast: message.isBroadcast === true,
 					source,
 					hasHeader: true,
@@ -1780,6 +1904,18 @@ function adaptSpokenInjection(
 					// A background task is addressable by id, which is what seeds its glyph.
 					speakerId: task.id ?? null,
 					speakerKind: task.status ?? null,
+					// Only the AGENT flavour has a session: a background agent's task id IS
+					// its narrator id, whereas a bash task id addresses a shell invocation
+					// with no session to open. Gating on `flavor` rather than on the presence
+					// of an id is what keeps a bash row from offering a dead link.
+					target:
+						body.flavor === "agent" && task.id
+							? ({
+									kind: "narrator",
+									narratorId: task.id,
+									messageId: task.resultMessageId ?? null,
+								} satisfies InjectionTarget)
+							: null,
 					isBroadcast: false,
 					source,
 					hasHeader: true,
@@ -1843,6 +1979,14 @@ function adaptSpokenInjection(
 				// visually distinct.
 				speakerId: hit.entryId ?? null,
 				speakerKind: null,
+				// The excerpt is a FLATTENED slice of the entry, so "read the rest" is the
+				// natural next action — this is the one bubble kind whose body is knowingly
+				// incomplete. Injected hits come from the global collections (see
+				// `knowledge-injection.ts`, which ACL-filters `knowledgeService` entries), so
+				// the scope is global rather than a guess.
+				target: hit.entryId
+					? ({ kind: "knowledge", entryId: hit.entryId, scope: "global" } satisfies InjectionTarget)
+					: null,
 				// Without this the row had no context-menu inspector at all.
 				modelFacing: modelFacingText,
 				isBroadcast: false,
@@ -1944,6 +2088,11 @@ function adaptSpokenInjection(
 					hasHeader: true,
 					// Same inspector contract as every other injection row.
 					modelFacing: modelFacingText,
+					// A spec-file save names the file it changed, and that file is openable in
+					// the Spec panel. Only a SINGLE-file delivery gets a target: a multi-file
+					// save has no one destination, and silently picking the first would take
+					// the reader somewhere the row did not promise.
+					target: specUpdateTarget(body),
 				},
 			},
 		];
@@ -1990,6 +2139,22 @@ const SPOKEN_INJECTION_SOURCES = new Set([
 	// see the `knowledge` branch above.
 	"knowledge_base_hint",
 ]);
+
+/**
+ * The Spec file a `spec_update` row points at, when it points at exactly one.
+ *
+ * Returns null for every other platform producer (a task digest is about the spec but
+ * is not a report of one file changing) and for a multi-file save. The multi-file case
+ * is a real one — `drainSpecUpdates` batches whatever the user saved — and there is no
+ * honest single destination for it, so the row stays inert rather than picking one.
+ */
+function specUpdateTarget(body: SideCarBody): InjectionTarget | null {
+	if (body.kind !== "specUpdates") return null;
+	const items = Array.isArray(body.items) ? body.items : [];
+	if (items.length !== 1) return null;
+	const uri = items[0]?.uri?.trim();
+	return uri ? { kind: "spec", uri } : null;
+}
 
 /**
  * Display name for one inbound message's sender.
@@ -2417,12 +2582,12 @@ function adaptToolItemFull(
 		// appears/disappears (the boolean folds into the measure cache key).
 		...(hasPendingPermission ? { hasPendingPermission: true } : {}),
 		// Same contract for the pinned tasks card: it never collapses to a header,
-		// even at L4 or as an older card at L5.
+		// even at L3 or as an older card at L4.
 		...(isPinnedSpecTasks ? { forceExpanded: true } : {}),
 		collapsesByLod:
 			!hasPendingPermission &&
 			!isActiveToolItem(item) &&
-			(ctx.lod === 4 || (ctx.lod === 5 && !isRecentToolItem(item, ctx))),
+			(ctx.lod === 3 || (ctx.lod === 4 && !isRecentToolItem(item, ctx))),
 	};
 	if (item.isSubagent) {
 		// Map height-relevant SubagentCardData fields (NOT `status` — that field
@@ -2988,37 +3153,16 @@ function toolTraceItem(
 }
 
 /**
- * The folded rows of one tool batch, with the reader's drilled-in rows carrying
- * their full card payload, plus the row INDICES those rows landed on.
- *
- * Expansion is decided per ROW KEY (`ctx.isRowExpanded`) and the indices are
- * DERIVED from the result, rather than the reverse. The measure layer resolves a
- * visible row back to `startIndex + vi` over this very array, so deriving the
- * indices here is what keeps the two sides numbering the same rows — and reading
- * the reader's intent from a key is what makes the decision survive a row list
- * that grows mid-stream (see `AdapterContext.isRowExpanded`).
- */
-function foldedToolItems(
-	items: AdapterToolItem[],
-	ctx: AdapterContext,
-	traceKey: string,
-): { rows: unknown[]; expandedIndices: number[] } {
-	const expandedIndices: number[] = [];
-	const rows = items.map((item, index) => {
-		const expanded = ctx.isRowExpanded?.(traceKey, toolItemKey(item)) ?? false;
-		if (expanded) expandedIndices.push(index);
-		return toolTraceItem(item, ctx, expanded);
-	});
-	return { rows, expandedIndices };
-}
-
-/**
  * Adapt a tool-run to element specs, LOD-aware (mirrors ToolRunLodGate):
- *   - L≥4: every item renders as a full card (per-card LOD handled by measure).
- *   - L3 : completed batches fold into `tool-run-summary`; active stay standalone.
+ *   - L≥3: every item renders as a full card (per-card LOD handled by measure).
  *   - L≤2: completed batches fold into `tool-run-count`; active stay standalone.
  * (The cross-segment reasoning+tool→activity fold is applied earlier by the
  * caller's groupRenderUnits, producing an "activity" unit — see adaptActivityUnit.)
+ *
+ * ⚠️ The `tool-run-count` line is only ever reached by a run that did NOT go
+ * through `groupRenderUnits` (which folds L1/L2 activity into NAMED trace rows).
+ * A count line has no rows, so it must never become the ONLY place a call is
+ * addressable — see CONTRACT.md's "every call addressable at every LOD".
  *
  * The pinned latest tasks.json call counts as "active" for the grouping: it keeps
  * its full expanded card at its original position at every LOD.
@@ -3026,7 +3170,7 @@ function foldedToolItems(
 function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpec[] {
 	const isMultiRun = items.length >= 2;
 	const isSoleSubagent = items.filter((item) => item.isSubagent).length === 1;
-	if (ctx.lod >= 4) {
+	if (ctx.lod >= 3) {
 		return items.map((item, index) =>
 			adaptToolItemFull(item, ctx, {
 				inRun: isMultiRun,
@@ -3053,40 +3197,15 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 		const first = group.items[0];
 		if (!first) continue;
 		const traceKey = toolItemKey(first);
-		if (ctx.lod === 3) {
-			// The trace's own spec key, resolved once: it addresses BOTH the fold state
-			// and the per-row drill-down set, which must agree (a row's card is built
-			// from the same key the measure layer resolves `expandedIndices` from).
-			const specKey = `toolrun-summary-${traceKey}`;
-			const folded = foldedToolItems(group.items, ctx, specKey);
-			specs.push({
-				kind: "tool-run-summary",
-				key: specKey,
-				data: {
-					items: folded.rows,
-					headerLabel: sysLabel(ctx, "toolCalls"),
-					headerCount: countLabel(ctx, "toolCallsCount", group.items.length),
-				},
-				opts: {
-					showEarlier: ctx.showEarlier?.(specKey) ?? false,
-					// Derived from the rows just built, never resolved independently: the
-					// two must agree on WHICH rows are open, and a second lookup is exactly
-					// where they used to drift (see foldedToolItems).
-					expandedIndices: folded.expandedIndices,
-					viewportHeight: ctx.viewportHeight,
-				},
-			});
-		} else {
-			specs.push({
-				kind: "tool-run-count",
-				key: `toolrun-count-${traceKey}`,
-				data: {
-					count: group.items.length,
-					headerLabel: sysLabel(ctx, "toolCalls"),
-					headerCount: countLabel(ctx, "toolCallsCount", group.items.length),
-				},
-			});
-		}
+		specs.push({
+			kind: "tool-run-count",
+			key: `toolrun-count-${traceKey}`,
+			data: {
+				count: group.items.length,
+				headerLabel: sysLabel(ctx, "toolCalls"),
+				headerCount: countLabel(ctx, "toolCallsCount", group.items.length),
+			},
+		});
 	}
 	return specs;
 }
@@ -3138,6 +3257,38 @@ function reasoningRowIdentity(
 function reasoningRowKeyBase(item: Extract<AdapterActivityInput, { kind: "reasoning" }>): string {
 	if (item.stableKeyBase) return `r-${item.stableKeyBase}-${item.stableKeyOffset ?? 0}`;
 	return `r-${item.msg?.id ?? "msg"}-${item.blockIndex ?? 0}`;
+}
+
+/**
+ * The LOD-INDEPENDENT identity of one reasoning STEP, shared by the two renderings
+ * that step has: a row of the `activity-trace` at L1/L2 and a row of the
+ * `reasoning-steps` trace at L3+.
+ *
+ * ## Why it cannot reuse the row key
+ *
+ * A folded row keys on `stableKeyBase` — the run's ordinal WITHIN ITS ACTIVITY UNIT
+ * (`run0`), which is what keeps a row stable across the streaming hand-off. L3+ has no
+ * activity unit at all, so that ordinal is not merely different there, it is
+ * uncomputable. The only facts both sides hold independently are the owning message,
+ * the run's FIRST block index, and the step's ordinal inside the run — so the identity
+ * is built from exactly those.
+ *
+ * ## Why callers must gate on a single-block run
+ *
+ * The two levels group reasoning differently: the activity fold pushes blocks ONE BY
+ * ONE and parses each on its own, while `adaptContentBlocks` joins a run's adjacent
+ * blocks and parses the concatenation. For a multi-block run the step boundaries
+ * therefore need not line up, and `s2` on one side can be a different step than `s2` on
+ * the other. Pairing those would morph one step into an unrelated one — worse than not
+ * morphing, because it looks deliberate. Both call sites emit this only for a run of
+ * exactly one block, where the two parses see the same text and agree by construction.
+ */
+export function reasoningStepUnitId(
+	messageId: string,
+	runStartBlockIndex: number,
+	stepIndex: number,
+): string {
+	return `reason-${messageId}-b${runStartBlockIndex}-s${stepIndex}`;
 }
 
 /**
@@ -3212,12 +3363,19 @@ function adaptActivityItems(
 			// identical result while paying only for newly settled paragraphs.
 			//
 			// Committed rows keep the plain parser: they are parsed once and then served
-			// from the measurement cache, so memoising them would only add bookkeeping.
-			// `…Titles` (not the full-body variant) because a folded row shows ONLY the
-			// title or the body's first line — it has no expandable body here. Emitting
-			// the whole body would rebuild a string the size of the entire reply per
-			// frame, which profiling put at 97.8% of the frame on a single-title body.
-			const parsed = isStreamingReasoningItem(item)
+			// from the measurement cache, so memoising them would only add bookkeeping —
+			// and they are the rows that carry an EXPANDABLE body (below), which needs
+			// the real text.
+			//
+			// The live row keeps `…Titles` (bodies truncated to their first line) and
+			// therefore stays non-expandable: emitting whole bodies per delta would
+			// rebuild a string the size of the entire reply every frame, which profiling
+			// put at 97.8% of the frame on a single-title body. It costs the reader
+			// nothing, because a live run already shows its newest characters through
+			// `liveTail`, and the row keeps its key across the hand-off — so the instant
+			// the turn persists the SAME row gains its chevron.
+			const isLiveParse = isStreamingReasoningItem(item);
+			const parsed = isLiveParse
 				? parseStreamingReasoningTitles(`${traceKey}|${reasoningRowKeyBase(item)}`, text)
 				: (ctx.resolveReasoningSegments ?? parseReasoningSegments)(text);
 			const rows =
@@ -3241,21 +3399,45 @@ function adaptActivityItems(
 			// thing the tail exists to look past. The end of `text` is the end of the
 			// last step, i.e. the newest characters.
 			const liveTail = streaming ? resolveReasoningLiveTail(text) : null;
-			traceItems.push(
-				...rows.map((row, index): AdapterTraceItem => {
-					const isLast = index === rows.length - 1;
-					return {
-						title: reasoningStepTitle(row),
-						hasIcon: true,
-						iconColor: "grape",
-						key: `${keyBase}-step-${index}`,
-						shimmer: streaming && isLast,
-						identity,
-						unitId: `reason-${keyBase}-${index}`,
-						...(liveTail && isLast ? { liveTail } : {}),
-					};
-				}),
-			);
+			for (const [index, row] of rows.entries()) {
+				const isLast = index === rows.length - 1;
+				const rowKey = `${keyBase}-step-${index}`;
+				// A step with real content gets an expandable markdown body, so the reader
+				// can open ONE step of a folded run instead of choosing between a bare
+				// title list and the whole reply. Live rows carry no body (see above), and
+				// an empty/placeholder step has nothing to reveal.
+				const bodyText = isLiveParse ? null : reasoningStepBody(row);
+				const expanded = bodyText != null && (ctx.isRowExpanded?.(traceKey, rowKey) ?? false);
+				// Recorded against the EMITTED row list, read before the push — the same
+				// numbering the measure layer resolves a visible row back to. See the note
+				// above the loop on why the reader's intent is keyed, not indexed.
+				if (expanded) expandedIndices.push(traceItems.length);
+				traceItems.push({
+					title: reasoningStepTitle(row),
+					hasIcon: true,
+					iconColor: "grape",
+					key: rowKey,
+					shimmer: streaming && isLast,
+					identity,
+					// Cross-level identity, so this folded step can morph into the
+					// `reasoning-steps` row it becomes at L3+. Derived from the identity the
+					// row already carries — which is absent for a streaming message (its id
+					// changes at the hand-off) — and only for a SINGLE-BLOCK run, where the two
+					// levels' parses provably see the same text. See reasoningStepUnitId.
+					//
+					// Falls back to the run-ordinal form otherwise: still unique per row (the
+					// value is painted as `data-nf-unit`), simply without a counterpart to pair.
+					// `blockIndices` is optional on the type, so an ABSENT list must not read as
+					// a single-block run: without knowing the run's extent there is no proof the
+					// two levels parse the same text, which is the whole precondition.
+					unitId:
+						identity && identity.blockIndices?.length === 1
+							? reasoningStepUnitId(identity.messageId, identity.blockIndex, index)
+							: `reason-${keyBase}-${index}`,
+					...(bodyText != null ? { bodyText } : {}),
+					...(liveTail && isLast ? { liveTail } : {}),
+				});
+			}
 			continue;
 		}
 		toolCount++;
@@ -3304,7 +3486,7 @@ function adaptActivityItems(
  * its rows visible even at L1.
  *
  * Two ways to qualify. A unit holding live output is current by definition. Any
- * other unit is judged by the L5 recency window (`recentMessageIds`, the last two
+ * other unit is judged by the L4 recency window (`recentMessageIds`, the last two
  * assistant run segments), which only moves when the user sends a new message — so
  * a run that finishes does NOT re-fold under the reader, and the "completed →
  * collapsed" self-inflicted jump never happens.
@@ -3324,7 +3506,7 @@ function isRecentActivityUnit(items: AdapterActivityInput[], ctx: AdapterContext
 }
 
 /** Adapt a cross-segment activity unit. The input is typed so source order and
- * message ownership survive the fold, including L5 recency and stable toggles. */
+ * message ownership survive the fold, including L4 recency and stable toggles. */
 export function adaptActivityUnit(
 	items: AdapterActivityInput[],
 	key: string,

@@ -54,6 +54,7 @@ import {
 	codexTierOrderSchema,
 	commandBlacklistEntrySchema,
 	commandWhitelistEntrySchema,
+	modelCardSchema,
 	whitelistDirEntrySchema,
 } from "../lib/validators";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
@@ -450,6 +451,7 @@ export const updateSettingsSchema = z
 					.max(100)
 					.optional(),
 				modelContextWindows: z.record(z.string(), z.number().int().min(1)),
+				modelCards: z.array(modelCardSchema).max(500).optional(),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
 				commandWhitelist: z.array(commandWhitelistEntrySchema).max(50),

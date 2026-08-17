@@ -62,7 +62,7 @@ export function TraitLayerEditor({
 	const [skillNames, setSkillNames] = useState<string[]>([]);
 	const [allSkillsBlocked, setAllSkillsBlocked] = useState(false);
 	const [skillsEnforced, setSkillsEnforced] = useState(false);
-	const [injectionMode, setInjectionMode] = useState<LayerDeviceInjection["defaultMode"]>("all");
+	const [injectionMode, setInjectionMode] = useState<LayerDeviceInjection["defaultMode"]>("global");
 	const [deviceOverrides, setDeviceOverrides] = useState<Record<string, "on" | "off">>({});
 
 	// Reset local edit state whenever the server view changes, so a save or a
@@ -74,7 +74,7 @@ export function TraitLayerEditor({
 		setSkillNames(data.customTraits.blockedSkills?.names ?? []);
 		setAllSkillsBlocked(data.customTraits.blockedSkills?.all ?? false);
 		setSkillsEnforced(data.enforced.blockedSkills);
-		setInjectionMode(data.deviceInjection?.defaultMode ?? "all");
+		setInjectionMode(data.deviceInjection?.defaultMode ?? "global");
 		setDeviceOverrides(data.deviceInjection?.devices ?? {});
 	}, [data]);
 
@@ -270,13 +270,14 @@ export function TraitLayerEditor({
 				<Select
 					label={t("traitLayerInjectionMode")}
 					data={[
+						{ value: "global", label: t("traitLayerInjectionGlobal") },
 						{ value: "all", label: t("traitLayerInjectionAll") },
 						{ value: "private", label: t("traitLayerInjectionPrivate") },
 						{ value: "none", label: t("traitLayerInjectionNone") },
 					]}
 					value={injectionMode}
 					onChange={(value) =>
-						setInjectionMode((value as LayerDeviceInjection["defaultMode"]) ?? "all")
+						setInjectionMode((value as LayerDeviceInjection["defaultMode"]) ?? "global")
 					}
 					allowDeselect={false}
 				/>

@@ -102,8 +102,8 @@ describe("renderLabelsForKind — every chrome-painting kind is localizable", ()
 		expect(renderLabelsForKind("inline-permission", STUB_LABELS)).toBe(STUB_LABELS.permission);
 		expect(renderLabelsForKind("ask-user-question", STUB_LABELS)).toBe(STUB_LABELS.askUserQuestion);
 		expect(renderLabelsForKind("ask-in-passing", STUB_LABELS)).toBe(STUB_LABELS.askInPassing);
-		// The three folded-trace kinds share one bundle (same CollapsibleTrace chrome).
-		for (const kind of ["tool-run-summary", "activity-trace", "reasoning-steps"] as const) {
+		// The two folded-trace kinds share one bundle (same CollapsibleTrace chrome).
+		for (const kind of ["activity-trace", "reasoning-steps"] as const) {
 			expect(renderLabelsForKind(kind, STUB_LABELS)).toBe(STUB_LABELS.trace);
 		}
 	});

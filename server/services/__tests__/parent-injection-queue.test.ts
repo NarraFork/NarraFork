@@ -15,7 +15,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { CompletedNotification } from "../background-task-service";
 import type { CompletedBgSubagentNotification } from "../bg-completion-queue";
-import type { ParentInboundMessage } from "../parent-inbound-queue";
+import { formatParentInboundMessages, type ParentInboundMessage } from "../parent-inbound-queue";
 import {
 	drainPendingInjections,
 	hasPendingInjections,
@@ -252,5 +252,45 @@ describe("regression: Send before completion stays before completion", () => {
 		);
 		// Nothing is left behind for a second consumer to find.
 		expect(hasPendingInjections(P)).toBe(false);
+	});
+});
+
+/**
+ * The idle-parent path formats its own text (the busy path goes through the
+ * sidecar renderer), so the sender-naming rule has to hold in both. An untitled
+ * subagent used to be named by an 8-char slice of its nanoid here.
+ */
+describe("formatParentInboundMessages names the sender readably", () => {
+	const NANOID = "UscgG1vLFnxzyKyaUOIfR";
+
+	function inbound(over: Partial<ParentInboundMessage> = {}): ParentInboundMessage {
+		return {
+			fromId: NANOID,
+			fromTitle: null,
+			fromType: "explore",
+			text: "found it",
+			timestamp: new Date().toISOString(),
+			...over,
+		};
+	}
+
+	test("uses the alias when the sender has no title", () => {
+		const text = formatParentInboundMessages([inbound({ fromLabel: "trace-providers" })], "en");
+		expect(text).toContain("trace-providers");
+		expect(text).not.toContain(NANOID);
+	});
+
+	test("a title still outranks the alias", () => {
+		const text = formatParentInboundMessages(
+			[inbound({ fromTitle: "Explorer", fromLabel: "trace-providers" })],
+			"en",
+		);
+		expect(text).toContain("Explorer");
+	});
+
+	test("without either, it falls back to a short id rather than the whole one", () => {
+		const text = formatParentInboundMessages([inbound()], "en");
+		expect(text).toContain("UscgG1vL");
+		expect(text).not.toContain(NANOID);
 	});
 });

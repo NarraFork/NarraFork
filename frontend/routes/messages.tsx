@@ -19,6 +19,7 @@ import { ChatRoomList } from "../components/chat/ChatRoomList";
 import { ChatRoomView } from "../components/chat/ChatRoomView";
 import { NewDmModal } from "../components/chat/NewDmModal";
 import { useChatRooms, useOpenChatDm } from "../hooks/useChat";
+import { APP_SHELL_FULL_BLEED_HEIGHT } from "../lib/safe-area";
 
 interface MessagesSearch {
 	room?: string;
@@ -49,7 +50,15 @@ function MessagesPage() {
 	const activeRoom = rooms?.find((room) => room.id === activeRoomId);
 
 	return (
-		<Box style={{ height: "100%", minHeight: 0 }}>
+		// Full bleed: Main's symmetric `md` gutter is cancelled with negative margins so
+		// the column divider and the header borders reach the edges of the content area
+		// instead of stopping short of them.
+		<Box
+			h={APP_SHELL_FULL_BLEED_HEIGHT}
+			mx="calc(var(--mantine-spacing-md) * -1)"
+			my="calc(var(--mantine-spacing-md) * -1)"
+			style={{ minHeight: 0, overflow: "hidden" }}
+		>
 			<Box style={{ height: "100%", minHeight: 0, display: "flex" }}>
 				<Box
 					style={{

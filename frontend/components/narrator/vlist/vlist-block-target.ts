@@ -7,7 +7,7 @@
  *   markdown / reasoning / reasoning-steps / web-search / media : `{msgId}-b{blockIndex}`
  *   message-bubble (user)                                        : `{msgId}-bubble` (blockIndex 0)
  *   tool-call / subagent-card                                    : `tool-{toolUseId}`
- *   aggregates (tool-run-summary / tool-run-count / activity-*)  : no single block
+ *   aggregates (tool-run-count / activity-*)                     : no single block
  *
  * Selection blockId encodings (vlist-selection.ts / MessageSelectionCtx):
  *   content block: `msg-{messageId}-{blockIndex}`
@@ -34,12 +34,8 @@ export interface VListBlockTarget {
 
 /** Kinds that are folded aggregates spanning multiple blocks/messages. These
  *  intentionally get no single-block menu (parity with the chunked path, whose
- *  ToolRunSummary/ActivityTrace/ToolRunCount are not wrapped in a block menu). */
-const AGGREGATE_KINDS = new Set<VListElementKind>([
-	"tool-run-summary",
-	"tool-run-count",
-	"activity-trace",
-]);
+ *  ActivityTrace/ToolRunCount are not wrapped in a block menu). */
+const AGGREGATE_KINDS = new Set<VListElementKind>(["tool-run-count", "activity-trace"]);
 
 /** Kinds that never participate in the single-block interaction menu. */
 const NON_INTERACTIVE_KINDS = new Set<VListElementKind>([

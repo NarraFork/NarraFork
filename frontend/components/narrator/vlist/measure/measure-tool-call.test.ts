@@ -82,12 +82,12 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 
 // ── Collapsed vs expanded ─────────────────────────────────────────────────────
 describe("measureToolCall — collapsed = header only", () => {
-	it("a folded card (L4) is exactly the collapsed height, with no detail", async () => {
+	it("a folded card (L3) is exactly the collapsed height, with no detail", async () => {
 		const { measureToolCall } = await mod();
 		const r = measureToolCall(
 			baseCard({ detail: { kind: "capped", cap: "code", contentLines: 50 } }),
 			600,
-			4,
+			3,
 		);
 		expect(r.effectiveOpened).toBe(false);
 		expect(r.detail).toBeNull();
@@ -96,15 +96,15 @@ describe("measureToolCall — collapsed = header only", () => {
 
 	it("collapsed height is independent of summary length (header truncates)", async () => {
 		const { measureToolCall } = await mod();
-		const short = measureToolCall(baseCard({ summary: "a" }), 600, 4);
-		const long = measureToolCall(baseCard({ summary: "x".repeat(500) }), 600, 4);
+		const short = measureToolCall(baseCard({ summary: "a" }), 600, 3);
+		const long = measureToolCall(baseCard({ summary: "x".repeat(500) }), 600, 3);
 		expect(long.height).toBe(short.height);
 	});
 
 	it("in-run card drops the border but adds a 1px divider unless last", async () => {
 		const { measureToolCall, CARD_PADDING, HEADER_ROW_HEIGHT, CARD_DIVIDER } = await mod();
-		const notLast = measureToolCall(baseCard({ inRun: true, isLast: false }), 600, 4);
-		const last = measureToolCall(baseCard({ inRun: true, isLast: true }), 600, 4);
+		const notLast = measureToolCall(baseCard({ inRun: true, isLast: false }), 600, 3);
+		const last = measureToolCall(baseCard({ inRun: true, isLast: true }), 600, 3);
 		expect(notLast.hasBorder).toBe(false);
 		// in-run chrome = padding only (no border) + divider when not last.
 		expect(last.height).toBe(CARD_PADDING * 2 + HEADER_ROW_HEIGHT);
@@ -118,12 +118,12 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		const few = measureToolCall(
 			baseCard({ detail: { kind: "capped", cap: "code", contentLines: 3 } }),
 			600,
-			6,
+			5,
 		);
 		const more = measureToolCall(
 			baseCard({ detail: { kind: "capped", cap: "code", contentLines: 6 } }),
 			600,
-			6,
+			5,
 		);
 		expect(few.detail).not.toBeNull();
 		expect(more.detail!.height).toBe(few.detail!.height + 3 * DETAIL_CONTENT_LINE_HEIGHT);
@@ -140,7 +140,7 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		const r = measureToolCall(
 			baseCard({ detail: { kind: "capped", cap: "code", contentLines: 500 } }),
 			600,
-			6,
+			5,
 		);
 		// The region = mt="xs" gap + label chrome + body clamped to the cap.
 		const labelH = DETAIL_LABEL_LINE_HEIGHT + DETAIL_LABEL_MARGIN_BOTTOM;
@@ -156,7 +156,7 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 				detail: { kind: "capped", cap: "bash-cmd", contentLines: 999 },
 			}),
 			600,
-			6,
+			5,
 		);
 		expect(r.detail!.appliedCap).toBe(DETAIL_CAPS["bash-cmd"]);
 		// bash-cmd has no leading label → region = mt="xs" gap + clamped body.
@@ -168,12 +168,12 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		const small = measureToolCall(
 			baseCard({ category: "browser", detail: { kind: "capped", cap: "media", contentPx: 150 } }),
 			600,
-			6,
+			5,
 		);
 		const huge = measureToolCall(
 			baseCard({ category: "browser", detail: { kind: "capped", cap: "media", contentPx: 5000 } }),
 			600,
-			6,
+			5,
 		);
 		expect(small.detail!.height).toBe(DETAIL_TOP_MARGIN + 150);
 		expect(huge.detail!.height).toBe(DETAIL_TOP_MARGIN + DETAIL_CAPS.media);
@@ -184,7 +184,7 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		const withVp = measureToolCall(
 			baseCard({ category: "plan", detail: { kind: "capped", cap: "plan", contentLines: 999 } }),
 			600,
-			6,
+			5,
 			{ viewportHeight: 1000 },
 		);
 		// 0.85 × 1000 = 850.
@@ -193,7 +193,7 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		const noVp = measureToolCall(
 			baseCard({ category: "plan", detail: { kind: "capped", cap: "plan", contentLines: 999 } }),
 			600,
-			6,
+			5,
 		);
 		expect(noVp.detail!.appliedCap).toBe(DETAIL_CAPS.plan);
 	});
@@ -220,7 +220,7 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 					},
 				}),
 				600,
-				6,
+				5,
 				{ viewportHeight: 1000 },
 			);
 		const prefix = card(true);
@@ -248,7 +248,7 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 					...(truncated ? { truncatedLeafCount: 1, truncatedTotalBytes: 17 * 1024 } : {}),
 				}),
 				600,
-				6,
+				5,
 			);
 		expect(card(true).height).toBe(card(false).height);
 		// The counters still travel through as the payload-completeness signal the
@@ -262,12 +262,12 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		const inputOnly = measureToolCall(
 			baseCard({ category: "generic", detail: { kind: "generic", inputLines: 3 } }),
 			600,
-			6,
+			5,
 		);
 		const both = measureToolCall(
 			baseCard({ category: "generic", detail: { kind: "generic", inputLines: 3, outputLines: 3 } }),
 			600,
-			6,
+			5,
 		);
 		expect(inputOnly.detail!.blocks).toHaveLength(1);
 		expect(both.detail!.blocks).toHaveLength(2);
@@ -291,7 +291,7 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 				detail: { kind: "capped", cap: "code", contentLines: 1, text: REFERENCE_LINE },
 			}),
 			400,
-			6,
+			5,
 		);
 		const block = measured.detail!.blocks[0];
 		const capped = block?.kind === "fixed" ? (block.data?.capped as number) : 0;
@@ -309,7 +309,7 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 					detail: { kind: "capped", cap: "code", contentLines: 1, text: REFERENCE_LINE },
 				}),
 				width,
-				6,
+				5,
 			);
 			const block = measured.detail!.blocks[0];
 			return block?.kind === "fixed" ? (block.data?.capped as number) : 0;
@@ -328,7 +328,7 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 				detail: { kind: "capped", cap: "code", contentLines: 1, text: "short" },
 			}),
 			600,
-			6,
+			5,
 		);
 		const block = measured.detail!.blocks[0];
 		const capped = block?.kind === "fixed" ? (block.data?.capped as number) : 0;
@@ -343,7 +343,7 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 				detail: { kind: "capped", cap: "code", contentLines: 1, text: "short", hasLabel: true },
 			}),
 			600,
-			6,
+			5,
 		);
 		const withoutLabel = m.measureToolCall(
 			baseCard({
@@ -351,7 +351,7 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 				detail: { kind: "capped", cap: "code", contentLines: 1, text: "short", hasLabel: false },
 			}),
 			600,
-			6,
+			5,
 		);
 		const labelChrome = m.DETAIL_LABEL_LINE_HEIGHT + m.DETAIL_LABEL_MARGIN_BOTTOM;
 		expect(withLabel.detail!.height - withoutLabel.detail!.height).toBe(labelChrome);
@@ -368,7 +368,7 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 				detail: { kind: "capped", cap: "code", contentLines: 1, text: huge },
 			}),
 			600,
-			6,
+			5,
 		);
 		const block = measured.detail!.blocks[0];
 		expect(block?.kind === "fixed" ? block.data?.capped : null).toBe(m.DETAIL_CAPS.code);
@@ -393,7 +393,7 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 		const measured = m.measureToolCall(
 			baseCard({ category: "generic", detail: { kind: "capped", cap: "code", contentLines: 4 } }),
 			600,
-			6,
+			5,
 		);
 		const block = measured.detail!.blocks[0];
 		const capped = block?.kind === "fixed" ? (block.data?.capped as number) : 0;
@@ -408,7 +408,7 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 				detail: { kind: "generic", inputLines: 1, inputText: "a", outputLines: 1, outputText: "b" },
 			}),
 			400,
-			6,
+			5,
 		);
 		const longOutput = m.measureToolCall(
 			baseCard({
@@ -422,7 +422,7 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 				},
 			}),
 			400,
-			6,
+			5,
 		);
 		expect(longOutput.detail!.height).toBeGreaterThan(shortBoth.detail!.height);
 	});
@@ -449,7 +449,7 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 
 	it("flags the region as markdown and carries real prepared blocks", async () => {
 		const { measureToolCall } = await mod();
-		const measured = measureToolCall(planCard(), 600, 6, { viewportHeight: 1000 });
+		const measured = measureToolCall(planCard(), 600, 5, { viewportHeight: 1000 });
 		const detail = measured.detail!;
 		expect(detail.markdown).toBe(true);
 		// Not one opaque fixed block: headings/paragraph/list/code all appear.
@@ -460,7 +460,7 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 	it("keeps blocks and frame.blocks in lockstep (render indexes by position)", async () => {
 		const { measureToolCall } = await mod();
 		for (const sourcePath of [undefined, ".narrafork/plan-abc.md"]) {
-			const measured = measureToolCall(planCard({ sourcePath }), 600, 6, { viewportHeight: 1000 });
+			const measured = measureToolCall(planCard({ sourcePath }), 600, 5, { viewportHeight: 1000 });
 			const detail = measured.detail!;
 			expect(detail.frame.blocks).toHaveLength(detail.blocks.length);
 			for (const [index, frame] of detail.frame.blocks.entries()) {
@@ -471,8 +471,8 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 
 	it("a source path adds exactly one leading provenance row", async () => {
 		const { measureToolCall, XS_LINE_HEIGHT } = await mod();
-		const without = measureToolCall(planCard(), 600, 6, { viewportHeight: 1000 });
-		const withSource = measureToolCall(planCard({ sourcePath: ".narrafork/plan-abc.md" }), 600, 6, {
+		const without = measureToolCall(planCard(), 600, 5, { viewportHeight: 1000 });
+		const withSource = measureToolCall(planCard({ sourcePath: ".narrafork/plan-abc.md" }), 600, 5, {
 			viewportHeight: 1000,
 		});
 		expect(withSource.detail!.blocks).toHaveLength(without.detail!.blocks.length + 1);
@@ -490,7 +490,7 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 		const longPlan = Array.from({ length: 400 }, (_, i) => `## Section ${i}\n\nbody text`).join(
 			"\n\n",
 		);
-		const measured = measureToolCall(planCard({ text: longPlan, contentLines: 1200 }), 600, 6, {
+		const measured = measureToolCall(planCard({ text: longPlan, contentLines: 1200 }), 600, 5, {
 			viewportHeight: 1000,
 		});
 		expect(measured.detail!.appliedCap).toBe(850);
@@ -642,7 +642,7 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 				detail: { kind: "capped", cap: "plan", contentLines: 3, text: PLAN },
 			}),
 			600,
-			6,
+			5,
 			{ viewportHeight: 1000 },
 		);
 		expect(measured.detail!.markdown).toBeUndefined();
@@ -657,7 +657,7 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 		const two = measureToolCall(
 			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: specTasks("a", "b") } }),
 			600,
-			6,
+			5,
 		);
 		const four = measureToolCall(
 			baseCard({
@@ -665,7 +665,7 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 				detail: { kind: "spec-tasks", tasks: specTasks("a", "b", "c", "d") },
 			}),
 			600,
-			6,
+			5,
 		);
 		expect(four.detail!.height).toBeGreaterThan(two.detail!.height);
 	});
@@ -676,12 +676,12 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 		const wide = measureToolCall(
 			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: specTasks(task) } }),
 			2000,
-			6,
+			5,
 		);
 		const narrow = measureToolCall(
 			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: specTasks(task) } }),
 			160,
-			6,
+			5,
 		);
 		expect(narrow.detail!.height).toBeGreaterThan(wide.detail!.height);
 	});
@@ -691,7 +691,7 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 		const noBadge = measureToolCall(
 			baseCard({ category: "recall", detail: { kind: "structured", bodyLines: ["one"] } }),
 			600,
-			6,
+			5,
 		);
 		const withBadge = measureToolCall(
 			baseCard({
@@ -699,7 +699,7 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 				detail: { kind: "structured", badgeRows: 1, bodyLines: ["one"] },
 			}),
 			600,
-			6,
+			5,
 		);
 		// With a badge: mt gap(10) → badge row(16) → badge-gap(4) → body line.
 		// Without:      mt gap(10) → body line. The mt="xs" gap simply moves onto
@@ -718,12 +718,12 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 		const wide = measureToolCall(
 			baseCard({ status: "fail", detail: { kind: "error", text } }),
 			2000,
-			6,
+			5,
 		);
 		const narrow = measureToolCall(
 			baseCard({ status: "fail", detail: { kind: "error", text } }),
 			160,
-			6,
+			5,
 		);
 		expect(narrow.detail!.height).toBeGreaterThan(wide.detail!.height);
 	});
@@ -731,21 +731,21 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 
 // ── LOD / effectiveOpened combinations ────────────────────────────────────────
 describe("resolveToolCallOpened — LOD gate mirrors ToolCallCard :5594", () => {
-	it("L6 always expands; L4 always collapses", async () => {
+	it("L5 always expands; L3 always collapses", async () => {
 		const { resolveToolCallOpened } = await mod();
 		const base = { lodExempt: false, isRecent: true, opened: true };
-		expect(resolveToolCallOpened(6, base)).toBe(true);
-		expect(resolveToolCallOpened(4, base)).toBe(false);
+		expect(resolveToolCallOpened(5, base)).toBe(true);
+		expect(resolveToolCallOpened(3, base)).toBe(false);
 	});
 
-	it("L5 follows `opened` for recent cards, collapses older cards", async () => {
+	it("L4 follows `opened` for recent cards, collapses older cards", async () => {
 		const { resolveToolCallOpened } = await mod();
-		expect(resolveToolCallOpened(5, { lodExempt: false, isRecent: true, opened: true })).toBe(true);
-		expect(resolveToolCallOpened(5, { lodExempt: false, isRecent: true, opened: false })).toBe(
+		expect(resolveToolCallOpened(4, { lodExempt: false, isRecent: true, opened: true })).toBe(true);
+		expect(resolveToolCallOpened(4, { lodExempt: false, isRecent: true, opened: false })).toBe(
 			false,
 		);
-		// Older card at L5 collapses regardless of `opened`.
-		expect(resolveToolCallOpened(5, { lodExempt: false, isRecent: false, opened: true })).toBe(
+		// Older card at L4 collapses regardless of `opened`.
+		expect(resolveToolCallOpened(4, { lodExempt: false, isRecent: false, opened: true })).toBe(
 			false,
 		);
 	});
@@ -755,23 +755,22 @@ describe("resolveToolCallOpened — LOD gate mirrors ToolCallCard :5594", () => 
 		expect(resolveToolCallOpened(1, { lodExempt: true, isRecent: false, opened: false })).toBe(
 			true,
 		);
-		expect(resolveToolCallOpened(4, { lodExempt: true, isRecent: false, opened: false })).toBe(
+		expect(resolveToolCallOpened(3, { lodExempt: true, isRecent: false, opened: false })).toBe(
 			true,
 		);
 	});
 
-	it("L1-L3 collapse (upstream tool-run gate owns these levels)", async () => {
+	it("L1/L2 collapse (upstream tool-run gate owns these levels)", async () => {
 		const { resolveToolCallOpened } = await mod();
 		const base = { lodExempt: false, isRecent: true, opened: true };
 		expect(resolveToolCallOpened(1, base)).toBe(false);
 		expect(resolveToolCallOpened(2, base)).toBe(false);
-		expect(resolveToolCallOpened(3, base)).toBe(false);
 	});
 
-	it("explicit LOD override expands L4 and old-L5 cards", async () => {
+	it("explicit LOD override expands L3 and older L4 cards", async () => {
 		const { resolveToolCallOpened } = await mod();
 		expect(
-			resolveToolCallOpened(4, {
+			resolveToolCallOpened(3, {
 				lodExempt: false,
 				isRecent: true,
 				opened: false,
@@ -779,7 +778,7 @@ describe("resolveToolCallOpened — LOD gate mirrors ToolCallCard :5594", () => 
 			}),
 		).toBe(true);
 		expect(
-			resolveToolCallOpened(5, {
+			resolveToolCallOpened(4, {
 				lodExempt: false,
 				isRecent: false,
 				opened: false,
@@ -790,12 +789,12 @@ describe("resolveToolCallOpened — LOD gate mirrors ToolCallCard :5594", () => 
 });
 
 describe("measureToolCall — running/pending cards are lodExempt", () => {
-	it("a running card stays expanded at L4 (would otherwise collapse)", async () => {
+	it("a running card stays expanded at L3 (would otherwise collapse)", async () => {
 		const { measureToolCall } = await mod();
 		const r = measureToolCall(
 			baseCard({ status: "running", detail: { kind: "capped", cap: "term", contentLines: 5 } }),
 			600,
-			4,
+			3,
 		);
 		expect(r.lodExempt).toBe(true);
 		expect(r.effectiveOpened).toBe(true);
@@ -817,7 +816,7 @@ describe("measureToolCall — running/pending cards are lodExempt", () => {
 });
 
 describe("measureToolCall — the pinned latest-tasks card is forceExpanded", () => {
-	it("a completed tasks card stays expanded at L4 (a level that collapses all)", async () => {
+	it("a completed tasks card stays expanded at L3 (a level that collapses all)", async () => {
 		const { measureToolCall } = await mod();
 		const r = measureToolCall(
 			baseCard({
@@ -830,7 +829,7 @@ describe("measureToolCall — the pinned latest-tasks card is forceExpanded", ()
 				},
 			}),
 			600,
-			4,
+			3,
 			{ forceExpanded: true },
 		);
 		expect(r.lodExempt).toBe(true);
@@ -849,7 +848,7 @@ describe("measureToolCall — the pinned latest-tasks card is forceExpanded", ()
 
 	it("an unpinned completed card is untouched by the flag's absence", async () => {
 		const { measureToolCall } = await mod();
-		const r = measureToolCall(baseCard({ status: "success" }), 600, 4);
+		const r = measureToolCall(baseCard({ status: "success" }), 600, 3);
 		expect(r.lodExempt).toBe(false);
 		expect(r.effectiveOpened).toBe(false);
 	});
@@ -859,7 +858,7 @@ describe("measureToolCall — the pinned latest-tasks card is forceExpanded", ()
 describe("measureToolCall — pendingPermission adds the InlinePermission UI", () => {
 	it("pending card is lodExempt, expanded, and includes the permission region", async () => {
 		const { measureToolCall } = await mod();
-		const r = measureToolCall(baseCard({ category: "file", toolName: "Write" }), 600, 4, {
+		const r = measureToolCall(baseCard({ category: "file", toolName: "Write" }), 600, 3, {
 			pendingPermission: { hasExecutionTarget: true, feedbackRows: 1, buttonCount: 2 },
 		});
 		expect(r.lodExempt).toBe(true);
@@ -873,11 +872,11 @@ describe("measureToolCall — pendingPermission adds the InlinePermission UI", (
 		const { measureToolCall, toolCardInnerWidth } = await mod();
 		const { measureInlinePermission } = await import("./measure-permission");
 		const perm = { hasExecutionTarget: true, feedbackRows: 2, buttonCount: 2 } as const;
-		const r = measureToolCall(baseCard({ category: "file", toolName: "Write" }), 600, 6, {
+		const r = measureToolCall(baseCard({ category: "file", toolName: "Write" }), 600, 5, {
 			pendingPermission: perm,
 		});
 		const inner = toolCardInnerWidth(600, false);
-		const direct = measureInlinePermission(perm, inner, 6);
+		const direct = measureInlinePermission(perm, inner, 5);
 		expect(r.permission!.height).toBe(direct.height);
 		// The card height includes the permission top margin + its height.
 		expect(r.height).toBe(
@@ -894,7 +893,7 @@ describe("measureToolCall — pendingPermission adds the InlinePermission UI", (
 				detail: { kind: "capped", cap: "diff", contentLines: 4 },
 			}),
 			600,
-			6,
+			5,
 			{ pendingPermission: { hasExecutionTarget: true, buttonCount: 2 } },
 		);
 		expect(r.detail).not.toBeNull();
@@ -925,20 +924,20 @@ describe("measureToolCallGroup — header + accumulated child cards", () => {
 			GROUP_BODY_MARGIN_TOP,
 		} = await mod();
 		const cards = [baseCard({ toolName: "Read" }), baseCard({ toolName: "Read" })];
-		const g = measureToolCallGroup(cards, 600, 5, { expanded: true });
+		const g = measureToolCallGroup(cards, 600, 4, { expanded: true });
 		expect(g.children).toHaveLength(2);
 
 		const inner = toolGroupBodyInnerWidth(600);
 		const childSum = cards
-			.map((c) => measureToolCall({ ...c, inRun: false }, inner, 5, { isRecent: true }).height)
+			.map((c) => measureToolCall({ ...c, inRun: false }, inner, 4, { isRecent: true }).height)
 			.reduce((a, b) => a + b, 0);
 		expect(g.height).toBe(g.chromeY + g.headerHeight + GROUP_BODY_MARGIN_TOP + childSum);
 	});
 
 	it("more children → taller expanded group", async () => {
 		const { measureToolCallGroup } = await mod();
-		const two = measureToolCallGroup([baseCard(), baseCard()], 600, 5, { expanded: true });
-		const three = measureToolCallGroup([baseCard(), baseCard(), baseCard()], 600, 5, {
+		const two = measureToolCallGroup([baseCard(), baseCard()], 600, 4, { expanded: true });
+		const three = measureToolCallGroup([baseCard(), baseCard(), baseCard()], 600, 4, {
 			expanded: true,
 		});
 		expect(three.height).toBeGreaterThan(two.height);
@@ -985,14 +984,14 @@ describe("measureToolCallGroup — header + accumulated child cards", () => {
 
 	it("the aggregates never change the group's height", async () => {
 		const { measureToolCallGroup } = await mod();
-		const bare = measureToolCallGroup([baseCard(), baseCard()], 600, 5, { expanded: true });
+		const bare = measureToolCallGroup([baseCard(), baseCard()], 600, 4, { expanded: true });
 		const timed = measureToolCallGroup(
 			[
 				baseCard({ durationMs: 9_999, startedAt: 1, completedAt: 10_000 }),
 				baseCard({ durationMs: 8_888, startedAt: 2, completedAt: 20_000 }),
 			],
 			600,
-			5,
+			4,
 			{ expanded: true },
 		);
 		expect(timed.height).toBe(bare.height);
@@ -1014,12 +1013,12 @@ describe("measureToolCall — lifecycle stamps reach the renderer", () => {
 
 	it("passes every stamp through onto `timing`", async () => {
 		const { measureToolCall } = await mod();
-		expect(measureToolCall(baseCard(STAMPS), 600, 5).timing).toEqual(STAMPS);
+		expect(measureToolCall(baseCard(STAMPS), 600, 4).timing).toEqual(STAMPS);
 	});
 
 	it("nulls the stamps a card does not carry (never undefined)", async () => {
 		const { measureToolCall } = await mod();
-		expect(measureToolCall(baseCard(), 600, 5).timing).toEqual({
+		expect(measureToolCall(baseCard(), 600, 4).timing).toEqual({
 			startedAt: null,
 			streamStartedAt: null,
 			permissionStartedAt: null,
@@ -1032,8 +1031,8 @@ describe("measureToolCall — lifecycle stamps reach the renderer", () => {
 
 	it("resolves the earliest start across all stamps", async () => {
 		const { earliestToolStartMs, measureToolCall } = await mod();
-		expect(earliestToolStartMs(measureToolCall(baseCard(STAMPS), 600, 5).timing)).toBe(800);
-		expect(earliestToolStartMs(measureToolCall(baseCard(), 600, 5).timing)).toBeNull();
+		expect(earliestToolStartMs(measureToolCall(baseCard(STAMPS), 600, 4).timing)).toBe(800);
+		expect(earliestToolStartMs(measureToolCall(baseCard(), 600, 4).timing)).toBeNull();
 	});
 
 	it("the stamps are HEIGHT-NEUTRAL on a collapsed AND an expanded card", async () => {
@@ -1042,8 +1041,8 @@ describe("measureToolCall — lifecycle stamps reach the renderer", () => {
 		const { measureToolCall } = await mod();
 		const detail = { kind: "capped", cap: "term", contentLines: 4, text: "a\nb\nc\nd" } as const;
 		for (const opts of [{}, { opened: true }] as const) {
-			const bare = measureToolCall(baseCard({ detail }), 600, 5, opts);
-			const timed = measureToolCall(baseCard({ detail, ...STAMPS }), 600, 5, opts);
+			const bare = measureToolCall(baseCard({ detail }), 600, 4, opts);
+			const timed = measureToolCall(baseCard({ detail, ...STAMPS }), 600, 4, opts);
 			expect(timed.height).toBe(bare.height);
 			expect(timed.headerHeight).toBe(bare.headerHeight);
 			expect(timed.collapsedHeight).toBe(bare.collapsedHeight);
@@ -1055,7 +1054,7 @@ describe("measureToolCall — lifecycle stamps reach the renderer", () => {
 describe("measureToolCall — MeasuredElement shape", () => {
 	it("returns a well-formed MeasuredElement (blocks/frame/contentWidth/usedWidth)", async () => {
 		const { measureToolCall } = await mod();
-		const r = measureToolCall(baseCard(), 600, 6);
+		const r = measureToolCall(baseCard(), 600, 5);
 		expect(r.blocks.length).toBeGreaterThan(0);
 		expect(r.blocks[0]?.kind).toBe("fixed");
 		expect(r.frame.blocks.length).toBe(r.blocks.length);
@@ -1071,9 +1070,9 @@ describe("measureToolCall — MeasuredElement shape", () => {
 				detail: { kind: "spec-tasks", tasks: specTasks("x".repeat(80)) },
 			}),
 		);
-		const collapsed = measure(600, 4);
-		const wide = measure(2000, 6);
-		const narrow = measure(160, 6);
+		const collapsed = measure(600, 3);
+		const wide = measure(2000, 5);
+		const narrow = measure(160, 5);
 		expect(collapsed.effectiveOpened).toBe(false);
 		expect(narrow.height).toBeGreaterThan(wide.height);
 	});

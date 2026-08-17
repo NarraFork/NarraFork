@@ -67,6 +67,38 @@ export function isInsidePlansDir(
 	return paths.contains(plansDir, paths.resolve(baseCwd, candidate));
 }
 
+/**
+ * Is this write TARGETING the plan itself rather than the project?
+ *
+ * Plan mode's whole contract is "write the plan, not the code", so a Write/Edit aimed
+ * at the plan file is the model DOING what plan mode asked — not something to warn it
+ * about. Anything under `<baseCwd>/.narrafork/plans/` counts, because relaxed plan mode
+ * lets a model choose its own file in that directory (ExitPlanMode's `plan_file_path`).
+ *
+ * `designatedPlanFilePath` is checked separately for exactly one reason: a cycle still
+ * anchored to the pre-`plans/` layout (`.narrafork/plan-<id>.md`) writes OUTSIDE the
+ * directory, and that file is just as much the plan.
+ *
+ * Purely lexical, like {@link isInsidePlansDir}, and judged with the TARGET's grammar.
+ * A false negative only costs a redundant reminder, so no filesystem probe is needed.
+ */
+export function isPlanAuthoringPath(
+	paths: TargetPathSemantics,
+	baseCwd: string,
+	candidate: string,
+	designatedPlanFilePath?: string | null,
+): boolean {
+	if (!candidate.trim()) return false;
+	const designated = designatedPlanFilePath?.trim();
+	if (
+		designated &&
+		paths.equals(paths.resolve(baseCwd, designated), paths.resolve(baseCwd, candidate))
+	) {
+		return true;
+	}
+	return isInsidePlansDir(paths, baseCwd, candidate);
+}
+
 /** Does this relative path hold a non-empty file under `cwd`? */
 export type PlanFileContentProbe = (cwd: string, relPath: string) => Promise<boolean>;
 

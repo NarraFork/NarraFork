@@ -17,7 +17,7 @@
 import { MAX_RENDER_LOD, MIN_RENDER_LOD, type RenderLod } from "./RenderLodCtx";
 
 /** Every selectable level, lowest detail first (matches the notch order). */
-export const LOD_LEVELS: readonly RenderLod[] = [1, 2, 3, 4, 5, 6];
+export const LOD_LEVELS: readonly RenderLod[] = [1, 2, 3, 4, 5];
 
 /** Whether a keyboard event's key is the modifier that reveals the indicator. */
 export function isAltKey(key: string): boolean {

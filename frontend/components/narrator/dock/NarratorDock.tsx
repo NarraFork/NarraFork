@@ -78,6 +78,11 @@ export function NarratorDock({ device, thresholds }: NarratorDockProps) {
 			tabComponents={narratorDockTabComponents}
 			onReady={handleReady}
 			thresholds={thresholds}
+			// One surface per narrator page. Stamped onto panel drags so a drop is only
+			// treated as an in-surface rearrangement by the surface it started on —
+			// panel ids are global, so a graph node's dock must not resolve this page's
+			// `ndock-terminal` against its own api (and vice versa).
+			surfaceId={`focus:${narratorId}`}
 			// Keep every panel's DOM + component instance alive when moved between
 			// groups (split / swap / merge), so the chat's live WebSocket session,
 			// the terminal (xterm), the spec editor and scroll positions survive a

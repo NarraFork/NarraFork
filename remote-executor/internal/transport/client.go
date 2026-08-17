@@ -164,6 +164,11 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 }
 
 func (c *Client) hello(includeToken bool) rpc.HelloFrame {
+	effective := c.cfg.EffectivePathRules()
+	rules := make([]rpc.PathRuleFrame, 0, len(effective))
+	for _, rule := range effective {
+		rules = append(rules, rpc.PathRuleFrame{Action: rule.Action, Path: rule.Path})
+	}
 	hello := rpc.HelloFrame{
 		Type:            "hello",
 		ProtocolVersion: rpc.ProtocolVersion,
@@ -172,6 +177,11 @@ func (c *Client) hello(includeToken bool) rpc.HelloFrame {
 		Platform:        c.platform,
 		DefaultCwd:      c.cfg.DefaultCwd,
 		Capabilities:    c.caps,
+		PathRules:       rules,
+		// Reported explicitly: an empty rule list and "this build does not report
+		// rules" must not look identical to the server, or the UI would show a
+		// misleading "not applied" badge against an older executor.
+		PathRulesUnrestricted: len(rules) == 0,
 	}
 	if includeToken {
 		hello.Token = c.cfg.Token

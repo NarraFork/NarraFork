@@ -28,6 +28,7 @@ import {
 	type PretextDocumentInput,
 	type PretextDocumentLoadOptions,
 } from "./pretext-document-loader";
+import { trimClockNow, trimLoadedHead } from "./vlist-head-trim";
 import { appendLoadedMessage } from "./vlist-message-append";
 import { removeLoadedMessages } from "./vlist-message-remove";
 import { replaceLoadedMessage } from "./vlist-message-replace";
@@ -545,6 +546,75 @@ export class PretextLayoutCoordinator {
 	}
 
 	/**
+	 * Drop the oldest loaded messages so a long session's window stays bounded.
+	 *
+	 * The exact list virtualizes its DOM but the DATA layer never shrank: within one
+	 * narrator session `input.messages` only grew, and every streaming delta rebuilds
+	 * the whole window, so per-frame cost rose linearly with history (measured: 3.4ms
+	 * at 90 messages, 35.7ms at 6000) along with the build products' memory.
+	 *
+	 * `resolveHeadTrim` owns WHEN this is allowed — notably never while a streaming
+	 * row is live, where a trim can destroy un-persisted output (see its "streaming"
+	 * rejection). This method only executes a decision already made.
+	 *
+	 * Unlike `removeMessages`, `oldestLoadedSeq` IS recomputed and `hasPrev` forced
+	 * true. The distinction is load-bearing and the two paths look deceptively alike:
+	 * a deletion does not change what the server holds, so its fetch bound stays put,
+	 * whereas a trim hands fetched history BACK and must retreat the cursor with it —
+	 * leaving it forward would make the next upward page start below the gap just
+	 * created, a hole no later fetch repairs. Same contract as `truncateInput` in
+	 * pretext-document-cache.ts.
+	 *
+	 * `messageVersion` stays fixed like every other in-place path (CONTRACT.md §4.5
+	 * constraint 2): the surviving rows' content did not change, so invalidating
+	 * their cached measurements would re-measure the whole window for nothing.
+	 *
+	 * Returns false when nothing was dropped, so the caller can skip its follow-up
+	 * work (the cache sweep) by result.
+	 */
+	trimHead(dropCount: number, getView?: () => PrependView): boolean {
+		if (!this.input || !this.lastBuildOptions) return false;
+		const result = trimLoadedHead(this.input.messages, dropCount);
+		if (result.messages === this.input.messages) return false;
+		this.input = {
+			...this.input,
+			messages: result.messages as TreeMessage[],
+			oldestLoadedSeq: result.oldestKeptSeq ?? this.input.oldestLoadedSeq,
+			// We dropped history we had already fetched, so older messages certainly
+			// exist upstream regardless of what the last page reported.
+			hasPrev: true,
+		};
+		// Same clock the shell's cooldown reads (see trimClockNow's note on mixing
+		// performance/Date epochs).
+		this.lastTrimAt = trimClockNow();
+		const view = getView?.();
+		const anchor =
+			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
+		const generation = ++this.generation;
+		this.commitLayout(
+			this.input,
+			this.lastBuildOptions,
+			anchor,
+			view?.viewportHeight ?? this.lastViewportHeight,
+			generation,
+		);
+		return true;
+	}
+
+	/**
+	 * When the most recent trim happened, or 0 if never.
+	 *
+	 * Read by the shell's first-screen fill loop, which re-fetches older pages while
+	 * pinned and short of canvas: without a cooldown a trim could be answered by an
+	 * immediate re-fetch, which re-grows the window, which permits the next trim —
+	 * a trim/refetch loop issuing a request per round. `resolveHeadTrim`'s height
+	 * factor is the primary guard; this is the second one.
+	 */
+	getLastTrimAt(): number {
+		return this.lastTrimAt;
+	}
+
+	/**
 	 * Apply a `message_updated` event IN PLACE when it is a trailing-block
 	 * truncation.
 	 *
@@ -661,6 +731,9 @@ export class PretextLayoutCoordinator {
 		this.narratorId = undefined;
 		this.loadingOlder = false;
 		this.streamingMessage = null;
+		// Cleared with the document: a stale timestamp would make the NEXT narrator's
+		// first-screen fill loop think it had just trimmed and skip a legitimate page.
+		this.lastTrimAt = 0;
 		this.current = { status: "idle" };
 		this.emit();
 	}
@@ -771,6 +844,9 @@ export class PretextLayoutCoordinator {
 	 * size its resize strategy from measurement rather than a guess.
 	 */
 	private lastBuildMs = 0;
+
+	/** Timestamp of the last `trimHead`; see {@link getLastTrimAt}. */
+	private lastTrimAt = 0;
 
 	/** Build the exact layout for the loaded input (shared by every commit path). */
 	private buildLayout(input: PretextDocumentInput, buildOptions: PretextLayoutBuildOptions) {

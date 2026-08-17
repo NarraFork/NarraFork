@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
+import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { requireChapterAccess } from "../lib/project-access";
 import {
 	gitCommitSchema,
@@ -253,7 +254,11 @@ gitRoutes.post("/:chapterId/git/commit", async (c) => {
 	const { worktreePath } = await resolveWorktree(chapterId);
 	const { message } = gitCommitSchema.parse(await c.req.json());
 
-	const sha = await gitService.commit(worktreePath, message);
+	const sha = await gitService.commit(
+		worktreePath,
+		message,
+		await resolveUserGitIdentityEnv(c.get("user").sub),
+	);
 
 	// Record commit
 	try {
@@ -312,7 +317,11 @@ gitRoutes.post("/:chapterId/git/stash", async (c) => {
 
 	switch (body.action) {
 		case "push":
-			await gitService.stash(worktreePath, body.message);
+			await gitService.stash(
+				worktreePath,
+				body.message,
+				await resolveUserGitIdentityEnv(c.get("user").sub),
+			);
 			break;
 		case "pop": {
 			const result = await gitService.stashPop(worktreePath);

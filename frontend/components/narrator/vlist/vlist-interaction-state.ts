@@ -12,12 +12,12 @@ export interface VListInteractionState {
 	 * the subagent-recovery card's checkboxes (where the set means "deselected"),
 	 * and a `reasoning-steps` element's step rows.
 	 *
-	 * ⚠️ NOT for the two traces that fold a live row list. See `expandedTraceRows`
+	 * ⚠️ NOT for the trace that folds a live row list. See `expandedTraceRows`
 	 * and `traceRowFoldChannel`.
 	 */
 	expandedRows: ReadonlyMap<string, ReadonlySet<number>>;
 	/**
-	 * KEY-addressed drill-down state for the two traces that fold a LIVE row list:
+	 * KEY-addressed drill-down state for the trace that folds a LIVE row list:
 	 * trace key → set of ROW KEYS. See `traceRowFoldChannel` for which kinds these
 	 * are and why the rest stay on `expandedRows`.
 	 *
@@ -208,14 +208,15 @@ export function toggleVListRow(
 /**
  * Trace kinds whose row fold is addressed by ROW KEY (`expandedTraceRows`).
  *
- * ONLY these two, because only these two can have a row INSERTED above an
- * existing one mid-stream: they fold reasoning rows and tool rows into one list,
- * and a live reasoning run grows by a row per step. Every other trace appends
- * only — a `reasoning-steps` element numbers step N as row N however many steps
- * follow — so its ordinals are
- * already stable and they stay on the index channel their adapter reads.
+ * ONLY `activity-trace`, because only it can have a row INSERTED above an
+ * existing one mid-stream: it folds reasoning rows and tool rows into one list,
+ * and a live reasoning run grows by a row per step — so an index stored for a
+ * tool row starts addressing a different row as the run writes another step.
+ * Every other trace appends only — a `reasoning-steps` element numbers step N as
+ * row N however many steps follow — so its ordinals are already stable and they
+ * stay on the index channel their adapter reads.
  */
-const KEY_ADDRESSED_TRACE_KINDS = new Set(["activity-trace", "tool-run-summary"]);
+const KEY_ADDRESSED_TRACE_KINDS = new Set(["activity-trace"]);
 
 /**
  * Which interaction channel one trace kind's row fold belongs in.

@@ -1941,10 +1941,13 @@ export const ReasoningBlock = memo(
 
 		// Render LOD layering. Streaming reasoning is always shown in full (live
 		// feedback); completed reasoning compresses by level:
-		//   L6/L5   → full (structured trace or collapsible block per user pref).
-		//   L4/L3   → structured: titles-only trace (steps can't expand);
-		//             non-structured: header only (body collapsed).
-		//   L2/L1   → a single "🧠 reasoning ×N" count line (click to expand).
+		//   L5/L4/L3 → structured: a step trace whose steps expand on click;
+		//              non-structured: header only (body collapsed / per user pref).
+		//   L2/L1    → a single "🧠 reasoning ×N" count line (click to expand).
+		//
+		// A structured trace is shape-identical at L3..L5 on purpose: a level that
+		// showed step titles whose bodies could not be opened gave the reader a list
+		// of promises.
 		const renderLod = useRenderLod();
 		const [lodReasoningOverride, setLodReasoningOverride] = useState(false);
 		// Reset on level change via compare-during-render (lint-clean, synchronous).
@@ -1955,7 +1958,10 @@ export const ReasoningBlock = memo(
 		}
 		const reasoningStepCount = structured ? segments.length : blocks.length;
 		const showReasoningCountLine = !streaming && renderLod <= 2 && !lodReasoningOverride;
-		const reasoningTitlesOnly = !streaming && (renderLod === 3 || renderLod === 4);
+		// A NON-structured run has no step titles to show, so the collapsing level
+		// leaves only its header. Structured runs are unaffected: their trace shows
+		// the titles and each step opens on its own (see the note above).
+		const reasoningCollapsedByLod = !streaming && renderLod === 3;
 
 		// --- Block ID, selection, swipe & context menu state ---
 		const rbInstanceId = useRef(nextRbInstanceId++);
@@ -2024,10 +2030,10 @@ export const ReasoningBlock = memo(
 		);
 
 		const handleToggle = () => {
-			// Under a collapsing level (L4/L3), an explicit tap is an override, not a
-			// change to the persisted preference — otherwise the level would just
-			// re-collapse the body on the next render.
-			if (reasoningTitlesOnly) {
+			// Under a collapsing level (a non-structured run at L3), an explicit tap is
+			// an override, not a change to the persisted preference — otherwise the
+			// level would just re-collapse the body on the next render.
+			if (reasoningCollapsedByLod) {
 				setLodReasoningOverride((v) => !v);
 				return;
 			}
@@ -2293,7 +2299,6 @@ export const ReasoningBlock = memo(
 					segments={segments}
 					streaming={traceStreaming}
 					persistKeyBase={persistKey}
-					titlesOnly={reasoningTitlesOnly}
 				/>
 				{partialEncryptedNotice}
 				{translatedText && rawText && (
@@ -2317,9 +2322,9 @@ export const ReasoningBlock = memo(
 		) : null;
 
 		// Non-structured reasoning: the header/body collapse follows the level —
-		// L6/L5 honour the user's `opened` pref, L4/L3 collapse to the header only
+		// L5/L4 honour the user's `opened` pref, L3 collapses to the header only
 		// unless the user explicitly toggles back open (`lodReasoningOverride`).
-		const effectiveReasoningOpened = reasoningTitlesOnly ? lodReasoningOverride : opened;
+		const effectiveReasoningOpened = reasoningCollapsedByLod ? lodReasoningOverride : opened;
 
 		return (
 			<>

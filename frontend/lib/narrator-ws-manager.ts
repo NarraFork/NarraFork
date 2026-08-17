@@ -173,13 +173,10 @@ const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const DISCONNECTED_THRESHOLD = 3;
 const CLIENT_PING_TIMEOUT_MS = 60_000;
-/**
- * Stop reconnecting after this many consecutive failures.
- * With exponential backoff capped at 30s this is roughly 25 minutes.
- */
-const MAX_RECONNECT_ATTEMPTS = 50;
 /** Server close code for "the session token that opened this socket expired". */
 const SESSION_EXPIRED_CLOSE_CODE = 4001;
+/** Server close code for graceful shutdown ("Going Away") — the common case is a restart. */
+const SERVER_SHUTDOWN_CLOSE_CODE = 1001;
 const WS_STATUS_ID = "narrator-global";
 const MAX_CATCH_UP_CURSORS = 100;
 /**
@@ -1412,13 +1409,20 @@ export class NarratorWSManager {
 			this.ws = null;
 			clearTimeout(this.pingTimeoutTimer);
 			this.pingTimeoutTimer = undefined;
-			// 1001 = Going Away — server is shutting down, don't reconnect.
-			this._setConnected(false, false, ev.code === 1001 ? true : this._disconnected);
-			if (ev.code === 1001) return;
+			this._setConnected(
+				false,
+				false,
+				ev.code === SERVER_SHUTDOWN_CLOSE_CODE ? true : this._disconnected,
+			);
+			// 1001 = Going Away — the server closed gracefully (shutdown / restart).
+			// A restart is by far the common case (auto-update, manual restart, crash
+			// supervisor), and it is usually back within seconds, so run a fresh
+			// backoff cycle instead of stranding the client until a visibility or
+			// network event happens to fire.
 			// 4001 = the session token this socket was opened with expired. HTTP
 			// sliding renewal has very likely already stored a fresh one, so retry
 			// immediately with whatever is in localStorage instead of backing off.
-			if (ev.code === SESSION_EXPIRED_CLOSE_CODE) {
+			if (ev.code === SESSION_EXPIRED_CLOSE_CODE || ev.code === SERVER_SHUTDOWN_CLOSE_CODE) {
 				this.reconnectAttempts = 0;
 			}
 			this._scheduleReconnect();
@@ -1436,14 +1440,13 @@ export class NarratorWSManager {
 			this._setConnected(false, false, true);
 			return;
 		}
-		if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-			// Give up — server is likely down for good.
-			this._setConnected(false, false, true);
-			return;
-		}
 		if (this.reconnectAttempts >= DISCONNECTED_THRESHOLD && !this._disconnected) {
 			this._setConnected(false, false, true);
 		}
+		// Never give up for good. The delay simply saturates at the 30s cap, so a
+		// long server outage (large update, maintenance, a machine that wakes after
+		// the client) still recovers on its own. A capped-interval probe is cheap;
+		// a silently dead message stream that needs a manual reconnect is not.
 		const delay = Math.min(
 			RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempts,
 			RECONNECT_MAX_DELAY_MS,
@@ -1806,8 +1809,25 @@ export class NarratorWSManager {
 				continue;
 			try {
 				entry.cb(data);
-			} catch {
-				// listener error — ignore
+			} catch (err) {
+				// A consumer that fails on a persisted-history frame has silently missed
+				// content while the version counters above already advanced — the next
+				// sync_check would compare equal and the server would never replay the
+				// lost frame. Drop the committed sync anchors so the following sync
+				// distrusts the local view and forces a catch-up / full reload, then
+				// nudge that sync immediately (gated internally by reconcile state).
+				console.warn(
+					`[NarratorWSManager] Listener failed on "${msgType}" for narrator ${narratorId}; ` +
+						"committed sync anchors were reset so the next sync re-fetches from the server.",
+					err,
+				);
+				if (narratorId && msgType && REALTIME_HISTORY_EVENT_TYPES.has(msgType)) {
+					this.clearCommittedCatchUpAnchor(narratorId);
+					const recoveryNarratorId = narratorId;
+					queueMicrotask(() => {
+						if (!this.cancelled) this.checkSync(recoveryNarratorId);
+					});
+				}
 			}
 		}
 	}

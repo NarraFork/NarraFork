@@ -20,6 +20,10 @@
  *     text signature cannot see a change that keeps the length and both ends
  *     (a typo fix in the middle of a long message is exactly that). The edit
  *     timestamp is the only field guaranteed to move on every edit.
+ *   - attachments — count, kinds and image dimensions, all of which change the
+ *     reserved block (see `attachmentsSignature`). A soft delete drops the
+ *     attachments, so the `deleted` flag alone would NOT distinguish the two
+ *     states' heights.
  *
  * `seq` is deliberately absent: it never changes for a given id.
  *
@@ -29,7 +33,11 @@
  */
 
 import type { ChatMessageMeasureData, MeasuredChatMessage } from "./measure-chat-message";
-import { measureChatMessage, preparedChatBlocks } from "./measure-chat-message";
+import {
+	attachmentsSignature,
+	measureChatMessage,
+	preparedChatBlocks,
+} from "./measure-chat-message";
 
 /**
  * Cache ceiling. One entry per (message, width) pair, so a room scrolled at two
@@ -70,10 +78,16 @@ export interface ChatMeasureIdentity extends ChatMessageMeasureData {
 }
 
 function buildKey(identity: ChatMeasureIdentity, outerWidth: number): string {
-	const flags = `${identity.deleted ? "d" : "-"}${identity.grouped ? "g" : "-"}`;
+	// `hasReply` joins the flags rather than riding on the preview signature: a reply
+	// to a deleted message has an EMPTY preview but still reserves the strip, so the
+	// preview alone cannot separate "reply, no text" from "not a reply".
+	const flags = `${identity.deleted ? "d" : "-"}${identity.grouped ? "g" : "-"}${
+		(identity.hasReply ?? !!identity.replyPreview?.trim()) ? "q" : "-"
+	}`;
 	const reply = identity.replyPreview?.trim() ? textSignature(identity.replyPreview) : "";
 	const edited = identity.editedAt ?? "";
-	return `${identity.id}|${outerWidth}|${flags}|e${edited}|r${reply}|t${textSignature(identity.text)}`;
+	const attachments = attachmentsSignature(identity.attachments);
+	return `${identity.id}|${outerWidth}|${flags}|e${edited}|r${reply}|a${attachments}|t${textSignature(identity.text)}`;
 }
 
 /** Measure with memoisation. Identical inputs always return the same object. */
@@ -91,6 +105,9 @@ export function measureChatMessageCached(
 		return hit;
 	}
 	const measured = measureChatMessage(identity, outerWidth, {
+		// An empty body needs no parse regardless of why it is empty (deleted, or an
+		// attachment-only message), and `measureChatMessage` distinguishes those two
+		// cases itself from `deleted` + `attachments`.
 		preparedBlocks:
 			identity.deleted || !identity.text.trim() ? [] : preparedChatBlocks(identity.text),
 	});

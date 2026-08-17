@@ -22,6 +22,7 @@
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
 import {
 	accumulateFrame,
+	DEFAULT_RENDER_LOD,
 	type MeasuredElement,
 	type PreparedInlineBlock,
 	type RenderLod,
@@ -119,7 +120,7 @@ export function webSearchChromeLeft(isSearching: boolean): number {
 export function measureWebSearch(
 	block: WebSearchBlockData,
 	contentWidth: number,
-	_lod: RenderLod = 5,
+	_lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredElement {
 	const query = resolveWebSearchQuery(block);
 	const isSearching = isWebSearchSearching(block);
@@ -184,7 +185,8 @@ export function measureWebSearch(
 export function prepareWebSearchMeasurer(
 	block: WebSearchBlockData,
 ): (contentWidth: number, lod?: RenderLod) => MeasuredElement {
-	return (contentWidth: number, lod: RenderLod = 5) => measureWebSearch(block, contentWidth, lod);
+	return (contentWidth: number, lod: RenderLod = DEFAULT_RENDER_LOD) =>
+		measureWebSearch(block, contentWidth, lod);
 }
 
 export const MEASURE_WEB_SEARCH_CONSTANTS = {

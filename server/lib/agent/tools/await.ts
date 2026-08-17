@@ -192,6 +192,9 @@ export const awaitTool: ToolDefinition = {
 						kind: "await",
 						awaitType: "agent",
 						targetId: id,
+						// Readable name for the header/badges; `subagentId` stays the real
+						// narrator id so the card can still open its session.
+						targetLabel: result.label,
 						resolvedId: result.id,
 						subagentId: result.id,
 						status: result.status,
@@ -232,12 +235,18 @@ export const awaitTool: ToolDefinition = {
 						combinedSignal,
 					);
 			const status = relabel(result.status);
+			// A bash task id is a nanoid too, so the alias is the readable handle. Bash
+			// always registers one; if a row somehow lacks it, keep the full id rather
+			// than inventing a prefix — unlike a subagent id, a task id is looked up by
+			// exact match (`getById`/`getByAlias`), so a prefix would not resolve.
+			const taskLabel = task.alias ?? taskId;
 			return {
-				output: formatResult(taskId, status, result.output),
+				output: formatResult(taskLabel, status, result.output),
 				metadata: {
 					kind: "await",
 					awaitType: "bash",
 					targetId: id,
+					targetLabel: taskLabel,
 					resolvedId: taskId,
 					status,
 					waitForText: wait_for_text,
@@ -257,6 +266,10 @@ export const awaitTool: ToolDefinition = {
 	},
 };
 
+/**
+ * Wording for a bash Await. `taskId` is the readable handle the model should
+ * reuse as a selector (the task's alias when it has one), not the raw nanoid.
+ */
 export function formatResult(taskId: string, status: string, output: string | null): string {
 	switch (status) {
 		case "running":

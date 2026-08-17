@@ -41,6 +41,7 @@ import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import type { PluginDockPanelProps } from "../../plugins/types";
 import type {
 	FilePanelParams,
+	KnowledgePanelParams,
 	NarratorBoundPanelParams,
 	SubagentPanelParams,
 } from "../panels/panel-kind";
@@ -78,6 +79,11 @@ const GitPanel = lazy(() =>
 );
 const FileViewerContent = lazy(() =>
 	import("../file-viewer/FileViewerContent").then((m) => ({ default: m.FileViewerContent })),
+);
+const KnowledgeEntryPanelContent = lazy(() =>
+	import("../knowledge/KnowledgeEntryPanelContent").then((m) => ({
+		default: m.KnowledgeEntryPanelContent,
+	})),
 );
 const LazyPluginDockPanel = lazy(() =>
 	import("../../plugins/PluginDockPanel").then((m) => ({ default: m.PluginDockPanel })),
@@ -156,13 +162,17 @@ function ToolPanelHeader({
 			<Text size="sm" fw={600} truncate style={{ flex: 1 }}>
 				{title}
 			</Text>
+			{/* `nodrag` on the interactive parts, matching the pointerdown guard above but
+			    for React Flow: when this header is a detached canvas node's dragHandle,
+			    RF's drag filter is purely class-based and would otherwise start a node
+			    drag from a button, since the button is a descendant of the handle. */}
 			{actions ? (
-				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+				<Group className="nodrag" gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
 					{actions}
 				</Group>
 			) : null}
 			<Tooltip label="Close" withinPortal>
-				<ActionIcon size="sm" variant="subtle" color="gray" onClick={onClose}>
+				<ActionIcon className="nodrag" size="sm" variant="subtle" color="gray" onClick={onClose}>
 					<IconX size={16} />
 				</ActionIcon>
 			</Tooltip>
@@ -177,6 +187,8 @@ function ToolPanelShell({
 	actions,
 	props,
 	subjectId,
+	detachKind,
+	resourceId,
 	children,
 }: {
 	title: string;
@@ -187,9 +199,22 @@ function ToolPanelShell({
 	// biome-ignore lint/suspicious/noExplicitAny: shell is params-agnostic
 	props: IDockviewPanelProps<any>;
 	subjectId: string;
+	/**
+	 * The panel's kind, stamped onto header drags so a consumer can rebuild this
+	 * panel elsewhere — the story-network canvas uses it to tear the panel out into
+	 * its own node. Omit for panels that must not be detached.
+	 */
+	detachKind?: string;
+	/** Resource identity for multi-instance kinds (subagent id, file path). */
+	resourceId?: string;
 	children: React.ReactNode;
 }) {
-	const onPointerDown = usePanelHeaderDrag(props, subjectId, "tool");
+	const onPointerDown = usePanelHeaderDrag(
+		props,
+		subjectId,
+		"tool",
+		detachKind ? { toolKind: detachKind, ...(resourceId ? { resourceId } : {}) } : undefined,
+	);
 	const close = useCallback(() => props.api.close(), [props.api]);
 	return (
 		<Box style={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -245,8 +270,18 @@ export interface SubagentSessionPanelContentProps {
 	compact: boolean;
 	onClose: () => void;
 	onHeaderPointerDown?: (event: React.PointerEvent) => void;
-	onViewSubagentSession?: (narratorId: string) => void;
+	onViewSubagentSession?: (narratorId: string, messageId?: string) => void;
 	onTitleChange?: (title: string) => void;
+	/**
+	 * Scroll to and flash this message on mount — set when the panel was opened from
+	 * a row that points at one specific thing this child said.
+	 *
+	 * Paired with `highlightRequestId` so a repeat click on an already-open panel
+	 * jumps again: `NarratorPanel` latches the jump per (narrator, target), and
+	 * remounting on a changed token is what re-arms that latch.
+	 */
+	highlightMessageId?: string;
+	highlightRequestId?: string;
 }
 
 /** Full child-narrator session rendered inside a secondary dock panel. */
@@ -257,6 +292,8 @@ export function SubagentSessionPanelContent({
 	onHeaderPointerDown,
 	onViewSubagentSession,
 	onTitleChange,
+	highlightMessageId,
+	highlightRequestId,
 }: SubagentSessionPanelContentProps) {
 	const navigate = useNavigate();
 	const { data: narrator } = useNarrator(subagentNarratorId);
@@ -306,7 +343,21 @@ export function SubagentSessionPanelContent({
 		<NarratorDockContext.Provider value={null}>
 			<LazyPanelBoundary>
 				<NarratorPanel
-					key={subagentNarratorId}
+					/*
+					 * The request token joins the key so a repeat jump into an ALREADY-OPEN
+					 * panel actually moves. `NarratorPanel` latches its deep-link jump per
+					 * (narrator, target) — deliberately, so it does not fight the reader's own
+					 * scrolling — which means passing the same target again is a no-op. A new
+					 * token remounts the session, re-arming the latch.
+					 *
+					 * Remounting is acceptable precisely because the reader ASKED to be taken
+					 * somewhere: whatever scroll position is discarded is the position they are
+					 * navigating away from. Without the token in the key, the second click on a
+					 * speaker row would look broken.
+					 */
+					key={
+						highlightRequestId ? `${subagentNarratorId}:${highlightRequestId}` : subagentNarratorId
+					}
 					narratorId={subagentNarratorId}
 					narrator={narrator}
 					compact={compact}
@@ -314,17 +365,28 @@ export function SubagentSessionPanelContent({
 					onHeaderPointerDown={onHeaderPointerDown}
 					onOpenStandalonePage={openStandalone}
 					onViewSubagentSession={onViewSubagentSession}
+					highlightMessageId={highlightMessageId}
 				/>
 			</LazyPanelBoundary>
 		</NarratorDockContext.Provider>
 	);
 }
 
-function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
+/**
+ * Exported so a detached canvas node can reuse this adapter verbatim. Rendering
+ * `SubagentSessionPanelContent` directly there would silently drop the header
+ * drag wiring below (`onHeaderPointerDown` is optional on that component), leaving
+ * a detached subagent panel with no way to be moved or dragged back into a dock.
+ */
+export function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 	const hostDock = useNarratorDockContext();
 	const { ref, compact } = usePanelCompact();
 	const close = useCallback(() => props.api.close(), [props.api]);
-	const onHeaderPointerDown = usePanelHeaderDrag(props, props.params.subagentNarratorId, "tool");
+	const onHeaderPointerDown = usePanelHeaderDrag(props, props.params.subagentNarratorId, "tool", {
+		toolKind: "subagent",
+		// Multi-instance: the child narrator is this panel's resource identity.
+		resourceId: props.params.subagentNarratorId,
+	});
 	const handleTitleChange = useCallback(
 		(title: string) => {
 			if (title !== props.api.title) props.api.setTitle(title);
@@ -341,6 +403,8 @@ function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 				onHeaderPointerDown={onHeaderPointerDown}
 				onViewSubagentSession={hostDock?.openSubagentPanel}
 				onTitleChange={handleTitleChange}
+				highlightMessageId={props.params.highlightMessageId}
+				highlightRequestId={props.params.highlightRequestId}
 			/>
 		</Box>
 	);
@@ -390,6 +454,7 @@ export function TerminalDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			icon={<IconTerminal2 size={16} color="var(--mantine-color-dimmed)" />}
 			props={props}
 			subjectId="__terminal__"
+			detachKind="terminal"
 		>
 			<Suspense
 				fallback={
@@ -535,6 +600,7 @@ export function SpecDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParam
 			icon={<IconNotebook size={16} color="var(--mantine-color-indigo-4)" />}
 			props={props}
 			subjectId="__spec__"
+			detachKind="spec"
 		>
 			<LazyPanelBoundary>
 				<SpecPanel narratorId={narratorId} onClose={close} chromeless />
@@ -561,7 +627,13 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 
 	if (!chapterId) {
 		return (
-			<ToolPanelShell title={t("panel.title")} icon={icon} props={props} subjectId="__git__">
+			<ToolPanelShell
+				title={t("panel.title")}
+				icon={icon}
+				props={props}
+				subjectId="__git__"
+				detachKind="git"
+			>
 				<Center h="100%">
 					<Text size="sm" c="dimmed">
 						No chapter
@@ -571,7 +643,13 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 		);
 	}
 	return (
-		<ToolPanelShell title={t("panel.title")} icon={icon} props={props} subjectId="__git__">
+		<ToolPanelShell
+			title={t("panel.title")}
+			icon={icon}
+			props={props}
+			subjectId="__git__"
+			detachKind="git"
+		>
 			<LazyPanelBoundary>
 				<GitPanel chapterId={chapterId} />
 			</LazyPanelBoundary>
@@ -609,6 +687,7 @@ export function BrowserDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPa
 			actions={actions}
 			props={props}
 			subjectId="__browser__"
+			detachKind="browser"
 		>
 			<LazyPanelBoundary>
 				<BrowserPanel
@@ -644,6 +723,7 @@ export function TasksDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPara
 			icon={icon}
 			props={props}
 			subjectId="__tasks__"
+			detachKind="tasks"
 		>
 			<LazyPanelBoundary>
 				<BackgroundTasksPanel narratorId={narratorId} chromeless />
@@ -673,6 +753,7 @@ export function SearchDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPar
 			icon={<IconSearch size={16} color="var(--mantine-color-dimmed)" />}
 			props={props}
 			subjectId="__search__"
+			detachKind="search"
 		>
 			<LazyPanelBoundary>
 				<NarratorSearchPanel narratorId={narratorId} />
@@ -699,6 +780,7 @@ export function UserChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			icon={<IconMessages size={16} color="var(--mantine-color-blue-4)" />}
 			props={props}
 			subjectId="__userchat__"
+			detachKind="userchat"
 		>
 			<LazyPanelBoundary>
 				<NarratorUserChatPanel narratorId={narratorId} />
@@ -767,9 +849,59 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 			icon={<IconFileText size={16} color="var(--mantine-color-dimmed)" />}
 			props={props}
 			subjectId={`__file__:${filePath}`}
+			detachKind="file"
+			// Multi-instance: the path is what identifies WHICH file viewer this is, so
+			// a torn-out panel can be rebuilt pointing at the same file.
+			resourceId={filePath}
 		>
 			<LazyPanelBoundary>
 				<FileViewerContent key={filePath} filePath={filePath} />
+			</LazyPanelBoundary>
+		</ToolPanelShell>
+	);
+}
+
+// ── Knowledge entry (multi-instance, one panel per entry) ──
+export function KnowledgeDockPanel(props: IDockviewPanelProps<KnowledgePanelParams>) {
+	const { t } = useTranslation("knowledge");
+	const { entryId, scope } = props.params;
+
+	const close = useCallback(() => props.api.close(), [props.api]);
+
+	useLayoutEffect(() => {
+		// Title will be updated by the content component once loaded; start generic.
+		const fallback = t("panel.title");
+		if (!props.api.title || props.api.title === "Knowledge") props.api.setTitle(fallback);
+	}, [t, props.api]);
+
+	if (!entryId) {
+		return (
+			<ToolPanelShell
+				title={t("panel.title")}
+				icon={<IconNotebook size={16} color="var(--mantine-color-dimmed)" />}
+				props={props}
+				subjectId="__knowledge__"
+			>
+				<Center h="100%">
+					<Text size="sm" c="dimmed">
+						{t("panel.notFound")}
+					</Text>
+				</Center>
+			</ToolPanelShell>
+		);
+	}
+
+	return (
+		<ToolPanelShell
+			title={t("panel.title")}
+			icon={<IconNotebook size={16} color="var(--mantine-color-dimmed)" />}
+			props={props}
+			subjectId={`__knowledge__:${entryId}`}
+			detachKind="knowledge"
+			resourceId={entryId}
+		>
+			<LazyPanelBoundary>
+				<KnowledgeEntryPanelContent key={entryId} entryId={entryId} scope={scope} onClose={close} />
 			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
@@ -793,6 +925,7 @@ export const narratorDockComponents: Record<
 	userchat: UserChatDockPanel,
 	subagent: SubagentDockPanel,
 	file: FileDockPanel,
+	knowledge: KnowledgeDockPanel,
 	plugin: PluginDockPanel,
 	// TEMPORARY (see ../mock/README-REMOVAL.md).
 	mock: MockDockPanel,

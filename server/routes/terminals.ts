@@ -1,11 +1,7 @@
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
 import { requireNarratorAccess } from "../lib/narrator-access";
-import {
-	createTerminalSchema,
-	updateTerminalGraphStateSchema,
-	updateTerminalViewStateSchema,
-} from "../lib/validators";
+import { createTerminalSchema, updateTerminalViewStateSchema } from "../lib/validators";
 import { requireAuth } from "../middleware/auth";
 import { terminalService } from "../services/terminal-service";
 import { terminalViewService } from "../services/terminal-view-service";
@@ -110,11 +106,9 @@ terminalRoutes.patch("/:id", async (c) => {
 		await terminalService.rename(id, name.trim());
 	}
 
-	// Graph state update
-	const parsed = updateTerminalGraphStateSchema.safeParse(body);
-	if (parsed.success && Object.keys(parsed.data).length > 0) {
-		await terminalService.updateGraphState(id, parsed.data);
-	}
+	// Graph-state updates used to be accepted here, for terminals shown as their own
+	// canvas nodes. That node type is gone — a chapter's terminals live in its dock's
+	// terminal panel — so the route now only renames.
 
 	const terminal = await terminalService.getById(id);
 	return c.json(terminal);

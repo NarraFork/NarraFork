@@ -388,5 +388,13 @@
 	"reviewScopeCollectionsHint": "New standalone entries submitted to these collections come to you.",
 	"reviewScopeOwnedHint_one": "You also review proposals on the 1 entry you own.",
 	"reviewScopeOwnedHint_other": "You also review proposals on the {{count}} entries you own.",
-	"reviewScopeTruncated": "Partial list (too many to show all)."
+	"reviewScopeTruncated": "Partial list (too many to show all).",
+
+	"panel.title": "Knowledge",
+	"panel.notFound": "Entry not found or inaccessible.",
+	"panel.openFull": "Open in full page",
+	"panel.unsavedTitle": "Unsaved changes",
+	"panel.unsavedMessage": "You have unsaved edits. Discard them?",
+	"panel.discardConfirm": "Discard",
+	"panel.keepEditing": "Keep editing"
 }

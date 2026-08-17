@@ -6,7 +6,7 @@
  * offset the measure layer resolved — zero DOM measurement.
  *
  * Visual parity targets (NOT imported — this is an isolated vlist copy):
- *   CollapsibleTrace.tsx / ToolRunSummary.tsx / ActivityTrace.tsx /
+ *   CollapsibleTrace.tsx / ActivityTrace.tsx /
  *   ReasoningCountLine.tsx / ReasoningStepsTrace.tsx.
  *
  * The header icon / colour is chosen from the measured `variant` (tool traces
@@ -41,6 +41,7 @@ import {
 	type ToolShimmerFlash,
 	type ToolShimmerKind,
 	TRACE_SHIMMER_CLASS,
+	TRACE_SHIMMER_FLASH_HOLD_MS,
 } from "@shared/tool-shimmer";
 import {
 	IconBrain,
@@ -50,6 +51,7 @@ import {
 	IconTool,
 } from "@tabler/icons-react";
 import { useEffect, useRef, useState } from "react";
+import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
 import type { ToolCategory } from "../measure/measure-tool-call";
 import {
 	type MeasuredCollapsibleTrace,
@@ -69,7 +71,7 @@ import {
 	type TraceVariant,
 } from "../measure/measure-tool-run";
 import { categoryIcon } from "./category-icons";
-import { activateOnKey } from "./key-activate";
+import { activateOnKey, swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
 import {
@@ -251,6 +253,9 @@ export function RenderToolRun({
 				wrap="nowrap"
 				align="center"
 				py={TRACE_HEADER_PADDING_Y}
+				// Selectable surface: the row interaction wrapper ignores role="button"
+				// targets, so mark the header as part of the block's selection region.
+				{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
 				role={header.hasChevron ? "button" : undefined}
 				tabIndex={header.hasChevron ? 0 : undefined}
 				aria-expanded={header.hasChevron ? header.opened : undefined}
@@ -263,7 +268,10 @@ export function RenderToolRun({
 					cursor: header.hasChevron ? "pointer" : "default",
 					userSelect: "none",
 				}}
-				onClick={header.hasChevron ? onToggleItems : undefined}
+				// A modified click selects the block; only a plain click toggles the rows.
+				onClick={
+					header.hasChevron && onToggleItems ? swallowSelectionClick(onToggleItems) : undefined
+				}
 				onKeyDown={header.hasChevron && onToggleItems ? activateOnKey(onToggleItems) : undefined}
 			>
 				{header.hasChevron ? (
@@ -291,6 +299,7 @@ export function RenderToolRun({
 					wrap="nowrap"
 					align="center"
 					py={TRACE_ROW_PADDING_Y}
+					{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
 					role="button"
 					tabIndex={0}
 					aria-expanded={toggle.showEarlier}
@@ -303,7 +312,8 @@ export function RenderToolRun({
 						cursor: "pointer",
 						userSelect: "none",
 					}}
-					onClick={onToggleEarlier}
+					// A modified click selects the block; only a plain click reveals rows.
+					onClick={onToggleEarlier ? swallowSelectionClick(onToggleEarlier) : undefined}
 					onKeyDown={onToggleEarlier ? activateOnKey(onToggleEarlier) : undefined}
 				>
 					<Box style={chevronSlotStyle}>
@@ -344,8 +354,15 @@ const chevronSlotStyle: React.CSSProperties = {
 	flexShrink: 0,
 };
 
-/** How long a one-shot outcome sweep stays on a row (600ms animation + a margin). */
-const ROW_FLASH_MS = 650;
+/**
+ * How long a one-shot outcome sweep stays on a row.
+ *
+ * From `@shared/tool-shimmer` so this path, the chunk path and the stylesheet cannot
+ * disagree: dropping the class before the animation ends cuts the highlight off
+ * wherever it happens to be, and the row shimmer has already shipped looking broken
+ * in exactly that way.
+ */
+const ROW_FLASH_MS = TRACE_SHIMMER_FLASH_HOLD_MS;
 
 /**
  * The shimmer STATE of one row, or null for a quiet row.
@@ -569,6 +586,10 @@ function TraceRowView({
 	const titleRow = (
 		<Group
 			data-nf-trace-titlerow
+			// Selectable surface: the row interaction wrapper (TraceRowInteraction)
+			// ignores role="button" targets, so mark the title line as part of the
+			// row's selection region — a modified click here selects the row's block.
+			{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
 			gap={TRACE_ROW_GAP}
 			wrap="nowrap"
 			align="center"
@@ -807,6 +828,7 @@ export function RenderTraceCountLine({
 			wrap="nowrap"
 			align="center"
 			py={TRACE_HEADER_PADDING_Y}
+			{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
 			role={onExpand ? "button" : undefined}
 			tabIndex={onExpand ? 0 : undefined}
 			aria-expanded={onExpand ? false : undefined}
@@ -815,7 +837,8 @@ export function RenderTraceCountLine({
 				cursor: onExpand ? "pointer" : "default",
 				userSelect: "none",
 			}}
-			onClick={onExpand}
+			// A modified click selects the block; only a plain click expands the trace.
+			onClick={onExpand ? swallowSelectionClick(onExpand) : undefined}
 			onKeyDown={onExpand ? activateOnKey(onExpand) : undefined}
 		>
 			<ThemeIcon size={TRACE_HEADER_ICON} variant="light" color={countLineColor(kind)} radius="sm">

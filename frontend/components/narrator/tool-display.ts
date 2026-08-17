@@ -196,6 +196,7 @@ import {
 	type SubagentToolInputSummary,
 	subagentSummaryToPartialInput,
 } from "@shared/subagent-tool-summary";
+import { agentTargetDisplay, formatAgentIdForDisplay } from "./agent-id-display";
 
 function extractStringArrayField(val: unknown, key: string): string[] {
 	if (!val || isTruncated(val) || typeof val !== "object") return [];
@@ -368,14 +369,19 @@ export function getSummary(
 		}
 		case "await": {
 			const awaitType = extractField(input, "type") || "task";
-			const id = extractField(input, "id") || "unknown";
+			// Prefer the server-resolved alias; a bare nanoid selector is truncated.
+			const id =
+				agentTargetDisplay(
+					metadata?.targetLabel as string | undefined,
+					extractField(input, "id"),
+				) || "unknown";
 			const waitForText = extractField(input, "wait_for_text");
 			return waitForText
 				? `${awaitType}: ${id} · wait "${short(waitForText, 24)}"`
 				: `${awaitType}: ${id}`;
 		}
 		case "send": {
-			const targets = getSendTargetLabels(input);
+			const targets = getSendTargetLabels(input).map((target) => formatAgentIdForDisplay(target));
 			const targetLabel = targets.length === 1 ? targets[0] : `${targets.length} targets`;
 			const flags: string[] = [];
 			if (!isTruncated(input) && typeof input === "object" && input) {

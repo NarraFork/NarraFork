@@ -287,6 +287,35 @@ describe("saveNarratorDockLayout — identity stripping", () => {
 			subagentNarratorId: "subagent_1",
 		});
 	});
+
+	test("a one-shot jump request is stripped, so a restore does not replay it", () => {
+		// `highlightMessageId` records "the reader just clicked a row pointing here",
+		// which is true at click time only. Persisting it would make every later restore
+		// yank the reader to a message from a previous visit — away from wherever they
+		// had actually left the session. The RESOURCE identity beside it must survive.
+		const subagentPanelId = subagentDockPanelId("subagent_1");
+		const { api } = makeApi({
+			toJSON: fakeLayout([dockPanelId("chat"), subagentPanelId], {
+				[dockPanelId("chat")]: { panelType: "chat", narratorId: "narr_1" },
+				[subagentPanelId]: {
+					panelType: "subagent",
+					subagentNarratorId: "subagent_1",
+					highlightMessageId: "msg_42",
+					highlightRequestId: "h7",
+				},
+			}),
+		});
+		saveNarratorDockLayout(api, "narr_1", "desktop");
+
+		const loaded = loadNarratorDockLayout("narr_1", "desktop");
+		const panels = (
+			loaded as unknown as { panels: Record<string, { params?: Record<string, unknown> }> }
+		).panels;
+		expect(panels[subagentPanelId].params).toEqual({
+			panelType: "subagent",
+			subagentNarratorId: "subagent_1",
+		});
+	});
 });
 
 describe("cleanupStaleNarratorDockLayouts", () => {

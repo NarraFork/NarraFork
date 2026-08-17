@@ -23,8 +23,9 @@
  * without waiting for an update.
  */
 
-import { parseModelId } from "@shared/model-id";
+import { normalizeModelCardKey, volatileKeyCandidates } from "@shared/model-card";
 import { logger } from "./logger";
+import { BUILTIN_MODEL_CARDS } from "./model-cards/builtin";
 
 export interface ModelPricing {
 	/** USD per 1M input (uncached) tokens. */
@@ -55,257 +56,64 @@ export interface ResolvedModelPricing extends ModelPricing {
 	overridden: boolean;
 }
 
-/**
- * Suffixes that identify a dated snapshot or channel of the *same* model and
- * are therefore safe to strip before matching (`-2026-06-01`, `-20260601`,
- * `-260601`, `-latest`, `-preview`).
- *
- * Semantic suffixes (`-mini`, `-codex`, `-thinking`, `-fast`, `-max`, `-spark`)
- * are deliberately absent: stripping them would collapse a cheap variant onto
- * its far more expensive base model and silently inflate every cost figure.
- *
- * The numeric forms are constrained to plausible dates (`20` century for the
- * 8-digit form, months 01-12 for both) rather than "any 6 or 8 digits". Without
- * that, a name whose trailing digits are a *version* — `foo-202601`, `bar-5000`
- * — would be stripped, and if the reduced form happened to hit another table row
- * the request would be priced at the wrong rate instead of reported as unpriced.
- * Mispricing silently is worse than not pricing at all.
+/*
+ * The date/snapshot suffix rules and the key normalization used here now live in
+ * `@shared/model-card` (VOLATILE_SUFFIX_PATTERNS / volatileKeyCandidates /
+ * normalizeModelCardKey), because model cards need exactly the same matching.
+ * Keeping a second copy here would let the two drift, and a drift shows up as a
+ * model priced from one row while its window comes from another.
  */
-const VOLATILE_SUFFIX_PATTERNS: readonly RegExp[] = [
-	// 2026-06-01
-	/-\d{4}-(?:0[1-9]|1[0-2])-\d{2}$/,
-	// 20260601 — four-digit year starting with 20, then a real month.
-	/-20\d{2}(?:0[1-9]|1[0-2])\d{2}$/,
-	// 260601 — two-digit year, then a real month.
-	/-\d{2}(?:0[1-9]|1[0-2])\d{2}$/,
-	/-latest$/,
-	/-preview$/,
-];
-
-/** GPT / Codex rows. */
-const GPT_PRICING: readonly ModelPricingEntry[] = [
-	// GPT-5.6 family charges a separate cache-write fee (input × 1.25).
-	{
-		modelKey: "gpt-5.6-sol",
-		aliases: ["gpt-5.6"],
-		family: "gpt",
-		input: 5.0,
-		cacheWrite: 6.25,
-		cacheRead: 0.5,
-		output: 30.0,
-	},
-	{
-		modelKey: "gpt-5.6-terra",
-		family: "gpt",
-		input: 2.5,
-		cacheWrite: 3.125,
-		cacheRead: 0.25,
-		output: 15.0,
-	},
-	{
-		modelKey: "gpt-5.6-luna",
-		family: "gpt",
-		input: 1.0,
-		cacheWrite: 1.25,
-		cacheRead: 0.1,
-		output: 6.0,
-	},
-	// Pre-5.6 GPT rows: cached input is billed at a discount, no cache-write fee.
-	{ modelKey: "gpt-5.5", family: "gpt", input: 5.0, cacheWrite: 0, cacheRead: 0.5, output: 30.0 },
-	{ modelKey: "gpt-5.4", family: "gpt", input: 2.5, cacheWrite: 0, cacheRead: 0.25, output: 15.0 },
-	{
-		modelKey: "gpt-5.4-mini",
-		family: "gpt",
-		input: 0.75,
-		cacheWrite: 0,
-		cacheRead: 0.075,
-		output: 4.5,
-	},
-	{
-		modelKey: "gpt-5.3-codex",
-		family: "gpt",
-		input: 1.75,
-		cacheWrite: 0,
-		cacheRead: 0.175,
-		output: 14.0,
-	},
-	{
-		modelKey: "gpt-5.3-codex-spark",
-		family: "gpt",
-		input: 1.75,
-		cacheWrite: 0,
-		cacheRead: 0.175,
-		output: 14.0,
-	},
-	{
-		modelKey: "gpt-5.2",
-		family: "gpt",
-		input: 1.75,
-		cacheWrite: 0,
-		cacheRead: 0.175,
-		output: 14.0,
-	},
-	{
-		modelKey: "gpt-5.2-codex",
-		family: "gpt",
-		input: 1.75,
-		cacheWrite: 0,
-		cacheRead: 0.175,
-		output: 14.0,
-	},
-	{
-		modelKey: "gpt-5.1-codex",
-		family: "gpt",
-		input: 1.25,
-		cacheWrite: 0,
-		cacheRead: 0.125,
-		output: 10.0,
-	},
-	{
-		modelKey: "gpt-5.1-codex-max",
-		family: "gpt",
-		input: 1.25,
-		cacheWrite: 0,
-		cacheRead: 0.125,
-		output: 10.0,
-	},
-	{
-		modelKey: "gpt-5.1-codex-mini",
-		family: "gpt",
-		input: 0.25,
-		cacheWrite: 0,
-		cacheRead: 0.025,
-		output: 2.0,
-	},
-	{ modelKey: "gpt-4o", family: "gpt", input: 2.5, cacheWrite: 0, cacheRead: 1.25, output: 10.0 },
-	{
-		modelKey: "gpt-4o-mini",
-		family: "gpt",
-		input: 0.15,
-		cacheWrite: 0,
-		cacheRead: 0.075,
-		output: 0.6,
-	},
-];
 
 /**
- * Claude rows. Keys use the date-stripped canonical form; dated snapshot names
- * (`claude-opus-4-6-20260514`) match after suffix stripping.
+ * The priced rows, derived from the builtin model cards.
  *
- * The bare `claude-opus` / `claude-sonnet` / `claude-haiku` aliases exist
- * backward compatibility. They are pinned to the 4.5 rows — the generation they
- * instead of permanently inflating `unpricedRequestCount`. An operator who wants
- * a different generation can override the key.
+ * The prices used to live here as two literal arrays, duplicating the window and
+ * effort data that also described the same models. They are now one field on one
+ * card per model, and this table is projected from the cards that carry a price.
+ *
+ * Deriving rather than duplicating is the point: a hand-maintained copy drifts,
+ * and drift here is invisible — a model would be priced from one row while its
+ * context window came from another, with both numbers looking plausible.
+ *
+ * Cards with no `officialPricing` are skipped: they exist to describe a window or
+ * effort tiers, and inventing a zero price for them would report a real request
+ * as costing nothing instead of as unpriced.
  */
-const CLAUDE_PRICING: readonly ModelPricingEntry[] = [
-	{
-		modelKey: "claude-opus-4-8",
-		aliases: ["claude-opus-4.8"],
-		family: "claude",
-		input: 5.0,
-		cacheWrite: 6.25,
-		cacheRead: 0.5,
-		output: 25.0,
-	},
-	{
-		modelKey: "claude-opus-4-7",
-		aliases: ["claude-opus-4.7"],
-		family: "claude",
-		input: 5.0,
-		cacheWrite: 6.25,
-		cacheRead: 0.5,
-		output: 25.0,
-	},
-	{
-		modelKey: "claude-opus-4-6",
-		aliases: ["claude-opus-4.6"],
-		family: "claude",
-		input: 5.0,
-		cacheWrite: 6.25,
-		cacheRead: 0.5,
-		output: 25.0,
-	},
-	{
-		modelKey: "claude-opus-4-5",
-		aliases: ["claude-opus-4.5", "claude-opus"],
-		family: "claude",
-		input: 5.0,
-		cacheWrite: 6.25,
-		cacheRead: 0.5,
-		output: 25.0,
-	},
-	{
-		modelKey: "claude-sonnet-4-6",
-		aliases: ["claude-sonnet-4.6"],
-		family: "claude",
-		input: 3.0,
-		cacheWrite: 3.75,
-		cacheRead: 0.3,
-		output: 15.0,
-	},
-	{
-		modelKey: "claude-sonnet-4-5",
-		aliases: ["claude-sonnet-4.5", "claude-sonnet"],
-		family: "claude",
-		input: 3.0,
-		cacheWrite: 3.75,
-		cacheRead: 0.3,
-		output: 15.0,
-	},
-	{
-		modelKey: "claude-haiku-4-5",
-		aliases: ["claude-haiku-4.5", "claude-haiku"],
-		family: "claude",
-		input: 1.0,
-		cacheWrite: 1.25,
-		cacheRead: 0.1,
-		output: 5.0,
-	},
-	// Legacy 3.x rows, kept so historical requests still price out.
-	{
-		modelKey: "claude-3-7-sonnet",
-		aliases: ["claude-3.7-sonnet"],
-		family: "claude",
-		input: 3.0,
-		cacheWrite: 3.75,
-		cacheRead: 0.3,
-		output: 15.0,
-	},
-	{
-		modelKey: "claude-3-5-sonnet",
-		aliases: ["claude-3.5-sonnet"],
-		family: "claude",
-		input: 3.0,
-		cacheWrite: 3.75,
-		cacheRead: 0.3,
-		output: 15.0,
-	},
-	{
-		modelKey: "claude-3-5-haiku",
-		aliases: ["claude-3.5-haiku"],
-		family: "claude",
-		input: 0.8,
-		cacheWrite: 1.0,
-		cacheRead: 0.08,
-		output: 4.0,
-	},
-];
+function pricingEntriesFromCards(): ModelPricingEntry[] {
+	const entries: ModelPricingEntry[] = [];
+	for (const card of BUILTIN_MODEL_CARDS) {
+		const pricing = card.officialPricing;
+		if (!pricing) continue;
+		const input = pricing.input ?? 0;
+		const output = pricing.output ?? 0;
+		// A card whose price fields are all zero is not a priced card.
+		if (input <= 0 && output <= 0) continue;
+		entries.push({
+			modelKey: normalizeModelCardKey(card.modelKey),
+			...(card.aliases?.length ? { aliases: card.aliases } : {}),
+			family: card.family ?? "",
+			input,
+			output,
+			cacheRead: pricing.cacheRead ?? 0,
+			cacheWrite: pricing.cacheWrite ?? 0,
+		});
+	}
+	return entries;
+}
 
-export const MODEL_PRICING_TABLE: readonly ModelPricingEntry[] = [
-	...GPT_PRICING,
-	...CLAUDE_PRICING,
-];
+export const MODEL_PRICING_TABLE: readonly ModelPricingEntry[] = pricingEntriesFromCards();
 
 /**
  * Normalize a model identifier for lookup: strip any `provider:` prefix, lower
  * case it, and drop surrounding whitespace. Vendor-specific separators are left
  * alone — `gpt-5.4` and `gpt-5-4` are different strings and only the published
  * spelling is matched, with `aliases` covering the known alternates.
+ *
+ * Re-exported under the pricing name for the existing call sites; the
+ * implementation is shared with model cards so both resolve a given id the same
+ * way.
  */
-export function normalizeModelPricingKey(model?: string): string {
-	if (!model) return "";
-	return parseModelId(model.trim()).model.trim().toLowerCase();
-}
+export const normalizeModelPricingKey = normalizeModelCardKey;
 
 interface PricingIndex {
 	byKey: Map<string, ModelPricingEntry>;
@@ -326,30 +134,6 @@ function pricingIndex(): PricingIndex {
 	}
 	cachedIndex = { byKey, byAlias };
 	return cachedIndex;
-}
-
-/**
- * Progressively strip volatile date/snapshot suffixes, yielding each reduced
- * form. Applied repeatedly so `x-preview-2026-06-01` reduces step by step.
- */
-function volatileCandidates(key: string): string[] {
-	const seen = new Set<string>([key]);
-	const candidates: string[] = [];
-	let current = key;
-	// Bounded so a pathological name cannot spin here.
-	for (let round = 0; round < 4; round++) {
-		let reduced: string | undefined;
-		for (const pattern of VOLATILE_SUFFIX_PATTERNS) {
-			if (!pattern.test(current)) continue;
-			reduced = current.replace(pattern, "");
-			break;
-		}
-		if (!reduced || seen.has(reduced) || reduced.length === 0) break;
-		seen.add(reduced);
-		candidates.push(reduced);
-		current = reduced;
-	}
-	return candidates;
 }
 
 /**
@@ -434,7 +218,7 @@ export function resolveModelPricing(model?: string): ResolvedModelPricing | null
 	const candidates: Array<{ key: string; via: ResolvedModelPricing["matchedVia"] }> = [
 		{ key, via: "exact" },
 	];
-	for (const stripped of volatileCandidates(key)) {
+	for (const stripped of volatileKeyCandidates(key)) {
 		candidates.push({ key: stripped, via: "suffix-stripped" });
 	}
 

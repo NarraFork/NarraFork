@@ -269,13 +269,51 @@ export const chapters = sqliteTable(
 		color: text("color"),
 		groupLabel: text("group_label"),
 		pinned: integer("pinned").default(0),
-		// 位置坐标系：锚定到 commit + 轴上偏移 + 离轴距离
+		/**
+		 * Ruler 坐标系：锚定到 commit + 轴上偏移 + 离轴距离。
+		 *
+		 * 这三列**只属于 ruler**：`axisOffset`/`crossOffset` 是相对 `anchorCommitSha`
+		 * 对应刻度的偏移，绝对位置是 `tickPosition(anchorCommitSha) + axisOffset`。
+		 * 脱离锚点它们没有意义 —— ruler 的刻度间距是每个 commit 240px，历史较长的
+		 * 章节其刻度坐标轻易上万，直接当世界坐标读会把节点丢到视口外极远处。
+		 *
+		 * classic 画布不要读写这三列，用下面的 `graphX`/`graphY`。
+		 */
 		anchorCommitSha: text("anchor_commit_sha"),
 		axisOffset: real("axis_offset").default(0),
 		crossOffset: real("cross_offset").default(0),
+		/**
+		 * Classic 画布的绝对世界坐标（React Flow 的 x/y），与 ruler 的锚定偏移分列存放。
+		 *
+		 * 两套坐标必须分开，因为它们语义不同且不可互换：ruler 存的是相对刻度的偏移，
+		 * classic 存的是绝对坐标。历史上两者共用 `axisOffset`/`crossOffset`，导致在
+		 * ruler 里拖过卡片的项目切回 classic 后，节点被按绝对坐标丢到极远处 —— 表现为
+		 * `fitView` 把缩放压到极小、画布看起来整个空白（节点其实在渲染，只是小到看不见），
+		 * 并且缩放低于 `MIN_EFFECTIVE_ZOOM` 还会让展开节点的 dock 反复挂载卸载。
+		 *
+		 * null = 该章节在 classic 中还没有被手动摆放过，交给 dagre 自动布局。这与 0 有
+		 * 实质区别：0 是一个用户真的可以拖到的位置（原点），若用 0 表示"未摆放"，任何
+		 * 拖到原点附近的节点都会在下次加载时被自动布局重新弹走。
+		 */
+		graphX: real("graph_x"),
+		graphY: real("graph_y"),
 		panelExpanded: integer("panel_expanded").default(0),
 		panelWidth: real("panel_width"),
 		panelHeight: real("panel_height"),
+		/**
+		 * 展开节点内嵌 dockview 表面的布局（序列化 envelope）；null = 用默认布局（仅 chat 面板）。
+		 *
+		 * 大字段：列表/图查询的 columns 白名单里不要加它（图接口一次返回全项目章节），
+		 * 只有 `GET /api/chapters/:id/dock-layout` 读取。写入上限见 updateChapterDockLayoutSchema。
+		 */
+		dockLayoutJson: text("dock_layout_json"),
+		/**
+		 * 从该章节 dock 中拖出、以独立节点形式留在画布上的工具面板（序列化 envelope）；null = 没有。
+		 *
+		 * 与 dockLayoutJson 分列存放：后者是 dockview 自己的 SerializedDockview，
+		 * 把自定义条目混进去会破坏 fromJSON。同样是大字段，列表/图查询不要读。
+		 */
+		detachedPanelsJson: text("detached_panels_json"),
 
 		// Review 相关
 		// biome-ignore lint/suspicious/noExplicitAny: self-referencing FK
@@ -911,6 +949,22 @@ export const remoteDevices = sqliteTable(
 		agentVersion: text("agent_version"),
 		/** JSON: { git, ripgrep, pty, ... } capability flags reported at handshake. */
 		capabilitiesJson: text("capabilities_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		/**
+		 * Desired ordered path guard rules, as `[{ action, path }]`.
+		 *
+		 * A record of intent, NOT an enforcement point. The executor enforces the
+		 * rules in its own config file on the target machine, precisely so that a
+		 * compromised server cannot widen its own access. This column exists to let
+		 * the UI show what the operator configured, diff it against what the device
+		 * reports at handshake, and regenerate the config snippet.
+		 */
+		pathRulesJson: text("path_rules_json", { mode: "json" }).$type<
+			Array<{ action: "allow" | "deny"; path: string }>
+		>(),
+		/** Ordered rules the device reported enforcing at its last handshake. */
+		reportedPathRulesJson: text("reported_path_rules_json", { mode: "json" }).$type<
+			Array<{ action: "allow" | "deny"; path: string }>
+		>(),
 		// ── Authorization scope ──
 		//
 		// Two independent axes. `scope`/`projectId` is the project axis and keeps its
@@ -1449,6 +1503,14 @@ export const terminals = sqliteTable(
 			.notNull()
 			.default("running"),
 		exitCode: integer("exit_code"),
+		/**
+		 * 已停用（不再读写）：这五列服务于"把某个终端作为画布上的专用节点显示"，
+		 * 该节点类型已删除 —— 章节的终端现在都在其 dock 的终端面板里（自带多标签）。
+		 *
+		 * 保留而不删列：删列需要迁移，而它们不影响任何查询正确性，留着只是几个无人读取的
+		 * 字段；一旦删错则数据不可恢复。后续可单独做一次纯清理迁移，届时连带
+		 * `idx_terminals_chapter` 里的 `graphOpened` 一起处理。
+		 */
 		graphOpened: integer("graph_opened").notNull().default(0),
 		graphX: real("graph_x"),
 		graphY: real("graph_y"),
@@ -1906,6 +1968,32 @@ export const chatMessages = sqliteTable(
 		contentText: text("content_text").notNull(),
 		/** Quoted message in the same room. */
 		replyToMessageId: text("reply_to_message_id"),
+		/**
+		 * Denormalized snapshot of the quoted message, captured at post time.
+		 *
+		 * Deliberately NOT resolved by joining the target row. The quote strip has to
+		 * render even when the target is outside the loaded page window — a room is
+		 * paginated by `seq`, so a reply to something 300 messages back has nothing to
+		 * resolve against locally, and the previous behaviour reported that as "this
+		 * message was deleted". Joining instead would put an extra lookup on every
+		 * page fetch and still read the target's `content_text`, which the read paths
+		 * are built to avoid.
+		 *
+		 * `reply_to_seq` is the jump target: `seq` is the pagination cursor, so it is
+		 * what tells the client whether it must keep fetching older pages to reach the
+		 * quoted message.
+		 *
+		 * The AUTHOR is stored as a user id, not a username: a rename must not leave a
+		 * stale name frozen in every quote. The preview text is the one thing that IS
+		 * frozen, because "what they said when I quoted them" is the point of a quote.
+		 * Truncated to CHAT_REPLY_PREVIEW_SNAPSHOT_MAX_CHARS on write.
+		 *
+		 * All three are null for rows written before this existed; the client falls
+		 * back to resolving within the loaded window for those.
+		 */
+		replyToSeq: integer("reply_to_seq"),
+		replyToSenderUserId: text("reply_to_sender_user_id"),
+		replyToPreview: text("reply_to_preview"),
 		editedAt: text("edited_at"),
 		deletedAt: text("deleted_at"),
 		createdAt: text("created_at").notNull(),
@@ -1913,6 +2001,71 @@ export const chatMessages = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_chat_messages_room_seq").on(table.roomId, table.seq),
 		index("idx_chat_messages_sender").on(table.senderUserId),
+	],
+);
+
+// === chat_attachments ===
+// Images and files posted into a chat room.
+//
+// ## Two-phase (upload, then claim)
+//
+// A row is created by the UPLOAD, with `message_id` null, and claimed by the send.
+// The composer has to show a thumbnail before the message exists, so the file must
+// be persisted first; the alternative (holding bytes in memory until send) loses
+// them on a reload and cannot survive a multi-file selection.
+//
+// `claimed_at` distinguishes "draft" from "posted" for the cleanup path: an
+// unclaimed row older than a grace window is an abandoned upload and is reclaimed.
+//
+// ## Storage lives OUTSIDE any worktree
+//
+// Files go to `~/.narrafork/chat-attachments/<roomId>/`, never into a narrator's
+// worktree. A worktree is subject to tree-snapshot rollback, which deletes whatever
+// the target tree does not contain — an attachment written there would silently
+// vanish from chat history when someone reverted a narrator turn. Forwarding to a
+// narrator COPIES into `<cwd>/.narrafork/attached/` instead, so a rollback can only
+// affect the copy.
+export const chatAttachments = sqliteTable(
+	"chat_attachments",
+	{
+		id: text("id").primaryKey(),
+		roomId: text("room_id")
+			.notNull()
+			.references(() => chatRooms.id, { onDelete: "cascade" }),
+		/**
+		 * Owning message; null while the upload is still a draft.
+		 *
+		 * No FK: the row is created before the message exists, and a soft delete keeps
+		 * the message row anyway, so cascade semantics would add nothing. Orphan rows
+		 * are handled by the cleanup path instead.
+		 */
+		messageId: text("message_id"),
+		uploaderUserId: text("uploader_user_id").references(() => users.id, {
+			onDelete: "set null",
+		}),
+		kind: text("kind", { enum: ["image", "file"] }).notNull(),
+		filename: text("filename").notNull(),
+		mediaType: text("media_type").notNull(),
+		sizeBytes: integer("size_bytes").notNull(),
+		/**
+		 * Pixel dimensions, images only, parsed at upload time.
+		 *
+		 * Stored rather than measured in the browser because the chat list's height
+		 * contract is zero-DOM: the row height must be pure arithmetic, so the layer
+		 * that reserves space for a thumbnail needs the aspect ratio without loading
+		 * the image.
+		 */
+		width: integer("width"),
+		height: integer("height"),
+		/** On-disk filename (`<id><ext>`), relative to the room directory. */
+		storedName: text("stored_name").notNull(),
+		createdAt: text("created_at").notNull(),
+		claimedAt: text("claimed_at"),
+	},
+	(table) => [
+		index("idx_chat_attachments_message").on(table.messageId),
+		index("idx_chat_attachments_room_unclaimed").on(table.roomId, table.claimedAt),
+		index("idx_chat_attachments_uploader").on(table.uploaderUserId),
 	],
 );
 

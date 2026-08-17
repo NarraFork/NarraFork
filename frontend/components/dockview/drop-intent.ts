@@ -34,7 +34,12 @@ export interface GroupHit {
 	intent: DropIntent;
 	/** The active panel id of the target group (used for swap). */
 	targetPanelId: string | undefined;
-	/** Group bounding box relative to the dockview root (px). */
+	/**
+	 * Group bounding box relative to the dockview root, in the root's OWN layout
+	 * pixels (i.e. any ancestor `scale()` divided back out). Meant to be applied
+	 * directly as CSS on an overlay inside that root, which already inherits the
+	 * ancestor scale.
+	 */
 	box: { left: number; top: number; width: number; height: number };
 }
 
@@ -90,6 +95,18 @@ export function hitTestGroups(
 		const el = (group as unknown as { element?: HTMLElement }).element;
 		const rect = el?.getBoundingClientRect();
 		if (!rect) continue;
+		// How much an ancestor `transform: scale()` magnifies this surface. `offsetWidth`
+		// is the element's own unscaled layout width, while the client rect is what the
+		// user sees, so their ratio IS the effective scale (1 outside a zoomed canvas).
+		//
+		// This matters because the two things below live in DIFFERENT coordinate spaces:
+		// hit-testing compares viewport pointer coordinates against the scaled rect,
+		// but `boundingBox` is derived from client-rect deltas (so also scaled) and is
+		// consumed as CSS pixels by an overlay that is itself inside the scaled root —
+		// which would apply the zoom a second time. Report the box unscaled so the
+		// overlay lands exactly on the group at any zoom.
+		const scale = el && el.offsetWidth > 0 ? rect.width / el.offsetWidth : 1;
+		const unscale = Number.isFinite(scale) && scale > 0 ? 1 / scale : 1;
 		if (
 			clientX < rect.left ||
 			clientX > rect.right ||
@@ -128,7 +145,12 @@ export function hitTestGroups(
 			group,
 			intent,
 			targetPanelId,
-			box: { left: box.left, top: box.top, width: box.width, height: box.height },
+			box: {
+				left: box.left * unscale,
+				top: box.top * unscale,
+				width: box.width * unscale,
+				height: box.height * unscale,
+			},
 		};
 	}
 	return null;

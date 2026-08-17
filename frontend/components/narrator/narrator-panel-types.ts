@@ -137,8 +137,14 @@ export interface NarratorPanelProps {
 	onBack?: () => void;
 	/** Open this embedded narrator as a standalone route. */
 	onOpenStandalonePage?: () => void;
-	/** Delegate child-session opening to the current desktop/mobile host. */
-	onViewSubagentSession?: (narratorId: string) => void;
+	/**
+	 * Delegate child-session opening to the current desktop/mobile host.
+	 *
+	 * `messageId` asks the opened session to scroll to and flash that message; hosts
+	 * that cannot jump may ignore it. Callers that only know which child to open omit
+	 * it, which opens the session at its tail.
+	 */
+	onViewSubagentSession?: (narratorId: string, messageId?: string) => void;
 	/** When true, shows a skeleton overlay instead of messages (e.g. during node resize) */
 	isResizing?: boolean;
 	/** Called on pointerdown on the header bar — allows parent to initiate drag */

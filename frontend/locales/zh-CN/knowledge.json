@@ -385,5 +385,13 @@
 	"reviewScopeCollectionsLabel": "你可以发布内容的集合：",
 	"reviewScopeCollectionsHint": "提交到这些集合的新条目会分配给你审核。",
 	"reviewScopeOwnedHint_other": "你还可以审核自己拥有的 {{count}} 个条目上的提交。",
-	"reviewScopeTruncated": "列表已截断（数量过多，未全部显示）。"
+	"reviewScopeTruncated": "列表已截断（数量过多，未全部显示）。",
+
+	"panel.title": "知识库",
+	"panel.notFound": "条目未找到或无权访问。",
+	"panel.openFull": "在完整页面中打开",
+	"panel.unsavedTitle": "未保存的修改",
+	"panel.unsavedMessage": "你有未保存的编辑内容，确定放弃？",
+	"panel.discardConfirm": "放弃",
+	"panel.keepEditing": "继续编辑"
 }

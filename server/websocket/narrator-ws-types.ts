@@ -947,6 +947,31 @@ export type NarratorServerMessage =
 				kind: "text" | "system";
 				contentText: string;
 				replyToMessageId: string | null;
+				/**
+				 * The reply snapshot and attachment metadata travel WITH the frame.
+				 *
+				 * Omitting them would make a live-arriving reply render an empty quote
+				 * strip (and an attachment-only message render as blank) until something
+				 * else triggered a refetch — a defect visible only on the live path,
+				 * which is the path most messages take.
+				 */
+				replyToSeq: number | null;
+				replyToSender: {
+					id: string;
+					username: string;
+					avatarColor: string | null;
+					avatarImageId: string | null;
+				} | null;
+				replyToPreview: string | null;
+				attachments: Array<{
+					id: string;
+					kind: "image" | "file";
+					filename: string;
+					mediaType: string;
+					sizeBytes: number;
+					width: number | null;
+					height: number | null;
+				}>;
 				editedAt: string | null;
 				deletedAt: string | null;
 				createdAt: string;

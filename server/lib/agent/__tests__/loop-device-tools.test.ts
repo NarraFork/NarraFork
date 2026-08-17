@@ -18,7 +18,15 @@ describe("device tool visibility", () => {
 	test("shows both device tools when a remote device is online", () => {
 		expect(
 			visibleToolNames({
-				availableDevices: [{ id: "device-1", slug: "device-1", name: "Device One", online: true }],
+				availableDevices: [
+					{
+						id: "device-1",
+						slug: "device-1",
+						name: "Device One",
+						online: true,
+						scope: "global" as const,
+					},
+				],
 				defaultDeviceId: "device-1",
 			}),
 		).toEqual(["Read", "SwitchDevice", "TransferFile"]);
@@ -27,7 +35,15 @@ describe("device tool visibility", () => {
 	test("keeps SwitchDevice but hides TransferFile for a stale remote default", () => {
 		expect(
 			visibleToolNames({
-				availableDevices: [{ id: "device-1", slug: "device-1", name: "Device One", online: false }],
+				availableDevices: [
+					{
+						id: "device-1",
+						slug: "device-1",
+						name: "Device One",
+						online: false,
+						scope: "global" as const,
+					},
+				],
 				defaultDeviceId: "device-1",
 			}),
 		).toEqual(["Read", "SwitchDevice"]);

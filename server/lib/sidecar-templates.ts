@@ -7,14 +7,14 @@
  * are prompt text and belong with the rest of it in `./i18n`. This module is the
  * bridge — it hands the renderer a flat `{ key: template }` map.
  *
- * Its own reason to exist (rather than living in `./i18n`) is `tasksBlockedActionNote`:
- * that rule already exists as `getBlockedTaskActionInstruction` in
- * `./prompts/system-reminders`, and the Dynamic Spec digest must emit the SAME text
- * the system prompt uses. Pulling it in here keeps one copy of the rule instead of a
- * second one in the message table that could drift.
+ * It used to also splice in `getBlockedTaskActionInstruction` from
+ * `./prompts/system-reminders`, so the Dynamic Spec digest could repeat the
+ * blocked-task rule the system prompt already carries. That repetition is gone: the
+ * digest is a mid-turn injection on a tool-call cadence, and the rule is in the system
+ * prompt of every request anyway. The keys below are now resolved from one place.
  *
  * The map is memoized per locale: a working narrator renders side-cars on most tool
- * results, and rebuilding ~30 lookups each time is pointless.
+ * results, and rebuilding ~25 lookups each time is pointless.
  */
 
 import {
@@ -23,7 +23,6 @@ import {
 	type SideCarModelTemplates,
 } from "@shared/sidecar-body";
 import { type Locale, t } from "./i18n";
-import { getBlockedTaskActionInstruction } from "./prompts/system-reminders";
 
 /**
  * Keys resolved straight from the `sidecar.*` message table.
@@ -49,10 +48,6 @@ const MESSAGE_TABLE_KEYS = [
 	"tasksEmptyDoneContinue",
 	"tasksTooManyHeading",
 	"tasksTooManyReorganize",
-	"tasksTooManyProtected",
-	"tasksFieldsNote",
-	"tasksSemanticsNote",
-	"tasksProtectedOnlyOnUserDemand",
 	// knowledge
 	"knowledgeHeading",
 	"knowledgeReadHint",
@@ -96,9 +91,6 @@ export function getSideCarModelTemplates(locale: Locale): SideCarModelTemplates 
 	for (const key of MESSAGE_TABLE_KEYS) {
 		templates[key] = t(`sidecar.${key}`, locale);
 	}
-	// Shared with the system prompt — see the module header on why it is not a
-	// second entry in the message table.
-	templates.tasksBlockedActionNote = getBlockedTaskActionInstruction(locale);
 	cache.set(locale, templates);
 	return templates;
 }

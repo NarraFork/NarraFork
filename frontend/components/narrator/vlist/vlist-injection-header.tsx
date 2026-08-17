@@ -17,9 +17,14 @@
 
 import { NarratorAvatar } from "@frontend/components/narrator/NarratorAvatar";
 import { UserAvatar } from "@frontend/components/UserAvatar";
-import { Badge, Group, Text, ThemeIcon } from "@mantine/core";
+import { Badge, Box, Group, Text, ThemeIcon } from "@mantine/core";
+import {
+	coerceInjectionTarget,
+	type InjectionTarget,
+} from "@shared/pretext-layout/injection-target";
 import { PLATFORM_INJECTION_SOURCES as ADAPTER_PLATFORM_SOURCES } from "@shared/pretext-layout/segment-adapter";
 import { IconChecklist, IconSparkles, IconTerminal2 } from "@tabler/icons-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { VListElementKind } from "./registry";
 import type { RenderExtra } from "./render-registry";
@@ -121,6 +126,8 @@ export function InjectionSpeakerHeader({
 	isBroadcast,
 	creator,
 	source,
+	onOpenSession,
+	openSessionLabel,
 }: {
 	speaker?: string | null;
 	/**
@@ -146,6 +153,17 @@ export function InjectionSpeakerHeader({
 	creator?: BubbleCreator | null;
 	/** Producer tag, used only to recognize platform-authored rows. */
 	source?: string | null;
+	/**
+	 * Open the speaker's own session (and jump to the message this row refers to).
+	 *
+	 * Supplied only for rows whose speaker really has one — a subagent that sent a
+	 * message, a background AGENT that finished — and only by hosts that own a dockview
+	 * surface. Absent leaves the row inert rather than offering a control that does
+	 * nothing, the same rule the tool-card "open session" item follows.
+	 */
+	onOpenSession?: () => void;
+	/** Localized tooltip / aria label for that affordance. */
+	openSessionLabel?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	// Identity resolution, in priority order:
@@ -182,7 +200,7 @@ export function InjectionSpeakerHeader({
 				// alias). With no speaker, its SOURCE name still says what spoke — better than
 				// "unknown sender", which is only right when nothing identifies the row at all.
 				speaker?.trim() || sourceName || t("sidecar.body.messageFromUnknown");
-	return (
+	const row = (
 		<Group gap={6} wrap="nowrap" h="100%" align="center">
 			{/*
 			 * Four kinds of speaker, four kinds of avatar. All of them used to funnel into
@@ -251,6 +269,88 @@ export function InjectionSpeakerHeader({
 			) : null}
 		</Group>
 	);
+	if (!onOpenSession) return row;
+	return (
+		<OpenSessionHeaderLink label={openSessionLabel ?? name} onOpen={onOpenSession}>
+			{row}
+		</OpenSessionHeaderLink>
+	);
+}
+
+/**
+ * Makes a speaker row open its speaker's session.
+ *
+ * ## Why the whole row, and not an icon button beside the name
+ *
+ * The row IS the identity, and "who said this" / "show me where they said it" are one
+ * question — a separate control would put two affordances for one intent inside a lane
+ * that is exactly one line tall.
+ *
+ * ## Height neutrality is load-bearing
+ *
+ * The measure pass already committed `INJECTION_HEADER_HEIGHT` for this lane and never
+ * learns whether the row is a link, so the wrapper must add nothing to the box: it
+ * fills the reserved height (`height: 100%`) with no padding, no border, and hover
+ * feedback expressed as a background tint. An underline or a border would move the
+ * text baseline inside a box whose height is already fixed.
+ *
+ * Hover lives in React state rather than a CSS rule because this file owns no
+ * stylesheet — and a tint swap re-renders only this row's header, which paints the
+ * same geometry either way.
+ *
+ * A `role="button"` Box, not a real `<button>`: the row contains an avatar `<img>` and
+ * badges, and nesting interactive content inside a button is invalid HTML that browsers
+ * reparent. `SubagentActivityRow` refuses a `<button>` for exactly this reason (it
+ * wraps a timing popover trigger), so this follows the same precedent.
+ */
+function OpenSessionHeaderLink({
+	label,
+	onOpen,
+	children,
+}: {
+	label: string;
+	onOpen: () => void;
+	children: React.ReactNode;
+}) {
+	const [hovered, setHovered] = useState(false);
+	return (
+		<Box
+			role="button"
+			tabIndex={0}
+			aria-label={label}
+			title={label}
+			data-injection-open-session
+			onMouseEnter={() => setHovered(true)}
+			onMouseLeave={() => setHovered(false)}
+			onClick={(event) => {
+				// Modifier-clicks belong to the list's selection system (toggle / range), the
+				// same as every other block. Opening a panel on ⌘-click would steal a gesture
+				// the reader uses to build a selection.
+				if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+				// The bubble sits inside the selection surface; without this a click would
+				// both open the session and register as a block interaction.
+				event.stopPropagation();
+				event.preventDefault();
+				onOpen();
+			}}
+			onKeyDown={(event) => {
+				if (event.key !== "Enter" && event.key !== " ") return;
+				event.stopPropagation();
+				event.preventDefault();
+				onOpen();
+			}}
+			style={{
+				height: "100%",
+				cursor: "pointer",
+				borderRadius: 4,
+				background: hovered
+					? "light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-5))"
+					: "transparent",
+			}}
+		>
+			{children}
+		</Box>
+	);
 }
 
 /**
@@ -266,8 +366,14 @@ export function injectInjectionBubbleChrome(
 	kind: VListElementKind,
 	extra: RenderExtra,
 	noteText: string | undefined,
+	navigation?: InjectionNavigation,
 ): void {
 	if (kind !== "injection-bubble") return;
+	// Clickable only when BOTH exist: a resolvable target on the row, and a host that
+	// can actually reach it. Either half missing leaves the row inert rather than
+	// painting a live-looking control that does nothing.
+	const target = coerceInjectionTarget(extra.target);
+	const openSession = target ? resolveInjectionOpener(target, navigation) : undefined;
 	extra.header = (
 		<InjectionSpeakerHeader
 			speaker={(extra.speaker as string | null | undefined) ?? null}
@@ -276,7 +382,63 @@ export function injectInjectionBubbleChrome(
 			isBroadcast={extra.isBroadcast === true}
 			creator={(extra.creator as BubbleCreator | null | undefined) ?? null}
 			source={(extra.source as string | null | undefined) ?? null}
+			onOpenSession={openSession}
+			openSessionLabel={target ? navigation?.labels?.[target.kind] : undefined}
 		/>
 	);
 	if (extra.hasNote === true && noteText) extra.noteText = noteText;
+}
+
+/**
+ * The host's ability to reach each kind of injection target.
+ *
+ * Every opener is OPTIONAL and independently so: a narrator page can open a child
+ * session and a spec file but has no reason to be able to do everything, and a
+ * detached canvas node can do neither. A missing opener disables that row's
+ * affordance — the same rule the tool cards' "open session" item follows — rather
+ * than routing to a fallback the reader did not ask for.
+ */
+export interface InjectionNavigation {
+	/** Open a child session, optionally scrolled to one message. */
+	onOpenNarrator?: (narratorId: string, messageId?: string) => void;
+	/** Open a knowledge-base entry (global or personal). */
+	onOpenKnowledge?: (entryId: string, scope: "global" | "personal") => void;
+	/** Open the Dynamic Spec panel with one file selected. */
+	onOpenSpec?: (uri: string) => void;
+	/** Open a chapter. */
+	onOpenChapter?: (chapterId: string) => void;
+	/** Localized tooltip / aria label per target kind. */
+	labels?: Partial<Record<InjectionTarget["kind"], string>>;
+}
+
+/**
+ * Bind one target to the host's opener for that kind, or undefined when the host
+ * cannot reach it.
+ *
+ * The `switch` is exhaustive on purpose: adding a target kind must be a compile error
+ * here rather than a row that silently stops being clickable.
+ */
+function resolveInjectionOpener(
+	target: InjectionTarget,
+	navigation: InjectionNavigation | undefined,
+): (() => void) | undefined {
+	if (!navigation) return undefined;
+	switch (target.kind) {
+		case "narrator": {
+			const open = navigation.onOpenNarrator;
+			return open ? () => open(target.narratorId, target.messageId ?? undefined) : undefined;
+		}
+		case "knowledge": {
+			const open = navigation.onOpenKnowledge;
+			return open ? () => open(target.entryId, target.scope) : undefined;
+		}
+		case "spec": {
+			const open = navigation.onOpenSpec;
+			return open ? () => open(target.uri) : undefined;
+		}
+		case "chapter": {
+			const open = navigation.onOpenChapter;
+			return open ? () => open(target.chapterId) : undefined;
+		}
+	}
 }

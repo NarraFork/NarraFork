@@ -17,13 +17,23 @@ import { useTranslation } from "react-i18next";
 import { useSearch } from "../hooks/useSearch";
 import { formatSmartTime } from "../lib/format";
 import {
+	DEFAULT_SEARCH_SORT,
 	getSearchResultDisplayTitle,
 	highlightSearchText,
+	normalizeSearchSort,
 	normalizeSearchType,
+	type SearchSortMode,
 	summarizeSearchRuntimeState,
 } from "../lib/search-utils";
 
 const linkStyle = { textDecoration: "none", color: "inherit" } as const;
+/** Badge color per result type; unknown types fall back to grape. */
+const RESULT_TYPE_COLORS: Record<string, string> = {
+	chapter: "blue",
+	narrator: "indigo",
+	message: "grape",
+	knowledge: "teal",
+};
 const MAX_VISIBLE_RESULTS = 200;
 const MAX_SEARCH_TITLE_CHARS = 500;
 const MAX_SEARCH_SNIPPET_CHARS = 2_000;
@@ -64,13 +74,16 @@ function getResultLink(
 		}
 		return { to: "/narrators/$narratorId", params: { narratorId: result.id } };
 	}
+	if (result.type === "knowledge") {
+		return { to: "/knowledge/$entryId", params: { entryId: result.id } };
+	}
 	return null;
 }
 
 interface SearchParams {
 	q?: string;
 	type?: string;
-	sort?: string;
+	sort?: SearchSortMode;
 }
 
 export const Route = createFileRoute("/search")({
@@ -78,17 +91,17 @@ export const Route = createFileRoute("/search")({
 	validateSearch: (search: Record<string, unknown>): SearchParams => ({
 		q: typeof search.q === "string" ? search.q : undefined,
 		type: normalizeSearchType(search.type),
-		sort: typeof search.sort === "string" ? search.sort : undefined,
+		sort: normalizeSearchSort(search.sort),
 	}),
 });
 
 function SearchPage() {
-	const { q, type = "all", sort = "relevance" } = Route.useSearch();
+	const { q, type = "all", sort = DEFAULT_SEARCH_SORT } = Route.useSearch();
 	const navigate = Route.useNavigate();
 	const [forceSearch, setForceSearch] = useState(false);
 	const { data, isLoading, isShortQuery } = useSearch(
 		q ?? "",
-		"chapters,messages,narrators",
+		"chapters,messages,narrators,knowledge",
 		forceSearch,
 	);
 	const { t } = useTranslation("search");
@@ -133,10 +146,13 @@ function SearchPage() {
 					case "message":
 						acc.message += 1;
 						break;
+					case "knowledge":
+						acc.knowledge += 1;
+						break;
 				}
 				return acc;
 			},
-			{ all: 0, chapter: 0, narrator: 0, message: 0 },
+			{ all: 0, chapter: 0, narrator: 0, message: 0, knowledge: 0 },
 		);
 	}, [data?.results]);
 	const displayedResults = useMemo(() => results.slice(0, MAX_VISIBLE_RESULTS), [results]);
@@ -155,6 +171,7 @@ function SearchPage() {
 				projectName: clampSearchText(result.projectName, MAX_SEARCH_META_CHARS),
 				chapterTitle: clampSearchText(result.chapterTitle, MAX_SEARCH_META_CHARS),
 				narratorTitle: clampSearchText(result.narratorTitle, MAX_SEARCH_META_CHARS),
+				collectionName: clampSearchText(result.collectionName, MAX_SEARCH_META_CHARS),
 				timestamp: result.updatedAt ?? result.createdAt ?? result.lastMessageAt,
 			})),
 		[displayedResults, t],
@@ -209,6 +226,7 @@ function SearchPage() {
 							{ value: "chapter", label: t("typeChapter", { count: counts.chapter }) },
 							{ value: "narrator", label: t("typeNarrator", { count: counts.narrator }) },
 							{ value: "message", label: t("typeMessage", { count: counts.message }) },
+							{ value: "knowledge", label: t("typeKnowledge", { count: counts.knowledge }) },
 						]}
 					/>
 					<Select
@@ -219,13 +237,18 @@ function SearchPage() {
 						onChange={(value) =>
 							value &&
 							navigate({
-								search: (prev) => ({ ...prev, sort: value === "relevance" ? undefined : value }),
+								search: (prev) => ({
+									...prev,
+									// `time` is the default, so it stays out of the URL; any other mode is
+									// explicit and must survive a reload / shared link.
+									sort: value === DEFAULT_SEARCH_SORT ? undefined : normalizeSearchSort(value),
+								}),
 								replace: true,
 							})
 						}
 						data={[
-							{ value: "relevance", label: t("sortRelevance") },
 							{ value: "time", label: t("sortTime") },
+							{ value: "relevance", label: t("sortRelevance") },
 							{ value: "type", label: t("sortType") },
 							{ value: "title", label: t("sortTitle") },
 						]}
@@ -272,6 +295,7 @@ function SearchPage() {
 							projectName,
 							chapterTitle,
 							narratorTitle,
+							collectionName,
 							timestamp,
 						}) => {
 							const card = (
@@ -284,16 +308,7 @@ function SearchPage() {
 								>
 									<Group gap="xs" mb={6} justify="space-between" wrap="nowrap">
 										<Group gap="xs" style={{ minWidth: 0 }}>
-											<Badge
-												size="xs"
-												color={
-													result.type === "chapter"
-														? "blue"
-														: result.type === "narrator"
-															? "indigo"
-															: "grape"
-												}
-											>
+											<Badge size="xs" color={RESULT_TYPE_COLORS[result.type] ?? "grape"}>
 												{t(`label_${result.type}`)}
 											</Badge>
 											<Text fw={500} truncate>
@@ -311,6 +326,11 @@ function SearchPage() {
 										{projectName && <Badge variant="outline">{projectName}</Badge>}
 										{chapterTitle && <Badge variant="light">{chapterTitle}</Badge>}
 										{narratorTitle && <Badge variant="light">{narratorTitle}</Badge>}
+										{collectionName && (
+											<Badge variant="outline" color="teal">
+												{collectionName}
+											</Badge>
+										)}
 										{result.status && (
 											<Badge variant="dot">
 												{translateSearchEnum(`status_${result.type}`, result.status)}

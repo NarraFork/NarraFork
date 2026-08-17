@@ -454,10 +454,10 @@ export interface SubagentExpandInput {
 export function resolveSubagentExpanded(lod: RenderLod, input: SubagentExpandInput): boolean {
 	const lodExempt = input.isActive || input.hasSelfPermission || input.pendingPermissionCount > 0;
 	if (lodExempt || input.lodUserOverride) return true;
-	if (lod >= 6) return true;
-	if (lod === 5) return input.isRecent ? input.opened : false;
-	if (lod === 4) return false;
-	// L1-L3 follow the upstream gate / user-opened state.
+	if (lod >= 5) return true;
+	if (lod === 4) return input.isRecent ? input.opened : false;
+	if (lod === 3) return false;
+	// L1/L2 follow the upstream gate / user-opened state.
 	return input.opened;
 }
 

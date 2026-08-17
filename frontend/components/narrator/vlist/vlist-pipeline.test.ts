@@ -181,7 +181,7 @@ describe("computeVListLayout", () => {
 	});
 });
 
-describe("L1-L6 render-unit matrix", () => {
+describe("L1-L5 render-unit matrix", () => {
 	it("uses one activity trace for L1/L2 and keeps its row state in measurement", async () => {
 		const { computeVListLayout } = await import("./vlist-pipeline");
 		const activity = {
@@ -252,7 +252,7 @@ describe("L1-L6 render-unit matrix", () => {
 		if (units[1]?.kind === "segment") expect(units[1].seg.kind).toBe("message");
 	});
 
-	it("lets L4 and old-L5 tool cards expand only through a LOD override", async () => {
+	it("lets L3 and older L4 tool cards expand only through a LOD override", async () => {
 		const { computeVListLayout } = await import("./vlist-pipeline");
 		const segment: AdapterSegment = {
 			kind: "tool-run",
@@ -266,7 +266,7 @@ describe("L1-L6 render-unit matrix", () => {
 				},
 			],
 		};
-		for (const lod of [4, 5] as const) {
+		for (const lod of [3, 4] as const) {
 			const collapsed = computeVListLayout([segment], {
 				contentWidth: 600,
 				lod,
@@ -297,7 +297,7 @@ describe("L1-L6 render-unit matrix", () => {
 				{ blockIndex: 1, isSubagent: false, tc: { toolName: "Bash", status: "running" } },
 			],
 		};
-		for (const lod of [1, 2, 3, 4, 5, 6] as const) {
+		for (const lod of [1, 2, 3, 4, 5] as const) {
 			const result = computeVListLayout([segment], { contentWidth: 600, lod });
 			const active = result.items.find(
 				(item) =>

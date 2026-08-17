@@ -261,6 +261,49 @@ function StatCard({
 	);
 }
 
+/**
+ * Message count and token totals in one card.
+ *
+ * They were five equally-sized cards before, which pushed the sections below out
+ * of reach and repeated the same "from usage history" caption four times. They
+ * are one group of related counters, so they read better as labelled rows under a
+ * single heading with the caption stated once.
+ */
+function StatsCard({
+	title,
+	rows,
+	hint,
+}: {
+	title: string;
+	rows: Array<{ label: string; value: React.ReactNode }>;
+	hint?: string;
+}) {
+	return (
+		<Paper withBorder p="sm" radius="md">
+			<Stack gap={6}>
+				<Text size="xs" c="dimmed">
+					{title}
+				</Text>
+				{rows.map((row) => (
+					<Group key={row.label} justify="space-between" wrap="nowrap" gap="xs">
+						<Text size="sm" c="dimmed">
+							{row.label}
+						</Text>
+						<Text size="sm" fw={700}>
+							{row.value}
+						</Text>
+					</Group>
+				))}
+				{hint ? (
+					<Text size="xs" c="dimmed">
+						{hint}
+					</Text>
+				) : null}
+			</Stack>
+		</Paper>
+	);
+}
+
 // `BooleanOverride` / `normalizeBooleanOverride` moved to ./details-panel-sections,
 // where the advanced-row promotion rules that depend on them are unit tested.
 const DANGER_REFLECTION_LEVEL_VALUES = ["off", "light", "standard", "strict"] as const;
@@ -538,8 +581,6 @@ export function NarratorDetailsPanel({
 	const formatStatNumber = (value?: number | null) =>
 		value == null ? "—" : value.toLocaleString(i18n.language);
 
-	const formatCost = (value?: number | null) => `$${Number(value ?? 0).toFixed(4)}`;
-
 	const formatStatus = (status?: string | null) => {
 		if (!status) return t("details.notAvailable");
 		const key = `status_${status}`;
@@ -613,7 +654,6 @@ export function NarratorDetailsPanel({
 	};
 
 	const usageStatsHint = usageStats ? t("details.stats.usageHistoryIncludesSubagents") : undefined;
-	const displayedCost = usageStats?.totalCost ?? Number(narrator?.totalCostUsd ?? 0);
 
 	const handleSaveCwd = async () => {
 		const nextCwd = cwdValue.trim();
@@ -979,31 +1019,31 @@ export function NarratorDetailsPanel({
 				/>
 				{/* Stat cards are the standing overview, so the filter never hides them —
 			    filtering only narrows the labelled sections below. */}
+				{/* Cost is deliberately absent: no provider path currently attributes a
+				    per-request price to a narrator, so the card only ever read $0.0000. */}
+				<StatsCard
+					title={t("details.stats.title")}
+					hint={usageStatsHint}
+					rows={[
+						{
+							label: t("details.stats.messages"),
+							value: (narrator?.messageCount ?? 0).toLocaleString(i18n.language),
+						},
+						{
+							label: t("details.stats.inputTokens"),
+							value: formatStatNumber(usageStats?.totalInputTokens),
+						},
+						{
+							label: t("details.stats.outputTokens"),
+							value: formatStatNumber(usageStats?.totalOutputTokens),
+						},
+						{
+							label: t("details.stats.cacheReadTokens"),
+							value: formatStatNumber(usageStats?.totalCacheReadTokens),
+						},
+					]}
+				/>
 				<SimpleGrid cols={2} spacing="sm">
-					<StatCard
-						label={t("details.stats.messages")}
-						value={(narrator?.messageCount ?? 0).toLocaleString(i18n.language)}
-					/>
-					<StatCard
-						label={t("details.stats.cost")}
-						value={formatCost(displayedCost)}
-						hint={usageStatsHint}
-					/>
-					<StatCard
-						label={t("details.stats.inputTokens")}
-						value={formatStatNumber(usageStats?.totalInputTokens)}
-						hint={usageStatsHint}
-					/>
-					<StatCard
-						label={t("details.stats.outputTokens")}
-						value={formatStatNumber(usageStats?.totalOutputTokens)}
-						hint={usageStatsHint}
-					/>
-					<StatCard
-						label={t("details.stats.cacheReadTokens")}
-						value={formatStatNumber(usageStats?.totalCacheReadTokens)}
-						hint={usageStatsHint}
-					/>
 					<StatCard
 						label={t("details.stats.viewers")}
 						value={viewers.length.toLocaleString(i18n.language)}

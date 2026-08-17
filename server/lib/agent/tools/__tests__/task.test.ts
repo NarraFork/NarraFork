@@ -11,9 +11,9 @@ beforeAll(async () => {
 		...realNarratorSubagent,
 		runSubagent: mock(async (input: Record<string, unknown>) => {
 			runCalls.push(input);
-			return "<subagent_id>subagent-1</subagent_id>\n\ndone";
+			// The runner already writes the alias into the tag and registers it.
+			return "<subagent_id>inspect-lease</subagent_id>\n\ndone";
 		}),
-		registerTaskAlias: mock(() => ({ alias: "worker", conflicted: false })),
 	}));
 	({ agentTool } = await import("../task"));
 });
@@ -84,5 +84,32 @@ describe("Agent task tool", () => {
 		await agentTool.execute({ prompt: "check preference plumbing", subagent_type: "general" }, ctx);
 
 		expect(runCalls[0]).toMatchObject({ userId: "user-42" });
+	});
+
+	// The tool used to re-write the runner's `<subagent_id>` tag to swap in an
+	// alias. The runner now emits the alias itself, so a second rewrite here would
+	// only be able to corrupt it — the output must pass through verbatim.
+	test("passes the runner's aliased result tag through unchanged", async () => {
+		const ctx: ToolContext = {
+			narratorId: "parent-narrator",
+			cwd: "/worktree",
+			signal: new AbortController().signal,
+			locale: "en",
+			currentToolUseId: "agent-tool-use-3",
+			updateExecutionLease: {
+				kind: "resumable",
+				setNarratorId: mock(() => {}),
+				transfer: mock(() => true),
+				release: mock(() => {}),
+			},
+			requestPermission: async () => ({ behavior: "allow" }),
+		};
+
+		const result = await agentTool.execute(
+			{ prompt: "check the tag", description: "inspect lease", subagent_type: "general" },
+			ctx,
+		);
+
+		expect(result.output).toBe("<subagent_id>inspect-lease</subagent_id>\n\ndone");
 	});
 });

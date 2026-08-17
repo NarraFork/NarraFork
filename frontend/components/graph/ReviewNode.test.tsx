@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactFlowProvider } from "@xyflow/react";
 import i18n from "i18next";
 import { parseHTML } from "linkedom";
@@ -27,28 +28,26 @@ const i18nModule = () => ({
 	default: mockedI18n,
 });
 
-// NarratorPanel's dependency tree includes Vite-only modules (i18n's
-// import.meta.glob), so provide the same test adapters used by its lightweight
-// export test while loading the real namespace. Bun's module mocks are
-// process-wide and mock.restore() does not undo them, so keep the namespace for
-// explicit cleanup below.
+// The expanded node's dependency tree (dockview + every tool panel) includes
+// Vite-only modules (i18n's import.meta.glob), so provide the same test adapters
+// used by NarratorPanel's lightweight export test while loading the real
+// namespace. Bun's module mocks are process-wide and mock.restore() does not undo
+// them, so keep the namespaces for explicit cleanup below.
 mock.module("../../lib/i18n", i18nModule);
 mock.module("@frontend/lib/i18n", i18nModule);
-const realNarratorPanelModule = {
-	...(await import("../narrator/NarratorPanel" + "?real")),
-};
 
-mock.module("../narrator/NarratorPanel", () => ({
-	...realNarratorPanelModule,
-	NarratorPanel: ({ narratorId }: { narratorId: string }) => (
-		<div data-testid="mock-review-narrator-panel">review narrator {narratorId}</div>
-	),
-}));
-
+// An expanded node now hosts a whole dockview surface (ChapterNodeDock) rather than
+// a bare NarratorPanel. The dock is NOT stubbed: it is lazy-loaded and fetches the
+// chapter's saved layout before mounting, so with the query below never resolving it
+// simply stays on its loading skeleton. That is fine — this suite asserts what
+// ReviewNode itself owns (the dock region is mounted for the right narrator), and
+// the dock's own behaviour is covered by the tests under ./dock/.
+//
+// A QueryClient IS provided though: the header's title actions own a chapter-title
+// mutation, so an expanded node is no longer renderable without a client.
 const { ReviewNode } = await import("./ReviewNode");
 
 afterAll(() => {
-	mock.module("../narrator/NarratorPanel", () => realNarratorPanelModule);
 	mock.restore();
 });
 
@@ -56,6 +55,21 @@ class TestResizeObserver {
 	observe() {}
 	unobserve() {}
 	disconnect() {}
+}
+
+/** Minimal Storage stand-in (linkedom provides none). */
+function memoryStorage(): Storage {
+	const store = new Map<string, string>();
+	return {
+		getItem: (k: string) => store.get(k) ?? null,
+		setItem: (k: string, v: string) => void store.set(k, String(v)),
+		removeItem: (k: string) => void store.delete(k),
+		clear: () => store.clear(),
+		key: (i: number) => [...store.keys()][i] ?? null,
+		get length() {
+			return store.size;
+		},
+	} as Storage;
 }
 
 let root: Root | undefined;
@@ -90,6 +104,9 @@ function installDom() {
 		Element: window.Element,
 		Node: window.Node,
 		Text: window.Text,
+		// The lazy dock's Suspense fallback (NarratorPanelSkeleton) reads a local
+		// preference, and linkedom ships no Storage implementation.
+		localStorage: memoryStorage(),
 		ResizeObserver: TestResizeObserver,
 		matchMedia,
 		requestAnimationFrame: window.requestAnimationFrame,
@@ -131,6 +148,20 @@ async function tick() {
 	await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/**
+ * Wait for an element to appear.
+ *
+ * The expanded node's dock is `lazy()`, so the subtree settles over several
+ * microtask / timer turns rather than within a single tick.
+ */
+async function waitForSelector(selector: string): Promise<void> {
+	for (let attempt = 0; attempt < 50; attempt++) {
+		if (container?.querySelector(selector)) return;
+		await tick();
+	}
+	throw new Error(`Timed out waiting for selector: ${selector}`);
+}
+
 function renderReviewNode(data: Record<string, unknown>) {
 	if (!container || !root) throw new Error("test root not initialized");
 	const nodeProps = {
@@ -144,11 +175,16 @@ function renderReviewNode(data: Record<string, unknown>) {
 		positionAbsoluteX: 0,
 		positionAbsoluteY: 0,
 	} as ComponentProps<typeof ReviewNode>;
+	const queryClient = new QueryClient({
+		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+	});
 	root.render(
 		<MantineProvider>
-			<ReactFlowProvider>
-				<ReviewNode {...nodeProps} />
-			</ReactFlowProvider>
+			<QueryClientProvider client={queryClient}>
+				<ReactFlowProvider>
+					<ReviewNode {...nodeProps} />
+				</ReactFlowProvider>
+			</QueryClientProvider>
 		</MantineProvider>,
 	);
 }
@@ -200,6 +236,10 @@ describe("ReviewNode", () => {
 
 		expect(container?.textContent).toContain("Review: panel smoke");
 		expect(container?.textContent).toContain("Reviewing");
-		expect(container?.textContent).toContain("review narrator nar-review-1");
+		// ReviewNode's own contract is that expanding mounts the dock region for the
+		// right narrator without crashing. What the dock then renders (a live
+		// dockview, its loading skeleton) belongs to ChapterNodeDock's own tests —
+		// asserting it here would just be re-testing React Query and Dockview.
+		await waitForSelector('[data-review-node-dock="nar-review-1"]');
 	});
 });

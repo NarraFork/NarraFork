@@ -1,5 +1,6 @@
 import { backgroundTaskService } from "@server/services/background-task-service";
 import { z } from "zod/v4";
+import { resolveNarratorGitIdentityEnv } from "../../git-identity";
 import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
 import { getHome } from "../../platform";
@@ -350,9 +351,21 @@ export const bashTool: ToolDefinition = {
 			});
 		}
 
+		// Attribute any commit this command makes to the person driving the turn
+		// rather than to the host machine's global git config. Applied to EVERY
+		// command, not just ones that look like `git commit`: the commit may happen
+		// inside a shell pipeline, a build script or a `gh` invocation, and `GIT_*`
+		// is inert for anything that is not git. A user's own inline assignment
+		// (`GIT_AUTHOR_NAME=x git commit`) still wins, since shell assignments are
+		// applied after the spawn environment.
+		const gitIdentityEnv = await resolveNarratorGitIdentityEnv({
+			turnUserId: ctx.userId,
+			narratorId: ctx.narratorId,
+		});
+
 		// Background execution: fire-and-forget via backgroundTaskService
 		if (run_in_background) {
-			return _runInBackground(command, cwd, timeoutMs, title, ctx, device);
+			return _runInBackground(command, cwd, timeoutMs, title, ctx, device, gitIdentityEnv);
 		}
 
 		// Commands that explicitly name in-workspace write targets (`sed -i src/a.ts`,
@@ -374,6 +387,7 @@ export const bashTool: ToolDefinition = {
 					command,
 					cwd,
 					signal: ctx.signal,
+					env: gitIdentityEnv ?? undefined,
 				});
 
 				let output = "";
@@ -597,6 +611,7 @@ async function _runInBackground(
 	title: string,
 	ctx: ToolContext,
 	device?: string,
+	gitIdentityEnv?: Record<string, string> | null,
 ): Promise<ToolResult> {
 	const taskId = `bash_${generateShortId()}`;
 	const bgAbort = new AbortController();
@@ -628,7 +643,15 @@ async function _runInBackground(
 		let timedOut = false;
 		try {
 			const backend = getToolBackend(ctx, device);
-			const handle = await backend.execCommand({ command, cwd, signal: bgAbort.signal });
+			const handle = await backend.execCommand({
+				command,
+				cwd,
+				signal: bgAbort.signal,
+				// Resolved by the caller before the task record was created: a background
+				// command outlives the turn, and re-resolving here could pick up a
+				// different acting user than the one who started it.
+				env: gitIdentityEnv ?? undefined,
+			});
 			let outputBytes = 0;
 			let outputTruncated = false;
 			const killFn = () => handle.kill();

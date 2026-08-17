@@ -24,6 +24,7 @@ import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-i
 import {
 	accumulateFrame,
 	type BlockFrame,
+	DEFAULT_RENDER_LOD,
 	type ElementFrame,
 	type MeasuredElement,
 	type PreparedBlock,
@@ -74,7 +75,7 @@ export interface MeasureImageInput {
 export function measureImage(
 	data: MeasureImageInput,
 	contentWidth: number,
-	_lod: RenderLod = 5,
+	_lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredElement {
 	const block: PreparedFixedBlock = {
 		...FLAT_BASE,
@@ -122,7 +123,7 @@ export interface MeasureTextFileInput {
 export function measureTextFile(
 	data: MeasureTextFileInput,
 	contentWidth: number,
-	_lod: RenderLod = 5,
+	_lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredElement {
 	const block: PreparedFixedBlock = {
 		...FLAT_BASE,
@@ -273,7 +274,7 @@ function buildHeaderInline(
 export function measureImageGeneration(
 	data: MeasureImageGenerationInput,
 	contentWidth: number,
-	_lod: RenderLod = 5,
+	_lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredElement {
 	const innerWidth = Math.max(1, contentWidth - IMGGEN_PAPER_PADDING * 2);
 	const generating = isGeneratingStatus(data.status);
@@ -394,7 +395,7 @@ export interface MediaBlockInput
 export function measureMedia(
 	block: MediaBlockInput,
 	contentWidth: number,
-	lod: RenderLod = 5,
+	lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredElement {
 	switch (block.type) {
 		case "image":

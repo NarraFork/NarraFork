@@ -613,6 +613,11 @@
 	"segmentCompactConfirm": "Compact {{count}} selected message(s)? The original messages will be hidden and replaced with a summary.",
 	"viewSubagentSession": "View session",
 	"openFullSubagentSession": "Open full session",
+	"injectionTarget": {
+		"openKnowledge": "Open knowledge entry",
+		"openSpecFile": "Open this spec file",
+		"openChapter": "Open chapter"
+	},
 	"subagentRecentCalls": "Recent calls",
 	"subagentWaitingPermission": "Waiting for permission ({{count}})",
 	"subagentWaitingPermissionTitle": "Waiting for permission",
@@ -1025,8 +1030,8 @@
 	"details.clearTrait": "Clear trait",
 	"details.customTraitsSaved": "Custom trait saved",
 	"details.customTraitsCleared": "Custom trait cleared",
+	"details.stats.title": "Statistics",
 	"details.stats.messages": "Messages",
-	"details.stats.cost": "Cost",
 	"details.stats.inputTokens": "Total input",
 	"details.stats.outputTokens": "Total output",
 	"details.stats.cacheReadTokens": "Cache reads",
@@ -1107,7 +1112,7 @@
 		"attachedCount": "{{count}} system injection(s) attached",
 		"body": {
 			"noticeSilentProgress": "{{count}} tool calls without a visible reply",
-			"noticeRelaxedPlan": "Still planning — do not implement yet",
+			"noticeRelaxedPlan": "Still planning — write the plan to {{planFile}}, do not implement yet",
 			"noticePipelineExit": "Pipeline still active — confirm it is still needed",
 			"tasksCurrent": "Dynamic Spec — {{n}} open task(s)",
 			"tasksEmptyNever": "Dynamic Spec — no tasks created yet",
@@ -1256,7 +1261,8 @@
 		"resultCount_other": "{{count}} results",
 		"role_user": "You",
 		"role_assistant": "Assistant",
-		"role_system": "System"
+		"role_system": "System",
+		"jumpUnavailable": "Expand this chapter's node on the canvas to jump to a message."
 	},
 	"access": {
 		"visibilityTitle": "Who can see this session",

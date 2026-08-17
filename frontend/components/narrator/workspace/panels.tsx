@@ -21,6 +21,7 @@ import {
 	FileModDockPanel as FileModToolAdapter,
 	FileDockPanel as FileViewerAdapter,
 	GitDockPanel as GitToolAdapter,
+	KnowledgeDockPanel as KnowledgePanelAdapter,
 	SearchDockPanel as SearchToolAdapter,
 	SpecDockPanel as SpecToolAdapter,
 	SubagentSessionPanelContent,
@@ -29,7 +30,11 @@ import {
 	UserChatDockPanel as UserChatToolAdapter,
 } from "../dock/panels";
 import { NarratorPanel } from "../NarratorPanel";
-import type { FilePanelParams, NarratorBoundPanelParams } from "../panels/panel-kind";
+import type {
+	FilePanelParams,
+	KnowledgePanelParams,
+	NarratorBoundPanelParams,
+} from "../panels/panel-kind";
 import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
 import { WebviewPanel } from "../WebviewPanel";
@@ -41,6 +46,7 @@ import {
 	type TerminalPanelParams,
 	type WebviewPanelParams,
 	type WorkspaceFilePanelParams,
+	type WorkspaceKnowledgePanelParams,
 	type WorkspacePanelParams,
 } from "./panel-types";
 import { useWorkspaceDirectorActive, useWorkspaceNarratorDockValue } from "./workspace-dock";
@@ -51,6 +57,7 @@ export type {
 	TerminalPanelParams,
 	WebviewPanelParams,
 	WorkspaceFilePanelParams,
+	WorkspaceKnowledgePanelParams,
 	WorkspacePanelParams,
 	WorkspacePanelType,
 } from "./panel-types";
@@ -102,7 +109,8 @@ function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 }
 
 function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
-	const { hostNarratorId, subagentNarratorId } = props.params;
+	const { hostNarratorId, subagentNarratorId, highlightMessageId, highlightRequestId } =
+		props.params;
 	const { ref, compact } = usePanelCompact();
 	const directorActive = useWorkspaceDirectorActive();
 	const dockValue = useWorkspaceNarratorDockValue(hostNarratorId);
@@ -126,6 +134,8 @@ function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 				onHeaderPointerDown={onHeaderPointerDown}
 				onViewSubagentSession={dockValue?.openSubagentPanel}
 				onTitleChange={handleTitleChange}
+				highlightMessageId={highlightMessageId}
+				highlightRequestId={highlightRequestId}
 			/>
 		</Box>
 	);
@@ -299,6 +309,28 @@ function WorkspaceFileDockPanel(props: IDockviewPanelProps<WorkspaceFilePanelPar
 	return <FileViewerAdapter {...fileProps} />;
 }
 
+/**
+ * Knowledge entry panel adapter. Delegates to the focus dock's
+ * `KnowledgeDockPanel` — it reads identity from params (a resource), so the
+ * only adaptation is dropping the workspace-only `hostNarratorId`.
+ */
+function WorkspaceKnowledgeDockPanel(props: IDockviewPanelProps<WorkspaceKnowledgePanelParams>) {
+	const directorActive = useWorkspaceDirectorActive();
+	if (directorActive) return null;
+
+	const adaptedParams: KnowledgePanelParams = {
+		panelType: "knowledge",
+		entryId: props.params.entryId,
+		scope: props.params.scope,
+		hostNarratorId: props.params.hostNarratorId,
+	};
+	const knowledgeProps = {
+		...props,
+		params: adaptedParams,
+	} as IDockviewPanelProps<KnowledgePanelParams>;
+	return <KnowledgePanelAdapter {...knowledgeProps} />;
+}
+
 function WorkspacePluginDockPanel(props: Parameters<typeof PluginDockPanel>[0]) {
 	const directorActive = useWorkspaceDirectorActive();
 	if (directorActive) return null;
@@ -313,6 +345,7 @@ export const workspacePanelComponents = {
 	[PANEL_COMPONENT.narratorTool]: NarratorToolDockPanel,
 	[PANEL_COMPONENT.subagent]: SubagentDockPanel,
 	[PANEL_COMPONENT.file]: WorkspaceFileDockPanel,
+	[PANEL_COMPONENT.knowledge]: WorkspaceKnowledgeDockPanel,
 	[PANEL_COMPONENT.plugin]: WorkspacePluginDockPanel,
 	// biome-ignore lint/suspicious/noExplicitAny: dockview panel registry is heterogeneous
 } satisfies Record<string, React.FunctionComponent<IDockviewPanelProps<any>>>;

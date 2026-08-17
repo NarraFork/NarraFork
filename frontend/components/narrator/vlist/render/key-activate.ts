@@ -27,3 +27,23 @@ export function activateOnKey(activate: () => void) {
 		activate();
 	};
 }
+
+/**
+ * onClick for a fold/toggle region that shares its block with the selection
+ * interaction layer (VListRowInteraction / TraceRowInteraction).
+ *
+ * A Ctrl/Cmd+Click or Shift+Click means "select this block", not "toggle the
+ * fold" — the interaction wrapper performs the selection, so the toggle must
+ * swallow the event. Without this guard every multi-select click also expands
+ * or collapses the card under the cursor, fighting the user on every click.
+ *
+ * Unconditional (matching the chunked ToolCallCard header): when the selection
+ * layer is absent a modified click simply does nothing, rather than expanding
+ * a card the reader was probably trying to select text from.
+ */
+export function swallowSelectionClick(activate: () => void) {
+	return (e: React.MouseEvent) => {
+		if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+		activate();
+	};
+}

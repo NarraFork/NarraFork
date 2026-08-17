@@ -339,7 +339,7 @@ function SettingsProvidersPage() {
 							prefix: "",
 							apiKey: "",
 							baseUrl: isGemini ? "https://generativelanguage.googleapis.com/v1beta" : "",
-							defaultModel: isGemini ? "gemini-2.5-flash" : "",
+							defaultModel: isGemini ? "gemini-3-flash-preview" : "",
 							protocol: type,
 							...(isGemini ? { geminiTransport: "generate-content" as const } : {}),
 							codexAccountId: "",

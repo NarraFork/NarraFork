@@ -99,16 +99,15 @@ describe("loadPretextDocumentTail", () => {
 });
 
 describe("firstScreenPageSizeForLod", () => {
-	it("returns a large page for low LOD (collapsed cards need many, but measure cheap)", () => {
+	it("returns a large page for low LOD (folded rows need many, but measure cheap)", () => {
 		expect(firstScreenPageSizeForLod(1)).toBe(100);
 		expect(firstScreenPageSizeForLod(2)).toBe(100);
-		expect(firstScreenPageSizeForLod(3)).toBe(100);
 	});
 
-	it("caps the page at high LOD (expanded cards are tall + expensive to measure)", () => {
+	it("caps the page at high LOD (cards are tall + expensive to measure)", () => {
+		expect(firstScreenPageSizeForLod(3)).toBe(40);
 		expect(firstScreenPageSizeForLod(4)).toBe(40);
 		expect(firstScreenPageSizeForLod(5)).toBe(40);
-		expect(firstScreenPageSizeForLod(6)).toBe(40);
 	});
 });
 

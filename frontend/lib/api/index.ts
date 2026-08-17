@@ -7,6 +7,7 @@ import { gitApi } from "./git";
 import { integrationsApi } from "./integrations";
 import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
+import { modelCardsApi } from "./model-cards";
 import { narratorsApi } from "./narrators";
 import { oauthAppsApi } from "./oauth-apps";
 import { oauthGrantsApi } from "./oauth-grants";
@@ -33,6 +34,7 @@ export const api = {
 	...gitApi,
 	...integrationsApi,
 	...miscApi,
+	...modelCardsApi,
 	...knowledgeApi,
 	...specApi,
 	...devicesApi,

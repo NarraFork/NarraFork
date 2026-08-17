@@ -92,17 +92,16 @@ describe("buildSpecToolResultReminder", () => {
 		// A brand-new narrator's tasks.json defaults to an empty tasks array.
 		const en = await buildSpecToolResultReminder(neverCreatedTasksNarratorId, "en");
 		expect(en).not.toBeNull();
-		expect(en).toContain("no active tasks");
-		expect(en).toContain("have not created any task");
+		expect(en).toContain("no open tasks");
 		expect(en).toContain("spec://tasks.json");
 		// Keeps the escape hatch for simple work.
-		expect(en).toContain("you may ignore this reminder");
+		expect(en).toContain("Simple work needs no list");
 
 		const zh = await buildSpecToolResultReminder(neverCreatedTasksNarratorId, "zh-CN");
 		expect(zh).not.toBeNull();
-		expect(zh).toContain("没有进行中的任务");
-		expect(zh).toContain("还没有在 spec://tasks.json 建立任何任务");
-		expect(zh).toContain("可以忽略本提醒");
+		expect(zh).toContain("没有开放任务");
+		expect(zh).toContain("请在 spec://tasks.json 建立任务清单");
+		expect(zh).toContain("可忽略本提醒");
 	});
 
 	test("shows the progress reminder (not a nudge) when there is an open task", async () => {
@@ -115,20 +114,21 @@ describe("buildSpecToolResultReminder", () => {
 		const en = await buildSpecToolResultReminder(openTasksNarratorId, "en");
 		expect(en).not.toBeNull();
 		expect(en).toContain("Implement the parser");
-		expect(en).toContain("compiled from spec://tasks.json");
+		expect(en).toContain("open tasks (spec://tasks.json)");
 		// Must not be the empty-tasks or oversized-list nudge.
-		expect(en).not.toContain("no active tasks");
-		expect(en).not.toContain("have not created any task");
-		expect(en).not.toContain("reorganization reminder");
-		expect(en).toContain("Every open task must be finite, executable");
-		expect(en).toContain("may trigger automatic continuation");
+		expect(en).not.toContain("no open tasks");
+		expect(en).not.toContain("Multi-step work?");
+		expect(en).not.toContain("over the");
 
 		const zh = await buildSpecToolResultReminder(openTasksNarratorId, "zh-CN");
-		expect(zh).toContain("每条开放任务必须有限、可执行");
-		expect(zh).toContain("可能触发自动续跑");
+		expect(zh).toContain("Dynamic Spec 当前任务");
+		expect(zh).toContain("状态有变化就更新 spec://tasks.json");
 	});
 
-	test("tells blocked tasks to create and execute an autonomous unblock task", async () => {
+	// ⚠️ The cadence digest is injected mid-turn, so it must NOT carry the rules the
+	// system prompt already states on every request. This is the regression guard for
+	// that: the digest reports state, `getDynamicSpecSystemReminder` teaches the rules.
+	test("stays short: a blocked task is reported without restating the blocked-task rule", async () => {
 		await writeSpecFile(
 			blockedTasksNarratorId,
 			"spec://tasks.json",
@@ -138,12 +138,18 @@ describe("buildSpecToolResultReminder", () => {
 
 		const en = await buildSpecToolResultReminder(blockedTasksNarratorId, "en");
 		expect(en).toContain("Collect missing trace evidence");
-		expect(en).toContain("add a concrete actionable unblock task");
-		expect(en).toContain("immediately use tools to execute it");
+		expect(en).toContain("- blocked:");
+		// The full rule lives in the system prompt (see prompts/system-reminders.ts).
+		expect(en).not.toContain("Blocked-task rule");
+		expect(en).not.toContain("unblock task");
+		expect(en).not.toContain("text/status/protected");
+		// heading + one task + one update line.
+		expect(en?.split("\n")).toHaveLength(3);
 
 		const zh = await buildSpecToolResultReminder(blockedTasksNarratorId, "zh-CN");
-		expect(zh).toContain("新增一个具体、可执行的解阻任务");
-		expect(zh).toContain("立即调用工具执行");
+		expect(zh).toContain("Collect missing trace evidence");
+		expect(zh).not.toContain("blocked 任务处理规则");
+		expect(zh?.split("\n")).toHaveLength(3);
 	});
 
 	test("nudges to refresh when all tasks are done", async () => {
@@ -155,18 +161,16 @@ describe("buildSpecToolResultReminder", () => {
 		);
 		const en = await buildSpecToolResultReminder(allDoneTasksNarratorId, "en");
 		expect(en).not.toBeNull();
-		expect(en).toContain("no active tasks");
-		expect(en).toContain("previous phase is complete");
-		expect(en).toContain("reorganize spec://tasks.json");
-		expect(en).toContain("remove completed ordinary tasks");
+		expect(en).toContain("no open tasks");
+		expect(en).toContain("Previous phase is done");
+		expect(en).toContain("Reorganize spec://tasks.json");
 		// The all-done branch should not use the "never created" phrasing.
-		expect(en).not.toContain("have not created any task");
+		expect(en).not.toContain("Multi-step work?");
 
 		const zh = await buildSpecToolResultReminder(allDoneTasksNarratorId, "zh-CN");
 		expect(zh).not.toBeNull();
-		expect(zh).toContain("上一阶段任务已全部完成");
+		expect(zh).toContain("上一阶段已完成");
 		expect(zh).toContain("整理 spec://tasks.json");
-		expect(zh).toContain("清理已完成的普通任务");
 	});
 
 	test("asks to reorganize when the task count exceeds the threshold", async () => {
@@ -183,13 +187,15 @@ describe("buildSpecToolResultReminder", () => {
 
 		const en = await buildSpecToolResultReminder(tooManyTasksNarratorId, "en");
 		expect(en).not.toBeNull();
-		expect(en).toContain(`exceeding ${SPEC_TASKS_REORGANIZE_THRESHOLD}`);
-		expect(en).toContain("merge duplicate or closely related tasks");
+		expect(en).toContain(`over the ${SPEC_TASKS_REORGANIZE_THRESHOLD} threshold`);
+		expect(en).toContain("merge duplicates");
 		expect(en).toContain("Preserve protected-task intent");
+		// heading + one action line: the reorganize nudge is two lines, not six.
+		expect(en?.split("\n")).toHaveLength(2);
 
 		const zh = await buildSpecToolResultReminder(tooManyTasksNarratorId, "zh-CN");
 		expect(zh).not.toBeNull();
 		expect(zh).toContain(`超过 ${SPEC_TASKS_REORGANIZE_THRESHOLD} 条`);
-		expect(zh).toContain("合并重复或高度相关的任务");
+		expect(zh).toContain("合并重复项");
 	});
 });

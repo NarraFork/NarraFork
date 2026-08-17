@@ -131,8 +131,8 @@ func TestPathGuardCanonicalizesSymlinkRoot(t *testing.T) {
 	}
 
 	guard := NewPathGuard([]string{linkedRoot})
-	if len(guard.roots) != 1 || !samePath(guard.roots[0], realRoot) {
-		t.Fatalf("root was not canonicalized: %#v", guard.roots)
+	if len(guard.rules) != 1 || !samePath(guard.rules[0].root, realRoot) {
+		t.Fatalf("root was not canonicalized: %#v", guard.rules)
 	}
 	if got, err := guard.CheckExisting(filepath.Join(linkedRoot, "file.txt")); err != nil || !samePath(got, file) {
 		t.Fatalf("existing path through root symlink rejected: got=%q err=%v", got, err)

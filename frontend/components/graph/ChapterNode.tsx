@@ -1,12 +1,18 @@
 import { ActionIcon, Badge, Card, Group, Text, Tooltip } from "@mantine/core";
 import { IconGitCommit, IconMessage, IconMinimize } from "@tabler/icons-react";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
-import { memo, Suspense, useCallback, useRef, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { CHAPTER_ROLE_ICONS, CHAPTER_STATUS_COLORS, statusRegistry } from "../../lib/constants";
 import { ChapterForkModal } from "../chapter/ChapterForkModal";
-import { NarratorPanel } from "../narrator/NarratorPanel";
 import { NarratorPanelSkeleton } from "../narrator/NarratorPanelSkeleton";
+import { NodeTitleEditor } from "./NodeTitleEditor";
+
+// Lazy: dockview + every tool panel is a large chunk, and most nodes on a canvas
+// are collapsed. Only expanding one pays for it.
+const ChapterNodeDock = lazy(() =>
+	import("./dock/ChapterNodeDock").then((m) => ({ default: m.ChapterNodeDock })),
+);
 
 export interface ChapterNodeData {
 	title: string;
@@ -28,9 +34,15 @@ export interface ChapterNodeData {
 
 const COLLAPSED_WIDTH = 280;
 const COLLAPSED_HEIGHT = 120;
-const EXPANDED_WIDTH = 380;
+/**
+ * Expanded size must fit a dockview cluster, not just a chat column: opening the
+ * first tool panel splits ~1/3 of the width off (see `resolveToolPlacement`), and
+ * at the old 380px that left a ~127px panel nobody could use.
+ */
+const EXPANDED_WIDTH = 720;
 const EXPANDED_HEIGHT = 640;
-const MIN_RESIZE_WIDTH = 280;
+/** Below this width a split-right tool panel is too narrow to be worth opening. */
+export const MIN_RESIZE_WIDTH = 480;
 const MIN_RESIZE_HEIGHT = 300;
 const TRUNK_WIDTH = 320;
 const TRUNK_HEIGHT = 140;
@@ -86,12 +98,12 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 
 	const handleStyle = { opacity: 0, width: 8, height: 8 };
 
-	// Track node resize to show skeleton overlay in NarratorPanel
-	const [isResizing, setIsResizing] = useState(false);
-	const onResizeStart = useCallback(() => setIsResizing(true), []);
-	const onResizeEnd = useCallback(() => setIsResizing(false), []);
+	// No resize-tracking state any more: it existed only to show NarratorPanel's
+	// skeleton overlay while dragging the node's corner. The dock's panels are laid
+	// out by the browser (CSS flex, `onlyWhenVisible`), so a resize reflows in the
+	// same frame and no longer produces the flash the overlay was hiding.
 
-	// Allow Ctrl+wheel to pass through to ReactFlow for zoom even when over NarratorPanel
+	// Allow Ctrl+wheel to pass through to ReactFlow for zoom even when over the dock
 	// (handled by NowheelPassthrough in NarraFlow — no per-node listener needed)
 	const panelWheelRef = useRef<HTMLDivElement>(null);
 
@@ -102,8 +114,6 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 					minWidth={MIN_RESIZE_WIDTH}
 					minHeight={MIN_RESIZE_HEIGHT}
 					position="bottom-right"
-					onResizeStart={onResizeStart}
-					onResizeEnd={onResizeEnd}
 					style={{
 						background: "transparent",
 						border: "none",
@@ -160,15 +170,24 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 					}}
 				>
 					<Group justify="space-between" mb={expanded ? 0 : 4} wrap="nowrap">
-						<Text
+						{/* Expanded, this is the ONLY visible copy of the title: the embedded
+						    panel suppresses its own header title (and hands its pencil /
+						    sparkles actions over here) because a dozen tool buttons used to
+						    squeeze that copy to zero width. */}
+						<NodeTitleEditor
+							chapterId={id}
+							narratorId={d.narratorId ?? null}
+							title={displayTitle}
+							prefix={roleIcon || undefined}
+							showActions={expanded}
 							size="sm"
-							fw={600}
-							lineClamp={1}
-							style={{ maxWidth: nodeWidth - (hasNarrator ? 100 : 80), minWidth: 0 }}
-						>
-							{roleIcon ? `${roleIcon} ` : ""}
-							{displayTitle}
-						</Text>
+							// Collapsed nodes have a known width, so the title is capped to leave
+							// room for the badge. An expanded node is user-resizable, so a fixed
+							// cap would waste whatever width they dragged out — flex instead.
+							textStyle={
+								expanded ? { flex: 1 } : { maxWidth: nodeWidth - (hasNarrator ? 100 : 80) }
+							}
+						/>
 						<Group gap={4} wrap="nowrap">
 							<Badge size="xs" color={CHAPTER_STATUS_COLORS[d.status] ?? "gray"}>
 								{tc(statusRegistry.chapterStatus(d.status).i18nKey)}
@@ -229,8 +248,11 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 					)}
 				</div>
 
-				{/* Expanded: NarratorPanel */}
+				{/* Expanded: a full dockview surface (chat + stackable tool panels) */}
 				{expanded && d.narratorId && (
+					// `position: relative` + `overflow: hidden` give the dock a containing
+					// block and clip it to the node. The nopan/nodrag/nowheel classes keep
+					// React Flow from swallowing dockview's tab clicks and sash drags.
 					// biome-ignore lint/a11y/noStaticElementInteractions: stopPropagation only
 					<div
 						className="nopan nodrag nowheel"
@@ -239,16 +261,16 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 						style={{
 							flex: 1,
 							minHeight: 0,
+							position: "relative",
 							overflow: "hidden",
 							borderTop: "1px solid var(--mantine-color-dark-4)",
 						}}
 					>
 						<Suspense fallback={<NarratorPanelSkeleton />}>
-							<NarratorPanel
+							<ChapterNodeDock
 								key={d.narratorId}
+								chapterId={id}
 								narratorId={d.narratorId}
-								compact
-								isResizing={isResizing}
 								onForkFromMessage={handleForkFromMessage}
 							/>
 						</Suspense>

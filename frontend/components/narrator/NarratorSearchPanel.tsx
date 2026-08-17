@@ -54,11 +54,19 @@ export function NarratorSearchPanel({ narratorId }: NarratorSearchPanelProps) {
 
 	const results = useMemo(() => data?.results ?? [], [data?.results]);
 
+	/**
+	 * Jumping to a result needs a chat panel to scroll. That is absent when this
+	 * panel has been torn out onto the story-network canvas and its source node is
+	 * collapsed — so the bridge is missing rather than inert, and the result rows
+	 * below go non-interactive instead of swallowing clicks.
+	 */
+	const scrollToMessage = dock?.scrollToMessage;
+	const canJump = !!scrollToMessage;
 	const handleJump = useCallback(
 		(messageId: string) => {
-			dock?.scrollToMessage(messageId);
+			scrollToMessage?.(messageId);
 		},
-		[dock],
+		[scrollToMessage],
 	);
 
 	return (
@@ -114,14 +122,22 @@ export function NarratorSearchPanel({ narratorId }: NarratorSearchPanelProps) {
 							<Text size="xs" c="dimmed" px={4}>
 								{t("search.resultCount", { count: results.length })}
 							</Text>
+							{!canJump && (
+								<Text size="xs" c="dimmed" px={4}>
+									{t("search.jumpUnavailable")}
+								</Text>
+							)}
 							{results.map((result) => (
 								<UnstyledButton
 									key={result.messageId}
 									onClick={() => handleJump(result.messageId)}
+									disabled={!canJump}
 									style={{
 										borderRadius: "var(--mantine-radius-sm)",
 										padding: "8px 10px",
 										border: "1px solid var(--mantine-color-default-border)",
+										cursor: canJump ? undefined : "default",
+										opacity: canJump ? undefined : 0.65,
 									}}
 									className="nf-search-result"
 								>

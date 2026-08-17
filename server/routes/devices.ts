@@ -1,30 +1,34 @@
 import { listExecutorPlatformInfo } from "@shared/remote-executor";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { DEVICE_PROTOCOL_VERSION } from "../lib/agent/execution/rpc-types";
-import { ValidationError } from "../lib/errors";
+import { ForbiddenError, NotFoundError, ValidationError } from "../lib/errors";
 import { getExecutorManifest } from "../lib/executor-binaries";
 import { issueExecutorTicket } from "../lib/executor-bootstrap-ticket";
 import { buildExecutorInstallScript } from "../lib/executor-install-script";
 import {
+	buildPathRulesConfigSnippet,
 	createRemoteDeviceSchema,
 	deviceBrowseQuerySchema,
 	deviceInstallScriptSchema,
 	deviceStatQuerySchema,
 	deviceTransferSchema,
+	updateDevicePathRulesSchema,
 	updateRemoteDeviceSchema,
 } from "../lib/validators";
-import { requireAdmin } from "../middleware/auth";
+import { assertAdmin } from "../middleware/auth";
 import {
 	getDeviceConnectionDiagnostics,
 	testDeviceConnection,
 } from "../services/device-connection-service";
 import {
+	canManageDevice,
 	createDevice,
 	getDevice,
 	listDevices,
 	revokeDevice,
 	rotateDeviceToken,
 	updateDevice,
+	updateDevicePathRules,
 } from "../services/device-service";
 import {
 	browseRemoteDirectory,
@@ -43,15 +47,53 @@ import {
 
 export const deviceRoutes = new Hono();
 
-// Remote executor devices grant file/command execution on other machines, and
-// the transfer endpoints read/write arbitrary server-local paths. Restrict the
-// entire surface to admins (global requireAuth already ran before this router).
-deviceRoutes.use("*", requireAdmin);
+/**
+ * Authorization on this router is per-endpoint, not blanket-admin.
+ *
+ * Three tiers, because the endpoints differ by orders of magnitude in blast radius:
+ *
+ * 1. **Any authenticated user** — register a device, read the executor manifest.
+ *    Registering only creates a record plus a key; nothing can execute until the
+ *    operator installs the executor on a machine they already control.
+ * 2. **Device manager** (registrar or admin, see `canManageDevice`) — inspect,
+ *    edit, set path rules, rotate the key, revoke, generate an install script.
+ *    Usage and management are separate powers: a shared device is usable by
+ *    everyone the project axis allows, but only its registrar or an admin may
+ *    reconfigure the machine the team depends on.
+ * 3. **Admin only** — `scope: "global"`, and every filesystem/transfer endpoint.
+ *    The transfer endpoints take an unbounded server-local `localPath`
+ *    (`validateLocalAbsolutePath` checks only that it is absolute), so they are
+ *    effectively arbitrary read/write on the NarraFork server itself. Opening them
+ *    to non-admins would be a privilege escalation regardless of device ownership.
+ */
 
-// List all (non-revoked) devices.
+/** Load a device and assert the caller may manage it. */
+async function requireManagedDevice(c: Context) {
+	const id = c.req.param("id") ?? "";
+	const device = await getDevice(id);
+	// Same not-found result either way: distinguishing "exists but not yours" from
+	// "does not exist" would let any user enumerate device ids.
+	if (!device) throw new NotFoundError("Device", id);
+	const user = c.get("user");
+	if (!canManageDevice(device, { userId: user.sub, isAdmin: user.role === "admin" })) {
+		throw new NotFoundError("Device", id);
+	}
+	return device;
+}
+
+function isAdminPrincipal(c: Context): boolean {
+	return c.get("user").role === "admin";
+}
+
+// List devices. Admins see every device; everyone else sees the ones they
+// registered, which is what a management page can act on. Devices merely usable by
+// this user are surfaced through the narrator device list, not here, so another
+// user's directUrl and key prefix are not handed out.
 deviceRoutes.get("/", async (c) => {
 	const devices = await listDevices();
-	return c.json(devices);
+	if (isAdminPrincipal(c)) return c.json(devices);
+	const userId = c.get("user").sub;
+	return c.json(devices.filter((device) => device.createdBy === userId));
 });
 
 // Published executor release info, for the install wizard and version badges.
@@ -70,9 +112,7 @@ deviceRoutes.get("/executor/manifest", async (c) => {
 
 // Get a single device.
 deviceRoutes.get("/:id", async (c) => {
-	const device = await getDevice(c.req.param("id"));
-	if (!device) throw new ValidationError("Device not found");
-	return c.json(device);
+	return c.json(await requireManagedDevice(c));
 });
 
 // Register a new device. Returns the plaintext token exactly once.
@@ -87,6 +127,12 @@ deviceRoutes.post("/", async (c) => {
 	}
 	if (data.scope === "project" && !data.projectId) {
 		throw new ValidationError("projectId is required for project scope");
+	}
+	// A global device is reachable from every project, so making one is an
+	// admin-level act. It is also the marker that makes a device inject by default,
+	// which is precisely the power a non-admin must not be able to grant itself.
+	if (data.scope === "global" && !isAdminPrincipal(c)) {
+		throw new ForbiddenError("Only an administrator may register a global device");
 	}
 
 	const result = await createDevice({
@@ -106,50 +152,101 @@ deviceRoutes.post("/", async (c) => {
 
 // Update a device's metadata.
 deviceRoutes.patch("/:id", async (c) => {
+	await requireManagedDevice(c);
 	const parsed = updateRemoteDeviceSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	// Same gate as creation: promoting an existing device to global would otherwise
+	// be an unguarded back door to the admin-only scope.
+	if (parsed.data.scope === "global" && !isAdminPrincipal(c)) {
+		throw new ForbiddenError("Only an administrator may make a device global");
+	}
 
 	const device = await updateDevice(c.req.param("id"), parsed.data);
-	if (!device) throw new ValidationError("Device not found");
+	if (!device) throw new NotFoundError("Device", c.req.param("id"));
 	return c.json(device);
+});
+
+/**
+ * Read the device's path guard rules.
+ *
+ * `rules` is the desired state recorded here; `reportedRules` is what the device
+ * said it was enforcing at its last handshake. They can differ whenever a saved
+ * change has not been applied on the target machine yet, and the UI is expected to
+ * surface that rather than implying the save took effect.
+ */
+deviceRoutes.get("/:id/path-rules", async (c) => {
+	const device = await requireManagedDevice(c);
+	return c.json({
+		rules: device.pathRules ?? [],
+		reportedRules: device.reportedPathRules,
+		configSnippet: buildPathRulesConfigSnippet(device.pathRules ?? []),
+	});
+});
+
+/**
+ * Record desired path guard rules.
+ *
+ * Saving does not change what the device enforces: the executor reads its rules
+ * from its own config file, so the operator still has to apply the snippet and
+ * restart the service. That is a deliberate trust boundary, not an oversight —
+ * see `updateDevicePathRules`.
+ */
+deviceRoutes.put("/:id/path-rules", async (c) => {
+	await requireManagedDevice(c);
+	const parsed = updateDevicePathRulesSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const device = await updateDevicePathRules(c.req.param("id"), parsed.data.rules);
+	if (!device) throw new NotFoundError("Device", c.req.param("id"));
+	return c.json({
+		rules: device.pathRules ?? [],
+		reportedRules: device.reportedPathRules,
+		configSnippet: buildPathRulesConfigSnippet(device.pathRules ?? []),
+	});
 });
 
 // Inspect the current connection state without starting or restarting a dial.
 deviceRoutes.get("/:id/diagnostics", async (c) => {
+	await requireManagedDevice(c);
 	const diagnostics = await getDeviceConnectionDiagnostics(c.req.param("id"));
-	if (!diagnostics) throw new ValidationError("Device not found");
+	if (!diagnostics) throw new NotFoundError("Device", c.req.param("id"));
 	return c.json(diagnostics);
 });
 
 // Test connectivity/authentication and one bounded RPC round trip.
 deviceRoutes.post("/:id/test", async (c) => {
+	await requireManagedDevice(c);
 	const result = await testDeviceConnection(c.req.param("id"));
-	if (!result) throw new ValidationError("Device not found");
+	if (!result) throw new NotFoundError("Device", c.req.param("id"));
 	return c.json(result);
 });
 
 // Rotate the device token. Returns the new plaintext token once.
 deviceRoutes.post("/:id/rotate-token", async (c) => {
+	await requireManagedDevice(c);
 	const result = await rotateDeviceToken(c.req.param("id"));
-	if (!result) throw new ValidationError("Device not found");
+	if (!result) throw new NotFoundError("Device", c.req.param("id"));
 	return c.json(result);
 });
 
 // Revoke (soft-delete) a device.
 deviceRoutes.delete("/:id", async (c) => {
+	await requireManagedDevice(c);
 	const ok = await revokeDevice(c.req.param("id"));
-	if (!ok) throw new ValidationError("Device not found");
+	if (!ok) throw new NotFoundError("Device", c.req.param("id"));
 	return c.json({ success: true });
 });
 
 // Generate a ready-to-run install script for one device and platform, along with
 // the single-use ticket its download step will spend.
 deviceRoutes.post("/:id/install-script", async (c) => {
-	const device = await getDevice(c.req.param("id"));
-	if (!device) throw new ValidationError("Device not found");
+	// Available to the registrar: without it, registering a device is useless, and
+	// the script grants nothing beyond enrolling a machine the operator already
+	// controls. The download ticket it mints is scoped to this device.
+	const device = await requireManagedDevice(c);
 	const parsed = deviceInstallScriptSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const { platform, mode, allowRoot, disableShell, serverBaseUrl } = parsed.data;
+	const { platform, mode, disableShell, serverBaseUrl } = parsed.data;
 
 	const manifest = await getExecutorManifest();
 	if (!manifest) {
@@ -181,7 +278,6 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 		deviceSlug: device.slug,
 		deviceName: device.name,
 		connectionMode: device.connectionMode,
-		allowRoot,
 		disableShell,
 		artifactFilename: artifact.filename,
 		expectedSha256: artifact.sha256,
@@ -199,10 +295,21 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 	});
 });
 
+/*
+ * ── Filesystem and transfer surface: admin only ───────────────────────────────
+ *
+ * These endpoints below are gated individually rather than by a router-wide
+ * middleware, so that adding a new endpoint above does not silently inherit (or
+ * silently lose) the wrong tier. The transfer endpoints accept an arbitrary
+ * server-local `localPath`, which makes them equivalent to filesystem access on
+ * the NarraFork server — see the tier notes at the top of this file.
+ */
+
 // Browse a remote path (file/dir metadata; recursive lists a directory tree).
 deviceRoutes.get("/:id/fs", async (c) => {
+	assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
-	if (!device) throw new ValidationError("Device not found");
+	if (!device) throw new NotFoundError("Device", c.req.param("id"));
 	const parsed = deviceStatQuerySchema.safeParse({
 		path: c.req.query("path"),
 		recursive: c.req.query("recursive") === "true",
@@ -218,8 +325,10 @@ deviceRoutes.get("/:id/fs", async (c) => {
 // List one level of a remote directory, for interactive path pickers. Separate
 // from /fs above because that endpoint's recursive mode walks whole subtrees.
 deviceRoutes.get("/:id/browse", async (c) => {
-	const device = await getDevice(c.req.param("id"));
-	if (!device) throw new ValidationError("Device not found");
+	// Manager tier, not admin: this reads directory names on the *device* only and
+	// touches no server-local path, and the path-rules editor needs it to let an
+	// operator pick real directories instead of typing them from memory.
+	const device = await requireManagedDevice(c);
 	const parsed = deviceBrowseQuerySchema.safeParse({
 		path: c.req.query("path") || undefined,
 		showHidden: c.req.query("showHidden") === "1",
@@ -240,6 +349,7 @@ deviceRoutes.get("/:id/browse", async (c) => {
 
 // Background transfer tasks return immediately and can be paused/resumed.
 deviceRoutes.post("/:id/transfer-tasks", async (c) => {
+	assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new ValidationError("Device not found");
 	const parsed = deviceTransferSchema.safeParse(await c.req.json());
@@ -253,24 +363,28 @@ deviceRoutes.post("/:id/transfer-tasks", async (c) => {
 });
 
 deviceRoutes.get("/:id/transfer-tasks", async (c) => {
+	assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new ValidationError("Device not found");
 	return c.json(await listDeviceTransferTasks(device.id));
 });
 
 deviceRoutes.get("/:id/transfer-tasks/:taskId", async (c) => {
+	assertAdmin(c);
 	const task = await getDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) throw new ValidationError("Transfer task not found");
 	return c.json(task);
 });
 
 deviceRoutes.post("/:id/transfer-tasks/:taskId/pause", async (c) => {
+	assertAdmin(c);
 	const task = await pauseDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) throw new ValidationError("Transfer task not found");
 	return c.json(task);
 });
 
 deviceRoutes.post("/:id/transfer-tasks/:taskId/cancel", async (c) => {
+	assertAdmin(c);
 	const task = await cancelDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) {
 		throw new ValidationError("Transfer task cannot be cancelled");
@@ -279,6 +393,7 @@ deviceRoutes.post("/:id/transfer-tasks/:taskId/cancel", async (c) => {
 });
 
 deviceRoutes.post("/:id/transfer-tasks/:taskId/resume", async (c) => {
+	assertAdmin(c);
 	const task = await resumeDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) {
 		throw new ValidationError("Transfer task is not resumable");
@@ -288,6 +403,7 @@ deviceRoutes.post("/:id/transfer-tasks/:taskId/resume", async (c) => {
 
 // Synchronous compatibility endpoint. Progress is broadcast via transfer:* events.
 deviceRoutes.post("/:id/transfers", async (c) => {
+	assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new ValidationError("Device not found");
 	const parsed = deviceTransferSchema.safeParse(await c.req.json());

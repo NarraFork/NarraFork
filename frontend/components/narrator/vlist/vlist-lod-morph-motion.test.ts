@@ -29,17 +29,62 @@ function fakeNode(): LodMorphNode & { animations: FakeAnimation[] } {
 	};
 }
 
+/** A plain MOVE (same component at both levels): slides, does not fade. */
 function plan(unitId: string, deltaY: number): LodMorphPlan {
-	return { unitId, deltaY, durationMs: 250 };
+	return { unitId, deltaY, fade: false, durationMs: 250 };
+}
+
+/** A RE-THEME (the component was swapped): slides and cross-fades. */
+function swapPlan(unitId: string, deltaY: number): LodMorphPlan {
+	return { unitId, deltaY, fade: true, durationMs: 250 };
 }
 
 describe("playLodMorph", () => {
-	it("slides + fades the new node from the old element's screen position", () => {
+	it("slides the new node from the old element's screen position", () => {
 		const node = fakeNode();
 		playLodMorph(plan("tool-a", -200), node);
 		const frames = node.animations[0]?.keyframes ?? [];
+		expect(frames[0]).toMatchObject({ transform: "translateY(-200px)" });
+		expect(frames.at(-1)).toMatchObject({ transform: "translateY(0px)" });
+	});
+
+	it("cross-fades a re-theme, so the component swap is masked", () => {
+		const node = fakeNode();
+		playLodMorph(swapPlan("tool-a", -200), node);
+		const frames = node.animations[0]?.keyframes ?? [];
 		expect(frames[0]).toMatchObject({ opacity: 0, transform: "translateY(-200px)" });
 		expect(frames.at(-1)).toMatchObject({ opacity: 1, transform: "translateY(0px)" });
+	});
+
+	/**
+	 * A body that merely moved keeps its component and its content, so fading it makes
+	 * unchanged prose blink once per zoom step. `opacity` must be ABSENT rather than
+	 * pinned to 1: writing it hands the property to the animation for the duration,
+	 * which is a needless composited layer on a node whose opacity never changes.
+	 */
+	it("writes no opacity at all for a plain move", () => {
+		const node = fakeNode();
+		playLodMorph(plan("m1-b0", -200), node);
+		for (const frame of node.animations[0]?.keyframes ?? []) {
+			expect(frame).not.toHaveProperty("opacity");
+		}
+	});
+
+	/**
+	 * The planner emits `deltaY: 0, fade: true` for a re-theme whose travel had to be
+	 * dropped — an activity fold that swapped the component in place, or a nested row
+	 * whose start box fell outside its clip. Writing a `translateY(0px)` pair there
+	 * hands `transform` to the animation (and thus a composited layer) for nothing.
+	 */
+	it("fades in place without touching transform when deltaY is 0", () => {
+		const node = fakeNode();
+		playLodMorph(swapPlan("tool-a", 0), node);
+		const frames = node.animations[0]?.keyframes ?? [];
+		expect(frames[0]).toEqual({ offset: 0, opacity: 0 });
+		expect(frames.at(-1)).toEqual({ offset: 1, opacity: 1 });
+		for (const frame of frames) {
+			expect(frame).not.toHaveProperty("transform");
+		}
 	});
 
 	it("animates only composited properties — never top/height/scaleY", () => {

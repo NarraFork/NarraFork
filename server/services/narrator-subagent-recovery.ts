@@ -1148,7 +1148,9 @@ export async function resumeRecoverySubagents(input: {
 			const title = subagent.title?.trim() || subagentId;
 			const subagentType = subagent.subagentType?.trim() || "general";
 
-			// a) stable alias so the model can Await it later
+			// a) stable alias so the model can Await it later. `title` may itself be the
+			//    id (untitled subagent); the alias builder recognizes that and falls back
+			//    to a short id instead of slugifying the whole nanoid.
 			const { alias } = await registerAndPersistSubagentAlias(input.narratorId, subagentId, title);
 			// b) durable background task row (idempotent restart when it exists)
 			await backgroundTaskService.createAgentTask({

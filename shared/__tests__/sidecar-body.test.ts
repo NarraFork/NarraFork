@@ -47,41 +47,27 @@ const EN: SideCarModelTemplates = {
 You have completed {count} tool call(s) since your last visible text reply. Before calling any more tools, briefly tell the user in one sentence what you are working on right now, then continue.
 </progress_update_request>`,
 	noticeRelaxedPlan: `<relaxed_plan_reminder>
-You are still in relaxed plan mode. This non-read-only tool call was allowed only so planning can continue with full context. Do not start implementation work yet. Continue investigating or refining the plan, then call ExitPlanMode to submit the complete plan for approval.
+You are still in relaxed plan mode, and this tool call modified something outside your plan file. Non-read-only tools are available only so planning can continue with full context — they are not permission to start implementing. Do not write or change implementation code yet.
+Your plan belongs in: {planFile}
+Continue investigating or refining the plan there, then call ExitPlanMode to submit the complete plan for approval.
 </relaxed_plan_reminder>`,
 	noticePipelineExit:
 		"[SYSTEM: Pipeline has already been used to extract captured output and is still active. Before making more tool calls, confirm whether you still need Pipeline. If not, stop using Pipeline so its captures can be cleaned up by the inactivity limit instead of continuing to accumulate.]",
 	behavior_fenceHeading:
 		"Behavior fence (durable behavior constraints set by the user — you must obey them):",
-	tasksCurrentHeading: "Current Dynamic Spec reminder (compiled from spec://tasks.json):",
-	tasksCurrentUpdateNote:
-		"If task state changed, update spec://tasks.json with Read/Edit/Write. Do not add IDs, timestamps, or notes fields to tasks.json.",
-	tasksEmptyHeading: "Dynamic Spec reminder (spec://tasks.json has no active tasks):",
+	tasksCurrentHeading: "Dynamic Spec — open tasks (spec://tasks.json):",
+	tasksCurrentUpdateNote: "Update spec://tasks.json if any state changed.",
+	tasksEmptyHeading: "Dynamic Spec — no open tasks.",
 	tasksEmptyNeverCreate:
-		"- You have not created any task in spec://tasks.json yet. If this is multi-step or non-trivial work, use Write/Edit to build a task list to track progress, e.g. one doing plus a few todo.",
-	tasksEmptyNeverSkip:
-		"- If the current work is genuinely simple and does not need to be broken down, you may ignore this reminder.",
+		"- Multi-step work? Write a task list to spec://tasks.json (one doing plus a few todo).",
+	tasksEmptyNeverSkip: "- Simple work needs no list; ignore this if so.",
 	tasksEmptyDoneReorganize:
-		"- The previous phase is complete. Before starting the next round of work, reassess the current goal and context, then reorganize spec://tasks.json: remove completed ordinary tasks, preserve protected-task intent, and keep only a concise set of necessary doing/todo/blocked tasks for the current phase.",
-	tasksEmptyDoneContinue:
-		"- Continue the work only after the task list is refreshed; do not retain completed tasks merely as history.",
+		"- Previous phase is done. Reorganize spec://tasks.json for the next one: drop completed ordinary tasks, keep a concise doing/todo/blocked set, preserve protected-task intent.",
+	tasksEmptyDoneContinue: "- Refresh the list before continuing.",
 	tasksTooManyHeading:
-		"Dynamic Spec reorganization reminder (spec://tasks.json has {count} tasks, exceeding {threshold}):",
+		"Dynamic Spec — {count} tasks in spec://tasks.json, over the {threshold} threshold.",
 	tasksTooManyReorganize:
-		"- Reorganize the task list before continuing: merge duplicate or closely related tasks, remove obsolete ordinary tasks, split oversized tasks, and keep only the necessary doing/todo/blocked tasks for the current phase.",
-	tasksTooManyProtected:
-		"- Preserve protected-task intent; do not rewrite, delete, or replace a protected task to bypass its goal.",
-	tasksFieldsNote:
-		"- Keep tasks.json to only text/status/protected; do not add IDs, timestamps, summaries, or other fields.",
-	tasksSemanticsNote:
-		"- Every open task must be finite, executable, and have a completion condition; an open protected task may trigger automatic continuation. Do not store standing behavior rules or constraints without a terminal state as tasks; those belong in spec://behavior_fence.",
-	tasksProtectedOnlyOnUserDemand:
-		"- Do not add protected yourself. It is only for tasks whose completion the user explicitly demanded be guaranteed.",
-	tasksBlockedActionNote: `Blocked-task rule:
-- A blocked task means the task itself cannot currently finish; it does not automatically mean work should stop.
-- If progress requires user-only information, permission, or a product/strategy decision, finish all independent work first, then ask exactly one targeted question.
-- If user input is not required and an investigation, evidence-gathering step, experiment, fix, or alternative path can remove the blocker, do not end the turn by merely explaining the blocker or repeating the same conclusion. Keep the original task blocked, add a concrete actionable unblock task to tasks.json as doing (and later steps as todo), then immediately use tools to execute it.
-- Only when no autonomous path exists may you explain an external hard blocker once and stop; never repeat the same blocker explanation across continuation turns.`,
+		"- Reorganize before continuing: merge duplicates, drop obsolete ordinary tasks, split oversized ones, keep only this phase's doing/todo/blocked. Preserve protected-task intent.",
 	knowledgeHeading: "Relevant knowledge-base entries were found based on the latest tool output:",
 	knowledgeReadHint: "(Use KnowledgeRead with an id for full content.)",
 	bgAgentEntry: `[System] Background agent "{title}" (ID: {id}) {status}.
@@ -107,37 +93,26 @@ const ZH: SideCarModelTemplates = {
 你已经连续 {count} 次工具调用没有向用户输出可见文本。继续调用更多工具前，请先用一句话简短告诉用户你当前正在做什么，然后继续。
 </progress_update_request>`,
 	noticeRelaxedPlan: `<relaxed_plan_reminder>
-你仍处于宽松计划模式。此次非只读工具调用只是为了让规划能带着完整上下文继续进行，并不表示可以开始实现。不要现在开始写实现代码；请继续调查或完善计划，然后调用 ExitPlanMode 提交完整计划供用户批准。
+你仍处于宽松计划模式，而这次工具调用改动了计划文件以外的内容。非只读工具只是为了让规划能带着完整上下文继续进行，并不表示可以开始实现。现在不要编写或修改实现代码。
+你的计划应写入：{planFile}
+请继续在该文件中调查或完善计划，然后调用 ExitPlanMode 提交完整计划供用户批准。
 </relaxed_plan_reminder>`,
 	noticePipelineExit:
 		"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
 	behavior_fenceHeading: "行为护栏（用户设定的行为约束，务必遵守）：",
-	tasksCurrentHeading: "当前 Dynamic Spec 提醒（由 spec://tasks.json 编译生成）：",
-	tasksCurrentUpdateNote:
-		"如任务状态已变化，请用 Read/Edit/Write 更新 spec://tasks.json；不要在 tasks.json 中添加 ID、时间戳或说明字段。",
-	tasksEmptyHeading: "Dynamic Spec 提醒（spec://tasks.json 当前没有进行中的任务）：",
+	tasksCurrentHeading: "Dynamic Spec 当前任务（spec://tasks.json）：",
+	tasksCurrentUpdateNote: "状态有变化就更新 spec://tasks.json。",
+	tasksEmptyHeading: "Dynamic Spec 当前没有开放任务。",
 	tasksEmptyNeverCreate:
-		"- 你还没有在 spec://tasks.json 建立任何任务。如果当前是多步骤或较复杂的工作，请用 Write/Edit 建立任务清单来跟踪进度，例如一条 doing + 若干 todo。",
-	tasksEmptyNeverSkip: "- 如果当前工作确实简单、无需拆分，可以忽略本提醒。",
+		"- 如果是多步骤工作，请在 spec://tasks.json 建立任务清单（一条 doing + 若干 todo）。",
+	tasksEmptyNeverSkip: "- 工作简单则无需拆分，可忽略本提醒。",
 	tasksEmptyDoneReorganize:
-		"- 上一阶段任务已全部完成。现在开始下一轮工作前，请先重新审视当前目标和上下文，整理 spec://tasks.json：清理已完成的普通任务，保留 protected task 的用户意图，并只保留当前阶段必要且精简的 doing/todo/blocked 任务。",
-	tasksEmptyDoneContinue: "- 整理完成后再继续当前工作；不要为了保留历史而堆积已完成任务。",
+		"- 上一阶段已完成。请为下一阶段整理 spec://tasks.json：清理已完成的普通任务，只保留精简的 doing/todo/blocked，并保留 protected task 的用户意图。",
+	tasksEmptyDoneContinue: "- 整理完再继续。",
 	tasksTooManyHeading:
-		"Dynamic Spec 整理提醒（spec://tasks.json 当前有 {count} 条任务，超过 {threshold} 条）：",
+		"Dynamic Spec 当前有 {count} 条任务（spec://tasks.json），超过 {threshold} 条。",
 	tasksTooManyReorganize:
-		"- 请先重新整理任务清单，再继续执行：合并重复或高度相关的任务，删除已过期的普通任务，拆分过大的任务，并确保当前阶段只有必要的 doing/todo/blocked 任务。",
-	tasksTooManyProtected:
-		"- protected task 的用户意图必须保留；不要通过改写、删除或替换 protected task 来绕过目标。",
-	tasksFieldsNote:
-		"- tasks.json 只保留 text/status/protected，不要添加 ID、时间戳、摘要或其他字段。",
-	tasksSemanticsNote:
-		"- 每条开放任务必须有限、可执行且有完成条件；protected task 未完成时可能触发自动续跑。不要把长期行为规则或无终点约束写成任务，这类内容属于 spec://behavior_fence。",
-	tasksProtectedOnlyOnUserDemand: "- 不要自行添加 protected。它只用于用户明确要求确保完成的任务。",
-	tasksBlockedActionNote: `blocked 任务处理规则：
-- blocked 表示该任务本身暂时不能完成，不自动等于停止工作。
-- 如果推进需要用户独有的信息、权限或产品/方案决策，先完成所有不受阻工作，再只提出一个精确问题。
-- 如果不需要用户介入，并且可以通过调查、取证、实验、修复或替代路径解除阻塞，不能只解释阻塞或重复相同结论。保留原 blocked 任务，在 tasks.json 中新增一个具体、可执行的解阻任务并标为 doing（后续步骤标为 todo），然后立即调用工具执行。
-- 只有确实不存在自主推进路径时，才可说明一次外部硬阻塞并停止；不得在续跑回合中重复同一阻塞说明。`,
+		"- 请先整理再继续：合并重复项，删除过期的普通任务，拆分过大的任务，只保留当前阶段的 doing/todo/blocked。protected task 的用户意图必须保留。",
 	subagentMessageEntry: `[来自子代理"{name}"（{type}）的进展汇报]：
 {text}`,
 	specUpdateHeading: "[系统] 用户通过 Spec 面板更新了以下文件，请注意同步你的工作计划：",
@@ -168,15 +143,32 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 	});
 
 	it("relaxed_plan and pipeline_exit_confirmation reproduce their tool messages", () => {
-		expect(renderSideCarBodyToText("relaxed_plan", { kind: "notice" }, EN)).toContain(
-			"<relaxed_plan_reminder>",
-		);
-		expect(renderSideCarBodyToText("relaxed_plan", { kind: "notice" }, EN)).toBe(
-			EN.noticeRelaxedPlan as string,
+		const body: SideCarBody = {
+			kind: "notice",
+			params: { planFile: ".narrafork/plans/plan-abc.md" },
+		};
+		expect(renderSideCarBodyToText("relaxed_plan", body, EN)).toContain("<relaxed_plan_reminder>");
+		expect(renderSideCarBodyToText("relaxed_plan", body, EN)).toBe(
+			(EN.noticeRelaxedPlan as string).replace("{planFile}", ".narrafork/plans/plan-abc.md"),
 		);
 		expect(renderSideCarBodyToText("pipeline_exit_confirmation", { kind: "notice" }, ZH)).toBe(
 			ZH.noticePipelineExit as string,
 		);
+	});
+
+	it("relaxed_plan names the designated plan file so the model knows where to write", () => {
+		// The reminder's whole job is to say "keep planning" — which is useless if the
+		// model then has to rediscover WHERE the plan goes from an EnterPlanMode result
+		// many turns back. Both locales must interpolate the path, not print `{planFile}`.
+		const body: SideCarBody = {
+			kind: "notice",
+			params: { planFile: ".narrafork/plans/plan-xyz.md" },
+		};
+		for (const templates of [EN, ZH]) {
+			const text = renderSideCarBodyToText("relaxed_plan", body, templates);
+			expect(text).toContain(".narrafork/plans/plan-xyz.md");
+			expect(text).not.toContain("{planFile}");
+		}
 	});
 
 	it("an unmapped notice source renders empty rather than a wrong reminder", () => {
@@ -200,7 +192,13 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 		expect(renderSideCarBodyToText("buffered_user", { kind: "prose", text }, EN)).toBe(text);
 	});
 
-	it("tasks/current reproduces buildSpecToolResultReminder's open-task shape", () => {
+	// ⚠️ The four `tasks` variants are injected MID-TURN on a tool-call cadence, so their
+	// LENGTH is part of the contract, not just their content. Each one is: heading, the
+	// task lines, and at most two action lines. The rules they used to repeat
+	// (`tasksFieldsNote`, `tasksSemanticsNote`, `tasksProtectedOnlyOnUserDemand`, the
+	// blocked-task rule) are in the system prompt of every request — asserted absent
+	// below so a future edit cannot quietly put them back.
+	it("tasks/current is the heading, the tasks, and one update line", () => {
 		const body: SideCarBody = {
 			kind: "tasks",
 			variant: "current",
@@ -210,65 +208,62 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 				{ role: "todo", text: "Write the tests" },
 			],
 		};
-		// Original: heading, `- ${prefix}: ${text}${protected ? " [protected]" : ""}` lines,
-		// the update note, the semantics reminder, then the blocked-task rule.
 		expect(renderSideCarBodyToText("living_work_spec", body, EN)).toBe(
 			[
-				"Current Dynamic Spec reminder (compiled from spec://tasks.json):",
+				"Dynamic Spec — open tasks (spec://tasks.json):",
 				"- doing: Implement the parser",
 				"- blocked: Collect missing trace evidence [protected]",
 				"- todo: Write the tests",
 				EN.tasksCurrentUpdateNote,
-				EN.tasksSemanticsNote,
-				EN.tasksBlockedActionNote,
 			].join("\n"),
 		);
 		expect(renderSideCarBodyToText("living_work_spec", body, ZH)).toBe(
 			[
-				"当前 Dynamic Spec 提醒（由 spec://tasks.json 编译生成）：",
+				"Dynamic Spec 当前任务（spec://tasks.json）：",
 				"- doing: Implement the parser",
 				"- blocked: Collect missing trace evidence [protected]",
 				"- todo: Write the tests",
 				ZH.tasksCurrentUpdateNote,
-				ZH.tasksSemanticsNote,
-				ZH.tasksBlockedActionNote,
 			].join("\n"),
 		);
 	});
 
-	it("tasks/emptyNever and emptyDone reproduce buildEmptyTasksNudge's two tones", () => {
+	it("tasks/current does not repeat what the system prompt already says", () => {
+		const body: SideCarBody = {
+			kind: "tasks",
+			variant: "current",
+			tasks: [{ role: "blocked", text: "Collect missing trace evidence" }],
+		};
+		const out = renderSideCarBodyToText("living_work_spec", body, EN);
+		// The blocked-task rule: in the system prompt, not in a per-cadence digest.
+		expect(out).not.toContain("Blocked-task rule");
+		expect(out).not.toContain("unblock task");
+		// tasks.json's shape and the protected/finite-task semantics: likewise.
+		expect(out).not.toContain("text/status/protected");
+		expect(out).not.toContain("finite, executable");
+		expect(out).not.toContain("Do not add protected yourself");
+		// Four lines total: heading + one task + one action line is three, so this is a
+		// cheap guard against the digest growing again.
+		expect(out.split("\n").length).toBeLessThanOrEqual(4);
+	});
+
+	it("tasks/emptyNever and emptyDone keep their two distinct tones", () => {
 		expect(
 			renderSideCarBodyToText("living_work_spec", { kind: "tasks", variant: "emptyNever" }, EN),
-		).toBe(
-			[
-				EN.tasksEmptyHeading,
-				EN.tasksEmptyNeverCreate,
-				EN.tasksEmptyNeverSkip,
-				EN.tasksFieldsNote,
-				EN.tasksSemanticsNote,
-				EN.tasksProtectedOnlyOnUserDemand,
-			].join("\n"),
-		);
+		).toBe([EN.tasksEmptyHeading, EN.tasksEmptyNeverCreate, EN.tasksEmptyNeverSkip].join("\n"));
 		expect(
 			renderSideCarBodyToText("living_work_spec", { kind: "tasks", variant: "emptyDone" }, EN),
 		).toBe(
-			[
-				EN.tasksEmptyHeading,
-				EN.tasksEmptyDoneReorganize,
-				EN.tasksEmptyDoneContinue,
-				EN.tasksFieldsNote,
-				EN.tasksSemanticsNote,
-				EN.tasksProtectedOnlyOnUserDemand,
-			].join("\n"),
+			[EN.tasksEmptyHeading, EN.tasksEmptyDoneReorganize, EN.tasksEmptyDoneContinue].join("\n"),
 		);
 		// The all-done branch must not reuse the never-created phrasing (asserted
 		// upstream in spec-reminder.test.ts too).
 		expect(
 			renderSideCarBodyToText("living_work_spec", { kind: "tasks", variant: "emptyDone" }, EN),
-		).not.toContain("have not created any task");
+		).not.toContain("Multi-step work?");
 	});
 
-	it("tasks/tooMany reproduces buildTooManyTasksNudge including both numbers", () => {
+	it("tasks/tooMany states both numbers in one line plus one action line", () => {
 		const body: SideCarBody = {
 			kind: "tasks",
 			variant: "tooMany",
@@ -277,12 +272,8 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 		};
 		expect(renderSideCarBodyToText("living_work_spec", body, EN)).toBe(
 			[
-				`Dynamic Spec reorganization reminder (spec://tasks.json has 31 tasks, exceeding ${THRESHOLD}):`,
+				`Dynamic Spec — 31 tasks in spec://tasks.json, over the ${THRESHOLD} threshold.`,
 				EN.tasksTooManyReorganize,
-				EN.tasksTooManyProtected,
-				EN.tasksFieldsNote,
-				EN.tasksSemanticsNote,
-				EN.tasksProtectedOnlyOnUserDemand,
 			].join("\n"),
 		);
 		expect(renderSideCarBodyToText("living_work_spec", body, ZH)).toContain(`超过 ${THRESHOLD} 条`);
@@ -303,6 +294,29 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 				"- [k2] FTS5 trigram: CJK search\n" +
 				"\n(Use KnowledgeRead with an id for full content.)",
 		);
+	});
+
+	// The agent flavour's id slot is an Await/Send selector, so — like bash below —
+	// it prints `alias ?? id`. A raw narrator nanoid there is what taught the model
+	// to keep addressing agents by gibberish.
+	it("tasksDone/agent prefers the alias in the selector slot", () => {
+		const body: SideCarBody = {
+			kind: "tasksDone",
+			flavor: "agent",
+			items: [
+				{
+					id: "UscgG1vLFnxzyKyaUOIfR",
+					alias: "read-the-two-paths",
+					title: "read the two paths",
+					status: "done",
+					preview: "both read",
+				},
+			],
+		};
+		const text = renderSideCarBodyToText("bg_agent", body, EN);
+		expect(text).toContain("(ID: read-the-two-paths)");
+		expect(text).not.toContain("UscgG1vLFnxzyKyaUOIfR");
+		expect(text).toContain('Await({ type: "agent", id: "read-the-two-paths" })');
 	});
 
 	it("tasksDone/agent reproduces formatBackgroundCompletionNotifications", () => {
@@ -385,6 +399,59 @@ also done`,
 		);
 	});
 
+	/**
+	 * The reader's navigation targets must never reach the model.
+	 *
+	 * `fromMessageId` / `resultMessageId` exist so a UI row can open the right session at
+	 * the right place. Leaking them into the model-facing text would (a) change bytes
+	 * this file exists to freeze and (b) teach the model to quote internal ids back at
+	 * us — the same failure the alias work fixed for narrator ids.
+	 */
+	it("never prints a reader-only message id in the model-facing text", () => {
+		const message = renderSideCarBodyToText(
+			"subagent_message",
+			{
+				kind: "messages",
+				items: [
+					{
+						fromId: "abcdefghij0123",
+						fromTitle: "explore-sidecar",
+						fromType: "explore",
+						fromMessageId: "msg-SECRET-1",
+						text: "done",
+					},
+				],
+			},
+			EN,
+		);
+		expect(message).not.toContain("msg-SECRET-1");
+		// And the bytes are exactly what they were without the field.
+		expect(message).toBe(`[Progress report from subagent "explore-sidecar" (explore)]:
+done`);
+
+		const done = renderSideCarBodyToText(
+			"bg_agent",
+			{
+				kind: "tasksDone",
+				flavor: "agent",
+				items: [
+					{
+						id: "a1",
+						title: "read the two paths",
+						status: "done",
+						preview: "both read",
+						resultMessageId: "msg-SECRET-2",
+					},
+				],
+			},
+			EN,
+		);
+		expect(done).not.toContain("msg-SECRET-2");
+		expect(done).toBe(`[System] Background agent "read the two paths" (ID: a1) done.
+Result preview: both read
+Use Await({ type: "agent", id: "a1" }) to see the full result, or Send({ id: "a1", message }) to continue.`);
+	});
+
 	it("messages/team reproduces the inline team formatter (FULL id fallback, newline joined)", () => {
 		// Two divergences from the subagent shape, both deliberate parity details:
 		// the id fallback is NOT truncated, and entries join with a single newline.
@@ -405,6 +472,52 @@ also done`,
 			"[Team broadcast from full-id-here (general)]: hi all\n" +
 				"[Team message from reviewer (review)]: one nit",
 		);
+	});
+
+	// An untitled sender used to be named by its id — truncated on the parent-report
+	// channel, in FULL on the team channel. Both are injected into the recipient's
+	// prompt, so a readable alias takes precedence when the producer supplies one.
+	it("messages prefer the sender's alias over its id when untitled", () => {
+		const body: SideCarBody = {
+			kind: "messages",
+			items: [
+				{
+					fromId: "UscgG1vLFnxzyKyaUOIfR",
+					fromTitle: null,
+					fromLabel: "trace-providers",
+					fromType: "explore",
+					text: "found it",
+				},
+			],
+		};
+		for (const source of ["subagent_message", "team_message"]) {
+			const text = renderSideCarBodyToText(source, body, EN);
+			expect(text).toContain("trace-providers");
+			expect(text).not.toContain("UscgG1vLFnxzyKyaUOIfR");
+		}
+	});
+
+	it("a title still outranks the alias, and the id fallback survives for old rows", () => {
+		const titled: SideCarBody = {
+			kind: "messages",
+			items: [
+				{
+					fromId: "UscgG1vLFnxzyKyaUOIfR",
+					fromTitle: "Explorer",
+					fromLabel: "trace-providers",
+					fromType: "explore",
+					text: "found it",
+				},
+			],
+		};
+		expect(renderSideCarBodyToText("subagent_message", titled, EN)).toContain("Explorer");
+
+		// Rows persisted before `fromLabel` existed keep their historical rendering.
+		const legacy: SideCarBody = {
+			kind: "messages",
+			items: [{ fromId: "zyxwvutsrq", fromType: "general", text: "also done" }],
+		};
+		expect(renderSideCarBodyToText("subagent_message", legacy, EN)).toContain("zyxwvuts");
 	});
 
 	it("specUpdates reproduces formatSpecUpdateSideCars (heading, blank line, blocks)", () => {

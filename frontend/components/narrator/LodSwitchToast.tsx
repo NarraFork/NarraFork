@@ -23,7 +23,8 @@ const HOLD_MS = 750;
 /**
  * LodSwitchToast — the render-LOD indicator.
  *
- * ONE appearance, always: a density icon, a 6-notch gauge where every notch is
+ * ONE appearance, always: a density icon, a notch gauge (one notch per level in
+ * `LOD_LEVELS`) where every notch is
  * its own click target, and −/+ steppers on either side. Notched wheels report a
  * huge delta per detent, so alt+wheel alone made the middle levels hard to land
  * on and was unreachable without a wheel; the click targets fix that, and they

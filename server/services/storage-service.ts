@@ -4,7 +4,20 @@ import { lstat, readdir, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narratorMessages, narrators, projects } from "../db/schema";
+import {
+	chapters,
+	chatAttachments,
+	chatRooms,
+	narratorMessages,
+	narrators,
+	projects,
+} from "../db/schema";
+import {
+	CHAT_DRAFT_ATTACHMENT_TTL_MS,
+	deleteChatAttachmentFiles,
+	getChatAttachmentsDir,
+	listStoredChatAttachmentNames,
+} from "../lib/chat-attachments";
 import { logger } from "../lib/logger";
 import { getNarraforkHome, getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
@@ -269,6 +282,31 @@ export async function scanUploads(): Promise<StorageCategoryResult> {
 			narratorDirs: narratorCount,
 			avatarBytes,
 		},
+	};
+}
+
+/**
+ * Chat attachments (`~/.narrafork/chat-attachments`).
+ *
+ * Its own category rather than folded into `uploads`: the two have different owners
+ * and different reclamation rules (a room vs. a narrator), so a combined figure
+ * could not tell an operator which cleanup button would actually free it.
+ */
+async function scanChatAttachments(): Promise<StorageCategoryResult> {
+	const dir = getChatAttachmentsDir();
+	const measured = await measureDirSize(dir);
+	let roomCount = 0;
+	try {
+		const entries = await readdir(dir, { withFileTypes: true });
+		roomCount = entries.filter((entry) => entry.isDirectory()).length;
+	} catch {
+		// dir may not exist
+	}
+	return {
+		key: "chatAttachments",
+		sizeBytes: measured.sizeBytes,
+		...(measured.truncated ? { truncated: true } : {}),
+		details: { roomDirs: roomCount },
 	};
 }
 
@@ -572,6 +610,12 @@ export async function* scanStorage(
 	yield { type: "category", data: uploadsResult };
 
 	throwIfAborted(signal);
+	yield { type: "progress", message: "scanning_chat_attachments" };
+	const chatAttachmentsResult = await scanChatAttachments();
+	categories.push(chatAttachmentsResult);
+	yield { type: "category", data: chatAttachmentsResult };
+
+	throwIfAborted(signal);
 	yield { type: "progress", message: "scanning_shares" };
 	const sharesResult = await scanShares();
 	categories.push(sharesResult);
@@ -653,6 +697,126 @@ export async function cleanupOrphanedUploads(): Promise<{ removed: number; freed
 	}
 
 	// Invalidate cache
+	cachedResult = null;
+	return { removed, freedBytes };
+}
+
+/**
+ * Reclaim chat attachments nothing can reach.
+ *
+ * Three distinct kinds of garbage, and they are NOT the same problem:
+ *
+ *  1. **Abandoned drafts** — a row with `message_id` null, older than the grace
+ *     window. Uploads are persisted before their message exists, so a composer that
+ *     is closed without sending leaves one behind. The window matters: sweeping
+ *     unclaimed rows immediately would delete an attachment a user is still typing
+ *     a message around.
+ *  2. **Files with no row** — a write that landed while the DB insert failed, or a
+ *     leftover from an older build. Reconciled per room against the rows, so the
+ *     comparison stays bounded by one room's attachment count.
+ *  3. **Directories with no room** — the room (or its narrator) was deleted. The
+ *     `chat_attachments` rows cascaded away with it; the files did not.
+ *
+ * Every read is bounded and indexed. Deliberately no whole-table scan of
+ * `chat_attachments`: the drafts query is filtered by the partial-index-friendly
+ * `(room_id, claimed_at)` predicate and capped, and the per-room reconciliation only
+ * ever reads the rooms that actually have a directory on disk.
+ */
+export async function cleanupOrphanedChatAttachments(): Promise<{
+	removed: number;
+	freedBytes: number;
+}> {
+	const root = getChatAttachmentsDir();
+	if (!existsSync(root)) return { removed: 0, freedBytes: 0 };
+
+	let removed = 0;
+	let freedBytes = 0;
+
+	// (1) Abandoned drafts. Capped so one sweep cannot turn into an unbounded delete;
+	// whatever is left over is collected by the next run.
+	const DRAFT_SWEEP_LIMIT = 500;
+	const cutoff = new Date(Date.now() - CHAT_DRAFT_ATTACHMENT_TTL_MS).toISOString();
+	const staleDrafts = db
+		.select({
+			id: chatAttachments.id,
+			roomId: chatAttachments.roomId,
+			storedName: chatAttachments.storedName,
+			sizeBytes: chatAttachments.sizeBytes,
+		})
+		.from(chatAttachments)
+		.where(sql`${chatAttachments.messageId} IS NULL AND ${chatAttachments.createdAt} < ${cutoff}`)
+		.limit(DRAFT_SWEEP_LIMIT)
+		.all();
+	if (staleDrafts.length > 0) {
+		db.delete(chatAttachments)
+			.where(
+				sql`${chatAttachments.id} IN (${sql.join(
+					staleDrafts.map((row) => sql`${row.id}`),
+					sql`, `,
+				)})`,
+			)
+			.run();
+		deleteChatAttachmentFiles(staleDrafts);
+		removed += staleDrafts.length;
+		freedBytes += staleDrafts.reduce((total, row) => total + row.sizeBytes, 0);
+		logger.info("Removed abandoned chat attachment drafts", { count: staleDrafts.length });
+	}
+
+	// (2) + (3) Reconcile the directories on disk against the rooms and rows.
+	const liveRoomIds = new Set(
+		db
+			.select({ id: chatRooms.id })
+			.from(chatRooms)
+			.all()
+			.map((r) => r.id),
+	);
+	let entries: Dirent[];
+	try {
+		entries = await readdir(root, { withFileTypes: true });
+	} catch {
+		cachedResult = null;
+		return { removed, freedBytes };
+	}
+
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		const roomId = entry.name;
+		const dirPath = resolve(root, roomId);
+
+		if (!liveRoomIds.has(roomId)) {
+			const size = await dirSize(dirPath);
+			await rm(dirPath, { recursive: true, force: true });
+			removed++;
+			freedBytes += size;
+			logger.info("Removed chat attachments for a deleted room", { roomId, size });
+			continue;
+		}
+
+		// One room's rows: bounded by that room's attachment count and served by the
+		// `(room_id, claimed_at)` index.
+		const known = new Set(
+			db
+				.select({ storedName: chatAttachments.storedName })
+				.from(chatAttachments)
+				.where(eq(chatAttachments.roomId, roomId))
+				.all()
+				.map((row) => row.storedName),
+		);
+		for (const storedName of listStoredChatAttachmentNames(roomId)) {
+			if (known.has(storedName)) continue;
+			const filePath = resolve(dirPath, storedName);
+			try {
+				const size = (await stat(filePath)).size;
+				await rm(filePath, { force: true });
+				removed++;
+				freedBytes += size;
+				logger.info("Removed unreferenced chat attachment file", { roomId, storedName, size });
+			} catch {
+				// Already gone, or unreadable — nothing to reclaim either way.
+			}
+		}
+	}
+
 	cachedResult = null;
 	return { removed, freedBytes };
 }
@@ -860,6 +1024,7 @@ export const storageService = {
 	invalidateStorageCache,
 	scanStorage,
 	cleanupOrphanedUploads,
+	cleanupOrphanedChatAttachments,
 	cleanupOrphanedIgnoredArchives,
 	cleanupAllShares,
 	cleanupOrphanedWorktrees,

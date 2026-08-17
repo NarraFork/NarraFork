@@ -41,6 +41,16 @@ export const NARRATOR_STATUS_RESERVED_TEXT_WIDTH_PX = 96;
 const RESTORE_HYSTERESIS_PX = 8;
 
 export interface NarratorStatusToolbarVisualOverflow {
+	/**
+	 * Reserve space for absolutely positioned badges. Prefer the inline axis.
+	 *
+	 * A one-sided block reserve is almost always wrong here: each wrapper is a
+	 * centre-aligned flex item, so padding on a single side moves that control off
+	 * the row's shared centre line and it reads as "this button sits lower than
+	 * its neighbours". A symmetric reserve keeps the centre but grows the row past
+	 * NARRATOR_STATUS_ROW_MIN_HEIGHT_PX. Badges painted inside a control that
+	 * clips its own overflow (ActionIcon does) cannot be rescued by either.
+	 */
 	blockStart?: number;
 	blockEnd?: number;
 	inlineStart?: number;

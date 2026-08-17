@@ -61,10 +61,9 @@ export interface ComputeLayoutOptions {
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
 	/**
-	 * Row-KEY addressed expansion, for the two traces that fold a LIVE row list
-	 * (`activity-trace` / `tool-run-summary`). See `AdapterContext.isRowExpanded`
-	 * for why an index cannot survive a live run — and why the append-only traces
-	 * stay on `expandedRows`.
+	 * Row-KEY addressed expansion, for the trace that folds a LIVE row list
+	 * (`activity-trace`). See `AdapterContext.isRowExpanded` for why an index cannot
+	 * survive a live run — and why the append-only traces stay on `expandedRows`.
 	 */
 	isRowExpanded?: (traceKey: string, rowKey: string) => boolean;
 	/** Resolve whether a translated body shows its ORIGINAL text. */

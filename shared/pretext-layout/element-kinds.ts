@@ -19,7 +19,6 @@ export type VListElementKind =
 	| "subagent-recovery"
 	| "tool-call"
 	| "tool-call-group"
-	| "tool-run-summary"
 	| "tool-run-count"
 	| "activity-trace"
 	| "reasoning-steps"

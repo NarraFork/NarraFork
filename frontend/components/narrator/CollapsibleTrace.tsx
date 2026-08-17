@@ -6,6 +6,7 @@ import {
 	type ToolShimmerFlash,
 	type ToolShimmerKind,
 	TRACE_SHIMMER_CLASS,
+	TRACE_SHIMMER_FLASH_HOLD_MS,
 } from "@shared/tool-shimmer";
 import { IconChevronDown, IconChevronRight, IconDots } from "@tabler/icons-react";
 import { type CSSProperties, memo, type ReactNode, useEffect, useRef, useState } from "react";
@@ -278,8 +279,13 @@ export function TraceIconSlot({ icon, color = "gray" }: { icon?: ReactNode; colo
  * looks like. (The header still shows its check: it displays one call at a time, so
  * there is no column for a check to clutter.)
  */
-/** How long a one-shot outcome sweep stays on a row (600ms animation + a margin). */
-const ROW_FLASH_MS = 650;
+/**
+ * How long a one-shot outcome sweep stays on a row.
+ *
+ * From `@shared/tool-shimmer`, shared with the vlist row path and pinned against the
+ * stylesheet: an early drop truncates the sweep mid-row.
+ */
+const ROW_FLASH_MS = TRACE_SHIMMER_FLASH_HOLD_MS;
 
 /**
  * The shimmer STATE of one row, or null for a quiet row.
@@ -307,8 +313,8 @@ function useTraceRowShimmerKind(item: CollapsibleTraceItem): ToolShimmerKind | n
 		prevStatusRef.current = status ?? null;
 		const next = resolveToolShimmerFlash(prev, status);
 		// ⚠️ A transition with no flash CLEARS the stored one; it must not just bail.
-		// The 650ms timer is torn down by this effect's own cleanup, so a flash that
-		// was outranked by a live `phase` below (a retry inside the window: running →
+		// The ROW_FLASH_MS timer is torn down by this effect's own cleanup, so a flash
+		// that was outranked by a live `phase` below (a retry inside the window: running →
 		// fail → running) survived and replayed on the NEXT quiet status —
 		// `→ cancelled` flashed red, which is the one transition that must never
 		// flash, and `→ pending` flashed green on a row awaiting the reader.

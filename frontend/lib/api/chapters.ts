@@ -16,9 +16,13 @@ export interface ForkChapterRequest {
 	/** Explicit parent chapter ID (ruler mode). Defaults to root chapter. */
 	parentChapterId?: string;
 	role?: string;
+	/** Ruler position: offsets relative to `anchorCommitSha`'s tick. */
 	anchorCommitSha?: string;
 	axisOffset?: number;
 	crossOffset?: number;
+	/** Classic canvas position: absolute React Flow world coordinates. */
+	graphX?: number;
+	graphY?: number;
 }
 
 export interface ChapterSplitResult {
@@ -156,9 +160,13 @@ export const chaptersApi = {
 		data: {
 			title?: string;
 			locale?: string;
+			/** Ruler position: offsets relative to `anchorCommitSha`'s tick. */
 			anchorCommitSha?: string;
 			axisOffset?: number;
 			crossOffset?: number;
+			/** Classic canvas position: absolute React Flow world coordinates. */
+			graphX?: number;
+			graphY?: number;
 		},
 	) =>
 		request<ApiEntity>(`/chapters/${chapterId}/review`, {
@@ -248,5 +256,32 @@ export const chaptersApi = {
 		request<ApiEntity>(`/chapters/${chapterId}/containers/remove`, {
 			method: "POST",
 			body: JSON.stringify(opts ?? {}),
+		}),
+
+	/**
+	 * Dockview layout of the chapter node's embedded surface (which tool panels
+	 * are open and how they are split). Its own endpoint because the payload is a
+	 * multi-KB blob that must not ride along with the project graph or a node drag.
+	 */
+	getChapterDockLayout: (chapterId: string) =>
+		request<{ layout: string | null }>(`/chapters/${chapterId}/dock-layout`),
+	/** Persist a serialized layout, or pass null to reset the node to its default. */
+	updateChapterDockLayout: (chapterId: string, layout: string | null) =>
+		request<{ ok: true }>(`/chapters/${chapterId}/dock-layout`, {
+			method: "PUT",
+			body: JSON.stringify({ layout }),
+		}),
+
+	/**
+	 * Tool panels torn out of this chapter's node dock, now standing as their own
+	 * canvas nodes. Separate from the dock layout: that payload is dockview's own
+	 * serialized grid and cannot carry custom entries.
+	 */
+	getChapterDetachedPanels: (chapterId: string) =>
+		request<{ panels: string | null }>(`/chapters/${chapterId}/detached-panels`),
+	updateChapterDetachedPanels: (chapterId: string, panels: string | null) =>
+		request<{ ok: true }>(`/chapters/${chapterId}/detached-panels`, {
+			method: "PUT",
+			body: JSON.stringify({ panels }),
 		}),
 };

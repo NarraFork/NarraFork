@@ -32,12 +32,43 @@ export interface UseDockviewDndOptions {
 	apiRef: RefObject<DockviewApi | null>;
 	rootRef: RefObject<HTMLElement | null>;
 	/**
-	 * Handle a drop of a subject that is NOT an existing panel (e.g. a sidebar
-	 * recent tab). Called with the raw drag state and resolved target so the
-	 * caller can create / move a panel however it wants.
+	 * Handle a drop of a subject that is NOT an existing panel of THIS surface
+	 * (a sidebar recent tab, a detached canvas panel, or a live panel belonging to
+	 * a different surface). Called with the raw drag state and resolved target so
+	 * the caller can create / move / reject it however it wants.
 	 */
 	onDropSubject?: (state: PanelDragState, target: DockviewDropTarget) => void;
 	thresholds?: DropZoneThresholds;
+	/**
+	 * This surface's identity, matched against `PanelDragState.surfaceId` to tell
+	 * "my own panel being rearranged" from "someone else's panel".
+	 *
+	 * Required once multiple surfaces coexist: panel ids are global, so without it
+	 * a surface would resolve a foreign `panelId` against its own api and move the
+	 * wrong panel. Leave unset to keep the historical single-surface behaviour
+	 * (any drag carrying a `panelId` is treated as local).
+	 */
+	surfaceId?: string;
+}
+
+/**
+ * Whether a drag should be handled as an in-surface panel move.
+ *
+ * True only for a live panel that belongs to THIS surface. A drag with no
+ * `panelId` has no live panel at all (sidebar tab, detached canvas panel). A drag
+ * whose `surfaceId` names a different surface is someone else's panel: resolving
+ * its global `panelId` here would hit our own same-kind panel and move that
+ * instead — the silent mis-move this guard exists to prevent.
+ *
+ * When either side omits `surfaceId`, the drag is treated as local so surfaces
+ * that have not opted in keep working exactly as before.
+ *
+ * Exported for unit testing.
+ */
+export function isLocalPanelDrag(state: PanelDragState, surfaceId: string | undefined): boolean {
+	if (!state.panelId) return false;
+	if (state.surfaceId === undefined || surfaceId === undefined) return true;
+	return state.surfaceId === surfaceId;
 }
 
 export interface UseDockviewDndResult {
@@ -96,7 +127,7 @@ export function dropExistingPanel(
 }
 
 export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndResult {
-	const { apiRef, rootRef, onDropSubject, thresholds } = options;
+	const { apiRef, rootRef, onDropSubject, thresholds, surfaceId } = options;
 	const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
 
 	useEffect(() => {
@@ -122,8 +153,9 @@ export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndRe
 			setDropIndicator(null);
 			const api = apiRef.current;
 			if (!api || !final || !resolved) return;
-			if (final.panelId) {
-				dropExistingPanel(api, final.panelId, resolved);
+			if (isLocalPanelDrag(final, surfaceId)) {
+				// biome-ignore lint/style/noNonNullAssertion: isLocalPanelDrag requires panelId
+				dropExistingPanel(api, final.panelId!, resolved);
 			} else {
 				onDropSubject?.(final, resolved);
 			}
@@ -133,7 +165,7 @@ export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndRe
 			unsubMove();
 			unsubEnd();
 		};
-	}, [apiRef, rootRef, onDropSubject, thresholds]);
+	}, [apiRef, rootRef, onDropSubject, thresholds, surfaceId]);
 
 	return { dropIndicator };
 }

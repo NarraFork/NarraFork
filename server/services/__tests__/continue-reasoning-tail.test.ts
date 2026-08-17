@@ -40,7 +40,7 @@ for (const statement of [
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
-const { resolveContinuationTail } = await import("../narrator-session");
+const { resolveContinuationTail, hasTrailingInjectionRow } = await import("../narrator-session");
 const { narratorMessageQueries } = await import("../narrator-messages");
 
 const NOW = "2026-08-20T09:00:00.000Z";
@@ -55,7 +55,7 @@ async function seedMessage(params: {
 	id: string;
 	narratorId?: string;
 	seq: number;
-	role: "user" | "assistant";
+	role: "user" | "assistant" | "sys";
 	contentJson?: unknown;
 	contentText?: string | null;
 }) {
@@ -163,6 +163,69 @@ describe("resolveContinuationTail", () => {
 
 		expect(tail?.id).toBe("a1");
 		expect(danglingReasoningIds).toEqual([]);
+	});
+});
+
+/**
+ * A trailing injection is the OTHER shape "continue" must recognize.
+ *
+ * `resolveContinuationTail` walks past `sys` rows on purpose (an injection is not a turn
+ * to build on), and reading that as "history ends on the row underneath" is what made
+ * the continuation append a synthetic "please continue" user row. That row displaces the
+ * injection from the trailing position, so the provider history builders stop lifting it
+ * into the current turn — the model then reads the reminder as background while being
+ * asked to continue something unnamed. Silent, so it is pinned here.
+ */
+describe("hasTrailingInjectionRow", () => {
+	test("true when an injection is the last model-visible row", () => {
+		expect(
+			hasTrailingInjectionRow([
+				{ id: "u1", role: "user", contentText: "做个功能" },
+				{ id: "a1", role: "assistant", contentJson: [{ type: "text", text: "做完了" }] },
+				{ id: "s1", role: "sys", contentText: "提醒：还有未完成任务" },
+			]),
+		).toBe(true);
+	});
+
+	test("true for a run of consecutive injections (several producers drained at once)", () => {
+		expect(
+			hasTrailingInjectionRow([
+				{ id: "a1", role: "assistant", contentJson: [{ type: "text", text: "做完了" }] },
+				{ id: "s1", role: "sys", contentText: "后台任务完成" },
+				{ id: "s2", role: "sys", contentText: "容器已就绪" },
+			]),
+		).toBe(true);
+	});
+
+	test("false when an assistant turn follows the injection", () => {
+		expect(
+			hasTrailingInjectionRow([
+				{ id: "s1", role: "sys", contentText: "提醒" },
+				{ id: "a1", role: "assistant", contentJson: [{ type: "text", text: "收到" }] },
+			]),
+		).toBe(false);
+	});
+
+	test("false when a user turn follows the injection — that is Retry's case", () => {
+		expect(
+			hasTrailingInjectionRow([
+				{ id: "s1", role: "sys", contentText: "提醒" },
+				{ id: "u1", role: "user", contentText: "换个方向" },
+			]),
+		).toBe(false);
+	});
+
+	test("ignores subagent rows, which are not top-level turns", () => {
+		expect(
+			hasTrailingInjectionRow([
+				{ id: "s1", role: "sys", contentText: "提醒" },
+				{ id: "sub1", role: "assistant", parentToolUseId: "tu1", contentText: "子代理输出" },
+			]),
+		).toBe(true);
+	});
+
+	test("false on empty history", () => {
+		expect(hasTrailingInjectionRow([])).toBe(false);
 	});
 });
 

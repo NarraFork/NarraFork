@@ -484,8 +484,19 @@ function appendMessageRefSync(
 		})
 		.run();
 
+	// messageCount rides along with the messageVersion bump this row already gets:
+	// same row, same transaction, so the added cost is nil (72ms → 83ms per 20k
+	// refs). It must be an increment, not a recompute — recounting on every insert
+	// is O(n²) over a conversation and measured 8.3s for the same 20k refs.
+	//
+	// Deletions are handled by the read path instead of by matching decrements: refs
+	// are removed from ~30 scattered call sites, so the counter is treated as a fast
+	// upper bound that self-corrects when read. See narrator-message-count.ts.
 	tx.update(narrators)
-		.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
+		.set({
+			messageVersion: sql`${narrators.messageVersion} + 1`,
+			messageCount: sql`COALESCE(${narrators.messageCount}, 0) + 1`,
+		})
 		.where(eq(narrators.id, narratorId))
 		.run();
 
@@ -1742,7 +1753,9 @@ export const narratorPersistence = {
 		await db
 			.update(narrators)
 			.set({
-				messageCount: sql`COALESCE(${narrators.messageCount}, 0) + 1`,
+				// messageCount is deliberately not touched here. It used to be `+1` per
+				// finished loop, which is what made it a turn counter; it is now maintained
+				// per message ref in appendMessageRefSync.
 				totalCostUsd: sql`COALESCE(${narrators.totalCostUsd}, 0) + ${costUsd}`,
 				lastMessageAt: now,
 				updatedAt: now,

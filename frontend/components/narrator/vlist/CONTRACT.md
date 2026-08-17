@@ -42,7 +42,7 @@
 export function measureXxx(
   data: <该元件的数据类型>,
   contentWidth: number,          // 可用内宽 px
-  lod: RenderLod,                // 1..6，默认 5（高度主开关）
+  lod: RenderLod,                // 1..5，默认 4（高度主开关）
   expandState?: <展开态，如有>,   // 折叠/展开、用户 override 等
 ): MeasuredElement             // { height, blocks, frame, usedWidth }
 ```
@@ -200,29 +200,30 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
   - 无论普通 capped 正文（`cappedBodyHeight`）还是 markdown 正文（`measureMarkdownDetail`），只要正文是服务端前缀就把盒高钉在 `cap`，**不测前缀**。测前缀会让高度取决于服务端预算切在哪里（更宽的布局把前缀折成更少行 → 盒子变矮，剩余可滚内容无处安放）；cap 永不裁切，因为盒子本身 `overflow:auto`。
   - **没有"内容已截断"提示行**：完整 payload 由读者在正文盒内滚过一半时自动取（`VListContentViewHost` 的 capture 阶段 scroll 监听），或打开全屏查看器时取。两条路都经同一个 `fullPayloadRequested` 门控，所以仍是用户动作；又因为盒高已钉在 cap，落地的完整正文测得 `min(exact, cap)` —— 对任何溢出盒子的正文（每个服务端前缀都溢出）逐像素相同。
   - `truncatedLeafCount` / `truncatedTotalBytes` 因此是**纯 payload 完整性信号**，不带几何：shell 用它判断哪些行可以取数、哪些请求在飞，measure cache 用它做 `|tp:` revision（payload 落地时唯一会动的字段）。
-- **effectiveOpened**：lodExempt(running/streaming/pendingPermission)恒展开；**最近一次 `spec://tasks.json` 调用的卡（latestSpecTasksToolUseId）恒展开**（`opts.forceExpanded`，由 adapter 从 shell 注入的 `resolveLatestSpecTasksToolUseId` 派生，任务板是叙述者的实时工作状态）；L6 全展开；L5 近卡随 opened、旧卡折叠；L4 全折叠 header；L1-L3 上游 gate 处理。
+- **effectiveOpened**：lodExempt(running/streaming/pendingPermission)恒展开；**最近一次 `spec://tasks.json` 调用的卡（latestSpecTasksToolUseId）恒展开**（`opts.forceExpanded`，由 adapter 从 shell 注入的 `resolveLatestSpecTasksToolUseId` 派生，任务板是叙述者的实时工作状态）；L5 全展开；L4 近卡随 opened、旧卡折叠；L3 全折叠 header；L1/L2 上游 gate 处理。
 - **分组卡**：Paper p=xs + header(+×N badge) + 展开体(子 ToolCallCard 累加)。折叠 default=false。
 
 ### tool-run 折叠形态（全部基于 CollapsibleTrace，行高固定）
-- **CollapsibleTrace**：表头 ≈24.8px；每行 18.8px（title truncate 单行🟢）。maxVisible 超出+1 toggle 行。仅 ReasoningStepsTrace 展开 step 有 markdown body🔴。折叠靠 prop（`collapseItems`/`collapsed`/`titlesOnly`），不读 LOD。
+- **CollapsibleTrace**：表头 ≈24.8px；每行 18.8px（title truncate 单行🟢）。maxVisible 超出+1 toggle 行。**reasoning step 行（独立 ReasoningStepsTrace 与 ActivityTrace 里的推理行都算）展开时有 markdown body🔴**；工具行展开是钻取整张卡（`card`，不是 `bodyText`），两条通道互斥。折叠靠 prop（`collapseItems`/`collapsed`/`expandedIndices`），不读 LOD。
   标题后紧跟**状态图标（12px 槽，仅在需要标记时渲染）+ 耗时**（`TraceItemData.status` / `.timing`，工具行才有；reasoning step 不带）。两者都落在行内容带 16.8px 之内（`TRACE_ROW_CONTENT` 由 xs 行盒决定），耗时是单行 nowrap、popover portaled，所以**不影响 18.8px 行高**（`measure-tool-run.test.ts` 有 height-neutral 断言）。它们是纯 passthrough，但会被画出来，因此必须进 `traceRevision`（`ts:` / `tm:`）。
   - **成功不画勾**：标记规则单源在 `@shared/tool-row-status`（chunk 与 vlist 共用）。只有"在飞 / 失败 / 取消"才画；`success`/`completed`、未识别状态、无生命周期的行**完全不渲染槽位**（不是空槽——每行留 12px 空隙和满列绿勾一样是噪音）。在飞状态是**显式枚举**而非"非终态"，否则拼写不认识的已完成调用会永远转圈。
   - **布局**：标题用 `flex: 0 1 auto`（可收缩以便 truncate，但不吸收剩余宽度），状态与耗时紧贴标题；行尾一个 `flex: 1` 的空 spacer 吃掉剩余宽度。耗时右对齐时读者需要横向跨过空隙回找本行，容易看成邻行的数字。
-- **ToolRunSummary**（L3）：表头 + min(N,10)×18.8🟢。
-- **ToolRunCountLine**（L2）：单行 ≈20.8px🟢。
-- **Pinned tasks 卡不折叠**：L1–L3 的分组折叠把"最近一次 `spec://tasks.json` 调用"的卡与 active 工具同组处理（保持完整展开卡、留在原时间位置），与 `groupRenderUnits` 的 `keepToolUseIds` 豁免是同一根 pin——判定复用 spinner 的 `latestSpecTasksToolUseId` 规则（`vlist-spec-tasks-pin.ts`）。该卡仍计入 fold 数量（不从前缀 trace 的 items 移除，计数与 chunked 一致）。
-  - **⚠️ 豁免按"工具条目"而非"整段 tool-run"**：`keepToolUseIds` 只把被 pin 的那一次调用拆出去，同段的其他调用照常折进 activity unit。早先按 message id 做段级豁免，整段 tool-run 会以普通 segment 抵达 adapter，L1/L2 于是把它的其他已完成调用压成 `tool-run-count`——一条不含任何行、只有"工具调用 ×N"的计数行，那些调用在低档位下彻底不可寻址（现象：低 LOD "吞掉"了一次工具调用）。不变量：**任何档位下每次调用都必须可寻址**（自己的卡，或某个 trace 里的具名行）；计数行没有行，因此不得成为某次调用的唯一落点。permission 阻塞的调用同理只豁免自己。
+- **ToolRunCountLine**（L1/L2）：单行 ≈20.8px🟢。只有"整段 tool-run 未进入 activity fold"的兜底路径才会出现（见下面的可寻址不变量）。
+- **Pinned tasks 卡不折叠**：L1/L2 的分组折叠把"最近一次 `spec://tasks.json` 调用"的卡与 active 工具同组处理（保持完整展开卡、留在原时间位置），与 `groupRenderUnits` 的 `keepToolUseIds` 豁免是同一根 pin——判定复用 spinner 的 `latestSpecTasksToolUseId` 规则（`vlist-spec-tasks-pin.ts`）。该卡仍计入 fold 数量（不从前缀 trace 的 items 移除，计数与 chunked 一致）。
+  - **⚠️ 豁免按"工具条目"而非"整段 tool-run"**：`keepToolUseIds` 只把被 pin 的那一次调用拆出去，同段的其他调用照常折进 activity unit。早先按 message id 做段级豁免，整段 tool-run 会以普通 segment 抵达 adapter，L1/L2 于是把它的其他已完成调用压成 `tool-run-count`（唯一还会产生计数行的路径）——一条不含任何行、只有"工具调用 ×N"的计数行，那些调用在低档位下彻底不可寻址（现象：低 LOD "吞掉"了一次工具调用）。不变量：**任何档位下每次调用都必须可寻址**（自己的卡，或某个 trace 里的具名行）；计数行没有行，因此不得成为某次调用的唯一落点。permission 阻塞的调用同理只豁免自己。
   - **pin 的 id 只由 `buildPretextDocumentLayout` 推导，不接受 build option**：shell 另有一份（`LatestTodosToolUseIdCtx`，供 chunked 任务板 spinner 用），但那份扫的是 tail-meta 的消息列表，与 layout 实际布局的列表（persisted window + live streaming row）可能不一致；而一个"故意不进 build deps"的外部值一旦陈旧就永远无法自纠。就地推导保证 pin 始终与它所属的文档一致。
 - **ActivityTrace**（L1/L2）：表头 + min(N,10)×18.8🟢；collapsed(L1) → 仅表头 ≈24.8px。
+  - **推理行可展开**：已落地（persisted）的结构化推理步骤带 `bodyText`，点击行展开该步 markdown🔴（高度按 `18.8 + 2*bodyPadY + markdownHeight`）。展开状态走 **row-KEY 通道**（`ctx.isRowExpanded`，与工具行钻取同一通道）——activity trace 的行序在流式过程中会被新步骤挤动，index 存不住。
+  - **流式推理行不带 body**：live 行走 `parseStreamingReasoningTitles`（body 截首行），因此不可展开。原因是每帧重新 adapt 时返回完整 body 会重建整篇回复大小的字符串（实测占单帧 97.8%）；读者不吃亏，因为 live 行本身已有 `liveTail` 显示最新字符，且行 key 跨 hand-off 稳定，落地瞬间同一行长出 chevron。
 - **ReasoningCountLine**（L1/L2）：单行 ≈20.8px🟢。
-- **ReasoningStepsTrace**：表头 + min(N,5)×18.8 + 展开 step markdown🔴。
+- **ReasoningStepsTrace**（L3–L5）：表头 + min(N,5)×18.8 + 展开 step markdown🔴。**不读 LOD**：不存在"标题可见但正文打不开"的档位（旧 `titlesOnly` 已下线），L3/L4/L5 形态一致，只有读者展开了哪些步骤不同。
 
 ### SubagentCard（唯一直接读 useRenderLod）
 - Header：p=xs(20) + 徽标行 16.8 + description(折叠 truncate🟢 / 展开换行🔴) + 可选结果预览行。折叠≈55-75px。
 - Recent Calls：≤3 行 × **18.8px（= `TRACE_ROW_HEIGHT`）🟢，行间无缝**（`RECENT_STACK_GAP = 0`）。这些行就是 trace 行：dot + 14px 类别 chip + 单行 `Tool · summary` + 状态槽 + 耗时，高度直接引用 `measure-tool-run` 而不是自己再算一遍；成功不画勾与"耗时紧贴标题"的规则同上，两条渲染路径的一致性由 `RenderSubagent.traceparity.test.tsx` 逐项比对守住。
   `recentCallSummaries` / `recentCallCategories` 是 render-only（切到 `recentRowCount`），summary 由 shell 注入的 `resolveSubagentRecentSummary` 从 header 的 `inputSummary` 得出；两者都进 `subagentRevision`（`gs:` / `gc:`），因为流式补全 `inputSummary` 时行数/名字/状态都不动，它们是唯一增量。
 - 展开体：prompt ContentViewer **maxHeight:200🟡**、result ContentViewer **maxHeight:300🟡**、permission 子块。
-- effectiveExpanded：lodExempt 恒展开；L6 展开；L5 近卡随 opened、旧卡折叠；L4 折叠。
+- effectiveExpanded：lodExempt 恒展开；L5 展开；L4 近卡随 opened、旧卡折叠；L3 折叠。
 
 ### 其它列表级元素
 - prune-divider（Divider + label）🟢
@@ -306,6 +307,51 @@ chunked 路径靠 Mantine `<Collapse>`：正文在正常流里，浏览器补间
 - **"没有可播的动作"不等于"播完了"。** `setInteraction` 先触发一次 re-render，文档重建发生在 `usePretextDocument` 的后续 effect 里。所以播放用的 layout effect 会先在"几何还没变"的那次 commit 上跑一遍——那次若消费掉 capture，就等于在它真正对应的几何到来前一次 commit 把它扔了（早期版本因此完全不动画）。保留它的代价为零，两端都有界：revision 校验挡住"文档被别的东西改了"的 capture，年龄上限（~400ms）淘汰"重建始终没来"的 capture。
 
 `prefers-reduced-motion: reduce` 下直接不捕获，于是播放 effect 找不到东西，折叠瞬时生效。
+
+## 4.7 LOD 切档过渡（元素级 diff，纯装饰层）
+
+切档和折叠是两件不同的事：折叠改一处高度，切档**重排整篇文档**。所以它不用 click 时捕获，而是**声明式 diff**——每次 commit 后快照视口×3 窗口，与上一帧配对，让已提交的新节点从旧屏幕位置滑回原位（`vlist-lod-morph.ts` 纯算 + `vlist-lod-morph-motion.ts` 播放 + shell 接线）。
+
+- **配对身份是 `unitId ?? key`。** 被重新主题化的元素（工具卡/子代理卡）逐档换 key（折叠批次以首个成员命名为 `toolrun-count-tool-<id>`），靠 adapter 挂的 LOD 无关 `unitId` 配对；**其余全部元素**（markdown 正文、user 气泡、system 卡、turn-usage、divider）没有 `unitId`，但它们的 `spec.key` 本身就与档位无关（`${msgId}-b{n}` / `${msgId}-bubble` / `${idBase}-sys` / `${idBase}-usage-*`），所以 `key` 就是它们的跨档身份，不需要新造 id。早期只配对前者，结果是切档"一半平滑"——卡片缓动到位，承载它们的文档主体瞬移。
+  - 两个命名空间不会撞：adapter 设 `unitId` 时一律设成该元素**自己的 `key`**，所以 `unitId` 绝不会是别的元素的 `key`。单档独占的 key（`toolrun-count-*`、`activity-*`）在另一档不存在，只会"配不上"（直接出现），不会"配错"。
+  - 节点定位相应有两条：先 `data-nf-unit`，再回落 `data-nf-row-key`（按 key 配对的元素只画后者）。漏掉回落不会报错——plan 照样产出，只是全部解析为 null，症状是文档主体又开始瞬移。
+- **只有换了组件才淡入。** cross-fade 的作用是遮掩**组件替换**，所以只在 `kind` 变化时播。一段只是移动了的 markdown 正文是同组件同内容，给它淡入等于让没变的正文每次缩放闪一下，比不动画更糟。
+- **有距离上限（复用折叠的 2000px）。** L5→L1 把几千像素的卡片栈压成 19px 行，下方元素的位移可以到上万像素；250ms 跨过去是一团模糊，还会让读者丢掉正在看的行。代价是超限元素瞬移、未超限的邻居仍在滑动，大幅切档会有局部撕裂——与折叠动画同一取舍。**但换了组件的元素例外**：超限时退化为"原位淡入"（`deltaY: 0, fade: true`）而不是完全不动画，否则 L2/L3 这种既换形态又大位移的组合会彻底失去过渡。
+- **原位换形态也要淡入。** 距离过滤（亚像素 / 超限）只能砍掉**滑动**，不能砍掉整个 plan：activity fold 常常在**原位**换组件（`deltaY ≈ 0`），只按距离 gate 会把最需要过渡的那一档静默丢掉。
+
+### L2/L3 边界：trace 行 ↔ 卡片（1:1，方向不对称）
+
+这是视觉落差最大的边界，因为它是**组件真的变了**的那一档：一次工具调用在 L1/L2 是 activity-trace 里的摘要**行**，在 L3+ 是顶层**卡片**。两者带同一个 `unitId`（`tool-<toolUseId>`，`segment-adapter.ts` 的 `:2994` 与 `:2586` 同源），所以**配对是 1:1**——一行对一卡，装着它们的 trace 元素本身不是参与者。因此快照会连同顶层元素一起收集**嵌套行**，几何提升到文档坐标（`traceTop + row.top`）。
+
+⚠️ 曾经有过两条把这块列为"不做"的错误论断，都已修正：
+- ~~"关系是 1:N，只有一个能 travel"~~ —— 错。把"N 张卡折进 1 个 trace 元素"与"配对关系"混为一谈了；配对发生在行↔卡片之间。
+- ~~"overflow 裁剪让两个方向都不可行"~~ —— 只对**一个方向**成立，见下。
+
+**两个方向不对称，这是画布的性质而非取舍。** morph 动的是**新节点**；嵌套行被裁剪到 trace 的盒子（shell 对非 dynamic 行 `overflow: hidden`），顶层卡片不被任何东西裁剪。所以哪一侧受裁剪取决于读者往哪个方向缩放：
+- **L2 → L3（行 → 卡）**：新节点是顶层卡片，无裁剪，可以从行的原位一路滑过来。这个方向拿到完整滑动。
+- **L3 → L2（卡 → 行）**：新节点是被裁剪的嵌套行，而它的来源卡片通常远在 trace 盒子之外；真去 translate 会让行在动画期间躲到裁剪之下**整段不可见**（闪一下，比瞬移更差）。为动画临时放开 overflow 会引入 `fill:"none"` 刻意消灭的清理路径，还会让行画到邻居身上。所以这个方向**保留淡入、放弃滑动**（`deltaY: 0, fade: true`）：读者仍然得到把两种形态联系起来的 cross-fade，只是失去位移，而那段位移本来也看不见。
+
+判定在 `clipFor` 里（纯算术，不在 DOM 边），语义是"起始盒与裁剪**完全无交集**才拒绝"——部分露出的起点仍然滑动，因为那时读者看得见它在移动。
+
+另外：trace 最多显示 `ACTIVITY_MAX_VISIBLE` 行，被"更早"折叠藏起来的调用**不产生行快照**，因此在另一档没有配对方、直接出现——绝不能让它从一个从未占据过的位置飞入。
+
+### 推理步骤的跨档身份（第三种身份，两个前置条件）
+
+工具调用两侧都是 `tool-<toolUseId>`，所以卡片一直能 morph；**推理曾经完全不能**，原因是结构性的：折叠行按 `stableKeyBase` 编号（run 在**其 activity 单元内**的序号，如 `run0`，这是保证流式 hand-off 稳定的东西），而 L3+ 根本没有 activity 单元，那个序号在那边不是"不同"而是**算不出来**。实测 16 条消息文档：L2→L3 推理行配对 0/16。
+
+所以引入第三种身份 `reasoningStepUnitId()` = **消息 id + run 起始块索引 + run 内步骤序号**（`reason-<msgId>-b<runStart>-s<step>`）——两侧都能独立推导的唯一事实集合。`key` 不动（它是交互通道），只新增 `unitId`。修复后推理行 16/16 配对，两个方向都是。
+
+⚠️ 两个前置条件，**两侧必须同时满足**（只有一侧收窄是最危险的形状：行会静默停止配对）：
+1. **消息已落地。** 流式消息 id 是 `__streaming__`，hand-off 时会变，用它派生身份等于"先配不上、然后在脚下改变"。L1/L2 侧退回 run-ordinal 形式（仍然唯一，只是没有配对方），L3+ 侧干脆不发。
+2. **run 只含一个块。** 两档的**分组方式不同**：activity fold 逐块 push 并逐块解析，L3+ 把 run 的相邻块 join 后整体解析。多块 run 的步骤边界因此可能不对齐，`s2` 在两侧可能是不同的步骤——**配错比不配更糟**，因为它看起来是刻意的。
+
+`unitId` 是 height-neutral 但会被**画出来**（`data-nf-unit`），所以必须进 `traceRevision`（`|tu:`）：它能在 `key` 和所有高度字段都不动的情况下变化（turn 落地那一刻 run 获得可配对身份），漏掉会让缓存供应没有 `data-nf-unit` 的行，**静默损失掉它本该启用的那个 morph**。
+
+**`reasoning-steps` 容器元素不配对，这是正确的。** 那才是真正的 1:N：L2 侧不存在"每个 run 一个容器"，一段里所有 run 和工具都并进同一个 `activity-trace`，N 个容器映射到 1 个元素；而且两侧 chrome 是不同的东西（「推理 · N 步」表头 vs 「活动」表头）。身份由行承载，容器只是外壳。
+
+**三个控制器的 `transform` 争用（两条互斥条件，都必须在）。** 折叠靠 `data-nf-row-key` 定位、LOD morph 靠 `data-nf-unit` 或 `data-nf-row-key`，两者落在**同一个节点**上，而 cancel 边界各自独立。互斥靠：
+1. **折叠自己那次重建不动档位。** `toggleVListLodUserOverride` 只改 `lodUserOverrides`（作为 per-card opt 抵达 build），`manifest.lod` 来自 `useRenderLod()`，只有缩放手势能动它。所以 LOD morph 的 gate（revision 不变 **且** lod 移动）拒绝它。
+2. **后续重建不能复活折叠的 capture。** 切档和折叠一样**不推进 documentRevision**，所以"折叠后 400ms 内立刻捏合"会同时通过 revision 与年龄两道校验 —— capture 因此额外记录自己的档位，`isFoldCaptureUsable` 一旦发现档位移动就判定失效（语义上也对：capture 拍的是另一套主题下的几何）。
 
 ## 5. 测试约定
 

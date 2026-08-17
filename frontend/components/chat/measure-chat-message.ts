@@ -71,6 +71,36 @@ export const CHAT_REPLY_PADDING_X = 6;
 /** Vertical gap between two consecutive bubbles in the list. */
 export const CHAT_MESSAGE_GAP = 8;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Attachment chrome
+//
+// Attachments are laid out ONE PER ROW rather than wrapped inline. A wrapping row
+// would make the block's height depend on how many items happen to fit at the
+// current width, which is a second wrap calculation the measure layer would have to
+// reproduce exactly — and the height contract has no tolerance for "approximately".
+// Stacking makes the height a plain sum.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Gap between the attachment block and the text body below it. */
+export const CHAT_ATTACHMENT_BLOCK_GAP = 6;
+/** Gap between two stacked attachments. */
+export const CHAT_ATTACHMENT_GAP = 4;
+/** Thumbnail box the image is fitted into (aspect preserved, never upscaled). */
+export const CHAT_IMAGE_MAX_WIDTH = 240;
+export const CHAT_IMAGE_MAX_HEIGHT = 180;
+/**
+ * Height reserved for an image whose dimensions are unknown.
+ *
+ * Reachable only for a malformed row: the upload path parses dimensions
+ * fail-closed, so a stored image always has them. A fixed fallback keeps such a row
+ * renderable instead of collapsing it to zero height.
+ */
+export const CHAT_IMAGE_FALLBACK_HEIGHT = 120;
+/** One-line chip for a non-image attachment (icon + name + size). */
+export const CHAT_FILE_CHIP_HEIGHT = 28;
+/** Minimum width a file chip needs before its label visibly clips. */
+export const CHAT_FILE_CHIP_MIN_WIDTH = 180;
+
 /**
  * Fenced-code chrome inside a bubble. Same values as the narrator markdown
  * measure so a code block does not change size between the two surfaces
@@ -123,6 +153,14 @@ export const CHAT_DELETED_MIN_CONTENT_WIDTH = 120;
 // Input
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Just enough of an attachment to reserve its space (no bytes, no DOM). */
+export interface ChatAttachmentMeasureData {
+	kind: "image" | "file";
+	/** Intrinsic pixel size, images only. Absent → the fallback height is used. */
+	width?: number | null;
+	height?: number | null;
+}
+
 export interface ChatMessageMeasureData {
 	/** Markdown body. Empty when the message was soft-deleted. */
 	text: string;
@@ -131,11 +169,41 @@ export interface ChatMessageMeasureData {
 	/** Quoted message preview, already truncated by the caller. */
 	replyPreview?: string | null;
 	/**
+	 * Whether to reserve the quote strip, independent of whether there is text to
+	 * put in it.
+	 *
+	 * Explicit rather than inferred from a non-empty `replyPreview`, which was the
+	 * previous rule and silently dropped the strip in exactly the cases that need a
+	 * label instead of a quote: a target that was deleted, and (before snapshots) a
+	 * target outside the loaded window. Both are still replies, and a reply whose
+	 * strip vanishes reads as an ordinary message answering nothing.
+	 *
+	 * Optional so an omitted value keeps the old inference, which remains correct for
+	 * the plain "quote with text" case.
+	 */
+	hasReply?: boolean;
+	/**
 	 * Consecutive message from the same author within the grouping window — the
 	 * header row is omitted, so the bubble is exactly `CHAT_HEADER_HEIGHT +
 	 * CHAT_HEADER_GAP` shorter.
 	 */
 	grouped?: boolean;
+	/**
+	 * Attachments drawn above the text body.
+	 *
+	 * Dimensions come from the SERVER (parsed at upload time), never from loading the
+	 * image: a height that depended on a network fetch would arrive after the row was
+	 * already laid out, and the list has no unknown-height correction pass.
+	 */
+	attachments?: readonly ChatAttachmentMeasureData[];
+}
+
+/** One attachment's reserved box, in bubble-content coordinates. */
+export interface MeasuredChatAttachment {
+	kind: "image" | "file";
+	top: number;
+	width: number;
+	height: number;
 }
 
 export interface MeasuredChatMessage extends MeasuredElement {
@@ -149,6 +217,10 @@ export interface MeasuredChatMessage extends MeasuredElement {
 	isDeletedPlaceholder: boolean;
 	/** The exact text the render layer must draw (already prefix-bounded). */
 	bodyText: string;
+	/** Per-attachment boxes, in order. Empty when there are none. */
+	attachments: MeasuredChatAttachment[];
+	/** Total height of the attachment block, including its gap to the body. */
+	attachmentsHeight: number;
 }
 
 /**
@@ -216,11 +288,19 @@ export function measureChatMessage(
 ): MeasuredChatMessage {
 	const contentWidth = Math.max(1, outerWidth - CHAT_BUBBLE_PADDING_X * 2);
 	const hasHeader = !data.grouped;
-	const hasReply = !!data.replyPreview?.trim();
-	const isDeletedPlaceholder = !!data.deleted || !data.text.trim();
+	// Explicit flag wins; the preview-derived fallback covers callers that predate it.
+	const hasReply = data.hasReply ?? !!data.replyPreview?.trim();
+	const attachmentsInput = data.attachments ?? [];
+	// An attachment carries a message on its own, so a body-less message with
+	// attachments is NOT the deleted placeholder — rendering it as one would
+	// mislabel an image-only post as removed.
+	const isDeletedPlaceholder =
+		!!data.deleted || (!data.text.trim() && attachmentsInput.length === 0);
 	const bodyText = isDeletedPlaceholder ? "" : boundChatBody(data.text);
+	const hasBody = !isDeletedPlaceholder && !!data.text.trim();
 
-	const blocks = isDeletedPlaceholder ? [] : (opts.preparedBlocks ?? preparedChatBlocks(data.text));
+	const blocks =
+		isDeletedPlaceholder || !hasBody ? [] : (opts.preparedBlocks ?? preparedChatBlocks(data.text));
 
 	const frame = accumulateFrame(blocks, contentWidth, pretextLineMetrics, {
 		codePaddingX: CODE_PADDING_X,
@@ -232,7 +312,14 @@ export function measureChatMessage(
 
 	const bodyHeight = isDeletedPlaceholder ? CHAT_DELETED_BODY_HEIGHT : frame.contentHeight;
 
-	let height = CHAT_BUBBLE_PADDING_Y * 2 + bodyHeight;
+	// A soft-deleted message reports no attachments from the server, but measuring
+	// defensively here keeps the height right even if a stale cached row still has
+	// them: the placeholder replaces the whole content area.
+	const { attachments, attachmentsHeight, attachmentsUsedWidth } = isDeletedPlaceholder
+		? { attachments: [], attachmentsHeight: 0, attachmentsUsedWidth: 0 }
+		: measureAttachments(attachmentsInput, contentWidth, hasBody);
+
+	let height = CHAT_BUBBLE_PADDING_Y * 2 + bodyHeight + attachmentsHeight;
 	if (hasHeader) height += CHAT_HEADER_HEIGHT + CHAT_HEADER_GAP;
 	if (hasReply) height += CHAT_REPLY_LINE_HEIGHT + CHAT_REPLY_GAP;
 
@@ -244,6 +331,10 @@ export function measureChatMessage(
 		isDeletedPlaceholder ? CHAT_DELETED_MIN_CONTENT_WIDTH : frame.usedWidth,
 		headerFloor,
 		replyFloor,
+		// Without this floor a one-word caption would shrink the bubble narrower than
+		// the thumbnail it contains, and the image would be clipped by the bubble's
+		// own `overflow: hidden`.
+		attachmentsUsedWidth,
 	);
 	const usedWidth = Math.min(outerWidth, Math.ceil(innerUsed) + CHAT_BUBBLE_PADDING_X * 2);
 
@@ -261,6 +352,78 @@ export function measureChatMessage(
 		hasReply,
 		isDeletedPlaceholder,
 		bodyText,
+		attachments,
+		attachmentsHeight,
+	};
+}
+
+/**
+ * Reserve space for the attachment block: pure arithmetic, one item per row.
+ *
+ * An image is fitted into `CHAT_IMAGE_MAX_WIDTH × CHAT_IMAGE_MAX_HEIGHT` preserving
+ * aspect ratio and NEVER upscaled — a 40×40 avatar stays 40×40 rather than being
+ * blown up to a blurry 240px box. The available content width also caps it, so a
+ * narrow bubble does not reserve a box wider than itself.
+ *
+ * `hasBody` decides whether the trailing gap to the text is charged: an
+ * attachment-only message has no body to separate from, and charging the gap anyway
+ * would leave a visible strip of dead space at the bottom of the bubble.
+ */
+function measureAttachments(
+	attachments: readonly ChatAttachmentMeasureData[],
+	contentWidth: number,
+	hasBody: boolean,
+): {
+	attachments: MeasuredChatAttachment[];
+	attachmentsHeight: number;
+	attachmentsUsedWidth: number;
+} {
+	if (attachments.length === 0) {
+		return { attachments: [], attachmentsHeight: 0, attachmentsUsedWidth: 0 };
+	}
+
+	const measured: MeasuredChatAttachment[] = [];
+	let top = 0;
+	let usedWidth = 0;
+
+	for (let index = 0; index < attachments.length; index++) {
+		const attachment = attachments[index];
+		if (index > 0) top += CHAT_ATTACHMENT_GAP;
+
+		let width: number;
+		let height: number;
+		if (attachment.kind === "image") {
+			const boxWidth = Math.min(CHAT_IMAGE_MAX_WIDTH, contentWidth);
+			const intrinsicWidth = attachment.width ?? 0;
+			const intrinsicHeight = attachment.height ?? 0;
+			if (intrinsicWidth > 0 && intrinsicHeight > 0) {
+				// `min(1, …)` is the no-upscale rule; both axes are constrained so a very
+				// tall screenshot is bounded by the height, not just the width.
+				const scale = Math.min(
+					1,
+					boxWidth / intrinsicWidth,
+					CHAT_IMAGE_MAX_HEIGHT / intrinsicHeight,
+				);
+				width = Math.max(1, Math.round(intrinsicWidth * scale));
+				height = Math.max(1, Math.round(intrinsicHeight * scale));
+			} else {
+				width = boxWidth;
+				height = CHAT_IMAGE_FALLBACK_HEIGHT;
+			}
+		} else {
+			width = Math.min(contentWidth, Math.max(CHAT_FILE_CHIP_MIN_WIDTH, contentWidth));
+			height = CHAT_FILE_CHIP_HEIGHT;
+		}
+
+		measured.push({ kind: attachment.kind, top, width, height });
+		usedWidth = Math.max(usedWidth, width);
+		top += height;
+	}
+
+	return {
+		attachments: measured,
+		attachmentsHeight: top + (hasBody ? CHAT_ATTACHMENT_BLOCK_GAP : 0),
+		attachmentsUsedWidth: usedWidth,
 	};
 }
 
@@ -270,4 +433,22 @@ export function prepareChatMessageMeasurer(
 ): (outerWidth: number) => MeasuredChatMessage {
 	const preparedBlocks = data.deleted || !data.text.trim() ? [] : preparedChatBlocks(data.text);
 	return (outerWidth: number) => measureChatMessage(data, outerWidth, { preparedBlocks });
+}
+
+/**
+ * Cache-key contribution for a message's attachments.
+ *
+ * ⚠️ The measure cache keys on this. Anything that changes an attachment's reserved
+ * box must appear here or the key will match a stale entry and the new content will
+ * be drawn into the old box (chat-measure-cache.ts documents the same hazard for the
+ * text signature). Today that is the count, each item's kind, and each image's
+ * intrinsic dimensions.
+ */
+export function attachmentsSignature(
+	attachments: readonly ChatAttachmentMeasureData[] | undefined,
+): string {
+	if (!attachments || attachments.length === 0) return "";
+	return attachments
+		.map((attachment) => `${attachment.kind}:${attachment.width ?? ""}x${attachment.height ?? ""}`)
+		.join(",");
 }

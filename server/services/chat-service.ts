@@ -23,15 +23,33 @@
  */
 
 import { db } from "@server/db";
-import { chatMessages, chatRoomMembers, chatRooms, narrators, users } from "@server/db/schema";
+import {
+	chatAttachments,
+	chatMessages,
+	chatRoomMembers,
+	chatRooms,
+	narrators,
+	users,
+} from "@server/db/schema";
+import { buildAttachedFilesHint } from "@server/lib/attached-files";
+import {
+	CHAT_ATTACHMENT_TOTAL_BYTES_MAX,
+	CHAT_ATTACHMENTS_PER_MESSAGE_MAX,
+	CHAT_DRAFT_ATTACHMENTS_MAX,
+	copyChatAttachmentToWorktree,
+	deleteChatAttachmentFiles,
+	getChatAttachmentFileInfo,
+	saveChatAttachment,
+} from "@server/lib/chat-attachments";
 import { ForbiddenError, NotFoundError, RateLimitError, ValidationError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
 import { hotSafe } from "@server/lib/hot-safe";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import type { Locale } from "@server/lib/prompt-i18n";
-import { canReadNarrator } from "@server/services/narrator-acl";
-import { and, asc, desc, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
+import type { TextFileRef } from "@server/lib/uploads";
+import { canReadNarrator, canWriteNarrator } from "@server/services/narrator-acl";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bounds
@@ -106,6 +124,25 @@ export interface ChatUserSnapshot {
 	avatarImageId: string | null;
 }
 
+/**
+ * One attachment as the client sees it.
+ *
+ * Metadata only — the bytes are fetched separately through
+ * `GET /api/chat/attachments/:id`, which re-checks room access. `storedName` is
+ * deliberately absent: it is a disk detail, and exposing it would invite a client
+ * to construct a path instead of going through the authorized endpoint.
+ */
+export interface ChatAttachmentRow {
+	id: string;
+	kind: "image" | "file";
+	filename: string;
+	mediaType: string;
+	sizeBytes: number;
+	/** Images only. Present so the client can reserve height without loading it. */
+	width: number | null;
+	height: number | null;
+}
+
 export interface ChatMessageRow {
 	id: string;
 	roomId: string;
@@ -113,6 +150,21 @@ export interface ChatMessageRow {
 	kind: "text" | "system";
 	contentText: string;
 	replyToMessageId: string | null;
+	/**
+	 * Quote snapshot, captured at post time (see the schema note).
+	 *
+	 * Three distinguishable states, which the previous window-resolution approach
+	 * collapsed into one misleading "deleted" label:
+	 *   - `replyToPreview` a non-empty string → the quoted text.
+	 *   - `replyToPreview` an empty string    → the target was already deleted.
+	 *   - all three null                      → a legacy row with no snapshot; the
+	 *     client resolves within the loaded window and reports honestly when it
+	 *     cannot.
+	 */
+	replyToSeq: number | null;
+	replyToSender: ChatUserSnapshot | null;
+	replyToPreview: string | null;
+	attachments: ChatAttachmentRow[];
 	editedAt: string | null;
 	deletedAt: string | null;
 	createdAt: string;
@@ -177,6 +229,46 @@ function truncatePreview(text: string): string {
 	const flat = text.replace(/\s+/g, " ").trim();
 	if (flat.length <= CHAT_PREVIEW_MAX_CHARS) return flat;
 	return `${flat.slice(0, CHAT_PREVIEW_MAX_CHARS)}…`;
+}
+
+/**
+ * The room-list preview for a message, including the attachment-only case.
+ *
+ * Attachment names, not a `[image]` marker: the filenames are user data, so they
+ * carry actual information ("crash-log.txt" tells you what the message is about)
+ * and need no translation, which a synthetic marker would. A localized marker
+ * would also be wrong here on principle — the preview is written once at post time
+ * and read by every member regardless of their language.
+ *
+ * ⚠️ The client mirrors this in `chatPreviewFromText` / `chatPreviewFromMessage`
+ * (frontend/hooks/useChat.ts). The same room's preview comes from here on a refetch
+ * and from there while live, so a divergence shows up as the text visibly changing
+ * under the reader. Change both together.
+ */
+export function buildRoomPreview(
+	text: string,
+	attachments: ReadonlyArray<{ filename: string }> = [],
+): string {
+	const body = text.trim();
+	if (body) return truncatePreview(body);
+	if (attachments.length === 0) return "";
+	return truncatePreview(attachments.map((attachment) => attachment.filename).join(", "));
+}
+
+/**
+ * Max characters of quoted text frozen into a reply snapshot.
+ *
+ * Matches the client's `CHAT_REPLY_PREVIEW_MAX_CHARS`: the strip is a single
+ * clamped line, so storing more would be bytes nothing can display. Truncating on
+ * WRITE (rather than on read) is what keeps the read path from ever touching a
+ * quoted message's `content_text`.
+ */
+export const CHAT_REPLY_PREVIEW_SNAPSHOT_MAX_CHARS = 120;
+
+function truncateReplyPreview(text: string): string {
+	const flat = text.replace(/\s+/g, " ").trim();
+	if (flat.length <= CHAT_REPLY_PREVIEW_SNAPSHOT_MAX_CHARS) return flat;
+	return `${flat.slice(0, CHAT_REPLY_PREVIEW_SNAPSHOT_MAX_CHARS)}…`;
 }
 
 function nowIso(): string {
@@ -383,23 +475,41 @@ async function resolvePrincipal(userId: string): Promise<{ userId: string; isAdm
 export interface PostMessageInput {
 	roomId: string;
 	senderUserId: string;
+	/** May be empty when `attachmentIds` is not — an attachment carries a message. */
 	text: string;
 	replyToMessageId?: string | null;
+	/** Previously uploaded, still-unclaimed attachments to attach to this message. */
+	attachmentIds?: string[];
 	kind?: "text" | "system";
 }
 
 /**
  * Append a message and advance the room's denormalized tail.
  *
- * One transaction claims the seq, writes the row, updates the room summary and
- * pushes the SENDER's own watermark — a message you just typed is never unread
- * for you, and doing it here avoids a second round trip that could interleave.
+ * One transaction claims the seq, writes the row, claims the attachments, updates
+ * the room summary and pushes the SENDER's own watermark — a message you just typed
+ * is never unread for you, and doing it here avoids a second round trip that could
+ * interleave.
+ *
+ * Attachment claiming is inside that transaction on purpose: a claim that succeeded
+ * while the insert failed would leave a file owned by a message that does not exist,
+ * and the reverse would show a message with attachments the reader cannot fetch.
  */
 export async function postMessage(input: PostMessageInput): Promise<ChatMessageRow> {
 	const text = input.text.trim();
-	if (!text) throw new ValidationError("Message text is required");
+	const attachmentIds = [...new Set(input.attachmentIds ?? [])];
+	// Text OR attachments — matching the narrator composer, where an attachment is
+	// meaningful content on its own. Only a fully empty request is rejected.
+	if (!text && attachmentIds.length === 0) {
+		throw new ValidationError("Message text or an attachment is required");
+	}
 	if (text.length > CHAT_MESSAGE_MAX_CHARS) {
 		throw new ValidationError(`Message exceeds ${CHAT_MESSAGE_MAX_CHARS} characters`);
+	}
+	if (attachmentIds.length > CHAT_ATTACHMENTS_PER_MESSAGE_MAX) {
+		throw new ValidationError(
+			`Maximum ${CHAT_ATTACHMENTS_PER_MESSAGE_MAX} attachments per message`,
+		);
 	}
 
 	const access = await assertCanRead(input.roomId, input.senderUserId);
@@ -408,20 +518,71 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 	// link). The watermark update below needs it.
 	if (!access.membership) await ensureMembers(input.roomId, [input.senderUserId]);
 
+	// The quote snapshot. Read the target's own scalars here — the ONE place a
+	// quoted message's body is touched — so every later read of the quote strip is
+	// served from this row instead of chasing the target across pages.
+	let replySnapshot: {
+		replyToSeq: number | null;
+		replyToSenderUserId: string | null;
+		replyToPreview: string | null;
+	} = { replyToSeq: null, replyToSenderUserId: null, replyToPreview: null };
 	if (input.replyToMessageId) {
 		const target = await db.query.chatMessages.findFirst({
 			where: and(
 				eq(chatMessages.id, input.replyToMessageId),
 				eq(chatMessages.roomId, input.roomId),
 			),
-			columns: { id: true },
+			columns: {
+				id: true,
+				seq: true,
+				senderUserId: true,
+				contentText: true,
+				deletedAt: true,
+			},
 		});
 		if (!target) throw new ValidationError("Replied-to message is not in this room");
+		replySnapshot = {
+			replyToSeq: target.seq,
+			replyToSenderUserId: target.senderUserId,
+			// An empty string (not null) for an already-deleted target: null means
+			// "legacy row, no snapshot taken", and conflating the two would send the
+			// client back to window resolution for a message we know is gone.
+			replyToPreview: target.deletedAt ? "" : truncateReplyPreview(target.contentText),
+		};
+	}
+
+	// Attachment metadata is read BEFORE the transaction so the returned row and the
+	// room preview can carry it. The claim itself re-checks ownership inside the
+	// transaction, so nothing here is trusted as a permission decision.
+	const pendingAttachments =
+		attachmentIds.length > 0
+			? await db.query.chatAttachments.findMany({
+					where: and(
+						inArray(chatAttachments.id, attachmentIds),
+						eq(chatAttachments.roomId, input.roomId),
+						eq(chatAttachments.uploaderUserId, input.senderUserId),
+						isNull(chatAttachments.messageId),
+					),
+				})
+			: [];
+	if (pendingAttachments.length !== attachmentIds.length) {
+		// Deliberately one message for every failure mode (unknown id, another room's
+		// attachment, someone else's draft, already claimed). Distinguishing them
+		// would confirm the existence of attachments the caller has no claim to.
+		throw new ValidationError("One or more attachments are unavailable");
+	}
+	const attachmentBytes = pendingAttachments.reduce((total, row) => total + row.sizeBytes, 0);
+	if (attachmentBytes > CHAT_ATTACHMENT_TOTAL_BYTES_MAX) {
+		throw new ValidationError(
+			`Combined attachments exceed the ${(CHAT_ATTACHMENT_TOTAL_BYTES_MAX / 1024 / 1024).toFixed(
+				0,
+			)}MB limit`,
+		);
 	}
 
 	const timestamp = nowIso();
 	const messageId = generateId();
-	const preview = truncatePreview(text);
+	const preview = buildRoomPreview(text, pendingAttachments);
 
 	const seq = db.transaction((tx) => {
 		const [updated] = tx
@@ -453,9 +614,41 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 				kind: input.kind ?? "text",
 				contentText: text,
 				replyToMessageId: input.replyToMessageId ?? null,
+				replyToSeq: replySnapshot.replyToSeq,
+				replyToSenderUserId: replySnapshot.replyToSenderUserId,
+				replyToPreview: replySnapshot.replyToPreview,
 				createdAt: timestamp,
 			})
 			.run();
+
+		if (attachmentIds.length > 0) {
+			// Every predicate is load-bearing and re-asserted here rather than trusted
+			// from the read above: `room_id` stops an attachment uploaded elsewhere from
+			// being smuggled into this room, `uploader_user_id` stops claiming someone
+			// else's draft, and `message_id IS NULL` stops re-claiming one that already
+			// belongs to a posted message. A row count mismatch aborts the whole
+			// transaction, so a partial claim is not a reachable state.
+			//
+			// `returning` rather than a driver rowcount: Drizzle's `.run()` is typed
+			// void here, and counting returned ids is the portable way to assert that
+			// every requested attachment was actually claimable.
+			const claimed_ = tx
+				.update(chatAttachments)
+				.set({ messageId, claimedAt: timestamp })
+				.where(
+					and(
+						inArray(chatAttachments.id, attachmentIds),
+						eq(chatAttachments.roomId, input.roomId),
+						eq(chatAttachments.uploaderUserId, input.senderUserId),
+						isNull(chatAttachments.messageId),
+					),
+				)
+				.returning({ id: chatAttachments.id })
+				.all();
+			if (claimed_.length !== attachmentIds.length) {
+				throw new ValidationError("One or more attachments are unavailable");
+			}
+		}
 
 		tx.update(chatRoomMembers)
 			.set({ lastReadSeq: claimed, lastReadAt: timestamp })
@@ -474,6 +667,14 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		where: eq(users.id, input.senderUserId),
 		columns: USER_COLUMNS,
 	});
+	const replyToSender = replySnapshot.replyToSenderUserId
+		? toUserSnapshot(
+				await db.query.users.findFirst({
+					where: eq(users.id, replySnapshot.replyToSenderUserId),
+					columns: USER_COLUMNS,
+				}),
+			)
+		: null;
 
 	const row: ChatMessageRow = {
 		id: messageId,
@@ -482,6 +683,10 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		kind: input.kind ?? "text",
 		contentText: text,
 		replyToMessageId: input.replyToMessageId ?? null,
+		replyToSeq: replySnapshot.replyToSeq,
+		replyToSender,
+		replyToPreview: replySnapshot.replyToPreview,
+		attachments: pendingAttachments.map(toAttachmentRow),
 		editedAt: null,
 		deletedAt: null,
 		createdAt: timestamp,
@@ -499,6 +704,70 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 	});
 
 	return row;
+}
+
+/**
+ * Assemble the client-facing shape for ONE stored message.
+ *
+ * The single place a `chat:message` WebSocket frame is built, so the live path and
+ * the paginated read path cannot drift: both go through this and `listMessages`
+ * respectively, and both are checked against the same `ChatMessageRow` type. A frame
+ * assembled by hand in `chat-notify` is how a field ends up delivered on a refetch
+ * but missing live.
+ *
+ * Three small indexed reads at most (sender, reply author, attachments), on a path
+ * that runs once per posted message.
+ */
+export async function hydrateMessageForBroadcast(
+	row: typeof chatMessages.$inferSelect,
+): Promise<ChatMessageRow> {
+	const [sender, replyToSender, attachmentRows] = await Promise.all([
+		row.senderUserId
+			? db.query.users.findFirst({ where: eq(users.id, row.senderUserId), columns: USER_COLUMNS })
+			: Promise.resolve(undefined),
+		row.replyToSenderUserId
+			? db.query.users.findFirst({
+					where: eq(users.id, row.replyToSenderUserId),
+					columns: USER_COLUMNS,
+				})
+			: Promise.resolve(undefined),
+		row.deletedAt
+			? Promise.resolve([])
+			: db.query.chatAttachments.findMany({
+					where: eq(chatAttachments.messageId, row.id),
+					orderBy: [asc(chatAttachments.createdAt)],
+				}),
+	]);
+
+	return {
+		id: row.id,
+		roomId: row.roomId,
+		seq: row.seq,
+		kind: row.kind,
+		contentText: row.deletedAt ? "" : row.contentText,
+		replyToMessageId: row.replyToMessageId,
+		replyToSeq: row.replyToSeq,
+		replyToSender: toUserSnapshot(replyToSender),
+		replyToPreview: row.replyToPreview,
+		attachments: attachmentRows.map(toAttachmentRow),
+		editedAt: row.editedAt,
+		deletedAt: row.deletedAt,
+		createdAt: row.createdAt,
+		sender: toUserSnapshot(sender),
+	};
+}
+
+/** DB row → the metadata shape clients receive (never `storedName`). */
+function toAttachmentRow(row: typeof chatAttachments.$inferSelect): ChatAttachmentRow {
+	return {
+		id: row.id,
+		kind: row.kind,
+		filename: row.filename,
+		mediaType: row.mediaType,
+		sizeBytes: row.sizeBytes,
+		width: row.width,
+		height: row.height,
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -535,6 +804,14 @@ export async function listMessages(input: ListMessagesInput): Promise<ChatMessag
 
 	const hasMore = rows.length > limit;
 	const page = hasMore ? rows.slice(0, limit) : rows;
+
+	// Two extra bounded queries for the whole page, never one per row: the page is
+	// at most CHAT_PAGE_MAX, so each is a single `IN (...)` on an indexed column.
+	const [replyAuthors, attachmentsByMessage] = await Promise.all([
+		loadReplyAuthors(page),
+		loadAttachmentsForMessages(page),
+	]);
+
 	const messages = page
 		.map((row) => ({
 			id: row.id,
@@ -543,6 +820,14 @@ export async function listMessages(input: ListMessagesInput): Promise<ChatMessag
 			kind: row.kind,
 			contentText: row.deletedAt ? "" : row.contentText,
 			replyToMessageId: row.replyToMessageId,
+			replyToSeq: row.replyToSeq,
+			replyToSender: row.replyToSenderUserId
+				? (replyAuthors.get(row.replyToSenderUserId) ?? null)
+				: null,
+			replyToPreview: row.replyToPreview,
+			// A soft-deleted message reports no attachments: its body is already gone,
+			// so listing files it used to carry would offer content the delete removed.
+			attachments: row.deletedAt ? [] : (attachmentsByMessage.get(row.id) ?? []),
 			editedAt: row.editedAt,
 			deletedAt: row.deletedAt,
 			createdAt: row.createdAt,
@@ -555,6 +840,56 @@ export async function listMessages(input: ListMessagesInput): Promise<ChatMessag
 		hasMore,
 		nextBeforeSeq: hasMore && messages.length > 0 ? messages[0].seq : null,
 	};
+}
+
+/**
+ * Resolve the authors named by a page's reply snapshots.
+ *
+ * The snapshot stores an id rather than a username so a rename is reflected
+ * everywhere, which means the name has to be joined back on read — but once per
+ * page, for the distinct set, not once per message.
+ */
+async function loadReplyAuthors(
+	rows: ReadonlyArray<{ replyToSenderUserId: string | null }>,
+): Promise<Map<string, ChatUserSnapshot>> {
+	const ids = [
+		...new Set(
+			rows
+				.map((row) => row.replyToSenderUserId)
+				.filter((id): id is string => typeof id === "string" && id.length > 0),
+		),
+	];
+	if (ids.length === 0) return new Map();
+	const users_ = await db.query.users.findMany({
+		where: inArray(users.id, ids),
+		columns: USER_COLUMNS,
+	});
+	const map = new Map<string, ChatUserSnapshot>();
+	for (const row of users_) {
+		const snapshot = toUserSnapshot(row);
+		if (snapshot) map.set(row.id, snapshot);
+	}
+	return map;
+}
+
+/** Attachment metadata for a page of messages, in one bounded query. */
+async function loadAttachmentsForMessages(
+	rows: ReadonlyArray<{ id: string; deletedAt: string | null }>,
+): Promise<Map<string, ChatAttachmentRow[]>> {
+	const ids = rows.filter((row) => !row.deletedAt).map((row) => row.id);
+	if (ids.length === 0) return new Map();
+	const attachmentRows = await db.query.chatAttachments.findMany({
+		where: inArray(chatAttachments.messageId, ids),
+		orderBy: [asc(chatAttachments.createdAt)],
+	});
+	const map = new Map<string, ChatAttachmentRow[]>();
+	for (const row of attachmentRows) {
+		if (!row.messageId) continue;
+		const list = map.get(row.messageId);
+		if (list) list.push(toAttachmentRow(row));
+		else map.set(row.messageId, [toAttachmentRow(row)]);
+	}
+	return map;
 }
 
 /**
@@ -880,10 +1215,263 @@ export async function softDeleteMessage(
 		// "this was never yours" if both arrive as a validation failure.
 		throw new ForbiddenError("You can only delete your own messages");
 	}
+	// Attachments go with the body. Leaving the files fetchable would make the
+	// delete cosmetic: the text is gone but the screenshot someone regretted posting
+	// is still served to anyone holding its id.
+	//
+	// Like the body itself, this is NOT recoverable — which is the existing contract
+	// for a chat delete, not a new one introduced here. The rows are read before the
+	// delete so the file removal knows which paths to unlink.
+	const attached = await db.query.chatAttachments.findMany({
+		where: eq(chatAttachments.messageId, messageId),
+		columns: { id: true, roomId: true, storedName: true },
+	});
 	await db
 		.update(chatMessages)
 		.set({ contentText: "", deletedAt: nowIso() })
 		.where(eq(chatMessages.id, messageId));
+	if (attached.length > 0) {
+		await db.delete(chatAttachments).where(eq(chatAttachments.messageId, messageId));
+		// After the DB rows are gone: an orphaned file is reclaimable by the cleanup
+		// sweep, whereas a row pointing at a missing file is a broken thumbnail.
+		deleteChatAttachmentFiles(attached);
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Attachments
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Persist an upload as an unclaimed (draft) attachment for a room.
+ *
+ * Access is checked FIRST, before anything reaches the disk: an unauthorized upload
+ * that got written and only then rejected would let a non-member consume the
+ * server's storage.
+ */
+export async function createChatAttachment(
+	roomId: string,
+	userId: string,
+	file: File,
+): Promise<ChatAttachmentRow> {
+	await assertCanRead(roomId, userId);
+
+	// Bound the drafts one user can accumulate in a room. An upload is persisted
+	// before its message exists, so "upload and never send" is reachable; the
+	// cleanup sweep reclaims those eventually, but a write-time bound is what stops
+	// a loop from filling the disk between sweeps.
+	const drafts = await db
+		.select({ id: chatAttachments.id })
+		.from(chatAttachments)
+		.where(
+			and(
+				eq(chatAttachments.roomId, roomId),
+				eq(chatAttachments.uploaderUserId, userId),
+				isNull(chatAttachments.messageId),
+			),
+		)
+		.limit(CHAT_DRAFT_ATTACHMENTS_MAX);
+	if (drafts.length >= CHAT_DRAFT_ATTACHMENTS_MAX) {
+		throw new ValidationError(
+			"Too many pending attachments. Send or remove some before uploading more.",
+		);
+	}
+
+	const saved = await saveChatAttachment(roomId, file);
+	const id = generateId();
+	try {
+		await db.insert(chatAttachments).values({
+			id,
+			roomId,
+			messageId: null,
+			uploaderUserId: userId,
+			kind: saved.kind,
+			filename: saved.filename,
+			mediaType: saved.mediaType,
+			sizeBytes: saved.sizeBytes,
+			width: saved.width ?? null,
+			height: saved.height ?? null,
+			storedName: saved.storedName,
+			createdAt: nowIso(),
+			claimedAt: null,
+		});
+	} catch (error) {
+		// The file is already on disk; without this it would be unreferenced from the
+		// moment the insert failed, and only the periodic sweep would notice.
+		deleteChatAttachmentFiles([{ roomId, storedName: saved.storedName }]);
+		throw error;
+	}
+
+	return {
+		id,
+		kind: saved.kind,
+		filename: saved.filename,
+		mediaType: saved.mediaType,
+		sizeBytes: saved.sizeBytes,
+		width: saved.width ?? null,
+		height: saved.height ?? null,
+	};
+}
+
+export interface ChatAttachmentReadTarget {
+	filePath: string;
+	size: number;
+	filename: string;
+	mediaType: string;
+	kind: "image" | "file";
+}
+
+/**
+ * Resolve an attachment for download, enforcing the ROOM's access rule.
+ *
+ * Deliberately not served from `/api/uploads/:narratorId/:imageId`, which is
+ * reachable by any authenticated user who knows the ids. A chat attachment must be
+ * exactly as visible as the conversation it belongs to, so it goes through
+ * `assertCanRead` — the same single decision point the message list uses. Reported
+ * as a missing attachment rather than a 403 for the same reason rooms are: a
+ * distinct "forbidden" would confirm it exists.
+ */
+export async function loadChatAttachmentForRead(
+	attachmentId: string,
+	userId: string,
+): Promise<ChatAttachmentReadTarget> {
+	const row = await db.query.chatAttachments.findFirst({
+		where: eq(chatAttachments.id, attachmentId),
+	});
+	if (!row) throw new NotFoundError("Chat attachment", attachmentId);
+	await assertCanRead(row.roomId, userId);
+
+	const info = getChatAttachmentFileInfo(row.roomId, row.storedName);
+	if (!info) throw new NotFoundError("Chat attachment", attachmentId);
+	return {
+		filePath: info.filePath,
+		size: info.size,
+		filename: row.filename,
+		mediaType: row.mediaType,
+		kind: row.kind,
+	};
+}
+
+/**
+ * Discard an unclaimed attachment (the composer removed a pending chip).
+ *
+ * Only the uploader, and only while unclaimed: once a message owns it, removal is
+ * the message's soft delete, not a separate operation.
+ */
+export async function discardChatAttachment(attachmentId: string, userId: string): Promise<void> {
+	const row = await db.query.chatAttachments.findFirst({
+		where: eq(chatAttachments.id, attachmentId),
+	});
+	if (!row) throw new NotFoundError("Chat attachment", attachmentId);
+	await assertCanRead(row.roomId, userId);
+	if (row.uploaderUserId !== userId) {
+		throw new ForbiddenError("You can only remove your own attachments");
+	}
+	if (row.messageId) {
+		throw new ValidationError("This attachment already belongs to a sent message");
+	}
+	await db.delete(chatAttachments).where(eq(chatAttachments.id, attachmentId));
+	deleteChatAttachmentFiles([{ roomId: row.roomId, storedName: row.storedName }]);
+}
+
+export interface MaterializeAttachmentsInput {
+	roomId: string;
+	userId: string;
+	narratorId: string;
+	attachmentIds: string[];
+}
+
+export interface MaterializedChatAttachments {
+	files: TextFileRef[];
+	/** The `<attached_files>` block to append to the forwarded text. */
+	hint: string;
+}
+
+/**
+ * Copy chat attachments into a narrator's worktree so a forward can name their paths.
+ *
+ * Two authorization checks, and both are required:
+ *   - `assertCanRead(roomId)` — you cannot forward out of a conversation you cannot
+ *     read.
+ *   - `canWriteNarrator` — this WRITES FILES into the narrator's worktree. Checking
+ *     read access would be the wrong question: a read-only observer of someone
+ *     else's session would be able to drop files into it.
+ *
+ * The hint text comes from `buildAttachedFilesHint`, the same builder the narrator's
+ * own attachment path uses, so a forwarded file is described to the model exactly
+ * like a directly attached one. Images need no separate treatment: they are copied
+ * as files and the Read tool handles image files.
+ */
+export async function materializeAttachmentsForNarrator(
+	input: MaterializeAttachmentsInput,
+): Promise<MaterializedChatAttachments> {
+	await assertCanRead(input.roomId, input.userId);
+	const attachmentIds = [...new Set(input.attachmentIds)];
+	if (attachmentIds.length === 0) return { files: [], hint: "" };
+	if (attachmentIds.length > CHAT_ATTACHMENTS_PER_MESSAGE_MAX) {
+		throw new ValidationError(
+			`Maximum ${CHAT_ATTACHMENTS_PER_MESSAGE_MAX} attachments per forward`,
+		);
+	}
+
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, input.narratorId),
+		columns: { id: true, ownerUserId: true, visibility: true, chapterId: true, cwd: true },
+	});
+	if (!narrator) throw new NotFoundError("Narrator", input.narratorId);
+	const user = await db.query.users.findFirst({
+		where: eq(users.id, input.userId),
+		columns: { role: true },
+	});
+	if (
+		!(await canWriteNarrator(narrator, {
+			userId: input.userId,
+			isAdmin: user?.role === "admin",
+		}))
+	) {
+		throw new ForbiddenError("You cannot attach files to this narrator");
+	}
+	if (!narrator.cwd) {
+		throw new ValidationError("This narrator has no working directory to attach files to");
+	}
+
+	const rows = await db.query.chatAttachments.findMany({
+		where: and(
+			inArray(chatAttachments.id, attachmentIds),
+			eq(chatAttachments.roomId, input.roomId),
+			// Only attachments belonging to a POSTED message may be forwarded: a draft
+			// is not yet part of the conversation, so forwarding one would leak content
+			// the room has never seen.
+			isNotNull(chatAttachments.messageId),
+		),
+		orderBy: [asc(chatAttachments.createdAt)],
+	});
+	if (rows.length === 0) return { files: [], hint: "" };
+
+	const files: TextFileRef[] = [];
+	for (const row of rows) {
+		try {
+			files.push(
+				await copyChatAttachmentToWorktree(narrator.cwd, {
+					roomId: row.roomId,
+					storedName: row.storedName,
+					filename: row.filename,
+					sizeBytes: row.sizeBytes,
+				}),
+			);
+		} catch (error) {
+			// One unreadable attachment (file reclaimed, permissions) must not lose the
+			// whole forward: the text still carries the transcript, which is the part
+			// the user selected. Logged so the gap is visible rather than silent.
+			logger.warn("Chat attachment could not be forwarded", {
+				attachmentId: row.id,
+				narratorId: input.narratorId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	return { files, hint: buildAttachedFilesHint(files) };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1020,6 +1608,12 @@ export async function summarizeMessages(input: SummarizeInput): Promise<{ summar
 	});
 	if (rows.length === 0) throw new ValidationError("Selected messages are not in this room");
 
+	// Reply authors for the selection, one bounded query (the selection is capped at
+	// CHAT_SUMMARIZE_MAX_MESSAGES). Without this the transcript is a flat list of
+	// utterances and the model cannot tell agreement from contradiction when two
+	// people are answering different things.
+	const replyAuthors = await loadReplyAuthors(rows);
+
 	// Bounded transcript: the model input is capped independently of how many
 	// rows matched, so one huge message cannot blow the request up.
 	const parts: string[] = [];
@@ -1027,7 +1621,18 @@ export async function summarizeMessages(input: SummarizeInput): Promise<{ summar
 	for (const row of rows) {
 		if (budget <= 0) break;
 		if (row.deletedAt) continue;
-		const line = `${row.sender?.username ?? "unknown"}: ${row.contentText}`;
+		const author = row.sender?.username ?? "unknown";
+		const quoted = row.replyToSenderUserId
+			? replyAuthors.get(row.replyToSenderUserId)?.username
+			: undefined;
+		// The quote is rendered inline from the SNAPSHOT, so summarizing never has to
+		// fetch a message outside the selection to know what was being answered.
+		const replyPrefix = row.replyToPreview
+			? `[replying to ${quoted ?? "unknown"}: "${row.replyToPreview}"] `
+			: row.replyToMessageId
+				? `[replying to ${quoted ?? "unknown"}] `
+				: "";
+		const line = `${author}: ${replyPrefix}${row.contentText}`;
 		parts.push(line.length > budget ? line.slice(0, budget) : line);
 		budget -= line.length;
 	}
@@ -1037,8 +1642,8 @@ export async function summarizeMessages(input: SummarizeInput): Promise<{ summar
 	const { summaryGenerate } = await import("../lib/agent");
 	const systemPrompt =
 		input.locale === "zh-CN"
-			? "你在总结一段团队聊天记录，供开发者转发给 AI 编码助手。用简体中文输出要点：结论、决定、待办、未解决的问题。保留具体的文件名、命令和标识符原文。不要加寒暄或前言。"
-			: "You are summarizing a team chat excerpt so a developer can forward it to an AI coding assistant. Output the essentials: conclusions, decisions, action items, open questions. Preserve concrete file names, commands and identifiers verbatim. No preamble or pleasantries.";
+			? '你在总结一段团队聊天记录，供开发者转发给 AI 编码助手。用简体中文输出要点：结论、决定、待办、未解决的问题。保留具体的文件名、命令和标识符原文。行首的 [replying to X: "…"] 表示该发言是在回复谁、回复的是哪句话，用它判断谁在回应谁、哪些分歧已经解决。不要加寒暄或前言。'
+			: 'You are summarizing a team chat excerpt so a developer can forward it to an AI coding assistant. Output the essentials: conclusions, decisions, action items, open questions. Preserve concrete file names, commands and identifiers verbatim. A leading [replying to X: "…"] marks which message a line answers — use it to attribute agreement and disagreement correctly. No preamble or pleasantries.';
 
 	try {
 		const result = await summaryGenerate(transcript, systemPrompt, { kind: "chat_summarize" });

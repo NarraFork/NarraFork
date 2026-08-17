@@ -3,9 +3,9 @@
  * channel its adapter path READS.
  *
  * There are two channels, and the split is deliberate (see
- * `VListInteractionState.expandedTraceRows`): `activity-trace` / `tool-run-summary`
- * fold a live row list and are addressed by ROW KEY, while `reasoning-steps` is
- * append-only and stays on the row INDEX.
+ * `VListInteractionState.expandedTraceRows`): `activity-trace` folds a live row
+ * list and is addressed by ROW KEY, while `reasoning-steps` is append-only and
+ * stays on the row INDEX.
  *
  * The regression this pins: the render layer reports BOTH the index and the key for
  * every trace row, so a shell that stores a key unconditionally sends the
@@ -23,14 +23,13 @@ import { describe, expect, it } from "bun:test";
 import { traceRowFoldChannel } from "./vlist-interaction-state";
 
 /** The kinds bound to the trace row toggle in PretextExactMessageList. */
-const TRACE_KINDS = ["activity-trace", "tool-run-summary", "reasoning-steps"] as const;
+const TRACE_KINDS = ["activity-trace", "reasoning-steps"] as const;
 
 describe("traceRowFoldChannel", () => {
-	it("puts the two live-row-list traces on the KEY channel", () => {
-		// Only these can gain a row ABOVE an existing one mid-stream (a live reasoning
-		// run emits one row per step), which is what invalidates a stored index.
+	it("puts the live-row-list trace on the KEY channel", () => {
+		// Only this one can gain a row ABOVE an existing one mid-stream (a live
+		// reasoning run emits one row per step), which invalidates a stored index.
 		expect(traceRowFoldChannel("activity-trace")).toBe("key");
-		expect(traceRowFoldChannel("tool-run-summary")).toBe("key");
 	});
 
 	it("keeps the append-only trace on the INDEX channel", () => {
@@ -87,22 +86,14 @@ async function indicesFor(
 	const specs =
 		kind === "activity-trace"
 			? [adaptActivityUnit([toolItem] as never, "act-1", ctx as never)]
-			: kind === "tool-run-summary"
-				? adaptSegment(
-						{ kind: "tool-run", items: [toolItem] } as never,
-						{
-							...ctx,
-							lod: 3,
-						} as never,
-					)
-				: adaptSegment(
-						{
-							kind: "message",
-							msg: reasoningMessage as never,
-							visibleBlockIndices: [0],
-						} as never,
-						ctx as never,
-					);
+			: adaptSegment(
+					{
+						kind: "message",
+						msg: reasoningMessage as never,
+						visibleBlockIndices: [0],
+					} as never,
+					ctx as never,
+				);
 	const spec = specs.find((s) => s?.kind === kind);
 	expect(spec).toBeDefined();
 	return [...(((spec?.opts as { expandedIndices?: number[] })?.expandedIndices ?? []) as number[])];

@@ -62,6 +62,10 @@ export function NarratorUserChatPanel({ narratorId }: NarratorUserChatPanelProps
 			// Only offer forwarding when a narrator composer is actually mounted to
 			// receive it; otherwise the button would be a no-op control.
 			onForwardToNarrator={submitToNarrator ? forward : undefined}
+			// Forwarding ATTACHMENTS needs the narrator itself, not just the composer
+			// bridge: the files are copied into its worktree before the forwarded text
+			// can name their paths.
+			narratorId={narratorId}
 		/>
 	);
 }

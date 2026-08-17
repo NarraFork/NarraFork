@@ -29,10 +29,10 @@ import type { PreparedRichInline } from "@chenglou/pretext/rich-inline";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Render LOD (mirrors RenderLodCtx). Height models MUST take LOD as input.
-// L1 (most folded) .. L6 (most detailed). Default L5.
+// L1 (most folded) .. L5 (most detailed). Default L4.
 // ─────────────────────────────────────────────────────────────────────────────
-export type RenderLod = 1 | 2 | 3 | 4 | 5 | 6;
-export const DEFAULT_RENDER_LOD: RenderLod = 5;
+export type RenderLod = 1 | 2 | 3 | 4 | 5;
+export const DEFAULT_RENDER_LOD: RenderLod = 4;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PreparedBlock — width-independent, produced once per data item.

@@ -66,7 +66,7 @@ function measureSectionsCard(sections: ToolDetailSection[]) {
 			detail: { kind: "sections", sections },
 		},
 		CONTENT_WIDTH,
-		6,
+		5,
 	);
 }
 

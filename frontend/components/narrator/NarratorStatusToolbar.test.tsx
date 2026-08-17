@@ -725,7 +725,7 @@ describe("NarratorStatusToolbar", () => {
 			{
 				key: "path",
 				collapsePriority: 10,
-				visualOverflow: { blockStart: 2, inlineEnd: 4 },
+				visualOverflow: { inlineEnd: 4 },
 				render: () => (
 					<button type="button" data-measure-width="28" style={{ position: "relative" }}>
 						Path
@@ -741,7 +741,7 @@ describe("NarratorStatusToolbar", () => {
 			{
 				key: "terminal",
 				collapsePriority: 20,
-				visualOverflow: { blockStart: 5, inlineEnd: 5 },
+				visualOverflow: { inlineEnd: 5 },
 				render: () => (
 					<Indicator label={3} size={14} offset={2}>
 						<button type="button" data-measure-width="28">
@@ -758,14 +758,77 @@ describe("NarratorStatusToolbar", () => {
 		const terminal = document.querySelector<HTMLElement>('[data-toolbar-action="terminal"]');
 		expect(toolbar?.style.overflow).toBe("visible");
 		expect(toolbar?.style.maxWidth).toBe("100%");
-		expect(path?.style.paddingBlockStart).toBe("2px");
 		expect(path?.style.paddingInlineEnd).toBe("4px");
 		expect(path?.getBoundingClientRect().width).toBe(32);
-		expect(terminal?.style.paddingBlockStart).toBe("5px");
 		expect(terminal?.style.paddingInlineEnd).toBe("5px");
 		expect(terminal?.getBoundingClientRect().width).toBe(33);
 		expect(document.querySelector('[data-testid="negative-path-badge"]')).not.toBeNull();
 		expect(terminal?.querySelector(".mantine-Indicator-indicator")).not.toBeNull();
+	});
+
+	/*
+	 * Every inline control shares one centre line. Measured in a real browser, a
+	 * one-sided `blockStart` reserve moved the affected wrapper's centre 1px (path)
+	 * and 2.5px (terminal) below its siblings, which is the whole "three different
+	 * heights" report. It also bought nothing: the badge it was meant to protect is
+	 * painted inside an ActionIcon, which clips its own overflow.
+	 */
+	test("does not apply vertical padding that would push an action off the row centre", async () => {
+		const actions: NarratorStatusToolbarAction[] = [
+			{
+				key: "path",
+				collapsePriority: 10,
+				visualOverflow: { inlineEnd: 4 },
+				render: () => (
+					<button type="button" data-measure-width="28">
+						Path
+					</button>
+				),
+			},
+			{
+				key: "terminal",
+				collapsePriority: 20,
+				visualOverflow: { inlineEnd: 5 },
+				render: () => (
+					<button type="button" data-measure-width="28">
+						Terminal
+					</button>
+				),
+			},
+		];
+		await renderToolbar(200, actions);
+
+		for (const key of ["path", "terminal"]) {
+			const wrapper = document.querySelector<HTMLElement>(`[data-toolbar-action="${key}"]`);
+			expect(wrapper?.style.paddingBlockStart).toBeFalsy();
+			expect(wrapper?.style.paddingBlockEnd).toBeFalsy();
+		}
+	});
+
+	/*
+	 * A symmetric reserve keeps the centre line but grows the wrapper, which pushes
+	 * the row past NARRATOR_STATUS_ROW_MIN_HEIGHT_PX. Keep the escape hatch honest:
+	 * whatever a caller passes is what gets applied, on both sides independently.
+	 */
+	test("applies block padding on exactly the sides the caller asked for", async () => {
+		await renderToolbar(200, [
+			{
+				key: "path",
+				collapsePriority: 10,
+				visualOverflow: { blockStart: 2, blockEnd: 3, inlineStart: 1, inlineEnd: 4 },
+				render: () => (
+					<button type="button" data-measure-width="28">
+						Path
+					</button>
+				),
+			},
+		]);
+
+		const wrapper = document.querySelector<HTMLElement>('[data-toolbar-action="path"]');
+		expect(wrapper?.style.paddingBlockStart).toBe("2px");
+		expect(wrapper?.style.paddingBlockEnd).toBe("3px");
+		expect(wrapper?.style.paddingInlineStart).toBe("1px");
+		expect(wrapper?.style.paddingInlineEnd).toBe("4px");
 	});
 
 	test("keeps the terminal accessible in the menu and invokes the original callback once", async () => {

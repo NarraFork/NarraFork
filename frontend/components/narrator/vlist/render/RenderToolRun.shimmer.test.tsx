@@ -25,7 +25,12 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { MantineProvider } from "@mantine/core";
-import { CARD_SHIMMER_CLASS, TRACE_SHIMMER_CLASS } from "@shared/tool-shimmer";
+import {
+	CARD_SHIMMER_CLASS,
+	TRACE_SHIMMER_CLASS,
+	TRACE_SHIMMER_FLASH_HOLD_MS,
+	TRACE_SHIMMER_FLASH_MS,
+} from "@shared/tool-shimmer";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -292,6 +297,64 @@ describe("the row shimmer keeps its gradient clipped to the text", () => {
 		// what the reader actually loses.
 		const root = trace([{ status: "running", title: "Read · shimmering.ts" }]);
 		expect(root.textContent ?? "").toContain("Read · shimmering.ts");
+	});
+
+	/**
+	 * The closing sweep must be ONE slow pass that enters at the right edge and leaves
+	 * past the left. It shipped as neither, for two compounding reasons that this block
+	 * pins separately.
+	 *
+	 * The arithmetic, which is not obvious and is the whole reason the bug existed: a
+	 * percentage `background-position` resolves against the FREE SPACE, so with
+	 * `background-size: 200%` the offset is `P × (W − 2W) = −P × W`. The repeating tile
+	 * is 2W wide, so ONE period of the pattern is 200% of P — and the old
+	 * `-200% → 200%` keyframes therefore ran TWO passes, with an end frame identical to
+	 * the start frame (a band parked over the row's right-hand end). `ease-out` then
+	 * spent the visible part of the sweep at speed and the invisible part crawling.
+	 *
+	 * The reader saw: a repeating shimmer whose green died partway across the row.
+	 */
+	it("sweeps the closing highlight exactly ONCE, across one period", () => {
+		const flash = traceCss.slice(
+			traceCss.indexOf("@keyframes nf-trace-shimmer-flash"),
+			traceCss.indexOf("@keyframes nf-trace-shimmer-flash") + 400,
+		);
+		const stops = Array.from(flash.matchAll(/background-position:\s*(-?[\d.]+)%/g)).map((m) =>
+			Number(m[1]),
+		);
+		expect(stops).toHaveLength(2);
+		const [from, to] = stops as [number, number];
+		// One period is 200% of P. More than that repeats the band; less leaves the sweep
+		// unfinished when the class is dropped.
+		expect(Math.abs(to - from)).toBe(200);
+		// Direction: P rising sweeps the tile LEFT, which is the closing gesture.
+		expect(to).toBeGreaterThan(from);
+		// Both ends park the band OUTSIDE the row, so nothing appears or vanishes
+		// mid-text. The band spans 35%–65% of a 2W tile; at P it sits at
+		// (0.7 − P)W … (1.3 − P)W, so it is off-screen right while P ≤ 0 and off-screen
+		// left once P ≥ 1.3.
+		expect(from).toBeLessThanOrEqual(0);
+		expect(to / 100).toBeGreaterThanOrEqual(1.3);
+	});
+
+	it("runs the closing sweep at CONSTANT speed", () => {
+		// An easing puts its slow end outside the box (see the keyframe bounds), so the
+		// highlight crossed the text quickly and then crawled off-screen unseen — which
+		// reads as the colour disappearing partway across.
+		const rule = traceCss.slice(traceCss.indexOf(".nf-trace-shimmer--done,"));
+		const animation = /animation:\s*nf-trace-shimmer-flash\s+(\d+)ms\s+([a-z-]+)/.exec(rule);
+		expect(animation).not.toBeNull();
+		expect(animation?.[2]).toBe("linear");
+	});
+
+	it("holds the class for LONGER than the animation it plays", () => {
+		// Three places carry this duration — the stylesheet and both row paths' timers —
+		// and the render paths read it from the shared module. If the stylesheet drifts,
+		// the class is pulled mid-sweep and the highlight is cut off wherever it stands.
+		const rule = traceCss.slice(traceCss.indexOf(".nf-trace-shimmer--done,"));
+		const ms = /animation:\s*nf-trace-shimmer-flash\s+(\d+)ms/.exec(rule);
+		expect(Number(ms?.[1])).toBe(TRACE_SHIMMER_FLASH_MS);
+		expect(TRACE_SHIMMER_FLASH_HOLD_MS).toBeGreaterThan(TRACE_SHIMMER_FLASH_MS);
 	});
 
 	it("restores the text fill under reduced motion", () => {

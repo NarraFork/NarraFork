@@ -7,6 +7,7 @@
  * on in phase 2 via device-connection-service.ts, which imports these helpers.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import type { ExecutorPathRule } from "@shared/executor-path-rules";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { projects, remoteDevices } from "../db/schema";
@@ -54,6 +55,14 @@ export interface RemoteDeviceView {
 	defaultCwd: string | null;
 	agentVersion: string | null;
 	capabilities: Record<string, unknown> | null;
+	/**
+	 * Ordered path guard rules the operator configured (desired state). A record of
+	 * intent only: the executor enforces the rules in its own config file, so this
+	 * is never consulted to authorize a request.
+	 */
+	pathRules: ExecutorPathRule[] | null;
+	/** Ordered rules the device reported enforcing at its last handshake. */
+	reportedPathRules: ExecutorPathRule[] | null;
 	scope: "global" | "project";
 	projectId: string | null;
 	createdAt: string;
@@ -122,6 +131,24 @@ export function isDeviceAuthorized(
 	return !!context.userId && context.userId === owner;
 }
 
+/**
+ * May this principal manage (view details of, edit, or delete) this device?
+ *
+ * Distinct from `isDeviceAuthorized`, which answers "may a narrator run tool calls
+ * on it". Usage and management are different powers: a shared device is *usable*
+ * by everyone the project axis allows, but only its registrar or an admin may
+ * rename it, change its scope, rotate its key, or revoke it. Letting any user who
+ * can use a device also reconfigure it would let one member repoint a machine the
+ * whole team depends on.
+ */
+export function canManageDevice(
+	device: Pick<RemoteDeviceView, "createdBy">,
+	principal: { userId: string | null | undefined; isAdmin: boolean },
+): boolean {
+	if (principal.isAdmin) return true;
+	return !!principal.userId && principal.userId === device.createdBy;
+}
+
 export function deviceHasFeature(
 	capabilities: Record<string, unknown> | null | undefined,
 	feature: string,
@@ -153,6 +180,11 @@ export function toDeviceView(row: RemoteDeviceRow): RemoteDeviceView {
 		defaultCwd: row.defaultCwd,
 		agentVersion: row.agentVersion,
 		capabilities: (row.capabilitiesJson as Record<string, unknown> | null) ?? null,
+		// Desired vs. reported are deliberately separate: the executor's own config
+		// is the authority, so the UI has to be able to show that a saved change has
+		// not been applied on the device yet.
+		pathRules: row.pathRulesJson ?? null,
+		reportedPathRules: row.reportedPathRulesJson ?? null,
 		scope: row.scope,
 		projectId: row.projectId,
 		createdAt: row.createdAt,
@@ -429,6 +461,35 @@ export async function updateDevice(
 		.set(patch)
 		.where(eq(remoteDevices.id, id))
 		.returning();
+	eventBus.emit({ type: "device:changed", deviceId: id });
+	return row ? toDeviceView(row) : null;
+}
+
+/**
+ * Records the operator's desired path guard rules.
+ *
+ * This does NOT change what the device enforces. The executor reads its rules
+ * from its own config file on the target machine, which is the entire point: a
+ * server-pushed guard could be widened by whoever controls the server. Saving
+ * here only captures intent so the UI can render it, diff it against the rules
+ * the device reports, and regenerate the config snippet to paste.
+ *
+ * Order is preserved exactly as supplied. Sorting or deduping would rewrite the
+ * policy, because the last matching rule is the one that wins.
+ */
+export async function updateDevicePathRules(
+	id: string,
+	rules: ExecutorPathRule[],
+): Promise<RemoteDeviceView | null> {
+	const existing = await getDeviceRow(id);
+	if (!existing || existing.revokedAt) return null;
+
+	const [row] = await db
+		.update(remoteDevices)
+		.set({ pathRulesJson: rules, updatedAt: new Date().toISOString() })
+		.where(eq(remoteDevices.id, id))
+		.returning();
+	logger.info("Remote device path rules updated", { deviceId: id, ruleCount: rules.length });
 	eventBus.emit({ type: "device:changed", deviceId: id });
 	return row ? toDeviceView(row) : null;
 }

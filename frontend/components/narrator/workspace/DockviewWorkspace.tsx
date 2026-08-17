@@ -50,8 +50,15 @@ export interface DirectorControl {
 	setPrimary: (panelId: string) => void;
 	/** Persist the primary/rail ratio. */
 	setRatio: (ratio: number) => void;
-	/** Open a child session in its host narrator's secondary area and return to grid mode. */
-	openSubagentPanel: (hostNarratorId: string, subagentNarratorId: string) => void;
+	/**
+	 * Open a child session in its host narrator's secondary area and return to grid
+	 * mode. `messageId` optionally scrolls that session to one message.
+	 */
+	openSubagentPanel: (
+		hostNarratorId: string,
+		subagentNarratorId: string,
+		messageId?: string,
+	) => void;
 	/** Close a dockview panel by id (goes through dockview's normal removal). */
 	closePanel: (panelId: string) => void;
 	/** Update a dockview panel's params (e.g. edited webview/plugin state). */
@@ -186,8 +193,8 @@ export function DockviewWorkspace({
 	);
 
 	const openSubagentPanel = useCallback(
-		(hostNarratorId: string, subagentNarratorId: string) => {
-			dockStoreRef.current?.openSubagentPanel(hostNarratorId, subagentNarratorId);
+		(hostNarratorId: string, subagentNarratorId: string, messageId?: string) => {
+			dockStoreRef.current?.openSubagentPanel(hostNarratorId, subagentNarratorId, messageId);
 			setMode("grid");
 		},
 		[setMode],
@@ -437,6 +444,9 @@ export function DockviewWorkspace({
 				onReady={handleReady}
 				onDidDrop={handleDidDrop}
 				onDropSubject={handleDropSubject}
+				// Identifies this workspace's surface on panel drags, so only it treats
+				// its own panel ids as local (see DockviewSurfaceProps.surfaceId).
+				surfaceId={`workspace:${workspaceId}`}
 				// Preserve panel component instances (live narrator sessions, terminals,
 				// webviews) when panels are dragged/rearranged across groups.
 				defaultRenderer="always"

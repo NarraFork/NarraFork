@@ -27,7 +27,7 @@ describe("measurePruneDivider — fixed decorative row", () => {
 		const wide = measurePruneDivider(2000);
 		const labeled = measurePruneDivider(600, { label: "a very long pruned-context boundary hint" });
 		const lowLod = measurePruneDivider(600, {}, 1);
-		const highLod = measurePruneDivider(600, {}, 6);
+		const highLod = measurePruneDivider(600, {}, 5);
 		expect(narrow.height).toBe(wide.height);
 		expect(labeled.height).toBe(wide.height);
 		expect(lowLod.height).toBe(highLod.height);

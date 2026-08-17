@@ -28,7 +28,6 @@ export {
 	registerTaskAlias,
 	resolveTaskAlias,
 } from "./subagent-alias";
-
 // Detach / Attach / Abort controllers
 export {
 	type AttachEntry,
@@ -44,7 +43,6 @@ export {
 	interruptForegroundSubagentsForParent,
 	ProxyAbortController,
 } from "./subagent-detach";
-
 // Executor
 export {
 	bufferSubagentUserMessage,
@@ -64,6 +62,14 @@ export {
 	type SubagentExecOptions,
 	updateSubagentBufferedMessage,
 } from "./subagent-executor";
+// Human/model-facing labels derived from those aliases
+export {
+	type AgentLabelSource,
+	agentLabelFromNarrator,
+	clearAgentLabelMemo,
+	resolveAgentLabel,
+	shortAgentId,
+} from "./subagent-label";
 
 // Manual override + conclusion watchers
 export {

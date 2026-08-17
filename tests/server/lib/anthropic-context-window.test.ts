@@ -85,7 +85,9 @@ describe("Anthropic effective context window respects explicit configuration", (
 	test("non-official relays never get the floor", () => {
 		const config = anthropicConfig({ officialApi: false });
 		settings.anthropicProviders = [config];
-		expect(getAnthropicEffectiveContextWindow("claude-sonnet-4-20250514", config)).toBe(200_000);
+		// Sonnet 4.5 is a genuine 200k model and the oldest Claude still carried, so
+		// it shows the floor being withheld without depending on a retired id.
+		expect(getAnthropicEffectiveContextWindow("claude-sonnet-4-5", config)).toBe(200_000);
 	});
 
 	test("prefixed override keys resolve for the provider prefix", () => {
@@ -130,7 +132,7 @@ describe("resolveModelContextWindow reports where the value came from", () => {
 	});
 
 	test("built-in table match is reported as builtin", () => {
-		expect(resolveModelContextWindow("claude-sonnet-4-20250514", "relay")).toEqual({
+		expect(resolveModelContextWindow("claude-sonnet-4-5", "relay")).toEqual({
 			contextWindow: 200_000,
 			source: "builtin",
 		});

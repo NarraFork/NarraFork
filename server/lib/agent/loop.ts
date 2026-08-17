@@ -8,6 +8,7 @@ import { beginNarratorResponseActivity } from "../../services/update-coordinator
 import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
 import { type DangerReflectionLevel, resolveBooleanOverride } from "../boolean-override";
 import { logger } from "../logger";
+import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import { hasUsableFunctionSearchChannelFor } from "../search/router";
@@ -28,6 +29,7 @@ import {
 	isRetryableError,
 } from "./error-handling";
 import { estimateTokens } from "./estimate-tokens";
+import { localPathSemantics } from "./execution/path-semantics";
 import {
 	buildMalformedCaptureRecord,
 	isMalformedRequestBodyError,
@@ -637,6 +639,47 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 
 const RELAXED_PLAN_READ_ONLY_SUBAGENTS = new Set(["explore", "plan"]);
 
+/**
+ * Is this tool use the model WRITING ITS PLAN, rather than starting implementation?
+ *
+ * Plan mode asks for exactly one write: the plan file. Reminding the model not to
+ * implement immediately after it complied is noise at the worst possible moment — it
+ * arrives attached to the one action that was correct, so the only signal the model
+ * can take from it is that its plan write was somehow suspect.
+ *
+ * Judged with the LOCAL path grammar even when the write ran on a remote executor:
+ * this is a "should we nag" heuristic, and a mismatch costs one redundant reminder,
+ * never a wrong permission decision (the gate in narrator-permission.ts does the
+ * target-accurate check).
+ */
+function isPlanAuthoringToolUse(
+	tu: AgentToolUse,
+	config: Pick<AgentConfig, "cwd" | "planFilePath">,
+): boolean {
+	if (tu.name !== "Write" && tu.name !== "Edit") return false;
+	const filePath = typeof tu.input.file_path === "string" ? tu.input.file_path : "";
+	if (!filePath || specVfsService.isSpecUri(filePath)) return false;
+	return isPlanAuthoringPath(localPathSemantics, config.cwd, filePath, config.planFilePath);
+}
+
+/**
+ * The plan file path to name in the reminder.
+ *
+ * `planFilePath` is the path the model was actually told to write (it may still be the
+ * pre-`plans/` layout for a cycle that started before the move), so it wins. The
+ * `planFileId` rebuild covers a config that carries the identity but not the resolved
+ * path; the placeholder is the last resort and at least points at the right directory
+ * rather than interpolating an empty string into a sentence.
+ */
+function relaxedPlanReminderPlanFile(
+	config: Pick<AgentConfig, "planFilePath" | "planFileId">,
+): string {
+	const designated = config.planFilePath?.trim();
+	if (designated) return designated;
+	const planFileId = config.planFileId?.trim();
+	return planFileId ? buildPlanFileRelPath(planFileId) : `${PLAN_DIR_REL}/`;
+}
+
 function isTaskStateMaintenanceToolUse(tu: AgentToolUse): boolean {
 	if (tu.name !== "Write" && tu.name !== "Edit") return false;
 	const filePath = typeof tu.input.file_path === "string" ? tu.input.file_path : null;
@@ -650,11 +693,12 @@ function isTaskStateMaintenanceToolUse(tu: AgentToolUse): boolean {
 
 export async function shouldInjectRelaxedPlanToolReminder(
 	tu: AgentToolUse,
-	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "cwd" | "chapterId">,
+	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "cwd" | "chapterId" | "planFilePath">,
 ): Promise<boolean> {
 	if (!config.planMode || !config.relaxedPlan) return false;
 	if (RELAXED_PLAN_READ_ONLY_TOOLS.has(tu.name)) return false;
 	if (isTaskStateMaintenanceToolUse(tu)) return false;
+	if (isPlanAuthoringToolUse(tu, config)) return false;
 
 	if (tu.name === "Agent" || tu.name === "Task") {
 		const subagentType =
@@ -2458,7 +2502,15 @@ export async function* agentLoop(
 		if (await shouldInjectRelaxedPlanToolReminder(tu, config)) {
 			queueLoopInjection({
 				source: "relaxed_plan",
-				...sideCarBodyWithText("relaxed_plan", { kind: "notice" }, locale),
+				...sideCarBodyWithText(
+					"relaxed_plan",
+					// The reminder now says WHERE the plan goes. Without it the model is told
+					// "keep planning" and left to rediscover the designated path from the
+					// EnterPlanMode result many turns back — which is how a plan ends up
+					// written somewhere ExitPlanMode will not read.
+					{ kind: "notice", params: { planFile: relaxedPlanReminderPlanFile(config) } },
+					locale,
+				),
 				toolUseId: tu.toolUseId,
 			});
 		}

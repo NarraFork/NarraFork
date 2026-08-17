@@ -8,6 +8,7 @@ import { buildSessionResult, loginUser, registerUser } from "../lib/auth";
 import { type AuthAttemptBlocked, authAttemptLimiter } from "../lib/auth-attempt-limiter";
 import { getClientIp } from "../lib/client-ip";
 import { AppError, formatZodError, RateLimitError, ValidationError } from "../lib/errors";
+import { invalidateGitIdentityCache } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import {
 	consumeMfaToken,
@@ -305,6 +306,10 @@ authRoutes.patch("/me", requireSessionAuth, async (c) => {
 	}
 	if (Object.keys(update).length > 0) {
 		await db.update(users).set(update).where(eq(users.id, payload.sub));
+		// The commit identity is memoized for a short window, so evict it here:
+		// otherwise a user fixes their name and their next commits still carry the
+		// old one, with nothing to indicate why.
+		invalidateGitIdentityCache(payload.sub);
 	}
 	return c.json({ ok: true });
 });

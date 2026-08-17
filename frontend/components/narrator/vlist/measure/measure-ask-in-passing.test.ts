@@ -27,7 +27,7 @@ describe("measureAskInPassing — pending (fixed 77px)", () => {
 
 	it("pending height ignores LOD", async () => {
 		const { measureAskInPassing } = await import("./measure-ask-in-passing");
-		const heights = ([1, 2, 3, 4, 5, 6] as const).map(
+		const heights = ([1, 2, 3, 4, 5] as const).map(
 			(lod) => measureAskInPassing("pending", {}, 800, lod).height,
 		);
 		expect(new Set(heights).size).toBe(1);
@@ -104,7 +104,7 @@ describe("measureAskInPassing — resolved (57~77px, lineClamp=2)", () => {
 
 	it("height does NOT change across LOD levels", async () => {
 		const { measureAskInPassing } = await import("./measure-ask-in-passing");
-		const heights = ([1, 2, 3, 4, 5, 6] as const).map(
+		const heights = ([1, 2, 3, 4, 5] as const).map(
 			(lod) => measureAskInPassing("resolved", { question: "Hi?" }, 800, lod).height,
 		);
 		expect(new Set(heights).size).toBe(1);

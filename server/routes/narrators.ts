@@ -236,6 +236,10 @@ import {
 } from "../services/narrator-draft-service";
 import { buildExportFileName, streamNarratorExport } from "../services/narrator-export";
 import {
+	countNarratorMessageRefs,
+	countNarratorMessageRefsBatch,
+} from "../services/narrator-message-count";
+import {
 	disarmQuestionReflection,
 	getQuestionReflectionDeadline,
 	reflectPendingAskUserQuestion,
@@ -274,6 +278,7 @@ import {
 	editAssistantMessage,
 	getBufferedMessages,
 	getNarratorExecutionDeviceState,
+	interruptAndWaitForIdle,
 	interruptNarrator,
 	isCompactInProgress,
 	isLoopRunning,
@@ -313,7 +318,6 @@ import {
 	type BufferedMessage,
 	getNarratorRuntimeModel,
 	isNarratorRuntimeBusy,
-	isWorkspaceBeingWritten,
 	pendingPermissions,
 	planModeAskedOnce,
 	resetActiveUpstreamSession,
@@ -741,6 +745,12 @@ narratorRoutes.get("/", async (c) => {
 
 		const baseWhere = and(...conditions);
 
+		// messageCount sorts on the stored column, which is an insert-only upper bound
+		// (see narrator-message-count.ts). Ordering is the one job that genuinely needs
+		// a stored value: it must be applied before LIMIT, so it cannot use the exact
+		// per-page counts computed after pagination. An approximate ordering with exact
+		// displayed numbers is the right trade here — the alternative is a correlated
+		// count(*) per candidate row, measured at 40ms per list request.
 		const sortColumnMap: Record<string, Column> = {
 			updatedAt: narrators.updatedAt,
 			createdAt: narrators.createdAt,
@@ -863,12 +873,21 @@ narratorRoutes.get("/", async (c) => {
 			}
 		}
 
+		// Exact message counts for this page. The stored `message_count` column is
+		// incremented per ref insert but never decremented (refs are removed from many
+		// scattered call sites), so it is an upper bound — a rolled-back or compacted
+		// conversation would keep reporting its high-water mark. Counting the page's
+		// ids is one grouped, indexed query: 0.8ms for a typical page, 11ms for a
+		// synthetic page of the 20 largest narrators in the database.
+		const messageCounts = await countNarratorMessageRefsBatch(narratorIds);
+
 		// Batch fetch presence and the current user's private draft markers
 		const presenceMap = getNarratorPresenceBatch(narratorIds);
 		const draftNarratorIds = await getNarratorIdsWithDraft(userId, narratorIds);
 
 		const items = rawItems.map((n) => ({
 			...publicNarratorResponse(n, draftNarratorIds.has(n.id)),
+			messageCount: messageCounts.get(n.id) ?? 0,
 			chapter: n.chapterId ? (chapterMap.get(n.chapterId) ?? null) : null,
 			activeTerminalCount: terminalCounts.get(n.id) ?? 0,
 			containerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.total ?? 0) : 0,
@@ -887,12 +906,15 @@ narratorRoutes.get("/", async (c) => {
 		await narratorService.listByChapter(chapterId),
 		narratorPrincipalOf(c),
 	);
-	const draftNarratorIds = await getNarratorIdsWithDraft(
-		userId,
-		list.map((narrator) => narrator.id),
-	);
+	const narratorIds = list.map((narrator) => narrator.id);
+	const draftNarratorIds = await getNarratorIdsWithDraft(userId, narratorIds);
+	// Same reason as the paged branch: the stored column only ever grows.
+	const messageCounts = await countNarratorMessageRefsBatch(narratorIds);
 	return c.json(
-		list.map((narrator) => publicNarratorResponse(narrator, draftNarratorIds.has(narrator.id))),
+		list.map((narrator) => ({
+			...publicNarratorResponse(narrator, draftNarratorIds.has(narrator.id)),
+			messageCount: messageCounts.get(narrator.id) ?? 0,
+		})),
 	);
 });
 
@@ -1075,8 +1097,14 @@ narratorRoutes.get("/:id", async (c) => {
 	const narrator = await narratorService.getById(id);
 	const hasDraft = await narratorHasDraft(c.get("user").sub, id);
 	const runtimeModel = getNarratorRuntimeModel(id, narrator.model?.trim() || FOLLOW_DEFAULT_MODEL);
+	// The stored counter is only refreshed when a turn ends, so a narrator that has
+	// not run since the turn-count → message-count change would still report the old
+	// value here. One narrator's refs are cheap to count exactly (an indexed count(*)),
+	// unlike the list endpoint where it would mean one subquery per row.
+	const messageCount = await countNarratorMessageRefs(id);
 	return c.json({
 		...publicNarratorResponse(narrator, hasDraft),
+		messageCount,
 		...(runtimeModel && {
 			runtimeModel: {
 				provider: runtimeModel.provider,
@@ -2101,12 +2129,12 @@ narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 
 	const narrator = await narratorService.getById(id);
 
-	if (
-		isSubagentVariant(narrator.variant) &&
-		(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id))
-	) {
-		throw new ValidationError("Cannot rollback on a running subagent");
-	}
+	// A rollback discards the turn it lands in, so a user asking for one has already
+	// decided the running turn is unwanted: stop it for them instead of refusing and
+	// making them press Stop first. A subagent is included — it used to be the one
+	// case that refused outright, but "the work I am undoing is still running" is not
+	// a reason to keep running it.
+	await prepareHistoryRewrite(id);
 
 	if (narrator.status === "archived") {
 		await narratorService.updateStatus(id, "idle");
@@ -2213,9 +2241,10 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 
 	const narrator = await narratorService.getById(id);
 
-	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id)) {
-		throw new ValidationError("Cannot edit while narrator is running");
-	}
+	// Editing a message truncates everything after it and regenerates, so the running
+	// turn is exactly what the user is replacing. Interrupt it for them rather than
+	// refusing and asking them to press Stop first.
+	await prepareHistoryRewrite(id);
 
 	if (narrator.status === "archived") {
 		await narratorService.updateStatus(id, "idle");
@@ -2929,31 +2958,32 @@ narratorRoutes.delete("/:id/compact/:messageId", async (c) => {
 });
 
 /**
- * Reject a block deletion while the narrator is writing to its own workspace.
+ * Clear the way for an operation that rewrites this narrator's history.
  *
- * Deleting a block rolls its file changes back, so it competes with the tools of a
- * running loop over the same worktree. The rollback path and the tool write path
- * hold different locks, so nothing else serializes them: without this check the
- * rollback either loses to a concurrent write or aborts on the state-drift guard,
- * surfacing as a rollback that fails at random.
+ * Editing history while the narrator's own loop is running is a genuine conflict:
+ * the loop is still appending the very message and tool-call rows being removed. But
+ * refusing was the wrong answer — the user asking to delete or roll back has already
+ * decided this turn is not what they want, so making them press Stop first is a
+ * detour through a state they do not care about. So the loop is interrupted on their
+ * behalf and we wait for it to actually leave (an abort only takes effect at the next
+ * await point; acting on the synchronous return would race its cleanup).
  *
- * `skipRevert` deletions touch history only, but they still remove the tool-call
- * rows a running loop may be writing to, so they are gated the same way.
+ * A loop that will not stop within the budget is reported rather than silently
+ * worked around: proceeding would interleave our deletion with its writes.
+ *
+ * Deliberately NOT checked here: whether something else is writing to the same
+ * worktree. That check matched by path, so a different narrator or a background
+ * subagent sharing the worktree made every deletion fail — including "delete
+ * messages only", which touches no file at all. It was also redundant for the file
+ * rollback: `reverseAndRestore` re-captures the worktree under its own lock and
+ * 3-way merges, reporting a conflict only on the paths actually being restored. That
+ * is a precise answer where this was a guess, so the guess is gone.
  */
-async function assertIdleForBlockDeletion(narratorId: string): Promise<void> {
-	const narrator = await narratorService.getById(narratorId);
-	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(narratorId)) {
-		// Repair a stale idle status so the user keeps the interrupt button.
-		await reconcileRunningStatus(narratorId);
-		throw new ValidationError("Cannot delete blocks while narrator is running");
-	}
-	// The narrator itself can be idle while a background subagent keeps writing to the
-	// same worktree, so admission also has to consider the workspace. The rollback
-	// re-checks this immediately before writing; this check exists to reject early
-	// with a clear message instead of failing deep in the rollback.
-	const worktreePath = await resolveNarratorCwd(narratorId);
-	if (worktreePath && isWorkspaceBeingWritten(worktreePath)) {
-		throw new ValidationError("Cannot delete blocks while something is writing to this workspace");
+async function prepareHistoryRewrite(narratorId: string): Promise<void> {
+	if (!(await interruptAndWaitForIdle(narratorId))) {
+		throw new ValidationError(
+			"This narrator did not stop after being interrupted; try again in a moment",
+		);
 	}
 }
 
@@ -2963,7 +2993,7 @@ narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
 	const body = await c.req.json();
 	const { batchDeleteBlocksSchema } = await import("../lib/validators");
 	const { blocks, skipRevert, scope } = batchDeleteBlocksSchema.parse(body);
-	await assertIdleForBlockDeletion(narratorId);
+	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlocks(narratorId, blocks, {
 		skipRevert,
 		...(scope ? { scope } : {}),
@@ -2983,7 +3013,7 @@ narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) =
 	// The narrator scope is the default and refuses on conflict, so the caller needs
 	// a way to ask for the wider one its error suggests.
 	const scope = revertScopeSchema.parse(c.req.query("scope"));
-	await assertIdleForBlockDeletion(narratorId);
+	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex, {
 		skipRevert,
 		...(scope ? { scope } : {}),
@@ -2999,9 +3029,7 @@ narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	// The narrator scope is the default and can refuse on conflict; the caller needs a
 	// way to act on that refusal, so the widening choice must be expressible here too.
 	const scope = revertScopeSchema.parse(c.req.query("scope"));
-	// This rolls the workspace back like a block deletion does, so it needs the same
-	// admission check against a loop writing to the same worktree.
-	await assertIdleForBlockDeletion(narratorId);
+	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessage(narratorId, messageId, {
 		skipRevert,
 		...(scope ? { scope } : {}),

@@ -38,8 +38,13 @@ mock.module("@frontend/hooks/usePlatform", () => ({
 	useUploadCapability: () => ({ serveAvatars: { supported: false } }),
 }));
 
-const { InjectionSpeakerHeader, injectInjectionBubbleChrome, isPlatformSource, speakerTint } =
-	await import("./vlist-injection-header");
+const {
+	InjectionSpeakerHeader,
+	injectInjectionBubbleChrome,
+	isPlatformSource,
+	speakerTint,
+}: typeof import("./vlist-injection-header") = await import("./vlist-injection-header");
+type InjectionNavigation = import("./vlist-injection-header").InjectionNavigation;
 
 let currentRoot: Root | null = null;
 let currentContainer: HTMLElement | null = null;
@@ -196,6 +201,74 @@ describe("speakerTint", () => {
 	});
 });
 
+/**
+ * Clicking a speaker row opens that speaker's session.
+ *
+ * Two failure modes worth pinning, because both LOOK fine:
+ *
+ *   - a row that paints as clickable but calls nothing (the shell forgot to bind the
+ *     handler) — the reader clicks and nothing happens;
+ *   - a row that navigates using the identicon seed instead of the session id, which
+ *     would send a `bg_bash` row to a narrator that does not exist.
+ */
+describe("InjectionSpeakerHeader — opening the speaker's session", () => {
+	/** Render, click the row if it is clickable, and report what happened. */
+	function clickRow(props: React.ComponentProps<typeof InjectionSpeakerHeader>): {
+		clickable: boolean;
+		clicks: number;
+	} {
+		renderHeader(props);
+		const container = currentContainer;
+		if (!container) throw new Error("expected a rendered container");
+		const link = container.querySelector("[data-injection-open-session]");
+		if (link) (link as unknown as HTMLElement).click();
+		return { clickable: !!link, clicks: 0 };
+	}
+
+	test("the row becomes a button and invokes the handler", () => {
+		let calls = 0;
+		renderHeader({
+			speaker: "explorer",
+			speakerId: "narr-1",
+			source: "subagent_message",
+			onOpenSession: () => {
+				calls += 1;
+			},
+			openSessionLabel: "open session",
+		});
+		const container = currentContainer;
+		if (!container) throw new Error("expected a rendered container");
+		const link = container.querySelector("[data-injection-open-session]");
+		expect(link).not.toBeNull();
+		// The label is what a screen reader and the tooltip announce.
+		expect(link?.getAttribute("aria-label")).toBe("open session");
+		(link as unknown as HTMLElement).click();
+		expect(calls).toBe(1);
+	});
+
+	test("without a handler the row is inert rather than a dead control", () => {
+		const { clickable } = clickRow({
+			speaker: "explorer",
+			speakerId: "narr-1",
+			source: "subagent_message",
+		});
+		expect(clickable).toBe(false);
+	});
+
+	test("the name is still readable when the row is a link", () => {
+		// The wrapper must not swallow or restructure the row's content.
+		const text = renderHeader({
+			speaker: "explorer",
+			speakerId: "narr-1",
+			speakerKind: "explore",
+			source: "subagent_message",
+			onOpenSession: () => {},
+		});
+		expect(text).toContain("explorer");
+		expect(text).toContain("explore");
+	});
+});
+
 describe("injectInjectionBubbleChrome", () => {
 	test("attaches the header and forwards the note only when one was measured", () => {
 		const withNote: RenderExtra = { hasNote: true, speaker: "fmt" };
@@ -215,6 +288,167 @@ describe("injectInjectionBubbleChrome", () => {
 			injectInjectionBubbleChrome(kind, extra, "truncated");
 			expect(extra.header).toBeUndefined();
 		}
+	});
+
+	/**
+	 * The binding rule: clickable requires BOTH a resolvable target on the row AND a
+	 * host that can reach that specific kind. Each half missing has its own silent
+	 * failure (a dead control / a row that quietly stops being clickable), so both are
+	 * pinned here rather than through the rendered DOM.
+	 */
+	describe("the navigation binding", () => {
+		/** Render the produced header, click it, and report whether it was clickable. */
+		function bindAndClick(extra: RenderExtra, navigation?: InjectionNavigation) {
+			injectInjectionBubbleChrome("injection-bubble", extra, undefined, navigation);
+			const doc = setupDom();
+			const container = doc.createElement("div");
+			doc.body.appendChild(container);
+			currentContainer = container as unknown as HTMLElement;
+			const root = createRoot(currentContainer);
+			currentRoot = root;
+			act(() => {
+				root.render(<MantineProvider>{extra.header as React.ReactNode}</MantineProvider>);
+			});
+			const link = currentContainer.querySelector("[data-injection-open-session]");
+			if (link) (link as unknown as HTMLElement).click();
+			return { clickable: !!link, label: link?.getAttribute("aria-label") ?? null };
+		}
+
+		test("a narrator target passes the session id and the message id through", () => {
+			const seen: Array<[string, string | undefined]> = [];
+			const { clickable } = bindAndClick(
+				{
+					speaker: "explorer",
+					speakerId: "narr-1",
+					target: { kind: "narrator", narratorId: "narr-1", messageId: "msg-9" },
+				},
+				{ onOpenNarrator: (id, messageId) => seen.push([id, messageId]) },
+			);
+			expect(clickable).toBe(true);
+			expect(seen).toEqual([["narr-1", "msg-9"]]);
+		});
+
+		test("a narrator target with no recorded message still opens its session", () => {
+			const seen: Array<[string, string | undefined]> = [];
+			bindAndClick(
+				{ target: { kind: "narrator", narratorId: "narr-2", messageId: null } },
+				{ onOpenNarrator: (id, messageId) => seen.push([id, messageId]) },
+			);
+			expect(seen).toEqual([["narr-2", undefined]]);
+		});
+
+		test("a knowledge target passes the entry id and its scope", () => {
+			const seen: Array<[string, string]> = [];
+			bindAndClick(
+				{ target: { kind: "knowledge", entryId: "k-1", scope: "global" } },
+				{ onOpenKnowledge: (entryId, scope) => seen.push([entryId, scope]) },
+			);
+			expect(seen).toEqual([["k-1", "global"]]);
+		});
+
+		test("a spec target passes the uri", () => {
+			const seen: string[] = [];
+			bindAndClick(
+				{ target: { kind: "spec", uri: "spec://index.md" } },
+				{ onOpenSpec: (uri) => seen.push(uri) },
+			);
+			expect(seen).toEqual(["spec://index.md"]);
+		});
+
+		test("a chapter target passes the chapter id", () => {
+			const seen: string[] = [];
+			bindAndClick(
+				{ target: { kind: "chapter", chapterId: "chap-7" } },
+				{ onOpenChapter: (id) => seen.push(id) },
+			);
+			expect(seen).toEqual(["chap-7"]);
+		});
+
+		test("each kind uses its OWN opener, never another kind's", () => {
+			// One shared "open" callback would send a spec row to a narrator route. The
+			// per-kind openers are what make that a type error rather than a live bug.
+			const { clickable } = bindAndClick(
+				{ target: { kind: "spec", uri: "spec://tasks.json" } },
+				{
+					onOpenNarrator: () => {
+						throw new Error("a spec target must not reach the narrator opener");
+					},
+					onOpenChapter: () => {
+						throw new Error("a spec target must not reach the chapter opener");
+					},
+				},
+			);
+			// No spec opener supplied → inert, rather than falling back to another kind.
+			expect(clickable).toBe(false);
+		});
+
+		test("does NOT navigate by the identicon seed", () => {
+			// `speakerId` is set for a bash task and a knowledge entry too, neither of which
+			// is a narrator. Using it as the navigation target is what would produce a row
+			// that opens a session that does not exist.
+			const { clickable } = bindAndClick(
+				{ speaker: "run-tests", speakerId: "task-bash-1", source: "bg_bash" },
+				{
+					onOpenNarrator: () => {
+						throw new Error("must not be called: a bash task has no session");
+					},
+				},
+			);
+			expect(clickable).toBe(false);
+		});
+
+		test("stays inert when the host supplies no navigation at all", () => {
+			const { clickable } = bindAndClick({
+				target: { kind: "narrator", narratorId: "narr-3", messageId: "msg-1" },
+			});
+			expect(clickable).toBe(false);
+		});
+
+		test("a malformed target is refused rather than rendered as a dead link", () => {
+			// `spec.data` is untyped by construction, so the render side must not trust it.
+			// An id-less target is exactly the shape that paints a live control that
+			// navigates nowhere.
+			for (const target of [
+				{ kind: "narrator" },
+				{ kind: "narrator", narratorId: "  " },
+				{ kind: "knowledge" },
+				{ kind: "spec" },
+				{ kind: "chapter" },
+				{ kind: "not-a-kind", narratorId: "n-1" },
+				null,
+				"narr-1",
+			]) {
+				const { clickable } = bindAndClick(
+					{ target },
+					{
+						onOpenNarrator: () => {
+							throw new Error("a malformed target must not be opened");
+						},
+						onOpenKnowledge: () => {
+							throw new Error("a malformed target must not be opened");
+						},
+						onOpenSpec: () => {
+							throw new Error("a malformed target must not be opened");
+						},
+						onOpenChapter: () => {
+							throw new Error("a malformed target must not be opened");
+						},
+					},
+				);
+				expect(clickable).toBe(false);
+			}
+		});
+
+		test("labels are resolved per kind", () => {
+			const { label } = bindAndClick(
+				{ target: { kind: "knowledge", entryId: "k-1", scope: "global" } },
+				{
+					onOpenKnowledge: () => {},
+					labels: { knowledge: "open the entry", narrator: "open the session" },
+				},
+			);
+			expect(label).toBe("open the entry");
+		});
 	});
 });
 

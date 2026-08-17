@@ -326,15 +326,34 @@ export function isAnimatableShift(delta: number): boolean {
  * the distinction needed. The age bound is the backstop for the case no revision can
  * catch: a click whose rebuild never commits (an error, a narrator switch) must not
  * leave a capture lying around for a much later commit to consume.
+ *
+ * ## Why the LOD is a third discriminator
+ *
+ * An LOD switch is invisible to BOTH checks above: like a fold it only changes build
+ * options, so it does not advance the document revision, and a reader who folds a card
+ * and then pinch-zooms within the age bound produces exactly that pair. Without this
+ * check the stale capture is consumed on the commit where the level moved, and two
+ * controllers then animate ONE node's `transform` in the same frame — the fold effect
+ * plays first, the LOD morph effect plays second, and which one wins is undefined
+ * (the item wrapper carries `data-nf-row-key` AND `data-nf-unit`, so both resolve to
+ * it).
+ *
+ * Rejecting the capture is also the semantically right answer independent of the
+ * clash: the switch re-themed the whole document, so geometry captured under the old
+ * level describes boxes that no longer exist. The fold then applies instantly while
+ * the LOD morph carries the movement, which is the transition the reader's last action
+ * actually asked for.
  */
 export function isFoldCaptureUsable(
-	capture: { documentRevision: number; capturedAt: number } | null,
+	capture: { documentRevision: number; capturedAt: number; lod: number } | null,
 	currentRevision: number,
 	now: number,
+	currentLod: number,
 	maxAgeMs = 400,
 ): boolean {
 	if (!capture) return false;
 	if (capture.documentRevision !== currentRevision) return false;
+	if (capture.lod !== currentLod) return false;
 	const age = now - capture.capturedAt;
 	return age >= 0 && age <= maxAgeMs;
 }

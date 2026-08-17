@@ -49,10 +49,25 @@ export interface ForkChapterInput {
 	/** Chapter role: branch or exploration (trunk is reserved for the root chapter). */
 	role?: "branch" | "exploration";
 	locale?: Locale;
-	/** Explicit graph position — if provided, skip auto-layout calculation. */
+	/**
+	 * Explicit RULER position — if provided, skip auto-layout calculation.
+	 * `axisOffset`/`crossOffset` are offsets relative to `anchorCommitSha`'s tick.
+	 */
 	anchorCommitSha?: string;
 	axisOffset?: number;
 	crossOffset?: number;
+	/**
+	 * Explicit CLASSIC canvas position (absolute React Flow world coordinates).
+	 *
+	 * Separate from the ruler triple above because the two coordinate systems are
+	 * not interchangeable: classic clients used to send their world coordinates as
+	 * `axisOffset`/`crossOffset`, which made the new chapter's stored position
+	 * meaningless to ruler (it reads them as offsets from a commit tick) and vice
+	 * versa. Supplying these places the chapter on the classic canvas only; its
+	 * ruler position stays auto-assigned.
+	 */
+	graphX?: number;
+	graphY?: number;
 }
 
 function summarizeStartupScript(script: string): string {
@@ -599,6 +614,12 @@ export const chapterFork = {
 					anchorCommitSha,
 					axisOffset,
 					crossOffset,
+					// Classic coordinates are stored only when the caller supplied them.
+					// Left null the chapter is simply unplaced on that canvas and gets
+					// auto-laid-out, which is the right default — there is no meaningful
+					// way to derive a React Flow position from a ruler tick offset.
+					graphX: input.graphX ?? null,
+					graphY: input.graphY ?? null,
 					lastAccessedAt: now,
 					createdAt: now,
 					updatedAt: now,

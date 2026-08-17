@@ -82,6 +82,7 @@ import {
 import type { ComponentType, ReactNode } from "react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
+import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
 import {
 	CARD_PADDING,
@@ -125,7 +126,7 @@ import {
 	type VListViewTarget,
 } from "../vlist-content-view-target";
 import { categoryIcon } from "./category-icons";
-import { activateOnKey } from "./key-activate";
+import { activateOnKey, swallowSelectionClick } from "./key-activate";
 import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
@@ -471,6 +472,10 @@ function ToolHeaderRow({
 	return (
 		<Group
 			data-nf-card-header
+			// The header doubles as the card's selectable surface: Ctrl/Cmd/Shift+Click
+			// must reach the row's selection wrapper (which ignores role="button"
+			// targets) instead of being treated as an interactive island.
+			{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
 			gap={4}
 			wrap="nowrap"
 			align="center"
@@ -487,7 +492,8 @@ function ToolHeaderRow({
 				cursor: onToggle ? "pointer" : "default",
 				userSelect: "none",
 			}}
-			onClick={onToggle}
+			// A modified click selects the block; only a plain click toggles the card.
+			onClick={onToggle ? swallowSelectionClick(onToggle) : undefined}
 			onKeyDown={onToggle ? activateOnKey(onToggle) : undefined}
 		>
 			<span
@@ -1133,11 +1139,26 @@ const SPEC_TASK_GLYPH: Record<string, { Icon: ComponentType<IconProps>; color: s
  * the measure layer folded exactly that into the row's `contentLeft`. Pinning the
  * width here rather than letting the Group shrink-wrap is what keeps the two in
  * step: a wider intrinsic lane would overlap the text the measure pass placed.
+ *
+ * `live` is what makes a `doing` row animate, and it is false for every card but
+ * one. A task board is a SNAPSHOT: each `spec://tasks.json` write keeps whatever
+ * was in progress at the time, so spinning on the status alone set every
+ * historical card spinning (chunked `SpecTasksDetail` gates the same spinner on
+ * `isThinking && isLatestTasksCard`). A live row also becomes a LOADER — a
+ * spinning play triangle reads as a control, not as work in flight.
  */
-function SpecTaskIcon({ status, protectedTask }: { status: string; protectedTask: boolean }) {
+function SpecTaskIcon({
+	status,
+	protectedTask,
+	live,
+}: {
+	status: string;
+	protectedTask: boolean;
+	live: boolean;
+}) {
 	const entry = SPEC_TASK_GLYPH[status] ?? SPEC_TASK_GLYPH.todo;
-	const { Icon } = entry;
-	const spinning = status === "doing";
+	const spinning = live && status === "doing";
+	const Icon = spinning ? IconLoader2 : entry.Icon;
 	return (
 		<Group
 			gap={SPEC_TASK_LOCK_GAP}
@@ -1815,6 +1836,7 @@ function SectionsDetailBody({
 	narratorId,
 	viewTargets,
 	viewControls,
+	specTasksLive,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
@@ -1822,6 +1844,8 @@ function SectionsDetailBody({
 	narratorId?: string;
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
+	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
+	specTasksLive?: boolean;
 }) {
 	// kind === "sections" guarantees the section list (the caller gates on it).
 	const sections = detail.sections ?? [];
@@ -1848,6 +1872,7 @@ function SectionsDetailBody({
 					// its full payload.
 					viewTarget={findViewTarget(viewTargets, sectionSlot(sectionIndex))}
 					viewControls={viewControls}
+					specTasksLive={specTasksLive}
 				/>
 			))}
 		</div>
@@ -1863,6 +1888,7 @@ function SectionView({
 	narratorId,
 	viewTarget,
 	viewControls,
+	specTasksLive,
 }: {
 	detail: MeasuredToolDetail;
 	part: MeasuredToolDetailSection;
@@ -1871,6 +1897,8 @@ function SectionView({
 	narratorId?: string;
 	viewTarget?: VListViewTarget;
 	viewControls?: VListViewControls;
+	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
+	specTasksLive?: boolean;
 }) {
 	// The slice of blocks owned by this section (skipping its own label row).
 	const bodyStart = part.blockStart + (part.hasLabel ? 1 : 0);
@@ -1912,6 +1940,7 @@ function SectionView({
 					narratorId={narratorId}
 					viewTarget={viewTarget}
 					viewControls={viewControls}
+					specTasksLive={specTasksLive}
 				/>
 			</div>
 		</>
@@ -1932,6 +1961,7 @@ function SectionBody({
 	narratorId,
 	viewTarget,
 	viewControls,
+	specTasksLive,
 }: {
 	part: MeasuredToolDetailSection;
 	blocks: MeasuredToolDetail["blocks"];
@@ -1941,6 +1971,8 @@ function SectionBody({
 	narratorId?: string;
 	viewTarget?: VListViewTarget;
 	viewControls?: VListViewControls;
+	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
+	specTasksLive?: boolean;
 }) {
 	// Section geometry is absolute within the region; shift it to a local origin.
 	const origin = frames[0]?.top ?? 0;
@@ -2037,6 +2069,7 @@ function SectionBody({
 			height={part.bodyHeight}
 			labels={labels}
 			narratorId={narratorId}
+			specTasksLive={specTasksLive}
 		/>
 	);
 }
@@ -2146,6 +2179,7 @@ function DetailBlocks({
 	height,
 	labels,
 	narratorId,
+	specTasksLive,
 }: {
 	kind: MeasuredToolDetail["kind"];
 	blocks: MeasuredToolDetail["blocks"];
@@ -2154,6 +2188,8 @@ function DetailBlocks({
 	height: number;
 	labels: DetailLabels;
 	narratorId?: string;
+	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
+	specTasksLive?: boolean;
 }) {
 	void narratorId;
 	// `c="red"`: red-4 on dark, red-filled on light (red-4 washes out on white).
@@ -2170,7 +2206,11 @@ function DetailBlocks({
 					const iconSlot = taskStatus ? (
 						<div style={{ position: "absolute", left: 0, top: 0, height: block.lineHeight }}>
 							<div style={{ display: "flex", alignItems: "center", height: block.lineHeight }}>
-								<SpecTaskIcon status={taskStatus} protectedTask={data.protected === true} />
+								<SpecTaskIcon
+									status={taskStatus}
+									protectedTask={data.protected === true}
+									live={specTasksLive === true}
+								/>
 							</div>
 						</div>
 					) : null;
@@ -2383,6 +2423,7 @@ function DetailRegion({
 	narratorId,
 	viewTargets,
 	viewControls,
+	specTasksLive,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
@@ -2390,6 +2431,8 @@ function DetailRegion({
 	narratorId?: string;
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
+	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
+	specTasksLive?: boolean;
 }) {
 	// Multi-part detail: the meta header + labelled body sections the classic card
 	// draws. This is the shape whose absence made whole blocks disappear.
@@ -2402,6 +2445,7 @@ function DetailRegion({
 				narratorId={narratorId}
 				viewTargets={viewTargets}
 				viewControls={viewControls}
+				specTasksLive={specTasksLive}
 			/>
 		);
 	}
@@ -2535,6 +2579,7 @@ function DetailRegion({
 			height={detail.height}
 			labels={labels}
 			narratorId={narratorId}
+			specTasksLive={specTasksLive}
 		/>
 	);
 }
@@ -2594,6 +2639,15 @@ export interface RenderToolCallProps {
 	 */
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
+	/**
+	 * This card is the newest `spec://tasks.json` board AND the narrator is running,
+	 * so its in-progress row is describing live work and may animate.
+	 *
+	 * Absent everywhere else on purpose: a task board is a snapshot, so animating on
+	 * the recorded `doing` status alone set every historical card spinning. See
+	 * `SpecTaskIcon`. Height-neutral (a glyph swap inside a reserved lane).
+	 */
+	specTasksLive?: boolean;
 }
 
 /** How long a one-shot outcome sweep stays mounted (600ms animation + a margin). */
@@ -2672,6 +2726,7 @@ export function RenderToolCall({
 	reflectionTakingOver,
 	viewTargets,
 	viewControls,
+	specTasksLive,
 }: RenderToolCallProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	const {
@@ -2743,6 +2798,7 @@ export function RenderToolCall({
 									narratorId={narratorId}
 									viewTargets={viewTargets}
 									viewControls={viewControls}
+									specTasksLive={specTasksLive}
 								/>
 							</div>
 						</Box>
@@ -2909,12 +2965,15 @@ export function RenderToolCallGroup({
 				gap={5}
 				wrap="nowrap"
 				align="center"
+				// Selectable surface: a modified click selects the block (handled by the
+				// row's interaction wrapper), only a plain click toggles the group.
+				{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
 				style={{
 					height: headerHeight,
 					cursor: onToggle ? "pointer" : "default",
 					userSelect: "none",
 				}}
-				onClick={onToggle}
+				onClick={onToggle ? swallowSelectionClick(onToggle) : undefined}
 			>
 				<ThemeIcon size={16} variant="light" color={groupColor} radius="sm">
 					<Icon size={10} />

@@ -41,7 +41,12 @@
  * Zero DOM. Follows the measure-markdown.ts / measure-web-search.ts template.
  */
 
-import type { MeasuredElement, PreparedBlock, RenderLod } from "../prepared-block";
+import {
+	DEFAULT_RENDER_LOD,
+	type MeasuredElement,
+	type PreparedBlock,
+	type RenderLod,
+} from "../prepared-block";
 import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 
@@ -191,11 +196,11 @@ export function resolveReasoningForm(
 	if (data.isStreaming && displayText.length === 0) return "streaming";
 	// Streaming with content is always shown in full (live feedback).
 	if (data.isStreaming) return "expanded";
-	// An explicit expand (user override or L5/L6 opened pref) wins over LOD.
+	// An explicit expand (user override or L4/L5 opened pref) wins over LOD.
 	if (expandState.expanded) return "expanded";
 	// Low LOD collapses to the single "reasoning ×N" count line.
 	if (lod <= 2) return "count";
-	// L3..L6 collapsed → header only.
+	// L3..L5 collapsed → header only.
 	return "collapsed";
 }
 
@@ -210,13 +215,13 @@ const EMPTY_FRAME = { blocks: [], contentHeight: 0, usedWidth: 0 } as const;
  * Measure a reasoning/thinking block at a content width. Deterministic, zero DOM.
  * @param data         reasoning block data (text/translatedText/isStreaming/…)
  * @param contentWidth available OUTER width in px
- * @param lod          render LOD (1..6) — selects count vs header/body form
+ * @param lod          render LOD (1..5) — selects count vs header/body form
  * @param expandState  resolved expand decision (expanded?)
  */
 export function measureReasoning(
 	data: ReasoningBlockData,
 	contentWidth: number,
-	lod: RenderLod = 5,
+	lod: RenderLod = DEFAULT_RENDER_LOD,
 	expandState: ReasoningExpandState = {},
 ): MeasuredReasoning {
 	const displayText = resolveReasoningDisplayText(data, expandState);
@@ -295,7 +300,7 @@ export function prepareReasoningMeasurer(
 	lod?: RenderLod,
 	expandState?: ReasoningExpandState,
 ) => MeasuredReasoning {
-	return (contentWidth, lod = 5, expandState = {}) =>
+	return (contentWidth, lod = DEFAULT_RENDER_LOD, expandState = {}) =>
 		measureReasoning(data, contentWidth, lod, expandState);
 }
 

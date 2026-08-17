@@ -17,6 +17,7 @@ export type WorkspacePanelType =
 	| "narrator-tool"
 	| "subagent"
 	| "file"
+	| "knowledge"
 	| "plugin";
 
 /** Params carried by a narrator panel. */
@@ -56,6 +57,15 @@ export interface SubagentPanelParams {
 	panelType: "subagent";
 	hostNarratorId: string;
 	subagentNarratorId: string;
+	/**
+	 * One-shot jump request: scroll to and flash this message once mounted. Set when
+	 * the panel was opened from a row pointing at one specific thing the child said.
+	 * Stripped before persistence — see the focus dock's counterpart in
+	 * `../panels/panel-kind` for why a request must not be restored.
+	 */
+	highlightMessageId?: string;
+	/** Distinguishes consecutive jump requests so a repeat click re-fires. */
+	highlightRequestId?: string;
 }
 
 /**
@@ -70,6 +80,17 @@ export interface WorkspaceFilePanelParams {
 	fileName?: string;
 }
 
+/**
+ * Multi-instance knowledge entry viewer/editor belonging to one narrator
+ * cluster. Like `file`, the host is explicit for orphan pruning.
+ */
+export interface WorkspaceKnowledgePanelParams {
+	panelType: "knowledge";
+	hostNarratorId: string;
+	entryId: string;
+	scope: "global" | "personal";
+}
+
 export type WorkspacePanelParams =
 	| NarratorPanelParams
 	| TerminalPanelParams
@@ -77,6 +98,7 @@ export type WorkspacePanelParams =
 	| NarratorToolPanelParams
 	| SubagentPanelParams
 	| WorkspaceFilePanelParams
+	| WorkspaceKnowledgePanelParams
 	| PluginDockPanelParams;
 
 /** Component registry name for each panel type. */
@@ -87,5 +109,6 @@ export const PANEL_COMPONENT = {
 	narratorTool: "narrator-tool",
 	subagent: "subagent",
 	file: "file",
+	knowledge: "knowledge",
 	plugin: "plugin",
 } as const;

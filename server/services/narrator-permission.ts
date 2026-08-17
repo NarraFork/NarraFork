@@ -3239,15 +3239,21 @@ function resolvePendingExecutionBackend(target: PendingExecutionTarget): Executi
 				`got ${backend.kind}/${backend.deviceId}.`,
 		);
 	}
-	const backendFlavor =
-		backend.pathFlavor ??
-		backend.paths?.flavor ??
-		(backend.platform?.os === "windows" ? "windows" : "posix");
-	if (target.pathFlavor !== backendFlavor) {
-		throw new Error(
-			`Frozen execution target path flavor drifted: expected ${target.pathFlavor}, ` +
-				`got ${backendFlavor}.`,
-		);
+	// A Dynamic Spec target runs on the host backend but keeps the spec:// grammar, so it
+	// never matches the backend's own filesystem flavor. Comparing the two would reject
+	// every reprocessed spec:// permission ("expected spec, got posix") — most visibly when
+	// a plan-mode spec write is pending and the user changes permission mode.
+	if (target.pathFlavor !== "spec") {
+		const backendFlavor =
+			backend.pathFlavor ??
+			backend.paths?.flavor ??
+			(backend.platform?.os === "windows" ? "windows" : "posix");
+		if (target.pathFlavor !== backendFlavor) {
+			throw new Error(
+				`Frozen execution target path flavor drifted: expected ${target.pathFlavor}, ` +
+					`got ${backendFlavor}.`,
+			);
+		}
 	}
 	const runtimeGeneration = backend.runtimeGeneration ?? 0;
 	if (target.runtimeGeneration !== runtimeGeneration) {
@@ -3600,7 +3606,14 @@ export async function handlePermission(
 	let planRedirectNotice: string | undefined;
 	if (isPlanMode && !isRelaxedPlan && planFileId && (toolName === "Write" || toolName === "Edit")) {
 		const filePath = typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
-		if (filePath) {
+		// A spec:// URI is never a filesystem plan file. Rewriting it to the plan path would
+		// also change the path grammar of an execution target that was already frozen as
+		// "spec" before permission handling, which the executor rejects outright ("path
+		// flavor is already frozen to spec and cannot change to posix") — so the model sees
+		// a routing error instead of a decision. Dynamic Spec writes are session metadata
+		// and are judged on their own below (tasks.json is allowed, anything else still
+		// falls through to the plan-mode soft deny).
+		if (filePath && !specVfsService.isSpecUri(filePath)) {
 			const paths = executionContext?.paths ?? localPathSemantics;
 			const absPath =
 				(executionContext && executionTargetPolicyPath(executionContext)) ??
@@ -3628,7 +3641,15 @@ export async function handlePermission(
 	// Conclusion file redirect
 	let conclusionRedirectNotice: string | undefined;
 	const subagentConcEntry = getConclusionEntry(narratorId);
-	if (subagentConcEntry && (toolName === "Write" || toolName === "Edit")) {
+	// Same reason as the plan-file redirect above: a spec:// target is frozen with the
+	// "spec" path grammar before permission handling, so rewriting it to a worktree path
+	// turns the call into a routing error rather than a decision. Dynamic Spec is the
+	// subagent's own session metadata, never the caller's conclusion document.
+	if (
+		subagentConcEntry &&
+		(toolName === "Write" || toolName === "Edit") &&
+		!specVfsService.isSpecUri(effectiveInput.file_path)
+	) {
 		const filePath = typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
 		const conclusionRelPath = subagentConcEntry.relPath;
 		if (filePath) {

@@ -7,6 +7,7 @@ import {
 	Group,
 	Loader,
 	Modal,
+	SegmentedControl,
 	Stack,
 	Text,
 	Textarea,
@@ -14,12 +15,13 @@ import {
 	Title,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import { createFileRoute, useNavigate, useSearch } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useChapterBatchMergeCapability } from "../../hooks/usePlatform";
-import { useDeleteProject, useProject } from "../../hooks/useProjects";
+import { useDeleteProject, useProject, useUpdateProject } from "../../hooks/useProjects";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { APP_SHELL_CONTENT_HEIGHT } from "../../lib/safe-area";
 
@@ -84,6 +86,7 @@ function ProjectDetailPage() {
 	const { data: project, isLoading: projectLoading } = useProject(projectId);
 	const { data: chapters } = useChapters(projectId);
 	const createChapter = useCreateChapter();
+	const updateProject = useUpdateProject();
 	const deleteProject = useDeleteProject();
 	const batchMergeCapability = useChapterBatchMergeCapability();
 	const [opened, { open, close }] = useDisclosure(false);
@@ -117,6 +120,9 @@ function ProjectDetailPage() {
 	if (!project) return <Text>{tp("projectNotFound")}</Text>;
 
 	const hasGitPath = !!project.gitPath;
+	// Anything that is not the deprecated Ruler falls back to the classic canvas, which
+	// matches the render branch below and the column's own default.
+	const flowMode: "classic" | "ruler" = project.flowMode === "ruler" ? "ruler" : "classic";
 	const batchMergeSupported =
 		batchMergeCapability.supported && batchMergeCapability.startRouteSupported;
 
@@ -134,6 +140,29 @@ function ProjectDetailPage() {
 					setTitle("");
 					setDescription("");
 				},
+			},
+		);
+	};
+
+	/**
+	 * Swap the canvas the story network renders in.
+	 *
+	 * Reads back from `project.flowMode` rather than local state, so the control always
+	 * shows what the server actually stored: a rejected PATCH leaves the old view
+	 * selected and says so, instead of the toggle appearing to have worked.
+	 */
+	const handleFlowModeChange = (next: string) => {
+		if (next !== "classic" && next !== "ruler") return;
+		if (next === flowMode) return;
+		updateProject.mutate(
+			{ id: projectId, data: { flowMode: next } },
+			{
+				onError: (err) =>
+					notifications.show({
+						color: "red",
+						title: tp("flowModeSwitchFailed"),
+						message: err instanceof Error ? err.message : String(err),
+					}),
 			},
 		);
 	};
@@ -162,6 +191,24 @@ function ProjectDetailPage() {
 					<Badge color={statusRegistry.projectStatus(project.status).color} size="sm">
 						{tc(statusRegistry.projectStatus(project.status).i18nKey)}
 					</Badge>
+					{/* Which canvas renders the story network.
+					    Sits with the title rather than among the action buttons because it
+					    changes the view, not the project's contents. It exists at all because
+					    `flowMode` used to be write-once at creation: a project created as
+					    `ruler` had no path back, which became untenable once Ruler was
+					    deprecated. Switching only rewrites this one preference — chapters,
+					    branches and worktrees are untouched, so it is freely reversible. */}
+					<SegmentedControl
+						size="xs"
+						value={flowMode}
+						onChange={handleFlowModeChange}
+						disabled={updateProject.isPending}
+						data={[
+							{ value: "classic", label: tp("flowModeClassic") },
+							{ value: "ruler", label: tp("flowModeRulerDeprecated") },
+						]}
+						aria-label={tp("flowModeSwitcherLabel")}
+					/>
 				</Group>
 				<Group gap="xs">
 					<Button variant="light" color="red" size="xs" onClick={openDelete}>
@@ -209,8 +256,12 @@ function ProjectDetailPage() {
 			{/* Graph canvas */}
 			<Box style={{ flex: 1, minHeight: 0 }}>
 				<Suspense fallback={<Loader />}>
-					{project?.flowMode === "ruler" ? (
-						<RulerFlow projectId={projectId} focusChapterId={focus} />
+					{flowMode === "ruler" ? (
+						<RulerFlow
+							projectId={projectId}
+							focusChapterId={focus}
+							onLeaveDeprecated={() => handleFlowModeChange("classic")}
+						/>
 					) : (
 						<NarraFlow projectId={projectId} focusChapterId={focus} />
 					)}

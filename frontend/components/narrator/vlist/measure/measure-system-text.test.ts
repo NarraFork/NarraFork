@@ -174,7 +174,7 @@ describe("measureSystemTextCard — height is independent of LOD", () => {
 			"spec_context_cleared",
 		] as const;
 		for (const kind of kinds) {
-			const heights = ([1, 2, 3, 4, 5, 6] as const).map(
+			const heights = ([1, 2, 3, 4, 5] as const).map(
 				(lod) =>
 					measureSystemTextCard(kind, { text: "some body text", title: "t" }, 500, lod).height,
 			);

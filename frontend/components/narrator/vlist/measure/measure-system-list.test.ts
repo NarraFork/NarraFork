@@ -112,7 +112,7 @@ describe("measureKnowledgeHint — height is independent of text content (trunca
 	});
 
 	it("height does NOT change across LOD levels", () => {
-		const heights = ([1, 2, 3, 4, 5, 6] as const).map(
+		const heights = ([1, 2, 3, 4, 5] as const).map(
 			(lod) => measureKnowledgeHint(D(3), 800, lod).height,
 		);
 		expect(new Set(heights).size).toBe(1);

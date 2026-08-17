@@ -180,8 +180,11 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 					panelInstanceId: params.panelInstanceId,
 				},
 				surface: {
+					// `graph` (a chapter node's embedded dock) reports as `narrator-focus`:
+					// both host exactly one narrator, and a new wire value would break
+					// already-published plugins. Mirrors PluginUiRuntimeProvider.
 					kind:
-						sessionContext.surface === "focus"
+						sessionContext.surface === "focus" || sessionContext.surface === "graph"
 							? ("narrator-focus" as const)
 							: sessionContext.surface === "settings"
 								? ("settings" as const)

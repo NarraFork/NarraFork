@@ -1,11 +1,12 @@
 import type { Statement } from "bun:sqlite";
-import { sqlite } from "../db";
+import { db, sqlite } from "../db";
 import { ValidationError } from "../lib/errors";
+import { knowledgeService } from "./knowledge-service";
 import { narratorReadableSqlFragment } from "./narrator-acl";
 import { projectReadableSqlFragment } from "./project-acl";
 
 interface SearchResult {
-	type: "chapter" | "message" | "narrator";
+	type: "chapter" | "message" | "narrator" | "knowledge";
 	id: string;
 	title?: string;
 	snippet: string;
@@ -18,6 +19,10 @@ interface SearchResult {
 	role?: string;
 	model?: string;
 	messageRole?: string;
+	/** Knowledge hits: the collection the entry lives in. */
+	collectionId?: string;
+	collectionName?: string;
+	tags?: string[];
 	createdAt?: string;
 	updatedAt?: string;
 	lastMessageAt?: string | null;
@@ -455,6 +460,37 @@ function scoreFromRank(rank: unknown, fallback: number): number {
 	return Math.max(0, Math.round(1000 - numeric * 1000));
 }
 
+/**
+ * Collection display names for knowledge hits, batch-loaded by id.
+ *
+ * One query for the whole result page rather than per row: a knowledge search can
+ * return up to the hard cap, and the collection name is only used as a badge.
+ */
+async function collectionNameMap(collectionIds: string[]): Promise<Map<string, string>> {
+	const ids = [...new Set(collectionIds.filter(Boolean))];
+	if (ids.length === 0) return new Map();
+	const rows = await db.query.knowledgeCollections.findMany({
+		where: (c, { inArray }) => inArray(c.id, ids),
+		columns: { id: true, name: true },
+	});
+	return new Map(rows.map((r) => [r.id, r.name]));
+}
+
+/**
+ * The one ordering used by every search response: score first, then recency.
+ *
+ * Exported because knowledge hits are resolved on a separate (async) path and
+ * merged in by the route — a second local sort there would drift from this one.
+ */
+export function sortSearchResults(results: SearchResult[]): SearchResult[] {
+	return results.sort((a, b) => {
+		if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
+		const bTime = Date.parse(b.updatedAt ?? b.createdAt ?? b.lastMessageAt ?? "") || 0;
+		const aTime = Date.parse(a.updatedAt ?? a.createdAt ?? a.lastMessageAt ?? "") || 0;
+		return bTime - aTime;
+	});
+}
+
 export const searchService = {
 	search(options: SearchOptions): SearchResult[] {
 		const { query, entities, limit = 50, principal } = options;
@@ -559,12 +595,66 @@ export const searchService = {
 			}
 		}
 
-		return results.sort((a, b) => {
-			if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
-			const bTime = Date.parse(b.updatedAt ?? b.createdAt ?? b.lastMessageAt ?? "") || 0;
-			const aTime = Date.parse(a.updatedAt ?? a.createdAt ?? a.lastMessageAt ?? "") || 0;
-			return bTime - aTime;
+		return sortSearchResults(results);
+	},
+
+	/**
+	 * Knowledge-base entries as global-search results.
+	 *
+	 * Async and therefore separate from `search()`: knowledge visibility is a
+	 * dual-axis (clearance + controlled tag) check that reads grants, so it cannot
+	 * be expressed as a SQL fragment the way the narrator/project gates are. The
+	 * matched rows are post-filtered by `knowledgeService.filterReadable`, which
+	 * fails closed — the same gate the knowledge routes use.
+	 *
+	 * Results carry `updatedAt`, so the "newest" sort in the UI orders them
+	 * alongside the other entity types without special-casing.
+	 */
+	async searchKnowledge(options: {
+		query: string;
+		limit?: number;
+		principal: { userId: string; isAdmin: boolean };
+	}): Promise<SearchResult[]> {
+		const { query, limit = 50, principal } = options;
+		const safeQuery = sanitizeQuery(query);
+		if (!safeQuery) return [];
+
+		// The caller's own personal versions shadow the committed one, mirroring what
+		// they see in the knowledge UI: a hit on text they only have locally must not
+		// be reported against the main body it replaced.
+		const rows = knowledgeService.search({
+			q: safeQuery,
+			limit,
+			draftUserId: principal.userId || undefined,
 		});
+		if (rows.length === 0) return [];
+
+		const readable = await knowledgeService.filterReadable(
+			principal.userId
+				? { userId: principal.userId, role: principal.isAdmin ? "admin" : "user" }
+				: undefined,
+			rows,
+		);
+		if (readable.length === 0) return [];
+
+		const collectionNames = await collectionNameMap(readable.map((r) => r.collectionId));
+		const safeQueryLower = safeQuery.toLowerCase();
+		return readable.map((row) => ({
+			type: "knowledge" as const,
+			id: row.id,
+			title: row.title,
+			collectionId: row.collectionId,
+			collectionName: collectionNames.get(row.collectionId),
+			tags: row.tags,
+			status: row.status,
+			createdAt: row.createdAt,
+			updatedAt: row.updatedAt,
+			matchField: row.title?.toLowerCase().includes(safeQueryLower) ? "title" : "content",
+			// Knowledge search returns rank-ordered rows without exposing the raw rank,
+			// so score by position within a band that keeps titles above body matches.
+			matchScore: safeQuery.length >= 3 ? 780 : 540,
+			snippet: row.snippet || row.title || "",
+		}));
 	},
 
 	/**

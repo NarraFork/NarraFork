@@ -9,6 +9,7 @@
 import type { PluginDockPanelParams } from "../../plugins/protocol";
 import {
 	type FilePanelParams,
+	type KnowledgePanelParams,
 	type NarratorBoundPanelParams,
 	PANEL_COMPONENT,
 	PANEL_DEFAULT_TITLE,
@@ -29,6 +30,7 @@ export type NarratorDockPanelParams =
 	| NarratorBoundPanelParams
 	| SubagentPanelParams
 	| FilePanelParams
+	| KnowledgePanelParams
 	| PluginDockPanelParams;
 
 /** Dockview component registry name for each panel type (kept === the type). */
@@ -45,12 +47,15 @@ export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
 	userchat: PANEL_COMPONENT.userchat,
 	subagent: PANEL_COMPONENT.subagent,
 	file: PANEL_COMPONENT.file,
+	knowledge: PANEL_COMPONENT.knowledge,
 	plugin: PANEL_COMPONENT.plugin,
 	mock: PANEL_COMPONENT.mock,
 };
 
 /** Stable dockview panel id for a singleton panel type within one narrator surface. */
-export function dockPanelId(type: Exclude<NarratorDockPanelType, "subagent" | "file">): string {
+export function dockPanelId(
+	type: Exclude<NarratorDockPanelType, "subagent" | "file" | "knowledge">,
+): string {
 	return sharedDockPanelId(type);
 }
 
@@ -86,6 +91,15 @@ export function fileDockPanelId(filePath: string): string {
 	return `ndock-file-${hashFilePath(filePath)}`;
 }
 
+/**
+ * Stable multi-instance panel id for one knowledge entry viewer/editor. The
+ * entryId is a nanoid (safe characters, bounded length), so it is embedded
+ * directly without hashing.
+ */
+export function knowledgeDockPanelId(entryId: string): string {
+	return `ndock-knowledge-${entryId}`;
+}
+
 /** Human-facing default title per panel type (i18n applied at render time). */
 export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> = {
 	chat: PANEL_DEFAULT_TITLE.chat,
@@ -100,6 +114,7 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 	userchat: PANEL_DEFAULT_TITLE.userchat,
 	subagent: PANEL_DEFAULT_TITLE.subagent,
 	file: PANEL_DEFAULT_TITLE.file,
+	knowledge: PANEL_DEFAULT_TITLE.knowledge,
 	plugin: PANEL_DEFAULT_TITLE.plugin,
 	mock: PANEL_DEFAULT_TITLE.mock,
 };

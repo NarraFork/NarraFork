@@ -113,8 +113,17 @@ describe("Anthropic effort capability detection", () => {
 		]) {
 			expect(supportsThinking(model)).toBe(true);
 		}
-		// DeepSeek keeps its own support via the Anthropic-compatible relay.
-		expect(supportsThinking("deepseek-v4-pro")).toBe(true);
+		// Every credential-free relay model keeps support via the
+		// Anthropic-compatible gateway path — no longer a DeepSeek exemption.
+		for (const model of [
+			"deepseek-v4-pro",
+			"GLM-5.1",
+			"kimi-k2.6",
+			"Qwen3.6-Plus",
+			"mimo-v2.5-pro",
+		]) {
+			expect(supportsThinking(model)).toBe(true);
+		}
 		// Pre-4 Claude is out: 3.7's budgeted-thinking special case went away with the
 		// rest of the <=4.6 compatibility surface, so 3.7 and 3.5 are both false now.
 		expect(supportsThinking("claude-3-7-sonnet-20250219")).toBe(false);

@@ -4,7 +4,22 @@ import { generateShortId } from "@server/lib/id";
 import type { InvocationScope } from "./plugin-capability-broker";
 
 export type PluginUiSurfaceScope = "workspace" | "narrator" | "project" | "global";
-export type PluginUiSurface = "workspace" | "director" | "focus" | "settings" | "provider-settings";
+/**
+ * Host surfaces a plugin UI session may be opened on.
+ *
+ * `graph` is a chapter node's embedded dock on the story-network canvas. Like
+ * `focus` it hosts exactly one narrator, so the two form a "focus family": a
+ * contribution that declares only `focus` is still accepted on `graph` (see
+ * `isSurfaceAllowedForView` in `routes/plugin-ui.ts`). Reported separately so a
+ * plugin can opt into declaring node support explicitly.
+ */
+export type PluginUiSurface =
+	| "workspace"
+	| "director"
+	| "focus"
+	| "graph"
+	| "settings"
+	| "provider-settings";
 
 export interface PluginUiSessionBinding {
 	pluginId: string;
@@ -136,7 +151,9 @@ export class PluginUiSessionService {
 			}
 		}
 		if (
-			!["workspace", "director", "focus", "settings", "provider-settings"].includes(binding.surface)
+			!["workspace", "director", "focus", "graph", "settings", "provider-settings"].includes(
+				binding.surface,
+			)
 		) {
 			throw new ValidationError("Invalid surface");
 		}

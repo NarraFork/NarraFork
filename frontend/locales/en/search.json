@@ -13,6 +13,7 @@
 	"typeChapter": "Chapters {{count}}",
 	"typeNarrator": "Narrators {{count}}",
 	"typeMessage": "Messages {{count}}",
+	"typeKnowledge": "Knowledge {{count}}",
 	"sortRelevance": "Relevance",
 	"sortTime": "Newest",
 	"sortType": "Type",
@@ -21,6 +22,7 @@
 	"label_chapter": "Chapter",
 	"label_narrator": "Narrator",
 	"label_message": "Message",
+	"label_knowledge": "Knowledge",
 	"score": "Score {{score}}",
 	"matchField": "Matched {{field}}",
 	"status_chapter_active": "Active",
@@ -32,6 +34,8 @@
 	"status_narrator_working": "Working",
 	"status_narrator_waiting": "Waiting",
 	"status_narrator_archived": "Archived",
+	"status_knowledge_active": "Active",
+	"status_knowledge_archived": "Archived",
 	"messageRole_user": "User",
 	"messageRole_assistant": "Assistant",
 	"messageRole_system": "System",
@@ -39,5 +43,6 @@
 	"messageRole_disp": "Display",
 	"matchField_title": "title",
 	"matchField_description": "description",
-	"matchField_message": "message"
+	"matchField_message": "message",
+	"matchField_content": "content"
 }

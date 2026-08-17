@@ -7,6 +7,8 @@
  */
 
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
+import { CHAT_ATTACHMENT_TOTAL_BYTES_MAX } from "../lib/chat-attachments";
 import { ValidationError } from "../lib/errors";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import {
@@ -14,15 +16,20 @@ import {
 	chatMessagesQuerySchema,
 	createDmRoomSchema,
 	markChatReadSchema,
+	materializeChatAttachmentsSchema,
 	postChatMessageSchema,
 	summarizeChatSchema,
 } from "../lib/validators";
 import {
+	createChatAttachment,
+	discardChatAttachment,
 	getUnreadSummary,
 	listDirectory,
 	listDmRooms,
 	listMessages,
+	loadChatAttachmentForRead,
 	markRead,
+	materializeAttachmentsForNarrator,
 	postMessage,
 	resolveDmRoom,
 	resolveNarratorRoom,
@@ -92,10 +99,120 @@ chatRoutes.post("/rooms/:roomId/messages", async (c) => {
 	const message = await postMessage({
 		roomId: c.req.param("roomId"),
 		senderUserId: userId,
-		text: parsed.data.text,
+		text: parsed.data.text ?? "",
 		replyToMessageId: parsed.data.replyToMessageId ?? null,
+		attachmentIds: parsed.data.attachmentIds,
 	});
 	return c.json(message, 201);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Attachments
+//
+// Two-phase by necessity: the composer shows a thumbnail before the message
+// exists, so the upload has to persist first and the send claims it. See the
+// `chat_attachments` schema note.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Upload one attachment as a draft for a room.
+ *
+ * `bodyLimit` is a STREAM-level defence that rejects an oversized request before the
+ * whole body is buffered; the per-kind rules (image magic bytes, the text-file
+ * allowlist, the size ceilings) run afterwards in `saveChatAttachment`. Both are
+ * needed: the limit alone would accept a 1 KiB disguised executable, and the
+ * business validation alone would first have to hold the entire payload in memory.
+ */
+chatRoutes.post(
+	"/rooms/:roomId/attachments",
+	bodyLimit({
+		maxSize: CHAT_ATTACHMENT_TOTAL_BYTES_MAX,
+		onError: (c) =>
+			c.json(
+				{
+					error: `Attachment exceeds the ${(CHAT_ATTACHMENT_TOTAL_BYTES_MAX / 1024 / 1024).toFixed(
+						0,
+					)} MiB limit`,
+					code: "CHAT_ATTACHMENT_TOO_LARGE",
+				},
+				413,
+			),
+	}),
+	async (c) => {
+		const formData = await c.req.formData();
+		const file = formData.get("file");
+		if (!(file instanceof File)) throw new ValidationError("A file is required");
+		const userId = c.get("user").sub;
+		const attachment = await createChatAttachment(c.req.param("roomId"), userId, file);
+		return c.json(attachment, 201);
+	},
+);
+
+/**
+ * Serve one attachment's bytes.
+ *
+ * Access follows the ROOM, resolved inside `loadChatAttachmentForRead` — not the
+ * public-ish `/api/uploads/:narratorId/:imageId` path, which any authenticated user
+ * can hit with the right ids. `Cache-Control: private` because the response is
+ * behind an ACL: `public` would let a shared proxy hand it to someone the room
+ * check would have refused. `immutable` is safe because an attachment id names one
+ * unchanging file.
+ *
+ * `Content-Disposition: attachment` for non-images: a stored file is only ever
+ * downloaded, never rendered, so this stops a `.svg`/`.html` upload from executing
+ * in the app's origin.
+ */
+chatRoutes.get("/attachments/:attachmentId", async (c) => {
+	const userId = c.get("user").sub;
+	const target = await loadChatAttachmentForRead(c.req.param("attachmentId"), userId);
+	// Streamed by Bun rather than read into memory; the size cap was enforced at
+	// upload time, so nothing here buffers the payload.
+	const headers: Record<string, string> = {
+		"Content-Type": target.kind === "image" ? target.mediaType : "application/octet-stream",
+		"Cache-Control": "private, max-age=31536000, immutable",
+		"X-Content-Type-Options": "nosniff",
+	};
+	if (target.kind !== "image") {
+		// RFC 5987 encoding so a non-ASCII filename survives the header.
+		headers["Content-Disposition"] =
+			`attachment; filename*=UTF-8''${encodeURIComponent(target.filename)}`;
+	}
+	return new Response(Bun.file(target.filePath), { headers });
+});
+
+/** Discard a still-unclaimed draft attachment (composer removed a pending chip). */
+chatRoutes.delete("/attachments/:attachmentId", async (c) => {
+	const userId = c.get("user").sub;
+	await discardChatAttachment(c.req.param("attachmentId"), userId);
+	return c.json({ ok: true });
+});
+
+/**
+ * Copy selected attachments into a narrator's worktree, ahead of a forward.
+ *
+ * Returns the `<attached_files>` hint the client appends to the forwarded text, so
+ * the wording a model sees is identical to a natively attached file's (both come
+ * from `buildAttachedFilesHint`). Requires WRITE access to the narrator — this
+ * writes files into its working directory.
+ */
+chatRoutes.post("/rooms/:roomId/materialize-attachments", async (c) => {
+	const parsed = materializeChatAttachmentsSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const userId = c.get("user").sub;
+	const result = await materializeAttachmentsForNarrator({
+		roomId: c.req.param("roomId"),
+		userId,
+		narratorId: parsed.data.narratorId,
+		attachmentIds: parsed.data.attachmentIds,
+	});
+	return c.json({
+		hint: result.hint,
+		files: result.files.map((file) => ({
+			filename: file.filename,
+			filePath: file.filePath,
+			size: file.size,
+		})),
+	});
 });
 
 chatRoutes.post("/rooms/:roomId/read", async (c) => {

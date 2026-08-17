@@ -35,7 +35,7 @@ import {
  */
 const L: SideCarLabels = {
 	noticeSilentProgress: "You have made {count} tool calls without a visible reply",
-	noticeRelaxedPlan: "Still in plan mode",
+	noticeRelaxedPlan: "Still in plan mode — write to {planFile}",
 	noticePipelineExit: "Pipeline is still active",
 	tasksCurrent: "Dynamic Spec — {n} open task(s)",
 	tasksEmptyNever: "Dynamic Spec — no tasks created yet",
@@ -73,6 +73,16 @@ describe("sideCarBodyToMarkdown — the 7 body kinds", () => {
 
 	it("notice: an unmapped source yields nothing (caller falls back to content)", () => {
 		expect(md("some_future_source", { kind: "notice" })).toBe("");
+	});
+
+	it("notice: relaxed_plan names the plan file, and a legacy row still reads sensibly", () => {
+		expect(
+			md("relaxed_plan", { kind: "notice", params: { planFile: ".narrafork/plans/plan-a.md" } }),
+		).toBe("###### Still in plan mode — write to .narrafork/plans/plan-a.md");
+		// Rows written before the param existed must not paint a literal placeholder.
+		expect(md("relaxed_plan", { kind: "notice" })).toBe(
+			"###### Still in plan mode — write to .narrafork/plans/",
+		);
 	});
 
 	it("prose: the behaviour fence gets its stable heading plus the text", () => {
@@ -292,9 +302,10 @@ describe("sideCarBodyToMarkdown — drops model-facing boilerplate", () => {
 			tasks: [{ role: "doing", text: "the actual task" }],
 		});
 		expect(out).toContain("the actual task");
-		// These phrases live in the MODEL projection (renderSideCarBodyToText) and must
-		// never reach the reader.
-		expect(out).not.toContain("do not add IDs");
+		// The one instruction line the MODEL projection still emits
+		// (`tasksCurrentUpdateNote`) must not reach the reader either. The heavier rules
+		// it used to sit beside now live only in the system prompt.
+		expect(out).not.toContain("Update spec://tasks.json");
 		expect(out).not.toContain("text/status/protected");
 		expect(out).not.toContain("tasksBlockedActionNote");
 	});

@@ -11,7 +11,8 @@ export interface LayerEnforcedFlags {
 
 export interface LayerDeviceInjection {
 	version: 1;
-	defaultMode: "none" | "private" | "all";
+	/** "global" (the default) injects only admin-registered global devices. */
+	defaultMode: "none" | "private" | "global" | "all";
 	/** Per-device tri-state overrides, keyed by device id. */
 	devices: Record<string, "on" | "off">;
 }

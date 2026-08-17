@@ -220,3 +220,29 @@ export const TRACE_SHIMMER_CLASS: Readonly<Record<ToolShimmerKind, string>> = {
 	success: "nf-trace-shimmer--done",
 	failed: "nf-trace-shimmer--fail",
 };
+
+/**
+ * Duration of the folded row's closing sweep, in ms — the SAME number
+ * `trace-shimmer.css` declares for `.nf-trace-shimmer--done` / `--fail`.
+ *
+ * It lives here for the reason the class names do: both row paths mount the class,
+ * neither can import the other, and the CSS is a third place. Pinned against the
+ * stylesheet in `RenderToolRun.shimmer.test.tsx`.
+ *
+ * Deliberately slower than the card's 600ms overlay sweep. A card's sweep is a
+ * translated overlay the eye catches anywhere on a large face; a row's is a
+ * highlight travelling one 18.8px line of dimmed text, and at 600ms it registered
+ * as a flicker rather than a report.
+ */
+export const TRACE_SHIMMER_FLASH_MS = 900;
+
+/**
+ * How long a row keeps its closing-sweep class, in ms.
+ *
+ * ⚠️ Must exceed `TRACE_SHIMMER_FLASH_MS`. Dropping the class while the animation
+ * is still running cuts the highlight off wherever it happens to be — the green
+ * appears to die mid-row instead of leaving it, which is one of the two ways this
+ * sweep has already looked broken (the other was two-pass keyframes; see the
+ * stylesheet).
+ */
+export const TRACE_SHIMMER_FLASH_HOLD_MS = TRACE_SHIMMER_FLASH_MS + 60;

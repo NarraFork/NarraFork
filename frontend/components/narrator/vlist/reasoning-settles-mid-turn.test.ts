@@ -75,20 +75,17 @@ describe("live reasoning settles once the model produces later content", () => {
 		expect(steps.every((step) => !step.shimmer)).toBe(true);
 	});
 
-	it("rejoins the low-LOD titles-only fold once settled", () => {
-		// `titlesOnly` is suppressed for live reasoning (full live feedback) and applies
-		// to history. A finished run inside the un-persisted row belongs to history, so
-		// at L3/L4 it must fold like any other — this is the layout half of the bug.
+	it("keeps the SAME step-trace shape live and settled (only the shimmer stops)", () => {
+		// The trace no longer has a level-dependent mode (`titlesOnly` is gone), so the
+		// live→settled transition must not change the element or its opts at all — that
+		// identity is what keeps the rows from being rebuilt when a run finishes.
 		const live = adaptSegment(liveSegment([REASONING], 0), { lod: 3 });
 		const settled = adaptSegment(liveSegment([REASONING, TOOL], -1), { lod: 3 });
-		const liveOpts = live.find((s) => s.kind === "reasoning-steps")?.opts as {
-			titlesOnly: boolean;
-		};
-		const settledOpts = settled.find((s) => s.kind === "reasoning-steps")?.opts as {
-			titlesOnly: boolean;
-		};
-		expect(liveOpts.titlesOnly).toBe(false);
-		expect(settledOpts.titlesOnly).toBe(true);
+		const liveSpec = live.find((s) => s.kind === "reasoning-steps");
+		const settledSpec = settled.find((s) => s.kind === "reasoning-steps");
+		expect(liveSpec?.key).toBe(settledSpec?.key);
+		expect(liveSpec?.opts).toEqual(settledSpec?.opts);
+		expect(liveSpec?.opts).not.toHaveProperty("titlesOnly");
 	});
 
 	it("settles only the FINISHED run of an interleaved turn", () => {

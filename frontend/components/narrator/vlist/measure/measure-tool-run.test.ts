@@ -153,27 +153,7 @@ describe("measureCollapsibleTrace — collapseItems (folded to header only)", ()
 	});
 });
 
-describe("measureToolRunSummary (L3) — titles-only trace, maxVisible=10", () => {
-	it("all bodies null → header + min(N,10) rows, no expandable rows", async () => {
-		const { measureToolRunSummary, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
-		const r = measureToolRunSummary(toolRows(6), 600);
-		expect(r.variant).toBe("tool-run-summary");
-		expect(r.maxVisible).toBe(10);
-		expect(r.rows.every((row) => !row.expandable)).toBe(true);
-		expect(r.height).toBeCloseTo(TRACE_HEADER_BAND_HEIGHT + 6 * TRACE_ROW_HEIGHT, 5);
-	});
-
-	it("caps visible rows at 10 and adds a toggle when N>10", async () => {
-		const { measureToolRunSummary } = await import("./measure-tool-run");
-		const r = measureToolRunSummary(toolRows(12), 600);
-		expect(r.rows).toHaveLength(10);
-		expect(r.toggle?.hiddenCount).toBe(2);
-	});
-});
-
-describe("measureToolRunCountLine (L2) — single fixed row", () => {
+describe("measureToolRunCountLine (L1/L2) — single fixed row", () => {
 	it("is a single ≈20.8px row regardless of count", async () => {
 		const { measureToolRunCountLine, TRACE_COUNT_LINE_HEIGHT } = await import("./measure-tool-run");
 		const a = measureToolRunCountLine(3, 600);
@@ -238,11 +218,18 @@ describe("measureActivityTrace (L1/L2)", () => {
 });
 
 describe("measureReasoningStepsTrace — expandable markdown bodies", () => {
-	it("titlesOnly → all rows collapsed (no bodies), height = header + N rows", async () => {
+	it("a step with no body is a plain, non-expandable title row", async () => {
 		const { measureReasoningStepsTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
 			"./measure-tool-run"
 		);
-		const r = measureReasoningStepsTrace(stepRows(3), 600, { titlesOnly: true });
+		const r = measureReasoningStepsTrace(
+			[
+				{ title: "Step 0", key: "s0" },
+				{ title: "Step 1", body: "", key: "s1" },
+				{ title: "Step 2", body: null, key: "s2" },
+			],
+			600,
+		);
 		expect(r.variant).toBe("reasoning-steps");
 		expect(r.maxVisible).toBe(5);
 		expect(r.rows.every((row) => !row.expandable)).toBe(true);
@@ -304,14 +291,20 @@ describe("measureReasoningStepsTrace — expandable markdown bodies", () => {
 		expect(narrow.height).toBeGreaterThan(wide.height);
 	});
 
-	it("titlesOnly wins over expandedIndices (no body rendered)", async () => {
+	it("an expandedIndex on a body-less step still adds no height", async () => {
+		// There is no level that suppresses bodies any more (the old `titlesOnly`), so
+		// the only thing that can keep a row flat is having nothing to reveal.
 		const { measureReasoningStepsTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
 			"./measure-tool-run"
 		);
-		const r = measureReasoningStepsTrace(stepRows(2), 600, {
-			titlesOnly: true,
-			expandedIndices: [0, 1],
-		});
+		const r = measureReasoningStepsTrace(
+			[
+				{ title: "Step 0", key: "s0" },
+				{ title: "Step 1", body: "   ", key: "s1" },
+			],
+			600,
+			{ expandedIndices: [0, 1] },
+		);
 		expect(r.rows.every((row) => !row.expanded)).toBe(true);
 		expect(r.height).toBeCloseTo(TRACE_HEADER_BAND_HEIGHT + 2 * TRACE_ROW_HEIGHT, 5);
 	});
@@ -733,16 +726,33 @@ describe("trace row drill-down", () => {
 		expect(opened[0]?.itemIndex).toBe(11);
 	});
 
-	it("measureActivityTrace / measureToolRunSummary forward the drill-down", async () => {
-		const { measureActivityTrace, measureToolRunSummary, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+	it("measureActivityTrace forwards the drill-down", async () => {
+		const { measureActivityTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
 		const rows = [{ title: "Read · a.ts", canDrillDown: true, card: drillCard(), key: "t-0" }];
 		const activity = measureActivityTrace(rows, 600, { expandedIndices: [0] }, {}, 2);
-		const summary = measureToolRunSummary(rows, 600, { expandedIndices: [0] }, {}, 3);
-		for (const measured of [activity, summary]) {
-			expect(measured.rows[0]?.cardMeasured).not.toBeNull();
-			expect(measured.rows[0]?.blockHeight).toBeGreaterThan(TRACE_ROW_HEIGHT);
-		}
+		expect(activity.rows[0]?.cardMeasured).not.toBeNull();
+		expect(activity.rows[0]?.blockHeight).toBeGreaterThan(TRACE_ROW_HEIGHT);
+	});
+
+	it("an activity reasoning row expands its markdown body (not a card)", async () => {
+		// The L1/L2 fold's reasoning rows carry `bodyText`; tool rows carry `card`.
+		// Both make a row expandable, through channels that must stay distinct.
+		const { measureActivityTrace, TRACE_BODY_PADDING_Y, traceBodyInnerWidth, TRACE_ROW_HEIGHT } =
+			await import("./measure-tool-run");
+		const { measureMarkdown } = await import("./measure-markdown");
+		const body = "Considered the cache key, then the width settle loop.";
+		const rows = [{ title: "Check the cache", bodyText: body, key: "r-run0-0" }];
+		const collapsed = measureActivityTrace(rows, 600, {}, {}, 2);
+		const expanded = measureActivityTrace(rows, 600, { expandedIndices: [0] }, {}, 2);
+		const md = measureMarkdown(body, traceBodyInnerWidth(600));
+		expect(collapsed.rows[0]?.expandable).toBe(true);
+		expect(collapsed.rows[0]?.expanded).toBe(false);
+		expect(collapsed.rows[0]?.blockHeight).toBeCloseTo(TRACE_ROW_HEIGHT, 5);
+		expect(expanded.rows[0]?.cardMeasured).toBeNull();
+		expect(expanded.rows[0]?.body).not.toBeNull();
+		expect(expanded.height).toBeCloseTo(
+			collapsed.height + TRACE_BODY_PADDING_Y * 2 + md.frame.contentHeight,
+			5,
+		);
 	});
 });

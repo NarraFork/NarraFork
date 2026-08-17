@@ -49,7 +49,7 @@ function measureTasksCard(tasks: SpecTaskLine[]) {
 			detail: { kind: "spec-tasks", tasks },
 		},
 		CONTENT_WIDTH,
-		6,
+		5,
 	);
 }
 
@@ -138,6 +138,55 @@ describe("spec-tasks rows — icon lane vs text lane", () => {
 		const locked = measureTasksCard([{ text, status: "todo", protected: true }]);
 		// Same text, less room → never shorter than the unprotected row.
 		expect(locked.detail?.height).toBeGreaterThanOrEqual(plain.detail?.height ?? 0);
+	});
+});
+
+/**
+ * A task board is a SNAPSHOT: each `spec://tasks.json` write keeps whatever was in
+ * progress when it was written, so animating on the recorded `doing` status alone set
+ * every historical card spinning. Only the newest board of a running narrator is live
+ * (`specTasksLive`), matching the chunked card's `isThinking && isLatestTasksCard`.
+ */
+describe("spec-tasks rows — the spinner is gated on `specTasksLive`", () => {
+	/** Tabler writes its icon name onto the svg class list (`tabler-icon-<name>`). */
+	function iconNames(root: Element): string[] {
+		return Array.from(root.querySelectorAll("svg")).flatMap((svg) =>
+			(svg.getAttribute("class") ?? "")
+				.split(/\s+/)
+				.filter((cls) => cls.startsWith("tabler-icon-") && cls !== "tabler-icon"),
+		);
+	}
+
+	function renderBoard(live: boolean): Element {
+		const measured = measureTasksCard([
+			{ text: "in progress", status: "doing" },
+			{ text: "queued", status: "todo" },
+		]);
+		return render(<RenderToolCall measured={measured} specTasksLive={live} />);
+	}
+
+	it("does not animate a historical board", () => {
+		const root = renderBoard(false);
+		expect(root.querySelectorAll(".vlist-spin")).toHaveLength(0);
+		expect(iconNames(root)).toContain("tabler-icon-player-play");
+	});
+
+	it("animates the live board's in-progress row, as a loader", () => {
+		const root = renderBoard(true);
+		expect(root.querySelectorAll(".vlist-spin")).toHaveLength(1);
+		const names = iconNames(root);
+		expect(names).toContain("tabler-icon-loader-2");
+		expect(names).not.toContain("tabler-icon-player-play");
+	});
+
+	it("leaves non-`doing` rows still on the live board", () => {
+		const measured = measureTasksCard([
+			{ text: "a", status: "todo" },
+			{ text: "b", status: "done" },
+			{ text: "c", status: "blocked" },
+		]);
+		const root = render(<RenderToolCall measured={measured} specTasksLive />);
+		expect(root.querySelectorAll(".vlist-spin")).toHaveLength(0);
 	});
 });
 

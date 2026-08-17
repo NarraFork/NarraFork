@@ -38,7 +38,6 @@ describe("render-registry dispatch", () => {
 			RenderMessageBubble,
 		);
 		// Several trace kinds share RenderToolRun / RenderTraceCountLine.
-		expect(elementType(renderElement("tool-run-summary", STUB))).toBe(RenderToolRun);
 		expect(elementType(renderElement("activity-trace", STUB))).toBe(RenderToolRun);
 		expect(elementType(renderElement("reasoning-steps", STUB))).toBe(RenderToolRun);
 		expect(elementType(renderElement("tool-run-count", STUB))).toBe(RenderTraceCountLine);

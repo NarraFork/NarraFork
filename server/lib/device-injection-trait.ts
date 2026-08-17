@@ -33,15 +33,22 @@ export const DEVICE_INJECTION_TRAIT_PREFIX = "custom-device-injection:";
  * - `none`: inject nothing; every device must be switched on deliberately.
  * - `private`: inject the acting user's own devices only — useful when communal
  *   machines would otherwise pollute every session.
- * - `all`: inject every authorized online device. This is the default because it
- *   is exactly the pre-trait behaviour: an existing deployment must not silently
- *   lose the devices its narrators were already using. Reducing context pollution
- *   is therefore opt-in, set once at the project or user layer.
+ * - `global`: inject only devices an administrator made global. The default.
+ * - `all`: inject every authorized online device, including project-scoped ones
+ *   another member registered. Means literally all; only meaningful as a
+ *   deliberate choice.
+ *
+ * `global` rather than `all` is the default because any authenticated user may
+ * register a device. Availability and injection are two different levels: being
+ * authorized to use a device does not mean it should announce itself in everyone's
+ * sessions. Auto-injecting every shared device would let one member place a
+ * machine they control into their colleagues' contexts, so "present by default"
+ * stays an administrative act (registering it global).
  */
-export const DEVICE_INJECTION_MODES = ["none", "private", "all"] as const;
+export const DEVICE_INJECTION_MODES = ["none", "private", "global", "all"] as const;
 export type DeviceInjectionMode = (typeof DEVICE_INJECTION_MODES)[number];
 
-export const DEFAULT_DEVICE_INJECTION_MODE: DeviceInjectionMode = "all";
+export const DEFAULT_DEVICE_INJECTION_MODE: DeviceInjectionMode = "global";
 
 export interface DeviceInjectionTrait {
 	version: 1;
@@ -150,6 +157,12 @@ export interface InjectionCandidate {
 	online: boolean;
 	/** True when this device belongs to the acting user (owner axis "private"). */
 	ownedByActingUser?: boolean;
+	/**
+	 * Project axis. Only `"global"` devices are injected by default under mode
+	 * `all`, and registering one is admin-only — so "appears in every session
+	 * without being asked for" stays an administrative decision.
+	 */
+	scope?: "global" | "project";
 }
 
 /**
@@ -159,6 +172,16 @@ export interface InjectionCandidate {
  * never widens, so it cannot become an escalation path. Offline devices are
  * excluded because naming a device the agent cannot reach only invites failed
  * tool calls.
+ *
+ * Availability and injection are deliberately two different levels:
+ *
+ * - Not authorized → never injected (enforced by the caller's authorized set).
+ * - Authorized → still not injected *by default* unless an administrator made the
+ *   device global. Any user may register a device, so auto-injecting every shared
+ *   device would let one member push a machine they control into everyone else's
+ *   sessions. A project-scoped device is opted in per narrator/project instead.
+ *
+ * An explicit per-device override always wins in both directions.
  */
 export function resolveInjectedDevices<T extends InjectionCandidate>(
 	authorized: readonly T[],
@@ -174,8 +197,13 @@ export function resolveInjectedDevices<T extends InjectionCandidate>(
 				return true;
 			case "none":
 				return false;
-			default:
+			case "private":
 				return device.ownedByActingUser === true;
+			default:
+				// "global": an administrator marked this device as reachable from every
+				// project. A device with no scope (rows predating the project axis) is
+				// treated as project-scoped, so the safer branch is the fallback.
+				return device.scope === "global";
 		}
 	});
 }

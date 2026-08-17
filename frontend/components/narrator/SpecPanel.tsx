@@ -27,6 +27,7 @@ import { api } from "../../lib/api";
 import type { SpecTaskItem } from "../../lib/api/spec";
 import { MarkdownContent } from "./MarkdownContent";
 import { SpecTaskBoard } from "./SpecTaskBoard";
+import { registerSpecFileSelector } from "./spec-file-reveal";
 
 const SpecMarkdownEditor = lazy(() =>
 	import("./SpecMarkdownEditor").then((m) => ({ default: m.SpecMarkdownEditor })),
@@ -128,6 +129,18 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 			setSelectedUri(uri);
 		},
 		[selectedUri, dirty, confirm, t],
+	);
+
+	/**
+	 * Publish the selector so a chat row can reveal one file (see `spec-file-reveal`).
+	 *
+	 * Deliberately `handleSelectFile` and not a raw `setSelectedUri`: the unsaved-edits
+	 * confirmation lives in that handler, and bypassing it would let an external jump
+	 * silently discard whatever the reader was typing.
+	 */
+	useEffect(
+		() => registerSpecFileSelector(narratorId, (uri: string) => void handleSelectFile(uri)),
+		[narratorId, handleSelectFile],
 	);
 
 	const handleSave = useCallback(async () => {

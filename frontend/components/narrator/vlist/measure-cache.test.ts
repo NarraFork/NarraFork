@@ -470,6 +470,42 @@ describe("extractDataRevision", () => {
 			);
 		});
 	});
+
+	/**
+	 * The OTHER reveal channel: a reasoning-step row inside the L1/L2 activity fold
+	 * expands its markdown body (a tool row nests a card instead). Its height is that
+	 * body's, and the body arrives on the row payload rather than in `opts` — so a
+	 * body edit with the same open row must not serve the earlier geometry.
+	 */
+	describe("reasoning rows inside the activity fold", () => {
+		const traceWithBody = (bodyText?: string) => ({
+			headerCount: "1 reasoning · 0 tools",
+			items: [
+				{ key: "r-run0-0-step-0", title: "Check the cache", ...(bodyText ? { bodyText } : {}) },
+			],
+		});
+
+		it("a row that gained a body re-keys the fold", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			expect(extractDataRevision(traceWithBody("the key folds lod in"))).not.toBe(
+				extractDataRevision(traceWithBody()),
+			);
+		});
+
+		it("editing the body text re-keys the fold", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			expect(extractDataRevision(traceWithBody("one line"))).not.toBe(
+				extractDataRevision(traceWithBody("one line\n\nand a second paragraph")),
+			);
+		});
+
+		it("an unchanged body still HITS", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			expect(extractDataRevision(traceWithBody("one line"))).toBe(
+				extractDataRevision(traceWithBody("one line")),
+			);
+		});
+	});
 });
 
 describe("isStreamingKey", () => {

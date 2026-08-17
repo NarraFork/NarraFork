@@ -2,6 +2,7 @@
 // Wraps OpenAIProvider with dynamic credential selection
 // Supports both HTTP (default) and Responses WebSocket modes
 
+import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { isAgentTaskInvalidMessage } from "../codex-agent-identity";
 import { type CallContext, getCodexManager } from "../codex-manager";
 import { isUnauthorizedCodexUsageError } from "../codex-usage";
@@ -27,6 +28,7 @@ import {
 	type OAIMessage,
 	OpenAIProvider,
 	resolveCodexRequestReasoningEffort,
+	stampReasoningSource,
 } from "./openai-provider";
 import type {
 	ChatParams,
@@ -593,7 +595,11 @@ export class CodexProvider implements ProviderAdapter {
 						}),
 				})) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
-					yield { ...event, credentialId: ctx.id };
+					// The WebSocket path bypasses OpenAIProvider.chat(), so tag encrypted
+					// reasoning credentials with the "codex" identity here — without it,
+					// the strict replay check on the next turn cannot prove ownership
+					// and would drop the credential.
+					yield { ...stampReasoningSource(event, "codex"), credentialId: ctx.id };
 				}
 				this.manager.reportSuccess(ctx.id);
 				return;
@@ -784,7 +790,13 @@ export class CodexProvider implements ProviderAdapter {
 
 		const request: CodexResponsesRequestBody = {
 			model,
-			input: convertHistoryToResponsesApi(sanitizedInputMessages),
+			input: convertHistoryToResponsesApi(sanitizedInputMessages, {
+				// Codex runs official gpt/codex ids → credential-strict replay. The
+				// reasoning source identity is the "codex" prefix shared by every
+				// provider instance this class creates.
+				strict: hasCredentialBoundReasoning(model),
+				currentSource: "codex",
+			}),
 			stream: true,
 			store: false,
 		};

@@ -16,7 +16,7 @@ import { getNarraforkPath } from "./narrafork-home";
 
 let uploadsDirTestOverride: string | null = null;
 
-function isWithinDir(root: string, target: string): boolean {
+export function isWithinDir(root: string, target: string): boolean {
 	const rel = relative(root, target);
 	return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
 }
@@ -62,7 +62,7 @@ export function contentJsonHasImageBlocks(contentJson: unknown): boolean {
 
 const ALLOWED_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 
-const MIME_TO_EXT: Record<string, string> = {
+export const MIME_TO_EXT: Record<string, string> = {
 	"image/png": ".png",
 	"image/jpeg": ".jpg",
 	"image/gif": ".gif",
@@ -354,7 +354,7 @@ export interface ProcessedImageUpload {
  * uploads from later being served back as images or sent to AI providers.
  * Callers must validate the declared MIME type and size *before* calling this.
  */
-async function processImageUpload(file: File): Promise<ProcessedImageUpload> {
+export async function processImageUpload(file: File): Promise<ProcessedImageUpload> {
 	const bytes = new Uint8Array(await file.arrayBuffer());
 	const detectedMediaType = detectImageMime(imageHeaderView(bytes));
 	if (!detectedMediaType) {
@@ -393,7 +393,7 @@ const UPLOAD_DIR_MODE = 0o700;
  * surfaces as a 500-class AppError. Reporting 400 would tell the client its request
  * was wrong and hide a real operator problem from error-rate monitoring.
  */
-function ensureUploadDirWritable(dir: string): void {
+export function ensureUploadDirWritable(dir: string): void {
 	try {
 		accessSync(dir, constants.W_OK);
 		return;
@@ -424,7 +424,7 @@ function ensureUploadDirWritable(dir: string): void {
  * on the message text would break on a localized or reworded message, and would also
  * match a file whose *contents* merely mention EACCES.
  */
-function toUploadPermissionError(error: unknown, filePath: string): unknown {
+export function toUploadPermissionError(error: unknown, filePath: string): unknown {
 	const code = (error as NodeJS.ErrnoException | null)?.code;
 	if (code !== "EACCES" && code !== "EPERM") return error;
 	logger.error("Image write permission denied", { filePath, error: String(error) });
@@ -621,7 +621,7 @@ export function validateTextFile(file: File): void {
 	}
 }
 
-function allocateWorktreeAttachmentPath(cwd: string, filename: string): string {
+export function allocateWorktreeAttachmentPath(cwd: string, filename: string): string {
 	const dir = resolve(cwd, ".narrafork", "attached");
 	mkdirSync(dir, { recursive: true });
 

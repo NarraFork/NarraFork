@@ -94,7 +94,7 @@ export function SystemInjectionNotice({
 	const labels = useMemo(
 		() => ({
 			noticeSilentProgress: t("sidecar.body.noticeSilentProgress", { count: "{count}" }),
-			noticeRelaxedPlan: t("sidecar.body.noticeRelaxedPlan"),
+			noticeRelaxedPlan: t("sidecar.body.noticeRelaxedPlan", { planFile: "{planFile}" }),
 			noticePipelineExit: t("sidecar.body.noticePipelineExit"),
 			tasksCurrent: t("sidecar.body.tasksCurrent", { n: "{n}" }),
 			tasksEmptyNever: t("sidecar.body.tasksEmptyNever"),

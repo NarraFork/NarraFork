@@ -14,7 +14,7 @@ import { pluginInstallationAuthorityId } from "../../services/plugin-integration
 import { PluginUiAssetService } from "../../services/plugin-ui-assets";
 import { PLUGIN_UI_HOST_REQUEST_MAX_BYTES, PluginUiHost } from "../../services/plugin-ui-host";
 import { PluginUiSessionService } from "../../services/plugin-ui-session";
-import { createPluginUiRoutes } from "../plugin-ui";
+import { createPluginUiRoutes, isSurfaceAllowedForView } from "../plugin-ui";
 
 const pluginId = "com.example.ui";
 const version = "1.0.0";
@@ -1046,5 +1046,38 @@ describe("plugin UI theme-asset endpoint", () => {
 			expect(res.headers.get("content-type") ?? "").not.toContain("text/html");
 			expect(await res.text()).not.toContain("<script>");
 		});
+	});
+});
+
+describe("isSurfaceAllowedForView", () => {
+	test("an exact surface match is allowed", () => {
+		expect(isSurfaceAllowedForView(["workspace"], "workspace")).toBe(true);
+		expect(isSurfaceAllowedForView(["focus", "settings"], "settings")).toBe(true);
+		expect(isSurfaceAllowedForView(["graph"], "graph")).toBe(true);
+	});
+
+	test("a focus-only view is admitted on graph (already-published plugins keep working)", () => {
+		// This is the compatibility rule: without it every existing plugin that
+		// declared `focus` would fail inside a chapter node with SCOPE_DENIED.
+		expect(isSurfaceAllowedForView(["focus"], "graph")).toBe(true);
+		expect(isSurfaceAllowedForView(["focus", "workspace"], "graph")).toBe(true);
+	});
+
+	test("a graph-only view is NOT admitted on focus", () => {
+		// Declaring graph alone states the view only makes sense at node size, so the
+		// family rule is deliberately one-way.
+		expect(isSurfaceAllowedForView(["graph"], "focus")).toBe(false);
+	});
+
+	test("an unrelated surface is still refused on graph", () => {
+		expect(isSurfaceAllowedForView(["workspace"], "graph")).toBe(false);
+		expect(isSurfaceAllowedForView(["settings"], "graph")).toBe(false);
+		expect(isSurfaceAllowedForView([], "graph")).toBe(false);
+	});
+
+	test("the family rule does not leak to other surfaces", () => {
+		expect(isSurfaceAllowedForView(["focus"], "workspace")).toBe(false);
+		expect(isSurfaceAllowedForView(["focus"], "settings")).toBe(false);
+		expect(isSurfaceAllowedForView(["workspace"], "director")).toBe(false);
 	});
 });

@@ -77,6 +77,7 @@ import {
 	type VListViewTarget,
 } from "../vlist-content-view-target";
 import { categoryIcon } from "./category-icons";
+import { swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { RenderInlinePermission } from "./RenderPermission";
 import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
@@ -391,7 +392,8 @@ function SubagentInner({
 		// the expanded description renders markdown links.
 		<Box
 			key="header"
-			onClick={onToggle}
+			// A modified click selects the block; only a plain click toggles the card.
+			onClick={onToggle ? swallowSelectionClick(onToggle) : undefined}
 			style={{
 				position: "absolute",
 				top,
@@ -709,7 +711,8 @@ function SubagentBody({
 					gap={4}
 					wrap="nowrap"
 					style={{ height: PROMPT_TOGGLE_ROW_HEIGHT, cursor: "pointer" }}
-					onClick={onTogglePrompt}
+					// A modified click selects the block; only a plain click toggles the prompt.
+					onClick={onTogglePrompt ? swallowSelectionClick(onTogglePrompt) : undefined}
 				>
 					{promptOpen ? (
 						<IconChevronDown size={CHEVRON_SIZE} />

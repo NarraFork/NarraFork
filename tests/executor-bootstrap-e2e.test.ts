@@ -143,7 +143,6 @@ test("the generated install script verifies the digest of what is actually serve
 		deviceSlug: "e2e-device",
 		deviceName: "E2E Device",
 		connectionMode: "reverse",
-		allowRoot: "/home/dev/projects",
 		disableShell: false,
 		artifactFilename: entry.filename,
 		expectedSha256: entry.sha256,

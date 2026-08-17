@@ -1,3 +1,8 @@
+import {
+	isAbsoluteExecutorPath,
+	MAX_EXECUTOR_PATH_LENGTH,
+	MAX_EXECUTOR_PATH_RULES,
+} from "@shared/executor-path-rules";
 import { EXECUTOR_PLATFORMS } from "@shared/remote-executor";
 import { z } from "zod";
 import { isSecureDirectDeviceUrl } from "../device-url";
@@ -90,19 +95,50 @@ export const deviceBrowseQuerySchema = z.object({
 export const deviceInstallScriptSchema = z.object({
 	platform: z.enum(EXECUTOR_PLATFORMS),
 	mode: z.enum(["system", "user"]).default("system"),
-	allowRoot: z
-		.string()
-		.trim()
-		.min(1)
-		.max(4096)
-		// biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the intent
-		.refine((value) => !/[\u0000-\u001f\u007f]/.test(value), {
-			message: "Path may not contain control characters or newlines",
-		}),
 	disableShell: z.boolean().default(false),
 	/**
 	 * Absolute base URL the target machine uses to reach NarraFork. Optional: the
 	 * server derives it from the request when omitted.
 	 */
 	serverBaseUrl: z.string().url().max(2000).optional(),
+});
+
+/**
+ * Renders rules as the `pathRules` fragment of the executor config file.
+ *
+ * Built with JSON.stringify rather than string concatenation so a path containing
+ * quotes or backslashes (routine on Windows) cannot break out of its JSON string.
+ */
+export function buildPathRulesConfigSnippet(
+	rules: ReadonlyArray<{ action: string; path: string }>,
+): string {
+	return JSON.stringify({ pathRules: rules }, null, 2);
+}
+
+/**
+ * One ordered path guard rule. Paths are accepted in both POSIX and Windows shape
+ * because the server may run on a different OS than the device, and rewriting the
+ * operator's path by the server's own rules would change its meaning.
+ */
+export const executorPathRuleSchema = z.object({
+	action: z.enum(["allow", "deny"]),
+	path: z
+		.string()
+		.trim()
+		.min(1)
+		.max(MAX_EXECUTOR_PATH_LENGTH)
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the intent
+		.refine((value) => !/[\u0000-\u001f\u007f]/.test(value), {
+			message: "Path may not contain control characters or newlines",
+		})
+		.refine(isAbsoluteExecutorPath, { message: "Path must be absolute" }),
+});
+
+/**
+ * Ordered rule list. Never sorted or deduped on the way in: order is the priority
+ * mechanism (last match wins) and duplicates are a legitimate way to override an
+ * earlier entry, so normalizing either one would silently change the policy.
+ */
+export const updateDevicePathRulesSchema = z.object({
+	rules: z.array(executorPathRuleSchema).max(MAX_EXECUTOR_PATH_RULES),
 });

@@ -22,13 +22,10 @@ export const ReasoningStepsTrace = memo(function ReasoningStepsTrace({
 	segments,
 	streaming,
 	persistKeyBase,
-	titlesOnly,
 }: {
 	segments: ReasoningSegment[];
 	streaming?: boolean;
 	persistKeyBase?: string;
-	/** When true, step bodies never expand — only the title list is shown. */
-	titlesOnly?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const lastIndex = segments.length - 1;
@@ -41,7 +38,7 @@ export const ReasoningStepsTrace = memo(function ReasoningStepsTrace({
 				key: `seg${i}`,
 				title: displayTitle(segment),
 				body:
-					!titlesOnly && !segment.isEmpty && segment.body.trim().length > 0 ? (
+					!segment.isEmpty && segment.body.trim().length > 0 ? (
 						<MarkdownContent text={segment.body} />
 					) : null,
 				shimmer: streaming && i === lastIndex,

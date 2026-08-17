@@ -50,20 +50,20 @@ describe("resolveSubagentExpanded — LOD / exemption main switch", () => {
 		).toBe(true);
 	});
 
-	it("non-exempt: L6 expands; L4 collapses; L5 follows recent+opened", async () => {
+	it("non-exempt: L5 expands; L3 collapses; L4 follows recent+opened", async () => {
 		const { resolveSubagentExpanded } = await import("./measure-subagent");
 		const inert = { isActive: false, hasSelfPermission: false, pendingPermissionCount: 0 };
-		expect(resolveSubagentExpanded(6, { ...inert, isRecent: false, opened: false })).toBe(true);
-		expect(resolveSubagentExpanded(4, { ...inert, isRecent: true, opened: true })).toBe(false);
-		// L5: recent card follows `opened`; old card always collapses.
-		expect(resolveSubagentExpanded(5, { ...inert, isRecent: true, opened: true })).toBe(true);
-		expect(resolveSubagentExpanded(5, { ...inert, isRecent: true, opened: false })).toBe(false);
-		expect(resolveSubagentExpanded(5, { ...inert, isRecent: false, opened: true })).toBe(false);
-		// L1-L3 follow the upstream gate (`opened`).
-		expect(resolveSubagentExpanded(3, { ...inert, isRecent: false, opened: true })).toBe(true);
+		expect(resolveSubagentExpanded(5, { ...inert, isRecent: false, opened: false })).toBe(true);
+		expect(resolveSubagentExpanded(3, { ...inert, isRecent: true, opened: true })).toBe(false);
+		// L4: recent card follows `opened`; old card always collapses.
+		expect(resolveSubagentExpanded(4, { ...inert, isRecent: true, opened: true })).toBe(true);
+		expect(resolveSubagentExpanded(4, { ...inert, isRecent: true, opened: false })).toBe(false);
+		expect(resolveSubagentExpanded(4, { ...inert, isRecent: false, opened: true })).toBe(false);
+		// L1/L2 follow the upstream gate (`opened`).
+		expect(resolveSubagentExpanded(2, { ...inert, isRecent: false, opened: true })).toBe(true);
 		expect(resolveSubagentExpanded(1, { ...inert, isRecent: false, opened: false })).toBe(false);
 		expect(
-			resolveSubagentExpanded(4, {
+			resolveSubagentExpanded(3, {
 				...inert,
 				isRecent: false,
 				opened: false,
@@ -76,8 +76,8 @@ describe("resolveSubagentExpanded — LOD / exemption main switch", () => {
 describe("measureSubagentCard — collapsed header (55-75px)", () => {
 	it("collapsed with no result preview ≈ 56px (padding + badge + desc)", async () => {
 		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
-		// L4 forces collapse; not recent, not opened, terminal, no result.
-		const r = measureSubagentCard(BASE, WIDTH, 4, { isRecent: false, opened: false });
+		// L3 forces collapse; not recent, not opened, terminal, no result.
+		const r = measureSubagentCard(BASE, WIDTH, 3, { isRecent: false, opened: false });
 		expect(r.effectiveExpanded).toBe(false);
 		const c = MEASURE_SUBAGENT_CONSTANTS;
 		// header = pad*2 + badge row + descMt + xs line ; + border*2 (not inRun).
@@ -96,7 +96,7 @@ describe("measureSubagentCard — collapsed header (55-75px)", () => {
 		const r = measureSubagentCard(
 			{ ...BASE, resultText: "The auth flow uses JWT bearer tokens." },
 			WIDTH,
-			4,
+			3,
 			{ isRecent: false, opened: false },
 		);
 		expect(r.effectiveExpanded).toBe(false);
@@ -115,8 +115,8 @@ describe("measureSubagentCard — collapsed header (55-75px)", () => {
 
 	it("collapsed description is a single fixed line regardless of length", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
-		const short = measureSubagentCard(BASE, WIDTH, 4, {});
-		const long = measureSubagentCard({ ...BASE, description: "x ".repeat(400) }, WIDTH, 4, {});
+		const short = measureSubagentCard(BASE, WIDTH, 3, {});
+		const long = measureSubagentCard({ ...BASE, description: "x ".repeat(400) }, WIDTH, 3, {});
 		expect(short.headerHeight).toBe(long.headerHeight);
 		expect(short.descriptionMeasured).toBeNull();
 	});
@@ -127,8 +127,8 @@ describe("measureSubagentCard — expanded body", () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
 		// A long description: collapsed truncates to 1 line; expanded wraps to many.
 		const longDesc = { ...BASE, description: "word ".repeat(120).trim() };
-		const collapsed = measureSubagentCard(longDesc, WIDTH, 4, {});
-		const expanded = measureSubagentCard(longDesc, WIDTH, 6, {});
+		const collapsed = measureSubagentCard(longDesc, WIDTH, 3, {});
+		const expanded = measureSubagentCard(longDesc, WIDTH, 5, {});
 		expect(collapsed.effectiveExpanded).toBe(false);
 		expect(expanded.effectiveExpanded).toBe(true);
 		// Expanded description wraps → carries a measured markdown/inline body.
@@ -140,8 +140,8 @@ describe("measureSubagentCard — expanded body", () => {
 	it("expanding a card with a body region is taller than collapsed", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
 		const data = { ...BASE, resultText: "one line result" };
-		const collapsed = measureSubagentCard(data, WIDTH, 4, {});
-		const expanded = measureSubagentCard(data, WIDTH, 6, {});
+		const collapsed = measureSubagentCard(data, WIDTH, 3, {});
+		const expanded = measureSubagentCard(data, WIDTH, 5, {});
 		// Collapsed shows only a result-preview line; expanded reveals the full
 		// result ContentViewer block → strictly taller.
 		expect(expanded.height).toBeGreaterThan(collapsed.height);
@@ -151,11 +151,11 @@ describe("measureSubagentCard — expanded body", () => {
 	it("expanded result is capped at maxHeight:300 (min(content, cap))", async () => {
 		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
 		const c = MEASURE_SUBAGENT_CONSTANTS;
-		const short = measureSubagentCard({ ...BASE, resultText: "one line result" }, WIDTH, 6, {});
+		const short = measureSubagentCard({ ...BASE, resultText: "one line result" }, WIDTH, 5, {});
 		const huge = measureSubagentCard(
 			{ ...BASE, resultText: Array.from({ length: 400 }, (_, i) => `line ${i}`).join("\n\n") },
 			WIDTH,
-			6,
+			5,
 			{},
 		);
 		// Short result block is well under the cap.
@@ -171,7 +171,7 @@ describe("measureSubagentCard — expanded body", () => {
 		const closed = measureSubagentCard(
 			{ ...BASE, prompt: "do the thing", promptOpen: false },
 			WIDTH,
-			6,
+			5,
 			{},
 		);
 		// Closed prompt = toggle row + bottom padding.
@@ -180,7 +180,7 @@ describe("measureSubagentCard — expanded body", () => {
 		const openShort = measureSubagentCard(
 			{ ...BASE, prompt: "short prompt", promptOpen: true },
 			WIDTH,
-			6,
+			5,
 			{},
 		);
 		expect(openShort.promptBlockHeight).toBeGreaterThan(closed.promptBlockHeight);
@@ -193,7 +193,7 @@ describe("measureSubagentCard — expanded body", () => {
 				promptOpen: true,
 			},
 			WIDTH,
-			6,
+			5,
 			{},
 		);
 		// Body is capped at 200 → block = toggle + (mt + 200) + bottom padding.
@@ -207,10 +207,10 @@ describe("measureSubagentCard — expanded body", () => {
 
 	it("expanded body grows monotonically as regions are added", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
-		const bare = measureSubagentCard(BASE, WIDTH, 6, {});
-		const withPrompt = measureSubagentCard({ ...BASE, prompt: "p" }, WIDTH, 6, {});
-		const withResult = measureSubagentCard({ ...BASE, resultText: "r" }, WIDTH, 6, {});
-		const withBoth = measureSubagentCard({ ...BASE, prompt: "p", resultText: "r" }, WIDTH, 6, {});
+		const bare = measureSubagentCard(BASE, WIDTH, 5, {});
+		const withPrompt = measureSubagentCard({ ...BASE, prompt: "p" }, WIDTH, 5, {});
+		const withResult = measureSubagentCard({ ...BASE, resultText: "r" }, WIDTH, 5, {});
+		const withBoth = measureSubagentCard({ ...BASE, prompt: "p", resultText: "r" }, WIDTH, 5, {});
 		expect(withPrompt.height).toBeGreaterThan(bare.height);
 		expect(withResult.height).toBeGreaterThan(bare.height);
 		expect(withBoth.height).toBeGreaterThan(withPrompt.height);
@@ -220,8 +220,8 @@ describe("measureSubagentCard — expanded body", () => {
 	it("resolveOverride adds a button block when present", async () => {
 		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
 		const c = MEASURE_SUBAGENT_CONSTANTS;
-		const without = measureSubagentCard(BASE, WIDTH, 6, {});
-		const withOverride = measureSubagentCard({ ...BASE, hasResolveOverride: true }, WIDTH, 6, {});
+		const without = measureSubagentCard(BASE, WIDTH, 5, {});
+		const withOverride = measureSubagentCard({ ...BASE, hasResolveOverride: true }, WIDTH, 5, {});
 		expect(withOverride.resolveOverrideHeight).toBe(
 			c.RESOLVE_OVERRIDE_BUTTON_HEIGHT + c.BLOCK_PADDING_BOTTOM,
 		);
@@ -233,16 +233,16 @@ describe("measureSubagentCard — recent calls (independent of expansion)", () =
 	it("recent calls show even when collapsed; ≤3 rows", async () => {
 		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
 		const c = MEASURE_SUBAGENT_CONSTANTS;
-		const none = measureSubagentCard(BASE, WIDTH, 4, {});
+		const none = measureSubagentCard(BASE, WIDTH, 3, {});
 		expect(none.recentCallsHeight).toBe(0);
 
-		const three = measureSubagentCard({ ...BASE, recentCallCount: 3 }, WIDTH, 4, {});
+		const three = measureSubagentCard({ ...BASE, recentCallCount: 3 }, WIDTH, 3, {});
 		expect(three.effectiveExpanded).toBe(false);
 		expect(three.recentRowCount).toBe(3);
 		expect(three.recentCallsHeight).toBeGreaterThan(0);
 
 		// >3 is clamped to 3 rows.
-		const five = measureSubagentCard({ ...BASE, recentCallCount: 5 }, WIDTH, 4, {});
+		const five = measureSubagentCard({ ...BASE, recentCallCount: 5 }, WIDTH, 3, {});
 		expect(five.recentRowCount).toBe(3);
 		expect(five.recentCallsHeight).toBe(three.recentCallsHeight);
 
@@ -261,7 +261,7 @@ describe("measureSubagentCard — recent calls (independent of expansion)", () =
 		const withBtn = measureSubagentCard(
 			{ ...BASE, recentCallCount: 1, hasRecentCallsButton: true },
 			WIDTH,
-			4,
+			3,
 			{},
 		);
 		const titleRow = Math.max(c.XS_LINE_HEIGHT, c.BUTTON_COMPACT_XS);
@@ -277,7 +277,7 @@ describe("measureSubagentCard — timing passthrough (header + recent rows)", ()
 		const m = measureSubagentCard(
 			{ ...BASE, timing: { executionStartedAt: 1_000, completedAt: 4_000, durationMs: 3_000 } },
 			WIDTH,
-			4,
+			3,
 			{},
 		);
 		expect(m.timing).toEqual({
@@ -307,7 +307,7 @@ describe("measureSubagentCard — timing passthrough (header + recent rows)", ()
 				],
 			},
 			WIDTH,
-			4,
+			3,
 			{},
 		);
 		expect(m.recentRowCount).toBe(3);
@@ -317,7 +317,7 @@ describe("measureSubagentCard — timing passthrough (header + recent rows)", ()
 
 	it("defaults to an empty row list and a null-filled header record", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
-		const m = measureSubagentCard(BASE, WIDTH, 4, {});
+		const m = measureSubagentCard(BASE, WIDTH, 3, {});
 		expect(m.recentCallTimings).toEqual([]);
 		expect(m.timing.durationMs).toBeNull();
 	});
@@ -325,7 +325,7 @@ describe("measureSubagentCard — timing passthrough (header + recent rows)", ()
 	it("timing is HEIGHT-NEUTRAL (header row + recent rows are fixed)", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
 		const rows = { ...BASE, recentCallCount: 3 };
-		const bare = measureSubagentCard(rows, WIDTH, 6, { opened: true });
+		const bare = measureSubagentCard(rows, WIDTH, 5, { opened: true });
 		const timed = measureSubagentCard(
 			{
 				...rows,
@@ -337,7 +337,7 @@ describe("measureSubagentCard — timing passthrough (header + recent rows)", ()
 				],
 			},
 			WIDTH,
-			6,
+			5,
 			{ opened: true },
 		);
 		expect(timed.height).toBe(bare.height);
@@ -357,7 +357,7 @@ describe("measureSubagentCard — permission integration (P11) + P10 dependency"
 				selfPermission: { hasExecutionTarget: true, buttonCount: 2 },
 			},
 			WIDTH,
-			4, // even at L4, a self-permission is lodExempt → expanded.
+			3, // even at L3, a self-permission is lodExempt → expanded.
 			{},
 		);
 		expect(r.effectiveExpanded).toBe(true);
@@ -377,7 +377,7 @@ describe("measureSubagentCard — permission integration (P11) + P10 dependency"
 	it("pending permissions force expansion; placeholder used without P10 detail", async () => {
 		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
 		const c = MEASURE_SUBAGENT_CONSTANTS;
-		const r = measureSubagentCard(BASE, WIDTH, 4, { pendingPermissionCount: 2 });
+		const r = measureSubagentCard(BASE, WIDTH, 3, { pendingPermissionCount: 2 });
 		expect(r.effectiveExpanded).toBe(true);
 		expect(r.pendingCardCount).toBe(2);
 		// 2 placeholder cards (200 each + 2px border) + 1 gap + title + mb + bottom pad.
@@ -393,10 +393,10 @@ describe("measureSubagentCard — permission integration (P11) + P10 dependency"
 		const { measureInlinePermission } = await import("./measure-permission");
 		const c = MEASURE_SUBAGENT_CONSTANTS;
 		const detail = { hasExecutionTarget: true, buttonCount: 2 };
-		const r = measureSubagentCard({ ...BASE, pendingPermissions: [detail] }, WIDTH, 4, {});
+		const r = measureSubagentCard({ ...BASE, pendingPermissions: [detail] }, WIDTH, 3, {});
 		expect(r.pendingCardCount).toBe(1);
 		const cardInner = WIDTH - c.BLOCK_PADDING_X * 2 - c.PENDING_CARD_BORDER * 2;
-		const perm = measureInlinePermission(detail, cardInner, 4);
+		const perm = measureInlinePermission(detail, cardInner, 3);
 		const cardBody = c.TOOLCALL_HEADER_ESTIMATE + perm.height + c.PENDING_CARD_BORDER * 2;
 		const expected =
 			c.PENDING_TITLE_ROW_HEIGHT +
@@ -411,8 +411,8 @@ describe("measureSubagentCard — outer frame (inRun vs Paper)", () => {
 	it("inRun=false adds a Paper border; inRun=true removes it", async () => {
 		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
 		const c = MEASURE_SUBAGENT_CONSTANTS;
-		const boxed = measureSubagentCard(BASE, WIDTH, 4, { inRun: false });
-		const inRun = measureSubagentCard(BASE, WIDTH, 4, { inRun: true, isLast: true });
+		const boxed = measureSubagentCard(BASE, WIDTH, 3, { inRun: false });
+		const inRun = measureSubagentCard(BASE, WIDTH, 3, { inRun: true, isLast: true });
 		expect(boxed.borderHeight).toBe(c.CARD_BORDER * 2);
 		expect(inRun.borderHeight).toBe(0);
 		expect(inRun.dividerHeight).toBe(0);
@@ -422,8 +422,8 @@ describe("measureSubagentCard — outer frame (inRun vs Paper)", () => {
 	it("inRun && !isLast adds a 1px divider", async () => {
 		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
 		const c = MEASURE_SUBAGENT_CONSTANTS;
-		const notLast = measureSubagentCard(BASE, WIDTH, 4, { inRun: true, isLast: false });
-		const last = measureSubagentCard(BASE, WIDTH, 4, { inRun: true, isLast: true });
+		const notLast = measureSubagentCard(BASE, WIDTH, 3, { inRun: true, isLast: false });
+		const last = measureSubagentCard(BASE, WIDTH, 3, { inRun: true, isLast: true });
 		expect(notLast.dividerHeight).toBe(c.DIVIDER_HEIGHT);
 		expect(last.dividerHeight).toBe(0);
 		expect(notLast.height).toBe(last.height + c.DIVIDER_HEIGHT);
@@ -434,8 +434,8 @@ describe("measureSubagentCard — width sensitivity + reusable measurer", () => 
 	it("expanded description wraps into more lines as width shrinks", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
 		const text = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen";
-		const wide = measureSubagentCard({ ...BASE, description: text }, 2000, 6, {});
-		const narrow = measureSubagentCard({ ...BASE, description: text }, 160, 6, {});
+		const wide = measureSubagentCard({ ...BASE, description: text }, 2000, 5, {});
+		const narrow = measureSubagentCard({ ...BASE, description: text }, 160, 5, {});
 		expect(narrow.height).toBeGreaterThan(wide.height);
 	});
 
@@ -446,8 +446,8 @@ describe("measureSubagentCard — width sensitivity + reusable measurer", () => 
 			description: "a recurring subagent description phrase for wrapping",
 			resultText: "some result body",
 		});
-		const collapsed = measure(WIDTH, 4, {});
-		const expanded = measure(WIDTH, 6, {});
+		const collapsed = measure(WIDTH, 3, {});
+		const expanded = measure(WIDTH, 5, {});
 		expect(collapsed.effectiveExpanded).toBe(false);
 		expect(expanded.effectiveExpanded).toBe(true);
 		expect(expanded.height).toBeGreaterThan(collapsed.height);

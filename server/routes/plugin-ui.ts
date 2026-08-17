@@ -65,7 +65,7 @@ const sessionInputSchema = z
 		hash: z.string().regex(/^[a-f0-9]{64}$/),
 		contributionId: z.string().min(1).max(128),
 		panelInstanceId: z.string().min(1).max(256),
-		surface: z.enum(["workspace", "director", "focus", "settings", "provider-settings"]),
+		surface: z.enum(["workspace", "director", "focus", "graph", "settings", "provider-settings"]),
 		surfaceScope: z.enum(["workspace", "narrator", "project", "global"]),
 		scope: invocationScopeSchema.optional(),
 	})
@@ -373,6 +373,24 @@ function bindUiCapability(
 	);
 }
 
+/**
+ * Whether a view's declared surfaces admit the surface it is being opened on.
+ *
+ * An exact match always passes. Beyond that, `graph` (a chapter node's embedded
+ * dock) accepts a view that declared only `focus`: both surfaces host exactly one
+ * narrator and expose the same host context, so requiring authors to re-publish a
+ * manifest would have made every existing focus plugin fail inside a node with
+ * PLUGIN_UI_SCOPE_DENIED. The reverse is deliberately NOT allowed — a view that
+ * opts into `graph` alone is stating it only makes sense at node size.
+ *
+ * Exported for unit testing.
+ */
+export function isSurfaceAllowedForView(declared: readonly string[], surface: string): boolean {
+	if (declared.includes(surface)) return true;
+	if (surface === "graph") return declared.includes("focus");
+	return false;
+}
+
 function assertUiContribution(
 	manifest: {
 		permissions?: { host?: string[] };
@@ -395,7 +413,7 @@ function assertUiContribution(
 		(candidate) => candidate.id === input.contributionId,
 	);
 	if (!view) throw new AppError("Plugin UI contribution not found", 404, "NOT_FOUND");
-	if (view.scope !== input.surfaceScope || !view.surfaces.includes(input.surface)) {
+	if (view.scope !== input.surfaceScope || !isSurfaceAllowedForView(view.surfaces, input.surface)) {
 		throw new AppError(
 			"Plugin UI contribution is not available on this surface",
 			403,

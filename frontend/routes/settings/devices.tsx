@@ -27,7 +27,9 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { CopyButton } from "../../components/common/CopyButton";
+import { DevicePathRulesEditor } from "../../components/settings/DevicePathRulesEditor";
 import { ExecutorInstallModal } from "../../components/settings/ExecutorInstallModal";
+import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
 import type {
 	CreateDeviceInput,
@@ -63,6 +65,11 @@ function SettingsDevicesPage() {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
 	const confirm = useConfirmDialog();
+	const { data: currentUser } = useCurrentUser();
+	// Non-admins may register and manage their own devices, but not the actions
+	// whose blast radius is the whole instance (transfers, global scope). The API
+	// enforces the same split; this only keeps the UI honest about it.
+	const isAdmin = currentUser?.role === "admin";
 	const [createOpen, setCreateOpen] = useState(false);
 	const [editingDevice, setEditingDevice] = useState<RemoteDevice | null>(null);
 	const [issuedToken, setIssuedToken] = useState<IssuedToken | null>(null);
@@ -169,6 +176,7 @@ function SettingsDevicesPage() {
 							onEdit={() => setEditingDevice(device)}
 							onTransfer={() => setTransferDevice(device)}
 							onInstall={() => setInstallDevice(device)}
+							isAdmin={isAdmin}
 							onRotate={() => rotateMut.mutate(device.id)}
 							onDelete={async () => {
 								const ok = await confirm({
@@ -190,6 +198,7 @@ function SettingsDevicesPage() {
 				onSubmit={(input) => createMut.mutate(input)}
 				loading={createMut.isPending}
 				projects={projects}
+				isAdmin={isAdmin}
 			/>
 			<EditDeviceModal
 				device={editingDevice}
@@ -199,6 +208,7 @@ function SettingsDevicesPage() {
 				}}
 				loading={updateMut.isPending}
 				projects={projects}
+				isAdmin={isAdmin}
 			/>
 			<TokenModal
 				issued={issuedToken}
@@ -245,6 +255,7 @@ function DeviceCard({
 	onDelete,
 	onTransfer,
 	onInstall,
+	isAdmin,
 }: {
 	device: RemoteDevice;
 	projectName?: string;
@@ -258,6 +269,8 @@ function DeviceCard({
 	onDelete: () => void;
 	onTransfer: () => void;
 	onInstall: () => void;
+	/** Transfers read/write arbitrary server-local paths, so they stay admin-only. */
+	isAdmin: boolean;
 }) {
 	const { t } = useTranslation("settings");
 	const platform =
@@ -317,7 +330,7 @@ function DeviceCard({
 						<Button size="xs" variant="subtle" onClick={onDiagnostics}>
 							{t("deviceDiagnosticsButton")}
 						</Button>
-						{device.status === "online" ? (
+						{device.status === "online" && isAdmin ? (
 							<Button size="xs" variant="subtle" onClick={onTransfer}>
 								{t("deviceTransferButton")}
 							</Button>
@@ -357,12 +370,15 @@ function CreateDeviceWizard({
 	onSubmit,
 	loading,
 	projects,
+	isAdmin,
 }: {
 	opened: boolean;
 	onClose: () => void;
 	onSubmit: (input: CreateDeviceInput) => void;
 	loading: boolean;
 	projects: ProjectOption[];
+	/** Only admins may register a global device. */
+	isAdmin: boolean;
 }) {
 	const { t } = useTranslation("settings");
 	const [step, setStep] = useState(0);
@@ -371,7 +387,7 @@ function CreateDeviceWizard({
 	const [description, setDescription] = useState("");
 	const [mode, setMode] = useState<"reverse" | "direct">("reverse");
 	const [directUrl, setDirectUrl] = useState("");
-	const [scope, setScope] = useState<"global" | "project">("global");
+	const [scope, setScope] = useState<"global" | "project">(isAdmin ? "global" : "project");
 	const [projectId, setProjectId] = useState<string | null>(null);
 
 	useEffect(() => {
@@ -459,13 +475,16 @@ function CreateDeviceWizard({
 						<Stack mt="md">
 							<Select
 								label={t("deviceScopeLabel")}
+								// A global device is reachable from every project and is what makes a
+								// device inject by default, so only an admin may choose it. The API
+								// rejects it too; this keeps the option from looking available.
 								data={[
-									{ value: "global", label: t("deviceScopeGlobal") },
+									...(isAdmin ? [{ value: "global", label: t("deviceScopeGlobal") }] : []),
 									{ value: "project", label: t("deviceScopeProject") },
 								]}
 								value={scope}
 								onChange={(value) => {
-									const next = (value as "global" | "project") ?? "global";
+									const next = (value as "global" | "project") ?? "project";
 									setScope(next);
 									if (next === "global") setProjectId(null);
 								}}
@@ -557,12 +576,14 @@ function EditDeviceModal({
 	onSubmit,
 	loading,
 	projects,
+	isAdmin,
 }: {
 	device: RemoteDevice | null;
 	onClose: () => void;
 	onSubmit: (input: UpdateDeviceInput) => void;
 	loading: boolean;
 	projects: ProjectOption[];
+	isAdmin: boolean;
 }) {
 	const { t } = useTranslation("settings");
 	const [name, setName] = useState("");
@@ -623,13 +644,19 @@ function EditDeviceModal({
 				) : null}
 				<Select
 					label={t("deviceScopeLabel")}
+					// Same admin gate as creation: promoting a device to global would
+					// otherwise be a back door around it. An already-global device keeps
+					// showing its current value for a non-admin manager, but cannot be set.
 					data={[
-						{ value: "global", label: t("deviceScopeGlobal") },
+						...(isAdmin || scope === "global"
+							? [{ value: "global", label: t("deviceScopeGlobal") }]
+							: []),
 						{ value: "project", label: t("deviceScopeProject") },
 					]}
+					disabled={!isAdmin}
 					value={scope}
 					onChange={(value) => {
-						const next = (value as "global" | "project") ?? "global";
+						const next = (value as "global" | "project") ?? "project";
 						setScope(next);
 						if (next === "global") setProjectId(null);
 					}}
@@ -669,6 +696,17 @@ function EditDeviceModal({
 						{t("deviceSaveButton")}
 					</Button>
 				</Group>
+				{/*
+				 * Below the metadata Save on purpose: path rules have their own save,
+				 * their own validation, and take effect only after the operator applies
+				 * the config on the device and restarts it.
+				 */}
+				{device ? (
+					<>
+						<Divider label={t("devicePathRules")} labelPosition="center" />
+						<DevicePathRulesEditor device={device} />
+					</>
+				) : null}
 			</Stack>
 		</Modal>
 	);

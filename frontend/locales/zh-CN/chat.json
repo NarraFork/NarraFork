@@ -33,5 +33,19 @@
 	"loadOlder": "加载更早的消息",
 	"historyStart": "会话开始",
 	"newMessages": "{{count}} 条新消息",
-	"toBottom": "跳到最新"
+	"toBottom": "跳到最新",
+	"replyUnavailable": "无法加载被引用的消息",
+	"jumpToReply": "跳转到被引用的消息",
+	"jumpToReplyOf": "跳转到 {{name}} 被引用的消息",
+	"jumpTargetUnavailable": "无法定位被引用的消息",
+	"jumpTargetTooFar": "被引用的消息在会话中过于久远",
+	"attachFiles": "添加图片或文件",
+	"removeAttachment": "移除",
+	"downloadAttachment": "下载",
+	"attachmentUploadFailed": "上传失败",
+	"attachmentPreviewFailed": "无法预览",
+	"attachmentLimitTitle": "附件过多",
+	"attachmentLimit": "每条消息最多 {{count}} 个附件",
+	"attachmentForwardFailed": "部分附件未能发送给叙述者",
+	"attachmentDownloadFailed": "下载失败"
 }

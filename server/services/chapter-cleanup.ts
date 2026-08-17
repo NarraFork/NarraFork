@@ -6,6 +6,7 @@ import { chapters, projects } from "../db/schema";
 import { chapterLock, worktreeLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
@@ -429,7 +430,15 @@ function restoreIgnoredFiles(chapterId: string, worktreePath: string): IgnoredRe
 }
 
 export const chapterCleanup = {
-	async dormant(chapterId: string): Promise<DormantReport> {
+	/**
+	 * Put a chapter to sleep, auto-committing whatever is still uncommitted.
+	 *
+	 * `userId` attributes that auto-save to the person who asked for the chapter to
+	 * sleep. The scheduled sweep (`dormantInactiveChapters`) deliberately passes
+	 * nothing: an unattended timer is not anyone's authored change, so those commits
+	 * keep falling back to the host identity.
+	 */
+	async dormant(chapterId: string, userId?: string): Promise<DormantReport> {
 		return chapterLock.acquire(chapterId, async () => {
 			const chapter = await db.query.chapters.findFirst({
 				where: eq(chapters.id, chapterId),
@@ -512,9 +521,10 @@ export const chapterCleanup = {
 			//
 			// Ordering is chapter → worktree, matching the hierarchy in `lib/async-mutex`; the
 			// reverse nesting anywhere would make a cycle out of two locks that are each safe.
+			const identity = await resolveUserGitIdentityEnv(userId);
 			try {
 				await worktreeLock.acquire(worktreePath, () =>
-					gitService.autoCommitUnlocked(worktreePath, "auto-save before dormant"),
+					gitService.autoCommitUnlocked(worktreePath, "auto-save before dormant", identity),
 				);
 			} catch (commitErr) {
 				// If worktree has merge conflicts, abort merge and retry
@@ -528,6 +538,7 @@ export const chapterCleanup = {
 						await gitService.autoCommitUnlocked(
 							worktreePath,
 							"auto-save before dormant (after merge abort)",
+							identity,
 						);
 					});
 				} catch (recoveryErr) {
@@ -987,6 +998,8 @@ export const chapterCleanup = {
 
 		const activeChapters = await db.query.chapters.findMany({
 			where: eq(chapters.projectId, projectId),
+			// Scans every chapter in the project, so skip the per-node UI blobs.
+			columns: { dockLayoutJson: false, detachedPanelsJson: false },
 			orderBy: [asc(chapters.lastAccessedAt)],
 		});
 

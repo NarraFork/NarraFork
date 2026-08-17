@@ -53,15 +53,15 @@ function resolvePageSize(pageSize: number | undefined): number {
  * count that fills the viewport + overscan in ONE page for the common case, so
  * the shell fill-loop rarely needs a follow-up fetch:
  *
- * - LOD 1-3: cards collapse to tiny count-lines, so many messages are needed to
- *   fill the viewport — but each measures almost nothing (~1ms/100), so a large
- *   page has negligible cost.
- * - LOD 4-6: cards expand and each message is tall, so few are needed; capping at
+ * - LOD 1/2: activity folds to trace rows / count-lines, so many messages are
+ *   needed to fill the viewport — but each measures almost nothing (~1ms/100), so
+ *   a large page has negligible cost.
+ * - LOD 3-5: cards expand and each message is tall, so few are needed; capping at
  *   40 keeps the expensive high-LOD measurement bounded (≈2x faster first paint)
  *   while still filling the viewport for every profile measured.
  */
 export function firstScreenPageSizeForLod(lod: number): number {
-	return lod <= 3 ? 100 : 40;
+	return lod <= 2 ? 100 : 40;
 }
 
 function resolveFetchPage(

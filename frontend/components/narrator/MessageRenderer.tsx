@@ -26,8 +26,8 @@ import { recentRunSegmentMessageIds } from "./run-segments";
 import { SubagentCard } from "./SubagentCard";
 import type { ToolCallData } from "./ToolCallCard";
 import { TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
-import { ToolRunCountLine, ToolRunSummary } from "./ToolRunSummary";
-import type { TraceRowHandlers, TraceRowSubagentHandlers } from "./trace-row-menu";
+import { ToolRunCountLine } from "./ToolRunSummary";
+import type { TraceRowSubagentHandlers } from "./trace-row-menu";
 
 // ---------------------------------------------------------------------------
 // renderToolRun — renders a tool-run segment from pre-computed ToolRunItems
@@ -44,22 +44,8 @@ export interface RenderToolRunOptions {
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 	onViewSubagentSession?: (narratorId: string) => void;
 	/**
-	 * Open a child session from a FOLDED row. Falls back to
-	 * `onViewSubagentSession`; supplied separately because a standalone panel gives
-	 * the rows a plain routing handler while the expanded SubagentCard keeps its own
-	 * richer navigation (which carries `scrollTo`/`from`).
-	 */
-	onViewSubagentSessionFolded?: (narratorId: string) => void;
-	/**
-	 * Detach a running subagent to a background task. Only the FOLDED trace rows
-	 * need this passed down: the expanded SubagentCard calls the api itself.
-	 */
-	onDetachSubagent?: (narratorId: string) => void;
-	/** Cancel a background subagent task (folded rows only, see above). */
-	onCancelBackgroundTask?: (narratorId: string) => void;
-	/**
 	 * Open a file-oriented tool's path in a read-only dock panel. Supplied by hosts
-	 * that own a dockview surface; used by folded rows and the expanded tool card.
+	 * that own a dockview surface; used by the expanded tool card.
 	 */
 	onOpenFilePanel?: (filePath: string) => void;
 	containerStyle?: React.CSSProperties;
@@ -67,7 +53,7 @@ export interface RenderToolRunOptions {
 	enableBlurIn?: boolean;
 	/**
 	 * Ids of messages belonging to the most recent assistant run segments.
-	 * Used by L5 to keep only the current + previous request's cards expanded;
+	 * Used by L4 to keep only the current + previous request's cards expanded;
 	 * cards from older segments collapse to headers. Undefined → treat all as
 	 * recent (no recency collapse).
 	 */
@@ -107,9 +93,6 @@ export function renderToolRun(
 		onDeleteBlock,
 		onRollbackToBlock,
 		onViewSubagentSession,
-		onViewSubagentSessionFolded,
-		onDetachSubagent,
-		onCancelBackgroundTask,
 		onOpenFilePanel,
 		containerStyle,
 		containerClassName,
@@ -237,27 +220,7 @@ export function renderToolRun(
 			containerClassName={containerClassName}
 			containerStyle={containerStyle}
 		>
-			<ToolRunLodGate
-				items={items}
-				runKey={runKey}
-				narratorId={narratorId}
-				renderItem={renderItem}
-				rowHandlers={{
-					onForkFromMessage,
-					onAskInPassing,
-					onCompactBeforeMessage,
-					onClearContextBefore,
-					onManualSummarize,
-					onDeleteBlock,
-					onRollbackToBlock,
-				}}
-				subagentHandlers={{
-					onViewSubagentSession: onViewSubagentSessionFolded ?? onViewSubagentSession,
-					onDetachSubagent,
-					onCancelBackgroundTask,
-					onOpenFilePanel,
-				}}
-			>
+			<ToolRunLodGate items={items} renderItem={renderItem}>
 				{fullListNode}
 			</ToolRunLodGate>
 		</ToolRunFrame>
@@ -312,12 +275,11 @@ function ToolRunFrame({
 
 // ---------------------------------------------------------------------------
 // ToolRunLodGate — decides, per render LOD, whether a tool-run renders as the
-// full card list (L6/L5-recent), a summary block (L3), or a single count line
-// (L2/L1).
+// full card list (L5 / L4-recent / L3 headers) or a single count line (L1/L2).
 //
 // Active tools (running / pending / initializing / streaming) are exempt
 // PER-ITEM, not per-run: only the in-flight cards render in full, while the
-// completed ones fold into the summary / count. This avoids the whole run
+// completed ones fold into the count. This avoids the whole run
 // oscillating between full and folded as a stream of tools completes one by
 // one (the "streaming flapping" bug). The shared isActiveToolItem lives in
 // render-units.ts.
@@ -325,32 +287,22 @@ function ToolRunFrame({
 
 function ToolRunLodGate({
 	items,
-	runKey,
-	narratorId,
 	renderItem,
-	rowHandlers,
-	subagentHandlers,
 	children,
 }: {
 	items: ToolRunItem[];
-	runKey: string;
-	narratorId?: string;
 	/** Renders one full tool card; used to keep active tools visible at low LOD. */
 	renderItem: (item: ToolRunItem, idx: number, total: number) => React.ReactNode;
-	/** Panel handlers behind each folded row's message menu (L3 summary rows). */
-	rowHandlers?: TraceRowHandlers;
-	/** Subagent lifecycle handlers for the folded rows (open / detach / cancel). */
-	subagentHandlers?: TraceRowSubagentHandlers;
 	children: React.ReactNode;
 }) {
 	const lod = useRenderLod();
 
-	// Full detail levels render the whole per-card list. L5's recency scoping is
+	// Full detail levels render the whole per-card list. L4's recency scoping is
 	// applied per-card inside ToolCallCard (earlier segments collapse to headers
-	// there), and L4 collapses every card to a header — but in both cases the
+	// there), and L3 collapses every card to a header — but in both cases the
 	// per-card LOD logic already keeps active cards expanded, so the run-level
-	// gate only needs to act at L3 and below.
-	if (lod >= 4) {
+	// gate only needs to act at L2 and below.
+	if (lod >= 3) {
 		return <>{children}</>;
 	}
 
@@ -358,29 +310,6 @@ function ToolRunLodGate({
 	// stay standalone at their original positions instead of being hoisted above
 	// earlier completed calls (which made the live card appear before its history).
 	const groups = groupToolRunItemsForLod(items);
-
-	if (lod === 3) {
-		return (
-			<>
-				{groups.map((group) => {
-					if (group.kind === "active") {
-						// total=1 → inRun=false, so the standalone live card keeps its own border.
-						return renderItem(group.item, group.index, 1);
-					}
-					return (
-						<ToolRunSummary
-							key={`folded-${group.startIndex}`}
-							items={group.items}
-							runKey={group.startIndex === 0 ? runKey : `${runKey}-folded-${group.startIndex}`}
-							narratorId={narratorId}
-							rowHandlers={rowHandlers}
-							subagentHandlers={subagentHandlers}
-						/>
-					);
-				})}
-			</>
-		);
-	}
 
 	// L1/L2 use count lines for each contiguous completed batch, with any live
 	// cards left in their chronological positions between those batches.
@@ -694,12 +623,10 @@ export function renderTreeMessages(
 			onManualSummarize,
 			onDeleteBlock,
 			onRollbackToBlock,
-			// The expanded card keeps the panel-level handler (richer navigation);
-			// the folded rows inside this run may override it.
+			// A tool-run at L3+ renders only full cards, so the panel-level handler is
+			// the only one it needs; the folded overrides belong to the activity trace,
+			// which is the only thing that still emits rows.
 			onViewSubagentSession,
-			onViewSubagentSessionFolded: foldedSubagentHandlers?.onViewSubagentSession,
-			onDetachSubagent: foldedSubagentHandlers?.onDetachSubagent,
-			onCancelBackgroundTask: foldedSubagentHandlers?.onCancelBackgroundTask,
 			onOpenFilePanel: foldedSubagentHandlers?.onOpenFilePanel,
 			enableBlurIn,
 			recentMessageIds,

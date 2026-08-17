@@ -19,6 +19,7 @@ import { measureLineStats, measureNaturalWidth, prepareWithSegments } from "@che
 import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
 import {
 	accumulateFrame,
+	DEFAULT_RENDER_LOD,
 	type ElementFrame,
 	type MeasuredElement,
 	type PreparedBlock,
@@ -200,7 +201,7 @@ export function isMeasuredCommandBubble(
 export function measureMessageBubble(
 	input: MeasureMessageInput,
 	contentWidth: number,
-	_lod: RenderLod = 5,
+	_lod: RenderLod = DEFAULT_RENDER_LOD,
 	expandState: MessageBubbleExpandState = {},
 ): MeasuredElement {
 	if (input.role === "user" && input.commandText) {

@@ -6,6 +6,7 @@ import { db } from "../db";
 import { chapterEdges, chapters, narrators, projects } from "../db/schema";
 import { worktreeLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { requireProjectAccess } from "../lib/project-access";
@@ -731,6 +732,10 @@ rulerRoutes.patch("/:id/ruler/positions", async (c) => {
 
 	db.transaction((tx) => {
 		for (const pos of positions) {
+			// Ruler's own three columns only. It must not write graphX/graphY: those are
+			// the classic canvas's absolute coordinates, and having each canvas write the
+			// other's storage is what made switching views destroy the layout arranged in
+			// the one you left. See `chapters.graphX` in the schema.
 			const updates: Record<string, unknown> = {
 				anchorCommitSha: pos.anchorCommitSha,
 				axisOffset: pos.axisOffset,
@@ -1181,7 +1186,11 @@ rulerRoutes.post("/:id/ruler/rebase", async (c) => {
 
 		let result: Awaited<ReturnType<typeof gitService.rebase>>;
 		try {
-			result = await gitService.rebase(worktreePath, trunkBranch);
+			result = await gitService.rebase(
+				worktreePath,
+				trunkBranch,
+				await resolveUserGitIdentityEnv(c.get("user").sub),
+			);
 		} catch (err) {
 			// The rebase never started, so the pre-rebase state is still the correct one.
 			if (parked) {

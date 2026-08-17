@@ -80,6 +80,18 @@ export interface DeviceHelloFrame {
 		features?: string[];
 		[key: string]: unknown;
 	};
+	/**
+	 * Ordered path guard rules the executor is enforcing. Report-only: the server
+	 * never sends rules to a device, because the executor's own config is what makes
+	 * the guard survive a compromised server.
+	 *
+	 * Optional and additive, so an executor predating this field simply omits it.
+	 * Absent means "did not report" (show nothing), which `pathRulesUnrestricted`
+	 * disambiguates from "reported an empty list".
+	 */
+	pathRules?: Array<{ action: string; path: string }>;
+	/** True when the device reports having no rules configured at all. */
+	pathRulesUnrestricted?: boolean;
 }
 
 /** Server's reply to a hello — accept or reject. */

@@ -18,6 +18,18 @@ import (
 
 const maxTokenBytes = 4096
 
+// maxPathRules bounds the ordered rule list. Evaluation is linear per path check,
+// and an operator-facing guard list this long is a misconfiguration, not a use case.
+const maxPathRules = 256
+
+// PathRule is one entry in the ordered path guard list.
+type PathRule struct {
+	// Action is "allow" or "deny".
+	Action string `json:"action"`
+	// Path is an absolute directory path.
+	Path string `json:"path"`
+}
+
 type tokenSourceKind uint8
 
 const (
@@ -48,7 +60,15 @@ type Config struct {
 	// AllowRoots restricts structured filesystem, transfer, and search paths plus
 	// Git/command working directories. It does not interpret Git arguments or
 	// sandbox shell/PTY command text. Empty means unrestricted path RPCs.
+	//
+	// Superseded by PathRules, which can also deny. Still honored so executors
+	// installed before ordered rules keep working across an upgrade.
 	AllowRoots []string `json:"allowRoots"`
+	// PathRules is an ordered allow/deny list guarding the same surface as
+	// AllowRoots. The last rule containing a path decides, so a deny can carve a
+	// hole out of an allow and a later allow can re-open an exception inside it.
+	// Empty means unrestricted. Mutually exclusive with AllowRoots.
+	PathRules []PathRule `json:"pathRules"`
 	// DefaultCwd is reported to the server at handshake.
 	DefaultCwd string `json:"defaultCwd"`
 	// InsecureSkipVerify disables reverse-dial TLS certificate verification.
@@ -82,6 +102,8 @@ func Load() (*Config, error) {
 	tokenFile := fs.String("token-file", "", `Read the token from a permission-restricted file ("-" aliases stdin)`)
 	tokenStdin := fs.Bool("token-stdin", false, "Read the registration token once from stdin")
 	allowRoots := fs.String("allow-root", "", "Comma-separated roots for structured path RPCs and command cwd checks (not a shell sandbox)")
+	var pathRuleFlags pathRuleList
+	fs.Var(&pathRuleFlags, "path-rule", `Ordered path rule "allow:/dir" or "deny:/dir" (repeatable; last match wins)`)
 	defaultCwd := fs.String("cwd", "", "Default working directory reported to the server")
 	insecure := fs.Bool("insecure", false, "Skip reverse-dial TLS certificate verification")
 	listenAddr := fs.String("listen", "", "Direct mode: listen on this address (e.g. 127.0.0.1:7900) instead of dialing out")
@@ -126,6 +148,17 @@ func Load() (*Config, error) {
 	}
 	if v := os.Getenv("NARRAFORK_EXECUTOR_ALLOW_ROOTS"); v != "" {
 		cfg.AllowRoots = splitCsv(v)
+	}
+	if v := os.Getenv("NARRAFORK_EXECUTOR_PATH_RULES"); v != "" {
+		rules := make([]PathRule, 0, 4)
+		for _, part := range splitCsv(v) {
+			rule, err := parsePathRule(part)
+			if err != nil {
+				return nil, fmt.Errorf("NARRAFORK_EXECUTOR_PATH_RULES: %w", err)
+			}
+			rules = append(rules, rule)
+		}
+		cfg.PathRules = rules
 	}
 	if v := os.Getenv("NARRAFORK_EXECUTOR_LISTEN"); v != "" {
 		cfg.ListenAddr = v
@@ -174,6 +207,9 @@ func Load() (*Config, error) {
 	}
 	if *allowRoots != "" {
 		cfg.AllowRoots = splitCsv(*allowRoots)
+	}
+	if len(pathRuleFlags) > 0 {
+		cfg.PathRules = pathRuleFlags
 	}
 	if *defaultCwd != "" {
 		cfg.DefaultCwd = *defaultCwd
@@ -400,10 +436,58 @@ func (c *Config) IsListenLoopback() bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// EffectivePathRules returns the ordered rule list the path guard should enforce.
+// AllowRoots is translated to one allow rule per root so a pre-rules install keeps
+// its exact previous behavior. An empty result means unrestricted.
+func (c *Config) EffectivePathRules() []PathRule {
+	if len(c.PathRules) > 0 {
+		return c.PathRules
+	}
+	rules := make([]PathRule, 0, len(c.AllowRoots))
+	for _, root := range c.AllowRoots {
+		rules = append(rules, PathRule{Action: "allow", Path: root})
+	}
+	return rules
+}
+
+// validatePathRules normalizes every rule and refuses ambiguous configurations.
+func (c *Config) validatePathRules() error {
+	if len(c.PathRules) > 0 && len(c.AllowRoots) > 0 {
+		return fmt.Errorf(
+			"allowRoots and pathRules are mutually exclusive: keep pathRules and remove allowRoots",
+		)
+	}
+	if len(c.PathRules) > maxPathRules {
+		return fmt.Errorf("pathRules has %d entries; the maximum is %d", len(c.PathRules), maxPathRules)
+	}
+	normalized := make([]PathRule, 0, len(c.PathRules))
+	for i, rule := range c.PathRules {
+		valid, err := normalizePathRule(rule)
+		if err != nil {
+			return fmt.Errorf("pathRules[%d]: %w", i, err)
+		}
+		normalized = append(normalized, valid)
+	}
+	c.PathRules = normalized
+
+	for i, root := range c.AllowRoots {
+		if strings.ContainsRune(root, 0) {
+			return fmt.Errorf("allowRoots[%d] contains a NUL byte", i)
+		}
+		if !isAbsolutePathRule(strings.TrimSpace(root)) {
+			return fmt.Errorf("allowRoots[%d] %q must be an absolute path", i, root)
+		}
+	}
+	return nil
+}
+
 // Validate enforces mode, credential, address, and TLS invariants. Listener code
 // calls it again so programmatically constructed Config values cannot bypass the
 // same policy enforced by Load.
 func (c *Config) Validate() error {
+	if err := c.validatePathRules(); err != nil {
+		return err
+	}
 	c.ServerURL = strings.TrimSpace(c.ServerURL)
 	c.DeviceRef = strings.TrimSpace(c.DeviceRef)
 	c.ListenAddr = strings.TrimSpace(c.ListenAddr)
@@ -456,6 +540,76 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("--insecure is only meaningful with a wss:// reverse-dial server")
 	}
 	return nil
+}
+
+// pathRuleList collects repeated --path-rule flags while preserving their order,
+// which is the whole point of the ordered rule model.
+type pathRuleList []PathRule
+
+func (l *pathRuleList) String() string {
+	parts := make([]string, 0, len(*l))
+	for _, rule := range *l {
+		parts = append(parts, rule.Action+":"+rule.Path)
+	}
+	return strings.Join(parts, ",")
+}
+
+func (l *pathRuleList) Set(value string) error {
+	rule, err := parsePathRule(value)
+	if err != nil {
+		return err
+	}
+	*l = append(*l, rule)
+	return nil
+}
+
+// parsePathRule accepts "allow:/dir" and "deny:/dir". The action is split on the
+// first colon only, so Windows paths like "deny:C:\secrets" keep their drive letter.
+func parsePathRule(value string) (PathRule, error) {
+	trimmed := strings.TrimSpace(value)
+	action, path, found := strings.Cut(trimmed, ":")
+	if !found {
+		return PathRule{}, fmt.Errorf("path rule %q must be prefixed with allow: or deny:", value)
+	}
+	return normalizePathRule(PathRule{Action: strings.ToLower(strings.TrimSpace(action)), Path: path})
+}
+
+func normalizePathRule(rule PathRule) (PathRule, error) {
+	action := strings.ToLower(strings.TrimSpace(rule.Action))
+	if action != "allow" && action != "deny" {
+		return PathRule{}, fmt.Errorf("path rule action %q must be allow or deny", rule.Action)
+	}
+	path := strings.TrimSpace(rule.Path)
+	if path == "" {
+		return PathRule{}, fmt.Errorf("path rule with action %q has an empty path", action)
+	}
+	if strings.ContainsRune(path, 0) {
+		return PathRule{}, fmt.Errorf("path rule %q contains a NUL byte", path)
+	}
+	if !isAbsolutePathRule(path) {
+		return PathRule{}, fmt.Errorf("path rule %q must be an absolute path", path)
+	}
+	return PathRule{Action: action, Path: path}, nil
+}
+
+// isAbsolutePathRule accepts both POSIX and Windows absolute shapes regardless of
+// the running OS: a config written for one platform should fail validation with a
+// clear message rather than being silently reinterpreted.
+func isAbsolutePathRule(path string) bool {
+	if strings.HasPrefix(path, "/") {
+		return true
+	}
+	if strings.HasPrefix(path, `\\`) {
+		return true
+	}
+	if len(path) >= 3 {
+		drive := path[0]
+		isLetter := (drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z')
+		if isLetter && path[1] == ':' && (path[2] == '\\' || path[2] == '/') {
+			return true
+		}
+	}
+	return false
 }
 
 func splitCsv(v string) []string {

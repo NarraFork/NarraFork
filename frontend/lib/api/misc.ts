@@ -1090,7 +1090,7 @@ export const miscApi = {
 
 	// Storage
 	getCachedStorage: () => request<{ cached: boolean; data?: StorageScanResult }>("/storage/cached"),
-	cleanupStorage: (target: "uploads" | "shares" | "worktrees" | "containers") =>
+	cleanupStorage: (target: "uploads" | "chatAttachments" | "shares" | "worktrees" | "containers") =>
 		request<{
 			ok: boolean;
 			removed?: number;

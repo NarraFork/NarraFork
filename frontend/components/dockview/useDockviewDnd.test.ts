@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { DockviewApi } from "dockview-react";
+import type { PanelDragState } from "../../lib/panel-drag";
 import type { DockviewDropTarget } from "./useDockviewDnd";
-import { dropExistingPanel } from "./useDockviewDnd";
+import { dropExistingPanel, isLocalPanelDrag } from "./useDockviewDnd";
 
 /**
  * Regression coverage for dropExistingPanel — the function that turns a resolved
@@ -177,5 +178,49 @@ describe("dropExistingPanel", () => {
 			targetPanelId: "spec",
 		});
 		expect(moves).toHaveLength(0);
+	});
+});
+
+/**
+ * Which drags a surface may treat as "my own panel being rearranged".
+ *
+ * This guard is what stops a cross-surface drop from moving the WRONG panel.
+ * Panel ids are global (`ndock-terminal`), so once several surfaces coexist — one
+ * per expanded graph node — a surface receiving a foreign panel's drop would
+ * resolve that id against its own api and silently move its own same-kind panel
+ * while the dragged one stayed put.
+ */
+function drag(over: Partial<PanelDragState> = {}): PanelDragState {
+	return { id: "subject", title: "t", x: 0, y: 0, ...over };
+}
+
+describe("isLocalPanelDrag", () => {
+	test("a live panel from the same surface is local", () => {
+		expect(
+			isLocalPanelDrag(drag({ panelId: "ndock-terminal", surfaceId: "chap_1" }), "chap_1"),
+		).toBe(true);
+	});
+
+	test("a live panel from ANOTHER surface is not local (the mis-move guard)", () => {
+		// Node A's terminal dropped onto node B: B must not resolve
+		// "ndock-terminal" against its own api and move its own terminal.
+		expect(
+			isLocalPanelDrag(drag({ panelId: "ndock-terminal", surfaceId: "chap_A" }), "chap_B"),
+		).toBe(false);
+	});
+
+	test("a drag with no panelId is never local (sidebar tab / detached panel)", () => {
+		expect(isLocalPanelDrag(drag({ surfaceId: "chap_1" }), "chap_1")).toBe(false);
+		expect(isLocalPanelDrag(drag({ toolKind: "terminal" }), "chap_1")).toBe(false);
+	});
+
+	test("legacy drags without surfaceId stay local (single-surface behaviour preserved)", () => {
+		// The focus page and the workspace worked before this field existed; a drag
+		// that carries no surfaceId must keep being handled in-surface.
+		expect(isLocalPanelDrag(drag({ panelId: "ndock-spec" }), "chap_1")).toBe(true);
+		expect(isLocalPanelDrag(drag({ panelId: "ndock-spec" }), undefined)).toBe(true);
+		expect(isLocalPanelDrag(drag({ panelId: "ndock-spec", surfaceId: "chap_1" }), undefined)).toBe(
+			true,
+		);
 	});
 });

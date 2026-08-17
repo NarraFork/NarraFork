@@ -183,7 +183,7 @@ describe("LodSwitchToast", () => {
 		await render({ lod: 5, pinned: true, onSelectLod });
 
 		const notches = notchButtons();
-		expect(notches).toHaveLength(6);
+		expect(notches).toHaveLength(5);
 		// The gauge must report the current level so the user can see where they are.
 		expect(notches[4]?.getAttribute("aria-current")).toBe("true");
 		expect(notches[0]?.getAttribute("aria-current")).toBeNull();
@@ -206,7 +206,7 @@ describe("LodSwitchToast", () => {
 	});
 
 	test("steppers are disabled at the ends of the scale", async () => {
-		await render({ lod: 6, pinned: true, onSelectLod: () => {} });
+		await render({ lod: 5, pinned: true, onSelectLod: () => {} });
 		expect(byTestId("lod-step-up")?.hasAttribute("disabled")).toBe(true);
 		expect(byTestId("lod-step-down")?.hasAttribute("disabled")).toBe(false);
 
@@ -224,7 +224,7 @@ describe("LodSwitchToast", () => {
 		await render({ lod: 4, onSelectLod });
 
 		expect(byTestId("lod-indicator")?.getAttribute("data-lod-pinned")).toBe("false");
-		expect(notchButtons()).toHaveLength(6);
+		expect(notchButtons()).toHaveLength(5);
 		expect(byTestId("lod-step-up")).not.toBeNull();
 		expect(byTestId("lod-step-down")).not.toBeNull();
 
