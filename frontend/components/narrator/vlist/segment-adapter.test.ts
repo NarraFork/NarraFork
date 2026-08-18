@@ -742,13 +742,11 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		expect(compacting.status).toBe("compacting");
 	});
 
-	it("merge_summary: reserves avatar; review_feedback: gray", () => {
+	it("merge_summary: reserves avatar", () => {
 		const merge = sysData([{ type: "merge_summary", text: "Merged X into trunk" }]);
 		expect(merge.kind).toBe("merge_summary");
 		expect(merge.hasAvatar).toBe(true);
 		expect(merge.text).toBe("Merged X into trunk");
-		const review = sysData([{ type: "review_feedback", text: "Review done" }]);
-		expect(review.color).toBe("gray");
 	});
 
 	it("bash_command: carries the command as both body text and command field", () => {
@@ -2774,5 +2772,198 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
 		const keyOf = (data: unknown) =>
 			buildCacheKey("m1-b0", "reasoning-steps", 600, 3, undefined, extractDataRevision(data));
 		expect(keyOf(withId)).not.toBe(keyOf(base));
+	});
+});
+
+/**
+ * A concluded review reaches its own element.
+ *
+ * The card went through three shapes before this one, and each failed on the same
+ * property — a review conclusion is a MARKDOWN DOCUMENT with an action:
+ *
+ *   1. `system-simple`: one clamped line, so the findings could not fit (and since the
+ *      producer wrote no display text, nothing was shown at all).
+ *   2. `system-text` nested in an `injection-bubble`: a card inside a bubble, a badge lane
+ *      reserved at a guessed width the real badges did not fill, a body painted line by
+ *      line as PLAIN text (no markdown, no highlighting), and no scroll box.
+ *   3. `review-card` — its own element: a constant header row over a maxHeight-capped
+ *      scroll box holding a real markdown body.
+ *
+ * So these cases pin the routing and the payload, not a nesting arrangement.
+ */
+describe("adaptSegment — a concluded review", () => {
+	const CTX: AdapterContext = { lod: 5 };
+
+	/** The row production writes: role=user (a request) with origin=system (a reviewer). */
+	const conclusionRow = (
+		blocks: Array<{ type: string; [key: string]: unknown }>,
+		ctx: AdapterContext = CTX,
+	) =>
+		adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "rf",
+					role: "user",
+					origin: "system",
+					originLabel: "review",
+					contentJson: blocks,
+				},
+			},
+			ctx,
+		);
+
+	const cardData = (
+		block: Record<string, unknown>,
+		ctx: AdapterContext = CTX,
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+	): any => {
+		const specs = conclusionRow(
+			[
+				{ type: "text", text: "model-facing copy" },
+				{ type: "review_feedback", ...block },
+			],
+			ctx,
+		);
+		return specs[0]?.data;
+	};
+
+	it("routes to `review-card`, not to the origin notice that would claim a system row", () => {
+		const specs = conclusionRow([
+			{ type: "text", text: "## Code Review: Approved\n" },
+			{ type: "review_feedback", verdict: "approve", findings: [], text: "Approved" },
+		]);
+		expect(specs).toHaveLength(1);
+		expect(specs[0]?.kind).toBe("review-card");
+	});
+
+	it("is not framed in a speaker bubble — no card-in-a-card", () => {
+		const specs = conclusionRow([
+			{ type: "review_feedback", verdict: "approve", findings: [], text: "Approved" },
+		]);
+		expect(specs[0]?.kind).not.toBe("injection-bubble");
+		expect(specs[0]?.kind).not.toBe("system-text");
+	});
+
+	it("does not hijack an injection row that merely carries a review block", () => {
+		// `deliverInjection`'s `extraBlocks` can append one to a row whose leading
+		// `system_injection` block owns it.
+		const specs = conclusionRow([
+			{ type: "text", text: "review concluded" },
+			{ type: "system_injection", source: "review" },
+			{ type: "review_feedback", verdict: "approve", findings: [] },
+		]);
+		expect(specs[0]?.kind).not.toBe("review-card");
+	});
+
+	it("carries the producer's markdown as the body, with verdict + action chrome", () => {
+		const data = cardData({
+			verdict: "request_changes",
+			findings: [{ severity: "critical", message: "the index has no migration" }],
+			text: "## Code Review: Changes Requested\n\n- the index has no migration\n",
+		});
+		// The body stays MARKDOWN: the card measures it with the markdown pipeline, so the
+		// heading and the list survive instead of being flattened.
+		expect(data.text).toContain("## Code Review");
+		expect(data.text).toContain("- the index has no migration");
+		expect(data.verdictLabel).toBe("Changes Requested");
+		expect(data.color).toBe("orange");
+		// Always present, so the reserved action row is never empty.
+		expect(data.actionLabel).toBe("Handle");
+		expect(data.applied).toBe(false);
+	});
+
+	it("composes a body from verdict + findings for rows written without text", () => {
+		// The rows already in the database carry only `verdict` and `findings`. Without this
+		// synthesis every historical review keeps rendering as a bare label — the reported
+		// "shows nothing" bug, surviving on old data.
+		const data = cardData({
+			verdict: "request_changes",
+			findings: [
+				{ severity: "critical", file: "server/db/schema.ts", line: 2606, message: "no migration" },
+				{ severity: "minor", message: "cached statement outlives the module" },
+			],
+		});
+		expect(data.text).toContain("Changes Requested");
+		expect(data.text).toContain("server/db/schema.ts:2606");
+		expect(data.text).toContain("no migration");
+		expect(data.text).toContain("cached statement outlives the module");
+		// And it is MARKDOWN, because the card renders its body through the markdown
+		// pipeline: bare `\n`-joined lines fold into one paragraph, which is how a
+		// historical conclusion came out as a single run-on blob.
+		expect(data.text).toContain("## ");
+		expect(data.text).toContain("\n\n");
+		expect(data.text).toContain("- **[critical]**");
+		// The file path is inline code, so it stands out from the prose around it.
+		expect(data.text).toContain("`server/db/schema.ts:2606`");
+	});
+
+	it("a composed body keeps one list item per finding", () => {
+		const data = cardData({
+			verdict: "request_changes",
+			findings: [
+				{ severity: "major", message: "first" },
+				{ severity: "minor", message: "second" },
+				{ severity: "suggestion", message: "third" },
+			],
+		});
+		const items = (data.text as string).split("\n").filter((l: string) => l.startsWith("- "));
+		expect(items).toHaveLength(3);
+	});
+
+	it("an approved review with no findings still says something", () => {
+		const data = cardData({ verdict: "approve", findings: [] });
+		expect(data.text).toBe("Approved");
+		expect(data.color).toBe("green");
+	});
+
+	it("marks a revision and flips the action once a turn has been started", () => {
+		const data = cardData({
+			verdict: "approve",
+			findings: [],
+			text: "## Code Review (revised): Approved\n",
+			revised: true,
+			applied: true,
+		});
+		expect(data.revisedLabel).toBe("Revised");
+		expect(data.applied).toBe(true);
+		expect(data.actionLabel).toBe("Handled");
+	});
+
+	it("uses the injected localized labels", () => {
+		const data = cardData(
+			{ verdict: "approve", findings: [] },
+			{ lod: 5, labels: { reviewVerdict_approve: "已通过", reviewFeedbackApply: "处理" } },
+		);
+		expect(data.text).toBe("已通过");
+		expect(data.verdictLabel).toBe("已通过");
+		expect(data.actionLabel).toBe("处理");
+	});
+
+	it("measures through the registry: the markdown body drives the height", () => {
+		const short = cardData({ verdict: "approve", findings: [], text: "Approved" });
+		const long = cardData({
+			verdict: "request_changes",
+			findings: [],
+			text: Array.from({ length: 12 }, (_, i) => `- finding number ${i} with real prose`).join(
+				"\n",
+			),
+		});
+		const measure = (d: unknown) =>
+			VLIST_REGISTRY["review-card"].measure(d as never, 800, 5).height;
+		expect(measure(short)).toBeGreaterThan(0);
+		expect(measure(long)).toBeGreaterThan(measure(short));
+	});
+
+	it("a very long conclusion is capped, because the body scrolls", () => {
+		// The property no earlier shape had: an unbounded conclusion must not grow the row
+		// without limit — the box is `overflow: auto` and the reader scrolls it.
+		const huge = cardData({
+			verdict: "request_changes",
+			findings: [],
+			text: Array.from({ length: 400 }, (_, i) => `- finding ${i}`).join("\n"),
+		});
+		const height = VLIST_REGISTRY["review-card"].measure(huge as never, 800, 5).height;
+		expect(height).toBeLessThan(600);
 	});
 });

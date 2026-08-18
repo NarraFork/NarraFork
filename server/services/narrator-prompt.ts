@@ -2,6 +2,7 @@ import { stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
+import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
 import { getGlobalPromptCandidates, PROJECT_PROMPT_FILENAMES } from "../lib/global-prompt-paths";
 import { buildPlanFileRelPath, isSafePlanFileIdForPath } from "../lib/plan-file-path";
 import { IS_WINDOWS, isWslAllowed } from "../lib/platform";
@@ -129,17 +130,17 @@ export async function buildEffectiveSystemPrompt(
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
 		const shellInfo = detectShell();
-		const shellLabel = IS_WINDOWS ? "Shell" : "Bash";
-		const toolList = IS_WINDOWS
-			? `All tools (Shell, Read, Write, Edit, Glob, Grep)`
-			: `All tools (Bash, Read, Write, Edit, Glob, Grep)`;
-		let cwdSection = `## Current Working Directory\n\n\`${cwd}\`\n\n${toolList} already use this as their default working directory. Do NOT \`cd\` into it in ${shellLabel} commands — it is redundant.`;
+		// The shell tool is named Bash on every platform (see BASH_TOOL_NAME). These
+		// sections used to say "Shell" whenever IS_WINDOWS, which contradicted the
+		// registered tool name on the common Windows setup (Git Bash) and made the
+		// model alternate between two names, one of which does not exist.
+		let cwdSection = `## Current Working Directory\n\n\`${cwd}\`\n\nAll tools (${BASH_TOOL_NAME}, Read, Write, Edit, Glob, Grep) already use this as their default working directory. Do NOT \`cd\` into it in ${BASH_TOOL_NAME} commands — it is redundant.`;
 
 		// Windows Git Bash: warn about MSYS2 path mangling and forbid cmd builtins
 		if (IS_WINDOWS && shellInfo.loginWrap) {
-			cwdSection += `\n\nCRITICAL — Windows Git Bash Shell Rules:
-- The Shell tool runs commands through Git Bash (MSYS2). MSYS2 automatically converts arguments that look like Unix paths: \`/S\` → \`S:/\`, \`/I\` → \`I:/\`, etc. This BREAKS any Windows cmd command that uses \`/flag\` syntax.
-- NEVER use Windows cmd builtins or utilities in the Shell tool: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`, \`ren\`, \`cls\`, \`more\`, \`sort\`, \`fc\`, \`comp\`, \`xcopy\`, \`robocopy\`, \`attrib\`, \`icacls\`.
+			cwdSection += `\n\nCRITICAL — Windows Git Bash Rules:
+- The ${BASH_TOOL_NAME} tool runs commands through Git Bash (MSYS2). MSYS2 automatically converts arguments that look like Unix paths: \`/S\` → \`S:/\`, \`/I\` → \`I:/\`, etc. This BREAKS any Windows cmd command that uses \`/flag\` syntax.
+- NEVER use Windows cmd builtins or utilities in the ${BASH_TOOL_NAME} tool: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`, \`ren\`, \`cls\`, \`more\`, \`sort\`, \`fc\`, \`comp\`, \`xcopy\`, \`robocopy\`, \`attrib\`, \`icacls\`.
 - Use the dedicated tools instead: Grep (uses ripgrep), Glob, Read, Write, Edit. These work correctly on all platforms.
 - For shell commands, use Unix-style equivalents available in Git Bash: \`ls\`, \`cat\`, \`cp\`, \`mv\`, \`rm\`, \`find\`, \`grep\`, \`mkdir\`, \`touch\`, \`head\`, \`tail\`, \`wc\`.
 - Use \`git\`, \`node\`, \`npm\`, \`bun\`, \`python\` etc. directly — they work fine in Git Bash.`;
@@ -147,8 +148,8 @@ export async function buildEffectiveSystemPrompt(
 
 		// Windows PowerShell guidance
 		if (IS_WINDOWS && shellInfo.type === "powershell") {
-			cwdSection += `\n\nCRITICAL — Windows PowerShell Shell Rules:
-- The Shell tool uses PowerShell on this system. Use PowerShell cmdlets (e.g. Get-ChildItem, Select-String) or common cross-platform commands (e.g. git, node, npm, bun, python).
+			cwdSection += `\n\nCRITICAL — Windows PowerShell Rules:
+- The ${BASH_TOOL_NAME} tool uses PowerShell on this system (the tool name is still ${BASH_TOOL_NAME}). Use PowerShell cmdlets (e.g. Get-ChildItem, Select-String) or common cross-platform commands (e.g. git, node, npm, bun, python).
 - NEVER use Windows cmd builtins: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`. They may behave unexpectedly in PowerShell.
 - Prefer the dedicated tools (Read, Write, Edit, Glob, Grep) over shell commands whenever possible.`;
 		}
@@ -212,7 +213,7 @@ export async function buildEffectiveSystemPrompt(
 			}
 			const deviceSection =
 				`## Execution Devices\n\n` +
-				`File and command tools (Read, Write, Edit, Glob, Grep, ${IS_WINDOWS ? "Shell" : "Bash"}) ` +
+				`File and command tools (Read, Write, Edit, Glob, Grep, ${BASH_TOOL_NAME}) ` +
 				`run only on their selected execution target.\n\n` +
 				`Current default execution target: **${currentTarget}**.${unavailableWarning}\n\n` +
 				`${availabilityText}\n\n` +

@@ -231,6 +231,8 @@
 	"dropFilesHere": "Drop files here",
 	"textFileTooLarge": "Text file too large (max 100MB)",
 	"unsupportedFileType": "Unsupported file type",
+	"draftAttachmentsRestoreFailedTitle": "Some attachments could not be restored",
+	"draftAttachmentsRestoreFailed": "{{count}} pending attachment(s) were lost and need to be attached again.",
 	"loadOlderMessages": "Load older messages",
 	"loadOlderCalls": "Load earlier tool calls",
 	"jumpTargetUnavailable": "That message is no longer in this conversation's history.",
@@ -812,6 +814,8 @@
 	"fileViewer.expandAll": "Expand all",
 	"fileViewer.collapseAll": "Collapse all",
 	"fileViewer.reload": "Reload",
+	"fileViewer.download": "Download",
+	"fileViewer.downloadFailed": "Download failed",
 	"fileViewer.parseFailed": "Could not parse as {{format}}; showing raw text.",
 	"fileViewer.truncated": "Showing the first {{chars}} characters — the file is longer.",
 	"fileViewer.nodesTruncated": "[Node tree truncated to keep the UI responsive.]",
@@ -906,6 +910,11 @@
 	"reviewVerdict_approve": "Approved",
 	"reviewVerdict_request_changes": "Changes Requested",
 	"reviewVerdict_comment_only": "Comments Only",
+	"reviewFeedbackRevisedBadge": "Revised",
+	"reviewFeedbackApply": "Handle",
+	"reviewFeedbackApplied": "Handled",
+	"reviewFeedbackApplyFailed": "Could not start a turn for the review conclusion",
+	"reviewFeedbackTruncated": "preview truncated",
 	"chromeNotInstalled": "Chrome/Chromium is not installed. Please install Chrome, or run: bunx puppeteer browsers install chrome",
 	"chromeFlatpakUnsupported": "Flatpak-installed Chrome cannot be used directly. Please install Chrome natively (deb/rpm), or run: bunx puppeteer browsers install chrome",
 	"details.title": "Session details",
@@ -1103,7 +1112,8 @@
 			"spec_blocked_continuation": "Blocked continuation",
 			"spec_goal_added": "Goal added",
 			"spec_fork_carryover": "Outline carried over",
-			"spec_context_cleared": "Context cleared"
+			"spec_context_cleared": "Context cleared",
+			"review_feedback": "Code review"
 		},
 		"cadence": {
 			"everyNTools": "every {{n}} tool calls"

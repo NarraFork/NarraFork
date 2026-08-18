@@ -43,6 +43,7 @@
 	"removeAttachment": "移除",
 	"downloadAttachment": "下载",
 	"attachmentUploadFailed": "上传失败",
+	"attachmentNoLongerAvailable": "附件已在服务器过期，请重新添加",
 	"attachmentPreviewFailed": "无法预览",
 	"attachmentLimitTitle": "附件过多",
 	"attachmentLimit": "每条消息最多 {{count}} 个附件",

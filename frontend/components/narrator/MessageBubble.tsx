@@ -1817,10 +1817,13 @@ function TextFileBlock({
 			<ThemeIcon size="sm" variant="light" color="gray">
 				<IconFile size={14} />
 			</ThemeIcon>
-			<Text size="sm" fw={500}>
+			<Text size="sm" fw={500} style={{ minWidth: 0 }}>
 				{block.filename}
 			</Text>
-			<Text size="xs" c="dimmed">
+			{/* The size must absorb none of the squeeze: with the default shrink a long
+			    filename compresses this box until "(1.5 KB)" wraps mid-value. Shrink is
+			    pushed entirely onto the filename, which wraps readably instead. */}
+			<Text size="xs" c="dimmed" style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
 				({formatFileSize(block.size)})
 			</Text>
 			{filePath && onOpen ? <IconExternalLink size={12} opacity={0.6} /> : null}

@@ -125,7 +125,8 @@ export interface MeasureInjectionBubbleInput {
 	 *
 	 * Why a nested element rather than flattening the card into text: these producers
 	 * already own structured, interactive UI — `merge_summary` has branch names and a
-	 * commit sha, `review_feedback` has a findings list, `spec_goal_added` has badges.
+	 * commit sha, `review_feedback` has a findings list and an action, `spec_goal_added`
+	 * has badges.
 	 * Projecting them to markdown would reduce that to prose and lose the affordances.
 	 * So the bubble becomes a FRAME around the card that already exists.
 	 *
@@ -204,9 +205,9 @@ function measureInnerCard(
 /** Inner kinds measured by `measure-system-simple` (fixed-height cards). */
 const SYSTEM_SIMPLE_KINDS = new Set([
 	"merge_summary",
-	"review_feedback",
 	// spec_continuation / spec_blocked_continuation are intercepted above as
 	// "spec-task" — the bubble draws the row itself rather than nesting this card.
+	// review_feedback is no longer framed at all: it is its own `review-card` element.
 ]);
 
 /** Inner kinds measured by `measure-system-text` (wrapping-body cards). */

@@ -26,6 +26,43 @@
 export const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 /**
+ * The shell tool is named `Bash` on every platform and shell flavour.
+ *
+ * It used to be renamed to `Shell` whenever `detectShell()` did not resolve to
+ * bash, which produced a defect with no error signal on Windows: the registered
+ * tool was `Bash` (Git Bash detected) while several prompt sections were built
+ * from `IS_WINDOWS` and told the model the tool was called `Shell`. The model
+ * then alternated between the two names, and every `Shell` call came back as
+ * `Unknown tool` — visible in the transcript only as a 0s failed tool card
+ * followed by reasoning about which name to use.
+ *
+ * A single name also keeps the wire name aligned with what every provider's
+ * training data expects, and keeps `TOOL_FIELD_CONFIG` (keyed by `"Bash"`)
+ * effective, which the `Shell` alias silently bypassed.
+ */
+export const BASH_TOOL_NAME = "Bash";
+
+/**
+ * Names that used to be minted for the shell tool. Stored history from older
+ * Windows installs still carries them, and a model that read such history may
+ * echo the old name, so they resolve to `Bash` instead of failing.
+ */
+const LEGACY_BASH_TOOL_NAMES = new Set(["Shell"]);
+
+/** True for the shell tool under its canonical name or any legacy alias. */
+export function isBashToolName(name: string): boolean {
+	return name === BASH_TOOL_NAME || LEGACY_BASH_TOOL_NAMES.has(name);
+}
+
+/**
+ * Map a legacy tool name onto its canonical name. Unknown names pass through
+ * untouched — this is an alias table, not a validator.
+ */
+export function canonicalizeToolName(name: string): string {
+	return LEGACY_BASH_TOOL_NAMES.has(name) ? BASH_TOOL_NAME : name;
+}
+
+/**
  * Upper bound on a wire tool name. OpenAI documents 64 for function names;
  * Anthropic allows 128. We keep the stricter limit so a name is valid for every
  * provider a session can switch to mid-run.

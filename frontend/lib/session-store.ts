@@ -58,6 +58,7 @@
 export type SessionNamespace =
 	| "narrator-draft"
 	| "narrator-history"
+	| "chat-draft"
 	| "permission-draft"
 	| "ask-draft"
 	| "ui-flag";
@@ -84,6 +85,10 @@ const TOTAL_BUDGET_CHARS = 1_500_000;
 const NAMESPACE_KEY_CAPS: Record<SessionNamespace, number> = {
 	"narrator-draft": 8,
 	"narrator-history": 8,
+	// One entry per `(user, room)` whose composer holds unsent text or attachment
+	// ids. Bounded like the narrator caps and for the same reason: a tab that
+	// visits many rooms must keep a working set, not a visit history.
+	"chat-draft": 12,
 	"permission-draft": 24,
 	"ask-draft": 24,
 	"ui-flag": 16,

@@ -859,6 +859,24 @@ export interface MeasuredToolDetailSection {
 	/** True when this section's body is markdown (plans / skills / knowledge). */
 	markdown: boolean;
 	/**
+	 * The width the body's LINE BREAKING actually used.
+	 *
+	 * NOT the section's available width, and that difference is the whole reason
+	 * this field exists: a markdown body lives inside a padded scroll box, so
+	 * `measureMarkdownDetail` wraps it at `availableWidth - DETAIL_BOX_CHROME_X`
+	 * while every other body kind is measured at the full `availableWidth`.
+	 *
+	 * The render layer MUST paint the markdown host at this width rather than
+	 * re-deriving one. Handing it `availableWidth` was wrong in both directions at
+	 * once: the host came out `DETAIL_BOX_CHROME_X` px wider than the box's own
+	 * content area, so EVERY markdown body grew a horizontal scrollbar with nothing
+	 * to scroll to — and on a one-line body (a failed search, a short error) that
+	 * bar covered essentially the whole 24px box. It also made `RenderMarkdown`
+	 * re-wrap the text at a wider width than the height was predicted from, which
+	 * is the drift CONTRACT §0 iron law 2 forbids.
+	 */
+	bodyContentWidth: number;
+	/**
 	 * The section body's RAW source text, carried for the fullscreen viewer only.
 	 *
 	 * Height-neutral by construction: a markdown body's geometry comes from
@@ -1767,6 +1785,10 @@ function measureSectionsDetail(
 			bodyContentHeight: Math.max(0, body.frame.contentHeight - DETAIL_TOP_MARGIN),
 			appliedCap: body.appliedCap,
 			markdown: body.markdown === true,
+			// The width the body was actually wrapped at (see the field's doc). For a
+			// markdown body this is narrower than `innerWidth` by the scroll box's
+			// padding; every other kind reports `innerWidth` unchanged.
+			bodyContentWidth: body.contentWidth,
 			// Forward the markdown body's raw source (see MeasuredToolDetailSection).
 			// Copying one string into the section descriptor cannot move `y`.
 			...(body.sourceText === undefined ? {} : { sourceText: body.sourceText }),

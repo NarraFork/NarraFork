@@ -2,6 +2,7 @@ import { statusRegistry } from "@frontend/lib/status-registry";
 import {
 	ActionIcon,
 	Badge,
+	Box,
 	Button,
 	Group,
 	Loader,
@@ -212,148 +213,164 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	}
 
 	return (
-		<ScrollArea.Autosize mah={300}>
-			<Stack gap="xs">
-				{/*
-				 * Stated once for the whole list rather than per row: the shortfall is a
-				 * property of the query window, not of any one file, and a missing badge on
-				 * its own would read as "nobody wrote this".
-				 */}
-				{attributionTruncated && (
-					<Text size="xs" c="dimmed">
-						{t("attributionWindowTruncated")}
-					</Text>
-				)}
+		<Box style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+			{/*
+			 * Only the file list scrolls. The commit box lives outside it so it stays
+			 * reachable no matter how many files changed — inside the scroller it sat
+			 * below hundreds of rows and looked missing.
+			 */}
+			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
+				<Stack gap="xs" pb="xs">
+					{/*
+					 * Stated once for the whole list rather than per row: the shortfall is a
+					 * property of the query window, not of any one file, and a missing badge on
+					 * its own would read as "nobody wrote this".
+					 */}
+					{attributionTruncated && (
+						<Text size="xs" c="dimmed">
+							{t("attributionWindowTruncated")}
+						</Text>
+					)}
 
-				{/* Staged section */}
-				{stagedFiles.length > 0 && (
-					<Stack gap={4}>
-						<Group gap="xs" justify="space-between">
-							<Text size="xs" fw={600}>
-								{t("staged")} ({status.staged})
-							</Text>
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								onClick={() => unstage.mutate({ all: true })}
-								loading={unstage.isPending}
-							>
-								{t("unstageAll")}
-							</Button>
-						</Group>
-						<TreeNodes
-							nodes={stagedTree}
-							depth={0}
-							ctx={{
-								keyPrefix: "s",
-								action: "unstage",
-								section: "staged",
-								expandedFolders: stagedFolders.expanded,
-								onToggle: stagedFolders.toggle,
-								onAction: (files) => unstage.mutate({ files }),
-								onOpenFile: (path) => {
-									setDiffFile(path);
-									setDiffStaged(true);
-								},
-								attrByPath,
-								t,
-							}}
-						/>
-						{hiddenStaged > 0 && (
-							<Text size="xs" c="dimmed" ta="center">
-								+{hiddenStaged} more
-							</Text>
-						)}
-					</Stack>
-				)}
-
-				{/* Unstaged / untracked section */}
-				{unstagedFiles.length > 0 && (
-					<Stack gap={4}>
-						<Group gap="xs" justify="space-between">
-							<Text size="xs" fw={600}>
-								{t("unstaged")} ({status.unstaged + status.untracked})
-							</Text>
-							<Group gap={4}>
+					{/* Staged section */}
+					{stagedFiles.length > 0 && (
+						<Stack gap={4}>
+							<Group gap="xs" justify="space-between">
+								<Text size="xs" fw={600}>
+									{t("staged")} ({status.staged})
+								</Text>
 								<Button
 									size="compact-xs"
 									variant="subtle"
-									onClick={() => stage.mutate({ all: true })}
-									loading={stage.isPending}
+									onClick={() => unstage.mutate({ all: true })}
+									loading={unstage.isPending}
 								>
-									{t("stageAll")}
-								</Button>
-								<Button
-									size="compact-xs"
-									variant="subtle"
-									color="red"
-									onClick={handleDiscardAll}
-									loading={discard.isPending}
-								>
-									{t("discardAll")}
+									{t("unstageAll")}
 								</Button>
 							</Group>
-						</Group>
-						<TreeNodes
-							nodes={unstagedTree}
-							depth={0}
-							ctx={{
-								keyPrefix: "u",
-								action: "stage",
-								section: "unstaged",
-								expandedFolders: unstagedFolders.expanded,
-								onToggle: unstagedFolders.toggle,
-								onAction: (files) => stage.mutate({ files }),
-								onOpenFile: (path) => {
-									setDiffFile(path);
-									setDiffStaged(false);
-								},
-								attrByPath,
-								t,
-							}}
-						/>
-						{(hiddenUnstaged > 0 || serverCapped) && (
-							<Text size="xs" c="dimmed" ta="center">
-								+{serverCapped ? totalFiles - status.files.length : hiddenUnstaged} more
-							</Text>
-						)}
-					</Stack>
-				)}
+							<TreeNodes
+								nodes={stagedTree}
+								depth={0}
+								ctx={{
+									keyPrefix: "s",
+									action: "unstage",
+									section: "staged",
+									expandedFolders: stagedFolders.expanded,
+									onToggle: stagedFolders.toggle,
+									onAction: (files) => unstage.mutate({ files }),
+									onOpenFile: (path) => {
+										setDiffFile(path);
+										setDiffStaged(true);
+									},
+									attrByPath,
+									t,
+								}}
+							/>
+							{hiddenStaged > 0 && (
+								<Text size="xs" c="dimmed" ta="center">
+									+{hiddenStaged} more
+								</Text>
+							)}
+						</Stack>
+					)}
 
-				{/* Commit area */}
-				<Group gap="xs" align="flex-end" wrap="nowrap">
-					<TextInput
-						placeholder={t("commitMessage")}
-						value={message}
-						onChange={(e) => setMessage(e.currentTarget.value)}
-						onKeyDown={(e) => {
-							if (e.key === "Enter" && !e.shiftKey) handleCommit();
-						}}
-						size="xs"
-						style={{ flex: 1 }}
-					/>
-					<Tooltip label={t("aiGenerate")}>
-						<ActionIcon
-							aria-label={t("aiGenerate")}
-							variant="subtle"
-							size="sm"
-							onClick={handleAiGenerate}
-							loading={aiMsg.isPending}
-						>
-							<IconSparkles size={14} />
-						</ActionIcon>
-					</Tooltip>
-					<Button
-						size="compact-xs"
-						leftSection={<IconCheck size={14} />}
-						onClick={handleCommit}
-						loading={commit.isPending}
-						disabled={!message.trim() || status.staged === 0}
+					{/* Unstaged / untracked section */}
+					{unstagedFiles.length > 0 && (
+						<Stack gap={4}>
+							<Group gap="xs" justify="space-between">
+								<Text size="xs" fw={600}>
+									{t("unstaged")} ({status.unstaged + status.untracked})
+								</Text>
+								<Group gap={4}>
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										onClick={() => stage.mutate({ all: true })}
+										loading={stage.isPending}
+									>
+										{t("stageAll")}
+									</Button>
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										color="red"
+										onClick={handleDiscardAll}
+										loading={discard.isPending}
+									>
+										{t("discardAll")}
+									</Button>
+								</Group>
+							</Group>
+							<TreeNodes
+								nodes={unstagedTree}
+								depth={0}
+								ctx={{
+									keyPrefix: "u",
+									action: "stage",
+									section: "unstaged",
+									expandedFolders: unstagedFolders.expanded,
+									onToggle: unstagedFolders.toggle,
+									onAction: (files) => stage.mutate({ files }),
+									onOpenFile: (path) => {
+										setDiffFile(path);
+										setDiffStaged(false);
+									},
+									attrByPath,
+									t,
+								}}
+							/>
+							{(hiddenUnstaged > 0 || serverCapped) && (
+								<Text size="xs" c="dimmed" ta="center">
+									+{serverCapped ? totalFiles - status.files.length : hiddenUnstaged} more
+								</Text>
+							)}
+						</Stack>
+					)}
+				</Stack>
+			</ScrollArea>
+
+			{/* Commit area — pinned below the scroller. */}
+			<Group
+				gap="xs"
+				align="flex-end"
+				wrap="nowrap"
+				pt="xs"
+				style={{
+					flexShrink: 0,
+					borderTop: "1px solid var(--mantine-color-default-border)",
+				}}
+			>
+				<TextInput
+					placeholder={t("commitMessage")}
+					value={message}
+					onChange={(e) => setMessage(e.currentTarget.value)}
+					onKeyDown={(e) => {
+						if (e.key === "Enter" && !e.shiftKey) handleCommit();
+					}}
+					size="xs"
+					style={{ flex: 1 }}
+				/>
+				<Tooltip label={t("aiGenerate")}>
+					<ActionIcon
+						aria-label={t("aiGenerate")}
+						variant="subtle"
+						size="sm"
+						onClick={handleAiGenerate}
+						loading={aiMsg.isPending}
 					>
-						{t("commitButton")}
-					</Button>
-				</Group>
-			</Stack>
+						<IconSparkles size={14} />
+					</ActionIcon>
+				</Tooltip>
+				<Button
+					size="compact-xs"
+					leftSection={<IconCheck size={14} />}
+					onClick={handleCommit}
+					loading={commit.isPending}
+					disabled={!message.trim() || status.staged === 0}
+				>
+					{t("commitButton")}
+				</Button>
+			</Group>
 
 			<GitFileDiff
 				chapterId={chapterId}
@@ -361,7 +378,7 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 				staged={diffStaged}
 				onClose={() => setDiffFile(null)}
 			/>
-		</ScrollArea.Autosize>
+		</Box>
 	);
 }
 

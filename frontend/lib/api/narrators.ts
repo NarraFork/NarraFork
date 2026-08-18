@@ -1268,6 +1268,21 @@ export const narratorsApi = {
 				method: "DELETE",
 			},
 		),
+	/**
+	 * Start a turn for a review conclusion the narrator already holds.
+	 *
+	 * Writes no message: the conclusion row IS the user message and has been in the
+	 * history since the review concluded. `started: false` is a normal outcome (the
+	 * narrator is busy, or the row was already handled), not an error — either way the
+	 * findings are in the history the next request rebuilds.
+	 */
+	applyReviewFeedback: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean; started: boolean; reason: string }>(
+			`/narrators/${narratorId}/review-feedback/${messageId}/apply`,
+			{
+				method: "POST",
+			},
+		),
 	dismissCwdRecoveryMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean; deletedMessageIds: string[] }>(
 			`/narrators/${narratorId}/cwd-recovery-messages/${messageId}`,

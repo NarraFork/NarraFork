@@ -672,10 +672,13 @@ const SYSTEM_SIMPLE_SUBTYPES = new Set([
 	"compact",
 	"segment_compact",
 	"merge_summary",
-	"review_feedback",
 	// spec_continuation / spec_blocked_continuation are NOT here: FRAMED_SPEC_TASK_CARDS
 	// intercepts them first and the bubble draws the task row itself. Listing them here
 	// would route them to the clamped single-line card the redesign removed.
+	// review_feedback is NOT here either, nor in SYSTEM_TEXT_SUBTYPES: a conclusion is a
+	// markdown DOCUMENT with an action, so it gets its own `review-card` element (a header
+	// over a capped scroll box). A clamped line could not show the findings and a
+	// plain-text card could not render them.
 ]);
 const SYSTEM_TEXT_SUBTYPES = new Set([
 	"info",
@@ -994,6 +997,20 @@ function adaptMessage(
 		if (systemCardBlock) {
 			return [adaptSystemBlock(systemCardBlock.type, systemCardBlock, idBase, msg, ctx)];
 		}
+		// A concluded review. The row is `role: "user"` because the findings ARE a request
+		// the model must answer, and it carries both projections of one conclusion: a `text`
+		// block for the model and a `review_feedback` block for the reader.
+		//
+		// Matched BEFORE the origin check below, which would otherwise win (the row is
+		// `origin: "system"`) and flatten the verdict, the findings and the action button
+		// into a plain notice. Gated on the absence of `system_injection` so it cannot hijack
+		// an injection row that merely carries a review card as an extra block; that row is
+		// owned by its leading injection block.
+		const reviewBlockIndex = blocks.findIndex((b) => b.type === "review_feedback");
+		if (reviewBlockIndex >= 0 && !blocks.some((b) => b.type === "system_injection")) {
+			const reviewBlock = blocks[reviewBlockIndex];
+			if (reviewBlock) return [adaptReviewCard(reviewBlock, idBase, reviewBlockIndex, ctx)];
+		}
 		// Turns stored as role=user for protocol/scheduling reasons that no human
 		// wrote (auto-continuation, review kickoff, AI-initiated sends). Painting
 		// them as user bubbles is what made authorship ambiguous, so they get the
@@ -1282,6 +1299,15 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	specResetTasks: "Reset",
 	mergeSummaryLabel: "Merge",
 	reviewFeedbackLabel: "Review",
+	// The review card's verdict badge, revision marker and action row. All MEASURED:
+	// the badges reserve horizontal room the body wraps around, and the button occupies
+	// its own row.
+	reviewVerdict_approve: "Approved",
+	reviewVerdict_request_changes: "Changes Requested",
+	reviewVerdict_comment_only: "Comments Only",
+	reviewFeedbackRevisedBadge: "Revised",
+	reviewFeedbackApply: "Handle",
+	reviewFeedbackApplied: "Handled",
 	// Message-origin attribution (see @shared/message-origin). The heading row of
 	// an origin_notice card, and the name shown on a user bubble whose author is
 	// not a NarraFork account.
@@ -1518,6 +1544,112 @@ function carryoverDescription(ctx: AdapterContext, block: AdapterContentBlock): 
 }
 
 /**
+ * A concluded review, as its own card.
+ *
+ * Deliberately NOT a framed bubble and NOT a `system-text` notice. The content is a
+ * markdown document — verdict, then findings with file paths, inline code and fenced
+ * snippets, sometimes several screens of it — so it needs a real markdown body inside a
+ * scroll box, which is what `review-card` measures (see measure-review-card.ts for what
+ * the earlier two shapes each failed to express).
+ *
+ * Everything here is height-relevant only through `text`: the badges and the action label
+ * sit in a header row whose height is a constant.
+ */
+function adaptReviewCard(
+	block: AdapterContentBlock,
+	idBase: string,
+	blockIndex: number,
+	ctx: AdapterContext,
+): ElementSpec {
+	const verdict = reviewVerdict(block);
+	const applied = block.applied === true;
+	return {
+		kind: "review-card",
+		// `-b{blockIndex}` ties the row to its content block, so the selection system can
+		// address it for the context menu (delete / rollback / fork).
+		key: `${idBase}-b${blockIndex}-review`,
+		data: {
+			text: composeReviewFeedbackText(block, ctx),
+			verdictLabel: sysLabel(ctx, `reviewVerdict_${verdict}`),
+			color: REVIEW_VERDICT_COLORS[verdict] ?? "gray",
+			...(block.revised === true
+				? { revisedLabel: sysLabel(ctx, "reviewFeedbackRevisedBadge") }
+				: {}),
+			// Always present, so the reserved action row is never empty; `applied` only
+			// changes the wording and disables it.
+			actionLabel: sysLabel(ctx, applied ? "reviewFeedbackApplied" : "reviewFeedbackApply"),
+			applied,
+		},
+	};
+}
+
+/** Verdict → Mantine colour for the review card's badge and tint. */
+const REVIEW_VERDICT_COLORS: Record<string, string> = {
+	approve: "green",
+	request_changes: "orange",
+	comment_only: "blue",
+};
+
+/** The block's verdict, defaulting to the least presumptuous of the three. */
+function reviewVerdict(block: AdapterContentBlock): string {
+	const verdict = typeof block.verdict === "string" ? block.verdict : "";
+	return verdict in REVIEW_VERDICT_COLORS ? verdict : "comment_only";
+}
+
+/**
+ * The review card's body.
+ *
+ * `text` is what the producer writes today, and it wins — it is the same copy the model
+ * received, so the card and the conversation agree.
+ *
+ * The synthesis path exists for rows written BEFORE that field did. Those blocks hold
+ * only `verdict` and `findings`, and the card used to fall back to the bare label
+ * ("Code Review") — which is why a concluded review appeared to have said nothing at
+ * all. Composing from the structured fields recovers those rows without a migration.
+ *
+ * The two wordings are deliberately NOT held identical: the producer's copy is
+ * model-facing (emoji, `**bold**`), while this one is built from the reader's injected
+ * i18n labels and therefore follows their language. Sharing one wording would mean
+ * copying the reader-facing strings into the server and freezing them at write time —
+ * the exact coupling `docs/INJECTION.md` §3.1 exists to avoid.
+ *
+ * ## The composed form is MARKDOWN
+ *
+ * It has to be, because the card renders its body through the markdown pipeline. An
+ * earlier version joined bare lines with `\n`, which markdown folds into ONE paragraph —
+ * so a historical conclusion with four findings came out as a single run-on blob with the
+ * severities buried mid-sentence. The verdict becomes a heading and each finding a list
+ * item, which is the same structure the server's own copy uses.
+ */
+function composeReviewFeedbackText(block: AdapterContentBlock, ctx: AdapterContext): string {
+	const provided = typeof block.text === "string" ? block.text.trim() : "";
+	if (provided) return provided;
+
+	const verdictLabel = sysLabel(ctx, `reviewVerdict_${reviewVerdict(block)}`);
+	const items: string[] = [];
+	const findings = Array.isArray(block.findings) ? block.findings : [];
+	for (const finding of findings) {
+		if (!finding || typeof finding !== "object") continue;
+		const entry = finding as Record<string, unknown>;
+		const message = typeof entry.message === "string" ? entry.message.trim() : "";
+		if (!message) continue;
+		const severity = typeof entry.severity === "string" ? entry.severity : "";
+		const file = typeof entry.file === "string" ? entry.file : "";
+		const line = typeof entry.line === "number" ? `:${entry.line}` : "";
+		// The location is code, so it is fenced inline rather than left as bare prose —
+		// a path with dots and slashes is far easier to pick out that way.
+		const location = file ? `\`${file}${line}\` — ` : "";
+		items.push(`- ${severity ? `**[${severity}]** ` : ""}${location}${message}`);
+	}
+	// A verdict with no findings is a complete statement ("approved"), so it stands alone
+	// as a plain line rather than an empty-looking heading.
+	if (items.length === 0) return verdictLabel;
+	// A blank line after the heading: without it the first list item is absorbed into the
+	// heading's paragraph.
+	return [`## ${verdictLabel}`, "", ...items].join("\n");
+}
+
+/**
  * Compose the compact / segment_compact indicator line by status, mirroring
  * MessageBubble's CompactIndicator / SegmentCompactIndicator — which ALWAYS
  * synthesize the label from status (never from block.text/summary). The compact
@@ -1689,22 +1821,16 @@ function adaptFramedSystemCard(
 /**
  * The chapter a framed system card refers to, when it names one.
  *
- * `review_feedback` carries `reviewChapterId` (the chapter that produced the review)
- * and `merge_summary` carries `sourceChapterId` (the chapter that was merged in) —
- * both written by their producers today, so neither needs a new field.
+ * `merge_summary` carries `sourceChapterId` (the chapter that was merged in), written by
+ * its producer today, so it needs no new field.
  *
- * Returns null when the id is absent, which is the shape of rows written before those
- * producers recorded it. An inert header is the correct outcome there; a link built on
- * a missing id would 404.
+ * Returns null when the id is absent, which is the shape of rows written before that
+ * producer recorded it. An inert header is the correct outcome there; a link built on a
+ * missing id would 404.
  */
 function framedCardTarget(kind: string, block: AdapterContentBlock): InjectionTarget | null {
 	const raw = block as unknown as Record<string, unknown>;
-	const id =
-		kind === "review_feedback"
-			? raw.reviewChapterId
-			: kind === "merge_summary"
-				? raw.sourceChapterId
-				: undefined;
+	const id = kind === "merge_summary" ? raw.sourceChapterId : undefined;
 	return typeof id === "string" && id.trim().length > 0 ? { kind: "chapter", chapterId: id } : null;
 }
 
@@ -1732,7 +1858,9 @@ function innerPayloadKind(inner: ElementSpec): string {
  */
 const FRAMED_SYSTEM_CARDS = new Set([
 	"merge_summary",
-	"review_feedback",
+	// `review_feedback` was here and is not any more: framing it produced a card inside a
+	// bubble — two frames around one body — while the body itself still could not render
+	// markdown or scroll. It is its own `review-card` element now.
 	"spec_continuation",
 	"spec_blocked_continuation",
 ]);
@@ -2353,12 +2481,6 @@ function adaptSystemSimpleData(
 				text: block.text ?? block.summary ?? sysLabel(ctx, "mergeSummaryLabel"),
 				color: "indigo",
 				hasAvatar: true,
-			};
-		case "review_feedback":
-			return {
-				kind: "review_feedback",
-				text: block.text ?? block.summary ?? sysLabel(ctx, "reviewFeedbackLabel"),
-				color: "gray",
 			};
 		default:
 			return { kind: blockType, text: block.text ?? block.summary ?? "" };

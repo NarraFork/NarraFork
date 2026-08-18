@@ -35,6 +35,7 @@ import { buildAttachedFilesHint } from "@server/lib/attached-files";
 import {
 	CHAT_ATTACHMENT_TOTAL_BYTES_MAX,
 	CHAT_ATTACHMENTS_PER_MESSAGE_MAX,
+	CHAT_ATTACHMENTS_UNAVAILABLE_CODE,
 	CHAT_DRAFT_ATTACHMENTS_MAX,
 	copyChatAttachmentToWorktree,
 	deleteChatAttachmentFiles,
@@ -569,7 +570,12 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		// Deliberately one message for every failure mode (unknown id, another room's
 		// attachment, someone else's draft, already claimed). Distinguishing them
 		// would confirm the existence of attachments the caller has no claim to.
-		throw new ValidationError("One or more attachments are unavailable");
+		// The CODE is specific even though the message is not: the composer needs to
+		// mark its chips as failed, which it cannot do by matching English prose.
+		throw new ValidationError(
+			"One or more attachments are unavailable",
+			CHAT_ATTACHMENTS_UNAVAILABLE_CODE,
+		);
 	}
 	const attachmentBytes = pendingAttachments.reduce((total, row) => total + row.sizeBytes, 0);
 	if (attachmentBytes > CHAT_ATTACHMENT_TOTAL_BYTES_MAX) {
@@ -646,7 +652,10 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 				.returning({ id: chatAttachments.id })
 				.all();
 			if (claimed_.length !== attachmentIds.length) {
-				throw new ValidationError("One or more attachments are unavailable");
+				throw new ValidationError(
+					"One or more attachments are unavailable",
+					CHAT_ATTACHMENTS_UNAVAILABLE_CODE,
+				);
 			}
 		}
 

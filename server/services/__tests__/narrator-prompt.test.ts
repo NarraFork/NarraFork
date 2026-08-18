@@ -324,3 +324,47 @@ describe("project instructions truncation", () => {
 		}
 	});
 });
+
+describe("narrator prompt shell tool naming", () => {
+	/**
+	 * The CWD section used to build its tool name from `IS_WINDOWS` while the tool
+	 * itself was registered from `detectShell()`. On the common Windows setup (Git
+	 * Bash) that produced a prompt advertising a `Shell` tool while only `Bash`
+	 * existed, and every `Shell` call came back as `Unknown tool` with no error
+	 * anywhere except the transcript. Assert the emitted prompt, since that is what
+	 * the model actually reads.
+	 */
+	test("advertises Bash as the command tool and never a Shell tool", async () => {
+		const { prompt } = await buildEffectiveSystemPrompt({
+			basePrompt: "Base prompt",
+			cwd: `/tmp/narrafork-shell-name-test-${Date.now()}`,
+			locale: "en",
+			replyInUserLanguage: false,
+		});
+
+		expect(prompt).toContain("All tools (Bash, Read, Write, Edit, Glob, Grep)");
+		expect(prompt).toContain("Do NOT `cd` into it in Bash commands");
+		// Catches any reintroduced platform-conditional label, in either wording.
+		expect(prompt).not.toContain("Shell, Read");
+		expect(prompt).not.toContain("Shell tool");
+		expect(prompt).not.toContain("in Shell commands");
+	});
+
+	test("device section names the same command tool as the CWD section", async () => {
+		const { prompt } = await buildEffectiveSystemPrompt({
+			basePrompt: "Base prompt",
+			cwd: `/tmp/narrafork-shell-device-test-${Date.now()}`,
+			locale: "en",
+			replyInUserLanguage: false,
+			devices: [
+				{
+					id: "dev-1",
+					name: "Remote One",
+					online: true,
+				},
+			],
+		});
+
+		expect(prompt).toContain("File and command tools (Read, Write, Edit, Glob, Grep, Bash)");
+	});
+});

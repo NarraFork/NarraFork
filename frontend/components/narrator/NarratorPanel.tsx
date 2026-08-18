@@ -3336,13 +3336,23 @@ export function NarratorPanel({
 			unregister?.();
 		};
 	}, [appendInputRef, dock]);
+	/*
+	 * Pending attachments — images and text files.
+	 *
+	 * Both kinds are persisted, and both share ONE set of bookkeeping refs below
+	 * (`attachmentDraftLocalVersionRef` / `attachmentDraftSaveSeqRef` /
+	 * `attachmentDraftHydratedKeyRef`) because they are stored in a SINGLE
+	 * IndexedDB record per `(user, narrator)`. Two independent version counters
+	 * would race on that one record: whichever kind saved last would write its own
+	 * fresh list beside the other kind's stale one.
+	 */
 	const [attachedImages, setAttachedImages] = useState<File[]>([]);
 	const openImageViewer = useImageViewer();
 	const attachedImagesRef = useRef<File[]>(attachedImages);
 	attachedImagesRef.current = attachedImages;
-	const imageDraftHydratedKeyRef = useRef<string | null>(null);
-	const imageDraftSaveSeqRef = useRef(0);
-	const imageDraftLocalVersionRef = useRef(0);
+	const attachmentDraftHydratedKeyRef = useRef<string | null>(null);
+	const attachmentDraftSaveSeqRef = useRef(0);
+	const attachmentDraftLocalVersionRef = useRef(0);
 	const [attachedTextFiles, setAttachedTextFiles] = useState<File[]>([]);
 	// Mirrors `attachedTextFiles` for the same reason `attachedImagesRef` exists:
 	// callers registered once (the user-chat forward bridge) must read the CURRENT
@@ -3351,104 +3361,161 @@ export function NarratorPanel({
 	attachedTextFilesRef.current = attachedTextFiles;
 	const [isDragging, setIsDragging] = useState(false);
 	const dragCounterRef = useRef(0);
-	const warnDraftImagesPersistenceFailure = useCallback((action: string, err: unknown) => {
+	const warnDraftAttachmentsPersistenceFailure = useCallback((action: string, err: unknown) => {
 		if (import.meta.env.DEV) {
-			console.warn(`[NarratorPanel] Failed to ${action} draft images:`, err);
+			console.warn(`[NarratorPanel] Failed to ${action} draft attachments:`, err);
 		}
 	}, []);
 	const updateAttachedImages = useCallback((next: SetStateAction<File[]>) => {
-		imageDraftLocalVersionRef.current++;
+		attachmentDraftLocalVersionRef.current++;
 		setAttachedImages((prev) => {
 			const resolved = typeof next === "function" ? (next as (prev: File[]) => File[])(prev) : next;
 			attachedImagesRef.current = resolved;
 			return resolved;
 		});
 	}, []);
-	const persistCurrentDraftImages = useCallback(
+	/**
+	 * Text-file counterpart of `updateAttachedImages`.
+	 *
+	 * Every mutation of `attachedTextFiles` must go through this rather than the
+	 * raw setter: it is what bumps the shared local-version counter, without which
+	 * an in-flight hydrate would overwrite a file the user just attached.
+	 */
+	const updateAttachedTextFiles = useCallback((next: SetStateAction<File[]>) => {
+		attachmentDraftLocalVersionRef.current++;
+		setAttachedTextFiles((prev) => {
+			const resolved = typeof next === "function" ? (next as (prev: File[]) => File[])(prev) : next;
+			attachedTextFilesRef.current = resolved;
+			return resolved;
+		});
+	}, []);
+	const persistCurrentDraftAttachments = useCallback(
 		(targetUserId: string, targetNarratorId: string) => {
-			const seq = ++imageDraftSaveSeqRef.current;
+			const seq = ++attachmentDraftSaveSeqRef.current;
 			void saveDraftImageAttachments(
 				targetUserId,
 				targetNarratorId,
 				attachedImagesRef.current,
+				attachedTextFilesRef.current,
 			).catch((err) => {
-				if (seq === imageDraftSaveSeqRef.current) {
-					warnDraftImagesPersistenceFailure("save", err);
+				if (seq === attachmentDraftSaveSeqRef.current) {
+					warnDraftAttachmentsPersistenceFailure("save", err);
 				}
 			});
 		},
-		[warnDraftImagesPersistenceFailure],
+		[warnDraftAttachmentsPersistenceFailure],
 	);
-	const hideAttachedImagesForSend = useCallback(() => {
-		imageDraftLocalVersionRef.current++;
+	/**
+	 * Clear the on-screen attachments for an in-flight send, WITHOUT touching the
+	 * stored draft — a failed send restores them, and the record has to still be
+	 * there for that to mean anything.
+	 */
+	const hideAttachedFilesForSend = useCallback(() => {
+		attachmentDraftLocalVersionRef.current++;
 		attachedImagesRef.current = [];
+		attachedTextFilesRef.current = [];
 		setAttachedImages([]);
+		setAttachedTextFiles([]);
 	}, []);
-	const clearAttachedImagesAndDraft = useCallback(() => {
-		imageDraftLocalVersionRef.current++;
+	const clearAttachedFilesAndDraft = useCallback(() => {
+		attachmentDraftLocalVersionRef.current++;
 		attachedImagesRef.current = [];
+		attachedTextFilesRef.current = [];
 		setAttachedImages([]);
+		setAttachedTextFiles([]);
 		if (!currentUserId) return;
-		const seq = ++imageDraftSaveSeqRef.current;
+		const seq = ++attachmentDraftSaveSeqRef.current;
 		void clearDraftImageAttachments(currentUserId, narratorId).catch((err) => {
-			if (seq === imageDraftSaveSeqRef.current) {
-				warnDraftImagesPersistenceFailure("clear", err);
+			if (seq === attachmentDraftSaveSeqRef.current) {
+				warnDraftAttachmentsPersistenceFailure("clear", err);
 			}
 		});
-	}, [currentUserId, narratorId, warnDraftImagesPersistenceFailure]);
+	}, [currentUserId, narratorId, warnDraftAttachmentsPersistenceFailure]);
 
 	useEffect(() => {
 		let cancelled = false;
-		const localVersionAtRequest = imageDraftLocalVersionRef.current;
+		const localVersionAtRequest = attachmentDraftLocalVersionRef.current;
 		const draftKey = currentUserId ? getDraftImageAttachmentKey(currentUserId, narratorId) : null;
-		imageDraftHydratedKeyRef.current = null;
+		attachmentDraftHydratedKeyRef.current = null;
 		attachedImagesRef.current = [];
+		attachedTextFilesRef.current = [];
 		setAttachedImages([]);
+		setAttachedTextFiles([]);
 		if (!currentUserId || !draftKey) return;
 
 		const persistLocalChanges = () => {
-			if (imageDraftLocalVersionRef.current !== localVersionAtRequest) {
-				persistCurrentDraftImages(currentUserId, narratorId);
+			if (attachmentDraftLocalVersionRef.current !== localVersionAtRequest) {
+				persistCurrentDraftAttachments(currentUserId, narratorId);
 			}
 		};
 
 		void loadDraftImageAttachments(currentUserId, narratorId)
-			.then((files) => {
+			.then((loaded) => {
 				if (cancelled) return;
-				imageDraftHydratedKeyRef.current = draftKey;
-				if (imageDraftLocalVersionRef.current === localVersionAtRequest) {
-					attachedImagesRef.current = files;
-					setAttachedImages(files);
+				attachmentDraftHydratedKeyRef.current = draftKey;
+				if (attachmentDraftLocalVersionRef.current === localVersionAtRequest) {
+					attachedImagesRef.current = loaded.images;
+					attachedTextFilesRef.current = loaded.textFiles;
+					setAttachedImages(loaded.images);
+					setAttachedTextFiles(loaded.textFiles);
+					// An entry that was stored but cannot be rebuilt (blob evicted by the
+					// browser, unreadable record) must be reported: silently restoring
+					// two of three attachments looks like the user misremembered.
+					if (loaded.droppedCount > 0) {
+						notifications.show({
+							color: "yellow",
+							title: t("draftAttachmentsRestoreFailedTitle"),
+							message: t("draftAttachmentsRestoreFailed", { count: loaded.droppedCount }),
+						});
+					}
 				} else {
 					persistLocalChanges();
 				}
 			})
 			.catch((err) => {
 				if (cancelled) return;
-				warnDraftImagesPersistenceFailure("load", err);
-				imageDraftHydratedKeyRef.current = draftKey;
+				warnDraftAttachmentsPersistenceFailure("load", err);
+				attachmentDraftHydratedKeyRef.current = draftKey;
 				persistLocalChanges();
 			});
 
 		return () => {
 			cancelled = true;
 		};
-	}, [currentUserId, narratorId, persistCurrentDraftImages, warnDraftImagesPersistenceFailure]);
+	}, [
+		currentUserId,
+		narratorId,
+		persistCurrentDraftAttachments,
+		warnDraftAttachmentsPersistenceFailure,
+		t,
+	]);
 
 	useEffect(() => {
 		if (
 			!currentUserId ||
 			sendingRef.current ||
-			imageDraftHydratedKeyRef.current !== getDraftImageAttachmentKey(currentUserId, narratorId)
+			attachmentDraftHydratedKeyRef.current !==
+				getDraftImageAttachmentKey(currentUserId, narratorId)
 		)
 			return;
-		const seq = ++imageDraftSaveSeqRef.current;
-		void saveDraftImageAttachments(currentUserId, narratorId, attachedImages).catch((err) => {
-			if (seq === imageDraftSaveSeqRef.current) {
-				warnDraftImagesPersistenceFailure("save", err);
+		const seq = ++attachmentDraftSaveSeqRef.current;
+		void saveDraftImageAttachments(
+			currentUserId,
+			narratorId,
+			attachedImages,
+			attachedTextFiles,
+		).catch((err) => {
+			if (seq === attachmentDraftSaveSeqRef.current) {
+				warnDraftAttachmentsPersistenceFailure("save", err);
 			}
 		});
-	}, [attachedImages, currentUserId, narratorId, warnDraftImagesPersistenceFailure]);
+	}, [
+		attachedImages,
+		attachedTextFiles,
+		currentUserId,
+		narratorId,
+		warnDraftAttachmentsPersistenceFailure,
+	]);
 
 	// --- Scroll state ---
 	const [isAtBottom, setIsAtBottom] = useState(true);
@@ -5897,8 +5964,7 @@ export function NarratorPanel({
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
 		hideInputForSend();
-		hideAttachedImagesForSend();
-		setAttachedTextFiles([]);
+		hideAttachedFilesForSend();
 		try {
 			const result = await api.sendNarratorMessage(
 				narratorId,
@@ -5911,7 +5977,7 @@ export function NarratorPanel({
 			);
 			const buffered = applyBufferedSendResult(result, msg, images.length, priority);
 			commitInputDraftAfterSend();
-			clearAttachedImagesAndDraft();
+			clearAttachedFilesAndDraft();
 			// Whether the message was buffered (202) or the backend fell through
 			// to a direct send (201), scroll so the new content is visible.
 			scrollToBottom(true);
@@ -5920,7 +5986,7 @@ export function NarratorPanel({
 			// Restore input and attachments on error
 			setInput(msg);
 			if (images.length > 0) updateAttachedImages(images);
-			if (textFiles.length > 0) setAttachedTextFiles(textFiles);
+			if (textFiles.length > 0) updateAttachedTextFiles(textFiles);
 			throw err; // Re-throw to let caller handle
 		}
 	};
@@ -5979,8 +6045,7 @@ export function NarratorPanel({
 				const textFiles = [...attachedTextFiles];
 				restoreOnError = { msg, images, textFiles };
 				hideInputForSend();
-				hideAttachedImagesForSend();
-				setAttachedTextFiles([]);
+				hideAttachedFilesForSend();
 
 				const currentCwd =
 					fetchedNarrator?.cwd ?? narrator?.cwd ?? chapterWorktreePath ?? undefined;
@@ -6018,7 +6083,7 @@ export function NarratorPanel({
 				}
 
 				commitInputDraftAfterSend();
-				clearAttachedImagesAndDraft();
+				clearAttachedFilesAndDraft();
 				restoreOnError = null;
 				navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarrator.id } });
 				return;
@@ -6062,11 +6127,10 @@ export function NarratorPanel({
 			// clears the input/attachments up-front for the optimistic bubble.
 			restoreOnError = { msg, images, textFiles };
 			hideInputForSend();
-			hideAttachedImagesForSend();
-			setAttachedTextFiles([]);
+			hideAttachedFilesForSend();
 			await submitMessage(msg, images, textFiles, abortController.signal);
 			commitInputDraftAfterSend();
-			clearAttachedImagesAndDraft();
+			clearAttachedFilesAndDraft();
 			restoreOnError = null;
 		} catch (err) {
 			// Restore the drafted input/attachments so the user doesn't lose their
@@ -6075,7 +6139,7 @@ export function NarratorPanel({
 			if (restoreOnError) {
 				setInput(restoreOnError.msg);
 				if (restoreOnError.images.length > 0) updateAttachedImages(restoreOnError.images);
-				if (restoreOnError.textFiles.length > 0) setAttachedTextFiles(restoreOnError.textFiles);
+				if (restoreOnError.textFiles.length > 0) updateAttachedTextFiles(restoreOnError.textFiles);
 			}
 			// A user-initiated cancel is not a failure — show a gentle notice, not an error.
 			if (isAbortError(err)) {
@@ -6130,7 +6194,7 @@ export function NarratorPanel({
 					// back afterwards so the operator does not lose what they were typing.
 					setInput(trimmed);
 					updateAttachedImages([]);
-					setAttachedTextFiles([]);
+					updateAttachedTextFiles([]);
 					await doSendBufferedRef.current(trimmed, false);
 				} catch (err) {
 					notifications.show({
@@ -6141,11 +6205,11 @@ export function NarratorPanel({
 				} finally {
 					setInput(preservedDraft);
 					if (preservedImages.length > 0) updateAttachedImages(preservedImages);
-					if (preservedTextFiles.length > 0) setAttachedTextFiles(preservedTextFiles);
+					if (preservedTextFiles.length > 0) updateAttachedTextFiles(preservedTextFiles);
 				}
 			})();
 		});
-	}, [dock, t, updateAttachedImages]);
+	}, [dock, t, updateAttachedImages, updateAttachedTextFiles]);
 
 	// The active queue button mirrors the keyboard shortcuts: a short press uses
 	// Enter's mode, while a long press uses Ctrl/Cmd+Enter's mode.
@@ -6417,7 +6481,7 @@ export function NarratorPanel({
 			return true;
 		});
 		if (valid.length > 0) {
-			setAttachedTextFiles((prev) => [...prev, ...valid]);
+			updateAttachedTextFiles((prev) => [...prev, ...valid]);
 		}
 	};
 
@@ -8251,10 +8315,10 @@ export function NarratorPanel({
 									}}
 								>
 									<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
-									<Text size="xs" truncate style={{ maxWidth: 160 }}>
+									<Text size="xs" truncate style={{ maxWidth: 160, minWidth: 0 }}>
 										{file.name}
 									</Text>
-									<Text size="xs" c="dimmed">
+									<Text size="xs" c="dimmed" style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
 										{formatFileSize(file.size)}
 									</Text>
 									<CloseButton
@@ -8262,7 +8326,9 @@ export function NarratorPanel({
 										iconSize={12}
 										variant="transparent"
 										c="dimmed"
-										onClick={() => setAttachedTextFiles((prev) => prev.filter((_, j) => j !== i))}
+										onClick={() =>
+											updateAttachedTextFiles((prev) => prev.filter((_, j) => j !== i))
+										}
 									/>
 								</Group>
 							))}
@@ -9607,14 +9673,20 @@ export function NarratorPanel({
 							size={isMobileViewport ? "100%" : 600}
 							// The viewer body already shows the base name; the title carries the
 							// full path so the drawer adds information rather than repeating it.
-							title={
-								<Text size="sm" fw={600} truncate>
-									{internalFileViewerPath}
-								</Text>
-							}
+							//
+							// `TruncatedPath` rather than `truncate`: it ellipsizes from the LEFT,
+							// so a deep path keeps the filename — the part that identifies the file —
+							// visible instead of clipping it and leaving only directories.
+							title={<TruncatedPath path={internalFileViewerPath} fw={600} />}
 							closeButtonProps={{ size: "sm" }}
 							styles={{
 								header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
+								// Mantine's header is a flex row and its title child has no
+								// `min-width: 0`, so a long unbroken path floors at its content
+								// width and pushes the close button off-screen — with no way back
+								// on touch, where there is no Escape key. The title must be the
+								// side that yields.
+								title: { minWidth: 0, flex: 1, overflow: "hidden" },
 								body: {
 									height: safeAreaDrawerBodyHeight(60),
 									padding: 0,

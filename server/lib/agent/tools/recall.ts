@@ -2,6 +2,7 @@ import type { Statement } from "bun:sqlite";
 import { z } from "zod/v4";
 import { sqlite } from "../../../db";
 import { buildFtsQuery, sanitizeQuery } from "../../../services/search-service";
+import { isBashToolName } from "../tool-name";
 import type { ToolDefinition, ToolResult } from "../types";
 
 /**
@@ -405,7 +406,6 @@ function extractStr(obj: any, ...keys: string[]): string {
 }
 
 const FILE_TOOLS = new Set(["Read", "Write", "Edit", "Glob"]);
-const BASH_TOOLS = new Set(["Bash", "Shell"]);
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
 function getToolCallSummary(toolName: string, inputJson: any): string {
@@ -415,7 +415,8 @@ function getToolCallSummary(toolName: string, inputJson: any): string {
 		const fp = extractStr(inputJson, "file_path", "filePath", "path", "pattern");
 		return fp ? basename(fp) : toolName;
 	}
-	if (BASH_TOOLS.has(toolName)) {
+	// Legacy "Shell" rows from older Windows installs summarize the same way.
+	if (isBashToolName(toolName)) {
 		const cmd = extractStr(inputJson, "command");
 		if (!cmd) return toolName;
 		return cmd.length > 80 ? `${cmd.slice(0, 77)}...` : cmd;

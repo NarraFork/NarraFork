@@ -50,7 +50,7 @@ import "../vlist-markdown.css";
 import { VListCodeCopyButton } from "../VListCodeCopyButton";
 import { CaretFiller } from "./caret-filler";
 import { FragmentGap, LineFragments } from "./line-fragments";
-import { StreamAnimStore, splitFragmentForAnim } from "./stream-token-anim";
+import { graphemeAnimAge, StreamAnimStore, splitFragmentForAnim } from "./stream-token-anim";
 import { TokenText } from "./TokenLines";
 
 /**
@@ -706,17 +706,34 @@ function InlineBlockView({
 		return { lines: out, totalLen: offset, visibleText: text };
 	}, [block, contentWidth, animKey]);
 
-	// Peek the animation boundary during render (pure — no store mutation), then
-	// commit the text after paint so the NEXT frame's boundary is correct. The
-	// streaming tail keeps a stable spec.key, so this component instance persists
+	// Resolve this frame's animation state during render (pure — no store mutation),
+	// then commit it after paint so the NEXT frame's boundary and ages are correct.
+	// The streaming tail keeps a stable spec.key, so this component instance persists
 	// across frames and the effect runs once per committed text.
-	const boundary =
-		animKey != null ? streamAnimStore.peekBoundary(animKey, visibleText) : Number.POSITIVE_INFINITY;
+	//
+	// `now` is read once and used for BOTH halves: peek derives the seal offset and
+	// the grapheme ages from it, and commit stamps the birth with it. Two clock reads
+	// would date this frame's own birth slightly in the past and start its animation
+	// already advanced.
+	const now = animKey != null ? Date.now() : 0;
+	// Named `animFrame`, not `frame`: this component's `frame` prop is the measured
+	// BlockFrame (geometry). Two different meanings of the word in one scope is how
+	// a later edit reaches for the wrong one.
+	const animFrame = animKey != null ? streamAnimStore.peekFrame(animKey, visibleText, now) : null;
+	// `now` is deliberately NOT a dependency: it changes on every render, so including
+	// it would commit a birth on renders that appended nothing (a hover, a resize, a
+	// parent rebuild), restamping text that was already mid-fade and restarting its
+	// animation. Excluding it means the closure keeps the `now` of the render where
+	// `visibleText` actually changed — which is precisely the birth time wanted.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: `now` must stay out; see above
 	useEffect(() => {
-		if (animKey != null) streamAnimStore.commitText(animKey, visibleText);
+		if (animKey != null) streamAnimStore.commitFrame(animKey, visibleText, now);
 	}, [animKey, visibleText]);
-	// Nothing to animate when every grapheme is already sealed (boundary >= end).
-	const animating = animKey != null && boundary < totalLen;
+	// The split point is the SEAL offset, not the append boundary — a grapheme must
+	// keep its span until its animation finishes (see stream-token-anim's header).
+	const sealOffset = animFrame?.sealOffset ?? Number.POSITIVE_INFINITY;
+	// Nothing to animate when every grapheme is already sealed.
+	const animating = animFrame != null && sealOffset < totalLen;
 
 	const isQuote = block.quoteRailLefts.length > 0;
 	const quotePaddingY = isQuote ? MARKDOWN_CONSTANTS.BLOCKQUOTE_PADDING : 0;
@@ -810,8 +827,16 @@ function InlineBlockView({
 							) : (
 								(() => {
 									const content =
-										animating && boundary < frag.globalStart + frag.text.length ? (
-											<FragmentAnimContent key="anim" frag={frag} boundary={boundary} />
+										animating &&
+										animFrame != null &&
+										sealOffset < frag.globalStart + frag.text.length ? (
+											<FragmentAnimContent
+												key="anim"
+												frag={frag}
+												sealOffset={sealOffset}
+												births={animFrame.births}
+												now={animFrame.now}
+											/>
 										) : (
 											frag.text
 										);
@@ -1016,22 +1041,51 @@ function MathSourceForCopy({ latex, display }: { latex: string; display: boolean
 
 /**
  * Fragment body for the streaming animation path: a static leading string
- * (already-sealed text) followed by per-grapheme animated spans keyed by their
- * GLOBAL offset within the block. Stable keys mean sealed graphemes reuse the
- * same node (no re-animate) while freshly-appended ones mount and play once.
- * `display:inline` keeps the grapheme spans from altering the fragment box, so
- * the measured geometry is preserved (zero-DOM contract).
+ * (text whose animation has finished) followed by per-grapheme spans keyed by
+ * their GLOBAL offset within the block.
+ *
+ * The split uses the time-driven SEAL offset, so a grapheme holds one stable span
+ * for its whole fade rather than losing it to the next delta — the bug that made
+ * continuous output look almost unanimated (see stream-token-anim's header).
+ *
+ * `display:inline` keeps the grapheme spans from altering the fragment box, so the
+ * measured geometry is preserved (zero-DOM contract).
  */
-function FragmentAnimContent({ frag, boundary }: { frag: InlineFragment; boundary: number }) {
-	const { staticText, animGraphemes } = splitFragmentForAnim(frag.text, frag.globalStart, boundary);
+function FragmentAnimContent({
+	frag,
+	sealOffset,
+	births,
+	now,
+}: {
+	frag: InlineFragment;
+	sealOffset: number;
+	births: readonly { offset: number; ts: number }[];
+	now: number;
+}) {
+	const { staticText, animGraphemes } = splitFragmentForAnim(
+		frag.text,
+		frag.globalStart,
+		sealOffset,
+	);
 	return (
 		<>
 			{staticText}
-			{animGraphemes.map((g) => (
-				<span key={g.gid} className="vlist-anim-token">
-					{g.text}
-				</span>
-			))}
+			{animGraphemes.map((g) => {
+				// A span can be REMOUNTED mid-animation when the line rewraps and its
+				// parent changes, which restarts the keyframes from zero and blurs the
+				// same character twice. A negative delay makes progress a function of the
+				// grapheme's age instead of its mount time, so a remount resumes.
+				const age = graphemeAnimAge(births, g.gid, now);
+				return (
+					<span
+						key={g.gid}
+						className="vlist-anim-token"
+						style={age > 0 ? { animationDelay: `-${age}ms` } : undefined}
+					>
+						{g.text}
+					</span>
+				);
+			})}
 		</>
 	);
 }

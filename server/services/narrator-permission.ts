@@ -26,6 +26,7 @@ import {
 } from "../lib/agent/execution/rpc-types";
 import { detectShell } from "../lib/agent/shell";
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
+import { isBashToolName } from "../lib/agent/tool-name";
 import { toolRegistry } from "../lib/agent/tool-registry";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import {
@@ -187,7 +188,10 @@ function resolvePermissionShellType(
 }
 
 function isRoutedPermissionTool(toolName: string): boolean {
-	return toolName === "Shell" || !!toolRegistry.get(toolName)?.executionRouting;
+	// toolRegistry.get resolves legacy aliases, so a stale "Shell" name still
+	// finds the Bash definition and stays routed (i.e. still requires a frozen
+	// execution target). Special-casing the alias here is no longer needed.
+	return !!toolRegistry.get(toolName)?.executionRouting;
 }
 
 function decisionPaths(context?: ExecutionTargetContext | null): TargetPathSemantics {
@@ -263,7 +267,7 @@ function getToolPolicyPaths(
 	bashAnalysis?: BashAnalysis,
 	context?: ExecutionTargetContext | null,
 ): string[] {
-	if (toolName === SHELL_TOOL_NAME || toolName === "Shell") {
+	if (isBashToolName(toolName)) {
 		return getShellScopePaths(cwd, input, bashAnalysis, context);
 	}
 	if (context && isRoutedPermissionTool(toolName)) {
@@ -309,7 +313,7 @@ function resolveWhitelistDecision(
 			: null;
 	}
 
-	if (toolName === SHELL_TOOL_NAME || toolName === "Shell") {
+	if (isBashToolName(toolName)) {
 		if (!bashAnalysis) return null;
 		if (bashAnalysis.nonWhitelisted.length > 0) return null;
 		if (bashAnalysis.dangerousPatterns.length > 0) return null;
@@ -452,7 +456,7 @@ export function resolvePermissionDecision(
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
-	if (toolName === SHELL_TOOL_NAME && bashAnalysis?.isCatastrophic) return "fatal";
+	if (isBashToolName(toolName) && bashAnalysis?.isCatastrophic) return "fatal";
 
 	const protectedPathReason = resolveProtectedPathDeny(
 		toolName,
@@ -530,7 +534,7 @@ export function resolvePermissionDecision(
 	}
 
 	// Command blacklist
-	if ((toolName === SHELL_TOOL_NAME || toolName === "Shell") && bashAnalysis) {
+	if (isBashToolName(toolName) && bashAnalysis) {
 		const commandDecision = compiledPolicy.evaluateCommands(
 			bashAnalysis.commands.map((command) => command.tokens),
 		);
@@ -563,7 +567,7 @@ export function resolvePermissionDecision(
 	}
 
 	const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
-	if (toolName === SHELL_TOOL_NAME && chapterGitIssues.length > 0) {
+	if (isBashToolName(toolName) && chapterGitIssues.length > 0) {
 		return resolveChapterGitIssueDecision(effectiveMode);
 	}
 
@@ -584,7 +588,7 @@ export function resolvePermissionDecision(
 	// Command whitelist
 	let effectiveBashAnalysis = bashAnalysis;
 	if (
-		(toolName === SHELL_TOOL_NAME || toolName === "Shell") &&
+		isBashToolName(toolName) &&
 		bashAnalysis &&
 		isCommandWhitelistCovered(bashAnalysis, compiledPolicy.commandWhitelist)
 	) {
@@ -603,7 +607,7 @@ export function resolvePermissionDecision(
 	// builtin analyzer found nothing unsafe) so an explicit allowlist hit still skips
 	// the approval prompt in interactive default mode.
 	const explicitCommandWhitelisted =
-		toolName === SHELL_TOOL_NAME &&
+		isBashToolName(toolName) &&
 		!!bashAnalysis &&
 		isExplicitlyCommandWhitelisted(bashAnalysis, compiledPolicy.commandWhitelist);
 
@@ -675,7 +679,7 @@ export function resolvePermissionDecision(
 			}
 			return "deny";
 		}
-		if (toolName === SHELL_TOOL_NAME) {
+		if (isBashToolName(toolName)) {
 			if (!effectiveBashAnalysis) return "deny";
 			if (effectiveBashAnalysis.nonWhitelisted.length > 0) return "deny";
 			if (effectiveBashAnalysis.dangerousPatterns.length > 0) return "deny";
@@ -698,7 +702,7 @@ export function resolvePermissionDecision(
 	}
 
 	// Bash/Shell: AST-based command-level security
-	if (toolName === SHELL_TOOL_NAME) {
+	if (isBashToolName(toolName)) {
 		if (!effectiveBashAnalysis) return "ask";
 		if (effectiveBashAnalysis.nonWhitelisted.length > 0) return "ask";
 		if (effectiveBashAnalysis.dangerousPatterns.length > 0) return "ask";
@@ -759,7 +763,7 @@ function resolveBlacklistDecision(
 			? input.subagent_type === "explore" || input.subagent_type === "plan"
 				? "read"
 				: "full"
-			: toolName === SHELL_TOOL_NAME || toolName === "Shell"
+			: isBashToolName(toolName)
 				? bashAnalysis?.hasWriteOperation
 					? "write"
 					: "read"
@@ -1124,7 +1128,7 @@ function resolveProtectedPathDeny(
 		return null;
 	}
 
-	if (toolName === SHELL_TOOL_NAME && bashAnalysis) {
+	if (isBashToolName(toolName) && bashAnalysis) {
 		if (bashAnalysis.hasWriteOperation) {
 			for (const p of bashAnalysis.filePaths) {
 				if (isGitInternalPath(p, targetOS)) {
@@ -1202,7 +1206,7 @@ function getDangerFingerprintScope(
 	if (!cwd) return {};
 	const normalizedCwd = resolvePath(cwd);
 	let paths: string[] = [];
-	if (toolName === SHELL_TOOL_NAME) {
+	if (isBashToolName(toolName)) {
 		paths = getShellScopePaths(normalizedCwd, input, bashAnalysis);
 	} else if (toolName === "Agent") {
 		const workdir = typeof input.workdir === "string" ? input.workdir : "";
@@ -1227,7 +1231,7 @@ function getDangerFingerprintInput(
 	toolName: string,
 	input: Record<string, unknown>,
 ): Record<string, unknown> {
-	if (toolName === SHELL_TOOL_NAME) {
+	if (isBashToolName(toolName)) {
 		// 只保留影响执行语义的字段：command 和 workdir
 		const result: Record<string, unknown> = {};
 		if (input.command !== undefined) result.command = input.command;
@@ -2105,7 +2109,7 @@ export function classifyDanger(
 			normalizeExecutionPolicyRuleSet({ whitelistDirs, commandWhitelist }, "narrator"),
 			executionContext,
 		);
-	if (toolName === SHELL_TOOL_NAME)
+	if (isBashToolName(toolName))
 		return classifyShellDanger(
 			input,
 			cwd,
@@ -3491,8 +3495,8 @@ export async function handlePermission(
 	let bashAnalysis: BashAnalysis | undefined;
 	let shellAnalysisError: string | undefined;
 	const isBashControlOp =
-		toolName === SHELL_TOOL_NAME && !input.command && (input.await != null || input.stop != null);
-	if (toolName === SHELL_TOOL_NAME && typeof input.command === "string") {
+		isBashToolName(toolName) && !input.command && (input.await != null || input.stop != null);
+	if (isBashToolName(toolName) && typeof input.command === "string") {
 		try {
 			const shellType = resolvePermissionShellType(executionContext?.backend);
 			const shellCwd = executionContext?.target.cwd ?? resolveToolCwd(cwd, effectiveInput);
@@ -3575,8 +3579,7 @@ export async function handlePermission(
 				options?.executionPlan?.endpoints.some((endpoint) => endpoint.operation === "write") ===
 					true ||
 				WRITE_TOOLS.has(toolName) ||
-				((toolName === SHELL_TOOL_NAME || toolName === "Shell") &&
-					bashAnalysis?.hasWriteOperation === true);
+				(isBashToolName(toolName) && bashAnalysis?.hasWriteOperation === true);
 			if (capabilityNeedsWrite && oauthDeviceLevel !== "readWrite") {
 				return {
 					behavior: "deny",
@@ -3849,7 +3852,7 @@ export async function handlePermission(
 		oauthKnowledgeCapability !== "write"
 	) {
 		const oauthDanger =
-			toolName === SHELL_TOOL_NAME && shellAnalysisError
+			isBashToolName(toolName) && shellAnalysisError
 				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)
 				: classifyDanger(
 						toolName,
@@ -4015,7 +4018,7 @@ export async function handlePermission(
 		dangerReflectionLevel !== "off"
 	) {
 		const danger =
-			toolName === SHELL_TOOL_NAME && shellAnalysisError
+			isBashToolName(toolName) && shellAnalysisError
 				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)
 				: classifyDanger(
 						toolName,
@@ -4104,7 +4107,7 @@ export async function handlePermission(
 	}
 	if (promotedPlanSoftDeny && permMode === "bypassPermissions" && dangerReflectionLevel !== "off") {
 		const baseDanger =
-			toolName === SHELL_TOOL_NAME && shellAnalysisError
+			isBashToolName(toolName) && shellAnalysisError
 				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)
 				: classifyDanger(
 						toolName,
@@ -4196,7 +4199,7 @@ export async function handlePermission(
 		const isReadToolPathDenied =
 			(permMode === "readOnly" || isPlanMode) &&
 			(READ_ONLY_TOOLS.includes(toolName) ||
-				(toolName === SHELL_TOOL_NAME &&
+				(isBashToolName(toolName) &&
 					bashAnalysis &&
 					!bashAnalysis.hasWriteOperation &&
 					bashAnalysis.nonWhitelisted.length === 0 &&

@@ -58,7 +58,8 @@ export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 
 	return (
 		<>
-			<ScrollArea.Autosize mah={300}>
+			{/* Fills the dock panel: the tab body hands down its full height. */}
+			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
 				<Stack gap={2}>
 					{commits.map((c) => (
 						<Group key={c.sha} gap={6} wrap="nowrap" py={2} px={4}>
@@ -111,7 +112,7 @@ export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 						</Button>
 					)}
 				</Stack>
-			</ScrollArea.Autosize>
+			</ScrollArea>
 			<ChapterSplitModal
 				chapterId={chapterId}
 				commitSha={splitTarget?.sha ?? null}

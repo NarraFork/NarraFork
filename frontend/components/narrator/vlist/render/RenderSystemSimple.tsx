@@ -10,16 +10,13 @@
  * @tabler icons — WITHOUT importing anything outside vlist/.
  *
  * Zero DOM measurement (heights come from the measure layer).
+ *
+ * `review_feedback` used to be one of these and is not any more: see the note where its
+ * row used to be.
  */
 
 import { Group, Loader, Paper, Text } from "@mantine/core";
-import {
-	IconAlertTriangle,
-	IconArrowsMinimize,
-	IconEyeCheck,
-	IconGitMerge,
-	IconX,
-} from "@tabler/icons-react";
+import { IconAlertTriangle, IconArrowsMinimize, IconGitMerge, IconX } from "@tabler/icons-react";
 import {
 	CARD_PADDING,
 	CENTER_ROW_PADDING_Y,
@@ -94,8 +91,6 @@ export function RenderSystemSimple({
 			return <CompactRow data={data} height={height} palette="teal" onOpen={onOpenCompact} />;
 		case "merge_summary":
 			return <MergeSummaryRow data={data} height={height} avatarSlot={avatarSlot} />;
-		case "review_feedback":
-			return <ReviewFeedbackRow data={data} height={height} />;
 		default:
 			return null;
 	}
@@ -220,24 +215,10 @@ function MergeSummaryRow({
 	);
 }
 
-// ── review_feedback: Paper p="xs" + single lineClamp={1} row ─────────────────
-function ReviewFeedbackRow({ data, height }: { data: SystemSimpleData; height: number }) {
-	const color = data.color ?? "gray";
-	return (
-		<Paper
-			p="xs"
-			radius="sm"
-			style={{ backgroundColor: cssLight(color), height, boxSizing: "border-box" }}
-		>
-			<Group gap={6} wrap="nowrap" h="100%" align="center">
-				<IconEyeCheck size={16} style={{ flexShrink: 0, color: cssColor(color, 6) }} />
-				<Text size="xs" c={color} lineClamp={1}>
-					{data.text}
-				</Text>
-			</Group>
-		</Paper>
-	);
-}
+// ── review_feedback ──────────────────────────────────────────────────────────
+// Removed: a verdict plus a findings list needs a wrapping body and an action row, so
+// the card became a `system-text` one (see RenderSystemText's ReviewFeedbackCard). The
+// clamped single line here could show neither.
 
 // ── spec_continuation / spec_blocked_continuation ────────────────────────────
 // Removed: the framed bubble now draws these as a task row itself (RenderSpecTask)

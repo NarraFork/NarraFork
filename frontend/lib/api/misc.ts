@@ -4,6 +4,7 @@ import type {
 } from "@frontend/types/usage-history";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
 import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
+import { parseContentDispositionFileName } from "./narrators";
 import type {
 	ApiEntity,
 	ChangelogEntry,
@@ -946,6 +947,25 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify({ path }),
 		}),
+	/**
+	 * Fetch a file for saving to disk.
+	 *
+	 * Not a plain link: `/api/fs/download` is behind the session gate, so the bytes
+	 * have to come through `authorizedFetch` and be handed to the browser as a Blob.
+	 * The server's `Content-Disposition` name is preferred over deriving one from
+	 * the path, since it has already been sanitized for use as a filename.
+	 */
+	fsDownload: async (path: string) => {
+		const res = await authorizedFetch(`${BASE}/fs/download?path=${encodeURIComponent(path)}`);
+		if (!res.ok) {
+			const error = await readFetchError(res, "Download failed");
+			throw new ApiError(error.message, res.status, error.data);
+		}
+		return {
+			blob: await res.blob(),
+			fileName: parseContentDispositionFileName(res.headers.get("content-disposition")),
+		};
+	},
 
 	// Routines
 	getRoutines: () =>

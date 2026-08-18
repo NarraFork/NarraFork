@@ -152,7 +152,24 @@ export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndRe
 			target = null;
 			setDropIndicator(null);
 			const api = apiRef.current;
-			if (!api || !final || !resolved) return;
+			const root = rootRef.current;
+			if (!api || !root || !final || !resolved) return;
+
+			// Only the surface the pointer was actually released over may act.
+			//
+			// Every surface subscribes to this singleton, so without this check a drag
+			// from surface A onto surface B is handled TWICE: B creates the panel while A
+			// — for which `isLocalPanelDrag` is true — also "rearranges" it locally from
+			// its own stale hit-test. The result is the same panel in both places, which
+			// is what "the target got it but the original is still there" was.
+			//
+			// `elementFromPoint` rather than comparing rects: surfaces overlap on the
+			// story-network canvas (a detached node can sit on top of a chapter node's
+			// dock), and rect containment would be true for both. Hit-testing the DOM
+			// answers "which one is on top here", which is what the user aimed at.
+			const dropped = document.elementFromPoint(final.x, final.y);
+			if (!dropped || !root.contains(dropped)) return;
+
 			if (isLocalPanelDrag(final, surfaceId)) {
 				// biome-ignore lint/style/noNonNullAssertion: isLocalPanelDrag requires panelId
 				dropExistingPanel(api, final.panelId!, resolved);

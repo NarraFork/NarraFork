@@ -86,6 +86,11 @@ export function TextFileRow({
 					style={{
 						font: `400 ${FONT_SIZE.xs}px ${SANS_FAMILY}`,
 						color: "var(--mantine-color-dimmed)",
+						// Never let the size be the thing that wraps: the row is reserved at a
+						// fixed TEXT_FILE_HEIGHT, so a "(1.5\nKB)" break would overflow a box
+						// the measure layer already committed to.
+						flexShrink: 0,
+						whiteSpace: "nowrap",
 					}}
 				>
 					({formatFileSize(size)})

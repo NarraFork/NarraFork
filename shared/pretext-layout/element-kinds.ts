@@ -15,6 +15,13 @@ export type VListElementKind =
 	| "system-text"
 	| "knowledge-hint"
 	| "plan-card"
+	/**
+	 * A concluded code review: a header row over a maxHeight-capped scroll box holding a
+	 * markdown body. Shaped like a tool card because the content is the same species as a
+	 * plan — a long agent-authored document with code in it — which neither a clamped
+	 * one-line card nor a plain-text notice could present.
+	 */
+	| "review-card"
 	| "ask-in-passing"
 	| "subagent-recovery"
 	| "tool-call"

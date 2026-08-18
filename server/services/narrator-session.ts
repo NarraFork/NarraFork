@@ -2095,6 +2095,58 @@ function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefine
 }
 
 /**
+ * Text of a trailing `role: "user"` row that a pass with no prompt of its own must resend.
+ *
+ * Every provider's history builder POPS the last top-level user row and expects the
+ * caller to send it as the current turn (`buildAnthropicHistory` line ~2832 and the
+ * same three lines in openai/gemini/cline). That contract holds for an ordinary user
+ * message, because whoever wrote the row also passes its text into `runAgentLoop`.
+ *
+ * It does NOT hold for a row written by a producer that then starts a bare
+ * `runAgentLoop(active, "")` — the review conclusion written by
+ * `review-event-handler` is the first such producer. The row was popped as "the
+ * current turn" and the current turn was empty, so the conclusion reached the model
+ * in NEITHER place: `pushUserTurn` pushes nothing for empty content, and history no
+ * longer contains the row. The reviewer's findings simply were not in the request.
+ *
+ * Nothing reports that. The turn runs, the model answers something generic about the
+ * previous context, and the transcript still shows the conclusion sitting there — so
+ * it reads as the model ignoring it rather than never receiving it.
+ *
+ * Recovered here rather than at the producer because the gap belongs to this seam:
+ * any future producer that persists a user row and starts an empty pass inherits the
+ * same bug, and a fix at one call site would not cover it. `sys` rows need none of
+ * this — the builders lift those into `trailingUserText` themselves.
+ */
+export function resolvePoppedTrailingUserText(
+	messages: ContinuableTopLevelMessage[],
+): string | null {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (!msg || msg.parentToolUseId) continue;
+		// Mirrors the builders' filter: they only consider user/assistant/sys, and only
+		// a trailing `user` row is popped. A trailing `sys` run is lifted by the builder
+		// itself, so reaching one means there is nothing for this helper to recover.
+		if (msg.role === "sys") return null;
+		if (msg.role !== "user") return null;
+		const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+		const text = blocks
+			.filter(
+				(block: { type?: string; text?: unknown }) =>
+					block?.type === "text" && typeof block.text === "string" && block.text.trim(),
+			)
+			.map((block: { text?: unknown }) => String(block.text))
+			.join("\n");
+		if (text.trim()) return text;
+		// `contentText` is the flat fallback for rows written without an explicit text
+		// block, matching how `dbMessageVisibleText` reads a row.
+		const flat = typeof msg.contentText === "string" ? msg.contentText : "";
+		return flat.trim() ? flat : null;
+	}
+	return null;
+}
+
+/**
  * Does model-visible history end on a server-authored injection?
  *
  * `resolveContinuationTail` walks PAST `sys` rows by design — it answers "what turn can
@@ -3428,10 +3480,32 @@ export async function runAgentLoop(
 					: trailingUserText
 				: currentText;
 
+			// The builders popped the trailing user row expecting the caller to send it as
+			// the current turn. A pass started with no prompt of its own (a review
+			// conclusion's "handle" button, any future producer that writes a user row and
+			// starts a bare loop) would otherwise drop that row entirely — see
+			// `resolvePoppedTrailingUserText`. Only consulted when this pass has nothing
+			// else to say, so an ordinary user turn (whose text is already in
+			// `currentText`) can never be duplicated.
+			const recoveredTrailingUserText =
+				currentTurnText.trim() || trailingToolResults.length > 0
+					? null
+					: resolvePoppedTrailingUserText(dbMessages);
+			if (recoveredTrailingUserText) {
+				logger.debug("Resending a popped trailing user row as this pass's turn", {
+					narratorId,
+					chars: recoveredTrailingUserText.length,
+				});
+			}
+
 			// When replaying a pure tool-result turn, preserve the original packet shape:
 			// no synthetic user text.
 			const isPureToolResultReplay = !currentTurnText.trim() && trailingToolResults.length > 0;
-			let effectiveText = isPureToolResultReplay ? "" : currentTurnText;
+			let effectiveText = isPureToolResultReplay
+				? ""
+				: currentTurnText.trim()
+					? currentTurnText
+					: (recoveredTrailingUserText ?? currentTurnText);
 
 			// Passive knowledge injection (point A): when this turn carries real user text,
 			// surface relevant knowledge-base entries the triggering user may read.
@@ -4081,6 +4155,9 @@ export async function runAgentLoop(
 				active.events.emit("event", { type: "user_message", data: userMsg });
 				await narratorService.updateStatus(narratorId, "working");
 				currentText = fb.feedbackText;
+				// Approving a permission with attached text starts a new pass here, so a
+				// cut-in message queued during the same tool call needs its boundary back.
+				rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -4106,6 +4183,9 @@ export async function runAgentLoop(
 					active.events.emit("event", { type: "user_message", data: userMsg });
 					await narratorService.updateStatus(narratorId, "working");
 					currentText = gitCheck.message;
+					// The guardrail notice starts a new pass, so keep a cut-in message's
+					// boundary alive instead of stranding it for the rest of the loop.
+					rearmCutInSoftStopBeforeContinuing(active);
 					continue;
 				}
 				// Git is clean and loop ended normally — conclude the review
@@ -4226,6 +4306,9 @@ export async function runAgentLoop(
 				await narratorService.updateStatus(narratorId, "working");
 				currentText = "";
 				currentImages = undefined;
+				// This drain starts a fresh pass before the buffer consumer below is
+				// reached, which would strand a cut-in message for the rest of the loop.
+				rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -7825,6 +7908,29 @@ export function requestBufferedMessageSoftStop(narratorId: string): boolean {
 	if (!active?.alive) return false;
 	active._bufferSoftStop = true;
 	return true;
+}
+
+/**
+ * Re-arm a cut-in soft stop that another producer is about to step in front of.
+ *
+ * `evaluateSoftStopRequest` consumes `_bufferSoftStop` when it grants the stop, on
+ * the assumption that the queued message is consumed right after the pass returns.
+ * Several branches in `runAgentLoop` break that assumption: chained permission
+ * feedback, the review git-state guard and the injection drain each start a FRESH
+ * pass before the buffer consumer is reached. That new pass has no soft-stop
+ * request left, so `shouldStop()` stays false for its entire duration and the
+ * queued message waits through every remaining tool call until the whole loop
+ * ends — the "it says it cut in, but it only arrived at the very end" report.
+ *
+ * Re-arming costs nothing when the queue is empty (the flag is only honoured while
+ * `hasPendingBufferedWork` holds), and the stepping-in producer keeps its priority:
+ * its own text still rides on the turn being started here.
+ */
+export function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator): void {
+	if (!active._bufferSoftStopTaken) return;
+	if (!hasPendingBufferedWork(active.narratorId)) return;
+	active._bufferSoftStopTaken = false;
+	active._bufferSoftStop = true;
 }
 
 /**

@@ -107,8 +107,24 @@ export const CHAT_DRAFT_ATTACHMENTS_MAX = 30;
  */
 export const CHAT_ATTACHMENT_TOTAL_BYTES_MAX = 64 * 1024 * 1024;
 
-/** Grace period before an unclaimed upload is treated as abandoned. */
+/**
+ * Grace period before an unclaimed upload is treated as abandoned.
+ *
+ * ⚠️ Mirrored in `frontend/components/chat/chat-composer-draft.ts`, which restores
+ * composer attachments for this window MINUS a safety margin — past it the row and
+ * file are already gone, and the restored id can only produce a send that fails.
+ * Lowering this value without lowering the mirror re-opens that window.
+ */
 export const CHAT_DRAFT_ATTACHMENT_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Error code for "one or more of these attachment ids cannot be claimed".
+ *
+ * A dedicated code because the composer has to react to this specific rejection
+ * (mark the restored chips as failed) rather than only reporting it. The message
+ * itself stays deliberately vague for all the failure modes — see the throw site.
+ */
+export const CHAT_ATTACHMENTS_UNAVAILABLE_CODE = "CHAT_ATTACHMENTS_UNAVAILABLE";
 
 export interface SavedChatAttachment {
 	kind: "image" | "file";

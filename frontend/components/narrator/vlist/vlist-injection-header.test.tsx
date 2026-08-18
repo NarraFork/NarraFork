@@ -154,6 +154,18 @@ describe("InjectionSpeakerHeader — identity resolution", () => {
 		expect(text).not.toContain("origin.kind.system");
 	});
 
+	test("a review conclusion is attributed, not left as an unknown sender", () => {
+		// The regression this pins: `review_feedback` was missing from PLATFORM_SOURCES, so
+		// every concluded review reached the reader under "unknown sender" — a row about
+		// their own code, apparently from nobody. The reviewer is a separate chapter, so the
+		// platform is the honest speaker here (the row is NarraFork reporting a verdict).
+		const text = renderHeader({ source: "review_feedback", speaker: null, creator: null });
+		expect(text).not.toContain("sidecar.body.messageFromUnknown");
+		// With the mocked `t` returning raw keys the producer name resolves to the generic
+		// platform label; in the app it is `sidecar.sources.review_feedback`.
+		expect(text).toContain("origin.kind.system");
+	});
+
 	test("shows the secondary descriptor and the broadcast marker", () => {
 		const text = renderHeader({
 			speaker: "alice",
@@ -170,6 +182,7 @@ describe("isPlatformSource", () => {
 	test("recognizes platform-authored producers", () => {
 		expect(isPlatformSource("container_ready")).toBe(true);
 		expect(isPlatformSource("spec_continuation")).toBe(true);
+		expect(isPlatformSource("review_feedback")).toBe(true);
 	});
 
 	test("does not claim agent or human producers", () => {

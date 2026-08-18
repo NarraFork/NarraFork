@@ -303,6 +303,7 @@ import {
 	sendMessage,
 	setNarratorDefaultDevice,
 	setTemporaryModelRestore,
+	startInjectionContinuationIfPossible,
 	startSpecContinuationIfPossible,
 	toBufferSummary,
 	updateActiveBlockedSkills,
@@ -3048,6 +3049,83 @@ narratorRoutes.delete("/:id/spec-carryover-messages/:messageId", async (c) => {
 		deletedMessageIds: [messageId],
 	});
 	return c.json({ ok: true, deletedMessageIds: [messageId] });
+});
+
+/**
+ * Start a turn for a review conclusion the narrator already has.
+ *
+ * The card's "handle" button. It deliberately writes NO message: the conclusion row is
+ * itself the `role: "user"` message and has been in the history since the review
+ * concluded, so there is nothing to hand over — only a loop to start over what is
+ * already there. Writing a copy here is what would put the same findings on screen
+ * twice.
+ *
+ * Which is also why a concluded review does not wake an idle narrator on its own: being
+ * informed needs no turn, and spending a model request is the reader's decision.
+ *
+ * `started: false` splits into two OUTCOMES that must not be conflated, because the
+ * latch is what disables the button forever:
+ *
+ *   - `busy` — a loop is already running, and it rebuilds history from the database on
+ *     its next pass, so the conclusion is taken up without this route doing anything.
+ *     The latch stays: the reader's intent is satisfied.
+ *   - `not_started` — nothing is running AND nothing was started (plan mode, a status
+ *     row that is not idle, a throw). Nobody is going to read the row, so the latch is
+ *     RELEASED — otherwise the button reads "Handled" for a turn that never happened
+ *     and the reader has no way to ask again.
+ */
+narratorRoutes.post("/:id/review-feedback/:messageId/apply", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+
+	const claim = await narratorService.markReviewFeedbackApplied(narratorId, messageId);
+	if (claim.alreadyApplied) return c.json({ ok: true, started: false, reason: "already_applied" });
+	if (claim.message) {
+		broadcastToNarrator(narratorId, {
+			type: "message_updated",
+			narratorId,
+			message: claim.message,
+		});
+	}
+
+	// Read BEFORE trying to start: afterwards a loop this call started is itself busy,
+	// so the two outcomes would be indistinguishable.
+	const alreadyRunning = isNarratorRuntimeBusy(narratorId);
+
+	// `startInjectionContinuationIfPossible` owns the gating (continuation lock, idle in
+	// both senses, not in plan mode) and runs the loop with an empty prompt — the
+	// established spelling for "the turn's content is already in the database".
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+	let started = false;
+	try {
+		({ started } = await startInjectionContinuationIfPossible(
+			narratorId,
+			locale,
+			replyInUserLanguage,
+		));
+	} finally {
+		// A latch nobody will act on is worse than no latch: the card would be
+		// permanently disabled for findings the model never saw.
+		if (!started && !alreadyRunning) {
+			const released = await narratorService
+				.releaseReviewFeedbackClaim(narratorId, messageId)
+				.catch(() => undefined);
+			if (released) {
+				broadcastToNarrator(narratorId, {
+					type: "message_updated",
+					narratorId,
+					message: released,
+				});
+			}
+		}
+	}
+	return c.json({
+		ok: true,
+		started,
+		reason: started ? "started" : alreadyRunning ? "busy" : "not_started",
+	});
 });
 
 // Dismiss a working-directory recovery display message after continuation succeeds.

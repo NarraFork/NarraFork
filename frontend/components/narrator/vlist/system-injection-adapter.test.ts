@@ -870,17 +870,11 @@ describe("framed system cards — the navigation target", () => {
 		return coerceInjectionTarget((specs[0]?.data as { target?: unknown })?.target) ?? null;
 	}
 
-	it("review feedback points at the review chapter it came from", () => {
-		expect(
-			framedTarget({
-				type: "review_feedback",
-				verdict: "approve",
-				findings: [],
-				reviewChapterId: "chap-review-1",
-				text: "looks good",
-			}),
-		).toEqual({ kind: "chapter", chapterId: "chap-review-1" });
-	});
+	// `review_feedback` used to be framed and therefore had a clickable speaker header
+	// pointing at the review chapter. It is its own `review-card` element now, which has no
+	// speaker row — so it has no navigation target, and asserting one here would pin a
+	// shape that no longer exists. (The block still carries `reviewChapterId`, so the
+	// affordance can be restored on the card's own header when it is wanted.)
 
 	it("a merge summary points at the source chapter that was merged in", () => {
 		expect(

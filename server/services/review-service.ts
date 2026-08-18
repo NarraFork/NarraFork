@@ -14,7 +14,7 @@ import type { Locale } from "../lib/prompt-i18n";
 import { buildReviewSystemPrompt, getReviewStartMessage } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { slugify } from "../lib/slug";
-import { ensureChapterSnapshot } from "./chapter-snapshot-ref";
+import { advanceChapterSnapshot, ensureChapterSnapshot } from "./chapter-snapshot-ref";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
@@ -337,8 +337,32 @@ export const reviewService = {
 	},
 
 	/**
-	 * Check git state of a review chapter after an agent turn.
-	 * If dirty (files modified or HEAD moved), reset and return a message for re-injection.
+	 * Check a review workspace after an agent turn, restoring it if the reviewer wrote.
+	 *
+	 * ## Why this compares tree hashes and not `git status`
+	 *
+	 * It used to ask `git status` whether anything was uncommitted, and that question is
+	 * unanswerable here: `createReview` deliberately transfers the AUTHOR's uncommitted
+	 * work into this worktree (see {@link transferWorkingState}), so the reviewed changes
+	 * are themselves uncommitted and untracked. Every turn therefore read as dirty, and
+	 * the "repair" — `reset --hard` plus `git checkout HEAD -- .` and `git clean -fd` —
+	 * deleted the very code under review. The reviewer then re-examined an empty
+	 * workspace, reported that the files no longer existed, and the check fired again on
+	 * the next turn: a loop that could not terminate while the source had any
+	 * uncommitted work.
+	 *
+	 * `refs/nf/base` names the exact state the reviewer was handed, which is the only
+	 * thing "did the reviewer change something" can honestly be measured against. It is
+	 * stable by construction: `transferWorkingState` writes it once, and the snapshot
+	 * hooks that run on the review narrator's own tool calls only advance
+	 * `refs/nf/head`.
+	 *
+	 * ## Why a missing baseline means "clean" rather than falling back
+	 *
+	 * The old `git status` path is not a safe fallback — it is the bug. Declining to
+	 * check costs a soft guard (the system prompt already tells the reviewer not to
+	 * modify files, and a stray edit lives only in a throwaway worktree); falling back
+	 * costs the user the code being reviewed.
 	 */
 	async checkAndResetGitState(
 		reviewChapterId: string,
@@ -357,49 +381,71 @@ export const reviewService = {
 		try {
 			// Held across the whole observe-then-restore sequence rather than relying on the
 			// individual writes' own locks. The decision of *what* to restore comes from the
-			// status and HEAD read at the top, so a write landing between the read and the
-			// reset would be judged by an observation that no longer describes the worktree:
-			// a `reset --hard` + `discardAll` chosen for an earlier state then destroys it.
+			// state read at the top, so a write landing between the read and the restore
+			// would be judged by an observation that no longer describes the worktree.
 			// Two overlapping turn-end checks are the realistic trigger, and both would
 			// otherwise pass through the per-method locks one after the other.
 			return await worktreeLock.acquire(worktreePath, async () => {
-				// Check for uncommitted changes
-				const status = await gitService.getStatusSummary(worktreePath);
-				const hasChanges = status.staged > 0 || status.unstaged > 0 || status.untracked > 0;
-
-				// Check HEAD hasn't moved
-				const currentHead = await gitService.getHeadCommit(worktreePath);
-				const headMoved = currentHead !== expectedSha;
-
-				if (!hasChanges && !headMoved) {
+				const baselineTree = await this.resolveReviewBaselineTree(worktreePath);
+				if (!baselineTree) {
+					logger.warn("Review workspace has no baseline snapshot; skipping the dirty check", {
+						reviewChapterId,
+						worktreePath,
+					});
 					return { clean: true };
 				}
 
-				// Reset to expected state. Unlocked variants: this block owns the lock.
+				const currentTree = await worktreeTreeSnapshot.tryCapture(worktreePath);
+				if (!currentTree) {
+					logger.warn("Could not capture the review workspace; skipping the dirty check", {
+						reviewChapterId,
+						worktreePath,
+					});
+					return { clean: true };
+				}
+
+				const contentChanged = currentTree !== baselineTree;
+				const currentHead = await gitService.getHeadCommit(worktreePath);
+				const headMoved = currentHead !== expectedSha;
+
+				if (!contentChanged && !headMoved) {
+					return { clean: true };
+				}
+
+				// Order is load-bearing. `reset --hard` throws away uncommitted work, and in
+				// this worktree that work IS the change under review, so the baseline has to
+				// be written back afterwards — unconditionally, because a commit the reviewer
+				// made may also have absorbed some of it.
 				if (headMoved) {
 					await gitService.resetHardUnlocked(worktreePath, expectedSha);
 				}
-				await gitService.discardAllUnlocked(worktreePath);
+				await worktreeTreeSnapshot.materializeTree(worktreePath, baselineTree);
 
 				const reasons: string[] = [];
-				if (hasChanges) reasons.push("file modifications detected");
+				if (contentChanged) reasons.push("file modifications detected");
 				if (headMoved) reasons.push("HEAD commit was moved");
 
+				// Says "the state under review" rather than "the original state": the earlier
+				// wording implied a return to the last commit, and a reviewer reading it
+				// concluded the changes were never supposed to be there.
 				const message =
-					`[System] Your working tree has been reset to the original state (${reasons.join(", ")}). ` +
+					`[System] Your working tree has been restored to the state under review (${reasons.join(", ")}). ` +
+					"The changes being reviewed — including uncommitted ones — are present again. " +
 					"As a reviewer, you must not modify any files. " +
-					"Please re-examine the code and output your review conclusion based on the original source.";
+					"Please re-examine the code and submit your review conclusion with ConcludeReview.";
 
-				logger.info("Review git state reset", {
+				logger.info("Review workspace restored to its baseline", {
 					reviewChapterId,
 					reasons,
 					expectedSha,
+					baselineTree,
+					currentTree,
 				});
 
 				return { clean: false, message };
 			});
 		} catch (err) {
-			logger.error("Failed to check/reset review git state", {
+			logger.error("Failed to check/restore review git state", {
 				reviewChapterId,
 				error: String(err),
 			});
@@ -408,31 +454,42 @@ export const reviewService = {
 	},
 
 	/**
-	 * Mark a review as concluded when the agent loop ends cleanly.
-	 * If a structured conclusion exists in review_conclusions (written by ConcludeReview tool),
-	 * the review is concluded with that data. Otherwise, it's concluded without structured data.
+	 * Announce a review conclusion, moving the chapter to `concluded` the first time.
+	 *
+	 * An already-concluded review still emits the event. The event means "there is a new
+	 * conclusion", not "the status changed": a reviewer that revises its verdict (after
+	 * the workspace guard restored its files, say) must be able to reach the source
+	 * chapter again, and gating the announcement on the status transition made the second
+	 * submission silently go nowhere.
+	 *
+	 * `converted` and `dismissed` stay closed — those reviews have had their worktree and
+	 * narrator torn down, so there is no consistent thing left to announce.
 	 */
 	async concludeReview(reviewChapterId: string) {
 		const chapter = await db.query.chapters.findFirst({
 			where: eq(chapters.id, reviewChapterId),
 		});
 		if (!chapter || chapter.role !== "review") return;
-		if (chapter.reviewStatus !== "reviewing") return;
+		if (chapter.reviewStatus !== "reviewing" && chapter.reviewStatus !== "concluded") return;
 		if (!chapter.reviewSourceChapterId) return;
 
+		const revised = chapter.reviewStatus === "concluded";
 		const now = new Date().toISOString();
-		await db
-			.update(chapters)
-			.set({ reviewStatus: "concluded", updatedAt: now })
-			.where(eq(chapters.id, reviewChapterId));
+		if (!revised) {
+			await db
+				.update(chapters)
+				.set({ reviewStatus: "concluded", updatedAt: now })
+				.where(eq(chapters.id, reviewChapterId));
+		}
 
 		eventBus.emit({
 			type: "review:concluded",
 			reviewChapterId,
 			sourceChapterId: chapter.reviewSourceChapterId,
+			revised,
 		});
 
-		logger.info("Review concluded", { reviewChapterId });
+		logger.info(revised ? "Review conclusion revised" : "Review concluded", { reviewChapterId });
 	},
 
 	/**
@@ -707,13 +764,24 @@ export const reviewService = {
 	 * misses the review. Adopting the source's lineage additionally means the review
 	 * chapter can later be forked or merged in snapshot space like any other.
 	 *
+	 * Whichever path runs, `refs/nf/base` ends up naming the state the reviewer was
+	 * handed. That ref is what {@link checkAndResetGitState} compares against, and it is
+	 * the only stable answer available: `refs/nf/head` advances on every tool call the
+	 * review narrator makes, and `git status` cannot answer the question at all, because
+	 * the transferred work IS uncommitted by construction (see A2 below).
+	 *
 	 * Never throws: a review that shows committed state plus a warning is far more
 	 * useful than no review at all.
 	 */
 	async transferWorkingState(
 		sourceWorktree: string,
 		targetWorktree: string,
-	): Promise<{ snapshotCommitSha: string | null; viaSnapshot: boolean }> {
+	): Promise<{
+		snapshotCommitSha: string | null;
+		viaSnapshot: boolean;
+		/** Snapshot commit `refs/nf/base` was left pointing at, when one could be recorded. */
+		baselineCommitSha: string | null;
+	}> {
 		try {
 			const source = await ensureChapterSnapshot(sourceWorktree, "review base state");
 			if (source) {
@@ -729,8 +797,14 @@ export const reviewService = {
 				);
 				if (adopted) {
 					await worktreeTreeSnapshot.setRef(targetWorktree, SNAPSHOT_HEAD_REF, adopted);
+					return { snapshotCommitSha: adopted, viaSnapshot: true, baselineCommitSha: adopted };
 				}
-				return { snapshotCommitSha: adopted ?? null, viaSnapshot: true };
+				// The bytes are right (`restoreInto` already ran) but the lineage did not
+				// come across, so `refs/nf/base` is still unset. Recording one locally keeps
+				// the dirty check working: without it every turn-end check falls into the
+				// "no baseline" branch and stops guarding at all.
+				const baseline = await this.recordReviewBaseline(targetWorktree);
+				return { snapshotCommitSha: baseline, viaSnapshot: true, baselineCommitSha: baseline };
 			}
 		} catch (err) {
 			logger.warn("Snapshot transfer into the review worktree failed; copying dirty files", {
@@ -740,7 +814,74 @@ export const reviewService = {
 			});
 		}
 		await this.copyDirtyFiles(sourceWorktree, targetWorktree);
-		return { snapshotCommitSha: null, viaSnapshot: false };
+		// Same reasoning as the `!adopted` branch: the copy path never touches the DAG,
+		// so the baseline has to be captured here or the guard has nothing to compare to.
+		const baseline = await this.recordReviewBaseline(targetWorktree);
+		return { snapshotCommitSha: null, viaSnapshot: false, baselineCommitSha: baseline };
+	},
+
+	/**
+	 * Capture the review workspace as it stands and record it as `refs/nf/base`.
+	 *
+	 * For the transfer paths that produced correct bytes without carrying a lineage
+	 * across. Advancing the DAG first (rather than only writing a tree) is what makes
+	 * the baseline a commit, which `refs/nf/base` requires and which keeps the review
+	 * workspace forkable/mergeable like any other.
+	 *
+	 * ## Write-once
+	 *
+	 * An existing baseline is returned unchanged rather than replaced. The guard is a
+	 * comparison AGAINST this ref, so re-recording it on a workspace the reviewer has
+	 * already written to would adopt those writes as "the state under review" — after
+	 * which every later check compares the workspace with itself, reports clean, and
+	 * silently stops reverting anything. There is no error in that state and no symptom
+	 * other than a reviewer's edits surviving, which looks like the reviewer complying.
+	 *
+	 * Only ever called right after a transfer, so the early return is not a behaviour
+	 * change for the real call sites — it is a guard against a second caller appearing.
+	 *
+	 * Returns null instead of throwing: a review with no baseline degrades to "the
+	 * reviewer's edits are not reverted", while a throw here would abort the whole
+	 * review creation and roll it back.
+	 */
+	async recordReviewBaseline(worktreePath: string): Promise<string | null> {
+		try {
+			const existing = await worktreeTreeSnapshot
+				.getRef(worktreePath, SNAPSHOT_BASE_REF)
+				.catch(() => null);
+			if (existing) {
+				logger.debug("Review baseline already recorded; keeping the original", {
+					worktreePath,
+					baselineCommitSha: existing,
+				});
+				return existing;
+			}
+			const advanced = await advanceChapterSnapshot(worktreePath, null, "review base state");
+			if (!advanced) return null;
+			await worktreeTreeSnapshot.setRef(worktreePath, SNAPSHOT_BASE_REF, advanced.commitSha);
+			return advanced.commitSha;
+		} catch (err) {
+			logger.warn("Could not record the review baseline snapshot", {
+				worktreePath,
+				error: String(err),
+			});
+			return null;
+		}
+	},
+
+	/**
+	 * The tree the reviewer was handed, or null when it cannot be resolved.
+	 *
+	 * Read from `refs/nf/base` rather than from a column, because the ref is already
+	 * the stable answer: `transferWorkingState` writes it once and nothing moves it
+	 * afterwards (`advanceChapterSnapshot` only touches `refs/nf/head`).
+	 */
+	async resolveReviewBaselineTree(worktreePath: string): Promise<string | null> {
+		const baseCommit = await worktreeTreeSnapshot
+			.getRef(worktreePath, SNAPSHOT_BASE_REF)
+			.catch(() => null);
+		if (!baseCommit) return null;
+		return worktreeTreeSnapshot.treeOfSnapshot(worktreePath, baseCommit).catch(() => null);
 	},
 
 	/**

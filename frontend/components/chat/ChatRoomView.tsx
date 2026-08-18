@@ -50,6 +50,13 @@ import { ApiError } from "../../lib/api/client";
 import { copyTextToClipboard } from "../../lib/clipboard";
 import { ChatComposerAttachments, type PendingChatAttachment } from "./ChatComposerAttachments";
 import { ChatMessageList, type ChatMessageListHandle } from "./ChatMessageList";
+import {
+	clearChatComposerDraft,
+	getChatDraftStorageId,
+	persistChatComposerDraft,
+	readChatComposerDraft,
+	type StoredChatDraftAttachment,
+} from "./chat-composer-draft";
 import { buildForwardText } from "./chat-forward-text";
 import { CHAT_HEADER_HEIGHT } from "./chat-header";
 import type { ChatReplyInfo } from "./chat-list-layout";
@@ -58,6 +65,13 @@ import type { ChatReplyInfo } from "./chat-list-layout";
 const CHAT_MESSAGE_MAX_CHARS = 8_000;
 /** Mirror of `CHAT_ATTACHMENTS_PER_MESSAGE_MAX` (server). */
 const CHAT_ATTACHMENTS_PER_MESSAGE_MAX = 10;
+/**
+ * Mirror of `CHAT_ATTACHMENTS_UNAVAILABLE_CODE` (server/lib/chat-attachments.ts).
+ *
+ * Mirrored, like the two above, because that module imports `node:path` and the
+ * server data directory at module scope and cannot be bundled for the browser.
+ */
+const CHAT_ATTACHMENTS_UNAVAILABLE_CODE = "CHAT_ATTACHMENTS_UNAVAILABLE";
 /**
  * How long a jumped-to message stays outlined.
  *
@@ -136,6 +150,103 @@ export function ChatRoomView({
 		},
 		[],
 	);
+
+	// ── Composer draft persistence ──────────────────────────────────────────
+	//
+	// A refresh AND a room switch both remount this view (`key={roomId}` at every
+	// call site), so without this the typed text and the already-uploaded
+	// attachments are dropped with no indication that anything was lost.
+
+	/**
+	 * Storage scope this mount has restored, or null before it has.
+	 *
+	 * Gates the persist effect below: writing before the read lands would store
+	 * the empty initial state OVER a real draft, destroying exactly what this is
+	 * meant to preserve. It is a ref rather than state because the persist effect
+	 * must observe the change without re-running for it.
+	 */
+	const draftHydratedScopeRef = useRef<string | null>(null);
+
+	/**
+	 * Upload times for attachments picked in this mount, plus those restored.
+	 *
+	 * The expiry clock has to keep running across reloads: it measures the age of
+	 * the server-side row, so re-stamping it on every save would let a draft that
+	 * is reopened daily hold an id the server reclaimed on day one. A `PendingChatAttachment`
+	 * has nowhere to carry this (it mirrors what the chip renders), so it lives
+	 * beside it, keyed by attachment id.
+	 */
+	const restoredUploadedAtRef = useRef<Map<string, number>>(new Map());
+
+	useEffect(() => {
+		// `currentUserId` comes from a query, so it is null on the first render(s).
+		// Hydration therefore has to be an effect keyed on it, not a lazy state
+		// initialiser — the initialiser would run while the id is still unknown and
+		// silently restore nothing.
+		if (!currentUserId || !roomId) return;
+		const scope = getChatDraftStorageId(currentUserId, roomId);
+		if (draftHydratedScopeRef.current === scope) return;
+		const stored = readChatComposerDraft(currentUserId, roomId);
+		draftHydratedScopeRef.current = scope;
+		// Anything typed before the user id resolved wins: it is newer than what was
+		// stored, and overwriting it would lose keystrokes the user just made.
+		setDraft((current) => (current ? current : stored.text));
+		if (stored.attachments.length > 0) {
+			restoredUploadedAtRef.current = new Map(
+				stored.attachments.map((item) => [item.id, item.uploadedAtMs]),
+			);
+			setPending((current) =>
+				current.length > 0
+					? current
+					: stored.attachments.map((item) => ({
+							localId: `restored-${item.id}`,
+							filename: item.filename,
+							sizeBytes: item.sizeBytes,
+							status: "ready" as const,
+							attachment: {
+								id: item.id,
+								kind: item.kind,
+								filename: item.filename,
+								mediaType: item.mediaType,
+								sizeBytes: item.sizeBytes,
+								// Not stored: only the chat LIST needs dimensions (to reserve row
+								// height without loading the image), and a composer chip never
+								// renders the image. Persisting them would be dead weight.
+								width: null,
+								height: null,
+							},
+						})),
+			);
+		}
+	}, [currentUserId, roomId]);
+
+	useEffect(() => {
+		if (!currentUserId || !roomId) return;
+		if (draftHydratedScopeRef.current !== getChatDraftStorageId(currentUserId, roomId)) return;
+		// Only `ready` chips are stored. An `uploading` one has no server id yet, and
+		// an `error` one names nothing the server holds — restoring either would
+		// produce a chip that can never be sent.
+		const attachments: StoredChatDraftAttachment[] = [];
+		for (const item of pending) {
+			const attachment = item.attachment;
+			if (item.status !== "ready" || !attachment) continue;
+			attachments.push({
+				id: attachment.id,
+				filename: attachment.filename,
+				sizeBytes: attachment.sizeBytes,
+				kind: attachment.kind,
+				mediaType: attachment.mediaType,
+				// Preserve the original upload time when there is one; only a chip first
+				// seen in this mount is stamped now.
+				uploadedAtMs: restoredUploadedAtRef.current.get(attachment.id) ?? Date.now(),
+			});
+			restoredUploadedAtRef.current.set(
+				attachment.id,
+				attachments[attachments.length - 1].uploadedAtMs,
+			);
+		}
+		persistChatComposerDraft(currentUserId, roomId, { text: draft, attachments });
+	}, [currentUserId, draft, pending, roomId]);
 
 	const messageIndexById = useMemo(() => {
 		const map = new Map<string, number>();
@@ -218,6 +329,7 @@ export function ChatRoomView({
 					// the user can see what did NOT go out and retry it — dropping it here
 					// would lose the attachment without ever saying so.
 					setPending((previous) => previous.filter((item) => item.status === "error"));
+					if (currentUserId && roomId) clearChatComposerDraft(currentUserId, roomId);
 				},
 				onError: (error) => {
 					notifications.show({
@@ -225,10 +337,33 @@ export function ChatRoomView({
 						title: t("sendFailed"),
 						message: error instanceof Error ? error.message : "",
 					});
+					// A restored attachment may name a row the server has already reclaimed
+					// (its 24h window elapsed, or it was sent from another tab). The server
+					// answers that with a single "attachments are unavailable" for the whole
+					// batch, so mark the ready chips as failed: the notification alone would
+					// leave the user staring at chips that look fine but cannot be sent.
+					if (error instanceof ApiError && error.data?.code === CHAT_ATTACHMENTS_UNAVAILABLE_CODE) {
+						setPending((previous) =>
+							previous.map((item) =>
+								item.status === "ready"
+									? { ...item, status: "error", error: t("attachmentNoLongerAvailable") }
+									: item,
+							),
+						);
+					}
 				},
 			},
 		);
-	}, [draft, hasUploadsInFlight, readyAttachmentIds, replyTo, roomId, sendMessage, t]);
+	}, [
+		currentUserId,
+		draft,
+		hasUploadsInFlight,
+		readyAttachmentIds,
+		replyTo,
+		roomId,
+		sendMessage,
+		t,
+	]);
 
 	// ── Attachments ─────────────────────────────────────────────────────────
 

@@ -80,6 +80,11 @@ const PLATFORM_SOURCES = new Set([
 	"browser_session_lost",
 	"spec_continuation",
 	"spec_blocked_continuation",
+	// A concluded review is announced BY the platform: the reviewer is a separate
+	// chapter with its own narrator, and this row is NarraFork reporting its verdict
+	// rather than that narrator speaking here. Missing from this list, it fell through
+	// to "unknown sender" — which is what the reader actually saw on every review.
+	"review_feedback",
 	// ⚠️ These three do NOT reach this header yet, and their `sidecar.sources.*` keys are
 	// therefore unused TODAY — do not delete either as orphans. The adapter deliberately
 	// keeps them as standalone `system-text` cards because their buttons are wired by

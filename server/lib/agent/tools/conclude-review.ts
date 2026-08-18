@@ -10,7 +10,9 @@ export const concludeReviewTool: ToolDefinition = {
 	name: "ConcludeReview",
 	description:
 		"Submit your structured review conclusion. You MUST call this tool when you have completed your code review. " +
-		"Do NOT output your conclusion as plain text — always use this tool to submit a structured verdict and findings.",
+		"Do NOT output your conclusion as plain text — always use this tool to submit a structured verdict and findings. " +
+		"Calling it again after you have already concluded replaces your earlier conclusion, which is what to do if you " +
+		"were asked to re-examine the code.",
 	rawJsonSchema: {
 		type: "object",
 		properties: {
@@ -107,16 +109,25 @@ export const concludeReviewTool: ToolDefinition = {
 			};
 		}
 
-		if (chapter.reviewStatus !== "reviewing") {
+		// A concluded review accepts a REVISED conclusion. Refusing it made the platform
+		// contradict itself: the workspace guard restores the reviewer's files and asks it
+		// to re-examine and re-submit, and the only tool for submitting then answered
+		// "Review is already concluded" — leaving findings the reviewer had disowned as
+		// the source chapter's latest word. `converted` and `dismissed` stay closed: those
+		// reviews have had their worktree and narrator torn down, so there is nothing
+		// coherent left to revise.
+		const revising = chapter.reviewStatus === "concluded";
+		if (chapter.reviewStatus !== "reviewing" && !revising) {
 			return {
-				output: `Error: Review is already ${chapter.reviewStatus ?? "in an invalid state"}.`,
+				output: `Error: Review is ${chapter.reviewStatus ?? "in an invalid state"} and can no longer accept a conclusion.`,
 				isError: true,
 			};
 		}
 
 		const now = new Date().toISOString();
 
-		// Write structured conclusion to the database
+		// Appended, not overwritten: `review_conclusions` is read newest-first, so a new
+		// row IS the current conclusion while the superseded one stays auditable.
 		await db.insert(reviewConclusions).values({
 			id: generateId(),
 			reviewChapterId: ctx.chapterId,
@@ -129,14 +140,18 @@ export const concludeReviewTool: ToolDefinition = {
 		// Import lazily to avoid a startup cycle through narrator-session -> agent index.
 		const { reviewService } = await import("../../../services/review-service");
 
-		// Trigger the existing concludeReview flow (status update + event emission)
+		// Status update (first time only) + event emission (every time, so a revision
+		// reaches the source chapter too).
 		await reviewService.concludeReview(ctx.chapterId);
 
-		logger.info("Structured review conclusion submitted", {
-			reviewChapterId: ctx.chapterId,
-			verdict,
-			findingsCount: findings.length,
-		});
+		logger.info(
+			revising ? "Revised review conclusion submitted" : "Structured review conclusion submitted",
+			{
+				reviewChapterId: ctx.chapterId,
+				verdict,
+				findingsCount: findings.length,
+			},
+		);
 
 		// Build a human-readable summary for the tool output
 		const severityCounts = { critical: 0, major: 0, minor: 0, suggestion: 0 };
@@ -150,7 +165,11 @@ export const concludeReviewTool: ToolDefinition = {
 
 		return {
 			output:
-				`Review conclusion submitted successfully.\n` +
+				`${
+					revising
+						? "Revised review conclusion submitted successfully — it replaces your earlier one."
+						: "Review conclusion submitted successfully."
+				}\n` +
 				`Verdict: ${verdict}\n` +
 				`Findings: ${findings.length} total${countParts ? ` (${countParts})` : ""}`,
 		};

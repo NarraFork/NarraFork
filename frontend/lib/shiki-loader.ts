@@ -100,15 +100,63 @@ let shikiCache: ShikiModule | null = null;
 type ThemeEnsurer = (theme: string) => Promise<boolean>;
 const themeEnsurers = new WeakMap<object, ThemeEnsurer>();
 
-async function getCore() {
-	if (!corePromise) {
-		corePromise = createHighlighterCore({
-			engine: createShikiOnigurumaEngine(),
-			langs: [],
-			themes: [],
-		}).catch(() => null);
-	}
-	return corePromise;
+/**
+ * Cache a single-flight async result, but only when it SUCCEEDED.
+ *
+ * The eviction is the whole point. The promises this guards are module-level, so
+ * a cached failure outlives every component that asked for it and the only way
+ * to clear it is a full page load. That produced a genuinely confusing bug: one
+ * transient failure (a cold PWA start where the inlined Oniguruma WASM chunk
+ * times out, a flaky mobile network) permanently disabled syntax highlighting
+ * for the whole session, and because the failure path renders a plain `<Code>`
+ * block, the app looked like it had simply decided the file needed no colours.
+ * Restarting the PWA "fixed" it — the signature of cached module state.
+ *
+ * Failures are therefore evicted so a later call retries, matching what
+ * `createShikiLanguageEnsurer` and `createShikiThemeEnsurer` already do for
+ * grammars and themes. A successful promise stays cached forever, so this costs
+ * nothing in the normal case and cannot re-create the core per highlight.
+ *
+ * Extracted (and exported) because "retry after failure" is invisible in the
+ * happy path: nothing observable changes until something fails, so a regression
+ * here would only surface as a user restarting the app to get colours back.
+ */
+export function cacheSuccessfulResult<T>(
+	read: () => Promise<T | null> | null,
+	write: (promise: Promise<T | null> | null) => void,
+	start: () => Promise<T | null>,
+): Promise<T | null> {
+	const existing = read();
+	if (existing) return existing;
+
+	const attempt = start();
+	write(attempt);
+	void attempt.then(
+		(value) => {
+			// Compare identity before clearing: a concurrent caller may already have
+			// installed a newer attempt, and dropping that one would undo its result.
+			if (value == null && read() === attempt) write(null);
+		},
+		() => {
+			if (read() === attempt) write(null);
+		},
+	);
+	return attempt;
+}
+
+function getCore() {
+	return cacheSuccessfulResult(
+		() => corePromise,
+		(promise) => {
+			corePromise = promise;
+		},
+		() =>
+			createHighlighterCore({
+				engine: createShikiOnigurumaEngine(),
+				langs: [],
+				themes: [],
+			}).catch(() => null),
+	);
 }
 
 function ensureTheme(
@@ -132,50 +180,57 @@ function ensureTheme(
  * its requested language and theme modules.
  */
 export function loadShiki(): Promise<ShikiModule | null> {
-	if (!shikiPromise) {
-		shikiPromise = getCore().then((core) => {
-			if (!core) return null;
+	// Same success-only caching as `getCore`, and needed for the same reason: this
+	// layer would otherwise cache the core's null just as durably, making the
+	// retry inside `getCore` unreachable.
+	return cacheSuccessfulResult(
+		() => shikiPromise,
+		(promise) => {
+			shikiPromise = promise;
+		},
+		() =>
+			getCore().then((core) => {
+				if (!core) return null;
 
-			const ensureLanguage = createShikiLanguageEnsurer(
-				languageAliases,
-				(canonicalId) => import(/* @vite-ignore */ getLanguageUrl(canonicalId)),
-				(language) => core.loadLanguage(language as Parameters<typeof core.loadLanguage>[0]),
-			);
-			const module: ShikiModule = {
-				bundledLanguages,
-				codeToHtml: async (code, options) => {
-					const [canonicalLanguage, themeReady] = await Promise.all([
-						ensureLanguage(options.lang),
-						ensureTheme(core, options.theme),
-					]);
-					if (!canonicalLanguage || !themeReady) {
-						throw new Error("Shiki language or theme unavailable");
-					}
-					return core.codeToHtml(code, {
-						lang: canonicalLanguage as BundledLanguage,
-						theme: options.theme,
-					});
-				},
-				codeToTokens: async (code, options) => {
-					const [canonicalLanguage, themeReady] = await Promise.all([
-						ensureLanguage(options.lang),
-						ensureTheme(core, options.theme),
-					]);
-					if (!canonicalLanguage || !themeReady) {
-						throw new Error("Shiki language or theme unavailable");
-					}
-					return core.codeToTokens(code, {
-						lang: canonicalLanguage as BundledLanguage,
-						theme: options.theme,
-					});
-				},
-			};
+				const ensureLanguage = createShikiLanguageEnsurer(
+					languageAliases,
+					(canonicalId) => import(/* @vite-ignore */ getLanguageUrl(canonicalId)),
+					(language) => core.loadLanguage(language as Parameters<typeof core.loadLanguage>[0]),
+				);
+				const module: ShikiModule = {
+					bundledLanguages,
+					codeToHtml: async (code, options) => {
+						const [canonicalLanguage, themeReady] = await Promise.all([
+							ensureLanguage(options.lang),
+							ensureTheme(core, options.theme),
+						]);
+						if (!canonicalLanguage || !themeReady) {
+							throw new Error("Shiki language or theme unavailable");
+						}
+						return core.codeToHtml(code, {
+							lang: canonicalLanguage as BundledLanguage,
+							theme: options.theme,
+						});
+					},
+					codeToTokens: async (code, options) => {
+						const [canonicalLanguage, themeReady] = await Promise.all([
+							ensureLanguage(options.lang),
+							ensureTheme(core, options.theme),
+						]);
+						if (!canonicalLanguage || !themeReady) {
+							throw new Error("Shiki language or theme unavailable");
+						}
+						return core.codeToTokens(code, {
+							lang: canonicalLanguage as BundledLanguage,
+							theme: options.theme,
+						});
+					},
+				};
 
-			shikiCache = module;
-			return module;
-		});
-	}
-	return shikiPromise;
+				shikiCache = module;
+				return module;
+			}),
+	);
 }
 
 /**

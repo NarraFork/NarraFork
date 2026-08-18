@@ -170,6 +170,10 @@ export const SEGMENT_RIGHT = GROUP_GAP + SEGMENT_DISMISS_WIDTH; // 64
 export const SPEC_GOAL_BADGE_RESERVE = 80 + GROUP_GAP_XS + 50 + GROUP_GAP_XS; // 150
 /** spec carryover: 1 badge (fork/eraser) + gap LEFT of the description text. */
 export const SPEC_FORK_BADGE_RESERVE = 110 + GROUP_GAP_XS; // 120
+// A `review_feedback` kind briefly lived here with its own badge reserve. Both are gone:
+// guessing a badge lane's width made the body wrap in a column that did not line up with
+// the badges actually drawn, and a review conclusion needs markdown and a scroll box that
+// this module's plain pre-wrap body cannot provide. See measure-review-card.ts.
 
 // ── Per-kind chrome descriptor ───────────────────────────────────────────────
 

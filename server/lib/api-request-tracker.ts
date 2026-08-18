@@ -109,8 +109,98 @@ function buildPersistableRawDump(options: ApiRequestFinishOptions): unknown {
  * Absolute ceiling for force-persisted dumps, independent of the user-configurable
  * `requestDumpMaxSize`. Force-persist bypasses the configurable cap on purpose, but a
  * single SQLite row must still never grow without bound (see CLAUDE.md large-field rules).
+ *
+ * Kept at or above the configurable default: force-persist exists to guarantee a dump is
+ * retained, so it must never end up stricter than the ceiling ordinary dumps get.
  */
-export const FORCED_DUMP_HARD_MAX_BYTES = 8 * 1024 * 1024;
+export const FORCED_DUMP_HARD_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Floor for the request-body text kept by {@link shrinkRawDump}.
+ *
+ * Shrinking spends whatever budget the configured ceiling leaves (see
+ * {@link shrinkRawDump}); this is only the "even a tiny ceiling keeps something
+ * recognizable" minimum. A malformed content part is visible near the head of the
+ * serialized body, so a small head is still a usable diagnosis.
+ */
+const MIN_SHRUNK_BODY_TEXT_CHARS = 32 * 1024;
+
+/**
+ * Bytes reserved for the dump's non-body fields (provider, model, url, headers,
+ * diagnostics, response metadata) when computing the body budget. Generous on purpose:
+ * overshooting only costs a second serialization pass, while undershooting would push
+ * the shrunken dump back over the ceiling and lose the body entirely.
+ */
+const SHRINK_OVERHEAD_BUDGET_BYTES = 64 * 1024;
+
+function truncateText(value: unknown, maxChars: number): unknown {
+	if (typeof value !== "string" || value.length <= maxChars) return value;
+	return `${value.slice(0, maxChars)}\n\n[... truncated ${
+		value.length - maxChars
+	} chars to fit agent.requestDumpMaxSize]`;
+}
+
+/**
+ * Reduce a too-large dump while preserving what a dump exists to answer: the request
+ * that was sent and the upstream's reply to it.
+ *
+ * Previously an oversized dump was replaced wholesale by `{ diagnostics }`. That made
+ * the dump feature silently useless in exactly the case it is turned on for: a failing
+ * request always carries diagnostics (the agent loop builds them unconditionally), and a
+ * request body carrying full conversation history routinely exceeds the 1MB default. The
+ * user saw `request: null` / `response: null` and concluded dumping was broken — it was.
+ *
+ * Shedding order follows what is least useful for diagnosis: SSE events first (a failed
+ * request has none worth keeping), then the response body text, then the request body.
+ *
+ * `maxBytes` is the ceiling the result has to fit in, and the body keeps as much of that
+ * budget as the rest of the dump leaves it — a 1MB ceiling must not yield a 24KB body.
+ * `maxBytes < 0` means "no ceiling", in which case only the events are shed.
+ */
+function shrinkRawDump(persistable: unknown, maxBytes: number): unknown {
+	if (persistable == null || typeof persistable !== "object" || Array.isArray(persistable)) {
+		return persistable;
+	}
+	const dump = { ...(persistable as Record<string, unknown>) };
+	const bodyBudget =
+		maxBytes < 0
+			? Number.POSITIVE_INFINITY
+			: Math.max(MIN_SHRUNK_BODY_TEXT_CHARS, maxBytes - SHRINK_OVERHEAD_BUDGET_BYTES);
+
+	const response = dump.response;
+	if (response != null && typeof response === "object" && !Array.isArray(response)) {
+		const next = { ...(response as Record<string, unknown>) };
+		// Streamed events are the bulkiest and least diagnostic part of a rejected request.
+		if (next.events !== undefined) {
+			const count = Array.isArray(next.events) ? next.events.length : undefined;
+			next.events = { dropped: true, ...(count !== undefined ? { count } : {}) };
+		}
+		// The upstream's own error text is short and is the most direct statement of what
+		// it rejected, so it is trimmed only against the full budget, never below it.
+		next.bodyText = truncateText(next.bodyText, bodyBudget);
+		dump.response = next;
+	}
+
+	const request = dump.request;
+	if (request != null && typeof request === "object" && !Array.isArray(request)) {
+		const next = { ...(request as Record<string, unknown>) };
+		if (next.body !== undefined) {
+			const bodyText = JSON.stringify(next.body) ?? "";
+			if (bodyText.length > bodyBudget) {
+				// Serialize to text rather than pruning the object graph: which key is
+				// oversized varies per provider, and the head of the JSON is what shows
+				// the offending content part.
+				next.body = undefined;
+				next.bodyChars = bodyText.length;
+				next.bodyTextTruncated = true;
+				next.bodyText = truncateText(bodyText, bodyBudget);
+			}
+		}
+		dump.request = next;
+	}
+
+	return dump;
+}
 
 /**
  * Serialize a raw dump for storage, enforcing the `requestDumpMaxSize` byte ceiling.
@@ -119,6 +209,10 @@ export const FORCED_DUMP_HARD_MAX_BYTES = 8 * 1024 * 1024;
  * envelope is serialized. Leak-detection dumps are exempt from the *configurable* cap
  * because their raw content is already bounded by the collector and is intentionally
  * retained, but they are still subject to {@link FORCED_DUMP_HARD_MAX_BYTES}.
+ *
+ * An oversized dump is shrunk (see {@link shrinkRawDump}) rather than discarded, so the
+ * request that triggered an upstream rejection stays inspectable. Only when even the
+ * shrunken form does not fit does the bounded diagnostics envelope remain as a fallback.
  */
 export function serializeRawDump(options: ApiRequestFinishOptions): string | null {
 	const diagnostics = normalizedDiagnostics(options);
@@ -126,29 +220,38 @@ export function serializeRawDump(options: ApiRequestFinishOptions): string | nul
 	if (persistable == null) return null;
 	const json = JSON.stringify(persistable);
 	if (json == null) return null;
-	if (options.forceDumpPersist) {
-		if (json.length <= FORCED_DUMP_HARD_MAX_BYTES) return json;
-		if (diagnostics) return JSON.stringify({ diagnostics });
-		return JSON.stringify({
-			truncated: true,
-			originalBytes: json.length,
-			maxBytes: FORCED_DUMP_HARD_MAX_BYTES,
-			note: "Forced raw dump exceeded the hard row ceiling and was dropped.",
-		});
-	}
-	const maxSize = settings.agent.requestDumpMaxSize;
-	if (maxSize >= 0 && json.length > maxSize) {
+
+	const withinLimit = (candidate: string, maxBytes: number): boolean =>
+		maxBytes < 0 || candidate.length <= maxBytes;
+
+	const serializeWithinLimit = (maxBytes: number, note: string): string => {
+		if (withinLimit(json, maxBytes)) return json;
+
+		// Keep the request/response instead of collapsing to diagnostics alone.
+		const shrunk = JSON.stringify(shrinkRawDump(persistable, maxBytes));
+		if (shrunk != null && withinLimit(shrunk, maxBytes)) return shrunk;
+
 		// Never discard the bounded diagnostic summary just because the optional full dump
-		// exceeded the configurable raw-dump ceiling.
+		// exceeded the raw-dump ceiling.
 		if (diagnostics) return JSON.stringify({ diagnostics });
 		return JSON.stringify({
 			truncated: true,
 			originalBytes: json.length,
-			maxBytes: maxSize,
-			note: "Raw dump exceeded agent.requestDumpMaxSize and was dropped.",
+			maxBytes,
+			note,
 		});
+	};
+
+	if (options.forceDumpPersist) {
+		return serializeWithinLimit(
+			FORCED_DUMP_HARD_MAX_BYTES,
+			"Forced raw dump exceeded the hard row ceiling and was dropped.",
+		);
 	}
-	return json;
+	return serializeWithinLimit(
+		settings.agent.requestDumpMaxSize,
+		"Raw dump exceeded agent.requestDumpMaxSize and was dropped.",
+	);
 }
 
 export async function finishApiRequest(

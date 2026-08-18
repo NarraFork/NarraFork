@@ -36,8 +36,21 @@ export function createDetachedPanelDockValue(input: {
 	narratorId: string;
 	chapterId: string;
 	sourceDock: NarratorDockContextValue | undefined;
+	/**
+	 * The node's OWN dockview api ref, owned by the caller so it survives this value
+	 * being rebuilt.
+	 *
+	 * Load-bearing and previously wrong: this used to be a fresh `{ current: null }`
+	 * created here. Because the value is rebuilt whenever `sourceDock` changes, each
+	 * rebuild registered a NEW null ref over the live one, so every lookup through
+	 * `dock-registry` (`getPanel` for "who holds this panel?") failed. That silently
+	 * broke both directions of cross-surface dragging: a foreign tab was never
+	 * accepted (no drop overlay), and a panel dragged out was never closed on its
+	 * source — leaving it in two surfaces at once.
+	 */
+	apiRef: { current: DockviewApi | null };
 }): NarratorDockContextValue {
-	const { narratorId, chapterId, sourceDock } = input;
+	const { narratorId, chapterId, sourceDock, apiRef } = input;
 	const scrollToMessage = sourceDock?.scrollToMessage;
 	const openSubagentPanel = sourceDock?.openSubagentPanel;
 
@@ -51,9 +64,8 @@ export function createDetachedPanelDockValue(input: {
 		onBack: null,
 		onMinimize: null,
 
-		// No dockview here. The only reader is NarratorPanel's plugin-panel entry,
-		// which bails when the ref is empty — and plugin panels are not detachable.
-		apiRef: { current: null } as { current: DockviewApi | null },
+		// The node's own surface. Passed in rather than created here — see the prop doc.
+		apiRef,
 
 		// Published state: the detachable set contains no consumer of these (their
 		// consumers, details/filemod, are excluded exactly because they need a chat

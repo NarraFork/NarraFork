@@ -572,4 +572,9 @@ function SpecCarryoverCard({
 	);
 }
 
+// A `review_feedback` card briefly lived here. It is gone: this module paints its body as
+// PLAIN pre-wrap text line by line, which cannot render the markdown, inline code or
+// fenced snippets a review conclusion is written in, and its cards grow rather than
+// scroll. See render/RenderReviewCard.tsx.
+
 export const RENDER_SYSTEM_TEXT_CHROME = { CARD_PADDING, GROUP_GAP } as const;

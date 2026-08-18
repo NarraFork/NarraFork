@@ -26,6 +26,7 @@ import {
 	getPipelineStateForToolCall,
 	isPipelineControlTool,
 } from "./pipeline-state";
+import { isBashToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
 import type {
@@ -348,7 +349,7 @@ function describeExecutionTargetDrift(
 }
 
 export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKind {
-	if ((tu.name === "Bash" || tu.name === "Shell") && tu.input.run_in_background === true) {
+	if (isBashToolName(tu.name) && tu.input.run_in_background === true) {
 		return "background_bash";
 	}
 	if (

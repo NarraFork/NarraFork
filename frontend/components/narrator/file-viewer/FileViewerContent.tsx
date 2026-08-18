@@ -19,15 +19,27 @@
  * and the existing modal / image viewer own binary previews.
  */
 
-import { ActionIcon, Box, Center, Group, Loader, SegmentedControl, Text } from "@mantine/core";
+import {
+	ActionIcon,
+	Box,
+	Center,
+	Group,
+	Loader,
+	SegmentedControl,
+	Text,
+	Tooltip,
+} from "@mantine/core";
 import { useClipboard } from "@mantine/hooks";
-import { IconCheck, IconCopy, IconRefresh } from "@tabler/icons-react";
+import { notifications } from "@mantine/notifications";
+import { IconCheck, IconCopy, IconDownload, IconRefresh } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useFileSystemCapability } from "../../../hooks/usePlatform";
-import { ApiError, authorizedFetch, readFetchError } from "../../../lib/api";
+import { ApiError, api, authorizedFetch, readFetchError } from "../../../lib/api";
+import { saveBlobAsFile } from "../../../lib/file-download";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { getShikiLang } from "../../../lib/shiki-lang";
+import { TruncatedText } from "../../common/TruncatedText";
 import { ContentViewer } from "../ContentViewer";
 import { getFilePreviewType, readTextPreview } from "../FilePreviewModal";
 import { MarkdownContent } from "../MarkdownContent";
@@ -118,6 +130,23 @@ export function fileBaseName(filePath: string): string {
 	return filePath.split(/[/\\]/).pop() || filePath;
 }
 
+/**
+ * Header flex roles, named so the one rule that matters is stated once.
+ *
+ * The bug these fix: the filename was `flexShrink: 0` beside a separate flex
+ * spacer, so a long name (an `api-request-<timestamp>-<id>.json` dump is ~55
+ * chars) grew the row past the panel and pushed the mode switch and every action
+ * button out of sight. In a `nowrap` row exactly one item may absorb the leftover
+ * space and give it back — that is the filename, and the controls must hold their
+ * size.
+ *
+ * `minWidth: 0` is the non-obvious half: a flex item's automatic minimum size is
+ * its content width, so without it the name refuses to shrink below the full
+ * string and `text-overflow: ellipsis` never engages, no matter what `flex` says.
+ */
+export const HEADER_FLEXIBLE_STYLE = { flex: 1, minWidth: 0 } as const;
+export const HEADER_FIXED_STYLE = { flexShrink: 0 } as const;
+
 interface LoadState {
 	text: string | null;
 	truncated: boolean;
@@ -206,6 +235,32 @@ export function FileViewerContent({ filePath }: FileViewerContentProps) {
 
 	const reload = useCallback(() => setReloadToken((token) => token + 1), []);
 
+	const [downloading, setDownloading] = useState(false);
+
+	/**
+	 * Save the file to disk.
+	 *
+	 * Goes to `/api/fs/download` rather than reusing `load.text`: what is in state
+	 * may be truncated at the fetch cap, and for a non-text file there is no state
+	 * at all. So the download is always the real, complete bytes from disk — which
+	 * is also why this button is available for binary files the panel cannot render.
+	 */
+	const download = useCallback(async () => {
+		setDownloading(true);
+		try {
+			const { blob, fileName: served } = await api.fsDownload(filePath);
+			saveBlobAsFile(blob, served ?? fileBaseName(filePath));
+		} catch (err) {
+			notifications.show({
+				color: "red",
+				title: tRef.current("fileViewer.downloadFailed"),
+				message: err instanceof Error ? err.message : String(err),
+			});
+		} finally {
+			setDownloading(false);
+		}
+	}, [filePath]);
+
 	// Parse for node mode. A truncated read is NOT attempted at all: its tail is
 	// cut mid-token, so any parser would either fail or (worse) succeed on a
 	// partial document and present it as complete.
@@ -226,14 +281,20 @@ export function FileViewerContent({ filePath }: FileViewerContentProps) {
 
 	const header = (
 		<Group gap={6} px="xs" py={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-			<Text size="xs" fw={600} style={{ flexShrink: 0 }} truncate>
-				{fileName}
-			</Text>
-			<Box style={{ flex: 1, minWidth: 0 }} />
+			{/* The name is the ONLY flexible item here (see HEADER_FLEXIBLE_STYLE); the
+			    full path is on hover, since the basename alone is what gets clipped. */}
+			<TruncatedText
+				text={fileName}
+				tooltipLabel={filePath}
+				size="xs"
+				fw={600}
+				style={HEADER_FLEXIBLE_STYLE}
+			/>
 			{modes.length > 1 && (
 				<SegmentedControl
 					size="xs"
 					value={mode}
+					style={HEADER_FIXED_STYLE}
 					onChange={(value) => setMode(value as FileViewerMode)}
 					data={modes.map((value) => ({
 						value,
@@ -246,24 +307,47 @@ export function FileViewerContent({ filePath }: FileViewerContentProps) {
 					}))}
 				/>
 			)}
-			<ActionIcon
-				size="sm"
-				variant="subtle"
-				color="gray"
-				aria-label={t("contextMenu_copyFilePath")}
-				onClick={() => clipboard.copy(filePath)}
-			>
-				{clipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
-			</ActionIcon>
-			<ActionIcon
-				size="sm"
-				variant="subtle"
-				color="gray"
-				aria-label={t("fileViewer.reload")}
-				onClick={reload}
-			>
-				<IconRefresh size={14} />
-			</ActionIcon>
+			{/* Grouped so the buttons hold their size as one unit: as individual flex
+			    children they each carried the default `flex-shrink: 1` and would be
+			    squeezed into unclickable slivers before the filename gave up any width. */}
+			<Group gap={2} wrap="nowrap" style={HEADER_FIXED_STYLE}>
+				<Tooltip label={t("contextMenu_copyFilePath")} withinPortal>
+					<ActionIcon
+						size="sm"
+						variant="subtle"
+						color="gray"
+						aria-label={t("contextMenu_copyFilePath")}
+						onClick={() => clipboard.copy(filePath)}
+					>
+						{clipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+					</ActionIcon>
+				</Tooltip>
+				{/* Offered even when the panel cannot render the file (binary, or a read
+				    that failed): saving the bytes does not depend on previewing them. */}
+				<Tooltip label={t("fileViewer.download")} withinPortal>
+					<ActionIcon
+						size="sm"
+						variant="subtle"
+						color="gray"
+						aria-label={t("fileViewer.download")}
+						loading={downloading}
+						onClick={download}
+					>
+						<IconDownload size={14} />
+					</ActionIcon>
+				</Tooltip>
+				<Tooltip label={t("fileViewer.reload")} withinPortal>
+					<ActionIcon
+						size="sm"
+						variant="subtle"
+						color="gray"
+						aria-label={t("fileViewer.reload")}
+						onClick={reload}
+					>
+						<IconRefresh size={14} />
+					</ActionIcon>
+				</Tooltip>
+			</Group>
 		</Group>
 	);
 

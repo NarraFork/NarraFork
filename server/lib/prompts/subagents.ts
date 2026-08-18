@@ -4,13 +4,16 @@ import {
 	type LocalizedValue,
 	pickLocalizedValue,
 } from "@shared/i18n-locales";
-import { IS_WINDOWS } from "../platform";
+import { BASH_TOOL_NAME } from "../agent/tool-name";
 
 export type BuiltinSubagentType = "explore" | "plan" | "general" | "search" | "review";
 export type SubagentType = string;
 
-const SH = IS_WINDOWS ? "Shell" : "Bash";
-const sh = IS_WINDOWS ? "shell" : "bash";
+// The shell tool is named Bash on every platform, so these labels are constant.
+// They previously flipped to "Shell"/"shell" on Windows, which told subagents to
+// call a tool that is not registered.
+const SH = BASH_TOOL_NAME;
+const sh = "bash";
 
 // --- Subagent system prompts ---
 

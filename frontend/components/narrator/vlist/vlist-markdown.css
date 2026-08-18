@@ -116,7 +116,17 @@
    graphemes in the active line of the live streaming tail. `display:inline`
    keeps each grapheme from becoming an atomic inline-block (which would alter
    wrapping / the fragment box); the animation itself uses only compositor
-   properties (opacity/transform/filter) so measured heights are unaffected. */
+   properties (opacity/transform/filter) so measured heights are unaffected.
+
+   ⚠️ The 0.32s duration is DUPLICATED as STREAM_ANIM_DURATION_MS in
+   stream-token-anim.ts, which uses it to decide when a grapheme's span may be
+   folded back into plain text. A duration longer here than there seals the span
+   mid-animation, snapping the character to its end state — the exact defect the
+   time-driven seal exists to fix, and one nothing else detects. Change both.
+
+   `both` fill-mode is load-bearing for the negative `animation-delay` a remounted
+   span carries: it makes an already-elapsed portion resolve to the correct
+   mid-animation state instead of the pre-start one. */
 .vlist-anim-token {
 	display: inline;
 	animation: vlist-token-in 0.32s ease-out both;

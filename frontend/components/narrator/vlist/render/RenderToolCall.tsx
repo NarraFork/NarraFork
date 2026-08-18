@@ -1990,7 +1990,13 @@ function SectionBody({
 				contentHeight: part.bodyContentHeight,
 				usedWidth: availableWidth,
 			},
-			contentWidth: availableWidth,
+			// The width the LINE BREAKING used, not the section's available width. A
+			// markdown body was wrapped inside its padded scroll box, so it is narrower
+			// by `DETAIL_BOX_CHROME_X`; painting it at `availableWidth` overflowed the
+			// box horizontally (a scrollbar with nothing to scroll to, covering a
+			// one-line body almost entirely) AND re-wrapped the text at a width the
+			// height was not predicted from. See `bodyContentWidth`.
+			contentWidth: part.bodyContentWidth,
 			appliedCap: part.appliedCap,
 			...(part.markdown ? { markdown: true } : {}),
 		}),

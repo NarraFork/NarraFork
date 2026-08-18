@@ -85,6 +85,7 @@ import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-c
 import type { MeasuredCollapsibleTrace, MeasuredTraceRow } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
 import { CaretFiller } from "./render/caret-filler";
+import type { ReviewCardActions } from "./render/RenderReviewCard";
 import type { ErrorNoticeActions, SpecCarryoverActions } from "./render/RenderSystemText";
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
@@ -204,6 +205,10 @@ import {
 	resolveReloadDelayMs,
 	shouldSurfaceDeferredReload,
 } from "./vlist-reload-policy";
+import {
+	resolveReviewFeedbackActions,
+	useReviewFeedbackActions,
+} from "./vlist-review-feedback-actions";
 import {
 	buildRowCtxActions,
 	buildRowToolActions,
@@ -437,7 +442,10 @@ export function resolveReflectionTakeOver(
 	return getHandler(item.spec.key, reflection.kind, requestId);
 }
 
-/** Shell-runnable tools whose execution can be interrupted mid-flight. */
+/**
+ * Shell-runnable tools whose execution can be interrupted mid-flight.
+ * "Shell" is a legacy alias retained for older stored history only.
+ */
 const TERMINABLE_TOOLS = new Set(["Bash", "Shell", "Execute"]);
 
 /**
@@ -1064,6 +1072,11 @@ interface ExactRowProps {
 	/** Localized "was truncated" note painted inside an injection bubble. */
 	injectionNoteLabel?: string;
 	/**
+	 * Localized note for a review card whose markdown body was cut at the parse ceiling.
+	 * HEIGHT-NEUTRAL: it sits in the card's already-reserved header row.
+	 */
+	reviewTruncatedLabel?: string;
+	/**
 	 * What this host can do when the reader clicks an injection bubble's speaker row:
 	 * open a child session, a knowledge entry, a Dynamic Spec file, or a chapter.
 	 *
@@ -1138,6 +1151,11 @@ interface ExactRowProps {
 	 */
 	errorNoticeActions?: ErrorNoticeActions;
 	/**
+	 * Live handler for a review-feedback card's action button. Present only on review
+	 * rows; absent → the button renders disabled instead of silently inert.
+	 */
+	reviewFeedbackActions?: ReviewCardActions;
+	/**
 	 * Compact-marker callbacks for THIS row (open summary / cancel a running
 	 * compaction). Absent for every non-marker row; referentially stable per key so
 	 * the memo below keeps skipping.
@@ -1200,6 +1218,7 @@ const ExactRow = memo(
 		onOpenFilePanel,
 		openAttachmentLabel,
 		injectionNoteLabel,
+		reviewTruncatedLabel,
 		injectionNavigation,
 		currentUserId,
 		narratorId,
@@ -1213,6 +1232,7 @@ const ExactRow = memo(
 		onResumeSubagentRecovery,
 		specCarryoverActions,
 		errorNoticeActions,
+		reviewFeedbackActions,
 		compactActions,
 		compactCancelTitle,
 		askInPassingFormSlot,
@@ -1365,6 +1385,14 @@ const ExactRow = memo(
 		// outside vlist/, so the shell injects them. Without this the two controls
 		// paint but do nothing — the chunked path's ErrorNotice drives them itself.
 		if (errorNoticeActions) extra.errorNoticeActions = errorNoticeActions;
+		// Review feedback card: the button hands the conclusion to the narrator through a
+		// REST call, so the shell injects it. Without this the card would show findings the
+		// reader has no way to act on — and an idle narrator is never woken by a conclusion
+		// on purpose, so this button is the only path.
+		if (reviewFeedbackActions) extra.reviewFeedbackActions = reviewFeedbackActions;
+		if (kind === "review-card" && reviewTruncatedLabel) {
+			extra.truncatedLabel = reviewTruncatedLabel;
+		}
 		// Compact / segment-compact markers: the row itself is the affordance — it
 		// opens the summary modal, or cancels a compaction still in flight. Both live
 		// outside vlist/ (modal + API), so they arrive as bound callbacks.
@@ -1636,6 +1664,7 @@ const ExactRow = memo(
 		prev.onOpenFilePanel === next.onOpenFilePanel &&
 		prev.openAttachmentLabel === next.openAttachmentLabel &&
 		prev.injectionNoteLabel === next.injectionNoteLabel &&
+		prev.reviewTruncatedLabel === next.reviewTruncatedLabel &&
 		prev.injectionNavigation === next.injectionNavigation &&
 		// Authorship decides the bubble's side; a row must repaint if the viewer changes.
 		prev.currentUserId === next.currentUserId &&
@@ -1652,6 +1681,7 @@ const ExactRow = memo(
 		prev.onResumeSubagentRecovery === next.onResumeSubagentRecovery &&
 		prev.specCarryoverActions === next.specCarryoverActions &&
 		prev.errorNoticeActions === next.errorNoticeActions &&
+		prev.reviewFeedbackActions === next.reviewFeedbackActions &&
 		prev.compactActions === next.compactActions &&
 		prev.compactCancelTitle === next.compactCancelTitle &&
 		prev.askInPassingFormSlot === next.askInPassingFormSlot &&
@@ -2320,6 +2350,11 @@ export const PretextExactMessageList = forwardRef<
 	}, []);
 	const resolveSpecActions = useSpecCarryoverActions(narratorId, openSpecTasks);
 
+	// Review feedback cards: the button hands the conclusion to this narrator as a user
+	// turn. A concluded review does not wake an idle narrator by design, so this is how
+	// the findings get acted on.
+	const resolveReviewActions = useReviewFeedbackActions(narratorId);
+
 	// Error notice cards: "mark as retryable" opens the shared rule dialog, the
 	// close button deletes the notice. The dialog is one shell-level instance
 	// (rows are zero-DOM copies and cannot own a modal); rows only carry the bound
@@ -2346,6 +2381,9 @@ export const PretextExactMessageList = forwardRef<
 	// "…was truncated" note inside an injection bubble. Height-neutral: the measure
 	// pass reserves a fixed line whenever `hasNote` holds, whatever the wording.
 	const injectionNoteLabel = t("sidecar.body.tasksDoneTruncated");
+	// Same shape for a review card whose body hit the markdown parse ceiling: the note
+	// sits in the card's already-reserved header row, so the wording is height-neutral.
+	const reviewTruncatedLabel = t("reviewFeedbackTruncated");
 	// Tooltip / aria label per navigable target kind. Height-neutral chrome, and
 	// memoized because it feeds the row memo's identity comparison.
 	const injectionTargetLabels = useMemo(
@@ -4895,6 +4933,7 @@ export const PretextExactMessageList = forwardRef<
 									onOpenFilePanel={rowHandlers?.onOpenFilePanel}
 									openAttachmentLabel={openAttachmentLabel}
 									injectionNoteLabel={injectionNoteLabel}
+									reviewTruncatedLabel={reviewTruncatedLabel}
 									injectionNavigation={injectionNavigation}
 									currentUserId={currentUserId}
 									permissionSlot={permissionSlot}
@@ -4918,6 +4957,11 @@ export const PretextExactMessageList = forwardRef<
 										item,
 										sourceIds,
 										errorNotice.resolve,
+									)}
+									reviewFeedbackActions={resolveReviewFeedbackActions(
+										item,
+										sourceIds,
+										resolveReviewActions,
 									)}
 									compactActions={compact.byKey.get(item.spec.key)}
 									compactCancelTitle={compact.cancelTitle}

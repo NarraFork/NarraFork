@@ -28,8 +28,8 @@
 import { ActionIcon, Card, Center, Text, Tooltip } from "@mantine/core";
 import { IconGripHorizontal, IconX } from "@tabler/icons-react";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
-import type { SerializedDockview } from "dockview-react";
-import { memo, useCallback, useMemo, useSyncExternalStore } from "react";
+import type { DockviewApi, SerializedDockview } from "dockview-react";
+import { memo, useCallback, useMemo, useRef, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { startDetachedPanelDrag } from "../../../lib/panel-drag";
 import { NarratorDockContext } from "../../narrator/dock/NarratorDockContext";
@@ -79,12 +79,18 @@ function DetachedPanelNodeInner({ data }: NodeProps) {
 	);
 
 	const narratorId = d.narratorId ?? "";
+	// Owned here, NOT inside the memo below: that value is rebuilt whenever
+	// `sourceDock` changes, and a ref created inside it would be replaced by an empty
+	// one on every rebuild — which is what previously made this surface unreachable
+	// through `dock-registry` (see `createDetachedPanelDockValue`).
+	const surfaceApiRef = useRef<DockviewApi | null>(null);
 	const dockValue = useMemo(
 		() =>
 			createDetachedPanelDockValue({
 				narratorId,
 				chapterId: d.chapterId,
 				sourceDock,
+				apiRef: surfaceApiRef,
 			}),
 		[narratorId, d.chapterId, sourceDock],
 	);

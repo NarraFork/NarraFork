@@ -41,7 +41,18 @@ export type NarraForkEvent =
 	| { type: "chapter:woken"; chapterId: string }
 	| { type: "chapter:abandoned"; chapterId: string; projectId: string }
 	| { type: "review:created"; reviewChapterId: string; sourceChapterId: string }
-	| { type: "review:concluded"; reviewChapterId: string; sourceChapterId: string }
+	| {
+			type: "review:concluded";
+			reviewChapterId: string;
+			sourceChapterId: string;
+			/**
+			 * The reviewer replaced an earlier conclusion rather than submitting its first.
+			 * Reachable because `ConcludeReview` accepts resubmission (a restored workspace
+			 * invalidates findings the reviewer already sent), so consumers must treat the
+			 * event as "there is a new conclusion" rather than "the review just finished".
+			 */
+			revised?: boolean;
+	  }
 	| { type: "review:converted"; reviewChapterId: string; action: "subagent" | "promote" }
 	| { type: "review:dismissed"; reviewChapterId: string }
 	| {

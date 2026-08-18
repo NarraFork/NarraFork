@@ -33,6 +33,7 @@ import {
 	resolveReasoningDisplayText,
 	resolveReasoningForm,
 } from "./measure/measure-reasoning";
+import { measureReviewCard } from "./measure/measure-review-card";
 import { measureSubagentCard } from "./measure/measure-subagent";
 import { measureSubagentRecovery } from "./measure/measure-subagent-recovery";
 import { measureKnowledgeHint } from "./measure/measure-system-list";
@@ -144,6 +145,12 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		label: "Plan card",
 		lodSensitive: false,
 		measure: (d, w, l) => measurePlanCard(d as AnyData, w, l),
+	},
+	"review-card": {
+		kind: "review-card",
+		label: "Review card",
+		lodSensitive: false,
+		measure: (d, w, l) => measureReviewCard(d as AnyData, w, l),
 	},
 	"ask-in-passing": {
 		kind: "ask-in-passing",

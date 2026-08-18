@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
 	clearBufferedMessageSoftStopIfIdle,
 	evaluateSoftStopRequest,
+	rearmCutInSoftStopBeforeContinuing,
 	requestBufferedMessageSoftStop,
 } from "../narrator-session";
 import {
@@ -19,6 +20,24 @@ function registerActiveNarrator(): ActiveNarrator {
 		alive: true,
 	} as unknown as ActiveNarrator;
 	activeNarrators.set(NARRATOR_ID, active);
+	return active;
+}
+
+/**
+ * Reproduce the state `runAgentLoop` is in right after a pass ended early to let a
+ * cut-in message through: the stop was granted (so `_bufferSoftStop` is spent) and
+ * recorded as taken, while the message itself is still queued.
+ */
+function grantedCutInStop(): ActiveNarrator {
+	const active = registerActiveNarrator();
+	queueMessage();
+	requestBufferedMessageSoftStop(NARRATOR_ID);
+	const decision = evaluateSoftStopRequest({
+		bufferSoftStop: active._bufferSoftStop,
+		hasPendingBufferedWork: true,
+	});
+	active._bufferSoftStop = decision.bufferSoftStop;
+	active._bufferSoftStopTaken = decision.softStopTaken;
 	return active;
 }
 
@@ -104,6 +123,60 @@ describe("evaluateSoftStopRequest", () => {
 				hasPendingBufferedWork: true,
 			}).stop,
 		).toBe(false);
+	});
+});
+
+describe("rearmCutInSoftStopBeforeContinuing", () => {
+	test("a producer that starts a new pass gives the still-queued cut-in its boundary back", () => {
+		// Regression: the injection drain / chained permission feedback / review
+		// git-state guard each `continue` into a FRESH pass before the buffer consumer
+		// is reached. `evaluateSoftStopRequest` had already spent `_bufferSoftStop` to
+		// grant this stop, so without re-arming the new pass runs with shouldStop()
+		// permanently false and the queued message is stranded until the whole loop
+		// ends — reported as "it says it cut in but nothing happened for ages".
+		const active = grantedCutInStop();
+		expect(active._bufferSoftStop).toBe(false);
+		expect(active._bufferSoftStopTaken).toBe(true);
+
+		rearmCutInSoftStopBeforeContinuing(active);
+
+		expect(active._bufferSoftStop).toBe(true);
+		// Consumed: the re-armed request now stands on its own, so the "queue emptied
+		// before the pass returned" resume path must not also fire for it.
+		expect(active._bufferSoftStopTaken).toBe(false);
+	});
+
+	test("the re-armed request stops the very next tool boundary", () => {
+		const active = grantedCutInStop();
+		rearmCutInSoftStopBeforeContinuing(active);
+
+		expect(
+			evaluateSoftStopRequest({
+				bufferSoftStop: active._bufferSoftStop,
+				hasPendingBufferedWork: true,
+			}).stop,
+		).toBe(true);
+	});
+
+	test("a cancelled cut-in is not re-armed", () => {
+		// Re-arming a stop with nothing left to deliver would end the next pass at its
+		// first tool call for no reason.
+		const active = grantedCutInStop();
+		bufferedMessages.delete(NARRATOR_ID);
+
+		rearmCutInSoftStopBeforeContinuing(active);
+
+		expect(active._bufferSoftStop).toBe(false);
+		expect(active._bufferSoftStopTaken).toBe(true);
+	});
+
+	test("does nothing when no cut-in stop was taken", () => {
+		const active = registerActiveNarrator();
+		queueMessage();
+
+		rearmCutInSoftStopBeforeContinuing(active);
+
+		expect(active._bufferSoftStop).toBeUndefined();
 	});
 });
 

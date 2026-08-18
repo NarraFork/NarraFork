@@ -238,10 +238,11 @@ export function EditTextFileChip({
 			}}
 		>
 			<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
-			<Text size="xs" truncate style={{ maxWidth: 160 }}>
+			<Text size="xs" truncate style={{ maxWidth: 160, minWidth: 0 }}>
 				{filename}
 			</Text>
-			<Text size="xs" c="dimmed">
+			{/* Fixed: the size is never the part that gives way — the filename truncates. */}
+			<Text size="xs" c="dimmed" style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
 				{formatFileSize(size)}
 			</Text>
 			<CloseButton

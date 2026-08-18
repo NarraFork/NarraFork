@@ -71,7 +71,10 @@ export function handleForeignPanelDrop(
 	api: DockviewApi,
 	target: { narratorId: string; chapterId: string },
 ): boolean {
-	const panelId = getPanelData()?.panelId;
+	// The event's own `getData()`, not the global `getPanelData()`: the drag payload is
+	// a module-level singleton that the drag source disposes on drag end, so reading it
+	// here races with that cleanup. The event captured it at drop time.
+	const panelId = event.getData()?.panelId;
 	if (!panelId) return false;
 	// A panel this surface already has is not a cross-surface move.
 	if (api.getPanel(panelId)) return false;

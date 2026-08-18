@@ -12,7 +12,7 @@
  *   │  <Group justify="center" py={4}> icon(14) + <Text size="xs">           │
  *   │  height = 4×2 + max(icon 14, xs line 17) = 25px                         │
  *   └────────────────────────────────────────────────────────────────────────┘
- *   ┌ paper-row (merge_summary / review_feedback / spec_continuation[/blocked])┐
+ *   ┌ paper-row (merge_summary) ─────────────────────────────────────────────┐
  *   │  <Paper p="xs"> <Group> icon(16)|Badge(16) + <Text size="xs" clamp>     │
  *   │  height = 10×2 + max(icon/badge 16, xs line 17) = 37px                  │
  *   └────────────────────────────────────────────────────────────────────────┘
@@ -32,8 +32,14 @@ import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts
 
 // ── Discriminant + payload ───────────────────────────────────────────────────
 
-/** The single-line / clamped system-card kinds covered by this module. */
-export type SystemSimpleKind = "compact" | "segment_compact" | "merge_summary" | "review_feedback";
+/**
+ * The single-line / clamped system-card kinds covered by this module.
+ *
+ * `review_feedback` used to be here and is now a `system-text` card: its body is a
+ * verdict plus a findings list, and one clamped line could show neither those findings
+ * nor the action button the card needs.
+ */
+export type SystemSimpleKind = "compact" | "segment_compact" | "merge_summary";
 
 /**
  * Render payload carried on the prepared block. Height is fully determined by
@@ -76,15 +82,12 @@ export const COMPACT_CARD_HEIGHT = CENTER_ROW_PADDING_Y * 2 + CENTER_ROW_CONTENT
 export const SEGMENT_COMPACT_CARD_HEIGHT = CENTER_ROW_PADDING_Y * 2 + CENTER_ROW_CONTENT; // 25
 /** merge_summary: Paper p="xs" + single lineClamp={1} row. ≈37px. */
 export const MERGE_SUMMARY_CARD_HEIGHT = CARD_PADDING * 2 + CARD_ROW_CONTENT; // 37
-/** review_feedback: Paper p="xs" + single lineClamp={1} row. ≈37px. */
-export const REVIEW_FEEDBACK_CARD_HEIGHT = CARD_PADDING * 2 + CARD_ROW_CONTENT; // 37
 
 /** Central lookup: kind → fixed height (px). Used by tests + the registry. */
 export const SYSTEM_SIMPLE_CARD_HEIGHTS: Record<SystemSimpleKind, number> = {
 	compact: COMPACT_CARD_HEIGHT,
 	segment_compact: SEGMENT_COMPACT_CARD_HEIGHT,
 	merge_summary: MERGE_SUMMARY_CARD_HEIGHT,
-	review_feedback: REVIEW_FEEDBACK_CARD_HEIGHT,
 };
 
 /**

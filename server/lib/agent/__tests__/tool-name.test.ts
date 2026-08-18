@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+	BASH_TOOL_NAME,
+	canonicalizeToolName,
+	isBashToolName,
 	isValidToolName,
 	MAX_TOOL_NAME_LENGTH,
 	normalizeToolName,
@@ -76,5 +79,29 @@ describe("normalizeToolName", () => {
 		expect(a).not.toBe(b);
 		// Same input must always yield the same wire name, or history would break.
 		expect(normalizeToolName(`plugin__${"a".repeat(90)}__one`)).toBe(a);
+	});
+});
+
+describe("shell tool name", () => {
+	test("is Bash regardless of platform or detected shell", () => {
+		// The old `detectShell().type === "bash" ? "Bash" : "Shell"` rule made the
+		// tool name depend on the host, while several prompt sections keyed off
+		// IS_WINDOWS instead — so the two disagreed on Windows + Git Bash and the
+		// model kept calling a tool that did not exist.
+		expect(BASH_TOOL_NAME).toBe("Bash");
+	});
+
+	test("recognizes the canonical name and the legacy Shell alias", () => {
+		expect(isBashToolName("Bash")).toBe(true);
+		expect(isBashToolName("Shell")).toBe(true);
+		expect(isBashToolName("Execute")).toBe(false);
+		expect(isBashToolName("Read")).toBe(false);
+	});
+
+	test("canonicalizes the legacy alias and leaves everything else alone", () => {
+		expect(canonicalizeToolName("Shell")).toBe("Bash");
+		expect(canonicalizeToolName("Bash")).toBe("Bash");
+		expect(canonicalizeToolName("Read")).toBe("Read");
+		expect(canonicalizeToolName("mcp__gh__search_issues")).toBe("mcp__gh__search_issues");
 	});
 });

@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { canonicalizeToolName } from "./tool-name";
 import type { ToolDefinition } from "./types";
 
 /**
@@ -65,7 +66,13 @@ export class ToolRegistry {
 	}
 
 	get(name: string): ToolDefinition | undefined {
-		return this.ensureMaterialized().get(name);
+		const tools = this.ensureMaterialized();
+		const exact = tools.get(name);
+		if (exact) return exact;
+		// Legacy alias fallback (currently only "Shell" → "Bash"). Exact matches win,
+		// so a plugin/MCP tool that genuinely owns a legacy name is never shadowed.
+		const canonical = canonicalizeToolName(name);
+		return canonical === name ? undefined : tools.get(canonical);
 	}
 
 	all(): ToolDefinition[] {

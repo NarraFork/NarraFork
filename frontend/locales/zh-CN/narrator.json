@@ -230,6 +230,8 @@
 	"dropFilesHere": "拖放文件到此处",
 	"textFileTooLarge": "文本文件过大（最大 100MB）",
 	"unsupportedFileType": "不支持的文件类型",
+	"draftAttachmentsRestoreFailedTitle": "部分附件未能恢复",
+	"draftAttachmentsRestoreFailed": "有 {{count}} 个待发附件已丢失，需要重新添加。",
 	"loadOlderMessages": "加载更早的消息",
 	"loadOlderCalls": "加载更早的工具调用",
 	"jumpTargetUnavailable": "该消息已不在此会话的历史记录中。",
@@ -811,6 +813,8 @@
 	"fileViewer.expandAll": "全部展开",
 	"fileViewer.collapseAll": "全部折叠",
 	"fileViewer.reload": "重新加载",
+	"fileViewer.download": "下载",
+	"fileViewer.downloadFailed": "下载失败",
 	"fileViewer.parseFailed": "无法按 {{format}} 解析，已显示原文。",
 	"fileViewer.truncated": "仅显示前 {{chars}} 个字符，文件实际更长。",
 	"fileViewer.nodesTruncated": "[节点树已截断以保持界面响应。]",
@@ -905,6 +909,11 @@
 	"reviewVerdict_approve": "已通过",
 	"reviewVerdict_request_changes": "需要修改",
 	"reviewVerdict_comment_only": "仅评论",
+	"reviewFeedbackRevisedBadge": "已修正",
+	"reviewFeedbackApply": "处理",
+	"reviewFeedbackApplied": "已处理",
+	"reviewFeedbackApplyFailed": "无法为评审结论启动一轮",
+	"reviewFeedbackTruncated": "预览已截断",
 	"chromeNotInstalled": "未检测到 Chrome/Chromium 浏览器。请先安装 Chrome，或运行：bunx puppeteer browsers install chrome",
 	"chromeFlatpakUnsupported": "Flatpak 安装的 Chrome 无法直接使用。请通过 deb/rpm 等原生方式安装 Chrome，或运行：bunx puppeteer browsers install chrome",
 	"details.title": "会话详情",
@@ -1102,7 +1111,8 @@
 			"spec_blocked_continuation": "阻塞续跑",
 			"spec_goal_added": "目标登记",
 			"spec_fork_carryover": "大纲继承",
-			"spec_context_cleared": "上下文已清空"
+			"spec_context_cleared": "上下文已清空",
+			"review_feedback": "代码评审"
 		},
 		"cadence": {
 			"everyNTools": "每 {{n}} 次工具调用"

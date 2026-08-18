@@ -3,7 +3,13 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node
 import { homedir } from "node:os";
 import { basename, extname, join, resolve, sep } from "node:path";
 import { Hono } from "hono";
-import { ValidationError } from "../lib/errors";
+import { buildAttachmentDisposition } from "../lib/content-disposition";
+import { AppError, ValidationError } from "../lib/errors";
+import {
+	isSecretPlatformPath,
+	isSecretUserPath,
+	SECRET_PATH_REFUSAL,
+} from "../lib/fs-secret-paths";
 import { IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
 
 export const fsRoutes = new Hono();
@@ -194,6 +200,32 @@ const MAX_PREVIEW_BYTES = 20 * 1024 * 1024; // 20 MB (images / PDFs)
 const MAX_TEXT_PREVIEW_BYTES = 1024 * 1024; // 1 MB (text files — larger payloads choke syntax highlighting)
 
 /**
+ * Refuse the files whose bytes ARE credentials.
+ *
+ * These routes are deliberately not sandboxed — the file browser has always listed
+ * the whole filesystem, and the viewer legitimately opens platform files outside any
+ * project (request dumps, truncated tool output, subagent conclusions). What must not
+ * follow from that is an escalation: `settings.json` carries `auth.jwtSecret` (forge
+ * any user's session), `narrafork.db` carries every password hash, and `~/.ssh`
+ * carries the user's keys. See `fs-secret-paths.ts` for why this is a deny-list.
+ *
+ * A 403 rather than a 404: pretending the file is absent would be a lie the caller
+ * can disprove with `/browse`, and the refusal is the honest answer.
+ */
+function assertReadableThroughFileApi(absPath: string): void {
+	if (isSecretPlatformPath(absPath) || isSecretUserPath(absPath, homedir())) {
+		throw new ForbiddenPathError();
+	}
+}
+
+/** 403 for a path the file API refuses to serve. */
+class ForbiddenPathError extends AppError {
+	constructor() {
+		super(SECRET_PATH_REFUSAL, 403, "FORBIDDEN_PATH");
+	}
+}
+
+/**
  * GET /api/fs/preview?path=...
  *
  * Serve a file for inline preview. Supports images, PDFs, and text files.
@@ -206,6 +238,10 @@ fsRoutes.get("/preview", async (c) => {
 	}
 
 	const absPath = resolve(rawPath);
+	// Before the existence probe, for the same reason as `/download`: the refusal is
+	// about the path, so it must not depend on whether the file is there.
+	assertReadableThroughFileApi(absPath);
+
 	if (!existsSync(absPath)) {
 		throw new ValidationError(`File does not exist: ${absPath}`);
 	}
@@ -249,6 +285,71 @@ fsRoutes.get("/preview", async (c) => {
 			"Content-Type": "text/plain; charset=utf-8",
 			"Content-Disposition": "inline",
 			"Cache-Control": "private, max-age=60",
+		},
+	});
+});
+
+/**
+ * Cap for `GET /api/fs/download`.
+ *
+ * Deliberately far above the preview caps: preview limits exist because the
+ * payload is parsed, highlighted and held in the browser's memory, while a
+ * download is streamed straight to disk. The ceiling is only here so a stray
+ * request for a 100 GB file cannot pin the process streaming it.
+ */
+const MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
+
+/**
+ * GET /api/fs/download?path=...
+ *
+ * Serve a file as an attachment. Separate from `/preview` rather than a flag on
+ * it: preview is capped for rendering (1 MB text / 20 MB binary) and marked
+ * cacheable, whereas a download must reach files above those caps, must never be
+ * cached under a session credential, and must not sniff as HTML.
+ */
+fsRoutes.get("/download", async (c) => {
+	const rawPath = c.req.query("path");
+	if (!rawPath) {
+		throw new ValidationError("path is required");
+	}
+
+	const absPath = resolve(rawPath);
+	// FIRST, before existence is probed: the refusal is a property of the path, and
+	// answering "does not exist" for a secret that is absent on this machine would turn
+	// the route into an existence oracle for exactly the files it is protecting.
+	assertReadableThroughFileApi(absPath);
+
+	if (!existsSync(absPath)) {
+		throw new ValidationError(`File does not exist: ${absPath}`);
+	}
+
+	let stat: ReturnType<typeof statSync>;
+	try {
+		stat = statSync(absPath);
+	} catch {
+		throw new ValidationError(`Cannot access: ${absPath}`);
+	}
+
+	if (!stat.isFile()) {
+		throw new ValidationError(`Not a file: ${absPath}`);
+	}
+	if (stat.size > MAX_DOWNLOAD_BYTES) {
+		return c.json({ error: "File too large to download" }, 413);
+	}
+
+	// BunFile as the body directly: Bun sets Content-Length from it, so the
+	// browser can show real download progress (a ReadableStream would force
+	// chunked encoding and drop the length).
+	const file = Bun.file(absPath);
+	return new Response(file, {
+		headers: {
+			// Always octet-stream: the point is to save the bytes, and an honest
+			// `text/html` here would be a stored-XSS vector on a same-origin URL.
+			"Content-Type": "application/octet-stream",
+			"Content-Disposition": buildAttachmentDisposition(basename(absPath)),
+			"Content-Length": String(stat.size),
+			"Cache-Control": "no-store",
+			"X-Content-Type-Options": "nosniff",
 		},
 	});
 });

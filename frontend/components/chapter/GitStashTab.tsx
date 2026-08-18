@@ -1,4 +1,4 @@
-import { Button, Group, Loader, ScrollArea, Stack, Text, TextInput } from "@mantine/core";
+import { Box, Button, Group, Loader, ScrollArea, Stack, Text, TextInput } from "@mantine/core";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useGitStash, useGitStashList } from "../../hooks/useGit";
@@ -30,65 +30,68 @@ export function GitStashTab({ chapterId }: { chapterId: string }) {
 	}
 
 	return (
-		<ScrollArea.Autosize mah={300}>
-			<Stack gap="xs">
-				<Group gap="xs" wrap="nowrap">
-					<TextInput
-						placeholder={t("stashMessage")}
-						value={stashMsg}
-						onChange={(e) => setStashMsg(e.currentTarget.value)}
-						onKeyDown={(e) => {
-							if (e.key === "Enter") handlePush();
-						}}
-						size="xs"
-						style={{ flex: 1 }}
-					/>
-					<Button size="compact-xs" onClick={handlePush} loading={stash.isPending}>
-						{t("stashPush")}
-					</Button>
-				</Group>
+		<Box style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+			{/* The push box stays put; only the stash list scrolls. */}
+			<Group gap="xs" wrap="nowrap" pb="xs" style={{ flexShrink: 0 }}>
+				<TextInput
+					placeholder={t("stashMessage")}
+					value={stashMsg}
+					onChange={(e) => setStashMsg(e.currentTarget.value)}
+					onKeyDown={(e) => {
+						if (e.key === "Enter") handlePush();
+					}}
+					size="xs"
+					style={{ flex: 1 }}
+				/>
+				<Button size="compact-xs" onClick={handlePush} loading={stash.isPending}>
+					{t("stashPush")}
+				</Button>
+			</Group>
 
-				{(!stashes || stashes.length === 0) && (
-					<Text size="sm" c="dimmed" py="md" ta="center">
-						{t("stashEmpty")}
-					</Text>
-				)}
+			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
+				<Stack gap="xs">
+					{(!stashes || stashes.length === 0) && (
+						<Text size="sm" c="dimmed" py="md" ta="center">
+							{t("stashEmpty")}
+						</Text>
+					)}
 
-				{stashes?.map((s) => (
-					<Group key={s.index} gap="xs" wrap="nowrap" py={2} px={4}>
-						<Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
-							stash@{"{"}
-							{s.index}
-							{"}"}
-						</Text>
-						<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }}>
-							{clampGitStashText(s.message)}
-						</Text>
-						<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-							{clampGitStashText(s.date)}
-						</Text>
-						<Group gap={4} style={{ flexShrink: 0 }}>
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								onClick={() => stash.mutate({ action: "pop", index: s.index })}
-								loading={stash.isPending}
-							>
-								{t("stashPop")}
-							</Button>
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								color="red"
-								onClick={() => stash.mutate({ action: "drop", index: s.index })}
-								loading={stash.isPending}
-							>
-								{t("stashDrop")}
-							</Button>
+					{stashes?.map((s) => (
+						<Group key={s.index} gap="xs" wrap="nowrap" py={2} px={4}>
+							<Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
+								stash@{"{"}
+								{s.index}
+								{"}"}
+							</Text>
+							<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }}>
+								{clampGitStashText(s.message)}
+							</Text>
+							<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+								{clampGitStashText(s.date)}
+							</Text>
+							<Group gap={4} style={{ flexShrink: 0 }}>
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									onClick={() => stash.mutate({ action: "pop", index: s.index })}
+									loading={stash.isPending}
+								>
+									{t("stashPop")}
+								</Button>
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									color="red"
+									onClick={() => stash.mutate({ action: "drop", index: s.index })}
+									loading={stash.isPending}
+								>
+									{t("stashDrop")}
+								</Button>
+							</Group>
 						</Group>
-					</Group>
-				))}
-			</Stack>
-		</ScrollArea.Autosize>
+					))}
+				</Stack>
+			</ScrollArea>
+		</Box>
 	);
 }

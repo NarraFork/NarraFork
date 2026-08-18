@@ -53,6 +53,7 @@ import {
 } from "./measure/measure-permission";
 import { measurePlanCard } from "./measure/measure-plan-card";
 import { measureReasoning, type ReasoningBlockData } from "./measure/measure-reasoning";
+import { measureReviewCard } from "./measure/measure-review-card";
 import { measureSubagentCard, type SubagentCardData } from "./measure/measure-subagent";
 import { type KnowledgeHintData, measureKnowledgeHint } from "./measure/measure-system-list";
 import {
@@ -87,6 +88,7 @@ import { RenderPruneDivider } from "./render/RenderMisc";
 import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPermission";
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
+import { RenderReviewCard } from "./render/RenderReviewCard";
 import { RenderSubagent } from "./render/RenderSubagent";
 import { RenderSystemList } from "./render/RenderSystemList";
 import { RenderSystemSimple } from "./render/RenderSystemSimple";
@@ -269,6 +271,28 @@ const PLAN_CARD_MD = [
 	"1. Add a preview mode to the calibration harness",
 	"2. Construct minimal sample data for every element kind",
 	"3. Verify tsgo + biome + the vlist test suite stay green",
+].join("\n");
+
+/**
+ * A realistic review conclusion: prose, inline code, a file path and a fenced snippet.
+ *
+ * Deliberately markdown-heavy — this is exactly the content the earlier plain-text card
+ * could not render, so the sample has to exercise the markdown path rather than read as
+ * three flat lines.
+ */
+const REVIEW_CONCLUSION_MD = [
+	"## Code Review: Changes Requested",
+	"",
+	"- 🚨 **[critical]** `server/db/schema.ts:2606` — the new index has no migration, so",
+	"  `chapter-roster-service.test.ts` asserts a plan the database cannot produce.",
+	"- 📋 **[minor]** `server/services/pm-communication.ts` — the cached statement outlives",
+	"  the module it was prepared in.",
+	"",
+	"```ts",
+	"const stmt = sqlite.prepare(SELECT_ROSTER); // survives a hot reload",
+	"```",
+	"",
+	"Please address the above findings before merging.",
 ].join("\n");
 
 const ASK_QUESTION_DATA: AskUserQuestionData = {
@@ -650,10 +674,8 @@ const HARNESS_CASES: HarnessCase[] = [
 		hasAvatar: true,
 		color: "indigo",
 	}),
-	...systemSimpleCase("review_feedback", "System · review feedback", {
-		text: "Review complete · 3 comments · 1 blocking",
-		color: "gray",
-	}),
+	// review_feedback is no longer a system-simple card either: it wraps its findings and
+	// carries an action button, so it lives in the system-text group below.
 	// spec_continuation / spec_blocked_continuation are no longer system-simple cards:
 	// the framed bubble draws them as a task row (RenderSpecTask). See measure-spec-task.
 
@@ -683,6 +705,29 @@ const HARNESS_CASES: HarnessCase[] = [
 		variant: "fork",
 		color: "indigo",
 	}),
+
+	// ── Review card ───────────────────────────────────────────────────────────
+	// Its own element rather than a system-text case: the body is real markdown inside a
+	// capped scroll box, so a long conclusion scrolls instead of growing the row.
+	preview(
+		{ id: "review-card", label: "Review card · changes requested @600", width: 600 },
+		(w) =>
+			measureReviewCard(
+				{
+					text: REVIEW_CONCLUSION_MD,
+					verdictLabel: "Changes Requested",
+					color: "orange",
+					actionLabel: "Handle",
+				},
+				w,
+			),
+		(m) => (
+			<RenderReviewCard
+				measured={m}
+				data={{ verdictLabel: "Changes Requested", color: "orange", actionLabel: "Handle" }}
+			/>
+		),
+	),
 
 	// ── Knowledge hint ────────────────────────────────────────────────────────
 	preview(

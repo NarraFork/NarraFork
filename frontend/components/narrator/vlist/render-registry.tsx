@@ -24,6 +24,7 @@ import { RenderPruneDivider } from "./render/RenderMisc";
 import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPermission";
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
+import { RenderReviewCard } from "./render/RenderReviewCard";
 
 import { RenderSubagent } from "./render/RenderSubagent";
 import { RenderSubagentRecovery } from "./render/RenderSubagentRecovery";
@@ -135,6 +136,12 @@ export function resolveRenderExtra(spec: {
 				extra.kind = data.kind;
 				extra.data = data;
 			}
+			break;
+		case "review-card":
+			// The whole spec data IS the card's chrome (verdict / badges / action label).
+			// Height-neutral: the body's geometry came from the markdown, and the header row
+			// is a constant.
+			extra.data = data;
 			break;
 		case "subagent-recovery":
 			// The measured block already carries the full payload; only the live
@@ -320,6 +327,18 @@ export function renderElement(
 					measured={m}
 					label={(extra.label as string) ?? "plan"}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
+				/>
+			);
+		case "review-card":
+			return (
+				<RenderReviewCard
+					measured={m as never}
+					// Header chrome (verdict badge / revision marker / action label) is
+					// height-neutral: the measure pass reserved a constant header row, so this
+					// only decides what is painted in it.
+					data={extra.data as never}
+					actions={extra.reviewFeedbackActions as never}
+					truncatedLabel={extra.truncatedLabel as string | undefined}
 				/>
 			);
 		case "ask-in-passing":

@@ -118,6 +118,9 @@ const settingsPath = resolve(narraforkDir, "settings.json");
 
 const DANGER_REFLECTION_LEVELS = new Set(["off", "light", "standard", "strict"]);
 
+/** The superseded 1MB `agent.requestDumpMaxSize` default, rewritten on load. */
+const LEGACY_REQUEST_DUMP_MAX_SIZE = 1024 * 1024;
+
 export function stripObsoleteSettingsKeys(settings: Record<string, unknown>): boolean {
 	let changed = false;
 	for (const key of OBSOLETE_TOP_LEVEL_SETTINGS_KEYS) {
@@ -256,6 +259,19 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	// Remove obsolete smart output interruption check setting.
 	if (raw.agent?.smartInterruptionCheck !== undefined) {
 		delete (merged.agent as Record<string, unknown>).smartInterruptionCheck;
+		needsSave = true;
+	}
+
+	// Raise the superseded 1MB raw-dump ceiling.
+	//
+	// 1MB was the old default and is below the size of essentially any request worth
+	// dumping (full history + replayed tool output), so it truncated the request body of
+	// every capture. Because it was a *default* rather than a deliberate choice, it sits
+	// in settings.json verbatim for existing installs and would survive the new default
+	// forever. Only the exact old default is rewritten: any other value — including a
+	// smaller one — is an operator decision and is left alone.
+	if (raw.agent?.requestDumpMaxSize === LEGACY_REQUEST_DUMP_MAX_SIZE) {
+		merged.agent.requestDumpMaxSize = DEFAULTS.agent.requestDumpMaxSize;
 		needsSave = true;
 	}
 

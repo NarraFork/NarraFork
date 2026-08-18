@@ -3,7 +3,6 @@ import {
 	COMPACT_CARD_HEIGHT,
 	MERGE_SUMMARY_CARD_HEIGHT,
 	measureSystemSimpleCard,
-	REVIEW_FEEDBACK_CARD_HEIGHT,
 	SEGMENT_COMPACT_CARD_HEIGHT,
 	SYSTEM_SIMPLE_CARD_HEIGHTS,
 	type SystemSimpleData,
@@ -35,19 +34,13 @@ describe("measureSystemSimpleCard — fixed per-kind heights", () => {
 		expect(r.height).toBe(37);
 	});
 
-	it("review_feedback = 37px (Paper p=xs + lineClamp=1)", () => {
-		expect(REVIEW_FEEDBACK_CARD_HEIGHT).toBe(37);
-		const r = measureSystemSimpleCard("review_feedback", D(), 800);
-		expect(r.height).toBe(37);
-	});
+	// `review_feedback` is deliberately absent: it is a `system-text` card now, because a
+	// verdict plus a findings list has to wrap and to carry an action button, and this
+	// module's single clamped line could express neither. Its geometry is pinned in
+	// measure-system-text.test.ts instead.
 
 	it("SYSTEM_SIMPLE_CARD_HEIGHTS lookup matches the measured height for every kind", () => {
-		const kinds: SystemSimpleKind[] = [
-			"compact",
-			"segment_compact",
-			"merge_summary",
-			"review_feedback",
-		];
+		const kinds: SystemSimpleKind[] = ["compact", "segment_compact", "merge_summary"];
 		for (const kind of kinds) {
 			const r = measureSystemSimpleCard(kind, D(), 640);
 			expect(r.height).toBe(SYSTEM_SIMPLE_CARD_HEIGHTS[kind]);
@@ -81,7 +74,7 @@ describe("measureSystemSimpleCard — height is independent of content", () => {
 
 	it("height does NOT change across LOD levels", () => {
 		const heights = ([1, 2, 3, 4, 5] as const).map(
-			(lod) => measureSystemSimpleCard("review_feedback", D(), 800, lod).height,
+			(lod) => measureSystemSimpleCard("merge_summary", D(), 800, lod).height,
 		);
 		expect(new Set(heights).size).toBe(1);
 		expect(heights[0]).toBe(37);

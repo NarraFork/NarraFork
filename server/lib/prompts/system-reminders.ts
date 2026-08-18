@@ -7,9 +7,9 @@ import {
 	pickLocalizedValue,
 } from "@shared/i18n-locales";
 import { buildPlanFileRelPath, PLAN_DIR_REL } from "../plan-file-path";
-import { IS_WINDOWS } from "../platform";
 
-const sh = IS_WINDOWS ? "shell" : "bash";
+// The shell tool is named Bash on every platform; this label no longer varies.
+const sh = "bash";
 
 // getUserLanguage and getUserReplyInLanguage are now re-exported from ./i18n
 

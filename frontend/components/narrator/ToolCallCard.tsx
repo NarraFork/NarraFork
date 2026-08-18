@@ -411,6 +411,9 @@ export { STATUS_COLORS };
 const READ_TOOLS = new Set(["Read"]);
 const FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
 const EDIT_TOOLS = new Set(["Edit", "Write"]);
+// "Shell" is a legacy alias the server no longer mints (the shell tool is always
+// "Bash" now); it stays here so stored history from older Windows installs keeps
+// rendering as a shell card instead of falling back to the generic one.
 const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);

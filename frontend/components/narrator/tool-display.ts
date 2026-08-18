@@ -23,6 +23,8 @@ export type ToolCategory =
 
 const READ_TOOLS = new Set(["Read"]);
 const FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
+// "Shell" is a legacy alias kept only so older stored history still classifies as
+// a shell call; the server always mints "Bash".
 const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);

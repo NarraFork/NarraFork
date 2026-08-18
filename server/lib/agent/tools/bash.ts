@@ -12,7 +12,7 @@ import {
 	createOptionalExecutionTimeout,
 	resolveOptionalExecutionTimeout,
 } from "../execution-timeout";
-import { detectShell } from "../shell";
+import { BASH_TOOL_NAME } from "../tool-name";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
 import { createStreamDecoder } from "./encoding";
@@ -130,8 +130,15 @@ export function updateBashTimeout(toolUseId: string, newTimeoutMs: number): numb
 	return clamped;
 }
 
-/** Tool name: "Bash" when using bash (including Git Bash on Windows), "Shell" for PowerShell/cmd. */
-export const SHELL_TOOL_NAME = detectShell().type === "bash" ? "Bash" : "Shell";
+/**
+ * Tool name for shell execution — always "Bash", on every platform and shell
+ * flavour. See `BASH_TOOL_NAME` in `../tool-name` for why the old
+ * bash-vs-Shell rename was removed.
+ *
+ * Kept as a named export because most call sites read as shell-permission /
+ * shell-analysis code; it is an alias of `BASH_TOOL_NAME`, not a second name.
+ */
+export const SHELL_TOOL_NAME = BASH_TOOL_NAME;
 
 export const bashTool: ToolDefinition = {
 	name: SHELL_TOOL_NAME,

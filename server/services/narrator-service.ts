@@ -2584,6 +2584,10 @@ export const narratorService = {
 		narratorMessageQueries.deleteDanglingReasoningMessage.bind(narratorMessageQueries),
 	dismissSpecCarryoverMessage:
 		narratorMessageQueries.dismissSpecCarryoverMessage.bind(narratorMessageQueries),
+	markReviewFeedbackApplied:
+		narratorMessageQueries.markReviewFeedbackApplied.bind(narratorMessageQueries),
+	releaseReviewFeedbackClaim:
+		narratorMessageQueries.releaseReviewFeedbackClaim.bind(narratorMessageQueries),
 	dismissCwdRecoveryMessage:
 		narratorMessageQueries.dismissCwdRecoveryMessage.bind(narratorMessageQueries),
 	dismissErrorMessage: narratorMessageQueries.dismissErrorMessage.bind(narratorMessageQueries),

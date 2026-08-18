@@ -56,7 +56,11 @@ export const DEFAULTS: NarraForkSettings = {
 		freshShellEnv: false,
 		requestDumpEnabled: false,
 		requestDumpErrorsOnly: false,
-		requestDumpMaxSize: 1024 * 1024, // 1MB
+		// 32MB. Enabling dumping is an explicit, warned, high-risk opt-in made to capture
+		// a specific failure, so the ceiling must be high enough that a real request —
+		// full conversation history, replayed tool output, inline images — survives intact.
+		// The old 1MB default silently truncated almost every request worth dumping.
+		requestDumpMaxSize: 32 * 1024 * 1024,
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
@@ -458,7 +462,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 	"agent.requestDumpMaxSize": {
-		desc: "Raw dump 响应体文本的最大字节数。默认 1MB (1048576)。设为 -1 表示不限制。超出部分会被截断并标记。",
+		desc: "单条 raw dump 落库的最大字节数。默认 32MB (33554432)。设为 -1 表示不限制。超出时优先丢弃 SSE 事件、再按剩余预算截断请求/响应体，并标记 bodyTextTruncated，不会整包丢弃请求体。",
 		type: "number",
 	},
 	"agent.modelContextWindows": {

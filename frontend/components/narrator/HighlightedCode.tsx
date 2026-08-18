@@ -56,43 +56,81 @@ export const HighlightedCode = memo(function HighlightedCode({
 
 		const shouldCache = code.length <= MAX_CACHEABLE_CODE_CHARS;
 		let cancelled = false;
+		let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
 		const initialKey = cacheKey(theme, lang, code);
 		setHtml(shouldCache ? peekCachedHtml(initialKey) : null);
 
-		loadShiki().then((shiki) => {
-			if (cancelled || !shiki) return;
-			bundledLangsRef.current = shiki.bundledLanguages;
-
-			const effectiveLang = lang in shiki.bundledLanguages ? lang : "text";
-			if (effectiveLang === "text") {
-				setHtml(null);
-				return;
-			}
-
-			const key = cacheKey(theme, effectiveLang, code);
-			const existing = shouldCache ? getCachedHtml(key) : null;
-			if (existing) {
-				setHtml(existing);
-				return;
-			}
-
-			shiki
-				.codeToHtml(code, { lang: effectiveLang as BundledLanguage, theme })
-				.then((result) => {
+		/**
+		 * One highlight attempt. Retries once on a transient failure.
+		 *
+		 * `loadShiki()` now evicts a failed core so a later call can recover, but a
+		 * block that is already on screen never makes that later call: this effect
+		 * runs on mount and then only when `lang`/`code`/`theme` change. On a cold
+		 * PWA start — where the engine chunk is most likely to fail — that meant the
+		 * whole visible conversation rendered as plain text and stayed that way,
+		 * because nothing re-triggered the effect. Restarting the app was the only
+		 * cure, which is what made this look like a caching bug rather than a
+		 * network one.
+		 *
+		 * Deliberately bounded to a single retry: the fallback (`<Code>`) is a
+		 * perfectly readable block, so this is a nicety worth one extra request and
+		 * not worth an unbounded backoff loop running behind every code block on
+		 * the page.
+		 */
+		const attempt = (retriesLeft: number) => {
+			loadShiki()
+				.then((shiki) => {
 					if (cancelled) return;
-					if (shouldCache) {
-						setCachedHtml(key, result);
+					if (!shiki) {
+						if (retriesLeft > 0) retryTimer = setTimeout(() => attempt(retriesLeft - 1), 1_000);
+						return;
 					}
-					setHtml(result);
+					bundledLangsRef.current = shiki.bundledLanguages;
+
+					const effectiveLang = lang in shiki.bundledLanguages ? lang : "text";
+					if (effectiveLang === "text") {
+						setHtml(null);
+						return;
+					}
+
+					const key = cacheKey(theme, effectiveLang, code);
+					const existing = shouldCache ? getCachedHtml(key) : null;
+					if (existing) {
+						setHtml(existing);
+						return;
+					}
+
+					shiki
+						.codeToHtml(code, { lang: effectiveLang as BundledLanguage, theme })
+						.then((result) => {
+							if (cancelled) return;
+							if (shouldCache) {
+								setCachedHtml(key, result);
+							}
+							setHtml(result);
+						})
+						.catch(() => {
+							if (cancelled) return;
+							setHtml(null);
+							// A throw here means the grammar or theme module failed to load, not
+							// that the code is unhighlightable — both ensurers evict their own
+							// failures, so a retry can genuinely succeed.
+							if (retriesLeft > 0) retryTimer = setTimeout(() => attempt(retriesLeft - 1), 1_000);
+						});
 				})
 				.catch(() => {
-					if (!cancelled) setHtml(null);
+					if (!cancelled && retriesLeft > 0) {
+						retryTimer = setTimeout(() => attempt(retriesLeft - 1), 1_000);
+					}
 				});
-		});
+		};
+
+		attempt(1);
 
 		return () => {
 			cancelled = true;
+			if (retryTimer) clearTimeout(retryTimer);
 		};
 	}, [lang, code, theme]);
 

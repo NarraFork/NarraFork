@@ -60,6 +60,10 @@ const NO_LABELS_KINDS: Record<string, string> = {
 	"knowledge-hint": "entry titles come from measured content",
 	// Localized through a dedicated shell branch instead of a `labels` bundle.
 	"plan-card": "shell injects extra.label",
+	// Header chrome (verdict / revision / action label) is composed by the adapter
+	// (ctx.labels) and travels as data; the one render-layer string — the note for a body
+	// cut at the parse ceiling — arrives as extra.truncatedLabel.
+	"review-card": "adapter data + shell injects extra.truncatedLabel",
 	// Body is measured markdown (already projected + localized by the adapter); its
 	// only chrome is the speaker header node and the trailing note, both built by the
 	// integration layer — the render layer imports no avatar and no i18n.

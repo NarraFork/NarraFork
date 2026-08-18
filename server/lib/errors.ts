@@ -28,8 +28,14 @@ export class NotFoundError extends AppError {
 }
 
 export class ValidationError extends AppError {
-	constructor(message: string) {
-		super(message, 400, "VALIDATION_ERROR");
+	/**
+	 * `code` may be narrowed past the generic `VALIDATION_ERROR` when a client has
+	 * to REACT differently to one rejection than to the rest. Without a distinct
+	 * code the only discriminator is the prose message, which is neither stable
+	 * nor localizable.
+	 */
+	constructor(message: string, code: string = "VALIDATION_ERROR") {
+		super(message, 400, code);
 	}
 }
 

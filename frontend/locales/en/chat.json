@@ -43,6 +43,7 @@
 	"removeAttachment": "Remove",
 	"downloadAttachment": "Download",
 	"attachmentUploadFailed": "Upload failed",
+	"attachmentNoLongerAvailable": "Attachment expired on the server; attach it again",
 	"attachmentPreviewFailed": "Preview unavailable",
 	"attachmentLimitTitle": "Too many attachments",
 	"attachmentLimit": "At most {{count}} attachments per message",
