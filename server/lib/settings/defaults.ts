@@ -198,6 +198,7 @@ export const DEFAULTS: NarraForkSettings = {
 		maxConcurrentTransfersPerDevice: 2,
 		transferVerify: "crc32c",
 		transfersDir: null,
+		allowPlaintextEnrollmentOnPrivateNetwork: false,
 	},
 };
 
@@ -372,6 +373,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"devices.transfersDir": {
 		desc: "下载文件的默认落盘根目录。为空则使用 ~/.narrafork/transfers。",
 		type: "string",
+	},
+	"devices.allowPlaintextEnrollmentOnPrivateNetwork": {
+		desc: "允许在内网明文 http 下使用一键安装命令自动领取设备密钥。默认关闭：一键安装会让安装命令本身成为凭据，https 下该交换是加密的，明文 http 下不是——开启表示你接受设备密钥在注册那一次以明文经过内网。无论此项如何设置，公网可路由地址上的明文 http 一律拒绝发放密钥；关闭时可改用「手动粘贴密钥」方式安装。内网判定仅限字面 IP 地址，主机名一律不适用（服务器无法验证域名实际解析到哪个网络）。",
+		type: "boolean",
 	},
 
 	// ── agent ───────────────────────────────────────────────────────────

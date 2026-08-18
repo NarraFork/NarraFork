@@ -745,6 +745,51 @@ describe("live-patch audit: fields that are height-NEUTRAL (single header row)",
 		);
 		expect(identified.height).toBe(base.height);
 	});
+
+	/**
+	 * `awaitAgentResolvedPatch` writes the child narrator id of a RUNNING Await so
+	 * the row's "open session" item appears during the wait.
+	 *
+	 * It is NOT in the exhaustive audit above, which requires a height change: this
+	 * patch must have none. That is the whole reason it writes its own field instead
+	 * of `_metadata.subagentId` — `classifyAwait` renders a `subagent:` row from the
+	 * latter, so the obvious implementation would have grown every running Await
+	 * card. This case is what would fail if someone "simplified" it back.
+	 *
+	 * No revision component is needed either (unlike `timeoutMs`): the menu reads the
+	 * MESSAGE TREE, not the cached measured payload, so a retained entry stays correct.
+	 */
+	it("the resolved await-agent narrator id does not change the measured height", async () => {
+		const { measureToolCall } = await measureMod();
+		const base = measureToolCall(expandedCard(), WIDTH, LOD, OPENED);
+		expect(base.height).toBeGreaterThan(base.collapsedHeight);
+		const resolved = measureToolCall(
+			expandedCard({ _awaitAgentNarratorId: "sub-live" } as Partial<ToolCallData>),
+			WIDTH,
+			LOD,
+			OPENED,
+		);
+		expect(resolved.height).toBe(base.height);
+	});
+
+	it("writing the await id into _metadata WOULD change the height (why it does not)", async () => {
+		// Pins the alternative this design rejects: `classifyAwait` emits a
+		// `subagent: …` row for `metadata.subagentId`, so routing the derived id
+		// through metadata is a layout change caused by a context-menu affordance.
+		const { classifyToolDetail } = await import("@shared/pretext-layout/tool-detail");
+		const base = {
+			toolName: "Await",
+			category: "await",
+			status: "running",
+			inputJson: { type: "agent", id: "paper-extract" },
+		} as const;
+		const without = classifyToolDetail({ ...base, metadata: { awaitType: "agent" } });
+		const withId = classifyToolDetail({
+			...base,
+			metadata: { awaitType: "agent", subagentId: "sub-live" },
+		});
+		expect(JSON.stringify(withId)).not.toBe(JSON.stringify(without));
+	});
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

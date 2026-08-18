@@ -1,0 +1,346 @@
+/**
+ * await-agent-resolution.ts — Resolve a RUNNING `Await({type:"agent"})` call's
+ * target selector into the real subagent narrator id.
+ *
+ * WHY THIS EXISTS
+ * The Await tool only learns its target's narrator id when it RETURNS: `subagentId`
+ * / `resolvedId` live in `metadata`, and the `<subagent_id>` tag lives in the
+ * output text (`tools/await.ts` execute → return). While the wait is in flight the
+ * tool call row has an empty `outputJson`, so every frontend derivation of "which
+ * session does this Await row point at" comes up empty:
+ *
+ *   vlist    → deriveAwaitAgentNarratorId  (vlist-tool-meta.ts)
+ *   chunked  → getAwaitAgentNarratorId     (ToolCallCard.tsx)
+ *   trace    → traceRowAwaitAgentNarratorId (trace-row-identity.ts)
+ *
+ * All three then hide (or disable) the "open session" item — precisely while the
+ * user most wants it, because the subagent is still working and its progress is
+ * only visible inside its own session.
+ *
+ * The missing fact is cheap: the selector the model typed (`input.id`) is an
+ * alias / title / id-prefix that the team's subagent roster can resolve. This
+ * module does exactly that, in BULK for a page of messages, so no per-row query
+ * is ever needed (the trace path documents that constraint explicitly).
+ *
+ * ── Deliberate scope limits ──
+ * - READ ONLY. It never writes `outputJson`: a non-null output makes the history
+ *   builders treat the call as finished (`status === "success" | "fail"` gating
+ *   in anthropic/openai providers reads status, but several UI paths gate on
+ *   `outputJson` truthiness — e.g. `isRunning = status === "running" && !outputJson`).
+ *   The resolved id is delivered as a separate transport field instead.
+ * - NEVER THROWS. A selector that matches nothing, or matches ambiguously,
+ *   resolves to nothing and the menu item simply stays hidden — the previous
+ *   behaviour. Failing a message load over a cosmetic navigation affordance
+ *   would be a strictly worse trade.
+ * - Bounded queries only: one roster query per parent narrator plus one
+ *   background-task query, both indexed, with narrow column projections. No
+ *   large fields (`output`, `input_json`, message bodies) are selected.
+ */
+
+import { eq, inArray } from "drizzle-orm";
+import { db } from "../db";
+import { backgroundTasks, narrators } from "../db/schema";
+import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
+
+/**
+ * Field carrying the resolved child narrator id of a RUNNING `Await({type:"agent"})`.
+ *
+ * ⚠️ Deliberately NOT written into `metadata.subagentId`, even though that is where
+ * a FINISHED Await keeps the same fact. Two reasons, both load-bearing:
+ *
+ *  1. Height. `classifyAwait` (shared/pretext-layout/tool-detail.ts) renders a
+ *     `subagent: …` row whenever `metadata.subagentId` exists, so writing it there
+ *     would grow every running Await card. This channel exists only to enable a
+ *     menu item, and a navigation affordance must not move layout.
+ *  2. Provenance. `metadata` is the tool's own returned payload; this value is
+ *     DERIVED by the server from the selector. Keeping it in a distinct field means
+ *     no reader can mistake a still-running wait for a completed one.
+ *
+ * Frontend readers treat it as the last fallback after the persisted metadata (see
+ * `deriveAwaitAgentNarratorId` / `getAwaitAgentNarratorId`), so a finished call
+ * always prefers its authoritative id.
+ */
+export const AWAIT_AGENT_RESOLVED_FIELD = "_awaitAgentNarratorId";
+
+/**
+ * Attach {@link AWAIT_AGENT_RESOLVED_FIELD} to the `tool_use` blocks of pending
+ * Await-agent calls, so the frontend can offer "open session" WHILE the wait is
+ * still in flight.
+ *
+ * Lives here rather than in `narrator-messages` on purpose: it is pure, and
+ * `narrator-messages` is part of an import cycle with `narrator-service`, so
+ * importing it from a test would evaluate that cycle and fail at module init.
+ *
+ * Runs on an already-enriched tree and only rewrites the blocks it has an id for,
+ * returning the SAME references otherwise — an unaffected page pays no copy.
+ */
+export function attachAwaitAgentNarratorIds(
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	tree: any[],
+	resolved: ReadonlyMap<string, string>,
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+): any[] {
+	if (resolved.size === 0 || !Array.isArray(tree) || tree.length === 0) return tree;
+	// Build lazily: `Array.prototype.map` would allocate a new array (and a new
+	// message object per entry) even when nothing matched, defeating the identity
+	// contract this function promises for unaffected pages.
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	let next: any[] | null = null;
+	for (let i = 0; i < tree.length; i++) {
+		const msg = tree[i];
+		const patched = patchMessage(msg, resolved);
+		if (patched === msg) {
+			next?.push(msg);
+			continue;
+		}
+		if (!next) next = tree.slice(0, i);
+		next.push(patched);
+	}
+	return next ?? tree;
+}
+
+/** Patch one message, returning the SAME reference when nothing changed. */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function patchMessage(msg: any, resolved: ReadonlyMap<string, string>): any {
+	const children = msg?.children?.length
+		? attachAwaitAgentNarratorIds(msg.children, resolved)
+		: msg?.children;
+	const childrenChanged = children !== msg?.children;
+	if (!Array.isArray(msg?.contentJson)) {
+		return childrenChanged ? { ...msg, children } : msg;
+	}
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	let contentJson: any[] | null = null;
+	for (let i = 0; i < msg.contentJson.length; i++) {
+		const block = msg.contentJson[i];
+		const subagentId = block?.type === "tool_use" ? resolved.get(block.id) : undefined;
+		if (!subagentId) {
+			contentJson?.push(block);
+			continue;
+		}
+		// `??=` does not narrow here (the source expression is `any`), so assign to a
+		// definitely-non-null local and keep the accumulator in sync.
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const acc: any[] = contentJson ?? msg.contentJson.slice(0, i);
+		contentJson = acc;
+		acc.push({ ...block, [AWAIT_AGENT_RESOLVED_FIELD]: subagentId });
+	}
+	if (!contentJson) return childrenChanged ? { ...msg, children } : msg;
+	return { ...msg, contentJson, children };
+}
+
+/** The Await tool-call shape this module reads. Mirrors the frontend derivations. */
+export interface AwaitAgentToolCallLike {
+	toolUseId: string;
+	toolName: string;
+	inputJson?: unknown;
+	outputJson?: unknown;
+}
+
+/** One pending Await-agent call: the row plus the selector it is waiting on. */
+export interface PendingAwaitAgent {
+	toolUseId: string;
+	/** The selector the model typed (`input.id`): alias | title | id | id-prefix. */
+	selector: string;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: {};
+}
+
+function nonEmpty(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/**
+ * Whether this Await call ALREADY knows its subagent id from persisted data.
+ *
+ * A finished Await carries it in `outputJson._metadata`; re-resolving such a row
+ * would be pure waste, and the persisted value is authoritative anyway (the wait
+ * may have targeted a subagent that has since been superseded by a same-alias
+ * sibling).
+ */
+function hasPersistedSubagentId(tc: AwaitAgentToolCallLike): boolean {
+	const metadata = asRecord(asRecord(tc.outputJson)._metadata);
+	return !!(nonEmpty(metadata.subagentId) ?? nonEmpty(metadata.resolvedId));
+}
+
+/**
+ * The pending Await-agent calls in a batch of tool calls.
+ *
+ * Pure and export-visible so tests can lock the gating without a database: only
+ * `Await`, only `type: "agent"`, only with a selector, only when the persisted
+ * metadata does not already answer the question.
+ */
+export function collectPendingAwaitAgents(
+	toolCalls: readonly AwaitAgentToolCallLike[],
+): PendingAwaitAgent[] {
+	const pending: PendingAwaitAgent[] = [];
+	const seen = new Set<string>();
+	for (const tc of toolCalls) {
+		if (tc.toolName !== "Await" || !tc.toolUseId) continue;
+		if (seen.has(tc.toolUseId)) continue;
+		const input = asRecord(tc.inputJson);
+		// A truncated input keeps its short fields, so `type`/`id` survive; anything
+		// else is not an agent await and has no session to open.
+		if (nonEmpty(input.type) !== "agent") continue;
+		const selector = nonEmpty(input.id);
+		if (!selector) continue;
+		if (hasPersistedSubagentId(tc)) continue;
+		seen.add(tc.toolUseId);
+		pending.push({ toolUseId: tc.toolUseId, selector });
+	}
+	return pending;
+}
+
+/** Roster entry a selector is matched against. */
+interface RosterEntry {
+	id: string;
+	title: string | null;
+	traits: unknown;
+}
+
+/**
+ * Resolve selectors against one parent narrator's subagent roster.
+ *
+ * Mirrors `resolveOneTarget` (agent-communication.ts) minus its throwing
+ * behaviour and its permission assertions:
+ *   1. the in-memory alias registry (same-session, no I/O)
+ *   2. an exact roster id
+ *   3. `subagentMatchesSelector` — id prefix / exact title / title slug / alias trait
+ *   4. a background-task alias or id (a detached agent's readable handle)
+ *
+ * An AMBIGUOUS selector resolves to nothing on purpose: guessing one of several
+ * candidates would silently navigate the user into the wrong session, which is
+ * worse than the item staying hidden.
+ */
+function resolveAgainstRoster(
+	selector: string,
+	roster: readonly RosterEntry[],
+	taskAliasToSubagentId: ReadonlyMap<string, string>,
+): string | undefined {
+	const byId = roster.find((entry) => entry.id === selector);
+	if (byId) return byId.id;
+
+	const matches = roster.filter((entry) => subagentMatchesSelector(entry, selector));
+	if (matches.length === 1) return matches[0].id;
+	// More than one candidate: ambiguous, resolve to nothing (see the note above).
+	if (matches.length > 1) return undefined;
+
+	return taskAliasToSubagentId.get(selector);
+}
+
+/**
+ * Resolve every pending Await-agent selector for ONE parent narrator's team.
+ *
+ * Returns `toolUseId → subagent narrator id` for the selectors that resolved
+ * unambiguously. Unresolvable entries are simply absent.
+ *
+ * `teamParentId` must be the TEAM scope (a subagent's parent, or the narrator
+ * itself for a primary), because both the alias registry and the roster are
+ * keyed by parent — the same rule `getCommunicationScope` applies.
+ */
+export async function resolveAwaitAgentNarratorIds(
+	teamParentId: string,
+	pending: readonly PendingAwaitAgent[],
+): Promise<Map<string, string>> {
+	const resolved = new Map<string, string>();
+	if (!teamParentId || pending.length === 0) return resolved;
+
+	try {
+		const [roster, tasks] = await Promise.all([
+			db.query.narrators.findMany({
+				where: eq(narrators.parentNarratorId, teamParentId),
+				columns: { id: true, title: true, traits: true },
+			}),
+			db.query.backgroundTasks.findMany({
+				where: eq(backgroundTasks.parentNarratorId, teamParentId),
+				columns: { id: true, alias: true, subagentNarratorId: true, type: true },
+			}),
+		]);
+		if (roster.length === 0 && tasks.length === 0) return resolved;
+
+		const taskAliasToSubagentId = new Map<string, string>();
+		for (const task of tasks) {
+			if (task.type !== "agent") continue;
+			// An agent task row shares the subagent's id (see createAgentTask), but the
+			// explicit column wins when present.
+			const subagentId = task.subagentNarratorId ?? task.id;
+			if (!subagentId) continue;
+			taskAliasToSubagentId.set(task.id, subagentId);
+			if (task.alias) taskAliasToSubagentId.set(task.alias, subagentId);
+		}
+
+		for (const entry of pending) {
+			// The registry maps an alias to a real id within this parent's session.
+			const aliasCandidate = resolveTaskAlias(teamParentId, entry.selector);
+			const hit =
+				resolveAgainstRoster(aliasCandidate, roster, taskAliasToSubagentId) ??
+				(aliasCandidate === entry.selector
+					? undefined
+					: resolveAgainstRoster(entry.selector, roster, taskAliasToSubagentId));
+			if (hit) resolved.set(entry.toolUseId, hit);
+		}
+	} catch {
+		// A navigation affordance must never fail a message load.
+		return resolved;
+	}
+	return resolved;
+}
+
+/**
+ * Resolve the pending Await-agent calls found in a batch of tool calls.
+ *
+ * The single entry point message-loading code needs: it derives the team scope
+ * from the narrator ids that own the calls, so a page mixing a primary narrator's
+ * messages with a subagent's still resolves each against the right roster.
+ */
+export async function resolveAwaitAgentIdsForToolCalls(
+	toolCalls: readonly (AwaitAgentToolCallLike & { narratorId?: string })[],
+): Promise<Map<string, string>> {
+	const pending = collectPendingAwaitAgents(toolCalls);
+	if (pending.length === 0) return new Map();
+
+	const ownerByToolUseId = new Map<string, string>();
+	for (const tc of toolCalls) {
+		if (tc.toolUseId && tc.narratorId && !ownerByToolUseId.has(tc.toolUseId)) {
+			ownerByToolUseId.set(tc.toolUseId, tc.narratorId);
+		}
+	}
+	const ownerIds = [...new Set([...ownerByToolUseId.values()])];
+	if (ownerIds.length === 0) return new Map();
+
+	// A subagent's Await resolves against its PARENT's roster (its own siblings),
+	// exactly as getCommunicationScope defines the team scope.
+	const scopeByNarratorId = new Map<string, string>();
+	try {
+		const owners = await db.query.narrators.findMany({
+			where: inArray(narrators.id, ownerIds),
+			columns: { id: true, parentNarratorId: true },
+		});
+		for (const owner of owners) {
+			scopeByNarratorId.set(owner.id, owner.parentNarratorId ?? owner.id);
+		}
+	} catch {
+		return new Map();
+	}
+
+	const byScope = new Map<string, PendingAwaitAgent[]>();
+	for (const entry of pending) {
+		const owner = ownerByToolUseId.get(entry.toolUseId);
+		const scope = owner ? scopeByNarratorId.get(owner) : undefined;
+		if (!scope) continue;
+		const bucket = byScope.get(scope);
+		if (bucket) bucket.push(entry);
+		else byScope.set(scope, [entry]);
+	}
+
+	const resolved = new Map<string, string>();
+	for (const [scope, entries] of byScope) {
+		const scopeResolved = await resolveAwaitAgentNarratorIds(scope, entries);
+		for (const [toolUseId, subagentId] of scopeResolved) resolved.set(toolUseId, subagentId);
+	}
+	return resolved;
+}

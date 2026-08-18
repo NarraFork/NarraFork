@@ -332,6 +332,17 @@ export interface ToolCallData {
 	resultMessageId?: string;
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
 	_subagentActivity?: SubagentActivitySummary;
+	/**
+	 * Child narrator id of a RUNNING `Await({type:"agent"})`, resolved by the server
+	 * from the call's target selector.
+	 *
+	 * A wait in flight has no output, so `metadata.subagentId` and the
+	 * `<subagent_id>` tag do not exist yet — this is the only source that lets the
+	 * card open the child's session before the wait returns. Kept out of `_metadata`
+	 * on purpose (it would render an extra `subagent:` row and change measured
+	 * height); see `AWAIT_AGENT_RESOLVED_FIELD` on the server.
+	 */
+	_awaitAgentNarratorId?: string;
 }
 
 export type { PendingPermission } from "@frontend/types/narrator";
@@ -3689,7 +3700,9 @@ function getAwaitAgentNarratorId(toolCall: ToolCallData): string | null {
 	if (typeof metadataId === "string" && metadataId.trim()) return metadataId;
 	const output = resolveDisplayText(toolCall.outputJson);
 	const outputId = stripSubagentIdTag(output).subagentId;
-	return outputId?.trim() || null;
+	if (outputId?.trim()) return outputId;
+	// Still waiting: the server's resolution of the selector is the only source.
+	return toolCall._awaitAgentNarratorId?.trim() || null;
 }
 
 function AwaitDetail({ toolCall }: { toolCall: ToolCallData }) {

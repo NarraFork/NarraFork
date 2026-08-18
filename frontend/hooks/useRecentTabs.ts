@@ -506,13 +506,22 @@ function isAttentionTab(tab: RecentTab): boolean {
 	return !!tab.substatus?.some((status) => status === "unread" || status === "error");
 }
 
-function clearLoadedTabs(
+export function clearLoadedTabs(
 	tabs: RecentTab[],
 	scope: "all" | "projects" | "inactive_narrators",
 	keepTabKey?: string,
 ): RecentTab[] {
-	const isKept = (tab: RecentTab) => (keepTabKey ? tabKey(tab) === keepTabKey : false);
-	if (scope === "all") return keepTabKey ? tabs.filter(isKept) : [];
+	// Pinning is an explicit user intent to keep a tab; no clear scope may drop it.
+	// Any tab type can be pinned; a pinned WORKSPACE header additionally keeps its
+	// children, so the group stays together (mirrors the server's unit-header rule).
+	const pinnedWorkspaces = new Set(
+		tabs.filter((tab) => tab.type === "workspace" && tab.pinned).map((tab) => tab.id),
+	);
+	const isKept = (tab: RecentTab) =>
+		(keepTabKey ? tabKey(tab) === keepTabKey : false) ||
+		tab.pinned === true ||
+		(!!tab.workspaceId && pinnedWorkspaces.has(tab.workspaceId));
+	if (scope === "all") return tabs.filter(isKept);
 	if (scope === "projects") return tabs.filter((tab) => tab.type !== "project" || isKept(tab));
 
 	const childrenByWorkspace = new Map<string, RecentTab[]>();

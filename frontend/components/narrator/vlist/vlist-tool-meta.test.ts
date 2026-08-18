@@ -124,6 +124,60 @@ describe("deriveToolMeta", () => {
 		expect(meta?.awaitAgentNarratorId).toBeUndefined();
 	});
 
+	/**
+	 * The regression this whole channel exists for: a RUNNING Await has no output, so
+	 * neither `_metadata.subagentId` nor the `<subagent_id>` tag exists and the row's
+	 * "open session" item stayed hidden for the entire wait. The server resolves the
+	 * selector and ships `_awaitAgentNarratorId`; without reading it here the fix is
+	 * invisible on the vlist path.
+	 */
+	it("resolves the await narrator id from the server field while the wait is running", () => {
+		const meta = deriveToolMeta(
+			toolBlock({
+				name: "Await",
+				input: { type: "agent", id: "paper-extract" },
+				status: "running",
+				_awaitAgentNarratorId: "sub-live",
+			}),
+		);
+		expect(meta?.awaitAgentNarratorId).toBe("sub-live");
+	});
+
+	it("prefers the tool's own returned metadata over the server-derived field", () => {
+		const meta = deriveToolMeta(
+			toolBlock({
+				name: "Await",
+				input: { type: "agent", id: "t-1" },
+				output: { _metadata: { subagentId: "sub-authoritative" } },
+				_awaitAgentNarratorId: "sub-derived",
+			}),
+		);
+		expect(meta?.awaitAgentNarratorId).toBe("sub-authoritative");
+	});
+
+	it("prefers the output tag over the server-derived field", () => {
+		const meta = deriveToolMeta(
+			toolBlock({
+				name: "Await",
+				input: { type: "agent", id: "t-1" },
+				output: "done <subagent_id>sub-tag</subagent_id>",
+				_awaitAgentNarratorId: "sub-derived",
+			}),
+		);
+		expect(meta?.awaitAgentNarratorId).toBe("sub-tag");
+	});
+
+	it("ignores the server-derived field for a non-agent await", () => {
+		const meta = deriveToolMeta(
+			toolBlock({
+				name: "Await",
+				input: { type: "bash", id: "b-1" },
+				_awaitAgentNarratorId: "sub-live",
+			}),
+		);
+		expect(meta?.awaitAgentNarratorId).toBeUndefined();
+	});
+
 	// ── background / terminal state ────────────────────────────────────────────
 
 	it("flags background subagents from either input key", () => {

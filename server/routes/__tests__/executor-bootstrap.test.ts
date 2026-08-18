@@ -86,7 +86,7 @@ describe("GET /api/executor/download/:platform", () => {
 		expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array(BINARY));
 	});
 
-	test("rejects a missing, unknown or replayed ticket with one generic message", async () => {
+	test("rejects a missing or unknown ticket with one generic message", async () => {
 		const instance = app();
 		const noTicket = await instance.request("/api/executor/download/linux-amd64");
 		expect(noTicket.status).toBe(403);
@@ -97,18 +97,36 @@ describe("GET /api/executor/download/:platform", () => {
 			`/api/executor/download/linux-amd64?ticket=${"c".repeat(64)}`,
 		);
 		expect(unknown.status).toBe(403);
-		// An unknown ticket and a replayed one must be indistinguishable to callers.
+		// Unknown, expired and exhausted tickets must be indistinguishable to callers:
+		// the specific reason is logged server-side only.
 		expect(((await unknown.json()) as { error: string }).error).toBe(body.error);
+	});
 
+	test("allows download retries but stops at the ticket's budget", async () => {
+		/*
+		 * Downloads are deliberately NOT single-use.
+		 *
+		 * A dropped connection partway through a multi-megabyte binary is ordinary, and
+		 * the natural human response is to re-run the same install command. When the
+		 * download was one-shot, a network blip meant going back to the UI to generate a
+		 * new command. The key exchange is still strictly once — that is where
+		 * single-use actually matters.
+		 */
+		const instance = app();
 		const ticket = issueExecutorTicket("linux-amd64");
-		expect(
-			(await instance.request(`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`)).status,
-		).toBe(200);
-		const replay = await instance.request(
+		for (let attempt = 0; attempt < 5; attempt++) {
+			expect(
+				(await instance.request(`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`))
+					.status,
+			).toBe(200);
+		}
+		const exhausted = await instance.request(
 			`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`,
 		);
-		expect(replay.status).toBe(403);
-		expect(((await replay.json()) as { error: string }).error).toBe(body.error);
+		expect(exhausted.status).toBe(403);
+		expect(((await exhausted.json()) as { error: string }).error).toBe(
+			"Invalid or expired download ticket",
+		);
 	});
 
 	test("a ticket cannot be redirected to another platform", async () => {
@@ -166,7 +184,9 @@ describe("GET /api/executor/download/:platform", () => {
 	test("rate limits repeated attempts from one address", async () => {
 		const instance = app();
 		let limited = false;
-		for (let i = 0; i < 25; i++) {
+		// Loops past the window rather than to a hard-coded count: the budget is sized
+		// for how many machines share one NAT egress, so it is expected to be retuned.
+		for (let i = 0; i < 200; i++) {
 			const response = await instance.request(
 				`/api/executor/download/linux-amd64?ticket=${"d".repeat(64)}`,
 			);
@@ -176,5 +196,28 @@ describe("GET /api/executor/download/:platform", () => {
 			}
 		}
 		expect(limited).toBe(true);
+	});
+
+	/**
+	 * One install spends 3 attempts (script + binary + token). The budget is NOT sized
+	 * for one machine: several hosts behind a single NAT egress — the ordinary LAN
+	 * deployment — share this counter, and if it were tight the later installs would
+	 * fail with a rate-limit message that has nothing to do with their ticket.
+	 *
+	 * Pins the headroom in units of installs, so a future reduction has to state that
+	 * it is shrinking the number of machines enrollable per minute from one address.
+	 */
+	test("leaves room for a batch of machines behind one NAT egress", async () => {
+		const instance = app();
+		const attemptsPerInstall = 3;
+		const machines = 10;
+		for (let i = 0; i < attemptsPerInstall * machines; i++) {
+			const response = await instance.request(
+				`/api/executor/download/linux-amd64?ticket=${"d".repeat(64)}`,
+			);
+			// 403 is the expected outcome for a bogus ticket; 429 would mean the limiter
+			// cut in before ten machines could enroll.
+			expect(response.status).toBe(403);
+		}
 	});
 });

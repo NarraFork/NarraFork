@@ -3,8 +3,17 @@ import { type Context, Hono } from "hono";
 import { DEVICE_PROTOCOL_VERSION } from "../lib/agent/execution/rpc-types";
 import { ForbiddenError, NotFoundError, ValidationError } from "../lib/errors";
 import { getExecutorManifest } from "../lib/executor-binaries";
-import { issueExecutorTicket } from "../lib/executor-bootstrap-ticket";
-import { buildExecutorInstallScript } from "../lib/executor-install-script";
+import { attachExecutorTicketScript, issueExecutorTicket } from "../lib/executor-bootstrap-ticket";
+import {
+	enrollmentRefusalMessage,
+	evaluateEnrollmentTransport,
+} from "../lib/executor-enrollment-policy";
+import {
+	buildExecutorInstallOneLiner,
+	buildExecutorInstallScript,
+} from "../lib/executor-install-script";
+import { resolvePublicOrigin } from "../lib/public-origin";
+import { settings } from "../lib/settings";
 import {
 	buildPathRulesConfigSnippet,
 	createRemoteDeviceSchema,
@@ -237,16 +246,16 @@ deviceRoutes.delete("/:id", async (c) => {
 	return c.json({ success: true });
 });
 
-// Generate a ready-to-run install script for one device and platform, along with
-// the single-use ticket its download step will spend.
+// Generate a ready-to-run install command for one device and platform, along with
+// the enrollment ticket its steps will spend.
 deviceRoutes.post("/:id/install-script", async (c) => {
 	// Available to the registrar: without it, registering a device is useless, and
 	// the script grants nothing beyond enrolling a machine the operator already
-	// controls. The download ticket it mints is scoped to this device.
+	// controls. The ticket it mints is scoped to this device.
 	const device = await requireManagedDevice(c);
 	const parsed = deviceInstallScriptSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const { platform, mode, disableShell, serverBaseUrl } = parsed.data;
+	const { platform, mode, disableShell, serverBaseUrl, tokenDelivery } = parsed.data;
 
 	const manifest = await getExecutorManifest();
 	if (!manifest) {
@@ -261,15 +270,63 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 		);
 	}
 
-	// Prefer an explicit base URL: the target machine may reach this server on a
-	// different host than the admin's browser did.
-	const baseUrl = (serverBaseUrl ?? new URL(c.req.url).origin).replace(/\/+$/, "");
+	/*
+	 * Which URL the target machine should use, in order of trustworthiness:
+	 *
+	 * 1. An explicit `serverBaseUrl` — the operator knows their topology, and the
+	 *    target machine may well reach this server on a different host than the
+	 *    browser did (split-horizon DNS, a VPN-only name).
+	 * 2. The forwarded public origin, for the ordinary reverse-proxy deployment.
+	 *
+	 * What it must NOT be is `new URL(c.req.url).origin`: behind a proxy that is the
+	 * proxy's upstream target, i.e. `http://127.0.0.1:7779`, which is unreachable
+	 * from any other machine. Baking that into the script was the original defect —
+	 * the URL was always localhost because the browser's own origin never reached
+	 * this code.
+	 */
+	const baseUrl = (serverBaseUrl ?? resolvePublicOrigin(c).origin).replace(/\/+$/, "");
 	const deviceWsUrl =
 		device.connectionMode === "direct" && device.directUrl
 			? device.directUrl
 			: `${baseUrl.replace(/^http/, "ws")}/ws/device`;
 
-	const ticket = issueExecutorTicket(platform, { deviceId: device.id });
+	// Evaluated against the URL the target machine will really use, not the request
+	// origin: an operator who overrode the base URL is telling us how the key will
+	// travel, and that is what has to be safe.
+	let resolvedBaseUrl: URL;
+	try {
+		resolvedBaseUrl = new URL(baseUrl);
+	} catch {
+		throw new ValidationError("Server base URL must be a valid absolute URL");
+	}
+	if (tokenDelivery === "enroll") {
+		const transport = evaluateEnrollmentTransport({
+			origin: resolvedBaseUrl,
+			allowPrivateNetworkPlaintext:
+				settings.devices?.allowPlaintextEnrollmentOnPrivateNetwork ?? false,
+		});
+		// Refused here rather than at redemption time so the operator finds out while
+		// still in the UI, where the remedy (https, the setting, or manual key entry)
+		// is actionable — instead of on the target machine mid-install.
+		if (!transport.allowed) {
+			throw new ValidationError(
+				enrollmentRefusalMessage(transport.reason, { hostname: resolvedBaseUrl.hostname }),
+			);
+		}
+	}
+
+	/*
+	 * The script embeds its own ticket, and the ticket must carry the script so the
+	 * public fetch endpoint can serve it without touching the database — a cycle.
+	 * Broken by minting the ticket first and attaching the rendered body after.
+	 */
+	const ticket = issueExecutorTicket(platform, {
+		deviceId: device.id,
+		deviceSlug: device.slug,
+		// Structural, not cosmetic: a prompt-mode ticket must be unable to hand out a
+		// key even if something later points it at the enroll endpoint.
+		allowTokenDelivery: tokenDelivery === "enroll",
+	});
 	const generated = buildExecutorInstallScript({
 		platform,
 		mode,
@@ -283,12 +340,22 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 		expectedSha256: artifact.sha256,
 		executorVersion: manifest.version,
 		ticket: ticket.ticket,
+		tokenDelivery,
+	});
+	attachExecutorTicketScript(ticket.ticket, {
+		body: generated.script,
+		filename: generated.filename,
+		shell: generated.shell,
 	});
 
+	const scriptUrl = `${baseUrl}/api/executor/install/${platform}?ticket=${ticket.ticket}`;
 	return c.json({
 		script: generated.script,
 		filename: generated.filename,
 		shell: generated.shell,
+		scriptUrl,
+		oneLiner: buildExecutorInstallOneLiner({ scriptUrl, shell: generated.shell }),
+		tokenDelivery,
 		executorVersion: manifest.version,
 		platform,
 		expiresAt: new Date(ticket.expiresAt).toISOString(),

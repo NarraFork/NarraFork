@@ -84,6 +84,16 @@ export function readSubagentIdTag(text: string): string | undefined {
 }
 
 /**
+ * Server-derived child narrator id for a RUNNING Await-agent call.
+ *
+ * A wait in flight has no output yet, so none of the persisted sources exist; the
+ * server resolves the selector and ships the answer in this field (see
+ * `AWAIT_AGENT_RESOLVED_FIELD` in server/services/narrator-messages.ts for why it
+ * is kept out of `metadata`).
+ */
+const AWAIT_AGENT_RESOLVED_FIELD = "_awaitAgentNarratorId";
+
+/**
  * The `_metadata` bag a tool call may carry either on its output or on itself.
  * Mirrors ToolCallCard's `toolCall.outputJson?._metadata ?? toolCall._metadata`.
  */
@@ -108,7 +118,14 @@ export function deriveAwaitAgentTargetId(
 	return nonEmpty(extractField(input, "id") || nonEmpty(metadata.targetId) || "");
 }
 
-/** The resolved child narrator id for an Await-agent call, when discoverable. */
+/**
+ * The resolved child narrator id for an Await-agent call, when discoverable.
+ *
+ * Order matters: the tool's OWN returned metadata is authoritative and wins, then
+ * the `<subagent_id>` tag in its output, and only then the server's live
+ * resolution of the selector — which is the only source that exists while the wait
+ * is still running.
+ */
 export function deriveAwaitAgentNarratorId(
 	block: ContentBlock,
 	metadata: Record<string, unknown>,
@@ -117,7 +134,9 @@ export function deriveAwaitAgentNarratorId(
 	if (fromMetadata) return fromMetadata;
 	const record = block as unknown as Record<string, unknown>;
 	const output = resolveDisplayText(record.output ?? record.outputJson);
-	return output ? readSubagentIdTag(output) : undefined;
+	const fromTag = output ? readSubagentIdTag(output) : undefined;
+	if (fromTag) return fromTag;
+	return nonEmpty(record[AWAIT_AGENT_RESOLVED_FIELD]);
 }
 
 /** Derive the tool meta for one `tool_use` content block. */

@@ -320,4 +320,50 @@ describe("traceRowAwaitAgentNarratorId — embedded metadata only", () => {
 			}).awaitAgentNarratorId,
 		).toBeUndefined();
 	});
+
+	/**
+	 * The server-derived field keeps this path within its performance invariant: it
+	 * arrives EMBEDDED on the row, so a running Await gains its "open session" item
+	 * without the per-row query the invariant forbids.
+	 */
+	test("uses the server-derived id while the wait is still running", () => {
+		expect(
+			traceRowToolMeta({
+				toolName: "Await",
+				toolUseId: "t1",
+				inputJson: { type: "agent", id: "paper-extract" },
+				status: "running",
+				_awaitAgentNarratorId: "sub-live",
+			}).awaitAgentNarratorId,
+		).toBe("sub-live");
+	});
+
+	test("prefers embedded metadata and the output tag over the server-derived id", () => {
+		expect(
+			traceRowAwaitAgentNarratorId({
+				toolName: "Await",
+				inputJson: { type: "agent", id: "t-1" },
+				outputJson: { _metadata: { subagentId: "sub-authoritative" } },
+				_awaitAgentNarratorId: "sub-derived",
+			}),
+		).toBe("sub-authoritative");
+		expect(
+			traceRowAwaitAgentNarratorId({
+				toolName: "Await",
+				inputJson: { type: "agent", id: "t-1" },
+				outputJson: "ok <subagent_id>sub-tag</subagent_id>",
+				_awaitAgentNarratorId: "sub-derived",
+			}),
+		).toBe("sub-tag");
+	});
+
+	test("ignores the server-derived id for a bash await", () => {
+		expect(
+			traceRowAwaitAgentNarratorId({
+				toolName: "Await",
+				inputJson: { type: "bash", id: "b-1" },
+				_awaitAgentNarratorId: "sub-live",
+			}),
+		).toBeUndefined();
+	});
 });

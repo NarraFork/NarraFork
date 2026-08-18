@@ -432,6 +432,16 @@ interface NarratorWSCallbacks {
 	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
 	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
 	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
+	/**
+	 * A running Await-agent call learned which child narrator it is waiting on.
+	 * Lets the card offer "open session" before the wait returns (the id is not in
+	 * the persisted row until then).
+	 */
+	onAwaitAgentResolved?: (
+		toolUseId: string,
+		subagentNarratorId: string,
+		parentToolUseId?: string,
+	) => void;
 	onTitleUpdated?: (title: string) => void;
 	onBufferSet?: (messages: BufferMessageSummary[]) => void;
 	onBufferConsumed?: (messageId: string, remaining: BufferMessageSummary[]) => void;
@@ -980,6 +990,13 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onToolOutput?.(
 							data.toolUseId as string,
 							data.output as string,
+							data.parentToolUseId as string | undefined,
+						);
+						break;
+					case "await_agent_resolved":
+						callbackOwner.callbacks.onAwaitAgentResolved?.(
+							data.toolUseId as string,
+							data.subagentNarratorId as string,
 							data.parentToolUseId as string | undefined,
 						);
 						break;

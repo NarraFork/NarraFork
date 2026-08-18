@@ -53,6 +53,7 @@ const {
 	addRecentTabsBatch,
 	applyRecentTabsDelta,
 	applyRecentTabsRuntimePatches,
+	clearLoadedTabs,
 	collectRecentTabsDeltaFrame,
 	recentTabsDataRevision,
 	recentTabsSectionQueryKey,
@@ -869,5 +870,47 @@ describe("recent tabs live window", () => {
 			"n105",
 			"n0",
 		]);
+	});
+});
+
+describe("recent tabs optimistic clear", () => {
+	const tab = (overrides: Partial<RecentTab> & Pick<RecentTab, "id">): RecentTab => ({
+		type: "narrator",
+		title: `Tab ${overrides.id}`,
+		lastVisitedAt: 0,
+		...overrides,
+	});
+
+	test("keeps pinned tabs in every scope", () => {
+		const tabs: RecentTab[] = [
+			tab({ id: "p-pinned", type: "project", pinned: true }),
+			tab({ id: "p-plain", type: "project" }),
+			tab({ id: "n-pinned", pinned: true }),
+			tab({ id: "n-idle" }),
+		];
+
+		expect(clearLoadedTabs(tabs, "all").map((item) => item.id)).toEqual(["p-pinned", "n-pinned"]);
+		expect(clearLoadedTabs(tabs, "projects").map((item) => item.id)).toEqual([
+			"p-pinned",
+			"n-pinned",
+			"n-idle",
+		]);
+		expect(clearLoadedTabs(tabs, "inactive_narrators").map((item) => item.id)).toEqual([
+			"p-pinned",
+			"p-plain",
+			"n-pinned",
+		]);
+	});
+
+	test("keeps a pinned workspace group together", () => {
+		const tabs: RecentTab[] = [
+			tab({ id: "ws-1", type: "workspace", pinned: true }),
+			tab({ id: "child-1", workspaceId: "ws-1" }),
+			tab({ id: "n-idle" }),
+		];
+
+		for (const scope of ["all", "inactive_narrators"] as const) {
+			expect(clearLoadedTabs(tabs, scope).map((item) => item.id)).toEqual(["ws-1", "child-1"]);
+		}
 	});
 });

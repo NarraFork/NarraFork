@@ -37,6 +37,9 @@ const PANEL_EXCLUDED_EVENT_TYPES = [
 	"tool_completed",
 	"tool_long_running",
 	"timeout_updated",
+	// Message-layer only: patches the Await card's resolved child id. The panel has
+	// no card to update, so delivering it here would be pure traffic.
+	"await_agent_resolved",
 	"tool_output",
 	"subagent_started",
 	"segment_compact_hide",

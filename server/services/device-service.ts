@@ -65,6 +65,14 @@ export interface RemoteDeviceView {
 	reportedPathRules: ExecutorPathRule[] | null;
 	scope: "global" | "project";
 	projectId: string | null;
+	/**
+	 * When/where the key was collected by the one-line installer, if it was. Null
+	 * for a device whose key an operator pasted by hand. Attribution only — see
+	 * `enrollDeviceToken`.
+	 */
+	enrolledAt: string | null;
+	enrolledFromIp: string | null;
+	enrolledUserAgent: string | null;
 	createdAt: string;
 	updatedAt: string;
 	revokedAt: string | null;
@@ -187,6 +195,9 @@ export function toDeviceView(row: RemoteDeviceRow): RemoteDeviceView {
 		reportedPathRules: row.reportedPathRulesJson ?? null,
 		scope: row.scope,
 		projectId: row.projectId,
+		enrolledAt: row.enrolledAt,
+		enrolledFromIp: row.enrolledFromIp,
+		enrolledUserAgent: row.enrolledUserAgent,
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,
 		revokedAt: row.revokedAt,
@@ -520,6 +531,54 @@ export function publishDeviceTokenRotated(id: string): void {
 export async function rotateDeviceToken(id: string): Promise<{ token: string } | null> {
 	const result = db.transaction((tx) => rotateDeviceTokenInTransaction(tx, id));
 	if (!result) return null;
+	publishDeviceTokenRotated(id);
+	return result;
+}
+
+export interface EnrollmentProvenance {
+	ip: string | null;
+	userAgent: string | null;
+}
+
+/**
+ * Exchange an enrollment ticket for a fresh device key, recording who collected it.
+ *
+ * Rotating rather than returning the existing key is the point, and it buys two
+ * things at once:
+ *
+ * - The key shown when the device was registered becomes irrelevant, so nobody has
+ *   to store it "just in case".
+ * - Enrollment becomes single-assignment. If a leaked install command is redeemed
+ *   by someone else first, the operator's own run fails outright instead of both
+ *   parties silently holding a working credential. A visible failure is the only
+ *   version of this that can be noticed.
+ *
+ * Provenance is recorded for attribution only — never consulted to authorize
+ * anything. The enrolling IP is not a stable identity (NAT, roaming, IPv6
+ * rotation), so gating on it would break honest re-enrollment far more often than
+ * it would stop an attacker.
+ */
+export async function enrollDeviceToken(
+	id: string,
+	provenance: EnrollmentProvenance,
+): Promise<{ token: string } | null> {
+	const now = new Date().toISOString();
+	const result = db.transaction((tx) => {
+		const rotated = rotateDeviceTokenInTransaction(tx, id, now);
+		if (!rotated) return null;
+		tx.update(remoteDevices)
+			.set({
+				enrolledAt: now,
+				enrolledFromIp: provenance.ip,
+				enrolledUserAgent: provenance.userAgent,
+			})
+			.where(eq(remoteDevices.id, id))
+			.run();
+		return rotated;
+	});
+	if (!result) return null;
+	logger.info("Remote device enrolled via install script", { deviceId: id, ip: provenance.ip });
+	// Same teardown as a manual rotation: any live connection is now stale.
 	publishDeviceTokenRotated(id);
 	return result;
 }

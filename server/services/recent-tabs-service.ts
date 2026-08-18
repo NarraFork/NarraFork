@@ -1140,7 +1140,9 @@ export async function clearRecentTabs(
 			const range = workspaceGroupRange(before, index);
 			const unit = before.slice(range.start, range.end + 1);
 			const keptExplicitly = isKeepUnit(before, index, keepTabKey);
-			let keep = keptExplicitly;
+			// Pinning is an explicit user intent to keep a tab around; no clear scope may
+			// drop it. `pinned` only ever lives on the unit header (see `pinRecentTab`).
+			let keep = keptExplicitly || unit[0].pinned === true;
 			if (!keep && scope === "projects") keep = tabSection(unit[0].type) !== "projects";
 			if (!keep && scope === "inactive_narrators") {
 				if (unit[0].type === "project") keep = true;

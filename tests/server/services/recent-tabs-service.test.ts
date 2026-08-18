@@ -430,6 +430,59 @@ describe("recent-tabs capacity and undo", () => {
 		expect(storedKeys()).toEqual(["workspace:ws-undo", "narrator:n-idle"]);
 	});
 
+	it("never clears pinned tabs, in any scope", async () => {
+		seedLegacyTabs([
+			makeTab("p-pinned", { type: "project", pinned: true }),
+			makeTab("p-plain", { type: "project" }),
+			makeTab("n-pinned", { pinned: true }),
+			makeTab("n-plain"),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+
+		await recentTabs.clearRecentTabs("user-1", "projects");
+		expect(storedKeys()).toEqual(["project:p-pinned", "narrator:n-pinned", "narrator:n-plain"]);
+
+		await recentTabs.clearRecentTabs("user-1", "inactive_narrators");
+		expect(storedKeys()).toEqual(["project:p-pinned", "narrator:n-pinned"]);
+
+		await recentTabs.clearRecentTabs("user-1", "all");
+		expect(storedKeys()).toEqual(["project:p-pinned", "narrator:n-pinned"]);
+	});
+
+	it("keeps a pinned workspace group intact when clearing inactive narrators", async () => {
+		seedLegacyTabs([
+			makeTab("ws-pinned", { type: "workspace", title: "Pinned workspace", pinned: true }),
+			makeTab("n-child", { workspaceId: "ws-pinned" }),
+			makeTab("n-loose"),
+		]);
+		db.insert(narrators)
+			.values({
+				id: "n-child",
+				type: "primary",
+				inheritMode: "fresh",
+				status: "idle",
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		db.insert(workspaces)
+			.values({
+				id: "ws-pinned",
+				userId: "user-1",
+				title: "Pinned workspace",
+				tree: "{}",
+				createdAt: new Date(NOW),
+				updatedAt: new Date(NOW),
+			})
+			.run();
+		await recentTabs.ensureMigrated("user-1");
+
+		await recentTabs.clearRecentTabs("user-1", "inactive_narrators");
+		expect(storedKeys()).toEqual(["workspace:ws-pinned", "narrator:n-child"]);
+		await recentTabs.runExpiredRecentTabsWorkspaceCleanup(Date.now() + 31_000);
+		expect(db.select().from(workspaces).where(eq(workspaces.id, "ws-pinned")).get()).toBeDefined();
+	});
+
 	it("deletes an inactive workspace only after the undo TTL expires", async () => {
 		seedLegacyTabs([
 			makeTab("ws-expire", { type: "workspace", title: "Expire workspace" }),

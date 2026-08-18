@@ -32,6 +32,7 @@ import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import type { SubagentActivityCatchUp, TreeMessage } from "@frontend/lib/api";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import {
+	awaitAgentResolvedPatch,
 	backgroundTaskPatch,
 	permissionRequestedPatch,
 	permissionResolvedPatch,
@@ -306,6 +307,15 @@ export function useVListLivePatches(
 			onTimeoutUpdated: (toolUseId, timeoutMs) => {
 				if (!toolUseId) return;
 				enqueue(timeoutUpdatedPatch({ toolUseId, timeoutMs }));
+			},
+
+			// A running Await-agent call resolved its target. Without this the row's
+			// "open session" item stays hidden for the whole wait — exactly when the
+			// child's progress is only visible inside its own session — because the
+			// id does not reach the persisted row until the tool returns.
+			onAwaitAgentResolved: (toolUseId, subagentNarratorId) => {
+				if (!toolUseId || !subagentNarratorId) return;
+				enqueue(awaitAgentResolvedPatch({ toolUseId, subagentNarratorId }));
 			},
 
 			// Execution began (permission granted). The persisted half of the same signal

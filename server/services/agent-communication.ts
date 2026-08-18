@@ -79,6 +79,16 @@ export interface AwaitAgentInput {
 	 * mid-wait replaces the timer behind this signal.
 	 */
 	timeoutSignal?: AbortSignal;
+	/**
+	 * Invoked as soon as the target selector resolves to a real subagent narrator
+	 * id — BEFORE the (potentially very long) wait begins.
+	 *
+	 * Exists so the UI can offer "open session" during the wait: the tool's own
+	 * metadata carries this id only in its RETURN value, which for a 30-minute wait
+	 * is 30 minutes too late. Must never throw and must never block; the caller
+	 * treats it as fire-and-forget notification.
+	 */
+	onTargetResolved?: (subagentNarratorId: string) => void;
 }
 
 export interface AwaitAgentResult {
@@ -703,6 +713,23 @@ function buildAwaitTimeoutContext(opts: AwaitAgentInput): {
 	};
 }
 
+/**
+ * Report a resolved Await target without ever letting that reporting break the
+ * wait. The callback only drives a UI affordance, so a throwing listener must not
+ * turn a working Await into a failed tool call.
+ */
+function notifyTargetResolved(opts: AwaitAgentInput, subagentNarratorId: string): void {
+	if (!opts.onTargetResolved || !subagentNarratorId) return;
+	try {
+		opts.onTargetResolved(subagentNarratorId);
+	} catch (err) {
+		logger.warn("Await target-resolved notification failed", {
+			subagentId: subagentNarratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
 async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 	const resolvedId = resolveTaskAlias(opts.callerNarratorId, opts.id);
 	let task = await backgroundTaskService.getById(resolvedId);
@@ -718,6 +745,7 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 	}
 
 	const subagentId = task.subagentNarratorId ?? task.id;
+	notifyTargetResolved(opts, subagentId);
 	const current = await narratorService.getById(subagentId).catch(() => null);
 	if (current && task.status !== "running" && !current.isBackground) {
 		// The background task row is from a previous run. The same subagent may have
@@ -760,6 +788,9 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 	}
 
 	const target = await resolveOneTarget(opts.id, scope);
+	// Announce the target before waiting: every branch below may block for the full
+	// timeout, and the UI needs this id to offer "open session" meanwhile.
+	notifyTargetResolved(opts, target.id);
 	// The narrator row is in hand, so the label needs no extra query.
 	const label = agentLabelFromNarrator(target, scope.teamParentId);
 	const build = (status: string, output: string | null | undefined) =>

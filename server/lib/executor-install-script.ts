@@ -5,14 +5,26 @@
  * device slug, platform and expected digest already filled in, so enrollment does
  * not depend on them transcribing flags correctly.
  *
- * Two rules shape everything here:
+ * Three rules shape everything here:
  *
  * 1. The registration token is never written into the script, argv, or the
- *    environment. The script prompts for it with echo disabled and writes it to a
- *    0600 file (Unix) or an ACL-restricted file (Windows).
+ *    environment. It reaches the machine one of two ways (`tokenDelivery`), and
+ *    both end with it in a 0600 file (Unix) or an ACL-restricted file (Windows):
+ *      - `prompt` — the script asks for it with echo disabled. The script itself
+ *        carries no credential, so it can be forwarded freely. Works over plain
+ *        http. Requires a human and a terminal.
+ *      - `enroll` — the script exchanges its one-time ticket for the key against
+ *        the public bootstrap endpoint. No human step, which is what makes a
+ *        copy-paste one-liner possible; in return the *command* becomes the
+ *        credential, so the route layer restricts it to https/loopback/opt-in LAN
+ *        (see `executor-enrollment-policy.ts`).
  * 2. Every interpolated value is quoted for its shell. Callers supply operator
  *    input (allow-root paths, install directories), so values are validated and
  *    then escaped rather than trusted.
+ * 3. Nothing is parsed with a tool the target may not have. The enroll response is
+ *    read with `sed`, not `jq`, because a fresh minimal host has one and not the
+ *    other — and a missing parser at that point would leave the binary installed
+ *    but the service unable to authenticate.
  */
 import {
 	type ExecutorPlatform,
@@ -22,6 +34,16 @@ import {
 import { ValidationError } from "./errors";
 
 export type ExecutorInstallMode = "system" | "user";
+
+/**
+ * How the device key reaches the target machine.
+ *
+ * `enroll` is the default the UI offers because it removes the manual copy step
+ * that made enrollment tedious. `prompt` remains the only option when the key
+ * cannot be transported safely (plaintext http on a routable address) and the
+ * stronger option when the operator would rather the script carry nothing.
+ */
+export type ExecutorTokenDelivery = "prompt" | "enroll";
 
 export interface ExecutorInstallScriptInput {
 	platform: ExecutorPlatform;
@@ -42,8 +64,13 @@ export interface ExecutorInstallScriptInput {
 	/** Lowercase hex SHA-256 the script verifies before installing. */
 	expectedSha256: string;
 	executorVersion: string;
-	/** One-time download ticket. Authorizes the binary fetch only. */
+	/**
+	 * Enrollment ticket. Authorizes the binary fetch, and — only when the ticket
+	 * was issued with token delivery enabled — the key exchange.
+	 */
 	ticket: string;
+	/** Defaults to "prompt", the behaviour that predates automated enrollment. */
+	tokenDelivery?: ExecutorTokenDelivery;
 }
 
 export interface GeneratedExecutorInstallScript {
@@ -53,6 +80,73 @@ export interface GeneratedExecutorInstallScript {
 	filename: string;
 	/** Interpreter the operator should run it with. */
 	shell: "sh" | "powershell";
+}
+
+/**
+ * The single command an operator pastes on the target machine.
+ *
+ * ## Unix: command substitution, never a pipe
+ *
+ * `sh -c "$(curl ...)"` — NOT `curl ... | sh`.
+ *
+ * With a pipe, the script body *is* stdin. The system-mode script runs `sudo`, and
+ * sudo with an occupied stdin falls back to reading the password from `/dev/tty`.
+ * That works in an interactive ssh session and fails outright wherever no
+ * controlling terminal exists (CI, `ssh host 'cmd'`, some provisioning agents) —
+ * and system mode is the recommended default, so the pipe form breaks the common
+ * path in exactly the environments where a one-liner is most useful.
+ *
+ * Command substitution fetches the script first and executes it with stdin left
+ * as the operator's terminal, so sudo can prompt normally.
+ *
+ * This looks like something worth "simplifying" back into a pipe. It is not:
+ * doing so reintroduces a silent failure in system mode on non-tty hosts.
+ *
+ * ## Why the `|| echo` fallback is not optional
+ *
+ * Command substitution discards the fetch's exit status: the command's status is
+ * the INNER shell's. With `curl -f`, an expired ticket (403) yields empty output,
+ * so `sh -c ""` succeeds and the operator sees only curl's one-line stderr next to
+ * a zero exit — indistinguishable from "installed fine". Measured directly:
+ * `sh -c "$(curl -fsSL <403 url>)"` exits 0.
+ *
+ * So the failure branch emits SHELL CODE, which the outer `sh` then runs: it
+ * explains what happened and exits non-zero. Deleting it restores a silent
+ * no-op on the single most likely failure — a lapsed command.
+ *
+ * Not covered on purpose: a 2xx response with an empty body. Guarding it needs an
+ * intermediate variable, which lengthens the one-liner and risks its quoting, and
+ * the only way to reach it is a server bug rather than the ordinary expiry path.
+ *
+ * ## Windows: pipe is fine
+ *
+ * `irm ... | iex` — elevation is a pre-flight `WindowsBuiltInRole::Administrator`
+ * check that fails via `Write-Error` and never reads stdin, so nothing here
+ * depends on stdin being a terminal. No fallback is needed either:
+ * `Invoke-RestMethod` treats an HTTP error status as a terminating error, so a
+ * lapsed ticket surfaces as a visible PowerShell error rather than a silent no-op.
+ */
+const UNIX_FETCH_FAILURE_FALLBACK = [
+	'echo "NarraFork: could not fetch the install script (see the error above)." >&2',
+	'echo "Install commands are short-lived and work once; generate a fresh one in ' +
+		'NarraFork (Settings -> Remote devices) and retry." >&2',
+	"exit 1",
+].join("; ");
+
+export function buildExecutorInstallOneLiner(input: {
+	scriptUrl: string;
+	shell: "sh" | "powershell";
+}): string {
+	if (input.shell === "powershell") {
+		return `irm ${powershellSingleQuote(input.scriptUrl)} | iex`;
+	}
+	// The inner curl is single-quoted for sh; the outer layer is a double-quoted
+	// command substitution so the fetched text is executed, not word-split. The
+	// fallback is quoted the same way, because it too is text the outer shell runs.
+	return (
+		`sh -c "$(curl -fsSL ${shellSingleQuote(input.scriptUrl)}` +
+		` || echo ${shellSingleQuote(UNIX_FETCH_FAILURE_FALLBACK)})"`
+	);
 }
 
 /**
@@ -124,6 +218,8 @@ function validateArtifactFilename(value: string): string {
 
 interface ResolvedInput extends ExecutorInstallScriptInput {
 	downloadUrl: string;
+	enrollUrl: string;
+	tokenDelivery: ExecutorTokenDelivery;
 	installDir: string;
 	configDir: string;
 	tokenPath: string;
@@ -169,7 +265,9 @@ function resolvePaths(input: ExecutorInstallScriptInput): ResolvedInput {
 		expectedSha256,
 		ticket,
 		artifactFilename,
+		tokenDelivery: input.tokenDelivery ?? "prompt",
 		downloadUrl: `${serverBaseUrl}/api/executor/download/${input.platform}?ticket=${ticket}`,
+		enrollUrl: `${serverBaseUrl}/api/executor/enroll/${input.platform}?ticket=${ticket}`,
 		installDir,
 		configDir,
 		tokenPath: isWindows ? `${configDir}\\device-token` : `${configDir}/device-token`,
@@ -193,6 +291,83 @@ function ptyNotice(platform: ExecutorPlatform): string[] {
 	return [
 		"# NOTE: Windows ConPTY is not implemented yet, so this device cannot host",
 		"# interactive terminals. File, search, transfer and Git operations work.",
+	];
+}
+
+/**
+ * The lines that put the device key into `$DEVICE_TOKEN`.
+ *
+ * Both branches end at the same place so the caller's write-to-0600-file logic is
+ * shared; only the acquisition differs.
+ *
+ * The `prompt` branch keeps its `[ -t 0 ]` guard: it reads from stdin, so without a
+ * terminal there is nothing to read and echo suppression is meaningless. The
+ * `enroll` branch must NOT have that guard — it is the entire reason a piped or
+ * non-interactive run can work at all.
+ */
+function unixTokenAcquisition(input: ResolvedInput): string[] {
+	const q = shellSingleQuote;
+	if (input.tokenDelivery === "prompt") {
+		return [
+			"if [ ! -t 0 ]; then",
+			'  echo "This script must run on a terminal so the key can be entered without" >&2',
+			'  echo "appearing in argv or shell history." >&2',
+			"  exit 1",
+			"fi",
+			'printf "Paste the device registration key (input hidden): "',
+			"stty -echo 2>/dev/null || true",
+			"IFS= read -r DEVICE_TOKEN",
+			"stty echo 2>/dev/null || true",
+			'printf "\\n"',
+			'if [ -z "$DEVICE_TOKEN" ]; then',
+			'  echo "No key entered." >&2',
+			"  exit 1",
+			"fi",
+		];
+	}
+
+	return [
+		'echo "Requesting the device key from NarraFork…"',
+		// umask before the response file exists: the key lands in it, and a
+		// world-readable temp file would defeat the 0600 destination.
+		"UMASK_ENROLL_OLD=$(umask)",
+		"umask 077",
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
+		'TMP_ENROLL=$(mktemp "${TMPDIR:-/tmp}/narrafork-enroll.XXXXXX")',
+		'umask "$UMASK_ENROLL_OLD"',
+		// Chained onto the binary's trap so a failure here cannot leave the key
+		// response behind on disk.
+		'trap \'rm -f "$TMP_BINARY" "$TMP_ENROLL"\' EXIT INT TERM',
+		"if command -v curl >/dev/null 2>&1; then",
+		`  curl -fsSL -X POST ${q(input.enrollUrl)} -o "$TMP_ENROLL" || ENROLL_FAILED=1`,
+		"elif command -v wget >/dev/null 2>&1; then",
+		// --post-data='', not --method=POST: an empty body still forces POST, and this
+		// is the only POST spelling GNU and BusyBox wget share — BusyBox has no
+		// --method at all, and a BusyBox-only host (e.g. a minimal Alpine install) is
+		// exactly the machine this fallback exists for.
+		`  wget -q --post-data='' -O "$TMP_ENROLL" ${q(input.enrollUrl)} || ENROLL_FAILED=1`,
+		"else",
+		'  echo "Neither curl nor wget is available." >&2',
+		"  exit 1",
+		"fi",
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
+		'if [ "${ENROLL_FAILED:-0}" = "1" ]; then',
+		'  echo "Could not obtain the device key." >&2',
+		'  echo "The enrollment ticket is short-lived and works once. Generate a fresh" >&2',
+		'  echo "install command in NarraFork (Settings -> Remote devices) and retry." >&2',
+		"  exit 1",
+		"fi",
+		// sed, not jq: a minimal host reliably has the former and often lacks the
+		// latter, and discovering that after installing the binary would leave a
+		// half-enrolled machine. The response shape is fixed and server-controlled.
+		`DEVICE_TOKEN=$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$TMP_ENROLL")`,
+		'rm -f "$TMP_ENROLL"',
+		"trap 'rm -f \"$TMP_BINARY\"' EXIT INT TERM",
+		'if [ -z "$DEVICE_TOKEN" ]; then',
+		'  echo "NarraFork did not return a device key." >&2',
+		"  exit 1",
+		"fi",
+		'echo "Device key received."',
 	];
 }
 
@@ -332,8 +507,20 @@ function buildUnixScript(input: ResolvedInput): string {
 		`# Device: ${input.deviceName} (${input.deviceSlug})`,
 		`# Platform: ${input.platform} · Executor v${input.executorVersion}`,
 		"#",
-		"# The registration key is NOT in this script. You will be prompted for it and",
-		"# it is written to a 0600 file, so it never reaches argv or shell history.",
+		...(input.tokenDelivery === "enroll"
+			? [
+					"# The registration key is NOT in this script. It is fetched once from",
+					"# NarraFork using the one-time ticket in the URLs below, then written to a",
+					"# 0600 file. The key never reaches argv or shell history.",
+					"#",
+					"# That ticket is a credential: it is valid for minutes, the key exchange",
+					"# works exactly once, and redeeming it rotates the device key. If someone",
+					"# else redeems it first, this script fails rather than silently sharing.",
+				]
+			: [
+					"# The registration key is NOT in this script. You will be prompted for it and",
+					"# it is written to a 0600 file, so it never reaches argv or shell history.",
+				]),
 		...ptyNotice(input.platform),
 		...directModeNotice(input),
 		"set -eu",
@@ -396,20 +583,7 @@ function buildUnixScript(input: ResolvedInput): string {
 		`${sudo}install -m 755 "$TMP_BINARY" "$BINARY"`,
 		'echo "Installed $BINARY"',
 		"",
-		"if [ ! -t 0 ]; then",
-		'  echo "This script must run on a terminal so the key can be entered without" >&2',
-		'  echo "appearing in argv or shell history." >&2',
-		"  exit 1",
-		"fi",
-		'printf "Paste the device registration key (input hidden): "',
-		"stty -echo 2>/dev/null || true",
-		"IFS= read -r DEVICE_TOKEN",
-		"stty echo 2>/dev/null || true",
-		'printf "\\n"',
-		'if [ -z "$DEVICE_TOKEN" ]; then',
-		'  echo "No key entered." >&2',
-		"  exit 1",
-		"fi",
+		...unixTokenAcquisition(input),
 		"",
 		"UMASK_OLD=$(umask)",
 		"umask 077",
@@ -446,6 +620,41 @@ function buildUnixScript(input: ResolvedInput): string {
 	].join("\n");
 }
 
+/**
+ * PowerShell counterpart of `unixTokenAcquisition`. Leaves the key in
+ * `$plainToken` for the shared ACL/write logic that follows.
+ *
+ * The enroll branch uses `Invoke-RestMethod`, which parses the JSON response
+ * itself, so there is no equivalent of the sed-vs-jq concern here.
+ */
+function windowsTokenAcquisition(input: ResolvedInput): string[] {
+	const q = powershellSingleQuote;
+	if (input.tokenDelivery === "prompt") {
+		return [
+			"$secureToken = Read-Host -Prompt 'Paste the device registration key' -AsSecureString",
+			"$plainToken = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(",
+			"  [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken))",
+			"if ([string]::IsNullOrWhiteSpace($plainToken)) { Write-Error 'No key entered.' }",
+		];
+	}
+	return [
+		"Write-Host 'Requesting the device key from NarraFork…'",
+		"try {",
+		`  $enrollResponse = Invoke-RestMethod -Method Post -Uri ${q(input.enrollUrl)} -UseBasicParsing`,
+		"} catch {",
+		"  Write-Error (",
+		"    'Could not obtain the device key: ' + $_.Exception.Message + " +
+			"' The enrollment ticket is short-lived and works once; generate a fresh " +
+			"install command in NarraFork (Settings -> Remote devices) and retry.')",
+		"}",
+		"$plainToken = $enrollResponse.token",
+		"if ([string]::IsNullOrWhiteSpace($plainToken)) {",
+		"  Write-Error 'NarraFork did not return a device key.'",
+		"}",
+		"Write-Host 'Device key received.'",
+	];
+}
+
 function buildWindowsScript(input: ResolvedInput): string {
 	const info = getExecutorPlatformInfo(input.platform);
 	const q = powershellSingleQuote;
@@ -457,8 +666,20 @@ function buildWindowsScript(input: ResolvedInput): string {
 		`# Device: ${input.deviceName} (${input.deviceSlug})`,
 		`# Platform: ${input.platform} · Executor v${input.executorVersion}`,
 		"#",
-		"# The registration key is NOT in this script. You will be prompted for it and",
-		"# it is written to an ACL-restricted file, so it never reaches argv or history.",
+		...(input.tokenDelivery === "enroll"
+			? [
+					"# The registration key is NOT in this script. It is fetched once from",
+					"# NarraFork using the one-time ticket in the URLs below, then written to an",
+					"# ACL-restricted file. The key never reaches argv or history.",
+					"#",
+					"# That ticket is a credential: it is valid for minutes, the key exchange",
+					"# works exactly once, and redeeming it rotates the device key. If someone",
+					"# else redeems it first, this script fails rather than silently sharing.",
+				]
+			: [
+					"# The registration key is NOT in this script. You will be prompted for it and",
+					"# it is written to an ACL-restricted file, so it never reaches argv or history.",
+				]),
 		...ptyNotice(input.platform),
 		...directModeNotice(input),
 		"$ErrorActionPreference = 'Stop'",
@@ -510,10 +731,7 @@ function buildWindowsScript(input: ResolvedInput): string {
 		"}",
 		'Write-Host "Installed $binary"',
 		"",
-		"$secureToken = Read-Host -Prompt 'Paste the device registration key' -AsSecureString",
-		"$plainToken = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(",
-		"  [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken))",
-		"if ([string]::IsNullOrWhiteSpace($plainToken)) { Write-Error 'No key entered.' }",
+		...windowsTokenAcquisition(input),
 		"# UTF8 without BOM: the executor reads the file as a raw token string.",
 		"[System.IO.File]::WriteAllText($tokenFile, $plainToken, (New-Object System.Text.UTF8Encoding($false)))",
 		"$plainToken = $null",

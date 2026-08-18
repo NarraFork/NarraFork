@@ -407,6 +407,17 @@ export interface BaseContentBlock {
 	uploadNarratorId?: string;
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
 	_subagentActivity?: SubagentActivitySummary;
+	/**
+	 * Child narrator id of a RUNNING `Await({type:"agent"})`, resolved server-side
+	 * from the call's target selector.
+	 *
+	 * Declared explicitly (the index signature would already admit it) because it is
+	 * the ONLY source of that id before the wait returns: a call in flight has no
+	 * output, so neither `_metadata.subagentId` nor the `<subagent_id>` tag exists
+	 * yet. See `AWAIT_AGENT_RESOLVED_FIELD` in server/services/narrator-messages.ts
+	 * for why it is kept out of `_metadata`.
+	 */
+	_awaitAgentNarratorId?: string;
 	/** Source citations on assistant text blocks, indexed against `text`. */
 	citations?: TextCitation[];
 	[key: string]: unknown;

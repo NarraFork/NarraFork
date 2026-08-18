@@ -39,6 +39,11 @@ import { resolveDefaultReasoningEffort, resolveProvider } from "../lib/settings"
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
+	AWAIT_AGENT_RESOLVED_FIELD,
+	attachAwaitAgentNarratorIds,
+	resolveAwaitAgentIdsForToolCalls,
+} from "./await-agent-resolution";
+import {
 	ensureRefsCoverMessage,
 	ensureRefsCoverSeq,
 	hasUnmaterializedRefsBelow,
@@ -1376,12 +1381,61 @@ async function buildTreeFromTopLevelRefs(
 			: Promise.resolve([]),
 	]);
 	attachSubagentActivities(topMessages, activities);
-	return enrichToolUseBlocks(
+	const enriched = enrichToolUseBlocks(
 		filterExitPlanBeforePlanCompact(
 			truncateToolIO(buildMessageTree([...topMessages, ...childMessages]), ioBudget),
 		),
 	);
+	// A still-waiting Await knows its target only as a selector; resolve it so the
+	// row can open the child's session before the wait returns.
+	return attachAwaitAgentNarratorIds(
+		enriched,
+		await resolveAwaitAgentIdsForMessages([...topMessages, ...childMessages]),
+	);
 }
+
+/**
+ * Resolve the pending Await-agent selectors across a batch of loaded messages.
+ *
+ * Kept next to its only callers so the extra work is obvious at the call site: it
+ * runs at most two small indexed queries per team scope and returns an empty map
+ * (no queries at all) when the page contains no in-flight Await-agent call, which
+ * is the overwhelmingly common case.
+ */
+async function resolveAwaitAgentIdsForMessages(
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	messages: any[],
+): Promise<Map<string, string>> {
+	const candidates: Array<{
+		toolUseId: string;
+		toolName: string;
+		inputJson?: unknown;
+		outputJson?: unknown;
+		narratorId?: string;
+	}> = [];
+	for (const msg of messages) {
+		for (const tc of msg?.toolCalls ?? []) {
+			if (tc?.toolName !== "Await") continue;
+			candidates.push({
+				toolUseId: tc.toolUseId,
+				toolName: tc.toolName,
+				inputJson: tc.inputJson,
+				outputJson: tc.outputJson,
+				narratorId: tc.narratorId ?? msg?.narratorId,
+			});
+		}
+	}
+	if (candidates.length === 0) return new Map();
+	return resolveAwaitAgentIdsForToolCalls(candidates);
+}
+
+/**
+ * Re-exported so callers already importing the message layer keep working; the
+ * implementation lives in `await-agent-resolution` because this module sits in an
+ * import cycle with `narrator-service` (importing it from a test would evaluate
+ * that cycle and fail at module init).
+ */
+export { AWAIT_AGENT_RESOLVED_FIELD, attachAwaitAgentNarratorIds };
 
 // ── Chunk manifest helpers ─────────────────────────────────────────────────
 
@@ -2776,8 +2830,14 @@ export const narratorMessageQueries = {
 			topMsgs,
 			await loadSubagentActivitiesForToolUseIds([...newTopSubagentToolUseIdSet]),
 		);
-		const tree = enrichToolUseBlocks(
-			filterExitPlanBeforePlanCompact(truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs]))),
+		const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMsgs, ...childMsgs]);
+		const tree = attachAwaitAgentNarratorIds(
+			enrichToolUseBlocks(
+				filterExitPlanBeforePlanCompact(
+					truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
+				),
+			),
+			awaitAgentIds,
 		);
 
 		const newTopToolUseIdSet = new Set(newTopToolUseIds);
@@ -2798,7 +2858,10 @@ export const narratorMessageQueries = {
 
 		return {
 			topLevel: tree,
-			orphanChildren: enrichToolUseBlocks(truncateToolIO(orphanChildren)),
+			orphanChildren: attachAwaitAgentNarratorIds(
+				enrichToolUseBlocks(truncateToolIO(orphanChildren)),
+				awaitAgentIds,
+			),
 			subagentActivities,
 			hitLimit: false,
 			cursor,

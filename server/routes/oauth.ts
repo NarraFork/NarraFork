@@ -31,6 +31,7 @@ import {
 	revokeToken,
 } from "../lib/oauth-provider";
 import { oauthRateLimit } from "../lib/oauth-rate-limit";
+import { resolvePublicOrigin } from "../lib/public-origin";
 import { requireSessionAuth } from "../middleware/auth";
 import {
 	createOAuthGrant,
@@ -92,63 +93,15 @@ interface ValidatedAuthorizationRequest {
 const MAX_AUDIT_USER_AGENT_CHARS = 512;
 const MAX_AUDIT_REQUEST_ID_CHARS = 256;
 const MAX_OAUTH_PROJECTS = 100;
-const MAX_FORWARDED_ORIGIN_HEADER_CHARS = 2_048;
-const MAX_FORWARDED_ORIGIN_HOPS = 20;
-
-function rightmostForwardedHeaderValue(raw: string): string | null {
-	if (raw.length > MAX_FORWARDED_ORIGIN_HEADER_CHARS) return null;
-	const values = raw.split(",");
-	if (values.length > MAX_FORWARDED_ORIGIN_HOPS) return null;
-	return values.at(-1)?.trim() || null;
-}
 
 /**
- * Resolve the browser-visible origin used by RFC 8414 metadata. Forwarded
- * origin headers are accepted only when the Bun socket boundary marked the
- * immediate peer as a configured trusted proxy. The rightmost value belongs
- * to the closest proxy, avoiding a caller-prepended spoofed value.
+ * Resolve the browser-visible origin used by RFC 8414 metadata.
+ *
+ * Shared with the executor enrollment endpoints via `lib/public-origin`: both
+ * need to emit an absolute URL that a machine other than this one can reach, and
+ * both must refuse to trust forwarding headers from an untrusted peer.
  */
-function resolveDiscoveryOrigin(c: Context): URL {
-	const requestUrl = new URL(c.req.url);
-	const directOrigin = new URL(requestUrl.origin);
-	const env = c.env as { trustedProxy?: unknown } | undefined;
-	if (env?.trustedProxy !== true) return directOrigin;
-
-	const forwardedProtoHeader = c.req.header("X-Forwarded-Proto");
-	const forwardedHostHeader = c.req.header("X-Forwarded-Host");
-	let protocol = requestUrl.protocol;
-	let host = requestUrl.host;
-
-	if (forwardedProtoHeader !== undefined) {
-		const forwardedProto = rightmostForwardedHeaderValue(forwardedProtoHeader)?.toLowerCase();
-		if (forwardedProto !== "http" && forwardedProto !== "https") return directOrigin;
-		protocol = `${forwardedProto}:`;
-	}
-	if (forwardedHostHeader !== undefined) {
-		const forwardedHost = rightmostForwardedHeaderValue(forwardedHostHeader);
-		if (!forwardedHost) return directOrigin;
-		host = forwardedHost;
-	}
-
-	try {
-		const publicOrigin = new URL(`${protocol}//${host}`);
-		if (publicOrigin.protocol !== "http:" && publicOrigin.protocol !== "https:") {
-			return directOrigin;
-		}
-		if (
-			publicOrigin.username ||
-			publicOrigin.password ||
-			publicOrigin.pathname !== "/" ||
-			publicOrigin.search ||
-			publicOrigin.hash
-		) {
-			return directOrigin;
-		}
-		return publicOrigin;
-	} catch {
-		return directOrigin;
-	}
-}
+const resolveDiscoveryOrigin = resolvePublicOrigin;
 
 function oauthString(value: unknown, field: string): string {
 	if (typeof value !== "string" || !value) {

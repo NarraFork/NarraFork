@@ -164,6 +164,12 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 			_timeoutMs: block._timeoutMs ?? (tc as any)?._timeoutMs,
 			_subagentActivity: block._subagentActivity,
+			// Server-derived child narrator id of a RUNNING Await-agent call. This
+			// mapping is an explicit field list, so omitting it here would silently
+			// drop the only source that exists before the wait returns.
+			_awaitAgentNarratorId:
+				// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
+				block._awaitAgentNarratorId ?? (tc as any)?._awaitAgentNarratorId,
 		});
 	}
 	return results;

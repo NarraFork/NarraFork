@@ -990,6 +990,21 @@ export const remoteDevices = sqliteTable(
 		),
 		/** @deprecated Migration-only idempotency shadow; use binding.provisionKey. */
 		oauthProvisionKey: text("oauth_provision_key"),
+		// ── Automated enrollment provenance ──
+		//
+		// Set when a machine exchanged an enrollment ticket for this device's key via
+		// the public bootstrap endpoint (the copy-paste install one-liner), instead of
+		// an operator pasting the key by hand.
+		//
+		// Recorded because that exchange is the one moment the key crosses the wire in
+		// plaintext: if a ticket leaks, these columns are the only evidence of who
+		// actually redeemed it. Deliberately NOT used to authorize anything — the
+		// enrollment IP is not a stable identity (NAT, roaming, IPv6 rotation), so
+		// treating it as one would break legitimate re-enrollment far more often than
+		// it would stop an attacker.
+		enrolledAt: text("enrolled_at"),
+		enrolledFromIp: text("enrolled_from_ip"),
+		enrolledUserAgent: text("enrolled_user_agent"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 		/** Soft-delete / revocation timestamp. Revoked devices reject connections. */

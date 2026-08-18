@@ -283,6 +283,23 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 	  }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
+	/**
+	 * A running `Await({type:"agent"})` has resolved which child narrator it is
+	 * waiting on, so its card can offer "open session" DURING the wait.
+	 *
+	 * Needed as its own frame because the id is otherwise unknowable until the tool
+	 * returns: an in-flight call has no `outputJson`, hence no `metadata.subagentId`
+	 * and no `<subagent_id>` tag. Reloads get the same fact from the message loader
+	 * (`AWAIT_AGENT_RESOLVED_FIELD`); this frame is what spares an already-open page
+	 * from needing one.
+	 */
+	| {
+			type: "await_agent_resolved";
+			narratorId: string;
+			toolUseId: string;
+			subagentNarratorId: string;
+			parentToolUseId?: string;
+	  }
 	| {
 			type: "tool_output";
 			narratorId: string;

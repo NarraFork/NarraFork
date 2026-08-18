@@ -117,6 +117,29 @@ export function timeoutUpdatedPatch(opts: { toolUseId: string; timeoutMs: number
 }
 
 /**
+ * `await_agent_resolved` → the row learns which child session it can open.
+ *
+ * HEIGHT-NEUTRAL BY CONSTRUCTION, and that is the point: the field only gates a
+ * context-menu item, and it is deliberately NOT written as `_metadata.subagentId`
+ * (which `classifyAwait` would render as an extra `subagent:` row, growing every
+ * running Await card). Because nothing measurable changes, no `extractDataRevision`
+ * component is needed either — the menu reads the message tree, not the measured
+ * payload, so a cached height entry stays correct.
+ *
+ * `status` is deliberately absent: resolving a target says nothing about the
+ * lifecycle, and writing one would let a replayed frame regress a finished card.
+ */
+export function awaitAgentResolvedPatch(opts: {
+	toolUseId: string;
+	subagentNarratorId: string;
+}): LivePatch {
+	return (messages) =>
+		patchToolCallFields(messages, opts.toolUseId, {
+			_awaitAgentNarratorId: opts.subagentNarratorId,
+		});
+}
+
+/**
  * `permission_request` → the card is waiting on the user.
  * Mirrors useNarratorChunksWS.ts:1608-1616.
  */

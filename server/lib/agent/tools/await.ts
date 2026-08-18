@@ -67,6 +67,32 @@ export function updateAwaitTimeout(toolUseId: string, newTimeoutMs: number): num
 	return clamped;
 }
 
+/**
+ * Tell the narrator's subscribers which child an in-flight Await is waiting on.
+ *
+ * Imported lazily and never awaited by the caller: this is a UI affordance, so it
+ * must not add latency to the wait or fail it. `type: "agent"` is rejected for
+ * subagents (see `buildRawJsonSchema`), so the owning narrator is always the
+ * top-level one and no `parentToolUseId` routing is needed.
+ */
+async function broadcastAwaitAgentResolved(
+	narratorId: string,
+	toolUseId: string,
+	subagentNarratorId: string,
+): Promise<void> {
+	try {
+		const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
+		broadcastToNarrator(narratorId, {
+			type: "await_agent_resolved",
+			narratorId,
+			toolUseId,
+			subagentNarratorId,
+		});
+	} catch {
+		// Best-effort only; a reload picks the same fact up from the message loader.
+	}
+}
+
 function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 	const subagent = Boolean(config?.parentNarratorId);
 	return {
@@ -185,6 +211,14 @@ export const awaitTool: ToolDefinition = {
 					timeoutMs: MAX_AWAIT_TIMEOUT_MS,
 					signal: ctx.signal,
 					timeoutSignal: timeoutController.signal,
+					// The wait can last for the whole timeout, and the returned metadata
+					// (which is what normally carries `subagentId`) only lands when it
+					// ends. Publishing the id here is what lets the card offer "open
+					// session" while the child is still working.
+					onTargetResolved: (subagentNarratorId) => {
+						if (!toolUseId) return;
+						void broadcastAwaitAgentResolved(ctx.narratorId, toolUseId, subagentNarratorId);
+					},
 				});
 				return {
 					output: result.formatted,

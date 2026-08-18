@@ -946,6 +946,23 @@ export interface NarraForkSettings {
 		transferVerify: "crc32c" | "sha256" | "none";
 		/** Default root directory for downloaded files. null → ~/.narrafork/transfers. */
 		transfersDir: string | null;
+		/**
+		 * Allow the automated enrollment exchange over plaintext http when the server
+		 * is reached at a private-network address (RFC 1918 / CGNAT / link-local /
+		 * IPv6 ULA), not just over https or loopback.
+		 *
+		 * Off by default, and it must stay a deliberate choice rather than a
+		 * convenience default. The one-line installer trades the old "script carries
+		 * no credential" property for the ticket becoming the credential; with https
+		 * that exchange is encrypted, and on http it is not. A LAN is a much higher
+		 * bar than the open internet, but "higher" is not "encrypted", so enabling
+		 * this accepts that the device key crosses the local network in the clear
+		 * once, at enrollment.
+		 *
+		 * Public hostnames are never covered by this: no matter what this is set to,
+		 * plaintext http on a routable address refuses to hand out a key.
+		 */
+		allowPlaintextEnrollmentOnPrivateNetwork?: boolean;
 	};
 }
 

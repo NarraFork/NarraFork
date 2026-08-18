@@ -30,6 +30,13 @@ export interface RemoteDevice {
 	reportedPathRules: ExecutorPathRule[] | null;
 	scope: "global" | "project";
 	projectId: string | null;
+	/**
+	 * Set when the key was collected by the one-line installer rather than pasted by
+	 * hand. Attribution only; never used to authorize anything.
+	 */
+	enrolledAt: string | null;
+	enrolledFromIp: string | null;
+	enrolledUserAgent: string | null;
 	createdAt: string;
 	updatedAt: string;
 	revokedAt: string | null;
@@ -163,21 +170,37 @@ export interface ExecutorManifestResponse {
 	platforms: ExecutorPlatformInfo[];
 }
 
+/** How the device key reaches the target machine. See `deviceInstallScriptSchema`. */
+export type ExecutorTokenDelivery = "enroll" | "prompt";
+
 export interface InstallScriptInput {
 	platform: ExecutorPlatform;
 	mode: "system" | "user";
 	disableShell?: boolean;
-	/** Override the base URL baked into the script (defaults to this server). */
+	/**
+	 * Absolute base URL the TARGET machine will use to reach NarraFork.
+	 *
+	 * Should normally be sent: the server can only fall back to the forwarded
+	 * request origin, which is right for a standard reverse proxy but wrong whenever
+	 * the target machine reaches this server by another name.
+	 */
 	serverBaseUrl?: string;
+	/** Defaults to "enroll" server-side (one-line install). */
+	tokenDelivery?: ExecutorTokenDelivery;
 }
 
 export interface InstallScriptResult {
 	script: string;
 	filename: string;
 	shell: "sh" | "powershell";
+	/** Public URL serving the script body; what the one-liner fetches. */
+	scriptUrl: string;
+	/** The single command to paste on the target machine. */
+	oneLiner: string;
+	tokenDelivery: ExecutorTokenDelivery;
 	executorVersion: string;
 	platform: ExecutorPlatform;
-	/** The embedded download ticket stops working after this time. */
+	/** The embedded enrollment ticket stops working after this time. */
 	expiresAt: string;
 }
 

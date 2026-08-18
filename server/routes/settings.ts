@@ -674,6 +674,20 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		/*
+		 * Only the enrollment opt-in is patchable here. The rest of `devices` (transfer
+		 * concurrency, verify mode, transfers dir) has no UI and is left to the config
+		 * file rather than exposed speculatively.
+		 *
+		 * This one has to be reachable over the API because the UI names it in the
+		 * refusal it shows when automatic key delivery is unavailable — and this schema
+		 * is `.strict()`, so before being listed the whole PATCH was rejected, making
+		 * that instruction impossible to follow without hand-editing settings.json.
+		 */
+		devices: z
+			.object({ allowPlaintextEnrollmentOnPrivateNetwork: z.boolean() })
+			.partial()
+			.optional(),
 	})
 	.strict();
 

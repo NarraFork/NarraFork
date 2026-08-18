@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { EXECUTOR_PLATFORMS, type ExecutorPlatform } from "@shared/remote-executor";
 import { ValidationError } from "../errors";
 import {
+	buildExecutorInstallOneLiner,
 	buildExecutorInstallScript,
 	type ExecutorInstallScriptInput,
 	powershellSingleQuote,
@@ -32,20 +33,41 @@ function input(overrides: Partial<ExecutorInstallScriptInput> = {}): ExecutorIns
 
 describe("token handling", () => {
 	test("no script embeds the registration key or passes it in argv", () => {
+		// Holds for BOTH delivery modes: enroll fetches the key at runtime, prompt reads
+		// it from the terminal, and neither may ever put it in argv or in the file the
+		// operator copies around.
 		for (const platform of EXECUTOR_PLATFORMS) {
 			for (const mode of ["system", "user"] as const) {
-				const { script } = buildExecutorInstallScript(input({ platform, mode }));
-				// The token must be read interactively and referenced only as a file.
-				expect(script).not.toContain("--token ");
-				expect(script).not.toContain("rdev_");
-				expect(script).toContain("--token-file");
-				expect(script).toMatch(/Paste the device registration key/);
+				for (const tokenDelivery of ["prompt", "enroll"] as const) {
+					const { script } = buildExecutorInstallScript(input({ platform, mode, tokenDelivery }));
+					expect(script).not.toContain("--token ");
+					expect(script).not.toContain("rdev_");
+					expect(script).toContain("--token-file");
+				}
 			}
 		}
 	});
 
+	test("prompt mode asks a human for the key", () => {
+		for (const platform of EXECUTOR_PLATFORMS) {
+			const { script } = buildExecutorInstallScript(input({ platform, tokenDelivery: "prompt" }));
+			expect(script).toMatch(/Paste the device registration key/);
+			// A prompt-mode script must never reach the enroll endpoint: its whole value
+			// is that the script text carries no credential.
+			expect(script).not.toContain("/api/executor/enroll/");
+		}
+	});
+
+	test("prompt mode is the default when delivery is unspecified", () => {
+		// Callers that predate automated enrollment must keep their old behaviour rather
+		// than silently start shipping a credential-bearing script.
+		const base = input();
+		delete base.tokenDelivery;
+		expect(buildExecutorInstallScript(base).script).toMatch(/Paste the device registration key/);
+	});
+
 	test("unix scripts disable terminal echo and write the key with mode 600", () => {
-		const { script } = buildExecutorInstallScript(input());
+		const { script } = buildExecutorInstallScript(input({ tokenDelivery: "prompt" }));
 		expect(script).toContain("stty -echo");
 		expect(script).toContain("install -m 600");
 		expect(script).toContain("umask 077");
@@ -54,10 +76,172 @@ describe("token handling", () => {
 	});
 
 	test("windows scripts read the key as a SecureString and lock the ACL down", () => {
-		const { script } = buildExecutorInstallScript(input({ platform: "windows-amd64" }));
+		const { script } = buildExecutorInstallScript(
+			input({ platform: "windows-amd64", tokenDelivery: "prompt" }),
+		);
 		expect(script).toContain("-AsSecureString");
 		expect(script).toContain("SetAccessRuleProtection($true, $false)");
 		expect(script).toContain("Set-Acl -LiteralPath $tokenFile");
+	});
+});
+
+describe("enroll-mode key delivery", () => {
+	test("unix scripts POST to the enroll endpoint with the ticket", () => {
+		const { script } = buildExecutorInstallScript(input({ tokenDelivery: "enroll" }));
+		expect(script).toContain(
+			`https://nf.example.com/api/executor/enroll/linux-amd64?ticket=${TICKET}`,
+		);
+		expect(script).toContain("-X POST");
+	});
+
+	test("the wget fallback spells POST as --post-data, the only form BusyBox shares", () => {
+		// BusyBox wget has no --method (it is a GNU extension), so the previous
+		// spelling made the fallback a guaranteed failure on exactly the minimal
+		// hosts it exists for. An empty --post-data still forces POST, on both.
+		const { script } = buildExecutorInstallScript(input({ tokenDelivery: "enroll" }));
+		expect(script).toContain("--post-data=''");
+		expect(script).not.toContain("--method=POST");
+	});
+
+	test("enroll mode drops the terminal requirement", () => {
+		// The `[ -t 0 ]` guard exists only to protect an interactive read. Leaving it in
+		// would defeat the entire point of a pasteable one-liner, which may well run
+		// where stdin is not a terminal.
+		const script = buildExecutorInstallScript(input({ tokenDelivery: "enroll" })).script;
+		expect(script).not.toContain("if [ ! -t 0 ]; then");
+		expect(script).not.toContain("stty -echo");
+	});
+
+	test("enroll mode still lands the key in a 0600 file", () => {
+		// Automating the fetch must not weaken where the key ends up.
+		const { script } = buildExecutorInstallScript(input({ tokenDelivery: "enroll" }));
+		expect(script).toContain("umask 077");
+		expect(script).toContain("install -m 600");
+	});
+
+	test("the key response is parsed without jq", () => {
+		// A minimal host reliably has sed and often lacks jq. Discovering that after the
+		// binary is installed would leave a machine that can never authenticate.
+		const { script } = buildExecutorInstallScript(input({ tokenDelivery: "enroll" }));
+		expect(script).toContain("sed -n");
+		expect(script).not.toContain("jq");
+	});
+
+	test("the key response file is created private and removed afterwards", () => {
+		const { script } = buildExecutorInstallScript(input({ tokenDelivery: "enroll" }));
+		const enrollUmask = script.indexOf("umask 077");
+		const mktemp = script.indexOf("narrafork-enroll.XXXXXX");
+		// Restrictive umask must precede creating the file the key lands in.
+		expect(enrollUmask).toBeGreaterThan(-1);
+		expect(mktemp).toBeGreaterThan(enrollUmask);
+		expect(script).toContain('rm -f "$TMP_ENROLL"');
+		// And a crash mid-way must not leave it behind either.
+		expect(script).toContain('trap \'rm -f "$TMP_BINARY" "$TMP_ENROLL"\' EXIT INT TERM');
+	});
+
+	test("a failed exchange explains that the ticket is one-shot", () => {
+		// The most likely failure is an expired or already-redeemed ticket, and the only
+		// fix is a fresh install command. Saying so on the target machine saves a
+		// round trip to the docs.
+		for (const platform of ["linux-amd64", "windows-amd64"] as const) {
+			const { script } = buildExecutorInstallScript(input({ platform, tokenDelivery: "enroll" }));
+			expect(script.toLowerCase()).toContain("works once");
+		}
+	});
+
+	test("windows scripts use Invoke-RestMethod and verify a key came back", () => {
+		const { script } = buildExecutorInstallScript(
+			input({ platform: "windows-amd64", tokenDelivery: "enroll" }),
+		);
+		expect(script).toContain("Invoke-RestMethod -Method Post");
+		expect(script).toContain("$plainToken = $enrollResponse.token");
+		expect(script).toContain("IsNullOrWhiteSpace($plainToken)");
+		expect(script).not.toContain("-AsSecureString");
+	});
+});
+
+describe("the one-line install command", () => {
+	test("unix uses command substitution, never a pipe", () => {
+		/*
+		 * This is the regression that matters most in this file.
+		 *
+		 * `curl … | sh` puts the script body on stdin. System mode runs sudo, and sudo
+		 * with occupied stdin falls back to /dev/tty — which works in an interactive
+		 * ssh session and fails outright with no controlling terminal (CI,
+		 * `ssh host 'cmd'`, provisioning agents). System mode is the recommended
+		 * default, so the pipe form breaks the common path exactly where a one-liner is
+		 * most useful, and it fails in a way that looks like a sudo problem.
+		 */
+		const oneLiner = buildExecutorInstallOneLiner({
+			scriptUrl: "https://nf.example.com/api/executor/install/linux-amd64?ticket=abc",
+			shell: "sh",
+		});
+		expect(oneLiner).toStartWith(
+			`sh -c "$(curl -fsSL 'https://nf.example.com/api/executor/install/linux-amd64?ticket=abc'`,
+		);
+		expect(oneLiner).not.toContain("| sh");
+	});
+
+	/**
+	 * Command substitution discards the fetch's exit status — the command reports the
+	 * INNER shell's. With `curl -f` an expired ticket yields an empty body, so a bare
+	 * `sh -c "$(curl …)"` runs `sh -c ""` and exits 0: the operator sees one line of
+	 * curl stderr next to a success, which reads as "installed fine".
+	 *
+	 * Verified directly against a 403 before this guard existed: exit status was 0.
+	 *
+	 * The fallback emits shell code for the outer shell to run, so a lapsed command
+	 * explains itself and exits non-zero. Asserting on the exit path rather than the
+	 * exact string, since the wording is expected to change.
+	 */
+	test("a failed fetch exits non-zero instead of running an empty script", () => {
+		const oneLiner = buildExecutorInstallOneLiner({
+			scriptUrl: "https://nf.example.com/api/executor/install/linux-amd64?ticket=abc",
+			shell: "sh",
+		});
+		expect(oneLiner).toContain("|| echo ");
+		expect(oneLiner).toContain("exit 1");
+		expect(oneLiner).toContain(">&2");
+	});
+
+	/**
+	 * Executes the generated command for real, because the property at stake is a
+	 * shell exit status and no string assertion can establish it. `false` stands in
+	 * for a failing fetch: same "substitution produced nothing" shape, no network.
+	 */
+	test("the generated command really exits non-zero when the fetch fails", async () => {
+		const oneLiner = buildExecutorInstallOneLiner({
+			scriptUrl: "https://nf.example.com/api/executor/install/linux-amd64?ticket=abc",
+			shell: "sh",
+		});
+		// Swap the fetch for `false`: the fallback branch is what is under test, and the
+		// URL's quoting is already pinned by the assertions above.
+		const failing = oneLiner.replace(/curl -fsSL '[^']*'/, "false");
+		const failed = Bun.spawnSync(["/bin/sh", "-c", failing]);
+		expect(failed.exitCode).toBe(1);
+		expect(new TextDecoder().decode(failed.stderr)).toContain("NarraFork");
+
+		// And the success path still runs the fetched body untouched.
+		const succeeding = oneLiner.replace(/curl -fsSL '[^']*'/, `echo 'exit 0'`);
+		expect(Bun.spawnSync(["/bin/sh", "-c", succeeding]).exitCode).toBe(0);
+	});
+
+	test("windows pipes into iex, which never reads stdin", () => {
+		// PowerShell elevation is a pre-flight role check that fails via Write-Error, so
+		// nothing on this path depends on stdin being a terminal.
+		expect(
+			buildExecutorInstallOneLiner({
+				scriptUrl: "https://nf.example.com/api/executor/install/windows-amd64?ticket=abc",
+				shell: "powershell",
+			}),
+		).toBe(`irm 'https://nf.example.com/api/executor/install/windows-amd64?ticket=abc' | iex`);
+	});
+
+	test("the script URL is quoted for its shell", () => {
+		// The URL carries a query string; unquoted, `&` or `?` would be interpreted.
+		expect(
+			buildExecutorInstallOneLiner({ scriptUrl: "https://h/x?a=1&b=2", shell: "sh" }),
+		).toContain(`'https://h/x?a=1&b=2'`);
 	});
 });
 

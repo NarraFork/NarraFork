@@ -52,6 +52,10 @@ const REQUIRED_EVENTS = [
 	// The header's timeout editor: the commit goes out over WS and this frame is
 	// the ONLY confirmation the card gets back.
 	"onTimeoutUpdated",
+	// A running Await-agent call resolving its target. Without this frame the row's
+	// "open session" item stays hidden for the whole wait: the child narrator id does
+	// not reach the persisted row until the tool RETURNS.
+	"onAwaitAgentResolved",
 	// Permission decisions (persisted status half).
 	"onPermissionRequest",
 	"onPermissionResolved",
@@ -588,6 +592,22 @@ describe("live event → patch field mapping", () => {
 		);
 		expect(block(result.messages).status).toBe("success");
 		expect(block(result.messages)._timeoutMs).toBe(90_000);
+	});
+
+	it("await_agent_resolved writes the child id without touching the lifecycle", async () => {
+		// The field name is the contract with `deriveAwaitAgentNarratorId`; writing it
+		// as `_metadata.subagentId` instead would ALSO grow the card (see the
+		// height-neutrality cases in live-patch-measure-audit.test.ts).
+		const { awaitAgentResolvedPatch } = await import("./vlist-live-events");
+		const result = awaitAgentResolvedPatch({
+			toolUseId: "tu-1",
+			subagentNarratorId: "sub-live",
+		})(toolDoc("tu-1", "running"));
+		expect(result.changed).toBe(true);
+		expect(block(result.messages)._awaitAgentNarratorId).toBe("sub-live");
+		expect(block(result.messages).status).toBe("running");
+		const metadata = block(result.messages)._metadata as Record<string, unknown> | undefined;
+		expect(metadata?.subagentId).toBeUndefined();
 	});
 
 	it("a resolved question gate leaves the tool answerable (pending, not fail)", async () => {

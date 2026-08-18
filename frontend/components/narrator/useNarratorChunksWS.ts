@@ -1630,6 +1630,22 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					),
 				);
 			},
+			// A running Await-agent call resolved its target, so its card can offer
+			// "open session" during the wait. The id reaches the persisted row only
+			// when the tool returns, which for a long wait is far too late.
+			onAwaitAgentResolved: (toolUseId: string, subagentNarratorId: string) => {
+				if (!toolUseId || !subagentNarratorId) return;
+				scheduleChunkUpdate((state) =>
+					applyToChunkContaining(state, toolUseId, (w) =>
+						mergeFieldsByIndex(
+							w,
+							toolUseId,
+							{ _awaitAgentNarratorId: subagentNarratorId },
+							EMPTY_INDEX,
+						),
+					),
+				);
+			},
 			// --- Subagents --------------------------------------------------------
 			onSubagentStarted: (
 				toolUseId: string,

@@ -20,7 +20,11 @@ import {
 	getExecutorManifest,
 	resetExecutorManifestCache,
 } from "../server/lib/executor-binaries";
-import { issueExecutorTicket, resetExecutorTickets } from "../server/lib/executor-bootstrap-ticket";
+import {
+	attachExecutorTicketScript,
+	issueExecutorTicket,
+	resetExecutorTickets,
+} from "../server/lib/executor-bootstrap-ticket";
 import { buildExecutorInstallScript } from "../server/lib/executor-install-script";
 import { HELPER_BIN_DIR } from "../server/lib/helper-binaries";
 import { settings } from "../server/lib/settings";
@@ -99,7 +103,16 @@ afterAll(() => {
 	if (scratchDir) rmSync(scratchDir, { recursive: true, force: true });
 });
 
-test("NarraFork mirrors the published release and serves it via a one-time ticket", async () => {
+function bootstrapApp() {
+	const app = new Hono();
+	app.route("/api/executor", executorBootstrapRoutes);
+	app.onError(
+		(err, c) => buildAppErrorResponse(err, c) ?? c.json({ error: "Internal server error" }, 500),
+	);
+	return app;
+}
+
+test("NarraFork mirrors the published release and serves it against a ticket", async () => {
 	const manifest = await getExecutorManifest({ forceRefresh: true });
 	expect(manifest?.version).toBe("0.5.24");
 	expect(manifest?.platforms["linux-amd64"]?.sha256).toBe(SHA256);
@@ -108,11 +121,7 @@ test("NarraFork mirrors the published release and serves it via a one-time ticke
 	const artifact = await ensureExecutorBinary("linux-amd64");
 	expect(artifact.sha256).toBe(SHA256);
 
-	const app = new Hono();
-	app.route("/api/executor", executorBootstrapRoutes);
-	app.onError(
-		(err, c) => buildAppErrorResponse(err, c) ?? c.json({ error: "Internal server error" }, 500),
-	);
+	const app = bootstrapApp();
 
 	const ticket = issueExecutorTicket("linux-amd64", { deviceId: "e2e-device" });
 	const download = await app.request(`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`);
@@ -122,9 +131,62 @@ test("NarraFork mirrors the published release and serves it via a one-time ticke
 	expect(createHash("sha256").update(served).digest("hex")).toBe(SHA256);
 	expect(download.headers.get("x-executor-sha256")).toBe(SHA256);
 
-	// The ticket is spent.
+	// A retry is allowed (a dropped download must not force a new install command),
+	// but the budget is finite.
+	for (let attempt = 0; attempt < 4; attempt++) {
+		expect(
+			(await app.request(`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`)).status,
+		).toBe(200);
+	}
 	expect(
 		(await app.request(`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`)).status,
+	).toBe(403);
+});
+
+test("the install endpoint serves the exact script attached to the ticket", async () => {
+	// This is what the one-liner fetches, so it has to be the same bytes the operator
+	// reviewed in the UI — not a regenerated script that could drift from it.
+	const app = bootstrapApp();
+	const manifest = await getExecutorManifest();
+	const entry = manifest?.platforms["linux-amd64"];
+	expect(entry).toBeTruthy();
+	if (!entry || !manifest) return;
+
+	const ticket = issueExecutorTicket("linux-amd64", { deviceId: "e2e-device" });
+	const generated = buildExecutorInstallScript({
+		platform: "linux-amd64",
+		mode: "user",
+		serverBaseUrl: "https://nf.example.com",
+		deviceWsUrl: "wss://nf.example.com/ws/device",
+		deviceSlug: "e2e-device",
+		deviceName: "E2E Device",
+		connectionMode: "reverse",
+		disableShell: false,
+		artifactFilename: entry.filename,
+		expectedSha256: entry.sha256,
+		executorVersion: manifest.version,
+		ticket: ticket.ticket,
+		tokenDelivery: "enroll",
+	});
+	attachExecutorTicketScript(ticket.ticket, {
+		body: generated.script,
+		filename: generated.filename,
+		shell: generated.shell,
+	});
+
+	const response = await app.request(`/api/executor/install/linux-amd64?ticket=${ticket.ticket}`);
+	expect(response.status).toBe(200);
+	expect(await response.text()).toBe(generated.script);
+	// Never cached, and never sniffed into something a browser would run.
+	expect(response.headers.get("cache-control")).toBe("no-store");
+	expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+});
+
+test("a ticket carrying no script cannot be used to fetch one", async () => {
+	const app = bootstrapApp();
+	const ticket = issueExecutorTicket("linux-amd64", { deviceId: "e2e-device" });
+	expect(
+		(await app.request(`/api/executor/install/linux-amd64?ticket=${ticket.ticket}`)).status,
 	).toBe(403);
 });
 

@@ -61,6 +61,56 @@ interface IssuedToken {
 	token: string;
 }
 
+/**
+ * Why registration no longer shows the key.
+ *
+ * It used to: register → read a one-time key → dismiss → generate a script → paste
+ * the key back when the script asked. Three dialogs to move one string, and the
+ * "save this, it is shown only once" warning was misleading, because the install
+ * flow rotates the key anyway.
+ *
+ * Now registration goes straight to the install dialog, which produces a single
+ * command. The key is displayed only where seeing it is the actual point: an
+ * explicit rotation, or the manual-entry install path.
+ */
+
+/**
+ * The plaintext-LAN enrollment opt-in.
+ *
+ * Lives on this page rather than in a generic settings form because it is only
+ * ever reached from here: the install dialog names this exact setting when it
+ * refuses automatic key delivery, and being sent to hand-edit settings.json to
+ * follow that instruction is not an acceptable next step.
+ *
+ * Admin-only, matching `PATCH /api/settings`. Non-admins see the state so a
+ * refusal in the install dialog is explicable, but cannot change it.
+ */
+function PlaintextEnrollmentSetting({ isAdmin }: { isAdmin: boolean }) {
+	const { t } = useTranslation("settings");
+	const qc = useQueryClient();
+	const { data: settings } = useQuery({ queryKey: ["settings"], queryFn: api.getSettings });
+	const enabled = settings?.devices?.allowPlaintextEnrollmentOnPrivateNetwork === true;
+
+	const mutation = useMutation({
+		mutationFn: (next: boolean) =>
+			api.updateSettings({ devices: { allowPlaintextEnrollmentOnPrivateNetwork: next } }),
+		onSuccess: (data) => qc.setQueryData(["settings"], data),
+		onError: (error: Error) => notifications.show({ color: "red", message: error.message }),
+	});
+
+	return (
+		<Card withBorder mt="lg" padding="md">
+			<Checkbox
+				label={t("devicePlaintextEnrollmentLabel")}
+				description={t("devicePlaintextEnrollmentHelp")}
+				checked={enabled}
+				disabled={!isAdmin || mutation.isPending}
+				onChange={(event) => mutation.mutate(event.currentTarget.checked)}
+			/>
+		</Card>
+	);
+}
+
 function SettingsDevicesPage() {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -104,7 +154,10 @@ function SettingsDevicesPage() {
 		onSuccess: (res) => {
 			qc.invalidateQueries({ queryKey: ["devices"] });
 			setCreateOpen(false);
-			setIssuedToken({ device: res.device, token: res.token });
+			// Straight to the install command. The key returned here is deliberately not
+			// shown: the installer rotates it, so displaying it would ask the operator to
+			// safeguard a string that is about to be replaced.
+			setInstallDevice(res.device);
 		},
 		onError: showError,
 	});
@@ -192,6 +245,8 @@ function SettingsDevicesPage() {
 				</Stack>
 			)}
 
+			<PlaintextEnrollmentSetting isAdmin={isAdmin} />
+
 			<CreateDeviceWizard
 				opened={createOpen}
 				onClose={() => setCreateOpen(false)}
@@ -210,16 +265,7 @@ function SettingsDevicesPage() {
 				projects={projects}
 				isAdmin={isAdmin}
 			/>
-			<TokenModal
-				issued={issuedToken}
-				onInstall={() => {
-					if (!issuedToken) return;
-					const device = issuedToken.device;
-					setIssuedToken(null);
-					setInstallDevice(device);
-				}}
-				onClose={() => setIssuedToken(null)}
-			/>
+			<TokenModal issued={issuedToken} onClose={() => setIssuedToken(null)} />
 			<ExecutorInstallModal device={installDevice} onClose={() => setInstallDevice(null)} />
 			<TransferModal device={transferDevice} onClose={() => setTransferDevice(null)} />
 			<DeviceDiagnosticsModal
@@ -322,6 +368,17 @@ function DeviceCard({
 							{t("deviceLastSeen")}: {formatDateTime(device.lastSeenAt, t("deviceNeverSeen"))}
 							{device.agentVersion ? ` · ${t("deviceAgentVersion")}: ${device.agentVersion}` : ""}
 						</Text>
+						{/*
+						 * Who collected the key, when the installer fetched it automatically. Shown
+						 * because that exchange is the one moment the key crosses the wire: if an
+						 * install command ever leaks, this line is the only evidence of who used it.
+						 */}
+						{device.enrolledAt ? (
+							<Text size="xs" c="dimmed">
+								{t("deviceEnrolledAt")}: {formatDateTime(device.enrolledAt, "—")}
+								{device.enrolledFromIp ? ` · ${device.enrolledFromIp}` : ""}
+							</Text>
+						) : null}
 					</Stack>
 					<Group gap="xs" justify="flex-end">
 						<Button size="xs" variant="light" loading={testing} onClick={onTest}>
@@ -1014,19 +1071,18 @@ function TransferModal({ device, onClose }: { device: RemoteDevice | null; onClo
 	);
 }
 
-function TokenModal({
-	issued,
-	onInstall,
-	onClose,
-}: {
-	issued: IssuedToken | null;
-	onInstall: () => void;
-	onClose: () => void;
-}) {
+/**
+ * Shows a device key in plaintext.
+ *
+ * Reached only by an explicit "rotate key", where seeing the new key *is* the
+ * requested outcome. Registration no longer routes here — see the note above
+ * `SettingsDevicesPage`.
+ */
+function TokenModal({ issued, onClose }: { issued: IssuedToken | null; onClose: () => void }) {
 	const { t } = useTranslation("settings");
 	const [manualOpen, setManualOpen] = useState(false);
-	// The generated installer is the primary path; the raw command is kept behind a
-	// disclosure for operators who install by hand.
+	// Kept behind a disclosure for operators who wire the executor up by hand rather
+	// than with the generated installer.
 	const command = issued
 		? buildDeviceRunCommand(issued.device.connectionMode, issued.device.slug, "file", {
 				serverBaseUrl: window.location.origin,
@@ -1047,9 +1103,8 @@ function TokenModal({
 						)}
 					</CopyButton>
 					<Divider />
-					<Text size="sm">{t("deviceTokenNextStep")}</Text>
+					<Text size="sm">{t("deviceRotatedNextStep")}</Text>
 					<Group>
-						<Button onClick={onInstall}>{t("executorInstallGenerate")}</Button>
 						<Button variant="subtle" onClick={() => setManualOpen((open) => !open)}>
 							{manualOpen ? t("deviceManualInstallHide") : t("deviceManualInstallShow")}
 						</Button>

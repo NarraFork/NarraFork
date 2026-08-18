@@ -98,9 +98,19 @@ export const deviceInstallScriptSchema = z.object({
 	disableShell: z.boolean().default(false),
 	/**
 	 * Absolute base URL the target machine uses to reach NarraFork. Optional: the
-	 * server derives it from the request when omitted.
+	 * server derives it from the forwarded public origin when omitted.
 	 */
 	serverBaseUrl: z.string().url().max(2000).optional(),
+	/**
+	 * How the device key reaches the machine.
+	 *
+	 * Defaults to "enroll" (the script collects the key itself, enabling a one-line
+	 * install) because the manual hand-off was the main friction in enrollment. The
+	 * route still refuses "enroll" when the transport cannot carry a key safely, so a
+	 * permissive default here does not weaken the guarantee — it only decides which
+	 * path is offered first.
+	 */
+	tokenDelivery: z.enum(["enroll", "prompt"]).default("enroll"),
 });
 
 /**
