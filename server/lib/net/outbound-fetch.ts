@@ -211,11 +211,32 @@ export async function outboundFetch(
 	const requestHeaders = new Headers(
 		init?.headers ?? (input instanceof Request ? input.headers : undefined),
 	);
-	// Avoid reusing a pooled connection across outbound requests. Long-lived NarraFork
-	// processes can otherwise inherit a relay/NAT connection that accepts a request but
-	// never returns headers before being reset. Each optional retry below therefore also
-	// gets a fresh connection; higher agent layers retain their configured backoff retries.
-	requestHeaders.set("Connection", "close");
+	// Connection reuse is deliberately left to Bun's pool: no `Connection: close` here.
+	//
+	// Forcing it (as this function used to) made every outbound request perform a fresh
+	// TCP+TLS handshake, and a tool-heavy narrator turn issues one request per tool
+	// round-trip — so a single turn took that gamble several times over. On multi-hop
+	// gateway paths a fresh connection is materially more likely to land on a hop that
+	// accepts the connection but never delivers the request: the stream then goes silent
+	// with no data, no FIN and no RST until that hop's own idle reaper fires, which is
+	// why the observed death window floated (249-736s) instead of matching any timeout
+	// of ours. Controlling for provider (nug2 only, counting every silent-failure shape)
+	// the weekly rate went 0.43% / 0.00% in the two weeks before this header landed to
+	// 2.00% in the week it landed and 1.7-3.0% after — 0.667% -> 2.584% across the
+	// boundary. The one direct-API provider stayed at 0.018% throughout.
+	//
+	// The risk the header targeted — inheriting a pooled connection that accepts a
+	// request but never answers — is already covered, in two layers depending on how the
+	// bad connection reveals itself:
+	//   - Reset/refused right away: shouldReplayTransportFailure() below replays onto a
+	//     fresh connection. Note this layer only helps a streaming AI call for TLS
+	//     handshake failures, since those POSTs are not in IDEMPOTENT_HTTP_METHODS and a
+	//     non-idempotent request must not be silently replayed once it may have landed.
+	//   - Accepted then silent: the stale-read guard in shared/stream-timeout.ts raises
+	//     StreamStaleError, which error-handling.ts classifies as retryable so the agent
+	//     loop reissues the turn.
+	// Re-adding the header would reintroduce the per-request gamble to guard against
+	// something both layers already handle.
 	const proxy = options.proxyUrl
 		? normalizeProxyUrl(options.proxyUrl, SUPPORTED_PROXY_PROTOCOLS).toString()
 		: "";

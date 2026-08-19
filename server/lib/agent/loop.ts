@@ -14,6 +14,7 @@ import { shouldUseNativeSearch } from "../search/native";
 import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
+import { StreamStaleError } from "../stream-timeout";
 import { analyzeShellCommand } from "./bash-analyze";
 import { finalizeAssistantTextWithCitations, TextCitationAccumulator } from "./citation-stream";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
@@ -534,6 +535,28 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
 			{ once: true },
 		);
 	});
+}
+
+/**
+ * Whether a failure means "the upstream stopped sending and nothing arrived
+ * before the connection died" — as opposed to an explicit rejection.
+ *
+ * Covers both detectors that can notice the silence: our own stale-read guard,
+ * and the transport-level idle timeout that fires first whenever a hop on the
+ * path drops a connection nobody is talking on. `AbortError` is deliberately
+ * excluded: a user interrupt is not upstream silence.
+ */
+function isStreamSilenceError(err: unknown): boolean {
+	if (err instanceof StreamStaleError) return true;
+	if (!(err instanceof Error)) return false;
+	if (err.name === "AbortError") return false;
+	if (err.name === "TimeoutError") return true;
+	const message = err.message.toLowerCase();
+	return (
+		message.includes("the operation timed out") ||
+		message.includes("socket connection was closed") ||
+		message.includes("stream stale")
+	);
 }
 
 function isMeaningfulStreamEvent(parsed: ParsedStreamEvent): boolean {
@@ -4793,6 +4816,32 @@ export async function* agentLoop(
 						return;
 					}
 					const msg = extractErrorMessage(err);
+					// An upstream that goes quiet mid-stream used to leave no trace at all:
+					// the turn simply stalled until some hop on the path dropped the
+					// connection, and the only surviving record was a generic transport
+					// error on the api_requests row. Log the shape of the silence itself so
+					// a stall can be attributed without reconstructing it from timestamps.
+					if (isStreamSilenceError(err)) {
+						logger.warn("Upstream stream went silent", {
+							narratorId: config.narratorId,
+							provider: effectiveProvider,
+							model: effectiveModel,
+							requestId,
+							message: msg,
+							// Time since the request was dispatched; with `ttft` below this
+							// separates "never spoke" from "spoke, then stopped".
+							elapsedMs: requestStartTime ? Date.now() - requestStartTime : undefined,
+							ttftMs: requestTtftMs,
+							streamEvents: streamEventCount,
+							contentlessEvents: contentlessEventCount,
+							// Tool calls the model had already asked for when the stream died.
+							// `startedToolCount` 0 with a non-zero `toolCount` means nothing had
+							// begun executing, so no local work can explain the silence.
+							toolCount: toolUses.length,
+							startedToolCount: earlyExecMap.size,
+							settledToolCount: settledResults.size,
+						});
+					}
 					requestDiagnostics = normalizeApiRequestDiagnostics({
 						...diagnosticsFromError(err),
 						message: msg,
