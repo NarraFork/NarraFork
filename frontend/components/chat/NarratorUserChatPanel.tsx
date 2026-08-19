@@ -21,14 +21,26 @@ import { ChatRoomView } from "./ChatRoomView";
 
 export interface NarratorUserChatPanelProps {
 	narratorId: string;
+	/**
+	 * Submit handler supplied by a host without dock context — the mobile Drawer
+	 * host passes the chat panel's own composer submit here.
+	 *
+	 * Takes precedence over the dock bridge for the same reason as the search
+	 * panel's jump handler: forwarding a message to the narrator is the point of
+	 * having this room beside a session, and on mobile the bridge does not exist.
+	 */
+	onForwardToNarrator?: (text: string) => void;
 }
 
-export function NarratorUserChatPanel({ narratorId }: NarratorUserChatPanelProps) {
+export function NarratorUserChatPanel({
+	narratorId,
+	onForwardToNarrator,
+}: NarratorUserChatPanelProps) {
 	const { t } = useTranslation("chat");
 	const dock = useNarratorDockContext();
 	const { data: room, isLoading, error } = useNarratorChatRoom(narratorId);
 
-	const submitToNarrator = dock?.submitToNarrator;
+	const submitToNarrator = onForwardToNarrator ?? dock?.submitToNarrator;
 	const forward = useCallback(
 		(text: string) => {
 			submitToNarrator?.(text);

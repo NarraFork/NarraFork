@@ -35,6 +35,7 @@ describe("collectVListUserMarkers", () => {
 				fraction: 16 / 2000,
 				ordinal: 1,
 				preview: "first question",
+				createdAt: null,
 			},
 			{
 				key: "m3-bubble",
@@ -43,7 +44,23 @@ describe("collectVListUserMarkers", () => {
 				fraction: 0.5,
 				ordinal: 2,
 				preview: "second question",
+				createdAt: null,
 			},
+		]);
+	});
+
+	it("carries the bubble's timestamp so the tooltip can show the send time", () => {
+		const items = [
+			bubble("m1-bubble", { role: "user", text: "a", createdAt: "2026-07-18T10:20:30.000Z" }),
+			bubble("m2-bubble", { role: "user", text: "b", createdAt: null }),
+			bubble("m3-bubble", { role: "user", text: "c" }),
+		];
+		const layout = [{ top: 0 }, { top: 100 }, { top: 200 }];
+		const markers = collectVListUserMarkers(items, layout, 1000);
+		expect(markers.map((marker) => marker.createdAt)).toEqual([
+			"2026-07-18T10:20:30.000Z",
+			null,
+			null,
 		]);
 	});
 

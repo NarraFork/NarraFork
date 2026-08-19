@@ -210,6 +210,8 @@
 	"containerRecheckFailed": "重新检查容器环境失败",
 	"activeTerminals": "{{count}} 个活跃终端",
 	"viewersWatching": "{{count}} 人正在查看",
+	"swipePin": "置顶",
+	"swipeUnpin": "取消置顶",
 	"containerRunning": "容器运行中",
 	"containerPaused": "容器已暂停",
 	"containerStopped": "容器已停止",

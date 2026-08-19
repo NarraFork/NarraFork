@@ -561,6 +561,57 @@ export function BackgroundTasksPanel({
 	);
 }
 
+/**
+ * Off-dock host for the background-tasks panel, with open state owned by the
+ * CALLER.
+ *
+ * The self-managed `BackgroundTasksDrawer` below bundles its own trigger button,
+ * which the registry-driven header cannot use: the header decides which entries
+ * are surfaced and in what order, so an entry that paints its own button would
+ * escape both the ordering and the overflow menu. This variant is the drawer
+ * without the button.
+ */
+export function BackgroundTasksDrawerHost({
+	narratorId,
+	opened,
+	onClose,
+}: {
+	narratorId: string;
+	opened: boolean;
+	onClose: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const { runningCount } = useBackgroundTasksButton(narratorId, opened);
+
+	return (
+		<Drawer
+			opened={opened}
+			onClose={onClose}
+			title={
+				<Group gap="xs">
+					<Text fw={600} size="sm">
+						{t("backgroundTasks.title")}
+					</Text>
+					{runningCount > 0 && (
+						<Badge size="xs" variant="filled" color="blue">
+							{runningCount}
+						</Badge>
+					)}
+				</Group>
+			}
+			position="right"
+			size="sm"
+			padding="md"
+			styles={{
+				header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
+				body: SAFE_AREA_PADDED_DRAWER_BODY_STYLE,
+			}}
+		>
+			<BackgroundTasksPanel narratorId={narratorId} onOpenSubagent={onClose} />
+		</Drawer>
+	);
+}
+
 interface BackgroundTasksDrawerProps {
 	narratorId: string;
 }

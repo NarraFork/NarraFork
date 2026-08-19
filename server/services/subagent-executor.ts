@@ -156,6 +156,36 @@ export function shouldStopSubagentForBufferedMessage(subagentId: string): boolea
 const MAX_BUFFERED_MESSAGES = 10;
 export const MAX_SUBAGENT_INTERRUPTION_RETRIES = 3;
 
+/**
+ * The `subagent_status_changed` frame to broadcast when a subagent's agent-loop
+ * pass succeeds right after one or more transient-error retries.
+ *
+ * The retry warning the parent panel displayed (the client-only `_retryInfo` on
+ * the subagent's narrator cache) is otherwise cleared only by
+ * `subagent_status_changed` on completion or `subagent_conclusion_updated`, so
+ * without this recovery frame a long-running subagent carries a stale
+ * "retry N/M" badge for its whole remaining run. Returns null on an ordinary
+ * successful pass (no retry preceded it) — no frame, no noise.
+ */
+export function subagentRetryRecoveredBroadcast(
+	transientRetries: number,
+	parentNarratorId: string,
+	subagentNarratorId: string,
+): {
+	type: "subagent_status_changed";
+	narratorId: string;
+	subagentNarratorId: string;
+	status: string;
+} | null {
+	if (transientRetries <= 0) return null;
+	return {
+		type: "subagent_status_changed",
+		narratorId: parentNarratorId,
+		subagentNarratorId,
+		status: "working",
+	};
+}
+
 export type SubagentInterruptionPlan =
 	| { action: "none"; retries: 0 }
 	| {
@@ -1247,6 +1277,16 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			break;
 		}
 
+		// A successful pass right after transient retries: tell the parent panel
+		// the subagent has recovered (see subagentRetryRecoveredBroadcast).
+		const retryRecovered = subagentRetryRecoveredBroadcast(
+			transientRetries,
+			parentNarratorId,
+			narratorId,
+		);
+		if (retryRecovered) {
+			broadcastToNarrator(parentNarratorId, retryRecovered);
+		}
 		// Reset transient retry counter on success
 		transientRetries = 0;
 

@@ -86,7 +86,12 @@ function makeViewport(scrollbarWidth: number): { current: HTMLElement } {
 	return { current: node as unknown as HTMLElement };
 }
 
-function marker(ordinal: number, fraction: number, top: number): VListUserMarker {
+function marker(
+	ordinal: number,
+	fraction: number,
+	top: number,
+	createdAt: string | null = null,
+): VListUserMarker {
 	return {
 		key: `m${ordinal}-bubble`,
 		itemIndex: ordinal,
@@ -94,6 +99,7 @@ function marker(ordinal: number, fraction: number, top: number): VListUserMarker
 		fraction,
 		ordinal,
 		preview: `turn ${ordinal}`,
+		createdAt,
 	};
 }
 
@@ -131,6 +137,19 @@ function markEls(): HTMLElement[] {
 	return Array.from(
 		container?.querySelectorAll("[data-vlist-user-marker]") ?? [],
 	) as unknown as HTMLElement[];
+}
+
+function tooltipEl(): HTMLElement | null {
+	return container?.querySelector("[data-vlist-user-marker-tooltip]") as HTMLElement | null;
+}
+
+/** Drive React's onMouseEnter/onMouseLeave (synthesized from mouseover/mouseout). */
+async function hover(mark: HTMLElement | undefined, direction: "enter" | "leave") {
+	await act(async () => {
+		mark?.dispatchEvent(
+			new MouseEvent(direction === "enter" ? "mouseover" : "mouseout", { bubbles: true }),
+		);
+	});
 }
 
 describe("VListUserMarkers", () => {
@@ -203,7 +222,13 @@ describe("VListUserMarkers", () => {
 		await renderMarkers();
 		const second = markEls()[1];
 		expect(second?.getAttribute("aria-label")).toBe("jump-2");
-		expect(second?.getAttribute("title")).toBe("#2 · turn 2");
+		// No native tooltip: the preview is rendered by an in-page element instead.
+		expect(second?.getAttribute("title")).toBeNull();
+		expect(tooltipEl()).toBeNull();
+		await hover(second, "enter");
+		expect(tooltipEl()?.textContent).toBe("#2 · turn 2");
+		await hover(second, "leave");
+		expect(tooltipEl()).toBeNull();
 		// Not a tab stop: the index is a pointer affordance beside the scrollbar, and
 		// N marks would otherwise insert N tab stops into the reading flow.
 		expect(second?.getAttribute("tabindex")).toBe("-1");
@@ -213,6 +238,42 @@ describe("VListUserMarkers", () => {
 		await renderMarkers({
 			markers: [{ ...marker(1, 0.5, 100), preview: "" }],
 		});
-		expect(markEls()[0]?.getAttribute("title")).toBe("#1");
+		await hover(markEls()[0], "enter");
+		expect(tooltipEl()?.textContent).toBe("#1");
+	});
+
+	test("shows the turn's send time in the tooltip when the marker carries one", async () => {
+		const { formatShortMessageTime } = await import("@frontend/lib/intl-format");
+		const createdAt = "2026-07-18T10:20:30.000Z";
+		await renderMarkers({
+			markers: [marker(1, 0.5, 100, createdAt)],
+		});
+		await hover(markEls()[0], "enter");
+		const tooltip = tooltipEl();
+		expect(tooltip?.textContent).toContain("#1 · turn 1");
+		expect(tooltip?.textContent).toContain(formatShortMessageTime(createdAt));
+	});
+
+	test("keeps the tooltip inside the track for edge marks", async () => {
+		// First mark (top 0): a center-anchored tooltip would slide half its height
+		// under the title bar; the clamp must push it back into the track. linkedom
+		// reports every offsetHeight as 0, so the tooltip height is pinned to 80px
+		// via the prototype to exercise the measured clamp.
+		await renderMarkers({ trackHeight: 600 });
+		await hover(markEls()[0], "enter");
+		const tooltip = tooltipEl() as HTMLElement;
+		Object.defineProperty(Object.getPrototypeOf(tooltip), "offsetHeight", {
+			configurable: true,
+			get: () => 80,
+		});
+		// Re-hover so the layout effect re-measures with the pinned height.
+		await hover(markEls()[0], "leave");
+		await hover(markEls()[0], "enter");
+		// Center top = edge gap + half the measured height (10 + 40).
+		expect((tooltipEl() as HTMLElement).style.top).toBe("50px");
+		// Last mark (top 594): clamped to trackHeight - edge gap - half height.
+		await hover(markEls()[0], "leave");
+		await hover(markEls()[2], "enter");
+		expect((tooltipEl() as HTMLElement).style.top).toBe("550px");
 	});
 });

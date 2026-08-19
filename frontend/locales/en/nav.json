@@ -59,5 +59,13 @@
 	"emptyVisibleZone": "Drag here to show",
 	"loadMoreRecentTabs": "Load more",
 	"retryRecentTabs": "Retry",
-	"recentTabsSyncError": "Recent tabs could not be synced"
+	"recentTabsSyncError": "Recent tabs could not be synced",
+	"recentTabsGrouping": "Tab grouping",
+	"groupModeFlat": "Flat list",
+	"groupModeDirectory": "Group by directory",
+	"expandDirectory": "Expand directory {{path}}",
+	"collapseDirectory": "Collapse directory {{path}}",
+	"directoryNarratorCount": "{{count}} narrators in this directory",
+	"directoryWorkingCount": "{{count}} working",
+	"directoryAttentionCount": "{{count}} need attention"
 }

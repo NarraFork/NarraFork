@@ -1,5 +1,6 @@
 {
 	"panel.title": "Git",
+	"panel.noChapter": "No chapter",
 	"panel.changes": "Changes",
 	"panel.commits": "Commits",
 	"panel.stash": "Stash",

@@ -38,7 +38,6 @@ import {
 	Stack,
 	Switch,
 	Text,
-	Textarea,
 	TextInput,
 	Tooltip,
 	UnstyledButton,
@@ -47,7 +46,7 @@ import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { tailRoleAllowsContinue } from "@shared/continue-tail";
 import { cardEffortLevels, lookupModelCard } from "@shared/model-card";
-import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
+import { MOBILE_TOOLBAR_VISIBLE_LIMIT } from "@shared/narrator-toolbar";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
 	claudeVersionAtLeast,
@@ -56,7 +55,6 @@ import {
 	parseClaudeModel,
 } from "@shared/reasoning-effort-support";
 import {
-	IconArchive,
 	IconArrowDown,
 	IconArrowLeft,
 	IconArrowsMinimize,
@@ -66,30 +64,22 @@ import {
 	IconChevronUp,
 	IconClock,
 	IconCopy,
-	IconDeviceDesktop,
-	IconDevices,
 	IconDotsVertical,
 	IconEraser,
 	IconExternalLink,
 	IconFile,
-	IconFileCode,
 	// TEMPORARY mock-stream harness icon (see ./mock/README-REMOVAL.md).
 	IconFlask,
 	IconFolderPlus,
 	IconGitBranch,
 	IconGitFork,
-	IconInfoCircle,
 	IconLock,
 	IconLockOpen,
-	IconMessages,
 	IconNotebook,
 	IconPaperclip,
 	IconPencil,
 	IconPlayerPlay,
 	IconPlayerTrackNext,
-	IconPuzzle,
-	IconRobot,
-	IconSearch,
 	IconSettings,
 	IconShield,
 	IconSparkles,
@@ -97,7 +87,6 @@ import {
 	IconTool,
 	IconTrash,
 	IconUpload,
-	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -117,13 +106,10 @@ import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
-import { useNarratorCommands } from "../../hooks/useCommands";
-import { useInputHistory, writeInputHistoryEntries } from "../../hooks/useInputHistory";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useModelCardIndex } from "../../hooks/useModelCards";
 import { useAllModels } from "../../hooks/useModels";
-import { useNamedNarrators } from "../../hooks/useNamedNarrator";
 import {
 	useArchiveNarrator,
 	useBlacklistDirs,
@@ -164,6 +150,7 @@ import {
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
 import { useNarratorLod } from "../../hooks/useNarratorLod";
+import { useNarratorToolbarLayout } from "../../hooks/useNarratorToolbarLayout";
 import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
@@ -221,7 +208,7 @@ import {
 } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { UserAvatar } from "../UserAvatar";
-import { BackgroundTasksDrawer, useBackgroundTasksButton } from "./BackgroundTasksDrawer";
+import { BackgroundTasksDrawerHost, useBackgroundTasksButton } from "./BackgroundTasksDrawer";
 
 import { ChapterBar } from "./ChapterBar";
 import {
@@ -230,14 +217,8 @@ import {
 	type ChunkTailMeta,
 } from "./ChunkedMessageList";
 import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
-import { CommandParamHelper } from "./CommandParamHelper";
-import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
-import {
-	hasComposerAttachments,
-	hasComposerText,
-	hasSendableComposerContent,
-} from "./composer-send-gate";
+import { hasSendableComposerContent } from "./composer-send-gate";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import {
 	clearDraftImageAttachments,
@@ -245,9 +226,9 @@ import {
 	loadDraftImageAttachments,
 	saveDraftImageAttachments,
 } from "./draft-image-attachments";
+import { ExecutionDeviceMenu } from "./ExecutionDeviceMenu";
 import { LeakedToolCallModal } from "./LeakedToolCallModal";
 import { LodSwitchToast } from "./LodSwitchToast";
-import { getMentionQuery, type MentionCandidate, MentionPopover } from "./MentionPopover";
 import {
 	COMPACTING_MARKER_ATTR,
 	CompactSummaryModal,
@@ -267,11 +248,17 @@ import {
 	resolveSelectedBlockMeta,
 	resolveSelectedMessageIds,
 } from "./MessageSelectionCtx";
+import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
 import { ModelMenuItems } from "./ModelMenuItems";
 import { ModelPriceModal } from "./ModelPriceModal";
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
+import {
+	NarratorComposer,
+	type NarratorComposerHandle,
+	type NarratorRemoteDraft,
+} from "./NarratorComposer";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import {
@@ -279,16 +266,8 @@ import {
 	NarratorStatusToolbar,
 	type NarratorStatusToolbarAction,
 } from "./NarratorStatusToolbar";
+import { NarratorToolbarOverflowMenu } from "./NarratorToolbarOverflowMenu";
 import { NugRechargeDialog } from "./NugRechargeDialog";
-import {
-	classifyDraftRevisionConflict,
-	cleanupLegacyNarratorInputStorage,
-	getNarratorDraftStorageId,
-	persistNarratorInputDraft,
-	purgeLegacyNarratorInputStorage,
-	readNarratorInputDraft,
-	resolveHydratedNarratorDraft,
-} from "./narrator-draft-storage";
 import { resolvePendingPerm, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
 	ContentBlock,
@@ -308,6 +287,11 @@ import {
 	resizeImageIfNeeded,
 } from "./narrator-panel-types";
 import { getNarratorStatusBarDisplay, planNarratorWorkIndicator } from "./narrator-status-bar";
+import {
+	type NarratorToolbarBadgeCounts,
+	resolveNarratorToolbarBadge,
+} from "./narrator-toolbar-badges";
+import type { NarratorToolbarHost, NarratorToolbarId } from "./narrator-toolbar-items";
 import { compactProgressLabel } from "./progress-label";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
 import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
@@ -575,19 +559,6 @@ function resolveBooleanOverride(value: unknown, globalDefault: boolean): boolean
 
 /** Number of queued messages before the queue collapses into a summary bar. */
 const QUEUE_COLLAPSE_THRESHOLD = 2;
-
-const INPUT_DRAFT_SYNC_DEBOUNCE_MS = 800;
-
-function createDraftSourceId(): string {
-	return (
-		globalThis.crypto?.randomUUID?.() ??
-		`draft-${Date.now()}-${Math.random().toString(36).slice(2)}`
-	);
-}
-
-function isDraftWithinSyncLimit(input: string): boolean {
-	return input.length <= MAX_NARRATOR_DRAFT_CHARS;
-}
 
 type CompactingMarkerKind = "context" | "segment";
 
@@ -2211,11 +2182,20 @@ export function NarratorPanel({
 	const browserSessionsCapability = useNarratorBrowserSessionsCapability();
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
-	const { t: tChat } = useTranslation("chat");
-	// Unread count for the discussion-room toolbar entry. The room is resolved only
-	// in dock mode (that is the only surface with a panel to open), and the count
-	// comes from the shared unread summary rather than a per-narrator request.
-	const userChatRoomQuery = useNarratorChatRoom(narratorId, !!dock && !isWorkspacePreview);
+	/*
+	 * Unread count for the discussion-room toolbar entry.
+	 *
+	 * Deliberately NOT gated on `dock` any more. It used to be, on the premise that
+	 * a dock surface is "the only surface with a panel to open" — that premise is no
+	 * longer true (MobileToolPanelHost opens the room in a Drawer), and leaving the
+	 * gate would have made the mobile badge silently read zero: the room would never
+	 * resolve, so `byRoom[...]` would have nothing to look up and the entry would
+	 * claim there was nothing to read.
+	 *
+	 * Still skipped for workspace previews, which stay lightweight and offer no
+	 * tool entries at all.
+	 */
+	const userChatRoomQuery = useNarratorChatRoom(narratorId, !isWorkspacePreview);
 	const chatUnreadQuery = useChatUnread();
 	const userChatRoomId = userChatRoomQuery.data?.id;
 	const userChatUnread = userChatRoomId ? (chatUnreadQuery.data?.byRoom[userChatRoomId] ?? 0) : 0;
@@ -2899,443 +2879,23 @@ export function NarratorPanel({
 		);
 	}, [narratorId]);
 
-	// --- Input management ---
-	const [input, setInput] = useState("");
-	const [draftHydrated, setDraftHydrated] = useState(false);
-	const [draftSyncState, setDraftSyncState] = useState<"loading" | "ready" | "error" | "conflict">(
-		"loading",
-	);
-	const [draftLoadAttempt, setDraftLoadAttempt] = useState(0);
-	const inputRef = useRef(input);
-	inputRef.current = input;
+	// --- Composer (text input) ---
+	// The text-input state lives in <NarratorComposer>: it changes on every
+	// keystroke, and keeping it here re-rendered this entire (very large) panel
+	// per key — measured ~110ms/keystroke in a dev trace. The panel interacts
+	// with the text purely through this imperative handle.
+	const composerRef = useRef<NarratorComposerHandle>(null);
 	const sendingRef = useRef(false);
-	const draftSourceIdRef = useRef(createDraftSourceId());
-	const lastSyncedDraftRef = useRef("");
-	const lastDraftRevisionRef = useRef<number | null>(null);
-	const lastDraftUpdatedAtRef = useRef<string | null>(null);
-	const draftConflictRef = useRef<{
-		hasDraft: boolean;
-		text: string;
-		revision: number;
-		updatedAt: string | null;
-		updatedBy: string | null;
-		sourceId: string | null;
-	} | null>(null);
-	const draftSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const draftSyncSeqRef = useRef(0);
-	// null until the user is known: recall is keyed per `(user, narrator)`, and a
-	// placeholder key would both consume a slot in the bounded history namespace and
-	// strand whatever was typed before hydration in a list nothing reads again.
-	const inputHistory = useInputHistory(
-		currentUserId ? getNarratorDraftStorageId(currentUserId, narratorId) : null,
-	);
-	useEffect(() => {
-		if (!currentUserId || !draftHydrated || sendingRef.current) return;
-		persistNarratorInputDraft(
-			currentUserId,
-			narratorId,
-			input,
-			lastDraftRevisionRef.current,
-			lastDraftUpdatedAtRef.current,
-		);
-	}, [currentUserId, draftHydrated, input, narratorId]);
-
-	const syncDraftNow = useCallback(
-		async (text: string, baseRevision = lastDraftRevisionRef.current) => {
-			if (!currentUserId) throw new Error("Current user is unavailable");
-			if (baseRevision == null) throw new Error("Draft has not been loaded from the server");
-			if (!isDraftWithinSyncLimit(text)) {
-				throw new Error(`Draft exceeds the ${MAX_NARRATOR_DRAFT_CHARS} character sync limit`);
-			}
-			if (draftSyncTimerRef.current) {
-				clearTimeout(draftSyncTimerRef.current);
-				draftSyncTimerRef.current = null;
-			}
-			const seq = ++draftSyncSeqRef.current;
-			const sourceId = draftSourceIdRef.current;
-			let revision = baseRevision;
-			let retriedOwnRevision = false;
-			while (true) {
-				try {
-					const result = await api.updateNarratorDraft(narratorId, text, revision, sourceId);
-					if (seq === draftSyncSeqRef.current) {
-						const newerConflict = draftConflictRef.current;
-						if (newerConflict && newerConflict.revision > result.revision) return result;
-						lastSyncedDraftRef.current = result.text;
-						lastDraftRevisionRef.current = result.revision;
-						lastDraftUpdatedAtRef.current = result.updatedAt;
-						draftConflictRef.current = null;
-						setDraftSyncState("ready");
-						persistNarratorInputDraft(
-							currentUserId,
-							narratorId,
-							inputRef.current,
-							result.revision,
-							result.updatedAt,
-						);
-						qc.setQueryData(
-							["narrators", narratorId],
-							(old: Record<string, unknown> | undefined) =>
-								old ? { ...old, traits: result.traits, hasDraft: result.hasDraft } : old,
-						);
-					}
-					return result;
-				} catch (err) {
-					const current =
-						err instanceof ApiError && err.status === 409
-							? (err.data?.current as
-									| {
-											hasDraft?: unknown;
-											text?: unknown;
-											revision?: unknown;
-											updatedAt?: unknown;
-											updatedBy?: unknown;
-											sourceId?: unknown;
-									  }
-									| undefined)
-							: undefined;
-					if (current && typeof current.text === "string" && typeof current.revision === "number") {
-						const remote = {
-							hasDraft: !!current.hasDraft,
-							text: current.text,
-							revision: current.revision,
-							updatedAt: typeof current.updatedAt === "string" ? current.updatedAt : null,
-							updatedBy: typeof current.updatedBy === "string" ? current.updatedBy : null,
-							sourceId: typeof current.sourceId === "string" ? current.sourceId : null,
-						};
-						const action = classifyDraftRevisionConflict({
-							requestSequence: seq,
-							latestSequence: draftSyncSeqRef.current,
-							requestSourceId: sourceId,
-							currentSourceId: remote.sourceId,
-						});
-						if (action === "retry" && !retriedOwnRevision) {
-							retriedOwnRevision = true;
-							revision = remote.revision;
-							continue;
-						}
-						if (action === "conflict") {
-							draftConflictRef.current = remote;
-							setDraftSyncState("conflict");
-						}
-					}
-					throw err;
-				}
-			}
-		},
-		[currentUserId, narratorId, qc],
+	// Flips only on the empty↔non-empty boundary (send-button gating, permission
+	// Enter hint) — the composer reports the flag, never the text.
+	const [composerHasText, setComposerHasText] = useState(false);
+	// WS draft_changed events land on the panel-level subscription; forward them
+	// into the composer's draft state machine.
+	const forwardDraftChanged = useCallback(
+		(draft: NarratorRemoteDraft) => composerRef.current?.handleDraftChanged(draft),
+		[],
 	);
 
-	const clearInputAndDraft = useCallback(() => {
-		setInput("");
-		if (draftSyncState === "ready") void syncDraftNow("").catch(() => {});
-	}, [draftSyncState, syncDraftNow]);
-
-	const hideInputForSend = useCallback(() => {
-		setInput("");
-	}, []);
-
-	// Reclaim pre-facade draft/history keys once per tab.
-	//
-	// Those keys were unbounded in count and up to 512k characters each, and
-	// nothing ever enumerated the area to expire them — so a tab that already
-	// accumulated dozens carries their quota cost until it is closed, which is the
-	// state that made typing (and the desktop) stutter. The per-narrator cleanup in
-	// the hydration effect below only reaches ids this tab happens to reopen, so a
-	// sweep is what actually frees an already-degraded session.
-	// Input history is MIGRATED rather than dropped: unlike a draft it has no server
-	// copy, so deleting it would silently cost the user their up-arrow recall.
-	useEffect(() => {
-		purgeLegacyNarratorInputStorage(writeInputHistoryEntries);
-	}, []);
-
-	useEffect(() => {
-		void draftLoadAttempt;
-		if (!currentUserId) {
-			setDraftHydrated(false);
-			setDraftSyncState("loading");
-			return;
-		}
-		let cancelled = false;
-		setDraftHydrated(false);
-		setDraftSyncState("loading");
-		draftConflictRef.current = null;
-		lastSyncedDraftRef.current = "";
-		lastDraftRevisionRef.current = null;
-		if (draftSyncTimerRef.current) {
-			clearTimeout(draftSyncTimerRef.current);
-			draftSyncTimerRef.current = null;
-		}
-		cleanupLegacyNarratorInputStorage(currentUserId, narratorId);
-		const localDraft = readNarratorInputDraft(currentUserId, narratorId);
-		lastDraftRevisionRef.current = localDraft.serverRevision;
-		lastDraftUpdatedAtRef.current = localDraft.serverUpdatedAt;
-		inputRef.current = localDraft.text;
-		setInput(localDraft.text);
-		setDraftHydrated(true);
-		const localDraftAtRequest = localDraft.text;
-
-		api
-			.getNarratorDraft(narratorId)
-			.then((draft) => {
-				if (cancelled) return;
-				const serverText = draft.hasDraft ? draft.text : "";
-				const currentInput = inputRef.current;
-				const resolved = resolveHydratedNarratorDraft({
-					local: localDraft,
-					serverText,
-					serverRevision: draft.revision,
-					currentInput,
-					localChangedSinceRequest: currentInput !== localDraftAtRequest,
-				});
-				lastSyncedDraftRef.current = serverText;
-				lastDraftRevisionRef.current = resolved.conflict
-					? localDraft.serverRevision
-					: draft.revision;
-				lastDraftUpdatedAtRef.current = resolved.conflict
-					? localDraft.serverUpdatedAt
-					: draft.updatedAt;
-				inputRef.current = resolved.text;
-				setInput(resolved.text);
-				persistNarratorInputDraft(
-					currentUserId,
-					narratorId,
-					resolved.text,
-					resolved.conflict ? localDraft.serverRevision : draft.revision,
-					resolved.conflict ? localDraft.serverUpdatedAt : draft.updatedAt,
-				);
-				if (resolved.conflict) {
-					draftConflictRef.current = draft;
-					setDraftSyncState("conflict");
-				} else {
-					setDraftSyncState("ready");
-				}
-			})
-			.catch(() => {
-				if (!cancelled) setDraftSyncState("error");
-			});
-		return () => {
-			cancelled = true;
-		};
-	}, [currentUserId, draftLoadAttempt, narratorId]);
-
-	useEffect(() => {
-		if (!draftHydrated || !currentUserId || draftSyncState !== "ready" || sendingRef.current)
-			return;
-		if (!isDraftWithinSyncLimit(input)) return;
-		if (input === lastSyncedDraftRef.current) return;
-		if (draftSyncTimerRef.current) clearTimeout(draftSyncTimerRef.current);
-		draftSyncTimerRef.current = setTimeout(() => {
-			draftSyncTimerRef.current = null;
-			void syncDraftNow(inputRef.current).catch((err) => {
-				if (import.meta.env.DEV) console.warn("[NarratorPanel] draft sync failed:", err);
-			});
-		}, INPUT_DRAFT_SYNC_DEBOUNCE_MS);
-		return () => {
-			if (draftSyncTimerRef.current) {
-				clearTimeout(draftSyncTimerRef.current);
-				draftSyncTimerRef.current = null;
-			}
-		};
-	}, [currentUserId, draftHydrated, draftSyncState, input, syncDraftNow]);
-
-	const retryDraftHydration = useCallback(() => {
-		setDraftLoadAttempt((attempt) => attempt + 1);
-	}, []);
-
-	const acceptServerDraft = useCallback(() => {
-		const remote = draftConflictRef.current;
-		if (!remote || !currentUserId) return;
-		const remoteText = remote.hasDraft ? remote.text : "";
-		lastSyncedDraftRef.current = remoteText;
-		lastDraftRevisionRef.current = remote.revision;
-		lastDraftUpdatedAtRef.current = remote.updatedAt;
-		draftConflictRef.current = null;
-		inputRef.current = remoteText;
-		setInput(remoteText);
-		setDraftSyncState("ready");
-		persistNarratorInputDraft(
-			currentUserId,
-			narratorId,
-			remoteText,
-			remote.revision,
-			remote.updatedAt,
-		);
-	}, [currentUserId, narratorId]);
-
-	const commitInputDraftAfterSend = useCallback(() => {
-		if (draftSyncState === "ready") {
-			setDraftSyncState("loading");
-			void syncDraftNow("").catch(() => setDraftSyncState("error"));
-		} else if (draftSyncState === "conflict") {
-			// The local text was sent, but another client owns a newer draft. Keep that
-			// remote draft rather than clearing it as a side effect of this send.
-			acceptServerDraft();
-		}
-	}, [draftSyncState, syncDraftNow, acceptServerDraft]);
-
-	const overwriteServerDraft = useCallback(() => {
-		const remote = draftConflictRef.current;
-		if (!remote) return;
-		void syncDraftNow(inputRef.current, remote.revision).catch((err) => {
-			notifications.show({
-				title: t("draftSyncFailed"),
-				message: err instanceof Error ? err.message : String(err),
-				color: "red",
-			});
-		});
-	}, [syncDraftNow, t]);
-
-	const handleDraftChanged = useCallback(
-		(draft: {
-			hasDraft: boolean;
-			text: string;
-			revision: number;
-			updatedAt: string | null;
-			updatedBy: string | null;
-			sourceId: string | null;
-		}) => {
-			const currentRevision = lastDraftRevisionRef.current;
-			if (currentRevision != null && draft.revision < currentRevision) return;
-			const remoteText = draft.hasDraft ? draft.text : "";
-			const hasLocalUnsyncedChanges = inputRef.current !== lastSyncedDraftRef.current;
-			if (
-				draft.sourceId !== draftSourceIdRef.current &&
-				hasLocalUnsyncedChanges &&
-				remoteText !== inputRef.current
-			) {
-				draftConflictRef.current = draft;
-				setDraftSyncState("conflict");
-				return;
-			}
-			lastSyncedDraftRef.current = remoteText;
-			lastDraftRevisionRef.current = draft.revision;
-			lastDraftUpdatedAtRef.current = draft.updatedAt;
-			draftConflictRef.current = null;
-			setDraftSyncState("ready");
-			const shouldApplyRemote = draft.sourceId !== draftSourceIdRef.current;
-			const nextInput = shouldApplyRemote ? remoteText : inputRef.current;
-			if (currentUserId) {
-				persistNarratorInputDraft(
-					currentUserId,
-					narratorId,
-					nextInput,
-					draft.revision,
-					draft.updatedAt,
-				);
-			}
-			if (shouldApplyRemote) setInput(remoteText);
-		},
-		[currentUserId, narratorId],
-	);
-
-	// --- Command popover ---
-	// Only fetch commands when user starts typing "/" to avoid unnecessary API call on page load
-	const { data: commandsList } = useNarratorCommands(
-		input.startsWith("/") ? narratorId : undefined,
-	);
-	// Show command popover only when typing command name (no space yet),
-	// or when typing optional tool sub-completion (/load <tool>, /unload <tool>).
-	// Suppress when browsing input history so arrow keys keep navigating history.
-	const commandPopoverVisible =
-		input.startsWith("/") &&
-		!input.includes("\n") &&
-		(!input.includes(" ") ||
-			// /load <tool>, /unload <tool>, and the skill sub-completions
-			// (/load skill <name>, /unload all_skills, ...).
-			/^\/(?:load|unload)\s(?:skill(?:\s\S*)?|\S*)$/i.test(input)) &&
-		(commandsList?.length ?? 0) > 0 &&
-		!inputHistory.isBrowsing;
-	// Matched command for param helper (after space is typed)
-	const matchedCommand = useMemo(() => {
-		if (!input.startsWith("/") || !commandsList?.length) return null;
-		const spaceIdx = input.indexOf(" ");
-		if (spaceIdx === -1) return null;
-		const cmdName = input.slice(1, spaceIdx);
-		return (
-			commandsList.find(
-				(c) => c.name.toLowerCase() === cmdName.toLowerCase() && c.type === "command",
-			) ?? null
-		);
-	}, [input, commandsList]);
-	const handleCommandSelect = useCallback((cmd: CommandItem) => {
-		if (cmd.type === "skill") {
-			// Skill selected — use /skill command so backend injects content directly
-			setInput(`/skill ${cmd.name} `);
-		} else if (cmd.type === "tool" && !cmd.name.includes(" ")) {
-			// Parent /load entry — expand to show sub-items
-			setInput(`/${cmd.name} `);
-		} else {
-			// Always keep command format — user can continue typing or press space for params
-			setInput(`/${cmd.name}`);
-		}
-	}, []);
-	const closeCommandPopover = useCallback(() => {
-		clearInputAndDraft();
-	}, [clearInputAndDraft]);
-
-	// === @mention of named narrators ===========================================
-	const { data: namedNarrators } = useNamedNarrators();
-	const [mentionCaret, setMentionCaret] = useState<number | null>(null);
-	const mentionQuery = useMemo(() => {
-		if (mentionCaret === null) return null;
-		// Don't compete with the slash-command popover.
-		if (input.startsWith("/")) return null;
-		return getMentionQuery(input, mentionCaret);
-	}, [input, mentionCaret]);
-	const mentionCandidates = useMemo<MentionCandidate[]>(() => {
-		if (!namedNarrators) return [];
-		return namedNarrators
-			.filter((n: { handle?: string | null }) => !!n.handle)
-			.map((n: { id: string; handle: string; title?: string | null; status?: string }) => ({
-				id: n.id,
-				handle: n.handle,
-				title: n.title,
-				status: n.status,
-			}));
-	}, [namedNarrators]);
-	const mentionPopoverVisible =
-		mentionQuery !== null && !inputHistory.isBrowsing && mentionCandidates.length > 0;
-	const handleMentionSelect = useCallback(
-		(candidate: MentionCandidate) => {
-			const caret = mentionCaret;
-			if (caret === null) return;
-			const upto = input.slice(0, caret);
-			const at = upto.lastIndexOf("@");
-			if (at === -1) return;
-			const before = input.slice(0, at);
-			const after = input.slice(caret);
-			const insert = `@${candidate.handle} `;
-			const next = before + insert + after;
-			setInput(next);
-			// Move caret to just after the inserted handle.
-			const nextCaret = before.length + insert.length;
-			requestAnimationFrame(() => {
-				const ta = textareaRef.current;
-				if (ta) {
-					ta.focus();
-					ta.setSelectionRange(nextCaret, nextCaret);
-				}
-				setMentionCaret(nextCaret);
-			});
-		},
-		[input, mentionCaret],
-	);
-	const closeMentionPopover = useCallback(() => setMentionCaret(null), []);
-
-	useEffect(() => {
-		const append = (text: string) => setInput((prev) => (prev ? `${prev}\n${text}` : text));
-		if (appendInputRef) {
-			appendInputRef.current = append;
-		}
-		// In dock mode also register the appender so a sibling terminal panel can
-		// push selected text into this chat input without a shared React parent.
-		const unregister = dock?.registerAppendChatInput(append);
-		return () => {
-			if (appendInputRef) appendInputRef.current = null;
-			unregister?.();
-		};
-	}, [appendInputRef, dock]);
 	/*
 	 * Pending attachments — images and text files.
 	 *
@@ -3633,7 +3193,7 @@ export function NarratorPanel({
 				requestAnimationFrame(() => {
 					scrollToBottom(true);
 					if (!suppressAutoFocusOnPromote) {
-						textareaRef.current?.focus();
+						composerRef.current?.focus();
 					}
 				});
 			});
@@ -3710,7 +3270,7 @@ export function NarratorPanel({
 		customApiProviderId: customApiProviderInfo?.providerId,
 		nugProviderId: nugProviderInfo?.providerId,
 		quotaProviderKey: customApiProviderInfo?.providerId ?? nugProviderInfo?.providerId,
-		onDraftChanged: handleDraftChanged,
+		onDraftChanged: forwardDraftChanged,
 		onQueuedNewNarratorCreated: (newNarratorId) => {
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarratorId } });
 		},
@@ -4135,10 +3695,9 @@ export function NarratorPanel({
 		narratorId,
 		tasksButtonEnabled,
 	);
-	const tasksToolOpened = dock ? dock.openToolTypes.has("tasks") : false;
-	const toggleTasksTool = useCallback(() => {
-		dock?.toggleToolPanel("tasks");
-	}, [dock]);
+	// Open state and toggling for the tasks entry now live in the registry-driven
+	// header (`toolbarEntryActive` / `activateToolbarEntry`), which also handles the
+	// off-dock drawer fallback.
 
 	// Dynamic Spec current task, for the compact status bar above the input.
 	const { data: specTasksData } = useSpecTasks(narratorId);
@@ -4514,20 +4073,18 @@ export function NarratorPanel({
 		[setFileModDrawerOpened],
 	);
 
-	// What the composer currently holds. Attachments count as content, so an
-	// image-only draft behaves like a typed one everywhere below.
-	const composerContent = {
-		text: input,
-		imageCount: attachedImages.length,
-		textFileCount: attachedTextFiles.length,
-	};
+	// What the composer currently holds, split by ownership: the text flag comes
+	// from NarratorComposer (updates only on empty↔non-empty flips), attachments
+	// are panel state. An image-only draft behaves like a typed one everywhere below.
+	const composerHasAttachments = attachedImages.length + attachedTextFiles.length > 0;
+	const composerSendable = composerHasText || composerHasAttachments;
 
 	// True when the composer carries nothing to send and there's a non-question pending
 	// permission. Used to show Enter-key hints on permission buttons via PermEnterHintCtx.
 	// A staged attachment keeps Enter bound to sending it rather than silently approving
 	// the permission.
 	const permHintActive =
-		!hasSendableComposerContent(composerContent) &&
+		!composerSendable &&
 		!!renderPermCb.pendingPermission &&
 		renderPermCb.pendingPermission.toolName !== "AskUserQuestion";
 
@@ -4618,7 +4175,6 @@ export function NarratorPanel({
 	const [generatingTitle, setGeneratingTitle] = useState(false);
 	const titleInputRef = useRef<HTMLInputElement>(null);
 	const fileInputRef = useRef<HTMLInputElement>(null);
-	const textareaRef = useRef<HTMLTextAreaElement>(null);
 	// Visible send/upload feedback. `progress` is 0..1 while attachments upload,
 	// or null once the request body is sent and we're awaiting the server.
 	// `canCancel` gates the cancel button — only meaningful while the upload is
@@ -4641,35 +4197,6 @@ export function NarratorPanel({
 	}, []);
 	const cancelSending = useCallback(() => {
 		sendAbortRef.current?.abort();
-	}, []);
-
-	// Force react-textarea-autosize to recalculate after viewport width
-	// changes (e.g. DevTools mobile↔desktop toggle). The library recalculates
-	// on window "resize" but can read stale layout during rapid toggles.
-	// Bumping a counter triggers a React re-render → useLayoutEffect inside
-	// TextareaAutosize fires resizeTextarea() with the final layout values.
-	const [, setTextareaResizeTick] = useState(0);
-	useEffect(() => {
-		const ta = textareaRef.current;
-		if (!ta) return;
-		let prevWidth = ta.clientWidth;
-		let timer = 0;
-		const ro = new ResizeObserver(() => {
-			const w = ta.clientWidth;
-			if (w !== prevWidth) {
-				prevWidth = w;
-				clearTimeout(timer);
-				// Wait for layout to settle before triggering re-render
-				timer = window.setTimeout(() => {
-					setTextareaResizeTick((n) => n + 1);
-				}, 100);
-			}
-		});
-		ro.observe(ta);
-		return () => {
-			clearTimeout(timer);
-			ro.disconnect();
-		};
 	}, []);
 
 	const startEditingTitle = () => {
@@ -5296,6 +4823,15 @@ export function NarratorPanel({
 	//     ONLY way to reach it.
 	// Workspace previews stay lightweight and get neither (same rule as the spec
 	// drawer), so their rows leave the affordance hidden rather than dead.
+	/**
+	 * Off-dock host state for the tool panels that previously had NO mobile entry
+	 * point (git / search / browser / discussion). One at a time: they are
+	 * full-screen drawers, and each holds a live subscription.
+	 */
+	const [mobileToolPanel, setMobileToolPanel] = useState<MobileToolPanelKind | null>(null);
+	/** Off-dock host state for the background-tasks drawer. */
+	const [mobileTasksOpen, setMobileTasksOpen] = useState(false);
+
 	const [internalFileViewerPath, setInternalFileViewerPath] = useState<string | null>(null);
 	const dockOpenFilePanel = dock?.openFilePanel;
 	const useInternalFileViewer = !dockOpenFilePanel && !isWorkspacePreview;
@@ -5455,6 +4991,48 @@ export function NarratorPanel({
 			handleOpenKnowledgeEntry,
 			handleOpenSpecFile,
 			handleOpenChapter,
+		],
+	);
+
+	// Memoized tail footer for ChunkedMessageList. ⚠️ This MUST be referentially
+	// stable across unrelated renders (e.g. composer keystrokes): an inline JSX
+	// value here is a fresh element identity every render, which defeats
+	// ChunkedMessageList's `memo` and re-renders the entire message tree per
+	// keystroke (~thousands of elements). `updateConclusionMutation.mutate` is
+	// stable across renders (bound to the mutation observer); the result object
+	// itself is NOT, so only its stable fields may be captured.
+	const updateConclusionMutate = updateConclusionMutation.mutate;
+	const updateConclusionPending = updateConclusionMutation.isPending;
+	const chunkListTailFooter = useMemo(
+		() =>
+			isSubagent &&
+			narrator &&
+			narrator.status === "idle" &&
+			!isTakenOver &&
+			substatus.includes("manual_override") &&
+			!isActive ? (
+				<Box ta="center" py="sm">
+					<Button
+						size="compact-sm"
+						variant="light"
+						color="indigo"
+						onClick={() => updateConclusionMutate(narratorId)}
+						loading={updateConclusionPending}
+					>
+						{t("updateConclusion")}
+					</Button>
+				</Box>
+			) : null,
+		[
+			isSubagent,
+			narrator,
+			isTakenOver,
+			substatus,
+			isActive,
+			updateConclusionMutate,
+			updateConclusionPending,
+			narratorId,
+			t,
 		],
 	);
 
@@ -5963,7 +5541,7 @@ export function NarratorPanel({
 	): Promise<boolean> => {
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
-		hideInputForSend();
+		composerRef.current?.hideTextForSend();
 		hideAttachedFilesForSend();
 		try {
 			const result = await api.sendNarratorMessage(
@@ -5976,7 +5554,7 @@ export function NarratorPanel({
 				signal,
 			);
 			const buffered = applyBufferedSendResult(result, msg, images.length, priority);
-			commitInputDraftAfterSend();
+			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
 			// Whether the message was buffered (202) or the backend fell through
 			// to a direct send (201), scroll so the new content is visible.
@@ -5984,7 +5562,7 @@ export function NarratorPanel({
 			return buffered;
 		} catch (err) {
 			// Restore input and attachments on error
-			setInput(msg);
+			composerRef.current?.setText(msg);
 			if (images.length > 0) updateAttachedImages(images);
 			if (textFiles.length > 0) updateAttachedTextFiles(textFiles);
 			throw err; // Re-throw to let caller handle
@@ -5994,7 +5572,7 @@ export function NarratorPanel({
 	/**
 	 * Latest `doSendBuffered`, for callers registered once with the dock bridge.
 	 *
-	 * `doSendBuffered` is redefined every render (it closes over the live input and
+	 * `doSendBuffered` is redefined every render (it closes over the live
 	 * attachments), so a bridge that captured it directly would keep calling a
 	 * stale closure with stale attachment state.
 	 */
@@ -6013,11 +5591,20 @@ export function NarratorPanel({
 	 * not interrupt the current turn.
 	 */
 	const handleSendWithMode = async (mode: "turn" | "tool" | "interrupt") => {
-		const msg = input.trim();
+		const composerText = composerRef.current?.getText() ?? "";
+		const msg = composerText.trim();
 		const attachmentCount = attachedImages.length + attachedTextFiles.length;
 		// An attachment-only message is a valid turn: images (and text files) carry the
 		// content by themselves, so an empty textarea must not block the send.
-		if (!hasSendableComposerContent(composerContent) || sendingRef.current) return;
+		if (
+			!hasSendableComposerContent({
+				text: composerText,
+				imageCount: attachedImages.length,
+				textFileCount: attachedTextFiles.length,
+			}) ||
+			sendingRef.current
+		)
+			return;
 		sendingRef.current = true;
 		lastProgressPercentRef.current = -1;
 		const abortController = new AbortController();
@@ -6030,7 +5617,7 @@ export function NarratorPanel({
 		});
 		let restoreOnError: { msg: string; images: File[]; textFiles: File[] } | null = null;
 		try {
-			inputHistory.push(msg);
+			composerRef.current?.noteSent(msg);
 
 			const newMatch = msg.match(/^\/new(?:\s+([\s\S]*))?$/);
 			if (newMatch) {
@@ -6044,7 +5631,7 @@ export function NarratorPanel({
 				const images = [...attachedImages];
 				const textFiles = [...attachedTextFiles];
 				restoreOnError = { msg, images, textFiles };
-				hideInputForSend();
+				composerRef.current?.hideTextForSend();
 				hideAttachedFilesForSend();
 
 				const currentCwd =
@@ -6082,7 +5669,7 @@ export function NarratorPanel({
 					);
 				}
 
-				commitInputDraftAfterSend();
+				composerRef.current?.commitDraftAfterSend();
 				clearAttachedFilesAndDraft();
 				restoreOnError = null;
 				navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarrator.id } });
@@ -6126,10 +5713,10 @@ export function NarratorPanel({
 			// Remember the draft so a cancelled upload can restore it — submitMessage
 			// clears the input/attachments up-front for the optimistic bubble.
 			restoreOnError = { msg, images, textFiles };
-			hideInputForSend();
+			composerRef.current?.hideTextForSend();
 			hideAttachedFilesForSend();
 			await submitMessage(msg, images, textFiles, abortController.signal);
-			commitInputDraftAfterSend();
+			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
 			restoreOnError = null;
 		} catch (err) {
@@ -6137,7 +5724,7 @@ export function NarratorPanel({
 			// message. `doSendBuffered` already restores internally on its own throw;
 			// this covers the `/new` and idle direct-send paths.
 			if (restoreOnError) {
-				setInput(restoreOnError.msg);
+				composerRef.current?.setText(restoreOnError.msg);
 				if (restoreOnError.images.length > 0) updateAttachedImages(restoreOnError.images);
 				if (restoreOnError.textFiles.length > 0) updateAttachedTextFiles(restoreOnError.textFiles);
 			}
@@ -6178,21 +5765,26 @@ export function NarratorPanel({
 	 * bookkeeping stays consistent. The current draft is deliberately preserved:
 	 * the forwarded text is its own message, not an edit of what the user was
 	 * composing.
+	 *
+	 * ONE implementation shared by both hosts that offer forwarding: the dock
+	 * bridge (`registerSubmitToNarrator`) and the mobile Drawer host's
+	 * `onForwardToNarrator` prop. They must not diverge — a host that skipped the
+	 * save/restore ritual below would send the user's in-progress draft and staged
+	 * attachments out with the forwarded text, then commit an empty draft to the
+	 * server.
 	 */
-	useEffect(() => {
-		const register = dock?.registerSubmitToNarrator;
-		if (!register) return;
-		return register((text: string) => {
+	const forwardTextToNarrator = useCallback(
+		(text: string) => {
 			const trimmed = text.trim();
 			if (!trimmed) return;
 			void (async () => {
-				const preservedDraft = inputRef.current;
+				const preservedDraft = composerRef.current?.getText() ?? "";
 				const preservedImages = attachedImagesRef.current;
 				const preservedTextFiles = attachedTextFilesRef.current;
 				try {
 					// Forward-only send: no attachments, and the in-progress draft is put
 					// back afterwards so the operator does not lose what they were typing.
-					setInput(trimmed);
+					composerRef.current?.setText(trimmed);
 					updateAttachedImages([]);
 					updateAttachedTextFiles([]);
 					await doSendBufferedRef.current(trimmed, false);
@@ -6203,13 +5795,20 @@ export function NarratorPanel({
 						message: err instanceof Error ? err.message : "",
 					});
 				} finally {
-					setInput(preservedDraft);
+					composerRef.current?.setText(preservedDraft);
 					if (preservedImages.length > 0) updateAttachedImages(preservedImages);
 					if (preservedTextFiles.length > 0) updateAttachedTextFiles(preservedTextFiles);
 				}
 			})();
-		});
-	}, [dock, t, updateAttachedImages, updateAttachedTextFiles]);
+		},
+		[t, updateAttachedImages, updateAttachedTextFiles],
+	);
+
+	useEffect(() => {
+		const register = dock?.registerSubmitToNarrator;
+		if (!register) return;
+		return register(forwardTextToNarrator);
+	}, [dock, forwardTextToNarrator]);
 
 	// The active queue button mirrors the keyboard shortcuts: a short press uses
 	// Enter's mode, while a long press uses Ctrl/Cmd+Enter's mode.
@@ -6219,6 +5818,12 @@ export function NarratorPanel({
 	const queueClickSuppressedRef = useRef(false);
 	const handleSendWithModeRef = useRef(handleSendWithMode);
 	handleSendWithModeRef.current = handleSendWithMode;
+	// Stable entry points handed to <NarratorComposer>: it re-renders per
+	// keystroke, so every prop must be referentially stable to keep its own
+	// memoized children (popovers) from thrashing.
+	const composerSendWithMode = useCallback((mode: "turn" | "tool" | "interrupt") => {
+		void handleSendWithModeRef.current(mode);
+	}, []);
 	const ctrlEnterQueueModeRef = useRef(userPrefs?.ctrlEnterQueueMode ?? "tool");
 	ctrlEnterQueueModeRef.current = userPrefs?.ctrlEnterQueueMode ?? "tool";
 	const clearQueueHoldTimer = useCallback(() => {
@@ -6325,7 +5930,7 @@ export function NarratorPanel({
 		if (queuedMessages.length > 0) {
 			cancelBuffer(narratorId);
 			// Restore the first queued message text to the input
-			setInput(queuedMessages[0].text);
+			composerRef.current?.setText(queuedMessages[0].text);
 			setQueuedMessages([]);
 		}
 	};
@@ -6336,13 +5941,13 @@ export function NarratorPanel({
 		setQueuedMessages((prev) => prev.filter((m) => m.id !== messageId));
 		// If removing the only message, restore its text to input
 		if (queuedMessages.length === 1 && msg) {
-			setInput(msg.text);
+			composerRef.current?.setText(msg.text);
 		}
 		api.removeBufferedMessage(narratorId, messageId).catch(() => {
 			// Rollback on failure
 			setQueuedMessages(snapshot);
 			if (queuedMessages.length === 1 && msg) {
-				setInput("");
+				composerRef.current?.setText("");
 			}
 		});
 	};
@@ -6485,19 +6090,11 @@ export function NarratorPanel({
 		}
 	};
 
-	const handlePaste = (e: React.ClipboardEvent) => {
-		const items = e.clipboardData.items;
-		const imageFiles: File[] = [];
-		for (const item of items) {
-			if (item.type.startsWith("image/")) {
-				const file = item.getAsFile();
-				if (file) imageFiles.push(file);
-			}
-		}
-		if (imageFiles.length > 0) {
-			addImages(imageFiles);
-		}
-	};
+	// Stable paste bridge for <NarratorComposer> (it re-renders per keystroke, so
+	// every callback prop must hold its identity).
+	const addImagesRef = useRef(addImages);
+	addImagesRef.current = addImages;
+	const handleComposerPasteImages = useCallback((files: File[]) => addImagesRef.current(files), []);
 
 	const isFileDragEvent = (e: React.DragEvent) => e.dataTransfer.types.includes("Files");
 
@@ -6557,69 +6154,6 @@ export function NarratorPanel({
 		if (textFileList.length > 0) addTextFiles(textFileList);
 	};
 
-	const handleKeyDown = (e: React.KeyboardEvent) => {
-		// Let CommandPopover handle arrow/tab/escape keys when visible,
-		// but still allow Enter to reach our send handler (CommandPopover
-		// calls stopPropagation when it consumes Enter for selection).
-		if (commandPopoverVisible && e.key !== "Enter") return;
-		// Same for the @mention popover: it consumes arrow/tab/escape/enter via a
-		// capture-phase listener; guard here so navigation keys don't double-handle.
-		if (mentionPopoverVisible && e.key !== "Enter") return;
-
-		if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-			// Permission shortcut: when the composer holds nothing to send and a
-			// permission is pending, the global keydown handler (useEffect above)
-			// handles Enter. preventDefault here to stop the textarea from inserting
-			// a newline. `effectiveFocusIndex` already accounts for staged
-			// attachments, so an image-only draft falls through to the send below.
-			if (
-				effectiveFocusIndex != null &&
-				!hasSendableComposerContent(composerContent) &&
-				!e.shiftKey &&
-				!e.ctrlKey &&
-				!e.metaKey
-			) {
-				e.preventDefault();
-				return; // action handled by global handler
-			}
-
-			// Enter and Ctrl/Cmd+Enter each send with their own configured queue
-			// behavior. Shift+Enter is left to the browser for a native newline.
-			if (e.ctrlKey || e.metaKey) {
-				if (!e.shiftKey) {
-					e.preventDefault();
-					void handleSendWithMode(userPrefs?.ctrlEnterQueueMode ?? "tool");
-				}
-			} else if (!e.shiftKey) {
-				e.preventDefault();
-				void handleSendWithMode(userPrefs?.enterQueueMode ?? "turn");
-			}
-			return;
-		}
-		// 上下箭头翻阅输入历史
-		// 需要处理 soft-wrap（长文本自动折行）的情况：
-		// 先让浏览器执行默认的光标移动，如果光标位置没变说明已在首/末视觉行，
-		// 此时才触发历史导航。
-		if (e.key === "ArrowUp" || e.key === "ArrowDown") {
-			const textarea = e.currentTarget as HTMLTextAreaElement;
-			const posBefore = textarea.selectionStart;
-			const direction = e.key === "ArrowUp" ? "up" : "down";
-			// 让浏览器先处理默认行为，下一帧再检查光标是否移动
-			requestAnimationFrame(() => {
-				const posAfter = textarea.selectionStart;
-				if (posBefore !== posAfter) return; // 光标移动了，说明还在文本中间行
-				const result = inputHistory.navigate(direction, input);
-				if (result !== null) {
-					setInput(result);
-					// 将光标移到末尾
-					requestAnimationFrame(() => {
-						textarea.selectionStart = textarea.selectionEnd = textarea.value.length;
-					});
-				}
-			});
-		}
-	};
-
 	// Global keyboard shortcuts for permission actions.
 	// The textarea's onKeyDown only fires when the textarea has focus, but the user
 	// may be looking at the permission UI without focusing the main input.
@@ -6634,9 +6168,10 @@ export function NarratorPanel({
 				target &&
 				(target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
 			) {
-				// Allow only if it's our main textarea AND it's empty
-				if (target !== textareaRef.current) return;
-				if (input.trim()) return;
+				// Allow only if it's our main textarea AND it's empty. The composer
+				// owns the text now; both checks read its live state through the handle.
+				if (!composerRef.current?.ownsTextarea(target)) return;
+				if (!composerRef.current.isTextEmpty()) return;
 			}
 
 			if (
@@ -6666,7 +6201,187 @@ export function NarratorPanel({
 		};
 		window.addEventListener("keydown", handler);
 		return () => window.removeEventListener("keydown", handler);
-	}, [effectiveFocusIndex, permButtonCount, input]);
+	}, [effectiveFocusIndex, permButtonCount]);
+
+	/*
+	 * ── Header toolbar: entries, layout and activation ──
+	 *
+	 * The header used to hard-code ~13 buttons in JSX, several of them behind
+	 * `{dock && …}`. That is what left the mobile page with no entry point at all
+	 * for git / search / browser / discussion: off-dock those conditions are false,
+	 * so the controls were absent rather than collapsed, and nothing said so.
+	 *
+	 * Now the SET of entries comes from the registry, the ORDER from the user's
+	 * persisted layout, and only the HOSTING is decided here.
+	 *
+	 * Placed ABOVE the skeleton early-return below: these are hooks, so they must
+	 * run on every render regardless of whether the narrator has loaded.
+	 */
+	const headerHostCapabilities = useMemo<NarratorToolbarHost[]>(() => {
+		if (isWorkspacePreview) return ["inline"];
+		// A drawer host exists whenever this panel is not a lightweight preview: it
+		// either owns its own drawers (details / filemod / spec) or is handed one by
+		// the route (terminal), and MobileToolPanelHost covers the rest.
+		const caps: NarratorToolbarHost[] = ["inline", "drawer"];
+		if (dock) caps.push("dock");
+		return caps;
+	}, [dock, isWorkspacePreview]);
+
+	const toolbarBadgeCounts = useMemo<NarratorToolbarBadgeCounts>(
+		() => ({
+			backgroundTasks: tasksRunningCount,
+			browserSessions: wsState.browserSessionCount,
+			userChatUnread,
+			terminals: activeTerminalCount,
+		}),
+		[tasksRunningCount, wsState.browserSessionCount, userChatUnread, activeTerminalCount],
+	);
+
+	/**
+	 * Which entries this narrator can actually offer right now, beyond what the
+	 * host supports. Distinct from `hosts` in the registry: that answers "can this
+	 * surface present the panel at all", this answers "does this narrator have the
+	 * thing" (a chapter for git, spec support, a terminal route, remote devices).
+	 */
+	const toolbarEntryEnabled = useCallback(
+		(id: NarratorToolbarId): boolean => {
+			switch (id) {
+				case "tasks":
+					return tasksSupported && tasksButtonEnabled;
+				case "spec":
+					return specToolAvailable;
+				case "terminal":
+					// Same condition as `terminalActionAvailable` further down, inlined so
+					// this hook does not depend on a value defined after the early return.
+					return terminalToolAvailable || !!onOpenTerminalPanel;
+				case "git":
+					// The git panel needs a chapter; a standalone narrator has none.
+					return !!chapterId;
+				case "browser":
+					return browserSessionsCapability.supported !== false;
+				case "device":
+					// Only meaningful with at least one remote device — otherwise "local"
+					// is the only choice and the control is decoration.
+					return (executionDevicesQuery.data?.devices.length ?? 0) > 0;
+				case "plugins":
+					return !!dock;
+				default:
+					return true;
+			}
+		},
+		[
+			tasksSupported,
+			tasksButtonEnabled,
+			specToolAvailable,
+			terminalToolAvailable,
+			onOpenTerminalPanel,
+			chapterId,
+			browserSessionsCapability.supported,
+			executionDevicesQuery.data?.devices.length,
+			dock,
+		],
+	);
+
+	const {
+		entries: toolbarEntries,
+		visible: toolbarVisibleDefs,
+		saveLayout: saveToolbarLayout,
+	} = useNarratorToolbarLayout({
+		hostCapabilities: headerHostCapabilities,
+		// Mobile caps by count (a phone row cannot both show buttons and keep the
+		// title readable); desktop passes null, rendering every surfaced entry and
+		// letting the flex row absorb the width (the title compresses in a narrow
+		// dock — no width measurement is involved).
+		visibleLimit: isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null,
+		// Per-narrator availability is applied INSIDE the partition (before the cap),
+		// so a capped mobile row back-fills past disabled entries instead of showing
+		// fewer buttons than the cap allows.
+		entryEnabled: toolbarEntryEnabled,
+	});
+
+	/** Whether an entry's panel is currently open (drives the active styling). */
+	const toolbarEntryActive = useCallback(
+		(id: NarratorToolbarId): boolean => {
+			switch (id) {
+				case "tasks":
+					return dock ? dock.openToolTypes.has("tasks") : mobileTasksOpen;
+				case "filemod":
+					return fileModDrawerOpened;
+				case "details":
+					return detailsOpened;
+				case "terminal":
+					return terminalToolOpened;
+				case "spec":
+					return specToolOpened;
+				case "git":
+					return dock?.openToolTypes.has("git") ?? false;
+				case "search":
+					return dock ? dock.openToolTypes.has("search") : mobileToolPanel === "search";
+				case "browser":
+					return dock ? dock.openToolTypes.has("browser") : mobileToolPanel === "browser";
+				case "userchat":
+					return dock ? dock.openToolTypes.has("userchat") : mobileToolPanel === "userchat";
+				default:
+					return false;
+			}
+		},
+		[
+			dock,
+			mobileTasksOpen,
+			fileModDrawerOpened,
+			detailsOpened,
+			terminalToolOpened,
+			specToolOpened,
+			mobileToolPanel,
+		],
+	);
+
+	/**
+	 * Activate an entry, preferring the dock panel and falling back to a drawer.
+	 *
+	 * The fallback is the whole point: on mobile `dock` is null, so git / search /
+	 * browser / discussion route into `MobileToolPanelHost` instead of silently
+	 * doing nothing.
+	 */
+	const activateToolbarEntry = useCallback(
+		(id: string) => {
+			switch (id) {
+				case "tasks":
+					if (dock) dock.toggleToolPanel("tasks");
+					else setMobileTasksOpen((v) => !v);
+					return;
+				case "filemod":
+					setFileModDrawerOpened((v: boolean) => !v);
+					return;
+				case "details":
+					toggleDetails();
+					return;
+				case "terminal":
+					(onOpenTerminalPanel ?? toggleTerminalTool)();
+					return;
+				case "spec":
+					toggleSpecTool();
+					return;
+				case "git":
+				case "search":
+				case "browser":
+				case "userchat":
+					if (dock) dock.toggleToolPanel(id);
+					else setMobileToolPanel((current) => (current === id ? null : id));
+					return;
+				default:
+					return;
+			}
+		},
+		[
+			dock,
+			setFileModDrawerOpened,
+			toggleDetails,
+			onOpenTerminalPanel,
+			toggleTerminalTool,
+			toggleSpecTool,
+		],
+	);
 
 	if (!narrator) return <NarratorPanelSkeleton />;
 
@@ -7036,13 +6751,9 @@ export function NarratorPanel({
 		</Popover>
 	);
 
-	const terminalActionAvailable = terminalToolAvailable || !!onOpenTerminalPanel;
-	const terminalActionLabel = onOpenTerminalPanel
-		? tt("openTerminal")
-		: terminalToolOpened
-			? tt("closeTerminal")
-			: tt("openTerminal");
-	const effectiveTerminalAction = onOpenTerminalPanel ?? toggleTerminalTool;
+	// The terminal entry's availability, label and action now live with the header
+	// registry (`toolbarEntryEnabled` / `activateToolbarEntry`), which is also what
+	// supplies its off-dock fallback.
 	// This array is rebuilt every render (a hook is not an option below the
 	// skeleton early-return above). NarratorStatusToolbar derives its
 	// measurement identity from the action keys, not from array identity.
@@ -7145,64 +6856,19 @@ export function NarratorPanel({
 					},
 				] satisfies NarratorStatusToolbarAction[])
 			: []),
-		...(terminalActionAvailable
-			? ([
-					{
-						key: "terminal",
-						collapsePriority: 40,
-						// The Indicator paints outside the button but inside the toolbar's
-						// `overflow: visible` box, so it needs no vertical reserve either.
-						visualOverflow: { inlineEnd: 5 },
-						render: (mode: "inline" | "menu") =>
-							mode === "menu" ? (
-								<Menu.Item
-									key="terminal"
-									leftSection={<IconTerminal size={16} />}
-									rightSection={
-										activeTerminalCount > 0 ? (
-											<Badge size="xs">{activeTerminalCount}</Badge>
-										) : undefined
-									}
-									onClick={effectiveTerminalAction}
-								>
-									{terminalActionLabel}
-								</Menu.Item>
-							) : (
-								<Tooltip label={terminalActionLabel}>
-									{/*
-									 * A default (block) Indicator wraps the button in a line box sized by
-									 * the inherited line-height, which is taller than the 22px button and
-									 * silently stretches the whole status row. Pinning it to the button's
-									 * own height keeps the row height a function of the controls.
-									 */}
-									<Indicator
-										inline
-										label={activeTerminalCount}
-										size={14}
-										disabled={activeTerminalCount === 0}
-										offset={2}
-										color="blue"
-										style={{
-											height: "var(--ai-size-sm)",
-											display: "flex",
-											alignItems: "center",
-										}}
-									>
-										<ActionIcon
-											variant="subtle"
-											color={terminalToolOpened ? "blue" : "gray"}
-											size="sm"
-											aria-label={terminalActionLabel}
-											onClick={effectiveTerminalAction}
-										>
-											<IconTerminal size={16} />
-										</ActionIcon>
-									</Indicator>
-								</Tooltip>
-							),
-					},
-				] satisfies NarratorStatusToolbarAction[])
-			: []),
+		/*
+		 * The terminal entry deliberately does NOT appear here any more.
+		 *
+		 * It is a tool entry, so it belongs to the registry-driven header row
+		 * (`narrator-toolbar-items.tsx`) together with git / search / browser / the
+		 * rest. Keeping a copy here would put the same control in two places at once
+		 * on mobile — the header AND this status row — which is precisely the split
+		 * that made the old mobile layout confusing to navigate.
+		 *
+		 * What stays in this row is session CONFIGURATION (path rules, relaxed plan,
+		 * promote), which modifies the state shown beside it rather than opening a
+		 * panel.
+		 */
 	];
 	// Only inputs that change an action's own rendered width belong here. The
 	// leading controls (model, reasoning effort, fast mode, permission mode) are
@@ -7392,228 +7058,97 @@ export function NarratorPanel({
 							)}
 						</Group>
 						{!isWorkspacePreview && (
-							<Group gap="xs">
-								{(() => {
-									const deviceData = executionDevicesQuery.data;
-									// Only surface the selector when at least one remote device
-									// exists — otherwise "local" is the only option and the
-									// control would just waste toolbar space.
-									if (!deviceData || deviceData.devices.length === 0) return null;
-									const currentDeviceId = deviceData.defaultDeviceId ?? "local";
-									const currentDevice =
-										currentDeviceId === "local"
-											? null
-											: deviceData.devices.find((d) => d.id === currentDeviceId);
-									const isRemote = currentDeviceId !== "local";
-									const currentLabel = currentDevice
-										? currentDevice.name
-										: t("executionTargetLocal");
-									return (
-										<Menu position="bottom-end" withinPortal>
-											<Menu.Target>
-												<Tooltip label={`${t("executionDeviceSelector")}: ${currentLabel}`}>
-													<ActionIcon
-														size="sm"
-														variant={isRemote ? "light" : "subtle"}
-														color={isRemote ? "indigo" : "gray"}
-														loading={updateExecutionDeviceMutation.isPending}
-														aria-label={t("executionDeviceSelector")}
-													>
-														{isRemote ? <IconDevices size={16} /> : <IconDeviceDesktop size={16} />}
-													</ActionIcon>
-												</Tooltip>
-											</Menu.Target>
-											<Menu.Dropdown>
-												<Menu.Label>{t("executionDeviceSelector")}</Menu.Label>
-												<Menu.Item
-													leftSection={<IconDeviceDesktop size={14} />}
-													rightSection={
-														<IconCheck
-															size={14}
-															style={{
-																visibility: currentDeviceId === "local" ? "visible" : "hidden",
-															}}
-														/>
-													}
-													onClick={() => updateExecutionDeviceMutation.mutate(null)}
-												>
-													{t("executionTargetLocal")}
-												</Menu.Item>
-												{deviceData.devices.map((device) => (
-													<Menu.Item
-														key={device.id}
-														leftSection={<IconDevices size={14} />}
-														disabled={!device.online}
-														rightSection={
-															<IconCheck
-																size={14}
-																style={{
-																	visibility: currentDeviceId === device.id ? "visible" : "hidden",
-																}}
-															/>
-														}
-														onClick={() => updateExecutionDeviceMutation.mutate(device.id)}
-													>
-														{device.online
-															? device.name
-															: `${device.name} (${t("executionDeviceOffline")})`}
-													</Menu.Item>
-												))}
-											</Menu.Dropdown>
-										</Menu>
+							<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
+								{/*
+								 * Registry-driven tool entries. The SET comes from the registry, the
+								 * ORDER from the user's saved layout, and how many are surfaced from
+								 * the host (mobile caps by count; desktop renders every surfaced
+								 * entry and lets the title compress before the row). Entries the
+								 * host cannot present are absent from both lists rather than rendered
+								 * disabled — but they stay in the layout, so they return on a surface
+								 * that supports them.
+								 */}
+								{toolbarVisibleDefs.map((def) => {
+									const Icon = def.icon;
+									const badge = resolveNarratorToolbarBadge(def.badge, toolbarBadgeCounts);
+									const active = toolbarEntryActive(def.id);
+									const label = t(def.labelKey, { ns: def.namespace ?? "narrator" });
+
+									// The device entry opens a list of targets rather than toggling a
+									// panel, so it renders its own Menu instead of a toggle button.
+									if (def.id === "device") {
+										return (
+											<ExecutionDeviceMenu
+												key={def.id}
+												label={t("executionDeviceSelector")}
+												localLabel={t("executionTargetLocal")}
+												offlineLabel={t("executionDeviceOffline")}
+												devices={executionDevicesQuery.data?.devices ?? []}
+												currentDeviceId={executionDevicesQuery.data?.defaultDeviceId ?? "local"}
+												pending={updateExecutionDeviceMutation.isPending}
+												onSelect={(deviceId) => updateExecutionDeviceMutation.mutate(deviceId)}
+											/>
+										);
+									}
+
+									if (def.id === "plugins") {
+										return (
+											<PluginContributionPicker
+												key={def.id}
+												onPick={openPluginPanel}
+												trigger={
+													<Tooltip label={label}>
+														<ActionIcon size="sm" variant="subtle" color="gray" aria-label={label}>
+															<Icon size={16} />
+														</ActionIcon>
+													</Tooltip>
+												}
+											/>
+										);
+									}
+
+									const button = (
+										<ActionIcon
+											size="sm"
+											variant={active ? "light" : "subtle"}
+											color={active ? "indigo" : "gray"}
+											aria-label={label}
+											onClick={() => activateToolbarEntry(def.id)}
+										>
+											<Icon size={16} />
+										</ActionIcon>
 									);
-								})()}
-								{dock ? (
-									tasksSupported && (
-										<Tooltip label={t("backgroundTasks.title")}>
-											<Indicator
-												inline
-												size={8}
-												color="blue"
-												processing
-												disabled={tasksRunningCount === 0}
-												offset={3}
-												zIndex={1}
-												style={{
-													height: "var(--ai-size-sm)",
-													display: "flex",
-													alignItems: "center",
-												}}
-											>
-												<ActionIcon
-													size="sm"
-													variant={tasksToolOpened ? "light" : "subtle"}
-													color={tasksToolOpened ? "indigo" : "gray"}
-													onClick={toggleTasksTool}
+
+									return (
+										<Tooltip key={def.id} label={label}>
+											{badge.count > 0 ? (
+												<Indicator
+													inline
+													// Running work reads as a state, not a quantity, so it pulses
+													// instead of printing a number (matches the old tasks button).
+													size={badge.processing ? 8 : 14}
+													offset={badge.processing ? 3 : 4}
+													label={badge.processing ? undefined : badge.label}
+													processing={badge.processing}
+													color={badge.processing ? "blue" : "teal"}
+													zIndex={1}
+													style={{
+														height: "var(--ai-size-sm)",
+														display: "flex",
+														alignItems: "center",
+													}}
 												>
-													<IconRobot size={16} />
-												</ActionIcon>
-											</Indicator>
+													{button}
+												</Indicator>
+											) : (
+												button
+											)}
 										</Tooltip>
-									)
-								) : (
-									<BackgroundTasksDrawer narratorId={narratorId} />
-								)}
-								<Tooltip label={t("fileMod_title")}>
-									<ActionIcon
-										size="sm"
-										variant={fileModDrawerOpened ? "light" : "subtle"}
-										color={fileModDrawerOpened ? "indigo" : "gray"}
-										onClick={() => setFileModDrawerOpened((v) => !v)}
-									>
-										<IconFileCode size={16} />
-									</ActionIcon>
-								</Tooltip>
-								<Tooltip label={t("details.title")}>
-									<ActionIcon
-										size="sm"
-										variant={detailsOpened ? "light" : "subtle"}
-										color={detailsOpened ? "indigo" : "gray"}
-										onClick={toggleDetails}
-									>
-										<IconInfoCircle size={16} />
-									</ActionIcon>
-								</Tooltip>
-								{specToolAvailable && (
-									<Tooltip
-										label={
-											specToolOpened
-												? t("spec.close", "Close Outline")
-												: t("spec.open", "Open Outline")
-										}
-									>
-										<ActionIcon
-											size="sm"
-											variant={specToolOpened ? "light" : "subtle"}
-											color={specToolOpened ? "indigo" : "gray"}
-											onClick={toggleSpecTool}
-										>
-											<IconNotebook size={16} />
-										</ActionIcon>
-									</Tooltip>
-								)}
-								{dock && (
-									<Tooltip label={t("git.title", "Git")}>
-										<ActionIcon
-											size="sm"
-											variant={dock.openToolTypes.has("git") ? "light" : "subtle"}
-											color={dock.openToolTypes.has("git") ? "indigo" : "gray"}
-											onClick={() => dock.toggleToolPanel("git")}
-										>
-											<IconGitBranch size={16} />
-										</ActionIcon>
-									</Tooltip>
-								)}
-								{dock && (
-									<Tooltip
-										label={dock.openToolTypes.has("search") ? t("search.close") : t("search.open")}
-									>
-										<ActionIcon
-											size="sm"
-											variant={dock.openToolTypes.has("search") ? "light" : "subtle"}
-											color={dock.openToolTypes.has("search") ? "indigo" : "gray"}
-											onClick={() => dock.toggleToolPanel("search")}
-										>
-											<IconSearch size={16} />
-										</ActionIcon>
-									</Tooltip>
-								)}
-								{dock && browserSessionsCapability.supported !== false && (
-									<Tooltip label={t("browser.title")}>
-										<Indicator
-											size={14}
-											offset={4}
-											label={wsState.browserSessionCount}
-											color="teal"
-											disabled={wsState.browserSessionCount === 0}
-											style={{ display: "flex", alignItems: "center" }}
-										>
-											<ActionIcon
-												size="sm"
-												variant={dock.openToolTypes.has("browser") ? "light" : "subtle"}
-												color={dock.openToolTypes.has("browser") ? "indigo" : "gray"}
-												onClick={() => dock.toggleToolPanel("browser")}
-											>
-												<IconWorldWww size={16} />
-											</ActionIcon>
-										</Indicator>
-									</Tooltip>
-								)}
-								{dock && (
-									<Tooltip label={tChat("panelTitle")}>
-										<Indicator
-											size={14}
-											offset={4}
-											label={userChatUnread > 99 ? "99+" : userChatUnread}
-											color="blue"
-											disabled={userChatUnread === 0}
-											style={{ display: "flex", alignItems: "center" }}
-										>
-											<ActionIcon
-												size="sm"
-												variant={dock.openToolTypes.has("userchat") ? "light" : "subtle"}
-												color={dock.openToolTypes.has("userchat") ? "indigo" : "gray"}
-												onClick={() => dock.toggleToolPanel("userchat")}
-											>
-												<IconMessages size={16} />
-											</ActionIcon>
-										</Indicator>
-									</Tooltip>
-								)}
-								{dock && (
-									<PluginContributionPicker
-										onPick={openPluginPanel}
-										trigger={
-											<Tooltip label={t("addPluginPanel")}>
-												<ActionIcon size="sm" variant="subtle" color="gray">
-													<IconPuzzle size={16} />
-												</ActionIcon>
-											</Tooltip>
-										}
-									/>
-								)}
+									);
+								})}
 								{/* TEMPORARY mock-stream harness entry — see ./mock/README-REMOVAL.md.
-								    Label is hard-coded (not i18n) like the rest of that debug surface. */}
+								    Deliberately NOT in the registry: it is debug-only and due for
+								    removal, so it must not occupy a persisted layout id. */}
 								{dock && mockStreamEnabled && (
 									<Tooltip label="Mock stream (debug)">
 										<ActionIcon
@@ -7626,19 +7161,21 @@ export function NarratorPanel({
 										</ActionIcon>
 									</Tooltip>
 								)}
-								<Tooltip label={t("archiveNarrator")}>
-									<ActionIcon
-										size="sm"
-										variant="subtle"
-										color="orange"
-										loading={archiveMutation.isPending}
-										onClick={() => {
-											openArchiveConfirm();
-										}}
-									>
-										<IconArchive size={16} />
-									</ActionIcon>
-								</Tooltip>
+								{/*
+								 * Overflow menu: lists the tucked entries, carries the aggregate badge
+								 * so a tucked unread count is not lost, and owns the reorder UI.
+								 * Archive lives at its bottom — a destructive action must not sit one
+								 * mis-tap away from the panel toggles.
+								 */}
+								<NarratorToolbarOverflowMenu
+									entries={toolbarEntries}
+									onSaveLayout={saveToolbarLayout}
+									hostCapabilities={headerHostCapabilities}
+									badgeCounts={toolbarBadgeCounts}
+									onActivate={activateToolbarEntry}
+									onArchive={openArchiveConfirm}
+									archiveLoading={archiveMutation.isPending}
+								/>
 								{onClose && (
 									<Tooltip label={t("closePanel")}>
 										<ActionIcon size="sm" variant="subtle" color="red" onClick={onClose}>
@@ -8081,26 +7618,7 @@ export function NarratorPanel({
 																onUnreadCountChange={setUnreadCount}
 																onTailMetaChange={handleChunkTailMetaChange}
 																onLodStep={handleLodStep}
-																tailFooter={
-																	isSubagent &&
-																	narrator &&
-																	narrator.status === "idle" &&
-																	!isTakenOver &&
-																	substatus.includes("manual_override") &&
-																	!isActive ? (
-																		<Box ta="center" py="sm">
-																			<Button
-																				size="compact-sm"
-																				variant="light"
-																				color="indigo"
-																				onClick={() => updateConclusionMutation.mutate(narratorId)}
-																				loading={updateConclusionMutation.isPending}
-																			>
-																				{t("updateConclusion")}
-																			</Button>
-																		</Box>
-																	) : null
-																}
+																tailFooter={chunkListTailFooter}
 															/>
 														)}
 													</RenderLodCtx.Provider>
@@ -8512,8 +8030,21 @@ export function NarratorPanel({
 						</Stack>
 					)}
 
-					{/* Chapter bar */}
-					{narrator.chapterId && <ChapterBar chapterId={narrator.chapterId} />}
+					{/* Chapter bar — clicking the info strip opens the Git view; off-dock
+					    (mobile) the same gesture routes into the MobileToolPanelHost drawer
+					    instead of the dock panel. */}
+					{narrator.chapterId && (
+						<ChapterBar
+							chapterId={narrator.chapterId}
+							onOpenGitPanel={
+								isWorkspacePreview
+									? undefined
+									: dock
+										? () => dock.openToolPanel("git")
+										: () => setMobileToolPanel("git")
+							}
+						/>
+					)}
 
 					{/* Status bar */}
 					<NarratorStatusBar
@@ -8999,7 +8530,13 @@ export function NarratorPanel({
 															variant="subtle"
 															color={terminalToolOpened ? "blue" : "gray"}
 															size="sm"
-															aria-label={terminalActionLabel}
+															aria-label={
+																onOpenTerminalPanel
+																	? tt("openTerminal")
+																	: terminalToolOpened
+																		? tt("closeTerminal")
+																		: tt("openTerminal")
+															}
 															onClick={onOpenTerminalPanel ?? toggleTerminalTool}
 														>
 															<IconTerminal size={16} />
@@ -9302,82 +8839,22 @@ export function NarratorPanel({
 										<IconPaperclip size={18} />
 									</ActionIcon>
 								</Tooltip>
-								<Box style={{ position: "relative", flex: 1 }}>
-									<CommandPopover
-										commands={commandsList ?? []}
-										input={input}
-										visible={commandPopoverVisible}
-										onSelect={handleCommandSelect}
-										onClose={closeCommandPopover}
-									/>
-									<MentionPopover
-										candidates={mentionCandidates}
-										query={mentionQuery}
-										visible={mentionPopoverVisible}
-										onSelect={handleMentionSelect}
-										onClose={closeMentionPopover}
-									/>
-									{matchedCommand && (
-										<CommandParamHelper
-											command={matchedCommand}
-											input={input}
-											visible={!commandPopoverVisible}
-										/>
-									)}
-									{draftSyncState === "error" && (
-										<Group gap="xs" mb={4} wrap="nowrap">
-											<Text size="xs" c="orange" style={{ flex: 1 }}>
-												{t("draftLoadFailed")}
-											</Text>
-											<Button size="compact-xs" variant="light" onClick={retryDraftHydration}>
-												{t("draftRetry")}
-											</Button>
-										</Group>
-									)}
-									{draftSyncState === "conflict" && (
-										<Stack gap={4} mb={4}>
-											<Text size="xs" c="orange">
-												{t("draftConflict")}
-											</Text>
-											<Group gap="xs">
-												<Button size="compact-xs" variant="light" onClick={acceptServerDraft}>
-													{t("draftUseServer")}
-												</Button>
-												<Button size="compact-xs" color="orange" onClick={overwriteServerDraft}>
-													{t("draftUseLocal")}
-												</Button>
-											</Group>
-										</Stack>
-									)}
-									{!isDraftWithinSyncLimit(input) && (
-										<Text size="xs" c="orange" mb={4}>
-											{t("draftTooLong", {
-												limit: formatLocaleNumber(MAX_NARRATOR_DRAFT_CHARS),
-											})}
-										</Text>
-									)}
-									<Textarea
-										ref={textareaRef}
-										placeholder={t("sendPlaceholder")}
-										value={input}
-										onChange={(e) => {
-											setInput(e.currentTarget.value);
-											setMentionCaret(e.currentTarget.selectionStart);
-											inputHistory.reset();
-										}}
-										onKeyDown={handleKeyDown}
-										onKeyUp={(e) => setMentionCaret(e.currentTarget.selectionStart)}
-										onClick={(e) => setMentionCaret(e.currentTarget.selectionStart)}
-										onBlur={() => setMentionCaret(null)}
-										onPaste={handlePaste}
-										autosize
-										minRows={1}
-										maxRows={6}
-									/>
-								</Box>
+								<NarratorComposer
+									ref={composerRef}
+									narratorId={narratorId}
+									sendingRef={sendingRef}
+									appendInputRef={appendInputRef}
+									permEnterActive={effectiveFocusIndex != null}
+									hasAttachments={composerHasAttachments}
+									enterMode={userPrefs?.enterQueueMode ?? "turn"}
+									ctrlEnterMode={userPrefs?.ctrlEnterQueueMode ?? "tool"}
+									onSendWithMode={composerSendWithMode}
+									onTextFlagsChange={setComposerHasText}
+									onPasteImages={handleComposerPasteImages}
+								/>
 								{(() => {
-									const hasInput = hasComposerText(composerContent);
-									const hasAttachments = hasComposerAttachments(composerContent);
+									const hasInput = composerHasText;
+									const hasAttachments = composerHasAttachments;
 
 									// Takeover button: shown while a subagent is running and not yet
 									// taken over. Clicking it interrupts the current turn and hands
@@ -9706,6 +9183,42 @@ export function NarratorPanel({
 								<FileViewerContent key={internalFileViewerPath} filePath={internalFileViewerPath} />
 							</Suspense>
 						</Drawer>
+					)}
+					{/*
+					 * Off-dock hosts for the entries that previously had NO mobile entry
+					 * point. Mounted only when this panel has no dock to put panels in, so
+					 * a desktop surface keeps using real dockview tabs.
+					 */}
+					{!dock && !isWorkspacePreview && (
+						<>
+							<MobileToolPanelHost
+								kind={mobileToolPanel}
+								onClose={() => setMobileToolPanel(null)}
+								narratorId={narratorId}
+								chapterId={chapterId}
+								browserSessionCount={wsState.browserSessionCount}
+								browserVisualChange={wsState.browserVisualChange}
+								// Replaces the dock's `scrollToMessage` / `submitToNarrator` bridges,
+								// which do not exist off-dock. Without these the mobile search panel
+								// would list results it cannot open, and the discussion room could not
+								// forward anything to the narrator. Forwarding goes through the SAME
+								// `forwardTextToNarrator` the dock bridge registers, so the mobile
+								// path preserves the in-progress draft and staged attachments too.
+								onJumpToMessage={(messageId) => {
+									void scrollToMessageTarget({
+										domIds: [`msg-${messageId}`],
+										targetIds: [messageId],
+										highlightId: messageId,
+									});
+								}}
+								onForwardToNarrator={forwardTextToNarrator}
+							/>
+							<BackgroundTasksDrawerHost
+								narratorId={narratorId}
+								opened={mobileTasksOpen}
+								onClose={() => setMobileTasksOpen(false)}
+							/>
+						</>
 					)}
 				</Stack>
 			</ContentViewerEnvironmentProvider>

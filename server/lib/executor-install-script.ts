@@ -736,6 +736,8 @@ function buildWindowsScript(input: ResolvedInput): string {
 		"[System.IO.File]::WriteAllText($tokenFile, $plainToken, (New-Object System.Text.UTF8Encoding($false)))",
 		"$plainToken = $null",
 		"",
+		// SYSTEM is included for a machine-wide install because the service runs as
+		// LocalSystem; without it the service starts but cannot read its own key file.
 		"# Restrict the key to this account (and SYSTEM for a service) only.",
 		"$acl = Get-Acl -LiteralPath $tokenFile",
 		"$acl.SetAccessRuleProtection($true, $false)",
@@ -761,25 +763,66 @@ function buildWindowsScript(input: ResolvedInput): string {
 		"$config | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $configFile -Encoding utf8",
 		'Write-Host "Config written to $configFile"',
 		"",
+		/*
+		 * system mode installs a real Windows service; user mode uses a scheduled task.
+		 *
+		 * The service path requires the executor to implement the service control
+		 * dispatcher, which it does since v0.5.25 (`cmd/narrafork-executor/
+		 * service_windows.go`): it detects an SCM launch with `svc.IsWindowsService()`
+		 * and reports SERVICE_RUNNING once serving begins. Before that support existed,
+		 * `New-Service` produced a service the SCM killed at startup with error 1053.
+		 *
+		 * That history is why the service is STARTED here rather than merely registered:
+		 * if the installed binary cannot actually run as a service, the install must fail
+		 * loudly at install time instead of leaving a service that fails at every boot.
+		 *
+		 * user mode stays a scheduled task on purpose — registering a service needs
+		 * administrator rights, which is exactly what a user-level install avoids.
+		 */
 		...(system
 			? [
+					"# Machine-wide install: a Windows service, started under SYSTEM.",
 					`$existing = Get-Service -Name ${q(serviceName)} -ErrorAction SilentlyContinue`,
 					"if ($existing) {",
 					`  Stop-Service -Name ${q(serviceName)} -Force -ErrorAction SilentlyContinue`,
 					`  sc.exe delete ${serviceName} | Out-Null`,
 					"  Start-Sleep -Seconds 2",
 					"}",
+					// An interim installer version registered a scheduled task for system mode.
+					// Left behind it would run a second executor against the same device.
+					`$staleTask = Get-ScheduledTask -TaskName ${q(serviceName)} -ErrorAction SilentlyContinue`,
+					"if ($staleTask) {",
+					"  Write-Host 'Removing the scheduled task from a previous install…'",
+					`  Stop-ScheduledTask -TaskName ${q(serviceName)} -ErrorAction SilentlyContinue`,
+					`  Unregister-ScheduledTask -TaskName ${q(serviceName)} -Confirm:$false -ErrorAction SilentlyContinue`,
+					"}",
 					"$binPath = '\"' + $binary + '\" --config \"' + $configFile + '\" --token-file \"' + $tokenFile + '\"'",
 					`New-Service -Name ${q(serviceName)} -BinaryPathName $binPath -DisplayName 'NarraFork Remote Executor' -StartupType Automatic | Out-Null`,
+					// Restart on failure, matching Restart=always in the systemd unit. Without
+					// this the SCM gives up after the first crash and the device silently stays
+					// offline until someone notices.
+					`sc.exe failure ${serviceName} reset= 86400 actions= restart/5000/restart/5000/restart/60000 | Out-Null`,
+					`sc.exe description ${serviceName} "Runs NarraFork file, search and command operations on this machine." | Out-Null`,
+					// The service logs to the Application event log under this source
+					// (`service_windows.go`). Registering the source makes Event Viewer render
+					// the entries properly instead of "description for Event ID ... cannot be
+					// found"; RegisterEventSource itself works unregistered, so this is cosmetic
+					// — but an unexplainable log is what a failed service start becomes.
+					// Idempotent: re-runs skip the registration when the source already exists.
+					"if (-not [System.Diagnostics.EventLog]::SourceExists('NarraForkExecutor')) {",
+					"  New-EventLog -LogName Application -Source 'NarraForkExecutor'",
+					"}",
 					`Start-Service -Name ${q(serviceName)}`,
 					`Get-Service -Name ${q(serviceName)} | Format-List Name, Status, StartType`,
 				]
 			: [
-					"# User-level install: run at logon via a scheduled task (no service rights needed).",
+					"# User-level install: run at logon via a scheduled task (no admin rights needed).",
 					"$action = New-ScheduledTaskAction -Execute $binary -Argument (",
 					"  '--config \"' + $configFile + '\" --token-file \"' + $tokenFile + '\"')",
 					"$trigger = New-ScheduledTaskTrigger -AtLogOn",
-					"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)",
+					// Without an unlimited ExecutionTimeLimit a task is killed after 3 days by
+					// default, which would look like a random disconnect long after install.
+					"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)",
 					`Register-ScheduledTask -TaskName ${q(serviceName)} -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null`,
 					`Start-ScheduledTask -TaskName ${q(serviceName)}`,
 					`Get-ScheduledTask -TaskName ${q(serviceName)} | Format-List TaskName, State`,

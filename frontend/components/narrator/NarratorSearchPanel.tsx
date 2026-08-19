@@ -41,9 +41,19 @@ function roleColor(role: string): string {
 
 export interface NarratorSearchPanelProps {
 	narratorId: string;
+	/**
+	 * Jump handler supplied by a host that has no dock context — the mobile
+	 * Drawer host passes the chat panel's own scroll function here.
+	 *
+	 * Takes precedence over the dock bridge: a host that provides this knows how
+	 * to reach its conversation, whereas the bridge is only present on dock
+	 * surfaces. Without it, mobile search would list results and refuse to open
+	 * any of them, which is the least useful half of a search panel.
+	 */
+	onJumpToMessage?: (messageId: string) => void;
 }
 
-export function NarratorSearchPanel({ narratorId }: NarratorSearchPanelProps) {
+export function NarratorSearchPanel({ narratorId, onJumpToMessage }: NarratorSearchPanelProps) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	const [query, setQuery] = useState("");
@@ -60,7 +70,7 @@ export function NarratorSearchPanel({ narratorId }: NarratorSearchPanelProps) {
 	 * collapsed — so the bridge is missing rather than inert, and the result rows
 	 * below go non-interactive instead of swallowing clicks.
 	 */
-	const scrollToMessage = dock?.scrollToMessage;
+	const scrollToMessage = onJumpToMessage ?? dock?.scrollToMessage;
 	const canJump = !!scrollToMessage;
 	const handleJump = useCallback(
 		(messageId: string) => {

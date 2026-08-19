@@ -323,17 +323,89 @@ describe("install locations and service wiring", () => {
 		expect(agent).toContain("LaunchAgents");
 	});
 
-	test("windows system mode requires elevation, user mode uses a scheduled task", () => {
-		const service = buildExecutorInstallScript(
+	test("windows system mode installs a real service, requiring elevation", () => {
+		/*
+		 * A registered service only works because the executor implements the Windows
+		 * service control dispatcher (`cmd/narrafork-executor/service_windows.go`). When
+		 * it did not, `New-Service` produced a service the SCM killed at startup with
+		 * error 1053 — after an otherwise fully successful install.
+		 *
+		 * So this assertion is really about a cross-language contract: if that Go file
+		 * is ever removed or its SCM detection stops working, this install path breaks
+		 * again, and the symptom looks like a permissions problem rather than a missing
+		 * dispatcher.
+		 */
+		const script = buildExecutorInstallScript(
 			input({ platform: "windows-amd64", mode: "system" }),
 		).script;
-		expect(service).toContain("WindowsBuiltInRole]::Administrator");
-		expect(service).toContain("New-Service");
-		const task = buildExecutorInstallScript(
+		expect(script).toContain("WindowsBuiltInRole]::Administrator");
+		expect(script).toContain("New-Service");
+		// Started, not just registered: a binary that cannot run as a service must fail
+		// the install rather than fail silently at every boot.
+		expect(script).toContain("Start-Service");
+		expect(script).not.toContain("Register-ScheduledTask");
+	});
+
+	test("windows system mode restarts the service after a failure", () => {
+		// The systemd unit has Restart=always. Without the SCM equivalent, the first
+		// crash leaves the device offline until a human notices.
+		const script = buildExecutorInstallScript(
+			input({ platform: "windows-amd64", mode: "system" }),
+		).script;
+		expect(script).toContain("sc.exe failure NarraForkExecutor");
+		expect(script).toContain("actions= restart/5000/restart/5000/restart/60000");
+	});
+
+	test("windows system mode registers the service's event log source", () => {
+		// The service writes to the Application log under source `NarraForkExecutor`
+		// (`cmd/narrafork-executor/service_windows.go`). Unregistered sources still
+		// record events, but Event Viewer renders them as "description cannot be
+		// found" — which is exactly what someone debugging a failed start does not
+		// need. The guard keeps the registration idempotent across re-installs.
+		const script = buildExecutorInstallScript(
+			input({ platform: "windows-amd64", mode: "system" }),
+		).script;
+		expect(script).toContain("SourceExists('NarraForkExecutor')");
+		expect(script).toContain("New-EventLog -LogName Application -Source 'NarraForkExecutor'");
+		// A user-level install has no service and must not try to register one (it
+		// lacks the admin rights New-EventLog needs).
+		const userScript = buildExecutorInstallScript(
 			input({ platform: "windows-amd64", mode: "user" }),
 		).script;
-		expect(task).toContain("Register-ScheduledTask");
-		expect(task).not.toContain("New-Service");
+		expect(userScript).not.toContain("New-EventLog");
+	});
+
+	test("windows system mode clears both kinds of previous install", () => {
+		// Two histories to clean: an older service registration, and the scheduled task
+		// an interim installer version used. A leftover task would run a SECOND executor
+		// against the same device.
+		const script = buildExecutorInstallScript(
+			input({ platform: "windows-amd64", mode: "system" }),
+		).script;
+		expect(script).toContain("sc.exe delete NarraForkExecutor");
+		expect(script).toContain("Unregister-ScheduledTask");
+	});
+
+	test("windows user mode uses a scheduled task and needs no admin rights", () => {
+		// Registering a service requires administrator rights, which is precisely what a
+		// user-level install exists to avoid.
+		const script = buildExecutorInstallScript(
+			input({ platform: "windows-amd64", mode: "user" }),
+		).script;
+		expect(script).toContain("Register-ScheduledTask");
+		expect(script).toContain("New-ScheduledTaskTrigger -AtLogOn");
+		expect(script).not.toContain("New-Service");
+		expect(script).not.toContain("WindowsBuiltInRole]::Administrator");
+	});
+
+	test("windows user mode tasks restart and never time out", () => {
+		const script = buildExecutorInstallScript(
+			input({ platform: "windows-amd64", mode: "user" }),
+		).script;
+		expect(script).toContain("-RestartCount 999");
+		// The 3-day default execution limit would surface as a random disconnect long
+		// after installation, with nothing pointing back to the installer.
+		expect(script).toContain("-ExecutionTimeLimit ([TimeSpan]::Zero)");
 	});
 
 	test("filenames and shells match the platform", () => {

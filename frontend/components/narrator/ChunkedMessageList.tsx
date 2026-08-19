@@ -2240,12 +2240,16 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 				: 0;
 		const userMessageMarkers = useMemo(() => {
 			if (totalSeqCount <= 0) return [];
-			const markers: { index: number; id: string }[] = [];
+			const markers: { index: number; id: string; createdAt: string | null }[] = [];
 			for (const chunk of chunks) {
 				for (const msg of chunk.messages ?? []) {
 					const seq = getMessageSeq(msg);
 					if (msg.role === "user" && msg.id && seq != null) {
-						markers.push({ index: seq - firstManifestSeq, id: msg.id });
+						markers.push({
+							index: seq - firstManifestSeq,
+							id: msg.id,
+							createdAt: msg.createdAt ?? null,
+						});
 					}
 				}
 			}

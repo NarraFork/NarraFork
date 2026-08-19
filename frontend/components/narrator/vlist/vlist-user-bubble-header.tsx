@@ -22,7 +22,7 @@ import {
 	resolveUserBubbleName,
 } from "@frontend/components/narrator/MessageOriginBadge";
 import { UserAvatar } from "@frontend/components/UserAvatar";
-import { formatLocaleDateTime, formatLocaleTime } from "@frontend/lib/intl-format";
+import { formatShortMessageTime } from "@frontend/lib/intl-format";
 import { Group, Text } from "@mantine/core";
 import { parseOriginLabel } from "@shared/message-origin";
 import { useTranslation } from "react-i18next";
@@ -39,21 +39,7 @@ export interface BubbleCreator {
 
 /** Format a message timestamp like MessageBubble: today → HH:mm, else MM/DD HH:mm. */
 export function formatBubbleTime(createdAt: string): string {
-	const d = new Date(createdAt);
-	if (Number.isNaN(d.getTime())) return "";
-	const now = new Date();
-	const isToday =
-		d.getFullYear() === now.getFullYear() &&
-		d.getMonth() === now.getMonth() &&
-		d.getDate() === now.getDate();
-	return isToday
-		? formatLocaleTime(d, { hour: "2-digit", minute: "2-digit" })
-		: formatLocaleDateTime(d, {
-				month: "2-digit",
-				day: "2-digit",
-				hour: "2-digit",
-				minute: "2-digit",
-			});
+	return formatShortMessageTime(createdAt);
 }
 
 /**

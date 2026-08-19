@@ -1191,6 +1191,12 @@
 			"execution": "Execution {{duration}}"
 		}
 	},
+	"toolbar": {
+		"more": "More tools",
+		"sectionVisible": "Shown in header",
+		"sectionTucked": "In this menu",
+		"headerOnly": "Header only"
+	},
 	"spec": {
 		"title": "Outline",
 		"open": "Open Outline",

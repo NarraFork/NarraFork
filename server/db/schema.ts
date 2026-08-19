@@ -1662,6 +1662,12 @@ export const userPreferences = sqliteTable("user_preferences", {
 	addSubagentToRecentTabs: integer("add_subagent_to_recent_tabs", { mode: "boolean" })
 		.notNull()
 		.default(true),
+	// How the sidebar renders the recent-tab work section. "flat" is the historical
+	// behaviour (one row per tab, manually sortable); "directory" merges narrators
+	// that share a working directory into collapsible groups so the path is shown once.
+	recentTabsGroupMode: text("recent_tabs_group_mode", { enum: ["flat", "directory"] })
+		.notNull()
+		.default("flat"),
 	// Notification preferences
 	notifyOnDone: integer("notify_on_done", { mode: "boolean" }).notNull().default(true),
 	notifyOnWaiting: integer("notify_on_waiting", { mode: "boolean" }).notNull().default(true),
@@ -1714,6 +1720,11 @@ export const userPreferences = sqliteTable("user_preferences", {
 	// Sidebar navigation layout (JSON: { items: [{ id, hidden }] } — order = display order,
 	// hidden:true items live in the "More" overflow menu)
 	navLayout: text("nav_layout").notNull().default("{}"),
+	// Narrator header toolbar layout (JSON: { items: [{ id }] } — a flat ordered list where
+	// "__divider__" marks the boundary: ids before it may be surfaced in the header, ids after
+	// it always live in the overflow menu). Order is the user's priority and is shared across
+	// desktop and mobile; how many actually fit is decided per host at render time.
+	narratorToolbarLayout: text("narrator_toolbar_layout").notNull().default("{}"),
 	/**
 	 * User layer of the layered trait system — the lowest-priority layer, applied
 	 * to every narrator the user acts on. Same encoding as `narrators.traits`.

@@ -18,11 +18,11 @@ import {
 	Group,
 	Indicator,
 	Loader,
+	Menu,
 	Modal,
 	NavLink,
 	Switch,
 	Text,
-	TextInput,
 	Title,
 	Tooltip,
 	useComputedColorScheme,
@@ -30,18 +30,19 @@ import {
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { isSessionInvalidResponse } from "@shared/session-auth";
 import {
+	IconAdjustmentsHorizontal,
 	IconAlertTriangle,
 	IconArrowLeft,
+	IconCheck,
 	IconClearAll,
 	IconDashboard,
 	IconFolders,
 	IconLayoutList,
+	IconList,
 	IconMessageChatbot,
 	IconMessageReport,
 	IconPlus,
-	IconSearch,
 	IconSettings,
-	IconX,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -97,6 +98,7 @@ import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
 import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
+import { HeaderSearchBox } from "./nav/HeaderSearchBox";
 import { NavOverflowMenu } from "./nav/NavOverflowMenu";
 import { NavUserMenu } from "./nav/NavUserMenu";
 import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
@@ -294,7 +296,9 @@ function AuthenticatedLayout() {
 	});
 	const headerRef = useRef<HTMLElement>(null);
 	const [logoutOpened, { open: openLogout, close: closeLogout }] = useDisclosure(false);
-	const [searchQuery, setSearchQuery] = useState("");
+	// The search QUERY state lives in HeaderSearchBox (per-keystroke re-renders
+	// must not touch the AppShell). Only the mobile open/closed toggle stays
+	// here because the title below is gated on it.
 	const [searchOpen, setSearchOpen] = useState(false);
 	const navigate = useNavigate();
 	const router = useRouter();
@@ -304,6 +308,7 @@ function AuthenticatedLayout() {
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();
+	const tabGroupMode = prefs?.recentTabsGroupMode ?? "flat";
 	const { tabs, clearTabs } = useRecentTabs();
 	const [oledMode] = useLocalPref("narrafork_oled");
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
@@ -550,13 +555,6 @@ function AuthenticatedLayout() {
 		);
 	}
 
-	const handleSearch = () => {
-		if (searchQuery.trim()) {
-			navigate({ to: "/search", search: { q: searchQuery.trim() } });
-			setSearchOpen(false);
-		}
-	};
-
 	const openRequestDumpSetting = () => {
 		navigate({ to: "/settings/agent", hash: "request-dump-enabled" });
 	};
@@ -577,11 +575,6 @@ function AuthenticatedLayout() {
 	const navbarBottomGutter = appShellNavbarBottomGutter(
 		wizardOpen ? "0px" : navCollapsed ? "4px" : "var(--mantine-spacing-md)",
 	);
-
-	const handleSearchKeyDown = (e: React.KeyboardEvent) => {
-		if (e.key === "Enter") handleSearch();
-		if (e.key === "Escape") setSearchOpen(false);
-	};
 
 	return (
 		<AppShellWithNavWidth
@@ -703,53 +696,7 @@ function AuthenticatedLayout() {
 								<IconMessageReport size={20} />
 							</ActionIcon>
 						</Tooltip>
-						{/* Desktop: always show search input */}
-						<TextInput
-							placeholder={t("searchPlaceholder")}
-							size="sm"
-							style={{ width: 300 }}
-							value={searchQuery}
-							onChange={(e) => setSearchQuery(e.currentTarget.value)}
-							onKeyDown={handleSearchKeyDown}
-							rightSection={
-								<ActionIcon size="sm" variant="subtle" onClick={handleSearch}>
-									<IconSearch size={16} />
-								</ActionIcon>
-							}
-							visibleFrom="sm"
-						/>
-						{/* Mobile: toggle search input via icon */}
-						{searchOpen ? (
-							<Group wrap="nowrap" gap="xs" hiddenFrom="sm" style={{ flex: 1, minWidth: 0 }}>
-								<TextInput
-									placeholder={t("searchPlaceholder")}
-									size="sm"
-									style={{ flex: 1, minWidth: 0 }}
-									value={searchQuery}
-									onChange={(e) => setSearchQuery(e.currentTarget.value)}
-									onKeyDown={handleSearchKeyDown}
-									rightSection={
-										<ActionIcon size="sm" variant="subtle" onClick={handleSearch}>
-											<IconSearch size={16} />
-										</ActionIcon>
-									}
-									autoFocus
-								/>
-								<ActionIcon variant="subtle" color="gray" onClick={() => setSearchOpen(false)}>
-									<IconX size={18} />
-								</ActionIcon>
-							</Group>
-						) : (
-							<ActionIcon
-								variant="subtle"
-								color="gray"
-								onClick={() => setSearchOpen(true)}
-								title={t("searchPlaceholder")}
-								hiddenFrom="sm"
-							>
-								<IconSearch size={18} />
-							</ActionIcon>
-						)}
+						<HeaderSearchBox searchOpen={searchOpen} onSearchOpenChange={setSearchOpen} />
 					</Group>
 				</Group>
 			</AppShell.Header>
@@ -881,6 +828,56 @@ function AuthenticatedLayout() {
 									rightSection={
 										navCollapsed ? undefined : (
 											<Group gap={8} wrap="nowrap">
+												{/* Display-mode switch for the tab list below. Wrapped in a Box that
+												    swallows the click: this lives INSIDE the NavLink, whose own
+												    onClick navigates to /narrators, and both sibling ActionIcons
+												    below stop propagation for the same reason. */}
+												<Box
+													onClick={(e: React.MouseEvent) => {
+														e.preventDefault();
+														e.stopPropagation();
+													}}
+													onPointerDown={(e: React.PointerEvent) => e.stopPropagation()}
+													style={{ display: "flex" }}
+												>
+													<Menu position="right-start" withinPortal shadow="md" width={210}>
+														<Menu.Target>
+															<Tooltip label={t("recentTabsGrouping")} position="right" withArrow>
+																<ActionIcon
+																	size={28}
+																	variant="subtle"
+																	color="gray"
+																	aria-label={t("recentTabsGrouping")}
+																>
+																	<IconAdjustmentsHorizontal size={16} />
+																</ActionIcon>
+															</Tooltip>
+														</Menu.Target>
+														<Menu.Dropdown>
+															<Menu.Label>{t("recentTabsGrouping")}</Menu.Label>
+															<Menu.Item
+																leftSection={<IconList size={14} />}
+																rightSection={
+																	tabGroupMode === "flat" ? <IconCheck size={14} /> : undefined
+																}
+																onClick={() => updatePrefs.mutate({ recentTabsGroupMode: "flat" })}
+															>
+																{t("groupModeFlat")}
+															</Menu.Item>
+															<Menu.Item
+																leftSection={<IconFolders size={14} />}
+																rightSection={
+																	tabGroupMode === "directory" ? <IconCheck size={14} /> : undefined
+																}
+																onClick={() =>
+																	updatePrefs.mutate({ recentTabsGroupMode: "directory" })
+																}
+															>
+																{t("groupModeDirectory")}
+															</Menu.Item>
+														</Menu.Dropdown>
+													</Menu>
+												</Box>
 												<Tooltip label={t("newNarrator")} position="right" withArrow>
 													<ActionIcon
 														size={28}

@@ -69,3 +69,25 @@ export function formatLocaleRelativeTime(
 ): string {
 	return new Intl.RelativeTimeFormat(resolveIntlLocale(locale), options).format(value, unit);
 }
+
+/**
+ * Message timestamp the way chat bubbles show it: today → HH:mm, otherwise
+ * MM/DD HH:mm. Shared by the bubble headers and the scrollbar user-mark
+ * tooltips so every surface renders the same turn the same way.
+ */
+export function formatShortMessageTime(value: DateInput, locale?: string | null): string {
+	const date = toValidDate(value);
+	if (!date) return "";
+	const now = new Date();
+	const isToday =
+		date.getFullYear() === now.getFullYear() &&
+		date.getMonth() === now.getMonth() &&
+		date.getDate() === now.getDate();
+	return isToday
+		? formatLocaleTime(date, { hour: "2-digit", minute: "2-digit" }, locale)
+		: formatLocaleDateTime(
+				date,
+				{ month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" },
+				locale,
+			);
+}

@@ -210,6 +210,8 @@
 	"containerRecheckFailed": "Failed to recheck container environment",
 	"activeTerminals": "{{count}} active terminal(s)",
 	"viewersWatching": "{{count}} people viewing",
+	"swipePin": "Pin",
+	"swipeUnpin": "Unpin",
 	"containerRunning": "Container running",
 	"containerPaused": "Container paused",
 	"containerStopped": "Container stopped",

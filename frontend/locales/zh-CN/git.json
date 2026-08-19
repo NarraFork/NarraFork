@@ -1,5 +1,6 @@
 {
 	"panel.title": "Git",
+	"panel.noChapter": "无章节",
 	"panel.changes": "变更",
 	"panel.commits": "提交",
 	"panel.stash": "暂存",

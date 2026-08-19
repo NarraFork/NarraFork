@@ -59,5 +59,13 @@
 	"emptyVisibleZone": "拖拽到此处显示",
 	"loadMoreRecentTabs": "加载更多",
 	"retryRecentTabs": "重试",
-	"recentTabsSyncError": "最近标签同步失败"
+	"recentTabsSyncError": "最近标签同步失败",
+	"recentTabsGrouping": "标签分组方式",
+	"groupModeFlat": "平铺列表",
+	"groupModeDirectory": "按目录聚合",
+	"expandDirectory": "展开目录 {{path}}",
+	"collapseDirectory": "折叠目录 {{path}}",
+	"directoryNarratorCount": "该目录下有 {{count}} 个叙述者",
+	"directoryWorkingCount": "{{count}} 个正在运行",
+	"directoryAttentionCount": "{{count}} 个需要处理"
 }

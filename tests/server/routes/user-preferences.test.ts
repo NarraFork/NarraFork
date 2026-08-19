@@ -301,6 +301,144 @@ describe("user preferences secret serialization", () => {
 	});
 });
 
+/**
+ * The upsert in PATCH / is one hand-written statement with a column list, a placeholder
+ * count, an ON CONFLICT SET clause and TWO positional value arrays. A new column that
+ * misses any of those four places fails silently: the request still returns 200 and the value
+ * simply never changes, or worse lands in the neighbouring column.
+ */
+describe("recent tabs group mode preference", () => {
+	it("persists the mode and returns it from GET", async () => {
+		seedPreferences([]);
+
+		const patchResult = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ recentTabsGroupMode: "directory" }),
+		});
+		expect(patchResult.status).toBe(200);
+		expect(patchResult.body).toMatchObject({ recentTabsGroupMode: "directory" });
+
+		const getResult = await requestJson("/");
+		expect(getResult.body).toMatchObject({ recentTabsGroupMode: "directory" });
+	});
+
+	it("defaults to flat so existing users keep the sortable list", async () => {
+		seedPreferences([]);
+		const { body } = await requestJson("/");
+		expect(body).toMatchObject({ recentTabsGroupMode: "flat" });
+	});
+
+	/*
+	 * `narrator_toolbar_layout` is the newest column threaded through that same
+	 * hand-written upsert, so it is exposed to the four-place trap described above:
+	 * column list, placeholder count, ON CONFLICT SET clause, and BOTH positional
+	 * value arrays. Every failure mode is silent — a 200 with the value unchanged,
+	 * or the value landing in the neighbouring column (`nav_layout`, which would
+	 * scramble the sidebar instead).
+	 */
+	it("persists the narrator toolbar layout and returns it from GET", async () => {
+		seedPreferences([]);
+		const layout = { items: [{ id: "git" }, { id: "__divider__" }, { id: "details" }] };
+
+		const patchResult = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ narratorToolbarLayout: layout }),
+		});
+		expect(patchResult.status).toBe(200);
+		expect(patchResult.body).toMatchObject({ narratorToolbarLayout: layout });
+
+		const getResult = await requestJson("/");
+		expect(getResult.body).toMatchObject({ narratorToolbarLayout: layout });
+	});
+
+	it("keeps the toolbar layout and the nav layout in separate columns", async () => {
+		// A placeholder off by one would write one into the other; both are JSON
+		// objects, so nothing would throw and the symptom would be a scrambled
+		// sidebar after customizing the toolbar.
+		seedPreferences([]);
+		const navLayout = { items: [{ id: "projects" }] };
+		const toolbarLayout = { items: [{ id: "search" }] };
+
+		const { status, body } = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ navLayout, narratorToolbarLayout: toolbarLayout }),
+		});
+		expect(status).toBe(200);
+		expect(body).toMatchObject({ navLayout, narratorToolbarLayout: toolbarLayout });
+	});
+
+	it("leaves the stored toolbar layout alone when a PATCH omits it", async () => {
+		seedPreferences([], {
+			narratorToolbarLayout: JSON.stringify({ items: [{ id: "browser" }] }),
+		});
+
+		const { status, body } = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ terminalFontSize: 18 }),
+		});
+		expect(status).toBe(200);
+		expect(body).toMatchObject({
+			terminalFontSize: 18,
+			narratorToolbarLayout: { items: [{ id: "browser" }] },
+		});
+	});
+
+	it("falls back to an empty object for a corrupted toolbar layout", async () => {
+		seedPreferences([], { narratorToolbarLayout: "{broken" });
+		const { status, body } = await requestJson("/");
+		expect(status).toBe(200);
+		expect(body).toMatchObject({ narratorToolbarLayout: {} });
+	});
+
+	it("leaves the stored mode alone when a PATCH omits it", async () => {
+		// This is what COALESCE(?, recent_tabs_group_mode) buys; a misplaced positional
+		// argument would show up here as the mode resetting on an unrelated settings change.
+		seedPreferences([], { recentTabsGroupMode: "directory" });
+
+		const patchResult = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ terminalFontSize: 18 }),
+		});
+		expect(patchResult.status).toBe(200);
+		expect(patchResult.body).toMatchObject({
+			terminalFontSize: 18,
+			recentTabsGroupMode: "directory",
+		});
+	});
+
+	it("rejects an unknown mode instead of storing it", async () => {
+		seedPreferences([], { recentTabsGroupMode: "flat" });
+		// Asserted through a raw request: this test app mounts the routes without the
+		// global AppError handler, so the rejection body is not JSON.
+		const response = await app.request("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ recentTabsGroupMode: "by-project" }),
+		});
+		expect(response.status).not.toBe(200);
+
+		const { body } = await requestJson("/");
+		expect(body).toMatchObject({ recentTabsGroupMode: "flat" });
+	});
+
+	it("creates a row with the requested mode when none exists yet", async () => {
+		// The INSERT branch has its own value array, separate from the UPDATE one.
+		seedUser();
+		const patchResult = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ recentTabsGroupMode: "directory" }),
+		});
+		expect(patchResult.status).toBe(200);
+		expect(patchResult.body).toMatchObject({ recentTabsGroupMode: "directory" });
+	});
+});
+
 describe("recent-tabs route contracts", () => {
 	it("returns a mutation delta instead of the full tab collection", async () => {
 		seedPreferences([]);

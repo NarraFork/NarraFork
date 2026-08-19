@@ -40,6 +40,8 @@ export interface VListUserMarker {
 	ordinal: number;
 	/** Single-line preview for the tooltip / aria-label ("" when text-less). */
 	preview: string;
+	/** Message timestamp shown in the tooltip (null when the row carries none). */
+	createdAt: string | null;
 }
 
 /** Tooltip preview budget — long enough to recognize a turn, short enough to read. */
@@ -89,6 +91,13 @@ function isUserBubble(item: VListUserMarkerItem | undefined): boolean {
 	return !!data && typeof data === "object" && data.role === "user";
 }
 
+/** Timestamp carried on the bubble spec (height-neutral adapter field). */
+function resolveVListUserMarkerCreatedAt(data: unknown): string | null {
+	if (!data || typeof data !== "object") return null;
+	const createdAt = (data as { createdAt?: unknown }).createdAt;
+	return typeof createdAt === "string" && createdAt.length > 0 ? createdAt : null;
+}
+
 /**
  * Collect one marker per user bubble in the loaded document.
  *
@@ -119,6 +128,7 @@ export function collectVListUserMarkers(
 			fraction: usable > 0 ? clamp01(top / usable) : 0,
 			ordinal: markers.length + 1,
 			preview: resolveVListUserMarkerPreview(item.spec.data),
+			createdAt: resolveVListUserMarkerCreatedAt(item.spec.data),
 		});
 	}
 	return markers;

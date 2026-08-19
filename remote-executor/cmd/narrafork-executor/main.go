@@ -33,9 +33,37 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("[narrafork-executor] ")
 
+	// On Windows, the process may have been launched by the Service Control
+	// Manager rather than from a console. If so it must hand control to the
+	// service dispatcher instead of running inline: the SCM waits for a status
+	// report and kills a process that never sends one. Everywhere else — and in a
+	// console session on Windows — this returns false and the run is ordinary.
+	handled, err := runAsServiceIfLaunchedBySCM(run)
+	if err != nil {
+		log.Fatalf("fatal: %v", err)
+	}
+	if handled {
+		return
+	}
+
+	if err := run(context.Background(), nil); err != nil {
+		log.Fatalf("fatal: %v", err)
+	}
+}
+
+/*
+run performs the executor's actual work: load config, build handlers, and serve
+until the context is cancelled.
+
+Extracted from main so the Windows service path can invoke exactly the same logic.
+A service must be able to (a) start work asynchronously and (b) report "running"
+to the SCM promptly, which is what `ready` is for: it is closed once serving is
+under way. It is nil for a console run, where nobody is waiting for the signal.
+*/
+func run(ctx context.Context, ready func()) error {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config error: %v", err)
+		return fmt.Errorf("config error: %w", err)
 	}
 
 	guard := handlers.NewPathGuardWithRules(toGuardRules(cfg.EffectivePathRules()))
@@ -79,26 +107,41 @@ func main() {
 		},
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// Signal handling belongs to the console path only. Under the SCM, shutdown
+	// arrives as a service control request and the caller cancels ctx instead;
+	// installing handlers there would be harmless but meaningless.
+	if ready == nil {
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+	}
 
 	log.Printf("starting executor: version=%s os=%s arch=%s git=%v rg=%v shell=%v cwd=%s",
 		buildinfo.Version, platform.OS, platform.Arch, caps.Git, caps.Ripgrep, caps.Shell, cfg.DefaultCwd)
+
+	// Reported before serving starts, not after it returns: these transports block
+	// for the process's lifetime, so waiting for success would guarantee an SCM
+	// start timeout. A connection failure afterwards is surfaced by the retry
+	// loop's own logging and by the device showing offline in NarraFork.
+	if ready != nil {
+		ready()
+	}
 
 	if cfg.ListenAddr != "" {
 		// Direct mode: listen for the NarraFork server to connect.
 		server := transport.NewServer(cfg, dispatcher, platform, caps)
 		if err := server.Run(ctx); err != nil && ctx.Err() == nil {
-			log.Fatalf("fatal: %v", err)
+			return err
 		}
 	} else {
 		// Reverse-dial mode: connect out to the NarraFork server.
 		client := transport.NewClient(cfg, dispatcher, platform, caps)
 		if err := client.Run(ctx); err != nil && ctx.Err() == nil {
-			log.Fatalf("fatal: %v", err)
+			return err
 		}
 	}
 	log.Printf("shutting down")
+	return nil
 }
 
 // toGuardRules converts validated config rules into guard rules. Config already

@@ -16,6 +16,8 @@ import {
 } from "@mantine/core";
 import {
 	IconGitCommit,
+	IconGitFork,
+	IconGitMerge,
 	IconGraph,
 	IconMoon,
 	IconPackage,
@@ -30,6 +32,16 @@ import classes from "./ChapterBar.module.css";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 
 // Lazy-loaded heavy panels and modals — only needed when user opens them
+const ChapterForkModal = lazy(() =>
+	import("@frontend/components/chapter/ChapterForkModal").then((m) => ({
+		default: m.ChapterForkModal,
+	})),
+);
+const ChapterMergeModal = lazy(() =>
+	import("@frontend/components/chapter/ChapterMergeModal").then((m) => ({
+		default: m.ChapterMergeModal,
+	})),
+);
 const ContainerPanel = lazy(() =>
 	import("@frontend/components/container/ContainerPanel").then((m) => ({
 		default: m.ContainerPanel,
@@ -48,9 +60,16 @@ const PodmanInstallModal = lazy(() =>
 
 interface ChapterBarProps {
 	chapterId: string;
+	/**
+	 * Open the Git view for this chapter. NarratorPanel routes the gesture: dock
+	 * panel when a dock surface exists, the mobile Drawer host otherwise. The raw
+	 * dock context below is only a fallback for surfaces that render this bar
+	 * without the panel around it.
+	 */
+	onOpenGitPanel?: () => void;
 }
 
-export function ChapterBar({ chapterId }: ChapterBarProps) {
+export function ChapterBar({ chapterId, onOpenGitPanel }: ChapterBarProps) {
 	const { t } = useTranslation("chapters");
 	const { t: tn } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
@@ -58,10 +77,10 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 	const { data: chapter } = useChapter(chapterId);
 	const { data: gitStatus } = useChapterGitStatus(chapterId);
 	// Git lives in the dockview surface (right side), not in a collapse below this
-	// bar. Null when this bar is rendered outside any dock surface (e.g. the mobile
-	// page or a ruler card) — then the git affordances are simply inert labels.
+	// bar. The prop wins because the caller knows the mobile Drawer host; the raw
+	// dock context is only a fallback for surfaces that render the bar standalone.
 	const dock = useNarratorDockContext();
-	const openGitPanel = dock ? () => dock.openToolPanel("git") : undefined;
+	const openGitPanel = onOpenGitPanel ?? (dock ? () => dock.openToolPanel("git") : undefined);
 	const containerCapability = useChapterContainersCapability();
 	const containerUnsupportedReason =
 		containerCapability.reason ?? tn("chapterBar.containersUnsupported");
@@ -82,6 +101,8 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 		},
 	});
 
+	const [forkModalOpen, setForkModalOpen] = useState(false);
+	const [mergeModalOpen, setMergeModalOpen] = useState(false);
 	const [containerConfigOpen, setContainerConfigOpen] = useState(false);
 	const [podmanInstallOpen, setPodmanInstallOpen] = useState(false);
 	const [containerPanelOpen, setContainerPanelOpen] = useState(false);
@@ -189,6 +210,33 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 
 				{/* Right: action menus */}
 				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+					{/* Git fork/merge menu */}
+					<Menu position="top-end" withinPortal>
+						<Menu.Target>
+							<Tooltip label={tn("chapterBar.git")}>
+								<ActionIcon variant="subtle" color="gray" size="sm">
+									<IconGitFork size={15} />
+								</ActionIcon>
+							</Tooltip>
+						</Menu.Target>
+						<Menu.Dropdown>
+							<Menu.Label>{tn("chapterBar.git")}</Menu.Label>
+							<Menu.Item
+								leftSection={<IconGitFork size={14} />}
+								onClick={() => setForkModalOpen(true)}
+							>
+								{t("fork")}
+							</Menu.Item>
+							<Menu.Divider />
+							<Menu.Item
+								leftSection={<IconGitMerge size={14} />}
+								onClick={() => setMergeModalOpen(true)}
+							>
+								{t("merge")}
+							</Menu.Item>
+						</Menu.Dropdown>
+					</Menu>
+
 					{/* Container toggle + menu */}
 					<Tooltip
 						label={
@@ -287,6 +335,26 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 			</Collapse>
 
 			{/* Modals */}
+			{forkModalOpen && (
+				<Suspense fallback={null}>
+					<ChapterForkModal
+						chapterId={chapterId}
+						chapterStatus={chapter.status}
+						opened={forkModalOpen}
+						onClose={() => setForkModalOpen(false)}
+					/>
+				</Suspense>
+			)}
+			{mergeModalOpen && (
+				<Suspense fallback={null}>
+					<ChapterMergeModal
+						chapterId={chapterId}
+						projectId={chapter.projectId}
+						opened={mergeModalOpen}
+						onClose={() => setMergeModalOpen(false)}
+					/>
+				</Suspense>
+			)}
 			{containerCapability.supported && containerConfigOpen && (
 				<Suspense fallback={null}>
 					<ContainerConfigModal

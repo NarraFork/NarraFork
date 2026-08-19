@@ -47,6 +47,7 @@ const DEFAULTS = {
 	terminalFontSize: 14,
 	recentTabs: "[]",
 	addSubagentToRecentTabs: true,
+	recentTabsGroupMode: "flat" as const,
 	// Notification defaults
 	notifyOnDone: true,
 	notifyOnWaiting: true,
@@ -71,6 +72,8 @@ const DEFAULTS = {
 	gatewayConfig: "{}",
 	// Sidebar navigation layout
 	navLayout: "{}",
+	// Narrator header toolbar layout
+	narratorToolbarLayout: "{}",
 };
 
 /** Mask a secret/webhook URL for safe display (show last 4 chars). */
@@ -215,6 +218,7 @@ function serializeUserPreferences(
 		notifyFeishuSecret: maskSecret(pref.notifyFeishuSecret),
 		gatewayConfig: serializeGatewayConfig(pref.gatewayConfig),
 		navLayout: parseJsonObject(pref.navLayout),
+		narratorToolbarLayout: parseJsonObject(pref.narratorToolbarLayout),
 	};
 }
 
@@ -235,6 +239,7 @@ userPreferencesRoutes.get("/", async (c) => {
 			commands: [],
 			gatewayConfig: {},
 			navLayout: {},
+			narratorToolbarLayout: {},
 		});
 	}
 
@@ -277,6 +282,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 		// Atomic upsert — avoids read-then-write race condition
 		const commandsJson = d.commands != null ? JSON.stringify(d.commands) : null;
 		const navLayoutJson = d.navLayout != null ? JSON.stringify(d.navLayout) : null;
+		const narratorToolbarLayoutJson =
+			d.narratorToolbarLayout != null ? JSON.stringify(d.narratorToolbarLayout) : null;
 
 		// Resolve masked placeholders from the latest row while holding the per-user lock.
 		let gatewayConfigJson: string | null = null;
@@ -293,16 +300,16 @@ userPreferencesRoutes.patch("/", async (c) => {
 			id, user_id,
 			auto_load_older_messages, fast_mode_default, language, word_wrap_markdown, word_wrap_code,
 			word_wrap_diff, reply_in_user_language, show_token_usage, show_output_stats, terminal_theme, terminal_font_size,
-			add_subagent_to_recent_tabs,
+			add_subagent_to_recent_tabs, recent_tabs_group_mode,
 			notify_on_done, notify_on_waiting, notify_pwa_enabled,
 			notify_sound_enabled, notify_sound_type, notify_sound_builtin, notify_sound_file_id,
 			notify_sound_volume, notify_sound_max_concurrent,
 			notify_dingtalk_enabled, notify_dingtalk_webhook, notify_dingtalk_secret,
 			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
 			commands, queue_mode, ctrl_enter_queue_mode, setup_wizard_completed, gateway_config,
-			nav_layout,
+			nav_layout, narrator_toolbar_layout,
 			created_at, updated_at
-		) VALUES (${Array(37).fill("?").join(", ")})
+		) VALUES (${Array(39).fill("?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   fast_mode_default = COALESCE(?, fast_mode_default),
@@ -316,6 +323,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   terminal_theme = COALESCE(?, terminal_theme),
 		   terminal_font_size = COALESCE(?, terminal_font_size),
 		   add_subagent_to_recent_tabs = COALESCE(?, add_subagent_to_recent_tabs),
+		   recent_tabs_group_mode = COALESCE(?, recent_tabs_group_mode),
 		   notify_on_done = COALESCE(?, notify_on_done),
 		   notify_on_waiting = COALESCE(?, notify_on_waiting),
 		   notify_pwa_enabled = COALESCE(?, notify_pwa_enabled),
@@ -337,6 +345,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   setup_wizard_completed = COALESCE(?, setup_wizard_completed),
 		   gateway_config = COALESCE(?, gateway_config),
 		   nav_layout = COALESCE(?, nav_layout),
+		   narrator_toolbar_layout = COALESCE(?, narrator_toolbar_layout),
 		   updated_at = ?`,
 			[
 				// INSERT values
@@ -354,6 +363,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.terminalTheme ?? DEFAULTS.terminalTheme,
 				d.terminalFontSize ?? DEFAULTS.terminalFontSize,
 				(d.addSubagentToRecentTabs ?? DEFAULTS.addSubagentToRecentTabs) ? 1 : 0,
+				d.recentTabsGroupMode ?? DEFAULTS.recentTabsGroupMode,
 				(d.notifyOnDone ?? DEFAULTS.notifyOnDone) ? 1 : 0,
 				(d.notifyOnWaiting ?? DEFAULTS.notifyOnWaiting) ? 1 : 0,
 				(d.notifyPwaEnabled ?? DEFAULTS.notifyPwaEnabled) ? 1 : 0,
@@ -375,6 +385,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.setupWizardCompleted ? 1 : 0,
 				gatewayConfigJson ?? DEFAULTS.gatewayConfig,
 				navLayoutJson ?? DEFAULTS.navLayout,
+				narratorToolbarLayoutJson ?? DEFAULTS.narratorToolbarLayout,
 				now,
 				now,
 				// ON CONFLICT UPDATE values (null = keep existing)
@@ -390,6 +401,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.terminalTheme ?? null,
 				d.terminalFontSize ?? null,
 				d.addSubagentToRecentTabs != null ? (d.addSubagentToRecentTabs ? 1 : 0) : null,
+				d.recentTabsGroupMode ?? null,
 				d.notifyOnDone != null ? (d.notifyOnDone ? 1 : 0) : null,
 				d.notifyOnWaiting != null ? (d.notifyOnWaiting ? 1 : 0) : null,
 				d.notifyPwaEnabled != null ? (d.notifyPwaEnabled ? 1 : 0) : null,
@@ -411,6 +423,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.setupWizardCompleted != null ? (d.setupWizardCompleted ? 1 : 0) : null,
 				gatewayConfigJson,
 				navLayoutJson,
+				narratorToolbarLayoutJson,
 				now,
 			],
 		);

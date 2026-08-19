@@ -183,6 +183,7 @@ export const settingsApi = {
 			terminalTheme: string;
 			terminalFontSize: number;
 			addSubagentToRecentTabs: boolean;
+			recentTabsGroupMode: "flat" | "directory";
 			// Notification preferences
 			notifyOnDone: boolean;
 			notifyOnWaiting: boolean;
@@ -222,6 +223,9 @@ export const settingsApi = {
 			navLayout: {
 				items: Array<{ id: string; hidden?: boolean }>;
 			};
+			narratorToolbarLayout: {
+				items: Array<{ id: string }>;
+			};
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -236,6 +240,7 @@ export const settingsApi = {
 		terminalTheme?: string;
 		terminalFontSize?: number;
 		addSubagentToRecentTabs?: boolean;
+		recentTabsGroupMode?: "flat" | "directory";
 		// Notification preferences
 		notifyOnDone?: boolean;
 		notifyOnWaiting?: boolean;
@@ -278,6 +283,11 @@ export const settingsApi = {
 		// the boundary — ids after it are tucked into the "More" menu)
 		navLayout?: {
 			items: Array<{ id: string; hidden?: boolean }>;
+		};
+		// Narrator header toolbar layout (same flat-ids + "__divider__" shape as
+		// navLayout; order is the user's priority, shared by desktop and mobile)
+		narratorToolbarLayout?: {
+			items: Array<{ id: string }>;
 		};
 	}) =>
 		request<ApiEntity>("/user-preferences", {

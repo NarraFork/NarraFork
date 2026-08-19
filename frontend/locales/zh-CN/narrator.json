@@ -1190,6 +1190,12 @@
 			"execution": "执行 {{duration}}"
 		}
 	},
+	"toolbar": {
+		"more": "更多工具",
+		"sectionVisible": "显示在标题栏",
+		"sectionTucked": "收纳在此菜单",
+		"headerOnly": "仅标题栏可用"
+	},
 	"spec": {
 		"title": "大纲",
 		"open": "打开大纲",

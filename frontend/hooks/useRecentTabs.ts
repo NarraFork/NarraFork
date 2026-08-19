@@ -348,6 +348,85 @@ export function applyRecentTabMove(
 	return next;
 }
 
+/**
+ * A before/after move on the flat order — the only reorder primitive the server has.
+ */
+export interface RecentTabOrderMove {
+	key: string;
+	beforeKey?: string;
+	afterKey?: string;
+}
+
+export interface RecentTabOrderMoveResult {
+	moves: RecentTabOrderMove[];
+	/** The order the cache converges to after applying every move in sequence. */
+	finalTabs: RecentTab[];
+}
+
+/**
+ * Translate a desired unit order into flat before/after moves.
+ *
+ * The sidebar's derived views (directory aggregation) reorder UNITS — blocks of one or
+ * more tab keys — while the server only reorders single keys. This walks the desired
+ * movable order and, whenever the next key is not already at its slot, emits ONE move
+ * placing it before the key that currently occupies the slot. Keys absent from
+ * `orderedBlocks` are fixed and never emitted or displaced relative to one another.
+ *
+ * Two properties are load-bearing and both are covered by tests:
+ *
+ *  - `beforeKey` is used throughout, never `afterKey`: the server expands an anchor
+ *    inside a workspace to the whole group boundary, so "after a workspace header" means
+ *    after its LAST CHILD there but right after the header in the client simulation —
+ *    "before an occupant" cannot diverge that way (an occupant is always a top-level
+ *    key: a workspace child only becomes the current slot after its own header was
+ *    placed, and by then it sits exactly where the walk expects it).
+ *  - Every move is simulated through {@link applyRecentTabMove}, the same function the
+ *    mutation cache path and the WS delta path use, so `finalTabs` is exactly what the
+ *    cache holds after the sequence is replayed — that is what lets the caller render
+ *    `finalTabs` optimistically without the order snapping back mid-flight.
+ */
+export function computeRecentTabOrderMoves(
+	tabs: RecentTab[],
+	orderedBlocks: string[][],
+): RecentTabOrderMoveResult {
+	const movable = new Set(orderedBlocks.flat());
+	let work = [...tabs];
+	const moves: RecentTabOrderMove[] = [];
+	let placedCount = 0;
+
+	for (const block of orderedBlocks) {
+		for (const key of block) {
+			// Defensive: a block naming a tab that is gone is skipped entirely — emitting
+			// a move for it would push a key the server does not have and corrupt the
+			// placed-slot bookkeeping for every key after it.
+			if (!work.some((tab) => tabKey(tab) === key)) continue;
+			// The slot this key must occupy: the first movable position not yet placed.
+			let seen = 0;
+			let targetIdx = -1;
+			for (let i = 0; i < work.length; i++) {
+				if (!movable.has(tabKey(work[i]))) continue;
+				if (seen === placedCount) {
+					targetIdx = i;
+					break;
+				}
+				seen++;
+			}
+			if (targetIdx < 0) continue; // defensive: no unplaced slot left
+			if (tabKey(work[targetIdx]) === key) {
+				placedCount++;
+				continue;
+			}
+			const beforeKey = tabKey(work[targetIdx]);
+			const move: RecentTabOrderMove = { key, beforeKey };
+			work = applyRecentTabMove(work, key, { beforeKey });
+			moves.push(move);
+			placedCount++;
+		}
+	}
+
+	return { moves, finalTabs: work };
+}
+
 function applyOperation(tabs: RecentTab[], operation: RecentTabsOperation): RecentTab[] {
 	if (operation.type === "remove") {
 		const removed = tabs.find((tab) => tabKey(tab) === operation.key);

@@ -16,6 +16,15 @@ import {
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
+	directoryRowId,
+	directoryRowKeyBlock,
+	directoryRowSortableIds,
+	groupRecentTabsByDirectory,
+	moveDirectoryRow,
+	type RecentTabRow,
+	resolveDirectoryDropTarget,
+} from "@frontend/hooks/recent-tab-directory-groups";
+import {
 	getEffectiveNarratorDisplay,
 	type StatusShape,
 	statusRegistry,
@@ -64,6 +73,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useCollapsedTabDirectories } from "../../hooks/useCollapsedTabDirectories";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
 import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
@@ -76,6 +86,7 @@ import {
 	bumpRecentTabRuntimeVersions,
 	clampRecentTabText,
 	collectRecentTabsDeltaFrame,
+	computeRecentTabOrderMoves,
 	normalizeRecentTabViewers,
 	pruneRecentTabsRuntimeVersions,
 	type RecentTab,
@@ -98,6 +109,7 @@ import { endDrag, moveDrag, startDragManual, startPointerDrag } from "../../lib/
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { queuePendingPanel } from "../narrator/workspace/dockview-layout";
 import { UserAvatar } from "../UserAvatar";
+import { RecentTabDirectoryRow, type RecentTabDirectoryRowProps } from "./RecentTabDirectoryRow";
 
 const CreateNarratorModal = React.lazy(() =>
 	import("../narrator/CreateNarratorModal").then((m) => ({
@@ -205,7 +217,35 @@ const CONTAINER_STATUS_I18N: Record<string, string> = {
 };
 
 const QUERY_KEY = ["user-preferences", "recent-tabs"];
-const SWIPE_THRESHOLD = 80;
+export const SWIPE_THRESHOLD = 80;
+
+/** What releasing a horizontal swipe at `swipeX` should do. */
+export type SwipeRelease = "close" | "pin" | "cancel";
+
+/**
+ * Decide the outcome of a released horizontal swipe on a tab row.
+ *
+ * Extracted from the component because the two directions mean very different things —
+ * right REMOVES the tab, left only reorders it — and a sign error would silently turn a
+ * pin gesture into a close. Both thresholds are symmetric, but the asymmetric
+ * consequences are why this is worth a test rather than an inline comparison.
+ */
+export function classifySwipeRelease(swipeX: number, canPin: boolean): SwipeRelease {
+	if (swipeX > SWIPE_THRESHOLD) return "close";
+	if (canPin && swipeX < -SWIPE_THRESHOLD) return "pin";
+	return "cancel";
+}
+
+/**
+ * Clamp a swipe's live travel.
+ *
+ * Left travel is suppressed entirely when the row cannot be pinned: a row that slides
+ * open, shows nothing, and springs back reads as a broken gesture rather than an absent
+ * one.
+ */
+export function clampSwipeTravel(dx: number, canPin: boolean): number {
+	return canPin ? dx : Math.max(0, dx);
+}
 const PREFETCH_QUERY_GC_TIME_MS = 5 * 60_000;
 
 function getRecentTabNarratorId(tab: RecentTab): string | null {
@@ -607,6 +647,12 @@ export function RecentTabList({
 	const { t } = useTranslation("nav");
 	const requireSetup = useSetupWizardGuard();
 	const pendingKey = usePendingTabKey();
+	const { data: userPrefsForGrouping } = useUserPreferences();
+	const { isCollapsed: isDirectoryCollapsed, toggle: toggleDirectory } =
+		useCollapsedTabDirectories();
+	// Only the work section aggregates: project tabs have no working directory at all.
+	const groupingEnabled =
+		filter === "narrator" && userPrefsForGrouping?.recentTabsGroupMode === "directory";
 
 	// Stable refs for values used in callbacks — avoids putting `tabs`/`pathname`
 	// in useCallback deps which would invalidate React.memo on every WS update.
@@ -718,6 +764,29 @@ export function RecentTabList({
 		}
 		return { pinnedItems: pinned, unpinnedItems: unpinned };
 	}, [topLevel, childrenByWorkspace]);
+
+	/**
+	 * Directory-aggregated rows for the unpinned group.
+	 *
+	 * Built from the unpinned TOP-LEVEL tabs; workspace children are folded into their
+	 * header's unit inside `groupRecentTabsByDirectory`, so a workspace the user assembled
+	 * by hand is neither scattered into directory groups nor split by a drag.
+	 */
+	const directoryRows = useMemo(() => {
+		if (!groupingEnabled) return [];
+		return groupRecentTabsByDirectory(
+			topLevel.filter((tab) => !tab.pinned),
+			childrenByWorkspace,
+		);
+	}, [groupingEnabled, topLevel, childrenByWorkspace]);
+	const directoryRowsRef = useRef(directoryRows);
+	directoryRowsRef.current = directoryRows;
+	const directorySortIds = useMemo(
+		() => directoryRows.flatMap(directoryRowSortableIds),
+		[directoryRows],
+	);
+	/** Sortable id currently dragged in directory mode; its unit's children collapse. */
+	const [dirDraggingId, setDirDraggingId] = useState<string | null>(null);
 
 	// Stable sort-id arrays for SortableContext
 	const pinnedSortIds = useMemo(() => pinnedItems.map(tabSortId), [pinnedItems]);
@@ -1073,6 +1142,25 @@ export function RecentTabList({
 		setCtxMenu(null);
 	}, [ctxMenu, pinTab]);
 
+	/**
+	 * Toggle pinned directly on a tab, for the swipe-left gesture.
+	 *
+	 * Separate from `handlePin` because that one reads the tab out of the context menu
+	 * state, and the swipe path never opens a menu — on touch it cannot: long-press fires
+	 * `contextmenu`, which the row swallows.
+	 *
+	 * Workspace CHILDREN are excluded. Pinning is a top-level ordering concept
+	 * (`pinnedItems` / `unpinnedItems` are top-level splits, and children render under
+	 * their header), so pinning a child would pull it out of its workspace group.
+	 */
+	const handleSwipePin = useCallback(
+		(tab: RecentTab) => {
+			if (tab.workspaceId) return;
+			pinTab(tabSortId(tab), !tab.pinned);
+		},
+		[pinTab],
+	);
+
 	const handleCtxClose = useCallback(() => {
 		if (!ctxMenu) return;
 		const { tab } = ctxMenu;
@@ -1205,6 +1293,112 @@ export function RecentTabList({
 		[wsCreateTarget, navigate, onNavigate],
 	);
 
+	// ── Directory-mode drag and drop ───────────────────────────────────────────
+	//
+	// The aggregated order is DERIVED from the server's flat order, so a drop cannot be
+	// persisted directly ("third slot inside a derived group" is not a before/after key).
+	// Instead the drop is translated twice: `moveDirectoryRow` permutes the visible rows,
+	// then `computeRecentTabOrderMoves` replays that permutation as flat before/after
+	// moves — the exact primitive the server persists. `finalTabs` from the same call is
+	// what the cache converges to, so it is shown optimistically and the order does not
+	// snap back while the moves are replayed one by one.
+
+	const directoryCollisionDetection = useCallback((args: Parameters<CollisionDetection>[0]) => {
+		const base = pointerWithin(args);
+		const collisions = base.length > 0 ? base : closestCenter(args);
+		if (collisions.length === 0) return collisions;
+		const first = collisions[0];
+		const resolved = resolveDirectoryDropTarget(
+			directoryRowsRef.current,
+			String(args.active.id),
+			String(first.id),
+		);
+		return [{ ...first, id: resolved }];
+	}, []);
+
+	const handleDirectoryDragStart = useCallback((event: DragStartEvent) => {
+		setOptimisticTabs(null);
+		const activeId = String(event.active.id);
+		setDirDraggingId(activeId);
+		// Bridge into the workspace-panel drag singleton, same as the flat handler.
+		const tab = findDirectoryRowTab(directoryRowsRef.current, activeId);
+		const nId =
+			tab?.type === "narrator" || tab?.type === "subagent"
+				? tab.id
+				: tab?.type === "chapter"
+					? tab.narratorId
+					: null;
+		if (!tab || !nId) return;
+		const me = event.activatorEvent as MouseEvent | TouchEvent;
+		const x = "clientX" in me ? me.clientX : (me.touches?.[0]?.clientX ?? 0);
+		const y = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
+		startDragManual(nId, tab.title, x, y);
+	}, []);
+
+	const handleDirectoryDragCancel = useCallback(() => {
+		endDrag();
+		setDirDraggingId(null);
+		setOptimisticTabs(null);
+	}, []);
+
+	const handleDirectoryDragEnd = useCallback(
+		(event: DragEndEvent) => {
+			justDragged = true;
+			setTimeout(() => {
+				justDragged = false;
+			}, 0);
+			endDrag();
+			setDirDraggingId(null);
+
+			const { active, over } = event;
+			if (!over || active.id === over.id) return;
+			const nextRows = moveDirectoryRow(
+				directoryRowsRef.current,
+				String(active.id),
+				String(over.id),
+			);
+			if (!nextRows) return;
+			const { moves, finalTabs } = computeRecentTabOrderMoves(
+				tabsRef.current,
+				nextRows.map(directoryRowKeyBlock),
+			);
+			if (moves.length === 0) return;
+
+			// Show the converged order at once; the moves below then persist it. The
+			// intermediate server states never flash because optimisticTabs masks them
+			// until the real order matches (same contract as the flat handler).
+			setDropSnap(true);
+			setOptimisticTabs(finalTabs);
+			requestAnimationFrame(() => setDropSnap(false));
+
+			void (async () => {
+				try {
+					let resetNeeded = false;
+					let lastRevision: number | undefined;
+					for (const move of moves) {
+						const result = await api.moveRecentTab(
+							move.key,
+							move.beforeKey
+								? { beforeKey: move.beforeKey }
+								: { afterKey: move.afterKey as string },
+						);
+						if (applyRecentTabsDelta(qc, result).length > 0) resetNeeded = true;
+						lastRevision = result.revision;
+					}
+					await refreshRecentTabsLoadedWindow(qc, {
+						reset: resetNeeded,
+						minimumRevision: lastRevision,
+					});
+				} catch {
+					// A failed move leaves the server order half-replayed; resync instead of
+					// trusting either the optimistic order or the partial cache.
+					await refreshRecentTabsLoadedWindow(qc, { reset: true }).catch(() => {});
+				}
+			})();
+		},
+		[qc],
+	);
+
 	if (topLevel.length === 0) {
 		if (sectionState.isLoading) {
 			return (
@@ -1309,6 +1503,7 @@ export function RecentTabList({
 											!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
 								}
 								onRemove={handleRemove}
+								onTogglePin={handleSwipePin}
 								onNavigate={onNavigate}
 								onContextMenu={handleContextMenu}
 								onPrefetch={prefetchNarratorTab}
@@ -1341,16 +1536,176 @@ export function RecentTabList({
 		);
 	};
 
+	/** Active/highlight state for a row, shared by both render paths. */
+	const isRowActive = (tab: RecentTab) => {
+		const tabKey = `${tab.type}:${tab.id}`;
+		return pendingKey
+			? pendingKey === tabKey
+			: isTabActive(tab, pathname) &&
+					!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId);
+	};
+
+	/**
+	 * Directory-aggregated renderer for the unpinned group. Every unit is sortable:
+	 * plain tabs and directory members move individually (members only within their own
+	 * group — membership comes from the cwd, not the position), directory headers move
+	 * the whole group, and workspace headers move the whole workspace, whose children
+	 * stay static because a workspace is a structure the user built by hand.
+	 */
+	const renderDirectoryRows = (rows: RecentTabRow[]) => {
+		if (rows.length === 0) return null;
+		const connectTopEligible = firstTabConnected && pinnedItems.length === 0;
+
+		return rows.map((row, rowIdx) => {
+			if (row.kind === "tab") {
+				const tab = row.tab;
+				return (
+					<SortableTabItem
+						key={tabSortId(tab)}
+						tab={tab}
+						active={isRowActive(tab)}
+						onRemove={handleRemove}
+						onTogglePin={handleSwipePin}
+						onNavigate={onNavigate}
+						onContextMenu={handleContextMenu}
+						onPrefetch={prefetchNarratorTab}
+						connectTop={connectTopEligible && rowIdx === 0}
+					/>
+				);
+			}
+
+			if (row.kind === "workspace") {
+				const draggingThis = dirDraggingId === tabSortId(row.tab);
+				return (
+					<React.Fragment key={tabSortId(row.tab)}>
+						<SortableTabItem
+							tab={row.tab}
+							active={isRowActive(row.tab)}
+							onRemove={handleRemove}
+							onTogglePin={handleSwipePin}
+							onNavigate={onNavigate}
+							onContextMenu={handleContextMenu}
+							onPrefetch={prefetchNarratorTab}
+							connectTop={connectTopEligible && rowIdx === 0}
+							onWsAddClick={handleWsAddClick}
+						/>
+						{/* Children are not individually sortable here; they collapse while the
+						    header is dragged so the drop gap measures as one header. */}
+						<div style={draggingThis ? { height: 0, overflow: "hidden" } : undefined}>
+							{row.children.map((child) => (
+								<StaticTabItem
+									key={tabSortId(child)}
+									tab={child}
+									active={isRowActive(child)}
+									onRemove={handleRemove}
+									onNavigate={onNavigate}
+									onContextMenu={handleContextMenu}
+									onPrefetch={prefetchNarratorTab}
+									indent
+								/>
+							))}
+						</div>
+					</React.Fragment>
+				);
+			}
+
+			const containsActive = row.children.some((child) => isTabActive(child, pathname));
+			const containsPending =
+				!!pendingKey && row.children.some((child) => `${child.type}:${child.id}` === pendingKey);
+			const collapsed = isDirectoryCollapsed(row.path, { containsActive, containsPending });
+			const draggingThis = dirDraggingId === directoryRowId(row.path);
+
+			return (
+				<React.Fragment key={directoryRowId(row.path)}>
+					<SortableDirectoryRow
+						path={row.path}
+						label={row.label}
+						tabs={row.children}
+						collapsed={collapsed}
+						active={collapsed && row.children.some((child) => isRowActive(child))}
+						onToggle={(path) => toggleDirectory(path, { containsActive, containsPending })}
+						connectTop={connectTopEligible && rowIdx === 0}
+						t={t}
+					/>
+					{!collapsed && (
+						<div style={draggingThis ? { height: 0, overflow: "hidden" } : undefined}>
+							{row.children.map((child) => (
+								<SortableTabItem
+									key={tabSortId(child)}
+									tab={child}
+									active={isRowActive(child)}
+									onRemove={handleRemove}
+									// Pinning a member lifts it out of the group into the pinned
+									// section — what "pin" means everywhere else in the list.
+									onTogglePin={handleSwipePin}
+									onNavigate={onNavigate}
+									onContextMenu={handleContextMenu}
+									onPrefetch={prefetchNarratorTab}
+									// The path lives on the header above; repeating it per member is
+									// exactly what this mode exists to stop.
+									hideSubtitle
+									indent
+								/>
+							))}
+						</div>
+					)}
+				</React.Fragment>
+			);
+		});
+	};
+
+	/** Floating preview while dragging in directory mode: header-only for a group. */
+	let directoryOverlay: React.ReactNode = null;
+	if (dirDraggingId) {
+		const dirRow = directoryRows.find(
+			(r) => r.kind === "directory" && directoryRowId(r.path) === dirDraggingId,
+		);
+		if (dirRow?.kind === "directory") {
+			directoryOverlay = (
+				<RecentTabDirectoryRow
+					path={dirRow.path}
+					label={dirRow.label}
+					tabs={dirRow.children}
+					collapsed
+					active={false}
+					onToggle={() => {}}
+					t={t}
+				/>
+			);
+		} else {
+			const tab = findDirectoryRowTab(directoryRows, dirDraggingId);
+			if (tab) {
+				directoryOverlay = <DragOverlayTabItem tab={tab} active={isTabActive(tab, pathname)} />;
+			}
+		}
+	}
+
 	return (
 		<Box style={{ overflow: "hidden" }}>
 			{/* When dropSnap is true, kill all transitions so items snap into place */}
 			{dropSnap && <style>{"[data-tab-sort-id]{transition:none!important}"}</style>}
 
-			{/* Render pinned tabs group */}
+			{/* Render pinned tabs group — always flat, always sortable */}
 			{renderTabGroup(pinnedItems, "pinned")}
 
 			{/* Render unpinned tabs group */}
-			{renderTabGroup(unpinnedItems, "unpinned")}
+			{groupingEnabled ? (
+				<DndContext
+					sensors={sensors}
+					collisionDetection={directoryCollisionDetection}
+					onDragStart={handleDirectoryDragStart}
+					onDragMove={handleDragMove}
+					onDragEnd={handleDirectoryDragEnd}
+					onDragCancel={handleDirectoryDragCancel}
+				>
+					<SortableContext items={directorySortIds} strategy={verticalListSortingStrategy}>
+						{renderDirectoryRows(directoryRows)}
+					</SortableContext>
+					<DragOverlay>{directoryOverlay}</DragOverlay>
+				</DndContext>
+			) : (
+				renderTabGroup(unpinnedItems, "unpinned")
+			)}
 
 			{sectionState.isError ? (
 				<Stack gap={2} py={4} align="center">
@@ -1853,10 +2208,16 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 	);
 }
 
-interface SortableTabItemProps {
+interface TabItemBodyProps {
 	tab: RecentTab;
 	active: boolean;
 	onRemove: (type: RecentTab["type"], id: string) => void;
+	/**
+	 * Toggle pinned state. Supplied by the list so a LEFT swipe can pin/unpin on touch,
+	 * where the right-click menu (the only other way to pin) is unreachable — long-press
+	 * fires `contextmenu`, which `handleContextMenu` deliberately swallows on touch.
+	 */
+	onTogglePin?: (tab: RecentTab) => void;
 	onNavigate?: () => void;
 	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
 	onPrefetch?: (tab: RecentTab) => void;
@@ -1864,24 +2225,50 @@ interface SortableTabItemProps {
 	connectTop?: boolean;
 	/** Workspace-only: click handler for the "add narrator" button */
 	onWsAddClick?: (e: React.MouseEvent, wsId: string) => void;
-	/** When true, reduce opacity to indicate the item is being dragged */
-	dimmed?: boolean;
-	/** Measured group height (header + children) — applied when dragging a workspace */
-	wsGroupHeight?: number;
+	/**
+	 * Directory mode: the working directory is printed once on the group header, so the
+	 * member rows must not repeat it. This is the entire space saving of the mode.
+	 */
+	hideSubtitle?: boolean;
+	/** Directory mode: indent the row so it reads as a member of the group above. */
+	indent?: boolean;
+	/** True while dnd-kit is dragging this row — suppresses the swipe-to-close gesture. */
+	isDragging?: boolean;
+	/** Outer wrapper ref (dnd-kit's `setNodeRef`, or nothing in the static case). */
+	outerRef?: (node: HTMLElement | null) => void;
+	outerStyle?: React.CSSProperties;
+	/** dnd-kit attributes + listeners, spread onto the outer wrapper. */
+	// biome-ignore lint/suspicious/noExplicitAny: dnd-kit attribute/listener bags are untyped maps
+	dragProps?: Record<string, any>;
 }
 
-const SortableTabItem = React.memo(function SortableTabItem({
+/**
+ * The visible row and every interaction on it: click-to-navigate, middle-click close,
+ * right-click menu, swipe-right-to-close, swipe-left-to-pin, and dragging the icon into
+ * a workspace panel.
+ *
+ * Deliberately free of `useSortable`. Directory mode renders rows OUTSIDE any
+ * `DndContext` (see `RecentTabList`), and a `useSortable` call there would throw. Keeping
+ * the body sortable-agnostic means both modes run the same interaction code instead of a
+ * second copy that drifts.
+ */
+function TabItemBody({
 	tab,
 	active,
 	onRemove,
+	onTogglePin,
 	onNavigate,
 	onContextMenu,
 	onPrefetch,
 	connectTop,
 	onWsAddClick,
-	dimmed,
-	wsGroupHeight,
-}: SortableTabItemProps) {
+	hideSubtitle,
+	indent,
+	isDragging = false,
+	outerRef,
+	outerStyle,
+	dragProps,
+}: TabItemBodyProps) {
 	const navigate = useNavigate();
 	const { t } = useTranslation("common");
 	const to =
@@ -1894,20 +2281,6 @@ const SortableTabItem = React.memo(function SortableTabItem({
 					: `/narrators/${tab.id}`;
 	const iconColor = getRecentTabIconColor(tab);
 	const filledStatus = isFilledRecentTabStatus(tab);
-
-	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-		id: tabSortId(tab),
-	});
-
-	const sortStyle: React.CSSProperties = {
-		transform: CSS.Transform.toString(transform),
-		transition,
-		opacity: isDragging || dimmed ? 0 : 1,
-		zIndex: isDragging ? 10 : undefined,
-		// When dragging a workspace header, reserve the full group height
-		// (header + children) so the gap placeholder matches the overlay size.
-		...(isDragging && wsGroupHeight ? { height: wsGroupHeight } : {}),
-	};
 
 	const handlePrefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
 
@@ -1956,13 +2329,20 @@ const SortableTabItem = React.memo(function SortableTabItem({
 		[onContextMenu, tab],
 	);
 
-	// Swipe-right to close (mobile) — only when not dragging
+	// Horizontal swipe gestures (touch only, and only when dnd-kit is not dragging):
+	// right closes the tab, left toggles pinned.
+	//
+	// Left-swipe exists because pinning had NO touch entry point at all. The only other
+	// way in is the right-click menu, and on touch that menu never opens: long-press
+	// fires `contextmenu`, which `handleContextMenu` suppresses (otherwise every
+	// long-press-to-drag would pop a menu).
 	const touchStartX = useRef(0);
 	const touchStartY = useRef(0);
 	const swiping = useRef(false);
 	const directionLocked = useRef<"horizontal" | "vertical" | null>(null);
 	const [swipeX, setSwipeX] = useState(0);
 	const [exiting, setExiting] = useState(false);
+	const canPin = !!onTogglePin;
 
 	const handleTouchStart = useCallback((e: React.TouchEvent) => {
 		isTouching.current = true;
@@ -1983,9 +2363,9 @@ const SortableTabItem = React.memo(function SortableTabItem({
 				directionLocked.current = Math.abs(dy) > Math.abs(dx) ? "vertical" : "horizontal";
 			}
 			if (directionLocked.current === "vertical") return;
-			setSwipeX(Math.max(0, dx));
+			setSwipeX(clampSwipeTravel(dx, canPin));
 		},
-		[isDragging],
+		[isDragging, canPin],
 	);
 
 	const handleTouchEnd = useCallback(() => {
@@ -1998,13 +2378,17 @@ const SortableTabItem = React.memo(function SortableTabItem({
 			return;
 		}
 		swiping.current = false;
-		if (swipeX > SWIPE_THRESHOLD) {
+		const release = classifySwipeRelease(swipeX, canPin);
+		if (release === "close") {
 			setExiting(true);
 			setTimeout(() => onRemove(tab.type, tab.id), 200);
-		} else {
-			setSwipeX(0);
+			return;
 		}
-	}, [swipeX, isDragging, tab.type, tab.id, onRemove]);
+		// Both remaining outcomes snap the row home. Pinning does not fly the row out:
+		// it stays in the list and only moves between the pinned and unpinned groups.
+		setSwipeX(0);
+		if (release === "pin") onTogglePin?.(tab);
+	}, [swipeX, isDragging, tab, onRemove, canPin, onTogglePin]);
 
 	const swipeStyle: React.CSSProperties = exiting
 		? {
@@ -2012,9 +2396,16 @@ const SortableTabItem = React.memo(function SortableTabItem({
 				opacity: 0,
 				transition: "transform 0.2s ease-out, opacity 0.2s ease-out",
 			}
-		: swipeX > 0
+		: swipeX !== 0
 			? { transform: `translateX(${swipeX}px)`, transition: "none" }
-			: {};
+			: // Animate the snap-back so a released half-swipe glides home instead of
+				// teleporting. Harmless at rest: nothing is moving.
+				{ transform: "translateX(0)", transition: "transform 0.15s ease-out" };
+
+	// Affordance revealed under the row while swiping left. It has to live BEHIND the row
+	// (the row itself is what moves), so it is absolutely positioned in the clipped outer
+	// wrapper and only mounted while the gesture is in progress.
+	const pinHintActive = swipeX < -SWIPE_THRESHOLD;
 
 	// Cross-component drag — pointerdown on icon starts a global narrator drag.
 	// We use onPointerDown + stopPropagation so @dnd-kit's PointerSensor
@@ -2038,12 +2429,34 @@ const SortableTabItem = React.memo(function SortableTabItem({
 
 	return (
 		<div
-			ref={setNodeRef}
-			{...attributes}
-			{...listeners}
-			style={{ ...sortStyle, overflow: "hidden", touchAction: "pan-y" }}
+			ref={outerRef}
+			{...dragProps}
+			style={{
+				...outerStyle,
+				overflow: "hidden",
+				touchAction: "pan-y",
+				// Anchor for the swipe-left pin affordance below.
+				position: "relative",
+			}}
 			data-tab-sort-id={tabSortId(tab)}
 		>
+			{swipeX < 0 && (
+				<Group
+					gap={4}
+					wrap="nowrap"
+					justify="flex-end"
+					pr="sm"
+					style={{
+						position: "absolute",
+						inset: 0,
+						pointerEvents: "none",
+						color: pinHintActive ? "var(--mantine-color-indigo-4)" : "var(--mantine-color-dimmed)",
+					}}
+				>
+					{tab.pinned ? <IconPinnedOff size={16} /> : <IconPin size={16} />}
+					<Text size="xs">{t(tab.pinned ? "swipeUnpin" : "swipePin")}</Text>
+				</Group>
+			)}
 			<div style={swipeStyle}>
 				<NavLink
 					active={active}
@@ -2056,6 +2469,7 @@ const SortableTabItem = React.memo(function SortableTabItem({
 					onTouchStart={handleTouchStart}
 					onTouchMove={handleTouchMove}
 					onTouchEnd={handleTouchEnd}
+					pl={indent ? "lg" : undefined}
 					label={
 						<Group gap={4} wrap="nowrap" style={{ overflow: "hidden" }}>
 							{tab.pinned && <IconPin size={12} style={{ flexShrink: 0, opacity: 0.5 }} />}
@@ -2066,7 +2480,7 @@ const SortableTabItem = React.memo(function SortableTabItem({
 					}
 					description={
 						<>
-							{tab.subtitle && (
+							{tab.subtitle && !hideSubtitle && (
 								<Text
 									size="xs"
 									c="dimmed"
@@ -2126,7 +2540,105 @@ const SortableTabItem = React.memo(function SortableTabItem({
 			</div>
 		</div>
 	);
+}
+
+interface SortableTabItemProps
+	extends Omit<TabItemBodyProps, "outerRef" | "outerStyle" | "dragProps" | "isDragging"> {
+	/** When true, reduce opacity to indicate the item is being dragged */
+	dimmed?: boolean;
+	/** Measured group height (header + children) — applied when dragging a workspace */
+	wsGroupHeight?: number;
+}
+
+/** Draggable row for the flat list: `useSortable` wrapper around {@link TabItemBody}. */
+const SortableTabItem = React.memo(function SortableTabItem({
+	dimmed,
+	wsGroupHeight,
+	...bodyProps
+}: SortableTabItemProps) {
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: tabSortId(bodyProps.tab),
+	});
+
+	const sortStyle: React.CSSProperties = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+		opacity: isDragging || dimmed ? 0 : 1,
+		zIndex: isDragging ? 10 : undefined,
+		// When dragging a workspace header, reserve the full group height
+		// (header + children) so the gap placeholder matches the overlay size.
+		...(isDragging && wsGroupHeight ? { height: wsGroupHeight } : {}),
+	};
+
+	return (
+		<TabItemBody
+			{...bodyProps}
+			isDragging={isDragging}
+			outerRef={setNodeRef}
+			outerStyle={sortStyle}
+			dragProps={{ ...attributes, ...listeners }}
+		/>
+	);
 });
+
+/**
+ * Non-draggable row, for the children of a workspace in directory mode.
+ *
+ * In directory mode a workspace moves as ONE unit (dragging the header moves the whole
+ * structure, and its members are not pulled into directory groups either), so children
+ * must not register as sortable — but they still render inside the DndContext. Keeping
+ * this sortable-free variant shares the interaction code instead of forking it.
+ */
+const StaticTabItem = React.memo(function StaticTabItem(
+	props: Omit<TabItemBodyProps, "outerRef" | "outerStyle" | "dragProps" | "isDragging">,
+) {
+	return <TabItemBody {...props} />;
+});
+
+/**
+ * Sortable wrapper for a directory group header. The header is the unit's drag handle
+ * AND its collapse toggle, so the click must go through the same post-drag suppression
+ * (`justDragged`) the flat rows use — without it, every reorder would also fold the group.
+ */
+function SortableDirectoryRow(props: RecentTabDirectoryRowProps) {
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: directoryRowId(props.path),
+	});
+
+	const style: React.CSSProperties = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+		opacity: isDragging ? 0 : 1,
+		zIndex: isDragging ? 10 : undefined,
+	};
+
+	const handleToggle = (path: string) => {
+		if (justDragged) {
+			justDragged = false;
+			return;
+		}
+		props.onToggle(path);
+	};
+
+	return (
+		<div ref={setNodeRef} {...attributes} {...listeners} style={style}>
+			<RecentTabDirectoryRow {...props} onToggle={handleToggle} />
+		</div>
+	);
+}
+
+/** Resolve a sortable id to its tab across the aggregated rows (for drag previews). */
+function findDirectoryRowTab(rows: RecentTabRow[], sortId: string): RecentTab | null {
+	for (const row of rows) {
+		if (row.kind === "directory") {
+			const hit = row.children.find((child) => tabSortId(child) === sortId);
+			if (hit) return hit;
+			continue;
+		}
+		if (tabSortId(row.tab) === sortId) return row.tab;
+	}
+	return null;
+}
 
 // === Indicator components for extra tab info ===
 

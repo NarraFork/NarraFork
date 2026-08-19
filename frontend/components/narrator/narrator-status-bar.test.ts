@@ -190,9 +190,49 @@ describe("NarratorPanel status layout contract", () => {
 
 		expect(source).toContain('aria-label={t("path_rules")}');
 		expect(source.match(/aria-label=\{t\("relaxed_plan"\)\}/g)).toHaveLength(2);
-		expect(source.match(/aria-label=\{terminalActionLabel\}/g)).toHaveLength(2);
 		expect(source).toContain('aria-label={t("modelTooltip")}');
 		expect(source).toContain('aria-label={t("reasoningEffort")}');
 		expect(source).toContain('aria-label={t("permissionMode")}');
+
+		/*
+		 * The terminal entry moved into the registry-driven header toolbar, so its
+		 * accessible name now comes from the resolved registry label rather than a
+		 * local `terminalActionLabel` binding. Only the status-bar copy computes its
+		 * own name inline.
+		 *
+		 * Asserted as "every terminal button has SOME aria-label" rather than by
+		 * matching one expression: the point of this test is that an icon-only
+		 * control is never nameless, and pinning it to a specific variable name is
+		 * what made it fail on a refactor that kept the names intact.
+		 */
+		// Walk back from each terminal icon to the ActionIcon that opens it, rather
+		// than matching a fixed window: a character budget silently reports "no
+		// terminal buttons found" the moment a prop is reformatted, which passes a
+		// `length > 0` check only by accident.
+		const terminalButtons: string[] = [];
+		for (let at = source.indexOf("<IconTerminal"); at !== -1; ) {
+			const open = source.lastIndexOf("<ActionIcon", at);
+			if (open !== -1) terminalButtons.push(source.slice(open, at));
+			at = source.indexOf("<IconTerminal", at + 1);
+		}
+		expect(terminalButtons.length).toBeGreaterThan(0);
+		for (const button of terminalButtons) {
+			expect(button).toContain("aria-label=");
+		}
+	});
+
+	test("registry-driven header entries are never nameless icons", async () => {
+		const source = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
+
+		// Header tool entries render from `narrator-toolbar-items.tsx`, so their
+		// accessible name is the resolved registry label. If this wiring is dropped,
+		// EVERY tool button in the header loses its name at once — a single missing
+		// prop, but a whole row of unlabelled icons.
+		expect(source).toContain("aria-label={label}");
+		// The overflow trigger owns its own name (it is not a registry entry).
+		const overflow = await Bun.file(
+			new URL("./NarratorToolbarOverflowMenu.tsx", import.meta.url),
+		).text();
+		expect(overflow).toContain("aria-label={moreLabel}");
 	});
 });

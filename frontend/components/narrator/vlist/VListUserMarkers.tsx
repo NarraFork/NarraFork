@@ -16,13 +16,20 @@
  * width — the controlled shell exception the guard already allows for the
  * scroll container.
  *
- * Tooltips are native `title` attributes rather than Mantine `Tooltip`s on
- * purpose: a long conversation renders a hundred marks, and a hundred floating
- * instances would be paid for on every scroll frame to show text the browser
- * renders for free.
+ * Tooltips are a single in-page element shared by all marks rather than native
+ * `title` attributes or one Mantine `Tooltip` per mark: native tooltips carry the
+ * OS delay and styling, and a hundred floating instances would be paid for on
+ * every scroll frame. Hovering a mark swaps the shared tooltip's text and
+ * position, so the cost stays constant no matter how long the conversation is.
+ *
+ * The tooltip clamps itself INSIDE the track using its own measured height, so
+ * a mark at the very top/bottom of the viewport never pushes it under the
+ * panel's title bar or composer. Measuring the tooltip (an overlay element we
+ * own) touches no document row, so the height-neutrality law above is intact.
  */
 
-import { memo, type RefObject, useEffect, useState } from "react";
+import { formatShortMessageTime } from "@frontend/lib/intl-format";
+import { memo, type RefObject, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
 	resolveVListUserMarkerTop,
 	shouldShowVListUserMarkers,
@@ -40,6 +47,21 @@ const MARKER_HEIGHT = 6;
  * paths sit at the same distance from the right edge.
  */
 const OVERLAY_SCROLLBAR_GUTTER = 2;
+
+/** Gap between a hovered mark and the shared tooltip's right edge. */
+const TOOLTIP_GAP = 6;
+/** Keeps the shared tooltip off the very top/bottom edge of the track. */
+const TOOLTIP_EDGE_GAP = 10;
+
+/** The one tooltip shown at a time: text lines plus the mark's track offset. */
+interface HoveredMarkerTooltip {
+	key: string;
+	/** "#3 · first words of the turn" — the main line. */
+	label: string;
+	/** Formatted send time, "" when the row carries no timestamp. */
+	timeLabel: string;
+	top: number;
+}
 
 export interface VListUserMarkersProps {
 	markers: readonly VListUserMarker[];
@@ -70,6 +92,9 @@ export const VListUserMarkers = memo(function VListUserMarkers({
 	resolveLabel,
 }: VListUserMarkersProps) {
 	const [scrollbarWidth, setScrollbarWidth] = useState(0);
+	const [hoveredTooltip, setHoveredTooltip] = useState<HoveredMarkerTooltip | null>(null);
+	const tooltipRef = useRef<HTMLDivElement | null>(null);
+	const [tooltipHeight, setTooltipHeight] = useState(0);
 
 	useEffect(() => {
 		const node = viewportRef.current;
@@ -85,7 +110,22 @@ export const VListUserMarkers = memo(function VListUserMarkers({
 		return () => observer.disconnect();
 	}, [viewportRef]);
 
+	// Measure the tooltip itself so the clamp below keeps its WHOLE box inside
+	// the track — a center-anchored tooltip next to a first/last mark would
+	// otherwise overflow the viewport edge and slide under the panel chrome.
+	// Runs every render (no dep array): the tooltip's height follows its text,
+	// which changes on every hover swap, and one offsetHeight read is trivial.
+	useLayoutEffect(() => {
+		const node = tooltipRef.current;
+		const height = node ? node.offsetHeight : 0;
+		setTooltipHeight((previous) => (previous === height ? previous : height));
+	});
+
 	if (!shouldShowVListUserMarkers(markers.length, documentHeight, trackHeight)) return null;
+
+	const tooltipHalf = tooltipHeight / 2;
+	const tooltipMinTop = TOOLTIP_EDGE_GAP + tooltipHalf;
+	const tooltipMaxTop = Math.max(tooltipMinTop, trackHeight - TOOLTIP_EDGE_GAP - tooltipHalf);
 
 	return (
 		<div
@@ -111,20 +151,21 @@ export const VListUserMarkers = memo(function VListUserMarkers({
 			>
 				{markers.map((marker) => {
 					const label = resolveLabel(marker.ordinal);
+					const top = resolveVListUserMarkerTop(marker.fraction, trackHeight, MARKER_HEIGHT);
+					const tooltipLabel = marker.preview
+						? `#${marker.ordinal} · ${marker.preview}`
+						: `#${marker.ordinal}`;
 					return (
 						<button
 							type="button"
 							key={marker.key}
 							tabIndex={-1}
-							title={
-								marker.preview ? `#${marker.ordinal} · ${marker.preview}` : `#${marker.ordinal}`
-							}
 							aria-label={label}
 							data-vlist-user-marker={marker.ordinal}
 							onClick={() => onJump(marker)}
 							style={{
 								position: "absolute",
-								top: resolveVListUserMarkerTop(marker.fraction, trackHeight, MARKER_HEIGHT),
+								top,
 								right: 0,
 								width: MARKER_WIDTH,
 								height: MARKER_HEIGHT,
@@ -138,13 +179,57 @@ export const VListUserMarkers = memo(function VListUserMarkers({
 							}}
 							onMouseEnter={(event) => {
 								event.currentTarget.style.width = `${MARKER_HOVER_WIDTH}px`;
+								// Formatted on hover, not per render: a long conversation renders a
+								// hundred marks, and a hundred Intl.DateTimeFormat calls per render
+								// pass would be paid to show one tooltip at a time.
+								const timeLabel = marker.createdAt ? formatShortMessageTime(marker.createdAt) : "";
+								setHoveredTooltip({ key: marker.key, label: tooltipLabel, timeLabel, top });
 							}}
 							onMouseLeave={(event) => {
 								event.currentTarget.style.width = `${MARKER_WIDTH}px`;
+								setHoveredTooltip((current) => (current?.key === marker.key ? null : current));
 							}}
 						/>
 					);
 				})}
+				{hoveredTooltip && (
+					<div
+						ref={tooltipRef}
+						data-vlist-user-marker-tooltip
+						style={{
+							position: "absolute",
+							right: MARKER_HOVER_WIDTH + TOOLTIP_GAP,
+							top: Math.min(Math.max(hoveredTooltip.top, tooltipMinTop), tooltipMaxTop),
+							transform: "translateY(-50%)",
+							// The track is only MARKER_WIDTH wide; without max-content the
+							// shrink-to-fit width collapses to it and the text wraps per
+							// character into a vertical strip.
+							width: "max-content",
+							maxWidth: 260,
+							padding: "4px 8px",
+							borderRadius: 4,
+							backgroundColor: "var(--mantine-color-dark-6)",
+							color: "var(--mantine-color-gray-1)",
+							fontSize: 12,
+							lineHeight: 1.4,
+							overflowWrap: "anywhere",
+							pointerEvents: "none",
+						}}
+					>
+						{hoveredTooltip.timeLabel && (
+							<div
+								style={{
+									color: "var(--mantine-color-gray-5)",
+									fontSize: 11,
+									marginBottom: 1,
+								}}
+							>
+								{hoveredTooltip.timeLabel}
+							</div>
+						)}
+						<div style={{ whiteSpace: "pre-wrap" }}>{hoveredTooltip.label}</div>
+					</div>
+				)}
 			</div>
 		</div>
 	);

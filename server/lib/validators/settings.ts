@@ -1,3 +1,4 @@
+import { PERSISTED_NARRATOR_TOOLBAR_IDS } from "@shared/narrator-toolbar";
 import { PERSISTED_NAV_IDS } from "@shared/nav-layout";
 import {
 	RECENT_TABS_LIVE_LIMIT,
@@ -124,6 +125,23 @@ const navLayoutSchema = z.object({
 		.max(20),
 });
 
+/**
+ * Narrator header toolbar layout: same flat-list-plus-divider shape as
+ * `navLayoutSchema`, and sourced from @shared/narrator-toolbar for the same
+ * anti-drift reason — an id the frontend renders but this enum rejects makes the
+ * whole layout unsavable, and the failure surfaces only as "my customization did
+ * not stick".
+ */
+const narratorToolbarLayoutSchema = z.object({
+	items: z
+		.array(
+			z.object({
+				id: z.enum(PERSISTED_NARRATOR_TOOLBAR_IDS),
+			}),
+		)
+		.max(30),
+});
+
 export const updateUserPreferencesSchema = z.object({
 	autoLoadOlderMessages: z.boolean().optional(),
 	fastModeDefault: z.boolean().optional(),
@@ -137,6 +155,7 @@ export const updateUserPreferencesSchema = z.object({
 	terminalTheme: z.string().min(1).max(50).optional(),
 	terminalFontSize: z.number().int().min(8).max(32).optional(),
 	addSubagentToRecentTabs: z.boolean().optional(),
+	recentTabsGroupMode: z.enum(["flat", "directory"]).optional(),
 	// Notification preferences
 	notifyOnDone: z.boolean().optional(),
 	notifyOnWaiting: z.boolean().optional(),
@@ -177,6 +196,8 @@ export const updateUserPreferencesSchema = z.object({
 	gatewayConfig: gatewayConfigSchema.optional(),
 	// Sidebar navigation layout: order = display order, hidden:true = tucked into "More" menu
 	navLayout: navLayoutSchema.optional(),
+	// Narrator header toolbar layout: order = priority, position vs divider = surfaced or tucked
+	narratorToolbarLayout: narratorToolbarLayoutSchema.optional(),
 });
 
 const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
