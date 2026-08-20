@@ -83,6 +83,10 @@ function installDom() {
 		Event: window.Event,
 		HTMLElement: window.HTMLElement,
 		HTMLButtonElement: window.HTMLButtonElement,
+		// The plain-http clipboard fallback builds an <input> and reads it back, so
+		// the constructor has to be reachable as a global (see installLegacyClipboard).
+		HTMLInputElement: window.HTMLInputElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
 		Element: window.Element,
 		Node: window.Node,
 		Text: window.Text,
@@ -221,6 +225,63 @@ function buttonByLabel(container: HTMLElement, label: string): HTMLButtonElement
 		throw new Error(`Button not found: ${label}`);
 	}
 	return button;
+}
+
+/**
+ * Present the DOM as a NON-secure context with no Clipboard API, which is what
+ * `copyTextToClipboard` sees on a plain-http deployment — the shape this project
+ * explicitly supports (small-team private hosting, frequently http on a LAN).
+ *
+ * Worth its own harness because the two branches copy by completely different
+ * means: the Clipboard API takes the string directly, while this one has to build
+ * a form control, select it and run `execCommand`. A test that only ever installs
+ * `navigator.clipboard` verifies the branch that plain-http users never reach.
+ *
+ * Returns the values `execCommand("copy")` would have placed on the clipboard,
+ * read off the temporary element the way the platform would.
+ */
+function installLegacyClipboard(): string[] {
+	const copied: string[] = [];
+	// linkedom implements neither, and the fallback calls both on the element it
+	// creates; without them the copy throws instead of exercising the path.
+	//
+	// `defineProperty`, not `Object.assign`: linkedom shares ONE
+	// `HTMLInputElement.prototype` across every window it hands out, and sibling
+	// suites (useClipboard, clipboard, CopyButton) install these same stubs with
+	// `defineProperty` — which leaves them `writable: false`. Assigning over that
+	// throws, so this harness worked alone and failed whenever one of those suites
+	// ran first in the same process.
+	for (const proto of [
+		globalThis.HTMLInputElement.prototype,
+		globalThis.HTMLTextAreaElement.prototype,
+	]) {
+		Object.defineProperties(proto, {
+			select: { value: () => {}, configurable: true },
+			setSelectionRange: { value: () => {}, configurable: true },
+		});
+	}
+	Object.defineProperty(globalThis.navigator, "clipboard", {
+		value: undefined,
+		configurable: true,
+	});
+	Object.defineProperty(globalThis.window, "isSecureContext", {
+		value: false,
+		configurable: true,
+	});
+	Object.defineProperty(globalThis.document, "execCommand", {
+		configurable: true,
+		value: (command: string) => {
+			if (command !== "copy") return false;
+			// Read the throwaway control the fallback appended. Located by its
+			// `aria-hidden` marker rather than `document.activeElement`, because
+			// linkedom's `focus()` does not move the active element — trusting it here
+			// would make this test pass on an empty clipboard.
+			const source = globalThis.document.querySelector('input[aria-hidden="true"]');
+			if (source instanceof globalThis.HTMLInputElement) copied.push(source.value);
+			return true;
+		},
+	});
+	return copied;
 }
 
 /** Tree rows are role="button" divs so their own action icons can stay nested. */
@@ -698,6 +759,117 @@ describe("GitPanel", () => {
 
 		expect(calls).toEqual([{ name: "stage", body: { all: true } }, { name: "ai" }]);
 		expect(container.querySelector("input")?.value).toBe("fix: update file");
+
+		queryClient.clear();
+	});
+
+	const LONG_BRANCH = "chapter/very-long-branch-name-Bo_bRv";
+
+	/** Mount the panel with `gitStatus` pre-seeded for a branch. */
+	async function renderWithBranch(chapterId: string, branch: string) {
+		const status = makeStatus();
+		status.branch = branch;
+		const queryClient = new QueryClient({
+			defaultOptions: {
+				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
+				mutations: { retry: false },
+			},
+		});
+		queryClient.setQueryData(["gitStatus", chapterId], status);
+
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<GitPanel chapterId={chapterId} />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+		return { container, queryClient };
+	}
+
+	/**
+	 * The header answers "which branch am I staging into". It reads the SAME
+	 * `gitStatus` query the Changes tab already fetches, so seeding that key is all
+	 * the setup it needs — if it ever grows its own request, this test keeps
+	 * passing while a second round-trip appears, so the assertion below on the copy
+	 * payload is the part that matters: it must be the full branch name, not the
+	 * truncated text the row displays.
+	 *
+	 * This covers the Clipboard API branch (secure context). The plain-http fallback
+	 * is a separate path and gets its own test below.
+	 */
+	test("shows the branch in a header and copies the full name on click", async () => {
+		const copied: string[] = [];
+		// A SECURE context has to be stated, not assumed: sibling clipboard suites
+		// pin `isSecureContext: false` onto linkedom's shared prototypes, and
+		// `canUseClipboardApi` bails on that — leaving this test silently exercising
+		// the fallback instead of the branch it names.
+		Object.defineProperty(globalThis.window, "isSecureContext", {
+			value: true,
+			configurable: true,
+		});
+		Object.defineProperty(globalThis.navigator, "clipboard", {
+			configurable: true,
+			value: {
+				writeText: async (text: string) => {
+					copied.push(text);
+				},
+			},
+		});
+
+		const { container, queryClient } = await renderWithBranch(
+			"chapter-git-branch-header",
+			LONG_BRANCH,
+		);
+
+		expect(container.textContent).toContain(LONG_BRANCH);
+		// Short HEAD sha, so the header identifies the commit as well as the branch.
+		expect(container.textContent).toContain("abc1234");
+
+		buttonByLabel(container, "Copy branch name").dispatchEvent(
+			new Event("click", { bubbles: true }),
+		);
+		await flushRender();
+
+		expect(copied).toEqual([LONG_BRANCH]);
+
+		queryClient.clear();
+	});
+
+	/**
+	 * The same button on a plain-http deployment, where `navigator.clipboard` is
+	 * absent and `copyTextToClipboard` falls back to a selected form control plus
+	 * `execCommand`. NarraFork is built for small-team private hosting, so LAN http
+	 * is a first-class deployment and this is the branch those users actually run —
+	 * yet a test that installs `navigator.clipboard` never reaches it, and a failure
+	 * here is silent: the icon still flips to the check mark (the promise resolves as
+	 * long as nothing throws) while the clipboard holds nothing.
+	 */
+	test("copies the branch through the plain-http fallback too", async () => {
+		const copied = installLegacyClipboard();
+
+		const { container, queryClient } = await renderWithBranch(
+			"chapter-git-branch-header-legacy",
+			LONG_BRANCH,
+		);
+
+		buttonByLabel(container, "Copy branch name").dispatchEvent(
+			new Event("click", { bubbles: true }),
+		);
+		await flushRender();
+
+		expect(copied).toEqual([LONG_BRANCH]);
+		// The throwaway control must not survive the copy, or it would accumulate in
+		// the document on every click.
+		expect(document.querySelectorAll('input[aria-hidden="true"]').length).toBe(0);
 
 		queryClient.clear();
 	});

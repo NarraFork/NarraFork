@@ -1,6 +1,8 @@
 {
 	"panel.title": "Git",
 	"panel.noChapter": "No chapter",
+	"panel.copyBranch": "Copy branch name",
+	"panel.branchCopied": "Copied",
 	"panel.changes": "Changes",
 	"panel.commits": "Commits",
 	"panel.stash": "Stash",

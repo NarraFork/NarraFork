@@ -2213,6 +2213,7 @@ function DetailBlocks({
 	// `c="red"`: red-4 on dark, red-filled on light (red-4 washes out on white).
 	const color = kind === "error" ? "var(--mantine-color-red-text)" : undefined;
 	const isSpecTasks = kind === "spec-tasks";
+	const isError = kind === "error";
 	return (
 		<div style={{ position: "relative", width: availableWidth, height }}>
 			{blocks.map((block, index) => {
@@ -2236,7 +2237,14 @@ function DetailBlocks({
 					// measured line geometry stays authoritative.
 					const href = typeof data.href === "string" ? data.href : null;
 					const dimmed = data.dimmed === true;
-					const lineColor = taskStatus === "done" || dimmed ? "var(--mantine-color-dimmed)" : color;
+					// A warning-toned error line is a DENIED PLAN's reviewer feedback: the
+					// user's own note back to the model, not a tool failure. The chunked
+					// PlanDetail paints it yellow, so red here would misreport it as an
+					// error while showing the identical text.
+					const toneColor =
+						isError && data.tone === "warning" ? "var(--mantine-color-yellow-text)" : color;
+					const lineColor =
+						taskStatus === "done" || dimmed ? "var(--mantine-color-dimmed)" : toneColor;
 					return (
 						<InlineLines
 							// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list

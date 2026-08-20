@@ -2920,6 +2920,7 @@ function buildToolCardData(
 	const inputJson = withFullInput(item, ctx);
 	const outputJson = withFullOutput(item, ctx);
 	const errorMessage = readNonEmptyString(item.tc, "errorMessage");
+	const denyMessage = nonEmptyTrimmed(item.tc.permissionDenyMessage);
 	return {
 		toolName: item.tc.toolName,
 		summary: toolSummary(item.tc, ctx),
@@ -2956,6 +2957,15 @@ function buildToolCardData(
 			metadata,
 			isStreaming,
 			...(errorMessage ? { errorMessage } : {}),
+			// The reviewer's note on the permission decision lives in a TOP-LEVEL
+			// column, not in `_metadata`, so the classifier cannot reach it on its own.
+			// A denied ExitPlanMode shows this text above the plan; without forwarding
+			// it the vlist card dropped the user's typed reason entirely.
+			//
+			// Forwarded UNCONDITIONALLY, including on a successful call: the column also
+			// holds approval feedback, and `status` travels alongside it (above), so the
+			// classifier is the single place that decides what counts as a denial.
+			...(denyMessage ? { denyMessage } : {}),
 			hasPendingPermission,
 			// Only MEASURED chrome strings (the ask replay's answer prefixes) —
 			// render-layer chrome is injected through renderLabels instead.

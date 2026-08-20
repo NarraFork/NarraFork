@@ -23,6 +23,7 @@ import {
 } from "@mantine/core";
 import { useClipboard, useMediaQuery } from "@mantine/hooks";
 import { hasUsablePlanBody } from "@shared/plan-reference";
+import { isServerAuthoredDenyMessage } from "@shared/pretext-layout/tool-detail";
 import {
 	collectTruncatedLeaves,
 	hasTruncatedLeaf,
@@ -4339,8 +4340,18 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 			: "";
 
 	const isDenied = toolCall.status === "fail" && toolCall.toolName === "ExitPlanMode";
-	// User feedback is stored in permissionDenyMessage (raw user input, not the full system prompt)
-	const denyFeedback = isDenied ? (toolCall.permissionDenyMessage ?? undefined) : undefined;
+	// User feedback is stored in permissionDenyMessage (raw user input, not the full
+	// system prompt). The `isDenied` gate matters beyond the status badge: the same
+	// column also holds the note typed alongside an APPROVAL, which would read as a
+	// rejection of an accepted plan.
+	const rawDenyFeedback = isDenied ? (toolCall.permissionDenyMessage ?? undefined) : undefined;
+	// Server-authored values (the feedback-less placeholder, a reprocessing failure)
+	// must not be presented as the reviewer's words. Shared with the vlist path so
+	// both cards hide exactly the same set.
+	const denyFeedback =
+		rawDenyFeedback && !isServerAuthoredDenyMessage(rawDenyFeedback.trim())
+			? rawDenyFeedback
+			: undefined;
 	const [planExpanded, setPlanExpanded] = useState(!isDenied);
 
 	const planSourceNotice = planFile ? (
@@ -4360,7 +4371,7 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 	if (isDenied) {
 		return (
 			<Box mt="xs">
-				{denyFeedback && denyFeedback !== "Permission denied by user" && (
+				{denyFeedback && (
 					<Text size="xs" c="yellow" mb={4}>
 						{denyFeedback}
 					</Text>

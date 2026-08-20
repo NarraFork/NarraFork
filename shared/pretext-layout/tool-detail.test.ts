@@ -1269,6 +1269,13 @@ describe("classifyToolDetail — taskOutput", () => {
 });
 
 describe("classifyToolDetail — plan deny feedback", () => {
+	/** The (unlabelled) feedback body of a denied plan. */
+	function denyBody(detail: ToolDetailData | null): ToolErrorDetail {
+		const found = asSections(detail).sections.find((s) => s.body?.kind === "error");
+		if (!found) throw new Error(`no feedback body in ${JSON.stringify(detail)}`);
+		return found.body as ToolErrorDetail;
+	}
+
 	it("keeps the denial feedback above the plan body", () => {
 		const d = classifyToolDetail({
 			toolName: "ExitPlanMode",
@@ -1276,8 +1283,135 @@ describe("classifyToolDetail — plan deny feedback", () => {
 			inputJson: { plan: "the plan" },
 			metadata: { denyFeedback: "needs more detail" },
 		});
-		expect((sectionBody(d, "error") as ToolErrorDetail).text).toBe("needs more detail");
+		expect(denyBody(d).text).toBe("needs more detail");
 		expect((sectionBody(d, "plan") as ToolCappedDetail).text).toBe("the plan");
+	});
+
+	// An "Error" heading would file the reviewer's own note under tool failures;
+	// the chunked PlanDetail prints it bare. `status: "fail"` is required for the
+	// column to be read at all, and without it this would pass because NO feedback
+	// section was produced rather than because the one produced is unlabelled.
+	it("leaves the feedback body unlabelled", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			denyMessage: "needs more detail",
+		});
+		expect(denyBody(d).text).toBe("needs more detail");
+		expect(hasSection(d, "error")).toBe(false);
+	});
+
+	// `permissionDenyMessage` is a TOP-LEVEL tool-call column, NOT a `_metadata`
+	// key: enrichToolUseBlocks copies it onto the block itself. Reading only the
+	// metadata keys is why a plan denied with typed feedback rendered as a bare
+	// collapsed plan — the user's own words were dropped with no error anywhere.
+	it("reads the denial feedback from the top-level denyMessage field", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			denyMessage: "split step 2 first",
+		});
+		expect(denyBody(d).text).toBe("split step 2 first");
+		expect((sectionBody(d, "plan") as ToolCappedDetail).text).toBe("the plan");
+	});
+
+	// The feedback is the reviewer's note back to the model, not a tool failure —
+	// the chunked PlanDetail paints it yellow, so the tone has to travel.
+	it("marks the feedback as a warning, not an error", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			denyMessage: "split step 2 first",
+		});
+		expect(denyBody(d).tone).toBe("warning");
+	});
+
+	// A deny with NO feedback stores an English system placeholder. Presenting it
+	// would attribute a system string to the user, so it counts as "no feedback".
+	it("drops the system placeholder written when no feedback was typed", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			denyMessage: "Permission denied by user",
+		});
+		expect(d?.kind).toBe("capped");
+		expect((d as ToolCappedDetail).text).toBe("the plan");
+	});
+
+	// `failReprocessedPendingPermission` DOES write this into the column (unlike the
+	// placeholder above, which only reaches `errorMessage`). Its detail text varies,
+	// so it is matched by prefix.
+	it("drops a reprocessing-failure message, whatever detail it carries", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			denyMessage: "Permission reprocessing failed: target narrator is frozen",
+		});
+		expect(d?.kind).toBe("capped");
+	});
+
+	// The column is NOT denial-only: narrator-permission stores `denyMessage ||
+	// feedbackText`, so an APPROVAL with a typed note lands in the same field (20 of
+	// this repository's 162 ExitPlanMode rows with the column set are approvals).
+	// Rendering those as denial feedback tells the reader their accepted plan was
+	// rejected — and the plan body is identical either way, so nothing else in the
+	// card contradicts it.
+	it("ignores the column on an APPROVED plan, where it holds approval feedback", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "success",
+			inputJson: { plan: "the plan" },
+			denyMessage: "批准。方案分析透彻",
+		});
+		expect(d?.kind).toBe("capped");
+		expect((d as ToolCappedDetail).text).toBe("the plan");
+	});
+
+	// A metadata copy (older rows / fixtures) still wins, so nothing regresses for
+	// payloads that already carried it there. Unlike the raw column, `denyFeedback`
+	// names a denial, so it is honoured without a status gate.
+	it("prefers a metadata copy over the top-level field", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			metadata: { denyFeedback: "from metadata" },
+			denyMessage: "from column",
+		});
+		expect(denyBody(d).text).toBe("from metadata");
+	});
+
+	// A denied call's `errorMessage` is the full "[计划模式] 用户拒绝了…" template,
+	// and `withErrorSection` appends it as a SECOND, red, "Error"-labelled section
+	// whenever `outputJson` is null — the same feedback twice, in two colours. Real
+	// denials always persist an output (`_text` + `_metadata`), which is the only
+	// reason it does not happen today; this pins the shape so the invariant is not
+	// left resting on another field being non-null.
+	it("shows the feedback exactly once on a realistic denied call", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			outputJson: { _text: "[计划模式] 用户拒绝了你的计划…", _metadata: { execDurationMs: 0 } },
+			denyMessage: "split step 2 first",
+			errorMessage: "[计划模式] 用户拒绝了你的计划，并附带以下反馈：split step 2 first",
+		});
+		const sections = asSections(d).sections;
+		expect(sections.map((s) => s.label)).toEqual([undefined, "plan"]);
+		expect(denyBody(d).text).toBe("split step 2 first");
 	});
 });
 

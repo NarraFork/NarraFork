@@ -346,6 +346,13 @@ export interface ToolStructuredDetail {
 export interface ToolErrorDetail {
 	kind: "error";
 	text: string;
+	/**
+	 * Render-only tone. `warning` paints the text yellow instead of red, which is
+	 * what a DENIED PLAN's reviewer feedback needs: it is the user's own note back
+	 * to the model, not a tool failure, and the chunked PlanDetail has always shown
+	 * it in yellow. Height-neutral (colour only).
+	 */
+	tone?: "warning";
 }
 
 /** An action control drawn on a meta row (share download / copy link). */
@@ -632,6 +639,20 @@ export interface ClassifyToolDetailInput {
 	/** Tool error text; appended as a trailing error section when nothing else shows it. */
 	errorMessage?: string | null;
 	/**
+	 * The reviewer's note on a permission decision
+	 * (`narrator_tool_calls.permissionDenyMessage`).
+	 *
+	 * A TOP-LEVEL tool-call column rather than a `_metadata` key, hence its own
+	 * field: a denied ExitPlanMode shows this text above the plan body, and reading
+	 * it from metadata alone lost every real denial (the user's typed reason simply
+	 * did not appear).
+	 *
+	 * Despite the column name it is NOT denial-only: `narrator-permission.ts` also
+	 * stores the feedback typed alongside an APPROVAL there. Consumers must gate on
+	 * a failed status before presenting it as a rejection.
+	 */
+	denyMessage?: string | null;
+	/**
 	 * True when a live permission form is mounted for this call. Ask cards suppress
 	 * their read-only question summary in that case (the interactive banner owns
 	 * the display), which is the ONLY reason `ask` should render nothing.
@@ -644,6 +665,12 @@ export interface ClassifyToolDetailInput {
 	 * therefore cannot be substituted by the render layer.
 	 */
 	labels?: Record<string, string>;
+}
+
+/** Trim a possibly-null string; undefined when absent or blank. */
+function nonEmptyTrimmedText(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	return value.trim() || undefined;
 }
 
 /** True when the status indicates a failed tool call. */
@@ -723,7 +750,14 @@ function classifyByCategory(
 		case "ask":
 			return classifyAsk(inputJson, input.hasPendingPermission === true, input.labels);
 		case "plan":
-			return classifyPlan(inputJson, metadata);
+			// Only a FAILED call's deny message is denial feedback. The same column
+			// carries the note typed alongside an APPROVAL, which reads as a rejection
+			// of an accepted plan if forwarded (see classifyPlan).
+			return classifyPlan(
+				inputJson,
+				metadata,
+				isFailStatus(status) ? nonEmptyTrimmedText(input.denyMessage) : undefined,
+			);
 		case "pipeline":
 			return classifyPipeline(toolName, inputJson, outputJson, metadata);
 		case "terminal":
@@ -1603,9 +1637,40 @@ function classifyAsk(
 	return { kind: "ask", questions };
 }
 
+/**
+ * Deny-message values the SERVER authored, which must never be shown as the
+ * reviewer's words.
+ *
+ * Defensive rather than load-bearing: measured against this repository's database,
+ * zero `permission_deny_message` rows hold either value, because
+ * `narrator-permission.ts` writes `effectiveDenyMessage ?? null` — the placeholder
+ * goes to `errorMessage` only. They are filtered anyway because a future writer
+ * that stores the placeholder in this column would attribute an English system
+ * string to the user with no error anywhere, and because the chunked
+ * `ToolCallCard` filters the same first value (keeping the two paths identical is
+ * the point).
+ *
+ * `Permission reprocessing failed:` IS written to this column (a frozen-target
+ * reprocessing failure), so it is matched by prefix.
+ */
+const PLACEHOLDER_DENY_MESSAGE = "Permission denied by user";
+const REPROCESSING_FAILURE_DENY_PREFIX = "Permission reprocessing failed:";
+
+/**
+ * True when the deny message came from the server, not from a reviewer.
+ *
+ * Exported so the chunked `ToolCallCard` shares this exact judgement: the two
+ * render paths show the same row, and a value one of them hides while the other
+ * prints it as the user's words is a difference no test of either alone can see.
+ */
+export function isServerAuthoredDenyMessage(text: string): boolean {
+	return text === PLACEHOLDER_DENY_MESSAGE || text.startsWith(REPROCESSING_FAILURE_DENY_PREFIX);
+}
+
 function classifyPlan(
 	inputJson: unknown,
 	metadata: Record<string, unknown> | null,
+	denyMessage?: string,
 ): ToolDetailData | null {
 	const planText = extractField(inputJson, "plan") || String(asObject(inputJson)?.plan ?? "");
 	// `hasUsablePlanBody` rejects our own model-facing plan reference. It reaches
@@ -1626,16 +1691,36 @@ function classifyPlan(
 		markdown: true,
 		...(planFile ? { sourcePath: planFile } : {}),
 	});
-	// A denied plan carries the reviewer's feedback above the body.
+	// A DENIED plan carries the reviewer's feedback above the body.
+	//
+	// `permissionDenyMessage` is a TOP-LEVEL tool-call column, not part of
+	// `_metadata` (see narrator-messages' enrichToolUseBlocks) — which is why the
+	// caller forwards it explicitly as `denyMessage`. Reading only the metadata
+	// keys meant the vlist path never found it: a plan denied WITH typed feedback
+	// rendered as a bare collapsed plan, silently dropping the one thing the user
+	// wrote. The metadata keys stay as the first sources so a payload that does
+	// carry them (older rows, synthetic fixtures) keeps working.
+	//
+	// The caller gates `denyMessage` on a FAILED status, because that same column
+	// also holds the feedback typed alongside an APPROVAL (narrator-permission's
+	// `denyMessage || feedbackText`): 20 of this repository's 162 ExitPlanMode rows
+	// with the column set were approvals, and presenting those as denial feedback
+	// tells the reader their accepted plan was rejected. The metadata keys are not
+	// gated — a payload that carries `denyFeedback` is describing a denial by name.
 	const denyFeedback =
 		(metadata ? readLeafText(metadata.denyFeedback) : undefined) ||
 		(metadata ? readLeafText(metadata.permissionDenyMessage) : undefined) ||
+		denyMessage ||
 		"";
-	if (!denyFeedback.trim()) return body;
+	// A server-authored value would put a system string where the user's words
+	// belong (the chunked PlanDetail filters the same placeholder).
+	if (!denyFeedback.trim() || isServerAuthoredDenyMessage(denyFeedback.trim())) return body;
+	// Deliberately UNLABELLED: the chunked PlanDetail prints this text bare, and an
+	// "Error" heading would file the reviewer's own note under tool failures.
 	return {
 		kind: "sections",
 		sections: [
-			{ label: "error", body: { kind: "error", text: denyFeedback } },
+			{ body: { kind: "error", text: denyFeedback, tone: "warning" } },
 			{ label: "plan", body },
 		],
 	};

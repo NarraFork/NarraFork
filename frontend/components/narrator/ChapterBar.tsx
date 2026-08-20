@@ -4,16 +4,7 @@ import { useContainers } from "@frontend/hooks/useContainers";
 import { useChapterContainersCapability } from "@frontend/hooks/usePlatform";
 import { type ApiError, api } from "@frontend/lib/api";
 import { CHAPTER_ROLE_ICONS, statusRegistry } from "@frontend/lib/constants";
-import {
-	ActionIcon,
-	Badge,
-	Collapse,
-	Group,
-	Menu,
-	Text,
-	Tooltip,
-	UnstyledButton,
-} from "@mantine/core";
+import { ActionIcon, Badge, Collapse, Group, Menu, Text, Tooltip } from "@mantine/core";
 import {
 	IconGitCommit,
 	IconGitFork,
@@ -26,9 +17,11 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
+import type React from "react";
 import { lazy, Suspense, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import classes from "./ChapterBar.module.css";
+import { isActivationKey, isTextSelectionGesture } from "./chapter-bar-git-trigger";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 
 // Lazy-loaded heavy panels and modals — only needed when user opens them
@@ -113,6 +106,31 @@ export function ChapterBar({ chapterId, onOpenGitPanel }: ChapterBarProps) {
 		}
 	}, []);
 
+	/**
+	 * Open Git, unless this click was the end of a text selection.
+	 *
+	 * Readers copy the branch name out of this row, and a drag-select ends with a
+	 * click on the same element — without this guard every copy attempt would also
+	 * swap the side panel, and the selection would be lost to the re-render. A
+	 * collapsed selection (a plain click) still opens the panel. The predicate lives
+	 * in chapter-bar-git-trigger.ts, where it is tested directly.
+	 */
+	const handleGitTriggerClick = useCallback(() => {
+		if (isTextSelectionGesture(window.getSelection())) return;
+		openGitPanel?.();
+	}, [openGitPanel]);
+
+	// Keyboard equivalent for the role="button" row. Space is prevented so the
+	// conversation behind it does not scroll instead.
+	const handleGitTriggerKeyDown = useCallback(
+		(e: React.KeyboardEvent) => {
+			if (!isActivationKey(e.key)) return;
+			e.preventDefault();
+			openGitPanel?.();
+		},
+		[openGitPanel],
+	);
+
 	if (!chapter) return null;
 
 	const roleIcon = CHAPTER_ROLE_ICONS[chapter.role] || "";
@@ -134,79 +152,82 @@ export function ChapterBar({ chapterId, onOpenGitPanel }: ChapterBarProps) {
 					backgroundColor: "light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-7))",
 				}}
 			>
-				{/* Left: chapter info — the whole strip is the Git panel affordance, so it
-				    is one button that stretches to the action icons. Cursor + hover tint
-				    are what tell the reader this text is clickable at all; without them
-				    the click target is invisible. */}
-				<UnstyledButton
-					onClick={openGitPanel}
-					disabled={!openGitPanel}
-					title={openGitPanel ? tn("chapterBar.git") : undefined}
+				{/* Left: chapter info — the whole strip opens the Git view. Deliberately a
+				    div with role="button" and not a real <button>: the UA stylesheet gives
+				    buttons `user-select: none`, and readers copy the branch name out of
+				    this row. `handleGitTriggerClick` is what keeps both gestures on the
+				    same element. */}
+				<Group
+					gap={6}
+					wrap="nowrap"
 					className={classes.gitTrigger}
+					role={openGitPanel ? "button" : undefined}
+					tabIndex={openGitPanel ? 0 : undefined}
+					title={openGitPanel ? tn("chapterBar.git") : undefined}
+					onClick={openGitPanel ? handleGitTriggerClick : undefined}
+					onKeyDown={openGitPanel ? handleGitTriggerKeyDown : undefined}
 				>
-					<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
-						{roleIcon && <Text size="xs">{roleIcon}</Text>}
-						<Text size="xs" fw={500} truncate>
-							{chapter.title}
-						</Text>
-						<Text size="xs" c="dimmed">
-							·
-						</Text>
-						<Text size="xs" c="dimmed" ff="monospace" truncate>
-							{chapter.branch}
-						</Text>
-						{gitStatus &&
-							(gitStatus.commitsAhead > 0 ||
-								gitStatus.linesAdded > 0 ||
-								gitStatus.linesRemoved > 0) && (
-								<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-									{gitStatus.commitsAhead > 0 && (
-										<Tooltip
-											label={tn("chapterBar.commitsAhead", {
-												count: gitStatus.commitsAhead,
-												base: gitStatus.baseBranch,
-											})}
+					{roleIcon && <Text size="xs">{roleIcon}</Text>}
+					<Text size="xs" fw={500} truncate>
+						{chapter.title}
+					</Text>
+					<Text size="xs" c="dimmed">
+						·
+					</Text>
+					<Text size="xs" c="dimmed" ff="monospace" truncate>
+						{chapter.branch}
+					</Text>
+					{gitStatus &&
+						(gitStatus.commitsAhead > 0 ||
+							gitStatus.linesAdded > 0 ||
+							gitStatus.linesRemoved > 0) && (
+							<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+								{gitStatus.commitsAhead > 0 && (
+									<Tooltip
+										label={tn("chapterBar.commitsAhead", {
+											count: gitStatus.commitsAhead,
+											base: gitStatus.baseBranch,
+										})}
+									>
+										<Badge
+											size="xs"
+											variant="light"
+											color="blue"
+											leftSection={<IconGitCommit size={10} />}
 										>
-											<Badge
-												size="xs"
-												variant="light"
-												color="blue"
-												leftSection={<IconGitCommit size={10} />}
-											>
-												{gitStatus.commitsAhead}
-											</Badge>
-										</Tooltip>
-									)}
-									{(gitStatus.linesAdded > 0 || gitStatus.linesRemoved > 0) && (
-										<Tooltip label={tn("chapterBar.uncommittedLines")}>
-											<Badge size="xs" variant="light" color="yellow">
-												{gitStatus.linesAdded > 0 && (
-													<Text span size="xs" c="green" fw={600}>
-														+{gitStatus.linesAdded}
-													</Text>
-												)}
-												{gitStatus.linesAdded > 0 && gitStatus.linesRemoved > 0 && " "}
-												{gitStatus.linesRemoved > 0 && (
-													<Text span size="xs" c="red" fw={600}>
-														-{gitStatus.linesRemoved}
-													</Text>
-												)}
-											</Badge>
-										</Tooltip>
-									)}
-								</Group>
-							)}
-						{chapter.status !== "active" && (
-							<Badge
-								size="xs"
-								variant="light"
-								color={statusRegistry.chapterStatus(chapter.status).color}
-							>
-								{tc(statusRegistry.chapterStatus(chapter.status).i18nKey)}
-							</Badge>
+											{gitStatus.commitsAhead}
+										</Badge>
+									</Tooltip>
+								)}
+								{(gitStatus.linesAdded > 0 || gitStatus.linesRemoved > 0) && (
+									<Tooltip label={tn("chapterBar.uncommittedLines")}>
+										<Badge size="xs" variant="light" color="yellow">
+											{gitStatus.linesAdded > 0 && (
+												<Text span size="xs" c="green" fw={600}>
+													+{gitStatus.linesAdded}
+												</Text>
+											)}
+											{gitStatus.linesAdded > 0 && gitStatus.linesRemoved > 0 && " "}
+											{gitStatus.linesRemoved > 0 && (
+												<Text span size="xs" c="red" fw={600}>
+													-{gitStatus.linesRemoved}
+												</Text>
+											)}
+										</Badge>
+									</Tooltip>
+								)}
+							</Group>
 						)}
-					</Group>
-				</UnstyledButton>
+					{chapter.status !== "active" && (
+						<Badge
+							size="xs"
+							variant="light"
+							color={statusRegistry.chapterStatus(chapter.status).color}
+						>
+							{tc(statusRegistry.chapterStatus(chapter.status).i18nKey)}
+						</Badge>
+					)}
+				</Group>
 
 				{/* Right: action menus */}
 				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>

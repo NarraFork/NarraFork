@@ -628,6 +628,8 @@ export interface ToolStructuredDetail {
 export interface ToolErrorDetail {
 	kind: "error";
 	text: string;
+	/** RENDER-ONLY tone (mirrors ToolErrorDetail.tone). Height-neutral. */
+	tone?: "warning";
 }
 
 /** A meta-row action control (mirrors ToolRowAction in tool-detail.ts). */
@@ -2139,6 +2141,10 @@ export function measureToolDetail(
 				ERROR_INDENT,
 				DETAIL_TOP_MARGIN,
 				"vlist-tc-error",
+				// RENDER-ONLY tone, carried on the block because the render layer only
+				// ever sees the measured blocks (it never re-reads the classifier
+				// output). Colour only — the geometry above is identical either way.
+				detail.tone ? { tone: detail.tone } : undefined,
 			);
 			return finishRegion("error", [block], innerWidth, null);
 		}

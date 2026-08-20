@@ -2212,6 +2212,81 @@ describe("adaptSegment — pending plan fallback", () => {
 			expect(planDetail(seg, withPendingPlan)?.text).toBe(PLAN);
 		});
 	});
+
+	// ── Regression: a denied plan's reviewer feedback ──────────────────────────
+	//
+	// `permissionDenyMessage` is a TOP-LEVEL tool-call column (enrichToolUseBlocks
+	// copies it onto the block), not a `_metadata` key. The adapter used to forward
+	// only `_metadata`, so the classifier could never see it: a plan the user
+	// rejected WITH typed feedback rendered as a bare plan body and the feedback —
+	// the whole point of rejecting with a message — appeared nowhere on the vlist
+	// path. Asserted through `adaptSegment` (not the classifier alone) because the
+	// missing link was the forwarding, which a classifier-level test cannot catch.
+	describe("a denied plan's reviewer feedback", () => {
+		function planSeg(permissionDenyMessage: string | null, status = "fail"): AdapterSegment {
+			return {
+				kind: "tool-run",
+				sourceMessages: [],
+				items: [
+					{
+						blockIndex: 0,
+						isSubagent: false,
+						tc: {
+							toolName: "ExitPlanMode",
+							toolUseId: "tu-plan",
+							status,
+							inputJson: { plan: PLAN },
+							permissionDenyMessage,
+						},
+					},
+				],
+			};
+		}
+		const deniedSeg = (permissionDenyMessage: string | null) => planSeg(permissionDenyMessage);
+
+		function sections(seg: AdapterSegment) {
+			const spec = adaptSegment(seg, PLAN_CTX).find((s) => s.key === "tool-tu-plan");
+			return (spec?.data as { detail?: unknown })?.detail as {
+				kind?: string;
+				sections?: Array<{
+					label?: string;
+					body?: { kind?: string; text?: string; tone?: string };
+				}>;
+			} | null;
+		}
+
+		it("surfaces the feedback above the plan body", () => {
+			const detail = sections(deniedSeg("split step 2 first"));
+			expect(detail?.kind).toBe("sections");
+			// Unlabelled on purpose: an "Error" heading would file the reviewer's own
+			// note under tool failures (the chunked PlanDetail prints it bare).
+			const feedback = detail?.sections?.find((s) => s.body?.kind === "error");
+			expect(feedback?.label).toBeUndefined();
+			expect(feedback?.body?.text).toBe("split step 2 first");
+			const plan = detail?.sections?.find((s) => s.label === "plan");
+			expect(plan?.body?.text).toBe(PLAN);
+		});
+
+		it("tones the feedback as a warning, not a tool error", () => {
+			const detail = sections(deniedSeg("split step 2 first"));
+			expect(detail?.sections?.find((s) => s.body?.kind === "error")?.body?.tone).toBe("warning");
+		});
+
+		it("shows only the plan when the denial carried no feedback", () => {
+			// A feedback-less deny stores an English system placeholder; attributing
+			// it to the user would be worse than showing nothing.
+			expect(sections(deniedSeg("Permission denied by user"))?.kind).toBe("capped");
+			expect(sections(deniedSeg(null))?.kind).toBe("capped");
+		});
+
+		// The column is NOT denial-only — narrator-permission stores the note typed
+		// alongside an APPROVAL in the same place. The adapter forwards it either way
+		// (status travels with it), so this asserts the pair end to end: an approved
+		// plan must not grow a rejection notice above a plan that WAS accepted.
+		it("says nothing about a denial when the plan was APPROVED with feedback", () => {
+			expect(sections(planSeg("批准。方案分析透彻", "success"))?.kind).toBe("capped");
+		});
+	});
 });
 
 describe("adaptSegment — header timing passthrough", () => {

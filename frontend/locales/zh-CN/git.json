@@ -1,6 +1,8 @@
 {
 	"panel.title": "Git",
 	"panel.noChapter": "无章节",
+	"panel.copyBranch": "复制分支名",
+	"panel.branchCopied": "已复制",
 	"panel.changes": "变更",
 	"panel.commits": "提交",
 	"panel.stash": "暂存",
