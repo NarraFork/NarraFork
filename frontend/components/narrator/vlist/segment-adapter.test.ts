@@ -127,6 +127,47 @@ describe("adaptSegment — user message", () => {
 		expect(data.attachments[0]!.uploadNarratorId).toBe("nar_1");
 	});
 
+	it("carries the intrinsic dimensions so measure can reserve the aspect box", () => {
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: {
+				id: "u3b",
+				role: "user",
+				narratorId: "nar_1",
+				contentJson: [
+					{
+						type: "image",
+						imageId: "img-2",
+						filename: "wide.png",
+						mediaType: "image/png",
+						width: 1200,
+						height: 100,
+					},
+				],
+			},
+		};
+		const data = adaptSegment(seg, CTX)[0]!.data as {
+			attachments: Array<Record<string, unknown>>;
+		};
+		expect(data.attachments[0]!.width).toBe(1200);
+		expect(data.attachments[0]!.height).toBe(100);
+		// A block without dimensions forwards null, not undefined, so the measure
+		// input shape is stable.
+		const noDims = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "u3c",
+					role: "user",
+					contentJson: [{ type: "image", imageId: "img-3" }],
+				},
+			},
+			CTX,
+		)[0]!.data as { attachments: Array<Record<string, unknown>> };
+		expect(noDims.attachments[0]!.width).toBeNull();
+		expect(noDims.attachments[0]!.height).toBeNull();
+	});
+
 	it("prefers a block's own uploadNarratorId over the message narrator", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
@@ -1654,6 +1695,98 @@ describe("folded tool rows — drill-down payload", () => {
 		);
 		expect(activityRows(spec)[0]?.canDrillDown).toBeUndefined();
 		expect(activityRows(spec)[0]?.card).toBeUndefined();
+	});
+
+	/**
+	 * An AGENT row drills into the SUBAGENT card, not the generic tool card.
+	 *
+	 * The bug this pins down: `isSubagent` was dropped when a tool-run folded into an
+	 * activity unit (hard-coded `false` while rebuilding the item), so every folded
+	 * Agent/Task/Send call built a `ToolCallData` payload — and the reader who opened
+	 * it got a title plus a raw input JSON dump instead of the badge row / recent
+	 * calls / prompt / result the very same call shows as a card at L3+.
+	 *
+	 * Silent by construction: a tool card renders any payload happily, so nothing
+	 * threw and the only signal was the card looking wrong.
+	 */
+	const agentTc = (id = "tu-a") => ({
+		toolName: "Agent",
+		toolUseId: id,
+		status: "success",
+		inputJson: { subagent_type: "explore", description: "trace the vlist path", prompt: "look" },
+		outputJson: { _text: "found it" },
+		_subagentActivity: {
+			subagentNarratorId: "child-1",
+			model: "kimi-2:k3",
+			latestToolCalls: [{ toolName: "Read", status: "success" }],
+		},
+	});
+
+	it("an expanded SUBAGENT row carries a subagent card, tagged by cardKind", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const spec = adaptActivityUnit(
+			[
+				{
+					kind: "tool",
+					msg: msgWith([]),
+					blockIndex: 0,
+					tc: agentTc(),
+					isSubagent: true,
+				},
+			],
+			"act-1",
+			{ lod: 2, ...openRows("act-1", "tool-tu-a") },
+		);
+		const row = activityRows(spec)[0] as (Row & { cardKind?: string }) | undefined;
+		expect(row?.cardKind).toBe("subagent-card");
+		const card = row?.card as
+			| { agentType?: string; description?: string; prompt?: string; recentCallCount?: number }
+			| undefined;
+		// The SubagentCardData shape, from the same constructor the L3+ card uses.
+		expect(card?.agentType).toBe("explore");
+		expect(card?.description).toBe("trace the vlist path");
+		expect(card?.recentCallCount).toBe(1);
+		// And emphatically NOT the generic tool payload.
+		expect((card as { detail?: unknown } | undefined)?.detail).toBeUndefined();
+	});
+
+	it("an ordinary tool row stays a tool card (no cardKind tag)", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const spec = adaptActivityUnit(
+			[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: readTc() }],
+			"act-1",
+			{ lod: 2, ...openRows("act-1", "tool-tu-1") },
+		);
+		const row = activityRows(spec)[0] as (Row & { cardKind?: string }) | undefined;
+		// Absent rather than "tool-call": every pre-existing producer leaves it unset,
+		// and the measure layer treats absent as the tool card.
+		expect(row?.cardKind).toBeUndefined();
+		expect(row?.card?.toolName).toBe("Read");
+	});
+
+	/**
+	 * The prompt fold is keyed by the CARD (`tool-<toolUseId>`), the same channel the
+	 * standalone card uses — so a prompt opened inside a drilled-in row is still open
+	 * after an LOD change, and vice versa. Keying it by the TRACE would put the state
+	 * where the card never looks.
+	 */
+	it("reads the drilled-in card's prompt fold from the CARD's key", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const build = (promptOpenKey: string) =>
+			adaptActivityUnit(
+				[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: agentTc(), isSubagent: true }],
+				"act-1",
+				{
+					lod: 2,
+					...openRows("act-1", "tool-tu-a"),
+					isPromptOpen: (key: string) => key === promptOpenKey,
+				},
+			);
+		const opened = activityRows(build("tool-tu-a"))[0]?.card as { promptOpen?: boolean };
+		expect(opened.promptOpen).toBe(true);
+		// The trace's own key is NOT the channel.
+		const closed = activityRows(build("act-1"))[0]?.card as { promptOpen?: boolean };
+		expect(closed.promptOpen).toBeUndefined();
 	});
 
 	/**

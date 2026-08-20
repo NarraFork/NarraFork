@@ -2507,6 +2507,9 @@ export async function processEvent(
 					// as errored and skip assistant-message binding. The notice below carries
 					// the apiRequestId for the download endpoint instead.
 					forceDumpPersist: event.forceDumpPersist,
+					// Replays of one rejected request share a spill file rather than each writing
+					// a near-identical multi-MB copy that prunes other captures away.
+					dumpSpillReuseToken: event.dumpSpillReuseToken,
 				});
 				if (!event.errorMessage) {
 					if (!ctx.pendingApiRequestIds) ctx.pendingApiRequestIds = [];

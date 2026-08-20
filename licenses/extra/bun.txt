@@ -1,0 +1,85 @@
+Bun itself is MIT-licensed.
+
+## JavaScriptCore
+
+Bun statically links JavaScriptCore (and WebKit) which is LGPL-2 licensed.
+WebCore files from WebKit are also licensed under LGPL2. Per LGPL2:
+
+> (1) If you statically link against an LGPL'd library, you must also provide
+> your application in an object (not necessarily source) format, so that a user
+> has the opportunity to modify the library and relink the application.
+
+You can find the patched version of WebKit used by Bun here:
+<https://github.com/oven-sh/webkit>. If you would like to relink Bun with
+changes:
+
+- `git clone https://github.com/oven-sh/WebKit vendor/WebKit`
+- `bun sync-webkit-source` (checks out the version pinned in `WEBKIT_VERSION` in
+  `scripts/build/deps/webkit.ts`)
+- `bun run build:local`
+
+This compiles JavaScriptCore, compiles Bun's `.cpp` bindings for JavaScriptCore
+(which are the object files using JavaScriptCore) and outputs a new `bun` binary
+with your changes.
+
+## Linked libraries
+
+Bun statically links these libraries:
+
+| Library         | License                                                       |
+|-----------------|---------------------------------------------------------------|
+| boringssl       | several licenses                                              |
+| brotli          | MIT                                                           |
+| libarchive      | several licenses                                              |
+| lol-html        | BSD 3-Clause                                                  |
+| ls-hpack        | MIT                                                           |
+| ls-qpack        | MIT                                                           |
+| lsquic          | MIT (portions derived from Chromium proto-quic, BSD 3-Clause)  |
+| mimalloc        | MIT                                                           |
+| picohttp        | dual-licensed under the Perl License or the MIT License        |
+| zstd            | dual-licensed under the BSD License or GPLv2 license           |
+| simdutf         | Apache 2.0                                                    |
+| tinycc          | LGPL v2.1                                                     |
+| uSockets        | Apache 2.0                                                    |
+| zlib-ng         | zlib                                                          |
+| c-ares          | MIT                                                           |
+| libicu          | https://github.com/unicode-org/icu/blob/main/icu4c/LICENSE     |
+| libbase64       | BSD 2-Clause                                                  |
+| libuv (Windows) | MIT                                                           |
+| libdeflate      | MIT                                                           |
+| libjpeg-turbo   | BSD 3-Clause / IJG / zlib                                     |
+| libspng         | BSD 2-Clause                                                  |
+| libwebp         | BSD 3-Clause                                                  |
+| highway         | Apache 2.0                                                    |
+| uucode          | MIT                                                           |
+| uWebsockets fork| Apache 2.0                                                    |
+| Tigerbeetle IO  | Apache 2.0                                                    |
+| LLVM libc++abi  | Apache 2.0 with LLVM exception                                |
+|   (__cxa_thread_atexit fallback)                                                |
+
+## Polyfills
+
+For compatibility reasons, the following packages are embedded into Bun's binary
+and injected if imported: acorn, acorn-walk, assert, browserify-zlib, buffer,
+constants-browserify, crypto-browserify, domain-browser, events,
+https-browserify, os-browserify, path-browserify, process, punycode,
+querystring-es3, stream-browserify, stream-http, string_decoder,
+timers-browserify, tty-browserify, url, util, vm-browserify — all MIT.
+
+## Additional credits
+
+- Bun's JS transpiler, CSS lexer, and Node.js module resolver source code is a
+  port of @evanw's esbuild project.
+- Credit to @kipply for the name "Bun"!
+
+----------------------------------------------------------------------
+
+The text above is Bun's own LICENSE.md, reproduced from
+https://github.com/oven-sh/bun/blob/bun-v1.3.14/LICENSE.md
+
+Bun's repository states "Bun itself is MIT-licensed" without including a
+separate MIT text or copyright line, so none is reproduced here rather than
+attributing one that upstream does not state. The full MIT terms are at
+https://opensource.org/license/mit and the authoritative statement of Bun's
+licensing, including the LGPL-2 relinking offer for its statically linked
+JavaScriptCore, is the document above.

@@ -24,6 +24,7 @@ import type {
 	LearningDoc,
 	LearningIndexResponse,
 	LearningSearchResponse,
+	LicenseManifestResponse,
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
 	SearchResponse,
@@ -1107,6 +1108,11 @@ export const miscApi = {
 
 	// Changelog
 	getChangelogs: () => request<ChangelogEntry[]>("/changelog"),
+
+	// Third-party licenses. Summaries and texts are separate calls: the full text
+	// set is ~1.1 MB and the page shows one entry at a time.
+	getLicenses: () => request<LicenseManifestResponse>("/licenses"),
+	getLicenseText: (id: string) => request<{ id: string; text: string }>(`/licenses/text/${id}`),
 
 	// Storage
 	getCachedStorage: () => request<{ cached: boolean; data?: StorageScanResult }>("/storage/cached"),

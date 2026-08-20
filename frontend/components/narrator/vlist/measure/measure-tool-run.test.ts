@@ -1,4 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import type { MeasuredSubagent } from "./measure-subagent";
+import type { MeasuredToolCall } from "./measure-tool-call";
 import { installCanvasStub } from "./test-canvas-stub";
 
 // Install the deterministic canvas stub BEFORE importing any pretext-backed
@@ -608,7 +610,10 @@ describe("trace row drill-down", () => {
 		const expanded = measureCollapsibleTrace({ items, maxVisible: 10 }, 600, {
 			expandedIndices: [1],
 		});
-		const card = expanded.rows[1]?.cardMeasured;
+		// `cardMeasured` is a union now (a subagent row drills into its own card), so
+		// a tool-card assertion narrows explicitly — `cardKind` is the discriminant.
+		expect(expanded.rows[1]?.cardKind).toBe("tool-call");
+		const card = expanded.rows[1]?.cardMeasured as MeasuredToolCall | null | undefined;
 		expect(card).not.toBeNull();
 		expect(card?.effectiveOpened).toBe(true);
 		// The drilled-in row block IS the card: the summary row is not painted, so no
@@ -665,8 +670,9 @@ describe("trace row drill-down", () => {
 				{ expandedIndices: [0] },
 				lod,
 			);
-			expect(r.rows[0]?.cardMeasured?.effectiveOpened).toBe(true);
-			expect(r.rows[0]?.cardMeasured?.detail).not.toBeNull();
+			const card = r.rows[0]?.cardMeasured as MeasuredToolCall | null | undefined;
+			expect(card?.effectiveOpened).toBe(true);
+			expect(card?.detail).not.toBeNull();
 		}
 	});
 
@@ -754,5 +760,134 @@ describe("trace row drill-down", () => {
 			collapsed.height + TRACE_BODY_PADDING_Y * 2 + md.frame.contentHeight,
 			5,
 		);
+	});
+});
+
+// ── Drill-down: an AGENT row nests a real SUBAGENT card ──────────────────────
+//
+// A folded Agent/Task/Send row used to reveal the GENERIC tool card, because the
+// measure layer had only one drill-down path. The card the same call renders as at
+// L3+ is the subagent card, so the two levels showed different things for one call
+// — and nothing failed, since a tool card renders any payload it is handed.
+
+/** A minimal SubagentCardData (the shape the adapter's subagent branch builds). */
+function drillSubagentCard(overrides: Record<string, unknown> = {}) {
+	return {
+		agentType: "explore",
+		description: "trace the vlist path",
+		prompt: "look at the fold",
+		toolUseId: "tu-a",
+		isTerminal: true,
+		isActive: false,
+		status: "success",
+		recentCallCount: 2,
+		recentCallNames: ["Read", "Grep"],
+		hasRecentCallsButton: true,
+		resultText: "found it",
+		...overrides,
+	};
+}
+
+describe("trace row drill-down — subagent card", () => {
+	const subRow = (card = drillSubagentCard()) => [
+		{
+			title: "Agent · trace the vlist path",
+			hasIcon: true,
+			key: "tool-tu-a",
+			canDrillDown: true,
+			card,
+			cardKind: "subagent-card" as const,
+		},
+	];
+
+	it("measures the SUBAGENT card, not the tool card", async () => {
+		const { measureActivityTrace } = await import("./measure-tool-run");
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const r = measureActivityTrace(subRow(), 600, { expandedIndices: [0] }, {}, 2);
+		const row = r.rows[0];
+		expect(row?.cardKind).toBe("subagent-card");
+		const card = row?.cardMeasured as MeasuredSubagent | null | undefined;
+		expect(card).not.toBeNull();
+		// A subagent measure result, identified by fields only IT has.
+		expect(card?.effectiveExpanded).toBe(true);
+		expect(card?.recentRowCount).toBe(2);
+		// Byte-for-byte the geometry the standalone card reports at the same width —
+		// one measure function, so the two levels cannot drift.
+		const standalone = measureSubagentCard(drillSubagentCard(), 600, 2, {
+			lodUserOverride: true,
+			isRecent: true,
+			inRun: false,
+			isLast: true,
+		});
+		expect(card?.height).toBeCloseTo(standalone.height, 5);
+	});
+
+	it("the drilled-in row block IS the card (no summary row above it)", async () => {
+		const { measureActivityTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
+		const rows = subRow();
+		const collapsed = measureActivityTrace(rows, 600, {}, {}, 2);
+		const expanded = measureActivityTrace(rows, 600, { expandedIndices: [0] }, {}, 2);
+		const card = expanded.rows[0]?.cardMeasured;
+		expect(expanded.rows[0]?.blockHeight).toBeCloseTo(card?.height ?? 0, 5);
+		expect(expanded.height).toBeCloseTo(
+			collapsed.height - TRACE_ROW_HEIGHT + (card?.height ?? 0),
+			5,
+		);
+		// Collapsed costs exactly a plain row: the payload is not even looked at.
+		expect(collapsed.rows[0]?.cardMeasured).toBeNull();
+		expect(collapsed.rows[0]?.blockHeight).toBeCloseTo(TRACE_ROW_HEIGHT, 5);
+	});
+
+	it("points the header morph at the DESCRIPTION line, not the badge row", async () => {
+		// The folded row showed `Agent · description`; the line that takes its place in
+		// the card is the description, since the badge row above it carries chips rather
+		// than that text. Pure arithmetic over the subagent card's own chrome.
+		const { measureActivityTrace } = await import("./measure-tool-run");
+		const {
+			BADGE_ROW_HEIGHT,
+			CARD_BORDER,
+			CARD_PADDING,
+			DESC_LEFT,
+			DESC_MARGIN_TOP,
+			XS_LINE_HEIGHT,
+		} = await import("./measure-subagent");
+		const r = measureActivityTrace(subRow(), 600, { expandedIndices: [0] }, {}, 2);
+		const drill = r.rows[0]?.drillHeader;
+		expect(drill).not.toBeNull();
+		expect(drill?.top).toBeCloseTo(
+			CARD_BORDER + CARD_PADDING + BADGE_ROW_HEIGHT + DESC_MARGIN_TOP,
+			5,
+		);
+		expect(drill?.left).toBeCloseTo(CARD_BORDER + CARD_PADDING + DESC_LEFT, 5);
+		expect(drill?.height).toBeCloseTo(XS_LINE_HEIGHT, 5);
+		expect(drill?.width).toBeCloseTo(600 - 2 * (CARD_BORDER + CARD_PADDING) - DESC_LEFT, 5);
+	});
+
+	it("an absent cardKind still means the TOOL card (every old producer)", async () => {
+		const { measureActivityTrace } = await import("./measure-tool-run");
+		const r = measureActivityTrace(
+			[{ title: "Read · a.ts", canDrillDown: true, card: drillCard(), key: "t-0" }],
+			600,
+			{ expandedIndices: [0] },
+			{},
+			2,
+		);
+		expect(r.rows[0]?.cardKind).toBe("tool-call");
+		expect((r.rows[0]?.cardMeasured as MeasuredToolCall | null)?.toolName).toBe("Read");
+	});
+
+	it("a collapsed subagent row is exactly as tall as any other trace row", async () => {
+		// Height-neutral while folded: the chevron shares the dot's 12px slot, so the
+		// only cost of drill-ability is paid when the reader opens it.
+		const { measureActivityTrace } = await import("./measure-tool-run");
+		const plain = measureActivityTrace(
+			[{ title: "Agent · trace the vlist path", hasIcon: true, key: "tool-tu-a" }],
+			600,
+			{},
+			{},
+			2,
+		);
+		const drillable = measureActivityTrace(subRow(), 600, {}, {}, 2);
+		expect(drillable.height).toBeCloseTo(plain.height, 5);
 	});
 });

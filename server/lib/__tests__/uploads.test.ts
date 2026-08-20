@@ -12,6 +12,7 @@ import {
 	MAX_IMAGE_PIXELS,
 	MAX_IMAGE_SEGMENT_SCANS,
 	parseImageDimensions,
+	sanitizeParsedDimensions,
 	saveAvatarImage,
 	saveUploadedImage,
 	setUploadsDirForTests,
@@ -383,5 +384,133 @@ describe("uploads helpers", () => {
 		).toBe(true);
 		expect(contentJsonHasImageBlocks([{ type: "text", text: "hello" }])).toBe(false);
 		expect(contentJsonHasImageBlocks(null)).toBe(false);
+	});
+
+	test("imageRefToContentBlock carries the intrinsic dimensions when valid", async () => {
+		const { imageRefToContentBlock } = await import("../uploads");
+		expect(
+			imageRefToContentBlock({
+				imageId: "img_1",
+				filename: "wide.png",
+				mediaType: "image/png",
+				width: 1200,
+				height: 100,
+			}),
+		).toEqual({
+			type: "image",
+			imageId: "img_1",
+			filename: "wide.png",
+			mediaType: "image/png",
+			width: 1200,
+			height: 100,
+		});
+		// Invalid/missing dimensions are omitted, not persisted as junk.
+		expect(
+			imageRefToContentBlock({
+				imageId: "img_2",
+				filename: "a.png",
+				mediaType: "image/png",
+				width: 0,
+				height: 100,
+			}),
+		).toEqual({ type: "image", imageId: "img_2", filename: "a.png", mediaType: "image/png" });
+		// The fallback narrator id is applied only when the ref lacks its own.
+		expect(
+			imageRefToContentBlock(
+				{ imageId: "img_3", filename: "b.png", mediaType: "image/png" },
+				"nar_fallback",
+			).uploadNarratorId,
+		).toBe("nar_fallback");
+	});
+
+	test("imageBytesToBase64 also reports the parsed dimensions", async () => {
+		const { imageBytesToBase64 } = await import("../uploads");
+		const result = imageBytesToBase64(new Uint8Array(pngHeader(640, 360)));
+		expect(result.detectedMediaType).toBe("image/png");
+		expect(result.dimensions).toEqual({ width: 640, height: 360 });
+	});
+
+	test("imageBytesToBase64 encodes a Uint8Array without a full copy", async () => {
+		const { imageBytesToBase64 } = await import("../uploads");
+		// The remote branch of the Read tool passes a Uint8Array, not a Buffer. The old
+		// `Buffer.from(bytes)` preamble duplicated the entire (up to 20 MiB) payload on
+		// the main thread purely so the 256 KiB header could be parsed. Spying on
+		// `Buffer.from` pins the intent stated in `imageHeaderView`'s comment: header
+		// inspection uses a view, so no allocation sized to the payload happens.
+		const png = pngHeader(64, 48);
+		const payload = new Uint8Array(png.byteLength + 4096);
+		payload.set(png);
+
+		const realFrom = Buffer.from;
+		const copiedLengths: number[] = [];
+		// biome-ignore lint/suspicious/noExplicitAny: test spy over an overloaded builtin
+		(Buffer as any).from = (...args: unknown[]) => {
+			// A view is `Buffer.from(arrayBuffer, byteOffset, length)`; a copy is the
+			// single-argument form over a typed array.
+			if (args.length === 1 && args[0] instanceof Uint8Array) {
+				copiedLengths.push((args[0] as Uint8Array).byteLength);
+			}
+			// biome-ignore lint/suspicious/noExplicitAny: forwarding to the real overloads
+			return (realFrom as any)(...args);
+		};
+		try {
+			const result = imageBytesToBase64(payload);
+			expect(result.detectedMediaType).toBe("image/png");
+			expect(result.dimensions).toEqual({ width: 64, height: 48 });
+			// Correctness of the encoding is still the point of the function.
+			expect(result.base64).toBe(realFrom(payload).toString("base64"));
+		} finally {
+			Buffer.from = realFrom;
+		}
+		expect(copiedLengths, "payload must not be copied to parse its header").toEqual([]);
+	});
+
+	test("sanitizeParsedDimensions drops sizes the layout cannot trust", () => {
+		// The Read and share-file tools parse arbitrary on-disk files, so these numbers
+		// come straight from an attacker-controlled header. The frontend only rejects
+		// non-finite values, so an absurd ratio survives into the aspect-ratio division
+		// and collapses the reserved box to ~1px — "pretending to have data" rather than
+		// falling back to the placeholder height. Undefined is the honest answer here,
+		// which is why this filters instead of throwing like the upload path does.
+		expect(sanitizeParsedDimensions({ width: 1920, height: 1080 })).toEqual({
+			width: 1920,
+			height: 1080,
+		});
+		expect(sanitizeParsedDimensions(undefined)).toBeUndefined();
+		// A PNG IHDR can declare the full uint32 range; this is the concrete case.
+		expect(
+			sanitizeParsedDimensions({ width: 4_294_967_295, height: 4_294_967_295 }),
+		).toBeUndefined();
+		expect(sanitizeParsedDimensions({ width: MAX_IMAGE_DIMENSION + 1, height: 1 })).toBeUndefined();
+		expect(sanitizeParsedDimensions({ width: 1, height: MAX_IMAGE_DIMENSION + 1 })).toBeUndefined();
+		// Each side is within bounds but the product is not.
+		const pixelSide = Math.floor(Math.sqrt(MAX_IMAGE_PIXELS)) + 1;
+		expect(sanitizeParsedDimensions({ width: pixelSide, height: pixelSide })).toBeUndefined();
+		// Degenerate and non-integral values are equally unusable.
+		expect(sanitizeParsedDimensions({ width: 0, height: 100 })).toBeUndefined();
+		expect(sanitizeParsedDimensions({ width: -10, height: 100 })).toBeUndefined();
+		expect(sanitizeParsedDimensions({ width: 1.5, height: 100 })).toBeUndefined();
+		expect(
+			sanitizeParsedDimensions({ width: Number.POSITIVE_INFINITY, height: 100 }),
+		).toBeUndefined();
+		expect(sanitizeParsedDimensions({ width: Number.NaN, height: 100 })).toBeUndefined();
+		// The exact boundary is accepted: the cap is inclusive.
+		expect(sanitizeParsedDimensions({ width: MAX_IMAGE_DIMENSION, height: 1 })).toEqual({
+			width: MAX_IMAGE_DIMENSION,
+			height: 1,
+		});
+	});
+
+	test("a header declaring an absurd size yields no forwardable dimensions", () => {
+		// End-to-end shape of the share-file / Read path: parsing succeeds (the file is a
+		// well-formed PNG as far as the header goes) but the result must not reach a
+		// consumer. Parsing and sanitizing are separate steps precisely so a caller
+		// cannot get the first without the second by accident.
+		const hostile = pngHeader(4_294_967_295, 4_294_967_295);
+		expect(parseImageDimensions(hostile)).toEqual({
+			width: 4_294_967_295,
+			height: 4_294_967_295,
+		});
+		expect(sanitizeParsedDimensions(parseImageDimensions(hostile))).toBeUndefined();
 	});
 });

@@ -250,6 +250,42 @@ describe("classifyToolDetail — read", () => {
 		});
 		expect(metaTexts(d)).toEqual(["/tmp/pic.png (12 KB, png)"]);
 	});
+	it("forwards intrinsic dimensions on a media ref (aspect-ratio reservation)", () => {
+		const d = classifyToolDetail({
+			toolName: "Read",
+			category: "read",
+			inputJson: { file_path: "/tmp/pic.png" },
+			metadata: { isImage: true, filePath: "/tmp/pic.png", width: 1600, height: 900 },
+		});
+		// The path meta row exists here, so the media cap sits inside a sections
+		// wrapper rather than being the unwrapped single body.
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.media?.width).toBe(1600);
+		expect(media.media?.height).toBe(900);
+		// The fixed estimate stays as the fallback signal; measure overrides it
+		// with the aspect fit when dims are present.
+		expect(media.contentPx).toBe(MEDIA_IMAGE_CONTENT_PX);
+	});
+	it("omits dimensions when only one side is present or they are invalid", () => {
+		const d = classifyToolDetail({
+			toolName: "Read",
+			category: "read",
+			inputJson: { file_path: "/tmp/pic.png" },
+			metadata: { isImage: true, width: 1600 },
+		}) as ToolCappedDetail;
+		expect(d.media?.width).toBeUndefined();
+		expect(d.media?.height).toBeUndefined();
+		const bad = classifyToolDetail({
+			toolName: "Read",
+			category: "read",
+			inputJson: { file_path: "/tmp/pic.png" },
+			metadata: { isImage: true, width: 0, height: -3 },
+		}) as ToolCappedDetail;
+		expect(bad.media?.width).toBeUndefined();
+		expect(bad.media?.height).toBeUndefined();
+	});
 });
 
 describe("classifyToolDetail — file", () => {
@@ -521,6 +557,19 @@ describe("classifyToolDetail — webFetch", () => {
 			(s) => s.body.kind === "capped" && s.body.cap === "media",
 		)?.body as ToolCappedDetail;
 		expect(media.contentPx).toBe(MEDIA_IMAGE_CONTENT_PX);
+	});
+	it("forwards screenshot dimensions from the metadata", () => {
+		const d = classifyToolDetail({
+			toolName: "WebFetch",
+			category: "webFetch",
+			inputJson: { mode: "screenshot" },
+			metadata: { previewUrl: "blob:x", width: 1280, height: 800 },
+		});
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.media?.width).toBe(1280);
+		expect(media.media?.height).toBe(800);
 	});
 	it("keeps the url link, mode badge and selector rows", () => {
 		const d = classifyToolDetail({
@@ -984,6 +1033,25 @@ describe("classifyToolDetail — share", () => {
 		expect(media.media?.previewUrl).toBe("/p/x");
 		expect(media.media?.filename).toBe("shot.png");
 	});
+	it("forwards preview image dimensions from the share metadata", () => {
+		const d = classifyToolDetail({
+			toolName: "ShareFile",
+			category: "share",
+			metadata: {
+				downloadUrl: "/d/x",
+				preview: true,
+				previewUrl: "/p/x",
+				filename: "shot.png",
+				width: 2400,
+				height: 300,
+			},
+		});
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.media?.width).toBe(2400);
+		expect(media.media?.height).toBe(300);
+	});
 	it("carries the download + copy-link ACTIONS and the metadata badges", () => {
 		const d = classifyToolDetail({
 			toolName: "ShareFile",
@@ -1120,6 +1188,19 @@ describe("classifyToolDetail — browser", () => {
 		expect(media.media?.previewUrl).toBe("/p/x");
 		expect(metaBadgeLabels(d)).toEqual(["screenshot", "s-1"]);
 		expect(metaRowsOf(d).rows.find((r) => r.href)?.href).toBe("https://x.dev");
+	});
+	it("forwards screenshot dimensions from the browser metadata", () => {
+		const d = classifyToolDetail({
+			toolName: "Browser",
+			category: "browser",
+			inputJson: { action: "screenshot", url: "https://x.dev" },
+			metadata: { previewUrl: "/p/x", sessionId: "s-1", width: 1440, height: 810 },
+		});
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.media?.width).toBe(1440);
+		expect(media.media?.height).toBe(810);
 	});
 	it("returns error on failed browser action with no output", () => {
 		const d = classifyToolDetail({

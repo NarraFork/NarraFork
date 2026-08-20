@@ -238,12 +238,50 @@ export function useResolvedImageSrc(
 	return { src, error: resolvedError, onLoadError };
 }
 
+/** The exact display rectangle a measure layer reserved via `fitImageBox`. */
+export interface ExactDisplayBox {
+	displayWidth: number;
+	displayHeight: number;
+}
+
+/**
+ * Read a block's exact display geometry, or null when it has none.
+ *
+ * SINGLE SOURCE for "does this block carry an exact fitted box?". The measure
+ * layer reserves either the aspect-fitted rectangle (intrinsic dimensions were
+ * persisted) or a fixed-height placeholder, and the render layer must paint the
+ * SAME one — a fitted reservation painted in the legacy full-width box is
+ * `boxWidth × h/w` tall, which overflows whenever the height cap was the binding
+ * constraint (§0 铁律 2). Three call sites made this judgement independently
+ * (tool-card media, chat media blocks, user-bubble attachments); one of them
+ * drifting is exactly the shape that breaks the invariant, so the predicate
+ * lives here and they all call it.
+ */
+export function readExactDisplayBox(
+	data: Record<string, unknown> | undefined,
+): ExactDisplayBox | null {
+	if (!data) return null;
+	const { displayWidth, displayHeight } = data;
+	if (typeof displayWidth !== "number" || typeof displayHeight !== "number") return null;
+	if (!(displayWidth > 0) || !(displayHeight > 0)) return null;
+	return { displayWidth, displayHeight };
+}
+
 interface VListImageProps {
 	media: VListImageRef;
 	/** Panel narrator id (fallback for uploads-scoped fetch). */
 	narratorId?: string;
 	/** The reserved box height (media cap px) — the image never exceeds it. */
 	maxHeight: number;
+	/**
+	 * Exact display geometry from the measure layer's aspect fit, when the block
+	 * carried intrinsic dimensions. In this mode the box IS the image frame
+	 * (width × height, no centring), so the paint occupies exactly the reserved
+	 * rectangle; absent → the legacy behaviour (full-width box of `maxHeight`
+	 * with the image centred inside it).
+	 */
+	displayWidth?: number;
+	displayHeight?: number;
 }
 
 /**
@@ -251,7 +289,13 @@ interface VListImageProps {
  * loads (or if it fails / is unsupported) the box keeps its reserved height with
  * a neutral placeholder, so nothing shifts.
  */
-export function VListImage({ media, narratorId, maxHeight }: VListImageProps) {
+export function VListImage({
+	media,
+	narratorId,
+	maxHeight,
+	displayWidth,
+	displayHeight,
+}: VListImageProps) {
 	const uploadCapability = useUploadCapability();
 	const openImageViewer = useImageViewer();
 	// Direct preview URLs and fs-preview reads don't need the narrator-serving
@@ -261,24 +305,39 @@ export function VListImage({ media, narratorId, maxHeight }: VListImageProps) {
 	const { src, error, onLoadError } = useResolvedImageSrc(media, narratorId, supported);
 	const filename = media.filename ?? "image";
 	const usable = src != null && !error;
+	// Same predicate the callers use to decide whether to pass the box at all
+	// (readExactDisplayBox), so the two sides cannot disagree about which mode
+	// this paint is in.
+	const exact = readExactDisplayBox({ displayWidth, displayHeight }) != null;
 
 	return (
 		<div
-			style={{
-				height: maxHeight,
-				maxWidth: "100%",
-				// A landscape screenshot is width-limited, not height-limited: at
-				// `fit-content` the box collapses to the scaled image width and the
-				// unused height shows as an empty band. Filling the row and centring
-				// the image matches the message bubble's `margin: 0 auto` framing.
-				width: "100%",
-				borderRadius: "var(--mantine-radius-sm)",
-				overflow: "hidden",
-				background: usable ? undefined : "var(--vlist-media-bg)",
-				display: "flex",
-				alignItems: "center",
-				justifyContent: "center",
-			}}
+			style={
+				exact
+					? {
+							width: displayWidth,
+							height: displayHeight,
+							maxWidth: "100%",
+							borderRadius: "var(--mantine-radius-sm)",
+							overflow: "hidden",
+							background: usable ? undefined : "var(--vlist-media-bg)",
+						}
+					: {
+							height: maxHeight,
+							maxWidth: "100%",
+							// A landscape screenshot is width-limited, not height-limited: at
+							// `fit-content` the box collapses to the scaled image width and the
+							// unused height shows as an empty band. Filling the row and centring
+							// the image matches the message bubble's `margin: 0 auto` framing.
+							width: "100%",
+							borderRadius: "var(--mantine-radius-sm)",
+							overflow: "hidden",
+							background: usable ? undefined : "var(--vlist-media-bg)",
+							display: "flex",
+							alignItems: "center",
+							justifyContent: "center",
+						}
+			}
 		>
 			{usable ? (
 				// biome-ignore lint/a11y/useKeyWithClickEvents: opens the shared fullscreen viewer (keys handled there)
@@ -287,17 +346,29 @@ export function VListImage({ media, narratorId, maxHeight }: VListImageProps) {
 					alt={filename}
 					onClick={() => openImageViewer({ src, filename, alt: filename })}
 					onError={onLoadError}
-					style={{
-						// `maxHeight` (not a hard height) so a wide screenshot scales on its
-						// width and keeps its aspect ratio without letterboxing.
-						maxHeight: maxHeight,
-						maxWidth: "100%",
-						width: "auto",
-						height: "auto",
-						objectFit: "contain",
-						display: "block",
-						cursor: "pointer",
-					}}
+					style={
+						exact
+							? {
+									// The box was reserved at exactly this size by the measure
+									// layer's fit formula; contain absorbs the ≤1px rounding error.
+									width: "100%",
+									height: "100%",
+									objectFit: "contain",
+									display: "block",
+									cursor: "pointer",
+								}
+							: {
+									// `maxHeight` (not a hard height) so a wide screenshot scales on its
+									// width and keeps its aspect ratio without letterboxing.
+									maxHeight: maxHeight,
+									maxWidth: "100%",
+									width: "auto",
+									height: "auto",
+									objectFit: "contain",
+									display: "block",
+									cursor: "pointer",
+								}
+					}
 					loading="lazy"
 				/>
 			) : null}

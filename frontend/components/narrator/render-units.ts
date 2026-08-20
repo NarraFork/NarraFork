@@ -290,6 +290,10 @@ function toolItemsFromToolRunSegment(
 		msg: it.msg,
 		blockIndex: it.blockIndex,
 		tc: it.tc,
+		// Drill-down shape depends on it: the vlist adapter renders a subagent row's
+		// card with the subagent-card measure/render pair, and it can only know the
+		// row is one if the flag survives the fold.
+		isSubagent: it.isSubagent,
 	}));
 }
 

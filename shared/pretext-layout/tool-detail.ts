@@ -50,14 +50,20 @@ export type DetailCapKind =
 	| "streaming";
 
 /**
- * Reserved pixel height for an inline media image (`media` cap `contentPx`).
+ * Fallback pixel height for an inline media image (`media` cap `contentPx`)
+ * when the payload carries NO intrinsic dimensions.
  *
- * Deliberately the SAME fixed 200px a user message's image block occupies
- * (frontend measure-media's `IMAGE_FIXED_HEIGHT`), so a screenshot in a tool card
- * and an image in a chat bubble reserve identical space. The previous 400 was a
- * standalone estimate: a 1280×900 screenshot squeezed to the card width is ~85px
- * shorter than that, so every screenshot row carried a tall empty band and the
- * reserved box dwarfed the picture inside it.
+ * Deliberately the SAME fixed 200px a dimensionless user-message image block
+ * occupies (frontend measure-media's `IMAGE_FIXED_HEIGHT`), so a screenshot in
+ * a tool card and an image in a chat bubble reserve identical space. The
+ * previous 400 was a standalone estimate: a 1280×900 screenshot squeezed to
+ * the card width is ~85px shorter than that, so every screenshot row carried a
+ * tall empty band and the reserved box dwarfed the picture inside it.
+ *
+ * When the metadata DOES carry the intrinsic width/height (browser / web-fetch
+ * screenshots, image Reads, image shares), the measure layer instead reserves
+ * the aspect-ratio-fitted height via `fitImageBox` — pure arithmetic on data,
+ * no measurement — so the box matches the painted picture exactly.
  *
  * Keep in sync with measure-media.ts's IMAGE_FIXED_HEIGHT (a shared → frontend
  * import would break this file's purity guard).
@@ -65,11 +71,13 @@ export type DetailCapKind =
 export const MEDIA_IMAGE_CONTENT_PX = 200;
 
 /**
- * RENDER-ONLY image descriptor for a `media` cap. Carries just enough for the
- * render layer to resolve an <img> src the same way the classic card does
- * (direct previewUrl → /api/fs/preview by path → /api/uploads blob by id). It
- * NEVER affects the measured height (media caps use contentPx). Keep the fields
- * optional; the render layer falls back gracefully when none resolve.
+ * Image descriptor for a `media` cap. Carries just enough for the render layer
+ * to resolve an <img> src the same way the classic card does (direct
+ * previewUrl → /api/fs/preview by path → /api/uploads blob by id). The src
+ * fields NEVER affect the measured height; `width`/`height` DO — when present,
+ * the measure layer reserves the aspect-fitted height instead of the fixed
+ * fallback. Keep the fields optional; both sides fall back gracefully when
+ * none resolve.
  */
 export interface ToolMediaRef {
 	/** A ready-to-use image URL (blob:/http[s]/data:) — the fast path. */
@@ -83,6 +91,12 @@ export interface ToolMediaRef {
 	/** Optional size (KB) + format label shown above an image read. */
 	sizeKB?: number;
 	imageFormat?: string;
+	/**
+	 * Intrinsic pixel size from the tool payload (screenshot result metadata,
+	 * upload record). HEIGHT-RELEVANT: drives the aspect-ratio reservation.
+	 */
+	width?: number;
+	height?: number;
 }
 
 /** 🟡 A single maxHeight-capped detail body (code/term/diff/media/skill/…). */
@@ -110,9 +124,10 @@ export interface ToolCappedDetail {
 	 */
 	text?: string;
 	/**
-	 * RENDER-ONLY image descriptor for `media` caps. When present the render
-	 * layer paints an actual image inside the reserved contentPx box instead of
-	 * an empty placeholder. Height-neutral.
+	 * Image descriptor for `media` caps. When present the render layer paints an
+	 * actual image inside the reserved box instead of an empty placeholder. The
+	 * src fields are render-only; `width`/`height` are MEASURED (they pick the
+	 * aspect-fitted content height over the fixed fallback).
 	 */
 	media?: ToolMediaRef;
 	/**
@@ -904,6 +919,21 @@ function filePathOf(inputJson: unknown): string {
 	return extractField(inputJson, "file_path", "path", "filePath");
 }
 
+/** Read a positive finite pixel count from an untrusted metadata leaf. */
+function readPixelCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** Intrinsic image dimensions from tool metadata, when both are present. */
+function mediaDimensions(metadata: Record<string, unknown> | null): {
+	width?: number;
+	height?: number;
+} {
+	const width = readPixelCount(metadata?.width);
+	const height = readPixelCount(metadata?.height);
+	return width !== undefined && height !== undefined ? { width, height } : {};
+}
+
 function classifyRead(
 	inputJson: unknown,
 	outputJson: unknown,
@@ -929,6 +959,7 @@ function classifyRead(
 						filename: filePath ? filePath.split(/[\\/]/).pop() : undefined,
 						sizeKB,
 						imageFormat,
+						...mediaDimensions(metadata),
 					},
 				}),
 			),
@@ -1227,7 +1258,7 @@ function classifyWebFetch(
 				undefined,
 				capped("media", {
 					contentPx: MEDIA_IMAGE_CONTENT_PX,
-					media: { previewUrl: fetchPreviewUrl, filename: url },
+					media: { previewUrl: fetchPreviewUrl, filename: url, ...mediaDimensions(metadata) },
 				}),
 			),
 		]);
@@ -1788,7 +1819,7 @@ function classifyShare(
 				undefined,
 				capped("media", {
 					contentPx: MEDIA_IMAGE_CONTENT_PX,
-					media: { previewUrl: sharePreviewUrl, filename },
+					media: { previewUrl: sharePreviewUrl, filename, ...mediaDimensions(metadata) },
 				}),
 			),
 		]);
@@ -1982,6 +2013,7 @@ function classifyBrowser(
 						previewUrl: browserPreviewUrl,
 						filename: url,
 						...(savedFilePath ? { filePath: savedFilePath } : {}),
+						...mediaDimensions(metadata),
 					},
 				}),
 			),

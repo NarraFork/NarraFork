@@ -8,6 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getToken } from "../lib/api";
+import { observePageLifecycle } from "../lib/page-lifecycle";
 import { buildWsUrl, safeCloseWs } from "../lib/ws";
 import { removeWSStatus, setWSStatus } from "../lib/ws-status";
 
@@ -70,8 +71,8 @@ class TerminalWSManager {
 	private _disconnected = false;
 	private statusListeners = new Set<() => void>();
 
-	// --- Visibility change tracking ---
-	private _boundVisibilityHandler: (() => void) | null = null;
+	// --- Page lifecycle tracking ---
+	private _unobservePageLifecycle: (() => void) | null = null;
 	private _hiddenAt = 0;
 
 	get connected() {
@@ -211,31 +212,38 @@ class TerminalWSManager {
 	}
 
 	// -----------------------------------------------------------------------
-	// Visibility change — recover from browser background throttling
+	// Page lifecycle — recover from background throttling, freeze and bfcache
 	// -----------------------------------------------------------------------
 
 	private _listenVisibility(): void {
-		if (this._boundVisibilityHandler) return;
-		this._boundVisibilityHandler = () => this._handleVisibilityChange();
-		document.addEventListener("visibilitychange", this._boundVisibilityHandler);
+		if (this._unobservePageLifecycle) return;
+		this._unobservePageLifecycle = observePageLifecycle({
+			// `pagehide` / `freeze` also mean "gone", and neither is guaranteed to be
+			// preceded by a `visibilitychange`. Without them the elapsed time below
+			// reads 0 and the threshold never triggers.
+			onHidden: () => {
+				if (!this._hiddenAt) this._hiddenAt = Date.now();
+			},
+			// Restored from the back/forward cache or resumed from a freeze: the socket
+			// is definitively gone even if it still reports OPEN. Reconnect
+			// unconditionally, which also clears an exhausted retry counter.
+			onRestoredFromCache: () => {
+				if (this.disposed) return;
+				this._hiddenAt = 0;
+				this.resetReconnect();
+			},
+			onForeground: () => this._handleForeground(),
+		});
 	}
 
 	private _unlistenVisibility(): void {
-		if (this._boundVisibilityHandler) {
-			document.removeEventListener("visibilitychange", this._boundVisibilityHandler);
-			this._boundVisibilityHandler = null;
-		}
+		this._unobservePageLifecycle?.();
+		this._unobservePageLifecycle = null;
 	}
 
-	private _handleVisibilityChange(): void {
+	private _handleForeground(): void {
 		if (this.disposed) return;
 
-		if (document.visibilityState === "hidden") {
-			this._hiddenAt = Date.now();
-			return;
-		}
-
-		// visible
 		const elapsed = this._hiddenAt ? Date.now() - this._hiddenAt : 0;
 		this._hiddenAt = 0;
 

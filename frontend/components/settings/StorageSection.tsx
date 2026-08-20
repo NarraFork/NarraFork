@@ -20,6 +20,7 @@ import {
 	IconBox,
 	IconCamera,
 	IconDatabase,
+	IconFileCode,
 	IconGitBranch,
 	IconInfoCircle,
 	IconLock,
@@ -111,6 +112,7 @@ const CATEGORY_ICONS: Record<string, React.ReactNode> = {
 	shares: <IconShare size={18} />,
 	worktrees: <IconGitBranch size={18} />,
 	treeSnapshots: <IconCamera size={18} />,
+	requestDumps: <IconFileCode size={18} />,
 	dormantIgnored: <IconLock size={18} />,
 	containers: <IconBox size={18} />,
 };
@@ -122,6 +124,7 @@ const CATEGORY_COLORS: Record<string, string> = {
 	shares: "teal",
 	worktrees: "orange",
 	treeSnapshots: "violet",
+	requestDumps: "indigo",
 	dormantIgnored: "yellow",
 	containers: "cyan",
 };
@@ -137,6 +140,7 @@ const DISPLAYED_CATEGORY_KEYS = [
 	"shares",
 	"worktrees",
 	"treeSnapshots",
+	"requestDumps",
 	"dormantIgnored",
 	"containers",
 ] as const;
@@ -621,6 +625,8 @@ export function StorageSection() {
 				return t("storageWorktreeCount", { count: Number(d.worktreeCount ?? 0) });
 			case "treeSnapshots":
 				return t("storageTreeSnapshotRepoCount", { count: Number(d.repoCount ?? 0) });
+			case "requestDumps":
+				return t("storageRequestDumpFileCount", { count: Number(d.fileCount ?? 0) });
 			case "dormantIgnored": {
 				const archives = t("storageIgnoredArchiveCount", {
 					count: Number(d.archiveCount ?? 0),

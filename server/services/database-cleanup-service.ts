@@ -1,6 +1,10 @@
-import { stat } from "node:fs/promises";
+import { stat, unlink } from "node:fs/promises";
 import { sqlite } from "@server/db";
 import { getDbPath } from "@server/db/connection";
+import {
+	isServableDumpFilePath,
+	REQUEST_DUMP_SPILL_POINTER_SCHEMA,
+} from "@server/lib/api-request-dump-store";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { shutdownDbWorkerPool } from "@server/lib/db-worker/pool";
 import {
@@ -392,6 +396,64 @@ async function buildSessionPreview(
 	};
 }
 
+/**
+ * Cap on spill paths collected per cleanup run.
+ *
+ * Bounded because this runs a `.all()` on the main thread (CLAUDE.md: no unbounded reads
+ * there). Exceeding it only leaves files for the store's own newest-N pruning to reclaim.
+ */
+const MAX_SPILL_PATHS_PER_CLEANUP = 5000;
+
+/**
+ * Paths of dump files referenced by the rows a dump cleanup is about to clear.
+ *
+ * Extraction happens in SQLite via `json_extract`, deliberately. The obvious spelling —
+ * `SELECT raw_dump_json ... WHERE raw_dump_json LIKE '%schema%'` — cannot use an index, so
+ * it copies every dump (each up to the inline ceiling) into the JS heap on the main thread
+ * just to find a path, which is exactly the large-field read the project's performance rules
+ * forbid outside a maintenance window. `json_extract` keeps the bytes inside SQLite and
+ * returns only the short path.
+ *
+ * `json_valid` guards the extract: a hand-edited or truncated row would otherwise make the
+ * whole statement error out and abandon every path in the batch.
+ */
+function collectSpillFilePaths(cutoffIso: string): string[] {
+	try {
+		const rows = sqlite
+			.prepare(
+				`SELECT json_extract(raw_dump_json, '$.spill.filePath') AS filePath
+				 FROM api_requests
+				 WHERE raw_dump_json IS NOT NULL
+				   AND created_at <= ?
+				   AND json_valid(raw_dump_json)
+				   AND json_extract(raw_dump_json, '$.spill.schema') = ?
+				 LIMIT ?`,
+			)
+			.all(cutoffIso, REQUEST_DUMP_SPILL_POINTER_SCHEMA, MAX_SPILL_PATHS_PER_CLEANUP) as Array<{
+			filePath: string | null;
+		}>;
+		const paths: string[] = [];
+		for (const row of rows) {
+			// Same guard the download route applies: never act on a path outside the dump dirs.
+			// The value came from our own row, so this is defense in depth against a corrupted
+			// or hand-edited one — deleting the wrong file is not recoverable.
+			if (typeof row.filePath === "string" && isServableDumpFilePath(row.filePath)) {
+				paths.push(row.filePath);
+			}
+		}
+		return paths;
+	} catch (error) {
+		logger.warn("Failed to collect spilled dump paths for cleanup", { error: String(error) });
+		return [];
+	}
+}
+
+async function deleteSpillFiles(paths: string[]): Promise<void> {
+	for (const path of paths) {
+		await unlink(path).catch(() => {});
+	}
+}
+
 async function buildDumpPreview(
 	olderThanDays = DEFAULT_API_REQUEST_DUMP_DAYS,
 	sampleLimit = DEFAULT_PREVIEW_SAMPLE_LIMIT,
@@ -749,6 +811,10 @@ export const databaseCleanupService = {
 					preview = await buildDumpPreview(normalizePreviewDays(target, options.olderThanDays), 0);
 					if (preview.counts.dumpsCleared > 0) {
 						const cutoffIso = getCutoffIso(preview.olderThanDays ?? DEFAULT_API_REQUEST_DUMP_DAYS);
+						// Collect the spill files BEFORE clearing the rows: the pointer is the only
+						// record of which file belongs to which request, so clearing first would
+						// leave the files orphaned on disk with nothing left to find them by.
+						const spillPaths = collectSpillFilePaths(cutoffIso);
 						const result = sqlite
 							.prepare(
 								`UPDATE api_requests
@@ -757,6 +823,13 @@ export const databaseCleanupService = {
 							)
 							.run(cutoffIso);
 						changed = numberFromRow(result?.changes) > 0;
+						// Delete unconditionally, NOT only when this UPDATE reported changes. These
+						// dumps are past the cutoff and being discarded either way; if a concurrent
+						// run cleared the rows first, `changes` is 0 while the files it pointed at are
+						// now unreachable — nothing records which request they belong to anymore. Gating
+						// on `changed` would leak them until the store's newest-50 pruning happened to
+						// reach them. Deleting a file whose row someone else just cleared is correct.
+						await deleteSpillFiles(spillPaths);
 					}
 				} else if (target === "toolCallPayloads") {
 					preview = await buildToolCallPayloadPreview(

@@ -2,7 +2,7 @@ import { createReadStream } from "node:fs";
 import { extname } from "node:path";
 import { z } from "zod/v4";
 import { specVfsService } from "../../../services/spec-vfs-service";
-import { imageBytesToBase64, imageToBase64 } from "../../uploads";
+import { imageBytesToBase64, imageToBase64, sanitizeParsedDimensions } from "../../uploads";
 import type { ExecutionBackend } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
@@ -203,6 +203,7 @@ export const readTool: ToolDefinition = {
 				let size: number;
 				let base64: string;
 				let detectedMediaType: string | undefined;
+				let dimensions: { width: number; height: number } | undefined;
 				const MIME_TO_FORMAT: Record<string, string> = {
 					"image/png": "png",
 					"image/jpeg": "jpeg",
@@ -219,7 +220,7 @@ export const readTool: ToolDefinition = {
 							isError: true,
 						};
 					}
-					({ base64, detectedMediaType } = await imageToBase64(ioPath));
+					({ base64, detectedMediaType, dimensions } = await imageToBase64(ioPath));
 				} else {
 					// Remote image: fetch the bytes over the device RPC (capped at the
 					// same limit) and base64-encode them here, so remote images work
@@ -236,12 +237,13 @@ export const readTool: ToolDefinition = {
 						};
 					}
 					size = totalSize || bytes.byteLength;
-					({ base64, detectedMediaType } = imageBytesToBase64(bytes));
+					({ base64, detectedMediaType, dimensions } = imageBytesToBase64(bytes));
 				}
 
 				// Prefer the real format detected from file content magic bytes
 				const actualFormat =
 					(detectedMediaType && MIME_TO_FORMAT[detectedMediaType]) || imageFormat;
+				const safeDimensions = sanitizeParsedDimensions(dimensions);
 				return {
 					output: `[Image: ${file_path} (${(size / 1024).toFixed(1)} KB, ${actualFormat})]`,
 					title: file_path,
@@ -251,6 +253,16 @@ export const readTool: ToolDefinition = {
 						imageFormat: actualFormat,
 						filePath: resolvedPath,
 						sizeKB: Number.parseFloat((size / 1024).toFixed(1)),
+						// Intrinsic pixel size: the frontend reserves an aspect-ratio box
+						// from these instead of a fixed placeholder height. Sanitized first —
+						// this tool reads arbitrary files, so the header's declared size is
+						// attacker-controlled, and an absurd ratio (a PNG claiming
+						// 4294967295x4294967295) would collapse the reserved box to ~1px
+						// while looking like real data. Out-of-bounds sizes are dropped so
+						// the frontend falls back to the placeholder height instead.
+						...(safeDimensions
+							? { width: safeDimensions.width, height: safeDimensions.height }
+							: {}),
 					},
 				};
 			} catch (err) {

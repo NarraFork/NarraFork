@@ -1,6 +1,7 @@
 import { db } from "@server/db";
 import { apiRequests, chapters, narrators } from "@server/db/schema";
-import { getCodexManager } from "@server/lib/codex-manager";
+import { redactSpillPointerPaths } from "@server/lib/api-request-dump-store";
+import { resolveCredentialDisplayName } from "@server/lib/credential-display-name";
 import {
 	encodeUsageHistoryCursor,
 	type UsageHistoryCursor,
@@ -291,6 +292,29 @@ export interface UsageHistoryRecord {
 	rawDump?: unknown | null;
 }
 
+/**
+ * Row backing a dump download: the identity a forwarded dump needs, plus the raw JSON text.
+ *
+ * The dump stays a STRING here on purpose — parsing it would pull a multi-MB row through
+ * the main thread for a response that may end up streaming a file instead.
+ */
+export interface RawDumpSource {
+	id: string;
+	narratorId: string | null;
+	narratorTitle: string | null;
+	chapterId: string | null;
+	chapterTitle: string | null;
+	projectId: string | null;
+	kind: string;
+	provider: string | null;
+	credentialId: string | null;
+	credentialName: string | null;
+	model: string | null;
+	errorMessage: string | null;
+	createdAt: string;
+	rawDumpJson: string | null;
+}
+
 interface UsageHistoryListRow {
 	id: string;
 	narratorId: string | null;
@@ -324,28 +348,13 @@ export class UsageHistoryService {
 	constructor(private readonly database: typeof db = db) {}
 
 	/**
-	 * Get credential display name from provider snapshots
+	 * Get credential display name from provider snapshots.
+	 *
+	 * Delegates to the shared resolver: the dump spill store needs the same answer, and two
+	 * copies of this lookup would drift the moment a provider changes its snapshot shape.
 	 */
 	private getCredentialName(provider: string | null, credentialId: string | null): string | null {
-		if (!provider || !credentialId) return null;
-
-		try {
-				if (!snapshot) return credentialId;
-				const cred = snapshot.entries.find((c) => c.id === credentialId);
-				return cred?.displayName || cred?.email || credentialId;
-			}
-			if (provider === "codex") {
-				const manager = getCodexManager();
-				const snapshot = manager.snapshot();
-				const cred = snapshot.entries.find((c) => c.id === credentialId);
-				return cred?.displayName || cred?.email || cred?.accountId || credentialId;
-			}
-			// Anthropic and OpenAI don't have credential management
-		} catch {
-			// Ignore errors from snapshot calls (e.g., plugin not loaded)
-		}
-
-		return credentialId;
+		return resolveCredentialDisplayName(provider, credentialId);
 	}
 
 	private mapListRecord(row: UsageHistoryListRow): UsageHistoryRecord {
@@ -367,7 +376,10 @@ export class UsageHistoryService {
 	private parseRawDump(rawDumpJson: string | null): unknown | null {
 		if (!rawDumpJson) return null;
 		try {
-			return JSON.parse(rawDumpJson);
+			// The spill pointer's absolute path is a property of the host, not of the request
+			// being diagnosed, and it carries the OS account name. Strip it on the way out; the
+			// download route resolves the path from the row itself.
+			return redactSpillPointerPaths(JSON.parse(rawDumpJson));
 		} catch {
 			return { invalidJson: true, rawText: rawDumpJson };
 		}
@@ -645,6 +657,45 @@ export class UsageHistoryService {
 			effectiveStartDate: range.effectiveStartDate,
 			effectiveEndDate: range.effectiveEndDate,
 			generatedAt: new Date().toISOString(),
+		};
+	}
+
+	/**
+	 * Everything needed to serve a complete dump download.
+	 *
+	 * Separate from {@link getUsageRecord} because the download route must not read the
+	 * dump text into a JSON response envelope when a spill file exists — it streams the
+	 * file instead. Returning the raw JSON string lets the route decide.
+	 */
+	async getRawDumpSource(id: string): Promise<RawDumpSource | null> {
+		const [record] = await this.database
+			.select({
+				id: apiRequests.id,
+				narratorId: apiRequests.narratorId,
+				kind: apiRequests.kind,
+				provider: apiRequests.provider,
+				credentialId: apiRequests.credentialId,
+				model: apiRequests.model,
+				errorMessage: apiRequests.errorMessage,
+				createdAt: apiRequests.createdAt,
+				rawDumpJson: apiRequests.rawDumpJson,
+				// Joined only here, never in the list query: a downloaded dump gets forwarded to
+				// whoever is helping diagnose it, and `narratorId` alone does not say which
+				// conversation or project produced it. One row, indexed lookups — the CLAUDE.md
+				// rule this respects is "list summaries stay lean", not "never join".
+				narratorTitle: narrators.title,
+				chapterId: narrators.chapterId,
+				chapterTitle: chapters.title,
+				projectId: chapters.projectId,
+			})
+			.from(apiRequests)
+			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
+			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.where(eq(apiRequests.id, id));
+		if (!record) return null;
+		return {
+			...record,
+			credentialName: this.getCredentialName(record.provider, record.credentialId),
 		};
 	}
 

@@ -163,6 +163,18 @@ const HIDDEN_COMPACT_MESSAGE_PREVIEW_CHARS = 800;
 const MAX_MESSAGE_IMAGE_PREVIEW_BLOB_BYTES = MAX_IMAGE_CLIPBOARD_BLOB_BYTES;
 const MAX_INLINE_IMAGE_RESULT_CHARS = MAX_INLINE_IMAGE_SOURCE_CHARS;
 const GENERATED_IMAGE_MAX_DISPLAY_WIDTH = 512;
+/**
+ * Height cap for a dimensioned chat image. Images with persisted intrinsic
+ * dimensions render at their aspect ratio up to this height; without dimensions
+ * the legacy fixed 200px box is used.
+ *
+ * Keep in sync with `vlist/measure/measure-media.ts`'s IMAGE_MAX_DISPLAY_HEIGHT,
+ * which is the source of the value. It cannot be imported here: this file is on
+ * the CHUNKED path, outside `vlist/`, and any static import into vlist/ trips the
+ * isolation guard (CONTRACT §0 铁律 1 — the flag-off path must not even load the
+ * vlist chunk). Same arrangement as tool-detail.ts's MEDIA_IMAGE_CONTENT_PX.
+ */
+const CHAT_IMAGE_MAX_HEIGHT = 400;
 const MAX_USER_MESSAGE_DISPLAY_CHARS = 120_000;
 
 /**
@@ -1762,6 +1774,21 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 
 	const src = block.previewUrl ?? blobUrl;
 
+	// Intrinsic pixel size persisted at upload time (server parses the header).
+	// With it the box follows the picture's real aspect ratio — a wide banner is
+	// short, a tall capture is capped — instead of everything occupying a fixed
+	// 200px band. Blocks persisted before dimensions were recorded keep the
+	// legacy fixed-height rendering below.
+	const imageDims =
+		typeof block.width === "number" &&
+		Number.isFinite(block.width) &&
+		block.width > 0 &&
+		typeof block.height === "number" &&
+		Number.isFinite(block.height) &&
+		block.height > 0
+			? { width: block.width, height: block.height }
+			: null;
+
 	if (!src && !narratorImageServing.supported) {
 		return (
 			<Paper p="sm" radius="sm" withBorder>
@@ -1773,7 +1800,55 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 	}
 
 	if (!src) {
+		if (imageDims) {
+			// Same box the loaded image will occupy (width-capped by the column,
+			// height-capped by MAX height via the pre-computed width bound), so the
+			// swap from skeleton to picture does not shift anything.
+			const skeletonWidth = Math.min(
+				imageDims.width,
+				Math.round((CHAT_IMAGE_MAX_HEIGHT * imageDims.width) / imageDims.height),
+			);
+			return (
+				<Box
+					w={`min(100%, ${skeletonWidth}px)`}
+					style={{ aspectRatio: `${imageDims.width} / ${imageDims.height}`, margin: "0 auto" }}
+				>
+					<Skeleton w="100%" h="100%" radius="sm" />
+				</Box>
+			);
+		}
 		return <Skeleton h={200} w={300} radius="sm" />;
+	}
+	if (imageDims) {
+		return (
+			<Box
+				style={{
+					maxWidth: "100%",
+					width: "fit-content",
+					borderRadius: "var(--mantine-radius-sm)",
+					overflow: "hidden",
+					margin: "0 auto",
+				}}
+			>
+				{/* biome-ignore lint/a11y/useKeyWithClickEvents: opens the shared fullscreen viewer (keys handled there) */}
+				<img
+					src={src}
+					alt={block.filename ?? "image"}
+					style={{
+						display: "block",
+						maxWidth: "100%",
+						maxHeight: CHAT_IMAGE_MAX_HEIGHT,
+						width: "auto",
+						height: "auto",
+						objectFit: "contain",
+						borderRadius: "var(--mantine-radius-sm)",
+						cursor: "pointer",
+					}}
+					loading="lazy"
+					onClick={() => openImageViewer({ src, filename: block.filename, alt: block.filename })}
+				/>
+			</Box>
+		);
 	}
 	return (
 		<Box

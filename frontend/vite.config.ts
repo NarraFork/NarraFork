@@ -42,78 +42,6 @@ function normalizeModulePath(path: string): string {
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "..", "package.json"), "utf-8"));
 const appVersion = pkg.version ?? "0.0.0";
 
-/** Collect direct dependency license info at build time. */
-function collectLicenses() {
-	const deps = pkg.dependencies ?? {};
-	const devDeps = pkg.devDependencies ?? {};
-	const all = { ...deps, ...devDeps };
-	const nodeModules = resolve(__dirname, "..", "node_modules");
-	const results: Array<{
-		name: string;
-		version: string;
-		license: string;
-		author: string;
-		repository: string;
-		isDev: boolean;
-		licenseText: string;
-	}> = [];
-
-	const licenseFileNames = [
-		"LICENSE",
-		"LICENSE.md",
-		"LICENSE.txt",
-		"license",
-		"license.md",
-		"LICENCE",
-		"LICENCE.md",
-		"License",
-		"LICENSE-MIT",
-		"LICENSE-APACHE",
-	];
-
-	for (const name of Object.keys(all)) {
-		try {
-			const depPkgPath = join(nodeModules, name, "package.json");
-			if (!existsSync(depPkgPath)) continue;
-			const depPkg = JSON.parse(readFileSync(depPkgPath, "utf8"));
-			const repo = depPkg.repository?.url ?? depPkg.repository ?? depPkg.homepage ?? "";
-			let repoStr = (typeof repo === "string" ? repo : (repo.url ?? ""))
-				.replace(/^git\+/, "")
-				.replace(/^git:\/\//, "https://")
-				.replace(/\.git$/, "");
-			// Convert GitHub shorthand "user/repo" to full URL
-			if (repoStr && !repoStr.includes("://")) {
-				repoStr = `https://github.com/${repoStr}`;
-			}
-
-			let licenseText = "";
-			const depDir = join(nodeModules, name);
-			for (const candidate of licenseFileNames) {
-				const lp = join(depDir, candidate);
-				if (existsSync(lp)) {
-					licenseText = readFileSync(lp, "utf8");
-					break;
-				}
-			}
-
-			results.push({
-				name,
-				version: depPkg.version ?? "",
-				license: depPkg.license ?? "UNKNOWN",
-				author: typeof depPkg.author === "string" ? depPkg.author : (depPkg.author?.name ?? ""),
-				repository: repoStr,
-				isDev: name in devDeps,
-				licenseText,
-			});
-		} catch {
-			// skip unreadable packages
-		}
-	}
-	return results;
-}
-
-const licenseData = collectLicenses();
-
 /**
  * Replace `lib/shiki-language-aliases.ts` with the precomputed alias map.
  *
@@ -421,7 +349,6 @@ export default defineConfig(({ mode, command }) => {
 			__DEV_VITE_PORT__: isServe ? JSON.stringify(vitePort) : "undefined",
 			__DEV_BACKEND_PORT__: isServe ? JSON.stringify(backendPort) : "undefined",
 			__APP_VERSION__: JSON.stringify(appVersion),
-			__LICENSE_DATA__: JSON.stringify(licenseData),
 		},
 		plugins: [
 			watchSharedDirectory(),

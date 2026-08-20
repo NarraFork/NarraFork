@@ -35,6 +35,7 @@ import { join } from "node:path";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
 import { getNarraforkPath } from "../narrafork-home";
+import { sliceToUtf8Budget } from "../utf8-budget";
 import { type ApiRequestDump, sanitizeHeaders } from "./request-dump";
 import type { ApiRequestDiagnostics } from "./types";
 
@@ -381,51 +382,90 @@ function buildPayload(input: MalformedRequestDumpInput): Record<string, unknown>
 }
 
 /**
+ * Bytes held back from the body budget for everything around it (metadata, summary,
+ * headers, and — for the spill store — the envelope the dump is nested in). Generous on
+ * purpose: overshooting costs a few unused KB, undershooting pushes the result back over
+ * the ceiling and loses the body entirely.
+ */
+const SHED_OVERHEAD_RESERVE_BYTES = 4096;
+
+const DROPPED_RESPONSE = {
+	dropped: true,
+	note: "Dropped to fit the dump file size ceiling.",
+} as const;
+
+/**
+ * The successive forms a `{ request, response }` dump can take on the way to fitting a byte
+ * ceiling, largest-first, so the request body (the whole point of a dump) survives longest.
+ *
+ * Only the *policy* lives here — what may be shed, in what order, with what body budget.
+ * Serialization stays with the caller because the two callers wrap the same payload
+ * differently: {@link writeMalformedRequestDump} writes it as the file's top level, while
+ * the spill store nests it inside an envelope and must measure the envelope. Sharing the
+ * policy while splitting the wrapping is what keeps the two from drifting: a lazily
+ * generated candidate is never serialized unless the previous one was too big.
+ *
+ * The first candidate is the untouched payload (`truncated: false`); every later one is
+ * lossy. The last candidate may still exceed the ceiling — a caller that runs out of
+ * candidates should keep it anyway, since a too-large record still beats no record.
+ */
+export function* dumpSheddingCandidates(
+	payload: Record<string, unknown>,
+	maxBytes: number,
+): Generator<{ value: Record<string, unknown>; truncated: boolean }> {
+	yield { value: payload, truncated: false };
+
+	// Response payloads (SSE events / body text) are the most expendable part.
+	yield { value: { ...payload, response: DROPPED_RESPONSE }, truncated: true };
+
+	// Last resort: keep metadata + summary, store the body as truncated text. Serializing
+	// the body to text rather than pruning its object graph is deliberate: which key is
+	// oversized varies per provider, and the head of the JSON is what shows the offender.
+	const request = isRecord(payload.request) ? payload.request : undefined;
+	const bodyText = request?.body != null ? (JSON.stringify(request.body) ?? "") : "";
+	const budget = Math.max(0, maxBytes - SHED_OVERHEAD_RESERVE_BYTES);
+	yield {
+		value: {
+			...payload,
+			response: DROPPED_RESPONSE,
+			request: {
+				...request,
+				body: undefined,
+				bodyTruncated: true,
+				bodyChars: bodyText.length,
+				bodyText: sliceToUtf8Budget(bodyText, budget),
+			},
+		},
+		truncated: true,
+	};
+}
+
+/**
  * Serialize within a byte ceiling, shedding the largest optional parts first so the
  * request body (the whole point of the capture) survives as long as possible.
  */
 function serializeWithinLimit(
 	payload: Record<string, unknown>,
 	maxBytes: number,
-): { json: string; truncated: boolean } {
+): { json: string; truncated: boolean; originalBytes: number } {
 	const pretty = JSON.stringify(payload, null, 2) ?? "";
-	if (Buffer.byteLength(pretty, "utf8") <= maxBytes) return { json: pretty, truncated: false };
+	const prettyBytes = Buffer.byteLength(pretty, "utf8");
+	if (prettyBytes <= maxBytes)
+		return { json: pretty, truncated: false, originalBytes: prettyBytes };
 
-	const compact = JSON.stringify(payload) ?? "";
-	if (Buffer.byteLength(compact, "utf8") <= maxBytes) return { json: compact, truncated: false };
-
-	// Response payloads (SSE events / body text) are the next most expendable.
-	const withoutResponse = JSON.stringify({
-		...payload,
-		response: { dropped: true, note: "Dropped to fit the dump file size ceiling." },
-	});
-	if (Buffer.byteLength(withoutResponse, "utf8") <= maxBytes) {
-		return { json: withoutResponse, truncated: true };
+	let originalBytes = prettyBytes;
+	let last = { json: pretty, truncated: true, originalBytes };
+	for (const candidate of dumpSheddingCandidates(payload, maxBytes)) {
+		const json = JSON.stringify(candidate.value) ?? "";
+		const bytes = Buffer.byteLength(json, "utf8");
+		// The untouched payload's compact size is what "original" means for this file.
+		if (!candidate.truncated) originalBytes = bytes;
+		if (bytes <= maxBytes) return { json, truncated: candidate.truncated, originalBytes };
+		last = { json, truncated: true, originalBytes };
 	}
-
-	// Last resort: keep metadata + summary, store the body as truncated text.
-	const request = isRecord(payload.request) ? payload.request : undefined;
-	const bodyText = request?.body != null ? (JSON.stringify(request.body) ?? "") : "";
-	const budget = Math.max(0, maxBytes - 4096);
-	return {
-		json:
-			JSON.stringify(
-				{
-					...payload,
-					response: { dropped: true, note: "Dropped to fit the dump file size ceiling." },
-					request: {
-						...request,
-						body: undefined,
-						bodyTruncated: true,
-						bodyChars: bodyText.length,
-						bodyText: bodyText.slice(0, budget),
-					},
-				},
-				null,
-				0,
-			) ?? "",
-		truncated: true,
-	};
+	// Even the smallest form is over the ceiling. Keep it: a too-large record still beats
+	// having no record of a rejection that carries no other detail.
+	return last;
 }
 
 /**

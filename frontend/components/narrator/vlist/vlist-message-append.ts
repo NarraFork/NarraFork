@@ -55,17 +55,22 @@ export type AppendDecision = { append: true } | { append: false; reason: AppendR
 /**
  * Block types that RESTRUCTURE the document rather than extend it.
  *
- * A compact marker hides everything before it and an ask-in-passing card is
- * inserted mid-history; both shift the seq of following messages, so the loaded
- * window has to be rebuilt from the server rather than extended locally. Mirrors the
- * chunked path's `isStructuralInsert`.
+ * An ask-in-passing card and a context-cleared marker are inserted mid-history
+ * and shift the seq of following messages, so the loaded window has to be rebuilt
+ * from the server rather than extended locally. Mirrors the chunked path's
+ * `isStructuralInsert`.
+ *
+ * Compact markers are deliberately NOT here any more. A compact / segment_compact
+ * marker that lands at the TAIL extends the window like any other row: its
+ * "everything before me is compacted away" meaning is a property of the SERVER's
+ * next load (the window starts at the marker), not a reason to yank already-loaded
+ * history out from under a reader who is browsing it — the deferred reload fired
+ * by `compact_done` owns that eventual convergence. A marker that lands
+ * MID-history (a segment compact, or a custom compact with a `beforeMessageId`)
+ * is still declined here by the ordinary not-tail check, and the caller routes it
+ * to `vlist-message-insert.ts`, which places it exactly.
  */
-const STRUCTURAL_BLOCK_TYPES = new Set([
-	"compact",
-	"segment_compact",
-	"ask_in_passing",
-	"context_cleared",
-]);
+const STRUCTURAL_BLOCK_TYPES = new Set(["ask_in_passing", "context_cleared"]);
 
 function hasStructuralBlock(message: AppendCandidate): boolean {
 	const blocks = message.contentJson;

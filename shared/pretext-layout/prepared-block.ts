@@ -135,6 +135,14 @@ export interface PreparedFixedBlock extends PreparedBlockBase {
 	tag: string;
 	/** Optional payload the renderer needs (kept small; no heavy data). */
 	data?: Record<string, unknown>;
+	/**
+	 * Known painted width (px), when the block's display size is a pure function
+	 * of data (e.g. an image with persisted intrinsic dimensions, fitted by
+	 * `fitImageBox`). Reported into the frame's `usedWidth` so a shrink-wrap
+	 * container (user bubble) grows around the image instead of clipping it.
+	 * Absent → the block contributes nothing to `usedWidth` (legacy behaviour).
+	 */
+	displayWidth?: number;
 }
 
 /**
@@ -637,7 +645,10 @@ export function accumulateFrame(
 				break;
 			case "fixed":
 				height = block.height;
-				blockUsedWidth = block.contentLeft;
+				// Same rationale as the unknown branch below: a block whose painted
+				// width is known from data (aspect-fitted image) must report it, or a
+				// shrink-wrap container clips it.
+				blockUsedWidth = block.contentLeft + (block.displayWidth ?? 0);
 				break;
 			case "unknown":
 				height = block.placeholderHeight;

@@ -4,6 +4,16 @@ export interface ApiRequestDump {
 	provider?: string;
 	model?: string;
 	diagnostics?: ApiRequestDiagnostics;
+	/**
+	 * Annotation attached by a special-case capture (currently only the upstream
+	 * "malformed request body" rejection).
+	 *
+	 * Deliberately an ADDITIONAL field rather than a replacement for the dump: a user who
+	 * opens a dump is asking what was sent, and answering with a structural summary while
+	 * dropping the request itself is the one outcome the dump exists to prevent. Size is
+	 * handled downstream by spilling the whole dump to a file, not by discarding parts of it.
+	 */
+	capture?: unknown;
 	request?: {
 		transport?: string;
 		url?: string;
@@ -158,6 +168,17 @@ export class ApiRequestDumpCollector {
 	setDiagnostics(diagnostics: ApiRequestDiagnostics | undefined): void {
 		if (!diagnostics) return;
 		this.dump.diagnostics = toJsonSafe(diagnostics);
+	}
+
+	/**
+	 * Attach a special-case capture annotation alongside the dump.
+	 *
+	 * Never touches `request`/`response`: the annotation is a pointer plus a structural
+	 * summary, and the request it describes must remain in the dump next to it.
+	 */
+	setCapture(capture: unknown): void {
+		if (capture == null) return;
+		this.dump.capture = toJsonSafe(capture);
 	}
 
 	snapshot(): ApiRequestDump {

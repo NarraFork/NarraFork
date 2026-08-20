@@ -37,7 +37,7 @@ import type { MeasuredElement, PreparedCodeBlock, PreparedFixedBlock } from "../
 import { FONT_SIZE, SANS_FAMILY } from "../pretext-fonts";
 import { swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
-import { VListImage } from "./vlist-image";
+import { readExactDisplayBox, VListImage } from "./vlist-image";
 import { TextFileRow } from "./vlist-text-file-row";
 
 const USER_BODY_FONT = `400 ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
@@ -468,8 +468,22 @@ function UserAttachmentView({
 			</div>
 		);
 	}
+	// An image whose intrinsic dimensions were persisted reserves an aspect-
+	// fitted box and stashes the exact display size in `data`; paint exactly that
+	// rectangle (the bubble shrink-wrapped around it). Dimensionless images keep
+	// the legacy centred-in-fixed-box behaviour. The predicate is shared with
+	// every other paint site (see readExactDisplayBox).
+	const exactBox = readExactDisplayBox(data);
 	return (
-		<div style={{ position: "absolute", top, left, maxWidth: "100%", width: "fit-content" }}>
+		<div
+			style={{
+				position: "absolute",
+				top,
+				left,
+				maxWidth: "100%",
+				width: exactBox ? exactBox.displayWidth : "fit-content",
+			}}
+		>
 			<VListImage
 				media={{
 					previewUrl: str(data.previewUrl),
@@ -479,6 +493,7 @@ function UserAttachmentView({
 				}}
 				narratorId={narratorId}
 				maxHeight={block.height}
+				{...(exactBox ?? {})}
 			/>
 		</div>
 	);

@@ -83,9 +83,23 @@ import {
 } from "../prepared-block";
 import { SPACING } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
+// The drilled-in SUBAGENT card (an Agent/Task/Send row reveals the same card it
+// gets at L3+). Not a cycle: measure-subagent sources its row height from
+// `@shared/pretext-layout/row-metrics` directly, so this edge is the only one
+// between the two modules.
+import {
+	BADGE_ROW_HEIGHT,
+	DESC_LEFT,
+	DESC_MARGIN_TOP,
+	type MeasuredSubagent,
+	measureSubagentCard,
+	CARD_BORDER as SUBAGENT_CARD_BORDER,
+	CARD_PADDING as SUBAGENT_CARD_PADDING,
+	type SubagentCardData,
+	XS_LINE_HEIGHT,
+} from "./measure-subagent";
 // The drill-down card. NOT a cycle: measure-tool-call depends on markdown /
-// media / permission / reflection / pretext-metrics and never on this module
-// (measure-subagent's dependency on it is one-way for the same reason).
+// media / permission / reflection / pretext-metrics and never on this module.
 import {
 	CARD_BORDER,
 	CARD_PADDING,
@@ -253,14 +267,23 @@ export interface TraceItemData {
 	 */
 	canDrillDown?: boolean;
 	/**
-	 * The nested tool card, present only on a row the reader actually drilled into.
+	 * The nested card payload, present only on a row the reader actually drilled
+	 * into.
 	 *
 	 * Height-bearing when expanded: the row grows by the measured card plus the body
 	 * box padding. Absent on collapsed rows by design — the adapter does not
 	 * classify a payload until its row is opened, so a several-hundred-row fold
 	 * stays as cheap as it was before drill-down existed.
+	 *
+	 * `ToolCallData` for an ordinary tool, `SubagentCardData` when `cardKind` is
+	 * "subagent-card": a subagent row must reveal the SAME card it gets at L3+.
 	 */
-	card?: ToolCallData;
+	card?: ToolCallData | SubagentCardData;
+	/**
+	 * Which card `card` holds. Absent means "tool-call", the overwhelmingly common
+	 * case — every pre-existing producer (and drill-down test) leaves it unset.
+	 */
+	cardKind?: "tool-call" | "subagent-card";
 }
 
 /** Trace payload. maxVisible + header labels default per variant. */
@@ -363,12 +386,18 @@ export interface MeasuredTraceRow {
 	/** Markdown body MeasuredElement when expanded, else null. */
 	body: MeasuredElement | null;
 	/**
-	 * The nested tool card when this row is drilled into, else null.
+	 * The nested card when this row is drilled into, else null.
 	 *
 	 * Mutually exclusive with `body`: a row either drills into a card (tool rows) or
 	 * expands a markdown body (reasoning steps), never both.
+	 *
+	 * A `MeasuredSubagent` when `cardKind` is "subagent-card" — the measure layer
+	 * dispatches on the row's `cardKind` so a folded Agent call reveals its
+	 * subagent card, not the generic tool card.
 	 */
-	cardMeasured: MeasuredToolCall | null;
+	cardMeasured: MeasuredToolCall | MeasuredSubagent | null;
+	/** Which card `cardMeasured` holds (meaningful only when it is non-null). */
+	cardKind: "tool-call" | "subagent-card";
 	/** Whether this row offers a drill-down (chevron present, card available). */
 	canDrillDown: boolean;
 	/** Top offset (px) where the body content begins (expanded only). */
@@ -555,7 +584,7 @@ export function measureCollapsibleTrace(
 	// Rows (with folded-in expanded bodies / drilled-in cards).
 	const rowBlockIndices: number[] = [];
 	const rowBodies: (MeasuredElement | null)[] = [];
-	const rowCards: (MeasuredToolCall | null)[] = [];
+	const rowCards: (MeasuredToolCall | MeasuredSubagent | null)[] = [];
 	for (let vi = 0; vi < visibleItems.length; vi++) {
 		const item = visibleItems[vi]!;
 		const itemIndex = startIndex + vi;
@@ -564,7 +593,7 @@ export function measureCollapsibleTrace(
 
 		let blockHeight = TRACE_ROW_HEIGHT;
 		let body: MeasuredElement | null = null;
-		let card: MeasuredToolCall | null = null;
+		let card: MeasuredToolCall | MeasuredSubagent | null = null;
 		if (expanded) {
 			if (item.card) {
 				// Drill-down: a standalone (bordered) card, exactly like a grouped card's
@@ -574,11 +603,22 @@ export function measureCollapsibleTrace(
 				// top): the summary title row is NOT painted for a drilled-in row — the
 				// card's own header morphs into its place, so the row block IS the card
 				// (`blockHeight === card.height`). No `traceBodyInnerWidth`, no indent.
-				card = measureToolCall({ ...item.card, inRun: false }, contentWidth, lod, {
-					lodUserOverride: true,
-					isRecent: true,
-					viewportHeight: expandState.viewportHeight,
-				});
+				//
+				// Dispatched by KIND: a subagent row measures its SubagentCard, so the
+				// drilled-in geometry is the same one the standalone L3+ card reports.
+				card =
+					item.cardKind === "subagent-card"
+						? measureSubagentCard(item.card as SubagentCardData, contentWidth, lod, {
+								lodUserOverride: true,
+								isRecent: true,
+								inRun: false,
+								isLast: true,
+							})
+						: measureToolCall({ ...(item.card as ToolCallData), inRun: false }, contentWidth, lod, {
+								lodUserOverride: true,
+								isRecent: true,
+								viewportHeight: expandState.viewportHeight,
+							});
 				blockHeight = card.height;
 			} else if (typeof item.bodyText === "string" && item.bodyText.trim().length > 0) {
 				const inner = traceBodyInnerWidth(contentWidth);
@@ -630,6 +670,8 @@ export function measureCollapsibleTrace(
 		const bf = frame.blocks[blockIndex]!;
 		const body = rowBodies[vi] ?? null;
 		const cardMeasured = rowCards[vi] ?? null;
+		const cardKind: "tool-call" | "subagent-card" =
+			item.cardKind === "subagent-card" ? "subagent-card" : "tool-call";
 		const expandable = isExpandable(item);
 		// A drilled-in row reports `expanded` too, so the renderer draws the open
 		// chevron and paints the body box for either kind of revealed content.
@@ -638,16 +680,31 @@ export function measureCollapsibleTrace(
 		// block's origin across the FULL row width, so its header row sits at
 		// `border + padding` inside the block. Pure restatement of the card chrome —
 		// the morph controller animates the outgoing summary row toward this rect.
-		const drillBorder = cardMeasured?.hasBorder ? CARD_BORDER : 0;
-		const drillHeader =
-			cardMeasured != null
-				? {
-						top: drillBorder + CARD_PADDING,
-						left: drillBorder + CARD_PADDING,
-						width: Math.max(1, contentWidth - 2 * (drillBorder + CARD_PADDING)),
-						height: HEADER_ROW_HEIGHT,
-					}
-				: null;
+		//
+		// Per KIND: a tool card's successor of the folded summary row is its header
+		// line (`Read · file.ts`); a subagent card's is its DESCRIPTION line — the
+		// badge row above it carries chips, not the title text the row showed.
+		let drillHeader: MeasuredTraceRow["drillHeader"] = null;
+		if (cardMeasured != null) {
+			if (cardKind === "subagent-card") {
+				const border =
+					(cardMeasured as MeasuredSubagent).borderHeight > 0 ? SUBAGENT_CARD_BORDER : 0;
+				drillHeader = {
+					top: border + SUBAGENT_CARD_PADDING + BADGE_ROW_HEIGHT + DESC_MARGIN_TOP,
+					left: border + SUBAGENT_CARD_PADDING + DESC_LEFT,
+					width: Math.max(1, contentWidth - 2 * (border + SUBAGENT_CARD_PADDING) - DESC_LEFT),
+					height: XS_LINE_HEIGHT,
+				};
+			} else {
+				const drillBorder = (cardMeasured as MeasuredToolCall).hasBorder ? CARD_BORDER : 0;
+				drillHeader = {
+					top: drillBorder + CARD_PADDING,
+					left: drillBorder + CARD_PADDING,
+					width: Math.max(1, contentWidth - 2 * (drillBorder + CARD_PADDING)),
+					height: HEADER_ROW_HEIGHT,
+				};
+			}
+		}
 		return {
 			itemIndex,
 			key: item.key ?? `row-${itemIndex}`,
@@ -671,6 +728,7 @@ export function measureCollapsibleTrace(
 			blockHeight: bf.height,
 			body,
 			cardMeasured,
+			cardKind,
 			canDrillDown: item.canDrillDown === true,
 			// A drilled-in card starts at the row block's top (no summary row above
 			// it); a markdown body still sits below the 18.8px row it belongs to.
@@ -735,8 +793,14 @@ export interface ActivityTraceItem {
 	timing?: Partial<ToolTimingStamps> | null;
 	/** Row offers a drill-down chevron (height-neutral while collapsed). */
 	canDrillDown?: boolean;
-	/** Nested tool card, present only on a drilled-in row. */
-	card?: ToolCallData;
+	/**
+	 * Nested card payload, present only on a drilled-in row. A `SubagentCardData`
+	 * when `cardKind` is "subagent-card" (an Agent/Task/Send row reveals the same
+	 * card it renders as at L3+), otherwise a `ToolCallData`.
+	 */
+	card?: ToolCallData | SubagentCardData;
+	/** Which card `card` holds; absent means "tool-call". */
+	cardKind?: "tool-call" | "subagent-card";
 	/**
 	 * Markdown body for a REASONING-STEP row; null/absent → no body to reveal.
 	 *

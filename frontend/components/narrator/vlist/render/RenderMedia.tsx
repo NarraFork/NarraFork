@@ -30,7 +30,12 @@ import type {
 	PreparedInlineBlock,
 } from "../prepared-block";
 import { FragmentGap, LineFragments } from "./line-fragments";
-import { inlineImageSrcFromResult, VListImage, type VListImageRef } from "./vlist-image";
+import {
+	inlineImageSrcFromResult,
+	readExactDisplayBox,
+	VListImage,
+	type VListImageRef,
+} from "./vlist-image";
 import { TextFileRow } from "./vlist-text-file-row";
 
 /** How the integration layer turns a media block's data into an <img> src. */
@@ -132,6 +137,14 @@ function ImageFixedView({
 	// resolves the src itself (previewUrl → uploads blob by id + narratorId).
 	const injected = resolveImageSrc?.(block.tag, data) ?? null;
 	const filename = typeof data.filename === "string" ? data.filename : "image";
+	// When the measure layer had intrinsic dimensions it reserved the aspect-
+	// fitted box and stashed the exact display geometry here; the paint must
+	// occupy exactly that rectangle. Without it the box is the fixed-height
+	// placeholder and the image centres inside it (legacy behaviour). The
+	// predicate is shared with every other paint site (see readExactDisplayBox).
+	const exactBox = readExactDisplayBox(data);
+	const exactWidth = exactBox?.displayWidth;
+	const exact = exactBox != null;
 	if (!injected) {
 		return (
 			<div
@@ -140,7 +153,7 @@ function ImageFixedView({
 					top: frame.top,
 					left: 0,
 					maxWidth: "100%",
-					width: "fit-content",
+					width: exact ? exactWidth : "fit-content",
 					margin: "0 auto",
 				}}
 			>
@@ -148,6 +161,7 @@ function ImageFixedView({
 					media={mediaRefFromData(data)}
 					narratorId={narratorId}
 					maxHeight={block.height}
+					{...(exactBox ?? {})}
 				/>
 			</div>
 		);
@@ -160,7 +174,7 @@ function ImageFixedView({
 				left: 0,
 				height: block.height,
 				maxWidth: "100%",
-				width: "fit-content",
+				width: exact ? exactWidth : "fit-content",
 				borderRadius: "var(--mantine-radius-sm)",
 				overflow: "hidden",
 				margin: "0 auto",
@@ -169,7 +183,11 @@ function ImageFixedView({
 			<img
 				src={injected}
 				alt={filename}
-				style={{ height: block.height, width: "auto", maxWidth: "100%", objectFit: "contain" }}
+				style={
+					exact
+						? { width: "100%", height: "100%", objectFit: "contain", display: "block" }
+						: { height: block.height, width: "auto", maxWidth: "100%", objectFit: "contain" }
+				}
 				loading="lazy"
 			/>
 		</div>

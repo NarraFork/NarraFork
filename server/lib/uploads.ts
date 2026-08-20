@@ -99,6 +99,49 @@ export interface ImageDimensions {
 	height: number;
 }
 
+/**
+ * The canonical persisted user-message image block. `width`/`height` carry the
+ * intrinsic pixel size parsed at upload time, so the frontend measure layer can
+ * reserve an aspect-ratio-fitted box as pure arithmetic (no DOM measurement).
+ */
+export type PersistedUserImageBlock = {
+	type: "image";
+	imageId: string;
+	filename: string;
+	mediaType: string;
+	width?: number;
+	height?: number;
+	uploadNarratorId?: string;
+};
+
+/**
+ * Type guard for a usable pixel count (positive finite number). Exported for
+ * call sites that rebuild an ImageRef from an untrusted persisted block.
+ */
+export function validImageDimension(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+/** Convert an uploads ImageRef into the canonical persisted user-message block. */
+export function imageRefToContentBlock(
+	image: ImageRef,
+	fallbackUploadNarratorId?: string | null,
+): PersistedUserImageBlock {
+	const uploadNarratorId = image.uploadNarratorId ?? fallbackUploadNarratorId;
+	const dimensions =
+		validImageDimension(image.width) && validImageDimension(image.height)
+			? { width: image.width, height: image.height }
+			: {};
+	return {
+		type: "image",
+		imageId: image.imageId,
+		filename: image.filename,
+		mediaType: image.mediaType,
+		...dimensions,
+		...(uploadNarratorId ? { uploadNarratorId } : {}),
+	};
+}
+
 function readUint24LE(buf: Buffer, offset: number): number | undefined {
 	if (offset < 0 || offset + 3 > buf.length) return undefined;
 	return buf[offset] | (buf[offset + 1] << 8) | (buf[offset + 2] << 16);
@@ -302,18 +345,51 @@ export function parseImageDimensions(bytes: Uint8Array): ImageDimensions | undef
 	);
 }
 
+/**
+ * Whether parsed dimensions are plausible enough to hand to a layout consumer.
+ *
+ * The bound matters because the numbers come from the file's own header: a PNG
+ * IHDR can declare 4294967295x4294967295 and the parser will read it faithfully.
+ * The frontend's `readImageIntrinsicSize` only checks for a positive finite
+ * number, so an absurd aspect ratio survives into `fitImageBox`, whose division
+ * then collapses the reserved box to ~1px — a layout that pretends to know the
+ * image's shape while being wrong.
+ */
+function areImageDimensionsPlausible(dimensions: ImageDimensions): boolean {
+	const { width, height } = dimensions;
+	return (
+		Number.isSafeInteger(width) &&
+		Number.isSafeInteger(height) &&
+		width > 0 &&
+		height > 0 &&
+		width <= MAX_IMAGE_DIMENSION &&
+		height <= MAX_IMAGE_DIMENSION &&
+		width * height <= MAX_IMAGE_PIXELS
+	);
+}
+
+/**
+ * Drop dimensions that fail the safety bounds instead of throwing.
+ *
+ * For the *upload* path a rejection is correct: the user is storing a file we
+ * refuse to serve. But the Read and share-file tools parse arbitrary files
+ * already on disk, where the header is fully attacker-controlled and the only
+ * thing at stake is a layout hint. There the honest answer is "no trustworthy
+ * intrinsic size", which callers already handle by falling back to a fixed
+ * placeholder height — so this returns undefined rather than failing the whole
+ * read or share.
+ */
+export function sanitizeParsedDimensions(
+	dimensions: ImageDimensions | undefined,
+): ImageDimensions | undefined {
+	if (!dimensions) return undefined;
+	return areImageDimensionsPlausible(dimensions) ? dimensions : undefined;
+}
+
 function validateImageDimensions(dimensions: ImageDimensions | undefined): void {
 	if (!dimensions) return;
-	const { width, height } = dimensions;
-	if (
-		!Number.isSafeInteger(width) ||
-		!Number.isSafeInteger(height) ||
-		width <= 0 ||
-		height <= 0 ||
-		width > MAX_IMAGE_DIMENSION ||
-		height > MAX_IMAGE_DIMENSION ||
-		width * height > MAX_IMAGE_PIXELS
-	) {
+	if (!areImageDimensionsPlausible(dimensions)) {
+		const { width, height } = dimensions;
 		throw new ValidationError(
 			`Image dimensions too large: ${width}x${height}. Max side: ${MAX_IMAGE_DIMENSION}px; max pixels: ${MAX_IMAGE_PIXELS}.`,
 		);
@@ -548,6 +624,14 @@ export interface ImageBase64Result {
 	base64: string;
 	/** The real media type detected from file content (may differ from the stored mediaType). */
 	detectedMediaType?: string;
+	/**
+	 * Intrinsic pixel size parsed from the (bounded) header prefix — undefined
+	 * when the content is not a parseable PNG/JPEG/GIF/WebP. The base64 encoding
+	 * of the payload dwarfs this scan, so it runs unconditionally; consumers
+	 * that surface an image preview (the Read tool's metadata) forward it so the
+	 * frontend can reserve an aspect-ratio box without measuring.
+	 */
+	dimensions?: ImageDimensions;
 }
 
 /**
@@ -557,9 +641,21 @@ export interface ImageBase64Result {
  * remote images are handled identically without a filesystem round trip.
  */
 export function imageBytesToBase64(bytes: Uint8Array): ImageBase64Result {
-	const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
-	const detectedMediaType = detectImageMime(buf);
-	return { base64: buf.toString("base64"), detectedMediaType };
+	// Header inspection goes through the bounded view, never a copy. `Buffer.from(bytes)`
+	// on a Uint8Array duplicates the entire (up to 20 MiB) payload, and the Read tool's
+	// remote branch hands us exactly that shape — so the old `Buffer.isBuffer(bytes) ? …`
+	// preamble added a full synchronous memcpy on the main thread purely to parse 256 KiB.
+	const header = imageHeaderView(bytes);
+	// Encoding needs the whole payload, but a *view* over it is enough — this is the
+	// same zero-copy construction `imageHeaderView` uses, just unbounded.
+	const full = Buffer.isBuffer(bytes)
+		? bytes
+		: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	return {
+		base64: full.toString("base64"),
+		detectedMediaType: detectImageMime(header),
+		dimensions: parseImageDimensions(header),
+	};
 }
 
 /**

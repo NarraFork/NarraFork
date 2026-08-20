@@ -71,6 +71,15 @@ export interface ActivityToolInput {
 	blockIndex: number;
 	tc: ToolRunItem["tc"];
 	/**
+	 * True when this call is an Agent/Task/Send-style subagent invocation.
+	 *
+	 * The chunked trace ignores it (its rows never drill down); the vlist adapter
+	 * reads it to render the row's drill-down as a SUBAGENT card rather than the
+	 * generic tool card. Optional because the chunked construction sites never
+	 * had it — only the fold's mapper (`toolItemsFromToolRunSegment`) sets it.
+	 */
+	isSubagent?: boolean;
+	/**
 	 * Disambiguator for a REPEATED tool-use id within one unit.
 	 *
 	 * A provider retry can put the same id in two persisted messages, which are two

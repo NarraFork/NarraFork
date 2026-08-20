@@ -15,6 +15,7 @@ import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
+import { abortableSleep } from "./abortable-sleep";
 import { analyzeShellCommand } from "./bash-analyze";
 import { finalizeAssistantTextWithCitations, TextCitationAccumulator } from "./citation-stream";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
@@ -516,25 +517,6 @@ function dedupeToolUsesInPlace(
 		toolUses.push(...deduped);
 	}
 	return toolUses;
-}
-
-/** Abort-aware sleep that resolves early when the signal fires. */
-function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
-	return new Promise<void>((resolve) => {
-		if (signal.aborted) {
-			resolve();
-			return;
-		}
-		const timer = setTimeout(resolve, ms);
-		signal.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timer);
-				resolve();
-			},
-			{ once: true },
-		);
-	});
 }
 
 /**
@@ -1278,6 +1260,7 @@ async function recordReflectionApiRequestEnd(
 			meterUnit: event.meterUnit ?? null,
 			errorMessage: event.errorMessage ?? null,
 			rawDump: event.rawDump,
+			dumpSpillReuseToken: event.dumpSpillReuseToken,
 		});
 	} catch (error) {
 		logger.warn("Failed to record reflection API request", {
@@ -3055,10 +3038,45 @@ export async function* agentLoop(
 			 */
 			let forceDumpPersist = false;
 			/**
-			 * Replacement raw dump used when the upstream rejected the request body as
-			 * malformed. The full body goes to a file on disk; this small record points at it.
+			 * Fallback dump used when the upstream rejected the request body as malformed and
+			 * no dump collector was active for this attempt (dumping disabled and the provider
+			 * does not leak XML tool calls). With a collector present the capture is attached
+			 * to the real dump instead — see {@link captureMalformedRequest}.
 			 */
 			let malformedRequestRecord: unknown;
+			/**
+			 * Attempts already spent replaying an upstream "malformed request body" rejection.
+			 *
+			 * Kept separate from `chatRetryCount` because this rejection is not a transient
+			 * transport fault and must not draw on (or be masked by) the ordinary retry budget:
+			 * recovered on their own with the request unchanged. Two replays convert that
+			 * self-healing window into a recovered turn; beyond that the failure is treated as
+			 * real, because a genuinely malformed body would repeat forever and retrying it
+			 * would only delay a hard error while re-sending the whole history each time.
+			 */
+			let malformedRetryCount = 0;
+			/**
+			 * Path of the dump file written for this turn's first malformed rejection, if any.
+			 *
+			 * The replays re-send an identical body, so one file is the whole evidence there is;
+			 * later attempts reuse this path instead of writing near-duplicates. `null` records
+			 * "the write was attempted and failed", which must not be retried either — the
+			 * capture record has a distinct note for that case and re-attempting would just
+			 * produce the same failure. See {@link captureMalformedRequest}.
+			 */
+			let malformedDumpPath: string | null | undefined;
+			/**
+			 * Turn-scoped key letting every attempt of THIS rejection share one spilled dump file.
+			 *
+			 * `malformedDumpPath` already keeps the malformed-dump directory to one file per turn,
+			 * but each attempt also persists its own force-saved `api_requests` row, and those
+			 * dumps spill to a SECOND directory (`request-dumps`) that had no such guard: three
+			 * attempts produced three near-identical multi-MB files, pruning unrelated
+			 * captures out of the newest-N window to store the same request three times. The
+			 * token is what tells the tracker these rows describe one request; each row still
+			 * gets a pointer, so no attempt looks like a failure without evidence.
+			 */
+			let malformedSpillReuseToken: string | undefined;
 			let requestStarted = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
@@ -3089,22 +3107,38 @@ export async function* agentLoop(
 			/**
 			 * Special case: the upstream rejected the request body as malformed
 			 * (`REQUEST_BODY_INVALID` / "Improperly formed request.") without saying which
-			 * field was wrong. Force-save the exact request that produced it to disk so the
-			 * root cause is investigable, and swap the DB-side dump for a small record that
-			 * large-field rules in CLAUDE.md).
+			 * field was wrong. Force-save the exact request that produced it to a dedicated
+			 * file so the root cause survives every retry path, and ANNOTATE the dump with a
+			 * pointer to that file plus a structural summary.
+			 *
+			 * The annotation must never replace the dump. A user opening a dump is asking what
+			 * was sent; handing back only a summary and a server-side path is the one outcome
+			 * the dump exists to prevent. Row size is bounded downstream by spilling the whole
+			 * dump to a file (see `api-request-dump-store`), not by dropping the request here.
 			 */
 			const captureMalformedRequest = async (errorMessage?: string): Promise<void> => {
 				const snapshot = requestDump?.snapshot();
-				const filePath = await writeMalformedRequestDump({
-					narratorId: config.narratorId,
-					requestId,
-					provider: effectiveProvider,
-					model: effectiveModel,
-					errorMessage,
-					diagnostics: requestDiagnostics,
-					dump: snapshot,
-				});
-				malformedRequestRecord = buildMalformedCaptureRecord({
+				// Write the file only for this turn's FIRST rejection. The replays re-send a
+				// byte-identical body, so a second file would be a near-duplicate of several MB,
+				// and at 3 attempts per turn they would evict unrelated captures through the
+				// newest-N pruning — losing other evidence to keep three copies of one.
+				//
+				// The capture record itself is still rebuilt every attempt: each attempt inserts
+				// its own `api_requests` row, and a row without the annotation would look like an
+				// ordinary failure with no pointer to the evidence.
+				if (malformedDumpPath === undefined) {
+					malformedDumpPath = await writeMalformedRequestDump({
+						narratorId: config.narratorId,
+						requestId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						errorMessage,
+						diagnostics: requestDiagnostics,
+						dump: snapshot,
+					});
+				}
+				const filePath = malformedDumpPath;
+				const captureRecord = buildMalformedCaptureRecord({
 					narratorId: config.narratorId,
 					requestId,
 					provider: effectiveProvider,
@@ -3114,7 +3148,19 @@ export async function* agentLoop(
 					dump: snapshot,
 					filePath,
 				});
+				if (requestDump) {
+					requestDump.setCapture(captureRecord.capture);
+				} else {
+					// No collector ran for this attempt, so there is no dump to annotate and the
+					// capture record is all the evidence there is.
+					malformedRequestRecord = captureRecord;
+				}
 				forceDumpPersist = true;
+				// Established on the FIRST rejection of this turn and reused by its replays, so
+				// their identical dumps share one spill file. Keyed on the first attempt's
+				// requestId: unique per turn without needing another id source, and stable across
+				// the replays because it is only assigned once.
+				malformedSpillReuseToken ??= `malformed:${requestId}`;
 			};
 
 			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
@@ -3152,10 +3198,13 @@ export async function* agentLoop(
 					contextPercent: requestContextPercent,
 					meterUsage: requestMeterUsage,
 					meterUnit: requestMeterUnit,
-					rawDump: malformedRequestRecord ?? requestDump?.snapshot(),
+					// The dump wins whenever one exists: `malformedRequestRecord` is only set on
+					// the no-collector path, where it is the sole record of the rejection.
+					rawDump: requestDump?.snapshot() ?? malformedRequestRecord,
 					errorMessage,
 					diagnostics,
 					forceDumpPersist,
+					dumpSpillReuseToken: malformedSpillReuseToken,
 				};
 			}
 
@@ -3323,6 +3372,99 @@ export async function* agentLoop(
 			 */
 			const canReplayResumableInPlace = (resumable: boolean): boolean =>
 				resumable && !hasAnyPersistableOutput() && !hasStartedEarlyToolExecution();
+
+			/**
+			 * Replays granted to an upstream "malformed request body" rejection.
+			 *
+			 * Two, deliberately: the rejection is overwhelmingly an upstream hiccup that clears
+			 * by itself, but it carries no signal distinguishing "transient" from "this body is
+			 * actually invalid". A small fixed budget recovers the former without turning the
+			 * latter into a long series of full-history re-sends.
+			 */
+			const MAX_MALFORMED_REPLAYS = 2;
+
+			/**
+			 * Whether to replay an identical request after a malformed-body rejection.
+			 *
+			 * The output guards are the same ones in-place replay always needs: re-sending is
+			 * only safe while nothing client-visible has been produced and no tool has begun
+			 * executing, otherwise the replay would duplicate output or repeat a side effect.
+			 * In practice this rejection arrives before any content, so the guards rarely bite —
+			 * but they must be checked rather than assumed, because when they do bite the cost
+			 * is duplicated work the user can see.
+			 */
+			const canReplayMalformedRequest = (): boolean =>
+				malformedRetryCount < MAX_MALFORMED_REPLAYS &&
+				!config.signal.aborted &&
+				// Same rule the ordinary retry budget applies (see `getMaxChatRetries`): a
+				// stateful provider has already consumed the request server-side, so re-sending
+				// it is not a replay. This guard is not theoretical here — `isMalformedRequestBodyError`
+				// matches on response TEXT and is not scoped to a channel, so a codex/responses
+				// error that merely contains "Improperly formed request." would otherwise replay
+				// a consumed request.
+				!usesStatefulModel(effectiveProvider, effectiveModel) &&
+				!hasAnyPersistableOutput() &&
+				!hasStartedEarlyToolExecution();
+
+			/**
+			 * What the caller must do after {@link runMalformedReplay} finishes.
+			 *
+			 * `"retry"` = fall back into the retry loop; `"aborted"` = the wait was cancelled and
+			 * the turn already reported it. Returned rather than left implicit because the two
+			 * call sites sit in different loops (`continue chatRetryLoop` vs `continue`), so the
+			 * shared generator cannot perform the jump itself.
+			 */
+			type MalformedReplayOutcome = "retry" | "aborted";
+
+			/**
+			 * Perform one malformed-body replay end to end: count it, remember the error so an
+			 * empty final attempt reports this instead of "empty response", announce the retry,
+			 * tear down the abandoned attempt, and wait out the backoff.
+			 *
+			 * Both rejection paths (a provider throw and an SSE `invalidState` event) go through
+			 * this. They were duplicated line for line, including the abort handling — which is
+			 * the kind of pair where a later fix lands on one copy and the other keeps the bug
+			 * with no test failing.
+			 *
+			 * The delay is computed ONCE and used for both the announced `delayMs` and the actual
+			 * sleep. Recomputing it after the counter moved is how the two silently disagree, and
+			 * a UI that says "retrying in 2s" while sleeping 4s has no error to report.
+			 */
+			async function* runMalformedReplay(
+				message: string,
+			): AsyncGenerator<AgentEvent, MalformedReplayOutcome, undefined> {
+				malformedRetryCount++;
+				lastRetryErrorMessage = message;
+				lastRetryDiagnostics = requestDiagnostics;
+				const delayMs = Math.min(
+					TRANSIENT_RETRY_BASE_MS * 2 ** (malformedRetryCount - 1),
+					backoffCeil,
+				);
+				logger.warn("Upstream rejected the request body as malformed; replaying", {
+					narratorId: config.narratorId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					requestId,
+					attempt: malformedRetryCount,
+					maxRetries: MAX_MALFORMED_REPLAYS,
+					delayMs,
+				});
+				yield {
+					type: "retrying",
+					message,
+					attempt: malformedRetryCount,
+					maxRetries: MAX_MALFORMED_REPLAYS,
+					delayMs,
+					diagnostics: requestDiagnostics,
+				};
+				yield* abandonAttemptForReplay(message);
+				await abortableSleep(delayMs, config.signal);
+				if (config.signal.aborted) {
+					yield { type: "error", message: "Aborted" };
+					return "aborted";
+				}
+				return "retry";
+			}
 
 			/**
 			 * Discard the partial output of an aborted attempt that carried only
@@ -4401,6 +4543,12 @@ export async function* agentLoop(
 								isMalformedRequestBodyError({ reason, message, diagnostics: requestDiagnostics })
 							) {
 								await captureMalformedRequest(message);
+								// Almost always an upstream hiccup that clears on its own, so replay the
+								// identical request a couple of times before surfacing a hard failure.
+								if (canReplayMalformedRequest()) {
+									if ((yield* runMalformedReplay(message)) === "aborted") return;
+									continue chatRetryLoop;
+								}
 							}
 							const classification = classifyInvalidState(reason, message, requestDiagnostics);
 							if (classification.category === "context_overflow") {
@@ -4852,6 +5000,14 @@ export async function* agentLoop(
 					// request before any retry/classification path can discard it.
 					if (isMalformedRequestBodyError(err)) {
 						await captureMalformedRequest(msg);
+						// Same reasoning as the stream-event path: replay a bounded number of times,
+						// since this rejection is overwhelmingly an upstream hiccup. Placed before the
+						// payment/availability checks because those cannot apply to this error, and
+						// before the generic retry classification, which marks it non-retryable.
+						if (canReplayMalformedRequest()) {
+							if ((yield* runMalformedReplay(msg)) === "aborted") return;
+							continue;
+						}
 					}
 					const nugProvider = (settings.nugProviders ?? []).find(
 						(p) => !p.disabled && (p.prefix === effectiveProvider || p.id === effectiveProvider),

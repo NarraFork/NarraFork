@@ -4,6 +4,12 @@ import { z } from "zod/v4";
 import { generateShortId } from "../../id";
 import { settings } from "../../settings";
 import { createShare, getMaxShareSizeBytes, getShareDir } from "../../shares";
+import { safeSpawn } from "../../spawn";
+import {
+	MAX_IMAGE_HEADER_SIZE,
+	parseImageDimensions,
+	sanitizeParsedDimensions,
+} from "../../uploads";
 import type { ToolDefinition, ToolResult } from "../types";
 
 /**
@@ -35,17 +41,73 @@ function pathSize(fullPath: string): number {
 	return stat.isDirectory() ? dirSize(fullPath) : stat.size;
 }
 
+/**
+ * Hard timeout for the archiving/compression subprocesses.
+ *
+ * These run on the agent loop's thread of execution: `await proc.exited` with no timeout
+ * means a wedged child stalls the narrator indefinitely with nothing to show for it. The
+ * input size is already bounded by the share ceiling, so the cap only has to cover a slow
+ * disk — but the stall cases it protects against (a hung network mount, a symlink cycle
+ * `tar` is walking) do not scale with the declared size at all, which is why a timeout is
+ * needed rather than trusting the pre-flight size check.
+ */
+const ARCHIVE_TIMEOUT_MS = 5 * 60_000;
+
+/** Version probes answer instantly or not at all. */
+const PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Cap on captured stderr from an archiver.
+ *
+ * The text goes into a tool result a model reads; a few KB names the failure, and more only
+ * costs context. Unbounded capture also let a child with a pathological error loop (one line
+ * per file across a deep tree) decide how much memory we allocate.
+ */
+const ARCHIVE_STDERR_MAX_BYTES = 8 * 1024;
+
+/**
+ * Run an archiving subprocess under a hard timeout and a bounded stderr capture.
+ *
+ * Returns `null` on success or a human-readable failure. A timeout is named as such:
+ * `safeSpawn` kills the child and reports a non-zero exit with empty stderr, which surfaces
+ * as a bare "exited with code N" — indistinguishable from a corrupt archive, and it sends
+ * whoever reads the tool result looking in the wrong place. `safeSpawn` does not report the
+ * reason, so elapsed time is what distinguishes them.
+ */
+export async function runArchiver(
+	tool: string,
+	cmd: string[],
+	opts?: { cwd?: string; timeoutMs?: number; maxStderrBytes?: number },
+): Promise<string | null> {
+	// Overridable so a test can assert the timeout and the stderr cap on a real subprocess:
+	// waiting out the production 5 minutes is not a test, and stubbing `safeSpawn` would only
+	// verify which arguments were passed, not that a wedged child is actually killed.
+	const timeoutMs = opts?.timeoutMs ?? ARCHIVE_TIMEOUT_MS;
+	const started = Date.now();
+	const result = await safeSpawn({
+		cmd,
+		cwd: opts?.cwd,
+		timeout: timeoutMs,
+		maxOutputBytes: opts?.maxStderrBytes ?? ARCHIVE_STDERR_MAX_BYTES,
+	});
+	if (result.exitCode === 0) return null;
+	if (Date.now() - started >= timeoutMs) {
+		return `${tool} timed out after ${Math.round(timeoutMs / 1000)}s`;
+	}
+	return result.stderr.trim() || `${tool} exited with code ${result.exitCode}`;
+}
+
 /** Check if the system `zip` command is available. Cached after first call. */
 let _zipAvailable: boolean | null = null;
 async function isZipCliAvailable(): Promise<boolean> {
 	if (_zipAvailable !== null) return _zipAvailable;
 	try {
-		const proc = Bun.spawn(["zip", "--version"], {
-			stdout: "ignore",
-			stderr: "ignore",
+		const result = await safeSpawn({
+			cmd: ["zip", "--version"],
+			timeout: PROBE_TIMEOUT_MS,
+			maxOutputBytes: 0,
 		});
-		const exitCode = await proc.exited;
-		_zipAvailable = exitCode === 0;
+		_zipAvailable = result.exitCode === 0;
 	} catch {
 		_zipAvailable = false;
 	}
@@ -82,17 +144,7 @@ async function zipViaCli(
 	basedir: string,
 	relativePaths: string[],
 ): Promise<string | null> {
-	const proc = Bun.spawn(["zip", "-r", outputPath, ...relativePaths], {
-		cwd: basedir,
-		stdout: "ignore",
-		stderr: "pipe",
-	});
-	const exitCode = await proc.exited;
-	if (exitCode !== 0) {
-		const stderr = await new Response(proc.stderr).text();
-		return stderr.trim() || `zip exited with code ${exitCode}`;
-	}
-	return null;
+	return runArchiver("zip", ["zip", "-r", outputPath, ...relativePaths], { cwd: basedir });
 }
 
 /**
@@ -352,36 +404,23 @@ async function handleSinglePath(
 			finalName = `${originalName}.tar.gz`;
 			storagePath = resolve(shareDir, finalName);
 			format = "tar.gz";
-			const proc = Bun.spawn(
-				["tar", "-czf", storagePath, "-C", resolve(fullPath, ".."), originalName],
-				{ stdout: "ignore", stderr: "pipe" },
-			);
-			const exitCode = await proc.exited;
-			if (exitCode !== 0) {
-				const stderr = await new Response(proc.stderr).text();
-				return {
-					output: `Failed to create archive: ${stderr.trim() || `tar exited with code ${exitCode}`}`,
-					isError: true,
-				};
-			}
+			const failure = await runArchiver("tar", [
+				"tar",
+				"-czf",
+				storagePath,
+				"-C",
+				resolve(fullPath, ".."),
+				originalName,
+			]);
+			if (failure) return { output: `Failed to create archive: ${failure}`, isError: true };
 		} else if (compress) {
 			// File + compress → copy then gzip
 			finalName = `${originalName}.gz`;
 			format = "gz";
 			const tempPath = resolve(shareDir, originalName);
 			await Bun.write(tempPath, Bun.file(fullPath));
-			const proc = Bun.spawn(["gzip", tempPath], {
-				stdout: "ignore",
-				stderr: "pipe",
-			});
-			const exitCode = await proc.exited;
-			if (exitCode !== 0) {
-				const stderr = await new Response(proc.stderr).text();
-				return {
-					output: `Failed to compress file: ${stderr.trim() || `gzip exited with code ${exitCode}`}`,
-					isError: true,
-				};
-			}
+			const failure = await runArchiver("gzip", ["gzip", tempPath]);
+			if (failure) return { output: `Failed to compress file: ${failure}`, isError: true };
 			storagePath = resolve(shareDir, finalName);
 		} else {
 			// File, no compression → direct copy
@@ -410,6 +449,29 @@ async function handleSinglePath(
 		const previewType = canPreview ? getPreviewType(finalName) : null;
 		const previewUrl = previewType ? `/api/shares/${record.id}/preview` : null;
 
+		// For image previews, forward the intrinsic pixel size so the frontend can
+		// reserve an aspect-ratio box instead of a fixed placeholder height. Only a
+		// bounded header prefix is read; unparseable formats (svg/bmp/…) just omit it.
+		//
+		// The parsed numbers are sanitized rather than forwarded raw: this tool shares
+		// arbitrary paths, so the declared size is whatever the file's header says. A
+		// PNG announcing 4294967295x4294967295 would otherwise reach the frontend,
+		// which only rejects non-finite values — the aspect-ratio division then
+		// degenerates and the "reserved" box is ~1px tall. Dropping implausible sizes
+		// returns to the placeholder-height fallback, which is at least honest.
+		let previewDimensions: { width: number; height: number } | undefined;
+		if (previewType === "image") {
+			try {
+				const header = new Uint8Array(
+					await Bun.file(storagePath).slice(0, MAX_IMAGE_HEADER_SIZE).arrayBuffer(),
+				);
+				previewDimensions = sanitizeParsedDimensions(parseImageDimensions(header));
+			} catch {
+				// Best effort: the preview still works, it just falls back to the
+				// fixed placeholder height.
+			}
+		}
+
 		return {
 			output:
 				`File shared successfully.\n\n` +
@@ -431,7 +493,14 @@ async function handleSinglePath(
 				isDirectory: isDir,
 				compressed: isDir || !!compress,
 				format,
-				...(previewUrl && { preview: true, previewType, previewUrl }),
+				...(previewUrl && {
+					preview: true,
+					previewType,
+					previewUrl,
+					...(previewDimensions
+						? { width: previewDimensions.width, height: previewDimensions.height }
+						: {}),
+				}),
 			},
 		};
 	} catch (err) {

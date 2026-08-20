@@ -69,6 +69,11 @@
 import { measureLineStats, prepareWithSegments } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
 import type { DiffLine } from "@shared/pretext-layout/diff-core";
+import {
+	type FittedImageBox,
+	fitImageBox,
+	readImageIntrinsicSize,
+} from "@shared/pretext-layout/image-fit";
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import {
@@ -200,6 +205,14 @@ export const DETAIL_CONTENT_LINE_HEIGHT = lineBoxHeight(DETAIL_BODY_FONT_SIZE, L
 export const DETAIL_LABEL_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** Detail section label `mb={2}`. */
 export const DETAIL_LABEL_MARGIN_BOTTOM = 2;
+/**
+ * Total vertical space one label row takes off a block (`cappedBodyHeight`'s
+ * `labelH`). Exported because the render layer has to subtract the SAME amount
+ * to size the body inside the block — it used to hardcode 19 in two places,
+ * which would silently clip (or under-fill) the body the day either part of the
+ * label chrome moved.
+ */
+export const DETAIL_LABEL_CHROME_Y = DETAIL_LABEL_LINE_HEIGHT + DETAIL_LABEL_MARGIN_BOTTOM; // 19
 /** Generic detail: `mt="xs"` gap before the output section. */
 export const GENERIC_SECTION_GAP = SPACING.xs; // 10
 
@@ -385,8 +398,10 @@ export const DETAIL_MONO_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${MONO
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * RENDER-ONLY image descriptor for a `media` cap (mirrors ToolMediaRef in
- * tool-detail.ts). Height-neutral; the render layer resolves an <img> src.
+ * Image descriptor for a `media` cap (mirrors ToolMediaRef in tool-detail.ts).
+ * The src fields are render-only (the render layer resolves an <img> src);
+ * `width`/`height` are HEIGHT-RELEVANT — when present, the reserved content
+ * height is the aspect-ratio fit rather than the fixed fallback.
  */
 export interface ToolMediaRef {
 	previewUrl?: string;
@@ -395,16 +410,48 @@ export interface ToolMediaRef {
 	filename?: string;
 	sizeKB?: number;
 	imageFormat?: string;
+	/** Intrinsic pixel size from the tool payload (drives the aspect fit). */
+	width?: number;
+	height?: number;
 }
 
 /**
- * Reserved pixel height for an inline media image (`media` cap `contentPx`).
+ * Fallback reserved pixel height for an inline media image (`media` cap
+ * `contentPx`) when the payload carries no intrinsic dimensions.
  *
  * Mirrors the shared classifier's MEDIA_IMAGE_CONTENT_PX, which is itself the
- * same fixed height a user message's image block uses (IMAGE_FIXED_HEIGHT), so a
- * screenshot inside a tool card reserves exactly as much room as a chat image.
+ * same fixed height a dimensionless user message's image block uses
+ * (IMAGE_FIXED_HEIGHT), so a screenshot inside a tool card reserves exactly as
+ * much room as a chat image.
  */
 export const MEDIA_IMAGE_CONTENT_PX = IMAGE_FIXED_HEIGHT;
+
+/**
+ * Content height for a media cap. With the image's intrinsic dimensions the
+ * reserved height is the aspect-ratio fit into (availableWidth × cap) — pure
+ * arithmetic on persisted data, and the render layer's contain-fit lands on
+ * the same box. Without dimensions the classifier's fixed estimate stands.
+ *
+ * ⚠️ The `fit` is returned ALONGSIDE the height, not discarded, because the
+ * render layer needs BOTH numbers. Reserving only the fitted height and letting
+ * the paint fall back to its legacy `width: 100%` box breaks §0 铁律 2 whenever
+ * the CAP is the binding constraint: a tall screenshot's fit narrows
+ * `displayWidth` to keep the ratio, but a full-width box paints
+ * `boxWidth × h/w` — far taller than the reserved 400px, so the image is
+ * clipped by the box's `overflow: hidden`. Both dimensions must travel to the
+ * `<img>` so measurement and paint describe the same rectangle.
+ */
+function mediaContentPx(
+	media: ToolMediaRef | undefined,
+	fallbackPx: number | undefined,
+	availableWidth: number,
+	cap: number,
+): { contentPx: number | undefined; fit: FittedImageBox | null } {
+	const natural = media ? readImageIntrinsicSize(media.width, media.height) : null;
+	if (!natural) return { contentPx: fallbackPx, fit: null };
+	const fit = fitImageBox(natural, availableWidth, cap);
+	return { contentPx: fit.displayHeight, fit };
+}
 
 /** 🟡 A single maxHeight-capped detail body (code/term/diff/media/skill/…). */
 export interface ToolCappedDetail {
@@ -429,8 +476,9 @@ export interface ToolCappedDetail {
 	 */
 	text?: string;
 	/**
-	 * RENDER-ONLY image descriptor for `media` caps. Height-neutral (the height
-	 * comes from contentPx). Kept in sync with tool-detail.ts.
+	 * Image descriptor for `media` caps. The src fields are render-only; the
+	 * intrinsic `width`/`height` drive the reserved content height (see
+	 * mediaContentPx). Kept in sync with tool-detail.ts.
 	 */
 	media?: ToolMediaRef;
 	/**
@@ -1489,7 +1537,7 @@ function cappedBodyHeight(
 					? measureCappedContentHeight(text, cap, availableWidth)
 					: (contentLines ?? 0) * DETAIL_CONTENT_LINE_HEIGHT);
 	const capped = Math.min(content, cap);
-	const labelH = hasLabel ? DETAIL_LABEL_LINE_HEIGHT + DETAIL_LABEL_MARGIN_BOTTOM : 0;
+	const labelH = hasLabel ? DETAIL_LABEL_CHROME_Y : 0;
 	return { height: labelH + capped, capped };
 }
 
@@ -1890,10 +1938,15 @@ export function measureToolDetail(
 			// A structured diff is measured ROW BY ROW at the width left over after the
 			// line-number gutter, because that gutter narrows every code line.
 			const diffGutterChars = diffGutterWidthChars(detail);
+			// A media cap with intrinsic dimensions reserves the aspect-fitted
+			// height instead of the fixed fallback (screenshots, image Reads). The
+			// fitted BOX (both dimensions) travels into `block.data` below so the
+			// render layer paints exactly the rectangle reserved here.
+			const media = mediaContentPx(detail.media, detail.contentPx, innerWidth, cap);
 			const { height, capped } = cappedBodyHeight(
 				cap,
 				detail.contentLines,
-				detail.contentPx,
+				media.contentPx,
 				hasLabel,
 				detail.text,
 				innerWidth,
@@ -1908,6 +1961,15 @@ export function measureToolDetail(
 				text: detail.text,
 				// Render-only image descriptor for media caps (painted as an <img>).
 				media: detail.media,
+				// The EXACT display box the height above was reserved from. Without
+				// these the render layer falls back to its legacy full-width centred
+				// box, which paints `boxWidth × h/w` — taller than the reservation
+				// whenever the cap (not the width) was the binding constraint, and the
+				// overflow is clipped away. Same contract as the chat image block's
+				// `displayWidth`/`displayHeight` (see measure-media).
+				...(media.fit
+					? { displayWidth: media.fit.displayWidth, displayHeight: media.fit.displayHeight }
+					: {}),
 				// Render-only syntax-highlighting hints (colour only, never geometry).
 				codeLang: detail.codeLang,
 				codeLangPath: detail.codeLangPath,

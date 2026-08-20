@@ -637,6 +637,12 @@ export type AgentEvent =
 			diagnostics?: ApiRequestDiagnostics;
 			/** Force raw-dump persistence regardless of the errors-only setting. */
 			forceDumpPersist?: boolean;
+			/**
+			 * Turn-scoped key marking several attempts as re-sends of ONE request, so their
+			 * identical dumps share a single spilled file instead of filling the newest-N
+			 * dump directory with multi-MB near-duplicates.
+			 */
+			dumpSpillReuseToken?: string;
 	  }
 	| { type: "silent_disconnect" }
 	| { type: "done" };

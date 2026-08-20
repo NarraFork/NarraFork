@@ -42,6 +42,7 @@ import { integrationRoutes } from "./routes/integrations";
 import { knowledgeRoutes } from "./routes/knowledge";
 import { knowledgePackRoutes } from "./routes/knowledge-packs";
 import { learningRoutes } from "./routes/learning";
+import licenseRoutes from "./routes/licenses";
 import { mcpRoutes } from "./routes/mcp";
 import { modelCardRoutes } from "./routes/model-cards";
 import { narratorRoutes } from "./routes/narrators";
@@ -185,6 +186,10 @@ app.route("/api/shares", shareRoutes);
 
 // Public: changelog (no sensitive data)
 app.route("/api/changelog", changelogRoutes);
+
+// Public: third-party license attribution. Required to reach whoever receives the
+// software, and /licenses is linked from the login page.
+app.route("/api/licenses", licenseRoutes);
 
 // Public: remote executor binary download. A machine being enrolled has no
 // session yet, so this authorizes with a single-use, platform-bound ticket

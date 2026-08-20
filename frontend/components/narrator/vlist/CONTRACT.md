@@ -101,9 +101,9 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 | 元件 | 固定部分 | 可变部分 | 备注 |
 |------|---------|---------|------|
 | assistant text | markdown 内边距 paddingInline=xs, paddingBlock=0.25rem 🟢 | markdown 正文 🔴 | ClampableText: L1 且 >600 字 → maxHeight:160 🟡 |
-| user 消息 | 气泡 p=sm + 头部单行(头像20+用户名+时间戳) 🟢 | 纯文本 pre-wrap（**不解析 markdown**）🔴 | 气泡 shrink-wrap: 宽=contentInset*2+usedWidth |
+| user 消息 | 气泡 p=sm + 头部单行(头像20+用户名+时间戳) 🟢 | 纯文本 pre-wrap（**不解析 markdown**）🔴 | 气泡 shrink-wrap: 宽=contentInset*2+usedWidth；带尺寸的附件图（`PreparedFixedBlock.displayWidth`）会把气泡**撑宽**到自己的显示宽（上限=列宽），无尺寸附件仍只占 300px 地板 |
 | user 消息(斜杠指令) | 气泡 p=sm + 头部 + 指令行(sm mono truncate) + 预览行(xs 单行 clamp) + 溢出时 toggle 行(xs) 🟢 | 展开后=展开提示词 pre-wrap 🔴 | 折叠态**高度恒定**，与展开文本长度无关；`commandText` 存在即走此形态 |
-| image | 固定 200px 🟢 | — | Skeleton 200×300 也 200 |
+| image | 有持久化宽高时=宽高比预留（`fitImageBox`，封顶 IMAGE_MAX_DISPLAY_HEIGHT=400）🟢 | — | 无尺寸（老消息）回落固定 200px；尺寸是**数据**不是测量：服务端上传时解析头部并写进 contentJson；fitted 分支与 image_generation 同属"高度随宽度单调性例外"（见 measure-media 注释），由 width-settle 结构护栏兜底 |
 | text_file | 单行(图标14+文件名+大小) py=2 🟢 | — | |
 | reasoning/thinking | 折叠 header 单行 🟢 | 展开=markdown 🔴（body 实际按 sm：正文14px/代码12px，见下注） | L2/L1→ReasoningCountLine 单行；见 measure-reasoning |
 
@@ -194,6 +194,7 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 - **展开体各详情 maxHeight（🟡 min(内容,上限)）**：
   - codeStyle=**200**、termStyle=**200**、bash/terminal cmd=**60**、EditDiff=**200**、图片/视频/iframe/skill/plan/knowledge body=**400**、流式 bash cmd=**120**。
   - 上限内的高度按**有界换行测量**得出（见 §4 开头 🟡 说明）：携带正文的详情一律测量换行，不再只数硬换行。
+  - **media 详情（截图/图片）带 `media.width/height` 时按宽高比预留**（`fitImageBox` 进 可用宽×cap，纯算术，见 measure-tool-call 的 `mediaContentPx`）：截图 metadata 自带宽高，无尺寸时回落固定 200px。
   - **需测量🔴**：SpecTasks 列表(任务数×行高)、Recall/Send/Pipeline/WebSearch 结构化列表段、各 badge 头部行、error 文本、AskUserQuestionBanner、ReflectionNotice、InlinePermission 的 Textarea(1-3/8-30 行)+动态按钮行。
   - isPlan 的 `vpHeight`=0.85×视口高 → **用视口高公式替代，不测 DOM**。plan 正文按 **markdown** 测量/渲染（与 chunked 路径的 `ContentViewer markdown` 对齐），并可前置一行 `_planFile` 来源提示；正文解析同样走有界前缀（块边界截断）。plan 详情**不向上转发 `onUnknownHeight`** —— 外框高度由 cap 决定，转发会让虚拟列表与滚动框互相打架。
 - **服务端截断的正文（`textTruncated`）预留整个 cap，且不占任何额外行**：
@@ -252,24 +253,57 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 
 **回归防线：** `live-patch-measure-audit.test.ts` 的 EXHAUSTIVE 组对每个 patch 函数跑真实的 segmentMessages → adaptSegments → measure，断言"高度变了的行，缓存键必须也变"。新增 patch 时把它加进那份列表即可自动获得覆盖，不需要手工列字段。
 
-## 4.5.1 历史删改的就地通道（删除 / 尾部截断）
+## 4.5.1 历史删改的就地通道（删除 / 尾部截断 / 中段插入 / marker 整条替换）
 
-§4.5 处理的是"服务端在已装载消息上原地改字段"。这一节处理另一件事：**服务端删掉了消息、或截短了某条消息的 block 列表**。它们是结构变化，本来只能走 `reload`。
+§4.5 处理的是"服务端在已装载消息上原地改字段"。这一节处理另一件事：**服务端删掉了消息、截短了某条消息的 block 列表、或在窗口中段插入了一行**。它们是结构变化，本来只能走 `reload`。
 
-问题在于 `reload` 被 `pinnedToBottom` 门控（`vlist-reload-policy.ts`）：读者滚上去时重载被**无限期推迟**，只暴露为未读提示。这条门控对"被动到达的新内容"是对的（替换窗口会把读者拽回底部、丢掉 loadOlder 页面），但对**读者自己刚点的回退/删除**是错的——他右键点的就是历史里某条消息，因此按定义不在底部，然后界面看起来没反应。未读徽标也是错误的表达：读者没有未读，是他的操作没落地。
+问题在于 `reload` 被 `pinnedToBottom` 门控（`vlist-reload-policy.ts`）：读者滚上去时重载被**无限期推迟**，只暴露为未读提示。这条门控对"被动到达的新内容"是对的（替换窗口会把读者拽回底部、丢掉 loadOlder 页面），但对**读者自己刚点的回退/删除/压缩**是错的——他右键点的就是历史里某条消息，因此按定义不在底部，然后界面看起来没反应。未读徽标也是错误的表达：读者没有未读，是他的操作没落地。
 
-因此新增两条就地通道，与 `appendMessage` 同构（`removeMessages` / `replaceMessage`）。判定是纯函数（`vlist-message-remove.ts` / `vlist-message-replace.ts`），**保守**：拿不准就返回同一数组引用，调用方按身份跳过重建并回落 `reload`。
+因此现在共有**四条**就地通道，都与 `appendMessage` 同构。前三条的判定是纯函数（`vlist-message-remove.ts` / `vlist-message-replace.ts` / `vlist-message-insert.ts`），**保守**：拿不准就返回同一数组引用，调用方按身份跳过重建并回落 `reload`。
+
+| 通道 | 入口 | 处理什么 |
+|------|------|---------|
+| 删除 | `removeMessages` | `messages_deleted` |
+| 尾部截断 | `replaceMessage` | 前缀式 `message_updated`（rollback 的边界消息）|
+| 中段插入 | `insertMessage` | 落在窗口中段的 compact marker（段压缩 / 带 `beforeMessageId` 的自定义压缩）|
+| marker 整条替换 | `applyLivePatch` + `isCompactMarkerMessage` | `replaceMessage` 拒绝的 compact marker `message_updated` |
 
 ### 为什么不会命中错误高度
 
-两条通道都保持 `messageVersion` 不变（§4.5 约束 2：动它会让全窗口重测，而留存行内容一个字没变），于是 `documentRevision` 不动，缓存键的正确性只能由 **`spec.key`** 承担（`registry.ts` 的 `buildCacheKey`）。
+四条通道都保持 `messageVersion` 不变（§4.5 约束 2：动它会让全窗口重测，而留存行内容一个字没变），于是 `documentRevision` 不动，缓存键的正确性只能由 **`spec.key` + `extractDataRevision`** 承担（`registry.ts` 的 `buildCacheKey`）。
 
 - **删除**：被删行的 key 直接不再出现，留存行的 key 与内容都没变 → 天然安全。
 - **尾部截断**：assistant block 的 key 是 `${msg.id}-b${bi}`，`bi` 是 block 在**原数组**中的索引。截掉尾部只让高索引 key 消失，留下的每个 `-b{bi}` 仍指向同一 block 同一内容 → 安全。
+- **中段插入**：新行带自己的 `spec.key`（`${markerMsgId}-sys`），既有行的 key 由**消息 id** 派生而不是数组下标，所以插入不会让任何既有 key 改指别的内容 → 安全。⚠️ 这依赖"key 从不含数组位置"这条既有约定（§4.5 里 `spec.key` 用内容身份那条的同一理由）；哪天有元件改用下标做 key，这条通道就必须一起收窄。
+- **marker 整条替换**：见下面单独一节——这是唯一一条 key **和**内容都可能变的通道。
 
 ⚠️ **这就是 `replaceMessage` 只接受"严格变短且是前缀"的原因，别放宽。** 正文被改写而 key 不变（`-b0` 还是 `-b0`）时，version 又没动，缓存键完全相同 ⇒ 新内容被塞进旧高度的盒子——正是 §4.5 约束 3 警告的形态。所以长度相等（编辑）、变长（追加）、中段删除（非前缀，`-b1` 会改指原来的 `-b2`）全部拒绝，交给 `reload`：那条路连同新 `messageVersion` 一起换掉整个窗口，永远正确。判定用显式字段清单（`type`/`id`/`name`/`text`/`thinking`/`summary`/`status`）而不是深比较——它每个事件只跑一次，不在 measure 热路径上。
 
 **已知残留（刻意）：** 非前缀的 `message_updated`（如手工编辑 assistant 文本）仍走 `reload`，因此非底部时仍会推迟。就地处理它需要让缓存键感知正文变化，而唯一能承载的就是 `documentRevision`（即 `messageVersion`），一动就是全窗口重测，等于放弃就地更新的全部收益。rollback 产生的恰好是前缀截断，不落在这个残留里。
+
+### 插入的窗口边界（上下各一条，理由不同）
+
+`insertMessage` 只在两个边界之内接受一行；越界一律回落 `reload`。
+
+- **下边界（比已装载尾部更新）**：那是 `appendMessage` 的职责，两条通道都接会插两次。
+- **上边界（`seq < oldestLoadedSeq`）**：⚠️ **判定只看这个边界，刻意不要 `hasPrev` 前提。** 两个独立的失败方式各自成立：
+  1. 还有未取的更老历史时（`hasPrev`），下一次 loadOlder 会把同一个 marker 再取回来——分页只认 `beforeSeq`，不知道本地插过一行 → 重复。
+  2. 即使 `hasPrev` 为 false 也不安全：`trimLoadedHead` 会把已取历史**交还**并同步把边界往新的方向推（`trimHead` 里 `oldestLoadedSeq = oldestKeptSeq`）。此时一个低于边界的 seq 在数组里**没有正确的位置**，而 `insertLoadedMessage` 会合法地给出 `insertAt = 0`，于是 marker 落到窗口最顶端——一个它不属于的位置，上面还压着比它更老的行。
+
+  早期只判第 1 条（`hasPrev && …`），第 2 条就成了静默错位。代价只是极少数情况多走一次 reload。
+
+### compact marker 的整条替换：靠正文签名而不是 status
+
+`replaceMessage` 拒绝的 `message_updated` 里有一类必须就地处理：**compact marker 的状态推进**（`compacting → compacted/failed`）。它不是前缀截断（block 一个没少，只是字段变了），但读者刚点的就是这次压缩，推迟等于操作看起来没落地。所以 `replaceOrReload` 在 `replaceMessage` 拒绝后，对 `isCompactMarkerMessage` 认可的消息走 `applyLivePatch` 整条替换（保持 `messageVersion` 与消息数不变，并且**必须 anchor**：failed 的段压缩卡比单行 marker 高）。
+
+这条通道的安全性**不能**只靠"status 折进了 measure cache key"：
+
+- 非 failed 的 `compact`/`segment_compact` 是单行 `system-simple`，label 由 status **合成**（`composeCompactText`），正文无法独立变化 → status 足够。
+- **failed 的段压缩是 `system-text` 卡，正文就是错误原文，按 pre-wrap 换行**，高度对文本敏感。而 `adaptSystemTextData` 的 `segment_compact_failed` 分支**根本不往 `data` 里写 status**，于是两次 `failed` 更新的 `extractDataRevision` 原本都是 `undefined` —— 缓存键逐字节相同，第二条更新直接命中第一条的高度，长错误信息被裁掉。
+
+因此 `extractDataRevision` 为 system 卡补了一条 `data.text` 的内容签名（`|sx:` + `textSignature`，O(1)，与 `detailTextRevision` 同一口径；后者只走 `d.detail`，system 卡没有 detail 所以进不去）。**这是这条通道成立的前提**，不是可选优化：没有它，就必须把这类更新退回 `reload`。
+
+覆盖：`measure-cache.test.ts` 断言同 status 不同正文（含等长不同换行）必须换 revision；`pretext-layout-coordinator.test.ts` 用真实 `applyLivePatch` 断言 version 不动时卡片高度确实跟着正文变高。
 
 ### rollback 会发出两个事件，必须都接
 

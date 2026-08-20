@@ -80,6 +80,8 @@ import {
 	contentJsonHasImageBlocks,
 	deleteNarratorUploads,
 	type ImageRef,
+	imageRefToContentBlock,
+	type PersistedUserImageBlock,
 	type TextFileRef,
 } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
@@ -1442,23 +1444,11 @@ export const narratorService = {
 		const now = new Date().toISOString();
 		const contentJson: Array<
 			| { type: "text"; text: string }
-			| {
-					type: "image";
-					imageId: string;
-					filename: string;
-					mediaType: string;
-					uploadNarratorId?: string;
-			  }
+			| PersistedUserImageBlock
 			| { type: "text_file"; filename: string; size: number; filePath: string }
 		> = [];
 		for (const image of options?.images ?? []) {
-			contentJson.push({
-				type: "image",
-				imageId: image.imageId,
-				filename: image.filename,
-				mediaType: image.mediaType,
-				...(image.uploadNarratorId ? { uploadNarratorId: image.uploadNarratorId } : {}),
-			});
+			contentJson.push(imageRefToContentBlock(image));
 		}
 		for (const file of options?.textFiles ?? []) {
 			contentJson.push({

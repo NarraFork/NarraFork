@@ -53,6 +53,13 @@
 
 import { prepareWithSegments } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
+// The recent-call rows ARE trace rows, so their height comes from the shared row
+// metrics rather than a second copy of it. Sourced from `row-metrics` directly
+// (NOT `./measure-tool-run`, which merely re-exports it): measure-tool-run now
+// imports THIS module to measure a drilled-in subagent card, so importing it back
+// would close a cycle — and `RECENT_ROW_HEIGHT` is a module-level const, which
+// would hit the TDZ at import time.
+import { BARE_ROW_HEIGHT } from "@shared/pretext-layout/row-metrics";
 import {
 	accumulateFrame,
 	DEFAULT_RENDER_LOD,
@@ -78,10 +85,6 @@ import {
 	measureInlinePermission,
 } from "./measure-permission";
 import { resolveToolTimingStamps, type ToolTimingStamps } from "./measure-tool-call";
-// The recent-call rows ARE trace rows, so their height comes from the trace model
-// rather than a second copy of it. One-way: measure-tool-run imports
-// measure-markdown + measure-tool-call and never this module, so no cycle.
-import { TRACE_ROW_HEIGHT } from "./measure-tool-run";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -130,10 +133,11 @@ export const RECENT_TITLE_MARGIN_BOTTOM = 4;
  * These rows used to be tinted `5px 7px` buttons (27px), so the same child tool
  * call looked like a chunky card row inside a subagent card and like a slim trace
  * line once the reader dropped to a low LOD. They are now the same row, which is
- * expressed by taking the height from `measure-tool-run` rather than restating it.
- * One-way import: `measure-tool-run` never imports this module.
+ * expressed by taking the height from the shared row metrics (`BARE_ROW_HEIGHT`,
+ * the constant `measure-tool-run`'s `TRACE_ROW_HEIGHT` re-exports) rather than
+ * restating it.
  */
-export const RECENT_ROW_HEIGHT = TRACE_ROW_HEIGHT; // 18.8
+export const RECENT_ROW_HEIGHT = BARE_ROW_HEIGHT; // 18.8
 /** Trace rows sit flush; the old 4px seam belonged to the tinted-button look. */
 export const RECENT_STACK_GAP = 0;
 /** At most 3 recent calls are shown (slice(-3)). */

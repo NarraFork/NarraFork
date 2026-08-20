@@ -17,6 +17,7 @@ import {
 	RECENT_TABS_WS_BATCH_SIZE,
 } from "@shared/recent-tabs";
 import { getToken } from "./api";
+import { observePageLifecycle } from "./page-lifecycle";
 import { buildWsUrl, safeCloseWs } from "./ws";
 import { removeWSStatus, setWSStatus } from "./ws-status";
 
@@ -191,6 +192,17 @@ const MAX_CATCH_UP_CURSORS = 100;
  */
 const VISIBILITY_RECONNECT_THRESHOLD_MS = 60_000;
 const FOREGROUND_RECOVERY_COALESCE_MS = 250;
+/**
+ * How long a foreground `sync_check` may go completely unanswered before the
+ * socket is treated as dead.
+ *
+ * A browser can hand back a socket that still reports `readyState === OPEN`
+ * after it stopped delivering anything. Without this probe `_connected` stays
+ * true, the UI claims a healthy connection, and the message stream is silently
+ * gone until the user navigates. Any inbound frame — including a heartbeat
+ * `ping` — clears it, so a live-but-idle narrator never trips it.
+ */
+const SYNC_PROBE_TIMEOUT_MS = 5_000;
 
 export function chunkNarratorIds(
 	narratorIds: readonly string[],
@@ -316,7 +328,19 @@ export function decideNarratorForegroundRecovery(opts: {
 	hiddenElapsedMs: number;
 	socketState: NarratorForegroundSocketState;
 	hasPendingReconnect: boolean;
+	/**
+	 * The browser told us it discarded this page's connections (restored from the
+	 * back/forward cache, or resumed from a freeze).
+	 *
+	 * This outranks every other input on purpose. `hiddenElapsedMs` can be 0
+	 * because bfcache/freeze need not be preceded by a `visibilitychange`, and
+	 * `socketState` can still read `"open"` for a socket the browser already
+	 * killed — trusting either would answer `"sync"` and push a `sync_check` into
+	 * a dead socket.
+	 */
+	socketDiscarded?: boolean;
 }): NarratorForegroundRecoveryAction {
+	if (opts.socketDiscarded) return "reconnect";
 	if (opts.hiddenElapsedMs >= VISIBILITY_RECONNECT_THRESHOLD_MS) return "reconnect";
 	if (opts.socketState === "missing" || opts.socketState === "closed") {
 		return opts.hasPendingReconnect ? "none" : "reconnect";
@@ -337,8 +361,21 @@ export class NarratorWSManager {
 	private reconnectAttempts = 0;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	private pingTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
-	private foregroundRecovery = createNarratorForegroundRecoveryCoalescer();
+	private syncProbeTimer: ReturnType<typeof setTimeout> | undefined;
+	private foregroundRecovery: NarratorForegroundRecoveryCoalescer;
+	private syncProbeTimeoutMs: number;
 	private cancelled = false;
+
+	/**
+	 * Timings are injectable so tests can drive the recovery sequences without
+	 * waiting out the real coalesce/probe windows.
+	 */
+	constructor(opts?: { foregroundCoalesceMs?: number; syncProbeTimeoutMs?: number }) {
+		this.foregroundRecovery = createNarratorForegroundRecoveryCoalescer(
+			opts?.foregroundCoalesceMs ?? FOREGROUND_RECOVERY_COALESCE_MS,
+		);
+		this.syncProbeTimeoutMs = opts?.syncProbeTimeoutMs ?? SYNC_PROBE_TIMEOUT_MS;
+	}
 
 	// --- Subscription ref-counting ---
 	// narratorId → Set of subscription handle IDs
@@ -422,9 +459,11 @@ export class NarratorWSManager {
 		this._unlistenNetwork();
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
+		this._clearSyncProbe();
 		this.foregroundRecovery.cancel();
 		this.reconnectTimer = undefined;
 		this.pingTimeoutTimer = undefined;
+		this._socketDiscarded = false;
 		this.pendingDispatchQueue = [];
 		this.dispatchScheduled = false;
 		removeWSStatus(WS_STATUS_ID);
@@ -1203,14 +1242,16 @@ export class NarratorWSManager {
 	 * Send a lightweight sync_check for a single narrator.
 	 * The server compares the version and replies with sync_ok (in sync),
 	 * catch_up (incremental), or full_reload (too far behind / deleted).
+	 *
+	 * Returns whether a frame was actually written to the socket.
 	 */
-	checkSync(narratorId: string): void {
-		if (this.pendingMessageReconciles.has(narratorId)) return;
-		if (this.ws?.readyState !== WebSocket.OPEN) return;
+	checkSync(narratorId: string): boolean {
+		if (this.pendingMessageReconciles.has(narratorId)) return false;
+		if (this.ws?.readyState !== WebSocket.OPEN) return false;
 		const handle = [...this.subscriptions.values()].find(
 			(record) => record.kind === "messages" && record.narratorIds.includes(narratorId),
 		);
-		if (!handle) return;
+		if (!handle) return false;
 		const version = this.messageVersions.get(narratorId) ?? 0;
 		const cursor = this.catchUpCursors.get(narratorId);
 		const requestId = this._registerRequest({
@@ -1227,22 +1268,28 @@ export class NarratorWSManager {
 		};
 		if (cursor) msg.catchUpCursor = cursor;
 		this.ws.send(JSON.stringify(msg));
+		return true;
 	}
 
 	/**
 	 * Send sync_check for all currently subscribed narrators.
 	 * Called on window focus to detect any missed messages.
+	 *
+	 * Returns how many checks were sent, so a caller can distinguish "nothing to
+	 * ask" from "asked and waiting" before arming a liveness timeout.
 	 */
-	checkAllSubscribedSync(): void {
-		if (this.ws?.readyState !== WebSocket.OPEN) return;
+	checkAllSubscribedSync(): number {
+		if (this.ws?.readyState !== WebSocket.OPEN) return 0;
 		const ids = new Set<string>();
 		for (const record of this.subscriptions.values()) {
 			if (record.kind !== "messages") continue;
 			for (const narratorId of record.narratorIds) ids.add(narratorId);
 		}
+		let sent = 0;
 		for (const narratorId of ids) {
-			this.checkSync(narratorId);
+			if (this.checkSync(narratorId)) sent++;
 		}
+		return sent;
 	}
 
 	// -----------------------------------------------------------------------
@@ -1266,6 +1313,7 @@ export class NarratorWSManager {
 	reconnect(): void {
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
+		this._clearSyncProbe();
 		this.foregroundRecovery.cancel();
 		this.reconnectTimer = undefined;
 		this.pingTimeoutTimer = undefined;
@@ -1295,6 +1343,7 @@ export class NarratorWSManager {
 	private _doConnect(): void {
 		if (this.cancelled) return;
 		this.reconnectTimer = undefined;
+		this._clearSyncProbe();
 		if (this._isNetworkOffline()) {
 			this.networkOffline = true;
 			this._setConnected(false, false, true);
@@ -1332,6 +1381,9 @@ export class NarratorWSManager {
 
 		ws.onmessage = (event) => {
 			if (this.cancelled || this.ws !== ws) return;
+			// Any inbound frame proves the socket still delivers, including a
+			// heartbeat `ping` on an otherwise idle narrator.
+			this._clearSyncProbe();
 			try {
 				const data = JSON.parse(event.data);
 				if (data.type === "ping") {
@@ -1409,6 +1461,7 @@ export class NarratorWSManager {
 			this.ws = null;
 			clearTimeout(this.pingTimeoutTimer);
 			this.pingTimeoutTimer = undefined;
+			this._clearSyncProbe();
 			this._setConnected(
 				false,
 				false,
@@ -1581,6 +1634,7 @@ export class NarratorWSManager {
 		this.networkOffline = true;
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
+		this._clearSyncProbe();
 		this.foregroundRecovery.cancel();
 		this.reconnectTimer = undefined;
 		this.pingTimeoutTimer = undefined;
@@ -1602,28 +1656,27 @@ export class NarratorWSManager {
 	}
 
 	// -----------------------------------------------------------------------
-	// Visibility change — recover from browser background throttling
+	// Page lifecycle — recover from background throttling, freeze and bfcache
 	// -----------------------------------------------------------------------
 
-	private _boundVisibilityHandler: (() => void) | null = null;
+	private _unobservePageLifecycle: (() => void) | null = null;
 	private _hiddenAt = 0;
+	/** Set when the browser told us it discarded this page's connections. */
+	private _socketDiscarded = false;
 
 	private _listenVisibility(): void {
-		if (this._boundVisibilityHandler) return;
-		this._boundVisibilityHandler = () => this._handleVisibilityChange();
-		document.addEventListener("visibilitychange", this._boundVisibilityHandler);
-		window.addEventListener("focus", this._boundVisibilityHandler);
-		window.addEventListener("pageshow", this._boundVisibilityHandler);
+		if (this._unobservePageLifecycle) return;
+		this._unobservePageLifecycle = observePageLifecycle({
+			onHidden: (info) => this._handlePageHidden(info),
+			onRestoredFromCache: () => this._handleRestoredFromCache(),
+			onForeground: () => this._handleForeground(),
+		});
 	}
 
 	private _unlistenVisibility(): void {
 		this.foregroundRecovery.cancel();
-		if (this._boundVisibilityHandler) {
-			document.removeEventListener("visibilitychange", this._boundVisibilityHandler);
-			window.removeEventListener("focus", this._boundVisibilityHandler);
-			window.removeEventListener("pageshow", this._boundVisibilityHandler);
-			this._boundVisibilityHandler = null;
-		}
+		this._unobservePageLifecycle?.();
+		this._unobservePageLifecycle = null;
 	}
 
 	/**
@@ -1640,20 +1693,47 @@ export class NarratorWSManager {
 	 * for all subscribed narrators — this detects missed messages without
 	 * the overhead of a full reconnect.
 	 */
-	private _handleVisibilityChange(): void {
+	private _handlePageHidden(info: { persisted: boolean }): void {
+		if (this.cancelled) return;
+		if (!this._hiddenAt) this._hiddenAt = Date.now();
+		this.foregroundRecovery.cancel();
+		if (!info.persisted) return;
+
+		// The page is entering the back/forward cache or being frozen: this socket
+		// will not survive, and on return it may still report OPEN. Detach it now so
+		// the recovery decision sees a clean "missing" state and no sync_check or
+		// permission decision is ever written into a dead socket.
+		this._socketDiscarded = true;
+		this._clearSyncProbe();
+		clearTimeout(this.pingTimeoutTimer);
+		this.pingTimeoutTimer = undefined;
+		const ws = this.ws;
+		this.ws = null;
+		safeCloseWs(ws);
+	}
+
+	private _handleRestoredFromCache(): void {
+		if (this.cancelled) return;
+		// Recorded as state rather than reconnecting inline: a plain foreground
+		// recovery may already be queued in the coalescer, and `schedule` returns
+		// false while a timer is pending. Dropping the signal there would let the
+		// weaker readyState/elapsed heuristics decide for a connection the browser
+		// has already told us is gone.
+		this._socketDiscarded = true;
+		this._handleForeground();
+	}
+
+	private _handleForeground(): void {
 		if (this.cancelled) return;
 
-		if (document.visibilityState === "hidden") {
-			if (!this._hiddenAt) this._hiddenAt = Date.now();
-			this.foregroundRecovery.cancel();
-			return;
-		}
-
-		// `visibilitychange`, `focus`, and `pageshow` commonly fire together when a
-		// frozen tab resumes. Coalesce them so one foreground transition performs at
-		// most one reconnect/sync cycle.
+		// `visibilitychange`, `focus`, `pageshow` and `resume` commonly fire together
+		// when a frozen tab resumes. Coalesce them so one foreground transition
+		// performs at most one reconnect/sync cycle.
 		this.foregroundRecovery.schedule(() => {
-			if (this.cancelled || document.visibilityState !== "visible") return;
+			if (this.cancelled) return;
+			// A discarded connection must be rebuilt regardless of what the document
+			// currently reports; the flag survives until it is consumed.
+			if (!this._socketDiscarded && document.visibilityState !== "visible") return;
 			this._recoverForeground();
 		});
 	}
@@ -1661,6 +1741,8 @@ export class NarratorWSManager {
 	private _recoverForeground(): void {
 		const elapsed = this._hiddenAt ? Date.now() - this._hiddenAt : 0;
 		this._hiddenAt = 0;
+		const socketDiscarded = this._socketDiscarded;
+		this._socketDiscarded = false;
 		const socketState: NarratorForegroundSocketState = !this.ws
 			? "missing"
 			: this.ws.readyState === WebSocket.OPEN
@@ -1672,13 +1754,38 @@ export class NarratorWSManager {
 			hiddenElapsedMs: elapsed,
 			socketState,
 			hasPendingReconnect: this.reconnectTimer !== undefined,
+			socketDiscarded,
 		});
 
 		if (action === "reconnect") {
 			this.reconnect();
 			return;
 		}
-		if (action === "sync") this.checkAllSubscribedSync();
+		// Only arm the liveness probe when a check was actually sent. With no
+		// messages subscription there is nothing to answer, and an unanswered
+		// probe would tear down a perfectly healthy socket.
+		if (action === "sync" && this.checkAllSubscribedSync() > 0) this._armSyncProbe();
+	}
+
+	// -----------------------------------------------------------------------
+	// Foreground liveness probe
+	// -----------------------------------------------------------------------
+
+	private _armSyncProbe(): void {
+		this._clearSyncProbe();
+		this.syncProbeTimer = setTimeout(() => {
+			this.syncProbeTimer = undefined;
+			if (this.cancelled || this._isNetworkOffline()) return;
+			// The socket accepted a sync_check and then answered nothing at all — not
+			// even a heartbeat. Treat it as dead rather than leaving the UI claiming a
+			// live connection whose message stream has stopped.
+			this.reconnect();
+		}, this.syncProbeTimeoutMs);
+	}
+
+	private _clearSyncProbe(): void {
+		clearTimeout(this.syncProbeTimer);
+		this.syncProbeTimer = undefined;
 	}
 
 	private _scheduleSubscribe(handle: SubscriptionHandle, narratorIds: string[]): void {

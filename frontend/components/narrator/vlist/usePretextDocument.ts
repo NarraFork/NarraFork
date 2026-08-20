@@ -221,6 +221,13 @@ export interface UsePretextDocumentResult {
 	 */
 	appendMessage: (message: TreeMessage) => boolean;
 	/**
+	 * Insert a mid-window structural marker (a segment-compact marker, or a custom
+	 * compact with a `beforeMessageId`) into the loaded window in place. Returns
+	 * false when the marker cannot be placed locally (duplicate, no seq, newer
+	 * than the loaded tail), so the caller falls back to a structural reload.
+	 */
+	insertMessage: (message: TreeMessage) => boolean;
+	/**
 	 * Drop deleted messages from the loaded window in place. Returns false when the
 	 * deletion cannot be applied locally (nothing loaded matches, or it would empty
 	 * the document), so the caller falls back to a structural reload.
@@ -639,6 +646,21 @@ export function usePretextDocument(
 			}) ?? false,
 		[coordinator, options.getCurrentView, options.isSubagent],
 	);
+	// Same live-view contract as appendMessage: the anchor is captured from the
+	// CURRENT scroll position at insert time, so a scroll in flight cannot desync
+	// it from the correction that follows.
+	const insertMessage = useCallback(
+		(message: TreeMessage) =>
+			coordinator?.insertMessage(message, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? false,
+		[coordinator, options.getCurrentView],
+	);
 	// Both in-place history mutations read the view LIVE at patch time, the same
 	// contract as loadOlder / applyLivePatch / appendMessage: a scroll in flight must
 	// not desync the captured anchor from the correction that follows it.
@@ -720,6 +742,7 @@ export function usePretextDocument(
 		applyLivePatch,
 		setStreamingMessage,
 		appendMessage,
+		insertMessage,
 		removeMessages,
 		replaceMessage,
 		trimHead,

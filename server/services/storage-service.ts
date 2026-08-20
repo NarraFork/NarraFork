@@ -12,6 +12,8 @@ import {
 	narrators,
 	projects,
 } from "../db/schema";
+import { MALFORMED_REQUEST_DUMP_DIR } from "../lib/agent/malformed-request-dump";
+import { REQUEST_DUMP_SPILL_DIR } from "../lib/api-request-dump-store";
 import {
 	CHAT_DRAFT_ATTACHMENT_TTL_MS,
 	deleteChatAttachmentFiles,
@@ -307,6 +309,43 @@ async function scanChatAttachments(): Promise<StorageCategoryResult> {
 		sizeBytes: measured.sizeBytes,
 		...(measured.truncated ? { truncated: true } : {}),
 		details: { roomDirs: roomCount },
+	};
+}
+
+/**
+ * Spilled API request dumps (`~/.narrafork/request-dumps` and the malformed-request
+ * captures next to them).
+ *
+ * A dump too large for its database row is written here so "download" can return the
+ * complete request; that makes the directory grow with debugging activity rather than with
+ * user data, so it needs to be visible in the breakdown. Both directories are self-pruning
+ * (newest N kept) and safe to delete — deleting only costs the ability to download older
+ * dumps in full.
+ */
+async function scanRequestDumps(): Promise<StorageCategoryResult> {
+	const dirs = [
+		resolve(NARRAFORK_DIR, REQUEST_DUMP_SPILL_DIR),
+		resolve(NARRAFORK_DIR, MALFORMED_REQUEST_DUMP_DIR),
+	];
+	let sizeBytes = 0;
+	let truncated = false;
+	let fileCount = 0;
+	for (const dir of dirs) {
+		const measured = await measureDirSize(dir);
+		sizeBytes += measured.sizeBytes;
+		if (measured.truncated) truncated = true;
+		try {
+			const entries = await readdir(dir, { withFileTypes: true });
+			fileCount += entries.filter((e) => e.isFile()).length;
+		} catch {
+			// dir may not exist yet
+		}
+	}
+	return {
+		key: "requestDumps",
+		sizeBytes,
+		...(truncated ? { truncated: true } : {}),
+		details: { fileCount },
 	};
 }
 
@@ -620,6 +659,12 @@ export async function* scanStorage(
 	const sharesResult = await scanShares();
 	categories.push(sharesResult);
 	yield { type: "category", data: sharesResult };
+
+	throwIfAborted(signal);
+	yield { type: "progress", message: "scanning_request_dumps" };
+	const requestDumpsResult = await scanRequestDumps();
+	categories.push(requestDumpsResult);
+	yield { type: "category", data: requestDumpsResult };
 
 	throwIfAborted(signal);
 	yield { type: "progress", message: "scanning_worktrees" };

@@ -68,6 +68,113 @@ describe("agent error handling", () => {
 		).toBe(false);
 	});
 
+	/**
+	 * Regression: an opencode 429 announcing a *weekly* allowance wall was retried
+	 * forever (observed: 8 identical requests in 54s with maxTransientRetries=-1).
+	 *
+	 * Two independent defects had to line up, so each is pinned separately below:
+	 *   1. Cloudflare's `retry-after: 374160` (≈4.3 days) response header was
+	 *      serialized into the error object and matched the bare `retry` keyword in
+	 *      the 429 rate-limit list — a header NAME acting as an upstream signal.
+	 *   2. "Weekly usage limit reached" matched neither `usage_limit_reached` nor
+	 *      `usage limit has been reached`, so nothing classified it as a hard wall.
+	 *
+	 * The payload below is the real one from `api_requests.raw_dump_json`. The
+	 * `retry-after` header MUST stay in it: without the header this assertion also
+	 * passes on the unfixed code, making it useless as a regression guard.
+	 */
+	test("does not retry a hard weekly-usage-limit 429 that carries a Retry-After header", () => {
+		const message =
+			"OpenAI API error 429: Weekly usage limit reached. Resets in 4 days. To continue using " +
+			"this model now, enable usage from your available balance: https://opencode.ai/workspace/wrk_01M/go";
+		const err = Object.assign(new Error(message), {
+			status: 429,
+			diagnostics: {
+				schema: "narrafork.error-diagnostics.v1",
+				source: "provider",
+				phase: "http_error",
+				reason: "GoUsageLimitError",
+				errorType: "GoUsageLimitError",
+				message: message.replace("OpenAI API error 429: ", ""),
+				responseSnippet: message.replace("OpenAI API error 429: ", ""),
+				statusCode: 429,
+				responseHeaders: {
+					"content-type": "text/plain;charset=UTF-8",
+					"retry-after": "374160",
+					server: "cloudflare",
+				},
+			},
+		});
+		expect(isRetryableError(err)).toBe(false);
+	});
+
+	test("a Retry-After header is not by itself evidence of a transient 429", () => {
+		// No rate-limit wording anywhere; the only "retry" in the object is the header name.
+		expect(
+			isRetryableError({
+				status: 429,
+				message: "Provider API error 429: account restricted",
+				diagnostics: { statusCode: 429, responseHeaders: { "retry-after": "600" } },
+			}),
+		).toBe(false);
+	});
+
+	test("field names containing 'retry' are not evidence of a transient 429", () => {
+		expect(
+			isRetryableError({
+				status: 429,
+				message: "Provider API error 429: account restricted",
+				diagnostics: { statusCode: 429, requestId: "req_retry_pool_7" },
+			}),
+		).toBe(false);
+		expect(
+			isRetryableError({
+				status: 429,
+				message: "Provider API error 429: account restricted",
+				retryCount: 3,
+			}),
+		).toBe(false);
+	});
+
+	test("still retries genuine rate-limit 429s", () => {
+		expect(
+			isRetryableError({
+				status: 429,
+				message:
+					"OpenAI API error 429: Rate limit reached for gpt-4o on tokens per min. Please try again in 2s.",
+			}),
+		).toBe(true);
+		// A standalone `retry` word is still a real signal, unlike `retry-after`.
+		expect(isRetryableError({ status: 429, message: "Provider API error 429: please retry" })).toBe(
+			true,
+		);
+	});
+
+	test("recognizes the whole usage-limit wording family as a hard wall", () => {
+		for (const wording of [
+			"Weekly usage limit reached. Resets in 4 days.",
+			"usage limit exceeded for this account",
+			"monthly usage limit hit",
+			"usage_limit_reached",
+			"The usage limit has been reached",
+		]) {
+			expect(isRetryableError({ status: 429, message: `Provider API error 429: ${wording}` })).toBe(
+				false,
+			);
+		}
+	});
+
+	test("an informational usage-limit mention is not treated as exhaustion", () => {
+		// Noun without a consumed verb: must stay on the normal heuristic path, and the
+		// rate-limit wording still makes it retryable.
+		expect(
+			isRetryableError({
+				status: 429,
+				message: "Provider API error 429: your usage limit is 1000/min; too many requests",
+			}),
+		).toBe(true);
+	});
+
 	test("still retries server-side transient status codes without keywords", () => {
 		for (const status of [500, 502, 503, 504, ...Array.from({ length: 10 }, (_, i) => 520 + i)]) {
 			expect(isRetryableError({ status, message: `Provider API error ${status}` })).toBe(true);

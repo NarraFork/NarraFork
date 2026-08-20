@@ -56,6 +56,17 @@ NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件�
 - 文件预览/分享/工具读取必须有大小上限或流式读取；HTML sanitize、压缩/解压、哈希大文件应放 worker/subprocess 或设置硬限制。
 - 新增可能处理大数据的功能时，必须同时设计：最大输入/输出字节数、超时、取消、分页/流式策略、慢操作日志和对事件循环的影响。
 
+**API request dump 溢写到文件（requestDumps）：**
+
+request dump 回答的是「我们到底发了什么、上游回了什么」，所以它必须完整——但完整就意味着大（含重放历史和内联图片时动辄数 MB），而上一节禁止让 SQLite 行无上限增长。两个要求只在「dump 存在数据库里」时冲突，因此按大小分流：
+
+- **行内只留有界的头部 + 指针。** `server/lib/api-request-dump-store.ts` 的 `RAW_DUMP_INLINE_MAX_BYTES`（当前 512KiB）是**行预算**，与 `agent.requestDumpMaxSize`（运维想保留多少 dump）是两件事；早期把两者混为一谈，导致 5MB 的 dump 在 32MB 默认值下从不溢写、整块进了 `raw_dump_json`。超过行预算时行里只保留可读的 head 和 `RawDumpSpillPointer`（带 `inlineTruncated`，让前端能说明「这是头部，完整内容需下载」）。
+- **完整 dump 落到 `~/.narrafork/request-dumps/`**（目录名即 `REQUEST_DUMP_SPILL_DIR`），文件名含时间戳 + requestId + 随机短 id（同毫秒两次写入不能互相覆盖，那正好毁掉别人在收集的证据）。写入有硬字节上限、失败清理和有界重试；具体数值以代码为准，不要在别处复制。
+- **该目录可以安全删除，运行时不会读回。** 产品逻辑不依赖这些文件，删除只损失「下载较早 dump 的完整内容」这一项能力。溢写文件数量本身也有上限（`MAX_REQUEST_DUMP_SPILL_FILES`），旧文件按 mtime 淘汰。
+- **下载路由 `GET /api/usage-history/:id/raw-dump`** 在行里有 spill 指针时直接流式返回文件（不在主线程解析再重新包装）；**文件被裁剪或手工删除时回落到行内 head 而不是 404**——用户至少拿到残存部分和解释缺失原因的指针。任何走「返回行而非文件」的分支都会先剥掉指针里的绝对路径（路径含宿主 OS 账号名，而 dump 会被转发给协助排查的人）。
+- **存储扫描含 `requestDumps` 分类**（`server/services/storage-service.ts`），与 shares、worktrees、treeSnapshots 并列。
+- **隐私定位：** dump 是请求的逐字副本，凭据已由 `sanitizeHeaders` 掩码，但消息正文是**故意保留**的（不看正文无法诊断被拒的请求）。按会话数据对待，不要当普通日志。
+
 **Changelog 与发布工作流：**
 
 项目使用 `changelogs/` 目录持久化每个版本的双语更新日志，构建时嵌入二进制。
@@ -73,6 +84,25 @@ NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件�
 3. **构建嵌入：** `scripts/build-cross-platform.ts` 会扫描 `changelogs/*.json` 生成 `server/generated/embedded-changelog.ts`，编译二进制后无需文件系统即可读取。
 4. **运行时读取：** `server/lib/changelog.ts` 双模式 — 开发时读文件系统，编译二进制读嵌入数据。API 端点 `GET /api/changelog`（公开，无需认证）。
 5. **前端查看：** 设置页 About 区域有「查看更新日志」链接，跳转到 `/changelog` 页面（Timeline 组件，按版本倒序，根据语言切换内容）。
+
+**第三方开源协议页面（`/licenses`）：**
+
+页面覆盖**所有随发布产物分发的第三方组件**（当前约 1180 条），而非仅 `package.json` 里的直接依赖。分组依据是"是否随产物分发"，不是 `dependencies` / `devDependencies` 的位置：
+
+- **`bundled`** — 不在 `node_modules` 里、但被编译进发布产物的组件。**由人工在 `licenses/extra/entries.json` 声明**，协议全文放同目录 `.txt`。当前包含：Bun 运行时（含其静态链接的 JavaScriptCore，**LGPL-2**，附带 relink 说明）、`vendor/zstd` 静态二进制（**BSD-3-Clause OR GPL-2.0，已选定 BSD-3**）、静态链接的 musl libc、Go 标准库 + `remote-executor/go.mod` 的 4 个模块、`@parcel/watcher` 的 8 个平台原生 `.node`（由 `scripts/download-parcel-watcher.ts` 直接从 npm 下载，**绕过 node_modules，扫描器看不到**）。
+- **`runtime`** — 从 `dependencies` 递归可达的包（含 `optionalDependencies`），全部随二进制分发。
+- **`development`** — 仅 `devDependencies` 可达，不分发，列出以求完整。
+
+**⚠️ 新增非 npm 二进制依赖时必须在 `licenses/extra/entries.json` 登记**，否则页面不会提及它，构成 attribution 缺口。
+
+实现要点：
+
+1. **扫描器** `server/lib/licenses/scan.ts` — 递归依赖树 + `readdir` 正则匹配协议文件（`/^(licen[cs]e|copying)([._-].*)?$/i`，比固定候选名多命中 23 个包）+ NOTICE 单独采集（Apache-2.0 §4(d)）+ 按 sha256 去重全文（1052 份 → 563 份唯一）。
+2. **双许可选定** `server/lib/licenses/dual-license.ts` — `"A OR B"` 必须人工声明采用哪个分支并写明理由；**未声明的 disjunction 会报 error 阻断构建**，不会静默显示原始 `"A OR B"`（那看起来像答案，却隐藏了没人做过选择的事实，MPL 分支还带源码披露义务）。同文件还有 `khroma` 这类"无 license 字段"的人工 override。
+3. **缺协议原文回落** `server/lib/licenses/spdx-templates.ts` — 38 个包声明了 SPDX 但没随包提供协议文件（monorepo 只在仓库根放一份）。回落到标准协议全文，条目标 `textSource: "spdx-template"`，**UI 明确提示"这是标准文本，不是该包自行提供的措辞"并给出上游链接**。所有模板均从 `node_modules` 中已安装的规范副本逐字复制（模板注释里标注了来源包），有测试逐字对比；**禁止凭记忆手写或改写协议文本**。
+4. **构建嵌入** `scripts/build-cross-platform.ts` Step 5c → `server/generated/embedded-licenses.ts`。**`problems` 中有 `error` 级会 `exit(1)` 阻断构建**（取代旧实现的静默 `catch {}`，正是它让 785 个包无声消失）。嵌入内容以 JSON 字符串 + `JSON.parse` 形式生成，与 `embedded-migrations-data.ts` 同理：1179 条对象字面量会让 TS 推断出过复杂 union 而报 TS2590。
+5. **运行时读取** `server/lib/licenses/manifest.ts` 双模式 — 开发扫 `node_modules`（约 130ms，进程内缓存），二进制读嵌入数据。API：`GET /api/licenses`（摘要，**不含全文**）+ `GET /api/licenses/text/:id`（按内容哈希取单份全文）。两者均公开无需认证，因为 attribution 必须对软件接收者可得，且 `/licenses` 从登录页可直达。
+6. **前端** `frontend/routes/licenses.tsx` — 运行时加载，展开行才拉取对应全文。改造前是构建期把 1.7MB 全文内联进 bundle（`__LICENSE_DATA__`），现在 licenses chunk 仅 7.6KB。
 
 **正式版（stable）直达增量包：**
 

@@ -16,6 +16,7 @@
  */
 
 import { measureLineStats, measureNaturalWidth, prepareWithSegments } from "@chenglou/pretext";
+import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
 import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
 import {
 	accumulateFrame,
@@ -37,7 +38,7 @@ import {
 	SPACING,
 } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
-import { IMAGE_FIXED_HEIGHT, TEXT_FILE_HEIGHT } from "./measure-media";
+import { IMAGE_FIXED_HEIGHT, IMAGE_MAX_DISPLAY_HEIGHT, TEXT_FILE_HEIGHT } from "./measure-media";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // ── Chrome constants (px) — from CONTRACT.md §4 / Mantine defaults ───────────
@@ -60,10 +61,12 @@ export const USER_HEADER_MIN_CONTENT_WIDTH = 140;
 /** Stack gap between a user bubble's attachments and its body text (Stack gap={4}). */
 export const USER_ATTACHMENT_GAP = 4;
 /**
- * Minimum inner width for a bubble carrying attachments. An image paints at its
- * intrinsic aspect ratio inside the reserved 200px-tall box, so the measure layer
- * cannot know its width; this floor keeps a short/absent caption from shrink-
- * wrapping the bubble narrower than the image it contains. Matches the classic
+ * Minimum inner width for a bubble carrying attachments. A dimensionless image
+ * paints at its intrinsic aspect ratio inside the reserved 200px-tall box, so
+ * the measure layer cannot know its width; this floor keeps a short/absent
+ * caption from shrink-wrapping the bubble narrower than the image it contains.
+ * (An image WITH persisted dimensions reports its fitted width directly and
+ * widens the bubble beyond this floor when wider.) Matches the classic
  * ImageBlock's Skeleton placeholder width (300). Height-neutral.
  */
 export const USER_ATTACHMENT_MIN_CONTENT_WIDTH = 300;
@@ -121,7 +124,8 @@ export type MessageRole = "assistant" | "user";
 /**
  * One attachment carried INSIDE a user bubble (image / text file). Mirrors
  * MessageBubble, which renders every block of a user message — not only the
- * text ones. `type` is the only height-relevant field; the rest is render data.
+ * text ones. `type` and (for images) the intrinsic `width`/`height` are the
+ * height-relevant fields; the rest is render data.
  */
 export interface MeasureUserAttachment {
 	type: string;
@@ -130,6 +134,9 @@ export interface MeasureUserAttachment {
 	filename?: string | null;
 	mediaType?: string | null;
 	size?: number | null;
+	/** Intrinsic pixel size persisted at upload time — drives aspect fitting. */
+	width?: number | null;
+	height?: number | null;
 	uploadNarratorId?: string | null;
 	/**
 	 * Text-file attachment's on-disk path. HEIGHT-NEUTRAL passthrough: the row is
@@ -244,20 +251,31 @@ function measureAssistantMessage(
 
 /**
  * Build the fixed block reserving one user attachment's box. Heights mirror the
- * media measures the classic path renders with (image → IMAGE_FIXED_HEIGHT,
- * text_file → TEXT_FILE_HEIGHT), so no DOM measurement is involved.
+ * media measures the classic path renders with, so no DOM measurement is
+ * involved: an image WITH persisted intrinsic dimensions reserves the
+ * aspect-ratio-fitted box (the same `fitImageBox` formula the render layer
+ * paints), an image WITHOUT them reserves the fixed 200px placeholder, and a
+ * text file keeps its single row.
+ *
+ * The fitted image also reports its `displayWidth`: the bubble shrink-wraps
+ * around it, so a wide screenshot widens the bubble up to the column instead
+ * of being squeezed into whatever width the caption text happened to wrap to.
  */
 function attachmentBlock(
 	attachment: MeasureUserAttachment,
 	marginTop: number,
+	innerWidth: number,
 ): PreparedFixedBlock | null {
 	const isImage = attachment.type === "image";
 	if (!isImage && attachment.type !== "text_file") return null;
+	const natural = isImage ? readImageIntrinsicSize(attachment.width, attachment.height) : null;
+	const fit = natural ? fitImageBox(natural, innerWidth, IMAGE_MAX_DISPLAY_HEIGHT) : null;
 	return {
 		kind: "fixed",
 		marginTop,
-		height: isImage ? IMAGE_FIXED_HEIGHT : TEXT_FILE_HEIGHT,
+		height: isImage ? (fit?.displayHeight ?? IMAGE_FIXED_HEIGHT) : TEXT_FILE_HEIGHT,
 		tag: isImage ? "user-image" : "user-text-file",
+		...(fit ? { displayWidth: fit.displayWidth } : {}),
 		data: {
 			imageId: attachment.imageId ?? null,
 			previewUrl: attachment.previewUrl ?? null,
@@ -267,6 +285,14 @@ function attachmentBlock(
 			uploadNarratorId: attachment.uploadNarratorId ?? null,
 			// Render-only (see MeasureUserAttachment.filePath): does not touch height.
 			filePath: attachment.filePath ?? null,
+			...(natural && fit
+				? {
+						width: natural.width,
+						height: natural.height,
+						displayWidth: fit.displayWidth,
+						displayHeight: fit.displayHeight,
+					}
+				: {}),
 		},
 		contentLeft: 0,
 		quoteRailLefts: [],
@@ -284,7 +310,11 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 	// bubble — the block order MessageBubble renders (server persists attachment
 	// blocks before the text block).
 	for (const attachment of input.attachments ?? []) {
-		const block = attachmentBlock(attachment, blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP);
+		const block = attachmentBlock(
+			attachment,
+			blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
+			innerWidth,
+		);
 		if (block) blocks.push(block);
 	}
 	const hasAttachments = blocks.length > 0;
@@ -321,9 +351,11 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 	// Shrink-wrap: bubble width = padding*2 + widest line (bounded by contentWidth).
 	// With a header, floor the inner width at USER_HEADER_MIN_CONTENT_WIDTH so the
 	// avatar/name/time row is not clipped by a short body. Height stays unchanged
-	// (body wraps within `innerWidth`, which is unaffected). Attachment boxes are
-	// height-only reservations (their painted width is intrinsic and capped at
-	// 100%), so they do not widen the bubble either.
+	// (body wraps within `innerWidth`, which is unaffected). An attachment whose
+	// display size is known from data (an image with persisted dimensions) reports
+	// its fitted `displayWidth` through the frame, so the bubble WIDENS around a
+	// wide screenshot up to the column; a dimensionless image keeps the
+	// USER_ATTACHMENT_MIN_CONTENT_WIDTH floor instead.
 	const innerUsed = Math.max(
 		1,
 		frame.usedWidth,

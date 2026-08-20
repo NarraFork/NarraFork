@@ -179,6 +179,129 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		expect(huge.detail!.height).toBe(DETAIL_TOP_MARGIN + DETAIL_CAPS.media);
 	});
 
+	it("media detail with intrinsic dimensions reserves the aspect-fitted height", async () => {
+		const { measureToolCall, DETAIL_CAPS, DETAIL_TOP_MARGIN, CARD_PADDING, CARD_BORDER } =
+			await mod();
+		const innerWidth = 600 - CARD_PADDING * 2 - CARD_BORDER * 2; // 578
+		// 1280×720 landscape: width-limited → 578 × floor(578*720/1280)=325.
+		const landscape = measureToolCall(
+			baseCard({
+				category: "browser",
+				detail: {
+					kind: "capped",
+					cap: "media",
+					contentPx: 200,
+					media: { previewUrl: "/p/x", width: 1280, height: 720 },
+				},
+			}),
+			600,
+			5,
+		);
+		expect(landscape.detail!.height).toBe(
+			DETAIL_TOP_MARGIN + Math.floor((innerWidth * 720) / 1280),
+		);
+		// 720×1280 portrait: height-capped at the media cap.
+		const portrait = measureToolCall(
+			baseCard({
+				category: "browser",
+				detail: {
+					kind: "capped",
+					cap: "media",
+					contentPx: 200,
+					media: { previewUrl: "/p/x", width: 720, height: 1280 },
+				},
+			}),
+			600,
+			5,
+		);
+		expect(portrait.detail!.height).toBe(DETAIL_TOP_MARGIN + DETAIL_CAPS.media);
+		// One-sided / invalid dims keep the fixed fallback.
+		const noDims = measureToolCall(
+			baseCard({
+				category: "browser",
+				detail: {
+					kind: "capped",
+					cap: "media",
+					contentPx: 200,
+					media: { previewUrl: "/p/x", width: 1280 },
+				},
+			}),
+			600,
+			5,
+		);
+		expect(noDims.detail!.height).toBe(DETAIL_TOP_MARGIN + 200);
+	});
+
+	/**
+	 * The fitted reservation is only half a contract: the render layer paints the
+	 * numbers it finds in `block.data`, and with none there it falls back to a
+	 * `width: 100%` box (see VListImage's legacy branch). That fallback paints
+	 * `boxWidth × h/w`, which for a HEIGHT-CAPPED portrait is far taller than the
+	 * 400px reserved here — clipped by the box's `overflow: hidden`, violating §0
+	 * 铁律 2. So the measured block must carry BOTH dimensions of the fit.
+	 */
+	it("media detail stashes the EXACT fitted box, not just its height", async () => {
+		const { measureToolCall, DETAIL_CAPS, CARD_PADDING, CARD_BORDER } = await mod();
+		const innerWidth = 600 - CARD_PADDING * 2 - CARD_BORDER * 2; // 578
+		const mediaBlock = (m: Awaited<ReturnType<typeof measureToolCall>>) => {
+			const block = m.detail?.blocks[0];
+			expect(block?.kind).toBe("fixed");
+			return (block as { data?: Record<string, unknown> }).data ?? {};
+		};
+		const card = (width: number, height: number) =>
+			measureToolCall(
+				baseCard({
+					category: "browser",
+					detail: {
+						kind: "capped",
+						cap: "media",
+						contentPx: 200,
+						media: { previewUrl: "/p/x", width, height },
+					},
+				}),
+				600,
+				5,
+			);
+
+		// HEIGHT-CAP DOMINATED (a tall screenshot): the fit clamps the height at the
+		// cap and NARROWS the width to keep the ratio. This is the case that broke —
+		// a full-width legacy box would paint 578 × 578*1280/720 ≈ 1027px tall.
+		const portrait = card(720, 1280);
+		const portraitData = mediaBlock(portrait);
+		expect(portraitData.displayHeight).toBe(DETAIL_CAPS.media);
+		expect(portraitData.displayWidth).toBe(Math.floor((DETAIL_CAPS.media * 720) / 1280)); // 225
+		// The premise: the reserved width really is narrower than the column, which is
+		// exactly why the legacy full-width paint could not match it.
+		expect(portraitData.displayWidth as number).toBeLessThan(innerWidth);
+
+		// WIDTH DOMINATED (a landscape screenshot): the fitted height already equals
+		// what a full-width box would paint, so this case was accidentally correct.
+		// Asserted anyway so both branches stay pinned.
+		const landscape = card(1280, 720);
+		const landscapeData = mediaBlock(landscape);
+		expect(landscapeData.displayWidth).toBe(innerWidth);
+		expect(landscapeData.displayHeight).toBe(Math.floor((innerWidth * 720) / 1280)); // 325
+
+		// No intrinsic dimensions → no fitted box at all, so the render layer keeps
+		// its legacy centred-in-fixed-box behaviour (the box height IS the fallback).
+		const noDims = measureToolCall(
+			baseCard({
+				category: "browser",
+				detail: {
+					kind: "capped",
+					cap: "media",
+					contentPx: 200,
+					media: { previewUrl: "/p/x" },
+				},
+			}),
+			600,
+			5,
+		);
+		const noDimsData = mediaBlock(noDims);
+		expect(noDimsData.displayWidth).toBeUndefined();
+		expect(noDimsData.displayHeight).toBeUndefined();
+	});
+
 	it("plan cap = round(0.85 × viewportHeight), falling back to 400", async () => {
 		const { measureToolCall, DETAIL_CAPS, DETAIL_TOP_MARGIN } = await mod();
 		const withVp = measureToolCall(

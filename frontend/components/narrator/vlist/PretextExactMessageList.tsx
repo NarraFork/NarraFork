@@ -90,7 +90,7 @@ import type { ErrorNoticeActions, SpecCarryoverActions } from "./render/RenderSy
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { isStreamingMessageSuperseded } from "./streaming-handoff";
-import { usePretextDocument } from "./usePretextDocument";
+import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
 import { useVListContentView } from "./useVListContentView";
 import { renderLabelsForKind, useVListLabels, type VListRenderLabels } from "./useVListLabels";
 import { useVListLivePatches } from "./useVListLivePatches";
@@ -712,6 +712,28 @@ function canShowRowSourceInline(item: VListItem): boolean {
  * open (the reader collapsed it while the modal was up, which the modal treats the
  * same way as any vanished target).
  */
+/**
+ * One drilled-in trace row's CARD payload, read from the freshly adapted spec.
+ *
+ * A drilled-in card is not its own list element, so its render props cannot come
+ * from `resolveRenderExtra(item.spec)` — they live one level down, on the trace's
+ * row item. Reading them here (rather than off the measured payload) is the same
+ * contract the row live-tails follow: `measured` may be a cache hit, while the
+ * spec is rebuilt every commit.
+ *
+ * Kept OUTSIDE the ExactRow body deliberately, like `resolveTraceRowViewTargets`
+ * below. `spec.data` must not become a memo comparison — it is a fresh object on
+ * every rebuild, so comparing it would re-render the whole window per frame — and
+ * it does not need to be: a payload change moves the trace's measure-cache
+ * revision (see measure-cache's `traceRevision` → `subagentRevision`), which
+ * yields a new `measured` object and re-renders the row through that term.
+ */
+function resolveTraceRowCardData(item: VListItem, itemIndex: number): Record<string, unknown> {
+	const traceItems = (item.spec.data as { items?: Array<{ card?: unknown }> } | null)?.items;
+	const card = traceItems?.[itemIndex]?.card;
+	return card && typeof card === "object" ? (card as Record<string, unknown>) : {};
+}
+
 function resolveTraceRowViewTargets(
 	item: VListItem,
 	itemIndex: number,
@@ -719,9 +741,28 @@ function resolveTraceRowViewTargets(
 	renderLabels: VListRenderLabels,
 ): readonly VListViewTarget[] {
 	const measured = item.measured as MeasuredCollapsibleTrace;
-	const card = measured.rows?.find((row) => row.itemIndex === itemIndex)?.cardMeasured;
+	const row = measured.rows?.find((candidate) => candidate.itemIndex === itemIndex);
+	const card = row?.cardMeasured;
 	if (!card) return [];
-	return resolveToolDetailViewTargets(rowKey, card, {
+	// A SUBAGENT row's bodies are the card's prompt + result, resolved exactly as
+	// the standalone card's are (see resolveItemViewTargets). Reading the payload
+	// from the fresh spec keeps this aligned with what `rowCard` painted.
+	if (row?.cardKind === "subagent-card") {
+		const cardData = resolveTraceRowCardData(item, itemIndex);
+		const description = typeof cardData.description === "string" ? cardData.description : "";
+		const agentType = typeof cardData.agentType === "string" ? cardData.agentType : "agent";
+		return resolveSubagentViewTargets(
+			rowKey,
+			card as MeasuredSubagent,
+			{
+				promptText: typeof cardData.prompt === "string" ? cardData.prompt : undefined,
+				resultText: typeof cardData.resultText === "string" ? cardData.resultText : undefined,
+				title: description ? `${agentType} — ${description}` : agentType,
+			},
+			{ prompt: renderLabels.subagent.prompt },
+		);
+	}
+	return resolveToolDetailViewTargets(rowKey, card as MeasuredToolCall, {
 		sections: renderLabels.toolCall.sections,
 	});
 }
@@ -1136,6 +1177,22 @@ interface ExactRowProps {
 	 * upstream, so binding per render allocates nothing new.
 	 */
 	getReflectionTakeOver?: (key: string, kind: string | undefined, requestId: string) => () => void;
+	/**
+	 * Toggle a drilled-in SUBAGENT card's prompt fold. The card is not its own list
+	 * element, so `toggles.onTogglePrompt` (bound to the trace's key) would write
+	 * the state where nothing reads it; this channels it to the card's own key
+	 * (`tool-<toolUseId>`) — the same one the standalone card uses at L3+.
+	 * `elementKey` is the trace, so the fold animation still captures the geometry
+	 * of the element that actually resizes.
+	 */
+	onTogglePromptForKey?: (elementKey: string, cardKey: string) => void;
+	/**
+	 * Bind the card-specific actions (open session / detach / cancel) for a
+	 * DRILLED-IN row's tool call. A trace element carries no per-row interaction
+	 * payload, so a drilled-in subagent card resolves its own through the shared
+	 * tool meta index.
+	 */
+	resolveRowToolActions?: (toolUseId: string) => VListRowToolActions | undefined;
 	/** Submit the subagent-recovery card's selection (mutation lives outside vlist/). */
 	onResumeSubagentRecovery?: (messageId: string, specKey: string, mode: "notify" | "await") => void;
 	/**
@@ -1229,6 +1286,8 @@ const ExactRow = memo(
 		resolveUpdateTimeout,
 		onReflectionTakeOver,
 		getReflectionTakeOver,
+		onTogglePromptForKey,
+		resolveRowToolActions,
 		onResumeSubagentRecovery,
 		specCarryoverActions,
 		errorNoticeActions,
@@ -1298,11 +1357,70 @@ const ExactRow = memo(
 			// that feeds the measure cache key) and recreated per render, which is free:
 			// it is not a prop, so the ExactRow memo is unaffected.
 			extra.rowCard = (row: MeasuredTraceRow) => {
-				const card = row.cardMeasured;
-				if (!card) return null;
+				if (!row.cardMeasured) return null;
 				// Per-ROW scope: several rows of ONE trace can be open at once, each with
 				// its own bodies, wrap/source state and payload request.
 				const rowKey = traceRowViewKey(item.spec.key, row.itemIndex);
+				// A SUBAGENT row drills into its subagent card, never the generic tool
+				// card: the badge row / recent calls / prompt fold / result body are the
+				// agent format the L3+ card shows, and drilling in asks for exactly that.
+				if (row.cardKind === "subagent-card") {
+					// The card payload comes from the FRESH spec through the module-level
+					// helper (the same pattern as the activity-trace live tails): `measured`
+					// can be a cache hit, while render extras must describe current data.
+					// Going through the helper is also what keeps the row's spec payload out
+					// of this component body, so the memo need not compare a per-frame object
+					// — see resolveTraceRowCardData for why that would be wrong.
+					const cardData = resolveTraceRowCardData(item, row.itemIndex);
+					const subExtra: Record<string, unknown> = {
+						...resolveRenderExtra({ kind: "subagent-card", data: cardData }),
+						labels: renderLabels.subagent,
+						narratorId,
+						// The header chevron CLOSES the drill-down — not a card fold: the card
+						// is measured force-open, so folding it in place would paint a
+						// collapsed header inside a box reserved for the full card.
+						onToggle: () => toggleRow(row.itemIndex, row.key),
+					};
+					// Prompt fold, keyed by the CARD's own key (`tool-<toolUseId>`, the row's
+					// unitId) — the same channel the standalone card uses, so a prompt the
+					// reader opened here is still open after an LOD change.
+					if (onTogglePromptForKey && row.unitId) {
+						const promptKey = row.unitId;
+						subExtra.onTogglePrompt = () => onTogglePromptForKey(item.spec.key, promptKey);
+					}
+					// "Open full session": the standalone card gets this from its element
+					// interaction; a trace element has none, so bind it per row from the
+					// shared tool meta index.
+					const subToolUseId = row.identity?.toolUseId;
+					const subToolActions = subToolUseId ? resolveRowToolActions?.(subToolUseId) : undefined;
+					if (subToolActions?.onViewSubagentSession) {
+						subExtra.onOpenSession = subToolActions.onViewSubagentSession;
+					}
+					if (viewControls) {
+						const subData = cardData as { resultText?: unknown; agentType?: unknown };
+						const description =
+							typeof subExtra.description === "string" ? subExtra.description : "";
+						const agentType = typeof subData.agentType === "string" ? subData.agentType : "agent";
+						const subTargets = resolveSubagentViewTargets(
+							rowKey,
+							row.cardMeasured as MeasuredSubagent,
+							{
+								promptText:
+									typeof subExtra.promptText === "string" ? subExtra.promptText : undefined,
+								resultText: typeof subData.resultText === "string" ? subData.resultText : undefined,
+								// Mirrors SubagentCard's result viewer title.
+								title: description ? `${agentType} — ${description}` : agentType,
+							},
+							{ prompt: renderLabels.subagent.prompt },
+						);
+						if (subTargets.length > 0) {
+							subExtra.viewTargets = subTargets;
+							subExtra.viewControls = viewControls;
+						}
+					}
+					return renderElement("subagent-card", row.cardMeasured, subExtra);
+				}
+				const card = row.cardMeasured as MeasuredToolCall;
 				const cardExtra: Record<string, unknown> = {
 					labels: renderLabels.toolCall,
 					narratorId,
@@ -1678,6 +1796,11 @@ const ExactRow = memo(
 		// every mounted row — silently, since the button still paints and still calls
 		// SOMETHING (the previous narrator's handler).
 		prev.getReflectionTakeOver === next.getReflectionTakeOver &&
+		// The drilled-in subagent card's prompt fold + session actions. Same stale-
+		// binding hazard as the take-over resolver above: pinned at first value, the
+		// row would call the previous narrator's handlers.
+		prev.onTogglePromptForKey === next.onTogglePromptForKey &&
+		prev.resolveRowToolActions === next.resolveRowToolActions &&
 		prev.onResumeSubagentRecovery === next.onResumeSubagentRecovery &&
 		prev.specCarryoverActions === next.specCarryoverActions &&
 		prev.errorNoticeActions === next.errorNoticeActions &&
@@ -1759,6 +1882,25 @@ export function hasRenderableExactLayout(
 	manifestItemCount: number,
 ): boolean {
 	return !!index && renderItemCount === manifestItemCount;
+}
+
+/**
+ * True when the message carries a compact / segment_compact marker block.
+ *
+ * These markers get the full set of in-place treatments the other structural
+ * inserts do not: a tail one is appended, a mid-window one is placed by
+ * `insertMessage`, and its status flip (compacting → compacted/failed) is
+ * applied through the live-patch channel. Everything else that restructures
+ * the document (ask_in_passing, context_cleared) still answers the reload.
+ */
+export function isCompactMarkerMessage(message: TreeMessage | undefined): boolean {
+	const blocks = message?.contentJson;
+	if (!Array.isArray(blocks)) return false;
+	for (const block of blocks) {
+		const type = (block as { type?: unknown } | null)?.type;
+		if (type === "compact" || type === "segment_compact") return true;
+	}
+	return false;
 }
 
 export function buildExactCatchUpCursor(
@@ -2310,6 +2452,18 @@ export const PretextExactMessageList = forwardRef<
 		},
 		[captureFoldBefore],
 	);
+	// Prompt fold for a card that is NOT its own list element: a drilled-in
+	// subagent card inside a trace row. The open state lives under the CARD's key
+	// (the same `tool-<toolUseId>` the standalone card uses, so the fold survives
+	// an LOD change), while the geometry capture belongs to the trace element that
+	// actually resizes.
+	const togglePromptForKey = useCallback(
+		(elementKey: string, cardKey: string) => {
+			captureFoldBefore(elementKey);
+			setInteraction((prev) => toggleVListPromptOpen(prev, cardKey));
+		},
+		[captureFoldBefore],
+	);
 
 	// Subagent-recovery card submit. The card's row set tracks DESELECTED indices
 	// (it starts fully selected), so the payload is derived by subtracting them
@@ -2535,10 +2689,17 @@ export const PretextExactMessageList = forwardRef<
 	// once, so they must not close over one render's callback. Declared before
 	// usePretextDocument because the assignment reads that hook's result.
 	const appendMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
-	// Same latest-value contract as appendMessageRef, for the two in-place history
-	// mutations (delete / trailing-block truncation).
+	// Same latest-value contract as appendMessageRef, for the mid-window structural
+	// insert (a compact marker the append path declines) and the two in-place
+	// history mutations (delete / trailing-block truncation).
+	const insertMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
 	const removeMessagesRef = useRef<(deletedIds: readonly string[]) => boolean>(() => false);
 	const replaceMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
+	// And for the generic live-patch channel, which applies a compact marker's
+	// status flip (compacting → compacted/failed) in place: the marker row's status
+	// is folded into the measure cache key, so the patched card re-measures and
+	// every other row is served from cache.
+	const applyLivePatchRef = useRef<UsePretextDocumentResult["applyLivePatch"]>(() => false);
 	const getReflectionTakeOver = useCallback(
 		(key: string, kind: string | undefined, requestId: string): (() => void) => {
 			const cacheKey = `${key}|${kind ?? ""}|${requestId}`;
@@ -2624,8 +2785,10 @@ export const PretextExactMessageList = forwardRef<
 		isSubagent,
 	});
 	appendMessageRef.current = pretextDocument.appendMessage;
+	insertMessageRef.current = pretextDocument.insertMessage;
 	removeMessagesRef.current = pretextDocument.removeMessages;
 	replaceMessageRef.current = pretextDocument.replaceMessage;
+	applyLivePatchRef.current = pretextDocument.applyLivePatch;
 	// Read by the jump loop, which spans awaits and must see the CURRENT document
 	// (its `readWindow` reads the coordinator snapshot synchronously, so it is also
 	// correct between a commit and the React re-render it triggers).
@@ -2705,15 +2868,21 @@ export const PretextExactMessageList = forwardRef<
 	// whole window it had to be deferred while the reader was scrolled up, which is
 	// what made the view knowingly fall behind during a live turn.
 	//
-	// Anything the append rules do not accept (a mid-window structural insert, an
-	// edit, a duplicate) falls through to the structural reload, which is always
-	// correct. `appendMessage` returning false is that signal.
+	// Anything the append rules do not accept falls through to the structural
+	// reload, which is always correct — with ONE class of exception: a compact
+	// marker that lands mid-window (a segment compact, or a custom compact with a
+	// `beforeMessageId`) is placed exactly by the in-place insert, so the reader
+	// watching that segment sees the marker appear where it belongs instead of
+	// after they scroll back to the bottom. `appendMessage`/`insertMessage`
+	// returning false is that signal.
 	const appendOrReload = useCallback(
 		(message: TreeMessage | undefined) => {
 			if (message && appendMessageRef.current(message)) {
 				// Applied locally: keep the applied revision in step so the reload gate
 				// does not see this message as still pending (which would surface a false
 				// "new messages" affordance and then refetch what is already on screen).
+				appliedMessageRevisionRef.current += 1;
+			} else if (message && isCompactMarkerMessage(message) && insertMessageRef.current(message)) {
 				appliedMessageRevisionRef.current += 1;
 			}
 			bumpMessageRevision();
@@ -2746,12 +2915,28 @@ export const PretextExactMessageList = forwardRef<
 	// rollback point and loses the rest, arriving as `message_updated`. Applying that
 	// truncation in place is what stops a rollback from looking half-done (messages
 	// below gone, the clicked card's tail blocks still there). Anything that is NOT a
-	// trailing truncation is declined by `replaceMessage` and reloads instead —
-	// necessarily so, since a version-neutral rebuild would serve the surviving
-	// blocks' cached heights for changed content.
+	// trailing truncation is declined by `replaceMessage` — with one exception: a
+	// compact marker's status flip (compacting → compacted/failed) keeps every block
+	// in place and changes only the marker's fields, and the marker row folds its
+	// status into the measure cache key, so the live-patch channel applies it safely
+	// (anchor-preserving, since a segment marker's FAILED card is taller). Every
+	// other update reloads, since a version-neutral rebuild would serve the
+	// surviving blocks' cached heights for changed content.
 	const replaceOrReload = useCallback(
 		(message: TreeMessage | undefined) => {
 			if (message && replaceMessageRef.current(message)) {
+				appliedMessageRevisionRef.current += 1;
+			} else if (
+				message &&
+				isCompactMarkerMessage(message) &&
+				applyLivePatchRef.current((messages) => {
+					const index = messages.findIndex((existing) => existing.id === message.id);
+					if (index < 0) return { messages, changed: false };
+					const patched = [...messages];
+					patched[index] = message;
+					return { messages: patched, changed: true };
+				})
+			) {
 				appliedMessageRevisionRef.current += 1;
 			}
 			bumpMessageRevision();
@@ -2771,6 +2956,35 @@ export const PretextExactMessageList = forwardRef<
 				appendOrReload(wsData.message),
 			onMessageUpdated: replaceOrReload,
 			onMessagesDeleted: removeOrReload,
+			// A segment compact hides its compressed messages through this dedicated
+			// event rather than `messages_deleted` (they are not gone — their summary
+			// lives behind the marker). The ids arrive in the event, so the in-place
+			// removal applies exactly as a deletion does: the run the reader just
+			// selected collapses immediately, wherever they are scrolled.
+			onSegmentCompactHide: (hiddenMessageIds: string[]) => {
+				if (removeMessagesRef.current(hiddenMessageIds)) {
+					appliedMessageRevisionRef.current += 1;
+				}
+				bumpMessageRevision();
+			},
+			// Completion (and failure — the dispatcher folds `compact_failed` into this
+			// callback) carries no message body: the content already arrived via
+			// `message` / `message_updated`, both applied in place above. It is kept
+			// for two things the in-place paths cannot cover:
+			//
+			//   1. Paths that broadcast a BARE compact_done with no preceding message
+			//      frame (narrator-recovery does, in several places). Without this
+			//      handler the document had no signal at all and stayed stale until the
+			//      reader reloaded the page — the reported bug's second half.
+			//   2. Converging the local seq numbering. `insertMessage` deliberately
+			//      does not shift the following seqs (see vlist-message-insert), and
+			//      this reload adopts the server's.
+			//
+			// It does NOT exist to shrink the window: the document page filters only on
+			// `segmentCompactId` (server-side), so a full-history compact leaves every
+			// older message readable and a segment compact's hidden rows are already
+			// gone via `onSegmentCompactHide` above.
+			onCompactDone: () => bumpMessageRevision(),
 			onPruneBoundary: bumpMessageRevision,
 			onFullReload: bumpMessageRevision,
 			// Live compact-progress ticks patch the loaded compact marker in place
@@ -2916,8 +3130,20 @@ export const PretextExactMessageList = forwardRef<
 			if (TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind)) {
 				const measured = item.measured as MeasuredCollapsibleTrace;
 				for (const row of measured.rows) {
-					const card = row.cardMeasured;
-					if (!card || card.truncatedLeafCount <= 0 || !card.toolUseId) continue;
+					if (!row.cardMeasured) continue;
+					// A drilled-in SUBAGENT card reaches its truncated PROMPT through the
+					// same affordance the standalone card uses: `promptTruncated` is only set
+					// while the prompt is OPEN, so unfolding it is the request — and the
+					// block already reserves the full cap, so the landing body cannot resize
+					// the row.
+					if (row.cardKind === "subagent-card") {
+						const subCard = row.cardMeasured as MeasuredSubagent;
+						if (!subCard.promptTruncated || !subCard.toolUseId) continue;
+						ids.push(subCard.toolUseId);
+						continue;
+					}
+					const card = row.cardMeasured as MeasuredToolCall;
+					if (card.truncatedLeafCount <= 0 || !card.toolUseId) continue;
 					const rowKey = traceRowViewKey(item.spec.key, row.itemIndex);
 					if (!isFullPayloadRequestedRow(activeInteraction, rowKey)) continue;
 					ids.push(card.toolUseId);
@@ -4440,6 +4666,16 @@ export const PretextExactMessageList = forwardRef<
 	// is a fresh array on every commit — including the one each streaming delta
 	// produces — so without this every mounted row's `interaction` prop changed
 	// identity per frame and the whole window re-rendered while a turn streamed.
+	//
+	// Tool facts the layout spec deliberately drops (child narrator id, file path,
+	// background state), keyed by toolUseId — a tool/subagent row's blockId is
+	// `tc-`/`sa-` + that id. ONE index shared by every per-row consumer: the
+	// element interactions below, the trace-row interaction slot, and the
+	// drilled-in card's action bindings.
+	const rowToolMetaIndex = useMemo(
+		() => buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]),
+		[pretextDocument.messages],
+	);
 	const interactionReuseRef = useRef<RowPayloadReuseState<RowInteraction> | null>(null);
 	const interactionsByKey = useMemo(() => {
 		// The closures below capture these; a change must rebuild every payload
@@ -4452,10 +4688,8 @@ export const PretextExactMessageList = forwardRef<
 			return map;
 		}
 		const manifestByKey = new Map(manifestItems.map((m) => [m.itemKey, m]));
-		// Tool facts the layout spec deliberately drops (child narrator id, file
-		// path, background state). Keyed by toolUseId — a tool/subagent row's
-		// blockId is `tc-`/`sa-` + that id.
-		const toolMetaIndex = buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]);
+		// The shared per-document index (built above) — never rebuilt per memo.
+		const toolMetaIndex = rowToolMetaIndex;
 		const handlers = rowHandlers ?? {};
 		// Editing capabilities mirror the chunked path's ctxActions gating: the
 		// user flow needs onEditAndRegenerate, the assistant flow needs
@@ -4549,12 +4783,15 @@ export const PretextExactMessageList = forwardRef<
 		}
 		commitRowPayloadFrame(interactionReuseRef, generation, map);
 		return map;
+		// `pretextDocument.messages` is no longer listed: the tool facts it fed are
+		// read through `rowToolMetaIndex`, which is memoized on that same array —
+		// so it already re-keys this memo when the document changes.
 	}, [
 		selectionIndex,
 		renderItems,
 		manifestItems,
 		rowHandlers,
-		pretextDocument.messages,
+		rowToolMetaIndex,
 		messagesById,
 		openEditor,
 	]);
@@ -4610,7 +4847,7 @@ export const PretextExactMessageList = forwardRef<
 	// `interaction` payload, which does carry per-row data and so needs a cache).
 	const traceRowInteractionSlot = useMemo<TraceRowInteractionSlot | undefined>(() => {
 		if (!selectionIndex) return undefined;
-		const toolMetaIndex = buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]);
+		const toolMetaIndex = rowToolMetaIndex;
 		const handlers = rowHandlers ?? {};
 		return (row, rowBody) => {
 			const identity = resolveTraceRowIdentity(row, selectionIndex, toolMetaIndex);
@@ -4639,7 +4876,25 @@ export const PretextExactMessageList = forwardRef<
 				</MessageContextMenuCtx.Provider>
 			);
 		};
-	}, [selectionIndex, rowHandlers, pretextDocument.messages, narratorId]);
+	}, [selectionIndex, rowHandlers, rowToolMetaIndex, narratorId]);
+
+	/**
+	 * The card-specific actions for a DRILLED-IN trace row's tool call (the
+	 * subagent card's "open full session" button, the lifecycle items). A trace
+	 * element carries no per-row interaction payload, so the drilled-in card
+	 * binds its own from the same meta index the row menus use.
+	 *
+	 * Referentially stable (memo deps are the shared index + the handlers), so
+	 * the ExactRow memo is unaffected.
+	 */
+	const resolveRowToolActions = useCallback(
+		(toolUseId: string): VListRowToolActions | undefined => {
+			const meta = rowToolMetaIndex.get(toolUseId);
+			if (!meta) return undefined;
+			return buildRowToolActions(meta, rowHandlers ?? {});
+		},
+		[rowToolMetaIndex, rowHandlers],
+	);
 
 	/**
 	 * Resolve the row-interaction slot for one list element.
@@ -4944,6 +5199,11 @@ export const PretextExactMessageList = forwardRef<
 									// Unresolved on purpose: a drilled-in card binds its OWN gate (see
 									// rowCard). Referentially stable (useCallback), so the memo is unaffected.
 									getReflectionTakeOver={getReflectionTakeOver}
+									// A drilled-in SUBAGENT card's own controls: the prompt fold (keyed by
+									// the card, not the trace) and the session/lifecycle actions a trace
+									// element has no interaction payload for. Both stable.
+									onTogglePromptForKey={togglePromptForKey}
+									resolveRowToolActions={resolveRowToolActions}
 									onUnknownHeight={
 										isDynamicRow ? getUnknownHeightReporter(item.spec.key) : undefined
 									}

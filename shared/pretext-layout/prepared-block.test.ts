@@ -83,4 +83,18 @@ describe("shared PreparedBlock frame math", () => {
 		});
 		expect(frame.contentHeight).toBe(35);
 	});
+
+	it("a fixed block reports its displayWidth into usedWidth (shrink-wrap support)", () => {
+		// An aspect-fitted image knows its painted width from data; without it the
+		// bubble would shrink-wrap to the caption and clip the picture.
+		const withWidth: PreparedFixedBlock = { ...fixed(0), displayWidth: 460 };
+		const frame = accumulateFrame([withWidth], 640, () => ({ lineCount: 1, maxLineWidth: 0 }));
+		expect(frame.usedWidth).toBe(460);
+		expect(frame.blocks[0]?.usedWidth).toBe(460);
+	});
+
+	it("a fixed block without displayWidth contributes no width (legacy behaviour)", () => {
+		const frame = accumulateFrame([fixed(0)], 640, () => ({ lineCount: 1, maxLineWidth: 0 }));
+		expect(frame.usedWidth).toBe(0);
+	});
 });

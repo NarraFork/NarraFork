@@ -862,11 +862,31 @@ async function ensureShadowRepo(dir: string, worktreePath: string): Promise<void
  */
 let mergeTreeSupported: boolean | null = null;
 
+/**
+ * The probe's argv, exactly. **No flag may be added to this array.**
+ *
+ * git only takes the "print usage and exit" shortcut when `-h` is the *sole*
+ * argument (`git.c`: `help = argc == 2 && !strcmp(argv[1], "-h")`), which is also
+ * what demotes merge-tree's RUN_SETUP to RUN_SETUP_GENTLY. With `--write-tree -h`
+ * the argc check fails, so git insists on finding a repository first and dies with
+ * "fatal: not a git repository" before printing anything — the probe then reads a
+ * modern git as unsupported and caches that for the process lifetime, permanently
+ * losing merge preview / scoped revert. Invisible in development (cwd is this
+ * repo) and fatal for a binary launched from anywhere else.
+ *
+ * Exported so a test can pin the shape; that assertion is the only thing standing
+ * between this comment and a well-meant "let's probe the actual flag" edit.
+ */
+export const MERGE_TREE_PROBE_ARGV: readonly string[] = ["git", "merge-tree", "-h"];
+
 export async function supportsMergeTree(): Promise<boolean> {
 	if (mergeTreeSupported !== null) return mergeTreeSupported;
 	try {
 		const result = await safeSpawn({
-			cmd: ["git", "merge-tree", "--write-tree", "-h"],
+			cmd: [...MERGE_TREE_PROBE_ARGV],
+			// Still pin a cwd that exists: an unset cwd inherits the process's, which may
+			// have been removed under a long-running server.
+			cwd: tmpdir(),
 			timeout: GIT_TIMEOUT_MS,
 			maxOutputBytes: 8192,
 		});
@@ -877,6 +897,11 @@ export async function supportsMergeTree(): Promise<boolean> {
 		mergeTreeSupported = false;
 	}
 	return mergeTreeSupported;
+}
+
+/** Test-only: drop the cached probe result so a fresh probe runs. */
+export function resetMergeTreeSupportCacheForTests(): void {
+	mergeTreeSupported = null;
 }
 
 /** Result of a three-way tree merge. */

@@ -168,6 +168,19 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// data…" forever. The nested (drilled-in trace row) path already keys it via
 	// `|tdn:` — this is the same contract for a standalone card.
 	if (typeof d.truncatedLeafCount === "number") rev += `|tp:${d.truncatedLeafCount}`;
+	// A system card's OWN body text (`system-text` and friends paint `data.text`
+	// as pre-wrap, so its height is a function of how it wraps). `detailTextRevision`
+	// below only reaches `data.detail`, which a system card does not have.
+	//
+	// This matters because of the compact-marker live-patch channel
+	// (PretextExactMessageList's `replaceOrReload`): it swaps the whole message in
+	// place while deliberately holding `messageVersion` fixed, so `status` used to
+	// be the only thing that could move the key. Two updates with the SAME status
+	// and different prose — a `compacted` marker whose summary was rewritten, or two
+	// `failed` markers with different error text — would otherwise hit the previous
+	// entry and paint the new text inside the old box (CONTRACT.md §4.5 约束 3).
+	// O(1) via the sampled signature, same as every other text field here.
+	if (typeof d.text === "string") rev += `|sx:${textSignature(d.text)}`;
 	rev += detailTextRevision(d.detail);
 	rev += reflectionRevision(d.reflection);
 	rev += subagentRevision(d);
@@ -255,6 +268,13 @@ function traceRevision(d: Record<string, unknown>): string {
 			if (typeof card.truncatedLeafCount === "number") rev += `|tdn:${card.truncatedLeafCount}`;
 			rev += detailTextRevision(card.detail);
 			rev += reflectionRevision(card.reflection);
+			// A drilled-in SUBAGENT card is measured with `measureSubagentCard`, so it
+			// has the SAME live-patch exposure the standalone card has: the activity /
+			// conclusion patches grow it while spec.key, messageVersion and opts all
+			// stay put (see `subagentRevision`), and the prompt fold is per-card state
+			// the trace's own `opts` never carries. Gated on `agentType` inside, so an
+			// ordinary tool card's payload contributes nothing.
+			rev += subagentRevision(card);
 		}
 	}
 	return rev;

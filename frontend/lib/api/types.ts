@@ -16,6 +16,59 @@ export type ChangelogEntry = {
 	date: string;
 } & LocalizedValue<string>;
 
+/**
+ * How a third-party component reaches the user — which is what determines our
+ * attribution obligations, not which `package.json` field listed it.
+ */
+export type LicenseEntryKind = "bundled" | "runtime" | "development";
+
+/** Where an entry's license text came from, so the page never overstates it. */
+export type LicenseTextSource = "package" | "spdx-template" | "missing";
+
+/**
+ * One third-party component, WITHOUT its license text.
+ *
+ * Texts are fetched individually by `textId`: the full set is ~1.1 MB against
+ * ~260 KB of metadata, and the page shows one at a time.
+ */
+export interface LicenseSummary {
+	name: string;
+	version: string;
+	/** The license we rely on. For dual-licensed components, the branch selected. */
+	license: string;
+	/** Upstream's raw disjunction, when a selection narrowed it. */
+	declaredLicense?: string;
+	/** Why that branch was selected. */
+	selectionReason?: string;
+	author: string;
+	repository: string;
+	kind: LicenseEntryKind;
+	textId?: string;
+	textSource: LicenseTextSource;
+	/** Present when the component ships a NOTICE file (Apache-2.0 §4(d)). */
+	noticeTextId?: string;
+	/**
+	 * How a bundled component reaches the user. Absent for npm packages, where
+	 * `dependencies` already answers it.
+	 */
+	distributedVia?: string;
+}
+
+/** A defect in the manifest, surfaced rather than swallowed. */
+export interface LicenseProblem {
+	severity: "error" | "warn";
+	name?: string;
+	message: string;
+}
+
+export interface LicenseManifestResponse {
+	entries: LicenseSummary[];
+	problems: LicenseProblem[];
+	generatedAt: number;
+	/** `filesystem` in development, `embedded` in a compiled binary. */
+	source: "filesystem" | "embedded" | "unavailable";
+}
+
 export interface LearningAction {
 	label: string;
 	description: string;

@@ -71,6 +71,34 @@ export function isLocalPanelDrag(state: PanelDragState, surfaceId: string | unde
 	return state.surfaceId === surfaceId;
 }
 
+/**
+ * Whether this surface should engage with a drag at all (hit-test + indicator).
+ *
+ * A surface can act on exactly two kinds of drags: a LOCAL panel drag (its own
+ * live panel being rearranged) and — only when it has an `onDropSubject` — an
+ * external subject it knows how to materialise. Everything else must not even
+ * show an indicator: the drop belongs to someone else, and a false affordance
+ * is worse than none.
+ *
+ * The concrete bug this guards: on the single-narrator page the focus dock has
+ * NO `onDropSubject` (it cannot host another narrator), yet it still lit up its
+ * groups with merge/split/swap indicators when a sidebar narrator was dragged
+ * over it — while the page-level create-workspace zone showed its own overlay
+ * for the same gesture. Dropping never landed in the dock (the page navigates
+ * to a fresh workspace instead), so the dock's indicator was a lie; with the
+ * dock split (tools open on the right) the two competing highlights made the
+ * gesture visibly broken.
+ *
+ * Exported for unit testing.
+ */
+export function canSurfaceHandleDrag(
+	state: PanelDragState,
+	surfaceId: string | undefined,
+	hasDropSubject: boolean,
+): boolean {
+	return isLocalPanelDrag(state, surfaceId) || hasDropSubject;
+}
+
 export interface UseDockviewDndResult {
 	dropIndicator: DropIndicator | null;
 }
@@ -137,6 +165,15 @@ export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndRe
 			const api = apiRef.current;
 			const root = rootRef.current;
 			if (!api || !root) return;
+			// Never advertise a drop this surface cannot perform (see
+			// canSurfaceHandleDrag): with no `onDropSubject` an external subject
+			// (e.g. a sidebar narrator) can never land here, and the indicator would
+			// compete with the outer drop zone that actually owns the gesture.
+			if (!canSurfaceHandleDrag(state, surfaceId, !!onDropSubject)) {
+				target = null;
+				setDropIndicator(null);
+				return;
+			}
 			const hit = hitTestGroups(api, state.x, state.y, state.panelId, thresholds);
 			if (!hit) {
 				target = null;

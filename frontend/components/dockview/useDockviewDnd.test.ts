@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { DockviewApi } from "dockview-react";
 import type { PanelDragState } from "../../lib/panel-drag";
 import type { DockviewDropTarget } from "./useDockviewDnd";
-import { dropExistingPanel, isLocalPanelDrag } from "./useDockviewDnd";
+import { canSurfaceHandleDrag, dropExistingPanel, isLocalPanelDrag } from "./useDockviewDnd";
 
 /**
  * Regression coverage for dropExistingPanel — the function that turns a resolved
@@ -222,5 +222,46 @@ describe("isLocalPanelDrag", () => {
 		expect(isLocalPanelDrag(drag({ panelId: "ndock-spec", surfaceId: "chap_1" }), undefined)).toBe(
 			true,
 		);
+	});
+});
+
+/**
+ * Which drags a surface should ENGAGE with at all (hit-test + drop indicator).
+ *
+ * Regression coverage for the single-narrator page: its focus dock has no
+ * `onDropSubject` (it cannot host another narrator), so a sidebar narrator
+ * dragged over it must produce NO indicator — the page-level create-workspace
+ * drop zone owns that gesture. Before this gate the dock lit up its groups
+ * with merge/split/swap highlights that a drop could never fulfil, competing
+ * with the page's overlay (most visible once the dock was split with tool
+ * panels on the right).
+ */
+describe("canSurfaceHandleDrag", () => {
+	test("a surface WITHOUT onDropSubject ignores external subjects (sidebar tab, detached panel)", () => {
+		// Sidebar narrator drag: no panelId at all.
+		expect(canSurfaceHandleDrag(drag({}), "focus:n1", false)).toBe(false);
+		// Detached canvas panel: tool kind, still no live panel here.
+		expect(canSurfaceHandleDrag(drag({ toolKind: "terminal" }), "focus:n1", false)).toBe(false);
+	});
+
+	test("a surface WITHOUT onDropSubject still rearranges its OWN panels", () => {
+		expect(
+			canSurfaceHandleDrag(
+				drag({ panelId: "ndock-terminal", surfaceId: "focus:n1" }),
+				"focus:n1",
+				false,
+			),
+		).toBe(true);
+	});
+
+	test("a surface WITH onDropSubject accepts external subjects (workspace / graph docks)", () => {
+		expect(canSurfaceHandleDrag(drag({}), "workspace:w1", true)).toBe(true);
+		expect(canSurfaceHandleDrag(drag({ toolKind: "terminal" }), "chap_1", true)).toBe(true);
+	});
+
+	test("a foreign surface's panel drag engages only when a drop handler exists", () => {
+		const state = drag({ panelId: "ndock-terminal", surfaceId: "workspace:w1" });
+		expect(canSurfaceHandleDrag(state, "focus:n1", false)).toBe(false);
+		expect(canSurfaceHandleDrag(state, "focus:n1", true)).toBe(true);
 	});
 });

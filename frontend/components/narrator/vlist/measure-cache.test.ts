@@ -180,9 +180,45 @@ describe("extractDataRevision", () => {
 
 	it("returns undefined for data without height-affecting mutable fields", async () => {
 		const { extractDataRevision } = await import("./measure-cache");
-		expect(extractDataRevision({ text: "hello", toolName: "Read" })).toBeUndefined();
 		expect(extractDataRevision(null)).toBeUndefined();
 		expect(extractDataRevision("plain string")).toBeUndefined();
+		expect(extractDataRevision({ toolName: "Read" })).toBeUndefined();
+	});
+
+	/**
+	 * A system card's OWN body text is height-affecting: `system-text` paints
+	 * `data.text` as pre-wrap, so the height is a function of how it wraps.
+	 * `detailTextRevision` only reaches `data.detail`, which a system card has none
+	 * of, so this used to be the one text field with no coverage at all.
+	 *
+	 * It matters because of the compact-marker live-patch channel
+	 * (PretextExactMessageList's `replaceOrReload`), which swaps the whole message
+	 * in place while deliberately holding `messageVersion` fixed — leaving `status`
+	 * as the only thing that could move the key.
+	 */
+	it("signs a system card's own text, so a same-status rewrite cannot hit the old height", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const marker = (text: string, status = "compacted") => ({ status, text });
+
+		// The failure mode: SAME status, different prose. A `compacted` marker whose
+		// summary was rewritten used to produce a byte-identical revision.
+		const first = extractDataRevision(marker("Compressed 12 messages"));
+		const rewritten = extractDataRevision(marker("Compressed 12 messages into a summary"));
+		expect(first).not.toBe(rewritten);
+
+		// Two `failed` markers with different error text — same shape, same status.
+		const failedA = extractDataRevision(marker("stream ended unexpectedly", "failed"));
+		const failedB = extractDataRevision(marker("provider returned 429", "failed"));
+		expect(failedA).not.toBe(failedB);
+
+		// Same-length rewrites too: length alone is not a content signature, and the
+		// pre-wrap height depends on where the line breaks fall.
+		const oneLine = extractDataRevision(marker("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+		const sixLines = extractDataRevision(marker("aaaa\naaaa\naaaa\naaaa\naaaa\naaaaa"));
+		expect(oneLine).not.toBe(sixLines);
+
+		// And identical input must still be identical, or the card never caches.
+		expect(extractDataRevision(marker("Compressed 12 messages"))).toBe(first);
 	});
 
 	it("tracks a capped detail's body length (its text now drives the height)", async () => {
@@ -468,6 +504,56 @@ describe("extractDataRevision", () => {
 			expect(extractDataRevision(traceWith(codeCard()))).toBe(
 				extractDataRevision(traceWith(codeCard())),
 			);
+		});
+
+		/**
+		 * A drilled-in SUBAGENT card carries the standalone card's whole live-patch
+		 * exposure INSIDE the fold: `patchSubagentActivity` grows its recent-calls block
+		 * and `subagentConclusionPatch` fills in its result, both without moving
+		 * spec.key, messageVersion or opts. Keyed by folding `subagentRevision` over the
+		 * row's card — without it the fold would serve the height it had when the child
+		 * had made no calls yet, and the rows would be clipped away (the exact failure
+		 * the standalone card's `|gn:` component exists to prevent).
+		 */
+		const agentCard = (over: Record<string, unknown> = {}) => ({
+			agentType: "explore",
+			description: "trace the vlist path",
+			status: "success",
+			recentCallCount: 0,
+			recentCallNames: [],
+			...over,
+		});
+
+		it("a subagent card's recent calls arriving re-keys the fold", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			const before = extractDataRevision(traceWith(agentCard()));
+			const after = extractDataRevision(
+				traceWith(agentCard({ recentCallCount: 2, recentCallNames: ["Read", "Grep"] })),
+			);
+			expect(after).not.toBe(before);
+			expect(after).toContain("gn:2");
+		});
+
+		it("a subagent conclusion landing re-keys the fold (status stays success)", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			expect(
+				extractDataRevision(traceWith(agentCard({ resultText: "found the dispatch site" }))),
+			).not.toBe(extractDataRevision(traceWith(agentCard())));
+		});
+
+		it("opening the prompt inside a drilled-in subagent card re-keys the fold", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			// The prompt fold lives on the CARD, not in the trace's opts, so it is the
+			// only thing that moves when the reader unfolds it.
+			expect(
+				extractDataRevision(traceWith(agentCard({ prompt: "look", promptOpen: true }))),
+			).not.toBe(extractDataRevision(traceWith(agentCard({ prompt: "look" }))));
+		});
+
+		it("an ordinary tool card pays nothing for the subagent component", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			// Gated on `agentType`, which only SubagentCardData has.
+			expect(extractDataRevision(traceWith(codeCard()))).not.toContain("|ga:");
 		});
 	});
 

@@ -301,6 +301,83 @@ describe("measureMessageBubble — user attachments", () => {
 			c.USER_BUBBLE_PADDING * 2 + c.USER_ATTACHMENT_MIN_CONTENT_WIDTH,
 		);
 	});
+
+	it("reserves the aspect-fitted height for an image with intrinsic dimensions", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		// 16:9 screenshot; the 1000px column minus bubble padding is the fit width.
+		const r = measureMessageBubble(
+			{
+				role: "user",
+				text: "",
+				attachments: [{ type: "image", imageId: "a", width: 1600, height: 900 }],
+			},
+			1000,
+		);
+		const innerWidth = 1000 - c.USER_BUBBLE_PADDING * 2;
+		// 1600×900 at 976px wide → 549 tall, over the 400 cap → capped, width narrows.
+		const expectedHeight = 400;
+		const expectedWidth = Math.floor((expectedHeight * 1600) / 900);
+		const block = r.blocks[0];
+		if (block?.kind !== "fixed") throw new Error("expected a fixed attachment block");
+		expect(block.height).toBe(expectedHeight);
+		expect(block.displayWidth).toBe(expectedWidth);
+		expect(block.data?.displayWidth).toBe(expectedWidth);
+		expect(block.data?.displayHeight).toBe(expectedHeight);
+		expect(r.height).toBe(
+			c.USER_BUBBLE_PADDING * 2 + c.USER_HEADER_HEIGHT + c.USER_HEADER_BODY_GAP + expectedHeight,
+		);
+		expect(r.usedWidth).toBe(c.USER_BUBBLE_PADDING * 2 + expectedWidth);
+		expect(r.usedWidth).toBeLessThanOrEqual(c.USER_BUBBLE_PADDING * 2 + innerWidth);
+	});
+
+	it("widens the bubble around a wide strip instead of squeezing it into the caption width", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const r = measureMessageBubble(
+			{
+				role: "user",
+				text: "hi",
+				attachments: [{ type: "image", imageId: "a", width: 1200, height: 100 }],
+			},
+			1000,
+		);
+		const innerWidth = 1000 - c.USER_BUBBLE_PADDING * 2;
+		// The strip fits by width: 976 × 81 — and the bubble wraps THAT, not the
+		// 2-char caption and not the dimensionless 300px floor.
+		const expectedWidth = innerWidth;
+		const expectedHeight = Math.floor((innerWidth * 100) / 1200);
+		expect(r.usedWidth).toBe(c.USER_BUBBLE_PADDING * 2 + expectedWidth);
+		const block = r.blocks[0];
+		if (block?.kind !== "fixed") throw new Error("expected a fixed attachment block");
+		expect(block.height).toBe(expectedHeight);
+	});
+
+	it("keeps the 300px floor for a narrow image with dimensions", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const r = measureMessageBubble(
+			{
+				role: "user",
+				text: "",
+				attachments: [{ type: "image", imageId: "a", width: 64, height: 64 }],
+			},
+			1000,
+		);
+		// A 64px icon does not stretch the bubble; the attachment floor wins.
+		expect(r.usedWidth).toBeGreaterThanOrEqual(
+			c.USER_BUBBLE_PADDING * 2 + c.USER_ATTACHMENT_MIN_CONTENT_WIDTH,
+		);
+		const block = r.blocks[0];
+		if (block?.kind !== "fixed") throw new Error("expected a fixed attachment block");
+		expect(block.height).toBe(64);
+	});
 });
 
 // ── slash-command bubbles ─────────────────────────────────────────────────────

@@ -30,6 +30,52 @@ describe("measureImage", () => {
 			expect(block.data?.uploadNarratorId).toBe("n1");
 		}
 	});
+
+	it("reserves the aspect-fitted height when intrinsic dimensions are known", async () => {
+		const { measureImage, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		// 16:9 screenshot in an 800px column → 800 × 450, under the 400 cap? No —
+		// 450 > 400, so the height cap clamps and the width narrows to match.
+		const tall = measureImage({ imageId: "a", width: 1600, height: 900 }, 800);
+		expect(tall.height).toBe(MEASURE_MEDIA_CONSTANTS.IMAGE_MAX_DISPLAY_HEIGHT);
+		expect(tall.usedWidth).toBe(Math.floor((400 * 1600) / 900));
+		const block = tall.blocks[0]!;
+		if (block.kind === "fixed") {
+			expect(block.height).toBe(MEASURE_MEDIA_CONSTANTS.IMAGE_MAX_DISPLAY_HEIGHT);
+			expect(block.displayWidth).toBe(tall.usedWidth);
+			expect(block.data?.displayWidth).toBe(tall.usedWidth);
+			expect(block.data?.displayHeight).toBe(tall.height);
+			expect(block.data?.width).toBe(1600);
+			expect(block.data?.height).toBe(900);
+		}
+	});
+
+	it("fits a wide strip by width, producing a short exact box", async () => {
+		const { measureImage } = await import("./measure-media");
+		// 12:1 banner in a 700px column → 700 × 58 (floored), no dead band.
+		const r = measureImage({ imageId: "s", width: 1200, height: 100 }, 700);
+		expect(r.height).toBe(Math.floor((700 * 100) / 1200));
+		expect(r.usedWidth).toBe(700);
+	});
+
+	it("never upscales a small image", async () => {
+		const { measureImage } = await import("./measure-media");
+		const r = measureImage({ imageId: "i", width: 64, height: 64 }, 700);
+		expect(r.height).toBe(64);
+		expect(r.usedWidth).toBe(64);
+	});
+
+	it("falls back to the fixed 200px when dimensions are missing or invalid", async () => {
+		const { measureImage, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		for (const data of [
+			{ imageId: "a" },
+			{ imageId: "b", width: 100 },
+			{ imageId: "c", width: 0, height: 100 },
+			{ imageId: "d", width: Number.NaN, height: 100 },
+		]) {
+			const r = measureImage(data, 700);
+			expect(r.height).toBe(MEASURE_MEDIA_CONSTANTS.IMAGE_FIXED_HEIGHT);
+		}
+	});
 });
 
 describe("measureTextFile", () => {

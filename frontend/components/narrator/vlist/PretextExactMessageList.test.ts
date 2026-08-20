@@ -7,6 +7,7 @@ import {
 	buildExactListLayout,
 	computeToolRunFrames,
 	hasRenderableExactLayout,
+	isCompactMarkerMessage,
 	isFramedRunItem,
 	resolveRowHitHeight,
 	shouldReloadExactDocument,
@@ -122,6 +123,31 @@ describe("PretextExactMessageList", () => {
 		expect(shouldForcePretextDocumentLoad(1, 0)).toBe(true);
 		expect(shouldForcePretextDocumentLoad(1, 1)).toBe(false);
 		expect(shouldForcePretextDocumentLoad(2, 1)).toBe(true);
+	});
+
+	it("recognizes compact / segment_compact markers for the in-place insert path", () => {
+		// These markers get the in-place treatment (append at the tail, insert
+		// mid-window, live-patch on the status flip) instead of the deferred reload.
+		expect(
+			isCompactMarkerMessage({
+				contentJson: [{ type: "compact", status: "compacting" }],
+			} as never),
+		).toBe(true);
+		expect(
+			isCompactMarkerMessage({
+				contentJson: [{ type: "segment_compact", status: "compacted" }],
+			} as never),
+		).toBe(true);
+		// Ordinary messages and the OTHER structural inserts must not take that path.
+		expect(isCompactMarkerMessage({ contentJson: [{ type: "text" }] } as never)).toBe(false);
+		expect(isCompactMarkerMessage({ contentJson: [{ type: "ask_in_passing" }] } as never)).toBe(
+			false,
+		);
+		expect(isCompactMarkerMessage({ contentJson: [{ type: "context_cleared" }] } as never)).toBe(
+			false,
+		);
+		expect(isCompactMarkerMessage(undefined)).toBe(false);
+		expect(isCompactMarkerMessage({ contentJson: null } as never)).toBe(false);
 	});
 
 	it("prefers the synchronous live scroll view when capturing a rebuild anchor", () => {

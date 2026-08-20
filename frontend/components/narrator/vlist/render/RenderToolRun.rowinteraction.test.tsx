@@ -27,6 +27,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
+import type { MeasuredToolCall } from "../measure/measure-tool-call";
 import {
 	type MeasuredTraceRow,
 	measureActivityTrace,
@@ -84,9 +85,15 @@ function traceRows(cardOnIndex?: number) {
 	}));
 }
 
-/** The shell's `rowCard` slot, reduced to what this test needs. */
+/**
+ * The shell's `rowCard` slot, reduced to what this test needs. `cardMeasured` is a
+ * union (a subagent row drills into its own card), so the tool branch narrows on
+ * the row's `cardKind` discriminant — exactly as the shell does.
+ */
 const rowCard = (row: MeasuredTraceRow) =>
-	row.cardMeasured ? <RenderToolCall measured={row.cardMeasured} /> : null;
+	row.cardMeasured && row.cardKind === "tool-call" ? (
+		<RenderToolCall measured={row.cardMeasured as MeasuredToolCall} />
+	) : null;
 
 /**
  * Stand-in for the shell's `TraceRowInteraction` wrapper: a marked element around
@@ -256,7 +263,7 @@ describe("RenderToolRun — the drilled-in card joins the row's interaction surf
 				measured={measured}
 				rowCard={(row) =>
 					row.cardMeasured ? (
-						<RenderToolCall measured={row.cardMeasured} onToggle={() => {}} />
+						<RenderToolCall measured={row.cardMeasured as MeasuredToolCall} onToggle={() => {}} />
 					) : null
 				}
 			/>,

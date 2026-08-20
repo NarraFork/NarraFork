@@ -1,0 +1,87 @@
+[
+	{
+		"name": "Bun runtime",
+		"version": "1.3.14",
+		"versionSource": "bun-runtime",
+		"license": "MIT",
+		"author": "Oven",
+		"repository": "https://github.com/oven-sh/bun",
+		"textFile": "bun.txt",
+		"distributedVia": "Compiled into every released binary by `bun build --compile`. Statically links JavaScriptCore (LGPL-2), tinycc (LGPL-2.1) and others — see the text for the full list and the relinking offer.",
+		"note": "versionSource checks this against the RUNNING Bun, which is what `bun build --compile` embeds (the `packageManager` pin only says what should be installed). bun.txt reproduces this version's LICENSE.md and its statically linked library list, so when Bun is upgraded update this version AND re-copy bun.txt from the matching upstream tag."
+	},
+	{
+		"name": "zstd",
+		"version": "1.5.7",
+		"license": "BSD-3-Clause",
+		"declaredLicense": "BSD-3-Clause OR GPL-2.0",
+		"selectionReason": "BSD-3-Clause branch selected. zstd is offered under either; relying on BSD-3-Clause means no GPL obligation attaches to NarraFork.",
+		"author": "Meta Platforms, Inc. and affiliates",
+		"repository": "https://github.com/facebook/zstd",
+		"textFile": "zstd.txt",
+		"distributedVia": "Static binaries at vendor/zstd/zstd-linux-{x64,arm64}, built by scripts/build-zstd-static.sh and shipped for delta updates."
+	},
+	{
+		"name": "musl libc",
+		"version": "bundled with Alpine build image",
+		"license": "MIT",
+		"author": "Rich Felker, et al.",
+		"repository": "https://musl.libc.org/",
+		"textFile": "musl.txt",
+		"distributedVia": "Statically linked into the vendor/zstd binaries (compiled in an Alpine container with `-static`)."
+	},
+	{
+		"name": "Go standard library",
+		"version": "1.23+",
+		"license": "BSD-3-Clause",
+		"author": "The Go Authors",
+		"repository": "https://github.com/golang/go",
+		"textFile": "go-stdlib.txt",
+		"distributedVia": "Compiled into the remote executor binaries in remote-executor/dist/, which server/lib/executor-binaries.ts serves to user devices."
+	},
+	{
+		"name": "github.com/bmatcuk/doublestar/v4",
+		"version": "4.7.1",
+		"license": "MIT",
+		"author": "Bob Matcuk",
+		"repository": "https://github.com/bmatcuk/doublestar",
+		"textFile": "go-doublestar.txt",
+		"distributedVia": "Compiled into the remote executor binaries (remote-executor/go.mod)."
+	},
+	{
+		"name": "github.com/coder/websocket",
+		"version": "1.8.12",
+		"license": "ISC",
+		"author": "Anmol Sethi",
+		"repository": "https://github.com/coder/websocket",
+		"textFile": "go-coder-websocket.txt",
+		"distributedVia": "Compiled into the remote executor binaries (remote-executor/go.mod)."
+	},
+	{
+		"name": "github.com/creack/pty",
+		"version": "1.1.24",
+		"license": "MIT",
+		"author": "Keith Rarick",
+		"repository": "https://github.com/creack/pty",
+		"textFile": "go-creack-pty.txt",
+		"distributedVia": "Compiled into the remote executor binaries (remote-executor/go.mod)."
+	},
+	{
+		"name": "golang.org/x/sys",
+		"version": "0.28.0",
+		"license": "BSD-3-Clause",
+		"author": "The Go Authors",
+		"repository": "https://github.com/golang/sys",
+		"textFile": "go-x-sys.txt",
+		"distributedVia": "Compiled into the remote executor binaries (remote-executor/go.mod, indirect)."
+	},
+	{
+		"name": "@parcel/watcher native binaries",
+		"version": "2.5.6",
+		"license": "MIT",
+		"author": "Devon Govett",
+		"repository": "https://github.com/parcel-bundler/watcher",
+		"textFile": "parcel-watcher.txt",
+		"distributedVia": "Eight platform `watcher.node` binaries embedded by scripts/download-parcel-watcher.ts, which fetches them straight from the npm registry — they never appear in node_modules, so the dependency scan cannot see them."
+	}
+]

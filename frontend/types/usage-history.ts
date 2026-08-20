@@ -1,6 +1,44 @@
+/**
+ * Pointer left on the dump when the complete copy was written to a file.
+ *
+ * Mirrors `RawDumpSpillPointer` in `server/lib/api-request-dump-store.ts`, minus the
+ * absolute `filePath` — `redactSpillPointerPaths` replaces it with `fileName` before the
+ * dump leaves the server, because the path carries the host's OS account name.
+ *
+ * Every field is optional: the pointer is read out of a stored JSON blob that may predate
+ * the current shape, and a missing field must degrade to "say less", never to a crash.
+ */
+export interface UsageHistoryRawDumpSpill {
+	schema?: string;
+	/**
+	 * True when the inline dump is only the head of a larger file.
+	 *
+	 * This is the whole reason the pointer is exposed: without surfacing it the UI presents
+	 * a truncated body as if it were the entire request.
+	 */
+	inlineTruncated?: boolean;
+	/**
+	 * True when the FILE itself had to shed parts to fit the server's per-file ceiling.
+	 *
+	 * Categorically different from `inlineTruncated`, which is always true on a pointer and
+	 * only says the row is a head that a download completes. This one says no complete copy
+	 * exists anywhere — downloading gets less than what was sent — so the UI must state that
+	 * outright rather than let a file that looks whole imply otherwise.
+	 */
+	truncated?: boolean;
+	/** Serialized byte size of the complete dump before shedding, when `truncated`. */
+	originalBytes?: number;
+	/** Byte size of the dump actually stored on disk. */
+	bytes?: number;
+	/** Spill file basename — what correlates a downloaded dump with a server log line. */
+	fileName?: string;
+	note?: string;
+}
+
 export interface UsageHistoryRawDump {
 	provider?: string;
 	model?: string;
+	spill?: UsageHistoryRawDumpSpill | null;
 	request?: {
 		transport?: string;
 		url?: string;

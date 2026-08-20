@@ -295,6 +295,83 @@ describe("PretextLayoutCoordinator", () => {
 		expect(coordinator.getSnapshot()).toBe(baseline);
 	});
 
+	/**
+	 * The compact-marker LIVE-PATCH channel (PretextExactMessageList's
+	 * `replaceOrReload`): a `message_updated` for a compact marker that
+	 * `replaceMessage` declines is applied by swapping the whole message in place,
+	 * deliberately holding `messageVersion` fixed (§4.5 约束 2). That makes
+	 * `extractDataRevision` the ONLY key component that can move, and the channel's
+	 * safety argument was "status is folded into the key".
+	 *
+	 * Status alone is not enough. A FAILED segment-compact marker is a system-TEXT
+	 * card whose body is the error message painted as pre-wrap, so its height is a
+	 * function of how that text wraps. Two `failed` updates carrying different prose
+	 * share a status, and every other key component (spec.key `-sys`, width, LOD,
+	 * opts, document version) is fixed — so without a text signature the second
+	 * update is served the first one's height and the error is clipped.
+	 *
+	 * (The non-failed `compact` / `segment_compact` line is NOT at risk: its label is
+	 * synthesized from status, so the text cannot move independently. This is the one
+	 * flavour of marker whose body is real prose.)
+	 */
+	it("re-measures a compact marker whose body text changed at an UNCHANGED status", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		const failedMarker = (error: string): TreeMessage =>
+			({
+				id: "seg-compact-1",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "user",
+				contentJson: [{ type: "segment_compact", status: "failed", error, messageCount: 4 }],
+				contentText: "[Segment compact failed]",
+				toolCalls: [],
+				createdAt: "2026-07-23T00:00:00.000Z",
+				children: [],
+				seq: 0,
+			}) as unknown as TreeMessage;
+		// A short one-line failure, then a long one that must wrap to more lines.
+		const short = "timeout";
+		const long = "压缩失败，模型返回了一段很长的错误说明。".repeat(12);
+		await coordinator.load("n1", compactBuildOptions, {
+			fetchPage: async () => ({
+				messages: [failedMarker(short)],
+				minSeq: 0,
+				maxSeq: 0,
+				hasNext: false,
+				hasPrev: false,
+				messageVersion: 3,
+				pruneBoundaryMessageId: null,
+				prunedPercent: null,
+			}),
+		});
+		const cardHeight = (snapshot: {
+			items?: readonly { spec: { kind: string }; measured: { height: number } }[];
+		}) => snapshot.items?.find((entry) => entry.spec.kind === "system-text")?.measured.height ?? 0;
+
+		const beforeHeight = cardHeight(coordinator.getSnapshot());
+		// The premise: the failed marker really does render as a text card here. A 0
+		// would make the comparison below vacuous.
+		expect(beforeHeight).toBeGreaterThan(0);
+
+		// Exactly what `replaceOrReload` does for a compact marker: replace the whole
+		// message through applyLivePatch, with the version untouched.
+		const applied = coordinator.applyLivePatch((messages) => {
+			const index = messages.findIndex((m) => m.id === "seg-compact-1");
+			if (index < 0) return { messages, changed: false };
+			const patched = [...messages];
+			patched[index] = failedMarker(long);
+			return { messages: patched, changed: true };
+		});
+		expect(applied).toBe(true);
+		const after = coordinator.getSnapshot();
+		// The version really did not move, so only the data revision could have
+		// invalidated the cached height.
+		expect(after.input?.messageVersion).toBe(3);
+		// The regression: a stale hit returns the SHORT card's height for a body that
+		// now wraps to several lines, clipping the error the reader needs to read.
+		expect(cardHeight(after)).toBeGreaterThan(beforeHeight);
+	});
+
 	it("leaves a finished compact marker's label alone", async () => {
 		const coordinator = new PretextLayoutCoordinator();
 		await coordinator.load("n1", compactBuildOptions, {

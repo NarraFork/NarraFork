@@ -37,10 +37,16 @@ class FakeWebSocket {
 	close(): void {
 		this.readyState = FakeWebSocket.CLOSED;
 	}
+
+	/** Deliver a server frame, as `onmessage` would. */
+	deliver(payload: unknown): void {
+		this.onmessage?.({ data: JSON.stringify(payload) } as MessageEvent);
+	}
 }
 
 function installBrowserHarness(initiallyOnline: boolean): {
 	windowTarget: EventTarget;
+	documentTarget: EventTarget & { visibilityState: DocumentVisibilityState };
 	navigatorState: { onLine: boolean };
 	restore: () => void;
 } {
@@ -55,7 +61,7 @@ function installBrowserHarness(initiallyOnline: boolean): {
 			hostname: "localhost",
 			port: "7778",
 		},
-	});
+	}) as EventTarget & { location: unknown };
 	const documentTarget = Object.assign(new EventTarget(), {
 		visibilityState: "visible" as DocumentVisibilityState,
 	});
@@ -85,6 +91,7 @@ function installBrowserHarness(initiallyOnline: boolean): {
 
 	return {
 		windowTarget,
+		documentTarget,
 		navigatorState,
 		restore: () => {
 			for (const key of globalKeys) {
@@ -103,6 +110,19 @@ function hasSubscribeFor(socket: FakeWebSocket, narratorId: string): boolean {
 		return message.type === "subscribe" && message.narratorIds?.includes(narratorId);
 	});
 }
+
+function syncCheckCount(socket: FakeWebSocket): number {
+	return socket.sent.filter((raw) => (JSON.parse(raw) as { type?: string }).type === "sync_check")
+		.length;
+}
+
+/** `PageTransitionEvent` is unavailable here; only `persisted` is read. */
+function pageTransition(type: "pagehide" | "pageshow", persisted: boolean): Event {
+	return Object.assign(new Event(type), { persisted });
+}
+
+/** Timings small enough that the recovery sequences complete without real waiting. */
+const FAST_TIMINGS = { foregroundCoalesceMs: 1, syncProbeTimeoutMs: 40 };
 
 describe("narrator foreground recovery", () => {
 	it("短时隐藏且连接正常时只执行同步", () => {
@@ -193,6 +213,183 @@ describe("narrator foreground recovery", () => {
 			await Promise.resolve();
 			expect(hasSubscribeFor(recoveredSocket, "narrator-1")).toBe(true);
 			expect(connectionChanges.at(-1)).toEqual([true, true]);
+
+			manager.unsubscribe(subscription);
+		} finally {
+			manager.disconnect();
+			harness.restore();
+		}
+	});
+
+	it("浏览器明确丢弃连接时压过隐藏时长与退避判定", () => {
+		// bfcache/freeze need not be preceded by a `visibilitychange`, so elapsed can
+		// be 0; and the resurrected socket may still report OPEN. Both weaker inputs
+		// would answer "sync" here, pushing a sync_check into a dead socket.
+		expect(
+			decideNarratorForegroundRecovery({
+				hiddenElapsedMs: 0,
+				socketState: "open",
+				hasPendingReconnect: true,
+				socketDiscarded: true,
+			}),
+		).toBe("reconnect");
+	});
+
+	it("BFCache 恢复时重建连接并恢复订阅", async () => {
+		const harness = installBrowserHarness(true);
+		const manager = new NarratorWSManager(FAST_TIMINGS);
+		const connectionChanges: Array<[boolean, boolean]> = [];
+		manager.onConnectionChange((connected, isReconnect) => {
+			connectionChanges.push([connected, isReconnect]);
+		});
+
+		try {
+			manager.connect();
+			const firstSocket = FakeWebSocket.instances[0];
+			firstSocket.open();
+			const subscription = manager.subscribe(["narrator-1"], { kind: "messages" });
+			await Promise.resolve();
+			expect(hasSubscribeFor(firstSocket, "narrator-1")).toBe(true);
+
+			// Entering the bfcache must detach the socket right away: on return it can
+			// still report OPEN, and anything written to it is silently lost.
+			harness.windowTarget.dispatchEvent(pageTransition("pagehide", true));
+			expect(firstSocket.readyState).toBe(FakeWebSocket.CLOSED);
+			expect(FakeWebSocket.instances).toHaveLength(1);
+
+			harness.windowTarget.dispatchEvent(pageTransition("pageshow", true));
+			await Bun.sleep(10);
+			expect(FakeWebSocket.instances).toHaveLength(2);
+
+			const restored = FakeWebSocket.instances[1];
+			restored.open();
+			await Promise.resolve();
+			expect(hasSubscribeFor(restored, "narrator-1")).toBe(true);
+			expect(connectionChanges.at(-1)).toEqual([true, true]);
+
+			manager.unsubscribe(subscription);
+		} finally {
+			manager.disconnect();
+			harness.restore();
+		}
+	});
+
+	it("只收到 pagehide（无 visibilitychange）也能在恢复时强制重连", async () => {
+		const harness = installBrowserHarness(true);
+		const manager = new NarratorWSManager(FAST_TIMINGS);
+
+		try {
+			manager.connect();
+			const firstSocket = FakeWebSocket.instances[0];
+			firstSocket.open();
+			const subscription = manager.subscribe(["narrator-1"], { kind: "messages" });
+			await Promise.resolve();
+
+			// iOS Safari commonly sends only `pagehide`. The old implementation recorded
+			// nothing here, so the elapsed-time threshold could never fire.
+			harness.windowTarget.dispatchEvent(pageTransition("pagehide", false));
+			harness.windowTarget.dispatchEvent(pageTransition("pageshow", true));
+			await Bun.sleep(10);
+
+			expect(FakeWebSocket.instances).toHaveLength(2);
+			FakeWebSocket.instances[1].open();
+			await Promise.resolve();
+			expect(hasSubscribeFor(FakeWebSocket.instances[1], "narrator-1")).toBe(true);
+
+			manager.unsubscribe(subscription);
+		} finally {
+			manager.disconnect();
+			harness.restore();
+		}
+	});
+
+	it("sync_check 完全无响应时判定连接已死并重连", async () => {
+		const harness = installBrowserHarness(true);
+		const manager = new NarratorWSManager(FAST_TIMINGS);
+
+		try {
+			manager.connect();
+			const firstSocket = FakeWebSocket.instances[0];
+			firstSocket.open();
+			const subscription = manager.subscribe(["narrator-1"], { kind: "messages" });
+			await Promise.resolve();
+
+			// A short hide with a socket that still reports OPEN takes the sync path.
+			harness.documentTarget.visibilityState = "hidden";
+			harness.documentTarget.dispatchEvent(new Event("visibilitychange"));
+			harness.documentTarget.visibilityState = "visible";
+			harness.documentTarget.dispatchEvent(new Event("visibilitychange"));
+			await Bun.sleep(10);
+			expect(syncCheckCount(firstSocket)).toBe(1);
+			expect(FakeWebSocket.instances).toHaveLength(1);
+
+			// Nothing answers — not even a heartbeat. Without the probe `_connected`
+			// would stay true while the message stream is gone.
+			await Bun.sleep(60);
+			expect(FakeWebSocket.instances).toHaveLength(2);
+			expect(firstSocket.readyState).toBe(FakeWebSocket.CLOSED);
+
+			manager.unsubscribe(subscription);
+		} finally {
+			manager.disconnect();
+			harness.restore();
+		}
+	});
+
+	it("探测窗口内收到任意帧就保持连接", async () => {
+		const harness = installBrowserHarness(true);
+		const manager = new NarratorWSManager(FAST_TIMINGS);
+
+		try {
+			manager.connect();
+			const firstSocket = FakeWebSocket.instances[0];
+			firstSocket.open();
+			const subscription = manager.subscribe(["narrator-1"], { kind: "messages" });
+			await Promise.resolve();
+
+			harness.documentTarget.visibilityState = "hidden";
+			harness.documentTarget.dispatchEvent(new Event("visibilitychange"));
+			harness.documentTarget.visibilityState = "visible";
+			harness.documentTarget.dispatchEvent(new Event("visibilitychange"));
+			await Bun.sleep(10);
+			expect(syncCheckCount(firstSocket)).toBe(1);
+
+			// A heartbeat is enough evidence: an idle narrator answers nothing else.
+			firstSocket.deliver({ type: "ping" });
+			await Bun.sleep(60);
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			expect(manager.connected).toBe(true);
+
+			manager.unsubscribe(subscription);
+		} finally {
+			manager.disconnect();
+			harness.restore();
+		}
+	});
+
+	it("没有消息订阅时不做存活探测", async () => {
+		const harness = installBrowserHarness(true);
+		const manager = new NarratorWSManager(FAST_TIMINGS);
+
+		try {
+			manager.connect();
+			const firstSocket = FakeWebSocket.instances[0];
+			firstSocket.open();
+			// A list subscription never sends sync_check, so an unanswered probe here
+			// would tear down a perfectly healthy socket.
+			const subscription = manager.subscribe(["narrator-1"], { kind: "list" });
+			await Promise.resolve();
+
+			harness.documentTarget.visibilityState = "hidden";
+			harness.documentTarget.dispatchEvent(new Event("visibilitychange"));
+			harness.documentTarget.visibilityState = "visible";
+			harness.documentTarget.dispatchEvent(new Event("visibilitychange"));
+			await Bun.sleep(30);
+
+			await Bun.sleep(40);
+			expect(syncCheckCount(firstSocket)).toBe(0);
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			expect(manager.connected).toBe(true);
 
 			manager.unsubscribe(subscription);
 		} finally {

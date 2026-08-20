@@ -30,6 +30,7 @@ import {
 } from "./pretext-document-loader";
 import { trimClockNow, trimLoadedHead } from "./vlist-head-trim";
 import { appendLoadedMessage } from "./vlist-message-append";
+import { insertLoadedMessage } from "./vlist-message-insert";
 import { removeLoadedMessages } from "./vlist-message-remove";
 import { replaceLoadedMessage } from "./vlist-message-replace";
 import type { VListItem } from "./vlist-pipeline";
@@ -482,6 +483,61 @@ export class PretextLayoutCoordinator {
 		if (!this.input || !this.lastBuildOptions) return false;
 		const result = appendLoadedMessage(this.input.messages, message, isSubagent);
 		if (!result.appended) return false;
+		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
+		const view = getView?.();
+		const anchor =
+			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
+		const generation = ++this.generation;
+		this.commitLayout(
+			this.input,
+			this.lastBuildOptions,
+			anchor,
+			view?.viewportHeight ?? this.lastViewportHeight,
+			generation,
+		);
+		return true;
+	}
+
+	/**
+	 * Insert a mid-window structural marker into the loaded window IN PLACE.
+	 *
+	 * The counterpart to `appendMessage` for a marker that is NOT at the tail: a
+	 * segment-compact marker lands at the seq of the first message it compresses,
+	 * and a custom compact with a `beforeMessageId` lands mid-history. Answering
+	 * either with a reload means the marker only appears when the reader scrolls
+	 * back to the bottom — and a reader who just selected a segment to compact is
+	 * by construction looking at it, not at the bottom. The event carries the
+	 * body and its seq, so the refetch buys nothing.
+	 *
+	 * Like every other in-place path this keeps `messageVersion` fixed and anchors
+	 * the rebuild, so a reader above the insert point is not moved.
+	 *
+	 * Returns false when nothing was inserted, so the caller can decide to reload.
+	 */
+	insertMessage(message: TreeMessage, getView?: () => PrependView): boolean {
+		if (!this.input || !this.lastBuildOptions) return false;
+		// A marker positioned above the loaded window's fetch bound cannot be placed
+		// in place, for two independent reasons — so the test is on the bound ALONE,
+		// deliberately NOT gated on `hasPrev`:
+		//
+		//  - While older history is still unfetched (`hasPrev`), the next loadOlder
+		//    page would hand the same marker back: paging is keyed by `beforeSeq` and
+		//    knows nothing of a locally inserted row.
+		//  - Even with `hasPrev` false — the head can have been dropped by
+		//    `trimLoadedHead` — a seq below the bound has no correct slot in the
+		//    array. `insertLoadedMessage` legitimately answers `insertAt = 0`, which
+		//    puts the marker at the very TOP of the window: a position it does not
+		//    belong to, above rows that are older than it.
+		//
+		// The structural reload owns both cases; the cost is one extra reload in a
+		// rare window.
+		const seq =
+			typeof message.seq === "number" && Number.isFinite(message.seq) ? message.seq : null;
+		if (seq != null && this.input.oldestLoadedSeq != null && seq < this.input.oldestLoadedSeq) {
+			return false;
+		}
+		const result = insertLoadedMessage(this.input.messages, message);
+		if (!result.inserted) return false;
 		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
 		const view = getView?.();
 		const anchor =

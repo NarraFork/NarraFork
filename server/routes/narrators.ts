@@ -44,6 +44,7 @@ import {
 } from "../db/schema";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
+import { redactSpillPointerPaths } from "../lib/api-request-dump-store";
 import { narratorTraitsLock } from "../lib/async-mutex";
 import {
 	AUTO_CONTINUATION_OVERRIDE_VALUES,
@@ -1153,7 +1154,11 @@ narratorRoutes.get("/:id/leaked-tool-dump/:requestId", async (c) => {
 
 	let rawDump: unknown;
 	try {
-		rawDump = JSON.parse(row.rawDumpJson);
+		// Same redaction as the usage-history detail path: the stored dump carries absolute
+		// server paths (spill pointer / malformed capture) that name the host OS account, and a
+		// dump is something users export and forward to whoever is helping them. This route
+		// used to return the row verbatim, so it leaked what the other path was careful about.
+		rawDump = redactSpillPointerPaths(JSON.parse(row.rawDumpJson));
 	} catch {
 		rawDump = { invalidJson: true, rawText: row.rawDumpJson };
 	}

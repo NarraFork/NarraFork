@@ -160,18 +160,35 @@ describe("appendMessage — no refetch, one row measured", () => {
 });
 
 describe("appendMessage — what falls back to a reload", () => {
-	it("refuses a duplicate, a mid-window insert and a structural marker", async () => {
+	it("refuses a duplicate and a mid-window insert, but appends a tail compact marker", async () => {
 		const { coordinator, count } = await loaded();
 		coordinator.appendMessage(message(count), false, atBottom);
 		// Returning false is the caller's signal to reload instead.
 		expect(coordinator.appendMessage(message(count), false, atBottom)).toBe(false);
 		expect(coordinator.appendMessage(message(5), false, atBottom)).toBe(false);
-		const compactMarker = {
+		// A structural marker that still restructures the document keeps the reload.
+		const askMarker = {
 			...message(count + 1),
 			role: "system",
-			contentJson: [{ type: "compact", summary: "…" }],
+			contentJson: [{ type: "ask_in_passing" }],
 		} as unknown as TreeMessage;
-		expect(coordinator.appendMessage(compactMarker, false, atBottom)).toBe(false);
+		expect(coordinator.appendMessage(askMarker, false, atBottom)).toBe(false);
+	});
+
+	it("appends a tail compact marker in place — deferring it was the reported bug", async () => {
+		const { coordinator, state, count } = await loaded();
+		const compactMarker = {
+			...message(count),
+			role: "system",
+			contentJson: [{ type: "compact", status: "compacting" }],
+		} as unknown as TreeMessage;
+		// Its "history before me is compacted away" meaning belongs to the server's
+		// NEXT load; a reader's already-loaded window simply gains the marker row.
+		expect(coordinator.appendMessage(compactMarker, false, atBottom)).toBe(true);
+		expect(state.fetches).toBe(1);
+		expect(coordinator.getSnapshot().input?.messages.some((m) => m.id === compactMarker.id)).toBe(
+			true,
+		);
 	});
 
 	it("refuses a child message on a parent page but accepts it on a subagent page", async () => {

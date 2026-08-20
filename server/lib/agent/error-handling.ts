@@ -76,10 +76,18 @@ const RETRYABLE_PATTERNS = [
 	"internal server error",
 ];
 
-/** 429 is only retryable by default when the message looks like rate limiting/load. */
+/**
+ * 429 is only retryable by default when the message looks like rate limiting/load.
+ *
+ * Deliberately contains no bare `retry` / `retry-after` entry. A `Retry-After`
+ * response header only says *when* a caller may try again — it says nothing about
+ * the failure being transient, and hard quota responses carry it too (observed:
+ * `retry-after: 374160`, i.e. 4.3 days, on a weekly-usage-limit 429). Matching the
+ * header name turned that quota wall into an infinite retry loop. Phrases below
+ * require the provider to actually be saying "try later"; a standalone `retry`
+ * word is handled by {@link STANDALONE_RETRY_PATTERN}.
+ */
 const RETRYABLE_429_PATTERNS = [
-	"retry",
-	"retry-after",
 	"overload",
 	"overloaded",
 	"capacity",
@@ -88,7 +96,20 @@ const RETRYABLE_429_PATTERNS = [
 	"rate limit",
 	"throttl",
 	"try again",
+	"please retry",
+	"retry later",
+	// Trailing space keeps the `retry-after` / `retry_after` header name out.
+	"retry after ",
+	"retry in ",
 ];
+
+/**
+ * A standalone `retry` word. Hyphen/underscore neighbours are excluded so that
+ * `retry-after` (header name), `retryable` (structured field name) and
+ * `retryCount` (unrelated counter) are never mistaken for the upstream telling
+ * us to try again.
+ */
+const STANDALONE_RETRY_PATTERN = /(?<![\w-])retry(?![\w-])/;
 
 /** Error codes that represent transient network/transport failures. */
 const RETRYABLE_ERROR_CODES = new Set([
@@ -112,9 +133,28 @@ const RETRYABLE_ERROR_CODES = new Set([
 	TRANSIENT_TLS_HANDSHAKE_CODE,
 ]);
 
+/**
+ * "The allowance is used up" wording family. Requires both a usage-limit noun and
+ * a consumed verb, so a merely informational "usage limit: 1000/min" is not swept
+ * in while every exhausted phrasing is:
+ *
+ *   Weekly usage limit reached / usage_limit_reached / usage limit has been
+ *   reached / usage limit exceeded / monthly usage limit hit
+ *
+ * The literal-string list below could not express this: the observed opencode 429
+ * says "Weekly usage limit reached" (space-separated, no "has been"), which
+ * matched neither `usage_limit_reached` nor `usage limit has been reached`.
+ * `reason: "GoUsageLimitError"` supplies only the noun half, so the verb is
+ * matched across the combined reason+message text.
+ */
+const USAGE_LIMIT_PATTERN = /usage[\s_-]*limit/;
+const USAGE_CONSUMED_PATTERN = /reach|exceed|exhaust|hit/;
+
+function isHardUsageLimitText(text: string): boolean {
+	return USAGE_LIMIT_PATTERN.test(text) && USAGE_CONSUMED_PATTERN.test(text);
+}
+
 const NON_RETRYABLE_PATTERNS = [
-	"usage_limit_reached",
-	"usage limit has been reached",
 	"insufficient_quota",
 	"quota exceeded",
 	"exceeded your current quota",
@@ -126,6 +166,18 @@ const NON_RETRYABLE_PATTERNS = [
 	"credit balance",
 	'"plan_type":"free"',
 ];
+
+/**
+ * Whether text describes a hard quota/billing/allowance wall — never retryable,
+ * regardless of status code or how "try again later" the rest of the response
+ * sounds. Single entry point so every caller shares the usage-limit wording
+ * family instead of only the literal patterns above.
+ */
+function isHardNonRetryableText(text: string): boolean {
+	return (
+		NON_RETRYABLE_PATTERNS.some((pattern) => text.includes(pattern)) || isHardUsageLimitText(text)
+	);
+}
 
 /** Patterns that indicate the request exceeded model input context. */
 const CONTEXT_OVERFLOW_PATTERNS = [
@@ -299,17 +351,20 @@ function has429Message(message: string): boolean {
 	return /\b429\b/.test(message);
 }
 
-function isRetryable429Message(message: string): boolean {
+/** Whether text carries a genuine rate-limit/load signal (see RETRYABLE_429_PATTERNS). */
+function hasRateLimitSignal(text: string): boolean {
 	return (
-		has429Message(message) && RETRYABLE_429_PATTERNS.some((pattern) => message.includes(pattern))
+		RETRYABLE_429_PATTERNS.some((pattern) => text.includes(pattern)) ||
+		STANDALONE_RETRY_PATTERN.test(text)
 	);
 }
 
+function isRetryable429Message(message: string): boolean {
+	return has429Message(message) && hasRateLimitSignal(message);
+}
+
 function hasRetryable429(statusCodes: Set<number>, msgCandidates: string[]): boolean {
-	return (
-		statusCodes.has(429) &&
-		msgCandidates.some((msg) => RETRYABLE_429_PATTERNS.some((pattern) => msg.includes(pattern)))
-	);
+	return statusCodes.has(429) && msgCandidates.some(hasRateLimitSignal);
 }
 
 function inferInvalidStateStatus(
@@ -359,9 +414,14 @@ export function classifyInvalidState(
 	const normalizedReason = reason.toLowerCase().trim();
 	const normalizedMessage = message?.toLowerCase() ?? "";
 	const statusCode = inferInvalidStateStatus(reason, diagnostics);
-	const hardNonRetryable = NON_RETRYABLE_PATTERNS.some(
-		(pattern) => normalizedMessage.includes(pattern) || normalizedReason.includes(pattern),
-	);
+	// Literal patterns are matched per-field (a pattern never spans reason+message),
+	// but the usage-limit family legitimately splits across the two: opencode sends
+	// reason `GoUsageLimitError` (noun) with message "Weekly usage limit reached"
+	// (verb), so it is also matched against the joined text.
+	const hardNonRetryable =
+		NON_RETRYABLE_PATTERNS.some(
+			(pattern) => normalizedMessage.includes(pattern) || normalizedReason.includes(pattern),
+		) || isHardUsageLimitText(`${normalizedReason} ${normalizedMessage}`);
 	// The provider/gateway explicitly flagged this failure as safe to resume
 	// with a continuation turn (partial output was already produced). Any
 	// hard non-retryable classification below (quota, refusal, content
@@ -724,7 +784,7 @@ export function isModelUnavailableError(err: unknown): boolean {
 	const combined = messages.join(" ");
 
 	// Never treat hard quota/billing/payment failures as a recoverable wait.
-	if (NON_RETRYABLE_PATTERNS.some((p) => combined.includes(p))) return false;
+	if (isHardNonRetryableText(combined)) return false;
 
 	// Structured signal from the gateway: an explicit upstream-unavailable
 	// `reason`. This is normalized from the gateway/channel error envelope by
@@ -766,7 +826,7 @@ export function isRetryableError(
 		if (primitiveClassification.category !== "non_retryable") {
 			return primitiveClassification.retryable;
 		}
-		if (NON_RETRYABLE_PATTERNS.some((p) => message.includes(p))) return false;
+		if (isHardNonRetryableText(message)) return false;
 		if (isRetryable429Message(message)) return true;
 		if (RETRYABLE_PATTERNS.some((p) => message.includes(p))) return true;
 		if (/\b5\d\d\b/.test(message)) return true;
@@ -797,6 +857,34 @@ export function isRetryableError(
 		obj.diagnostics && typeof obj.diagnostics === "object"
 			? (obj.diagnostics as Partial<ApiRequestDiagnostics>)
 			: undefined;
+
+	/**
+	 * Human-readable provider text only — no serialized object blob.
+	 *
+	 * The built-in retry heuristics must judge what the provider *said*, not the
+	 * shape of the error object. `msgCandidates` above deliberately includes the
+	 * whole serialized error so user-authored keyword rules can reach nested
+	 * fields, but feeding that blob to the 429 heuristic made field and header
+	 * NAMES act as upstream signals: a `retry-after` response header (present on
+	 * hard quota walls, observed at 374160s ≈ 4.3 days) matched the rate-limit
+	 * keyword list and turned a weekly-usage-limit 429 into an infinite retry
+	 * loop. `retryable: false` and an unrelated `retryCount` field had the same
+	 * effect. Custom rules keep the full candidate list; heuristics get this one.
+	 */
+	const narrowCandidates = [
+		obj.message,
+		typeof obj.error === "string" ? obj.error : undefined,
+		nestedObj?.message,
+		typeof nestedObj?.error === "string" ? nestedObj.error : undefined,
+		causeObj?.message,
+		typeof causeObj?.error === "string" ? causeObj.error : undefined,
+		diagnostics?.message,
+		diagnostics?.responseSnippet,
+		diagnostics?.reason,
+	]
+		.filter((value): value is string => typeof value === "string" && value.length > 0)
+		.map((value) => value.toLowerCase());
+
 	const invalidStateReason =
 		typeof obj.reason === "string"
 			? obj.reason
@@ -806,7 +894,7 @@ export function isRetryableError(
 	if (invalidStateReason) {
 		const classification = classifyInvalidState(
 			invalidStateReason,
-			msgCandidates.join(" "),
+			narrowCandidates.join(" "),
 			diagnostics,
 			customRetryRules,
 			typeof obj.retryable === "boolean" ? obj.retryable : diagnostics?.retryable,
@@ -826,8 +914,13 @@ export function isRetryableError(
 		if (classification.category !== "non_retryable") return classification.retryable;
 	}
 
-	// Message-based hard quota / plan restrictions should never retry.
-	if (msgCandidates.some((msg) => NON_RETRYABLE_PATTERNS.some((p) => msg.includes(p)))) {
+	// Message-based hard quota / plan restrictions should never retry. Matched
+	// against the joined narrow text too, since the usage-limit wording family can
+	// split its noun and verb across `reason` and `message`.
+	if (
+		msgCandidates.some(isHardNonRetryableText) ||
+		isHardUsageLimitText(narrowCandidates.join(" "))
+	) {
 		return false;
 	}
 
@@ -902,10 +995,18 @@ export function isRetryableError(
 
 	// Check HTTP status codes. 429 needs a rate-limit/load keyword to avoid retrying billing/quota failures;
 	// every 5xx status is treated as a transient upstream failure.
+	//
+	// The 429 keyword checks read `narrowCandidates`, never the serialized blob: a
+	// `retry-after` header or a `retryable` field name is not the upstream saying
+	// "try again later". A plain 429 still falls through to custom rules, which do
+	// see the full candidate list.
 	if ([...statusCodes].some(isDefaultRetryableStatus)) return true;
-	if (hasRetryable429(statusCodes, msgCandidates)) return true;
-	if (msgCandidates.some(isRetryable429Message)) return true;
-	// Plain 429 errors must not fall through to broader transient keywords.
+	if (hasRetryable429(statusCodes, narrowCandidates)) return true;
+	if (narrowCandidates.some(isRetryable429Message)) return true;
+	// Plain 429 errors must not fall through to broader transient keywords. Detection
+	// stays broad (a 429 buried anywhere in the error still counts as a 429) while the
+	// retryable signal above stays narrow — narrowing detection instead would let a
+	// deeply-nested 429 reach RETRYABLE_PATTERNS and be retried for the wrong reason.
 	if (statusCodes.has(429) || msgCandidates.some(has429Message)) {
 		return matchesCustomRetryRules(obj, msgCandidates, statusCodes, customRetryRules);
 	}

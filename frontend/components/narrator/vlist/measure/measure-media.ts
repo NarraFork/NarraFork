@@ -2,7 +2,10 @@
  * measure-media.ts — Zero-DOM height model for the three MessageBubble media
  * blocks (CONTRACT.md §4, WBS-batch2 P2):
  *
- *   - image            → fixed 200px (Skeleton placeholder is also 200). 🟢
+ *   - image            → aspect-ratio fitted box when the block carries the
+ *     intrinsic width/height persisted at upload time (ZERO measurement, pure
+ *     arithmetic on data); fixed 200px placeholder when they are absent (old
+ *     messages). 🟢
  *   - text_file        → single icon+name+size row, py=2. 🟢
  *   - image_generation → header row (icon + status + optional loader) + image
  *     area. With intrinsic width/height the image area is reserved via aspect
@@ -21,6 +24,7 @@
  */
 
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
+import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
 import {
 	accumulateFrame,
 	type BlockFrame,
@@ -55,9 +59,36 @@ const FLAT_BASE: PreparedBlockBase = {
 };
 
 // ── image ────────────────────────────────────────────────────────────────────
-/** Fixed image height (px). Matches the rendered `<Image h={200}>` and the
- * `<Skeleton h={200}>` loading placeholder. */
+/**
+ * Fallback image height (px) when the block carries NO intrinsic dimensions
+ * (messages persisted before width/height were recorded). Matches the classic
+ * `<Image h={200}>` and the `<Skeleton h={200}>` loading placeholder.
+ */
 export const IMAGE_FIXED_HEIGHT = 200;
+/**
+ * Height cap (px) for a dimensioned image. Without it a tall screenshot would
+ * reserve its full aspect height (a 700×7000 capture → 7000px of list). When
+ * the cap clamps, the box narrows to keep the aspect ratio, so the paint still
+ * matches the reservation exactly.
+ *
+ * ⚠️ THIS IS THE SOURCE OF THE 400. Two other copies exist and must move with
+ * it, neither of which can import this module:
+ *   - `MessageBubble.tsx`'s `CHAT_IMAGE_MAX_HEIGHT` — the CHUNKED path, which
+ *     lives outside vlist/ and therefore cannot import anything in it (§0 铁律 1
+ *     is enforced by `vlist-isolation.guard.test.ts`: a static import from
+ *     outside vlist/ fails the build). Same value, painted by a different
+ *     renderer for the same images.
+ *   - `DETAIL_CAPS.media` in `measure-tool-call.ts` — the tool card's media cap.
+ *     Coincidentally equal and deliberately NOT aliased: it is one entry in a cap
+ *     table whose other rows (code/term/diff/…) have nothing to do with images,
+ *     so tying it to this constant would couple two unrelated tables.
+ * Tests import this constant rather than re-declaring 400 (a fourth copy that
+ * silently drifts is a test that stops protecting the value it names).
+ *
+ * Same "Keep in sync with …" arrangement as tool-detail.ts's
+ * MEDIA_IMAGE_CONTENT_PX ↔ IMAGE_FIXED_HEIGHT, and for the same reason.
+ */
+export const IMAGE_MAX_DISPLAY_HEIGHT = 400;
 
 export interface MeasureImageInput {
 	imageId?: string;
@@ -65,18 +96,59 @@ export interface MeasureImageInput {
 	mediaType?: string;
 	filename?: string;
 	uploadNarratorId?: string;
+	/** Intrinsic pixel size, persisted at upload time. Drives aspect fitting. */
+	width?: number | null;
+	height?: number | null;
 }
 
 /**
- * Measure an inline image block. Always a fixed 200px tall box (the rendered
- * image is `h={200} w="auto"`, and the loading Skeleton is also 200). Zero
- * measurement.
+ * Measure an inline image block. With intrinsic dimensions the box is the
+ * aspect-ratio fit into (`contentWidth` × IMAGE_MAX_DISPLAY_HEIGHT) — the same
+ * formula the render layer paints, so reservation and paint cannot drift.
+ * Without them the box is the fixed 200px placeholder (the rendered image is
+ * `h={200} w="auto"`, and the loading Skeleton is also 200). Zero measurement.
+ *
+ * ⚠️ Like `measureImageGeneration`, the fitted branch is a DELIBERATE exception
+ * to "height is monotone non-increasing in width": a wider column produces a
+ * TALLER box. Termination of the width loop rests on the structural cycle
+ * guard in `vlist-width-settle.ts`, not on measure-layer monotonicity.
  */
 export function measureImage(
 	data: MeasureImageInput,
 	contentWidth: number,
 	_lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredElement {
+	const natural = readImageIntrinsicSize(data.width, data.height);
+	if (natural) {
+		const fit = fitImageBox(natural, contentWidth, IMAGE_MAX_DISPLAY_HEIGHT);
+		const block: PreparedFixedBlock = {
+			...FLAT_BASE,
+			kind: "fixed",
+			height: fit.displayHeight,
+			tag: "image",
+			displayWidth: fit.displayWidth,
+			data: {
+				imageId: data.imageId ?? null,
+				previewUrl: data.previewUrl ?? null,
+				mediaType: data.mediaType ?? null,
+				filename: data.filename ?? null,
+				uploadNarratorId: data.uploadNarratorId ?? null,
+				width: natural.width,
+				height: natural.height,
+				displayWidth: fit.displayWidth,
+				displayHeight: fit.displayHeight,
+			},
+		};
+		const blocks: PreparedBlock[] = [block];
+		const frame = accumulateFrame(blocks, contentWidth, pretextLineMetrics);
+		return {
+			height: frame.contentHeight,
+			blocks,
+			frame,
+			contentWidth,
+			usedWidth: Math.min(contentWidth, fit.displayWidth),
+		};
+	}
 	const block: PreparedFixedBlock = {
 		...FLAT_BASE,
 		kind: "fixed",
@@ -188,8 +260,8 @@ export interface MeasureImageGenerationInput {
 	savedPath?: string;
 	partialSavedPath?: string;
 	/** Intrinsic pixel width/height — enables aspect-ratio reservation. */
-	width?: number;
-	height?: number;
+	width?: number | null;
+	height?: number | null;
 }
 
 interface ImageMetrics {
@@ -413,6 +485,7 @@ export function measureMedia(
 
 export const MEASURE_MEDIA_CONSTANTS = {
 	IMAGE_FIXED_HEIGHT,
+	IMAGE_MAX_DISPLAY_HEIGHT,
 	TEXT_FILE_ICON_SIZE,
 	TEXT_FILE_PADDING_Y,
 	TEXT_FILE_HEIGHT,

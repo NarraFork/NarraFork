@@ -96,19 +96,21 @@ import {
 	usesStatefulModel,
 } from "../lib/settings";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
-import type { ImageRef, TextFileRef } from "../lib/uploads";
+import type { ImageRef, PersistedUserImageBlock, TextFileRef } from "../lib/uploads";
 import {
 	copyTextFileToWorktree,
 	deleteCreatedAttachmentFiles,
 	deleteUploadedImage,
 	getImagePath,
 	getUploadedImageInfo,
+	imageRefToContentBlock,
 	imageToBase64,
 	isFileWithinWorktree,
 	saveTextFileToWorktree,
 	saveUploadedImage,
 	validateTextFile,
 	validateUploadedImage,
+	validImageDimension,
 } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -234,39 +236,10 @@ import {
 	updateActiveSubagentReasoningEffort,
 } from "./narrator-session-state";
 
-type PersistedUserImageBlock = {
-	type: "image";
-	imageId: string;
-	filename: string;
-	mediaType: string;
-	width?: number;
-	height?: number;
-	uploadNarratorId?: string;
-};
-
-function validImageDimension(value: unknown): value is number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0;
-}
-
-/** Convert an uploads ImageRef into the canonical persisted user-message block. */
-export function imageRefToContentBlock(
-	image: ImageRef,
-	fallbackUploadNarratorId?: string | null,
-): PersistedUserImageBlock {
-	const uploadNarratorId = image.uploadNarratorId ?? fallbackUploadNarratorId;
-	const dimensions =
-		validImageDimension(image.width) && validImageDimension(image.height)
-			? { width: image.width, height: image.height }
-			: {};
-	return {
-		type: "image",
-		imageId: image.imageId,
-		filename: image.filename,
-		mediaType: image.mediaType,
-		...dimensions,
-		...(uploadNarratorId ? { uploadNarratorId } : {}),
-	};
-}
+export type { PersistedUserImageBlock };
+// Re-exported so existing imports (tests, other services) keep working; the
+// implementation lives in ../lib/uploads next to ImageRef.
+export { imageRefToContentBlock };
 
 interface PlannedUpdateRecoveryControl {
 	token: string;

@@ -332,6 +332,12 @@ export type AdapterActivityInput =
 			blockIndex?: number;
 			tc?: AdapterToolItem["tc"];
 			/**
+			 * True for an Agent/Task/Send-style subagent call (the caller computes it
+			 * from the tool name / activity summary / children). Drives the drilled-in
+			 * card's KIND — see `toolTraceItem`'s `cardKind`.
+			 */
+			isSubagent?: boolean;
+			/**
 			 * Disambiguator for a REPEATED tool-use id within one activity unit.
 			 *
 			 * A provider retry can put the same id in two persisted messages — two real
@@ -444,12 +450,23 @@ interface AdapterTraceItem {
 	 */
 	canDrillDown?: boolean;
 	/**
-	 * The full tool-card payload (`ToolCallData`) rendered INSIDE this row when the
-	 * reader drilled into it. `undefined` while collapsed, deliberately: a folded
-	 * trace can hold hundreds of rows, and classifying every one of their payloads
-	 * up front would undo the whole point of the fold. Only an expanded row pays.
+	 * The full card payload rendered INSIDE this row when the reader drilled into
+	 * it. `undefined` while collapsed, deliberately: a folded trace can hold
+	 * hundreds of rows, and classifying every one of their payloads up front would
+	 * undo the whole point of the fold. Only an expanded row pays.
+	 *
+	 * Shape depends on `cardKind`: a `ToolCallData` for an ordinary tool, a
+	 * `SubagentCardData` for an Agent/Task/Send row — the drill-down must paint the
+	 * same card the call gets at L3+, and a subagent's card is not the generic one.
 	 */
 	card?: unknown;
+	/**
+	 * Which card `card` holds — absent means "tool-call" (the overwhelmingly common
+	 * case, and what every pre-existing producer emits). Read by the measure layer
+	 * to pick `measureSubagentCard` vs `measureToolCall`, and by the render shell to
+	 * dispatch `renderElement` the same way.
+	 */
+	cardKind?: "tool-call" | "subagent-card";
 }
 
 export type AdapterRenderUnit =
@@ -893,9 +910,11 @@ function webSearchData(block: AdapterContentBlock, ctx: AdapterContext) {
 }
 
 /**
- * Attachment payload for a user bubble's image / text_file block. Only `type`
- * is height-relevant (image → fixed box, text_file → single row); the rest are
- * render-only fields the integration layer needs to resolve a blob src.
+ * Attachment payload for a user bubble's image / text_file block. `type` plus
+ * the image's intrinsic `width`/`height` are height-relevant (known dimensions
+ * reserve an aspect-ratio-fitted box; absent ones fall back to the fixed
+ * placeholder height); the rest are render-only fields the integration layer
+ * needs to resolve a blob src.
  *
  * `uploadNarratorId` falls back to the message's own narrator, matching
  * MessageBubble's `block.uploadNarratorId ?? message.narratorId ?? narratorId`.
@@ -909,6 +928,10 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 		filename: block.filename ?? null,
 		mediaType: block.mediaType ?? null,
 		size: typeof block.size === "number" ? block.size : null,
+		// Intrinsic pixel size, persisted at upload time (imageRefToContentBlock).
+		// HEIGHT-RELEVANT: the measure layer fits the box by aspect ratio.
+		width: typeof block.width === "number" ? block.width : null,
+		height: typeof block.height === "number" ? block.height : null,
 		uploadNarratorId: uploadNarratorId ?? null,
 		// HEIGHT-NEUTRAL: a text-file attachment's on-disk path, forwarded so the
 		// render layer can open it in a file panel. It never affects the reserved
@@ -2712,131 +2735,16 @@ function adaptToolItemFull(
 			(ctx.lod === 3 || (ctx.lod === 4 && !isRecentToolItem(item, ctx))),
 	};
 	if (item.isSubagent) {
-		// Map height-relevant SubagentCardData fields (NOT `status` — that field
-		// doesn't exist on SubagentCardData; it uses isTerminal + recentCallCount).
-		const activity = item.tc._subagentActivity;
-		const recentCalls = activity?.latestToolCalls ?? [];
-		// Names and timings are derived from the SAME filtered list so index i lines
-		// up in both arrays — the renderer pairs them positionally per row.
-		const namedRecentCalls = recentCalls
-			.filter(
-				(call): call is Record<string, unknown> =>
-					call != null &&
-					typeof call === "object" &&
-					typeof (call as { toolName?: unknown }).toolName === "string" &&
-					((call as { toolName: string }).toolName?.length ?? 0) > 0,
-			)
-			.slice(0, 3);
-		const recentCallNames = namedRecentCalls.map((call) => call.toolName as string);
-		const recentCallTimings = namedRecentCalls.map((call) => ({
-			...(typeof call.status === "string" ? { status: call.status } : {}),
-			...recentCallTiming(call),
-		}));
-		// Row label detail + category chip. These rows are TRACE rows now, and a trace
-		// row says `Tool · summary` with a tinted category chip — the vlist copy used to
-		// show the bare tool name in a grey box, so the same child call read differently
-		// here than in the chunked card. Both are render-only (one truncating line, one
-		// fixed 14px chip slot).
-		//
-		// The summary comes from the header's `inputSummary` — the whitelisted short
-		// keys the server projects INSIDE SQLite — through a resolver the shell injects
-		// (the pure adapter has no access to `getSummary`).
-		const recentCallSummaries = namedRecentCalls.map(
-			(call) =>
-				ctx.resolveSubagentRecentSummary?.(call.toolName as string, call.inputSummary) ?? null,
-		);
-		const recentCallCategories = namedRecentCalls.map(
-			(call) => ctx.resolveToolCategory?.(call.toolName as string) ?? null,
-		);
-		// The conclusion body, via the SHARED extraction rule. A bare `typeof === "string"`
-		// check used to live here, which dropped the result entirely for the ~43% of rows
-		// whose output is the runner's `{_text, _metadata}` envelope — a finished subagent
-		// card with a blank conclusion. `withFullOutput` so a projected/truncated body is
-		// replaced by the real one once the shell fetched it.
-		const resultBody = subagentResultText(withFullOutput(item, ctx));
-		const resultText = resultBody || undefined;
-		const isActive = !isTerminalStatus(item.tc.status);
-		// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
-		// derivations). prompt/isBackground/agentType live on inputJson; Send tools
-		// carry the prompt on `message` and imply agentType "send".
-		//
-		// `withFullInput` so a prompt the server had to truncate is replaced by the
-		// real body once the shell fetched it (the fetch itself is gated on the
-		// reader OPENING the prompt — see the shell's promptExpandedToolUseIds).
-		const input = asObject(withFullInput(item, ctx));
-		const isSend = item.tc.toolName === "Send";
-		// `readLeafString` (not readNonEmptyString): a truncated prompt arrives as a
-		// `{_truncated, preview}` wrapper, which a plain string check would drop —
-		// making the whole prompt block disappear instead of showing its preview.
-		const promptField = readLeafString(input, "prompt");
-		const prompt = promptField ?? (isSend ? readLeafString(input, "message") : undefined);
-		// Whether that prompt is still only a PREVIEW. Drives the shell's on-demand
-		// fetch; height-neutral (the prompt body is capped either way).
-		const promptTruncated =
-			hasTruncatedLeaf(input.prompt) || (isSend && hasTruncatedLeaf(input.message));
-		const isBackground = input.background === true || input.run_in_background === true;
-		const agentType =
-			readNonEmptyString(input, "subagent_type") ?? (isSend ? "send" : item.tc.toolName);
-		// Thinking-effort badge. Same precedence as SubagentCard.tsx minus the live
-		// narrator query (which the adapter has no access to): the activity summary
-		// already carries the child narrator's EFFECTIVE tier, so it wins over the
-		// requested tool input. `reasoning_effort` is the canonical persisted key;
-		// `reasoningEffort` covers legacy/alternate Agent callers.
-		const reasoningEffort =
-			nonEmptyTrimmed(activity?.reasoningEffort) ??
-			readNonEmptyString(input, "reasoning_effort") ??
-			readNonEmptyString(input, "reasoningEffort");
-		// Description mirrors chunk's `input.description ?? (prompt-derived)`; falls
-		// back to the generic tool summary when neither is present.
-		const description =
-			readNonEmptyString(input, "description") ??
-			(prompt ? (prompt.includes("\n") ? prompt.slice(0, 80) : prompt) : toolSummary(item.tc, ctx));
+		const data = buildSubagentCardData(item, ctx);
 		return {
 			kind: "subagent-card",
 			key,
 			// Pairs this card with the folded row it becomes at low LOD (ElementSpec.unitId).
 			unitId: key,
-			data: {
-				agentType,
-				description,
-				// Identity passthrough (height-neutral) so the shell can bind the
-				// on-demand prompt fetch to this exact tool call.
-				...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : {}),
-				model: activity?.model ?? undefined,
-				...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-				...(prompt === undefined ? {} : { prompt }),
-				// The prompt block's own fold state (independent of the card's), so the
-				// measure layer reserves the body only when the reader opened it.
-				...(prompt !== undefined && ctx.isPromptOpen?.(key) === true ? { promptOpen: true } : {}),
-				// Still a preview → the shell may fetch the real body while it is open.
-				...(promptTruncated ? { promptTruncated: true } : {}),
-				isBackground,
-				recentCallCount: recentCallNames.length,
-				recentCallNames,
-				recentCallSummaries,
-				recentCallCategories,
-				// Mirrors SubagentCard: the recent-calls header offers "open full
-				// session" only once the activity summary knows the child narrator.
-				// Height-bearing (compact-xs button row > plain xs text row).
-				hasRecentCallsButton: !!nonEmptyTrimmed(activity?.subagentNarratorId),
-				isTerminal: isTerminalStatus(item.tc.status),
-				isActive,
-				// Raw terminal status → render-only status glyph (success/fail/cancelled).
-				// Height-neutral (a single 12px header slot).
-				status: item.tc.status ?? undefined,
-				// ── Header timing (height-neutral; feeds the portaled popover) ────────
-				// The card's own stamps, plus one entry per recent-call ROW positionally
-				// aligned with `recentCallNames`. SubagentCard renders a ToolTimingArea in
-				// both places (SubagentCard.tsx:623 / :684); without these the vlist copy
-				// had no timing at all.
-				timing: cardTiming(item.tc),
-				recentCallTimings,
-				resultText,
-				resultPreview: resultText?.slice(0, 120),
-			},
+			data,
 			opts: {
 				...opts,
-				isActive,
+				isActive: data.isActive,
 				inRun: runContext.inRun,
 				isLast: runContext.isLast,
 			},
@@ -2850,6 +2758,138 @@ function adaptToolItemFull(
 		unitId: key,
 		data: buildToolCardData(item, ctx, runContext, hasPendingPermission),
 		opts,
+	};
+}
+
+/**
+ * The complete `SubagentCardData` payload for ONE subagent tool call.
+ *
+ * Extracted from `adaptToolItemFull` so a folded trace row can build the very
+ * same card when the reader drills into it (see `toolTraceItem`'s `expanded`
+ * path). Keeping one constructor is what guarantees the drilled-in card measures
+ * and paints identically to the standalone card at high LOD — a second, parallel
+ * derivation is how the two would silently diverge.
+ */
+function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
+	// Map height-relevant SubagentCardData fields (NOT `status` — that field
+	// doesn't exist on SubagentCardData; it uses isTerminal + recentCallCount).
+	const key = toolItemKey(item);
+	const activity = item.tc._subagentActivity;
+	const recentCalls = activity?.latestToolCalls ?? [];
+	// Names and timings are derived from the SAME filtered list so index i lines
+	// up in both arrays — the renderer pairs them positionally per row.
+	const namedRecentCalls = recentCalls
+		.filter(
+			(call): call is Record<string, unknown> =>
+				call != null &&
+				typeof call === "object" &&
+				typeof (call as { toolName?: unknown }).toolName === "string" &&
+				((call as { toolName: string }).toolName?.length ?? 0) > 0,
+		)
+		.slice(0, 3);
+	const recentCallNames = namedRecentCalls.map((call) => call.toolName as string);
+	const recentCallTimings = namedRecentCalls.map((call) => ({
+		...(typeof call.status === "string" ? { status: call.status } : {}),
+		...recentCallTiming(call),
+	}));
+	// Row label detail + category chip. These rows are TRACE rows now, and a trace
+	// row says `Tool · summary` with a tinted category chip — the vlist copy used to
+	// show the bare tool name in a grey box, so the same child call read differently
+	// here than in the chunked card. Both are render-only (one truncating line, one
+	// fixed 14px chip slot).
+	//
+	// The summary comes from the header's `inputSummary` — the whitelisted short
+	// keys the server projects INSIDE SQLite — through a resolver the shell injects
+	// (the pure adapter has no access to `getSummary`).
+	const recentCallSummaries = namedRecentCalls.map(
+		(call) =>
+			ctx.resolveSubagentRecentSummary?.(call.toolName as string, call.inputSummary) ?? null,
+	);
+	const recentCallCategories = namedRecentCalls.map(
+		(call) => ctx.resolveToolCategory?.(call.toolName as string) ?? null,
+	);
+	// The conclusion body, via the SHARED extraction rule. A bare `typeof === "string"`
+	// check used to live here, which dropped the result entirely for the ~43% of rows
+	// whose output is the runner's `{_text, _metadata}` envelope — a finished subagent
+	// card with a blank conclusion. `withFullOutput` so a projected/truncated body is
+	// replaced by the real one once the shell fetched it.
+	const resultBody = subagentResultText(withFullOutput(item, ctx));
+	const resultText = resultBody || undefined;
+	const isActive = !isTerminalStatus(item.tc.status);
+	// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
+	// derivations). prompt/isBackground/agentType live on inputJson; Send tools
+	// carry the prompt on `message` and imply agentType "send".
+	//
+	// `withFullInput` so a prompt the server had to truncate is replaced by the
+	// real body once the shell fetched it (the fetch itself is gated on the
+	// reader OPENING the prompt — see the shell's promptExpandedToolUseIds).
+	const input = asObject(withFullInput(item, ctx));
+	const isSend = item.tc.toolName === "Send";
+	// `readLeafString` (not readNonEmptyString): a truncated prompt arrives as a
+	// `{_truncated, preview}` wrapper, which a plain string check would drop —
+	// making the whole prompt block disappear instead of showing its preview.
+	const promptField = readLeafString(input, "prompt");
+	const prompt = promptField ?? (isSend ? readLeafString(input, "message") : undefined);
+	// Whether that prompt is still only a PREVIEW. Drives the shell's on-demand
+	// fetch; height-neutral (the prompt body is capped either way).
+	const promptTruncated =
+		hasTruncatedLeaf(input.prompt) || (isSend && hasTruncatedLeaf(input.message));
+	const isBackground = input.background === true || input.run_in_background === true;
+	const agentType =
+		readNonEmptyString(input, "subagent_type") ?? (isSend ? "send" : item.tc.toolName);
+	// Thinking-effort badge. Same precedence as SubagentCard.tsx minus the live
+	// narrator query (which the adapter has no access to): the activity summary
+	// already carries the child narrator's EFFECTIVE tier, so it wins over the
+	// requested tool input. `reasoning_effort` is the canonical persisted key;
+	// `reasoningEffort` covers legacy/alternate Agent callers.
+	const reasoningEffort =
+		nonEmptyTrimmed(activity?.reasoningEffort) ??
+		readNonEmptyString(input, "reasoning_effort") ??
+		readNonEmptyString(input, "reasoningEffort");
+	// Description mirrors chunk's `input.description ?? (prompt-derived)`; falls
+	// back to the generic tool summary when neither is present.
+	const description =
+		readNonEmptyString(input, "description") ??
+		(prompt ? (prompt.includes("\n") ? prompt.slice(0, 80) : prompt) : toolSummary(item.tc, ctx));
+	return {
+		agentType,
+		description,
+		// Identity passthrough (height-neutral) so the shell can bind the
+		// on-demand prompt fetch to this exact tool call.
+		...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : {}),
+		model: activity?.model ?? undefined,
+		...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+		...(prompt === undefined ? {} : { prompt }),
+		// The prompt block's own fold state (independent of the card's), so the
+		// measure layer reserves the body only when the reader opened it. The key is
+		// the SAME `tool-<toolUseId>` the standalone card uses, so a prompt the reader
+		// opened inside a drilled-in row is still open after an LOD change.
+		...(prompt !== undefined && ctx.isPromptOpen?.(key) === true ? { promptOpen: true } : {}),
+		// Still a preview → the shell may fetch the real body while it is open.
+		...(promptTruncated ? { promptTruncated: true } : {}),
+		isBackground,
+		recentCallCount: recentCallNames.length,
+		recentCallNames,
+		recentCallSummaries,
+		recentCallCategories,
+		// Mirrors SubagentCard: the recent-calls header offers "open full
+		// session" only once the activity summary knows the child narrator.
+		// Height-bearing (compact-xs button row > plain xs text row).
+		hasRecentCallsButton: !!nonEmptyTrimmed(activity?.subagentNarratorId),
+		isTerminal: isTerminalStatus(item.tc.status),
+		isActive,
+		// Raw terminal status → render-only status glyph (success/fail/cancelled).
+		// Height-neutral (a single 12px header slot).
+		status: item.tc.status ?? undefined,
+		// ── Header timing (height-neutral; feeds the portaled popover) ────────
+		// The card's own stamps, plus one entry per recent-call ROW positionally
+		// aligned with `recentCallNames`. SubagentCard renders a ToolTimingArea in
+		// both places (SubagentCard.tsx:623 / :684); without these the vlist copy
+		// had no timing at all.
+		timing: cardTiming(item.tc),
+		recentCallTimings,
+		resultText,
+		resultPreview: resultText?.slice(0, 120),
 	};
 }
 
@@ -3262,14 +3302,23 @@ function toolTraceItem(
 		// pending-permission flag is false by construction here — the drilled-in card
 		// deliberately hosts no permission form.
 		...(expanded && canDrillDown
-			? {
-					card: buildToolCardData(
-						item,
-						ctx,
-						{ inRun: false, isLast: true, isSoleSubagent: false },
-						ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false,
-					),
-				}
+			? item.isSubagent
+				? {
+						// A subagent row drills into its SUBAGENT card (badge row +
+						// recent calls + prompt fold + result), not the generic tool
+						// card — the same payload the L3+ card carries, from the same
+						// constructor.
+						card: buildSubagentCardData(item, ctx),
+						cardKind: "subagent-card" as const,
+					}
+				: {
+						card: buildToolCardData(
+							item,
+							ctx,
+							{ inRun: false, isLast: true, isSoleSubagent: false },
+							ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false,
+						),
+					}
 			: {}),
 	};
 }
@@ -3576,7 +3625,10 @@ function adaptActivityItems(
 			...item,
 			msg: item.msg,
 			blockIndex: item.blockIndex ?? 0,
-			isSubagent: false,
+			// Carried in from the render-unit fold: a subagent row must drill into a
+			// subagent CARD, and hard-coding `false` here is what made every folded
+			// Agent call expand into the generic tool card at L1/L2.
+			isSubagent: item.isSubagent === true,
 			tc: item.tc,
 		};
 		// The row's FINAL key, resolved BEFORE the expansion lookup.

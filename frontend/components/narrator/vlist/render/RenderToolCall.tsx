@@ -91,6 +91,7 @@ import {
 	DETAIL_BOX_PADDING_X,
 	DETAIL_BOX_PADDING_Y,
 	DETAIL_CONTENT_LINE_HEIGHT,
+	DETAIL_LABEL_CHROME_Y,
 	DETAIL_TOP_MARGIN,
 	ENTRY_SNIPPET_MAX_LINES,
 	earliestToolStartMs,
@@ -132,7 +133,7 @@ import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
 import { TokenFlowText, TokenText } from "./TokenLines";
-import { VListImage, type VListImageRef } from "./vlist-image";
+import { readExactDisplayBox, VListImage, type VListImageRef } from "./vlist-image";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // i18n-facing labels, injected by the dispatch/registry layer (no i18n import
@@ -2023,7 +2024,18 @@ function SectionBody({
 		const media =
 			block?.kind === "fixed" ? (block.data?.media as VListImageRef | undefined) : undefined;
 		if (media) {
-			return <VListImage media={media} narratorId={narratorId} maxHeight={part.bodyHeight} />;
+			// The measure layer reserved either the aspect-fitted rectangle or a
+			// fixed-height placeholder; paint the same one it reserved (see
+			// readExactDisplayBox).
+			const exact = block?.kind === "fixed" ? readExactDisplayBox(block.data) : null;
+			return (
+				<VListImage
+					media={media}
+					narratorId={narratorId}
+					maxHeight={part.bodyHeight}
+					{...(exact ?? {})}
+				/>
+			);
 		}
 		const text =
 			block?.kind === "fixed" && typeof block.data?.text === "string" ? block.data.text : null;
@@ -2524,7 +2536,8 @@ function DetailRegion({
 								<VListImage
 									media={media}
 									narratorId={narratorId}
-									maxHeight={bf.height - (hasLabel ? 19 : 0)}
+									maxHeight={bf.height - (hasLabel ? DETAIL_LABEL_CHROME_Y : 0)}
+									{...(readExactDisplayBox(block.data) ?? {})}
 								/>
 							) : (
 								<VListContentViewHost target={viewTarget} controls={viewControls}>
@@ -2547,8 +2560,9 @@ function DetailRegion({
 											...(bodyWrapped
 												? { whiteSpace: "pre-wrap", wordBreak: "break-word" }
 												: { whiteSpace: "pre" }),
-											// The scroll body fills the block minus the label chrome.
-											height: bf.height - (hasLabel ? 19 : 0),
+											// The scroll body fills the block minus the label chrome (the
+											// same amount `cappedBodyHeight` added for the label row).
+											height: bf.height - (hasLabel ? DETAIL_LABEL_CHROME_Y : 0),
 										}}
 									>
 										{/* Real body text (code/command/diff/output). Diffs get +/- line

@@ -13,12 +13,15 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
+import type { MeasuredSubagent } from "../measure/measure-subagent";
+import type { MeasuredToolCall } from "../measure/measure-tool-call";
 import {
 	type MeasuredTraceRow,
 	measureActivityTrace,
 	TRACE_ROW_HEIGHT,
 } from "../measure/measure-tool-run";
 import { installCanvasStub } from "../measure/test-canvas-stub";
+import { RenderSubagent } from "./RenderSubagent";
 import { RenderToolCall } from "./RenderToolCall";
 import { RenderToolRun } from "./RenderToolRun";
 
@@ -60,9 +63,15 @@ function traceRows(cardOnIndex?: number) {
 	}));
 }
 
-/** The shell's `rowCard` slot, reduced to what this test needs. */
+/**
+ * The shell's `rowCard` slot, reduced to what this test needs. `cardMeasured` is a
+ * union (a subagent row drills into its own card), so the tool branch narrows on
+ * the row's `cardKind` discriminant — exactly as the shell does.
+ */
 const rowCard = (row: MeasuredTraceRow) =>
-	row.cardMeasured ? <RenderToolCall measured={row.cardMeasured} /> : null;
+	row.cardMeasured && row.cardKind === "tool-call" ? (
+		<RenderToolCall measured={row.cardMeasured as MeasuredToolCall} />
+	) : null;
 
 function render(node: React.ReactNode): Element {
 	return parse(
@@ -147,5 +156,99 @@ describe("RenderToolRun — trace row drill-down", () => {
 		expect(drill.querySelectorAll("svg").length).toBeGreaterThan(
 			plain.querySelectorAll("svg").length,
 		);
+	});
+});
+
+/**
+ * An AGENT row drills into the SUBAGENT card — the agent format, not a tool card.
+ *
+ * The reported bug: at a low LOD, opening a folded front-desk Agent call painted the
+ * generic tool card (title + raw input JSON + output) instead of the badge row /
+ * description / recent calls / prompt fold the same call shows as a card at L3+.
+ * Nothing threw, because a tool card renders whatever payload it is handed — so the
+ * only way to catch it is to assert the SHAPE that reaches the DOM.
+ */
+describe("RenderToolRun — a subagent row drills into the agent card", () => {
+	const SUBAGENT_CARD = {
+		agentType: "explore",
+		description: "trace the vlist path",
+		prompt: "look at the fold",
+		toolUseId: "tu-a",
+		isTerminal: true,
+		isActive: false,
+		status: "success",
+		recentCallCount: 2,
+		recentCallNames: ["Read", "Grep"],
+		recentCallSummaries: ["loop.ts", "cardKind"],
+		recentCallCategories: ["read", "search"],
+		hasRecentCallsButton: true,
+		resultText: "found the dispatch site",
+	};
+
+	const subagentRow = () => [
+		{
+			title: "Agent · trace the vlist path",
+			hasIcon: true,
+			key: "tool-tu-a",
+			canDrillDown: true,
+			card: SUBAGENT_CARD,
+			cardKind: "subagent-card" as const,
+		},
+	];
+
+	/**
+	 * The shell's `rowCard` slot for both kinds, dispatching on `cardKind` exactly as
+	 * `PretextExactMessageList` does — the point being that the row hands the slot a
+	 * measured SUBAGENT card, so a shell that dispatches gets the agent format.
+	 */
+	const dispatchingRowCard = (row: MeasuredTraceRow) => {
+		if (!row.cardMeasured) return null;
+		if (row.cardKind === "subagent-card") {
+			return (
+				<RenderSubagent
+					measured={row.cardMeasured as MeasuredSubagent}
+					description={SUBAGENT_CARD.description}
+					agentType={SUBAGENT_CARD.agentType}
+					promptText={SUBAGENT_CARD.prompt}
+					recentCallNames={SUBAGENT_CARD.recentCallNames}
+					status={SUBAGENT_CARD.status}
+				/>
+			);
+		}
+		return <RenderToolCall measured={row.cardMeasured as MeasuredToolCall} />;
+	};
+
+	it("paints the agent card's own chrome (badge + recent calls + prompt fold)", () => {
+		const measured = measureActivityTrace(subagentRow(), WIDTH, { expandedIndices: [0] }, {}, 2);
+		const root = render(<RenderToolRun measured={measured} rowCard={dispatchingRowCard} />);
+		// The agent-type badge and the description are the card's header.
+		expect(root.textContent).toContain("explore");
+		expect(root.textContent).toContain("trace the vlist path");
+		// Recent calls read as trace rows (`Tool · summary`), the subagent card's
+		// signature region — a tool card has no such thing.
+		expect(root.textContent).toContain("Recent calls");
+		expect(root.textContent).toContain("Read · loop.ts");
+		// The prompt is behind its own fold row, not dumped as an input JSON blob.
+		expect(root.textContent).toContain("Prompt");
+		expect(root.textContent).not.toContain("look at the fold");
+		expect(root.querySelectorAll('[data-testid="subagent-activity"]').length).toBe(2);
+	});
+
+	it("occupies exactly the height the measure layer reserved for the card", () => {
+		const measured = measureActivityTrace(subagentRow(), WIDTH, { expandedIndices: [0] }, {}, 2);
+		const root = render(<RenderToolRun measured={measured} rowCard={dispatchingRowCard} />);
+		expect(declaresHeight(root, measured.height)).toBe(true);
+		// The row block IS the card, so the card's own height is declared too.
+		const card = measured.rows[0]?.cardMeasured;
+		expect(card?.height).toBeGreaterThan(TRACE_ROW_HEIGHT);
+		expect(measured.rows[0]?.blockHeight).toBeCloseTo(card?.height ?? 0, 5);
+	});
+
+	it("reveals nothing while the row is folded", () => {
+		const measured = measureActivityTrace(subagentRow(), WIDTH, {}, {}, 2);
+		const root = render(<RenderToolRun measured={measured} rowCard={dispatchingRowCard} />);
+		expect(root.textContent).toContain("Agent · trace the vlist path");
+		expect(root.textContent).not.toContain("Recent calls");
+		expect(root.textContent).not.toContain("Prompt");
 	});
 });
