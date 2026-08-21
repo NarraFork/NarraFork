@@ -243,6 +243,7 @@ export function renderElement(
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					animateStreaming={extra.animateStreaming as boolean | undefined}
 					animKeyBase={extra.animKeyBase as string | undefined}
+					animScope={extra.animScope as string | undefined}
 				/>
 			);
 		case "message-bubble":
@@ -286,6 +287,7 @@ export function renderElement(
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					animateStreaming={extra.animateStreaming as boolean | undefined}
 					animKeyBase={extra.animKeyBase as string | undefined}
+					animScope={extra.animScope as string | undefined}
 				/>
 			);
 		case "media":
@@ -317,6 +319,7 @@ export function renderElement(
 					data={extra.data as never}
 					actions={extra.specCarryoverActions as never}
 					errorActions={extra.errorNoticeActions as never}
+					injectionGuardActions={extra.injectionGuardActions as never}
 				/>
 			);
 		case "knowledge-hint":

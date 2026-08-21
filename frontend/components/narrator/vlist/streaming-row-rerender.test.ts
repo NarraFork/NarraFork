@@ -46,11 +46,18 @@ const SHELL = readFileSync(join(import.meta.dir, "PretextExactMessageList.tsx"),
  *   concise body  → `\n\t\t[deps],`   (an arrow returning an expression directly)
  *
  * Whichever comes FIRST after the declaration is this hook's own.
+ *
+ * Both patterns are matched at ANY indentation depth. The concise-body pattern used
+ * to be the literal `"\n\t\t["` — exactly two tabs — so re-indenting the shell made
+ * it miss, the scan fell through to the next hook's `}, [`, and the guard reported
+ * `[editingRow, renderItems]` for a callback that has neither. That is the very
+ * failure this comment already warned about, reintroduced through the indentation.
  */
 function depsRange(start: number): { open: number; close: number } {
-	const candidates = [SHELL.indexOf("}, [", start), SHELL.indexOf("\n\t\t[", start)].filter(
-		(at) => at > start,
-	);
+	const rest = SHELL.slice(start);
+	const candidates = [rest.indexOf("}, ["), rest.search(/\n\t+\[/)]
+		.filter((at) => at > 0)
+		.map((at) => start + at);
 	expect(candidates.length).toBeGreaterThan(0);
 	const at = Math.min(...candidates);
 	const open = SHELL.indexOf("[", at);

@@ -64,6 +64,8 @@
 	"compactFailed": "压缩失败",
 	"compactFailedDesc": "消息压缩失败，请重试。",
 	"retryCompact": "重试压缩",
+	"saveCompactSummaryFailed": "摘要保存失败",
+	"saveCompactSummaryFailedDesc": "编辑后的摘要未保存。文本仍在编辑器中，可重试。",
 	"retryCompactFailed": "重试压缩失败",
 	"compactAttempts": "尝试记录",
 	"compactAttempt": "第 {{attempt}} 次 · {{model}}",
@@ -601,6 +603,9 @@
 	"userMessagePreviewTruncated": "消息预览已截断以保持界面响应。",
 	"deleteMessageFailed": "删除失败",
 	"deleteMessageFailedDesc": "消息删除失败，请重试。",
+	"interruptGuard": {
+		"dismiss": "删除此提醒"
+	},
 	"compactUnsupportedTitle": "压缩不可用",
 	"compactUnsupported": "当前后端/运行时不支持消息压缩。",
 	"compactFallbackSummaryTitle": "确定性压缩摘要",
@@ -650,6 +655,17 @@
 	"contextStaleHint": "压缩、清空或删除消息后，上下文展示目前不准确，下次请求服务器后才可获知准确数值。",
 	"estimated": "估算",
 	"quotaBalance": "API 余额：{{balance}}",
+	"kimi": {
+		"fiveHourShort": "5h {{percent}}%",
+		"fiveHourRatio": "5h {{used}}/{{limit}}",
+		"unavailable": "Kimi 用量不可用",
+		"window5h": "5 小时限制",
+		"windowWeekly": "周限制",
+		"windowMonthly": "月限制",
+		"windowLine": "{{label}}：已用 {{used}}/{{limit}}",
+		"resetSuffix": "，{{time}} 重置",
+		"fetchError": "用量获取失败：{{error}}"
+	},
 	"recharge": {
 		"title": "NUG 充值",
 		"open": "充值",
@@ -1113,7 +1129,8 @@
 			"spec_goal_added": "目标登记",
 			"spec_fork_carryover": "大纲继承",
 			"spec_context_cleared": "上下文已清空",
-			"review_feedback": "代码评审"
+			"review_feedback": "代码评审",
+			"interrupt_task_guard": "中断任务提醒"
 		},
 		"cadence": {
 			"everyNTools": "每 {{n}} 次工具调用"

@@ -31,6 +31,7 @@ import {
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
 import { DiffWordTokens } from "@frontend/components/narrator/DiffWordTokens";
+import { findVerticalScrollParent } from "@frontend/hooks/scroll-parent";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import type { ShikiToken } from "@frontend/lib/shiki-token-cache";
@@ -79,7 +80,7 @@ import {
 	IconTool,
 	IconX,
 } from "@tabler/icons-react";
-import type { ComponentType, ReactNode } from "react";
+import type { ComponentType, ReactNode, Ref } from "react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
 import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
@@ -1438,8 +1439,15 @@ const DIFF_COLORS = {
  * measure ALREADY classified as overflowing. A short diff (the case where the
  * height is the exact row count) is never truncated.
  *
- * The rows past the limit are still reachable: the detail's plain `text` is the
- * unified-diff copy source, and the classic card renders the full body.
+ * The rows past the INITIAL budget are not unreachable: the truncation notice at
+ * the end of the painted window doubles as a scroll sentinel — each time the
+ * reader scrolls it into view, `useDiffRowReveal` grows the window by one base
+ * budget until every row is painted. That is height-neutral by construction (see
+ * the height-safety paragraph: a truncated body's box is already exactly `cap`,
+ * so extra rows only extend the scrollable content of a fixed box), and it is a
+ * user action, the same gate the full-payload auto-fetch uses. The detail's
+ * plain `text` remains the unified-diff copy source, and the fullscreen viewer
+ * still shows the whole body in one step.
  */
 const DIFF_ROW_OVERSCAN_SCREENS = 4;
 /** Fallback visible-row estimate when the cap did not reach the render layer. */
@@ -1479,6 +1487,65 @@ function diffRenderRowLimit(cap: number | undefined): number {
 	return Math.max(budget, cappedUsefulLines(cap));
 }
 
+/**
+ * Progressive reveal for a row-budget-truncated diff body.
+ *
+ * The initial paint stops at `diffRenderRowLimit(cap)`; the truncation notice at
+ * the end of the painted window doubles as the sentinel. Each time the reader
+ * scrolls it into the box's visible region the window grows by one base budget,
+ * until no rows remain hidden — the "auto-load on scroll" the capped boxes
+ * already promise for server-side prefixes (`useAutoLoadOnScroll`), here served
+ * from rows that are already local.
+ *
+ * Height-neutral: the notice only ever appears on a body the measure layer
+ * classified as overflowing, whose box height is exactly `cap` (see
+ * `diffRenderRowLimit`), so painting more rows extends the scrollable content of
+ * a FIXED box and cannot move any measured geometry.
+ *
+ * One batch per reach: the sentinel sits at the end of the painted content, so a
+ * reveal pushes it below the visible region again; the next batch waits for the
+ * next scroll. Component-local by design — leaving the virtualization window
+ * resets the window to the initial budget, and the same scroll gesture re-veals
+ * it (the rows are local; nothing has to be re-fetched).
+ */
+function useDiffRowReveal(baseRowLimit: number, rowCount: number) {
+	const [extraRows, setExtraRows] = useState(0);
+	const rowLimit = Math.min(rowCount, baseRowLimit + extraRows);
+	const hidden = rowCount - rowLimit;
+	const sentinelRef = useRef<HTMLDivElement | null>(null);
+	useEffect(() => {
+		const node = sentinelRef.current;
+		if (!node || hidden <= 0) return;
+		// Test DOMs without an observer keep the pre-reveal behaviour: the notice
+		// stays a static footer.
+		if (typeof IntersectionObserver !== "function") return;
+		// `root` is the capped box, NOT the default (the viewport).
+		//
+		// This is what makes "one batch per reach" true. An observer without a root
+		// ignores the clipping done by ancestor `overflow`, so a 200px box sitting
+		// fully inside the viewport reports its footer as intersecting even though the
+		// box has scrolled nowhere and the reader cannot see it — every batch fires
+		// immediately, in a chain, until all 500 rows are painted. That defeats both
+		// the node ceiling and the user-action gate the reveal is built on.
+		//
+		// Resolved from the DOM rather than threaded down as a ref: the sentinel sits
+		// several components below whoever owns the scrollport, and the box that
+		// actually scrolls differs between the inline detail, the drilldown, and the
+		// fullscreen viewer. A null root (no scrollable ancestor found — the body fits,
+		// so nothing is hidden anyway) falls back to viewport semantics.
+		const observer = new IntersectionObserver(
+			(entries) => {
+				if (!entries.some((entry) => entry.isIntersecting)) return;
+				setExtraRows((prev) => prev + baseRowLimit);
+			},
+			{ root: findVerticalScrollParent(node.parentElement) },
+		);
+		observer.observe(node);
+		return () => observer.disconnect();
+	}, [hidden, baseRowLimit]);
+	return { rowLimit, hidden, sentinelRef };
+}
+
 /** Fill the single `{count}` placeholder of the truncation notice template. */
 function formatDiffTruncated(template: string, hidden: number): string {
 	return template.includes("{count}")
@@ -1487,9 +1554,20 @@ function formatDiffTruncated(template: string, hidden: number): string {
 }
 
 /** The "N rows are not painted" footer inside a truncated diff body. */
-function DiffTruncatedNotice({ hidden, label }: { hidden: number; label: string }) {
+function DiffTruncatedNotice({
+	hidden,
+	label,
+	ref,
+}: {
+	hidden: number;
+	label: string;
+	/** Progressive-reveal hook: the sentinel observer watches this node. */
+	ref?: Ref<HTMLDivElement>;
+}) {
 	return (
-		<div style={{ opacity: 0.6, fontStyle: "italic" }}>{formatDiffTruncated(label, hidden)}</div>
+		<div ref={ref} style={{ opacity: 0.6, fontStyle: "italic" }}>
+			{formatDiffTruncated(label, hidden)}
+		</div>
 	);
 }
 
@@ -1538,12 +1616,12 @@ function DiffBody({
 	truncatedLabel?: string | undefined;
 }) {
 	const colors = DIFF_COLORS;
-	const rowLimit = diffRenderRowLimit(cap);
+	const baseRowLimit = diffRenderRowLimit(cap);
+	const { rowLimit, hidden, sentinelRef } = useDiffRowReveal(baseRowLimit, lines.length);
 	const painted = useMemo(
 		() => (lines.length > rowLimit ? lines.slice(0, rowLimit) : lines),
 		[lines, rowLimit],
 	);
-	const hidden = lines.length - painted.length;
 	// Shiki sees the row CONTENT only (no markers, no gutter), so the grammar gets
 	// plausible source. Only the painted rows are highlighted — tokens for rows
 	// that are never drawn are pure waste.
@@ -1606,7 +1684,11 @@ function DiffBody({
 				);
 			})}
 			{hidden > 0 ? (
-				<DiffTruncatedNotice hidden={hidden} label={truncatedLabel ?? DEFAULT_DIFF_TRUNCATED} />
+				<DiffTruncatedNotice
+					hidden={hidden}
+					label={truncatedLabel ?? DEFAULT_DIFF_TRUNCATED}
+					ref={sentinelRef}
+				/>
 			) : null}
 		</>
 	);
@@ -1664,13 +1746,13 @@ function DiffTextFallback({
 }) {
 	// Same row budget as the structured path: the fallback had the identical
 	// unbounded-node problem, and the box height is likewise measure-owned.
-	const rowLimit = diffRenderRowLimit(cap);
+	const baseRowLimit = diffRenderRowLimit(cap);
 	const all = useMemo(() => text.split("\n"), [text]);
+	const { rowLimit, hidden, sentinelRef } = useDiffRowReveal(baseRowLimit, all.length);
 	const lines = useMemo(
 		() => (all.length > rowLimit ? all.slice(0, rowLimit) : all),
 		[all, rowLimit],
 	);
-	const hidden = all.length - lines.length;
 	const source = useMemo(
 		() => lines.map((line) => (/^[+\- ]/.test(line) ? line.slice(1) : line)).join("\n"),
 		[lines],
@@ -1708,7 +1790,11 @@ function DiffTextFallback({
 				);
 			})}
 			{hidden > 0 ? (
-				<DiffTruncatedNotice hidden={hidden} label={truncatedLabel ?? DEFAULT_DIFF_TRUNCATED} />
+				<DiffTruncatedNotice
+					hidden={hidden}
+					label={truncatedLabel ?? DEFAULT_DIFF_TRUNCATED}
+					ref={sentinelRef}
+				/>
 			) : null}
 		</>
 	);

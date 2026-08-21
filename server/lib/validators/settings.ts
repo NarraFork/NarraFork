@@ -214,6 +214,19 @@ export const recentTabSchema = z.object({
 	lastVisitedAt: z.number(),
 	pinned: z.boolean().optional(),
 	isScheduled: z.boolean().optional(),
+	/**
+	 * Hand-arranged position inside a directory group.
+	 *
+	 * Accepted so an undo-restore can carry it back: the client already sends it
+	 * (`toPersistedRecentTab`) and the service already honours it
+	 * (`dirSortOrderFor`), but Zod strips unknown keys — so the snapshot path
+	 * silently flattened every hand-arranged group back to recency order, which is
+	 * exactly what the client-side comment promised it would not do.
+	 *
+	 * Bounded by the same limit as the reorder endpoint's key list: a position is an
+	 * index into one group's members, which cannot exceed the stored tab count.
+	 */
+	dirSortOrder: z.number().int().min(0).max(RECENT_TABS_STORAGE_LIMIT).optional(),
 });
 
 export const upsertRecentTabSchema = recentTabSchema.extend({
@@ -262,6 +275,18 @@ export const pinRecentTabSchema = z.object({
 	key: z.string().min(1).max(100),
 	/** Whether to pin or unpin */
 	pinned: z.boolean(),
+});
+
+/**
+ * Member order for ONE directory group in the sidebar's aggregated view.
+ *
+ * Only `dir_sort_order` is written; the flat order is untouched (see
+ * `setRecentTabDirectoryOrder`). Bounded by the storage limit because a group cannot
+ * contain more members than the user has tabs.
+ */
+export const setRecentTabDirectoryOrderSchema = z.object({
+	/** Tab keys ("type:id") in the desired top-to-bottom order. */
+	keys: z.array(z.string().min(1).max(100)).min(1).max(RECENT_TABS_STORAGE_LIMIT),
 });
 
 export const clearRecentTabsSchema = z.object({

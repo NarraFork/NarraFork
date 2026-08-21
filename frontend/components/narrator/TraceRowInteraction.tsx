@@ -226,7 +226,7 @@ export function TraceRowInteraction({
 	const sessionNarratorId = tool?.subagentNarratorId ?? tool?.awaitAgentNarratorId;
 	const canViewSession = !!(sessionNarratorId && onViewSubagentSession);
 	// Background lifecycle actions only ever apply to a real child narrator, and
-	// only while it is still running — same gating as SubagentCard's menu.
+	// only while it is still running (the gating the chunked subagent menu used).
 	const childNarratorId = tool?.subagentNarratorId;
 	const canDetach = !!(
 		childNarratorId &&

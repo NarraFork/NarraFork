@@ -16,8 +16,15 @@
 	}
 }
 
+/* Duration is user-configurable (Settings → Appearance). AppRootLayout writes
+   --nf-blur-in-duration onto <html> from `narrafork_blur_in_ms`; the fallback
+   here is the same 400ms default, so a browser with nothing stored — or one
+   rendering before that effect runs — looks unchanged.
+
+   A duration of 0 makes the animation a no-op in one frame, which is how the
+   slider expresses "instant" without needing a separate switch. */
 :root[data-advanced-anim="true"] .nf-blur-in-enter {
-	animation: nf-blur-in 400ms ease-out both;
+	animation: nf-blur-in var(--nf-blur-in-duration, 400ms) ease-out both;
 	transform-origin: center top;
 	will-change: opacity, filter, transform;
 }

@@ -21,7 +21,6 @@ import {
 	Menu,
 	Modal,
 	NavLink,
-	Switch,
 	Text,
 	Title,
 	Tooltip,
@@ -37,7 +36,6 @@ import {
 	IconClearAll,
 	IconDashboard,
 	IconFolders,
-	IconLayoutList,
 	IconList,
 	IconMessageChatbot,
 	IconMessageReport,
@@ -59,7 +57,7 @@ import { useTranslation } from "react-i18next";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
 import { useChatUnreadLive } from "../hooks/useChat";
 import { useKnowledgeNotifications } from "../hooks/useKnowledge";
-import { useLocalPref } from "../hooks/useLocalPref";
+import { useLocalNumberPref, useLocalPref } from "../hooks/useLocalPref";
 import { useNavLayout } from "../hooks/useNavLayout";
 import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
@@ -75,7 +73,6 @@ import {
 } from "../lib/app-shell-scroll";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../lib/history-state";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
-import { NARRATOR_VIRTUAL_LIST_INTERACTIVE } from "../lib/narrator-virtual-list";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "../lib/responsive";
 import {
@@ -94,6 +91,10 @@ import {
 	installAuthenticatedAppShellRootLock,
 	SAFE_AREA_INSET_TOP,
 } from "../lib/safe-area";
+// The streaming fade's duration lives in lib/, not next to the animation logic in
+// vlist/: publishing it from here must not statically import the virtual list,
+// which stays behind its dynamic-import boundary (vlist-isolation.guard.test.ts).
+import { setStreamAnimDurationMs } from "../lib/stream-anim-duration";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
@@ -313,9 +314,8 @@ function AuthenticatedLayout() {
 	const { tabs, clearTabs } = useRecentTabs();
 	const [oledMode] = useLocalPref("narrafork_oled");
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
-	const [narratorVirtualList, setNarratorVirtualList] = useLocalPref(
-		"narrafork_narrator_virtual_list",
-	);
+	const [blurInMs] = useLocalNumberPref("narrafork_blur_in_ms");
+	const [streamTokenMs] = useLocalNumberPref("narrafork_stream_token_ms");
 	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
 	useWakeLock(wakeLockEnabled);
 	useRecentTabKeyboardNav();
@@ -511,6 +511,34 @@ function AuthenticatedLayout() {
 		}
 	}, [advancedAnim]);
 
+	// Publish the configured blur-in duration as a CSS variable on <html>.
+	// Removing it (rather than writing the default) when advanced animation is
+	// off keeps the stylesheet's own fallback as the single source of the default.
+	useEffect(() => {
+		const html = document.documentElement;
+		if (advancedAnim) {
+			html.style.setProperty("--nf-blur-in-duration", `${blurInMs}ms`);
+		} else {
+			html.style.removeProperty("--nf-blur-in-duration");
+		}
+	}, [advancedAnim, blurInMs]);
+
+	// The streaming per-grapheme fade has TWO consumers that must agree: the CSS
+	// animation and the JS retirement clock in stream-token-anim, which decides
+	// when a grapheme's span may be folded back into static text. A JS duration
+	// SHORTER than the CSS one seals spans mid-animation and snaps the character
+	// to its end state — so both are written here, from one value, in one effect.
+	//
+	// The JS side is set first: it only takes effect on the next animation frame,
+	// while the CSS var applies to spans already on screen. Setting the (longer)
+	// clock before the (shorter) CSS duration can only over-retain spans for a
+	// frame, which is invisible; the reverse order truncates fades in flight.
+	useEffect(() => {
+		setStreamAnimDurationMs(streamTokenMs);
+		const html = document.documentElement;
+		html.style.setProperty("--nf-stream-token-duration", `${streamTokenMs}ms`);
+	}, [streamTokenMs]);
+
 	// Sync theme-color meta tag with actual background color
 	useEffect(() => {
 		const color = computedScheme === "dark" ? (oledMode ? "#000000" : "#1a1b1e") : "#ffffff";
@@ -632,27 +660,6 @@ function AuthenticatedLayout() {
 								{t("appName")}
 							</Title>
 						</Tooltip>
-						{NARRATOR_VIRTUAL_LIST_INTERACTIVE && (
-							<Tooltip
-								label={t("narratorVirtualListToggle")}
-								position="bottom"
-								withArrow
-								openDelay={400}
-							>
-								<Switch
-									size="sm"
-									checked={narratorVirtualList}
-									onChange={(e) => setNarratorVirtualList(e.currentTarget.checked)}
-									thumbIcon={
-										narratorVirtualList ? (
-											<IconLayoutList size={12} color="var(--mantine-color-indigo-6)" />
-										) : undefined
-									}
-									aria-label={t("narratorVirtualListToggle")}
-									style={{ flexShrink: 0 }}
-								/>
-							</Tooltip>
-						)}
 
 						<UpdateBadge />
 						{requestDumpEnabled && (

@@ -197,10 +197,33 @@ describe("error notice card — controls invoke the injected actions", () => {
 	it("keeps the card height identical with and without wired actions", () => {
 		// The controls occupy the width the measure layer already reserves
 		// (ERROR_RIGHT), so wiring them must not move a single row.
-		const bare = measureSystemTextCard("error", { text: ERROR_TEXT }, CONTENT_WIDTH);
-		const wired = measureSystemTextCard("error", { text: ERROR_TEXT }, CONTENT_WIDTH);
-		expect(wired.height).toBe(bare.height);
-		expect(wired.contentWidth).toBe(bare.contentWidth);
+		//
+		// Asserted against the RENDERED card, not by measuring the same data twice:
+		// `measureSystemTextCard` never sees `actions`, so comparing two identical
+		// calls is a tautology that stays green no matter what the render layer does
+		// to the controls. What can actually regress is the painted card outgrowing
+		// its measured box, so that is what is checked.
+		const wired = renderErrorCard({
+			onMarkRetryable: () => {},
+			onDismiss: () => {},
+			markRetryableLabel: "标记为可重试",
+		});
+		const bare = renderErrorCard();
+		expect(wired.measured.height).toBe(bare.measured.height);
+		expect(wired.measured.contentWidth).toBe(bare.measured.contentWidth);
+		// The card's own box is pinned to the measured height, and the controls live
+		// inside the body's first row — so the painted Paper must still claim exactly
+		// the height that was reserved.
+		const paperStyle = (root: HTMLElement) =>
+			// Whitespace-normalized: linkedom serializes inline styles without the space
+			// after the colon that a browser emits.
+			(
+				(root.querySelector("[class*=Paper]") as HTMLElement | null)?.getAttribute("style") ?? ""
+			).replace(/\s+/g, "");
+		expect(paperStyle(wired.container)).toContain(`height:${wired.measured.height}px`);
+		expect(paperStyle(bare.container)).toContain(`height:${bare.measured.height}px`);
+		wired.unmount();
+		bare.unmount();
 	});
 });
 
@@ -334,5 +357,98 @@ describe("error notice card — the provider fix is a labelled, measured button"
 		expect(container.querySelectorAll("button")).toHaveLength(0);
 		act(() => root.unmount());
 		container.remove();
+	});
+});
+
+/**
+ * The model probe, restored after the chunked error card was deleted.
+ *
+ * It shares the card's ONE optional button row with the provider fix, and each is
+ * independently eligible — which is exactly why the render layer binds handlers by
+ * `buttonIds` rather than by position. With index-based binding, a card that
+ * qualifies for only the probe would attach the FIX handler to it: a correct label
+ * over the wrong action, which no height or layout assertion can see.
+ */
+describe("error notice card — the model probe shares the fix's button row", () => {
+	const FIX_LABEL = "关闭图像生成并重试";
+	const TEST_LABEL = "测试当前模型";
+	const bothCtx = {
+		canOfferProviderFix: () => true,
+		canOfferModelTest: () => true,
+		labels: { disableImageGen: FIX_LABEL, testCurrentModel: TEST_LABEL },
+	};
+	const testOnlyCtx = {
+		canOfferModelTest: () => true,
+		labels: { testCurrentModel: TEST_LABEL },
+	};
+	const allHandlers = (calls: string[]): ErrorNoticeActions => ({
+		onMarkRetryable: () => calls.push("retry"),
+		onDismiss: () => calls.push("dismiss"),
+		onDisableImageGen: () => calls.push("fix"),
+		onTestModel: () => calls.push("test"),
+	});
+
+	it("routes the probe click to onTestModel when it is the ONLY eligible button", () => {
+		// The regression guard: `buttons[0]` here IS the probe, so positional binding
+		// would silently disable image generation instead of opening the dialog.
+		const calls: string[] = [];
+		const { buttons, unmount } = renderErrorCard(allHandlers(calls), undefined, testOnlyCtx);
+		const probe = buttons.find((b) => b.textContent?.includes(TEST_LABEL));
+		expect(probe).toBeDefined();
+		act(() => probe?.click());
+		expect(calls).toEqual(["test"]);
+		unmount();
+	});
+
+	it("keeps each button on its own handler when BOTH are eligible", () => {
+		const calls: string[] = [];
+		const { buttons, unmount } = renderErrorCard(allHandlers(calls), undefined, bothCtx);
+		act(() => buttons.find((b) => b.textContent?.includes(FIX_LABEL))?.click());
+		act(() => buttons.find((b) => b.textContent?.includes(TEST_LABEL))?.click());
+		expect(calls).toEqual(["fix", "test"]);
+		unmount();
+	});
+
+	it("adds ONE row for two buttons — they share it", () => {
+		// Both labels sit in a single Group, so the second must cost width, not height.
+		// A per-button row would put the lower one outside the measured box.
+		const both = renderErrorCard(undefined, undefined, bothCtx);
+		const one = renderErrorCard(undefined, undefined, testOnlyCtx);
+		const plain = renderErrorCard();
+		const c = MEASURE_SYSTEM_TEXT_CONSTANTS;
+		expect(one.measured.height - plain.measured.height).toBe(c.STACK_GAP + c.BUTTON_COMPACT_XS);
+		expect(both.measured.height).toBe(one.measured.height);
+		both.unmount();
+		one.unmount();
+		plain.unmount();
+	});
+
+	it("paints no probe when the shell says the error is not eligible", () => {
+		const calls: string[] = [];
+		const { buttons, container, unmount } = renderErrorCard(allHandlers(calls));
+		expect(buttons).toHaveLength(2); // the two always-present icon controls
+		expect(container.textContent).not.toContain(TEST_LABEL);
+		unmount();
+	});
+
+	it("falls back to the adapter's English label with no translation injected", () => {
+		const { container, unmount } = renderErrorCard(allHandlers([]), undefined, {
+			canOfferModelTest: () => true,
+		});
+		expect(container.textContent).toContain("Test current model");
+		unmount();
+	});
+
+	it("renders the probe DISABLED when the handler is missing", () => {
+		// Same honesty rule as the other controls: the adapter decided the button
+		// exists, so an unwired one must look unavailable rather than inert.
+		const { buttons, unmount } = renderErrorCard(
+			{ onMarkRetryable: () => {}, onDismiss: () => {} },
+			undefined,
+			testOnlyCtx,
+		);
+		const probe = buttons.find((b) => b.textContent?.includes(TEST_LABEL));
+		expect(probe?.hasAttribute("disabled")).toBe(true);
+		unmount();
 	});
 });

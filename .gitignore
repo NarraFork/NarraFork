@@ -54,3 +54,6 @@ mitm-dump/
 package-lock.json
 IMPROVEMENT-PLAN.md
 *.log
+
+# Dynamic Spec runtime state (per-narrator task queue / planning notes)
+spec/

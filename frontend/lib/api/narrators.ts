@@ -15,8 +15,6 @@ import type {
 	BlacklistCmd,
 	BlacklistDir,
 	BufferMessageSummary,
-	ChunkManifest,
-	ChunkRangeResult,
 	CommandBlacklistRuleInput,
 	CommandWhitelistRuleInput,
 	CompactMessageDetail,
@@ -492,21 +490,6 @@ export const narratorsApi = {
 	deleteNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`, { method: "DELETE" }),
 	markNarratorRead: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/mark-read`, { method: "PATCH" }),
-	// Chunk virtualization: lightweight manifest of structural fingerprints.
-	// `window` walks older bands: `limitChunks` caps the returned chunk count and
-	// `beforeSeq` requests the band of chunks immediately older than that seq.
-	getChunkManifest: (
-		id: string,
-		since?: number,
-		window?: { limitChunks?: number; beforeSeq?: number },
-	) => {
-		const params = new URLSearchParams();
-		if (since != null) params.set("since", String(since));
-		if (window?.limitChunks != null) params.set("limitChunks", String(window.limitChunks));
-		if (window?.beforeSeq != null) params.set("beforeSeq", String(window.beforeSeq));
-		const qs = params.toString();
-		return request<ChunkManifest>(`/narrators/${id}/chunk-manifest${qs ? `?${qs}` : ""}`);
-	},
 	// Exact-layout input page: transport batches are ordered by seq and carry no
 	// scrollbar geometry or band semantics.
 	getPretextDocumentPage: (
@@ -523,19 +506,7 @@ export const narratorsApi = {
 			`/narrators/${id}/pretext-document${qs ? `?${qs}` : ""}`,
 		);
 	},
-	// Chunk virtualization: fetch a contiguous range of chunks (full trees).
-	getNarratorChunks: (
-		id: string,
-		opts?: { fromSeq?: number; direction?: "older" | "newer"; count?: number },
-	) => {
-		const params = new URLSearchParams();
-		if (opts?.fromSeq != null) params.set("fromSeq", String(opts.fromSeq));
-		if (opts?.direction) params.set("direction", opts.direction);
-		if (opts?.count != null) params.set("count", String(opts.count));
-		const qs = params.toString();
-		return request<ChunkRangeResult>(`/narrators/${id}/chunks${qs ? `?${qs}` : ""}`);
-	},
-	// Chunk virtualization: resolve a message to its top-level seq coordinate.
+	// Resolve a message id to its top-level seq coordinate (jump-to-message).
 	getMessageLocation: (id: string, messageId: string) =>
 		request<MessageLocationResult>(
 			`/narrators/${id}/message-location/${encodeURIComponent(messageId)}`,
@@ -1279,6 +1250,13 @@ export const narratorsApi = {
 	dismissErrorMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean; deletedMessageIds: string[] }>(
 			`/narrators/${narratorId}/error-messages/${messageId}`,
+			{
+				method: "DELETE",
+			},
+		),
+	dismissInterruptTaskGuardMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean; deletedMessageIds: string[] }>(
+			`/narrators/${narratorId}/interrupt-task-guard-messages/${messageId}`,
 			{
 				method: "DELETE",
 			},

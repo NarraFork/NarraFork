@@ -1829,6 +1829,24 @@ export const userRecentTabs = sqliteTable(
 		pinned: integer("pinned", { mode: "boolean" }).notNull().default(false),
 		isScheduled: integer("is_scheduled", { mode: "boolean" }).notNull().default(false),
 		sortOrder: integer("sort_order").notNull(),
+		/**
+		 * The member position the user arranged by hand inside a directory group
+		 * (sidebar directory-aggregation mode).
+		 *
+		 * MUST stay separate from `sort_order`. That column carries recency and is
+		 * rewritten by the `above_idle` auto-promote every time a narrator starts
+		 * working, so a hand-ordered position stored there is wiped by the next status
+		 * change — that was the actual reason drag-to-reorder never stuck in this mode.
+		 *
+		 * NULL means "never hand-ordered" and sorts BEFORE the ordered members, in
+		 * recency order. A newly visited narrator is the newest thing in the group, so
+		 * burying it under older hand-placed rows would contradict the recency promise
+		 * the rest of the list makes.
+		 *
+		 * Cleared when the tab's cwd changes, otherwise a stale index from the previous
+		 * directory would interleave with the new group's members.
+		 */
+		dirSortOrder: integer("dir_sort_order"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},

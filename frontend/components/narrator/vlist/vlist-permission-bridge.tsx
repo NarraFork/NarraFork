@@ -26,8 +26,8 @@
 
 import { type ReactNode, useMemo } from "react";
 import { AskUserQuestionBanner, coerceQuestions } from "../AskUserQuestionBanner";
+import { InlinePermission } from "../InlinePermission";
 import type { PendingPermission, PermissionCallbacks } from "../narrator-panel-types";
-import { InlinePermission } from "../ToolCallCard";
 import { decidePermissionSlot } from "./vlist-permission-match";
 import type { VListItem } from "./vlist-pipeline";
 import type { VListReflectionSource } from "./vlist-reflection-index";

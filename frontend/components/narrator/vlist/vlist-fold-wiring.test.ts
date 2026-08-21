@@ -22,6 +22,7 @@ import { join } from "node:path";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
+import { sliceBracketedRegion } from "./source-slice";
 import { createVListInteractionState, toggleVListLodUserOverride } from "./vlist-interaction-state";
 
 const DIR = import.meta.dir;
@@ -42,7 +43,10 @@ function playEffect(): string {
 	expect(start).toBeGreaterThan(0);
 	const end = SHELL.indexOf("foldMotionRef.current.play(", start);
 	expect(end).toBeGreaterThan(start);
-	return SHELL.slice(start, SHELL.indexOf("\t});", end));
+	// The effect ends at the first `});` at ANY indentation after the play call;
+	// a hardcoded one-tab sentinel silently over-ran when the shell was re-indented.
+	const endOfEffect = SHELL.slice(end).search(/\n\t+\}\);/);
+	return SHELL.slice(start, endOfEffect < 0 ? undefined : end + endOfEffect);
 }
 
 describe("fold transition: capture happens on the user's click", () => {
@@ -120,7 +124,9 @@ describe("fold transition: play happens before paint", () => {
 		const emptyGuard = body.indexOf(
 			"if (motions.length === 0 && frameMotions.length === 0) return;",
 		);
-		const consume = body.indexOf("foldCaptureRef.current = null;\n\t\tfoldMotionRef");
+		// Indentation-independent: the point is that the capture is cleared right
+		// before the play call, not how deeply the effect happens to be nested.
+		const consume = body.search(/foldCaptureRef\.current = null;\s*foldMotionRef/);
 		expect(emptyGuard).toBeGreaterThan(-1);
 		expect(consume).toBeGreaterThan(emptyGuard);
 	});
@@ -266,9 +272,12 @@ describe("fold transition: play happens before paint", () => {
 	it("captures row and frame geometry in one snapshot", () => {
 		// A frame's border is only correct while it agrees with the cards inside it, so
 		// both maps must come from the same read of the committed layout.
-		const start = SHELL.indexOf("readFoldGeometryRef.current = () => {");
-		const body = SHELL.slice(start, SHELL.indexOf("\n\t};", start));
-		expect(start).toBeGreaterThan(0);
+		// Brace-matched: cutting at a hardcoded `"\n\t};"` assumed one tab of
+		// indentation, and when the shell was re-indented the slice ran PAST this
+		// callback into unrelated code — so the guard reported a getBoundingClientRect
+		// that was never in the capture at all (see source-slice.ts).
+		const body = sliceBracketedRegion(SHELL, "readFoldGeometryRef.current = () => {");
+		if (body === null) throw new Error("readFoldGeometryRef.current assignment not found");
 		expect(body).toContain("captureFoldGeometry(");
 		expect(body).toContain("captureFoldFrameGeometry(");
 		// Derived from the layout, never measured off the border element itself.

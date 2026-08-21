@@ -237,20 +237,35 @@ describe("authenticated AppShell scroll contract", () => {
 		expect(css.slice(mainRuleEnd).match(/overflow-y: auto/g)).toBe(null);
 	});
 
-	test("the real message scroller contains only mobile vertical overscroll", async () => {
+	/**
+	 * The message scroller must not fight the shell for scroll ownership.
+	 *
+	 * This used to read `ChunkedMessageList.tsx` and assert its inline
+	 * `overscrollBehaviorY: resolveMessageScrollerOverscrollBehavior(isMobileViewport)`.
+	 * Both the component and that helper are gone, so the test threw ENOENT — a
+	 * failure that says nothing about scroll ownership and invites re-anchoring the
+	 * assertion to whatever passes. Retargeted at the surviving scroller (the exact
+	 * vlist's viewport), whose contract is narrower: overscroll containment moved to
+	 * CSS on `.nf-app-shell-main` (asserted above), so the component itself must only
+	 * own its own overflow and must NOT set `touchAction`, which would take gesture
+	 * handling away from the shell.
+	 */
+	test("the real message scroller owns overflow without overriding shell gestures", async () => {
 		const source = await Bun.file(
-			new URL("../components/narrator/ChunkedMessageList.tsx", import.meta.url),
+			new URL("../components/narrator/vlist/PretextExactMessageList.tsx", import.meta.url),
 		).text();
-		const scrollerStart = source.indexOf("ref={setScrollerNode}");
-		const scrollerEnd = source.indexOf("<div ref={setContentNode}", scrollerStart);
+		const scrollerStart = source.indexOf("ref={assignViewport}");
+		expect(scrollerStart).toBeGreaterThan(-1);
+		const scrollerEnd = source.indexOf("data-pretext-exact-message-list", scrollerStart);
+		expect(scrollerEnd).toBeGreaterThan(scrollerStart);
 		const scroller = source.slice(scrollerStart, scrollerEnd);
 
-		expect(scrollerStart).toBeGreaterThan(-1);
-		expect(scroller).toContain(
-			"overscrollBehaviorY: resolveMessageScrollerOverscrollBehavior(isMobileViewport)",
-		);
+		// It is the scroll container…
+		expect(scroller).toContain('overflow: "auto"');
+		// …but it must not claim the touch gestures the shell resolves, and it must not
+		// re-enable the browser's scroll anchoring, which competes with this list's own
+		// anchored writes on every streaming frame.
 		expect(scroller).not.toContain("touchAction");
-		expect(scroller).toContain('overflowY: "auto"');
-		expect(scroller).toContain('overflowX: "hidden"');
+		expect(scroller).toContain('overflowAnchor: "none"');
 	});
 });

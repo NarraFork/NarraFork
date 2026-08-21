@@ -16,6 +16,7 @@ import {
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
+	applyDirectoryMemberOrder,
 	directoryRowId,
 	directoryRowKeyBlock,
 	directoryRowSortableIds,
@@ -23,6 +24,7 @@ import {
 	moveDirectoryRow,
 	type RecentTabRow,
 	resolveDirectoryDropTarget,
+	sameRecentTabOrder,
 } from "@frontend/hooks/recent-tab-directory-groups";
 import {
 	getEffectiveNarratorDisplay,
@@ -268,14 +270,6 @@ function workspaceGroupId(tab: RecentTab | undefined): string | null {
 	if (!tab) return null;
 	if (tab.type === "workspace") return tab.id;
 	return tab.workspaceId ?? null;
-}
-
-function sameTabOrder(left: RecentTab[], right: RecentTab[]): boolean {
-	if (left.length !== right.length) return false;
-	for (let i = 0; i < left.length; i++) {
-		if (tabSortId(left[i]) !== tabSortId(right[i])) return false;
-	}
-	return true;
 }
 
 // === Shared hook: WS subscription + cache updates (mount once in root) ===
@@ -705,18 +699,39 @@ export function RecentTabList({
 
 	const renderTabs = optimisticTabs ?? tabs;
 
+	/**
+	 * True while directory mode is replaying a multi-move sequence.
+	 *
+	 * One aggregated drop can expand into several serial `moveRecentTab` requests, and the
+	 * optimistic order must survive all of them. State rather than a ref because the
+	 * convergence effect below genuinely depends on it: it arms its fallback timeout only
+	 * once the replay finishes, and must re-run when that flips. On a slow connection the
+	 * old unconditional timeout fired mid-sequence, so the list snapped back to the old
+	 * order and then jumped to the new one.
+	 */
+	const [dirReplayInFlight, setDirReplayInFlight] = useState(false);
+
 	useEffect(() => {
 		if (!optimisticTabs || draggingTabId) return;
-		if (sameTabOrder(optimisticTabs, tabs)) {
+		// Compares `dirSortOrder` too: an in-group reorder leaves the flat sequence
+		// untouched, so an identity-only check reads as converged immediately and the
+		// row springs back for one round trip.
+		if (sameRecentTabOrder(optimisticTabs, tabs)) {
 			setOptimisticTabs(null);
 			return;
 		}
+		// Still replaying: the server order is legitimately mid-sequence, so waiting is
+		// correct and a timeout here would only expose an intermediate state.
+		if (dirReplayInFlight) return;
 
+		// Fallback for the case where the server order never converges to the optimistic
+		// one (a move was rejected, or another client reordered concurrently). Dropping
+		// the mask is the honest outcome: what the server holds is the truth.
 		const timeout = window.setTimeout(() => {
 			setOptimisticTabs(null);
 		}, 1000);
 		return () => window.clearTimeout(timeout);
-	}, [optimisticTabs, tabs, draggingTabId]);
+	}, [optimisticTabs, tabs, draggingTabId, dirReplayInFlight]);
 
 	const filtered = useMemo(
 		() =>
@@ -776,12 +791,40 @@ export function RecentTabList({
 	}, [groupingEnabled, topLevel, childrenByWorkspace]);
 	const directoryRowsRef = useRef(directoryRows);
 	directoryRowsRef.current = directoryRows;
-	const directorySortIds = useMemo(
-		() => directoryRows.flatMap(directoryRowSortableIds),
-		[directoryRows],
-	);
 	/** Sortable id currently dragged in directory mode; its unit's children collapse. */
 	const [dirDraggingId, setDirDraggingId] = useState<string | null>(null);
+
+	/**
+	 * Collapsed state per directory path, resolved once and shared.
+	 *
+	 * Both the renderer and `directorySortIds` need this answer, and they must not
+	 * disagree: registering a sortable id for a row that did not render leaves dnd-kit
+	 * with an id it cannot measure. Computing it twice is exactly how the two would
+	 * drift, so it is derived here and read from both places.
+	 */
+	const directoryCollapsedByPath = useMemo(() => {
+		const map = new Map<string, boolean>();
+		for (const row of directoryRows) {
+			if (row.kind !== "directory") continue;
+			const containsActive = row.children.some((child) => isTabActive(child, pathname));
+			const containsPending =
+				!!pendingKey && row.children.some((child) => `${child.type}:${child.id}` === pendingKey);
+			map.set(row.path, isDirectoryCollapsed(row.path, { containsActive, containsPending }));
+		}
+		return map;
+	}, [directoryRows, pathname, pendingKey, isDirectoryCollapsed]);
+
+	const directorySortIds = useMemo(
+		() =>
+			directoryRows.flatMap((row) =>
+				directoryRowSortableIds(row, {
+					collapsed: row.kind === "directory" ? directoryCollapsedByPath.get(row.path) : undefined,
+					dragging:
+						row.kind === "directory" ? dirDraggingId === directoryRowId(row.path) : undefined,
+				}),
+			),
+		[directoryRows, directoryCollapsedByPath, dirDraggingId],
+	);
 
 	// Stable sort-id arrays for SortableContext
 	const pinnedSortIds = useMemo(() => pinnedItems.map(tabSortId), [pinnedItems]);
@@ -1311,10 +1354,28 @@ export function RecentTabList({
 		return [{ ...first, id: resolved }];
 	}, []);
 
+	/**
+	 * Pointer travel direction for the in-flight directory drag.
+	 *
+	 * `moveDirectoryRow` needs it because the drop anchor is collapsed to a group HEADER,
+	 * which loses where inside a multi-row group the pointer was. Kept in a ref because
+	 * it is written on every pointer move and only read once, at drop.
+	 */
+	const dirDragDirectionRef = useRef<"up" | "down">("down");
+
+	const handleDirectoryDragMove = useCallback(
+		(event: DragMoveEvent) => {
+			if (event.delta.y !== 0) dirDragDirectionRef.current = event.delta.y > 0 ? "down" : "up";
+			handleDragMove(event);
+		},
+		[handleDragMove],
+	);
+
 	const handleDirectoryDragStart = useCallback((event: DragStartEvent) => {
 		setOptimisticTabs(null);
 		const activeId = String(event.active.id);
 		setDirDraggingId(activeId);
+		dirDragDirectionRef.current = "down";
 		// Bridge into the workspace-panel drag singleton, same as the flat handler.
 		const tab = findDirectoryRowTab(directoryRowsRef.current, activeId);
 		const nId =
@@ -1347,12 +1408,36 @@ export function RecentTabList({
 
 			const { active, over } = event;
 			if (!over || active.id === over.id) return;
+			const rows = directoryRowsRef.current;
+			const activeId = String(active.id);
 			const nextRows = moveDirectoryRow(
-				directoryRowsRef.current,
-				String(active.id),
+				rows,
+				activeId,
 				String(over.id),
+				dirDragDirectionRef.current,
 			);
 			if (!nextRows) return;
+
+			// A reorder INSIDE one directory group is persisted as that group's member
+			// order, never as flat moves. Flat moves would have to shuffle the recency
+			// order to express it, and `above_idle` rewrites that order the moment any
+			// member starts working — which is why hand-ordering never used to survive.
+			const memberRow = findDirectoryMemberRow(nextRows, activeId);
+			if (memberRow) {
+				const keys = memberRow.children.map((child) => `${child.type}:${child.id}`);
+				setDropSnap(true);
+				setOptimisticTabs(applyDirectoryMemberOrder(tabsRef.current, keys));
+				requestAnimationFrame(() => setDropSnap(false));
+				void api
+					.setRecentTabDirectoryOrder(keys)
+					.then((result) => applyRecentTabsDeltaAndFollowUp(qc, result))
+					.catch(() => {
+						notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
+						void refreshRecentTabsLoadedWindow(qc, { reset: true }).catch(() => {});
+					});
+				return;
+			}
+
 			const { moves, finalTabs } = computeRecentTabOrderMoves(
 				tabsRef.current,
 				nextRows.map(directoryRowKeyBlock),
@@ -1366,6 +1451,7 @@ export function RecentTabList({
 			setOptimisticTabs(finalTabs);
 			requestAnimationFrame(() => setDropSnap(false));
 
+			setDirReplayInFlight(true);
 			void (async () => {
 				try {
 					let resetNeeded = false;
@@ -1392,13 +1478,20 @@ export function RecentTabList({
 						});
 					}
 				} catch {
-					// A failed move leaves the server order half-replayed; resync instead of
-					// trusting either the optimistic order or the partial cache.
+					// A failed move leaves the server order HALF-REPLAYED, so resync rather
+					// than trusting the optimistic order or the partial cache. The user must
+					// be told: the list is about to settle into an order that is neither what
+					// they had nor what they asked for, and silently doing that reads as the
+					// drag having been ignored at random.
+					notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
 					await refreshRecentTabsLoadedWindow(qc, { reset: true }).catch(() => {});
+				} finally {
+					// Releases the convergence effect to arm its fallback timeout.
+					setDirReplayInFlight(false);
 				}
 			})();
 		},
-		[qc],
+		[qc, t],
 	);
 
 	if (topLevel.length === 0) {
@@ -1614,7 +1707,10 @@ export function RecentTabList({
 			const containsActive = row.children.some((child) => isTabActive(child, pathname));
 			const containsPending =
 				!!pendingKey && row.children.some((child) => `${child.type}:${child.id}` === pendingKey);
-			const collapsed = isDirectoryCollapsed(row.path, { containsActive, containsPending });
+			// Read the SHARED resolution rather than calling `isDirectoryCollapsed` again:
+			// `directorySortIds` registers member ids based on that map, and a second
+			// evaluation here could disagree and register ids for rows that never rendered.
+			const collapsed = directoryCollapsedByPath.get(row.path) ?? true;
 			const draggingThis = dirDraggingId === directoryRowId(row.path);
 
 			return (
@@ -1696,7 +1792,7 @@ export function RecentTabList({
 					sensors={sensors}
 					collisionDetection={directoryCollisionDetection}
 					onDragStart={handleDirectoryDragStart}
-					onDragMove={handleDragMove}
+					onDragMove={handleDirectoryDragMove}
 					onDragEnd={handleDirectoryDragEnd}
 					onDragCancel={handleDirectoryDragCancel}
 				>
@@ -2627,6 +2723,24 @@ function SortableDirectoryRow(props: RecentTabDirectoryRowProps) {
 			<RecentTabDirectoryRow {...props} onToggle={handleToggle} />
 		</div>
 	);
+}
+
+/**
+ * The directory row that owns `sortId` as a MEMBER, if any.
+ *
+ * Distinguishes "reordered a member inside its group" (persisted as group member order)
+ * from every other drop (persisted as flat moves). A directory HEADER is not a member,
+ * so dragging a whole group correctly falls through to the flat path.
+ */
+function findDirectoryMemberRow(
+	rows: RecentTabRow[],
+	sortId: string,
+): Extract<RecentTabRow, { kind: "directory" }> | null {
+	for (const row of rows) {
+		if (row.kind !== "directory") continue;
+		if (row.children.some((child) => `${child.type}:${child.id}` === sortId)) return row;
+	}
+	return null;
 }
 
 /** Resolve a sortable id to its tab across the aggregated rows (for drag previews). */

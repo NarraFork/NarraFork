@@ -217,6 +217,7 @@ export {
 	removeRecentTabSchema,
 	reorderFavoriteDirectoriesSchema,
 	restoreRecentTabsSchema,
+	setRecentTabDirectoryOrderSchema,
 	updateFavoriteDirectorySchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,

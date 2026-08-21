@@ -275,6 +275,188 @@ describe("recent-tabs row-level persistence", () => {
 	});
 });
 
+/**
+ * `dir_sort_order` records the member order a user arranged by hand inside a directory
+ * group in the sidebar. It has to be a column of its own: the flat `sort_order` carries
+ * recency and is rewritten by the `above_idle` auto-promote whenever a narrator starts
+ * working, so an arrangement expressed through flat moves was destroyed by the next
+ * status change. These tests pin the two properties that make it durable.
+ */
+describe("recent-tabs directory member order", () => {
+	function storedDirOrder(userId = "user-1"): Array<{ key: string; dirSortOrder: number | null }> {
+		return db
+			.select({ key: userRecentTabs.tabKey, dirSortOrder: userRecentTabs.dirSortOrder })
+			.from(userRecentTabs)
+			.where(eq(userRecentTabs.userId, userId))
+			.orderBy(userRecentTabs.sortOrder)
+			.all();
+	}
+
+	it("records the requested order without touching the flat order", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2"), makeTab("n-3")]);
+		await recentTabs.ensureMigrated("user-1");
+		const flatBefore = storedKeys();
+
+		const result = await recentTabs.setRecentTabDirectoryOrder("user-1", [
+			"narrator:n-3",
+			"narrator:n-1",
+		]);
+
+		expect(result.changed).toBe(true);
+		expect(storedKeys()).toEqual(flatBefore);
+		expect(storedDirOrder()).toEqual([
+			{ key: "narrator:n-1", dirSortOrder: 1 },
+			{ key: "narrator:n-2", dirSortOrder: null },
+			{ key: "narrator:n-3", dirSortOrder: 0 },
+		]);
+	});
+
+	it("broadcasts a delta so other clients converge", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2")]);
+		await recentTabs.ensureMigrated("user-1");
+		broadcasts.length = 0;
+
+		const result = await recentTabs.setRecentTabDirectoryOrder("user-1", [
+			"narrator:n-2",
+			"narrator:n-1",
+		]);
+
+		expect(result.revision).toBeGreaterThan(result.baseRevision);
+		const delta = broadcasts.find((entry) => entry.event.type === "user:recent_tabs_delta");
+		expect(delta).toBeDefined();
+		// The OPERATIONS matter, not just the event name: the delta is the only channel
+		// another client has for this change, and a payload that omits `dirSortOrder`
+		// leaves every other tab converging on the old order while this one shows the new
+		// one. Asserting the event type alone would not notice that.
+		const operations = (delta?.event as { operations?: Array<Record<string, unknown>> })
+			?.operations;
+		expect(Array.isArray(operations)).toBe(true);
+		const positions = new Map(
+			(operations ?? [])
+				.filter((op) => op.type === "upsert")
+				.map((op) => {
+					const tab = op.tab as { type?: string; id?: string; dirSortOrder?: number } | undefined;
+					return [`${tab?.type}:${tab?.id}`, tab?.dirSortOrder];
+				}),
+		);
+		expect(positions.get("narrator:n-2")).toBe(0);
+		expect(positions.get("narrator:n-1")).toBe(1);
+	});
+
+	/**
+	 * The snapshot restore path must carry hand-arranged positions back.
+	 *
+	 * The client sends `dirSortOrder` (`toPersistedRecentTab` carries it precisely so an
+	 * undo does not flatten the groups) and the service honours it (`dirSortOrderFor`),
+	 * but the request schema did not DECLARE it — and Zod strips unknown keys, so it was
+	 * gone before the service ever saw it. Every restore silently reverted the groups to
+	 * recency order, with nothing to indicate the positions had been dropped.
+	 */
+	it("restores hand-arranged positions from a tab snapshot", async () => {
+		seedUser();
+		await recentTabs.restoreRecentTabs("user-1", {
+			tabs: [
+				{ ...makeTab("n-1"), dirSortOrder: 1 },
+				{ ...makeTab("n-2"), dirSortOrder: 0 },
+			],
+		});
+		expect(storedDirOrder()).toEqual([
+			{ key: "narrator:n-1", dirSortOrder: 1 },
+			{ key: "narrator:n-2", dirSortOrder: 0 },
+		]);
+	});
+
+	it("accepts a snapshot tab WITHOUT a position (never hand-ordered)", async () => {
+		seedUser();
+		await recentTabs.restoreRecentTabs("user-1", { tabs: [makeTab("n-1")] });
+		expect(storedDirOrder()).toEqual([{ key: "narrator:n-1", dirSortOrder: null }]);
+	});
+
+	it("ignores keys the user no longer has instead of failing the whole reorder", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		await recentTabs.setRecentTabDirectoryOrder("user-1", [
+			"narrator:ghost",
+			"narrator:n-2",
+			"narrator:n-1",
+		]);
+
+		expect(storedDirOrder()).toEqual([
+			{ key: "narrator:n-1", dirSortOrder: 2 },
+			{ key: "narrator:n-2", dirSortOrder: 1 },
+		]);
+	});
+
+	/**
+	 * The regression that motivated the separate column. `above_idle` is fired on every
+	 * transition to `working`; if it disturbed `dir_sort_order`, hand-ordering would decay
+	 * on its own with no user action and no error.
+	 */
+	it("survives an above_idle auto-promote", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2"), makeTab("n-3")]);
+		await recentTabs.ensureMigrated("user-1");
+		await recentTabs.setRecentTabDirectoryOrder("user-1", [
+			"narrator:n-3",
+			"narrator:n-2",
+			"narrator:n-1",
+		]);
+
+		await recentTabs.moveRecentTab("user-1", {
+			key: "narrator:n-3",
+			position: "above_idle",
+		});
+
+		expect(storedDirOrder().sort((a, b) => a.key.localeCompare(b.key))).toEqual([
+			{ key: "narrator:n-1", dirSortOrder: 2 },
+			{ key: "narrator:n-2", dirSortOrder: 1 },
+			{ key: "narrator:n-3", dirSortOrder: 0 },
+		]);
+	});
+
+	/**
+	 * A cwd change moves the tab into a DIFFERENT directory group. Carrying the old index
+	 * across would interleave it with that group's members and produce an order nobody
+	 * chose — and since both orders are plausible-looking, nobody would spot the cause.
+	 */
+	it("clears the hand-arranged position when the tab changes directory", async () => {
+		seedLegacyTabs([
+			makeTab("n-1", { subtitle: "/w/repo" }),
+			makeTab("n-2", { subtitle: "/w/repo" }),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+		await recentTabs.setRecentTabDirectoryOrder("user-1", ["narrator:n-2", "narrator:n-1"]);
+
+		await recentTabs.upsertRecentTab("user-1", makeTab("n-1", { subtitle: "/w/other" }));
+
+		const rows = storedDirOrder().sort((a, b) => a.key.localeCompare(b.key));
+		expect(rows).toEqual([
+			{ key: "narrator:n-1", dirSortOrder: null },
+			{ key: "narrator:n-2", dirSortOrder: 0 },
+		]);
+	});
+
+	it("keeps the position when an unrelated field changes", async () => {
+		seedLegacyTabs([
+			makeTab("n-1", { subtitle: "/w/repo" }),
+			makeTab("n-2", { subtitle: "/w/repo" }),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+		await recentTabs.setRecentTabDirectoryOrder("user-1", ["narrator:n-2", "narrator:n-1"]);
+
+		await recentTabs.upsertRecentTab(
+			"user-1",
+			makeTab("n-1", { subtitle: "/w/repo", title: "Renamed" }),
+		);
+
+		const rows = storedDirOrder().sort((a, b) => a.key.localeCompare(b.key));
+		expect(rows).toEqual([
+			{ key: "narrator:n-1", dirSortOrder: 1 },
+			{ key: "narrator:n-2", dirSortOrder: 0 },
+		]);
+	});
+});
+
 describe("recent-tabs pagination and workspace groups", () => {
 	it("places narrator tabs in work and only project tabs in projects", async () => {
 		seedLegacyTabs([

@@ -2559,8 +2559,6 @@ export const narratorService = {
 	getLatestSuccessfulCompactSummary:
 		narratorMessageQueries.getLatestSuccessfulCompactSummary.bind(narratorMessageQueries),
 	isSubagentNarrator: narratorMessageQueries.isSubagentNarrator.bind(narratorMessageQueries),
-	getChunkManifest: narratorMessageQueries.getChunkManifest.bind(narratorMessageQueries),
-	getChunksByRange: narratorMessageQueries.getChunksByRange.bind(narratorMessageQueries),
 	getPretextDocumentPage:
 		narratorMessageQueries.getPretextDocumentPage.bind(narratorMessageQueries),
 	getMessageVersion: narratorMessageQueries.getMessageVersion.bind(narratorMessageQueries),
@@ -2581,6 +2579,8 @@ export const narratorService = {
 	dismissCwdRecoveryMessage:
 		narratorMessageQueries.dismissCwdRecoveryMessage.bind(narratorMessageQueries),
 	dismissErrorMessage: narratorMessageQueries.dismissErrorMessage.bind(narratorMessageQueries),
+	dismissInterruptTaskGuardMessage:
+		narratorMessageQueries.dismissInterruptTaskGuardMessage.bind(narratorMessageQueries),
 	deleteMessagesAfter: narratorMessageQueries.deleteMessagesAfter.bind(narratorMessageQueries),
 	deleteMessageBlock: narratorMessageQueries.deleteMessageBlock.bind(narratorMessageQueries),
 	deleteMessageBlocks: narratorMessageQueries.deleteMessageBlocks.bind(narratorMessageQueries),

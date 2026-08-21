@@ -5,9 +5,8 @@ import {
 	normalizeSubagentReasoningEffort,
 	upsertStreamingToolBlock,
 } from "./message-tree-utils";
-import type { ContentBlock, NarratorMsg, PendingPermission } from "./narrator-panel-types";
+import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
-import type { ToolCallData } from "./ToolCallCard";
 import { isSpecTasksToolUse } from "./tool-display";
 
 /**
@@ -29,13 +28,6 @@ export {
 	type ReflectionSuggestion,
 } from "@shared/pretext-layout/reflection";
 
-// Local bindings for the helpers used inside this module (a re-export alone does
-// not bring the names into scope).
-import {
-	isActiveReflectionPermissionLike,
-	isReflectionPermissionLike,
-} from "@shared/pretext-layout/reflection";
-
 // Re-export functions that moved to message-segments.ts for backward compatibility
 export {
 	filterChildrenByToolUse,
@@ -43,46 +35,6 @@ export {
 	isToolOnlyMessage,
 	resolveAllToolCallsFromMsg,
 } from "./message-segments";
-
-/** Resolve a PendingPermission from a tool call's data or WS state fallback. */
-export function resolvePendingPerm(
-	tc: ToolCallData,
-	wsPerm: PendingPermission | null | undefined,
-	pendingPermissions?: PendingPermission[],
-): PendingPermission | null {
-	// Prefer WS-sourced permissions — they carry the full (untruncated) inputJson.
-	// The message-list API truncates large inputJson, so building from tc.inputJson
-	// would lose data (e.g. ExitPlanMode plan text).
-	let perm: PendingPermission | null = null;
-	if (pendingPermissions && tc.toolUseId) {
-		const fromList = pendingPermissions.find((p) => p.toolUseId === tc.toolUseId);
-		if (fromList) perm = fromList;
-	}
-	if (!perm && wsPerm && tc.toolUseId && tc.toolUseId === wsPerm.toolUseId) {
-		perm = wsPerm;
-	}
-	// Fallback: build from the tool call record itself (status-driven path,
-	// e.g. page refresh before WS reconnects or getPendingPermissions resolves).
-	// Reflection gates also store a pending tool-call row while their internal
-	// loop decides. They are actionable only while still running or awaiting user;
-	// after they resolve, historical notices must not keep approval controls alive.
-	if (
-		!perm &&
-		tc.status === "pending" &&
-		tc.toolUseId &&
-		(!isReflectionPermissionLike(tc) || isActiveReflectionPermissionLike(tc))
-	) {
-		perm = {
-			id: tc.id ?? tc.toolUseId,
-			toolName: tc.toolName,
-			toolUseId: tc.toolUseId,
-			inputJson: tc.inputJson,
-			decisionReason: tc.permissionDecisionReason ?? undefined,
-			suggestions: tc.permissionSuggestions ?? undefined,
-		};
-	}
-	return perm;
-}
 
 export function revokeContentBlockPreviewUrls(
 	blocks: Array<{ previewUrl?: unknown }> | null | undefined,

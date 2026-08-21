@@ -142,7 +142,83 @@ export function groupRecentTabsByDirectory(
 		if (row.kind === "directory") row.children.push(tab);
 	}
 
+	for (const index of groupIndexByPath.values()) {
+		const row = rows[index];
+		if (row.kind === "directory") row.children = sortDirectoryMembers(row.children);
+	}
+
 	return rows;
+}
+
+/**
+ * Order a group's members: hand-arranged ones keep the position the user gave them,
+ * everything else stays in the incoming (recency) order.
+ *
+ * ── WHY UNORDERED MEMBERS SORT FIRST ──────────────────────────────────────────
+ * The obvious reading of "no explicit position" is "put it last", but that is wrong
+ * here: a member without `dirSortOrder` is one the user has never dragged, and the
+ * common way to become one is to be BRAND NEW — a narrator opened a moment ago.
+ * Sorting those to the bottom would bury the newest session under older hand-placed
+ * rows, contradicting the recency promise the rest of the list makes, and it would look
+ * like the new narrator failed to appear.
+ *
+ * The cost is that a member dragged to the top of its group is displaced by the next
+ * new arrival. That is the better failure: recency is a standing guarantee, while a
+ * single hand-placed position is cheap to redo, and the hand-placed members keep their
+ * order relative to EACH OTHER either way.
+ *
+ * The sort is stable (`Array.prototype.sort` is), so equal keys preserve recency order.
+ */
+function sortDirectoryMembers(children: RecentTab[]): RecentTab[] {
+	if (!children.some((child) => child.dirSortOrder !== undefined)) return children;
+	return [...children].sort((left, right) => {
+		const leftOrder = left.dirSortOrder;
+		const rightOrder = right.dirSortOrder;
+		if (leftOrder === undefined && rightOrder === undefined) return 0;
+		if (leftOrder === undefined) return -1;
+		if (rightOrder === undefined) return 1;
+		return leftOrder - rightOrder;
+	});
+}
+
+/**
+ * Optimistic counterpart of the dir-order endpoint: stamp `dirSortOrder` locally.
+ *
+ * The flat order is deliberately left alone — that is what the server does too, so
+ * the optimistic state and the authoritative state describe the same change.
+ */
+export function applyDirectoryMemberOrder(tabs: RecentTab[], keys: string[]): RecentTab[] {
+	const positionByKey = new Map(keys.map((key, index) => [key, index]));
+	return tabs.map((tab) => {
+		const position = positionByKey.get(`${tab.type}:${tab.id}`);
+		if (position === undefined || tab.dirSortOrder === position) return tab;
+		return { ...tab, dirSortOrder: position };
+	});
+}
+
+/**
+ * Have the two lists converged — same rows in the same order, AND the same
+ * hand-arranged positions inside directory groups?
+ *
+ * `dirSortOrder` is part of the comparison because a reorder INSIDE a group changes
+ * only that column: the flat sequence is identical before and after. Comparing
+ * identities alone declared the optimistic state "already converged" on the first
+ * frame after the drop, so the sidebar dropped its mask, repainted from the cache's
+ * stale order, and the row visibly sprang back before jumping again when the PATCH
+ * landed — which undoes the whole point of hand-ordering.
+ */
+export function sameRecentTabOrder(left: RecentTab[], right: RecentTab[]): boolean {
+	if (left.length !== right.length) return false;
+	for (let i = 0; i < left.length; i++) {
+		const a = left[i];
+		const b = right[i];
+		if (!a || !b) return false;
+		if (a.type !== b.type || a.id !== b.id) return false;
+		// `?? null` so "never hand-ordered" compares equal across both shapes
+		// (absent vs. explicit null) instead of masking forever.
+		if ((a.dirSortOrder ?? null) !== (b.dirSortOrder ?? null)) return false;
+	}
+	return true;
 }
 
 export interface DirectoryStatusSummary {
@@ -251,10 +327,30 @@ export function directoryRowKeyBlock(row: RecentTabRow): string[] {
 	return row.children.map(tabKeyOf);
 }
 
-/** Sortable ids a row contributes, in visible order (dir header first, then members). */
-export function directoryRowSortableIds(row: RecentTabRow): string[] {
+/**
+ * Sortable ids a row contributes, in visible order (dir header first, then members).
+ *
+ * Members are registered ONLY when they are actually measurable. dnd-kit derives drop
+ * positions from each registered id's rect, so registering an id with no usable rect
+ * corrupts the whole list's collision math, not just that row:
+ *
+ *  - a COLLAPSED group does not render its members at all, so they have no DOM node;
+ *  - while the group HEADER is dragged its members are squashed to `height: 0`, which
+ *    turns them into a stack of coincident zero-height rects that the pointer "hits"
+ *    arbitrarily — the drop indicator jitters between them.
+ *
+ * The header is always registered: it is the one id in a directory row that exists in
+ * every state, which is why {@link resolveDirectoryDropTarget} anchors to it rather
+ * than to a member.
+ */
+export function directoryRowSortableIds(
+	row: RecentTabRow,
+	options: { collapsed?: boolean; dragging?: boolean } = {},
+): string[] {
 	if (row.kind === "directory") {
-		return [directoryRowId(row.path), ...row.children.map(tabKeyOf)];
+		const headerId = directoryRowId(row.path);
+		if (options.collapsed || options.dragging) return [headerId];
+		return [headerId, ...row.children.map(tabKeyOf)];
 	}
 	return directoryRowKeyBlock(row);
 }
@@ -297,6 +393,14 @@ export function moveDirectoryRow(
 	rows: RecentTabRow[],
 	activeId: string,
 	overId: string,
+	/**
+	 * Which way the pointer travelled. Required because {@link resolveDirectoryDropTarget}
+	 * collapses every hover over a directory group down to its HEADER id, which throws
+	 * away where inside the group the pointer actually was. A group occupies several rows,
+	 * so releasing over its lower half must land the unit AFTER the group — with only a
+	 * row index to go on, that is indistinguishable from landing before it.
+	 */
+	direction: "up" | "down",
 ): RecentTabRow[] | null {
 	const info = buildDirectoryDragInfo(rows);
 	const active = info.get(activeId);
@@ -332,11 +436,14 @@ export function moveDirectoryRow(
 	if (from === to) return null;
 	const next = [...rows];
 	const [moved] = next.splice(from, 1);
-	// One index serves both directions: dragging DOWN lands after the target row
-	// (the removal above already shifted it one slot left, so inserting at `to`
-	// drops the unit right behind it), and dragging UP lands before it (nothing
-	// shifted, so inserting at `to` puts the unit ahead of it).
-	next.splice(to, 0, moved);
+	// Removing the unit shifts every row after it one slot left, so a target that sat
+	// below the origin is now at `to - 1`.
+	const shifted = to > from ? to - 1 : to;
+	// `direction` — not the sign of `to - from` — decides the side. They agree for a
+	// single-row target, but a multi-row directory group anchors to its header no matter
+	// where inside it the pointer was, and the header's row index alone would always
+	// resolve to "before the group".
+	next.splice(direction === "down" ? shifted + 1 : shifted, 0, moved);
 	return next;
 }
 

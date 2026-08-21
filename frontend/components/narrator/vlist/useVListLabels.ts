@@ -123,9 +123,11 @@ export interface VListRenderLabels {
 		/** Terminate a running bash / MCP tool. */
 		terminate: string;
 		/**
-		 * Diff bodies paint only as many rows as the capped box can reveal (see
-		 * RenderToolCall diffRenderRowLimit); this footer reports the rest. Carries a
-		 * literal `{count}` because the hidden row count is per body.
+		 * Diff bodies initially paint only as many rows as the capped box can
+		 * reveal (see RenderToolCall diffRenderRowLimit); this footer reports the
+		 * rest and doubles as the scroll sentinel that progressively reveals them
+		 * (useDiffRowReveal). Carries a literal `{count}` because the hidden row
+		 * count is per body.
 		 */
 		diffTruncated: string;
 		/** Placeholder for a valid but EMPTY spec task document (`{ tasks: [] }`). */
@@ -330,6 +332,9 @@ export function useVListLabels(): VListLabels {
 			// presence changes the card's measured height (unlike the always-reserved
 			// button rows of the spec cards, whose wording is height-neutral).
 			disableImageGen: t("disableImageGen"),
+			// Also an adapter label, and for the same reason: it shares the fix's
+			// conditional button row, so the card's height depends on it existing.
+			testCurrentModel: t("testCurrentModel"),
 			specViewTasks: t("specGoalViewTasks"),
 			specClearTasks: t("specForkClearTasks"),
 			specResetTasks: t("specForkResetSpec"),
@@ -414,6 +419,7 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceBufferedUser: t("sidecar.sources.buffered_user"),
 			sidecarSourceSubagentMessage: t("sidecar.sources.subagent_message"),
 			sidecarSourceSpecUpdate: t("sidecar.sources.spec_update"),
+			sidecarSourceInterruptTaskGuard: t("sidecar.sources.interrupt_task_guard"),
 		}),
 		[t, tCommon],
 	);

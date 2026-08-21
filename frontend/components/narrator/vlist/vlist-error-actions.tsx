@@ -12,6 +12,9 @@
  * Behaviour parity with the chunked card:
  *   - fix    → (conditional) turn off the provider's native image_generation tool
  *              and retry, for the one failure where that is the actual cause
+ *   - probe  → (conditional, admin only) open ModelTestDialog against the model the
+ *              failed turn dispatched to. Restored here after the chunked card was
+ *              deleted took its only entry point with it
  *   - retry  → open the shared RetryRuleModal prefilled with this error's text
  *              (POST /settings/retry-rules + settings query invalidation live
  *              inside that component)
@@ -31,9 +34,11 @@ import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { removeMessagesFromCache } from "../MessageBubble";
+import { ModelTestDialog } from "../../providers/ModelTestDialog";
+import { removeMessagesFromCache } from "../messages-query-cache";
 import { RetryRuleModal } from "../RetryRuleModal";
 import { useCodexImageGenerationFix } from "../useCodexImageGenerationFix";
+import { useNarratorModelTest } from "../useNarratorModelTest";
 import type { ErrorNoticeActions } from "./render/RenderSystemText";
 import type { VListItem } from "./vlist-pipeline";
 
@@ -79,7 +84,10 @@ export function resolveErrorNoticeActions(
 export interface VListErrorNoticeActions {
 	/** Per-row resolver handed to `resolveErrorNoticeActions`. */
 	resolve: ErrorNoticeActionsResolver;
-	/** The single retry-rule dialog for the whole list (mounted by the shell). */
+	/**
+	 * The dialogs the whole list shares, mounted once by the shell: the retry-rule
+	 * editor and the model probe. Rows are zero-DOM copies and cannot own a modal.
+	 */
 	ruleModal: ReactNode;
 	/**
 	 * Whether an error card with this text may offer the provider fix. Handed to
@@ -88,6 +96,11 @@ export interface VListErrorNoticeActions {
 	 * known during adaptation, not at paint time.
 	 */
 	canOfferProviderFix: (errorText: string) => boolean;
+	/**
+	 * Whether an error card with this text may offer the model probe. Same measured-
+	 * row contract as `canOfferProviderFix` — it shares that button row.
+	 */
+	canOfferModelTest: (errorText: string) => boolean;
 }
 
 /**
@@ -108,6 +121,10 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 	// provider this narrator resolved to and retries its last turn), but whether a
 	// given ROW may offer it depends on that row's error text, hence `canFix`.
 	const imageGenFix = useCodexImageGenerationFix(narratorId);
+	// The model probe, restored from the deleted chunked card. Same per-narrator /
+	// per-row-text split as the fix above: eligibility depends on the user's role and
+	// the narrator's resolved model, the error text decides which rows offer it.
+	const modelTest = useNarratorModelTest(narratorId);
 	// Read at click time so a second click is rejected without making the handler
 	// depend on the in-flight state.
 	const dismissingRef = useRef(dismissingId);
@@ -150,6 +167,7 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 			// occupies a measured row), so this only makes the painted button live for
 			// the rows that carry it.
 			const offerImageGenFix = imageGenFix.canFix(errorText);
+			const offerModelTest = modelTest.canTest(errorText);
 			const actions: ErrorNoticeActions = {
 				onMarkRetryable: () => setRuleTarget(errorText),
 				onDismiss: () => void dismiss(messageId),
@@ -158,6 +176,9 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 				...(offerImageGenFix
 					? { onDisableImageGen: imageGenFix.run, disablingImageGen: imageGenFix.busy }
 					: {}),
+				// The dialog opens for THIS row's text, so the probe reports against the
+				// error the reader clicked rather than whichever card rendered last.
+				...(offerModelTest ? { onTestModel: () => modelTest.open(errorText) } : {}),
 			};
 			cache.set(messageId, actions);
 			return actions;
@@ -172,14 +193,33 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 		imageGenFix.canFix,
 		imageGenFix.run,
 		imageGenFix.busy,
+		modelTest.canTest,
+		modelTest.open,
 	]);
 
 	const closeRuleModal = useCallback(() => setRuleTarget(null), []);
 
-	const ruleModal =
-		ruleTarget === null ? null : (
-			<RetryRuleModal opened onClose={closeRuleModal} errorMessage={ruleTarget} />
-		);
+	const ruleModal = (
+		<>
+			{ruleTarget === null ? null : (
+				<RetryRuleModal opened onClose={closeRuleModal} errorMessage={ruleTarget} />
+			)}
+			{modelTest.target === null ? null : (
+				<ModelTestDialog
+					opened
+					onClose={modelTest.close}
+					modelValue={modelTest.modelValue}
+					selectedModelValue={modelTest.selectedModelValue}
+					sourceError={modelTest.target}
+				/>
+			)}
+		</>
+	);
 
-	return { resolve, ruleModal, canOfferProviderFix: imageGenFix.canFix };
+	return {
+		resolve,
+		ruleModal,
+		canOfferProviderFix: imageGenFix.canFix,
+		canOfferModelTest: modelTest.canTest,
+	};
 }

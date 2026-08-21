@@ -80,7 +80,7 @@ beforeAll(() => {
  * A streaming row driven frame by frame, mirroring how the shell re-renders the
  * live tail: one stable `animKeyBase`, growing text, a fresh measure each frame.
  */
-async function mountStreamingRow(animKeyBase: string) {
+async function mountStreamingRow(animKeyBase: string, animScope?: string) {
 	const { measureMarkdown } = await import("../measure/measure-markdown");
 	const { RenderMarkdown } = await import("./RenderMarkdown");
 
@@ -97,6 +97,10 @@ async function mountStreamingRow(animKeyBase: string) {
 							measured={measureMarkdown(text, CONTENT_WIDTH)}
 							animateStreaming
 							animKeyBase={animKeyBase}
+							// The shell derives this from the panel narrator; default it to the
+							// key base's own narrator segment so a caller that omits it still
+							// gets ONE scope per row rather than one per block.
+							animScope={animScope ?? animKeyBase.split(":")[0]}
 						/>
 					</RenderLodCtx.Provider>
 				</MantineProvider>,
@@ -133,7 +137,7 @@ async function mountStreamingRow(animKeyBase: string) {
 describe("streaming fade-in survives subsequent deltas", () => {
 	it("keeps the SAME span element alive after more text arrives", async () => {
 		const row = await mountStreamingRow("k-identity");
-		// Frame 1 seeds the key (first sighting never animates, by design).
+		// Frame 1 seeds the key (a cold-scope first sighting is a mount: no fade).
 		row.frame("连续输出的");
 		expect(row.animSpans()).toHaveLength(0);
 
@@ -198,6 +202,25 @@ describe("streaming fade-in survives subsequent deltas", () => {
 				expect(delay.startsWith("-")).toBe(true);
 			}
 		}
+
+		row.unmount();
+	});
+
+	it("animates the opening chunk of a paragraph born mid-stream", async () => {
+		const row = await mountStreamingRow("k-newpara");
+		// The first block's first frame seeds cold (mount semantics: no fade)…
+		row.frame("第一段话。");
+		expect(row.animSpans()).toHaveLength(0);
+		// …but once any block has committed, the scope is warm: the stream is live.
+		row.frame("第一段话。\n\n");
+		row.frame("第一段话。\n\n第二段");
+		// The new paragraph's opening chunk must fade in, not pop in. Before the
+		// scope split, a first sighting sealed unconditionally and this was "".
+		expect(row.animText()).toContain("第二段");
+		// The next delta onto the new paragraph animates as an ordinary append.
+		row.frame("第一段话。\n\n第二段话");
+		expect(row.animText()).toContain("话");
+		expect(row.text()).toBe("第一段话。第二段话");
 
 		row.unmount();
 	});

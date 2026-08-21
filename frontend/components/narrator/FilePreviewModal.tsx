@@ -15,8 +15,7 @@
  * rejected past MAX_FILE_PREVIEW_BLOB_BYTES.
  */
 
-import { Box, Group, Modal, Text } from "@mantine/core";
-import { IconLoader2 } from "@tabler/icons-react";
+import { Box, Group, Loader, Modal, Text } from "@mantine/core";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useFileSystemCapability } from "../../hooks/usePlatform";
@@ -204,7 +203,10 @@ export function FilePreviewModal({
 		>
 			{loading && (
 				<Group gap={4} p="md">
-					<IconLoader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
+					{/* Mantine's Loader, not a hand-spun IconLoader2: the `spin` keyframe this
+					    used to reference was injected at runtime by ToolCallCard, so deleting
+					    that component left the icon frozen. A Loader carries its own animation. */}
+					<Loader size={14} />
 					<Text size="sm" c="dimmed">
 						{t("filePreview_loading")}
 					</Text>

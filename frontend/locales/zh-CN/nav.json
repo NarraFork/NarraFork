@@ -1,6 +1,5 @@
 {
 	"appName": "NarraFork",
-	"narratorVirtualListToggle": "叙述者虚拟列表（默认开启，关闭则回到经典列表）",
 	"dashboard": "仪表盘",
 	"projects": "叙事线",
 	"narrators": "叙述者",
@@ -60,6 +59,7 @@
 	"loadMoreRecentTabs": "加载更多",
 	"retryRecentTabs": "重试",
 	"recentTabsSyncError": "最近标签同步失败",
+	"recentTabsReorderFailed": "标签顺序保存失败",
 	"recentTabsGrouping": "标签分组方式",
 	"groupModeFlat": "平铺列表",
 	"groupModeDirectory": "按目录聚合",

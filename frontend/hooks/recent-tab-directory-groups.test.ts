@@ -7,15 +7,18 @@
 import { describe, expect, it } from "bun:test";
 import {
 	aggregateDirectoryStatus,
+	applyDirectoryMemberOrder,
 	buildDirectoryDragInfo,
 	directoryLabel,
 	directoryRowId,
 	directoryRowKeyBlock,
+	directoryRowSortableIds,
 	groupRecentTabsByDirectory,
 	moveDirectoryRow,
 	normalizeTabDirectory,
 	type RecentTabRow,
 	resolveDirectoryDropTarget,
+	sameRecentTabOrder,
 } from "./recent-tab-directory-groups";
 import type { RecentTab } from "./recent-tabs-utils";
 
@@ -221,41 +224,132 @@ describe("moveDirectoryRow", () => {
 	it("lands before the target when dragged up, after it when dragged down", () => {
 		// Rows: dir[a,b], tab:solo, ws:w1[wc]. solo sits BELOW the group, so dragging it
 		// onto the group header is a drag UP and lands before the group.
-		const up = moveDirectoryRow(fixtureRows(), "narrator:solo", "dir:/w/repo");
+		const up = moveDirectoryRow(fixtureRows(), "narrator:solo", "dir:/w/repo", "up");
 		expect(shape(up ?? [])).toEqual(["tab:solo", "dir:/w/repo[a,b]", "ws:w1[wc]"]);
 		// Dragging the group DOWN onto solo lands after it.
-		const down = moveDirectoryRow(fixtureRows(), "dir:/w/repo", "narrator:solo");
+		const down = moveDirectoryRow(fixtureRows(), "dir:/w/repo", "narrator:solo", "down");
 		expect(shape(down ?? [])).toEqual(["tab:solo", "dir:/w/repo[a,b]", "ws:w1[wc]"]);
 	});
 
+	/**
+	 * The regression this whole direction parameter exists for. `resolveDirectoryDropTarget`
+	 * collapses a hover anywhere inside a group to the group's HEADER, so without an
+	 * explicit direction a drag released over the group's LOWER half was indistinguishable
+	 * from one released above it, and the unit landed a whole group-height too high.
+	 */
+	it("distinguishes 'past the group' from 'before the group' for the same anchor id", () => {
+		// ws:w1 sits below the group; dragging it UP onto the group lands before it.
+		const above = moveDirectoryRow(fixtureRows(), "workspace:w1", "dir:/w/repo", "up");
+		expect(shape(above ?? [])).toEqual(["ws:w1[wc]", "dir:/w/repo[a,b]", "tab:solo"]);
+		// Same active, same anchor, opposite direction: it must land AFTER the group.
+		const below = moveDirectoryRow(fixtureRows(), "workspace:w1", "dir:/w/repo", "down");
+		expect(shape(below ?? [])).toEqual(["dir:/w/repo[a,b]", "ws:w1[wc]", "tab:solo"]);
+	});
+
+	it("resolves direction the same way for a collapsed group (no member rows rendered)", () => {
+		// Collapse is a render concern, so the row model is identical — which is exactly why
+		// the anchor must stay the header and the direction must be passed in.
+		const down = moveDirectoryRow(fixtureRows(), "tab:missing", "dir:/w/repo", "down");
+		expect(down).toBeNull(); // unknown active id is refused, not guessed
+		const solo = moveDirectoryRow(fixtureRows(), "narrator:solo", "dir:/w/repo", "down");
+		expect(shape(solo ?? [])).toEqual(["dir:/w/repo[a,b]", "tab:solo", "ws:w1[wc]"]);
+	});
+
 	it("moves a whole group past a workspace unit as one block", () => {
-		const next = moveDirectoryRow(fixtureRows(), "dir:/w/repo", "workspace:w1");
+		const next = moveDirectoryRow(fixtureRows(), "dir:/w/repo", "workspace:w1", "down");
 		expect(shape(next ?? [])).toEqual(["tab:solo", "ws:w1[wc]", "dir:/w/repo[a,b]"]);
 		expect(directoryRowKeyBlock((next ?? [])[2])).toEqual(["narrator:a", "narrator:b"]);
 	});
 
 	it("reorders members inside their own group", () => {
-		const next = moveDirectoryRow(fixtureRows(), "narrator:b", "narrator:a");
+		const next = moveDirectoryRow(fixtureRows(), "narrator:b", "narrator:a", "up");
 		expect(shape(next ?? [])).toEqual(["dir:/w/repo[b,a]", "tab:solo", "ws:w1[wc]"]);
 	});
 
 	it("drops a member onto its own header as 'first position'", () => {
-		const next = moveDirectoryRow(fixtureRows(), "narrator:b", "dir:/w/repo");
+		const next = moveDirectoryRow(fixtureRows(), "narrator:b", "dir:/w/repo", "up");
 		expect(shape(next ?? [])[0]).toBe("dir:/w/repo[b,a]");
 	});
 
 	it("refuses to move a member out of its group — cwd, not position, defines membership", () => {
-		expect(moveDirectoryRow(fixtureRows(), "narrator:a", "narrator:solo")).toBeNull();
-		expect(moveDirectoryRow(fixtureRows(), "narrator:a", "workspace:w1")).toBeNull();
+		expect(moveDirectoryRow(fixtureRows(), "narrator:a", "narrator:solo", "down")).toBeNull();
+		expect(moveDirectoryRow(fixtureRows(), "narrator:a", "workspace:w1", "down")).toBeNull();
 	});
 
 	it("refuses to move a workspace child directly — the workspace is one unit", () => {
-		expect(moveDirectoryRow(fixtureRows(), "narrator:wc", "narrator:solo")).toBeNull();
+		expect(moveDirectoryRow(fixtureRows(), "narrator:wc", "narrator:solo", "up")).toBeNull();
 	});
 
 	it("refuses no-op drops onto the same unit", () => {
-		expect(moveDirectoryRow(fixtureRows(), "dir:/w/repo", "narrator:a")).toBeNull();
-		expect(moveDirectoryRow(fixtureRows(), "narrator:solo", "narrator:solo")).toBeNull();
+		expect(moveDirectoryRow(fixtureRows(), "dir:/w/repo", "narrator:a", "down")).toBeNull();
+		expect(moveDirectoryRow(fixtureRows(), "narrator:solo", "narrator:solo", "up")).toBeNull();
+	});
+});
+
+/**
+ * `dirSortOrder` is the column that made hand-ordering survive at all: the flat order it
+ * used to be expressed through is rewritten by the `above_idle` auto-promote on every
+ * status change, so any arrangement stored there was wiped by the next narrator that
+ * started working.
+ */
+describe("directory member ordering", () => {
+	it("keeps recency order when no member was ever hand-ordered", () => {
+		const rows = groupRecentTabsByDirectory([
+			tab({ id: "a", subtitle: "/w/repo" }),
+			tab({ id: "b", subtitle: "/w/repo" }),
+			tab({ id: "c", subtitle: "/w/repo" }),
+		]);
+		expect(shape(rows)).toEqual(["dir:/w/repo[a,b,c]"]);
+	});
+
+	it("applies hand-arranged positions", () => {
+		const rows = groupRecentTabsByDirectory([
+			tab({ id: "a", subtitle: "/w/repo", dirSortOrder: 2 }),
+			tab({ id: "b", subtitle: "/w/repo", dirSortOrder: 0 }),
+			tab({ id: "c", subtitle: "/w/repo", dirSortOrder: 1 }),
+		]);
+		expect(shape(rows)).toEqual(["dir:/w/repo[b,c,a]"]);
+	});
+
+	/**
+	 * Unordered members sort FIRST, not last. A member without a position is typically a
+	 * brand-new narrator, and sorting it below older hand-placed rows would bury the newest
+	 * session and read as "my new narrator did not show up".
+	 */
+	it("puts never-ordered members above hand-ordered ones, in recency order", () => {
+		const rows = groupRecentTabsByDirectory([
+			tab({ id: "old1", subtitle: "/w/repo", dirSortOrder: 0 }),
+			tab({ id: "new1", subtitle: "/w/repo" }),
+			tab({ id: "old2", subtitle: "/w/repo", dirSortOrder: 1 }),
+			tab({ id: "new2", subtitle: "/w/repo" }),
+		]);
+		// new1/new2 keep their incoming (recency) order; old1/old2 keep their arrangement.
+		expect(shape(rows)).toEqual(["dir:/w/repo[new1,new2,old1,old2]"]);
+	});
+});
+
+describe("directoryRowSortableIds", () => {
+	/**
+	 * dnd-kit positions drops from each registered id's rect, so an id with no measurable
+	 * rect corrupts the whole list's collision math rather than just its own row.
+	 */
+	it("registers members only when they are actually measurable", () => {
+		const dirRow = fixtureRows()[0];
+		expect(directoryRowSortableIds(dirRow)).toEqual(["dir:/w/repo", "narrator:a", "narrator:b"]);
+		// Collapsed: members are not rendered at all, so they have no DOM node.
+		expect(directoryRowSortableIds(dirRow, { collapsed: true })).toEqual(["dir:/w/repo"]);
+		// Header being dragged: members are squashed to height 0 and would otherwise be a
+		// stack of coincident zero-height hit targets.
+		expect(directoryRowSortableIds(dirRow, { dragging: true })).toEqual(["dir:/w/repo"]);
+	});
+
+	it("is unaffected for plain and workspace rows", () => {
+		const rows = fixtureRows();
+		expect(directoryRowSortableIds(rows[1], { collapsed: true })).toEqual(["narrator:solo"]);
+		expect(directoryRowSortableIds(rows[2], { dragging: true })).toEqual([
+			"workspace:w1",
+			"narrator:wc",
+		]);
 	});
 });
 
@@ -296,5 +390,69 @@ describe("buildDirectoryDragInfo", () => {
 		expect(info.get("narrator:solo")).toEqual({ role: "plain", rowIndex: 1 });
 		expect(info.get("workspace:w1")).toEqual({ role: "wsHeader", rowIndex: 2 });
 		expect(info.get("narrator:wc")).toEqual({ role: "wsChild", rowIndex: 2 });
+	});
+});
+
+/**
+ * The optimistic mask's convergence test.
+ *
+ * The sidebar shows a hand-arranged order immediately and keeps that mask until the
+ * server's list matches. An in-group reorder changes ONLY `dirSortOrder` — the flat
+ * sequence is byte-identical before and after — so a comparison that looks at row
+ * identities alone reports "already converged" on the first frame after the drop.
+ * The mask is dropped, the cache's stale order repaints, and the row springs back
+ * until the PATCH lands: invisible on localhost, obvious against a remote server,
+ * and it defeats the entire feature.
+ */
+describe("sameRecentTabOrder", () => {
+	it("sees an in-group reorder that leaves the flat sequence identical", () => {
+		const before = [tab({ id: "a", dirSortOrder: 0 }), tab({ id: "b", dirSortOrder: 1 })];
+		const after = [tab({ id: "a", dirSortOrder: 1 }), tab({ id: "b", dirSortOrder: 0 })];
+		expect(sameRecentTabOrder(before, after)).toBe(false);
+	});
+
+	it("treats absent and null hand-order as the same (never-ordered)", () => {
+		// Otherwise the mask can never converge: the two shapes describe one state.
+		const left = [tab({ id: "a" })];
+		const right = [{ ...tab({ id: "a" }), dirSortOrder: null } as unknown as RecentTab];
+		expect(sameRecentTabOrder(left, right)).toBe(true);
+	});
+
+	it("still detects a plain flat reorder and a length change", () => {
+		const a = tab({ id: "a" });
+		const b = tab({ id: "b" });
+		expect(sameRecentTabOrder([a, b], [b, a])).toBe(false);
+		expect(sameRecentTabOrder([a, b], [a])).toBe(false);
+	});
+
+	it("converges once the server reports the same positions", () => {
+		const optimistic = [tab({ id: "a", dirSortOrder: 1 }), tab({ id: "b", dirSortOrder: 0 })];
+		const server = [tab({ id: "a", dirSortOrder: 1 }), tab({ id: "b", dirSortOrder: 0 })];
+		expect(sameRecentTabOrder(optimistic, server)).toBe(true);
+	});
+});
+
+describe("applyDirectoryMemberOrder", () => {
+	it("stamps positions from the key order and leaves the flat order alone", () => {
+		const tabs = [tab({ id: "a" }), tab({ id: "b" }), tab({ id: "outside" })];
+		const next = applyDirectoryMemberOrder(tabs, ["narrator:b", "narrator:a"]);
+		expect(next.map((t) => t.id)).toEqual(["a", "b", "outside"]);
+		expect(next.find((t) => t.id === "b")?.dirSortOrder).toBe(0);
+		expect(next.find((t) => t.id === "a")?.dirSortOrder).toBe(1);
+	});
+
+	it("leaves tabs outside the group untouched (same object identity)", () => {
+		const outside = tab({ id: "outside" });
+		const next = applyDirectoryMemberOrder([tab({ id: "a" }), outside], ["narrator:a"]);
+		expect(next[1]).toBe(outside);
+	});
+
+	it("produces a state that sameRecentTabOrder can distinguish from the input", () => {
+		// The two functions are the optimistic write and its convergence test; if they
+		// disagree the mask either never lifts or lifts a frame too early.
+		const tabs = [tab({ id: "a", dirSortOrder: 0 }), tab({ id: "b", dirSortOrder: 1 })];
+		const next = applyDirectoryMemberOrder(tabs, ["narrator:b", "narrator:a"]);
+		expect(sameRecentTabOrder(tabs, next)).toBe(false);
+		expect(sameRecentTabOrder(next, next)).toBe(true);
 	});
 });

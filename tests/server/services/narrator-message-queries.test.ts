@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { TOOL_IO_BUDGETS } from "@shared/pretext-layout/tool-io-projection";
 import {
 	buildSubagentSummarySqlExpr,
 	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
@@ -80,7 +81,7 @@ function insertMessage(params: {
 	id: string;
 	seq: number;
 	narratorId?: string;
-	role?: "user" | "assistant" | "system";
+	role?: "user" | "assistant" | "system" | "sys";
 	contentJson: unknown[];
 	contentText?: string | null;
 	parentToolUseId?: string | null;
@@ -434,7 +435,7 @@ describe("narratorService message query regressions", () => {
 		expect(emergency).toBeNull();
 	});
 
-	it("getChunksByRange 构建树、截断大输出并过滤 ExitPlan→plan compact 包装消息", async () => {
+	it("getPretextDocumentPage 构建树、截断大输出并过滤 ExitPlan→plan compact 包装消息", async () => {
 		seedBase();
 
 		insertMessage({
@@ -469,7 +470,7 @@ describe("narratorService message query regressions", () => {
 			toolUseId: "tu-read",
 			toolName: "Read",
 			status: "success",
-			outputJson: { blob: "X".repeat(2600) },
+			outputJson: { blob: "X".repeat(TOOL_IO_BUDGETS.leaf + 100) },
 		});
 
 		insertMessage({
@@ -479,9 +480,9 @@ describe("narratorService message query regressions", () => {
 			contentJson: [{ type: "text", text: "child response" }],
 		});
 
-		const result = await narratorService.getChunksByRange("n1", { count: 1 });
-		expect(result.hasOlder).toBe(false);
-		expect(result.hasNewer).toBe(false);
+		const result = await narratorService.getPretextDocumentPage("n1", { limit: 20 });
+		expect(result.hasPrev).toBe(false);
+		expect(result.hasNext).toBe(false);
 		expect(result.messages.map((m: { id: string }) => m.id)).toEqual(["m-plan", "m-read"]);
 		expect(result.messages.map((m: { seq?: number }) => m.seq)).toEqual([1, 2]);
 
@@ -490,22 +491,20 @@ describe("narratorService message query regressions", () => {
 
 		// Truncation is FIELD-LEVEL: the oversized `blob` leaf becomes the wrapper while
 		// the enclosing object keeps its shape, so sibling fields (notably `_metadata`,
-		// which drives every structured card) survive.
-		const readTc = readMsg?.toolCalls?.find(
-			(tc: { toolUseId: string }) => tc.toolUseId === "tu-read",
-		);
-		expect(readTc?.outputJson?._truncated).toBeUndefined();
-		expect(readTc?.outputJson?.blob?._truncated).toBe(true);
-		expect(readTc?.outputJson?.blob?.fullLength).toBe(2600);
-
+		// which drives every structured card) survive. The exact-layout page strips
+		// redundant tool-call rows, so the projected value is asserted on the enriched
+		// content block — the only carrier this path delivers.
+		expect(readMsg?.toolCalls).toEqual([]);
 		const readBlock = readMsg?.contentJson?.find(
 			(b: { type?: string; id?: string }) => b.type === "tool_use" && b.id === "tu-read",
 		);
-		expect(readBlock?.status).toBe("success");
+		expect(readBlock?.outputJson?._truncated).toBeUndefined();
 		expect(readBlock?.outputJson?.blob?._truncated).toBe(true);
+		expect(readBlock?.outputJson?.blob?.fullLength).toBe(TOOL_IO_BUDGETS.leaf + 100);
+		expect(readBlock?.status).toBe("success");
 	});
 
-	it("getChunksByRange 对子代理只返回有界 latest-3 activity，不返回 child 正文", async () => {
+	it("getPretextDocumentPage 对子代理只返回有界 latest-3 activity，不返回 child 正文", async () => {
 		seedBase();
 		insertSubagentNarrator({
 			id: "sa-done",
@@ -585,7 +584,7 @@ describe("narratorService message query regressions", () => {
 			})
 			.run();
 
-		const range = await narratorService.getChunksByRange("n1", { count: 1 });
+		const range = await narratorService.getPretextDocumentPage("n1", { limit: 20 });
 		const taskMsg = range.messages.find((m: { id: string }) => m.id === "m-task");
 		expect(taskMsg?.children ?? []).toEqual([]);
 		const taskBlock = taskMsg?.contentJson?.find(
@@ -604,13 +603,12 @@ describe("narratorService message query regressions", () => {
 			expect(toolCall).not.toHaveProperty("outputJson");
 			expect(toolCall).not.toHaveProperty("sideCars");
 		}
-		const taskToolCall = taskMsg?.toolCalls?.find(
-			(toolCall: { toolUseId: string }) => toolCall.toolUseId === "tu-task",
-		);
-		expect(taskToolCall?._subagentActivity).toEqual(taskBlock?._subagentActivity);
+		// The exact-layout page strips redundant tool-call rows; the activity lives
+		// solely on the enriched content block.
+		expect(taskMsg?.toolCalls).toEqual([]);
 	});
 
-	it("getChunksByRange 对运行中和后台子代理同样不内联 child 消息", async () => {
+	it("getPretextDocumentPage 对运行中和后台子代理同样不内联 child 消息", async () => {
 		seedBase();
 		insertSubagentNarrator({ id: "sa-working", status: "working" });
 		insertSubagentNarrator({
@@ -662,7 +660,7 @@ describe("narratorService message query regressions", () => {
 			contentJson: [{ type: "text", text: "live child b" }],
 		});
 
-		const range = await narratorService.getChunksByRange("n1", { count: 1 });
+		const range = await narratorService.getPretextDocumentPage("n1", { limit: 20 });
 		const taskA = range.messages.find((m: { id: string }) => m.id === "m-task-a");
 		const taskB = range.messages.find((m: { id: string }) => m.id === "m-task-b");
 		expect(taskA?.children ?? []).toEqual([]);
@@ -699,7 +697,7 @@ describe("narratorService message query regressions", () => {
 		expect(detail.toolUseId).toBe("shared-tool");
 	});
 
-	it("compact 标记写入和完成时应更新 chunk manifest 版本并保持顺序", async () => {
+	it("compact 标记写入和完成时保持页面顺序与 messageVersion 递增", async () => {
 		seedBase();
 
 		insertMessage({
@@ -735,14 +733,10 @@ describe("narratorService message query regressions", () => {
 			{ messageId: "m1", seq: 2 },
 		]);
 
-		const manifestAfterInsert = await narratorService.getChunkManifest("n1", 0);
-		expect(manifestAfterInsert.unchanged).toBe(false);
-		if (!manifestAfterInsert.unchanged) {
-			expect(manifestAfterInsert.messageVersion).toBe(1);
-			expect(manifestAfterInsert.total).toBe(3);
-		}
+		const pageAfterInsert = await narratorService.getPretextDocumentPage("n1", { limit: 20 });
+		expect(pageAfterInsert.messageVersion).toBe(1);
 
-		let range = await narratorService.getChunksByRange("n1", { count: 1 });
+		let range = pageAfterInsert;
 		expect(range.messages.map((m: { id: string }) => m.id)).toEqual(["m0", compacting.id, "m1"]);
 		let compactBlock = range.messages
 			.find((m: { id: string }) => m.id === compacting.id)
@@ -753,11 +747,10 @@ describe("narratorService message query regressions", () => {
 		const afterFinalize = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
 		expect(afterFinalize?.messageVersion).toBe(2);
 
-		const manifestAfterFinalize = await narratorService.getChunkManifest("n1", 1);
-		expect(manifestAfterFinalize.unchanged).toBe(false);
-		expect(manifestAfterFinalize.messageVersion).toBe(2);
+		const pageAfterFinalize = await narratorService.getPretextDocumentPage("n1", { limit: 20 });
+		expect(pageAfterFinalize.messageVersion).toBe(2);
 
-		range = await narratorService.getChunksByRange("n1", { count: 1 });
+		range = pageAfterFinalize;
 		compactBlock = range.messages
 			.find((m: { id: string }) => m.id === compacting.id)
 			?.contentJson?.find((b: { type?: string }) => b.type === "compact");
@@ -2181,9 +2174,9 @@ describe("narratorService message query regressions", () => {
 		});
 	});
 
-	describe("getChunksByRange 边界标志", () => {
-		// CHUNK_SIZE = 20; seed 50 top-level messages (seq 0..49) so a count=1
-		// window (rowLimit 20) leaves content on both sides for paging.
+	describe("getPretextDocumentPage 边界标志", () => {
+		// Seed 50 top-level messages (seq 0..49) so a limit=20 window leaves
+		// content on both sides for paging.
 		function seedManyMessages(n: number) {
 			seedBase("n1");
 			for (let i = 0; i < n; i++) {
@@ -2195,135 +2188,65 @@ describe("narratorService message query regressions", () => {
 			}
 		}
 
-		it("尾部窗口 hasOlder 为真、hasNewer 为假", async () => {
+		it("尾部窗口 hasPrev 为真、hasNext 为假", async () => {
 			seedManyMessages(50);
-			const res = await narratorService.getChunksByRange("n1", { direction: "older", count: 1 });
+			const res = await narratorService.getPretextDocumentPage("n1", { limit: 20 });
 			// Tail window: newest 20 messages, seq 30..49.
 			expect(res.minSeq).toBe(30);
 			expect(res.maxSeq).toBe(49);
-			expect(res.hasOlder).toBe(true);
-			expect(res.hasNewer).toBe(false);
+			expect(res.hasPrev).toBe(true);
+			expect(res.hasNext).toBe(false);
 		});
 
 		it("向更早分页时两侧标志都精确（中间窗口）", async () => {
 			seedManyMessages(50);
-			const tail = await narratorService.getChunksByRange("n1", { direction: "older", count: 1 });
+			const tail = await narratorService.getPretextDocumentPage("n1", { limit: 20 });
 			// Page older from the tail's min seq (30): expect seq 10..29.
-			const older = await narratorService.getChunksByRange("n1", {
-				direction: "older",
-				count: 1,
-				fromSeq: tail.minSeq ?? undefined,
+			const older = await narratorService.getPretextDocumentPage("n1", {
+				beforeSeq: tail.minSeq ?? undefined,
+				limit: 20,
 			});
 			expect(older.minSeq).toBe(10);
 			expect(older.maxSeq).toBe(29);
-			// Still older content below seq 10, and newer content above seq 29.
-			expect(older.hasOlder).toBe(true);
-			expect(older.hasNewer).toBe(true);
+			// Still older content below seq 10, and the caller already holds the
+			// newer rows above seq 29 (a beforeSeq page is by definition preceded).
+			expect(older.hasPrev).toBe(true);
+			expect(older.hasNext).toBe(true);
 		});
 
-		it("到达最早一页时 hasOlder 为假、hasNewer 为真", async () => {
+		it("到达最早一页时 hasPrev 为假、hasNext 为真", async () => {
 			seedManyMessages(50);
 			// Page older starting just past the head so the window lands on seq 0..9.
-			const head = await narratorService.getChunksByRange("n1", {
-				direction: "older",
-				count: 1,
-				fromSeq: 10,
+			const head = await narratorService.getPretextDocumentPage("n1", {
+				beforeSeq: 10,
+				limit: 20,
 			});
 			expect(head.minSeq).toBe(0);
 			expect(head.maxSeq).toBe(9);
-			expect(head.hasOlder).toBe(false);
-			expect(head.hasNewer).toBe(true);
+			expect(head.hasPrev).toBe(false);
+			expect(head.hasNext).toBe(true);
 		});
 
 		it("向更新分页时两侧标志都精确", async () => {
 			seedManyMessages(50);
-			// Newer than seq 9 → seq 10..29 (rowLimit 20).
-			const newer = await narratorService.getChunksByRange("n1", {
-				direction: "newer",
-				count: 1,
-				fromSeq: 9,
+			// Newer than seq 9 → seq 10..29 (limit 20), ascending.
+			const newer = await narratorService.getPretextDocumentPage("n1", {
+				afterSeq: 9,
+				limit: 20,
 			});
 			expect(newer.minSeq).toBe(10);
 			expect(newer.maxSeq).toBe(29);
-			expect(newer.hasOlder).toBe(true);
-			expect(newer.hasNewer).toBe(true);
+			expect(newer.hasPrev).toBe(true);
+			expect(newer.hasNext).toBe(true);
 		});
 
 		it("消息数不足一个窗口时两侧标志均为假", async () => {
 			seedManyMessages(5);
-			const res = await narratorService.getChunksByRange("n1", { direction: "older", count: 1 });
+			const res = await narratorService.getPretextDocumentPage("n1", { limit: 20 });
 			expect(res.minSeq).toBe(0);
 			expect(res.maxSeq).toBe(4);
-			expect(res.hasOlder).toBe(false);
-			expect(res.hasNewer).toBe(false);
-		});
-	});
-
-	describe("getChunkManifest 窗口化", () => {
-		// CHUNK_SIZE = 20; seed 50 top-level messages (seq 0..49) → 3 chunks:
-		// [0..19], [20..39], [40..49].
-		function seedManyMessages(n: number) {
-			seedBase("n1");
-			for (let i = 0; i < n; i++) {
-				insertMessage({
-					id: `m${i}`,
-					seq: i,
-					contentJson: [{ type: "text", text: `msg ${i}` }],
-				});
-			}
-		}
-
-		it("limitChunks 只返回最新 N 个 chunk，total 仍为全量", async () => {
-			seedManyMessages(50);
-			const manifest = await narratorService.getChunkManifest("n1", undefined, { limitChunks: 2 });
-			expect(manifest.unchanged).toBe(false);
-			if (manifest.unchanged) return;
-			// Newest 2 chunks: [20..39] and [40..49].
-			expect(manifest.chunks.map((c) => [c[1], c[2]])).toEqual([
-				[20, 39],
-				[40, 49],
-			]);
-			expect(manifest.total).toBe(50);
-			expect(manifest.windowFirstIndex).toBe(1);
-			expect(manifest.hasOlderChunks).toBe(true);
-		});
-
-		it("beforeSeq 向更早翻页，取紧邻的更旧 chunk", async () => {
-			seedManyMessages(50);
-			// Older than the tail window (firstSeq 20) → expect chunk [0..19].
-			const older = await narratorService.getChunkManifest("n1", undefined, {
-				limitChunks: 10,
-				beforeSeq: 20,
-			});
-			expect(older.unchanged).toBe(false);
-			if (older.unchanged) return;
-			expect(older.chunks.map((c) => [c[1], c[2]])).toEqual([[0, 19]]);
-			expect(older.windowFirstIndex).toBe(0);
-			expect(older.hasOlderChunks).toBe(false);
-			expect(older.total).toBe(50);
-		});
-
-		it("limitChunks 覆盖全部时返回完整 manifest 且 hasOlderChunks 为假", async () => {
-			seedManyMessages(50);
-			const manifest = await narratorService.getChunkManifest("n1", undefined, {
-				limitChunks: 100,
-			});
-			expect(manifest.unchanged).toBe(false);
-			if (manifest.unchanged) return;
-			expect(manifest.chunks.length).toBe(3);
-			expect(manifest.windowFirstIndex).toBe(0);
-			expect(manifest.hasOlderChunks).toBe(false);
-		});
-
-		it("不传 window 时返回完整 manifest（向后兼容）", async () => {
-			seedManyMessages(50);
-			const manifest = await narratorService.getChunkManifest("n1");
-			expect(manifest.unchanged).toBe(false);
-			if (manifest.unchanged) return;
-			expect(manifest.chunks.length).toBe(3);
-			expect(manifest.windowFirstIndex).toBe(0);
-			expect(manifest.hasOlderChunks).toBe(false);
-			expect(manifest.total).toBe(50);
+			expect(res.hasPrev).toBe(false);
+			expect(res.hasNext).toBe(false);
 		});
 	});
 
@@ -2461,12 +2384,16 @@ describe("narratorService message query regressions", () => {
 		]);
 		const childRow = await db.query.narrators.findFirst({ where: eq(narrators.id, child.id) });
 		expect(childRow?.forkMessageId).toBe("fork-after");
-		const childManifest = await narratorService.getChunkManifest(child.id);
-		expect(childManifest.unchanged).toBe(false);
-		if (!childManifest.unchanged) {
-			expect(childManifest.total).toBe(2);
-			expect(childManifest.messageVersion).toBe(childRow?.messageVersion ?? 0);
-		}
+		// The lazy fork only materializes the refs after its parent's last compact,
+		// so the tail page must keep hasPrev true until the lineage is exhausted.
+		const childTailPage = await narratorService.getPretextDocumentPage(child.id, { limit: 20 });
+		expect(childTailPage.hasPrev).toBe(true);
+		expect(childTailPage.messageVersion).toBe(childRow?.messageVersion ?? 0);
+		const childOlderPage = await narratorService.getPretextDocumentPage(child.id, {
+			beforeSeq: childTailPage.minSeq ?? undefined,
+			limit: 100,
+		});
+		expect(childOlderPage.hasPrev).toBe(false);
 
 		const beforeVersion = await narratorService.getMessageVersion(child.id);
 		const continued = await narratorService.persistUserMessage(child.id, "continue after fork");
@@ -2702,7 +2629,7 @@ describe("subagent activity input summary projection", () => {
 				});
 			}
 		}
-		const range = await narratorService.getChunksByRange("n1", { count: 1 });
+		const range = await narratorService.getPretextDocumentPage("n1", { limit: 20 });
 		const block = range.messages
 			.find((m: { id: string }) => m.id === "m-agent")
 			?.contentJson?.find(
@@ -2847,5 +2774,154 @@ describe("subagent activity input summary projection", () => {
 		expect(JSON.stringify(calls[0])).not.toContain("SECRET-BODY");
 		// Only the whitelisted key survives.
 		expect(calls[0]?.inputSummary).toEqual({ file_path: "/repo/f.ts" });
+	});
+});
+
+/**
+ * Dismissing an interrupt task-guard reminder.
+ *
+ * The card's close button DELETEs the notice, and the delete has to satisfy three
+ * things the endpoint alone cannot show:
+ *
+ *   - it must refuse to delete anything that is not that reminder (the id comes from
+ *     the client, and every other system card would be equally deletable otherwise);
+ *   - a message SHARED with another narrator (a full fork copies the ref) must lose
+ *     only this narrator's ref — deleting the row would tear the notice out of the
+ *     fork's history too, which no user asked for and nothing would report;
+ *   - `messageVersion` must advance, or the client's next page load is served the
+ *     pre-delete document from cache.
+ *
+ * Its siblings (dismissCwdRecoveryMessage / dismissErrorMessage) are covered here;
+ * this one shipped without any server-side test at all — the only coverage was a
+ * frontend guard that string-matches the source.
+ */
+describe("dismissInterruptTaskGuardMessage", () => {
+	const guardBlocks = [
+		{ type: "system_injection", source: "interrupt_task_guard", text: "继续未完成的任务" },
+	];
+
+	function insertGuard(id: string, seq: number, narratorId = "n1") {
+		insertMessage({ id, seq, narratorId, role: "sys", contentJson: guardBlocks });
+	}
+
+	async function messageVersionOf(narratorId: string) {
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { messageVersion: true },
+		});
+		return row?.messageVersion ?? 0;
+	}
+
+	it("deletes the reminder and bumps messageVersion", async () => {
+		seedBase();
+		insertGuard("g1", 1);
+		const before = await messageVersionOf("n1");
+
+		await narratorService.dismissInterruptTaskGuardMessage("n1", "g1");
+
+		expect(
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "g1") }),
+		).toBeUndefined();
+		expect(
+			await db.query.narratorMessageRefs.findFirst({
+				where: eq(narratorMessageRefs.messageId, "g1"),
+			}),
+		).toBeUndefined();
+		expect(await messageVersionOf("n1")).toBe(before + 1);
+	});
+
+	it("keeps the message row when ANOTHER narrator still references it", async () => {
+		// A full fork shares the prefix by copying refs, so the row is not this
+		// narrator's to delete — only its own ref is.
+		seedBase();
+		db.insert(narrators)
+			.values({
+				id: "n2",
+				chapterId: "ch1",
+				type: "primary",
+				inheritMode: "full",
+				createdAt: ts(),
+				updatedAt: ts(),
+			})
+			.run();
+		insertGuard("g1", 1);
+		db.insert(narratorMessageRefs)
+			.values({ id: "ref-n2-g1", narratorId: "n2", messageId: "g1", seq: 1 })
+			.run();
+
+		await narratorService.dismissInterruptTaskGuardMessage("n1", "g1");
+
+		// The row survives for the fork…
+		expect(
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "g1") }),
+		).toBeDefined();
+		// …with exactly the fork's ref left.
+		const refs = await db.query.narratorMessageRefs.findMany({
+			where: eq(narratorMessageRefs.messageId, "g1"),
+		});
+		expect(refs.map((r) => r.narratorId)).toEqual(["n2"]);
+	});
+
+	it("refuses a message that is not an interrupt task-guard reminder", async () => {
+		seedBase();
+		// A different system injection: same role, same block type, other source.
+		insertMessage({
+			id: "other",
+			seq: 1,
+			role: "sys",
+			contentJson: [{ type: "system_injection", source: "spec_carryover", text: "x" }],
+		});
+
+		await expect(narratorService.dismissInterruptTaskGuardMessage("n1", "other")).rejects.toThrow(
+			/not an interrupt task-guard reminder/,
+		);
+		// And nothing was deleted on the way to the error.
+		expect(
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "other") }),
+		).toBeDefined();
+	});
+
+	it("refuses a guard-shaped block on a non-sys message", async () => {
+		// Role is checked as well as the block: an assistant message could otherwise
+		// carry a matching block and become deletable.
+		seedBase();
+		insertMessage({ id: "a1", seq: 1, role: "assistant", contentJson: guardBlocks });
+		await expect(narratorService.dismissInterruptTaskGuardMessage("n1", "a1")).rejects.toThrow();
+	});
+
+	it("is idempotent: a second dismissal is a no-op, not an error", async () => {
+		seedBase();
+		insertGuard("g1", 1);
+		await narratorService.dismissInterruptTaskGuardMessage("n1", "g1");
+		const afterFirst = await messageVersionOf("n1");
+		// The row is gone, so there is no ref to find and nothing to verify — the
+		// caller's goal already holds, and a throw here would surface as a failed
+		// dismissal for a notice that is already gone.
+		await narratorService.dismissInterruptTaskGuardMessage("n1", "g1");
+		expect(await messageVersionOf("n1")).toBe(afterFirst);
+	});
+
+	it("ignores a message this narrator does not reference", async () => {
+		// The id is client-supplied, so a stale/foreign id must not touch another
+		// narrator's history.
+		seedBase();
+		db.insert(narrators)
+			.values({
+				id: "n2",
+				chapterId: "ch1",
+				type: "primary",
+				inheritMode: "fresh",
+				createdAt: ts(),
+				updatedAt: ts(),
+			})
+			.run();
+		insertGuard("g2", 1, "n2");
+
+		await narratorService.dismissInterruptTaskGuardMessage("n1", "g2");
+
+		expect(
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "g2") }),
+		).toBeDefined();
+		expect(await messageVersionOf("n1")).toBe(0);
 	});
 });

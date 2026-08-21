@@ -102,10 +102,21 @@ export interface SystemTextData {
 	 * those kinds, whose chrome ALWAYS reserves a button row.
 	 *
 	 * The `error` card is the exception: its button row is conditional (only the
-	 * provider fix adds one), so for that kind a non-empty `buttons` array ADDS a
-	 * row — see `resolveSystemTextChrome`.
+	 * optional provider fix / model probe add one), so for that kind a non-empty
+	 * `buttons` array ADDS a row — see `resolveSystemTextChrome`. The error card's
+	 * buttons share ONE row, so the count is height-neutral once the row exists.
 	 */
 	buttons?: string[];
+	/**
+	 * Stable identifier per entry in `buttons`, positionally aligned.
+	 *
+	 * Height-neutral: it exists so the render layer binds a handler by MEANING
+	 * instead of by index. The error card's buttons are independently conditional,
+	 * so with index-based binding a card that qualifies for only the SECOND one
+	 * would wire the first one's handler to it — a wrong action behind a correct
+	 * label, which no height or layout assertion can catch.
+	 */
+	buttonIds?: string[];
 	/** Primary Mantine colour (indigo / red / orange …). Height-neutral. */
 	color?: string;
 	/** carryover variant: fork (git-fork icon) vs contextCleared (eraser icon). */
@@ -328,6 +339,10 @@ export function resolveBodyText(kind: SystemTextKind, data: SystemTextData): str
  */
 export function resolveSystemTextChrome(kind: SystemTextKind, data: SystemTextData): KindChrome {
 	const chrome = KIND_CHROME[kind];
+	// One row regardless of how many buttons qualify: the error card lays them out
+	// in a single `Group`, so the second button costs width, not height. (The card is
+	// full-width and the labels are short; a wrap would need a viewport far narrower
+	// than the list's own minimum.)
 	if (kind !== "error" || !data.buttons?.length) return chrome;
 	return { ...chrome, postBody: STACK_GAP + BUTTON_COMPACT_XS };
 }

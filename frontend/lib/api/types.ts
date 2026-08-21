@@ -16,6 +16,24 @@ export type ChangelogEntry = {
 	date: string;
 } & LocalizedValue<string>;
 
+/** One Kimi usage window (5-hour / weekly / monthly) as cached by the server. */
+export interface KimiUsageWindow {
+	used: number | null;
+	limit: number | null;
+	remaining: number | null;
+	resetTime: string | null;
+}
+
+/** Per-provider Kimi (kimi.com / kimi.ai) usage cache entry. */
+export interface KimiUsageCache {
+	fiveHour: KimiUsageWindow | null;
+	weekly: KimiUsageWindow | null;
+	monthly: KimiUsageWindow | null;
+	extraWindows: Array<{ label: string } & KimiUsageWindow>;
+	fetchedAt: number;
+	error: string | null;
+}
+
 /**
  * How a third-party component reaches the user — which is what determines our
  * attribution obligations, not which `package.json` field listed it.
@@ -151,6 +169,23 @@ export interface StorageScanResult {
 	categories: StorageCategoryResult[];
 	totalBytes: number;
 	scannedAt: number;
+}
+
+/**
+ * Server-side background scan job state. The scan outlives the page that started
+ * it; clients poll this to observe progress and pick up the final result.
+ */
+export type StorageScanJobStatus = "idle" | "running" | "complete" | "error" | "cancelled";
+
+export interface StorageScanJobState {
+	status: StorageScanJobStatus;
+	progressMessage: string | null;
+	progressDetail: { done: number; total: number } | null;
+	categories: StorageCategoryResult[];
+	result: StorageScanResult | null;
+	error: string | null;
+	startedAt: number | null;
+	finishedAt: number | null;
 }
 
 export interface DatabaseCleanupCandidateSummary {
@@ -778,45 +813,6 @@ export interface PaginatedNarrators {
 	hasMore: boolean;
 	nextCursor: string | null;
 	totalCount: number;
-}
-
-// ── Chunk virtualization (manifest + range) ────────────────────────────────
-
-/** Decoded manifest entry (after expanding the compact wire tuple). */
-export interface ChunkManifestEntry {
-	/** = first message id in the chunk (stable across compact/seq shifts) */
-	id: string;
-	firstSeq: number;
-	lastSeq: number;
-	count: number;
-}
-
-/** Compact wire tuple: [id, firstSeq, lastSeq, count]. */
-export type ChunkManifestTuple = [string, number, number, number];
-
-export type ChunkManifest =
-	| { unchanged: true; messageVersion: number }
-	| {
-			unchanged: false;
-			messageVersion: number;
-			total: number;
-			/** Index of the first returned chunk within the full history. */
-			windowFirstIndex: number;
-			/** True when chunks older than the returned window exist. */
-			hasOlderChunks: boolean;
-			/** Compact tuples on the wire; decode with decodeChunkManifestTuple. */
-			chunks: ChunkManifestTuple[];
-	  };
-
-export interface ChunkRangeResult {
-	messages: TreeMessage[];
-	minSeq: number | null;
-	maxSeq: number | null;
-	hasOlder: boolean;
-	hasNewer: boolean;
-	messageVersion: number;
-	pruneBoundaryMessageId?: string | null;
-	prunedPercent?: number | null;
 }
 
 export interface PretextDocumentPageResult {

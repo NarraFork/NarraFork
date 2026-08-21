@@ -1,8 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { ApiError } from "./client";
-import {
-	scanStorageStream,
-} from "./streams";
 
 	const g = globalThis as typeof globalThis & {
 		localStorage?: Storage;
@@ -103,41 +100,6 @@ import {
 		} catch (err) {
 			expect(err).toBeInstanceOf(ApiError);
 			expect((err as ApiError).status).toBe(500);
-		}
-	});
-
-	test("surfaces structured storage scan errors", async () => {
-		Object.defineProperty(g, "localStorage", {
-			value: {
-				getItem: () => null,
-				setItem: () => {},
-				removeItem: () => {},
-			},
-			configurable: true,
-		});
-		Object.defineProperty(g, "fetch", {
-			value: async () =>
-				new Response(
-					JSON.stringify({
-						code: "STORAGE_SCAN_FORBIDDEN",
-						reason: "Admin access required",
-					}),
-					{
-						status: 403,
-						statusText: "Forbidden",
-						headers: { "content-type": "application/json" },
-					},
-				),
-			configurable: true,
-		});
-
-		try {
-			await scanStorageStream({});
-			throw new Error("expected storage scan to fail");
-		} catch (err) {
-			expect(err).toBeInstanceOf(ApiError);
-			expect((err as Error).message).toBe("Admin access required");
-			expect((err as ApiError).data?.code).toBe("STORAGE_SCAN_FORBIDDEN");
 		}
 	});
 });

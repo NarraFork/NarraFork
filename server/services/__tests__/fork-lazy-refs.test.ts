@@ -191,7 +191,7 @@ describe("older history stays reachable", () => {
 		expect(await hasUnmaterializedRefsBelow("parent", 5)).toBeFalse();
 	});
 
-	test("the chunk manifest keeps hasOlderChunks true while history is un-materialized", async () => {
+	test("the exact-layout tail page keeps hasPrev true while history is un-materialized", async () => {
 		const { tailMessageId } = await seedParentWithCompact();
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
@@ -199,12 +199,19 @@ describe("older history stays reachable", () => {
 			standalone: true,
 		});
 
-		const manifest = await narratorMessageQueries.getChunkManifest(child.id);
-		expect(manifest.unchanged).toBeFalse();
-		if (manifest.unchanged) return;
-		// Without the lazy-aware probe this would be false (windowFirstIndex === 0) and
-		// the client would stop scrolling at the fork boundary.
-		expect(manifest.hasOlderChunks).toBeTrue();
+		const tail = await narratorMessageQueries.getPretextDocumentPage(child.id);
+		// Without the lazy-aware probe this would be false (only 4 local rows, well
+		// under the limit) and the client would stop scrolling at the fork boundary.
+		expect(tail.hasPrev).toBeTrue();
+
+		// Walking older pulls the hidden refs in and yields the parent's history.
+		const older = await narratorMessageQueries.getPretextDocumentPage(child.id, {
+			beforeSeq: tail.minSeq ?? undefined,
+			limit: 50,
+		});
+		expect(older.messages.map((m) => m.id)).toContain("parent-old-0");
+		// Fully materialized now: the walk has reached actual start of history.
+		expect(older.hasPrev).toBeFalse();
 	});
 
 	test("backfilling yields exactly the parent's visible history", async () => {

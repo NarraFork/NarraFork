@@ -26,9 +26,11 @@ import {
 } from "./reflection-progress-store";
 
 /**
- * Message-layer events exclusively owned by the chunks hook (useNarratorChunksWS).
- * Panel never receives these — they are unconditionally excluded from the
- * panel's `kind: "panel"` subscription.
+ * Message-layer events owned by the message-list subscription, not the panel.
+ *
+ * The panel never receives these: they are unconditionally excluded from its
+ * `kind: "panel"` subscription, so the list is the single consumer that applies
+ * them to the document.
  */
 const PANEL_EXCLUDED_EVENT_TYPES = [
 	"user_message",

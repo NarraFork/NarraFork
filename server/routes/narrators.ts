@@ -2691,21 +2691,29 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 		requestedLimit != null && !Number.isNaN(requestedLimit)
 			? Math.min(Math.max(requestedLimit, 1), 100)
 			: 100;
-	const [result, narratorMeta] = await Promise.all([
-		narratorService.getPretextDocumentPage(id, {
-			afterSeq: afterSeq != null && !Number.isNaN(afterSeq) ? afterSeq : undefined,
-			beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
-			limit,
-			messageVersion:
-				expectedMessageVersion != null && !Number.isNaN(expectedMessageVersion)
-					? expectedMessageVersion
-					: undefined,
-		}),
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { pruneBoundaryMessageId: true, prunedPercent: true, messageVersion: true },
-		}),
-	]);
+	const result = await narratorService.getPretextDocumentPage(id, {
+		afterSeq: afterSeq != null && !Number.isNaN(afterSeq) ? afterSeq : undefined,
+		beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
+		limit,
+		messageVersion:
+			expectedMessageVersion != null && !Number.isNaN(expectedMessageVersion)
+				? expectedMessageVersion
+				: undefined,
+	});
+	// Read the prune metadata AFTER the page, never concurrently.
+	//
+	// The page builder materializes a lazy fork's missing refs on demand
+	// (`ensureRefsCoverSeq`), and that backfill bumps `messageVersion`. Run in
+	// parallel, this query resolves BEFORE the backfill commits while the page
+	// carries the post-backfill version — so the equality check below failed
+	// deterministically on the first upward scroll past a fork boundary, the one
+	// place the backfill actually copies anything. Sequenced, both sides observe
+	// the same post-backfill version, and the check goes back to meaning what it
+	// says: another writer changed the narrator underneath us.
+	const narratorMeta = await db.query.narrators.findFirst({
+		where: eq(narrators.id, id),
+		columns: { pruneBoundaryMessageId: true, prunedPercent: true, messageVersion: true },
+	});
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
 	if (narratorMeta.messageVersion !== result.messageVersion)
 		throw new AppError(
@@ -2720,67 +2728,7 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	});
 });
 
-// Chunk manifest for the virtualized message list (lightweight fingerprints).
-// `since` short-circuits with { unchanged: true } when the structure version
-// has not changed.
-narratorRoutes.get("/:id/chunk-manifest", async (c) => {
-	const id = c.req.param("id");
-	const sinceRaw = c.req.query("since");
-	const since = sinceRaw != null ? Number.parseInt(sinceRaw, 10) : undefined;
-	const limitRaw = c.req.query("limitChunks");
-	const limitChunks = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
-	const beforeSeqRaw = c.req.query("beforeSeq");
-	const beforeSeq = beforeSeqRaw != null ? Number.parseInt(beforeSeqRaw, 10) : undefined;
-	const window =
-		(limitChunks != null && !Number.isNaN(limitChunks)) ||
-		(beforeSeq != null && !Number.isNaN(beforeSeq))
-			? {
-					limitChunks: limitChunks != null && !Number.isNaN(limitChunks) ? limitChunks : undefined,
-					beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
-				}
-			: undefined;
-	const result = await narratorService.getChunkManifest(
-		id,
-		since != null && !Number.isNaN(since) ? since : undefined,
-		window,
-	);
-	return c.json(result);
-});
-
-// Fetch a contiguous range of chunks (full message trees) for the virtualized
-// list. Replaces the legacy 20/50 + around triple-path on the chunk codepath.
-narratorRoutes.get("/:id/chunks", async (c) => {
-	const id = c.req.param("id");
-	const fromSeqRaw = c.req.query("fromSeq");
-	const fromSeq = fromSeqRaw != null ? Number.parseInt(fromSeqRaw, 10) : undefined;
-	const direction = c.req.query("direction") === "newer" ? "newer" : "older";
-	const countRaw = c.req.query("count");
-	const count = countRaw != null ? Number.parseInt(countRaw, 10) : undefined;
-	const [result, narratorMeta] = await Promise.all([
-		narratorService.getChunksByRange(id, {
-			fromSeq: fromSeq != null && !Number.isNaN(fromSeq) ? fromSeq : undefined,
-			direction,
-			count: count != null && !Number.isNaN(count) ? count : undefined,
-		}),
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: {
-				pruneBoundaryMessageId: true,
-				prunedPercent: true,
-				messageVersion: true,
-			},
-		}),
-	]);
-	if (!narratorMeta) throw new NotFoundError("Narrator", id);
-	return c.json({
-		...result,
-		pruneBoundaryMessageId: narratorMeta.pruneBoundaryMessageId ?? null,
-		prunedPercent: narratorMeta.prunedPercent ?? null,
-		messageVersion: narratorMeta.messageVersion ?? 0,
-	});
-});
-
-// Resolve a message id to the chunk coordinate used by the virtualized list.
+// Resolve a message id to the document coordinate the exact-layout list jumps to.
 narratorRoutes.get("/:id/message-location/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
@@ -3138,6 +3086,19 @@ narratorRoutes.delete("/:id/cwd-recovery-messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	await narratorService.dismissCwdRecoveryMessage(narratorId, messageId);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
+	return c.json({ ok: true, deletedMessageIds: [messageId] });
+});
+
+// Dismiss the interrupt task-guard reminder message
+narratorRoutes.delete("/:id/interrupt-task-guard-messages/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	await narratorService.dismissInterruptTaskGuardMessage(narratorId, messageId);
 	broadcastToNarrator(narratorId, {
 		type: "messages_deleted",
 		narratorId,

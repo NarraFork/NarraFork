@@ -77,6 +77,8 @@ interface RenderReasoningProps {
 	animateStreaming?: boolean;
 	/** Stable per-element key base (the vlist item's spec.key) for anim memory. */
 	animKeyBase?: string;
+	/** The anim store's scope (narratorId); see RenderMarkdown.animScope. */
+	animScope?: string;
 }
 
 const BRAIN_ICON_SIZE = 10;
@@ -99,6 +101,7 @@ export function RenderReasoning({
 	onUnknownHeight,
 	animateStreaming,
 	animKeyBase,
+	animScope,
 }: RenderReasoningProps) {
 	switch (measured.form) {
 		case "streaming":
@@ -119,6 +122,7 @@ export function RenderReasoning({
 					onUnknownHeight={onUnknownHeight}
 					animateStreaming={animateStreaming}
 					animKeyBase={animKeyBase}
+					animScope={animScope}
 				/>
 			);
 	}
@@ -266,6 +270,7 @@ function ExpandedView({
 	onUnknownHeight,
 	animateStreaming,
 	animKeyBase,
+	animScope,
 }: {
 	measured: MeasuredReasoning;
 	labels: ReasoningLabels;
@@ -276,6 +281,8 @@ function ExpandedView({
 	onUnknownHeight?: (height: number) => void;
 	animateStreaming?: boolean;
 	animKeyBase?: string;
+	/** The anim store's scope (narratorId); see RenderMarkdown.animScope. */
+	animScope?: string;
 }) {
 	const showToggle = !measured.isStreaming;
 	const bodyMeasured: MeasuredElement = {
@@ -317,6 +324,7 @@ function ExpandedView({
 					onUnknownHeight={onUnknownHeight}
 					animateStreaming={animateStreaming}
 					animKeyBase={animKeyBase != null ? `${animKeyBase}:reasoning` : undefined}
+					animScope={animScope}
 				/>
 				{measured.hasTranslationToggle ? (
 					<Group

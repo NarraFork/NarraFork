@@ -27,6 +27,10 @@ export interface AppearanceSectionProps {
 	setWakeLock: (v: boolean) => void;
 	advancedAnim: boolean;
 	setAdvancedAnim: (v: boolean) => void;
+	blurInMs: number;
+	setBlurInMs: (v: number) => void;
+	streamTokenMs: number;
+	setStreamTokenMs: (v: number) => void;
 	expandReasoning: boolean;
 	setExpandReasoning: (v: boolean) => void;
 	centeredColumn: boolean;
@@ -46,6 +50,10 @@ export function AppearanceSection({
 	setWakeLock,
 	advancedAnim,
 	setAdvancedAnim,
+	blurInMs,
+	setBlurInMs,
+	streamTokenMs,
+	setStreamTokenMs,
 	expandReasoning,
 	setExpandReasoning,
 	centeredColumn,
@@ -55,6 +63,8 @@ export function AppearanceSection({
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
+	const [localBlurInMs, setLocalBlurInMs] = useState<number | null>(null);
+	const [localStreamTokenMs, setLocalStreamTokenMs] = useState<number | null>(null);
 	const { themes: availableThemes, setEnabled: setThemeEnabled } = usePluginAvailableThemes();
 	const [pluginThemePref, setPluginThemePref] = usePluginThemePref();
 
@@ -130,6 +140,71 @@ export function AppearanceSection({
 				checked={advancedAnim}
 				onChange={(e) => setAdvancedAnim(e.currentTarget.checked)}
 			/>
+			{/* Duration of the card-level blur-in. Shown always but disabled while the
+			    switch above is off, so the control that owns it stays discoverable
+			    instead of appearing out of nowhere after a toggle. Local state during
+			    the drag keeps the slider responsive; the pref is written on release. */}
+			<Stack gap={4} ml="xl" opacity={advancedAnim ? 1 : 0.5}>
+				<Text size="sm" fw={500}>
+					{t("blurInDuration")}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{t("blurInDurationDesc")}
+				</Text>
+				<Slider
+					disabled={!advancedAnim}
+					value={localBlurInMs ?? blurInMs}
+					onChange={setLocalBlurInMs}
+					onChangeEnd={(v) => {
+						setLocalBlurInMs(null);
+						setBlurInMs(v);
+					}}
+					min={0}
+					max={2000}
+					step={50}
+					label={(v) => (v === 0 ? t("blurInDurationInstant") : `${v}ms`)}
+					marks={[
+						{ value: 0, label: t("blurInDurationInstant") },
+						{ value: 400, label: "400ms" },
+						{ value: 1000, label: "1s" },
+						{ value: 2000, label: "2s" },
+					]}
+					mb="md"
+				/>
+			</Stack>
+			{/* Duration of the streaming per-grapheme fade. Both renderers (the virtual
+			    list and the classic one) follow this value. Note the setting is a
+			    request, not a guarantee: past ~1s a fast stream hits the live-span cap
+			    in stream-token-anim and the oldest graphemes seal early, so the fade
+			    shortens on its own. The description text says so. */}
+			<Stack gap={4} ml="xl" opacity={advancedAnim ? 1 : 0.5}>
+				<Text size="sm" fw={500}>
+					{t("streamTokenDuration")}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{t("streamTokenDurationDesc")}
+				</Text>
+				<Slider
+					disabled={!advancedAnim}
+					value={localStreamTokenMs ?? streamTokenMs}
+					onChange={setLocalStreamTokenMs}
+					onChangeEnd={(v) => {
+						setLocalStreamTokenMs(null);
+						setStreamTokenMs(v);
+					}}
+					min={0}
+					max={5000}
+					step={20}
+					label={(v) => (v === 0 ? t("blurInDurationInstant") : `${v}ms`)}
+					marks={[
+						{ value: 0, label: t("blurInDurationInstant") },
+						{ value: 320, label: "320ms" },
+						{ value: 2500, label: "2.5s" },
+						{ value: 5000, label: "5s" },
+					]}
+					mb="md"
+				/>
+			</Stack>
 			<Switch
 				label={t("narratorCenteredColumn")}
 				description={t("narratorCenteredColumnDesc")}

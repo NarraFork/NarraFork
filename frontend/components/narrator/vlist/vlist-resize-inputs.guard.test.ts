@@ -20,6 +20,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { sliceBracketedRegion } from "./source-slice";
 
 const VLIST_DIR = import.meta.dir;
 
@@ -27,13 +28,18 @@ function read(relativePath: string): string {
 	return readFileSync(join(VLIST_DIR, relativePath), "utf8");
 }
 
-/** The `usePretextDocument({...})` call's option object in the shell. */
+/**
+ * The `usePretextDocument({...})` call's option object in the shell.
+ *
+ * Brace-matched, NOT cut at a hardcoded `"\n\t});"`: that sentinel assumed the
+ * call sits at one tab of indentation, so re-indenting the shell made this guard
+ * fail for a reason that has nothing to do with viewport buckets (see
+ * source-slice.ts).
+ */
 function documentHookOptions(source: string): string {
-	const start = source.indexOf("usePretextDocument(narratorId, {");
-	expect(start).toBeGreaterThan(-1);
-	const end = source.indexOf("\n\t});", start);
-	expect(end).toBeGreaterThan(start);
-	return source.slice(start, end);
+	const region = sliceBracketedRegion(source, "usePretextDocument(narratorId, {");
+	if (region === null) throw new Error("usePretextDocument(narratorId, { … }) call not found");
+	return region;
 }
 
 describe("resize inputs cannot reach the layout at pixel resolution", () => {

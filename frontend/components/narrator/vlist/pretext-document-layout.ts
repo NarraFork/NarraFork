@@ -63,6 +63,8 @@ export interface BuildPretextDocumentLayoutOptions {
 	resolveSubagentRecentSummary?: (toolName: string, inputSummary: unknown) => string | null;
 	/** Whether an error card may offer the provider fix (a measured button row). */
 	canOfferProviderFix?: (errorText: string) => boolean;
+	/** Whether an error card may offer the model probe (shares that measured row). */
+	canOfferModelTest?: (errorText: string) => boolean;
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
 	/**
 	 * Pinned-card resolver forwarded to the adapter. Built locally by

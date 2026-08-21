@@ -23,10 +23,10 @@ import { narratorRefsBackfillLock } from "../lib/async-mutex";
 import { logger } from "../lib/logger";
 
 /**
- * Refs pulled in per backfill step. The virtualized list asks for 7 chunks of 20
- * (`getChunksByRange`), so one step covers several screens: enough that scrolling
- * doesn't crawl backwards one page at a time, small enough to stay a sub-10ms
- * ranged insert.
+ * Refs pulled in per backfill step. The exact-layout page asks for up to 100
+ * rows (`getPretextDocumentPage`), so one step covers several screens: enough
+ * that scrolling doesn't crawl backwards one page at a time, small enough to
+ * stay a sub-10ms ranged insert.
  */
 const BACKFILL_WINDOW_REFS = 400;
 

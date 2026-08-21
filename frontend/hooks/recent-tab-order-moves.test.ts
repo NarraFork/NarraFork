@@ -139,6 +139,31 @@ describe("computeRecentTabOrderMoves", () => {
 		expect(keys(replay(tabs, moves))).toEqual(keys(finalTabs));
 	});
 
+	/**
+	 * Reordering WITHIN a directory group must never reach this function: the sidebar routes
+	 * that case to the dir-order endpoint instead. This asserts the property that made the
+	 * split necessary — expressing an in-group swap as flat moves compresses the group's
+	 * members together in the flat order, which moves the GROUP itself (its position is the
+	 * position of its first member) even though the user only swapped two rows inside it.
+	 */
+	test("an in-group swap expressed as flat blocks would move unrelated tabs — hence the split", () => {
+		// Flat order interleaves the group's members with an outsider.
+		const tabs = [
+			tab("d1", { subtitle: "/w/repo" }),
+			tab("other"),
+			tab("d2", { subtitle: "/w/repo" }),
+		];
+		// Blocks describe only the in-group swap: [d2,d1] then other.
+		const { moves, finalTabs } = computeRecentTabOrderMoves(tabs, [
+			["narrator:d2", "narrator:d1"],
+			["narrator:other"],
+		]);
+		expect(moves.length).toBeGreaterThan(0);
+		// `other` was dragged nowhere, yet it is no longer between the members.
+		expect(keys(finalTabs)).toEqual(["narrator:d2", "narrator:d1", "narrator:other"]);
+		expect(keys(replay(tabs, moves))).toEqual(keys(finalTabs));
+	});
+
 	test("skips block keys that do not exist in the list instead of emitting junk moves", () => {
 		const tabs = [tab("a")];
 		const { moves, finalTabs } = computeRecentTabOrderMoves(tabs, [

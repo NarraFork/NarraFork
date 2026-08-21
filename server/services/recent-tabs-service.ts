@@ -247,6 +247,7 @@ function normalizeTab(tab: PersistedRecentTab): PersistedRecentTab {
 	if (tab.status !== undefined) normalized.status = tab.status;
 	if (tab.pinned) normalized.pinned = true;
 	if (tab.isScheduled) normalized.isScheduled = true;
+	if (tab.dirSortOrder !== undefined) normalized.dirSortOrder = tab.dirSortOrder;
 	return normalized;
 }
 
@@ -387,6 +388,7 @@ function rowToTab(row: RecentTabRow): PersistedRecentTab {
 	if (row.status != null) tab.status = row.status;
 	if (row.pinned) tab.pinned = true;
 	if (row.isScheduled) tab.isScheduled = true;
+	if (row.dirSortOrder != null) tab.dirSortOrder = row.dirSortOrder;
 	return tab;
 }
 
@@ -443,9 +445,35 @@ function buildRowValue(
 		pinned: tab.pinned ?? false,
 		isScheduled: tab.isScheduled ?? false,
 		sortOrder,
+		// A cwd change moves the tab to a DIFFERENT directory group, so a position
+		// index earned in the old group must not travel with it — it would interleave
+		// with the new group's members and produce an order nobody chose. Only
+		// narrator/subagent subtitles are cwds, and for those a subtitle change IS a
+		// cwd change; other types never take part in directory aggregation, so
+		// clearing is a no-op for them.
+		dirSortOrder: dirSortOrderFor(tab, existing),
 		createdAt: existing?.createdAt ?? now,
 		updatedAt: now,
 	};
+}
+
+/**
+ * The `dir_sort_order` to persist for a tab.
+ *
+ * A cwd change wins over the value on the tab, and that ordering is load-bearing rather
+ * than a preference. An upsert merges the STORED tab under the incoming one
+ * (`{...tabs[index], ...tab}`), so by the time the value reaches here a position carried
+ * over from the database is indistinguishable from one the reorder endpoint just set —
+ * checking "explicit value present" first therefore never cleared anything.
+ *
+ * Testing the subtitle first is safe because the reorder endpoint writes only
+ * `dirSortOrder` and never touches the subtitle, so its writes always take the branch
+ * below.
+ */
+function dirSortOrderFor(tab: PersistedRecentTab, existing?: RecentTabRow): number | null {
+	if (existing && existing.subtitle !== (tab.subtitle ?? null)) return null;
+	if (tab.dirSortOrder !== undefined) return tab.dirSortOrder;
+	return existing?.dirSortOrder ?? null;
 }
 
 function insertRowsInTransaction(
@@ -562,7 +590,11 @@ function rowNeedsUpdate(row: RecentTabRow, desired: RecentTabInsert): boolean {
 		row.lastVisitedAt !== desired.lastVisitedAt ||
 		row.pinned !== desired.pinned ||
 		row.isScheduled !== desired.isScheduled ||
-		row.sortOrder !== desired.sortOrder
+		row.sortOrder !== desired.sortOrder ||
+		// Normalize both sides: the column is nullable and the desired value may be
+		// `undefined` from a partially built insert, and `null !== undefined` would
+		// otherwise report a change on every write.
+		(row.dirSortOrder ?? null) !== (desired.dirSortOrder ?? null)
 	);
 }
 
@@ -610,6 +642,7 @@ function applyRowDiffInTransaction(
 				pinned: desired.pinned,
 				isScheduled: desired.isScheduled,
 				sortOrder: desired.sortOrder,
+				dirSortOrder: desired.dirSortOrder ?? null,
 				updatedAt: now,
 			})
 			.where(eq(userRecentTabs.id, existing.id))
@@ -1074,6 +1107,33 @@ export async function moveRecentTab(
 			tabs.splice(originalIndex, 0, ...group);
 		}
 		return { tabs: regroupWorkspaces(tabs) };
+	});
+}
+
+/**
+ * Persist the member order the user arranged by hand inside one directory group.
+ *
+ * Writes ONLY `dir_sort_order`; the flat order is left exactly as it was. That
+ * separation is the whole point: the flat order carries recency and is rewritten by
+ * the `above_idle` auto-promote whenever a narrator starts working, so expressing a
+ * hand-made arrangement as flat moves meant it was wiped by the next status change.
+ *
+ * `keys` is the desired order. Keys not present in the user's tabs are ignored rather
+ * than rejected — the client's view can legitimately lag a removal, and failing the
+ * whole reorder because one row vanished would lose the rest of the intent.
+ */
+export async function setRecentTabDirectoryOrder(
+	userId: string,
+	keys: string[],
+): Promise<RecentTabsMutationResult> {
+	return mutate(userId, (tabs) => {
+		const positionByKey = new Map(keys.map((key, index) => [key, index]));
+		for (const tab of tabs) {
+			const position = positionByKey.get(tabKey(tab));
+			if (position === undefined) continue;
+			tab.dirSortOrder = position;
+		}
+		return { tabs };
 	});
 }
 

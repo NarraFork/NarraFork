@@ -34,6 +34,7 @@ import {
 	IconGitFork,
 	IconListCheck,
 	IconLock,
+	IconNetwork,
 	IconPhotoOff,
 	IconRepeat,
 	IconRestore,
@@ -104,6 +105,32 @@ export interface ErrorNoticeActions {
 	onDisableImageGen?: () => void;
 	/** The disable+retry round trip is in flight. */
 	disablingImageGen?: boolean;
+	/**
+	 * Open the model-test dialog for this narrator's resolved model.
+	 *
+	 * Same contract as `onDisableImageGen`: whether the button EXISTS is decided by
+	 * the adapter (it shares the card's measured button row), and this only makes it
+	 * live. Admin-only, network-errors-only — the eligibility rules live in the
+	 * shell, which is also what hosts the dialog.
+	 */
+	onTestModel?: () => void;
+}
+
+/**
+ * Live action for an interrupt task-guard reminder card (origin_notice whose
+ * source is `interrupt_task_guard`): a close button in the heading row that
+ * deletes the notice. The mutation (DELETE + cache prune) lives outside vlist/,
+ * so the shell injects it; without the slot no button is painted at all —
+ * unlike the error card's controls, other origin notices have no dismiss
+ * affordance, so there is no "disabled but visible" state to preserve.
+ */
+export interface InjectionGuardActions {
+	/** Delete this reminder message. */
+	onDismiss?: () => void;
+	/** Dismiss request in flight (disables the close button). */
+	dismissing?: boolean;
+	/** Localized tooltip / aria-label for the close button. */
+	dismissLabel?: string;
 }
 
 interface RenderSystemTextProps {
@@ -116,6 +143,8 @@ interface RenderSystemTextProps {
 	actions?: SpecCarryoverActions;
 	/** error: live handlers for the retry-rule + dismiss controls. */
 	errorActions?: ErrorNoticeActions;
+	/** origin_notice (interrupt_task_guard only): live dismiss handler. */
+	injectionGuardActions?: InjectionGuardActions;
 }
 
 function cssColor(color: string, shade: number): string {
@@ -136,6 +165,7 @@ export function RenderSystemText({
 	data = { text: "" },
 	actions,
 	errorActions,
+	injectionGuardActions,
 }: RenderSystemTextProps) {
 	const body = measured.blocks[0] as PreparedCodeBlock | undefined;
 	if (!body || body.kind !== "code") return null;
@@ -166,7 +196,16 @@ export function RenderSystemText({
 				<SegmentFailedCard body={body} width={width} font={font} height={height} data={data} />
 			);
 		case "origin_notice":
-			return <OriginNoticeCard body={body} width={width} font={font} height={height} data={data} />;
+			return (
+				<OriginNoticeCard
+					body={body}
+					width={width}
+					font={font}
+					height={height}
+					data={data}
+					guardActions={injectionGuardActions}
+				/>
+			);
 		case "spec_goal_added":
 			return (
 				<SpecGoalCard
@@ -263,17 +302,19 @@ function PlainNoticeCard({
 	);
 }
 
-// ── error: Stack(icon + body + retry/close actions, [fix button row]) ────────
+// ── error: Stack(icon + body + retry/close actions, [optional button row]) ───
 // The right-side icons are REAL controls (parity with the chunked ErrorNotice):
 // "mark as retryable" opens the rule dialog, the close button deletes the notice.
 // Handlers are injected; without them the controls render disabled rather than
 // looking clickable while doing nothing.
 //
-// The provider fix is a LABELLED button on its own row instead of a third icon:
-// an icon-only control explains itself only through a hover tooltip, which touch
-// users never see, so the one action that actually resolves the failure would be
-// undiscoverable. Its label comes from `data.buttons[0]` — the adapter put it
-// there, which is also how the measure layer knew to reserve this row.
+// The conditional actions (provider fix, model probe) are LABELLED buttons on a
+// shared row instead of extra icons: an icon-only control explains itself only
+// through a hover tooltip, which touch users never see, so the actions that
+// actually resolve the failure would be undiscoverable. Their labels come from
+// `data.buttons` — the adapter put them there, which is also how the measure layer
+// knew to reserve this row — and `data.buttonIds` says which is which, since each
+// is independently eligible.
 function ErrorCard({
 	body,
 	width,
@@ -291,7 +332,17 @@ function ErrorCard({
 }) {
 	const showActions = data.actions !== false;
 	const markLabel = actions?.markRetryableLabel ?? "Mark as retryable";
-	const fixLabel = data.buttons?.[0];
+	// Bound by ID, not position: both buttons are independently eligible, so on a
+	// card that qualifies for only the model probe, `buttons[0]` IS the probe. Older
+	// data (before buttonIds existed) carried the fix alone, hence the fallback.
+	const buttonLabels = data.buttons ?? [];
+	const buttonIds = data.buttonIds ?? (buttonLabels.length > 0 ? ["disableImageGen"] : []);
+	const labelFor = (id: string): string | undefined => {
+		const index = buttonIds.indexOf(id);
+		return index < 0 ? undefined : buttonLabels[index];
+	};
+	const fixLabel = labelFor("disableImageGen");
+	const modelTestLabel = labelFor("testCurrentModel");
 	return (
 		<Paper
 			p="xs"
@@ -331,19 +382,37 @@ function ErrorCard({
 						</>
 					) : null}
 				</Group>
-				{showActions && fixLabel ? (
-					<Button
-						size="compact-xs"
-						variant="light"
-						color="red"
-						leftSection={<IconPhotoOff size={12} />}
-						style={{ alignSelf: "flex-start" }}
-						loading={actions?.disablingImageGen === true}
-						disabled={!actions?.onDisableImageGen}
-						onClick={actions?.onDisableImageGen}
-					>
-						{fixLabel}
-					</Button>
+				{showActions && (fixLabel || modelTestLabel) ? (
+					// One row for both: the measure layer reserves a single
+					// BUTTON_COMPACT_XS row whenever any button qualifies, so a second
+					// button must cost width rather than height.
+					<Group gap={GROUP_GAP} wrap="nowrap">
+						{fixLabel ? (
+							<Button
+								size="compact-xs"
+								variant="light"
+								color="red"
+								leftSection={<IconPhotoOff size={12} />}
+								loading={actions?.disablingImageGen === true}
+								disabled={!actions?.onDisableImageGen}
+								onClick={actions?.onDisableImageGen}
+							>
+								{fixLabel}
+							</Button>
+						) : null}
+						{modelTestLabel ? (
+							<Button
+								size="compact-xs"
+								variant="light"
+								color="blue"
+								leftSection={<IconNetwork size={12} />}
+								disabled={!actions?.onTestModel}
+								onClick={actions?.onTestModel}
+							>
+								{modelTestLabel}
+							</Button>
+						) : null}
+					</Group>
 				) : null}
 			</Stack>
 		</Paper>
@@ -397,12 +466,14 @@ function OriginNoticeCard({
 	font,
 	height,
 	data,
+	guardActions,
 }: {
 	body: PreparedCodeBlock;
 	width: number;
 	font: string;
 	height: number;
 	data: SystemTextData;
+	guardActions?: InjectionGuardActions;
 }) {
 	const timeLabel = typeof data.timeLabel === "string" ? data.timeLabel : "";
 	return (
@@ -422,9 +493,25 @@ function OriginNoticeCard({
 						{data.title ?? ""}
 					</Text>
 					{timeLabel ? (
-						<Text size="xs" c="dimmed" ml="auto" style={{ whiteSpace: "nowrap" }}>
+						<Text size="xs" c="dimmed" ml="auto" style={{ whiteSpace: "nowrap", flexShrink: 0 }}>
 							{timeLabel}
 						</Text>
+					) : null}
+					{guardActions ? (
+						// Height-neutral: pinned to the 17px heading row the measure layer
+						// already reserves; width only trims the clamped title, never the body.
+						<Tooltip label={guardActions.dismissLabel ?? ""} disabled={!guardActions.dismissLabel}>
+							<CloseButton
+								size="xs"
+								variant="subtle"
+								c="dimmed"
+								ml={timeLabel ? undefined : "auto"}
+								style={{ flexShrink: 0, height: BODY_LINE_HEIGHT, minHeight: BODY_LINE_HEIGHT }}
+								aria-label={guardActions.dismissLabel}
+								disabled={!guardActions.onDismiss || guardActions.dismissing === true}
+								onClick={guardActions.onDismiss}
+							/>
+						</Tooltip>
 					) : null}
 				</Group>
 				<SystemTextBody body={body} width={width} font={font} />

@@ -14,6 +14,7 @@ import {
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
 	restoreRecentTabsSchema,
+	setRecentTabDirectoryOrderSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "../lib/validators";
@@ -26,6 +27,7 @@ import {
 	pinRecentTab,
 	removeRecentTab,
 	restoreRecentTabs,
+	setRecentTabDirectoryOrder,
 	upsertRecentTab,
 	upsertRecentTabsBatch,
 } from "../services/recent-tabs-service";
@@ -511,6 +513,18 @@ userPreferencesRoutes.patch("/recent-tabs/pin", async (c) => {
 	const parsed = pinRecentTabSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	return c.json(await pinRecentTab(userId, parsed.data.key, parsed.data.pinned));
+});
+
+/**
+ * Member order inside one directory group. Separate from `/recent-tabs/move` because it
+ * writes a different column with different semantics: move rewrites the flat recency
+ * order (and has to expand workspace groups), this only records a hand-made arrangement.
+ */
+userPreferencesRoutes.patch("/recent-tabs/dir-order", async (c) => {
+	const userId = c.get("user").sub;
+	const parsed = setRecentTabDirectoryOrderSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await setRecentTabDirectoryOrder(userId, parsed.data.keys));
 });
 
 // --- Graph viewport persistence (per-project) ---

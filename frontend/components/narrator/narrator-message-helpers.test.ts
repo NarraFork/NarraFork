@@ -1,14 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
 	findLatestSpecTasksToolUseId,
-	getReflectionSuggestion,
 	normalizeReflectionAfterToolStatus,
 	preserveCompleteStreamedOutput,
 	preserveLiveSubagentActivity,
-	resolvePendingPerm,
 } from "./narrator-message-helpers";
-import type { NarratorMsg, PendingPermission } from "./narrator-panel-types";
-import type { ToolCallData } from "./ToolCallCard";
+import type { NarratorMsg } from "./narrator-panel-types";
 
 function msg(overrides: Partial<NarratorMsg> = {}): NarratorMsg {
 	return {
@@ -23,17 +20,6 @@ function msg(overrides: Partial<NarratorMsg> = {}): NarratorMsg {
 		createdAt: "2026-01-01T00:00:00.000Z",
 		...overrides,
 	} as NarratorMsg;
-}
-
-function toolCall(overrides: Partial<ToolCallData> = {}): ToolCallData {
-	return {
-		id: "tc-1",
-		toolName: "Edit",
-		toolUseId: "tool-1",
-		inputJson: { file_path: "truncated.ts" },
-		status: "pending",
-		...overrides,
-	};
 }
 
 describe("preserveLiveSubagentActivity", () => {
@@ -93,83 +79,6 @@ describe("preserveLiveSubagentActivity", () => {
 
 		expect(preserved.contentJson[0]._subagentActivity?.model).toBe("known-model");
 		expect(preserved.toolCalls?.[0]._subagentActivity?.model).toBe("known-model");
-	});
-});
-
-describe("resolvePendingPerm", () => {
-	test("prefers websocket permission list over truncated tool call input", () => {
-		const wsPerm: PendingPermission = {
-			id: "perm-1",
-			toolName: "Edit",
-			toolUseId: "tool-1",
-			inputJson: { file_path: "full.ts", old_string: "long old", new_string: "long new" },
-		};
-		const resolved = resolvePendingPerm(toolCall(), null, [wsPerm]);
-
-		expect(resolved).toBe(wsPerm);
-		expect(resolved?.inputJson).toEqual({
-			file_path: "full.ts",
-			old_string: "long old",
-			new_string: "long new",
-		});
-	});
-
-	test("falls back to pending tool call rows when websocket permission is not available", () => {
-		const resolved = resolvePendingPerm(
-			toolCall({
-				id: "tc-fallback",
-				permissionDecisionReason: "dangerous_command",
-				permissionSuggestions: [{ type: "danger_reflection", status: "awaiting_user" }],
-			}),
-			null,
-		);
-
-		expect(resolved).toMatchObject({
-			id: "tc-fallback",
-			toolName: "Edit",
-			toolUseId: "tool-1",
-			inputJson: { file_path: "truncated.ts" },
-			decisionReason: "dangerous_command",
-		});
-	});
-
-	test("does not resurrect resolved reflection permissions from historical tool calls", () => {
-		const resolved = resolvePendingPerm(
-			toolCall({
-				permissionSuggestions: [{ type: "danger_reflection", status: "confirmed" }],
-			}),
-			null,
-		);
-
-		expect(resolved).toBeNull();
-	});
-
-	test("recognizes task reflection suggestions without making resolved ones actionable", () => {
-		expect(
-			getReflectionSuggestion([
-				{
-					type: "task_reflection",
-					status: "running",
-					requestId: "task-reflection-1",
-					reason: "Checking protected task change",
-					nextSteps: "Gather concrete evidence.",
-				},
-			]),
-		).toMatchObject({
-			kind: "task_reflection",
-			status: "running",
-			requestId: "task-reflection-1",
-			nextSteps: "Gather concrete evidence.",
-		});
-
-		const resolved = resolvePendingPerm(
-			toolCall({
-				permissionSuggestions: [{ type: "task_reflection", status: "confirmed" }],
-			}),
-			null,
-		);
-
-		expect(resolved).toBeNull();
 	});
 });
 

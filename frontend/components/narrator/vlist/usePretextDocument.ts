@@ -91,6 +91,9 @@ export interface UsePretextDocumentOptions {
 	 * The reference changes with the user/narrator/provider it depends on, which is
 	 * why folding it into buildOptions triggers a rebuild. */
 	canOfferProviderFix?: (errorText: string) => boolean;
+	/** Whether an error card may offer the model probe. Shares the fix's measured
+	 * button row, so the same rebuild contract applies. */
+	canOfferModelTest?: (errorText: string) => boolean;
 	/** Resolve a tool item's pending-permission presence (live WS list). Its
 	 * reference changes when the pending set changes, so folding it into
 	 * buildOptions triggers a document rebuild (cards expand / collapse). */
@@ -336,6 +339,7 @@ export function usePretextDocument(
 			resolveToolSummary: options.resolveToolSummary,
 			resolveSubagentRecentSummary: options.resolveSubagentRecentSummary,
 			canOfferProviderFix: options.canOfferProviderFix,
+			canOfferModelTest: options.canOfferModelTest,
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
 			// ⚠️ No `latestSpecTasksToolUseId` here, deliberately. The pinned tasks card
 			// is resolved by `buildPretextDocumentLayout` from the exact message list it
@@ -383,6 +387,8 @@ export function usePretextDocument(
 			// narrator's resolved provider does, and a card that gains (or loses) the
 			// button changes height.
 			options.canOfferProviderFix,
+			// Same reason: gaining or losing the probe button changes the card's height.
+			options.canOfferModelTest,
 			// Rebuild when the pending-permission set changes (its reference changes
 			// with the set), so cards expand/collapse as permissions come and go.
 			options.resolveHasPendingPermission,

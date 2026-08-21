@@ -394,6 +394,16 @@ export const settingsApi = {
 			method: "PATCH",
 			body: JSON.stringify({ key, pinned }),
 		}),
+	/**
+	 * Record the member order of ONE directory group. Writes only `dirSortOrder`, so it
+	 * cannot be replaced by a sequence of `moveRecentTab` calls: those rewrite the flat
+	 * recency order, which the `above_idle` auto-promote then overwrites.
+	 */
+	setRecentTabDirectoryOrder: (keys: string[]) =>
+		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/dir-order", {
+			method: "PATCH",
+			body: JSON.stringify({ keys }),
+		}),
 	clearRecentTabs: (scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/clear", {
 			method: "POST",

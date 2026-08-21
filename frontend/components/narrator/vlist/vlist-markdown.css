@@ -34,8 +34,7 @@
 	/* Inline-code chip (mirrors MarkdownContent.module.css code.mdCode). */
 	--vlist-inline-code-bg: var(--mantine-color-dark-5);
 	--vlist-inline-code-fg: var(--mantine-color-white);
-	/* Monospace detail panel inside tool cards (bash output / code / diff bodies).
-	   The chunk renderer's equivalent is ToolCallCard's termStyle. */
+	/* Monospace detail panel inside tool cards (bash output / code / diff bodies). */
 	--vlist-detail-panel-bg: var(--mantine-color-dark-8);
 	--vlist-detail-panel-fg: var(--mantine-color-gray-3);
 	/* Media / image reservation fill behind a not-yet-loaded picture. */
@@ -118,18 +117,24 @@
    wrapping / the fragment box); the animation itself uses only compositor
    properties (opacity/transform/filter) so measured heights are unaffected.
 
-   ⚠️ The 0.32s duration is DUPLICATED as STREAM_ANIM_DURATION_MS in
-   stream-token-anim.ts, which uses it to decide when a grapheme's span may be
-   folded back into plain text. A duration longer here than there seals the span
-   mid-animation, snapping the character to its end state — the exact defect the
-   time-driven seal exists to fix, and one nothing else detects. Change both.
+   ⚠️ The duration is DUPLICATED in JS: stream-token-anim.ts uses it to decide
+   when a grapheme's span may be folded back into plain text. A duration longer
+   here than there seals the span mid-animation, snapping the character to its end
+   state — the exact defect the time-driven seal exists to fix, and one nothing
+   else detects.
+
+   It is user-configurable (Settings → Appearance), so BOTH sides read one
+   preference: AppRootLayout writes --nf-stream-token-duration onto <html> and
+   calls setStreamAnimDurationMs with the same value. The 0.32s fallback here must
+   equal DEFAULT_STREAM_ANIM_DURATION_MS (a test pins the pair), so a browser with
+   nothing stored — or a frame rendered before that effect runs — behaves as before.
 
    `both` fill-mode is load-bearing for the negative `animation-delay` a remounted
    span carries: it makes an already-elapsed portion resolve to the correct
    mid-animation state instead of the pre-start one. */
 .vlist-anim-token {
 	display: inline;
-	animation: vlist-token-in 0.32s ease-out both;
+	animation: vlist-token-in var(--nf-stream-token-duration, 0.32s) ease-out both;
 }
 
 @keyframes vlist-token-in {
@@ -260,9 +265,11 @@
 	font-size: 1em;
 }
 
-/* Spinner for in-flight tool/subagent status glyphs (StatusIcon parity). The
-   chunk-mode `spin` keyframe is injected by ToolCallCard (outside vlist), so the
-   vlist path defines its own — scoped name avoids any collision. */
+/* Spinner for in-flight tool/subagent status glyphs (StatusIcon parity). Scoped
+   name because this file is vlist-local: anything outside vlist/ that needs a
+   spinner uses Mantine's Loader, which carries its own animation. (A global `spin`
+   keyframe used to be injected at runtime by ToolCallCard; that component is gone,
+   and its one remaining consumer was left with a dead animation name.) */
 @keyframes vlist-spin {
 	to {
 		transform: rotate(360deg);
@@ -279,10 +286,11 @@
    `trace-shimmer.css`, loaded globally by main.tsx, and are selected through
    CARD_SHIMMER_CLASS / TRACE_SHIMMER_CLASS in `@shared/tool-shimmer`.
 
-   They are global rather than vlist-local on purpose: the chunk path paints the
-   same cards and rows, vlist may not import it, and the previous arrangement — a
-   private `vlist-tool-*-shimmer` copy here plus a runtime <style> in ToolCallCard —
-   is exactly how the two paths came to agree on neutral/blue/green while BOTH
-   lacked the purple (reflecting) and red (failed) states. Height-neutrality is
+   They stay global rather than vlist-local because the classes are selected through
+   shared code that vlist may not import. The arrangement they replaced — a private
+   `vlist-tool-*-shimmer` copy here plus a runtime <style> injected by the (now
+   deleted) chunked ToolCallCard — is exactly how two renderers came to agree on
+   neutral/blue/green while BOTH lacked the purple (reflecting) and red (failed)
+   states. Height-neutrality is
    unchanged: the card sweep is an `inset: 0` overlay, the row shimmer only recolours
    text. */

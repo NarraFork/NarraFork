@@ -3,7 +3,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { AppearanceSection } from "../../components/settings/AppearanceSection";
-import { useLocalPref } from "../../hooks/useLocalPref";
+import { useLocalNumberPref, useLocalPref } from "../../hooks/useLocalPref";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 
 export const Route = createFileRoute("/settings/appearance")({
@@ -18,6 +18,8 @@ function SettingsAppearancePage() {
 	const [isFullscreen, setIsFullscreen] = useLocalPref("narrafork_fullscreen");
 	const [wakeLock, setWakeLock] = useLocalPref("narrafork_wakelock");
 	const [advancedAnim, setAdvancedAnim] = useLocalPref("narrafork_advanced_anim");
+	const [blurInMs, setBlurInMs] = useLocalNumberPref("narrafork_blur_in_ms");
+	const [streamTokenMs, setStreamTokenMs] = useLocalNumberPref("narrafork_stream_token_ms");
 	const [expandReasoning, setExpandReasoning] = useLocalPref("narrafork_expand_reasoning");
 	const [centeredColumn, setCenteredColumn] = useLocalPref("narrafork_narrator_centered_column");
 	const [lodAltGesture, setLodAltGesture] = useLocalPref("narrafork_lod_alt_gesture");
@@ -46,6 +48,10 @@ function SettingsAppearancePage() {
 				setWakeLock={setWakeLock}
 				advancedAnim={advancedAnim}
 				setAdvancedAnim={setAdvancedAnim}
+				blurInMs={blurInMs}
+				setBlurInMs={setBlurInMs}
+				streamTokenMs={streamTokenMs}
+				setStreamTokenMs={setStreamTokenMs}
 				expandReasoning={expandReasoning}
 				setExpandReasoning={setExpandReasoning}
 				centeredColumn={centeredColumn}

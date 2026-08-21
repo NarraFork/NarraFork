@@ -98,6 +98,8 @@ export interface ComputeLayoutOptions {
 	 * row, so this decision changes the card's measured height.
 	 */
 	canOfferProviderFix?: (errorText: string) => boolean;
+	/** Same measured-row contract as canOfferProviderFix; shares that button row. */
+	canOfferModelTest?: (errorText: string) => boolean;
 	/** True when a tool/subagent item has a live pending permission request; forces
 	 * its card expanded and folds into the measure cache key. */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
@@ -176,6 +178,7 @@ export function computePretextVListLayout(
 		resolveToolSummary: opts.resolveToolSummary as AdapterContext["resolveToolSummary"],
 		resolveSubagentRecentSummary: opts.resolveSubagentRecentSummary,
 		canOfferProviderFix: opts.canOfferProviderFix,
+		canOfferModelTest: opts.canOfferModelTest,
 		resolveHasPendingPermission: opts.resolveHasPendingPermission,
 		resolveLatestSpecTasksToolUseId: opts.resolveLatestSpecTasksToolUseId,
 		resolvePendingPlan: opts.resolvePendingPlan,

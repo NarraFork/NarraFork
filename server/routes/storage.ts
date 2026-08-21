@@ -2,75 +2,41 @@ import { Hono } from "hono";
 import { z } from "zod/v4";
 import { requireAdmin } from "../middleware/auth";
 import { databaseCleanupService } from "../services/database-cleanup-service";
+import {
+	cancelStorageScan,
+	getStorageScanJob,
+	startStorageScan,
+} from "../services/storage-scan-job";
 import { storageService } from "../services/storage-service";
 
 export const storageRoutes = new Hono();
 
 /**
- * GET /api/storage/scan — SSE stream that scans all storage categories (admin only).
- * Events: progress (status message), category (scan result), complete, error.
+ * POST /api/storage/scan/start — Kick off a storage scan as a server-side background job
+ * (admin only). Scanning is decoupled from the HTTP connection: the client may navigate
+ * away and the scan still runs to completion and populates the shared cache. Concurrent
+ * calls dedupe onto the in-flight job (`started: false`).
  */
-storageRoutes.get("/scan", requireAdmin, async (_c) => {
-	// One controller per request, shared by start() and cancel(). Without it a client disconnect left
-	// the scan running to completion (worker tasks included) while every send() threw into the void.
-	const abort = new AbortController();
-	const stream = new ReadableStream({
-		async start(controller) {
-			const encoder = new TextEncoder();
-			let streamClosed = false;
-			const send = (event: string, data: unknown) => {
-				if (streamClosed || abort.signal.aborted) return;
-				try {
-					controller.enqueue(encoder.encode(`event:${event}\ndata:${JSON.stringify(data)}\n\n`));
-				} catch {
-					// The consumer is gone; stop writing and let cancel()/finally tear things down.
-					streamClosed = true;
-				}
-			};
+storageRoutes.post("/scan/start", requireAdmin, (c) => {
+	const { started, state } = startStorageScan();
+	return c.json({ started, state });
+});
 
-			try {
-				const gen = storageService.scanStorage({ signal: abort.signal });
-				let finalResult: unknown = null;
+/**
+ * GET /api/storage/scan/status — Poll the background scan job (admin only).
+ */
+storageRoutes.get("/scan/status", requireAdmin, (c) => {
+	return c.json({ state: getStorageScanJob() });
+});
 
-				for (;;) {
-					const { value, done } = await gen.next();
-					if (done) {
-						finalResult = value;
-						break;
-					}
-					if (value.type === "progress") {
-						send("progress", { message: value.message, detail: value.detail });
-					} else if (value.type === "category") {
-						send("category", value.data);
-					}
-				}
-
-				send("complete", finalResult);
-			} catch (err) {
-				if (!abort.signal.aborted) send("error", { error: String(err) });
-			} finally {
-				streamClosed = true;
-				try {
-					controller.close();
-				} catch {
-					// Already closed by cancel().
-				}
-			}
-		},
-		cancel() {
-			// Fired when the client disconnects. Aborting propagates into scanStorage, which cancels
-			// the in-flight worker read tasks instead of scanning on for seconds with nowhere to write.
-			abort.abort();
-		},
-	});
-
-	return new Response(stream, {
-		headers: {
-			"Content-Type": "text/event-stream",
-			"Cache-Control": "no-cache",
-			Connection: "keep-alive",
-		},
-	});
+/**
+ * POST /api/storage/scan/cancel — Abort the running scan job, if any (admin only).
+ */
+storageRoutes.post("/scan/cancel", requireAdmin, async (c) => {
+	// Awaited: `abort()` alone leaves the state at `running`, so the response would
+	// report the very status the caller just cancelled. The service waits (briefly,
+	// bounded) for the scan to reach its terminal state before answering.
+	return c.json({ state: await cancelStorageScan() });
 });
 
 /**

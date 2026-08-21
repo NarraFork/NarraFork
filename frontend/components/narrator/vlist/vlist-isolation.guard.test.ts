@@ -1,17 +1,16 @@
 /**
- * vlist-isolation.guard.test.ts — Enforces the persistent protected invariant:
- *   "Do not affect the path when narrafork_narrator_virtual_list is OFF."
+ * vlist-isolation.guard.test.ts — Keeps the exact virtual list behind its lazy
+ * loading boundary.
  *
- * Mechanism: the new pretext vlist must stay OUT of the synchronous module graph
- * of the existing narrator render path. Concretely, NO file outside
- * frontend/components/narrator/vlist/ may STATICALLY import from vlist/. The only
- * allowed entry is a dynamic `import()` (lazy chunk) guarded by the feature flag,
- * so when the flag is OFF the browser never even fetches vlist code.
+ * The narrator virtual list is THE message renderer; NarratorPanel loads it via a
+ * dynamic `import()` purely for bundle splitting (the initial payload must not
+ * carry the ~4.6MB vlist module graph before it is needed). Mechanism: NO file
+ * outside frontend/components/narrator/vlist/ may STATICALLY import from vlist/.
+ * The only allowed entry is a dynamic `import()` (lazy chunk).
  *
- * This turns the one-time manual grep evidence into a CI-enforced guard. During
- * the later (riskiest) integration phase — when PretextMessageList is wired into
- * NarratorPanel behind the flag — this test goes red the instant someone leaks a
- * static import of vlist into the always-on path.
+ * Historically this guarded the Chunk/Virtual feature flag (the OFF path must not
+ * even fetch vlist code); the flag is gone, but the loading boundary is worth
+ * keeping and worth a CI guard, so the rule survives with a new rationale.
  *
  * Zero-runtime, filesystem-only; no DOM, no canvas.
  */

@@ -7,7 +7,7 @@ import { useTranslation } from "react-i18next";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { DiffView } from "./DiffView";
 import type { PendingPermission } from "./narrator-panel-types";
-import { PermEnterHintCtx } from "./ToolCallCard";
+import { PermEnterHintCtx } from "./tool-call-contexts";
 
 const MAX_FULL_FILE_PREVIEW_CHARS = 120_000;
 /**

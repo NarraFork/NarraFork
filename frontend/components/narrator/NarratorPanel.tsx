@@ -186,7 +186,6 @@ import {
 	formatFullLocaleDateTime,
 } from "../../lib/format";
 import { formatLocaleNumber } from "../../lib/intl-format";
-import { resolveNarratorVirtualListEnabled } from "../../lib/narrator-virtual-list";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
 import { formatRevertWarning, formatRevertWarnings } from "../../lib/revert-warnings";
@@ -211,13 +210,14 @@ import { UserAvatar } from "../UserAvatar";
 import { BackgroundTasksDrawerHost, useBackgroundTasksButton } from "./BackgroundTasksDrawer";
 
 import { ChapterBar } from "./ChapterBar";
-import {
-	ChunkedMessageList,
-	type ChunkedMessageListHandle,
-	type ChunkTailMeta,
-} from "./ChunkedMessageList";
 import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
+import {
+	COMPACTING_MARKER_ATTR,
+	CompactSummaryModal,
+	CompactSummaryModalCtx,
+	type CompactSummaryModalTarget,
+} from "./compact-summary-modal";
 import { hasSendableComposerContent } from "./composer-send-gate";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import {
@@ -226,18 +226,15 @@ import {
 	loadDraftImageAttachments,
 	saveDraftImageAttachments,
 } from "./draft-image-attachments";
+import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { ExecutionDeviceMenu } from "./ExecutionDeviceMenu";
+import {
+	formatKimiBarText,
+	formatKimiDetailsText,
+	isKimiProviderBaseUrl,
+} from "./kimi-usage-format";
 import { LeakedToolCallModal } from "./LeakedToolCallModal";
 import { LodSwitchToast } from "./LodSwitchToast";
-import {
-	COMPACTING_MARKER_ATTR,
-	CompactSummaryModal,
-	CompactSummaryModalCtx,
-	type CompactSummaryModalTarget,
-	EditingMessageCtx,
-	type EditingMessageState,
-} from "./MessageBubble";
-import { renderTreeMessagesWithKeys } from "./MessageRenderer";
 import {
 	BLOCK_ID_ATTR,
 	collectSelectedText,
@@ -251,6 +248,7 @@ import {
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
 import { ModelMenuItems } from "./ModelMenuItems";
 import { ModelPriceModal } from "./ModelPriceModal";
+import type { MessageListHandle, MessageListTailMeta } from "./message-list-handle";
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
@@ -269,13 +267,8 @@ import {
 } from "./NarratorStatusToolbar";
 import { NarratorToolbarOverflowMenu } from "./NarratorToolbarOverflowMenu";
 import { NugRechargeDialog } from "./NugRechargeDialog";
-import { resolvePendingPerm, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
-import type {
-	ContentBlock,
-	NarratorMsg,
-	NarratorPanelProps,
-	PermissionCallbacks,
-} from "./narrator-panel-types";
+import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
+import type { ContentBlock, NarratorMsg, NarratorPanelProps } from "./narrator-panel-types";
 import {
 	ACCEPTED_TYPES,
 	formatFileSize,
@@ -313,9 +306,7 @@ import {
 	FileModDrawerCtx,
 	LatestTodosToolUseIdCtx,
 	PermEnterHintCtx,
-	type ToolCallData,
-} from "./ToolCallCard";
-import { useNarratorChunks } from "./useNarratorChunks";
+} from "./tool-call-contexts";
 import { type PaymentRequiredInfo, useNarratorPanelWS } from "./useNarratorPanelWS";
 
 type ModelComboboxItem = string | { value: string; label: string };
@@ -339,103 +330,6 @@ function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredI
 	} catch {
 		return null;
 	}
-}
-
-interface WorkspaceChunkPreviewProps {
-	narratorId: string;
-	isSubagent?: boolean;
-	permCb: PermissionCallbacks;
-	showTokenUsage?: boolean;
-	pruneBoundaryMessageId?: string | null;
-	pruneDividerLabel?: string;
-	lastUserMessageId?: string;
-	hasChapter?: boolean;
-	resolvePerm?: (tc: ToolCallData) => ReturnType<typeof resolvePendingPerm>;
-	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
-}
-
-function WorkspaceChunkPreview({
-	narratorId,
-	isSubagent,
-	permCb,
-	showTokenUsage,
-	pruneBoundaryMessageId,
-	pruneDividerLabel,
-	lastUserMessageId,
-	hasChapter,
-	resolvePerm,
-	onAskInPassing,
-}: WorkspaceChunkPreviewProps) {
-	const { chunks, streamingMsg } = useNarratorChunks(narratorId, { isSubagent });
-	const rendered = useMemo(() => {
-		const tailMessages = (chunks[chunks.length - 1]?.messages ?? []) as NarratorMsg[];
-		const messages = tailMessages.slice(-8);
-		if (messages.length === 0 && !streamingMsg) return { elements: [], keys: [] };
-		return renderTreeMessagesWithKeys(
-			messages,
-			narratorId,
-			undefined,
-			null,
-			permCb,
-			showTokenUsage,
-			pruneBoundaryMessageId,
-			pruneDividerLabel,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			lastUserMessageId,
-			hasChapter,
-			undefined,
-			streamingMsg,
-			resolvePerm,
-			onAskInPassing,
-			false,
-		);
-	}, [
-		chunks,
-		hasChapter,
-		lastUserMessageId,
-		narratorId,
-		onAskInPassing,
-		permCb,
-		pruneBoundaryMessageId,
-		pruneDividerLabel,
-		resolvePerm,
-		showTokenUsage,
-		streamingMsg,
-	]);
-
-	return (
-		<Box h="100%" style={{ position: "relative", overflow: "hidden" }}>
-			<Box
-				px="md"
-				pt="md"
-				style={{
-					position: "absolute",
-					left: 0,
-					right: 0,
-					bottom: 0,
-					display: "flex",
-					flexDirection: "column",
-					gap: 12,
-				}}
-			>
-				{rendered.elements.map((element, index) => (
-					<Box
-						key={rendered.keys[index] ?? `preview-${index}`}
-						style={{ flex: "0 0 auto", minWidth: 0 }}
-					>
-						{element}
-					</Box>
-				))}
-			</Box>
-		</Box>
-	);
 }
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
@@ -2006,7 +1900,6 @@ export function NarratorPanel({
 	onBack,
 	onOpenStandalonePage,
 	onViewSubagentSession,
-	isResizing,
 	onHeaderPointerDown,
 	onClose,
 	onOpenTerminalPanel,
@@ -2054,13 +1947,15 @@ export function NarratorPanel({
 	const isWorkspacePreview = workspacePreview === true;
 	// Chunk mode is the only live message-list implementation. Workspace
 	// previews use a separate lightweight tail-chunk query below.
-	const [chunkTailMeta, setChunkTailMeta] = useState<ChunkTailMeta>({ lastRealMessage: null });
+	const [chunkTailMeta, setMessageListTailMeta] = useState<MessageListTailMeta>({
+		lastRealMessage: null,
+	});
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on narratorId change
 	useEffect(() => {
-		setChunkTailMeta({ lastRealMessage: null });
+		setMessageListTailMeta({ lastRealMessage: null });
 	}, [narratorId]);
-	const handleChunkTailMetaChange = useCallback((meta: ChunkTailMeta) => {
-		setChunkTailMeta((prev) => {
+	const handleMessageListTailMetaChange = useCallback((meta: MessageListTailMeta) => {
+		setMessageListTailMeta((prev) => {
 			if (
 				prev.statusReady === meta.statusReady &&
 				prev.lastRealMessage?.id === meta.lastRealMessage?.id &&
@@ -2448,6 +2343,31 @@ export function NarratorPanel({
 		queryFn: () => api.nugGetQuota(nugProviderConfig?.id ?? ""),
 		enabled: missingCurrentNugQuota,
 		staleTime: 30_000,
+	});
+
+	// Kimi (kimi.com / kimi.ai) usage quotas — server keeps one global cache per
+	// provider; GET triggers a stale-while-revalidate refresh upstream. The query
+	// stays disabled unless the current narrator's provider is a Kimi provider,
+	// so nothing polls while Kimi is not in use.
+	const currentKimiProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (
+			(settingsData?.customApiProviders ?? []) as Array<{
+				id: string;
+				prefix?: string;
+				baseUrl?: string;
+				disabled?: boolean;
+			}>
+		).find((p) => p.prefix === prefix);
+		return cfg && !cfg.disabled && isKimiProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
+	}, [resolvedModel, settingsData?.customApiProviders]);
+	const { data: kimiUsagesData } = useQuery({
+		queryKey: ["kimi", "usages"],
+		queryFn: api.kimiGetUsages,
+		enabled: currentKimiProviderId != null,
+		staleTime: 30_000,
+		refetchInterval: 60_000,
 	});
 
 	useEffect(() => {
@@ -3082,7 +3002,7 @@ export function NarratorPanel({
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const viewportRef = useRef<HTMLDivElement>(null);
 	const contentRef = useRef<HTMLDivElement>(null);
-	const chunkListRef = useRef<ChunkedMessageListHandle>(null);
+	const chunkListRef = useRef<MessageListHandle>(null);
 	// The message area box — the LOD indicator's containing block, and the hover
 	// region that decides whether holding Alt targets THIS panel.
 	const messageAreaRef = useRef<HTMLDivElement>(null);
@@ -3108,10 +3028,6 @@ export function NarratorPanel({
 		},
 		[setLod],
 	);
-	// Persist the user's direct Chunk/Virtual choice; the rollout gate controls availability only.
-	// Unset (new users) resolves to Virtual; Chunk is now an explicit opt-out.
-	const [narratorVirtualListRequested] = useLocalPref("narrafork_narrator_virtual_list");
-	const narratorVirtualList = resolveNarratorVirtualListEnabled(narratorVirtualListRequested);
 	// Reading-width preference, needed here only so the lazy-chunk fallback lays its
 	// skeleton out in the same column the list will use (no width step on mount).
 	const [narratorCenteredColumn] = useLocalPref("narrafork_narrator_centered_column");
@@ -3235,6 +3151,16 @@ export function NarratorPanel({
 			settingsData?.customApiProviders ?? [];
 		const cfg = customApiProviders.find((p) => p.prefix === prefix);
 		if (!cfg) return null;
+		// Kimi providers show structured usage (5h window in the bar, weekly/monthly
+		// in the details popover) instead of the generic relay quota string.
+		const kimiUsage = kimiUsagesData?.[cfg.id];
+		if (kimiUsage) {
+			const quotaBalance = formatKimiBarText(kimiUsage, t);
+			const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
+			if (quotaBalance || detailedQuotaBalance) {
+				return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+			}
+		}
 		const quotas = settingsData?.customApiQuotas as
 			| Record<string, { quotaBalance: string | null; detailedQuotaBalance?: string | null }>
 			| undefined;
@@ -3246,7 +3172,13 @@ export function NarratorPanel({
 			quotaBalance: quota?.quotaBalance ?? null,
 			detailedQuotaBalance,
 		};
-	}, [resolvedModel, settingsData?.customApiProviders, settingsData?.customApiQuotas]);
+	}, [
+		resolvedModel,
+		settingsData?.customApiProviders,
+		settingsData?.customApiQuotas,
+		kimiUsagesData,
+		t,
+	]);
 
 	const nugProviderInfo = useMemo(() => {
 		if (!nugProviderConfig) return null;
@@ -3330,7 +3262,6 @@ export function NarratorPanel({
 		contextStale,
 		activePruneStart,
 		activeCompactStart,
-		pruneBoundaryMessageId,
 		prunedPercent,
 		compactProgress,
 		quotaBalance,
@@ -3473,16 +3404,6 @@ export function NarratorPanel({
 		},
 		[narratorId, handleCompactError],
 	);
-
-	// Stable resolvePerm callback for renderTreeMessages — uses a ref to avoid
-	// recreating on every permission state change, which would break memo on
-	// MessageBubble and cascade re-renders through all reasoning summaries.
-	const renderPermCbRef = useRef(renderPermCb);
-	renderPermCbRef.current = renderPermCb;
-	const resolvePermForRender = useCallback((tc: import("./ToolCallCard").ToolCallData) => {
-		const p = renderPermCbRef.current;
-		return resolvePendingPerm(tc, p.pendingPermission, p.pendingPermissions);
-	}, []);
 
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
 		useDisclosure(false);
@@ -4352,8 +4273,6 @@ export function NarratorPanel({
 		narratorIsIdle &&
 		retryRecoveryAllowsContinue;
 
-	const lastUserMessageId = chunkTailMeta.lastUserMessageId;
-
 	const hasChapter = !!narrator?.chapterId;
 
 	// --- Fork handler ---
@@ -4404,45 +4323,6 @@ export function NarratorPanel({
 		[narratorId],
 	);
 	// --- Message rendering setup ---
-	const highlightScrolledRef = useRef(false);
-	const highlightStartTimerRef = useRef<number | null>(null);
-	const highlightClearTimerRef = useRef<number | null>(null);
-	const [highlightedId, setHighlightedId] = useState<string | null>(null);
-
-	const clearHighlightTimers = useCallback(() => {
-		if (highlightStartTimerRef.current != null) {
-			window.clearTimeout(highlightStartTimerRef.current);
-			highlightStartTimerRef.current = null;
-		}
-		if (highlightClearTimerRef.current != null) {
-			window.clearTimeout(highlightClearTimerRef.current);
-			highlightClearTimerRef.current = null;
-		}
-	}, []);
-
-	const scheduleHighlight = useCallback(
-		(messageId: string, delayMs: number) => {
-			clearHighlightTimers();
-			highlightStartTimerRef.current = window.setTimeout(() => {
-				setHighlightedId(messageId);
-				highlightClearTimerRef.current = window.setTimeout(() => {
-					setHighlightedId((current) => (current === messageId ? null : current));
-					highlightClearTimerRef.current = null;
-				}, 1600);
-				highlightStartTimerRef.current = null;
-			}, delayMs);
-		},
-		[clearHighlightTimers],
-	);
-
-	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId/highlightMessageId are used to reset one-shot highlight state when the active target changes
-	useEffect(() => {
-		highlightScrolledRef.current = false;
-		clearHighlightTimers();
-		setHighlightedId(null);
-	}, [narratorId, highlightMessageId, clearHighlightTimers]);
-
-	useEffect(() => clearHighlightTimers, [clearHighlightTimers]);
 
 	// --- Multi-select state ---
 	const [selectionMode, setSelectionMode] = useState(false);
@@ -5001,50 +4881,7 @@ export function NarratorPanel({
 		],
 	);
 
-	// Memoized tail footer for ChunkedMessageList. ⚠️ This MUST be referentially
-	// stable across unrelated renders (e.g. composer keystrokes): an inline JSX
-	// value here is a fresh element identity every render, which defeats
-	// ChunkedMessageList's `memo` and re-renders the entire message tree per
-	// keystroke (~thousands of elements). `updateConclusionMutation.mutate` is
-	// stable across renders (bound to the mutation observer); the result object
-	// itself is NOT, so only its stable fields may be captured.
-	const updateConclusionMutate = updateConclusionMutation.mutate;
-	const updateConclusionPending = updateConclusionMutation.isPending;
-	const chunkListTailFooter = useMemo(
-		() =>
-			isSubagent &&
-			narrator &&
-			narrator.status === "idle" &&
-			!isTakenOver &&
-			substatus.includes("manual_override") &&
-			!isActive ? (
-				<Box ta="center" py="sm">
-					<Button
-						size="compact-sm"
-						variant="light"
-						color="indigo"
-						onClick={() => updateConclusionMutate(narratorId)}
-						loading={updateConclusionPending}
-					>
-						{t("updateConclusion")}
-					</Button>
-				</Box>
-			) : null,
-		[
-			isSubagent,
-			narrator,
-			isTakenOver,
-			substatus,
-			isActive,
-			updateConclusionMutate,
-			updateConclusionPending,
-			narratorId,
-			t,
-		],
-	);
-
 	// --- Flat message elements ---
-	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
 	const pruneDividerLabel = t("pruneBoundaryLabel");
 	const showScrollToBottomButton = !isAtBottom || unreadCount > 0;
 
@@ -5091,25 +4928,11 @@ export function NarratorPanel({
 			// hand it only the easy case AND paint no highlight: the flash is written to
 			// the revealed node imperatively inside the list, not driven by this panel's
 			// `highlightedId` state.
-			if (!narratorVirtualList) {
-				for (const domId of domIds) {
-					const el = document.getElementById(domId);
-					if (el) {
-						requestAnimationFrame(() => {
-							el.scrollIntoView({ behavior: "smooth", block: "center" });
-							if (highlightId) {
-								scheduleHighlight(highlightId, 400);
-							}
-						});
-						return true;
-					}
-				}
-			}
 			const handle = chunkListRef.current;
 			if (!handle) return false;
 			return await handle.scrollToMessageTarget({ domIds, targetIds, highlightId });
 		},
-		[narratorVirtualList, scheduleHighlight],
+		[],
 	);
 
 	// Bridge: let the sibling search panel jump to a message in this chat via the
@@ -5370,29 +5193,6 @@ export function NarratorPanel({
 			mutationObserver.disconnect();
 		};
 	}, [selectionOverlayBlockId, isWorkspacePreview, scrollToMessageTarget]);
-
-	// --- Scroll to highlighted message ---
-	// Chunked path only. The virtual list owns this jump itself (it needs the
-	// document index to reach an unmounted row, and it flashes the revealed node
-	// imperatively instead of through panel state), so driving it from here too
-	// would issue the same scroll twice.
-	useEffect(() => {
-		if (narratorVirtualList) return;
-		if (!highlightMessageId || highlightScrolledRef.current) return;
-		let active = true;
-		// Latched only on success, so a jump that could not land yet is retried when the
-		// effect re-runs (a later render may have mounted the row).
-		void scrollToMessageTarget({
-			domIds: [`msg-${highlightMessageId}`],
-			targetIds: [highlightMessageId],
-			highlightId: highlightMessageId,
-		}).then((revealed) => {
-			if (active && revealed) highlightScrolledRef.current = true;
-		});
-		return () => {
-			active = false;
-		};
-	}, [highlightMessageId, narratorVirtualList, scrollToMessageTarget]);
 
 	const applyBufferedSendResult = useCallback(
 		(
@@ -7474,24 +7274,6 @@ export function NarratorPanel({
 						pos="relative"
 						style={{ flex: 1, minHeight: 0, overflow: "hidden", isolation: "isolate" }}
 					>
-						{/* Legacy-only resize skeleton; Virtual keeps its real rows mounted. */}
-						{!narratorVirtualList && isResizing && (
-							<Box
-								pos="absolute"
-								top={0}
-								left={0}
-								right={0}
-								bottom={0}
-								py="sm"
-								px="md"
-								style={{
-									zIndex: 2,
-									backgroundColor: "var(--mantine-color-body)",
-								}}
-							>
-								<NarratorMessageListSkeleton />
-							</Box>
-						)}
 						<Box
 							h="100%"
 							ref={selectionToolbarParentRef}
@@ -7507,139 +7289,59 @@ export function NarratorPanel({
 											<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
 												<EditingMessageCtx.Provider value={editingMessageCtxValue}>
 													<RenderLodCtx.Provider value={renderLodCtxValue}>
-														{isWorkspacePreview ? (
-															<WorkspaceChunkPreview
-																narratorId={narratorId}
-																isSubagent={isSubagent}
-																permCb={renderPermCb}
-																showTokenUsage={showTokenUsage}
-																pruneBoundaryMessageId={pruneBoundaryMessageId}
-																pruneDividerLabel={pruneDividerLabel}
-																lastUserMessageId={lastUserMessageId}
-																hasChapter={hasChapter}
-																resolvePerm={resolvePermForRender}
-																onAskInPassing={handleAskInPassing}
-															/>
-														) : narratorVirtualList ? (
-															// Same message-shaped skeleton the list itself shows while its
-															// document loads, so the lazy-chunk wait and the document wait
-															// look like one continuous placeholder (no blank → text flash).
-															//
-															// The column geometry comes from the shared helper rather than
-															// Mantine padding, so this fallback, the list's own placeholder
-															// and the real rows are all the same width — otherwise the
-															// mount stepped through two different column widths.
-															<Suspense
-																fallback={
-																	<Box
-																		style={narratorColumnPlaceholderStyle(narratorCenteredColumn)}
-																	>
-																		<NarratorMessageListSkeleton />
-																	</Box>
-																}
-															>
-																<PretextExactMessageList
-																	ref={chunkListRef}
-																	narratorId={narratorId}
-																	isSubagent={isSubagent}
-																	isActive={isActive}
-																	scrollRef={chunkViewportRef}
-																	contentRef={contentRef}
-																	onAtBottomChange={setIsAtBottom}
-																	onUnreadCountChange={setUnreadCount}
-																	onTailMetaChange={handleChunkTailMetaChange}
-																	onLodStep={handleLodStep}
-																	onSelectionResolverChange={setChunkSelectionResolver}
-																	rowHandlers={vlistRowHandlers}
-																	permCb={renderPermCb}
-																	pruneDividerLabel={pruneDividerLabel}
-																	hasChapter={hasChapter}
-																	highlightMessageId={highlightMessageId}
-																	tailFooter={
-																		isSubagent &&
-																		narrator &&
-																		narrator.status === "idle" &&
-																		!isTakenOver &&
-																		substatus.includes("manual_override") &&
-																		!isActive ? (
-																			<Box ta="center" py="sm">
-																				<Button
-																					size="compact-sm"
-																					variant="light"
-																					color="indigo"
-																					onClick={() =>
-																						updateConclusionMutation.mutate(narratorId)
-																					}
-																					loading={updateConclusionMutation.isPending}
-																				>
-																					{t("updateConclusion")}
-																				</Button>
-																			</Box>
-																		) : null
-																	}
-																/>
-															</Suspense>
-														) : (
-															<ChunkedMessageList
+														{/* Same message-shaped skeleton the list itself shows while its
+													    document loads, so the lazy-chunk wait and the document wait
+													    look like one continuous placeholder (no blank → text flash).
+													    The column geometry comes from the shared helper rather than
+													    Mantine padding, so this fallback, the list's own placeholder
+													    and the real rows are all the same width — otherwise the
+													    mount stepped through two different column widths. */}
+														<Suspense
+															fallback={
+																<Box style={narratorColumnPlaceholderStyle(narratorCenteredColumn)}>
+																	<NarratorMessageListSkeleton />
+																</Box>
+															}
+														>
+															<PretextExactMessageList
 																ref={chunkListRef}
 																narratorId={narratorId}
 																isSubagent={isSubagent}
-																isMobileViewport={isMobileViewport}
-																permCb={renderPermCb}
-																hasChapter={hasChapter}
-																onForkFromMessage={forkHandler}
-																highlightedId={highlightedId}
-																highlightMessageId={highlightMessageId}
-																onHighlightTarget={scheduleHighlight}
-																showTokenUsage={showTokenUsage}
-																pruneBoundaryMessageId={pruneBoundaryMessageId}
-																pruneDividerLabel={pruneDividerLabel}
-																onCompactBeforeMessage={
-																	compactSupported ? handleCompactBefore : undefined
-																}
-																onClearContextBefore={
-																	compactSupported ? handleClearContextBefore : undefined
-																}
-																onManualSummarize={
-																	compactSupported ? handleManualSummarize : undefined
-																}
-																onDeleteBlock={handleDeleteBlock}
-																onRollbackToBlock={
-																	rollbackEditRegenerateSupported ? handleRollback : undefined
-																}
-																onEditAndRegenerate={
-																	rollbackEditRegenerateSupported
-																		? handleEditAndRegenerate
-																		: undefined
-																}
-																onEditAssistantMessage={handleEditAssistantMessage}
-																onRestoreAssistantMessage={handleRestoreAssistantMessage}
-																lastUserMessageId={lastUserMessageId}
-																onViewSubagentSession={onViewSubagentSession}
-																// Folded rows have no routing fallback of their own (the
-																// expanded SubagentCard does), so give them the panel's.
-																onViewSubagentSessionFolded={handleVlistViewSubagentSession}
-																onDetachSubagent={
-																	canDetachSubagentToBackground ? handleDetachSubagent : undefined
-																}
-																onCancelBackgroundTask={
-																	canCancelSubagentBackground
-																		? handleCancelSubagentBackground
-																		: undefined
-																}
-																onOpenFilePanel={handleOpenFilePanel}
-																resolvePerm={resolvePermForRender}
-																onAskInPassing={handleAskInPassing}
+																isActive={isActive}
 																scrollRef={chunkViewportRef}
 																contentRef={contentRef}
-																onSelectionResolverChange={setChunkSelectionResolver}
 																onAtBottomChange={setIsAtBottom}
 																onUnreadCountChange={setUnreadCount}
-																onTailMetaChange={handleChunkTailMetaChange}
+																onTailMetaChange={handleMessageListTailMetaChange}
 																onLodStep={handleLodStep}
-																tailFooter={chunkListTailFooter}
+																onSelectionResolverChange={setChunkSelectionResolver}
+																rowHandlers={vlistRowHandlers}
+																permCb={renderPermCb}
+																pruneDividerLabel={pruneDividerLabel}
+																hasChapter={hasChapter}
+																highlightMessageId={highlightMessageId}
+																tailFooter={
+																	isSubagent &&
+																	narrator &&
+																	narrator.status === "idle" &&
+																	!isTakenOver &&
+																	substatus.includes("manual_override") &&
+																	!isActive ? (
+																		<Box ta="center" py="sm">
+																			<Button
+																				size="compact-sm"
+																				variant="light"
+																				color="indigo"
+																				onClick={() => updateConclusionMutation.mutate(narratorId)}
+																				loading={updateConclusionMutation.isPending}
+																			>
+																				{t("updateConclusion")}
+																			</Button>
+																		</Box>
+																	) : null
+																}
 															/>
-														)}
+														</Suspense>
 													</RenderLodCtx.Provider>
 													<LodSwitchToast
 														lod={renderLod}

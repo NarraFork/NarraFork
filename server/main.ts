@@ -1158,6 +1158,16 @@ try {
 	logger.warn("Codex usage refresh scheduler startup failed", { error: String(err) });
 }
 
+try {
+	// One-shot warmup when Kimi providers exist; no periodic timer — refresh is
+	// demand-driven (stale-while-revalidate on GET /api/kimi/usages, plus a
+	// refresh when provider settings change).
+	const { refreshAllKimiUsages } = await import("./lib/kimi-usage-cache");
+	void refreshAllKimiUsages().catch(() => {});
+} catch (err) {
+	logger.warn("Kimi usage startup refresh failed", { error: String(err) });
+}
+
 	if (configuredCredentialsPath) {
 		return {
 			credentialsPath: configuredCredentialsPath,

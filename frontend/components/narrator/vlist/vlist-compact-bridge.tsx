@@ -29,7 +29,7 @@ import { IconX } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useCallback, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { CompactSummaryModalCtx } from "../MessageBubble";
+import { CompactSummaryModalCtx } from "../compact-summary-modal";
 import { resolveVListCompactTarget, type VListCompactTarget } from "./vlist-compact-target";
 import type { VListItem } from "./vlist-pipeline";
 

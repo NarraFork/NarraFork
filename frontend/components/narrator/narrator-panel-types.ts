@@ -145,8 +145,6 @@ export interface NarratorPanelProps {
 	 * it, which opens the session at its tail.
 	 */
 	onViewSubagentSession?: (narratorId: string, messageId?: string) => void;
-	/** When true, shows a skeleton overlay instead of messages (e.g. during node resize) */
-	isResizing?: boolean;
 	/** Called on pointerdown on the header bar — allows parent to initiate drag */
 	onHeaderPointerDown?: (e: React.PointerEvent) => void;
 	/** Close this panel (used in workspace multi-panel mode) */

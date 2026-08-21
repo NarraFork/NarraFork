@@ -123,6 +123,13 @@ interface RenderMarkdownProps {
 	animateStreaming?: boolean;
 	/** Stable per-element key base (the vlist item's spec.key) for anim memory. */
 	animKeyBase?: string;
+	/**
+	 * The anim store's mount-vs-live-birth SCOPE — the narratorId. Passed as its
+	 * own value rather than parsed out of `animKeyBase`: the store used to slice
+	 * that key at its first ":", so the key template's shape silently decided
+	 * whether a new paragraph faded in or popped.
+	 */
+	animScope?: string;
 }
 
 /**
@@ -137,6 +144,7 @@ export function RenderMarkdown({
 	onUnknownHeight,
 	animateStreaming,
 	animKeyBase,
+	animScope,
 }: RenderMarkdownProps) {
 	const { blocks, frame, contentWidth } = measured;
 	const hostRef = useRef<HTMLDivElement | null>(null);
@@ -224,6 +232,7 @@ export function RenderMarkdown({
 								contentWidth={contentWidth}
 								flowing
 								animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
+								animScope={animScope}
 								codeCopyPlacement={copyPlacements.get(index)}
 							/>
 						</div>
@@ -259,6 +268,7 @@ export function RenderMarkdown({
 							contentWidth={contentWidth}
 							flowing={false}
 							animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
+							animScope={animScope}
 							codeCopyPlacement={copyPlacements.get(index)}
 						/>
 					</Fragment>
@@ -356,6 +366,7 @@ function BlockView({
 	contentWidth,
 	flowing,
 	animKey,
+	animScope,
 	codeCopyPlacement,
 }: {
 	block: PreparedBlock;
@@ -365,6 +376,8 @@ function BlockView({
 	flowing: boolean;
 	/** Streaming per-grapheme animation key for this block (undefined = no anim). */
 	animKey?: string;
+	/** The anim store's scope (narratorId) for this block's key. */
+	animScope?: string;
 	/** Non-default corner for a fenced panel's copy button; absent → top-right. */
 	codeCopyPlacement?: CodeCopyPlacement;
 }) {
@@ -376,6 +389,7 @@ function BlockView({
 					frame={frame}
 					contentWidth={contentWidth}
 					animKey={animKey}
+					animScope={animScope}
 				/>
 			);
 		case "code":
@@ -668,12 +682,18 @@ function InlineBlockView({
 	frame,
 	contentWidth,
 	animKey,
+	animScope,
 }: {
 	block: PreparedInlineBlock;
 	frame: BlockFrame;
 	contentWidth: number;
 	/** Streaming per-grapheme animation key for this block (undefined = no anim). */
 	animKey?: string;
+	/**
+	 * Mount-vs-live-birth scope (the narratorId). Bound to the shared store once
+	 * per render so peek and commit cannot disagree about it.
+	 */
+	animScope?: string;
 }) {
 	// Materialize lines + fragments, assigning each fragment a running GLOBAL
 	// offset within the block's concatenated visible text. That offset is what
@@ -719,10 +739,19 @@ function InlineBlockView({
 	// would date this frame's own birth slightly in the past and start its animation
 	// already advanced.
 	const now = animKey != null ? Date.now() : 0;
+	// One scope handle for both halves of the frame. The scope defaults to the
+	// animKey itself only when the shell supplied none: a key that is its own scope
+	// can never be warmed by a sibling, so the first sighting seals — the safe
+	// direction (a mount must not replay a fade), and the same thing the old
+	// key-slicing did for a key without ":".
+	const scoped = useMemo(
+		() => streamAnimStore.scoped(animScope ?? animKey ?? ""),
+		[animScope, animKey],
+	);
 	// Named `animFrame`, not `frame`: this component's `frame` prop is the measured
 	// BlockFrame (geometry). Two different meanings of the word in one scope is how
 	// a later edit reaches for the wrong one.
-	const animFrame = animKey != null ? streamAnimStore.peekFrame(animKey, visibleText, now) : null;
+	const animFrame = animKey != null ? scoped.peekFrame(animKey, visibleText, now) : null;
 	// `now` is deliberately NOT a dependency: it changes on every render, so including
 	// it would commit a birth on renders that appended nothing (a hover, a resize, a
 	// parent rebuild), restamping text that was already mid-fade and restarting its
@@ -730,8 +759,8 @@ function InlineBlockView({
 	// `visibleText` actually changed — which is precisely the birth time wanted.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: `now` must stay out; see above
 	useEffect(() => {
-		if (animKey != null) streamAnimStore.commitFrame(animKey, visibleText, now);
-	}, [animKey, visibleText]);
+		if (animKey != null) scoped.commitFrame(animKey, visibleText, now);
+	}, [animKey, visibleText, scoped]);
 	// The split point is the SEAL offset, not the append boundary — a grapheme must
 	// keep its span until its animation finishes (see stream-token-anim's header).
 	const sealOffset = animFrame?.sealOffset ?? Number.POSITIVE_INFINITY;

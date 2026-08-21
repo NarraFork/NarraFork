@@ -15,7 +15,13 @@
 	display: inline;
 	overflow-wrap: anywhere;
 	word-break: break-word;
-	animation: markdownWordIn 0.35s ease-out both;
+	/* Duration is user-configurable (Settings → Appearance); AppRootLayout writes
+	   --nf-stream-token-duration onto <html>. This is the classic (non-virtual)
+	   renderer, where retirement is driven by the append boundary rather than by
+	   time, so it has no JS-side duration to keep in sync — it just follows the
+	   same preference so both renderers animate at the speed the user chose. The
+	   0.35s fallback is its historical value. */
+	animation: markdownWordIn var(--nf-stream-token-duration, 0.35s) ease-out both;
 }
 
 @keyframes markdownWordIn {

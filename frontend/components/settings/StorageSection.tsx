@@ -51,8 +51,8 @@ import {
 	type DatabaseStorageBreakdown,
 	type DatabaseVacuumResult,
 	type StorageCategoryResult,
+	type StorageScanJobState,
 	type StorageScanResult,
-	scanStorageStream,
 } from "../../lib/api";
 import { formatLocaleDateTime, formatLocaleTime } from "../../lib/intl-format";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
@@ -294,7 +294,21 @@ export function StorageSection() {
 	const [databasePreviewError, setDatabasePreviewError] = useState<string | null>(null);
 	const [databaseCleaning, setDatabaseCleaning] = useState(false);
 	const [databaseVacuuming, setDatabaseVacuuming] = useState(false);
-	const abortRef = useRef<AbortController | null>(null);
+	// Aborts only the status-polling fetches on unmount. The scan itself is a server-side
+	// background job: leaving this page neither cancels nor restarts it.
+	const pollAbortRef = useRef<AbortController | null>(null);
+	const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	/**
+	 * False once this component has unmounted.
+	 *
+	 * Needed because the unmount cleanup can run WHILE a request is in flight, and a
+	 * `.then` that lands afterwards would start a fresh 500ms polling chain with no
+	 * cleanup left to stop it — it then runs until the job reaches a terminal state.
+	 * Bounded, but it keeps fetching (and calling setState on an unmounted tree) for
+	 * as long as the scan lasts. Both async entry points check this before starting
+	 * to poll.
+	 */
+	const mountedRef = useRef(true);
 
 	const { data: settingsData } = useQuery({
 		queryKey: ["settings"],
@@ -306,11 +320,87 @@ export function StorageSection() {
 			?.requestDumpEnabled,
 	);
 
+	const applyJobState = (state: StorageScanJobState) => {
+		if (state.status === "running") {
+			setScanning(true);
+			setProgressMsg(state.progressMessage ?? "");
+			setProgressDetail(state.progressDetail);
+			for (const cat of state.categories) upsertCategory(cat);
+			return false;
+		}
+		setScanning(false);
+		setProgressMsg("");
+		setProgressDetail(null);
+		if (state.status === "complete" && state.result) {
+			setScanResult(state.result);
+		} else if (state.status === "error") {
+			console.error("Storage scan failed:", state.error);
+			notifications.show({
+				color: "red",
+				message: state.error || t("storageScanFailed"),
+			});
+		}
+		return true;
+	};
+
+	const stopPolling = () => {
+		if (pollTimerRef.current) {
+			clearTimeout(pollTimerRef.current);
+			pollTimerRef.current = null;
+		}
+		pollAbortRef.current?.abort();
+		pollAbortRef.current = null;
+	};
+
+	const pollScanStatus = () => {
+		stopPolling();
+		const controller = new AbortController();
+		pollAbortRef.current = controller;
+		const tick = async () => {
+			try {
+				const res = await api.getStorageScanStatus(controller.signal);
+				const finished = applyJobState(res.state);
+				if (!finished && !controller.signal.aborted) {
+					pollTimerRef.current = setTimeout(() => void tick(), 500);
+				}
+			} catch (err) {
+				if ((err as Error).name !== "AbortError") {
+					// Transient polling failures shouldn't kill the scan indicator; retry once per tick.
+					pollTimerRef.current = setTimeout(() => void tick(), 1000);
+				}
+			}
+		};
+		void tick();
+	};
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: unmount-only cleanup; stopPolling is stable
 	useEffect(() => {
 		return () => {
-			abortRef.current?.abort();
-			abortRef.current = null;
+			mountedRef.current = false;
+			stopPolling();
 		};
+	}, []);
+
+	// Resume an in-flight background scan after remounting (navigating away and back).
+	// biome-ignore lint/correctness/useExhaustiveDependencies: mount-only resume; handlers are stable
+	useEffect(() => {
+		api
+			.getStorageScanStatus()
+			.then((res) => {
+				if (!mountedRef.current) return;
+				if (res.state.status === "running") {
+					applyJobState(res.state);
+					pollScanStatus();
+					return;
+				}
+				// A TERMINAL state is also worth applying: a scan that finished — or failed —
+				// while this page was closed used to be ignored entirely, so the reader came
+				// back to stale numbers with no hint that the run had ended, let alone that it
+				// had errored. `applyJobState` surfaces the result / the error notification;
+				// `idle` (nothing ever ran) carries neither and is a harmless no-op.
+				applyJobState(res.state);
+			})
+			.catch(() => {});
 	}, []);
 
 	useEffect(() => {
@@ -383,48 +473,56 @@ export function StorageSection() {
 		}
 	};
 
+	const upsertCategory = (cat: StorageCategoryResult) => {
+		setScanResult((prev) => {
+			const categories = prev ? [...prev.categories] : [];
+			const idx = categories.findIndex((c) => c.key === cat.key);
+			if (idx >= 0) categories[idx] = cat;
+			else categories.push(cat);
+			return {
+				categories,
+				totalBytes: categories.reduce((s, c) => s + c.sizeBytes, 0),
+				scannedAt: Date.now(),
+			};
+		});
+	};
+
 	const handleScan = async () => {
 		if (!storageHealthReady || scanning || !scanSupported) return;
 		setScanning(true);
 		setProgressMsg("");
 		setProgressDetail(null);
-		abortRef.current = new AbortController();
 
 		try {
-			const result = await scanStorageStream({
-				onProgress: (msg, detail) => {
-					setProgressMsg(msg);
-					setProgressDetail(detail ?? null);
-				},
-				onCategory: (cat) => {
-					setScanResult((prev) => {
-						const categories = prev ? [...prev.categories] : [];
-						const idx = categories.findIndex((c) => c.key === cat.key);
-						if (idx >= 0) categories[idx] = cat;
-						else categories.push(cat);
-						return {
-							categories,
-							totalBytes: categories.reduce((s, c) => s + c.sizeBytes, 0),
-							scannedAt: Date.now(),
-						};
-					});
-				},
-				signal: abortRef.current.signal,
-			});
-			setScanResult(result);
+			const res = await api.startStorageScan();
+			// The unmount cleanup may already have run during this await; starting the
+			// poll chain now would leave it with nothing to stop it.
+			if (!mountedRef.current) return;
+			// started=false means a scan (possibly from another admin or a previous visit of
+			// this page) is already in flight — either way we just observe the same job.
+			applyJobState(res.state);
+			pollScanStatus();
 		} catch (err) {
-			if ((err as Error).name !== "AbortError") {
-				console.error("Storage scan failed:", err);
-				notifications.show({
-					color: "red",
-					message: err instanceof Error && err.message ? err.message : t("storageScanFailed"),
-				});
-			}
+			console.error("Storage scan failed:", err);
+			notifications.show({
+				color: "red",
+				message: err instanceof Error && err.message ? err.message : t("storageScanFailed"),
+			});
+			setScanning(false);
+		}
+	};
+
+	const handleCancelScan = async () => {
+		try {
+			const res = await api.cancelStorageScan();
+			applyJobState(res.state);
+		} catch (err) {
+			console.error("Cancel storage scan failed:", err);
 		} finally {
+			stopPolling();
 			setScanning(false);
 			setProgressMsg("");
 			setProgressDetail(null);
-			abortRef.current = null;
 		}
 	};
 
@@ -762,12 +860,23 @@ export function StorageSection() {
 						<Button
 							size="xs"
 							variant="light"
+							color={scanning ? "red" : undefined}
 							leftSection={scanning ? <Loader size={14} /> : <IconRefresh size={14} />}
-							onClick={handleScan}
-							disabled={scanning || !storageHealthReady || !scanSupported}
-							title={!storageHealthReady || !scanSupported ? scanDisabledReason : undefined}
+							onClick={scanning ? handleCancelScan : handleScan}
+							disabled={!scanning && (!storageHealthReady || !scanSupported)}
+							title={
+								scanning
+									? undefined
+									: !storageHealthReady || !scanSupported
+										? scanDisabledReason
+										: undefined
+							}
 						>
-							{scanning ? t("storageScanning") : scanResult ? t("storageRescan") : t("storageScan")}
+							{scanning
+								? t("storageScanCancel")
+								: scanResult
+									? t("storageRescan")
+									: t("storageScan")}
 						</Button>
 					</Group>
 				</Group>

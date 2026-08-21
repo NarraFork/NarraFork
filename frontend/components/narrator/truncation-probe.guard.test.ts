@@ -24,10 +24,7 @@ import { join } from "node:path";
 
 /** Modules that consume a tool call's inputJson / outputJson. */
 const PAYLOAD_CONSUMERS = [
-	"ToolCallCard.tsx",
-	"SubagentCard.tsx",
 	"ToolCallInspector.tsx",
-	"ChunkedMessageList.tsx",
 	"narrator-message-helpers.ts",
 	"vlist/segment-adapter.ts",
 	"vlist/vlist-selection.ts",
@@ -90,19 +87,48 @@ describe("field-level truncation: no root-level payload probes", () => {
 		expect(ROOT_PROBE.test("(value as { _truncated?: unknown })._truncated === true")).toBe(false);
 		expect(ROOT_PROBE.test("record._truncated === true")).toBe(false);
 	});
+});
 
-	it("the payload-level questions route through the recursive probe", () => {
-		// ToolCallCard decides whether to FETCH the full record from this.
-		const card = read("ToolCallCard.tsx");
-		const hasTruncatedData = card.slice(
-			card.indexOf("function hasTruncatedData("),
-			card.indexOf("function LazyDetailRenderer("),
+/**
+ * The POSITIVE half of the guard.
+ *
+ * The negative rule above only says nobody probes the root; it cannot say that the
+ * "does this row need its full payload" decision is asked correctly at all. That
+ * half used to be covered by two assertions naming `LazyDetailRenderer` and
+ * `SubagentCard` — both deleted with the chunked renderer, and the assertions went
+ * with them. What remained would stay green even if the vlist stopped asking the
+ * question entirely, which is the same class of silent failure the file exists for
+ * (the "load full content" affordance simply never appears).
+ *
+ * The vlist asks it through `truncatedLeafCount`, the measure layer's count of
+ * truncated LEAVES — the field-level answer, derived once during measurement rather
+ * than re-probed at paint time.
+ */
+describe("field-level truncation: the question IS asked, via the leaf count", () => {
+	const SHELL = read("vlist/PretextExactMessageList.tsx");
+
+	it("gates the full-payload fetch on truncatedLeafCount, for tool cards", () => {
+		// `<= 0` (not `!truncated`): the count is the signal, and a card with zero
+		// truncated leaves must not request a fetch.
+		expect(SHELL).toMatch(/truncatedLeafCount\s*<=\s*0\s*\)\s*continue/);
+	});
+
+	it("folds the leaf count into the measure cache key", () => {
+		// Without this the post-fetch card would keep hitting the pre-fetch entry and
+		// the row would never repaint with the full payload — the count would stay above
+		// zero forever, so the affordance would appear to do nothing.
+		const cache = read("vlist/measure-cache.ts");
+		expect(cache).toContain("truncatedLeafCount");
+	});
+
+	it("the recursive leaf probe is still the exported way to ask about a payload", () => {
+		// `hasTruncatedLeaf` is the correct question for a raw payload (tool-display
+		// uses it). If it disappeared, a future consumer would have nothing to reach for
+		// but the root probe the rule above forbids.
+		const projection = readFileSync(
+			join(import.meta.dir, "..", "..", "..", "shared", "pretext-layout", "tool-io-projection.ts"),
+			"utf8",
 		);
-		expect(hasTruncatedData.length).toBeGreaterThan(0);
-		expect(hasTruncatedData).toContain("hasTruncatedLeaf(toolCall.inputJson)");
-		expect(hasTruncatedData).toContain("hasTruncatedLeaf(toolCall.outputJson)");
-
-		// SubagentCard gates its own detail fetch the same way.
-		expect(read("SubagentCard.tsx")).toContain("hasTruncatedLeaf(toolCall.outputJson)");
+		expect(projection).toMatch(/export function hasTruncatedLeaf\(/);
 	});
 });

@@ -16,6 +16,11 @@ import {
 } from "../lib/custom-api-quota-cache";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
+import {
+	getAllKimiCachedUsages,
+	purgeKimiUsageCache,
+	refreshAllKimiUsages,
+} from "../lib/kimi-usage-cache";
 import { logger } from "../lib/logger";
 import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getLanAddresses } from "../lib/net/lan-addresses";
@@ -885,6 +890,7 @@ function buildSettingsResponse(
 		clineModelsGrouped: getClineEnabledModelsGrouped(),
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
+		kimiUsages: getAllKimiCachedUsages(),
 		codexAvailable: codexManager.snapshot().available > 0,
 		codexModels: getBuiltinCodexModels(),
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
@@ -945,6 +951,32 @@ function getGeminiTransportChangedProviderIds(
 			return (
 				(provider.geminiTransport ?? "generate-content") !==
 				(nextProvider.geminiTransport ?? "generate-content")
+			);
+		})
+		.map((provider) => provider.id);
+}
+
+/**
+ * Custom API providers whose KIMI USAGE identity changed.
+ *
+ * Narrower than the quota test: the usage endpoint is addressed by `baseUrl` and
+ * authenticated by `apiKey`, and nothing else affects what it returns. `disabled`
+ * counts too — a disabled provider stops being refreshed, so leaving its numbers
+ * cached would show a quota that is no longer being updated.
+ */
+function getCustomApiProviderIdsWithKimiIdentityChanges(
+	prev: NarraForkSettings["customApiProviders"],
+	next: NarraForkSettings["customApiProviders"],
+): string[] {
+	const nextById = new Map((next ?? []).map((provider) => [provider.id, provider]));
+	return (prev ?? [])
+		.filter((provider) => {
+			const nextProvider = nextById.get(provider.id);
+			if (!nextProvider) return false;
+			return (
+				provider.baseUrl !== nextProvider.baseUrl ||
+				provider.apiKey !== nextProvider.apiKey ||
+				Boolean(provider.disabled) !== Boolean(nextProvider.disabled)
 			);
 		})
 		.map((provider) => provider.id);
@@ -1049,6 +1081,21 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	if (staleCustomApiQuotaIds.length) {
 		purgeCustomApiQuotaCache(staleCustomApiQuotaIds);
 		logger.info("Purged custom API quota cache", { providerIds: staleCustomApiQuotaIds });
+	}
+	// Kimi usage keys off (baseUrl, apiKey) only, so it uses its OWN staleness test
+	// rather than the quota one: that set also fires on `protocol`,
+	// `geminiTransport` and `codexAccountId`, none of which changes what the usage
+	// endpoint returns — throwing the cache away for them just forces a needless
+	// upstream refetch.
+	const staleKimiUsageIds = uniqueIds([
+		...removedCustomApiIds,
+		...getCustomApiProviderIdsWithKimiIdentityChanges(
+			prev.customApiProviders,
+			next.customApiProviders,
+		),
+	]);
+	if (staleKimiUsageIds.length) {
+		purgeKimiUsageCache(staleKimiUsageIds);
 	}
 
 	// Collect prefixes of removed providers — needed to purge agent-level fields
@@ -1580,6 +1627,14 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 					updateNarratorModel(row.id, row.afterModel);
 				}
 			}
+		}
+
+		// Refresh Kimi usage caches when the provider list changed, so a newly
+		// added kimi.com/kimi.ai provider shows its quota without waiting for the
+		// periodic scheduler. Fire-and-forget: a slow upstream must not delay the
+		// settings response.
+		if (validated.customApiProviders) {
+			void refreshAllKimiUsages().catch(() => {});
 		}
 
 		if (vnetChanged) {

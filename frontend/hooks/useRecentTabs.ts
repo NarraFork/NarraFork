@@ -645,6 +645,9 @@ function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
 	if (tab.status !== undefined) persisted.status = tab.status;
 	if (tab.pinned !== undefined) persisted.pinned = tab.pinned;
 	if (tab.isScheduled !== undefined) persisted.isScheduled = tab.isScheduled;
+	// Carried so an undo-restore does not silently flatten hand-arranged directory
+	// groups back to recency order.
+	if (tab.dirSortOrder !== undefined) persisted.dirSortOrder = tab.dirSortOrder;
 	return persisted;
 }
 

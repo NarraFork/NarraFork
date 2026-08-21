@@ -64,6 +64,8 @@
 	"compactFailed": "Compact failed",
 	"compactFailedDesc": "Failed to compact messages. Please try again.",
 	"retryCompact": "Retry compaction",
+	"saveCompactSummaryFailed": "Failed to save the summary",
+	"saveCompactSummaryFailedDesc": "The edited summary was not saved. Your text is still in the editor — try again.",
 	"retryCompactFailed": "Failed to retry compaction",
 	"compactAttempts": "Attempts",
 	"compactAttempt": "Attempt {{attempt}} · {{model}}",
@@ -602,6 +604,9 @@
 	"userMessagePreviewTruncated": "Message preview truncated to keep the UI responsive.",
 	"deleteMessageFailed": "Delete failed",
 	"deleteMessageFailedDesc": "Failed to delete message. Please try again.",
+	"interruptGuard": {
+		"dismiss": "Delete this reminder"
+	},
 	"compactUnsupportedTitle": "Compact unavailable",
 	"compactUnsupported": "Compacting is not available in this backend/runtime.",
 	"compactFallbackSummaryTitle": "Deterministic compact summary",
@@ -651,6 +656,17 @@
 	"contextStaleHint": "Context usage shown is inaccurate after compacting/clearing/deleting messages. The accurate value will be available after the next request to the server.",
 	"estimated": "estimated",
 	"quotaBalance": "API balance: {{balance}}",
+	"kimi": {
+		"fiveHourShort": "5h {{percent}}%",
+		"fiveHourRatio": "5h {{used}}/{{limit}}",
+		"unavailable": "Kimi usage unavailable",
+		"window5h": "5-hour limit",
+		"windowWeekly": "Weekly limit",
+		"windowMonthly": "Monthly limit",
+		"windowLine": "{{label}}: used {{used}}/{{limit}}",
+		"resetSuffix": ", resets at {{time}}",
+		"fetchError": "Usage fetch failed: {{error}}"
+	},
 	"recharge": {
 		"title": "NUG Recharge",
 		"open": "Recharge",
@@ -1114,7 +1130,8 @@
 			"spec_goal_added": "Goal added",
 			"spec_fork_carryover": "Outline carried over",
 			"spec_context_cleared": "Context cleared",
-			"review_feedback": "Code review"
+			"review_feedback": "Code review",
+			"interrupt_task_guard": "Interrupted-task reminder"
 		},
 		"cadence": {
 			"everyNTools": "every {{n}} tool calls"

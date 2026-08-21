@@ -874,8 +874,8 @@ function isSpecTasksInput(toolName: string, input: any): boolean {
 /**
  * Recursively project inputJson/outputJson of every tool call in a message tree.
  *
- * `maxLen` is the PER-LEAF budget and keeps the conservative 2000 default: five of
- * the six call sites are WS broadcasts or collapsed (chunked) rendering, and only
+ * `maxLen` is the PER-LEAF budget and keeps the conservative 2000 default: most
+ * call sites are WS broadcasts or other collapsed summaries, and only
  * `getPretextDocumentPage` drives the vlist's exact measurement — so the one
  * caller that wants a larger budget opts in explicitly rather than every other
  * caller inheriting an inflated default.
@@ -973,8 +973,8 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
  * the fallback array was present — so no measured height can move. This is a
  * transport-only projection, which is why it is confined to the one endpoint
  * whose consumer is the vlist loader rather than applied in `truncateToolIO`
- * (whose other five call sites include the chunked path and WS broadcasts, where
- * the array is NOT redundant).
+ * (whose other call sites include WS broadcasts, where the array is NOT
+ * redundant).
  *
  * `toolCalls` is replaced with `[]` rather than deleted: `segmentMessages` and
  * several call sites do `msg.toolCalls?.find(...)` / `Array.isArray(msg.toolCalls)`,
@@ -1028,8 +1028,8 @@ export function stripRedundantToolCallRows(tree: any[]): any[] {
  *
  * The vlist adapter never reads `providerMetadata` at all (it derives a reasoning
  * row from `thinking`/`text`), so on the exact path this is height-neutral by
- * construction; the flag is what keeps it height-neutral for the chunked renderer
- * too. Both are pinned by tests.
+ * construction; the flag is what keeps it height-neutral for the collapsed
+ * summary paths too. Both are pinned by tests.
  *
  * Transport-only, and confined to the exact-layout page for the same reason
  * `stripRedundantToolCallRows` is: the real value must survive on every path that
@@ -1340,9 +1340,9 @@ function attachSubagentActivities(
 /**
  * Build the enriched message tree for a page of top-level refs.
  *
- * `ioBudget` has NO default on purpose: this helper serves both the chunked
- * pagination path (collapsed cards, small budget) and the exact-layout page
- * (measured bodies, larger budget), so each caller must state which one it is.
+ * `ioBudget` has NO default on purpose: this helper serves both summary-style
+ * callers (collapsed cards, small budget) and the exact-layout page (measured
+ * bodies, larger budget), so each caller must state which one it is.
  */
 async function buildTreeFromTopLevelRefs(
 	refRows: Array<{ messageId: string; seq: number }>,
@@ -1436,56 +1436,6 @@ async function resolveAwaitAgentIdsForMessages(
  * that cycle and fail at module init).
  */
 export { AWAIT_AGENT_RESOLVED_FIELD, attachAwaitAgentNarratorIds };
-
-// ── Chunk manifest helpers ─────────────────────────────────────────────────
-
-/** Number of top-level messages per chunk. Keep in sync with the frontend. */
-export const CHUNK_SIZE = 20;
-
-/** Compact manifest chunk tuple: [id, firstSeq, lastSeq, count]. */
-type ManifestChunkTuple = [string, number, number, number];
-
-interface ComputedManifest {
-	messageVersion: number;
-	total: number;
-	chunks: ManifestChunkTuple[];
-}
-
-/**
- * Per-narrator manifest cache, keyed by narratorId and validated by
- * messageVersion. Because the manifest is a pure function of the ref table at a
- * given messageVersion, a cached entry whose version still matches is exact —
- * so even a first load (no client `since`) of a recently-viewed narrator skips
- * the full ref scan. Bounded LRU to cap memory.
- *
- * On off-threading: the remaining cost on a cache MISS is a single synchronous
- * indexed ref scan (~17-23ms on the largest histories) plus ~4ms of JS slicing.
- * That is one-time per (narrator, version) and below the threshold where a
- * worker + separate DB connection would pay for its complexity/risk. If a
- * pathological narrator (far beyond ~30k messages) ever makes the first-open
- * scan visibly block, revisit moving the scan to a worker then.
- */
-const MANIFEST_CACHE_LIMIT = 64;
-const manifestCache = new Map<string, ComputedManifest>();
-
-function getCachedManifest(narratorId: string, version: number): ComputedManifest | null {
-	const hit = manifestCache.get(narratorId);
-	if (!hit || hit.messageVersion !== version) return null;
-	// LRU touch.
-	manifestCache.delete(narratorId);
-	manifestCache.set(narratorId, hit);
-	return hit;
-}
-
-function setCachedManifest(narratorId: string, entry: ComputedManifest): void {
-	manifestCache.delete(narratorId);
-	manifestCache.set(narratorId, entry);
-	while (manifestCache.size > MANIFEST_CACHE_LIMIT) {
-		const oldest = manifestCache.keys().next().value;
-		if (oldest === undefined) break;
-		manifestCache.delete(oldest);
-	}
-}
 
 // ── narratorMessages object ────────────────────────────────────────────────
 
@@ -2190,305 +2140,6 @@ export const narratorMessageQueries = {
 	},
 
 	/**
-	 * Lightweight chunk manifest for the virtualized message list.
-	 *
-	 * Reads ONLY the narrow narrator_message_refs join (indexed by seq), never
-	 * the large content_json/output_json payloads. Returns one fingerprint per
-	 * CHUNK_SIZE top-level messages so the client can detect which chunks changed
-	 * without refetching content. When `sinceVersion` matches the current
-	 * messageVersion, short-circuits with `{ unchanged: true }`.
-	 */
-	/**
-	 * Compute (or read from cache) the FULL manifest for a narrator at the given
-	 * messageVersion. The full chunk array is the cheap part (one indexed ref
-	 * scan + JS slicing) and stays cached so windowed reads never rescan. Pure
-	 * function of the ref table at this version, so a cached hit is exact.
-	 */
-	async computeFullManifest(narratorId: string, messageVersion: number): Promise<ComputedManifest> {
-		const cached = getCachedManifest(narratorId, messageVersion);
-		if (cached) return cached;
-
-		const isSubagent = await this.isSubagentNarrator(narratorId);
-
-		// Narrow query: seq + messageId only, ordered by seq. No large columns,
-		// no COUNT(*). Uses idx_narrator_refs_seq.
-		//
-		// Primary narrators never have refs pointing to child (parent_tool_use_id
-		// IS NOT NULL) messages — children are not referenced in the junction
-		// table — so the join to narrator_messages would filter nothing and is
-		// pure overhead (≈4x slower on large histories). Skip it entirely and
-		// query the narrow refs table alone. Subagent narrators legitimately hold
-		// child refs as top-level, so they keep the (cheap, small) join path.
-		const refRows = isSubagent
-			? await db
-					.select({
-						messageId: narratorMessageRefs.messageId,
-						seq: narratorMessageRefs.seq,
-					})
-					.from(narratorMessageRefs)
-					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							isNull(narratorMessageRefs.segmentCompactId),
-						),
-					)
-					.orderBy(narratorMessageRefs.seq)
-			: await db
-					.select({
-						messageId: narratorMessageRefs.messageId,
-						seq: narratorMessageRefs.seq,
-					})
-					.from(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							isNull(narratorMessageRefs.segmentCompactId),
-						),
-					)
-					.orderBy(narratorMessageRefs.seq);
-
-		// Compact tuple payload: [id, firstSeq, lastSeq, count]. Tuples avoid
-		// repeating object keys ~1.5k times (≈60% smaller wire/parse than an
-		// array of objects). The structural fingerprint (hash) is intentionally
-		// omitted here — it is only needed by the (not-yet-built) chunks_dirty
-		// incremental reconciliation, and would otherwise cost wire bytes + a
-		// djb2 pass per chunk for no current consumer.
-		const chunks: ManifestChunkTuple[] = [];
-		for (let i = 0; i < refRows.length; i += CHUNK_SIZE) {
-			const slice = refRows.slice(i, i + CHUNK_SIZE);
-			const first = slice[0];
-			const last = slice[slice.length - 1];
-			chunks.push([first.messageId, first.seq, last.seq, slice.length]);
-		}
-
-		const entry: ComputedManifest = { messageVersion, total: refRows.length, chunks };
-		setCachedManifest(narratorId, entry);
-		return entry;
-	},
-
-	/**
-	 * Lightweight chunk manifest for the virtualized message list.
-	 *
-	 * Reads ONLY the narrow narrator_message_refs join (indexed by seq), never
-	 * the large content_json/output_json payloads. Returns one fingerprint per
-	 * CHUNK_SIZE top-level messages so the client can detect which chunks changed
-	 * without refetching content. When `sinceVersion` matches the current
-	 * messageVersion, short-circuits with `{ unchanged: true }`.
-	 *
-	 * Windowing: the client opens with only the newest `limitChunks` chunks and
-	 * walks older bands via `beforeSeq` (reverse infinite scroll). The full chunk
-	 * array is still computed/cached server-side (cheap), but only the requested
-	 * window is sent on the wire. `total` is always the full top-level count so
-	 * callers know the true history size; `windowFirstIndex`/`hasOlderChunks`
-	 * locate the window inside the full history.
-	 */
-	async getChunkManifest(
-		narratorId: string,
-		sinceVersion?: number,
-		window?: { limitChunks?: number; beforeSeq?: number },
-	): Promise<
-		| { unchanged: true; messageVersion: number }
-		| {
-				unchanged: false;
-				messageVersion: number;
-				total: number;
-				/** Index of the first returned chunk within the full history. */
-				windowFirstIndex: number;
-				/** True when chunks older than the returned window exist. */
-				hasOlderChunks: boolean;
-				/** Compact tuples: [id, firstSeq, lastSeq, count]. */
-				chunks: Array<[string, number, number, number]>;
-		  }
-	> {
-		// A lazy fork only materialized the refs after its parent's last compact.
-		// Asking for a window older than that must first pull those refs in, or the
-		// manifest would silently describe a truncated history.
-		if (window?.beforeSeq != null && Number.isFinite(window.beforeSeq)) {
-			await ensureRefsCoverSeq(narratorId, window.beforeSeq);
-		}
-
-		const messageVersion = await this.getMessageVersion(narratorId);
-		if (sinceVersion != null && sinceVersion === messageVersion) {
-			return { unchanged: true, messageVersion };
-		}
-
-		const full = await this.computeFullManifest(narratorId, messageVersion);
-		const allChunks = full.chunks;
-
-		// Resolve the window [windowFirstIndex, windowEnd) over the full chunk
-		// array. `beforeSeq` walks older: take the chunks whose firstSeq < beforeSeq,
-		// keeping the newest `limit` of them. No `beforeSeq` → newest `limit`.
-		const limit =
-			window?.limitChunks != null && Number.isFinite(window.limitChunks)
-				? Math.min(Math.max(Math.trunc(window.limitChunks), 1), 200)
-				: allChunks.length;
-		let windowEnd = allChunks.length; // exclusive
-		if (window?.beforeSeq != null && Number.isFinite(window.beforeSeq)) {
-			// First chunk index whose firstSeq >= beforeSeq; everything before it is older.
-			let idx = allChunks.length;
-			for (let i = 0; i < allChunks.length; i++) {
-				if (allChunks[i][1] >= window.beforeSeq) {
-					idx = i;
-					break;
-				}
-			}
-			windowEnd = idx;
-		}
-		const windowFirstIndex = Math.max(0, windowEnd - limit);
-		const chunks = allChunks.slice(windowFirstIndex, windowEnd);
-
-		// `hasOlderChunks` drives the client's reverse-infinite-scroll. For a lazy fork
-		// the materialized refs are only part of the story: once the window reaches the
-		// oldest local chunk, the parent may still hold older history that a further
-		// scroll would reveal.
-		let hasOlderChunks = windowFirstIndex > 0;
-		if (!hasOlderChunks) {
-			const oldestLocalSeq = allChunks.length > 0 ? allChunks[0][1] : (window?.beforeSeq ?? 0);
-			hasOlderChunks = await hasUnmaterializedRefsBelow(narratorId, oldestLocalSeq);
-		}
-
-		return {
-			unchanged: false,
-			messageVersion,
-			total: full.total,
-			windowFirstIndex,
-			hasOlderChunks,
-			chunks,
-		};
-	},
-
-	/**
-	 * Fetch a contiguous range of top-level messages (with full child trees) for
-	 * the virtualized list. Replaces the legacy 20/50 + around triple-path.
-	 *
-	 * - direction "older": messages with seq < fromSeq (descending then reversed)
-	 * - direction "newer": messages with seq > fromSeq (ascending)
-	 * - fromSeq omitted: the latest tail
-	 *
-	 * `count` is expressed in chunks; the row limit is count * CHUNK_SIZE. Uses
-	 * LIMIT n+1 for the queried direction and a separate indexed LIMIT 1 existence
-	 * probe for the opposite edge, so hasOlder/hasNewer are exact without a COUNT(*).
-	 */
-	async getChunksByRange(
-		narratorId: string,
-		opts: { fromSeq?: number; direction?: "older" | "newer"; count?: number } = {},
-	) {
-		const direction = opts.direction ?? "older";
-		const chunkCount = Math.min(Math.max(opts.count ?? 7, 1), 20);
-		const rowLimit = chunkCount * CHUNK_SIZE;
-
-		// Reading older than the lazy-fork boundary requires those refs locally first.
-		// "newer" never needs a backfill: it walks toward history the child owns.
-		if (direction === "older" && opts.fromSeq != null && Number.isFinite(opts.fromSeq)) {
-			await ensureRefsCoverSeq(narratorId, opts.fromSeq - rowLimit);
-		}
-
-		const isSubagent = await this.isSubagentNarrator(narratorId);
-
-		// Base predicate shared by the window query and the opposite-edge existence
-		// probe below. Excludes the seq cursor so it can be reused for either side.
-		const baseConditions = [
-			eq(narratorMessageRefs.narratorId, narratorId),
-			isNull(narratorMessageRefs.segmentCompactId),
-			...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
-		];
-		const conditions = [...baseConditions];
-		if (opts.fromSeq != null && Number.isFinite(opts.fromSeq)) {
-			conditions.push(
-				direction === "newer"
-					? gt(narratorMessageRefs.seq, opts.fromSeq)
-					: lt(narratorMessageRefs.seq, opts.fromSeq),
-			);
-		}
-
-		const refRows = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(and(...conditions))
-			.orderBy(
-				direction === "newer" ? narratorMessageRefs.seq : sql`${narratorMessageRefs.seq} DESC`,
-			)
-			.limit(rowLimit + 1);
-
-		const hasMoreInDirection = refRows.length > rowLimit;
-		const pageRows = hasMoreInDirection ? refRows.slice(0, rowLimit) : refRows;
-		if (direction === "older") {
-			pageRows.reverse();
-		}
-
-		const messageVersion = await this.getMessageVersion(narratorId);
-
-		if (pageRows.length === 0) {
-			return {
-				messages: [],
-				minSeq: null,
-				maxSeq: null,
-				// Even with no rows in this window, a lazy fork's parent may hold older
-				// history; reporting false here would end the client's upward scroll.
-				hasOlder:
-					opts.fromSeq != null && Number.isFinite(opts.fromSeq)
-						? await hasUnmaterializedRefsBelow(narratorId, opts.fromSeq)
-						: false,
-				hasNewer: false,
-				messageVersion,
-			};
-		}
-
-		const tree = await buildTreeFromTopLevelRefs(
-			pageRows,
-			isSubagent,
-			// Chunked cards render collapsed and fetch the full payload on expand
-			// (LazyDetailRenderer), so a small budget is sufficient here.
-			DEFAULT_TOOL_IO_BUDGET,
-		);
-		const minSeq = pageRows[0].seq;
-		const maxSeq = pageRows[pageRows.length - 1].seq;
-
-		// hasOlder/hasNewer relative to the returned window. For the direction we
-		// queried, hasMoreInDirection answers it directly. For the opposite side,
-		// probe for the existence of a single row beyond the window edge — a small,
-		// indexed LIMIT 1 lookup, not a heuristic based on seq sign/anchor presence.
-		const existsBeyond = async (op: "older" | "newer", edgeSeq: number): Promise<boolean> => {
-			const row = await db
-				.select({ seq: narratorMessageRefs.seq })
-				.from(narratorMessageRefs)
-				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-				.where(
-					and(
-						...baseConditions,
-						op === "newer"
-							? gt(narratorMessageRefs.seq, edgeSeq)
-							: lt(narratorMessageRefs.seq, edgeSeq),
-					),
-				)
-				.limit(1);
-			return row.length > 0;
-		};
-
-		const localHasOlder =
-			direction === "older" ? hasMoreInDirection : await existsBeyond("older", minSeq);
-		// A lazy fork can be out of local refs while its parent still holds older
-		// history, so "no more rows here" is not the same as "start of history".
-		const hasOlder = localHasOlder || (await hasUnmaterializedRefsBelow(narratorId, minSeq));
-		const hasNewer =
-			direction === "newer" ? hasMoreInDirection : await existsBeyond("newer", maxSeq);
-
-		return {
-			messages: tree,
-			minSeq,
-			maxSeq,
-			hasOlder,
-			hasNewer,
-			messageVersion,
-		};
-	},
-
-	/**
 	 * Exact-layout input page. This is a transport page only: it carries ordered
 	 * full message trees and never defines a scrollbar unit or height estimate.
 	 * The client must collect the complete document before committing a layout.
@@ -2498,6 +2149,15 @@ export const narratorMessageQueries = {
 		opts: { afterSeq?: number; beforeSeq?: number; limit?: number; messageVersion?: number } = {},
 	) {
 		const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 100), 1), 100);
+		// A lazy fork only materialized the refs after its parent's last compact.
+		// Reading older than `beforeSeq` means reading rows BELOW it, so the backfill
+		// must cover the whole requested page — and it must happen BEFORE the
+		// messageVersion snapshot below: materializing refs bumps the version, and
+		// the page's own consistency check would otherwise fire on the backfill it
+		// itself triggered.
+		if (opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)) {
+			await ensureRefsCoverSeq(narratorId, Math.trunc(opts.beforeSeq as number) - limit);
+		}
 		const isSubagent = await this.isSubagentNarrator(narratorId);
 		const messageVersion = await this.getMessageVersion(narratorId);
 		if (opts.messageVersion != null && opts.messageVersion !== messageVersion)
@@ -2548,12 +2208,25 @@ export const narratorMessageQueries = {
 
 		if (pageRows.length === 0) {
 			await assertDocumentUnchanged();
+			// An empty window is NOT necessarily the start of history. A lazy fork's
+			// ancestors can still hold older messages while this narrator has no visible
+			// ref in the requested range — e.g. a segment-compact hole wider than one
+			// page, which the backfill cursor skips past without copying anything. The
+			// legacy chunk reader probed for that case; reporting `hasPrev: false` here
+			// instead ends the client's upward scroll permanently (the loader latches it),
+			// silently hiding history that does exist.
+			const hasPrevBelowEmptyWindow =
+				opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)
+					? await hasUnmaterializedRefsBelow(narratorId, Math.trunc(opts.beforeSeq))
+					: false;
 			return {
 				messages: [],
 				minSeq: null,
 				maxSeq: null,
-				hasNext: false,
-				hasPrev: false,
+				// Mirrors the non-empty descending branch: a `beforeSeq` page is by
+				// definition preceded by newer rows the caller already holds.
+				hasNext: !ascending && opts.beforeSeq != null,
+				hasPrev: hasPrevBelowEmptyWindow,
 				messageVersion,
 			};
 		}
@@ -2579,25 +2252,31 @@ export const narratorMessageQueries = {
 
 		let hasPrev: boolean;
 		let hasNext: boolean;
+		// A lazy fork can be out of local refs while its parent still holds older
+		// history, so "no more rows here" is not the same as "start of history" —
+		// the lazy-aware probe keeps hasPrev true until the lineage is exhausted.
+		const probeUnmaterializedBelow = async (): Promise<boolean> =>
+			minSeq != null && (await hasUnmaterializedRefsBelow(narratorId, minSeq));
 		if (ascending) {
 			// Ascending page after `afterSeq`: more-in-direction means newer rows
 			// remain; probe once (indexed LIMIT 1) for anything older than the window.
 			hasNext = hasMoreInDirection;
-			const olderProbe =
-				minSeq == null
-					? []
-					: await db
+			hasPrev =
+				(minSeq != null &&
+					(
+						await db
 							.select({ seq: narratorMessageRefs.seq })
 							.from(narratorMessageRefs)
 							.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 							.where(and(...baseConditions, lt(narratorMessageRefs.seq, minSeq)))
-							.limit(1);
-			hasPrev = olderProbe.length > 0;
+							.limit(1)
+					).length > 0) ||
+				(await probeUnmaterializedBelow());
 		} else {
 			// Descending newest page: more-in-direction means older rows remain. The
 			// tail page has nothing newer; a `beforeSeq` page is by definition
 			// preceded by the newer rows the caller already holds.
-			hasPrev = hasMoreInDirection;
+			hasPrev = hasMoreInDirection || (await probeUnmaterializedBelow());
 			hasNext = opts.beforeSeq != null;
 		}
 
@@ -3177,6 +2856,70 @@ export const narratorMessageQueries = {
 			(blocks[0]?.type === "spec_fork_carryover" || blocks[0]?.type === "spec_context_cleared");
 		if (msg?.role !== "disp" || !isSpecCarryover) {
 			throw new ValidationError("Message is not a Dynamic Spec carryover notice");
+		}
+
+		db.transaction((tx) => {
+			tx.delete(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				)
+				.run();
+			const otherRef = tx.query.narratorMessageRefs
+				.findFirst({
+					where: eq(narratorMessageRefs.messageId, messageId),
+				})
+				.sync();
+			if (!otherRef) {
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+			}
+			tx.update(narrators)
+				.set({
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+		});
+	},
+
+	/**
+	 * Dismiss the interrupt task-guard reminder (source "interrupt_task_guard").
+	 *
+	 * Same three-step pattern as dismissSpecCarryoverMessage: the row is a plain
+	 * role="sys" injection (a text block plus the system_injection block persisted by
+	 * deliverInjection), so removing the narrator's ref — and the message itself when
+	 * no other narrator references it — is enough; the next history rebuild simply
+	 * stops reading it. Idempotent when the message is already gone.
+	 */
+	async dismissInterruptTaskGuardMessage(narratorId: string, messageId: string) {
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!ref) return;
+
+		const msg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { role: true, contentJson: true },
+		});
+		// Unreachable while foreign keys are on: `narrator_message_refs.message_id` is a
+		// NOT NULL reference to `narrator_messages.id`, so a ref cannot outlive its
+		// message. Treated as "already gone" (like the missing-ref case above) rather
+		// than as an error, because that is what it would mean if it ever happened.
+		if (!msg) return;
+		const blocks = Array.isArray(msg.contentJson)
+			? (msg.contentJson as Array<{ type?: unknown; source?: unknown }>)
+			: [];
+		const isInterruptTaskGuard = blocks.some(
+			(block) => block?.type === "system_injection" && block?.source === "interrupt_task_guard",
+		);
+		if (msg.role !== "sys" || !isInterruptTaskGuard) {
+			throw new ValidationError("Message is not an interrupt task-guard reminder");
 		}
 
 		db.transaction((tx) => {

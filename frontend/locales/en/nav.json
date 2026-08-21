@@ -1,6 +1,5 @@
 {
 	"appName": "NarraFork",
-	"narratorVirtualListToggle": "Narrator virtual list (on by default; turn off for the classic list)",
 	"dashboard": "Dashboard",
 	"projects": "NarraFlow",
 	"narrators": "Narrators",
@@ -60,6 +59,7 @@
 	"loadMoreRecentTabs": "Load more",
 	"retryRecentTabs": "Retry",
 	"recentTabsSyncError": "Recent tabs could not be synced",
+	"recentTabsReorderFailed": "Tab order could not be saved",
 	"recentTabsGrouping": "Tab grouping",
 	"groupModeFlat": "Flat list",
 	"groupModeDirectory": "Group by directory",

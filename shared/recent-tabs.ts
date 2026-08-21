@@ -32,6 +32,13 @@ export interface PersistedRecentTab {
 	lastVisitedAt: number;
 	pinned?: boolean;
 	isScheduled?: boolean;
+	/**
+	 * Hand-arranged position inside a directory group (sidebar directory-aggregation
+	 * mode). Absent means "never hand-ordered", which sorts before ordered members in
+	 * recency order. See the `dir_sort_order` column comment for why this cannot live
+	 * on the flat sort order.
+	 */
+	dirSortOrder?: number;
 }
 
 /** Incremental operations used by mutation responses and user-scoped WebSocket deltas. */

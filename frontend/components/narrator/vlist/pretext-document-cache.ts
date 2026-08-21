@@ -22,16 +22,15 @@
  * coordinator mutation path (`applyCompactProgress`, `applyLivePatch`,
  * `appendMessage`, `loadOlder`) rebuilds `{...input, messages: [...]}` and
  * replaces message objects wholesale rather than mutating them in place, which is
- * the same property `narrator-chunks-cache.ts` depends on. Storing references is
- * therefore safe and needs no deep clone. If that ever changes, this cache must
- * clone.
+ * what makes storing references safe here: no deep clone is needed. If that ever
+ * changes, this cache must clone.
  *
  * Streaming state is intentionally NOT cached: the server re-sends a
  * `streaming_snapshot` on every `kind: "messages"` subscribe, so in-flight output
  * heals itself after a remount.
  *
- * Deliberately REACT-FREE so it can be unit tested without a DOM, mirroring
- * `narrator-chunks-cache.ts` and `frontend/lib/shiki-token-cache.ts`.
+ * Deliberately REACT-FREE so it can be unit tested without a DOM, like
+ * `frontend/lib/shiki-token-cache.ts`.
  */
 
 import type { PretextDocumentInput } from "./pretext-document-loader";
@@ -209,8 +208,7 @@ export const invalidateCachedPretextDocument: PretextDocumentCache["invalidate"]
 /**
  * Clear every cached document (tests, and any future in-page principal switch).
  *
- * Unlike `clearNarratorChunksCache` this is NOT wired into logout, for two
- * reasons: `useLogout` navigates with `window.location.href`, which tears down the
+ * NOT wired into logout, for two reasons: `useLogout` navigates with `window.location.href`, which tears down the
  * whole module graph including this cache, and the vlist isolation guard forbids
  * `useAuth` from statically importing anything under `vlist/`. If logout ever
  * becomes an in-page transition, this needs calling from a dynamic import there.

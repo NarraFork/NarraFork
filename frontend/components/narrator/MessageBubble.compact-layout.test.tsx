@@ -58,7 +58,7 @@ mock.module("../../hooks/useModels", () => ({
 	}),
 }));
 
-const { CompactSummaryModal, compactSummaryQueryKey } = await import("./MessageBubble");
+const { CompactSummaryModal, compactSummaryQueryKey } = await import("./compact-summary-modal");
 
 class TestResizeObserver {
 	observe() {}

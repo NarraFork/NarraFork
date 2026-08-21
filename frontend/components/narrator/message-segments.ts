@@ -6,7 +6,7 @@
 
 import { isEmptyReasoningBlock } from "@shared/reasoning-content";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "./narrator-panel-types";
-import type { ToolCallData } from "./ToolCallCard";
+import type { ToolCallData } from "./tool-call-data";
 
 // ---------------------------------------------------------------------------
 // Legacy tool name mapping

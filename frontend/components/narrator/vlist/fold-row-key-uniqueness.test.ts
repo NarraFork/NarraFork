@@ -220,91 +220,6 @@ describe("hand-off across an activity-unit boundary", () => {
 });
 
 /**
- * The CHUNKED renderer merges activity units across chunk boundaries, concatenating
- * items produced by SEPARATE `groupRenderUnits` calls. Neither call can see the other,
- * so the fold's own document-wide hand-off resolution provably cannot reach this path —
- * measured before the fix as `["tu-1","tu-2","tu-1"]` in one merged trace.
- */
-describe("cross-chunk merge resolves the hand-off", () => {
-	const chunkMessage = (
-		messageId: string,
-		toolUseId: string,
-		status: string,
-		streaming = false,
-	) => ({
-		...toolMessage(messageId, toolUseId, status, streaming),
-		narratorId: "n",
-		parentToolUseId: null,
-		contentText: null,
-		createdAt: "2026-07-20T00:00:00.000Z",
-	});
-
-	/** Every row the chunked renderer would draw, applying the override contract. */
-	const mergedRows = async (
-		headMessages: unknown[],
-		tailMessages: unknown[],
-		streamingToolUseId: string,
-	) => {
-		const mod = await import("../cross-chunk-activity");
-		const options = { renderLod: 2 } as const;
-		const base = [
-			mod.computeChunkActivityUnits("head", headMessages as never, options),
-			mod.computeChunkActivityUnits("tail", tailMessages as never, options),
-		];
-		const plan = mod.buildCrossChunkActivityRenderPlan(
-			base,
-			mod.buildCrossChunkActivityOverrides(base),
-			{
-				chunkId: "tail",
-				messages: tailMessages as never,
-				streamingMsg: chunkMessage(STREAMING_ID, streamingToolUseId, "running", true) as never,
-			},
-			options,
-		);
-		const keys: string[] = [];
-		for (const chunk of plan.chunkUnits) {
-			const chunkOverrides = plan.overrides.get(chunk.chunkId);
-			let activityIndex = 0;
-			for (const unit of chunk.units ?? []) {
-				if (unit.kind !== "activity") continue;
-				const override = chunkOverrides?.get(activityIndex);
-				activityIndex++;
-				if (override?.hidden) continue;
-				// Mirrors MessageRenderer: replaceItems supersedes the unit's own list.
-				const own = override?.replaceItems ?? unit.items;
-				const items = override?.appendItems ? [...own, ...override.appendItems] : own;
-				for (const item of items) {
-					if (item.kind === "tool" && item.tc.toolUseId) keys.push(item.tc.toolUseId);
-				}
-			}
-		}
-		return keys;
-	};
-
-	it("drops the synthetic copy when the persisted one is in the OWNER chunk", async () => {
-		const keys = await mergedRows(
-			[chunkMessage("real-msg", "tu-1", "success")],
-			[chunkMessage("m2", "tu-2", "success")],
-			"tu-1",
-		);
-		expect(keys).toEqual(["tu-1", "tu-2"]);
-		expect(duplicatesOf(keys)).toEqual([]);
-	});
-
-	it("drops it when the persisted one is in a CONTINUATION chunk", async () => {
-		// The direction `appendItems` alone cannot express — it only adds, so the owner
-		// needed `replaceItems` to shed its own superseded item.
-		const keys = await mergedRows(
-			[chunkMessage("m0", "tu-0", "success")],
-			[chunkMessage("real-msg", "tu-9", "success")],
-			"tu-9",
-		);
-		expect(keys).toEqual(["tu-0", "tu-9"]);
-		expect(duplicatesOf(keys)).toEqual([]);
-	});
-});
-
-/**
  * EXHAUSTIVE invariant, rather than one test per known shape.
  *
  * The three duplication paths found so far (same unit, split across a unit boundary,
@@ -381,24 +296,6 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 		return perTrace;
 	}
 
-	/**
-	 * The same, for the CHUNKED renderer.
-	 *
-	 * That path has its own key derivation (`activityTraceRowKeys` in ActivityTrace),
-	 * separate from the vlist adapter's. Both render the same fold, so a divergence
-	 * would let one path de-duplicate while the other overlaps — and the vlist sweep
-	 * alone would never notice.
-	 */
-	async function chunkedTraceRowKeys(messages: unknown[]): Promise<string[][]> {
-		const { segmentMessages } = await import("../message-segments");
-		const { groupRenderUnits } = await import("../render-units");
-		const { activityTraceRowKeys } = await import("../ActivityTrace");
-		const units = groupRenderUnits(segmentMessages(messages as never), true);
-		return units
-			.filter((unit) => unit.kind === "activity")
-			.map((unit) => activityTraceRowKeys(unit.items));
-	}
-
 	it("holds for every sequence of length 1-3 over the message alphabet", async () => {
 		const failures: string[] = [];
 		const sequences: Kind[][] = [];
@@ -410,23 +307,12 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 			}
 		}
 		for (const sequence of sequences) {
-			// BOTH renderers, from the same generated shape: the vlist adapter and the
-			// chunked component derive row keys independently.
 			counter = 0;
 			const viaVlist = await traceRowKeys(sequence.map(build));
-			counter = 0;
-			const viaChunked = await chunkedTraceRowKeys(sequence.map(build));
-			for (const [label, perTrace] of [
-				["vlist", viaVlist],
-				["chunked", viaChunked],
-			] as const) {
-				for (const [index, keys] of perTrace.entries()) {
-					const dupes = duplicatesOf(keys);
-					if (dupes.length > 0) {
-						failures.push(
-							`[${sequence.join(",")}] ${label} trace#${index} duplicates: ${dupes.join(", ")}`,
-						);
-					}
+			for (const [index, keys] of viaVlist.entries()) {
+				const dupes = duplicatesOf(keys);
+				if (dupes.length > 0) {
+					failures.push(`[${sequence.join(",")}] trace#${index} duplicates: ${dupes.join(", ")}`);
 				}
 			}
 		}
@@ -434,44 +320,6 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 		expect(failures).toEqual([]);
 		// Guard the guard: the sweep must actually have exercised a lot of shapes.
 		expect(sequences.length).toBe(KINDS.length + KINDS.length ** 2 + KINDS.length ** 3);
-	});
-
-	it("keeps the two renderers' row SHAPE aligned (same count, same dedupe decisions)", async () => {
-		// Uniqueness on each side is not enough. The two derivations must agree on WHICH
-		// rows exist and which collapse, or a fix verified on one path would silently not
-		// hold on the other — that is how the cross-chunk duplicate survived three
-		// rounds of fixes on the vlist side.
-		//
-		// The keys themselves are deliberately NOT compared: the vlist prefixes tool rows
-		// with `tool-` while the chunked path uses the bare tool-use id (a pre-existing
-		// difference, verified against HEAD). Each key space is internal to its own
-		// renderer, so the prefix is irrelevant — the row COUNT per trace and the retry
-		// suffixes are what encode the de-duplication decisions.
-		const normalize = (perTrace: string[][]) =>
-			perTrace.map((keys) => keys.map((key) => key.replace(/^tool-/, "")));
-
-		const mismatches: string[] = [];
-		for (const sequence of [
-			["toolA", "liveA"],
-			["liveA", "toolA"],
-			["toolA", "toolA"],
-			["reason", "liveA", "toolA"],
-			["toolA", "text", "liveA"],
-			["pendingA", "toolA", "liveA"],
-			["reason", "reason", "toolB"],
-			["liveA", "liveB", "toolA"],
-		] as Kind[][]) {
-			counter = 0;
-			const viaVlist = normalize(await traceRowKeys(sequence.map(build)));
-			counter = 0;
-			const viaChunked = normalize(await chunkedTraceRowKeys(sequence.map(build)));
-			if (JSON.stringify(viaVlist) !== JSON.stringify(viaChunked)) {
-				mismatches.push(
-					`[${sequence.join(",")}]\n  vlist  =${JSON.stringify(viaVlist)}\n  chunked=${JSON.stringify(viaChunked)}`,
-				);
-			}
-		}
-		expect(mismatches).toEqual([]);
 	});
 
 	it("holds through the PRODUCTION entry point, down to the painted rows", async () => {

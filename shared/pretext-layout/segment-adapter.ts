@@ -576,6 +576,15 @@ export interface AdapterContext {
 	 * measured height.
 	 */
 	canOfferProviderFix?: (errorText: string) => boolean;
+	/**
+	 * Whether this error card may offer "test the current model", given its text.
+	 *
+	 * Same contract as `canOfferProviderFix`: admin-only and network-error-only, so
+	 * eligibility depends on the current user and the narrator's model — facts the
+	 * pure adapter may not read — and the control is a labelled button on the card's
+	 * optional button row, so the answer changes the measured height.
+	 */
+	canOfferModelTest?: (errorText: string) => boolean;
 	/** Pure resolvers injected by the shell; deterministic fallbacks keep tests simple. */
 	resolveReasoningSegments?: (text: string) => ReasoningSegment[];
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
@@ -1317,6 +1326,10 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	// icon: an icon-only control hides its meaning behind a hover tooltip, which
 	// touch users never see at all.
 	disableImageGen: "Turn off image generation and retry",
+	// The error card's conditional model probe (admin-only, network errors only).
+	// Carried over from the deleted chunked card's icon-only action; a label for the
+	// same reason as above.
+	testCurrentModel: "Test current model",
 	specViewTasks: "View tasks",
 	specClearTasks: "Clear",
 	specResetTasks: "Reset",
@@ -1429,6 +1442,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceBufferedUser: "Buffered user message",
 	sidecarSourceSubagentMessage: "Subagent message",
 	sidecarSourceSpecUpdate: "Outline update",
+	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
 	// Periodic task-digest subtitle: carries the cadence ("every N tool calls") so a
 	// routine digest reads differently from a turn-end continuation in the header.
 	cadenceEveryNTools: "every {n} tool calls",
@@ -1494,6 +1508,7 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	spec_update: "sidecarSourceSpecUpdate",
 	behavior_fence: "sidecarSourceBehaviorFence",
 	pipeline_exit_confirmation: "sidecarSourcePipelineExit",
+	interrupt_task_guard: "sidecarSourceInterruptTaskGuard",
 };
 
 /**
@@ -2529,19 +2544,35 @@ function adaptSystemTextData(
 			return { kind: "info", text: block.message ?? block.text ?? contentText };
 		case "error": {
 			const errorText = block.message ?? block.text ?? sysLabel(ctx, "unknownError");
-			// The provider fix is a LABELLED button on its own row, so it changes the
-			// card's height and must be decided here, during measurement — not painted
-			// in later by the render layer. `canOfferProviderFix` is injected by the
-			// shell (it depends on the user's role and the narrator's resolved
-			// provider, neither of which belongs in the pure adapter); the error-text
-			// match itself is a pure predicate the shell applies.
+			// Both buttons are LABELLED controls on the card's one optional button row,
+			// so whether that row exists changes the card's height and must be decided
+			// here, during measurement — not painted in later by the render layer. The
+			// predicates are injected by the shell (they depend on the user's role and
+			// the narrator's resolved provider, neither of which belongs in the pure
+			// adapter); the error-text match itself is a pure predicate it applies.
+			//
+			// `buttonIds` names each label so the render layer binds handlers by MEANING
+			// rather than by position. With two conditional buttons, index-based binding
+			// silently attaches the wrong handler as soon as only the second one is
+			// eligible.
 			const offerFix = ctx.canOfferProviderFix?.(errorText) === true;
+			const offerModelTest = ctx.canOfferModelTest?.(errorText) === true;
+			const buttons: string[] = [];
+			const buttonIds: string[] = [];
+			if (offerFix) {
+				buttons.push(sysLabel(ctx, "disableImageGen"));
+				buttonIds.push("disableImageGen");
+			}
+			if (offerModelTest) {
+				buttons.push(sysLabel(ctx, "testCurrentModel"));
+				buttonIds.push("testCurrentModel");
+			}
 			return {
 				kind: "error",
 				text: errorText,
 				color: "red",
 				actions: true,
-				...(offerFix ? { buttons: [sysLabel(ctx, "disableImageGen")] } : {}),
+				...(buttons.length > 0 ? { buttons, buttonIds } : {}),
 			};
 		}
 		case "bash_command":

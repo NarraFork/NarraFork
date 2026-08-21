@@ -1,5 +1,4 @@
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { clearNarratorChunksCache } from "../components/narrator/narrator-chunks-cache";
 import { type ApiError, api, clearToken, getToken, setToken } from "../lib/api";
 import { isMfaChallenge, type LoginResult, type LoginSession } from "../lib/api/auth";
 import { changeAppLanguage, getNamespacesForPath } from "../lib/i18n";
@@ -81,10 +80,6 @@ export function useLogout() {
 		logout: () => {
 			clearToken();
 			qc.clear();
-			// Narrator message snapshots live in a module-level cache outside React
-			// Query, so they must be dropped explicitly or one account's conversation
-			// history would still be in memory for the next sign-in.
-			clearNarratorChunksCache();
 			window.location.href = "/login";
 		},
 	};

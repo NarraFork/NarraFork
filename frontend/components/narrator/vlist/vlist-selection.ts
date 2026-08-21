@@ -5,11 +5,10 @@
  * private module functions (buildSelectionIndex / entriesToBlockMeta /
  * entriesToMessageIds / entriesToText + helpers, ChunkedMessageList.tsx
  * ~L295-515). We intentionally do NOT export/import those from
- * ChunkedMessageList, because touching that file would risk the OFF-path
- * (narrafork_narrator_virtual_list disabled) behavior guarantee.
+ * ChunkedMessageList: the selection core must not sit in the legacy list's
+ * module graph (the vlist is lazily loaded; see vlist-isolation.guard.test.ts).
  *
- * Differences from the ChunkedMessageList version, all behavior-preserving for
- * the ON path:
+ * Differences from the ChunkedMessageList version, all behavior-preserving:
  *  - Input is a FLAT NarratorMsg[] (the shell already flattens chunks), not
  *    ChunkData[]. `chunkIndex` is a monotonic traversal ordinal — it is only a
  *    tiebreaker for entry metadata; the pure range computation keys on

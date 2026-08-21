@@ -507,11 +507,13 @@ describe("buildRecoveryOfferedUpdate must not touch updatedAt", () => {
 });
 
 describe("TOOL_CALL_RESET_FIELDS", () => {
-	// `pending` means "stopped at the permission gate": resolvePendingPerm
-	// (frontend/components/narrator/narrator-message-helpers.ts) SYNTHESIZES a
-	// PendingPermission from any row in that state. Re-arming a recovered Agent/Await
-	// row as `pending` therefore made a phantom Allow/Deny form appear on the subagent
-	// card while the work was already running and nothing awaited a decision.
+	// `pending` means "stopped at the permission gate". The chunked renderer
+	// SYNTHESIZED a PendingPermission from any row in that state, so re-arming a
+	// recovered Agent/Await row as `pending` made a phantom Allow/Deny form appear on
+	// the subagent card while the work was already running and nothing awaited a
+	// decision. The vlist matches against the live WS list instead and would not
+	// synthesize one, but the status is still wrong on its own terms — a running row
+	// reported as gated — so this stays pinned.
 	test("re-arms as running, never pending, so no phantom permission form appears", () => {
 		expect(TOOL_CALL_RESET_FIELDS.status).toBe("running");
 		expect(TOOL_CALL_RESET_FIELDS.status).not.toBe("pending");

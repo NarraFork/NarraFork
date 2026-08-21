@@ -9,6 +9,7 @@ import {
 	registerSchema,
 	updateUserPreferencesSchema,
 } from "../../../server/lib/validators";
+import { recentTabSchema, restoreRecentTabsSchema } from "../../../server/lib/validators/settings";
 import { narratorWsMessageSchema } from "../../../server/lib/validators/websocket";
 import { SUPPORTED_LOCALES } from "../../../shared/i18n-locales";
 
@@ -194,5 +195,58 @@ describe("narrator websocket catch-up cursor validation", () => {
 				false,
 			);
 		}
+	});
+});
+
+/**
+ * The recent-tab payload's `dirSortOrder`.
+ *
+ * Zod strips unknown keys, so a field the client sends and the service honours is
+ * silently discarded unless the schema DECLARES it. That is what happened to the
+ * hand-arranged directory position: the undo-restore path dropped it on every
+ * request, flattening the groups back to recency order with no error anywhere. The
+ * service-level tests cannot see this — they call the service directly, past Zod —
+ * so the guarantee has to be asserted at the schema.
+ */
+describe("recentTabSchema — dirSortOrder", () => {
+	const base = {
+		type: "narrator" as const,
+		id: "n-1",
+		title: "Tab",
+		lastVisitedAt: 1,
+	};
+
+	it("PRESERVES a hand-arranged position instead of stripping it", () => {
+		const result = recentTabSchema.safeParse({ ...base, dirSortOrder: 3 });
+		expect(result.success).toBe(true);
+		expect(result.success && result.data.dirSortOrder).toBe(3);
+	});
+
+	it("accepts 0 as a real position, not a missing one", () => {
+		// 0 is the first slot in a group; a falsy check anywhere in the path would
+		// silently demote it to "never hand-ordered".
+		const result = recentTabSchema.safeParse({ ...base, dirSortOrder: 0 });
+		expect(result.success && result.data.dirSortOrder).toBe(0);
+	});
+
+	it("leaves it absent when the client never hand-ordered the tab", () => {
+		const result = recentTabSchema.safeParse(base);
+		expect(result.success).toBe(true);
+		expect(result.success && result.data.dirSortOrder).toBeUndefined();
+	});
+
+	it("rejects a negative or non-integer position", () => {
+		expect(recentTabSchema.safeParse({ ...base, dirSortOrder: -1 }).success).toBe(false);
+		expect(recentTabSchema.safeParse({ ...base, dirSortOrder: 1.5 }).success).toBe(false);
+	});
+
+	it("carries the position through the restore payload", () => {
+		// The path that regressed: a full-list restore (the undo fallback when no token
+		// is available).
+		const result = restoreRecentTabsSchema.safeParse({
+			tabs: [{ ...base, dirSortOrder: 2 }],
+		});
+		expect(result.success).toBe(true);
+		expect(result.success && result.data.tabs?.[0]?.dirSortOrder).toBe(2);
 	});
 });

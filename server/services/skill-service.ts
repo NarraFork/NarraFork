@@ -103,6 +103,11 @@ interface SkillSignatureEntry {
 
 interface DiscoveredSkillFile extends SkillSignatureEntry {
 	skillDir: string;
+	/**
+	 * Index of the search directory this file was found under, per
+	 * {@link getSkillSearchDirs}. Higher wins a name collision.
+	 */
+	searchDirRank: number;
 }
 
 interface DiscoveryResult {
@@ -235,6 +240,13 @@ async function walkForSkills(dir: string, skills: SkillInfo[], depth: number): P
 	} catch {
 		return; // directory doesn't exist or not readable
 	}
+	// Name-sorted, because the winner of a same-name collision is decided by ARRIVAL
+	// ORDER (callers build a Map and let the later entry overwrite). `readdir` gives no
+	// order guarantee, so two skills of the same name in sibling sub-directories of ONE
+	// search dir could resolve differently here than in the summary path
+	// (`walkForSkillFiles`, which sorts by `location`) — and a disagreement between
+	// those two means the toggle writes to a different copy than the list displays.
+	entries.sort((a, b) => a.name.localeCompare(b.name));
 
 	for (const entry of entries) {
 		if ((await resolveEntryType(dir, entry)) !== "dir") continue;
@@ -584,6 +596,7 @@ async function walkForSkillFiles(
 	entries: DiscoveredSkillFile[],
 	depth: number,
 	state: { truncated: boolean },
+	searchDirRank: number,
 ): Promise<void> {
 	if (depth > MAX_WALK_DEPTH || state.truncated) return;
 	let dirEntries: import("node:fs").Dirent[];
@@ -592,6 +605,11 @@ async function walkForSkillFiles(
 	} catch {
 		return;
 	}
+	// Sorted for the same reason as `walkForSkills`: the two walkers must agree on
+	// which copy of a same-named skill wins. The final `entries.sort` below orders the
+	// whole list, but it cannot fix the TRUNCATION boundary — with an unordered
+	// readdir, hitting the entry cap would keep an arbitrary subset.
+	dirEntries.sort((a, b) => a.name.localeCompare(b.name));
 
 	for (const entry of dirEntries) {
 		if (state.truncated) return;
@@ -607,6 +625,7 @@ async function walkForSkillFiles(
 				skillDir: childDir,
 				disabled: false,
 				mtimeMs: skillMtime,
+				searchDirRank,
 			});
 		} else {
 			const disabledFile = join(childDir, "SKILL.md.disabled");
@@ -617,9 +636,10 @@ async function walkForSkillFiles(
 					skillDir: childDir,
 					disabled: true,
 					mtimeMs: disabledMtime,
+					searchDirRank,
 				});
 			} else {
-				await walkForSkillFiles(childDir, entries, depth + 1, state);
+				await walkForSkillFiles(childDir, entries, depth + 1, state, searchDirRank);
 			}
 		}
 
@@ -633,11 +653,16 @@ async function walkForSkillFiles(
 async function discoverSkillFiles(rootPath: string): Promise<DiscoveryResult> {
 	const entries: DiscoveredSkillFile[] = [];
 	const state = { truncated: false };
-	for (const dir of getSkillSearchDirs(rootPath)) {
-		await walkForSkillFiles(dir, entries, 0, state);
+	const searchDirs = getSkillSearchDirs(rootPath);
+	for (let rank = 0; rank < searchDirs.length; rank++) {
+		await walkForSkillFiles(searchDirs[rank], entries, 0, state, rank);
 		if (state.truncated) break;
 	}
-	entries.sort((a, b) => a.location.localeCompare(b.location));
+	// Stable order for the cache signature. Sorting by absolute path alone would
+	// silently reorder name collisions relative to `getSkillSearchDirs` (".agents"
+	// sorts before ".narrafork", but ranks after it), which is what let a disabled
+	// copy in a higher-priority dir be shadowed by an enabled lower-priority one.
+	entries.sort((a, b) => a.searchDirRank - b.searchDirRank || a.location.localeCompare(b.location));
 	return { entries, truncated: state.truncated };
 }
 

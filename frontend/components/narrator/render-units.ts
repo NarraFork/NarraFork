@@ -31,13 +31,60 @@
  * decision is the direct result of a user action rather than an unprompted jump.
  */
 
-import type { ActivityInput } from "./ActivityTrace";
 import type { RenderSegment, ToolRunItem } from "./message-segments";
-import type { NarratorMsg } from "./narrator-panel-types";
+import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
 import { isReasoningBlock } from "./reasoning-segments";
 
 /** Id of the synthetic live row (mirrors buildStreamingMsg / STREAMING_MESSAGE_ID). */
 const STREAMING_MESSAGE_ID = "__streaming__";
+
+/** One reasoning block folded into the trace. */
+export interface ActivityReasoningInput {
+	kind: "reasoning";
+	msg: NarratorMsg;
+	blockIndex: number;
+	block: ContentBlock;
+	/**
+	 * Hand-off-stable key base for this reasoning RUN, assigned by
+	 * `groupRenderUnits` as an ordinal within the activity unit.
+	 *
+	 * Row keys must not derive from `msg.id`: a live run owns the synthetic
+	 * `__streaming__` id and inherits a real one when the turn persists, so an
+	 * id-derived key changes at the hand-off and React rebuilds a row whose content
+	 * only settled — the icon/frame jump this whole fold exists to remove. The
+	 * ordinal is identical on both sides, so the row keeps its DOM node.
+	 */
+	stableKeyBase?: string;
+	/** This block's offset inside its run (rows of one run share `stableKeyBase`). */
+	stableKeyOffset?: number;
+}
+
+/** One tool call folded into the trace. */
+export interface ActivityToolInput {
+	kind: "tool";
+	msg: NarratorMsg;
+	blockIndex: number;
+	tc: ToolRunItem["tc"];
+	/**
+	 * True when this call is an Agent/Task/Send-style subagent invocation.
+	 *
+	 * The vlist adapter reads it to render the row's drill-down as a SUBAGENT card
+	 * rather than the generic tool card.
+	 */
+	isSubagent?: boolean;
+	/**
+	 * Disambiguator for a REPEATED tool-use id within one unit.
+	 *
+	 * A provider retry can put the same id in two persisted messages, which are two
+	 * real calls the reader must both see. Their row keys would otherwise be identical
+	 * (`tool-<id>`) and, since trace rows are absolutely positioned, they would paint
+	 * on top of each other. Absent for the overwhelmingly common single-occurrence
+	 * case, so normal rows keep their hand-off-stable key unchanged.
+	 */
+	dedupeSuffix?: number;
+}
+
+export type ActivityInput = ActivityReasoningInput | ActivityToolInput;
 
 export type RenderUnit =
 	| { kind: "segment"; seg: RenderSegment }
