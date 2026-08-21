@@ -57,9 +57,11 @@ const {
 	collectRecentTabsDeltaFrame,
 	recentTabsDataRevision,
 	recentTabsSectionQueryKey,
+	recordRecentTabVisit,
 	refreshRecentTabsLoadedWindow,
 } = await import("./useRecentTabs");
 const { api } = await import("../lib/api");
+const { queryClient: globalQC } = await import("../lib/query-client");
 
 describe("shouldAddSubagentRecentTab", () => {
 	test("waits until preferences finish loading", () => {
@@ -195,6 +197,96 @@ describe("recent tab payload builders", () => {
 	});
 });
 
+describe("recordRecentTabVisit", () => {
+	/**
+	 * Drive one visit and report how many upsert requests it produced. The tab is seeded
+	 * into the global cache first, because the dedupe deliberately does not skip a tab
+	 * that is no longer in a loaded window.
+	 */
+	async function visitCalls(
+		visits: Array<Parameters<typeof recordRecentTabVisit>[0]>,
+		options: { seedLoaded?: boolean } = {},
+	): Promise<Array<Parameters<typeof api.upsertRecentTab>[0]>> {
+		const original = api.upsertRecentTab;
+		const calls: Array<Parameters<typeof api.upsertRecentTab>[0]> = [];
+		api.upsertRecentTab = async (tab) => {
+			calls.push(tab);
+			if (options.seedLoaded !== false) {
+				globalQC.setQueryData(
+					recentTabsSectionQueryKey(tab.type === "project" ? "projects" : "work"),
+					pageData([{ ...tab, lastVisitedAt: tab.lastVisitedAt }], 1),
+				);
+			}
+			return { changed: false, baseRevision: 1, revision: 1, operations: [] };
+		};
+		try {
+			for (const visit of visits) await recordRecentTabVisit(visit);
+		} finally {
+			api.upsertRecentTab = original;
+		}
+		return calls;
+	}
+
+	test("writes once when only status and lastVisitedAt differ between re-renders", async () => {
+		// A narrator page re-runs its visit effect on every status/substatus WS patch.
+		const calls = await visitCalls([
+			{ type: "narrator", id: "dedupe-status", title: "Task", status: "idle" },
+			{ type: "narrator", id: "dedupe-status", title: "Task", status: "working" },
+			{
+				type: "narrator",
+				id: "dedupe-status",
+				title: "Task",
+				status: "waiting",
+				lastVisitedAt: Date.now() + 1_000,
+			},
+		]);
+		expect(calls).toHaveLength(1);
+	});
+
+	test("writes again when a persisted field actually changes", async () => {
+		const calls = await visitCalls([
+			{ type: "narrator", id: "dedupe-title", title: "Untitled" },
+			{ type: "narrator", id: "dedupe-title", title: "Untitled" },
+			{ type: "narrator", id: "dedupe-title", title: "Renamed by the model" },
+		]);
+		expect(calls.map((call) => call.title)).toEqual(["Untitled", "Renamed by the model"]);
+	});
+
+	test("re-creates a tab that is no longer in any loaded window", async () => {
+		// Removing the tab from the sidebar and navigating back must write again, which
+		// the signature alone cannot distinguish from a redundant re-render.
+		const calls = await visitCalls(
+			[
+				{ type: "narrator", id: "dedupe-removed", title: "Task" },
+				{ type: "narrator", id: "dedupe-removed", title: "Task" },
+			],
+			{ seedLoaded: false },
+		);
+		expect(calls).toHaveLength(2);
+	});
+
+	test("retries after a failed write instead of remembering it as persisted", async () => {
+		const original = api.upsertRecentTab;
+		let attempts = 0;
+		api.upsertRecentTab = async (tab) => {
+			attempts++;
+			if (attempts === 1) throw new Error("network down");
+			globalQC.setQueryData(
+				recentTabsSectionQueryKey("work"),
+				pageData([{ ...tab, lastVisitedAt: tab.lastVisitedAt }], 1),
+			);
+			return { changed: false, baseRevision: 1, revision: 1, operations: [] };
+		};
+		try {
+			await recordRecentTabVisit({ type: "narrator", id: "dedupe-retry", title: "Task" });
+			await recordRecentTabVisit({ type: "narrator", id: "dedupe-retry", title: "Task" });
+		} finally {
+			api.upsertRecentTab = original;
+		}
+		expect(attempts).toBe(2);
+	});
+});
+
 function pageData(
 	items: RecentTabsInfiniteData["pages"][number]["items"],
 	revision: number,
@@ -236,7 +328,7 @@ describe("recent tabs delta reducer", () => {
 				},
 			],
 		};
-		expect(applyRecentTabsDelta(qc, delta)).toEqual([]);
+		expect(applyRecentTabsDelta(qc, delta)).toEqual({ gaps: [], backfill: [] });
 		expect(
 			qc
 				.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))
@@ -382,7 +474,7 @@ describe("recent tabs delta reducer", () => {
 				revision: 5,
 				operations: [{ type: "remove", key: "narrator:n1" }],
 			}),
-		).toEqual(["projects", "work"]);
+		).toEqual({ gaps: ["projects", "work"], backfill: [] });
 		expect(
 			qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("projects"))?.pages[0]
 				.revision,
@@ -390,6 +482,90 @@ describe("recent tabs delta reducer", () => {
 		expect(
 			qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages[0].revision,
 		).toBe(3);
+	});
+
+	test("a gap does not invalidate the section queries on top of the caller's reset", () => {
+		const qc = new QueryClient();
+		qc.setQueryData(
+			recentTabsSectionQueryKey("work"),
+			pageData([{ type: "narrator", id: "n1", title: "N1", lastVisitedAt: 1 }], 3),
+		);
+		const invalidated: unknown[] = [];
+		const originalInvalidate = qc.invalidateQueries.bind(qc);
+		qc.invalidateQueries = ((filters?: unknown) => {
+			invalidated.push(filters);
+			return Promise.resolve();
+		}) as typeof qc.invalidateQueries;
+		try {
+			applyRecentTabsDelta(qc, {
+				baseRevision: 4,
+				revision: 5,
+				operations: [{ type: "remove", key: "narrator:n1" }],
+			});
+		} finally {
+			qc.invalidateQueries = originalInvalidate;
+		}
+		expect(invalidated).toEqual([]);
+	});
+
+	test("an applied revision needs no page fetch, but a shrunk full window does", () => {
+		const qc = new QueryClient();
+		qc.setQueryData(
+			recentTabsSectionQueryKey("work"),
+			pageData(
+				[
+					{ type: "narrator", id: "n1", title: "N1", lastVisitedAt: 2 },
+					{ type: "narrator", id: "n2", title: "N2", lastVisitedAt: 1 },
+				],
+				1,
+			),
+		);
+
+		// A visit upsert reorders/updates in place: nothing left the window.
+		expect(
+			applyRecentTabsDelta(qc, {
+				baseRevision: 1,
+				revision: 2,
+				operations: [
+					{
+						type: "upsert",
+						key: "narrator:n2",
+						tab: { type: "narrator", id: "n2", title: "N2", lastVisitedAt: 9 },
+						beforeKey: "narrator:n1",
+						afterKey: null,
+					},
+				],
+			}),
+		).toEqual({ gaps: [], backfill: [] });
+
+		// A removal from a window with no further server rows still needs no fetch.
+		expect(
+			applyRecentTabsDelta(qc, {
+				baseRevision: 2,
+				revision: 3,
+				operations: [{ type: "remove", key: "narrator:n2" }],
+			}),
+		).toEqual({ gaps: [], backfill: [] });
+
+		// The same removal when the server has more rows leaves an empty slot.
+		qc.setQueryData(
+			recentTabsSectionQueryKey("work"),
+			pageData(
+				[
+					{ type: "narrator", id: "n1", title: "N1", lastVisitedAt: 2 },
+					{ type: "narrator", id: "n2", title: "N2", lastVisitedAt: 1 },
+				],
+				3,
+				true,
+			),
+		);
+		expect(
+			applyRecentTabsDelta(qc, {
+				baseRevision: 3,
+				revision: 4,
+				operations: [{ type: "remove", key: "narrator:n2" }],
+			}),
+		).toEqual({ gaps: [], backfill: ["work"] });
 	});
 
 	test("keeps runtime-enriched fields when a visit upserts only persisted columns", () => {
@@ -433,7 +609,7 @@ describe("recent tabs delta reducer", () => {
 					},
 				],
 			}),
-		).toEqual([]);
+		).toEqual({ gaps: [], backfill: [] });
 
 		const tab = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages[0]
 			.items[0] as RecentTab | undefined;
@@ -848,6 +1024,66 @@ describe("recent tab identity preservation", () => {
 				previous,
 			),
 		).toBe(previous);
+	});
+
+	test("a no-op runtime tick leaves both cache entries byte-identical", () => {
+		// The per-tab merge already preserves identity; this asserts the cache WRITE does
+		// too. Allocating a new window object here re-renders every consumer of the
+		// recent-tabs cache (app shell, sidebar lists, graph) on each status tick.
+		const qc = new QueryClient();
+		const tab: RecentTab = {
+			type: "narrator",
+			id: "n1",
+			title: "N1",
+			lastVisitedAt: 1,
+			status: "working",
+			substatus: ["reasoning"],
+			activeTerminalCount: 1,
+		};
+		qc.setQueryData(recentTabsSectionQueryKey("work"), pageData([tab], 1));
+		applyRecentTabsRuntimePatches(qc, [
+			{ key: "narrator:n1", patch: { status: "working", substatus: ["reasoning"] } },
+		]);
+		const windowBefore = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"));
+		const flatBefore = qc.getQueryData<RecentTab[]>(["user-preferences", "recent-tabs"]);
+
+		applyRecentTabsRuntimePatches(qc, [
+			// Same values, freshly allocated array — exactly what a runtime poll returns.
+			{ key: "narrator:n1", patch: { status: "working", substatus: ["reasoning"] } },
+		]);
+
+		expect(qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))).toBe(
+			windowBefore,
+		);
+		expect(qc.getQueryData<RecentTab[]>(["user-preferences", "recent-tabs"])).toBe(flatBefore);
+
+		// A real change must still produce new objects, or the rows would never update.
+		applyRecentTabsRuntimePatches(qc, [
+			{ key: "narrator:n1", patch: { status: "idle", substatus: [] } },
+		]);
+		expect(qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))).not.toBe(
+			windowBefore,
+		);
+		expect(qc.getQueryData<RecentTab[]>(["user-preferences", "recent-tabs"])).not.toBe(flatBefore);
+	});
+
+	test("an applied delta that changes nothing observable keeps the window object", () => {
+		const qc = new QueryClient();
+		qc.setQueryData(
+			recentTabsSectionQueryKey("work"),
+			pageData([{ type: "narrator", id: "n1", title: "N1", lastVisitedAt: 1 }], 1),
+		);
+		const windowBefore = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"));
+
+		// A revision bump IS observable (it gates cursor validity), so this must allocate.
+		applyRecentTabsDelta(qc, {
+			baseRevision: 1,
+			revision: 2,
+			operations: [{ type: "remove", key: "narrator:absent" }],
+		});
+		expect(qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))).not.toBe(
+			windowBefore,
+		);
 	});
 });
 

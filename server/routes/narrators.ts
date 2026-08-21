@@ -5766,42 +5766,37 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
  */
 narratorRoutes.get("/:id/background-tasks", async (c) => {
 	const parentNarratorId = c.req.param("id");
+	const limitRaw = c.req.query("limit");
+	const limit = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
 	const { backgroundTaskService } = await import("../services/background-task-service");
-	const taskSummaries = await backgroundTaskService.listSummariesByParent(parentNarratorId);
-	const tasks = taskSummaries.map((task) => {
-		if (task.type !== "agent") return task;
-		const subagentId = task.subagentNarratorId ?? task.id;
-		if (!isNarratorActive(subagentId) && !isLoopRunning(subagentId)) return task;
-		return {
-			...task,
-			effectiveStatus: task.status === "running" ? "running" : "continued",
-			currentNarratorStatus: "working",
-			canCancelActiveWork: true,
-		};
-	});
+	// In-process liveness (a subagent whose loop is running while its task row is
+	// already terminal) is applied inside the service, not here: `activeCount`, the
+	// `activeTasks` set, the paged rows and the delta upserts all have to agree, and
+	// a route-only overlay left the badge disagreeing with the rows beside it.
+	return c.json(
+		await backgroundTaskService.listPageByParent(parentNarratorId, {
+			cursor: c.req.query("cursor"),
+			limit: limit != null && !Number.isNaN(limit) ? limit : undefined,
+		}),
+	);
+});
 
-	// Also include legacy agent background tasks from narrators table
-	// (for tasks created before the migration)
-	const legacyTasks = await db
-		.select({
-			id: narrators.id,
-			subagentType: narrators.subagentType,
-			backgroundStatus: narrators.backgroundStatus,
-			backgroundResult: narrators.backgroundResult,
-			backgroundCompletedAt: narrators.backgroundCompletedAt,
-			status: narrators.status,
-			createdAt: narrators.createdAt,
-			title: narrators.title,
-		})
-		.from(narrators)
-		.where(and(eq(narrators.parentNarratorId, parentNarratorId), eq(narrators.isBackground, true)))
-		.orderBy(desc(narrators.createdAt));
-
-	// Filter out legacy tasks that already exist in the unified table
-	const unifiedIds = new Set(tasks.map((t) => t.id));
-	const filteredLegacy = legacyTasks.filter((t) => !unifiedIds.has(t.id));
-
-	return c.json({ tasks, legacySubagentTasks: filteredLegacy });
+/**
+ * GET /api/narrators/:id/background-tasks/resolve?target=…
+ * Resolve an Await/Send target (task id, alias, or subagent narrator id) to the
+ * subagent narrator id. A one-shot lookup so a tool card never has to fetch the
+ * whole task list for a single id.
+ */
+narratorRoutes.get("/:id/background-tasks/resolve", async (c) => {
+	const parentNarratorId = c.req.param("id");
+	const target = c.req.query("target") ?? "";
+	if (!target) throw new ValidationError("target is required");
+	const { backgroundTaskService } = await import("../services/background-task-service");
+	const subagentNarratorId = await backgroundTaskService.resolveSubagentNarratorId(
+		parentNarratorId,
+		target,
+	);
+	return c.json({ subagentNarratorId });
 });
 
 /**

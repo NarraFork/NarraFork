@@ -82,6 +82,7 @@ import {
 	addRecentTabsBatch,
 	applyRecentTabMove,
 	applyRecentTabsDelta,
+	applyRecentTabsDeltaAndFollowUp,
 	applyRecentTabsRuntimePatches,
 	bumpRecentTabRuntimeVersions,
 	clampRecentTabText,
@@ -304,8 +305,12 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		() => liveTabs.map(getRecentTabNarratorId).filter((id): id is string => !!id),
 		[liveTabs],
 	);
-	const runtimeTargetsKey = JSON.stringify(
-		liveTabs.map((tab) => [tabSortId(tab), getRecentTabNarratorId(tab)] as const),
+	// The serialized form is the dependency for everything runtime-related below, so it
+	// must only be recomputed when the live window itself changed — not on every render
+	// of a component that re-renders on each narrator status tick.
+	const runtimeTargetsKey = useMemo(
+		() => JSON.stringify(liveTabs.map((tab) => [tabSortId(tab), getRecentTabNarratorId(tab)])),
+		[liveTabs],
 	);
 	const runtimeTargets = useMemo(
 		() => JSON.parse(runtimeTargetsKey) as Array<[string, string | null]>,
@@ -489,13 +494,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 					const moveKey = tab.workspaceId ? `workspace:${tab.workspaceId}` : tabSortId(tab);
 					api
 						.moveRecentTab(moveKey, { position: "above_idle" })
-						.then((result) => {
-							const gaps = applyRecentTabsDelta(qc, result);
-							return refreshRecentTabsLoadedWindow(qc, {
-								reset: gaps.length > 0,
-								minimumRevision: result.revision,
-							});
-						})
+						.then((result) => applyRecentTabsDeltaAndFollowUp(qc, result))
 						.catch(() => {});
 				}
 			}
@@ -532,11 +531,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				const { delta } = collected;
 				flushTabPatches();
 				const previousTabs = tabsRef.current;
-				const gaps = applyRecentTabsDelta(qc, delta);
-				void refreshRecentTabsLoadedWindow(qc, {
-					reset: gaps.length > 0,
-					minimumRevision: delta.revision,
-				}).catch(() => {});
+				void applyRecentTabsDeltaAndFollowUp(qc, delta).catch(() => {});
 				const nextTabs = qc.getQueryData<RecentTab[]>(QUERY_KEY) ?? previousTabs;
 				const currentPath = pathnameRef.current;
 				if (
@@ -1374,6 +1369,7 @@ export function RecentTabList({
 			void (async () => {
 				try {
 					let resetNeeded = false;
+					let backfillNeeded = false;
 					let lastRevision: number | undefined;
 					for (const move of moves) {
 						const result = await api.moveRecentTab(
@@ -1382,13 +1378,19 @@ export function RecentTabList({
 								? { beforeKey: move.beforeKey }
 								: { afterKey: move.afterKey as string },
 						);
-						if (applyRecentTabsDelta(qc, result).length > 0) resetNeeded = true;
+						const applied = applyRecentTabsDelta(qc, result);
+						if (applied.gaps.length > 0) resetNeeded = true;
+						if (applied.backfill.length > 0) backfillNeeded = true;
 						lastRevision = result.revision;
 					}
-					await refreshRecentTabsLoadedWindow(qc, {
-						reset: resetNeeded,
-						minimumRevision: lastRevision,
-					});
+					// One follow-up for the whole replay, and only when a move could not be
+					// applied locally: a pure reorder never changes which rows are loaded.
+					if (resetNeeded || backfillNeeded) {
+						await refreshRecentTabsLoadedWindow(qc, {
+							reset: resetNeeded,
+							minimumRevision: lastRevision,
+						});
+					}
 				} catch {
 					// A failed move leaves the server order half-replayed; resync instead of
 					// trusting either the optimistic order or the partial cache.

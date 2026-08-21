@@ -309,8 +309,8 @@ describe("traceRowAwaitAgentNarratorId — embedded metadata only", () => {
 	});
 
 	test("returns undefined when the id is not embedded (no network fallback)", () => {
-		// ToolCallCard would fall back to listBackgroundTasks here; folded rows must
-		// not, so the menu item is simply hidden.
+		// ToolCallCard would fall back to resolveBackgroundTaskTarget here; folded
+		// rows must not, so the menu item is simply hidden.
 		expect(
 			traceRowToolMeta({
 				toolName: "Await",

@@ -7,8 +7,8 @@
  * view file, view subagent session — so each appears only when its data exists.
  *
  * The network invariant is asserted directly: a row must NEVER fall back to a
- * per-row `listBackgroundTasks` query to resolve a child narrator (a trace shows
- * 10+ rows). With no embedded id the item is simply absent, and `fetch` is stubbed
+ * per-row background-task lookup to resolve a child narrator (a trace shows 10+
+ * rows). With no embedded id the item is simply absent, and `fetch` is stubbed
  * to fail the test if anything tries.
  *
  * The swipe hook is stubbed with the context menu forced open so the dropdown
@@ -294,9 +294,9 @@ describe("TraceRowInteraction — subagent session gating (no per-row query)", (
 	});
 
 	test("hides the item when no id is embedded, and issues NO request", async () => {
-		// The expanded ToolCallCard would fall back to listBackgroundTasks here; a
-		// folded row must not, or a 10-row trace would open 10 subscriptions. The
-		// fetch stub in beforeEach throws if anything tries.
+		// The expanded ToolCallCard would fall back to resolveBackgroundTaskTarget
+		// here; a folded row must not, or a 10-row trace would open 10 subscriptions.
+		// The fetch stub in beforeEach throws if anything tries.
 		await renderRow({
 			tool: { toolName: "Await", toolUseId: "tu-1" },
 			onViewSubagentSession: viewSubagentSessionMock,

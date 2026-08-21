@@ -22,8 +22,8 @@ import {
 import type { WorkspaceDirectorState } from "../../../components/narrator/workspace/dockview-layout";
 import type { PluginDockPanelParams } from "../../../components/plugins/protocol";
 import {
-	addRecentTab,
 	addRecentTabsBatch,
+	recordRecentTabVisit,
 	updateRecentTabLocal,
 } from "../../../hooks/useRecentTabs";
 import { useUpdateWorkspace, useWorkspace } from "../../../hooks/useWorkspace";
@@ -137,7 +137,7 @@ function WorkspacePage() {
 	// ── Record recent tab ──
 	useEffect(() => {
 		if (!workspace) return;
-		addRecentTab({
+		void recordRecentTabVisit({
 			type: "workspace",
 			id: workspaceId,
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON

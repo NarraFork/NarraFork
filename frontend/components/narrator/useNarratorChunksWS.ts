@@ -1975,7 +1975,8 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						),
 					),
 				);
-				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
+				// The task list itself is patched from `background_task_list_delta`; this
+				// handler only owns the message-stream tool card and the toast.
 				notifications.show({
 					title: t("backgroundTasks.completed"),
 					message: resultPreview?.slice(0, 100) || "",
@@ -1997,7 +1998,6 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						return result;
 					}),
 				);
-				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
 				notifications.show({
 					title: t("backgroundTasks.failed"),
 					message: error?.slice(0, 100) || "",
@@ -2017,7 +2017,6 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						),
 					),
 				);
-				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
 			},
 			// --- Streaming snapshot (reconnect restore) ---------------------------
 			onStreamingSnapshot: (snapshot) => {

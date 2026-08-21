@@ -1316,14 +1316,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, _retryInfo: undefined } : old,
 				);
 			},
+			// The task LIST is not invalidated here: it is patched in place from
+			// `background_task_list_delta` (see useBackgroundTaskList). Invalidating on
+			// these frames would refetch the whole first page for every status change
+			// and every 2 s output tick — the traffic paging was introduced to remove.
 			onBackgroundTaskStatusChanged: (taskId: string) => {
-				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
 				// An expanded task row watches its own bounded output tail; refresh it so
-				// the final output lands without waiting for the next poll tick.
+				// the final output lands promptly.
 				qc.invalidateQueries({ queryKey: ["background-task-tail", narratorId, taskId] });
 			},
 			onBackgroundTaskOutput: (taskId: string) => {
-				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
 				qc.invalidateQueries({ queryKey: ["background-task-tail", narratorId, taskId] });
 			},
 			onPresenceUpdate: (v) => {

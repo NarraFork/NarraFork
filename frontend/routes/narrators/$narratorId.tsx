@@ -41,9 +41,9 @@ import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import {
-	addRecentTab,
 	addRecentTabsBatch,
 	addSubagentRecentTab,
+	recordRecentTabVisit,
 	shouldAddSubagentRecentTab,
 } from "../../hooks/useRecentTabs";
 import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/useTerminals";
@@ -172,7 +172,7 @@ function NarratorDetailPage() {
 		if (chapterId) {
 			// Chapter-bound narrator: record as chapter tab
 			const displayTitle = narratorTitle || chapterTitle || "Chapter";
-			addRecentTab({
+			void recordRecentTabVisit({
 				type: "chapter",
 				id: chapterId,
 				narratorId: narratorId,
@@ -182,7 +182,7 @@ function NarratorDetailPage() {
 				isScheduled,
 			});
 		} else {
-			addRecentTab({
+			void recordRecentTabVisit({
 				type: "narrator",
 				id: narratorId,
 				title: narratorTitle || "New conversation",

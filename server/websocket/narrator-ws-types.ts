@@ -4,6 +4,7 @@
  * without creating circular imports.
  */
 
+import type { BackgroundTaskListDelta } from "@shared/background-task-list";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
@@ -616,6 +617,20 @@ export type NarratorServerMessage =
 			/** Byte length of the accumulated output so far */
 			outputBytes: number;
 	  }
+	/**
+	 * Incremental background-task list update.
+	 *
+	 * Replaces the list's polling: the client applies `upsert`/`removeIds` in place
+	 * as long as `version` advances by exactly one within the same `listEpoch`, and
+	 * refetches its first page otherwise. Carrying the whole row (rather than a
+	 * status patch) means a task the client has never seen and one it has both take
+	 * the same path.
+	 */
+	| ({
+			type: "background_task_list_delta";
+			/** The PARENT narrator whose list changed. */
+			narratorId: string;
+	  } & BackgroundTaskListDelta)
 	| {
 			type: "git_status";
 			narratorId: string;

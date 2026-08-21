@@ -1,4 +1,5 @@
 import type { PendingPermission } from "@frontend/types/narrator";
+import type { BackgroundTaskListDelta } from "@shared/background-task-list";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
 import {
@@ -612,6 +613,12 @@ interface NarratorWSCallbacks {
 	onBackgroundTaskCancelled?: (taskNarratorId: string, toolUseId: string) => void;
 	onBackgroundTaskStatusChanged?: (taskId: string, status: string, narratorId: string) => void;
 	onBackgroundTaskOutput?: (taskId: string, narratorId: string) => void;
+	/**
+	 * Incremental background-task list update. This is what replaced the list's
+	 * polling, so a surface that shows tasks must handle it (or refetch) rather
+	 * than relying on a timer.
+	 */
+	onBackgroundTaskListDelta?: (delta: BackgroundTaskListDelta, narratorId: string) => void;
 	onMessagesDeleted?: (
 		deletedMessageIds: string[],
 		replacement?: MessageReplacementAliases,
@@ -1404,6 +1411,19 @@ export function useNarratorWS(
 					case "background_task_output":
 						callbackOwner.callbacks.onBackgroundTaskOutput?.(
 							data.taskId as string,
+							data.narratorId as string,
+						);
+						break;
+					case "background_task_list_delta":
+						callbackOwner.callbacks.onBackgroundTaskListDelta?.(
+							{
+								listEpoch: data.listEpoch as string,
+								version: data.version as number,
+								activeCount: data.activeCount as number,
+								upsert: data.upsert as BackgroundTaskListDelta["upsert"],
+								removeIds: data.removeIds as string[] | undefined,
+								invalidate: data.invalidate as boolean | undefined,
+							},
 							data.narratorId as string,
 						);
 						break;

@@ -312,6 +312,35 @@ export function buildRecentTabUpsert(tab: AddRecentTabInput): RecentTab & { upda
 	return { ...entry, updateOnly: explicitUpdateOnly ?? false };
 }
 
+/**
+ * Identity of what a visit upsert would actually persist, used to skip repeat requests.
+ *
+ * A narrator page re-runs its visit effect whenever the narrator query object changes,
+ * which happens on every status/substatus WS patch — several times per turn. Each of
+ * those upserts wrote the same row and produced a revision, which then had to be
+ * broadcast and applied by every client.
+ *
+ * `status` and `lastVisitedAt` are deliberately excluded: live status reaches the tab
+ * over the narrator WS and the runtime endpoint (which both override the persisted
+ * column), so re-sending it buys nothing, and `lastVisitedAt` does not affect ordering
+ * on a revisit. Every other persisted field is included, so a real title/cwd/workspace
+ * change is still written through.
+ */
+export function recentTabVisitSignature(tab: AddRecentTabInput): string {
+	return JSON.stringify([
+		tab.type,
+		tab.id,
+		tab.narratorId ?? null,
+		tab.parentNarratorId ?? null,
+		tab.workspaceId ?? null,
+		clampRecentTabText(tab.title) ?? "",
+		clampRecentTabText(tab.subtitle) ?? null,
+		tab.pinned ?? null,
+		tab.isScheduled ?? null,
+		tab.updateOnly ?? false,
+	]);
+}
+
 export interface SubagentRecentTabInput {
 	id: string;
 	parentNarratorId?: string | null;

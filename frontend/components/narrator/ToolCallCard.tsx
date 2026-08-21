@@ -5758,29 +5758,26 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const { t: tc } = useTranslation("common");
 	const awaitAgentTargetId = getAwaitAgentTargetId(toolCall);
 	const embeddedAwaitAgentNarratorId = getAwaitAgentNarratorId(toolCall);
+	// One-shot lookup of a single id.
+	//
+	// This used to fetch the ENTIRE task list on a 3 s timer (and, sharing the
+	// panel's query key, kept that list polling even when no panel was open) to
+	// extract one narrator id. The id does not change once assigned, so the answer
+	// is cached indefinitely and never re-polled.
 	const { data: queriedAwaitAgentNarratorId } = useQuery({
-		queryKey: ["background-tasks", narratorId],
-		queryFn: () => api.listBackgroundTasks(narratorId as string),
+		queryKey: ["background-task-target", narratorId, awaitAgentTargetId],
+		queryFn: () =>
+			api
+				.resolveBackgroundTaskTarget(narratorId as string, awaitAgentTargetId as string)
+				.then((res) => res.subagentNarratorId ?? undefined),
 		enabled: !!(
 			narratorId &&
 			onViewSubagentSession &&
 			awaitAgentTargetId &&
 			!embeddedAwaitAgentNarratorId
 		),
-		staleTime: 2_000,
-		refetchInterval: isRunning ? 3_000 : false,
-		select: (data) => {
-			if (!awaitAgentTargetId) return undefined;
-			const task = data.tasks.find(
-				(candidate) =>
-					candidate.type === "agent" &&
-					(candidate.id === awaitAgentTargetId ||
-						candidate.alias === awaitAgentTargetId ||
-						candidate.subagentNarratorId === awaitAgentTargetId),
-			);
-			if (task?.subagentNarratorId) return task.subagentNarratorId;
-			return data.legacySubagentTasks.find((candidate) => candidate.id === awaitAgentTargetId)?.id;
-		},
+		staleTime: Number.POSITIVE_INFINITY,
+		gcTime: 60_000,
 	});
 	const awaitAgentNarratorId = embeddedAwaitAgentNarratorId ?? queriedAwaitAgentNarratorId ?? null;
 	const canShowAwaitAgent = !!(awaitAgentTargetId && onViewSubagentSession);

@@ -3,6 +3,7 @@ import {
 	Alert,
 	Badge,
 	Box,
+	Button,
 	Code,
 	Collapse,
 	Drawer,
@@ -14,6 +15,8 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import type { BackgroundTaskListItem } from "@shared/background-task-list";
+import { isBackgroundTaskActiveStatus } from "@shared/background-task-list";
 import {
 	IconChevronDown,
 	IconChevronRight,
@@ -23,7 +26,7 @@ import {
 	IconTerminal2,
 	IconX,
 } from "@tabler/icons-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -36,17 +39,18 @@ import {
 import { ContentViewer } from "./ContentViewer";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { ToolCallInspector } from "./ToolCallInspector";
+import { useBackgroundTaskList } from "./useBackgroundTaskList";
 
-const TASK_OUTPUT_PREVIEW_CHARS = 4_000;
 /** Poll interval for the live output tail of a running task. */
 const TAIL_POLL_INTERVAL_MS = 1_500;
 
-function toTaskOutputPreview(output: string | null | undefined): string | null {
-	if (!output) return null;
-	if (output.length <= TASK_OUTPUT_PREVIEW_CHARS) return output;
-	return `${output.slice(0, TASK_OUTPUT_PREVIEW_CHARS)}\n…`;
-}
-
+/**
+ * One row as this panel renders it.
+ *
+ * The unified/legacy normalization that used to happen here (`toUnifiedTasks`)
+ * now happens server-side, so this is a thin projection of the wire shape rather
+ * than a merge of two different ones.
+ */
 interface UnifiedTask {
 	id: string;
 	kind: "bash" | "agent";
@@ -62,7 +66,23 @@ interface UnifiedTask {
 }
 
 export function isBackgroundTaskActive(status: string): boolean {
-	return status === "running" || status === "continued" || status === "child_running";
+	return isBackgroundTaskActiveStatus(status);
+}
+
+function toUnifiedTask(task: BackgroundTaskListItem): UnifiedTask {
+	return {
+		id: task.id,
+		kind: task.type,
+		status: task.effectiveStatus || task.status,
+		label: task.title || task.alias || task.command || task.subagentType || "Task",
+		command: task.command,
+		output: task.output,
+		exitCode: task.exitCode,
+		toolUseId: task.toolUseId,
+		subagentNarratorId: task.subagentNarratorId,
+		activeChildTaskCount: task.activeChildTaskCount,
+		canCancelActiveWork: task.canCancelActiveWork,
+	};
 }
 
 function statusColor(status: string): string {
@@ -107,82 +127,12 @@ function statusLabel(
 }
 
 /**
- * Shared background-tasks query. Keyed identically for the panel content and the
- * toolbar button so React Query dedupes them into a single request per narrator.
- */
-function useBackgroundTasksQuery(narratorId: string, enabled: boolean, opened: boolean) {
-	return useQuery({
-		queryKey: ["background-tasks", narratorId],
-		queryFn: async () => {
-			const tasksData = await api.listBackgroundTasks(narratorId);
-			return {
-				...tasksData,
-				tasks: tasksData.tasks.map((task) => ({
-					...task,
-					output: toTaskOutputPreview(task.output),
-				})),
-				legacySubagentTasks: tasksData.legacySubagentTasks.map((task) => ({
-					...task,
-					backgroundResult: toTaskOutputPreview(task.backgroundResult),
-				})),
-			};
-		},
-		enabled,
-		refetchInterval: opened ? 3000 : 10000,
-		gcTime: 30_000,
-	});
-}
-
-/** Merge unified tasks + legacy subagent tasks into a single flat list. */
-// biome-ignore lint/suspicious/noExplicitAny: query result shape is dynamic JSON
-function toUnifiedTasks(data: any): UnifiedTask[] {
-	const result: UnifiedTask[] = [];
-
-	// New unified tasks
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON entity
-	for (const task of (data?.tasks ?? []) as any[]) {
-		result.push({
-			id: task.id,
-			kind: task.type,
-			status: task.effectiveStatus ?? task.status,
-			label: task.title || task.alias || task.command || task.subagentType || "Task",
-			command: task.command,
-			output: task.output,
-			exitCode: task.exitCode,
-			toolUseId: task.toolUseId,
-			subagentNarratorId: task.subagentNarratorId,
-			activeChildTaskCount: task.activeChildTaskCount ?? 0,
-			canCancelActiveWork: task.canCancelActiveWork ?? task.status === "running",
-		});
-	}
-
-	// Legacy subagent tasks (not already in the unified list)
-	const unifiedIds = new Set(result.map((t) => t.id));
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON entity
-	for (const task of (data?.legacySubagentTasks ?? []) as any[]) {
-		if (unifiedIds.has(task.id)) continue;
-		const status = task.backgroundStatus ?? task.status;
-		result.push({
-			id: task.id,
-			kind: "agent",
-			status,
-			label: task.title || task.subagentType || "Agent",
-			command: null,
-			output: task.backgroundResult,
-			exitCode: null,
-			toolUseId: null,
-			subagentNarratorId: task.id,
-			activeChildTaskCount: 0,
-			canCancelActiveWork: status === "running",
-		});
-	}
-
-	return result;
-}
-
-/**
  * Lightweight state for the toolbar button (support gate + running count).
- * Shares the same query as the panel so no extra request is issued.
+ *
+ * Reads the server-computed `activeCount` rather than counting loaded rows: the
+ * badge must be right even when the panel has only loaded the first page, and
+ * loading every page just to count them is what made this surface expensive.
+ * Shares the panel's query key, so mounting the badge costs no extra request.
  */
 export function useBackgroundTasksButton(
 	narratorId: string,
@@ -193,12 +143,8 @@ export function useBackgroundTasksButton(
 } {
 	const subagentsCapability = useNarratorSubagentsCapability();
 	const supported = enabled && subagentsCapability.supported && subagentsCapability.background;
-	const { data } = useBackgroundTasksQuery(narratorId, supported, false);
-	const runningCount = useMemo(
-		() => toUnifiedTasks(data).filter((task) => isBackgroundTaskActive(task.status)).length,
-		[data],
-	);
-	return { supported, runningCount };
+	const { activeCount } = useBackgroundTaskList(narratorId, supported);
+	return { supported, runningCount: activeCount };
 }
 
 /**
@@ -321,7 +267,6 @@ export function BackgroundTasksPanel({
 	const { t } = useTranslation("narrator");
 	const [inspectedToolUseId, setInspectedToolUseId] = useState<string | null>(null);
 	const [expandedTaskIds, setExpandedTaskIds] = useState<ReadonlySet<string>>(() => new Set());
-	const qc = useQueryClient();
 	const navigate = useNavigate();
 	// When rendered inside a dock surface (single-narrator page or workspace),
 	// open subagent sessions as dockview panels; otherwise fall back to routing.
@@ -333,9 +278,10 @@ export function BackgroundTasksPanel({
 	const reattachFallbackReason =
 		subagentsCapability.reattachReason ?? t("backgroundTasks.reattachPartial");
 
-	const { data, isLoading } = useBackgroundTasksQuery(narratorId, backgroundTasksSupported, true);
+	const { tasks, isLoading, hasNextPage, isFetchingNextPage, fetchNextPage, refresh } =
+		useBackgroundTaskList(narratorId, backgroundTasksSupported);
 
-	const allTasks = useMemo(() => toUnifiedTasks(data), [data]);
+	const allTasks = useMemo(() => tasks.map(toUnifiedTask), [tasks]);
 
 	const handleOpenSubagent = useCallback(
 		(subagentNarratorId: string) => {
@@ -371,12 +317,15 @@ export function BackgroundTasksPanel({
 			if (!backgroundTasksSupported) return;
 			try {
 				await api.cancelBackgroundTask(narratorId, taskId);
-				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
+				// A cancel also produces a delta, but that is a race against this
+				// response; refreshing here makes the local action feel immediate and the
+				// delta then arrives as a no-op (same version already applied).
+				refresh();
 			} catch {
 				// ignore
 			}
 		},
-		[backgroundTasksSupported, narratorId, qc],
+		[backgroundTasksSupported, narratorId, refresh],
 	);
 
 	// When not supported there is nothing to show. In the dock this panel would
@@ -543,6 +492,21 @@ export function BackgroundTasksPanel({
 					<Group justify="center" py="md">
 						<Loader size="sm" />
 					</Group>
+				)}
+
+				{/* Explicit control rather than scroll-driven auto-paging: older tasks
+				    are history, and a user scrolling to read one row should not pull in
+				    pages they did not ask for. */}
+				{hasNextPage && (
+					<Button
+						variant="subtle"
+						size="xs"
+						onClick={fetchNextPage}
+						loading={isFetchingNextPage}
+						fullWidth
+					>
+						{t("backgroundTasks.loadOlder")}
+					</Button>
 				)}
 
 				{!isLoading && allTasks.length === 0 && (

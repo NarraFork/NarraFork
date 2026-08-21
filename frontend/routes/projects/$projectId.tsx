@@ -22,7 +22,7 @@ import { useTranslation } from "react-i18next";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useChapterBatchMergeCapability } from "../../hooks/usePlatform";
 import { useDeleteProject, useProject, useUpdateProject } from "../../hooks/useProjects";
-import { addRecentTab } from "../../hooks/useRecentTabs";
+import { recordRecentTabVisit } from "../../hooks/useRecentTabs";
 import { APP_SHELL_CONTENT_HEIGHT } from "../../lib/safe-area";
 
 const NarraFlow = lazy(() =>
@@ -107,7 +107,7 @@ function ProjectDetailPage() {
 	// Record project visit in recent tabs
 	useEffect(() => {
 		if (project) {
-			addRecentTab({
+			void recordRecentTabVisit({
 				type: "project",
 				id: projectId,
 				title: project.name,

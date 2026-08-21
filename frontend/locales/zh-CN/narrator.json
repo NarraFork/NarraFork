@@ -1085,7 +1085,8 @@
 		"outputEmpty": "无输出",
 		"outputLoadFailed": "输出加载失败",
 		"openAgent": "打开 agent",
-		"reattachPartial": "当前后端运行时打开已分离的子代理会话后，不会重新阻塞原父级工具调用。"
+		"reattachPartial": "当前后端运行时打开已分离的子代理会话后，不会重新阻塞原父级工具调用。",
+		"loadOlder": "加载更早的任务"
 	},
 	"sidecar": {
 		"unknownSource": "未知来源",

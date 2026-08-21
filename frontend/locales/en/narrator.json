@@ -1086,7 +1086,8 @@
 		"outputEmpty": "No output",
 		"outputLoadFailed": "Failed to load output",
 		"openAgent": "Open agent",
-		"reattachPartial": "Opening a detached subagent session will not re-block the original parent tool call in this backend runtime."
+		"reattachPartial": "Opening a detached subagent session will not re-block the original parent tool call in this backend runtime.",
+		"loadOlder": "Load older tasks"
 	},
 	"sidecar": {
 		"unknownSource": "unknown",

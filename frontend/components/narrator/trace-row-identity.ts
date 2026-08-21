@@ -64,9 +64,9 @@ export interface TraceRowToolMeta {
 	 * 【performance invariant】This is derived by a pure function from data already
 	 * in hand. A folded trace shows 10+ rows and a page shows several traces, so
 	 * the row menu must NEVER replicate ToolCallCard's fallback lookup
-	 * (`useQuery(["background-tasks", …])` → api.listBackgroundTasks): that would
-	 * open one react-query subscription per row. When the id is not embedded the
-	 * "view subagent session" item is simply hidden.
+	 * (`useQuery(["background-task-target", …])` → api.resolveBackgroundTaskTarget):
+	 * that would open one react-query subscription per row. When the id is not
+	 * embedded the "view subagent session" item is simply hidden.
 	 */
 	awaitAgentNarratorId?: string;
 	/**

@@ -1,4 +1,5 @@
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
+import type { BackgroundTaskListPage } from "@shared/background-task-list";
 import {
 	ApiError,
 	absorbRenewedToken,
@@ -599,41 +600,26 @@ export const narratorsApi = {
 		}>(`/narrators/${narratorId}/background-tasks/${taskId}/cancel`, {
 			method: "POST",
 		}),
-	listBackgroundTasks: (narratorId: string) =>
-		request<{
-			tasks: {
-				id: string;
-				type: "bash" | "agent";
-				status: string;
-				effectiveStatus: string;
-				currentNarratorStatus: string | null;
-				activeChildTaskCount: number;
-				canCancelActiveWork: boolean;
-				command: string | null;
-				exitCode: number | null;
-				toolUseId: string | null;
-				subagentNarratorId: string | null;
-				subagentType: string | null;
-				alias: string | null;
-				title: string | null;
-				/** Preview only (truncated server-side). Use getBackgroundTaskOutput for the full text. */
-				output: string | null;
-				outputBytes: number;
-				outputTruncated: boolean;
-				startedAt: string;
-				completedAt: string | null;
-			}[];
-			legacySubagentTasks: {
-				id: string;
-				subagentType: string | null;
-				backgroundStatus: string | null;
-				backgroundResult: string | null;
-				backgroundCompletedAt: string | null;
-				status: string;
-				createdAt: string;
-				title: string | null;
-			}[];
-		}>(`/narrators/${narratorId}/background-tasks`),
+	/**
+	 * One cursor page of a narrator's background tasks, newest first.
+	 *
+	 * Paged because a long-lived narrator accumulates hundreds of long-finished
+	 * tasks; the previous unpaged version re-sent all of them every few seconds.
+	 * Steady-state updates arrive as `background_task_list_delta` WS frames — do
+	 * NOT add a `refetchInterval` to callers of this.
+	 */
+	listBackgroundTasks: (narratorId: string, opts?: { limit?: number; cursor?: string | null }) => {
+		const params = new URLSearchParams();
+		if (opts?.limit != null) params.set("limit", String(opts.limit));
+		if (opts?.cursor) params.set("cursor", opts.cursor);
+		const query = params.size > 0 ? `?${params.toString()}` : "";
+		return request<BackgroundTaskListPage>(`/narrators/${narratorId}/background-tasks${query}`);
+	},
+	/** Resolve an Await/Send target to its subagent narrator id (one-shot; never polled). */
+	resolveBackgroundTaskTarget: (narratorId: string, target: string) =>
+		request<{ subagentNarratorId: string | null }>(
+			`/narrators/${narratorId}/background-tasks/resolve?target=${encodeURIComponent(target)}`,
+		),
 	getBackgroundTaskOutput: (narratorId: string, taskId: string) =>
 		request<{ output: string | null; status: string }>(
 			`/narrators/${narratorId}/background-tasks/${taskId}/output`,

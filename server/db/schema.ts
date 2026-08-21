@@ -687,6 +687,13 @@ export const narrators = sqliteTable(
 		index("idx_narrators_refs_inherited_from")
 			.on(table.refsInheritedFrom)
 			.where(sql`"refs_inherited_from" IS NOT NULL`),
+		// Cursor paging for the LEGACY half of the background-task list (subagents
+		// recorded before `background_tasks` existed). Partial because the set of
+		// interest is a small slice of a large table, and the list always filters on
+		// it. `idx_narrators_parent` alone cannot serve the `createdAt desc` order.
+		index("idx_narrators_background_parent_created")
+			.on(table.parentNarratorId, table.createdAt, table.id)
+			.where(sql`"is_background" = 1`),
 	],
 );
 
@@ -3004,6 +3011,10 @@ export const backgroundTasks = sqliteTable(
 	(table) => [
 		index("idx_bg_tasks_parent").on(table.parentNarratorId, table.status),
 		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
+		// Cursor paging order for the task list: `(parent, createdAt desc, id desc)`.
+		// Without it a parent with hundreds of tasks sorts its whole history on every
+		// page request.
+		index("idx_bg_tasks_parent_created").on(table.parentNarratorId, table.createdAt, table.id),
 	],
 );
 
