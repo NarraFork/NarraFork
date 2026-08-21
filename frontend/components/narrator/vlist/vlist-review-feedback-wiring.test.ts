@@ -115,7 +115,11 @@ describe("review feedback actions — shell wiring", () => {
 		// height from the measure pass, the cap as a ceiling, and `overflow: auto`.
 		expect(CARD).toContain("height: measured.bodyHeight");
 		expect(CARD).toContain("maxHeight: measured.appliedCap");
-		expect(CARD).toContain('overflow: "auto"');
+		// The scroll is vertical-only: a markdown body is always wrapped, so horizontal
+		// overflow is a paint artifact and must not summon a scrollbar (a short body
+		// would be covered by it almost entirely).
+		expect(CARD).toContain('overflowY: "auto"');
+		expect(CARD).toContain('overflowX: "hidden"');
 	});
 
 	it("renders the body as markdown rather than painting plain text lines", () => {

@@ -25,6 +25,11 @@
  *    pinned to the bottom of the overflow menu and must never be draggable into
  *    the always-visible row: it is not a panel toggle and a mis-tap is not
  *    symmetric with one. Close is always the rightmost control.
+ *
+ * `lodlevel` is a deliberate exception to the first class: the detail level is
+ * render configuration (not per-session state), and its historic only entry
+ * point — Alt — is a user-configurable gesture that can be turned off entirely
+ * in Settings, so the toolbar menu is the entry point that survives that.
  */
 export const NARRATOR_TOOLBAR_IDS = [
 	"tasks",
@@ -36,6 +41,7 @@ export const NARRATOR_TOOLBAR_IDS = [
 	"search",
 	"browser",
 	"userchat",
+	"lodlevel",
 	"device",
 	"plugins",
 ] as const;

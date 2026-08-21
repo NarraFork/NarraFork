@@ -1252,7 +1252,15 @@ function MarkdownDetailBody({
 			style={{
 				maxHeight: detail.appliedCap ?? undefined,
 				height: boxHeight,
-				overflow: "auto",
+				// A markdown body is ALWAYS wrapped (the rendered form wraps by
+				// construction, the source view is `pre-wrap`), so it never needs
+				// horizontal scrolling; anything wider than the box is a painted
+				// artifact (a wrap point's trailing space), and `overflowX: auto`
+				// would answer it with a scrollbar that covers a short body.
+				// Content that legitimately exceeds the width (tables, display
+				// math, mermaid) scrolls inside its OWN block-level box.
+				overflowY: "auto",
+				overflowX: "hidden",
 				boxSizing: "border-box",
 				padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
 				// Markdown body text inherits the theme foreground, so the surface must
@@ -1798,7 +1806,16 @@ function CappedBodyBox({
 			style={{
 				maxHeight: cap ?? undefined,
 				height,
-				overflow: "auto",
+				// The chunked ContentViewer's axis policy: a WRAPPED body never needs
+				// horizontal scrolling — its text is measured to fit — so any horizontal
+				// overflow is a rendering artifact (e.g. a wrap point's trailing space
+				// painted by `pre` fragments), and `overflowX: auto` would answer it
+				// with a scrollbar. On a short body that bar covers almost the whole
+				// box: a one-line output reserves ~24px and a classic scrollbar takes
+				// ~half of it, which is exactly what a failed WebSearch card showed.
+				// An UNWRAPPED body (`pre`) scrolls horizontally by definition.
+				overflowY: "auto",
+				overflowX: wordWrap ? "hidden" : "auto",
 				fontSize: DETAIL_BODY_FONT_SIZE,
 				// The measure layer counts INTEGER line boxes
 				// (DETAIL_CONTENT_LINE_HEIGHT = round(11 × 1.4) = 15). Declaring the
@@ -2124,7 +2141,11 @@ function CappedMarkdownBody({
 			style={{
 				maxHeight: cap ?? undefined,
 				height: boxHeight,
-				overflow: "auto",
+				// Same axis policy as MarkdownDetailBody: a markdown body is always
+				// wrapped, so horizontal overflow is a paint artifact, not content
+				// to scroll to (see CappedBodyBox for the full rationale).
+				overflowY: "auto",
+				overflowX: "hidden",
 				boxSizing: "border-box",
 				padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
 				// Markdown body text inherits the theme foreground, so the surface
@@ -2552,7 +2573,13 @@ function DetailRegion({
 									<div
 										style={{
 											maxHeight: typeof block.data?.cap === "number" ? block.data.cap : undefined,
-											overflow: "auto",
+											// Axis policy of the chunked ContentViewer (see
+											// CappedBodyBox): a WRAPPED body never scrolls
+											// horizontally, so any overflow is a rendering artifact
+											// that must not summon a scrollbar; an UNWRAPPED body
+											// scrolls horizontally by definition.
+											overflowY: "auto",
+											overflowX: bodyWrapped ? "hidden" : "auto",
 											fontSize: DETAIL_BODY_FONT_SIZE,
 											// Integer line box, not the 1.4 ratio — see CappedBodyBox.
 											lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`,

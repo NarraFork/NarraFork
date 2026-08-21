@@ -20,6 +20,13 @@ describe("resolveWheelLodStep", () => {
 		expect(resolveWheelLodStep({ altKey: false, deltaY: 10 })).toBeNull();
 		expect(resolveWheelLodStep({ altKey: false, deltaY: -10 })).toBeNull();
 	});
+	it("returns null when the gesture is disabled, even with alt held", () => {
+		// The settings toggle (narrafork_lod_alt_gesture). Null — not a no-op step —
+		// is what lets the wheel event fall through to normal scrolling: the caller
+		// only calls preventDefault when a direction was resolved.
+		expect(resolveWheelLodStep({ altKey: true, deltaY: 10 }, false)).toBeNull();
+		expect(resolveWheelLodStep({ altKey: true, deltaY: -10 }, false)).toBeNull();
+	});
 });
 
 describe("resolvePinchLodStep", () => {

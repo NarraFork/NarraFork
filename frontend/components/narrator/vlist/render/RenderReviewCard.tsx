@@ -129,7 +129,10 @@ export function RenderReviewCard({
 					// Fixed by the measure pass; the overflow scrolls rather than growing the row.
 					height: measured.bodyHeight,
 					maxHeight: measured.appliedCap,
-					overflow: "auto",
+					// A markdown body is always wrapped, so horizontal overflow is a paint
+					// artifact (see the tool card's CappedBodyBox for the full rationale).
+					overflowY: "auto",
+					overflowX: "hidden",
 					boxSizing: "border-box",
 					padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
 					// Scheme-aware, like every other detail panel: a fixed dark surface renders

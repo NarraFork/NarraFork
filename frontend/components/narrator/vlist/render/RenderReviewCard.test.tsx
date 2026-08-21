@@ -179,9 +179,10 @@ describe("review card — the body scrolls instead of growing the row", () => {
 		) as unknown as HTMLElement | null;
 		expect(body).toBeTruthy();
 		// Matched without whitespace assumptions: the serialized inline style has no space
-		// after the colon.
+		// after the colon. Vertical scroll only: the body is always-wrapped markdown.
 		const style = (body?.getAttribute("style") ?? "").replace(/\s+/g, "");
-		expect(style).toContain("overflow:auto");
+		expect(style).toContain("overflow-y:auto");
+		expect(style).toContain("overflow-x:hidden");
 		expect(style).toMatch(/height:\d/);
 		expect(style).toMatch(/max-height:\d/);
 		unmount();

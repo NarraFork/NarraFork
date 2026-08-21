@@ -31,6 +31,8 @@ export interface AppearanceSectionProps {
 	setExpandReasoning: (v: boolean) => void;
 	centeredColumn: boolean;
 	setCenteredColumn: (v: boolean) => void;
+	lodAltGesture: boolean;
+	setLodAltGesture: (v: boolean) => void;
 }
 
 export function AppearanceSection({
@@ -48,6 +50,8 @@ export function AppearanceSection({
 	setExpandReasoning,
 	centeredColumn,
 	setCenteredColumn,
+	lodAltGesture,
+	setLodAltGesture,
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
@@ -131,6 +135,12 @@ export function AppearanceSection({
 				description={t("narratorCenteredColumnDesc")}
 				checked={centeredColumn}
 				onChange={(e) => setCenteredColumn(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("lodAltGesture")}
+				description={t("lodAltGestureDesc")}
+				checked={lodAltGesture}
+				onChange={(e) => setLodAltGesture(e.currentTarget.checked)}
 			/>
 			{/* Word Wrap */}
 			<Title order={5} mt="sm">

@@ -14,6 +14,13 @@ type Key =
 	| "narrafork_expand_reasoning"
 	| "narrafork_narrator_virtual_list"
 	| "narrafork_narrator_centered_column"
+	// Alt+wheel / pinch stepping of the render LOD, plus the Alt-held indicator.
+	// Default ON; can be turned off because Alt+wheel collides with OS/browser
+	// gestures on some setups (window drag, horizontal scroll, IME) and an
+	// accidental Alt while scrolling then silently changes how much detail the
+	// whole transcript renders. With it off, Alt does nothing for LOD — the
+	// toolbar's detail-level menu (`lodlevel`) is the remaining click entry point.
+	| "narrafork_lod_alt_gesture"
 	// Ruler's deprecation notice has been acknowledged. Not per-project: the fact that
 	// the view is deprecated is global, so being told once is enough.
 	| "narrafork_ruler_deprecation_ack"
@@ -64,6 +71,9 @@ const DEFAULT_TRUE: ReadonlySet<Key> = new Set([
 	// has flipped the header switch keeps their explicit choice (including an
 	// explicit `false`, which stays on ChunkedMessageList).
 	"narrafork_narrator_virtual_list",
+	// The LOD gesture is existing behavior, so nothing-stored must keep it working;
+	// the switch exists to opt OUT.
+	"narrafork_lod_alt_gesture",
 ]);
 
 /**

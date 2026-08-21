@@ -1943,6 +1943,11 @@ export const PretextExactMessageList = forwardRef<
 	// Reading-width preference: OFF (default) lets the content column fill the
 	// viewport like the chunked path; ON caps it at a centered reading width.
 	const [centeredColumn] = useLocalPref("narrafork_narrator_centered_column");
+	// Alt+wheel LOD stepping. OFF makes alt+wheel behave like a plain wheel (no
+	// preventDefault, so the list scrolls); the toolbar's detail-level menu then
+	// becomes the entry point. Touch pinch is unaffected — it involves no Alt and
+	// cannot be triggered accidentally while scrolling with a modifier held.
+	const [lodAltGesture] = useLocalPref("narrafork_lod_alt_gesture");
 	const viewportRef = useRef<HTMLDivElement | null>(null);
 	/**
 	 * The SAME node as `viewportRef.current`, held in state so effects that observe
@@ -3158,18 +3163,12 @@ export const PretextExactMessageList = forwardRef<
 		);
 	}, [truncatedExpandedToolUseIds]);
 
-	// Mark a row as having asked for its full payload. Referentially stable per key
-	// so the viewer controls (compared identity-wise by every mounted row's memo)
-	// never churn during a scroll.
-	const loadFullPayloadCacheRef = useRef<Map<string, () => void>>(new Map());
-	const getLoadFullPayload = useCallback((key: string): (() => void) => {
-		const cached = loadFullPayloadCacheRef.current.get(key);
-		if (cached) return cached;
-		const handler = () => {
-			setInteraction((prev) => markVListFullPayloadRequested(prev, key));
-		};
-		loadFullPayloadCacheRef.current.set(key, handler);
-		return handler;
+	// Mark a row as having asked for its full payload. This must mark
+	// SYNCHRONOUSLY: the channel below treats `requestFullPayload` as fire-and-
+	// forget, so handing it a thunk factory (as the removed per-row notice-line
+	// prop once consumed) marks nothing and the fetch never starts.
+	const requestRowFullPayload = useCallback((key: string) => {
+		setInteraction((prev) => markVListFullPayloadRequested(prev, key));
 	}, []);
 
 	// Fullscreen content viewer: per-body wrap / source state plus the single open
@@ -3180,7 +3179,7 @@ export const PretextExactMessageList = forwardRef<
 	// the halfway mark of an inline body, or opening one in fullscreen. Both are
 	// user actions on the grow-only interaction channel, which is what lets a
 	// committed row's payload change at all.
-	const contentView = useVListContentView({ requestFullPayload: getLoadFullPayload });
+	const contentView = useVListContentView({ requestFullPayload: requestRowFullPayload });
 
 	// The open modal's body, re-derived from the CURRENT document.
 	//
@@ -4266,7 +4265,7 @@ export const PretextExactMessageList = forwardRef<
 			olderHistoryIntentAtRef.current = Date.now();
 		};
 		const onWheel = (event: WheelEvent) => {
-			const dir = resolveWheelLodStep(event);
+			const dir = resolveWheelLodStep(event, lodAltGesture);
 			if (dir === null) {
 				if (event.deltaY < 0) {
 					detachFromBottom();
@@ -4323,7 +4322,7 @@ export const PretextExactMessageList = forwardRef<
 			node.removeEventListener("touchmove", onTouchMove);
 			node.removeEventListener("touchend", onTouchEnd);
 		};
-	}, [detachFromBottom]);
+	}, [detachFromBottom, lodAltGesture]);
 
 	const scrollToMessageTarget = useCallback(
 		async ({
@@ -4549,7 +4548,6 @@ export const PretextExactMessageList = forwardRef<
 				unknownHeightReporterCacheRef.current,
 				togglesCacheRef.current,
 				reflectionTakeOverCacheRef.current,
-				loadFullPayloadCacheRef.current,
 			],
 			liveKeys,
 		);

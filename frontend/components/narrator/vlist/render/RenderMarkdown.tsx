@@ -297,7 +297,10 @@ function MarkdownSourceBody({
 				position: "relative",
 				width,
 				height,
-				overflow: "auto",
+				// The source is `pre-wrap`, so it never needs horizontal scrolling —
+				// the chunked ContentViewer's wrapped state is `overflowX: hidden`.
+				overflowY: "auto",
+				overflowX: "hidden",
 				fontSize: CODE_BLOCK_FONT_SIZE,
 				// The integer line box the measure layer uses for code, for the same
 				// reason: a unitless ratio makes the browser pick a fractional height.

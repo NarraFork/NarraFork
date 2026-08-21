@@ -413,6 +413,11 @@
 	"updateZstdMissingDescWindows": "Incremental updates require the zstd command-line tool, which is downloaded automatically from the update server. The download failed this time (usually a network timeout). Please check your connection and retry.",
 	"updateZstdInstallCmd": "# macOS\nbrew install zstd\n\n# Debian / Ubuntu\nsudo apt install zstd\n\n# Fedora / RHEL\nsudo dnf install zstd",
 
+	"startupRecoveryFailedTitle": "Some narrators could not be restored",
+	"startupRecoveryFailedDesc": "The new version is running normally. Restoring narrator sessions stopped early, so some narrators may show as interrupted — usually because their model points at a provider that no longer exists.",
+	"startupRecoveryFailedReason": "Reason: {{reason}}",
+	"startupRecoveryFailedAction": "Review affected narrators",
+
 	"gitNotInstalled": "Git is not installed",
 	"gitNotInstalledBannerDesc": "Project and version-control features are unavailable until Git is installed. Everything else — standalone narrators, providers and settings — works normally.",
 	"gitInstallViaNarrator": "Let a narrator install it",

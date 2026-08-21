@@ -12,7 +12,7 @@ import {
 	Title,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { IconAlertTriangle, IconCertificate, IconRefresh, IconSearch } from "@tabler/icons-react";
+import { IconAlertTriangle, IconRefresh, IconSearch } from "@tabler/icons-react";
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
@@ -20,6 +20,7 @@ import { api } from "../../lib/api";
 import { PathInput } from "../common/PathInput";
 import type { UpdateModalData } from "../UpdateModal";
 import { DependencyStatus } from "./DependencyStatus";
+import { TlsSection } from "./TlsSection";
 
 const HOST_PRESETS = ["localhost", "127.0.0.1", "::1", "192.168.0.0", "0.0.0.0"];
 
@@ -93,8 +94,6 @@ export function ServerSystemSection({
 	const tlsGenerationDisabledReason = t("tlsGenerationUnsupported");
 	const [checking, setChecking] = useState(false);
 	const [checkResult, setCheckResult] = useState<string | null>(null);
-	const [generating, setGenerating] = useState(false);
-	const [generateResult, setGenerateResult] = useState<string | null>(null);
 	const [updateModalOpened, { open: openUpdateModal, close: closeUpdateModal }] =
 		useDisclosure(false);
 	const [updateData, setUpdateData] = useState<UpdateModalData>({});
@@ -159,60 +158,19 @@ export function ServerSystemSection({
 				checked={tlsEnabled}
 				onChange={(e) => setTlsEnabled(e.currentTarget.checked)}
 			/>
-			<Group gap="sm" align="flex-start">
-				<Button
-					leftSection={<IconCertificate size={16} />}
-					variant="light"
-					color="green"
-					size="xs"
-					loading={generating}
-					disabled={!settingsFeatureCapability.tlsGeneration}
-					title={!settingsFeatureCapability.tlsGeneration ? tlsGenerationDisabledReason : undefined}
-					onClick={async () => {
-						if (!settingsFeatureCapability.tlsGeneration) {
-							setGenerateResult(tlsGenerationDisabledReason);
-							return;
-						}
-						setGenerating(true);
-						setGenerateResult(null);
-						try {
-							const result = await api.generateTlsCert();
-							setTlsCertFile(result.certPath);
-							setTlsKeyFile(result.keyPath);
-							setTlsEnabled(true);
-							if (result.serverRestarting && result.newUrl) {
-								setGenerateResult(t("tlsGenerateSuccess"));
-								setTimeout(() => {
-									window.location.href = result.newUrl;
-								}, 1000);
-							} else if (result.manualRestartRequired) {
-								setGenerateResult(t("serverRestartRequired"));
-							} else {
-								setGenerateResult(t("tlsGenerateSuccess"));
-							}
-						} catch {
-							setGenerateResult(t("tlsGenerateError"));
-						} finally {
-							setGenerating(false);
-						}
+			{settingsFeatureCapability.tlsGeneration ? (
+				<TlsSection
+					onCertIssued={(certPath, keyPath) => {
+						setTlsCertFile(certPath);
+						setTlsKeyFile(keyPath);
+						setTlsEnabled(true);
 					}}
-				>
-					{generating ? t("tlsGenerating") : t("tlsGenerateCert")}
-				</Button>
-				{generateResult && (
-					<Text size="sm" c="dimmed" style={{ flex: 1 }}>
-						{generateResult}
-					</Text>
-				)}
-			</Group>
-			{!settingsFeatureCapability.tlsGeneration && (
+				/>
+			) : (
 				<Alert color="yellow" icon={<IconAlertTriangle size={16} />} variant="light" py={6}>
 					{tlsGenerationDisabledReason}
 				</Alert>
 			)}
-			<Alert color="yellow" icon={<IconAlertTriangle size={16} />} variant="light" py={6}>
-				{t("tlsGenerateWarning")}
-			</Alert>
 			{tlsEnabled && (
 				<>
 					<PathInput

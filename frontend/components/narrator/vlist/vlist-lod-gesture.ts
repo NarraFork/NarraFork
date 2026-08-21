@@ -21,9 +21,17 @@ export const PINCH_RATIO_THRESHOLD = 1.2;
 
 /**
  * Resolve the LOD step direction from an alt+wheel event, or null when the event
- * is not an LOD gesture (no alt held).
+ * is not an LOD gesture (no alt held, or the gesture is turned off).
+ *
+ * `enabled` is the user's `narrafork_lod_alt_gesture` preference. Returning null
+ * when it is off is what makes the wheel event fall through to normal scrolling
+ * (the caller skips preventDefault), rather than becoming a swallowed no-op.
  */
-export function resolveWheelLodStep(e: { altKey: boolean; deltaY: number }): LodStepDir | null {
+export function resolveWheelLodStep(
+	e: { altKey: boolean; deltaY: number },
+	enabled = true,
+): LodStepDir | null {
+	if (!enabled) return null;
 	if (!e.altKey) return null;
 	return e.deltaY > 0 ? -1 : 1;
 }

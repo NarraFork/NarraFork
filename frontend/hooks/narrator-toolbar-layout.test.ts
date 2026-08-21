@@ -49,6 +49,16 @@ describe("mergeToolbarLayout", () => {
 		expect(flat.indexOf("browser")).toBeLessThan(flat.indexOf(NARRATOR_TOOLBAR_DIVIDER_ID));
 	});
 
+	it("surfaces the lodlevel entry for layouts saved before it existed", () => {
+		// `lodlevel` ships as the Alt-gesture-independent detail-level entry point;
+		// existing users (no stored id) must get it surfaced, not tucked away.
+		const merged = mergeToolbarLayout({
+			items: [{ id: "git" }, { id: NARRATOR_TOOLBAR_DIVIDER_ID }],
+		});
+		const flat = ids(merged);
+		expect(flat.indexOf("lodlevel")).toBeLessThan(flat.indexOf(NARRATOR_TOOLBAR_DIVIDER_ID));
+	});
+
 	it("drops unknown ids rather than resurrecting a removed feature", () => {
 		const merged = mergeToolbarLayout({
 			items: [{ id: "git" }, { id: "mock-stream-debug" }, { id: NARRATOR_TOOLBAR_DIVIDER_ID }],
@@ -155,7 +165,9 @@ describe("partitionToolbar", () => {
 			hostCapabilities: ["inline"],
 			visibleLimit: null,
 		});
-		expect([...visible, ...overflow].map((d) => d.id)).toEqual(["device"]);
+		// `lodlevel` (detail-level menu) and `device` are self-contained inline
+		// controls; everything else needs a panel surface.
+		expect([...visible, ...overflow].map((d) => d.id)).toEqual(["lodlevel", "device"]);
 	});
 
 	it("treats a zero cap as everything tucked", () => {

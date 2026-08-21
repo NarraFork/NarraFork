@@ -729,7 +729,12 @@ function SubagentBody({
 							style={{
 								marginTop: PROMPT_BODY_MARGIN_TOP,
 								maxHeight: measured.promptBlockHeight - PROMPT_TOGGLE_ROW_HEIGHT - BLOCK_PADDING_X,
-								overflow: "auto",
+								// The chunked ContentViewer's axis policy: a wrapped body has
+								// nothing to scroll to horizontally, so `overflowX: auto` would
+								// only turn a paint artifact into a scrollbar covering a short
+								// body (see CappedBodyBox). Unwrapped scrolls horizontally.
+								overflowY: "auto",
+								overflowX: promptWrapped ? "hidden" : "auto",
 								// Wrap only changes the scroll axis: the box height is already
 								// fixed by measure-subagent's prompt cap.
 								...(promptWrapped ? { whiteSpace: "pre-wrap" } : { whiteSpace: "pre" }),
@@ -838,7 +843,11 @@ function SubagentBody({
 					<div
 						style={{
 							maxHeight: measured.resultBlockHeight - BLOCK_PADDING_X,
-							overflow: "auto",
+							// A markdown body is always wrapped (rendered form wraps by
+							// construction, the source view is `pre-wrap`), so horizontal
+							// overflow is a paint artifact, never content to scroll to.
+							overflowY: "auto",
+							overflowX: "hidden",
 							paddingInline: RESULT_MD_PADDING_INLINE,
 							paddingBlock: RESULT_MD_PADDING_BLOCK,
 							boxSizing: "border-box",

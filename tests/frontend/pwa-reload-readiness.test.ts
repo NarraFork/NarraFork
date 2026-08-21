@@ -1,8 +1,44 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import {
+	consumeStartupRecoveryFailure,
 	isUpdatedServerReadyForReload,
+	stashStartupRecoveryFailure,
 	waitForUpdatedServerAndReload,
 } from "../../frontend/lib/pwa";
+
+// bun test has no DOM, so the hand-off store needs a stub. Without one the helpers would fall
+// into their own catch blocks and return null, making the round-trip assertions vacuous.
+const globalObject = globalThis as typeof globalThis & { sessionStorage?: Storage };
+const originalSessionStorage = globalObject.sessionStorage;
+let storedValues = new Map<string, string>();
+
+beforeEach(() => {
+	storedValues = new Map();
+	Object.defineProperty(globalObject, "sessionStorage", {
+		configurable: true,
+		value: {
+			get length() {
+				return storedValues.size;
+			},
+			clear: () => storedValues.clear(),
+			getItem: (key: string) => storedValues.get(key) ?? null,
+			key: (index: number) => [...storedValues.keys()][index] ?? null,
+			removeItem: (key: string) => storedValues.delete(key),
+			setItem: (key: string, value: string) => storedValues.set(key, value),
+		} satisfies Storage,
+	});
+});
+
+afterAll(() => {
+	if (originalSessionStorage === undefined) {
+		Reflect.deleteProperty(globalObject, "sessionStorage");
+	} else {
+		Object.defineProperty(globalObject, "sessionStorage", {
+			configurable: true,
+			value: originalSessionStorage,
+		});
+	}
+});
 
 describe("isUpdatedServerReadyForReload", () => {
 	test("waits when the server is unreachable", () => {
@@ -61,12 +97,48 @@ describe("isUpdatedServerReadyForReload", () => {
 		).toBe(false);
 	});
 
-	test("keeps waiting on a failed readiness so the update UI can surface the error", () => {
+	test("reloads into the new build even when startup recovery failed", () => {
+		// A failed recovery does NOT make the replacement unusable: the server keeps serving every
+		// route (`shouldServeRequests` is unconditionally true) precisely so the settings UI can
+		// repair whatever broke it. Blocking here pinned the user to the old bundle, which is the
+		// one place that repair UI does not exist.
 		expect(
 			isUpdatedServerReadyForReload(
 				{ status: "failed", version: "0.2.0", readiness: "failed" },
 				"0.2.0",
 			),
+		).toBe(true);
+	});
+
+	test("still refuses a failed server that is not the target build", () => {
+		// Version identity remains the only gate: a failed OLD process must never be reloaded into.
+		expect(
+			isUpdatedServerReadyForReload(
+				{ status: "failed", version: "0.1.0", readiness: "failed" },
+				"0.2.0",
+			),
 		).toBe(false);
+	});
+});
+
+describe("startup recovery failure hand-off across the reload", () => {
+	test("round-trips a reason and clears it so it is announced only once", () => {
+		stashStartupRecoveryFailure('Provider "muyuan" is not configured.');
+		expect(consumeStartupRecoveryFailure()).toBe('Provider "muyuan" is not configured.');
+		// A manual refresh must not re-announce a failure the user already saw.
+		expect(consumeStartupRecoveryFailure()).toBeNull();
+	});
+
+	test("distinguishes a reasonless failure from no failure at all", () => {
+		// An empty string still means "recovery failed", so the banner must render; null means
+		// nothing failed. Collapsing the two would silently hide the failure.
+		stashStartupRecoveryFailure(undefined);
+		expect(consumeStartupRecoveryFailure()).toBe("");
+		expect(consumeStartupRecoveryFailure()).toBeNull();
+	});
+
+	test("treats a blank reason as reasonless rather than reporting whitespace", () => {
+		stashStartupRecoveryFailure("   ");
+		expect(consumeStartupRecoveryFailure()).toBe("");
 	});
 });

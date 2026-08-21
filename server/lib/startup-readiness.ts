@@ -63,9 +63,14 @@ export function buildHealthPayload(
 /**
  * HTTP status for `/api/health`.
  *
- * A failed recovery still reports 503 so update polling (`waitForUpdatedServerAndReload`) and
- * external monitors can distinguish "this build came up healthy" from "this build came up with
- * broken narrator state". Only health is degraded; other routes answer normally.
+ * A failed recovery still reports 503 so external monitors can distinguish "this build came up
+ * healthy" from "this build came up with broken narrator state". Only health is degraded; other
+ * routes answer normally.
+ *
+ * This status is NOT a signal to withhold the new build from the user. Update polling reloads on
+ * version identity alone and merely reports the reason afterwards (see
+ * `isUpdatedServerReadyForReload`), because treating 503 as "do not reload" stranded the user on
+ * the old bundle — the one build without the UI that repairs the broken narrator state.
  */
 export function healthStatusCode(state: StartupRecoveryState, baseStatus: number): number {
 	return state.status === "failed" ? 503 : baseStatus;

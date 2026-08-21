@@ -212,7 +212,9 @@ describe("PretextExactMessageList", () => {
 		expect(source).toContain("pruneBoundaryMessageId: pretextDocument.pruneBoundaryMessageId");
 		expect(source).toContain("prunedPercent: pretextDocument.prunedPercent");
 		expect(source).toContain("onPruneBoundary: bumpMessageRevision");
-		expect(source).toContain("resolveWheelLodStep(event)");
+		// The alt-gesture preference is threaded through so the wheel handler can
+		// fall through to normal scrolling when the gesture is turned off.
+		expect(source).toContain("resolveWheelLodStep(event, lodAltGesture)");
 		expect(source).toContain("resolvePinchLodStep(distance / pinchBaseline)");
 		expect(source).not.toContain("computeSparseBandSpacers");
 		expect(source).not.toContain("bandHeights");

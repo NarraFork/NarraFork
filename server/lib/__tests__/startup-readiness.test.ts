@@ -54,7 +54,9 @@ describe("startup readiness health payload", () => {
 		expect("recoveryError" in payload).toBe(false);
 	});
 
-	test("surfaces the recovery error so update polling can stop", () => {
+	// The reason must reach the client because the update flow reloads into this build anyway and
+	// reports the failure afterwards. It is diagnostic payload, not a signal to withhold the build.
+	test("surfaces the recovery error so the client can report it", () => {
 		expect(buildHealthPayload({ status: "ok" }, { status: "failed", error: "boom" })).toEqual({
 			status: "failed",
 			readiness: "failed",

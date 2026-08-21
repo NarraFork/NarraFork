@@ -41,6 +41,7 @@ mock.module("@frontend/hooks/usePlatform", () => ({
 const {
 	InjectionSpeakerHeader,
 	injectInjectionBubbleChrome,
+	isKnowledgeSource,
 	isPlatformSource,
 	speakerTint,
 }: typeof import("./vlist-injection-header") = await import("./vlist-injection-header");
@@ -175,6 +176,62 @@ describe("InjectionSpeakerHeader — identity resolution", () => {
 		});
 		expect(text).toContain("primary");
 		expect(text).toContain("sidecar.body.messageBroadcast");
+	});
+});
+
+/**
+ * A cited knowledge ENTRY is a document, not a participant.
+ *
+ * The regression this pins: a knowledge hit arrives with `speakerId` set to the entry id,
+ * exactly like a subagent arrives with its narrator id — so it fell into the identicon
+ * branch and every injected entry wore a randomly-generated glyph. An identicon is this
+ * app's mark for "somebody with their own session", and its pattern says nothing a reader
+ * can act on, while the entry already has a recognizable icon on every other knowledge
+ * surface.
+ */
+describe("InjectionSpeakerHeader — a knowledge hit is a document, not a speaker", () => {
+	test("an injected entry shows an icon, not a generated identicon", () => {
+		renderHeader({
+			speaker: "charge_manager 日志说明",
+			speakerId: "k-entry-1",
+			source: "knowledge_base_hint",
+		});
+		const container = currentContainer;
+		if (!container) throw new Error("expected a rendered container");
+		// The identicon is an <img> with an inline SVG data URI; an icon glyph is not an <img>.
+		expect(container.querySelector('img[src^="data:image/svg+xml"]')).toBeNull();
+		expect(container.querySelectorAll("img").length).toBe(0);
+		// The entry title still names the row, so the reader knows WHICH entry was cited.
+		expect(container.textContent ?? "").toContain("charge_manager 日志说明");
+	});
+
+	test("a subagent with the same shape still gets its identicon", () => {
+		// The contrast that keeps the knowledge rule meaningful rather than arbitrary: the
+		// only difference between these two rows is the producer tag.
+		renderHeader({ speaker: "explore-1", speakerId: "narr-1", source: "subagent_message" });
+		const container = currentContainer;
+		if (!container) throw new Error("expected a rendered container");
+		expect(container.querySelector('img[src^="data:image/svg+xml"]')).not.toBeNull();
+	});
+});
+
+describe("isKnowledgeSource", () => {
+	test("recognizes the knowledge-hint producer", () => {
+		expect(isKnowledgeSource("knowledge_base_hint")).toBe(true);
+	});
+
+	test("claims nothing else, and never the platform or an agent", () => {
+		for (const source of ["subagent_message", "bg_bash", "living_work_spec", "team_message"]) {
+			expect(isKnowledgeSource(source)).toBe(false);
+		}
+		expect(isKnowledgeSource(null)).toBe(false);
+		expect(isKnowledgeSource(undefined)).toBe(false);
+	});
+
+	test("is not a platform source: a cited entry is not NarraFork speaking", () => {
+		// If it leaked into PLATFORM_SOURCES the row would be renamed "System" and lose the
+		// entry title, which is the one thing the reader needs from it.
+		expect(isPlatformSource("knowledge_base_hint")).toBe(false);
 	});
 });
 

@@ -9,6 +9,11 @@
  * Does NOT replicate the full tab structure of the standalone route. Only shows
  * the content body with a "open in full page" action.
  *
+ * ⚠️ The body field differs per scope (`currentContent` on a global entry vs
+ * `content` on a personal one) — see `knowledge-entry-fields.ts`, which owns
+ * that discrimination. Reading `content` for both is what made every global
+ * entry render as "(empty)".
+ *
  * Dirty state is tracked to prevent silent data loss when the panel is closed
  * or the entry changes. The save-race pattern from SpecPanel is replicated:
  * `editVersionRef` ensures a save that completes while the user kept editing
@@ -41,6 +46,11 @@ import {
 } from "../../../hooks/useKnowledge";
 import { MarkdownContent } from "../MarkdownContent";
 import type { KnowledgeEntryScope } from "../panels/panel-kind";
+import {
+	canEditKnowledgeEntry,
+	knowledgeEntryContent,
+	knowledgeEntryTitle,
+} from "./knowledge-entry-fields";
 
 export interface KnowledgeEntryPanelContentProps {
 	entryId: string;
@@ -66,7 +76,7 @@ export function KnowledgeEntryPanelContent({
 
 	// ── Permission check ──
 	const { data: user } = useCurrentUser();
-	const canEdit = computeCanEdit(scope, entryData, user);
+	const canEdit = canEditKnowledgeEntry(scope, entryData, user);
 
 	// ── Edit state ──
 	const [editing, setEditing] = useState(false);
@@ -80,7 +90,7 @@ export function KnowledgeEntryPanelContent({
 	const isSaving = addRevision.isPending || updatePersonal.isPending;
 
 	// Sync content from server when not dirty
-	const serverContent = extractContent(scope, entryData);
+	const serverContent = knowledgeEntryContent(scope, entryData);
 	useEffect(() => {
 		if (!dirty && serverContent != null) {
 			setEditContent(serverContent);
@@ -159,7 +169,7 @@ export function KnowledgeEntryPanelContent({
 		);
 	}
 
-	const title = extractTitle(scope, entryData);
+	const title = knowledgeEntryTitle(scope, entryData) ?? t("panel.title");
 
 	return (
 		<Box style={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -225,38 +235,4 @@ export function KnowledgeEntryPanelContent({
 			</Box>
 		</Box>
 	);
-}
-
-// ── Helpers ──
-
-function computeCanEdit(
-	scope: KnowledgeEntryScope,
-	// biome-ignore lint/suspicious/noExplicitAny: entry shape varies by scope
-	entryData: any,
-	// biome-ignore lint/suspicious/noExplicitAny: user entity
-	user: any,
-): boolean {
-	if (!entryData || !user) return false;
-	if (scope === "personal") return true; // personal entries are always editable by the owner
-	// Global: admin or owner
-	return user.role === "admin" || entryData.ownerUserId === user.id;
-}
-
-function extractContent(
-	_scope: KnowledgeEntryScope,
-	// biome-ignore lint/suspicious/noExplicitAny: entry shape varies
-	entryData: any,
-): string | null {
-	if (!entryData) return null;
-	// Both global and personal entries store body in `content`
-	return entryData.content ?? null;
-}
-
-function extractTitle(
-	_scope: KnowledgeEntryScope,
-	// biome-ignore lint/suspicious/noExplicitAny: entry shape varies
-	entryData: any,
-): string {
-	if (!entryData) return "Knowledge";
-	return entryData.title ?? "Knowledge";
 }

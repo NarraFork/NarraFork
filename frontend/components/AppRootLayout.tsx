@@ -104,6 +104,7 @@ import { NavUserMenu } from "./nav/NavUserMenu";
 import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
 import { useNavBadges } from "./nav/use-nav-badges";
+import { StartupRecoveryAlert } from "./StartupRecoveryAlert";
 import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
@@ -1034,6 +1035,7 @@ function AuthenticatedLayout() {
 				style={{ paddingBottom: APP_SHELL_MAIN_PADDING_BOTTOM }}
 			>
 				<GitMissingAlert />
+				<StartupRecoveryAlert />
 				<Outlet />
 			</AppShell.Main>
 

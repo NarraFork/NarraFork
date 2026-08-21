@@ -23,7 +23,7 @@ import {
 	type InjectionTarget,
 } from "@shared/pretext-layout/injection-target";
 import { PLATFORM_INJECTION_SOURCES as ADAPTER_PLATFORM_SOURCES } from "@shared/pretext-layout/segment-adapter";
-import { IconChecklist, IconSparkles, IconTerminal2 } from "@tabler/icons-react";
+import { IconBook2, IconChecklist, IconSparkles, IconTerminal2 } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { VListElementKind } from "./registry";
@@ -124,6 +124,26 @@ export function isSpecSource(source: string | null | undefined): boolean {
 	return !!source && SPEC_SOURCES.has(source);
 }
 
+/**
+ * Producers whose "speaker" is a knowledge-base ENTRY, not an agent.
+ *
+ * A knowledge hit reaches this header with a `speakerId` (the entry id) exactly like a
+ * subagent does, so it used to land in the identicon branch — every injected entry wore a
+ * randomly-generated glyph. That claims the wrong thing twice over: an identicon is this
+ * app's mark for "a participant with its own session", and the pattern itself carries no
+ * meaning a reader can use, while the object being cited already HAS a recognizable icon
+ * everywhere else it appears (the nav item, the entry cards, the knowledge panel tab).
+ *
+ * So this is the same rule `bg_bash` follows — a non-participant gets its object's glyph
+ * rather than an invented identity — and the glyph is chosen to match the knowledge
+ * surfaces the row links to.
+ */
+const KNOWLEDGE_SOURCES = new Set(["knowledge_base_hint"]);
+
+export function isKnowledgeSource(source: string | null | undefined): boolean {
+	return !!source && KNOWLEDGE_SOURCES.has(source);
+}
+
 export function InjectionSpeakerHeader({
 	speaker,
 	speakerId,
@@ -137,8 +157,10 @@ export function InjectionSpeakerHeader({
 	speaker?: string | null;
 	/**
 	 * The speaker's own id (a subagent narrator id, a background task id, a knowledge
-	 * entry id) — the identicon seed. Absent for the platform and for real accounts,
-	 * which have their own avatar treatments.
+	 * entry id). Seeds the identicon ONLY for producers that are actual participants —
+	 * a command (`bg_bash`) and a document (`knowledge_base_hint`) carry an id too but
+	 * are routed to their object's glyph instead. Absent for the platform and for real
+	 * accounts, which have their own avatar treatments.
 	 */
 	speakerId?: string | null;
 	/**
@@ -240,6 +262,18 @@ export function InjectionSpeakerHeader({
 				>
 					{isSpecSource(source) ? <IconChecklist size={12} /> : <IconSparkles size={12} />}
 				</ThemeIcon>
+			) : isKnowledgeSource(source) ? (
+				/*
+				 * A cited knowledge ENTRY, which is a document rather than a participant.
+				 *
+				 * Same glyph and accent the knowledge surfaces use for a global entry (the
+				 * entry cards on `/knowledge`, the knowledge panel tab this row opens), so
+				 * the reader recognizes the object instead of decoding a random identicon
+				 * pattern that means nothing.
+				 */
+				<ThemeIcon size={20} radius="sm" variant="light" color="blue">
+					<IconBook2 size={12} />
+				</ThemeIcon>
 			) : source === "bg_bash" ? (
 				/*
 				 * A finished background command is TOOL OUTPUT, not a participant. Giving it
@@ -252,8 +286,9 @@ export function InjectionSpeakerHeader({
 					<IconTerminal2 size={12} />
 				</ThemeIcon>
 			) : speakerId ? (
-				// An agent / task / entry that has its own id: the deterministic identicon,
-				// which stays distinct where initials collide.
+				// An AGENT with its own session id: the deterministic identicon, which stays
+				// distinct where initials collide. Non-participants (a command, a document)
+				// are routed to their object's glyph above rather than reaching this branch.
 				<NarratorAvatar narratorId={speakerId} title={name} size={20} showTooltip={false} />
 			) : (
 				// No id to key a glyph on: fall back to initials rather than inventing one.

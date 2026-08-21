@@ -943,6 +943,12 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		// Reading-width preference: OFF (default) fills the viewport, ON caps the
 		// content column at a centered reading width (same option the vlist reads).
 		const [centeredColumn] = useLocalPref("narrafork_narrator_centered_column");
+		// Alt+wheel LOD stepping (see useLocalPref for why it's opt-out). Read through
+		// a ref because the input-handler effect registers once with `[]` deps; a ref
+		// keeps the toggle live without tearing down every scroll listener.
+		const [lodAltGesture] = useLocalPref("narrafork_lod_alt_gesture");
+		const lodAltGestureRef = useRef(lodAltGesture);
+		lodAltGestureRef.current = lodAltGesture;
 		const contentColumnStyle = useMemo(
 			() => ({
 				padding: CONTENT_PADDING,
@@ -1948,7 +1954,9 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			const onWheel = (e: WheelEvent) => {
 				// Alt+wheel steps the render LOD instead of scrolling. Non-passive so we
 				// can suppress the scroll; detached-from-bottom logic is skipped.
-				if (e.altKey) {
+				// With the gesture turned off, fall through to the normal scroll path
+				// (no preventDefault) so alt+wheel scrolls like a plain wheel.
+				if (e.altKey && lodAltGestureRef.current) {
 					e.preventDefault();
 					stepLod(e.deltaY > 0 ? -1 : 1, e.clientX, e.clientY);
 					return;

@@ -1,5 +1,4 @@
 import { existsSync } from "node:fs";
-import { networkInterfaces } from "node:os";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -19,6 +18,7 @@ import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
+import { getLanAddresses } from "../lib/net/lan-addresses";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
@@ -783,23 +783,6 @@ function maskSearchSettings(search: NarraForkSettings["search"]): NarraForkSetti
 			),
 		})),
 	};
-}
-
-/** Get RFC 1918 private IPv4 addresses from network interfaces. */
-function getLanAddresses(): string[] {
-	const nets = networkInterfaces();
-	const result: string[] = [];
-	for (const ifaces of Object.values(nets)) {
-		for (const iface of ifaces ?? []) {
-			if (iface.internal || iface.family !== "IPv4") continue;
-			const a = iface.address;
-			// RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-			if (a.startsWith("10.") || a.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(a)) {
-				result.push(a);
-			}
-		}
-	}
-	return result;
 }
 
 function isWildcardListenHost(host: string): boolean {
@@ -1646,10 +1629,16 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 	}),
 );
 
-// Generate a self-signed TLS certificate and enable HTTPS
+// Generate a TLS certificate and enable HTTPS.
+//
+// Compatibility shim over the CA flow in routes/tls.ts: existing clients (and
+// the setup wizard) still call this endpoint, so it now issues a CA-signed
+// certificate exactly like POST /api/settings/tls/generate, keeping the
+// original response shape plus the new SAN fields.
 settingsRoutes.post("/generate-tls", requireAdmin, async (c) => {
-	const { generateSelfSignedCert } = await import("../lib/tls");
-	const result = await generateSelfSignedCert();
+	const { ensureCa, issueServerCert } = await import("../lib/tls");
+	const ca = await ensureCa();
+	const result = await issueServerCert();
 
 	// Update settings to enable TLS with generated cert paths
 	const current = settings;
@@ -1676,6 +1665,11 @@ settingsRoutes.post("/generate-tls", requireAdmin, async (c) => {
 		certPath: result.certPath,
 		keyPath: result.keyPath,
 		expiresAt: result.expiresAt,
+		effectiveSans: result.effectiveSans,
+		customSans: result.customSans,
+		autoSans: result.autoSans,
+		caCreated: ca.created,
+		caExpiresAt: ca.expiresAt,
 		newUrl,
 		serverRestarting: true,
 	});

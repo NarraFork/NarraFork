@@ -111,7 +111,10 @@ describe("a plain row's source view cannot resize the row", () => {
 		const body = src.slice(start, src.indexOf("\n/**", start));
 		// Height comes from the caller (the measured frame), never from the content.
 		expect(body).toContain("height,");
-		expect(body).toContain('overflow: "auto"');
+		expect(body).toContain('overflowY: "auto"');
+		// The source is pre-wrap, so horizontal overflow is a paint artifact, never
+		// content — the wrapped state of every body box is `overflowX: hidden`.
+		expect(body).toContain('overflowX: "hidden"');
 		// No growth escape hatches: either of these would let the text set the height.
 		expect(body).not.toContain("minHeight");
 		expect(body).not.toContain("maxHeight");

@@ -23,13 +23,21 @@ function normalizeVersion(version: string | undefined): string | undefined {
 /**
  * Decide whether the polled server is the updated build we can reload into.
  *
- * The replacement binary starts serving (its reported version flips to the new one) as soon as
- * it binds the port, even while it finishes background narrator-continuation recovery. During
- * that window the health endpoint reports `status: "recovering"` rather than `"ok"`. Recovery is
- * a backend concern and must not block loading the new frontend bundle, so a `recovering` server
- * is reloadable AS LONG AS we can prove it is the target build. Without an explicit target
- * version, automatic reload is unsafe because a still-running old server is indistinguishable
- * from the replacement.
+ * Version identity is the entire question. The replacement binary starts serving as soon as it
+ * binds the port and reports the new version immediately, so a version match is what proves the
+ * replacement — not the old process — is the one answering. Without an explicit target version
+ * automatic reload is unsafe, because a still-running old server is indistinguishable from it.
+ *
+ * Recovery state deliberately does NOT gate the reload, in any of its values:
+ *   - `recovering` finishes in the background and only concerns backend continuations;
+ *   - `failed` means some narrator could not be restored (typically pinned to a provider prefix
+ *     that no longer exists in settings).
+ *
+ * Neither makes the HTTP surface unusable. The server is explicit about this: `shouldServeRequests`
+ * is unconditionally true so the frontend, auth and settings routes stay reachable, precisely
+ * because those are what repair the state that made recovery fail. Blocking the reload here
+ * inverted that policy — the new server was already up and serving while the user stayed pinned
+ * to the old bundle by the very error the new UI is needed to fix.
  */
 export function isUpdatedServerReadyForReload(
 	health: ServerHealth | null,
@@ -37,15 +45,40 @@ export function isUpdatedServerReadyForReload(
 ): boolean {
 	const normalizedTarget = normalizeVersion(targetVersion);
 	if (!health || !normalizedTarget) return false;
-	if (health.status === "failed" || health.readiness === "failed") return false;
-	const serverVersion = normalizeVersion(health.version);
-	if (serverVersion !== normalizedTarget) return false;
-	return (
-		health.status === "ok" ||
-		health.status === "recovering" ||
-		health.readiness === "ready" ||
-		health.readiness === "recovering"
-	);
+	return normalizeVersion(health.version) === normalizedTarget;
+}
+
+const STARTUP_RECOVERY_FAILURE_KEY = "narrafork_startup_recovery_failure";
+
+/**
+ * Carry a failed-recovery reason across the reload into the updated build.
+ *
+ * `sessionStorage` is scoped to this tab and survives exactly one reload, which matches the
+ * lifetime of the message. The alternative — reporting the failure in the update dialog and
+ * refusing to reload — kept the user on a bundle that cannot reach the repair UI.
+ */
+export function stashStartupRecoveryFailure(reason: string | undefined): void {
+	try {
+		sessionStorage.setItem(STARTUP_RECOVERY_FAILURE_KEY, reason?.trim() || "");
+	} catch {
+		// A blocked or full sessionStorage must not prevent the reload; the failure is also
+		// reported over WS and remains visible in the settings migration screen.
+	}
+}
+
+/**
+ * Read and clear the stashed reason. Returns null when startup recovery did not fail, and an
+ * empty string when it failed without a reported reason, so the caller can still say so.
+ */
+export function consumeStartupRecoveryFailure(): string | null {
+	try {
+		const stored = sessionStorage.getItem(STARTUP_RECOVERY_FAILURE_KEY);
+		if (stored === null) return null;
+		sessionStorage.removeItem(STARTUP_RECOVERY_FAILURE_KEY);
+		return stored;
+	} catch {
+		return null;
+	}
 }
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -134,6 +167,11 @@ export async function clearPwaCacheAndReload(): Promise<void> {
 /**
  * Poll the backend until the updated server is responding, then clear stale PWA
  * state and reload into the new frontend bundle.
+ *
+ * A failed startup recovery is reported but never blocks the reload — see
+ * `isUpdatedServerReadyForReload`. The reason is stashed first so it survives the reload that
+ * is about to discard this page; otherwise letting the reload through would silently drop the
+ * only explanation the user ever gets.
  */
 export async function waitForUpdatedServerAndReload({
 	targetVersion,
@@ -150,10 +188,10 @@ export async function waitForUpdatedServerAndReload({
 	while (!signal?.aborted) {
 		const health = await fetchServerHealth(requestTimeoutMs, signal);
 		if (signal?.aborted) return;
-		if (health?.status === "failed" || health?.readiness === "failed") {
-			throw new Error(health.recoveryError || "Updated server startup recovery failed.");
-		}
 		if (isUpdatedServerReadyForReload(health, normalizedTarget)) {
+			if (health?.readiness === "failed" || health?.status === "failed") {
+				stashStartupRecoveryFailure(health?.recoveryError);
+			}
 			await clearPwaCacheAndReload();
 			return;
 		}

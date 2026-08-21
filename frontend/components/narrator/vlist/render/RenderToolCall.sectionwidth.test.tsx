@@ -82,18 +82,30 @@ function render(node: ReactNode): Element {
 	return document.getElementById("r") as unknown as Element;
 }
 
-/** Every `overflow: auto` scroll box paired with the width of its painted child. */
-function scrollBoxes(root: Element): Array<{ box: string; childWidth: number | null }> {
-	const out: Array<{ box: string; childWidth: number | null }> = [];
+/** Every `overflow` scroll box paired with the width of its painted child. */
+function scrollBoxes(root: Element): Array<{ style: string; childWidth: number | null }> {
+	const out: Array<{ style: string; childWidth: number | null }> = [];
 	for (const el of Array.from(root.querySelectorAll("div"))) {
 		const style = el.getAttribute("style") ?? "";
-		if (!/overflow:\s*auto/.test(style)) continue;
+		if (!/overflow(-[xy])?:\s*(auto|hidden)/.test(style) || !/overflow-y:\s*auto/.test(style))
+			continue;
 		const child = el.firstElementChild;
 		const childStyle = child?.getAttribute("style") ?? "";
 		const match = /(?:^|;)\s*width:\s*([\d.]+)px/.exec(childStyle);
-		out.push({ box: style, childWidth: match ? Number(match[1]) : null });
+		out.push({ style, childWidth: match ? Number(match[1]) : null });
 	}
 	return out;
+}
+
+/** Wrap controls pinned to one state, so a body's axis policy is observable. */
+function wrapControls(isWrapped: boolean): import("../VListContentViewHost").VListViewControls {
+	return {
+		isWrapped: () => isWrapped,
+		isSourceShown: () => false,
+		toggleWrap: () => {},
+		toggleSource: () => {},
+		openFullscreen: () => {},
+	};
 }
 
 describe("a section's markdown body is painted at its wrap width", () => {
@@ -151,5 +163,81 @@ describe("a section's markdown body is painted at its wrap width", () => {
 		const section = measured.detail?.sections?.at(-1);
 		expect(section?.markdown).toBe(false);
 		expect(section?.bodyContentWidth).toBe(measured.detail?.contentWidth);
+	});
+});
+
+/**
+ * The second half of the fix: a WRAPPED body never needs horizontal scrolling, so
+ * its box must not offer it. With both axes on `overflow: auto`, ANY horizontal
+ * overflow summons a scrollbar — and a short body has real overflow sources that
+ * are NOT content: a wrap point keeps its trailing space, and the fragments paint
+ * with `white-space: pre`, so the line's max-content is a few px wider than the
+ * reserved width. The result was a ~12px bar covering almost all of a ~24px box —
+ * the failed WebSearch card from the bug report.
+ *
+ * The policy is the chunked ContentViewer's own (`wrapStyle`): wrapped →
+ * `overflowX: hidden`, unwrapped → `overflowX: auto`.
+ */
+describe("a wrapped body box never offers horizontal scrolling", () => {
+	it("the markdown output box scrolls vertically only", () => {
+		const measured = measureCard(markdownOutputSections("Search error: Tool returned no results"));
+		const boxes = scrollBoxes(render(<RenderToolCall measured={measured} />));
+		expect(boxes).toHaveLength(1);
+		expect(boxes[0]?.style).toContain("overflow-y:auto");
+		expect(boxes[0]?.style).toContain("overflow-x:hidden");
+	});
+
+	it("a WRAPPED plain capped body hides the horizontal axis", () => {
+		const measured = measureCard([
+			{ label: "output", body: { kind: "capped", cap: "code", contentLines: 1, text: "plain" } },
+		]);
+		const targets = [
+			{
+				id: "tool-x:s0",
+				slot: "s0",
+				kind: "code" as const,
+				text: "plain",
+			},
+		];
+		const boxes = scrollBoxes(
+			render(
+				<RenderToolCall
+					measured={measured}
+					viewTargets={targets}
+					viewControls={wrapControls(true)}
+				/>,
+			),
+		);
+		expect(boxes).toHaveLength(1);
+		expect(boxes[0]?.style).toContain("overflow-y:auto");
+		expect(boxes[0]?.style).toContain("overflow-x:hidden");
+	});
+
+	it("an UNWRAPPED plain capped body keeps its horizontal scrollbar", () => {
+		// The policy must not overshoot: with wrap off the reader scrolled
+		// horizontally ON PURPOSE, and the whole point of `pre` is long lines.
+		const measured = measureCard([
+			{ label: "output", body: { kind: "capped", cap: "code", contentLines: 1, text: "plain" } },
+		]);
+		const targets = [
+			{
+				id: "tool-x:s0",
+				slot: "s0",
+				kind: "code" as const,
+				text: "plain",
+			},
+		];
+		const boxes = scrollBoxes(
+			render(
+				<RenderToolCall
+					measured={measured}
+					viewTargets={targets}
+					viewControls={wrapControls(false)}
+				/>,
+			),
+		);
+		expect(boxes).toHaveLength(1);
+		expect(boxes[0]?.style).toContain("overflow-y:auto");
+		expect(boxes[0]?.style).toContain("overflow-x:auto");
 	});
 });

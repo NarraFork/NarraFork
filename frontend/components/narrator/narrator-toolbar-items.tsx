@@ -21,6 +21,7 @@ import {
 	type NarratorToolbarId,
 } from "@shared/narrator-toolbar";
 import {
+	IconBaselineDensityMedium,
 	IconDeviceDesktop,
 	IconFileCode,
 	IconGitBranch,
@@ -138,6 +139,14 @@ const TOOLBAR_ITEM_DETAILS: Record<NarratorToolbarId, Omit<NarratorToolbarItemDe
 		icon: IconMessages,
 		hosts: ["dock", "drawer"],
 		badge: "userChatUnread",
+	},
+	lodlevel: {
+		labelKey: "lodDensity",
+		icon: IconBaselineDensityMedium,
+		// A Menu of detail levels; no host surface required, so it works even in
+		// the lightweight workspace preview (whose only capability is "inline").
+		hosts: ["inline"],
+		selfContained: true,
 	},
 	device: {
 		labelKey: "executionDeviceSelector",

@@ -153,7 +153,10 @@ describe("plain markdown rows honour the source toggle", () => {
 		expect(pxOf(box, "height")).toBeCloseTo(rendered.predictedHeight, 1);
 		expect(pxOf(box, "width")).toBeCloseTo(CONTENT_WIDTH, 1);
 		// Overflow scrolls inside the reserved box rather than growing it.
-		expect(box.getAttribute("style")).toMatch(/overflow:\s*auto/);
+		// Vertical-only: the source is pre-wrap, so horizontal overflow is a paint
+		// artifact and must not summon a scrollbar.
+		expect(box.getAttribute("style")).toMatch(/overflow-y:\s*auto/);
+		expect(box.getAttribute("style")).toMatch(/overflow-x:\s*hidden/);
 
 		rendered.unmount();
 		source.unmount();

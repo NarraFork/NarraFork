@@ -259,6 +259,7 @@ import {
 	type NarratorComposerHandle,
 	type NarratorRemoteDraft,
 } from "./NarratorComposer";
+import { NarratorLodMenu } from "./NarratorLodMenu";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import {
@@ -3085,7 +3086,13 @@ export function NarratorPanel({
 	// The message area box — the LOD indicator's containing block, and the hover
 	// region that decides whether holding Alt targets THIS panel.
 	const messageAreaRef = useRef<HTMLDivElement>(null);
-	const lodIndicatorPinned = useLodIndicatorTrigger(messageAreaRef, !isWorkspacePreview);
+	// Holding Alt reveals the indicator only while the Alt gesture is enabled: with
+	// it off, Alt is not an LOD modifier at all, so it must not summon LOD UI.
+	const [lodAltGesture] = useLocalPref("narrafork_lod_alt_gesture");
+	const lodIndicatorPinned = useLodIndicatorTrigger(
+		messageAreaRef,
+		!isWorkspacePreview && lodAltGesture,
+	);
 	// Indicator-driven level pick (notch click or −/+). Unlike the gestures there
 	// is no pointer event to anchor on, so anchor on the indicator's own position
 	// (the middle of the message area) before the rebuild — otherwise picking a
@@ -7087,6 +7094,18 @@ export function NarratorPanel({
 												currentDeviceId={executionDevicesQuery.data?.defaultDeviceId ?? "local"}
 												pending={updateExecutionDeviceMutation.isPending}
 												onSelect={(deviceId) => updateExecutionDeviceMutation.mutate(deviceId)}
+											/>
+										);
+									}
+
+									if (def.id === "lodlevel") {
+										return (
+											<NarratorLodMenu
+												key={def.id}
+												lod={renderLod}
+												isDefault={renderLodIsDefault}
+												onSelectLod={handleSelectLod}
+												onSetAsDefault={setAsDefault}
 											/>
 										);
 									}
