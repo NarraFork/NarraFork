@@ -40,22 +40,26 @@ import {
 	Center,
 	Group,
 	Loader,
+	Modal,
 	NavLink,
 	Paper,
 	Stack,
 	Text,
+	TextInput,
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { RecentTabsDelta as RecentTabsDeltaFrame } from "@shared/recent-tabs";
 import {
+	IconArchive,
 	IconArrowUp,
 	IconBox,
 	IconBrain,
 	IconCheck,
 	IconClock,
 	IconColumns,
+	IconCopy,
 	IconExclamationMark,
 	IconFolder,
 	IconFolderPlus,
@@ -76,6 +80,7 @@ import { useNavigate, useRouterState } from "@tanstack/react-router";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCollapsedTabDirectories } from "../../hooks/useCollapsedTabDirectories";
+import { useArchiveNarrator } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
 import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
@@ -100,12 +105,14 @@ import {
 	selectRecentTabsLiveWindow,
 	shouldApplyRecentTabsRuntimeResponse,
 	snapshotRecentTabRuntimeVersions,
+	updateRecentTabLocal,
 	useRecentTabs,
 } from "../../hooks/useRecentTabs";
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { copyTextToClipboard } from "../../lib/clipboard";
 import { clearFaviconAlert, setFaviconAlert } from "../../lib/favicon";
 import { clearNotifiedAttention, triggerNotification } from "../../lib/notification";
 import { endDrag, moveDrag, startDragManual, startPointerDrag } from "../../lib/panel-drag";
@@ -634,6 +641,7 @@ export function RecentTabList({
 	const navigate = useNavigate();
 	const qc = useQueryClient();
 	const { t } = useTranslation("nav");
+	const { t: tn } = useTranslation("narrator");
 	const requireSetup = useSetupWizardGuard();
 	const pendingKey = usePendingTabKey();
 	const { data: userPrefsForGrouping } = useUserPreferences();
@@ -684,6 +692,13 @@ export function RecentTabList({
 		y: number;
 		tab: RecentTab;
 	} | null>(null);
+
+	// Rename / archive-from-context-menu modal state
+	const [renameTab, setRenameTab] = useState<{ id: string; title: string } | null>(null);
+	const [renameValue, setRenameValue] = useState("");
+	const [renaming, setRenaming] = useState(false);
+	const [archiveConfirmTab, setArchiveConfirmTab] = useState<{ id: string } | null>(null);
+	const archiveNarrator = useArchiveNarrator();
 
 	// Workspace "add narrator" modal state
 	const [wsCreateTarget, setWsCreateTarget] = useState<string | null>(null);
@@ -1289,6 +1304,71 @@ export function RecentTabList({
 		}
 	}, [ctxMenu, fsRevealCapability.supported]);
 
+	/** 复制工作目录到剪贴板（chapter/narrator/subagent） */
+	const handleCopyCwd = useCallback(async () => {
+		if (!ctxMenu) return;
+		const { tab } = ctxMenu;
+		setCtxMenu(null);
+		const dir = await resolveTabDirectory(tab);
+		if (!dir) {
+			notifications.show({ color: "red", message: t("copyCwdNoDir") });
+			return;
+		}
+		try {
+			// 走仓库的剪贴板封装而非直接 navigator.clipboard：私有化部署常以纯 HTTP
+			// 访问，此时 Clipboard API 不存在，封装会回落到临时选中的表单控件。
+			await copyTextToClipboard(dir);
+			notifications.show({ color: "green", message: t("copyCwdSuccess", { path: dir }) });
+		} catch {
+			notifications.show({ color: "red", message: t("copyCwdFailed") });
+		}
+	}, [ctxMenu, resolveTabDirectory, t]);
+
+	/** 打开重命名对话框 */
+	const handleRename = useCallback(() => {
+		if (!ctxMenu) return;
+		const { tab } = ctxMenu;
+		setCtxMenu(null);
+		if (tab.type !== "narrator") return; // 仅叙述者会话可重命名
+		setRenameValue(tab.title || "");
+		setRenameTab({ id: tab.id, title: tab.title || "" });
+	}, [ctxMenu]);
+
+	/** 提交重命名 */
+	const handleRenameSubmit = useCallback(async () => {
+		if (!renameTab) return;
+		const trimmed = renameValue.trim();
+		if (!trimmed || trimmed === renameTab.title) {
+			setRenameTab(null);
+			return;
+		}
+		setRenaming(true);
+		try {
+			await api.updateNarratorTitle(renameTab.id, trimmed);
+			updateRecentTabLocal("narrator", renameTab.id, { title: trimmed });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		} finally {
+			setRenaming(false);
+			setRenameTab(null);
+		}
+	}, [renameTab, renameValue, qc]);
+
+	/** 打开归档确认 */
+	const handleArchive = useCallback(() => {
+		if (!ctxMenu) return;
+		const { tab } = ctxMenu;
+		setCtxMenu(null);
+		if (tab.type !== "narrator") return;
+		setArchiveConfirmTab({ id: tab.id });
+	}, [ctxMenu]);
+
+	/** 执行归档 */
+	const handleArchiveConfirm = useCallback(() => {
+		if (!archiveConfirmTab) return;
+		archiveNarrator.mutate(archiveConfirmTab.id);
+		setArchiveConfirmTab(null);
+	}, [archiveConfirmTab, archiveNarrator]);
+
 	const handleDragCancel = useCallback(() => {
 		endDrag();
 		setOptimisticTabs(null);
@@ -1843,6 +1923,12 @@ export function RecentTabList({
 						ctxMenu.tab.type === "narrator" ||
 						ctxMenu.tab.type === "subagent"
 					}
+					onCopyCwd={handleCopyCwd}
+					canCopyCwd={["chapter", "narrator", "subagent"].includes(ctxMenu.tab.type)}
+					onRename={handleRename}
+					canRename={ctxMenu.tab.type === "narrator"}
+					onArchive={handleArchive}
+					canArchive={ctxMenu.tab.type === "narrator"}
 					isFirst={
 						topLevel.findIndex((t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id) === 0
 					}
@@ -1850,6 +1936,48 @@ export function RecentTabList({
 					t={t}
 				/>
 			)}
+			<Modal
+				opened={!!renameTab}
+				onClose={() => setRenameTab(null)}
+				title={t("rename")}
+				centered
+				size="sm"
+			>
+				<TextInput
+					value={renameValue}
+					onChange={(e) => setRenameValue(e.currentTarget.value)}
+					onKeyDown={(e) => {
+						if (e.key === "Enter") void handleRenameSubmit();
+						if (e.key === "Escape") setRenameTab(null);
+					}}
+					data-autofocus
+				/>
+				<Group justify="flex-end" mt="md">
+					<Button variant="default" onClick={() => setRenameTab(null)}>
+						{t("cancel")}
+					</Button>
+					<Button loading={renaming} onClick={() => void handleRenameSubmit()}>
+						{t("rename")}
+					</Button>
+				</Group>
+			</Modal>
+			<Modal
+				opened={!!archiveConfirmTab}
+				onClose={() => setArchiveConfirmTab(null)}
+				title={tn("archiveNarrator")}
+				centered
+				size="sm"
+			>
+				<Text size="sm">{tn("archiveActiveWarning")}</Text>
+				<Group justify="flex-end" mt="md">
+					<Button variant="default" onClick={() => setArchiveConfirmTab(null)}>
+						{t("cancel")}
+					</Button>
+					<Button color="orange" loading={archiveNarrator.isPending} onClick={handleArchiveConfirm}>
+						{tn("confirmArchive")}
+					</Button>
+				</Group>
+			</Modal>
 			{wsCreateTarget !== null && (
 				<React.Suspense fallback={null}>
 					<CreateNarratorModal
@@ -2880,6 +3008,12 @@ interface TabContextMenuProps {
 	canReveal: boolean;
 	onNewNarratorHere: () => void;
 	canNewNarratorHere: boolean;
+	onCopyCwd: () => void;
+	canCopyCwd: boolean;
+	onRename: () => void;
+	canRename: boolean;
+	onArchive: () => void;
+	canArchive: boolean;
 	isFirst: boolean;
 	isWorkspace: boolean;
 	t: (key: string) => string;
@@ -2897,6 +3031,12 @@ function TabContextMenu({
 	canReveal,
 	onNewNarratorHere,
 	canNewNarratorHere,
+	onCopyCwd,
+	canCopyCwd,
+	onRename,
+	canRename,
+	onArchive,
+	canArchive,
 	isFirst,
 	isWorkspace,
 	t,
@@ -2947,6 +3087,30 @@ function TabContextMenu({
 							<Text size="sm">{t(isWorkspace ? "dissolveWorkspace" : "closeTab")}</Text>
 						</Group>
 					</UnstyledButton>
+					{canCopyCwd && (
+						<UnstyledButton px="xs" py={4} onClick={onCopyCwd} style={{ borderRadius: 4 }}>
+							<Group gap={8} wrap="nowrap">
+								<IconCopy size={14} />
+								<Text size="sm">{t("copyCwd")}</Text>
+							</Group>
+						</UnstyledButton>
+					)}
+					{canRename && (
+						<UnstyledButton px="xs" py={4} onClick={onRename} style={{ borderRadius: 4 }}>
+							<Group gap={8} wrap="nowrap">
+								<IconPencil size={14} />
+								<Text size="sm">{t("rename")}</Text>
+							</Group>
+						</UnstyledButton>
+					)}
+					{canArchive && (
+						<UnstyledButton px="xs" py={4} onClick={onArchive} style={{ borderRadius: 4 }}>
+							<Group gap={8} wrap="nowrap">
+								<IconArchive size={14} />
+								<Text size="sm">{t("archive")}</Text>
+							</Group>
+						</UnstyledButton>
+					)}
 					{canReveal && (
 						<UnstyledButton px="xs" py={4} onClick={onReveal} style={{ borderRadius: 4 }}>
 							<Group gap={8} wrap="nowrap">

@@ -230,3 +230,105 @@ describe("OpenAIProvider chat request formatting", () => {
 		expect(JSON.stringify(body2.input)).toContain('"type":"reasoning"');
 	});
 });
+
+describe("OpenAIProvider empty-content turns", () => {
+	it("does not emit an empty-text input_text item when content is empty (continuation/retry)", async () => {
+		const originalFetch = globalThis.fetch;
+		let capturedBody: Record<string, unknown> | null = null;
+		globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+			const [, init] = args;
+			capturedBody = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null;
+			return createDoneSseResponse();
+		}) as typeof fetch;
+
+		try {
+			// 续跑/重试场景：历史里已有最后一条 user input_text，当前轮没有新内容
+			const history: unknown[] = [
+				{
+					role: "user",
+					content: [{ type: "input_text", text: "Dynamic Spec 自动续跑（系统消息）" }],
+				},
+			];
+			const params: ChatParams = {
+				conversationId: "conv-empty-content",
+				content: "",
+				model: "test:gpt-5",
+				cwd: "/tmp",
+				history,
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+			};
+			for await (const _event of provider.chat(params)) {
+				// Drain stream
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+
+		expect(capturedBody).not.toBeNull();
+		if (!capturedBody) {
+			throw new Error("Expected request body to be captured");
+		}
+		const body = capturedBody as {
+			input?: Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
+		};
+		const input = body.input ?? [];
+		// 历史那条 user 消息必须保留
+		expect(input.length).toBe(1);
+		// 不得出现空 text 的 input_text 项（上游会以 missing input.content.text 拒绝）
+		for (const msg of input) {
+			for (const part of msg.content ?? []) {
+				if (part.type === "input_text") {
+					expect(typeof part.text).toBe("string");
+					expect(part.text?.length).toBeGreaterThan(0);
+				}
+			}
+		}
+	});
+
+	it("does not emit an empty-text input_text item when content is empty and history is empty", async () => {
+		const originalFetch = globalThis.fetch;
+		let capturedBody: Record<string, unknown> | null = null;
+		globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+			const [, init] = args;
+			capturedBody = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null;
+			return createDoneSseResponse();
+		}) as typeof fetch;
+
+		try {
+			const params: ChatParams = {
+				conversationId: "conv-empty-content-2",
+				content: "",
+				model: "test:gpt-5",
+				cwd: "/tmp",
+				history: [],
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+			};
+			for await (const _event of provider.chat(params)) {
+				// Drain stream
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+
+		expect(capturedBody).not.toBeNull();
+		if (!capturedBody) {
+			throw new Error("Expected request body to be captured");
+		}
+		const body = capturedBody as {
+			input?: Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
+		};
+		const input = body.input ?? [];
+		for (const msg of input) {
+			for (const part of msg.content ?? []) {
+				if (part.type === "input_text") {
+					expect(typeof part.text).toBe("string");
+					expect(part.text?.length).toBeGreaterThan(0);
+				}
+			}
+		}
+	});
+});
