@@ -761,7 +761,7 @@ export class CodexProvider implements ProviderAdapter {
 			} else {
 				messages.push({ role: "user", content: params.content });
 			}
-		} else if (params.toolResults.length === 0) {
+		} else if (params.toolResults.length === 0 && params.content) {
 			messages.push({ role: "user", content: params.content });
 		}
 

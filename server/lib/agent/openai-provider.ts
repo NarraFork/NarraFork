@@ -751,7 +751,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		const currentUserMessage = buildOAIUserMessage(params.content, params.images);
 		if (currentUserMessage) {
 			messages.push(currentUserMessage);
-		} else if (params.toolResults.length === 0) {
+		} else if (params.toolResults.length === 0 && params.content) {
+			// 仅当确有非空文本时才发送用户消息：空 content 在 Responses API 下会生成
+			// text 为空字符串的 input_text 项，部分 responses 兼容上游会以
+			// "missing input.content.text" 拒绝（见续跑/重试场景的批量 400）。
 			messages.push({ role: "user", content: params.content });
 		}
 
@@ -1476,7 +1479,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const currentUserMessage = buildOAIUserMessage(params.content, params.images);
 		if (currentUserMessage) {
 			messages.push(currentUserMessage);
-		} else if (params.toolResults.length === 0) {
+		} else if (params.toolResults.length === 0 && params.content) {
 			messages.push({ role: "user", content: params.content });
 		}
 
