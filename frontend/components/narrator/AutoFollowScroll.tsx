@@ -51,6 +51,15 @@ export interface AutoFollowScrollProps extends Omit<BoxProps, "children"> {
 	followTo?: (el: HTMLElement) => void;
 	/** Allow disabling without changing call sites. Defaults to true. */
 	enabled?: boolean;
+	/**
+	 * Follow immediately on mount. Defaults to true. Pass false for bodies that
+	 * must open at their head (a truncated body only fetches the rest once the
+	 * reader scrolls deep — pinning it to the tail on mount would fire that fetch
+	 * for a body nobody read) and should only follow while their content GROWS
+	 * (a streaming tool output). A `followKey` change still follows at once: it
+	 * means a new streaming session started, not a remount.
+	 */
+	followOnMount?: boolean;
 	/** When true, injects `ref` into a single valid child instead of making Box scrollable. */
 	asChild?: boolean;
 	onScroll?: UIEventHandler<HTMLElement>;
@@ -65,6 +74,7 @@ export function AutoFollowScroll({
 	deps = [],
 	followTo,
 	enabled = true,
+	followOnMount = true,
 	asChild,
 	onScroll,
 	onWheel,
@@ -176,19 +186,30 @@ export function AutoFollowScroll({
 		scrollRef.current = node;
 	}, []);
 
+	// `followOnMount: false` skips exactly ONE follow pass — the one running on
+	// mount. Flipped to "already skipped" either by that first pass or by a
+	// followKey change (a new streaming session follows immediately, so the
+	// mount guard must not swallow it).
+	const skippedMountFollowRef = useRef(false);
+
 	useLayoutEffect(() => {
 		if (lastFollowKeyRef.current !== followKey) {
 			lastFollowKeyRef.current = followKey;
 			autoFollowRef.current = true;
 			userIntentRef.current = false;
 			programmaticScrollUntilRef.current = 0;
+			skippedMountFollowRef.current = true;
 			setShowResume(false);
 		}
 		if (!enabled || !autoFollowRef.current) return;
+		if (!followOnMount && !skippedMountFollowRef.current) {
+			skippedMountFollowRef.current = true;
+			return;
+		}
 		followNow();
 		const rafId = requestAnimationFrame(followNow);
 		return () => cancelAnimationFrame(rafId);
-	}, [enabled, followKey, followNow, ...deps]);
+	}, [enabled, followKey, followNow, followOnMount, ...deps]);
 
 	useEffect(() => {
 		if (!enabled) return;

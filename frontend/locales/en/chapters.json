@@ -87,8 +87,6 @@
 	"mergeReviewRequiredDesc": "This chapter needs an approved review before it can be merged.",
 	"mergeReviewRequestChanges": "Review requested changes",
 	"mergeReviewRequestChangesDesc": "The latest review requested changes. Please address them before merging.",
-	"mergeDirtySource": "Commit-mode merge needs a clean source chapter. Commit or stash its changes, or switch back to workspace merge.",
-	"mergeDirtyTarget": "Commit-mode merge needs a clean target chapter. Commit or stash its changes, or switch back to workspace merge.",
 	"mergeMode": "Merge mode",
 	"mergeModeSnapshot": "Workspace (default)",
 	"mergeModeCommit": "Commit (real merge commit)",

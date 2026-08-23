@@ -246,7 +246,17 @@ interface PlannedUpdateRecoveryControl {
 	controller: AbortController;
 	onInterrupt?: (token: string) => void | Promise<void>;
 	interruptFinalizer: Promise<void> | null;
-	interruptForegroundSubagents: boolean;
+	/**
+	 * Subagents this recovery owner is waiting on, if any.
+	 *
+	 * A list rather than a flag because the recovery path re-drives a foreground
+	 * Agent through `resumeSubagent`, whose run signal is deliberately independent
+	 * of the parent — so nothing else can identify which subagents belong to it.
+	 * Empty means "this owner holds no subagent", which is the correct answer for
+	 * the Await batch: those awaits own only the parent-side wait, and the agents
+	 * they watch must keep running.
+	 */
+	foregroundSubagentIds: readonly string[];
 }
 
 export interface PlannedUpdateRecoveryRegistration {
@@ -265,7 +275,7 @@ export function registerPlannedUpdateRecoveryController(
 	narratorId: string,
 	controller: AbortController,
 	onInterrupt?: (token: string) => void | Promise<void>,
-	options: { interruptForegroundSubagents?: boolean; token?: string } = {},
+	options: { foregroundSubagentIds?: readonly string[]; token?: string } = {},
 ): PlannedUpdateRecoveryRegistration {
 	const token = options.token ?? randomUUID();
 	const control: PlannedUpdateRecoveryControl = {
@@ -273,7 +283,7 @@ export function registerPlannedUpdateRecoveryController(
 		controller,
 		onInterrupt,
 		interruptFinalizer: null,
-		interruptForegroundSubagents: options.interruptForegroundSubagents ?? false,
+		foregroundSubagentIds: options.foregroundSubagentIds ?? [],
 	};
 	plannedUpdateRecoveryControls.set(narratorId, control);
 	// These recovery stages drive a narrator with NO activeNarrators entry, yet they
@@ -302,10 +312,10 @@ export function registerPlannedUpdateRecoveryController(
 
 function interruptPlannedUpdateRecovery(narratorId: string): {
 	interrupted: boolean;
-	interruptForegroundSubagents: boolean;
+	foregroundSubagentIds: readonly string[];
 } {
 	const control = plannedUpdateRecoveryControls.get(narratorId);
-	if (!control) return { interrupted: false, interruptForegroundSubagents: false };
+	if (!control) return { interrupted: false, foregroundSubagentIds: [] };
 	control.controller.abort(new Error("Narrator interrupted by user"));
 	if (!control.interruptFinalizer) {
 		control.interruptFinalizer = Promise.resolve().then(() => control.onInterrupt?.(control.token));
@@ -318,7 +328,7 @@ function interruptPlannedUpdateRecovery(narratorId: string): {
 	});
 	return {
 		interrupted: true,
-		interruptForegroundSubagents: control.interruptForegroundSubagents,
+		foregroundSubagentIds: control.foregroundSubagentIds,
 	};
 }
 
@@ -5662,7 +5672,11 @@ export async function retryLastMessage(
 		.limit(RETRY_TAIL_SCAN_LIMIT);
 
 	if (!tailRefs.length) {
-		throw new NotFoundError("No messages to retry", narratorId);
+		// A ValidationError, not a NotFoundError: the narrator exists and was found, it
+		// just has nothing to retry. Passing this sentence as a NotFoundError `entity`
+		// also fed it into the catalog's "{entity} not found: {id}" template, which in a
+		// localized UI produced "未找到No messages to retry：<id>".
+		throw new ValidationError("No messages to retry");
 	}
 
 	const tailMessages = await db.query.narratorMessages.findMany({
@@ -5681,16 +5695,15 @@ export async function retryLastMessage(
 
 	const resolved = resolveRetryTarget(orderedTail);
 	if (!resolved.target) {
-		throw new NotFoundError(
+		throw new ValidationError(
 			resolved.reason === "empty" ? "No messages to retry" : "Last message is not a user message",
-			narratorId,
 		);
 	}
 	const lastMsg = resolved.target;
 
 	const prompt = lastMsg.contentText ?? "";
 	if (!prompt.trim()) {
-		throw new NotFoundError("Last user message has no text", narratorId);
+		throw new ValidationError("Last user message has no text");
 	}
 
 	if (resolved.emptyAssistantIds.length > 0) {
@@ -6789,7 +6802,10 @@ async function editAndRegenerateUnlocked(
 	});
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "user") {
-		throw new NotFoundError("Can only edit user messages", messageId);
+		// The message was found; the request is what is wrong. As a NotFoundError this
+		// sentence became the catalog's `{entity}` and rendered as "未找到Can only edit
+		// user messages：<id>" once a translation existed.
+		throw new ValidationError("Can only edit user messages");
 	}
 
 	const narrator = await narratorService.getById(narratorId);
@@ -7148,7 +7164,7 @@ export async function editAssistantMessage(
 	});
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "assistant") {
-		throw new NotFoundError("Can only edit assistant messages", messageId);
+		throw new ValidationError("Can only edit assistant messages");
 	}
 
 	const newContentJson = buildEditedAssistantContentJson(targetMsg.contentJson, newContent);
@@ -7217,7 +7233,7 @@ export async function restoreAssistantMessage(
 	});
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "assistant") {
-		throw new NotFoundError("Can only restore assistant messages", messageId);
+		throw new ValidationError("Can only restore assistant messages");
 	}
 
 	// Nothing to restore if the message was never edited.
@@ -7623,12 +7639,18 @@ export function interruptNarrator(narratorId: string): boolean {
 	const recovery = interruptPlannedUpdateRecovery(narratorId);
 	if (!active && !recovery.interrupted) return false;
 	active?.abortController.abort();
-	// A recovered Send await owns only the parent-side wait; interrupting it must not stop
-	// the target task. Fan out only for a live parent loop or a recovered foreground Agent.
-	if (active || recovery.interruptForegroundSubagents) {
+	// Stopping this narrator cancels the Agent tool calls of its current turn, and the
+	// subagents those calls own must stop with them. The fan-out is what settles their
+	// DB/UI state; membership is decided inside, per aborted tool call, so a subagent the
+	// user is driving from its own panel (independent run signal, nobody's pending tool
+	// call) is not swept up. A recovered Send await owns only the parent-side wait, so it
+	// contributes no ids; a recovered foreground Agent names the subagent it re-drove,
+	// because that continuation's signal is deliberately not this narrator's.
+	if (active || recovery.foregroundSubagentIds.length > 0) {
+		const explicitSubagentIds = recovery.foregroundSubagentIds;
 		import("./narrator-subagent")
 			.then(({ interruptForegroundSubagentsForParent }) =>
-				interruptForegroundSubagentsForParent(narratorId),
+				interruptForegroundSubagentsForParent(narratorId, explicitSubagentIds),
 			)
 			.catch((err) => {
 				logger.warn("Failed to interrupt foreground subagents", {

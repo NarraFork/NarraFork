@@ -2,7 +2,7 @@ import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import { formatOriginLabel } from "@shared/message-origin";
 import { and, asc, desc, eq, lt, lte } from "drizzle-orm";
 import { db } from "../db";
-import { scheduledTaskRuns, scheduledTasks } from "../db/schema";
+import { scheduledTaskRuns, scheduledTasks, users } from "../db/schema";
 import { AsyncMutex } from "../lib/async-mutex";
 import { nextCronRun } from "../lib/cron";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -10,7 +10,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
 import { chapterCleanup } from "./chapter-cleanup";
-import { canWriteNarrator } from "./narrator-acl";
+import { canWriteNarrator, type NarratorPrincipal } from "./narrator-acl";
 import { narratorService } from "./narrator-service";
 import { isLoopRunning, sendMessage } from "./narrator-session";
 
@@ -61,6 +61,37 @@ const CIRCUIT_BREAKER_THRESHOLD = 5;
 
 function now(): string {
 	return new Date().toISOString();
+}
+
+/**
+ * The ACL principal a task runs as: its creator, with the creator's LIVE role.
+ *
+ * The role is read from `users` rather than assumed, because `isAdmin: false` is not a
+ * neutral default here — it is a claim that the creator is not an administrator. An
+ * admin-created task was therefore judged as a plain user against its own narrator, and
+ * on a session with no owner (every narrator that predates access control has
+ * `owner_user_id = NULL`) there was nothing left to pass: not owner, not the write
+ * audience, no explicit grant. The run reported "creator no longer has write access" to
+ * the very person who could drive that session by hand in the UI, which is why the
+ * message reads as a lie rather than as a permission problem.
+ *
+ * Live rather than snapshotted at creation time, matching `chat-service`'s
+ * `resolvePrincipal` and the auth middleware: a demotion has to reach the scheduler on
+ * the next tick, not whenever the task is next edited.
+ *
+ * A task with no `createdBy` (created before the column, or whose user was deleted)
+ * resolves to the empty id and no admin flag. That is the fail-closed direction: it
+ * matches no owner and no grant, so such a task can only reuse a session that is
+ * genuinely open to everyone, and otherwise gets a fresh narrator of its own.
+ */
+async function principalForTask(task: ScheduledTask): Promise<NarratorPrincipal> {
+	const userId = task.createdBy ?? "";
+	if (!userId) return { userId: "", isAdmin: false };
+	const user = await db.query.users.findFirst({
+		where: eq(users.id, userId),
+		columns: { role: true },
+	});
+	return { userId, isAdmin: user?.role === "admin" };
 }
 
 export const scheduledTaskService = {
@@ -392,10 +423,7 @@ export const scheduledTaskService = {
 			// way to inject messages into someone else's private session.
 			const existing = await narratorService.listByChapter(task.chapterId);
 			const reusable = existing[0]
-				? await canWriteNarrator(existing[0], {
-						userId: task.createdBy ?? "",
-						isAdmin: false,
-					})
+				? await canWriteNarrator(existing[0], await principalForTask(task))
 				: false;
 			if (existing.length > 0 && reusable) {
 				narratorId = existing[0].id;
@@ -431,8 +459,7 @@ export const scheduledTaskService = {
 				// been transferred or un-shared, and a task must not keep writing to a
 				// session its creator can no longer reach. Falls through to a fresh one.
 				const mayReuse =
-					existing !== null &&
-					(await canWriteNarrator(existing, { userId: task.createdBy ?? "", isAdmin: false }));
+					existing !== null && (await canWriteNarrator(existing, await principalForTask(task)));
 				if (existing && mayReuse && existing.status !== "archived") {
 					narratorId = existing.id;
 				}

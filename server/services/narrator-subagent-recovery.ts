@@ -597,9 +597,14 @@ async function prepareAndStartRecovery(input: {
 	const { registerPlannedUpdateRecoveryController } = await import("./narrator-session");
 	const controller = new AbortController();
 	const registration = registerPlannedUpdateRecoveryController(narratorId, controller, undefined, {
-		// A foreground Agent candidate is re-driven in place, so interrupting the parent
-		// must also stop the subagent it is waiting on.
-		interruptForegroundSubagents: candidates.some((candidate) => candidate.kind === "agent"),
+		// A foreground Agent candidate is re-driven in place through `resumeSubagent`,
+		// whose run signal is independent of this narrator by design. Naming the
+		// subagents here is therefore the only way an interrupt can reach them — and
+		// naming them individually is what keeps the interrupt from touching any other
+		// child of the same parent.
+		foregroundSubagentIds: candidates
+			.filter((candidate) => candidate.kind === "agent")
+			.map((candidate) => candidate.targetId),
 	});
 
 	void runRecoveryStage(input, candidates, controller.signal)
@@ -1353,7 +1358,7 @@ export async function startRecoveryAwaitBatch(input: {
 	// Same reasoning as the Path A stage: this batch runs with no activeNarrators entry,
 	// so a registered controller is the ONLY thing Interrupt can reach. Without it the
 	// user's interrupt does nothing and they sit through the full Await timeout.
-	// `interruptForegroundSubagents` stays false — these awaits own only the parent-side
+	// `foregroundSubagentIds` stays empty — these awaits own only the parent-side
 	// wait, and the resumed background agents should keep running.
 	const { registerPlannedUpdateRecoveryController } = await import("./narrator-session");
 	const controller = new AbortController();
@@ -1361,7 +1366,7 @@ export async function startRecoveryAwaitBatch(input: {
 		input.narratorId,
 		controller,
 		undefined,
-		{ interruptForegroundSubagents: false },
+		{ foregroundSubagentIds: [] },
 	);
 
 	void runRecoveryAwaitBatch(

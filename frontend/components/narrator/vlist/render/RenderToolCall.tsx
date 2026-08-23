@@ -83,6 +83,7 @@ import {
 import type { ComponentType, ReactNode, Ref } from "react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
+import { AutoFollowScroll } from "../../AutoFollowScroll";
 import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
 import {
@@ -1870,11 +1871,20 @@ export const __TEST__ToolTimingBreakdown = ToolTimingBreakdown;
  * A capped body scroll box: the fixed-height, clamped container the measure layer
  * reserved. Shared by the single-block path and the per-section path so both keep
  * identical geometry.
+ *
+ * `tailFollow` turns on output-tail following for bodies whose NEWEST content is
+ * at the BOTTOM (bash / terminal output). While the text grows the box stays
+ * pinned to the tail; a reader scrolling up detaches it (AutoFollowScroll shows
+ * a jump-to-bottom button). It deliberately does NOT pin on mount: a completed
+ * body opens at its head exactly as before, so the truncated-body auto-fetch
+ * (`useAutoLoadOnScroll`) still gates on the reader actually scrolling deep.
  */
 function CappedBodyBox({
 	height,
 	cap,
 	wordWrap = true,
+	tailFollow = false,
+	followDeps = [],
 	children,
 }: {
 	height: number;
@@ -1885,9 +1895,13 @@ function CappedBodyBox({
 	 * only decides what the reader sees inside it.
 	 */
 	wordWrap?: boolean;
+	/** Follow the output tail while `followDeps` change (streaming output). */
+	tailFollow?: boolean;
+	/** Content identity that drives follow attempts (the body text + wrap flag). */
+	followDeps?: readonly unknown[];
 	children: ReactNode;
 }) {
-	return (
+	const box = (
 		<div
 			style={{
 				maxHeight: cap ?? undefined,
@@ -1923,6 +1937,14 @@ function CappedBodyBox({
 		>
 			{children}
 		</div>
+	);
+	if (!tailFollow) return box;
+	// asChild: the follow handlers land on the SAME div, so the wrapper adds only
+	// a position:relative box — height-neutral, like VListContentViewHost's own.
+	return (
+		<AutoFollowScroll asChild followOnMount={false} deps={followDeps}>
+			{box}
+		</AutoFollowScroll>
 	);
 }
 
@@ -2145,12 +2167,25 @@ function SectionBody({
 		const isDiff = block?.kind === "fixed" && block.tag === "detail-diff";
 		const lang = block?.kind === "fixed" ? resolveDetailLang(block.data) : undefined;
 		const blockData = block?.kind === "fixed" ? block.data : undefined;
+		const blockTag = block?.kind === "fixed" ? block.tag : undefined;
+		const wordWrap = viewTarget ? viewControls?.isWrapped(viewTarget) !== false : true;
+		// Output-tail following is for bodies whose newest content is at the BOTTOM:
+		// the classifier marks them with a literal "output" section label AND a
+		// terminal-style cap (bash output, terminal read/list). The same tags appear
+		// on INPUT previews (a streaming Write body is also `detail-streaming`, a
+		// streaming command `detail-streaming-bash`) but those never carry the
+		// "output" label, so gating on both keeps code / diff / previews head-anchored.
+		const tailFollow =
+			part.label === "output" &&
+			(blockTag === "detail-term" || blockTag === "detail-streaming-bash");
 		return (
 			<VListContentViewHost target={viewTarget} controls={viewControls}>
 				<CappedBodyBox
 					height={part.bodyHeight}
 					cap={part.appliedCap}
-					wordWrap={viewTarget ? viewControls?.isWrapped(viewTarget) !== false : true}
+					wordWrap={wordWrap}
+					tailFollow={tailFollow}
+					followDeps={[text, wordWrap]}
 				>
 					{isDiff ? (
 						<DiffLines

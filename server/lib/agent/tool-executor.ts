@@ -459,6 +459,46 @@ export function releaseToolAdmissionState(state: ToolAdmissionState): void {
 }
 
 /**
+ * Run a permission wait WITHOUT holding the update start grant.
+ *
+ * A start grant is meant to cover the brief, bounded window between "this tool is allowed to
+ * start" and "its execution lease exists". A permission request breaks that assumption: it
+ * suspends until a human answers, which may be hours, and `checkpointFenceIsStable()` requires
+ * `toolStartGrants` to be empty. Holding the grant across the prompt therefore blocks a planned
+ * update for exactly as long as nobody is at the keyboard.
+ *
+ * Releasing here is safe precisely because the wait is already durable: the tool-call row is
+ * `pending` before the handler suspends, so `checkpointPlannedUpdateContinuations` persists it as
+ * a `pending_permission` continuation, and the replacement process re-offers the request with its
+ * stored `inputJson` intact. Nothing is interrupted and no user input is discarded — the decision
+ * simply outlives the process, which is what a durable pending permission is for.
+ *
+ * After the decision, admission is re-acquired before execution. That re-entry is the point of
+ * this design rather than a side effect: a tool approved during a restart window must NOT start
+ * against a server that is about to be replaced. `preAdmitToolExecution` re-queues it behind the
+ * gate, and if the update wins the race the tool becomes a durable deferred continuation instead
+ * of a half-executed side effect. An abort during that wait is surfaced to the caller unchanged.
+ */
+function releaseAdmissionForUserDecisionWait(state: ToolAdmissionState): () => void {
+	let released = false;
+	return () => {
+		// Release once, and only for a request that has actually suspended on a human. Every
+		// decision the handler can make on its own (policy auto-allow, plan-mode deny, an
+		// exception) keeps the grant, preserving the rule that phase-one admission is
+		// irrevocable: work that has already started must never be turned back into a durable
+		// pause. Reflection decision tools hold no grant of their own, so there is nothing to
+		// release for them.
+		if (released || !state.startGrant) return;
+		released = true;
+		// `permissionGranted` is intentionally not recorded here. The re-admission performed by
+		// acquireFinalToolExecution happens after the decision is known, and only an approved
+		// call reaches it — a denial returns earlier — so a deferral created there is already
+		// scoped to an approved tool.
+		releaseToolAdmissionState(state);
+	};
+}
+
+/**
  * A reflection loop's decision tool (DangerConfirm/DangerCancel, ExitPlanConfirm/...) must
  * bypass update admission.
  *
@@ -779,6 +819,10 @@ export async function executeTool(
 					executionBackend: frozenExecution?.backend,
 					executionTarget: frozenExecution?.target,
 					executionPlan: frozenExecution?.plan,
+					// Drop the update start grant once the request is durably pending, so an
+					// unanswered permission cannot block a planned restart. Admission is re-acquired
+					// by acquireFinalToolExecution before the tool actually runs.
+					onAwaitingUserDecision: releaseAdmissionForUserDecisionWait(admissionState),
 					onInputResolved: frozenExecution
 						? async (resolvedInput) => {
 								const refined = await resolveAndPersistFrozenExecutionTarget(

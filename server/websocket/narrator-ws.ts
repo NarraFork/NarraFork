@@ -44,7 +44,7 @@ import type {
 	UnloadToolResult,
 } from "../services/command-service";
 import { resolveCommand } from "../services/command-service";
-import { canReadNarrator, canWriteNarrator } from "../services/narrator-acl";
+import { canReadNarrator, canWriteNarrator, NARRATOR_ACL_COLUMNS } from "../services/narrator-acl";
 import { getStreamingSnapshot } from "../services/narrator-event-handler";
 import {
 	handleBlockAllSkillsCommand,
@@ -443,7 +443,7 @@ async function authorizeReadableNarrators(
 		try {
 			const row = await db.query.narrators.findFirst({
 				where: eq(narrators.id, narratorId),
-				columns: { id: true, ownerUserId: true, visibility: true, chapterId: true },
+				columns: NARRATOR_ACL_COLUMNS,
 			});
 			ok = row ? await canReadNarrator(row, principal) : false;
 		} catch (err) {
@@ -587,7 +587,7 @@ async function authorizeNarratorId(
 ): Promise<boolean> {
 	const row = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { id: true, ownerUserId: true, visibility: true, chapterId: true },
+		columns: NARRATOR_ACL_COLUMNS,
 	});
 	if (!row) return false;
 	return need === "write"
@@ -921,7 +921,7 @@ export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 ): Promise<void> {
 	const row = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { id: true, ownerUserId: true, visibility: true, chapterId: true },
+		columns: NARRATOR_ACL_COLUMNS,
 	});
 
 	const verdicts = new Map<string, boolean>();

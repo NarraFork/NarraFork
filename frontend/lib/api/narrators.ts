@@ -27,6 +27,7 @@ import type {
 	NarratorGrantBatchResult,
 	NarratorMessageSearchResponse,
 	NarratorVisibility,
+	NarratorWriteAudience,
 	PaginatedNarrators,
 	PretextDocumentPageResult,
 	RuleTargetSelector,
@@ -1579,6 +1580,12 @@ export const narratorsApi = {
 		request<NarratorAccess>(`/narrators/${narratorId}/visibility`, {
 			method: "PATCH",
 			body: JSON.stringify({ visibility }),
+		}),
+
+	setNarratorWriteAudience: (narratorId: string, writeAudience: NarratorWriteAudience) =>
+		request<NarratorAccess>(`/narrators/${narratorId}/write-audience`, {
+			method: "PATCH",
+			body: JSON.stringify({ writeAudience }),
 		}),
 
 	/** Share with several users at once; the response reports each user's outcome. */

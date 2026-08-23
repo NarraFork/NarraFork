@@ -51,7 +51,9 @@ import {
 	writePlannedUpdateRecoverySnapshot,
 } from "./update-coordinator";
 import {
+	CHECKPOINT_ACTIVE_TOOL_LIMIT,
 	checkpointPlannedUpdateContinuations,
+	isLiveNarratorForCheckpoint,
 	verifySendAwaitCheckpointEpoch,
 } from "./update-recovery-service";
 
@@ -203,7 +205,6 @@ const PATCH_SIZE_SLACK = 1.25;
 const REPLACEMENT_HANDOFF_WATCHDOG_MS = 75_000;
 const CHECKPOINT_MAX_ROUNDS = 8;
 const CHECKPOINT_REQUIRED_STABLE_PASSES = 2;
-const CHECKPOINT_ACTIVE_TOOL_LIMIT = 10_001;
 
 interface PlacedUpdateInfo {
 	version: string;
@@ -1622,7 +1623,9 @@ export function cancelPreparedUpdate(reason?: string): {
 export interface PlannedUpdateCheckpointHooks {
 	waitForFence?: () => Promise<void>;
 	checkpoint?: () => Promise<PlannedUpdateRecoverySnapshot>;
-	listActiveToolCallIds?: () => Promise<string[]>;
+	listActiveToolCallIds?: (
+		snapshot: Pick<PlannedUpdateRecoverySnapshot, "narrators">,
+	) => Promise<string[]>;
 	listCoveredToolCallIds?: (updateEpoch: string) => Promise<string[]>;
 	verifySendAwaitContinuations?: (updateEpoch: string) => Promise<{
 		stable: boolean;
@@ -1630,9 +1633,21 @@ export interface PlannedUpdateCheckpointHooks {
 	}>;
 }
 
-async function listActiveToolCallIds(): Promise<string[]> {
+/**
+ * Non-terminal tool rows the fence requires a continuation for.
+ *
+ * Scoped to live narrators by the same predicate the checkpoint uses. The two MUST agree: the
+ * fence demands a continuation for every row it reports, so counting a row the checkpoint
+ * deliberately skips leaves it permanently uncovered and the update fails after
+ * CHECKPOINT_MAX_ROUNDS instead of restarting. Abandoned rows accumulate from ordinary
+ * provider errors, so that would make updates fail on exactly the installations that have
+ * hit an error before.
+ */
+async function listActiveToolCallIds(
+	snapshot: Pick<PlannedUpdateRecoverySnapshot, "narrators">,
+): Promise<string[]> {
 	const rows = await db
-		.select({ id: narratorToolCalls.id })
+		.select({ id: narratorToolCalls.id, narratorId: narratorToolCalls.narratorId })
 		.from(narratorToolCalls)
 		.where(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]))
 		.limit(CHECKPOINT_ACTIVE_TOOL_LIMIT);
@@ -1641,7 +1656,9 @@ async function listActiveToolCallIds(): Promise<string[]> {
 			`Planned-update checkpoint exceeds the ${CHECKPOINT_ACTIVE_TOOL_LIMIT - 1}-row safety limit`,
 		);
 	}
-	return rows.map((row) => row.id);
+	return rows
+		.filter((row) => isLiveNarratorForCheckpoint(snapshot, row.narratorId))
+		.map((row) => row.id);
 }
 
 /**
@@ -1676,7 +1693,7 @@ export async function checkpointPreparedUpdateFence(
 		await waitForFence();
 
 		const [activeToolCallIds, coveredToolCallIds, sendAwaitVerification] = await Promise.all([
-			loadActiveToolCallIds(),
+			loadActiveToolCallIds(snapshot),
 			loadCoveredToolCallIds(updateEpoch),
 			verifySendAwaits(updateEpoch),
 		]);

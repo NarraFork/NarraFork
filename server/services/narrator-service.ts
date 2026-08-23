@@ -1,5 +1,10 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+	isWriteAudienceAllowed,
+	type NarratorVisibility,
+	type NarratorWriteAudience,
+} from "@shared/narrator-access";
 import { foldHandle } from "@shared/narrator-handle";
 import { and, eq, inArray, isNotNull, notInArray, sql } from "drizzle-orm";
 import { db } from "../db";
@@ -102,6 +107,7 @@ import { integrationResourceBindingService } from "./integration-resource-bindin
 import {
 	assertNarratorAccess,
 	defaultVisibilityForNarrator,
+	defaultWriteAudienceForNarrator,
 	type NarratorAccessNeed,
 } from "./narrator-acl";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
@@ -308,6 +314,11 @@ export interface CreateNarratorInput {
 	 * created: private for standalone, project for chapter-bound.
 	 */
 	visibility?: "private" | "project" | "public";
+	/**
+	 * Write audience. Omitted means the default for the kind of narrator being
+	 * created: owner-only for standalone, project for chapter-bound.
+	 */
+	writeAudience?: "owner" | "project" | "public";
 }
 
 interface CreateSubagentInput {
@@ -1142,6 +1153,35 @@ export interface PreparedNarratorCreation {
 	handleFold: string | null;
 }
 
+/**
+ * Settle the two audience columns for a new narrator, keeping the pair legal.
+ *
+ * The write audience is nested inside the read audience (see
+ * `@shared/narrator-access`), so it is derived from whichever visibility actually
+ * takes effect rather than from the chapter id independently — otherwise a caller
+ * passing an explicit `visibility: "private"` would silently get a `project` write
+ * audience, which is exactly the lying-column state this nesting removes.
+ *
+ * An explicitly supplied pair is validated rather than clamped: reaching here with an
+ * illegal combination means a caller constructed it in code, which is a bug to
+ * surface, not a user action to accommodate.
+ */
+function resolveNarratorAudiences(
+	visibility: NarratorVisibility | undefined,
+	writeAudience: NarratorWriteAudience | undefined,
+	chapterId: string | null | undefined,
+): { visibility: NarratorVisibility; writeAudience: NarratorWriteAudience } {
+	const effectiveVisibility = visibility ?? defaultVisibilityForNarrator(chapterId);
+	const effectiveWriteAudience =
+		writeAudience ?? defaultWriteAudienceForNarrator(effectiveVisibility);
+	if (!isWriteAudienceAllowed(effectiveVisibility, effectiveWriteAudience)) {
+		throw new ValidationError(
+			`Write audience "${effectiveWriteAudience}" is wider than visibility "${effectiveVisibility}"`,
+		);
+	}
+	return { visibility: effectiveVisibility, writeAudience: effectiveWriteAudience };
+}
+
 export async function prepareNarratorCreation(
 	input: CreateNarratorInput,
 ): Promise<PreparedNarratorCreation> {
@@ -1282,7 +1322,7 @@ export async function prepareNarratorCreation(
 			oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
 			defaultDeviceId: input.defaultDeviceId ?? null,
 			ownerUserId: input.ownerUserId ?? null,
-			visibility: input.visibility ?? defaultVisibilityForNarrator(chapterId),
+			...resolveNarratorAudiences(input.visibility, input.writeAudience, chapterId),
 			inheritMode: "fresh",
 			status: "idle",
 			title: input.title ?? null,
@@ -1399,11 +1439,26 @@ export const narratorService = {
 				parentNarratorId: input.parentNarratorId,
 				cwd: input.cwd,
 				defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
-				// A subagent is part of its parent's work, so it inherits both halves of
-				// access control verbatim. Anything else would either hide a subagent from
-				// the person driving the parent, or expose a private session's subtasks.
+				// A subagent is part of its parent's work, so its access is DELEGATED to the
+				// root rather than copied: `acl_root_narrator_id` is the only thing consulted
+				// when deciding who may read or drive it. That is what makes a later sharing
+				// change on the main session reach its subagents — there is nothing to
+				// propagate, because there is no copy. Copying used to be the approach, and
+				// sharing a parent afterwards silently left its subagents unreachable.
+				//
+				// Nested subagents point at the same root, so the chain is never walked on a
+				// decision path.
+				aclRootNarratorId: parent.aclRootNarratorId ?? input.parentNarratorId,
+				// Kept because "whose work is this" is still read for listings, attribution
+				// and user deletion — it just no longer decides access.
 				ownerUserId: parent.ownerUserId,
-				visibility: parent.visibility,
+				// Frozen at their strictest values ON PURPOSE, not copied from the parent.
+				// Delegation means these are never consulted, and a copy that cannot follow
+				// the root is a trap: any future code path that reads them instead of the
+				// judged row would get a stale snapshot that may be WIDER than the root.
+				// Pinning them here makes such a mistake fail closed instead of leaking.
+				visibility: "private",
+				writeAudience: "owner",
 				inheritMode: "fresh",
 				status: "working",
 				createdAt: now,
@@ -1832,9 +1887,12 @@ export const narratorService = {
 					behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 					parentNarratorId,
 					// A fork carries the parent's history, so it must not be reachable by a
-					// wider audience than the parent was.
+					// wider audience than the parent was. Both axes are copied, not delegated:
+					// a fork is an independent session (`type: "primary"`), and its owner must
+					// be able to re-share it without the origin's settings overriding them.
 					ownerUserId: parent.ownerUserId,
 					visibility: parent.visibility,
+					writeAudience: parent.writeAudience,
 					inheritMode: "full",
 					status: "idle",
 					title: opts?.title ?? null,
@@ -2024,10 +2082,11 @@ export const narratorService = {
 					parentNarratorId,
 					forkMessageId: null,
 					// Same rule as forkFromMessages: inherited history keeps the parent's
-					// audience. When the fork lands in a chapter it is at least
+					// audiences, both of them. When the fork lands in a chapter it is at least
 					// project-visible anyway, so inheriting can only narrow, never widen.
 					ownerUserId: parent.ownerUserId,
 					visibility: parent.visibility,
+					writeAudience: parent.writeAudience,
 					inheritMode,
 					apiConversationId,
 					contextSummary,
@@ -2509,9 +2568,12 @@ export const narratorService = {
 				behaviorFenceAttachOverride: normalizeBooleanOverride(parent.behaviorFenceAttachOverride),
 				title: opts?.title ?? undefined,
 				// A tool-initiated fork belongs to whoever owns the session that spawned
-				// it — the model has no identity of its own to attribute it to.
+				// it — the model has no identity of its own to attribute it to. Both
+				// audiences come along so the fork is never reachable more widely than
+				// the session it came from.
 				ownerUserId: parent.ownerUserId,
 				visibility: parent.visibility,
+				writeAudience: parent.writeAudience,
 			});
 			eventBus.emit({
 				type: "narrator:forked",

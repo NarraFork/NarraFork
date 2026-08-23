@@ -23,12 +23,23 @@ let resumeSubagent: typeof import("../subagent-resume").resumeSubagent;
 // later-loaded suite and break e.g. provider-resolution / resolve-aggregation.
 const realModules: Record<string, () => unknown> = {};
 
+/**
+ * Per-narrator status, so a test can present a zombie `working` row.
+ *
+ * Defaults to `idle`; absent from the map means idle. `reconcileRunningStatus` is mocked
+ * to clear the entry, which is exactly what the real one does to a row whose runtime
+ * owner is gone.
+ */
+const statusOverrides = new Map<string, string>();
+/** Every narrator id `resumeSubagent` asked to reconcile, in order. */
+const reconcileCalls: string[] = [];
+
 function makeNarrator(id: string) {
 	return {
 		id,
 		variant: "subagent:general",
 		parentNarratorId,
-		status: "idle",
+		status: statusOverrides.get(id) ?? "idle",
 		substatus: ["unread"],
 		errorMessage: null,
 		model: "test-model",
@@ -230,6 +241,16 @@ beforeAll(async () => {
 		...realNarratorSession,
 		getSubagentFinalText: mock(async () => "mock final text"),
 		startParentInboundContinuationIfPossible: mock(async () => ({ started: false })),
+		// Stands in for the real reconcile: repairs a `working` row with no runtime owner
+		// by dropping it to idle, and reports whether it changed anything. Recorded so a
+		// test can assert resume consults it BEFORE judging the status — the ordering is
+		// the whole point, and a mock that only counted calls would not show it.
+		reconcileRunningStatus: mock(async (narratorId: string) => {
+			reconcileCalls.push(narratorId);
+			if (!statusOverrides.has(narratorId)) return false;
+			statusOverrides.delete(narratorId);
+			return true;
+		}),
 		editAndRegenerate: mock(
 			async (
 				narratorId: string,
@@ -318,6 +339,8 @@ afterEach(async () => {
 	editedMessageCalls.length = 0;
 	deleteMessagesAfterCalls.length = 0;
 	loadedTrailingToolResults = [];
+	reconcileCalls.length = 0;
+	statusOverrides.clear();
 	clearManualOverrideRuntimes();
 	foregroundResolvers.clear();
 	terminalResolvers.clear();
@@ -332,6 +355,69 @@ afterAll(() => {
 		mock.module(specifier, factory);
 	}
 	mock.restore();
+});
+
+/**
+ * A subagent row left at `working` with nobody behind it must not become a dead end.
+ *
+ * Nothing else repairs one. The parent's interrupt path only settles subagents whose
+ * owning Agent tool call was cancelled (deliberately, so it cannot kill a subagent the
+ * user is driving from its own panel), and startup recovery only runs at startup. A row
+ * orphaned mid-run — its owning turn died, a detach setup threw — used to refuse every
+ * resume with "Subagent is already running", and the card offers no other action.
+ *
+ * So resume reconciles first and then judges, exactly like every primary-narrator entry
+ * point. The ordering is the assertion: reconciling AFTER the status check would repair
+ * the row and still refuse the request that triggered the repair.
+ */
+describe("resumeSubagent status reconciliation", () => {
+	test("repairs a zombie working row and admits the resume", async () => {
+		const subagentId = "resume-zombie-row";
+		statusOverrides.set(subagentId, "working");
+
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "follow_up",
+			actor: "user",
+			prompt: "continue",
+			createdBy: "user-1",
+			locale: "en",
+		});
+
+		expect(result.started).toBe(true);
+		expect(reconcileCalls).toEqual([subagentId]);
+		// The repaired status was re-read rather than assumed: had resume kept its stale
+		// copy of the row, this would have thrown "already running" above.
+		expect(startCalls).toHaveLength(1);
+		await finishRun(subagentId);
+	});
+
+	test("still refuses a subagent whose runtime owner is alive", async () => {
+		const subagentId = "resume-live-owner";
+		// `reconcileRunningStatus` returns false for a row with a live owner, so the status
+		// stays `working` and the guard below must still fire.
+		statusOverrides.set(subagentId, "working");
+		const { reconcileRunningStatus } = await import("../narrator-session");
+		(
+			reconcileRunningStatus as unknown as { mockImplementationOnce: (fn: unknown) => void }
+		).mockImplementationOnce(async (narratorId: string) => {
+			reconcileCalls.push(narratorId);
+			return false;
+		});
+
+		await expect(
+			resumeSubagent({
+				subagentId,
+				intent: "follow_up",
+				actor: "user",
+				prompt: "continue",
+				createdBy: "user-1",
+				locale: "en",
+			}),
+		).rejects.toThrow("already running");
+		expect(reconcileCalls).toEqual([subagentId]);
+		expect(startCalls).toHaveLength(0);
+	});
 });
 
 describe("resumeSubagent", () => {

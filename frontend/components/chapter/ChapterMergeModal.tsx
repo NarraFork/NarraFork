@@ -2,8 +2,9 @@ import { Alert, Button, Modal, Select, Stack, Text, TextInput } from "@mantine/c
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ApiError, api } from "../../lib/api";
+import { api } from "../../lib/api";
 import { notifyResultWarnings } from "../../lib/operation-warnings";
+import { ErrorDetail } from "../common/ErrorDetail";
 
 interface MergeCheckResult {
 	hasConflicts: boolean;
@@ -102,13 +103,17 @@ export function ChapterMergeModal({
 		.filter((ch) => ch.id !== chapterId && ch.status === "active")
 		.map((ch) => ({ value: ch.id, label: ch.title }));
 
+	// Both mutations render their own failure as an Alert further down, so the global
+	// toast would repeat the same sentence on top of the modal that already shows it.
 	const checkConflicts = useMutation({
+		meta: { suppressErrorToast: true },
 		mutationFn: () =>
 			api.checkMergeConflicts(chapterId, targetId ?? "") as Promise<MergeCheckResult>,
 		onSuccess: (data) => setConflicts(data),
 	});
 
 	const merge = useMutation({
+		meta: { suppressErrorToast: true },
 		mutationFn: () =>
 			api.mergeChapter(chapterId, {
 				targetChapterId: targetId ?? "",
@@ -207,17 +212,13 @@ export function ChapterMergeModal({
 				)}
 
 				{merge.isError && (
+					// The dirty-worktree cases used to be detected by comparing the response's
+					// `error` field against the literals "MERGE_DIRTY_SOURCE"/"MERGE_DIRTY_TARGET".
+					// They now travel as `messageCode`, so ErrorDetail localizes them from the
+					// errors namespace like any other catalog error — and anything else keeps its
+					// server prose instead of collapsing to "unknown error".
 					<Alert color="red" title={t("mergeFailed")}>
-						<Text size="sm">
-							{merge.error instanceof ApiError && merge.error.data?.error === "MERGE_DIRTY_SOURCE"
-								? t("mergeDirtySource")
-								: merge.error instanceof ApiError &&
-										merge.error.data?.error === "MERGE_DIRTY_TARGET"
-									? t("mergeDirtyTarget")
-									: merge.error instanceof Error
-										? merge.error.message
-										: tc("unknownError")}
-						</Text>
+						<ErrorDetail error={merge.error} fallback={tc("unknownError")} />
 					</Alert>
 				)}
 

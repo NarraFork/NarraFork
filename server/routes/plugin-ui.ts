@@ -1,4 +1,4 @@
-import { AppError, formatZodError, NotFoundError, ValidationError } from "@server/lib/errors";
+import { AppError, NotFoundError, ValidationError, zodValidationError } from "@server/lib/errors";
 import { requireNarratorAccess } from "@server/lib/narrator-access";
 import {
 	type Capability,
@@ -604,7 +604,7 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const pluginId = c.req.param("pluginId");
 			const themeId = c.req.param("themeId");
 			const body = themeToggleSchema.safeParse(await c.req.json().catch(() => undefined));
-			if (!body.success) throw new ValidationError(formatZodError(body.error));
+			if (!body.success) throw zodValidationError(body.error);
 			// Guard: only allow toggling a theme that actually exists as a theme-only
 			// contribution on an enabled plugin. Prevents rows for arbitrary ids.
 			if (body.data.enabled) {
@@ -699,7 +699,7 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 	app.post("/ui/sessions", auth, async (c) => {
 		try {
 			const body = sessionInputSchema.safeParse(await c.req.json().catch(() => undefined));
-			if (!body.success) throw new ValidationError(formatZodError(body.error));
+			if (!body.success) throw zodValidationError(body.error);
 			assertSurfaceScope(body.data);
 			// A narrator-scoped panel reads that narrator's context through the UI host,
 			// so the session may only be created by someone who can read the narrator.

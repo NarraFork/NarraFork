@@ -34,6 +34,7 @@ export const ACL_EVENT_TYPES = [
 	"project_owner_transferred",
 	// Narrators
 	"narrator_visibility_changed",
+	"narrator_write_audience_changed",
 	"narrator_shared",
 	"narrator_unshared",
 	"narrator_grant_changed",

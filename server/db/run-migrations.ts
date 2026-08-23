@@ -1194,6 +1194,11 @@ export async function runMigrations(sqlite: Database): Promise<{
 		if (!hadCollectionProjectGateColumn) {
 			backfillCollectionProjectGate(sqlite);
 		}
+		// Unconditional, unlike the backfills above: this one is idempotent and gates
+		// itself on whether any subagent still lacks a root, so a failed attempt is
+		// retried instead of skipped forever. See its doc comment for why the
+		// column-absence gate is wrong specifically here.
+		backfillSubagentAclRoot(sqlite);
 		if (!hadAclGrantsTable) {
 			migrateGrantsToUnifiedAcl(sqlite);
 		}
@@ -1333,6 +1338,152 @@ function backfillCollectionProjectGate(sqlite: Database): void {
 		logger.warn("collection project-gate backfill failed (non-fatal)", { error: String(err) });
 	}
 }
+
+/**
+ * Point every existing subagent at the root narrator its access decisions delegate to.
+ *
+ * The root is the first non-subagent ancestor, found by walking `parent_narrator_id`.
+ * One recursive CTE does the whole walk; `depth < 64` guards against a cycle, which
+ * would otherwise spin inside SQLite on the main thread.
+ *
+ * Three things this must get right, each the opposite of what a plain
+ * `SET acl_root_narrator_id = parent_narrator_id` would do:
+ *   - a NESTED subagent gets the ROOT, not its immediate parent. Decisions read this
+ *     column once and never walk, so a pointer at another subagent would resolve to a
+ *     row whose own audiences deny everyone.
+ *   - a FORK is skipped. It carries a `parent_narrator_id` too but is an independent
+ *     session, and filling this in would put it permanently under its origin.
+ *   - an unresolvable chain (deleted ancestor, cycle) stays NULL.
+ *
+ * Exported so its behaviour can be asserted directly; see
+ * `__tests__/subagent-acl-root-backfill.test.ts`.
+ */
+export const SUBAGENT_ACL_ROOT_BACKFILL_SQL = `WITH RECURSIVE lineage(id, ancestor_id, depth) AS (
+	SELECT id, parent_narrator_id, 0
+	FROM narrators
+	WHERE type = 'subagent' AND parent_narrator_id IS NOT NULL
+	UNION ALL
+	SELECT l.id, n.parent_narrator_id, l.depth + 1
+	FROM lineage l
+	JOIN narrators n ON n.id = l.ancestor_id
+	WHERE n.type = 'subagent' AND n.parent_narrator_id IS NOT NULL AND l.depth < 64
+)
+UPDATE narrators SET acl_root_narrator_id = (
+	SELECT l.ancestor_id FROM lineage l
+	JOIN narrators root ON root.id = l.ancestor_id
+	WHERE l.id = narrators.id AND root.type != 'subagent'
+	LIMIT 1
+)
+WHERE type = 'subagent'`;
+
+/**
+ * How many subagents still have no delegation target, i.e. are readable only by their
+ * owner and admins until the backfill fills them in.
+ *
+ * Returns null when the question cannot be asked (the column or table is not there yet),
+ * which is different from "none" and must not be reported as success.
+ */
+function countSubagentsMissingAclRoot(sqlite: Database): number | null {
+	try {
+		const row = sqlite
+			.prepare(
+				"SELECT count(*) as c FROM narrators WHERE type = 'subagent' AND acl_root_narrator_id IS NULL",
+			)
+			.get() as { c: number } | undefined;
+		return row?.c ?? 0;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Point every existing subagent at its root, applying
+ * {@link SUBAGENT_ACL_ROOT_BACKFILL_SQL}.
+ *
+ * Subagents used to carry a copy of their parent's `visibility`/`owner_user_id`,
+ * snapshotted at creation and never updated, so sharing a parent afterwards never
+ * reached its subagents. Access is now delegated to the root, and
+ * `acl_root_narrator_id` is the single authority for it — an unfilled row is denied to
+ * everyone but its owner and admins.
+ *
+ * NOT gated on the column having just been added, unlike the `visibility` backfills
+ * above, and the difference is deliberate. Those backfills PUBLISH rows, so re-running
+ * one would keep undoing an admin's later decision to make something private; the gate
+ * protects a human choice. This one records a structural fact — which narrator a subagent
+ * belongs to — that no user can set and that does not change. So it is safe to re-run,
+ * and it must be: the migration itself commits inside a transaction and is stamped, while
+ * this runs outside and only warns on failure. Gated on the column's prior absence, a
+ * single failure (a lock, a timeout on a large table) would be permanent, and every
+ * affected subagent would stay invisible to the people the parent is shared with, with
+ * nothing left to retry it.
+ *
+ * Instead it is gated on there being work to do, so a failed attempt is retried on the
+ * next startup and a completed one costs a single indexed COUNT.
+ *
+ * The unresolved count is logged because those rows are the fail-closed ones: they became
+ * NARROWER than before the upgrade, which a user notices and reports. The opposite
+ * mistake would not be noticed at all.
+ */
+function backfillSubagentAclRoot(sqlite: Database): void {
+	const before = countSubagentsMissingAclRoot(sqlite);
+	// null means the column is absent — nothing to do, and nothing to warn about.
+	if (before === null || before === 0) return;
+	try {
+		const result = sqlite.prepare(SUBAGENT_ACL_ROOT_BACKFILL_SQL).run();
+		const after = countSubagentsMissingAclRoot(sqlite);
+		logger.info("Backfilled acl_root_narrator_id for existing subagents", {
+			count: result.changes,
+			// Rows whose chain is genuinely unresolvable (deleted ancestor, cycle). These
+			// are now owner/admin-only until repaired, and re-running cannot fix them.
+			unresolved: after ?? 0,
+		});
+	} catch (err) {
+		// Non-fatal: startup must not depend on this. Unfilled rows fail closed rather
+		// than falling back to their stale snapshot, and because the gate above is "is
+		// there still work", the next startup tries again instead of skipping forever.
+		logger.warn("subagent acl root backfill failed; will retry on next startup", {
+			error: String(err),
+			pending: before,
+		});
+	}
+}
+
+/**
+ * There is deliberately NO backfill for `write_audience`.
+ *
+ * Every existing row keeps the column default, `owner`, because that is what those
+ * sessions already enforced. A backfill deriving the write audience from `visibility`
+ * was written and reverted; it is worth recording why, because the argument for it is
+ * superficially compelling and its failure mode is a silent privilege escalation.
+ *
+ * The argument was that "who may drive" had not been a stored decision, so anyone who
+ * could reach a session could already drive it, and deriving write from read would
+ * merely restore the status quo. That premise is false. Since the ACL kernel shipped,
+ * `canWriteNarrator` has consulted only ownership, admin, and an explicit write grant —
+ * `visibility` has never granted write, and the released code says so at that branch:
+ * making a narrator public shares a view of the work, it must never hand strangers the
+ * ability to approve a tool call.
+ *
+ * So deriving `write_audience = 'public'` from `visibility = 'public'` would not restore
+ * anything; it would hand write access to every signed-in user. The rows it would hit
+ * hardest are the pre-ACL ones {@link backfillNarratorVisibility} publishes with
+ * `owner_user_id = NULL`, which on an older instance is usually the entire history. And
+ * because `resolveProjectGate(null)` reports "no gate here" for a session belonging to
+ * no project, nothing downstream would have narrowed it again.
+ *
+ * A `WHERE write_audience = 'owner'` guard does not help: the column is added by the
+ * same migration, so that condition is true for every row on the only run that matters.
+ *
+ * The bug that motivated the backfill was real but unrelated: scheduled tasks judged
+ * their creator with a hard-coded `isAdmin: false`, so an admin-created task was refused
+ * on a session that admin could drive by hand. That is fixed at its source, in
+ * `scheduled-task-service.ts`'s `principalForTask`, and needed no change to anyone's
+ * stored access.
+ *
+ * If a deployment does want its old public sessions team-drivable, that is an explicit
+ * administrative act on a session whose consequences someone accepted — not a silent
+ * consequence of upgrading.
+ */
 
 /**
  * One-time migration: fold `knowledge_grants` and `narrator_grants` into the

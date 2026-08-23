@@ -812,6 +812,72 @@ export function isModelUnavailableError(err: unknown): boolean {
 	return false;
 }
 
+/**
+ * Phrases an endpoint uses to say "you may not turn reasoning off".
+ *
+ * Observed: `Anthropic API error 400: Reasoning is mandatory for this endpoint
+ * and cannot be disabled.` Some gateways only serve reasoning-enabled traffic,
+ * so an explicit `thinking: {type:"disabled"}` / `reasoning_effort: "none"` is a
+ * hard 400 there — including on auxiliary calls (titles, summaries) which
+ * deliberately ask for no reasoning to stay cheap.
+ *
+ * Kept to explicit "mandatory / cannot be disabled" wording. A looser rule (any
+ * 400 mentioning reasoning) would also swallow genuine parameter errors, and the
+ * caller's response to a match is to silently re-send with reasoning ON — the
+ * opposite of what the user configured, so a false positive here is a silent
+ * cost increase rather than a visible failure.
+ */
+const REASONING_MANDATORY_PATTERNS = [
+	"reasoning is mandatory",
+	"thinking is mandatory",
+	"reasoning cannot be disabled",
+	"thinking cannot be disabled",
+	"reasoning can not be disabled",
+	"thinking can not be disabled",
+	"cannot disable reasoning",
+	"cannot disable thinking",
+	"reasoning is required for this",
+	"thinking is required for this",
+];
+
+/** Collect human-readable provider text from an error graph (bounded depth). */
+function errorTextCandidates(err: unknown): string[] {
+	if (err == null) return [];
+	if (typeof err !== "object") return [extractErrorMessage(err).toLowerCase()];
+	const obj = err as Record<string, unknown>;
+	const nested =
+		obj.error && typeof obj.error === "object" ? (obj.error as Record<string, unknown>) : undefined;
+	const cause =
+		obj.cause && typeof obj.cause === "object" ? (obj.cause as Record<string, unknown>) : undefined;
+	const diagnostics =
+		obj.diagnostics && typeof obj.diagnostics === "object"
+			? (obj.diagnostics as Partial<ApiRequestDiagnostics>)
+			: undefined;
+	return [
+		obj.message,
+		typeof obj.error === "string" ? obj.error : undefined,
+		nested?.message,
+		cause?.message,
+		diagnostics?.message,
+		diagnostics?.responseSnippet,
+		diagnostics?.reason,
+	]
+		.filter((value): value is string => typeof value === "string" && value.length > 0)
+		.map((value) => value.toLowerCase());
+}
+
+/**
+ * Whether the upstream rejected the request specifically because reasoning was
+ * switched off. Callers that force `reasoningEffort: "none"` use this to re-send
+ * with a minimal reasoning tier instead of failing (see the auxiliary generate
+ * paths in `agent/index.ts`).
+ */
+export function isReasoningMandatoryError(err: unknown): boolean {
+	return errorTextCandidates(err).some((text) =>
+		REASONING_MANDATORY_PATTERNS.some((pattern) => text.includes(pattern)),
+	);
+}
+
 export function isRetryableError(
 	err: unknown,
 	customRetryRules = settings.agent.customRetryRules,

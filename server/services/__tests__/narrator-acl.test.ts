@@ -196,19 +196,19 @@ describe("visibility grants read only", () => {
 describe("who may change sharing", () => {
 	test("the owner may", async () => {
 		const row = await rowOf(await makeNarrator({ ownerUserId: ownerId }));
-		expect(canManageNarratorAcl(row, asUser(ownerId))).toBe(true);
+		expect(await canManageNarratorAcl(row, asUser(ownerId))).toBe(true);
 	});
 
 	test("a write-granted user may not", async () => {
 		const id = await makeNarrator({ ownerUserId: ownerId });
 		await grant(id, friendId, "write");
 		const row = await rowOf(id);
-		expect(canManageNarratorAcl(row, asUser(friendId))).toBe(false);
+		expect(await canManageNarratorAcl(row, asUser(friendId))).toBe(false);
 	});
 
 	test("a stranger may not, even on a public narrator", async () => {
 		const row = await rowOf(await makeNarrator({ ownerUserId: ownerId, visibility: "public" }));
-		expect(canManageNarratorAcl(row, asUser(strangerId))).toBe(false);
+		expect(await canManageNarratorAcl(row, asUser(strangerId))).toBe(false);
 	});
 });
 
@@ -217,8 +217,8 @@ describe("who may change sharing", () => {
 describe("narrators with no owner", () => {
 	test("only admins may manage them", async () => {
 		const row = await rowOf(await makeNarrator({ ownerUserId: null, visibility: "public" }));
-		expect(canManageNarratorAcl(row, admin())).toBe(true);
-		expect(canManageNarratorAcl(row, asUser(strangerId))).toBe(false);
+		expect(await canManageNarratorAcl(row, admin())).toBe(true);
+		expect(await canManageNarratorAcl(row, asUser(strangerId))).toBe(false);
 	});
 
 	test("a null owner is not matched by a null-ish user id", async () => {

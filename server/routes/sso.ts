@@ -18,7 +18,7 @@
  */
 import { type Context, Hono } from "hono";
 import { buildSessionResult } from "../lib/auth";
-import { AppError, formatZodError, ValidationError } from "../lib/errors";
+import { AppError, zodValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -179,7 +179,7 @@ export async function handleSsoCallback(c: Context) {
 /** Public: exchange a one-time SSO code for the real session JWT. */
 ssoRoutes.post("/exchange", async (c) => {
 	const parsed = oidcExchangeSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 	sweep();
 	const entry = pendingCodes.get(parsed.data.code);
 	pendingCodes.delete(parsed.data.code);

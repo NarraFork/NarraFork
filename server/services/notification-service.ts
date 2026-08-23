@@ -4,7 +4,7 @@ import { chapters, narrators, userPreferences, users } from "@server/db/schema";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { and, eq, inArray } from "drizzle-orm";
-import { listNarratorAudience } from "./narrator-acl";
+import { listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
 import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
 
 // --- DingTalk helpers ---
@@ -107,12 +107,7 @@ type AttentionReason = "waiting_permission" | "done" | "error";
  * than running one authorization check per candidate.
  */
 async function filterUsersWhoCanRead(
-	narrator: {
-		id: string;
-		ownerUserId: string | null;
-		visibility: string;
-		chapterId: string | null;
-	},
+	narrator: NarratorAclRow,
 	candidateUserIds: string[],
 ): Promise<string[]> {
 	const audience = await listNarratorAudience(narrator);

@@ -638,35 +638,106 @@ export const narrators = sqliteTable(
 			onDelete: "set null",
 		}),
 		/**
-		 * Who may READ this narrator. Write access never comes from here — it requires
-		 * ownership, admin, or an explicit `narrator_grants` row with access="write".
+		 * The READ audience. One of the two independent audience axes; the other is
+		 * `writeAudience` below. Read access never confers the right to drive.
 		 *
 		 * - "private" — owner (+ granted users) only. Default for standalone narrators.
-		 * - "project" — visible to the members of the owning chapter's project. Default
-		 *               for chapter-bound narrators, so forking or merging someone else's
-		 *               chapter does not leave an unopenable node on the story graph.
+		 * - "project" — visible to the members of the owning project, resolved the same
+		 *               way every other check resolves it (chapter first, then
+		 *               `contextProjectId`). Default for chapter-bound narrators, so
+		 *               forking or merging someone else's chapter does not leave an
+		 *               unopenable node on the story graph.
 		 * - "public"  — every authenticated user. Also what the one-time backfill assigns
 		 *               to pre-ACL rows so an upgrade never silently hides existing work.
 		 *
-		 * NOTE: "project" currently resolves to the same audience as "public", because
-		 * there is no project membership table yet — every authenticated user can already
-		 * reach every project. The distinction is recorded here deliberately: when
-		 * membership lands, only the one branch in `narrator-acl.ts` has to change
-		 * instead of every call site.
+		 * "public" here is deliberately NOT behind the project gate: its audience is
+		 * meant to be wider than any project. "project" is, and is resolved through
+		 * the owning chapter (see `narrator-acl.ts`).
 		 */
 		visibility: text("visibility", { enum: ["private", "project", "public"] })
 			.notNull()
 			.default("private"),
+		/**
+		 * The WRITE audience: who may drive this narrator — send messages, decide
+		 * permission requests, change models, roll back history, open terminals.
+		 *
+		 * Separate from `visibility` on purpose. Making a session readable shares a view
+		 * of the work; handing over the ability to approve a Bash call or a file write is
+		 * a different decision, so it gets its own axis instead of being implied by the
+		 * read audience.
+		 *
+		 * - "owner"   — owner, admins, and holders of an explicit write grant. The
+		 *               default, and what every pre-existing row is backfilled to: an
+		 *               upgrade must never widen who can drive someone's session.
+		 * - "project" — additionally, project members holding write/manage. Members with
+		 *               only `read` are excluded: a project read member is defined as
+		 *               "cannot change the project", and driving a session inside it
+		 *               (running commands, editing files) would go around that line.
+		 *               Grants nothing when the narrator resolves to no project.
+		 * - "public"  — additionally, any authenticated user who can pass the project
+		 *               gate. Wider than "project members who may write", but still
+		 *               bounded by the gate: a session inside a private project stays
+		 *               undrivable by people who cannot reach that project.
+		 *
+		 * Both non-owner tiers require the project gate's READ first, so removing someone
+		 * from a project immediately stops them driving its sessions even if an older
+		 * narrator grant survives. Unknown values fail closed.
+		 */
+		writeAudience: text("write_audience", { enum: ["owner", "project", "public"] })
+			.notNull()
+			.default("owner"),
+		/**
+		 * The root narrator a subagent delegates its access decisions to, and the single
+		 * authority for those decisions: both the row-level checks and the SQL list
+		 * predicate read only this column, never the `parentNarratorId` chain.
+		 *
+		 * Null for primary narrators (they are judged on their own columns). For a
+		 * subagent, null — or a value pointing at a row that no longer exists — means the
+		 * ownership is undeterminable and access FAILS CLOSED (owner/admin only). It must
+		 * never fall back to judging the subagent by its own columns: those are frozen at
+		 * their strictest values and do not follow the root.
+		 *
+		 * `set null` rather than cascade: deleting a root must not delete the subagent's
+		 * transcript, and the resulting null degrades to "denied", which is the safe
+		 * direction. The chain is used only for the migration backfill and an offline
+		 * consistency check — never on a decision path, because a second source of truth
+		 * is what lets the list predicate and the row check disagree.
+		 */
+		// biome-ignore lint/suspicious/noExplicitAny: self-module forward reference
+		aclRootNarratorId: text("acl_root_narrator_id").references((): any => narrators.id, {
+			onDelete: "set null",
+		}),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
 	(table) => [
+		// NOTE: the "write audience is nested inside the read audience" rule is enforced
+		// ONLY in the service layer (`@shared/narrator-access` holds the single
+		// definition; `narrator-sharing.ts` and the creation path apply it). There is
+		// deliberately NO database CHECK constraint.
+		//
+		// A `check()` here was tried and reverted. SQLite cannot attach a table-level
+		// constraint to an existing table, so Drizzle generates the 12-step rebuild
+		// (create `__new_narrators`, copy every row, DROP TABLE `narrators`, rename).
+		// Dropping this table takes the `narrators_fts_*` triggers with it — they are
+		// created outside the migration system by `db/fts.ts`, so the rebuild would
+		// silently leave full-text search un-indexed for every subsequent write. Paying
+		// that for a rule the service layer already enforces is the wrong trade.
+		//
+		// The consequence to know: a future code path that writes these columns without
+		// going through the service layer can create an illegal pair, and nothing will
+		// stop it. `narrator-access-nesting.test.ts` covers the paths that exist today.
 		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		// FK covering index for user deletion, and the lookup behind "my narrators".
 		index("idx_narrators_owner").on(table.ownerUserId),
 		// Leads the visibility predicate pushed down into the paginated list query.
 		index("idx_narrators_visibility").on(table.visibility),
+		// Same role for the write-audience branches of that predicate.
+		index("idx_narrators_write_audience").on(table.writeAudience),
+		// Join key for the subagent -> root delegation in the readable predicate, and the
+		// FK covering index for root deletion (ON DELETE SET NULL).
+		index("idx_narrators_acl_root").on(table.aclRootNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),

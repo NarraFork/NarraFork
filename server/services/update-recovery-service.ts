@@ -35,6 +35,21 @@ import {
 
 export const CLAIM_LEASE_MS = 5 * 60_000;
 export const CLAIM_RENEW_INTERVAL_MS = 30_000;
+/**
+ * Row ceiling for the two checkpoint scans of non-terminal tool calls.
+ *
+ * Both the fence's coverage count (`listActiveToolCallIds`) and this module's
+ * continuation writer read the same set, so they must agree on how many rows a
+ * checkpoint is willing to look at — a limit on one side only would let the fence
+ * demand coverage for rows the writer never saw. Defined here because
+ * update-service imports this module, not the other way round.
+ *
+ * The extra 1 is the overflow probe: reaching the limit means the real count is
+ * unbounded, which is a bug to surface rather than a set to silently truncate.
+ * Abandoned non-terminal rows accumulate from ordinary provider errors, so this
+ * scan grows with the age of an installation and cannot be left unbounded.
+ */
+export const CHECKPOINT_ACTIVE_TOOL_LIMIT = 10_001;
 const NON_IDEMPOTENT_KINDS = new Set<ToolContinuationRecord["kind"]>([
 	"deferred_tool",
 	"pending_permission",
@@ -213,6 +228,41 @@ function localeFor(snapshot: PlannedUpdateRecoverySnapshot, narratorId: string):
 		"en") as Locale;
 }
 
+/**
+ * Whether a non-terminal tool-call row belongs to work this process is actually still running.
+ *
+ * A tool row is NOT proof of live work. Three ordinary paths leave `initializing`/`pending`/
+ * `running` rows behind on a narrator that finished long ago:
+ *
+ *   - a provider/loop error, whose non-Aborted cleanup branch deliberately leaves in-flight
+ *     rows alone (see narrator-subagent-recovery's header: that leak is the input its
+ *     recovery card is built for),
+ *   - a permission request whose process died before the user answered,
+ *   - any crash between "tool row written" and "result written".
+ *
+ * Those rows can be arbitrarily old. Checkpointing them writes a continuation, which the
+ * replacement process then delivers to its owner via `continueNarrator` — reviving a narrator
+ * the user considered finished and making a stale plan act on current code. The narrator's own
+ * `status` cannot distinguish the cases either: an errored turn leaves `idle`, but a turn killed
+ * mid-flight leaves `working`/`waiting` forever, so a dead narrator reads as busy.
+ *
+ * The authority is therefore this process's in-memory registry, not the database: a narrator is
+ * live only while it holds a registered agent loop or execution lease, both of which are released
+ * in a `finally`. `capturePlannedUpdateRecoverySnapshot` builds the manifest from exactly those
+ * two registries, so reusing its narrator list keeps checkpoint coverage and manifest membership
+ * from disagreeing.
+ *
+ * Background agents are the deliberate exception: a background task outlives its parent's turn,
+ * so its parent is legitimately absent from the registries. Those rows are keyed off the
+ * `background_tasks` table instead and never consult this predicate.
+ */
+export function isLiveNarratorForCheckpoint(
+	snapshot: Pick<PlannedUpdateRecoverySnapshot, "narrators">,
+	narratorId: string,
+): boolean {
+	return snapshot.narrators.some((target) => target.narratorId === narratorId);
+}
+
 class ContinuationClaimLostError extends Error {
 	constructor(toolCallId: string) {
 		super(`Continuation claim was lost for tool call ${toolCallId}`);
@@ -355,9 +405,43 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 	const runningAgents = listRunningSubagentExecutions();
 	const runningAgentByToolUseId = new Map(runningAgents.map((entry) => [entry.toolUseId, entry]));
 	const runningAgentBySubagentId = new Map(runningAgents.map((entry) => [entry.subagentId, entry]));
-	const toolCalls = await db.query.narratorToolCalls.findMany({
-		where: inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
-	});
+	// Only rows owned by a narrator this process is still running may become continuations.
+	// See isLiveNarratorForCheckpoint: an unfiltered scan resurrects narrators whose turn
+	// ended long ago but left non-terminal tool rows behind.
+	//
+	// Bounded and column-scoped to match listActiveToolCallIds, which counts the same set for
+	// the fence. Selecting whole rows pulled `output_json` for every abandoned call in the
+	// database — the one large column this scan never reads — inside a loop that runs up to
+	// CHECKPOINT_MAX_ROUNDS times per fence.
+	const allNonTerminalToolCalls = await db
+		.select({
+			id: narratorToolCalls.id,
+			narratorId: narratorToolCalls.narratorId,
+			toolUseId: narratorToolCalls.toolUseId,
+			toolName: narratorToolCalls.toolName,
+			inputJson: narratorToolCalls.inputJson,
+			status: narratorToolCalls.status,
+			executionStartedAt: narratorToolCalls.executionStartedAt,
+			createdAt: narratorToolCalls.createdAt,
+		})
+		.from(narratorToolCalls)
+		.where(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]))
+		.limit(CHECKPOINT_ACTIVE_TOOL_LIMIT);
+	if (allNonTerminalToolCalls.length >= CHECKPOINT_ACTIVE_TOOL_LIMIT) {
+		throw new Error(
+			`Planned-update checkpoint exceeds the ${CHECKPOINT_ACTIVE_TOOL_LIMIT - 1}-row safety limit`,
+		);
+	}
+	const toolCalls = allNonTerminalToolCalls.filter((toolCall) =>
+		isLiveNarratorForCheckpoint(snapshot, toolCall.narratorId),
+	);
+	const abandonedToolCallCount = allNonTerminalToolCalls.length - toolCalls.length;
+	if (abandonedToolCallCount > 0) {
+		logger.info("Skipped non-terminal tool calls with no live narrator during checkpoint", {
+			updateEpoch: snapshot.updateEpoch,
+			skipped: abandonedToolCallCount,
+		});
+	}
 	// Scoped to the unfinished calls instead of every subagent message in the database:
 	// the origin map is only consulted for these tool_use ids, and the unscoped version
 	// read ~72k rows to build 3.1k mappings when 8 were needed. Empty input means no
@@ -1668,9 +1752,15 @@ export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 				),
 			{
 				token: recoveryToken,
-				interruptForegroundSubagents: queue.some(
-					({ record }) => record.narratorId === narratorId && record.kind === "foreground_agent",
-				),
+				// The subagents this owner re-drives in the foreground. Named individually
+				// because their continuation runs on a signal that is not this narrator's,
+				// so an interrupt cannot otherwise find them — and so it cannot reach the
+				// parent's other children either.
+				foregroundSubagentIds: queue.flatMap(({ record }) => {
+					if (record.narratorId !== narratorId || record.kind !== "foreground_agent") return [];
+					const subagentId = payloadString(record.payloadJson, "subagentId");
+					return subagentId ? [subagentId] : [];
+				}),
 			},
 		);
 		parentControls.set(narratorId, { controller, registration });

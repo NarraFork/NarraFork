@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { chapters, projects } from "../db/schema";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { catalogError, NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getContainerUnsupportedReason, supportsContainers } from "../lib/platform";
 import { requireChapterAccess, requireProjectAccess } from "../lib/project-access";
@@ -292,15 +292,14 @@ chapterRoutes.post("/:id/merge", async (c) => {
 	if (parsed.data.mode === "commit") {
 		if (source.worktreePath) {
 			const sourceStatus = await gitService.getStatus(source.worktreePath);
-			if (sourceStatus.trim()) {
-				return c.json({ error: "MERGE_DIRTY_SOURCE", code: "VALIDATION_ERROR" }, 400);
-			}
+			// These used to smuggle the code through the `error` field, which forced the client
+			// to compare prose. The catalog carries it in `messageCode`, so `error` can hold a
+			// real sentence again for consumers without translations.
+			if (sourceStatus.trim()) throw catalogError("MERGE_DIRTY_SOURCE");
 		}
 		if (target?.worktreePath) {
 			const targetStatus = await gitService.getStatus(target.worktreePath);
-			if (targetStatus.trim()) {
-				return c.json({ error: "MERGE_DIRTY_TARGET", code: "VALIDATION_ERROR" }, 400);
-			}
+			if (targetStatus.trim()) throw catalogError("MERGE_DIRTY_TARGET");
 		}
 	}
 

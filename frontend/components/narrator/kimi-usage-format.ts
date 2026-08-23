@@ -3,6 +3,18 @@ import type { KimiUsageCache, KimiUsageWindow } from "../../lib/api/types";
 /** Minimal translation signature compatible with react-i18next's `t`. */
 export type KimiTFunction = (key: string, options?: Record<string, unknown>) => string;
 
+/**
+ * Whether the last refresh for this provider failed.
+ *
+ * The server withholds the error TEXT from non-admins (it is verbatim upstream output
+ * about the deployment's provider account) and sends `hasError` instead. Testing `error`
+ * alone would therefore read a non-admin's failed fetch as a success, and the status bar
+ * would present whatever numbers were last cached as if they were current.
+ */
+export function kimiUsageFailed(usage: KimiUsageCache): boolean {
+	return usage.error != null || usage.hasError === true;
+}
+
 /** True when the baseUrl points at a kimi.com / kimi.ai host (mirrors the server check). */
 export function isKimiProviderBaseUrl(baseUrl?: string): boolean {
 	if (!baseUrl) return false;
@@ -57,7 +69,7 @@ export function formatKimiBarText(usage: KimiUsageCache, t: KimiTFunction): stri
 			limit: fiveHour.limit,
 		});
 	}
-	if (usage.error) return t("kimi.unavailable");
+	if (kimiUsageFailed(usage)) return t("kimi.unavailable");
 	return null;
 }
 
@@ -70,6 +82,9 @@ export function formatKimiDetailsText(usage: KimiUsageCache, t: KimiTFunction): 
 	for (const extra of usage.extraWindows) {
 		lines.push(formatWindowLine(extra.label, extra, t));
 	}
+	// A non-admin gets `hasError` without the text, so the reason line falls back to a
+	// bare "fetch failed". Saying nothing at all would leave stale numbers looking current.
 	if (usage.error) lines.push(t("kimi.fetchError", { error: usage.error }));
+	else if (usage.hasError) lines.push(t("kimi.fetchFailed"));
 	return lines.join("\n");
 }

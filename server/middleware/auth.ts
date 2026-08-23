@@ -18,7 +18,10 @@ import {
 	renewToken,
 	verifyToken,
 } from "../lib/auth";
-import { AppError } from "../lib/errors";
+// The two remaining raw AppErrors below are deliberate: `INVALID_SCOPE` is a programming
+// error that never reaches a browser, and `INSUFFICIENT_SCOPE` is read by third-party
+// OAuth clients rather than rendered in the UI, so neither needs a localized wording.
+import { AppError, catalogError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { validateAccessToken } from "../lib/oauth-provider";
 
@@ -239,7 +242,7 @@ async function maybeRenewSessionToken(c: Context, payload: JwtPayload): Promise<
 	});
 	if (!row) {
 		invalidateUserCache(payload.sub);
-		throw new AppError("User no longer exists", 401, "UNAUTHORIZED");
+		throw catalogError("USER_GONE");
 	}
 
 	try {
@@ -270,7 +273,7 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 
 	const header = c.req.header("Authorization");
 	if (!header?.startsWith("Bearer ")) {
-		throw new AppError("Authentication required", 401, "UNAUTHORIZED");
+		throw catalogError("AUTH_REQUIRED");
 	}
 
 	const token = header.slice(7);
@@ -279,13 +282,13 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 		payload = await verifyToken(token);
 	} catch (err) {
 		if (await isExpiredSessionJwt(err, token)) {
-			throw new AppError("Token expired", 401, "TOKEN_EXPIRED");
+			throw catalogError("TOKEN_EXPIRED");
 		}
 		// Not a valid session JWT — fall through to OAuth access tokens issued by
 		// NarraFork's own authorization server (third-party API clients).
 		const oauthGrant = await validateAccessToken(token).catch(() => null);
 		if (!oauthGrant) {
-			throw new AppError("Invalid or expired token", 401, "UNAUTHORIZED");
+			throw catalogError("TOKEN_INVALID");
 		}
 		// OAuth access tokens are short-lived and revocable, so always resolve the
 		// live user row instead of using the session-JWT existence cache.
@@ -294,7 +297,7 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 			columns: { id: true, role: true },
 		});
 		if (!row) {
-			throw new AppError("User no longer exists", 401, "UNAUTHORIZED");
+			throw catalogError("USER_GONE");
 		}
 		const principal: OAuthAuthPrincipal = {
 			type: "oauth",
@@ -325,7 +328,7 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 			columns: { id: true, tokenVersion: true },
 		});
 		if (!row) {
-			throw new AppError("User no longer exists", 401, "UNAUTHORIZED");
+			throw catalogError("USER_GONE");
 		}
 		verified = { at: Date.now(), tokenVersion: row.tokenVersion };
 		verifiedUsers.set(payload.sub, verified);
@@ -334,7 +337,7 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 		// Reported as expiry, not as a generic failure: the credential really is finished, and
 		// TOKEN_EXPIRED is the code the frontend acts on by clearing its stored token and
 		// sending the user back to login.
-		throw new AppError("Session revoked", 401, "TOKEN_EXPIRED");
+		throw catalogError("SESSION_REVOKED");
 	}
 
 	const principal: SessionAuthPrincipal = { type: "session", user: payload };
@@ -363,7 +366,7 @@ export async function requireExternalAuth(c: Context, next: Next) {
 export async function requireOAuthAuth(c: Context, next: Next) {
 	const principal = await authenticateRequest(c);
 	if (principal.type !== "oauth") {
-		throw new AppError("OAuth access token required", 401, "OAUTH_REQUIRED");
+		throw catalogError("OAUTH_TOKEN_REQUIRED");
 	}
 	await next();
 }
@@ -376,7 +379,7 @@ export async function requireOAuthAuth(c: Context, next: Next) {
 export async function requireSessionAuth(c: Context, next: Next) {
 	const principal = await authenticateRequest(c);
 	if (principal.type !== "session" || c.get("oauth")) {
-		throw new AppError("Session authentication required", 401, "SESSION_REQUIRED");
+		throw catalogError("SESSION_REQUIRED");
 	}
 	await next();
 }
@@ -386,14 +389,14 @@ export function assertAdmin(c: Context): void {
 	if (principal?.type === "oauth" || c.get("oauth")) {
 		// OAuth grants are intentionally never accepted for administrative actions,
 		// even when the live user row currently has the admin role.
-		throw new AppError("Admin access requires a session", 403, "FORBIDDEN");
+		throw catalogError("ADMIN_REQUIRES_SESSION");
 	}
 	const user = principal?.user ?? (c.get("user") as JwtPayload | undefined);
 	if (!user) {
-		throw new AppError("Authentication required", 401, "UNAUTHORIZED");
+		throw catalogError("AUTH_REQUIRED");
 	}
 	if (user.role !== "admin") {
-		throw new AppError("Admin access required", 403, "FORBIDDEN");
+		throw catalogError("ADMIN_REQUIRED");
 	}
 }
 

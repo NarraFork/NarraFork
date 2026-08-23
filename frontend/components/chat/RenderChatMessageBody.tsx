@@ -19,6 +19,11 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import {
+	handleMarkdownAnchorClick,
+	MD_HEADING_SLUG_ATTR,
+	markdownLinkTargetProps,
+} from "@frontend/lib/markdown-anchor-scroll";
 import { MARKDOWN_CONSTANTS } from "@shared/pretext-layout/parse-markdown";
 import type {
 	BlockFrame,
@@ -38,6 +43,9 @@ import { CHAT_CODE_PADDING, type MeasuredChatMessage } from "./measure-chat-mess
 
 /** Code panel border, per side. Folded into the measure layer's vertical padding. */
 const CODE_PANEL_BORDER = 1;
+
+/** Bounds ONE chat message for anchor resolution (see markdown-anchor-scroll). */
+const MD_BODY_ATTR = "data-md-body";
 
 /**
  * The font a fenced code line is painted with.
@@ -75,6 +83,10 @@ export function RenderChatMessageBody({ measured, deletedLabel }: RenderChatMess
 	return (
 		<div
 			data-chat-body
+			// Bounds this message for same-document `#heading` anchor resolution, so a
+			// link only finds headings in its own message rather than in whichever
+			// message happens to come first in the room.
+			{...{ [MD_BODY_ATTR]: "" }}
 			style={{
 				position: "relative",
 				// Pinned to the measured height: the box never derives its size from
@@ -184,6 +196,9 @@ function ChatInlineBlock({
 	return (
 		<div
 			data-chat-inline-block
+			// Anchor target when this block is a heading. Attribute only — height-neutral,
+			// so the reserved geometry is untouched.
+			{...(block.headingSlug ? { [MD_HEADING_SLUG_ATTR]: block.headingSlug } : {})}
 			style={{
 				position: "absolute",
 				top: frame.top,
@@ -271,8 +286,16 @@ function ChatInlineBlock({
 								{fragment.href != null ? (
 									<a
 										href={fragment.href}
-										target="_blank"
-										rel="noopener noreferrer"
+										// A `#heading` anchor scrolls inside this message's own scroller
+										// instead of navigating; real destinations still open in a new tab.
+										{...markdownLinkTargetProps(fragment.href)}
+										onClick={(event) => {
+											handleMarkdownAnchorClick(
+												event,
+												fragment.href,
+												event.currentTarget.closest(`[${MD_BODY_ATTR}]`),
+											);
+										}}
 										className={fragment.className}
 										style={{
 											font: fragment.font,

@@ -336,6 +336,22 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 		if (!manualOverride && activeResumeRuns.has(input.subagentId)) {
 			throw new ValidationError("Subagent already has an active resumed run");
 		}
+		// Reconcile BEFORE judging the status, the same way every primary-narrator entry
+		// point does (send, continue, recover-subagents, re-execute). A `working` row whose
+		// runtime owner is gone would otherwise refuse this resume forever, and the subagent
+		// card offers no other way out — the parent's interrupt path only settles subagents
+		// belonging to a cancelled tool call, so a row orphaned any other way (its owning
+		// turn died mid-flight, a detach setup threw) was never repaired by anything.
+		//
+		// `reconcileRunningStatus` is safe here despite its primary-narrator call sites: it
+		// consults the runtime, not the variant, and returns false while any owner is still
+		// live, so a genuinely running subagent is still refused below.
+		// Dynamic import for the same reason as every other narrator-session call in this
+		// file: a static one closes a require cycle between the two modules.
+		const { reconcileRunningStatus } = await import("./narrator-session");
+		if (await reconcileRunningStatus(input.subagentId)) {
+			original.status = (await narratorService.getById(input.subagentId)).status;
+		}
 		if (
 			!manualOverride &&
 			(original.status === "working" || original.status === "waiting") &&

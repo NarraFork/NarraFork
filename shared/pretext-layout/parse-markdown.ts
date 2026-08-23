@@ -30,6 +30,7 @@ import { measureRichInlineStats, prepareRichInline } from "@chenglou/pretext/ric
 import { marked, type Token, type Tokens } from "marked";
 import type { GlyphVerticalResolver, GlyphWidthResolver, KatexRuntime } from "./katex-geometry";
 import { measureKatex } from "./katex-geometry";
+import { inlineTokensToPlainText, slugifyHeading } from "./markdown-anchor";
 import { normalizeMathDelimiters, splitMathOutsideCode } from "./math-delimiters";
 import type {
 	InlineMathFragment,
@@ -419,11 +420,22 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 			}
 			case "heading": {
 				const variant = headingVariant(token.depth);
-				appendGroup(
-					blocks,
-					buildInlineBlocks(token.tokens ?? [], variant, ctx),
-					emToPx(HEADING_MARGIN_TOP, headingSize(variant)),
+				const headingBlocks = buildInlineBlocks(token.tokens ?? [], variant, ctx);
+				// Tag the heading with the anchor slug a `[x](#…)` link resolves against.
+				// Derived from the inline TOKENS, not `token.text`: the raw source of
+				// `## 见 [文档](https://x)` would slug the url into the anchor.
+				//
+				// Only the first block is tagged — a heading that wraps produces several
+				// inline blocks, and an anchor must name one landing point.
+				attachHeadingSlug(
+					headingBlocks,
+					slugifyHeading(
+						inlineTokensToPlainText(
+							(token.tokens ?? []) as readonly { type?: string; text?: string }[],
+						),
+					),
 				);
+				appendGroup(blocks, headingBlocks, emToPx(HEADING_MARGIN_TOP, headingSize(variant)));
 				continue;
 			}
 			case "code": {
@@ -606,6 +618,26 @@ function decorateListItem(blocks: PreparedBlock[], marker: string, markerClass: 
 		markerLeft: Math.max(0, first.contentLeft - markerArea + MARKER_GAP),
 		markerClassName: markerClass,
 	};
+}
+
+/**
+ * Tag a heading's FIRST inline block with its anchor slug.
+ *
+ * Mutates the array in place the way `decorateListItem` does, and for the same
+ * reason: the blocks were just built here and are not yet shared with anyone. It
+ * must stay that way — `prepared-markdown-cache` hands the SAME block objects to
+ * every consumer of a given text, so tagging a cached block would leak the slug
+ * into unrelated bodies.
+ *
+ * A slug-less heading (`## ***`) is left untagged rather than tagged with "": an
+ * empty attribute would match an empty query and turn every unresolvable anchor
+ * into a jump to the first such heading.
+ */
+function attachHeadingSlug(blocks: PreparedBlock[], slug: string): void {
+	if (slug.length === 0) return;
+	const first = blocks[0];
+	if (!first || first.kind !== "inline") return;
+	blocks[0] = { ...first, headingSlug: slug };
 }
 
 function markerText(list: Tokens.List, item: Tokens.ListItem, index: number): string {

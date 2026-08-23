@@ -16,6 +16,7 @@ export type SupportedLanguage = Locale;
 
 export const namespaces = [
 	"common",
+	"errors",
 	"chapters",
 	"containers",
 	"dashboard",
@@ -67,13 +68,20 @@ function normalizePathname(pathname: string): string {
  * "Something went wrong!" screen. Every authenticated path must therefore
  * preload these before the shell can render.
  */
-const APP_SHELL_NAMESPACES = ["common", "nav", "settings"] as const satisfies Namespace[];
+const APP_SHELL_NAMESPACES = ["common", "errors", "nav", "settings"] as const satisfies Namespace[];
 
-/** Public paths that render without the authenticated app shell. */
+/**
+ * Public paths that render without the authenticated app shell.
+ *
+ * `errors` is in every entry, not just the authenticated shell: a failed request can happen on
+ * any surface, including the login form and the consent page. A path missing it does not throw
+ * — `describeApiError` silently falls back to the server's English prose, which is exactly the
+ * defect this whole change exists to remove, and it would be invisible in review.
+ */
 const PUBLIC_PATH_NAMESPACES = new Map<string, Namespace[]>([
-	["/login", ["common"]],
-	["/oauth/authorize", ["common"]],
-	["/licenses", ["common", "nav"]],
+	["/login", ["common", "errors"]],
+	["/oauth/authorize", ["common", "errors"]],
+	["/licenses", ["common", "errors", "nav"]],
 ]);
 
 export function getNamespacesForPath(pathname: string): Namespace[] {

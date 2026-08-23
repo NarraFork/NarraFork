@@ -162,6 +162,7 @@ export {
 	narratorHandleSchema,
 	narratorTransferOwnerSchema,
 	narratorVisibilitySchema,
+	narratorWriteAudienceSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
 	retryFailedCompactSchema,

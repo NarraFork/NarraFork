@@ -1,13 +1,26 @@
 /**
  * NarratorAccessPanel.tsx — who can see and drive one narrator.
  *
- * Two controls, matching the two halves of the model:
- *   - visibility: the broad READ audience (private / project / everyone);
- *   - people:     explicit per-user grants, read or write.
+ * Two NESTED audience levels plus the per-person list:
+ *   - visibility:    the broad READ audience (private / project / everyone);
+ *   - writeAudience: the broad WRITE audience, always a subset of the read audience;
+ *   - people:        explicit per-user grants, read or write.
+ *
+ * The second control's options are constrained by the first, because driving a session
+ * presupposes seeing it — you cannot let everyone drive something only the project can
+ * open. Forbidden options are DISABLED rather than hidden: hiding them would read as
+ * "this product cannot do that", while a disabled option with a reason points at the
+ * control that has to change first.
+ *
+ * Setting the read audience alone still does not hand over the ability to drive — that
+ * remains a separate, deliberate step, and the write hints spell out the consequence
+ * (approving commands, editing files) rather than leaving it to be discovered.
  *
  * Only the owner and admins can change anything; everyone else sees the state
  * read-only. Narrators created before access control have no owner, so the panel
- * says so instead of offering controls that would fail.
+ * says so instead of offering controls that would fail. A subagent has no access
+ * state of its own — it follows its main session — so the panel explains that and
+ * links there instead of rendering controls that cannot take effect.
  *
  * The user picker is backed by `/api/chat/directory` — the one endpoint a non-admin
  * may use to look up usernames. `/api/admin/users` stays admin-only.
@@ -16,6 +29,7 @@
 import {
 	ActionIcon,
 	Alert,
+	Anchor,
 	Badge,
 	Box,
 	Button,
@@ -29,6 +43,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
+import { NARRATOR_WRITE_AUDIENCES, WRITE_AUDIENCE_BY_VISIBILITY } from "@shared/narrator-access";
 import {
 	IconInfoCircle,
 	IconLock,
@@ -37,21 +52,41 @@ import {
 	IconUsers,
 	IconWorld,
 } from "@tabler/icons-react";
-import { useMemo, useState } from "react";
+import { Link } from "@tanstack/react-router";
+import { type ReactNode, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useChatDirectory } from "../../hooks/useChat";
 import { useNarratorAccess, useNarratorAccessMutations } from "../../hooks/useNarratorAccess";
-import type { NarratorGrantAccess, NarratorVisibility } from "../../lib/api/types";
+import type {
+	NarratorGrantAccess,
+	NarratorVisibility,
+	NarratorWriteAudience,
+} from "../../lib/api/types";
 import { UserAvatar } from "../UserAvatar";
 
 export interface NarratorAccessPanelProps {
 	narratorId: string;
 }
 
+/** Icon per write tier, mirroring the visibility control so the levels read as parallel. */
+const WRITE_AUDIENCE_ICONS: Record<NarratorWriteAudience, ReactNode> = {
+	owner: <IconLock size={13} />,
+	project: <IconUsers size={13} />,
+	public: <IconWorld size={13} />,
+};
+
+/** Translation-key suffix per tier. Separate from the value so keys stay readable. */
+const TIER_LABEL_KEY: Record<NarratorWriteAudience, string> = {
+	owner: "Owner",
+	project: "Project",
+	public: "Public",
+};
+
 export function NarratorAccessPanel({ narratorId }: NarratorAccessPanelProps) {
 	const { t } = useTranslation("narrator");
 	const access = useNarratorAccess(narratorId);
-	const { setVisibility, grant, updateGrant, revokeGrant } = useNarratorAccessMutations(narratorId);
+	const { setVisibility, setWriteAudience, grant, updateGrant, revokeGrant } =
+		useNarratorAccessMutations(narratorId);
 
 	const [query, setQuery] = useState("");
 	// Debounced: the directory query scans usernames, so one request per keystroke
@@ -61,6 +96,10 @@ export function NarratorAccessPanel({ narratorId }: NarratorAccessPanelProps) {
 	const directory = useChatDirectory(debouncedQuery, !!access.data?.canManage);
 
 	const canManage = access.data?.canManage ?? false;
+	// Which write tiers the current read audience permits — the same table the server
+	// validates against, so the UI cannot offer something that would 400.
+	const allowedWriteAudiences =
+		WRITE_AUDIENCE_BY_VISIBILITY[access.data?.visibility ?? "private"] ?? [];
 	const grants = access.data?.grants ?? [];
 	const grantedUserIds = useMemo(() => new Set(grants.map((g) => g.userId)), [grants]);
 
@@ -82,6 +121,23 @@ export function NarratorAccessPanel({ narratorId }: NarratorAccessPanelProps) {
 			<Alert color="gray" icon={<IconInfoCircle size={16} />}>
 				{t("access.unavailable")}
 			</Alert>
+		);
+	}
+
+	// A subagent's access is decided by its main session. Showing the (frozen) controls
+	// here would invite changes that silently do nothing.
+	if (access.data.isDelegated) {
+		return (
+			<Stack gap="md" role="region" aria-label={t("access.panelLabel")}>
+				<Alert color="blue" icon={<IconInfoCircle size={16} />}>
+					{t("access.delegatedNotice")}
+				</Alert>
+				{access.data.delegatesToNarratorId ? (
+					<Anchor component={Link} to={`/narrators/${access.data.delegatesToNarratorId}`} size="sm">
+						{t("access.delegatedLink")}
+					</Anchor>
+				) : null}
+			</Stack>
 		);
 	}
 
@@ -128,6 +184,44 @@ export function NarratorAccessPanel({ narratorId }: NarratorAccessPanelProps) {
 				/>
 				<Text size="xs" c="dimmed">
 					{t(`access.visibilityHint.${access.data.visibility}`)}
+				</Text>
+			</Stack>
+
+			<Stack gap={6}>
+				<Text size="sm" fw={500}>
+					{t("access.writeAudienceTitle")}
+				</Text>
+				<SegmentedControl
+					aria-label={t("access.writeAudienceTitle")}
+					value={access.data.writeAudience}
+					onChange={(value) => setWriteAudience.mutate(value as NarratorWriteAudience)}
+					disabled={!canManage || setWriteAudience.isPending}
+					data={NARRATOR_WRITE_AUDIENCES.map((tier) => {
+						const permitted = allowedWriteAudiences.includes(tier);
+						const label = (
+							<Group key={tier} gap={4} justify="center" wrap="nowrap">
+								{WRITE_AUDIENCE_ICONS[tier]}
+								<span>{t(`access.writeAudience${TIER_LABEL_KEY[tier]}`)}</span>
+							</Group>
+						);
+						return {
+							value: tier,
+							// A forbidden tier stays visible but disabled, and the tooltip says
+							// which control has to change first — hiding it would read as "the
+							// product cannot do this".
+							label: permitted ? (
+								label
+							) : (
+								<Tooltip key={tier} label={t(`access.writeAudienceBlocked.${tier}`)} withArrow>
+									<Box style={{ opacity: 0.45, cursor: "not-allowed" }}>{label}</Box>
+								</Tooltip>
+							),
+							disabled: !permitted,
+						};
+					})}
+				/>
+				<Text size="xs" c={access.data.writeAudience === "owner" ? "dimmed" : "orange"}>
+					{t(`access.writeAudienceHint.${access.data.writeAudience}`)}
 				</Text>
 			</Stack>
 

@@ -4446,6 +4446,13 @@ export async function handlePermission(
 			attentionEmitted,
 		};
 		pendingPermissions.set(toolCallId, pendingEntry);
+		// The row is already `pending` and the request is now registered, so this wait is durable:
+		// a checkpoint will persist it as a `pending_permission` continuation and the replacement
+		// process re-offers it with its stored input. Tell the executor it may drop its update
+		// start grant, so an unanswered request does not block a planned restart. Deliberately
+		// after `pendingPermissions.set` — releasing before the request is discoverable would let
+		// a restart checkpoint see neither an in-flight tool nor a recoverable request.
+		options?.onAwaitingUserDecision?.();
 		if (toolName === "AskUserQuestion" && questionReflectionDeadline !== undefined) {
 			pendingEntry.questionReflectionDeadline = questionReflectionDeadline;
 			pendingEntry.questionReflectionTimer = scheduleQuestionReflection(

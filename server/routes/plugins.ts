@@ -3,7 +3,7 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { z } from "zod/v4";
-import { AppError, formatZodError, NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError, zodValidationError } from "../lib/errors";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { pluginIdSchema } from "../lib/plugins/manifest";
 import { permissionGrantSchema } from "../lib/plugins/permissions";
@@ -546,13 +546,13 @@ function errorResponse(c: Context, error: unknown): Response {
 }
 
 function parseBodyError(error: unknown): ValidationError {
-	if (error instanceof z.ZodError) return new ValidationError(formatZodError(error));
+	if (error instanceof z.ZodError) return zodValidationError(error);
 	return new ValidationError("Invalid JSON request body");
 }
 
 function parsePluginId(c: Context): string {
 	const parsed = pluginIdParamSchema.safeParse(c.req.param());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 	return parsed.data.pluginId;
 }
 
@@ -673,7 +673,7 @@ export function createPluginRoutes(
 				throw parseBodyError(error);
 			}
 			const parsed = permissionReplaceSchema.safeParse(rawBody);
-			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			if (!parsed.success) throw zodValidationError(parsed.error);
 			const grantedBy = adminActor(c);
 			const mutation = await manager.replacePermissions(pluginId, {
 				expectedRevision: parsed.data.expectedRevision,
@@ -715,7 +715,7 @@ export function createPluginRoutes(
 				throw parseBodyError(error);
 			}
 			const parsed = providerConfigUpdateSchema.safeParse(rawBody);
-			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			if (!parsed.success) throw zodValidationError(parsed.error);
 			const updated = await providerConfig.update(
 				pluginId,
 				parsed.data.providerInstanceId,
@@ -751,7 +751,7 @@ export function createPluginRoutes(
 				throw parseBodyError(error);
 			}
 			const parsed = providerCatalogRefreshSchema.safeParse(rawBody);
-			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			if (!parsed.success) throw zodValidationError(parsed.error);
 			// Ownership check: the refresher addresses a provider instance globally, so without
 			// this an admin could refresh another plugin's catalog through this plugin's path.
 			const views = await providerConfig.list(pluginId);
@@ -806,7 +806,7 @@ export function createPluginRoutes(
 				throw parseBodyError(error);
 			}
 			const parsed = providerProxyUpdateSchema.safeParse(rawBody);
-			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			if (!parsed.success) throw zodValidationError(parsed.error);
 			const updated = await providerConfig.updateProxy(
 				pluginId,
 				parsed.data.providerInstanceId,
@@ -829,7 +829,7 @@ export function createPluginRoutes(
 				throw parseBodyError(error);
 			}
 			const parsed = providerPrefixUpdateSchema.safeParse(rawBody);
-			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			if (!parsed.success) throw zodValidationError(parsed.error);
 			const updated = await providerConfig.updatePrefix(
 				pluginId,
 				parsed.data.providerInstanceId,
@@ -855,7 +855,7 @@ export function createPluginRoutes(
 				throw parseBodyError(error);
 			}
 			const parsed = permissionRevokeSchema.safeParse(rawBody);
-			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			if (!parsed.success) throw zodValidationError(parsed.error);
 			const mutation = await manager.revokePermissions(pluginId, {
 				...parsed.data,
 				grantedBy: adminActor(c),
@@ -957,7 +957,7 @@ export function createPluginRoutes(
 				throw parseBodyError(error);
 			}
 			const parsed = installSchema.safeParse(body);
-			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			if (!parsed.success) throw zodValidationError(parsed.error);
 			const source = resolveInstallPath(parsed.data.path, installRoots);
 			const status = await manager.install(source);
 			return c.json(sanitizeSummary(status), 201);

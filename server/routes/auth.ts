@@ -7,7 +7,7 @@ import { users } from "../db/schema";
 import { buildSessionResult, loginUser, registerUser } from "../lib/auth";
 import { type AuthAttemptBlocked, authAttemptLimiter } from "../lib/auth-attempt-limiter";
 import { getClientIp } from "../lib/client-ip";
-import { AppError, formatZodError, RateLimitError, ValidationError } from "../lib/errors";
+import { AppError, RateLimitError, ValidationError, zodValidationError } from "../lib/errors";
 import { invalidateGitIdentityCache } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import {
@@ -76,7 +76,7 @@ authRoutes.post("/register", async (c) => {
 	// Validate before taking a lease so malformed bodies don't consume the
 	// instance's registration budget or the shared bcrypt slot.
 	const parsed = registerSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 
 	// An instance with no users yet is exempt from the instance-wide interval: the
 	// bootstrap admin is often created after a couple of validation failures, and
@@ -107,7 +107,7 @@ authRoutes.post("/register", async (c) => {
 
 authRoutes.post("/login", async (c) => {
 	const parsed = loginSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 	// Result is either a full session ({ user, token, language }) or an MFA
 	// challenge ({ mfaRequired, mfaToken, methods }) when a second factor is
 	// enrolled — in the latter case no session token is issued yet and the
@@ -122,7 +122,7 @@ authRoutes.post("/login", async (c) => {
  */
 authRoutes.post("/mfa/verify", async (c) => {
 	const parsed = mfaVerifySchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 	const { mfaToken, method, code } = parsed.data;
 	const { challenge, sourceIp } = await verifyRateLimitedMfaToken(c, mfaToken);
 	const userId = challenge.sub;
@@ -180,7 +180,7 @@ authRoutes.post("/mfa/verify", async (c) => {
 authRoutes.post("/passkey/login/options", async (c) => {
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = passkeyLoginOptionsSchema.safeParse(body);
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 	// Usernameless: no allowCredentials, the authenticator picks the credential.
 	const options = await passkeyService.authenticationOptions({
 		userId: null,
@@ -192,7 +192,7 @@ authRoutes.post("/passkey/login/options", async (c) => {
 /** Complete a passwordless passkey login and establish a session. */
 authRoutes.post("/passkey/login/verify", async (c) => {
 	const parsed = passkeyLoginVerifySchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 	const result = await passkeyService.verifyAuthentication({
 		response: parsed.data.response as unknown as AuthenticationResponseJSON,
 		expectedUserId: null,
@@ -227,7 +227,7 @@ authRoutes.post("/mfa/passkey/options", async (c) => {
 /** Verify the passkey second factor and establish a session. */
 authRoutes.post("/mfa/passkey/verify", async (c) => {
 	const parsed = passkeyMfaVerifySchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 	const { challenge, sourceIp } = await verifyRateLimitedMfaToken(c, parsed.data.mfaToken);
 	const userId = challenge.sub;
 	const attempt = authAttemptLimiter.beginMfa(userId, sourceIp, false);
@@ -296,7 +296,7 @@ authRoutes.get("/me", requireSessionAuth, async (c) => {
 authRoutes.patch("/me", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const parsed = updateProfileSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 	const update: Record<string, string | null> = {};
 	if (parsed.data.gitUsername !== undefined) {
 		update.gitUsername = parsed.data.gitUsername || null;
@@ -356,7 +356,7 @@ authRoutes.get("/me/security", requireSessionAuth, async (c) => {
 authRoutes.patch("/me/mfa", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const parsed = mfaToggleSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 
 	if (parsed.data.enabled) {
 		const hasFactor = await mfaService.hasAnyFactor(payload.sub);
@@ -404,7 +404,7 @@ authRoutes.post("/me/totp/setup", requireSessionAuth, async (c) => {
 authRoutes.post("/me/totp/activate", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const parsed = totpActivateSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 
 	const result = await mfaService.activate(payload.sub, parsed.data.code);
 	if (!result.ok) {
@@ -420,7 +420,7 @@ authRoutes.post("/me/totp/activate", requireSessionAuth, async (c) => {
 authRoutes.delete("/me/totp", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const parsed = totpDisableSchema.safeParse(await c.req.json().catch(() => ({})));
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 
 	const active = await mfaService.isTotpActive(payload.sub);
 	if (!active) {
@@ -484,7 +484,7 @@ authRoutes.post("/me/passkeys/register/options", requireSessionAuth, async (c) =
 authRoutes.post("/me/passkeys/register/verify", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const parsed = passkeyRegisterSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 	const result = await passkeyService.verifyRegistration({
 		userId: payload.sub,
 		response: parsed.data.response as unknown as RegistrationResponseJSON,
@@ -503,7 +503,7 @@ authRoutes.patch("/me/passkeys/:id", requireSessionAuth, async (c) => {
 	const id = c.req.param("id");
 	if (!id) throw new ValidationError("Passkey id is required");
 	const parsed = passkeyRenameSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	if (!parsed.success) throw zodValidationError(parsed.error);
 	const ok = await passkeyService.rename(payload.sub, id, parsed.data.name);
 	if (!ok) throw new AppError("Passkey not found", 404, "NOT_FOUND");
 	return c.json({ ok: true });

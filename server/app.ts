@@ -6,7 +6,8 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { db } from "./db";
 import { users } from "./db/schema";
-import { buildAppErrorResponse } from "./lib/app-error-response";
+import { buildAppErrorResponse, toErrorPayload } from "./lib/app-error-response";
+import { catalogError } from "./lib/errors";
 import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { getRuntimeEnvironment } from "./lib/platform";
@@ -271,13 +272,9 @@ app.use("/api/*", async (c, next) => {
 	const path = c.req.path;
 	if (!requiresGit(c.req.method, path)) return next();
 	if (gitAvailable || recheckGit()) return next();
-	return c.json(
-		{
-			error: "Git is not installed. Please install git and retry this Git-dependent action.",
-			code: "GIT_NOT_INSTALLED",
-		},
-		503,
-	);
+	// Routed through the catalog so this reaches the user in their language like any other
+	// error, instead of being the one hand-written English body in the request pipeline.
+	throw catalogError("GIT_NOT_INSTALLED");
 });
 
 app.route("/api/projects", projectRoutes);
@@ -350,7 +347,13 @@ app.onError((err, c) => {
 	const knownErrorResponse = buildAppErrorResponse(err, c);
 	if (knownErrorResponse) return knownErrorResponse;
 	logger.error("Unhandled error", { error: String(err), stack: (err as Error).stack });
-	return c.json({ error: "Internal server error" }, 500);
+	// The message stays deliberately generic (an unhandled error may quote internals), but it
+	// still carries a code so the client can localize it rather than print English.
+	//
+	// Built through the catalog rather than as an object literal: a literal's `messageCode`
+	// is just a string to TypeScript, so a typo would compile, and the client discards an
+	// unknown code silently — the only symptom would be English text in a localized UI.
+	return c.json(toErrorPayload(catalogError("INTERNAL_ERROR")), 500);
 });
 
 export { app };

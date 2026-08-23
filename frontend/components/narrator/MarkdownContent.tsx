@@ -1,4 +1,10 @@
+import {
+	handleMarkdownAnchorClick,
+	MD_HEADING_SLUG_ATTR,
+	markdownLinkTargetProps,
+} from "@frontend/lib/markdown-anchor-scroll";
 import { Code, Divider, Table, Text } from "@mantine/core";
+import { reactChildrenToHeadingText, slugifyHeading } from "@shared/pretext-layout/markdown-anchor";
 import {
 	Children,
 	Component,
@@ -29,6 +35,17 @@ import {
 import { hasUnclosedFence, splitStableAndTail } from "./streaming-markdown-split";
 
 export { MD_PATTERN } from "./markdown-detection";
+
+/**
+ * Marks the container that bounds ONE markdown body, so a `#heading` click can
+ * find its own headings and no one else's.
+ *
+ * Needed because the streaming renderer splits a message into a memoised prefix
+ * tree and an active tail tree; both are children of this single root, so the
+ * scope stays whole while the split moves. Resolved via `closest` at click time
+ * rather than passed down, since the component map is built once at module level.
+ */
+const MD_ROOT_ATTR = "data-md-body";
 
 /**
  * Carries the live `streaming` flag down to the markdown `code` renderer so the
@@ -151,7 +168,20 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 	function headingComponent({ children, node }: any) {
 		const tag = (node?.tagName ?? "h3") as "h1" | "h2" | "h3" | "h4" | "h5" | "h6";
 		const Tag = tag;
-		return <Tag>{at(children)}</Tag>;
+		// The slug a `[x](#…)` link in the same body resolves against. Read off the
+		// RENDERED children rather than the source, so a heading containing a link
+		// slugs its visible label instead of the destination url.
+		//
+		// `reactChildrenToHeadingText` rather than this file's `extractText`: the same
+		// markdown must advertise the same slug in the prepared (vlist) renderer, and
+		// the two walks disagreed on images and math. It lives beside
+		// `inlineTokensToPlainText` so the agreement is testable in one place.
+		//
+		// Carried in a data attribute, not `id`: the narrator message list mounts
+		// hundreds of independent markdown bodies into one document and several
+		// legitimately repeat a heading, which as ids would be duplicates.
+		const slug = slugifyHeading(reactChildrenToHeadingText(children));
+		return <Tag {...(slug ? { [MD_HEADING_SLUG_ATTR]: slug } : {})}>{at(children)}</Tag>;
 	}
 
 	return {
@@ -180,8 +210,28 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 			return <li>{at(children)}</li>;
 		},
 		a({ href, children }) {
+			// A same-document `#heading` anchor scrolls WITHIN this body and gets no
+			// `target`; every real destination keeps opening in a new tab as before.
+			// Applying `target="_blank"` to a fragment is what used to open a blank tab
+			// on an in-document link.
+			//
+			// The scope is resolved from the DOM at click time (`closest`) rather than
+			// through a context: these components are built once at module level, and a
+			// context would force them to be rebuilt per instance — re-mounting every
+			// markdown subtree in the app on each render.
 			return (
-				<a className={classes.mdLink} href={href} target="_blank" rel="noopener noreferrer">
+				<a
+					className={classes.mdLink}
+					href={href}
+					{...markdownLinkTargetProps(href)}
+					onClick={(event) => {
+						handleMarkdownAnchorClick(
+							event,
+							href,
+							event.currentTarget.closest(`[${MD_ROOT_ATTR}]`),
+						);
+					}}
+				>
 					{at(children)}
 				</a>
 			);
@@ -609,7 +659,7 @@ function StreamingSplitMarkdown({
 	const animateTail = tailAnimate && !hasUnclosedFence(tail) && !hasUnclosedMath(tail);
 
 	return (
-		<div className={wordWrap ? classes.root : classes.rootNoWrap}>
+		<div {...{ [MD_ROOT_ATTR]: "" }} className={wordWrap ? classes.root : classes.rootNoWrap}>
 			{stablePrefix && (
 				<StablePrefixMarkdown
 					source={stablePrefix}
@@ -731,7 +781,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 		return (
 			<MarkdownErrorBoundary fallback={plainFallback}>
 				<MermaidStreamingCtx.Provider value={true}>
-					<div className={wordWrap ? classes.root : classes.rootNoWrap}>
+					<div {...{ [MD_ROOT_ATTR]: "" }} className={wordWrap ? classes.root : classes.rootNoWrap}>
 						<AnimatedMarkdownTree
 							source={trimmed}
 							remarkPlugins={remarkPlugins}
@@ -770,7 +820,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 	return (
 		<MarkdownErrorBoundary fallback={plainFallback}>
 			<MermaidStreamingCtx.Provider value={!!streaming}>
-				<div className={wordWrap ? classes.root : classes.rootNoWrap}>
+				<div {...{ [MD_ROOT_ATTR]: "" }} className={wordWrap ? classes.root : classes.rootNoWrap}>
 					<StaticMarkdownTree
 						source={markdownSource}
 						remarkPlugins={remarkPlugins}

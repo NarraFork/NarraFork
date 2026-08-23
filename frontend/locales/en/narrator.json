@@ -665,7 +665,8 @@
 		"windowMonthly": "Monthly limit",
 		"windowLine": "{{label}}: used {{used}}/{{limit}}",
 		"resetSuffix": ", resets at {{time}}",
-		"fetchError": "Usage fetch failed: {{error}}"
+		"fetchError": "Usage fetch failed: {{error}}",
+		"fetchFailed": "Usage fetch failed (ask an administrator for details)"
 	},
 	"recharge": {
 		"title": "NUG Recharge",
@@ -1308,6 +1309,22 @@
 			"project": "Anyone working on this project can follow along.",
 			"public": "Any signed-in user can open this session."
 		},
+		"writeAudienceTitle": "Who can drive this session",
+		"writeAudienceOwner": "Only me",
+		"writeAudienceProject": "Project members",
+		"writeAudiencePublic": "Everyone",
+		"writeAudienceHint": {
+			"owner": "Only you, admins, and people you individually grant \"can drive\" may send messages and approve tool calls.",
+			"project": "Project members with write access can send messages and approve tool calls, including running commands and editing files. Read-only members can still only watch.",
+			"public": "Any signed-in user who can reach this project can send messages and approve tool calls, including running commands and editing files."
+		},
+		"writeAudienceBlocked": {
+			"owner": "This option is always available.",
+			"project": "Driving requires seeing: set visibility above to Project or Everyone first.",
+			"public": "Driving requires seeing: set visibility above to Everyone first."
+		},
+		"delegatedNotice": "This is a subagent. Its access follows the main session it belongs to and cannot be set separately.",
+		"delegatedLink": "Open the main session to change sharing",
 		"peopleTitle": "People with access",
 		"ownerLabel": "Owner: {{username}}",
 		"noOwner": "This session predates access control and has no owner, so only an administrator can change its sharing. Ask one to transfer it to you.",

@@ -150,6 +150,44 @@ describe("who may change sharing", () => {
 	});
 });
 
+describe("the read/write gate on mutating sub-paths", () => {
+	test("`leave` is reachable with read access only", async () => {
+		// Closing a tab clears the "interrupted" badge, and a read-only viewer legitimately
+		// triggers it. Denying it would leave the badge stuck for everyone else.
+		const id = await makeNarrator();
+		await request(OWNER, `/${id}/grants`, {
+			method: "POST",
+			body: { userIds: [FRIEND], access: "read" },
+		});
+		expect((await request(FRIEND, `/${id}/leave`, { method: "POST" })).status).not.toBe(404);
+	});
+
+	test("the exemption does not extend to a deeper path ending in the same word", async () => {
+		// The gate used to test only the LAST path segment, so any future
+		// `/:id/<anything>/leave` would inherit the read downgrade without anyone deciding
+		// so. A read-only user must be refused here — 404 is how this API hides sessions
+		// the caller may not write.
+		const id = await makeNarrator();
+		await request(OWNER, `/${id}/grants`, {
+			method: "POST",
+			body: { userIds: [FRIEND], access: "read" },
+		});
+		const res = await request(FRIEND, `/${id}/rooms/r1/leave`, { method: "POST" });
+		expect(res.status).toBe(404);
+		// And specifically the ACL's 404, not the router's: the body carries an error.
+		expect(await res.json()).toHaveProperty("error");
+	});
+
+	test("an ordinary mutating sub-path still requires write", async () => {
+		const id = await makeNarrator();
+		await request(OWNER, `/${id}/grants`, {
+			method: "POST",
+			body: { userIds: [FRIEND], access: "read" },
+		});
+		expect((await request(FRIEND, `/${id}/interrupt`, { method: "POST" })).status).toBe(404);
+	});
+});
+
 describe("grant levels", () => {
 	test("a read grant does not allow driving the session", async () => {
 		const id = await makeNarrator();
@@ -270,6 +308,117 @@ describe("visibility", () => {
 			body: { visibility: "everyone" },
 		});
 		expect(res.status).toBe(400);
+	});
+});
+
+describe("write audience", () => {
+	test("opening it to everyone lets a stranger drive the session", async () => {
+		// The regression this whole axis exists for: a broad audience used to be settable
+		// for reading only, so collaborators had to be added one by one before they could
+		// do anything.
+		//
+		// Two steps, because the write audience is nested inside the read audience: you
+		// cannot let everyone drive a session only you can open.
+		const id = await makeNarrator();
+		expect(
+			(await request(STRANGER, `/${id}/model`, { method: "PATCH", body: { model: "m" } })).status,
+		).toBe(404);
+
+		await request(OWNER, `/${id}/visibility`, { method: "PATCH", body: { visibility: "public" } });
+		const res = await request(OWNER, `/${id}/write-audience`, {
+			method: "PATCH",
+			body: { writeAudience: "public" },
+		});
+		expect(res.status).toBe(200);
+		expect((await res.json()).writeAudience).toBe("public");
+
+		expect(
+			(await request(STRANGER, `/${id}/model`, { method: "PATCH", body: { model: "m" } })).status,
+		).toBe(200);
+	});
+
+	test("setting a write audience wider than the read audience is refused", async () => {
+		// The nesting is enforced at the boundary, and the message names the control to
+		// change first rather than just reporting an invalid combination.
+		const id = await makeNarrator();
+		const res = await request(OWNER, `/${id}/write-audience`, {
+			method: "PATCH",
+			body: { writeAudience: "public" },
+		});
+		expect(res.status).toBe(400);
+		expect((await res.json()).error).toMatch(/visibility/i);
+	});
+
+	test("narrowing the read audience clamps the write audience instead of failing", async () => {
+		// Tightening access must never be refused for producing an illegal pair.
+		const id = await makeNarrator();
+		await request(OWNER, `/${id}/visibility`, { method: "PATCH", body: { visibility: "public" } });
+		await request(OWNER, `/${id}/write-audience`, {
+			method: "PATCH",
+			body: { writeAudience: "public" },
+		});
+
+		const res = await request(OWNER, `/${id}/visibility`, {
+			method: "PATCH",
+			body: { visibility: "private" },
+		});
+		expect(res.status).toBe(200);
+		expect((await res.json()).writeAudience).toBe("owner");
+		expect(
+			(await request(STRANGER, `/${id}/model`, { method: "PATCH", body: { model: "m" } })).status,
+		).toBe(404);
+	});
+
+	test("narrowing it back to owner-only takes the ability away again", async () => {
+		const id = await makeNarrator();
+		await request(OWNER, `/${id}/visibility`, { method: "PATCH", body: { visibility: "public" } });
+		await request(OWNER, `/${id}/write-audience`, {
+			method: "PATCH",
+			body: { writeAudience: "public" },
+		});
+		await request(OWNER, `/${id}/write-audience`, {
+			method: "PATCH",
+			body: { writeAudience: "owner" },
+		});
+		expect(
+			(await request(STRANGER, `/${id}/model`, { method: "PATCH", body: { model: "m" } })).status,
+		).toBe(404);
+	});
+
+	test("a write-granted user cannot change the audience", async () => {
+		// Driving a session is not deciding who else may. Visibility is opened first so
+		// the request is a LEGAL pair — otherwise this would be refused by the nesting
+		// rule and pass without ever exercising the ownership check it is about.
+		const id = await makeNarrator();
+		await request(OWNER, `/${id}/visibility`, { method: "PATCH", body: { visibility: "public" } });
+		await request(OWNER, `/${id}/grants`, {
+			method: "POST",
+			body: { userIds: [FRIEND], access: "write" },
+		});
+		const res = await request(FRIEND, `/${id}/write-audience`, {
+			method: "PATCH",
+			body: { writeAudience: "public" },
+		});
+		expect(res.status).toBe(400);
+		expect((await res.json()).error).toMatch(/owner or an administrator/i);
+	});
+
+	test("an unknown write audience value is rejected", async () => {
+		const id = await makeNarrator();
+		const res = await request(OWNER, `/${id}/write-audience`, {
+			method: "PATCH",
+			body: { writeAudience: "anyone" },
+		});
+		expect(res.status).toBe(400);
+	});
+
+	test("the read audience alone still does not grant write", async () => {
+		const id = await makeNarrator();
+		await request(OWNER, `/${id}/visibility`, { method: "PATCH", body: { visibility: "public" } });
+		expect((await request(STRANGER, `/${id}`)).status).toBe(200);
+		expect(
+			(await request(STRANGER, `/${id}/model`, { method: "PATCH", body: { model: "m" } })).status,
+		).toBe(404);
 	});
 });
 

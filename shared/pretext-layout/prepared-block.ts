@@ -85,6 +85,20 @@ export interface PreparedInlineBlock extends PreparedBlockBase {
 	 */
 	mathHtmls?: Array<InlineMathFragment | null>;
 	/**
+	 * Anchor slug when this block is a markdown HEADING; absent otherwise.
+	 *
+	 * Height-neutral but PAINTED (as `data-md-heading`), so it is what lets a
+	 * `[x](#…)` link elsewhere in the same body find this heading. Lives on the
+	 * prepared block because that is where the heading's inline tokens are still
+	 * available — the render layer only ever sees materialized line fragments, by
+	 * which point the heading text has been split across visual lines and the
+	 * block no longer knows it was a heading at all.
+	 *
+	 * Only the FIRST block of a multi-line heading carries it: that is the block a
+	 * jump should land on, and duplicating it would give one anchor several targets.
+	 */
+	headingSlug?: string;
+	/**
 	 * Optional render-only payload (kept small; no heavy data). Height-neutral —
 	 * geometry never consults it. Used e.g. to carry a spec-task's status/lock
 	 * glyph so the render layer can draw it in the reserved indent lane.

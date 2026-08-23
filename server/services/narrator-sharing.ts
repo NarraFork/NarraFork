@@ -12,6 +12,12 @@
  * streaming events until they happened to reload.
  */
 
+import {
+	clampWriteAudience,
+	isWriteAudienceAllowed,
+	type NarratorVisibility,
+	type NarratorWriteAudience,
+} from "@shared/narrator-access";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { aclGrants, narrators, users } from "../db/schema";
@@ -22,7 +28,8 @@ import {
 	broadcastToUser,
 	dropNarratorSubscriptionsForUnauthorizedUsers,
 } from "../websocket/narrator-ws";
-import { canManageNarratorAcl, type NarratorPrincipal } from "./narrator-acl";
+import { recordAclEvent } from "./acl/acl-audit";
+import { canManageNarratorAcl, type NarratorPrincipal, resolveAclRootId } from "./narrator-acl";
 
 export interface NarratorGrantView {
 	id: string;
@@ -36,7 +43,10 @@ export interface NarratorGrantView {
 
 export interface NarratorAccessView {
 	narratorId: string;
+	/** Broad READ audience: private | project | public. */
 	visibility: string;
+	/** Broad WRITE audience: owner | project | public. */
+	writeAudience: string;
 	owner: {
 		userId: string;
 		username: string | null;
@@ -46,6 +56,14 @@ export interface NarratorAccessView {
 	grants: NarratorGrantView[];
 	/** Whether the requesting user may change any of the above. */
 	canManage: boolean;
+	/**
+	 * True for a subagent, whose access is decided by `delegatesToNarratorId` rather
+	 * than by anything on this view. The panel uses it to explain where the real
+	 * setting lives instead of rendering controls that cannot take effect.
+	 */
+	isDelegated: boolean;
+	/** The narrator actually governing access — the root for a subagent, else itself. */
+	delegatesToNarratorId: string | null;
 }
 
 type NarratorRow = typeof narrators.$inferSelect;
@@ -79,9 +97,19 @@ async function loadNarrator(narratorId: string): Promise<NarratorRow> {
  *
  * A plain 403 here, not the 404 used for read denial: the caller has already been
  * allowed to see the narrator, so hiding the reason would only be confusing.
+ *
+ * A subagent is refused outright rather than checked. Its access is delegated to the
+ * root narrator, so editing its own audiences or grants would change nothing — and a
+ * control that silently does nothing is worse than an error explaining where the real
+ * setting lives.
  */
-function assertCanManage(row: NarratorRow, principal: NarratorPrincipal): void {
-	if (canManageNarratorAcl(row, principal)) return;
+async function assertCanManage(row: NarratorRow, principal: NarratorPrincipal): Promise<void> {
+	if (row.type === "subagent") {
+		throw new ValidationError(
+			"A subagent's access follows its main session; change the sharing there instead",
+		);
+	}
+	if (await canManageNarratorAcl(row, principal)) return;
 	throw new ValidationError(
 		row.ownerUserId === null
 			? "This narrator has no owner; an administrator must assign one before it can be shared"
@@ -89,12 +117,24 @@ function assertCanManage(row: NarratorRow, principal: NarratorPrincipal): void {
 	);
 }
 
-/** Current sharing state, for the access panel. */
+/**
+ * Current sharing state, for the access panel.
+ *
+ * For a subagent this reports the state of the narrator that actually governs access
+ * — the root — not the subagent's own columns. Those are frozen at their strictest
+ * values and play no part in any decision, so showing them would tell the user their
+ * shared session is private.
+ *
+ * A subagent whose root cannot be resolved reports its own (deny-everything) state,
+ * which is exactly what is being enforced.
+ */
 export async function getNarratorAccess(
 	narratorId: string,
 	principal: NarratorPrincipal,
 ): Promise<NarratorAccessView> {
 	const row = await loadNarrator(narratorId);
+	const governingId = (await resolveAclRootId(row)) ?? narratorId;
+	const governing = governingId === narratorId ? row : await loadNarrator(governingId);
 	const grants = await db
 		.select({
 			id: aclGrants.id,
@@ -107,18 +147,19 @@ export async function getNarratorAccess(
 		})
 		.from(aclGrants)
 		.leftJoin(users, eq(users.id, aclGrants.principalId))
-		.where(narratorUserGrantScope(narratorId));
+		.where(narratorUserGrantScope(governingId));
 
-	const owner = row.ownerUserId
+	const owner = governing.ownerUserId
 		? ((await db.query.users.findFirst({
-				where: eq(users.id, row.ownerUserId),
+				where: eq(users.id, governing.ownerUserId),
 				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
 			})) ?? null)
 		: null;
 
 	return {
 		narratorId,
-		visibility: row.visibility,
+		visibility: governing.visibility,
+		writeAudience: governing.writeAudience,
 		owner: owner
 			? {
 					userId: owner.id,
@@ -136,24 +177,114 @@ export async function getNarratorAccess(
 			access: grant.access as "read" | "write",
 			createdAt: grant.createdAt,
 		})),
-		canManage: canManageNarratorAcl(row, principal),
+		// A subagent is never manageable in place, whoever is asking.
+		canManage: row.type !== "subagent" && (await canManageNarratorAcl(row, principal)),
+		isDelegated: row.type === "subagent",
+		delegatesToNarratorId: governingId === narratorId ? null : governingId,
 	};
 }
 
+/**
+ * Change the broad READ audience.
+ *
+ * Narrowing it may leave the write audience wider than the new read audience, which is
+ * not a legal pair. That is resolved by CLAMPING the write audience down, never by
+ * refusing the request: refusing would leave the user stuck at the more open setting
+ * they were trying to back out of, which is the worst direction for a safety control to
+ * fail in. The clamp lands in the same UPDATE, so no observer can catch an illegal pair
+ * in between, and it is audited separately so "who narrowed the write audience" has an
+ * answer that does not require inferring it.
+ */
 export async function setNarratorVisibility(
 	narratorId: string,
-	visibility: "private" | "project" | "public",
+	visibility: NarratorVisibility,
 	principal: NarratorPrincipal,
 ): Promise<NarratorAccessView> {
 	const row = await loadNarrator(narratorId);
-	assertCanManage(row, principal);
-	if (row.visibility !== visibility) {
+	await assertCanManage(row, principal);
+	const clampedWriteAudience = clampWriteAudience(visibility, row.writeAudience);
+	const writeAudienceChanged = clampedWriteAudience !== row.writeAudience;
+	if (row.visibility !== visibility || writeAudienceChanged) {
 		await db
 			.update(narrators)
-			.set({ visibility, updatedAt: new Date().toISOString() })
+			.set({
+				visibility,
+				writeAudience: clampedWriteAudience,
+				updatedAt: new Date().toISOString(),
+			})
 			.where(eq(narrators.id, narratorId));
+		recordAclEvent({
+			actor: principal,
+			eventType: "narrator_visibility_changed",
+			scopeType: "narrator",
+			scopeId: narratorId,
+			outcome: "updated",
+			detail: { from: row.visibility, to: visibility },
+		});
+		if (writeAudienceChanged) {
+			recordAclEvent({
+				actor: principal,
+				eventType: "narrator_write_audience_changed",
+				scopeType: "narrator",
+				scopeId: narratorId,
+				outcome: "updated",
+				// Flagged as a consequence rather than a direct request, so the trail shows
+				// the user narrowed visibility and this followed.
+				detail: {
+					from: row.writeAudience,
+					to: clampedWriteAudience,
+					reason: "clamped_by_visibility",
+				},
+			});
+		}
 		// Narrowing the audience can strip access from people currently watching.
 		await announceAccessChange(narratorId, "visibility_changed");
+	}
+	return await getNarratorAccess(narratorId, principal);
+}
+
+/**
+ * Change who may DRIVE this narrator, as a broad audience.
+ *
+ * The counterpart to {@link setNarratorVisibility} on the other axis. Audited for the
+ * same reason project visibility is: "who opened this session up for anyone to run
+ * commands in" is precisely the question asked after something goes wrong, and the
+ * answer has to survive the change being reverted.
+ */
+export async function setNarratorWriteAudience(
+	narratorId: string,
+	writeAudience: NarratorWriteAudience,
+	principal: NarratorPrincipal,
+): Promise<NarratorAccessView> {
+	const row = await loadNarrator(narratorId);
+	await assertCanManage(row, principal);
+	// The opposite of the clamp in `setNarratorVisibility`: widening the write audience
+	// past the read audience is REFUSED rather than silently pulling visibility up with
+	// it, because that would enlarge an audience the user did not ask to enlarge. The
+	// message names the next step, since "invalid combination" leaves them guessing.
+	if (!isWriteAudienceAllowed(row.visibility, writeAudience)) {
+		throw new ValidationError(
+			writeAudience === "public"
+				? "This session is not visible to everyone yet; set visibility to everyone before letting everyone drive it"
+				: "This session is only visible to you; set visibility to the project before letting project members drive it",
+		);
+	}
+	if (row.writeAudience !== writeAudience) {
+		await db
+			.update(narrators)
+			.set({ writeAudience, updatedAt: new Date().toISOString() })
+			.where(eq(narrators.id, narratorId));
+		recordAclEvent({
+			actor: principal,
+			eventType: "narrator_write_audience_changed",
+			scopeType: "narrator",
+			scopeId: narratorId,
+			outcome: "updated",
+			detail: { from: row.writeAudience, to: writeAudience },
+		});
+		// Narrowing it must end the authority of anyone currently driving the session,
+		// including the subscriptions they are holding open.
+		await announceAccessChange(narratorId, "write_audience_changed");
 	}
 	return await getNarratorAccess(narratorId, principal);
 }
@@ -180,7 +311,7 @@ export async function grantNarratorAccess(
 	principal: NarratorPrincipal,
 ): Promise<BulkGrantOutcome> {
 	const row = await loadNarrator(narratorId);
-	assertCanManage(row, principal);
+	await assertCanManage(row, principal);
 
 	// Preserve caller order while collapsing duplicates, so a repeated id cannot
 	// attempt the same insert twice.
@@ -244,7 +375,7 @@ export async function updateNarratorGrant(
 	principal: NarratorPrincipal,
 ): Promise<NarratorGrantView[]> {
 	const row = await loadNarrator(narratorId);
-	assertCanManage(row, principal);
+	await assertCanManage(row, principal);
 	const grant = await db.query.aclGrants.findFirst({
 		where: and(eq(aclGrants.id, grantId), narratorUserGrantScope(narratorId)),
 	});
@@ -262,7 +393,7 @@ export async function revokeNarratorGrant(
 	principal: NarratorPrincipal,
 ): Promise<void> {
 	const row = await loadNarrator(narratorId);
-	assertCanManage(row, principal);
+	await assertCanManage(row, principal);
 	const grant = await db.query.aclGrants.findFirst({
 		where: and(eq(aclGrants.id, grantId), narratorUserGrantScope(narratorId)),
 	});
@@ -284,7 +415,7 @@ export async function transferNarratorOwner(
 	principal: NarratorPrincipal,
 ): Promise<NarratorAccessView> {
 	const row = await loadNarrator(narratorId);
-	assertCanManage(row, principal);
+	await assertCanManage(row, principal);
 	if (newOwnerUserId === null && !principal.isAdmin) {
 		throw new ValidationError("Only an administrator can leave a narrator without an owner");
 	}
@@ -346,7 +477,13 @@ export async function purgeNarratorGrantsForUser(userId: string): Promise<number
  */
 async function announceAccessChange(
 	narratorId: string,
-	reason: "visibility_changed" | "shared" | "unshared" | "grant_changed" | "owner_changed",
+	reason:
+		| "visibility_changed"
+		| "write_audience_changed"
+		| "shared"
+		| "unshared"
+		| "grant_changed"
+		| "owner_changed",
 	affectedUserIds: string[] = [],
 ): Promise<void> {
 	try {
@@ -354,6 +491,26 @@ async function announceAccessChange(
 			broadcastToUser(userId, { type: "narrator_access_changed", narratorId, reason });
 		}
 		await dropNarratorSubscriptionsForUnauthorizedUsers(narratorId);
+		// Subagents delegate their access to this narrator, so tightening it revokes
+		// theirs too — but their subscriptions are keyed by their own ids and would keep
+		// streaming to someone who just lost access. Bounded and id-only: a sharing
+		// change must not turn into an unbounded scan on a session with many subtasks.
+		const subagents = await db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(eq(narrators.aclRootNarratorId, narratorId))
+			.limit(SUBAGENT_SUBSCRIPTION_SWEEP_LIMIT);
+		for (const subagent of subagents) {
+			await dropNarratorSubscriptionsForUnauthorizedUsers(subagent.id);
+		}
+		if (subagents.length === SUBAGENT_SUBSCRIPTION_SWEEP_LIMIT) {
+			// Past the cap a stale subscription may survive until its next authorization
+			// check, which still refuses. A delay, not a hole.
+			logger.warn("Subagent subscription sweep hit its cap; some may lag one check", {
+				narratorId,
+				limit: SUBAGENT_SUBSCRIPTION_SWEEP_LIMIT,
+			});
+		}
 	} catch (err) {
 		logger.warn("Failed to announce narrator access change", {
 			narratorId,
@@ -362,3 +519,11 @@ async function announceAccessChange(
 		});
 	}
 }
+
+/**
+ * Cap on how many subagents get their subscriptions swept on one ACL change.
+ *
+ * Not a hot path, but it must not become an unbounded scan. Beyond the cap the
+ * enforcement still holds — every subsequent authorization check re-reads the root.
+ */
+const SUBAGENT_SUBSCRIPTION_SWEEP_LIMIT = 500;

@@ -1011,6 +1011,209 @@ describe("narrator visibility backfill (real migration replay)", () => {
 });
 
 /**
+ * Splitting sharing into a read axis and a write axis must not WIDEN who can drive an
+ * existing session. Upgrading is not consent.
+ *
+ * These are regression tests against a backfill that was written, shipped into a review,
+ * and reverted: it set `write_audience` to the widest value each row's `visibility`
+ * permitted, on the premise that read access had already implied write. It had not —
+ * `canWriteNarrator` has only ever consulted ownership, admin and explicit write grants.
+ * So the "restoration" would have handed every signed-in user the ability to approve tool
+ * calls in the pre-ACL sessions `backfillNarratorVisibility` publishes with a null owner,
+ * which on an older instance is usually all of them.
+ *
+ * The assertions are phrased against `visibility`, because that is the column the
+ * reverted logic keyed on: if anything ever derives write from read again, the `public`
+ * and `project` cases below are what fail.
+ */
+describe("narrator write audience is never widened by migrating (real migration replay)", () => {
+	// folderMillis of 0138_pale_komodo, the migration that adds narrators.write_audience.
+	const WRITE_AUDIENCE_WHEN = 1787393037284;
+
+	function writeAudienceOf(database: Database, narratorId: string): string {
+		return (
+			database
+				.prepare("SELECT write_audience AS w FROM narrators WHERE id = ?")
+				.get(narratorId) as { w: string }
+		).w;
+	}
+
+	/**
+	 * A database migrated to just before 0138: `write_audience` absent, with one narrator
+	 * per read audience already in place.
+	 *
+	 * `visibility` is set through the same `runMigrations` path production uses, so these
+	 * rows carry legal audiences rather than hand-built states.
+	 */
+	async function databaseBeforeWriteAudience(): Promise<Database> {
+		const database = new Database(":memory:");
+		await runMigrations(database);
+		database.run("DROP INDEX IF EXISTS idx_narrators_write_audience");
+		database.run("ALTER TABLE narrators DROP COLUMN write_audience");
+		database.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [WRITE_AUDIENCE_WHEN]);
+		for (const [id, visibility] of [
+			["narrator-public", "public"],
+			["narrator-project", "project"],
+			["narrator-private", "private"],
+		]) {
+			database.run(
+				"INSERT INTO narrators (id, visibility, created_at, updated_at) VALUES (?, ?, ?, ?)",
+				[id, visibility, "now", "now"],
+			);
+		}
+		return database;
+	}
+
+	test("a publicly READABLE session does not become publicly drivable", async () => {
+		sqlite = await databaseBeforeWriteAudience();
+
+		await runMigrations(sqlite);
+
+		// The escalation the reverted backfill produced. `public` write combined with
+		// `resolveProjectGate(null)`'s "no gate here" means every signed-in user could
+		// drive these sessions — and pre-ACL rows are exactly the `public` ones.
+		expect(writeAudienceOf(sqlite, "narrator-public")).toBe("owner");
+	});
+
+	test("a project-visible session does not become project-drivable", async () => {
+		sqlite = await databaseBeforeWriteAudience();
+
+		await runMigrations(sqlite);
+
+		// Narrower than the `public` case but still a widening nobody asked for: project
+		// members who could only watch would gain the ability to run commands.
+		expect(writeAudienceOf(sqlite, "narrator-project")).toBe("owner");
+	});
+
+	test("a private session stays owner-only", async () => {
+		sqlite = await databaseBeforeWriteAudience();
+
+		await runMigrations(sqlite);
+
+		expect(writeAudienceOf(sqlite, "narrator-private")).toBe("owner");
+	});
+
+	test("an explicitly widened session is left alone by later migrations", async () => {
+		// The other direction: once an owner deliberately opens a session up, replaying
+		// migrations must not pull it back. Nothing should be writing this column during a
+		// migration at all, and this is what would catch a "corrective" one.
+		sqlite = await databaseBeforeWriteAudience();
+		await runMigrations(sqlite);
+		sqlite.run("UPDATE narrators SET write_audience = 'public' WHERE id = ?", ["narrator-public"]);
+
+		await runMigrations(sqlite);
+
+		expect(writeAudienceOf(sqlite, "narrator-public")).toBe("public");
+	});
+
+	test("narrators created after the upgrade default to owner-only", async () => {
+		sqlite = await databaseBeforeWriteAudience();
+		await runMigrations(sqlite);
+		sqlite.run(
+			"INSERT INTO narrators (id, visibility, created_at, updated_at) VALUES (?, ?, ?, ?)",
+			["narrator-after", "public", "later", "later"],
+		);
+
+		await runMigrations(sqlite);
+
+		// A new public session is a choice about who may WATCH. The service layer decides
+		// its write audience at creation; migrations never revisit it.
+		expect(writeAudienceOf(sqlite, "narrator-after")).toBe("owner");
+	});
+});
+
+/**
+ * The subagent-root backfill must survive a failed attempt.
+ *
+ * It is the one backfill that is NOT gated on the column having just been added, and this
+ * is why. Migrations commit inside a transaction and are stamped; the backfills run after
+ * it and only warn on failure. Under a column-absence gate, one failure — a lock, a
+ * timeout on a large `narrators` table — would be permanent, and every affected subagent
+ * would stay invisible to the people its parent is shared with, with nothing left to retry
+ * it. So the gate is "does any subagent still lack a root", which makes the work
+ * self-healing on the next startup and costs one indexed COUNT once it is done.
+ *
+ * Re-running is safe here precisely because this column records a structural fact nobody
+ * can edit (which narrator a subagent belongs to), unlike the `visibility` backfills where
+ * a re-run would undo a human decision.
+ */
+describe("subagent acl root backfill is retried until it succeeds", () => {
+	function rootOf(database: Database, id: string): string | null {
+		const row = database
+			.prepare("SELECT acl_root_narrator_id AS r FROM narrators WHERE id = ?")
+			.get(id) as { r: string | null } | undefined;
+		return row?.r ?? null;
+	}
+
+	function insertNarrator(
+		database: Database,
+		id: string,
+		type: string,
+		parent: string | null,
+	): void {
+		database.run(
+			"INSERT INTO narrators (id, type, parent_narrator_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+			[id, type, parent, "now", "now"],
+		);
+	}
+
+	test("a subagent left unfilled by an earlier run is repaired on a later one", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		// The state a crashed or lock-failed backfill leaves behind: the column exists and
+		// is stamped, but this row never got its pointer. Under the old column-absence gate
+		// nothing would ever look at it again.
+		insertNarrator(sqlite, "parent-1", "primary", null);
+		insertNarrator(sqlite, "sub-1", "subagent", "parent-1");
+		expect(rootOf(sqlite, "sub-1")).toBeNull();
+
+		await runMigrations(sqlite);
+
+		expect(rootOf(sqlite, "sub-1")).toBe("parent-1");
+	});
+
+	test("a genuinely unresolvable chain stays null instead of being guessed", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		// No parent at all: there is no root to delegate to, and inventing one would be a
+		// silent access decision. Null means "undeterminable", which the ACL layer denies.
+		insertNarrator(sqlite, "orphan", "subagent", null);
+
+		await runMigrations(sqlite);
+
+		expect(rootOf(sqlite, "orphan")).toBeNull();
+	});
+
+	test("a primary narrator is never given a pointer, however often this runs", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		insertNarrator(sqlite, "primary-1", "primary", null);
+		// A fork has a parent but is an independent session; pointing it at its origin
+		// would put its sharing permanently under someone else's control.
+		insertNarrator(sqlite, "fork-1", "primary", "primary-1");
+
+		await runMigrations(sqlite);
+		await runMigrations(sqlite);
+
+		expect(rootOf(sqlite, "primary-1")).toBeNull();
+		expect(rootOf(sqlite, "fork-1")).toBeNull();
+	});
+
+	test("an already-filled pointer is not rewritten by a later run", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		insertNarrator(sqlite, "parent-2", "primary", null);
+		insertNarrator(sqlite, "sub-2", "subagent", "parent-2");
+		await runMigrations(sqlite);
+		expect(rootOf(sqlite, "sub-2")).toBe("parent-2");
+
+		await runMigrations(sqlite);
+
+		expect(rootOf(sqlite, "sub-2")).toBe("parent-2");
+	});
+});
+
+/**
  * A machine that developed NarraFork from source and then upgraded to a release binary carries
  * a database whose schema already advanced past migrations whose hashes were never recorded
  * (locally generated migrations hash differently from the released SQL files). Replaying such a

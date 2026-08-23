@@ -87,8 +87,6 @@
 	"mergeReviewRequiredDesc": "此章节需要通过审查后才能合并。",
 	"mergeReviewRequestChanges": "审查要求修改",
 	"mergeReviewRequestChangesDesc": "最新审查要求修改，请先处理后再合并。",
-	"mergeDirtySource": "提交模式合并要求源章节工作区干净。请先提交或暂存其改动，或改回工作区合并。",
-	"mergeDirtyTarget": "提交模式合并要求目标章节工作区干净。请先提交或暂存其改动，或改回工作区合并。",
 	"mergeMode": "合并模式",
 	"mergeModeSnapshot": "工作区（默认）",
 	"mergeModeCommit": "提交（生成真实合并提交）",

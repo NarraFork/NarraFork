@@ -503,6 +503,16 @@ export const narratorVisibilitySchema = z.object({
 });
 
 /**
+ * Write audience of a narrator — who may drive it without an individual grant.
+ *
+ * Separate from `visibility` because sharing a view of the work and handing over the
+ * ability to approve commands are different decisions.
+ */
+export const narratorWriteAudienceSchema = z.object({
+	writeAudience: z.enum(["owner", "project", "public"]),
+});
+
+/**
  * Share with specific users.
  *
  * Bounded at 50 per call: sharing is a deliberate act on a handful of colleagues,

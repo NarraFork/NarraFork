@@ -6,6 +6,7 @@ export type {
 
 import type { TextCitation } from "@shared/citations";
 import type { LocalizedValue } from "@shared/i18n-locales";
+import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type { TextCitation } from "@shared/citations";
@@ -24,14 +25,26 @@ export interface KimiUsageWindow {
 	resetTime: string | null;
 }
 
-/** Per-provider Kimi (kimi.com / kimi.ai) usage cache entry. */
+/**
+ * Per-provider Kimi (kimi.com / kimi.ai) usage cache entry.
+ *
+ * `GET /api/kimi/usages` is readable by any signed-in user, but the upstream error text
+ * is not: it is verbatim provider output about the deployment's own account and can
+ * contain a key fragment or an internal URL, so the server sends `error` only to admins
+ * and everyone else gets `hasError`. Both fields are optional here because a given
+ * response carries exactly one of them — read them through `kimiUsageFailed()` rather
+ * than testing `error` directly, or a non-admin's failed fetch reads as a successful one.
+ */
 export interface KimiUsageCache {
 	fiveHour: KimiUsageWindow | null;
 	weekly: KimiUsageWindow | null;
 	monthly: KimiUsageWindow | null;
 	extraWindows: Array<{ label: string } & KimiUsageWindow>;
 	fetchedAt: number;
-	error: string | null;
+	/** Admin-only: the upstream failure text. Absent for non-admins. */
+	error?: string | null;
+	/** Non-admin substitute for `error`: that it failed, without saying how. */
+	hasError?: boolean;
 }
 
 /**
@@ -1049,12 +1062,14 @@ export interface CodexUsageSchedulerSnapshot {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Read audience of a narrator.
- * - private: owner + explicitly granted users
- * - project: everyone working on the owning chapter's project
- * - public:  every signed-in user (also what pre-ACL narrators were migrated to)
+ * The two narrator audiences, re-exported from the shared module that also carries the
+ * nesting rule between them (`WRITE_AUDIENCE_BY_VISIBILITY`).
+ *
+ * Defined there rather than here so the panel greys out the write audiences a given
+ * read audience forbids using the same table the server validates against — a second
+ * copy of those enums would eventually disagree about which pairs are legal.
  */
-export type NarratorVisibility = "private" | "project" | "public";
+export type { NarratorVisibility, NarratorWriteAudience };
 
 /** read = follow along; write = also send messages, decide permissions, change settings. */
 export type NarratorGrantAccess = "read" | "write";
@@ -1072,6 +1087,7 @@ export interface NarratorGrant {
 export interface NarratorAccess {
 	narratorId: string;
 	visibility: NarratorVisibility;
+	writeAudience: NarratorWriteAudience;
 	/** null for narrators created before access control; only admins can manage those. */
 	owner: {
 		userId: string;
@@ -1082,6 +1098,13 @@ export interface NarratorAccess {
 	grants: NarratorGrant[];
 	/** Whether the current user may change visibility, grants or ownership. */
 	canManage: boolean;
+	/**
+	 * True for a subagent: the values above describe the main session that governs its
+	 * access, and nothing here can be edited in place.
+	 */
+	isDelegated: boolean;
+	/** The narrator whose settings govern access, when that is not this one. */
+	delegatesToNarratorId: string | null;
 }
 
 /** A project's three membership tiers. Ordered by increasing authority. */

@@ -155,6 +155,7 @@ import {
 	narratorGrantUpdateSchema,
 	narratorTransferOwnerSchema,
 	narratorVisibilitySchema,
+	narratorWriteAudienceSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
 	retryFailedCompactSchema,
@@ -330,6 +331,7 @@ import {
 	grantNarratorAccess,
 	revokeNarratorGrant,
 	setNarratorVisibility,
+	setNarratorWriteAudience,
 	transferNarratorOwner,
 	updateNarratorGrant,
 } from "../services/narrator-sharing";
@@ -497,20 +499,39 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
 ]);
 
 /**
- * Routes that mutate but must stay reachable with read access only.
+ * Sub-paths that mutate but must stay reachable with read access only.
  *
  * `leave` just clears the "interrupted" badge when someone closes the tab, and a
  * read-only viewer legitimately triggers it. Denying it would leave the badge
  * stuck for everyone else.
+ *
+ * Matched against the WHOLE sub-path after the narrator id, not its last segment.
+ * A last-segment test grants the exemption to anything that happens to end in the
+ * same word — a future `/:id/rooms/:roomId/leave` would silently inherit a
+ * downgrade nobody chose, and the resulting hole looks exactly like correct code.
  */
-const READ_ONLY_WRITE_ROUTES = new Set(["leave"]);
+const READ_ONLY_WRITE_SUBPATHS = new Set(["leave"]);
+
+/** The path after `/api/narrators/:id/`, or "" when there is none. */
+function narratorSubPath(requestPath: string, id: string): string {
+	const marker = `/${encodeURIComponent(id)}/`;
+	const at = requestPath.indexOf(marker);
+	if (at === -1) {
+		// The id may arrive unencoded; nanoid ids never need escaping, so this is the
+		// ordinary case rather than a fallback.
+		const plain = requestPath.indexOf(`/${id}/`);
+		if (plain === -1) return "";
+		return requestPath.slice(plain + id.length + 2);
+	}
+	return requestPath.slice(at + marker.length);
+}
 
 narratorRoutes.use("/:id/*", async (c, next) => {
 	const id = c.req.param("id");
 	if (!id || NARRATOR_ID_GATE_EXEMPT_SEGMENTS.has(id)) return next();
-	const tail = c.req.path.split("/").pop() ?? "";
+	const subPath = narratorSubPath(c.req.path, id);
 	const need =
-		c.req.method === "GET" || READ_ONLY_WRITE_ROUTES.has(tail)
+		c.req.method === "GET" || READ_ONLY_WRITE_SUBPATHS.has(subPath)
 			? ("read" as const)
 			: ("write" as const);
 	await requireNarratorAccess(c, id, need);
@@ -1245,6 +1266,18 @@ narratorRoutes.patch("/:id/visibility", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	return c.json(
 		await setNarratorVisibility(c.req.param("id"), parsed.data.visibility, narratorPrincipalOf(c)),
+	);
+});
+
+narratorRoutes.patch("/:id/write-audience", async (c) => {
+	const parsed = narratorWriteAudienceSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await setNarratorWriteAudience(
+			c.req.param("id"),
+			parsed.data.writeAudience,
+			narratorPrincipalOf(c),
+		),
 	);
 });
 

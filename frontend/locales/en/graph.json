@@ -126,6 +126,7 @@
 		"mergeConflictFailedDesc": "AI could not resolve conflicts in: {{files}}. A temporary chapter has been created for manual resolution.",
 		"mergeError": "Merge failed",
 		"mergeDirtySource": "Commit-mode merge needs a clean chapter worktree. Commit or stash its changes, or merge in workspace mode, where uncommitted changes are fine.",
+		"mergeDirtyTarget": "Commit-mode merge needs a clean target worktree. Commit or stash the target's changes, or merge in workspace mode, where uncommitted changes are fine.",
 		"mergeDirtyTrunk": "Commit-mode merge needs a clean trunk worktree. Commit or stash trunk's changes, or merge in workspace mode, where uncommitted changes are fine.",
 		"rebaseOntoTrunk": "Rebase onto trunk",
 		"rebaseSuccess": "Rebase completed",

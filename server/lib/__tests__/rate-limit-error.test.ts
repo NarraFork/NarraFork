@@ -28,10 +28,34 @@ describe("RateLimitError", () => {
 		const response = await app.request("/");
 		expect(response.status).toBe(429);
 		expect(response.headers.get("retry-after")).toBe("3");
+		// `toEqual`, not a subset match: the shape of a 429 body is a contract. `code`
+		// stays the caller's choice (the login form branches on it), while `messageCode`
+		// only names the wording — asserting both here is what keeps a wording change
+		// from quietly becoming a behaviour change.
 		expect(await response.json()).toEqual({
 			error: "Too many attempts. Please try again later.",
 			code: "LOGIN_THROTTLED",
+			messageCode: "LOGIN_THROTTLED",
 			retryAfterSeconds: 3,
+		});
+	});
+
+	test("caller-supplied prose is left un-localized rather than replaced", async () => {
+		// The catalog has no wording for a sentence it has never seen, so attaching
+		// `LOGIN_THROTTLED` here would swap the specific message for the generic one.
+		const app = new Hono();
+		app.get("/", () => {
+			throw new RateLimitError("MFA_THROTTLED", 1_000, "Too many verification codes requested.");
+		});
+		app.onError(
+			(error, c) =>
+				buildAppErrorResponse(error, c) ?? c.json({ error: "Internal server error" }, 500),
+		);
+
+		expect(await (await app.request("/")).json()).toEqual({
+			error: "Too many verification codes requested.",
+			code: "MFA_THROTTLED",
+			retryAfterSeconds: 1,
 		});
 	});
 });

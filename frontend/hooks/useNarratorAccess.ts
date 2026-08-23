@@ -1,6 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
-import type { NarratorGrantAccess, NarratorVisibility } from "../lib/api/types";
+import type {
+	NarratorGrantAccess,
+	NarratorVisibility,
+	NarratorWriteAudience,
+} from "../lib/api/types";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { queryClient } from "../lib/query-client";
 
@@ -77,6 +81,12 @@ export function useNarratorAccessMutations(narratorId: string) {
 		onSuccess: invalidate,
 	});
 
+	const setWriteAudience = useMutation({
+		mutationFn: (writeAudience: NarratorWriteAudience) =>
+			api.setNarratorWriteAudience(narratorId, writeAudience),
+		onSuccess: invalidate,
+	});
+
 	const grant = useMutation({
 		mutationFn: ({ userIds, access }: { userIds: string[]; access: NarratorGrantAccess }) =>
 			api.grantNarratorAccess(narratorId, userIds, access),
@@ -99,5 +109,5 @@ export function useNarratorAccessMutations(narratorId: string) {
 		onSuccess: invalidate,
 	});
 
-	return { setVisibility, grant, updateGrant, revokeGrant, transferOwner };
+	return { setVisibility, setWriteAudience, grant, updateGrant, revokeGrant, transferOwner };
 }

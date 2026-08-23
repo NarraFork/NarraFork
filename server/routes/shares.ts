@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { basename, extname } from "node:path";
 import { Hono } from "hono";
 import sanitizeHtml from "sanitize-html";
-import { NotFoundError } from "../lib/errors";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { getShare } from "../lib/shares";
 
 export const shareRoutes = new Hono();
@@ -79,7 +79,11 @@ shareRoutes.get("/:shareId/preview", async (c) => {
 
 	const mime = getPreviewMime(record.originalName);
 	if (!mime) {
-		throw new NotFoundError("Preview not supported for this file type", shareId);
+		// The share and its file both exist; only inline preview is unavailable for this
+		// type. A 400 also stops the client from retrying as if the share had expired.
+		// (As a NotFoundError `entity` this sentence went into "{entity} not found: {id}",
+		// which reads as nonsense in any language once that template is translated.)
+		throw new ValidationError("Preview not supported for this file type");
 	}
 
 	const contentType = mime;

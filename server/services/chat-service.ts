@@ -49,7 +49,11 @@ import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import type { Locale } from "@server/lib/prompt-i18n";
 import type { TextFileRef } from "@server/lib/uploads";
-import { canReadNarrator, canWriteNarrator } from "@server/services/narrator-acl";
+import {
+	canReadNarrator,
+	canWriteNarrator,
+	NARRATOR_ACL_COLUMNS,
+} from "@server/services/narrator-acl";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -358,7 +362,7 @@ export async function resolveNarratorRoom(
 ): Promise<ChatRoomSummary> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { id: true, ownerUserId: true, visibility: true, chapterId: true },
+		columns: NARRATOR_ACL_COLUMNS,
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	if (!(await canReadNarrator(narrator, await resolvePrincipal(userId)))) {
@@ -449,7 +453,7 @@ export async function assertCanRead(roomId: string, userId: string): Promise<Cha
 	if (!room.narratorId) throw new NotFoundError("Chat room", roomId);
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, room.narratorId),
-		columns: { id: true, ownerUserId: true, visibility: true, chapterId: true },
+		columns: NARRATOR_ACL_COLUMNS,
 	});
 	if (!narrator) throw new NotFoundError("Narrator", room.narratorId);
 	if (!(await canReadNarrator(narrator, await resolvePrincipal(userId)))) {
@@ -1425,7 +1429,7 @@ export async function materializeAttachmentsForNarrator(
 
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, input.narratorId),
-		columns: { id: true, ownerUserId: true, visibility: true, chapterId: true, cwd: true },
+		columns: { ...NARRATOR_ACL_COLUMNS, cwd: true },
 	});
 	if (!narrator) throw new NotFoundError("Narrator", input.narratorId);
 	const user = await db.query.users.findFirst({

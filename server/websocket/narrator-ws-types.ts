@@ -887,7 +887,13 @@ export type NarratorServerMessage =
 	| {
 			type: "narrator_access_changed";
 			narratorId: string;
-			reason: "visibility_changed" | "shared" | "unshared" | "grant_changed" | "owner_changed";
+			reason:
+				| "visibility_changed"
+				| "write_audience_changed"
+				| "shared"
+				| "unshared"
+				| "grant_changed"
+				| "owner_changed";
 	  }
 	| {
 			type: "team_message";

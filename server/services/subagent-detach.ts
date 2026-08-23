@@ -1,4 +1,4 @@
-import { and, eq, like } from "drizzle-orm";
+import { and, eq, inArray, like } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { ValidationError } from "../lib/errors";
@@ -150,17 +150,76 @@ export function interruptForegroundSubagent(
 }
 
 /**
- * Interrupt all foreground subagents currently owned by a parent narrator.
- * This is a defensive cleanup path for primary narrator interrupts: the parent
- * abort signal should normally propagate through ProxyAbortController, but this
- * also updates DB/UI state so child cards do not remain stuck as "working" if
- * the parent loop stops before the child finalizer can broadcast.
+ * Abort a subagent's own session loop, awaited so the abort lands BEFORE the
+ * caller writes idle[interrupted].
+ *
+ * `interruptNarrator` is synchronous (it aborts the controller and fans out; the
+ * loop's own unwinding is not awaited), so the only thing awaited here is the
+ * dynamic import — the cost is a resolved module, not the loop's convergence.
+ * The import stays dynamic to keep the narrator-session ↔ subagent cycle out of
+ * the module graph.
+ *
+ * Awaiting matters because both sides write status. Fire-and-forget let
+ * `markInterrupted` persist idle[interrupted] first and the loop's
+ * `finalizeInterruptedRun` run afterwards, so the card could flash back to
+ * working in between — the final state converged, but the intermediate one was
+ * decided by scheduling order. A failure to abort is logged and does NOT skip
+ * the status write: an un-aborted loop is a worse outcome when the card also
+ * stays stuck on "working".
+ */
+async function abortIndependentLoop(subagentId: string, parentNarratorId: string): Promise<void> {
+	try {
+		const { interruptNarrator } = await import("./narrator-session");
+		interruptNarrator(subagentId);
+	} catch (err) {
+		logger.warn("Failed to abort a subagent's own session loop", {
+			parentNarratorId,
+			subagentId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
+/**
+ * Interrupt the foreground subagents that the parent's *just-cancelled* Agent
+ * tool calls own.
+ *
+ * Scope is deliberately narrow: stopping a parent narrator cancels the Agent
+ * tool calls of its current turn, and stopping their subagents is a consequence
+ * of that cancellation — not of the parent's identity. A subagent the user is
+ * driving themselves from its own panel (a `resumeSubagent` continuation, whose
+ * run signal is independent of the parent by construction) is nobody's pending
+ * tool call, and interrupting it would kill work the user never asked to stop.
+ *
+ * So membership is decided per entry, by two facts rather than by
+ * `parentNarratorId`:
+ * - `entry.parentSignal.aborted` — the Agent tool call that owns this subagent
+ *   was itself cancelled. This is the signal the parent loop hands to the Task
+ *   tool, so it covers a turn that started several subagents at once: aborting
+ *   the parent marks every one of their entries at the same instant, with no
+ *   need to count them here.
+ * - `explicitSubagentIds` — the planned-update recovery path re-drives a
+ *   foreground Agent through `resumeSubagent`, whose signal is deliberately NOT
+ *   the parent's, so the aborted-signal test cannot see it. Its owner passes the
+ *   ids it is waiting on.
+ *
+ * Entries whose parent signal is still live are left alone: their tool call is
+ * running, and if the parent is being interrupted right now, its abort reaches
+ * them through ProxyAbortController anyway.
+ *
+ * The DB/UI writes remain because the abort alone is not observable: a child
+ * card would stay "working" if the parent loop unwinds before the child's own
+ * finalizer broadcasts.
  */
 export async function interruptForegroundSubagentsForParent(
 	parentNarratorId: string,
+	explicitSubagentIds?: Iterable<string>,
 ): Promise<number> {
+	const explicit = new Set(explicitSubagentIds ?? []);
 	const entries = [...getDetachableMap().values()].filter(
-		(entry) => entry.parentNarratorId === parentNarratorId,
+		(entry) =>
+			entry.parentNarratorId === parentNarratorId &&
+			(entry.parentSignal.aborted || explicit.has(entry.subagentId)),
 	);
 	let interrupted = 0;
 	const touched = new Set<string>();
@@ -202,9 +261,7 @@ export async function interruptForegroundSubagentsForParent(
 			// If the user was operating this subagent via its own independent loop
 			// (takeover), abort that loop too so it does not keep running orphaned.
 			if (wasTakenOver) {
-				import("./narrator-session")
-					.then(({ interruptNarrator }) => interruptNarrator(subagentId))
-					.catch(() => {});
+				await abortIndependentLoop(subagentId, parentNarratorId);
 			}
 			await markInterrupted(subagentId, entry.toolUseId);
 		} catch (err) {
@@ -216,39 +273,42 @@ export async function interruptForegroundSubagentsForParent(
 		}
 	}
 
-	// Reconcile any stale foreground children that no longer have an in-memory
-	// controller but are still persisted as active. Background tasks are excluded:
-	// they intentionally outlive the parent narrator. Taken-over children (any
-	// status, isBackground already cleared) are also swept so their in-memory
-	// takeover state and taken_over tag do not leak when the parent is interrupted.
-	const reconcileChildren = await db.query.narrators.findMany({
-		where: and(
-			eq(narrators.parentNarratorId, parentNarratorId),
-			eq(narrators.isBackground, false),
-			like(narrators.variant, "subagent:%"),
-		),
-		columns: { id: true, status: true },
-	});
-	for (const child of reconcileChildren) {
-		const childTakenOver = isTakenOver(child.id);
-		const childActive = child.status === "working" || child.status === "waiting";
-		if (!childTakenOver && !childActive) continue;
-		try {
-			if (childTakenOver) {
-				// Clear takeover state first so preserveTakenOverSubstatus does not
-				// re-add taken_over, and abort the subagent's independent loop.
-				clearTakenOver(child.id);
-				import("./narrator-session")
-					.then(({ interruptNarrator }) => interruptNarrator(child.id))
-					.catch(() => {});
+	// An explicitly named subagent may have no detach entry at all: the recovery
+	// path drives it through its own engine (session loop / resume run) rather
+	// than the foreground runner. Its owner still declared it, so stop it and
+	// settle its card. Ownership is verified against the DB — an id handed in by
+	// mistake must not let one parent interrupt another parent's child.
+	const unhandledExplicit = [...explicit].filter((id) => !touched.has(id));
+	if (unhandledExplicit.length > 0) {
+		const owned = await db.query.narrators.findMany({
+			where: and(
+				inArray(narrators.id, unhandledExplicit),
+				eq(narrators.parentNarratorId, parentNarratorId),
+				eq(narrators.isBackground, false),
+				like(narrators.variant, "subagent:%"),
+			),
+			columns: { id: true, status: true },
+		});
+		for (const child of owned) {
+			const childTakenOver = isTakenOver(child.id);
+			if (!childTakenOver && child.status !== "working" && child.status !== "waiting") continue;
+			try {
+				if (childTakenOver) {
+					// Clear takeover state first so preserveTakenOverSubstatus does not
+					// re-add taken_over, and abort the subagent's independent loop.
+					clearTakenOver(child.id);
+				}
+				// The subagent may be running on the generic session engine (a takeover,
+				// or a recovery-driven continuation); that loop is only reachable here.
+				await abortIndependentLoop(child.id, parentNarratorId);
+				await markInterrupted(child.id);
+			} catch (err) {
+				logger.warn("Failed to interrupt declared foreground subagent", {
+					parentNarratorId,
+					subagentId: child.id,
+					error: err instanceof Error ? err.message : String(err),
+				});
 			}
-			await markInterrupted(child.id);
-		} catch (err) {
-			logger.warn("Failed to mark stale foreground subagent interrupted", {
-				parentNarratorId,
-				subagentId: child.id,
-				error: err instanceof Error ? err.message : String(err),
-			});
 		}
 	}
 

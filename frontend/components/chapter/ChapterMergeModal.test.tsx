@@ -7,6 +7,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import chaptersLocale from "../../locales/en/chapters.json";
 import commonLocale from "../../locales/en/common.json";
+import errorsLocale from "../../locales/en/errors.json";
 
 // Isolated i18next instance + <I18nextProvider> so shared-singleton mutations from
 // other frontend suites can't leave this suite rendering raw i18n keys.
@@ -19,6 +20,8 @@ interface MergeCall {
 
 let mergeCalls: MergeCall[] = [];
 let mergeResult: unknown = { success: true };
+/** When set, `mergeChapter` rejects with a TestApiError carrying this shape. */
+let mergeRejection: { message: string; data: Record<string, unknown> } | null = null;
 let notificationsShown: Array<{
 	title?: unknown;
 	message?: unknown;
@@ -84,6 +87,11 @@ const moduleMocks = {
 				Promise.resolve({ hasConflicts: false, conflictFiles: [], isFastForward: false }),
 			mergeChapter: (chapterId: string, data: MergeCall["data"]) => {
 				mergeCalls.push({ chapterId, data });
+				if (mergeRejection) {
+					const error = new TestApiError(mergeRejection.message);
+					error.data = mergeRejection.data;
+					return Promise.reject(error);
+				}
 				return Promise.resolve(mergeResult);
 			},
 		},
@@ -176,8 +184,10 @@ async function initTestI18n() {
 			lng: "en",
 			fallbackLng: "en",
 			defaultNS: "chapters",
-			ns: ["chapters", "common"],
-			resources: { en: { chapters: chaptersLocale, common: commonLocale } },
+			ns: ["chapters", "common", "errors"],
+			resources: {
+				en: { chapters: chaptersLocale, common: commonLocale, errors: errorsLocale },
+			},
 			interpolation: { escapeValue: false },
 			react: { useSuspense: false },
 		});
@@ -423,5 +433,82 @@ describe("merge payload and warning presentation", () => {
 		await chooseMergeMode("Commit (real merge commit)");
 
 		expect(document.body.textContent).toContain("Both chapters must have a clean worktree");
+	});
+});
+
+/**
+ * How a failed merge is presented.
+ *
+ * The dirty-worktree cases used to be recognized by comparing the response's `error` field
+ * against the literal strings "MERGE_DIRTY_SOURCE"/"MERGE_DIRTY_TARGET" — the server smuggled a
+ * code through a prose field, so `error` could not hold a real sentence. They now arrive as
+ * `messageCode` and are translated from the `errors` namespace, with the server's English kept
+ * behind a disclosure.
+ */
+describe("merge failure presentation", () => {
+	beforeEach(async () => {
+		mergeCalls = [];
+		notificationsShown = [];
+		mergeResult = { success: true };
+		mergeRejection = null;
+		reviewConclusion = null;
+		requireReviewBeforeMerge = false;
+		installDom();
+		await initTestI18n();
+		container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+	});
+
+	test("localizes a dirty source worktree from its messageCode", async () => {
+		// The server prose is deliberately NOT the catalog wording here. If it matched, this test
+		// would pass even with the messageCode lookup removed — the raw-prose fallback alone would
+		// produce the expected text, and the assertion would prove nothing about the contract.
+		mergeRejection = {
+			message: "sentinel-raw-source-prose",
+			data: {
+				error: "sentinel-raw-source-prose",
+				code: "VALIDATION_ERROR",
+				messageCode: "MERGE_DIRTY_SOURCE",
+			},
+		};
+		render();
+		await flush();
+		await mergeWithTarget();
+
+		// Asserted as a substring of the localized sentence rather than the whole thing, so
+		// rewording the translation does not break a test about which error was chosen.
+		expect(document.body.textContent).toContain("clean source worktree");
+		// The affordance that keeps the raw server text reachable without cluttering the message.
+		expect(document.body.textContent).toContain("Show original message");
+	});
+
+	test("distinguishes a dirty target from a dirty source", async () => {
+		mergeRejection = {
+			message: "dirty target",
+			data: { error: "dirty target", code: "VALIDATION_ERROR", messageCode: "MERGE_DIRTY_TARGET" },
+		};
+		render();
+		await flush();
+		await mergeWithTarget();
+
+		expect(document.body.textContent).toContain("clean target worktree");
+		expect(document.body.textContent).not.toContain("clean source worktree");
+	});
+
+	test("keeps the server's own wording for an error with no messageCode", async () => {
+		// The un-migrated majority. Previously anything unrecognized here collapsed into
+		// "unknown error", discarding the one sentence that said what went wrong.
+		mergeRejection = {
+			message: "refusing to merge unrelated histories",
+			data: { error: "refusing to merge unrelated histories", code: "GIT_ERROR" },
+		};
+		render();
+		await flush();
+		await mergeWithTarget();
+
+		expect(document.body.textContent).toContain("refusing to merge unrelated histories");
+		// No disclosure: it would only repeat the sentence already shown.
+		expect(document.body.textContent).not.toContain("Show original message");
 	});
 });

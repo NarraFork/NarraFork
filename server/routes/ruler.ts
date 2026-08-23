@@ -5,7 +5,7 @@ import { z } from "zod";
 import { db } from "../db";
 import { chapterEdges, chapters, narrators, projects } from "../db/schema";
 import { worktreeLock } from "../lib/async-mutex";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { catalogError, NotFoundError, ValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
@@ -885,14 +885,10 @@ rulerRoutes.post("/:id/ruler/merge", async (c) => {
 	// workspaces themselves, where being dirty is normal.
 	if (parsed.data.mode === "commit") {
 		const trunkStatus = await gitService.getStatus(rootChapter.worktreePath);
-		if (trunkStatus.trim()) {
-			return c.json({ error: "MERGE_DIRTY_TRUNK", code: "VALIDATION_ERROR" }, 400);
-		}
+		if (trunkStatus.trim()) throw catalogError("MERGE_DIRTY_TRUNK");
 		if (source.worktreePath) {
 			const sourceStatus = await gitService.getStatus(source.worktreePath);
-			if (sourceStatus.trim()) {
-				return c.json({ error: "MERGE_DIRTY_SOURCE", code: "VALIDATION_ERROR" }, 400);
-			}
+			if (sourceStatus.trim()) throw catalogError("MERGE_DIRTY_SOURCE");
 		}
 	}
 

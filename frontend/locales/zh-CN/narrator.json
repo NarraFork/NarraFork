@@ -664,7 +664,8 @@
 		"windowMonthly": "月限制",
 		"windowLine": "{{label}}：已用 {{used}}/{{limit}}",
 		"resetSuffix": "，{{time}} 重置",
-		"fetchError": "用量获取失败：{{error}}"
+		"fetchError": "用量获取失败：{{error}}",
+		"fetchFailed": "用量获取失败（详情请联系管理员）"
 	},
 	"recharge": {
 		"title": "NUG 充值",
@@ -1307,6 +1308,22 @@
 			"project": "参与这个项目的人都可以查看。",
 			"public": "任何已登录用户都可以打开这个会话。"
 		},
+		"writeAudienceTitle": "谁可以操作这个会话",
+		"writeAudienceOwner": "仅所有者",
+		"writeAudienceProject": "项目成员",
+		"writeAudiencePublic": "所有人",
+		"writeAudienceHint": {
+			"owner": "只有你、管理员，以及你单独授予「可操作」的人能发消息和审批工具调用。",
+			"project": "在这个项目里拥有写权限的成员都可以发消息、审批工具调用（含执行命令和修改文件）。只读成员仍然只能查看。",
+			"public": "任何能访问该项目的已登录用户都可以发消息、审批工具调用（含执行命令和修改文件）。"
+		},
+		"writeAudienceBlocked": {
+			"owner": "这一档始终可选。",
+			"project": "能操作必须先能查看：请把上面的可见性改为「项目内」或「所有人」。",
+			"public": "能操作必须先能查看：请把上面的可见性改为「所有人」。"
+		},
+		"delegatedNotice": "这是子代理，它的访问权限跟随所属主会话，无法单独设置。",
+		"delegatedLink": "前往主会话设置共享",
 		"peopleTitle": "有权访问的人",
 		"ownerLabel": "所有者：{{username}}",
 		"noOwner": "这个会话早于权限机制存在，没有所有者，因此只有管理员能修改共享设置。可以请管理员把它转交给你。",

@@ -24,6 +24,11 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import {
+	handleMarkdownAnchorClick,
+	MD_HEADING_SLUG_ATTR,
+	markdownLinkTargetProps,
+} from "@frontend/lib/markdown-anchor-scroll";
 import { Box } from "@mantine/core";
 import { Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "../measure/measure-markdown";
@@ -73,6 +78,17 @@ const CODE_FONT = `${FONT_WEIGHT.regular} ${CODE_BLOCK_FONT_SIZE}px ${MONO_FAMIL
  * height describes.
  */
 const CODE_PANEL_BORDER = 1;
+
+/**
+ * Bounds ONE markdown body for anchor resolution.
+ *
+ * The exact list mounts a separate `RenderMarkdown` per row, and different rows
+ * legitimately repeat a heading ("## 结论" in two different answers), so a
+ * `#结论` click must only look inside the row it was clicked in. Resolved through
+ * `closest` at click time, which also means a row that scrolls out and remounts
+ * needs no re-registration.
+ */
+const MD_BODY_ATTR = "data-md-body";
 
 /**
  * Font size (px) every LaTeX formula is painted at. MUST equal the `basePx` the
@@ -204,6 +220,7 @@ export function RenderMarkdown({
 		return (
 			<div
 				ref={hostRef}
+				{...{ [MD_BODY_ATTR]: "" }}
 				style={{
 					position: "relative",
 					width: contentWidth,
@@ -245,6 +262,7 @@ export function RenderMarkdown({
 	return (
 		<div
 			ref={hostRef}
+			{...{ [MD_BODY_ATTR]: "" }}
 			style={{
 				position: "relative",
 				width: contentWidth,
@@ -620,12 +638,17 @@ function TableCellView({
 									) : frag.href != null ? (
 										<a
 											href={frag.href}
-											target="_blank"
-											// `noopener` is implied by `target="_blank"` in current browsers,
-											// but stated anyway so both markdown paths carry the same `rel`
-											// (the chunked MarkdownContent does) and neither depends on that
-											// default holding.
-											rel="noopener noreferrer"
+											// Same rule as the paragraph path above: fragments scroll in place,
+											// everything else opens in a new tab. A table cell can hold a
+											// document-internal link too.
+											{...markdownLinkTargetProps(frag.href)}
+											onClick={(event) => {
+												handleMarkdownAnchorClick(
+													event,
+													frag.href,
+													event.currentTarget.closest(`[${MD_BODY_ATTR}]`),
+												);
+											}}
 											className={frag.className}
 											style={{
 												font: frag.font,
@@ -779,6 +802,11 @@ function InlineBlockView({
 			// handler (vlist-copy-text.ts) needs this boundary to tell "same paragraph,
 			// wrapped" from "next paragraph".
 			data-vlist-inline-block
+			// Anchor target for a same-document `[x](#…)` link (see
+			// lib/markdown-anchor-scroll). Height-neutral: an attribute only. Set on
+			// the block box rather than on a line, because a wrapped heading has
+			// several lines and a jump must land on the block's top.
+			{...(block.headingSlug ? { [MD_HEADING_SLUG_ATTR]: block.headingSlug } : {})}
 			style={{
 				position: "absolute",
 				top: frame.top,
@@ -875,12 +903,18 @@ function InlineBlockView({
 									return frag.href != null ? (
 										<a
 											href={frag.href}
-											target="_blank"
-											// `noopener` is implied by `target="_blank"` in current browsers,
-											// but stated anyway so both markdown paths carry the same `rel`
-											// (the chunked MarkdownContent does) and neither depends on that
-											// default holding.
-											rel="noopener noreferrer"
+											// A same-document `#heading` anchor gets NO target and scrolls this
+											// body's own scroller; every real destination keeps `_blank`.
+											// `noopener` is stated rather than relied on as the `_blank` default,
+											// so both markdown paths carry the same `rel`.
+											{...markdownLinkTargetProps(frag.href)}
+											onClick={(event) => {
+												handleMarkdownAnchorClick(
+													event,
+													frag.href,
+													event.currentTarget.closest(`[${MD_BODY_ATTR}]`),
+												);
+											}}
 											className={frag.className}
 											style={{
 												font: frag.font,

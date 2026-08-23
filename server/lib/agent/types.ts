@@ -236,6 +236,19 @@ export interface PermissionHandlerOptions {
 	 * is still initializing; later input changes must match this identity exactly.
 	 */
 	onInputResolved?: (input: Record<string, unknown>) => Promise<void>;
+	/**
+	 * Signal that this request is now durably pending and about to suspend until a human answers.
+	 *
+	 * Called exactly once, AFTER the tool-call row is persisted as `pending` and the request is
+	 * registered, and only on the path that truly waits for a person. Auto-allow/auto-deny
+	 * decisions never call it.
+	 *
+	 * The executor uses this to drop its update start grant for the duration of the wait, so an
+	 * unanswered permission request cannot block a planned restart. The ordering matters: the row
+	 * must already be durable when this fires, otherwise a checkpoint racing the release would
+	 * observe the tool as neither in-flight nor recoverable.
+	 */
+	onAwaitingUserDecision?: () => void;
 }
 
 export interface ToolResult {

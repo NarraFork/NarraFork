@@ -238,6 +238,11 @@ function clampCamera(cam: Camera, opts?: ClampBounds, soft?: boolean): Camera {
 const DIRTY_ERROR_MAP: Record<string, string> = {
 	MERGE_DIRTY_TRUNK: "ruler.mergeDirtyTrunk",
 	MERGE_DIRTY_SOURCE: "ruler.mergeDirtySource",
+	// The third of the trio, missing since this map was written: `chapters.ts` throws it
+	// for a dirty TARGET, and the same commit-mode merge that can send the user back here
+	// with the other two can send them back with this one. Without an entry it fell through
+	// to the generic "merge failed", which names no worktree and no way forward.
+	MERGE_DIRTY_TARGET: "ruler.mergeDirtyTarget",
 	REBASE_PARKED_WORK_CONFLICT: "ruler.rebaseParkedWorkConflict",
 	// The workspace could not be read, so the earlier debt could not be settled. Distinct
 	// from the conflict above: the coordinates are deliberately KEPT, so this becomes
@@ -247,8 +252,19 @@ const DIRTY_ERROR_MAP: Record<string, string> = {
 	PARKED_SNAPSHOT_UNRESOLVABLE: "ruler.parkedSnapshotUnresolvable",
 };
 
-/** Map a structured dirty-worktree ApiError to an i18n key, or null for unknown errors. */
+/**
+ * Map a structured dirty-worktree ApiError to an i18n key, or null for unknown errors.
+ *
+ * `messageCode` is consulted first: the MERGE_DIRTY_* cases now travel there, and their `error`
+ * field holds a real sentence rather than the code. The old `error`-field read stays as the
+ * fallback because REBASE_PARKED_WORK_* / PARKED_SNAPSHOT_UNRESOLVABLE still smuggle their code
+ * through that field, and Ruler is deprecated — migrating them is not worth touching it for.
+ */
 function dirtyErrorKey(err: ApiError): string | null {
+	const messageCode = err.data?.messageCode;
+	if (typeof messageCode === "string" && DIRTY_ERROR_MAP[messageCode]) {
+		return DIRTY_ERROR_MAP[messageCode];
+	}
 	const code = (err.data?.error as string) ?? err.message;
 	return DIRTY_ERROR_MAP[code] ?? null;
 }
