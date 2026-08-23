@@ -50,6 +50,10 @@ function SettingsServerPage() {
 				setUpdateChannel={is.setUpdateChannel}
 				updateAutoDownload={is.updateAutoDownload}
 				setUpdateAutoDownload={is.setUpdateAutoDownload}
+				brandName={is.brandName}
+				setBrandName={is.setBrandName}
+				brandIconColor={is.brandIconColor}
+				setBrandIconColor={is.setBrandIconColor}
 			/>
 		</Stack>
 	);

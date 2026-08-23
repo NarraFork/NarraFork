@@ -275,6 +275,29 @@ Target file: \`{conclusionFile}\``,
 		en: "Plan mode was cancelled by the user. Do not submit or execute this plan unless the user asks you to plan again.",
 		"zh-CN": "计划模式已被用户取消。除非用户再次要求规划，否则不要提交或执行此计划。",
 	},
+	// Manual mid-turn toggles. These name the plan file because the model has NOT seen the
+	// plan-mode reminder yet at the moment the toggle lands, and the permission gate is
+	// already refusing any write that does not target that exact path.
+	"tool.planModeEnteredByUser": {
+		en: `The user just switched you into plan mode. Stop implementing and switch to planning.
+
+Your designated plan file is \`{planFilePath}\`. Write/Edit are restricted to that path; every other project file is read-only now. Explore and design first, write your plan to that file, then call ExitPlanMode for approval.
+
+This applies from now on, including any work you had already started in this turn.`,
+		"zh-CN": `用户刚刚把你切换进了计划模式。停止实现动作，转入规划。
+
+你的指定计划文件是 \`{planFilePath}\`。Write/Edit 只允许写入该路径，其他项目文件现在都是只读的。请先探索和设计，把计划写入该文件，然后调用 ExitPlanMode 提交批准。
+
+此约束从现在起生效，包括你在本轮中已经开始的工作。`,
+	},
+	"tool.planModeExitedByUser": {
+		en: `The user just exited plan mode. The plan-mode restrictions no longer apply.
+
+Exiting plan mode is NOT plan approval — no plan has been approved and nothing has authorized you to start implementing. Unless the user told you what to do next, confirm the next step with them before making changes.`,
+		"zh-CN": `用户刚刚退出了计划模式，计划模式的约束不再适用。
+
+退出计划模式不等于计划已获批准 —— 没有任何计划被批准，也没有任何东西授权你开始实现。除非用户已经说明下一步做什么，否则先与用户确认再进行修改。`,
+	},
 	"tool.suggestAnswerSystem": {
 		en: "You are a senior software engineering advisor. The user is being asked one or more questions by an AI coding assistant during a conversation. You will receive the full conversation context in <conversation> tags and the questions in <questions> tags. For each question, suggest the best-practice answer considering the specific project context and conversation history. If options are provided, pick from them; otherwise give a concise free-text answer. Reply with ONLY a valid JSON object mapping each question key to your recommended answer string. No explanation, no markdown fences.",
 		"zh-CN":
@@ -851,6 +874,8 @@ export type ToolMessageKey =
 	| "subagentConclusionRedirected"
 	| "subagentConclusionRedirectedFileNotFound"
 	| "planModeCancelled"
+	| "planModeEnteredByUser"
+	| "planModeExitedByUser"
 	| "suggestAnswerSystem"
 	| "questionReflectionSystem"
 	| "turnNudge"

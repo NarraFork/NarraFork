@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
 	assertAppShellJavaScriptIsPrecached,
 	assertModulePreloadsArePrecached,
+	assertNoBrandAssetsArePrecached,
 	extractAppShellUrls,
 	extractEmittedHtml,
 	filterAppShellManifest,
+	isBrandDependentPrecacheUrl,
 	type PrecacheManifestEntry,
 } from "../../frontend/build/app-shell-precache";
 
@@ -87,7 +89,50 @@ describe("PWA app shell precache", () => {
 		});
 	});
 
+	test("drops brand-dependent assets whatever injected them", () => {
+		// These arrive via `additionalManifestEntries` (includeAssets, and the
+		// unconditional manifest entry), so they are already past `globPatterns` by the
+		// time this filter runs. Precaching them pins one instance's name and icon
+		// colour into every installed app, with no runtime symptom.
+		const manifest = [
+			entry("index.html"),
+			entry("assets/index-c3.js"),
+			entry("manifest.webmanifest"),
+			entry("favicon.svg"),
+			entry("apple-touch-icon-180x180.png"),
+			entry("pwa-192x192.png"),
+			entry("pwa-512x512.png"),
+		];
+
+		expect(filterAppShellManifest(manifest, FINAL_HTML).map(({ url }) => url)).toEqual([
+			"index.html",
+			"assets/index-c3.js",
+		]);
+	});
+
+	test("recognizes brand assets through leading-slash and relative forms", () => {
+		// Workbox URL forms vary by injection path; matching only the bare name would
+		// let "/favicon.svg" through.
+		for (const url of ["favicon.svg", "/favicon.svg", "./manifest.webmanifest"]) {
+			expect(isBrandDependentPrecacheUrl(url)).toBe(true);
+		}
+		expect(isBrandDependentPrecacheUrl("assets/logo.svg")).toBe(false);
+	});
+
+	test("asserts no brand asset survived into the final precache", () => {
+		expect(() => assertNoBrandAssetsArePrecached([entry("index.html")])).not.toThrow();
+		expect(() =>
+			assertNoBrandAssetsArePrecached([entry("index.html"), entry("manifest.webmanifest")]),
+		).toThrow("manifest.webmanifest");
+	});
+
 	test("keeps shell JS and existing CSS/font/icon rules without lazy route chunks", () => {
+		// `assets/logo.svg` stands in for a non-JS asset here. It used to be
+		// `favicon.svg`, which is no longer precached at all now that the icon paths
+		// are brand-dependent (see the globPatterns comment in frontend/vite.config.ts)
+		// — keeping it would have implied a precache entry that does not exist. The
+		// behaviour under test is unchanged: the filter drops only JS that the final
+		// HTML does not reference.
 		const manifest = [
 			entry("index.html"),
 			entry("registerSW.js"),
@@ -97,7 +142,7 @@ describe("PWA app shell precache", () => {
 			entry("assets/route-narrator-lazy.js"),
 			entry("assets/index.css"),
 			entry("assets/app.woff2"),
-			entry("favicon.svg"),
+			entry("assets/logo.svg"),
 		];
 
 		expect(filterAppShellManifest(manifest, FINAL_HTML).map(({ url }) => url)).toEqual([
@@ -108,7 +153,7 @@ describe("PWA app shell precache", () => {
 			"assets/router-b2.js",
 			"assets/index.css",
 			"assets/app.woff2",
-			"favicon.svg",
+			"assets/logo.svg",
 		]);
 	});
 

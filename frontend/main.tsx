@@ -29,6 +29,7 @@ import {
 	resolvePluginUiContribution,
 	syncPluginUiContributions,
 } from "@frontend/components/plugins";
+import { useBranding } from "@frontend/hooks/useBranding";
 import { usePluginContributions } from "@frontend/hooks/usePluginContributions";
 import { readActivePluginThemeKey } from "@frontend/hooks/usePluginThemes";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
@@ -126,6 +127,12 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 	// React Query-backed sync: enabled by getToken(), so it fires right after
 	// login; mutations invalidate the same query key.
 	usePluginContributions();
+
+	// Instance branding (tab title, favicon, PWA icon URLs). Mounted here rather
+	// than in a route because it must apply on EVERY page including login — the
+	// pre-login surfaces are where telling two instances apart matters most. The
+	// endpoint is public, so this needs no session.
+	useBranding();
 
 	// WS reconnect → resync the contribution snapshot (the event stream is only
 	// an invalidation signal; the HTTP response remains the payload of truth).

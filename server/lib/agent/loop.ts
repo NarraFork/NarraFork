@@ -2342,43 +2342,62 @@ export async function* agentLoop(
 	// at least one online remote endpoint.
 	allTools = filterDeviceTools(allTools, config);
 
-	// In plan mode, override descriptions for forbidden tools so the model knows not to call them.
-	// When relaxedPlan is enabled, skip this — tools remain fully available.
-	if (config.planMode && !config.relaxedPlan) {
-		const disabledDesc = getToolMessage("planModeToolDisabled", locale);
-		allTools = allTools.map((t) =>
-			PLAN_MODE_ALLOWED_TOOLS.has(t.name)
-				? t
-				: {
-						...t,
-						description: disabledDesc,
-					},
-		);
+	/**
+	 * Whether plan mode should currently blank out the forbidden tools' descriptions.
+	 *
+	 * Read live, not frozen: plan mode can be toggled MANUALLY while this pass runs, and
+	 * `config.planMode`/`relaxedPlan` are getters on the session's live state.
+	 */
+	function planModeDisablesTools(): boolean {
+		return !!config.planMode && !config.relaxedPlan;
 	}
 
 	function resolveToolsForProvider(
 		providerName: string,
 		modelName: string,
 	): ResolvedToolDefinition[] {
+		let resolved = allTools;
 		// Inline native search (Codex): the provider declares its own search tool in
 		// the main request, so the function-style WebSearch is hidden entirely.
 		if (shouldUseNativeSearch(providerName, modelName)) {
-			return allTools.filter((t) => t.name !== "WebSearch");
-		}
-		// Hide WebSearch when every enabled channel would deterministically fail
-		// for THIS session's provider (the global isAvailable check can't see the
-		// session, so a native-only channel list would otherwise advertise a tool
-		// that always errors on non-opted providers).
-		if (
-			allTools.some((t) => t.name === "WebSearch") &&
+			resolved = resolved.filter((t) => t.name !== "WebSearch");
+		} else if (
+			// Hide WebSearch when every enabled channel would deterministically fail
+			// for THIS session's provider (the global isAvailable check can't see the
+			// session, so a native-only channel list would otherwise advertise a tool
+			// that always errors on non-opted providers).
+			resolved.some((t) => t.name === "WebSearch") &&
 			!hasUsableFunctionSearchChannelFor(providerName)
 		) {
-			return allTools.filter((t) => t.name !== "WebSearch");
+			resolved = resolved.filter((t) => t.name !== "WebSearch");
 		}
-		return allTools;
+
+		// In plan mode, override descriptions for forbidden tools so the model knows not to
+		// call them. Applied here rather than baked into `allTools` because a manual toggle
+		// can flip plan mode between turns, and `allTools` is built once per pass.
+		// When relaxedPlan is enabled, skip this — tools remain fully available.
+		if (planModeDisablesTools()) {
+			const disabledDesc = getToolMessage("planModeToolDisabled", locale);
+			resolved = resolved.map((t) =>
+				PLAN_MODE_ALLOWED_TOOLS.has(t.name)
+					? t
+					: {
+							...t,
+							description: disabledDesc,
+						},
+			);
+		}
+		return resolved;
 	}
 
 	let tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+	/**
+	 * The plan-mode tool-description state `tools` was formatted with.
+	 *
+	 * Compared at each turn boundary so a manual toggle re-formats the tool array, while an
+	 * unchanged state skips the ~30-tool schema conversion `formatTools` performs.
+	 */
+	let toolsPlanModeDisabled = planModeDisablesTools();
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
 	let completedToolCount = config.initialCompletedToolCount ?? 0;
@@ -2685,6 +2704,9 @@ export async function* agentLoop(
 				config.provider = newResolved.provider;
 				if (providerChanged || modelChanged) {
 					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+					// This re-format already applied the current plan-mode state; record it so the
+					// turn-boundary check does not immediately redo the same work.
+					toolsPlanModeDisabled = planModeDisablesTools();
 				}
 			}
 
@@ -2762,6 +2784,19 @@ export async function* agentLoop(
 					if (replacement) {
 						applyHistoryReplacement(replacement);
 					}
+				}
+
+				// A manual plan-mode toggle landed between turns: re-format the tool array so
+				// the forbidden tools carry (or drop) the disabled description. Checked after
+				// onBeforeTurn because a model switch there already re-formatted the tools.
+				const planModeDisabledNow = planModeDisablesTools();
+				if (planModeDisabledNow !== toolsPlanModeDisabled) {
+					toolsPlanModeDisabled = planModeDisabledNow;
+					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+					logger.info("Re-formatted tools after a mid-loop plan-mode change", {
+						narratorId: config.narratorId,
+						planModeDisablesTools: planModeDisabledNow,
+					});
 				}
 			}
 

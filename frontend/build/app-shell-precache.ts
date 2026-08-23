@@ -93,8 +93,42 @@ function isJavaScriptUrl(url: string): boolean {
 }
 
 /**
+ * Assets whose bytes are static but whose ROLE depends on instance branding, and
+ * which therefore must never be precached.
+ *
+ * `manifest.webmanifest` is generated per-request (instance name + icon URLs), and
+ * index.html swings its icon links between these static defaults and
+ * `/api/branding/*` depending on the configured colour. A precache entry pins one
+ * build-time revision, so an installed PWA would keep serving the previous brand
+ * indefinitely — silently, since precaching is working exactly as designed.
+ *
+ * Excluding them from `globPatterns` is NOT sufficient, which is the whole reason
+ * this list exists: vite-plugin-pwa injects them through `additionalManifestEntries`
+ * instead — `includeAssets` for the icons, and `manifest.webmanifest`
+ * unconditionally whenever a `manifest` option is present. That path bypasses
+ * `globPatterns` entirely. This filter runs in `manifestTransforms`, the one place
+ * that sees the final list.
+ */
+const BRAND_DEPENDENT_PRECACHE_URLS = new Set([
+	"manifest.webmanifest",
+	"favicon.svg",
+	"apple-touch-icon-180x180.png",
+	"pwa-192x192.png",
+	"pwa-512x512.png",
+]);
+
+/** Whether a precache URL points at a brand-dependent asset. */
+export function isBrandDependentPrecacheUrl(url: string): boolean {
+	const normalized = normalizePrecacheUrl(url);
+	return normalized != null && BRAND_DEPENDENT_PRECACHE_URLS.has(normalized);
+}
+
+/**
  * Keep non-JS assets selected by Workbox, but restrict JS to files referenced by
  * the final HTML application shell. Route-only lazy chunks remain runtime-cached.
+ *
+ * Brand-dependent assets are dropped regardless of type — see
+ * `BRAND_DEPENDENT_PRECACHE_URLS`.
  */
 export function filterAppShellManifest<T extends PrecacheManifestEntry>(
 	manifest: T[],
@@ -104,10 +138,31 @@ export function filterAppShellManifest<T extends PrecacheManifestEntry>(
 	const shellJavaScript = new Set([...shell.scripts, ...shell.modulePreloads]);
 
 	return manifest.filter((entry) => {
+		if (isBrandDependentPrecacheUrl(entry.url)) return false;
 		if (!isJavaScriptUrl(entry.url)) return true;
 		const normalized = normalizePrecacheUrl(entry.url);
 		return normalized != null && shellJavaScript.has(normalized);
 	});
+}
+
+/**
+ * Build-time invariant: no brand-dependent asset survived into the precache.
+ *
+ * Asserted on the FINAL manifest rather than trusting the filter, because every
+ * injection path here is outside our control (a vite-plugin-pwa upgrade could add
+ * another one) and the failure is invisible at runtime.
+ */
+export function assertNoBrandAssetsArePrecached(manifest: PrecacheManifestEntry[]): void {
+	const leaked = manifest.map((entry) => entry.url).filter(isBrandDependentPrecacheUrl);
+
+	if (leaked.length > 0) {
+		throw new Error(
+			`PWA precache still contains brand-dependent assets: ${leaked.join(", ")}. ` +
+				"Precaching them pins one instance's name and icon colour into every installed " +
+				"app. Find the injection path (includeAssets / includeManifestIcons / the " +
+				"unconditional manifest entry) and exclude it.",
+		);
+	}
 }
 
 function getPrecachedUrls(manifest: PrecacheManifestEntry[]): Set<string> {

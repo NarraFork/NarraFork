@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -8,6 +9,7 @@ import { resolveProviderAndModel } from "../lib/agent/provider";
 import { type CapturedRequest, createUrlCapture } from "../lib/agent/request-url-tracker";
 import { AsyncMutex } from "../lib/async-mutex";
 import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
+import { normalizeBrandingSettings } from "../lib/branding";
 import { isValidTrustedProxyCidr } from "../lib/client-ip";
 import { getCodexManager } from "../lib/codex-manager";
 import {
@@ -351,6 +353,22 @@ export const updateSettingsSchema = z
 			.optional(),
 		paths: z
 			.object({ defaultProjectDir: z.string().min(1) })
+			.partial()
+			.optional(),
+		/**
+		 * Per-instance branding. Validated STRICTLY here even though every read path
+		 * falls back to defaults: an admin who typed a malformed colour should be told
+		 * so, rather than saving a value that silently renders as NarraFork indigo.
+		 *
+		 * Both fields accept "" to mean "clear it" — the UI must send the empty string
+		 * rather than omitting the key, since `.partial()` reads an absent key as
+		 * "leave unchanged".
+		 */
+		branding: z
+			.object({
+				name: z.string().trim().max(BRAND_NAME_MAX_LENGTH),
+				iconColor: z.union([z.literal(""), z.string().trim().regex(BRAND_ICON_COLOR_PATTERN)]),
+			})
 			.partial()
 			.optional(),
 		agent: z
@@ -1577,6 +1595,7 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 
 		normalizeCustomApiProviderSettings(merged);
 		normalizeSearchSettings(merged);
+		normalizeBrandingSettings(merged);
 
 		const prefixChanges = getProviderPrefixChanges(
 			[currentCustomApiProviders, current.nugProviders, current.clineProviders],

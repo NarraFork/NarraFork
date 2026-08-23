@@ -2,6 +2,7 @@ import type {
 	CredentialUsageTotals,
 	CredentialUsageTotalsDetail,
 } from "@frontend/types/usage-history";
+import type { ResolvedBranding } from "@shared/branding";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
 import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
 import { parseContentDispositionFileName } from "./narrators";
@@ -1115,6 +1116,10 @@ export const miscApi = {
 
 	// Changelog
 	getChangelogs: () => request<ChangelogEntry[]>("/changelog"),
+
+	// Per-instance branding. Public like /changelog: the login page and the browser
+	// tab both need the instance name before a session exists.
+	getBranding: () => request<ResolvedBranding>("/branding"),
 
 	// Third-party licenses. Summaries and texts are separate calls: the full text
 	// set is ~1.1 MB and the page shows one entry at a time.

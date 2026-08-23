@@ -41,6 +41,33 @@
 					el.setAttribute("content", tc);
 				});
 			} catch (_e) {}
+
+			/*
+				Per-instance branding, applied from a localStorage mirror written by
+				frontend/lib/branding.ts.
+
+				This HTML is a build artifact shared by every deployment, so the instance
+				name cannot be baked in. Reading the mirror here — before any bundle loads
+				— is what stops the tab from showing "NarraFork" for the duration of the
+				/api/branding round trip, which is exactly the ambiguity this feature
+				exists to remove. The fetched value corrects this a moment later.
+
+				Storage keys are duplicated from BRAND_*_STORAGE_KEY in that module;
+				they are asserted to match in tests/frontend/branding-boot.test.ts.
+			*/
+			try {
+				var bn = localStorage.getItem("narrafork_brand_name");
+				if (bn) document.title = bn;
+				var bc = localStorage.getItem("narrafork_brand_icon_color");
+				// The mirror only holds a colour when it differs from the default, so its
+				// mere presence means the recolouring endpoints are worth requesting.
+				if (bc) {
+					var fi = document.querySelector('link[rel="icon"]');
+					if (fi) fi.setAttribute("href", "/api/branding/favicon.svg");
+					var ati = document.querySelector('link[rel="apple-touch-icon"]');
+					if (ati) ati.setAttribute("href", "/api/branding/apple-touch-icon.png");
+				}
+			} catch (_e) {}
 		</script>
 	</head>
 	<body>

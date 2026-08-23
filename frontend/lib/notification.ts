@@ -3,6 +3,7 @@
  * based on user preferences. DingTalk/Feishu are handled server-side.
  */
 
+import { brandNotificationIconUrl, getCurrentBranding } from "./branding";
 import { type NotificationSoundPrefs, playNotificationSound } from "./notification-sound";
 
 export interface NotificationPrefs extends NotificationSoundPrefs {
@@ -80,9 +81,16 @@ export function triggerNotification(
 				? `${narratorTitle} has finished`
 				: `${narratorTitle} is waiting for permission`;
 		try {
-			new Notification("NarraFork", {
+			// Title and icon follow the instance branding. This matters more here than
+			// anywhere else in the app: a desktop notification fires precisely when the
+			// window is NOT focused, so with a fixed "NarraFork" title the user cannot
+			// tell which of several instances is asking for them.
+			//
+			// The tag stays instance-agnostic on purpose — it deduplicates within one
+			// origin, and two instances are two origins.
+			new Notification(getCurrentBranding().name, {
 				body,
-				icon: "/pwa-192x192.png",
+				icon: brandNotificationIconUrl(),
 				tag: `narrator-${status}`,
 			});
 		} catch {

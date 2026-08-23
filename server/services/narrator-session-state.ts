@@ -71,6 +71,22 @@ export interface ActiveNarrator {
 	_planFileId?: string;
 	/** Plan file path — set when entering plan mode, passed to EnterPlanMode tool for the prompt */
 	_planFilePath?: string;
+	/**
+	 * Live plan-mode value for the RUNNING pass, set by a manual toggle mid-pass.
+	 *
+	 * `undefined` means "follow the DB snapshot taken at pass start". A manual toggle
+	 * writes the DB, but the pass already captured `planMode` into its AgentConfig, so
+	 * without this the running turn keeps the stale value while the permission gate
+	 * (which re-reads the DB per tool call) has already switched.
+	 *
+	 * ⚠️ Cleared at the start of every pass. The DB is the truth; this only covers the
+	 * window between "DB changed" and "the next pass re-reads it". Leaving it set would
+	 * make one manual toggle permanently shadow every other path that changes plan mode
+	 * (the model's own EnterPlanMode/ExitPlanMode, fork, recovery).
+	 */
+	_planModeLive?: boolean;
+	/** Live relaxed-plan value for the running pass. Same one-pass lifetime as `_planModeLive`. */
+	_relaxedPlanLive?: boolean;
 	/** Prepared EnterPlanMode calls that have not committed plan mode yet. */
 	_preparedPlanModes?: Map<string, PreparedPlanMode>;
 	/** Legacy permission mode snapshot from before entering plan mode; retained for migration/UI context. */
@@ -615,6 +631,48 @@ export const planModeAskedOnce = hotSafe<Set<string>>(
 	"narrafork.planModeAskedOnce",
 	() => new Set(),
 );
+
+/**
+ * Narrators whose plan mode was toggled manually mid-pass, so the system prompt must be
+ * rebuilt at the next turn boundary.
+ *
+ * The plan-mode reminder (the read-only constraint, the designated plan file path, the
+ * ExitPlanMode submission rules) lives ONLY in the system prompt, and that prompt is
+ * fixed when a pass starts. Without a rebuild the model is never told it entered plan
+ * mode, yet the permission gate is already denying its writes and demanding a plan file
+ * it has never heard of.
+ *
+ * A one-shot marker rather than a persisted column: it is consumed by the act of
+ * rebuilding. Persisting it would make a fork or a history replay re-trigger a rebuild
+ * that already happened (the same reason `InjectionSchedule` is a parameter).
+ */
+const pendingPlanModePromptRebuild = hotSafe<Set<string>>(
+	"narrafork.pendingPlanModePromptRebuild",
+	() => new Set(),
+);
+
+/**
+ * Ask the running loop to rebuild its system prompt at the next turn boundary.
+ *
+ * Returns false when the narrator has no live session: there is no pass holding a stale
+ * prompt, and the next activation builds a fresh one from the DB anyway.
+ */
+export function requestPlanModePromptRebuild(narratorId: string): boolean {
+	const active = activeNarrators.get(narratorId);
+	if (!active?.alive) return false;
+	pendingPlanModePromptRebuild.add(narratorId);
+	return true;
+}
+
+/** Take the pending rebuild request, if any. One-shot: a second call returns false. */
+export function consumePlanModePromptRebuild(narratorId: string): boolean {
+	return pendingPlanModePromptRebuild.delete(narratorId);
+}
+
+/** Drop a pending rebuild request (session teardown / recreation). */
+export function clearPlanModePromptRebuild(narratorId: string): void {
+	pendingPlanModePromptRebuild.delete(narratorId);
+}
 
 /**
  * Extra owners of a narrator's `working`/`waiting` status that are NOT an agent loop.

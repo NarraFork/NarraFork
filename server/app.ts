@@ -19,6 +19,7 @@ import { adminRoutes } from "./routes/admin";
 import { anthropicRoutes } from "./routes/anthropic";
 import { authRoutes } from "./routes/auth";
 import { benchmarkRoutes } from "./routes/benchmarks";
+import brandingRoutes from "./routes/branding";
 import changelogRoutes from "./routes/changelog";
 import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
@@ -189,6 +190,12 @@ app.route("/api/shares", shareRoutes);
 
 // Public: changelog (no sensitive data)
 app.route("/api/changelog", changelogRoutes);
+
+// Public: per-instance branding (name, icon colour, recoloured icons). Must be
+// readable before login — the login page and the browser tab are exactly where a
+// user needs to tell two instances apart. Exposes only a display name and a hex
+// colour; see that route's header.
+app.route("/api/branding", brandingRoutes);
 
 // Public: third-party license attribution. Required to reach whoever receives the
 // software, and /licenses is linked from the login page.

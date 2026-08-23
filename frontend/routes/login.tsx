@@ -12,12 +12,12 @@ import {
 	Tabs,
 	Text,
 	TextInput,
-	Title,
 } from "@mantine/core";
 import { IconFingerprint } from "@tabler/icons-react";
 import { createFileRoute, Link, Navigate, useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { BrandTitle } from "../components/common/BrandTitle";
 import {
 	useAuthStatus,
 	useLogin,
@@ -392,9 +392,9 @@ function LoginPage() {
 			<Paper withBorder shadow="md" p="xl" w={400}>
 				<form onSubmit={(e) => e.preventDefault()}>
 					<Stack>
-						<Title order={2} ta="center">
-							NarraFork
-						</Title>
+						{/* The instance name is what tells a user which deployment they are
+						    signing into, so this is the one place it must not be generic. */}
+						<BrandTitle order={2} centered />
 
 						{mfaToken ? (
 							<Stack>

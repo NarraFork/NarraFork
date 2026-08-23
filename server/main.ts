@@ -244,12 +244,52 @@ const NO_CACHE_FRONTEND_PATHS = new Set([
 	// `PLUGIN_UI_RUNTIME_VERSION` — surfacing as HostRuntimeUnavailableError in the panel.
 	PLUGIN_UI_RUNTIME_JS_URL,
 	PLUGIN_UI_RUNTIME_CSS_URL,
+	// Brand assets sit at fixed paths whose MEANING changes when an admin edits the
+	// instance icon colour: index.html swings its <link rel="icon"> between these
+	// static defaults and /api/branding/*. The bytes here never change, so
+	// revalidation is cheap (a 304), but the default `max-age=3600` would delay a
+	// brand change by up to an hour with no signal that anything was stale.
+	"/favicon.svg",
+	"/apple-touch-icon-180x180.png",
+	"/pwa-192x192.png",
+	"/pwa-512x512.png",
 ]);
 
 function getFrontendCacheControl(path: string): string {
 	if (path.startsWith("/assets/")) return "public, max-age=31536000, immutable";
 	if (NO_CACHE_FRONTEND_PATHS.has(path)) return "no-cache";
 	return "public, max-age=3600";
+}
+
+/**
+ * Serve the web manifest with the instance name and icons substituted in.
+ *
+ * Installed as a shared helper because BOTH static-serving branches below
+ * (embedded assets in a compiled binary, filesystem in a source run) have to route
+ * through it. Handling only one would make branding work in dev and silently stop
+ * working in the shipped binary — or the reverse — with no error either way.
+ *
+ * Returns null when the request is not for the manifest, so callers can fall
+ * through to their normal asset handling.
+ */
+async function serveBrandedManifest(path: string, staticPath: string): Promise<Response | null> {
+	if (path !== "/manifest.webmanifest") return null;
+	try {
+		const file = Bun.file(staticPath);
+		if (!(await file.exists())) return null;
+		const { brandManifestJson } = await import("./lib/branding");
+		return new Response(brandManifestJson(await file.text(), settings), {
+			headers: {
+				"Content-Type": MIME_TYPES[".webmanifest"],
+				"Cache-Control": "no-cache",
+			},
+		});
+	} catch (err) {
+		// Fall back to the static manifest rather than failing the request: an
+		// unbranded manifest still installs correctly.
+		logger.warn("Failed to serve branded web manifest", { error: String(err) });
+		return null;
+	}
 }
 
 // Production: serve Vite build output via Hono
@@ -287,6 +327,8 @@ if (isProd) {
 
 					const filePath = embeddedAssets[c.req.path];
 					if (filePath) {
+						const branded = await serveBrandedManifest(c.req.path, filePath);
+						if (branded) return branded;
 						const blob = Bun.file(filePath);
 						const mime = MIME_TYPES[extname(c.req.path)] ?? "application/octet-stream";
 						return new Response(blob, {
@@ -339,6 +381,9 @@ if (isProd) {
 			if (!filePath.startsWith(staticDir)) {
 				return next();
 			}
+
+			const branded = await serveBrandedManifest(c.req.path, filePath);
+			if (branded) return branded;
 
 			const file = Bun.file(filePath);
 			if (await file.exists()) {

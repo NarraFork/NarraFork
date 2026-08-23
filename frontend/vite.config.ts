@@ -7,6 +7,7 @@ import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 import {
 	assertAppShellJavaScriptIsPrecached,
+	assertNoBrandAssetsArePrecached,
 	type EmittedBundle,
 	extractEmittedHtml,
 	filterAppShellManifest,
@@ -276,6 +277,80 @@ function pluginUiRuntimeAssets(): Plugin {
 	} satisfies Plugin;
 }
 
+/**
+ * Own the web manifest, because VitePWA cannot be told to keep it out of the
+ * precache (see the `manifest: false` comment where VitePWA is configured).
+ *
+ * Emits `manifest.webmanifest` and injects its `<link>`, which is exactly what
+ * VitePWA would have done minus the `additionalManifestEntries` push. The server
+ * rewrites `name`/`short_name`/`icons` per request
+ * (`server/lib/branding/manifest.ts`); this file is the shape it starts from and
+ * the fallback if that rewrite ever fails.
+ *
+ * Icons point at the static PNGs here rather than `/api/branding/*` so the file is
+ * valid on its own — the server substitutes the branded URLs. That means a
+ * deployment serving `dist/` from a plain static host still installs, just without
+ * per-instance branding.
+ */
+function webManifestAsset(appName: string, shortName: string): Plugin {
+	const manifest = {
+		name: appName,
+		short_name: shortName,
+		description: "AI-powered collaborative programming with narrative forking",
+		// Deliberately the dark UI background, not the brand accent: browsers paint
+		// these across the PWA status bar and splash screen, so an accent colour would
+		// introduce the app with a screen that does not match it.
+		theme_color: "#1a1b1e",
+		background_color: "#1a1b1e",
+		display: "standalone",
+		scope: "/",
+		start_url: "/",
+		lang: "en",
+		icons: [
+			{ src: "/pwa-192x192.png", sizes: "192x192", type: "image/png" },
+			{ src: "/pwa-512x512.png", sizes: "512x512", type: "image/png" },
+			{ src: "/pwa-512x512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
+		],
+	};
+	const body = JSON.stringify(manifest);
+	let isMainApplicationBuild = false;
+
+	return {
+		name: "narrafork-web-manifest",
+		configResolved(config) {
+			// Same guard as the other emitting plugins here: PWA's injectManifest starts a
+			// nested library build for src-sw.ts into the same outDir.
+			isMainApplicationBuild = !config.build.lib && !config.build.ssr;
+		},
+		configureServer(server) {
+			// Dev has no emitted file, and the dev server does not proxy
+			// /manifest.webmanifest to the backend, so serve it here.
+			server.middlewares.use((req, res, next) => {
+				const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+				if (pathname !== "/manifest.webmanifest") {
+					next();
+					return;
+				}
+				res.statusCode = 200;
+				res.setHeader("Content-Type", "application/manifest+json");
+				res.setHeader("Cache-Control", "no-cache");
+				res.end(body);
+			});
+		},
+		transformIndexHtml: {
+			order: "post",
+			handler(html) {
+				if (html.includes('rel="manifest"')) return html;
+				return html.replace("</head>", '<link rel="manifest" href="/manifest.webmanifest"></head>');
+			},
+		},
+		generateBundle() {
+			if (!isMainApplicationBuild) return;
+			this.emitFile({ type: "asset", fileName: "manifest.webmanifest", source: body });
+		},
+	} satisfies Plugin;
+}
+
 function shikiRuntimeAssets(): Plugin {
 	const packageRoots = {
 		langs: resolve(__dirname, "..", "node_modules/@shikijs/langs/dist"),
@@ -355,6 +430,7 @@ export default defineConfig(({ mode, command }) => {
 			shikiLanguageAliases(),
 			shikiRuntimeAssets(),
 			pluginUiRuntimeAssets(),
+			webManifestAsset(appName, shortName),
 			TanStackRouterVite({
 				target: "react",
 				autoCodeSplitting: true,
@@ -372,35 +448,27 @@ export default defineConfig(({ mode, command }) => {
 					filename: "src-sw.ts",
 					registerType: "autoUpdate",
 					injectRegister: "auto",
-					includeAssets: ["favicon.svg", "apple-touch-icon-180x180.png"],
-					manifest: {
-						name: appName,
-						short_name: shortName,
-						description: "AI-powered collaborative programming with narrative forking",
-						theme_color: "#1a1b1e",
-						background_color: "#1a1b1e",
-						display: "standalone",
-						scope: "/",
-						start_url: "/",
-						icons: [
-							{
-								src: "pwa-192x192.png",
-								sizes: "192x192",
-								type: "image/png",
-							},
-							{
-								src: "pwa-512x512.png",
-								sizes: "512x512",
-								type: "image/png",
-							},
-							{
-								src: "pwa-512x512.png",
-								sizes: "512x512",
-								type: "image/png",
-								purpose: "maskable",
-							},
-						],
-					},
+					// `includeAssets` and `includeManifestIcons` both push entries into
+					// `additionalManifestEntries`, i.e. straight into the precache without
+					// passing through `globPatterns`. Both are off because the brand icons must
+					// stay revalidatable — see BRAND_DEPENDENT_PRECACHE_URLS in
+					// build/app-shell-precache.ts. The files are still emitted; only their
+					// precache entries are suppressed.
+					includeAssets: [],
+					includeManifestIcons: false,
+					// `manifest: false` hands the web manifest to `webManifestAsset()` below.
+					//
+					// This is not a style preference. When VitePWA owns the manifest it appends
+					// a `{url: "manifest.webmanifest", revision}` entry to
+					// `additionalManifestEntries`, unconditionally and with no option to
+					// suppress it — and Workbox applies that list AFTER `manifestTransforms`
+					// (see workbox-build/lib/transform-manifest.js: "Run
+					// additionalManifestEntriesTransform last"). So neither our filter nor our
+					// build-time assertion can see it, let alone remove it. The manifest is now
+					// branded per-request by the server, and a precached copy would pin one
+					// instance's name into every installed app — silently, since precaching
+					// would be working exactly as designed.
+					manifest: false,
 					injectManifest: {
 						// Use IIFE output for the custom service worker to avoid Rolldown's
 						// deprecated inlineDynamicImports path in the plugin's ES build mode.
@@ -408,10 +476,23 @@ export default defineConfig(({ mode, command }) => {
 						globPatterns: [
 							"index.html",
 							"registerSW.js",
-							"manifest.webmanifest",
-							"favicon.svg",
-							"apple-touch-icon-180x180.png",
-							"pwa-*.png",
+							// NOT precached, deliberately: manifest.webmanifest, favicon.svg,
+							// apple-touch-icon-180x180.png and pwa-*.png.
+							//
+							// Those four used to be listed here, from before instance branding
+							// existed. Precaching pins a file by build-time revision, but the
+							// manifest is now generated per-request (instance name + icon URLs)
+							// and the icon paths swing between these static defaults and
+							// /api/branding/* depending on the configured colour. A precached
+							// copy would keep serving the OLD brand to installed PWA users
+							// indefinitely, with no error anywhere — the exact failure mode this
+							// feature is supposed to fix. They are served with `no-cache` + ETag
+							// instead (see NO_CACHE_FRONTEND_PATHS in server/main.ts), so
+							// revalidation is a 304 and a brand change lands immediately.
+							//
+							// Cost of dropping them: a cold offline start has no app icon. The
+							// app shell itself (HTML + JS + CSS) is still fully precached.
+							//
 							// Let Workbox discover JS, then retain only the final HTML's script and
 							// modulepreload references. Route-only lazy chunks stay runtime-cached.
 							"assets/**/*.js",
@@ -424,6 +505,10 @@ export default defineConfig(({ mode, command }) => {
 									finalAppShellHtml ?? readFileSync(join(frontendOutDir, "index.html"), "utf8");
 								const filtered = filterAppShellManifest(manifest, html);
 								assertAppShellJavaScriptIsPrecached(html, filtered);
+								// The manifest.webmanifest entry is injected unconditionally by
+								// vite-plugin-pwa, so this transform is the only place it can be
+								// removed — and the only place the removal can be verified.
+								assertNoBrandAssetsArePrecached(filtered);
 
 								return { manifest: filtered };
 							},

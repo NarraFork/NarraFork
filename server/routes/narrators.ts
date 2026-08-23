@@ -237,6 +237,7 @@ import {
 	updateNarratorDraft,
 } from "../services/narrator-draft-service";
 import { buildExportFileName, streamNarratorExport } from "../services/narrator-export";
+import { deliverInjection } from "../services/narrator-injection";
 import {
 	countNarratorMessageRefs,
 	countNarratorMessageRefsBatch,
@@ -323,6 +324,7 @@ import {
 	isNarratorRuntimeBusy,
 	pendingPermissions,
 	planModeAskedOnce,
+	requestPlanModePromptRebuild,
 	resetActiveUpstreamSession,
 	type SavedBufferedFile,
 } from "../services/narrator-session-state";
@@ -3921,7 +3923,21 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		});
 	}
 	if (planState.wasPlanMode) {
+		// Already in plan mode, so nothing changed and there is nothing to announce. The
+		// live override is deliberately NOT written here: whichever path turned plan mode
+		// on (this route earlier, or the model's own EnterPlanMode) already set it, and
+		// writing it on a no-op would pair a live override with no rebuild request.
 		return c.json({ ok: true, planMode: true, traits: publicTraitsResponse(planState.traits) });
+	}
+
+	if (active) {
+		// A running pass froze `planMode`/`relaxedPlan` into its AgentConfig before this
+		// toggle. These live values are what its getters read, so the tool-description
+		// override and the relaxed-plan checks switch over without waiting for the next
+		// pass. Set only past the no-op return above, so every live override written here
+		// is paired with the rebuild request below.
+		active._planModeLive = true;
+		active._relaxedPlanLive = planState.relaxedPlan;
 	}
 
 	const userId = c.get("user").sub;
@@ -3961,6 +3977,32 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 			message: { ...fullMsg, seq: msg.seq },
 		});
 	}
+
+	// Tell the model, in the conversation, that this just happened.
+	//
+	// The tool_use row above is a reader-facing record of the toggle; the system prompt
+	// rebuild requested below carries the plan-mode RULES. Neither says "your instructions
+	// changed just now", so without this the model keeps its previous implementation intent
+	// under the new constraints and walks straight into the permission gate.
+	//
+	// `role: "user"` because this is the user's action, not a system fact. The returned
+	// `turnText` is deliberately ignored: it exists for callers that drive the loop
+	// themselves, and here the running loop picks the row up via the rebuild below.
+	await deliverInjection(id, {
+		content: getToolMessageWithParams("planModeEnteredByUser", locale as Locale, {
+			planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
+		}),
+		source: "plan_mode_toggled",
+		role: "user",
+		schedule: "onNextTurn",
+		locale: locale as Locale,
+		createdBy: userId,
+	});
+	// The plan-mode reminder lives only in the system prompt, which a running pass fixed at
+	// its start. This rebuild is what actually delivers it — and it re-reads history, so it
+	// also brings in the two rows written above.
+	requestPlanModePromptRebuild(id);
+
 	broadcastToNarrator(id, {
 		type: "plan_mode_changed",
 		narratorId: id,
@@ -3988,7 +4030,19 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 	planModeAskedOnce.delete(id);
 
 	if (!planState.wasPlanMode && cancelledPermissions === 0) {
+		// Nothing was in plan mode and no permission was cancelled, so this changed
+		// nothing. Same reason as the enter route for not writing the live override on a
+		// no-op: `false` would shadow a model-driven EnterPlanMode later in the same pass.
 		return c.json({ ok: true, planMode: false, traits: publicTraitsResponse(planState.traits) });
+	}
+
+	if (active) {
+		// Symmetric to the enter route: a running pass froze `planMode: true`, so its getter
+		// needs the live value to release the tool-description override.
+		active._planModeLive = false;
+		// Left undefined rather than false: exiting plan mode must not change the user's
+		// permission policy, so relaxed-plan falls back to the narrator's own DB value.
+		active._relaxedPlanLive = undefined;
 	}
 
 	const msg = await narratorService.persistSystemMessage(id, message, undefined, userId);
@@ -3997,6 +4051,21 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 		narratorId: id,
 		message: msg,
 	});
+
+	// Same reason as the enter route: the row above is invisible to a pass whose in-memory
+	// history was built before it, and the stale system prompt still carries the plan-mode
+	// constraint. This injection states that the toggle happened AND that leaving plan mode
+	// is not plan approval; the rebuild delivers it plus the constraint-free prompt.
+	await deliverInjection(id, {
+		content: getToolMessage("planModeExitedByUser", locale),
+		source: "plan_mode_toggled",
+		role: "user",
+		schedule: "onNextTurn",
+		locale,
+		createdBy: userId,
+	});
+	requestPlanModePromptRebuild(id);
+
 	broadcastToNarrator(id, {
 		type: "plan_mode_changed",
 		narratorId: id,

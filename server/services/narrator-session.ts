@@ -217,7 +217,9 @@ import {
 	bufferedMessages,
 	claimNarratorRuntime,
 	clearActiveHistoryCompactPending,
+	clearPlanModePromptRebuild,
 	compactLocks,
+	consumePlanModePromptRebuild,
 	hasPendingHistoryCompact,
 	isNarratorRuntimeBusy,
 	knowledgeInjectionCycleStates,
@@ -2478,6 +2480,15 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			return rebuildHistoryForCurrentContext(null, true);
 		}
 
+		// Plan mode was toggled manually mid-pass. The rebuild carries TWO things the
+		// running turn cannot otherwise get: the plan-mode reminder (which only exists in
+		// the system prompt, fixed at pass start) and the row the toggle just persisted
+		// (the in-memory history was built before it existed). Without it the model is
+		// never told it entered plan mode while the permission gate already enforces it.
+		if (consumePlanModePromptRebuild(narratorId)) {
+			return rebuildHistoryForCurrentContext(getPruneBoundary(), true);
+		}
+
 		const row = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
 			columns: { pruneBoundaryMessageId: true },
@@ -2681,6 +2692,16 @@ export async function runAgentLoop(
 			// persisted boundary so the context stays within budget. When compactStart
 			// is <= pruneStart, dynamic pruning is explicitly disabled; clear any stale
 			// boundary left over from an earlier threshold configuration.
+			// A manual plan-mode toggle only needs to override the CURRENT pass, whose
+			// AgentConfig captured `freshNarrator` above. This pass just re-read the DB, so
+			// any live override is now redundant — and keeping it would make one manual
+			// toggle permanently shadow every other path that changes plan mode.
+			active._planModeLive = undefined;
+			active._relaxedPlanLive = undefined;
+			// The prompt this pass is about to build already reflects the toggled state, so a
+			// rebuild request raised before it is satisfied by construction.
+			clearPlanModePromptRebuild(narratorId);
+
 			const loopThresholds = getContextThresholds(resolved.model, resolved.provider);
 			const pruningWindowEnabled = isDynamicPruningWindowEnabled(loopThresholds);
 			active._pruneBoundaryMessageId = pruningWindowEnabled
@@ -2723,6 +2744,9 @@ export async function runAgentLoop(
 					defaultDeviceId: oauthRuntime?.defaultDeviceId ?? active._defaultDeviceId ?? null,
 					allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
 				},
+				// Same reason as in rebuildSystemPrompt: a legacy plan path cannot be rebuilt
+				// from the identity, and the reminder must name the file the gate allows.
+				active._planFilePath,
 			);
 			active.systemPrompt = freshSystemPrompt;
 			active._usedCompactSummary = usedCompactSummary;
@@ -2815,6 +2839,13 @@ export async function runAgentLoop(
 						freshOAuthRuntime ? false : isPlanModeTrait(freshNarrator.traits),
 						active._planFileId,
 						settings.agent.defaultSystemPrompt,
+						undefined,
+						// The reminder, the Write/Edit gate and ExitPlanMode resolution must all
+						// name the SAME file. A cycle resumed from the pre-`plans/` layout keeps a
+						// legacy path in `_planFilePath` that `buildPlanFileRelPath` cannot
+						// reconstruct from the identity alone, so passing it is what stops the
+						// model being told to write somewhere the gate then rejects.
+						active._planFilePath,
 					);
 					// NOTE: Do NOT set active.systemPrompt here — the returned value
 					// flows through onBeforeTurn → loop.ts which updates config.systemPrompt.
@@ -2869,6 +2900,12 @@ export async function runAgentLoop(
 					active._planFileId = planState.planFileId;
 					active._planFilePath = planState.planFilePath;
 					active._previousPermissionMode = planState.previousPermissionMode;
+					// A manual toggle earlier in THIS pass may have left a live override behind.
+					// The DB now says plan mode is on, so the override has nothing left to
+					// correct — and a stale `false` here would keep the tool-description
+					// override released for a pass the model just put into plan mode.
+					active._planModeLive = undefined;
+					active._relaxedPlanLive = undefined;
 					if (!planState.wasPlanMode) {
 						broadcastToNarrator(narratorId, {
 							type: "plan_mode_changed",
@@ -2899,6 +2936,13 @@ export async function runAgentLoop(
 					active._planFileId = undefined;
 					active._planFilePath = undefined;
 					active._previousPermissionMode = undefined;
+					// Drop any live override from a manual toggle earlier in this pass. The DB is
+					// authoritative again from here, and this must not wait for the pass-start
+					// clear: the non-compact branch below aborts the loop, but the compact branch
+					// only aborts when there is plan text, so a stale `true` could otherwise keep
+					// plan mode applied to a pass the model just exited.
+					active._planModeLive = undefined;
+					active._relaxedPlanLive = undefined;
 					planModeAskedOnce.delete(narratorId);
 					// Plan mode is a trait overlay. Exiting it must not silently change the
 					// user's current permission policy. Still continue approval handling even
@@ -3158,14 +3202,25 @@ export async function runAgentLoop(
 				locale,
 				signal: active.abortController.signal,
 				chapterId: active._chapterId,
-				planMode: oauthRuntime ? false : isPlanModeTrait(freshNarrator.traits),
+				// Plan mode can be toggled MANUALLY while this pass is running, so both flags
+				// are read live rather than frozen here. `_planModeLive`/`_relaxedPlanLive` are
+				// undefined until a toggle happens, in which case the pass-start DB snapshot
+				// applies; they are cleared at the top of every pass so the DB stays the truth.
+				get planMode() {
+					if (oauthRuntime) return false;
+					return active._planModeLive ?? isPlanModeTrait(freshNarrator.traits);
+				},
 				permissionMode: oauthRuntime?.permissionMode ?? freshNarrator.permissionMode ?? "default",
 				previousPermissionMode: oauthRuntime
 					? undefined
 					: (active._previousPermissionMode ?? freshNarrator.previousPermissionMode ?? undefined),
-				relaxedPlan: oauthRuntime
-					? false
-					: resolveEffectiveRelaxedPlan(freshNarrator.permissionMode, freshNarrator.relaxedPlan),
+				get relaxedPlan() {
+					if (oauthRuntime) return false;
+					return (
+						active._relaxedPlanLive ??
+						resolveEffectiveRelaxedPlan(freshNarrator.permissionMode, freshNarrator.relaxedPlan)
+					);
+				},
 				planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
 				planReflectionAutoApproveOverride: normalizeBooleanOverride(
 					freshNarrator.planReflectionAutoApproveOverride,

@@ -23,6 +23,26 @@ const STATIC_MEDIA_DESTINATIONS = new Set(["font", "image"]);
 const SEVEN_DAYS_SECONDS = 7 * 24 * 60 * 60;
 const THIRTY_DAYS_SECONDS = 30 * 24 * 60 * 60;
 
+/**
+ * Brand assets, which must NOT be cached by this worker.
+ *
+ * These paths are fixed but their meaning is not: index.html points the icon links
+ * at either these static defaults or `/api/branding/*` depending on the configured
+ * instance colour, and the manifest is generated per-request with the instance
+ * name. The `CacheFirst` media route below would otherwise hold an icon for up to
+ * 30 days — long enough that changing a brand colour looks like it did nothing.
+ *
+ * `/api/branding/*` is already excluded by `isApiOrWsPath`; these are the
+ * non-API paths that need the same treatment.
+ */
+const BRAND_ASSET_PATHS = new Set([
+	"/favicon.svg",
+	"/apple-touch-icon-180x180.png",
+	"/pwa-192x192.png",
+	"/pwa-512x512.png",
+	"/manifest.webmanifest",
+]);
+
 function isApiOrWsPath(pathname: string) {
 	return (
 		pathname === "/api" ||
@@ -32,11 +52,16 @@ function isApiOrWsPath(pathname: string) {
 	);
 }
 
+function isBrandAssetPath(pathname: string) {
+	return BRAND_ASSET_PATHS.has(pathname);
+}
+
 // Same-origin JS/CSS/workers: keep fast while refreshing in the background.
 registerRoute(
 	({ request, url }) =>
 		url.origin === self.location.origin &&
 		!isApiOrWsPath(url.pathname) &&
+		!isBrandAssetPath(url.pathname) &&
 		STATIC_ASSET_DESTINATIONS.has(request.destination),
 	new StaleWhileRevalidate({
 		cacheName: "narrafork-static-assets",
@@ -52,6 +77,7 @@ registerRoute(
 	({ request, url }) =>
 		url.origin === self.location.origin &&
 		!isApiOrWsPath(url.pathname) &&
+		!isBrandAssetPath(url.pathname) &&
 		STATIC_MEDIA_DESTINATIONS.has(request.destination),
 	new CacheFirst({
 		cacheName: "narrafork-static-media",

@@ -95,6 +95,7 @@ import {
 // vlist/: publishing it from here must not statically import the virtual list,
 // which stays behind its dynamic-import boundary (vlist-isolation.guard.test.ts).
 import { setStreamAnimDurationMs } from "../lib/stream-anim-duration";
+import { BrandTitle } from "./common/BrandTitle";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
@@ -651,14 +652,12 @@ function AuthenticatedLayout() {
 							openDelay={400}
 							disabled={wizardOpen}
 						>
-							<Title
+							<BrandTitle
 								order={3}
 								visibleFrom="sm"
 								onClick={wizardOpen ? undefined : toggleNavCollapsed}
 								style={{ cursor: wizardOpen ? "default" : "pointer", userSelect: "none" }}
-							>
-								{t("appName")}
-							</Title>
+							/>
 						</Tooltip>
 
 						<UpdateBadge />
@@ -684,11 +683,7 @@ function AuthenticatedLayout() {
 								</Button>
 							</Tooltip>
 						)}
-						{!searchOpen && (
-							<Title order={3} hiddenFrom="sm">
-								{t("appName")}
-							</Title>
-						)}
+						{!searchOpen && <BrandTitle order={3} hiddenFrom="sm" />}
 					</Group>
 					<Group wrap="nowrap">
 						<OutputStatsBadge enabled={prefs?.showOutputStats ?? false} />

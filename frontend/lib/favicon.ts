@@ -18,9 +18,17 @@
  *   - the user reads it (the tab regains focus / becomes visible) — clears all
  *   - the originating narrator resolves the state (e.g. a reflection ends and
  *     it returns to "working") — clears that narrator only
+ *
+ * Two colors meet in this file and only one of them is configurable:
+ *   - the LOGO color follows the instance's branding (`lib/branding.ts`), because
+ *     the favicon is one of the few things distinguishing two deployments in one
+ *     browser;
+ *   - the DOT color stays hard-coded, because it encodes narrator *status* and
+ *     must keep matching the in-app status palette. Letting a brand color reach it
+ *     would make "error" mean whatever hue an admin happened to pick.
  */
 
-const DEFAULT_FAVICON_HREF = "/favicon.svg";
+import { brandFaviconUrl, getCurrentBranding, onBrandingChange } from "./branding";
 
 export type FaviconAlertKind = "reflecting" | "unread" | "waiting" | "error";
 
@@ -46,10 +54,18 @@ const ALERT_COLOR: Record<FaviconAlertKind, string> = {
 	error: "#fa5252",
 };
 
-/** Build the alert favicon: the NarraFork fork logo + a colored dot. */
-function buildAlertSvg(dotColor: string): string {
+/**
+ * Build the alert favicon: the fork logo in the instance's brand color + a
+ * status-colored dot.
+ *
+ * The logo is redrawn inline rather than composited over `/favicon.svg` because a
+ * data URI cannot reference another document, and fetching the SVG to overlay it
+ * would make the favicon depend on a network round trip at exactly the moment
+ * something needs attention.
+ */
+function buildAlertSvg(dotColor: string, brandColor: string): string {
 	return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="96" fill="#4c6ef5"/>
+  <rect width="512" height="512" rx="96" fill="${brandColor}"/>
   <g fill="none" stroke="#fff" stroke-width="32" stroke-linecap="round" stroke-linejoin="round">
     <path d="M256 400 V200"/>
     <path d="M256 200 Q256 160 216 130 L176 108"/>
@@ -63,7 +79,8 @@ function buildAlertSvg(dotColor: string): string {
 }
 
 function alertHref(kind: FaviconAlertKind): string {
-	return `data:image/svg+xml,${encodeURIComponent(buildAlertSvg(ALERT_COLOR[kind]))}`;
+	const svg = buildAlertSvg(ALERT_COLOR[kind], getCurrentBranding().iconColor);
+	return `data:image/svg+xml,${encodeURIComponent(svg)}`;
 }
 
 // Active alerts keyed by narrator ID, plus the color kind currently painted.
@@ -83,16 +100,30 @@ function applyHref(href: string): void {
 /**
  * Recompute the favicon from the set of active alerts: paint the
  * highest-severity color, or restore the default when nothing is pending.
+ *
+ * `force` bypasses the "already painted this kind" shortcut. The alert SVG embeds
+ * the brand color, so when branding changes the *kind* is unchanged while the
+ * bytes are not — without the override an alerting tab would keep the old brand
+ * color until the alert cleared.
  */
-function repaint(): void {
+function repaint(force = false): void {
 	let winner: FaviconAlertKind | null = null;
 	for (const kind of alerts.values()) {
 		if (!winner || ALERT_SEVERITY[kind] > ALERT_SEVERITY[winner]) winner = kind;
 	}
-	if (winner === paintedKind) return;
+	if (winner === paintedKind && !force) return;
 	paintedKind = winner;
-	applyHref(winner ? alertHref(winner) : DEFAULT_FAVICON_HREF);
+	// The non-alert case is left to `lib/branding.ts`, which owns the plain favicon
+	// href; painting it from here too would fight that module over the same
+	// attribute.
+	if (winner) applyHref(alertHref(winner));
+	else applyHref(brandFaviconUrl());
 }
+
+// Repaint an active alert when the instance's brand color arrives or changes.
+onBrandingChange(() => {
+	if (paintedKind) repaint(true);
+});
 
 /**
  * Clear favicon alerts.  Pass a narrator ID to clear only that narrator's

@@ -19,6 +19,7 @@ import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import { PathInput } from "../common/PathInput";
 import type { UpdateModalData } from "../UpdateModal";
+import { BrandingSection } from "./BrandingSection";
 import { DependencyStatus } from "./DependencyStatus";
 import { TlsSection } from "./TlsSection";
 
@@ -59,6 +60,11 @@ export interface ServerSystemSectionProps {
 	setUpdateChannel: (v: "stable" | "beta") => void;
 	updateAutoDownload: boolean;
 	setUpdateAutoDownload: (v: boolean) => void;
+	// Instance identity
+	brandName: string;
+	setBrandName: (v: string) => void;
+	brandIconColor: string;
+	setBrandIconColor: (v: string) => void;
 }
 
 export function ServerSystemSection({
@@ -88,6 +94,10 @@ export function ServerSystemSection({
 	setUpdateChannel,
 	updateAutoDownload,
 	setUpdateAutoDownload,
+	brandName,
+	setBrandName,
+	brandIconColor,
+	setBrandIconColor,
 }: ServerSystemSectionProps) {
 	const { t } = useTranslation("settings");
 	const settingsFeatureCapability = useSettingsFeatureCapability();
@@ -150,6 +160,15 @@ export function ServerSystemSection({
 					]}
 				/>
 			</div>
+
+			{/* Instance identity — placed right after the server basics because it is
+			    the same kind of setting: what this deployment IS, not how it behaves. */}
+			<BrandingSection
+				brandName={brandName}
+				setBrandName={setBrandName}
+				brandIconColor={brandIconColor}
+				setBrandIconColor={setBrandIconColor}
+			/>
 
 			{/* TLS */}
 			<Switch
