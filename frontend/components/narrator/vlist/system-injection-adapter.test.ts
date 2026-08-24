@@ -40,9 +40,9 @@ const CTX: AdapterContext = { lod: 5 };
  * adapter projected the BODY rather than reading this text block.
  */
 const MODEL_TEXT = [
-	"Dynamic Spec — open tasks (spec://tasks.json):",
+	"Dynamic Spec — excerpt of open tasks (not the full list; read spec://tasks.json for all of it):",
 	"- doing: migrate the queues",
-	"Update spec://tasks.json if any state changed.",
+	"Update spec://tasks.json if any state changed. Edit it in place; do not rewrite the file from this excerpt.",
 ].join("\n");
 
 const TASKS_BODY: SideCarBody = {
@@ -166,7 +166,7 @@ describe("system_injection — the body the reader gets", () => {
 		// The instruction half is prompt engineering. Its presence here would mean the
 		// adapter read the row's text block instead of projecting the body.
 		expect(data.text).not.toContain("Update spec://tasks.json");
-		expect(data.text).not.toContain("open tasks (spec://tasks.json)");
+		expect(data.text).not.toContain("excerpt of open tasks");
 	});
 
 	it("projects to Markdown structure (heading + list), not the private line vocabulary", () => {

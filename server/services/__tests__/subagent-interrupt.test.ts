@@ -28,6 +28,7 @@ const {
 } = await import("../subagent-manual-override");
 const {
 	bufferSubagentUserMessage,
+	canDeliverBufferedMessageInPass,
 	clearSubagentBufferedMessages,
 	getSubagentBufferedMessages,
 	MAX_SUBAGENT_INTERRUPTION_RETRIES,
@@ -166,6 +167,51 @@ describe("foreground subagent interrupt semantics", () => {
 		clearSubagentBufferedMessages(SUBAGENT_ID);
 
 		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+	});
+});
+
+/**
+ * Which queued messages the running pass may carry at its next after-tools
+ * boundary. Anything rejected here waits for the whole loop pass to end, which
+ * for a long-running subagent is arbitrarily far away — so a wrong "false" turns
+ * agent-to-agent Send back into a delayed mailbox with no error to notice.
+ */
+describe("canDeliverBufferedMessageInPass", () => {
+	test("a plain message is carried by the current pass", () => {
+		expect(canDeliverBufferedMessageInPass({}, "user-1")).toBe(true);
+	});
+
+	// The regression this predicate was written for: Send stamps the sender's
+	// userId as createdBy, and the old condition rejected any createdBy at all, so
+	// every parent→child Send waited for the subagent's pass to finish.
+	test("a message from the user the pass already runs as is carried in-pass", () => {
+		expect(canDeliverBufferedMessageInPass({ createdBy: "user-1" }, "user-1")).toBe(true);
+	});
+
+	test("a message from a different user waits for a pass built for that identity", () => {
+		expect(canDeliverBufferedMessageInPass({ createdBy: "user-2" }, "user-1")).toBe(false);
+	});
+
+	// "No particular user" cannot conflict with the pass identity.
+	test("an unattributed message is carried even when the pass has a user", () => {
+		expect(canDeliverBufferedMessageInPass({ createdBy: null }, "user-1")).toBe(true);
+		expect(canDeliverBufferedMessageInPass({}, null)).toBe(true);
+	});
+
+	test("an attributed message waits when the pass itself has no user", () => {
+		expect(canDeliverBufferedMessageInPass({ createdBy: "user-1" }, null)).toBe(false);
+	});
+
+	// In-pass delivery contributes text only, so anything whose payload is not
+	// text must go through the history-rebuilding path or be silently dropped.
+	test("attachments and pre-prompt commands still wait for the restart path", () => {
+		expect(
+			canDeliverBufferedMessageInPass({ images: [{ imageId: "img-1" }] as never }, "user-1"),
+		).toBe(false);
+		expect(
+			canDeliverBufferedMessageInPass({ textFiles: [new File(["x"], "a.txt")] }, "user-1"),
+		).toBe(false);
+		expect(canDeliverBufferedMessageInPass({ prePromptBashCommand: "ls" }, "user-1")).toBe(false);
 	});
 });
 

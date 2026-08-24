@@ -211,6 +211,14 @@ export interface SubagentCardData {
 	agentType: string;
 	/** Extra "background" badge is shown. Height-neutral (same row). */
 	isBackground?: boolean;
+	/**
+	 * Extra "taken over by user" badge is shown — the parent's call is blocked
+	 * until the user releases the child. Height-neutral (same fixed badge row as
+	 * the background badge), but PAINTED from the cached payload, so it is keyed in
+	 * `subagentRevision`: the takeover patch writes this field alone, with `status`,
+	 * `opts` and `messageVersion` all unmoved.
+	 */
+	isTakenOver?: boolean;
 	/** Extra model badge label. Height-neutral (same row). */
 	model?: string;
 	/** Extra thinking-effort badge label. Height-neutral (same row). */

@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
 	hasActiveUpdateSchedule,
+	LOCAL_SCHEDULE_CLAIM_MAX_AGE_MS,
 	type PreparedUpdateStatus,
 	resolveScheduledUpdatePill,
 	resolveUpdateCoordinationCounts,
 	resolveUpdateStatusPollInterval,
+	shouldAssumeLocalSchedule,
 	shouldShowUpdateScheduleButton,
 	UPDATE_STATUS_ACTIVE_POLL_MS,
 	UPDATE_STATUS_IDLE_POLL_MS,
@@ -224,6 +226,78 @@ describe("update status poll interval", () => {
 				status: status({ scheduled: false, error: "spawn failed" }),
 				dataUpdatedAt: 1,
 				errorSinceMs: null,
+			}),
+		).toBe(false);
+	});
+});
+
+describe("local schedule claim", () => {
+	const claimedAt = 10_000;
+	function claim(overrides: Partial<Parameters<typeof shouldAssumeLocalSchedule>[0]> = {}) {
+		return shouldAssumeLocalSchedule({
+			applyScheduled: true,
+			claimedAt,
+			serverConfirmedSchedule: false,
+			abandonedLocally: false,
+			now: claimedAt + 1_000,
+			...overrides,
+		});
+	}
+
+	test("bridges the window before the first poll confirms the schedule", () => {
+		expect(claim()).toBe(true);
+	});
+
+	test("never claims anything when this client did not schedule an update", () => {
+		expect(claim({ applyScheduled: false })).toBe(false);
+		expect(claim({ claimedAt: null })).toBe(false);
+	});
+
+	test("releases the claim once this client asked to abandon the attempt", () => {
+		// The regression: cancelling left `applyResult.scheduled` set forever, so the claim kept
+		// overriding an idle coordinator and `/api/update/status` was polled once a second for good.
+		expect(claim({ abandonedLocally: true })).toBe(false);
+	});
+
+	test("hands over to server truth as soon as the server confirms a schedule", () => {
+		expect(claim({ serverConfirmedSchedule: true })).toBe(false);
+	});
+
+	test("expires so an attempt that ends without confirmation cannot poll forever", () => {
+		expect(claim({ now: claimedAt + LOCAL_SCHEDULE_CLAIM_MAX_AGE_MS - 1 })).toBe(true);
+		expect(claim({ now: claimedAt + LOCAL_SCHEDULE_CLAIM_MAX_AGE_MS })).toBe(false);
+	});
+
+	test("expiry cannot cut a real drain short, because the server keeps the fast poll itself", () => {
+		// Long past the claim's expiry, a genuinely scheduled update still polls fast on server
+		// truth alone — which is why bounding the local claim is safe.
+		expect(claim({ now: claimedAt + 10 * LOCAL_SCHEDULE_CLAIM_MAX_AGE_MS })).toBe(false);
+		expect(
+			resolveUpdateStatusPollInterval({
+				status: { ready: true, canAutoRestart: true, scheduled: true, phase: "quiescing_tools" },
+				dataUpdatedAt: claimedAt + 10 * LOCAL_SCHEDULE_CLAIM_MAX_AGE_MS,
+				assumeScheduled: false,
+			}),
+		).toBe(UPDATE_STATUS_ACTIVE_POLL_MS);
+	});
+
+	test("a cancelled attempt stops polling once the claim is released", () => {
+		// End-to-end shape of the bug report: coordinator idle with a cancellation error, and the
+		// released claim lets that error be believed.
+		const cancelledStatus: PreparedUpdateStatus = {
+			ready: true,
+			canAutoRestart: true,
+			scheduled: false,
+			phase: "idle",
+			error: "Scheduled update update_1 was cancelled by an administrator",
+			errorKind: "cancelled",
+		};
+		expect(
+			resolveUpdateStatusPollInterval({
+				status: cancelledStatus,
+				dataUpdatedAt: claimedAt + 2_000,
+				errorSinceMs: claimedAt,
+				assumeScheduled: claim({ abandonedLocally: true }),
 			}),
 		).toBe(false);
 	});

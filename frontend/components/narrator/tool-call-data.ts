@@ -64,4 +64,13 @@ export interface ToolCallData {
 	 * height); see `AWAIT_AGENT_RESOLVED_FIELD` on the server.
 	 */
 	_awaitAgentNarratorId?: string;
+	/**
+	 * The subagent this call waits on is TAKEN OVER by the user, so the call is
+	 * blocked until the takeover stops.
+	 *
+	 * Kept out of `_metadata` for the same two reasons as
+	 * `_awaitAgentNarratorId`: it must not become an extra detail row (height), and
+	 * it is server-derived rather than tool-reported (provenance).
+	 */
+	_takenOver?: boolean;
 }

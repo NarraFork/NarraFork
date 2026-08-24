@@ -104,6 +104,41 @@ export interface UseDockviewDndResult {
 }
 
 /**
+ * Marker attribute stamped on every DockviewSurface root, so a drop can ask
+ * "which surface is topmost under the pointer" without knowing about any of them.
+ */
+export const DOCKVIEW_SURFACE_ATTR = "data-dockview-surface";
+
+/**
+ * Whether `root` is the topmost DockviewSurface in a front-to-back hit-test stack.
+ *
+ * Two requirements pull in opposite directions, which is why this is not a plain
+ * `elementFromPoint(...) === root` test:
+ *
+ *  - Overlapping surfaces must not BOTH act on one drop (a detached canvas panel
+ *    can sit on top of a chapter node's dock, and rect containment is true for
+ *    both). So ordering has to be respected: only the frontmost surface wins.
+ *  - Elements that are not surfaces at all must be transparent to the test. The
+ *    concrete bug: @dnd-kit's `<DragOverlay>` is `position: fixed` and follows the
+ *    pointer, so the topmost element at the release point is the drag ghost, not
+ *    the surface underneath. A plain topmost-element check therefore rejected
+ *    EVERY sidebar-tab drop into a live workspace — while the move handler, which
+ *    does no such test, still painted the drop indicator. "The highlight shows but
+ *    releasing does nothing" was exactly this.
+ *
+ * So: walk the stack front-to-back, skip anything that belongs to no surface, and
+ * let the first surface encountered decide. Exported for unit testing.
+ */
+export function isTopmostSurface(root: Element, stack: readonly Element[]): boolean {
+	for (const el of stack) {
+		const surface = el.closest?.(`[${DOCKVIEW_SURFACE_ATTR}]`) ?? null;
+		if (!surface) continue;
+		return surface === root;
+	}
+	return false;
+}
+
+/**
  * Move / merge / swap an existing dockview panel per the resolved intent.
  * Exported for unit testing the merge/split/swap dispatch (see
  * useDockviewDnd.test.ts); not part of the public surface API.
@@ -200,12 +235,14 @@ export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndRe
 			// its own stale hit-test. The result is the same panel in both places, which
 			// is what "the target got it but the original is still there" was.
 			//
-			// `elementFromPoint` rather than comparing rects: surfaces overlap on the
+			// DOM hit-testing rather than comparing rects: surfaces overlap on the
 			// story-network canvas (a detached node can sit on top of a chapter node's
-			// dock), and rect containment would be true for both. Hit-testing the DOM
-			// answers "which one is on top here", which is what the user aimed at.
-			const dropped = document.elementFromPoint(final.x, final.y);
-			if (!dropped || !root.contains(dropped)) return;
+			// dock), and rect containment would be true for both. But the topmost
+			// element is often NOT a surface (a drag ghost rides under the pointer), so
+			// the whole stack is consulted and non-surface layers are skipped — see
+			// `isTopmostSurface`.
+			const stack = document.elementsFromPoint?.(final.x, final.y) ?? [];
+			if (!isTopmostSurface(root, stack)) return;
 
 			if (isLocalPanelDrag(final, surfaceId)) {
 				// biome-ignore lint/style/noNonNullAssertion: isLocalPanelDrag requires panelId

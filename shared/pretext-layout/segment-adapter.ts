@@ -206,9 +206,41 @@ export interface AdapterToolItem {
 			 * compact-xs row), exactly like SubagentCard gates it.
 			 */
 			subagentNarratorId?: string | null;
+			/**
+			 * The child is currently taken over by the user. Reaches the card through
+			 * the reconnect catch-up snapshot (the live path writes `_takenOver` on the
+			 * block instead), so both sources are consulted — see `resolveTakenOver`.
+			 */
+			takenOver?: boolean;
 		} | null;
+		/**
+		 * The subagent this call is waiting on is TAKEN OVER by the user, so the call
+		 * is blocked until the user releases it. Server-derived; painted as a badge in
+		 * the card's already-fixed header row.
+		 */
+		_takenOver?: boolean;
 		[key: string]: unknown;
 	};
+}
+
+/**
+ * Whether this call should show the "taken over by user" badge.
+ *
+ * Two sources, because they cover different moments and neither is redundant:
+ *   - `tc._takenOver`               — message load + the live takeover patch
+ *   - `_subagentActivity.takenOver` — the reconnect catch-up snapshot
+ *
+ * GATED ON A NON-TERMINAL STATUS, and that gate is load-bearing rather than
+ * cosmetic. Takeover state is cleared inside the subagent loop at several points
+ * that do NOT broadcast (see the handoff branches in narrator-session.ts), so a
+ * card can hold a stale `true` after its call has already finished. A FINISHED
+ * call is never blocked on anything, so its badge would be a lie about why the
+ * session is stuck — and "the badge lingers on a completed card" is precisely the
+ * failure that would teach users to ignore it.
+ */
+function resolveTakenOver(item: AdapterToolItem): boolean {
+	if (isTerminalStatus(item.tc.status)) return false;
+	return item.tc._takenOver === true || item.tc._subagentActivity?.takenOver === true;
 }
 
 /**
@@ -2909,6 +2941,10 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		hasRecentCallsButton: !!nonEmptyTrimmed(activity?.subagentNarratorId),
 		isTerminal: isTerminalStatus(item.tc.status),
 		isActive,
+		// The user is driving this child directly, so the parent's call is parked
+		// until they stop. Height-neutral (it joins the fixed badge row), but still
+		// keyed in the measure cache — see `subagentRevision`.
+		...(resolveTakenOver(item) ? { isTakenOver: true } : {}),
 		// Raw terminal status → render-only status glyph (success/fail/cancelled).
 		// Height-neutral (a single 12px header slot).
 		status: item.tc.status ?? undefined,
@@ -2960,6 +2996,11 @@ function buildToolCardData(
 		inRun: runContext.inRun,
 		isLast: runContext.isLast,
 		category,
+		// An in-flight `Await({type:"agent"})` whose target got taken over never
+		// returns (the takeover short-circuit only applies to a NEW wait), so this
+		// badge is the only thing on screen explaining the stall. Height-neutral: it
+		// joins the fixed header row next to the remote-target badge.
+		...(resolveTakenOver(item) ? { isTakenOver: true } : {}),
 		// ── Header timing / identity passthrough (all height-neutral) ──────────
 		...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : {}),
 		...(errorMessage ? { errorMessage } : {}),

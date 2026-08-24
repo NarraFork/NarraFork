@@ -773,8 +773,14 @@ export interface NarraForkSettings {
 		autoCompactPruneThreshold?: number;
 		/**
 		 * When a narrator has an in-progress context compaction, whether a newly-sent
-		 * user message should wait for the compaction to finish before being sent.
-		 * Default false = send immediately (do not wait).
+		 * user message is QUEUED until the compaction finishes instead of starting a
+		 * turn right away. Default true.
+		 *
+		 * Queuing is the safe default because a turn started mid-compact runs against
+		 * the history the compact is replacing. It is a real queue, not a blocking
+		 * wait: the send returns immediately and the message stays editable and
+		 * cancellable until the compact settles. Off = send immediately, concurrent
+		 * with the compact. Either way, an explicit `priority` send cuts in.
 		 */
 		queueDuringCompaction?: boolean;
 		/**

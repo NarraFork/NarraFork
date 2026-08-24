@@ -587,6 +587,19 @@ interface NarratorWSCallbacks {
 		status: string,
 		substatus?: string[],
 	) => void;
+	/**
+	 * The user took over (or released) a subagent, so the parent's waiting CARD is
+	 * blocked on a person. Separate from `onSubagentStatusChanged`, which serves the
+	 * panel's status chip and is excluded from the message subscription.
+	 *
+	 * `toolUseId` is best-effort; without it the consumer matches the card by
+	 * `subagentNarratorId`.
+	 */
+	onSubagentTakeoverChanged?: (info: {
+		subagentNarratorId: string;
+		toolUseId?: string;
+		takenOver: boolean;
+	}) => void;
 	onSubagentWarning?: (
 		subagentNarratorId: string,
 		info: {
@@ -1362,6 +1375,13 @@ export function useNarratorWS(
 							data.status as string,
 							data.substatus as string[] | undefined,
 						);
+						break;
+					case "subagent_takeover_changed":
+						callbackOwner.callbacks.onSubagentTakeoverChanged?.({
+							subagentNarratorId: data.subagentNarratorId as string,
+							toolUseId: data.toolUseId as string | undefined,
+							takenOver: data.takenOver === true,
+						});
 						break;
 					case "subagent_warning":
 						callbackOwner.callbacks.onSubagentWarning?.(data.subagentNarratorId as string, {

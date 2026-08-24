@@ -18,9 +18,11 @@ import {
 } from "@tabler/icons-react";
 import { Link } from "@tanstack/react-router";
 import type { MouseEvent, PointerEvent } from "react";
+import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { formatSmartTime } from "../../lib/format";
+import { startPointerDrag } from "../../lib/panel-drag";
 import { highlightSearchText } from "../../lib/search-utils";
 import { getEffectiveNarratorDisplay, statusAccentColor } from "../../lib/status-registry";
 import { UserAvatar } from "../UserAvatar";
@@ -283,6 +285,66 @@ function CreatedLastMessageText({ narrator }: { narrator: NarratorListItem }) {
 	);
 }
 
+/**
+ * Avatar wrapper that starts a cross-region drag of this narrator.
+ *
+ * The same handle the sidebar rows use (`RecentTabs`' `handleIconPointerDown`): the
+ * `panel-drag` singleton takes ownership of the pointer, and the sidebar / workspace docks
+ * pick the drag up from there.
+ *
+ * `preventDefault` on pointerdown is what keeps this from also navigating: it suppresses
+ * the following mousedown/click, so the surrounding card's `onClick` never fires for a
+ * gesture that started on the handle. A plain click below the singleton's 5px threshold is
+ * dropped silently, so the handle is not a dead zone either — it just does not navigate.
+ */
+function NarratorDragHandle({
+	narrator,
+	size,
+	label,
+}: {
+	narrator: NarratorListItem;
+	size: number;
+	label: string;
+}) {
+	const handlePointerDown = useCallback(
+		(event: PointerEvent<HTMLSpanElement>) => {
+			if (event.button !== 0) return;
+			event.stopPropagation();
+			event.preventDefault();
+			startPointerDrag(
+				narrator.id,
+				narrator.title || narrator.id.slice(0, 8),
+				event.clientX,
+				event.clientY,
+			);
+		},
+		[narrator.id, narrator.title],
+	);
+
+	return (
+		<Tooltip label={label} openDelay={500} position="top">
+			<span
+				onPointerDown={handlePointerDown}
+				style={{
+					display: "inline-flex",
+					cursor: "grab",
+					// Claim the touch gesture for the drag singleton; otherwise the browser
+					// keeps vertical movement for scrolling and the drag never starts.
+					touchAction: "none",
+				}}
+			>
+				<NarratorAvatar
+					narratorId={narrator.id}
+					avatarImageId={narrator.avatarImageId}
+					title={narrator.title}
+					size={size}
+					showTooltip={false}
+				/>
+			</span>
+		</Tooltip>
+	);
+}
+
 function ActiveNarratorCard({
 	narrator,
 	localQuery,
@@ -322,13 +384,9 @@ function ActiveNarratorCard({
 			<Stack gap={4} visibleFrom="sm">
 				<Group justify="space-between" wrap="nowrap">
 					<Group gap="xs" style={{ minWidth: 0 }}>
-						<NarratorAvatar
-							narratorId={narrator.id}
-							avatarImageId={narrator.avatarImageId}
-							title={narrator.title}
-							size={20}
-							showTooltip={false}
-						/>
+						{/* Desktop only: the mobile sidebar is a drawer, so there is nowhere
+						    to drop and the handle would just break tapping the avatar. */}
+						<NarratorDragHandle narrator={narrator} size={20} label={t("dragToSidebar")} />
 						{narrator.status === "working" && (
 							<Loader size={14} color={substatus.includes("planning") ? "green" : undefined} />
 						)}

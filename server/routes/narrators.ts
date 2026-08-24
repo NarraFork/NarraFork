@@ -237,7 +237,6 @@ import {
 	updateNarratorDraft,
 } from "../services/narrator-draft-service";
 import { buildExportFileName, streamNarratorExport } from "../services/narrator-export";
-import { deliverInjection } from "../services/narrator-injection";
 import {
 	countNarratorMessageRefs,
 	countNarratorMessageRefsBatch,
@@ -366,6 +365,7 @@ import {
 import { broadcastSpecChanged } from "../services/spec-broadcast";
 import { appendProtectedSpecTask } from "../services/spec-vfs-service";
 import { resumeSubagent, withSubagentResumeLock } from "../services/subagent-resume";
+import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
 import { usageHistoryService } from "../services/usage-history-service";
 import { syncNarratorDraftToRecentTabs } from "../services/user-preferences-service";
 import {
@@ -1532,6 +1532,21 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const userId = c.get("user").sub;
 	const queuedNewCommand = parseNewCommand(message);
 
+	// Whether an idle-but-compacting narrator should QUEUE this message instead of
+	// starting a turn right now. Evaluated up-front because two independent paths need
+	// the same answer: the `/goal` fast path (which would otherwise mutate tasks.json
+	// and start a Spec turn against the history being replaced) and the ordinary send
+	// path. `priority` is the user's explicit cut-in and opts out.
+	//
+	// Subagents are excluded, and not for lack of care: their queue lives in a separate
+	// map that only accepts input while a foreground runner is attached, and
+	// `resumeBufferedMessagesIfIdle` declines for subagents by design. Queuing an idle
+	// compacting subagent would therefore strand the message with no consumer, so that
+	// window keeps the blocking wait below.
+	const compactionQueueEligible = !priority && getQueueDuringCompaction();
+	const queueBehindCompaction =
+		compactionQueueEligible && !isSubagentVariant(narrator.variant) && isCompactInProgress(id);
+
 	// Resolve slash commands
 	let finalMessage = message;
 	let commandText: string | null = queuedNewCommand?.rawCommand ?? null;
@@ -1613,8 +1628,14 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// this avoids mutating tasks.json in the middle of the current turn.
 	if (cmdResult.resolved && "specGoal" in cmdResult) {
 		const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
+		// A compacting narrator counts as busy here for the same reason a running one
+		// does: appending the protected task now and starting its Spec turn would run
+		// that turn against the history the compact is replacing.
 		const goalNarratorBusy =
-			narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+			narrator.status === "working" ||
+			narrator.status === "waiting" ||
+			isLoopRunning(id) ||
+			queueBehindCompaction;
 		if (!goalNarratorBusy) {
 			// Idle: persist the typed /goal command as the canonical user message and
 			// append the protected task immediately.
@@ -1696,13 +1717,23 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	let narratorBusy =
 		narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
 
-	// When the user opts in via settings.agent.queueDuringCompaction, a message
-	// sent while the narrator is idle-but-compacting waits for the compaction to
-	// finish before being sent. Otherwise the new turn could run against context
-	// that the background compact is concurrently rebuilding (compaction resets
-	// the upstream session). When the narrator is busy the message is buffered
-	// below regardless, so this only matters for the idle-during-compaction window.
-	if (!narratorBusy && isCompactInProgress(id) && getQueueDuringCompaction()) {
+	// An idle narrator whose context is being compacted takes the same queue path as a
+	// busy one, so the turn runs against the summary that is about to replace its
+	// history rather than racing it (a compact resets the upstream session). This is a
+	// QUEUE, not a wait: the request returns 202 immediately and the message becomes a
+	// cancellable, editable queued card. `drainQueuedMessagesAfterCompact` consumes it
+	// when the compact settles — including on failure or cancel, so nothing is stranded.
+	//
+	// `priority` (already folded into `queueBehindCompaction`) is the user's explicit
+	// "don't wait for the compact" cut-in: it keeps the pre-existing concurrent
+	// behaviour where the compact runs on in the background and the new turn uses the
+	// current history.
+	if (queueBehindCompaction) narratorBusy = true;
+
+	// A compacting SUBAGENT cannot use that queue (see `compactionQueueEligible`), so it
+	// keeps the original blocking wait: still better than racing the summary, just
+	// without the cancellable card.
+	if (!narratorBusy && compactionQueueEligible && isCompactInProgress(id)) {
 		await awaitCompactCompletion(id);
 		narrator = await narratorService.getById(id);
 		narratorBusy =
@@ -3415,6 +3446,13 @@ narratorRoutes.post("/:id/takeover", async (c) => {
 				status: narrator.status,
 				substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
 			});
+			// The blocked parent CARD is a separate consumer from the panel's status
+			// chip — without this the tool call keeps rendering as plain "running".
+			await broadcastSubagentTakeoverChanged({
+				parentNarratorId: narrator.parentNarratorId,
+				subagentNarratorId: id,
+				takenOver: true,
+			});
 			return c.json({ takenOver: true });
 		}
 
@@ -3429,6 +3467,14 @@ narratorRoutes.post("/:id/takeover", async (c) => {
 				return c.json({ error: "Background task is not running" }, 400);
 			}
 			ctrl.abort("Taken over by user");
+			// The background transition itself also broadcasts (see
+			// finalizeBackgroundSubagentTakeover); this covers the window before the
+			// aborted loop reaches that point, so the card flips immediately.
+			await broadcastSubagentTakeoverChanged({
+				parentNarratorId: narrator.parentNarratorId,
+				subagentNarratorId: id,
+				takenOver: true,
+			});
 			return c.json({ takenOver: true });
 		}
 
@@ -3456,6 +3502,11 @@ narratorRoutes.post("/:id/takeover", async (c) => {
 				subagentNarratorId: id,
 				status: narrator.status,
 				substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
+			});
+			await broadcastSubagentTakeoverChanged({
+				parentNarratorId: narrator.parentNarratorId,
+				subagentNarratorId: id,
+				takenOver: true,
 			});
 			return c.json({ takenOver: true });
 		}
@@ -3515,6 +3566,18 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 			orderBy: narratorMessages.createdAt,
 		});
 		const parentToolUseId = firstMsg?.parentToolUseId ?? "";
+
+		// Clear the card's takeover badge here rather than at each exit below: every
+		// remaining branch stops the takeover (the only failure path is the guard
+		// above), so one call covers all six of them and cannot be forgotten when a
+		// branch is added. Deferred branches included — the user has released control
+		// even when the result handoff waits for the loop to end.
+		await broadcastSubagentTakeoverChanged({
+			parentNarratorId: narrator.parentNarratorId,
+			subagentNarratorId: id,
+			takenOver: false,
+			...(parentToolUseId ? { toolUseId: parentToolUseId } : {}),
+		});
 
 		if (wasBackground) {
 			// Background takeover: the parent was never blocked (it holds the
@@ -3978,29 +4041,15 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		});
 	}
 
-	// Tell the model, in the conversation, that this just happened.
+	// Make the running loop pick all of this up at its next turn boundary.
 	//
-	// The tool_use row above is a reader-facing record of the toggle; the system prompt
-	// rebuild requested below carries the plan-mode RULES. Neither says "your instructions
-	// changed just now", so without this the model keeps its previous implementation intent
-	// under the new constraints and walks straight into the permission gate.
-	//
-	// `role: "user"` because this is the user's action, not a system fact. The returned
-	// `turnText` is deliberately ignored: it exists for callers that drive the loop
-	// themselves, and here the running loop picks the row up via the rebuild below.
-	await deliverInjection(id, {
-		content: getToolMessageWithParams("planModeEnteredByUser", locale as Locale, {
-			planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
-		}),
-		source: "plan_mode_toggled",
-		role: "user",
-		schedule: "onNextTurn",
-		locale: locale as Locale,
-		createdBy: userId,
-	});
-	// The plan-mode reminder lives only in the system prompt, which a running pass fixed at
-	// its start. This rebuild is what actually delivers it — and it re-reads history, so it
-	// also brings in the two rows written above.
+	// Two things are stale in a pass that started before this toggle, and one rebuild fixes
+	// both: the system prompt (which is where the plan-mode reminder lives, fixed at pass
+	// start) and the in-memory history (built before the rows above existed). Because the
+	// rebuild re-reads history from the DB, the EnterPlanMode tool call and its result —
+	// which already state the designated plan file and the next steps — reach the model as
+	// its own turn. No separate notification is needed, and inventing a user message to
+	// carry one would put words in the user's mouth.
 	requestPlanModePromptRebuild(id);
 
 	broadcastToNarrator(id, {
@@ -4052,18 +4101,9 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 		message: msg,
 	});
 
-	// Same reason as the enter route: the row above is invisible to a pass whose in-memory
-	// history was built before it, and the stale system prompt still carries the plan-mode
-	// constraint. This injection states that the toggle happened AND that leaving plan mode
-	// is not plan approval; the rebuild delivers it plus the constraint-free prompt.
-	await deliverInjection(id, {
-		content: getToolMessage("planModeExitedByUser", locale),
-		source: "plan_mode_toggled",
-		role: "user",
-		schedule: "onNextTurn",
-		locale,
-		createdBy: userId,
-	});
+	// Same reason as the enter route: the row above is invisible to a pass whose history was
+	// built before it, and the stale prompt still carries the plan-mode constraint. The
+	// rebuild delivers the constraint-free prompt and brings that row in with it.
 	requestPlanModePromptRebuild(id);
 
 	broadcastToNarrator(id, {

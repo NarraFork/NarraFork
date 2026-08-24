@@ -1203,6 +1203,26 @@ export function addRecentTab(tab: AddRecentTabInput): Promise<void> {
 }
 
 /**
+ * Add or reposition a tab, PROPAGATING failure — and optionally placing it at an anchor.
+ *
+ * Two differences from {@link addRecentTab}, both needed by the external-drop path:
+ *
+ *  - It rejects instead of swallowing. A drop that silently did nothing is indistinguishable
+ *    from an unsupported gesture, so the caller has to be able to show a failure notice.
+ *  - The anchor rides along with the upsert, so creating and positioning the tab is ONE
+ *    revision. Doing it as upsert-then-move renders the tab at the default insertion point
+ *    for a frame before it jumps to where the user aimed.
+ */
+export function addRecentTabOrThrow(
+	tab: AddRecentTabInput,
+	anchor?: { beforeKey: string } | { afterKey: string },
+): Promise<void> {
+	return applyGlobalRecentTabsMutation(
+		api.upsertRecentTab({ ...buildRecentTabUpsert(tab), ...(anchor ?? {}) }),
+	);
+}
+
+/**
  * Last-persisted visit signature per tab, insertion-ordered by recency of use.
  *
  * Bounded: a long-lived session visits an unbounded number of narrators, and this

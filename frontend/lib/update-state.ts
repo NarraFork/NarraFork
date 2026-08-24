@@ -112,6 +112,51 @@ export interface UpdateStatusPollInput {
 }
 
 /**
+ * How long a local apply result may keep claiming a schedule the server never confirmed.
+ *
+ * Only a bridge across the first poll round-trip is needed, so this is generous rather than tuned.
+ * It exists purely so the claim cannot outlive the attempt when no confirming poll ever arrives.
+ */
+export const LOCAL_SCHEDULE_CLAIM_MAX_AGE_MS = 15_000;
+
+export interface LocalScheduleClaimInput {
+	/** The local `/apply` response reported that an update was scheduled. */
+	applyScheduled: boolean;
+	/** When that response arrived, or null when this client never scheduled anything. */
+	claimedAt: number | null;
+	/** A status poll has since reported `scheduled: true`, so the server can speak for itself. */
+	serverConfirmedSchedule: boolean;
+	/** This client asked to abandon the attempt (cancel, or shut down for a manual start). */
+	abandonedLocally: boolean;
+	now: number;
+}
+
+/**
+ * Whether the local apply result may still stand in for server-confirmed schedule state.
+ *
+ * The claim covers one narrow window: a status poll already in flight when apply was clicked can
+ * land afterwards still describing an idle coordinator, possibly carrying the *previous* attempt's
+ * error. Believing that would stop polling at the start of a healthy update, and would leave the
+ * dialog reporting a failure that is not this attempt's.
+ *
+ * Because the apply result is never cleared, the claim must expire — it is consulted precisely
+ * when the server says nothing is scheduled, which is also what the server says once the attempt
+ * ends. Left standing it turns the end of every attempt (cancelled here, cancelled elsewhere, or
+ * failed mid-drain) into a one-second poll against an idle coordinator that never stops. Note that
+ * expiry cannot cut a real drain short: while an update is genuinely scheduled the server reports
+ * `scheduled: true` and that alone keeps the fast poll.
+ */
+export function shouldAssumeLocalSchedule(input: LocalScheduleClaimInput): boolean {
+	if (!input.applyScheduled || input.claimedAt === null) return false;
+	// This client just asked for the attempt to end; insisting it is scheduled would fight the
+	// cancellation it requested.
+	if (input.abandonedLocally) return false;
+	// Server truth is available and strictly better than a stale local guess.
+	if (input.serverConfirmedSchedule) return false;
+	return input.now - input.claimedAt < LOCAL_SCHEDULE_CLAIM_MAX_AGE_MS;
+}
+
+/**
  * Decide the status poll interval.
  *
  * Two things must hold. An update that is actually draining needs second-level updates, because

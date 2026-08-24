@@ -699,3 +699,137 @@ describe("recent-tabs capacity and undo", () => {
 		).toBeUndefined();
 	});
 });
+
+/**
+ * Anchored upsert: create AND position a tab in one revision.
+ *
+ * This exists so an external drop (a narrator card dragged from the list page into the
+ * sidebar) does not need upsert-then-move. Two revisions would render the tab at the
+ * default insertion point for one frame before it jumps to where the user aimed.
+ */
+describe("recent-tabs anchored upsert", () => {
+	it("inserts a NEW tab before and after an anchor", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2"), makeTab("n-3")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		await recentTabs.upsertRecentTab("user-1", makeTab("n-before"), {
+			beforeKey: "narrator:n-2",
+		});
+		expect(storedKeys()).toEqual([
+			"narrator:n-1",
+			"narrator:n-before",
+			"narrator:n-2",
+			"narrator:n-3",
+		]);
+
+		await recentTabs.upsertRecentTab("user-1", makeTab("n-after"), { afterKey: "narrator:n-3" });
+		expect(storedKeys().at(-1)).toBe("narrator:n-after");
+	});
+
+	it("repositions a tab that is ALREADY in the list", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2"), makeTab("n-3")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		await recentTabs.upsertRecentTab("user-1", makeTab("n-3"), { beforeKey: "narrator:n-1" });
+		expect(storedKeys()).toEqual(["narrator:n-3", "narrator:n-1", "narrator:n-2"]);
+	});
+
+	// The drop resolver keeps unpinned tabs out of the pinned section, but the anchor is
+	// still honoured verbatim here: the server must not silently relocate a tab the client
+	// explicitly positioned. What it MUST NOT do is invent a position of its own.
+	it("honours an anchor that lands right after the pinned section", async () => {
+		seedLegacyTabs([makeTab("p-1", { pinned: true }), makeTab("n-1"), makeTab("n-2")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		await recentTabs.upsertRecentTab("user-1", makeTab("n-new"), { beforeKey: "narrator:n-1" });
+		expect(storedKeys()).toEqual([
+			"narrator:p-1",
+			"narrator:n-new",
+			"narrator:n-1",
+			"narrator:n-2",
+		]);
+	});
+
+	// A workspace is contiguous, so an index inside it is not a position anything can
+	// occupy. Anchoring to a CHILD must therefore resolve to the group's boundary, or
+	// `regroupWorkspaces` would move the tab somewhere the user did not choose.
+	it("expands an anchor on a workspace child to the whole group", async () => {
+		seedLegacyTabs([
+			makeTab("n-top"),
+			makeTab("ws-1", { type: "workspace", title: "Workspace" }),
+			makeTab("child-a", { workspaceId: "ws-1" }),
+			makeTab("child-b", { workspaceId: "ws-1" }),
+			makeTab("n-tail"),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+
+		await recentTabs.upsertRecentTab("user-1", makeTab("n-new"), {
+			afterKey: "narrator:child-a",
+		});
+		expect(storedKeys()).toEqual([
+			"narrator:n-top",
+			"workspace:ws-1",
+			"narrator:child-a",
+			"narrator:child-b",
+			"narrator:n-new",
+			"narrator:n-tail",
+		]);
+	});
+
+	// A stale anchor is the client's view lagging a removal. A NEW tab still has to land
+	// somewhere, so it takes the default insertion point.
+	it("falls back to the default insertion point when the anchor is gone", async () => {
+		seedLegacyTabs([makeTab("p-1", { pinned: true }), makeTab("n-1")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		await recentTabs.upsertRecentTab("user-1", makeTab("n-new"), {
+			beforeKey: "narrator:vanished",
+		});
+		expect(storedKeys()).toEqual(["narrator:p-1", "narrator:n-new", "narrator:n-1"]);
+	});
+
+	// An EXISTING tab must not move at all in that case: a plain revisit carrying a stale
+	// anchor would otherwise yank the tab out of its place.
+	it("leaves an existing tab in place when the anchor is gone", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2"), makeTab("n-3")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		await recentTabs.upsertRecentTab("user-1", makeTab("n-2"), { afterKey: "narrator:vanished" });
+		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-2", "narrator:n-3"]);
+	});
+
+	it("ignores a self-anchor instead of reading it as a move", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		await recentTabs.upsertRecentTab("user-1", makeTab("n-2"), { beforeKey: "narrator:n-2" });
+		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-2"]);
+	});
+
+	// Membership owns a child's position; an anchor must not pull it out of its group.
+	it("ignores an anchor on a tab that belongs to a workspace", async () => {
+		seedLegacyTabs([
+			makeTab("n-top"),
+			makeTab("ws-1", { type: "workspace", title: "Workspace" }),
+			makeTab("child-a", { workspaceId: "ws-1" }),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+
+		await recentTabs.upsertRecentTab("user-1", makeTab("child-a", { workspaceId: "ws-1" }), {
+			beforeKey: "narrator:n-top",
+		});
+		expect(storedKeys()).toEqual(["narrator:n-top", "workspace:ws-1", "narrator:child-a"]);
+	});
+
+	// One revision is the entire reason this endpoint grew anchors.
+	it("costs exactly one revision", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2")]);
+		const baseline = await recentTabs.ensureMigrated("user-1");
+
+		const result = await recentTabs.upsertRecentTab("user-1", makeTab("n-new"), {
+			afterKey: "narrator:n-1",
+		});
+		expect(result.revision).toBe(baseline + 1);
+		expect(result.changed).toBe(true);
+	});
+});

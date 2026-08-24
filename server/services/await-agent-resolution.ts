@@ -63,6 +63,87 @@ import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 export const AWAIT_AGENT_RESOLVED_FIELD = "_awaitAgentNarratorId";
 
 /**
+ * Field marking a tool call whose target subagent is currently TAKEN OVER by the
+ * user (`subagent-takeover.ts`).
+ *
+ * Why the parent's card needs it at all: a takeover leaves the parent narrator
+ * blocked — a foreground Agent/Task call stays suspended in
+ * `waitForManualOverride`, and an `Await({type:"agent"})` that was already in
+ * flight when the takeover began never returns. Neither state is visible on the
+ * card, so a user who forgets to press "Stop takeover" silently stalls the whole
+ * session with no indication of why.
+ *
+ * ⚠️ Deliberately NOT written into `metadata`, for the same two reasons as
+ * {@link AWAIT_AGENT_RESOLVED_FIELD}:
+ *
+ *  1. Height. `classifyAwait` turns metadata entries into extra rows; this flag
+ *     is painted as a badge inside the card's ALREADY-FIXED header row, so it
+ *     must not reach the detail classifier.
+ *  2. Provenance. `metadata` is the tool's own returned payload, while this is
+ *     server-derived runtime state that vanishes on restart (takeover authority
+ *     is in-memory). A reader must not mistake it for something the tool
+ *     reported.
+ */
+export const TAKEN_OVER_FIELD = "_takenOver";
+
+/**
+ * Mark the `tool_use` blocks of calls whose target subagent is taken over.
+ *
+ * Same shape and identity contract as {@link attachAwaitAgentNarratorIds}: an
+ * unaffected page comes back as the SAME references, so the common case (no live
+ * takeover) pays a single set-size check.
+ */
+export function attachTakenOverFlags(
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	tree: any[],
+	takenOverToolUseIds: ReadonlySet<string>,
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+): any[] {
+	if (takenOverToolUseIds.size === 0 || !Array.isArray(tree) || tree.length === 0) return tree;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	let next: any[] | null = null;
+	for (let i = 0; i < tree.length; i++) {
+		const msg = tree[i];
+		const patched = patchTakenOverMessage(msg, takenOverToolUseIds);
+		if (patched === msg) {
+			next?.push(msg);
+			continue;
+		}
+		if (!next) next = tree.slice(0, i);
+		next.push(patched);
+	}
+	return next ?? tree;
+}
+
+/** Patch one message, returning the SAME reference when nothing changed. */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function patchTakenOverMessage(msg: any, takenOverToolUseIds: ReadonlySet<string>): any {
+	const children = msg?.children?.length
+		? attachTakenOverFlags(msg.children, takenOverToolUseIds)
+		: msg?.children;
+	const childrenChanged = children !== msg?.children;
+	if (!Array.isArray(msg?.contentJson)) {
+		return childrenChanged ? { ...msg, children } : msg;
+	}
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	let contentJson: any[] | null = null;
+	for (let i = 0; i < msg.contentJson.length; i++) {
+		const block = msg.contentJson[i];
+		const hit = block?.type === "tool_use" && takenOverToolUseIds.has(block.id);
+		if (!hit) {
+			contentJson?.push(block);
+			continue;
+		}
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const acc: any[] = contentJson ?? msg.contentJson.slice(0, i);
+		contentJson = acc;
+		acc.push({ ...block, [TAKEN_OVER_FIELD]: true });
+	}
+	if (!contentJson) return childrenChanged ? { ...msg, children } : msg;
+	return { ...msg, contentJson, children };
+}
+
+/**
  * Attach {@link AWAIT_AGENT_RESOLVED_FIELD} to the `tool_use` blocks of pending
  * Await-agent calls, so the frontend can offer "open session" WHILE the wait is
  * still in flight.

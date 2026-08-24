@@ -41,6 +41,7 @@ import { projectDbManager } from "./lib/project-db";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
 import {
 	registerGracefulShutdownHandler,
+	registerOperatorShutdownHandler,
 	registerRuntimeAddressGetter,
 	registerServerRestart,
 } from "./lib/server-restart";
@@ -1673,6 +1674,21 @@ registerGracefulShutdownHandler(async (request) => {
 		skipWindowsProcessTreeKill: true,
 		skipBashProcessKill: true,
 	});
+	setTimeout(() => process.exit(0), 250);
+	return result;
+});
+
+/**
+ * Administrator-initiated shutdown with no successor process.
+ *
+ * Unlike the handoff path above, nothing is coming to take over the port: the user asked to stop
+ * this version so they can launch the prepared binary themselves. So this runs the full teardown
+ * — child processes included — rather than the handoff variant that deliberately leaves Bash
+ * processes and the browser alive for a replacement to inherit.
+ */
+registerOperatorShutdownHandler(async ({ reason }) => {
+	logger.info("Administrator requested shutdown", { reason });
+	const result = await performGracefulShutdown({ reason });
 	setTimeout(() => process.exit(0), 250);
 	return result;
 });

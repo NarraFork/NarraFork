@@ -1,0 +1,43 @@
+{
+	"title": "Interactive tutorial",
+	"subtitle": "Learn NarraFork by driving it. Every lesson runs the real product — real narrators, real tools, real approvals — with a scripted model, so no AI API is called and nothing is billed.",
+	"noApiBadge": "No AI API calls",
+	"tracks": {
+		"conversation": "Working with a narrator",
+		"chapters": "NarraFlow and chapters",
+		"subagents": "Subagents and background work"
+	},
+	"trackDescriptions": {
+		"conversation": "A turn from end to end: reasoning, tools, approvals, interrupting, plan mode.",
+		"chapters": "Projects are repositories, chapters are worktrees. Forking, the graph, merging back.",
+		"subagents": "Delegating to explore/plan/general/review agents, and letting work run in the background."
+	},
+	"start": "Start lesson",
+	"resume": "Continue",
+	"replay": "Replay",
+	"runAll": "Take the whole tour",
+	"steps": "Steps",
+	"stepCount": "{{done}} / {{total}} steps",
+	"lessonComplete": "Lesson complete",
+	"nextLesson": "Next lesson",
+	"backToOverview": "All lessons",
+	"markStepDone": "Got it, next",
+	"skipToEnd": "Mark as complete",
+	"reset": "Reset progress",
+	"resetConfirmTitle": "Reset this lesson?",
+	"resetConfirmBody": "Your recorded progress for this lesson is cleared. The narrators it created are kept — starting again opens a fresh one.",
+	"resetConfirm": "Reset",
+	"cancel": "Cancel",
+	"hint": "Hint",
+	"recommendedAfter": "Easier after: {{lessons}}",
+	"sandboxTitle": "Tutorial sandbox",
+	"sandboxBody": "Lessons that need a repository work in a real git repository created just for the tutorial. It appears in your NarraFlow list marked as a tutorial, and is never connected to your own projects.",
+	"sandboxMissing": "Not created yet. It appears when you start a lesson that needs it.",
+	"sandboxOpen": "Open the sandbox",
+	"sandboxDeleteHint": "To remove it, delete the narraflow like any other. It will be recreated the next time you start a lesson.",
+	"openGraph": "Open the narraflow view",
+	"startFailed": "Could not start the lesson: {{error}}",
+	"gitRequired": "This lesson needs git, which is not available on this machine.",
+	"loading": "Loading…",
+	"empty": "No lessons are available."
+}

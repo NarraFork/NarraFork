@@ -51,6 +51,40 @@ const fakeBackgroundTaskService = {
 		const parentIds = new Set(parentNarratorIds);
 		return [...tasks.values()].filter((t) => parentIds.has(t.parentNarratorId));
 	},
+	// Mirrors the real bounded view: bash rows only, running first, then a short
+	// terminal tail, with the remainder reported rather than dropped silently.
+	async listTeamBashTasks(input: {
+		parentNarratorIds: string[];
+		limit: number;
+		recentTerminalLimit: number;
+		query?: string;
+	}) {
+		const parentIds = new Set(input.parentNarratorIds);
+		const needle = input.query?.trim().toLowerCase();
+		const matching = [...tasks.values()]
+			.filter((t) => t.type === "bash" && parentIds.has(t.parentNarratorId))
+			.filter((t) => {
+				if (!needle) return true;
+				return [t.alias, t.title, t.command].some((field) =>
+					(field ?? "").toLowerCase().includes(needle),
+				);
+			})
+			.reverse();
+		const running = matching.filter((t) => t.status === "running");
+		const terminal = matching.filter((t) => t.status !== "running");
+		const terminalLimit = needle ? input.limit : input.recentTerminalLimit;
+		const shownRunning = running.slice(0, input.limit);
+		const shownTerminal = terminal.slice(
+			0,
+			Math.min(Math.max(input.limit - shownRunning.length, 0), terminalLimit),
+		);
+		const shown = [...shownRunning, ...shownTerminal];
+		return {
+			tasks: shown,
+			omitted: Math.max(matching.length - shown.length, 0),
+			omittedCapped: false,
+		};
+	},
 	async cancel(id: string) {
 		const task = tasks.get(id);
 		if (!task || task.status !== "running") return false;
@@ -120,6 +154,37 @@ const narrators = new Map<string, FakeNarrator>();
 const fakeNarratorService = {
 	async listSubagentsByParent(parentNarratorId: string) {
 		return [...narrators.values()].filter((n) => n.parentNarratorId === parentNarratorId);
+	},
+	// Mirrors the real bounded view: active members first, then newest, with the
+	// remainder reported. Insertion order stands in for `createdAt`.
+	async listSubagentsForTeamView(input: {
+		parentNarratorId: string;
+		limit: number;
+		query?: string;
+	}) {
+		const needle = input.query?.trim().toLowerCase();
+		const slug = (text: string) => text.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+		const matching = [...narrators.values()]
+			.filter((n) => n.parentNarratorId === input.parentNarratorId)
+			.filter((n) => {
+				if (!needle) return true;
+				return (
+					n.id.toLowerCase().startsWith(needle) ||
+					(n.title ?? "").toLowerCase().includes(needle) ||
+					(n.title ? slug(n.title).includes(needle) : false)
+				);
+			})
+			.reverse()
+			.sort((a, b) => {
+				const rank = (s: string) => (s === "working" || s === "waiting" ? 0 : 1);
+				return rank(a.status) - rank(b.status);
+			});
+		const shown = matching.slice(0, input.limit);
+		return {
+			subagents: shown,
+			omitted: Math.max(matching.length - shown.length, 0),
+			omittedCapped: false,
+		};
 	},
 	async getById(id: string) {
 		const n = narrators.get(id);
@@ -591,6 +656,186 @@ describe("TeamStatus actions", () => {
 		);
 		expect(rejected.isError).toBe(true);
 		expect(rejected.output).toContain("not a direct subagent");
+	});
+});
+
+/**
+ * The list actions are bounded. A narrator that keeps working keeps spawning
+ * subagents (never reaped) and background bash tasks, so an unbounded listing grew
+ * for the lifetime of the session until it dominated the turn it was meant to
+ * inform. What has to hold: the cut is reported rather than silent, active members
+ * survive it, and an explicit `query` reaches past the window.
+ */
+describe("TeamStatus list actions are bounded", () => {
+	function seedAgents(count: number, status: string) {
+		for (let i = 0; i < count; i++) {
+			narrators.set(`sub-${i}`, {
+				id: `sub-${i}`,
+				parentNarratorId: "primary",
+				variant: "subagent:general",
+				status,
+				title: `Worker ${i}`,
+			});
+		}
+	}
+
+	test("default listing caps rows and reports what it omitted", async () => {
+		seed();
+		seedAgents(60, "idle");
+
+		const result = await teamStatusTool.execute({ action: "list_agents" }, makeCtx("primary"));
+
+		const rows = (result.output ?? "").split("\n").filter((l) => l.startsWith("- kind=agent"));
+		expect(rows).toHaveLength(20);
+		// The omission must be stated: a silent cut reads as "that is the whole team".
+		expect(result.output).toContain("40 more agents not shown");
+		expect(result.output).toContain("query");
+	});
+
+	test("an untruncated listing carries no omission note", async () => {
+		seed();
+		seedAgents(3, "idle");
+
+		const result = await teamStatusTool.execute({ action: "list_agents" }, makeCtx("primary"));
+
+		expect(result.output).not.toContain("not shown");
+	});
+
+	test("limit widens the window and is clamped to the maximum", async () => {
+		seed();
+		seedAgents(60, "idle");
+
+		const widened = await teamStatusTool.execute(
+			{ action: "list_agents", limit: 40 },
+			makeCtx("primary"),
+		);
+		expect(
+			(widened.output ?? "").split("\n").filter((l) => l.startsWith("- kind=agent")),
+		).toHaveLength(40);
+		expect(widened.output).toContain("20 more agents not shown");
+
+		// Above the cap the request is clamped, not honoured — the whole point is a
+		// bounded read.
+		const overLimit = await teamStatusTool.execute(
+			{ action: "list_agents", limit: 5_000 },
+			makeCtx("primary"),
+		);
+		expect(
+			(overLimit.output ?? "").split("\n").filter((l) => l.startsWith("- kind=agent")),
+		).toHaveLength(60);
+	});
+
+	test("active members survive truncation ahead of finished ones", async () => {
+		seed();
+		// 30 finished agents created FIRST, then one still working. Ordered by age the
+		// working one would fall outside a 20-row window.
+		seedAgents(30, "idle");
+		narrators.set("sub-live", {
+			id: "sub-live",
+			parentNarratorId: "primary",
+			variant: "subagent:general",
+			status: "working",
+			title: "Still Running",
+		});
+
+		const result = await teamStatusTool.execute({ action: "list_agents" }, makeCtx("primary"));
+
+		expect(result.output).toContain("id=sub-live");
+	});
+
+	test("query reaches a member past the default window", async () => {
+		seed();
+		// Created FIRST so 60 newer agents push it out of the newest-first window.
+		narrators.set("needle-agent", {
+			id: "needle-agent",
+			parentNarratorId: "primary",
+			variant: "subagent:explore",
+			status: "idle",
+			title: "Audit The Migrations",
+		});
+		seedAgents(60, "idle");
+		// Confirm it is genuinely outside the default listing before searching for it.
+		const unfiltered = await teamStatusTool.execute({ action: "list_agents" }, makeCtx("primary"));
+		expect(unfiltered.output).not.toContain("id=needle-agent");
+
+		const found = await teamStatusTool.execute(
+			{ action: "list_agents", query: "audit" },
+			makeCtx("primary"),
+		);
+		expect(found.output).toContain("id=needle-agent");
+		expect(
+			(found.output ?? "").split("\n").filter((l) => l.startsWith("- kind=agent")),
+		).toHaveLength(1);
+	});
+
+	test("a search with no matches is distinguished from an empty team", async () => {
+		seed();
+		seedAgents(2, "idle");
+
+		const noMatch = await teamStatusTool.execute(
+			{ action: "list_agents", query: "nonexistent" },
+			makeCtx("primary"),
+		);
+		expect(noMatch.output).toContain('match "nonexistent"');
+
+		seed();
+		const empty = await teamStatusTool.execute({ action: "list_agents" }, makeCtx("primary"));
+		expect(empty.output).toContain("No sibling subagents found.");
+	});
+
+	test("bash listing keeps running tasks and trims the finished tail", async () => {
+		seed();
+		for (let i = 0; i < 30; i++) {
+			tasks.set(`done-${i}`, {
+				id: `done-${i}`,
+				parentNarratorId: "primary",
+				type: "bash",
+				status: "completed",
+				command: `echo ${i}`,
+				alias: null,
+				title: null,
+				canCancelActiveWork: false,
+			});
+		}
+		tasks.set("live-1", {
+			id: "live-1",
+			parentNarratorId: "primary",
+			type: "bash",
+			status: "running",
+			command: "bun test",
+			alias: "tests",
+			title: "Run tests",
+			canCancelActiveWork: true,
+		});
+
+		const result = await teamStatusTool.execute({ action: "list_bash" }, makeCtx("primary"));
+
+		const rows = (result.output ?? "").split("\n").filter((l) => l.startsWith("- kind=bash"));
+		// One running row plus the recent-terminal tail, not all 31.
+		expect(rows).toHaveLength(6);
+		expect(result.output).toContain("id=live-1");
+		expect(result.output).toContain("25 more bash tasks not shown");
+	});
+
+	test("agents and bash tasks get independent budgets", async () => {
+		seed();
+		// A crowded agent list must not squeeze out the running bash task.
+		seedAgents(40, "idle");
+		tasks.set("live-1", {
+			id: "live-1",
+			parentNarratorId: "primary",
+			type: "bash",
+			status: "running",
+			command: "bun test",
+			alias: "tests",
+			title: "Run tests",
+			canCancelActiveWork: true,
+		});
+
+		const result = await teamStatusTool.execute({ action: "list" }, makeCtx("primary"));
+
+		expect(result.output).toContain("id=live-1");
+		expect(result.output).toContain("20 more agents not shown");
 	});
 });
 

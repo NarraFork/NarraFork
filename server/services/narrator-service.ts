@@ -6,7 +6,7 @@ import {
 	type NarratorWriteAudience,
 } from "@shared/narrator-access";
 import { foldHandle } from "@shared/narrator-handle";
-import { and, eq, inArray, isNotNull, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	apiRequests,
@@ -81,6 +81,7 @@ import {
 	type Locale,
 } from "../lib/prompt-i18n";
 import { FOLLOW_DEFAULT_MODEL, resolveEffectiveModel, settings } from "../lib/settings";
+import { escapeLikeNeedle } from "../lib/sql-like";
 import {
 	contentJsonHasImageBlocks,
 	deleteNarratorUploads,
@@ -137,6 +138,29 @@ export { narratorPersistence } from "./narrator-persistence";
  */
 const REFS_INSERT_BATCH = 500;
 const MAX_INHERITED_FULL_FORK_REFS = 500;
+
+/**
+ * Cap for the "and N more" figure reported by `listSubagentsForTeamView`.
+ *
+ * An exact remainder would be an unbounded `COUNT(*)` over a table that grows for
+ * the whole lifetime of a session; past this point "500+" tells the caller the
+ * same thing an exact number would.
+ */
+const TEAM_VIEW_OMITTED_COUNT_CAP = 500;
+
+/**
+ * The narrator columns a team listing renders. Deliberately narrower than the
+ * full row: `systemPrompt` / `contextSummary` are large and unused by any listing,
+ * and `traits` is needed only because it carries the alias a label resolves from.
+ */
+export interface TeamViewSubagent {
+	id: string;
+	title: string | null;
+	traits: string[];
+	variant: string;
+	status: string;
+	createdAt: string;
+}
 
 /**
  * A history compact marker is transient while its block is `compacting` (or
@@ -1476,12 +1500,101 @@ export const narratorService = {
 
 	/**
 	 * List all subagents belonging to a parent narrator.
+	 *
+	 * Unbounded on purpose: selector resolution (`Send`, `Await`, `ContextAsk`)
+	 * needs to see every candidate or it would report "no such subagent" for one
+	 * that exists. Callers that only DISPLAY the team must use
+	 * `listSubagentsForTeamView`, which is bounded.
 	 */
 	async listSubagentsByParent(parentNarratorId: string) {
 		return db.query.narrators.findMany({
 			where: eq(narrators.parentNarratorId, parentNarratorId),
 			orderBy: (n, { asc }) => [asc(n.createdAt)],
 		});
+	},
+
+	/**
+	 * Bounded team listing for display, ordered by usefulness rather than by age.
+	 *
+	 * A narrator that keeps working keeps spawning subagents, and unlike background
+	 * task rows these are never reaped — so the full list grows for the lifetime of
+	 * the session. `TeamStatus` printed all of it into the model's context.
+	 *
+	 * Ordering is `active first, then most recent`: `working`/`waiting` members are
+	 * what a coordination question is actually about, and among the rest the newest
+	 * are the ones the caller just launched. Plain `createdAt` ordering buries a
+	 * still-running agent under dozens of finished ones as soon as the team is
+	 * larger than the limit. The same ordering applies to a search, so `omitted`
+	 * stays a correct remainder for the rows actually shown.
+	 *
+	 * `query` matches title / alias traits / id prefix — the same handles the
+	 * listing prints, so a member found by name can be addressed by that name.
+	 *
+	 * Only the display columns are selected: the full row carries `systemPrompt` and
+	 * `contextSummary`, which can be large and which no listing renders.
+	 *
+	 * `omitted` is capped: an exact remainder would be an unbounded `COUNT(*)` on
+	 * the very table this method exists to stop scanning.
+	 */
+	async listSubagentsForTeamView(input: {
+		parentNarratorId: string;
+		limit: number;
+		query?: string;
+	}): Promise<{
+		subagents: TeamViewSubagent[];
+		omitted: number;
+		omittedCapped: boolean;
+	}> {
+		const limit = Math.max(1, Math.trunc(input.limit));
+		const needle = escapeLikeNeedle(input.query);
+		const conditions = [eq(narrators.parentNarratorId, input.parentNarratorId)];
+		if (needle) {
+			const like = `%${needle}%`;
+			const match = or(
+				sql`${narrators.title} LIKE ${like} ESCAPE '\\'`,
+				// Aliases live in the traits JSON array as `subagent-alias:<slug>`; a
+				// LIKE over the raw JSON text is enough for a display filter and needs
+				// no json1 table function.
+				sql`${narrators.traits} LIKE ${like} ESCAPE '\\'`,
+				sql`${narrators.id} LIKE ${`${needle}%`} ESCAPE '\\'`,
+			);
+			if (match) conditions.push(match);
+		}
+		const where = and(...conditions);
+		// Active members first. A CASE rather than a status filter so both groups come
+		// back in one query and one ordering — and NOT a bare `sql\`1\``, which SQLite
+		// reads as the ordinal of the first selected column.
+		const activeFirst = sql`CASE WHEN ${narrators.status} IN ('working','waiting') THEN 0 ELSE 1 END`;
+
+		const rows = await db
+			.select({
+				id: narrators.id,
+				title: narrators.title,
+				traits: narrators.traits,
+				variant: narrators.variant,
+				status: narrators.status,
+				createdAt: narrators.createdAt,
+			})
+			.from(narrators)
+			.where(where)
+			.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
+			.limit(limit)
+			.all();
+
+		const remainder = await db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(where)
+			.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
+			.limit(TEAM_VIEW_OMITTED_COUNT_CAP + 1)
+			.offset(rows.length)
+			.all();
+
+		return {
+			subagents: rows,
+			omitted: Math.min(remainder.length, TEAM_VIEW_OMITTED_COUNT_CAP),
+			omittedCapped: remainder.length > TEAM_VIEW_OMITTED_COUNT_CAP,
+		};
 	},
 
 	async persistSubagentUserMessage(

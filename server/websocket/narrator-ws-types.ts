@@ -820,6 +820,28 @@ export type NarratorServerMessage =
 			status: string;
 			substatus?: string[];
 	  }
+	/**
+	 * The user took over (or released) a subagent — the PARENT's waiting card must
+	 * say so.
+	 *
+	 * Distinct from `subagent_status_changed` (which carries the same fact in its
+	 * substatus) because that frame is consumed by the PANEL subscription, whose job
+	 * is the narrator row's status chip. This one belongs to the MESSAGE layer: it
+	 * patches the blocked Agent/Task or in-flight Await card, which is the only place
+	 * a reader can see WHY the session stopped moving.
+	 *
+	 * `toolUseId` is best-effort: when the spawning tool_use cannot be resolved the
+	 * frame still ships, and the client falls back to matching the card by
+	 * `subagentNarratorId`. Dropping the frame instead would silently lose the
+	 * indicator in exactly the edge cases that are hardest to debug.
+	 */
+	| {
+			type: "subagent_takeover_changed";
+			narratorId: string;
+			subagentNarratorId: string;
+			toolUseId?: string;
+			takenOver: boolean;
+	  }
 	| {
 			type: "subagent_warning";
 			narratorId: string;

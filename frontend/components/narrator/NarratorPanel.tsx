@@ -677,6 +677,32 @@ type QueueMode = "turn" | "tool" | "interrupt";
 const QUEUE_MODES: QueueMode[] = ["turn", "tool", "interrupt"];
 
 /**
+ * The queue choices offered while an idle narrator is COMPACTING its context.
+ *
+ * Only two of the three modes mean anything here. There is no running turn and no
+ * running tool call to cut in front of, so "wait for the turn to finish" and
+ * "interrupt the turn" would both describe something that does not exist. What the
+ * user actually decides is whether to wait for the compaction: waiting keeps the
+ * turn on the post-compact summary, running now starts it against the current
+ * history while the compaction continues in the background.
+ *
+ * Each entry maps onto the same `QueueMode` the rest of the composer speaks, so the
+ * Enter / Ctrl+Enter bindings and the one-shot triggers keep working unchanged.
+ */
+const COMPACT_QUEUE_MODES: Array<{ mode: QueueMode; labelKey: string; descKey: string }> = [
+	{
+		mode: "turn",
+		labelKey: "compactQueueMode_wait",
+		descKey: "compactQueueMode_wait_desc",
+	},
+	{
+		mode: "interrupt",
+		labelKey: "compactQueueMode_now",
+		descKey: "compactQueueMode_now_desc",
+	},
+];
+
+/**
  * A single queue-mode row: icon + label + description, with a right-side marker
  * that is either a check (this mode is the current binding) or a play icon
  * (clicking sends the current input with this mode right now).
@@ -685,6 +711,7 @@ function QueueModeMenuItem({
 	mode,
 	selected,
 	action,
+	labelKey,
 	descriptionKey,
 	onClick,
 	t,
@@ -693,6 +720,12 @@ function QueueModeMenuItem({
 	selected: boolean;
 	/** "configure" shows a check on the active mode; "trigger" shows a play icon. */
 	action: "configure" | "trigger";
+	/**
+	 * Label override. Defaults to the mode's generic name; the compacting menu
+	 * passes its own because "wait for the turn to finish" describes a turn that is
+	 * not running (see {@link COMPACT_QUEUE_MODES}).
+	 */
+	labelKey?: string;
 	descriptionKey: string;
 	onClick: () => void;
 	t: (key: string) => string;
@@ -712,7 +745,7 @@ function QueueModeMenuItem({
 			fw={action === "configure" && selected ? 600 : 400}
 		>
 			<Stack gap={0}>
-				<Text size="sm">{t(`queueMode_${mode}`)}</Text>
+				<Text size="sm">{t(labelKey ?? `queueMode_${mode}`)}</Text>
 				<Text size="xs" c="dimmed">
 					{t(descriptionKey)}
 				</Text>
@@ -735,6 +768,7 @@ function SendOptionsMenuContent({
 	enterQueueMode,
 	ctrlEnterQueueMode,
 	hasInput,
+	compacting,
 	onSelectEnterMode,
 	onSelectCtrlEnterMode,
 	onSendWithMode,
@@ -743,11 +777,42 @@ function SendOptionsMenuContent({
 	enterQueueMode: QueueMode;
 	ctrlEnterQueueMode: QueueMode;
 	hasInput: boolean;
+	/**
+	 * The narrator is idle but compacting, so the menu offers the two-way
+	 * wait-for-compaction choice instead of the three turn/tool/interrupt modes.
+	 */
+	compacting?: boolean;
 	onSelectEnterMode: (mode: QueueMode) => void;
 	onSelectCtrlEnterMode: (mode: QueueMode) => void;
 	onSendWithMode: (mode: QueueMode) => void;
 	t: (key: string) => string;
 }) {
+	// With a draft in hand during a compaction, the menu answers the only question that
+	// applies: wait for the compaction, or run now? The generic turn/tool/interrupt
+	// names would describe a turn and a tool call that are not running.
+	//
+	// With an EMPTY composer it falls through to the key-binding config below instead.
+	// Those bindings still govern the narrator's later busy turns, and offering send
+	// actions with nothing to send would present two items that quietly do nothing.
+	if (compacting && hasInput) {
+		return (
+			<>
+				<Menu.Label>{t("compactQueueSection")}</Menu.Label>
+				{COMPACT_QUEUE_MODES.map(({ mode, labelKey, descKey }) => (
+					<QueueModeMenuItem
+						key={mode}
+						mode={mode}
+						selected={false}
+						action="trigger"
+						labelKey={labelKey}
+						descriptionKey={descKey}
+						onClick={() => onSendWithMode(mode)}
+						t={t}
+					/>
+				))}
+			</>
+		);
+	}
 	if (hasInput) {
 		return (
 			<>
@@ -810,6 +875,7 @@ function SendOptionsSplitButton({
 	enterQueueMode,
 	ctrlEnterQueueMode,
 	hasInput,
+	compacting,
 	color,
 	variant,
 	onSelectEnterMode,
@@ -821,6 +887,8 @@ function SendOptionsSplitButton({
 	enterQueueMode: QueueMode;
 	ctrlEnterQueueMode: QueueMode;
 	hasInput: boolean;
+	/** Show the compaction wait/run-now chooser instead of the queue modes. */
+	compacting?: boolean;
 	/** Match the primary button's color/variant so the two segments look unified. */
 	color?: string;
 	variant?: string;
@@ -848,6 +916,7 @@ function SendOptionsSplitButton({
 						enterQueueMode={enterQueueMode}
 						ctrlEnterQueueMode={ctrlEnterQueueMode}
 						hasInput={hasInput}
+						compacting={compacting}
 						onSelectEnterMode={onSelectEnterMode}
 						onSelectCtrlEnterMode={onSelectCtrlEnterMode}
 						onSendWithMode={onSendWithMode}
@@ -3929,6 +3998,20 @@ export function NarratorPanel({
 	const isBlockingCompacting = substatus.includes("compacting");
 	const isBackgroundCompacting = substatus.includes("background_compacting");
 	const isCompacting = isBlockingCompacting || isBackgroundCompacting;
+	/**
+	 * Whether the composer should present the compaction wait/run-now choice.
+	 *
+	 * Only meaningful while the narrator is idle: a busy narrator's own queue modes
+	 * already govern where the message lands, and a background compact running
+	 * alongside a live turn changes nothing about that decision. Subagents are
+	 * excluded because the server cannot queue them across a compaction (their queue
+	 * needs a foreground runner), so it keeps waiting internally and there is no
+	 * choice to offer.
+	 *
+	 * Declared next to the compacting flags rather than inline at the button so the
+	 * send handler and the menu cannot disagree about which state the composer is in.
+	 */
+	const showCompactQueueChoice = isCompacting && !isActive && !isSubagent;
 	const compactProgressText = isCompacting ? compactProgressLabel(t, compactProgress) : null;
 	const queuePosition = substatus.find((s) => s.startsWith("queue_position:"));
 	const queueDepth = substatus.find((s) => s.startsWith("queue_depth:"));
@@ -5248,11 +5331,21 @@ export function NarratorPanel({
 	);
 
 	// --- Send / retry message ---
+	/**
+	 * Send as a new turn on an idle narrator.
+	 *
+	 * `priority` is not about queue ordering here — an idle narrator has no turn to
+	 * cut in front of. It is the explicit "do not wait for the running compaction"
+	 * opt-out: the server queues an idle-but-compacting narrator's messages by
+	 * default, and this flag makes it start the turn immediately instead. On a
+	 * narrator that is neither busy nor compacting it changes nothing.
+	 */
 	const submitMessage = async (
 		msg: string,
 		images: File[] = [],
 		textFiles: File[] = [],
 		signal?: AbortSignal,
+		priority?: boolean,
 	) => {
 		const optimisticBlocks: ContentBlock[] = [
 			...images.map((f) => ({
@@ -5275,7 +5368,7 @@ export function NarratorPanel({
 				msg,
 				images.length > 0 ? images : undefined,
 				textFiles.length > 0 ? textFiles : undefined,
-				undefined,
+				priority,
 				reportUploadProgress,
 				signal,
 			);
@@ -5392,7 +5485,15 @@ export function NarratorPanel({
 	 *   - "turn": normal queue — wait for the current turn to finish
 	 *   - "tool": priority queue — cut in after the current tool call completes
 	 *   - "interrupt": priority queue + immediate interrupt (auto-resume consumes it)
-	 * When the narrator is idle, `mode` is ignored and the message is sent
+	 *
+	 * An idle narrator that is COMPACTING is a third state, not a busy one: there is
+	 * no turn to cut into, but starting one now would race the summary that is about
+	 * to replace the history. The server queues it by default and consumes the queue
+	 * when the compact settles, so the only meaningful choice is wait-or-not — which
+	 * is what {@link COMPACT_QUEUE_MODES} offers. `mode` maps onto it as "turn" =
+	 * wait, anything else = run now (`priority` opts out of the server-side queue).
+	 *
+	 * When the narrator is fully idle, `mode` is ignored and the message is sent
 	 * directly (an idle session is never interrupted). `/new` while active always
 	 * uses the normal queue regardless of mode — spawning a new narrator should
 	 * not interrupt the current turn.
@@ -5513,6 +5614,23 @@ export function NarratorPanel({
 					const buffered = await doSendBuffered(msg, true, abortController.signal);
 					if (buffered) interruptMutation.mutate(narratorId);
 				}
+				return;
+			}
+			// Idle but compacting: the server decides queue-or-send, so this only has to
+			// carry the user's intent. "turn" (wait) leaves `priority` off and lets the
+			// server queue it; any other mode sets `priority` to run now. The response
+			// tells us which happened — a 202 lands in the queued-messages area, a 201
+			// starts a turn — so both outcomes are handled by `submitMessage` already.
+			if (showCompactQueueChoice) {
+				const images = [...attachedImages];
+				const textFiles = [...attachedTextFiles];
+				restoreOnError = { msg, images, textFiles };
+				composerRef.current?.hideTextForSend();
+				hideAttachedFilesForSend();
+				await submitMessage(msg, images, textFiles, abortController.signal, mode !== "turn");
+				composerRef.current?.commitDraftAfterSend();
+				clearAttachedFilesAndDraft();
+				restoreOnError = null;
 				return;
 			}
 			const images = [...attachedImages];
@@ -8619,6 +8737,7 @@ export function NarratorPanel({
 												enterQueueMode={userPrefs?.enterQueueMode ?? "turn"}
 												ctrlEnterQueueMode={userPrefs?.ctrlEnterQueueMode ?? "tool"}
 												hasInput={hasInput || hasAttachments}
+												compacting={showCompactQueueChoice}
 												color={opts?.color}
 												variant={opts?.variant}
 												onSelectEnterMode={(mode) =>
@@ -8700,6 +8819,26 @@ export function NarratorPanel({
 											return withSendOptions(
 												<Button key="continue" onClick={handleContinue}>
 													{t("continue")}
+												</Button>,
+											);
+										}
+										// Idle but compacting: the message will be QUEUED (the server holds
+										// it until the compaction settles), so the button says so rather
+										// than promising an immediate send. No hold gesture here — the
+										// alternative is a single "run now" item in the split menu, and a
+										// long-press that silently bypassed the compaction would be a
+										// surprising default for a two-way choice.
+										if (showCompactQueueChoice) {
+											return withSendOptions(
+												<Button
+													key="send-compact-queue"
+													onClick={handleSend}
+													disabled={!hasInput && !hasAttachments}
+													loading={isSending}
+												>
+													{queuedMessages.length > 0
+														? `${t("queue")} (${queuedMessages.length})`
+														: t("queue")}
 												</Button>,
 											);
 										}

@@ -109,6 +109,8 @@ export interface VListRenderLabels {
 		input: string;
 		output: string;
 		remote: string;
+		/** Header badge for a call blocked by a user takeover of its subagent. */
+		takenOver: string;
 		/** `_planFile` provenance template carrying a literal `{file}` placeholder. */
 		planSource: string;
 		/**
@@ -173,6 +175,8 @@ export interface VListRenderLabels {
 		resolveOverride: string;
 		waitingBadge: string;
 		backgroundBadge: string;
+		/** "Taken over by user" badge on a card whose child the user is driving. */
+		takenOverBadge: string;
 		/** Same bundle as the tool card: the header + recent-call rows reuse it. */
 		timing: VListTimingLabels;
 	};
@@ -466,6 +470,9 @@ export function useVListLabels(): VListLabels {
 				input: tCommon("input"),
 				output: tCommon("output"),
 				remote: t("toolCallRemoteBadge"),
+				// The SAME key the narrator status chip uses for `taken_over`, so the
+				// blocked card and the child's own status read identically.
+				takenOver: t("subagentTakenOver"),
 				// The raw `_planFile` path lives in the measured detail (shared/ has no
 				// i18n), so inject the template with a literal placeholder and let the
 				// render layer substitute the path — same trick as COUNT_PLACEHOLDER.
@@ -538,6 +545,7 @@ export function useVListLabels(): VListLabels {
 				// filled from the same title so the bundle stays type-complete.
 				waitingBadge: t("subagentWaitingPermissionTitle"),
 				backgroundBadge: t("backgroundBadge"),
+				takenOverBadge: t("subagentTakenOver"),
 				timing,
 			},
 			permission,

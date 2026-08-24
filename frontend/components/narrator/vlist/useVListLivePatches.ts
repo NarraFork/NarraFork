@@ -42,6 +42,7 @@ import {
 	reflectionStoppedPatch,
 	subagentActivityPatch,
 	subagentConclusionPatch,
+	subagentTakeoverPatch,
 	timeoutUpdatedPatch,
 	toolCompletedPatch,
 	toolExecutingPatch,
@@ -52,6 +53,7 @@ import {
 	LivePatchQueue,
 	patchSubagentActivitySnapshots,
 	patchSubagentIdentity,
+	patchSubagentTakeoverByNarrator,
 } from "./vlist-live-patch";
 
 export interface UseVListLivePatchesOptions {
@@ -316,6 +318,23 @@ export function useVListLivePatches(
 			onAwaitAgentResolved: (toolUseId, subagentNarratorId) => {
 				if (!toolUseId || !subagentNarratorId) return;
 				enqueue(awaitAgentResolvedPatch({ toolUseId, subagentNarratorId }));
+			},
+
+			// The user took over a subagent, so this card's call is now blocked on a
+			// PERSON. Without the badge a suspended Agent card and an in-flight Await
+			// look exactly like ordinary running work, and a forgotten takeover stalls
+			// the session with nothing on screen explaining why.
+			onSubagentTakeoverChanged: ({ subagentNarratorId, toolUseId, takenOver }) => {
+				if (toolUseId) {
+					enqueue(subagentTakeoverPatch({ toolUseId, takenOver }));
+					return;
+				}
+				// No spawning tool_use resolved server-side — match the card by the child
+				// narrator id it already carries rather than dropping the indicator.
+				if (!subagentNarratorId) return;
+				enqueue((messages) =>
+					patchSubagentTakeoverByNarrator(messages, subagentNarratorId, takenOver),
+				);
 			},
 
 			// Execution began (permission granted). The persisted half of the same signal

@@ -66,6 +66,7 @@ import {
 	isTakenOver,
 	markTakenOver,
 } from "./subagent-takeover";
+import { broadcastSubagentTakeoverChanged } from "./subagent-takeover-broadcast";
 import { clearTeamInbox } from "./subagent-team";
 import { buildSubagentSystemPrompt } from "./subagent-tools";
 import { resolveEffectiveTraits, resolveNarratorProjectId } from "./trait-layer-service";
@@ -534,6 +535,16 @@ async function transitionBackgroundTakenOverToIdle(
 		narratorId,
 		status: "idle",
 		substatus: ["taken_over"],
+	});
+	// The parent's Agent/Task CARD is a separate consumer from the panel status
+	// chip above: the `subagent_status_changed` frame is excluded from the message
+	// subscription, so without this the card never learns about the takeover.
+	// `toolUseId` is already in hand here, so no lookup is needed.
+	await broadcastSubagentTakeoverChanged({
+		parentNarratorId,
+		subagentNarratorId: narratorId,
+		takenOver: true,
+		...(toolUseId ? { toolUseId } : {}),
 	});
 }
 

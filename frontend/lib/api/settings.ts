@@ -18,7 +18,16 @@ export interface RecentTabsPageResponse {
 }
 
 export type RecentTabsMutationResponse = RecentTabsMutationResult;
-export type RecentTabUpsertInput = PersistedRecentTab & { updateOnly?: boolean };
+export type RecentTabUpsertInput = PersistedRecentTab & {
+	updateOnly?: boolean;
+	/**
+	 * Place the tab relative to an existing one in the SAME revision that creates it.
+	 * Mutually exclusive. Only the single-tab endpoint is used with these; the batch
+	 * endpoint accepts them too but no caller needs it yet.
+	 */
+	beforeKey?: string;
+	afterKey?: string;
+};
 
 export type RecentTabMoveTarget =
 	| { beforeKey: string }

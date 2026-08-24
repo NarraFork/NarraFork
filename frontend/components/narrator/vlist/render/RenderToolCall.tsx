@@ -148,6 +148,8 @@ export interface ToolCallLabels {
 	output?: string;
 	/** Remote-execution header badge label. */
 	remote?: string;
+	/** Header badge label for a call blocked by a user takeover of its subagent. */
+	takenOver?: string;
 	/**
 	 * Localized `_planFile` provenance template, e.g. `"Plan from {file}"`. The
 	 * measure layer only carries the raw path (shared/ has no i18n), so the
@@ -192,6 +194,7 @@ const DEFAULT_LABELS: Required<
 		| "input"
 		| "output"
 		| "remote"
+		| "takenOver"
 		| "planSource"
 		| "download"
 		| "copy"
@@ -204,6 +207,7 @@ const DEFAULT_LABELS: Required<
 	input: "Input",
 	output: "Output",
 	remote: "remote",
+	takenOver: "Taken over by user",
 	planSource: "Plan from {file}",
 	download: "Download",
 	copy: "Copy link",
@@ -428,6 +432,10 @@ interface ToolHeaderRowProps {
 	isRemoteTarget: boolean;
 	/** Localized remote-execution badge label. */
 	remoteLabel: string;
+	/** The awaited subagent is taken over by the user → the call is parked. */
+	isTakenOver: boolean;
+	/** Localized takeover badge label. */
+	takenOverLabel: string;
 	opened: boolean;
 	onToggle?: () => void;
 	/** Optional category-icon override; falls back to a neutral tool glyph. */
@@ -457,6 +465,8 @@ function ToolHeaderRow({
 	status,
 	isRemoteTarget,
 	remoteLabel,
+	isTakenOver,
+	takenOverLabel,
 	opened,
 	onToggle,
 	icon: Icon = IconTool,
@@ -551,6 +561,20 @@ function ToolHeaderRow({
 					style={{ flexShrink: 0 }}
 				>
 					{remoteLabel}
+				</Badge>
+			) : null}
+			{/* An in-flight Await whose target got taken over never returns, and the
+			    header would otherwise show nothing but a ticking timer. Grape matches
+			    the `taken_over` substatus colour in status-registry.ts. */}
+			{isTakenOver ? (
+				<Badge
+					data-testid="tool-taken-over"
+					size="xs"
+					variant="light"
+					color="grape"
+					style={{ flexShrink: 0 }}
+				>
+					{takenOverLabel}
 				</Badge>
 			) : null}
 			<span
@@ -2948,6 +2972,8 @@ export function RenderToolCall({
 				status={status}
 				isRemoteTarget={measured.isRemoteTarget}
 				remoteLabel={merged.remote}
+				isTakenOver={measured.isTakenOver}
+				takenOverLabel={merged.takenOver}
 				opened={effectiveOpened}
 				onToggle={onToggle}
 				icon={icon ?? categoryIcon(category, measured.toolName)}

@@ -91,7 +91,7 @@ export const DEFAULTS: NarraForkSettings = {
 		autoCompactKeepPairs: 2,
 		autoCompactPruneThreshold: 80,
 		minPruneRatio: 30,
-		queueDuringCompaction: false,
+		queueDuringCompaction: true,
 		contextThresholds: cloneDefaultContextThresholds(),
 	},
 	chapters: {
@@ -640,9 +640,9 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "0-100, 默认 30",
 	},
 	"agent.queueDuringCompaction": {
-		desc: "叙述者正在进行上下文压缩时，新发送的用户消息是否等压缩完成后再发送。关闭时立即发送（默认行为）。",
+		desc: "叙述者正在进行上下文压缩时，新发送的用户消息是否排队等压缩完成后再执行。开启时消息进入队列（可编辑、可取消），压缩结束后自动开始该轮次；关闭时立即发送，与压缩并发。无论开关如何，用户都可以在发送菜单中选择插队立即执行。",
 		type: "boolean",
-		valid: "true / false，默认 false",
+		valid: "true / false，默认 true",
 	},
 
 	// ── chapters ────────────────────────────────────────────────────────

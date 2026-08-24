@@ -187,6 +187,33 @@ describe("live-patch audit: fields that DO change height are in the cache key", 
 		);
 	});
 
+	/**
+	 * The takeover badge — invisible to the exhaustive audit below for the same
+	 * reason the recent-call label is: no height moves, so a stale key cannot be
+	 * detected from geometry.
+	 *
+	 * It is worse than the label case in one respect, which is why both card kinds
+	 * are pinned here: the takeover patch writes `_takenOver` and NOTHING else. The
+	 * card stays `running` throughout (that is the whole point — the call is parked,
+	 * not finished), `opts` is untouched and `messageVersion` is deliberately held
+	 * fixed by `applyLivePatch`. So this revision component is the ONLY thing that
+	 * can invalidate the entry; without it the header keeps painting the
+	 * pre-takeover badge row and the user never learns why the session stalled.
+	 */
+	it("the takeover flag is in the revision for BOTH card kinds", async () => {
+		const { extractDataRevision } = await cacheMod();
+		// Subagent card (`subagentRevision`, gated on agentType).
+		const agentBase = { agentType: "explore", recentCallCount: 0, isActive: true };
+		expect(extractDataRevision({ ...agentBase, isTakenOver: true })).not.toBe(
+			extractDataRevision(agentBase),
+		);
+		// Tool card (an in-flight Await), which takes the top-level branch instead.
+		const awaitBase = { toolName: "Await", category: "await", status: "running" };
+		expect(extractDataRevision({ ...awaitBase, isTakenOver: true })).not.toBe(
+			extractDataRevision(awaitBase),
+		);
+	});
+
 	it("a folded trace row's duration is in the revision", async () => {
 		const { extractDataRevision } = await cacheMod();
 		// Same class of bug one layer up: the row's duration is height-neutral but
@@ -770,6 +797,25 @@ describe("live-patch audit: fields that are height-NEUTRAL (single header row)",
 			OPENED,
 		);
 		expect(resolved.height).toBe(base.height);
+	});
+
+	it("the takeover badge does not change the measured height", async () => {
+		// The badge joins the card's ALREADY-FIXED header row, which is what makes it
+		// safe to flip mid-wait: an Agent card suspended for the whole takeover, and an
+		// Await that never returns, must not resize under the reader.
+		const { measureToolCall } = await measureMod();
+		const base = measureToolCall(expandedCard(), WIDTH, LOD, OPENED);
+		const takenOver = measureToolCall(
+			expandedCard({ isTakenOver: true } as Partial<ToolCallData>),
+			WIDTH,
+			LOD,
+			OPENED,
+		);
+		expect(takenOver.height).toBe(base.height);
+		// …and it must actually reach the renderer, which reads it off the measured
+		// payload (a flag that measures identically AND is dropped shows nothing).
+		expect(takenOver.isTakenOver).toBe(true);
+		expect(base.isTakenOver).toBe(false);
 	});
 
 	it("writing the await id into _metadata WOULD change the height (why it does not)", async () => {

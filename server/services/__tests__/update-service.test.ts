@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { registerOperatorShutdownHandler } from "../../lib/server-restart";
 import { toolContinuationService } from "../tool-continuation-service";
 import {
 	beginQuiescingTools,
@@ -24,6 +25,7 @@ import {
 	getUpdateDirectory,
 	getUpdateStatus,
 	isTrustedUpdateServerUrl,
+	shutdownForManualUpdate,
 } from "../update-service";
 
 const originalCancelEpoch = toolContinuationService.cancelEpoch;
@@ -268,6 +270,87 @@ describe("cancelling a prepared update", () => {
 		const result = cancelPreparedUpdate("operator asked to stop");
 		expect(result.cancelled).toBe(true);
 		expect(result.status.cancelRequested).toBe(true);
+	});
+});
+
+describe("shutting down for a manual update start", () => {
+	beforeEach(() => {
+		resetUpdateCoordinationForTests();
+	});
+
+	afterEach(() => {
+		resetUpdateCoordinationForTests();
+		registerOperatorShutdownHandler(null);
+	});
+
+	/** Record shutdown requests instead of tearing the test process down. */
+	function captureShutdowns(): Array<{ reason: string }> {
+		const calls: Array<{ reason: string }> = [];
+		registerOperatorShutdownHandler(async (options) => {
+			calls.push(options);
+			return { success: true, reason: options.reason, pid: process.pid, durationMs: 0 };
+		});
+		return calls;
+	}
+
+	test("schedules a shutdown when nothing is scheduled", () => {
+		const calls = captureShutdowns();
+		const result = shutdownForManualUpdate({ reason: "operator_requested" });
+
+		expect(result.success).toBe(true);
+		expect(result.cancelledSchedule).toBe(false);
+		// The response must be flushed before teardown starts, so the handler runs on a timer
+		// rather than inline. Firing it synchronously would kill the request that asked for it.
+		expect(calls).toEqual([]);
+	});
+
+	test("cancels a pending schedule first so paused tools are not frozen mid-teardown", () => {
+		captureShutdowns();
+		scheduleUpdate("6.0.0");
+
+		const result = shutdownForManualUpdate({ reason: "operator_requested" });
+
+		expect(result.success).toBe(true);
+		expect(result.cancelledSchedule).toBe(true);
+		// Cancellation reopens the tool gate and clears the epoch, so the drain orchestration can
+		// no longer reach markUpdateRestarting() and write a manifest no successor will claim.
+		expect(getUpdateCoordinationStatus().cancelRequested).toBe(true);
+	});
+
+	test("refuses once a replacement process is already starting", () => {
+		const calls = captureShutdowns();
+		scheduleUpdate("6.1.0");
+		beginQuiescingTools();
+		markUpdateRestarting();
+
+		const result = shutdownForManualUpdate({ reason: "operator_requested" });
+
+		expect(result.success).toBe(false);
+		expect(result.code).toBe("REPLACEMENT_ALREADY_STARTING");
+		expect(calls).toEqual([]);
+		expect(getUpdateCoordinationStatus().phase).toBe("restarting");
+	});
+
+	test("reports failure when the runtime registered no shutdown handler", () => {
+		registerOperatorShutdownHandler(null);
+
+		const result = shutdownForManualUpdate({ reason: "operator_requested" });
+
+		// Reporting success here would be the worst outcome: the UI would tell the user to go start
+		// the new binary while this process still holds the port.
+		expect(result.success).toBe(false);
+		expect(result.code).toBe("SHUTDOWN_UNAVAILABLE");
+	});
+
+	test("leaves no recovery manifest behind, since no successor is spawned", () => {
+		captureShutdowns();
+		scheduleUpdate("6.2.0");
+
+		shutdownForManualUpdate({ reason: "operator_requested" });
+
+		// A manifest with no process to claim it is a standing "resume these narrators" instruction
+		// for every later startup.
+		expect(consumePlannedUpdateRecoverySnapshot()).toBeNull();
 	});
 });
 

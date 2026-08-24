@@ -105,6 +105,8 @@ export interface SubagentLabels {
 	waitingBadge?: string;
 	/** Background badge label. */
 	backgroundBadge?: string;
+	/** "Taken over by user" badge label. */
+	takenOverBadge?: string;
 	/**
 	 * Timing popover strings for the header + recent-call rows. Absent → the render
 	 * layer's English fallbacks. Height-neutral (portaled popover / fixed rows).
@@ -120,6 +122,7 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing">> = {
 	resolveOverride: "Resolve override",
 	waitingBadge: "Awaiting permission",
 	backgroundBadge: "Background",
+	takenOverBadge: "Taken over by user",
 };
 
 /**
@@ -137,6 +140,12 @@ interface RenderSubagentProps {
 	agentType?: string;
 	/** Extra background badge. */
 	isBackground?: boolean;
+	/**
+	 * Extra "taken over by user" badge: the parent's tool call is parked until the
+	 * user releases the child. The Loader stays — the child really is being worked
+	 * on — so the badge is what says the session is waiting on a PERSON.
+	 */
+	isTakenOver?: boolean;
 	/** Extra model badge. */
 	model?: string;
 	/** Extra thinking-effort badge (cyan), mirroring SubagentCard.tsx. */
@@ -361,6 +370,7 @@ function SubagentInner({
 	description,
 	agentType = "agent",
 	isBackground,
+	isTakenOver,
 	model,
 	reasoningEffort,
 	resultPreview,
@@ -415,6 +425,14 @@ function SubagentInner({
 				{isBackground ? (
 					<Badge size="xs" variant="light" color="blue">
 						{labels.backgroundBadge}
+					</Badge>
+				) : null}
+				{/* Grape matches the `taken_over` narrator substatus colour in
+				    status-registry.ts, so the same state reads the same way on the card
+				    and in the narrator list. */}
+				{isTakenOver ? (
+					<Badge data-testid="subagent-taken-over" size="xs" variant="light" color="grape">
+						{labels.takenOverBadge}
 					</Badge>
 				) : null}
 				{model ? (

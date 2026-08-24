@@ -28,7 +28,7 @@ import { createContext, type RefObject, useCallback, useContext, useEffect, useR
 import type { PanelDragState } from "../../lib/panel-drag";
 import type { DropZoneThresholds } from "./drop-intent";
 import { swapPanels } from "./panel-swap";
-import { type DockviewDropTarget, useDockviewDnd } from "./useDockviewDnd";
+import { DOCKVIEW_SURFACE_ATTR, type DockviewDropTarget, useDockviewDnd } from "./useDockviewDnd";
 
 /** Theme class that maps dockview CSS variables to Mantine (see theme.css). */
 export const DOCKVIEW_THEME_CLASS = "dockview-theme-narrafork";
@@ -239,7 +239,13 @@ export function DockviewSurface({
 
 	return (
 		<DockviewSurfaceIdContext.Provider value={surfaceId}>
-			<Box ref={rootRef} style={{ height: "100%", width: "100%", position: "relative" }}>
+			<Box
+				ref={rootRef}
+				// Lets a drop identify the topmost SURFACE under the pointer while
+				// ignoring unrelated layers such as a drag ghost (see isTopmostSurface).
+				{...{ [DOCKVIEW_SURFACE_ATTR]: surfaceId ?? "" }}
+				style={{ height: "100%", width: "100%", position: "relative" }}
+			>
 				<DockviewReact
 					className={surfaceClass || undefined}
 					// Supply our own theme so dockview stamps OUR class on the internal

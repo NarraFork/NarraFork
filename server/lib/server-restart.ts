@@ -34,6 +34,16 @@ type GracefulShutdownResult = {
 
 type GracefulShutdownFn = (request: GracefulShutdownRequest) => Promise<GracefulShutdownResult>;
 
+/**
+ * Shut this process down on an administrator's request, with no replacement taking over.
+ *
+ * Distinct from `GracefulShutdownFn`, which only ever runs because a replacement process asked
+ * for the port. Here nobody is coming: the user intends to start the new binary themselves, so
+ * the handler must not open a restart-handoff session or leave a recovery manifest behind
+ * claiming a spawned successor.
+ */
+type OperatorShutdownFn = (options: { reason: string }) => Promise<GracefulShutdownResult>;
+
 type GracefulRestartSession = {
 	token: string;
 	url: string;
@@ -49,6 +59,7 @@ const RESTART_HANDOFF_DIR = getNarraforkPath("restart-handoff");
 let _restartFn: RestartFn | null = null;
 let _runtimeAddressGetter: RuntimeAddressGetter | null = null;
 let _gracefulShutdownFn: GracefulShutdownFn | null = null;
+let _operatorShutdownFn: OperatorShutdownFn | null = null;
 let _gracefulRestartSession: GracefulRestartSession | null = null;
 
 /** Called by server/main.ts to register the in-process restart implementation. */
@@ -64,6 +75,69 @@ export function registerRuntimeAddressGetter(fn: RuntimeAddressGetter): void {
 /** Called by server/main.ts to register the graceful shutdown implementation. */
 export function registerGracefulShutdownHandler(fn: GracefulShutdownFn): void {
 	_gracefulShutdownFn = fn;
+}
+
+/**
+ * Called by server/main.ts to register the administrator-initiated shutdown implementation.
+ *
+ * Accepts null so tests can restore the unregistered state they found the module in; this is
+ * shared module-level state, and a fake left behind would let a later test shut something down.
+ */
+export function registerOperatorShutdownHandler(fn: OperatorShutdownFn | null): void {
+	_operatorShutdownFn = fn;
+}
+
+/**
+ * Whether an administrator-initiated shutdown can be performed in this process.
+ *
+ * False in environments that never registered the handler (tests, embedded harnesses), so the
+ * route can answer with a real reason instead of reporting a shutdown that never happens.
+ */
+export function canOperatorShutdown(): boolean {
+	return _operatorShutdownFn !== null;
+}
+
+/**
+ * Delay between answering the shutdown request and beginning teardown.
+ *
+ * Teardown calls `closeAllConnections()`, which terminates in-flight HTTP requests — including
+ * the one that asked for the shutdown. Running it inline would drop the response, leaving the
+ * caller unable to distinguish "shutting down" from "request failed". The replacement-process
+ * handoff tolerates that because its marker file is authoritative; an administrator clicking a
+ * button has no such fallback, so the response is flushed first.
+ */
+const OPERATOR_SHUTDOWN_RESPONSE_GRACE_MS = 300;
+
+/**
+ * Stop this server at an administrator's request, shortly after the current response is flushed.
+ *
+ * Returns false when no handler is registered, which the caller must surface rather than treat as
+ * success: a silent no-op here looks exactly like a completed shutdown to the UI, and the user
+ * would go start the new binary while the old one still holds the port.
+ */
+export function scheduleOperatorShutdown(options: { reason: string }): boolean {
+	const fn = _operatorShutdownFn;
+	if (!fn) {
+		logger.error("Operator shutdown requested but no handler registered", {
+			reason: options.reason,
+		});
+		return false;
+	}
+	logger.info("Operator shutdown scheduled", {
+		reason: options.reason,
+		graceMs: OPERATOR_SHUTDOWN_RESPONSE_GRACE_MS,
+	});
+	const timer = setTimeout(() => {
+		void fn(options).catch((err) => {
+			logger.error("Operator shutdown failed", {
+				reason: options.reason,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+	}, OPERATOR_SHUTDOWN_RESPONSE_GRACE_MS);
+	// Never let the grace timer be the reason the process lingers if it exits another way first.
+	(timer as { unref?: () => void }).unref?.();
+	return true;
 }
 
 /**

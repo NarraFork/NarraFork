@@ -178,6 +178,9 @@ export function resolveRenderExtra(spec: {
 			if ("model" in data) extra.model = data.model;
 			if ("reasoningEffort" in data) extra.reasoningEffort = data.reasoningEffort;
 			if ("isBackground" in data) extra.isBackground = data.isBackground;
+			// The takeover badge is height-neutral but PAINTED, so it must reach the
+			// renderer explicitly — the measure layer keeps only the geometry it needs.
+			if ("isTakenOver" in data) extra.isTakenOver = data.isTakenOver;
 			if ("resultPreview" in data) extra.resultPreview = data.resultPreview;
 			if ("resultText" in data) extra.resultText = data.resultText;
 			// RenderSubagent reads the prompt body via `promptText` (not `prompt`).
@@ -437,6 +440,7 @@ export function renderElement(
 					description={(extra.description as string) ?? ""}
 					agentType={extra.agentType as string | undefined}
 					isBackground={extra.isBackground as boolean | undefined}
+					isTakenOver={extra.isTakenOver as boolean | undefined}
 					model={extra.model as string | undefined}
 					reasoningEffort={extra.reasoningEffort as string | undefined}
 					resultPreview={extra.resultPreview as string | undefined}

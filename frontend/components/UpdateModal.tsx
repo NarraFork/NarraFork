@@ -36,8 +36,10 @@ import { normalizeLanguage } from "../lib/i18n";
 import { formatLocaleDate } from "../lib/intl-format";
 import {
 	resolveUpdateCoordinationCounts,
+	shouldAssumeLocalSchedule,
 	shouldShowUpdateScheduleButton,
 } from "../lib/update-state";
+import { useConfirmDialog } from "./common/ConfirmDialogProvider";
 import { CopyButton } from "./common/CopyButton";
 import { MarkdownContent } from "./narrator/MarkdownContent";
 
@@ -102,9 +104,21 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		null,
 	);
 	const [applyAttemptStartedAt, setApplyAttemptStartedAt] = useState<number | null>(null);
+	// When this client's own `/apply` reported a schedule, and whether the server has since
+	// confirmed one. Together they bound how long the optimistic claim may replace server truth;
+	// see `shouldAssumeLocalSchedule`.
+	const [scheduleClaimedAt, setScheduleClaimedAt] = useState<number | null>(null);
+	const [serverConfirmedSchedule, setServerConfirmedSchedule] = useState(false);
+	// Set once this client asks to end the attempt, so the optimistic claim stops fighting the
+	// cancellation it requested. Without it the claim keeps the one-second poll alive forever.
+	const [scheduleAbandonedLocally, setScheduleAbandonedLocally] = useState(false);
 	const [restartWaitError, setRestartWaitError] = useState<string | null>(null);
 	const [cancelError, setCancelError] = useState<string | null>(null);
 	const [isCancellingSchedule, setIsCancellingSchedule] = useState(false);
+	const [isShuttingDown, setIsShuttingDown] = useState(false);
+	const [shutdownError, setShutdownError] = useState<string | null>(null);
+	const [shutdownDone, setShutdownDone] = useState<{ newBinaryPath?: string } | null>(null);
+	const confirm = useConfirmDialog();
 	const updateCapability = useUpdateCapability();
 	const platform = usePlatform();
 	const downloadAvailable = updateCapability.download.supported && updateCapability.download.sse;
@@ -136,6 +150,14 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		? (result.version ?? requestedTargetVersion)
 		: requestedTargetVersion;
 
+	const assumeScheduled = shouldAssumeLocalSchedule({
+		applyScheduled: applyResult?.scheduled === true,
+		claimedAt: scheduleClaimedAt,
+		serverConfirmedSchedule,
+		abandonedLocally: scheduleAbandonedLocally,
+		now: Date.now(),
+	});
+
 	const {
 		data: preparedStatus,
 		dataUpdatedAt: preparedStatusUpdatedAt,
@@ -143,9 +165,18 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		refetch: refetchPreparedStatus,
 	} = useUpdateScheduleStatus({
 		targetVersion,
-		enabled: opened || applyResult?.scheduled === true,
+		// Once this server has been told to stop, polling it can only produce failures. Keeping the
+		// query alive would turn an intentional shutdown into a stream of errors in the dialog.
+		//
+		// A closed dialog still follows an attempt this client started, because the restart wait
+		// begun here has to survive it. `serverConfirmedSchedule` keeps that true for the rest of
+		// the session, which is harmless: `enabled` only decides whether the query may run at all,
+		// while `refetchInterval` decides whether it repeats. The repetition is what was broken —
+		// the unbounded `applyResult.scheduled` also fed `assumeScheduled`, so a cancelled attempt
+		// kept re-requesting `/api/update/status` once a second forever.
+		enabled: !shutdownDone && (opened || assumeScheduled || serverConfirmedSchedule),
 		errorSinceMs: applyAttemptStartedAt,
-		assumeScheduled: applyResult?.scheduled === true,
+		assumeScheduled,
 	});
 
 	const handleDownload = (options?: { retry?: boolean }) => {
@@ -178,10 +209,16 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const handleApply = async () => {
 		setApplyAttemptStartedAt(Date.now());
 		setRestartWaitError(null);
+		// A retry after a cancelled or failed attempt starts a fresh claim: the previous attempt's
+		// abandonment and confirmation must not carry over and suppress this one.
+		setScheduleAbandonedLocally(false);
+		setServerConfirmedSchedule(false);
+		setScheduleClaimedAt(null);
 		const { clearPwaCache } = await import("@frontend/lib/pwa");
 		const applyResponse = await apply(targetVersion);
 		if (!applyResponse.success) return;
 		if ("scheduled" in applyResponse && applyResponse.scheduled) {
+			setScheduleClaimedAt(Date.now());
 			void refetchPreparedStatus();
 			void startRestartWait(targetVersion);
 			return;
@@ -207,6 +244,10 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		setCancelError(null);
 		try {
 			await api.cancelUpdate();
+			// The attempt is over as far as this client is concerned. Releasing the optimistic claim
+			// here is what lets the poll wind down once the coordinator reports idle; leaving it set
+			// kept `/api/update/status` running once a second indefinitely.
+			setScheduleAbandonedLocally(true);
 			restartWaitRef.current?.controller.abort();
 			restartWaitRef.current = null;
 			setRestartWaitError(null);
@@ -218,6 +259,54 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 			setCancelError(error instanceof Error ? error.message : String(error));
 		} finally {
 			setIsCancellingSchedule(false);
+		}
+	};
+
+	/**
+	 * Stop the old version now and let the user start the new one themselves.
+	 *
+	 * The alternative to waiting for `updateSchedule`, which has no deadline by design. Everything
+	 * that polls the server is torn down first: once the process is gone every request fails, and a
+	 * live restart-wait would report that as a timeout error on top of a shutdown the user asked
+	 * for. The dialog then switches to a terminal "stopped, run this path" state rather than
+	 * pretending it can still observe the server.
+	 */
+	const handleForceShutdown = async () => {
+		const confirmed = await confirm({
+			title: t("updateForceShutdownConfirmTitle"),
+			message: t("updateForceShutdownConfirmMessage"),
+			confirmLabel: t("updateForceShutdown"),
+			confirmColor: "red",
+		});
+		if (!confirmed) return;
+
+		setIsShuttingDown(true);
+		setShutdownError(null);
+		try {
+			const response = await api.shutdownForUpdate();
+			if (!response.success) {
+				setShutdownError(
+					response.code === "REPLACEMENT_ALREADY_STARTING"
+						? t("updateForceShutdownAlreadyRestarting")
+						: response.code === "SHUTDOWN_UNAVAILABLE"
+							? t("updateForceShutdownUnavailable")
+							: (response.error ?? t("updateForceShutdownFailed")),
+				);
+				return;
+			}
+			// `/shutdown` cancels any schedule server-side, so this client's claim is void too.
+			setScheduleAbandonedLocally(true);
+			restartWaitRef.current?.controller.abort();
+			restartWaitRef.current = null;
+			setRestartWaitError(null);
+			setShutdownDone({ newBinaryPath: response.newBinaryPath ?? preparedBinaryPath });
+		} catch (error) {
+			// A plain call rather than a mutation, so no global toast fires. The shutdown races the
+			// response, so a network failure here genuinely may mean it worked — say so instead of
+			// reporting a bare fetch error the user cannot act on.
+			setShutdownError(error instanceof Error ? error.message : String(error));
+		} finally {
+			setIsShuttingDown(false);
 		}
 	};
 
@@ -331,6 +420,13 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		(applyResult && !applyResult.success ? applyResult.error : null) ??
 		(statusErrorIsCurrent ? preparedStatusDetails?.error : null) ??
 		null;
+
+	// Once the coordinator has confirmed a schedule, its own reports drive the poll and the local
+	// claim retires. This is the ordinary way the claim ends: it hands over to server truth as soon
+	// as server truth exists, and the coordinator reporting idle later is then believed.
+	useEffect(() => {
+		if (preparedStatus?.scheduled === true) setServerConfirmedSchedule(true);
+	}, [preparedStatus?.scheduled]);
 
 	useEffect(() => {
 		if (coordinationFailed) {
@@ -584,6 +680,34 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							</>
 						)}
 
+						{/*
+						 * Escape hatch from the unbounded wait above: stop this version now and start the
+						 * new one by hand. Only offered while nothing is scheduled and no shutdown has
+						 * been confirmed, so it cannot be used to interrupt a restart already underway.
+						 */}
+						{showUpdateScheduleButton && !shutdownDone && (
+							<>
+								<Divider variant="dashed" />
+								<Text size="sm">{t("updateForceShutdownDescription")}</Text>
+								<Button
+									fullWidth
+									color="red"
+									variant="outline"
+									leftSection={<IconPower size={16} />}
+									onClick={handleForceShutdown}
+									loading={isShuttingDown}
+								>
+									{t("updateForceShutdown")}
+								</Button>
+							</>
+						)}
+
+						{shutdownError && (
+							<Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />}>
+								<Text size="sm">{shutdownError}</Text>
+							</Alert>
+						)}
+
 						{isDrainingBackgroundBash && (
 							<Alert color="blue" variant="light" icon={<IconClock size={16} />}>
 								<Group gap="xs" wrap="nowrap" justify="space-between" align="center">
@@ -698,6 +822,36 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							{t("updateRestarting")}
 						</Alert>
 						<Text size="sm">{t("updateRestartingDescription")}</Text>
+					</Stack>
+				)}
+
+				{shutdownDone && (
+					<Stack gap="sm">
+						<Alert color="yellow" variant="light" icon={<IconPower size={16} />}>
+							{t("updateForceShutdownDone")}
+						</Alert>
+						<Text size="sm">{t("updateForceShutdownDoneDescription")}</Text>
+						{shutdownDone.newBinaryPath && (
+							<Group gap="xs" align="flex-start">
+								<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
+									{shutdownDone.newBinaryPath}
+								</Code>
+								<CopyButton value={shutdownDone.newBinaryPath}>
+									{({ copied, copy }) => (
+										<Tooltip label={copied ? t("copied") : t("copy")}>
+											<Button
+												size="xs"
+												variant="subtle"
+												color={copied ? "green" : "gray"}
+												onClick={copy}
+											>
+												{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+											</Button>
+										</Tooltip>
+									)}
+								</CopyButton>
+							</Group>
+						)}
 					</Stack>
 				)}
 

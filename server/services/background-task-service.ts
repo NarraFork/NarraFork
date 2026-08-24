@@ -32,6 +32,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
+import { escapeLikeNeedle } from "../lib/sql-like";
 import { pushPendingInjection } from "./parent-injection-queue";
 
 // === Types ===
@@ -149,6 +150,16 @@ const LIST_OUTPUT_PREVIEW_CHARS = BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS;
  * must never join/materialize the whole buffer on the main thread.
  */
 export const OUTPUT_TAIL_MAX_CHARS = 20_000;
+/**
+ * Cap for the "how many rows did I leave out" count reported by the bounded team
+ * view.
+ *
+ * A precise total would be an unbounded `COUNT(*)` over a table that grows with
+ * every task the team has ever spawned — exactly the read the bounded view exists
+ * to avoid. The cap keeps the scan bounded and the caller reports `500+` rather
+ * than pretending to know more.
+ */
+const TEAM_OMITTED_COUNT_CAP = 500;
 /** Auto-cleanup completed tasks older than 30 minutes */
 const CLEANUP_RETENTION_MS = 30 * 60_000;
 /** Run cleanup at most once per 5 minutes */
@@ -980,6 +991,138 @@ class BackgroundTaskService {
 			.where(inArray(backgroundTasks.parentNarratorId, parentIds))
 			.orderBy(desc(backgroundTasks.createdAt))
 			.all();
+	}
+
+	/**
+	 * Bounded team view over BASH tasks, for the `TeamStatus` tool.
+	 *
+	 * `listSummariesByParents` is unbounded: it returns every row every parent in
+	 * the team has ever spawned. That is survivable for the panel (which pages) but
+	 * not for a tool whose output goes into the model's context — a long-lived
+	 * narrator accumulates tasks continuously, so the listing grew without limit
+	 * and eventually dominated the turn it was supposed to inform.
+	 *
+	 * Shape of the answer, and why:
+	 * - Running rows come first and in full (capped). "What is still running" is the
+	 *   question the tool exists to answer, and it cannot be expressed as an
+	 *   ordering over `createdAt`.
+	 * - Terminal rows are included only as a short recent tail. They are context, not
+	 *   the answer, and `cleanupCompleted` already deletes them after 30 minutes —
+	 *   so the tail is bounded in age as well as in count.
+	 * - `omitted` reports what was left out, capped at TEAM_OMITTED_COUNT_CAP. A
+	 *   silent cut would let the model conclude the team is idle when it is not.
+	 *
+	 * `query` searches alias/title/command across ALL rows (running and terminal),
+	 * because an explicit search is a request to look past the default window.
+	 *
+	 * Only bash rows: agent members are listed from `narrators` (a background agent
+	 * row and its narrator row are the same entity, and the narrator row is the one
+	 * carrying status/title), so returning agent task rows here would double-list
+	 * them. This also means no liveness overlay is needed — `continued` /
+	 * `child_running` are derived for agent rows only.
+	 *
+	 * `output` is never read: the tool prints no output text, and the column holds
+	 * up to 512 KB per row.
+	 */
+	async listTeamBashTasks(input: {
+		parentNarratorIds: string[];
+		/** Max rows returned in total (running + terminal tail). */
+		limit: number;
+		/** Max terminal rows included when no `query` is given. */
+		recentTerminalLimit: number;
+		/** Free-text needle over alias / title / command. */
+		query?: string;
+	}): Promise<{
+		tasks: BackgroundTaskSummary[];
+		/** Rows matching the filter that were left out. */
+		omitted: number;
+		/** `omitted` hit TEAM_OMITTED_COUNT_CAP and is a lower bound. */
+		omittedCapped: boolean;
+	}> {
+		const parentIds = [...new Set(input.parentNarratorIds)].filter(Boolean);
+		if (parentIds.length === 0) return { tasks: [], omitted: 0, omittedCapped: false };
+
+		const limit = Math.max(1, Math.trunc(input.limit));
+		const needle = escapeLikeNeedle(input.query);
+		const scope = [
+			inArray(backgroundTasks.parentNarratorId, parentIds),
+			eq(backgroundTasks.type, "bash"),
+		];
+		if (needle) {
+			const like = `%${needle}%`;
+			const match = or(
+				sql`${backgroundTasks.alias} LIKE ${like} ESCAPE '\\'`,
+				sql`${backgroundTasks.title} LIKE ${like} ESCAPE '\\'`,
+				sql`${backgroundTasks.command} LIKE ${like} ESCAPE '\\'`,
+			);
+			if (match) scope.push(match);
+		}
+
+		// The preview column is deliberately replaced by NULL rather than omitted:
+		// `reconcileSummaries` spreads whole rows, so the field has to exist.
+		const { output: _output, ...columns } = getTableColumns(backgroundTasks);
+		const selection = { ...columns, output: sql<string | null>`null` };
+
+		// A search is a request to look past the default window, so it gets the whole
+		// budget for terminal rows instead of the short tail.
+		const terminalLimit = needle ? limit : Math.max(0, Math.trunc(input.recentTerminalLimit));
+
+		const [runningRows, terminalRows] = await Promise.all([
+			db
+				.select(selection)
+				.from(backgroundTasks)
+				.where(and(...scope, eq(backgroundTasks.status, "running")))
+				.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
+				.limit(limit + 1)
+				.all(),
+			terminalLimit === 0
+				? Promise.resolve([])
+				: db
+						.select(selection)
+						.from(backgroundTasks)
+						.where(and(...scope, ne(backgroundTasks.status, "running")))
+						.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
+						.limit(terminalLimit + 1)
+						.all(),
+		]);
+
+		// Running rows keep their priority even when they overflow the budget: a
+		// truncated running set is still the most useful answer available.
+		const shownRunning = runningRows.slice(0, limit);
+		const terminalBudget = Math.max(0, limit - shownRunning.length);
+		const shownTerminal = terminalRows.slice(0, Math.min(terminalBudget, terminalLimit));
+		const rows = [...shownRunning, ...shownTerminal];
+
+		// `offset` counts rows in the scope, not the specific ones shown, so skipping
+		// `rows.length` yields the correct remainder even though the shown set
+		// reorders running rows ahead of newer terminal ones.
+		const omitted = await this.countTeamBashTasks(scope, rows.length);
+
+		return {
+			tasks: await this.reconcileSummaries(rows as BackgroundTaskRecord[]),
+			omitted: Math.min(omitted, TEAM_OMITTED_COUNT_CAP),
+			omittedCapped: omitted > TEAM_OMITTED_COUNT_CAP,
+		};
+	}
+
+	/**
+	 * How many matching rows exist beyond the first `skip`, capped.
+	 *
+	 * Written as a bounded id scan rather than `COUNT(*)` so a team with thousands
+	 * of historical rows cannot turn a tool call into a full-table aggregate — the
+	 * caller only needs "and N more", and beyond the cap "500+" is as actionable as
+	 * an exact figure.
+	 */
+	private async countTeamBashTasks(scope: ReturnType<typeof and>[], skip: number): Promise<number> {
+		const rows = await db
+			.select({ id: backgroundTasks.id })
+			.from(backgroundTasks)
+			.where(and(...scope))
+			.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
+			.limit(TEAM_OMITTED_COUNT_CAP + 1)
+			.offset(skip)
+			.all();
+		return rows.length;
 	}
 
 	async listSummariesByParent(parentNarratorId: string): Promise<BackgroundTaskSummary[]> {

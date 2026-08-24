@@ -35,7 +35,11 @@ const DATA: SubagentCardData = {
 	isTerminal: true,
 };
 
-function renderCard(badges: { model?: string; reasoningEffort?: string }): Element {
+function renderCard(badges: {
+	model?: string;
+	reasoningEffort?: string;
+	isTakenOver?: boolean;
+}): Element {
 	const measured = measureSubagentCard({ ...DATA, ...badges }, WIDTH, 5, {});
 	return parse(
 		renderToStaticMarkup(
@@ -46,6 +50,7 @@ function renderCard(badges: { model?: string; reasoningEffort?: string }): Eleme
 					agentType={DATA.agentType}
 					model={badges.model}
 					reasoningEffort={badges.reasoningEffort}
+					isTakenOver={badges.isTakenOver}
 					isActive={false}
 				/>
 			</MantineProvider>,
@@ -83,5 +88,28 @@ describe("RenderSubagent — header badges", () => {
 		);
 		const without = measureSubagentCard({ ...DATA, model: "sonnet" }, WIDTH, 5, {});
 		expect(withBadge.height).toBe(without.height);
+	});
+
+	/**
+	 * The takeover badge is the only thing on a suspended Agent card that explains
+	 * why the parent session stopped moving: the card keeps its Loader (the child
+	 * really is being worked on, by a human), so without the badge it is
+	 * indistinguishable from ordinary running work.
+	 */
+	it("paints the takeover badge while the user is driving the child", () => {
+		const root = renderCard({ isTakenOver: true });
+		expect(root.querySelector('[data-testid="subagent-taken-over"]')).not.toBeNull();
+	});
+
+	it("omits the takeover badge by default", () => {
+		expect(renderCard({}).querySelector('[data-testid="subagent-taken-over"]')).toBeNull();
+	});
+
+	it("the takeover badge is height-neutral too (it can flip mid-wait)", () => {
+		// It flips on a card the reader may be looking at, so a resize here would jump
+		// the viewport under them.
+		expect(measureSubagentCard({ ...DATA, isTakenOver: true }, WIDTH, 5, {}).height).toBe(
+			measureSubagentCard(DATA, WIDTH, 5, {}).height,
+		);
 	});
 });

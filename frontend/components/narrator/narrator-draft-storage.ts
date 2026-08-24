@@ -250,7 +250,21 @@ export function persistNarratorInputDraft(
 		serverRevision,
 		serverUpdatedAt,
 	};
-	writeSession("narrator-draft", id, JSON.stringify(envelope));
+	/*
+	 * An EMPTY mirror is disposable; one with text is not.
+	 *
+	 * Every narrator a tab opens writes this record during hydration, and for a
+	 * narrator nobody typed into the text is "". Under a pure-LRU key cap those
+	 * empty records were the most recent writes, so they outranked — and evicted —
+	 * the one narrator whose draft the user had actually written. Switching away and
+	 * back then found no local mirror, and hydration correctly treated the server
+	 * revision as authoritative: the composer blanked and "restored" the older
+	 * server copy, with no error anywhere because every layer did its job.
+	 *
+	 * The empty record still has to be WRITTEN (it is how a cleared draft stops
+	 * resurrecting on reload); it just must never be worth more than typed text.
+	 */
+	writeSession("narrator-draft", id, JSON.stringify(envelope), text ? "durable" : "disposable");
 	return true;
 }
 

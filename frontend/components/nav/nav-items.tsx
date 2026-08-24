@@ -9,6 +9,7 @@ import {
 	IconDatabase,
 	IconFolders,
 	IconMessages,
+	IconSchool,
 	IconWand,
 } from "@tabler/icons-react";
 import type { ComponentType } from "react";
@@ -76,6 +77,13 @@ const NAV_ITEM_DETAILS: Record<CustomizableNavId, Omit<NavItemDef, "id">> = {
 		labelKey: "learning",
 		to: "/learn",
 		icon: IconBook2,
+	},
+	tutorial: {
+		labelKey: "tutorial",
+		to: "/tutorial",
+		icon: IconSchool,
+		// Lesson pages live under /tutorial/<id>, which must keep the entry active.
+		activePrefix: "/tutorial",
 	},
 	knowledge: {
 		labelKey: "knowledge",

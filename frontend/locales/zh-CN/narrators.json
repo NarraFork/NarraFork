@@ -29,6 +29,7 @@
 	"addToFavorites": "添加到收藏",
 	"favoriteDirectories": "收藏目录",
 	"cwdLabel": "{{path}}",
+	"dragToSidebar": "拖到侧栏排序，或拖到某个工作区加入其中",
 	"archive": "归档",
 	"unarchive": "取消归档",
 	"archivedNarrators": "已归档叙述者",

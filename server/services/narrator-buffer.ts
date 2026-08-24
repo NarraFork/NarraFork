@@ -11,6 +11,7 @@ import {
 	type BufferCreator,
 	type BufferedMessage,
 	bufferedMessages,
+	compactLocks,
 	isNarratorRuntimeBusy,
 	type SavedBufferedFile,
 } from "./narrator-session-state";
@@ -36,9 +37,21 @@ const MAX_BUFFERED_MESSAGES = 50;
  *
  * `isNarratorRuntimeBusy` is the authoritative in-memory answer to "is this narrator
  * busy", covering live loops, permission/danger pauses and loop-less runtime claims.
+ *
+ * A running compact is admitted too, and it is the one owner that is NOT "busy" in
+ * the runtime sense: the narrator can be perfectly idle while its context is being
+ * rebuilt. Queuing is still the right answer there, because a turn started against
+ * the pre-compact history races the summary that is about to replace it. The
+ * consumer for this case is `drainQueuedMessagesAfterCompact` (see
+ * ./compact-queue-drain.ts), which runs when the compact lock is released on ANY
+ * exit — success, failure, cancel or watchdog timeout.
  */
 function canQueueForNarrator(narratorId: string): boolean {
-	return activeNarrators.has(narratorId) || isNarratorRuntimeBusy(narratorId);
+	return (
+		activeNarrators.has(narratorId) ||
+		isNarratorRuntimeBusy(narratorId) ||
+		compactLocks.has(narratorId)
+	);
 }
 
 /** Directory under ~/.narrafork where buffered text files are persisted. */

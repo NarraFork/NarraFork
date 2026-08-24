@@ -9,7 +9,11 @@ import {
 	registerSchema,
 	updateUserPreferencesSchema,
 } from "../../../server/lib/validators";
-import { recentTabSchema, restoreRecentTabsSchema } from "../../../server/lib/validators/settings";
+import {
+	recentTabSchema,
+	restoreRecentTabsSchema,
+	upsertRecentTabSchema,
+} from "../../../server/lib/validators/settings";
 import { narratorWsMessageSchema } from "../../../server/lib/validators/websocket";
 import { SUPPORTED_LOCALES } from "../../../shared/i18n-locales";
 
@@ -248,5 +252,39 @@ describe("recentTabSchema — dirSortOrder", () => {
 		});
 		expect(result.success).toBe(true);
 		expect(result.success && result.data.tabs?.[0]?.dirSortOrder).toBe(2);
+	});
+});
+
+describe("upsertRecentTabSchema — placement anchors", () => {
+	const base = {
+		type: "narrator" as const,
+		id: "n-1",
+		title: "Tab",
+		lastVisitedAt: 1,
+	};
+
+	it("accepts either anchor on its own", () => {
+		const before = upsertRecentTabSchema.safeParse({ ...base, beforeKey: "narrator:n-2" });
+		expect(before.success && before.data.beforeKey).toBe("narrator:n-2");
+		const after = upsertRecentTabSchema.safeParse({ ...base, afterKey: "narrator:n-2" });
+		expect(after.success && after.data.afterKey).toBe("narrator:n-2");
+	});
+
+	// Both at once has no single meaning, and the service reads `beforeKey` first — so
+	// accepting the pair would silently discard the other half of the request.
+	it("rejects both anchors together", () => {
+		const result = upsertRecentTabSchema.safeParse({
+			...base,
+			beforeKey: "narrator:n-2",
+			afterKey: "narrator:n-3",
+		});
+		expect(result.success).toBe(false);
+	});
+
+	it("stays valid with no anchor at all (the ordinary visit path)", () => {
+		const result = upsertRecentTabSchema.safeParse(base);
+		expect(result.success).toBe(true);
+		expect(result.success && result.data.beforeKey).toBeUndefined();
+		expect(result.success && result.data.afterKey).toBeUndefined();
 	});
 });

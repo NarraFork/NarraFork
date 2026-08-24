@@ -8,9 +8,21 @@ import type { TextCitation } from "@shared/citations";
 import type { LocalizedValue } from "@shared/i18n-locales";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
+import type {
+	TutorialLesson,
+	TutorialLessonSummary,
+	TutorialTrack,
+} from "@shared/tutorial/lessons";
 
 export type { TextCitation } from "@shared/citations";
 export type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
+export type {
+	TutorialCompletion,
+	TutorialLesson,
+	TutorialLessonSummary,
+	TutorialStep,
+	TutorialTrack,
+} from "@shared/tutorial/lessons";
 
 export type ChangelogEntry = {
 	version: string;
@@ -141,6 +153,42 @@ export interface LearningIndexResponse {
 
 export interface LearningSearchResponse {
 	results: LearningDocSummary[];
+}
+
+// --- Interactive tutorial ---
+//
+// The lesson/step shapes are imported from `@shared/tutorial/lessons` rather than
+// redeclared: the server serialises exactly those types, and a second copy here is
+// how a field silently stops being rendered after the shared one changes.
+
+export interface TutorialIndexResponse {
+	tracks: TutorialTrack[];
+	lessons: TutorialLessonSummary[];
+	progress: Record<string, TutorialLessonProgress>;
+	sandbox: { exists: boolean; projectId: string | null };
+}
+
+export interface TutorialLessonResponse {
+	lesson: TutorialLesson;
+	progress: TutorialLessonProgress | null;
+}
+
+export interface TutorialLessonSessionResponse {
+	lessonId: string;
+	narratorId: string;
+	projectId: string | null;
+	chapterId: string | null;
+}
+
+export interface TutorialLessonProgress {
+	completedStepIds: string[];
+	completedAt?: string;
+}
+
+export interface TutorialSandboxStatus {
+	exists: boolean;
+	projectId: string | null;
+	gitPath: string;
 }
 
 export interface SearchFallback {
@@ -448,6 +496,13 @@ export interface SubagentActivitySummary {
 	/** Effective tier, already resolving a null narrator override through the global default. */
 	reasoningEffort?: string | null;
 	latestToolCalls: SubagentToolCallHeader[];
+	/**
+	 * The child is TAKEN OVER by the user (the parent's call is blocked until the
+	 * user stops it). Carried on the snapshot because the snapshot is the reconnect
+	 * catch-up channel — without it, a client reconnecting mid-takeover would keep
+	 * rendering a plain "running" card.
+	 */
+	takenOver?: boolean;
 }
 
 export interface SubagentActivityCatchUp {
@@ -519,6 +574,18 @@ export interface BaseContentBlock {
 	 * for why it is kept out of `_metadata`.
 	 */
 	_awaitAgentNarratorId?: string;
+	/**
+	 * The subagent this call is waiting on is currently TAKEN OVER by the user, so
+	 * the call is blocked until the takeover is stopped.
+	 *
+	 * Server-DERIVED runtime state (`TAKEN_OVER_FIELD` in
+	 * server/services/await-agent-resolution.ts), deliberately kept out of
+	 * `_metadata`: it must not reach the detail classifier, which would turn it into
+	 * an extra row and grow the card. Painted as a badge in the already-fixed header
+	 * row instead. Takeover authority is in-memory server-side, so this flag simply
+	 * stops appearing after a restart.
+	 */
+	_takenOver?: boolean;
 	/** Source citations on assistant text blocks, indexed against `text`. */
 	citations?: TextCitation[];
 	[key: string]: unknown;
@@ -560,6 +627,8 @@ export interface ToolCallRecord {
 	createdAt?: string | number | null;
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
 	_subagentActivity?: SubagentActivitySummary;
+	/** See `BaseContentBlock._takenOver`. */
+	_takenOver?: boolean;
 }
 
 export type PathFlavor = "posix" | "windows";

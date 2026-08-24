@@ -1177,6 +1177,39 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		expect("reasoningEffort" in data).toBe(false);
 	});
 
+	it("flags a taken-over child from either source (block field or activity snapshot)", () => {
+		// Two channels deliver the same fact and neither is redundant: `_takenOver`
+		// comes from message load + the live patch, `activity.takenOver` from the
+		// reconnect catch-up snapshot.
+		expect(
+			subagentData({ toolName: "Task", status: "running", _takenOver: true }).isTakenOver,
+		).toBe(true);
+		expect(
+			subagentData({
+				toolName: "Task",
+				status: "running",
+				_subagentActivity: { latestToolCalls: [], model: null, takenOver: true },
+			}).isTakenOver,
+		).toBe(true);
+	});
+
+	/**
+	 * The safety gate. Takeover state is cleared inside the subagent loop at several
+	 * points that do NOT broadcast (the handoff branches in narrator-session.ts), so
+	 * a card can hold a stale `true` after its call has already finished. A finished
+	 * call is not blocked on anything, so the badge would be lying about why the
+	 * session is stuck — and a badge that lingers on completed cards is one users
+	 * learn to ignore.
+	 */
+	it("never flags a call that already finished, even with a stale flag", () => {
+		const data = subagentData({ toolName: "Task", status: "success", _takenOver: true });
+		expect("isTakenOver" in data).toBe(false);
+	});
+
+	it("omits the flag entirely when nothing reports a takeover", () => {
+		expect("isTakenOver" in subagentData({ toolName: "Task", status: "running" })).toBe(false);
+	});
+
 	it("omits prompt when inputJson carries none (no fabrication)", () => {
 		const data = subagentData({
 			toolName: "Task",

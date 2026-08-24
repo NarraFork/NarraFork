@@ -99,6 +99,11 @@ export function upsertSubagentToolCallHeader(
 		subagentNarratorId: activity?.subagentNarratorId ?? null,
 		model: normalizeSubagentModel(activity?.model),
 		...(reasoningEffort ? { reasoningEffort } : {}),
+		// This rebuilds the summary from scratch, so anything not restated here is
+		// ERASED. A child tool event knows nothing about takeover, and dropping the
+		// flag on every such event would make the badge flicker off the moment the
+		// taken-over child ran anything.
+		...(activity?.takenOver ? { takenOver: true } : {}),
 		latestToolCalls: latest.slice(-3),
 	};
 }
@@ -115,6 +120,11 @@ export function replaceSubagentActivitySnapshot(
 		subagentNarratorId: activity.subagentNarratorId ?? null,
 		model: normalizeSubagentModel(activity.model) ?? normalizeSubagentModel(previous?.model),
 		...(reasoningEffort ? { reasoningEffort } : {}),
+		// The snapshot is AUTHORITATIVE for takeover (the server reads the live
+		// in-memory Set when building it), so unlike `model` it must NOT fall back to
+		// the previous value: a snapshot arriving after the user stopped the takeover
+		// is precisely the correction this channel exists to deliver.
+		...(activity.takenOver ? { takenOver: true } : {}),
 		latestToolCalls: [],
 	};
 	for (const header of activity.latestToolCalls ?? []) {

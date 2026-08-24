@@ -1,5 +1,10 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { flush, resetSessionStoreForTest, writeSession } from "@frontend/lib/session-store";
+import {
+	flush,
+	resetSessionStoreForTest,
+	SESSION_STORE_LIMITS,
+	writeSession,
+} from "@frontend/lib/session-store";
 import { getDraftImageAttachmentKey } from "./draft-image-attachments";
 import {
 	classifyDraftRevisionConflict,
@@ -162,6 +167,45 @@ describe("local mirror size limit", () => {
 		// Writing bodies this large per keystroke is what saturated the main thread.
 		const text = "y".repeat(MAX_LOCAL_DRAFT_MIRROR_CHARS + 1);
 		expect(persistNarratorInputDraft("user-a", "narrator-1", text, 1, null)).toBe(false);
+	});
+
+	test("a typed draft survives visiting enough other narrators to overflow the cap", () => {
+		/*
+		 * The reported symptom: type into a narrator, switch narrators a few times,
+		 * come back to a BLANK composer that then "restored" an older server copy.
+		 *
+		 * Every narrator opened mirrors its draft during hydration, and for one nobody
+		 * typed into that mirror is empty. Those empty writes were the most recent, so
+		 * a recency-only key cap evicted the single mirror that held text. Hydration
+		 * then found no local base revision and — correctly, given what it could see —
+		 * took the server revision as authoritative.
+		 */
+		persistNarratorInputDraft("user-a", "narrator-typed", "text the user wrote", 5, "t5");
+		flush();
+		const cap = SESSION_STORE_LIMITS.NAMESPACE_KEY_CAPS["narrator-draft"];
+		for (let i = 0; i < cap + 4; i++) {
+			persistNarratorInputDraft("user-a", `narrator-visited-${i}`, "", 0, null);
+			flush();
+		}
+		expect(readNarratorInputDraft("user-a", "narrator-typed")).toEqual({
+			text: "text the user wrote",
+			serverRevision: 5,
+			serverUpdatedAt: "t5",
+		});
+	});
+
+	test("a cleared draft is still mirrored, so it cannot resurrect on reload", () => {
+		// The empty mirror is cheap to evict, NOT skipped: without it, hydration would
+		// find the older non-empty copy and put the cleared text back.
+		persistNarratorInputDraft("user-a", "narrator-1", "typed", 1, null);
+		flush();
+		persistNarratorInputDraft("user-a", "narrator-1", "", 2, null);
+		flush();
+		expect(readNarratorInputDraft("user-a", "narrator-1")).toEqual({
+			text: "",
+			serverRevision: 2,
+			serverUpdatedAt: null,
+		});
 	});
 
 	test("clears a smaller stored copy when the draft outgrows the limit", () => {

@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import type { DockviewApi } from "dockview-react";
+import { parseHTML } from "linkedom";
 import type { PanelDragState } from "../../lib/panel-drag";
 import type { DockviewDropTarget } from "./useDockviewDnd";
-import { canSurfaceHandleDrag, dropExistingPanel, isLocalPanelDrag } from "./useDockviewDnd";
+import {
+	canSurfaceHandleDrag,
+	DOCKVIEW_SURFACE_ATTR,
+	dropExistingPanel,
+	isLocalPanelDrag,
+	isTopmostSurface,
+} from "./useDockviewDnd";
 
 /**
  * Regression coverage for dropExistingPanel — the function that turns a resolved
@@ -263,5 +270,65 @@ describe("canSurfaceHandleDrag", () => {
 		const state = drag({ panelId: "ndock-terminal", surfaceId: "workspace:w1" });
 		expect(canSurfaceHandleDrag(state, "focus:n1", false)).toBe(false);
 		expect(canSurfaceHandleDrag(state, "focus:n1", true)).toBe(true);
+	});
+});
+
+/**
+ * Which surface owns a release point.
+ *
+ * The regression this covers: dragging a sidebar recent tab into an ALREADY OPEN
+ * workspace showed the drop indicator but did nothing on release. The drop gate
+ * asked `elementFromPoint(...)` whether the topmost element belonged to this
+ * surface — but @dnd-kit's `<DragOverlay>` is `position: fixed` with no
+ * `pointer-events: none`, so the topmost element at the release point is always
+ * the drag ghost. Every such drop was rejected, while the move handler (which has
+ * no equivalent gate) kept painting the highlight.
+ *
+ * So the gate has to skip non-surface layers yet still respect front-to-back
+ * ordering, since two surfaces can overlap on the story-network canvas and only
+ * the frontmost may act.
+ */
+function surfaceStack(html: string): { doc: Document; el: (id: string) => Element } {
+	const { document } = parseHTML(`<html><body>${html}</body></html>`);
+	return {
+		doc: document as unknown as Document,
+		el: (id: string) => {
+			const found = document.getElementById(id);
+			if (!found) throw new Error(`missing #${id}`);
+			return found as unknown as Element;
+		},
+	};
+}
+
+describe("isTopmostSurface", () => {
+	const html = `
+		<div id="ghost">tab</div>
+		<div id="front" ${DOCKVIEW_SURFACE_ATTR}="chap_A"><div id="frontInner"></div></div>
+		<div id="back" ${DOCKVIEW_SURFACE_ATTR}="chap_B"><div id="backInner"></div></div>
+	`;
+
+	test("a drag ghost above the surface does not block the drop (the regression)", () => {
+		const { el } = surfaceStack(html);
+		// Front-to-back: ghost first (it rides under the pointer), then the surface.
+		expect(isTopmostSurface(el("front"), [el("ghost"), el("frontInner"), el("front")])).toBe(true);
+	});
+
+	test("the frontmost surface wins when two surfaces overlap", () => {
+		const { el } = surfaceStack(html);
+		const stack = [el("ghost"), el("frontInner"), el("front"), el("backInner"), el("back")];
+		expect(isTopmostSurface(el("front"), stack)).toBe(true);
+		// The one behind must NOT also act, or the same drop lands twice.
+		expect(isTopmostSurface(el("back"), stack)).toBe(false);
+	});
+
+	test("a point over no surface at all is rejected", () => {
+		const { el } = surfaceStack(html);
+		expect(isTopmostSurface(el("front"), [el("ghost")])).toBe(false);
+		expect(isTopmostSurface(el("front"), [])).toBe(false);
+	});
+
+	test("a descendant of the surface counts as that surface", () => {
+		const { el } = surfaceStack(html);
+		expect(isTopmostSurface(el("front"), [el("frontInner")])).toBe(true);
 	});
 });

@@ -229,10 +229,33 @@ export const recentTabSchema = z.object({
 	dirSortOrder: z.number().int().min(0).max(RECENT_TABS_STORAGE_LIMIT).optional(),
 });
 
-export const upsertRecentTabSchema = recentTabSchema.extend({
-	/** When true, only update an existing tab — skip if not already present. */
-	updateOnly: z.boolean().optional(),
-});
+export const upsertRecentTabSchema = recentTabSchema
+	.extend({
+		/** When true, only update an existing tab — skip if not already present. */
+		updateOnly: z.boolean().optional(),
+		/**
+		 * Where to place the tab, for a drop that both creates and positions it.
+		 *
+		 * Without these, "drag a narrator into the sidebar at this spot" needs an upsert
+		 * followed by a move: two revisions, and between them the tab is visible at the
+		 * default insertion point before jumping to where it was aimed. The delta's upsert
+		 * operation already carries these anchors and clients already honour them, so the
+		 * whole gesture fits in one revision.
+		 *
+		 * An anchor that no longer exists is ignored rather than rejected (the client's
+		 * view can lag a removal); see `applyRecentTabUpsert`.
+		 */
+		beforeKey: z.string().min(1).max(100).optional(),
+		afterKey: z.string().min(1).max(100).optional(),
+	})
+	.superRefine((value, ctx) => {
+		if (value.beforeKey !== undefined && value.afterKey !== undefined) {
+			ctx.addIssue({
+				code: "custom",
+				message: "Only one of beforeKey or afterKey may be given",
+			});
+		}
+	});
 
 export const batchUpsertRecentTabsSchema = z.object({
 	tabs: z.array(upsertRecentTabSchema).min(1).max(RECENT_TABS_WS_BATCH_SIZE),

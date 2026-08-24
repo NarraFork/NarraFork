@@ -761,7 +761,7 @@
 	"minPruneRatio": "最小裁剪比例",
 	"minPruneRatioDesc": "每次裁剪至少裁掉剩余可裁剪消息的该比例。值越大单次裁剪幅度越大、裁剪次数越少，可减少 prompt 缓存失效、降低计费；代价是单次丢弃更多上下文。默认 30%。",
 	"queueDuringCompaction": "压缩期间排队发送",
-	"queueDuringCompactionDesc": "叙述者正在进行上下文压缩时，新发送的消息会等压缩完成后再发送，而不是立即发送。默认关闭（不等待）。",
+	"queueDuringCompactionDesc": "叙述者正在进行上下文压缩时，新发送的消息进入队列（可编辑、可取消），压缩完成后自动开始该轮次；关闭时立即发送，与压缩并发。无论开关如何，都可以在发送菜单中选择立即执行来插队。默认开启。",
 	"contextThresholdsStandard": "标准 (≤600k)",
 	"contextThresholdsLarge": "大窗口 (>600k)",
 	"pruneStart": "开始裁剪",

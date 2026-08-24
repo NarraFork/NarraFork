@@ -41,7 +41,9 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
 	AWAIT_AGENT_RESOLVED_FIELD,
 	attachAwaitAgentNarratorIds,
+	attachTakenOverFlags,
 	resolveAwaitAgentIdsForToolCalls,
+	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import {
 	ensureRefsCoverMessage,
@@ -66,6 +68,9 @@ import {
 	revertPatchForToolUse,
 	revertPatchForToolUses,
 } from "./snapshot-revert";
+// Pure in-memory state module (no imports of its own), so importing it here
+// cannot widen this file's already-delicate import cycle with narrator-service.
+import { isTakenOver, listTakenOverSubagents } from "./subagent-takeover";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -1098,6 +1103,17 @@ export interface SubagentActivity {
 	/** Effective tier used by the subagent, including the global default when stored override is null. */
 	reasoningEffort: string | null;
 	latestToolCalls: SubagentActivityToolCall[];
+	/**
+	 * The child is currently TAKEN OVER by the user, so the parent's tool call is
+	 * blocked until the user stops it (`subagent-takeover.ts`).
+	 *
+	 * Carried on the activity snapshot because that snapshot is the reconnect
+	 * catch-up channel: without it a client that reconnects mid-takeover would keep
+	 * showing a plain "running" card, which is exactly the stalled-and-silent state
+	 * the flag exists to surface. Absent (rather than `false`) in the normal case so
+	 * the payload does not grow for every card.
+	 */
+	takenOver?: boolean;
 }
 
 export interface SubagentActivityCatchUp {
@@ -1264,6 +1280,9 @@ async function buildSubagentActivities(
 			model: owner.model,
 			reasoningEffort: effectiveReasoningEffort ?? null,
 			latestToolCalls: toolCallsByNarrator.get(owner.subagentNarratorId) ?? [],
+			// Synchronous in-memory read (no query); omitted when false so the common
+			// snapshot stays the same size it was.
+			...(isTakenOver(owner.subagentNarratorId) ? { takenOver: true } : {}),
 		});
 	}
 	return activities;
@@ -1388,10 +1407,39 @@ async function buildTreeFromTopLevelRefs(
 	);
 	// A still-waiting Await knows its target only as a selector; resolve it so the
 	// row can open the child's session before the wait returns.
-	return attachAwaitAgentNarratorIds(
-		enriched,
-		await resolveAwaitAgentIdsForMessages([...topMessages, ...childMessages]),
+	const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMessages, ...childMessages]);
+	return attachTakenOverFlags(
+		attachAwaitAgentNarratorIds(enriched, awaitAgentIds),
+		collectTakenOverToolUseIds(activities, awaitAgentIds),
 	);
+}
+
+/**
+ * The tool calls on this page whose target subagent is currently taken over.
+ *
+ * Reuses facts ALREADY in hand — no extra query:
+ *   - `activities`   → an Agent/Task/Send card's child narrator id
+ *   - `awaitAgentIds`→ a running `Await({type:"agent"})`'s resolved child id
+ *
+ * Takeover authority is the in-memory Set (`subagent-takeover.ts`), so the
+ * membership test is synchronous. A finished Await needs no flag: its output
+ * already states `taken_over` in words.
+ */
+function collectTakenOverToolUseIds(
+	activities: ReadonlyMap<string, SubagentActivity>,
+	awaitAgentIds: ReadonlyMap<string, string>,
+): Set<string> {
+	const flagged = new Set<string>();
+	const takenOver = new Set(listTakenOverSubagents());
+	if (takenOver.size === 0) return flagged;
+	for (const [toolUseId, activity] of activities) {
+		const child = activity.subagentNarratorId;
+		if (child && takenOver.has(child)) flagged.add(toolUseId);
+	}
+	for (const [toolUseId, child] of awaitAgentIds) {
+		if (takenOver.has(child)) flagged.add(toolUseId);
+	}
+	return flagged;
 }
 
 /**
@@ -1435,7 +1483,12 @@ async function resolveAwaitAgentIdsForMessages(
  * import cycle with `narrator-service` (importing it from a test would evaluate
  * that cycle and fail at module init).
  */
-export { AWAIT_AGENT_RESOLVED_FIELD, attachAwaitAgentNarratorIds };
+export {
+	AWAIT_AGENT_RESOLVED_FIELD,
+	attachAwaitAgentNarratorIds,
+	attachTakenOverFlags,
+	TAKEN_OVER_FIELD,
+};
 
 // ── narratorMessages object ────────────────────────────────────────────────
 
@@ -2505,18 +2558,22 @@ export const narratorMessageQueries = {
 			}
 		}
 
-		attachSubagentActivities(
-			topMsgs,
-			await loadSubagentActivitiesForToolUseIds([...newTopSubagentToolUseIdSet]),
-		);
+		const topActivities = await loadSubagentActivitiesForToolUseIds([
+			...newTopSubagentToolUseIdSet,
+		]);
+		attachSubagentActivities(topMsgs, topActivities);
 		const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMsgs, ...childMsgs]);
-		const tree = attachAwaitAgentNarratorIds(
-			enrichToolUseBlocks(
-				filterExitPlanBeforePlanCompact(
-					truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
+		const takenOverToolUseIds = collectTakenOverToolUseIds(topActivities, awaitAgentIds);
+		const tree = attachTakenOverFlags(
+			attachAwaitAgentNarratorIds(
+				enrichToolUseBlocks(
+					filterExitPlanBeforePlanCompact(
+						truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
+					),
 				),
+				awaitAgentIds,
 			),
-			awaitAgentIds,
+			takenOverToolUseIds,
 		);
 
 		const newTopToolUseIdSet = new Set(newTopToolUseIds);
@@ -2537,9 +2594,12 @@ export const narratorMessageQueries = {
 
 		return {
 			topLevel: tree,
-			orphanChildren: attachAwaitAgentNarratorIds(
-				enrichToolUseBlocks(truncateToolIO(orphanChildren)),
-				awaitAgentIds,
+			orphanChildren: attachTakenOverFlags(
+				attachAwaitAgentNarratorIds(
+					enrichToolUseBlocks(truncateToolIO(orphanChildren)),
+					awaitAgentIds,
+				),
+				takenOverToolUseIds,
 			),
 			subagentActivities,
 			hitLimit: false,

@@ -14,6 +14,7 @@ import {
 	getUpdateDirectory,
 	getUpdateInstructions,
 	getUpdateStatus,
+	shutdownForManualUpdate,
 	type UpdateProgress,
 } from "../services/update-service";
 
@@ -186,4 +187,21 @@ updateRoutes.post("/apply", requireAuth, requireAdmin, async (c) => {
 updateRoutes.post("/cancel", requireAuth, requireAdmin, (c) => {
 	const { cancelled, status } = cancelPreparedUpdate("Cancelled from the update dialog");
 	return c.json({ success: true, cancelled, ...status });
+});
+
+/**
+ * POST /api/update/shutdown
+ * Stop this server now so the administrator can start the downloaded version themselves.
+ *
+ * The counterpart to `/apply` for users who do not want to wait for narrator work to drain. The
+ * response is returned first and teardown begins a moment later, because teardown terminates
+ * in-flight requests — including this one.
+ *
+ * Deliberately not idempotent-safe against concurrent callers in any special way: a second
+ * request arriving during the grace window simply schedules another shutdown, and
+ * `performGracefulShutdown` already collapses that onto the single in-flight teardown.
+ */
+updateRoutes.post("/shutdown", requireAuth, requireAdmin, (c) => {
+	const result = shutdownForManualUpdate({ reason: "operator_requested" });
+	return c.json(result, result.success ? 200 : 409);
 });

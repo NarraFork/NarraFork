@@ -26,8 +26,10 @@ export {
 } from "./drop-intent";
 export { swapPanels } from "./panel-swap";
 export {
+	DOCKVIEW_SURFACE_ATTR,
 	type DockviewDropTarget,
 	isLocalPanelDrag,
+	isTopmostSurface,
 	type UseDockviewDndOptions,
 	type UseDockviewDndResult,
 	useDockviewDnd,

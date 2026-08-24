@@ -39,6 +39,8 @@
  *   - a byte budget enforced on WRITE, with LRU eviction of this module's own
  *     namespaces (never of keys it does not own);
  *   - per-namespace key caps, so one unbounded id space cannot starve others;
+ *   - a two-tier eviction order, so an entry that holds NOTHING the user typed is
+ *     never the reason one that does gets dropped (see `SessionWritePriority`);
  *   - coalesced writes: a hot key is written at most once per flush window, and
  *     always flushed on `pagehide`/`visibilitychange` so nothing is lost;
  *   - quota failure is HANDLED (evict, retry once, then report) instead of
@@ -110,16 +112,61 @@ const FLUSH_DELAY_MS = 400;
 
 const KEY_PREFIX = "nf.s.";
 
+/**
+ * How much a caller stands to lose if this entry is evicted.
+ *
+ * Recency alone is the wrong eviction order here, because the hot path writes
+ * entries that carry NOTHING worth keeping. Every narrator a tab opens mirrors
+ * its draft on hydration, and for an untouched narrator that mirror is the empty
+ * string — yet it took a slot, and being the most recent write it outranked a
+ * draft the user had actually typed. Eight visited narrators later, the typed one
+ * was gone, and hydration then "restored" the server copy over it.
+ *
+ * `"disposable"` says: this entry is reconstructible from a source of truth (or
+ * holds nothing at all), so evict it before anything the user authored. It is a
+ * property of the VALUE, not of the namespace — the same key is disposable while
+ * empty and durable once typed into.
+ */
+export type SessionWritePriority = "durable" | "disposable";
+
 interface OwnedEntry {
 	namespace: SessionNamespace;
 	chars: number;
-	/** Monotonic touch counter — the LRU ordering. */
+	/** Monotonic touch counter — the LRU ordering WITHIN a priority tier. */
 	touched: number;
+	/** Eviction tier; disposable entries are dropped before durable ones. */
+	priority: SessionWritePriority;
 }
 
 /** Metadata for owned keys. Mirrors what is in storage; never the source of truth. */
 const owned = new Map<string, OwnedEntry>();
-const pending = new Map<string, string | null>();
+
+interface PendingWrite {
+	/** null means "remove this key". */
+	value: string | null;
+	priority: SessionWritePriority;
+}
+
+const pending = new Map<string, PendingWrite>();
+
+/**
+ * Eviction order: disposable entries first, then least-recently-touched.
+ *
+ * Sorting by priority BEFORE recency is the whole fix. Ordering by `touched`
+ * alone let a freshly-written empty mirror protect itself and evict a typed
+ * draft, which is invisible at the storage layer and only shows up as a composer
+ * that blanked itself after a narrator switch.
+ */
+function evictionOrder(a: OwnedEntry, b: OwnedEntry): number {
+	if (a.priority !== b.priority) return a.priority === "disposable" ? -1 : 1;
+	return a.touched - b.touched;
+}
+
+function evictionCandidates(protectedKey: string): Array<[string, OwnedEntry]> {
+	return [...owned.entries()]
+		.filter(([key]) => key !== protectedKey)
+		.sort((a, b) => evictionOrder(a[1], b[1]));
+}
 
 let totalChars = 0;
 let touchCounter = 0;
@@ -163,7 +210,17 @@ function adoptExistingEntries(area: Storage): void {
 		}
 		const value = area.getItem(key);
 		if (value === null) continue;
-		owned.set(key, { namespace, chars: value.length, touched: ++touchCounter });
+		// Adopted entries are DURABLE. The priority a previous page lifecycle wrote
+		// with is not stored (it is a write-time hint, not part of the value), and
+		// guessing "disposable" would make a reload the thing that discards a typed
+		// draft — the exact failure this tier exists to prevent. A durable guess only
+		// costs one eviction round, and the next write restates the real priority.
+		owned.set(key, {
+			namespace,
+			chars: value.length,
+			touched: ++touchCounter,
+			priority: "durable",
+		});
 		totalChars += value.length;
 	}
 	for (const key of stale) {
@@ -212,7 +269,7 @@ function scheduleFlush(): void {
 }
 
 /**
- * Evict least-recently-touched owned entries until `needed` characters fit.
+ * Evict owned entries until `needed` characters fit — disposable ones first.
  *
  * Only touches keys in `owned`, so a sweep can never remove state belonging to
  * another feature. `protectedKey` is the key being written: evicting it to make
@@ -220,9 +277,7 @@ function scheduleFlush(): void {
  */
 function evictUntilFits(area: Storage, needed: number, protectedKey: string): void {
 	if (totalChars + needed <= TOTAL_BUDGET_CHARS) return;
-	const candidates = [...owned.entries()]
-		.filter(([key]) => key !== protectedKey)
-		.sort((a, b) => a[1].touched - b[1].touched);
+	const candidates = evictionCandidates(protectedKey);
 	for (const [key, entry] of candidates) {
 		if (totalChars + needed <= TOTAL_BUDGET_CHARS) return;
 		try {
@@ -242,13 +297,12 @@ function evictUntilFits(area: Storage, needed: number, protectedKey: string): vo
  * Unlike `evictUntilFits` this consults NO budget: it is reached only after the
  * browser rejected a write that our accounting believed would fit, so any
  * budget-relative target is by definition already satisfied and would evict
- * nothing. It releases a fraction of the owned entries, oldest first, which is
- * enough to let one retry through while leaving the active working set intact.
+ * nothing. It releases a fraction of the owned entries — disposable first, then
+ * oldest — which is enough to let one retry through while leaving the active
+ * working set intact.
  */
 function evictLeastRecentlyUsed(area: Storage, protectedKey: string): void {
-	const candidates = [...owned.entries()]
-		.filter(([key]) => key !== protectedKey)
-		.sort((a, b) => a[1].touched - b[1].touched);
+	const candidates = evictionCandidates(protectedKey);
 	if (candidates.length === 0) return;
 	// Half the owned entries, and never fewer than one: a single oversized
 	// neighbour is a common cause, and dropping everything would throw away drafts
@@ -266,16 +320,23 @@ function evictLeastRecentlyUsed(area: Storage, protectedKey: string): void {
 	}
 }
 
-/** Enforce a namespace's key cap by dropping its oldest entries. */
+/**
+ * Enforce a namespace's key cap, dropping disposable entries before durable ones.
+ *
+ * This is the cap that actually bit: `narrator-draft` holds 8 keys, and every
+ * narrator a tab opens mirrors its draft — empty for the ones nobody typed in.
+ * Ordered by recency alone, those empty mirrors were the NEWEST entries and so
+ * evicted the one draft that had text in it.
+ */
 function enforceNamespaceCap(
 	area: Storage,
 	namespace: SessionNamespace,
 	protectedKey: string,
 ): void {
 	const cap = NAMESPACE_KEY_CAPS[namespace];
-	const entries = [...owned.entries()]
-		.filter(([key, entry]) => entry.namespace === namespace && key !== protectedKey)
-		.sort((a, b) => a[1].touched - b[1].touched);
+	const entries = evictionCandidates(protectedKey).filter(
+		([, entry]) => entry.namespace === namespace,
+	);
 	// `entries` excludes the protected key, so the cap compares against cap - 1.
 	let excess = entries.length - (cap - 1);
 	for (const [key, entry] of entries) {
@@ -300,7 +361,12 @@ function enforceNamespaceCap(
  * but it drives `quotaFailures`, which turns a previously invisible failure into
  * something `sessionStoreStats()` can report.
  */
-function writeThrough(area: Storage, key: string, value: string | null): boolean {
+function writeThrough(
+	area: Storage,
+	key: string,
+	value: string | null,
+	priority: SessionWritePriority,
+): boolean {
 	const existing = owned.get(key);
 
 	if (value === null) {
@@ -326,7 +392,7 @@ function writeThrough(area: Storage, key: string, value: string | null): boolean
 	const commit = (): boolean => {
 		try {
 			area.setItem(key, value);
-			owned.set(key, { namespace, chars: value.length, touched: ++touchCounter });
+			owned.set(key, { namespace, chars: value.length, touched: ++touchCounter, priority });
 			totalChars = Math.max(0, totalChars - (existing?.chars ?? 0)) + value.length;
 			return true;
 		} catch {
@@ -380,7 +446,7 @@ export function flush(): void {
 	ensureInitialised(area);
 	const queue = [...pending.entries()];
 	pending.clear();
-	for (const [key, value] of queue) writeThrough(area, key, value);
+	for (const [key, write] of queue) writeThrough(area, key, write.value, write.priority);
 }
 
 /**
@@ -394,7 +460,8 @@ export function readSession(namespace: SessionNamespace, id: string): string | n
 	if (!area) return null;
 	ensureInitialised(area);
 	const key = physicalKey(namespace, id);
-	if (pending.has(key)) return pending.get(key) ?? null;
+	const queued = pending.get(key);
+	if (queued !== undefined) return queued.value;
 	const value = area.getItem(key);
 	if (value === null) return null;
 	const entry = owned.get(key);
@@ -402,7 +469,15 @@ export function readSession(namespace: SessionNamespace, id: string): string | n
 	// set and must not be the next eviction victim.
 	if (entry) entry.touched = ++touchCounter;
 	else {
-		owned.set(key, { namespace, chars: value.length, touched: ++touchCounter });
+		// Same reasoning as `adoptExistingEntries`: a value found in storage with no
+		// metadata predates this page lifecycle, and assuming it is disposable would
+		// let a reload discard authored text.
+		owned.set(key, {
+			namespace,
+			chars: value.length,
+			touched: ++touchCounter,
+			priority: "durable",
+		});
 		totalChars += value.length;
 	}
 	return value;
@@ -411,8 +486,19 @@ export function readSession(namespace: SessionNamespace, id: string): string | n
 /**
  * Queue a value for storage. Oversized values are REMOVED rather than stored, so
  * a body that grows past the cap cannot leave a truncated stale copy behind.
+ *
+ * `priority` defaults to `"durable"`, so a caller that never thinks about it gets
+ * the safe tier. Pass `"disposable"` only for a value that is reconstructible
+ * from a source of truth or carries nothing the user produced — an empty draft
+ * mirror being the case this exists for. Marking authored text disposable would
+ * silently make it the first thing evicted.
  */
-export function writeSession(namespace: SessionNamespace, id: string, value: string): void {
+export function writeSession(
+	namespace: SessionNamespace,
+	id: string,
+	value: string,
+	priority: SessionWritePriority = "durable",
+): void {
 	const area = storage();
 	if (!area) return;
 	ensureInitialised(area);
@@ -420,7 +506,7 @@ export function writeSession(namespace: SessionNamespace, id: string, value: str
 		removeSession(namespace, id);
 		return;
 	}
-	pending.set(physicalKey(namespace, id), value);
+	pending.set(physicalKey(namespace, id), { value, priority });
 	scheduleFlush();
 }
 
@@ -429,7 +515,9 @@ export function removeSession(namespace: SessionNamespace, id: string): void {
 	const area = storage();
 	if (!area) return;
 	ensureInitialised(area);
-	pending.set(physicalKey(namespace, id), null);
+	// A removal frees space, so its own tier never decides anything; `durable`
+	// keeps the queue entry shape uniform.
+	pending.set(physicalKey(namespace, id), { value: null, priority: "durable" });
 	scheduleFlush();
 }
 

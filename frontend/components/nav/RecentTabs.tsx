@@ -20,6 +20,7 @@ import {
 	directoryRowId,
 	directoryRowKeyBlock,
 	directoryRowSortableIds,
+	directoryRowSortId,
 	groupRecentTabsByDirectory,
 	moveDirectoryRow,
 	type RecentTabRow,
@@ -86,6 +87,7 @@ import { useFsRevealCapability } from "../../hooks/usePlatform";
 import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
 import {
 	addRecentTab,
+	addRecentTabOrThrow,
 	addRecentTabsBatch,
 	applyRecentTabMove,
 	applyRecentTabsDelta,
@@ -120,6 +122,9 @@ import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { queuePendingPanel } from "../narrator/workspace/dockview-layout";
 import { UserAvatar } from "../UserAvatar";
 import { RecentTabDirectoryRow, type RecentTabDirectoryRowProps } from "./RecentTabDirectoryRow";
+import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
+import type { RecentTabDropRow, RecentTabDropTarget } from "./recent-tab-drop-target";
+import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 
 const CreateNarratorModal = React.lazy(() =>
 	import("../narrator/CreateNarratorModal").then((m) => ({
@@ -255,6 +260,52 @@ export function classifySwipeRelease(swipeX: number, canPin: boolean): SwipeRele
  */
 export function clampSwipeTravel(dx: number, canPin: boolean): number {
 	return canPin ? dx : Math.max(0, dx);
+}
+
+/**
+ * Whether a scroll container may auto-scroll for the current pointer position.
+ *
+ * dnd-kit's auto-scroller decides the VERTICAL direction from the activation rect's
+ * `top`/`bottom` only (`getScrollDirectionAndSpeed`), so a pointer that has left the
+ * sidebar horizontally still drives the tab list as long as its height falls inside the
+ * container's threshold band. That is wrong once the pointer is over the narrator /
+ * workspace surface: the list scrolls under a drag that is no longer about ordering, and
+ * the drop target keeps sliding away.
+ *
+ * So the horizontal test that the built-in vertical logic omits is added here: the
+ * container may only scroll while the pointer is inside its own column.
+ *
+ * Returns true when the pointer position is unknown — keyboard-initiated drags and the
+ * frames before the first move have no coordinates, and blocking them would disable
+ * auto-scroll outright rather than scope it.
+ */
+export function autoScrollAllowedForPointer(
+	pointerX: number | null,
+	rect: { left: number; right: number },
+): boolean {
+	if (pointerX === null) return true;
+	return pointerX >= rect.left && pointerX <= rect.right;
+}
+
+/**
+ * Horizontal band that a scroll container's auto-scroll is allowed in.
+ *
+ * The container itself is the inner `overflow:auto` box, which sits inside the navbar's
+ * horizontal padding. Gating on its own rect would leave that padding as a dead strip
+ * where a drag still inside the sidebar stops scrolling. So the enclosing `<nav>` is
+ * preferred when there is one, and the element's own rect is the fallback for any
+ * scroll container outside the navbar.
+ */
+function autoScrollGateRect(element: Element): { left: number; right: number } {
+	const nav = element.closest("nav");
+	return (nav ?? element).getBoundingClientRect();
+}
+
+/** Viewport x of a drag's activator event, or null for non-pointer activations. */
+function pointerXFromActivatorEvent(activatorEvent: Event): number | null {
+	const e = activatorEvent as MouseEvent | TouchEvent;
+	if ("clientX" in e) return e.clientX;
+	return e.touches?.[0]?.clientX ?? null;
 }
 const PREFETCH_QUERY_GC_TIME_MS = 5 * 60_000;
 
@@ -891,6 +942,30 @@ export function RecentTabList({
 		useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 5 } }),
 	);
 
+	/**
+	 * Viewport x of the pointer for the in-flight drag, or null when unknown.
+	 *
+	 * A ref rather than state because it is written on every pointer move and only read
+	 * from `canScroll` below — re-rendering the whole tab list per frame is exactly what
+	 * this file avoids elsewhere.
+	 */
+	const dragPointerXRef = useRef<number | null>(null);
+
+	/**
+	 * Scope auto-scroll to the sidebar column.
+	 *
+	 * Without this the tab list keeps scrolling after the pointer has moved onto the
+	 * narrator / workspace area, because dnd-kit derives the vertical scroll direction
+	 * from the pointer's height alone. See `autoScrollAllowedForPointer`.
+	 */
+	const autoScrollOptions = useMemo(
+		() => ({
+			canScroll: (element: Element) =>
+				autoScrollAllowedForPointer(dragPointerXRef.current, autoScrollGateRect(element)),
+		}),
+		[],
+	);
+
 	// Height of the workspace group (header + children) measured on drag start.
 	// Applied to the header's sortable wrapper when isDragging so dnd-kit reserves
 	// the full group height as the gap placeholder.
@@ -912,6 +987,10 @@ export function RecentTabList({
 			const activeId = event.active.id as string;
 			setDraggingTabId(activeId);
 			setActiveGroup(group);
+			// Seed the auto-scroll gate here, not only in onDragMove: the body below
+			// returns early for tabs with no narrator, and auto-scroll can already run
+			// on the frames before the first move event.
+			dragPointerXRef.current = pointerXFromActivatorEvent(event.activatorEvent);
 
 			const items = group === "pinned" ? pinnedItemsRef.current : unpinnedItemsRef.current;
 
@@ -965,12 +1044,16 @@ export function RecentTabList({
 		const me = event.activatorEvent as MouseEvent | TouchEvent;
 		const baseX = "clientX" in me ? me.clientX : (me.touches?.[0]?.clientX ?? 0);
 		const baseY = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
+		// Feed the auto-scroll gate before moving the panel-drag singleton: dnd-kit runs
+		// its auto-scroll effect after this callback, so the x it reads is this frame's.
+		dragPointerXRef.current = baseX + event.delta.x;
 		moveDrag(baseX + event.delta.x, baseY + event.delta.y);
 	}, []);
 
 	// After a drop, suppress all sortable transitions for one frame so the
 	// layout snaps into place without any sliding animation.
 	const clearDragState = useCallback(() => {
+		dragPointerXRef.current = null;
 		setDropSnap(true);
 		setDraggingTabId(null);
 		setWsGroupHeight(null);
@@ -1456,6 +1539,7 @@ export function RecentTabList({
 		const activeId = String(event.active.id);
 		setDirDraggingId(activeId);
 		dirDragDirectionRef.current = "down";
+		dragPointerXRef.current = pointerXFromActivatorEvent(event.activatorEvent);
 		// Bridge into the workspace-panel drag singleton, same as the flat handler.
 		const tab = findDirectoryRowTab(directoryRowsRef.current, activeId);
 		const nId =
@@ -1473,6 +1557,7 @@ export function RecentTabList({
 
 	const handleDirectoryDragCancel = useCallback(() => {
 		endDrag();
+		dragPointerXRef.current = null;
 		setDirDraggingId(null);
 		setOptimisticTabs(null);
 	}, []);
@@ -1484,6 +1569,7 @@ export function RecentTabList({
 				justDragged = false;
 			}, 0);
 			endDrag();
+			dragPointerXRef.current = null;
 			setDirDraggingId(null);
 
 			const { active, over } = event;
@@ -1574,28 +1660,30 @@ export function RecentTabList({
 		[qc, t],
 	);
 
-	if (topLevel.length === 0) {
-		if (sectionState.isLoading) {
-			return (
-				<Center py="xs">
-					<Loader size="xs" />
-				</Center>
-			);
-		}
-		if (sectionState.isError) {
-			return (
-				<Stack gap={2} py={4} align="center">
-					<Text size="xs" c="red">
-						{t("recentTabsSyncError")}
-					</Text>
-					<Button size="compact-xs" variant="subtle" onClick={sectionState.retry}>
-						{t("retryRecentTabs")}
-					</Button>
-				</Stack>
-			);
-		}
-		return null;
-	}
+	/**
+	 * The empty-section body, or null when there are tabs to render.
+	 *
+	 * Computed rather than returned early: the external-drop hook below must run on every
+	 * render (rules of hooks), and an EMPTY section is precisely a state that has to accept
+	 * a drop — a fresh install or a just-cleared sidebar is where dragging a narrator in is
+	 * most useful. Returning before the hook would have made those the only cases it never
+	 * armed for.
+	 */
+	const emptyBody =
+		topLevel.length > 0 ? null : sectionState.isLoading ? (
+			<Center py="xs">
+				<Loader size="xs" />
+			</Center>
+		) : sectionState.isError ? (
+			<Stack gap={2} py={4} align="center">
+				<Text size="xs" c="red">
+					{t("recentTabsSyncError")}
+				</Text>
+				<Button size="compact-xs" variant="subtle" onClick={sectionState.retry}>
+					{t("retryRecentTabs")}
+				</Button>
+			</Stack>
+		) : null;
 
 	// The tab being dragged (may be a workspace header or a child).
 	const draggingTab = draggingTabId
@@ -1617,6 +1705,7 @@ export function RecentTabList({
 			<DndContext
 				sensors={sensors}
 				collisionDetection={collisionDetection}
+				autoScroll={autoScrollOptions}
 				onDragStart={onDragStart}
 				onDragMove={handleDragMove}
 				onDragEnd={handleDragEnd}
@@ -1695,7 +1784,15 @@ export function RecentTabList({
 					})}
 				</SortableContext>
 				{/* Floating overlay while dragging — workspace shows the whole group, others show a single tab. */}
-				<DragOverlay dropAnimation={dropAnimation}>
+				{/*
+				 * `pointerEvents: none` is load-bearing, not cosmetic. dnd-kit renders this
+				 * ghost as `position: fixed` under the pointer and tracks the gesture on
+				 * document, so it never needs hits itself — but while it is hittable it is
+				 * the topmost element at every release point, and the drop targets that ask
+				 * the DOM "what is under the pointer" (dockview surfaces, the graph canvas)
+				 * all see the ghost instead of themselves.
+				 */}
+				<DragOverlay dropAnimation={dropAnimation} style={{ pointerEvents: "none" }}>
 					{draggingTab && activeGroup === group ? (
 						draggingTab.type === "workspace" ? (
 							<DragOverlayWorkspaceItem
@@ -1832,6 +1929,131 @@ export function RecentTabList({
 		});
 	};
 
+	// ── External drop: a narrator dragged in from the list page ────────────────
+	//
+	// Not part of the DndContexts above: their sortable ids come from the tabs that already
+	// exist, so a narrator that is not a tab yet can never be an `active` item there. This
+	// rides the `panel-drag` singleton instead (see `useRecentTabExternalDrop`).
+
+	const listBoxRef = useRef<HTMLDivElement | null>(null);
+
+	/**
+	 * Measure the rendered rows in viewport coordinates.
+	 *
+	 * Read from the DOM rather than computed from the tab arrays: only the DOM knows the
+	 * real geometry after collapsed directories, workspace children and variable row
+	 * heights. `data-tab-sort-id` is already on every row variant, so no new markup is
+	 * needed — and a row that did not render simply is not measured, which is the correct
+	 * answer for a collapsed group's members.
+	 */
+	const measureDropRows = useCallback((): RecentTabDropRow[] => {
+		const container = listBoxRef.current;
+		if (!container) return [];
+		const pinnedKeys = new Set(pinnedItemsRef.current.map(tabSortId));
+		const blockByRowId = new Map<string, string[]>();
+		for (const row of directoryRowsRef.current) {
+			blockByRowId.set(directoryRowSortId(row), directoryRowKeyBlock(row));
+		}
+		const tabsById = new Map(
+			[...pinnedItemsRef.current, ...unpinnedItemsRef.current].map((tab) => [tabSortId(tab), tab]),
+		);
+		const rows: RecentTabDropRow[] = [];
+		for (const element of container.querySelectorAll<HTMLElement>("[data-tab-sort-id]")) {
+			const key = element.dataset.tabSortId;
+			if (!key) continue;
+			const rect = element.getBoundingClientRect();
+			// A zero-height row is a collapsed workspace child (squashed during an internal
+			// drag). Including it would give the pointer a target with no area, and several
+			// coincident ones make the resolved slot arbitrary.
+			if (rect.height <= 0) continue;
+			const tab = tabsById.get(key);
+			const directoryBlock = blockByRowId.get(key);
+			// A directory row has no tab of its own; its members' keys ARE its block. Members
+			// rendered under an expanded header share that block so an anchor next to any of
+			// them lands outside the group rather than splitting it.
+			const memberBlock = directoryRowsRef.current
+				.filter((row) => row.kind === "directory")
+				.find((row) => row.children.some((child) => tabSortId(child) === key));
+			const keyBlock = directoryBlock ??
+				(memberBlock ? directoryRowKeyBlock(memberBlock) : undefined) ?? [key];
+			rows.push({
+				key,
+				top: rect.top,
+				bottom: rect.bottom,
+				pinned: pinnedKeys.has(key),
+				...(tab ? { workspaceId: workspaceGroupId(tab) ?? undefined } : {}),
+				keyBlock,
+			});
+		}
+		return rows;
+	}, []);
+
+	const handleExternalDrop = useCallback(
+		({
+			narratorId,
+			title,
+			target,
+		}: {
+			narratorId: string;
+			title: string;
+			target: RecentTabDropTarget;
+		}) => {
+			const cached = findCachedNarratorSummary(qc, narratorId);
+			const tab = {
+				type: "narrator" as const,
+				id: narratorId,
+				title: cached?.title || title || "",
+				// `cwd` becomes the tab's subtitle, which is also what directory grouping keys
+				// on — and it is NOT a runtime field, so nothing backfills it later. A tab
+				// created without it stays subtitle-less (and ungroupable) until the narrator
+				// is visited, which is why the lookup below also reads the paginated cache.
+				...(cached?.cwd ? { subtitle: cached.cwd } : {}),
+				...(cached?.status ? { status: cached.status } : {}),
+			};
+
+			if (target.kind === "workspace") {
+				const workspaceId = target.workspaceId;
+				void addRecentTabOrThrow({ ...tab, workspaceId })
+					.then(() => {
+						// Hand the narrator to the workspace as a pending panel and open it —
+						// the same route "+ add narrator" takes, so the sidebar never has to
+						// touch the layout serialization format.
+						queuePendingPanel(workspaceId, { panelType: "narrator", narratorId });
+						navigate({ to: "/narrators/workspace/$workspaceId", params: { workspaceId } });
+						onNavigate?.();
+					})
+					.catch(() => {
+						notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
+					});
+				return;
+			}
+
+			// An empty section has no anchor to name; the default insertion point in an empty
+			// list is the first slot, which is the only position there is.
+			const anchor =
+				target.kind === "empty"
+					? undefined
+					: target.kind === "before"
+						? { beforeKey: target.key }
+						: { afterKey: target.key };
+			void addRecentTabOrThrow(tab, anchor).catch(() => {
+				notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
+			});
+		},
+		[navigate, onNavigate, qc, t],
+	);
+
+	const externalDrop = useRecentTabExternalDrop({
+		containerRef: listBoxRef,
+		// Project tabs are not narrators, so that section has nothing to accept.
+		enabled: filter === "narrator",
+		// An internal reorder is bridged into the same singleton, so without this gate one
+		// drop would be handled twice — by @dnd-kit and by this hook.
+		suspended: draggingTabId !== null || dirDraggingId !== null,
+		measureRows: measureDropRows,
+		onDrop: handleExternalDrop,
+	});
+
 	/** Floating preview while dragging in directory mode: header-only for a group. */
 	let directoryOverlay: React.ReactNode = null;
 	if (dirDraggingId) {
@@ -1858,10 +2080,46 @@ export function RecentTabList({
 		}
 	}
 
+	if (topLevel.length === 0) {
+		return (
+			<Box
+				ref={listBoxRef}
+				style={{
+					overflow: "hidden",
+					position: "relative",
+					// An empty section is content-sized, i.e. zero-height, so the drop hit test
+					// would never match and dragging a narrator into a freshly cleared sidebar
+					// could not work. Reserve one row's worth of area for it — but only where a
+					// drop is actually accepted, so the projects section stays flush.
+					...(filter === "narrator" ? { minHeight: 44 } : {}),
+				}}
+			>
+				{emptyBody}
+				{externalDrop && (
+					<RecentTabDropIndicator
+						rows={externalDrop.rows}
+						target={externalDrop.target}
+						containerTop={externalDrop.containerTop}
+					/>
+				)}
+			</Box>
+		);
+	}
+
 	return (
-		<Box style={{ overflow: "hidden" }}>
+		// `position: relative` anchors the external-drop indicator, which is absolutely
+		// positioned over the rows.
+		<Box ref={listBoxRef} style={{ overflow: "hidden", position: "relative" }}>
 			{/* When dropSnap is true, kill all transitions so items snap into place */}
 			{dropSnap && <style>{"[data-tab-sort-id]{transition:none!important}"}</style>}
+
+			{externalDrop && (
+				<RecentTabDropIndicator
+					rows={externalDrop.rows}
+					target={externalDrop.target}
+					containerTop={externalDrop.containerTop}
+				/>
+			)}
 
 			{/* Render pinned tabs group — always flat, always sortable */}
 			{renderTabGroup(pinnedItems, "pinned")}
@@ -1871,6 +2129,7 @@ export function RecentTabList({
 				<DndContext
 					sensors={sensors}
 					collisionDetection={directoryCollisionDetection}
+					autoScroll={autoScrollOptions}
 					onDragStart={handleDirectoryDragStart}
 					onDragMove={handleDirectoryDragMove}
 					onDragEnd={handleDirectoryDragEnd}
@@ -1879,7 +2138,8 @@ export function RecentTabList({
 					<SortableContext items={directorySortIds} strategy={verticalListSortingStrategy}>
 						{renderDirectoryRows(directoryRows)}
 					</SortableContext>
-					<DragOverlay>{directoryOverlay}</DragOverlay>
+					{/* See the pointerEvents note on the flat group's DragOverlay above. */}
+					<DragOverlay style={{ pointerEvents: "none" }}>{directoryOverlay}</DragOverlay>
 				</DndContext>
 			) : (
 				renderTabGroup(unpinnedItems, "unpinned")
@@ -2872,6 +3132,43 @@ function findDirectoryMemberRow(
 }
 
 /** Resolve a sortable id to its tab across the aggregated rows (for drag previews). */
+interface CachedNarratorSummary {
+	title?: string | null;
+	cwd?: string | null;
+	status?: string | null;
+}
+
+/**
+ * Best-effort narrator metadata from whatever the query cache already holds.
+ *
+ * Checks the single-narrator entry first, then every paginated LIST cache. The list page is
+ * where an external drag starts, and it populates only `["narrators", "paginated", …]` —
+ * the detail entry exists just for narrators that have been opened. Reading only the detail
+ * key therefore missed exactly the common case, producing a tab with no `cwd`: a permanent
+ * gap, because `cwd` is persisted rather than patched in by the runtime endpoint, so the
+ * row would stay subtitle-less and invisible to directory grouping until someone opened it.
+ *
+ * No fetch here on purpose: a drop must commit in the same tick as the release, and the
+ * fields are cosmetic — the tab is correct without them and self-corrects on the first visit.
+ */
+function findCachedNarratorSummary(
+	qc: ReturnType<typeof useQueryClient>,
+	narratorId: string,
+): CachedNarratorSummary | null {
+	const direct = qc.getQueryData<CachedNarratorSummary>(["narrators", narratorId]);
+	if (direct) return direct;
+	const lists = qc.getQueriesData<{
+		pages?: Array<{ items?: Array<CachedNarratorSummary & { id?: string }> }>;
+	}>({ queryKey: ["narrators", "paginated"] });
+	for (const [, data] of lists) {
+		for (const page of data?.pages ?? []) {
+			const hit = page.items?.find((item) => item.id === narratorId);
+			if (hit) return hit;
+		}
+	}
+	return null;
+}
+
 function findDirectoryRowTab(rows: RecentTabRow[], sortId: string): RecentTab | null {
 	for (const row of rows) {
 		if (row.kind === "directory") {

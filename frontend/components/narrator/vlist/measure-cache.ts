@@ -168,6 +168,13 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// data…" forever. The nested (drilled-in trace row) path already keys it via
 	// `|tdn:` — this is the same contract for a standalone card.
 	if (typeof d.truncatedLeafCount === "number") rev += `|tp:${d.truncatedLeafCount}`;
+	// Takeover badge. Height-neutral (it rides the fixed header row), and keyed for
+	// exactly the reason `timeoutMs` above is: the takeover patch writes this ONE
+	// field — `status` cannot move, because the whole point is that the call is
+	// STILL running while the user drives its child by hand. Without this the
+	// rebuild serves the pre-takeover payload and the header stays silent about why
+	// the session stopped.
+	if (d.isTakenOver === true) rev += "|tv:1";
 	// A system card's OWN body text (`system-text` and friends paint `data.text`
 	// as pre-wrap, so its height is a function of how it wraps). `detailTextRevision`
 	// below only reaches `data.detail`, which a system card does not have.
@@ -339,6 +346,10 @@ function subagentRevision(d: Record<string, unknown>): string {
 	if (typeof d.model === "string") rev += `|go:${d.model}`;
 	if (typeof d.reasoningEffort === "string") rev += `|ge:${d.reasoningEffort}`;
 	if (d.isBackground === true) rev += "|gg:1";
+	// Takeover badge — same fixed badge row as `isBackground`, so height-neutral,
+	// but the takeover patch writes it ALONE (the card stays `running` throughout),
+	// which makes this the only key component that can move.
+	if (d.isTakenOver === true) rev += "|gw:1";
 	// Measured bodies: the description wraps when expanded, the prompt and result
 	// are measured up to their caps.
 	if (typeof d.description === "string") rev += `|gd:${textSignature(d.description)}`;

@@ -55,8 +55,10 @@ Continue investigating or refining the plan there, then call ExitPlanMode to sub
 		"[SYSTEM: Pipeline has already been used to extract captured output and is still active. Before making more tool calls, confirm whether you still need Pipeline. If not, stop using Pipeline so its captures can be cleaned up by the inactivity limit instead of continuing to accumulate.]",
 	behavior_fenceHeading:
 		"Behavior fence (durable behavior constraints set by the user — you must obey them):",
-	tasksCurrentHeading: "Dynamic Spec — open tasks (spec://tasks.json):",
-	tasksCurrentUpdateNote: "Update spec://tasks.json if any state changed.",
+	tasksCurrentHeading:
+		"Dynamic Spec — excerpt of open tasks (not the full list; read spec://tasks.json for all of it):",
+	tasksCurrentUpdateNote:
+		"Update spec://tasks.json if any state changed. Edit it in place; do not rewrite the file from this excerpt.",
 	tasksEmptyHeading: "Dynamic Spec — no open tasks.",
 	tasksEmptyNeverCreate:
 		"- Multi-step work? Write a task list to spec://tasks.json (one doing plus a few todo).",
@@ -100,8 +102,9 @@ const ZH: SideCarModelTemplates = {
 	noticePipelineExit:
 		"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
 	behavior_fenceHeading: "行为护栏（用户设定的行为约束，务必遵守）：",
-	tasksCurrentHeading: "Dynamic Spec 当前任务（spec://tasks.json）：",
-	tasksCurrentUpdateNote: "状态有变化就更新 spec://tasks.json。",
+	tasksCurrentHeading: "Dynamic Spec 当前任务节选（非完整列表，完整内容见 spec://tasks.json）：",
+	tasksCurrentUpdateNote:
+		"状态有变化就更新 spec://tasks.json。请就地修改，不要按本节选重写整个文件。",
 	tasksEmptyHeading: "Dynamic Spec 当前没有开放任务。",
 	tasksEmptyNeverCreate:
 		"- 如果是多步骤工作，请在 spec://tasks.json 建立任务清单（一条 doing + 若干 todo）。",
@@ -210,7 +213,7 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 		};
 		expect(renderSideCarBodyToText("living_work_spec", body, EN)).toBe(
 			[
-				"Dynamic Spec — open tasks (spec://tasks.json):",
+				"Dynamic Spec — excerpt of open tasks (not the full list; read spec://tasks.json for all of it):",
 				"- doing: Implement the parser",
 				"- blocked: Collect missing trace evidence [protected]",
 				"- todo: Write the tests",
@@ -219,7 +222,7 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 		);
 		expect(renderSideCarBodyToText("living_work_spec", body, ZH)).toBe(
 			[
-				"Dynamic Spec 当前任务（spec://tasks.json）：",
+				"Dynamic Spec 当前任务节选（非完整列表，完整内容见 spec://tasks.json）：",
 				"- doing: Implement the parser",
 				"- blocked: Collect missing trace evidence [protected]",
 				"- todo: Write the tests",

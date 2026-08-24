@@ -1811,6 +1811,19 @@ export const userPreferences = sqliteTable("user_preferences", {
 	 * column for this to work.
 	 */
 	traits: text("traits", { mode: "json" }).$type<string[]>().notNull().default([]),
+	/**
+	 * Interactive tutorial progress, keyed by lesson id:
+	 * `{ "<lessonId>": { completedStepIds: string[], completedAt?: string } }`
+	 *
+	 * Per user rather than global because the tutorial is a personal learning
+	 * record, and stored as one JSON blob rather than a table because it is only
+	 * ever read and written whole, for one user, on a page nobody hot-loops.
+	 *
+	 * Unknown lesson ids are tolerated on read: lessons are code, not data, so a
+	 * renamed or retired lesson would otherwise make a stored row invalid. Progress
+	 * for a lesson that no longer exists is simply not shown.
+	 */
+	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });

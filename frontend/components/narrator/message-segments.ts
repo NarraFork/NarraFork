@@ -170,6 +170,10 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			_awaitAgentNarratorId:
 				// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 				block._awaitAgentNarratorId ?? (tc as any)?._awaitAgentNarratorId,
+			// Same contract: an explicit field list, so a missing entry here silently
+			// drops the takeover badge and the card goes back to looking merely busy.
+			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
+			_takenOver: block._takenOver ?? (tc as any)?._takenOver,
 		});
 	}
 	return results;

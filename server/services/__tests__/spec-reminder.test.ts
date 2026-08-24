@@ -114,15 +114,22 @@ describe("buildSpecToolResultReminder", () => {
 		const en = await buildSpecToolResultReminder(openTasksNarratorId, "en");
 		expect(en).not.toBeNull();
 		expect(en).toContain("Implement the parser");
-		expect(en).toContain("open tasks (spec://tasks.json)");
+		// The digest shows at most 4 selected tasks, so the heading must say it is an
+		// excerpt — otherwise a model reads it as the whole file and "restores" the
+		// entries it thinks it lost by overwriting tasks.json with just these lines.
+		expect(en).toContain("excerpt of open tasks");
+		expect(en).toContain("not the full list");
+		expect(en).toContain("do not rewrite the file from this excerpt");
 		// Must not be the empty-tasks or oversized-list nudge.
 		expect(en).not.toContain("no open tasks");
 		expect(en).not.toContain("Multi-step work?");
 		expect(en).not.toContain("over the");
 
 		const zh = await buildSpecToolResultReminder(openTasksNarratorId, "zh-CN");
-		expect(zh).toContain("Dynamic Spec 当前任务");
+		expect(zh).toContain("Dynamic Spec 当前任务节选");
+		expect(zh).toContain("非完整列表");
 		expect(zh).toContain("状态有变化就更新 spec://tasks.json");
+		expect(zh).toContain("不要按本节选重写整个文件");
 	});
 
 	// ⚠️ The cadence digest is injected mid-turn, so it must NOT carry the rules the

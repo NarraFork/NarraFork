@@ -29,6 +29,7 @@
 	"addToFavorites": "Add to favorites",
 	"favoriteDirectories": "Favorites",
 	"cwdLabel": "{{path}}",
+	"dragToSidebar": "Drag into the sidebar, or onto a workspace to add it there",
 	"archive": "Archive",
 	"unarchive": "Unarchive",
 	"archivedNarrators": "Archived Narrators",

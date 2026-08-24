@@ -161,6 +161,17 @@ export function isBackgroundTakenOver(subagentId: string): boolean {
 	return getTakenOverBackgroundSet().has(subagentId);
 }
 
+/**
+ * Every subagent currently taken over.
+ *
+ * For batch callers (message loading) that would otherwise probe `isTakenOver`
+ * once per candidate row. Synchronous and allocation-bounded by the number of
+ * live takeovers (realistically 0-2), so it is safe on the main thread.
+ */
+export function listTakenOverSubagents(): string[] {
+	return [...getTakenOverSet()];
+}
+
 // === Substatus preservation ===
 
 /**

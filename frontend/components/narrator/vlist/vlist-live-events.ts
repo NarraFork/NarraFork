@@ -140,6 +140,28 @@ export function awaitAgentResolvedPatch(opts: {
 }
 
 /**
+ * `subagent_takeover_changed` → the card says the user is driving its child.
+ *
+ * HEIGHT-NEUTRAL (the badge joins the card's fixed header/badge row) but,
+ * unlike `awaitAgentResolvedPatch` above, the value is PAINTED — so it needs a
+ * component in `extractDataRevision` / `subagentRevision`. That is not optional
+ * insurance here: nothing else in the cache key can move, because the whole
+ * point is that the call is STILL `running` while a person drives the child by
+ * hand. Without the revision the rebuild would serve the pre-takeover payload
+ * and the header would stay silent about why the session stopped.
+ *
+ * Written on the block (never into `_metadata`): `classifyAwait` turns metadata
+ * into extra detail rows, which would grow every Await card.
+ *
+ * `status` is deliberately absent: a takeover says nothing about the tool's
+ * lifecycle, and writing one would let a replayed frame regress a finished card.
+ */
+export function subagentTakeoverPatch(opts: { toolUseId: string; takenOver: boolean }): LivePatch {
+	return (messages) =>
+		patchToolCallFields(messages, opts.toolUseId, { _takenOver: opts.takenOver });
+}
+
+/**
  * `permission_request` → the card is waiting on the user.
  * Mirrors useNarratorChunksWS.ts:1608-1616.
  */

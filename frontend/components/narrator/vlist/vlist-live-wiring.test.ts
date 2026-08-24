@@ -610,6 +610,59 @@ describe("live event → patch field mapping", () => {
 		expect(metadata?.subagentId).toBeUndefined();
 	});
 
+	it("subagent_takeover_changed flags the card without touching the lifecycle", async () => {
+		// `_takenOver` (not `_metadata`) is the contract: a metadata entry becomes a
+		// detail ROW via classifyAwait, so it would grow every Await card — a layout
+		// change caused by a badge. And the status must NOT move: the call is parked,
+		// not finished, which is exactly what the badge is there to say.
+		const { subagentTakeoverPatch } = await import("./vlist-live-events");
+		const result = subagentTakeoverPatch({ toolUseId: "tu-1", takenOver: true })(
+			toolDoc("tu-1", "running"),
+		);
+		expect(result.changed).toBe(true);
+		expect(block(result.messages)._takenOver).toBe(true);
+		expect(block(result.messages).status).toBe("running");
+		const metadata = block(result.messages)._metadata as Record<string, unknown> | undefined;
+		expect(metadata?.takenOver).toBeUndefined();
+	});
+
+	it("stopping a takeover clears the flag (false is written, not omitted)", async () => {
+		// Omitting the field on release would leave the badge on forever: the card
+		// keeps whatever the previous patch wrote, and no later event repeats it.
+		const { subagentTakeoverPatch } = await import("./vlist-live-events");
+		const taken = subagentTakeoverPatch({ toolUseId: "tu-1", takenOver: true })(
+			toolDoc("tu-1", "running"),
+		);
+		const released = subagentTakeoverPatch({ toolUseId: "tu-1", takenOver: false })(taken.messages);
+		expect(released.changed).toBe(true);
+		expect(block(released.messages)._takenOver).toBe(false);
+	});
+
+	it("a takeover frame without a toolUseId still finds the card by child narrator id", async () => {
+		// The spawning tool_use is resolved from the child's first user message and can
+		// be missing. Falling back to the child id keeps the badge working there; every
+		// card already carries that id (activity summary / resolved Await target).
+		const { patchSubagentTakeoverByNarrator } = await import("./vlist-live-patch");
+		const doc = toolDoc("tu-1", "running");
+		(block(doc) as Record<string, unknown>)._subagentActivity = {
+			subagentNarratorId: "sub-9",
+			model: null,
+			latestToolCalls: [],
+		};
+		const result = patchSubagentTakeoverByNarrator(doc, "sub-9", true);
+		expect(result.changed).toBe(true);
+		expect(block(result.messages)._takenOver).toBe(true);
+	});
+
+	it("a takeover frame for an unrelated child leaves the document identical", async () => {
+		const { patchSubagentTakeoverByNarrator } = await import("./vlist-live-patch");
+		const doc = toolDoc("tu-1", "running");
+		(block(doc) as Record<string, unknown>)._awaitAgentNarratorId = "sub-9";
+		const result = patchSubagentTakeoverByNarrator(doc, "sub-other", true);
+		expect(result.changed).toBe(false);
+		expect(result.messages).toBe(doc);
+	});
+
 	it("a resolved question gate leaves the tool answerable (pending, not fail)", async () => {
 		const { reflectionResolvedPatch } = await import("./vlist-live-events");
 		const result = reflectionResolvedPatch({

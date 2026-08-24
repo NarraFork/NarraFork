@@ -25,7 +25,12 @@ import { downloadHelperBinary, getHelperBinaryServerBaseUrl } from "../lib/helpe
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
-import { beginGracefulRestartSession, cancelGracefulRestartSession } from "../lib/server-restart";
+import {
+	beginGracefulRestartSession,
+	cancelGracefulRestartSession,
+	canOperatorShutdown,
+	scheduleOperatorShutdown,
+} from "../lib/server-restart";
 import { settings } from "../lib/settings";
 import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
 import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
@@ -1618,6 +1623,98 @@ export function cancelPreparedUpdate(reason?: string): {
 	}
 	cancelScheduledUpdate(reason);
 	return { cancelled: true, status: getUpdateCoordinationStatus() };
+}
+
+/**
+ * Stop this server so an administrator can start the prepared binary themselves.
+ *
+ * This is the manual counterpart to `applyUpdate`. That path waits for narrator work to reach a
+ * safe point and then spawns the replacement itself; here the user has decided not to wait and
+ * will launch the new version by hand. Nothing is spawned, so no restart handoff session and no
+ * recovery manifest are created — a manifest with no successor to claim it is exactly the stale
+ * "resume these narrators" instruction that `classifyRecoveryManifestOwnership` exists to reject.
+ *
+ * A scheduled update is cancelled first, for two reasons. It reopens the tool gate so paused work
+ * is not frozen mid-teardown, and it clears the coordinator's epoch, so the drain orchestration
+ * cannot reach `markUpdateRestarting()` and write a manifest while the process is already going
+ * away. Cancellation is skipped once the phase is `restarting`: a replacement has been spawned
+ * already, so this process is being replaced rather than merely stopped.
+ */
+export function shutdownForManualUpdate(options: { reason: string }): {
+	success: boolean;
+	error?: string;
+	code?: "SHUTDOWN_UNAVAILABLE" | "REPLACEMENT_ALREADY_STARTING";
+	cancelledSchedule: boolean;
+	newBinaryPath?: string;
+} {
+	const before = getUpdateCoordinationStatus();
+	if (before.phase === "restarting") {
+		return {
+			success: false,
+			error: "A replacement server is already starting; wait for it to finish",
+			code: "REPLACEMENT_ALREADY_STARTING",
+			cancelledSchedule: false,
+		};
+	}
+
+	if (!canOperatorShutdown()) {
+		return {
+			success: false,
+			error: "This server cannot shut itself down in the current runtime",
+			code: "SHUTDOWN_UNAVAILABLE",
+			cancelledSchedule: false,
+		};
+	}
+
+	const cancelledSchedule = before.scheduled
+		? cancelPreparedUpdate(`${options.reason} (superseded by manual shutdown)`).cancelled
+		: false;
+
+	// Reported so the UI can repeat the path the user is about to run. Absent in dev mode, where
+	// no binary was placed next to the executable.
+	const preparedInfo = readPlacedUpdateInfoPath();
+
+	const scheduled = scheduleOperatorShutdown({ reason: options.reason });
+	if (!scheduled) {
+		return {
+			success: false,
+			error: "This server cannot shut itself down in the current runtime",
+			code: "SHUTDOWN_UNAVAILABLE",
+			cancelledSchedule,
+		};
+	}
+
+	logger.warn("Shutting down for a manual update start", {
+		reason: options.reason,
+		cancelledSchedule,
+		newBinaryPath: preparedInfo,
+	});
+
+	return {
+		success: true,
+		cancelledSchedule,
+		...(preparedInfo ? { newBinaryPath: preparedInfo } : {}),
+	};
+}
+
+/**
+ * Best-effort read of the prepared binary path for the shutdown response.
+ *
+ * Deliberately skips the SHA-512 verification `readPlacedUpdateInfo` performs: this value is
+ * only echoed back so the user can copy the command, and hashing a ~100MB binary on the request
+ * path is exactly the kind of synchronous main-thread work the shutdown must not wait on. The
+ * download and apply paths remain the ones that verify before treating a binary as usable.
+ */
+function readPlacedUpdateInfoPath(): string | undefined {
+	if (!existsSync(PLACED_UPDATE_INFO_PATH)) return undefined;
+	try {
+		const info = JSON.parse(readFileSync(PLACED_UPDATE_INFO_PATH, "utf8")) as PlacedUpdateInfo;
+		if (info.fromVersion !== APP_VERSION) return undefined;
+		const candidate = info.newBinaryPath ?? info.updatePath;
+		return candidate ? resolve(candidate) : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 export interface PlannedUpdateCheckpointHooks {

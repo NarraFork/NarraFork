@@ -18,6 +18,7 @@ export const CUSTOMIZABLE_NAV_IDS = [
 	"routines",
 	"scheduled-tasks",
 	"learn",
+	"tutorial",
 	"knowledge",
 ] as const;
 

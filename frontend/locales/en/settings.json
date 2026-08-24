@@ -761,7 +761,7 @@
 	"minPruneRatio": "Min prune ratio",
 	"minPruneRatioDesc": "Each prune pass drops at least this fraction of the remaining prunable messages. Larger values prune in bigger, less frequent steps, reducing prompt-cache invalidation and cost at the expense of dropping more context at once. Default 30%.",
 	"queueDuringCompaction": "Queue messages during compaction",
-	"queueDuringCompactionDesc": "When the narrator is compacting its context, wait for the compaction to finish before sending a newly-typed message instead of sending it immediately. Off by default (do not wait).",
+	"queueDuringCompactionDesc": "While the narrator is compacting its context, a newly-sent message is queued (editable and cancellable) and its turn starts automatically once the compaction finishes. When off, the message is sent immediately, concurrently with the compaction. Either way, the send menu lets you cut in and run immediately. On by default.",
 	"contextThresholdsStandard": "Standard (≤600k)",
 	"contextThresholdsLarge": "Large (>600k)",
 	"pruneStart": "Start pruning",

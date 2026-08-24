@@ -136,6 +136,107 @@ describe("namespace key caps", () => {
 	});
 });
 
+describe("write priority", () => {
+	/*
+	 * The reported bug in storage terms: a narrator whose draft the user typed lost
+	 * its local mirror because every OTHER narrator the tab opened wrote an empty
+	 * mirror on hydration. Those empty writes were the most recent, so a
+	 * recency-only cap evicted the one entry that held text. Nothing errored — the
+	 * composer simply blanked on switch-back and hydration re-applied the server copy.
+	 */
+	test("a durable entry outlives cap overflow driven by disposable writes", () => {
+		const cap = SESSION_STORE_LIMITS.NAMESPACE_KEY_CAPS["narrator-draft"];
+		writeSession("narrator-draft", "typed", "text the user wrote", "durable");
+		flush();
+		for (let i = 0; i < cap + 4; i++) {
+			writeSession("narrator-draft", `empty${i}`, "", "disposable");
+			flush();
+		}
+		expect(readSession("narrator-draft", "typed")).toBe("text the user wrote");
+	});
+
+	test("disposable entries are evicted before durable ones under the cap", () => {
+		const cap = SESSION_STORE_LIMITS.NAMESPACE_KEY_CAPS["narrator-draft"];
+		// Fill the namespace with disposable entries, then add durable ones. Each
+		// durable insert must consume a disposable slot, never another durable one.
+		for (let i = 0; i < cap; i++) {
+			writeSession("narrator-draft", `d${i}`, `disposable-${i}`, "disposable");
+			flush();
+		}
+		for (let i = 0; i < cap; i++) {
+			writeSession("narrator-draft", `k${i}`, `durable-${i}`, "durable");
+			flush();
+		}
+		for (let i = 0; i < cap; i++) {
+			expect(readSession("narrator-draft", `k${i}`)).toBe(`durable-${i}`);
+		}
+	});
+
+	test("the default priority is durable", () => {
+		// A call site that never considers priority must get the safe tier: the
+		// opposite default would make every unannotated write first to be dropped.
+		const cap = SESSION_STORE_LIMITS.NAMESPACE_KEY_CAPS["narrator-draft"];
+		writeSession("narrator-draft", "unannotated", "kept");
+		flush();
+		for (let i = 0; i < cap - 1; i++) {
+			writeSession("narrator-draft", `later${i}`, `x${i}`, "disposable");
+			flush();
+		}
+		writeSession("narrator-draft", "overflow", "pushes past the cap", "disposable");
+		flush();
+		expect(readSession("narrator-draft", "unannotated")).toBe("kept");
+	});
+
+	test("a disposable entry becomes durable once it holds text", () => {
+		// Priority describes the VALUE, not the key: the empty mirror of a narrator
+		// the user then types into must stop being cheap to evict.
+		const cap = SESSION_STORE_LIMITS.NAMESPACE_KEY_CAPS["narrator-draft"];
+		writeSession("narrator-draft", "n1", "", "disposable");
+		flush();
+		writeSession("narrator-draft", "n1", "now typed", "durable");
+		flush();
+		for (let i = 0; i < cap + 2; i++) {
+			writeSession("narrator-draft", `other${i}`, "", "disposable");
+			flush();
+		}
+		expect(readSession("narrator-draft", "n1")).toBe("now typed");
+	});
+
+	test("entries adopted from a previous page lifecycle are treated as durable", () => {
+		// Priority is a write-time hint and is not stored, so a reload has no way to
+		// recover it. Guessing "disposable" would make refreshing the tab the thing
+		// that discards a typed draft.
+		writeSession("narrator-draft", "survivor", "typed before reload", "durable");
+		flush();
+		resetSessionStoreForTest(); // simulates a reload: storage kept, module state lost
+		const cap = SESSION_STORE_LIMITS.NAMESPACE_KEY_CAPS["narrator-draft"];
+		for (let i = 0; i < cap + 2; i++) {
+			writeSession("narrator-draft", `fresh${i}`, "", "disposable");
+			flush();
+		}
+		expect(readSession("narrator-draft", "survivor")).toBe("typed before reload");
+	});
+
+	test("a disposable write still lands in storage", () => {
+		// The empty mirror is what stops a cleared draft from resurrecting on reload,
+		// so "cheap to evict" must not become "not written".
+		writeSession("narrator-draft", "cleared", "", "disposable");
+		flush();
+		expect(readSession("narrator-draft", "cleared")).toBe("");
+	});
+
+	test("a quota cliff drops disposable entries before durable ones", () => {
+		writeSession("narrator-draft", "typed", "z".repeat(3_000), "durable");
+		writeSession("narrator-draft", "spare", "w".repeat(3_000), "disposable");
+		flush();
+		quotaChars = 7_000;
+		writeSession("narrator-draft", "incoming", "y".repeat(3_000), "durable");
+		flush();
+		expect(readSession("narrator-draft", "incoming")).toBe("y".repeat(3_000));
+		expect(readSession("narrator-draft", "typed")).toBe("z".repeat(3_000));
+	});
+});
+
 describe("quota handling", () => {
 	test("a quota cliff evicts and retries instead of silently dropping the write", () => {
 		writeSession("narrator-draft", "old", "x".repeat(4_000));

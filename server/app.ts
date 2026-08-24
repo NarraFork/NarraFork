@@ -75,6 +75,7 @@ import { storageRoutes } from "./routes/storage";
 import { terminalRoutes } from "./routes/terminals";
 import { tlsRoutes } from "./routes/tls";
 import { traitLayerRoutes } from "./routes/trait-layers";
+import { tutorialRoutes } from "./routes/tutorial";
 import { updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
 import usageHistoryRoutes from "./routes/usage-history";
@@ -265,6 +266,10 @@ const GIT_REQUIRED_RULES: readonly GitRequiredRule[] = [
 	// Commit file diff endpoints need git diff-tree. Commit list/details can fall
 	// back to database records, so they are intentionally not blocked here.
 	{ methods: ["GET"], pattern: /^\/api\/chapters\/[^/]+\/commits\/[^/]+\/files(?:\/|$)/ },
+	// Starting a tutorial lesson provisions the sandbox with git init + a commit.
+	// Only the start path: browsing the catalog and reading progress are database
+	// -only, and a user without git should still be able to read the lessons.
+	{ methods: ["POST"], pattern: /^\/api\/tutorial\/[^/]+\/start$/ },
 ];
 
 function requiresGit(method: string, path: string): boolean {
@@ -295,6 +300,7 @@ app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);
 app.route("/api/settings/tls", tlsRoutes);
 app.route("/api/learning", learningRoutes);
+app.route("/api/tutorial", tutorialRoutes);
 app.route("/api/admin", adminRoutes);
 app.route("/api/search", searchRoutes);
 app.route("/api/mcp", mcpRoutes);

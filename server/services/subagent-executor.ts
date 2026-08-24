@@ -157,6 +157,49 @@ const MAX_BUFFERED_MESSAGES = 10;
 export const MAX_SUBAGENT_INTERRUPTION_RETRIES = 3;
 
 /**
+ * Whether a buffered message can be folded into the CURRENT agent-loop pass at
+ * the next after-tools boundary, instead of waiting for the pass to end.
+ *
+ * The in-pass path is the only one that makes agent-to-agent Send feel like
+ * conversation: everything else waits for the subagent's whole loop to wind
+ * down, which for a long task is arbitrarily far away. So the default answer
+ * must be yes, and every "no" needs a concrete reason the current pass cannot
+ * carry the message.
+ *
+ * The three reasons a message must wait for `consumeNextBufferedSubagentMessage`:
+ *
+ * - **Attachments** (`images` / `textFiles`). In-pass delivery contributes text
+ *   only; the images path needs `persistSubagentUserMessage` with refs and a
+ *   rebuilt history, and `textFiles` must be written into the worktree first.
+ *   Injecting the text alone would silently drop what the sender attached.
+ * - **A pre-prompt bash command.** It must run before the prompt is seen, which
+ *   only the pass-restart path does.
+ * - **A different acting user than the running pass.** `config.userId` is fixed
+ *   when the pass starts and drives knowledge-base ACL, trait layering and fast
+ *   mode. Honouring a message from another user inside this pass would evaluate
+ *   it under the wrong identity, so it waits for a pass whose config is built
+ *   for that user. Note this compares identities rather than merely asking
+ *   whether `createdBy` is set: a Send from the parent narrator carries the same
+ *   userId the subagent is already running as, so it needs no new config and has
+ *   no reason to wait.
+ */
+export function canDeliverBufferedMessageInPass(
+	message: Pick<
+		SubagentBufferedMessage,
+		"images" | "textFiles" | "createdBy" | "prePromptBashCommand"
+	>,
+	currentUserId: string | null | undefined,
+): boolean {
+	if (message.images?.length) return false;
+	if (message.textFiles?.length) return false;
+	if (message.prePromptBashCommand) return false;
+	// An absent createdBy is "no particular user", which never conflicts with the
+	// pass identity; only a concrete, different user forces a rebuild.
+	if (message.createdBy && message.createdBy !== (currentUserId ?? null)) return false;
+	return true;
+}
+
+/**
  * The `subagent_status_changed` frame to broadcast when a subagent's agent-loop
  * pass succeeds right after one or more transient-error retries.
  *
@@ -909,21 +952,30 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					}
 				}
 
-				// 1. A user message queued for this subagent.
+				// 1. A message queued for this subagent — typed by the user on the subagent
+				// page, or sent by the parent narrator / a sibling through Send.
+				//
+				// This is the boundary that makes Send feel like conversation: the message
+				// lands in the very next request instead of waiting for this whole pass to
+				// finish. See `canDeliverBufferedMessageInPass` for the cases that cannot be
+				// carried here and must fall through to the pass-restart path.
 				//
 				// Text only, no `deliverInjection`: the row is written just below by
 				// `persistSubagentUserMessage` as a real `role: "user"` turn (which is what
-				// it is — the user typed it). Injecting again would duplicate it. The text is
-				// still needed because the loop built its in-memory history at pass start.
+				// it is — somebody addressed this subagent). Injecting again would duplicate
+				// it. The text is still needed because the loop built its in-memory history
+				// at pass start.
 				const queue = getSubagentBufferedMessagesMap().get(narratorId);
 				const buf = queue?.[0];
-				const canInjectAsText =
-					!!buf &&
-					!buf.images?.length &&
-					!buf.textFiles?.length &&
-					!buf.createdBy &&
-					!buf.prePromptBashCommand;
-				if (buf && canInjectAsText) {
+				// A pending soft stop means this pass is already ending for the sake of the
+				// queue (direct user feedback asks for that). Draining here would be worse
+				// than waiting: the loop sets `gracefulStopRequested` back in the tool loop
+				// and returns right after this drain, discarding the `nextTurnContent` we
+				// would have contributed — while the queue is now empty, so the restart path
+				// finds nothing and the subagent finalizes with the message unanswered.
+				// Leave those to `consumeNextBufferedSubagentMessage`, which rebuilds history.
+				const softStopPending = shouldStopSubagentForBufferedMessage(narratorId);
+				if (buf && !softStopPending && canDeliverBufferedMessageInPass(buf, currentUserId)) {
 					queue?.shift();
 					if (queue?.length === 0) {
 						getSubagentBufferedMessagesMap().delete(narratorId);

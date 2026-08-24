@@ -3,6 +3,57 @@ import type { ToolDefinition, ToolResult } from "../types";
 
 type TeamAction = "list" | "list_agents" | "list_bash" | "file_changes" | "broadcast" | "send";
 
+/**
+ * Default and maximum rows PER KIND (agents, bash) for the list actions.
+ *
+ * These listings used to be unbounded. A narrator that keeps working keeps
+ * spawning subagents — which are never reaped — and keeps starting background bash
+ * tasks, so the output grew for the lifetime of the session until it dominated the
+ * turn it was meant to inform.
+ *
+ * The default is small because the useful answer is "what is still running"; the
+ * ordering puts active members first, so a truncated listing still leads with them.
+ * `limit` exists for the cases where the caller genuinely wants more, and `query`
+ * for reaching a specific member past the window.
+ */
+const LIST_DEFAULT_LIMIT = 20;
+const LIST_MAX_LIMIT = 100;
+/**
+ * Terminal bash rows shown alongside the running ones when no `query` is given.
+ *
+ * Finished tasks are context, not the answer. They are also already age-bounded —
+ * `cleanupCompleted` deletes them 30 minutes after completion — so this only caps
+ * how much of that window is printed.
+ */
+const LIST_RECENT_TERMINAL_LIMIT = 5;
+
+function clampListLimit(raw: unknown): number {
+	const n = typeof raw === "number" ? raw : Number(raw);
+	if (!Number.isFinite(n)) return LIST_DEFAULT_LIMIT;
+	return Math.min(Math.max(Math.trunc(n), 1), LIST_MAX_LIMIT);
+}
+
+/**
+ * Trailing note describing what the listing left out.
+ *
+ * Always emitted when something was omitted: a silently truncated listing reads
+ * as "the team is idle" / "that agent does not exist", and both conclusions are
+ * worse than a longer output.
+ */
+function omissionNote(
+	kind: string,
+	omitted: number,
+	capped: boolean,
+	searched: boolean,
+): string | null {
+	if (omitted <= 0) return null;
+	const amount = capped ? `${omitted}+` : `${omitted}`;
+	const hint = searched
+		? "raise `limit` to see more of them"
+		: "use `query` to search by name, or raise `limit`";
+	return `(${amount} more ${kind} not shown — ${hint})`;
+}
+
 function teamMemberType(variant: string | null | undefined): string {
 	return variant?.startsWith("subagent:") ? variant.slice(9) : "primary";
 }
@@ -49,6 +100,8 @@ export const teamStatusTool: ToolDefinition = {
 		"Notes:\n" +
 		"- The primary narrator is the team root; subagents use their parent's team scope.\n" +
 		"- All actions are limited to the current narrator's direct subagent team.\n" +
+		`- The list actions are bounded: active members come first, then a few recent finished ones, up to ${LIST_DEFAULT_LIMIT} rows per kind. A trailing note reports what was omitted.\n` +
+		"- Use `query` to find a specific member by name/alias/id prefix past that window, and `limit` to widen it.\n" +
 		"- file_changes only tracks modifications made via Write and Edit tools; Bash changes are not tracked.",
 	parameters: z.object({
 		action: z
@@ -59,6 +112,19 @@ export const teamStatusTool: ToolDefinition = {
 			.optional()
 			.describe("Target subagent ID (required for 'send', optional for 'file_changes')"),
 		message: z.string().optional().describe("Message text (required for 'broadcast' and 'send')"),
+		query: z
+			.string()
+			.optional()
+			.describe(
+				"List actions only: filter members by title, alias or id prefix. Searches the whole team, past the default window.",
+			),
+		limit: z
+			.number()
+			.int()
+			.optional()
+			.describe(
+				`List actions only: max rows per kind (default ${LIST_DEFAULT_LIMIT}, max ${LIST_MAX_LIMIT}).`,
+			),
 	}),
 	rawJsonSchema: {
 		type: "object",
@@ -76,15 +142,26 @@ export const teamStatusTool: ToolDefinition = {
 				description: "Message text (required for 'broadcast' and 'send')",
 				type: "string",
 			},
+			query: {
+				description:
+					"List actions only: filter members by title, alias or id prefix. Searches the whole team, past the default window.",
+				type: "string",
+			},
+			limit: {
+				description: `List actions only: max rows per kind (default ${LIST_DEFAULT_LIMIT}, max ${LIST_MAX_LIMIT}).`,
+				type: "integer",
+			},
 		},
 		required: ["action"],
 		additionalProperties: false,
 	},
 	async execute(args, ctx): Promise<ToolResult> {
-		const { action, target_id, message } = args as {
+		const { action, target_id, message, query, limit } = args as {
 			action: TeamAction;
 			target_id?: string;
 			message?: string;
+			query?: string;
+			limit?: number;
 		};
 
 		// The primary narrator is the team root; a subagent shares its parent's team scope.
@@ -93,15 +170,47 @@ export const teamStatusTool: ToolDefinition = {
 		if (action === "list" || action === "list_agents" || action === "list_bash") {
 			const { narratorService } = await import("@server/services/narrator-service");
 			const { backgroundTaskService } = await import("@server/services/background-task-service");
-			const siblings = await narratorService.listSubagentsByParent(scopeId);
 
 			const wantAgents = action !== "list_bash";
 			const wantBash = action !== "list_agents";
+			const rowLimit = clampListLimit(limit);
+			const needle = query?.trim() || undefined;
+
+			// Both kinds are bounded independently so one crowded kind cannot starve the
+			// other — a team with 80 finished agents would otherwise hide every running
+			// bash task under a shared budget.
+			const agentView = wantAgents
+				? await narratorService.listSubagentsForTeamView({
+						parentNarratorId: scopeId,
+						limit: rowLimit,
+						query: needle,
+					})
+				: null;
+
+			// Bash tasks are keyed by the narrator that STARTED them, so the team scope has
+			// to include the parent, this narrator and every sibling. The sibling ids come
+			// from the unbounded listing on purpose: a bounded one would drop tasks owned
+			// by siblings outside the display window, which is a wrong answer rather than
+			// a shortened one. Only ids are read, so no large columns are materialized.
+			const bashView = wantBash
+				? await (async () => {
+						const siblingIds = (await narratorService.listSubagentsByParent(scopeId)).map(
+							(s) => s.id,
+						);
+						return backgroundTaskService.listTeamBashTasks({
+							parentNarratorIds: [scopeId, ctx.narratorId, ...siblingIds],
+							limit: rowLimit,
+							recentTerminalLimit: LIST_RECENT_TERMINAL_LIMIT,
+							query: needle,
+						});
+					})()
+				: null;
 
 			const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
 			const lines: string[] = [];
-			if (wantAgents) {
-				for (const s of siblings) {
+			const notes: string[] = [];
+			if (agentView) {
+				for (const s of agentView.subagents) {
 					const isSelf = s.id === ctx.narratorId ? " (you)" : "";
 					const sType = s.variant.startsWith("subagent:") ? s.variant.slice(9) : "unknown";
 					// Lead with the alias, like the bash rows below, so the model addresses
@@ -110,12 +219,16 @@ export const teamStatusTool: ToolDefinition = {
 						`- kind=agent | alias=${agentLabelFromNarrator(s, scopeId)}${isSelf} | id=${s.id} | type=${sType} | status=${s.status} | title=${s.title ?? "(untitled)"}`,
 					);
 				}
+				const note = omissionNote(
+					"agents",
+					agentView.omitted,
+					agentView.omittedCapped,
+					Boolean(needle),
+				);
+				if (note) notes.push(note);
 			}
-			if (wantBash) {
-				const teamParentIds = [scopeId, ctx.narratorId, ...siblings.map((s) => s.id)];
-				const summaries = await backgroundTaskService.listSummariesByParents(teamParentIds);
-				for (const task of summaries) {
-					if (task.type !== "bash") continue;
+			if (bashView) {
+				for (const task of bashView.tasks) {
 					const status = task.effectiveStatus ?? task.status;
 					const alias = task.alias ? ` | alias=${task.alias}` : "";
 					const cancel = task.canCancelActiveWork ? " | canCancel=true" : "";
@@ -123,6 +236,13 @@ export const teamStatusTool: ToolDefinition = {
 						`- kind=bash | id=${task.id}${alias} | status=${status}${cancel} | title=${bashLabel(task.title, task.command)}`,
 					);
 				}
+				const note = omissionNote(
+					"bash tasks",
+					bashView.omitted,
+					bashView.omittedCapped,
+					Boolean(needle),
+				);
+				if (note) notes.push(note);
 			}
 
 			if (lines.length === 0) {
@@ -132,7 +252,11 @@ export const teamStatusTool: ToolDefinition = {
 						: action === "list_bash"
 							? "background bash tasks"
 							: "background agents or bash tasks";
-				return { output: `No ${scope} found.` };
+				// A search that found nothing is a different fact from an empty team, and
+				// the model's next move differs: broaden the needle vs. stop looking.
+				return {
+					output: needle ? `No ${scope} match "${needle}".` : `No ${scope} found.`,
+				};
 			}
 			const header =
 				action === "list_agents"
@@ -140,7 +264,8 @@ export const teamStatusTool: ToolDefinition = {
 					: action === "list_bash"
 						? `Background bash tasks (${lines.length}):`
 						: `Background tasks (${lines.length}):`;
-			return { output: `${header}\n${lines.join("\n")}` };
+			const body = `${header}\n${lines.join("\n")}`;
+			return { output: notes.length > 0 ? `${body}\n${notes.join("\n")}` : body };
 		}
 
 		// The remaining actions operate on the current narrator's direct subagent team.

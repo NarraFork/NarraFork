@@ -372,6 +372,80 @@ export function patchSubagentIdentity(
 }
 
 /**
+ * Mark every loaded card that waits on `subagentNarratorId` as taken over (or
+ * released), WITHOUT knowing the parent tool use id.
+ *
+ * The takeover frame's `toolUseId` is best-effort: the spawning `tool_use` is
+ * resolved from the child's first user message, which a corrupted or
+ * partially-written history can leave unresolvable. Falling back to matching by
+ * CHILD NARRATOR id keeps the indicator working there, and both routes exist on
+ * a card already:
+ *
+ *   - Agent/Task/Send → `_subagentActivity.subagentNarratorId`
+ *   - running Await    → `_awaitAgentNarratorId` (server-resolved selector)
+ *
+ * Writes the same `_takenOver` field the id-addressed patch writes, so the two
+ * paths cannot disagree about what the card reads.
+ */
+export function patchSubagentTakeoverByNarrator(
+	messages: readonly TreeMessage[],
+	subagentNarratorId: string,
+	takenOver: boolean,
+): LivePatchResult {
+	if (!subagentNarratorId || !Array.isArray(messages) || messages.length === 0)
+		return unchanged(messages);
+	const result = markTakenOverForNarrator(messages as TreeMessage[], subagentNarratorId, takenOver);
+	return result.changed ? result : unchanged(messages);
+}
+
+/** Whether this tool block/row points at `subagentNarratorId`. */
+function ownsSubagent(entry: Record<string, unknown>, subagentNarratorId: string): boolean {
+	const activity = entry._subagentActivity as { subagentNarratorId?: unknown } | null | undefined;
+	if (activity?.subagentNarratorId === subagentNarratorId) return true;
+	return entry._awaitAgentNarratorId === subagentNarratorId;
+}
+
+function markTakenOverForNarrator(
+	messages: TreeMessage[],
+	subagentNarratorId: string,
+	takenOver: boolean,
+): { messages: readonly TreeMessage[]; changed: boolean } {
+	let changed = false;
+	const updated = messages.map((message) => {
+		let next = message;
+		let localChanged = false;
+		const nextContent = (message.contentJson ?? []).map((block) => {
+			if (block.type !== "tool_use") return block;
+			const record = block as unknown as Record<string, unknown>;
+			if (!ownsSubagent(record, subagentNarratorId)) return block;
+			if (record._takenOver === takenOver) return block;
+			localChanged = true;
+			return { ...block, _takenOver: takenOver };
+		});
+		const nextCalls = (message.toolCalls ?? []).map((call) => {
+			const record = call as unknown as Record<string, unknown>;
+			if (!ownsSubagent(record, subagentNarratorId)) return call;
+			if (record._takenOver === takenOver) return call;
+			localChanged = true;
+			return { ...call, _takenOver: takenOver };
+		});
+		if (localChanged) {
+			changed = true;
+			next = { ...message, contentJson: nextContent, toolCalls: nextCalls };
+		}
+		if (next.children?.length) {
+			const child = markTakenOverForNarrator(next.children, subagentNarratorId, takenOver);
+			if (child.changed) {
+				changed = true;
+				next = { ...next, children: child.messages as TreeMessage[] };
+			}
+		}
+		return next;
+	});
+	return { messages: changed ? updated : messages, changed };
+}
+
+/**
  * Replace a parent card's activity summary with the server-authoritative
  * snapshot delivered by reconnect catch-up. Mirrors the chunked path's
  * `applySubagentActivitySnapshots`.

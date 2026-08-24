@@ -725,6 +725,17 @@ export interface ToolCallData {
 	/** Remote execution → header badge (same row → height-neutral). */
 	isRemoteTarget?: boolean;
 	/**
+	 * The subagent this call waits on is TAKEN OVER by the user → header badge
+	 * (same row → height-neutral). Matters for an in-flight `Await({type:"agent"})`,
+	 * which never returns while the takeover lasts; without the badge the card only
+	 * shows a ticking timer.
+	 *
+	 * Keyed in `extractDataRevision` despite being height-neutral: the takeover
+	 * patch writes this field ALONE, so nothing else in the cache key moves and a
+	 * stale entry would keep painting the pre-takeover header.
+	 */
+	isTakenOver?: boolean;
+	/**
 	 * Header timing passthrough (all HEIGHT-NEUTRAL — they render inside the one
 	 * fixed header row). The chunked header shows an elapsed timer while running,
 	 * the final duration afterwards, and a `/ timeout` suffix; none of that existed
@@ -1051,6 +1062,8 @@ export interface MeasuredToolCall extends MeasuredElement {
 	toolName: string;
 	summary: string;
 	isRemoteTarget: boolean;
+	/** See `ToolCallData.isTakenOver` — a header badge, painted from this payload. */
+	isTakenOver: boolean;
 	/**
 	 * Header timing passthrough — measured never reads these for layout (they live
 	 * in the fixed 19px header row), the renderer just paints them.
@@ -2290,6 +2303,7 @@ export function measureToolCall(
 		toolName: data.toolName,
 		summary: data.summary,
 		isRemoteTarget: data.isRemoteTarget === true,
+		isTakenOver: data.isTakenOver === true,
 		// Bash prefers pure execution time (mirrors the chunked getBashExecDurationMs).
 		displayDurationMs:
 			(data.category === "bash" ? data.execDurationMs : undefined) ?? data.durationMs ?? null,

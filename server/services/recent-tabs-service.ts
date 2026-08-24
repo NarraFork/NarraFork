@@ -920,15 +920,53 @@ function findRepresentedTabIndex(
 	return index;
 }
 
-export type RecentTabUpsertInput = PersistedRecentTab & { updateOnly?: boolean };
+export type RecentTabUpsertInput = PersistedRecentTab & {
+	updateOnly?: boolean;
+	/**
+	 * Position the tab relative to an existing one, in the same revision that creates
+	 * or updates it. Mutually exclusive; see `upsertRecentTabSchema`.
+	 */
+	beforeKey?: string;
+	afterKey?: string;
+};
+
+/**
+ * Place a group at `anchorKey`, reporting whether the anchor existed.
+ *
+ * Deliberately NOT `insertRelativeToKey`, which appends when the anchor is missing. That
+ * is right for an explicit move (the user asked for a position; the bottom is a position),
+ * but wrong for an upsert: a stale anchor there would yank an existing tab to the bottom
+ * of the list on what the user experienced as a plain revisit.
+ */
+function tryInsertRelativeToKey(
+	tabs: PersistedRecentTab[],
+	group: PersistedRecentTab[],
+	anchorKey: string,
+	position: "before" | "after",
+): boolean {
+	const anchorIndex = tabs.findIndex((tab) => tabKey(tab) === anchorKey);
+	if (anchorIndex < 0) return false;
+	// Anchoring to a member of a workspace means anchoring to the whole group: the group
+	// is kept contiguous by `regroupWorkspaces`, so an index inside it is not a position
+	// anything can actually land at.
+	const range = workspaceGroupRange(tabs, anchorIndex);
+	tabs.splice(position === "before" ? range.start : range.end + 1, 0, ...group);
+	return true;
+}
 
 function applyRecentTabUpsert(
 	current: PersistedRecentTab[],
 	input: RecentTabUpsertInput,
 ): PersistedRecentTab[] {
-	const { updateOnly, ...tabInput } = input;
+	const { updateOnly, beforeKey, afterKey, ...tabInput } = input;
 	const tab = normalizeTab(tabInput);
 	const key = tabKey(tab);
+	const anchorKey = beforeKey ?? afterKey;
+	// Self-anchoring has no meaning and would be read as "already in place".
+	const anchor =
+		anchorKey && anchorKey !== key
+			? { key: anchorKey, position: beforeKey ? ("before" as const) : ("after" as const) }
+			: null;
 	const before = current.map(cloneTab);
 	const tabs = current.map(cloneTab);
 	const index = findRepresentedTabIndex(tabs, tab, updateOnly === true);
@@ -946,6 +984,17 @@ function applyRecentTabUpsert(
 			// Re-visiting a normal tab updates metadata in place. Only explicit move/pin changes order.
 			tabs[index] = normalizeTab({ ...tabs[index], ...tab });
 		}
+		// An anchor on an already-present tab repositions it, so dropping a tab that
+		// happens to be in the sidebar already lands where it was aimed instead of
+		// silently doing nothing. Skipped once the tab belongs to a workspace: the group
+		// owns its members' positions (`regroupWorkspaces` would undo it anyway).
+		if (anchor && !tabs[index].workspaceId) {
+			const { group } = extractMovedGroup(tabs, index);
+			if (!tryInsertRelativeToKey(tabs, group, anchor.key, anchor.position)) {
+				// Anchor gone: leave the tab exactly where it was rather than relocating it.
+				tabs.splice(index, 0, ...group);
+			}
+		}
 	} else if (!updateOnly) {
 		if (tab.workspaceId) {
 			const headerIndex = tabs.findIndex(
@@ -956,14 +1005,24 @@ function applyRecentTabUpsert(
 				tabs.splice(range.end + 1, 0, tab);
 			} else {
 				delete tab.workspaceId;
-				tabs.splice(getPinnedSectionEndIndex(tabs), 0, tab);
+				insertNewTab(tabs, tab, anchor);
 			}
 		} else {
-			tabs.splice(getPinnedSectionEndIndex(tabs), 0, tab);
+			insertNewTab(tabs, tab, anchor);
 		}
 	}
 	const normalized = normalizeAndLimitTabs(tabs, key);
 	return normalized.protectedGroupTooLarge ? before : normalized.tabs;
+}
+
+/** Insert a brand-new top-level tab at its anchor, or at the default insertion point. */
+function insertNewTab(
+	tabs: PersistedRecentTab[],
+	tab: PersistedRecentTab,
+	anchor: { key: string; position: "before" | "after" } | null,
+): void {
+	if (anchor && tryInsertRelativeToKey(tabs, [tab], anchor.key, anchor.position)) return;
+	tabs.splice(getPinnedSectionEndIndex(tabs), 0, tab);
 }
 
 export async function upsertRecentTabsBatch(
@@ -990,9 +1049,16 @@ export async function upsertRecentTabsBatch(
 export async function upsertRecentTab(
 	userId: string,
 	tabInput: PersistedRecentTab,
-	options: { updateOnly?: boolean } = {},
+	options: { updateOnly?: boolean; beforeKey?: string; afterKey?: string } = {},
 ): Promise<RecentTabsMutationResult> {
-	return upsertRecentTabsBatch(userId, [{ ...tabInput, updateOnly: options.updateOnly }]);
+	return upsertRecentTabsBatch(userId, [
+		{
+			...tabInput,
+			updateOnly: options.updateOnly,
+			...(options.beforeKey ? { beforeKey: options.beforeKey } : {}),
+			...(options.afterKey ? { afterKey: options.afterKey } : {}),
+		},
+	]);
 }
 
 export async function removeRecentTab(
@@ -1032,19 +1098,20 @@ function extractMovedGroup(
 	};
 }
 
+/**
+ * Move-path insert: falls back to the END of the list when the anchor is gone.
+ *
+ * That fallback is specific to an explicit move — the user asked for a position, so
+ * landing at the bottom is a worse position but still an answer. The upsert path must
+ * NOT behave this way (see `tryInsertRelativeToKey`).
+ */
 function insertRelativeToKey(
 	tabs: PersistedRecentTab[],
 	group: PersistedRecentTab[],
 	anchorKey: string,
 	position: "before" | "after",
 ): void {
-	const anchorIndex = tabs.findIndex((tab) => tabKey(tab) === anchorKey);
-	if (anchorIndex < 0) {
-		tabs.push(...group);
-		return;
-	}
-	const range = workspaceGroupRange(tabs, anchorIndex);
-	tabs.splice(position === "before" ? range.start : range.end + 1, 0, ...group);
+	if (!tryInsertRelativeToKey(tabs, group, anchorKey, position)) tabs.push(...group);
 }
 
 export interface MoveRecentTabInput {

@@ -13,6 +13,7 @@ import { parseSubstatus } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import { getAutoCompactKeepPairs, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
 import { narratorContext } from "./narrator-context";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
 import { narratorService } from "./narrator-service";
@@ -624,6 +625,11 @@ export function triggerMidTurnCompact(
 		.finally(() => {
 			if (compactLocks.get(narratorId) === compactLock) {
 				compactLocks.delete(narratorId);
+				// This probe lock normally steps aside for runCustomCompact's own lock,
+				// which then owns the drain. Only a probe that found no boundary reaches
+				// here still holding the lock — and a message queued behind it would
+				// otherwise have no consumer at all.
+				void drainQueuedMessagesAfterCompact(narratorId);
 			}
 		});
 }
@@ -755,6 +761,12 @@ export async function runCustomCompact(
 		watchdog.stop();
 		if (compactLocks.get(narratorId) === compactLock) {
 			compactLocks.delete(narratorId);
+			// Deliver anything the user queued while this compact ran. Deliberately in
+			// `finally`: a failed, cancelled or timed-out compact leaves the same queue
+			// as a successful one, and only the lock-release path sees every exit.
+			// `resumeBufferedMessagesIfIdle` declines when another owner exists, so a
+			// blocking compact whose turn is still running is unaffected.
+			void drainQueuedMessagesAfterCompact(narratorId);
 		}
 	}
 }
@@ -1271,6 +1283,9 @@ export async function runSegmentCompact(
 		watchdog.stop();
 		if (compactLocks.get(narratorId) === lock) {
 			compactLocks.delete(narratorId);
+			// A segment compact holds the same lock the queue admission checks, so a
+			// message queued behind one needs the same consumer.
+			void drainQueuedMessagesAfterCompact(narratorId);
 		}
 	}
 }

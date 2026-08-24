@@ -141,6 +141,7 @@ export {
 	isBackgroundTakenOver,
 	isPendingStopTakeover,
 	isTakenOver,
+	listTakenOverSubagents,
 	markPendingBackgroundFinalize,
 	markPendingStopTakeover,
 	markPendingTakeover,

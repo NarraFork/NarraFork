@@ -1,3 +1,4 @@
+import { TUTORIAL_PROVIDER_PREFIX } from "@shared/tutorial/lessons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo } from "react";
 import { api } from "../lib/api";
@@ -15,6 +16,32 @@ import type { ProviderCapabilityKey } from "./usePlatform";
 
 const MODELS_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 const MODELS_SETTINGS_QUERY_STALE_TIME_MS = 30_000;
+
+/**
+ * Whether a provider prefix may appear in a model picker.
+ *
+ * `tutorial:` is excluded unconditionally. The interactive tutorial routes real
+ * narrator sessions to a scripted provider that only recites authored lines, so it
+ * must never be selectable for real work — a user who picked it would get a
+ * session that ignores everything they say, with no error to explain why.
+ *
+ * The tutorial model is deliberately not registered as a model source, so this is
+ * a second line of defence rather than the only one. It is needed because
+ * `getConfiguredFallbackModels` resurfaces whatever `agent.defaultModel` /
+ * `agent.summaryModel` happen to hold, so a value left there by a mistake would
+ * otherwise reach every picker in the app.
+ *
+ * Exported so the exclusion is testable directly: asserting it through the hook
+ * would need a rendered React tree and a settings fixture, which is how a filter
+ * like this ends up unverified.
+ */
+export function isSelectableProviderPrefix(
+	prefix: string,
+	disabledProviders: ReadonlySet<string>,
+): boolean {
+	if (prefix === TUTORIAL_PROVIDER_PREFIX) return false;
+	return !disabledProviders.has(prefix);
+}
 
 export interface ProviderModels {
 	prefix: string;
@@ -595,11 +622,12 @@ export function useAllModels() {
 			});
 		}
 
-		// Filter out user-disabled providers and providers that are not available for agent mode.
+		// Filter out user-disabled providers, providers unavailable for agent mode, and
+		// the reserved tutorial prefix.
 		const enabledModelArrays = providerModelArrays
 			.filter(
 				(g) =>
-					!disabledProviders.has(g.prefix) &&
+					isSelectableProviderPrefix(g.prefix, disabledProviders) &&
 					(!g.agentProviderType || providerAgentModeSupported(g.agentProviderType)),
 			)
 			.map((g) => g.models);

@@ -42,6 +42,10 @@ const PANEL_EXCLUDED_EVENT_TYPES = [
 	// Message-layer only: patches the Await card's resolved child id. The panel has
 	// no card to update, so delivering it here would be pure traffic.
 	"await_agent_resolved",
+	// Message-layer only, same reason: it patches the blocked Agent/Await CARD's
+	// takeover badge. The panel already learns the same fact from
+	// `subagent_status_changed`'s substatus, which drives the status chip.
+	"subagent_takeover_changed",
 	"tool_output",
 	"subagent_started",
 	"segment_compact_hide",
