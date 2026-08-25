@@ -138,13 +138,19 @@ export function buildRowToolActions(
 	}
 
 	// A subagent card knows its child directly; an Await-agent card knows it only
-	// once the target resolved (an unresolved target has nothing to open).
-	const sessionNarratorId = meta.subagentNarratorId ?? meta.awaitAgentNarratorId;
+	// once the target resolved (an unresolved target has nothing to open); a Send
+	// card knows its single addressee from the tool's own returned targets.
+	const sessionNarratorId =
+		meta.subagentNarratorId ?? meta.awaitAgentNarratorId ?? meta.sendTargetNarratorId;
 	if (sessionNarratorId && handlers.onViewSubagentSession) {
 		actions.onViewSubagentSession = () => handlers.onViewSubagentSession?.(sessionNarratorId);
 	}
 
 	// Background lifecycle actions only ever apply to a real child narrator.
+	// ⚠️ Deliberately NOT `sessionNarratorId`: a Send target is not this call's
+	// child (it may be a sibling, or the parent), and its lifecycle belongs to the
+	// Agent call that created it. Detaching or cancelling from here would act on a
+	// narrator this row never owned.
 	const childNarratorId = meta.subagentNarratorId;
 	if (childNarratorId) {
 		if (handlers.onDetachSubagent && !meta.isBackground && !meta.isTerminal) {

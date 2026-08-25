@@ -40,6 +40,7 @@
 import { eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narrators } from "../db/schema";
+import { isSubagentVariant } from "../lib/narrator-utils";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 
 /**
@@ -395,14 +396,28 @@ export async function resolveAwaitAgentIdsForToolCalls(
 
 	// A subagent's Await resolves against its PARENT's roster (its own siblings),
 	// exactly as getCommunicationScope defines the team scope.
+	//
+	// ⚠️ "Is the caller a subagent" is decided by `variant`, NOT by the presence of
+	// `parentNarratorId` — that is what `getCommunicationScope` (the authority the
+	// Await tool itself runs through) does, and the two disagree for a real and
+	// common shape: a FORKED primary narrator also carries a `parentNarratorId`
+	// (the narrator it was forked from), while its own subagents are parented to
+	// IT. Treating that parent link as "I am a subagent" pointed the lookup at the
+	// fork source's roster, where the target does not exist.
+	//
+	// Measured on a real database: of 2082 Await-agent calls whose subagent id is
+	// known from persisted metadata, this mistake alone lost 131 — a running Await
+	// on a forked narrator's own child could never offer "open session". It fails
+	// silently (a missing menu item), which is why it survived so long.
 	const scopeByNarratorId = new Map<string, string>();
 	try {
 		const owners = await db.query.narrators.findMany({
 			where: inArray(narrators.id, ownerIds),
-			columns: { id: true, parentNarratorId: true },
+			columns: { id: true, parentNarratorId: true, variant: true },
 		});
 		for (const owner of owners) {
-			scopeByNarratorId.set(owner.id, owner.parentNarratorId ?? owner.id);
+			const isSubagent = isSubagentVariant(owner.variant ?? "");
+			scopeByNarratorId.set(owner.id, isSubagent ? (owner.parentNarratorId ?? owner.id) : owner.id);
 		}
 	} catch {
 		return new Map();

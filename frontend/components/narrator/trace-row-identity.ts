@@ -78,6 +78,14 @@ export interface TraceRowToolMeta {
 	 * Like `awaitAgentNarratorId` this is EMBEDDED-only: no per-row query.
 	 */
 	subagentNarratorId?: string;
+	/**
+	 * `Send` → the addressed narrator id, when the call had exactly one target.
+	 *
+	 * Send creates no child messages, so `subagentNarratorId` is empty for it;
+	 * the real id lives only in `metadata.targets[]`. See
+	 * `traceRowSendTargetNarratorId`.
+	 */
+	sendTargetNarratorId?: string;
 	/** Subagent launched in background mode (`background` / `run_in_background`). */
 	isBackground?: boolean;
 	/** The tool call reached a terminal status (no detach / cancel). */
@@ -175,6 +183,37 @@ export function traceRowAwaitAgentNarratorId(tc: TraceRowToolCallLike): string |
 }
 
 /**
+ * Reserved selectors a subagent uses to address its parent. Mirrors
+ * `PARENT_SELECTORS` (server/services/agent-communication.ts) and
+ * `RESERVED_SEND_SELECTORS` (vlist-tool-meta.ts).
+ */
+const RESERVED_SEND_SELECTORS = new Set(["parent", "main", "@parent", "@main"]);
+
+function isReservedSendSelector(value: unknown): boolean {
+	return typeof value === "string" && RESERVED_SEND_SELECTORS.has(value.trim().toLowerCase());
+}
+
+/**
+ * `Send` → the narrator id whose session this row can open.
+ *
+ * Mirrors `deriveSendTargetNarratorId` (vlist-tool-meta.ts) so both render paths
+ * navigate identically from the same row; see that function for why only a
+ * single-target Send resolves, and why a parent report is excluded even though its
+ * `id` is a real narrator id (the affordance opens a SUBAGENT panel).
+ */
+export function traceRowSendTargetNarratorId(tc: TraceRowToolCallLike): string | undefined {
+	if (tc.toolName !== "Send") return undefined;
+	const metadata = asRecord(asRecord(tc.outputJson)._metadata ?? tc._metadata);
+	const targets = metadata.targets;
+	if (!Array.isArray(targets) || targets.length !== 1) return undefined;
+	const target = asRecord(targets[0]);
+	if (isReservedSendSelector(target.label)) return undefined;
+	const id = nonEmpty(target.id);
+	if (!id || isReservedSendSelector(id)) return undefined;
+	return id;
+}
+
+/**
  * Whether a subagent tool was launched in background mode. Mirrors
  * SubagentCard.tsx's `isBackground` (both the Agent `background` flag and the
  * Bash-style `run_in_background` alias).
@@ -208,6 +247,8 @@ export function traceRowToolMeta(tc: TraceRowToolCallLike): TraceRowToolMeta {
 	// stays a pure derivation — never a per-row lookup.
 	const subagentNarratorId = nonEmpty(tc._subagentActivity?.subagentNarratorId);
 	if (subagentNarratorId) meta.subagentNarratorId = subagentNarratorId;
+	const sendTargetNarratorId = traceRowSendTargetNarratorId(tc);
+	if (sendTargetNarratorId) meta.sendTargetNarratorId = sendTargetNarratorId;
 	if (traceRowIsBackground(tc)) meta.isBackground = true;
 	if (traceRowIsTerminal(tc)) meta.isTerminal = true;
 	const resultMessageId = nonEmpty(tc.resultMessageId);

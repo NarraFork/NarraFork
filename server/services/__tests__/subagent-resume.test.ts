@@ -225,6 +225,10 @@ beforeAll(async () => {
 				runId: `run-${startCalls.length}`,
 				completion,
 				terminalCompletion,
+				// Part of the contract: the resume path claims any owed resumed-background
+				// notice after delivering the conclusion. A mock without it made every
+				// terminal completion throw.
+				takeResumedBackgroundAnnouncement: () => undefined,
 				userMessage: {
 					id: `user-message-${startCalls.length}`,
 					narratorId: subagentId,

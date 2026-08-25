@@ -21,6 +21,7 @@ import {
 	settleManualOverrideClaim,
 } from "./subagent-manual-override";
 import {
+	announceResumedBackgroundTask,
 	combineSubagentAbortSignals,
 	type SubagentUpdateExecutionLease,
 	startContinuedSubagent,
@@ -546,6 +547,9 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				allowRunningRestart: input.allowRunningRestart,
 				skipStaleAttach: input.skipStaleAttach,
 				preserveBackground: input.preserveBackground,
+				// Forwarded so the resumed-task notice knows whether the tool result below
+				// will be rewritten (i.e. whether the parent already has the output).
+				skipConclusionDelivery: input.skipConclusionDelivery,
 				resumableUpdateLease: input.resumableUpdateLease,
 				timeoutMs: input.timeoutMs,
 				executionDeadlineAt: input.executionDeadlineAt,
@@ -575,6 +579,20 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 						if (active?.token === token && active.runId === started.runId) {
 							activeResumeRuns.delete(input.subagentId);
 						}
+					});
+				}
+				// AFTER the conclusion above, never before: this wakes the parent, and a turn
+				// started while the historical Agent tool result still held the previous run's
+				// output would be built from a result this continuation just superseded.
+				// Failure here must not fail the run — the notice is an affordance, the
+				// conclusion is the record.
+				const announcement = started.takeResumedBackgroundAnnouncement?.();
+				if (announcement) {
+					await announceResumedBackgroundTask(announcement).catch((err) => {
+						logger.warn("Failed to announce a resumed background task", {
+							subagentId: input.subagentId,
+							error: err instanceof Error ? err.message : String(err),
+						});
 					});
 				}
 				return output;

@@ -850,6 +850,8 @@ function resolveTraceRowIdentity(
 			// Subagent lifecycle facts (open session / detach / cancel), matching the
 			// three items the expanded SubagentCard offers.
 			...(meta?.subagentNarratorId ? { subagentNarratorId: meta.subagentNarratorId } : {}),
+			// Send's addressee — the only source is the tool's own returned targets.
+			...(meta?.sendTargetNarratorId ? { sendTargetNarratorId: meta.sendTargetNarratorId } : {}),
 			...(meta?.isBackground ? { isBackground: true } : {}),
 			...(meta?.isTerminal ? { isTerminal: true } : {}),
 		};
@@ -1012,6 +1014,7 @@ function sameToolMeta(a: VListToolMeta | undefined, b: VListToolMeta | undefined
 		a.subagentNarratorId === b.subagentNarratorId &&
 		a.awaitAgentTargetId === b.awaitAgentTargetId &&
 		a.awaitAgentNarratorId === b.awaitAgentNarratorId &&
+		a.sendTargetNarratorId === b.sendTargetNarratorId &&
 		a.isBackground === b.isBackground &&
 		a.isTerminal === b.isTerminal &&
 		a.resultMessageId === b.resultMessageId

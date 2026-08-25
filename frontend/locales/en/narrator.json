@@ -1219,7 +1219,8 @@
 		"more": "More tools",
 		"sectionVisible": "Shown in header",
 		"sectionTucked": "In this menu",
-		"headerOnly": "Header only"
+		"headerOnly": "Header only",
+		"hiddenNoRoom": "No room"
 	},
 	"spec": {
 		"title": "Outline",

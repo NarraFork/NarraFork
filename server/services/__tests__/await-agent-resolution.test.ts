@@ -283,4 +283,68 @@ describe("resolveAwaitAgentIdsForToolCalls", () => {
 		]);
 		expect(resolved.size).toBe(0);
 	});
+
+	/**
+	 * ⚠️ THE SCOPE RULE: "am I a subagent" is decided by `variant`, never by the
+	 * presence of `parentNarratorId`.
+	 *
+	 * A FORKED primary narrator carries a `parentNarratorId` (the narrator it was
+	 * forked from) while its OWN subagents are parented to itself. Reading that
+	 * link as "I am a subagent" sends the lookup to the fork source's roster, where
+	 * the target does not exist — so a running Await on a forked narrator's own
+	 * child silently loses its "open session" item.
+	 *
+	 * Measured on a real database this single mistake cost 131 of 2082 resolvable
+	 * Await-agent calls. It has no error signal, hence this test.
+	 */
+	test("a forked primary resolves against its OWN roster, not the fork source's", async () => {
+		const now = new Date().toISOString();
+		const FORK_SOURCE = "fork-source-narrator";
+		const FORKED = "forked-primary-narra";
+		const DECOY = "decoy-subagent-00000";
+		await db.insert(narrators).values([
+			{ id: FORK_SOURCE, type: "primary", variant: "primary", createdAt: now, updatedAt: now },
+			// The forked narrator is PRIMARY but has a parent link.
+			{
+				id: FORKED,
+				type: "primary",
+				variant: "primary",
+				parentNarratorId: FORK_SOURCE,
+				createdAt: now,
+				updatedAt: now,
+			},
+			// Its own child, parented to it.
+			{
+				id: SUB_A,
+				type: "subagent",
+				variant: "subagent:general",
+				parentNarratorId: FORKED,
+				title: "Compare runtime build",
+				createdAt: now,
+				updatedAt: now,
+			},
+			// A same-named child of the FORK SOURCE. If the scope were taken from
+			// parentNarratorId, the lookup would land here — returning the wrong
+			// session rather than none, which is worse than a hidden menu item.
+			{
+				id: DECOY,
+				type: "subagent",
+				variant: "subagent:general",
+				parentNarratorId: FORK_SOURCE,
+				title: "Compare runtime build",
+				createdAt: now,
+				updatedAt: now,
+			},
+		]);
+
+		const resolved = await resolveAwaitAgentIdsForToolCalls([
+			{
+				toolUseId: "t1",
+				toolName: "Await",
+				inputJson: { type: "agent", id: "compare-runtime-build" },
+				narratorId: FORKED,
+			},
+		]);
+		expect(resolved.get("t1")).toBe(SUB_A);
+	});
 });

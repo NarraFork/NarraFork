@@ -16,6 +16,7 @@ import {
 	reasoningTraceRowIdentity,
 	toolTraceRowIdentity,
 	traceRowAwaitAgentNarratorId,
+	traceRowSendTargetNarratorId,
 	traceRowToolBlockId,
 	traceRowToolMeta,
 } from "./trace-row-identity";
@@ -365,5 +366,109 @@ describe("traceRowAwaitAgentNarratorId — embedded metadata only", () => {
 				_awaitAgentNarratorId: "sub-live",
 			}),
 		).toBeUndefined();
+	});
+});
+
+/**
+ * Send rows.
+ *
+ * A Send spawns no child messages, so the `_subagentActivity` join that every
+ * other subagent card relies on is empty for it — the addressee's real narrator
+ * id exists ONLY in `metadata.targets[]`. Until this was read, "view session"
+ * was hidden on essentially every Send row on both render paths.
+ */
+describe("traceRowSendTargetNarratorId", () => {
+	test("resolves a single sibling target's narrator id", () => {
+		expect(
+			traceRowSendTargetNarratorId({
+				toolName: "Send",
+				inputJson: { id: "verify-unstable", message: "done" },
+				outputJson: {
+					_text: "Sent to verify-unstable; message queued.",
+					_metadata: {
+						kind: "send",
+						targets: [{ id: "SOuKPDwfvhldnXwHuZ6rN", label: "verify-unstable", status: "queued" }],
+					},
+				},
+			}),
+		).toBe("SOuKPDwfvhldnXwHuZ6rN");
+	});
+
+	/**
+	 * ⚠️ A parent report is excluded even though its `id` is a real narrator id: the
+	 * affordance opens a SUBAGENT session panel, which would then present a primary
+	 * narrator as a subagent. See `deriveSendTargetNarratorId`.
+	 */
+	test("stays silent for a parent report, identified by its reserved label", () => {
+		expect(
+			traceRowSendTargetNarratorId({
+				toolName: "Send",
+				outputJson: { _metadata: { targets: [{ id: "SOuKPDwfvhldnXwHuZ6rN", label: "parent" }] } },
+			}),
+		).toBeUndefined();
+	});
+
+	test("stays silent for a fan-out Send", () => {
+		expect(
+			traceRowSendTargetNarratorId({
+				toolName: "Send",
+				outputJson: { _metadata: { targets: [{ id: "sub-a" }, { id: "sub-b" }] } },
+			}),
+		).toBeUndefined();
+	});
+
+	test("rejects reserved selectors sitting in the id field", () => {
+		for (const reserved of ["parent", "main", "@parent", "@main", "MAIN"]) {
+			expect(
+				traceRowSendTargetNarratorId({
+					toolName: "Send",
+					outputJson: { _metadata: { targets: [{ id: reserved, status: "failed" }] } },
+				}),
+			).toBeUndefined();
+		}
+	});
+
+	test("stays silent without targets, and for other tools", () => {
+		expect(traceRowSendTargetNarratorId({ toolName: "Send" })).toBeUndefined();
+		expect(
+			traceRowSendTargetNarratorId({
+				toolName: "Bash",
+				outputJson: { _metadata: { targets: [{ id: "sub-a" }] } },
+			}),
+		).toBeUndefined();
+	});
+
+	/**
+	 * The two implementations must agree, or the chunked and virtualized lists
+	 * navigate differently from the same row. Both the resolving and the excluded
+	 * shape are compared: agreeing only on "yes" would let one path keep offering a
+	 * parent report the other refuses.
+	 */
+	test("matches the vlist derivation, for both a sibling and a parent report", async () => {
+		const { deriveSendTargetNarratorId } = await import("./vlist/vlist-tool-meta");
+		for (const metadata of [
+			{ targets: [{ id: "SOuKPDwfvhldnXwHuZ6rN", label: "verify-unstable" }] },
+			{ targets: [{ id: "SOuKPDwfvhldnXwHuZ6rN", label: "parent" }] },
+		]) {
+			expect(deriveSendTargetNarratorId("Send", metadata)).toBe(
+				traceRowSendTargetNarratorId({ toolName: "Send", outputJson: { _metadata: metadata } }),
+			);
+		}
+	});
+
+	/**
+	 * ⚠️ A Send target is NOT this row's child: it may be a sibling, or the
+	 * parent. Its background lifecycle belongs to the Agent call that created it,
+	 * so the id must reach "view session" WITHOUT enabling detach / cancel.
+	 */
+	test("feeds view-session only, never the lifecycle fields", () => {
+		const meta = traceRowToolMeta({
+			toolName: "Send",
+			toolUseId: "tu-send",
+			status: "running",
+			outputJson: { _metadata: { targets: [{ id: "SOuKPDwfvhldnXwHuZ6rN" }] } },
+		});
+		expect(meta.sendTargetNarratorId).toBe("SOuKPDwfvhldnXwHuZ6rN");
+		expect(meta.subagentNarratorId).toBeUndefined();
 	});
 });

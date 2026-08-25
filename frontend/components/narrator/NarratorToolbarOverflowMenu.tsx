@@ -37,6 +37,7 @@ import {
 	NARRATOR_TOOLBAR_DIVIDER_ID,
 	type NarratorToolbarEntry,
 } from "../../hooks/narrator-toolbar-layout";
+import { HEADER_TOOLBAR_FIXED_ATTR } from "./narrator-header-toolbar-capacity";
 import {
 	aggregateOverflowBadge,
 	type NarratorToolbarBadgeCounts,
@@ -45,6 +46,7 @@ import {
 import {
 	isNarratorToolbarItemAvailable,
 	type NarratorToolbarHost,
+	type NarratorToolbarItemDef,
 	narratorToolbarItem,
 } from "./narrator-toolbar-items";
 
@@ -162,6 +164,25 @@ function SortableDivider({ label }: { label: string }) {
 export interface NarratorToolbarOverflowMenuProps {
 	/** Full flat layout (both zones) — the drag list operates on this. */
 	entries: readonly NarratorToolbarEntry[];
+	/**
+	 * Entries NOT on the header row right now, whether the reader tucked them away
+	 * or the row ran out of width.
+	 *
+	 * Supplied by the header rather than derived from the divider position, because
+	 * the divider only records the reader's intent. An entry collapsed for width is
+	 * still "shown in header" by that measure, so deriving the aggregate badge from
+	 * the divider would take its unread count off screen with nothing to show it —
+	 * silently, which is the whole reason the aggregate badge exists.
+	 */
+	hiddenDefs?: readonly NarratorToolbarItemDef[];
+	/**
+	 * Ids the reader placed above the divider that the row could not fit.
+	 *
+	 * Marked in the list because otherwise the menu says "shown in header" about an
+	 * entry that is demonstrably not there — the reader would go looking for it in
+	 * the row and find nothing, with no explanation.
+	 */
+	noRoomIds?: readonly string[];
 	onSaveLayout: (entries: NarratorToolbarEntry[]) => void;
 	/** Capabilities of the current host; unavailable entries are not listed. */
 	hostCapabilities: readonly NarratorToolbarHost[];
@@ -175,6 +196,8 @@ export interface NarratorToolbarOverflowMenuProps {
 
 export function NarratorToolbarOverflowMenu({
 	entries,
+	hiddenDefs,
+	noRoomIds,
 	onSaveLayout,
 	hostCapabilities,
 	badgeCounts,
@@ -236,14 +259,19 @@ export function NarratorToolbarOverflowMenu({
 		[flatIds, listedEntries, entries, onSaveLayout],
 	);
 
-	const overflowDefs = useMemo(() => {
+	/**
+	 * Fallback for a caller that does not pass `hiddenDefs`: the entries below the
+	 * divider. Correct only when nothing was collapsed for width.
+	 */
+	const tuckedDefs = useMemo(() => {
 		if (dividerIndex < 0) return [];
 		return listedEntries
 			.slice(dividerIndex + 1)
 			.flatMap((entry) => (entry.kind === "item" ? [narratorToolbarItem(entry.id)] : []))
 			.filter((def): def is NonNullable<typeof def> => def != null);
 	}, [listedEntries, dividerIndex]);
-	const aggregate = aggregateOverflowBadge(overflowDefs, badgeCounts);
+	const aggregate = aggregateOverflowBadge(hiddenDefs ?? tuckedDefs, badgeCounts);
+	const noRoomIdSet = useMemo(() => new Set(noRoomIds ?? []), [noRoomIds]);
 
 	const moreLabel = t("toolbar.more");
 
@@ -261,6 +289,13 @@ export function NarratorToolbarOverflowMenu({
 			<Menu.Target>
 				<Tooltip label={moreLabel} disabled={menuOpen}>
 					<Indicator
+						/*
+						 * The header's capacity measurement subtracts this control's width from
+						 * the budget. Marking it "fixed" is what says "always rendered, so it is
+						 * safe to measure" — without the attribute the budget is overstated by
+						 * one button and the row keeps one entry too many.
+						 */
+						{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
 						inline
 						size={aggregate.processing ? 8 : 14}
 						offset={aggregate.processing ? 3 : 4}
@@ -306,15 +341,25 @@ export function NarratorToolbarOverflowMenu({
 							// UI in the header row; from the menu there is nothing to activate, so
 							// the row shows a hint instead of a dead click.
 							const activatable = def.selfContained !== true;
+							const tucked = dividerIndex >= 0 && index > dividerIndex;
+							// "No room" only makes sense above the divider; below it, the entry is
+							// in this menu because the reader put it here.
+							const noRoom = !tucked && noRoomIdSet.has(entry.id);
 							return (
 								<SortableRow
 									key={entry.id}
 									id={entry.id}
-									tucked={dividerIndex >= 0 && index > dividerIndex}
+									tucked={tucked || noRoom}
 									label={t(def.labelKey, { ns: def.namespace ?? "narrator" })}
 									badgeLabel={badge.label || undefined}
 									badgeProcessing={badge.processing}
-									headerOnlyHint={activatable ? undefined : t("toolbar.headerOnly")}
+									headerOnlyHint={
+										noRoom
+											? t("toolbar.hiddenNoRoom")
+											: activatable
+												? undefined
+												: t("toolbar.headerOnly")
+									}
 									onActivate={
 										activatable
 											? () => {

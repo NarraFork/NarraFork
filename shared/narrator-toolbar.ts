@@ -12,9 +12,12 @@
  * The order below is the DEFAULT order for fresh installs, roughly "how often a
  * reader reaches for it". It is NOT a visibility list — every id starts before
  * the divider (i.e. eligible to be surfaced) and the *host* decides how many
- * actually fit: the desktop header renders every surfaced entry inline (no
- * width measurement — in a narrow dock the title compresses rather than the
- * row), the mobile header applies a fixed cap. See `useNarratorToolbarLayout`.
+ * actually fit: the desktop header MEASURES its available width and collapses
+ * the rest into the overflow menu (see
+ * `frontend/components/narrator/narrator-header-toolbar-capacity.ts`), while the
+ * mobile header additionally applies the fixed cap below. Earlier the desktop
+ * row rendered every surfaced entry and let the title compress instead, which
+ * squeezed long titles down to a few characters.
  *
  * Two classes of control are deliberately absent:
  *

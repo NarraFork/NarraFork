@@ -152,6 +152,53 @@ describe("buildRowToolActions", () => {
 		expect(actions.onViewSubagentSession).toBeUndefined();
 	});
 
+	it("binds view-session to a Send's single addressee", () => {
+		const sink: string[] = [];
+		const actions = buildRowToolActions(
+			{ toolName: "Send", sendTargetNarratorId: "sub-3" },
+			allHandlers(sink),
+		);
+		actions.onViewSubagentSession?.();
+		expect(sink).toEqual(["view:sub-3"]);
+	});
+
+	/**
+	 * ⚠️ A Send target is not this row's child — it may be a sibling, or the
+	 * parent — and its background lifecycle belongs to the Agent call that created
+	 * it. Detaching or cancelling from a Send row would act on a narrator this row
+	 * never owned, so the id must reach view-session ONLY.
+	 */
+	it("never offers detach or cancel from a Send row", () => {
+		const running = buildRowToolActions(
+			{ toolName: "Send", sendTargetNarratorId: "sub-3" },
+			allHandlers([]),
+		);
+		expect(running.onViewSubagentSession).toBeDefined();
+		expect(running.onDetachSubagent).toBeUndefined();
+		expect(running.onCancelBackgroundTask).toBeUndefined();
+
+		const background = buildRowToolActions(
+			{ toolName: "Send", sendTargetNarratorId: "sub-3", isBackground: true },
+			allHandlers([]),
+		);
+		expect(background.onDetachSubagent).toBeUndefined();
+		expect(background.onCancelBackgroundTask).toBeUndefined();
+	});
+
+	/**
+	 * A real child (Agent/Task) still wins: when both facts are present the row IS
+	 * a subagent card, and its own child is what "view session" should open.
+	 */
+	it("prefers a real child narrator over a Send target", () => {
+		const sink: string[] = [];
+		const actions = buildRowToolActions(
+			{ toolName: "Send", subagentNarratorId: "sub-child", sendTargetNarratorId: "sub-target" },
+			allHandlers(sink),
+		);
+		actions.onViewSubagentSession?.();
+		expect(sink).toEqual(["view:sub-child"]);
+	});
+
 	// ── background lifecycle gating ────────────────────────────────────────────
 
 	it("offers detach for a live foreground subagent", () => {

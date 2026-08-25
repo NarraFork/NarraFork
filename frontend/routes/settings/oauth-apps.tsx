@@ -194,12 +194,12 @@ function ExternalWebSocketSettingsSection() {
 							label={t("oauthExternalWebSocketAllowedOrigins")}
 							description={t("oauthExternalWebSocketAllowedOriginsHint")}
 							value={form.allowedOriginsText}
-							onChange={(event) =>
-								setForm((current) => ({
-									...current,
-									allowedOriginsText: event.currentTarget.value,
-								}))
-							}
+							onChange={(event) => {
+								// currentTarget is nulled after the handler returns, so read it
+								// before the deferred updater runs.
+								const val = event.currentTarget.value;
+								setForm((current) => ({ ...current, allowedOriginsText: val }));
+							}}
 							minRows={2}
 							autosize
 						/>

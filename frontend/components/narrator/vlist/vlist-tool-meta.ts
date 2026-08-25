@@ -51,6 +51,8 @@ export interface VListToolMeta {
 	awaitAgentTargetId?: string;
 	/** Await({type:"agent"}): the resolved child narrator id, when known. */
 	awaitAgentNarratorId?: string;
+	/** Send: the addressed narrator id, when the call had exactly one target. */
+	sendTargetNarratorId?: string;
 	/** File-oriented tools: the input file path (copy path / view file). */
 	filePath?: string;
 	/** Read tool → the file can be previewed inline (modal). */
@@ -119,6 +121,64 @@ export function deriveAwaitAgentTargetId(
 }
 
 /**
+ * Reserved selectors a subagent uses to address its parent. Mirrors
+ * `PARENT_SELECTORS` (server/services/agent-communication.ts).
+ *
+ * Checked against BOTH fields, because the two carry it in different shapes:
+ *
+ *  - `id` holds a raw selector only on the mixed-target rejection path, which
+ *    echoes the selectors back instead of resolved ids.
+ *  - `label` holds it on a SUCCESSFUL parent report: `tryRouteToParent` labels the
+ *    target with the selector the model typed while `id` is the parent's real
+ *    narrator id. That id is the only reason the label has to be consulted at all
+ *    (see `deriveSendTargetNarratorId`).
+ */
+const RESERVED_SEND_SELECTORS = new Set(["parent", "main", "@parent", "@main"]);
+
+function isReservedSendSelector(value: unknown): boolean {
+	return typeof value === "string" && RESERVED_SEND_SELECTORS.has(value.trim().toLowerCase());
+}
+
+/**
+ * `Send` → the narrator id whose session the card can open.
+ *
+ * Send's `metadata.targets[]` is the only place this fact lives: a Send does not
+ * create child messages, so `_subagentActivity` (a join on `parentToolUseId`) is
+ * empty for it — 628 of 649 Send calls in a real database. Without reading the
+ * targets, "view session" is hidden on every Send card even though the tool
+ * layer deliberately kept the REAL id there for exactly this purpose (see
+ * `SendTargetResult.id`).
+ *
+ * Only a SINGLE-target Send resolves. A fan-out Send addresses several sessions
+ * and one menu item cannot say which — the same reason an ambiguous Await
+ * selector resolves to nothing rather than guessing (`resolveAgainstRoster`).
+ * This also excludes the mixed parent/sibling rejection path, which is the one
+ * shape whose `id` holds a raw selector rather than a narrator id (it always has
+ * ≥2 targets, since "mixed" requires both kinds).
+ *
+ * ⚠️ A report to the PARENT resolves to nothing even though its `id` is a perfectly
+ * valid narrator id. The affordance this feeds opens a SUBAGENT session panel
+ * (`openSubagentPanel` → `SubagentSessionPanelContent`), which titles an untitled
+ * narrator "Subagent" and files it under subagent recent tabs. Pointing that at a
+ * primary narrator misrepresents what the reader is looking at, and nothing would
+ * report the mismatch. The parent's own session is reachable from the subagent
+ * panel's own header, which is the honest route.
+ */
+export function deriveSendTargetNarratorId(
+	toolName: string | undefined,
+	metadata: Record<string, unknown>,
+): string | undefined {
+	if (toolName !== "Send") return undefined;
+	const targets = metadata.targets;
+	if (!Array.isArray(targets) || targets.length !== 1) return undefined;
+	const target = asRecord(targets[0]);
+	if (isReservedSendSelector(target.label)) return undefined;
+	const id = nonEmpty(target.id);
+	if (!id || isReservedSendSelector(id)) return undefined;
+	return id;
+}
+
+/**
  * The resolved child narrator id for an Await-agent call, when discoverable.
  *
  * Order matters: the tool's OWN returned metadata is authoritative and wins, then
@@ -162,6 +222,8 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 		const awaitNarratorId = deriveAwaitAgentNarratorId(block, metadata);
 		if (awaitNarratorId) meta.awaitAgentNarratorId = awaitNarratorId;
 	}
+	const sendTargetNarratorId = deriveSendTargetNarratorId(toolName, metadata);
+	if (sendTargetNarratorId) meta.sendTargetNarratorId = sendTargetNarratorId;
 	if (filePath) {
 		meta.filePath = filePath;
 		meta.isFileTool = true;

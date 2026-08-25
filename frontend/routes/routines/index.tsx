@@ -6,6 +6,7 @@ import {
 	Collapse,
 	Container,
 	Group,
+	JsonInput,
 	Modal,
 	NumberInput,
 	Paper,
@@ -87,6 +88,12 @@ import {
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { filterUnsupportedMcpImportTransports } from "../../lib/mcp-import";
+import {
+	MCP_SECRET_KEEP_PLACEHOLDER,
+	type McpJsonParseErrorKey,
+	mcpDraftToJsonText,
+	parseMcpDraftJson,
+} from "../../lib/mcp-json-draft";
 import {
 	buildMcpSecretPatch,
 	createPreservedMcpSecretEntries,
@@ -1883,6 +1890,50 @@ function McpToolsTab() {
 	const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
 	const [expandedServer, setExpandedServer] = useState<string | null>(null);
 
+	// JSON editing mode for the current draft. `draft` stays the single source of
+	// truth: every accepted keystroke is parsed straight back into it, so Save and
+	// Test need no knowledge of which view is active. `jsonText` is only the edit
+	// buffer, never regenerated from `draft` while typing (that would fight the
+	// caret), which is why it is re-serialized on each mode switch instead.
+	const [editMode, setEditMode] = useState<"form" | "json">("form");
+	const [jsonText, setJsonText] = useState("");
+	const [jsonError, setJsonError] = useState<{
+		key: McpJsonParseErrorKey;
+		params?: Record<string, string>;
+	} | null>(null);
+	const jsonErrorMessage = jsonError ? t(jsonError.key, jsonError.params) : undefined;
+
+	const handleJsonChange = useCallback(
+		(value: string) => {
+			setJsonText(value);
+			const result = parseMcpDraftJson(value, draft);
+			if (!result.ok) {
+				setJsonError({ key: result.errorKey, params: result.params });
+				return;
+			}
+			setJsonError(null);
+			setDraft(result.draft);
+		},
+		[draft],
+	);
+
+	const handleEditModeChange = useCallback(
+		(value: string) => {
+			const next = value === "json" ? "json" : "form";
+			if (next === editMode) return;
+			if (next === "json") {
+				setJsonText(mcpDraftToJsonText(draft));
+				setJsonError(null);
+			} else if (jsonError) {
+				// Returning to the form would render `draft`, which still holds the
+				// last valid document — the invalid text would vanish without a trace.
+				return;
+			}
+			setEditMode(next);
+		},
+		[draft, editMode, jsonError],
+	);
+
 	// Import state
 	const [importOpened, { open: openImport, close: closeImport }] = useDisclosure(false);
 	const importMutation = useImportMcpServers();
@@ -1946,6 +1997,8 @@ function McpToolsTab() {
 		if (!mcpServerManagementSupported) return;
 		setEditingId(null);
 		setDraft({ ...EMPTY_DRAFT });
+		setEditMode("form");
+		setJsonError(null);
 		testMutation.reset();
 		openEdit();
 	}, [mcpServerManagementSupported, openEdit, testMutation]);
@@ -1967,6 +2020,8 @@ function McpToolsTab() {
 			if (!mcpServerManagementSupported) return;
 			const envKeys = server.envKeys ?? [];
 			const headerKeys = server.headerKeys ?? [];
+			setEditMode("form");
+			setJsonError(null);
 			setEditingId(server.id);
 			setDraft({
 				name: server.name ?? "",
@@ -2026,6 +2081,9 @@ function McpToolsTab() {
 
 	const handleSave = useCallback(() => {
 		if (!mcpServerManagementSupported || draftTransportUnsupportedReason) return;
+		// With invalid JSON on screen, `draft` still holds the last document that
+		// parsed. Saving it would persist something the user is not looking at.
+		if (jsonError) return;
 		if (draft.transport !== "stdio") {
 			const normalizedUrl = normalizeUrlProtocol(draft.url) ?? "";
 			if (normalizedUrl !== draft.url) setDraft((d) => ({ ...d, url: normalizedUrl }));
@@ -2047,12 +2105,14 @@ function McpToolsTab() {
 		closeEdit,
 		draftToPayload,
 		draftTransportUnsupportedReason,
+		jsonError,
 		mcpServerManagementSupported,
 		mcpServerPermissionsSupported,
 	]);
 
 	const handleTest = useCallback(() => {
 		if (!mcpServerManagementSupported || draftTransportUnsupportedReason) return;
+		if (jsonError) return;
 		if (draft.transport !== "stdio") {
 			const normalizedUrl = normalizeUrlProtocol(draft.url) ?? "";
 			if (normalizedUrl !== draft.url) setDraft((d) => ({ ...d, url: normalizedUrl }));
@@ -2066,6 +2126,7 @@ function McpToolsTab() {
 		testMutation,
 		draftToPayload,
 		draftTransportUnsupportedReason,
+		jsonError,
 		mcpServerManagementSupported,
 		mcpServerPermissionsSupported,
 	]);
@@ -2360,105 +2421,206 @@ function McpToolsTab() {
 				size="lg"
 			>
 				<Stack>
-					<TextInput
-						label={t("mcpServerName")}
-						placeholder={t("mcpServerNamePlaceholder")}
-						value={draft.name}
-						onChange={(e) => {
-							const val = e.currentTarget.value;
-							setDraft((d) => ({ ...d, name: val }));
-						}}
-					/>
-					<div>
-						<Text size="sm" fw={500} mb={4}>
-							{t("mcpTransportType")}
-						</Text>
+					<Group justify="flex-end">
 						<SegmentedControl
-							value={draft.transport}
-							onChange={(v) => {
-								const nextTransport = v as McpServerDraft["transport"];
-								if (!getDraftTransportCapability(nextTransport).supported) return;
-								setDraft((d) => ({
-									...d,
-									transport: nextTransport,
-								}));
-							}}
+							value={editMode}
+							onChange={handleEditModeChange}
 							data={[
+								{ value: "form", label: t("mcpEditModeForm") },
 								{
-									value: "stdio",
-									label: t("mcpTransportStdio"),
-									disabled: !mcpTransportCapability.stdio.supported,
-								},
-								{
-									value: "streamable-http",
-									label: t("mcpTransportHttp"),
-									disabled: !mcpTransportCapability.streamableHttp.supported,
-								},
-								{
-									value: "sse",
-									label: t("mcpTransportSse"),
-									disabled: !mcpTransportCapability.sse.supported,
+									value: "json",
+									label: t("mcpEditModeJson"),
 								},
 							]}
 							size="xs"
 						/>
-					</div>
+					</Group>
 
-					{draftTransportUnsupportedReason && (
-						<Alert color="yellow" variant="light" title={t("mcpTransportUnsupportedTitle")}>
-							{draftTransportUnsupportedReason}
-						</Alert>
-					)}
-
-					{draft.transport === "stdio" ? (
+					{editMode === "json" ? (
 						<>
-							<TextInput
-								label={t("mcpCommand")}
-								placeholder={t("mcpCommandPlaceholder")}
-								value={draft.command}
-								onChange={(e) => {
-									const val = e.currentTarget.value;
-									setDraft((d) => ({ ...d, command: val }));
-								}}
-							/>
-							<Textarea
-								label={t("mcpArgs")}
-								placeholder={t("mcpArgsPlaceholder")}
-								value={draft.args}
-								onChange={(e) => {
-									const val = e.currentTarget.value;
-									setDraft((d) => ({ ...d, args: val }));
-								}}
+							<Text size="xs" c="dimmed">
+								{t("mcpJsonEditDesc", { placeholder: MCP_SECRET_KEEP_PLACEHOLDER })}
+							</Text>
+							<JsonInput
+								value={jsonText}
+								onChange={handleJsonChange}
+								error={jsonErrorMessage}
 								autosize
-								minRows={2}
-								maxRows={6}
-							/>
-							<TextInput
-								label={t("mcpCwd")}
-								placeholder={t("mcpCwdPlaceholder")}
-								value={draft.cwd}
-								onChange={(e) => {
-									const val = e.currentTarget.value;
-									setDraft((d) => ({ ...d, cwd: val }));
-								}}
+								minRows={12}
+								maxRows={24}
+								spellCheck={false}
+								styles={{ input: { fontFamily: "monospace", fontSize: 12 } }}
 							/>
 						</>
 					) : (
 						<>
 							<TextInput
-								label={t("mcpUrl")}
-								placeholder={t("mcpUrlPlaceholder")}
-								value={draft.url}
+								label={t("mcpServerName")}
+								placeholder={t("mcpServerNamePlaceholder")}
+								value={draft.name}
 								onChange={(e) => {
 									const val = e.currentTarget.value;
-									setDraft((d) => ({ ...d, url: val }));
+									setDraft((d) => ({ ...d, name: val }));
 								}}
 							/>
-							{/* Headers */}
+							<div>
+								<Text size="sm" fw={500} mb={4}>
+									{t("mcpTransportType")}
+								</Text>
+								<SegmentedControl
+									value={draft.transport}
+									onChange={(v) => {
+										const nextTransport = v as McpServerDraft["transport"];
+										if (!getDraftTransportCapability(nextTransport).supported) return;
+										setDraft((d) => ({
+											...d,
+											transport: nextTransport,
+										}));
+									}}
+									data={[
+										{
+											value: "stdio",
+											label: t("mcpTransportStdio"),
+											disabled: !mcpTransportCapability.stdio.supported,
+										},
+										{
+											value: "streamable-http",
+											label: t("mcpTransportHttp"),
+											disabled: !mcpTransportCapability.streamableHttp.supported,
+										},
+										{
+											value: "sse",
+											label: t("mcpTransportSse"),
+											disabled: !mcpTransportCapability.sse.supported,
+										},
+									]}
+									size="xs"
+								/>
+							</div>
+
+							{draftTransportUnsupportedReason && (
+								<Alert color="yellow" variant="light" title={t("mcpTransportUnsupportedTitle")}>
+									{draftTransportUnsupportedReason}
+								</Alert>
+							)}
+
+							{draft.transport === "stdio" ? (
+								<>
+									<TextInput
+										label={t("mcpCommand")}
+										placeholder={t("mcpCommandPlaceholder")}
+										value={draft.command}
+										onChange={(e) => {
+											const val = e.currentTarget.value;
+											setDraft((d) => ({ ...d, command: val }));
+										}}
+									/>
+									<Textarea
+										label={t("mcpArgs")}
+										placeholder={t("mcpArgsPlaceholder")}
+										value={draft.args}
+										onChange={(e) => {
+											const val = e.currentTarget.value;
+											setDraft((d) => ({ ...d, args: val }));
+										}}
+										autosize
+										minRows={2}
+										maxRows={6}
+									/>
+									<TextInput
+										label={t("mcpCwd")}
+										placeholder={t("mcpCwdPlaceholder")}
+										value={draft.cwd}
+										onChange={(e) => {
+											const val = e.currentTarget.value;
+											setDraft((d) => ({ ...d, cwd: val }));
+										}}
+									/>
+								</>
+							) : (
+								<>
+									<TextInput
+										label={t("mcpUrl")}
+										placeholder={t("mcpUrlPlaceholder")}
+										value={draft.url}
+										onChange={(e) => {
+											const val = e.currentTarget.value;
+											setDraft((d) => ({ ...d, url: val }));
+										}}
+									/>
+									{/* Headers */}
+									<div>
+										<Group justify="space-between" mb={4}>
+											<Text size="sm" fw={500}>
+												{t("mcpHeaders")}
+											</Text>
+											<Button
+												size="compact-xs"
+												variant="subtle"
+												onClick={() =>
+													setDraft((d) => ({
+														...d,
+														headers: [...d.headers, { key: "", value: "", dirty: false }],
+													}))
+												}
+											>
+												{t("mcpAddHeader")}
+											</Button>
+										</Group>
+										{draft.headers.map((h, i) => (
+											// biome-ignore lint/suspicious/noArrayIndexKey: dynamic key-value pairs without stable IDs
+											<Group key={i} gap="xs" mb={4}>
+												<TextInput
+													placeholder={t("mcpHeaderKey")}
+													value={h.key}
+													readOnly={h.preserved}
+													onChange={(e) => {
+														if (h.preserved) return;
+														const val = e.currentTarget.value;
+														const headers = [...draft.headers];
+														headers[i] = { ...h, key: val };
+														setDraft((d) => ({ ...d, headers }));
+													}}
+													size="xs"
+													style={{ flex: 1 }}
+												/>
+												<TextInput
+													placeholder={
+														h.preserved && !h.value ? t("mcpSecretUnchanged") : t("mcpHeaderValue")
+													}
+													type="password"
+													value={h.value}
+													onChange={(e) => {
+														const val = e.currentTarget.value;
+														const headers = [...draft.headers];
+														headers[i] = { ...h, value: val, dirty: true };
+														setDraft((d) => ({ ...d, headers }));
+													}}
+													size="xs"
+													style={{ flex: 1 }}
+												/>
+												<ActionIcon
+													variant="subtle"
+													color="red"
+													size="sm"
+													onClick={() => {
+														const headers = draft.headers.filter((_, j) => j !== i);
+														setDraft((d) => ({ ...d, headers }));
+													}}
+												>
+													<IconTrash size={12} />
+												</ActionIcon>
+											</Group>
+										))}
+									</div>
+								</>
+							)}
+
+							{/* Environment Variables */}
 							<div>
 								<Group justify="space-between" mb={4}>
 									<Text size="sm" fw={500}>
-										{t("mcpHeaders")}
+										{t("mcpEnv")}
 									</Text>
 									<Button
 										size="compact-xs"
@@ -2466,41 +2628,41 @@ function McpToolsTab() {
 										onClick={() =>
 											setDraft((d) => ({
 												...d,
-												headers: [...d.headers, { key: "", value: "", dirty: false }],
+												env: [...d.env, { key: "", value: "", dirty: false }],
 											}))
 										}
 									>
-										{t("mcpAddHeader")}
+										{t("mcpAddEnv")}
 									</Button>
 								</Group>
-								{draft.headers.map((h, i) => (
+								{draft.env.map((e, i) => (
 									// biome-ignore lint/suspicious/noArrayIndexKey: dynamic key-value pairs without stable IDs
 									<Group key={i} gap="xs" mb={4}>
 										<TextInput
-											placeholder={t("mcpHeaderKey")}
-											value={h.key}
-											readOnly={h.preserved}
-											onChange={(e) => {
-												if (h.preserved) return;
-												const val = e.currentTarget.value;
-												const headers = [...draft.headers];
-												headers[i] = { ...h, key: val };
-												setDraft((d) => ({ ...d, headers }));
+											placeholder={t("mcpEnvKey")}
+											value={e.key}
+											readOnly={e.preserved}
+											onChange={(ev) => {
+												if (e.preserved) return;
+												const val = ev.currentTarget.value;
+												const env = [...draft.env];
+												env[i] = { ...e, key: val };
+												setDraft((d) => ({ ...d, env }));
 											}}
 											size="xs"
 											style={{ flex: 1 }}
 										/>
 										<TextInput
 											placeholder={
-												h.preserved && !h.value ? t("mcpSecretUnchanged") : t("mcpHeaderValue")
+												e.preserved && !e.value ? t("mcpSecretUnchanged") : t("mcpEnvValue")
 											}
 											type="password"
-											value={h.value}
-											onChange={(e) => {
-												const val = e.currentTarget.value;
-												const headers = [...draft.headers];
-												headers[i] = { ...h, value: val, dirty: true };
-												setDraft((d) => ({ ...d, headers }));
+											value={e.value}
+											onChange={(ev) => {
+												const val = ev.currentTarget.value;
+												const env = [...draft.env];
+												env[i] = { ...e, value: val, dirty: true };
+												setDraft((d) => ({ ...d, env }));
 											}}
 											size="xs"
 											style={{ flex: 1 }}
@@ -2510,8 +2672,8 @@ function McpToolsTab() {
 											color="red"
 											size="sm"
 											onClick={() => {
-												const headers = draft.headers.filter((_, j) => j !== i);
-												setDraft((d) => ({ ...d, headers }));
+												const env = draft.env.filter((_, j) => j !== i);
+												setDraft((d) => ({ ...d, env }));
 											}}
 										>
 											<IconTrash size={12} />
@@ -2519,104 +2681,40 @@ function McpToolsTab() {
 									</Group>
 								))}
 							</div>
-						</>
-					)}
 
-					{/* Environment Variables */}
-					<div>
-						<Group justify="space-between" mb={4}>
-							<Text size="sm" fw={500}>
-								{t("mcpEnv")}
-							</Text>
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								onClick={() =>
+							<Switch
+								label={t("mcpEnabled")}
+								checked={draft.enabled}
+								onChange={(e) => {
+									const val = e.currentTarget.checked;
+									setDraft((d) => ({ ...d, enabled: val }));
+								}}
+							/>
+
+							<Select
+								label={t("mcpDefaultBehavior")}
+								description={t("mcpDefaultBehaviorDesc")}
+								value={draft.defaultBehavior}
+								disabled={!mcpServerPermissionsSupported}
+								onChange={(v) => {
+									if (!mcpServerPermissionsSupported) return;
 									setDraft((d) => ({
 										...d,
-										env: [...d.env, { key: "", value: "", dirty: false }],
-									}))
-								}
-							>
-								{t("mcpAddEnv")}
-							</Button>
-						</Group>
-						{draft.env.map((e, i) => (
-							// biome-ignore lint/suspicious/noArrayIndexKey: dynamic key-value pairs without stable IDs
-							<Group key={i} gap="xs" mb={4}>
-								<TextInput
-									placeholder={t("mcpEnvKey")}
-									value={e.key}
-									readOnly={e.preserved}
-									onChange={(ev) => {
-										if (e.preserved) return;
-										const val = ev.currentTarget.value;
-										const env = [...draft.env];
-										env[i] = { ...e, key: val };
-										setDraft((d) => ({ ...d, env }));
-									}}
-									size="xs"
-									style={{ flex: 1 }}
-								/>
-								<TextInput
-									placeholder={e.preserved && !e.value ? t("mcpSecretUnchanged") : t("mcpEnvValue")}
-									type="password"
-									value={e.value}
-									onChange={(ev) => {
-										const val = ev.currentTarget.value;
-										const env = [...draft.env];
-										env[i] = { ...e, value: val, dirty: true };
-										setDraft((d) => ({ ...d, env }));
-									}}
-									size="xs"
-									style={{ flex: 1 }}
-								/>
-								<ActionIcon
-									variant="subtle"
-									color="red"
-									size="sm"
-									onClick={() => {
-										const env = draft.env.filter((_, j) => j !== i);
-										setDraft((d) => ({ ...d, env }));
-									}}
-								>
-									<IconTrash size={12} />
-								</ActionIcon>
-							</Group>
-						))}
-					</div>
-
-					<Switch
-						label={t("mcpEnabled")}
-						checked={draft.enabled}
-						onChange={(e) => {
-							const val = e.currentTarget.checked;
-							setDraft((d) => ({ ...d, enabled: val }));
-						}}
-					/>
-
-					<Select
-						label={t("mcpDefaultBehavior")}
-						description={t("mcpDefaultBehaviorDesc")}
-						value={draft.defaultBehavior}
-						disabled={!mcpServerPermissionsSupported}
-						onChange={(v) => {
-							if (!mcpServerPermissionsSupported) return;
-							setDraft((d) => ({
-								...d,
-								defaultBehavior: (v ?? "") as McpServerDraft["defaultBehavior"],
-							}));
-						}}
-						data={[
-							{ value: "", label: t("mcpBehaviorFollow") },
-							{ value: "readOnly", label: t("mcpBehaviorReadOnly") },
-							{ value: "readWrite", label: t("mcpBehaviorReadWrite") },
-							{ value: "ask", label: t("mcpBehaviorAsk") },
-							{ value: "deny", label: t("mcpBehaviorDeny") },
-						]}
-						clearable={false}
-						size="sm"
-					/>
+										defaultBehavior: (v ?? "") as McpServerDraft["defaultBehavior"],
+									}));
+								}}
+								data={[
+									{ value: "", label: t("mcpBehaviorFollow") },
+									{ value: "readOnly", label: t("mcpBehaviorReadOnly") },
+									{ value: "readWrite", label: t("mcpBehaviorReadWrite") },
+									{ value: "ask", label: t("mcpBehaviorAsk") },
+									{ value: "deny", label: t("mcpBehaviorDeny") },
+								]}
+								clearable={false}
+								size="sm"
+							/>
+						</>
+					)}
 
 					{/* Test result */}
 					{testMutation.data && (
@@ -2635,7 +2733,9 @@ function McpToolsTab() {
 						<Button
 							variant="light"
 							onClick={handleTest}
-							disabled={!mcpServerManagementSupported || !!draftTransportUnsupportedReason}
+							disabled={
+								!mcpServerManagementSupported || !!draftTransportUnsupportedReason || !!jsonError
+							}
 							loading={testMutation.isPending}
 						>
 							{testMutation.isPending ? t("mcpTesting") : t("mcpTestConnection")}
@@ -2648,7 +2748,8 @@ function McpToolsTab() {
 							disabled={
 								!mcpServerManagementSupported ||
 								!draft.name.trim() ||
-								!!draftTransportUnsupportedReason
+								!!draftTransportUnsupportedReason ||
+								!!jsonError
 							}
 							loading={createMutation.isPending || updateMutation.isPending}
 						>

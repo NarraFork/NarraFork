@@ -464,6 +464,56 @@ describe("background task list deltas", () => {
 		expect((deltas[0]?.upsert as { status: string }).status).toBe("cancelled");
 		expect(broadcasts.some((b) => b.message.type === "background_task_cancelled")).toBe(false);
 	});
+
+	// Resuming a taken-over task by hand changes NO stored column: the row must keep
+	// its terminal status/completedAt for `finalizeResumedAgentTask`'s version guard.
+	// So nothing on the write paths pushes a frame, and with polling gone the panel
+	// kept rendering the stored status — a task the user was actively watching run
+	// stayed labelled "cancelled" for the whole continuation.
+	test("a manual continuation pushes a delta even though the row is unchanged", async () => {
+		await seedParent();
+		const subagentId = "resumed-sub";
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: subagentId,
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: PARENT,
+			status: "idle",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await backgroundTaskService.createAgentTask({
+			id: subagentId,
+			parentNarratorId: PARENT,
+			subagentNarratorId: subagentId,
+			subagentType: "general",
+		});
+		await backgroundTaskService.markTakenOver(subagentId);
+		await flushDeltas();
+		const stored = await backgroundTaskService.getById(subagentId);
+		expect(stored).toMatchObject({ status: "cancelled" });
+		broadcasts.length = 0;
+
+		// What the resumed runner sees: the loop is live in this process while the row
+		// is terminal, which is exactly the state `applyLiveness` calls `continued`.
+		liveLoops.add(subagentId);
+		backgroundTaskService.notifyDerivedStatusChanged(PARENT, subagentId);
+		await flushDeltas();
+
+		const deltas = listDeltas();
+		expect(deltas).toHaveLength(1);
+		const upsert = deltas[0]?.upsert as { status: string; effectiveStatus: string };
+		// The stored status is untouched — only the derived one moved, which is the
+		// whole reason this frame has to be pushed explicitly.
+		expect(upsert.status).toBe("cancelled");
+		expect(upsert.effectiveStatus).toBe("continued");
+		expect(deltas[0]?.activeCount).toBe(1);
+		await expect(backgroundTaskService.getById(subagentId)).resolves.toMatchObject({
+			status: "cancelled",
+			completedAt: stored?.completedAt ?? null,
+		});
+	});
 });
 
 describe("resolveSubagentNarratorId", () => {

@@ -328,7 +328,10 @@ export function ProjectSkillsManager({
 						placeholder={t("skillNamePlaceholder")}
 						value={draft.name}
 						onChange={(e) => {
-							updateDraft((d) => ({ ...d, name: e.currentTarget.value }));
+							// Read the value before the updater runs: React nulls out
+							// currentTarget once the event handler returns.
+							const val = e.currentTarget.value;
+							updateDraft((d) => ({ ...d, name: val }));
 						}}
 					/>
 					<TextInput
@@ -336,7 +339,8 @@ export function ProjectSkillsManager({
 						placeholder={t("skillDescriptionPlaceholder")}
 						value={draft.description}
 						onChange={(e) => {
-							updateDraft((d) => ({ ...d, description: e.currentTarget.value }));
+							const val = e.currentTarget.value;
+							updateDraft((d) => ({ ...d, description: val }));
 						}}
 					/>
 					<Textarea
@@ -344,7 +348,8 @@ export function ProjectSkillsManager({
 						placeholder={t("skillContentPlaceholder")}
 						value={draft.content}
 						onChange={(e) => {
-							updateDraft((d) => ({ ...d, content: e.currentTarget.value }));
+							const val = e.currentTarget.value;
+							updateDraft((d) => ({ ...d, content: val }));
 						}}
 						autosize
 						minRows={8}

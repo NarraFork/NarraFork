@@ -1596,12 +1596,15 @@ export function NarratorDetailsPanel({
 											placeholder={t("details.modelPurposePlaceholder")}
 											minRows={2}
 											value={modelPurposes[type]?.[model] ?? ""}
-											onChange={(event) =>
+											onChange={(event) => {
+												// currentTarget is nulled after the handler returns, so read it
+												// before the deferred updater runs.
+												const val = event.currentTarget.value;
 												setModelPurposes((old) => ({
 													...old,
-													[type]: { ...(old[type] ?? {}), [model]: event.currentTarget.value },
-												}))
-											}
+													[type]: { ...(old[type] ?? {}), [model]: val },
+												}));
+											}}
 										/>
 									))}
 								</Stack>

@@ -42,6 +42,20 @@ export interface NavItemDef {
 	 * the matching hook, so this is only the wiring key.
 	 */
 	badge?: "knowledgeReviewInbox" | "chatUnread";
+	/**
+	 * Start life BELOW the divider, i.e. in the "More" menu rather than the rail.
+	 *
+	 * The sidebar's vertical budget is shared with the recent-tabs list, which is
+	 * where the reader actually works; every entry pinned to the rail takes a row
+	 * from it permanently. So the default is "surfaced" only for entries a reader
+	 * navigates to repeatedly — the rest are one click away in the overflow menu,
+	 * which is also where the customization UI lives, so they stay discoverable.
+	 *
+	 * This is a DEFAULT, not a policy: it applies to an id the reader has never
+	 * positioned. Once an id appears in the persisted layout, its stored position
+	 * wins, so flipping this flag never moves an entry out from under someone.
+	 */
+	defaultTucked?: boolean;
 }
 
 /**
@@ -77,6 +91,7 @@ const NAV_ITEM_DETAILS: Record<CustomizableNavId, Omit<NavItemDef, "id">> = {
 		labelKey: "learning",
 		to: "/learn",
 		icon: IconBook2,
+		defaultTucked: true,
 	},
 	tutorial: {
 		labelKey: "tutorial",

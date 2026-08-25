@@ -437,6 +437,26 @@ class BackgroundTaskService {
 		void this.broadcastTaskUpsert(parentNarratorId, taskId);
 	}
 
+	/**
+	 * Push a delta for a row whose STORED state did not change, but whose derived
+	 * `effectiveStatus` did.
+	 *
+	 * `continued` and `child_running` are computed from narrator/runtime state, not
+	 * from the task row, so a subagent resumed by hand produces no write here and
+	 * therefore no delta. The list is purely delta-driven (there is deliberately no
+	 * poll left to paper over a missing frame), so without this the panel keeps
+	 * rendering the row's last stored status — a taken-over task reads "cancelled"
+	 * for the entire manual continuation.
+	 *
+	 * Exposed rather than left private because the caller that knows a continuation
+	 * started/ended is the subagent runner, and the alternative (having the runner
+	 * touch the row just to trigger a broadcast) would overwrite the terminal
+	 * version guard `finalizeResumedAgentTask` relies on.
+	 */
+	notifyDerivedStatusChanged(parentNarratorId: string, taskId: string): void {
+		this.queueTaskUpsert(parentNarratorId, taskId);
+	}
+
 	// ── Create ──────────────────────────────────────────────────────────
 
 	async createBashTask(opts: {

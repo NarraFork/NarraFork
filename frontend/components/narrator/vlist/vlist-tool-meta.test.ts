@@ -178,6 +178,136 @@ describe("deriveToolMeta", () => {
 		expect(meta?.awaitAgentNarratorId).toBeUndefined();
 	});
 
+	// ── Send ───────────────────────────────────────────────────────────────────
+	//
+	// The regression these cover: a Send creates no child messages, so the
+	// `_subagentActivity` join every other subagent card relies on is EMPTY for it
+	// (628 of 649 Send calls in a real database). The real narrator id lives only
+	// in `metadata.targets[]`, which no render path used to read — so "view
+	// session" was hidden on essentially every Send card.
+	//
+	// Payload shapes below are copied from real rows, not invented.
+
+	it("resolves the Send addressee from a single sibling target", () => {
+		const meta = deriveToolMeta(
+			toolBlock({
+				name: "Send",
+				input: { id: "verify-unstable", message: "done" },
+				output: {
+					_text: "Sent to verify-unstable; message queued.",
+					_metadata: {
+						kind: "send",
+						targets: [
+							{
+								id: "SOuKPDwfvhldnXwHuZ6rN",
+								title: "Verify unstable candidates",
+								status: "queued",
+								label: "verify-unstable",
+								awaited: false,
+							},
+						],
+					},
+				},
+			}),
+		);
+		expect(meta?.sendTargetNarratorId).toBe("SOuKPDwfvhldnXwHuZ6rN");
+	});
+
+	/**
+	 * ⚠️ A report to the PARENT is excluded even though its `id` is a real narrator
+	 * id: `tryRouteToParent` puts the parent's nanoid in `id` and the selector the
+	 * model typed in `label`.
+	 *
+	 * The affordance this feeds opens a SUBAGENT session panel, which titles an
+	 * untitled narrator "Subagent" and files it under subagent recent tabs. Aiming it
+	 * at a primary narrator misrepresents what the reader is looking at, and nothing
+	 * anywhere would report the mismatch.
+	 */
+	it("stays silent for a parent report, whose label is the reserved selector", () => {
+		const meta = deriveToolMeta(
+			toolBlock({
+				name: "Send",
+				input: { id: "parent", message: "done" },
+				output: {
+					_text: "Reported to the parent narrator; it will see the report on its next turn.",
+					_metadata: {
+						kind: "send",
+						targets: [
+							{
+								id: "SOuKPDwfvhldnXwHuZ6rN",
+								title: "未提交修改的代码审查",
+								status: "queued",
+								label: "parent",
+								awaited: false,
+							},
+						],
+					},
+				},
+			}),
+		);
+		expect(meta?.sendTargetNarratorId).toBeUndefined();
+	});
+
+	it("excludes every parent selector spelling, however it is cased or padded", () => {
+		for (const label of ["parent", "main", "@parent", "@main", "PARENT", " parent "]) {
+			const meta = deriveToolMeta(
+				toolBlock({
+					name: "Send",
+					output: { _metadata: { targets: [{ id: "SOuKPDwfvhldnXwHuZ6rN", label }] } },
+				}),
+			);
+			expect(meta?.sendTargetNarratorId).toBeUndefined();
+		}
+	});
+
+	/**
+	 * A fan-out Send addresses several sessions and one menu item cannot say
+	 * which. Same rule as an ambiguous Await selector: resolve to nothing rather
+	 * than navigate somewhere the reader did not ask for.
+	 */
+	it("stays silent for a fan-out Send", () => {
+		const meta = deriveToolMeta(
+			toolBlock({
+				name: "Send",
+				output: { _metadata: { targets: [{ id: "sub-a" }, { id: "sub-b" }] } },
+			}),
+		);
+		expect(meta?.sendTargetNarratorId).toBeUndefined();
+	});
+
+	/**
+	 * The mixed parent/sibling rejection path echoes the RAW selectors back
+	 * instead of resolved ids — the one shape whose `id` is not a narrator id.
+	 * It always has ≥2 targets, but the reserved-selector guard is asserted
+	 * directly so a future single-target rejection cannot slip through.
+	 */
+	it("rejects a reserved selector sitting in the id field", () => {
+		for (const reserved of ["parent", "main", "@parent", "@main", "PARENT"]) {
+			const meta = deriveToolMeta(
+				toolBlock({
+					name: "Send",
+					output: { _metadata: { targets: [{ id: reserved, status: "failed" }] } },
+				}),
+			);
+			expect(meta?.sendTargetNarratorId).toBeUndefined();
+		}
+	});
+
+	it("stays silent when a Send carries no targets", () => {
+		expect(
+			deriveToolMeta(toolBlock({ name: "Send", output: { _text: "Send error: ..." } }))
+				?.sendTargetNarratorId,
+		).toBeUndefined();
+		expect(deriveToolMeta(toolBlock({ name: "Send" }))?.sendTargetNarratorId).toBeUndefined();
+	});
+
+	it("does not read targets for other tools", () => {
+		const meta = deriveToolMeta(
+			toolBlock({ name: "Bash", output: { _metadata: { targets: [{ id: "sub-a" }] } } }),
+		);
+		expect(meta?.sendTargetNarratorId).toBeUndefined();
+	});
+
 	// ── background / terminal state ────────────────────────────────────────────
 
 	it("flags background subagents from either input key", () => {

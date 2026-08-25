@@ -33,8 +33,10 @@ export function useNarratorToolbarLayout({
 }: {
 	hostCapabilities: readonly NarratorToolbarHost[];
 	/**
-	 * `null` = no cap: the desktop header renders every surfaced entry and lets
-	 * the flex row absorb the width (the title compresses in a narrow dock).
+	 * `null` = no cap: `visible` holds every surfaced entry. The narrator header
+	 * passes `null` and applies its own MEASURED capacity afterwards
+	 * (`useNarratorHeaderToolbarCapacity`), which needs the uncapped count as its
+	 * input.
 	 */
 	visibleLimit: number | null;
 	/**

@@ -149,6 +149,7 @@ import {
 	useUpdateWhitelistDir,
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
+import { useNarratorHeaderToolbarCapacity } from "../../hooks/useNarratorHeaderToolbarCapacity";
 import { useNarratorLod } from "../../hooks/useNarratorLod";
 import { useNarratorToolbarLayout } from "../../hooks/useNarratorToolbarLayout";
 import {
@@ -267,6 +268,12 @@ import {
 } from "./NarratorStatusToolbar";
 import { NarratorToolbarOverflowMenu } from "./NarratorToolbarOverflowMenu";
 import { NugRechargeDialog } from "./NugRechargeDialog";
+import {
+	HEADER_TITLE_MIN_WIDTH_PX,
+	HEADER_TITLE_SLOT_ATTR,
+	HEADER_TOOLBAR_FIXED_ATTR,
+	selectHeaderToolbarEntries,
+} from "./narrator-header-toolbar-capacity";
 import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type { ContentBlock, NarratorMsg, NarratorPanelProps } from "./narrator-panel-types";
 import {
@@ -2355,6 +2362,16 @@ export function NarratorPanel({
 	 * workspace, detached subagent panel) still renders this block.
 	 */
 	const hostOwnsTitle = dock?.hostOwnsTitle === true;
+
+	/*
+	 * Header geometry for the tool-row capacity measurement. The ROW is the budget
+	 * source: its width does not depend on how many entries are inline, which is
+	 * what keeps the decision from cascading (see narrator-header-toolbar-capacity).
+	 */
+	const headerRowRef = useRef<HTMLDivElement>(null);
+	const headerLeadingRef = useRef<HTMLDivElement>(null);
+	const headerToolbarRef = useRef<HTMLDivElement>(null);
+
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
 	// concrete member so capability/context-window lookups work (the backend
@@ -6209,20 +6226,74 @@ export function NarratorPanel({
 
 	const {
 		entries: toolbarEntries,
-		visible: toolbarVisibleDefs,
+		visible: toolbarSurfacedDefs,
+		overflow: toolbarTuckedDefs,
 		saveLayout: saveToolbarLayout,
 	} = useNarratorToolbarLayout({
+		// Uncapped on purpose: the cap depends on how many entries are SURFACEABLE,
+		// which is what this partition computes. Capping here would make the count
+		// fed to the measurement depend on the measurement's own result.
+		visibleLimit: null,
 		hostCapabilities: headerHostCapabilities,
-		// Mobile caps by count (a phone row cannot both show buttons and keep the
-		// title readable); desktop passes null, rendering every surfaced entry and
-		// letting the flex row absorb the width (the title compresses in a narrow
-		// dock — no width measurement is involved).
-		visibleLimit: isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null,
 		// Per-narrator availability is applied INSIDE the partition (before the cap),
-		// so a capped mobile row back-fills past disabled entries instead of showing
-		// fewer buttons than the cap allows.
+		// so a capped row back-fills past disabled entries instead of showing fewer
+		// buttons than the cap allows.
 		entryEnabled: toolbarEntryEnabled,
 	});
+
+	/**
+	 * Width the title keeps before any entry collapses. Zero when the host draws
+	 * the title itself (a graph node), so the entries may claim that space —
+	 * previously the only way to stop the icon row from crushing the title was to
+	 * hide the title entirely, which is what `hostOwnsTitle` was doing.
+	 */
+	const headerTitleSlotMinWidth = useMemo(() => {
+		if (hostOwnsTitle || isWorkspacePreview) return 0;
+		// Plus the pencil / sparkles pair beside the title (ActionIcon size="xs" =
+		// 18px each, gap 4).
+		return HEADER_TITLE_MIN_WIDTH_PX + 2 * 18 + 2 * 4;
+	}, [hostOwnsTitle, isWorkspacePreview]);
+
+	const headerCapacity = useNarratorHeaderToolbarCapacity({
+		rowRef: headerRowRef,
+		toolbarRef: headerToolbarRef,
+		leadingRef: headerLeadingRef,
+		titleSlotMinWidth: headerTitleSlotMinWidth,
+		itemCount: toolbarSurfacedDefs.length,
+		// The measurement may not save a phone from itself: at ~360px a readable
+		// title plus two entries is the honest maximum, whatever the arithmetic says.
+		maxCapacity: isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null,
+		enabled: !isWorkspacePreview,
+	});
+
+	/**
+	 * `null` capacity = no successful measurement yet (first frame, no
+	 * ResizeObserver). Falling back to the mobile cap / "show everything" keeps the
+	 * previous behaviour rather than briefly emptying the row.
+	 */
+	const headerVisibleLimit =
+		headerCapacity ?? (isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null);
+	const headerSelection = useMemo(
+		() => selectHeaderToolbarEntries(toolbarSurfacedDefs, headerVisibleLimit),
+		[toolbarSurfacedDefs, headerVisibleLimit],
+	);
+	const toolbarVisibleDefs = headerSelection.visible;
+	/**
+	 * Everything not on the row: entries collapsed for width, plus the ones the
+	 * reader tucked away. Layout order is preserved so the menu reads as a
+	 * continuation of the row. This is also what the overflow button's aggregate
+	 * badge counts — without it, an entry collapsed for width would take its unread
+	 * count off screen with no trace.
+	 */
+	const toolbarHiddenDefs = useMemo(
+		() => [...headerSelection.hidden, ...toolbarTuckedDefs],
+		[headerSelection.hidden, toolbarTuckedDefs],
+	);
+	/** Ids collapsed for width — the menu marks these so "shown in header" stays honest. */
+	const toolbarNoRoomIds = useMemo(
+		() => headerSelection.hidden.map((def) => def.id as string),
+		[headerSelection.hidden],
+	);
 
 	/** Whether an entry's panel is currently open (drives the active styling). */
 	const toolbarEntryActive = useCallback(
@@ -6848,6 +6919,7 @@ export function NarratorPanel({
 					)}
 					{/* Header */}
 					<Group
+						ref={headerRowRef}
 						justify="space-between"
 						py="xs"
 						px="md"
@@ -6868,7 +6940,7 @@ export function NarratorPanel({
 								: undefined
 						}
 					>
-						<Group gap="xs" style={{ flex: 1, minWidth: 0 }}>
+						<Group ref={headerLeadingRef} gap="xs" style={{ flex: 1, minWidth: 0 }}>
 							{!isWorkspacePreview &&
 								(onMinimize ? (
 									<Tooltip label={t("backToGraph")} position="right">
@@ -6916,10 +6988,25 @@ export function NarratorPanel({
 										<IconArrowLeft size={16} />
 									</ActionIcon>
 								))}
-							{/* `flex: 1` even when the title is suppressed: it is what pushes the
-							    tool row to the right edge, and it hands the freed width to those
-							    buttons instead of leaving a gap where the title used to be. */}
-							<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="nowrap">
+							{/*
+							 * `flex: 1` even when the title is suppressed: it is what pushes the
+							 * tool row to the right edge, and it hands the freed width to those
+							 * buttons instead of leaving a gap where the title used to be.
+							 *
+							 * The floor that keeps the title readable is the capacity BUDGET
+							 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
+							 * would win against the tool row's `flex-shrink: 0` only by overflowing
+							 * or wrapping a nowrap row — both worse than the truncation it would
+							 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
+							 * budgets it by policy instead of reading a width this element derives
+							 * from whatever the tool row left over.
+							 */}
+							<Group
+								{...{ [HEADER_TITLE_SLOT_ATTR]: "" }}
+								gap={4}
+								style={{ flex: 1, minWidth: 0 }}
+								wrap="nowrap"
+							>
 								{hostOwnsTitle ? null : editingTitle && !isWorkspacePreview ? (
 									<TextInput
 										ref={titleInputRef}
@@ -6983,12 +7070,13 @@ export function NarratorPanel({
 							)}
 						</Group>
 						{!isWorkspacePreview && (
-							<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
+							<Group ref={headerToolbarRef} gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
 								{/*
 								 * Registry-driven tool entries. The SET comes from the registry, the
 								 * ORDER from the user's saved layout, and how many are surfaced from
-								 * the host (mobile caps by count; desktop renders every surfaced
-								 * entry and lets the title compress before the row). Entries the
+								 * the measured width of this row (mobile additionally caps by count).
+								 * Entries that do not fit move into the overflow menu instead of
+								 * compressing the title, which is what the row used to do. Entries the
 								 * host cannot present are absent from both lists rather than rendered
 								 * disabled — but they stay in the layout, so they return on a surface
 								 * that supports them.
@@ -7089,6 +7177,7 @@ export function NarratorPanel({
 								{dock && mockStreamEnabled && (
 									<Tooltip label="Mock stream (debug)">
 										<ActionIcon
+											{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
 											size="sm"
 											variant={dock.openToolTypes.has("mock") ? "light" : "subtle"}
 											color={dock.openToolTypes.has("mock") ? "indigo" : "gray"}
@@ -7099,13 +7188,16 @@ export function NarratorPanel({
 									</Tooltip>
 								)}
 								{/*
-								 * Overflow menu: lists the tucked entries, carries the aggregate badge
-								 * so a tucked unread count is not lost, and owns the reorder UI.
-								 * Archive lives at its bottom — a destructive action must not sit one
-								 * mis-tap away from the panel toggles.
+								 * Overflow menu: lists everything not on the row (tucked by the user or
+								 * collapsed for width), carries the aggregate badge so a hidden unread
+								 * count is not lost, and owns the reorder UI. Archive lives at its
+								 * bottom — a destructive action must not sit one mis-tap away from the
+								 * panel toggles.
 								 */}
 								<NarratorToolbarOverflowMenu
 									entries={toolbarEntries}
+									hiddenDefs={toolbarHiddenDefs}
+									noRoomIds={toolbarNoRoomIds}
 									onSaveLayout={saveToolbarLayout}
 									hostCapabilities={headerHostCapabilities}
 									badgeCounts={toolbarBadgeCounts}
@@ -7115,7 +7207,13 @@ export function NarratorPanel({
 								/>
 								{onClose && (
 									<Tooltip label={t("closePanel")}>
-										<ActionIcon size="sm" variant="subtle" color="red" onClick={onClose}>
+										<ActionIcon
+											{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
+											size="sm"
+											variant="subtle"
+											color="red"
+											onClick={onClose}
+										>
 											<IconX size={16} />
 										</ActionIcon>
 									</Tooltip>

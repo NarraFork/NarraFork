@@ -115,9 +115,11 @@ export interface ToolbarPartition {
  * excluded from both lists; they stay in the persisted layout and return when
  * the narrator regains whatever the entry needs.
  *
- * `visibleLimit` of `null` means "no cap" — the desktop header takes every
- * available entry and lets the flex row absorb the width (the title compresses
- * in a narrow dock; there is deliberately no width measurement here).
+ * `visibleLimit` of `null` means "no cap": every available entry comes back in
+ * `visible`. That is what the narrator header asks for, because the row's real
+ * capacity is MEASURED one step later (`useNarratorHeaderToolbarCapacity`) and
+ * that measurement needs to know how many entries are surfaceable. Capping here
+ * would make its input depend on its own output.
  */
 export function partitionToolbar({
 	entries,

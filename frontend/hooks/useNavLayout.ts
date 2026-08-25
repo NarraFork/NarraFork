@@ -1,8 +1,14 @@
-import { type CustomizableNavId, isCustomizableNavId, NAV_DIVIDER_ID } from "@shared/nav-layout";
+import type { CustomizableNavId } from "@shared/nav-layout";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
-import { CUSTOMIZABLE_NAV_ITEMS } from "../components/nav/nav-items";
 import type { api } from "../lib/api";
+import {
+	DEFAULT_NAV_ENTRIES,
+	mergeNavLayout,
+	NAV_DIVIDER_ID,
+	type NavLayoutEntry,
+	toPersistedNavLayout,
+} from "./nav-layout";
 import { useUpdateUserPreferences, useUserPreferences } from "./useUserPreferences";
 
 /**
@@ -10,78 +16,17 @@ import { useUpdateUserPreferences, useUserPreferences } from "./useUserPreferenc
  * the divider — marks the boundary: every id AFTER it is tucked into the
  * "More" menu, every id before it is shown in the sidebar. Visibility is
  * derived from position, never stored separately.
+ *
+ * The merge / serialize rules live in `./nav-layout` so they can be tested
+ * without a React tree; this hook is only the query wiring around them.
  */
-export { NAV_DIVIDER_ID };
-
-/** One entry in the flat layout list. */
-export type NavLayoutEntry = { kind: "item"; id: CustomizableNavId } | { kind: "divider" };
+export { NAV_DIVIDER_ID, type NavLayoutEntry };
 
 export interface NavLayout {
 	items: NavLayoutEntry[];
 }
 
 type Preferences = Awaited<ReturnType<typeof api.getUserPreferences>>;
-
-const DEFAULT_ENTRIES: NavLayoutEntry[] = [
-	...CUSTOMIZABLE_NAV_ITEMS.map((def): NavLayoutEntry => ({ kind: "item", id: def.id })),
-	{ kind: "divider" },
-];
-
-/**
- * Normalize persisted data into the flat entry list:
- * - legacy `{id, hidden}` shape → place hidden entries after the divider
- * - drop unknown/stale ids, drop duplicate dividers (keep the first)
- * - append new registry ids missing from the persisted layout (new features),
- *   inserted just before the divider so they are visible by default
- */
-function mergeWithDefaults(persisted: unknown): NavLayoutEntry[] {
-	const rawItems =
-		persisted && typeof persisted === "object" && !Array.isArray(persisted)
-			? (persisted as { items?: unknown }).items
-			: undefined;
-
-	const beforeDivider: CustomizableNavId[] = [];
-	const afterDivider: CustomizableNavId[] = [];
-	let seenDivider = false;
-
-	if (Array.isArray(rawItems)) {
-		for (const raw of rawItems) {
-			if (!raw || typeof raw !== "object") continue;
-			const record = raw as { id?: unknown; kind?: unknown; hidden?: unknown };
-			if (record.id === NAV_DIVIDER_ID || record.kind === "divider") {
-				if (!seenDivider) seenDivider = true;
-				continue;
-			}
-			if (typeof record.id !== "string" || !isCustomizableNavId(record.id)) continue;
-			if (beforeDivider.includes(record.id) || afterDivider.includes(record.id)) continue;
-			// Legacy shape: explicit hidden flag wins; otherwise position relative to divider.
-			const hidden = record.hidden === true || (record.hidden == null && seenDivider);
-			(hidden ? afterDivider : beforeDivider).push(record.id);
-		}
-	}
-
-	// New registry ids (new navigation entries) default to visible.
-	for (const def of CUSTOMIZABLE_NAV_ITEMS) {
-		if (!beforeDivider.includes(def.id) && !afterDivider.includes(def.id)) {
-			beforeDivider.push(def.id);
-		}
-	}
-
-	return [
-		...beforeDivider.map((id): NavLayoutEntry => ({ kind: "item", id })),
-		{ kind: "divider" },
-		...afterDivider.map((id): NavLayoutEntry => ({ kind: "item", id })),
-	];
-}
-
-/** Serialize entries to the persisted JSON shape (flat ids, divider marker included). */
-function toPersisted(entries: NavLayoutEntry[]): { items: Array<{ id: string }> } {
-	return {
-		items: entries.map((entry) =>
-			entry.kind === "divider" ? { id: NAV_DIVIDER_ID } : { id: entry.id },
-		),
-	};
-}
 
 /**
  * Read and write the user's customizable sidebar navigation layout.
@@ -94,7 +39,7 @@ export function useNavLayout() {
 	const queryClient = useQueryClient();
 
 	const entries = useMemo<NavLayoutEntry[]>(
-		() => (prefs ? mergeWithDefaults(prefs.navLayout) : DEFAULT_ENTRIES),
+		() => (prefs ? mergeNavLayout(prefs.navLayout) : DEFAULT_NAV_ENTRIES),
 		[prefs],
 	);
 
@@ -113,7 +58,7 @@ export function useNavLayout() {
 
 	const saveLayout = useCallback(
 		(nextEntries: NavLayoutEntry[]) => {
-			const persisted = toPersisted(nextEntries);
+			const persisted = toPersistedNavLayout(nextEntries);
 			const previous = queryClient.getQueryData<Preferences>(["user-preferences"]);
 			// Optimistic update
 			if (previous) {

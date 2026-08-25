@@ -222,11 +222,15 @@ export function TraceRowInteraction({
 			: filePath
 		: "";
 	// A subagent card knows its child directly; an Await-agent row knows it only
-	// once its target resolved. Both open the same session.
-	const sessionNarratorId = tool?.subagentNarratorId ?? tool?.awaitAgentNarratorId;
+	// once its target resolved; a Send row knows its single addressee from the
+	// tool's own returned targets. All three open the same session.
+	const sessionNarratorId =
+		tool?.subagentNarratorId ?? tool?.awaitAgentNarratorId ?? tool?.sendTargetNarratorId;
 	const canViewSession = !!(sessionNarratorId && onViewSubagentSession);
 	// Background lifecycle actions only ever apply to a real child narrator, and
 	// only while it is still running (the gating the chunked subagent menu used).
+	// ⚠️ Deliberately NOT `sessionNarratorId`: a Send target may be a sibling or
+	// the parent, whose lifecycle this row does not own.
 	const childNarratorId = tool?.subagentNarratorId;
 	const canDetach = !!(
 		childNarratorId &&
