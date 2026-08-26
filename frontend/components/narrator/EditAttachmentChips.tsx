@@ -13,6 +13,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUploadCapability } from "../../hooks/usePlatform";
 import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "../../lib/api";
+import { apiUrl } from "../../lib/base-path";
 import { useImageViewer } from "../common/ImageViewerProvider";
 import { MAX_IMAGE_CLIPBOARD_BLOB_BYTES } from "./image-clipboard";
 
@@ -41,7 +42,7 @@ function useUploadedImageBlobUrl(
 		if (token) headers.Authorization = `Bearer ${token}`;
 		let cancelled = false;
 		let objectUrl: string | null = null;
-		fetch(`/api/uploads/${uploadNarratorId}/${imageId}`, { headers })
+		fetch(apiUrl(`/uploads/${uploadNarratorId}/${imageId}`), { headers })
 			.then(async (res) => {
 				absorbRenewedToken(res, token);
 				if (!res.ok) {

@@ -24,14 +24,20 @@ import type { NarraForkSettings } from "../settings/types";
  * Icon entries point at the branding routes rather than the static PNGs.
  *
  * Those routes serve `no-cache` + ETag, so an admin changing the colour is picked
- * up on the next revalidation. Pointing at `/pwa-512x512.png` would pin the
+ * up on the next revalidation. Pointing at `pwa-512x512.png` would pin the
  * default icon for anyone who already installed the app.
+ *
+ * The paths are RELATIVE, resolved by the browser against the manifest's own URL.
+ * A rooted `/api/branding/…` would address the origin root, which is not where
+ * NarraFork lives when it is mounted under a prefix (a reverse-proxy subpath, or
+ * code-server's `/proxy/<port>/`) — the icons would 404 and an installed app would
+ * fall back to a generic placeholder with nothing pointing at the cause.
  */
 const BRANDED_ICONS = [
-	{ src: "/api/branding/icon-192.png", sizes: "192x192", type: "image/png" },
-	{ src: "/api/branding/icon-512.png", sizes: "512x512", type: "image/png" },
+	{ src: "api/branding/icon-192.png", sizes: "192x192", type: "image/png" },
+	{ src: "api/branding/icon-512.png", sizes: "512x512", type: "image/png" },
 	{
-		src: "/api/branding/icon-512.png",
+		src: "api/branding/icon-512.png",
 		sizes: "512x512",
 		type: "image/png",
 		purpose: "maskable",

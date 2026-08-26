@@ -30,11 +30,25 @@ import {
 } from "../lib/oidc";
 import { settings } from "../lib/settings";
 import type { OidcProviderConfig } from "../lib/settings/types";
+import { spaRedirectLocation } from "../lib/spa-base-href";
 import { oidcExchangeSchema } from "../lib/validators";
 import { requireSessionAuth } from "../middleware/auth";
 import { ssoService } from "../services/sso-service";
 
 export const ssoRoutes = new Hono();
+
+/**
+ * Redirect the browser to an in-app route, correct under any mount prefix.
+ *
+ * ⚠️ A rooted `c.redirect("/login")` sends the user to the PROXY's `/login` when
+ * NarraFork is served from a subpath — not to us. At the end of a *successful* SSO
+ * ceremony that is a 404 or someone else's page, and nothing about it points back here.
+ * See `lib/spa-base-href.ts` for why the relative form is computed from the path we
+ * received.
+ */
+function redirectToApp(c: Context, target: string): Response {
+	return c.redirect(spaRedirectLocation(new URL(c.req.url).pathname, target));
+}
 
 const STATE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const CODE_TTL_MS = 2 * 60 * 1000; // 2 minutes
@@ -110,14 +124,16 @@ ssoRoutes.get("/providers", (c) => {
 ssoRoutes.get("/:providerId/start", async (c) => {
 	const providerId = c.req.param("providerId");
 	const provider = providerId ? findProvider(providerId) : undefined;
-	if (!provider) return c.redirect("/login?sso_error=unknown_provider");
+	if (!provider) return redirectToApp(c, "/login?sso_error=unknown_provider");
 	try {
 		const redirectUri = callbackUrl(c);
 		const url = await beginCeremony(provider, redirectUri);
+		// The IdP's own absolute URL — NOT an in-app route, so it must not be made
+		// relative to our mount point.
 		return c.redirect(url);
 	} catch (err) {
 		logger.error("SSO start failed", { provider: providerId, error: String(err) });
-		return c.redirect("/login?sso_error=start_failed");
+		return redirectToApp(c, "/login?sso_error=start_failed");
 	}
 });
 
@@ -126,17 +142,17 @@ export async function handleSsoCallback(c: Context) {
 	const code = c.req.query("code");
 	const state = c.req.query("state");
 	const oidcError = c.req.query("error");
-	if (oidcError) return c.redirect(`/login?sso_error=${encodeURIComponent(oidcError)}`);
-	if (!code || !state) return c.redirect("/login?sso_error=missing_params");
+	if (oidcError) return redirectToApp(c, `/login?sso_error=${encodeURIComponent(oidcError)}`);
+	if (!code || !state) return redirectToApp(c, "/login?sso_error=missing_params");
 
 	sweep();
 	const pending = pendingStates.get(state);
 	pendingStates.delete(state);
 	if (!pending || pending.expiresAt <= Date.now()) {
-		return c.redirect("/login?sso_error=state_expired");
+		return redirectToApp(c, "/login?sso_error=state_expired");
 	}
 	const provider = findProvider(pending.providerId);
-	if (!provider) return c.redirect("/login?sso_error=unknown_provider");
+	if (!provider) return redirectToApp(c, "/login?sso_error=unknown_provider");
 
 	let claims: OidcClaims;
 	try {
@@ -152,16 +168,16 @@ export async function handleSsoCallback(c: Context) {
 			provider: provider.id,
 			error: String(err),
 		});
-		return c.redirect("/login?sso_error=verification_failed");
+		return redirectToApp(c, "/login?sso_error=verification_failed");
 	}
 
 	// Link flow: attach the identity to the already-known user.
 	if (pending.linkUserId) {
 		const result = await ssoService.linkIdentity(pending.linkUserId, provider, claims);
 		if (!result.ok) {
-			return c.redirect("/settings/security?sso_error=already_linked_other");
+			return redirectToApp(c, "/settings/security?sso_error=already_linked_other");
 		}
-		return c.redirect("/settings/security?sso_linked=1");
+		return redirectToApp(c, "/settings/security?sso_linked=1");
 	}
 
 	// Login flow: resolve or provision the user, then hand back a one-time code.
@@ -169,10 +185,10 @@ export async function handleSsoCallback(c: Context) {
 		const userId = await ssoService.resolveLogin(provider, claims);
 		const ssoCode = generateId(32);
 		pendingCodes.set(ssoCode, { userId, expiresAt: Date.now() + CODE_TTL_MS });
-		return c.redirect(`/login?sso_code=${encodeURIComponent(ssoCode)}`);
+		return redirectToApp(c, `/login?sso_code=${encodeURIComponent(ssoCode)}`);
 	} catch (err) {
 		const code = err instanceof AppError && err.code ? err.code.toLowerCase() : "login_failed";
-		return c.redirect(`/login?sso_error=${encodeURIComponent(code)}`);
+		return redirectToApp(c, `/login?sso_error=${encodeURIComponent(code)}`);
 	}
 }
 

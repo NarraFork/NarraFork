@@ -1,6 +1,7 @@
+import { apiUrl } from "@frontend/lib/base-path";
 import type { Locale } from "@shared/i18n-locales";
 import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
-import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
+import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
 import type { ApiEntity } from "./types";
 
 /** Session result returned on a successful (single-factor or post-MFA) login. */
@@ -236,7 +237,7 @@ export const authApi = {
 	listSsoProviders: () => request<{ providers: SsoProvider[] }>("/auth/sso/providers"),
 
 	/** Server-side path users hit to begin an SSO login (browser navigates here). */
-	ssoStartUrl: (providerId: string) => `/api/auth/sso/${encodeURIComponent(providerId)}/start`,
+	ssoStartUrl: (providerId: string) => apiUrl(`/auth/sso/${encodeURIComponent(providerId)}/start`),
 
 	/** Exchange the one-time SSO code (from the callback redirect) for a session. */
 	ssoExchange: (code: string) =>
@@ -271,7 +272,7 @@ export const authApi = {
 	uploadAvatar: async (file: File) => {
 		const formData = new FormData();
 		formData.append("file", file);
-		const res = await authorizedFetch(`${BASE}/auth/me/avatar`, {
+		const res = await authorizedFetch(`${apiBase()}/auth/me/avatar`, {
 			method: "PATCH",
 			body: formData,
 		});

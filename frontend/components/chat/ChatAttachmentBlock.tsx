@@ -31,6 +31,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "../../lib/api";
 import type { ChatAttachment } from "../../lib/api/chat";
+import { apiUrl } from "../../lib/base-path";
 import { useImageViewer } from "../common/ImageViewerProvider";
 import type { MeasuredChatAttachment } from "./measure-chat-message";
 
@@ -81,7 +82,7 @@ function useChatAttachmentBlobUrl(
 		let cancelled = false;
 		let objectUrl: string | null = null;
 		setFailed(false);
-		fetch(`/api/chat/attachments/${attachmentId}`, { headers })
+		fetch(apiUrl(`/chat/attachments/${attachmentId}`), { headers })
 			.then(async (res) => {
 				// The token actually sent is passed through, so a tab that switched
 				// accounts mid-flight cannot have the old account's renewal written back.
@@ -120,7 +121,7 @@ async function downloadChatAttachment(attachment: ChatAttachment): Promise<boole
 	const token = getToken();
 	const headers: Record<string, string> = {};
 	if (token) headers.Authorization = `Bearer ${token}`;
-	const res = await fetch(`/api/chat/attachments/${attachment.id}`, { headers });
+	const res = await fetch(apiUrl(`/chat/attachments/${attachment.id}`), { headers });
 	absorbRenewedToken(res, token ?? undefined);
 	if (!res.ok) {
 		await clearTokenOnSessionFailure(res);

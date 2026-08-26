@@ -47,6 +47,11 @@ scripts/lib/__tests__/*
 # Imported by tests/scripts/build-plugin.test.ts, so it has to be in the repo or
 # `bun test` fails on a missing module in a fresh clone.
 !scripts/build-plugin.ts
+# The only way to produce the VS Code extension's .vsix. `scripts/*` above is a
+# blanket ignore, so without this line the script would silently be absent from a
+# fresh clone and `bun run package` inside vscode-extension/ would fail on a missing
+# module rather than on anything explaining why.
+!scripts/package-vscode-extension.ts
 .tmp-narrafork-home.*
 .release.local.json
 mitm-dump/
@@ -57,3 +62,14 @@ IMPROVEMENT-PLAN.md
 
 # Dynamic Spec runtime state (per-narrator task queue / planning notes)
 spec/
+
+# VS Code extension: build output and packaged artifacts. The SOURCES are tracked;
+# only the compiled `out/` and the .vsix are derived. `node_modules` is separate from
+# the repo root's because the extension runs on Node with its own toolchain.
+vscode-extension/node_modules/
+vscode-extension/out/
+vscode-extension/*.vsix
+# Scratch fixtures written by tests/vscode-extension/discovery.test.ts. Kept inside the
+# test directory (rather than /tmp) so the path stays within the working tree; each run
+# deletes its own, this covers an interrupted run.
+tests/vscode-extension/.tmp-settings-*.json

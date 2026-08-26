@@ -26,15 +26,28 @@ import {
 export const BRAND_NAME_STORAGE_KEY = "narrafork_brand_name";
 export const BRAND_ICON_COLOR_STORAGE_KEY = "narrafork_brand_icon_color";
 
-/** Recolouring endpoints. Requested only when the colour is not the default. */
-export const BRAND_FAVICON_URL = "/api/branding/favicon.svg";
-export const BRAND_APPLE_TOUCH_ICON_URL = "/api/branding/apple-touch-icon.png";
-export const BRAND_NOTIFICATION_ICON_URL = "/api/branding/icon-192.png";
+/**
+ * Recolouring endpoints. Requested only when the colour is not the default.
+ *
+ * RELATIVE, and every URL below with them. These values become `href` attributes and
+ * a `Notification`'s `icon`, all of which the browser resolves against the document
+ * base — so a relative path follows the app to whatever prefix it is mounted at (a
+ * reverse-proxy subpath, code-server's `/proxy/<port>/`). A rooted `/api/branding/…`
+ * would address the proxy's own root and 404, and the visible result is a missing
+ * favicon: no console error worth noticing, and nothing connecting it to branding.
+ *
+ * ⚠️ `index.html`'s inline boot script writes these same paths as literals (it runs
+ * before any module can load). The test in `tests/frontend/branding-boot.test.ts`
+ * asserts the two sides match, so a change here must be mirrored there.
+ */
+export const BRAND_FAVICON_URL = "api/branding/favicon.svg";
+export const BRAND_APPLE_TOUCH_ICON_URL = "api/branding/apple-touch-icon.png";
+export const BRAND_NOTIFICATION_ICON_URL = "api/branding/icon-192.png";
 
 /** Static defaults, used whenever the instance has not customized its colour. */
-export const DEFAULT_FAVICON_URL = "/favicon.svg";
-export const DEFAULT_APPLE_TOUCH_ICON_URL = "/apple-touch-icon-180x180.png";
-export const DEFAULT_NOTIFICATION_ICON_URL = "/pwa-192x192.png";
+export const DEFAULT_FAVICON_URL = "favicon.svg";
+export const DEFAULT_APPLE_TOUCH_ICON_URL = "apple-touch-icon-180x180.png";
+export const DEFAULT_NOTIFICATION_ICON_URL = "pwa-192x192.png";
 
 type BrandingListener = (branding: ResolvedBranding) => void;
 

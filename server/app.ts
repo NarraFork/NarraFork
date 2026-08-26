@@ -1,5 +1,3 @@
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
 import { SESSION_RENEWAL_HEADER } from "@shared/session-auth";
 import { count } from "drizzle-orm";
 import { Hono } from "hono";
@@ -7,6 +5,7 @@ import { cors } from "hono/cors";
 import { db } from "./db";
 import { users } from "./db/schema";
 import { buildAppErrorResponse, toErrorPayload } from "./lib/app-error-response";
+import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "./lib/cors-origin";
 import { catalogError } from "./lib/errors";
 import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
@@ -84,12 +83,6 @@ import { vnetRoutes } from "./routes/vnet";
 import { volumeSnapshotRoutes } from "./routes/volume-snapshots";
 import { workspaceRoutes } from "./routes/workspaces";
 
-const isCompiledBinary = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
-const hasFrontendBuild = existsSync(
-	resolve(import.meta.dir, "..", "dist", "frontend", "index.html"),
-);
-const isProd = isCompiledBinary || process.env.NODE_ENV === "production" || hasFrontendBuild;
-
 export interface AppEnv {
 	Bindings: {
 		clientIp?: string;
@@ -101,10 +94,72 @@ const app = new Hono<AppEnv>();
 
 const SLOW_API_REQUEST_MS = 1_000;
 
+/*
+ * Cross-origin policy for `/api/*`.
+ *
+ * Previously a single hard-coded string. Two reasons it had to change:
+ *
+ *  1. An embedded front end (the VS Code extension's webview) is cross-origin by
+ *     construction, and its desktop origin contains a per-webview random UUID that
+ *     cannot be configured ahead of time.
+ *  2. The former dev value was `http://localhost:5173`, while this repo's Vite dev
+ *     server runs on 7778 (`frontend/vite.config.ts`). That mismatch was invisible
+ *     because development is same-origin through Vite's proxy, so the branch had
+ *     simply never been exercised — a good illustration of why this decision belongs
+ *     in a tested function rather than inline.
+ *
+ * ⚠️ The allowance is only safe because authentication is `Authorization: Bearer`
+ * with no cookie path anywhere in the pipeline; see `lib/cors-origin.ts` for the full
+ * argument and for what must be revisited if a cookie is ever added.
+ */
+/*
+ * ⚠️ `Vary: Origin` on EVERY `/api/*` response, not only the preflight.
+ *
+ * Hono's cors middleware sets `Vary` only for `OPTIONS`. That was adequate while the
+ * allowed origin was one hard-coded string, because the header did not depend on the
+ * request. It now does: the value echoes back the caller's own origin. Without `Vary`
+ * a shared cache (a reverse proxy, a CDN) may serve the response it stored for one
+ * origin — including its `Access-Control-Allow-Origin` — to a different origin, which
+ * either leaks a readable response to a caller that was never allowed or refuses one
+ * that was. Both depend on deployment topology and neither produces an error.
+ *
+ * Registered BEFORE `cors()` so the append happens after it has written its headers
+ * (middleware unwinds in reverse), and appended rather than set so the
+ * `Access-Control-Request-Headers` value cors adds on a preflight survives.
+ */
+app.use("/api/*", async (c, next) => {
+	await next();
+	const existing = c.res.headers.get("Vary") ?? "";
+	if (!/(^|,)\s*origin\s*(,|$)/i.test(existing)) {
+		c.res.headers.append("Vary", "Origin");
+	}
+});
+
 app.use(
 	"/api/*",
 	cors({
-		origin: isProd ? `http://localhost:${settings.server.port}` : "http://localhost:5173",
+		origin: (origin, c) => {
+			// The request's own origin, so a reverse proxy or an alternate hostname is
+			// same-origin without configuration. Derived per request rather than from
+			// settings, which only know the listen port.
+			let selfOrigin: string | null = null;
+			try {
+				selfOrigin = new URL(c.req.url).origin;
+			} catch {
+				// An unparseable request URL only costs the same-origin shortcut; the
+				// remaining rules still apply.
+			}
+			return (
+				resolveAllowedCorsOrigin(origin, {
+					selfOrigin,
+					configured: normalizeConfiguredOrigins(settings.server.allowedOrigins),
+					// No dev-origin list: the Vite dev server runs on loopback, which the
+					// resolver already allows on any port. Enumerating it here would be a
+					// constant that looks load-bearing while never deciding anything —
+					// and `VITE_PORT` varies per invocation, so it could not be accurate.
+				}) ?? undefined
+			);
+		},
 		// The sliding-renewal token rides on a custom response header, which is
 		// invisible to cross-origin readers unless explicitly exposed.
 		exposeHeaders: [SESSION_RENEWAL_HEADER],

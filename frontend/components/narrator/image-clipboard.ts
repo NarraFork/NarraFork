@@ -1,4 +1,5 @@
 import { ApiError, authorizedFetch, readFetchError } from "../../lib/api";
+import { apiUrl, isApiUrl, resolveServerUrl } from "../../lib/base-path";
 
 export const MAX_INLINE_IMAGE_SOURCE_CHARS = 16 * 1024 * 1024;
 export const MAX_IMAGE_CLIPBOARD_BLOB_BYTES = 25 * 1024 * 1024;
@@ -19,9 +20,7 @@ function assertInlineImageSourceSafe(source: string): void {
 }
 
 function isRelativeImageUrl(source: string): boolean {
-	return (
-		source.startsWith("/api/") || /\.(?:png|jpe?g|gif|webp|avif|svg)(?:[?#].*)?$/i.test(source)
-	);
+	return isApiUrl(source) || /\.(?:png|jpe?g|gif|webp|avif|svg)(?:[?#].*)?$/i.test(source);
 }
 
 function normalizeImageSrc(imageSrc?: string | null): string | null {
@@ -35,7 +34,12 @@ function normalizeImageSrc(imageSrc?: string | null): string | null {
 		isRelativeImageUrl(source)
 	) {
 		if (source.startsWith("data:")) assertInlineImageSourceSafe(source);
-		return source;
+		// A rooted `/api/…` here is a server-minted, PERSISTED value (a screenshot's
+		// `previewUrl`), so it must be re-pointed at the mount prefix before it is fetched.
+		// Unlike the `<img>` path there is no fallback chain to rescue it: copy and download
+		// simply fail, and under a prefix the proxy answers with HTML, so the failure reads
+		// as a corrupt image rather than a wrong URL.
+		return resolveServerUrl(source);
 	}
 	assertInlineImageSourceSafe(source);
 	return `data:image/png;base64,${source}`;
@@ -44,7 +48,7 @@ function normalizeImageSrc(imageSrc?: string | null): string | null {
 function getSavedPathPreviewSource(savedPath?: string | null): string | null {
 	const path = savedPath?.trim();
 	if (!path) return null;
-	return `/api/fs/preview?path=${encodeURIComponent(path)}`;
+	return `${apiUrl("/fs/preview")}?path=${encodeURIComponent(path)}`;
 }
 
 function clipboardItemSupports(type: string): boolean {
@@ -67,7 +71,7 @@ export async function fetchImageBlob({
 	const savedPathSource = getSavedPathPreviewSource(savedPath);
 	const source = savedPathSource ?? normalizeImageSrc(imageSrc);
 	if (!source) throw new Error("No image source");
-	const needsAuth = savedPathSource != null || source.startsWith("/api/");
+	const needsAuth = savedPathSource != null || isApiUrl(source);
 
 	const response = needsAuth ? await authorizedFetch(source) : await fetch(source);
 	if (!response.ok) {

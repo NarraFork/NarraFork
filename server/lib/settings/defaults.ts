@@ -9,7 +9,7 @@ import { DEFAULT_CODEX_TIER_ORDER } from "../codex-manager";
 import type { FieldDoc, NarraForkSettings } from "./types";
 
 export const DEFAULTS: NarraForkSettings = {
-	server: { port: 7778, host: "localhost", openBrowser: "browser" },
+	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
 	proxy: { mode: "direct" },
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	knowledge: {
@@ -220,6 +220,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: '服务器启动时是否自动打开浏览器。"off" 不打开，"browser" 打开浏览器标签，"app" 打开 PWA 窗口。',
 		type: "string",
 		valid: '"off" | "browser" | "app"',
+	},
+	"server.allowedOrigins": {
+		desc: "额外允许跨源读取 /api/* 的来源（逐字匹配，如 https://ide.example.com）。同源、本机回环（localhost/127.x）以及编辑器 webview 来源本身就被允许，无需在此列出；只有部署在其他非本机主机上的前端才需要配置。",
+		type: "string[]",
 	},
 	"server.tls.enabled": {
 		desc: "是否启用 HTTPS。启用后需要配置 certFile 和 keyFile。",

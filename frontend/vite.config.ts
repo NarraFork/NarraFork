@@ -5,6 +5,7 @@ import react from "@vitejs/plugin-react";
 import { bundledLanguagesAlias, bundledLanguagesInfo } from "shiki";
 import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
+import { injectSpaBaseHref } from "../server/lib/spa-base-href";
 import {
 	assertAppShellJavaScriptIsPrecached,
 	assertNoBrandAssetsArePrecached,
@@ -125,6 +126,45 @@ function watchSharedDirectory(): Plugin {
 		apply: "serve",
 		configureServer(server) {
 			server.watcher.add(sharedDir);
+		},
+	};
+}
+
+/**
+ * Inject `<base href>` into the dev server's `index.html`, exactly as the backend does
+ * in production.
+ *
+ * WHY THE DEV SERVER NEEDS THIS TOO
+ * --------------------------------
+ * `base: "./"` makes asset references relative, and relative references resolve against
+ * the DOCUMENT's directory. Vite answers a deep SPA link (`/projects/abc`) from the same
+ * `index.html` without adding a `<base>`, so on that URL the document directory is
+ * `/projects/` — and `frontend/lib/base-path.ts` reads `document.baseURI` to learn where
+ * the app is mounted. It therefore concludes the mount root is `/projects/`, and every
+ * API call goes to `/projects/api/…`.
+ *
+ * ⚠️ That failure is worse than a 404: Vite's SPA fallback answers those paths with
+ * `index.html`, so the app reports "invalid response"/parse errors instead of a wrong
+ * URL. Reaching it only takes reloading the page on any non-root route.
+ *
+ * `injectSpaBaseHref` is IMPORTED from the server rather than reimplemented, because two
+ * copies of "how deep am I" would be free to disagree — and a disagreement is invisible
+ * until someone reloads a deep link in exactly one of the two environments.
+ */
+function devSpaBaseHref(): Plugin {
+	return {
+		name: "narrafork-dev-spa-base-href",
+		apply: "serve",
+		transformIndexHtml: {
+			// After every other HTML transform, so the tag is injected into the final
+			// document and cannot be displaced by a later rewrite.
+			order: "post",
+			handler(html, ctx) {
+				// `ctx.originalUrl` is the browser's path (`/projects/abc`); `ctx.path` is
+				// already resolved to `/index.html`, which would always compute `./`.
+				const requestPath = (ctx.originalUrl ?? ctx.path ?? "/").split(/[?#]/, 1)[0] || "/";
+				return injectSpaBaseHref(html, requestPath);
+			},
 		},
 	};
 }
@@ -303,13 +343,17 @@ function webManifestAsset(appName: string, shortName: string): Plugin {
 		theme_color: "#1a1b1e",
 		background_color: "#1a1b1e",
 		display: "standalone",
-		scope: "/",
-		start_url: "/",
+		// Relative, for the same reason as `base: "./"` above: a rooted scope claims the
+		// proxy's whole origin, which both overreaches and is wrong about where the app
+		// lives. The browser resolves these against the manifest's own URL, so under a
+		// prefix they land on the prefix.
+		scope: "./",
+		start_url: "./",
 		lang: "en",
 		icons: [
-			{ src: "/pwa-192x192.png", sizes: "192x192", type: "image/png" },
-			{ src: "/pwa-512x512.png", sizes: "512x512", type: "image/png" },
-			{ src: "/pwa-512x512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
+			{ src: "pwa-192x192.png", sizes: "192x192", type: "image/png" },
+			{ src: "pwa-512x512.png", sizes: "512x512", type: "image/png" },
+			{ src: "pwa-512x512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
 		],
 	};
 	const body = JSON.stringify(manifest);
@@ -341,7 +385,9 @@ function webManifestAsset(appName: string, shortName: string): Plugin {
 			order: "post",
 			handler(html) {
 				if (html.includes('rel="manifest"')) return html;
-				return html.replace("</head>", '<link rel="manifest" href="/manifest.webmanifest"></head>');
+				// Relative href, resolved against the injected `<base>` — a rooted one would
+				// request the proxy's own `/manifest.webmanifest` under a mount prefix.
+				return html.replace("</head>", '<link rel="manifest" href="manifest.webmanifest"></head>');
 			},
 		},
 		generateBundle() {
@@ -418,6 +464,24 @@ export default defineConfig(({ mode, command }) => {
 
 	return {
 		root: resolve(__dirname),
+		/*
+		 * Emit RELATIVE asset references (`./assets/…`) instead of rooted ones.
+		 *
+		 * This is what lets NarraFork be served from a prefix it does not know at build
+		 * time: a reverse-proxy subpath, or code-server's `/proxy/<port>/` (which is what
+		 * `asExternalUri` returns, and therefore what the VS Code extension's panel loads).
+		 * A rooted `/assets/…` resolves against the proxy's own root, where code-server
+		 * answers 404 with an HTML body — so the app reports a parse failure rather than
+		 * a wrong URL.
+		 *
+		 * Relative references resolve against the DOCUMENT's directory, which is wrong on
+		 * a deep SPA route (`/projects/abc` would look for `/projects/assets/…`). The
+		 * server closes that gap by injecting `<base href>` when it answers a navigation
+		 * — see `server/lib/spa-base-href.ts`. Both halves are required; neither works
+		 * alone, and the failure mode of a missing half is a blank page with a 404 on the
+		 * entry script.
+		 */
+		base: "./",
 		define: {
 			// Inject dev ports whenever running the dev server (regardless of mode)
 			// so that WS URL rewriting works in start:dev (production mode + vite serve)
@@ -427,6 +491,7 @@ export default defineConfig(({ mode, command }) => {
 		},
 		plugins: [
 			watchSharedDirectory(),
+			devSpaBaseHref(),
 			shikiLanguageAliases(),
 			shikiRuntimeAssets(),
 			pluginUiRuntimeAssets(),

@@ -10,6 +10,7 @@
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { createHighlighterCore } from "shiki/core";
 import { createOnigurumaEngine } from "shiki/engine/oniguruma";
+import { assetUrl } from "./base-path";
 import { SHIKI_LANGUAGE_ALIASES as languageAliases } from "./shiki-language-aliases";
 import { createShikiLanguageEnsurer } from "./shiki-language-loader";
 
@@ -30,14 +31,19 @@ export interface ShikiModule {
 // Grammars/themes are emitted by the Vite config as standalone runtime assets,
 // deliberately outside Rollup's module graph. Only the selected URL is imported
 // when a code block actually asks for that language or theme.
-const SHIKI_RUNTIME_BASE = `${import.meta.env.BASE_URL}shiki`;
-
+//
+// Resolved through `assetUrl` rather than `import.meta.env.BASE_URL`: with
+// `base: "./"` that constant is the literal `"./"`, which a dynamic `import()`
+// resolves against the IMPORTING MODULE's URL — i.e. `/assets/`, where no grammars
+// exist. `assetUrl` resolves against the app's mount root instead. The failure is
+// per-language and silent (a code block renders unhighlighted), so it would survive
+// review easily.
 function getLanguageUrl(language: string) {
-	return `${SHIKI_RUNTIME_BASE}/langs/${language}.mjs`;
+	return assetUrl(`shiki/langs/${language}.mjs`);
 }
 
 function getThemeUrl(theme: string) {
-	return `${SHIKI_RUNTIME_BASE}/themes/${theme}.mjs`;
+	return assetUrl(`shiki/themes/${theme}.mjs`);
 }
 
 // Preserve the existing `lang in bundledLanguages` compatibility surface while

@@ -3,8 +3,8 @@ import type { BackgroundTaskListPage } from "@shared/background-task-list";
 import {
 	ApiError,
 	absorbRenewedToken,
+	apiBase,
 	authorizedFetch,
-	BASE,
 	getToken,
 	postFormDataWithProgress,
 	readFetchError,
@@ -320,7 +320,7 @@ export const narratorsApi = {
 	uploadNarratorAvatar: async (id: string, file: File) => {
 		const formData = new FormData();
 		formData.append("file", file);
-		const res = await authorizedFetch(`${BASE}/narrators/${id}/avatar`, {
+		const res = await authorizedFetch(`${apiBase()}/narrators/${id}/avatar`, {
 			method: "PATCH",
 			body: formData,
 		});
@@ -541,7 +541,7 @@ export const narratorsApi = {
 			// The server only localizes Markdown labels for the languages it knows.
 			lang: opts.lang === "zh-CN" ? "zh-CN" : "en",
 		});
-		const res = await authorizedFetch(`${BASE}/narrators/${id}/export?${params.toString()}`);
+		const res = await authorizedFetch(`${apiBase()}/narrators/${id}/export?${params.toString()}`);
 		if (!res.ok) {
 			const error = await readFetchError(res, "Export failed");
 			throw new ApiError(error.message, res.status, error.data);
@@ -659,7 +659,7 @@ export const narratorsApi = {
 		for (const img of opts.newImages ?? []) formData.append("images", img);
 		for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
 		// Content-Type is left unset so the browser adds the multipart boundary.
-		const res = await authorizedFetch(`${BASE}${path}`, { method: "PATCH", body: formData });
+		const res = await authorizedFetch(`${apiBase()}${path}`, { method: "PATCH", body: formData });
 		if (!res.ok) {
 			const error = await readFetchError(res, "Request failed");
 			throw new ApiError(error.message, res.status, error.data);
@@ -1008,7 +1008,7 @@ export const narratorsApi = {
 		const token = getToken();
 		if (token) headers.Authorization = `Bearer ${token}`;
 
-		const url = `${BASE}/narrators/${narratorId}/messages`;
+		const url = `${apiBase()}/narrators/${narratorId}/messages`;
 		let res: Response;
 		if (images?.length || textFiles?.length) {
 			const formData = new FormData();
@@ -1146,11 +1146,14 @@ export const narratorsApi = {
 			});
 		}
 
-		const res = await fetch(`${BASE}/narrators/${narratorId}/edit-and-regenerate/${messageId}`, {
-			method: "POST",
-			headers,
-			body,
-		});
+		const res = await fetch(
+			`${apiBase()}/narrators/${narratorId}/edit-and-regenerate/${messageId}`,
+			{
+				method: "POST",
+				headers,
+				body,
+			},
+		);
 		absorbRenewedToken(res, token);
 		if (res.status === 401) {
 			const error = await readFetchError(res, "Unauthorized");

@@ -2,7 +2,7 @@ import type { PluginViewSurface } from "../../components/plugins/types";
 import {
 	ApiError,
 	absorbRenewedToken,
-	BASE,
+	apiBase,
 	getToken,
 	postFormDataWithProgress,
 	readFetchError,
@@ -237,7 +237,7 @@ export const pluginsApi = {
 		if (token) headers.Authorization = `Bearer ${token}`;
 		const formData = new FormData();
 		formData.append("archive", file);
-		const res = await postFormDataWithProgress(`${BASE}/plugins/install`, formData, {
+		const res = await postFormDataWithProgress(`${apiBase()}/plugins/install`, formData, {
 			headers,
 			onProgress: options?.onProgress,
 			signal: options?.signal,

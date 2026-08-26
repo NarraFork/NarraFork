@@ -1,6 +1,20 @@
+import { apiUrl } from "@frontend/lib/base-path";
 import { isSessionInvalidResponse, SESSION_RENEWAL_HEADER } from "@shared/session-auth";
 
-export const BASE = "/api";
+/**
+ * The API root, resolved against the app's mount prefix.
+ *
+ * A FUNCTION, not the former `export const BASE = "/api"`. The prefix is derived from
+ * the document (see `lib/base-path.ts`), and a module-level constant is evaluated at
+ * import time with no way to correct it afterwards — under a mount prefix every call
+ * site that captured it would keep addressing the origin root, which is the proxy,
+ * not us.
+ *
+ * Never ends in a slash, because every call site spells it `` `${apiBase()}/x` ``.
+ */
+export function apiBase(): string {
+	return apiUrl();
+}
 const TOKEN_KEY = "narrafork_token";
 const MAX_RESPONSE_TEXT_PREVIEW_CHARS = 120_000;
 
@@ -14,16 +28,53 @@ export class ApiError extends Error {
 	}
 }
 
+/**
+ * Observers of session-token changes.
+ *
+ * Exists for the editor-host bridge (`lib/host-bridge.ts`), which mirrors the token into
+ * VS Code's SecretStorage. A one-shot injection at panel load is not enough: the server
+ * re-signs the token as it nears expiry and `absorbRenewedToken` swaps it mid-session, so
+ * a host copy taken at load time goes stale on its own. The staleness surfaces later and
+ * somewhere else — the NEXT panel injects an expired token and the user is bounced to the
+ * login screen with nothing explaining why — which is why the notification lives at the
+ * storage boundary rather than at the call sites that happen to log in.
+ */
+type TokenChangeListener = (token: string | null) => void;
+const tokenChangeListeners = new Set<TokenChangeListener>();
+
+/** Subscribe to token changes. Returns an unsubscribe function. */
+export function onTokenChange(listener: TokenChangeListener): () => void {
+	tokenChangeListeners.add(listener);
+	return () => tokenChangeListeners.delete(listener);
+}
+
+function notifyTokenChange(token: string | null): void {
+	for (const listener of tokenChangeListeners) {
+		try {
+			listener(token);
+		} catch {
+			// A failing observer must never break authentication itself.
+		}
+	}
+}
+
 export function getToken(): string | null {
 	return localStorage.getItem(TOKEN_KEY);
 }
 
 export function setToken(token: string): void {
+	// Compare first so a no-op write does not announce a change: `absorbRenewedToken` and
+	// hydration paths both re-assert the current value, and the bridge would otherwise
+	// send a redundant message per request.
+	const changed = localStorage.getItem(TOKEN_KEY) !== token;
 	localStorage.setItem(TOKEN_KEY, token);
+	if (changed) notifyTokenChange(token);
 }
 
 export function clearToken(): void {
+	const had = localStorage.getItem(TOKEN_KEY) !== null;
 	localStorage.removeItem(TOKEN_KEY);
+	if (had) notifyTokenChange(null);
 }
 
 /**
@@ -89,6 +140,25 @@ export function absorbRenewedToken(response: Response, expectedToken?: string | 
 }
 
 /**
+ * Resolve a rooted, app-relative API path against the mount prefix.
+ *
+ * Only a `/api…` input is rewritten, and that predicate is what makes this
+ * idempotent rather than a trap:
+ *   - at the root, `apiBase()` is `/api`, so an already-built URL is `/api/x` — and
+ *     `apiUrl("/api/x")` returns `/api/x` unchanged;
+ *   - under a prefix, an already-built URL is `/proxy/7778/api/x`, which does not
+ *     match `/api` and is therefore left alone.
+ *
+ * Anything else (absolute URL, `URL` object, blob/data URI) passes through untouched:
+ * those are not ours to reinterpret.
+ */
+function resolveApiInput(input: string | URL): string | URL {
+	if (typeof input !== "string") return input;
+	if (input !== "/api" && !input.startsWith("/api/") && !input.startsWith("/api?")) return input;
+	return apiUrl(input);
+}
+
+/**
  * Authenticated `fetch` for the call sites that cannot use `request` (binary
  * bodies, SSE streams, FormData uploads, callers that need the raw `Response`).
  *
@@ -96,8 +166,15 @@ export function absorbRenewedToken(response: Response, expectedToken?: string | 
  * call site is correct by default instead of having to remember three lines —
  * including the compare-and-swap that a hand-rolled `absorbRenewedToken(res)`
  * cannot do, since only this wrapper knows which token was sent.
+ *
+ * It also resolves rooted `/api/…` paths against the app's mount prefix, so the
+ * dozens of existing call sites that spell the path as a literal keep working when
+ * NarraFork is served from a subpath. That is a rewrite rather than a lint rule
+ * because a missed call site fails only under a prefix, where it reaches the proxy's
+ * own root and returns HTML — reported as a parse error, not a wrong URL.
  */
 export async function authorizedFetch(input: string | URL, init?: RequestInit): Promise<Response> {
+	input = resolveApiInput(input);
 	const token = getToken();
 	const headers = new Headers(init?.headers);
 	if (token && !headers.has("Authorization")) {
@@ -245,7 +322,7 @@ export async function request<T>(
 	if (token) {
 		headers.Authorization = `Bearer ${token}`;
 	}
-	const response = await fetch(`${BASE}${path}`, { ...options, headers });
+	const response = await fetch(apiUrl(path), { ...options, headers });
 	absorbRenewedToken(response, token);
 	if (response.status === 401) {
 		const error = await readErrorData(response, "Unauthorized");

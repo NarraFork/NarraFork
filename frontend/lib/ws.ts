@@ -12,8 +12,11 @@
  *
  * When accessed through a reverse proxy (or in production), the URL is
  * derived from `window.location` so it always goes through the same host
- * the page was loaded from.
+ * the page was loaded from, and carries the app's mount prefix so a subpath
+ * deployment (or code-server's `/proxy/<port>/`) reaches OUR socket.
  */
+
+import { assetUrl } from "@frontend/lib/base-path";
 
 declare const __DEV_VITE_PORT__: string | undefined;
 declare const __DEV_BACKEND_PORT__: string | undefined;
@@ -23,6 +26,9 @@ export function buildWsUrl(path: string, query?: string): string {
 
 	// Dev mode: if we're hitting the Vite dev server directly on localhost,
 	// bypass its broken WS proxy and connect to the backend port instead.
+	//
+	// No mount prefix here on purpose: this branch talks to the backend's own port
+	// directly, where the app IS at the root.
 	if (
 		typeof __DEV_VITE_PORT__ === "string" &&
 		typeof __DEV_BACKEND_PORT__ === "string" &&
@@ -31,9 +37,12 @@ export function buildWsUrl(path: string, query?: string): string {
 		return `ws://${window.location.hostname}:${__DEV_BACKEND_PORT__}${path}${suffix}`;
 	}
 
-	// Production / reverse-proxy: derive from the page URL.
+	// Production / reverse-proxy: derive from the page URL, including the mount
+	// prefix. Without the prefix the handshake goes to the proxy's own `/ws/...`,
+	// which for code-server is code-server's own WebSocket endpoint — it answers,
+	// then closes, so this surfaces as a flapping connection rather than a 404.
 	const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-	return `${protocol}//${window.location.host}${path}${suffix}`;
+	return `${protocol}//${window.location.host}${assetUrl(path)}${suffix}`;
 }
 
 /**

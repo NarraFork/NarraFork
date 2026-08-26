@@ -1,6 +1,7 @@
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ApiError, api, clearToken, getToken, setToken } from "../lib/api";
 import { isMfaChallenge, type LoginResult, type LoginSession } from "../lib/api/auth";
+import { assetUrl } from "../lib/base-path";
 import { changeAppLanguage, getNamespacesForPath } from "../lib/i18n";
 
 /** Establish a session from a login/verify result: store token, seed cache, set language. */
@@ -80,7 +81,10 @@ export function useLogout() {
 		logout: () => {
 			clearToken();
 			qc.clear();
-			window.location.href = "/login";
+			// Mount-prefixed: a rooted "/login" leaves the app entirely when NarraFork is
+			// served from a subpath, so logging out would navigate to the proxy's root
+			// rather than the login page.
+			window.location.href = assetUrl("login");
 		},
 	};
 }

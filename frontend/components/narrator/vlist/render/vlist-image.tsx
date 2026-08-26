@@ -20,6 +20,7 @@
 
 import { useUploadCapability } from "@frontend/hooks/usePlatform";
 import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "@frontend/lib/api";
+import { apiUrl, resolveServerUrl } from "@frontend/lib/base-path";
 import { useCallback, useEffect, useState } from "react";
 import { useImageViewer } from "../../../common/ImageViewerProvider";
 import { MAX_INLINE_IMAGE_SOURCE_CHARS } from "../../image-clipboard";
@@ -139,7 +140,19 @@ export function useResolvedImageSrc(
 	// retired for as long as the ref points at the same image.
 	const [failed, setFailed] = useState<FailedImageSources | null>(null);
 
-	const rawDirect = ref?.previewUrl ?? null;
+	/*
+	 * Resolved against the mount prefix HERE, at the point the value becomes an `<img
+	 * src>`, because it cannot be fixed where it is produced: a screenshot's `previewUrl`
+	 * is minted by the server as a rooted `/api/shares/<id>/preview` and PERSISTED with
+	 * the tool call, so rows written before (or by an older server than) any generator fix
+	 * would still carry the rooted form.
+	 *
+	 * Under a prefix the rooted path reaches the proxy's own root instead of us. The
+	 * fallback chain below would eventually recover via `filePath`/`imageId`, so the
+	 * symptom is a flash of broken image plus a pointless request — degraded rather than
+	 * broken, which is exactly why it would never get reported.
+	 */
+	const rawDirect = ref?.previewUrl ? resolveServerUrl(ref.previewUrl) : null;
 	const filePath = ref?.filePath;
 	const imageId = ref?.imageId;
 	const uploadNarratorId = ref?.uploadNarratorId ?? narratorId;
@@ -169,9 +182,9 @@ export function useResolvedImageSrc(
 		// Decide the fetch endpoint: fs preview by path, else uploads by id.
 		let url: string | null = null;
 		if (filePath) {
-			url = `/api/fs/preview?path=${encodeURIComponent(filePath)}`;
+			url = `${apiUrl("/fs/preview")}?path=${encodeURIComponent(filePath)}`;
 		} else if (imageId && uploadNarratorId) {
-			url = `/api/uploads/${uploadNarratorId}/${imageId}`;
+			url = apiUrl(`/uploads/${uploadNarratorId}/${imageId}`);
 		}
 		if (!url) return;
 

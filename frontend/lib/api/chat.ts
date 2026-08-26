@@ -1,4 +1,4 @@
-import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
+import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
 
 export interface ChatUserSnapshot {
 	id: string;
@@ -126,7 +126,7 @@ export const chatApi = {
 	uploadChatAttachment: async (roomId: string, file: File): Promise<ChatAttachment> => {
 		const formData = new FormData();
 		formData.append("file", file);
-		const res = await authorizedFetch(`${BASE}/chat/rooms/${roomId}/attachments`, {
+		const res = await authorizedFetch(`${apiBase()}/chat/rooms/${roomId}/attachments`, {
 			method: "POST",
 			body: formData,
 		});

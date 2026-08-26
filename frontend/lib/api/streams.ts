@@ -1,4 +1,4 @@
-import { ApiError, authorizedFetch, BASE, getErrorMessage, readFetchError } from "./client";
+import { ApiError, apiBase, authorizedFetch, getErrorMessage, readFetchError } from "./client";
 
 const MAX_SSE_BUFFER_CHARS = 64_000;
 

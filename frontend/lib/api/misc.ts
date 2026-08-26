@@ -4,7 +4,7 @@ import type {
 } from "@frontend/types/usage-history";
 import type { ResolvedBranding } from "@shared/branding";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
-import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
+import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
 import { parseContentDispositionFileName } from "./narrators";
 import type {
 	ApiEntity,
@@ -120,7 +120,7 @@ export const miscApi = {
 	uploadNotificationSound: async (file: File) => {
 		const formData = new FormData();
 		formData.append("file", file);
-		const res = await authorizedFetch(`${BASE}/notification-sounds`, {
+		const res = await authorizedFetch(`${apiBase()}/notification-sounds`, {
 			method: "POST",
 			body: formData,
 		});
@@ -999,7 +999,7 @@ export const miscApi = {
 	 * the path, since it has already been sanitized for use as a filename.
 	 */
 	fsDownload: async (path: string) => {
-		const res = await authorizedFetch(`${BASE}/fs/download?path=${encodeURIComponent(path)}`);
+		const res = await authorizedFetch(`${apiBase()}/fs/download?path=${encodeURIComponent(path)}`);
 		if (!res.ok) {
 			const error = await readFetchError(res, "Download failed");
 			throw new ApiError(error.message, res.status, error.data);
@@ -1153,6 +1153,12 @@ export const miscApi = {
 		}),
 
 	// Workspaces
+	/**
+	 * ⚠️ Returns rows WITHOUT `tree` — the layout blob is up to 2 MiB per workspace and
+	 * this lists every one the user owns, so the server sends `treeBytes` instead and the
+	 * full layout comes from `getWorkspace`. These rows are typed as the loose
+	 * `ApiEntity`, so reading `.tree` here compiles and is simply `undefined` at runtime.
+	 */
 	listWorkspaces: () => request<ApiEntity[]>("/workspaces"),
 	getWorkspace: (id: string) => request<ApiEntity>(`/workspaces/${id}`),
 	createWorkspace: (data: { title?: string; tree: string }) =>

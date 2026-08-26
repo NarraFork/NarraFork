@@ -47,6 +47,7 @@ import {
 } from "./lib/server-restart";
 import { saveSettings, settings } from "./lib/settings";
 import { ShutdownActivityTracker } from "./lib/shutdown-activity";
+import { injectSpaBaseHref } from "./lib/spa-base-href";
 import {
 	buildHealthPayload,
 	createStartupReadinessGate,
@@ -263,6 +264,30 @@ function getFrontendCacheControl(path: string): string {
 }
 
 /**
+ * Answer a SPA navigation with `index.html`, corrected for the mount prefix.
+ *
+ * Shared by BOTH static-serving branches below (embedded assets in a compiled binary,
+ * filesystem in a source run) for the same reason `serveBrandedManifest` is: handling
+ * only one would make the app work in dev and silently break in the shipped binary —
+ * or the reverse. Here the failure is total (the entry script 404s, so no client code
+ * runs at all) and has no client-side recovery path, which is precisely why it must be
+ * impossible to fix only half of it.
+ *
+ * The response body is read into memory rather than streamed because the `<base href>`
+ * has to be rewritten. `index.html` is a few KB, and this path is already `no-cache`,
+ * so there is no bulk-read hazard here.
+ */
+async function serveSpaIndex(indexFile: Bun.BunFile, requestPath: string): Promise<Response> {
+	const html = injectSpaBaseHref(await indexFile.text(), requestPath);
+	return new Response(html, {
+		headers: {
+			"Content-Type": "text/html; charset=utf-8",
+			"Cache-Control": "no-cache",
+		},
+	});
+}
+
+/**
  * Serve the web manifest with the instance name and icons substituted in.
  *
  * Installed as a shared helper because BOTH static-serving branches below
@@ -342,13 +367,7 @@ if (isProd) {
 
 					// SPA catch-all: serve index.html for non-file routes
 					if (!c.req.path.includes(".")) {
-						const blob = Bun.file(indexPath);
-						return new Response(blob, {
-							headers: {
-								"Content-Type": "text/html; charset=utf-8",
-								"Cache-Control": "no-cache",
-							},
-						});
+						return serveSpaIndex(Bun.file(indexPath), c.req.path);
 					}
 
 					return next();
@@ -402,12 +421,7 @@ if (isProd) {
 			if (!c.req.path.includes(".")) {
 				const indexFile = Bun.file(resolve(staticDir, "index.html"));
 				if (await indexFile.exists()) {
-					return new Response(indexFile, {
-						headers: {
-							"Content-Type": "text/html; charset=utf-8",
-							"Cache-Control": "no-cache",
-						},
-					});
+					return serveSpaIndex(indexFile, c.req.path);
 				}
 			}
 

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ApiError, BASE, request } from "../../lib/api/client";
+import { ApiError, apiBase, request } from "../../lib/api/client";
 import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
 import type { JsonValue, PluginDockPanelParams, UiRpcRequest } from "./protocol";
 import { isJsonValue, uiRpcErrorCodeSchema, uiRpcErrorSchema } from "./protocol";
@@ -119,7 +119,7 @@ function assetUrl(
 	assetToken: string,
 	path: string,
 ): string {
-	return `${BASE}/plugins/ui/${encodeURIComponent(params.pluginId)}/${encodeURIComponent(contribution.version)}/${hash}/asset/${encodeURIComponent(sessionId)}/${encodeURIComponent(assetToken)}/${encodeAssetPath(path)}`;
+	return `${apiBase()}/plugins/ui/${encodeURIComponent(params.pluginId)}/${encodeURIComponent(contribution.version)}/${hash}/asset/${encodeURIComponent(sessionId)}/${encodeURIComponent(assetToken)}/${encodeAssetPath(path)}`;
 }
 
 export async function createPluginUiBackendSession(

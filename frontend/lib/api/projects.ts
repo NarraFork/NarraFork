@@ -1,8 +1,8 @@
 import type { ForkWorktreeSource } from "@shared/chapter-fork";
 import {
 	ApiError,
+	apiBase,
 	authorizedFetch,
-	BASE,
 	getErrorMessage,
 	readFetchError,
 	request,
@@ -120,7 +120,7 @@ export const projectsApi = {
 		onCredentialRequired?: () => void,
 	): Promise<ApiEntity> => {
 		return new Promise((resolve, reject) => {
-			authorizedFetch(`${BASE}/projects`, {
+			authorizedFetch(`${apiBase()}/projects`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify(data),

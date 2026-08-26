@@ -18,6 +18,8 @@ import {
 	BRAND_FAVICON_URL,
 	BRAND_ICON_COLOR_STORAGE_KEY,
 	BRAND_NAME_STORAGE_KEY,
+	DEFAULT_APPLE_TOUCH_ICON_URL,
+	DEFAULT_FAVICON_URL,
 } from "../../frontend/lib/branding";
 
 const INDEX_HTML = await Bun.file("frontend/index.html").text();
@@ -77,8 +79,24 @@ describe("index.html boot script", () => {
 	test("still ships the static default icon links for unbranded instances", () => {
 		// The boot script only rewrites these when a custom colour is cached, so the
 		// defaults must remain the markup's starting state.
-		expect(INDEX_HTML).toContain('rel="icon" href="/favicon.svg"');
-		expect(INDEX_HTML).toContain('rel="apple-touch-icon" href="/apple-touch-icon-180x180.png"');
+		expect(INDEX_HTML).toContain(`rel="icon" href="${DEFAULT_FAVICON_URL}"`);
+		expect(INDEX_HTML).toContain(`rel="apple-touch-icon" href="${DEFAULT_APPLE_TOUCH_ICON_URL}"`);
+	});
+
+	test("keeps every icon href relative so a prefixed mount resolves them", () => {
+		// A rooted href addresses the origin root, which behind a reverse-proxy subpath
+		// or code-server's `/proxy/<port>/` is the proxy, not us. The icons 404 and the
+		// only symptom is a missing favicon — no error anyone would trace back here.
+		for (const url of [
+			BRAND_FAVICON_URL,
+			BRAND_APPLE_TOUCH_ICON_URL,
+			DEFAULT_FAVICON_URL,
+			DEFAULT_APPLE_TOUCH_ICON_URL,
+		]) {
+			expect(url.startsWith("/")).toBe(false);
+		}
+		// And the markup must not reintroduce one.
+		expect(INDEX_HTML).not.toMatch(/rel="(?:icon|apple-touch-icon)" href="\//);
 	});
 
 	test("guards its storage access", () => {
@@ -150,9 +168,21 @@ describe("service worker runtime caching", () => {
 	});
 
 	test("its brand path set covers every static brand asset plus the manifest", () => {
+		// App-relative (no leading slash): a Service Worker sees full pathnames, which
+		// carry the mount prefix, so the set is compared against the path with that
+		// prefix stripped. Listing rooted paths here would make the exclusion miss
+		// under a prefix and silently CacheFirst the brand icons for 30 days.
 		for (const path of [...BRAND_STATIC_PATHS, "/manifest.webmanifest"]) {
-			expect(SERVICE_WORKER).toContain(`"${path}"`);
+			expect(SERVICE_WORKER).toContain(`"${path.replace(/^\//, "")}"`);
 		}
+	});
+
+	test("strips the mount prefix before classifying a path", () => {
+		// Without this the worker compares `/proxy/7778/api/health` against `/api/…`,
+		// concludes it is not API traffic, and caches API responses — stale data with
+		// no error anywhere.
+		expect(SERVICE_WORKER).toContain("appRelativePath");
+		expect(SERVICE_WORKER).toContain("self.registration.scope");
 	});
 });
 

@@ -1,21 +1,96 @@
-import { and, asc, desc, eq, gt, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import type { Context } from "hono";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { db } from "../db";
 import { workspaces } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { createWorkspaceSchema, updateWorkspaceSchema } from "../lib/validators";
+import { WORKSPACE_TREE_MAX_BYTES } from "../lib/validators/workspaces";
 import { ensureMigrated, hasRecentTab, removeRecentTab } from "../services/recent-tabs-service";
 
 export const workspaceRoutes = new Hono();
 
+/**
+ * Upper bound on the listing. Workspaces are user-assembled surfaces, so a few
+ * dozen is already an unusual amount; the limit exists so the query can never
+ * degrade into an unbounded scan as rows accumulate.
+ */
+const WORKSPACE_LIST_LIMIT = 200;
+
+/**
+ * Stream-level cap for the two routes that accept a layout.
+ *
+ * The Zod schema already bounds `tree`, but it only runs AFTER the whole body has
+ * been buffered and JSON-parsed on the single JS thread — so without this an
+ * oversized payload still costs that parse before being rejected. The allowance
+ * is the tree budget plus a small margin for the JSON envelope (`{"tree":...}`,
+ * an optional title, and the escaping the layout string picks up when nested
+ * inside JSON).
+ */
+const WORKSPACE_WRITE_BODY_MAX_BYTES = WORKSPACE_TREE_MAX_BYTES + 256 * 1024;
+
+const workspaceWriteBodyLimit = bodyLimit({
+	maxSize: WORKSPACE_WRITE_BODY_MAX_BYTES,
+	onError: (c) =>
+		c.json(
+			{
+				error: `Workspace layout exceeds the ${Math.floor(
+					WORKSPACE_TREE_MAX_BYTES / (1024 * 1024),
+				)} MiB limit`,
+				code: "WORKSPACE_TREE_TOO_LARGE",
+			},
+			413,
+		),
+});
+
+/**
+ * Read the JSON body, letting an over-cap request surface as the 413 above.
+ *
+ * When the request carries no `Content-Length`, `bodyLimit` enforces its cap by
+ * ERRORING THE BODY STREAM, which arrives here as a failed read. Rethrowing that
+ * specific error lets the middleware produce its 413 instead of it being reported
+ */
+async function readWorkspaceJson(c: Context): Promise<unknown> {
+	try {
+		return await c.req.json();
+	} catch (err) {
+		if (err instanceof Error && err.name === "BodyLimitError") throw err;
+		throw new ValidationError("Workspace request body must be valid JSON");
+	}
+}
+
 // List current user's workspaces
+//
+// ⚠️ BREAKING SHAPE CHANGE: `tree` is no longer returned here, and `treeBytes` is
+// new. Nothing consumes this route today (`api.listWorkspaces()` is defined in
+// `frontend/lib/api/misc.ts` but has no call sites), which is why the change is
+// safe to make now — a later consumer written against the old shape would find
+// `tree` undefined only at runtime, since the client types these rows as a loose
+// `ApiEntity` and TypeScript cannot flag it.
+//
+// `tree` is excluded because it is a per-workspace layout blob bounded by
+// `WORKSPACE_TREE_MAX_BYTES` (2 MiB), and this route returns every workspace the
+// user owns. Serializing all of them would put tens of megabytes of layout JSON
+// through the single JS thread for a listing that only needs titles. `treeBytes`
+// is returned instead so a caller can show size without reading the payload; the
+// full layout is read only by `GET /workspaces/:id`.
 workspaceRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
-	const rows = await db.query.workspaces.findMany({
-		where: eq(workspaces.userId, userId),
-		orderBy: [desc(workspaces.updatedAt)],
-	});
+	const rows = await db
+		.select({
+			id: workspaces.id,
+			userId: workspaces.userId,
+			title: workspaces.title,
+			treeBytes: sql<number>`length(cast(${workspaces.tree} as blob))`,
+			createdAt: workspaces.createdAt,
+			updatedAt: workspaces.updatedAt,
+		})
+		.from(workspaces)
+		.where(eq(workspaces.userId, userId))
+		.orderBy(desc(workspaces.updatedAt))
+		.limit(WORKSPACE_LIST_LIMIT);
 	return c.json(rows);
 });
 
@@ -31,9 +106,9 @@ workspaceRoutes.get("/:id", async (c) => {
 });
 
 // Create a workspace
-workspaceRoutes.post("/", async (c) => {
+workspaceRoutes.post("/", workspaceWriteBodyLimit, async (c) => {
 	const userId = c.get("user").sub;
-	const parsed = createWorkspaceSchema.safeParse(await c.req.json());
+	const parsed = createWorkspaceSchema.safeParse(await readWorkspaceJson(c));
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
 	const now = new Date();
@@ -56,10 +131,10 @@ workspaceRoutes.post("/", async (c) => {
 });
 
 // Update a workspace (tree or title)
-workspaceRoutes.patch("/:id", async (c) => {
+workspaceRoutes.patch("/:id", workspaceWriteBodyLimit, async (c) => {
 	const userId = c.get("user").sub;
 	const id = c.req.param("id");
-	const parsed = updateWorkspaceSchema.safeParse(await c.req.json());
+	const parsed = updateWorkspaceSchema.safeParse(await readWorkspaceJson(c));
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
 	const ws = await db.query.workspaces.findFirst({

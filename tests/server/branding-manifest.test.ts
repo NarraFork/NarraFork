@@ -73,19 +73,29 @@ describe("brandManifestJson", () => {
 		// revalidate, so a colour change reaches them.
 		const manifest = brand({ iconColor: "#e64980" });
 		expect(manifest.icons.map((icon) => icon.src)).toEqual([
-			"/api/branding/icon-192.png",
-			"/api/branding/icon-512.png",
-			"/api/branding/icon-512.png",
+			"api/branding/icon-192.png",
+			"api/branding/icon-512.png",
+			"api/branding/icon-512.png",
 		]);
 		for (const icon of manifest.icons) {
-			expect(icon.src.startsWith("/api/branding/")).toBe(true);
+			expect(icon.src.startsWith("api/branding/")).toBe(true);
 		}
 	});
 
 	test("rewrites icons even for a default install, so installing never pins a static path", () => {
 		const manifest = brand(undefined);
 		for (const icon of manifest.icons) {
-			expect(icon.src.startsWith("/api/branding/")).toBe(true);
+			expect(icon.src.startsWith("api/branding/")).toBe(true);
+		}
+	});
+
+	test("keeps icon paths relative so a prefixed mount resolves them", () => {
+		// A rooted `/api/branding/…` addresses the origin root, which is not where the
+		// app lives behind a reverse-proxy subpath or code-server's `/proxy/<port>/`.
+		// The icons would 404 and an installed app would show a generic placeholder,
+		// with nothing in the failure pointing back at the manifest.
+		for (const icon of brand({ iconColor: "#e64980" }).icons) {
+			expect(icon.src.startsWith("/")).toBe(false);
 		}
 	});
 

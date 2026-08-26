@@ -24,6 +24,7 @@ import {
 	saveSettings,
 	settings,
 } from "../lib/settings";
+import { spaRedirectLocation } from "../lib/spa-base-href";
 
 export const nugRoutes = new Hono();
 
@@ -1083,6 +1084,18 @@ nugRoutes.get("/providers/:id/oauth/start", (c) => {
 	});
 });
 
+/**
+ * Redirect the browser to an in-app route, correct under any mount prefix.
+ *
+ * ⚠️ A rooted `c.redirect("/settings/providers")` addresses the PROXY's own path when
+ * NarraFork is served from a subpath, so the user lands outside the app at the end of an
+ * OAuth ceremony that actually succeeded — with the credential already stored and nothing
+ * explaining the wrong page. See `lib/spa-base-href.ts` for the arithmetic.
+ */
+function redirectToApp(c: import("hono").Context, target: string): Response {
+	return c.redirect(spaRedirectLocation(new URL(c.req.url).pathname, target));
+}
+
 /** OAuth callback handler — exported so app.ts can mount it before requireAuth. */
 export async function handleNugOAuthCallback(c: import("hono").Context) {
 	const code = c.req.query("code");
@@ -1091,18 +1104,18 @@ export async function handleNugOAuthCallback(c: import("hono").Context) {
 
 	if (error) {
 		// User denied or error occurred — redirect to settings with error
-		return c.redirect(`/settings/providers?oauth_error=${encodeURIComponent(error)}`);
+		return redirectToApp(c, `/settings/providers?oauth_error=${encodeURIComponent(error)}`);
 	}
 
 	if (!code || !state) {
-		return c.redirect("/settings/providers?oauth_error=missing_params");
+		return redirectToApp(c, "/settings/providers?oauth_error=missing_params");
 	}
 
 	// Validate state against server-side store (consume on use)
 	const pending = pendingOAuthStates.get(state);
 	if (!pending || pending.expiresAt <= Date.now()) {
 		pendingOAuthStates.delete(state ?? "");
-		return c.redirect("/settings/providers?oauth_error=state_expired");
+		return redirectToApp(c, "/settings/providers?oauth_error=state_expired");
 	}
 	pendingOAuthStates.delete(state);
 
@@ -1110,12 +1123,12 @@ export async function handleNugOAuthCallback(c: import("hono").Context) {
 	const providers = settings.nugProviders ?? [];
 	const config = providers.find((p) => p.id === providerId);
 	if (!config) {
-		return c.redirect(`/settings/providers?oauth_error=invalid_provider`);
+		return redirectToApp(c, `/settings/providers?oauth_error=invalid_provider`);
 	}
 
 	const baseUrl = normalizeNugBaseUrl(config.baseUrl);
 	if (!config.oauthClientId || !config.oauthClientSecret) {
-		return c.redirect(`/settings/providers?oauth_error=oauth_not_configured`);
+		return redirectToApp(c, `/settings/providers?oauth_error=oauth_not_configured`);
 	}
 
 	// Reuse the exact callbackUrl that was sent in /oauth/start to guarantee
@@ -1138,7 +1151,7 @@ export async function handleNugOAuthCallback(c: import("hono").Context) {
 		if (!tokenResponse.ok) {
 			const errText = await tokenResponse.text().catch(() => "");
 			logger.error("NUG OAuth token exchange failed", { error: errText, provider: config.name });
-			return c.redirect(`/settings/providers?oauth_error=${encodeURIComponent(errText)}`);
+			return redirectToApp(c, `/settings/providers?oauth_error=${encodeURIComponent(errText)}`);
 		}
 
 		const tokenData = (await tokenResponse.json()) as {
@@ -1159,10 +1172,10 @@ export async function handleNugOAuthCallback(c: import("hono").Context) {
 		saveSettings(settings);
 
 		// Redirect to settings page with success
-		return c.redirect(`/settings/providers?oauth_success=${providerId}`);
+		return redirectToApp(c, `/settings/providers?oauth_success=${providerId}`);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
 		logger.error("NUG OAuth callback failed", { error: msg, provider: config.name });
-		return c.redirect(`/settings/providers?oauth_error=${encodeURIComponent(msg)}`);
+		return redirectToApp(c, `/settings/providers?oauth_error=${encodeURIComponent(msg)}`);
 	}
 }

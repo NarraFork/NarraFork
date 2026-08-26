@@ -78,18 +78,39 @@ describe.skipIf(!hasBuild)("built web manifest", () => {
 		};
 		expect(manifest.name).toBeTruthy();
 		expect(manifest.short_name).toBeTruthy();
-		expect(manifest.start_url).toBe("/");
 		expect(manifest.theme_color).toBe("#1a1b1e");
 		expect(manifest.icons.map((icon) => icon.sizes)).toContain("512x512");
+	});
+
+	test("keeps start_url, scope and icons relative so a prefixed mount installs", async () => {
+		// The app can be served from a prefix it does not know at build time (a
+		// reverse-proxy subpath, or code-server's `/proxy/<port>/`). The browser resolves
+		// these against the manifest's own URL, so relative values follow the app while a
+		// rooted `/` would claim the proxy's origin — the PWA would install pointing at a
+		// start URL that is not NarraFork, and nothing in the failure would say so.
+		const manifest = (await Bun.file(MANIFEST_PATH).json()) as {
+			icons: Array<{ src: string }>;
+			scope: string;
+			start_url: string;
+		};
+		expect(manifest.start_url.startsWith("/")).toBe(false);
+		expect(manifest.scope.startsWith("/")).toBe(false);
+		for (const icon of manifest.icons) {
+			expect(icon.src.startsWith("/")).toBe(false);
+		}
 	});
 
 	test("is linked from the built HTML", async () => {
 		// Turning off VitePWA's manifest also removed its <link> injection. Without a
 		// replacement the app silently stops being installable.
+		//
+		// The href is relative for the same reason as the manifest's own fields, and is
+		// resolved against the `<base>` the server injects (`server/lib/spa-base-href.ts`).
 		const html = await Bun.file(HTML_PATH).text();
 		const links = html.match(/<link rel="manifest"[^>]*>/g) ?? [];
 		expect(links).toHaveLength(1);
-		expect(links[0]).toContain('href="/manifest.webmanifest"');
+		expect(links[0]).toContain('href="manifest.webmanifest"');
+		expect(links[0]).not.toContain('href="/manifest.webmanifest"');
 	});
 });
 

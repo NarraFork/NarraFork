@@ -1,3 +1,4 @@
+import { assetUrl } from "../../lib/base-path";
 import { PLUGIN_UI_RUNTIME_CSS_URL, PLUGIN_UI_RUNTIME_JS_URL } from "../../plugin-runtime/paths";
 import { createPluginAssetShell, createPluginNonce } from "./asset-shell";
 import type {
@@ -291,8 +292,19 @@ export class PluginUiSession {
 			styleUrl: this.contribution.styleUrl,
 			...(usesHostRuntime
 				? {
-						runtimeUrl: PLUGIN_UI_RUNTIME_JS_URL,
-						runtimeStyleUrl: PLUGIN_UI_RUNTIME_CSS_URL,
+						/*
+						 * Mount-prefixed here rather than in `plugin-runtime/paths.ts`: those
+						 * constants are also imported by the Bun build helper and by
+						 * `server/main.ts` (for `NO_CACHE_FRONTEND_PATHS`), neither of which has
+						 * a document to derive a prefix from. They stay rooted; only this
+						 * browser-side consumer resolves them.
+						 *
+						 * Under a prefix the rooted path reaches the proxy's root, so the shared
+						 * runtime 404s and the panel reports `HostRuntimeUnavailableError` —
+						 * which names a missing runtime, not a wrong URL.
+						 */
+						runtimeUrl: assetUrl(PLUGIN_UI_RUNTIME_JS_URL),
+						runtimeStyleUrl: assetUrl(PLUGIN_UI_RUNTIME_CSS_URL),
 					}
 				: {}),
 			defaultTimeoutMs: this.options.defaultTimeoutMs,

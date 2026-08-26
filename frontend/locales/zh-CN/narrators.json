@@ -69,6 +69,8 @@
 	"distributePanels": "均匀分配面板",
 	"workspaceSplitMode": "分屏模式",
 	"workspaceDirectorMode": "导播台模式",
+	"workspaceLayoutSaveFailedTitle": "工作区布局未保存",
+	"workspaceLayoutSaveFailedMessage": "当前面板排布（{{kb}} KB）保存失败，重新打开该工作区时将恢复到上一次的布局。",
 	"createdAtLabel": "创建于 {{time}}",
 	"lastMessageAtLabel": "最后消息 {{time}}",
 	"addWebview": "添加网页视图",

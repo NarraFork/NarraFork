@@ -1,3 +1,5 @@
+import { apiUrl } from "./base-path";
+
 interface ServerHealth {
 	/** Overall health status reported by the replacement server. */
 	status: string;
@@ -105,7 +107,7 @@ async function fetchServerHealth(
 	const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
 
 	try {
-		const response = await fetch(`/api/health?_=${Date.now()}`, {
+		const response = await fetch(`${apiUrl("/health")}?_=${Date.now()}`, {
 			cache: "no-store",
 			headers: { "Cache-Control": "no-cache" },
 			signal: controller.signal,

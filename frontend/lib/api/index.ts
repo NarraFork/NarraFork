@@ -1,7 +1,7 @@
 import { authApi } from "./auth";
 import { chaptersApi } from "./chapters";
 import { chatApi } from "./chat";
-import { BASE } from "./client";
+import { apiBase } from "./client";
 import { devicesApi } from "./devices";
 import { gitApi } from "./git";
 import { integrationsApi } from "./integrations";
@@ -20,7 +20,7 @@ import { terminalsApi } from "./terminals";
 import { traitLayersApi } from "./trait-layers";
 
 export function getAvatarUrl(userId: string, avatarImageId: string): string {
-	return `${BASE}/uploads/avatars/${userId}/${avatarImageId}`;
+	return `${apiBase()}/uploads/avatars/${userId}/${avatarImageId}`;
 }
 
 export const api = {

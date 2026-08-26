@@ -21,8 +21,15 @@
 		<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 		<meta name="mobile-web-app-capable" content="yes" />
 		<meta name="description" content="AI-powered collaborative programming with narrative forking" />
-		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-		<link rel="apple-touch-icon" href="/apple-touch-icon-180x180.png" />
+		<!--
+			Relative hrefs, resolved against the <base> the server injects when it answers
+			a SPA navigation (server/lib/spa-base-href.ts). Rooted paths would address the
+			origin root, which is not where NarraFork lives behind a reverse-proxy subpath
+			or code-server's /proxy/<port>/ — the icons would 404 with nothing to indicate
+			why. Keep in sync with DEFAULT_*_URL in frontend/lib/branding.ts.
+		-->
+		<link rel="icon" href="favicon.svg" type="image/svg+xml" />
+		<link rel="apple-touch-icon" href="apple-touch-icon-180x180.png" />
 		<title>NarraFork</title>
 		<script>
 			var d = localStorage.getItem("mantine-color-scheme-value");
@@ -63,9 +70,9 @@
 				// mere presence means the recolouring endpoints are worth requesting.
 				if (bc) {
 					var fi = document.querySelector('link[rel="icon"]');
-					if (fi) fi.setAttribute("href", "/api/branding/favicon.svg");
+					if (fi) fi.setAttribute("href", "api/branding/favicon.svg");
 					var ati = document.querySelector('link[rel="apple-touch-icon"]');
-					if (ati) ati.setAttribute("href", "/api/branding/apple-touch-icon.png");
+					if (ati) ati.setAttribute("href", "api/branding/apple-touch-icon.png");
 				}
 			} catch (_e) {}
 		</script>

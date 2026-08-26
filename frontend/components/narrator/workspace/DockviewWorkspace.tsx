@@ -8,8 +8,10 @@
  * bridging, narrator join/leave lifecycle, and director (maximize) mode.
  */
 
+import { notifications } from "@mantine/notifications";
 import { type DockviewApi, type DockviewDidDropEvent, positionToDirection } from "dockview-react";
 import { type RefObject, useCallback, useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { api as apiClient } from "../../../lib/api";
 import { isNarratorSubject, type PanelDragState } from "../../../lib/panel-drag";
 import {
@@ -122,6 +124,7 @@ export function DockviewWorkspace({
 	onDirectorStateChange,
 	directorControlRef,
 }: DockviewWorkspaceProps) {
+	const { t } = useTranslation("narrators");
 	const apiRef = useRef<DockviewApi | null>(null);
 	// Per-workspace dock store (shards tool-panel coordination by narratorId).
 	// Created once, bound to this surface's api ref.
@@ -134,10 +137,37 @@ export function DockviewWorkspace({
 	const loadedAtRef = useRef<number | null>(null);
 	/** Narrator ids we have joined (via panels) and must leave on unmount. */
 	const joinedNarratorIdsRef = useRef<Set<string>>(new Set());
+	/** One save-failure notice per mount, so a failing debounce cannot spam. */
+	const saveFailureNotifiedRef = useRef(false);
 
 	// Keep latest treeJson without forcing effect re-runs on every keystroke.
 	const treeJsonRef = useRef(treeJson);
 	treeJsonRef.current = treeJson;
+
+	/**
+	 * Surface a layout-save failure instead of dropping it.
+	 *
+	 * This used to be a bare `.catch(() => {})`, which is how a rejected save
+	 * became invisible: the user keeps arranging panels, the server still holds the
+	 * previous layout, and the next visit silently restores the older arrangement
+	 * with no indication that anything was lost. The size is included because the
+	 * most likely rejection is the server's `tree` byte ceiling, and knowing the
+	 * payload size is what makes that diagnosable.
+	 */
+	const reportLayoutSaveFailure = useCallback(
+		(id: string, serialized: string, error: unknown) => {
+			const bytes = new TextEncoder().encode(serialized).byteLength;
+			console.warn("[workspace] failed to persist layout", { workspaceId: id, bytes, error });
+			if (saveFailureNotifiedRef.current) return;
+			saveFailureNotifiedRef.current = true;
+			notifications.show({
+				color: "red",
+				title: t("workspaceLayoutSaveFailedTitle"),
+				message: t("workspaceLayoutSaveFailedMessage", { kb: Math.round(bytes / 1024) }),
+			});
+		},
+		[t],
+	);
 
 	const persist = useCallback(() => {
 		const api = apiRef.current;
@@ -145,9 +175,11 @@ export function DockviewWorkspace({
 		if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
 		saveTimerRef.current = setTimeout(() => {
 			const serialized = serializeWorkspaceLayout(api, directorRef.current);
-			apiClient.updateWorkspace(workspaceId, { tree: serialized }).catch(() => {});
+			apiClient
+				.updateWorkspace(workspaceId, { tree: serialized })
+				.catch((error) => reportLayoutSaveFailure(workspaceId, serialized, error));
 		}, SAVE_DEBOUNCE_MS);
-	}, [workspaceId]);
+	}, [workspaceId, reportLayoutSaveFailure]);
 
 	// ── Director mode (pure overlay; never mutates the dockview layout) ──
 	// All director mutations flow through the imperative handle so the persisted
@@ -420,11 +452,24 @@ export function DockviewWorkspace({
 			const api = apiRef.current;
 			if (api) {
 				// Flush a final save synchronously via the client (best-effort).
+				// No user-facing notice here: the component is unmounting, so a toast
+				// would land on whatever page the user just navigated to. The log line
+				// still records it, and the same failure would already have been
+				// surfaced by the debounced path if it was reproducible.
 				try {
 					const serialized = serializeWorkspaceLayout(api, directorRef.current);
-					apiClient.updateWorkspace(workspaceId, { tree: serialized }).catch(() => {});
-				} catch {
-					// ignore
+					apiClient.updateWorkspace(workspaceId, { tree: serialized }).catch((error) => {
+						console.warn("[workspace] failed to flush layout on unmount", {
+							workspaceId,
+							bytes: new TextEncoder().encode(serialized).byteLength,
+							error,
+						});
+					});
+				} catch (error) {
+					console.warn("[workspace] failed to serialize layout on unmount", {
+						workspaceId,
+						error,
+					});
 				}
 				for (const d of apiDisposablesRef.current) d.dispose();
 				apiDisposablesRef.current = [];

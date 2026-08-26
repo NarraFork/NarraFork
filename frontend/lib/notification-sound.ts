@@ -4,6 +4,7 @@
  */
 
 import { authorizedFetch, clearTokenOnSessionFailure } from "./api";
+import { apiUrl } from "./base-path";
 
 let audioCtx: AudioContext | null = null;
 
@@ -347,7 +348,7 @@ export function playNotificationSound(prefs: NotificationSoundPrefs): void {
 		maxConcurrent: prefs.notifySoundMaxConcurrent ?? DEFAULT_SOUND_MAX_CONCURRENT,
 	};
 	if (prefs.notifySoundType === "custom" && prefs.notifySoundFileId) {
-		playCustomSound(`/api/notification-sounds/${prefs.notifySoundFileId}`, options);
+		playCustomSound(apiUrl(`/notification-sounds/${prefs.notifySoundFileId}`), options);
 	} else {
 		playBuiltinSound(prefs.notifySoundBuiltin || "gentle", options);
 	}

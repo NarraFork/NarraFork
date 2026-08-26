@@ -18,6 +18,7 @@ import type { UseMutationResult } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import { apiUrl } from "../../lib/base-path";
 import {
 	BUILTIN_SOUND_NAMES,
 	DEFAULT_SOUND_MAX_CONCURRENT,
@@ -290,7 +291,7 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 										leftSection={<IconPlayerPlay size={14} />}
 										onClick={() =>
 											playCustomSound(
-												`/api/notification-sounds/${userPrefs.notifySoundFileId}`,
+												apiUrl(`/notification-sounds/${userPrefs.notifySoundFileId}`),
 												previewOptions,
 											)
 										}

@@ -484,6 +484,14 @@ export interface NarraForkSettings {
 		openBrowser: "off" | "browser" | "app";
 		/** Optional TLS configuration for HTTPS. */
 		tls?: TlsConfig;
+		/**
+		 * Extra origins allowed to read `/api/*` cross-origin, matched verbatim.
+		 *
+		 * Same-origin, loopback and editor-webview origins are allowed without being
+		 * listed here (see `lib/cors-origin.ts`), so this is only for a front end served
+		 * from a different, non-local host.
+		 */
+		allowedOrigins?: string[];
 	};
 	/**
 	 * Machine-level client fingerprint state shared across providers.

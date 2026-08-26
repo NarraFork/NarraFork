@@ -59,6 +59,8 @@ import {
 	RoutePendingIndicator,
 } from "./components/common/RouteChunkErrorBoundary";
 import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-layout";
+import { getRouterBasepath } from "./lib/base-path";
+import { installHostBridge } from "./lib/host-bridge";
 import i18n, { getInitialNamespaces, initI18n } from "./lib/i18n";
 import { mantineTheme } from "./lib/mantine-theme";
 import { queryClient } from "./lib/query-client";
@@ -70,6 +72,16 @@ function createAppRouter(history: RouterHistory) {
 	return createRouter({
 		history,
 		routeTree,
+		/*
+		 * The mount prefix, so routing works when the app is not at the origin root
+		 * (a reverse-proxy subpath, or code-server's `/proxy/<port>/`).
+		 *
+		 * TanStack strips this from `location.pathname` before matching and adds it back
+		 * when building hrefs. Omitting it makes the first navigation appear to work —
+		 * the initial HTML came from the server — and then every `<Link>` writes a URL
+		 * outside the prefix, landing on the proxy's root.
+		 */
+		basepath: getRouterBasepath(),
 		context: { queryClient },
 		/*
 		 * Give EVERY route its own error boundary.
@@ -253,6 +265,17 @@ function applyInitialPluginTheme() {
 
 async function bootstrap() {
 	applyInitialPluginTheme();
+	/*
+	 * Session handoff with an editor host that embeds this app (the VS Code extension).
+	 *
+	 * Installed BEFORE the router mounts so an injected token is in storage by the time
+	 * the first authenticated query runs — otherwise the panel would flash its login page
+	 * and then replace it, which reads as a failed login rather than a resumed session.
+	 *
+	 * Returns null (and installs nothing) unless this document is a deliberately embedded
+	 * panel; see `lib/host-bridge.ts` for the guards.
+	 */
+	installHostBridge();
 	// Before React mounts, so the first gesture on the first paint is already
 	// covered. Safari in a browser tab ignores index.html's `user-scalable=no`, and
 	// a component-level handler is structurally too late (see pinch-zoom-guard.ts).

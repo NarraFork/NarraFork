@@ -69,6 +69,8 @@
 	"distributePanels": "Distribute panels evenly",
 	"workspaceSplitMode": "Split mode",
 	"workspaceDirectorMode": "Director mode",
+	"workspaceLayoutSaveFailedTitle": "Workspace layout not saved",
+	"workspaceLayoutSaveFailedMessage": "The current panel arrangement ({{kb}} KB) could not be saved, so reopening this workspace will restore the previous layout.",
 	"createdAtLabel": "Created {{time}}",
 	"lastMessageAtLabel": "Last message {{time}}",
 	"addWebview": "Add webview",

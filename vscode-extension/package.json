@@ -1,0 +1,75 @@
+{
+	"name": "narrafork-vscode",
+	"displayName": "NarraFork",
+	"description": "Connect to a locally running NarraFork backend from VS Code or code-server.",
+	"version": "0.0.0",
+	"private": true,
+	"publisher": "narrafork",
+	"license": "SEE LICENSE IN ../LICENSE",
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"main": "./out/extension.js",
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"extensionKind": [
+		"workspace",
+		"ui"
+	],
+	"capabilities": {
+		"untrustedWorkspaces": {
+			"supported": true,
+			"description": "The extension only talks to a NarraFork backend over HTTP; it does not read or execute workspace content."
+		}
+	},
+	"contributes": {
+		"commands": [
+			{
+				"command": "narrafork.openPanel",
+				"title": "NarraFork: Open Panel"
+			},
+			{
+				"command": "narrafork.reconnect",
+				"title": "NarraFork: Reconnect"
+			},
+			{
+				"command": "narrafork.signOut",
+				"title": "NarraFork: Sign Out (forget stored token)"
+			},
+			{
+				"command": "narrafork.openInBrowser",
+				"title": "NarraFork: Open in Browser"
+			}
+		],
+		"configuration": {
+			"title": "NarraFork",
+			"properties": {
+				"narrafork.serverUrl": {
+					"type": "string",
+					"default": "",
+					"markdownDescription": "Base URL of the NarraFork backend, e.g. `http://127.0.0.1:7778`. Leave empty to discover it from `~/.narrafork/settings.json` and fall back to port 7778. When set, ONLY this URL is tried — a wrong value fails loudly instead of silently connecting elsewhere."
+				},
+				"narrafork.openOnStartup": {
+					"type": "boolean",
+					"default": false,
+					"description": "Open the NarraFork panel automatically when the window finishes loading."
+				}
+			}
+		}
+	},
+	"scripts": {
+		"compile": "tsc -p .",
+		"watch": "tsc -p . --watch",
+		"typecheck": "tsc -p . --noEmit",
+		"package": "bun ../scripts/package-vscode-extension.ts"
+	},
+	"devDependencies": {
+		"@types/node": "^22.10.2",
+		"@types/vscode": "^1.85.0",
+		"typescript": "^5.9.3"
+	}
+}

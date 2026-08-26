@@ -20,6 +20,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useFileSystemCapability } from "../../hooks/usePlatform";
 import { ApiError, authorizedFetch, readFetchError } from "../../lib/api";
+import { apiUrl } from "../../lib/base-path";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { useImageViewer } from "../common/ImageViewerProvider";
 import { ContentViewer } from "./ContentViewer";
@@ -130,7 +131,7 @@ export function FilePreviewModal({
 		let cancelled = false;
 		const controller = new AbortController();
 		setLoading(true);
-		const url = `/api/fs/preview?path=${encodeURIComponent(filePath)}`;
+		const url = `${apiUrl("/fs/preview")}?path=${encodeURIComponent(filePath)}`;
 
 		if (previewType === "text") {
 			authorizedFetch(url, { signal: controller.signal })

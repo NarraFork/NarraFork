@@ -9,6 +9,7 @@ import {
 import i18n from "i18next";
 import LanguageDetector from "i18next-browser-languagedetector";
 import { initReactI18next } from "react-i18next";
+import { stripBase } from "./base-path";
 import { localeLoaders } from "./i18n-locale-loaders";
 
 export const supportedLanguages = SUPPORTED_LOCALES;
@@ -48,8 +49,18 @@ export function normalizeLanguage(lng: string | null | undefined): SupportedLang
 	return normalizeLocale(lng);
 }
 
+/**
+ * Reduce a raw `location.pathname` to the route path these tables are keyed by.
+ *
+ * The mount prefix is stripped first: callers pass `window.location.pathname`, which
+ * behind a reverse-proxy subpath or code-server's `/proxy/<port>/` carries that
+ * prefix, and none of the keys below have it. Without stripping, `/proxy/7778/login`
+ * matches no entry, falls through to the authenticated-shell defaults, and the login
+ * page renders raw translation keys — a visible defect with no error attached to it.
+ */
 function normalizePathname(pathname: string): string {
-	const path = pathname.split(/[?#]/, 1)[0] || "/";
+	const withoutQuery = pathname.split(/[?#]/, 1)[0] || "/";
+	const path = `/${stripBase(withoutQuery)}`;
 	if (path === "/") return path;
 	return path.replace(/\/+$/, "") || "/";
 }
