@@ -14,6 +14,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { toMappableLoopbackOrigin } from "./loopback";
 
 /** Default listen port, matching `DEFAULTS.server.port` in the backend settings. */
 export const DEFAULT_BACKEND_PORT = 7778;
@@ -44,7 +45,15 @@ interface HealthPayload {
 	version?: unknown;
 }
 
-/** Normalize a user-supplied base URL to a bare origin, or null when unusable. */
+/**
+ * Normalize a user-supplied base URL to a bare origin, or null when unusable.
+ *
+ * A loopback address is additionally rewritten to the `localhost` spelling, because
+ * `asExternalUri` cannot port-map an IPv6 literal and silently returns it unchanged
+ * (see `loopback.ts`). Doing it HERE means a user who pins `http://[::1]:7778` — the
+ * natural thing to write when the backend is bound to the IPv6 loopback only — still
+ * gets a working panel instead of a blank one.
+ */
 export function normalizeOrigin(value: string): string | null {
 	const trimmed = value.trim();
 	if (!trimmed) return null;
@@ -54,7 +63,7 @@ export function normalizeOrigin(value: string): string | null {
 	try {
 		const url = new URL(withScheme);
 		if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-		return url.origin;
+		return toMappableLoopbackOrigin(url.origin);
 	} catch {
 		return null;
 	}
@@ -93,10 +102,15 @@ export async function readConfiguredPortFromSettings(
 		const tls = (server as { tls?: unknown }).tls;
 		const tlsEnabled =
 			!!tls && typeof tls === "object" && (tls as { enabled?: unknown }).enabled === true;
-		// 127.0.0.1 rather than the configured `host`: that field is a BIND address
-		// ("0.0.0.0" is common) and is not necessarily a reachable name. Loopback always
-		// reaches a local listener, whatever it bound to.
-		return { origin: `${tlsEnabled ? "https" : "http"}://127.0.0.1:${port}` };
+		// `localhost` rather than the configured `host`: that field is a BIND address
+		// ("0.0.0.0" is common) and is not necessarily a reachable name.
+		//
+		// ⚠️ And `localhost` rather than `127.0.0.1`, which this previously hardcoded.
+		// Bun binding `host: "localhost"` on a dual-stack machine listens on the IPv6
+		// loopback ONLY, so `127.0.0.1` is refused outright and discovery reports "no
+		// backend" while the app is plainly running. `localhost` resolves to whichever
+		// family is actually up, and is also a spelling `asExternalUri` can port-map.
+		return { origin: `${tlsEnabled ? "https" : "http"}://localhost:${port}` };
 	} catch {
 		return null;
 	}
@@ -178,7 +192,9 @@ export async function discoverBackend(options: DiscoverOptions = {}): Promise<Di
 	const candidates: Array<{ origin: string; source: BackendEndpoint["source"] }> = [];
 	const fromSettings = await readSettings();
 	if (fromSettings) candidates.push({ origin: fromSettings.origin, source: "settings-file" });
-	const fallback = `http://127.0.0.1:${DEFAULT_BACKEND_PORT}`;
+	// `localhost`, so this reaches a backend bound to either loopback family — and so
+	// `asExternalUri` can map it. See `readConfiguredPortFromSettings`.
+	const fallback = `http://localhost:${DEFAULT_BACKEND_PORT}`;
 	if (!candidates.some((candidate) => candidate.origin === fallback)) {
 		candidates.push({ origin: fallback, source: "default" });
 	}

@@ -14,6 +14,8 @@
  * accepted deliberately.
  */
 
+import { isValidCspSource } from "./loopback";
+
 export interface ShellOptions {
 	/** Webview-reachable base URL, trailing slash included. */
 	baseUrl: string;
@@ -57,6 +59,14 @@ export function buildFrameUrl(baseUrl: string, handshakeNonce: string): string {
 	return url.toString();
 }
 
+/** Raised when the frame origin cannot be expressed in a CSP source list. */
+export class UnrepresentableFrameOriginError extends Error {
+	constructor(readonly origin: string) {
+		super(`Origin cannot appear in a Content-Security-Policy source list: ${origin}`);
+		this.name = "UnrepresentableFrameOriginError";
+	}
+}
+
 /**
  * Build the webview HTML.
  *
@@ -66,8 +76,20 @@ export function buildFrameUrl(baseUrl: string, handshakeNonce: string): string {
  *  - `connect-src 'none'`: the relay never makes requests. All API traffic happens
  *    INSIDE the iframe, on the backend's origin, under the SPA's own code.
  *  - `default-src 'none'` so anything not named above is refused rather than inherited.
+ *
+ * ⚠️ An origin that cannot appear in a source list is REFUSED here rather than
+ * interpolated. A bracketed IPv6 host is the real case: the browser discards the
+ * invalid source, `frame-src` collapses to `'none'`, and the iframe is blocked by a
+ * policy that looks permissive in the served HTML. The only evidence is a console
+ * warning inside a webview nobody has open — so this must fail where it can be
+ * explained. (`toMappableLoopbackOrigin` in `loopback.ts` normally prevents such an
+ * origin from getting this far; this is the backstop that keeps a future caller from
+ * reintroducing it silently.)
  */
 export function renderShellHtml(options: ShellOptions): string {
+	if (!isValidCspSource(options.baseOrigin)) {
+		throw new UnrepresentableFrameOriginError(options.baseOrigin);
+	}
 	const frameUrl = buildFrameUrl(options.baseUrl, options.handshakeNonce);
 	const csp = [
 		"default-src 'none'",

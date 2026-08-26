@@ -51,7 +51,7 @@
 				"narrafork.serverUrl": {
 					"type": "string",
 					"default": "",
-					"markdownDescription": "Base URL of the NarraFork backend, e.g. `http://127.0.0.1:7778`. Leave empty to discover it from `~/.narrafork/settings.json` and fall back to port 7778. When set, ONLY this URL is tried — a wrong value fails loudly instead of silently connecting elsewhere."
+					"markdownDescription": "Base URL of the NarraFork backend, e.g. `http://localhost:7778`. Leave empty to discover it from `~/.narrafork/settings.json` and fall back to port 7778. When set, ONLY this URL is tried — a wrong value fails loudly instead of silently connecting elsewhere.\n\nPrefer the `localhost` name over `127.0.0.1` or `[::1]`: the backend may be listening on only one loopback family, and in a browser-based editor (code-server) an IPv6 literal cannot be forwarded to your browser."
 				},
 				"narrafork.openOnStartup": {
 					"type": "boolean",

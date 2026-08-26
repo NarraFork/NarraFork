@@ -21,6 +21,28 @@
  */
 
 import * as vscode from "vscode";
+import { isLoopbackHost, isMappableByExternalUri, toMappableLoopbackOrigin } from "./loopback";
+
+/** Raised when the resolved URL cannot be reached from the webview's browser. */
+export class UnreachableWebviewUrlError extends Error {
+	constructor(
+		readonly backendOrigin: string,
+		readonly resolved: string,
+		/**
+		 * Whether `asExternalUri` could even have mapped this authority.
+		 *
+		 * False means the address was spelled in a form its regex does not accept (an
+		 * IPv6 literal), which the user can fix by changing `narrafork.serverUrl`. True
+		 * means the editor declined to forward a form it does understand — a different
+		 * problem, and one no rewording here would solve. The two need different advice,
+		 * so the distinction travels with the error rather than being re-derived.
+		 */
+		readonly wasMappable: boolean,
+	) {
+		super(`Resolved URL is not reachable from this editor's browser: ${resolved}`);
+		this.name = "UnreachableWebviewUrlError";
+	}
+}
 
 /**
  * Resolve `origin` to a webview-reachable base URL, always ending in `/`.
@@ -30,11 +52,54 @@ import * as vscode from "vscode";
  * request lands one level too high and 404s. The official documentation calls this out
  * explicitly ("you must use trailing slashes"), and the resulting blank panel gives no
  * hint about the cause.
+ *
+ * The origin is normalized to a spelling `asExternalUri` can map BEFORE the call (see
+ * `loopback.ts`): an IPv6 literal silently defeats its port-mapping regex, and the
+ * resulting URL points at the user's own machine.
  */
 export async function resolveWebviewBaseUrl(origin: string): Promise<string> {
-	const external = await vscode.env.asExternalUri(vscode.Uri.parse(origin));
+	const mappable = toMappableLoopbackOrigin(origin);
+	const external = await vscode.env.asExternalUri(vscode.Uri.parse(mappable));
 	const asString = external.toString(true);
-	return asString.endsWith("/") ? asString : `${asString}/`;
+	const withSlash = asString.endsWith("/") ? asString : `${asString}/`;
+
+	assertReachableFromWebview(mappable, withSlash);
+	return withSlash;
+}
+
+/**
+ * Refuse a resolved URL that the webview's browser cannot reach.
+ *
+ * ⚠️ `asExternalUri` does NOT report failure. When it cannot map an authority it
+ * returns the input unchanged, so "no mapping was needed" and "no mapping was
+ * possible" are the same value and must be told apart from context:
+ *
+ *  - Desktop VS Code: the webview runs on this machine, so an unchanged loopback URL
+ *    is correct and expected.
+ *  - A browser-hosted editor (code-server) or a remote/tunnelled window: the browser
+ *    is somewhere else, so a loopback URL addresses the USER'S machine, where nothing
+ *    is listening. Framing it yields a blank panel with no server-side error.
+ *
+ * Throwing here converts that into a message naming the cause. `isMappableByExternalUri`
+ * keeps the check honest: a still-loopback URL whose authority WAS mappable means the
+ * editor deliberately declined to forward (nothing we can fix by rewording), while an
+ * unmappable authority is the bug this guards.
+ */
+function assertReachableFromWebview(requested: string, resolved: string): void {
+	const env = describeHostEnvironment();
+	const webviewIsElsewhere = env.isWeb || env.remoteName !== undefined;
+	if (!webviewIsElsewhere) return;
+
+	let hostname: string;
+	try {
+		hostname = new URL(resolved).hostname;
+	} catch {
+		return;
+	}
+	if (!isLoopbackHost(hostname)) return;
+
+	// Still loopback in an environment where the browser is not this machine.
+	throw new UnreachableWebviewUrlError(requested, resolved, isMappableByExternalUri(requested));
 }
 
 /** The origin part of a base URL, for CSP directives that take an origin. */

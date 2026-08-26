@@ -32,6 +32,31 @@ proxyEndpointTemplate: process.env.VSCODE_PROXY_URI ?? rootBase + '/proxy/{{port
 
 如果运维设置了 `VSCODE_PROXY_URI`（如 `https://{{port}}.example.com`），返回的是子域名形式——相对路径方案在这种形式下同样正确，这也是选"全相对"而非"读取并拼接前缀"的原因。
 
+### `asExternalUri` 不认 IPv6 字面量（三重静默失效的源头）
+
+端口映射只对**它自己的正则**认得的 authority 生效，出处是 code-server 打包的 VS Code（`out/vs/workbench/api/node/extensionHostProcess.js`）：
+
+```js
+const t = /^(localhost|127\.0\.0\.1|0\.0\.0\.0):(\d+)$/.exec(e.authority);
+if (t) return { address: t[1], port: +t[2] };
+```
+
+`[::1]:7778` **不匹配**，于是 `asExternalUri` 原样返回、不建隧道、不给 `/proxy/<port>/`。讽刺的是同一文件的回环主机名列表 `["localhost","127.0.0.1","0:0:0:0:0:0:0:1","::1"]` 是包含 `::1` 的——只有端口映射这条路径没有 IPv6 分支。
+
+**调用方无法从 API 得知失败**：`asExternalUri` 成功返回，只是返回了一个浏览器到不了的地址。「无需映射」（桌面版，正确）与「无法映射」（code-server，致命）是同一个返回值，必须靠环境区分。
+
+这个坑一路静默到底，因为三层各自都不报错：
+
+1. 映射未发生 → URL 仍是 `http://[::1]:7778`；
+2. 该地址被塞进 webview → 浏览器在用户机器上，那里没有监听者；
+3. **带方括号的 IPv6 host 无法出现在 CSP source list** → 浏览器丢弃该 source，`frame-src` 退化为 `'none'`，iframe 被一条在 HTML 里看起来完全宽松的策略拦下。
+
+唯一证据是 webview devtools 里的一行告警——而那是用户最不会打开的地方。
+
+现在的对策分三处，见 `src/loopback.ts`：调用 `asExternalUri` **之前**把回环地址规范化为 `localhost`（同一台机器，只换一种 VS Code 认得的拼法）；在 web/remote 编辑器里若解析结果**仍是回环**则抛 `UnreachableWebviewUrlError`；CSP 无法表达的 origin 在 `renderShellHtml` 里抛 `UnrepresentableFrameOriginError`。两者都由 `extension.ts` 转成一条指名解决办法的错误提示，而不是白屏。
+
+⚠️ 规范化目标必须是 `localhost` 而**不是** `127.0.0.1`：Bun 以 `host: "localhost"` 启动时在双栈机器上**只监听 IPv6 回环**，此时 `127.0.0.1` 直接 ECONNREFUSED。这也是 discovery 曾经的真实 bug——它硬编码 `127.0.0.1` 作为候选，导致后端明明在跑却报「没有后端响应」。`localhost` 会解析到实际在监听的那个协议族（Node 18+ 的 fetch 会双栈尝试，已实测确认）。
+
 ### code-server 的 webview 与主窗口同源
 
 `patches/webview.diff` 标题即 "Serve webviews from the same origin"：`webviewEndpoint` 指向 code-server 自身静态路由，并绕过 `parentOriginHash` 校验。
@@ -49,18 +74,25 @@ proxyEndpointTemplate: process.env.VSCODE_PROXY_URI ?? rootBase + '/proxy/{{port
 vscode-extension/src/
   extension.ts     激活、命令、发现与状态生命周期
   discovery.ts     端点发现（settings.json → 默认端口，逐个探活 /api/health）
-  external-uri.ts  asExternalUri 换算 + 环境识别
+  external-uri.ts  asExternalUri 换算 + 环境识别 + 不可达则显式报错
+  loopback.ts      回环地址拼写规范化（asExternalUri / CSP 各自的可表达性）
   panel.ts         webview 面板生命周期与消息处理
   shell.ts         webview HTML（CSP + nonce + 消息中继）
   token-store.ts   SecretStorage 托管 token
   status-bar.ts    连接状态指示
 ```
 
-`discovery.ts`、`shell.ts`、`token-store.ts` 刻意不 import `vscode` 运行时（token-store 只 import type），所以它们能在仓库根的 `bun test` 下被测试，无需编辑器环境。测试在 `tests/vscode-extension/`。
+`discovery.ts`、`shell.ts`、`token-store.ts`、`loopback.ts` 刻意不 import `vscode` 运行时（token-store 只 import type），所以它们能在仓库根的 `bun test` 下被测试，无需编辑器环境。测试在 `tests/vscode-extension/`。
+
+`loopback.test.ts` 特意**用 VS Code 的原始正则做断言**而非复述它的判定结果，这样测试不会漂移成「我们以为 VS Code 接受什么」。
 
 ## 关键决策
 
 **发现策略只有一条硬规则：配置了 `narrafork.serverUrl` 就只试它。** 用户显式指定地址后静默回落，会把他连到**另一个**后端，而状态栏报告成功——错误的 pin 必须可见地失败。
+
+**设置项的探活必须防抖。** VS Code 的设置界面**每敲一个键就写一次值**，于是 `onDidChangeConfiguration` 按字符触发。早期实现每次触发都启动一轮完整发现（每候选 3s 超时、无防抖、无取消），输入 `http://localhost:7778` 会并发出约 21 条探测链，各自在完成时写同一个状态栏——按完成顺序而非敲键顺序。用户观感是「输入框在吞字、跟自己较劲」：窗口为 `http://l` 这种半截地址转圈，状态栏在过期结论之间闪。
+
+插件**从不写用户设置**（`src/` 里没有任何 `.update()` 调用，由测试固定），所以文本并非真被改写；但上述抖动足以造成同样的体验。现在的做法：防抖 600ms 后才探活，缓存失效仍然立即执行（不延迟才正确），并用 generation 计数丢弃被取代的迟到结果——否则慢的那一条会用过期结论覆盖新结论，把一个可用端点挤掉。见 `tests/vscode-extension/settings-edit-debounce.test.ts`。
 
 **探活用 `/api/health` 而非 TCP 连接。** 它是唯一既公开（无需会话）又能标识软件（返回 `version`/`commit`）的端点。开发机上"某个端口有东西在听"几乎总是成立，所以要检查响应体形状。503 算"找到了"：后端在启动恢复失败时刻意返回 503 + 健康负载并保持 UI 可达，而 UI 正是修复该状态的地方。
 

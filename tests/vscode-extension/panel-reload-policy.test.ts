@@ -58,12 +58,19 @@ describe("command wiring", () => {
 		expect(reconnectBody).toContain("forceReload: true");
 	});
 
-	it("openPanel does not force a reload", () => {
+	it("openPanel defaults to NOT forcing a reload", () => {
+		// `openPanel` forwards an options object (so the reconnect command can route its
+		// error reporting through the same place), so the guarantee is no longer "the word
+		// does not appear" but "the default is empty". A caller that omits options must
+		// never destroy the running SPA.
 		const openPanelBody = EXTENSION_SOURCE.slice(
 			EXTENSION_SOURCE.indexOf("async function openPanel("),
-			EXTENSION_SOURCE.indexOf("export async function activate("),
+			EXTENSION_SOURCE.indexOf("/**\n * Explain why a panel could not be opened."),
 		);
 		expect(openPanelBody.length).toBeGreaterThan(0);
-		expect(openPanelBody).not.toContain("forceReload");
+		expect(openPanelBody).toMatch(/options:\s*\{\s*forceReload\?:\s*boolean\s*\}\s*=\s*\{\}/);
+		// It must pass the caller's options through verbatim rather than synthesising a
+		// reload of its own.
+		expect(openPanelBody).not.toContain("forceReload: true");
 	});
 });

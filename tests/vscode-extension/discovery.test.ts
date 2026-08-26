@@ -16,7 +16,16 @@ import {
 	readConfiguredPortFromSettings,
 } from "../../vscode-extension/src/discovery";
 
-const DEFAULT_ORIGIN = `http://127.0.0.1:${DEFAULT_BACKEND_PORT}`;
+/**
+ * `localhost`, not `127.0.0.1`.
+ *
+ * ⚠️ The default candidate deliberately uses the NAME. A backend bound to the IPv6
+ * loopback only (Bun's behaviour for `host: "localhost"` on a dual-stack machine)
+ * refuses `127.0.0.1` outright, so the old hardcoded IPv4 literal reported "no backend"
+ * while the app was plainly running. `localhost` resolves to whichever family is up and
+ * is also a spelling `asExternalUri` can port-map — see `src/loopback.ts`.
+ */
+const DEFAULT_ORIGIN = `http://localhost:${DEFAULT_BACKEND_PORT}`;
 
 /** A fetch stub that answers `/api/health` for the listed origins only. */
 function fakeFetch(
@@ -42,17 +51,46 @@ const noSettingsFile: typeof readConfiguredPortFromSettings = async () => null;
 
 describe("normalizeOrigin", () => {
 	it("keeps an explicit http/https origin", () => {
-		expect(normalizeOrigin("http://127.0.0.1:7778")).toBe("http://127.0.0.1:7778");
+		expect(normalizeOrigin("http://nf.internal:7778")).toBe("http://nf.internal:7778");
 		expect(normalizeOrigin("https://nf.example.com")).toBe("https://nf.example.com");
 	});
 
 	it("assumes http for a bare host:port, which is what a user types", () => {
-		expect(normalizeOrigin("127.0.0.1:7778")).toBe("http://127.0.0.1:7778");
+		expect(normalizeOrigin("nf.internal:7778")).toBe("http://nf.internal:7778");
 		expect(normalizeOrigin("localhost:9000")).toBe("http://localhost:9000");
 	});
 
 	it("discards any path, since only the origin is used", () => {
-		expect(normalizeOrigin("http://127.0.0.1:7778/projects/abc")).toBe("http://127.0.0.1:7778");
+		expect(normalizeOrigin("http://nf.internal:7778/projects/abc")).toBe("http://nf.internal:7778");
+	});
+
+	/*
+	 * ⚠️ Loopback spellings are REWRITTEN to `localhost`, and this is a behaviour change
+	 * rather than tidying.
+	 *
+	 * `asExternalUri` port-maps only authorities matching its own regex
+	 * (`/^(localhost|127\.0\.0\.1|0\.0\.0\.0):(\d+)$/`, verbatim from the VS Code bundle
+	 * code-server ships). An IPv6 literal does not match, so it is returned UNCHANGED —
+	 * no tunnel, no `/proxy/<port>/` — and the panel then framed an address that only
+	 * exists on the server, from a browser on the user's machine. A bracketed IPv6 host
+	 * also cannot appear in a CSP source list, so `frame-src` collapsed to `'none'`.
+	 *
+	 * Normalising at the point the user's value is parsed means pinning `http://[::1]:7778`
+	 * — the natural thing to write when the backend is IPv6-loopback-only — still works.
+	 */
+	it("rewrites a loopback address to the localhost spelling", () => {
+		expect(normalizeOrigin("http://[::1]:7778")).toBe("http://localhost:7778");
+		expect(normalizeOrigin("[::1]:7778")).toBe("http://localhost:7778");
+		expect(normalizeOrigin("http://127.0.0.1:7778")).toBe("http://localhost:7778");
+		expect(normalizeOrigin("https://[::1]:8443")).toBe("https://localhost:8443");
+	});
+
+	it("does not rewrite a remote host that merely looks local", () => {
+		// Rewriting a non-loopback host would change WHICH machine is addressed.
+		expect(normalizeOrigin("http://notlocalhost.example:7778")).toBe(
+			"http://notlocalhost.example:7778",
+		);
+		expect(normalizeOrigin("http://10.0.0.5:7778")).toBe("http://10.0.0.5:7778");
 	});
 
 	it("rejects unusable values", () => {
@@ -127,23 +165,32 @@ describe("readConfiguredPortFromSettings", () => {
 		}
 	}
 
+	/*
+	 * ⚠️ The derived origin uses `localhost`, not `127.0.0.1` as it once did.
+	 *
+	 * This is the failure that made the whole feature look broken on a normal machine:
+	 * `bun run dev` with the default `host: "localhost"` makes Bun listen on the IPv6
+	 * loopback ONLY, so probing `127.0.0.1` got ECONNREFUSED and discovery reported "no
+	 * backend responded" while NarraFork was running and serving happily. The name
+	 * resolves to whichever family is actually listening.
+	 */
 	it("derives a loopback origin from server.port", async () => {
 		expect(await readFrom(JSON.stringify({ server: { port: 9123 } }))).toEqual({
-			origin: "http://127.0.0.1:9123",
+			origin: "http://localhost:9123",
 		});
 	});
 
 	it("uses https when TLS is enabled", async () => {
 		expect(
 			await readFrom(JSON.stringify({ server: { port: 8443, tls: { enabled: true } } })),
-		).toEqual({ origin: "https://127.0.0.1:8443" });
+		).toEqual({ origin: "https://localhost:8443" });
 	});
 
 	it("ignores server.host, which is a BIND address rather than a reachable name", async () => {
 		// `0.0.0.0` is a common value and is not connectable; loopback always reaches a
 		// local listener whatever it bound to.
 		expect(await readFrom(JSON.stringify({ server: { port: 7778, host: "0.0.0.0" } }))).toEqual({
-			origin: "http://127.0.0.1:7778",
+			origin: "http://localhost:7778",
 		});
 	});
 
@@ -199,14 +246,18 @@ describe("discoverBackend", () => {
 	});
 
 	describe("a configured URL", () => {
+		// A non-loopback host, so "verbatim" is actually observable: a pinned LOOPBACK
+		// address is deliberately re-spelled to `localhost` (see the normalizeOrigin
+		// tests above), which would otherwise make these assertions ambiguous about
+		// which behaviour they are pinning.
 		it("is used verbatim", async () => {
 			const result = await discoverBackend({
-				configuredUrl: "  127.0.0.1:9999 ",
-				fetchImpl: fakeFetch({ "http://127.0.0.1:9999": {} }),
+				configuredUrl: "  nf.internal:9999 ",
+				fetchImpl: fakeFetch({ "http://nf.internal:9999": {} }),
 				readSettings: noSettingsFile,
 			});
 			expect(result.ok && result.endpoint).toEqual({
-				origin: "http://127.0.0.1:9999",
+				origin: "http://nf.internal:9999",
 				version: "0.6.3",
 				source: "configured",
 			});
@@ -217,12 +268,12 @@ describe("discoverBackend", () => {
 			// them to a DIFFERENT backend while the status bar reported success.
 			const log: string[] = [];
 			const result = await discoverBackend({
-				configuredUrl: "http://127.0.0.1:9999",
+				configuredUrl: "http://nf.internal:9999",
 				fetchImpl: fakeFetch({ [DEFAULT_ORIGIN]: {} }, log),
 				readSettings: async () => ({ origin: DEFAULT_ORIGIN }),
 			});
 			expect(result.ok).toBe(false);
-			expect(log).toEqual(["http://127.0.0.1:9999/api/health"]);
+			expect(log).toEqual(["http://nf.internal:9999/api/health"]);
 		});
 
 		it("fails loudly when it cannot even be parsed", async () => {
