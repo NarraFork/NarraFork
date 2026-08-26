@@ -3634,42 +3634,6 @@ export async function handlePermission(
 		}
 	}
 
-<<<<<<< HEAD
-	// Conclusion file redirect
-	let conclusionRedirectNotice: string | undefined;
-	const subagentConcEntry = getConclusionEntry(narratorId);
-	// Same reason as the plan-file redirect above: a spec:// target is frozen with the
-	// "spec" path grammar before permission handling, so rewriting it to a worktree path
-	// turns the call into a routing error rather than a decision. Dynamic Spec is the
-	// subagent's own session metadata, never the caller's conclusion document.
-	if (
-		subagentConcEntry &&
-		(toolName === "Write" || toolName === "Edit") &&
-		!specVfsService.isSpecUri(effectiveInput.file_path)
-	) {
-		const filePath = typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
-		const conclusionRelPath = subagentConcEntry.relPath;
-		if (filePath) {
-			const absPath =
-				(executionContext && executionTargetPolicyPath(executionContext)) ??
-				resolveDecisionPath(cwd, filePath, executionContext);
-			const conclusionPath = resolveDecisionPath(cwd, subagentConcEntry.absPath, executionContext);
-			if (!decisionPaths(executionContext).equals(absPath, conclusionPath)) {
-				effectiveInput = { ...effectiveInput, file_path: conclusionRelPath };
-				conclusionRedirectNotice = getToolMessageWithParams(
-					"subagentConclusionRedirected",
-					locale,
-					{
-						originalPath: filePath,
-						conclusionFile: conclusionRelPath,
-					},
-				);
-			}
-		} else {
-			effectiveInput = { ...effectiveInput, file_path: conclusionRelPath };
-		}
-	}
-
 	if (toolName === "AskUserQuestion") {
 		const askResult = await validateOrRepairAskUserQuestionInput(
 			narratorId,

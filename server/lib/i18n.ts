@@ -235,42 +235,6 @@ In plan mode, Write/Edit operations are restricted to the plan file only.
 		"zh-CN":
 			'[计划模式] 注意：你的写入目标已从 "{originalPath}" 重定向到指定的计划文件 "{planFile}"。在计划模式下，请直接使用正确的计划文件路径。',
 	},
-	"tool.subagentConclusionRedirected": {
-		en: `⚠️ File path redirected: "{originalPath}" → "{conclusionFile}".
-
-You are an explore/plan subagent in READ-ONLY mode. All Write/Edit operations are restricted to the designated conclusion file.
-
-**Do NOT attempt to modify source code, configuration, or any project files.** Your role is to investigate and report findings, not to implement changes. If the task requires code modifications, describe what needs to change in your conclusion — the caller will implement it.
-
-Always target the conclusion file directly: \`{conclusionFile}\``,
-		"zh-CN": `⚠️ 文件路径已重定向："{originalPath}" → "{conclusionFile}"。
-
-你是 explore/plan 子代理，处于只读模式。所有 Write/Edit 操作被限制为只能写入指定的结论文件。
-
-**不要尝试修改源代码、配置或任何项目文件。** 你的职责是调查并报告发现，而不是实施变更。如果任务需要修改代码，在结论中描述需要改什么——调用者会去实施。
-
-始终直接写入结论文件：\`{conclusionFile}\``,
-	},
-	"tool.subagentConclusionRedirectedFileNotFound": {
-		en: `⚠️ File path redirected: "{originalPath}" → "{conclusionFile}".
-
-The conclusion file "{conclusionFile}" does not exist yet, so Edit failed.
-
-**You are an explore/plan subagent in READ-ONLY mode.** Do NOT attempt to modify source code, configuration, or any project files.
-
-**Action required:** Use **Write** (not Edit) to create the conclusion file first with your complete findings. After the file exists, you can use Edit to append or modify it.
-
-Target file: \`{conclusionFile}\``,
-		"zh-CN": `⚠️ 文件路径已重定向："{originalPath}" → "{conclusionFile}"。
-
-结论文件 "{conclusionFile}" 尚不存在，因此 Edit 操作失败。
-
-**你是 explore/plan 子代理，处于只读模式。** 不要尝试修改源代码、配置或任何项目文件。
-
-**需要执行的操作：** 首先使用 **Write**（而不是 Edit）创建结论文件，写入你的完整发现。文件创建后，你可以使用 Edit 追加或修改。
-
-目标文件：\`{conclusionFile}\``,
-	},
 	"tool.relaxedPlanToolReminder": {
 		en: `<relaxed_plan_reminder>
 You are still in relaxed plan mode. This non-read-only tool call was allowed only so planning can continue with full context. Do not start implementation work yet. Continue investigating or refining the plan, then call ExitPlanMode to submit the complete plan for approval.
@@ -278,7 +242,6 @@ You are still in relaxed plan mode. This non-read-only tool call was allowed onl
 		"zh-CN": `<relaxed_plan_reminder>
 你仍处于宽松计划模式。此次非只读工具调用只是为了让规划能带着完整上下文继续进行，并不表示可以开始实现。不要现在开始写实现代码；请继续调查或完善计划，然后调用 ExitPlanMode 提交完整计划供用户批准。
 </relaxed_plan_reminder>`,
-	},
 	},
 	"tool.planModeCancelled": {
 		en: "Plan mode was cancelled by the user. Do not submit or execute this plan unless the user asks you to plan again.",
@@ -861,8 +824,6 @@ export type ToolMessageKey =
 	| "planModeSoftDenyAskReason"
 	| "planModeToolDisabled"
 	| "planModeFileRedirected"
-	| "subagentConclusionRedirected"
-	| "subagentConclusionRedirectedFileNotFound"
 	| "relaxedPlanToolReminder"
 	| "planModeCancelled"
 	| "suggestAnswerSystem"

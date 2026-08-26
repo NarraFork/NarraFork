@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import { and, desc, eq, inArray, lt, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { chapters, narratorMessages, narrators } from "../db/schema";
+import { BOOLEAN_OVERRIDE_VALUES, type BooleanOverride } from "../lib/boolean-override";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { RESOURCE_SCOPE_FIELD_BY_TYPE, scopeContains } from "../lib/integrations/resource-scope";
 import { pluginIdSchema } from "../lib/plugins/manifest";
@@ -1284,6 +1285,7 @@ export interface NarratorCommandAdapter {
 		cwd?: string;
 		chapterId?: string | null;
 		permissionMode?: string;
+		planReflectionAutoApproveOverride?: BooleanOverride;
 		type?: "primary" | "subagent";
 		subagentType?: string;
 		parentNarratorId?: string;
@@ -1339,6 +1341,7 @@ export interface NarratorCommandAdapter {
 		title?: string;
 		model?: string;
 		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+		planReflectionAutoApproveOverride?: BooleanOverride;
 		pluginId: string;
 		context: HostCallContext;
 		signal: AbortSignal;
@@ -1441,6 +1444,7 @@ export const narratorCreateInputSchema = z
 		type: z.enum(["primary", "subagent"]).optional(),
 		subagentType: z.string().min(1).max(64).optional(),
 		parentNarratorId: idSchema.optional(),
+		planReflectionAutoApproveOverride: z.enum(BOOLEAN_OVERRIDE_VALUES).optional(),
 	})
 	.strict();
 export const narratorDeleteInputSchema = z.object({ narratorId: idSchema }).strict();
@@ -1472,18 +1476,27 @@ const narratorReasoningEffortSchema = z
 	.nullable()
 	.optional();
 
-/** Update a narrator's title / model / reasoning effort (at least one field). */
+/** Update a narrator's profile and reflection behavior (at least one field). */
 export const narratorUpdateProfileInputSchema = z
 	.object({
 		narratorId: idSchema,
 		title: z.string().trim().min(1).max(200).optional(),
 		model: z.union([z.literal("__default__"), z.string().trim().min(1).max(200)]).optional(),
 		reasoningEffort: narratorReasoningEffortSchema,
+		planReflectionAutoApproveOverride: z.enum(BOOLEAN_OVERRIDE_VALUES).optional(),
 	})
 	.strict()
-	.refine((data) => data.title !== undefined || data.model !== undefined || data.reasoningEffort !== undefined, {
-		message: "At least one of title, model or reasoningEffort must be provided",
-	});
+	.refine(
+		(data) =>
+			data.title !== undefined ||
+			data.model !== undefined ||
+			data.reasoningEffort !== undefined ||
+			data.planReflectionAutoApproveOverride !== undefined,
+		{
+			message:
+				"At least one of title, model, reasoningEffort or planReflectionAutoApproveOverride must be provided",
+		},
+	);
 
 /** Spec files a plugin may write through the public API (safety allowlist). */
 const SPEC_WRITE_WHITELIST = new Set(["tasks.json", "index.md"]);
@@ -2001,6 +2014,7 @@ export class PluginPublicApi {
 						cwd: input.cwd,
 						chapterId: input.chapterId,
 						permissionMode: input.permissionMode,
+						planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
 						type: input.type,
 						subagentType: input.subagentType,
 						parentNarratorId: input.parentNarratorId,
@@ -2138,6 +2152,9 @@ export class PluginPublicApi {
 						...(input.title !== undefined ? { title: input.title } : {}),
 						...(input.model !== undefined ? { model: input.model } : {}),
 						...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
+						...(input.planReflectionAutoApproveOverride !== undefined
+							? { planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride }
+							: {}),
 						pluginId: call.host.plugin.pluginId,
 						context: call.host,
 						signal: call.signal,
@@ -3283,6 +3300,7 @@ export function createCorePluginPublicApiAdapters(options: {
 						cwd: input.cwd,
 						chapterId: input.chapterId,
 						permissionMode: input.permissionMode,
+						planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
 						type: input.type,
 						subagentType: input.subagentType,
 						parentNarratorId: input.parentNarratorId,
@@ -3366,6 +3384,9 @@ export function createCorePluginPublicApiAdapters(options: {
 					...(input.model !== undefined ? { model: input.model } : {}),
 					...(input.reasoningEffort !== undefined
 						? { reasoningEffort: input.reasoningEffort }
+						: {}),
+					...(input.planReflectionAutoApproveOverride !== undefined
+						? { planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride }
 						: {}),
 				});
 				return { updated: result.updated };

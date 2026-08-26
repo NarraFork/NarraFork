@@ -351,6 +351,7 @@ interface CreateSubagentInput {
 	cwd: string;
 	title?: string;
 	permissionMode?: string;
+	planReflectionAutoApproveOverride?: BooleanOverride;
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	systemPrompt?: string;
@@ -1462,7 +1463,10 @@ export const narratorService = {
 				fastMode: legacyFastModeMirror(parent.fastModeOverride),
 				relaxedPlan: resolvedRelaxedPlan,
 				pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
-				planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
+				planReflectionAutoApproveOverride:
+					input.planReflectionAutoApproveOverride ??
+					parent.planReflectionAutoApproveOverride ??
+					"inherit",
 				dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
 				autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 				behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,

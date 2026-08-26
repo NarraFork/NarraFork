@@ -176,11 +176,6 @@ import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
 import { drainSpecUpdatesForNarrator } from "./spec-update-queue";
 import { specVfsService } from "./spec-vfs-service";
-import {
-	deleteConclusionFileId,
-	getConclusionEntry,
-	setConclusionFileId,
-} from "./subagent-conclusion";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import {
 	getConclusionWatcher,
@@ -5406,6 +5401,7 @@ export interface CreateNarratorForPluginInput {
 	cwd?: string;
 	chapterId?: string | null;
 	permissionMode?: string;
+	planReflectionAutoApproveOverride?: BooleanOverride;
 	/** "subagent" creates a team temp worker owned by `parentNarratorId`. */
 	type?: "primary" | "subagent";
 	subagentType?: string;
@@ -5447,6 +5443,7 @@ export async function createNarratorForPlugin(
 				| "readOnly"
 				| "dontAsk"
 				| undefined,
+			planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
 		});
 		return {
 			narratorId: narrator.id,
@@ -5464,6 +5461,7 @@ export async function createNarratorForPlugin(
 		model: input.model,
 		cwd: input.cwd,
 		permissionMode: input.permissionMode,
+		planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
 	});
 	return {
 		narratorId: narrator.id,
@@ -5586,6 +5584,7 @@ export async function updateNarratorProfileForPlugin(
 		title?: string;
 		model?: string;
 		reasoningEffort?: ReasoningEffort | null;
+		planReflectionAutoApproveOverride?: BooleanOverride;
 	},
 ): Promise<{ updated: string[] }> {
 	const { persistTitle } = await import("./narrator-title");
@@ -5607,6 +5606,12 @@ export async function updateNarratorProfileForPlugin(
 		await narratorService.updateReasoningEffort(narratorId, input.reasoningEffort);
 		updateNarratorReasoningEffort(narratorId, input.reasoningEffort);
 		updated.push("reasoningEffort");
+	}
+	if (input.planReflectionAutoApproveOverride !== undefined) {
+		await narratorService.updateReflectionOverrides(narratorId, {
+			planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
+		});
+		updated.push("planReflectionAutoApproveOverride");
 	}
 	return { updated };
 }

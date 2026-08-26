@@ -17,7 +17,6 @@ import { localBackend, setRemoteBackendResolver } from "../../lib/agent/executio
 import type { ToolExecutionTarget } from "../../lib/agent/types";
 import type { ExecutionTargetContext } from "../execution-policy/types";
 import type { PendingDangerReflection, PendingExecutionTarget } from "../narrator-session-state";
-import { deleteConclusionFileId, setConclusionFileId } from "../subagent-conclusion";
 
 const { db, sqlite } = getTestDb();
 
@@ -889,7 +888,6 @@ describe("Dynamic Spec writes are never redirected to a filesystem path", () => 
 		specPath: string;
 		traits?: string[];
 		planFileId?: string;
-		conclusion?: boolean;
 	}): Promise<PermissionResult> {
 		const id = `spec-redirect-${input.label}`;
 		const toolUse = `spec-redirect-tool-use-${input.label}`;
@@ -908,24 +906,17 @@ describe("Dynamic Spec writes are never redirected to a filesystem path", () => 
 		if (input.planFileId) {
 			activeNarrators.set(id, { _planFileId: input.planFileId } as never);
 		}
-		if (input.conclusion) {
-			setConclusionFileId(id, `conclusion-${input.label}`, "/local/work");
-		}
-		try {
-			return await handlePermission(
-				id,
-				new AbortController().signal,
-				"Write",
-				toolInput,
-				toolUse,
-				"/local/work",
-				"en",
-				undefined,
-				{ executionBackend: localBackend, executionTarget: specTarget(input.specPath) },
-			);
-		} finally {
-			if (input.conclusion) deleteConclusionFileId(id);
-		}
+		return await handlePermission(
+			id,
+			new AbortController().signal,
+			"Write",
+			toolInput,
+			toolUse,
+			"/local/work",
+			"en",
+			undefined,
+			{ executionBackend: localBackend, executionTarget: specTarget(input.specPath) },
+		);
 	}
 
 	function expectAllowedPath(result: PermissionResult, path: string): void {
@@ -957,63 +948,6 @@ describe("Dynamic Spec writes are never redirected to a filesystem path", () => 
 			}),
 			"spec://tasks.json",
 		);
-	});
-
-	test("a conclusion-scoped subagent still writes its own spec:// files", async () => {
-		expectAllowedPath(
-			await writeSpec({
-				label: "conclusion-tasks",
-				specPath: "spec://tasks.json",
-				conclusion: true,
-			}),
-			"spec://tasks.json",
-		);
-	});
-
-	test("a conclusion-scoped subagent's filesystem write is still redirected", async () => {
-		const id = "spec-redirect-conclusion-fs";
-		const toolUse = "spec-redirect-conclusion-fs-tool-use";
-		const toolInput = { file_path: "docs/findings.md", content: "x" };
-		// A real writable cwd keeps the conclusion file inside the worktree; the
-		// ~/.narrafork/conclusions fallback would be an out-of-cwd write and pause for
-		// reflection, which would test the danger path rather than the redirect.
-		const cwd = mkdtempSync(join(tmpdir(), "narrafork-conclusion-redirect-"));
-		await seedPermissionRequest({
-			narratorId: id,
-			messageId: "spec-redirect-conclusion-fs-message",
-			toolCallId: "spec-redirect-conclusion-fs-tool-call",
-			toolUseId: toolUse,
-			toolName: "Write",
-			input: toolInput,
-			permissionMode: "bypassPermissions",
-		});
-		setConclusionFileId(id, "conclusion-fs", cwd);
-		try {
-			const result = await handlePermission(
-				id,
-				new AbortController().signal,
-				"Write",
-				toolInput,
-				toolUse,
-				cwd,
-				"en",
-				undefined,
-				{
-					executionBackend: localBackend,
-					executionTarget: frozenTarget(localBackend, {
-						cwd,
-						path: join(cwd, "docs/findings.md"),
-					}),
-				},
-			);
-			expect(result.behavior).toBe("allow");
-			if (result.behavior === "allow") {
-				expect(result.updatedInput?.file_path).toBe(".narrafork/conclusion-conclusion-fs.md");
-			}
-		} finally {
-			deleteConclusionFileId(id);
-			rmSync(cwd, { recursive: true, force: true });
-		}
 	});
 });
 
@@ -1410,10 +1344,7 @@ describe("OAuth remote runtime permission constraints", () => {
 				toolName: "Write",
 				toolInput: { file_path: "/local/work/config.json", content: "{}" },
 				backend: localBackend,
-				target: frozenTarget(localBackend, {
-					cwd: "/local/work",
-					path: "/local/work/config.json",
-				}),
+				target: frozenTarget(localBackend, { cwd: "/local/work" }),
 			}),
 		).toMatchObject({
 			behavior: "deny",
@@ -1660,10 +1591,7 @@ describe("subagent permission routing identity", () => {
 			parentNarratorId,
 			{
 				executionBackend: localBackend,
-				executionTarget: frozenTarget(localBackend, {
-					cwd: "/workspace",
-					path: "/outside/file.ts",
-				}),
+				executionTarget: frozenTarget(localBackend, { cwd: "/workspace" }),
 			},
 			spawningToolUseId,
 		);
@@ -1695,15 +1623,15 @@ describe("subagent permission routing identity", () => {
 describe("device-scoped permission rules", () => {
 	test("unscoped blacklist (deviceScope null) denies on every device", () => {
 		for (const deviceId of ["local", "device-a", "device-b"]) {
+			const path = deviceId === "local" ? "C:\\secret" : "/secret";
+			const filePath = deviceId === "local" ? "C:\\secret\\file.ts" : "/secret/file.ts";
 			expect(
 				resolvePermissionDecision({
 					toolName: "Write",
-					input: { file_path: "/secret/file.ts", content: "x" },
+					input: { file_path: filePath, content: "x" },
 					permMode: "acceptEdits",
 					cwd: "/workspace",
-					blacklistDirs: [
-						{ path: "/secret", denyLevel: "denyAll", enabled: true, deviceScope: null },
-					],
+					blacklistDirs: [{ path, denyLevel: "denyAll", enabled: true, deviceScope: null }],
 					executionContext: staticExecutionContext(deviceId),
 				}),
 			).toBe("deny");
@@ -1730,17 +1658,18 @@ describe("device-scoped permission rules", () => {
 	});
 
 	test("blacklist scoped to 'local' applies to the host but not remote devices", () => {
-		const opts = (deviceId: string) =>
-			({
+		const opts = (deviceId: string) => {
+			const path = deviceId === "local" ? "C:\\etc" : "/etc";
+			const filePath = deviceId === "local" ? "C:\\etc\\hosts" : "/etc/hosts";
+			return {
 				toolName: "Write",
-				input: { file_path: "/etc/hosts", content: "x" },
+				input: { file_path: filePath, content: "x" },
 				permMode: "acceptEdits" as const,
 				cwd: "/workspace",
-				blacklistDirs: [
-					{ path: "/etc", denyLevel: "denyAll", enabled: true, deviceScope: "local" },
-				],
+				blacklistDirs: [{ path, denyLevel: "denyAll", enabled: true, deviceScope: "local" }],
 				executionContext: staticExecutionContext(deviceId),
-			}) satisfies Parameters<typeof resolvePermissionDecision>[0];
+			} satisfies Parameters<typeof resolvePermissionDecision>[0];
+		};
 		expect(resolvePermissionDecision(opts("local"))).toBe("deny");
 		expect(resolvePermissionDecision(opts("device-a"))).not.toBe("deny");
 	});
