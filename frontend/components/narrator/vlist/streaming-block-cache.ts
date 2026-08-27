@@ -34,6 +34,7 @@
 
 import { parseMarkdownUnits } from "@shared/pretext-layout/parse-markdown";
 import type { PreparedBlock } from "@shared/pretext-layout/prepared-block";
+import { getKatexRevision } from "./katex-runtime";
 import { markdownMathSupport } from "./measure/math-support";
 
 /**
@@ -60,6 +61,18 @@ interface StreamingEntry {
 	settledText: string;
 	/** Prepared blocks of `settledText`, in order. */
 	settledBlocks: PreparedBlock[];
+	/**
+	 * KaTeX revision the entry's blocks were prepared under.
+	 *
+	 * This cache is a SECOND, independent memo layer: it keeps its own settled blocks
+	 * rather than going through `prepared-markdown-cache` (whose key already carries
+	 * the revision). So the revision has to be tracked here too — otherwise a body
+	 * that settled BEFORE the runtime arrived keeps serving blocks in which the
+	 * formula is literal text, forever. That is the streaming half of the "formulas
+	 * only render after a page reload" bug: bumping the revision invalidated every
+	 * other layer and this one silently held the stale answer.
+	 */
+	mathRevision: number;
 }
 
 const entries = new Map<string, StreamingEntry>();
@@ -68,8 +81,8 @@ function unitKey(raw: string, isFirst: boolean): string {
 	return `${isFirst ? "F" : "M"}:${raw}`;
 }
 
-function freshEntry(): StreamingEntry {
-	return { memo: new Map(), settledText: "", settledBlocks: [] };
+function freshEntry(mathRevision: number): StreamingEntry {
+	return { memo: new Map(), settledText: "", settledBlocks: [], mathRevision };
 }
 
 /**
@@ -84,15 +97,17 @@ export function getStreamingPreparedBlocks(key: string, text: string): PreparedB
 		entries.delete(key);
 		return [];
 	}
+	const mathRevision = getKatexRevision();
 	const existing = entries.get(key);
-	// Reuse requires append-only growth. A rewritten body (a retry, or the
-	// front-truncation `appendStreamingTextPreview` applies past its 120k cap) shares no
-	// prefix, so the settled boundary is void.
+	// Reuse requires append-only growth AND the same math support. A rewritten body
+	// (a retry, or the front-truncation `appendStreamingTextPreview` applies past its
+	// 120k cap) shares no prefix, so the settled boundary is void; a revision change
+	// means the settled blocks were prepared without KaTeX and must be redone.
 	let entry: StreamingEntry;
-	if (existing && text.startsWith(existing.settledText)) {
+	if (existing && existing.mathRevision === mathRevision && text.startsWith(existing.settledText)) {
 		entry = existing;
 	} else {
-		entry = freshEntry();
+		entry = freshEntry(mathRevision);
 		entries.set(key, entry);
 	}
 	if (entry.memo.size > MAX_UNITS_PER_ROW) entry.memo.clear();

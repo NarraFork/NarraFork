@@ -458,13 +458,34 @@ mcpRoutes.delete("/servers/:id", requireAdmin, async (c) => {
 	return c.json({ ok: true });
 });
 
-/** Manually connect a server. */
+/**
+ * Manually connect a server, persisting the intent.
+ *
+ * Connect and disconnect are the same switch as the `enabled` toggle in the edit
+ * dialog: there is exactly one persisted connection intent. Without persisting
+ * here, a manual disconnect would be undone by the next startup (`initialize()`
+ * reconnects everything still marked `enabled`) or even by the next unrelated
+ * `PATCH` (which calls `reload()`).
+ *
+ * Settings are written before touching the runtime so that a crash between the
+ * two steps leaves the intent recorded rather than silently reverted.
+ */
 mcpRoutes.post("/servers/:id/connect", requireAdmin, async (c) => {
 	const { id } = c.req.param();
 	const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
 	const config = servers.find((s) => s.id === id);
 	if (!config) return c.json({ error: "Not found" }, 404);
 
+	if (!config.enabled) {
+		config.enabled = true;
+		settings.mcpServers = servers;
+		saveSettings(settings);
+	}
+
+	// A failed connection is deliberately NOT rolled back to enabled=false: the
+	// user asked for this server to be up, and the failure is already reported
+	// through status/error. Reverting would silently discard that request and
+	// stop future startups from retrying.
 	await mcpManager.connect(config);
 	syncMcpTools();
 
@@ -473,12 +494,27 @@ mcpRoutes.post("/servers/:id/connect", requireAdmin, async (c) => {
 	return c.json(status ?? { id, status: "error" });
 });
 
-/** Manually disconnect a server. */
+/** Manually disconnect a server, persisting the intent (see connect above). */
 mcpRoutes.post("/servers/:id/disconnect", requireAdmin, async (c) => {
 	const { id } = c.req.param();
+	const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
+	const config = servers.find((s) => s.id === id);
+	// Accepting an unknown id would let the caller believe they turned something
+	// off, which now also means "wrote a config change" — worth failing loudly.
+	if (!config) return c.json({ error: "Not found" }, 404);
+
+	if (config.enabled) {
+		config.enabled = false;
+		settings.mcpServers = servers;
+		saveSettings(settings);
+	}
+
 	await mcpManager.disconnect(id);
 	syncMcpTools();
-	return c.json({ ok: true });
+
+	const statuses = mcpManager.getServerStatuses();
+	const status = statuses.find((s) => s.id === id);
+	return c.json(status ?? { id, status: "disconnected", enabled: false });
 });
 
 /** Test an existing server with secret values inherited from persisted settings. */

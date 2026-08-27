@@ -203,6 +203,38 @@ describe("getStreamingPreparedBlocks — cache lifecycle", () => {
 		expect(streamingBlockCacheSize()).toBe(0);
 	});
 
+	/**
+	 * The KaTeX runtime arrives asynchronously, so a streaming body can SETTLE while
+	 * formulas are still literal text. This cache keeps its own settled blocks (it does
+	 * not go through prepared-markdown-cache, whose key already carries the revision),
+	 * so without tracking the revision itself it kept serving those text-only blocks
+	 * after the runtime landed — formulas stayed as raw `$…$` until a page reload.
+	 */
+	it("re-prepares settled blocks when the KaTeX revision changes", async () => {
+		const { getStreamingPreparedBlocks, resetStreamingBlockCache } = await load();
+		const runtime = await import("./katex-runtime");
+		runtime.resetKatexRuntimeForTest();
+		resetStreamingBlockCache("math-rev");
+
+		// Settle several blocks BEFORE the runtime exists, ending with display math.
+		// LIVE_TAIL_TOKENS keeps the last two units unsettled, so the trailing prose
+		// is what pushes the formula into the settled prefix.
+		const text = "开头段落\n\n$$a^2+b^2=c^2$$\n\n中间段落\n\n结尾段落\n\n补充段落\n";
+		const before = getStreamingPreparedBlocks("math-rev", text);
+		expect(before.some((block) => block.kind === "unknown" && block.tag === "katex")).toBe(false);
+
+		await runtime.ensureKatexLoaded("$a$");
+		expect(runtime.isKatexReady()).toBe(true);
+
+		// Same text, same key: the entry is reusable by prefix, so only the revision
+		// check can force the re-preparation that turns the formula into a katex block.
+		const after = getStreamingPreparedBlocks("math-rev", text);
+		expect(after.some((block) => block.kind === "unknown" && block.tag === "katex")).toBe(true);
+
+		runtime.resetKatexRuntimeForTest();
+		resetStreamingBlockCache("math-rev");
+	});
+
 	it("stays correct after the unit memo is evicted by its cap", async () => {
 		const { measureMarkdown, getStreamingPreparedBlocks, resetStreamingBlockCache } = await load();
 		resetStreamingBlockCache("evict");

@@ -8,6 +8,7 @@ import {
 	fetchAndUpdateUserInfo,
 	fetchBalance,
 	getAuthStatus,
+	getPendingAuthorizeUrl,
 	hasPendingAuth,
 	importFromCallbackUrl,
 	startBrowserAuth,
@@ -420,6 +421,7 @@ clineRoutes.get("/status", (c) => {
 		})),
 		totalModels,
 		pendingAuth: hasPendingAuth(),
+		authorizeUrl: getPendingAuthorizeUrl() ?? undefined,
 	});
 });
 

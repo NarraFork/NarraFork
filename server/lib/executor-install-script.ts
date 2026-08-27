@@ -276,6 +276,394 @@ function resolvePaths(input: ExecutorInstallScriptInput): ResolvedInput {
 	};
 }
 
+/**
+ * The canonical "is systemd actually running" test — `sd_booted()` in shell form.
+ *
+ * `command -v systemctl` is NOT a substitute and was the original defect. Debian
+ * images ship the systemd *binaries* as ordinary package content, so a PRoot /
+ * proot-distro guest, a Docker image, or a WSL distro without systemd enabled all
+ * have a working `/usr/bin/systemctl` that cannot reach any manager. There
+ * `systemctl daemon-reload` exits 1, and under the installer's `set -eu` that
+ * aborted the run *after* the binary, key and config were already in place: a
+ * fully provisioned machine whose executor never starts, with the only clue being
+ * a "Failed to connect to bus" line.
+ */
+const SYSTEMD_RUNNING_TEST = "[ -d /run/systemd/system ]";
+
+/**
+ * User mode needs a second check beyond `SYSTEMD_RUNNING_TEST`.
+ *
+ * A per-user manager is a separate thing from the system one: it is absent in an
+ * ssh session on a host without lingering enabled, and inside containers that run
+ * systemd only for PID 1. `show-environment` is the cheapest read-only probe that
+ * actually touches the user bus, so it fails exactly when `--user enable --now`
+ * would.
+ */
+const SYSTEMD_USER_BUS_TEST = "systemctl --user show-environment >/dev/null 2>&1";
+
+/**
+ * Relative to `$CONFIG_DIR`. Holds the supervisor pidfile and the bounded log,
+ * i.e. the state systemd would otherwise own (journal + unit state).
+ */
+const SUPERVISOR_STATE_SUBDIR = "run";
+const SUPERVISOR_CTL_NAME = "narrafork-executor-ctl";
+
+/**
+ * Markers around the autostart line appended to the login profile.
+ *
+ * Present so re-running the installer replaces nothing and appends nothing twice,
+ * and so a human can find and delete the block. Without an init system the login
+ * profile is the only "start it again next time" hook that exists.
+ */
+const AUTOSTART_BEGIN_MARKER = "# >>> narrafork-executor autostart >>>";
+const AUTOSTART_END_MARKER = "# <<< narrafork-executor autostart <<<";
+
+/**
+ * A POSIX-sh process supervisor, installed next to the binary when the machine has
+ * no service manager at all.
+ *
+ * It exists because "no systemd" is not a rare case: proot-distro guests on
+ * Android, minimal container images, and WSL distros with systemd disabled all
+ * land here, and on those machines the executor is otherwise a foreground process
+ * that dies with the terminal that started it.
+ *
+ * Three properties are load-bearing:
+ *
+ * - **`setsid`, not just `nohup`.** nohup only ignores SIGHUP; the process stays
+ *   in the invoking session and keeps its controlling terminal. `setsid` gives it
+ *   a fresh session with no terminal, which is what lets it outlive the shell.
+ *   Verified on a proot-distro guest: PPID becomes 1 and the process survives the
+ *   parent shell exiting.
+ * - **The log is size-bounded.** systemd would have handed stdout to a journal
+ *   with its own rotation. Appending forever instead is a disk-filling bug on
+ *   precisely the small devices this path targets.
+ * - **Restart backoff resets after an uptime threshold.** A process that ran for a
+ *   minute is working; carrying a penalty forward from an unrelated earlier crash
+ *   would turn one bad restart into a permanently slow one.
+ *
+ * Emitted inside a QUOTED heredoc, so `$$`, `$!` and the local variables below
+ * reach the file literally. The only values interpolated by JavaScript are
+ * code-controlled paths (never operator input), and they are written in double
+ * quotes so a `$HOME` inside them expands when the control script runs.
+ */
+function supervisorControlScript(input: ResolvedInput): string[] {
+	const binaryPath = `${input.installDir}/${input.binaryName}`;
+	const stateDir = `${input.configDir}/${SUPERVISOR_STATE_SUBDIR}`;
+	return [
+		"#!/bin/sh",
+		"# NarraFork remote executor supervisor.",
+		"#",
+		"# Installed because this machine has no service manager (no running systemd).",
+		"# Keeps one executor alive, restarts it with backoff, bounds its own log.",
+		"#   start | stop | restart | status | log [lines]",
+		"set -u",
+		"",
+		`BINARY="${binaryPath}"`,
+		`CONFIG_FILE="${input.configPath}"`,
+		`TOKEN_FILE="${input.tokenPath}"`,
+		`STATE_DIR="${stateDir}"`,
+		'SUPERVISOR_PID_FILE="$STATE_DIR/supervisor.pid"',
+		'CHILD_PID_FILE="$STATE_DIR/executor.pid"',
+		'LOG_FILE="$STATE_DIR/executor.log"',
+		"# Bounded deliberately: this path exists for phones and small images, where an",
+		"# append-forever log is a disk-filling bug rather than a debugging aid.",
+		"LOG_MAX_BYTES=1048576",
+		"# How often a RUNNING executor's log is checked against that bound.",
+		"#",
+		"# Checking only between restarts (which is all the first version did) bounds the",
+		"# log of a crash-looping executor and does nothing at all for a healthy one — the",
+		"# case that actually runs for weeks. Short interval also caps how long `stop`",
+		"# takes to be acted on: the shell defers its TERM handler until the current",
+		"# `sleep` returns.",
+		"LOG_CHECK_SECONDS=5",
+		"",
+		'mkdir -p "$STATE_DIR" 2>/dev/null || true',
+		'chmod 700 "$STATE_DIR" 2>/dev/null || true',
+		"",
+		"# Refuses anything non-numeric: a truncated or hand-edited pidfile must not",
+		"# turn into a kill against an unrelated pid.",
+		"read_pid() {",
+		'  [ -f "$1" ] || return 1',
+		'  _pid=$(cat "$1" 2>/dev/null) || return 1',
+		'  case "$_pid" in',
+		"    ''|*[!0-9]*) return 1 ;;",
+		"  esac",
+		"  printf '%s' \"$_pid\"",
+		"}",
+		"",
+		"supervisor_running() {",
+		'  _sp=$(read_pid "$SUPERVISOR_PID_FILE") || return 1',
+		'  kill -0 "$_sp" 2>/dev/null',
+		"}",
+		"",
+		"# Copy-then-truncate, NOT rename.",
+		"#",
+		"# The executor holds this file open for the whole run, so renaming it would",
+		"# leave the process writing into the ROTATED file: executor.log.1 would then",
+		"# grow without bound while the file the check looks at stays empty — the exact",
+		"# bug the bound exists to prevent, now invisible. Truncating in place is safe",
+		"# because the redirection is append mode, which recomputes the offset on every",
+		"# write instead of keeping a stale one (no sparse gap).",
+		"rotate_log() {",
+		'  [ -f "$LOG_FILE" ] || return 0',
+		// `tr` strips the padding some `wc` implementations emit; without it the numeric
+		// guard below would reject a valid size and silently disable rotation.
+		'  _size=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d "[:space:]")',
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
+		'  case "${_size:-x}" in',
+		"    ''|*[!0-9]*) return 0 ;;",
+		"  esac",
+		'  [ "$_size" -gt "$LOG_MAX_BYTES" ] || return 0',
+		'  cp -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true',
+		'  : > "$LOG_FILE" 2>/dev/null || true',
+		"}",
+		"",
+		"# A healthy executor never exits, so checking the log only between restarts",
+		"# bounds nothing on the machines that stay up. This runs the check on a timer",
+		"# for as long as the supervisor lives.",
+		"#",
+		"# A background subshell rather than a poll around `wait`: an exited child stays",
+		"# a zombie until it is reaped, and `kill -0` keeps succeeding on a zombie, so a",
+		"# `kill -0` poll loop would spin forever instead of restarting the executor.",
+		"start_rotator() {",
+		'  ( while :; do sleep "$LOG_CHECK_SECONDS"; rotate_log; done ) &',
+		"  ROTATOR_PID=$!",
+		"}",
+		"",
+		"stop_rotator() {",
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
+		'  [ -n "${ROTATOR_PID:-}" ] || return 0',
+		'  kill -TERM "$ROTATOR_PID" 2>/dev/null || true',
+		'  ROTATOR_PID=""',
+		"}",
+		"",
+		"stop_child() {",
+		'  _cp=$(read_pid "$CHILD_PID_FILE") || return 0',
+		'  kill -TERM "$_cp" 2>/dev/null || return 0',
+		"  _i=0",
+		'  while [ "$_i" -lt 30 ]; do',
+		'    kill -0 "$_cp" 2>/dev/null || return 0',
+		"    sleep 1",
+		"    _i=$((_i + 1))",
+		"  done",
+		'  kill -KILL "$_cp" 2>/dev/null || true',
+		"}",
+		"",
+		"# Internal subcommand: the restart loop. Started detached by `start`.",
+		"supervise() {",
+		'  echo "$$" > "$SUPERVISOR_PID_FILE"',
+		"  # The rotator is killed alongside the executor: leaving it behind would keep a",
+		"  # timer running against a log nobody writes to any more.",
+		'  trap \'stop_rotator; stop_child; rm -f "$SUPERVISOR_PID_FILE" "$CHILD_PID_FILE"; exit 0\' TERM INT',
+		'  ROTATOR_PID=""',
+		"  start_rotator",
+		"  _delay=1",
+		"  while :; do",
+		"    rotate_log",
+		"    _started=$(date +%s 2>/dev/null || echo 0)",
+		'    "$BINARY" --config "$CONFIG_FILE" --token-file "$TOKEN_FILE" >> "$LOG_FILE" 2>&1 &',
+		"    _child=$!",
+		'    echo "$_child" > "$CHILD_PID_FILE"',
+		'    wait "$_child" 2>/dev/null',
+		'    rm -f "$CHILD_PID_FILE"',
+		"    _now=$(date +%s 2>/dev/null || echo 0)",
+		"    if [ $((_now - _started)) -ge 60 ]; then _delay=1; fi",
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
+		'    echo "[supervisor] executor exited; restarting in ${_delay}s" >> "$LOG_FILE"',
+		'    sleep "$_delay"',
+		"    _delay=$((_delay * 2))",
+		'    if [ "$_delay" -gt 30 ]; then _delay=30; fi',
+		"  done",
+		"}",
+		"",
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
+		'case "${1:-}" in',
+		"  __supervise)",
+		"    supervise",
+		"    ;;",
+		"  start)",
+		"    if supervisor_running; then",
+		'      echo "narrafork-executor is already running."',
+		"      exit 0",
+		"    fi",
+		'    rm -f "$SUPERVISOR_PID_FILE" "$CHILD_PID_FILE"',
+		"    # setsid, not bare nohup: nohup only ignores SIGHUP and leaves the process in",
+		"    # this session with this terminal, so it still dies with the shell on some",
+		"    # systems. A new session with no controlling terminal is the point.",
+		"    if command -v setsid >/dev/null 2>&1; then",
+		'      setsid "$0" __supervise >/dev/null 2>&1 < /dev/null &',
+		"    else",
+		'      nohup "$0" __supervise >/dev/null 2>&1 < /dev/null &',
+		"    fi",
+		"    _i=0",
+		'    while [ "$_i" -lt 10 ]; do',
+		"      if supervisor_running; then break; fi",
+		"      sleep 1",
+		"      _i=$((_i + 1))",
+		"    done",
+		"    if supervisor_running; then",
+		'      echo "narrafork-executor started (log: $LOG_FILE)."',
+		"    else",
+		'      echo "narrafork-executor did not start; see $LOG_FILE" >&2',
+		"      exit 1",
+		"    fi",
+		"    ;;",
+		"  stop)",
+		"    if supervisor_running; then",
+		'      _sp=$(read_pid "$SUPERVISOR_PID_FILE")',
+		"      # The supervisor's TERM handler stops the executor first, so signalling the",
+		"      # supervisor alone must not leave an orphan behind.",
+		'      kill -TERM "$_sp" 2>/dev/null || true',
+		"      _i=0",
+		'      while [ "$_i" -lt 35 ]; do',
+		"        if ! supervisor_running; then break; fi",
+		"        sleep 1",
+		"        _i=$((_i + 1))",
+		"      done",
+		"    fi",
+		"    stop_child",
+		'    rm -f "$SUPERVISOR_PID_FILE" "$CHILD_PID_FILE"',
+		'    echo "narrafork-executor stopped."',
+		"    ;;",
+		"  restart)",
+		'    "$0" stop',
+		'    "$0" start',
+		"    ;;",
+		"  status)",
+		"    if supervisor_running; then",
+		'      _cp=$(read_pid "$CHILD_PID_FILE") || _cp="-"',
+		'      echo "running (supervisor $(read_pid "$SUPERVISOR_PID_FILE"), executor $_cp)"',
+		"    else",
+		'      echo "stopped"',
+		"      exit 1",
+		"    fi",
+		"    ;;",
+		"  log)",
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
+		'    tail -n "${2:-50}" "$LOG_FILE" 2>/dev/null || echo "no log yet"',
+		"    ;;",
+		"  *)",
+		'    echo "usage: $0 {start|stop|restart|status|log [lines]}" >&2',
+		"    exit 2",
+		"    ;;",
+		"esac",
+	];
+}
+
+/**
+ * Install steps for the no-service-manager path: write the control script, hook
+ * the login profile, start now, and verify it is actually up.
+ *
+ * The start is verified rather than assumed, for the same reason the Windows path
+ * calls `Start-Service` instead of only registering one: a machine where the
+ * executor cannot run must fail the install loudly, not report success and stay
+ * offline.
+ */
+function supervisorFallbackSetup(input: ResolvedInput): string[] {
+	const ctlPath = `${input.installDir}/${SUPERVISOR_CTL_NAME}`;
+	const system = input.mode === "system";
+	const sudo = system ? "sudo " : "";
+	const q = shellSingleQuote;
+
+	/*
+	 * The autostart hook writes to the *invoking* user's profile, so it is only
+	 * correct when that user can start the supervisor without elevation.
+	 *
+	 * In user mode that is always true. In system mode the config and key are
+	 * root-owned 0600, so the supervisor has to run as root too — and a profile hook
+	 * containing `sudo` would either prompt for a password at every login or fail
+	 * silently in a non-interactive one. Rather than install something that
+	 * misbehaves, system mode hooks the profile only when the installer is already
+	 * running as root (the ordinary case for a container without systemd) and
+	 * otherwise prints what to wire up manually.
+	 */
+	const autostartHook = [
+		'PROFILE_FILE="$HOME/.profile"',
+		'if [ -f "$HOME/.bash_profile" ]; then PROFILE_FILE="$HOME/.bash_profile"; fi',
+		`if ! grep -qF ${q(AUTOSTART_BEGIN_MARKER)} "$PROFILE_FILE" 2>/dev/null; then`,
+		"  {",
+		'    echo ""',
+		`    echo ${q(AUTOSTART_BEGIN_MARKER)}`,
+		`    echo ${q(`[ -x "${ctlPath}" ] && "${ctlPath}" start >/dev/null 2>&1 || true`)}`,
+		`    echo ${q(AUTOSTART_END_MARKER)}`,
+		'  } >> "$PROFILE_FILE"',
+		'  echo "Added an autostart block to $PROFILE_FILE (remove the marked lines to undo)."',
+		"else",
+		'  echo "Autostart block already present in $PROFILE_FILE."',
+		"fi",
+	];
+
+	return [
+		'echo "No running service manager detected (no systemd)."',
+		'echo "Installing the bundled supervisor instead."',
+		`CTL_PATH="${ctlPath}"`,
+		// Written via a temp file + install(1) so the control script is never briefly
+		// present with a partial body and an executable bit.
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
+		'TMP_CTL=$(mktemp "${TMPDIR:-/tmp}/narrafork-ctl.XXXXXX")',
+		"cat > \"$TMP_CTL\" <<'NFCTLEOF'",
+		...supervisorControlScript(input),
+		"NFCTLEOF",
+		`${sudo}install -m 755 "$TMP_CTL" "$CTL_PATH"`,
+		'rm -f "$TMP_CTL"',
+		'echo "Supervisor installed at $CTL_PATH"',
+		"",
+		/*
+		 * Without an init system there is no boot, so the login profile is the only
+		 * hook available. On a proot-distro guest that is exactly right: entering the
+		 * distro IS the boot, and `start` is a no-op when already running.
+		 *
+		 * Appended only when the marker is absent, so re-running the installer neither
+		 * duplicates the block nor rewrites a profile the operator has since edited.
+		 */
+		...(system
+			? [
+					'if [ "$(id -u)" = "0" ]; then',
+					...autostartHook.map((line) => `  ${line}`),
+					"else",
+					'  echo "Skipping the login autostart hook: this system-mode install keeps its"',
+					'  echo "config root-owned, so the supervisor needs root. Start it at boot with"',
+					'  echo "your own mechanism, or run: sudo $CTL_PATH start"',
+					"fi",
+				]
+			: autostartHook),
+		"",
+		// restart, not start: a re-run must pick up the freshly written config and key
+		// rather than leave an older process holding a now-rotated device key.
+		`${sudo}"$CTL_PATH" restart`,
+		"",
+		'echo "NOTE: there is no init system here, so the executor cannot start at boot."',
+		`echo "      Manage it with: ${sudo}$CTL_PATH {start|stop|restart|status|log}"`,
+		/*
+		 * State the privilege difference out loud, because the same install command
+		 * produces materially different confinement depending on the target machine.
+		 *
+		 * The systemd unit runs the executor as a dedicated `narrafork-executor` account
+		 * under NoNewPrivileges / ProtectSystem=full / RestrictSUIDSGID. None of that
+		 * exists here — there is no manager to enforce it — so a system-mode fallback
+		 * install runs as root with the executor's full reach (arbitrary file access and
+		 * command execution over the wire). An operator who read the systemd path's
+		 * hardening and assumed it applies everywhere would be wrong, and nothing in the
+		 * output said so.
+		 *
+		 * Printed rather than blocked: on a container without systemd, running as root
+		 * is often the only option, and refusing to install would just push the operator
+		 * to a hand-rolled setup with no supervisor at all.
+		 */
+		...(system
+			? [
+					"",
+					'echo "SECURITY: with no systemd, the executor runs as root here, WITHOUT the"',
+					'echo "          unit hardening the systemd path applies (dedicated service"',
+					'echo "          account, NoNewPrivileges, ProtectSystem, RestrictSUIDSGID)."',
+					'echo "          The executor can read/write any path and run any command as"',
+					'echo "          root. Prefer a user-mode install (--user) on such hosts, or"',
+					'echo "          confine the device with the path rules in NarraFork."',
+				]
+			: []),
+	];
+}
+
 function directModeNotice(input: ExecutorInstallScriptInput): string[] {
 	if (input.connectionMode !== "direct") return [];
 	return [
@@ -379,7 +767,7 @@ function buildUnixScript(input: ResolvedInput): string {
 	const unameArches = info.unameArches.map(q).join(" ");
 	const serviceName = "narrafork-executor";
 
-	const serviceSetup = system
+	const systemdSetup = system
 		? [
 				`SERVICE_PATH=/etc/systemd/system/${serviceName}.service`,
 				`echo "Installing systemd unit at $SERVICE_PATH"`,
@@ -446,6 +834,30 @@ function buildUnixScript(input: ResolvedInput): string {
 				`systemctl --user enable --now ${serviceName}`,
 				`systemctl --user --no-pager status ${serviceName} || true`,
 			];
+
+	/*
+	 * Pick the service mechanism at RUN time, not at generation time.
+	 *
+	 * The server cannot know whether the target has a running init: the platform
+	 * triple says `linux-arm64` for both a systemd VM and a proot-distro guest on a
+	 * phone. So both paths are emitted and the script chooses.
+	 *
+	 * User mode additionally probes the per-user bus, because a system manager being
+	 * up says nothing about whether *this* user has one (no lingering over ssh, or a
+	 * container running systemd only as PID 1).
+	 *
+	 * Neither branch is indented, and must not be: both contain quoted heredocs
+	 * (`<<'UNIT'`, `<<'NFCTLEOF'`), whose terminator only ends the body when it sits
+	 * at column 0. Indenting for readability would silently swallow the rest of the
+	 * script into a heredoc body.
+	 */
+	const serviceSetup = [
+		`if ${SYSTEMD_RUNNING_TEST}${system ? "" : ` && ${SYSTEMD_USER_BUS_TEST}`}; then`,
+		...systemdSetup,
+		"else",
+		...supervisorFallbackSetup(input),
+		"fi",
+	];
 
 	const launchdSetup =
 		input.mode === "system"

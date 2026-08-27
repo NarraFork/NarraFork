@@ -42,6 +42,7 @@ import { useCreateNarrator } from "../../hooks/useNarrator";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { DirectoryPicker } from "../common/DirectoryPicker";
+import { resolveCwdPrefill } from "./create-narrator-cwd-prefill";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 const CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS = 60_000;
@@ -208,6 +209,37 @@ export function CreateNarratorModal({
 	useEffect(() => {
 		if (opened && initialCwd) setCwd(initialCwd);
 	}, [opened, initialCwd]);
+
+	// When the caller gives no entry-point directory, pre-fill the instance's default
+	// project directory: the field previously only SHOWED it as a placeholder while an
+	// empty submit actually created the narrator in ~, which read as "the setting does
+	// nothing". Prefilling makes what you see what you get.
+	//
+	// The decision lives in `resolveCwdPrefill` because it is a timing question — the
+	// settings query is often unresolved on the first open, so the default arrives a
+	// render or two late and a fires-once-on-open effect would miss it permanently.
+	const prefilledForOpenRef = useRef(false);
+	useEffect(() => {
+		const decision = resolveCwdPrefill({
+			opened,
+			alreadyPrefilled: prefilledForOpenRef.current,
+			initialCwd,
+			cwd,
+			defaultProjectDir,
+		});
+		if (decision.kind === "reset") {
+			prefilledForOpenRef.current = false;
+			return;
+		}
+		if (decision.kind === "markPrefilled") {
+			prefilledForOpenRef.current = true;
+			return;
+		}
+		if (decision.kind === "prefill") {
+			setCwd(decision.value);
+			prefilledForOpenRef.current = true;
+		}
+	}, [opened, cwd, initialCwd, defaultProjectDir]);
 
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 

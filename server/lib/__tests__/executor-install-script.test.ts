@@ -310,7 +310,210 @@ describe("install locations and service wiring", () => {
 		expect(script).toContain("systemctl --user enable --now");
 		expect(script).not.toContain("sudo ");
 	});
+});
 
+/*
+ * A machine can have the systemd binaries and no systemd. Debian ships them as
+ * ordinary package content, so a proot-distro guest on Android, a plain container
+ * image, or a WSL distro with systemd disabled all have a working
+ * `/usr/bin/systemctl` that cannot reach any manager.
+ *
+ * That combination broke the installer in a specific and expensive way: under
+ * `set -eu`, `systemctl --user daemon-reload` exiting 1 aborted the run AFTER the
+ * binary, key and config were written. The machine looked provisioned and the
+ * executor never started — measured on a proot-distro aarch64 guest, where
+ * daemon-reload exits 1 with "Failed to connect to user scope bus".
+ */
+describe("hosts without a running init system", () => {
+	test("the probe tests for a running systemd, not for the systemctl binary", () => {
+		// `command -v systemctl` is what makes this bug possible: it succeeds on every
+		// machine described above. /run/systemd/system is the documented sd_booted()
+		// check and is absent exactly when there is no manager to talk to.
+		for (const mode of ["system", "user"] as const) {
+			const { script } = buildExecutorInstallScript(input({ mode }));
+			expect(script).toContain("[ -d /run/systemd/system ]");
+			expect(script).not.toContain("command -v systemctl");
+		}
+	});
+
+	test("user mode also probes the per-user bus", () => {
+		// The system manager running says nothing about whether THIS user has one: no
+		// lingering over ssh, or a container that runs systemd only as PID 1. Without
+		// this, `--user enable --now` still fails on a host that passed the first check.
+		const { script } = buildExecutorInstallScript(input({ mode: "user" }));
+		expect(script).toContain("systemctl --user show-environment >/dev/null 2>&1");
+		// System mode must NOT gate on the user bus: a root install has no user manager
+		// and would be pushed onto the fallback on a perfectly systemd-managed host.
+		const systemScript = buildExecutorInstallScript(input({ mode: "system" })).script;
+		expect(systemScript).not.toContain("systemctl --user show-environment");
+	});
+
+	test("both mechanisms ship in one script, chosen on the target", () => {
+		// The platform triple cannot distinguish a systemd VM from a proot guest — both
+		// are linux-arm64 — so the decision has to happen at run time on the machine.
+		const { script } = buildExecutorInstallScript(input({ platform: "linux-arm64" }));
+		expect(script).toContain("/etc/systemd/system/narrafork-executor.service");
+		expect(script).toContain("narrafork-executor-ctl");
+		expect(script).toContain("No running service manager detected");
+	});
+
+	test("the fallback supervisor uses setsid to escape the invoking session", () => {
+		// nohup alone only ignores SIGHUP; the process keeps this session and its
+		// controlling terminal. A fresh session is what actually lets it outlive the
+		// shell that ran the installer — confirmed on the proot guest, where the
+		// detached process reparents to PID 1 and survives the parent exiting.
+		const { script } = buildExecutorInstallScript(input({ mode: "user" }));
+		expect(script).toContain('setsid "$0" __supervise');
+		// nohup stays as a fallback for the rare host without setsid.
+		expect(script).toContain('nohup "$0" __supervise');
+	});
+
+	test("the fallback restarts the executor with resetting backoff", () => {
+		// Stands in for Restart=always plus RestartSec. The reset matters: a process
+		// that stayed up a minute is working, and carrying a penalty forward from an
+		// unrelated earlier crash would make one bad restart permanently slow.
+		const { script } = buildExecutorInstallScript(input({ mode: "user" }));
+		expect(script).toContain("_delay=$((_delay * 2))");
+		expect(script).toContain("if [ $((_now - _started)) -ge 60 ]; then _delay=1; fi");
+	});
+
+	test("the fallback bounds its own log", () => {
+		// systemd would have handed stdout to a rotating journal. Appending forever is a
+		// disk-filling bug on the phones and minimal images this path exists for.
+		const { script } = buildExecutorInstallScript(input({ mode: "user" }));
+		expect(script).toContain("LOG_MAX_BYTES=1048576");
+		expect(script).toContain("rotate_log");
+	});
+
+	test("the log bound applies to a RUNNING executor, not only between restarts", () => {
+		/*
+		 * Checking the size only before each spawn bounds a crash-looping executor and
+		 * does nothing for a healthy one — which is the process that actually runs for
+		 * weeks and produces the log that fills the disk. Measured with a stand-in
+		 * binary that stays up and writes continuously: with the check only in the
+		 * restart path the log grew unbounded, and with the timer it settled at the cap
+		 * plus one interval's output.
+		 */
+		const { script } = buildExecutorInstallScript(input({ mode: "user" }));
+		expect(script).toContain("LOG_CHECK_SECONDS=");
+		expect(script).toContain("start_rotator");
+		// Started by the supervise loop, so it lives exactly as long as the supervisor.
+		expect(script).toContain("  start_rotator");
+		// And torn down with it: a timer left running against an abandoned log is a
+		// leaked process on a device that has no service manager to reap it.
+		expect(script).toContain("stop_rotator");
+		expect(script).toContain("trap 'stop_rotator; stop_child;");
+	});
+
+	test("rotation copies and truncates rather than renaming", () => {
+		/*
+		 * The executor holds the log open for its whole run, so `mv` leaves it writing
+		 * into the ROTATED file. Verified directly: after a rename the writer kept
+		 * appending to executor.log.1 (21KB → 28KB) while executor.log no longer
+		 * existed — the file the size check reads. The bound would then never trigger
+		 * again, so the disk fills with the failure mode looking like success.
+		 *
+		 * `cp` + `: >` keeps the inode the executor writes to, and append-mode
+		 * redirection recomputes the offset per write so truncation leaves no sparse
+		 * gap.
+		 */
+		const { script } = buildExecutorInstallScript(input({ mode: "user" }));
+		expect(script).toContain('cp -f "$LOG_FILE" "$LOG_FILE.1"');
+		expect(script).not.toContain('mv -f "$LOG_FILE" "$LOG_FILE.1"');
+	});
+
+	test("the fallback refuses a non-numeric pidfile", () => {
+		// A truncated or hand-edited pidfile must not become a kill against whatever
+		// unrelated process now holds that number.
+		const { script } = buildExecutorInstallScript(input({ mode: "user" }));
+		expect(script).toContain("''|*[!0-9]*) return 1 ;;");
+	});
+
+	test("the fallback verifies the executor actually came up", () => {
+		// Same rule as the Windows path calling Start-Service: a machine where the
+		// executor cannot run must fail the install loudly rather than report success
+		// and sit offline.
+		const { script } = buildExecutorInstallScript(input({ mode: "user" }));
+		expect(script).toContain("did not start; see $LOG_FILE");
+	});
+
+	test("re-running the installer neither duplicates autostart nor keeps the old process", () => {
+		const { script } = buildExecutorInstallScript(input({ mode: "user" }));
+		// Marker-guarded append: a second run must not add the block again, nor rewrite
+		// a profile the operator has since edited.
+		expect(script).toContain("# >>> narrafork-executor autostart >>>");
+		expect(script).toContain("grep -qF '# >>> narrafork-executor autostart >>>'");
+		// restart, not start: the re-run just rotated the device key, so an older
+		// process holding the previous one has to be replaced.
+		expect(script).toContain('"$CTL_PATH" restart');
+	});
+
+	test("user-mode fallback introduces no sudo", () => {
+		// Guards the whole no-init path against the same rule the systemd user path
+		// follows: a user-level install must never need elevation, including in the
+		// supervisor and its autostart hook.
+		const { script } = buildExecutorInstallScript(input({ mode: "user" }));
+		expect(script).not.toContain("sudo ");
+	});
+
+	test("system-mode fallback states that it runs unhardened as root", () => {
+		/*
+		 * One install command yields two different confinement models: the systemd unit
+		 * runs as a dedicated account under NoNewPrivileges/ProtectSystem, the fallback
+		 * runs as root with none of it. Since the executor is remote file access plus
+		 * command execution, an operator who read the unit and assumed its hardening
+		 * applies everywhere is wrong — and before this the output never mentioned it.
+		 */
+		const { script } = buildExecutorInstallScript(input({ mode: "system" }));
+		expect(script).toContain("SECURITY:");
+		expect(script).toContain("runs as root here");
+		expect(script).toContain("NoNewPrivileges");
+		// User mode has nothing to warn about: it never elevates in the first place.
+		const userScript = buildExecutorInstallScript(input({ mode: "user" })).script;
+		expect(userScript).not.toContain("SECURITY:");
+	});
+
+	test("system-mode fallback skips the login hook unless already root", () => {
+		/*
+		 * System mode keeps config and key root-owned 0600, so the supervisor needs
+		 * root. A profile hook containing sudo would prompt for a password at every
+		 * login and fail silently in a non-interactive one, so it is only written when
+		 * the installer is already running as root.
+		 */
+		const { script } = buildExecutorInstallScript(input({ mode: "system" }));
+		expect(script).toContain('if [ "$(id -u)" = "0" ]; then');
+		expect(script).toContain("Skipping the login autostart hook");
+	});
+
+	test("heredoc terminators stay at column zero", () => {
+		/*
+		 * The branch bodies embed quoted heredocs, whose terminator only ends the body
+		 * when it starts at column 0. Indenting the branches for readability would make
+		 * the shell swallow the rest of the script into a heredoc body — a script that
+		 * still "runs" and does almost nothing.
+		 */
+		for (const mode of ["system", "user"] as const) {
+			const { script } = buildExecutorInstallScript(input({ mode }));
+			for (const terminator of ["UNIT", "NFCTLEOF", "CONFEOF"]) {
+				const lines = script.split("\n").filter((line) => line.trimEnd() === terminator);
+				expect(lines.length).toBeGreaterThan(0);
+				for (const line of lines) expect(line).toBe(terminator);
+			}
+		}
+	});
+
+	test("macOS keeps launchd and gains no shell supervisor", () => {
+		// launchd is always present on darwin, so the fallback would be dead code there
+		// — and its presence would imply a choice that never happens.
+		for (const mode of ["system", "user"] as const) {
+			const { script } = buildExecutorInstallScript(input({ platform: "darwin-arm64", mode }));
+			expect(script).not.toContain("narrafork-executor-ctl");
+			expect(script).not.toContain("/run/systemd/system");
+		}
+	});
+});
+
+describe("install locations, continued", () => {
 	test("macOS uses launchd rather than systemd", () => {
 		const daemon = buildExecutorInstallScript(
 			input({ platform: "darwin-arm64", mode: "system" }),
@@ -472,13 +675,25 @@ describe("injection resistance", () => {
 	});
 
 	test("command substitution in the device name cannot execute", () => {
-		const { script } = buildExecutorInstallScript(input({ deviceName: "$(id > /tmp/pwned)" }));
-		// Present only on a comment line; nothing outside comments may carry it.
-		const executable = script
-			.split("\n")
-			.filter((line) => !line.trimStart().startsWith("#"))
-			.join("\n");
-		expect(executable).not.toContain("$(id");
+		const payload = "$(id > /tmp/pwned)";
+		/*
+		 * Asserted against the PAYLOAD, not against `$(id` on its own.
+		 *
+		 * The narrower spelling would also match the installer's own code — the no-init
+		 * fallback tests `[ "$(id -u)" = "0" ]` before writing a login hook — and a test
+		 * that fails on legitimate command substitution pushes whoever hits it toward
+		 * rewriting the guard rather than checking the guarantee. What must hold is that
+		 * operator input never reaches an executable line, which is what this checks.
+		 */
+		for (const mode of ["system", "user"] as const) {
+			const { script } = buildExecutorInstallScript(input({ mode, deviceName: payload }));
+			const executable = script
+				.split("\n")
+				.filter((line) => !line.trimStart().startsWith("#"))
+				.join("\n");
+			expect(executable).not.toContain(payload);
+			expect(executable).not.toContain("pwned");
+		}
 	});
 
 	test("the config heredoc delimiter is quoted so config values never expand", () => {

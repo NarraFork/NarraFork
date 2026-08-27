@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { mkdirSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { formatOriginLabel } from "@shared/message-origin";
 import {
 	MAX_EDIT_ATTACHMENTS_PER_TYPE,
@@ -125,7 +126,7 @@ import {
 	resolveSetupAuthorization,
 	selectActionableDependencies,
 } from "../lib/prompt-i18n";
-import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction } from "../lib/settings";
+import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, settings } from "../lib/settings";
 import {
 	deleteAvatarImage,
 	deleteUploadedImage,
@@ -364,6 +365,7 @@ import {
 } from "../services/snapshot-revert";
 import { broadcastSpecChanged } from "../services/spec-broadcast";
 import { appendProtectedSpecTask } from "../services/spec-vfs-service";
+import { resolveStandaloneNarratorCwd } from "../services/standalone-narrator-cwd";
 import { resumeSubagent, withSubagentResumeLock } from "../services/subagent-resume";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
 import { usageHistoryService } from "../services/usage-history-service";
@@ -943,6 +945,33 @@ narratorRoutes.get("/", async (c) => {
 	);
 });
 
+/**
+ * Bind the standalone-cwd decision to this process's real filesystem and settings.
+ *
+ * The decision itself lives in `standalone-narrator-cwd` so its branches (a `~` to
+ * expand, a configured directory that cannot be created) are unit-testable without a
+ * disk.
+ */
+function standaloneNarratorCwd(input: {
+	cwd?: string;
+	chapterId?: string | null;
+}): string | undefined {
+	return resolveStandaloneNarratorCwd(input, {
+		home: getHome(),
+		configuredDir: settings.paths.defaultProjectDir,
+		ensureDir: (path) => {
+			mkdirSync(path, { recursive: true });
+		},
+		toAbsolute: (path) => resolve(path),
+		onEnsureFailed: (path, error) => {
+			logger.warn("Failed to ensure default project dir exists for narrator cwd", {
+				path,
+				error: String(error),
+			});
+		},
+	});
+}
+
 // Create narrator
 narratorRoutes.post("/", async (c) => {
 	const body = await c.req.json();
@@ -962,12 +991,14 @@ narratorRoutes.post("/", async (c) => {
 	// Ownership always comes from the authenticated session, never from the body:
 	// a client must not be able to create a narrator on someone else's behalf.
 	const ownerUserId = c.get("user").sub;
+	const resolvedCwd = standaloneNarratorCwd(input);
 
 	if (input.kind) {
 		const user = c.get("user");
 		const locale = await getUserLanguage(user.sub);
 		const narrator = await narratorService.create({
 			...input,
+			cwd: resolvedCwd,
 			ownerUserId,
 			creatorIsAdmin: user.role === "admin",
 			locale,
@@ -975,7 +1006,11 @@ narratorRoutes.post("/", async (c) => {
 		return c.json(publicNarratorResponse(narrator), 201);
 	}
 
-	const narrator = await narratorService.create({ ...input, ownerUserId });
+	const narrator = await narratorService.create({
+		...input,
+		cwd: resolvedCwd,
+		ownerUserId,
+	});
 	return c.json(publicNarratorResponse(narrator), 201);
 });
 
@@ -3340,10 +3375,29 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	if (!interrupted) {
 		// Fallback: the UI Stop button should hard-stop foreground/background subagents.
 		// The soft foreground interrupt is still used by Send({ doInterrupt: true }).
-		const { cancelBackgroundTask, interruptForegroundSubagent } = await import(
+		const { cancelBackgroundTask, interruptForegroundSubagent, isTakenOver } = await import(
 			"../services/narrator-subagent"
 		);
-		interrupted = interruptForegroundSubagent(id, { hard: true });
+		// EXCEPTION — a taken-over subagent must never be HARD interrupted from here.
+		// A hard interrupt makes runForegroundLoop break out of its loop before the
+		// queue-drain and the takeover suspension, so `finalizeSubagent` discards
+		// every queued message and the parent's blocked tool call is resolved — the
+		// takeover silently ends and the user's message is lost. During a takeover the
+		// user drives this subagent like an independent narrator, so Stop means "stop
+		// the current turn", exactly as the soft interrupt does: the loop then drains
+		// the queue (or re-suspends in `taken_over`) and the parent stays blocked.
+		//
+		// CONSEQUENCE, deliberate: while a taken-over subagent is SUSPENDED (parked in
+		// idle[taken_over] awaiting the user's next command, no foreground controller),
+		// this reports false and changes nothing — including the zombie fallback below,
+		// which only fires for working/waiting. That is the honest answer: no turn is in
+		// flight to stop. The alternative is worse — the soft path's only other lever is
+		// `interruptManualOverride`, which SETTLES the subagent and hands a result to the
+		// parent, i.e. it would END the takeover rather than interrupt anything. Ending
+		// one is `POST /:id/stop-takeover`'s job. The UI matches: it shows "Stop takeover"
+		// rather than Stop while suspended, so the inert button is unreachable there; a
+		// direct API caller gets `{interrupted: false}`.
+		interrupted = interruptForegroundSubagent(id, { hard: !isTakenOver(id) });
 		if (!interrupted) {
 			interrupted = await cancelBackgroundTask(id);
 		}

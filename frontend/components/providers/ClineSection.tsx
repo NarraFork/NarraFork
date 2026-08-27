@@ -14,6 +14,8 @@ import {
 import { useDebouncedValue } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
+	IconCopy,
+	IconExternalLink,
 	IconEye,
 	IconEyeOff,
 	IconLink,
@@ -25,6 +27,7 @@ import {
 	IconRefresh,
 	IconSearch,
 	IconStarFilled,
+	IconX,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useMemo, useState } from "react";
@@ -97,6 +100,7 @@ export const ClineSection = React.memo(function ClineSection({
 	const canLogout = isClineRouteSupported("logout");
 	const [refreshing, setRefreshing] = useState(false);
 	const [callbackUrl, setCallbackUrl] = useState("");
+	const [authorizeUrl, setAuthorizeUrl] = useState("");
 	const [poolSearch, setPoolSearch] = useState("");
 	const [debouncedSearch] = useDebouncedValue(poolSearch, 300);
 
@@ -152,15 +156,25 @@ export const ClineSection = React.memo(function ClineSection({
 		gcTime: CLINE_PROVIDER_QUERY_GC_TIME_MS,
 	});
 
-	// Login mutation
+	// Login mutation — do NOT auto-open the browser; show the URL panel instead
+	// so the user can copy it to another device or cancel the flow.
 	const loginMutation = useMutation({
 		mutationFn: () => api.clineBrowserAuth(),
 		onSuccess: (data) => {
-			window.open(data.authorizeUrl, "_blank");
+			setAuthorizeUrl(data.authorizeUrl);
 			refetchStatus();
 		},
 		onError: () => {
 			notifications.show({ color: "red", title: t("clineLoginError"), message: "" });
+		},
+	});
+
+	// Cancel pending auth mutation
+	const cancelAuthMutation = useMutation({
+		mutationFn: api.clineCancelAuth,
+		onSuccess: () => {
+			setAuthorizeUrl("");
+			refetchStatus();
 		},
 	});
 
@@ -234,6 +248,18 @@ export const ClineSection = React.memo(function ClineSection({
 
 	const isAuthenticated = clineStatus?.authenticated ?? false;
 	const isPending = clineStatus?.pendingAuth ?? false;
+	// Prefer the URL captured from the mutation response; fall back to the one
+	// reported by /status (covers page reloads while an auth flow is pending).
+	const pendingAuthorizeUrl = authorizeUrl || clineStatus?.authorizeUrl || "";
+	const handleCopyAuthorizeUrl = useCallback(async () => {
+		if (!pendingAuthorizeUrl) return;
+		try {
+			await navigator.clipboard.writeText(pendingAuthorizeUrl);
+			notifications.show({ color: "green", title: t("clineAuthUrlCopied"), message: "" });
+		} catch {
+			notifications.show({ color: "red", title: t("clineAuthUrlCopyFailed"), message: "" });
+		}
+	}, [pendingAuthorizeUrl, t]);
 
 	// Extract enabled models from settings
 	const clineProviders: Array<{
@@ -341,14 +367,63 @@ export const ClineSection = React.memo(function ClineSection({
 						variant="light"
 						leftSection={<IconLogin size={14} />}
 						onClick={() => canStartAuth && loginMutation.mutate()}
-						loading={loginMutation.isPending || isPending}
-						disabled={!canStartAuth}
+						loading={loginMutation.isPending}
+						disabled={!canStartAuth || isPending}
 						title={!canStartAuth ? providerRouteUnsupportedReason : undefined}
 					>
 						{isPending ? t("clineLoginLoading") : t("clineLogin")}
 					</Button>
 				)}
 			</Group>
+
+			{/* Pending OAuth: show the authorize URL instead of auto-navigating */}
+			{!isAuthenticated && isPending && (
+				<Stack gap={4}>
+					<Text size="xs" c="dimmed">
+						{t("clineAuthPendingDesc")}
+					</Text>
+					<Group gap="xs" align="center" wrap="nowrap">
+						<Text
+							size="xs"
+							style={{ fontFamily: "monospace", flex: 1, minWidth: 0 }}
+							truncate
+							title={pendingAuthorizeUrl}
+						>
+							{pendingAuthorizeUrl || t("clineAuthUrlUnavailable")}
+						</Text>
+						<Tooltip label={t("clineAuthOpenUrl")}>
+							<ActionIcon
+								size="sm"
+								variant="light"
+								disabled={!pendingAuthorizeUrl}
+								onClick={() => pendingAuthorizeUrl && window.open(pendingAuthorizeUrl, "_blank")}
+							>
+								<IconExternalLink size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<Tooltip label={t("clineAuthCopyUrl")}>
+							<ActionIcon
+								size="sm"
+								variant="light"
+								disabled={!pendingAuthorizeUrl}
+								onClick={() => handleCopyAuthorizeUrl()}
+							>
+								<IconCopy size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<Button
+							size="xs"
+							variant="light"
+							color="red"
+							leftSection={<IconX size={14} />}
+							onClick={() => cancelAuthMutation.mutate()}
+							loading={cancelAuthMutation.isPending}
+						>
+							{t("clineAuthCancel")}
+						</Button>
+					</Group>
+				</Stack>
+			)}
 
 			{/* Paste callback URL (for remote deployments) */}
 			{!isAuthenticated && (

@@ -11,6 +11,16 @@ const actualToolBridgeModule = { ...(await import("../../../server/lib/mcp/tool-
 const settingsState: { mcpServers: McpServerConfig[] } = { mcpServers: [] };
 const connectedServerIds = new Set<string>();
 let lastTestConfig: McpServerConfig | null = null;
+let saveSettingsCalls = 0;
+
+/**
+ * The set `mcpManager.initialize()` would connect on the next startup. Mirrors
+ * the manager's own filter, so asserting against it checks the behavior the
+ * disconnect fix is about, not merely the value of a field.
+ */
+function autoConnectOnStartup(): string[] {
+	return settingsState.mcpServers.filter((s) => s.enabled).map((s) => s.id);
+}
 
 const mcpManagerMock = {
 	getServerStatuses: () =>
@@ -38,7 +48,9 @@ const mcpManagerMock = {
 mock.module("../../../server/lib/settings", () => ({
 	...actualSettingsModule,
 	settings: settingsState,
-	saveSettings: () => {},
+	saveSettings: () => {
+		saveSettingsCalls++;
+	},
 }));
 mock.module("../../../server/lib/mcp/manager", () => ({
 	...actualManagerModule,
@@ -96,6 +108,7 @@ beforeEach(() => {
 	role = "user";
 	connectedServerIds.clear();
 	lastTestConfig = null;
+	saveSettingsCalls = 0;
 	settingsState.mcpServers = [structuredClone(existingServer)];
 });
 
@@ -248,5 +261,62 @@ describe("MCP external server management authorization", () => {
 
 		expect((await app.request("/servers/existing", { method: "DELETE" })).status).toBe(200);
 		expect(settingsState.mcpServers.some((server) => server.id === "existing")).toBe(false);
+	});
+});
+
+describe("MCP manual connect/disconnect persists the connection intent", () => {
+	beforeEach(() => {
+		role = "admin";
+	});
+
+	it("persists a manual disconnect so the next startup does not reconnect", async () => {
+		settingsState.mcpServers[0].enabled = true;
+		connectedServerIds.add("existing");
+		saveSettingsCalls = 0;
+
+		const response = await app.request("/servers/existing/disconnect", { method: "POST" });
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ id: "existing", enabled: false });
+
+		expect(settingsState.mcpServers[0].enabled).toBe(false);
+		expect(saveSettingsCalls).toBeGreaterThan(0);
+		// The actual regression: a manually disconnected server used to come back
+		// because initialize() reconnects everything still marked enabled.
+		expect(autoConnectOnStartup()).not.toContain("existing");
+		expect(connectedServerIds.has("existing")).toBe(false);
+	});
+
+	it("persists a manual connect so the next startup reconnects", async () => {
+		expect(settingsState.mcpServers[0].enabled).toBe(false);
+		saveSettingsCalls = 0;
+
+		const response = await app.request("/servers/existing/connect", { method: "POST" });
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ id: "existing", status: "connected" });
+
+		expect(settingsState.mcpServers[0].enabled).toBe(true);
+		expect(saveSettingsCalls).toBeGreaterThan(0);
+		expect(autoConnectOnStartup()).toContain("existing");
+	});
+
+	it("does not rewrite settings when the intent already matches", async () => {
+		settingsState.mcpServers[0].enabled = false;
+		saveSettingsCalls = 0;
+
+		expect((await app.request("/servers/existing/disconnect", { method: "POST" })).status).toBe(
+			200,
+		);
+		expect(saveSettingsCalls).toBe(0);
+		expect(settingsState.mcpServers[0].enabled).toBe(false);
+	});
+
+	it("rejects an unknown server id on disconnect without touching settings", async () => {
+		const before = structuredClone(settingsState.mcpServers);
+		saveSettingsCalls = 0;
+
+		const response = await app.request("/servers/missing/disconnect", { method: "POST" });
+		expect(response.status).toBe(404);
+		expect(saveSettingsCalls).toBe(0);
+		expect(settingsState.mcpServers).toEqual(before);
 	});
 });

@@ -59,12 +59,12 @@ import {
 import { agentLabelFromNarrator, agentResultTag, resolveAgentLabel } from "./subagent-label";
 import { resumeManualOverride, waitForManualOverride } from "./subagent-manual-override";
 import {
+	beginSubagentInterruptSuspension,
 	clearTakenOver,
 	consumePendingStopTakeover,
 	consumePendingTakeover,
 	isBackgroundTakenOver,
 	isTakenOver,
-	markTakenOver,
 } from "./subagent-takeover";
 import { broadcastSubagentTakeoverChanged } from "./subagent-takeover-broadcast";
 import { clearTeamInbox } from "./subagent-team";
@@ -1441,10 +1441,13 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					// subagent taken over and use the taken_over substatus so the
 					// parent tool call stays running ("user is operating") instead of
 					// showing a plain manual_override suspension.
-					const isTakeover = consumePendingTakeover(subagentId);
-					if (isTakeover) {
-						markTakenOver(subagentId);
-					}
+					// One call, because the marker read here is destructive: it covers the
+					// interrupt that STARTS a takeover, and every later interrupt within
+					// one — the user stopping a turn they are driving themselves. Both must
+					// suspend as `taken_over`, or the second Stop of a takeover downgrades
+					// it to a plain `manual_override`, the takeover UI vanishes, and the
+					// parent stays blocked with no visible way to release it.
+					const { heldByTakeover } = beginSubagentInterruptSuspension(subagentId);
 
 					// The user may have already clicked "Stop takeover" during the
 					// brief window between the takeover interrupt firing and the loop
@@ -1454,13 +1457,13 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					// the finalizer hand the current turn's result straight back to the
 					// blocked parent. clearTakenOver must run before finalizeSubagent so
 					// preserveTakenOverSubstatus does not re-inject the taken_over tag.
-					if (isTakeover && consumePendingStopTakeover(subagentId)) {
+					if (heldByTakeover && consumePendingStopTakeover(subagentId)) {
 						clearTakenOver(subagentId);
 						break;
 					}
 
 					const control = await suspendForUserControl(
-						isTakeover ? ["taken_over"] : ["manual_override"],
+						heldByTakeover ? ["taken_over"] : ["manual_override"],
 					);
 					if ((await applyControlResult(control)) === "resume") continue;
 					if (executionTimeout?.didTimeout() && !signal.aborted) {

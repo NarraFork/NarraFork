@@ -162,6 +162,62 @@ export function isBackgroundTakenOver(subagentId: string): boolean {
 }
 
 /**
+ * Whether a subagent-only interrupt should suspend as a takeover rather than as a
+ * plain manual_override.
+ *
+ * Two distinct facts answer this, and using only the first is a real bug:
+ * - `pendingTakeover` — this interrupt IS the takeover request (the very first one).
+ * - `alreadyTakenOver` — the takeover is already established and the user just
+ *   stopped a turn they were driving themselves. Every interrupt after the first
+ *   falls here.
+ *
+ * Reading only the pending marker made the second Stop of a takeover suspend as
+ * `manual_override`: the takeover UI disappears while `isTakenOver` still holds, so
+ * the parent stays blocked with no visible way to release it, and the queue drain
+ * that `feedQueuedMessageIntoSuspension` performs is attributed to the wrong state.
+ */
+export function suspensionIsTakeover(flags: {
+	pendingTakeover: boolean;
+	alreadyTakenOver: boolean;
+}): boolean {
+	return flags.pendingTakeover || flags.alreadyTakenOver;
+}
+
+/**
+ * Consume the pending-takeover marker AND decide the substatus, as one step.
+ *
+ * These two things were separate statements in the runner, and that is what made the
+ * bug possible: `consumePendingTakeover` is destructive, so by the time a second
+ * interrupt arrives the marker is gone and only `isTakenOver` still says the user is
+ * driving. Reading them apart invites "check the flag I just consumed", which reads
+ * correctly and is wrong from the second Stop onward.
+ *
+ * Keeping the order here — consume, promote to taken-over, then answer — means a test
+ * can exercise the ACTUAL sequence a repeated interrupt performs, rather than
+ * restating the boolean logic (a test that passes even if the runner reverts to
+ * reading the consumed marker alone).
+ *
+ * Returns `startedTakeover` too, because the caller distinguishes "the takeover began
+ * on this interrupt" for its settling-window handling.
+ */
+export function beginSubagentInterruptSuspension(subagentId: string): {
+	startedTakeover: boolean;
+	heldByTakeover: boolean;
+} {
+	const startedTakeover = consumePendingTakeover(subagentId);
+	if (startedTakeover) markTakenOver(subagentId);
+	return {
+		startedTakeover,
+		heldByTakeover: suspensionIsTakeover({
+			pendingTakeover: startedTakeover,
+			// Read AFTER the promotion above, so a takeover that just started reports
+			// consistently no matter which of the two facts the caller looks at.
+			alreadyTakenOver: isTakenOver(subagentId),
+		}),
+	};
+}
+
+/**
  * Every subagent currently taken over.
  *
  * For batch callers (message loading) that would otherwise probe `isTakenOver`

@@ -8817,7 +8817,13 @@ export function NarratorPanel({
 										const showInterrupt =
 											isActive && !hasInput && !hasAttachments && retryRecoveryAllowsInterrupt;
 
-										const hasCutInMessage = !!queuedMessages[0]?.priority;
+										// "Cut in line" describes a Stop that hands the turn over to the
+										// queued priority message. A taken-over subagent has no cut-in
+										// semantics (see `canCutInLine`): its queue is filled without a
+										// soft stop, so the label would name an action the server does
+										// not perform — and it sat on the one button whose hold gesture
+										// interrupts, which is how "cut in" got read as "interrupt".
+										const hasCutInMessage = !isTakenOver && !!queuedMessages[0]?.priority;
 										const showRetry =
 											!showInterrupt && !hasInput && !hasAttachments && canRetryLastUserMessage;
 										const showContinue =

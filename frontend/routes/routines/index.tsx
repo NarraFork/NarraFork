@@ -1838,6 +1838,44 @@ function statusColor(status: string): string {
 	return "gray";
 }
 
+/**
+ * The status values the server reports, and the badge key each maps to.
+ *
+ * An explicit table rather than `mcpStatus${capitalize(status)}` with a cast: the
+ * computed form type-checks for ANY string, so a new server-side status would
+ * silently render a raw missing key instead of failing at build time. Listing them
+ * also makes the mapping greppable from the locale files.
+ */
+const MCP_STATUS_LABEL_KEYS = {
+	connected: "mcpStatusConnected",
+	disconnected: "mcpStatusDisconnected",
+	connecting: "mcpStatusConnecting",
+	error: "mcpStatusError",
+} as const;
+
+type McpStatusLabelKey = (typeof MCP_STATUS_LABEL_KEYS)[keyof typeof MCP_STATUS_LABEL_KEYS];
+
+/**
+ * Translation key for a server's badge.
+ *
+ * A disabled server and a manually disconnected one used to render identically
+ * ("Disconnected", gray), which hid the fact that disconnecting persists. Only
+ * the settled `disconnected` state is relabeled: a `connecting`/`error` entry
+ * that still exists while `enabled` is already false is a real transient and
+ * should be shown as such rather than dressed up as "Disabled".
+ */
+function mcpStatusLabelKey(
+	status: string,
+	enabled: boolean | undefined,
+): McpStatusLabelKey | "mcpStatusDisabled" {
+	if (enabled === false && status === "disconnected") return "mcpStatusDisabled";
+	// An unrecognised status falls back to the disconnected label rather than
+	// rendering a missing key: the badge is a hint, not a diagnostic surface.
+	return (
+		MCP_STATUS_LABEL_KEYS[status as keyof typeof MCP_STATUS_LABEL_KEYS] ?? "mcpStatusDisconnected"
+	);
+}
+
 function McpToolsTab() {
 	const { t } = useTranslation("routines");
 	const { data: currentUser } = useCurrentUser();
@@ -2235,9 +2273,7 @@ function McpToolsTab() {
 										{server.name}
 									</Text>
 									<Badge size="xs" variant="light" color={statusColor(server.status)}>
-										{t(
-											`mcpStatus${server.status.charAt(0).toUpperCase()}${server.status.slice(1)}` as "mcpStatusConnected",
-										)}
+										{t(mcpStatusLabelKey(server.status, server.enabled))}
 									</Badge>
 									<Badge size="xs" variant="outline">
 										{server.transport}
@@ -2249,7 +2285,12 @@ function McpToolsTab() {
 									)}
 								</Group>
 								<Group gap={4}>
-									{server.status === "connected" ? (
+									{/* These buttons write the persisted `enabled` intent, so they branch on
+									    it rather than on the live socket state. An enabled-but-unreachable
+									    server still needs a disable button here: branching on `connected`
+									    alone would leave it with only "Connect", making it impossible to
+									    stop from this list while it retries on every startup. */}
+									{server.enabled && (
 										<ActionIcon
 											variant="subtle"
 											size="sm"
@@ -2262,13 +2303,16 @@ function McpToolsTab() {
 											loading={disconnectMutation.isPending}
 											title={
 												mcpServerManagementSupported
-													? t("mcpDisconnect")
+													? server.status === "connected"
+														? t("mcpDisconnect")
+														: t("mcpDisableAndDisconnect")
 													: mcpServerManagementUnsupportedReason
 											}
 										>
 											<IconPlugOff size={14} />
 										</ActionIcon>
-									) : (
+									)}
+									{server.status !== "connected" && (
 										<ActionIcon
 											variant="subtle"
 											size="sm"
@@ -2684,6 +2728,7 @@ function McpToolsTab() {
 
 							<Switch
 								label={t("mcpEnabled")}
+								description={t("mcpEnabledDesc")}
 								checked={draft.enabled}
 								onChange={(e) => {
 									const val = e.currentTarget.checked;

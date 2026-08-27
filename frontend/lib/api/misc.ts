@@ -385,8 +385,11 @@ export const miscApi = {
 		request<{ ok: boolean }>(`/mcp/servers/${id}`, { method: "DELETE" }),
 	mcpConnectServer: (id: string) =>
 		request<Record<string, unknown>>(`/mcp/servers/${id}/connect`, { method: "POST" }),
+	// Returns the server's status projection (like connect), not a bare ack:
+	// disconnecting now persists `enabled: false`, and the caller needs the
+	// authoritative post-change state rather than having to infer it.
 	mcpDisconnectServer: (id: string) =>
-		request<{ ok: boolean }>(`/mcp/servers/${id}/disconnect`, { method: "POST" }),
+		request<Record<string, unknown>>(`/mcp/servers/${id}/disconnect`, { method: "POST" }),
 	mcpTestConnection: (data: Record<string, unknown>) =>
 		request<{
 			ok: boolean;
@@ -830,6 +833,7 @@ export const miscApi = {
 			providers: Array<{ id: string; name: string; prefix: string; hasToken: boolean }>;
 			totalModels: number;
 			pendingAuth: boolean;
+			authorizeUrl?: string;
 		}>("/cline/status"),
 	clineBrowserAuth: (apiBaseUrl?: string) =>
 		request<{ authorizeUrl: string }>("/cline/auth/browser", {

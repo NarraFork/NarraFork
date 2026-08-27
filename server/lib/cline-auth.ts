@@ -309,6 +309,9 @@ let pendingOAuthState: {
 	server: ReturnType<typeof Bun.serve> | null;
 } | null = null;
 
+/** Authorization URL of the pending OAuth flow, so the frontend can re-display/copy it. */
+let pendingAuthorizeUrl: string | null = null;
+
 /**
  * Parse a Cline OAuth callback URL and extract credentials.
  *
@@ -412,6 +415,7 @@ export async function startBrowserAuth(
 			pendingOAuthState.server.stop();
 		}
 		pendingOAuthState = null;
+		pendingAuthorizeUrl = null;
 	}
 
 	const baseUrl = (apiBaseUrl || DEFAULT_API_BASE_URL).replace(/\/+$/, "");
@@ -462,6 +466,7 @@ export async function startBrowserAuth(
 				pendingOAuthState.server.stop();
 			}
 			pendingOAuthState = null;
+			pendingAuthorizeUrl = null;
 		};
 
 		// Start local callback server
@@ -483,6 +488,7 @@ export async function startBrowserAuth(
 		});
 
 		pendingOAuthState = { resolve, reject, server };
+		pendingAuthorizeUrl = authorizeUrl;
 	});
 
 	const waitForCompletion = async (): Promise<ClineCredentials> => {
@@ -503,9 +509,15 @@ export function cancelBrowserAuth(): void {
 		}
 		pendingOAuthState = null;
 	}
+	pendingAuthorizeUrl = null;
 }
 
 /** Check if there's a pending OAuth flow. */
 export function hasPendingAuth(): boolean {
 	return pendingOAuthState !== null;
+}
+
+/** Get the authorize URL of the pending OAuth flow (null if none). */
+export function getPendingAuthorizeUrl(): string | null {
+	return pendingAuthorizeUrl;
 }
