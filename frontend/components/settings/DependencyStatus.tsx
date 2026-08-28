@@ -1,5 +1,6 @@
 import { useSetupAssistant } from "@frontend/hooks/useSetupAssistant";
 import { api } from "@frontend/lib/api";
+import { ApiError } from "@frontend/lib/api/client";
 import {
 	Alert,
 	Badge,
@@ -78,6 +79,19 @@ export function DependencyStatus({ onDelegated }: DependencyStatusProps = {}) {
 			}
 		},
 		onError: (err) => {
+			qc.invalidateQueries({ queryKey: ["dependencies"] });
+			// A sudo password cannot be typed into the non-interactive install path,
+			// so this is not a dead end: hand the user straight to the terminal that
+			// CAN prompt, instead of closing with a red toast they cannot act on.
+			if (err instanceof ApiError && err.data?.code === "SUDO_PASSWORD_REQUIRED") {
+				closeConfirm();
+				openTerminal();
+				notifications.show({
+					color: "yellow",
+					message: t("depsInstallNeedsSudoPassword"),
+				});
+				return;
+			}
 			closeConfirm();
 			setSelectedDep(null);
 			notifications.show({

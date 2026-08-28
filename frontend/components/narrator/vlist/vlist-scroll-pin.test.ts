@@ -54,6 +54,88 @@ describe("isSuppressedScrollEcho — telling our own write from the reader", () 
 	});
 });
 
+describe("isBottomLostToContentGrowth — a row growing beneath a pinned reader", () => {
+	/**
+	 * The shipped defect: a PENDING PERMISSION row is measured after paint (the real
+	 * InlinePermission / AskUserQuestionBanner mounts, then its ResizeObserver reports
+	 * again as the feedback textarea / target block / reflection notice settle). Between
+	 * two reports a scroll frame saw a large distance-from-bottom with the reader never
+	 * having touched anything, and unpinned auto-follow — permanently, because the pin
+	 * effect is gated on `pinnedToBottom`, so every later message landed off-screen.
+	 */
+	it("keeps the pin when the bottom moved but scrollTop did not", async () => {
+		const { isBottomLostToContentGrowth } = await import("./PretextExactMessageList");
+		// The permission form grew 120px below the viewport: same scrollTop, new bottom.
+		expect(isBottomLostToContentGrowth(true, 4000, 4000)).toBe(true);
+		// Sub-pixel settling of a programmatic write is not an upward gesture.
+		expect(isBottomLostToContentGrowth(true, 4000, 3999.6)).toBe(true);
+		// A shrinking viewport (composer grew, window resized) moves the bottom the same way.
+		expect(isBottomLostToContentGrowth(true, 0, 0)).toBe(true);
+	});
+
+	it("releases the pin as soon as the reader actually travels upward", async () => {
+		const { isBottomLostToContentGrowth } = await import("./PretextExactMessageList");
+		// Every gesture toward earlier content LOWERS scrollTop, which is the whole
+		// discriminator — no per-gesture listener needed.
+		expect(isBottomLostToContentGrowth(true, 4000, 3800)).toBe(false); // wheel / drag
+		expect(isBottomLostToContentGrowth(true, 4000, 2000)).toBe(false); // PageUp
+		expect(isBottomLostToContentGrowth(true, 4000, 3997)).toBe(false); // gentle 3px nudge
+	});
+
+	it("never re-pins a reader who had already left the bottom", async () => {
+		const { isBottomLostToContentGrowth } = await import("./PretextExactMessageList");
+		// Reading history while output streams: growth below must not drag them back.
+		expect(isBottomLostToContentGrowth(false, 1000, 1000)).toBe(false);
+		expect(isBottomLostToContentGrowth(false, 1000, 1200)).toBe(false);
+	});
+});
+
+describe("processScrollFrame answers content growth in the same frame", () => {
+	/**
+	 * Deciding to stay pinned is not enough on its own: the VIEW must also be pulled
+	 * back to the new bottom. Leaving that to the geometry-revision pin effect is not
+	 * sufficient — that effect is keyed on `exactLayout.totalHeight`, which only moves
+	 * once a reported height lands in `heightOverrides`. A report inside the 1px jitter
+	 * guard, or one for a row that already left the dynamic path, grows the real DOM box
+	 * without changing the layout, so the effect never runs and the view sits a form's
+	 * height short of the bottom.
+	 */
+	it("re-glues to the bottom and resolves the window from the settled position", async () => {
+		const source = await Bun.file(
+			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
+		).text();
+		const frame = source.slice(
+			source.indexOf("const processScrollFrame = useCallback("),
+			source.indexOf("const onScroll = useCallback("),
+		);
+		expect(frame).toContain("isBottomLostToContentGrowth(");
+		expect(frame).toContain("if (grewBeneathReader) writeScrollTop(getScrollBottomTarget(node));");
+		// The mounted window must come from where the viewport now is, not from the
+		// pre-re-glue reading.
+		expect(frame).toContain("const settledTop = scrollTopRef.current;");
+		expect(frame).toContain("resolveVisibleWindow(layout, settledTop,");
+	});
+
+	/**
+	 * The panel's affordances read the SAME value the pin does. Reporting the raw
+	 * `atBottom` while staying pinned would flash the scroll-to-bottom button and count
+	 * unread messages for a reader who is being followed (NarratorPanel:
+	 * `showScrollToBottomButton = !isAtBottom || unreadCount > 0`).
+	 */
+	it("reports the effective pin to the panel, not the raw geometry reading", async () => {
+		const source = await Bun.file(
+			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
+		).text();
+		const frame = source.slice(
+			source.indexOf("const processScrollFrame = useCallback("),
+			source.indexOf("const onScroll = useCallback("),
+		);
+		expect(frame).toContain("onAtBottomChange?.(effectiveAtBottom);");
+		expect(frame).toContain("if (effectiveAtBottom) onUnreadCountChange?.(0);");
+		expect(frame).not.toContain("onAtBottomChange?.(atBottom);");
+	});
+});
+
 describe("the scroll container disables the browser's own anchoring", () => {
 	it("sets overflow-anchor: none on the scroll viewport", async () => {
 		// The list answers every geometry change with an explicit anchored write, so

@@ -4,6 +4,7 @@
 	"FORBIDDEN_ACTION": "You are not allowed to perform this action",
 	"INTERNAL_ERROR": "The server ran into an internal error",
 	"GIT_NOT_INSTALLED": "Git is not installed. Install git and retry this action.",
+	"DEFAULT_MODEL_NOT_CONFIGURED": "No default model is configured. Choose one in Settings → Models, then retry.",
 	"PODMAN_NOT_FOUND": "Podman is not installed",
 	"GIT_AUTH_REQUIRED": "Git authentication is required",
 	"MERGE_DIRTY_SOURCE": "Commit-mode merge needs a clean source worktree. Commit or stash its changes, or switch back to workspace merge, where uncommitted changes are fine.",

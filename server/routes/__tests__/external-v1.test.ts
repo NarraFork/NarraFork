@@ -1651,21 +1651,31 @@ describe("External v1 narrator failure visibility", () => {
 		});
 		const narratorId = provisioned.body.narrator.id;
 
-		// The locale selects the language of prompts injected into the narrator context,
-		// so a Chinese session must be able to declare it instead of always getting "en".
-		const accepted = await app.request(`/api/external/v1/narrators/${narratorId}/messages`, {
-			method: "POST",
-			headers: jsonHeaders(token),
-			body: JSON.stringify({ message: "查一下导航日志", locale: "zh-CN" }),
-		});
-		expect(accepted.status).toBe(202);
+		// A provisioned narrator follows the instance default model, and accepting a
+		// message spins up its session — which resolves that model. There is no
+		// fallback model by design, so the fixture has to configure one; otherwise
+		// this asserts nothing about locale handling and fails on setup instead.
+		const previousDefaultModel = settings.agent.defaultModel;
+		settings.agent.defaultModel = "anthropic:claude-sonnet-4.6";
+		try {
+			// The locale selects the language of prompts injected into the narrator context,
+			// so a Chinese session must be able to declare it instead of always getting "en".
+			const accepted = await app.request(`/api/external/v1/narrators/${narratorId}/messages`, {
+				method: "POST",
+				headers: jsonHeaders(token),
+				body: JSON.stringify({ message: "查一下导航日志", locale: "zh-CN" }),
+			});
+			expect(accepted.status).toBe(202);
 
-		const rejected = await app.request(`/api/external/v1/narrators/${narratorId}/messages`, {
-			method: "POST",
-			headers: jsonHeaders(token),
-			body: JSON.stringify({ message: "hello", locale: "klingon" }),
-		});
-		expect(rejected.status).toBe(400);
+			const rejected = await app.request(`/api/external/v1/narrators/${narratorId}/messages`, {
+				method: "POST",
+				headers: jsonHeaders(token),
+				body: JSON.stringify({ message: "hello", locale: "klingon" }),
+			});
+			expect(rejected.status).toBe(400);
+		} finally {
+			settings.agent.defaultModel = previousDefaultModel;
+		}
 	});
 });
 

@@ -6,15 +6,12 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useEffect, useRef, useState } from "react";
+import { type InstallPhase, nextInstallAction } from "./dependency-install-progress";
 
 interface DependencyInstallTerminalProps {
 	command: string;
 	onDone: () => void;
 }
-
-// Shell prompt patterns: user@host:dir$ / root:/# / bash-5.1$ / etc.
-// Uses (?<!\d) to avoid matching progress indicators like "50%" or "100>".
-const PROMPT_RE = /(?<!\d)[\w@.\-~:/]+[$#>%]\s*$/;
 
 /**
  * Lightweight interactive terminal for dependency installation.
@@ -27,9 +24,15 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 	const fitAddonRef = useRef<FitAddon | null>(null);
 	const [terminalId, setTerminalId] = useState<string | undefined>();
 	const [startError, setStartError] = useState<string | null>(null);
-	const commandSentRef = useRef(false);
-	const doneRef = useRef(false);
+	const phaseRef = useRef<InstallPhase>("awaiting-prompt");
 	const writingRef = useRef(false);
+	// Output that arrived before xterm existed. Kept so the first prompt survives
+	// the gap between subscribing and mounting the terminal.
+	const pendingOutputRef = useRef("");
+	const pendingScrollbackRef = useRef<{
+		data: string;
+		dims: { cols: number; rows: number };
+	} | null>(null);
 	const doneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const terminalCapability = useTerminalCapability();
 	const terminalSupported = terminalCapability.supported;
@@ -69,42 +72,92 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 		};
 	}, [terminalSupported]);
 
+	/**
+	 * Prompt-driven state machine, run once the bytes that may CONTAIN the prompt
+	 * have actually landed in the buffer.
+	 *
+	 * Must be reachable from BOTH the live-output and the scrollback paths: the
+	 * shell emits its first prompt as soon as it starts, which is before this
+	 * component has finished an HTTP round trip and subscribed. That prompt is
+	 * therefore replayed as a `scrollback` snapshot, never as `output`. Running
+	 * this only on `output` meant the first prompt was never seen, so the install
+	 * command was never sent and the window stayed blank forever.
+	 *
+	 * Every caller must schedule this through `term.write`'s completion callback,
+	 * never straight after the call: xterm queues writes and parses them in a later
+	 * task, so a synchronous check reads the buffer as it was BEFORE this chunk and
+	 * can miss the prompt it was meant to find.
+	 */
+	const advanceOnPrompt = (term: Terminal, write: (data: string) => void) => {
+		const line = term.buffer.active.getLine(term.buffer.active.cursorY);
+		switch (nextInstallAction(phaseRef.current, line ? line.translateToString(true) : null)) {
+			case "send-command":
+				phaseRef.current = "running";
+				write(`${command}\n`);
+				break;
+			case "finish":
+				phaseRef.current = "done";
+				// Small delay so user can see the final output
+				scheduleDone();
+				break;
+			case "wait":
+				break;
+		}
+	};
+	// Held in a ref so the xterm-creation effect can call it without listing it as
+	// a dependency: it is redefined every render, and depending on it would tear
+	// down and rebuild the terminal (losing the buffer) on each one.
+	const advanceOnPromptRef = useRef(advanceOnPrompt);
+	advanceOnPromptRef.current = advanceOnPrompt;
+
 	// WebSocket subscription
 	const { write } = useTerminalWS(terminalId, {
 		onOutput: (data) => {
 			const term = termRef.current;
-			if (!term) return;
+			// xterm is created in a later effect than the one that subscribes, so
+			// early bytes can arrive with no terminal to write to. Hold them instead
+			// of dropping them — dropping loses the prompt this component waits for.
+			if (!term) {
+				pendingOutputRef.current += data;
+				return;
+			}
 			writingRef.current = true;
-			term.write(data);
+			term.write(data, () => {
+				if (termRef.current === term) advanceOnPrompt(term, write);
+			});
 			writingRef.current = false;
-
-			// Detect prompt in the last line of visible buffer
-			if (!commandSentRef.current) {
-				// Before command: wait for first prompt, then send command
-				const line = term.buffer.active.getLine(term.buffer.active.cursorY);
-				if (line) {
-					const text = line.translateToString(true);
-					if (PROMPT_RE.test(text)) {
-						commandSentRef.current = true;
-						write(`${command}\n`);
-					}
-				}
-			} else if (!doneRef.current) {
-				// After command: detect next prompt = install finished
-				const line = term.buffer.active.getLine(term.buffer.active.cursorY);
-				if (line) {
-					const text = line.translateToString(true);
-					if (PROMPT_RE.test(text)) {
-						doneRef.current = true;
-						// Small delay so user can see the final output
-						scheduleDone();
-					}
-				}
+		},
+		onScrollback: (data, dims) => {
+			const term = termRef.current;
+			if (!term) {
+				// A snapshot supersedes anything buffered so far, rather than appending.
+				pendingScrollbackRef.current = { data, dims };
+				pendingOutputRef.current = "";
+				return;
+			}
+			writingRef.current = true;
+			try {
+				// Match the server-side buffer dimensions so wrapping is reproduced,
+				// then let the ResizeObserver fit back to the container.
+				term.resize(dims.cols, dims.rows);
+				term.reset();
+				term.write(data, () => {
+					if (termRef.current === term) advanceOnPrompt(term, write);
+				});
+			} finally {
+				writingRef.current = false;
 			}
 		},
+		onError: (message) => {
+			const term = termRef.current;
+			if (term) term.write(`\r\n${message}\r\n`);
+			else pendingOutputRef.current += `\r\n${message}\r\n`;
+		},
 		onExit: () => {
-			if (!doneRef.current) {
-				doneRef.current = true;
+			// The shell exiting is terminal regardless of which phase we were in:
+			// there will be no further prompt to wait for.
+			if (phaseRef.current !== "done") {
+				phaseRef.current = "done";
 				scheduleDone();
 			}
 		},
@@ -131,6 +184,32 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 
 		termRef.current = term;
 		fitAddonRef.current = fitAddon;
+
+		// Replay whatever arrived before this terminal existed, then run the prompt
+		// check on it: the first prompt is usually in there, and it is the trigger
+		// that sends the install command.
+		const pendingScrollback = pendingScrollbackRef.current;
+		const pendingOutput = pendingOutputRef.current;
+		pendingScrollbackRef.current = null;
+		pendingOutputRef.current = "";
+		const replay = `${pendingScrollback?.data ?? ""}${pendingOutput}`;
+		if (replay) {
+			writingRef.current = true;
+			try {
+				if (pendingScrollback) {
+					term.resize(pendingScrollback.dims.cols, pendingScrollback.dims.rows);
+				}
+				// term.write is asynchronous: the buffer only holds these bytes by the
+				// time the callback runs. Checking the prompt synchronously after this
+				// call would read a still-empty line and miss it.
+				term.write(replay, () => {
+					if (termRef.current === term) advanceOnPromptRef.current(term, write);
+				});
+			} finally {
+				writingRef.current = false;
+			}
+			if (pendingScrollback) fitAddon.fit();
+		}
 
 		// Forward user input to terminal
 		const dataDisposable = term.onData((data) => {

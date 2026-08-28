@@ -18,16 +18,18 @@
  *     input state, the fork+send mutation, the cancel DELETE and the navigation are
  *     literally the same component. Its row becomes a dynamic (post-paint measured)
  *     row, so a slightly different real height cannot clip the form.
- *   - resolved → binds an `onOpen` callback that routes to the target narrator,
+ *   - resolved → binds an `onOpen` callback that opens the target narrator,
  *     resolved from the row's own message payload (the layout spec drops it).
+ *     "Opens" goes through the same `useOpenAskInPassingNarrator` the cards use,
+ *     so a docked surface gets a panel beside the chat and only an off-dock one
+ *     navigates away.
  *
  * Lives in vlist/ (so the isolation guard allows importing outer app modules) and
  * is only ever used by PretextExactMessageList.
  */
 
-import { useNavigate } from "@tanstack/react-router";
 import { type ReactNode, useMemo } from "react";
-import { AskInPassingPendingCard } from "../AskInPassingCard";
+import { AskInPassingPendingCard, useOpenAskInPassingNarrator } from "../AskInPassingCard";
 import {
 	resolveVListAskInPassingTarget,
 	type VListAskInPassingTarget,
@@ -76,7 +78,10 @@ export function useVListAskInPassing({
 	sourceIdsByKey,
 	messages,
 }: UseVListAskInPassingArgs): VListAskInPassingActions {
-	const navigate = useNavigate();
+	// Shared with the chunked path's cards, so both open the answer in the same
+	// host: a panel beside the conversation when this surface has a dock, a route
+	// only when it does not.
+	const openAnswer = useOpenAskInPassingNarrator();
 
 	// Targets first (pure): which rows are ask-in-passing cards, in which state,
 	// and where a resolved one points. Keeps the React work below trivial.
@@ -113,12 +118,10 @@ export function useVListAskInPassing({
 			if (target.kind !== "resolved") continue;
 			const targetNarratorId = target.targetNarratorId;
 			if (!targetNarratorId) continue;
-			map.set(key, () =>
-				navigate({ to: "/narrators/$narratorId", params: { narratorId: targetNarratorId } }),
-			);
+			map.set(key, () => openAnswer(targetNarratorId));
 		}
 		return map.size > 0 ? map : EMPTY_OPENS;
-	}, [targets, navigate]);
+	}, [targets, openAnswer]);
 
 	return { pendingSlots, openByKey };
 }

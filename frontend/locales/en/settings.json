@@ -1249,6 +1249,7 @@
 	"depsInstallButton": "Install",
 	"depsInstallTitle": "Installing {{name}}",
 	"depsInstallFailed": "Installation failed: {{error}}",
+	"depsInstallNeedsSudoPassword": "This install needs a sudo password, which cannot be entered automatically. Opened a terminal so you can type it.",
 	"depsInstallConfirmTitle": "Install {{name}}",
 	"depsInstallConfirmMessage": "The following command will be executed:",
 	"depsInstallConfirm": "Confirm Install",

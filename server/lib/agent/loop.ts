@@ -2905,6 +2905,28 @@ export async function* agentLoop(
 			};
 			let messageId: string | undefined;
 			let credentialId: string | undefined;
+			/**
+			 * Whether a graceful soft stop has been granted for THIS turn.
+			 *
+			 * Turn-scoped rather than declared next to the tool-execution phase because
+			 * the request must be observable from the STREAMING phase too: the host's
+			 * `shouldStop` is one-shot (see `evaluateSoftStopRequest` in
+			 * narrator-session), so whoever consumes it has to record the answer for the
+			 * rest of the turn.
+			 */
+			let gracefulStopRequested = false;
+			/**
+			 * Consume a pending soft-stop request at most once per turn.
+			 *
+			 * Every boundary asks through here, so the grant is spent exactly once no
+			 * matter which phase observes it first. Asking again after a grant would
+			 * return the *next* request's answer (usually false) and silently resurrect
+			 * the turn the caller already agreed to end.
+			 */
+			const observeSoftStopForTurn = (): boolean => {
+				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
+				return gracefulStopRequested;
+			};
 			// Map of tool executions started during streaming (toolUseId → Promise)
 			const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
 			// Synchronously queryable map of settled early-exec results (populated via .then())
@@ -3855,6 +3877,7 @@ export async function* agentLoop(
 								// in final group order after preceding tools complete.
 								if (
 									config.deferEagerToolsForSafeStop !== true &&
+									!observeSoftStopForTurn() &&
 									!earlyExecMap.has(tu.toolUseId) &&
 									!isStrictSerial(tu) &&
 									!hasPriorStrictSerialBarrier(tu) &&
@@ -4214,8 +4237,16 @@ export async function* agentLoop(
 										// streaming loop can drain completed results without awaiting.
 										// Skip after a strict-serial barrier — those tools must execute
 										// in final group order after preceding tools complete.
+										//
+										// A pending soft stop also suppresses the eager start: the
+										// queued cut-in is meant to be answered after the tool that
+										// was running when it arrived, and an eagerly started tool is
+										// awaited (not skipped) by the execution phase below. Without
+										// this gate every remaining tool of the turn still runs, which
+										// is what made a cut-in look like it landed a request late.
 										if (
 											config.deferEagerToolsForSafeStop !== true &&
+											!observeSoftStopForTurn() &&
 											!isStrictSerial(tu) &&
 											!hasPriorStrictSerialBarrier(tu) &&
 											shouldEagerExecuteTool(tu)
@@ -6145,7 +6176,6 @@ export async function* agentLoop(
 			// Tracks cumulative execution time of preceding serial tools in this turn,
 			// used to subtract wait time when computing display duration for fast tools.
 			let prevToolsExecMs = 0;
-			let gracefulStopRequested = false;
 			for (const group of groups) {
 				if (config.signal.aborted) {
 					await Promise.resolve();
@@ -6365,8 +6395,7 @@ export async function* agentLoop(
 				// Check after every serial tool and complete parallel-safe group. Once a soft
 				// stop is observed, never start another tool: only await promises that were
 				// already registered in earlyExecMap and mark every other remaining call skipped.
-				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
-				if (gracefulStopRequested) {
+				if (observeSoftStopForTurn()) {
 					const skippedOutput = getToolMessage("skippedForSoftStop", locale);
 					let fatalOutput: string | undefined;
 					for (const remainingTool of toolUses.slice(toolIndex)) {
@@ -6527,8 +6556,7 @@ export async function* agentLoop(
 
 			// Close the small race between the final group boundary and the next provider
 			// request: direct user feedback may arrive while after-tools injections are drained.
-			if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
-			if (gracefulStopRequested) {
+			if (observeSoftStopForTurn()) {
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}

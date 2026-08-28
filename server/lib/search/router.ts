@@ -113,9 +113,26 @@ async function nugMcpSearch(
 	return { channelId: channel.id, channelLabel: channelLabel(channel), text: parsed.text };
 }
 
+/**
+ * Whether this channel could serve a search request at all.
+ *
+ * A PREDICATE, so it must never throw: it is reached from `WebSearch.isAvailable()`
+ * while the agent loop builds its tool list, and a throw there fails the whole turn
+ * rather than hiding one channel. `resolveEffectiveModel` throws when the channel
+ * follows the (deliberately unset-able) instance default model — a fresh install
+ * with this channel already enabled — and "no model to resolve" is precisely the
+ * definition of an unusable channel, so it is answered as false here instead of
+ * being propagated. Mirrors `resolveMetaModelForLookup`, which returns its sentinel
+ * unchanged for the same reason.
+ */
 function isSubagentChannelUsable(channel: SearchChannelConfig): boolean {
 	if (!channel.model) return false;
-	const model = resolveEffectiveModel(channel.model);
+	let model: string;
+	try {
+		model = resolveEffectiveModel(channel.model);
+	} catch {
+		return false;
+	}
 	const provider = resolveProvider(model);
 	return supportsNativeSearch(provider, model);
 }

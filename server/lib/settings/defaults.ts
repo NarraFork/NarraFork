@@ -27,6 +27,12 @@ export const DEFAULTS: NarraForkSettings = {
 		allowPrivateProxyTarget: false,
 	},
 	agent: {
+		// Deliberately empty on a fresh install — same reasoning as `summaryModel`
+		// below. Shipping a concrete model here names a provider the user has not
+		// configured, and every downstream failure then blames that phantom model
+		// instead of the real cause ("no default model configured"). The setup
+		// wizard makes selecting one a hard gate before anything can run.
+		defaultModel: "",
 		defaultPermissionMode: "acceptEdits",
 		defaultStartInPlanMode: false,
 		// Deliberately empty: an unset summary model follows the default model
@@ -385,6 +391,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── agent ───────────────────────────────────────────────────────────
 	"agent.defaultModel": {
+		desc: '新建叙述者的默认模型。格式为 "provider:modelId"，如 "anthropic:claude-sonnet-4.6"。留空表示未配置：此时任何依赖默认模型的操作都会直接报错，而不会回退到某个硬编码模型（回退会让报错指向用户从未选择过的 provider）。',
 		type: "string",
 	},
 	"agent.defaultPermissionMode": {

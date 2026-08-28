@@ -2,11 +2,68 @@ import { Box, Button, Group, Paper, Stack, Text, TextInput } from "@mantine/core
 import { notifications } from "@mantine/notifications";
 import { IconArrowRight, IconMessageQuestion } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAskInPassing, useCancelAskInPassing } from "../../hooks/useNarrator";
+import { resolveAskInPassingOpenPlan } from "./ask-in-passing-open-target";
+import { useNarratorDockContext } from "./dock/NarratorDockContext";
 
 const CARD_BG = "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))";
+
+/**
+ * The opener for an ask-in-passing answer, by narrator id.
+ *
+ * Used by the PENDING card, which only learns the target when its mutation
+ * resolves — so it needs the action, not a pre-bound callback. Applies the
+ * in-surface-first rule from `resolveAskInPassingOpenPlan`.
+ */
+export function useOpenAskInPassingNarrator(): (targetNarratorId: string) => void {
+	const navigate = useNavigate();
+	const dock = useNarratorDockContext();
+	const openInDock = dock?.openSubagentPanel;
+
+	return useCallback(
+		(targetNarratorId: string) => {
+			const plan = resolveAskInPassingOpenPlan({
+				targetNarratorId,
+				canOpenInDock: !!openInDock,
+			});
+			if (plan.mode === "none") return;
+			// A panel beside this conversation, not a page instead of it: the aside was
+			// asked ABOUT what is on screen, so navigating away discards the context
+			// that motivated it (scroll position, draft, the message itself).
+			if (plan.mode === "dock") {
+				openInDock?.(plan.targetNarratorId);
+				return;
+			}
+			navigate({
+				to: "/narrators/$narratorId",
+				params: { narratorId: plan.targetNarratorId },
+			});
+		},
+		[openInDock, navigate],
+	);
+}
+
+/**
+ * A pre-bound opener for one known target, or null when there is nowhere to go.
+ *
+ * Null (rather than a no-op) so a legacy resolved card with no recorded target
+ * renders inert instead of offering a click that routes to an empty narrator id.
+ */
+export function useOpenAskInPassingTarget(
+	targetNarratorId: string | null | undefined,
+): (() => void) | null {
+	const openNarrator = useOpenAskInPassingNarrator();
+	const resolvedId = targetNarratorId?.trim() ?? "";
+
+	// Built unconditionally (hook rules); only handed back when there is a target.
+	const open = useCallback(() => {
+		if (resolvedId) openNarrator(resolvedId);
+	}, [resolvedId, openNarrator]);
+
+	return resolvedId ? open : null;
+}
 
 export function AskInPassingPendingCard({
 	messageId,
@@ -19,7 +76,16 @@ export function AskInPassingPendingCard({
 	const [value, setValue] = useState("");
 	const resolveMutation = useAskInPassing();
 	const cancelMutation = useCancelAskInPassing();
-	const navigate = useNavigate();
+	const openAnswer = useOpenAskInPassingNarrator();
+	const inputRef = useRef<HTMLInputElement>(null);
+
+	// The card only ever appears because the reader just picked 顺便提问, so the
+	// input is the single thing they want next. Without this they must aim at a
+	// freshly-inserted row before typing — and on the virtual list that row may
+	// still be settling its height.
+	useEffect(() => {
+		inputRef.current?.focus();
+	}, []);
 
 	const isBusy = resolveMutation.isPending || cancelMutation.isPending;
 
@@ -35,10 +101,7 @@ export function AskInPassingPendingCard({
 			},
 			{
 				onSuccess: (newNarrator: { id: string }) => {
-					navigate({
-						to: "/narrators/$narratorId",
-						params: { narratorId: newNarrator.id },
-					});
+					openAnswer(newNarrator.id);
 				},
 				onError: (error: Error) => {
 					notifications.show({
@@ -85,6 +148,7 @@ export function AskInPassingPendingCard({
 			</Group>
 			<Group gap="xs" wrap="nowrap">
 				<TextInput
+					ref={inputRef}
 					flex={1}
 					size="sm"
 					placeholder={t("askInPassing_placeholder")}
@@ -126,11 +190,13 @@ export function AskInPassingResolvedCard({
 	block: any;
 }) {
 	const { t } = useTranslation("narrator");
-	const navigate = useNavigate();
 
 	const question = block.question as string;
-	const targetNarratorId = block.targetNarratorId as string;
+	const targetNarratorId = block.targetNarratorId as string | undefined;
 	const truncatedQuestion = question.length > 60 ? `${question.slice(0, 60)}...` : question;
+	// Null for cards written before the target was persisted — such a card stays
+	// readable but not clickable, rather than routing to an empty narrator id.
+	const open = useOpenAskInPassingTarget(targetNarratorId);
 
 	return (
 		<Paper
@@ -140,14 +206,21 @@ export function AskInPassingResolvedCard({
 			style={{
 				backgroundColor: CARD_BG,
 				borderLeft: "3px solid var(--mantine-color-indigo-7)",
-				cursor: "pointer",
+				cursor: open ? "pointer" : undefined,
 			}}
-			onClick={() =>
-				navigate({
-					to: "/narrators/$narratorId",
-					params: { narratorId: targetNarratorId },
-				})
-			}
+			onClick={open ?? undefined}
+			{...(open
+				? {
+						role: "button",
+						tabIndex: 0,
+						onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => {
+							if (e.key === "Enter" || e.key === " ") {
+								e.preventDefault();
+								open();
+							}
+						},
+					}
+				: {})}
 		>
 			<Group gap={6} wrap="nowrap">
 				<IconMessageQuestion size={14} color="var(--mantine-color-indigo-5)" />

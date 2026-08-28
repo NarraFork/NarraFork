@@ -1249,6 +1249,7 @@
 	"depsInstallButton": "安装",
 	"depsInstallTitle": "安装 {{name}}",
 	"depsInstallFailed": "安装失败：{{error}}",
+	"depsInstallNeedsSudoPassword": "该安装需要 sudo 密码，无法自动输入。已打开终端，请在其中输入密码。",
 	"depsInstallConfirmTitle": "安装 {{name}}",
 	"depsInstallConfirmMessage": "将执行以下命令：",
 	"depsInstallConfirm": "确认安装",

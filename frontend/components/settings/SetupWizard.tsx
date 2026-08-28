@@ -80,17 +80,25 @@ export function countConfiguredProviders(
 }
 
 /**
- * Wizard step order. Providers come BEFORE dependencies on purpose: a provider
- * key is the one thing the user must supply themselves, while missing system
- * dependencies can be handed to a Setup Assistant narrator — which only works
- * once a provider exists. Gating on deps first blocked first-time users on an
+ * Wizard step order. Everything a delegated Setup Assistant narrator needs to
+ * actually run comes BEFORE the dependency step:
+ *
+ *  - `provider`: a provider key is the one thing the user must supply themselves.
+ *  - `basic`: the default/summary models. Delegation creates a narrator whose
+ *    model is `settings.agent.defaultModel`; with that still unset the narrator
+ *    would be spawned against whatever the resolver falls back to, which is not
+ *    a provider the user configured. Choosing the models first is what makes the
+ *    delegated install run on a real, user-chosen model.
+ *
+ * Dependencies come last of the three because they are the only part that can be
+ * handed to an agent, so gating on them first blocked first-time users on an
  * install step they could have delegated.
  */
 export const WIZARD_STEPS = [
 	"welcome",
 	"provider",
-	"deps",
 	"basic",
+	"deps",
 	"network",
 	"complete",
 ] as const;
@@ -104,9 +112,10 @@ export function wizardStepIndex(step: WizardStep): number {
 /**
  * Which gate (if any) blocks "Next" on the current step.
  *
- * Providers are a hard gate: nothing downstream — including delegated dependency
- * installation — works without one. Dependencies are deliberately NOT gated, so
- * a user can move on and let the Setup Assistant finish the job later.
+ * Providers and models are hard gates: nothing downstream — including delegated
+ * dependency installation, which spawns a narrator on the default model — works
+ * without them. Dependencies are deliberately NOT gated, so a user can move on
+ * and let the Setup Assistant finish the job later.
  */
 export function wizardNextBlockedReasonKey(state: {
 	step: number;

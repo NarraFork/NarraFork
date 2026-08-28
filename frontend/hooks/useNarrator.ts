@@ -264,8 +264,21 @@ export function useAskInPassing() {
 			question: string;
 			pendingMessageId: string;
 		}) => api.askInPassing(narratorId, { question, pendingMessageId }),
+		// Only the narrator LISTS need refreshing (a new standalone narrator now
+		// exists). Invalidating the whole `["narrators"]` prefix also dropped every
+		// open session's messages/tool-calls/preview caches — including the panel the
+		// answer opens in, which then refetches its history from scratch. Mirrors the
+		// predicate `useForkNarrator` already uses for the same reason.
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["narrators"] });
+			qc.invalidateQueries({
+				predicate: (query) => {
+					const key = query.queryKey;
+					if (!Array.isArray(key) || key[0] !== "narrators") return false;
+					if (key.length === 2 && typeof key[1] === "object") return true;
+					if (key.length === 3 && key[1] === "paginated") return true;
+					return false;
+				},
+			});
 		},
 	});
 }

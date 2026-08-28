@@ -18,8 +18,14 @@ dependencyRoutes.post("/:name/install", requireSessionAuth, requireAdmin, async 
 	}
 	const result = await dependencyService.install(name);
 	if (!result.ok) {
+		// A missing sudo password is not a server fault and retrying this endpoint
+		// cannot fix it — the user has to run the command somewhere a password can
+		// be typed. 422 says "your request cannot be fulfilled as asked", which is
+		// what lets the client offer the interactive terminal instead of showing
+		// this as an internal error.
+		const status = result.code === "SUDO_PASSWORD_REQUIRED" ? 422 : 500;
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic status code
-		return c.json(result, 500 as any);
+		return c.json(result, status as any);
 	}
 	return c.json(result);
 });

@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getProvider, resolveProviderAndModel } from "../../../server/lib/agent/provider";
 import { __setCodexManagerForTests, CodexManager } from "../../../server/lib/codex-manager";
+import { AppError } from "../../../server/lib/errors";
 import { deleteNugCachedModels, setNugCachedModels } from "../../../server/lib/nug-model-cache";
+import { isProviderUnavailableError } from "../../../server/lib/provider-availability-error";
 import {
 	expandAllowedPoolForDisplay,
 	getContextThresholds,
@@ -265,9 +267,79 @@ describe("resolveProviderAndModel behavior", () => {
 		expect(resolved.model).toBe("deepseek:gpt-4o");
 	});
 
-	test("self-referential defaultModel 使用硬 fallback，避免递归返回占位符", () => {
+	// 这里刻意不做硬 fallback：回退会命名一个用户从未配置的 provider，
+	test("self-referential defaultModel 直接报错，不回退到硬编码模型", () => {
 		settings.agent.defaultModel = "__default__";
 
+		expect(() => resolveEffectiveModel("__default__")).toThrow(/No default model is configured/);
+	});
+
+	test("未配置 defaultModel 时解析 follow-default 直接报错", () => {
+		settings.agent.defaultModel = "";
+
+		expect(() => resolveEffectiveModel("__default__")).toThrow(/No default model is configured/);
+	});
+
+	test("未配置默认模型的报错是可本地化的 503，而不是不透明的 500", () => {
+		// 必须是 AppError 且带 catalog 信息：裸 Error 会被全局 Hono handler
+		// 兜成 "Internal server error" 500，把唯一可行动的信息（去设置里选一个
+		// 默认模型）丢掉——External API v1 的调用方只能看到 500。
+		settings.agent.defaultModel = "";
+
+		let caught: unknown;
+		try {
+			resolveEffectiveModel("__default__");
+		} catch (err) {
+			caught = err;
+		}
+
+		expect(caught).toBeInstanceOf(AppError);
+		const appError = caught as AppError;
+		expect(appError.name).toBe("DefaultModelNotConfiguredError");
+		expect(appError.statusCode).toBe(503);
+		expect(appError.code).toBe("DEFAULT_MODEL_NOT_CONFIGURED");
+		expect(appError.messageCode).toBe("DEFAULT_MODEL_NOT_CONFIGURED");
+		// 重试无法修复它，所以不能落进 summary 模型的 transient 重试路径：
+		// 那里会以退避重试数分钟，表现为请求挂住而不是报出真实原因。
+		expect(isProviderUnavailableError(appError)).toBe(true);
+	});
+
+	test("未配置 defaultModel 不影响具体模型的解析", () => {
+		// 报错必须只落在真正需要默认模型的路径上：显式选定模型的会话
+		// 不应该因为实例还没配默认模型而失败。
+		addOpenaiProvider("deepseek");
+		settings.agent.defaultModel = "";
+
+		expect(resolveEffectiveModel("deepseek:deepseek-chat")).toBe("deepseek:deepseek-chat");
+	});
+
+	test("summaryModel 未设置且 defaultModel 未配置时报错而非回退", () => {
+		settings.agent.defaultModel = "";
+		settings.agent.summaryModel = "";
+
+		expect(() => resolveEffectiveModel("__summary__")).toThrow(/No default model is configured/);
+	});
+
+	test("空聚合的 defaultModel 报错而非回退到硬编码模型", () => {
+		settings.agent.modelAggregations = [
+			{
+				id: "empty-agg",
+				name: "Empty Aggregation",
+				models: [],
+				routingMode: "priority",
+			},
+		];
+		settings.agent.defaultModel = "__agg__:empty-agg";
+
+		expect(() => resolveEffectiveModel("__default__")).toThrow(/No default model is configured/);
+	});
+
+	test("未配置 defaultModel 时上下文窗口查询回落到默认档位而不是编造模型", () => {
+		// 这是纯元数据查询（上下文窗口/能力），不能抛错；但也绝不能替换成一个
+		// 具体模型——那会把某个用户从未选择的模型的上下文窗口当作事实上报。
+		settings.agent.defaultModel = "";
+
+		expect(() => getModelContextWindow("__default__", "")).not.toThrow();
 	});
 
 	test("allowed pool 匹配 follow-default 不推进 balanced 聚合轮询", () => {

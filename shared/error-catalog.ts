@@ -95,6 +95,18 @@ export const ERROR_CATALOG = {
 		code: "GIT_NOT_INSTALLED",
 		en: "Git is not installed. Please install git and retry this Git-dependent action.",
 	},
+	/**
+	 * 503 rather than 500: the instance is not configured yet, which the operator
+	 * can fix, and retrying the same request unchanged will keep failing. Carrying
+	 * a real code matters because there is deliberately no fallback model — without
+	 * it the failure surfaces as a bare "Internal server error" and the actionable
+	 * part ("pick a default model") is lost.
+	 */
+	DEFAULT_MODEL_NOT_CONFIGURED: {
+		status: 503,
+		code: "DEFAULT_MODEL_NOT_CONFIGURED",
+		en: "No default model is configured. Choose one in Settings → Models, then retry.",
+	},
 	PODMAN_NOT_FOUND: {
 		status: 422,
 		code: "PODMAN_NOT_FOUND",

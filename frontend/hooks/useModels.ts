@@ -156,9 +156,7 @@ export function getConfiguredFallbackModels(
 			add(prefix, configured.defaultModel, configured.name, configured.type);
 		}
 	}
-	for (const current of [
-		settings.agent?.summaryModel || "",
-	]) {
+	for (const current of [settings.agent?.defaultModel || "", settings.agent?.summaryModel || ""]) {
 		const value = String(current);
 		const colon = value.indexOf(":");
 		if (colon <= 0) continue;
@@ -679,8 +677,13 @@ export function useAllModels() {
 			};
 		};
 
-		// Use `||` (not `??`) so a stored empty string falls back to the built-in
-		// default instead of leaking through as an invalid/empty model value.
+		// May be "" before the setup wizard has run. There is deliberately no
+		// hardcoded fallback: showing a concrete model here would present a
+		// provider the user never configured as the current default, and the
+		// resulting failure would name that phantom model instead of the real
+		// cause. `buildFollowOption` already falls back to labelling the entry
+		// with its own sentinel when the target is empty.
+		const defaultModelValue = settingsData?.agent?.defaultModel || "";
 		const followDefaultOption = buildFollowOption(
 			FOLLOW_DEFAULT_MODEL,
 			"__default__",
@@ -692,9 +695,8 @@ export function useAllModels() {
 		// the server-side resolveConfiguredSummaryModel behavior where an unset
 		// summary model follows the default model. Never surface a hardcoded
 		// model that is not actually configured: it would masquerade as a real
-		// selection and mislead the user. defaultModelValue is always non-empty
-		// (server enforces a configured default), so the follow-option label and
-		// the model button's first-letter rendering stay safe.
+		// selection and mislead the user. Both may be "" pre-setup, in which case
+		// `buildFollowOption` labels the entry with its sentinel value.
 		const summaryModelValue = settingsData?.agent?.summaryModel || defaultModelValue;
 		const followSummaryOption = buildFollowOption(
 			FOLLOW_SUMMARY_MODEL,

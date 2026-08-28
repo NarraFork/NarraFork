@@ -441,21 +441,32 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
+		// The stop must arrive AFTER the first tool was eagerly started, which is the
+		// only situation where mislabeling is possible: its side effects have already
+		// happened, so it has to be awaited and reported with its real result.
+		// (`shouldStop: () => true` cannot express this — a stop pending before any tool
+		// exists now suppresses the eager start itself, so nothing is ever "started".)
+		let asks = 0;
 		for await (const event of agentLoop(
-			makeConfig(ac.signal, { shouldStop: () => true }),
+			makeConfig(ac.signal, { shouldStop: () => ++asks > 1 }),
 			"finish tools that already started",
 			[],
 		)) {
 			events.push(event);
 		}
 
-		expect(executedToolValues).toEqual(["serial:first", "serial:second"]);
+		// First tool ran (started before the stop); the second never started.
+		expect(executedToolValues).toEqual(["serial:first"]);
 		const toolResults = events.filter(
 			(event): event is Extract<AgentEvent, { type: "tool_result" }> =>
 				event.type === "tool_result",
 		);
-		expect(toolResults.map((event) => event.isError)).toEqual([false, false]);
-		expect(toolResults.every((event) => event.metadata?.skippedForSoftStop !== true)).toBe(true);
+		expect(toolResults.map((event) => event.toolUseId)).toEqual(["tu_stop_1", "tu_stop_2"]);
+		// The already-started tool keeps its real success result…
+		expect(toolResults[0]?.isError).toBe(false);
+		expect(toolResults[0]?.metadata?.skippedForSoftStop).toBeUndefined();
+		// …while the one that never ran is explicitly reported as skipped.
+		expect(toolResults[1]?.metadata).toEqual({ skippedForSoftStop: true });
 	});
 
 	test("after-tools 阶段到达的 soft-stop 会阻止下一轮模型请求", async () => {
@@ -530,8 +541,14 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
+		// Only the trailing Read is eager-eligible here (Write/Edit are excluded from
+		// eager execution), so the stop is armed once that Read has actually started.
+		// That is the state this test exists for: one tool already running, a
+		// side-effect tool sandwiched before it that must never run.
 		for await (const event of agentLoop(
-			makeConfig(ac.signal, { shouldStop: () => true }),
+			makeConfig(ac.signal, {
+				shouldStop: () => executedToolValues.includes("read:started.txt"),
+			}),
 			"stop without running an unstarted edit",
 			[],
 		)) {

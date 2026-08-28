@@ -410,6 +410,46 @@ export function isSuppressedScrollEcho(
 	return Math.abs(reportedScrollTop - suppressedScrollTop) <= SCROLL_ECHO_EPSILON;
 }
 
+/**
+ * True when a scroll frame reporting "not at the bottom" describes the CONTENT
+ * GROWING BENEATH a reader who is pinned there — not the reader leaving.
+ *
+ * The reader cannot leave the bottom without moving the scroll position: every
+ * gesture that travels toward earlier content LOWERS scrollTop. Content growing
+ * below the viewport (or the viewport itself getting shorter) leaves scrollTop
+ * untouched and moves the bottom away from it. So "scrollTop did not decrease" is
+ * the exact discriminator between the two, and it needs no per-gesture listener.
+ *
+ * ## The defect this closes
+ *
+ * A pending PERMISSION row is one of the few rows measured after paint (see
+ * vlist-permission-bridge): the real InlinePermission / AskUserQuestionBanner
+ * mounts, reports its height, and its ResizeObserver reports AGAIN as the feedback
+ * textarea, the target/badge block or a reflection notice settle — each report
+ * growing the canvas. Between two of those reports a scroll frame observed a
+ * distance-from-bottom of tens of pixels with the reader never having touched
+ * anything, and unpinned auto-follow.
+ *
+ * That loss was PERMANENT rather than a one-frame glitch: the pin effect is gated on
+ * `pinnedToBottom`, so once unpinned nothing re-glued the view, and every later
+ * message landed off-screen until the reader scrolled down by hand. The same shape
+ * covers a shrinking viewport (a growing composer, a window resize), which moves the
+ * bottom for exactly the same reason.
+ *
+ * Exported for the unit test; pure.
+ */
+export function isBottomLostToContentGrowth(
+	pinnedToBottom: boolean,
+	previousScrollTop: number,
+	reportedScrollTop: number,
+): boolean {
+	if (!pinnedToBottom) return false;
+	// Same 1px tolerance as the echo/bottom comparisons: sub-pixel settling of a
+	// programmatic write must not read as an upward gesture. A real gesture moves
+	// further than the epsilon the bottom itself is detected with.
+	return reportedScrollTop >= previousScrollTop - SCROLL_ECHO_EPSILON;
+}
+
 function waitAnimationFrame(): Promise<void> {
 	return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
@@ -4206,10 +4246,22 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			scrollRafRef.current = 0;
 			const node = viewportRef.current;
 			if (!node) return;
+			const previousTop = scrollTopRef.current;
 			const nextTop = node.scrollTop;
 			scrollTopRef.current = nextTop;
 
 			const atBottom = getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON;
+			// The bottom moved away from a pinned reader who never scrolled — a row grew
+			// beneath them (the classic case: a pending permission form settling its
+			// height after paint). Keeping the pin here is what stops that growth from
+			// silently cancelling auto-follow; see isBottomLostToContentGrowth.
+			const grewBeneathReader =
+				!atBottom && isBottomLostToContentGrowth(pinnedToBottomRef.current, previousTop, nextTop);
+			// What the pin actually IS after this frame, which is what the rest of the
+			// frame must reason about: reporting the raw `atBottom` while staying pinned
+			// would flash the scroll-to-bottom affordance and make the panel count unread
+			// messages for a reader who is being followed.
+			const effectiveAtBottom = atBottom || grewBeneathReader;
 			// Suppress the pinned-state update ONLY for the echo of our own write. A
 			// different value means the reader scrolled, and their intent wins immediately
 			// (see writeScrollTop / isSuppressedScrollEcho).
@@ -4223,25 +4275,37 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				// in this frame treats their scrolling as programmatic.
 				suppressScrollStateRef.current = false;
 				suppressedScrollTopRef.current = null;
-				if (pinnedToBottomRef.current !== atBottom) {
-					pinnedToBottomRef.current = atBottom;
-					setPinnedToBottom(atBottom);
+				if (pinnedToBottomRef.current !== effectiveAtBottom) {
+					pinnedToBottomRef.current = effectiveAtBottom;
+					setPinnedToBottom(effectiveAtBottom);
 				}
 			}
-			if (atBottom) onUnreadCountChange?.(0);
-			onAtBottomChange?.(atBottom);
-			maybeAutoLoadOlder(nextTop, atBottom);
+			// Re-glue in THIS frame rather than leaving it to the geometry-revision pin
+			// effect. That effect is keyed on `exactLayout.totalHeight`, which only moves
+			// once a reported height lands in `heightOverrides` — a report inside the 1px
+			// jitter guard, or one for a row that is no longer on the dynamic path, grows
+			// the real DOM box without changing the layout, so the effect would never run
+			// and the view would sit a form's height short of the bottom.
+			if (grewBeneathReader) writeScrollTop(getScrollBottomTarget(node));
+			if (effectiveAtBottom) onUnreadCountChange?.(0);
+			onAtBottomChange?.(effectiveAtBottom);
+			maybeAutoLoadOlder(nextTop, effectiveAtBottom);
 
 			// Advance scrollTop state only when it changes the mounted window; this is
 			// the sole re-render trigger for scrolling.
+			//
+			// Read back from the ref rather than reusing `nextTop`: the re-glue above may
+			// have moved the position, and the window must be resolved for where the
+			// viewport now IS (a stale value would mount the band the reader just left).
+			const settledTop = scrollTopRef.current;
 			const layout = exactLayoutRef.current;
 			if (!layout) return;
-			const nextWindow = resolveVisibleWindow(layout, nextTop, viewportHeight, ITEM_OVERSCAN);
+			const nextWindow = resolveVisibleWindow(layout, settledTop, viewportHeight, ITEM_OVERSCAN);
 			const cur = visibleRef.current;
 			if (nextWindow.start !== cur.start || nextWindow.end !== cur.end) {
-				setScrollTop(nextTop);
+				setScrollTop(settledTop);
 			}
-		}, [maybeAutoLoadOlder, onAtBottomChange, onUnreadCountChange, viewportHeight]);
+		}, [maybeAutoLoadOlder, onAtBottomChange, onUnreadCountChange, viewportHeight, writeScrollTop]);
 
 		const onScroll = useCallback(() => {
 			if (scrollRafRef.current) return;

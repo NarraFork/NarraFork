@@ -3,9 +3,11 @@
  * Extracted from the monolithic settings/index.ts.
  */
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
+import { ERROR_CATALOG } from "@shared/error-catalog";
 import type { ModelCard } from "@shared/model-card";
 import { parseModelId } from "@shared/model-id";
 import { getCodexManager } from "../codex-manager";
+import { AppError } from "../errors";
 import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
 import { resolveNugModelMeta } from "../nug-model-cache";
 import type {
@@ -197,7 +199,30 @@ export const FOLLOW_DEFAULT_MODEL = "__default__";
  */
 export const FOLLOW_SUMMARY_MODEL = "__summary__";
 
-/** Hard fallback used if the configured default model is accidentally self-referential. */
+/**
+ * Raised when the default model cannot be resolved to a concrete model.
+ *
+ * There is deliberately NO hardcoded fallback model. A fallback looks harmless
+ * but is actively misleading: it names a provider the user may never have
+ * configured" from a model the user never chose — during setup that arrives as
+ * provider. Failing here instead points at the real problem: no default model
+ * is configured.
+ *
+ * Catalog-backed (503 + `DEFAULT_MODEL_NOT_CONFIGURED`) rather than a bare
+ * Error, because a bare Error falls through the global Hono handler as an
+ * opaque 500 "Internal server error" — which throws away the one thing the
+ * operator needs to know. `name` is pinned because `isProviderUnavailableError`
+ * matches on it to keep this out of the transient-retry path.
+ */
+export class DefaultModelNotConfiguredError extends AppError {
+	constructor() {
+		const entry = ERROR_CATALOG.DEFAULT_MODEL_NOT_CONFIGURED;
+		super(entry.en, entry.status, entry.code, {
+			messageCode: "DEFAULT_MODEL_NOT_CONFIGURED",
+		});
+		this.name = "DefaultModelNotConfiguredError";
+	}
+}
 
 /**
  * Prefix for model aggregation values stored in narrators.model.
@@ -324,26 +349,31 @@ function isFollowSummaryModelValue(model: string): boolean {
 	return !!parsed.provider && parsed.model === FOLLOW_SUMMARY_MODEL;
 }
 
+/**
+ * Normalize a resolved candidate. Returns null when the candidate is empty or
+ * still self-referential — callers decide whether that is fatal, so a broken
+ * value never silently becomes a concrete model nobody selected.
+ */
 function sanitizeResolvedModelCandidate(model: string | null | undefined): string | null {
 	const trimmed = model?.trim();
 	if (!trimmed) return null;
-	if (isFollowDefaultModelValue(trimmed)) return FALLBACK_DEFAULT_MODEL;
+	if (isFollowDefaultModelValue(trimmed)) return null;
 	return trimmed;
 }
 
 function resolveConfiguredDefaultModel(stickyProvider?: string): string {
 	const configured = s().agent.defaultModel?.trim();
-	if (!configured || isFollowDefaultModelValue(configured)) return FALLBACK_DEFAULT_MODEL;
+	if (!configured || isFollowDefaultModelValue(configured)) {
+		throw new DefaultModelNotConfiguredError();
+	}
 
 	const agg = parseAggModelValue(configured);
 	if (agg) {
-		if (agg.pinnedModel) {
-			return sanitizeResolvedModelCandidate(agg.pinnedModel) ?? FALLBACK_DEFAULT_MODEL;
-		}
-		return (
-			sanitizeResolvedModelCandidate(resolveAggregation(agg.aggId, stickyProvider)) ??
-			FALLBACK_DEFAULT_MODEL
-		);
+		const candidate = agg.pinnedModel
+			? sanitizeResolvedModelCandidate(agg.pinnedModel)
+			: sanitizeResolvedModelCandidate(resolveAggregation(agg.aggId, stickyProvider));
+		if (!candidate) throw new DefaultModelNotConfiguredError();
+		return candidate;
 	}
 
 	return configured;
@@ -359,13 +389,13 @@ function resolveConfiguredSummaryModel(stickyProvider?: string): string {
 
 	const agg = parseAggModelValue(configured);
 	if (agg) {
-		if (agg.pinnedModel) {
-			return sanitizeResolvedModelCandidate(agg.pinnedModel) ?? FALLBACK_DEFAULT_MODEL;
-		}
-		return (
-			sanitizeResolvedModelCandidate(resolveAggregation(agg.aggId, stickyProvider)) ??
-			FALLBACK_DEFAULT_MODEL
-		);
+		// An empty/broken summary aggregation falls back to the default model,
+		// mirroring the "unset summary follows default" rule above. The default
+		// resolver throws if it too is unconfigured, so nothing invents a model.
+		const candidate = agg.pinnedModel
+			? sanitizeResolvedModelCandidate(agg.pinnedModel)
+			: sanitizeResolvedModelCandidate(resolveAggregation(agg.aggId, stickyProvider));
+		return candidate ?? resolveConfiguredDefaultModel(stickyProvider);
 	}
 
 	return configured;
@@ -869,7 +899,12 @@ function resolveMetaModelForLookup(model: string, seen = new Set<string>()): str
 
 	if (isFollowDefaultModelValue(raw)) {
 		const configured = s().agent.defaultModel?.trim();
-		if (!configured || isFollowDefaultModelValue(configured)) return FALLBACK_DEFAULT_MODEL;
+		// No default configured: return the sentinel unchanged rather than naming
+		// a model nobody selected. This is a metadata lookup (context window,
+		// capabilities), so the caller detects "did not resolve" and uses its own
+		// tier default — it must not throw, and it must not fabricate a model
+		// whose context window would then be reported as fact.
+		if (!configured || isFollowDefaultModelValue(configured)) return raw;
 		return resolveMetaModelForLookup(configured, seen);
 	}
 

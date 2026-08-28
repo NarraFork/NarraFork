@@ -27,10 +27,14 @@ describe("setup wizard completion", () => {
 });
 
 describe("setup wizard step order and gating", () => {
-	test("providers come before dependencies", () => {
+	test("providers and models both come before dependencies", () => {
 		// Order matters: dependency installation can be delegated to a Setup
-		// Assistant narrator, which needs a configured provider to exist first.
+		// Assistant narrator, which is spawned on `settings.agent.defaultModel`.
+		// Both the provider credential AND the model selection must therefore be
+		// settled before the user can reach the step that offers delegation,
+		// otherwise the narrator runs on an unconfigured fallback model.
 		expect(wizardStepIndex("provider")).toBeLessThan(wizardStepIndex("deps"));
+		expect(wizardStepIndex("basic")).toBeLessThan(wizardStepIndex("deps"));
 		expect(WIZARD_STEPS[0]).toBe("welcome");
 		expect(WIZARD_STEPS.at(-1)).toBe("complete");
 	});
