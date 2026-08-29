@@ -9,8 +9,14 @@ const ORIGINATOR = "narrafork";
  * Must stay in sync with the `cc_version` reported in the Anthropic billing
  * block (see CC_CLI_VERSION in agent/anthropic-provider.ts): a request whose
  * User-Agent and billing block disagree does not match any real CLI release.
+ *
+ * Transcribed from the `VERSION` constant embedded in the official
+ * `claude-cli` 2.1.251 binary. The npm package stopped shipping `cli.js`
+ * around 2.1.227 and now only wraps a per-platform native executable, so this
+ * value is verified against strings extracted from that binary rather than
+ * from readable package sources.
  */
-export const CLAUDE_CLI_VERSION = "2.1.227";
+export const CLAUDE_CLI_VERSION = "2.1.251";
 // Managed Codex client version used only for outbound protocol emulation.
 // Keep the User-Agent prefix/suffix and originator aligned when updating it.
 const CODEX_CLI_VERSION = "0.146.0";

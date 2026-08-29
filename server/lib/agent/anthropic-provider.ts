@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
@@ -7,7 +7,7 @@ import {
 	parseClaudeModel,
 } from "@shared/reasoning-effort-support";
 import { computeFingerprint } from "../fingerprint";
-import { generateId } from "../id";
+import { getClaudeDeviceId } from "../installation-id";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -63,11 +63,12 @@ const WEB_SEARCH_MAX_TOKENS = 8192;
 /**
  * Official Claude Code chat beta flags, in the order the CLI emits them.
  *
- * Derived from `claude-cli` 2.1.227's own beta assembly (`KHS` → `ehr` → the
- * per-request pushes in the query builder), not from a single capture: the CLI
- * decides each flag PER MODEL, so a fixed string necessarily claims betas the
- * real client would not send for the model in hand. Each entry below repeats
- * the upstream predicate it is gated on.
+ * Derived from `claude-cli` 2.1.251's own beta assembly (a model-level set, a
+ * request-level set, and per-attempt pushes inside the retry closure), not from
+ * a single capture: the CLI decides each flag PER MODEL, so a fixed string
+ * necessarily claims betas the real client would not send for the model in hand.
+ * Each entry below repeats the upstream predicate it is gated on. All nine were
+ * re-checked against 2.1.251's beta registry — none was renamed or retired.
  *
  * Flags the CLI can also send but NarraFork never earns are omitted, because a
  * beta declares a capability the client must actually implement:
@@ -79,9 +80,19 @@ const WEB_SEARCH_MAX_TOKENS = 8192;
  *     `cache-diagnosis-2026-04-07`, `context-hint-2026-04-09`,
  *     `task-budgets-2026-03-13`, `per-turn-control-2026-07-01` — feature-gated.
  *   - `fallback-credit-2026-06-01` — upstream pushes it only once the
- *     fallback-credit lane is armed (`Bqd`), i.e. after a server-side fallback
- *     minted a credit token this client would have to echo back. NarraFork
- *     never mints or echoes one, so declaring it described a lane we cannot use.
+ *     fallback-credit lane is armed, i.e. after a server-side fallback minted a
+ *     credit token this client would have to echo back. NarraFork never mints or
+ *     echoes one, so declaring it described a lane we cannot use.
+ *
+ * Three betas new in 2.1.251 are withheld for the same reason:
+ *   - `auto-mode-classifier-2026-07-16` — assembled by a separate helper used
+ *     only for the security-classifier side request, never for `/v1/messages`.
+ *   - `thinking-display-updates-2026-08-18` — needs a first-party backend on the
+ *     official host plus an enabled feature flag, and turning it on also forces
+ *     `thinking.display = "updates"` and removes `redact-thinking`.
+ *   - `server-side-fallback-2026-07-01` — the category-shaped sibling of
+ *     `-2026-06-01` (the two are alternatives, not a rename). Both require a
+ *     locally-held fallback plan and the sticky-beta rejection state machine.
  */
 function buildAnthropicBetaFlags(model: string): string {
 	const flags: string[] = [];
@@ -165,11 +176,38 @@ async function broadcastBaseUrlFixSuggested(info: {
 }
 
 /**
- * Stable device ID — generated once per process lifetime.
- * Real Claude Code CLI persists this to disk; we keep it per-process which is
- * sufficient for rate-limit / session-tracking purposes.
+ * Derive a stable session UUID from a conversation id.
+ *
+ * `claude-cli` carries ONE session id for the lifetime of a conversation: the
+ * same value goes out as `X-Claude-Code-Session-Id` and as
+ * `metadata.user_id.session_id`, and upstream validates the shape with
+ * `/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i`.
+ *
+ * NarraFork cannot simply hold the id in an instance field, because
+ * AnthropicProvider instances are rebuilt every chat turn (see the
+ * v1FallbackCache note above). An instance-scoped id therefore changed on every
+ * message of a single conversation, which is not just a fidelity problem:
+ * Anthropic-facing relays key credential affinity on this value (sticky-session
+ * routing reads `metadata.user_id`'s session segment first and returns it as the
+ * routing hash), so a per-turn id scattered the turns of one conversation across
+ * different upstream credentials and missed the prompt cache each time — the
+ * same failure mode documented for the missing `X-Conversation-ID` header.
+ *
+ * Deriving it from the conversation id keeps it stable without persisting
+ * anything. Same construction as the Codex window id (see deriveCodexWindowId):
+ * hash, truncate to 16 bytes, then force the RFC 4122 version/variant bits so
+ * the result is a well-formed v4 UUID.
  */
-const DEVICE_ID = generateId();
+function deriveClaudeSessionId(conversationId: string): string {
+	const bytes = createHash("sha256")
+		.update(`narrafork-claude-session:${conversationId}`)
+		.digest()
+		.subarray(0, 16);
+	bytes[6] = (bytes[6] & 0x0f) | 0x40;
+	bytes[8] = (bytes[8] & 0x3f) | 0x80;
+	const hex = bytes.toString("hex");
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
 
 /**
  * Claude Code CLI version reported in the billing block. Shared with the
@@ -180,19 +218,29 @@ const CC_CLI_VERSION = CLAUDE_CLI_VERSION;
 /**
  * Build the billing block that opens the official system array.
  *
- * Format, transcribed from `claude-cli` 2.1.227's `Oyo`:
+ * Format, transcribed from `claude-cli` 2.1.251's attribution-header builder:
  *   `x-anthropic-billing-header: cc_version={version}.{fingerprint}; cc_entrypoint=cli; cch=00000;`
  *
  * The fingerprint is derived from the first *user-authored* text of the
  * conversation, so it is stable for a given conversation but differs between
  * conversations.
  *
- * `cch=00000;` is appended whenever the backend is first-party AND the base URL
- * is `api.anthropic.com` — exactly the official-API case. It is a LITERAL, not a
- * per-request hash, so it costs nothing in cache stability: the whole block stays
- * byte-identical across every turn of a conversation. Earlier NarraFork releases
- * dropped it on the theory that it varied per request; the upstream source shows
- * the only value it ever takes is `00000`.
+ * `cch=00000;` is a LITERAL, not a per-request hash, so it costs nothing in
+ * cache stability: the whole block stays byte-identical across every turn of a
+ * conversation. Earlier NarraFork releases dropped it on the theory that it
+ * varied per request; the upstream source shows the only value it ever takes is
+ * `00000`.
+ *
+ * Upstream gates it on `(backend === "firstParty" && jo()) || backend ===
+ * "vertex"`, where `jo()` means "`ANTHROPIC_BASE_URL` is unset or its host is
+ * exactly api.anthropic.com". NarraFork deliberately does NOT reproduce that
+ * host check, and the reason is the relay case rather than convenience: a relay
+ * configured as an official-dialect provider forwards this block verbatim to
+ * api.anthropic.com, so what Anthropic receives is a request arriving at its own
+ * endpoint — precisely the case where a real CLI does send `cch`. Adding the
+ * host gate would strip it exactly where upstream expects it. For a relay
+ * fronting a non-Anthropic upstream the segment is inert, so the fidelity gain
+ * on the Anthropic path costs nothing elsewhere.
  *
  * Still omitted, because each is conditional on state NarraFork does not have:
  * `cc_workload=` (a workload id), `cc_is_subagent=true` (upstream's own subagent
@@ -426,10 +474,12 @@ export function supportsEffort(model: string): boolean {
 /**
  * Whether a model accepts a `temperature`.
  *
- * `claude-cli` 2.1.227's `wHo` lists the models that DO take it — `claude-3-*`
- * and the 4.0–4.6 generations — and returns false for everything else. Every
- * in-scope Claude (4.7 and newer, plus the Fable/Mythos series) is therefore on
- * the rejecting side, so the parameter is never sent for a recognised Claude id.
+ * `claude-cli` 2.1.251 lists the models that DO take it — `claude-3-*`, Opus
+ * 4.0/4.1/4.5/4.6, Sonnet 4.0/4.5/4.6 and Haiku 4.5 — and returns false for
+ * everything else. Every in-scope Claude (4.7 and newer, plus the Fable/Mythos
+ * series) is therefore on the rejecting side, so the parameter is never sent for
+ * a recognised Claude id. Upstream also only sends it when thinking is off,
+ * which the caller enforces separately (see `chat`).
  *
  * An unparseable id keeps the parameter: generic Anthropic-compatible relays
  * (GLM, Kimi, ...) expect a normal Messages body, and dropping `temperature`
@@ -443,8 +493,9 @@ function acceptsTemperature(model: string): boolean {
  * Whether a model accepts mid-conversation `role: "system"` messages, i.e.
  * whether the `mid-conversation-system-2026-04-07` beta may be declared.
  *
- * Mirrors `claude-cli` 2.1.227's `qHS`, which leaves Opus 4.8+, Sonnet 5+,
- * Haiku 5+ and Fable/Mythos on the supported side. Opus 4.7 is the one in-scope
+ * Mirrors `claude-cli` 2.1.251's own gate, which names Opus 4.0–4.7, Sonnet
+ * 4.0–4.6 and Haiku 4.5 as unsupported and leaves Opus 4.8+, Sonnet 5+, Haiku 5+
+ * and Fable/Mythos on the supported side. Opus 4.7 is the one in-scope
  * exclusion, so this gate cannot collapse into "is this a modern Claude".
  *
  * This is not just a header decision: when the beta is absent upstream stops
@@ -513,7 +564,7 @@ function resolveGenerateMaxTokens(options?: GenerateOptions): number {
 /**
  * Map reasoning effort to Anthropic thinking configuration.
  *
- * Mirrors `claude-cli` 2.1.227's thinking assembly for the supported version
+ * Mirrors `claude-cli` 2.1.251's thinking assembly for the supported version
  * range (Claude 4.7 and newer):
  *   - `reasoningEffort === "none"` → `{ type: "disabled" }`, sent explicitly
  *     rather than omitted (upstream emits it for every thinking-capable model on
@@ -521,6 +572,12 @@ function resolveGenerateMaxTokens(options?: GenerateOptions): number {
  *   - everything else → `{ type: "adaptive" }`. Upstream's budgeted branch
  *     (`{ type: "enabled", budget_tokens }`) only exists for the 4.0–4.6
  *     generations, which are out of scope.
+ *
+ * One deliberate divergence: upstream sends `disabled` only on a first-party
+ * backend and omits `thinking` entirely elsewhere. NarraFork sends it on every
+ * backend, because here `"none"` is the user explicitly asking for no reasoning —
+ * omitting the field would let a relay apply its own default and turn thinking
+ * back on, silently overriding that choice.
  *
  * Relay models behind an Anthropic-compatible gateway (DeepSeek, GLM, Kimi, ...)
  * are not Claude versions and generally do not implement `adaptive`, so they get
@@ -991,8 +1048,16 @@ export class AnthropicProvider implements ProviderAdapter {
 	private tlsRejectUnauthorized: boolean;
 	/** Cached base URL after successful /v1 fallback resolution. */
 	private resolvedBaseUrl?: string;
-	/** Stable session ID — one per provider instance (≈ per narrator session). */
-	private readonly sessionId = generateId();
+	/**
+	 * Session id used when the caller has no conversation to derive one from —
+	 * the one-shot utility paths (title/summary generation), which upstream also
+	 * treats as standalone sessions.
+	 *
+	 * A UUID rather than a nanoid because that is the only shape upstream accepts
+	 * for a session id. The chat path does not use this field: it derives a
+	 * conversation-stable id instead (see sessionIdFor).
+	 */
+	private readonly fallbackSessionId = randomUUID();
 	/**
 	 * Reasoning-signature source identity to report instead of the configured
 	 * prefix. Set by NUG when this provider is used as an `anthropic`-channel
@@ -1048,12 +1113,30 @@ export class AnthropicProvider implements ProviderAdapter {
 		});
 	}
 
-	/** Build the shared chat/utility request headers for this provider mode. */
+	/**
+	 * Resolve the session id for one request.
+	 *
+	 * Conversation-derived when the caller has a conversation, so every turn of
+	 * that conversation reports the same id (see deriveClaudeSessionId for why
+	 * that matters). The utility paths pass nothing and get this instance's
+	 * fallback id.
+	 */
+	private sessionIdFor(conversationId?: string): string {
+		return conversationId ? deriveClaudeSessionId(conversationId) : this.fallbackSessionId;
+	}
+
+	/**
+	 * Build the shared chat/utility request headers for this provider mode.
+	 *
+	 * @param conversationId Present only on the chat path. Drives the session id,
+	 *   which must match the one in `metadata.user_id` for the same request.
+	 */
 	private buildRequestHeaders(
 		apiKey: string,
 		isOfficial: boolean,
 		model: string,
 		accept = "application/json",
+		conversationId?: string,
 	): Record<string, string> {
 		const headers: Record<string, string> = {
 			Accept: accept,
@@ -1066,7 +1149,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			headers["anthropic-dangerous-direct-browser-access"] = "true";
 			headers["user-agent"] = this.resolveUserAgent(true);
 			headers["x-app"] = "cli";
-			headers["X-Claude-Code-Session-Id"] = this.sessionId;
+			headers["X-Claude-Code-Session-Id"] = this.sessionIdFor(conversationId);
 			// Fresh per attempt, matching `claude-cli`'s `ZGp`, which mints a UUID
 			// for every official-API attempt (`Gn() === "firstParty" && mf()`) and
 			// passes it as this header. It is request-scoped telemetry, so it lands
@@ -1076,7 +1159,10 @@ export class AnthropicProvider implements ProviderAdapter {
 			headers["X-Stainless-Arch"] = STAINLESS_ARCH;
 			headers["X-Stainless-Lang"] = "js";
 			headers["X-Stainless-OS"] = STAINLESS_OS;
-			headers["X-Stainless-Package-Version"] = "0.94.0";
+			// The `anthropic-sdk-typescript` version bundled into `claude-cli`
+			// 2.1.251, read from the SDK's own `VERSION` constant. The SDK reports
+			// it verbatim, so a stale value here is a version the CLI never shipped.
+			headers["X-Stainless-Package-Version"] = "0.112.1";
 			headers["X-Stainless-Retry-Count"] = "0";
 			headers["X-Stainless-Runtime"] = "node";
 			headers["X-Stainless-Runtime-Version"] = "v26.3.0";
@@ -1118,19 +1204,38 @@ export class AnthropicProvider implements ProviderAdapter {
 		return blocks;
 	}
 
-	/** Attribution metadata the official API receives on every request. */
+	/**
+	 * Attribution metadata the official API receives on every request.
+	 *
+	 * `metadata` carries exactly one key, `user_id`, whose value is the JSON
+	 * *string* of the inner object — not a nested object. `account_uuid` is the
+	 * empty string rather than omitted, matching what upstream sends when no
+	 * account is signed in.
+	 *
+	 * Caller-supplied `metadata` is spread FIRST so the attribution `user_id`
+	 * always wins. The opposite order let a caller's own `user_id` replace it,
+	 * and that value has a contract the caller has no reason to know about:
+	 * relays parse it for device/session identity, and one that fails to parse
+	 * makes them treat the request as coming from an unknown client — which for
+	 * Anthropic-facing relays means substituting their own short system prompt
+	 * and losing the prompt cache. Extra keys still pass through.
+	 *
+	 * @param conversationId Present only on the chat path; keeps `session_id`
+	 *   equal to the `X-Claude-Code-Session-Id` header on the same request.
+	 */
 	private buildRequestMetadata(
 		isOfficial: boolean,
 		metadata?: Record<string, unknown>,
+		conversationId?: string,
 	): Record<string, unknown> | undefined {
 		if (!isOfficial) return metadata;
 		return {
-			user_id: JSON.stringify({
-				device_id: DEVICE_ID,
-				account_uuid: "",
-				session_id: this.sessionId,
-			}),
 			...(metadata ?? {}),
+			user_id: JSON.stringify({
+				device_id: getClaudeDeviceId(),
+				account_uuid: "",
+				session_id: this.sessionIdFor(conversationId),
+			}),
 		};
 	}
 
@@ -1501,7 +1606,7 @@ export class AnthropicProvider implements ProviderAdapter {
 					(typeof c === "string" && c === "") ||
 					(Array.isArray(c) && c.length === 0)
 				) {
-					logger.warn("Dropping empty assistant message before API call", {
+					logger.debug("Dropping empty assistant message before API call", {
 						index: i,
 						contentType: typeof c,
 					});
@@ -1664,13 +1769,23 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.tools = cachedTools;
 		}
 
-		const requestMetadata = this.buildRequestMetadata(isOfficial, params.metadata);
+		const requestMetadata = this.buildRequestMetadata(
+			isOfficial,
+			params.metadata,
+			params.conversationId,
+		);
 		if (requestMetadata) body.metadata = requestMetadata;
 
 		// Request path: official API uses ?beta=true, proxy mode uses plain path.
 		const reqPath = isOfficial ? "/messages?beta=true" : "/messages";
 
-		const reqHeaders = this.buildRequestHeaders(apiKey, isOfficial, model);
+		const reqHeaders = this.buildRequestHeaders(
+			apiKey,
+			isOfficial,
+			model,
+			"application/json",
+			params.conversationId,
+		);
 		// Only on the chat path: the utility/generate paths are one-shot calls with
 		// no conversation identity to report.
 		if (this.sendConversationIdHeader && params.conversationId) {
@@ -3211,7 +3326,7 @@ function systemMessageText(message: AnthropicMessage): string {
  * `claude-cli` solves it with the same buffer: its `api_system` entries live in a
  * pending list that is flushed immediately before it pushes an assistant turn and
  * once more when the array ends, and a flush whose predecessor is not a user turn
- * is emitted as a plain user message instead (`Aj`/`I` in 2.1.227). That yields
+ * is emitted as a plain user message instead. That yields
  * exactly two legal shapes — `user, system, assistant` and `user, system` at the
  * end — and never puts a system message after an assistant, which would also
  * break user/assistant alternation. This mirrors it.
@@ -3425,7 +3540,7 @@ function filterThinkingOnlyAssistantMessages(messages: AnthropicMessage[]): void
 
 		const allThinking = content.every((b) => isThinkingBlock(b));
 		if (allThinking) {
-			logger.warn("Dropping thinking-only assistant message before API call", {
+			logger.debug("Dropping thinking-only assistant message before API call", {
 				index: i,
 				blockCount: content.length,
 			});
@@ -3464,7 +3579,7 @@ function dropEmptyThinkingBlocks(messages: AnthropicMessage[]): void {
 			(b) => b.type !== "thinking" || (typeof b.thinking === "string" && b.thinking.trim() !== ""),
 		);
 		if (kept.length === content.length) continue;
-		logger.warn("Dropping empty thinking block before API call", {
+		logger.debug("Dropping empty thinking block before API call", {
 			removed: content.length - kept.length,
 			remaining: kept.length,
 		});
