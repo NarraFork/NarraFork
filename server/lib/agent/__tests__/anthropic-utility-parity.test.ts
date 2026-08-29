@@ -142,14 +142,31 @@ describe.each([
 		}
 	});
 
-	test("sends attribution metadata", async () => {
+	test("sends attribution metadata in the CLI's own shape", async () => {
 		const req = await capture(true, run);
 		const metadata = req.body.metadata as Record<string, string>;
+
+		// `metadata` carries exactly one key, and its value is a JSON *string*.
+		expect(Object.keys(metadata)).toEqual(["user_id"]);
+		expect(typeof metadata.user_id).toBe("string");
+
 		const userId = JSON.parse(metadata.user_id) as Record<string, string>;
 
-		expect(userId.device_id).toBeTruthy();
-		expect(userId.session_id).toBeTruthy();
-		expect(userId).toHaveProperty("account_uuid");
+		// Upstream validates its own device id against /^[0-9a-f]{64}$/ and
+		// regenerates the value whenever it fails, so a differently-shaped id is
+		// one no real install would report. It is also the only shape the legacy
+		// `user_{64hex}_account_..._session_...` form can carry.
+		expect(userId.device_id).toMatch(/^[0-9a-f]{64}$/);
+		// Session ids are UUIDs upstream, checked with the same pattern.
+		expect(userId.session_id).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+		);
+		// Empty string rather than absent, matching a signed-out client.
+		expect(userId.account_uuid).toBe("");
+
+		// One session id per request: the header and the metadata must agree,
+		// because upstream reads a single value into both.
+		expect(req.headers["x-claude-code-session-id"]).toBe(userId.session_id);
 	});
 
 	test("proxy mode stays lean and unfingerprinted", async () => {

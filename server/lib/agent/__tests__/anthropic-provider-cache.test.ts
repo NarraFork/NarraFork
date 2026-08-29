@@ -289,14 +289,99 @@ describe("AnthropicProvider final wire-body cache construction", () => {
 		expect(request.headers.get("user-agent")).toContain(`claude-cli/${CLAUDE_CLI_VERSION}`);
 		expect(systemFrom(request.body)[0].text).toContain(`cc_version=${CLAUDE_CLI_VERSION}.`);
 
-		// Stainless telemetry, transcribed from the captured CLI request.
-		expect(request.headers.get("x-stainless-package-version")).toBe("0.94.0");
+		// Stainless telemetry. The package version is the anthropic-sdk-typescript
+		// build bundled into the CLI, read from the SDK's own VERSION constant.
+		expect(request.headers.get("x-stainless-package-version")).toBe("0.112.1");
 		expect(request.headers.get("x-stainless-runtime-version")).toBe("v26.3.0");
 		expect(request.headers.get("x-app")).toBe("cli");
 		// The CLI mints a fresh UUID per official-API attempt and sends it here.
 		expect(request.headers.get("x-client-request-id")).toMatch(
 			/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
 		);
+	});
+
+	test("keeps one session id per conversation across provider rebuilds", async () => {
+		installFetchCapture();
+
+		// A provider instance is rebuilt for every chat turn (see the
+		// v1FallbackCache note in the provider), so an instance-scoped session id
+		// changed on every message of one conversation. That is not only unlike the
+		// real CLI, which carries one id for the conversation's lifetime: relays in
+		// front of Anthropic key credential affinity on this exact value, so a
+		// per-turn id spread one conversation across several upstream credentials
+		// and missed the prompt cache on each turn. Two fresh providers stand in for
+		// two consecutive turns here.
+		const first = await sendAndCapture(new AnthropicProvider(config(true)), "turn one");
+		const second = await sendAndCapture(new AnthropicProvider(config(true)), "turn two");
+
+		const sessionOf = (request: CapturedRequest): string => {
+			const metadata = request.body.metadata as Record<string, string>;
+			return (JSON.parse(metadata.user_id) as Record<string, string>).session_id;
+		};
+
+		expect(sessionOf(first)).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+		);
+		expect(sessionOf(second)).toBe(sessionOf(first));
+		// The header must carry the same value the body reports.
+		expect(first.headers.get("x-claude-code-session-id")).toBe(sessionOf(first));
+		expect(second.headers.get("x-claude-code-session-id")).toBe(sessionOf(first));
+
+		// Stable is not the same as constant: a different conversation must get a
+		// different id, or every conversation would share one credential.
+		const provider = new AnthropicProvider(config(true));
+		const otherParams: ChatParams = {
+			...chatParams(provider, "other conversation"),
+			conversationId: "cache-conversation-other",
+		};
+		const before = capturedRequests.length;
+		for await (const _event of provider.chat(otherParams)) {
+			// Exhaust the response so the provider completes the real request path.
+		}
+		expect(sessionOf(capturedRequests[before])).not.toBe(sessionOf(first));
+	});
+
+	test("reports a persisted 64-hex device id", async () => {
+		installFetchCapture();
+
+		// Upstream validates its own device id against /^[0-9a-f]{64}$/ and rewrites
+		// the stored value whenever it fails, so this is the only shape a real
+		// install reports. It is persisted, so it must also survive a rebuild.
+		const first = await sendAndCapture(new AnthropicProvider(config(true)), "device one");
+		const second = await sendAndCapture(new AnthropicProvider(config(true)), "device two");
+
+		const deviceOf = (request: CapturedRequest): string => {
+			const metadata = request.body.metadata as Record<string, string>;
+			return (JSON.parse(metadata.user_id) as Record<string, string>).device_id;
+		};
+
+		expect(deviceOf(first)).toMatch(/^[0-9a-f]{64}$/);
+		expect(deviceOf(second)).toBe(deviceOf(first));
+	});
+
+	test("caller metadata cannot overwrite the attribution user_id", async () => {
+		installFetchCapture();
+
+		// `user_id` is not a free-form field: relays parse it for device/session
+		// identity, and one that fails to parse makes them treat the request as
+		// coming from an unknown client — which costs the caller its own system
+		// prompt and the prompt cache. So the attribution value wins over anything
+		// the caller passes, while unrelated keys still travel.
+		const provider = new AnthropicProvider(config(true));
+		const params: ChatParams = {
+			...chatParams(provider, "metadata precedence tail"),
+			metadata: { user_id: "not-a-parseable-user-id" } as ChatParams["metadata"],
+		};
+
+		const before = capturedRequests.length;
+		for await (const _event of provider.chat(params)) {
+			// Exhaust the response so the provider completes the real request path.
+		}
+		const metadata = capturedRequests[before].body.metadata as Record<string, string>;
+
+		expect(metadata.user_id).not.toBe("not-a-parseable-user-id");
+		const userId = JSON.parse(metadata.user_id) as Record<string, string>;
+		expect(userId.device_id).toMatch(/^[0-9a-f]{64}$/);
 	});
 
 	test("skips harness system reminders when deriving the billing fingerprint", async () => {

@@ -813,6 +813,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "作为 x-codex-installation-id 发送的持久化 UUID（客户端指纹身份，首次访问自动生成）。",
 		type: "string",
 	},
+	"clientFingerprint.claudeDeviceId": {
+		desc: "官方 Anthropic 请求中作为 metadata.user_id.device_id 发送的持久化设备标识（64 位小写 hex，首次访问自动生成）。与真实 Claude Code CLI 的 device_id 形状和生命周期一致：一次安装对应一个设备标识，重启不变。",
+		type: "string",
+	},
 
 	// ── pricing ─────────────────────────────────────────────────────────
 	"pricing.overrides": {

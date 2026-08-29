@@ -9,14 +9,14 @@
  * separated the 3.x/4.0–4.6 generations are gone. What remains is what still
  * varies inside the supported range:
  *
- *   - `temperature` is refused by every in-scope Claude (`wHo`), and only
- *     third-party relay ids still receive it.
- *   - `role: "system"` turns need `mid-conversation-system-2026-04-07` (`qHS`),
- *     which Opus 4.7 does not have, so the message must be downgraded there.
- *   - the Claude Code beta is withheld from Haiku by name (`KHS`), and the
- *     1M-context and effort betas track NarraFork's own capability answers.
+ *   - `temperature` is refused by every in-scope Claude, and only third-party
+ *     relay ids still receive it.
+ *   - `role: "system"` turns need `mid-conversation-system-2026-04-07`, which
+ *     Opus 4.7 does not have, so the message must be downgraded there.
+ *   - the Claude Code beta is withheld from Haiku by name, and the 1M-context
+ *     and effort betas track NarraFork's own capability answers.
  *
- * Transcribed predicates: `wHo`, `qHS`, `KHS`, `EZb` in claude-cli 2.1.227.
+ * Predicates transcribed from claude-cli 2.1.251.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { type AnthropicProviderConfig, settings } from "../../settings";
