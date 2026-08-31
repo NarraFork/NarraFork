@@ -36,7 +36,7 @@ import {
 	useGitUnstage,
 } from "../../hooks/useGit";
 import { useGitFolderPrefs } from "../../hooks/useGitFolderPrefs";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { buildAttributionBadge } from "./attribution-label";
 import { GitFileDiff } from "./GitFileDiff";
 import { type GitFileSection, gitFileBadgeChar } from "./git-file-status";

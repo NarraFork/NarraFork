@@ -27,6 +27,7 @@ import {
 	IconRobot,
 	IconSearch,
 	IconTerminal2,
+	IconTextSize,
 	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
@@ -68,6 +69,9 @@ const FileModificationsPanel = lazy(() =>
 	import("../FileModificationsDrawer").then((m) => ({ default: m.FileModificationsPanel })),
 );
 const SpecPanel = lazy(() => import("../SpecPanel").then((m) => ({ default: m.SpecPanel })));
+const AppearancePanel = lazy(() =>
+	import("../AppearancePanel").then((m) => ({ default: m.AppearancePanel })),
+);
 const NarratorSearchPanel = lazy(() =>
 	import("../NarratorSearchPanel").then((m) => ({ default: m.NarratorSearchPanel })),
 );
@@ -789,6 +793,30 @@ export function UserChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 	);
 }
 
+// ── Appearance (live transcript typography) ──
+export function AppearanceDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const { t } = useTranslation("narrator");
+
+	useLayoutEffect(() => {
+		const title = t("appearance.title");
+		if (title && title !== props.api.title) props.api.setTitle(title);
+	}, [t, props.api]);
+
+	return (
+		<ToolPanelShell
+			title={t("appearance.title")}
+			icon={<IconTextSize size={16} color="var(--mantine-color-dimmed)" />}
+			props={props}
+			subjectId="__appearance__"
+			detachKind="appearance"
+		>
+			<LazyPanelBoundary>
+				<AppearancePanel />
+			</LazyPanelBoundary>
+		</ToolPanelShell>
+	);
+}
+
 // ── Mock stream harness (TEMPORARY, see ../mock/README-REMOVAL.md) ──
 export function MockDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const dock = useNarratorDockContext();
@@ -923,6 +951,7 @@ export const narratorDockComponents: Record<
 	tasks: TasksDockPanel,
 	search: SearchDockPanel,
 	userchat: UserChatDockPanel,
+	appearance: AppearanceDockPanel,
 	subagent: SubagentDockPanel,
 	file: FileDockPanel,
 	knowledge: KnowledgeDockPanel,

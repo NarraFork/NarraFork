@@ -6,34 +6,20 @@
 import "@frontend/lib/legacy-browser-polyfills";
 import { reportReactRenderError } from "@frontend/lib/hmr-guard";
 import "@frontend/lib/dom-mutation-guard";
-import { Center, Loader, MantineProvider, v8CssVariablesResolver } from "@mantine/core";
-import { DatesProvider } from "@mantine/dates";
 import "@mantine/core/styles.css";
 import "@mantine/dates/styles.css";
 import "@mantine/notifications/styles.css";
 import "@mantine/tiptap/styles.css";
-import { AppNotifications } from "@frontend/components/AppNotifications";
-import { ConfirmDialogProvider } from "@frontend/components/common/ConfirmDialogProvider";
-import { ImageViewerProvider } from "@frontend/components/common/ImageViewerProvider";
-import type {
-	PluginDockPanelParams,
-	PluginUiContext,
-	PluginUiContribution,
-	PluginUiSessionContext,
-} from "@frontend/components/plugins";
-import {
-	invalidatePluginUiContributions,
-	PluginThemeInjector,
-	PluginUiRuntimeProvider,
-	requestPluginUiBackend,
-	resolvePluginUiContribution,
-	syncPluginUiContributions,
-} from "@frontend/components/plugins";
-import { useBranding } from "@frontend/hooks/useBranding";
-import { usePluginContributions } from "@frontend/hooks/usePluginContributions";
-import { readActivePluginThemeKey } from "@frontend/hooks/usePluginThemes";
-import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import { installPinchZoomGuard } from "@frontend/lib/pinch-zoom-guard";
+/*
+ * The plain store, NOT `hooks/usePluginThemes`.
+ *
+ * That hook module reaches React Query and the whole `lib/api` barrel — 53 modules that
+ * would then sit on THIS module's import graph. Since the entry cannot accept HMR
+ * updates and has no importer above it, editing any of them would reload the page. See
+ * `lib/plugin-theme-pref-store.ts` for the full explanation.
+ */
+import { readActivePluginThemeKey } from "@frontend/lib/plugin-theme-pref-store";
 import "@frontend/styles/oled.css";
 import "@frontend/styles/blur-anim.css";
 import "@frontend/styles/nav-collapsed.css";
@@ -45,207 +31,32 @@ import "@frontend/styles/toast.css";
 import "@frontend/styles/card-shimmer.css";
 import "@frontend/styles/trace-shimmer.css";
 
-import { QueryClientProvider } from "@tanstack/react-query";
-import {
-	createBrowserHistory,
-	createRouter,
-	type RouterHistory,
-	RouterProvider,
-} from "@tanstack/react-router";
+/*
+ * Deep import rather than the `components/plugins` barrel, for the same reason as the
+ * theme store above: the barrel re-exports every plugin component, so importing one
+ * function through it puts all of them on the entry's graph.
+ */
+import { syncPluginUiContributions } from "@frontend/components/plugins/registry";
+import { createBrowserHistory } from "@tanstack/react-router";
 import React from "react";
 import ReactDOM from "react-dom/client";
-import {
-	RouteChunkErrorBoundary,
-	RoutePendingIndicator,
-} from "./components/common/RouteChunkErrorBoundary";
-import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-layout";
-import { getRouterBasepath } from "./lib/base-path";
-import { installHostBridge } from "./lib/host-bridge";
-import i18n, { getInitialNamespaces, initI18n } from "./lib/i18n";
-import { mantineTheme } from "./lib/mantine-theme";
-import { queryClient } from "./lib/query-client";
-import { routeTree } from "./routeTree.gen";
-
-const theme = mantineTheme;
-
-function createAppRouter(history: RouterHistory) {
-	return createRouter({
-		history,
-		routeTree,
-		/*
-		 * The mount prefix, so routing works when the app is not at the origin root
-		 * (a reverse-proxy subpath, or code-server's `/proxy/<port>/`).
-		 *
-		 * TanStack strips this from `location.pathname` before matching and adds it back
-		 * when building hrefs. Omitting it makes the first navigation appear to work —
-		 * the initial HTML came from the server — and then every `<Link>` writes a URL
-		 * outside the prefix, landing on the proxy's root.
-		 */
-		basepath: getRouterBasepath(),
-		context: { queryClient },
-		/*
-		 * Give EVERY route its own error boundary.
-		 *
-		 * TanStack wraps each match in a CatchBoundary only when that match resolves an
-		 * `errorComponent`; otherwise the error travels up to the nearest ancestor that
-		 * has one. Previously only the root route did, so any failure in a leaf route
-		 * unmounted the whole app shell and took the navigation with it — the user was
-		 * left on a bare error screen with no links, recoverable only by a page load.
-		 *
-		 * This matters most for code-split route chunks, which the single-threaded
-		 * backend serves alongside the API. While it is blocked by a long synchronous
-		 * job (a storage scan on a large database is the known case) a chunk request can
-		 * fail, and `lazyRouteComponent` caches that rejection for the lifetime of the
-		 * document. Catching at the deepest match keeps every ancestor — sidebar, tab
-		 * strip, header — mounted and usable.
-		 *
-		 * The root route keeps its own `errorComponent`, so failures during app
-		 * bootstrap (i18n, shell layout) still get the full-page treatment.
-		 */
-		defaultErrorComponent: RouteChunkErrorBoundary,
-		/*
-		 * Show a spinner once a navigation has been pending long enough to notice.
-		 * Without it, clicking a link while the backend is busy looks like a dead
-		 * button: the router is waiting on the route chunk, but nothing on screen says
-		 * so, which is exactly how the storage-scan stall was first reported.
-		 */
-		defaultPendingComponent: RoutePendingIndicator,
-		defaultPendingMs: 400,
-		defaultPendingMinMs: 300,
-	});
-}
-
-type AppRouter = ReturnType<typeof createAppRouter>;
-
-declare module "@tanstack/react-router" {
-	interface Register {
-		router: AppRouter;
-	}
-}
-
-/**
- * App-shell plugin runtime wiring.
+/*
+ * The React tree lives in `App.tsx`, NOT here.
  *
- * Responsibilities:
- * - keep the host-owned contribution store in sync (login → token appears,
- *   WS reconnect → invalidate + refetch);
- * - build the handshake/context.get context from the live app shell.
+ * This module runs bootstrap side effects at module scope, so `@vitejs/plugin-react`
+ * can never treat it as a valid Fast Refresh boundary. Defining a component here made
+ * it an INVALID boundary instead, and since the entry has no accepting importer above
+ * it, every propagated update ended in `location.reload()` — editing any high fan-in
+ * module (`lib/query-client`, `hooks/useBranding`, `components/plugins`) reloaded the
+ * whole page. See `App.tsx`'s header for the measurement.
  *
- * Host-local `panel.open` is intentionally NOT wired here: opening a Dockview
- * panel requires a surface-scoped api (focus dock vs. workspace), and the
- * router correctly reports NOT_SUPPORTED until a surface-level bridge lands.
+ * ⚠️ Do not move components back into this file, and keep the imports below limited to
+ * bootstrap concerns.
  */
-function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
-	// React Query-backed sync: enabled by getToken(), so it fires right after
-	// login; mutations invalidate the same query key.
-	usePluginContributions();
-
-	// Instance branding (tab title, favicon, PWA icon URLs). Mounted here rather
-	// than in a route because it must apply on EVERY page including login — the
-	// pre-login surfaces are where telling two instances apart matters most. The
-	// endpoint is public, so this needs no session.
-	useBranding();
-
-	// WS reconnect → resync the contribution snapshot (the event stream is only
-	// an invalidation signal; the HTTP response remains the payload of truth).
-	React.useEffect(
-		() =>
-			narratorWSManager.onConnectionChange((connected, isReconnect) => {
-				if (connected && isReconnect) void syncPluginUiContributions().catch(() => {});
-			}),
-		[],
-	);
-
-	// Lifecycle mutations in another tab are delivered as an invalidation marker;
-	// refetch the bounded HTTP snapshot so every open panel converges quickly.
-	React.useEffect(() => {
-		const listener = narratorWSManager.addListener(
-			{ types: ["plugin_contributions_changed"] },
-			() => {
-				invalidatePluginUiContributions();
-				void queryClient.invalidateQueries({ queryKey: ["plugins", "ui-contributions"] });
-			},
-		);
-		return () => narratorWSManager.removeListener(listener);
-	}, []);
-
-	const colorScheme =
-		typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: light)").matches
-			? ("light" as const)
-			: ("dark" as const);
-
-	const getContext = React.useCallback(
-		(
-			params: PluginDockPanelParams,
-			sessionContext: PluginUiSessionContext,
-			contribution: PluginUiContribution,
-		): PluginUiContext => {
-			return {
-				contextVersion: 1,
-				host: {
-					appVersion: typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "unknown",
-					locale: i18n.language || "en",
-					colorScheme,
-					platform: navigator.platform.toLowerCase().includes("win")
-						? ("windows" as const)
-						: navigator.platform.toLowerCase().includes("mac")
-							? ("macos" as const)
-							: ("linux" as const),
-				},
-				plugin: {
-					id: params.pluginId,
-					version: contribution.version || params.fallback?.pluginVersion || "unknown",
-					contributionId: params.contributionId,
-					panelInstanceId: params.panelInstanceId,
-				},
-				surface: {
-					// `graph` (a chapter node's embedded dock) reports as `narrator-focus`:
-					// both host exactly one narrator, and a new wire value would break
-					// already-published plugins. Mirrors PluginUiRuntimeProvider.
-					kind:
-						sessionContext.surface === "focus" || sessionContext.surface === "graph"
-							? ("narrator-focus" as const)
-							: sessionContext.surface === "settings"
-								? ("settings" as const)
-								: sessionContext.surface,
-					active: true,
-					visible: true,
-				},
-				...(sessionContext.narratorId
-					? {
-							narrator: {
-								id: sessionContext.narratorId,
-								chapterId: sessionContext.chapterId,
-								projectId: sessionContext.projectId,
-							},
-						}
-					: {}),
-				...(sessionContext.projectId ? { project: { id: sessionContext.projectId } } : {}),
-				...(sessionContext.workspaceId
-					? {
-							workspace: {
-								id: sessionContext.workspaceId,
-								ownerNarratorId: sessionContext.narratorId,
-								presentation: sessionContext.presentation ?? "grid",
-							},
-						}
-					: {}),
-				route: { routeId: window.location.pathname || "plugin-ui" },
-			};
-		},
-		[colorScheme],
-	);
-
-	return (
-		<PluginUiRuntimeProvider
-			resolveContribution={resolvePluginUiContribution}
-			getContext={getContext}
-			onBackendRequest={requestPluginUiBackend}
-		>
-			{children}
-		</PluginUiRuntimeProvider>
-	);
-}
+import { App } from "./App";
+import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-layout";
+import { installHostBridge } from "./lib/host-bridge";
+import { getInitialNamespaces, initI18n } from "./lib/i18n";
 
 /**
  * Apply the persisted plugin theme attribute before React mounts so the first
@@ -280,7 +91,12 @@ async function bootstrap() {
 	// covered. Safari in a browser tab ignores index.html's `user-scalable=no`, and
 	// a component-level handler is structurally too late (see pinch-zoom-guard.ts).
 	installPinchZoomGuard();
-	const router = createAppRouter(createBrowserHistory());
+	/*
+	 * History is created HERE, not in `App`, so a Fast Refresh of the React tree cannot
+	 * replace it. A fresh history would reset the URL bar's session entries and detach
+	 * the router from the browser's back/forward stack.
+	 */
+	const history = createBrowserHistory();
 
 	// Sweep focus-dock layouts unopened for >30 days (best-effort, never throws).
 	cleanupStaleNarratorDockLayouts();
@@ -293,7 +109,7 @@ async function bootstrap() {
 		/*
 		 * Let the dev-only HMR guard see render errors an error boundary handled.
 		 *
-		 * Every route has a CatchBoundary (see `defaultErrorComponent` above), so a
+		 * Every route has a CatchBoundary (see `defaultErrorComponent` in App.tsx), so a
 		 * stale-module-graph failure inside a route becomes an error card and never
 		 * reaches `window.onerror` — the guard's one-time reload would never fire.
 		 *
@@ -311,33 +127,7 @@ async function bootstrap() {
 		},
 	}).render(
 		<React.StrictMode>
-			<MantineProvider
-				theme={theme}
-				defaultColorScheme="auto"
-				cssVariablesResolver={v8CssVariablesResolver}
-			>
-				<DatesProvider settings={{ firstDayOfWeek: 1 }}>
-					<ConfirmDialogProvider>
-						<ImageViewerProvider>
-							<AppNotifications />
-							<QueryClientProvider client={queryClient}>
-								<PluginThemeInjector />
-								<PluginRuntimeShell>
-									<React.Suspense
-										fallback={
-											<Center h="100vh">
-												<Loader />
-											</Center>
-										}
-									>
-										<RouterProvider router={router} />
-									</React.Suspense>
-								</PluginRuntimeShell>
-							</QueryClientProvider>
-						</ImageViewerProvider>
-					</ConfirmDialogProvider>
-				</DatesProvider>
-			</MantineProvider>
+			<App history={history} />
 		</React.StrictMode>,
 	);
 }

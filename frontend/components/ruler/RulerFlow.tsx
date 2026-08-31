@@ -36,7 +36,7 @@ import type { ParkedWorkFields, ParkedWorkStatus } from "../../lib/api/projects"
 import { buildRulerCommitForkRequest } from "../../lib/chapter-fork-options";
 import { Z } from "../../lib/z-index";
 import { ChapterForkModal } from "../chapter/ChapterForkModal";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { NarratorPanel } from "../narrator/NarratorPanel";
 import { resolveChapterAnchors } from "./chapter-anchoring";
 import {

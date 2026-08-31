@@ -6,6 +6,7 @@ import {
 	normalizeSubagentToolInputSummary,
 	type SubagentToolInputSummary,
 } from "@shared/subagent-tool-summary";
+import { readToolProgressPayload, type ToolProgressPayload } from "@shared/tool-progress";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
 	BufferMessageSummary,
@@ -434,6 +435,15 @@ interface NarratorWSCallbacks {
 	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
 	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
 	/**
+	 * A determinate "N of M done" measurement from a running tool (TransferFile),
+	 * rendered as an actual progress bar rather than parsed out of its text output.
+	 */
+	onToolStructuredProgress?: (
+		toolUseId: string,
+		progress: ToolProgressPayload,
+		parentToolUseId?: string,
+	) => void;
+	/**
 	 * A running Await-agent call learned which child narrator it is waiting on.
 	 * Lets the card offer "open session" before the wait returns (the id is not in
 	 * the persisted row until then).
@@ -687,6 +697,8 @@ interface NarratorWSCallbacks {
 			input?: unknown;
 			streamStartedAt?: number;
 			streamingOutput?: string;
+			/** Latest determinate progress, so a reconnect paints the bar immediately. */
+			structuredProgress?: ToolProgressPayload;
 			toolCallId?: string | null;
 			createdAt?: string | number | null;
 			timing?: SubagentToolCallTiming | null;
@@ -1013,6 +1025,19 @@ export function useNarratorWS(
 							data.parentToolUseId as string | undefined,
 						);
 						break;
+					case "tool_structured_progress": {
+						// Validated rather than cast: a malformed frame must degrade to a
+						// barless card, not to a bar reading `NaN%`.
+						const progress = readToolProgressPayload(data.progress);
+						if (progress) {
+							callbackOwner.callbacks.onToolStructuredProgress?.(
+								data.toolUseId as string,
+								progress,
+								data.parentToolUseId as string | undefined,
+							);
+						}
+						break;
+					}
 					case "await_agent_resolved":
 						callbackOwner.callbacks.onAwaitAgentResolved?.(
 							data.toolUseId as string,
@@ -1495,6 +1520,7 @@ export function useNarratorWS(
 								input?: unknown;
 								streamStartedAt?: number;
 								streamingOutput?: string;
+								structuredProgress?: ToolProgressPayload;
 								toolCallId?: string | null;
 								createdAt?: string | number | null;
 								timing?: SubagentToolCallTiming | null;

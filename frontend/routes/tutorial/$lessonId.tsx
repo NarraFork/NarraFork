@@ -76,14 +76,24 @@ function TutorialLessonPage() {
 	const startLesson = useStartTutorialLesson();
 	const resetLesson = useResetTutorialLesson();
 
-	const [narratorId, setNarratorId] = useState<string | undefined>(undefined);
-	const [projectId, setProjectId] = useState<string | undefined>(undefined);
+	// `undefined` means "not started in this tab". It is only ever set by a start
+	// call; the server-reported session below is what makes a RETURNING user land back
+	// on their running conversation.
+	const [startedNarratorId, setStartedNarratorId] = useState<string | undefined>(undefined);
+	const [startedProjectId, setStartedProjectId] = useState<string | undefined>(undefined);
 	const [startError, setStartError] = useState<string | null>(null);
 	const [resetOpen, { open: openReset, close: closeReset }] = useDisclosure(false);
 	const [railOpen, { open: openRail, close: closeRail }] = useDisclosure(false);
 
 	const lesson = data?.lesson;
 	const recordedStepIds = data?.progress?.completedStepIds ?? [];
+
+	// One tutorial narrator spans every lesson, so a lesson the user already began
+	// (or simply reloaded) has a live session on the server. Mounting it is not a
+	// convenience: pressing start again writes another lesson boundary, which rewinds
+	// the script of a lesson that was halfway through.
+	const narratorId = startedNarratorId ?? data?.session?.narratorId;
+	const projectId = startedProjectId ?? data?.session?.projectId ?? undefined;
 
 	// Fork and merge happen on the graph, not in this narrator, so their evidence
 	// has to be polled rather than observed. Only for chapters lessons: elsewhere
@@ -101,8 +111,8 @@ function TutorialLessonPage() {
 		setStartError(null);
 		startLesson.mutate(lessonId, {
 			onSuccess: (session) => {
-				setNarratorId(session.narratorId);
-				setProjectId(session.projectId ?? undefined);
+				setStartedNarratorId(session.narratorId);
+				setStartedProjectId(session.projectId ?? undefined);
 			},
 			onError: (error) => setStartError((error as Error)?.message ?? String(error)),
 		});
@@ -122,10 +132,13 @@ function TutorialLessonPage() {
 	const confirmReset = () => {
 		resetLesson.mutate(lessonId, {
 			onSuccess: () => {
-				// A reset means "let me do it again from the top", so drop the narrator
-				// too: its history would otherwise resume the script mid-way.
-				setNarratorId(undefined);
-				setProjectId(undefined);
+				// A reset means "let me do it again from the top". Only the LOCAL start
+				// state is dropped, which puts the start button back; the narrator itself is
+				// kept (it holds the earlier lessons the user may want to read), and
+				// pressing start writes a fresh lesson boundary so the script replays from
+				// turn 0 in the same conversation.
+				setStartedNarratorId(undefined);
+				setStartedProjectId(undefined);
 				closeReset();
 			},
 		});
@@ -159,7 +172,13 @@ function TutorialLessonPage() {
 			onNext={
 				nextLessonId
 					? () => {
-							setNarratorId(undefined);
+							// Drop THIS lesson's start state so the next lesson opens on its own
+							// start button. The narrator is shared across lessons, so carrying the
+							// id over would mount the previous lesson's conversation under the next
+							// lesson's steps — before its boundary row exists, which is what makes
+							// the script play from turn 0.
+							setStartedNarratorId(undefined);
+							setStartedProjectId(undefined);
 							void navigate({
 								to: "/tutorial/$lessonId",
 								params: { lessonId: nextLessonId },

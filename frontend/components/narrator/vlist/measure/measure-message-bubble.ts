@@ -36,6 +36,7 @@ import {
 	MONO_FAMILY,
 	SANS_FAMILY,
 	SPACING,
+	typographyMetrics,
 } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 import { IMAGE_FIXED_HEIGHT, IMAGE_MAX_DISPLAY_HEIGHT, TEXT_FILE_HEIGHT } from "./measure-media";
@@ -74,8 +75,12 @@ export const USER_ATTACHMENT_MIN_CONTENT_WIDTH = 300;
 export const ASSISTANT_PAD_X = SPACING.xs;
 export const ASSISTANT_PAD_Y = 4; // 0.25rem ≈ 4px
 
+/**
+ * Baseline line box for the user/assistant body, exported for tests that assert
+ * heights in multiples of a line. NOT used for measurement — that reads
+ * `typographyMetrics().line.body`, which follows the reader's scale.
+ */
 const BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm);
-const USER_BODY_FONT = `400 ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 
 // ── Slash-command bubble chrome ──────────────────────────────────────────────
 /**
@@ -326,8 +331,8 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 			kind: "code",
 			// Cross-width memo (see prepared-markdown-cache): the segment precompute is
 			// width-independent and is the dominant cost of a user bubble.
-			prepared: getPreparedTextWithSegments(input.text, USER_BODY_FONT, "pre-wrap"),
-			lineHeight: BODY_LINE_HEIGHT,
+			prepared: getPreparedTextWithSegments(input.text, typographyMetrics().font.body, "pre-wrap"),
+			lineHeight: typographyMetrics().line.body,
 			lang: null,
 			marginTop: hasAttachments ? USER_ATTACHMENT_GAP : 0,
 			contentLeft: 0,
@@ -404,14 +409,14 @@ function measureCommandMessage(
 	// that ended each line did not fit `innerWidth >= maxLineWidth` either — so
 	// re-wrapping at `innerUsed` reproduces exactly the same breaks. Measuring
 	// twice would cost a second pretext pass for a provably identical answer.
-	const expansionPrepared = prepareWithSegments(expansionText, COMMAND_PREVIEW_FONT, {
+	const expansionPrepared = prepareWithSegments(expansionText, typographyMetrics().font.xs, {
 		whiteSpace: "pre-wrap",
 	});
 	const expansionStats = measureLineStats(expansionPrepared, innerWidth);
 	// The command line is clamped to one line (truncate), so its NATURAL width is
 	// what the bubble should try to accommodate; `min(innerWidth, …)` caps it when
 	// the command is longer than the frame.
-	const commandPrepared = prepareWithSegments(commandText, COMMAND_LINE_FONT);
+	const commandPrepared = prepareWithSegments(commandText, typographyMetrics().font.bodyMediumMono);
 	const commandWidth = measureNaturalWidth(commandPrepared);
 	const innerUsed = Math.min(
 		innerWidth,
@@ -439,7 +444,7 @@ function measureCommandMessage(
 	blocks.push({
 		kind: "fixed",
 		marginTop: 0,
-		height: COMMAND_LINE_HEIGHT,
+		height: typographyMetrics().line.body,
 		tag: "command-line",
 		data: { text: commandText },
 		contentLeft: 0,
@@ -454,7 +459,7 @@ function measureCommandMessage(
 	const bodyBlock: PreparedCodeBlock = {
 		kind: "code",
 		prepared: expansionPrepared,
-		lineHeight: COMMAND_PREVIEW_LINE_HEIGHT,
+		lineHeight: typographyMetrics().line.xs,
 		lang: null,
 		marginTop: COMMAND_ROW_GAP,
 		contentLeft: 0,
@@ -466,21 +471,21 @@ function measureCommandMessage(
 	if (hasBody) blocks.push(bodyBlock);
 
 	const commandTop = 0;
-	const bodyTop = hasBody ? COMMAND_LINE_HEIGHT + COMMAND_ROW_GAP : -1;
+	const bodyTop = hasBody ? typographyMetrics().line.body + COMMAND_ROW_GAP : -1;
 	const bodyHeight = !hasBody
 		? 0
 		: expanded
-			? expansionStats.lineCount * COMMAND_PREVIEW_LINE_HEIGHT
-			: COMMAND_PREVIEW_LINE_HEIGHT;
+			? expansionStats.lineCount * typographyMetrics().line.xs
+			: typographyMetrics().line.xs;
 	const toggleTop = overflows ? bodyTop + bodyHeight + COMMAND_ROW_GAP : -1;
 	const toggleLabel = expanded
 		? (expandState.hideLabel ?? "Hide expanded prompt")
 		: (expandState.showLabel ?? "Show expanded prompt");
 
 	const contentHeight =
-		COMMAND_LINE_HEIGHT +
+		typographyMetrics().line.body +
 		(hasBody ? COMMAND_ROW_GAP + bodyHeight : 0) +
-		(overflows ? COMMAND_ROW_GAP + COMMAND_TOGGLE_HEIGHT : 0);
+		(overflows ? COMMAND_ROW_GAP + typographyMetrics().line.xs : 0);
 
 	const headerHeight = hasHeader ? USER_HEADER_HEIGHT + USER_HEADER_BODY_GAP : 0;
 	const height = USER_BUBBLE_PADDING * 2 + headerHeight + contentHeight;
@@ -504,7 +509,7 @@ function measureCommandMessage(
 		blocks: blocks.map((_, index) => ({
 			index,
 			top: index === 0 ? commandTop : bodyTop,
-			height: index === 0 ? COMMAND_LINE_HEIGHT : bodyHeight,
+			height: index === 0 ? typographyMetrics().line.body : bodyHeight,
 			usedWidth: innerUsed,
 		})),
 		contentHeight,

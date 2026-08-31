@@ -32,7 +32,7 @@ import { useTranslation } from "react-i18next";
 import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "../../lib/api";
 import type { ChatAttachment } from "../../lib/api/chat";
 import { apiUrl } from "../../lib/base-path";
-import { useImageViewer } from "../common/ImageViewerProvider";
+import { useImageViewer } from "../common/image-viewer-context";
 import type { MeasuredChatAttachment } from "./measure-chat-message";
 
 /**

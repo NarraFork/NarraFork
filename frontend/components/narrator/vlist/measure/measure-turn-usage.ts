@@ -31,7 +31,7 @@ import {
 	type PreparedFixedBlock,
 	type RenderLod,
 } from "../prepared-block";
-import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight } from "../pretext-fonts";
+import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, typographyMetrics } from "../pretext-fonts";
 
 /** xs single-line box: round(12 × 1.4) = 17. */
 export const TURN_USAGE_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
@@ -70,7 +70,7 @@ function usageLineBlock(text: string, marginTop: number): PreparedFixedBlock {
 	return {
 		kind: "fixed",
 		marginTop,
-		height: TURN_USAGE_LINE_HEIGHT,
+		height: typographyMetrics().line.xs,
 		tag: "turn-usage-line",
 		data: { text },
 		contentLeft: 0,

@@ -31,7 +31,7 @@ import {
 	useUpsertModelCard,
 } from "../../hooks/useModelCards";
 import { formatLocaleNumber } from "../../lib/intl-format";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
 
 /** Tiers a card may declare. `none` is deliberately absent — see ModelCard docs. */
 const EFFORT_TIER_OPTIONS = ["low", "medium", "high", "xhigh", "max"] as const;

@@ -36,15 +36,12 @@ import type { MeasuredInjectionBubble } from "../measure/measure-injection-bubbl
 import {
 	INJECTION_BUBBLE_PADDING,
 	INJECTION_HEADER_HEIGHT,
-	INJECTION_NOTE_HEIGHT,
 } from "../measure/measure-injection-bubble";
-import { FONT_SIZE, LINE_HEIGHT, SANS_FAMILY } from "../pretext-fonts";
+import { typographyMetrics } from "../pretext-fonts";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { RenderSpecTask } from "./RenderSpecTask";
 import { RenderSystemSimple } from "./RenderSystemSimple";
 import { RenderSystemText } from "./RenderSystemText";
-
-const NOTE_FONT_SIZE = FONT_SIZE.xs;
 
 export interface RenderInjectionBubbleProps {
 	measured: MeasuredInjectionBubble;
@@ -164,9 +161,15 @@ export function RenderInjectionBubble({
 							top: measured.noteTop,
 							left: INJECTION_BUBBLE_PADDING,
 							right: INJECTION_BUBBLE_PADDING,
-							height: INJECTION_NOTE_HEIGHT,
-							font: `400 ${NOTE_FONT_SIZE}px ${SANS_FAMILY}`,
-							lineHeight: `${LINE_HEIGHT.xs}`,
+							height: typographyMetrics().line.xs,
+							// All three read live. Previously these were three different sources —
+							// a scaled `height`, a frozen 12px `font`, and a unitless baseline
+							// ratio for `lineHeight` — so the text stayed baseline-sized inside a
+							// scaled line box. `lineHeight` is also given in px on purpose: the
+							// `font` shorthand resets line-height to `normal`, so a unitless value
+							// here only worked because it happened to be declared afterwards.
+							font: typographyMetrics().font.xs,
+							lineHeight: `${typographyMetrics().line.xs}px`,
 							color: "var(--mantine-color-dimmed)",
 							overflow: "hidden",
 							whiteSpace: "nowrap",

@@ -1,48 +1,20 @@
 import { ActionIcon, Menu, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconCopy, IconDownload, IconRotate2, IconRotateClockwise2 } from "@tabler/icons-react";
-import { useCallback, useContext, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { copyImageSourceToClipboard, downloadImageSource } from "../../lib/image-actions";
-import { createSharedContext } from "../../lib/shared-context";
 import { Z } from "../../lib/z-index";
-import { PANZOOM_TOOLTIP_Z, PanZoomStage } from "./PanZoomStage";
-
-/**
- * Options describing the image to open in the fullscreen viewer.
+/*
+ * The context, its types and `useImageViewer` live in `image-viewer-context.ts`.
  *
- * `src` is the directly-displayable URL (blob:/data:/http(s)/relative). It is
- * used both for on-screen rendering and as the primary source for copy/download.
- * `savedPath` is an optional server-side file path used as a fallback source for
- * copy/download when `src` is a bounded preview that may not be the full image.
+ * A hook export beside this component makes the module an INVALID Fast Refresh boundary,
+ * and since this provider is mounted in `App.tsx`, that put the invalidation on the app
+ * shell's own path — shell edits became full page reloads. See that file's header.
  */
-export interface ImageViewerOptions {
-	src: string;
-	/** Optional server file path fetched via /api/fs/preview for copy/download. */
-	savedPath?: string | null;
-	/** Suggested download filename (extension optional). */
-	filename?: string | null;
-	/** Accessible alt text / title. */
-	alt?: string | null;
-}
-
-interface ImageViewerContextValue {
-	open: (options: ImageViewerOptions) => void;
-}
-
-/**
- * Registry-keyed so a Fast Refresh re-evaluation (or a duplicated production
- * chunk) cannot split provider and consumer across two context objects. The
- * viewer is opened from lazily-mounted subtrees — vlist rows, Dockview workspace
- * panels — that load long after `main.tsx` mounted the provider, which is exactly
- * where a fresh context object used to surface as "must be used within
- * ImageViewerProvider". See `lib/shared-context.ts`.
- */
-const ImageViewerContext = createSharedContext<ImageViewerContextValue | null>(
-	"common/ImageViewerProvider",
-	null,
-);
+import { ImageViewerContext, type ImageViewerOptions } from "./image-viewer-context";
+import { PANZOOM_TOOLTIP_Z, PanZoomStage } from "./PanZoomStage";
 
 function deriveFilename(options: ImageViewerOptions): string {
 	const fromName = options.filename?.split(/[\\/]/).pop()?.trim();
@@ -230,10 +202,4 @@ function ImageViewerOverlay({
 	);
 }
 
-export function useImageViewer() {
-	const ctx = useContext(ImageViewerContext);
-	if (!ctx) {
-		throw new Error("useImageViewer must be used within ImageViewerProvider");
-	}
-	return ctx.open;
-}
+// `useImageViewer` moved to `image-viewer-context.ts` — see the import comment above.

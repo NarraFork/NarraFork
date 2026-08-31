@@ -1,28 +1,19 @@
 /**
- * Workspace layout persistence + legacy migration for the Dockview-based workspace.
+ * Workspace ARRANGEMENT persistence for the Dockview-based workspace.
  *
- * The workspace row stores a JSON string in `workspaces.tree`. Historically this
- * was a NarraFork split-tree (`{ tree, presentation }`). We now persist Dockview's
- * native `SerializedDockview` wrapped with a small envelope so we can:
- *   - version the format,
- *   - carry NarraFork-specific presentation state (director mode),
- *   - detect + migrate legacy split-tree payloads on load.
+ * The workspace row stores a JSON string in `workspaces.tree`: Dockview's native
+ * `SerializedDockview` wrapped in a small versioned envelope that also carries
+ * NarraFork's presentation state (director mode).
+ *
+ * It records POSITIONS only. Which panels a workspace contains is membership, owned by
+ * `workspace_panels` and delivered separately — so a blob that is missing, stale or
+ * corrupt costs an arrangement and never a panel. Reading legacy shapes (split-tree,
+ * seed envelope) to recover membership is the server's job, done once in
+ * `recoverPanelsFromLayout`; this module no longer migrates them.
  */
 
 import type { Direction, DockviewApi, SerializedDockview } from "dockview-react";
-import {
-	isSeedEnvelope,
-	type SeedEnvelope,
-	type PanelSpec as SharedPanelSpec,
-} from "../panels/layout-envelope";
-import {
-	getAllLeaves,
-	leafPanelType,
-	parseWorkspaceLayout,
-	type SplitBranch,
-	type SplitLeaf,
-	type SplitNode,
-} from "../split-tree";
+import type { SeedEnvelope, PanelSpec as SharedPanelSpec } from "../panels/layout-envelope";
 import {
 	DEFAULT_DIRECTOR_PRIMARY_RATIO,
 	normalizeDirectorPrimaryRatio,
@@ -60,10 +51,17 @@ export type PanelSpec = SharedPanelSpec<WorkspacePanelParams>;
 /** A workspace seed envelope (api-free initial layout, e.g. from a sidebar drag). */
 export type WorkspaceSeedEnvelope = SeedEnvelope<WorkspacePanelParams>;
 
-/** Result of resolving a stored tree string into something we can render. */
+/**
+ * Result of resolving a stored tree string.
+ *
+ * `none` means "no usable arrangement", NOT "no panels": membership is a separate,
+ * authoritative input, so this outcome still renders every panel — just at default
+ * positions. The old `panels` variant (a client-side legacy migration) is gone; see
+ * `resolveWorkspaceLayout`.
+ */
 export type ResolvedLayout =
 	| { kind: "dockview"; layout: SerializedDockview; director: WorkspaceDirectorState }
-	| { kind: "panels"; panels: PanelSpec[]; director: WorkspaceDirectorState };
+	| { kind: "none"; director: WorkspaceDirectorState };
 
 // ── Seed construction ──
 
@@ -132,15 +130,22 @@ function isSerializedDockview(value: unknown): value is SerializedDockview {
 }
 
 /**
- * Resolve a stored tree string into a renderable layout.
+ * Resolve a stored tree string into a restorable ARRANGEMENT.
+ *
+ * Returns only what the layout blob legitimately carries now: a dockview layout to
+ * position panels with, plus director presentation state. It no longer materialises a
+ * panel LIST from legacy shapes (split-tree, seed envelope) — membership comes from
+ * `workspace_panels`, and the server's `recoverPanelsFromLayout` is what reads those
+ * legacy shapes, once, to backfill rows.
+ *
+ * Keeping a client-side legacy→panels path would have required inventing membership row
+ * ids on the client, which is precisely what `panelRowId` exists to prevent.
  *
  * Order of precedence:
  *   1. Dockview envelope (current format) → restore verbatim.
  *   2. Raw SerializedDockview (defensive) → wrap with default director state.
- *   3. Seed envelope (api-free initial layout, e.g. from a sidebar drag) →
- *      materialise its panel list imperatively.
- *   4. Legacy split-tree → migrate into a panel list ("extract & re-arrange").
- *   5. Anything else / parse failure → empty panel list.
+ *   3. Anything else (seed envelope, legacy split-tree, corrupt) → no arrangement;
+ *      the caller places every member at a default position.
  */
 export function resolveWorkspaceLayout(treeJson: string | null | undefined): ResolvedLayout {
 	if (treeJson) {
@@ -156,22 +161,13 @@ export function resolveWorkspaceLayout(treeJson: string | null | undefined): Res
 			if (isSerializedDockview(parsed)) {
 				return { kind: "dockview", layout: parsed, director: DEFAULT_DIRECTOR_STATE };
 			}
-			if (isSeedEnvelope(parsed)) {
-				return {
-					kind: "panels",
-					panels: (parsed as WorkspaceSeedEnvelope).seed,
-					director: DEFAULT_DIRECTOR_STATE,
-				};
-			}
 		} catch {
-			// fall through to legacy handling
+			// fall through to "no arrangement"
 		}
 	}
 
-	// Legacy split-tree (or empty) → extract panels and re-arrange.
-	const legacy = parseWorkspaceLayout(treeJson ?? "");
-	const panels = migrateLegacyTree(legacy.tree);
-	return { kind: "panels", panels, director: DEFAULT_DIRECTOR_STATE };
+	// No usable arrangement. Membership still renders in full, at default positions.
+	return { kind: "none", director: DEFAULT_DIRECTOR_STATE };
 }
 
 function normalizeDirector(value: unknown): WorkspaceDirectorState {
@@ -198,101 +194,21 @@ export function nextWorkspacePanelId(): string {
 	return `dvp_${Date.now().toString(36)}_${panelIdCounter.toString(36)}`;
 }
 
-function nextPanelId(): string {
-	return nextWorkspacePanelId();
-}
-
-/** Convert a legacy split-tree leaf into panel params (or null if unusable). */
-function leafToParams(leaf: SplitLeaf): { params: WorkspacePanelParams; title: string } | null {
-	const type = leafPanelType(leaf);
-	if (type === "terminal" && leaf.terminalConfig) {
-		return {
-			params: { panelType: "terminal", terminalConfig: leaf.terminalConfig },
-			title: "Terminal",
-		};
-	}
-	if (type === "webview" && leaf.webviewConfig) {
-		return {
-			params: { panelType: "webview", webviewConfig: leaf.webviewConfig },
-			title: leaf.webviewConfig.title || leaf.webviewConfig.url || "Webview",
-		};
-	}
-	if (type === "narrator" && leaf.narratorId) {
-		return {
-			params: { panelType: "narrator", narratorId: leaf.narratorId },
-			title: "Narrator",
-		};
-	}
-	return null;
-}
-
-/**
- * Migrate a legacy split-tree into an ordered list of PanelSpec.
- *
- * We preserve coarse split structure: the first leaf becomes the root panel,
- * and each subsequent leaf is placed relative to the previous panel using the
- * direction implied by its nearest branch (`horizontal` → right, `vertical` →
- * below). Exact size ratios are intentionally dropped (per migration decision).
- */
-export function migrateLegacyTree(tree: SplitNode): PanelSpec[] {
-	const specs: PanelSpec[] = [];
-	let previousId: string | null = null;
-
-	const walk = (node: SplitNode, dirFromParent: Direction) => {
-		if (node.type === "leaf") {
-			const resolved = leafToParams(node);
-			if (!resolved) return;
-			const id = nextPanelId();
-			specs.push({
-				id,
-				params: resolved.params,
-				title: resolved.title,
-				placement:
-					previousId === null
-						? { kind: "first" }
-						: { kind: "relative", referenceId: previousId, direction: dirFromParent },
-			});
-			previousId = id;
-			return;
-		}
-		const branch = node as SplitBranch;
-		const childDir: Direction = branch.direction === "horizontal" ? "right" : "below";
-		branch.children.forEach((child, idx) => {
-			// First child inherits the branch's own placement direction; siblings
-			// stack along the branch's split axis.
-			walk(child, idx === 0 ? dirFromParent : childDir);
-		});
-	};
-
-	walk(tree, "right");
-	return specs;
-}
-
-/**
- * Apply a resolved layout to a fresh DockviewApi.
- * For the "panels" case we build the layout imperatively via addPanel.
- */
-export function applyResolvedLayout(api: DockviewApi, resolved: ResolvedLayout): void {
-	if (resolved.kind === "dockview") {
-		api.fromJSON(resolved.layout);
-		return;
-	}
-	for (const spec of resolved.panels) {
-		api.addPanel({
-			id: spec.id,
-			component: componentForParams(spec.params),
-			title: spec.title,
-			params: spec.params,
-			position:
-				spec.placement.kind === "relative"
-					? {
-							referencePanel: spec.placement.referenceId,
-							direction: spec.placement.direction,
-						}
-					: undefined,
-		});
-	}
-}
+// ── Removed: client-side legacy migration ──
+//
+// `leafToParams` / `migrateLegacyTree` / `applyResolvedLayout` turned a legacy
+// split-tree into a panel list and added those panels directly. All three are gone:
+//
+//   - Membership is server-owned, and `recoverPanelsFromLayout`
+//     (`server/services/workspace-panel-service.ts`) already reads every legacy shape
+//     — split-tree, seed envelope, raw dockview — once, to backfill rows. Migrating
+//     again on the client produced panels with no membership row, which the surface
+//     then pruned on the next open and closed in the meantime.
+//   - Doing it here now requires inventing a `panelRowId` for terminal/webview panels,
+//     which is exactly what that required field exists to make impossible.
+//
+// The arrangement-only remnant of this path is `resolveWorkspaceLayout` returning
+// `kind: "none"`, after which the caller places every member at a default position.
 
 /** Map panel params to the registered Dockview component name. */
 export function componentForParams(params: WorkspacePanelParams): string {
@@ -314,45 +230,24 @@ export function componentForParams(params: WorkspacePanelParams): string {
 	}
 }
 
-/** Collect the narrator ids currently present in a resolved/legacy layout. */
-export function collectNarratorIdsFromTree(treeJson: string | null | undefined): string[] {
-	const legacy = parseWorkspaceLayout(treeJson ?? "");
-	return getAllLeaves(legacy.tree)
-		.filter((l) => leafPanelType(l) === "narrator" && l.narratorId)
-		.map((l) => l.narratorId as string);
-}
+// ── Removed: collectNarratorIdsFromTree ──
+//
+// Read the layout blob to answer "which narrators are in this workspace". That
+// question is now answered by membership (`workspace_panels`), and asking the layout
+// was unsound for exactly the reason this whole area was redesigned: the layout can
+// legitimately omit a member. Its one caller (the unmount `leaveNarrator` sweep) reads
+// the member list instead, so a subscription is no longer leaked for a narrator the
+// layout happened not to mention.
 
-// ── Pending-panel handoff ──
-// Lets the sidebar (or other callers) request that a panel be added to a
-// workspace without knowing anything about the Dockview layout format. The
-// DockviewWorkspace instance drains these when it mounts / becomes active.
-
-const pendingPanels = new Map<string, WorkspacePanelParams[]>();
-const pendingListeners = new Map<string, Set<() => void>>();
-
-/** Queue a panel to be added to a workspace the next time it is (re)opened. */
-export function queuePendingPanel(workspaceId: string, params: WorkspacePanelParams): void {
-	const list = pendingPanels.get(workspaceId) ?? [];
-	list.push(params);
-	pendingPanels.set(workspaceId, list);
-	// Notify any mounted workspace instance so it can drain immediately.
-	for (const fn of pendingListeners.get(workspaceId) ?? []) fn();
-}
-
-/** Drain and return any panels queued for a workspace. */
-export function drainPendingPanels(workspaceId: string): WorkspacePanelParams[] {
-	const list = pendingPanels.get(workspaceId) ?? [];
-	pendingPanels.delete(workspaceId);
-	return list;
-}
-
-/** Subscribe to pending-panel additions for a workspace; returns an unsubscribe. */
-export function onPendingPanel(workspaceId: string, fn: () => void): () => void {
-	const set = pendingListeners.get(workspaceId) ?? new Set();
-	set.add(fn);
-	pendingListeners.set(workspaceId, set);
-	return () => {
-		set.delete(fn);
-		if (set.size === 0) pendingListeners.delete(workspaceId);
-	};
-}
+// ── Removed: pending-panel handoff ──
+//
+// There used to be a module-level `Map` here that let the sidebar queue "add this
+// narrator panel" in MEMORY, to be drained when a `DockviewWorkspace` next mounted.
+// It was the direct cause of the "listed in the sidebar but no panel renders" bug:
+// the recent-tab row was persisted immediately while the panel existed only in this
+// map, so any interruption between the two — navigating away, a reload, a failed
+// layout save — left a sidebar child with no panel anywhere, permanently.
+//
+// Panels are now created through `POST /workspaces/:id/panels` BEFORE navigation, so
+// the membership row and its sidebar projection commit in one server transaction and
+// there is no in-memory intermediate state to lose.

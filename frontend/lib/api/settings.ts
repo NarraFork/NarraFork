@@ -243,6 +243,11 @@ export const settingsApi = {
 			showOutputStats: boolean;
 			terminalTheme: string;
 			terminalFontSize: number;
+			/** Narrator transcript typography, as percentages of the built-in defaults. */
+			narratorFontScalePercent: number;
+			narratorLetterSpacingPercent: number;
+			narratorLineHeightScalePercent: number;
+			narratorParagraphScalePercent: number;
 			addSubagentToRecentTabs: boolean;
 			recentTabsGroupMode: "flat" | "directory";
 			// Notification preferences
@@ -300,6 +305,10 @@ export const settingsApi = {
 		showOutputStats?: boolean;
 		terminalTheme?: string;
 		terminalFontSize?: number;
+		narratorFontScalePercent?: number;
+		narratorLetterSpacingPercent?: number;
+		narratorLineHeightScalePercent?: number;
+		narratorParagraphScalePercent?: number;
 		addSubagentToRecentTabs?: boolean;
 		recentTabsGroupMode?: "flat" | "directory";
 		// Notification preferences

@@ -27,6 +27,7 @@ import {
 	useComputedColorScheme,
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
+import { setTypography } from "@shared/pretext-layout/typography";
 import { isSessionInvalidResponse } from "@shared/session-auth";
 import {
 	IconAdjustmentsHorizontal,
@@ -104,7 +105,10 @@ import { HeaderSearchBox } from "./nav/HeaderSearchBox";
 import { NavOverflowMenu } from "./nav/NavOverflowMenu";
 import { NavUserMenu } from "./nav/NavUserMenu";
 import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
-import { isTabActive, RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
+import { RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
+// `isTabActive` comes from the logic module, not `RecentTabs.tsx`: a non-component export
+// there breaks its Fast Refresh boundary and turns tab-list edits into page reloads.
+import { isTabActive } from "./nav/recent-tabs-logic";
 import { useNavBadges } from "./nav/use-nav-badges";
 import { StartupRecoveryAlert } from "./StartupRecoveryAlert";
 import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
@@ -491,6 +495,33 @@ function AuthenticatedLayout() {
 			void changeAppLanguage(prefs.language, getNamespacesForPath(window.location.pathname));
 		}
 	}, [prefs?.language]);
+
+	// Publish the reader's narrator typography into the height model's parameter
+	// source. Done here (not in the narrator route) because `typography.ts` is a
+	// module singleton read by the measure layer: it must hold the right values BEFORE
+	// any transcript measures itself, otherwise the first paint uses the neutral
+	// setting and then re-measures the whole document a moment later.
+	//
+	// `setTypography` clamps, no-ops when nothing moved, and notifies its subscribers
+	// (the prepared cache drops entries; `usePretextDocument` rebuilds the committed
+	// layout with an anchor) — so nothing else is needed here. Values are only applied
+	// once prefs have loaded; `undefined` would clamp to the defaults and cause a
+	// visible reflow on every page load for anyone who changed a setting.
+	useEffect(() => {
+		if (!prefs) return;
+		setTypography({
+			fontScalePercent: prefs.narratorFontScalePercent,
+			letterSpacingPercent: prefs.narratorLetterSpacingPercent,
+			lineHeightScalePercent: prefs.narratorLineHeightScalePercent,
+			paragraphScalePercent: prefs.narratorParagraphScalePercent,
+		});
+	}, [
+		prefs,
+		prefs?.narratorFontScalePercent,
+		prefs?.narratorLetterSpacingPercent,
+		prefs?.narratorLineHeightScalePercent,
+		prefs?.narratorParagraphScalePercent,
+	]);
 
 	// Sync OLED mode data attribute on <html>
 	useEffect(() => {

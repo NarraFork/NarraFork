@@ -60,11 +60,18 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 
 		// Guard the render side by source inspection: a ratio-valued lineHeight in a
 		// capped body is exactly the regression this constant exists to prevent.
+		//
+		// The render side now reads `detailContentLineHeight()` rather than the frozen
+		// constant, because the line box follows the reader's line-spacing setting — but
+		// the invariant is unchanged: it must take the px line box from THIS module, so
+		// measure and render cannot disagree. A ratio would reintroduce the drift.
 		const source = await Bun.file(
 			new URL("../render/RenderToolCall.tsx", import.meta.url).pathname,
 		).text();
 		expect(source).not.toMatch(/lineHeight:\s*1\.4\b/);
-		expect(source).toContain("lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`");
+		expect(source).toContain("lineHeight: `${detailContentLineHeight()}px`");
+		// And the accessor must agree with the pinned baseline at neutral typography.
+		expect(m.detailContentLineHeight()).toBe(m.DETAIL_CONTENT_LINE_HEIGHT);
 	});
 
 	it("exposes the maxHeight cap table (code/term/diff=200, bash=60, media=400, streaming-bash=120)", async () => {

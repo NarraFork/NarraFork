@@ -336,6 +336,7 @@
 	"downloads": "下载",
 	"showHiddenDirs": "显示隐藏目录",
 	"hideHiddenDirs": "隐藏隐藏目录",
+	"symlinkDirectory": "指向目录的符号链接",
 	"editPath": "编辑路径",
 	"quickAccess": "快捷访问",
 	"favorites": "收藏夹",

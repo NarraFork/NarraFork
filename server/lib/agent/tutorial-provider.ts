@@ -34,6 +34,7 @@
 import {
 	getTutorialScript,
 	resolveTutorialTurn,
+	TUTORIAL_LESSON_BOUNDARY_BLOCK,
 	TUTORIAL_MODEL_ID,
 	TUTORIAL_PROVIDER_PREFIX,
 	type TutorialScript,
@@ -147,11 +148,25 @@ type Part =
 	| { type: "text"; text: string }
 	| { type: "thinking"; thinking: string }
 	| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
-	| { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean };
+	| { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }
+	/**
+	 * Where a lesson begins. Carried in this private encoding — not just read and
+	 * discarded — because the turn counter needs it at `chat()` time, and by then
+	 * the DB rows are long gone.
+	 */
+	| { type: "lesson_boundary"; lessonId?: string };
 
 interface Message {
 	role: "user" | "assistant";
 	content: Part[];
+}
+
+/** Index of the last message that opens a lesson, or -1 when there is none. */
+function lastLessonBoundaryIndex(history: Message[]): number {
+	for (let i = history.length - 1; i >= 0; i--) {
+		if (history[i]?.content?.some((part) => part?.type === "lesson_boundary")) return i;
+	}
+	return -1;
 }
 
 /**
@@ -162,11 +177,19 @@ interface Message {
  * by a tool-result user message and then the SAME script turn's continuation
  * would be wrong — the loop re-enters `chat()` after tool execution and must get
  * the NEXT turn, so assistant messages are the right unit.
+ *
+ * `from` skips everything before the current lesson's boundary. One tutorial
+ * narrator now spans every lesson (that continuity is the point — the user's
+ * learning session should read as one conversation), so without this the count
+ * would keep climbing across lessons and each new lesson would open on its
+ * `fallbackTurn` instead of turn 0. Nothing throws; the model just says the
+ * lesson is already over.
  */
-function countAssistantTurns(history: unknown[]): number {
+function countAssistantTurns(history: unknown[], from = 0): number {
 	let count = 0;
-	for (const entry of history as Message[]) {
-		if (entry?.role === "assistant") count++;
+	const messages = history as Message[];
+	for (let i = Math.max(0, from); i < messages.length; i++) {
+		if (messages[i]?.role === "assistant") count++;
 	}
 	return count;
 }
@@ -277,6 +300,18 @@ export class TutorialProvider implements ProviderAdapter {
 					.map((b) => b.text as string)
 					.join("\n") ||
 				(msg.contentText ?? "");
+			// A lesson boundary must survive into the built history, and it must survive
+			// even when the row has no text: `scriptTurnIndex` reads it to restart the
+			// count, and losing it silently makes every lesson after the first play its
+			// "this lesson is finished" fallback.
+			const boundary = blocks.find((b) => b.type === TUTORIAL_LESSON_BOUNDARY_BLOCK);
+			if (boundary) {
+				const lessonId = typeof boundary.lessonId === "string" ? boundary.lessonId : undefined;
+				const parts: Part[] = [{ type: "lesson_boundary", ...(lessonId ? { lessonId } : {}) }];
+				if (text) parts.push({ type: "text", text });
+				history.push({ role: "user", content: parts });
+				continue;
+			}
 			if (text) history.push({ role: "user", content: [{ type: "text", text }] });
 		}
 
@@ -329,6 +364,19 @@ export class TutorialProvider implements ProviderAdapter {
 			transport: "tutorial-script",
 			body: { lessonId: lessonId ?? null, turnIndex: index, model: params.model },
 		});
+
+		// Report zero context occupancy, and do it as a real measurement rather than
+		// leaving it unset.
+		//
+		// One tutorial narrator now spans every lesson, so its history genuinely grows.
+		// Left unreported, the loop falls back to estimating tokens against a 128k
+		// default and would eventually cross `compactStart` — which starts an auto
+		// compact on `settings.agent.summaryModel`, a REAL model this provider cannot
+		// redirect. That is the exact silent-billing failure the tutorial is built to
+		// avoid, and it would only appear for the users who finished the most lessons.
+		//
+		// there is no context window to occupy and no prompt to measure.
+		yield { contextUsagePercentage: 0 };
 
 		let outputIndex = 0;
 
@@ -470,6 +518,14 @@ const TUTORIAL_GENERATE_FALLBACK = "Tutorial session.";
  */
 export function scriptTurnIndex(history: unknown[]): number {
 	const messages = history as Message[];
+	const boundary = lastLessonBoundaryIndex(messages);
+	// Counting from the boundary makes the injected ack irrelevant by construction:
+	// the ack is prepended at index 1, always BEFORE any boundary, so it cannot be
+	// inside the counted range. Only a session with no boundary at all (the first
+	// lesson of a reused narrator, or a lesson started before this row existed)
+	// still needs the subtraction.
+	if (boundary >= 0) return countAssistantTurns(messages, boundary + 1);
+
 	const total = countAssistantTurns(messages);
 	const injected =
 		messages[1]?.role === "assistant" &&

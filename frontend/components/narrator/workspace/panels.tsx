@@ -13,6 +13,7 @@ import type { IDockviewPanelProps } from "dockview-react";
 import { lazy, Suspense, useCallback, useLayoutEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
+import { api as apiClient } from "../../../lib/api";
 import { PluginDockPanel } from "../../plugins/PluginDockPanel";
 import { NarratorDockContext } from "../dock/NarratorDockContext";
 import {
@@ -49,7 +50,11 @@ import {
 	type WorkspaceKnowledgePanelParams,
 	type WorkspacePanelParams,
 } from "./panel-types";
-import { useWorkspaceDirectorActive, useWorkspaceNarratorDockValue } from "./workspace-dock";
+import {
+	useWorkspaceDirectorActive,
+	useWorkspaceId,
+	useWorkspaceNarratorDockValue,
+} from "./workspace-dock";
 
 export type {
 	NarratorPanelParams,
@@ -254,12 +259,34 @@ function WebviewDockPanel(props: IDockviewPanelProps<WebviewPanelParams>) {
 	// Director overlay hosts the live webview instance; avoid a second mount.
 	const directorActive = useWorkspaceDirectorActive();
 
+	const workspaceId = useWorkspaceId();
+
 	const handleConfigChange = useCallback(
 		(config: WebviewLeafConfig) => {
-			props.api.updateParameters({ panelType: "webview", webviewConfig: config });
+			// Spread the live params rather than rebuilding them: a fresh object drops
+			// `panelRowId`, and without it this panel can no longer find the row that owns
+			// its config — every later edit would be layout-only.
+			props.api.updateParameters({ ...props.params, webviewConfig: config });
 			if (config.title?.trim()) props.api.setTitle(config.title.trim());
+			// The config is row state, not arrangement. Writing only the layout blob meant
+			// the edit survived until the layout was discarded (a revision conflict, a
+			// corrupt tree) and then silently reverted to the previous URL.
+			const panelRowId = props.params.panelRowId;
+			if (!workspaceId || !panelRowId) return;
+			void apiClient
+				.updateWorkspacePanelConfig(workspaceId, panelRowId, {
+					panelType: "webview",
+					webviewConfig: config,
+				})
+				.catch((error) => {
+					console.warn("[workspace] failed to persist webview config", {
+						workspaceId,
+						panelRowId,
+						error,
+					});
+				});
 		},
-		[props.api],
+		[props.api, props.params, workspaceId],
 	);
 
 	if (directorActive) return null;

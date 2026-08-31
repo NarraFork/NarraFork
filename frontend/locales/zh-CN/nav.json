@@ -67,6 +67,7 @@
 	"retryRecentTabs": "重试",
 	"recentTabsSyncError": "最近标签同步失败",
 	"recentTabsReorderFailed": "标签顺序保存失败",
+	"workspaceAddPanelFailed": "无法将该叙述者加入工作区",
 	"recentTabsGrouping": "标签分组方式",
 	"groupModeFlat": "平铺列表",
 	"groupModeDirectory": "按目录聚合",

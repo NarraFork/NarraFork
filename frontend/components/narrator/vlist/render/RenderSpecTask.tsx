@@ -43,10 +43,8 @@ import {
 } from "@tabler/icons-react";
 import type { ComponentType } from "react";
 import {
-	SPEC_TASK_FONT,
 	SPEC_TASK_GLYPH,
 	SPEC_TASK_GLYPH_GAP,
-	SPEC_TASK_LINE_HEIGHT,
 	SPEC_TASK_LOCK,
 	SPEC_TASK_LOCK_GAP,
 	SPEC_TASK_ROW_GAP,
@@ -56,6 +54,7 @@ import {
 	specTaskRows,
 } from "../measure/measure-spec-task";
 import type { MeasuredElement } from "../prepared-block";
+import { typographyMetrics } from "../pretext-fonts";
 
 /**
  * Glyph per Dynamic Spec role, matching the tool card's task list so the two read as
@@ -96,7 +95,7 @@ export function RenderSpecTask({
 				c="dimmed"
 				style={{
 					width: measured.contentWidth,
-					lineHeight: `${SPEC_TASK_LINE_HEIGHT}px`,
+					lineHeight: `${typographyMetrics().line.xs}px`,
 					whiteSpace: "pre-wrap",
 					overflowWrap: "anywhere",
 				}}
@@ -155,7 +154,7 @@ function SpecTaskRowView({
 				gap={SPEC_TASK_LOCK_GAP}
 				wrap="nowrap"
 				align="center"
-				style={{ flexShrink: 0, height: SPEC_TASK_LINE_HEIGHT }}
+				style={{ flexShrink: 0, height: typographyMetrics().line.xs }}
 			>
 				<ThemeIcon size={SPEC_TASK_GLYPH} variant="light" color={color} radius="xl">
 					<Icon size={10} className={spinning ? "vlist-spin" : undefined} />
@@ -175,8 +174,8 @@ function SpecTaskRowView({
 					// saw, while the frame's height is already pinned.
 					flex: "0 0 auto",
 					width: textWidth,
-					font: SPEC_TASK_FONT,
-					lineHeight: `${SPEC_TASK_LINE_HEIGHT}px`,
+					font: typographyMetrics().font.xs,
+					lineHeight: `${typographyMetrics().line.xs}px`,
 					whiteSpace: "pre-wrap",
 					overflowWrap: "anywhere",
 					color: blocked ? "var(--mantine-color-orange-6)" : undefined,

@@ -186,7 +186,8 @@ export interface NarratorExecutionDevice {
 /** One level of a remote device's directory tree, in that device's path syntax. */
 export interface RemoteDirectoryListing {
 	path: string;
-	entries: Array<{ name: string; path: string; isDirectory: boolean }>;
+	/** `isSymlink` is absent on executors predating symlink resolution. */
+	entries: Array<{ name: string; path: string; isDirectory: boolean; isSymlink?: boolean }>;
 	parent: string | null;
 	sep: string;
 	truncated: boolean;

@@ -66,6 +66,21 @@ interface MutationOptions {
 	undoTabs?: PersistedRecentTab[];
 	workspaceIdsToDelete?: string[];
 	deferredWorkspaceIds?: string[];
+	/**
+	 * Extra work to run INSIDE the same transaction that persists the tab rows.
+	 *
+	 * This exists so workspace membership and its sidebar projection commit
+	 * together. Writing them as two requests is what allowed a persisted sidebar
+	 * tab to coexist with a panel that was never stored anywhere, and no amount of
+	 * client-side reconciliation can close that window from outside a transaction.
+	 *
+	 * Runs even when the tab rows themselves need no change: "the projection
+	 * already matches" is a normal outcome (re-adding a panel for a narrator whose
+	 * tab is already attached), and skipping the membership write in that case
+	 * would drop the caller's actual work.
+	 */
+	// biome-ignore lint/suspicious/noExplicitAny: Drizzle transaction type is private to the driver.
+	inTransaction?: (tx: any) => void;
 }
 
 interface MutationState {
@@ -815,6 +830,16 @@ function persistMutationLocked(
 	options: MutationOptions = {},
 ): RecentTabsMutationResult {
 	if (tabsEqual(before, after)) {
+		// The tab rows need no change, but `inTransaction` work still has to run and
+		// still has to be atomic — see the field's note. Without this branch, adding a
+		// panel for a narrator whose sidebar tab was already attached would silently
+		// perform no membership write at all.
+		if (options.inTransaction) {
+			const runInTransaction = options.inTransaction;
+			db.transaction((tx) => {
+				runInTransaction(tx);
+			});
+		}
 		return {
 			changed: false,
 			baseRevision,
@@ -828,6 +853,9 @@ function persistMutationLocked(
 	const now = new Date().toISOString();
 	db.transaction((tx) => {
 		applyRowDiffInTransaction(tx, userId, after, oldRows, now);
+		// Before the meta/revision write so a throw from the caller's work aborts the
+		// whole thing, leaving neither the membership change nor a bumped revision.
+		options.inTransaction?.(tx);
 		tx.update(userRecentTabsMeta)
 			.set({ revision, updatedAt: now })
 			.where(eq(userRecentTabsMeta.userId, userId))
@@ -1059,6 +1087,52 @@ export async function upsertRecentTab(
 			...(options.afterKey ? { afterKey: options.afterKey } : {}),
 		},
 	]);
+}
+
+/**
+ * Attach or detach one narrator's sidebar tab from a workspace group, running
+ * the caller's own membership write in the SAME transaction.
+ *
+ * This is the only way `workspace_panels` and `user_recent_tabs.workspace_id`
+ * are allowed to change together. The membership row is the authority; this
+ * function maintains its sidebar projection so the two cannot diverge — which is
+ * precisely what happened while a client wrote the tab and separately hoped a
+ * panel would be persisted later.
+ *
+ * `attach` is expressed as an update-only upsert: the tab must already exist for
+ * it to join a group. A narrator with no sidebar tab still becomes a real panel
+ * (membership does not depend on the projection); it simply has no row to move,
+ * and the tab it later acquires is created attached.
+ */
+export async function applyWorkspaceMembershipProjection(
+	userId: string,
+	input: {
+		narratorId: string;
+		/** Target workspace, or null to release the tab back to the top level. */
+		workspaceId: string | null;
+		// biome-ignore lint/suspicious/noExplicitAny: Drizzle transaction type is private to the driver.
+		inTransaction: (tx: any) => void;
+	},
+): Promise<RecentTabsMutationResult> {
+	return userPreferencesLock.acquire(userId, async () => {
+		const baseRevision = ensureMigratedLocked(userId);
+		const oldRows = readRows(userId);
+		const before = oldRows.map(rowToTab);
+		const after = before.map((tab) => {
+			if (getTabNarratorId(tab) !== input.narratorId) return cloneTab(tab);
+			const next = cloneTab(tab);
+			if (input.workspaceId === null) delete next.workspaceId;
+			else next.workspaceId = input.workspaceId;
+			return next;
+		});
+		// `regroupWorkspaces` (inside normalizeAndLimitTabs, via persistMutationLocked's
+		// caller contract) keeps a header and its children contiguous, so the moved tab
+		// lands in the right group without this function knowing the ordering rules.
+		const normalized = normalizeAndLimitTabs(after);
+		return persistMutationLocked(userId, oldRows, before, normalized.tabs, baseRevision, {
+			inTransaction: input.inTransaction,
+		});
+	});
 }
 
 export async function removeRecentTab(

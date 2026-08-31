@@ -42,7 +42,6 @@ import {
 } from "@tabler/icons-react";
 import { useMemo } from "react";
 import {
-	BODY_LINE_HEIGHT,
 	CARD_PADDING,
 	GROUP_GAP,
 	ICON_16,
@@ -54,6 +53,7 @@ import {
 	type SystemTextKind,
 } from "../measure/measure-system-text";
 import type { MeasuredElement, PreparedCodeBlock } from "../prepared-block";
+import { typographyMetrics } from "../pretext-fonts";
 
 /** Matches the original SYSTEM_MESSAGE_BG in MessageBubble.tsx (copied, not imported). */
 const SYSTEM_MESSAGE_BG = "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))";
@@ -442,7 +442,13 @@ function SegmentFailedCard({
 			<Group gap={GROUP_GAP} wrap="nowrap" align="flex-start" h="100%">
 				<IconAlertTriangle size={ICON_16} style={{ flexShrink: 0, color: cssColor("red", 7) }} />
 				<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
-					<Text size="xs" fw={600} c="red.8" style={{ height: BODY_LINE_HEIGHT }} lineClamp={1}>
+					<Text
+						size="xs"
+						fw={600}
+						c="red.8"
+						style={{ height: typographyMetrics().line.xs }}
+						lineClamp={1}
+					>
 						{data.title ?? ""}
 					</Text>
 					<SystemTextBody body={body} width={width} font={font} color={cssColor("red", 9)} />
@@ -459,7 +465,7 @@ function SegmentFailedCard({
 
 // ── origin_notice: Stack(heading row [icon + source + time] + body) ──────────
 // Geometry mirrors measure-system-text's origin_notice chrome:
-// preBody = BODY_LINE_HEIGHT (heading row) + ORIGIN_HEADING_GAP, no side chrome.
+// preBody = the xs heading row + ORIGIN_HEADING_GAP, no side chrome.
 function OriginNoticeCard({
 	body,
 	width,
@@ -483,7 +489,7 @@ function OriginNoticeCard({
 			style={{ backgroundColor: SYSTEM_MESSAGE_BG, height, boxSizing: "border-box" }}
 		>
 			<Stack gap={ORIGIN_HEADING_GAP} style={{ minWidth: 0 }}>
-				<Group gap={GROUP_GAP} wrap="nowrap" style={{ height: BODY_LINE_HEIGHT }}>
+				<Group gap={GROUP_GAP} wrap="nowrap" style={{ height: typographyMetrics().line.xs }}>
 					<IconRepeat
 						size={13}
 						stroke={1.6}
@@ -506,7 +512,11 @@ function OriginNoticeCard({
 								variant="subtle"
 								c="dimmed"
 								ml={timeLabel ? undefined : "auto"}
-								style={{ flexShrink: 0, height: BODY_LINE_HEIGHT, minHeight: BODY_LINE_HEIGHT }}
+								style={{
+									flexShrink: 0,
+									height: typographyMetrics().line.xs,
+									minHeight: typographyMetrics().line.xs,
+								}}
 								aria-label={guardActions.dismissLabel}
 								disabled={!guardActions.onDismiss || guardActions.dismissing === true}
 								onClick={guardActions.onDismiss}

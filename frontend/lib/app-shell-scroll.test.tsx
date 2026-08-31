@@ -123,8 +123,13 @@ describe("authenticated AppShell scroll contract", () => {
 			"@tanstack/router-core",
 			Bun.pathToFileURL(Bun.resolveSync("@tanstack/react-router", import.meta.dir)).href,
 		);
-		const [mainSource, restorationBundle] = await Promise.all([
-			Bun.file(new URL("../main.tsx", import.meta.url)).text(),
+		// `App.tsx`, not `main.tsx`: the router is constructed there (the tree was moved out
+		// of the entry so Fast Refresh has a valid boundary — see App.tsx's header). Reading
+		// the entry instead would make both `not.toContain` assertions pass on a file that
+		// no longer mentions the router at all, so the `createRouter(` check below keeps this
+		// honest rather than vacuously green.
+		const [appSource, restorationBundle] = await Promise.all([
+			Bun.file(new URL("../App.tsx", import.meta.url)).text(),
 			Bun.file(new URL("./scroll-restoration.js", routerCoreEntry)).text(),
 		]);
 
@@ -135,8 +140,9 @@ describe("authenticated AppShell scroll contract", () => {
 		// No selector-level exclusion exists, which is what makes "just enable it" unsafe.
 		expect(restorationBundle).not.toContain("ignoreScrollSelectors");
 		// Therefore the router must never opt in.
-		expect(mainSource).not.toContain("scrollRestoration:");
-		expect(mainSource).not.toContain("scrollToTopSelectors:");
+		expect(appSource).toContain("createRouter(");
+		expect(appSource).not.toContain("scrollRestoration:");
+		expect(appSource).not.toContain("scrollToTopSelectors:");
 	});
 
 	test("real Router PUSH resets only Main and POP restores it without touching narrator scroll", async () => {

@@ -36,8 +36,8 @@ import {
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { CopyButton } from "../../components/common/CopyButton";
+import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import {
 	useDeletePasskey,
 	useIdentities,

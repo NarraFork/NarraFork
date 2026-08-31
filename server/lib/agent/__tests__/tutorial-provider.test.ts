@@ -14,7 +14,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { TUTORIAL_MODEL, TUTORIAL_PROVIDER_PREFIX } from "@shared/tutorial/lessons";
+import {
+	TUTORIAL_LESSON_BOUNDARY_BLOCK,
+	TUTORIAL_MODEL,
+	TUTORIAL_PROVIDER_PREFIX,
+} from "@shared/tutorial/lessons";
 import type { ChatParams, ParsedStreamEvent } from "../provider";
 import {
 	type DEFAULT_TUTORIAL_PACING,
@@ -126,6 +130,50 @@ describe("scriptTurnIndex", () => {
 		provider.pushAssistantTurn(history, "", []);
 		expect(scriptTurnIndex(history)).toBe(1);
 	});
+
+	test("a lesson boundary restarts the count at 0", () => {
+		// The whole reason the boundary exists. One tutorial narrator spans every
+		// lesson, so without this a lesson opened after a few others would report a
+		// double-digit index and play its `fallbackTurn` ("this script is finished")
+		// with nothing to indicate why.
+		const provider = new TutorialProvider();
+		const history: unknown[] = [];
+		provider.injectSystemPrompt(history, "sys", TUTORIAL_MODEL);
+		for (let i = 0; i < 6; i++) {
+			provider.pushUserTurn(history, `msg ${i}`, TUTORIAL_MODEL, []);
+			provider.pushAssistantTurn(history, `answer ${i}`, []);
+		}
+		expect(scriptTurnIndex(history)).toBe(6);
+
+		history.push({
+			role: "user",
+			content: [{ type: "lesson_boundary", lessonId: "permissions" }],
+		});
+		expect(scriptTurnIndex(history)).toBe(0);
+	});
+
+	test("turns after a boundary advance from that boundary", () => {
+		const provider = new TutorialProvider();
+		const history: unknown[] = [];
+		provider.pushAssistantTurn(history, "old lesson", []);
+		history.push({ role: "user", content: [{ type: "lesson_boundary" }] });
+		provider.pushUserTurn(history, "hi", TUTORIAL_MODEL, []);
+		provider.pushAssistantTurn(history, "new lesson turn 0", []);
+		expect(scriptTurnIndex(history)).toBe(1);
+	});
+
+	test("the LAST boundary wins", () => {
+		// Every lesson start writes one, so a session that has run several holds
+		// several. Counting from the first would make the newest lesson resume at the
+		// accumulated index — the exact failure the boundary was added to remove.
+		const provider = new TutorialProvider();
+		const history: unknown[] = [];
+		history.push({ role: "user", content: [{ type: "lesson_boundary", lessonId: "a" }] });
+		provider.pushAssistantTurn(history, "a-0", []);
+		provider.pushAssistantTurn(history, "a-1", []);
+		history.push({ role: "user", content: [{ type: "lesson_boundary", lessonId: "b" }] });
+		expect(scriptTurnIndex(history)).toBe(0);
+	});
 });
 
 describe("TutorialProvider.buildHistory", () => {
@@ -207,6 +255,72 @@ describe("TutorialProvider.buildHistory", () => {
 		];
 		const { trailingToolResults } = await provider.buildHistory(rows, TUTORIAL_MODEL);
 		expect(trailingToolResults[0]).toMatchObject({ is_error: true });
+	});
+
+	test("a persisted lesson boundary row restarts the turn count", async () => {
+		// End-to-end for the reuse: the boundary is written as a `sys` row by
+		// `tutorial-service`, and it only works if `buildHistory` carries it through to
+		// the history the turn counter reads. Dropping it here is invisible — the
+		// lesson simply answers that its script is already finished.
+		const provider = new TutorialProvider();
+		const rows: DbMessage[] = [
+			{
+				id: "m1",
+				role: "user",
+				contentJson: [{ type: "text", text: "earlier lesson" }],
+				contentText: "earlier lesson",
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+			{
+				id: "m2",
+				role: "assistant",
+				contentJson: [{ type: "text", text: "earlier answer" }],
+				contentText: "earlier answer",
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+			{
+				id: "m3",
+				role: "sys",
+				contentJson: [
+					{ type: "text", text: "A new tutorial lesson starts here." },
+					{ type: TUTORIAL_LESSON_BOUNDARY_BLOCK, lessonId: "permissions" },
+				],
+				contentText: "A new tutorial lesson starts here.",
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+		];
+		const { history } = await provider.buildHistory(rows, TUTORIAL_MODEL);
+		expect(scriptTurnIndex(history)).toBe(0);
+	});
+
+	test("a boundary row with no text still marks the boundary", async () => {
+		// `deliverInjection` refuses empty content today, so this row shape should not
+		// occur — but the boundary must not depend on text surviving, because losing it
+		// silently rewinds the lesson to its fallback line.
+		const provider = new TutorialProvider();
+		const rows: DbMessage[] = [
+			{
+				id: "m1",
+				role: "assistant",
+				contentJson: [{ type: "text", text: "earlier answer" }],
+				contentText: "earlier answer",
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+			{
+				id: "m2",
+				role: "sys",
+				contentJson: [{ type: TUTORIAL_LESSON_BOUNDARY_BLOCK, lessonId: "permissions" }],
+				contentText: null,
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+		];
+		const { history } = await provider.buildHistory(rows, TUTORIAL_MODEL);
+		expect(scriptTurnIndex(history)).toBe(0);
 	});
 });
 

@@ -6256,6 +6256,13 @@ export async function reExecuteDeniedToolCall(
 					toolUseId: event.toolUseId,
 					elapsed: event.elapsed,
 				});
+			} else if (event.type === "tool_structured_progress") {
+				broadcastToNarrator(narratorId, {
+					type: "tool_structured_progress",
+					narratorId,
+					toolUseId: event.toolUseId,
+					progress: event.progress,
+				});
 			} else if (event.type === "tool_long_running") {
 				broadcastToNarrator(narratorId, {
 					type: "tool_long_running",

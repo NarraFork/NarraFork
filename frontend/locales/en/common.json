@@ -336,6 +336,7 @@
 	"downloads": "Downloads",
 	"showHiddenDirs": "Show hidden directories",
 	"hideHiddenDirs": "Hide hidden directories",
+	"symlinkDirectory": "Symbolic link to a directory",
 	"editPath": "Edit path",
 	"quickAccess": "Quick Access",
 	"favorites": "Favorites",

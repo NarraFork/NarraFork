@@ -108,14 +108,106 @@ describe("entries collapsed for width stay accounted for", () => {
 		expect(panel).toContain("hiddenDefs={toolbarHiddenDefs}");
 		expect(panel).toContain("noRoomIds={toolbarNoRoomIds}");
 		expect(menu).toContain("aggregateOverflowBadge(hiddenDefs ?? tuckedDefs, badgeCounts)");
-		expect(menu).toContain('t("toolbar.hiddenNoRoom")');
 	});
 
-	it("the no-room hint exists in both locales", async () => {
+	/**
+	 * The width shortfall is stated ONCE under the section heading, not per row.
+	 * A per-row caption was the first attempt and it read badly: the header fits two
+	 * entries on a phone, so all nine remaining rows carried the same words, which
+	 * turned the caption into noise and buried the dimming that actually carries the
+	 * meaning. A future edit that re-adds a per-row hint would regress that quietly,
+	 * since nothing about it errors.
+	 */
+	it("states the width shortfall once per section, not once per row", async () => {
+		const menu = await overflowMenu();
+		expect(menu).toContain('t("toolbar.someHiddenNoRoom")');
+		expect(menu).toContain("{anyNoRoom ?");
+		expect(menu).not.toContain("noRoomHint");
+
+		// The note is a property of the section, so it must be resolved from all
+		// surfaced entries rather than inside the row loop.
+		const noteAt = menu.indexOf('t("toolbar.someHiddenNoRoom")');
+		const loopAt = menu.indexOf("{listedEntries.map(");
+		expect(noteAt).toBeGreaterThan(-1);
+		expect(noteAt).toBeLessThan(loopAt);
+	});
+
+	it("dimming is what marks a row as absent from the header", async () => {
+		const menu = await overflowMenu();
+		// With the caption gone this is the only per-row signal left, so losing it
+		// would make a collapsed entry indistinguishable from a surfaced one.
+		expect(menu).toContain('color: tucked ? "var(--mantine-color-dimmed)" : undefined');
+	});
+
+	it("the section note exists in both locales", async () => {
 		for (const locale of ["en", "zh-CN"]) {
 			const json = await read(`../../locales/${locale}/narrator.json`);
-			expect(JSON.parse(json).toolbar.hiddenNoRoom).toBeTruthy();
+			const toolbar = JSON.parse(json).toolbar;
+			expect(toolbar.someHiddenNoRoom).toBeTruthy();
+			expect(toolbar.hiddenNoRoom).toBeUndefined();
 		}
+	});
+});
+
+/**
+ * The self-contained controls (detail level, execution device, plugin picker)
+ * render their own Menu in the header, so the overflow menu cannot "activate"
+ * them. It used to list them as a dead row labelled "header only" — and on a phone
+ * the header keeps two icons while everything else lives in that menu, so those
+ * controls had NO reachable entry point at all.
+ *
+ * They now expand their options inline. Every way of breaking that reverts to the
+ * dead row (or to an unscrollable list) without raising anything.
+ */
+describe("self-contained controls are reachable from the overflow menu", () => {
+	it("the menu renders inline options instead of a header-only hint", async () => {
+		const menu = await overflowMenu();
+		expect(menu).toContain("renderInlineOptions");
+		expect(menu).toContain("<Collapse expanded={!!expanded}");
+		// A collapsed row must not mount its options: the plugin list fetches on mount,
+		// so keeping it mounted would make merely opening this menu do that work.
+		expect(menu).toContain("keepMounted={false}");
+		// The hint string is gone on purpose: keeping it would keep asserting
+		// "this only works from the header", which is no longer true.
+		expect(menu).not.toContain("toolbar.headerOnly");
+	});
+
+	it("the hint key is removed from both locales", async () => {
+		for (const locale of ["en", "zh-CN"]) {
+			const json = await read(`../../locales/${locale}/narrator.json`);
+			const toolbar = JSON.parse(json).toolbar;
+			expect(toolbar.headerOnly).toBeUndefined();
+			// The chevron's accessible name.
+			expect(toolbar.expandOptions).toBeTruthy();
+		}
+	});
+
+	it("the panel supplies options for every self-contained registry id", async () => {
+		const panel = await narratorPanel();
+		expect(panel).toContain("renderInlineOptions={renderToolbarInlineOptions}");
+		const start = panel.indexOf("const renderToolbarInlineOptions");
+		expect(start).toBeGreaterThan(-1);
+		const body = panel.slice(start, panel.indexOf("if (!narrator) return", start));
+		// An unhandled id falls through to `null`, which silently restores the dead row.
+		for (const id of ["device", "lodlevel", "plugins"]) {
+			expect(body).toContain(`case "${id}":`);
+		}
+	});
+
+	it("keeps the drag listeners off the node that wraps the expansion", async () => {
+		const menu = await overflowMenu();
+		const rowStart = menu.indexOf("function SortableRow");
+		const rowEnd = menu.indexOf("function SortableDivider");
+		expect(rowStart).toBeGreaterThan(-1);
+		const row = menu.slice(rowStart, rowEnd);
+		// `touch-action: none` on an ancestor of the expansion makes a long device or
+		// plugin list unscrollable on touch — the platform this whole change is for.
+		const nodeRefAt = row.indexOf("ref={setNodeRef}");
+		const listenersAt = row.indexOf("{...listeners}");
+		const groupAt = row.indexOf("<Group");
+		expect(nodeRefAt).toBeGreaterThan(-1);
+		expect(listenersAt).toBeGreaterThan(groupAt);
+		expect(row.slice(nodeRefAt, groupAt)).not.toContain("touchAction");
 	});
 });
 

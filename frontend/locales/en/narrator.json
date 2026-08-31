@@ -1095,11 +1095,13 @@
 		"statusContinued": "continued and running",
 		"statusChildRunning": "background work running ({{count}})",
 		"statusCompleted": "completed",
+		"statusPaused": "paused",
 		"statusCancelled": "cancelled",
 		"statusFailed": "failed",
 		"statusTimeout": "timed out",
 		"agentTask": "Agent",
 		"bashTask": "Command",
+		"transferTask": "Transfer",
 		"commandLabel": "Command",
 		"outputLabel": "Output",
 		"outputLive": "live",
@@ -1137,7 +1139,8 @@
 			"spec_fork_carryover": "Outline carried over",
 			"spec_context_cleared": "Context cleared",
 			"review_feedback": "Code review",
-			"interrupt_task_guard": "Interrupted-task reminder"
+			"interrupt_task_guard": "Interrupted-task reminder",
+			"tutorial_lesson": "Tutorial lesson"
 		},
 		"cadence": {
 			"everyNTools": "every {{n}} tool calls"
@@ -1219,8 +1222,8 @@
 		"more": "More tools",
 		"sectionVisible": "Shown in header",
 		"sectionTucked": "In this menu",
-		"headerOnly": "Header only",
-		"hiddenNoRoom": "No room"
+		"expandOptions": "Show options",
+		"someHiddenNoRoom": "Dimmed entries did not fit the header"
 	},
 	"spec": {
 		"title": "Outline",
@@ -1348,5 +1351,19 @@
 		"readOnlyNotice": "Only the owner or an administrator can change sharing.",
 		"unavailable": "Sharing settings are unavailable for this session.",
 		"denied": "You no longer have access to this session."
+	},
+	"appearance": {
+		"title": "Typography",
+		"intro": "Adjust how this transcript is set. Changes apply as you drag.",
+		"fontScale": "Font size",
+		"fontScaleDesc": "Scales body text, headings, code and labels together.",
+		"letterSpacing": "Letter spacing",
+		"letterSpacingDesc": "Extra space between characters, as a share of the font size.",
+		"paragraphScale": "Paragraph spacing",
+		"paragraphScaleDesc": "Gaps between paragraphs, lists, code blocks and messages.",
+		"reset": "Reset to defaults",
+		"scopeNote": "Applies to the conversation text only, on every device you sign in from.",
+		"lineHeight": "Line spacing",
+		"lineHeightDesc": "Spacing between lines inside a paragraph."
 	}
 }

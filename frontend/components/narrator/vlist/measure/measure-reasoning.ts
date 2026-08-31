@@ -47,7 +47,13 @@ import {
 	type PreparedBlock,
 	type RenderLod,
 } from "../prepared-block";
-import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts";
+import {
+	FONT_SIZE,
+	LINE_HEIGHT,
+	lineBoxHeight,
+	SPACING,
+	typographyMetrics,
+} from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 
 // ── Chrome constants (px) — from CONTRACT.md §4 + ReasoningBlock / CountLine ──
@@ -65,7 +71,7 @@ export const REASONING_XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.
  * the header of the expanded form: py*2 + max(icon lane, xs text line).
  */
 export const REASONING_HEADER_ROW_HEIGHT =
-	REASONING_ROW_PADDING_Y * 2 + Math.max(REASONING_ICON_SIZE, REASONING_XS_LINE_HEIGHT);
+	REASONING_ROW_PADDING_Y * 2 + Math.max(REASONING_ICON_SIZE, typographyMetrics().line.xs);
 
 /** ReasoningCountLine row height (identical structure to the header row). */
 export const REASONING_COUNT_LINE_HEIGHT = REASONING_HEADER_ROW_HEIGHT;
@@ -84,7 +90,7 @@ export const REASONING_BODY_BORDER_LEFT = 2;
  */
 export const REASONING_TRANSLATION_TOGGLE_MARGIN_TOP = 4;
 export const REASONING_TRANSLATION_TOGGLE_HEIGHT =
-	REASONING_TRANSLATION_TOGGLE_MARGIN_TOP + REASONING_XS_LINE_HEIGHT;
+	REASONING_TRANSLATION_TOGGLE_MARGIN_TOP + typographyMetrics().line.xs;
 
 /** The four visual forms of a reasoning block. */
 export type ReasoningForm = "streaming" | "count" | "collapsed" | "expanded";

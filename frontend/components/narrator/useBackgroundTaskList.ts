@@ -16,6 +16,7 @@
 
 import type { BackgroundTaskListDelta, BackgroundTaskListItem } from "@shared/background-task-list";
 import { BACKGROUND_TASK_LIST_PAGE_SIZE } from "@shared/background-task-list";
+import { readToolProgressPayload, type ToolProgressPayload } from "@shared/tool-progress";
 import { type InfiniteData, useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { api } from "../../lib/api";
@@ -126,6 +127,50 @@ export function useBackgroundTaskList(
 	const reloadRef = useRef(reload);
 	reloadRef.current = reload;
 
+	/**
+	 * Merge a live transfer progress snapshot into a row already in the cache.
+	 *
+	 * Deliberately NOT routed through `applyDelta`. That reducer enforces a
+	 * contiguous version sequence and refetches the first page whenever a number is
+	 * skipped — correct for structural changes, ruinous for a frame that fires ~2×/s
+	 * per active transfer (every dropped frame would cost a full page refetch).
+	 *
+	 * Safe to apply unordered because each payload is a complete snapshot and this
+	 * only ever *updates* a row: it cannot insert, remove or reorder anything, so it
+	 * can never desynchronize the paging window. A frame for an unknown row is
+	 * ignored — the row arrives through the ordinary delta channel, which brings its
+	 * own progress with it.
+	 */
+	const applyProgress = useCallback(
+		(taskId: string, progress: ToolProgressPayload, listEpoch: string) => {
+			qc.setQueryData<BackgroundTaskInfiniteData>(queryKey, (old) => {
+				if (!old) return old;
+				// Epoch-gated like a delta: a frame minted by a different server process
+				// addresses a row set this client no longer holds. Checked inside the
+				// updater so the cache is read once, under the same lock as the write.
+				const cachedEpoch = old.pages[0]?.listEpoch;
+				if (cachedEpoch && listEpoch !== cachedEpoch) return old;
+				let changed = false;
+				const pages = old.pages.map((page) => {
+					const patchList = (list: BackgroundTaskListItem[] | undefined) => {
+						if (!list?.some((task) => task.id === taskId)) return list;
+						changed = true;
+						return list.map((task) => (task.id === taskId ? { ...task, progress } : task));
+					};
+					const tasks = patchList(page.tasks) ?? page.tasks;
+					const activeTasks = patchList(page.activeTasks);
+					if (tasks === page.tasks && activeTasks === page.activeTasks) return page;
+					return { ...page, tasks, ...(activeTasks ? { activeTasks } : {}) };
+				});
+				return changed ? { ...old, pages } : old;
+			});
+		},
+		[qc, queryKey],
+	);
+
+	const applyProgressRef = useRef(applyProgress);
+	applyProgressRef.current = applyProgress;
+
 	// --- Delta application -------------------------------------------------
 	const applyDelta = useCallback(
 		(delta: BackgroundTaskListDelta) => {
@@ -170,11 +215,24 @@ export function useBackgroundTaskList(
 		const listener = narratorWSManager.addListener(
 			{
 				narratorIds: [narratorId],
-				types: ["background_task_list_delta", "subagent_status_changed"],
+				types: [
+					"background_task_list_delta",
+					"background_task_progress",
+					"subagent_status_changed",
+				],
 			},
 			(data) => {
 				if (data.type === "subagent_status_changed") {
 					scheduleSubagentRefresh();
+					return;
+				}
+				if (data.type === "background_task_progress") {
+					// Validated, not cast: a malformed frame must leave the row's bar alone
+					// rather than paint NaN%.
+					const progress = readToolProgressPayload(data.progress);
+					if (progress) {
+						applyProgressRef.current(data.taskId as string, progress, data.listEpoch as string);
+					}
 					return;
 				}
 				applyDelta({

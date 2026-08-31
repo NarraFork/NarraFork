@@ -33,12 +33,7 @@ function lodIcon(level: RenderLod) {
 	return IconBaselineDensityLarge;
 }
 
-export function NarratorLodMenu({
-	lod,
-	isDefault,
-	onSelectLod,
-	onSetAsDefault,
-}: {
+export interface NarratorLodOptionsProps {
 	lod: RenderLod;
 	/** Whether `lod` equals the saved default — hides the "set as default" row. */
 	isDefault: boolean;
@@ -46,10 +41,61 @@ export function NarratorLodMenu({
 	onSelectLod: (next: RenderLod) => void;
 	/** Save the current level as the global default (used by new narrators). */
 	onSetAsDefault: () => void;
-}) {
+	/** Hide the heading when the surrounding surface already labels the group. */
+	withLabel?: boolean;
+}
+
+/**
+ * The level rows on their own, without a trigger or a dropdown around them.
+ *
+ * Exported so the header's Menu and the toolbar overflow menu's inline expansion
+ * present the SAME rows: the overflow menu used to show this entry as a dead
+ * "header only" line, which on a phone (where nearly everything is collapsed into
+ * that menu) meant the control had no reachable entry point at all.
+ */
+export function NarratorLodOptions({
+	lod,
+	isDefault,
+	onSelectLod,
+	onSetAsDefault,
+	withLabel = true,
+}: NarratorLodOptionsProps) {
+	const { t } = useTranslation("narrator");
+
+	return (
+		<>
+			{withLabel && <Menu.Label>{t("lodDensity")}</Menu.Label>}
+			{LOD_LEVELS.map((level) => {
+				const LevelIcon = lodIcon(level);
+				return (
+					<Menu.Item
+						key={level}
+						leftSection={<LevelIcon size={14} />}
+						rightSection={
+							<IconCheck size={14} style={{ visibility: level === lod ? "visible" : "hidden" }} />
+						}
+						onClick={() => onSelectLod(level)}
+					>
+						{t("lodSelectLevel", { level })}
+					</Menu.Item>
+				);
+			})}
+			{!isDefault && (
+				<>
+					<Menu.Divider />
+					<Menu.Item leftSection={<IconPin size={14} />} onClick={onSetAsDefault}>
+						{t("lodSetAsDefault")}
+					</Menu.Item>
+				</>
+			)}
+		</>
+	);
+}
+
+export function NarratorLodMenu(props: Omit<NarratorLodOptionsProps, "withLabel">) {
 	const { t } = useTranslation("narrator");
 	const label = t("lodDensity");
-	const CurrentIcon = lodIcon(lod);
+	const CurrentIcon = lodIcon(props.lod);
 
 	return (
 		<Menu position="bottom-end" withinPortal>
@@ -61,30 +107,7 @@ export function NarratorLodMenu({
 				</Tooltip>
 			</Menu.Target>
 			<Menu.Dropdown>
-				<Menu.Label>{label}</Menu.Label>
-				{LOD_LEVELS.map((level) => {
-					const LevelIcon = lodIcon(level);
-					return (
-						<Menu.Item
-							key={level}
-							leftSection={<LevelIcon size={14} />}
-							rightSection={
-								<IconCheck size={14} style={{ visibility: level === lod ? "visible" : "hidden" }} />
-							}
-							onClick={() => onSelectLod(level)}
-						>
-							{t("lodSelectLevel", { level })}
-						</Menu.Item>
-					);
-				})}
-				{!isDefault && (
-					<>
-						<Menu.Divider />
-						<Menu.Item leftSection={<IconPin size={14} />} onClick={onSetAsDefault}>
-							{t("lodSetAsDefault")}
-						</Menu.Item>
-					</>
-				)}
+				<NarratorLodOptions {...props} />
 			</Menu.Dropdown>
 		</Menu>
 	);

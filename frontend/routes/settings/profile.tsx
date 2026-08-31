@@ -3,7 +3,7 @@ import { notifications } from "@mantine/notifications";
 import { createFileRoute } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { ProfileSection } from "../../components/settings/ProfileSection";
 import {
 	useCurrentUser,

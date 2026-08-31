@@ -325,6 +325,19 @@ export function isExitPlanReflectionWaitingForUser(requestId: string): boolean {
 	return pendingExitPlanReflections.get(requestId)?.reflectionStoppedByUser === true;
 }
 
+/**
+ * The narrator owning a pending plan reflection, for authorizing a user decision.
+ *
+ * The plan gate's request id (`exit_plan_*`) is SYNTHETIC — it never appears as a
+ * `narrator_tool_calls` row id — so a resolver that only knows permission rows and
+ * the danger/task registries reports this gate as unresolvable and the takeover
+ * route answers 404 "Narrator not found: unknown" before the handler ever runs.
+ * See `resolveDecisionNarratorId` in narrator-permission.ts.
+ */
+export function getExitPlanReflectionNarratorId(requestId: string): string | null {
+	return pendingExitPlanReflections.get(requestId)?.narratorId ?? null;
+}
+
 export function cleanupExitPlanReflection(requestId: string): void {
 	pendingExitPlanReflections.delete(requestId);
 }

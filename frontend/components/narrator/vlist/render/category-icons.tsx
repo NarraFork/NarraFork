@@ -32,6 +32,7 @@ import {
 	IconShare,
 	IconShieldLock,
 	IconTerminal2,
+	IconTransfer,
 	IconWand,
 	IconWorldSearch,
 	IconWorldWww,
@@ -96,6 +97,8 @@ export function categoryIcon(cat: ToolCategory, toolName?: string): ComponentTyp
 			return IconTerminal2;
 		case "share":
 			return IconShare;
+		case "transfer":
+			return IconTransfer;
 		case "recall":
 			return IconHistory;
 		case "skill":

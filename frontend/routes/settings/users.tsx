@@ -19,7 +19,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { UserAclModal } from "../../components/knowledge/UserAclModal";
 import { CreateUserModal } from "../../components/settings/CreateUserModal";
 import { RegistrationCodesSection } from "../../components/settings/RegistrationCodesSection";

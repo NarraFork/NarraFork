@@ -21,7 +21,7 @@ import {
 } from "../../hooks/usePlatform";
 import { api, type RuntimeScanResult } from "../../lib/api";
 import { formatLocaleTime } from "../../lib/intl-format";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
 
 function runtimeDiagnosticMessage(value?: {
 	reason?: string;

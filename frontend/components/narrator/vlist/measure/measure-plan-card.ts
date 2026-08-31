@@ -24,7 +24,13 @@
  */
 
 import { DEFAULT_RENDER_LOD, type MeasuredElement, type RenderLod } from "../prepared-block";
-import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts";
+import {
+	FONT_SIZE,
+	LINE_HEIGHT,
+	lineBoxHeight,
+	SPACING,
+	typographyMetrics,
+} from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 
 // ── Chrome constants (px) — from CONTRACT.md §3/§4 / Mantine defaults ─────────
@@ -46,8 +52,8 @@ export const PLAN_CARD_RADIUS = 8;
 /** Header row height = tallest inline element in the Group. */
 export function planCardHeaderHeight(hasActions: boolean): number {
 	return hasActions
-		? Math.max(PLAN_HEADER_ICON, PLAN_HEADER_LABEL_LINE, PLAN_HEADER_BUTTON)
-		: Math.max(PLAN_HEADER_ICON, PLAN_HEADER_LABEL_LINE);
+		? Math.max(PLAN_HEADER_ICON, typographyMetrics().line.xs, PLAN_HEADER_BUTTON)
+		: Math.max(PLAN_HEADER_ICON, typographyMetrics().line.xs);
 }
 
 /** Fixed chrome around the markdown body (padding + border + header + mb). */

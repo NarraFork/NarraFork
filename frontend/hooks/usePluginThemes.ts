@@ -7,6 +7,11 @@ import {
 	pluginsApi,
 } from "../lib/api/plugins";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
+import {
+	readActivePluginThemeKey,
+	subscribePluginThemePref,
+	writeActivePluginThemeKey,
+} from "../lib/plugin-theme-pref-store";
 import { pluginKeys } from "./usePlugins";
 
 /**
@@ -141,48 +146,18 @@ export function usePluginAvailableThemes(enabled = true): UsePluginAvailableThem
 
 // --- Active plugin theme preference (device-scoped, like OLED mode) ---
 
-const PLUGIN_THEME_STORAGE_KEY = "narrafork_plugin_theme";
-
-const prefListeners = new Set<() => void>();
-let prefStorageListener: ((e: StorageEvent) => void) | null = null;
-
-function ensurePrefStorageListener() {
-	if (prefStorageListener) return;
-	prefStorageListener = (e: StorageEvent) => {
-		if (e.key === PLUGIN_THEME_STORAGE_KEY) {
-			for (const cb of prefListeners) cb();
-		}
-	};
-	window.addEventListener("storage", prefStorageListener);
-}
-
-function removePrefStorageListenerIfIdle() {
-	if (prefListeners.size > 0 || !prefStorageListener) return;
-	window.removeEventListener("storage", prefStorageListener);
-	prefStorageListener = null;
-}
-
-function subscribePref(cb: () => void): () => void {
-	prefListeners.add(cb);
-	ensurePrefStorageListener();
-	return () => {
-		prefListeners.delete(cb);
-		removePrefStorageListenerIfIdle();
-	};
-}
-
-function getPrefSnapshot(): string | null {
-	try {
-		return localStorage.getItem(PLUGIN_THEME_STORAGE_KEY);
-	} catch {
-		return null;
-	}
-}
-
-/** Read the persisted active plugin theme key without React (for bootstrap). */
-export function readActivePluginThemeKey(): string | null {
-	return getPrefSnapshot();
-}
+/**
+ * Re-exported so existing imports keep working. The store itself lives in
+ * `lib/plugin-theme-pref-store.ts` because `main.tsx` reads it before React mounts, and
+ * importing it from HERE would put this module's React Query dependencies (and through
+ * them the whole `lib/api` barrel) on the entry's graph — where an HMR update has no
+ * accepting importer and becomes a full page reload. See that file's header.
+ *
+ * ⚠️ `main.tsx` must import from the store directly, NOT through this re-export: a
+ * re-export still makes this module (and its dependencies) part of the entry's graph,
+ * which is exactly what the split removes. `app-hmr-boundary.test.ts` asserts that.
+ */
+export { readActivePluginThemeKey };
 
 /**
  * Device-scoped preference for the active plugin theme key (or `null` for the
@@ -191,15 +166,13 @@ export function readActivePluginThemeKey(): string | null {
  * and can be applied before React mounts to avoid a flash of the default theme.
  */
 export function usePluginThemePref(): [string | null, (key: string | null) => void] {
-	const value = useSyncExternalStore(subscribePref, getPrefSnapshot, () => null);
+	const value = useSyncExternalStore(
+		subscribePluginThemePref,
+		readActivePluginThemeKey,
+		() => null,
+	);
 	const setValue = useCallback((key: string | null) => {
-		try {
-			if (key) localStorage.setItem(PLUGIN_THEME_STORAGE_KEY, key);
-			else localStorage.removeItem(PLUGIN_THEME_STORAGE_KEY);
-		} catch {
-			// Ignore storage failures (private mode, quota, etc.).
-		}
-		for (const cb of prefListeners) cb();
+		writeActivePluginThemeKey(key);
 	}, []);
 	return [value, setValue];
 }

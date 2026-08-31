@@ -36,7 +36,13 @@
 
 import type { ElementFrame, MeasuredElement, PreparedBlock } from "../prepared-block";
 import { DEFAULT_RENDER_LOD, type RenderLod } from "../prepared-block";
-import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts";
+import {
+	FONT_SIZE,
+	LINE_HEIGHT,
+	lineBoxHeight,
+	SPACING,
+	typographyMetrics,
+} from "../pretext-fonts";
 import { DETAIL_CAPS, DETAIL_TOP_MARGIN, measureMarkdownDetail } from "./measure-tool-call";
 
 // ── Chrome constants (px) ────────────────────────────────────────────────────
@@ -66,7 +72,7 @@ export const REVIEW_HEADER_GAP = 6;
 export function reviewCardHeaderHeight(): number {
 	return Math.max(
 		REVIEW_HEADER_ICON,
-		REVIEW_HEADER_LABEL_LINE,
+		typographyMetrics().line.xs,
 		REVIEW_HEADER_BADGE,
 		REVIEW_HEADER_BUTTON,
 	);

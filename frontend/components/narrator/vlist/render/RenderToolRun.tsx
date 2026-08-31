@@ -64,11 +64,11 @@ import {
 	TRACE_HEADER_ICON,
 	TRACE_HEADER_PADDING_Y,
 	TRACE_ROW_GAP,
-	TRACE_ROW_HEIGHT,
 	TRACE_ROW_ICON,
 	TRACE_ROW_PADDING_Y,
 	type TraceCountLineKind,
 	type TraceVariant,
+	traceMetrics,
 } from "../measure/measure-tool-run";
 import { categoryIcon } from "./category-icons";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
@@ -606,7 +606,7 @@ function TraceRowView({
 			aria-label={shimmerLabel ? `${row.title || "…"} — ${shimmerLabel}` : undefined}
 			title={shimmerLabel}
 			style={{
-				height: TRACE_ROW_HEIGHT,
+				height: traceMetrics().rowHeight,
 				cursor: row.expandable ? "pointer" : "default",
 				userSelect: "none",
 			}}
@@ -715,7 +715,7 @@ function TraceRowView({
 					py={TRACE_BODY_PADDING_Y}
 					style={{
 						position: "absolute",
-						top: TRACE_ROW_HEIGHT,
+						top: traceMetrics().rowHeight,
 						left: 0,
 						right: 0,
 						paddingLeft: TRACE_BODY_PADDING_LEFT,

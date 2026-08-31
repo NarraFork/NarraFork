@@ -45,6 +45,7 @@ import {
 	NumberInput,
 	Paper,
 	Popover,
+	Progress,
 	Stack,
 	Text,
 	ThemeIcon,
@@ -83,18 +84,19 @@ import {
 import type { ComponentType, ReactNode, Ref } from "react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
+import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { AutoFollowScroll } from "../../AutoFollowScroll";
 import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
 import {
 	CARD_PADDING,
 	cappedUsefulLines,
-	DETAIL_BODY_FONT_SIZE,
 	DETAIL_BOX_PADDING_X,
 	DETAIL_BOX_PADDING_Y,
-	DETAIL_CONTENT_LINE_HEIGHT,
 	DETAIL_LABEL_CHROME_Y,
 	DETAIL_TOP_MARGIN,
+	detailBodyFontSize,
+	detailContentLineHeight,
 	ENTRY_SNIPPET_MAX_LINES,
 	earliestToolStartMs,
 	GROUP_BODY_BORDER_LEFT,
@@ -106,7 +108,6 @@ import {
 	type MeasuredToolCallGroup,
 	type MeasuredToolDetail,
 	type MeasuredToolDetailSection,
-	SECTION_LABEL_HEIGHT,
 	SPEC_TASK_ICON,
 	SPEC_TASK_INDENT,
 	SPEC_TASK_LOCK,
@@ -115,10 +116,12 @@ import {
 	type ToolCallStatus,
 	type ToolCategory,
 	type ToolRowAction,
+	type ToolRowProgress,
 	type ToolSectionLabel,
 	type ToolTimingStamps,
 } from "../measure/measure-tool-call";
 import type { BlockFrame, PreparedInlineBlock } from "../prepared-block";
+import { typographyMetrics } from "../pretext-fonts";
 import { useShikiTokens } from "../useShikiTokens";
 import { VListContentViewHost, type VListViewControls } from "../VListContentViewHost";
 import {
@@ -264,6 +267,7 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	pipeline: "indigo",
 	terminal: "yellow",
 	share: "green",
+	transfer: "blue",
 	recall: "cyan",
 	skill: "grape",
 	browser: "teal",
@@ -403,10 +407,11 @@ function InlineLines({
 								<span
 									className={frag.className}
 									style={{
-										font: frag.font,
-										marginLeft: frag.gapBefore,
-										whiteSpace: "pre",
-										display: "inline-block",
+										...fragmentTextStyle({
+											font: frag.font,
+											gapBefore: frag.gapBefore,
+											letterSpacing: letterSpacingForFont(frag.font),
+										}),
 										color,
 									}}
 								>
@@ -1137,6 +1142,56 @@ function readBadges(data: Record<string, unknown> | undefined): StructBadge[] {
 	return out;
 }
 
+/** Read the render-only progress descriptor off a fixed progress-row block. */
+function readProgress(data: Record<string, unknown> | undefined): ToolRowProgress | null {
+	if (!data?.progress || typeof data.progress !== "object") return null;
+	const p = data.progress as Record<string, unknown>;
+	// `ratio` must be an explicit number to fill the bar; anything else (including
+	// a missing field) is INDETERMINATE, which renders as an animated bar rather
+	// than as 0% — a bar stuck at zero reads as a stalled transfer.
+	const ratio = typeof p.ratio === "number" && Number.isFinite(p.ratio) ? p.ratio : null;
+	return {
+		ratio,
+		...(typeof p.percent === "number" && Number.isFinite(p.percent) ? { percent: p.percent } : {}),
+		...(Array.isArray(p.figures)
+			? { figures: p.figures.filter((f): f is string => typeof f === "string") }
+			: {}),
+		...(typeof p.color === "string" ? { color: p.color } : {}),
+		...(p.active === true ? { active: true } : {}),
+	};
+}
+
+/**
+ * A determinate (or animated indeterminate) progress bar on a meta row.
+ *
+ * The percent sits beside the track rather than above it so the whole control
+ * fits the single fixed row the measure layer reserved (META_PROGRESS_ROW).
+ */
+function MetaProgress({ progress }: { progress: ToolRowProgress }) {
+	const ratio = progress.ratio;
+	const indeterminate = ratio === null;
+	const color = progress.color ?? "blue";
+	return (
+		<Group gap={6} wrap="nowrap" style={{ alignItems: "center", width: "100%" }}>
+			<Progress
+				value={indeterminate ? 100 : Math.min(100, Math.max(0, ratio * 100))}
+				color={color}
+				size="sm"
+				radius="xl"
+				// Stripes animate while work continues. An indeterminate bar MUST animate:
+				// it is painted full-width, so without motion it would claim completion.
+				striped={indeterminate || progress.active === true}
+				animated={indeterminate || progress.active === true}
+				style={{ flex: 1, minWidth: 0 }}
+				aria-label="progress"
+			/>
+			<Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
+				{progress.percent != null ? `${progress.percent}%` : "—"}
+			</Text>
+		</Group>
+	);
+}
+
 /** Read the render-only action list off a fixed action-row block. */
 function readActions(data: Record<string, unknown> | undefined): ToolRowAction[] {
 	if (!data || !Array.isArray(data.actions)) return [];
@@ -1320,8 +1375,8 @@ function MarkdownDetailBody({
 			{showSource && sourceText ? (
 				<div
 					style={{
-						fontSize: DETAIL_BODY_FONT_SIZE,
-						lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`,
+						fontSize: detailBodyFontSize(),
+						lineHeight: `${detailContentLineHeight()}px`,
 						fontFamily: "var(--mantine-font-family-monospace)",
 						color: "var(--vlist-detail-panel-fg)",
 						whiteSpace: "pre-wrap",
@@ -1499,9 +1554,7 @@ const DIFF_ROW_SOFT_MAX = 200;
  */
 function diffRenderRowLimit(cap: number | undefined): number {
 	const visible =
-		cap != null && cap > 0
-			? Math.ceil(cap / DETAIL_CONTENT_LINE_HEIGHT)
-			: DIFF_ROW_FALLBACK_VISIBLE;
+		cap != null && cap > 0 ? Math.ceil(cap / detailContentLineHeight()) : DIFF_ROW_FALLBACK_VISIBLE;
 	const budget = Math.min(DIFF_ROW_SOFT_MAX, visible * DIFF_ROW_OVERSCAN_SCREENS);
 	// The floor, not a second ceiling: `visible * overscan` can itself drop below
 	// `cappedUsefulLines(cap)` once the cap is large (at cap=8000 the overscan budget is 2136 but
@@ -1940,14 +1993,14 @@ function CappedBodyBox({
 				// An UNWRAPPED body (`pre`) scrolls horizontally by definition.
 				overflowY: "auto",
 				overflowX: wordWrap ? "hidden" : "auto",
-				fontSize: DETAIL_BODY_FONT_SIZE,
+				fontSize: detailBodyFontSize(),
 				// The measure layer counts INTEGER line boxes
 				// (DETAIL_CONTENT_LINE_HEIGHT = round(11 × 1.4) = 15). Declaring the
 				// ratio `1.4` here would make the browser use 15.4px instead, so every
 				// wrapped line drifts 0.4px and a 15-line body renders 6px taller than
 				// the box reserved for it — the overflow is silently clipped. Pinning
 				// the same integer keeps measure and render byte-identical.
-				lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`,
+				lineHeight: `${detailContentLineHeight()}px`,
 				fontFamily: "var(--mantine-font-family-monospace)",
 				// Scheme-aware: a fixed dark-8 panel renders near-black text on
 				// near-black in light mode (see vlist-markdown.css).
@@ -2066,7 +2119,7 @@ function SectionView({
 						top: part.top,
 						left: 0,
 						width: availableWidth,
-						height: SECTION_LABEL_HEIGHT,
+						height: typographyMetrics().line.xs,
 					}}
 				>
 					{sectionLabelText(labels, part.label)}
@@ -2325,8 +2378,8 @@ function CappedMarkdownBody({
 			{showSource && sourceText ? (
 				<div
 					style={{
-						fontSize: DETAIL_BODY_FONT_SIZE,
-						lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`,
+						fontSize: detailBodyFontSize(),
+						lineHeight: `${detailContentLineHeight()}px`,
 						fontFamily: "var(--mantine-font-family-monospace)",
 						color: "var(--vlist-detail-panel-fg)",
 						whiteSpace: "pre-wrap",
@@ -2448,6 +2501,13 @@ function DetailBlocks({
 				const data = block.kind === "fixed" ? (block.data ?? {}) : {};
 				const badges = readBadges(data);
 				const actions = readActions(data);
+				const progress = readProgress(data);
+				const figures =
+					block.kind === "fixed" && block.tag === "detail-meta-progress-figures"
+						? (Array.isArray(data.figures) ? data.figures : []).filter(
+								(f): f is string => typeof f === "string",
+							)
+						: [];
 				const snippet =
 					block.kind === "fixed" &&
 					block.tag === "detail-entry-snippet" &&
@@ -2481,6 +2541,12 @@ function DetailBlocks({
 									</Badge>
 								))}
 							</Group>
+						) : null}
+						{progress ? <MetaProgress progress={progress} /> : null}
+						{figures.length > 0 ? (
+							<Text size="xs" c="dimmed" ff="monospace" style={{ whiteSpace: "nowrap" }}>
+								{figures.join("  ·  ")}
+							</Text>
 						) : null}
 						{actions.length > 0 ? <MetaActions actions={actions} labels={labels} /> : null}
 						{snippet != null ? (
@@ -2725,9 +2791,9 @@ function DetailRegion({
 											// scrolls horizontally by definition.
 											overflowY: "auto",
 											overflowX: bodyWrapped ? "hidden" : "auto",
-											fontSize: DETAIL_BODY_FONT_SIZE,
+											fontSize: detailBodyFontSize(),
 											// Integer line box, not the 1.4 ratio — see CappedBodyBox.
-											lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`,
+											lineHeight: `${detailContentLineHeight()}px`,
 											fontFamily: "var(--mantine-font-family-monospace)",
 											// Scheme-aware — see CappedBodyBox.
 											background: "var(--vlist-detail-panel-bg)",

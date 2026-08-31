@@ -132,8 +132,6 @@ function widthOf(element: Element): number {
 /** Minimal shape needed to decide collapse order; satisfied by NarratorToolbarItemDef. */
 export interface HeaderToolbarCandidate {
 	id: string;
-	/** A control that opens its own menu and cannot be activated from the overflow list. */
-	selfContained?: boolean;
 }
 
 export interface HeaderToolbarSelection<T> {
@@ -146,19 +144,16 @@ export interface HeaderToolbarSelection<T> {
 /**
  * Choose which entries stay on the row for a given capacity.
  *
- * Collapsing walks backwards through the layout order — the reader put the tools
- * they reach for most at the front — with ONE exception: a self-contained control
- * (device picker, detail level, plugin picker) is dropped last.
+ * Collapsing walks strictly backwards through the layout order: the reader put the
+ * tools they reach for most at the front, so the last ones are the ones to give up.
  *
- * That exception is not cosmetic. Those controls open their own menu from the
- * header; the overflow list can only show them as a labelled row with a
- * "header only" hint, because Mantine v7 has no submenu and nesting a Menu inside
- * a dropdown is unreliable (see CompactMenuSub). They also sit at the END of the
- * default order, so without this rule the first thing a narrow desktop row would
- * collapse is the handful of entries that then become unreachable altogether.
- *
- * A reader may still tuck them away explicitly — there the hint is the truth
- * ("this one only works from the header"), and dragging it back restores it.
+ * This used to carry an exception that kept the self-contained controls (detail
+ * level, execution device, plugin picker) on the row LONGEST, because the overflow
+ * menu could only list them as a dead "header only" row. The menu now expands their
+ * options inline, so the exception lost its premise — and it was actively harmful:
+ * those three sit at the END of the default order, so on a phone (capacity 2) the
+ * header showed exactly them while background tasks, terminal, git and search were
+ * all collapsed. The two least-reached controls occupied the entire row.
  */
 export function selectHeaderToolbarEntries<T extends HeaderToolbarCandidate>(
 	defs: readonly T[],
@@ -167,18 +162,9 @@ export function selectHeaderToolbarEntries<T extends HeaderToolbarCandidate>(
 	if (capacity == null || capacity >= defs.length) return { visible: [...defs], hidden: [] };
 
 	const keep = Math.max(0, capacity);
-	const dropCount = defs.length - keep;
-	const dropOrder = [
-		// Activatable entries, last in layout order first.
-		...defs.filter((def) => def.selfContained !== true).reverse(),
-		// Then the ones with no overflow fallback, also last-first.
-		...defs.filter((def) => def.selfContained === true).reverse(),
-	];
-	const dropped = new Set(dropOrder.slice(0, dropCount).map((def) => def.id));
-
 	return {
-		visible: defs.filter((def) => !dropped.has(def.id)),
-		hidden: defs.filter((def) => dropped.has(def.id)),
+		visible: defs.slice(0, keep),
+		hidden: defs.slice(keep),
 	};
 }
 

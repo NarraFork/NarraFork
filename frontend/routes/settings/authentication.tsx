@@ -18,7 +18,7 @@ import { IconKey, IconPlus, IconTrash } from "@tabler/icons-react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { useAuthConfig, useCurrentUser, useUpdateAuthConfig } from "../../hooks/useAuth";
 import type { AdminOidcProvider } from "../../lib/api";
 

@@ -13,14 +13,8 @@
  * Zero DOM measurement.
  */
 
-import {
-	type MeasuredTurnUsage,
-	TURN_USAGE_LINE_HEIGHT,
-	TURN_USAGE_PADDING_RIGHT,
-} from "../measure/measure-turn-usage";
-import { FONT_SIZE, SANS_FAMILY } from "../pretext-fonts";
-
-const USAGE_FONT = `400 ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
+import { type MeasuredTurnUsage, TURN_USAGE_PADDING_RIGHT } from "../measure/measure-turn-usage";
+import { typographyMetrics } from "../pretext-fonts";
 
 export function RenderTurnUsage({ measured }: { measured: MeasuredTurnUsage }) {
 	return (
@@ -40,9 +34,14 @@ export function RenderTurnUsage({ measured }: { measured: MeasuredTurnUsage }) {
 							top: frame.top,
 							left: 0,
 							right: TURN_USAGE_PADDING_RIGHT,
-							height: TURN_USAGE_LINE_HEIGHT,
-							font: USAGE_FONT,
-							lineHeight: `${TURN_USAGE_LINE_HEIGHT}px`,
+							height: typographyMetrics().line.xs,
+							// Read live, like the two values around it. This was a frozen
+							// `400 ${FONT_SIZE.xs}px` constant while `height` and `lineHeight`
+							// scaled, so a scaled-up reader got a taller line box holding
+							// baseline-sized text — self-evidently inconsistent within one style
+							// object, and invisible because `nowrap + ellipsis` hides the overflow.
+							font: typographyMetrics().font.xs,
+							lineHeight: `${typographyMetrics().line.xs}px`,
 							color: "var(--mantine-color-dimmed)",
 							textAlign: "right",
 							whiteSpace: "nowrap",

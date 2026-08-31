@@ -37,7 +37,13 @@
  */
 
 import { DEFAULT_RENDER_LOD, type MeasuredElement, type RenderLod } from "../prepared-block";
-import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts";
+import {
+	FONT_SIZE,
+	LINE_HEIGHT,
+	lineBoxHeight,
+	SPACING,
+	typographyMetrics,
+} from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 import { isSpecTaskPayload, measureSpecTask, type SpecTaskData } from "./measure-spec-task";
 import { measureSystemSimpleCard } from "./measure-system-simple";
@@ -334,7 +340,7 @@ export function measureInjectionBubble(
 	const bodyWidth = body.contentWidth;
 
 	const headerBlock = hasHeader ? INJECTION_HEADER_HEIGHT + INJECTION_HEADER_BODY_GAP : 0;
-	const noteBlock = hasNote ? INJECTION_NOTE_GAP + INJECTION_NOTE_HEIGHT : 0;
+	const noteBlock = hasNote ? INJECTION_NOTE_GAP + typographyMetrics().line.xs : 0;
 	const bodyTop = INJECTION_BUBBLE_PADDING + headerBlock;
 	const height = INJECTION_BUBBLE_PADDING * 2 + headerBlock + frame.contentHeight + noteBlock;
 
@@ -366,6 +372,6 @@ export function measureInjectionBubble(
 		usedWidth,
 		bodyTop,
 		hasHeader,
-		noteTop: hasNote ? height - INJECTION_BUBBLE_PADDING - INJECTION_NOTE_HEIGHT : -1,
+		noteTop: hasNote ? height - INJECTION_BUBBLE_PADDING - typographyMetrics().line.xs : -1,
 	};
 }

@@ -161,6 +161,9 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			_longRunning: block._longRunning ?? (tc as any)?._longRunning,
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 			_streamingOutput: block._streamingOutput ?? (tc as any)?._streamingOutput,
+			// Explicit field list, so omitting this silently drops the progress bar.
+			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
+			_structuredProgress: block._structuredProgress ?? (tc as any)?._structuredProgress,
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 			_timeoutMs: block._timeoutMs ?? (tc as any)?._timeoutMs,
 			_subagentActivity: block._subagentActivity,

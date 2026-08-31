@@ -1,5 +1,6 @@
 import { PERSISTED_NARRATOR_TOOLBAR_IDS } from "@shared/narrator-toolbar";
 import { PERSISTED_NAV_IDS } from "@shared/nav-layout";
+import { TYPOGRAPHY_RANGE } from "@shared/pretext-layout/typography";
 import {
 	RECENT_TABS_LIVE_LIMIT,
 	RECENT_TABS_PAGE_SIZE,
@@ -154,6 +155,35 @@ export const updateUserPreferencesSchema = z.object({
 	showOutputStats: z.boolean().optional(),
 	terminalTheme: z.string().min(1).max(50).optional(),
 	terminalFontSize: z.number().int().min(8).max(32).optional(),
+	// Narrator transcript typography (percentages). Bounds are taken FROM the shared
+	// range table rather than restated, so the validator and the clamp that protects
+	// the height model cannot drift apart — a mismatch here would let the API accept a
+	// value the renderer then silently clamps, so the saved setting and the visible
+	// result would disagree with no error.
+	narratorFontScalePercent: z
+		.number()
+		.int()
+		.min(TYPOGRAPHY_RANGE.fontScalePercent.min)
+		.max(TYPOGRAPHY_RANGE.fontScalePercent.max)
+		.optional(),
+	narratorLetterSpacingPercent: z
+		.number()
+		.int()
+		.min(TYPOGRAPHY_RANGE.letterSpacingPercent.min)
+		.max(TYPOGRAPHY_RANGE.letterSpacingPercent.max)
+		.optional(),
+	narratorLineHeightScalePercent: z
+		.number()
+		.int()
+		.min(TYPOGRAPHY_RANGE.lineHeightScalePercent.min)
+		.max(TYPOGRAPHY_RANGE.lineHeightScalePercent.max)
+		.optional(),
+	narratorParagraphScalePercent: z
+		.number()
+		.int()
+		.min(TYPOGRAPHY_RANGE.paragraphScalePercent.min)
+		.max(TYPOGRAPHY_RANGE.paragraphScalePercent.max)
+		.optional(),
 	addSubagentToRecentTabs: z.boolean().optional(),
 	recentTabsGroupMode: z.enum(["flat", "directory"]).optional(),
 	// Notification preferences

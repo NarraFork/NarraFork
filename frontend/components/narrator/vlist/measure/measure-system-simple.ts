@@ -28,7 +28,13 @@ import {
 	type PreparedFixedBlock,
 	type RenderLod,
 } from "../prepared-block";
-import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts";
+import {
+	FONT_SIZE,
+	LINE_HEIGHT,
+	lineBoxHeight,
+	SPACING,
+	typographyMetrics,
+} from "../pretext-fonts";
 
 // ── Discriminant + payload ───────────────────────────────────────────────────
 
@@ -70,25 +76,66 @@ export const CARD_PADDING = SPACING.xs; // 10
 export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
 
 /** Center-row icon is 14; the xs line (17) is taller → the row is 17px tall. */
-const CENTER_ROW_CONTENT = Math.max(14, XS_LINE_HEIGHT); // 17
+const CENTER_ROW_CONTENT = Math.max(14, XS_LINE_HEIGHT); // 17 (neutral baseline)
+/** Centre-row lane at the reader's typography: the 14px glyph floors it. */
+function centerRowContent(): number {
+	return Math.max(14, typographyMetrics().line.xs);
+}
 /** Paper-row icon/Badge is 16; the xs line (17) is taller → 17px tall. */
-const CARD_ROW_CONTENT = Math.max(16, XS_LINE_HEIGHT); // 17
+const CARD_ROW_CONTENT = Math.max(16, XS_LINE_HEIGHT); // 17 (neutral baseline)
+/** Card-row lane at the reader's typography: the 16px glyph floors it. */
+function cardRowContent(): number {
+	return Math.max(16, typographyMetrics().line.xs);
+}
 
 // ── Per-kind fixed heights (px) ──────────────────────────────────────────────
 
 /** compact indicator: centered single line, py={4}. ≈25px. */
 export const COMPACT_CARD_HEIGHT = CENTER_ROW_PADDING_Y * 2 + CENTER_ROW_CONTENT; // 25
+/** Live counterparts of the three card heights above. */
+export function compactCardHeight(): number {
+	return CENTER_ROW_PADDING_Y * 2 + centerRowContent();
+}
+export function segmentCompactCardHeight(): number {
+	return CENTER_ROW_PADDING_Y * 2 + centerRowContent();
+}
+export function mergeSummaryCardHeight(): number {
+	return CARD_PADDING * 2 + cardRowContent();
+}
 /** segment_compact (compacting/compacted): centered single line, py={4}. ≈25px. */
 export const SEGMENT_COMPACT_CARD_HEIGHT = CENTER_ROW_PADDING_Y * 2 + CENTER_ROW_CONTENT; // 25
 /** merge_summary: Paper p="xs" + single lineClamp={1} row. ≈37px. */
 export const MERGE_SUMMARY_CARD_HEIGHT = CARD_PADDING * 2 + CARD_ROW_CONTENT; // 37
 
-/** Central lookup: kind → fixed height (px). Used by tests + the registry. */
+/**
+ * Central lookup: kind → fixed height (px) at NEUTRAL typography. Used by tests.
+ *
+ * A frozen record, so measurement must NOT read it — see {@link systemSimpleCardHeight}.
+ */
 export const SYSTEM_SIMPLE_CARD_HEIGHTS: Record<SystemSimpleKind, number> = {
 	compact: COMPACT_CARD_HEIGHT,
 	segment_compact: SEGMENT_COMPACT_CARD_HEIGHT,
 	merge_summary: MERGE_SUMMARY_CARD_HEIGHT,
 };
+
+/**
+ * A card's height at the reader's current typography.
+ *
+ * Resolved per call rather than through a record built at import time: these cards
+ * are single-line, so their whole height IS a text line plus fixed padding, and a
+ * frozen value would leave them the only cards in the transcript that ignore the
+ * font-size setting.
+ */
+export function systemSimpleCardHeight(kind: SystemSimpleKind): number {
+	switch (kind) {
+		case "compact":
+			return compactCardHeight();
+		case "segment_compact":
+			return segmentCompactCardHeight();
+		default:
+			return mergeSummaryCardHeight();
+	}
+}
 
 /**
  * A no-op line resolver. These cards contain only `PreparedFixedBlock`s, whose
@@ -110,7 +157,7 @@ export function measureSystemSimpleCard(
 ): MeasuredElement {
 	const block: PreparedFixedBlock = {
 		kind: "fixed",
-		height: SYSTEM_SIMPLE_CARD_HEIGHTS[kind],
+		height: systemSimpleCardHeight(kind),
 		tag: kind,
 		data: { ...data } as Record<string, unknown>,
 		marginTop: 0,

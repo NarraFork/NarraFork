@@ -33,7 +33,7 @@ import { pushSubagentBufferedMessage } from "./subagent-executor";
 import { agentLabelFromNarrator, resolveAgentLabel, shortAgentId } from "./subagent-label";
 import { hasActiveSubagentResumeRun, resumeSubagent } from "./subagent-resume";
 import { waitForBackgroundTask } from "./subagent-runner";
-import { isTakenOver } from "./subagent-takeover";
+import { isTakenOver, TAKEN_OVER_SUBSTATUS } from "./subagent-takeover";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -630,6 +630,29 @@ function settledSubagentStatus(narrator: Narrator, fallback = "completed"): stri
 	return fallback;
 }
 
+/**
+ * Whether a subagent status/substatus pair means "this run has ended".
+ *
+ * `working`/`waiting` are the only non-terminal states a subagent run can sit in,
+ * so anything else is a settled run. A takeover is excluded on purpose: a
+ * taken-over subagent parks in `idle[taken_over]` between the user's own turns,
+ * which is idle-shaped but is NOT the end of the run — its result is handed back
+ * only when the user stops the takeover. Treating it as terminal would end the
+ * parent's Await with a partial result while the user is still working.
+ */
+function subagentRunHasSettled(
+	subagentId: string,
+	status: string,
+	substatus: string[] | undefined,
+): boolean {
+	if (status === "working" || status === "waiting") return false;
+	if (isTakenOver(subagentId)) return false;
+	// The in-memory takeover Set is authoritative, but it is cleared slightly
+	// before/after the mirrored tag depending on the path, so both are consulted.
+	if (substatus?.includes(TAKEN_OVER_SUBSTATUS)) return false;
+	return true;
+}
+
 export async function waitForSubagentResult(opts: {
 	subagentId: string;
 	parentNarratorId: string;
@@ -654,6 +677,7 @@ export async function waitForSubagentResult(opts: {
 			settled = true;
 			if (timer) clearTimeout(timer);
 			eventBus.off("narrator:subagent_completed", onCompleted);
+			eventBus.off("narrator:status_changed", onStatusChanged);
 			opts.signal?.removeEventListener("abort", onAbort);
 		};
 
@@ -672,12 +696,45 @@ export async function waitForSubagentResult(opts: {
 			void finish("completed");
 		};
 
+		/**
+		 * Second, independent wake-up source — and for some runs the ONLY one.
+		 *
+		 * `narrator:subagent_completed` is emitted by the subagent RUNNER
+		 * (`finalizeSubagent`) and by the parent-interrupt path. A subagent driven by
+		 * the generic session engine instead — which is exactly what a user takeover,
+		 * and any `resumeSubagent` continuation started from the subagent's own page,
+		 * produces — finishes inside `runAgentLoop`, which never emits it. So a parent
+		 * that called `Await` on such a child waited out its whole timeout even though
+		 * the child had settled minutes earlier, and kept re-waiting because the result
+		 * still looked pending.
+		 *
+		 * `narrator:status_changed` is emitted by every status write path
+		 * (`updateStatus` and `compareAndSetStatus` both emit unconditionally), so it
+		 * covers the engines the dedicated event does not. Both listeners are kept:
+		 * `cleanup` is idempotent and `finish` is guarded by `settled`, so whichever
+		 * arrives first wins and the other is a no-op.
+		 */
+		const onStatusChanged = (event: {
+			narratorId: string;
+			status: string;
+			substatus?: string[];
+		}) => {
+			if (settled) return;
+			if (event.narratorId !== opts.subagentId) return;
+			if (!subagentRunHasSettled(opts.subagentId, event.status, event.substatus)) return;
+			// The status carries no result text, so `finish` re-reads the row and lets
+			// `settledSubagentStatus` decide the real outcome (completed/failed/
+			// cancelled/timed_out) rather than assuming success here.
+			void finish("completed");
+		};
+
 		const onAbort = () => {
 			cleanup();
 			resolve({ status: "aborted", output: "Await aborted." });
 		};
 
 		eventBus.on("narrator:subagent_completed", onCompleted);
+		eventBus.on("narrator:status_changed", onStatusChanged);
 		if (opts.signal) {
 			if (opts.signal.aborted) {
 				onAbort();
@@ -689,6 +746,34 @@ export async function waitForSubagentResult(opts: {
 			cleanup();
 			resolve({ status: "timeout", output: "Subagent is still running." });
 		}, timeoutMs);
+
+		// Re-read AFTER subscribing, to close the gap the status check above opens.
+		// That check awaited a DB read, and a subagent that settled during that await
+		// emitted both of its events before either listener existed — so the wait
+		// would then run to its full timeout on a child that had already finished.
+		// Subscribing first and verifying second means every ordering is covered:
+		// settle-before-subscribe is caught here, settle-after-subscribe by the
+		// listeners, and a settle in between is caught twice (harmlessly, since
+		// `finish` is guarded by `settled`).
+		void narratorService
+			.getById(opts.subagentId)
+			.then((fresh) => {
+				if (settled) return;
+				if (
+					!subagentRunHasSettled(opts.subagentId, fresh.status, parseSubstatus(fresh.substatus))
+				) {
+					return;
+				}
+				void finish("completed");
+			})
+			.catch((err) => {
+				// A failed re-read is not a reason to end the wait: the listeners are
+				// already live, so the ordinary path still works.
+				logger.warn("Failed to re-check subagent status after subscribing to its result", {
+					subagentId: opts.subagentId,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
 	});
 }
 

@@ -1,6 +1,6 @@
 import { Combobox, Group, Loader, Text, TextInput, useCombobox } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
-import { IconFolder, IconFolderPlus } from "@tabler/icons-react";
+import { IconFolder, IconFolderPlus, IconFolderSymlink } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -273,16 +273,23 @@ export function PathInput(props: PathInputProps) {
 							</Text>
 						</Combobox.Empty>
 					)}
-					{displayedOptions.map((entry) => (
-						<Combobox.Option key={entry.path} value={entry.path}>
-							<Group gap={8} wrap="nowrap">
-								<IconFolder size={14} style={{ flexShrink: 0, opacity: 0.5 }} />
-								<Text size="xs" truncate>
-									{filterLower ? highlightMatch(entry.name, filterLower) : entry.name}
-								</Text>
-							</Group>
-						</Combobox.Option>
-					))}
+					{displayedOptions.map((entry) => {
+						const EntryIcon = entry.isSymlink ? IconFolderSymlink : IconFolder;
+						return (
+							<Combobox.Option
+								key={entry.path}
+								value={entry.path}
+								title={entry.isSymlink ? t("symlinkDirectory") : undefined}
+							>
+								<Group gap={8} wrap="nowrap">
+									<EntryIcon size={14} style={{ flexShrink: 0, opacity: 0.5 }} />
+									<Text size="xs" truncate>
+										{filterLower ? highlightMatch(entry.name, filterLower) : entry.name}
+									</Text>
+								</Group>
+							</Combobox.Option>
+						);
+					})}
 					{hiddenOptions > 0 && (
 						<Combobox.Option value={MORE_OPTION_VALUE} disabled>
 							<Text size="xs" c="dimmed" ta="center">

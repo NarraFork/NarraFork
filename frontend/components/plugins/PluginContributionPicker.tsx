@@ -67,12 +67,18 @@ function statusColor(availability: PluginContributionRecord["availability"]): st
 	}
 }
 
-export function PluginContributionPicker({
+/**
+ * The contribution rows on their own, without a trigger or a dropdown around them.
+ *
+ * Exported so a host that already owns a Menu (the narrator toolbar's overflow
+ * menu, which expands entries inline) can present the same list instead of a dead
+ * "header only" row.
+ */
+export function PluginContributionOptions({
 	onPick,
-	trigger,
-	disabled,
-	tooltip,
-}: PluginContributionPickerProps) {
+}: {
+	onPick: (pick: PluginContributionPick) => void;
+}) {
 	const { t } = useTranslation("plugins");
 	const { contributions, synced, isFetching, invalidate } = usePluginContributions();
 
@@ -87,6 +93,100 @@ export function PluginContributionPicker({
 	const availableCount = records.filter(
 		(record) => record.availability === "available" && isPackageHash(record.hash),
 	).length;
+
+	return (
+		<>
+			<Group justify="space-between" px="xs" py={4} wrap="nowrap">
+				<Text size="xs" fw={600} c="dimmed">
+					{t("picker.title")}
+				</Text>
+				<Tooltip label={t("picker.refresh")} withinPortal>
+					<ActionIcon
+						size="sm"
+						variant="subtle"
+						color="gray"
+						onClick={invalidate}
+						aria-label={t("picker.refresh")}
+					>
+						<IconRefresh size={14} />
+					</ActionIcon>
+				</Tooltip>
+			</Group>
+			<Menu.Divider />
+			{!synced && isFetching ? (
+				<Center py="md">
+					<Loader size="sm" />
+				</Center>
+			) : records.length === 0 ? (
+				<Box px="sm" py="md">
+					<Text size="xs" c="dimmed" ta="center">
+						{t("picker.empty")}
+					</Text>
+				</Box>
+			) : (
+				<>
+					{availableCount === 0 ? (
+						<Box px="sm" py={4}>
+							<Text size="xs" c="dimmed">
+								{t("picker.noneAvailable")}
+							</Text>
+						</Box>
+					) : null}
+					{records.map((record) => {
+						const key = `${record.pluginId}:${record.contributionId}`;
+						const available = record.availability === "available" && isPackageHash(record.hash);
+						return (
+							<Menu.Item
+								key={key}
+								disabled={!available}
+								onClick={() => {
+									if (!isPackageHash(record.hash)) return;
+									onPick({
+										pluginId: record.pluginId,
+										contributionId: record.contributionId,
+										title: record.title,
+										version: record.version ?? "",
+										hash: record.hash,
+										scope: record.scope,
+									});
+								}}
+								leftSection={
+									<ThemeIcon size="sm" variant="light" color={statusColor(record.availability)}>
+										<IconPuzzle size={12} />
+									</ThemeIcon>
+								}
+								rightSection={
+									record.availability !== "available" ? (
+										<Badge size="xs" variant="light" color={statusColor(record.availability)}>
+											{t(`picker.status.${record.availability}`)}
+										</Badge>
+									) : null
+								}
+							>
+								<Stack gap={0}>
+									<Text size="xs" fw={500} truncate>
+										{record.title}
+									</Text>
+									<Text size="xs" c="dimmed" truncate>
+										{record.pluginName ?? record.pluginId} · {record.version}
+									</Text>
+								</Stack>
+							</Menu.Item>
+						);
+					})}
+				</>
+			)}
+		</>
+	);
+}
+
+export function PluginContributionPicker({
+	onPick,
+	trigger,
+	disabled,
+	tooltip,
+}: PluginContributionPickerProps) {
+	const { t } = useTranslation("plugins");
 
 	return (
 		<Menu position="bottom-end" withinPortal shadow="md" width={320}>
@@ -106,86 +206,7 @@ export function PluginContributionPicker({
 				)}
 			</Menu.Target>
 			<Menu.Dropdown>
-				<Group justify="space-between" px="xs" py={4} wrap="nowrap">
-					<Text size="xs" fw={600} c="dimmed">
-						{t("picker.title")}
-					</Text>
-					<Tooltip label={t("picker.refresh")} withinPortal>
-						<ActionIcon
-							size="sm"
-							variant="subtle"
-							color="gray"
-							onClick={invalidate}
-							aria-label={t("picker.refresh")}
-						>
-							<IconRefresh size={14} />
-						</ActionIcon>
-					</Tooltip>
-				</Group>
-				<Menu.Divider />
-				{!synced && isFetching ? (
-					<Center py="md">
-						<Loader size="sm" />
-					</Center>
-				) : records.length === 0 ? (
-					<Box px="sm" py="md">
-						<Text size="xs" c="dimmed" ta="center">
-							{t("picker.empty")}
-						</Text>
-					</Box>
-				) : (
-					<>
-						{availableCount === 0 ? (
-							<Box px="sm" py={4}>
-								<Text size="xs" c="dimmed">
-									{t("picker.noneAvailable")}
-								</Text>
-							</Box>
-						) : null}
-						{records.map((record) => {
-							const key = `${record.pluginId}:${record.contributionId}`;
-							const available = record.availability === "available" && isPackageHash(record.hash);
-							return (
-								<Menu.Item
-									key={key}
-									disabled={!available}
-									onClick={() => {
-										if (!isPackageHash(record.hash)) return;
-										onPick({
-											pluginId: record.pluginId,
-											contributionId: record.contributionId,
-											title: record.title,
-											version: record.version ?? "",
-											hash: record.hash,
-											scope: record.scope,
-										});
-									}}
-									leftSection={
-										<ThemeIcon size="sm" variant="light" color={statusColor(record.availability)}>
-											<IconPuzzle size={12} />
-										</ThemeIcon>
-									}
-									rightSection={
-										record.availability !== "available" ? (
-											<Badge size="xs" variant="light" color={statusColor(record.availability)}>
-												{t(`picker.status.${record.availability}`)}
-											</Badge>
-										) : null
-									}
-								>
-									<Stack gap={0}>
-										<Text size="xs" fw={500} truncate>
-											{record.title}
-										</Text>
-										<Text size="xs" c="dimmed" truncate>
-											{record.pluginName ?? record.pluginId} · {record.version}
-										</Text>
-									</Stack>
-								</Menu.Item>
-							);
-						})}
-					</>
-				)}
+				<PluginContributionOptions onPick={onPick} />
 			</Menu.Dropdown>
 		</Menu>
 	);

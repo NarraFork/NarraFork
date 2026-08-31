@@ -439,6 +439,96 @@ describe("recent tabs group mode preference", () => {
 	});
 });
 
+/**
+ * The four typography columns are the worst case for the upsert described above: they are
+ * ADJACENT and share one type (integer percent). A positional argument off by one does not
+ * throw and does not fail validation — it silently writes the line-height value into the
+ * paragraph column, so the user's "line height" slider moves their paragraph spacing.
+ *
+ * They also caught the other half of the same hazard: adding them to the column list without
+ * updating the hand-written placeholder count produced `39 values for 43 columns`, failing
+ * EVERY first preference write. The placeholder count is now derived from `INSERT_COLUMNS`,
+ * and the distinct-values test below is what makes a future off-by-one visible.
+ */
+describe("narrator typography preferences", () => {
+	it("gives each of the four columns its own distinct value", async () => {
+		// Four different numbers: any pair of swapped positional arguments changes which
+		// field reports which number, and no two are interchangeable.
+		seedPreferences([]);
+
+		const typography = {
+			narratorFontScalePercent: 111,
+			narratorLetterSpacingPercent: 7,
+			narratorParagraphScalePercent: 133,
+			narratorLineHeightScalePercent: 144,
+		};
+		const patchResult = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(typography),
+		});
+		expect(patchResult.status).toBe(200);
+		expect(patchResult.body).toMatchObject(typography);
+
+		const getResult = await requestJson("/");
+		expect(getResult.body).toMatchObject(typography);
+	});
+
+	it("creates a row carrying all four values when none exists yet", async () => {
+		// The INSERT branch — the one that used to fail outright on the placeholder count.
+		seedUser();
+		const typography = {
+			narratorFontScalePercent: 90,
+			narratorLetterSpacingPercent: -3,
+			narratorParagraphScalePercent: 120,
+			narratorLineHeightScalePercent: 80,
+		};
+		const patchResult = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(typography),
+		});
+		expect(patchResult.status).toBe(200);
+		expect(patchResult.body).toMatchObject(typography);
+	});
+
+	it("leaves the stored typography alone when a PATCH omits it", async () => {
+		seedPreferences([], {
+			narratorFontScalePercent: 125,
+			narratorLetterSpacingPercent: 5,
+			narratorParagraphScalePercent: 115,
+			narratorLineHeightScalePercent: 135,
+		});
+
+		const patchResult = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ terminalFontSize: 18 }),
+		});
+		expect(patchResult.status).toBe(200);
+		expect(patchResult.body).toMatchObject({
+			terminalFontSize: 18,
+			narratorFontScalePercent: 125,
+			narratorLetterSpacingPercent: 5,
+			narratorParagraphScalePercent: 115,
+			narratorLineHeightScalePercent: 135,
+		});
+	});
+
+	it("rejects an out-of-range value instead of storing it", async () => {
+		seedPreferences([], { narratorFontScalePercent: 100 });
+		const response = await app.request("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ narratorFontScalePercent: 10_000 }),
+		});
+		expect(response.status).not.toBe(200);
+
+		const { body } = await requestJson("/");
+		expect(body).toMatchObject({ narratorFontScalePercent: 100 });
+	});
+});
+
 describe("recent-tabs route contracts", () => {
 	it("returns a mutation delta instead of the full tab collection", async () => {
 		seedPreferences([]);

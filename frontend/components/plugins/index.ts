@@ -25,12 +25,9 @@ export {
 	toPluginUiContribution,
 } from "./PluginContributionStore";
 export {
-	PLUGIN_DOCKVIEW_COMPONENT,
 	PluginDockPanel,
 	type PluginDockPanelHostApi,
 	PluginDockPanelView,
-	pluginDockviewComponents,
-	withPluginDockviewComponent,
 } from "./PluginDockPanel";
 export {
 	PLUGIN_THEME_ATTRIBUTE,
@@ -38,12 +35,9 @@ export {
 	PluginThemeInjector,
 } from "./PluginThemeInjector";
 export {
-	fallbackPluginUiContext,
 	PluginPanelSlot,
 	PluginUiLayer,
 	PluginUiRuntimeProvider,
-	useOptionalPluginUiRuntime,
-	usePluginUiRuntime,
 } from "./PluginUiRuntimeProvider";
 export type { PluginUiHostSurface, PluginUiSessionContext } from "./PluginUiSurfaceContext";
 export {
@@ -52,6 +46,16 @@ export {
 	resolvePluginUiOwnerNarratorId,
 	usePluginUiSurface,
 } from "./PluginUiSurfaceContext";
+export {
+	PLUGIN_DOCKVIEW_COMPONENT,
+	pluginDockviewComponents,
+	withPluginDockviewComponent,
+} from "./plugin-dockview-components";
+export {
+	fallbackPluginUiContext,
+	useOptionalPluginUiRuntime,
+	usePluginUiRuntime,
+} from "./plugin-ui-runtime-context";
 export type {
 	JsonPrimitive,
 	JsonValue,

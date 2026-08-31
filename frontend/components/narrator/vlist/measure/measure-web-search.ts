@@ -34,6 +34,7 @@ import {
 	lineBoxHeight,
 	SANS_FAMILY,
 	SPACING,
+	typographyMetrics,
 } from "../pretext-fonts";
 import { pretextLineMetrics } from "./pretext-metrics";
 
@@ -131,27 +132,27 @@ export function measureWebSearch(
 	const innerWidth = Math.max(1, contentWidth - WEB_SEARCH_PADDING * 2 - WEB_SEARCH_BORDER * 2);
 
 	const items: RichInlineItem[] = [
-		{ text: label, font: WEB_SEARCH_LABEL_FONT, break: "normal", extraWidth: 0 },
+		{ text: label, font: typographyMetrics().font.xs, break: "normal", extraWidth: 0 },
 	];
 	const classNames: string[] = [WEB_SEARCH_LABEL_CLASS];
 	const hrefs: Array<string | null> = [null];
-	const fonts: string[] = [WEB_SEARCH_LABEL_FONT];
+	const fonts: string[] = [typographyMetrics().font.xs];
 	if (query) {
 		items.push({
 			text: query,
-			font: WEB_SEARCH_QUERY_FONT,
+			font: typographyMetrics().font.xsMedium,
 			break: "normal",
 			extraWidth: 0,
 		});
 		classNames.push(WEB_SEARCH_QUERY_CLASS);
 		hrefs.push(null);
-		fonts.push(WEB_SEARCH_QUERY_FONT);
+		fonts.push(typographyMetrics().font.xsMedium);
 	}
 
 	const textBlock: PreparedInlineBlock = {
 		kind: "inline",
 		flow: prepareRichInline(items),
-		lineHeight: WEB_SEARCH_TEXT_LINE_HEIGHT,
+		lineHeight: typographyMetrics().line.xs,
 		classNames,
 		hrefs,
 		fonts,

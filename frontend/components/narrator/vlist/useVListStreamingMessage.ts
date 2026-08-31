@@ -44,6 +44,7 @@ import {
 	applyStreamingToolExecuting,
 	applyStreamingToolLongRunning,
 	applyStreamingToolOutput,
+	applyStreamingToolProgress,
 	applyStreamingToolStarted,
 	collectPersistedToolUseIds,
 	createStreamingToolStore,
@@ -455,6 +456,13 @@ export function useVListStreamingMessage(
 			onToolOutput: (toolUseId, output, rawParentToolUseId) => {
 				if (!isSubagent && rawParentToolUseId) return;
 				pushToolOutput(toolUseId, output);
+			},
+			// Determinate progress. NOT routed through the text throttle: the producer
+			// already coalesces to ~4 frames/s, and the payload is a few numbers rather
+			// than a growing string, so a second throttle would only delay the bar.
+			onToolStructuredProgress: (toolUseId, progress, rawParentToolUseId) => {
+				if (!isSubagent && rawParentToolUseId) return;
+				if (applyStreamingToolProgress(toolStoreRef.current, toolUseId, progress)) flush();
 			},
 			onToolLongRunning: (toolUseId, _elapsedMs, rawParentToolUseId) => {
 				if (!isSubagent && rawParentToolUseId) return;

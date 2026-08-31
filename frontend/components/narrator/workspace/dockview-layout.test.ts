@@ -1,16 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { serializeSeedEnvelope } from "../panels/layout-envelope";
-import {
-	createBranch,
-	createLeafWith,
-	createTerminalLeaf,
-	createWebviewLeaf,
-	type SplitNode,
-} from "../split-tree";
+import { createBranch, createLeafWith } from "../split-tree";
 import { DEFAULT_DIRECTOR_PRIMARY_RATIO } from "./director-constants";
 import {
 	componentForParams,
-	migrateLegacyTree,
 	nextWorkspacePanelId,
 	resolveWorkspaceLayout,
 	twoNarratorWorkspaceSeed,
@@ -18,98 +11,33 @@ import {
 } from "./dockview-layout";
 import { PANEL_COMPONENT } from "./panel-types";
 
-describe("migrateLegacyTree", () => {
-	test("single narrator leaf → one panel, placed first", () => {
-		const tree: SplitNode = createLeafWith("narr_1");
-		const specs = migrateLegacyTree(tree);
-		expect(specs).toHaveLength(1);
-		expect(specs[0].params).toEqual({ panelType: "narrator", narratorId: "narr_1" });
-		expect(specs[0].placement).toEqual({ kind: "first" });
-	});
-
-	test("horizontal branch → second panel placed to the right of the first", () => {
-		const tree = createBranch("horizontal", [createLeafWith("a"), createLeafWith("b")]);
-		const specs = migrateLegacyTree(tree);
-		expect(specs).toHaveLength(2);
-		expect(specs[0].placement).toEqual({ kind: "first" });
-		expect(specs[1].placement).toMatchObject({
-			kind: "relative",
-			referenceId: specs[0].id,
-			direction: "right",
-		});
-	});
-
-	test("vertical branch → second panel placed below the first", () => {
-		const tree = createBranch("vertical", [createLeafWith("a"), createLeafWith("b")]);
-		const specs = migrateLegacyTree(tree);
-		expect(specs[1].placement).toMatchObject({ kind: "relative", direction: "below" });
-	});
-
-	test("terminal and webview leaves are preserved with their config", () => {
-		const tree = createBranch("horizontal", [
-			createLeafWith("narr"),
-			createTerminalLeaf({ narratorId: "narr" }),
-			createWebviewLeaf({ url: "https://example.com", title: "Docs" }),
-		]);
-		const specs = migrateLegacyTree(tree);
-		expect(specs).toHaveLength(3);
-		expect(specs[1].params).toEqual({
-			panelType: "terminal",
-			terminalConfig: { narratorId: "narr" },
-		});
-		expect(specs[2].params).toEqual({
-			panelType: "webview",
-			webviewConfig: { url: "https://example.com", title: "Docs" },
-		});
-		expect(specs[2].title).toBe("Docs");
-	});
-
-	test("empty narrator leaf (no id) is dropped", () => {
-		const tree = createBranch("horizontal", [createLeafWith("a"), { ...createLeafWith("") }]);
-		// createLeafWith("") still has narratorId "" which is falsy → dropped
-		const specs = migrateLegacyTree(tree);
-		expect(specs).toHaveLength(1);
-		expect(specs[0].params).toEqual({ panelType: "narrator", narratorId: "a" });
-	});
-
-	test("nested branches flatten into a linear placement chain", () => {
-		// H[ a, V[ b, c ] ]
-		const tree = createBranch("horizontal", [
-			createLeafWith("a"),
-			createBranch("vertical", [createLeafWith("b"), createLeafWith("c")]),
-		]);
-		const specs = migrateLegacyTree(tree);
-		expect(specs.map((s) => (s.params as { narratorId: string }).narratorId)).toEqual([
-			"a",
-			"b",
-			"c",
-		]);
-		// first child of nested branch inherits parent direction (right),
-		// sibling stacks along the branch axis (below)
-		expect(specs[1].placement).toMatchObject({ direction: "right" });
-		expect(specs[2].placement).toMatchObject({ direction: "below" });
-	});
-});
+// The `migrateLegacyTree` suite is gone with the function. Client-side legacy migration
+// invented panels that had no membership row, which the surface then pruned on the next
+// open. Reading legacy shapes is now the server's job, once, in
+// `recoverPanelsFromLayout` — covered by `tests/server/services/workspace-panel-service.test.ts`
+// ("backfill on first read"), including the split-tree and seed-envelope cases this
+// suite used to assert.
 
 describe("resolveWorkspaceLayout", () => {
-	test("null/empty → empty panel list with grid director state", () => {
+	// "No usable arrangement" must never be read as "no panels": membership is a
+	// separate, authoritative input, so the caller still places every member at a
+	// default position.
+	test("null input yields no arrangement, with default director state", () => {
 		const resolved = resolveWorkspaceLayout(null);
-		expect(resolved.kind).toBe("panels");
-		if (resolved.kind === "panels") {
-			expect(resolved.panels).toHaveLength(0);
-			expect(resolved.director.mode).toBe("grid");
-		}
+		expect(resolved.kind).toBe("none");
+		expect(resolved.director.mode).toBe("grid");
 	});
 
-	test("legacy split-tree JSON → migrated panel list", () => {
+	test("a legacy split-tree yields no arrangement (the server backfills membership)", () => {
 		const legacy = JSON.stringify(
 			createBranch("horizontal", [createLeafWith("a"), createLeafWith("b")]),
 		);
-		const resolved = resolveWorkspaceLayout(legacy);
-		expect(resolved.kind).toBe("panels");
-		if (resolved.kind === "panels") {
-			expect(resolved.panels).toHaveLength(2);
-		}
+		expect(resolveWorkspaceLayout(legacy).kind).toBe("none");
+	});
+
+	test("a seed envelope yields no arrangement (also server-backfilled)", () => {
+		const seed = serializeSeedEnvelope(twoNarratorWorkspaceSeed("a", "b", "right"));
+		expect(resolveWorkspaceLayout(seed).kind).toBe("none");
 	});
 
 	test("dockview envelope → restored verbatim (legacy director without ratio → default)", () => {
@@ -182,25 +110,8 @@ describe("resolveWorkspaceLayout", () => {
 		}
 	});
 
-	test("malformed JSON → falls back to empty panel list", () => {
-		const resolved = resolveWorkspaceLayout("{not valid json");
-		expect(resolved.kind).toBe("panels");
-	});
-
-	test("seed envelope → materialised panel list (no split-tree round-trip)", () => {
-		const seed = serializeSeedEnvelope(twoNarratorWorkspaceSeed("a", "b", "right"));
-		const resolved = resolveWorkspaceLayout(seed);
-		expect(resolved.kind).toBe("panels");
-		if (resolved.kind === "panels") {
-			expect(resolved.panels).toHaveLength(2);
-			expect(resolved.panels[0].params).toEqual({ panelType: "narrator", narratorId: "a" });
-			expect(resolved.panels[0].placement).toEqual({ kind: "first" });
-			expect(resolved.panels[1].params).toEqual({ panelType: "narrator", narratorId: "b" });
-			expect(resolved.panels[1].placement).toMatchObject({
-				kind: "relative",
-				direction: "right",
-			});
-		}
+	test("malformed JSON yields no arrangement rather than throwing", () => {
+		expect(resolveWorkspaceLayout("{not valid json").kind).toBe("none");
 	});
 });
 

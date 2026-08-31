@@ -10,13 +10,20 @@ import {
 	Group,
 	Indicator,
 	Loader,
+	Progress,
 	Stack,
 	Text,
 	Tooltip,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import type { BackgroundTaskListItem } from "@shared/background-task-list";
+import type { BackgroundTaskListItem, BackgroundTaskType } from "@shared/background-task-list";
 import { isBackgroundTaskActiveStatus } from "@shared/background-task-list";
+import {
+	deriveToolProgress,
+	formatProgressBytes,
+	formatProgressDuration,
+	type ToolProgressPayload,
+} from "@shared/tool-progress";
 import {
 	IconChevronDown,
 	IconChevronRight,
@@ -24,6 +31,7 @@ import {
 	IconInfoCircle,
 	IconRobot,
 	IconTerminal2,
+	IconTransfer,
 	IconX,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
@@ -53,7 +61,7 @@ const TAIL_POLL_INTERVAL_MS = 1_500;
  */
 interface UnifiedTask {
 	id: string;
-	kind: "bash" | "agent";
+	kind: BackgroundTaskType;
 	status: string;
 	label: string;
 	command: string | null;
@@ -63,6 +71,8 @@ interface UnifiedTask {
 	subagentNarratorId: string | null;
 	activeChildTaskCount: number;
 	canCancelActiveWork: boolean;
+	/** `transfer` rows only: live byte progress, rendered as a real bar. */
+	progress?: ToolProgressPayload;
 }
 
 export function isBackgroundTaskActive(status: string): boolean {
@@ -82,7 +92,51 @@ function toUnifiedTask(task: BackgroundTaskListItem): UnifiedTask {
 		subagentNarratorId: task.subagentNarratorId,
 		activeChildTaskCount: task.activeChildTaskCount,
 		canCancelActiveWork: task.canCancelActiveWork,
+		...(task.progress ? { progress: task.progress } : {}),
 	};
+}
+
+/**
+ * The live progress bar for a background transfer row.
+ *
+ * A real `Progress` element rather than text: it animates while work continues,
+ * and an indeterminate transfer (no known total — an upload's sender knows only
+ * what it has sent) must be visibly moving instead of frozen at 0%.
+ */
+function TransferProgressBar({ progress }: { progress: ToolProgressPayload }) {
+	const { ratio, percent, ratePerSecond, etaSeconds } = deriveToolProgress(progress);
+	const indeterminate = ratio === null;
+	const figures = [
+		progress.total != null
+			? `${formatProgressBytes(progress.completed)} / ${formatProgressBytes(progress.total)}`
+			: formatProgressBytes(progress.completed),
+		...(ratePerSecond !== null ? [`${formatProgressBytes(ratePerSecond)}/s`] : []),
+		...(etaSeconds !== null ? [`ETA ${formatProgressDuration(etaSeconds)}`] : []),
+		...(progress.itemsTotal != null && progress.itemsTotal > 1
+			? [`${Math.min((progress.itemsDone ?? 0) + 1, progress.itemsTotal)}/${progress.itemsTotal}`]
+			: []),
+	];
+	return (
+		<Stack gap={2} mt={4}>
+			<Group gap={6} wrap="nowrap" align="center">
+				<Progress
+					value={indeterminate ? 100 : Math.min(100, Math.max(0, ratio * 100))}
+					color="blue"
+					size="sm"
+					radius="xl"
+					striped
+					animated
+					style={{ flex: 1, minWidth: 0 }}
+				/>
+				<Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
+					{percent != null ? `${percent}%` : "—"}
+				</Text>
+			</Group>
+			<Text size="xs" c="dimmed" ff="monospace" truncate>
+				{figures.join("  ·  ")}
+			</Text>
+		</Stack>
+	);
 }
 
 function statusColor(status: string): string {
@@ -94,6 +148,10 @@ function statusColor(status: string): string {
 			return "violet";
 		case "completed":
 			return "green";
+		// Yellow, not the failure red: a paused transfer is intact and resumable, and
+		// colouring it like an error would push users to discard recoverable work.
+		case "paused":
+			return "yellow";
 		case "cancelled":
 			return "orange";
 		default:
@@ -115,6 +173,8 @@ function statusLabel(
 			return t("backgroundTasks.statusChildRunning", { count: activeChildTaskCount });
 		case "completed":
 			return t("backgroundTasks.statusCompleted");
+		case "paused":
+			return t("backgroundTasks.statusPaused");
 		case "cancelled":
 			return t("backgroundTasks.statusCancelled");
 		case "failed":
@@ -360,7 +420,12 @@ export function BackgroundTasksPanel({
 					// lives in its subagent session, which the row already links to.
 					const canExpand = task.kind === "bash";
 					const expanded = canExpand && expandedTaskIds.has(task.id);
-					const Icon = task.kind === "bash" ? IconTerminal2 : IconRobot;
+					const Icon =
+						task.kind === "bash"
+							? IconTerminal2
+							: task.kind === "transfer"
+								? IconTransfer
+								: IconRobot;
 					return (
 						<Box
 							key={task.id}
@@ -464,6 +529,18 @@ export function BackgroundTasksPanel({
 									)}
 								</Group>
 							</Group>
+							{/* Always shown while it exists — a transfer's bar is the row's whole
+							    point, and it must not be hidden behind expanding the row. */}
+							{task.progress && <TransferProgressBar progress={task.progress} />}
+							{/* A paused transfer's `output` holds the reason it stopped (e.g. a
+							    restart), which is exactly what the user needs to decide whether
+							    to resume. The `!isActive` gate below would hide it, since paused
+							    counts as active. */}
+							{task.status === "paused" && task.output && (
+								<Text size="xs" c="dimmed" mt={4} lineClamp={2}>
+									{task.output.slice(0, 200)}
+								</Text>
+							)}
 							{!expanded && !isActive && task.output && (
 								<Text size="xs" c="dimmed" mt={4} lineClamp={2}>
 									{task.output.slice(0, 200)}

@@ -16,6 +16,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { Fragment, useMemo } from "react";
 import {
 	IMGGEN_GROUP_GAP,
@@ -345,10 +346,11 @@ function HeaderInlineView({
 								<span
 									className={frag.className}
 									style={{
-										font: frag.font,
-										marginLeft: frag.gapBefore,
-										whiteSpace: "pre",
-										display: "inline-block",
+										...fragmentTextStyle({
+											font: frag.font,
+											gapBefore: frag.gapBefore,
+											letterSpacing: letterSpacingForFont(frag.font),
+										}),
 										color:
 											frag.className === "vlist-imggen-prompt"
 												? // `c="violet"`: violet-4 on dark, violet-filled on light.

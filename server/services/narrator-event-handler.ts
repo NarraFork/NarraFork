@@ -4,6 +4,7 @@ import {
 	projectSubagentToolInputSummary,
 	type SubagentToolInputSummary,
 } from "@shared/subagent-tool-summary";
+import type { ToolProgressPayload } from "@shared/tool-progress";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -251,6 +252,15 @@ export interface ToolChunkSnapshot {
 	streamStartedAt?: number;
 	/** Latest streaming output from bash tool */
 	streamingOutput?: string;
+	/**
+	 * Latest determinate progress measurement (TransferFile).
+	 *
+	 * On the snapshot for the same reason `streamingOutput` is: a client that opens
+	 * the page mid-transfer receives only this catch-up, so without it the bar would
+	 * be missing until the NEXT frame — which for the tail of a slow transfer can be
+	 * the rest of the wait.
+	 */
+	structuredProgress?: ToolProgressPayload;
 	/**
 	 * Short whitelisted input keys, kept for SUBAGENT chunks only — those omit
 	 * `input` entirely (see {@link ToolChunkSnapshot.input}), so without this a
@@ -1885,6 +1895,22 @@ export async function processEvent(
 				narratorId: broadcastTargetId,
 				toolUseId: event.toolUseId,
 				elapsed: event.elapsed,
+			});
+			return null;
+		}
+
+		case "tool_structured_progress": {
+			// Recorded on the snapshot before broadcasting, so a client that connects
+			// between two frames still gets the current bar from its catch-up.
+			const snap = getOrCreateSnapshot(broadcastTargetId);
+			const chunk = snap.toolChunks.get(event.toolUseId);
+			if (chunk) chunk.structuredProgress = event.progress;
+			dualBroadcast(ctx, {
+				type: "tool_structured_progress",
+				narratorId: broadcastTargetId,
+				toolUseId: event.toolUseId,
+				progress: event.progress,
+				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 			return null;
 		}

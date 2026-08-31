@@ -22,7 +22,7 @@ import { useUploadCapability } from "@frontend/hooks/usePlatform";
 import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "@frontend/lib/api";
 import { apiUrl, resolveServerUrl } from "@frontend/lib/base-path";
 import { useCallback, useEffect, useState } from "react";
-import { useImageViewer } from "../../../common/ImageViewerProvider";
+import { useImageViewer } from "../../../common/image-viewer-context";
 import { MAX_INLINE_IMAGE_SOURCE_CHARS } from "../../image-clipboard";
 
 /** Cap a preview blob so a runaway file never balloons memory (25 MB). */

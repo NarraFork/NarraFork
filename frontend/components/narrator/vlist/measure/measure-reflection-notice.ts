@@ -59,7 +59,15 @@ import {
 	type PreparedFixedBlock,
 	type PreparedInlineBlock,
 } from "../prepared-block";
-import { FONT_SIZE, FONT_WEIGHT, lineBoxHeight, SANS_FAMILY, SPACING } from "../pretext-fonts";
+import {
+	FONT_SIZE,
+	FONT_WEIGHT,
+	lineBoxHeight,
+	SANS_FAMILY,
+	SPACING,
+	scaledLineBoxHeight,
+	typographyMetrics,
+} from "../pretext-fonts";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,11 +91,19 @@ export const NOTICE_ICON_GAP = SPACING.sm; // 12
 export const NOTICE_TEXT_INDENT = NOTICE_ICON_SIZE + NOTICE_ICON_GAP; // 34
 
 /** Title: Text size="xs" fw={700} lh={1.35} → round(12 × 1.35) = 16. */
-export const NOTICE_TITLE_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, 1.35); // 16
+export const NOTICE_TITLE_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, 1.35);
+/** noticeTitleLineHeight() at the reader's typography (baseline above). */
+export function noticeTitleLineHeight(): number {
+	return scaledLineBoxHeight(FONT_SIZE.xs, 1.35);
+} // 16
 export const NOTICE_TITLE_FONT = `${FONT_WEIGHT.bold} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
 
 /** Summary / nextSteps: Text size="xs" lh={1.45} → round(12 × 1.45) = 17. */
-export const NOTICE_BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, 1.45); // 17
+export const NOTICE_BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, 1.45);
+/** noticeBodyLineHeight() at the reader's typography (baseline above). */
+export function noticeBodyLineHeight(): number {
+	return scaledLineBoxHeight(FONT_SIZE.xs, 1.45);
+} // 17
 export const NOTICE_BODY_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
 /** Both body rows carry `mt={3}`. */
 export const NOTICE_BODY_MARGIN_TOP = 3;
@@ -185,8 +201,18 @@ export function measureReflectionNotice(
 		metas.push(meta);
 	};
 
+	// Every row below reads live typography. The two `*LineHeight()` helpers existed for
+	// exactly this and had NO call sites, so the notice measured its title font scaled
+	// while the box around it stayed at baseline, and both body rows ignored the reader's
+	// setting entirely. The render layer paints from the measured block, so measure is the
+	// only place this can be fixed.
 	push(
-		makeInline(data.title, NOTICE_TITLE_FONT, NOTICE_TITLE_LINE_HEIGHT, "vlist-reflection-title"),
+		makeInline(
+			data.title,
+			typographyMetrics().font.xsBold,
+			noticeTitleLineHeight(),
+			"vlist-reflection-title",
+		),
 		{ role: "title" },
 		0,
 	);
@@ -195,8 +221,8 @@ export function measureReflectionNotice(
 		push(
 			makeInline(
 				data.summary,
-				NOTICE_BODY_FONT,
-				NOTICE_BODY_LINE_HEIGHT,
+				typographyMetrics().font.xs,
+				noticeBodyLineHeight(),
 				"vlist-reflection-summary",
 			),
 			{ role: "summary" },
@@ -208,8 +234,8 @@ export function measureReflectionNotice(
 		push(
 			makeInline(
 				data.nextSteps,
-				NOTICE_BODY_FONT,
-				NOTICE_BODY_LINE_HEIGHT,
+				typographyMetrics().font.xs,
+				noticeBodyLineHeight(),
 				"vlist-reflection-next-steps",
 			),
 			{ role: "next-steps" },

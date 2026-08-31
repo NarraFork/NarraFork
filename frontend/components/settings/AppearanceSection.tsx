@@ -1,4 +1,9 @@
 import { Group, SegmentedControl, Select, Slider, Stack, Switch, Text, Title } from "@mantine/core";
+import {
+	DEFAULT_TYPOGRAPHY,
+	setTypography,
+	TYPOGRAPHY_RANGE,
+} from "@shared/pretext-layout/typography";
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -37,6 +42,69 @@ export interface AppearanceSectionProps {
 	setCenteredColumn: (v: boolean) => void;
 	lodAltGesture: boolean;
 	setLodAltGesture: (v: boolean) => void;
+}
+
+/**
+ * One typography slider.
+ *
+ * Same two-phase contract as the docked panel's knob: the drag writes the module
+ * (visible immediately, and cheap) while the preference is saved once on release.
+ * Writing per frame would re-measure every open transcript on every pointer move.
+ */
+function TypographyKnob({
+	label,
+	description,
+	value,
+	min,
+	max,
+	step,
+	marks,
+	onPreview,
+	onCommit,
+}: {
+	label: string;
+	description: string;
+	value: number;
+	min: number;
+	max: number;
+	step: number;
+	marks: { value: number; label: string }[];
+	onPreview: (value: number) => void;
+	onCommit: (value: number) => void;
+}) {
+	const [dragging, setDragging] = useState<number | null>(null);
+	return (
+		<Stack gap={4}>
+			<Group justify="space-between" wrap="nowrap" gap="xs">
+				<Text size="sm" fw={500}>
+					{label}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{`${dragging ?? value}%`}
+				</Text>
+			</Group>
+			<Text size="xs" c="dimmed">
+				{description}
+			</Text>
+			<Slider
+				value={dragging ?? value}
+				onChange={(next) => {
+					setDragging(next);
+					onPreview(next);
+				}}
+				onChangeEnd={(next) => {
+					setDragging(null);
+					onCommit(next);
+				}}
+				min={min}
+				max={max}
+				step={step}
+				label={(v) => `${v}%`}
+				marks={marks}
+				mb="md"
+			/>
+		</Stack>
+	);
 }
 
 export function AppearanceSection({
@@ -217,6 +285,79 @@ export function AppearanceSection({
 				checked={lodAltGesture}
 				onChange={(e) => setLodAltGesture(e.currentTarget.checked)}
 			/>
+			{/* Narrator typography — the same three knobs the in-session Typography panel
+			    exposes. Both write the SAME user preference; this surface exists so the
+			    controls are reachable without opening a conversation, while the docked
+			    panel exists so they can be judged against real content. */}
+			<Title order={5} mt="sm">
+				{t("narratorTypographySubSection")}
+			</Title>
+			<Text size="xs" c="dimmed">
+				{t("narratorTypographyDesc")}
+			</Text>
+			<TypographyKnob
+				label={t("narratorFontScale")}
+				description={t("narratorFontScaleDesc")}
+				value={userPrefs?.narratorFontScalePercent ?? DEFAULT_TYPOGRAPHY.fontScalePercent}
+				min={TYPOGRAPHY_RANGE.fontScalePercent.min}
+				max={TYPOGRAPHY_RANGE.fontScalePercent.max}
+				step={5}
+				marks={[
+					{ value: 70, label: "70%" },
+					{ value: 100, label: "100%" },
+					{ value: 180, label: "180%" },
+				]}
+				onPreview={(v) => setTypography({ fontScalePercent: v })}
+				onCommit={(v) => updateUserPref.mutate({ narratorFontScalePercent: v })}
+			/>
+			<TypographyKnob
+				label={t("narratorLetterSpacing")}
+				description={t("narratorLetterSpacingDesc")}
+				value={userPrefs?.narratorLetterSpacingPercent ?? DEFAULT_TYPOGRAPHY.letterSpacingPercent}
+				min={TYPOGRAPHY_RANGE.letterSpacingPercent.min}
+				max={TYPOGRAPHY_RANGE.letterSpacingPercent.max}
+				step={1}
+				marks={[
+					{ value: -5, label: "-5%" },
+					{ value: 0, label: "0" },
+					{ value: 25, label: "25%" },
+				]}
+				onPreview={(v) => setTypography({ letterSpacingPercent: v })}
+				onCommit={(v) => updateUserPref.mutate({ narratorLetterSpacingPercent: v })}
+			/>
+			<TypographyKnob
+				label={t("narratorLineHeight")}
+				description={t("narratorLineHeightDesc")}
+				value={
+					userPrefs?.narratorLineHeightScalePercent ?? DEFAULT_TYPOGRAPHY.lineHeightScalePercent
+				}
+				min={TYPOGRAPHY_RANGE.lineHeightScalePercent.min}
+				max={TYPOGRAPHY_RANGE.lineHeightScalePercent.max}
+				step={5}
+				marks={[
+					{ value: 75, label: "75%" },
+					{ value: 100, label: "100%" },
+					{ value: 220, label: "220%" },
+				]}
+				onPreview={(v) => setTypography({ lineHeightScalePercent: v })}
+				onCommit={(v) => updateUserPref.mutate({ narratorLineHeightScalePercent: v })}
+			/>
+			<TypographyKnob
+				label={t("narratorParagraphScale")}
+				description={t("narratorParagraphScaleDesc")}
+				value={userPrefs?.narratorParagraphScalePercent ?? DEFAULT_TYPOGRAPHY.paragraphScalePercent}
+				min={TYPOGRAPHY_RANGE.paragraphScalePercent.min}
+				max={TYPOGRAPHY_RANGE.paragraphScalePercent.max}
+				step={5}
+				marks={[
+					{ value: 50, label: "50%" },
+					{ value: 100, label: "100%" },
+					{ value: 250, label: "250%" },
+				]}
+				onPreview={(v) => setTypography({ paragraphScalePercent: v })}
+				onCommit={(v) => updateUserPref.mutate({ narratorParagraphScalePercent: v })}
+			/>
+
 			{/* Word Wrap */}
 			<Title order={5} mt="sm">
 				{t("wordWrapSubSection")}

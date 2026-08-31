@@ -1,12 +1,17 @@
 /**
- * usePretextDocument.test.ts — the FONT-GENERATION subscription.
+ * usePretextDocument.test.ts — the FONT- and TYPOGRAPHY-generation subscriptions.
  *
  * This hook is the only mount point for the font-generation mechanism that
  * `katex-runtime` (observation) and `prepared-markdown-cache` (the generation
- * itself) implement. Without the subscription both sides are dead code: the
- * generation advances, the caches are dropped, and the COMMITTED layout keeps its
- * baked wrap points — measurement and render diverge, which is the single failure
- * the exact list exists to prevent.
+ * itself) implement, and for the user-driven typography generation in
+ * `@shared/pretext-layout/typography`. Without the subscriptions both sides are
+ * dead code: the generation advances, the caches are dropped, and the COMMITTED
+ * layout keeps its baked wrap points — measurement and render diverge, which is
+ * the single failure the exact list exists to prevent.
+ *
+ * The typography case is the one users actually hit: the settings panel is meant
+ * to be dragged while watching the transcript, so a missing subscription here is
+ * a slider that visibly does nothing.
  *
  * Two properties are pinned, and the second matters as much as the first:
  *   1. a generation change rebuilds the committed layout;
@@ -22,6 +27,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { resetTypographyForTest, setTypography } from "@shared/pretext-layout/typography";
 import { parseHTML } from "linkedom";
 import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -256,5 +262,65 @@ describe("usePretextDocument font-generation subscription", () => {
 		await settle();
 
 		expect(viewCalls - viewCallsBefore).toBe(1);
+	});
+});
+
+describe("usePretextDocument typography subscription", () => {
+	afterEach(() => {
+		// The generation gates caches that are cleared alongside it, so rewinding is
+		// safe here and keeps each test independent.
+		resetTypographyForTest();
+	});
+
+	test("a typography change rebuilds the committed layout exactly once", async () => {
+		await mount();
+		expect(latest().status).toBe("ready");
+		const before = latest().index;
+		expect(before).toBeDefined();
+
+		measureCache.clear();
+		const viewCallsBefore = viewCalls;
+		setTypography({ fontScalePercent: 130 });
+		await settle();
+
+		// One live subscriber, same contract as the font case.
+		expect(viewCalls - viewCallsBefore).toBe(1);
+		// A NEW index: the old heights were measured at the previous font scale, so
+		// serving them would leave the transcript predicting 14px rows while the
+		// render layer paints 18.2px ones.
+		expect(latest().index).not.toBe(before);
+		expect(latest().status).toBe("ready");
+		expect(measureCache.size).toBeGreaterThan(0);
+	});
+
+	test("a no-op write does not rebuild", async () => {
+		await mount();
+		expect(latest().status).toBe("ready");
+		const before = latest().index;
+
+		const viewCallsBefore = viewCalls;
+		// Already the active value: re-measuring every message here would make
+		// dragging a slider across a value it already holds cost a full rebuild.
+		setTypography({ fontScalePercent: 100 });
+		await settle();
+
+		expect(viewCalls - viewCallsBefore).toBe(0);
+		expect(latest().index).toBe(before);
+	});
+
+	test("unmount unsubscribes, so a later change does not touch a released layout", async () => {
+		const root = await mount();
+		expect(latest().status).toBe("ready");
+		root.unmount();
+		roots = roots.filter((entry) => entry !== root);
+		await settle();
+
+		measureCache.clear();
+		const viewCallsBefore = viewCalls;
+		setTypography({ paragraphScalePercent: 150 });
+		await settle();
+
+		expect(viewCalls - viewCallsBefore).toBe(0);
+		expect(measureCache.size).toBe(0);
 	});
 });

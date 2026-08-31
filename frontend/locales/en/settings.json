@@ -2103,5 +2103,15 @@
 	"modelCardResetTooltip": "Discard your changes and follow the builtin values again",
 	"modelCardResetConfirm": "Discard your changes to {{model}} and follow the builtin values again?",
 	"modelCardDeleteConfirm": "Delete the model card for {{model}}? Its pricing, context window and matching rules are not recoverable.",
-	"modelCardFamilyPlaceholder": "gpt / claude / gemini"
+	"modelCardFamilyPlaceholder": "gpt / claude / gemini",
+	"narratorTypographySubSection": "Conversation typography",
+	"narratorTypographyDesc": "Applies to conversation text only. A Typography panel inside each conversation offers the same controls next to live content.",
+	"narratorFontScale": "Font size",
+	"narratorFontScaleDesc": "Scales body text, headings, code and labels together.",
+	"narratorLetterSpacing": "Letter spacing",
+	"narratorLetterSpacingDesc": "Extra space between characters, as a share of the font size.",
+	"narratorParagraphScale": "Paragraph spacing",
+	"narratorParagraphScaleDesc": "Gaps between paragraphs, lists, code blocks and messages.",
+	"narratorLineHeight": "Line spacing",
+	"narratorLineHeightDesc": "Spacing between lines inside a paragraph."
 }

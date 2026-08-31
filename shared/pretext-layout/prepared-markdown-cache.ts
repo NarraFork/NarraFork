@@ -76,6 +76,7 @@ import { prepareWithSegments } from "@chenglou/pretext";
 import type { MathSupport } from "./parse-markdown";
 import { clearCellMinWidthCache, parseMarkdownToPreparedBlocks } from "./parse-markdown";
 import type { PreparedBlock } from "./prepared-block";
+import { getTypographyRevision, onTypographyChange } from "./typography";
 
 /**
  * Retention ceiling in SOURCE CHARACTERS, with bulk-clear on overflow (the same
@@ -171,8 +172,10 @@ export function getPreparedMarkdownBlocks(
 	}
 	// `math ? "m" : "n"` and the revision both matter: the flag covers "no runtime
 	// at all", the revision covers "a different runtime state". `fontRevision`
-	// covers "the same text, measured against a different font" (header note).
-	const key = `${math ? "m" : "n"}${mathRevision}\u0000f${fontRevision}\u0000${markdown}`;
+	// covers "the same text, measured against a different font" (header note), and
+	// the typography generation covers "the same text and face, at a different size
+	// or letter spacing" — the user-driven counterpart of a face swap.
+	const key = `${math ? "m" : "n"}${mathRevision}\u0000f${fontRevision}\u0000t${getTypographyRevision()}\u0000${markdown}`;
 	const found = cache.get(key);
 	if (found !== undefined) {
 		hits++;
@@ -197,10 +200,15 @@ export function getPreparedMarkdownBlocks(
  * width-independent and measured at ~1075µs per item (the second-largest cost
  * after markdown). Same contract as above: the result is shared and immutable.
  *
- * Keyed on `(fontRevision, font, whiteSpace, text)`. The font STRING alone is not
- * enough — it names a family stack, not the faces that were actually resolvable
- * when the widths were baked (header note). No KaTeX revision: there is no math
- * on this path.
+ * Keyed on `(fontRevision, font, letterSpacing, whiteSpace, text)`. The font
+ * STRING alone is not enough — it names a family stack, not the faces that were
+ * actually resolvable when the widths were baked (header note). No KaTeX revision:
+ * there is no math on this path.
+ *
+ * `letterSpacing` is keyed EXPLICITLY rather than via the typography generation
+ * because it is a per-call argument: the same generation legitimately produces
+ * different spacings for different font sizes (the setting is an em fraction), so
+ * the generation alone would collide a 14px body with an 11px code block.
  */
 const segmentCache = new Map<string, ReturnType<typeof prepareWithSegments>>();
 /** Sum of cached key lengths for `segmentCache`. */
@@ -210,13 +218,22 @@ export function getPreparedTextWithSegments(
 	text: string,
 	font: string,
 	whiteSpace?: "pre-wrap",
+	letterSpacing?: number,
 ): ReturnType<typeof prepareWithSegments> {
-	const options = whiteSpace ? { whiteSpace } : undefined;
+	// Omitted entirely at 0 so pretext keeps its no-spacing fast path, and so an
+	// unscaled document produces byte-identical prepared handles to before.
+	const options =
+		whiteSpace || letterSpacing
+			? {
+					...(whiteSpace ? { whiteSpace } : {}),
+					...(letterSpacing ? { letterSpacing } : {}),
+				}
+			: undefined;
 	if (text.length > MAX_CACHED_TEXT_LENGTH) {
 		misses++;
 		return options ? prepareWithSegments(text, font, options) : prepareWithSegments(text, font);
 	}
-	const key = `f${fontRevision}\u0000${font}\u0000${whiteSpace ?? ""}\u0000${text}`;
+	const key = `f${fontRevision}\u0000${font}\u0000${letterSpacing ?? 0}\u0000${whiteSpace ?? ""}\u0000${text}`;
 	const found = segmentCache.get(key);
 	if (found !== undefined) {
 		hits++;
@@ -257,6 +274,32 @@ export function resetPreparedFontRevisionForTest(): void {
 	fontRevision = 0;
 	resetPreparedMarkdownCache();
 }
+
+/**
+ * Drop every prepared entry when the user's TYPOGRAPHY changes.
+ *
+ * Same hazard as a font swap, from a different cause: the prepared layer bakes a
+ * pixel width into every fragment, so a changed font scale or letter spacing makes
+ * a cached entry describe wrap points that will not match what gets painted. The
+ * typography generation is folded into the markdown key above, which alone would
+ * stop stale entries being SERVED — this subscription is what stops them being
+ * RETAINED, so a user sweeping a slider does not accumulate one full copy of the
+ * transcript's prepared blocks per percentage point.
+ *
+ * It also covers `segmentCache`, whose key carries the font string and letter
+ * spacing but not the generation: entries for a size the user has moved away from
+ * would otherwise sit there until the ceiling evicted them.
+ *
+ * Registered at module scope because the cache is a module singleton — there is no
+ * later moment at which having missed a change would be safe. Placed at the end of
+ * the file so both maps are initialised before the callback can close over them.
+ */
+onTypographyChange(() => {
+	resetPreparedMarkdownCache();
+	// The parser's own advance memos (table min-widths, the math placeholder
+	// advance) hold measurements at the previous size too.
+	clearCellMinWidthCache();
+});
 
 /** Diagnostics for tests and perf assertions. */
 export function preparedMarkdownCacheStats(): {

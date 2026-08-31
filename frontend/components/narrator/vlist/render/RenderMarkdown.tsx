@@ -46,12 +46,13 @@ import type {
 	PreparedUnknownBlock,
 } from "../prepared-block";
 import { DEFAULT_TABLE_METRICS, layoutTable, tableRowLineHeight } from "../prepared-block";
-import { CODE_BLOCK_FONT_SIZE, FONT_SIZE, FONT_WEIGHT, MONO_FAMILY } from "../pretext-fonts";
+import { MONO_FAMILY, typographyMetrics } from "../pretext-fonts";
 import { useShikiTokens } from "../useShikiTokens";
 import { type CodeCopyPlacement, resolveCodeCopyPlacement } from "../vlist-content-view-float";
 import { splitTokensByVisualLines } from "../vlist-token-lines";
 import { hasUnpredictableBlock } from "../vlist-unpredictable-blocks";
 import "../vlist-markdown.css";
+import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { VListCodeCopyButton } from "../VListCodeCopyButton";
 import { CaretFiller } from "./caret-filler";
 import { FragmentGap, LineFragments } from "./line-fragments";
@@ -66,9 +67,19 @@ import { TokenText } from "./TokenLines";
  */
 const streamAnimStore = new StreamAnimStore();
 
-// Markdown fenced code renders at 11px monospace (settled Shiki parity). Must
-// match measure (parse-markdown FONT_MARKDOWN_CODE / CODE_LINE_HEIGHT).
-const CODE_FONT = `${FONT_WEIGHT.regular} ${CODE_BLOCK_FONT_SIZE}px ${MONO_FAMILY}`;
+/**
+ * Markdown fenced code renders at 11px monospace (settled Shiki parity), scaled by
+ * the reader's typography. Must match measure, which prepares the block with
+ * `typographyMetrics().font.markdownCode` — hence the same accessor here rather
+ * than a second string built from the constants.
+ *
+ * A function for the same reason `mathBaseFontSize` is: a module-level capture
+ * freezes the font at chunk-load time, and the resulting mismatch is silent (the
+ * code panel keeps painting at 11px inside line boxes measured for a larger size).
+ */
+function codeFont(): string {
+	return typographyMetrics().font.markdownCode;
+}
 
 /**
  * The fenced panel's border, per side. The measure layer folds it into the box's
@@ -92,17 +103,25 @@ const MD_BODY_ATTR = "data-md-body";
 
 /**
  * Font size (px) every LaTeX formula is painted at. MUST equal the `basePx` the
- * measure layer passes to katex-geometry (parse-markdown MATH_BASE_FONT_SIZE) —
- * both are `FONT_SIZE.sm`, derived here from the same shared constant rather than
- * hardcoded, so the two cannot silently diverge.
+ * measure layer passes to katex-geometry (parse-markdown reads
+ * `typographyMetrics().mathSize`) — both resolve to the SCALED body size from the
+ * one shared snapshot rather than being hardcoded, so the two cannot silently
+ * diverge.
  *
  * Why this is load-bearing: KaTeX sizes its own root box RELATIVELY
  * (`.katex { font: normal 1.21em … }`), so the rendered geometry depends entirely
  * on the font size the formula's DOM ancestor carries. Left to inherit, KaTeX picks
  * up the document default (Mantine `body` = 16px) and paints ~14% larger than
  * measured — which the width-pinned, `overflow:hidden` host box then clips.
+ *
+ * A FUNCTION, not a constant: a module-level capture would pin every formula to the
+ * typography that happened to be active when this chunk loaded, so changing the
+ * font scale would rescale all the prose and leave the formulas behind (clipped, in
+ * the direction that makes them larger than their measured box).
  */
-const MATH_BASE_FONT_SIZE = FONT_SIZE.sm;
+function mathBaseFontSize(): number {
+	return typographyMetrics().mathSize;
+}
 
 /** Lightweight mermaid host — reuses the real MermaidDiagram via dynamic import
  * so the vlist shell never statically depends on the heavy mermaid bundle
@@ -318,6 +337,7 @@ function MarkdownSourceBody({
 	width: number;
 	height: number;
 }) {
+	const metrics = typographyMetrics();
 	return (
 		<div
 			data-vlist-markdown-source
@@ -329,10 +349,15 @@ function MarkdownSourceBody({
 				// the chunked ContentViewer's wrapped state is `overflowX: hidden`.
 				overflowY: "auto",
 				overflowX: "hidden",
-				fontSize: CODE_BLOCK_FONT_SIZE,
+				// Follows the reader's typography like every other text surface here.
+				// This body is not height-critical (it scrolls inside a box pinned to the
+				// RENDERED markdown's height, see above), so it only has to be legible —
+				// but leaving it unscaled would make the source toggle the one place in
+				// the transcript that ignores the font-size setting.
+				fontSize: metrics.codeSize,
 				// The integer line box the measure layer uses for code, for the same
 				// reason: a unitless ratio makes the browser pick a fractional height.
-				lineHeight: `${MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT}px`,
+				lineHeight: `${metrics.line.code}px`,
 				fontFamily: MONO_FAMILY,
 				whiteSpace: "pre-wrap",
 				wordBreak: "break-word",
@@ -650,24 +675,22 @@ function TableCellView({
 												);
 											}}
 											className={frag.className}
-											style={{
+											style={fragmentTextStyle({
 												font: frag.font,
-												marginLeft: frag.gapBefore,
-												whiteSpace: "pre",
-												display: "inline-block",
-											}}
+												gapBefore: frag.gapBefore,
+												letterSpacing: letterSpacingForFont(frag.font),
+											})}
 										>
 											{frag.text}
 										</a>
 									) : (
 										<span
 											className={frag.className}
-											style={{
+											style={fragmentTextStyle({
 												font: frag.font,
-												marginLeft: frag.gapBefore,
-												whiteSpace: "pre",
-												display: "inline-block",
-											}}
+												gapBefore: frag.gapBefore,
+												letterSpacing: letterSpacingForFont(frag.font),
+											})}
 										>
 											{frag.text}
 										</span>
@@ -916,24 +939,22 @@ function InlineBlockView({
 												);
 											}}
 											className={frag.className}
-											style={{
+											style={fragmentTextStyle({
 												font: frag.font,
-												marginLeft: frag.gapBefore,
-												whiteSpace: "pre",
-												display: "inline-block",
-											}}
+												gapBefore: frag.gapBefore,
+												letterSpacing: letterSpacingForFont(frag.font),
+											})}
 										>
 											{content}
 										</a>
 									) : (
 										<span
 											className={frag.className}
-											style={{
+											style={fragmentTextStyle({
 												font: frag.font,
-												marginLeft: frag.gapBefore,
-												whiteSpace: "pre",
-												display: "inline-block",
-											}}
+												gapBefore: frag.gapBefore,
+												letterSpacing: letterSpacingForFont(frag.font),
+											})}
 										>
 											{content}
 										</span>
@@ -970,7 +991,7 @@ function InlineBlockView({
  * (`.katex { font: normal 1.21em … }`), so without an explicit base it inherits
  * the document default (Mantine `body` = 16px) and paints ~14% larger than
  * katex-geometry measured — which the width pin then clips. Pinning
- * MATH_BASE_FONT_SIZE reproduces the measurement context exactly.
+ * `mathBaseFontSize()` reproduces the measurement context exactly.
  *
  * The markup comes from KaTeX's own renderer, not from model output: KaTeX
  * escapes anything it cannot parse and its default `trust: false` refuses
@@ -1030,7 +1051,7 @@ function InlineMathView({
 				overflow: "hidden",
 				// Reproduce the measurement context: KaTeX's `1.21em` root resolves
 				// against this size, so it must match katex-geometry's `basePx`.
-				fontSize: MATH_BASE_FONT_SIZE,
+				fontSize: mathBaseFontSize(),
 				// KaTeX splits a formula into several `.base` spans, cut after binary /
 				// relation operators precisely so a browser MAY break there. The box is
 				// pinned to the measured width with zero slack, so sub-pixel rounding was
@@ -1279,7 +1300,7 @@ function CodeBlockView({
 						boxSizing: "border-box",
 						minWidth: "max-content",
 						whiteSpace: "pre",
-						font: CODE_FONT,
+						font: codeFont(),
 						// MUST stay after `font`: the shorthand resets line-height to
 						// `normal` (~13px at 11px), which both left the leading uncovered
 						// and painted the text ~2px above the settled Shiki view — that one
@@ -1349,7 +1370,7 @@ function UnknownBlockView({
 								style={{
 									margin: 0,
 									padding: 8,
-									font: CODE_FONT,
+									font: codeFont(),
 									whiteSpace: "pre-wrap",
 									color: "var(--mantine-color-dimmed)",
 								}}
@@ -1374,7 +1395,7 @@ function UnknownBlockView({
 							style={{
 								margin: 0,
 								padding: 8,
-								font: CODE_FONT,
+								font: codeFont(),
 								whiteSpace: "pre-wrap",
 								color: "var(--vlist-code-fg)",
 							}}
@@ -1396,7 +1417,7 @@ function UnknownBlockView({
 							// Same relative-root problem as inline math: KaTeX's `1.21em`
 							// must resolve against the base the height model measured with,
 							// or the block renders taller than its reserved frame.
-							fontSize: MATH_BASE_FONT_SIZE,
+							fontSize: mathBaseFontSize(),
 						}}
 					>
 						{/* Same reasoning as the inline case: with `output: "html"` there is

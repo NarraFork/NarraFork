@@ -12,6 +12,14 @@
  * is a destructive action rather than a panel toggle, and the cost of a mis-tap is
  * not symmetric with opening a panel — so it can never be dragged up into the
  * always-visible row.
+ *
+ * Self-contained entries (the detail-level and execution-device pickers, the
+ * plugin picker) expand INLINE here via `renderInlineOptions`. They used to render
+ * as a dead row labelled "header only", which on a phone meant no reachable entry
+ * point at all: the header keeps two icons at that width and everything else lives
+ * in this menu. The expansion is a `Collapse` rather than `Menu.Sub` because
+ * Mantine's submenu opens on hover or ArrowRight only — neither exists on touch,
+ * which is the platform this fixes (same reasoning as CompactMenuSub).
  */
 
 import {
@@ -29,9 +37,25 @@ import {
 	verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { ActionIcon, Badge, Group, Indicator, Menu, Text, Tooltip } from "@mantine/core";
-import { IconArchive, IconDotsVertical, IconGripVertical } from "@tabler/icons-react";
-import { useCallback, useMemo, useState } from "react";
+import {
+	ActionIcon,
+	Badge,
+	Box,
+	Collapse,
+	Group,
+	Indicator,
+	Menu,
+	Text,
+	Tooltip,
+	UnstyledButton,
+} from "@mantine/core";
+import {
+	IconArchive,
+	IconChevronDown,
+	IconDotsVertical,
+	IconGripVertical,
+} from "@tabler/icons-react";
+import { type ReactNode, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	NARRATOR_TOOLBAR_DIVIDER_ID,
@@ -54,23 +78,33 @@ function entryId(entry: NarratorToolbarEntry): string {
 	return entry.kind === "divider" ? NARRATOR_TOOLBAR_DIVIDER_ID : entry.id;
 }
 
+/** Max height of an inline expansion before it scrolls (device / plugin lists can be long). */
+const INLINE_OPTIONS_MAX_HEIGHT_PX = 260;
+
 function SortableRow({
 	id,
 	tucked,
 	label,
 	badgeLabel,
 	badgeProcessing,
-	headerOnlyHint,
 	onActivate,
+	inlineOptions,
+	expanded,
+	onToggleExpanded,
+	expandLabel,
 }: {
 	id: string;
+	/** Not on the header row (tucked away, or collapsed for width) — rendered dimmed. */
 	tucked: boolean;
 	label: string;
 	badgeLabel?: string;
 	badgeProcessing?: boolean;
-	/** Shown instead of a click action for self-contained controls. */
-	headerOnlyHint?: string;
 	onActivate?: () => void;
+	/** Rows to reveal below this entry; present only for self-contained controls. */
+	inlineOptions?: ReactNode;
+	expanded?: boolean;
+	onToggleExpanded?: () => void;
+	expandLabel?: string;
 }) {
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id,
@@ -78,12 +112,11 @@ function SortableRow({
 	const def = narratorToolbarItem(id);
 	if (!def) return null;
 	const Icon = def.icon;
+	const hasInlineOptions = !!inlineOptions;
 
 	return (
 		<div
 			ref={setNodeRef}
-			{...attributes}
-			{...listeners}
 			style={{
 				transform: CSS.Transform.toString(transform),
 				transition,
@@ -93,30 +126,47 @@ function SortableRow({
 				background: isDragging ? "var(--mantine-color-dark-6)" : undefined,
 				borderRadius: isDragging ? "var(--mantine-radius-sm)" : undefined,
 				boxShadow: isDragging ? "var(--mantine-shadow-md)" : undefined,
-				userSelect: "none",
-				touchAction: "none",
-				cursor: isDragging ? "grabbing" : undefined,
 			}}
 		>
-			<Group gap={6} wrap="nowrap" px={8} py={6}>
+			{/*
+			 * Drag listeners live on the ROW, not on the node above, so the inline
+			 * expansion below is outside `touch-action: none`. Hoisting them would make
+			 * a scrollable device / plugin list unscrollable on touch — silently, since
+			 * the rows still render and nothing errors.
+			 */}
+			<Group
+				{...attributes}
+				{...listeners}
+				gap={6}
+				wrap="nowrap"
+				px={8}
+				py={6}
+				style={{
+					userSelect: "none",
+					touchAction: "none",
+					cursor: isDragging ? "grabbing" : undefined,
+				}}
+			>
 				<span style={{ display: "flex", color: "var(--mantine-color-dimmed)" }}>
 					<IconGripVertical size={14} />
 				</span>
 				<Group
 					gap={6}
 					wrap="nowrap"
-					// A self-contained control cannot be opened from the menu, so its row
-					// is plain data (still draggable) rather than a button.
-					style={{ flex: 1, minWidth: 0, cursor: onActivate ? "pointer" : "default" }}
+					style={{
+						flex: 1,
+						minWidth: 0,
+						cursor: onActivate ? "pointer" : "default",
+						// Dimming the whole label is the entire "not on the header row"
+						// signal. It used to be a per-row "No room" caption, but when the
+						// row fits only two entries EVERY other row carried it, and a
+						// caption repeated nine times is noise rather than information.
+						color: tucked ? "var(--mantine-color-dimmed)" : undefined,
+					}}
 					onClick={onActivate}
 				>
 					<Icon size={14} />
-					<Text
-						size="sm"
-						c={tucked ? "dimmed" : undefined}
-						style={{ flex: 1, minWidth: 0 }}
-						truncate
-					>
+					<Text size="sm" c="inherit" style={{ flex: 1, minWidth: 0 }} truncate>
 						{label}
 					</Text>
 					{badgeLabel ? (
@@ -124,13 +174,51 @@ function SortableRow({
 							{badgeLabel}
 						</Badge>
 					) : null}
-					{headerOnlyHint ? (
-						<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-							{headerOnlyHint}
-						</Text>
-					) : null}
 				</Group>
+				{hasInlineOptions ? (
+					<UnstyledButton
+						aria-label={expandLabel}
+						aria-expanded={expanded}
+						onClick={(event) => {
+							// The label beside it may be an activation target; expanding must not
+							// double as opening whatever that would open.
+							event.stopPropagation();
+							onToggleExpanded?.();
+						}}
+						style={{
+							display: "flex",
+							alignItems: "center",
+							justifyContent: "center",
+							flexShrink: 0,
+							padding: "0 4px",
+							borderRadius: "var(--mantine-radius-sm)",
+							color: "var(--mantine-color-dimmed)",
+							background: expanded ? "var(--mantine-color-default-hover)" : undefined,
+						}}
+					>
+						<IconChevronDown
+							size={14}
+							style={{
+								transform: expanded ? "rotate(180deg)" : undefined,
+								transition: "transform 150ms ease",
+							}}
+						/>
+					</UnstyledButton>
+				) : null}
 			</Group>
+			{hasInlineOptions ? (
+				/*
+				 * `keepMounted={false}` so a collapsed row costs nothing: the plugin
+				 * options subscribe to the contribution store and trigger a fetch on
+				 * mount, and merely opening this menu should not do that for a row the
+				 * reader never expanded.
+				 */
+				<Collapse expanded={!!expanded} keepMounted={false}>
+					<Box pl="md" style={{ maxHeight: INLINE_OPTIONS_MAX_HEIGHT_PX, overflowY: "auto" }}>
+						{inlineOptions}
+					</Box>
+				</Collapse>
+			) : null}
 		</div>
 	);
 }
@@ -189,6 +277,16 @@ export interface NarratorToolbarOverflowMenuProps {
 	badgeCounts: NarratorToolbarBadgeCounts;
 	/** Activate an entry (open its panel / drawer). */
 	onActivate: (id: string) => void;
+	/**
+	 * Rows to reveal inline for a self-contained control (one that renders its own
+	 * Menu in the header and therefore cannot be "activated"). `close` dismisses
+	 * this menu once the reader picks something.
+	 *
+	 * Required for every `selfContained` entry the host offers: without it the row
+	 * is informational only, which is what made the detail-level and device pickers
+	 * unreachable on a phone.
+	 */
+	renderInlineOptions?: (id: string, close: () => void) => ReactNode;
 	/** Archive action, pinned below the sortable list. Omit to hide it. */
 	onArchive?: () => void;
 	archiveLoading?: boolean;
@@ -202,11 +300,18 @@ export function NarratorToolbarOverflowMenu({
 	hostCapabilities,
 	badgeCounts,
 	onActivate,
+	renderInlineOptions,
 	onArchive,
 	archiveLoading,
 }: NarratorToolbarOverflowMenuProps) {
 	const { t } = useTranslation("narrator");
 	const [menuOpen, setMenuOpen] = useState(false);
+	/**
+	 * At most one expansion at a time, and never across an open/close cycle: a
+	 * dropdown that reopens mid-scroll with a 260px list already unfolded hides the
+	 * rows the reader came for.
+	 */
+	const [expandedId, setExpandedId] = useState<string | null>(null);
 	// A press must travel ≥6px to become a drag, so a plain tap still activates
 	// the row (important on touch, where every tap has some jitter).
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
@@ -228,6 +333,20 @@ export function NarratorToolbarOverflowMenu({
 
 	const flatIds = useMemo(() => listedEntries.map(entryId), [listedEntries]);
 	const dividerIndex = useMemo(() => flatIds.indexOf(NARRATOR_TOOLBAR_DIVIDER_ID), [flatIds]);
+
+	const closeMenu = useCallback(() => {
+		setMenuOpen(false);
+		setExpandedId(null);
+	}, []);
+
+	const handleMenuChange = useCallback((opened: boolean) => {
+		setMenuOpen(opened);
+		if (!opened) setExpandedId(null);
+	}, []);
+
+	// An unfolded list would ride along with the sortable transform and make the
+	// drop position hard to read, so collapse before the move starts.
+	const handleDragStart = useCallback(() => setExpandedId(null), []);
 
 	const handleDragEnd = useCallback(
 		(event: DragEndEvent) => {
@@ -272,13 +391,29 @@ export function NarratorToolbarOverflowMenu({
 	}, [listedEntries, dividerIndex]);
 	const aggregate = aggregateOverflowBadge(hiddenDefs ?? tuckedDefs, badgeCounts);
 	const noRoomIdSet = useMemo(() => new Set(noRoomIds ?? []), [noRoomIds]);
+	/**
+	 * Whether ANY entry the reader surfaced failed to fit. Drives one note under the
+	 * "shown in header" heading rather than a caption per row: the note is about the
+	 * row's width, which is one fact about the whole section, not a property each
+	 * entry carries.
+	 */
+	const anyNoRoom = useMemo(
+		() =>
+			listedEntries.some(
+				(entry, index) =>
+					entry.kind === "item" &&
+					!(dividerIndex >= 0 && index > dividerIndex) &&
+					noRoomIdSet.has(entry.id),
+			),
+		[listedEntries, dividerIndex, noRoomIdSet],
+	);
 
 	const moreLabel = t("toolbar.more");
 
 	return (
 		<Menu
 			opened={menuOpen}
-			onChange={setMenuOpen}
+			onChange={handleMenuChange}
 			position="bottom-end"
 			withinPortal
 			// The menu is the drop target — a click on a row must not close it.
@@ -320,11 +455,31 @@ export function NarratorToolbarOverflowMenu({
 				</Tooltip>
 			</Menu.Target>
 			<Menu.Dropdown>
-				<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+				<DndContext
+					sensors={sensors}
+					collisionDetection={closestCenter}
+					onDragStart={handleDragStart}
+					onDragEnd={handleDragEnd}
+				>
 					<SortableContext items={flatIds} strategy={verticalListSortingStrategy}>
-						<Text size="xs" c="dimmed" fw={600} px={8} py={4}>
-							{t("toolbar.sectionVisible")}
-						</Text>
+						<Box px={8} py={4}>
+							<Text size="xs" c="dimmed" fw={600}>
+								{t("toolbar.sectionVisible")}
+							</Text>
+							{/*
+							 * The heading claims these are in the header, which a narrow row
+							 * makes false for most of them. Saying so ONCE here replaces the
+							 * per-row "No room" caption: at the mobile cap of two entries every
+							 * remaining row carried that caption, which made it noise and
+							 * pushed the dimmed styling — the actual signal — into the
+							 * background.
+							 */}
+							{anyNoRoom ? (
+								<Text size="xs" c="dimmed" fs="italic">
+									{t("toolbar.someHiddenNoRoom")}
+								</Text>
+							) : null}
+						</Box>
 						{listedEntries.map((entry, index) => {
 							if (entry.kind === "divider") {
 								return (
@@ -337,10 +492,13 @@ export function NarratorToolbarOverflowMenu({
 							const def = narratorToolbarItem(entry.id);
 							if (!def) return null;
 							const badge = resolveNarratorToolbarBadge(def.badge, badgeCounts);
-							// Self-contained controls (device menu, plugin picker) open their own
-							// UI in the header row; from the menu there is nothing to activate, so
-							// the row shows a hint instead of a dead click.
+							// A self-contained control renders its own Menu in the header, so it has
+							// no panel to toggle from here. Instead of the old dead row it expands
+							// its options inline — which is the only entry point it has on a phone.
 							const activatable = def.selfContained !== true;
+							const inlineOptions = activatable
+								? undefined
+								: renderInlineOptions?.(entry.id, closeMenu);
 							const tucked = dividerIndex >= 0 && index > dividerIndex;
 							// "No room" only makes sense above the divider; below it, the entry is
 							// in this menu because the reader put it here.
@@ -353,21 +511,20 @@ export function NarratorToolbarOverflowMenu({
 									label={t(def.labelKey, { ns: def.namespace ?? "narrator" })}
 									badgeLabel={badge.label || undefined}
 									badgeProcessing={badge.processing}
-									headerOnlyHint={
-										noRoom
-											? t("toolbar.hiddenNoRoom")
-											: activatable
-												? undefined
-												: t("toolbar.headerOnly")
-									}
 									onActivate={
 										activatable
 											? () => {
-													setMenuOpen(false);
+													closeMenu();
 													onActivate(entry.id);
 												}
 											: undefined
 									}
+									inlineOptions={inlineOptions ?? undefined}
+									expanded={expandedId === entry.id}
+									onToggleExpanded={() =>
+										setExpandedId((current) => (current === entry.id ? null : entry.id))
+									}
+									expandLabel={t("toolbar.expandOptions")}
 								/>
 							);
 						})}
@@ -381,7 +538,7 @@ export function NarratorToolbarOverflowMenu({
 							leftSection={<IconArchive size={14} />}
 							disabled={archiveLoading}
 							onClick={() => {
-								setMenuOpen(false);
+								closeMenu();
 								onArchive();
 							}}
 						>

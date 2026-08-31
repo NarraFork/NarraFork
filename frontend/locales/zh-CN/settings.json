@@ -2103,5 +2103,15 @@
 	"modelCardResetTooltip": "放弃你的修改，重新跟随内置值",
 	"modelCardResetConfirm": "放弃你对 {{model}} 的修改，重新跟随内置值？",
 	"modelCardDeleteConfirm": "删除 {{model}} 的模型卡？其价格、上下文窗口和匹配规则将无法恢复。",
-	"modelCardFamilyPlaceholder": "gpt / claude / gemini"
+	"modelCardFamilyPlaceholder": "gpt / claude / gemini",
+	"narratorTypographySubSection": "会话排版",
+	"narratorTypographyDesc": "仅作用于会话正文。每个会话内也有「排版」面板，可对着实际内容调整同样的选项。",
+	"narratorFontScale": "字体大小",
+	"narratorFontScaleDesc": "同时缩放正文、标题、代码与标签。",
+	"narratorLetterSpacing": "字间距",
+	"narratorLetterSpacingDesc": "字符之间的额外间距，按字号的百分比计算。",
+	"narratorParagraphScale": "段落间距",
+	"narratorParagraphScaleDesc": "段落、列表、代码块与消息之间的间距。",
+	"narratorLineHeight": "行间距",
+	"narratorLineHeightDesc": "同一段落内各行之间的间距。"
 }

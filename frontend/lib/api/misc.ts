@@ -3,6 +3,7 @@ import type {
 	CredentialUsageTotalsDetail,
 } from "@frontend/types/usage-history";
 import type { ResolvedBranding } from "@shared/branding";
+import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
 import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
 import { parseContentDispositionFileName } from "./narrators";
@@ -38,6 +39,39 @@ import type {
 	TutorialLessonSessionResponse,
 	TutorialSandboxStatus,
 } from "./types";
+
+/**
+ * One workspace with its membership and arrangement.
+ *
+ * `panels` is authoritative; `layout` only says where those panels sit and is guarded
+ * by `layoutRevision`. `tree` is the same string as `layout`, still returned so older
+ * readers keep working during the rollout.
+ */
+export interface WorkspaceDetail extends ApiEntity {
+	title?: string;
+	layout: string;
+	tree: string;
+	layoutRevision: number;
+	panels: WorkspacePanel[];
+}
+
+/** Server code for a layout save that lost a race against another session. */
+export const WORKSPACE_LAYOUT_CONFLICT_CODE = "WORKSPACE_LAYOUT_CONFLICT";
+
+/**
+ * Whether a failed layout save was a lost race (as opposed to a real error).
+ *
+ * The current revision rides along so the caller can rebase and retry without an
+ * extra read — the retry happens while the user is dragging panels, so a second round
+ * trip would be visible as lag.
+ */
+export function isWorkspaceLayoutConflict(
+	error: unknown,
+): error is ApiError & { data: { currentRevision: number } } {
+	if (!(error instanceof ApiError) || error.status !== 409) return false;
+	const data = error.data as { code?: unknown; currentRevision?: unknown } | null;
+	return data?.code === WORKSPACE_LAYOUT_CONFLICT_CODE && typeof data.currentRevision === "number";
+}
 
 export const miscApi = {
 	// Dashboard aggregated summary
@@ -972,7 +1006,12 @@ export const miscApi = {
 		const qs = params.toString();
 		return request<{
 			path: string | null;
-			entries: Array<{ name: string; path: string }>;
+			/**
+			 * Directories, including symlinks whose target is a directory (`isSymlink`).
+			 * `path` is the link's own path, not its target: the user is choosing the
+			 * path they navigated to.
+			 */
+			entries: Array<{ name: string; path: string; isSymlink?: boolean }>;
 			drives?: Array<{ name: string; path: string }>;
 			parent?: string | null;
 			sep: string;
@@ -1157,20 +1196,47 @@ export const miscApi = {
 		}),
 
 	// Workspaces
-	/**
-	 * ⚠️ Returns rows WITHOUT `tree` — the layout blob is up to 2 MiB per workspace and
-	 * this lists every one the user owns, so the server sends `treeBytes` instead and the
-	 * full layout comes from `getWorkspace`. These rows are typed as the loose
-	 * `ApiEntity`, so reading `.tree` here compiles and is simply `undefined` at runtime.
-	 */
+	//
+	// Membership (`panels`) and arrangement (`layout`) are separate concerns here:
+	// panels are rows the server owns, the layout is a positioning blob. A client must
+	// never derive "which panels exist" from the layout — that equivalence is what
+	// allowed a narrator to be listed in the sidebar while no panel rendered.
 	listWorkspaces: () => request<ApiEntity[]>("/workspaces"),
-	getWorkspace: (id: string) => request<ApiEntity>(`/workspaces/${id}`),
+	getWorkspace: (id: string) => request<WorkspaceDetail>(`/workspaces/${id}`),
 	createWorkspace: (data: { title?: string; tree: string }) =>
 		request<ApiEntity>("/workspaces", { method: "POST", body: JSON.stringify(data) }),
-	updateWorkspace: (id: string, data: { title?: string; tree?: string }) =>
+	/** Rename only. The layout goes through `saveWorkspaceLayout` (revision-guarded). */
+	updateWorkspace: (id: string, data: { title: string }) =>
 		request<ApiEntity>(`/workspaces/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
 	deleteWorkspace: (id: string) =>
 		request<{ ok: boolean }>(`/workspaces/${id}`, { method: "DELETE" }),
+
+	listWorkspacePanels: (id: string) =>
+		request<{ panels: WorkspacePanel[] }>(`/workspaces/${id}/panels`),
+	/** Add a panel. Idempotent for narrators: an existing member is returned as-is. */
+	addWorkspacePanel: (id: string, input: WorkspacePanelInput) =>
+		request<{ panel: WorkspacePanel }>(`/workspaces/${id}/panels`, {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+	updateWorkspacePanelConfig: (id: string, panelId: string, config: unknown) =>
+		request<{ panel: WorkspacePanel }>(`/workspaces/${id}/panels/${panelId}`, {
+			method: "PATCH",
+			body: JSON.stringify({ config }),
+		}),
+	removeWorkspacePanel: (id: string, panelId: string) =>
+		request<{ ok: boolean }>(`/workspaces/${id}/panels/${panelId}`, { method: "DELETE" }),
+	/**
+	 * Save the arrangement under optimistic concurrency.
+	 *
+	 * Rejects with a 409 carrying `currentRevision` when another session saved first;
+	 * see `isWorkspaceLayoutConflict`. Losing this write costs positions only.
+	 */
+	saveWorkspaceLayout: (id: string, layout: string, expectedRevision: number) =>
+		request<{ layoutRevision: number }>(`/workspaces/${id}/layout`, {
+			method: "PUT",
+			body: JSON.stringify({ layout, expectedRevision }),
+		}),
 
 	// Changelog
 	getChangelogs: () => request<ChangelogEntry[]>("/changelog"),

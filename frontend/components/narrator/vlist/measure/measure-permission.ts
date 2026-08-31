@@ -61,6 +61,8 @@ import {
 	MONO_FAMILY,
 	SANS_FAMILY,
 	SPACING,
+	scaledLineBoxHeight,
+	typographyMetrics,
 } from "../pretext-fonts";
 import { pretextLineMetrics } from "./pretext-metrics";
 
@@ -79,7 +81,11 @@ export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
  * real rendered value (14) is used here for accuracy — the VListHarness
  * calibrates the exact pixels. (Reported to the main agent; no skeleton change.)
  */
-export const OPTION_DESC_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, 1.2); // 14
+export const OPTION_DESC_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, 1.2);
+/** optionDescLineHeight() at the reader's typography (baseline above). */
+export function optionDescLineHeight(): number {
+	return scaledLineBoxHeight(FONT_SIZE.xs, 1.2);
+} // 14
 /**
  * Textarea autosize row box: 12px × base line-height (1.55) → round(18.6) = 19.
  * Multiline inputs use `--input-line-height: var(--mantine-line-height)` (1.55),
@@ -149,7 +155,7 @@ export const CUSTOM_INPUT_MAX_ROWS = 3;
  */
 export function xsTextareaHeight(rows: number): number {
 	const r = clamp(rows, CUSTOM_INPUT_MIN_ROWS, CUSTOM_INPUT_MAX_ROWS);
-	return r * TEXTAREA_ROW_HEIGHT + XS_TEXTAREA_CHROME;
+	return r * typographyMetrics().line.xsBase + XS_TEXTAREA_CHROME;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -196,7 +202,7 @@ export const READONLY_NOTE_HEIGHT = XS_LINE_HEIGHT; // 17
 /** Height of the ExitPlanMode edit Textarea, clamped to [8, 30] rows. */
 export function planTextareaHeight(rows: number): number {
 	const r = clamp(rows, PLAN_TEXTAREA_MIN_ROWS, PLAN_TEXTAREA_MAX_ROWS);
-	return r * TEXTAREA_ROW_HEIGHT + PLAN_TEXTAREA_CHROME;
+	return r * typographyMetrics().line.xsBase + PLAN_TEXTAREA_CHROME;
 }
 
 /**
@@ -213,8 +219,8 @@ export function executionTargetHeight(cwdLines: number, pathLines: number): numb
 		TARGET_BORDER * 2 +
 		TARGET_HEADER_ROW +
 		(hasDetail ? TARGET_HEADER_MARGIN : 0) +
-		cwd * XS_LINE_HEIGHT +
-		path * XS_LINE_HEIGHT
+		cwd * typographyMetrics().line.xs +
+		path * typographyMetrics().line.xs
 	);
 }
 
@@ -440,7 +446,15 @@ export function measureAskUserQuestion(
 	data.questions.forEach((q, qi) => {
 		// Header (gap before it = the outer Stack gap, unless it is the first block).
 		push(
-			makeInline(q.header, HEADER_FONT, HEADER_LINE_HEIGHT, 0, "vlist-ask-header"),
+			makeInline(
+				q.header,
+				typographyMetrics().font.bodyMedium,
+				// Scaled to match the scaled font on the line above. A frozen box here held
+				// scaled glyphs, which clips ascenders/descenders rather than merely looking off.
+				scaledLineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm),
+				0,
+				"vlist-ask-header",
+			),
 			{ role: "header", questionIndex: qi },
 			ALERT_STACK_GAP,
 		);
@@ -452,11 +466,16 @@ export function measureAskUserQuestion(
 				// First option is separated from the header by the question Stack gap;
 				// subsequent options by the tighter options Stack gap.
 				const labelMt = oi === 0 ? QUESTION_STACK_GAP : OPTIONS_GAP;
+				// Live typography, like the header above. These read frozen baseline
+				// constants while the header scaled, so at a non-default setting a card's
+				// header grew and its options did not — the option text simply ignored the
+				// reader's preference. The render layer paints from `block.fonts` /
+				// `block.lineHeight`, so measure is the only authority and this is the fix.
 				push(
 					makeInline(
 						opt.label,
-						OPTION_LABEL_FONT,
-						OPTION_LABEL_LINE_HEIGHT,
+						typographyMetrics().font.body,
+						scaledLineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm),
 						OPTION_INDENT,
 						"vlist-ask-option-label",
 					),
@@ -467,8 +486,9 @@ export function measureAskUserQuestion(
 					push(
 						makeInline(
 							opt.description,
-							OPTION_DESC_FONT,
-							OPTION_DESC_LINE_HEIGHT,
+							typographyMetrics().font.xs,
+							// 1.2 is Mantine's hard-coded InputDescription ratio, not a body ratio.
+							optionDescLineHeight(),
 							OPTION_INDENT,
 							"vlist-ask-option-desc",
 						),
@@ -491,8 +511,8 @@ export function measureAskUserQuestion(
 			push(
 				makeInline(
 					q.savedCustomAnswer,
-					CUSTOM_ANSWER_FONT,
-					CUSTOM_ANSWER_LINE_HEIGHT,
+					typographyMetrics().font.xsMono,
+					scaledLineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs),
 					0,
 					"vlist-ask-custom-answer",
 				),
@@ -631,7 +651,7 @@ export function measureInlinePermission(
 	if (data.hasDecisionReason) {
 		const reasonLines = Math.max(1, data.decisionReasonLines ?? 1);
 		push(
-			makeFixed(reasonLines * XS_LINE_HEIGHT, "decision-reason", { reasonLines }),
+			makeFixed(reasonLines * typographyMetrics().line.xs, "decision-reason", { reasonLines }),
 			{ role: "decision-reason", data: { reasonLines } },
 			DECISION_REASON_MARGIN_BOTTOM,
 		);

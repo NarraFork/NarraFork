@@ -1,3 +1,4 @@
+import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { SubagentActivitySummary, TreeMessage } from "../../lib/api";
 import {
 	findMsgByToolUseIdInTree,
@@ -178,6 +179,8 @@ export interface TopLevelStreamingChunk {
 	_longRunning?: boolean;
 	_streamedFullOutput?: boolean;
 	_streamingOutput?: string;
+	/** Latest determinate progress measurement (drives a real progress bar). */
+	_structuredProgress?: ToolProgressPayload;
 }
 
 /**
@@ -207,6 +210,7 @@ export function topLevelStreamingChunkToToolFields(
 			...(chunk._longRunning ? { _longRunning: true } : {}),
 			...(chunk._streamedFullOutput ? { _streamedFullOutput: true } : {}),
 			_streamingOutput: chunk._streamingOutput,
+			...(chunk._structuredProgress ? { _structuredProgress: chunk._structuredProgress } : {}),
 		};
 	}
 
@@ -367,6 +371,9 @@ export function buildTopLevelStreamingChunksMsg(
 					...(chunk._longRunning && { _longRunning: true }),
 					...(chunk._streamedFullOutput && { _streamedFullOutput: true }),
 					...(chunk._streamingOutput && { _streamingOutput: chunk._streamingOutput }),
+					...(chunk._structuredProgress && {
+						_structuredProgress: chunk._structuredProgress,
+					}),
 				} as (typeof toolCalls)[number];
 			}
 		} else {

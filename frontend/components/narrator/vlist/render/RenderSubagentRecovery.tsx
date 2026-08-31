@@ -19,6 +19,7 @@ import {
 	HEADER_INNER_GAP,
 	ROW_GAP,
 	ROW_HEIGHT,
+	rowHeight,
 	type SubagentRecoveryData,
 	type SubagentRecoveryRow,
 } from "../measure/measure-subagent-recovery";
@@ -99,7 +100,7 @@ export function RenderSubagentRecovery({
 				{rows.length > 0 && (
 					<Stack gap={ROW_GAP}>
 						{rows.map((row, index) => (
-							<Group key={row.id} gap={6} wrap="nowrap" style={{ height: ROW_HEIGHT }}>
+							<Group key={row.id} gap={6} wrap="nowrap" style={{ height: rowHeight() }}>
 								<Checkbox
 									size="xs"
 									checked={!deselected.has(index)}

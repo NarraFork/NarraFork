@@ -171,6 +171,14 @@ export interface TutorialIndexResponse {
 export interface TutorialLessonResponse {
 	lesson: TutorialLesson;
 	progress: TutorialLessonProgress | null;
+	/**
+	 * The tutorial narrator this lesson would continue, when one already exists.
+	 *
+	 * Null means nothing is running yet. The page must mount this rather than asking
+	 * the user to start again: starting writes a new lesson boundary, which rewinds
+	 * the script of a lesson that was already in progress.
+	 */
+	session: TutorialLessonSessionResponse | null;
 }
 
 export interface TutorialLessonSessionResponse {

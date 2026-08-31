@@ -103,7 +103,17 @@ export interface PathIdentity {
 /** A directory entry returned by listDir. */
 export interface DirEntry {
 	name: string;
+	/**
+	 * True for a real directory AND for a symlink whose target is a directory.
+	 * Raw `readdir`/`ReadDir` types come from lstat, where a symlinked directory
+	 * reports false; backends resolve the link so callers see the effective type.
+	 */
 	isDirectory: boolean;
+	/**
+	 * The entry is a symbolic link. Optional because older remote executors do not
+	 * report it; absent means "unknown", not "not a link".
+	 */
+	isSymlink?: boolean;
 }
 
 /** Options for reading raw file bytes. */

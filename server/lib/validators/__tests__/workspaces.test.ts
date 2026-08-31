@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	createWorkspaceSchema,
+	saveWorkspaceLayoutSchema,
 	updateWorkspaceSchema,
 	WORKSPACE_TREE_MAX_BYTES,
 	WORKSPACE_TREE_MAX_CHARS_FOR_TEST,
@@ -76,16 +77,41 @@ describe("workspace tree size limit", () => {
 		expect(createWorkspaceSchema.safeParse({ tree }).success).toBe(true);
 	});
 
-	test("update applies the same rule and keeps tree optional", () => {
+	// `PATCH /workspaces/:id` is rename-only. It neither checks nor advances
+	// `layout_revision`, so accepting a layout there would defeat the optimistic lock:
+	// a write through it leaves every client's cached revision looking valid while the
+	// blob has moved on, and the next guarded PUT then overwrites it with a stale
+	// arrangement while passing its `expectedRevision` check.
+	test("the rename route does not accept a layout at all", () => {
 		expect(updateWorkspaceSchema.safeParse({ title: "renamed" }).success).toBe(true);
+		const parsed = updateWorkspaceSchema.safeParse({
+			title: "renamed",
+			tree: asciiTreeOfBytes(1024),
+		});
+		expect(parsed.success).toBe(true);
+		// Even if a client sends it, it must not survive parsing into the update.
+		expect(parsed.success && "tree" in parsed.data).toBe(false);
+	});
+
+	test("the layout route applies the same byte rule", () => {
 		expect(
-			updateWorkspaceSchema.safeParse({ tree: asciiTreeOfBytes(WORKSPACE_TREE_MAX_BYTES) }).success,
+			saveWorkspaceLayoutSchema.safeParse({
+				layout: asciiTreeOfBytes(WORKSPACE_TREE_MAX_BYTES),
+				expectedRevision: 0,
+			}).success,
 		).toBe(true);
 		expect(
-			updateWorkspaceSchema.safeParse({ tree: asciiTreeOfBytes(WORKSPACE_TREE_MAX_BYTES + 1) })
-				.success,
+			saveWorkspaceLayoutSchema.safeParse({
+				layout: asciiTreeOfBytes(WORKSPACE_TREE_MAX_BYTES + 1),
+				expectedRevision: 0,
+			}).success,
 		).toBe(false);
-		expect(updateWorkspaceSchema.safeParse({ tree: cjkTreeOverByteBudget() }).success).toBe(false);
+		expect(
+			saveWorkspaceLayoutSchema.safeParse({
+				layout: cjkTreeOverByteBudget(),
+				expectedRevision: 0,
+			}).success,
+		).toBe(false);
 	});
 
 	test("still rejects a tree too short to be JSON", () => {

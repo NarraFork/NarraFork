@@ -132,6 +132,8 @@ export type {
 	KnowledgeVerdict,
 	KnowledgeWithdrawResult,
 } from "./knowledge-types";
+export type { WorkspaceDetail } from "./misc";
+export { isWorkspaceLayoutConflict, WORKSPACE_LAYOUT_CONFLICT_CODE } from "./misc";
 export type {
 	CreateOAuthAppInput,
 	OAuthApp,

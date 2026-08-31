@@ -246,6 +246,7 @@ import {
 	disarmQuestionReflection,
 	getQuestionReflectionDeadline,
 	reflectPendingAskUserQuestion,
+	resolveDecisionNarratorId,
 	stopDangerReflectionLoop,
 	takeOverQuestionReflection,
 } from "../services/narrator-permission";
@@ -322,7 +323,6 @@ import {
 	type BufferedMessage,
 	getNarratorRuntimeModel,
 	isNarratorRuntimeBusy,
-	pendingPermissions,
 	planModeAskedOnce,
 	requestPlanModePromptRebuild,
 	resetActiveUpstreamSession,
@@ -556,13 +556,14 @@ narratorRoutes.use("/:id", async (c, next) => {
  * Approving a tool call is the single most consequential action on this surface —
  * it is what lets an agent write files or run commands — and the path carries no
  * narrator id, so the gates above cannot see these routes at all. The owning
- * narrator is resolved from the pending request (in memory) or from the tool-call
- * row (once decided), and write access is required.
+ * narrator is resolved through `resolveDecisionNarratorId`, which knows every
+ * decision registry (permission, danger/plan/task/question reflection) plus the
+ * tool-call-row fallback, and write access is required.
  */
 narratorRoutes.use("/permissions/:requestId/*", async (c, next) => {
 	const requestId = c.req.param("requestId");
 	if (!requestId) return next();
-	await requireOwningNarratorAccess(c, () => resolvePermissionNarratorId(requestId), "write");
+	await requireOwningNarratorAccess(c, () => resolveDecisionNarratorId(requestId), "write");
 	return next();
 });
 
@@ -583,19 +584,6 @@ for (const segment of [
 		await requireOwningNarratorAccess(c, () => resolveRuleNarratorId(segment, entryId), "write");
 		return next();
 	});
-}
-
-/** The narrator a permission request belongs to, pending or already decided. */
-async function resolvePermissionNarratorId(requestId: string): Promise<string | null> {
-	const pending = pendingPermissions.get(requestId);
-	if (pending?.narratorId) return pending.narratorId;
-	// Decided (or reflection-driven) requests are only in the tool-call table. The
-	// request id is the tool-call row id.
-	const row = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, requestId),
-		columns: { narratorId: true },
-	});
-	return row?.narratorId ?? null;
 }
 
 /** The narrator owning one allow/deny-list entry. */
@@ -5967,6 +5955,29 @@ narratorRoutes.post("/:id/background-tasks/:taskId/cancel", async (c) => {
 	const task = await backgroundTaskService.getById(taskId);
 	if (task && task.parentNarratorId !== parentNarratorId) {
 		return c.json({ error: "Task does not belong to this narrator" }, 403);
+	}
+
+	// A transfer's projection row cannot be cancelled on its own: the work lives in
+	// the owning `device_transfer_tasks` row, which holds the resume checkpoint. Only
+	// cancelling that discards the checkpoint and aborts the in-flight run — marking
+	// the projection alone would show "cancelled" while bytes kept moving.
+	if (task?.type === "transfer") {
+		if (!task.transferTaskId) {
+			return c.json({ error: "Transfer task has no owning transfer record" }, 409);
+		}
+		const { cancelDeviceTransferTaskById } = await import("../services/device-transfer-service");
+		const cancelled = await cancelDeviceTransferTaskById(task.transferTaskId);
+		if (!cancelled) {
+			return c.json({ error: "Transfer is not cancellable" }, 409);
+		}
+		// The projection follows from the runner's own terminal report, so it is not
+		// written here — one owner, one writer.
+		return c.json({
+			success: true,
+			cancelledTask: true,
+			interruptedContinuation: false,
+			cancelledChildren: 0,
+		});
 	}
 
 	const subagentId = task?.type === "agent" ? (task.subagentNarratorId ?? task.id) : taskId;

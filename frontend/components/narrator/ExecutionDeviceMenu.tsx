@@ -19,25 +19,76 @@ export interface ExecutionDeviceOption {
 	online: boolean;
 }
 
-export function ExecutionDeviceMenu({
-	label,
-	localLabel,
-	offlineLabel,
-	devices,
-	currentDeviceId,
-	pending,
-	onSelect,
-}: {
+export interface ExecutionDeviceOptionsProps {
 	label: string;
 	localLabel: string;
 	offlineLabel: string;
 	devices: readonly ExecutionDeviceOption[];
 	/** `"local"` or a device id. */
 	currentDeviceId: string;
-	pending?: boolean;
 	/** `null` selects the local target. */
 	onSelect: (deviceId: string | null) => void;
-}) {
+	/** Hide the heading when the surrounding surface already labels the group. */
+	withLabel?: boolean;
+}
+
+/**
+ * The target rows on their own, without a trigger or a dropdown around them.
+ *
+ * Exported so the header's Menu and the toolbar overflow menu's inline expansion
+ * present the SAME rows. The overflow menu used to render this entry as a dead
+ * "header only" line, which on a phone — where the header keeps two icons and the
+ * rest lives in that menu — left the control with no reachable entry point.
+ */
+export function ExecutionDeviceOptions({
+	label,
+	localLabel,
+	offlineLabel,
+	devices,
+	currentDeviceId,
+	onSelect,
+	withLabel = true,
+}: ExecutionDeviceOptionsProps) {
+	return (
+		<>
+			{withLabel && <Menu.Label>{label}</Menu.Label>}
+			<Menu.Item
+				leftSection={<IconDeviceDesktop size={14} />}
+				rightSection={
+					<IconCheck
+						size={14}
+						style={{ visibility: currentDeviceId === "local" ? "visible" : "hidden" }}
+					/>
+				}
+				onClick={() => onSelect(null)}
+			>
+				{localLabel}
+			</Menu.Item>
+			{devices.map((device) => (
+				<Menu.Item
+					key={device.id}
+					leftSection={<IconDevices size={14} />}
+					disabled={!device.online}
+					rightSection={
+						<IconCheck
+							size={14}
+							style={{ visibility: currentDeviceId === device.id ? "visible" : "hidden" }}
+						/>
+					}
+					onClick={() => onSelect(device.id)}
+				>
+					{device.online ? device.name : `${device.name} (${offlineLabel})`}
+				</Menu.Item>
+			))}
+		</>
+	);
+}
+
+export function ExecutionDeviceMenu({
+	pending,
+	...options
+}: Omit<ExecutionDeviceOptionsProps, "withLabel"> & { pending?: boolean }) {
+	const { label, localLabel, devices, currentDeviceId } = options;
 	const isRemote = currentDeviceId !== "local";
 	const currentDevice = isRemote ? devices.find((d) => d.id === currentDeviceId) : undefined;
 	const currentLabel = currentDevice ? currentDevice.name : localLabel;
@@ -58,35 +109,7 @@ export function ExecutionDeviceMenu({
 				</Tooltip>
 			</Menu.Target>
 			<Menu.Dropdown>
-				<Menu.Label>{label}</Menu.Label>
-				<Menu.Item
-					leftSection={<IconDeviceDesktop size={14} />}
-					rightSection={
-						<IconCheck
-							size={14}
-							style={{ visibility: currentDeviceId === "local" ? "visible" : "hidden" }}
-						/>
-					}
-					onClick={() => onSelect(null)}
-				>
-					{localLabel}
-				</Menu.Item>
-				{devices.map((device) => (
-					<Menu.Item
-						key={device.id}
-						leftSection={<IconDevices size={14} />}
-						disabled={!device.online}
-						rightSection={
-							<IconCheck
-								size={14}
-								style={{ visibility: currentDeviceId === device.id ? "visible" : "hidden" }}
-							/>
-						}
-						onClick={() => onSelect(device.id)}
-					>
-						{device.online ? device.name : `${device.name} (${offlineLabel})`}
-					</Menu.Item>
-				))}
+				<ExecutionDeviceOptions {...options} />
 			</Menu.Dropdown>
 		</Menu>
 	);

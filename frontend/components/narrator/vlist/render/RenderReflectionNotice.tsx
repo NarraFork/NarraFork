@@ -27,20 +27,13 @@ import {
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
 import { Button, ThemeIcon } from "@mantine/core";
+import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { shouldShowThinkingChars } from "@shared/progress-phase";
-import {
-	IconBan,
-	IconCheck,
-	IconLoader2,
-	IconPlayerStop,
-	IconShield,
-	IconX,
-} from "@tabler/icons-react";
+import { IconBan, IconCheck, IconPlayerStop, IconShield, IconX } from "@tabler/icons-react";
 import { Fragment, useMemo } from "react";
 import { useReflectionProgress } from "../../reflection-progress-store";
 import {
 	type MeasuredReflectionNotice,
-	NOTICE_BODY_FONT,
 	NOTICE_BORDER,
 	NOTICE_BUTTON_HEIGHT,
 	NOTICE_ICON_SIZE,
@@ -48,7 +41,7 @@ import {
 	type ReflectionBlockMeta,
 } from "../measure/measure-reflection-notice";
 import type { PreparedInlineBlock } from "../prepared-block";
-import { RADIUS } from "../pretext-fonts";
+import { RADIUS, typographyMetrics } from "../pretext-fonts";
 import { FragmentGap, LineFragments } from "./line-fragments";
 
 export interface ReflectionNoticeLabels {
@@ -173,10 +166,11 @@ function InlineRow({
 								<span
 									className={frag.className}
 									style={{
-										font: frag.font,
-										marginLeft: frag.gapBefore,
-										whiteSpace: "pre",
-										display: "inline-block",
+										...fragmentTextStyle({
+											font: frag.font,
+											gapBefore: frag.gapBefore,
+											letterSpacing: letterSpacingForFont(frag.font),
+										}),
 										color,
 									}}
 								>
@@ -219,7 +213,7 @@ function ReflectionProgressText({
 	return (
 		<span
 			style={{
-				font: NOTICE_BODY_FONT,
+				font: typographyMetrics().font.xs,
 				color,
 				whiteSpace: "nowrap",
 				overflow: "hidden",

@@ -25,13 +25,13 @@ import {
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
 import { Box, Button, Group, Paper, Stack, Text, TextInput } from "@mantine/core";
+import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { IconArrowRight, IconMessageQuestion } from "@tabler/icons-react";
 import { Fragment, type KeyboardEvent, type ReactNode, useCallback, useMemo } from "react";
 import {
 	PENDING_HINT_MARGIN,
 	PENDING_PADDING_X,
 	PENDING_PADDING_Y,
-	QUESTION_FONT,
 	QUESTION_MAX_LINES,
 	RESOLVED_GROUP_GAP,
 	RESOLVED_ICON,
@@ -40,6 +40,7 @@ import {
 	RESOLVED_PADDING_Y,
 } from "../measure/measure-ask-in-passing";
 import type { MeasuredElement, PreparedFixedBlock, PreparedInlineBlock } from "../prepared-block";
+import { typographyMetrics } from "../pretext-fonts";
 import { FragmentGap, LineFragments } from "./line-fragments";
 
 const CARD_BG = "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))";
@@ -175,7 +176,7 @@ function ResolvedCard({
 			out.push(
 				line.fragments.map((f) => ({
 					text: f.text,
-					font: block.fonts[f.itemIndex] ?? QUESTION_FONT,
+					font: block.fonts[f.itemIndex] ?? typographyMetrics().font.bodyMedium,
 					gapBefore: f.gapBefore,
 				})),
 			);
@@ -256,10 +257,11 @@ function ResolvedCard({
 											<FragmentGap gapBefore={frag.gapBefore} />
 											<span
 												style={{
-													font: frag.font,
-													marginLeft: frag.gapBefore,
-													whiteSpace: "pre",
-													display: "inline-block",
+													...fragmentTextStyle({
+														font: frag.font,
+														gapBefore: frag.gapBefore,
+														letterSpacing: letterSpacingForFont(frag.font),
+													}),
 													color: "var(--mantine-color-text)",
 												}}
 											>

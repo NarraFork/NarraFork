@@ -40,11 +40,10 @@ import {
 } from "../prepared-block";
 import {
 	FONT_SIZE,
-	FONT_WEIGHT,
 	LINE_HEIGHT,
 	lineBoxHeight,
-	SANS_FAMILY,
 	SPACING,
+	typographyMetrics,
 } from "../pretext-fonts";
 import { inlineMetrics, pretextLineMetrics } from "./pretext-metrics";
 
@@ -239,9 +238,6 @@ export const IMGGEN_MAX_DISPLAY_WIDTH = 512;
 /** Conservative fallback image area height when intrinsic size is unknown. */
 export const IMGGEN_UNKNOWN_IMAGE_HEIGHT = 240;
 
-const IMGGEN_STATUS_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
-// revisedPrompt is fw={500} in the original component.
-const IMGGEN_PROMPT_FONT = `500 ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
 // ml={4} applied to the revisedPrompt span.
 const IMGGEN_PROMPT_GAP = 4;
 
@@ -300,8 +296,13 @@ function buildHeaderInline(
 
 	const statusText = data.statusText ?? "";
 	if (statusText.length > 0) {
-		items.push({ text: statusText, font: IMGGEN_STATUS_FONT, break: "normal", extraWidth: 0 });
-		fonts.push(IMGGEN_STATUS_FONT);
+		items.push({
+			text: statusText,
+			font: typographyMetrics().font.xs,
+			break: "normal",
+			extraWidth: 0,
+		});
+		fonts.push(typographyMetrics().font.xs);
 		classNames.push(IMGGEN_STATUS_CLASS);
 		hrefs.push(null);
 	}
@@ -309,18 +310,18 @@ function buildHeaderInline(
 	if (prompt.length > 0) {
 		items.push({
 			text: prompt,
-			font: IMGGEN_PROMPT_FONT,
+			font: typographyMetrics().font.xsMedium,
 			break: "normal",
 			extraWidth: items.length > 0 ? IMGGEN_PROMPT_GAP : 0,
 		});
-		fonts.push(IMGGEN_PROMPT_FONT);
+		fonts.push(typographyMetrics().font.xsMedium);
 		classNames.push(IMGGEN_PROMPT_CLASS);
 		hrefs.push(null);
 	}
 	// Guarantee at least one fragment so pretext produces a valid single line.
 	if (items.length === 0) {
-		items.push({ text: " ", font: IMGGEN_STATUS_FONT, break: "normal", extraWidth: 0 });
-		fonts.push(IMGGEN_STATUS_FONT);
+		items.push({ text: " ", font: typographyMetrics().font.xs, break: "normal", extraWidth: 0 });
+		fonts.push(typographyMetrics().font.xs);
 		classNames.push(IMGGEN_STATUS_CLASS);
 		hrefs.push(null);
 	}
@@ -329,7 +330,7 @@ function buildHeaderInline(
 		...FLAT_BASE,
 		kind: "inline",
 		flow: prepareRichInline(items),
-		lineHeight: IMGGEN_HEADER_LINE_HEIGHT,
+		lineHeight: typographyMetrics().line.xs,
 		classNames,
 		hrefs,
 		fonts,
@@ -357,7 +358,7 @@ export function measureImageGeneration(
 	const headerBlock = buildHeaderInline(data, iconArea);
 	const headerTextWidth = Math.max(1, innerWidth - iconArea);
 	const { lineCount, maxLineWidth } = inlineMetrics(headerBlock, headerTextWidth);
-	const textHeight = lineCount * IMGGEN_HEADER_LINE_HEIGHT;
+	const textHeight = lineCount * typographyMetrics().line.xs;
 	// The header row is at least as tall as the icon.
 	const headerHeight = Math.max(IMGGEN_ICON_SIZE, textHeight);
 

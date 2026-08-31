@@ -67,6 +67,7 @@
 	"retryRecentTabs": "Retry",
 	"recentTabsSyncError": "Recent tabs could not be synced",
 	"recentTabsReorderFailed": "Tab order could not be saved",
+	"workspaceAddPanelFailed": "Could not add this narrator to the workspace",
 	"recentTabsGrouping": "Tab grouping",
 	"groupModeFlat": "Flat list",
 	"groupModeDirectory": "Group by directory",

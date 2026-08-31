@@ -8,7 +8,7 @@
  */
 
 import { IMGGEN_GROUP_GAP, TEXT_FILE_ICON_SIZE } from "../measure/measure-media";
-import { FONT_SIZE, SANS_FAMILY } from "../pretext-fonts";
+import { typographyMetrics } from "../pretext-fonts";
 
 /** Local copy of shared/text-file-types formatFileSize (keeps render self-contained). */
 export function formatFileSize(bytes: number): string {
@@ -77,14 +77,14 @@ export function TextFileRow({
 				<FileGlyph />
 			</div>
 			<span
-				style={{ font: `500 ${FONT_SIZE.sm}px ${SANS_FAMILY}`, color: "var(--mantine-color-text)" }}
+				style={{ font: typographyMetrics().font.bodyMedium, color: "var(--mantine-color-text)" }}
 			>
 				{filename}
 			</span>
 			{size != null ? (
 				<span
 					style={{
-						font: `400 ${FONT_SIZE.xs}px ${SANS_FAMILY}`,
+						font: typographyMetrics().font.xs,
 						color: "var(--mantine-color-dimmed)",
 						// Never let the size be the thing that wraps: the row is reserved at a
 						// fixed TEXT_FILE_HEIGHT, so a "(1.5\nKB)" break would overflow a box

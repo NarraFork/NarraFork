@@ -9,6 +9,8 @@
  * cursor-driven, and steady-state refreshes arrive as WS deltas.
  */
 
+import type { ToolProgressPayload } from "./tool-progress";
+
 /** Default page size for the cursor-paged list. */
 export const BACKGROUND_TASK_LIST_PAGE_SIZE = 30;
 /** Hard cap for a client-requested page size. */
@@ -36,6 +38,16 @@ export const BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS = 4_000;
 export const BACKGROUND_TASK_DELTA_MAX_REMOVE_IDS = 50;
 
 /**
+ * The kinds of work a background task row can represent.
+ *
+ * `transfer` rows are a PROJECTION of a `device_transfer_tasks` row, which owns
+ * the transfer's durable state. They exist here only so a device transfer shows
+ * up in the places a narrator's background work is expected: Await, the task
+ * drawer, and completion notifications.
+ */
+export type BackgroundTaskType = "bash" | "agent" | "transfer";
+
+/**
  * One row of the task list, normalized so the unified `background_tasks` table
  * and the legacy `narrators.is_background` rows have a single shape. The
  * normalization used to live in the frontend (`toUnifiedTasks`), which meant
@@ -43,7 +55,7 @@ export const BACKGROUND_TASK_DELTA_MAX_REMOVE_IDS = 50;
  */
 export interface BackgroundTaskListItem {
 	id: string;
-	type: "bash" | "agent";
+	type: BackgroundTaskType;
 	/** Raw persisted status of the row. */
 	status: string;
 	/**
@@ -85,6 +97,16 @@ export interface BackgroundTaskListItem {
 	createdAt: string;
 	/** True when this row came from the legacy `narrators.is_background` path. */
 	legacy: boolean;
+	/**
+	 * `transfer` rows only: the live byte progress, JOINED from the owning
+	 * `device_transfer_tasks` row at read time.
+	 *
+	 * Deliberately not a stored column on `background_tasks`. Progress changes
+	 * every 500ms while a transfer runs; persisting it in both tables would mean
+	 * two rows that must agree on a fast-moving value, and the projection exists
+	 * precisely to avoid that.
+	 */
+	progress?: ToolProgressPayload;
 }
 
 export interface BackgroundTaskListPage {
@@ -126,8 +148,42 @@ export interface BackgroundTaskListDelta {
 	invalidate?: boolean;
 }
 
+/**
+ * A live progress update for one `transfer` row.
+ *
+ * Deliberately NOT a `BackgroundTaskListDelta`. That channel is strictly ordered:
+ * the client refetches the whole first page whenever a version number is skipped
+ * (see applyBackgroundTaskDelta). Progress arrives ~2×/s per active transfer, so
+ * routing it through there would (a) make every dropped frame trigger a full
+ * refetch, and (b) cost an activeCount query per frame.
+ *
+ * This frame carries no version because it needs none: each payload is a complete
+ * snapshot, so a lost frame is corrected by the next one. It only ever updates a
+ * row the client already has — it can neither insert, remove nor reorder.
+ */
+export interface BackgroundTaskProgressFrame {
+	/** Must match the client's cached epoch, else the row set is meaningless. */
+	listEpoch: string;
+	taskId: string;
+	progress: ToolProgressPayload;
+}
+
+/**
+ * Whether a (possibly derived) status means the task still has work outstanding.
+ *
+ * `paused` counts as ACTIVE even though nothing is executing. A paused transfer
+ * holds a resume checkpoint and is waiting on a decision — treating it as
+ * terminal would drop it out of the active set and out of the drawer's running
+ * count, i.e. a transfer the user deliberately paused would quietly vanish and
+ * only reappear if they went looking through the full history.
+ */
 export function isBackgroundTaskActiveStatus(status: string): boolean {
-	return status === "running" || status === "continued" || status === "child_running";
+	return (
+		status === "running" ||
+		status === "paused" ||
+		status === "continued" ||
+		status === "child_running"
+	);
 }
 
 /** Descending `(createdAt, id)` comparator — the list's single ordering. */

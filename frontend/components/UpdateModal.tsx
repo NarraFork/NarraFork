@@ -39,8 +39,8 @@ import {
 	shouldAssumeLocalSchedule,
 	shouldShowUpdateScheduleButton,
 } from "../lib/update-state";
-import { useConfirmDialog } from "./common/ConfirmDialogProvider";
 import { CopyButton } from "./common/CopyButton";
+import { useConfirmDialog } from "./common/confirm-dialog-context";
 import { MarkdownContent } from "./narrator/MarkdownContent";
 
 function formatBytes(bytes: number): string {

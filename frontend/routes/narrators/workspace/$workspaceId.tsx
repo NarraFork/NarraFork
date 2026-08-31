@@ -1,4 +1,5 @@
 import { ActionIcon, Box, Center, Group, Loader, Text, TextInput, Tooltip } from "@mantine/core";
+import type { WorkspacePanel } from "@shared/workspace-panels";
 import {
 	IconArrowLeft,
 	IconCheck,
@@ -6,7 +7,8 @@ import {
 	IconLayoutSidebarRight,
 	IconPencil,
 } from "@tabler/icons-react";
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { WebviewLeafConfig } from "../../../components/narrator/split-tree";
@@ -22,11 +24,11 @@ import {
 import type { WorkspaceDirectorState } from "../../../components/narrator/workspace/dockview-layout";
 import type { PluginDockPanelParams } from "../../../components/plugins/protocol";
 import {
-	addRecentTabsBatch,
 	recordRecentTabVisit,
+	refreshRecentTabsLoadedWindow,
 	updateRecentTabLocal,
 } from "../../../hooks/useRecentTabs";
-import { useUpdateWorkspace, useWorkspace } from "../../../hooks/useWorkspace";
+import { useUpdateWorkspace, useWorkspace, workspaceQueryKey } from "../../../hooks/useWorkspace";
 import { APP_SHELL_FULL_BLEED_HEIGHT } from "../../../lib/safe-area";
 
 export const Route = createFileRoute("/narrators/workspace/$workspaceId")({
@@ -36,9 +38,17 @@ export const Route = createFileRoute("/narrators/workspace/$workspaceId")({
 	},
 });
 
+/**
+ * Stable empty membership for the pre-load render.
+ *
+ * A fresh `[]` each render would be a new prop identity every time, re-running the
+ * surface's membership-sync effect on every unrelated re-render.
+ */
+const EMPTY_PANELS: WorkspacePanel[] = [];
+
 function WorkspacePage() {
 	const { workspaceId } = Route.useParams();
-	const navigate = useNavigate();
+	const qc = useQueryClient();
 	const { t } = useTranslation("narrators");
 	const { data: workspace, isLoading } = useWorkspace(workspaceId);
 	const updateWorkspace = useUpdateWorkspace();
@@ -120,10 +130,9 @@ function WorkspacePage() {
 	}, []);
 
 	const handleUpdateWebviewConfig = useCallback((panelId: string, config: WebviewLeafConfig) => {
-		directorControlRef.current?.updatePanelParams(panelId, {
-			panelType: "webview",
-			webviewConfig: config,
-		});
+		// Delegated rather than rebuilt here: the surface owns keeping the panel's
+		// `panelRowId` and persisting the config to its membership row.
+		directorControlRef.current?.updateWebviewConfig(panelId, config);
 	}, []);
 
 	const handleUpdatePluginParams = useCallback((panelId: string, params: PluginDockPanelParams) => {
@@ -145,46 +154,33 @@ function WorkspacePage() {
 		});
 	}, [workspaceId, workspace]);
 
-	// ── Sync child narrator tabs' workspaceId when the panel set changes ──
-	const prevNarratorIdsRef = useRef<Set<string>>(new Set());
-	const handleNarratorIdsChange = useCallback(
-		(ids: string[]) => {
-			const currentIds = new Set(ids);
-			const prevIds = prevNarratorIdsRef.current;
-			const updates = [
-				...[...currentIds]
-					.filter((narratorId) => !prevIds.has(narratorId))
-					.map((narratorId) => ({
-						type: "narrator" as const,
-						id: narratorId,
-						title: "",
-						workspaceId,
-						updateOnly: true,
-					})),
-				...[...prevIds]
-					.filter((narratorId) => !currentIds.has(narratorId))
-					.map((narratorId) => ({
-						type: "narrator" as const,
-						id: narratorId,
-						title: "",
-						workspaceId: null,
-						updateOnly: true,
-					})),
-			];
-			if (updates.length > 0) void addRecentTabsBatch(updates).catch(() => {});
-			prevNarratorIdsRef.current = currentIds;
-			// Navigate away when the workspace becomes empty.
-			if (ids.length === 0 && prevIds.size > 0) {
-				navigate({ to: "/narrators" });
-			}
-		},
-		[workspaceId, navigate],
-	);
+	/**
+	 * Re-read membership after the surface changed it (a panel was closed).
+	 *
+	 * Awaited by the caller so the surface is only considered converged once its
+	 * authoritative input reflects the change. Also refreshes the sidebar window,
+	 * because removing a narrator panel releases its tab back to the top level —
+	 * server-side, in the same transaction.
+	 */
+	const handleMembershipChanged = useCallback(async () => {
+		await qc.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId) });
+		void refreshRecentTabsLoadedWindow(qc).catch(() => {});
+	}, [qc, workspaceId]);
+
+	// The sidebar projection is NOT maintained here any more.
+	//
+	// This route used to diff the live narrator-id set against the previous one and
+	// write `workspaceId` onto recent tabs accordingly. Two problems, both structural:
+	// the initial "previous" set was empty, so the diff could only ever ATTACH and
+	// never detach; and it made the client a second writer of membership, racing the
+	// layout save. Both are gone — `workspace-panel-service` now writes the panel row
+	// and its projection in one transaction.
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
 	const serverUpdatedAt = (workspace as any)?.updatedAt as number | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-	const treeJson = (workspace as any)?.tree as string | undefined;
+	const treeJson = workspace?.layout ?? workspace?.tree;
+	const panels = workspace?.panels ?? EMPTY_PANELS;
+	const layoutRevision = workspace?.layoutRevision ?? 0;
 
 	if (isLoading || !workspace) {
 		return (
@@ -264,23 +260,50 @@ function WorkspacePage() {
 			</Group>
 
 			<Box style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden", position: "relative" }}>
+				{/*
+				 * An explicit empty state, rather than a blank surface.
+				 *
+				 * A workspace with no members is now a real, reachable state (the last panel
+				 * was closed), and it used to render as an unexplained void. Deliberately does
+				 * NOT navigate away on its own: creation persists the workspace before its
+				 * first panel, so an automatic redirect would bounce the user out of a
+				 * workspace that is about to receive one.
+				 */}
+				{panels.length === 0 && (
+					<Center h="100%" style={{ flexDirection: "column", gap: 8 }}>
+						<Text size="sm" c="dimmed">
+							{t("workspaceEmpty")}
+						</Text>
+						<ActionIcon
+							variant="light"
+							size="lg"
+							component={Link}
+							to="/narrators"
+							aria-label={t("listView")}
+						>
+							<IconArrowLeft size={18} />
+						</ActionIcon>
+					</Center>
+				)}
 				{/* Keep Dockview mounted for its API and persisted layout, but remove it from
 				    the visual and hit-test trees while DirectorLayout owns the surface. */}
 				<Box
-					aria-hidden={directorMode || undefined}
+					aria-hidden={directorMode || panels.length === 0 || undefined}
 					style={{
 						height: "100%",
 						width: "100%",
-						visibility: directorMode ? "hidden" : "visible",
-						pointerEvents: directorMode ? "none" : undefined,
+						visibility: directorMode || panels.length === 0 ? "hidden" : "visible",
+						pointerEvents: directorMode || panels.length === 0 ? "none" : undefined,
 					}}
 				>
 					<DockviewWorkspace
 						workspaceId={workspaceId}
+						panels={panels}
 						treeJson={treeJson}
+						layoutRevision={layoutRevision}
 						serverUpdatedAt={serverUpdatedAt}
 						directorControlRef={directorControlRef}
-						onNarratorIdsChange={handleNarratorIdsChange}
+						onMembershipChanged={handleMembershipChanged}
 						onPanelsChange={handlePanelsChange}
 						onDirectorStateChange={handleDirectorStateChange}
 					/>

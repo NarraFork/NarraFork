@@ -64,9 +64,64 @@ export const createWorkspaceSchema = z.object({
 	tree: workspaceTreeSchema,
 });
 
+/**
+ * `tree` is deliberately absent: `PUT /workspaces/:id/layout` is the only write path.
+ *
+ * This route does not check or advance `layout_revision`, so accepting a layout here
+ * would silently defeat the optimistic lock — a write through it leaves every client's
+ * cached revision looking valid while the blob has changed, so the next guarded `PUT`
+ * overwrites it with a stale arrangement AND passes its `expectedRevision` check.
+ */
 export const updateWorkspaceSchema = z.object({
 	title: z.string().max(200).optional(),
-	tree: workspaceTreeSchema.optional(),
+});
+
+// === Membership (workspace_panels) ===
+
+const workspacePanelIdSchema = z.string().min(1).max(50);
+
+/**
+ * Create one top-level panel.
+ *
+ * A discriminated union rather than one loose object because the two shapes carry
+ * different identity: a narrator panel IS its `narratorId` and has no config,
+ * while the other kinds are identified by their row and carry params. Allowing
+ * both fields on one shape would permit a "narrator panel with a config", which
+ * the service would then have to reject at runtime.
+ *
+ * `config` is unknown here on purpose: its shape belongs to the panel component
+ * (terminal / webview / plugin), and the service enforces the only property this
+ * layer can meaningfully assert — a byte ceiling.
+ */
+export const createWorkspacePanelSchema = z.discriminatedUnion("kind", [
+	z.object({ kind: z.literal("narrator"), narratorId: workspacePanelIdSchema }).strict(),
+	z
+		.object({
+			// `plugin` is deliberately absent: a workspace plugin panel binds to an owning
+			// narrator, making it that narrator's resource rather than membership. See
+			// `NON_MEMBERSHIP_DIRECTOR_PANEL_TYPES`.
+			kind: z.enum(["terminal", "webview"]),
+			config: z.unknown(),
+		})
+		.strict(),
+]);
+
+export const updateWorkspacePanelConfigSchema = z.object({
+	config: z.unknown(),
+});
+
+/**
+ * Save the arrangement.
+ *
+ * `expectedRevision` is REQUIRED, not optional. Layout is written as one whole
+ * blob, so an omitted token would silently restore last-write-wins for any client
+ * that forgot it — two tabs open on one workspace would go back to overwriting
+ * each other's arrangement on every drag. Making it mandatory means a stale client
+ * gets a 409 it can act on instead of quietly winning.
+ */
+export const saveWorkspaceLayoutSchema = z.object({
+	layout: workspaceTreeSchema,
+	expectedRevision: z.number().int().min(0),
 });
 
 // === Project DB (backup/import) ===

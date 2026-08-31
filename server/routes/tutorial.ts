@@ -21,6 +21,7 @@ import { getUserLanguage } from "../lib/i18n";
 import { logger } from "../lib/logger";
 import { tutorialIdSchema, tutorialProgressSchema } from "../lib/validators";
 import {
+	getLessonSession,
 	getProgress,
 	getSandboxStatus,
 	recordProgress,
@@ -57,7 +58,12 @@ tutorialRoutes.get("/:lessonId", async (c) => {
 	const lesson = getTutorialLesson(lessonId, locale);
 	if (!lesson) return c.json({ error: "Tutorial lesson not found" }, 404);
 	const progress = await getProgress(userId);
-	return c.json({ lesson, progress: progress[lessonId] ?? null });
+	// The session the lesson would CONTINUE, if one exists. Included here rather than
+	// behind a second request because the page needs it to decide what to render at
+	// all: without it a returning user sees a start screen, and starting again writes
+	// a new lesson boundary that rewinds the script they were halfway through.
+	const session = await getLessonSession({ userId, lessonId, locale });
+	return c.json({ lesson, progress: progress[lessonId] ?? null, session });
 });
 
 /**

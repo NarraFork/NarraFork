@@ -21,7 +21,14 @@
 
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
 import { accumulateFrame, type MeasuredElement, type PreparedInlineBlock } from "../prepared-block";
-import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, lineBoxHeight, SANS_FAMILY } from "../pretext-fonts";
+import {
+	FONT_SIZE,
+	FONT_WEIGHT,
+	LINE_HEIGHT,
+	lineBoxHeight,
+	SANS_FAMILY,
+	typographyMetrics,
+} from "../pretext-fonts";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 /** Status glyph box (matches the tool card's SPEC_TASK_ICON). */
@@ -125,7 +132,7 @@ export function measureSpecTask(data: SpecTaskData, innerWidth: number): Measure
 		const block = inlineBlock(emptyLabel);
 		const frame = accumulateFrame([block], Math.max(1, innerWidth), pretextLineMetrics);
 		return {
-			height: Math.max(SPEC_TASK_LINE_HEIGHT, frame.contentHeight),
+			height: Math.max(typographyMetrics().line.xs, frame.contentHeight),
 			blocks: [block],
 			frame,
 			contentWidth: Math.max(1, innerWidth),
@@ -154,13 +161,13 @@ export function measureSpecTask(data: SpecTaskData, innerWidth: number): Measure
 		const frame = accumulateFrame([block], textWidth, pretextLineMetrics);
 		blocks.push(block);
 		// A row is at least one glyph tall even when its text is empty.
-		height += Math.max(SPEC_TASK_GLYPH, frame.contentHeight, SPEC_TASK_LINE_HEIGHT);
+		height += Math.max(SPEC_TASK_GLYPH, frame.contentHeight, typographyMetrics().line.xs);
 		if (i < rows.length - 1) height += SPEC_TASK_ROW_GAP;
 		usedWidth = Math.max(usedWidth, frame.usedWidth + specTaskChromeWidth(row));
 	}
 
 	return {
-		height: Math.max(SPEC_TASK_LINE_HEIGHT, height),
+		height: Math.max(typographyMetrics().line.xs, height),
 		blocks,
 		// The frame is synthesized: the render copy lays rows out with flex (each row's
 		// own wrap already decided its height), so per-block `top` values are unused.
@@ -172,15 +179,17 @@ export function measureSpecTask(data: SpecTaskData, innerWidth: number): Measure
 
 /** One row's prepared inline flow, at the shared task font. */
 function inlineBlock(text: string): PreparedInlineBlock {
-	const items: RichInlineItem[] = [{ text, font: SPEC_TASK_FONT, break: "normal", extraWidth: 0 }];
+	const items: RichInlineItem[] = [
+		{ text, font: typographyMetrics().font.xs, break: "normal", extraWidth: 0 },
+	];
 	return {
 		...baseBlockFields(),
 		kind: "inline",
 		flow: prepareRichInline(items),
-		lineHeight: SPEC_TASK_LINE_HEIGHT,
+		lineHeight: typographyMetrics().line.xs,
 		classNames: ["vlist-spec-task"],
 		hrefs: [null],
-		fonts: [SPEC_TASK_FONT],
+		fonts: [typographyMetrics().font.xs],
 	};
 }
 

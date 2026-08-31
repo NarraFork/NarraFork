@@ -8,7 +8,7 @@ import {
 	extractSkippedIds,
 	showOperationWarnings,
 } from "../../lib/operation-warnings";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
 
 const MAX_CHAPTER_CLEANUP_LABEL_CHARS = 500;
 

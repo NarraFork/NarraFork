@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { clampSwipeTravel, classifySwipeRelease, SWIPE_THRESHOLD } from "./RecentTabs";
+import { clampSwipeTravel, classifySwipeRelease, SWIPE_THRESHOLD } from "./recent-tabs-logic";
 
 describe("classifySwipeRelease", () => {
 	it("closes only past the threshold to the right", () => {

@@ -7,7 +7,7 @@ import {
 	useDeleteVolumeSnapshot,
 	useVolumeSnapshots,
 } from "../../hooks/useVolumeSnapshots";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { CreateSnapshotModal } from "./CreateSnapshotModal";
 
 interface VolumeSnapshotPanelProps {

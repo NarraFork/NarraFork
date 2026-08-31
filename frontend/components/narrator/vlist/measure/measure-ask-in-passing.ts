@@ -41,6 +41,7 @@ import {
 	lineBoxHeight,
 	SANS_FAMILY,
 	SPACING,
+	typographyMetrics,
 } from "../pretext-fonts";
 import { pretextLineMetrics } from "./pretext-metrics";
 
@@ -118,7 +119,9 @@ export const RESOLVED_CHROME_X =
 export const RESOLVED_MIN_HEIGHT = RESOLVED_PADDING_Y * 2 + RESOLVED_LABEL_HEIGHT + SM_LINE_HEIGHT; // 57
 /** Resolved maximum height (question wraps to two lines). ≈77px. */
 export const RESOLVED_MAX_HEIGHT =
-	RESOLVED_PADDING_Y * 2 + RESOLVED_LABEL_HEIGHT + QUESTION_MAX_LINES * SM_LINE_HEIGHT; // 77
+	RESOLVED_PADDING_Y * 2 +
+	RESOLVED_LABEL_HEIGHT +
+	QUESTION_MAX_LINES * typographyMetrics().line.body; // 77
 
 /** Question text font (Text size="sm" fw={500}). Renderer MUST use this string. */
 export const QUESTION_FONT = `500 ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
@@ -217,12 +220,17 @@ function measureResolved(data: AskInPassingResolvedData, contentWidth: number): 
 		...baseBlockFields(),
 		kind: "inline",
 		flow: prepareRichInline([
-			{ text: questionText, font: QUESTION_FONT, break: "normal", extraWidth: 0 },
+			{
+				text: questionText,
+				font: typographyMetrics().font.bodyMedium,
+				break: "normal",
+				extraWidth: 0,
+			},
 		]),
-		lineHeight: SM_LINE_HEIGHT,
+		lineHeight: typographyMetrics().line.body,
 		classNames: ["vlist-frag vlist-frag--body"],
 		hrefs: [null],
-		fonts: [QUESTION_FONT],
+		fonts: [typographyMetrics().font.bodyMedium],
 	};
 	const blocks: PreparedInlineBlock[] = [questionBlock];
 

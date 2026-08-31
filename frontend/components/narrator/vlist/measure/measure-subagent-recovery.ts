@@ -33,7 +33,13 @@ import {
 	type PreparedFixedBlock,
 	type RenderLod,
 } from "../prepared-block";
-import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts";
+import {
+	FONT_SIZE,
+	LINE_HEIGHT,
+	lineBoxHeight,
+	SPACING,
+	typographyMetrics,
+} from "../pretext-fonts";
 
 // ── Payload ──────────────────────────────────────────────────────────────────
 
@@ -87,7 +93,11 @@ export const HEADER_INNER_GAP = 2;
 /** Checkbox size="xs" control box; the row never shrinks below it. */
 export const CHECKBOX_CONTROL_SIZE = 20;
 /** One checkbox row: max(control, xs text line). */
-export const ROW_HEIGHT = Math.max(CHECKBOX_CONTROL_SIZE, XS_LINE_HEIGHT); // 20
+export const ROW_HEIGHT = Math.max(CHECKBOX_CONTROL_SIZE, XS_LINE_HEIGHT); // 20 (baseline)
+/** Row lane at the reader's typography; the checkbox control floors it. */
+export function rowHeight(): number {
+	return Math.max(CHECKBOX_CONTROL_SIZE, typographyMetrics().line.xs);
+}
 /** Checkbox list Stack gap={4}. */
 export const ROW_GAP = 4;
 /** Button size="compact-sm" height. */
@@ -101,7 +111,10 @@ export const BUTTON_ROW_HEIGHT = 26;
 export const ROWS_MAX = 12;
 
 /** Title + description, two clamped lines with one inner gap. */
-export const HEADER_HEIGHT = XS_LINE_HEIGHT * 2 + HEADER_INNER_GAP; // 36
+export const HEADER_HEIGHT = XS_LINE_HEIGHT * 2 + HEADER_INNER_GAP; // 36 (baseline)
+export function headerHeight(): number {
+	return typographyMetrics().line.xs * 2 + HEADER_INNER_GAP;
+}
 
 /** Pending height with zero rows: padding + header + button row. */
 export const PENDING_BASE_HEIGHT = CARD_PADDING * 2 + HEADER_HEIGHT + STACK_GAP + BUTTON_ROW_HEIGHT;
@@ -109,7 +122,10 @@ export const PENDING_BASE_HEIGHT = CARD_PADDING * 2 + HEADER_HEIGHT + STACK_GAP 
 export const PENDING_HEIGHT_PER_ROW = ROW_HEIGHT + ROW_GAP; // 24
 
 /** Resolved height: a single dimmed line inside Paper p="xs". */
-export const RESOLVED_HEIGHT = RESOLVED_PADDING * 2 + XS_LINE_HEIGHT; // 37
+export const RESOLVED_HEIGHT = RESOLVED_PADDING * 2 + XS_LINE_HEIGHT; // 37 (baseline)
+export function resolvedHeight(): number {
+	return RESOLVED_PADDING * 2 + typographyMetrics().line.xs;
+}
 
 /**
  * Linear height of the pending card:
@@ -119,12 +135,12 @@ export const RESOLVED_HEIGHT = RESOLVED_PADDING * 2 + XS_LINE_HEIGHT; // 37
 export function subagentRecoveryPendingHeight(rowCount: number): number {
 	const n = Math.max(0, rowCount);
 	if (n === 0) return PENDING_BASE_HEIGHT;
-	const rows = STACK_GAP + n * ROW_HEIGHT + (n - 1) * ROW_GAP;
+	const rows = STACK_GAP + n * rowHeight() + (n - 1) * ROW_GAP;
 	return PENDING_BASE_HEIGHT + rows;
 }
 
 export function subagentRecoveryHeight(kind: SubagentRecoveryKind, rowCount: number): number {
-	return kind === "resolved" ? RESOLVED_HEIGHT : subagentRecoveryPendingHeight(rowCount);
+	return kind === "resolved" ? resolvedHeight() : subagentRecoveryPendingHeight(rowCount);
 }
 
 /**

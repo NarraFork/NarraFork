@@ -35,6 +35,9 @@ import {
 	ThemeIcon,
 	UnstyledButton,
 } from "@mantine/core";
+// The row height comes from the shared row metrics, resolved at RENDER time, so it
+// tracks the reader's typography exactly as the measure side does.
+import { bareRowMetrics } from "@shared/pretext-layout/row-metrics";
 import {
 	IconBan,
 	IconChevronDown,
@@ -55,7 +58,7 @@ import {
 	PENDING_CARD_BORDER,
 	PROMPT_BODY_MARGIN_TOP,
 	PROMPT_TOGGLE_ROW_HEIGHT,
-	RECENT_ROW_HEIGHT,
+	promptFontSize,
 	RECENT_STACK_GAP,
 	RECENT_TITLE_MARGIN_BOTTOM,
 	RESULT_MD_PADDING_BLOCK,
@@ -63,12 +66,12 @@ import {
 	SELF_PERMISSION_MARGIN_X,
 	STATUS_ICON_SIZE,
 	THEME_ICON_SIZE,
-	XS_LINE_HEIGHT,
 } from "../measure/measure-subagent";
 import type { ToolCategory } from "../measure/measure-tool-call";
 // The recent-call rows ARE trace rows, so their lane geometry comes from the trace
 // height model rather than a second set of numbers.
 import { TRACE_CHEVRON, TRACE_ROW_GAP, TRACE_ROW_ICON } from "../measure/measure-tool-run";
+import { typographyMetrics } from "../pretext-fonts";
 import { VListContentViewHost, type VListViewControls } from "../VListContentViewHost";
 import {
 	findViewTarget,
@@ -554,7 +557,7 @@ function SubagentInner({
 							style={{
 								display: "block",
 								width: "100%",
-								height: RECENT_ROW_HEIGHT,
+								height: bareRowMetrics().height,
 								boxSizing: "border-box",
 								cursor: onOpenSession ? "pointer" : "default",
 							}}
@@ -756,7 +759,7 @@ function SubagentBody({
 								// Wrap only changes the scroll axis: the box height is already
 								// fixed by measure-subagent's prompt cap.
 								...(promptWrapped ? { whiteSpace: "pre-wrap" } : { whiteSpace: "pre" }),
-								fontSize: 11,
+								fontSize: promptFontSize(),
 								fontFamily: "var(--mantine-font-family-monospace)",
 							}}
 						>
@@ -797,7 +800,7 @@ function SubagentBody({
 							style={{
 								border: `${PENDING_CARD_BORDER}px solid ${cssColor("yellow", 6)}`,
 								borderRadius: 4,
-								minHeight: XS_LINE_HEIGHT,
+								minHeight: typographyMetrics().line.xs,
 							}}
 						/>
 					))}
@@ -876,7 +879,7 @@ function SubagentBody({
 						{resultTarget && viewControls?.isSourceShown(resultTarget) ? (
 							<div
 								style={{
-									fontSize: 11,
+									fontSize: promptFontSize(),
 									fontFamily: "var(--mantine-font-family-monospace)",
 									whiteSpace: "pre-wrap",
 									wordBreak: "break-word",

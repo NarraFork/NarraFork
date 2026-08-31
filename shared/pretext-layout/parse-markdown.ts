@@ -47,23 +47,22 @@ import {
 	BASE_LINE_HEIGHT,
 	CODE_BLOCK_FONT_SIZE,
 	emToPx,
-	FONT_BODY,
-	FONT_BODY_BOLD,
-	FONT_BODY_BOLD_ITALIC,
-	FONT_BODY_ITALIC,
-	FONT_INLINE_CODE,
-	FONT_MARKDOWN_CODE,
 	FONT_SIZE,
-	FONT_WEIGHT,
 	HEADING,
-	headingFont,
+	headingMetrics,
 	LINE_HEIGHT,
 	lineBoxHeight,
-	MATH_BASE_FONT_SIZE,
-	SANS_FAMILY,
+	typographyMetrics,
 } from "./pretext-fonts";
+import { letterSpacingForFont, scaleBlockSpacing } from "./typography";
 
 // ── Layout constants (px), mirroring MarkdownContent.module.css ──────────────
+//
+// These are the NEUTRAL baseline (100% typography). Anything that feeds
+// measurement reads `typographyMetrics()` / `markdownMetrics()` instead so the
+// reader's font scale and block spacing apply; the constants remain as the
+// reference those scalings are defined against, and as the values the render layer
+// falls back to when it has no block in hand.
 const BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm); // 14 * 1.45 ≈ 20px
 // Fenced code renders at 11px / 1.55 (settled Shiki view, HighlightedCode.module.css).
 const CODE_LINE_HEIGHT = lineBoxHeight(CODE_BLOCK_FONT_SIZE, BASE_LINE_HEIGHT); // 11 * 1.55 ≈ 17
@@ -77,7 +76,6 @@ const LIST_INDENT = emToPx(1.5, FONT_SIZE.sm); // padding-inline-start 1.5em @14
 const BLOCKQUOTE_PADDING = 10; // spacing xs
 const BLOCKQUOTE_BORDER = 3;
 const CODE_LANG_EXTRA_TOP = 12; // codeBlockWithLang: pad-top = xs + 12px (12px extra)
-const TABLE_MARGIN_TOP = emToPx(0.35, FONT_SIZE.sm);
 /**
  * Upper bound used to measure a cell's max-content width. Large enough that no
  * realistic cell wraps, small enough to stay far from float-precision trouble.
@@ -204,7 +202,7 @@ function mathPiece(latex: string, font: string, math: MathSupport): InlinePiece 
 		// MUST stay in lockstep with the font size the render layer pins on the math
 		// host — KaTeX's root is `1.21em`, so any mismatch rescales the formula away
 		// from this measurement (see MATH_BASE_FONT_SIZE).
-		basePx: MATH_BASE_FONT_SIZE,
+		basePx: typographyMetrics().mathSize,
 		glyphWidth: math.glyphWidth,
 		glyphVertical: math.glyphVertical,
 	});
@@ -408,13 +406,13 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 				// paragraph. Peel display formulas into their own blocks first.
 				const withDisplay = buildParagraphWithDisplayMath(token as Tokens.Paragraph, ctx);
 				if (withDisplay) {
-					appendGroup(blocks, withDisplay, PARAGRAPH_MARGIN_TOP);
+					appendGroup(blocks, withDisplay, typographyMetrics().margin.paragraph);
 					continue;
 				}
 				appendGroup(
 					blocks,
 					buildInlineBlocks(token.tokens ?? [], "body", ctx),
-					PARAGRAPH_MARGIN_TOP,
+					typographyMetrics().margin.paragraph,
 				);
 				continue;
 			}
@@ -435,7 +433,7 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 						),
 					),
 				);
-				appendGroup(blocks, headingBlocks, emToPx(HEADING_MARGIN_TOP, headingSize(variant)));
+				appendGroup(blocks, headingBlocks, headingMarginTop(variant));
 				continue;
 			}
 			case "code": {
@@ -451,20 +449,32 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 								lang: "mermaid",
 							}),
 						],
-						CODE_MARGIN_TOP,
+						typographyMetrics().margin.code,
 					);
 					continue;
 				}
 				// Display-math code fences (if any lexer surfaces them as code).
 				if (lang === "math" || lang === "katex" || lang === "latex") {
-					appendGroup(blocks, [buildDisplayMathBlock(token.text, ctx, lang)], CODE_MARGIN_TOP);
+					appendGroup(
+						blocks,
+						[buildDisplayMathBlock(token.text, ctx, lang)],
+						typographyMetrics().margin.code,
+					);
 					continue;
 				}
-				appendGroup(blocks, [buildCodeBlock(token.text, token.lang ?? null, ctx)], CODE_MARGIN_TOP);
+				appendGroup(
+					blocks,
+					[buildCodeBlock(token.text, token.lang ?? null, ctx)],
+					typographyMetrics().margin.code,
+				);
 				continue;
 			}
 			case "list":
-				appendGroup(blocks, buildListBlocks(token as Tokens.List, ctx), LIST_MARGIN_TOP);
+				appendGroup(
+					blocks,
+					buildListBlocks(token as Tokens.List, ctx),
+					typographyMetrics().margin.list,
+				);
 				continue;
 			case "blockquote":
 				appendGroup(
@@ -477,24 +487,40 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 				);
 				continue;
 			case "hr":
-				appendGroup(blocks, [buildRuleBlock(ctx)], PARAGRAPH_MARGIN_TOP);
+				appendGroup(blocks, [buildRuleBlock(ctx)], typographyMetrics().margin.paragraph);
 				continue;
 			case "table":
-				appendGroup(blocks, [buildTableBlock(token as Tokens.Table, ctx)], TABLE_MARGIN_TOP);
+				appendGroup(
+					blocks,
+					[buildTableBlock(token as Tokens.Table, ctx)],
+					typographyMetrics().margin.table,
+				);
 				continue;
 			case "text": {
 				const t = token as Tokens.Text;
 				if (Array.isArray(t.tokens) && t.tokens.length > 0) {
-					appendGroup(blocks, buildInlineBlocks(t.tokens, "body", ctx), PARAGRAPH_MARGIN_TOP);
+					appendGroup(
+						blocks,
+						buildInlineBlocks(t.tokens, "body", ctx),
+						typographyMetrics().margin.paragraph,
+					);
 				} else {
-					appendGroup(blocks, buildPlainText(t.text, "body", ctx), PARAGRAPH_MARGIN_TOP);
+					appendGroup(
+						blocks,
+						buildPlainText(t.text, "body", ctx),
+						typographyMetrics().margin.paragraph,
+					);
 				}
 				continue;
 			}
 			default: {
 				const fallback = fallbackText(token);
 				if (fallback.length > 0) {
-					appendGroup(blocks, buildPlainText(fallback, "body", ctx), PARAGRAPH_MARGIN_TOP);
+					appendGroup(
+						blocks,
+						buildPlainText(fallback, "body", ctx),
+						typographyMetrics().margin.paragraph,
+					);
 				}
 			}
 		}
@@ -528,7 +554,7 @@ function buildDisplayMathBlock(
 	const geometry = measureKatex(ctx.math.katex, source, {
 		displayMode: true,
 		// Same lockstep requirement as inline math (see MATH_BASE_FONT_SIZE).
-		basePx: MATH_BASE_FONT_SIZE,
+		basePx: typographyMetrics().mathSize,
 		glyphWidth: ctx.math.glyphWidth,
 		glyphVertical: ctx.math.glyphVertical,
 	});
@@ -700,12 +726,23 @@ function buildOneInline(
 	ctx: ParseContext,
 ): PreparedInlineBlock | null {
 	if (pieces.length === 0) return null;
-	const items: RichInlineItem[] = pieces.map((p) => ({
-		text: p.text,
-		font: p.font,
-		break: p.breakMode,
-		extraWidth: p.extraWidth,
-	}));
+	// Letter spacing is PER ITEM because the setting is an em fraction and the items
+	// in one line can differ in size (body prose, a smaller inline-code chip, a
+	// heading). Applying one line-wide value would over-space the small runs.
+	//
+	// Resolved from each piece's own font size rather than a role lookup: that keeps
+	// this correct for pieces whose size does not come from a named role. Omitted at
+	// 0 so an unscaled document produces the same prepared handle as before.
+	const items: RichInlineItem[] = pieces.map((p) => {
+		const spacing = letterSpacingForFont(p.font);
+		return {
+			text: p.text,
+			font: p.font,
+			break: p.breakMode,
+			extraWidth: p.extraWidth,
+			...(spacing ? { letterSpacing: spacing } : {}),
+		};
+	});
 	const hasMath = pieces.some((p) => p.math != null);
 	// A formula taller than the text line box must grow the line, or its glyphs
 	// would overlap the neighbouring lines. `PreparedInlineBlock` carries a single
@@ -859,7 +896,7 @@ function codePiece(text: string, marks: MarkState): InlinePiece | null {
 	if (text.length === 0) return null;
 	return {
 		text,
-		font: FONT_INLINE_CODE,
+		font: typographyMetrics().font.inlineCode,
 		className: `vlist-frag vlist-frag--code${marks.href !== null ? " is-link" : ""}`,
 		href: marks.href,
 		breakMode: "normal",
@@ -882,15 +919,20 @@ function canMerge(a: InlinePiece, b: InlinePiece): boolean {
 
 function resolveFont(variant: InlineVariant, marks: MarkState): string {
 	if (variant !== "body") {
-		return headingFont(headingLevel(variant));
+		return headingMetrics(headingLevel(variant)).font;
 	}
 	// Measure with the SAME weight+style the browser paints, else synthetic
 	// bold/italic (applied via CSS) rewraps differently from the prediction.
-	if (marks.bold && marks.italic) return FONT_BODY_BOLD_ITALIC;
-	if (marks.bold) return FONT_BODY_BOLD;
-	if (marks.italic) return FONT_BODY_ITALIC;
-	if (marks.href !== null) return `${FONT_WEIGHT.regular} ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
-	return FONT_BODY;
+	//
+	// Read live (not from the module-level FONT_BODY* constants) so the reader's
+	// font scale reaches measurement; the render layer paints from the same
+	// `fonts[]` array these strings land in, which is what keeps the two in step.
+	const { font } = typographyMetrics();
+	if (marks.bold && marks.italic) return font.bodyBoldItalic;
+	if (marks.bold) return font.bodyBold;
+	if (marks.italic) return font.bodyItalic;
+	// A link measures as plain body text (colour only, no weight change).
+	return font.body;
 }
 
 function resolveClassName(variant: InlineVariant, marks: MarkState): string {
@@ -908,13 +950,22 @@ function resolveClassName(variant: InlineVariant, marks: MarkState): string {
 // Code / rule / unknown blocks
 // ─────────────────────────────────────────────────────────────────────────────
 function buildCodeBlock(text: string, lang: string | null, ctx: ParseContext): PreparedCodeBlock {
+	const metrics = typographyMetrics();
 	return {
 		...blockBase(ctx),
 		kind: "code",
-		prepared: prepareWithSegments(stripTrailingNewline(text), FONT_MARKDOWN_CODE, {
+		// Called directly, NOT through `prepared-markdown-cache`: that module imports
+		// this one, so reaching back would close a cycle. Caching is not lost — the
+		// whole parse result is memoised one level up, keyed on the typography
+		// generation, so this runs once per (text, generation) anyway.
+		//
+		// `letterSpacing` is omitted at 0 to keep pretext's no-spacing fast path and
+		// to leave an unscaled document's prepared handles byte-identical to before.
+		prepared: prepareWithSegments(stripTrailingNewline(text), metrics.font.markdownCode, {
 			whiteSpace: "pre-wrap",
+			...(metrics.letterSpacing.code ? { letterSpacing: metrics.letterSpacing.code } : {}),
 		}),
-		lineHeight: CODE_LINE_HEIGHT,
+		lineHeight: metrics.line.code,
 		lang: lang && lang.trim().length > 0 ? lang.trim() : null,
 	};
 }
@@ -978,7 +1029,7 @@ function buildTableBlock(token: Tokens.Table, ctx: ParseContext): PreparedTableB
 		rows,
 		align,
 		columns,
-		lineHeight: BODY_LINE_HEIGHT,
+		lineHeight: typographyMetrics().line.body,
 	};
 }
 
@@ -999,12 +1050,23 @@ function buildTableCell(
 	// Header cells paint at medium weight (Mantine Table.Th), so they must also be
 	// MEASURED at that weight or the predicted column width is too narrow.
 	const resolved = isHeader ? pieces.map(boldenPiece) : pieces;
-	const items: RichInlineItem[] = resolved.map((p) => ({
-		text: p.text,
-		font: p.font,
-		break: p.breakMode,
-		extraWidth: p.extraWidth,
-	}));
+	// Letter spacing is applied per piece, exactly as `buildOneInline` does for a
+	// paragraph. Leaving it out here did not merely mis-size the text: the render layer
+	// paints cell fragments through `letterSpacingForFont` regardless, so measured and
+	// painted advances disagreed — the failure mode `letterSpacingForFont` itself warns
+	// about. It also fed the column solver: `naturalWidth` and `minWidth` below are the
+	// max-content/min-content inputs to `solveTableColumns`, so every column came out
+	// narrower than the text it would receive and the cells clipped.
+	const items: RichInlineItem[] = resolved.map((p) => {
+		const spacing = letterSpacingForFont(p.font);
+		return {
+			text: p.text,
+			font: p.font,
+			break: p.breakMode,
+			extraWidth: p.extraWidth,
+			...(spacing ? { letterSpacing: spacing } : {}),
+		};
+	});
 	const flow = prepareRichInline(items);
 	// Natural width (max-content): a bound large enough that no wrap can occur.
 	const natural = measureRichInlineStats(flow, TABLE_NATURAL_WIDTH_BOUND);
@@ -1067,9 +1129,10 @@ function measureCellMinWidth(pieces: readonly InlinePiece[]): number {
  * prepare path. Tables repeat values heavily down a column (statuses, flags, short
  * identifiers, empty cells), so the memo turns most of that into map lookups.
  *
- * The key includes `extraWidth` because it is added to the measured atom, and the
- * font because it decides every advance. Text is the rest of the key, so entries are
- * exact — this memoises a pure function, it does not approximate.
+ * The key includes `extraWidth` because it is added to the measured atom, the font
+ * because it decides every advance, and the letter spacing because it widens every
+ * atom. Text is the rest of the key, so entries are exact — this memoises a pure
+ * function, it does not approximate.
  *
  * NOTE: the entries hold NUMBERS, not prepared handles, so this cache is cheap to
  * retain. It is still keyed by font (never by "the current font generation") because
@@ -1086,17 +1149,31 @@ const cellMinWidthCache = new Map<string, number>();
 const CELL_MIN_WIDTH_CACHE_CEILING = 16384;
 
 function pieceMinWidth(piece: InlinePiece): number {
-	const key = `${piece.font}\u0000${piece.extraWidth ?? 0}\u0000${piece.text}`;
+	// Spacing widens every atom, so it belongs in the key as well as in the measurement.
+	// `clearCellMinWidthCache` on a typography change would cover it, but keying it makes
+	// the memo exact on its own rather than dependent on that invalidation firing.
+	const spacing = letterSpacingForFont(piece.font);
+	const key = `${piece.font}\u0000${piece.extraWidth ?? 0}\u0000${spacing}\u0000${piece.text}`;
 	const cached = cellMinWidthCache.get(key);
 	if (cached !== undefined) return cached;
 	let widest = 0;
 	// `segments` ARE pretext's own break units (whole words for Latin, per-character
 	// for CJK), which is why each is measured as an unbreakable atom.
-	const { segments } = prepareWithSegments(piece.text, piece.font);
+	const { segments } = prepareWithSegments(
+		piece.text,
+		piece.font,
+		spacing ? { letterSpacing: spacing } : undefined,
+	);
 	for (const segment of segments) {
 		if (segment.trim().length === 0) continue;
 		const atom = prepareRichInline([
-			{ text: segment, font: piece.font, break: "never", extraWidth: piece.extraWidth },
+			{
+				text: segment,
+				font: piece.font,
+				break: "never",
+				extraWidth: piece.extraWidth,
+				...(spacing ? { letterSpacing: spacing } : {}),
+			},
 		]);
 		const { maxLineWidth } = measureRichInlineStats(atom, TABLE_NATURAL_WIDTH_BOUND);
 		if (maxLineWidth > widest) widest = maxLineWidth;
@@ -1121,8 +1198,12 @@ export function clearCellMinWidthCache(): void {
  * a math atom's width is already baked into `extraWidth`, so both pass through.
  */
 function boldenPiece(piece: InlinePiece): InlinePiece {
-	if (piece.math != null || piece.font === FONT_INLINE_CODE) return piece;
-	const bold = piece.font === FONT_BODY_ITALIC ? FONT_BODY_BOLD_ITALIC : FONT_BODY_BOLD;
+	// Compared against the LIVE strings: the piece was built by `resolveFont` under
+	// the same generation, so a stale constant here would fail every match and
+	// silently leave header cells measured at regular weight (i.e. too narrow).
+	const { font } = typographyMetrics();
+	if (piece.math != null || piece.font === font.inlineCode) return piece;
+	const bold = piece.font === font.bodyItalic ? font.bodyBoldItalic : font.bodyBold;
 	if (piece.font === bold) return piece;
 	return { ...piece, font: bold };
 }
@@ -1199,9 +1280,21 @@ function headingSize(variant: InlineVariant): number {
 }
 
 function lineHeightForVariant(variant: InlineVariant): number {
-	if (variant === "body") return BODY_LINE_HEIGHT;
-	const h = HEADING[variant];
-	return lineBoxHeight(h.size, h.lineHeight);
+	if (variant === "body") return typographyMetrics().line.body;
+	return headingMetrics(headingLevel(variant)).lineHeight;
+}
+
+/**
+ * A heading's top margin (px): `0.4em` of its own BASELINE size, then scaled by the
+ * block-spacing knob.
+ *
+ * The em base stays unscaled on purpose. Resolving it against the scaled heading
+ * size would make the font-scale knob move block spacing too, so a reader who only
+ * enlarged the text would also get looser gaps — the two knobs must stay
+ * independent (see TypographySettings.paragraphScalePercent).
+ */
+function headingMarginTop(variant: InlineVariant): number {
+	return scaleBlockSpacing(emToPx(HEADING_MARGIN_TOP, headingSize(variant)));
 }
 
 /**

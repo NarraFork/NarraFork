@@ -93,6 +93,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
 	lazy,
+	type ReactNode,
 	type SetStateAction,
 	Suspense,
 	useCallback,
@@ -196,14 +197,15 @@ import {
 	safeAreaDrawerBodyHeight,
 } from "../../lib/safe-area";
 import { Z } from "../../lib/z-index";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
-import { useImageViewer } from "../common/ImageViewerProvider";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
+import { useImageViewer } from "../common/image-viewer-context";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { TruncatedText } from "../common/TruncatedText";
 import { PermissionRuleEditor } from "../permissions/PermissionRuleEditor";
 import {
 	buildPluginDockPanelOpenRequest,
+	PluginContributionOptions,
 	PluginContributionPicker,
 } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
@@ -228,7 +230,7 @@ import {
 	saveDraftImageAttachments,
 } from "./draft-image-attachments";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
-import { ExecutionDeviceMenu } from "./ExecutionDeviceMenu";
+import { ExecutionDeviceMenu, ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
@@ -258,7 +260,7 @@ import {
 	type NarratorComposerHandle,
 	type NarratorRemoteDraft,
 } from "./NarratorComposer";
-import { NarratorLodMenu } from "./NarratorLodMenu";
+import { NarratorLodMenu, NarratorLodOptions } from "./NarratorLodMenu";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import {
@@ -6365,6 +6367,11 @@ export function NarratorPanel({
 					if (dock) dock.toggleToolPanel(id);
 					else setMobileToolPanel((current) => (current === id ? null : id));
 					return;
+				// Dock-only (registry `hosts: ["dock"]`): the panel exists to sit beside the
+				// transcript while a slider moves, so there is no drawer fallback to offer.
+				case "appearance":
+					dock?.toggleToolPanel("appearance");
+					return;
 				default:
 					return;
 			}
@@ -6376,6 +6383,78 @@ export function NarratorPanel({
 			onOpenTerminalPanel,
 			toggleTerminalTool,
 			toggleSpecTool,
+		],
+	);
+
+	/**
+	 * Options the overflow menu expands inline for a self-contained control.
+	 *
+	 * These three render their own Menu in the header, so there is nothing for
+	 * `activateToolbarEntry` to toggle. Before this, the menu listed them as a dead
+	 * row labelled "header only" — and on a phone the header keeps two icons while
+	 * everything else lives in that menu, so the detail level and the execution
+	 * device had NO reachable entry point at all. Returning the same option rows the
+	 * header's dropdown uses keeps the two surfaces in step by construction.
+	 *
+	 * Every id whose registry entry is `selfContained` must be handled here; an
+	 * unhandled one silently reverts to the informational row.
+	 */
+	const renderToolbarInlineOptions = useCallback(
+		(id: string, close: () => void): ReactNode => {
+			switch (id) {
+				case "device":
+					return (
+						<ExecutionDeviceOptions
+							label={t("executionDeviceSelector")}
+							localLabel={t("executionTargetLocal")}
+							offlineLabel={t("executionDeviceOffline")}
+							devices={executionDevicesQuery.data?.devices ?? []}
+							currentDeviceId={executionDevicesQuery.data?.defaultDeviceId ?? "local"}
+							onSelect={(deviceId) => {
+								close();
+								updateExecutionDeviceMutation.mutate(deviceId);
+							}}
+							withLabel={false}
+						/>
+					);
+				case "lodlevel":
+					return (
+						<NarratorLodOptions
+							lod={renderLod}
+							isDefault={renderLodIsDefault}
+							onSelectLod={(next) => {
+								close();
+								handleSelectLod(next);
+							}}
+							onSetAsDefault={() => {
+								close();
+								setAsDefault();
+							}}
+							withLabel={false}
+						/>
+					);
+				case "plugins":
+					return (
+						<PluginContributionOptions
+							onPick={(pick) => {
+								close();
+								openPluginPanel(pick);
+							}}
+						/>
+					);
+				default:
+					return null;
+			}
+		},
+		[
+			t,
+			executionDevicesQuery.data,
+			updateExecutionDeviceMutation,
+			renderLod,
+			renderLodIsDefault,
+			handleSelectLod,
+			setAsDefault,
+			openPluginPanel,
 		],
 	);
 
@@ -7202,6 +7281,7 @@ export function NarratorPanel({
 									hostCapabilities={headerHostCapabilities}
 									badgeCounts={toolbarBadgeCounts}
 									onActivate={activateToolbarEntry}
+									renderInlineOptions={renderToolbarInlineOptions}
 									onArchive={openArchiveConfirm}
 									archiveLoading={archiveMutation.isPending}
 								/>

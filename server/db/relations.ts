@@ -56,6 +56,7 @@ import {
 	users,
 	volumeSnapshotApplications,
 	volumeSnapshots,
+	workspacePanels,
 	workspaces,
 } from "./schema";
 
@@ -559,10 +560,22 @@ export const volumeSnapshotApplicationsRelations = relations(
 	}),
 );
 
-export const workspacesRelations = relations(workspaces, ({ one }) => ({
+export const workspacesRelations = relations(workspaces, ({ one, many }) => ({
 	user: one(users, {
 		fields: [workspaces.userId],
 		references: [users.id],
+	}),
+	panels: many(workspacePanels),
+}));
+
+export const workspacePanelsRelations = relations(workspacePanels, ({ one }) => ({
+	workspace: one(workspaces, {
+		fields: [workspacePanels.workspaceId],
+		references: [workspaces.id],
+	}),
+	narrator: one(narrators, {
+		fields: [workspacePanels.narratorId],
+		references: [narrators.id],
 	}),
 }));
 

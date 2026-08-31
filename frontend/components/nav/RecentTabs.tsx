@@ -119,11 +119,28 @@ import { clearFaviconAlert, setFaviconAlert } from "../../lib/favicon";
 import { clearNotifiedAttention, triggerNotification } from "../../lib/notification";
 import { endDrag, moveDrag, startDragManual, startPointerDrag } from "../../lib/panel-drag";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
-import { queuePendingPanel } from "../narrator/workspace/dockview-layout";
+
 import { UserAvatar } from "../UserAvatar";
 import { RecentTabDirectoryRow, type RecentTabDirectoryRowProps } from "./RecentTabDirectoryRow";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import type { RecentTabDropRow, RecentTabDropTarget } from "./recent-tab-drop-target";
+/*
+ * Imported, NOT re-exported.
+ *
+ * A convenience `export { … } from "./recent-tabs-logic"` here would keep old import
+ * paths working, but it is still a runtime export of this module, so plugin-react puts it
+ * in `currentExports` and the boundary breaks exactly as before. Measured: editing
+ * `recent-tabs-logic.ts` behind such a re-export still produced
+ * `invalidate … ("autoScrollAllowedForPointer" export is incompatible)` and a full page
+ * reload. Importers must reach the logic module directly.
+ */
+import {
+	autoScrollAllowedForPointer,
+	clampSwipeTravel,
+	classifySwipeRelease,
+	isTabActive,
+	SWIPE_THRESHOLD,
+} from "./recent-tabs-logic";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 
 const CreateNarratorModal = React.lazy(() =>
@@ -232,60 +249,6 @@ const CONTAINER_STATUS_I18N: Record<string, string> = {
 };
 
 const QUERY_KEY = ["user-preferences", "recent-tabs"];
-export const SWIPE_THRESHOLD = 80;
-
-/** What releasing a horizontal swipe at `swipeX` should do. */
-export type SwipeRelease = "close" | "pin" | "cancel";
-
-/**
- * Decide the outcome of a released horizontal swipe on a tab row.
- *
- * Extracted from the component because the two directions mean very different things —
- * right REMOVES the tab, left only reorders it — and a sign error would silently turn a
- * pin gesture into a close. Both thresholds are symmetric, but the asymmetric
- * consequences are why this is worth a test rather than an inline comparison.
- */
-export function classifySwipeRelease(swipeX: number, canPin: boolean): SwipeRelease {
-	if (swipeX > SWIPE_THRESHOLD) return "close";
-	if (canPin && swipeX < -SWIPE_THRESHOLD) return "pin";
-	return "cancel";
-}
-
-/**
- * Clamp a swipe's live travel.
- *
- * Left travel is suppressed entirely when the row cannot be pinned: a row that slides
- * open, shows nothing, and springs back reads as a broken gesture rather than an absent
- * one.
- */
-export function clampSwipeTravel(dx: number, canPin: boolean): number {
-	return canPin ? dx : Math.max(0, dx);
-}
-
-/**
- * Whether a scroll container may auto-scroll for the current pointer position.
- *
- * dnd-kit's auto-scroller decides the VERTICAL direction from the activation rect's
- * `top`/`bottom` only (`getScrollDirectionAndSpeed`), so a pointer that has left the
- * sidebar horizontally still drives the tab list as long as its height falls inside the
- * container's threshold band. That is wrong once the pointer is over the narrator /
- * workspace surface: the list scrolls under a drag that is no longer about ordering, and
- * the drop target keeps sliding away.
- *
- * So the horizontal test that the built-in vertical logic omits is added here: the
- * container may only scroll while the pointer is inside its own column.
- *
- * Returns true when the pointer position is unknown — keyboard-initiated drags and the
- * frames before the first move have no coordinates, and blocking them would disable
- * auto-scroll outright rather than scope it.
- */
-export function autoScrollAllowedForPointer(
-	pointerX: number | null,
-	rect: { left: number; right: number },
-): boolean {
-	if (pointerX === null) return true;
-	return pointerX >= rect.left && pointerX <= rect.right;
-}
 
 /**
  * Horizontal band that a scroll container's auto-scroll is allowed in.
@@ -1473,25 +1436,27 @@ export function RecentTabList({
 			if (!wsCreateTarget) return;
 			const wsId = wsCreateTarget;
 			setWsCreateTarget(null);
-			// Add to recent tabs with workspaceId
-			addRecentTab({
-				type: "narrator",
-				id: data.id,
-				title: data.title,
-				subtitle: data.cwd,
-				status: data.status,
-				workspaceId: wsId,
-			});
-			// Hand the new narrator off to the Dockview workspace as a pending panel.
-			// The DockviewWorkspace drains this on mount/activation and adds the
-			// panel via its own layout API, so the sidebar never needs to touch the
-			// layout serialization format.
-			queuePendingPanel(wsId, { panelType: "narrator", narratorId: data.id });
-			// Navigate to the workspace
+			// Persist MEMBERSHIP first, then navigate.
+			//
+			// This used to write the recent-tab row and queue the panel in memory, which is
+			// how a sidebar child could end up with no panel anywhere: the row survived and
+			// the queued panel did not. The server now writes the panel row and its sidebar
+			// projection in one transaction, so there is no half-applied state to leave
+			// behind — and no need to add the tab from here at all.
+			try {
+				await api.addWorkspacePanel(wsId, { kind: "narrator", narratorId: data.id });
+			} catch {
+				// Nothing was persisted, so nothing has to be undone. Staying put (rather
+				// than opening a workspace that does not contain the narrator) is what keeps
+				// the sidebar and the surface in agreement.
+				notifications.show({ color: "red", message: t("workspaceAddPanelFailed") });
+				return;
+			}
+			void refreshRecentTabsLoadedWindow(qc).catch(() => {});
 			navigate({ to: `/narrators/workspace/${wsId}` });
 			onNavigate?.();
 		},
-		[wsCreateTarget, navigate, onNavigate],
+		[wsCreateTarget, navigate, onNavigate, qc, t],
 	);
 
 	// ── Directory-mode drag and drop ───────────────────────────────────────────
@@ -2013,17 +1978,21 @@ export function RecentTabList({
 
 			if (target.kind === "workspace") {
 				const workspaceId = target.workspaceId;
-				void addRecentTabOrThrow({ ...tab, workspaceId })
+				// A drop onto a workspace is a MEMBERSHIP change, so it goes to the panel
+				// endpoint — which writes the row and the sidebar grouping together. The old
+				// path wrote the tab here and queued the panel in memory, which is how the two
+				// could end up disagreeing for good.
+				void api
+					.addWorkspacePanel(workspaceId, { kind: "narrator", narratorId })
 					.then(() => {
-						// Hand the narrator to the workspace as a pending panel and open it —
-						// the same route "+ add narrator" takes, so the sidebar never has to
-						// touch the layout serialization format.
-						queuePendingPanel(workspaceId, { panelType: "narrator", narratorId });
+						// The projection changed server-side; pull the authoritative window so the
+						// tab appears under its new header without a second write from here.
+						void refreshRecentTabsLoadedWindow(qc).catch(() => {});
 						navigate({ to: "/narrators/workspace/$workspaceId", params: { workspaceId } });
 						onNavigate?.();
 					})
 					.catch(() => {
-						notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
+						notifications.show({ color: "red", message: t("workspaceAddPanelFailed") });
 					});
 				return;
 			}
@@ -2435,20 +2404,6 @@ function ShapeOverlay({ shape, size }: { shape: StatusShape; size: number }) {
 			<Icon size={Math.round(size * SHAPE_GLYPH_RATIO)} stroke={3} />
 		</Box>
 	);
-}
-
-export function isTabActive(tab: RecentTab, pathname: string): boolean {
-	if (tab.type === "project") {
-		return pathname === `/projects/${tab.id}`;
-	}
-	if (tab.type === "chapter") {
-		return tab.narratorId ? pathname === `/narrators/${tab.narratorId}` : false;
-	}
-	if (tab.type === "workspace") {
-		return pathname === `/narrators/workspace/${tab.id}`;
-	}
-	// narrator and subagent both route to /narrators/:id
-	return pathname === `/narrators/${tab.id}`;
 }
 
 /** Non-sortable child tab rendered indented under a workspace tab. */

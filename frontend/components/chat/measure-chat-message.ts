@@ -41,7 +41,12 @@ import {
 	type PreparedBlock,
 } from "@shared/pretext-layout/prepared-block";
 import { getPreparedMarkdownBlocks } from "@shared/pretext-layout/prepared-markdown-cache";
-import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight } from "@shared/pretext-layout/pretext-fonts";
+import {
+	FONT_SIZE,
+	LINE_HEIGHT,
+	lineBoxHeight,
+	scaledLineBoxHeight,
+} from "@shared/pretext-layout/pretext-fonts";
 import { pretextLineMetrics } from "@shared/pretext-layout/pretext-metrics";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,6 +68,10 @@ export const CHAT_HEADER_GAP = 4;
 
 /** Quote strip shown when the message replies to another (single clamped line). */
 export const CHAT_REPLY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
+/** chatReplyLineHeight() at the reader's typography (baseline above). */
+export function chatReplyLineHeight(): number {
+	return scaledLineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
+}
 export const CHAT_REPLY_GAP = 4;
 /** Left rail + its inner padding for the quote strip. */
 export const CHAT_REPLY_RAIL = 3;
@@ -124,6 +133,10 @@ export const CHAT_CODE_PADDING = { x: CODE_PADDING_X, y: CODE_PADDING_Y } as con
  * Fixed height, because the placeholder text is ours, not the author's.
  */
 export const CHAT_DELETED_BODY_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm);
+/** chatDeletedBodyHeight() at the reader's typography (baseline above). */
+export function chatDeletedBodyHeight(): number {
+	return scaledLineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm);
+}
 
 /**
  * Ceiling on the body text a single bubble measures and draws.
@@ -310,7 +323,7 @@ export function measureChatMessage(
 		quoteMarginTop: MARKDOWN_CONSTANTS.PARAGRAPH_MARGIN_TOP,
 	});
 
-	const bodyHeight = isDeletedPlaceholder ? CHAT_DELETED_BODY_HEIGHT : frame.contentHeight;
+	const bodyHeight = isDeletedPlaceholder ? chatDeletedBodyHeight() : frame.contentHeight;
 
 	// A soft-deleted message reports no attachments from the server, but measuring
 	// defensively here keeps the height right even if a stale cached row still has
@@ -321,7 +334,7 @@ export function measureChatMessage(
 
 	let height = CHAT_BUBBLE_PADDING_Y * 2 + bodyHeight + attachmentsHeight;
 	if (hasHeader) height += CHAT_HEADER_HEIGHT + CHAT_HEADER_GAP;
-	if (hasReply) height += CHAT_REPLY_LINE_HEIGHT + CHAT_REPLY_GAP;
+	if (hasReply) height += chatReplyLineHeight() + CHAT_REPLY_GAP;
 
 	// Shrink-wrap: the box is as wide as its widest line, floored by the header
 	// (which must not be clipped) and capped by the space it was given.

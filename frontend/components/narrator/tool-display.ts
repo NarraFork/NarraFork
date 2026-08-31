@@ -15,6 +15,7 @@ export type ToolCategory =
 	| "pipeline"
 	| "terminal"
 	| "share"
+	| "transfer"
 	| "recall"
 	| "skill"
 	| "browser"
@@ -64,6 +65,7 @@ const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 const PIPELINE_TOOLS = new Set(["StartPipeline", "ExtractPipeline", "EndPipeline"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
 const SHARE_TOOLS = new Set(["ShareFile"]);
+const TRANSFER_TOOLS = new Set(["TransferFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
 const SKILL_TOOLS = new Set(["Skill"]);
 const BROWSER_TOOLS = new Set(["Browser"]);
@@ -95,6 +97,7 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (PIPELINE_TOOLS.has(name)) return "pipeline";
 	if (TERMINAL_TOOLS.has(name)) return "terminal";
 	if (SHARE_TOOLS.has(name)) return "share";
+	if (TRANSFER_TOOLS.has(name)) return "transfer";
 	if (RECALL_TOOLS.has(name)) return "recall";
 	if (SKILL_TOOLS.has(name)) return "skill";
 	if (BROWSER_TOOLS.has(name)) return "browser";
@@ -135,6 +138,13 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 			return "teal";
 		case "share":
 			return "green";
+		// Not share's green: the two are adjacent in meaning (both hand a file
+		// somewhere) and a reader scanning a long run needs to tell "published a
+		// download link" from "moved bytes to a device" at a glance. Blue is already
+		// send/ask's colour, but those never sit next to a transfer the way a share
+		// does, and the glyph disambiguates.
+		case "transfer":
+			return "blue";
 		case "taskOutput":
 		case "await":
 			return "indigo";
@@ -433,6 +443,23 @@ export function getSummary(
 		case "share": {
 			const fp = getFilePath(input);
 			return fp ? basename(fp) : "Share";
+		}
+		case "transfer": {
+			const direction = extractField(input, "direction");
+			const remotePath = extractField(input, "remotePath");
+			const localPath = extractField(input, "localPath");
+			// The device NAME comes from metadata: the input only carries the nanoid,
+			// which tells the reader nothing. Falls back to nothing rather than to the
+			// id — a bare `SXz3MqJ…` in the header is noise, and the detail card shows
+			// the resolved name anyway.
+			const deviceName = readLeafText(metadata?.deviceName);
+			// Name the file being moved, not the source: for both directions the
+			// interesting basename is the same one, and remotePath is the side the
+			// user typically named explicitly.
+			const name = remotePath ? basename(remotePath) : localPath ? basename(localPath) : "";
+			const arrow = direction === "upload" ? "→" : "←";
+			if (!name) return deviceName ? `${arrow} ${deviceName}` : direction || "Transfer";
+			return short(deviceName ? `${name} ${arrow} ${deviceName}` : name, 60);
 		}
 		case "skill": {
 			const skillName = extractField(input, "skill", "name");

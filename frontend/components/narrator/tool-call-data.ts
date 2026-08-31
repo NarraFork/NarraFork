@@ -6,6 +6,7 @@
  * the vlist adapter) do not import the 6k-line card component just for a type.
  */
 
+import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { SubagentActivitySummary } from "../../lib/api";
 import type { ExecutionTargetIdentity } from "../../lib/api/types";
 
@@ -45,6 +46,15 @@ export interface ToolCallData {
 	_longRunning?: boolean;
 	/** Real-time streaming output from bash tool (updated via WS tool_output events) */
 	_streamingOutput?: string;
+	/**
+	 * Latest determinate progress measurement (WS `tool_structured_progress`).
+	 *
+	 * Rendered as a real progress bar. Kept separate from `_streamingOutput`
+	 * because the two are different kinds of thing: one is a text stream, this is
+	 * a measurement — drawing a bar out of the text would mean re-parsing the
+	 * tool's own formatting.
+	 */
+	_structuredProgress?: ToolProgressPayload;
 	/** Frontend promoted a complete streaming output into outputJson on completion */
 	_streamedFullOutput?: boolean;
 	/** Current timeout in ms (set from inputJson.timeout or updated via WS timeout_updated) */

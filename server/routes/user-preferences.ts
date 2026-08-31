@@ -1,3 +1,4 @@
+import { DEFAULT_TYPOGRAPHY } from "@shared/pretext-layout/typography";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
@@ -47,6 +48,13 @@ const DEFAULTS = {
 	showOutputStats: true,
 	terminalTheme: "auto",
 	terminalFontSize: 14,
+	// Narrator transcript typography. Sourced from the shared neutral setting rather
+	// than literals so "no preference" always means the same thing the height model
+	// treats as unscaled (see shared/pretext-layout/typography.ts).
+	narratorFontScalePercent: DEFAULT_TYPOGRAPHY.fontScalePercent,
+	narratorLetterSpacingPercent: DEFAULT_TYPOGRAPHY.letterSpacingPercent,
+	narratorLineHeightScalePercent: DEFAULT_TYPOGRAPHY.lineHeightScalePercent,
+	narratorParagraphScalePercent: DEFAULT_TYPOGRAPHY.paragraphScalePercent,
 	recentTabs: "[]",
 	addSubagentToRecentTabs: true,
 	recentTabsGroupMode: "flat" as const,
@@ -100,6 +108,66 @@ const GATEWAY_SECRET_FIELDS = [
 	"clientSecret",
 ] as const;
 const GATEWAY_STT_SECRET_FIELDS = ["apiKey"] as const;
+
+/**
+ * Columns written by the INSERT half of the PATCH upsert, in positional order.
+ *
+ * The placeholder count is DERIVED from this array rather than written as a literal.
+ * It used to be a hand-maintained `Array(39)`, and adding the four typography columns
+ * without touching it produced `SQLiteError: 39 values for 43 columns` — every first
+ * write of any preference failed, because the INSERT half is the path taken whenever
+ * the user has no row yet.
+ *
+ * This array is therefore the single source of truth for that half. The value array
+ * passed to `sqlite.run` must stay in this exact order, and the ON CONFLICT SET clause
+ * that follows keeps its own separate parameter list — a new column still has to be
+ * added in all of: this array, the INSERT values, the SET clause, and the UPDATE values.
+ */
+const INSERT_COLUMNS = [
+	"id",
+	"user_id",
+	"auto_load_older_messages",
+	"fast_mode_default",
+	"language",
+	"word_wrap_markdown",
+	"word_wrap_code",
+	"word_wrap_diff",
+	"reply_in_user_language",
+	"show_token_usage",
+	"show_output_stats",
+	"terminal_theme",
+	"terminal_font_size",
+	"narrator_font_scale_percent",
+	"narrator_letter_spacing_percent",
+	"narrator_paragraph_scale_percent",
+	"narrator_line_height_scale_percent",
+	"add_subagent_to_recent_tabs",
+	"recent_tabs_group_mode",
+	"notify_on_done",
+	"notify_on_waiting",
+	"notify_pwa_enabled",
+	"notify_sound_enabled",
+	"notify_sound_type",
+	"notify_sound_builtin",
+	"notify_sound_file_id",
+	"notify_sound_volume",
+	"notify_sound_max_concurrent",
+	"notify_dingtalk_enabled",
+	"notify_dingtalk_webhook",
+	"notify_dingtalk_secret",
+	"notify_feishu_enabled",
+	"notify_feishu_webhook",
+	"notify_feishu_secret",
+	"commands",
+	"queue_mode",
+	"ctrl_enter_queue_mode",
+	"setup_wizard_completed",
+	"gateway_config",
+	"nav_layout",
+	"narrator_toolbar_layout",
+	"created_at",
+	"updated_at",
+] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -298,20 +366,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 		}
 
 		sqlite.run(
-			`INSERT INTO user_preferences (
-			id, user_id,
-			auto_load_older_messages, fast_mode_default, language, word_wrap_markdown, word_wrap_code,
-			word_wrap_diff, reply_in_user_language, show_token_usage, show_output_stats, terminal_theme, terminal_font_size,
-			add_subagent_to_recent_tabs, recent_tabs_group_mode,
-			notify_on_done, notify_on_waiting, notify_pwa_enabled,
-			notify_sound_enabled, notify_sound_type, notify_sound_builtin, notify_sound_file_id,
-			notify_sound_volume, notify_sound_max_concurrent,
-			notify_dingtalk_enabled, notify_dingtalk_webhook, notify_dingtalk_secret,
-			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
-			commands, queue_mode, ctrl_enter_queue_mode, setup_wizard_completed, gateway_config,
-			nav_layout, narrator_toolbar_layout,
-			created_at, updated_at
-		) VALUES (${Array(39).fill("?").join(", ")})
+			`INSERT INTO user_preferences (${INSERT_COLUMNS.join(", ")})
+		 VALUES (${INSERT_COLUMNS.map(() => "?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   fast_mode_default = COALESCE(?, fast_mode_default),
@@ -324,6 +380,10 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   show_output_stats = COALESCE(?, show_output_stats),
 		   terminal_theme = COALESCE(?, terminal_theme),
 		   terminal_font_size = COALESCE(?, terminal_font_size),
+		   narrator_font_scale_percent = COALESCE(?, narrator_font_scale_percent),
+		   narrator_letter_spacing_percent = COALESCE(?, narrator_letter_spacing_percent),
+		   narrator_paragraph_scale_percent = COALESCE(?, narrator_paragraph_scale_percent),
+		   narrator_line_height_scale_percent = COALESCE(?, narrator_line_height_scale_percent),
 		   add_subagent_to_recent_tabs = COALESCE(?, add_subagent_to_recent_tabs),
 		   recent_tabs_group_mode = COALESCE(?, recent_tabs_group_mode),
 		   notify_on_done = COALESCE(?, notify_on_done),
@@ -364,6 +424,10 @@ userPreferencesRoutes.patch("/", async (c) => {
 				(d.showOutputStats ?? DEFAULTS.showOutputStats) ? 1 : 0,
 				d.terminalTheme ?? DEFAULTS.terminalTheme,
 				d.terminalFontSize ?? DEFAULTS.terminalFontSize,
+				d.narratorFontScalePercent ?? DEFAULTS.narratorFontScalePercent,
+				d.narratorLetterSpacingPercent ?? DEFAULTS.narratorLetterSpacingPercent,
+				d.narratorParagraphScalePercent ?? DEFAULTS.narratorParagraphScalePercent,
+				d.narratorLineHeightScalePercent ?? DEFAULTS.narratorLineHeightScalePercent,
 				(d.addSubagentToRecentTabs ?? DEFAULTS.addSubagentToRecentTabs) ? 1 : 0,
 				d.recentTabsGroupMode ?? DEFAULTS.recentTabsGroupMode,
 				(d.notifyOnDone ?? DEFAULTS.notifyOnDone) ? 1 : 0,
@@ -402,6 +466,10 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.showOutputStats != null ? (d.showOutputStats ? 1 : 0) : null,
 				d.terminalTheme ?? null,
 				d.terminalFontSize ?? null,
+				d.narratorFontScalePercent ?? null,
+				d.narratorLetterSpacingPercent ?? null,
+				d.narratorParagraphScalePercent ?? null,
+				d.narratorLineHeightScalePercent ?? null,
 				d.addSubagentToRecentTabs != null ? (d.addSubagentToRecentTabs ? 1 : 0) : null,
 				d.recentTabsGroupMode ?? null,
 				d.notifyOnDone != null ? (d.notifyOnDone ? 1 : 0) : null,

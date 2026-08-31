@@ -4,6 +4,7 @@ import type {
 	ApiRequestDiagnostics,
 	KnowledgeInjectionRecord,
 	ReasoningProviderMetadata,
+import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
 import type { PathFlavor } from "./execution/backend";
 
@@ -117,6 +118,21 @@ export interface ToolContext {
 	emitProgress?: (toolUseId: string, elapsed: number) => void;
 	/** Emit real-time output for streaming tool results (e.g. bash). Receives cumulative output. */
 	emitOutput?: (output: string) => void;
+	/**
+	 * Emit a live DETERMINATE progress measurement for a tool that knows how much
+	 * work remains (currently TransferFile).
+	 *
+	 * Separate from `emitOutput` because the two answer different questions and
+	 * are consumed differently. `emitOutput` is a text stream whose meaning is
+	 * whatever the tool prints; this is a measurement the UI renders as an actual
+	 * progress bar. Sending a bar as text (an ASCII `[███░░]`) would make the
+	 * client's only option to re-parse the tool's own formatting.
+	 *
+	 * Callers should ALSO emit a text form via `emitOutput` — the text is what the
+	 * model reads and what surfaces with no progress support fall back to, so this
+	 * channel stays purely additive.
+	 */
+	emitStructuredProgress?: (progress: ToolProgressPayload) => void;
 	/** Emit a long-running process notification (≥60s). UI can show a terminate button. */
 	emitLongRunning?: (toolUseId: string, elapsed: number) => void;
 	/** The toolUseId of the current tool execution (set by executeTool) */
@@ -392,6 +408,16 @@ export type AgentEvent =
 	| { type: "tool_executing"; toolUseId: string; executionStartedAt: number }
 	| { type: "tool_progress"; toolUseId: string; elapsed: number }
 	| { type: "tool_output"; toolUseId: string; output: string }
+	/**
+	 * A DETERMINATE progress measurement from a tool that knows its total work.
+	 *
+	 * Deliberately not folded into `tool_progress`, which carries only elapsed
+	 * seconds and means "still alive" — an indeterminate heartbeat every tool gets.
+	 * This one means "N of M done" and only a tool that can actually measure that
+	 * emits it, so a client can tell a real bar from a spinner by which frame
+	 * arrived rather than by inspecting fields for plausibility.
+	 */
+	| { type: "tool_structured_progress"; toolUseId: string; progress: ToolProgressPayload }
 	// Watchdog notification: tool has been running for ≥60s
 	| { type: "tool_long_running"; toolUseId: string; elapsed: number }
 	| {

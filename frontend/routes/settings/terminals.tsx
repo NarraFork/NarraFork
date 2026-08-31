@@ -27,7 +27,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { lazy, Suspense, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";

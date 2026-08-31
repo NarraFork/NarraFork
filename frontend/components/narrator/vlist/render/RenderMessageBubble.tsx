@@ -22,11 +22,6 @@ import {
 	ASSISTANT_PAD_X,
 	ASSISTANT_PAD_Y,
 	COMMAND_CHEVRON_SIZE,
-	COMMAND_LINE_FONT,
-	COMMAND_LINE_HEIGHT,
-	COMMAND_PREVIEW_FONT,
-	COMMAND_PREVIEW_LINE_HEIGHT,
-	COMMAND_TOGGLE_HEIGHT,
 	isMeasuredCommandBubble,
 	type MeasuredCommandBubble,
 	USER_BUBBLE_PADDING,
@@ -34,13 +29,11 @@ import {
 	USER_HEADER_HEIGHT,
 } from "../measure/measure-message-bubble";
 import type { MeasuredElement, PreparedCodeBlock, PreparedFixedBlock } from "../prepared-block";
-import { FONT_SIZE, SANS_FAMILY } from "../pretext-fonts";
+import { typographyMetrics } from "../pretext-fonts";
 import { swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { readExactDisplayBox, VListImage } from "./vlist-image";
 import { TextFileRow } from "./vlist-text-file-row";
-
-const USER_BODY_FONT = `400 ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 
 /**
  * Bubble side + tint for a human-authored message.
@@ -220,8 +213,8 @@ function CommandBubble({
 						top: contentTop + measured.commandTop,
 						left: USER_BUBBLE_PADDING,
 						right: USER_BUBBLE_PADDING,
-						height: COMMAND_LINE_HEIGHT,
-						font: COMMAND_LINE_FONT,
+						height: typographyMetrics().line.body,
+						font: typographyMetrics().font.bodyMediumMono,
 						// `c="indigo"` equivalent: indigo-4 on dark, indigo-filled on
 						// light (indigo-4 is unreadable on the light bubble).
 						color: "var(--mantine-color-indigo-text)",
@@ -249,11 +242,11 @@ function CommandBubble({
 									key={i}
 									style={{
 										position: "absolute",
-										top: i * COMMAND_PREVIEW_LINE_HEIGHT,
+										top: i * typographyMetrics().line.xs,
 										left: 0,
-										height: COMMAND_PREVIEW_LINE_HEIGHT,
+										height: typographyMetrics().line.xs,
 										whiteSpace: "pre",
-										font: COMMAND_PREVIEW_FONT,
+										font: typographyMetrics().font.xs,
 										color: "var(--mantine-color-dimmed)",
 									}}
 								>
@@ -263,8 +256,8 @@ function CommandBubble({
 						) : (
 							<div
 								style={{
-									height: COMMAND_PREVIEW_LINE_HEIGHT,
-									font: COMMAND_PREVIEW_FONT,
+									height: typographyMetrics().line.xs,
+									font: typographyMetrics().font.xs,
 									color: "var(--mantine-color-dimmed)",
 									whiteSpace: "pre",
 									overflow: "hidden",
@@ -294,14 +287,14 @@ function CommandBubble({
 							position: "absolute",
 							top: contentTop + measured.toggleTop,
 							left: USER_BUBBLE_PADDING,
-							height: COMMAND_TOGGLE_HEIGHT,
+							height: typographyMetrics().line.xs,
 							display: "flex",
 							alignItems: "center",
 							gap: 4,
 							padding: 0,
 							border: "none",
 							background: "none",
-							font: COMMAND_PREVIEW_FONT,
+							font: typographyMetrics().font.xs,
 							color: "var(--mantine-color-indigo-4)",
 							cursor: onToggle ? "pointer" : "default",
 							textAlign: "left",
@@ -415,7 +408,7 @@ function UserBubble({
 									left: 0,
 									height: lineHeight,
 									whiteSpace: "pre",
-									font: USER_BODY_FONT,
+									font: typographyMetrics().font.body,
 									color: "var(--mantine-color-text)",
 								}}
 							>

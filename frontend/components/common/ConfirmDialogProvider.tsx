@@ -1,34 +1,19 @@
 import { Button, Group, Modal, Stack, Text } from "@mantine/core";
-import { type ReactNode, useCallback, useContext, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { createSharedContext } from "../../lib/shared-context";
 import { Z } from "../../lib/z-index";
-
-interface ConfirmOptions {
-	message: ReactNode;
-	title?: ReactNode;
-	confirmLabel?: ReactNode;
-	cancelLabel?: ReactNode;
-	confirmColor?: string;
-}
-
-interface PendingConfirm extends ConfirmOptions {
-	resolve: (confirmed: boolean) => void;
-}
-
-interface ConfirmDialogContextValue {
-	confirm: (options: ConfirmOptions) => Promise<boolean>;
-}
-
-/**
- * Registry-keyed for the same reason as the image viewer: the provider is mounted
- * once in `main.tsx`, while `useConfirmDialog()` is called from lazily-loaded
- * route chunks and dock panels. See `lib/shared-context.ts`.
+/*
+ * The context, its types and `useConfirmDialog` live in `confirm-dialog-context.ts`.
+ *
+ * A hook export beside this component makes the module an INVALID Fast Refresh boundary,
+ * and this provider is mounted in `App.tsx` — so that invalidation sat on the app shell's
+ * own path and turned shell edits into full page reloads. See that file's header.
  */
-const ConfirmDialogContext = createSharedContext<ConfirmDialogContextValue | null>(
-	"common/ConfirmDialogProvider",
-	null,
-);
+import {
+	ConfirmDialogContext,
+	type ConfirmOptions,
+	type PendingConfirm,
+} from "./confirm-dialog-context";
 
 export function ConfirmDialogProvider({ children }: { children: ReactNode }) {
 	const { t } = useTranslation("common");
@@ -86,10 +71,4 @@ export function ConfirmDialogProvider({ children }: { children: ReactNode }) {
 	);
 }
 
-export function useConfirmDialog() {
-	const context = useContext(ConfirmDialogContext);
-	if (!context) {
-		throw new Error("useConfirmDialog must be used within ConfirmDialogProvider");
-	}
-	return context.confirm;
-}
+// `useConfirmDialog` moved to `confirm-dialog-context.ts` — see the import comment above.

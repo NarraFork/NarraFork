@@ -24,6 +24,7 @@
  * Pure: mutates the passed store and returns whether the caller should re-render.
  */
 
+import type { ToolProgressPayload } from "@shared/tool-progress";
 import {
 	getStreamingFieldPreview,
 	getToolOutputPreview,
@@ -271,6 +272,37 @@ export function applyStreamingToolOutput(
 	const preview = getToolOutputPreview(output);
 	if (existing._streamingOutput === preview) return false;
 	store.set(toolUseId, { ...existing, _streamingOutput: preview });
+	return true;
+}
+
+/**
+ * Record a determinate progress measurement for a RUNNING tool.
+ *
+ * Same "only a tool the store already knows" rule as the output channel: a frame
+ * for a tool that already persisted belongs to its real card, and creating an
+ * entry here would resurrect a synthetic one beside it.
+ */
+export function applyStreamingToolProgress(
+	store: StreamingToolStore,
+	toolUseId: string,
+	progress: ToolProgressPayload,
+): boolean {
+	const existing = store.get(toolUseId);
+	if (!existing) return false;
+	// Identity check on the fields a bar is drawn from. Byte counts advance
+	// monotonically so this rarely short-circuits, but a paused transfer would
+	// otherwise re-render the row on every repeated frame.
+	const prev = existing._structuredProgress;
+	if (
+		prev &&
+		prev.completed === progress.completed &&
+		prev.total === progress.total &&
+		prev.itemsDone === progress.itemsDone &&
+		prev.currentItem === progress.currentItem
+	) {
+		return false;
+	}
+	store.set(toolUseId, { ...existing, _structuredProgress: progress });
 	return true;
 }
 

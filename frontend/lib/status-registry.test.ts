@@ -311,10 +311,16 @@ describe("status shapes separate states colour no longer can", () => {
 		const source = await Bun.file(
 			new URL("../components/nav/RecentTabs.tsx", import.meta.url),
 		).text();
-		const overlay = source.slice(
-			source.indexOf("function ShapeOverlay"),
-			source.indexOf("export function isTabActive"),
-		);
+		// Both delimiters are asserted to EXIST before slicing. `indexOf` returns -1 for a
+		// missing needle, and `slice(start, -1)` silently yields a near-empty or reversed
+		// range — which would make the three `not.toContain` checks below pass on nothing.
+		// (`isTabActive` used to be the end delimiter and has since moved to
+		// `recent-tabs-logic.ts`, which is exactly how this trap gets sprung.)
+		const start = source.indexOf("function ShapeOverlay");
+		const end = source.indexOf("function WorkspaceChildTab");
+		expect(start).toBeGreaterThan(-1);
+		expect(end).toBeGreaterThan(start);
+		const overlay = source.slice(start, end);
 		expect(overlay).toContain('color: "var(--mantine-color-white)"');
 		// No body of its own: no background fill and no circle to align.
 		expect(overlay).not.toContain("background:");

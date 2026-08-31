@@ -28,6 +28,8 @@ import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
  * - `userchat` — the human discussion room beside this narrator (people talking to
  *   each other; its content never enters the narrator's context unless someone
  *   forwards it explicitly).
+ * - `appearance` — live typography controls for this transcript (font size / letter
+ *   spacing / block spacing), so the reader can adjust while watching the effect.
  * - `subagent` — a multi-instance child-narrator session in the cluster's secondary area.
  * - `file`     — a multi-instance read-only file viewer in the secondary area.
  * - `webview`  — a standalone webview (workspace only).
@@ -44,6 +46,7 @@ export type PanelKind =
 	| "tasks"
 	| "search"
 	| "userchat"
+	| "appearance"
 	| "subagent"
 	| "file"
 	| "knowledge"
@@ -199,6 +202,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	tasks: "tasks",
 	search: "search",
 	userchat: "userchat",
+	appearance: "appearance",
 	subagent: "subagent",
 	file: "file",
 	knowledge: "knowledge",
@@ -225,6 +229,7 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	tasks: "Tasks",
 	search: "Search",
 	userchat: "Discussion",
+	appearance: "Appearance",
 	subagent: "Subagent",
 	file: "File",
 	knowledge: "Knowledge",

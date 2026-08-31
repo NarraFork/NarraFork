@@ -14,7 +14,31 @@
  *
  * IMPORTANT: pretext `font` strings follow the CSS shorthand accepted by canvas
  * `measureText`: "[style] [weight] <size>px <family>". Keep size in px.
+ *
+ * ## Constants are the BASELINE; `typographyMetrics()` is what to measure with
+ *
+ * Every `export const` below is the NEUTRAL (100%) value — the Mantine default the
+ * whole height model was originally written against. They are still correct as
+ * base values and as the reference the scaling is defined against, but a module
+ * that captures one at import time freezes the reader's typography at whatever it
+ * was when the bundle loaded.
+ *
+ * New code, and anything that feeds a `font` string or a line height into
+ * measurement, must read {@link typographyMetrics} at MEASURE TIME instead. The
+ * returned snapshot is memoised per typography generation, so calling it per
+ * fragment is cheap.
+ *
+ * Failing to do so is silent: heights stay at the baseline while the render layer
+ * paints scaled text, so rows overlap and the scrollbar lies.
  */
+
+import {
+	getTypographyRevision,
+	letterSpacingPxFor,
+	scaleBlockSpacing,
+	scaleFontSize,
+	scaleLineHeightRatio,
+} from "./typography";
 
 // ── Font families (Mantine defaults; app does not override) ──────────────────
 export const SANS_FAMILY =
@@ -138,4 +162,169 @@ export function emToPx(em: number, fontSizePx: number): number {
  */
 export function lineBoxHeight(fontSizePx: number, lineHeight: number): number {
 	return Math.round(fontSizePx * lineHeight);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Typography-aware metrics (read at MEASURE TIME — see the header note)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Every size, line box and font string the markdown path needs, resolved against
+ * the reader's current typography.
+ *
+ * A SNAPSHOT rather than a set of functions: measurement runs per fragment across
+ * the whole document, and one memoised object per generation keeps that a property
+ * read instead of a string rebuild. Line boxes are rounded (the browser lays out
+ * integer line boxes) while font sizes stay fractional — rounding the size too
+ * would quantise the scale into visible steps.
+ */
+export interface TypographyMetrics {
+	/** Scaled font sizes, keyed like {@link FONT_SIZE}. */
+	size: { xs: number; sm: number; md: number; lg: number; xl: number };
+	/** Scaled fenced-code body size (baseline 11px, matching Shiki). */
+	codeSize: number;
+	/** Scaled math base size (the context KaTeX sizes itself against). */
+	mathSize: number;
+	/**
+	 * Rounded line boxes per role.
+	 *
+	 * `xs` uses the xs line-height ratio (1.4); `xsBase` uses the BASE ratio (1.55),
+	 * which a few card headers render at. They differ by ~2px at the default size, so
+	 * the two are kept distinct rather than collapsed — picking the wrong one shifts
+	 * every row of the affected card by a couple of pixels with nothing to flag it.
+	 */
+	line: { body: number; xs: number; xsBase: number; code: number; base: number };
+	/** Font strings at the scaled size, by role and mark combination. */
+	font: {
+		body: string;
+		bodyBold: string;
+		bodyMedium: string;
+		bodyMediumMono: string;
+		bodyItalic: string;
+		bodyBoldItalic: string;
+		inlineCode: string;
+		markdownCode: string;
+		xs: string;
+		xsMedium: string;
+		xsBold: string;
+		xsMono: string;
+	};
+	/** Per-role letter spacing (px). 0 when the reader has not asked for any. */
+	letterSpacing: { body: number; xs: number; code: number };
+	/**
+	 * Scaled markdown block margins. Driven by the BLOCK-SPACING knob, not the font
+	 * scale, so enlarging text does not silently also loosen the layout.
+	 */
+	margin: { paragraph: number; list: number; code: number; table: number };
+	/** The generation this snapshot describes (folded into cache keys by callers). */
+	revision: number;
+}
+
+let metricsCache: TypographyMetrics | null = null;
+let metricsCacheRevision = -1;
+
+/** Heading geometry (size + line box + font string) at the current typography. */
+export interface HeadingMetrics {
+	size: number;
+	lineHeight: number;
+	font: string;
+	letterSpacing: number;
+}
+
+/**
+ * The active typography metrics, memoised per generation.
+ *
+ * Safe to call in a hot loop: it is a revision compare plus a property read on
+ * every call after the first of each generation.
+ */
+export function typographyMetrics(): TypographyMetrics {
+	const revision = getTypographyRevision();
+	if (metricsCache && metricsCacheRevision === revision) return metricsCache;
+
+	const xs = scaleFontSize(FONT_SIZE.xs);
+	const sm = scaleFontSize(FONT_SIZE.sm);
+	const codeSize = scaleFontSize(CODE_BLOCK_FONT_SIZE);
+
+	const metrics: TypographyMetrics = {
+		size: {
+			xs,
+			sm,
+			md: scaleFontSize(FONT_SIZE.md),
+			lg: scaleFontSize(FONT_SIZE.lg),
+			xl: scaleFontSize(FONT_SIZE.xl),
+		},
+		codeSize,
+		// Follows the body size: a formula's reference context is body text, and the
+		// render layer pins this exact value on the math host (see MATH_BASE_FONT_SIZE).
+		mathSize: sm,
+		// Both knobs meet here and only here: the scaled SIZE times the scaled RATIO,
+		// which is what CSS `font-size` × `line-height` computes. Scaling either factor
+		// elsewhere would make the two settings multiply each other.
+		line: {
+			body: lineBoxHeight(sm, scaleLineHeightRatio(LINE_HEIGHT.sm)),
+			xs: lineBoxHeight(xs, scaleLineHeightRatio(LINE_HEIGHT.xs)),
+			xsBase: lineBoxHeight(xs, scaleLineHeightRatio(BASE_LINE_HEIGHT)),
+			code: lineBoxHeight(codeSize, scaleLineHeightRatio(BASE_LINE_HEIGHT)),
+			base: lineBoxHeight(sm, scaleLineHeightRatio(BASE_LINE_HEIGHT)),
+		},
+		font: {
+			body: `${FONT_WEIGHT.regular} ${sm}px ${SANS_FAMILY}`,
+			bodyBold: `${FONT_WEIGHT.bold} ${sm}px ${SANS_FAMILY}`,
+			bodyMedium: `${FONT_WEIGHT.medium} ${sm}px ${SANS_FAMILY}`,
+			bodyMediumMono: `${FONT_WEIGHT.medium} ${sm}px ${MONO_FAMILY}`,
+			bodyItalic: `italic ${FONT_WEIGHT.regular} ${sm}px ${SANS_FAMILY}`,
+			bodyBoldItalic: `italic ${FONT_WEIGHT.bold} ${sm}px ${SANS_FAMILY}`,
+			inlineCode: `${FONT_WEIGHT.regular} ${xs}px ${MONO_FAMILY}`,
+			markdownCode: `${FONT_WEIGHT.regular} ${codeSize}px ${MONO_FAMILY}`,
+			xs: `${FONT_WEIGHT.regular} ${xs}px ${SANS_FAMILY}`,
+			xsMedium: `${FONT_WEIGHT.medium} ${xs}px ${SANS_FAMILY}`,
+			xsBold: `${FONT_WEIGHT.bold} ${xs}px ${SANS_FAMILY}`,
+			xsMono: `${FONT_WEIGHT.regular} ${xs}px ${MONO_FAMILY}`,
+		},
+		letterSpacing: {
+			body: letterSpacingPxFor(sm),
+			xs: letterSpacingPxFor(xs),
+			code: letterSpacingPxFor(codeSize),
+		},
+		// Margins are em-derived from the BASELINE body size, then scaled by the
+		// block-spacing knob — deliberately NOT by the font scale (see the interface).
+		margin: {
+			paragraph: scaleBlockSpacing(emToPx(0.35, FONT_SIZE.sm)),
+			list: scaleBlockSpacing(emToPx(0.35, FONT_SIZE.sm)),
+			code: scaleBlockSpacing(emToPx(0.35, FONT_SIZE.sm)),
+			table: scaleBlockSpacing(emToPx(0.35, FONT_SIZE.sm)),
+		},
+		revision,
+	};
+	metricsCache = metrics;
+	metricsCacheRevision = revision;
+	return metrics;
+}
+
+/** Heading metrics for h1..h6 at the current typography. */
+export function headingMetrics(level: 1 | 2 | 3 | 4 | 5 | 6): HeadingMetrics {
+	const h = HEADING[`h${level}` as keyof typeof HEADING];
+	const size = scaleFontSize(h.size);
+	return {
+		size,
+		lineHeight: lineBoxHeight(size, scaleLineHeightRatio(h.lineHeight)),
+		font: `${FONT_WEIGHT.bold} ${size}px ${HEADINGS_FAMILY}`,
+		letterSpacing: letterSpacingPxFor(size),
+	};
+}
+
+/** A scaled line box for an arbitrary (baseline) size + line-height pair. */
+export function scaledLineBoxHeight(baseFontSizePx: number, lineHeight: number): number {
+	return lineBoxHeight(scaleFontSize(baseFontSizePx), scaleLineHeightRatio(lineHeight));
+}
+
+/** A scaled font string built from a baseline size. */
+export function scaledFont(
+	weight: number,
+	baseFontSizePx: number,
+	family: string,
+	style?: "italic",
+): string {
+	const size = scaleFontSize(baseFontSizePx);
+	return `${style ? `${style} ` : ""}${weight} ${size}px ${family}`;
 }

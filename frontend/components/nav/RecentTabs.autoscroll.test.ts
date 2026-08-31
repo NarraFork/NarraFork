@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { autoScrollAllowedForPointer } from "./RecentTabs";
+import { autoScrollAllowedForPointer } from "./recent-tabs-logic";
 
 const NAVBAR = { left: 0, right: 260 };
 

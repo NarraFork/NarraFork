@@ -21,7 +21,7 @@
  * unit-testable without pulling the whole shell into the test graph.
  */
 
-import { useConfirmDialog } from "@frontend/components/common/ConfirmDialogProvider";
+import { useConfirmDialog } from "@frontend/components/common/confirm-dialog-context";
 import { api } from "@frontend/lib/api";
 import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";

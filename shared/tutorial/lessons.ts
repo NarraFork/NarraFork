@@ -44,6 +44,41 @@ export const TUTORIAL_MODEL = `${TUTORIAL_PROVIDER_PREFIX}:${TUTORIAL_MODEL_ID}`
 /** Marker written to `projects.traits` / `narrators.traits` for sandbox rows. */
 export const TUTORIAL_TRAIT = "tutorial";
 
+/**
+ * Content-block type marking where a lesson begins inside a REUSED tutorial
+ * narrator.
+ *
+ * The tutorial keeps one narrator per slot across every lesson, so the user's
+ * learning session reads as one continuous conversation instead of thirteen
+ * disconnected ones. That reuse breaks the provider's turn counter unless the
+ * count restarts here: `scriptTurnIndex` counts assistant turns, and by lesson
+ * five the history holds dozens — so every lesson after the first would open on
+ * its `fallbackTurn` ("this lesson's script is finished") without a single error
+ * to notice.
+ *
+ * A message row rather than a narrator column because the boundary must live in
+ * the same ordered stream the provider already receives: `buildHistory` is handed
+ * messages, not the narrator row, and the row also has to be visible to the
+ * reader as "a new lesson starts here".
+ */
+export const TUTORIAL_LESSON_BOUNDARY_BLOCK = "tutorial_lesson_boundary";
+
+/**
+ * Model-facing text for a lesson boundary row.
+ *
+ * The scripted provider ignores this text — it plays `turns[index]` regardless —
+ * but the row is a real `sys` message that a compact or an export would read, and
+ * a blank one there would look like a bug. Localized because the reader sees the
+ * same row.
+ */
+export function tutorialLessonBoundaryText(lessonTitle: string, locale?: Locale | string): string {
+	const text: LocalizedText = {
+		en: `A new tutorial lesson starts here: ${lessonTitle}. Everything above is the earlier part of this same learning session and stays available as context.`,
+		"zh-CN": `新的教程课程从这里开始：${lessonTitle}。上面的内容是同一个学习会话中较早的部分，仍然作为上下文保留。`,
+	};
+	return pickLocalizedValue(text, locale);
+}
+
 // ---------------------------------------------------------------------------
 // Lesson structure
 // ---------------------------------------------------------------------------

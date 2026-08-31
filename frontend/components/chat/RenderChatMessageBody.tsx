@@ -24,6 +24,7 @@ import {
 	MD_HEADING_SLUG_ATTR,
 	markdownLinkTargetProps,
 } from "@frontend/lib/markdown-anchor-scroll";
+import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { MARKDOWN_CONSTANTS } from "@shared/pretext-layout/parse-markdown";
 import type {
 	BlockFrame,
@@ -297,24 +298,22 @@ function ChatInlineBlock({
 											);
 										}}
 										className={fragment.className}
-										style={{
+										style={fragmentTextStyle({
 											font: fragment.font,
-											marginLeft: fragment.gapBefore,
-											whiteSpace: "pre",
-											display: "inline-block",
-										}}
+											gapBefore: fragment.gapBefore,
+											letterSpacing: letterSpacingForFont(fragment.font),
+										})}
 									>
 										{fragment.text}
 									</a>
 								) : (
 									<span
 										className={fragment.className}
-										style={{
+										style={fragmentTextStyle({
 											font: fragment.font,
-											marginLeft: fragment.gapBefore,
-											whiteSpace: "pre",
-											display: "inline-block",
-										}}
+											gapBefore: fragment.gapBefore,
+											letterSpacing: letterSpacingForFont(fragment.font),
+										})}
 									>
 										{fragment.text}
 									</span>
@@ -541,12 +540,11 @@ function ChatTableCell({
 								) : null}
 								<span
 									className={fragment.className}
-									style={{
+									style={fragmentTextStyle({
 										font: fragment.font,
-										marginLeft: fragment.gapBefore,
-										whiteSpace: "pre",
-										display: "inline-block",
-									}}
+										gapBefore: fragment.gapBefore,
+										letterSpacing: letterSpacingForFont(fragment.font),
+									})}
 								>
 									{fragment.text}
 								</span>

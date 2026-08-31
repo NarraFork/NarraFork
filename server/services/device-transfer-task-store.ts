@@ -7,6 +7,16 @@ export type DeviceTransferTask = typeof deviceTransferTasks.$inferSelect;
 export type DeviceTransferTaskInsert = typeof deviceTransferTasks.$inferInsert;
 export type DeviceTransferTaskStopIntent = "paused" | "cancelled";
 
+/**
+ * Why a transfer is paused after an unclean shutdown.
+ *
+ * Exported because the `background_tasks` projection shows the SAME sentence in
+ * the task drawer. Two hand-written copies would eventually describe the same
+ * state differently, and the drawer is the half users actually read.
+ */
+export const TRANSFER_RESTART_PAUSE_NOTICE =
+	"NarraFork restarted while the transfer was active; resume to continue.";
+
 type TransferTaskDb = Pick<typeof applicationDb, "insert" | "update" | "select">;
 
 export class DeviceTransferTaskStore {
@@ -15,6 +25,22 @@ export class DeviceTransferTaskStore {
 	async create(values: DeviceTransferTaskInsert): Promise<DeviceTransferTask> {
 		const [task] = await this.database.insert(deviceTransferTasks).values(values).returning();
 		return task;
+	}
+
+	/**
+	 * Look up a transfer by id alone (no device scope).
+	 *
+	 * For callers holding only a transfer id — the `background_tasks` projection
+	 * stores `transferTaskId` and nothing about the device. Every mutating method
+	 * stays device-scoped; this is read-only resolution.
+	 */
+	async getById(taskId: string): Promise<DeviceTransferTask | null> {
+		const [task] = await this.database
+			.select()
+			.from(deviceTransferTasks)
+			.where(eq(deviceTransferTasks.id, taskId))
+			.limit(1);
+		return task ?? null;
 	}
 
 	async get(deviceId: string, taskId: string): Promise<DeviceTransferTask | null> {
@@ -96,13 +122,27 @@ export class DeviceTransferTaskStore {
 			);
 	}
 
+	/**
+	 * Mark a running generation completed, reporting whether the write actually landed.
+	 *
+	 * The return value matters because `status = "running"` in the WHERE clause makes
+	 * this a no-op after `pause()`/`cancel()`, and both of those change the row BEFORE
+	 * aborting the run. With little work left (a small file, a final chunk) the transfer
+	 * resolves normally before the abort is observed, so the row is already `paused` and
+	 * this UPDATE matches nothing.
+	 *
+	 * Callers must not treat that silence as success: reporting "completed" for a row
+	 * that says `paused` leaves the drawer and the device page permanently disagreeing,
+	 * and a resume then re-sends a file that already arrived. Progress writes may stay
+	 * silent no-ops — progress is self-correcting — but a terminal state cannot.
+	 */
 	async complete(
 		taskId: string,
 		generation: number,
 		result: { filesTransferred: number; bytesTransferred: number },
-	): Promise<void> {
+	): Promise<boolean> {
 		const completedAt = new Date().toISOString();
-		await this.database
+		const rows = await this.database
 			.update(deviceTransferTasks)
 			.set({
 				status: "completed",
@@ -120,7 +160,9 @@ export class DeviceTransferTaskStore {
 					eq(deviceTransferTasks.runGeneration, generation),
 					eq(deviceTransferTasks.status, "running"),
 				),
-			);
+			)
+			.returning({ id: deviceTransferTasks.id });
+		return rows.length > 0;
 	}
 
 	async finishStoppedOrFailed(input: {
@@ -219,7 +261,7 @@ export class DeviceTransferTaskStore {
 				.update(deviceTransferTasks)
 				.set({
 					status: "paused",
-					error: "NarraFork restarted while the transfer was active; resume to continue.",
+					error: TRANSFER_RESTART_PAUSE_NOTICE,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(

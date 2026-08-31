@@ -1,5 +1,5 @@
 import { execSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, extname, join, resolve, sep } from "node:path";
 import { Hono } from "hono";
@@ -354,24 +354,81 @@ fsRoutes.get("/download", async (c) => {
 	});
 });
 
-/** List immediate subdirectories of a path. */
-function listDirs(dir: string, showHidden = false): { name: string; path: string }[] {
+/**
+ * Ceiling on the extra `statSync` calls one listing may spend resolving symlinks.
+ *
+ * This route is synchronous on the server's only JS thread, so the per-entry work
+ * has to be bounded (see the main-thread rules in CLAUDE.md). Only symlinks are
+ * probed, so an ordinary directory costs nothing; the cap exists for the
+ * pathological case of a directory holding tens of thousands of links, possibly on
+ * a network filesystem where each stat is a round trip.
+ *
+ * Same order as MAX_DIRECTORY_ENTRIES on the client: past that point the listing is
+ * already unusable as a picker.
+ */
+const MAX_SYMLINK_PROBES = 1000;
+
+/** A directory entry returned by `/browse`. */
+interface BrowseEntry {
+	name: string;
+	path: string;
+	/** The entry is a symbolic link that resolves to a directory. */
+	isSymlink: boolean;
+}
+
+/**
+ * List immediate subdirectories of a path.
+ *
+ * Symlinks need a second `stat` because `withFileTypes` reports `Dirent` flags from
+ * **lstat**: a link pointing at a directory answers `isDirectory() === false` and
+ * only `isSymbolicLink() === true`. Filtering on `isDirectory()` alone therefore
+ * made every symlinked directory invisible in the picker — including the common
+ * case of a project directory reached through a link.
+ *
+ * Links we deliberately do NOT list:
+ *  - dangling (`ENOENT`) and self-referential/cyclic (`ELOOP`) links, plus anything
+ *    else `stat` refuses: the only action the picker offers is "enter or select this
+ *    directory", so an entry that cannot be entered just defers the error to the
+ *    user's next click;
+ *  - links to files, exactly like ordinary files.
+ */
+function listDirs(dir: string, showHidden = false): BrowseEntry[] {
+	let items: Dirent[];
 	try {
-		const items = readdirSync(dir, { withFileTypes: true });
-		return items
-			.filter((d) => {
-				if (!d.isDirectory()) return false;
-				// Skip hidden dirs on Unix unless showHidden is true
-				if (!showHidden && d.name.startsWith(".")) return false;
-				// Always skip system dirs on Windows
-				if (d.name === "$RECYCLE.BIN" || d.name === "System Volume Information") return false;
-				return true;
-			})
-			.map((d) => ({ name: d.name, path: join(dir, d.name) }))
-			.sort((a, b) => a.name.localeCompare(b.name));
+		items = readdirSync(dir, { withFileTypes: true });
 	} catch {
 		return [];
 	}
+
+	const entries: BrowseEntry[] = [];
+	let probesLeft = MAX_SYMLINK_PROBES;
+
+	for (const d of items) {
+		// Skip hidden dirs on Unix unless showHidden is true
+		if (!showHidden && d.name.startsWith(".")) continue;
+		// Always skip system dirs on Windows
+		if (d.name === "$RECYCLE.BIN" || d.name === "System Volume Information") continue;
+
+		const path = join(dir, d.name);
+		if (d.isDirectory()) {
+			entries.push({ name: d.name, path, isSymlink: false });
+			continue;
+		}
+		if (!d.isSymbolicLink()) continue;
+		if (probesLeft <= 0) continue;
+		probesLeft--;
+		try {
+			// statSync follows the link; a broken or cyclic link throws here and the
+			// entry is dropped rather than failing the whole listing.
+			if (statSync(path).isDirectory()) {
+				entries.push({ name: d.name, path, isSymlink: true });
+			}
+		} catch {
+			// ENOENT (dangling) / ELOOP (cycle) / EACCES — not a usable directory.
+		}
+	}
+
+	return entries.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** Get parent directory, or null if at filesystem root. */

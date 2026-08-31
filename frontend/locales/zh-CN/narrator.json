@@ -1094,11 +1094,13 @@
 		"statusContinued": "继续运行中",
 		"statusChildRunning": "后台工作仍运行（{{count}}）",
 		"statusCompleted": "已完成",
+		"statusPaused": "已暂停",
 		"statusCancelled": "已取消",
 		"statusFailed": "失败",
 		"statusTimeout": "已超时",
 		"agentTask": "代理",
 		"bashTask": "命令",
+		"transferTask": "传输",
 		"commandLabel": "命令",
 		"outputLabel": "输出",
 		"outputLive": "实时",
@@ -1136,7 +1138,8 @@
 			"spec_fork_carryover": "大纲继承",
 			"spec_context_cleared": "上下文已清空",
 			"review_feedback": "代码评审",
-			"interrupt_task_guard": "中断任务提醒"
+			"interrupt_task_guard": "中断任务提醒",
+			"tutorial_lesson": "教程课程"
 		},
 		"cadence": {
 			"everyNTools": "每 {{n}} 次工具调用"
@@ -1218,8 +1221,8 @@
 		"more": "更多工具",
 		"sectionVisible": "显示在标题栏",
 		"sectionTucked": "收纳在此菜单",
-		"headerOnly": "仅标题栏可用",
-		"hiddenNoRoom": "宽度不足"
+		"expandOptions": "展开选项",
+		"someHiddenNoRoom": "灰色项标题栏放不下"
 	},
 	"spec": {
 		"title": "大纲",
@@ -1347,5 +1350,19 @@
 		"readOnlyNotice": "只有所有者或管理员可以修改共享设置。",
 		"unavailable": "该会话暂时无法读取共享设置。",
 		"denied": "你已不再有权访问这个会话。"
+	},
+	"appearance": {
+		"title": "排版",
+		"intro": "调整本会话正文的排版，拖动时即时生效。",
+		"fontScale": "字体大小",
+		"fontScaleDesc": "同时缩放正文、标题、代码与标签。",
+		"letterSpacing": "字间距",
+		"letterSpacingDesc": "字符之间的额外间距，按字号的百分比计算。",
+		"paragraphScale": "段落间距",
+		"paragraphScaleDesc": "段落、列表、代码块与消息之间的间距。",
+		"reset": "恢复默认值",
+		"scopeNote": "仅作用于会话正文，并在你登录的所有设备上生效。",
+		"lineHeight": "行间距",
+		"lineHeightDesc": "同一段落内各行之间的间距。"
 	}
 }

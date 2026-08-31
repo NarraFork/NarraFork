@@ -239,6 +239,7 @@ import {
 	entriesToText,
 	type SelectionIndex,
 } from "./vlist-selection";
+import { createSmoothFollower, type SmoothFollower } from "./vlist-smooth-follow";
 import {
 	resolveSpecCarryoverActions,
 	useSpecCarryoverActions,
@@ -2139,8 +2140,15 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		 * next frame's write pulled them back to the bottom. Recording the value we wrote
 		 * lets `processScrollFrame` tell "this event is the echo of our write" from "the
 		 * reader moved", and honour the latter immediately.
+		 *
+		 * `advanceState`: the full write also pushes the settled value into React state.
+		 * The smooth-follow chase uses `false` for its per-frame writes so the shell
+		 * re-renders only when the mounted WINDOW changes (the scroll event each write
+		 * generates flows through `processScrollFrame`'s existing window gate) instead
+		 * of once per animation frame; the chase's exact landing still uses the full
+		 * write so state converges to the true position.
 		 */
-		const writeScrollTop = useCallback((nextTop: number) => {
+		const writeScrollTopCore = useCallback((nextTop: number, advanceState: boolean) => {
 			const node = viewportRef.current;
 			if (!node) return;
 			const target = Math.max(0, nextTop);
@@ -2151,18 +2159,64 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			suppressScrollStateRef.current = true;
 			suppressedScrollTopRef.current = settled;
 			scrollTopRef.current = settled;
-			setScrollTop(settled);
+			if (advanceState) setScrollTop(settled);
 			requestAnimationFrame(() => {
 				suppressScrollStateRef.current = false;
 				suppressedScrollTopRef.current = null;
 			});
 		}, []);
+		const writeScrollTop = useCallback(
+			(nextTop: number) => writeScrollTopCore(nextTop, true),
+			[writeScrollTopCore],
+		);
+		const writeChaseScrollTop = useCallback(
+			(nextTop: number) => writeScrollTopCore(nextTop, false),
+			[writeScrollTopCore],
+		);
+
+		/**
+		 * The smooth bottom-follow chase (vlist-smooth-follow). Held in a ref like the
+		 * fold-motion and highlight controllers: it is a decoration-layer driver, and
+		 * letting it into state would re-render the window for an animation.
+		 *
+		 * Reached through a getter so the instance is created lazily on first use —
+		 * the deps close over `writeScrollTop`/`writeChaseScrollTop`, which are stable.
+		 */
+		const smoothFollowerRef = useRef<SmoothFollower | null>(null);
+		const getSmoothFollower = useCallback((): SmoothFollower => {
+			let follower = smoothFollowerRef.current;
+			if (!follower) {
+				follower = createSmoothFollower({
+					readCurrent: () => viewportRef.current?.scrollTop ?? 0,
+					readTarget: () => getScrollBottomTarget(viewportRef.current),
+					getViewportHeight: () => viewportRef.current?.clientHeight ?? 0,
+					writeInstant: (value) => writeScrollTop(value),
+					writeChase: (value) => writeChaseScrollTop(value),
+				});
+				smoothFollowerRef.current = follower;
+			}
+			return follower;
+		}, [writeScrollTop, writeChaseScrollTop]);
+		// A chase in flight never survives the shell going away.
+		useEffect(() => () => smoothFollowerRef.current?.cancel(), []);
 
 		const onScrollTopCorrection = useCallback(
-			(nextTop: number, anchorKind: "bottom" | "item") => {
+			(nextTop: number, anchorKind: "bottom" | "item", smoothFollow?: boolean) => {
+				// A bottom correction stamped smooth answers TAIL GROWTH (streaming row,
+				// appended message, live patch at the tail): glide the pinned viewport to
+				// the live bottom instead of snapping every committed row up a delta per
+				// frame. The follower re-reads the target itself, and its gate falls back
+				// to this exact instant write for loads/switches/shrinks/reduced motion.
+				if (anchorKind === "bottom" && smoothFollow === true) {
+					getSmoothFollower().ensure();
+					return;
+				}
+				// Every other correction owns geometry (anchored rebuild, fold, LOD,
+				// removal): it must land in the same commit, so a chase in flight dies here.
+				getSmoothFollower().cancel();
 				writeScrollTop(applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current));
 			},
-			[writeScrollTop],
+			[getSmoothFollower, writeScrollTop],
 		);
 		const [interaction, setInteraction] = useState<VListInteractionState>(() =>
 			createVListInteractionState(lod),
@@ -2314,8 +2368,14 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			return {
 				scrollTop,
 				viewportHeight: node?.clientHeight ?? viewportHeightRef.current,
+				// Mid-chase the viewport lags BEHIND the bottom by the glide residual, so
+				// the raw geometric reading would report "not pinned" while the reader is
+				// in fact following — every streaming commit would then capture an ITEM
+				// anchor, and its correction would cancel the chase it should feed. An
+				// active chase IS the bottom pin in motion.
 				pinnedToBottom: node
-					? getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON
+					? getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON ||
+						smoothFollowerRef.current?.isActive() === true
 					: pinnedToBottomRef.current,
 				// Document offset of the point the LOD gesture is centered on, so the
 				// rebuild anchors THAT content instead of the viewport top. Stale points
@@ -2434,6 +2494,10 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		 * force a synchronous layout for information we already have.
 		 */
 		const captureFoldBefore = useCallback((key: string) => {
+			// A fold owns its own FLIP geometry, planned (while pinned) against the
+			// PREDICTED bottom scrollTop — a chase still gliding towards it would
+			// move the rows under the running animation. Land the chase first.
+			smoothFollowerRef.current?.snapToTarget();
 			// Reduced motion: no capture, so the layout effect below finds nothing to play
 			// and the fold applies instantly (the committed geometry).
 			if (prefersReducedMotion()) return;
@@ -4178,10 +4242,13 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			void scrollGeometryRevision;
 			if (!pinnedToBottom || !exactLayout) return;
 			const frame = requestAnimationFrame(() => {
-				writeScrollTop(getScrollBottomTarget(viewportRef.current));
+				// Route through the chase: streaming-sized growth glides, while a fresh
+				// load / narrator switch / prepend re-pin fails the gate and snaps exactly
+				// as the unconditional write did before.
+				getSmoothFollower().ensure();
 			});
 			return () => cancelAnimationFrame(frame);
-		}, [exactLayout, pinnedToBottom, scrollGeometryRevision, writeScrollTop]);
+		}, [exactLayout, pinnedToBottom, scrollGeometryRevision, getSmoothFollower]);
 
 		// First-screen fill: the tail page alone may not cover the viewport (many
 		// short messages). While pinned at the bottom with more history available,
@@ -4276,6 +4343,10 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				suppressScrollStateRef.current = false;
 				suppressedScrollTopRef.current = null;
 				if (pinnedToBottomRef.current !== effectiveAtBottom) {
+					// Losing the pin to a real upward gesture also kills any chase in
+					// flight — otherwise its next frame writes again and drags the reader
+					// back down (the chase only ever runs while pinned).
+					if (!effectiveAtBottom) getSmoothFollower().cancel();
 					pinnedToBottomRef.current = effectiveAtBottom;
 					setPinnedToBottom(effectiveAtBottom);
 				}
@@ -4286,7 +4357,11 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			// jitter guard, or one for a row that is no longer on the dynamic path, grows
 			// the real DOM box without changing the layout, so the effect would never run
 			// and the view would sit a form's height short of the bottom.
-			if (grewBeneathReader) writeScrollTop(getScrollBottomTarget(node));
+			//
+			// Through the chase, not a bare write: the growth beneath a pinned reader is
+			// exactly the "pushed up" jump the smooth follow exists to remove, and the
+			// follower's gate reproduces the old instant write for every non-glide case.
+			if (grewBeneathReader) getSmoothFollower().ensure();
 			if (effectiveAtBottom) onUnreadCountChange?.(0);
 			onAtBottomChange?.(effectiveAtBottom);
 			maybeAutoLoadOlder(nextTop, effectiveAtBottom);
@@ -4305,7 +4380,13 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			if (nextWindow.start !== cur.start || nextWindow.end !== cur.end) {
 				setScrollTop(settledTop);
 			}
-		}, [maybeAutoLoadOlder, onAtBottomChange, onUnreadCountChange, viewportHeight, writeScrollTop]);
+		}, [
+			maybeAutoLoadOlder,
+			onAtBottomChange,
+			onUnreadCountChange,
+			viewportHeight,
+			getSmoothFollower,
+		]);
 
 		const onScroll = useCallback(() => {
 			if (scrollRafRef.current) return;
@@ -4320,18 +4401,24 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 
 		const scrollToBottom = useCallback(
 			(instant?: boolean) => {
+				// An explicit jump-to-bottom lands where it was told to, instantly — a
+				// chase drifting in afterwards would fight the write.
+				getSmoothFollower().cancel();
 				pinnedToBottomRef.current = true;
 				setPinnedToBottom(true);
 				if (instant) writeScrollTop(getScrollBottomTarget(viewportRef.current));
 				else
 					requestAnimationFrame(() => writeScrollTop(getScrollBottomTarget(viewportRef.current)));
 			},
-			[writeScrollTop],
+			[getSmoothFollower, writeScrollTop],
 		);
 		const detachFromBottom = useCallback(() => {
+			// Reader intent (wheel-up): the chase must die with the pin, or its next
+			// frame re-writes scrollTop and pulls the reader back down.
+			getSmoothFollower().cancel();
 			pinnedToBottomRef.current = false;
 			setPinnedToBottom(false);
-		}, []);
+		}, [getSmoothFollower]);
 
 		// Quick index of user turns beside the scrollbar (parity with the chunked
 		// path's ScrollbarUserMarkers). Positions come from the exact layout's real
@@ -4349,11 +4436,12 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			(marker: VListUserMarker) => {
 				// A jump is an explicit reading action: unpin so streaming output cannot
 				// immediately pull the reader back to the tail.
+				getSmoothFollower().cancel();
 				pinnedToBottomRef.current = false;
 				setPinnedToBottom(false);
 				writeScrollTop(resolveVListUserMarkerScrollTop(marker.top, VLIST_USER_MARKER_JUMP_LEAD));
 			},
-			[writeScrollTop],
+			[getSmoothFollower, writeScrollTop],
 		);
 		const resolveUserMarkerLabel = useCallback(
 			(ordinal: number) =>
@@ -4376,6 +4464,9 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			const emit = (dir: 1 | -1, clientY: number | null) => {
 				const now = Date.now();
 				if (!throttle.tryStep(now)) return;
+				// The LOD morph diffs viewport geometry across the level switch; a chase
+				// still gliding through the rebuild would move rows under the morph.
+				smoothFollowerRef.current?.snapToTarget();
 				lodFocusRef.current =
 					clientY == null
 						? null
@@ -4463,6 +4554,9 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				// then stop scrolling and stop paging rather than fight the new target.
 				const token = ++jumpTokenRef.current;
 				const cancelled = () => token !== jumpTokenRef.current;
+				// A jump navigates AWAY from the bottom: any chase still gliding towards
+				// it would fight the reveal's scrollIntoView / layout writes.
+				getSmoothFollower().cancel();
 				// The row that was actually revealed, so the flash lands on the node the
 				// reader is now looking at rather than on a guessed id. Unlike the chunked
 				// path — which arms a 400ms timer and hopes the scroll finished — the flash
@@ -4577,7 +4671,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				if (cancelled()) return false;
 				return revealByLayout(revealIds);
 			},
-			[narratorId, t, writeScrollTop],
+			[narratorId, t, getSmoothFollower, writeScrollTop],
 		);
 
 		// UI-driven LOD changes (the indicator's notches / steppers) never pass through
@@ -4586,6 +4680,10 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		const prepareLodChange = useCallback((clientY: number) => {
 			const node = viewportRef.current;
 			if (!node) return;
+			// Same landing the gesture path does: the morph diffs viewport geometry
+			// across the switch and a gliding chase would move rows under it.
+			// snapToTarget stops the chase AND settles the residual in one write.
+			smoothFollowerRef.current?.snapToTarget();
 			lodFocusRef.current = createLodFocusPoint(
 				clientY,
 				node.getBoundingClientRect().top,

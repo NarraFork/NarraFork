@@ -32,6 +32,7 @@ import {
 	IconRobot,
 	IconSearch,
 	IconTerminal,
+	IconTextSize,
 	IconWorldWww,
 } from "@tabler/icons-react";
 import type { ComponentType } from "react";
@@ -70,11 +71,13 @@ export interface NarratorToolbarItemDef {
 	/**
 	 * The entry is a self-contained control (its own Menu / picker) rather than a
 	 * panel toggle: the header renders its component directly, and it cannot be
-	 * "activated" through {@link activateToolbarEntry}. In the overflow menu such
-	 * a row shows a header-only hint instead of a click action — clicking it would
-	 * otherwise silently do nothing (the default branch of the activation switch).
-	 * Tucking it away is still allowed: there it means "hidden", and dragging it
-	 * back above the divider restores it.
+	 * "activated" through the panel-toggle switch.
+	 *
+	 * In the overflow menu such a row expands its options INLINE instead
+	 * (`renderInlineOptions`), because a phone keeps only two icons in the header
+	 * and everything else lives in that menu — the row used to be a dead
+	 * "header only" hint, which left these controls with no reachable entry point
+	 * at all on mobile.
 	 */
 	selfContained?: boolean;
 }
@@ -139,6 +142,13 @@ const TOOLBAR_ITEM_DETAILS: Record<NarratorToolbarId, Omit<NarratorToolbarItemDe
 		icon: IconMessages,
 		hosts: ["dock", "drawer"],
 		badge: "userChatUnread",
+	},
+	appearance: {
+		labelKey: "appearance.title",
+		icon: IconTextSize,
+		// Dock only: the panel's whole purpose is being visible BESIDE the transcript
+		// while a slider moves, which a modal drawer over the content cannot provide.
+		hosts: ["dock"],
 	},
 	lodlevel: {
 		labelKey: "lodDensity",

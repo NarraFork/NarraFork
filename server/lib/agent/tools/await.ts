@@ -17,10 +17,13 @@ export { DEFAULT_TIMEOUT_MS as DEFAULT_AWAIT_TIMEOUT_MS };
 // the Bash tool's runningBashProcesses map. Pinned to globalThis via hotSafe so hot
 // reloads don't lose references to in-flight timers.
 
+/** What an Await call is waiting on. */
+export type AwaitTargetType = "agent" | "bash" | "transfer";
+
 interface RunningAwaitEntry {
 	startedAt: number;
 	timeoutMs: number;
-	awaitType: "agent" | "bash";
+	awaitType: AwaitTargetType;
 	targetId: string;
 	narratorId: string;
 	/** Reschedule the timeout to fire `newMs` after the wait started. */
@@ -32,7 +35,7 @@ export interface RunningAwaitSnapshot {
 	startedAt: number;
 	timeoutMs: number;
 	deadlineAt: string;
-	awaitType: "agent" | "bash";
+	awaitType: AwaitTargetType;
 	targetId: string;
 	narratorId: string;
 }
@@ -100,10 +103,10 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 		properties: {
 			type: {
 				description: subagent
-					? 'What to await: "bash" (subagents cannot await other agents).'
-					: 'What to await: "agent" (primary narrator only) or "bash" (also available to subagents).',
+					? 'What to await: "bash" or "transfer" (subagents cannot await other agents).'
+					: 'What to await: "agent" (primary narrator only), "bash", or "transfer" (a background device file transfer).',
 				type: "string",
-				enum: subagent ? ["bash"] : ["agent", "bash"],
+				enum: subagent ? ["bash", "transfer"] : ["agent", "bash", "transfer"],
 			},
 			id: {
 				description: "The task/subagent ID, alias, or accessible subagent name.",
@@ -130,6 +133,8 @@ export const awaitTool: ToolDefinition = {
 		'Use `type: "agent"` to await a background or running subagent from a primary narrator. ' +
 		'Subagents cannot use `type: "agent"` to wait for other agents; use asynchronous Send instead. ' +
 		'Use `type: "bash"` to await a background bash task. ' +
+		'Use `type: "transfer"` to await a background device file transfer; a paused transfer ' +
+		"returns immediately as paused rather than waiting, so you can decide whether to resume it. " +
 		"If an agent wait times out, the result includes its recent timestamped tool activity. " +
 		"A timeout ends only the current wait, not the task: if activity is recent, keep waiting with " +
 		"Await and a meaningful timeout instead of sending status checks or interrupting the agent. " +
@@ -138,9 +143,9 @@ export const awaitTool: ToolDefinition = {
 		"tasks. For bash tasks, `wait_for_text` returns early once matching output appears.",
 	parameters: z.object({
 		type: z
-			.enum(["agent", "bash"])
+			.enum(["agent", "bash", "transfer"])
 			.describe(
-				'What to await: "agent" (primary narrator only) or "bash" (also available to subagents).',
+				'What to await: "agent" (primary narrator only), "bash", or "transfer" (a background device file transfer).',
 			),
 		id: z.string().describe("The task/subagent ID, alias, or accessible subagent name."),
 		timeout: looseNumber(AWAIT_TIMEOUT_DESCRIPTION),
@@ -157,7 +162,7 @@ export const awaitTool: ToolDefinition = {
 	},
 	async execute(args, ctx): Promise<ToolResult> {
 		const { type, id, wait_for_text } = args as {
-			type: "agent" | "bash";
+			type: AwaitTargetType;
 			id: string;
 			wait_for_text?: string;
 		};
@@ -242,19 +247,58 @@ export const awaitTool: ToolDefinition = {
 			);
 			let taskId = resolveTaskAlias(ctx.narratorId, id);
 			let task = await backgroundTaskService.getById(taskId);
+			if (!task) {
+				// A background transfer's alias is registered against the OWNING
+				// `device_transfer_tasks` row, because that row is all the tool has when it
+				// hands the work off (the `background_tasks` projection is created later, by
+				// the runner, once the claim succeeds). So the id the model was handed lives
+				// in a different id space than this table's primary key, and looking it up
+				// as a projection id can only miss.
+				//
+				// Resolving through `transferTaskId` is what closes that gap. Without it
+				// every `Await({type:"transfer"})` answers "not a valid background task ID"
+				// for an id the tool itself told the model to use.
+				task = await backgroundTaskService.getByTransferTaskId(taskId);
+				if (task) taskId = task.id;
+			}
 			if (!task && taskId === id) {
 				task = await backgroundTaskService.getByAlias(id, ctx.narratorId);
 				if (task) taskId = task.id;
 			}
 			if (!task)
 				return { output: `Error: "${id}" is not a valid background task ID.`, isError: true };
-			if (task.type !== "bash") {
-				return { output: `Error: "${id}" is a ${task.type} task, not bash.`, isError: true };
+			// The requested type must match the row's. Both kinds wait on the same
+			// mechanism (the lifecycle events are type-agnostic), but silently accepting
+			// a mismatch would let `type: "bash"` "succeed" on a transfer and report a
+			// bash-shaped result for it.
+			if (task.type !== type) {
+				return { output: `Error: "${id}" is a ${task.type} task, not ${type}.`, isError: true };
 			}
 			if (task.parentNarratorId !== ctx.narratorId) {
 				return { output: `Error: "${id}" does not belong to this narrator.`, isError: true };
 			}
 			if (task.alias && task.id !== id) registerTaskAlias(ctx.narratorId, task.id, task.alias);
+
+			// A PAUSED transfer answers immediately instead of waiting. Nothing is
+			// running, so no lifecycle event is coming and the wait could only end in a
+			// timeout — leaving the model with no idea why. Telling it the transfer is
+			// paused lets it resume or give up.
+			if (task.status === "paused") {
+				const label = task.alias ?? taskId;
+				return {
+					output:
+						`Task ${label} is PAUSED, not running: ${task.output ?? "no reason recorded"}\n\n` +
+						`Resume it before awaiting again, or cancel it if it is no longer wanted.`,
+					metadata: {
+						kind: "await",
+						awaitType: type,
+						targetId: id,
+						targetLabel: label,
+						resolvedId: taskId,
+						status: "paused",
+					},
+				};
+			}
 
 			const result = wait_for_text
 				? await backgroundTaskService.waitForText(
@@ -278,7 +322,7 @@ export const awaitTool: ToolDefinition = {
 				output: formatResult(taskLabel, status, result.output),
 				metadata: {
 					kind: "await",
-					awaitType: "bash",
+					awaitType: type,
 					targetId: id,
 					targetLabel: taskLabel,
 					resolvedId: taskId,

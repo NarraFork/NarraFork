@@ -7,9 +7,11 @@ import {
 	type BackgroundTaskListDelta,
 	type BackgroundTaskListItem,
 	type BackgroundTaskListPage,
+	type BackgroundTaskType,
 	compareBackgroundTaskListItemsDesc,
 	isBackgroundTaskActiveStatus,
 } from "@shared/background-task-list";
+import type { ToolProgressPayload } from "@shared/tool-progress";
 import {
 	and,
 	type Column,
@@ -21,11 +23,12 @@ import {
 	lt,
 	ne,
 	notExists,
+	notInArray,
 	or,
 	sql,
 } from "drizzle-orm";
 import { db } from "../db";
-import { backgroundTasks, narrators } from "../db/schema";
+import { backgroundTasks, deviceTransferTasks, narrators } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
@@ -33,6 +36,7 @@ import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { escapeLikeNeedle } from "../lib/sql-like";
+import { TRANSFER_RESTART_PAUSE_NOTICE } from "./device-transfer-task-store";
 import { pushPendingInjection } from "./parent-injection-queue";
 
 // === Types ===
@@ -124,7 +128,7 @@ export interface WaitResult {
 
 export interface CompletedNotification {
 	id: string;
-	type: "bash" | "agent";
+	type: BackgroundTaskType;
 	title: string | null;
 	alias: string | null;
 	status: string;
@@ -201,6 +205,18 @@ const MAX_TRACKED_LIST_VERSIONS = 500;
  */
 function toWaitStatus(status: string): string {
 	return status === "timeout" ? "timed_out" : status;
+}
+
+/**
+ * Whether a row's own status means there is still work a cancel could stop.
+ *
+ * `paused` is included: the owning `device_transfer_tasks` row accepts `cancel`
+ * from `paused` (it discards the resume checkpoint), so reporting a paused
+ * transfer as uncancellable would hide an action the backend supports and leave
+ * the user with a stuck card and no way to discard it.
+ */
+function isCancellableTaskStatus(status: string): boolean {
+	return status === "running" || status === "paused";
 }
 
 function truncateToBytes(str: string, maxBytes: number): string {
@@ -362,6 +378,23 @@ class BackgroundTaskService {
 		this.listVersions.clear();
 	}
 
+	/**
+	 * Install a broadcast sink directly. Test-only.
+	 *
+	 * `getBroadcastFn` lazily imports `narrator-ws` and CACHES the result, so with
+	 * `mock.module` the first resolution wins for the whole process — two test files
+	 * mocking that module observe each other's sink depending on execution order.
+	 * Injecting here removes the ordering dependency. Pass null to restore the
+	 * lazy-import behaviour.
+	 */
+	setBroadcastFnForTests(
+		fn:
+			| ((id: string, msg: import("../websocket/narrator-ws-types").NarratorServerMessage) => void)
+			| null,
+	): void {
+		this._broadcastFn = fn;
+	}
+
 	private bumpListVersion(parentNarratorId: string): number {
 		const next = (this.listVersions.get(parentNarratorId) ?? 0) + 1;
 		// Re-insert so the map stays insertion-ordered by recency of use, which is
@@ -435,6 +468,35 @@ class BackgroundTaskService {
 	/** Fire-and-forget wrapper for the synchronous mark* paths. */
 	private queueTaskUpsert(parentNarratorId: string, taskId: string): void {
 		void this.broadcastTaskUpsert(parentNarratorId, taskId);
+	}
+
+	/**
+	 * Push live byte progress for a transfer's projection row.
+	 *
+	 * Bypasses `broadcastListDelta` deliberately — see BackgroundTaskProgressFrame.
+	 * Two costs are avoided: bumping the ordered version (where a dropped frame
+	 * forces a full page refetch) and the `countActiveByParent` query that every
+	 * delta performs. At ~2 frames/s per active transfer both would be paid
+	 * continuously for a value that is self-correcting.
+	 *
+	 * Silently does nothing when no projection exists (an admin transfer from the
+	 * devices page), which is the same no-op the rest of this path takes.
+	 */
+	async broadcastTransferProgress(
+		transferTaskId: string,
+		progress: ToolProgressPayload,
+	): Promise<void> {
+		const row = await this.getByTransferTaskId(transferTaskId);
+		if (!row) return;
+		const fn = await this.getBroadcastFn();
+		if (!fn) return;
+		fn(row.parentNarratorId, {
+			type: "background_task_progress",
+			narratorId: row.parentNarratorId,
+			listEpoch: BACKGROUND_TASK_LIST_EPOCH,
+			taskId: row.id,
+			progress,
+		});
 	}
 
 	/**
@@ -582,6 +644,160 @@ class BackgroundTaskService {
 		this.queueTaskUpsert(opts.parentNarratorId, opts.id);
 		this.maybeCleanup();
 		return row as BackgroundTaskRecord;
+	}
+
+	/**
+	 * Create the `background_tasks` PROJECTION of a device transfer.
+	 *
+	 * The transfer itself is owned by a `device_transfer_tasks` row, which holds the
+	 * resume checkpoint, the run generation and the byte progress. This row exists
+	 * only so the transfer appears where a narrator's background work is expected:
+	 * `Await`, the task drawer, and completion notifications.
+	 *
+	 * Idempotent per transfer generation. The runner calls this from `claim`, and a
+	 * resumed transfer claims again under a new generation — re-inserting would give
+	 * one transfer several drawer rows, all but one of them permanently stale. A
+	 * resume instead REVIVES the existing row, which is also what keeps a resumed
+	 * transfer at its original place in the list rather than jumping to the top as
+	 * though it were new work.
+	 */
+	async createTransferTask(opts: {
+		parentNarratorId: string;
+		transferTaskId: string;
+		title: string;
+		toolUseId?: string;
+		alias?: string;
+	}): Promise<BackgroundTaskRecord> {
+		const now = new Date().toISOString();
+		const existing = await this.getByTransferTaskId(opts.transferTaskId);
+		if (existing) {
+			// A resumed transfer: clear the terminal-ish state its previous run left so
+			// the drawer stops showing "paused" (and its restart notice) while bytes are
+			// moving again.
+			const [revived] = await db
+				.update(backgroundTasks)
+				.set({
+					status: "running",
+					output: null,
+					completedAt: null,
+					notified: false,
+					// Backfilled, never overwritten: a row created before the alias was carried
+					// here has none, and that is the row a restarted transfer resumes into —
+					// exactly when the model's handle has to resolve from the database.
+					...(opts.alias && !existing.alias ? { alias: opts.alias } : {}),
+					updatedAt: now,
+				})
+				.where(eq(backgroundTasks.id, existing.id))
+				.returning();
+			this.parentNarratorCache.set(existing.id, existing.parentNarratorId);
+			this.queueTaskUpsert(existing.parentNarratorId, existing.id);
+			return (revived ?? existing) as BackgroundTaskRecord;
+		}
+
+		const row: typeof backgroundTasks.$inferInsert = {
+			id: `bgtx_${generateShortId()}`,
+			parentNarratorId: opts.parentNarratorId,
+			type: "transfer",
+			status: "running",
+			transferTaskId: opts.transferTaskId,
+			toolUseId: opts.toolUseId ?? null,
+			alias: opts.alias ?? null,
+			title: opts.title,
+			// Progress deliberately never lands in `output` — it is joined from the
+			// owning row at read time. `output` carries only the final summary.
+			output: null,
+			outputBytes: 0,
+			outputTruncated: false,
+			notified: false,
+			startedAt: now,
+			createdAt: now,
+			updatedAt: now,
+		};
+		await db.insert(backgroundTasks).values(row);
+		this.parentNarratorCache.set(row.id, opts.parentNarratorId);
+		this.queueTaskUpsert(opts.parentNarratorId, row.id);
+		this.maybeCleanup();
+		return row as BackgroundTaskRecord;
+	}
+
+	/** The projection row for a transfer, if one exists. */
+	async getByTransferTaskId(transferTaskId: string): Promise<BackgroundTaskRecord | null> {
+		const [row] = await db
+			.select()
+			.from(backgroundTasks)
+			.where(eq(backgroundTasks.transferTaskId, transferTaskId))
+			.limit(1)
+			.all();
+		return row ?? null;
+	}
+
+	/**
+	 * A transfer stopped but is RESUMABLE.
+	 *
+	 * Emits no lifecycle event and pushes no notification: `paused` is not an
+	 * outcome. Signalling completion here would unblock a waiting `Await` with a
+	 * terminal answer for work that is still pending, and mark the row `notified`
+	 * so the eventual real completion is never announced.
+	 */
+	async markTransferPaused(transferTaskId: string, reason: string | null): Promise<void> {
+		const existing = await this.getByTransferTaskId(transferTaskId);
+		if (!existing || existing.status !== "running") return;
+		const now = new Date().toISOString();
+		await db
+			.update(backgroundTasks)
+			.set({
+				status: "paused",
+				// No completedAt: it has not completed, and stamping one makes the row
+				// eligible for age-based reaping while the transfer is still resumable.
+				output: reason,
+				updatedAt: now,
+			})
+			.where(and(eq(backgroundTasks.id, existing.id), eq(backgroundTasks.status, "running")));
+		this.queueTaskUpsert(existing.parentNarratorId, existing.id);
+	}
+
+	/**
+	 * A transfer reached a terminal state. Routes to the ordinary bash-style
+	 * terminal paths so `Await`, the notification drain and the drawer all behave
+	 * exactly as they do for any other background task.
+	 */
+	async finishTransferTask(
+		transferTaskId: string,
+		outcome:
+			| { status: "completed"; summary: string }
+			| { status: "failed"; error: string }
+			| { status: "cancelled" },
+	): Promise<void> {
+		const existing = await this.getByTransferTaskId(transferTaskId);
+		// Only a live row transitions. A cancel already recorded by the drawer, or a
+		// second terminal report from a racing generation, must not overwrite it.
+		if (!existing || (existing.status !== "running" && existing.status !== "paused")) return;
+
+		// The mark* methods all guard on `status = "running"` (their job is to refuse
+		// overwriting a terminal row), so a PAUSED row would silently fail to
+		// transition — a cancelled or restarted-then-cancelled transfer would sit in
+		// the drawer as "paused" forever with no error anywhere. Lift it back to
+		// `running` first, under the same guard, so the terminal write applies.
+		if (existing.status === "paused") {
+			const now = new Date().toISOString();
+			const [lifted] = await db
+				.update(backgroundTasks)
+				.set({ status: "running", updatedAt: now })
+				.where(and(eq(backgroundTasks.id, existing.id), eq(backgroundTasks.status, "paused")))
+				.returning();
+			// Lost the race to another writer; whatever it wrote is authoritative.
+			if (!lifted) return;
+		}
+
+		if (outcome.status === "completed") {
+			await this.markCompleted(existing.id, outcome.summary);
+			return;
+		}
+		if (outcome.status === "failed") {
+			await this.markFailed(existing.id, outcome.error);
+			return;
+		}
+		await this.markCancelled(existing.id);
 	}
 
 	// ── Status updates ──────────────────────────────────────────────────
@@ -1179,7 +1395,7 @@ class BackgroundTaskService {
 				effectiveStatus: task.status,
 				currentNarratorStatus: null,
 				activeChildTaskCount: 0,
-				canCancelActiveWork: task.status === "running",
+				canCancelActiveWork: isCancellableTaskStatus(task.status),
 			}));
 		}
 
@@ -1244,7 +1460,9 @@ class BackgroundTaskService {
 				currentNarratorStatus,
 				activeChildTaskCount,
 				canCancelActiveWork:
-					task.status === "running" || effectiveStatus === "continued" || activeChildTaskCount > 0,
+					isCancellableTaskStatus(task.status) ||
+					effectiveStatus === "continued" ||
+					activeChildTaskCount > 0,
 			};
 		});
 	}
@@ -1281,9 +1499,10 @@ class BackgroundTaskService {
 	/** Overlay in-process liveness onto reconciled rows. */
 	private async applyLiveness(items: BackgroundTaskListItem[]): Promise<BackgroundTaskListItem[]> {
 		if (items.length === 0) return items;
+		const withProgress = await this.applyTransferProgress(items);
 		const isLive = await this.getLivenessFn();
-		if (!isLive) return items;
-		return items.map((item) => {
+		if (!isLive) return withProgress;
+		return withProgress.map((item) => {
 			if (item.type !== "agent") return item;
 			if (!isLive(item.subagentNarratorId ?? item.id)) return item;
 			return {
@@ -1292,6 +1511,76 @@ class BackgroundTaskService {
 				currentNarratorStatus: "working",
 				canCancelActiveWork: true,
 			};
+		});
+	}
+
+	/**
+	 * Attach live byte progress to `transfer` rows by JOINING the owning
+	 * `device_transfer_tasks` rows.
+	 *
+	 * Read-time rather than stored: progress changes every 500ms, and persisting it
+	 * on the projection too would create two rows that must agree on a fast-moving
+	 * value. Placed inside `applyLiveness` because that is the one funnel every list
+	 * path already passes through (paged rows, the active set, and delta upserts) —
+	 * attaching it anywhere else would give some surfaces a bar and others none.
+	 *
+	 * Bounded: only the transfer rows already in `items` are looked up, and only
+	 * their small numeric columns. Terminal rows are skipped — a finished transfer's
+	 * bar would sit at 100% saying nothing its summary does not.
+	 */
+	private async applyTransferProgress(
+		items: BackgroundTaskListItem[],
+	): Promise<BackgroundTaskListItem[]> {
+		const transferRows = items.filter(
+			(item) => item.type === "transfer" && isBackgroundTaskActiveStatus(item.effectiveStatus),
+		);
+		if (transferRows.length === 0) return items;
+		const projectionIds = transferRows.map((item) => item.id);
+		const owners = await db
+			.select({
+				projectionId: backgroundTasks.id,
+				direction: deviceTransferTasks.direction,
+				bytesTransferred: deviceTransferTasks.bytesTransferred,
+				totalBytes: deviceTransferTasks.totalBytes,
+				filesTransferred: deviceTransferTasks.filesTransferred,
+				totalFiles: deviceTransferTasks.totalFiles,
+				currentFile: deviceTransferTasks.currentFile,
+				startedAt: deviceTransferTasks.startedAt,
+				updatedAt: deviceTransferTasks.updatedAt,
+			})
+			.from(backgroundTasks)
+			.innerJoin(deviceTransferTasks, eq(backgroundTasks.transferTaskId, deviceTransferTasks.id))
+			.where(inArray(backgroundTasks.id, projectionIds))
+			.all();
+		if (owners.length === 0) return items;
+		const byProjection = new Map(owners.map((row) => [row.projectionId, row]));
+		return items.map((item) => {
+			const owner = byProjection.get(item.id);
+			if (!owner) return item;
+			const progress: ToolProgressPayload = {
+				completed: owner.bytesTransferred,
+				// Omitted rather than zeroed when unknown: a `total: 0` lets the client
+				// compute 0% and paint a bar frozen at zero, which reads as a stalled
+				// transfer instead of an unmeasurable one.
+				...(owner.totalBytes != null && owner.totalBytes > 0 ? { total: owner.totalBytes } : {}),
+				...(owner.totalFiles != null && owner.totalFiles > 1
+					? { itemsDone: owner.filesTransferred, itemsTotal: owner.totalFiles }
+					: {}),
+				...(owner.currentFile ? { currentItem: owner.currentFile } : {}),
+				// Elapsed spans the CURRENT run only (startedAt is re-stamped on resume),
+				// so a transfer paused overnight does not report an overnight-long elapsed
+				// and therefore a near-zero rate.
+				...(owner.startedAt
+					? {
+							elapsedMs: Math.max(
+								0,
+								new Date(owner.updatedAt).getTime() - new Date(owner.startedAt).getTime(),
+							),
+						}
+					: {}),
+				phase: owner.direction,
+			};
+			return { ...item, progress };
 		});
 	}
 
@@ -1516,7 +1805,15 @@ class BackgroundTaskService {
 				.where(
 					and(
 						eq(backgroundTasks.parentNarratorId, parentNarratorId),
-						or(eq(backgroundTasks.status, "running"), eq(backgroundTasks.type, "agent")),
+						or(
+							eq(backgroundTasks.status, "running"),
+							// A paused transfer is still active work (see
+							// isBackgroundTaskActiveStatus). Omitting it here would make the
+							// candidate set disagree with the predicate that filters it,
+							// which is the silent kind of bug: the row simply never appears.
+							eq(backgroundTasks.status, "paused"),
+							eq(backgroundTasks.type, "agent"),
+						),
 					),
 				)
 				.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
@@ -2027,7 +2324,12 @@ class BackgroundTaskService {
 				and(
 					eq(backgroundTasks.parentNarratorId, parentNarratorId),
 					eq(backgroundTasks.notified, false),
-					ne(backgroundTasks.status, "running"),
+					// "Not running" is NOT the same as "finished": a paused transfer is
+					// stopped but resumable. Notifying on it would tell the model a
+					// transfer completed when in fact it is waiting to be resumed — and
+					// because the row is then marked `notified`, the REAL completion would
+					// never be announced.
+					notInArray(backgroundTasks.status, ["running", "paused"]),
 				),
 			)
 			.all();
@@ -2137,11 +2439,35 @@ class BackgroundTaskService {
 		if (staleTasks.length === 0) return 0;
 
 		const now = new Date().toISOString();
-		const taskIds = staleTasks.map((task) => task.id);
-		await db
-			.update(backgroundTasks)
-			.set({ status: "cancelled", completedAt: now, updatedAt: now })
-			.where(and(inArray(backgroundTasks.id, taskIds), eq(backgroundTasks.status, "running")));
+		// A transfer is the one kind that SURVIVES a restart. Its owning
+		// `device_transfer_tasks` row keeps a resume checkpoint and is itself recovered
+		// as `paused` (see DeviceTransferTaskStore.recoverInterrupted), so cancelling
+		// the projection would make the drawer say "cancelled" about a transfer the user
+		// can still resume — the two halves would disagree about the same transfer, and
+		// the drawer is the half the user reads.
+		const transferIds = staleTasks.filter((t) => t.type === "transfer").map((t) => t.id);
+		const endedIds = staleTasks.filter((t) => t.type !== "transfer").map((t) => t.id);
+
+		if (transferIds.length > 0) {
+			await db
+				.update(backgroundTasks)
+				.set({
+					status: "paused",
+					// No completedAt: the task has not completed, and stamping one would
+					// make `cleanupCompleted`'s age filter eligible to reap a live transfer.
+					updatedAt: now,
+					output: TRANSFER_RESTART_PAUSE_NOTICE,
+				})
+				.where(
+					and(inArray(backgroundTasks.id, transferIds), eq(backgroundTasks.status, "running")),
+				);
+		}
+		if (endedIds.length > 0) {
+			await db
+				.update(backgroundTasks)
+				.set({ status: "cancelled", completedAt: now, updatedAt: now })
+				.where(and(inArray(backgroundTasks.id, endedIds), eq(backgroundTasks.status, "running")));
+		}
 
 		// Only agent tasks carry a subagent narrator whose background fields describe the
 		// run; a bash task has no narrator row of its own to reset.
@@ -2167,6 +2493,11 @@ class BackgroundTaskService {
 
 		for (const task of staleTasks) {
 			this.cleanupRuntime(task.id);
+			// A paused transfer emits NOTHING here. The `cancelled` event is what
+			// unblocks a waiting `Await`, and answering "cancelled" for a transfer that
+			// is merely paused would tell the model the transfer is over. An Await that
+			// waits out its timeout is recoverable; a wrong terminal answer is not.
+			if (task.type === "transfer") continue;
 			eventBus.emit({
 				type: "background_task:cancelled",
 				taskId: task.id,
@@ -2185,7 +2516,10 @@ class BackgroundTaskService {
 		logger.info("Recovered stale background tasks after restart", {
 			count: staleTasks.length,
 			bash: bashCount,
-			agent: staleTasks.length - bashCount,
+			agent: staleTasks.length - bashCount - transferIds.length,
+			// Reported separately because these were PAUSED, not cancelled — the log is
+			// how an operator tells "work was destroyed" from "work is resumable".
+			transferPaused: transferIds.length,
 		});
 		return staleTasks.length;
 	}
@@ -2213,7 +2547,17 @@ class BackgroundTaskService {
 		const rows = await db
 			.select({ id: backgroundTasks.id, parentNarratorId: backgroundTasks.parentNarratorId })
 			.from(backgroundTasks)
-			.where(and(ne(backgroundTasks.status, "running"), lt(backgroundTasks.completedAt, cutoff)))
+			.where(
+				and(
+					// `paused` is excluded alongside `running`: a paused transfer is
+					// resumable work, not a finished row. Reaping it would delete the
+					// drawer entry for a transfer the user can still continue — and since
+					// the owning device_transfer_tasks row survives, the transfer would
+					// resume with no task card anywhere.
+					notInArray(backgroundTasks.status, ["running", "paused"]),
+					lt(backgroundTasks.completedAt, cutoff),
+				),
+			)
 			.all();
 		const deletable = rows.filter((row) => !this.activeAgentContinuations.has(row.id));
 
@@ -2225,7 +2569,7 @@ class BackgroundTaskService {
 			.where(
 				and(
 					inArray(backgroundTasks.id, deletableIds),
-					ne(backgroundTasks.status, "running"),
+					notInArray(backgroundTasks.status, ["running", "paused"]),
 					lt(backgroundTasks.completedAt, cutoff),
 				),
 			);

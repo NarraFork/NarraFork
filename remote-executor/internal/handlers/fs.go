@@ -234,6 +234,24 @@ func (h *Handlers) FsMkdirp(params map[string]any) (any, error) {
 	return map[string]any{}, nil
 }
 
+// maxSymlinkProbes bounds the extra stat calls one FsList may spend classifying
+// symlinks. Only symlinked entries are probed, so an ordinary directory costs
+// nothing; the cap protects against a directory holding tens of thousands of links
+// (each stat is a syscall, and a round trip on a network filesystem).
+const maxSymlinkProbes = 1000
+
+// FsList lists one directory level.
+//
+// Symlinks need an extra resolution step because os.ReadDir reports lstat-derived
+// types: a link pointing at a directory answers IsDir() == false. Reporting those
+// as non-directories made every symlinked directory invisible in the interactive
+// directory picker, which only shows entries with isDirectory == true.
+//
+// Resolution goes through the PathGuard rather than a bare os.Stat: a symlink may
+// point outside allowRoots, and such an entry would be refused the moment the user
+// tried to descend into it. Dropping it here is more honest than offering an entry
+// that cannot be opened. Links that dangle, cycle, or resolve outside the guard are
+// skipped without failing the listing.
 func (h *Handlers) FsList(params map[string]any) (any, error) {
 	path, err := h.guardedExistingPath(params, "path")
 	if err != nil {
@@ -244,10 +262,33 @@ func (h *Handlers) FsList(params map[string]any) (any, error) {
 		return nil, err
 	}
 	entries := make([]map[string]any, 0, len(dirEntries))
+	probesLeft := maxSymlinkProbes
 	for _, e := range dirEntries {
+		if e.Type()&os.ModeSymlink == 0 {
+			entries = append(entries, map[string]any{
+				"name":        e.Name(),
+				"isDirectory": e.IsDir(),
+				"isSymlink":   false,
+			})
+			continue
+		}
+		if probesLeft <= 0 {
+			continue
+		}
+		probesLeft--
+		resolved, guardErr := h.guard.CheckExisting(filepath.Join(path, e.Name()))
+		if guardErr != nil {
+			// Dangling link, or a target outside an allowed root.
+			continue
+		}
+		info, statErr := os.Stat(resolved)
+		if statErr != nil {
+			continue
+		}
 		entries = append(entries, map[string]any{
 			"name":        e.Name(),
-			"isDirectory": e.IsDir(),
+			"isDirectory": info.IsDir(),
+			"isSymlink":   true,
 		})
 	}
 	return map[string]any{"entries": entries}, nil

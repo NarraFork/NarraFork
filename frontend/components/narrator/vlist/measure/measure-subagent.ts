@@ -59,7 +59,8 @@ import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-i
 // imports THIS module to measure a drilled-in subagent card, so importing it back
 // would close a cycle — and `RECENT_ROW_HEIGHT` is a module-level const, which
 // would hit the TDZ at import time.
-import { BARE_ROW_HEIGHT } from "@shared/pretext-layout/row-metrics";
+import { BARE_ROW_HEIGHT, bareRowMetrics } from "@shared/pretext-layout/row-metrics";
+import { scaleFontSize } from "@shared/pretext-layout/typography";
 import {
 	accumulateFrame,
 	DEFAULT_RENDER_LOD,
@@ -77,6 +78,9 @@ import {
 	MONO_FAMILY,
 	SANS_FAMILY,
 	SPACING,
+	scaledFont,
+	scaledLineBoxHeight,
+	typographyMetrics,
 } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 import {
@@ -136,6 +140,11 @@ export const RECENT_TITLE_MARGIN_BOTTOM = 4;
  * expressed by taking the height from the shared row metrics (`BARE_ROW_HEIGHT`,
  * the constant `measure-tool-run`'s `TRACE_ROW_HEIGHT` re-exports) rather than
  * restating it.
+ *
+ * NEUTRAL baseline: measurement reads `bareRowMetrics().height` so the row follows
+ * the reader's font scale. Keeping this a constant while a trace row scaled would
+ * reintroduce exactly the mismatch described above — the same call rendered at two
+ * different heights depending on which surface showed it.
  */
 export const RECENT_ROW_HEIGHT = BARE_ROW_HEIGHT; // 18.8
 /** Trace rows sit flush; the old 4px seam belonged to the tinted-button look. */
@@ -161,10 +170,30 @@ export const PROMPT_TOGGLE_ROW_HEIGHT = Math.max(CHEVRON_SIZE, XS_LINE_HEIGHT); 
 export const PROMPT_BODY_MARGIN_TOP = 4;
 /** ContentViewer maxHeight cap for the prompt (🟡). */
 export const PROMPT_MAX_HEIGHT = 200;
+/** Baseline size of the prompt body, shared by the font string and the line box. */
+export const PROMPT_FONT_SIZE = 11;
 /** Prompt ContentViewer is a <Code block style={{fontSize:11}}> (monospace). */
-export const PROMPT_FONT = `${FONT_WEIGHT.regular} 11px ${MONO_FAMILY}`;
+export const PROMPT_FONT = `${FONT_WEIGHT.regular} ${PROMPT_FONT_SIZE}px ${MONO_FAMILY}`;
 /** Prompt line box: round(11 × 1.55) = 17 (Code block base line-height). */
-export const PROMPT_LINE_HEIGHT = lineBoxHeight(11, LINE_HEIGHT.md); // 17
+export const PROMPT_LINE_HEIGHT = lineBoxHeight(PROMPT_FONT_SIZE, LINE_HEIGHT.md);
+/** promptLineHeight() at the reader's typography (baseline above). */
+export function promptLineHeight(): number {
+	return scaledLineBoxHeight(11, LINE_HEIGHT.md);
+} // 17
+/**
+ * Scaled prompt font — the partner of `promptLineHeight()`, and it must move with it.
+ *
+ * Measuring with the frozen `PROMPT_FONT` while sizing the line box with the scaled
+ * helper made the wrap width and the reserved height disagree, which the fixed 200px
+ * prompt cap then silently clips.
+ */
+export function promptFont(): string {
+	return scaledFont(FONT_WEIGHT.regular, PROMPT_FONT_SIZE, MONO_FAMILY);
+}
+/** Scaled prompt font size (px), for the render layer's `fontSize`. */
+export function promptFontSize(): number {
+	return scaleFontSize(PROMPT_FONT_SIZE);
+}
 
 // pendingPermissions — title + ToolCallCard × N (P10, placeholder).
 /** Title Text xs. */
@@ -403,15 +432,17 @@ const EMPTY_FRAME: ElementFrame = { blocks: [], contentHeight: 0, usedWidth: 0 }
 
 /** Measure a wrapping xs text line block (description, expanded). */
 function measureWrappedText(text: string, innerWidth: number, className: string): MeasuredElement {
-	const items: RichInlineItem[] = [{ text, font: DESC_FONT, break: "normal", extraWidth: 0 }];
+	const items: RichInlineItem[] = [
+		{ text, font: typographyMetrics().font.xs, break: "normal", extraWidth: 0 },
+	];
 	const block: PreparedInlineBlock = {
 		...baseBlockFields(),
 		kind: "inline",
 		flow: prepareRichInline(items),
-		lineHeight: XS_LINE_HEIGHT,
+		lineHeight: typographyMetrics().line.xs,
 		classNames: [className],
 		hrefs: [null],
-		fonts: [DESC_FONT],
+		fonts: [typographyMetrics().font.xs],
 	};
 	const frame = accumulateFrame([block], innerWidth, pretextLineMetrics);
 	return {
@@ -428,8 +459,8 @@ function measurePromptBody(prompt: string, innerWidth: number): MeasuredElement 
 	const block: PreparedCodeBlock = {
 		...baseBlockFields(),
 		kind: "code",
-		prepared: prepareWithSegments(prompt, PROMPT_FONT, { whiteSpace: "pre-wrap" }),
-		lineHeight: PROMPT_LINE_HEIGHT,
+		prepared: prepareWithSegments(prompt, promptFont(), { whiteSpace: "pre-wrap" }),
+		lineHeight: promptLineHeight(),
 		lang: null,
 	};
 	const frame = accumulateFrame([block], innerWidth, pretextLineMetrics, {
@@ -516,14 +547,14 @@ export function measureSubagentCard(
 		: null;
 	const descriptionHeight = descriptionMeasured
 		? descriptionMeasured.frame.contentHeight
-		: XS_LINE_HEIGHT;
+		: typographyMetrics().line.xs;
 
 	const headerHeight =
 		CARD_PADDING * 2 +
 		BADGE_ROW_HEIGHT +
 		DESC_MARGIN_TOP +
 		descriptionHeight +
-		(hasResultPreview ? RESULT_PREVIEW_MARGIN_TOP + XS_LINE_HEIGHT : 0);
+		(hasResultPreview ? RESULT_PREVIEW_MARGIN_TOP + typographyMetrics().line.xs : 0);
 
 	// ── Recent Calls (always shown when there are activity calls) ───────────────
 	const recentRowCount = Math.min(Math.max(0, data.recentCallCount ?? 0), RECENT_MAX_ROWS);
@@ -531,9 +562,10 @@ export function measureSubagentCard(
 	let recentCallsHeight = 0;
 	if (recentRowCount > 0) {
 		const titleRow = hasRecentCallsButton
-			? Math.max(XS_LINE_HEIGHT, BUTTON_COMPACT_XS)
-			: XS_LINE_HEIGHT;
-		const rowsHeight = recentRowCount * RECENT_ROW_HEIGHT + (recentRowCount - 1) * RECENT_STACK_GAP;
+			? Math.max(typographyMetrics().line.xs, BUTTON_COMPACT_XS)
+			: typographyMetrics().line.xs;
+		const rowsHeight =
+			recentRowCount * bareRowMetrics().height + (recentRowCount - 1) * RECENT_STACK_GAP;
 		recentCallsHeight = titleRow + RECENT_TITLE_MARGIN_BOTTOM + rowsHeight + BLOCK_PADDING_BOTTOM;
 	}
 

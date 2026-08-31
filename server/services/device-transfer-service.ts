@@ -18,7 +18,18 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants, mkdirSync } from "node:fs";
 import { open, readdir, rename, rm, stat } from "node:fs/promises";
-import { dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	join,
+	posix,
+	relative,
+	resolve,
+	sep,
+	win32,
+} from "node:path";
+import { formatProgressBytes } from "@shared/tool-progress";
 import { db } from "../db";
 import {
 	type ChunkFrameHeader,
@@ -237,6 +248,18 @@ interface ReceiveState {
 	abortHandler?: () => void;
 	settled: boolean;
 	cleaned: boolean;
+	/**
+	 * Progress reporting metadata for this receive, retained so EVERY written
+	 * chunk can report — not just the `transfer.begin` reply.
+	 *
+	 * The upload path reports per chunk from its own loop; download had no
+	 * equivalent because the chunks arrive through the frame handler, which has
+	 * only the `ReceiveState`. Without this field the meta never reached
+	 * `writeChunk`, so a download emitted exactly ONE progress event (at 0%,
+	 * before any bytes) and then went silent until it finished — any consumer
+	 * showing a progress bar sat at zero for the whole transfer.
+	 */
+	progress?: TransferProgressMeta;
 }
 
 /** transferId → receive state (server is the receiver, i.e. download). */
@@ -267,6 +290,16 @@ export interface RemoteBrowseEntry {
 	name: string;
 	path: string;
 	isDirectory: boolean;
+	/**
+	 * The entry is a symbolic link resolving to a directory.
+	 *
+	 * Optional because executors older than the release that added symlink
+	 * resolution do not report it — absent means "unknown", not "not a link". On
+	 * those executors symlinked directories remain invisible here (their `fs.list`
+	 * reports lstat types), which is why this is a plain additive field rather than
+	 * a negotiated protocol feature: upgrading the executor restores them.
+	 */
+	isSymlink?: boolean;
 }
 
 export interface RemoteBrowseResult {
@@ -360,7 +393,7 @@ export async function browseRemoteDirectory(
 		"fs.list",
 		{ path: remotePath },
 		{ signal: opts.signal },
-	)) as { entries?: { name?: unknown; isDirectory?: unknown }[] };
+	)) as { entries?: { name?: unknown; isDirectory?: unknown; isSymlink?: unknown }[] };
 
 	const maxEntries = opts.maxEntries ?? 2000;
 	const dirs: RemoteBrowseEntry[] = [];
@@ -376,6 +409,7 @@ export async function browseRemoteDirectory(
 			name: entry.name,
 			path: pathApi.join(remotePath, entry.name),
 			isDirectory: true,
+			isSymlink: entry.isSymlink === true,
 		});
 	}
 	dirs.sort((a, b) => a.name.localeCompare(b.name));
@@ -525,6 +559,7 @@ async function downloadFileInner(args: {
 			abortSignal: args.signal,
 			settled: false,
 			cleaned: false,
+			progress: args.progress,
 		};
 		receives.set(transferId, state);
 		if (args.signal) {
@@ -568,6 +603,8 @@ async function downloadFileInner(args: {
 				// The executor may report additional already-sent chunks (unlikely
 				// for download, but harmless): merge them.
 				for (const idx of begin.completedChunks) state.received.add(idx);
+				// Painted at 0% (when a progress consumer exists) so the card shows
+				// something started before the first chunk lands.
 				emitProgress(state, args.progress);
 				if (state.received.size >= totalChunks) void finalizeReceive(state);
 			})
@@ -688,6 +725,9 @@ async function uploadFileInner(args: {
 				throw new Error(`Device ${deviceId} went offline mid-upload`);
 			}
 			bytesSent += len;
+			// Progress goes through the caller's callback only. There used to be a
+			// `transfer:progress` eventBus emit here too, but that event has never had
+			// a listener in any release, so it was per-chunk work with no effect.
 			if (args.progress) {
 				const progress = {
 					bytesTransferred: (args.progress.baseBytes ?? 0) + bytesSent,
@@ -696,13 +736,6 @@ async function uploadFileInner(args: {
 					totalFiles: args.progress.totalFiles,
 					currentFile: args.progress.currentFile,
 				};
-				eventBus.emit({
-					type: "transfer:progress",
-					transferId,
-					deviceId,
-					direction: "upload",
-					...progress,
-				});
 				args.progress.onProgress?.(progress);
 			}
 		};
@@ -940,6 +973,11 @@ async function writeChunk(
 	state.pendingAckIndices.push(header.chunkIndex);
 	state.pendingAckCrc.push(crc32c(payload));
 
+	// Report AFTER the bytes are durable-ish (written to the .part handle) so the
+	// number never overstates what has actually landed. The upload path reports
+	// the same way from its own send loop.
+	emitProgress(state, state.progress);
+
 	if (state.pendingAckIndices.length >= ACK_FLUSH_THRESHOLD) flushAcks(state);
 
 	// Persist the resume manifest periodically (fsync + write) so an interrupted
@@ -1108,6 +1146,14 @@ function failReceivesForDevice(deviceId: string, error: string): void {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function emitProgress(state: ReceiveState, meta?: TransferProgressMeta): void {
+	if (!meta) {
+		// With no consumer there is nobody to measure against, so nothing to
+		// report. An earlier version also emitted `transfer:progress` on the event
+		// bus here, but that event never had a listener in any release, so the
+		// emit was work with no effect — and `writeChunk` now reaches this
+		// function once per chunk, which would have paid it for every megabyte.
+		return;
+	}
 	const progress = {
 		bytesTransferred: (meta?.baseBytes ?? 0) + state.bytesWritten,
 		totalBytes: meta?.totalBytes ?? state.fileSize,
@@ -1115,13 +1161,6 @@ function emitProgress(state: ReceiveState, meta?: TransferProgressMeta): void {
 		totalFiles: meta?.totalFiles ?? 1,
 		currentFile: meta?.currentFile,
 	};
-	eventBus.emit({
-		type: "transfer:progress",
-		transferId: state.transferId,
-		deviceId: state.deviceId,
-		direction: state.direction,
-		...progress,
-	});
 	meta?.onProgress?.(progress);
 }
 
@@ -1246,6 +1285,44 @@ interface TransferTaskOperations {
 	downloadDirectory: typeof downloadDirectory;
 	uploadDirectory: typeof uploadDirectory;
 	statLocal: typeof stat;
+	/**
+	 * Narrator-facing projection hooks (`background_tasks`).
+	 *
+	 * Injected rather than imported so this module keeps its single concern — moving
+	 * bytes — and so the task-manager tests can assert the projection contract
+	 * without a narrator, a database row, or the whole task service. All optional:
+	 * an admin transfer started from the devices page has no narrator to project to.
+	 */
+	onTransferClaimed?: (input: {
+		parentNarratorId: string;
+		transferTaskId: string;
+		title: string;
+		toolUseId?: string;
+		/**
+		 * The readable handle the tool already gave the model.
+		 *
+		 * Persisted on the projection so it still resolves after a restart, when the
+		 * in-memory alias registry is gone: the model's transcript still says
+		 * `Await({ type: "transfer", id: "<alias>" })`, and a resumed transfer is
+		 * exactly the case where it will be retried.
+		 */
+		alias?: string;
+	}) => Promise<unknown>;
+	onTransferPaused?: (transferTaskId: string, reason: string | null) => Promise<unknown>;
+	/**
+	 * Live progress for the narrator-facing row.
+	 *
+	 * Driven by the SAME 500ms writer that persists progress, so no second timer
+	 * exists and the broadcast rate cannot drift from the persistence rate.
+	 */
+	onTransferProgress?: (transferTaskId: string, progress: TransferProgressUpdate) => void;
+	onTransferFinished?: (
+		transferTaskId: string,
+		outcome:
+			| { status: "completed"; summary: string }
+			| { status: "failed"; error: string }
+			| { status: "cancelled" },
+	) => Promise<unknown>;
 }
 
 interface ActiveTransferTaskRun {
@@ -1256,6 +1333,27 @@ interface ActiveTransferTaskRun {
 }
 
 const TASK_PROGRESS_WRITE_INTERVAL_MS = 500;
+
+/** Readable drawer/Await label for a transfer task. */
+function transferTaskTitle(task: DeviceTransferTask): string {
+	const arrow = task.direction === "upload" ? "→" : "←";
+	const name = basename(task.direction === "upload" ? task.localPath : task.remotePath);
+	return `${task.direction} ${arrow} ${name || task.remotePath}`;
+}
+
+/** The completion text the model reads when it awaits a background transfer. */
+function transferTaskSummary(task: DeviceTransferTask, result: DirectoryTransferResult): string {
+	const verb = task.direction === "download" ? "Downloaded" : "Uploaded";
+	const what =
+		result.filesTransferred === 1
+			? formatProgressBytes(result.bytesTransferred)
+			: `${result.filesTransferred} files (${formatProgressBytes(result.bytesTransferred)})`;
+	const route =
+		task.direction === "upload"
+			? `${task.localPath} → ${task.remotePath}`
+			: `${task.remotePath} → ${task.localPath}`;
+	return `${verb} ${what} — ${route}`;
+}
 
 export function createDeviceTransferTaskManager(
 	store: DeviceTransferTaskStore,
@@ -1284,6 +1382,10 @@ export function createDeviceTransferTaskManager(
 			if (!progress) return;
 			pending = null;
 			lastWriteAt = Date.now();
+			// Broadcast on the same beat as the persistence write. Fire-and-forget and
+			// ahead of the await: a WS push must not delay the durable write, and a
+			// failed push must not fail the transfer.
+			operations.onTransferProgress?.(taskId, progress);
 			inFlight = store
 				.updateProgress(taskId, generation, progress)
 				.catch((error) =>
@@ -1316,6 +1418,28 @@ export function createDeviceTransferTaskManager(
 	async function execute(task: DeviceTransferTask, run: ActiveTransferTaskRun): Promise<void> {
 		const progressWriter = createProgressWriter(task.id, run.generation);
 		try {
+			// The narrator-facing projection is created here, AFTER `claim` succeeded, so
+			// a row that lost the claim race never produces a drawer card. Only transfers
+			// started by a narrator have one: an admin transfer from the devices page
+			// belongs to no narrator, and inventing a parent for it would put a card in
+			// somebody's drawer that they never asked for.
+			if (task.parentNarratorId) {
+				// Guarded like the terminal hooks: this sits inside the try block, so an
+				// unguarded throw here would be caught below and recorded as a TRANSFER
+				// failure — a broken drawer update would abort work that was fine.
+				const parentNarratorId = task.parentNarratorId;
+				await reportProjection(task.id, () =>
+					operations.onTransferClaimed?.({
+						parentNarratorId,
+						transferTaskId: task.id,
+						title: transferTaskTitle(task),
+						...(task.toolUseId ? { toolUseId: task.toolUseId } : {}),
+						// Carried onto the projection so `Await` can still resolve the handle the
+						// model holds after a restart, when the in-memory registry is empty.
+						...(task.alias ? { alias: task.alias } : {}),
+					}),
+				);
+			}
 			let result: DirectoryTransferResult;
 			if (task.recursive) {
 				result =
@@ -1377,13 +1501,95 @@ export function createDeviceTransferTaskManager(
 				result = { filesTransferred: 1, bytesTransferred: file.bytes };
 			}
 			await progressWriter.flush();
-			await store.complete(task.id, run.generation, result);
+			const completed = await store.complete(task.id, run.generation, result);
+			// Projection updated only AFTER the owning row is durable: the owner is the
+			// source of truth, so the drawer must never claim an outcome the transfer
+			// record itself does not yet carry.
+			//
+			// `complete()` is a no-op once the row left `running`, which happens when a
+			// pause/cancel lands while the last of the work was already in flight (both
+			// write the row before aborting). Reporting "completed" anyway is how the
+			// drawer came to say "done" for a row that says "paused" — and a resume from
+			// that state re-sends a file that already arrived. So on a miss we report the
+			// state the owner actually holds rather than the one this run wanted.
+			if (!task.parentNarratorId) return;
+			if (completed) {
+				await reportProjection(task.id, () =>
+					operations.onTransferFinished?.(task.id, {
+						status: "completed",
+						summary: transferTaskSummary(task, result),
+					}),
+				);
+				return;
+			}
+			const owner = await store.get(task.deviceId, task.id);
+			logger.info("Transfer finished into a non-running row; reporting the owner's state", {
+				taskId: task.id,
+				ownerStatus: owner?.status ?? "missing",
+			});
+			await reportProjection(task.id, () => {
+				// A row that vanished (deleted mid-run) has no state to mirror; leaving the
+				// card as-is beats inventing an outcome for a transfer nobody can inspect.
+				if (!owner) return;
+				// No reason: the work did not fail, it finished into a paused row. A fabricated
+				// error string here would show up on the card as if something went wrong.
+				if (owner.status === "paused") return operations.onTransferPaused?.(task.id, null);
+				if (owner.status === "cancelled") {
+					return operations.onTransferFinished?.(task.id, { status: "cancelled" });
+				}
+				// Any other state (already completed by an earlier generation, or failed)
+				// is reported verbatim rather than reinterpreted.
+				return owner.status === "completed"
+					? operations.onTransferFinished?.(task.id, {
+							status: "completed",
+							summary: transferTaskSummary(task, result),
+						})
+					: operations.onTransferFinished?.(task.id, {
+							status: "failed",
+							error: owner.error ?? "Transfer ended in an unexpected state",
+						});
+			});
 		} catch (error) {
 			await progressWriter.flush();
+			const message = error instanceof Error ? error.message : String(error);
 			await store.finishStoppedOrFailed({
 				taskId: task.id,
 				generation: run.generation,
 				stopIntent: run.stopIntent,
+				error: message,
+			});
+			if (!task.parentNarratorId) return;
+			// `stopIntent` is what separates the three endings, and it is the only place
+			// that distinction exists: the thrown error looks the same for a pause, a
+			// cancel and a genuine failure (all arrive as an abort). Getting this wrong
+			// would either bury a real failure as "paused" or declare a resumable
+			// transfer dead.
+			await reportProjection(task.id, () =>
+				run.stopIntent === "paused"
+					? operations.onTransferPaused?.(task.id, message)
+					: operations.onTransferFinished?.(
+							task.id,
+							run.stopIntent === "cancelled"
+								? { status: "cancelled" }
+								: { status: "failed", error: message },
+						),
+			);
+		}
+	}
+
+	/**
+	 * Run a projection update without letting it affect the transfer.
+	 *
+	 * The projection is a convenience view; the transfer is the work. A failure to
+	 * update a drawer card must never turn a completed transfer into a failed one,
+	 * so this logs and swallows.
+	 */
+	async function reportProjection(taskId: string, fn: () => unknown): Promise<void> {
+		try {
+			await fn();
+		} catch (error) {
+			logger.warn("Failed to update background task projection for transfer", {
+				taskId,
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
@@ -1420,11 +1626,28 @@ export function createDeviceTransferTaskManager(
 			localPath: string;
 			recursive?: boolean;
 			createdBy?: string | null;
+			/**
+			 * Set only when a narrator started this transfer. Omitting it (the devices
+			 * page) means the transfer runs with no `background_tasks` projection.
+			 */
+			parentNarratorId?: string | null;
+			toolUseId?: string | null;
+			/**
+			 * Mint the readable handle for this transfer, given its id.
+			 *
+			 * A callback rather than a plain string because the alias registry is keyed by
+			 * the row's id, which only exists here. Called BEFORE the row is written so the
+			 * handle lands in the same INSERT — a later UPDATE would race the runner, which
+			 * is scheduled immediately and reads the row back to build its projection.
+			 */
+			registerAlias?: (transferTaskId: string) => string;
 		}) {
 			await ensureRecovery();
 			const now = new Date().toISOString();
+			const id = `txtask_${generateId()}`;
 			const task = await store.create({
-				id: `txtask_${generateId()}`,
+				id,
+				alias: input.registerAlias?.(id) ?? null,
 				deviceId: input.deviceId,
 				direction: input.direction,
 				remotePath: input.remotePath,
@@ -1433,6 +1656,8 @@ export function createDeviceTransferTaskManager(
 				status: "queued",
 				runGeneration: 0,
 				createdBy: input.createdBy ?? null,
+				parentNarratorId: input.parentNarratorId ?? null,
+				toolUseId: input.toolUseId ?? null,
 				createdAt: now,
 				updatedAt: now,
 			});
@@ -1470,6 +1695,36 @@ export function createDeviceTransferTaskManager(
 			schedule(task.id, task.runGeneration);
 			return task;
 		},
+		/**
+		 * Cancel by transfer id alone, resolving the device from the row.
+		 *
+		 * For callers that hold a `background_tasks` projection (which carries only
+		 * `transferTaskId`) rather than a device id.
+		 */
+		async cancelById(taskId: string) {
+			const existing = await store.getById(taskId);
+			if (!existing) return null;
+			const task = await store.cancel(existing.deviceId, taskId);
+			if (!task) return null;
+			const run = activeRuns.get(taskId);
+			const aborted = run?.generation === task.runGeneration;
+			if (aborted && run) {
+				run.stopIntent = "cancelled";
+				run.controller.abort(TRANSFER_CANCELLED_ABORT_REASON);
+			}
+			// With a live run, `execute`'s catch block reports the terminal state and this
+			// must not pre-empt it. With NO live run there is nobody left to report: a
+			// paused (or restart-recovered) transfer has already exited its runner, and
+			// `store.cancel` accepts that transition. Leaving it to the runner would strand
+			// the projection at `paused` forever — the drawer would keep offering a resume
+			// for a transfer whose checkpoint was just discarded.
+			if (!aborted && task.parentNarratorId) {
+				await reportProjection(task.id, () =>
+					operations.onTransferFinished?.(task.id, { status: "cancelled" }),
+				);
+			}
+			return task;
+		},
 		recover: () => store.recoverInterrupted(),
 	};
 }
@@ -1481,10 +1736,49 @@ const transferTaskManager = createDeviceTransferTaskManager(new DeviceTransferTa
 	downloadDirectory,
 	uploadDirectory,
 	statLocal: stat,
+	// Lazily imported: background-task-service imports this module (for the restart
+	// pause notice), so a top-level import here would close the cycle.
+	onTransferClaimed: async (input) => {
+		const { backgroundTaskService } = await import("./background-task-service");
+		return backgroundTaskService.createTransferTask(input);
+	},
+	onTransferPaused: async (transferTaskId, reason) => {
+		const { backgroundTaskService } = await import("./background-task-service");
+		return backgroundTaskService.markTransferPaused(transferTaskId, reason);
+	},
+	onTransferProgress: (transferTaskId, progress) => {
+		void (async () => {
+			const { backgroundTaskService } = await import("./background-task-service");
+			await backgroundTaskService.broadcastTransferProgress(transferTaskId, {
+				completed: progress.bytesTransferred,
+				...(progress.totalBytes > 0 ? { total: progress.totalBytes } : {}),
+				...(progress.totalFiles > 1
+					? { itemsDone: progress.filesDone, itemsTotal: progress.totalFiles }
+					: {}),
+				...(progress.currentFile ? { currentItem: progress.currentFile } : {}),
+			});
+		})().catch(() => {
+			// A missed progress frame is self-correcting: the next one carries the
+			// complete state. Never surfaced as a transfer error.
+		});
+	},
+	onTransferFinished: async (transferTaskId, outcome) => {
+		const { backgroundTaskService } = await import("./background-task-service");
+		return backgroundTaskService.finishTransferTask(transferTaskId, outcome);
+	},
 });
 
 export const startDeviceTransferTask = transferTaskManager.start;
 export const getDeviceTransferTask = transferTaskManager.get;
+/**
+ * Cancel a transfer knowing only its id.
+ *
+ * The device-scoped `cancelDeviceTransferTask` requires the caller to already know
+ * which device the transfer belongs to, which a narrator-side caller does not: it
+ * holds a projection row carrying just `transferTaskId`. Rather than make that
+ * caller look the device up (and get it wrong), it resolves here.
+ */
+export const cancelDeviceTransferTaskById = transferTaskManager.cancelById;
 export const listDeviceTransferTasks = transferTaskManager.list;
 export const pauseDeviceTransferTask = transferTaskManager.pause;
 export const cancelDeviceTransferTask = transferTaskManager.cancel;

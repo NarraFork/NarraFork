@@ -1,4 +1,4 @@
-import { useConfirmDialog } from "@frontend/components/common/ConfirmDialogProvider";
+import { useConfirmDialog } from "@frontend/components/common/confirm-dialog-context";
 import {
 	ActionIcon,
 	Anchor,

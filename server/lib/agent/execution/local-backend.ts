@@ -19,7 +19,7 @@ import {
 	stat,
 	unlink,
 } from "node:fs/promises";
-import { isAbsolute, posix as posixPath, resolve } from "node:path";
+import { isAbsolute, join as joinPath, posix as posixPath, resolve } from "node:path";
 import { envWithAmbientProxy } from "../../net/proxy-env";
 import { getHome, IS_WINDOWS } from "../../platform";
 import { pathsEqualForOS, toForwardSlash } from "../../platform-path";
@@ -48,6 +48,12 @@ import { localPathSemantics } from "./path-semantics";
 
 const FILE_READ_CHUNK_BYTES = 64 * 1024;
 const MAX_POSIX_SYMLINKS = 40;
+/**
+ * Ceiling on the extra `stat` calls one `listDir` spends classifying symlinks.
+ * Beyond this the remaining links are reported as non-directories rather than
+ * turning a single listing into an unbounded number of syscalls.
+ */
+const MAX_LISTDIR_SYMLINK_PROBES = 1000;
 
 /**
  * Bun's POSIX realpath compatibility layer currently mishandles `\\` in pathnames.
@@ -435,9 +441,39 @@ export class LocalBackend implements ExecutionBackend {
 		mkdirSync(path, { recursive: true });
 	}
 
+	/**
+	 * List one directory level, resolving symlinks to their effective type.
+	 *
+	 * `withFileTypes` reports lstat flags, so a symlink pointing at a directory
+	 * answers `isDirectory() === false`; without the extra stat, Read's listing
+	 * renders symlinked directories as plain files (no trailing `/`).
+	 *
+	 * Only symlinks are probed, and the probe budget is capped: a directory holding
+	 * a huge number of links must not turn one listing into thousands of syscalls.
+	 * A link that dangles or cycles is reported as a non-directory rather than
+	 * failing the listing.
+	 */
 	async listDir(path: string): Promise<DirEntry[]> {
 		const entries = await readdir(path, { withFileTypes: true });
-		return entries.map((e) => ({ name: e.name, isDirectory: e.isDirectory() }));
+		let probesLeft = MAX_LISTDIR_SYMLINK_PROBES;
+		const out: DirEntry[] = [];
+		for (const e of entries) {
+			if (!e.isSymbolicLink()) {
+				out.push({ name: e.name, isDirectory: e.isDirectory(), isSymlink: false });
+				continue;
+			}
+			let isDirectory = false;
+			if (probesLeft > 0) {
+				probesLeft--;
+				try {
+					isDirectory = (await stat(joinPath(path, e.name))).isDirectory();
+				} catch {
+					// Dangling or cyclic link — not a directory.
+				}
+			}
+			out.push({ name: e.name, isDirectory, isSymlink: true });
+		}
+		return out;
 	}
 
 	async glob(pattern: string, opts: GlobOptions): Promise<string[]> {

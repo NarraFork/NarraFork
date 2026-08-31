@@ -47,7 +47,18 @@ describe("subagent communication policy", () => {
 		expect(subagentSendProperties.timeout).toBeUndefined();
 		expect(primarySendProperties.await).toBeDefined();
 		expect(primarySendProperties.timeout).toBeDefined();
-		expect((subagentAwaitProperties.type as { enum?: unknown[] }).enum).toEqual(["bash"]);
-		expect((primaryAwaitProperties.type as { enum?: unknown[] }).enum).toEqual(["agent", "bash"]);
+		// The invariant is that "agent" is hidden from subagents — NOT that the list is
+		// exactly one entry. Non-agent wait targets (bash, and a background device
+		// transfer) are deliberately available to subagents: a subagent that starts a
+		// background transfer must be able to wait for its own work.
+		const subagentAwaitTypes = (subagentAwaitProperties.type as { enum?: unknown[] }).enum ?? [];
+		expect(subagentAwaitTypes).not.toContain("agent");
+		expect(subagentAwaitTypes).toContain("bash");
+		expect(subagentAwaitTypes).toContain("transfer");
+		expect((primaryAwaitProperties.type as { enum?: unknown[] }).enum).toEqual([
+			"agent",
+			"bash",
+			"transfer",
+		]);
 	});
 });

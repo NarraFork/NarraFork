@@ -1125,6 +1125,33 @@ export const deviceTransferTasks = sqliteTable(
 		currentFile: text("current_file"),
 		error: text("error"),
 		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+		/**
+		 * The narrator that started this transfer, when a narrator did.
+		 *
+		 * NULL for an admin transfer started from the devices page: that transfer
+		 * belongs to no conversation, and it deliberately gets no `background_tasks`
+		 * projection — a card in some narrator's drawer for work it never requested
+		 * would be worse than no card.
+		 *
+		 * `set null` rather than `cascade`: deleting a narrator must not abort or erase
+		 * a transfer that is moving real bytes to a device.
+		 */
+		parentNarratorId: text("parent_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		/** The TransferFile tool call that started it, for card ↔ task correlation. */
+		toolUseId: text("tool_use_id"),
+		/**
+		 * The readable handle the TransferFile tool gave the model (`upload-app-apk`).
+		 *
+		 * Stored on the OWNING row, not only in the in-memory alias registry, because
+		 * the registry does not survive a restart — and a transfer is the one background
+		 * kind that does. Its projection row is created by the runner (after `claim`),
+		 * which is a different process lifetime than the turn that minted the alias, so
+		 * this column is how the handle reaches it. NULL for an admin transfer, which
+		 * has no model to address it.
+		 */
+		alias: text("alias"),
 		createdAt: text("created_at").notNull(),
 		startedAt: text("started_at"),
 		updatedAt: text("updated_at").notNull(),
@@ -1135,6 +1162,8 @@ export const deviceTransferTasks = sqliteTable(
 		index("idx_device_transfer_tasks_status_updated").on(table.status, table.updatedAt),
 		// FK covering index for user deletion.
 		index("idx_device_transfer_tasks_created_by").on(table.createdBy),
+		// FK covering index for narrator deletion (the `set null` above).
+		index("idx_device_transfer_tasks_parent_narrator").on(table.parentNarratorId),
 	],
 );
 
@@ -1736,6 +1765,28 @@ export const userPreferences = sqliteTable("user_preferences", {
 	showOutputStats: integer("show_output_stats", { mode: "boolean" }).notNull().default(true),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
+	/**
+	 * Narrator transcript typography, as PERCENTAGES of the built-in defaults.
+	 *
+	 * Percentages rather than px because these are measurement inputs consumed by the
+	 * exact height model (`shared/pretext-layout/typography.ts`), which scales a whole
+	 * family of roles (body, xs, headings, code) from one factor. Storing an absolute
+	 * size would fix only one role and leave the rest to drift.
+	 *
+	 * Defaults are the neutral setting: 100 / 0 / 100 measures byte-identically to a
+	 * build without this feature, so existing rows and fresh installs are unaffected.
+	 * Ranges are enforced in `TYPOGRAPHY_RANGE` and clamped on read as well as write —
+	 * a value outside them makes scaled text collide with unscalable card chrome.
+	 */
+	narratorFontScalePercent: integer("narrator_font_scale_percent").notNull().default(100),
+	/** Letter spacing as a percentage OF the font size (an em fraction ×100). */
+	narratorLetterSpacingPercent: integer("narrator_letter_spacing_percent").notNull().default(0),
+	/** Intra-paragraph line-height (leading) multiplier; distinct from block spacing. */
+	narratorLineHeightScalePercent: integer("narrator_line_height_scale_percent")
+		.notNull()
+		.default(100),
+	/** Block spacing (markdown block margins + transcript item gaps) multiplier. */
+	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
 	addSubagentToRecentTabs: integer("add_subagent_to_recent_tabs", { mode: "boolean" })
 		.notNull()
@@ -2775,11 +2826,109 @@ export const workspaces = sqliteTable(
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
-		tree: text("tree").notNull(), // JSON: SplitNode
+		/**
+		 * Serialized dockview layout — ARRANGEMENT ONLY.
+		 *
+		 * This column used to be the authoritative answer to "which narrators are in
+		 * this workspace", while `user_recent_tabs.workspace_id` held the same answer
+		 * independently. Two sources written by two separate client requests, with no
+		 * atomicity between them, is what produced the "the sidebar lists a narrator
+		 * but no panel renders" class of bug: the tab row was persisted while the
+		 * panel only ever existed in a client-side pending queue.
+		 *
+		 * Membership now lives in `workspace_panels`. This blob is read for POSITIONS
+		 * only: entries naming a panel that is not a member are discarded, and members
+		 * the blob does not mention are appended at a default position. Losing this
+		 * column therefore costs the arrangement, never a panel.
+		 *
+		 * The column name stays `tree` (a rename migration would buy nothing); the API
+		 * exposes it as `layout` to reflect the narrowed role.
+		 */
+		tree: text("tree").notNull(),
+		/**
+		 * Optimistic-concurrency token for layout writes.
+		 *
+		 * Layout is saved as one whole blob, so two tabs open on the same workspace
+		 * would otherwise silently overwrite each other's arrangement on every drag.
+		 * A mismatched `expectedRevision` is rejected with 409 so the client can
+		 * re-read and retry instead of last-write-wins. Membership does not need this
+		 * — `workspace_panels` is row-per-panel, so concurrent edits to different
+		 * panels cannot collide at all.
+		 */
+		layoutRevision: integer("layout_revision").notNull().default(0),
 		createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
 		updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 	},
 	(table) => [index("idx_workspaces_user").on(table.userId)],
+);
+
+// === workspace_panels ===
+// The authoritative membership of a workspace: one row per TOP-LEVEL panel.
+//
+// Rows, not a blob, for two reasons that the previous blob-only design could not
+// satisfy:
+//   - Adding or removing one panel touches one row, so two clients editing
+//     different panels never overwrite each other (a whole-blob write does).
+//   - Membership can be written in the SAME transaction as its
+//     `user_recent_tabs.workspace_id` projection, so a client can no longer end
+//     up with a persisted sidebar tab and a panel that exists nowhere.
+//
+// Scope is deliberately limited to panels that can stand on their own and are
+// rendered as top-level cells by BOTH presentation modes — the same set as
+// `isDirectorRenderablePanel`. Dependent panels (narrator-tool / subagent /
+// file / knowledge) stay in the layout blob: they only exist as a resource OF a
+// member (`hostNarratorId`), the sidebar never lists them, so they cannot
+// produce the "listed but invisible" shape, and reopening one is a single click.
+export const workspacePanels = sqliteTable(
+	"workspace_panels",
+	{
+		id: text("id").primaryKey(),
+		workspaceId: text("workspace_id")
+			.notNull()
+			.references(() => workspaces.id, { onDelete: "cascade" }),
+		/**
+		 * Membership kinds only.
+		 *
+		 * `plugin` was briefly included and is deliberately absent: a workspace plugin
+		 * panel binds to an owning narrator (`binding.kind === "workspace-narrator"`), so
+		 * it is that narrator's resource, not a standalone member. No code ever wrote such
+		 * a row, so narrowing this needs no data migration — and SQLite does not enforce
+		 * the enum anyway; it is a TypeScript-level constraint that keeps a non-membership
+		 * kind from being inserted.
+		 */
+		kind: text("kind", { enum: ["narrator", "terminal", "webview"] }).notNull(),
+		/**
+		 * Set only when `kind = "narrator"`.
+		 *
+		 * CASCADE rather than SET NULL: a narrator panel whose narrator is gone has
+		 * nothing left to render, so keeping the row would leave an empty cell the
+		 * user cannot open or meaningfully close.
+		 */
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
+		/**
+		 * Panel params for terminal / webview / plugin kinds (including a plugin's
+		 * `viewState`). Bounded per row by the service, which is also why moving
+		 * plugin panels out of the blob shrinks the layout back to a skeleton.
+		 */
+		configJson: text("config_json"),
+		/** Stable member order, used to place members the layout does not mention. */
+		sortOrder: integer("sort_order").notNull(),
+		createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+		updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+	},
+	(table) => [
+		index("idx_workspace_panels_workspace").on(table.workspaceId, table.sortOrder),
+		/**
+		 * One cell per narrator per workspace, enforced by the database.
+		 *
+		 * The previous design checked this by scanning `api.panels` on the client
+		 * before adding, which cannot hold under concurrency — two tabs (or a drop
+		 * racing a pending-panel drain) could both pass the check and create
+		 * duplicates.
+		 */
+		uniqueIndex("idx_workspace_panels_narrator").on(table.workspaceId, table.narratorId),
+		index("idx_workspace_panels_narrator_lookup").on(table.narratorId),
+	],
 );
 
 // === api_requests ===
@@ -3084,9 +3233,19 @@ export const backgroundTasks = sqliteTable(
 		parentNarratorId: text("parent_narrator_id")
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
-		type: text("type", { enum: ["bash", "agent"] }).notNull(),
+		type: text("type", { enum: ["bash", "agent", "transfer"] }).notNull(),
 		status: text("status", {
-			enum: ["running", "completed", "failed", "cancelled", "timeout"],
+			/**
+			 * `paused` exists only for `transfer` rows: a device transfer keeps a resume
+			 * checkpoint, so being stopped is a RESUMABLE intermediate state rather than
+			 * an ending. Bash and agent tasks have no equivalent — a killed process
+			 * cannot be continued — so they never take this value.
+			 *
+			 * Consumers must treat it as ACTIVE, not terminal (see
+			 * isBackgroundTaskActiveStatus and drainCompletedNotifications): a paused
+			 * transfer still occupies a slot and still needs the user to act on it.
+			 */
+			enum: ["running", "paused", "completed", "failed", "cancelled", "timeout"],
 		}).notNull(),
 		// Bash-specific
 		command: text("command"),
@@ -3096,6 +3255,18 @@ export const backgroundTasks = sqliteTable(
 			onDelete: "cascade",
 		}),
 		subagentType: text("subagent_type"),
+		/**
+		 * Transfer-specific: the `device_transfer_tasks` row that OWNS this transfer.
+		 *
+		 * This table holds only a status projection. The transfer's durable state —
+		 * resume checkpoint, run generation, and above all its byte PROGRESS — lives
+		 * in the owning row and is never mirrored here: progress changes every 500ms,
+		 * and duplicating it would make two tables that must agree on a fast-moving
+		 * value. The list layer joins it at read time instead.
+		 */
+		transferTaskId: text("transfer_task_id").references(() => deviceTransferTasks.id, {
+			onDelete: "cascade",
+		}),
 		// Common
 		toolUseId: text("tool_use_id"),
 		alias: text("alias"),
@@ -3113,6 +3284,10 @@ export const backgroundTasks = sqliteTable(
 	(table) => [
 		index("idx_bg_tasks_parent").on(table.parentNarratorId, table.status),
 		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
+		// The transfer runner reaches the projection by the OWNING row's id (it never
+		// holds the projection id), and it does so at every lifecycle transition.
+		// Doubles as the FK covering index for transfer-row deletion.
+		index("idx_bg_tasks_transfer").on(table.transferTaskId),
 		// Cursor paging order for the task list: `(parent, createdAt desc, id desc)`.
 		// Without it a parent with hundreds of tasks sorts its whole history on every
 		// page request.

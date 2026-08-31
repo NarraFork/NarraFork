@@ -98,43 +98,23 @@ describe("resolveHeaderToolbarCapacity", () => {
 });
 
 describe("selectHeaderToolbarEntries", () => {
-	const defs = [
-		{ id: "a" },
-		{ id: "b" },
-		{ id: "menu1", selfContained: true },
-		{ id: "c" },
-		{ id: "menu2", selfContained: true },
-	];
+	const defs = [{ id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }, { id: "e" }];
 
 	test("an uncapped or generous capacity keeps everything on the row", () => {
 		expect(selectHeaderToolbarEntries(defs, null).visible.map((d) => d.id)).toEqual([
 			"a",
 			"b",
-			"menu1",
 			"c",
-			"menu2",
+			"d",
+			"e",
 		]);
 		expect(selectHeaderToolbarEntries(defs, 99).hidden).toEqual([]);
 	});
 
-	test("collapses activatable entries from the end before any self-contained one", () => {
-		// `c` is the last activatable entry, so it goes first even though two
-		// self-contained controls sit after it in layout order.
-		expect(selectHeaderToolbarEntries(defs, 4).hidden.map((d) => d.id)).toEqual(["c"]);
-		expect(selectHeaderToolbarEntries(defs, 3).hidden.map((d) => d.id)).toEqual(["b", "c"]);
-		expect(selectHeaderToolbarEntries(defs, 2).hidden.map((d) => d.id)).toEqual(["a", "b", "c"]);
-	});
-
-	test("self-contained controls are the last to leave the row", () => {
-		// The regression this exists for: those controls cannot be opened from the
-		// overflow menu (Mantine v7 has no submenu), so collapsing them first would
-		// make the device picker and detail level unreachable on a narrow desktop
-		// row — with a menu row that still claims to be "shown in header".
-		expect(selectHeaderToolbarEntries(defs, 1).visible.map((d) => d.id)).toEqual(["menu1"]);
-		expect(selectHeaderToolbarEntries(defs, 2).visible.map((d) => d.id)).toEqual([
-			"menu1",
-			"menu2",
-		]);
+	test("collapses strictly from the end of the layout order", () => {
+		expect(selectHeaderToolbarEntries(defs, 4).hidden.map((d) => d.id)).toEqual(["e"]);
+		expect(selectHeaderToolbarEntries(defs, 3).hidden.map((d) => d.id)).toEqual(["d", "e"]);
+		expect(selectHeaderToolbarEntries(defs, 1).visible.map((d) => d.id)).toEqual(["a"]);
 	});
 
 	test("keeps layout order in both lists and never loses or duplicates an entry", () => {
@@ -151,16 +131,20 @@ describe("selectHeaderToolbarEntries", () => {
 		}
 	});
 
-	test("the real registry's self-contained controls survive a one-slot row", () => {
-		// Guards the premise above against the registry rather than a fixture: if
-		// `selfContained` were dropped from device / lodlevel / plugins, the rule
-		// would silently stop protecting anything.
-		const selfContained = NARRATOR_TOOLBAR_ITEMS.filter((def) => def.selfContained === true);
-		expect(selfContained.length).toBeGreaterThan(0);
-
-		const { visible } = selectHeaderToolbarEntries(NARRATOR_TOOLBAR_ITEMS, 1);
-		expect(visible).toHaveLength(1);
-		expect(visible[0]?.selfContained).toBe(true);
+	test("a phone-sized row keeps the entries the reader put first", () => {
+		/*
+		 * The regression this replaces the old "self-contained controls leave last"
+		 * rule with. That rule existed because the overflow menu could only show those
+		 * controls as a dead "header only" row; the menu now expands their options
+		 * inline, and keeping the rule meant a phone (MOBILE_TOOLBAR_VISIBLE_LIMIT = 2)
+		 * surfaced `lodlevel` + `device` — the two entries at the END of the default
+		 * order — while background tasks, terminal, git and search all collapsed.
+		 */
+		const { visible } = selectHeaderToolbarEntries(NARRATOR_TOOLBAR_ITEMS, 2);
+		expect(visible.map((def) => def.id)).toEqual(
+			NARRATOR_TOOLBAR_ITEMS.slice(0, 2).map((def) => def.id),
+		);
+		expect(visible.some((def) => def.selfContained === true)).toBe(false);
 	});
 });
 

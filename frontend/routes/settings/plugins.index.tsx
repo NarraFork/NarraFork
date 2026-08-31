@@ -27,7 +27,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { isPluginsDisabledError, localizePluginError } from "../../components/plugins-admin/errors";
 import { PluginInstallModal } from "../../components/plugins-admin/PluginInstallModal";
 import { PluginStatusBadge } from "../../components/plugins-admin/PluginStatusBadge";

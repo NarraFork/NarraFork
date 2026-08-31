@@ -24,7 +24,7 @@ import {
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { isPluginsDisabledError, localizePluginError } from "../../components/plugins-admin/errors";
 import { PluginDiagnosticsPanel } from "../../components/plugins-admin/PluginDiagnosticsPanel";
 import { PluginProviderConfigPanel } from "../../components/plugins-admin/PluginProviderConfigPanel";

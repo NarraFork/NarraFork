@@ -45,8 +45,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { CopyButton } from "../../components/common/CopyButton";
+import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { type ApiError, api, type OAuthApp } from "../../lib/api";
 import {

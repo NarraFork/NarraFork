@@ -55,6 +55,7 @@ import {
 	LINE_HEIGHT,
 	lineBoxHeight,
 	SPACING,
+	typographyMetrics,
 } from "../pretext-fonts";
 import { pretextLineMetrics } from "./pretext-metrics";
 
@@ -138,7 +139,16 @@ export interface SystemTextData {
 /** Paper p="xs" inner padding (top + bottom each). */
 export const CARD_PADDING = SPACING.xs; // 10
 /** xs body line box: round(12 × 1.4) = 17. Shared by SANS + MONO (xs line-height). */
-export const BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+/**
+ * These cards render their body at xs (12px), NOT at the sm body size.
+ *
+ * Named `XS_BODY_LINE_HEIGHT` rather than `BODY_LINE_HEIGHT` because
+ * `measure-message-bubble` uses the latter name for the sm line (20px). While both
+ * spellings existed, a name-keyed migration mapped this module to the sm role and
+ * made every system card 3px taller per line — with nothing to signal it. The
+ * `typography-wiring` guard now fails on any such collision.
+ */
+export const XS_BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 
 /** Leading alert/notice icon size (error / segment_compact_failed). */
 export const ICON_16 = 16;
@@ -264,7 +274,7 @@ export const KIND_CHROME: Record<SystemTextKind, KindChrome> = {
 		whiteSpace: "pre-wrap",
 		leftChrome: SEGMENT_LEFT,
 		rightChrome: SEGMENT_RIGHT,
-		preBody: BODY_LINE_HEIGHT + SEGMENT_TITLE_GAP, // title line (17) + gap (2) = 19
+		preBody: typographyMetrics().line.xs + SEGMENT_TITLE_GAP, // title line (17) + gap (2) = 19
 		postBody: 0,
 		sideMin: BUTTON_COMPACT_XS, // 18
 		prefix: "",
@@ -306,7 +316,7 @@ export const KIND_CHROME: Record<SystemTextKind, KindChrome> = {
 		// so the body keeps the full card width.
 		leftChrome: 0,
 		rightChrome: 0,
-		preBody: BODY_LINE_HEIGHT + ORIGIN_HEADING_GAP, // heading (17) + gap (4) = 21
+		preBody: typographyMetrics().line.xs + ORIGIN_HEADING_GAP, // heading (17) + gap (4) = 21
 		postBody: 0,
 		sideMin: 0,
 		prefix: "",
@@ -372,7 +382,7 @@ export function measureSystemTextCard(
 	const bodyBlock: PreparedCodeBlock = {
 		kind: "code",
 		prepared: prepareWithSegments(bodyText, chrome.font, { whiteSpace: chrome.whiteSpace }),
-		lineHeight: BODY_LINE_HEIGHT,
+		lineHeight: typographyMetrics().line.xs,
 		lang: null,
 		marginTop: 0,
 		contentLeft: 0,
@@ -424,13 +434,13 @@ export function systemTextChromeHeight(kind: SystemTextKind): number {
  */
 export function systemTextSingleLineHeight(kind: SystemTextKind): number {
 	const chrome = KIND_CHROME[kind];
-	const bodyStack = chrome.preBody + BODY_LINE_HEIGHT + chrome.postBody;
+	const bodyStack = chrome.preBody + typographyMetrics().line.xs + chrome.postBody;
 	return CARD_PADDING * 2 + Math.max(chrome.sideMin, bodyStack);
 }
 
 export const MEASURE_SYSTEM_TEXT_CONSTANTS = {
 	CARD_PADDING,
-	BODY_LINE_HEIGHT,
+	BODY_LINE_HEIGHT: XS_BODY_LINE_HEIGHT,
 	ICON_16,
 	ICON_MARGIN_TOP,
 	GROUP_GAP,

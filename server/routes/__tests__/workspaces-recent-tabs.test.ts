@@ -3,10 +3,12 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
+	narrators,
 	userPreferences,
 	userRecentTabs,
 	userRecentTabsMeta,
 	users,
+	workspacePanels,
 	workspaces,
 } from "../../db/schema";
 
@@ -219,10 +221,10 @@ describe("workspace layout payload handling", () => {
 		seedWorkspace("workspace-cap");
 
 		const oversized = "x".repeat(WORKSPACE_TREE_MAX_BYTES + 512 * 1024);
-		const response = await app.request("/workspaces/workspace-cap", {
-			method: "PATCH",
+		const response = await app.request("/workspaces/workspace-cap/layout", {
+			method: "PUT",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ tree: oversized }),
+			body: JSON.stringify({ layout: oversized, expectedRevision: 0 }),
 		});
 		expect(response.status).toBe(413);
 		expect(((await response.json()) as { code: string }).code).toBe("WORKSPACE_TREE_TOO_LARGE");
@@ -243,10 +245,13 @@ describe("workspace layout payload handling", () => {
 		seedUser();
 		seedWorkspace("workspace-schema-cap");
 
-		const response = await app.request("/workspaces/workspace-schema-cap", {
-			method: "PATCH",
+		const response = await app.request("/workspaces/workspace-schema-cap/layout", {
+			method: "PUT",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ tree: "x".repeat(WORKSPACE_TREE_MAX_BYTES + 1) }),
+			body: JSON.stringify({
+				layout: "x".repeat(WORKSPACE_TREE_MAX_BYTES + 1),
+				expectedRevision: 0,
+			}),
 		});
 		expect(response.status).toBe(400);
 		expect(
@@ -264,10 +269,10 @@ describe("workspace layout payload handling", () => {
 
 		const tree = JSON.stringify({ kind: "dockview", pad: "x".repeat(700_000) });
 		expect(Buffer.byteLength(tree, "utf8")).toBeGreaterThan(500_000);
-		const response = await app.request("/workspaces/workspace-large", {
-			method: "PATCH",
+		const response = await app.request("/workspaces/workspace-large/layout", {
+			method: "PUT",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ tree }),
+			body: JSON.stringify({ layout: tree, expectedRevision: 0 }),
 		});
 		expect(response.status).toBe(200);
 		expect(
@@ -277,5 +282,197 @@ describe("workspace layout payload handling", () => {
 				.where(eq(workspaces.id, "workspace-large"))
 				.get()?.tree,
 		).toBe(tree);
+	});
+});
+
+describe("membership routes", () => {
+	function seedNarrator(id: string): void {
+		db.insert(narrators).values({ id, title: id, createdAt: NOW, updatedAt: NOW }).run();
+	}
+
+	// Opening a workspace must deliver membership and arrangement together. If a
+	// client could render the layout before knowing the member set, it would be
+	// able to display exactly the state this redesign removes.
+	it("returns membership alongside the layout on GET /:id", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		seedNarrator("n1");
+		await app.request("/workspaces/ws/panels", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ kind: "narrator", narratorId: "n1" }),
+		});
+
+		const response = await app.request("/workspaces/ws");
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as {
+			layout: string;
+			tree: string;
+			layoutRevision: number;
+			panels: Array<{ kind: string; narratorId: string | null }>;
+		};
+		expect(body.panels).toHaveLength(1);
+		expect(body.panels[0]).toMatchObject({ kind: "narrator", narratorId: "n1" });
+		// `layout` is the new name for the same blob; `tree` stays for compatibility.
+		expect(body.layout).toBe(body.tree);
+		expect(body.layoutRevision).toBe(0);
+	});
+
+	it("creates a panel with 201 and reports an existing one with 200", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		seedNarrator("n1");
+
+		const first = await app.request("/workspaces/ws/panels", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ kind: "narrator", narratorId: "n1" }),
+		});
+		const second = await app.request("/workspaces/ws/panels", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ kind: "narrator", narratorId: "n1" }),
+		});
+
+		expect(first.status).toBe(201);
+		// Idempotent: the status is how a caller distinguishes the two outcomes.
+		expect(second.status).toBe(200);
+		expect(
+			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
+		).toHaveLength(1);
+	});
+
+	it("deletes a panel and releases its sidebar tab", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		seedNarrator("n1");
+		seedTab({
+			id: "tab-n1",
+			tabKey: "narrator:n1",
+			type: "narrator",
+			entityId: "n1",
+			title: "n1",
+			sortOrder: 1,
+			workspaceId: "ws",
+			representedNarratorId: "n1",
+		});
+		const created = (await (
+			await app.request("/workspaces/ws/panels", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ kind: "narrator", narratorId: "n1" }),
+			})
+		).json()) as { panel: { id: string } };
+
+		const response = await app.request(`/workspaces/ws/panels/${created.panel.id}`, {
+			method: "DELETE",
+		});
+
+		expect(response.status).toBe(200);
+		expect(
+			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
+		).toHaveLength(0);
+		expect(
+			db
+				.select({ workspaceId: userRecentTabs.workspaceId })
+				.from(userRecentTabs)
+				.where(eq(userRecentTabs.tabKey, "narrator:n1"))
+				.get()?.workspaceId,
+		).toBe(null);
+	});
+
+	it("rejects a foreign workspace's panels as not found", async () => {
+		seedUser();
+		db.insert(users)
+			.values({
+				id: "someone-else",
+				username: "someone-else",
+				passwordHash: "test-password-hash",
+				role: "user",
+				createdAt: NOW,
+			})
+			.run();
+		db.insert(workspaces)
+			.values({
+				id: "other-ws",
+				userId: "someone-else",
+				title: "other",
+				tree: "{}",
+				createdAt: new Date(NOW),
+				updatedAt: new Date(NOW),
+			})
+			.run();
+
+		const response = await app.request("/workspaces/other-ws/panels");
+		expect(response.status).toBe(404);
+	});
+});
+
+describe("layout arrangement is guarded by a revision", () => {
+	it("accepts a matching revision and advances it", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		const layout = JSON.stringify({ kind: "dockview", marker: "v1" });
+
+		const response = await app.request("/workspaces/ws/layout", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ layout, expectedRevision: 0 }),
+		});
+
+		expect(response.status).toBe(200);
+		expect(((await response.json()) as { layoutRevision: number }).layoutRevision).toBe(1);
+		expect(
+			db.select({ tree: workspaces.tree }).from(workspaces).where(eq(workspaces.id, "ws")).get()
+				?.tree,
+		).toBe(layout);
+	});
+
+	// Two tabs open on one workspace used to overwrite each other's arrangement on
+	// every drag. The loser now learns it lost, and gets the revision it needs to
+	// rebase without an extra read.
+	it("rejects a stale revision with 409 and reports the current one", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		await app.request("/workspaces/ws/layout", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				layout: JSON.stringify({ kind: "dockview", marker: "winner" }),
+				expectedRevision: 0,
+			}),
+		});
+
+		const response = await app.request("/workspaces/ws/layout", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				layout: JSON.stringify({ kind: "dockview", marker: "loser" }),
+				expectedRevision: 0,
+			}),
+		});
+
+		expect(response.status).toBe(409);
+		const body = (await response.json()) as { code: string; currentRevision: number };
+		expect(body.code).toBe("WORKSPACE_LAYOUT_CONFLICT");
+		expect(body.currentRevision).toBe(1);
+		// The winner's arrangement must survive.
+		expect(
+			db.select({ tree: workspaces.tree }).from(workspaces).where(eq(workspaces.id, "ws")).get()
+				?.tree,
+		).toContain("winner");
+	});
+
+	it("requires expectedRevision rather than defaulting to last-write-wins", async () => {
+		seedUser();
+		seedWorkspace("ws");
+
+		const response = await app.request("/workspaces/ws/layout", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ layout: JSON.stringify({ kind: "dockview" }) }),
+		});
+
+		expect(response.status).toBe(400);
 	});
 });

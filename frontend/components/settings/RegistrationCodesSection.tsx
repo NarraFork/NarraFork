@@ -22,8 +22,8 @@ import { useTranslation } from "react-i18next";
 import type { CreatedRegistrationCode, RegistrationCode } from "../../lib/api";
 import { api } from "../../lib/api";
 import { formatLocaleDate } from "../../lib/intl-format";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { CopyButton } from "../common/CopyButton";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
 
 const DEFAULT_EXPIRY_HOURS = 168;
 

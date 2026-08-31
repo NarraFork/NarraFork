@@ -75,6 +75,7 @@ import {
 	readImageIntrinsicSize,
 } from "@shared/pretext-layout/image-fit";
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
+import { scaleFontSize } from "@shared/pretext-layout/typography";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import {
 	accumulateFrame,
@@ -97,6 +98,9 @@ import {
 	MONO_FAMILY,
 	SANS_FAMILY,
 	SPACING,
+	scaledFont,
+	scaledLineBoxHeight,
+	typographyMetrics,
 } from "../pretext-fonts";
 import { preparedMarkdownBlocks } from "./math-support";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "./measure-markdown";
@@ -148,6 +152,7 @@ export type ToolCategory =
 	| "pipeline"
 	| "terminal"
 	| "share"
+	| "transfer"
 	| "recall"
 	| "skill"
 	| "browser"
@@ -200,7 +205,27 @@ export const DETAIL_BODY_FONT_SIZE = 11;
  * wrapped line drifts 0.4px from the box this constant reserved and a 15-line
  * body overflows by 6px — clipped silently, because the box is height-fixed.
  */
-export const DETAIL_CONTENT_LINE_HEIGHT = lineBoxHeight(DETAIL_BODY_FONT_SIZE, LINE_HEIGHT.xs); // 15
+export const DETAIL_CONTENT_LINE_HEIGHT = lineBoxHeight(DETAIL_BODY_FONT_SIZE, LINE_HEIGHT.xs);
+/** detailContentLineHeight() at the reader's typography (baseline above). */
+export function detailContentLineHeight(): number {
+	return scaledLineBoxHeight(DETAIL_BODY_FONT_SIZE, LINE_HEIGHT.xs);
+} // 15
+/**
+ * Scaled font for detail bodies, and the partner of `detailContentLineHeight()`.
+ *
+ * These two must move together. Wrapping at the frozen `DETAIL_BODY_FONT` while
+ * multiplying by the scaled line box produced a height computed from one font and a
+ * wrap computed from another: at 150% the reserved box was ~50% taller per line but
+ * the text still wrapped as 11px, so a long body ended up short of its box — and at a
+ * shrunken scale it overflowed a height-fixed box and was clipped.
+ */
+export function detailBodyFont(): string {
+	return scaledFont(FONT_WEIGHT.regular, DETAIL_BODY_FONT_SIZE, MONO_FAMILY);
+}
+/** Scaled detail body font size (px), for the render layer's `fontSize`. */
+export function detailBodyFontSize(): number {
+	return scaleFontSize(DETAIL_BODY_FONT_SIZE);
+}
 /** Detail section label ("Input"/"Output", Text size="xs") line box: 12×1.4 = 17. */
 export const DETAIL_LABEL_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** Detail section label `mb={2}`. */
@@ -297,7 +322,7 @@ export const SPEC_TASK_LOCK_LANE = SPEC_TASK_LOCK + SPEC_TASK_LOCK_GAP; // 15
 export const SPEC_TASK_EMPTY_PADDING_Y = 6;
 /** Empty task doc placeholder height: padding + border + one xs row. */
 export const SPEC_TASK_EMPTY_HEIGHT =
-	SPEC_TASK_EMPTY_PADDING_Y * 2 + CARD_BORDER * 2 + XS_LINE_HEIGHT; // 31
+	SPEC_TASK_EMPTY_PADDING_Y * 2 + CARD_BORDER * 2 + typographyMetrics().line.xs; // 31
 
 /** Structured (recall/send/pipeline/web-search) badge header row (Badge xs). */
 export const STRUCT_BADGE_ROW = 16;
@@ -323,6 +348,17 @@ export const META_ROW_GAP = 4;
 export const META_BADGE_ROW = 16;
 /** Reserved action-button row (Button size=xs = 30). */
 export const META_ACTION_ROW = 30;
+/**
+ * Reserved progress-bar row: the `Progress` track (size="sm" = 8) plus the
+ * percent label beside it, which is the taller of the two.
+ *
+ * A FIXED reservation on purpose. The alternative — sizing to the current
+ * numbers — would re-measure the card on every progress frame and walk the whole
+ * conversation below it up and down while the user is trying to read it.
+ */
+export const META_PROGRESS_ROW = 18;
+/** Reserved figures line under a progress bar (xs text). */
+export const META_PROGRESS_FIGURES_ROW = 16;
 /** Max meta rows measured/painted in one region (bounded work). */
 export const META_ROWS_MAX = 12;
 /** Max structured entries measured/painted (mirrors the classifier's slice). */
@@ -458,7 +494,7 @@ export interface ToolCappedDetail {
 	kind: "capped";
 	/** Which cap applies (also selects the default label behaviour). */
 	cap: DetailCapKind;
-	/** Estimated content line count (× DETAIL_CONTENT_LINE_HEIGHT). */
+	/** Estimated content line count (× detailContentLineHeight()). */
 	contentLines?: number;
 	/** Direct content pixel estimate (media/images); wins over contentLines. */
 	contentPx?: number;
@@ -639,6 +675,20 @@ export interface ToolRowAction {
 	value: string;
 }
 
+/** A determinate progress bar on a meta row (mirrors ToolRowProgress). */
+export interface ToolRowProgress {
+	/** 0–1 fill, or null for an indeterminate/animated bar. */
+	ratio: number | null;
+	/** Whole percent beside the bar; absent when indeterminate. */
+	percent?: number;
+	/** Pre-formatted figures under the bar ("20.1 MB / 48.0 MB", "2.1 MB/s"). */
+	figures?: string[];
+	/** RENDER-ONLY bar colour. Height-neutral. */
+	color?: string;
+	/** RENDER-ONLY animated state. Height-neutral. */
+	active?: boolean;
+}
+
 /** One meta row (mirrors ToolMetaRow in tool-detail.ts). */
 export interface ToolMetaRow {
 	/** Row text; wraps, MEASURED. */
@@ -651,6 +701,15 @@ export interface ToolMetaRow {
 	badges?: ToolStructuredBadge[];
 	/** Action buttons (reserved fixed button row when present). */
 	actions?: ToolRowAction[];
+	/**
+	 * A progress bar (reserved fixed row when present).
+	 *
+	 * The reservation is FIXED and independent of the numbers — that is what keeps
+	 * a card from resizing on every progress frame. Only the presence of a
+	 * `figures` line changes the height, and a producer that emits figures emits
+	 * them for the whole run.
+	 */
+	progress?: ToolRowProgress;
 	/** RENDER-ONLY dimmed styling. Height-neutral. */
 	dimmed?: boolean;
 }
@@ -1166,6 +1225,9 @@ export function computeDefaultOpen(data: ToolCallData, pendingPermission: boolea
 	const autoOpen: ToolCategory[] = [
 		"tasks",
 		"share",
+		// A transfer's whole point is the live bar; a collapsed card would hide the
+		// one thing that changes while it runs.
+		"transfer",
 		"recall",
 		"send",
 		"pipeline",
@@ -1213,7 +1275,7 @@ export function resolveDetailCap(cap: DetailCapKind, viewportHeight?: number): n
  * "this overflows" without measuring any further.
  */
 export function cappedUsefulLines(cap: number): number {
-	return Math.ceil(cap / DETAIL_CONTENT_LINE_HEIGHT) + 1;
+	return Math.ceil(cap / detailContentLineHeight()) + 1;
 }
 
 /**
@@ -1296,7 +1358,7 @@ export function measureDiffContentHeight(
 ): number {
 	const boxWidth = Math.max(1, availableWidth - DETAIL_BOX_CHROME_X);
 	// One monospace advance at the body font, measured through pretext (zero DOM).
-	const gutterWidth = gutterChars > 0 ? monoAdvance(DETAIL_BODY_FONT, gutterChars) : 0;
+	const gutterWidth = gutterChars > 0 ? monoAdvance(detailBodyFont(), gutterChars) : 0;
 	const wrapWidth = Math.max(1, boxWidth - gutterWidth);
 	const maxUsefulLines = cappedUsefulLines(cap);
 	// Explicit row bound, so the cost is visibly O(cap) rather than relying on the
@@ -1320,7 +1382,7 @@ export function measureDiffContentHeight(
 		if (line.content.length === 0) {
 			totalLines += 1;
 		} else {
-			const prepared = prepareWithSegments(line.content, DETAIL_BODY_FONT, {
+			const prepared = prepareWithSegments(line.content, detailBodyFont(), {
 				whiteSpace: "pre-wrap",
 			});
 			totalLines += Math.max(1, measureLineStats(prepared, wrapWidth).lineCount);
@@ -1331,7 +1393,7 @@ export function measureDiffContentHeight(
 	// Every row that could matter has been measured: either the loop consumed the
 	// whole diff, or it stopped at `maxUsefulLines` rows, which each contribute at
 	// least one line — so the total already reached the cap and returned above.
-	return Math.min(totalLines * DETAIL_CONTENT_LINE_HEIGHT + DETAIL_BOX_CHROME_Y, cap);
+	return Math.min(totalLines * detailContentLineHeight() + DETAIL_BOX_CHROME_Y, cap);
 }
 
 /**
@@ -1367,12 +1429,12 @@ export function measureCappedContentHeight(text: string, cap: number, availableW
 	const wrapWidth = Math.max(1, availableWidth - DETAIL_BOX_CHROME_X);
 	const maxUsefulLines = cappedUsefulLines(cap);
 	const prefix = cappedMeasurePrefix(text, maxUsefulLines, wrapWidth);
-	const prepared = prepareWithSegments(prefix, DETAIL_BODY_FONT, { whiteSpace: "pre-wrap" });
+	const prepared = prepareWithSegments(prefix, detailBodyFont(), { whiteSpace: "pre-wrap" });
 	const { lineCount } = measureLineStats(prepared, wrapWidth);
 	const lines = Math.max(1, lineCount);
 	// Overflowing the cap: the exact line count no longer matters.
 	if (lines >= maxUsefulLines) return cap;
-	return Math.min(lines * DETAIL_CONTENT_LINE_HEIGHT + DETAIL_BOX_CHROME_Y, cap);
+	return Math.min(lines * detailContentLineHeight() + DETAIL_BOX_CHROME_Y, cap);
 }
 
 /**
@@ -1473,7 +1535,11 @@ function buildMarkdownDetailFrame(
 	const mdBlocks = preparedMarkdownBlocks(markdown);
 	const blocks: PreparedBlock[] = [];
 	if (sourcePath) {
-		blocks.push(makeFixed(XS_LINE_HEIGHT, "detail-plan-source", DETAIL_TOP_MARGIN, { sourcePath }));
+		blocks.push(
+			makeFixed(typographyMetrics().line.xs, "detail-plan-source", DETAIL_TOP_MARGIN, {
+				sourcePath,
+			}),
+		);
 	}
 	for (const [index, block] of mdBlocks.entries()) {
 		// The leading gap belongs to the merged list's first block: a markdown block
@@ -1496,7 +1562,7 @@ function buildMarkdownDetailFrame(
 		);
 	}
 	if (blocks.length === 0) {
-		blocks.push(makeFixed(XS_LINE_HEIGHT, "detail-plan-empty", DETAIL_TOP_MARGIN));
+		blocks.push(makeFixed(typographyMetrics().line.xs, "detail-plan-empty", DETAIL_TOP_MARGIN));
 	}
 	const frame = accumulateFrame(blocks, innerWidth, RESOLVER, {
 		codePaddingX: MEASURE_MARKDOWN_CODE_PADDING.x,
@@ -1550,7 +1616,7 @@ function cappedBodyHeight(
 				? measureDiffContentHeight(diff.lines, diff.gutterChars, cap, availableWidth)
 				: text != null && text.length > 0
 					? measureCappedContentHeight(text, cap, availableWidth)
-					: (contentLines ?? 0) * DETAIL_CONTENT_LINE_HEIGHT);
+					: (contentLines ?? 0) * detailContentLineHeight());
 	const capped = Math.min(content, cap);
 	const labelH = hasLabel ? DETAIL_LABEL_CHROME_Y : 0;
 	return { height: labelH + capped, capped };
@@ -1578,7 +1644,7 @@ function metaRowBlocks(row: ToolMetaRow, marginTop: number): PreparedBlock[] {
 		out.push(
 			makeInline(
 				row.text,
-				row.mono ? DETAIL_MONO_FONT : DETAIL_TEXT_FONT,
+				row.mono ? typographyMetrics().font.xsMono : typographyMetrics().font.xs,
 				XS_LINE_HEIGHT,
 				0,
 				nextMargin,
@@ -1595,6 +1661,26 @@ function metaRowBlocks(row: ToolMetaRow, marginTop: number): PreparedBlock[] {
 	if ((row.badges?.length ?? 0) > 0) {
 		out.push(makeFixed(META_BADGE_ROW, "detail-meta-badges", nextMargin, { badges: row.badges }));
 		nextMargin = META_ROW_GAP;
+	}
+	if (row.progress) {
+		out.push(
+			makeFixed(META_PROGRESS_ROW, "detail-meta-progress", nextMargin, {
+				progress: row.progress,
+			}),
+		);
+		nextMargin = META_ROW_GAP;
+		const figures = row.progress.figures ?? [];
+		if (figures.length > 0) {
+			// One line: the figures are joined with separators by the render layer, and
+			// a producer keeps the set stable for a run (see ToolRowProgress.figures),
+			// so this never wraps into a second line mid-transfer.
+			out.push(
+				makeFixed(META_PROGRESS_FIGURES_ROW, "detail-meta-progress-figures", nextMargin, {
+					figures,
+				}),
+			);
+			nextMargin = META_ROW_GAP;
+		}
 	}
 	if ((row.actions?.length ?? 0) > 0) {
 		out.push(
@@ -1651,11 +1737,11 @@ function entryBlocks(
 		// Clamped: measure the wrap, then cap the row count so one huge snippet
 		// cannot stretch the list (parity with the chunked `lineClamp`).
 		const lines = Math.min(
-			clampedLineCount(entry.snippet, DETAIL_TEXT_FONT, innerWidth),
+			clampedLineCount(entry.snippet, typographyMetrics().font.xs, innerWidth),
 			ENTRY_SNIPPET_MAX_LINES,
 		);
 		out.push(
-			makeFixed(lines * XS_LINE_HEIGHT, "detail-entry-snippet", nextMargin, {
+			makeFixed(lines * typographyMetrics().line.xs, "detail-entry-snippet", nextMargin, {
 				text: entry.snippet,
 				maxLines: ENTRY_SNIPPET_MAX_LINES,
 				...(entry.tone ? { tone: entry.tone } : {}),
@@ -1805,7 +1891,7 @@ function measureSectionsDetail(
 		let hasLabel = false;
 		if (part.label !== undefined) {
 			hasLabel = true;
-			const labelHeight = SECTION_LABEL_HEIGHT + SECTION_LABEL_MARGIN_BOTTOM;
+			const labelHeight = typographyMetrics().line.xs + SECTION_LABEL_MARGIN_BOTTOM;
 			blocks.push(makeFixed(labelHeight, "detail-section-label", 0, { label: part.label }));
 			frameBlocks.push({
 				index: frameBlocks.length,
@@ -1843,7 +1929,7 @@ function measureSectionsDetail(
 			hasLabel,
 			top,
 			height: y - top,
-			bodyTop: top + (hasLabel ? SECTION_LABEL_HEIGHT + SECTION_LABEL_MARGIN_BOTTOM : 0),
+			bodyTop: top + (hasLabel ? typographyMetrics().line.xs + SECTION_LABEL_MARGIN_BOTTOM : 0),
 			bodyHeight,
 			bodyContentHeight: Math.max(0, body.frame.contentHeight - DETAIL_TOP_MARGIN),
 			appliedCap: body.appliedCap,
@@ -1870,7 +1956,11 @@ function measureSectionsDetail(
 	if (blocks.length === 0) {
 		// An all-empty section list still occupies one placeholder row so the card
 		// never collapses to a zero-height detail box.
-		const block = makeFixed(XS_LINE_HEIGHT, "detail-sections-empty", DETAIL_TOP_MARGIN);
+		const block = makeFixed(
+			typographyMetrics().line.xs,
+			"detail-sections-empty",
+			DETAIL_TOP_MARGIN,
+		);
 		const region = finishRegion("sections", [block], innerWidth, null);
 		return { ...region, sections: [] };
 	}
@@ -1904,7 +1994,7 @@ export function measureToolDetail(
 				blocks.push(...metaRowBlocks(row, i === 0 ? DETAIL_TOP_MARGIN : META_ROW_GAP));
 			});
 			if (blocks.length === 0) {
-				blocks.push(makeFixed(XS_LINE_HEIGHT, "detail-meta-empty", DETAIL_TOP_MARGIN));
+				blocks.push(makeFixed(typographyMetrics().line.xs, "detail-meta-empty", DETAIL_TOP_MARGIN));
 			}
 			return finishRegion("meta-rows", blocks, innerWidth, null);
 		}
@@ -2088,7 +2178,7 @@ export function measureToolDetail(
 			if (blocks.length === 0) {
 				return finishRegion(
 					"ask",
-					[makeFixed(XS_LINE_HEIGHT, "detail-ask-empty", DETAIL_TOP_MARGIN)],
+					[makeFixed(typographyMetrics().line.xs, "detail-ask-empty", DETAIL_TOP_MARGIN)],
 					innerWidth,
 					null,
 				);
@@ -2119,7 +2209,7 @@ export function measureToolDetail(
 				});
 				return finishRegion("structured", blocks, innerWidth, null);
 			}
-			const font = detail.mono ? DETAIL_MONO_FONT : DETAIL_TEXT_FONT;
+			const font = detail.mono ? typographyMetrics().font.xsMono : typographyMetrics().font.xs;
 			detail.bodyLines.forEach((line, i) => {
 				const marginTop =
 					i === 0 ? (badgeRows > 0 ? STRUCT_BADGE_GAP : DETAIL_TOP_MARGIN) : STRUCT_BADGE_GAP;

@@ -264,10 +264,28 @@ function resolveToolMetadata(tc: AdapterToolItem["tc"]): unknown {
 		(tc.outputJson as { _metadata?: unknown } | null | undefined)?._metadata ??
 		(tc as { _metadata?: unknown })._metadata;
 	const liveOutput = (tc as { _streamingOutput?: unknown })._streamingOutput;
-	if (liveOutput === undefined) return persisted;
+	// Same bridge as the streaming output, for the same reason: the live WS path
+	// writes the determinate progress measurement onto the tool call itself, while
+	// the classifier reads its live inputs off the metadata object. Without this the
+	// field is present on the item and never looked at, so a running transfer
+	// renders with no bar.
+	const liveProgress = (tc as { _structuredProgress?: unknown })._structuredProgress;
+	if (liveOutput === undefined && liveProgress === undefined) return persisted;
 	const base = persisted && typeof persisted === "object" ? (persisted as object) : {};
-	if ((base as { _streamingOutput?: unknown })._streamingOutput !== undefined) return persisted;
-	return { ...base, _streamingOutput: liveOutput };
+	const out: Record<string, unknown> = { ...base };
+	if (
+		liveOutput !== undefined &&
+		(base as { _streamingOutput?: unknown })._streamingOutput === undefined
+	) {
+		out._streamingOutput = liveOutput;
+	}
+	if (
+		liveProgress !== undefined &&
+		(base as { _structuredProgress?: unknown })._structuredProgress === undefined
+	) {
+		out._structuredProgress = liveProgress;
+	}
+	return out;
 }
 
 /** Terminal tool statuses (subagent card gates its result preview on this). */
@@ -1475,6 +1493,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceSubagentMessage: "Subagent message",
 	sidecarSourceSpecUpdate: "Outline update",
 	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
+	sidecarSourceTutorialLesson: "Tutorial lesson",
 	// Periodic task-digest subtitle: carries the cadence ("every N tool calls") so a
 	// routine digest reads differently from a turn-end continuation in the header.
 	cadenceEveryNTools: "every {n} tool calls",
@@ -1541,6 +1560,10 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	behavior_fence: "sidecarSourceBehaviorFence",
 	pipeline_exit_confirmation: "sidecarSourcePipelineExit",
 	interrupt_task_guard: "sidecarSourceInterruptTaskGuard",
+	// The interactive tutorial's lesson boundary. Named because a reused tutorial
+	// narrator shows one of these per lesson, and the generic "System" heading would
+	// make the row that separates lessons the least legible thing in the transcript.
+	tutorial_lesson: "sidecarSourceTutorialLesson",
 };
 
 /**

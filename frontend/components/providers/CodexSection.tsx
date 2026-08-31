@@ -68,7 +68,7 @@ import {
 } from "../../lib/codex-tiers";
 import type { ProxyOverride } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import { CodexQuotaOverview } from "./CodexQuotaOverview";

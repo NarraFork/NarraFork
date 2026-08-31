@@ -25,11 +25,17 @@
 
 import { hasUsablePlanBody } from "../plan-reference";
 import {
+	deriveToolProgress,
+	formatProgressBytes,
+	formatProgressDuration,
+	hasRenderableProgress,
+	readToolProgressPayload,
+} from "../tool-progress";
+import {
 	computeDiffCached,
 	diffLineNoWidth as computeDiffLineNoWidth,
 	type DiffLine,
 } from "./diff-core";
-
 import { hasTruncatedLeaf, readLeafText, stringifyForDisplay } from "./tool-io-projection";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -363,6 +369,36 @@ export interface ToolRowAction {
 }
 
 /**
+ * A determinate progress bar drawn on a meta row (a running device transfer).
+ *
+ * A real bar element, not text: an ASCII `[███░░░]` in a monospace body would
+ * make the client re-parse the producer's own formatting to know anything, and it
+ * cannot animate, cannot carry a colour, and reads as output rather than as
+ * chrome. The height cost is a FIXED reserved row (see META_PROGRESS_ROW), so
+ * this is height-stable regardless of how the numbers change.
+ *
+ * `ratio` null = INDETERMINATE (total genuinely unknown — an upload's sender
+ * knows only what it has sent). The render layer must animate rather than paint a
+ * 0% bar, because a bar frozen at zero reads as a stalled transfer.
+ */
+export interface ToolRowProgress {
+	/** 0–1 fill, or null for an indeterminate/animated bar. */
+	ratio: number | null;
+	/** Whole percent shown beside the bar; omitted when indeterminate. */
+	percent?: number;
+	/**
+	 * Figures shown under the bar, already formatted ("20.1 MB / 48.0 MB",
+	 * "2.1 MB/s", "ETA 13s"). Pre-formatted because unit choice belongs to the
+	 * producer, and this layer has no i18n access.
+	 */
+	figures?: string[];
+	/** Mantine colour for the bar. Height-neutral. */
+	color?: string;
+	/** True while work continues — drives the animated stripes. Height-neutral. */
+	active?: boolean;
+}
+
+/**
  * 🔴 One meta row: the header information the classic cards show ABOVE the body
  * — a file path, a fetched URL, a terminal id, mode/action badges, and the
  * share card's download / copy-link buttons.
@@ -378,6 +414,8 @@ export interface ToolMetaRow {
 	badges?: ToolStructuredBadge[];
 	/** Interactive controls on this row (download / copy link). */
 	actions?: ToolRowAction[];
+	/** A determinate progress bar on this row (a running transfer). */
+	progress?: ToolRowProgress;
 	/** Dimmed secondary styling (the default for paths/provenance). */
 	dimmed?: boolean;
 }
@@ -682,8 +720,8 @@ function isFailStatus(status?: string | null): boolean {
  * Classify a tool call into a `ToolDetailData` (or null when there's no
  * meaningful detail body). `category` is the already-resolved ToolCategory
  * string (read|file|bash|search|webSearch|webFetch|tasks|taskOutput|agent|
- * await|send|ask|plan|pipeline|terminal|share|recall|skill|browser|knowledge|
- * generic).
+ * await|send|ask|plan|pipeline|terminal|share|transfer|recall|skill|browser|
+ * knowledge|generic).
  */
 export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailData | null {
 	const { toolName, category, status, inputJson, outputJson } = input;
@@ -764,6 +802,8 @@ function classifyByCategory(
 			return classifyTerminal(status, inputJson, outputJson);
 		case "share":
 			return classifyShare(inputJson, outputJson, metadata);
+		case "transfer":
+			return classifyTransfer(status, inputJson, outputJson, metadata, input.errorMessage);
 		case "recall":
 			return classifyRecall(inputJson, outputJson, metadata);
 		case "skill":
@@ -806,7 +846,10 @@ function metaRows(rows: Array<ToolMetaRow | null>): ToolMetaRowsDetail | null {
 	const kept = rows.filter(
 		(r): r is ToolMetaRow =>
 			r !== null &&
-			(r.text.length > 0 || (r.badges?.length ?? 0) > 0 || (r.actions?.length ?? 0) > 0),
+			(r.text.length > 0 ||
+				(r.badges?.length ?? 0) > 0 ||
+				(r.actions?.length ?? 0) > 0 ||
+				r.progress != null),
 	);
 	return kept.length > 0 ? { kind: "meta-rows", rows: kept } : null;
 }
@@ -1910,6 +1953,159 @@ function classifyShare(
 		]);
 	}
 	return sections([section(undefined, header)]);
+}
+
+/** Tool statuses meaning the call is over (no live bar past this point). */
+const TERMINAL_TOOL_STATUSES_FOR_PROGRESS = new Set([
+	"success",
+	"fail",
+	"error",
+	"cancelled",
+	"completed",
+]);
+
+function isTerminalToolStatus(status: string | null | undefined): boolean {
+	return status != null && TERMINAL_TOOL_STATUSES_FOR_PROGRESS.has(status);
+}
+
+/**
+ * Build a progress-bar row descriptor from a raw measurement payload.
+ *
+ * Returns null for a payload describing nothing (no work done, no known total) —
+ * an empty bar that never moves is worse than no bar, because it looks like a
+ * transfer that has stalled.
+ *
+ * The figures come PRE-FORMATTED from the producer (`figures` on the payload's
+ * sibling channel is not available here), so this layer formats only the byte
+ * counts it can reason about generically. Unit choice for bytes is unambiguous,
+ * unlike a localized phrase, which is why it is allowed in this i18n-free layer.
+ */
+function readTransferProgressRow(value: unknown): ToolRowProgress | null {
+	const payload = readToolProgressPayload(value);
+	if (!payload || !hasRenderableProgress(payload)) return null;
+	const view = deriveToolProgress(payload);
+	const figures: string[] = [
+		payload.total != null
+			? `${formatProgressBytes(payload.completed)} / ${formatProgressBytes(payload.total)}`
+			: formatProgressBytes(payload.completed),
+	];
+	if (view.ratePerSecond !== null) figures.push(`${formatProgressBytes(view.ratePerSecond)}/s`);
+	if (view.etaSeconds !== null) figures.push(`ETA ${formatProgressDuration(view.etaSeconds)}`);
+	if (payload.itemsTotal != null && payload.itemsTotal > 1) {
+		const item = payload.currentItem ? ` ${payload.currentItem}` : "";
+		figures.push(
+			`file ${Math.min((payload.itemsDone ?? 0) + 1, payload.itemsTotal)}/${payload.itemsTotal}${item}`,
+		);
+	}
+	return {
+		ratio: view.ratio,
+		...(view.percent !== null ? { percent: view.percent } : {}),
+		figures,
+		color: "blue",
+		active: true,
+	};
+}
+
+/**
+ * TransferFile: a device/direction badge header plus the transfer body — the LIVE
+ * progress bar while bytes move, the completion figures once they have.
+ *
+ * Before this existed the tool fell through to `classifyGeneric`, so a transfer
+ * rendered as its own raw argument JSON: the reader saw the paths they had just
+ * asked for and no indication of whether anything was happening. A multi-minute
+ * upload looked identical at 0% and at 99%.
+ *
+ * The running body is the tool's own `emitOutput` text (already a formatted bar —
+ * see server/lib/agent/tools/transfer-progress.ts) rather than a structure rebuilt
+ * from numbers here. Two reasons: the progress figures never reach the client as
+ * fields (only `tool_output` carries them mid-flight), and keeping ONE formatter
+ * means the text a user copies out of the card is the text they saw in it.
+ */
+function classifyTransfer(
+	status: string | null | undefined,
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata: Record<string, unknown> | null,
+	errorMessage?: string | null,
+): ToolDetailData | null {
+	const direction =
+		readLeafText(metadata?.transferDirection) ?? extractField(inputJson, "direction");
+	const deviceName = readLeafText(metadata?.deviceName);
+	const remotePath = readLeafText(metadata?.remotePath) || extractField(inputJson, "remotePath");
+	const localPath = readLeafText(metadata?.localPath) || extractField(inputJson, "localPath");
+	const recursive =
+		metadata?.recursive === true ||
+		(!isTruncated(inputJson) && asObject(inputJson)?.recursive === true);
+	const filesTransferred =
+		typeof metadata?.filesTransferred === "number" ? metadata.filesTransferred : undefined;
+	const liveProgress = readTransferProgressRow(metadata?._structuredProgress);
+	// A REAL bar row, built from the measurement the tool emitted. Only while the
+	// call is still running: a finished transfer's bar would sit at 100% forever,
+	// saying nothing the summary line does not already say.
+	const progressRow: ToolMetaRow | null =
+		!isTerminalToolStatus(status) && liveProgress ? { text: "", progress: liveProgress } : null;
+
+	const header = metaRows([
+		badgeRow(
+			chips([
+				chip(direction || undefined, "blue"),
+				// The device is the whole point of the call — which machine the bytes
+				// went to — so it gets a chip of its own rather than being folded into
+				// a path line where it would read as part of the filename.
+				chip(deviceName, "gray"),
+				chip(recursive ? "recursive" : undefined, "violet"),
+				chip(readLeafText(metadata?.bytesFormatted), "cyan"),
+				chip(readLeafText(metadata?.rateFormatted), "teal"),
+				chip(
+					filesTransferred != null && filesTransferred > 1
+						? `${filesTransferred} files`
+						: undefined,
+					"lime",
+				),
+			]),
+		),
+		// Source → destination in TRANSFER order, not field order: reading "the local
+		// file went to that remote path" requires knowing which side is which, and an
+		// arrow answers that without a label per line.
+		pathRow(
+			direction === "upload"
+				? [localPath, remotePath].filter(Boolean).join("  →  ")
+				: [remotePath, localPath].filter(Boolean).join("  →  "),
+		),
+		progressRow,
+	]);
+
+	// The text form is the fallback for a card with no bar (an older payload, a
+	// finished call). It is NOT shown alongside the bar: the two say the same thing.
+	const streamingOutput = readLeafText(metadata?._streamingOutput) ?? "";
+	const output = resolveDisplayText(outputJson);
+	const body = output || (progressRow ? "" : streamingOutput);
+	// A failed transfer with no body still has to say SOMETHING under the paths: a
+	// bare header leaves the reader unable to tell "failed" from "still starting".
+	//
+	// Only a placeholder, and only when there is no real message — `withErrorSection`
+	// appends the actual `errorMessage` to this same detail afterwards, so adding one
+	// here too would print the failure twice.
+	if (isFailStatus(status) && !body && !nonEmptyTrimmedText(errorMessage)) {
+		return sections([
+			section(undefined, header),
+			section("error", { kind: "error", text: "Transfer failed" }),
+		]);
+	}
+	return sections([
+		section(undefined, header),
+		section(
+			undefined,
+			body
+				? capped(output ? "term" : "streaming-bash", {
+						contentLines: countLines(body),
+						hasLabel: false,
+						text: body,
+						...(output ? truncatedFlag(outputJson) : truncatedFlag(metadata?._streamingOutput)),
+					})
+				: null,
+		),
+	]);
 }
 
 function classifyRecall(

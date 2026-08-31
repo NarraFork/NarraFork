@@ -4721,9 +4721,12 @@ export async function resolvePermission(
  * frame that skipped this lookup was authorized by nothing but knowledge of the
  * request id, and request ids are broadcast to every reader of the session.
  *
- * All three in-memory registries key by request id and record `narratorId`. Once a
+ * All four in-memory registries key by request id and record `narratorId`. Once a
  * request has been decided it lives only in `narrator_tool_calls`, where the request
- * id IS the row id — hence the final fallback rather than "not found".
+ * id IS the row id — hence the final fallback rather than "not found". (An ExitPlan
+ * reflection's `exit_plan_*` id is synthetic and lives ONLY in its registry: it
+ * never resolves through the tool-call row, which is why the registry lookups must
+ * all run before that fallback.)
  */
 export async function resolveDecisionNarratorId(requestId: string): Promise<string | null> {
 	const pending = pendingPermissions.get(requestId);
@@ -4733,6 +4736,11 @@ export async function resolveDecisionNarratorId(requestId: string): Promise<stri
 	const { getTaskReflectionNarratorId } = await import("@server/lib/agent/tools/task-reflection");
 	const taskReflectionNarratorId = getTaskReflectionNarratorId(requestId);
 	if (taskReflectionNarratorId) return taskReflectionNarratorId;
+	const { getExitPlanReflectionNarratorId } = await import(
+		"@server/lib/agent/tools/exit-plan-reflection"
+	);
+	const planReflectionNarratorId = getExitPlanReflectionNarratorId(requestId);
+	if (planReflectionNarratorId) return planReflectionNarratorId;
 	const row = await db.query.narratorToolCalls.findFirst({
 		where: eq(narratorToolCalls.id, requestId),
 		columns: { narratorId: true },

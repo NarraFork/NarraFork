@@ -26,6 +26,9 @@ const INDEX_HTML = await Bun.file("frontend/index.html").text();
 const VITE_CONFIG = await Bun.file("frontend/vite.config.ts").text();
 const SERVICE_WORKER = await Bun.file("frontend/src-sw.ts").text();
 const MAIN_TSX = await Bun.file("frontend/main.tsx").text();
+// The provider tree lives in App.tsx, not the entry — see that file's header for why
+// (an invalid Fast Refresh boundary in main.tsx turned every edit into a full reload).
+const APP_TSX = await Bun.file("frontend/App.tsx").text();
 const SERVER_MAIN = await Bun.file("server/main.ts").text();
 
 /** Brand assets whose bytes are static but whose ROLE changes with the settings. */
@@ -209,6 +212,12 @@ describe("server cache headers", () => {
 
 describe("app shell wiring", () => {
 	test("useBranding is mounted so every route including login applies it", () => {
-		expect(MAIN_TSX).toContain("useBranding()");
+		expect(APP_TSX).toContain("useBranding()");
+	});
+
+	test("the entry renders <App />, so the assertion above covers the mounted tree", () => {
+		// Without this, moving the tree to a third file would leave the check above green
+		// while `useBranding()` was no longer reachable from what actually mounts.
+		expect(MAIN_TSX).toContain("<App history={history} />");
 	});
 });

@@ -15,13 +15,21 @@ import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { resolve } from "node:path";
-import { TUTORIAL_PROVIDER_PREFIX, TUTORIAL_TRAIT } from "@shared/tutorial/lessons";
+import {
+	TUTORIAL_LESSON_BOUNDARY_BLOCK,
+	TUTORIAL_PROVIDER_PREFIX,
+	TUTORIAL_TRAIT,
+} from "@shared/tutorial/lessons";
 import { TUTORIAL_SANDBOX_COMMITS, TUTORIAL_SANDBOX_FILES } from "@shared/tutorial/sandbox-files";
 import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
-import { chapters, narrators, projects, users } from "../../db/schema";
+import { chapters, narratorMessages, narrators, projects, users } from "../../db/schema";
 import { resolveProviderAndModel } from "../../lib/agent/provider";
-import { TutorialProvider, tutorialModelForSubagent } from "../../lib/agent/tutorial-provider";
+import {
+	TutorialProvider,
+	tutorialModelForLesson,
+	tutorialModelForSubagent,
+} from "../../lib/agent/tutorial-provider";
 import { generateId } from "../../lib/id";
 import {
 	resolveEffectiveSubagentModelPolicy,
@@ -31,6 +39,7 @@ import { settings } from "../../lib/settings";
 import { gitService } from "../git-service";
 import {
 	ensureSandbox,
+	getLessonSession,
 	getProgress,
 	getSandboxStatus,
 	recordProgress,
@@ -173,6 +182,44 @@ describe("ensureSandbox", () => {
 	});
 });
 
+describe("getLessonSession", () => {
+	test("reports nothing before the lesson is started", async () => {
+		const userId = await freshUser();
+		expect(await getLessonSession({ userId, lessonId: LESSON, locale: "en" })).toBeNull();
+	});
+
+	test("does not provision anything just by being asked", async () => {
+		// Opening a lesson page must stay free. Provisioning here would run `git init`
+		// for every lesson somebody merely looked at.
+		const userId = await freshUser();
+		await getLessonSession({ userId, lessonId: "tool-calls", locale: "en" });
+		expect((await getSandboxStatus(userId)).exists).toBe(false);
+	});
+
+	test("reports the running session so a returning user resumes it", async () => {
+		const userId = await freshUser();
+		const started = await startLesson({ userId, lessonId: LESSON, locale: "en" });
+		const session = await getLessonSession({ userId, lessonId: LESSON, locale: "en" });
+		expect(session?.narratorId).toBe(started.narratorId);
+	});
+
+	test("a lesson the user never started reports nothing, even though the slot has a narrator", async () => {
+		// The slot's narrator serves every lesson in it. Reporting it for an unstarted
+		// lesson would auto-mount a session with no boundary row for that lesson, so the
+		// script would answer with its "this lesson is finished" fallback before the
+		// user sent anything.
+		const userId = await freshUser();
+		await startLesson({ userId, lessonId: "tool-calls", locale: "en" });
+		expect(await getLessonSession({ userId, lessonId: "permissions", locale: "en" })).toBeNull();
+	});
+
+	test("an unknown lesson is rejected", async () => {
+		expect(
+			getLessonSession({ userId: await freshUser(), lessonId: "nope", locale: "en" }),
+		).rejects.toThrow();
+	});
+});
+
 describe("getSandboxStatus", () => {
 	test("reports absence before provisioning and presence after", async () => {
 		const userId = await freshUser();
@@ -243,13 +290,159 @@ describe("startLesson", () => {
 		expect(narrator?.model).toContain("zh-CN");
 	});
 
-	test("each start creates a fresh narrator", async () => {
-		// A lesson replays its script from turn 0, and the turn index is derived from
-		// conversation history — a reused session would resume mid-script.
+	test("the standalone trait survives the traits rewrite", async () => {
+		// `startLesson` rewrites the whole `traits` column to refresh the subagent pools.
+		// It used to build the baseline from the `existing` narrator, which is undefined on
+		// the create path — so the write erased what `createNarrator` had just stored.
+		// `standalone` is the casualty that matters: `db/index.ts` runs a startup backfill
+		// asserting every chapter-less narrator carries it, so a tutorial narrator became a
+		// standing violation, reclassified as chapter-bound until the next restart. Nothing
+		// errored, which is why only an assertion on the stored row can catch it.
+		const userId = await freshUser();
+		const session = await startLesson({ userId, lessonId: LESSON, locale: "en" });
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, session.narratorId),
+			columns: { chapterId: true, traits: true },
+		});
+		// Precondition: this lesson is the standalone one, or the assertion below is vacuous.
+		expect(narrator?.chapterId).toBeNull();
+		expect(narrator?.traits ?? []).toContain("standalone");
+		// The pools must still be there — the rewrite has to ADD, not replace.
+		expect(narrator?.traits ?? []).toContain(TUTORIAL_TRAIT);
+	});
+
+	test("a reused narrator keeps standalone across a second start", async () => {
+		// The reuse path reads the row too, so a regression that only fixed the create path
+		// would still drop the trait on the second start of the same slot.
+		const userId = await freshUser();
+		await startLesson({ userId, lessonId: LESSON, locale: "en" });
+		const session = await startLesson({ userId, lessonId: LESSON, locale: "en" });
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, session.narratorId),
+			columns: { traits: true },
+		});
+		expect(narrator?.traits ?? []).toContain("standalone");
+	});
+
+	test("a second start reuses the same narrator", async () => {
+		// Continuity is the point: the tutorial teaches that a narrator is a durable
+		// session, and a new one per lesson contradicts the lesson while also throwing
+		// away everything the user just did.
 		const userId = await freshUser();
 		const first = await startLesson({ userId, lessonId: LESSON, locale: "en" });
 		const second = await startLesson({ userId, lessonId: LESSON, locale: "en" });
+		expect(second.narratorId).toBe(first.narratorId);
+	});
+
+	test("consecutive chapter lessons both start", async () => {
+		// The regression this reuse fixes: a chapter may hold only ONE primary
+		// narrator, so creating one per lesson made the SECOND chapter-bound lesson
+		// fail with "Chapter already has a primary narrator" — every lesson after
+		// `tool-calls` was unreachable, and the failure surfaced as a lesson error
+		// rather than anything pointing at the cause.
+		const userId = await freshUser();
+		const first = await startLesson({ userId, lessonId: "tool-calls", locale: "en" });
+		const second = await startLesson({ userId, lessonId: "permissions", locale: "en" });
+		const third = await startLesson({ userId, lessonId: "interrupt-and-queue", locale: "en" });
+		expect(second.narratorId).toBe(first.narratorId);
+		expect(third.narratorId).toBe(first.narratorId);
+		expect(second.chapterId).toBe(first.chapterId);
+	});
+
+	test("a chapter lesson and a standalone lesson use separate narrators", async () => {
+		// A chapter lesson's tools must operate on the sandbox worktree; a standalone
+		// lesson has no chapter at all. Sharing one row would mean either handing the
+		// standalone lesson a worktree it does not need or unbinding the chapter one.
+		const userId = await freshUser();
+		const standalone = await startLesson({ userId, lessonId: LESSON, locale: "en" });
+		const chapterBound = await startLesson({ userId, lessonId: "tool-calls", locale: "en" });
+		expect(chapterBound.narratorId).not.toBe(standalone.narratorId);
+		expect(standalone.chapterId).toBeNull();
+		expect(chapterBound.chapterId).toBeTruthy();
+	});
+
+	test("the reused narrator's model and subagent pools follow the new lesson", async () => {
+		// Traits name the LESSON. A reused narrator still holding the previous
+		// lesson's pools would send this lesson's subagents to the wrong script — and
+		// a lesson id that no longer exists means no script at all.
+		const userId = await freshUser();
+		await startLesson({ userId, lessonId: "tool-calls", locale: "en" });
+		const session = await startLesson({ userId, lessonId: "permissions", locale: "en" });
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, session.narratorId),
+			columns: { model: true, traits: true },
+		});
+		expect(narrator?.model).toBe(tutorialModelForLesson("permissions", "en"));
+		const explore = resolveEffectiveSubagentModelPolicy(narrator?.traits ?? [], "explore");
+		expect(explore.models[0]?.model).toBe(tutorialModelForSubagent("permissions", "en", "explore"));
+	});
+
+	test("each start writes a lesson boundary the turn counter can find", async () => {
+		// Load-bearing for the reuse: `scriptTurnIndex` counts assistant turns only
+		// after the latest boundary. Without this row a reused session plays the
+		// lesson's "this script is finished" fallback instead of turn 0 — no error,
+		// just a lesson that appears to be over before it starts.
+		const userId = await freshUser();
+		const session = await startLesson({ userId, lessonId: LESSON, locale: "en" });
+		await startLesson({ userId, lessonId: LESSON, locale: "en" });
+
+		const rows = await db.query.narratorMessages.findMany({
+			where: eq(narratorMessages.narratorId, session.narratorId),
+			columns: { contentJson: true },
+		});
+		const boundaries = rows.filter((row) =>
+			(Array.isArray(row.contentJson) ? row.contentJson : []).some(
+				(block) => (block as { type?: string })?.type === TUTORIAL_LESSON_BOUNDARY_BLOCK,
+			),
+		);
+		expect(boundaries).toHaveLength(2);
+	});
+
+	test("the reused narrator is put back into a clean lesson state", async () => {
+		// A user who switched to bypassPermissions during one lesson would otherwise
+		// never see the approval card the permissions lesson is entirely about, and a
+		// narrator left in plan mode would refuse the writes a later script performs.
+		const userId = await freshUser();
+		const first = await startLesson({ userId, lessonId: LESSON, locale: "en" });
+		await db
+			.update(narrators)
+			.set({ permissionMode: "bypassPermissions", planMode: true })
+			.where(eq(narrators.id, first.narratorId));
+
+		await startLesson({ userId, lessonId: LESSON, locale: "en" });
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, first.narratorId),
+			columns: { permissionMode: true, planMode: true },
+		});
+		expect(narrator?.permissionMode).toBe("default");
+		expect(narrator?.planMode).toBe(false);
+	});
+
+	test("a narrator on a real model is never reused", async () => {
+		// Pointing a real model at a tutorial session is exactly the silent billing
+		// this module exists to prevent, so a row whose model drifted off the scripted
+		// provider must be left alone rather than adopted.
+		const userId = await freshUser();
+		const first = await startLesson({ userId, lessonId: LESSON, locale: "en" });
+		await db
+			.update(narrators)
+			.set({ model: "anthropic:claude-opus-4.6" })
+			.where(eq(narrators.id, first.narratorId));
+
+		const second = await startLesson({ userId, lessonId: LESSON, locale: "en" });
 		expect(second.narratorId).not.toBe(first.narratorId);
+	});
+
+	test("concurrent starts do not create two narrators for one chapter", async () => {
+		// Both would find no tutorial narrator and both create one; the second insert
+		// then hits the one-primary-per-chapter rule and the user is told a lesson
+		// cannot start for a reason unrelated to the lesson.
+		const userId = await freshUser();
+		const results = await Promise.all([
+			startLesson({ userId, lessonId: "tool-calls", locale: "en" }),
+			startLesson({ userId, lessonId: "permissions", locale: "en" }),
+		]);
+		expect(new Set(results.map((r) => r.narratorId)).size).toBe(1);
 	});
 
 	test("a standalone lesson does not provision the sandbox", async () => {

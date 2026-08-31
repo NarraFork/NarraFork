@@ -638,6 +638,16 @@ export function createWorkspaceDockStore(
 const WorkspaceDockCtx = createContext<WorkspaceDockStore | null>(null);
 
 /**
+ * The surface's workspace id, for descendants that must write to `workspace_panels`.
+ *
+ * `WorkspaceDockProvider` already received this to build the plugin-ui host context, but
+ * that shape is opaque to ordinary panels. A panel adapter that edits row-owned state
+ * (a webview's config) needs the id to persist it, and without it the edit reached only
+ * the layout blob — where it is dropped whenever the layout is discarded.
+ */
+const WorkspaceIdCtx = createContext<string | null>(null);
+
+/**
  * Provide a per-workspace dock store to narrator cells + tool panels (all React
  * descendants of `<DockviewReact>`). The store is created + owned by
  * `DockviewWorkspace` (which also drives `refreshOpenToolTypes` on layout
@@ -656,7 +666,9 @@ export function WorkspaceDockProvider({
 		<PluginUiSurfaceProvider
 			hostContext={{ surface: "workspace", workspaceId, presentation: "grid" }}
 		>
-			<WorkspaceDockCtx.Provider value={store}>{children}</WorkspaceDockCtx.Provider>
+			<WorkspaceIdCtx.Provider value={workspaceId}>
+				<WorkspaceDockCtx.Provider value={store}>{children}</WorkspaceDockCtx.Provider>
+			</WorkspaceIdCtx.Provider>
 		</PluginUiSurfaceProvider>
 	);
 }
@@ -664,6 +676,16 @@ export function WorkspaceDockProvider({
 /** Access the workspace dock store, or null when outside a provider. */
 export function useWorkspaceDock(): WorkspaceDockStore | null {
 	return useContext(WorkspaceDockCtx);
+}
+
+/**
+ * The enclosing workspace's id, or null on the focus page (no workspace surface).
+ *
+ * Null is a meaningful answer, not a missing one: the same panel adapters render inside a
+ * single narrator's dock, where there is no membership row to write to.
+ */
+export function useWorkspaceId(): string | null {
+	return useContext(WorkspaceIdCtx);
 }
 
 /**

@@ -30,6 +30,7 @@ import {
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
 import { Alert, Badge, Box, Button, Group, Paper, Text } from "@mantine/core";
+import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { IconClockHour4 } from "@tabler/icons-react";
 import { Fragment, useMemo } from "react";
 import {
@@ -127,10 +128,11 @@ function InlineLines({
 								<span
 									className={frag.className}
 									style={{
-										font: frag.font,
-										marginLeft: frag.gapBefore,
-										whiteSpace: "pre",
-										display: "inline-block",
+										...fragmentTextStyle({
+											font: frag.font,
+											gapBefore: frag.gapBefore,
+											letterSpacing: letterSpacingForFont(frag.font),
+										}),
 										color,
 									}}
 								>

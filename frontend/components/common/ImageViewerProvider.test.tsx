@@ -19,7 +19,11 @@ mock.module("@mantine/notifications", () => ({
 	notifications: { show: () => {} },
 }));
 
-const { ImageViewerProvider, useImageViewer } = await import("./ImageViewerProvider");
+// Two modules since the hook was split out of the provider (a non-component export made
+// the provider an invalid Fast Refresh boundary — see `image-viewer-context.ts`). Both are
+// still imported dynamically, after the `mock.module` calls above have been registered.
+const { ImageViewerProvider } = await import("./ImageViewerProvider");
+const { useImageViewer } = await import("./image-viewer-context");
 
 class TestResizeObserver {
 	observe() {}

@@ -12,7 +12,13 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { IconAlertTriangle, IconArrowUp, IconFolder, IconRefresh } from "@tabler/icons-react";
+import {
+	IconAlertTriangle,
+	IconArrowUp,
+	IconFolder,
+	IconFolderSymlink,
+	IconRefresh,
+} from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -131,21 +137,25 @@ export function RemoteDirectoryBrowser({
 								{t("permissionBrowseNoSubdirectories")}
 							</Text>
 						)}
-						{data?.entries.map((entry) => (
-							<UnstyledButton
-								key={entry.path}
-								onClick={() => setCurrentPath(entry.path)}
-								p={6}
-								style={{ borderRadius: 4 }}
-							>
-								<Group gap={8} wrap="nowrap">
-									<IconFolder size={15} style={{ flexShrink: 0, opacity: 0.6 }} />
-									<Text size="xs" truncate>
-										{entry.name}
-									</Text>
-								</Group>
-							</UnstyledButton>
-						))}
+						{data?.entries.map((entry) => {
+							const EntryIcon = entry.isSymlink ? IconFolderSymlink : IconFolder;
+							return (
+								<UnstyledButton
+									key={entry.path}
+									onClick={() => setCurrentPath(entry.path)}
+									p={6}
+									style={{ borderRadius: 4 }}
+									title={entry.isSymlink ? tc("symlinkDirectory") : undefined}
+								>
+									<Group gap={8} wrap="nowrap">
+										<EntryIcon size={15} style={{ flexShrink: 0, opacity: 0.6 }} />
+										<Text size="xs" truncate>
+											{entry.name}
+										</Text>
+									</Group>
+								</UnstyledButton>
+							);
+						})}
 						{data?.truncated && (
 							<Text size="xs" c="dimmed" p="xs">
 								{t("permissionBrowseTruncated")}

@@ -32,9 +32,9 @@ import {
 	REASONING_ROW_PADDING_Y,
 	REASONING_TRANSLATION_TOGGLE_HEIGHT,
 	REASONING_TRANSLATION_TOGGLE_MARGIN_TOP,
-	REASONING_XS_LINE_HEIGHT,
 } from "../measure/measure-reasoning";
 import type { MeasuredElement } from "../prepared-block";
+import { typographyMetrics } from "../pretext-fonts";
 import { swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 
@@ -143,7 +143,7 @@ function StreamingRow({ labels }: { labels: ReasoningLabels }) {
 				size="xs"
 				fs="italic"
 				c="dimmed"
-				style={{ lineHeight: `${REASONING_XS_LINE_HEIGHT}px` }}
+				style={{ lineHeight: `${typographyMetrics().line.xs}px` }}
 			>
 				{thinking}
 			</Text>
@@ -172,10 +172,10 @@ function CountLine({
 			onClick={onExpand ? swallowSelectionClick(onExpand) : undefined}
 		>
 			<BrainBadge />
-			<Text size="xs" c="dimmed" style={{ lineHeight: `${REASONING_XS_LINE_HEIGHT}px` }}>
+			<Text size="xs" c="dimmed" style={{ lineHeight: `${typographyMetrics().line.xs}px` }}>
 				{reasoning}
 			</Text>
-			<Text size="xs" c="dimmed" style={{ lineHeight: `${REASONING_XS_LINE_HEIGHT}px` }}>
+			<Text size="xs" c="dimmed" style={{ lineHeight: `${typographyMetrics().line.xs}px` }}>
 				{countLabel}
 			</Text>
 			<IconChevronRight
@@ -235,10 +235,10 @@ function ReasoningHeaderRow({
 				<span style={{ width: REASONING_CHEVRON_SIZE, flexShrink: 0 }} />
 			)}
 			<BrainBadge />
-			<Text size="xs" c="dimmed" style={{ lineHeight: `${REASONING_XS_LINE_HEIGHT}px` }}>
+			<Text size="xs" c="dimmed" style={{ lineHeight: `${typographyMetrics().line.xs}px` }}>
 				{reasoning}
 			</Text>
-			<Text size="xs" c="dimmed" style={{ lineHeight: `${REASONING_XS_LINE_HEIGHT}px` }}>
+			<Text size="xs" c="dimmed" style={{ lineHeight: `${typographyMetrics().line.xs}px` }}>
 				{charsLabel}
 			</Text>
 			{preview ? (
@@ -249,7 +249,7 @@ function ReasoningHeaderRow({
 					style={{
 						flex: 1,
 						minWidth: 0,
-						lineHeight: `${REASONING_XS_LINE_HEIGHT}px`,
+						lineHeight: `${typographyMetrics().line.xs}px`,
 						opacity: 0.75,
 					}}
 				>

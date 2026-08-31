@@ -1,6 +1,9 @@
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useCallback, useEffect, useSyncExternalStore } from "react";
-import { isTabActive } from "../components/nav/RecentTabs";
+// The logic module, not `RecentTabs.tsx`: importing from the component file would create
+// a cycle (RecentTabs imports this hook) AND keep a non-component export there, which
+// breaks its Fast Refresh boundary. See `recent-tabs-logic.ts`.
+import { isTabActive } from "../components/nav/recent-tabs-logic";
 import { queryClient } from "../lib/query-client";
 import { RECENT_TABS_QUERY_KEY, type RecentTab } from "./useRecentTabs";
 

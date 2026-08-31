@@ -26,14 +26,32 @@ export interface NarratorPanelParams {
 	narratorId: string;
 }
 
+/**
+ * The membership row a non-narrator top-level panel belongs to.
+ *
+ * REQUIRED, and that is the point: terminal / webview / plugin panels are membership
+ * (rows in `workspace_panels`), and their identity has to come from params rather than
+ * from the dockview panel id. Making it non-optional means "add a terminal panel
+ * without first creating its row" cannot be expressed — which is exactly the mistake
+ * that left these three kinds writing only to the layout blob, so they were pruned on
+ * the next open and closed by the membership sync in the meantime.
+ *
+ * A narrator panel needs no equivalent: `narratorId` already identifies its row, which
+ * is unique per workspace by database constraint.
+ */
+export interface WorkspaceMemberRowRef {
+	/** `workspace_panels.id` for this panel. */
+	panelRowId: string;
+}
+
 /** Params carried by a terminal panel. */
-export interface TerminalPanelParams {
+export interface TerminalPanelParams extends WorkspaceMemberRowRef {
 	panelType: "terminal";
 	terminalConfig: TerminalLeafConfig;
 }
 
 /** Params carried by a webview panel. */
-export interface WebviewPanelParams {
+export interface WebviewPanelParams extends WorkspaceMemberRowRef {
 	panelType: "webview";
 	webviewConfig: WebviewLeafConfig;
 }

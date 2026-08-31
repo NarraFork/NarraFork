@@ -34,6 +34,7 @@ import {
 	IconFolder,
 	IconFolderOpen,
 	IconFolderPlus,
+	IconFolderSymlink,
 	IconGripVertical,
 	IconHome,
 	IconPencil,
@@ -702,34 +703,41 @@ export function DirectoryBrowser({
 									</>
 								)}
 								{/* Subdirectories */}
-								{displayedEntries.map((entry) => (
-									<UnstyledButton
-										key={entry.path}
-										onClick={() => navigateTo(entry.path)}
-										onDoubleClick={() => handleEntryDoubleClick(entry.path)}
-										px="sm"
-										py={5}
-										className="dir-entry"
-										style={{ borderRadius: 0 }}
-									>
-										<Group gap="xs" wrap="nowrap">
-											<IconFolder
-												size={16}
-												style={{
-													flexShrink: 0,
-													opacity: entry.name.startsWith(".") ? 0.5 : 0.8,
-												}}
-											/>
-											<Text
-												size="sm"
-												truncate
-												c={entry.name.startsWith(".") ? "dimmed" : undefined}
-											>
-												{entry.name}
-											</Text>
-										</Group>
-									</UnstyledButton>
-								))}
+								{displayedEntries.map((entry) => {
+									// Symlinked directories are navigable like any other, but the
+									// distinction matters when picking a path to persist: the link
+									// can later be repointed or removed.
+									const EntryIcon = entry.isSymlink ? IconFolderSymlink : IconFolder;
+									return (
+										<UnstyledButton
+											key={entry.path}
+											onClick={() => navigateTo(entry.path)}
+											onDoubleClick={() => handleEntryDoubleClick(entry.path)}
+											px="sm"
+											py={5}
+											className="dir-entry"
+											style={{ borderRadius: 0 }}
+											title={entry.isSymlink ? t("symlinkDirectory") : undefined}
+										>
+											<Group gap="xs" wrap="nowrap">
+												<EntryIcon
+													size={16}
+													style={{
+														flexShrink: 0,
+														opacity: entry.name.startsWith(".") ? 0.5 : 0.8,
+													}}
+												/>
+												<Text
+													size="sm"
+													truncate
+													c={entry.name.startsWith(".") ? "dimmed" : undefined}
+												>
+													{entry.name}
+												</Text>
+											</Group>
+										</UnstyledButton>
+									);
+								})}
 								{hiddenEntryCount > 0 && (
 									<Text c="dimmed" size="xs" ta="center" px="sm" py={8}>
 										{t("directoryPickerMoreEntries", { count: hiddenEntryCount })}

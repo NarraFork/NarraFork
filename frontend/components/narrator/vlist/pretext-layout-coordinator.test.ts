@@ -1029,3 +1029,122 @@ describe("PretextLayoutCoordinator.applyLivePatch", () => {
 		expect(coordinator.getSnapshot().scrollTop).toBeUndefined();
 	});
 });
+
+/**
+ * `scrollTopSmoothFollow` marks the corrections that answer TAIL GROWTH — the
+ * shell may glide those to the new bottom (vlist-smooth-follow); every other
+ * correction must stay instant (fold/LOD own their transitions, prepend/rebuild/
+ * removal are "keep what the reader sees", not "new content arrived").
+ */
+describe("PretextLayoutCoordinator — scrollTopSmoothFollow stamping", () => {
+	const pinnedView = () => ({ scrollTop: 0, pinnedToBottom: true, viewportHeight: 720 });
+
+	it("stamps the streaming-row commit (the primary chase case)", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
+		const streaming = message(2, "streaming…");
+		coordinator.setStreamingMessage(streaming, pinnedView);
+		const snap = coordinator.getSnapshot();
+		expect(snap.scrollTopAnchorKind).toBe("bottom");
+		expect(snap.scrollTopSmoothFollow).toBe(true);
+	});
+
+	it("stamps an appended tail message", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
+		const appended = coordinator.appendMessage(message(2, "three"), false, pinnedView);
+		expect(appended).toBe(true);
+		const snap = coordinator.getSnapshot();
+		expect(snap.scrollTopAnchorKind).toBe("bottom");
+		expect(snap.scrollTopSmoothFollow).toBe(true);
+	});
+
+	it("stamps a live patch that resizes a tail card", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => toolPage("running") });
+		coordinator.applyLivePatch(
+			(messages) => ({
+				messages: messages.map((msg) => ({
+					...msg,
+					contentJson: msg.contentJson.map((block) =>
+						block.type === "tool_use" ? { ...block, status: "success" } : block,
+					),
+				})) as TreeMessage[],
+				changed: true,
+			}),
+			pinnedView,
+		);
+		const snap = coordinator.getSnapshot();
+		expect(snap.scrollTopAnchorKind).toBe("bottom");
+		expect(snap.scrollTopSmoothFollow).toBe(true);
+	});
+
+	it("never stamps when the captured anchor is not the bottom (unpinned reader)", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
+		// Reader scrolled up: the correction keeps their place, and there is nothing
+		// to glide to — the flag must not leak onto item-kind corrections.
+		coordinator.setStreamingMessage(message(2, "streaming…"), () => ({
+			scrollTop: 0,
+			pinnedToBottom: false,
+			viewportHeight: 720,
+		}));
+		expect(coordinator.getSnapshot().scrollTopSmoothFollow).toBeUndefined();
+	});
+
+	it("does not stamp rebuilds (LOD / fold / options)", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
+		const rebuilt = coordinator.rebuild(
+			buildOptions,
+			{ kind: "bottom", distanceFromBottom: 0 },
+			720,
+		);
+		expect(rebuilt.scrollTopAnchorKind).toBe("bottom");
+		expect(rebuilt.scrollTopSmoothFollow).toBeUndefined();
+	});
+
+	it("does not stamp the pinned prepend re-pin (first-screen fill)", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		const fetchPage = async (
+			_id: string,
+			opts: { beforeSeq?: number; limit: number },
+		): Promise<PretextDocumentPageResult> =>
+			opts.beforeSeq == null
+				? {
+						messages: [message(2, "three"), message(3, "four")],
+						minSeq: 2,
+						maxSeq: 3,
+						hasNext: false,
+						hasPrev: true,
+						messageVersion: 3,
+						pruneBoundaryMessageId: null,
+						prunedPercent: null,
+					}
+				: {
+						messages: [message(0, "one"), message(1, "two")],
+						minSeq: 0,
+						maxSeq: 1,
+						hasNext: true,
+						hasPrev: false,
+						messageVersion: 3,
+						pruneBoundaryMessageId: null,
+						prunedPercent: null,
+					};
+		await coordinator.load("n1", buildOptions, { fetchPage });
+		await coordinator.loadOlder(buildOptions, pinnedView);
+		const snap = coordinator.getSnapshot();
+		// A prepend re-pin means "keep the tail in view", not "new content arrived":
+		// gliding down through the just-loaded history would be wrong.
+		expect(snap.scrollTopAnchorKind).toBe("bottom");
+		expect(snap.scrollTopSmoothFollow).toBeUndefined();
+	});
+
+	it("does not stamp removals and truncations", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
+		const removed = coordinator.removeMessages(["m-1"], pinnedView);
+		expect(removed).toBe(true);
+		expect(coordinator.getSnapshot().scrollTopSmoothFollow).toBeUndefined();
+	});
+});

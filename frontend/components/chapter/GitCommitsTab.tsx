@@ -14,7 +14,7 @@ import { useTranslation } from "react-i18next";
 import { useGitLog, useGitReset } from "../../hooks/useGit";
 import { useChapterSplitCapability } from "../../hooks/usePlatform";
 import { formatRelativeTime } from "../../lib/format";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { ChapterSplitModal } from "./ChapterSplitModal";
 
 const LIMIT = 50;

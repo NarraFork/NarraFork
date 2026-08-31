@@ -11,7 +11,6 @@
  * group drags, so `onUnhandledDragOver` only accepts our payloads.
  */
 
-import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
 import type { WorkspacePanelParams } from "./panel-types";
 
 /** Custom MIME type identifying a NarraFork sidebar drag. */
@@ -34,24 +33,19 @@ export function narratorDropPayload(narratorId: string, title: string): Workspac
 	};
 }
 
-/** Build a terminal drag payload. */
-export function terminalDropPayload(
-	config: TerminalLeafConfig,
-	title = "Terminal",
-): WorkspaceDropPayload {
-	return { title, params: { panelType: "terminal", terminalConfig: config } };
-}
-
-/** Build a webview drag payload. */
-export function webviewDropPayload(
-	config: WebviewLeafConfig,
-	title?: string,
-): WorkspaceDropPayload {
-	return {
-		title: title || config.title || config.url || "Webview",
-		params: { panelType: "webview", webviewConfig: config },
-	};
-}
+// ── Removed: terminalDropPayload / webviewDropPayload ──
+//
+// Both were unreachable: nothing in the app called them, and nothing calls
+// `writeWorkspaceDropPayload` either, so no terminal/webview payload is ever produced.
+// (`narratorDropPayload` above is kept because the drop HANDLER still decodes narrator
+// payloads, and a future producer is meaningful.)
+//
+// They are not merely dead but actively wrong now: terminal and webview panels are
+// MEMBERSHIP, so creating one requires a `workspace_panels` row first — the row id then
+// travels in the panel's params as `panelRowId`. A drag payload assembled on the client
+// cannot know that id, which is why the type no longer permits these objects. A future
+// drop path must call `POST /workspaces/:id/panels` and let the resulting row drive the
+// panel, rather than smuggling params through the drag.
 
 /** Write a payload onto a dragstart event's dataTransfer. */
 export function writeWorkspaceDropPayload(

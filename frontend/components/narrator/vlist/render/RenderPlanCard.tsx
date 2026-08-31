@@ -20,10 +20,17 @@ import {
 	planCardHeaderHeight,
 } from "../measure/measure-plan-card";
 import type { MeasuredElement } from "../prepared-block";
-import { FONT_SIZE, FONT_WEIGHT, SANS_FAMILY } from "../pretext-fonts";
+import { typographyMetrics } from "../pretext-fonts";
 import { RenderMarkdown } from "./RenderMarkdown";
 
-const LABEL_FONT = `${FONT_WEIGHT.medium} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
+/**
+ * The label font, read at RENDER time so it matches what measure prepared
+ * (measure-plan-card uses the same snapshot). A module-level string would freeze the
+ * label at the typography active when this chunk loaded.
+ */
+function labelFont(): string {
+	return typographyMetrics().font.xsMedium;
+}
 
 interface RenderPlanCardProps {
 	measured: MeasuredElement;
@@ -70,7 +77,7 @@ export function RenderPlanCard({
 					size={PLAN_HEADER_ICON}
 					style={{ color: "var(--mantine-color-teal-6)", flexShrink: 0 }}
 				/>
-				<span style={{ font: LABEL_FONT, color: "var(--mantine-color-teal-6)" }}>{label}</span>
+				<span style={{ font: labelFont(), color: "var(--mantine-color-teal-6)" }}>{label}</span>
 				{actions != null ? <div style={{ marginLeft: "auto" }}>{actions}</div> : null}
 			</div>
 			{/* markdown body: absolute-positioned lines from the measured frame */}

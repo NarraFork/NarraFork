@@ -66,7 +66,7 @@ import {
 	CHAT_HEADER_HEIGHT,
 	CHAT_MESSAGE_GAP,
 	CHAT_REPLY_GAP,
-	CHAT_REPLY_LINE_HEIGHT,
+	chatReplyLineHeight,
 } from "./measure-chat-message";
 import { RenderChatMessageBody } from "./RenderChatMessageBody";
 
@@ -672,7 +672,7 @@ function ChatReplyStrip({
 				activate();
 			}}
 			style={{
-				height: CHAT_REPLY_LINE_HEIGHT,
+				height: chatReplyLineHeight(),
 				marginBottom: CHAT_REPLY_GAP,
 				paddingLeft: 8,
 				borderLeft: "3px solid var(--mantine-primary-color-filled)",

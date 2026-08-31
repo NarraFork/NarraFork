@@ -424,6 +424,7 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceSubagentMessage: t("sidecar.sources.subagent_message"),
 			sidecarSourceSpecUpdate: t("sidecar.sources.spec_update"),
 			sidecarSourceInterruptTaskGuard: t("sidecar.sources.interrupt_task_guard"),
+			sidecarSourceTutorialLesson: t("sidecar.sources.tutorial_lesson"),
 		}),
 		[t, tCommon],
 	);

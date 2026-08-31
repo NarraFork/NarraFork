@@ -29,7 +29,7 @@ import {
 	type PreparedRuleBlock,
 	type RenderLod,
 } from "../prepared-block";
-import { lineBoxHeight, SPACING } from "../pretext-fonts";
+import { lineBoxHeight, SPACING, scaledLineBoxHeight } from "../pretext-fonts";
 
 // ── Chrome constants (px) — MessageRenderer.tsx prune-divider + Mantine ──────
 
@@ -72,7 +72,8 @@ export function measurePruneDivider(
 ): MeasuredElement {
 	const block: PreparedRuleBlock = {
 		kind: "rule",
-		height: PRUNE_DIVIDER_LABEL_ROW,
+		// Scaled at measure time; the constant above is the neutral baseline.
+		height: scaledLineBoxHeight(PRUNE_DIVIDER_LABEL_FONT_SIZE, 1.55),
 		marginTop: PRUNE_DIVIDER_MARGIN_Y,
 		contentLeft: 0,
 		quoteRailLefts: [],

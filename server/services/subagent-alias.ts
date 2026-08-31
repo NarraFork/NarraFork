@@ -302,6 +302,23 @@ export function getTaskAlias(narratorId: string, realId: string): string | undef
 	return getAliasRegistryMap().get(narratorId)?.idToAlias.get(realId);
 }
 
+/**
+ * Remove ONE task alias registration.
+ *
+ * For a caller whose task creation failed AFTER it minted the alias (the row it
+ * names will never exist). Registering again for the same id would return the
+ * stale alias, so the entry has to go: the next attempt re-mints from the base
+ * name (a `-2` suffix only if the freed name is somehow retaken first).
+ */
+export function unregisterTaskAlias(narratorId: string, realId: string): void {
+	const reg = getAliasRegistryMap().get(narratorId);
+	if (!reg) return;
+	const alias = reg.idToAlias.get(realId);
+	if (!alias) return;
+	reg.idToAlias.delete(realId);
+	reg.aliasToId.delete(alias);
+}
+
 /** Clean up alias registry for a narrator. */
 export function clearAliasRegistry(narratorId: string): void {
 	getAliasRegistryMap().delete(narratorId);

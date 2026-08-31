@@ -1072,6 +1072,19 @@ export async function executeTool(
 			};
 		}
 
+		// Wire up emitStructuredProgress: determinate "N of M" measurements.
+		//
+		// Unthrottled here on purpose — the producer owns the rate. A transfer
+		// reports once per chunk and coalesces to ~4/s before calling this, so a
+		// second throttle would only add latency to the final frame. (The text
+		// channel below throttles because its producers, e.g. bash, stream freely.)
+		if (config.onEvent) {
+			const onEvent = config.onEvent;
+			ctx.emitStructuredProgress = (progress) => {
+				onEvent({ type: "tool_structured_progress", toolUseId: tu.toolUseId, progress });
+			};
+		}
+
 		// Wire up emitOutput: throttled streaming of tool output to the UI
 		let pendingOutputTimer: ReturnType<typeof setTimeout> | undefined;
 		if (config.onEvent) {

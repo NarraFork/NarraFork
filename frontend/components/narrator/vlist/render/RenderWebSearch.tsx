@@ -29,6 +29,7 @@ import {
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
 import { Loader, Paper, ThemeIcon } from "@mantine/core";
+import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { IconWorldSearch } from "@tabler/icons-react";
 import { Fragment, useMemo } from "react";
 import {
@@ -156,14 +157,15 @@ export function RenderWebSearch({ measured, isSearching = false }: RenderWebSear
 										<FragmentGap gapBefore={frag.gapBefore} />
 										<span
 											style={{
-												font: frag.font,
+												...fragmentTextStyle({
+													font: frag.font,
+													gapBefore: frag.gapBefore,
+													letterSpacing: letterSpacingForFont(frag.font),
+												}),
 												// `font` restores the 12px size the parent zeroed out.
 												// lineHeight:1 shrinks the box to the em-square so flex
 												// can centre the glyphs in the reserved 17px line.
 												lineHeight: 1,
-												marginLeft: frag.gapBefore,
-												whiteSpace: "pre",
-												display: "inline-block",
 												color: fragColor(frag.className),
 											}}
 										>

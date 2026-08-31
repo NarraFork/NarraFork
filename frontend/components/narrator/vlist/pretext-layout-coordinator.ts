@@ -7,6 +7,7 @@ import {
 	restorePretextLayoutAnchor,
 } from "@shared/pretext-layout";
 import { resetPreparedMarkdownCache } from "@shared/pretext-layout/prepared-markdown-cache";
+import { getTypographyRevision } from "@shared/pretext-layout/typography";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import type { NarratorMsg } from "../narrator-panel-types";
 import {
@@ -72,6 +73,16 @@ export interface PretextLayoutCoordinatorSnapshot {
 	items?: readonly VListItem[];
 	scrollTop?: number;
 	scrollTopAnchorKind?: PretextLayoutAnchor["kind"];
+	/**
+	 * Present (and true) only when this correction answers TAIL GROWTH — a streaming
+	 * row growing, a message appended, a live patch resizing a card at the tail —
+	 * so the shell may glide the pinned viewport to the new bottom instead of
+	 * snapping (vlist-smooth-follow). Every other correction (prepend re-pin, fold,
+	 * LOD, removal, truncation, restore) omits it and stays instant: those mean
+	 * "keep what the reader sees", not "new content arrived", and the fold/LOD
+	 * transitions own their own FLIP geometry.
+	 */
+	scrollTopSmoothFollow?: boolean;
 	/** More (older) messages exist above the loaded window. */
 	hasPrev?: boolean;
 	/** An older-page fetch is in flight (drives the load indicator). */
@@ -471,12 +482,15 @@ export class PretextLayoutCoordinator {
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
 		const generation = ++this.generation;
+		// A live patch resizes a card at the tail (a tool completes and grows its
+		// output body): tail growth, so a pinned reader may glide to the new bottom.
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
 			anchor,
 			view?.viewportHeight ?? this.lastViewportHeight,
 			generation,
+			true,
 		);
 		return true;
 	}
@@ -512,12 +526,15 @@ export class PretextLayoutCoordinator {
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
 		const generation = ++this.generation;
+		// A new message landing at the tail is tail growth: a pinned reader may
+		// glide to the new bottom instead of being snapped to it.
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
 			anchor,
 			view?.viewportHeight ?? this.lastViewportHeight,
 			generation,
+			true,
 		);
 		return true;
 	}
@@ -779,12 +796,15 @@ export class PretextLayoutCoordinator {
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
 		const generation = ++this.generation;
+		// The streaming row IS the tail growing: a pinned reader glides to the new
+		// bottom rather than watching every committed row jump up per delta.
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
 			anchor,
 			view?.viewportHeight ?? this.lastViewportHeight,
 			generation,
+			true,
 		);
 		return true;
 	}
@@ -898,10 +918,16 @@ export class PretextLayoutCoordinator {
 	 * Drop every cached measurement and prepared body, then rebuild at the last
 	 * committed params.
 	 *
-	 * This is the FONT-GENERATION path (see the `documentRevision` note): the
-	 * prepared handles carry pixel widths baked against the previous face, so they
-	 * cannot be reused, and the heights derived from them are already on screen.
-	 * The rebuild anchors so the reader is not moved by the corrected geometry.
+	 * Serves both generations that invalidate BAKED PIXEL WIDTHS (see the
+	 * `documentRevision` note):
+	 *  - FONT — a face resolved mid-session, so prepared handles carry widths
+	 *    measured against the previous face.
+	 *  - TYPOGRAPHY — the reader changed font scale / letter spacing / block
+	 *    spacing, which are measurement inputs, not presentation.
+	 *
+	 * In both cases the prepared handles cannot be reused and the heights derived
+	 * from them are already on screen. The rebuild anchors so the reader is not
+	 * moved by the corrected geometry.
 	 *
 	 * No-ops before the first commit — the first build will use the new generation
 	 * anyway.
@@ -959,7 +985,7 @@ export class PretextLayoutCoordinator {
 			pruneBoundaryMessageId: input.pruneBoundaryMessageId,
 			// The loaded-message count keeps the revision distinct as the window
 			// grows upward within one document version (prepended older pages).
-			layoutRevision: `${input.messageVersion}:${input.messages.length}:${buildOptions.widthBucket}:${buildOptions.lod}:k${getKatexRevision()}:f${getFontRevision()}`,
+			layoutRevision: `${input.messageVersion}:${input.messages.length}:${buildOptions.widthBucket}:${buildOptions.lod}:k${getKatexRevision()}:f${getFontRevision()}:t${getTypographyRevision()}`,
 			// The KaTeX revision belongs on the DOCUMENT revision, not just the layout
 			// revision: `layoutRevision` only reaches the manifest identity, while the
 			// measure cache keys on `documentRevision` + the data revision. Without it
@@ -972,7 +998,12 @@ export class PretextLayoutCoordinator {
 			// every prepared fragment carries a baked pixel width measured against the
 			// then-available face, so a face swap invalidates heights on math-free
 			// documents too (see prepared-markdown-cache's FONT REVISION note).
-			documentRevision: `${input.messageVersion}~k:${getKatexRevision()}~f:${getFontRevision()}`,
+			//
+			// The TYPOGRAPHY generation is the user-driven counterpart: the reader's own
+			// font-scale / letter-spacing / block-spacing settings are measurement
+			// inputs, so a change makes every cached height describe a document that is
+			// no longer the one being painted.
+			documentRevision: `${input.messageVersion}~k:${getKatexRevision()}~f:${getFontRevision()}~t:${getTypographyRevision()}`,
 		});
 	}
 
@@ -1076,6 +1107,7 @@ export class PretextLayoutCoordinator {
 		anchor: PretextLayoutAnchor | undefined,
 		viewportHeight: number,
 		generation: number,
+		smoothFollow?: boolean,
 	): PretextLayoutCoordinatorSnapshot {
 		if (generation !== this.generation) return this.current;
 		try {
@@ -1103,7 +1135,15 @@ export class PretextLayoutCoordinator {
 				// error for diagnostics; without clearing it here that error would ride
 				// along on every later healthy snapshot forever.
 				error: undefined,
-				...(scrollTop == null ? {} : { scrollTop, scrollTopAnchorKind: anchor?.kind ?? "item" }),
+				...(scrollTop == null
+					? {}
+					: {
+							scrollTop,
+							scrollTopAnchorKind: anchor?.kind ?? "item",
+							...(smoothFollow === true && anchor?.kind === "bottom"
+								? { scrollTopSmoothFollow: true }
+								: {}),
+						}),
 			};
 			this.emit();
 			return this.current;

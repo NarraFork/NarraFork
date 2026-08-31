@@ -39,7 +39,13 @@ import {
 	type PreparedFixedBlock,
 	type RenderLod,
 } from "../prepared-block";
-import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts";
+import {
+	FONT_SIZE,
+	LINE_HEIGHT,
+	lineBoxHeight,
+	SPACING,
+	typographyMetrics,
+} from "../pretext-fonts";
 
 // ── Payload ──────────────────────────────────────────────────────────────────
 
@@ -75,9 +81,15 @@ export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 export const STACK_GAP = 2;
 
 /** Height with zero entries: padding×2 + the lone heading line. ≈37px. */
-export const KNOWLEDGE_HINT_BASE_HEIGHT = CARD_PADDING * 2 + XS_LINE_HEIGHT; // 37
+export const KNOWLEDGE_HINT_BASE_HEIGHT = CARD_PADDING * 2 + XS_LINE_HEIGHT; // 37 (baseline)
+export function knowledgeHintBaseHeight(): number {
+	return CARD_PADDING * 2 + typographyMetrics().line.xs;
+}
 /** Extra height per additional entry row: one xs line + one Stack gap. =19px. */
-export const KNOWLEDGE_HINT_HEIGHT_PER_ENTRY = XS_LINE_HEIGHT + STACK_GAP; // 19
+export const KNOWLEDGE_HINT_HEIGHT_PER_ENTRY = XS_LINE_HEIGHT + STACK_GAP; // 19 (baseline)
+export function knowledgeHintHeightPerEntry(): number {
+	return typographyMetrics().line.xs + STACK_GAP;
+}
 
 /**
  * The linear height of a knowledge_hint card with `entryCount` entries:
@@ -86,7 +98,7 @@ export const KNOWLEDGE_HINT_HEIGHT_PER_ENTRY = XS_LINE_HEIGHT + STACK_GAP; // 19
  */
 export function knowledgeHintHeight(entryCount: number): number {
 	const n = Math.max(0, entryCount);
-	return KNOWLEDGE_HINT_BASE_HEIGHT + n * KNOWLEDGE_HINT_HEIGHT_PER_ENTRY;
+	return knowledgeHintBaseHeight() + n * knowledgeHintHeightPerEntry();
 }
 
 /**

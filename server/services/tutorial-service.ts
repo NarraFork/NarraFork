@@ -28,12 +28,22 @@
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { getTutorialLesson, TUTORIAL_TRAIT } from "@shared/tutorial/lessons";
+import {
+	getTutorialLesson,
+	TUTORIAL_LESSON_BOUNDARY_BLOCK,
+	TUTORIAL_PROVIDER_PREFIX,
+	TUTORIAL_TRAIT,
+	tutorialLessonBoundaryText,
+} from "@shared/tutorial/lessons";
 import { TUTORIAL_SANDBOX_COMMITS, TUTORIAL_SANDBOX_FILES } from "@shared/tutorial/sandbox-files";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, projects, userPreferences } from "../db/schema";
-import { tutorialModelForLesson, tutorialModelForSubagent } from "../lib/agent/tutorial-provider";
+import {
+	parseTutorialModel,
+	tutorialModelForLesson,
+	tutorialModelForSubagent,
+} from "../lib/agent/tutorial-provider";
 import { AsyncMutex, userPreferencesLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
@@ -47,7 +57,9 @@ import {
 import type { Locale } from "../lib/prompt-i18n";
 import { chapterService } from "./chapter-service";
 import { gitService } from "./git-service";
+import { deliverInjection } from "./narrator-injection";
 import { narratorService } from "./narrator-service";
+import { interruptAndWaitForIdle } from "./narrator-session";
 
 /** Every subagent pool the restriction trait must cover. */
 const SUBAGENT_POOL_KEYS = ["explore", "plan", "search", "review", "general"] as const;
@@ -274,11 +286,77 @@ export function tutorialSubagentTraits(
 }
 
 /**
- * Create the narrator for a lesson and return where the UI should mount it.
+ * Serialises lesson starts per user.
  *
- * Each call creates a FRESH narrator rather than reusing one: a lesson replays a
- * script from turn 0, and the turn index is derived from conversation history, so
- * a reused session would resume mid-script with no way back.
+ * Two lessons launched at once would both find no tutorial narrator for the slot
+ * and both create one — and for the chapter slot the second insert then hits the
+ * "one primary narrator per chapter" rule, so the user is told a lesson cannot
+ * start for a reason that has nothing to do with the lesson.
+ */
+const lessonLock = new AsyncMutex();
+
+/** Whether this narrator is a live tutorial session for the given slot. */
+function isReusableTutorialNarrator(row: {
+	status: string;
+	traits: string[] | null;
+	model: string | null;
+}): boolean {
+	if (row.status === "archived") return false;
+	if (!(row.traits ?? []).includes(TUTORIAL_TRAIT)) return false;
+	// A narrator whose model no longer routes to the scripted provider must not be
+	// reused: pointing a real model at a tutorial session is exactly the silent
+	// billing this module exists to prevent.
+	return (row.model ?? "").startsWith(`${TUTORIAL_PROVIDER_PREFIX}:`);
+}
+
+/**
+ * The user's existing tutorial narrator for a slot, if any.
+ *
+ * Two slots, not one: a `chapter` lesson needs a narrator bound to the sandbox
+ * worktree (its tools must operate on real files), while a `standalone` lesson has
+ * no chapter at all. Sharing one row across both would mean either giving the
+ * standalone lesson a worktree it does not need or unbinding the chapter one.
+ */
+async function findLessonNarrator(
+	userId: string,
+	slot: { chapterId: string | null },
+): Promise<{ id: string; traits: string[] | null; model: string | null } | undefined> {
+	const rows = await db.query.narrators.findMany({
+		where: and(
+			eq(narrators.ownerUserId, userId),
+			eq(narrators.variant, "primary"),
+			slot.chapterId === null
+				? isNull(narrators.chapterId)
+				: eq(narrators.chapterId, slot.chapterId),
+		),
+		columns: { id: true, traits: true, status: true, model: true, createdAt: true },
+	});
+	// Newest first: if an older run left more than one behind (a chapter that was
+	// recreated, a pre-reuse install), continue the most recent session rather than
+	// resurrecting the oldest.
+	const usable = rows
+		.filter((row) => isReusableTutorialNarrator(row))
+		.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+	return usable[0];
+}
+
+/**
+ * Start a lesson on the user's tutorial narrator, creating it only if needed.
+ *
+ * REUSED rather than freshly created per lesson. Two reasons, and the first one is
+ * a hard failure:
+ *
+ *  1. A chapter may hold only ONE primary narrator (`prepareNarratorCreation`), so
+ *     creating one per lesson made the second chapter-bound lesson fail outright
+ *     with "Chapter already has a primary narrator" — every lesson after
+ *     `tool-calls` was unreachable.
+ *  2. A course with no continuity teaches worse. The narrator is the thing the
+ *     tutorial is teaching the user to work with; a new one per lesson contradicts
+ *     the lesson that a narrator is a durable session, and the user cannot scroll
+ *     back to what they just learned.
+ *
+ * The script still plays from turn 0 because a lesson boundary row is written
+ * first and `scriptTurnIndex` counts only from there.
  */
 export async function startLesson(input: {
 	userId: string;
@@ -288,49 +366,164 @@ export async function startLesson(input: {
 	const lesson = getTutorialLesson(input.lessonId, input.locale);
 	if (!lesson) throw new NotFoundError("Tutorial lesson", input.lessonId);
 
-	const needsProject = lesson.needs.project === true || lesson.needs.narrator === "chapter";
-	const sandbox = needsProject ? await ensureSandbox(input.userId) : null;
-	const model = tutorialModelForLesson(lesson.id, input.locale);
+	return lessonLock.acquire(input.userId, async () => {
+		const needsProject = lesson.needs.project === true || lesson.needs.narrator === "chapter";
+		const sandbox = needsProject ? await ensureSandbox(input.userId) : null;
+		const chapterId = lesson.needs.narrator === "chapter" ? (sandbox?.chapterId ?? null) : null;
+		const model = tutorialModelForLesson(lesson.id, input.locale);
+		const now = new Date().toISOString();
 
+		const existing = await findLessonNarrator(input.userId, { chapterId });
+		const narratorId = existing
+			? await continueLessonNarrator(existing, { model, cwd: sandbox?.gitPath ?? null, now })
+			: await createLessonNarrator({ ...input, lesson, chapterId, model, sandbox });
+
+		// Traits carry the per-type subagent model pools, which name the LESSON — so
+		// they are rewritten on every start, not only at creation. A reused narrator
+		// still holding the previous lesson's pools would send this lesson's subagents
+		// to the wrong script (and, once a lesson id is dropped, to no script at all).
+		//
+		// The baseline is read back from the row rather than taken from `existing`, which
+		// is undefined on the create path. Using it there reduced the baseline to
+		// `[TUTORIAL_TRAIT]`, and since this is a whole-column write it erased what
+		// `createNarrator` had just stored — including `standalone`, which every
+		// chapter-less narrator must carry (there is a startup backfill in `db/index.ts`
+		// enforcing exactly that, so a tutorial narrator became a standing violation of
+		// it, silently reclassified as chapter-bound until the next restart) and `plan`
+		// when `defaultStartInPlanMode` is on.
+		const current = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { traits: true },
+		});
+		const traits = tutorialSubagentTraits(
+			[...((current?.traits ?? []) as string[]), TUTORIAL_TRAIT],
+			{ lessonId: lesson.id, locale: input.locale },
+		);
+		await db
+			.update(narrators)
+			.set({ traits: dedupeTraits(traits), updatedAt: now })
+			.where(eq(narrators.id, narratorId));
+
+		// Written AFTER the traits/model update so the row the provider reads first is
+		// already the one this lesson expects.
+		await writeLessonBoundary(narratorId, lesson.id, lesson.title, input.locale);
+
+		logger.info("Tutorial lesson started", {
+			userId: input.userId,
+			lessonId: lesson.id,
+			narratorId,
+			reused: !!existing,
+		});
+
+		return {
+			lessonId: lesson.id,
+			narratorId,
+			projectId: sandbox?.projectId ?? null,
+			chapterId,
+		};
+	});
+}
+
+/** Traits are a set; the pool encoder preserves order, so dedupe keeps it stable. */
+function dedupeTraits(traits: string[]): string[] {
+	return [...new Set(traits)];
+}
+
+/**
+ * Point an existing tutorial narrator at this lesson.
+ *
+ * Interrupted first: the previous lesson may have been left mid-turn (the user
+ * clicked "next lesson" while a scripted turn was streaming), and a loop that is
+ * still running holds the OLD model in memory — it would keep playing the previous
+ * script and then write its turns after this lesson's boundary row, which is the
+ * one thing the turn counter cannot recover from.
+ */
+async function continueLessonNarrator(
+	existing: { id: string },
+	update: { model: string; cwd: string | null; now: string },
+): Promise<string> {
+	await interruptAndWaitForIdle(existing.id);
+	await db
+		.update(narrators)
+		.set({
+			model: update.model,
+			// A chapter lesson's tools must land in the sandbox worktree. Only set when
+			// known: a standalone lesson has no path to offer and must not blank the one
+			// a previous lesson established.
+			...(update.cwd ? { cwd: update.cwd } : {}),
+			// Permission cards are a lesson, not an obstacle. A user who switched this
+			// session to bypassPermissions during an earlier lesson would otherwise never
+			// see the approval card the permissions lesson is entirely about.
+			permissionMode: "default",
+			// Plan mode is entered by one lesson and must not leak into the next: a
+			// narrator still in plan mode would refuse the writes a later script performs,
+			// which reads as the tutorial being broken.
+			planMode: false,
+			previousPermissionMode: null,
+			planFileId: null,
+			status: "idle",
+			errorMessage: null,
+			updatedAt: update.now,
+		})
+		.where(eq(narrators.id, existing.id));
+	return existing.id;
+}
+
+async function createLessonNarrator(input: {
+	userId: string;
+	locale: Locale;
+	lesson: { id: string; title: string };
+	chapterId: string | null;
+	model: string;
+	sandbox: TutorialSandbox | null;
+}): Promise<string> {
 	const narrator = await narratorService.create({
-		chapterId: lesson.needs.narrator === "chapter" ? sandbox?.chapterId : null,
+		chapterId: input.chapterId,
 		type: "primary",
-		model,
+		model: input.model,
 		// A non-empty title suppresses title generation, which would otherwise run on
 		// `settings.agent.summaryModel` — a real model the tutorial model cannot
 		// redirect. See the module header.
-		title: lesson.title,
+		title: input.lesson.title,
 		// Permission cards are a lesson, not an obstacle: never bypass them.
 		permissionMode: "default",
-		cwd: sandbox?.gitPath,
+		cwd: input.sandbox?.gitPath,
 		ownerUserId: input.userId,
 		extraTraits: [],
 	});
-
-	// Written after creation because `CreateNarratorInput.extraTraits` only accepts
-	// the bare `NarratorTrait` tags, not the encoded custom-trait payloads.
-	const traits = tutorialSubagentTraits([...(narrator.traits ?? []), TUTORIAL_TRAIT], {
-		lessonId: lesson.id,
-		locale: input.locale,
-	});
-	await db
-		.update(narrators)
-		.set({ traits, updatedAt: new Date().toISOString() })
-		.where(eq(narrators.id, narrator.id));
-
-	logger.info("Tutorial lesson started", {
-		userId: input.userId,
-		lessonId: lesson.id,
-		narratorId: narrator.id,
-	});
-
-	return {
-		lessonId: lesson.id,
-		narratorId: narrator.id,
-		projectId: sandbox?.projectId ?? null,
-		chapterId: lesson.needs.narrator === "chapter" ? (sandbox?.chapterId ?? null) : null,
-	};
+	return narrator.id;
 }
+
+/**
+ * Mark where this lesson begins in the narrator's conversation.
+ *
+ * Load-bearing for the reuse: `scriptTurnIndex` counts assistant turns only after
+ * the latest boundary, so this row is what makes a reused session still play the
+ * new lesson from turn 0. Missing it produces no error — the lesson simply answers
+ * with its "this script is finished" fallback line.
+ *
+ * `role: "sys"` so the model sees it as a system fact rather than something the
+ * user said, and `schedule: "none"` so writing it never starts a turn: the user
+ * has not asked for anything yet.
+ */
+async function writeLessonBoundary(
+	narratorId: string,
+	lessonId: string,
+	lessonTitle: string,
+	locale: Locale,
+): Promise<void> {
+	await deliverInjection(narratorId, {
+		content: tutorialLessonBoundaryText(lessonTitle, locale),
+		source: TUTORIAL_LESSON_BOUNDARY_SOURCE,
+		role: "sys",
+		schedule: "none",
+		locale,
+		extraBlocks: [{ type: TUTORIAL_LESSON_BOUNDARY_BLOCK, lessonId, lessonTitle }],
+	});
+}
+
+/** Producer tag for the boundary row. */
+const TUTORIAL_LESSON_BOUNDARY_SOURCE = "tutorial_lesson";
 
 // ---------------------------------------------------------------------------
 // Progress
@@ -448,6 +641,55 @@ async function writeProgress(userId: string, progress: TutorialProgressMap): Pro
 		createdAt: now,
 		updatedAt: now,
 	});
+}
+
+/**
+ * The narrator a lesson would continue, without starting anything.
+ *
+ * The page needs this to show the ONGOING conversation when the user comes back to
+ * a lesson (or reloads mid-lesson) instead of a start screen. Without it the reuse
+ * is invisible: the session exists on the server, but the UI still asks the user to
+ * begin and only learns the narrator id from a start call — which would write
+ * another boundary row and rewind the script the user was halfway through.
+ *
+ * Deliberately read-only: it never provisions the sandbox and never creates a
+ * narrator, so merely opening a lesson page still costs nothing.
+ */
+export async function getLessonSession(input: {
+	userId: string;
+	lessonId: string;
+	locale: Locale;
+}): Promise<TutorialLessonSession | null> {
+	const lesson = getTutorialLesson(input.lessonId, input.locale);
+	if (!lesson) throw new NotFoundError("Tutorial lesson", input.lessonId);
+
+	const project = await findSandboxProject(input.userId);
+	const wantsChapter = lesson.needs.narrator === "chapter";
+	// No sandbox yet means no chapter-bound narrator can exist. Returning here also
+	// avoids a chapter lookup for a project that was deleted.
+	if (wantsChapter && !project) return null;
+
+	const chapter = wantsChapter && project ? await findSandboxChapter(project.id) : null;
+	if (wantsChapter && !chapter) return null;
+
+	const existing = await findLessonNarrator(input.userId, {
+		chapterId: wantsChapter ? (chapter?.id ?? null) : null,
+	});
+	if (!existing) return null;
+
+	// The slot's narrator serves EVERY lesson in that slot, so its mere existence does
+	// not mean THIS lesson was started. Reporting it anyway would auto-mount a session
+	// for a lesson the user never began — and with no boundary row for it, the script
+	// would answer with its "this lesson is finished" fallback line before the user
+	// sent anything. The model value is the record of which lesson it is on.
+	if (parseTutorialModel(existing.model ?? "").lessonId !== lesson.id) return null;
+
+	return {
+		lessonId: lesson.id,
+		narratorId: existing.id,
+		projectId: project?.id ?? null,
+		chapterId: wantsChapter ? (chapter?.id ?? null) : null,
+	};
 }
 
 /** Whether this user currently has a provisioned sandbox. */

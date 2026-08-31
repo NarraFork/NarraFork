@@ -109,7 +109,10 @@ describe("processScrollFrame answers content growth in the same frame", () => {
 			source.indexOf("const onScroll = useCallback("),
 		);
 		expect(frame).toContain("isBottomLostToContentGrowth(");
-		expect(frame).toContain("if (grewBeneathReader) writeScrollTop(getScrollBottomTarget(node));");
+		// The re-glue routes through the smooth-follow chase: growth beneath a pinned
+		// reader is precisely the "content jumps up" case the chase glides over, and
+		// its gate reproduces the old instant write for loads/switches/shrinks.
+		expect(frame).toContain("if (grewBeneathReader) getSmoothFollower().ensure();");
 		// The mounted window must come from where the viewport now is, not from the
 		// pre-re-glue reading.
 		expect(frame).toContain("const settledTop = scrollTopRef.current;");
@@ -145,6 +148,99 @@ describe("the scroll container disables the browser's own anchoring", () => {
 			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
 		).text();
 		expect(source).toContain('overflowAnchor: "none"');
+	});
+});
+
+describe("smooth bottom-follow wiring (vlist-smooth-follow)", () => {
+	async function shell() {
+		return Bun.file(new URL("./PretextExactMessageList.tsx", import.meta.url).pathname).text();
+	}
+
+	it("routes all three bottom-follow writers through the chase", async () => {
+		const source = await shell();
+		// 1. The streaming commit's bottom correction (only when the coordinator
+		//    stamped it smooth, i.e. tail growth).
+		expect(source).toContain('anchorKind === "bottom" && smoothFollow === true');
+		// 2. The geometry-revision pin effect.
+		const pinEffect = source.slice(
+			source.indexOf("const scrollGeometryRevision ="),
+			source.indexOf("const scrollGeometryRevision =") + 900,
+		);
+		expect(pinEffect).toContain("getSmoothFollower().ensure();");
+		// 3. The same-frame re-glue (asserted in its own group above).
+	});
+
+	it("non-glide corrections still land instantly and kill any chase in flight", async () => {
+		const source = await shell();
+		const correction = source.slice(
+			source.indexOf("const onScrollTopCorrection = useCallback("),
+			source.indexOf("const onScrollTopCorrection = useCallback(") + 1200,
+		);
+		// Anchored rebuilds / fold / LOD / removals keep their committed-geometry
+		// semantics: same instant write as before, and no chase survives them.
+		expect(correction).toContain("getSmoothFollower().cancel();");
+		expect(correction).toContain(
+			"writeScrollTop(applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current));",
+		);
+	});
+
+	it("the chase dies with the pin on EVERY reader-intent path", async () => {
+		const source = await shell();
+		// wheel-up detach.
+		const detach = source.slice(
+			source.indexOf("const detachFromBottom = useCallback("),
+			source.indexOf("const detachFromBottom = useCallback(") + 400,
+		);
+		expect(detach).toContain("getSmoothFollower().cancel();");
+		// Any non-echo upward movement caught by processScrollFrame.
+		const frame = source.slice(
+			source.indexOf("const processScrollFrame = useCallback("),
+			source.indexOf("const onScroll = useCallback("),
+		);
+		expect(frame).toContain("if (!effectiveAtBottom) getSmoothFollower().cancel();");
+		// Explicit jumps: scrollToBottom handle, user-marker jump, message reveal.
+		const toBottom = source.slice(
+			source.indexOf("const scrollToBottom = useCallback("),
+			source.indexOf("const scrollToBottom = useCallback(") + 500,
+		);
+		expect(toBottom).toContain("getSmoothFollower().cancel();");
+		const reveal = source.slice(
+			source.indexOf("const scrollToMessageTarget = useCallback("),
+			source.indexOf("const scrollToMessageTarget = useCallback(") + 900,
+		);
+		expect(reveal).toContain("getSmoothFollower().cancel();");
+	});
+
+	it("fold and LOD transitions land the chase BEFORE capturing geometry", async () => {
+		const source = await shell();
+		// Both plan their FLIP/morph against the predicted bottom while pinned; a
+		// chase still gliding would move rows under the running animation.
+		const foldCapture = source.slice(
+			source.indexOf("const captureFoldBefore = useCallback("),
+			source.indexOf("const captureFoldBefore = useCallback(") + 700,
+		);
+		expect(foldCapture).toContain("smoothFollowerRef.current?.snapToTarget();");
+		const lodEmit = source.slice(
+			source.indexOf("const emit = (dir: 1 | -1"),
+			source.indexOf("const emit = (dir: 1 | -1") + 500,
+		);
+		expect(lodEmit).toContain("smoothFollowerRef.current?.snapToTarget();");
+	});
+
+	it("readCurrentView treats an active chase AS the bottom pin", async () => {
+		// Without this the chase's own lag makes every streaming commit capture an
+		// ITEM anchor, whose correction cancels the chase it should feed (thrash).
+		const source = await shell();
+		const view = source.slice(
+			source.indexOf("const readCurrentView = useCallback("),
+			source.indexOf("const readCurrentView = useCallback(") + 1200,
+		);
+		expect(view).toContain("smoothFollowerRef.current?.isActive()");
+	});
+
+	it("the chase never outlives the shell", async () => {
+		const source = await shell();
+		expect(source).toContain("useEffect(() => () => smoothFollowerRef.current?.cancel(), []);");
 	});
 });
 

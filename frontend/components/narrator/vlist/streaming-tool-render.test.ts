@@ -196,6 +196,102 @@ describe("a running command's output reaches the card", () => {
 	});
 });
 
+describe("a determinate progress bar reaches the card", () => {
+	/** Same pipeline as layoutRow, but classified as a transfer. */
+	function layoutTransferRow(
+		mod: Mod,
+		store: ReturnType<Mod["createStreamingToolStore"]>,
+		revision: string,
+	) {
+		const toolChunksMsg = mod.buildTopLevelStreamingChunksMsg(
+			mod.streamingToolChunks(store),
+			"n1",
+			null,
+		);
+		const row = mod.buildStreamingMsg({
+			streamingBlocks: [{ type: "text", text: "上传中" }] as never,
+			toolChunksMsg,
+			narratorId: "n1",
+		});
+		if (!row) throw new Error("expected a streaming row");
+		return mod.buildPretextDocumentLayout([row] as never, {
+			...layoutOptions(revision),
+			resolveToolCategory: () => "transfer",
+		});
+	}
+
+	/** The progress descriptor the measure layer put on a reserved fixed block. */
+	function barOf(built: ReturnType<Mod["buildPretextDocumentLayout"]>) {
+		const measured = toolRow(built)?.measured as
+			| { detail?: { blocks?: Array<{ kind: string; tag?: string; data?: unknown }> } }
+			| undefined;
+		const found = measured?.detail?.blocks?.find(
+			(b) => b.kind === "fixed" && b.tag === "detail-meta-progress",
+		);
+		const data = found?.data as
+			| { progress?: { ratio: number | null; percent?: number } }
+			| undefined;
+		return data?.progress ?? null;
+	}
+
+	it("carries the measurement all the way to a reserved bar block", async () => {
+		// The full chain: WS frame → store → synthetic message → segment → adapter
+		// metadata bridge → classifier → measure. A break anywhere leaves the card
+		// with no bar, which is indistinguishable from a transfer that never started.
+		const mod = await load();
+		const store = mod.createStreamingToolStore();
+		mod.applyStreamingToolStarted(store, {
+			toolUseId: "t1",
+			toolName: "TransferFile",
+			input: { direction: "upload", remotePath: "/r/app.apk", localPath: "/l/app.apk" },
+		});
+		mod.applyStreamingToolProgress(store, "t1", {
+			completed: 4 * 1024 * 1024,
+			total: 10 * 1024 * 1024,
+			elapsedMs: 2000,
+		});
+		const bar = barOf(layoutTransferRow(mod, store, "prog-1"));
+		expect(bar?.percent).toBe(40);
+		expect(bar?.ratio).toBeCloseTo(0.4, 5);
+	});
+
+	it("keeps the card height FIXED as the bar advances", async () => {
+		// The reservation must not depend on the numbers: a card that re-measures on
+		// every progress frame walks the whole conversation below it up and down while
+		// the user is reading.
+		const mod = await load();
+		const store = mod.createStreamingToolStore();
+		mod.applyStreamingToolStarted(store, {
+			toolUseId: "t1",
+			toolName: "TransferFile",
+			input: { direction: "upload", remotePath: "/r/app.apk", localPath: "/l/app.apk" },
+		});
+		mod.applyStreamingToolProgress(store, "t1", {
+			completed: 1024,
+			total: 10 * 1024 * 1024,
+			elapsedMs: 1000,
+		});
+		const early = toolRow(layoutTransferRow(mod, store, "h-1"))?.measured.height ?? 0;
+		mod.applyStreamingToolProgress(store, "t1", {
+			completed: 9 * 1024 * 1024,
+			total: 10 * 1024 * 1024,
+			elapsedMs: 9000,
+		});
+		const late = toolRow(layoutTransferRow(mod, store, "h-2"))?.measured.height ?? 0;
+		expect(early).toBeGreaterThan(0);
+		expect(late).toBe(early);
+	});
+
+	it("ignores a progress frame for a tool the store never saw", async () => {
+		// Such a frame belongs to an already-persisted card; acting on it would
+		// resurrect a synthetic duplicate beside the real one.
+		const mod = await load();
+		const store = mod.createStreamingToolStore();
+		expect(mod.applyStreamingToolProgress(store, "ghost", { completed: 1, total: 2 })).toBe(false);
+		expect(store.size).toBe(0);
+	});
+});
+
 describe("per-tool hand-off leaves exactly one card", () => {
 	it("drops the synthetic card once the persisted message carries the tool", async () => {
 		const mod = await load();

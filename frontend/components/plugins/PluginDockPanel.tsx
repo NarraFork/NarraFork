@@ -17,8 +17,11 @@ import { useTranslation } from "react-i18next";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
 import { pluginContributionStore } from "./PluginContributionStore";
-import { PluginPanelSlot, useOptionalPluginUiRuntime } from "./PluginUiRuntimeProvider";
+import { PluginPanelSlot } from "./PluginUiRuntimeProvider";
 import { usePluginUiSurface } from "./PluginUiSurfaceContext";
+// The hook comes from the context module (a non-component export in the provider breaks
+// its Fast Refresh boundary); the slot component from the provider itself.
+import { useOptionalPluginUiRuntime } from "./plugin-ui-runtime-context";
 import type { PluginDockPanelParams } from "./protocol";
 import { parsePluginDockPanelParams } from "./protocol";
 import { PluginUiHostError } from "./runtime";
@@ -362,10 +365,7 @@ export function PluginDockPanel(props: IDockviewPanelProps<PluginDockPanelParams
 	return <PluginDockPanelView rawParams={props.params} hostApi={hostApi} />;
 }
 
-export const PLUGIN_DOCKVIEW_COMPONENT = "plugin" as const;
-
-export function withPluginDockviewComponent<T extends Record<string, unknown>>(components: T) {
-	return { ...components, [PLUGIN_DOCKVIEW_COMPONENT]: PluginDockPanel };
-}
-
-export const pluginDockviewComponents = { [PLUGIN_DOCKVIEW_COMPONENT]: PluginDockPanel };
+// `PLUGIN_DOCKVIEW_COMPONENT`, `withPluginDockviewComponent` and
+// `pluginDockviewComponents` moved to `plugin-dockview-components.ts`. They are not
+// components, and a non-component export here invalidates this module's Fast Refresh
+// boundary — see that file's header for the measurement.

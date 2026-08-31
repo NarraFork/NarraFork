@@ -233,4 +233,11 @@ export {
 } from "./tutorial";
 export { narratorWsMessageSchema, terminalWsMessageSchema } from "./websocket";
 
-export { createWorkspaceSchema, importProjectSchema, updateWorkspaceSchema } from "./workspaces";
+export {
+	createWorkspacePanelSchema,
+	createWorkspaceSchema,
+	importProjectSchema,
+	saveWorkspaceLayoutSchema,
+	updateWorkspacePanelConfigSchema,
+	updateWorkspaceSchema,
+} from "./workspaces";

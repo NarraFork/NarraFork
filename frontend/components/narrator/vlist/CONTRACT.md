@@ -387,6 +387,27 @@ chunked 路径靠 Mantine `<Collapse>`：正文在正常流里，浏览器补间
 1. **折叠自己那次重建不动档位。** `toggleVListLodUserOverride` 只改 `lodUserOverrides`（作为 per-card opt 抵达 build），`manifest.lod` 来自 `useRenderLod()`，只有缩放手势能动它。所以 LOD morph 的 gate（revision 不变 **且** lod 移动）拒绝它。
 2. **后续重建不能复活折叠的 capture。** 切档和折叠一样**不推进 documentRevision**，所以"折叠后 400ms 内立刻捏合"会同时通过 revision 与年龄两道校验 —— capture 因此额外记录自己的档位，`isFoldCaptureUsable` 一旦发现档位移动就判定失效（语义上也对：capture 拍的是另一套主题下的几何）。
 
+## 4.8 钉底平滑跟随（流式滚动的"不顶跳"契约）
+
+§4.6/§4.7 处理"高度怎么看起来在动"，这一节处理**视口怎么到达新底部**。钉底跟随流式输出时，每条新行/新 toolcall/卡高落地都曾把 `scrollTop` 瞬时写到新底部——相对视口，所有已提交行在一帧内上跳一个增量。现在这些写入走**追赶式平滑跟随**（`vlist-smooth-follow.ts`：纯算步进/门控 + rAF 控制器，与 fold-animation/fold-motion 同一分层范式）：提交帧画面保持不动，随后视口指数趋近（TAU=100ms，速度上限 4000px/s）滑行到**每帧重读的实时底部**，新内容从底部滑入。移动目标无需重启动画，无速度突变。
+
+**只钉底跟随写入平滑，其他一切写入保持瞬时。** 三条底部写入路径统一经 `follower.ensure()` 路由（门控失败时内部回退到与改造前逐字节相同的瞬时写）：流式 bottom 锚点修正（`onScrollTopCorrection`）、几何 revision pin effect、`processScrollFrame` 的 re-glue。item 锚点修正、marker 跳转、reveal 跳转、`scrollToBottom(instant)` 保持瞬时——锚定修正的全部意义在于不可见，导航跳转是读者的显式动作。
+
+**门控是一条纯算术规则**：`delta = 实时底部 − 当前 scrollTop`，仅当 `0 < delta <= smoothFollowMaxDelta(viewport)`（= clamp(1.5×vh, 480, 2000)）且非 reduced-motion 才滑行。这一条自动区分：流式增量（小 delta → 滑行）vs 首次加载/切换叙述者/prepend 重吸附/巨型落地（大 delta → 瞬时）、回退缩文档（delta ≤ 0 → 瞬时）。**但它不单独够用**：fold/LOD 重建也能产生小 delta，而它们各自拥有 FLIP/morph 几何。所以另有两道配合：
+
+1. **成因标记 `scrollTopSmoothFollow`**（coordinator 快照 → `usePretextDocument` → `onScrollTopCorrection` 第三参）。只有 `setStreamingMessage` / `appendMessage` / `applyLivePatch` 三个**尾部增长**提交携带它；rebuild/remove/insert/replace/trim/restore/prepend 一律不携带。没有标记的 bottom 修正（如钉底下的 prepend 重吸附）几何上与流式增量不可区分——钉底时两者的 delta 都是"距新底部一小段"——所以成因必须由协调器盖章，shell 不得嗅探。契约测试在 `pretext-layout-coordinator.test.ts` 的 stamping 组。
+2. **几何占有转换前吸附**：`captureFoldBefore` 与 LOD 的 `emit`/`prepareLodChange` 先调 `snapToTarget()`（无追赶时为空操作）。钉底下的 fold FLIP 按 `getScrollBottomTarget` **预测** afterScrollTop，追赶滞后会毁掉视口坐标 delta。
+
+**追赶期间的三条不变量**（都有守卫断言，见 `vlist-scroll-pin.test.ts` 的 smooth-follow 组）：
+
+- **`readCurrentView` 必须把活跃追赶视为钉底。** 追赶中视口滞后底部一个残差，裸几何读数会报"未钉底"→ 每条流式提交捕获 item 锚点 → 其修正取消本应喂给它的追赶（自残死循环）。活跃追赶即"钉底在途中"。
+- **追赶死于每一种读者意图。** `detachFromBottom`（wheel-up）、`processScrollFrame` 判出的非回声上滑、scrollToBottom/marker/reveal 跳转、卸载，全部 cancel。值基回声抑制与 `isBottomLostToContentGrowth` 天然兼容追赶写入：`processScrollFrame` 读 DOM 实时值，单调递增的追赶写入永远不会被误判为"用户上滑"（上滑 = scrollTop 下降 > 1px）。
+- **追赶逐帧用轻量写**（DOM + refs + 抑制簿记，不推进 React state）；写入产生的 scroll 事件走 `processScrollFrame` 既有窗口门控推进 state。落定的最后一帧用完整写收敛 state。直接 `setScrollTop` 每帧全量重渲染是明确要避免的。
+
+**为什么不用 CSS `scroll-behavior: smooth`**：逐帧写会不断重启浏览器补间（移动目标下永远追不上或攒延迟）、无法控制速度/阈值、且会污染锚定修正等必须瞬时的写入（该属性是容器级的，按写切换它会把时序复杂度搬回 shell）。
+
+`prefers-reduced-motion: reduce` 下 `ensure()` 恒走瞬时写——行为与改造前完全一致，且这不是可选优化而是可达性契约（复用 vlist-fold-motion 的 `prefersReducedMotion()`）。
+
 ## 5. 测试约定
 
 - **canvas stub**：measure 测试 `beforeAll(() => installCanvasStub())`（见 `measure/test-canvas-stub.ts`），提供确定性 measureText（每字符=0.6×fontSize）。**必须在 import pretext-backed 模块之前调用**（用动态 `await import()`）。

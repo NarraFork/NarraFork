@@ -1084,6 +1084,178 @@ describe("classifyToolDetail — share", () => {
 	});
 });
 
+describe("classifyToolDetail — transfer", () => {
+	it("renders a REAL determinate bar from the measurement, not ascii text", () => {
+		// The bar is a structured row the render layer paints with a Progress
+		// element. Carrying it as text would mean the client re-parses the producer's
+		// own formatting, and the bar could neither animate nor be styled.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "running",
+			inputJson: { direction: "upload", remotePath: "/r/app.apk", localPath: "/l/app.apk" },
+			metadata: {
+				_structuredProgress: {
+					completed: 4 * 1024 * 1024,
+					total: 10 * 1024 * 1024,
+					elapsedMs: 2000,
+				},
+			},
+		});
+		const bar = metaRowsOf(d).rows.find((r) => r.progress);
+		expect(bar?.progress?.ratio).toBeCloseTo(0.4, 5);
+		expect(bar?.progress?.percent).toBe(40);
+		expect(bar?.progress?.figures).toContain("4.0 MB / 10.0 MB");
+		expect(bar?.progress?.active).toBe(true);
+	});
+
+	it("marks the bar INDETERMINATE when the total is unknown", () => {
+		// An upload reports no total. A ratio of 0 would paint a bar frozen at zero,
+		// which reads as a stalled transfer rather than as an unmeasurable one.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "running",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+			metadata: { _structuredProgress: { completed: 4 * 1024 * 1024, elapsedMs: 2000 } },
+		});
+		const bar = metaRowsOf(d).rows.find((r) => r.progress);
+		expect(bar?.progress?.ratio).toBeNull();
+		expect(bar?.progress?.percent).toBeUndefined();
+	});
+
+	it("suppresses the ascii text body while the real bar is showing", () => {
+		// Both channels describe the same instant; showing them together would say it
+		// twice, once badly.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "running",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+			metadata: {
+				_structuredProgress: { completed: 100, total: 1000, elapsedMs: 1000 },
+				_streamingOutput: "upload → pad7s — 10%",
+			},
+		});
+		const hasTextBody = asSections(d).sections.some((s) => s.body.kind === "capped");
+		expect(hasTextBody).toBe(false);
+	});
+
+	it("falls back to the streamed TEXT when no measurement arrived", () => {
+		// An older payload, or a producer that only wired the text channel.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "running",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+			metadata: { _streamingOutput: "upload → pad7s — 40%\n4.0 MB / 10.0 MB" },
+		});
+		expect(cappedSectionBody(d, "streaming-bash").text).toContain("4.0 MB / 10.0 MB");
+	});
+
+	it("drops the bar once the call is terminal", () => {
+		// A finished transfer's bar would sit at 100% forever, saying nothing the
+		// summary line does not already say.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "success",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+			outputJson: "Uploaded 10.0 MB",
+			metadata: {
+				_structuredProgress: { completed: 10, total: 10, elapsedMs: 1000 },
+			},
+		});
+		expect(metaRowsOf(d).rows.some((r) => r.progress)).toBe(false);
+	});
+
+	it("uses the persisted output once the transfer finishes", () => {
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "success",
+			inputJson: { direction: "upload", remotePath: "/r/app.apk", localPath: "/l/app.apk" },
+			outputJson: "Uploaded 10.0 MB — /l/app.apk → pad7s:/r/app.apk in 5s, 2.0 MB/s.",
+			metadata: { transferDirection: "upload", deviceName: "pad7s" },
+		});
+		expect(cappedSectionBody(d, "term").text).toContain("Uploaded 10.0 MB");
+	});
+
+	it("badges the direction, device, size and rate", () => {
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "success",
+			inputJson: { direction: "download", remotePath: "/r/f", localPath: "/l/f" },
+			outputJson: "done",
+			metadata: {
+				transferDirection: "download",
+				deviceName: "pad7s",
+				bytesFormatted: "48.0 MB",
+				rateFormatted: "2.1 MB/s",
+				filesTransferred: 12,
+				recursive: true,
+			},
+		});
+		expect(metaBadgeLabels(d)).toEqual([
+			"download",
+			"pad7s",
+			"recursive",
+			"48.0 MB",
+			"2.1 MB/s",
+			"12 files",
+		]);
+	});
+
+	it("orders the path row source → destination per direction", () => {
+		// An arrow is the only thing telling the reader which side is which, so it
+		// must follow the transfer, not the argument order.
+		const up = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "success",
+			inputJson: { direction: "upload", remotePath: "/remote/x", localPath: "/local/x" },
+			outputJson: "ok",
+		});
+		expect(metaTexts(up)).toContain("/local/x  →  /remote/x");
+		const down = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "success",
+			inputJson: { direction: "download", remotePath: "/remote/x", localPath: "/local/x" },
+			outputJson: "ok",
+		});
+		expect(metaTexts(down)).toContain("/remote/x  →  /local/x");
+	});
+
+	it("keeps the header and reports the failure when a transfer errors with no body", () => {
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "fail",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+		});
+		expect(metaTexts(d)).toContain("/l/f  →  /r/f");
+		expect((sectionBody(d, "error") as ToolErrorDetail).kind).toBe("error");
+	});
+
+	it("shows a failure message exactly once, not beside a placeholder", () => {
+		// The trailing `withErrorSection` pass appends `errorMessage` to whatever the
+		// classifier returned, so emitting our own placeholder unconditionally would
+		// print the failure twice.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "fail",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+			errorMessage: "Device pad7s is offline.",
+		});
+		const errors = asSections(d).sections.filter((s) => s.body.kind === "error");
+		expect(errors.length).toBe(1);
+		expect((errors[0]?.body as ToolErrorDetail).text).toBe("Device pad7s is offline.");
+	});
+});
+
 describe("classifyToolDetail — recall", () => {
 	it("keeps each search hit as its own entry (role badge + title + snippet)", () => {
 		const d = classifyToolDetail({
