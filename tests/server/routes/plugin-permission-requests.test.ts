@@ -55,15 +55,26 @@ class PendingPermissionManager implements PluginManager {
 	}
 
 	getPermissions(): unknown {
-		return { pluginId: "com.example.demo", installationId: "installation-1", revision: 3, grants: [] };
+		return {
+			pluginId: "com.example.demo",
+			installationId: "installation-1",
+			revision: 3,
+			grants: [],
+		};
 	}
 
 	replacePermissions(): unknown {
-		return { status: { pluginId: "com.example.demo", desiredState: "enabled" }, permissions: { grants: [] } };
+		return {
+			status: { pluginId: "com.example.demo", desiredState: "enabled" },
+			permissions: { grants: [] },
+		};
 	}
 
 	revokePermissions(): unknown {
-		return { status: { pluginId: "com.example.demo", desiredState: "enabled" }, permissions: { grants: [] } };
+		return {
+			status: { pluginId: "com.example.demo", desiredState: "enabled" },
+			permissions: { grants: [] },
+		};
 	}
 
 	async install(): Promise<unknown> {
@@ -91,8 +102,15 @@ class PendingPermissionManager implements PluginManager {
 		return Promise.resolve(this.requests);
 	}
 
-	async approvePermissionRequest(pluginId: string, requestId: string, grantedBy: unknown): Promise<unknown> {
-		this.calls.push({ method: "approvePermissionRequest", value: { pluginId, requestId, grantedBy } });
+	async approvePermissionRequest(
+		pluginId: string,
+		requestId: string,
+		grantedBy: unknown,
+	): Promise<unknown> {
+		this.calls.push({
+			method: "approvePermissionRequest",
+			value: { pluginId, requestId, grantedBy },
+		});
 		return this.approveMutation;
 	}
 
@@ -133,7 +151,10 @@ describe("plugin permission request routes", () => {
 		expect(response.status).toBe(200);
 		const body = (await response.json()) as { status: { desiredState: string } };
 		expect(body.status.desiredState).toBe("enabled");
-		const call = manager.calls.at(-1) as { method: string; value: { requestId: string; grantedBy: unknown } };
+		const call = manager.calls.at(-1) as {
+			method: string;
+			value: { requestId: string; grantedBy: unknown };
+		};
 		expect(call.method).toBe("approvePermissionRequest");
 		expect(call.value.requestId).toBe("req-1");
 		expect(call.value.grantedBy).toBe("admin");
@@ -148,7 +169,10 @@ describe("plugin permission request routes", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ denied: true });
 		expect(manager.calls).toEqual([
-			{ method: "denyPermissionRequest", value: { pluginId: "com.example.demo", requestId: "req-1" } },
+			{
+				method: "denyPermissionRequest",
+				value: { pluginId: "com.example.demo", requestId: "req-1" },
+			},
 		]);
 	});
 
@@ -165,10 +189,9 @@ describe("plugin permission request routes", () => {
 	it("rejects malformed request ids with 400", async () => {
 		const app = createApp(new PendingPermissionManager());
 		for (const requestId of ["   ", "x".repeat(257)]) {
-			const response = await app.request(
-				`/com.example.demo/grants/requests/${requestId}/approve`,
-				{ method: "POST" },
-			);
+			const response = await app.request(`/com.example.demo/grants/requests/${requestId}/approve`, {
+				method: "POST",
+			});
 			expect(response.status).toBe(400);
 		}
 	});

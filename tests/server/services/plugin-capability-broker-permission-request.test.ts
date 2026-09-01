@@ -56,12 +56,14 @@ function context(overrides: Partial<HostCallContext> = {}): HostCallContext {
 
 describe("CapabilityBroker permission request on denial", () => {
 	test("un-granted capability fires onPermissionRequest and attaches pendingRequestId", async () => {
-		const callback = mock<(input: PluginPermissionRequestInput) => Promise<{ requestId: string } | undefined> | { requestId: string } | undefined>(async () => ({ requestId: "pending-req-1" }));
+		const callback = mock<
+			(
+				input: PluginPermissionRequestInput,
+			) => Promise<{ requestId: string } | undefined> | { requestId: string } | undefined
+		>(async () => ({ requestId: "pending-req-1" }));
 
 		const capabilityBroker = new CapabilityBroker({
-			bindings: new Map([
-				[principal.pluginId, makeBinding({ installationGrants: [] })],
-			]),
+			bindings: new Map([[principal.pluginId, makeBinding({ installationGrants: [] })]]),
 			now: () => now,
 			onPermissionRequest: callback,
 		} as never);
@@ -87,12 +89,14 @@ describe("CapabilityBroker permission request on denial", () => {
 	});
 
 	test("callback returning undefined does not add pendingRequestId", async () => {
-		const callback = mock<(input: PluginPermissionRequestInput) => Promise<{ requestId: string } | undefined> | { requestId: string } | undefined>(() => undefined);
+		const callback = mock<
+			(
+				input: PluginPermissionRequestInput,
+			) => Promise<{ requestId: string } | undefined> | { requestId: string } | undefined
+		>(() => undefined);
 
 		const capabilityBroker = new CapabilityBroker({
-			bindings: new Map([
-				[principal.pluginId, makeBinding({ installationGrants: [] })],
-			]),
+			bindings: new Map([[principal.pluginId, makeBinding({ installationGrants: [] })]]),
 			now: () => now,
 			onPermissionRequest: callback,
 		} as never);
@@ -109,12 +113,14 @@ describe("CapabilityBroker permission request on denial", () => {
 	});
 
 	test("granted capability succeeds and does NOT fire onPermissionRequest", async () => {
-		const callback = mock<(input: PluginPermissionRequestInput) => Promise<{ requestId: string } | undefined> | { requestId: string } | undefined>(() => ({ requestId: "should-not-appear" }));
+		const callback = mock<
+			(
+				input: PluginPermissionRequestInput,
+			) => Promise<{ requestId: string } | undefined> | { requestId: string } | undefined
+		>(() => ({ requestId: "should-not-appear" }));
 
 		const capabilityBroker = new CapabilityBroker({
-			bindings: new Map([
-				[principal.pluginId, makeBinding()],
-			]),
+			bindings: new Map([[principal.pluginId, makeBinding()]]),
 			now: () => now,
 			onPermissionRequest: callback,
 		} as never);
@@ -126,7 +132,11 @@ describe("CapabilityBroker permission request on denial", () => {
 	});
 
 	test("plugin disabled denial does NOT fire onPermissionRequest", async () => {
-		const callback = mock<(input: PluginPermissionRequestInput) => Promise<{ requestId: string } | undefined> | { requestId: string } | undefined>(() => ({ requestId: "should-not-appear" }));
+		const callback = mock<
+			(
+				input: PluginPermissionRequestInput,
+			) => Promise<{ requestId: string } | undefined> | { requestId: string } | undefined
+		>(() => ({ requestId: "should-not-appear" }));
 
 		const capabilityBroker = new CapabilityBroker({
 			bindings: new Map([
@@ -152,7 +162,11 @@ describe("CapabilityBroker permission request on denial", () => {
 	});
 
 	test("plugin quarantine denial does NOT fire onPermissionRequest", async () => {
-		const callback = mock<(input: PluginPermissionRequestInput) => Promise<{ requestId: string } | undefined> | { requestId: string } | undefined>(() => ({ requestId: "should-not-appear" }));
+		const callback = mock<
+			(
+				input: PluginPermissionRequestInput,
+			) => Promise<{ requestId: string } | undefined> | { requestId: string } | undefined
+		>(() => ({ requestId: "should-not-appear" }));
 
 		const capabilityBroker = new CapabilityBroker({
 			bindings: new Map([
@@ -183,9 +197,7 @@ describe("CapabilityBroker permission request on denial", () => {
 		});
 
 		const capabilityBroker = new CapabilityBroker({
-			bindings: new Map([
-				[principal.pluginId, makeBinding({ installationGrants: [] })],
-			]),
+			bindings: new Map([[principal.pluginId, makeBinding({ installationGrants: [] })]]),
 			now: () => now,
 			onPermissionRequest: callback,
 		} as never);
@@ -209,9 +221,7 @@ describe("CapabilityBroker permission request on denial", () => {
 		});
 
 		const capabilityBroker = new CapabilityBroker({
-			bindings: new Map([
-				[principal.pluginId, makeBinding({ installationGrants: [] })],
-			]),
+			bindings: new Map([[principal.pluginId, makeBinding({ installationGrants: [] })]]),
 			now: () => now,
 			onPermissionRequest: callback,
 		} as never);
@@ -232,9 +242,7 @@ describe("CapabilityBroker permission request on denial", () => {
 		});
 
 		const capabilityBroker = new CapabilityBroker({
-			bindings: new Map([
-				[principal.pluginId, makeBinding({ installationGrants: [] })],
-			]),
+			bindings: new Map([[principal.pluginId, makeBinding({ installationGrants: [] })]]),
 			now: () => now,
 			onPermissionRequest: callback,
 		} as never);

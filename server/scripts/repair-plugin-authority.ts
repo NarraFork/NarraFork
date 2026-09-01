@@ -21,11 +21,12 @@
  *   --force-unlock takes the DB lock over a dead lock file (use only when
  *   you are certain no NarraFork instance is running).
  */
-import { createHash, randomUUID } from "node:crypto";
+
+import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import { Database } from "bun:sqlite";
+import { join } from "node:path";
 import { adaptPluginCapability } from "../lib/integrations/capability-adapters";
 
 const DEFAULT_PLUGIN_ID = "com.whisent.narrator-team";
@@ -56,10 +57,6 @@ function scopeKey(scope: { type: string; id?: string }): string {
 	return scope.type === "global" ? "global" : `${scope.type}:${scope.id}`;
 }
 
-function hashHexOf(value: string): string {
-	return createHash("sha256").update(value).digest("hex");
-}
-
 interface ParsedArgs {
 	pluginId: string;
 	dryRun: boolean;
@@ -87,7 +84,9 @@ function assertNoLiveInstance(home: string, forceUnlock: boolean): void {
 		const running = /narrafork|bun/i.test(alive) && alive.includes(String(lock.pid));
 		if (running) {
 			if (forceUnlock) {
-				console.warn(`[repair] WARN: lock pid ${lock.pid} appears alive; --force-unlock taken (proceed at your own risk)`);
+				console.warn(
+					`[repair] WARN: lock pid ${lock.pid} appears alive; --force-unlock taken (proceed at your own risk)`,
+				);
 				return;
 			}
 			console.error(
@@ -131,7 +130,14 @@ interface Plan {
 
 function buildPlan(home: string, pluginId: string): Plan {
 	const state = readJson(join(home, "plugins", "state.json")) as {
-		plugins?: Record<string, { installationId?: string | null; current?: { hash?: string }; grants?: { count?: number; capabilities?: string[] } }>;
+		plugins?: Record<
+			string,
+			{
+				installationId?: string | null;
+				current?: { hash?: string };
+				grants?: { count?: number; capabilities?: string[] };
+			}
+		>;
 	};
 	const perms = readJson(join(home, "plugins", "permissions.json")) as {
 		plugins?: Record<string, Record<string, { grants?: MirrorGrant[] }>>;
@@ -149,9 +155,7 @@ function buildPlan(home: string, pluginId: string): Plan {
 		mirrorGrants = perms.plugins?.[pluginId]?.[installationId]?.grants ?? [];
 	}
 	const canonicalCaps = new Set(
-		mirrorGrants.length > 0
-			? mirrorGrants.map((g) => g.capability)
-			: summaryCaps,
+		mirrorGrants.length > 0 ? mirrorGrants.map((g) => g.capability) : summaryCaps,
 	);
 	if (mirrorGrants.length === 0) {
 		mirrorGrants = [...canonicalCaps].map((capability) => ({
@@ -175,7 +179,12 @@ function buildPlan(home: string, pluginId: string): Plan {
 		.query(
 			"SELECT id, state, revision, metadata_json FROM integration_authorities WHERE integration_type='plugin' AND integration_id=? ORDER BY created_at",
 		)
-		.all(pluginId) as Array<{ id: string; state: string; revision: number; metadata_json: string | null }>;
+		.all(pluginId) as Array<{
+		id: string;
+		state: string;
+		revision: number;
+		metadata_json: string | null;
+	}>;
 	db.close();
 
 	let authorityId: string | undefined;
@@ -197,7 +206,9 @@ function buildPlan(home: string, pluginId: string): Plan {
 			if (r.id === authorityId) return false;
 			let metaInstallationId: string | undefined;
 			try {
-				metaInstallationId = r.metadata_json ? (JSON.parse(r.metadata_json) as { installationId?: string }).installationId : undefined;
+				metaInstallationId = r.metadata_json
+					? (JSON.parse(r.metadata_json) as { installationId?: string }).installationId
+					: undefined;
 			} catch {
 				metaInstallationId = undefined;
 			}
@@ -254,14 +265,7 @@ function executePlan(home: string, plan: Plan, dryRun: boolean): void {
 		if (!plan.authorityExists) {
 			db.query(
 				"INSERT INTO integration_authorities (id, kind, integration_type, integration_id, state, revision, policy_json, metadata_json, expires_at, created_at, updated_at) VALUES (?, 'plugin_installation', 'plugin', ?, 'active', ?, NULL, ?, NULL, ?, ?)",
-			).run(
-				authorityId,
-				plan.pluginId,
-				nextRevision,
-				JSON.stringify({ installationId }),
-				now,
-				now,
-			);
+			).run(authorityId, plan.pluginId, nextRevision, JSON.stringify({ installationId }), now, now);
 		} else {
 			db.query(
 				"UPDATE integration_authorities SET revision=?, updated_at=? WHERE id=? AND revision=?",
@@ -277,9 +281,10 @@ function executePlan(home: string, plan: Plan, dryRun: boolean): void {
 			if (!adapted) continue;
 			const grantId = grant.grantId ?? `legacy-${plan.pluginId}-${grant.capability}`.slice(0, 128);
 			const grantedBy = grant.grantedBy ?? "legacy-api";
-			const constraintsJson = grant.constraints && Object.keys(grant.constraints).length > 0
-				? JSON.stringify(grant.constraints)
-				: null;
+			const constraintsJson =
+				grant.constraints && Object.keys(grant.constraints).length > 0
+					? JSON.stringify(grant.constraints)
+					: null;
 			db.query(
 				"INSERT INTO integration_capability_grants (id, authority_id, capability_id, scope_type, scope_id, scope_key, constraints_json, expires_at, revoked_at, created_by_type, created_by_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
 			).run(
@@ -336,9 +341,7 @@ function verify(home: string, plan: Plan): void {
 	const db = new Database(join(home, "narrafork.db"), { readonly: true });
 	if (plan.authorityId) {
 		const row = db
-			.query(
-				"SELECT state, revision FROM integration_authorities WHERE id=?",
-			)
+			.query("SELECT state, revision FROM integration_authorities WHERE id=?")
 			.get(plan.authorityId) as { state: string; revision: number } | undefined;
 		const grants = db
 			.query(
@@ -357,25 +360,35 @@ function verify(home: string, plan: Plan): void {
 		.all(plan.pluginId) as Array<{ id: string; metadata_json: string | null }>;
 	const nonUuidActive = remainingActive.filter((r) => {
 		try {
-			const meta = r.metadata_json ? (JSON.parse(r.metadata_json) as { installationId?: string }) : undefined;
+			const meta = r.metadata_json
+				? (JSON.parse(r.metadata_json) as { installationId?: string })
+				: undefined;
 			return meta?.installationId === undefined || !isStableInstallationId(meta.installationId);
 		} catch {
 			return true;
 		}
 	});
-	console.log(`[repair] remaining active authorities: ${remainingActive.length} (non-UUID: ${nonUuidActive.length})`);
+	console.log(
+		`[repair] remaining active authorities: ${remainingActive.length} (non-UUID: ${nonUuidActive.length})`,
+	);
 	db.close();
 }
 
 function main(): void {
 	const args = parseArgs(process.argv.slice(2));
-	const home = process.env.NARRATEFORK_HOME ?? join(homedir(), ".narrafork");
+	// NARRAFORK_HOME, not NARRATEFORK_HOME: a typo here silently falls back to
+	// ~/.narrafork, so on an installation with a custom data dir the script would
+	// inspect and repair a DIFFERENT database than the one actually in use — and
+	// report success either way.
+	const home = process.env.NARRAFORK_HOME?.trim() || join(homedir(), ".narrafork");
 	assertNoLiveInstance(home, args.forceUnlock);
 	const plan = buildPlan(home, args.pluginId);
 	console.log(`[repair] plugin: ${plan.pluginId}`);
 	console.log(`[repair] installationId (UUID): ${plan.installationId ?? "(none)"}`);
 	console.log(`[repair] package hash: ${plan.stateHash?.slice(0, 16) ?? "(none)"}`);
-	console.log(`[repair] canonical authority exists: ${plan.authorityExists} (state=${plan.authorityState ?? "n/a"}, revision=${plan.authorityRevision})`);
+	console.log(
+		`[repair] canonical authority exists: ${plan.authorityExists} (state=${plan.authorityState ?? "n/a"}, revision=${plan.authorityRevision})`,
+	);
 	console.log(`[repair] grants to write: ${plan.grantsToWrite.length}`);
 	console.log(`[repair] legacy authorities to retire: ${plan.legacyToRevoke.length}`);
 	executePlan(home, plan, args.dryRun);

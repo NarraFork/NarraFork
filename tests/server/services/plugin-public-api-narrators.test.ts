@@ -291,7 +291,7 @@ describe("narrafork.narrator.send_message (public API surface)", () => {
 					};
 				},
 				async specTaskAdd() {
-					return { added: false, taskText: "", revisionId: null };
+					return { added: false, taskText: "", protected: false, revisionId: null };
 				},
 				async specBehaviorFenceUpdate() {
 					return { updated: false, revisionId: null };
@@ -366,7 +366,7 @@ describe("narrafork.narrator.send_message (public API surface)", () => {
 					};
 				},
 				async specTaskAdd() {
-					return { added: false, taskText: "", revisionId: null };
+					return { added: false, taskText: "", protected: false, revisionId: null };
 				},
 				async specBehaviorFenceUpdate() {
 					return { updated: false, revisionId: null };
@@ -435,7 +435,7 @@ describe("narrafork.narrator.send_message (public API surface)", () => {
 					};
 				},
 				async specTaskAdd() {
-					return { added: false, taskText: "", revisionId: null };
+					return { added: false, taskText: "", protected: false, revisionId: null };
 				},
 				async specBehaviorFenceUpdate() {
 					return { updated: false, revisionId: null };
@@ -502,7 +502,7 @@ describe("narrafork.narrator.interrupt (public API surface)", () => {
 					};
 				},
 				async specTaskAdd() {
-					return { added: false, taskText: "", revisionId: null };
+					return { added: false, taskText: "", protected: false, revisionId: null };
 				},
 				async specBehaviorFenceUpdate() {
 					return { updated: false, revisionId: null };
@@ -684,7 +684,7 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 				return {} as never;
 			},
 			async specTaskAdd() {
-				return { added: false, taskText: "", revisionId: null };
+				return { added: false, taskText: "", protected: false, revisionId: null };
 			},
 			async specBehaviorFenceUpdate() {
 				return { updated: false, revisionId: null };
@@ -773,7 +773,7 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 				return {} as never;
 			},
 			async specTaskAdd() {
-				return { added: false, taskText: "", revisionId: null };
+				return { added: false, taskText: "", protected: false, revisionId: null };
 			},
 			async specBehaviorFenceUpdate() {
 				return { updated: false, revisionId: null };
@@ -842,7 +842,7 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 				return {} as never;
 			},
 			async specTaskAdd() {
-				return { added: false, taskText: "", revisionId: null };
+				return { added: false, taskText: "", protected: false, revisionId: null };
 			},
 			async specBehaviorFenceUpdate() {
 				return { updated: false, revisionId: null };
@@ -911,7 +911,7 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 				return {} as never;
 			},
 			async specTaskAdd() {
-				return { added: false, taskText: "", revisionId: null };
+				return { added: false, taskText: "", protected: false, revisionId: null };
 			},
 			async specBehaviorFenceUpdate() {
 				return { updated: false, revisionId: null };
@@ -976,7 +976,7 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 				return {} as never;
 			},
 			async specTaskAdd() {
-				return { added: false, taskText: "", revisionId: null };
+				return { added: false, taskText: "", protected: false, revisionId: null };
 			},
 			async specBehaviorFenceUpdate() {
 				return { updated: false, revisionId: null };

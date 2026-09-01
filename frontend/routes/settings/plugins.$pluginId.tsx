@@ -26,8 +26,8 @@ import {
 	IconTrash,
 	IconX,
 } from "@tabler/icons-react";
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
@@ -38,6 +38,7 @@ import { PluginSettingsSurfacePanel } from "../../components/plugins-admin/Plugi
 import { PluginStatusBadge } from "../../components/plugins-admin/PluginStatusBadge";
 
 import {
+	pluginKeys,
 	useActivatePlugin,
 	useDisablePlugin,
 	useEnablePlugin,
@@ -47,7 +48,6 @@ import {
 	usePluginPermissionRequests,
 	useRetryPlugin,
 	useUninstallPlugin,
-	pluginKeys,
 } from "../../hooks/usePlugins";
 import type { PluginDetail } from "../../lib/api/plugins";
 import { pluginsApi } from "../../lib/api/plugins";
@@ -255,7 +255,7 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 						capability,
 						scope: {
 							type: newScopeType,
-							id: newScopeType === "global" ? undefined : (newScopeId.trim() || undefined),
+							id: newScopeType === "global" ? undefined : newScopeId.trim() || undefined,
 						},
 					},
 				],
@@ -308,8 +308,8 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 		try {
 			const existing = set.grants.map((grant) => ({
 				capability: grant.capability,
-			scope: grant.scope,
-		}));
+				scope: grant.scope,
+			}));
 			await pluginsApi.replaceGrants(plugin.pluginId, {
 				expectedRevision: set.revision,
 				grants: [...existing, { capability, scope: { type: "global" } }],
@@ -337,12 +337,7 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 					<Button size="xs" variant="light" onClick={() => invalidateGrants()} disabled={busy}>
 						{t("admin.detail.grants.refresh")}
 					</Button>
-					<Button
-						size="xs"
-						variant="outline"
-						onClick={() => setAdding((v) => !v)}
-						disabled={busy}
-					>
+					<Button size="xs" variant="outline" onClick={() => setAdding((v) => !v)} disabled={busy}>
 						{t("admin.detail.grants.add")}
 					</Button>
 				</Group>
@@ -374,7 +369,11 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 								/>
 							</Field>
 						</Group>
-						<Button size="xs" onClick={() => void addGrant()} disabled={busy || !newCapability.trim()}>
+						<Button
+							size="xs"
+							onClick={() => void addGrant()}
+							disabled={busy || !newCapability.trim()}
+						>
 							{t("admin.detail.grants.addSubmit")}
 						</Button>
 					</Stack>
@@ -391,6 +390,16 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 								{pendingRequests.length}
 							</Badge>
 						</Group>
+						{/* An upgrade request is a different decision from a runtime prompt: the
+						    plugin did not ask for the capability, a NEW VERSION declared it and the
+						    host withheld it. Saying so is the whole point of the fail-closed
+						    upgrade path — an unlabelled row reads as "the plugin needs this", which
+						    is exactly the framing that makes silent widening feel acceptable. */}
+						{pendingRequests.some((req) => req.source === "upgrade") && (
+							<Text size="xs" c="dimmed">
+								{t("admin.detail.grants.pendingUpgradeHint")}
+							</Text>
+						)}
 						{pendingRequests.map((req) => (
 							<Paper key={req.requestId} withBorder p="xs" radius="md">
 								<Group justify="space-between" wrap="nowrap">
@@ -402,6 +411,15 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 											{req.scope.type}
 											{req.scope.id ? `:${req.scope.id}` : ""}
 										</Badge>
+										{req.source === "upgrade" && (
+											<Badge color="yellow" variant="light" size="sm">
+												{req.requestedForVersion
+													? t("admin.detail.grants.pendingSourceUpgradeVersion", {
+															version: req.requestedForVersion,
+														})
+													: t("admin.detail.grants.pendingSourceUpgrade")}
+											</Badge>
+										)}
 										<Text size="xs" c="dimmed">
 											{formatLocaleDateTime(req.requestedAt)}
 										</Text>

@@ -3731,33 +3731,35 @@ export function NarratorPanel({
 			version: string;
 			hash: string;
 		}) => {
-		const api = dockApiRef?.current;
-		if (!api) return;
-		// A plugin contribution is a singleton per narrator surface: re-picking it
-		// from the picker must focus the existing panel, not stack a second
-		// instance (each addPanel gets a fresh panelInstanceId).
-		const existingPlugin = api.panels.find((panel) => {
-			const params = panel.params as { panelType?: string; pluginId?: string; contributionId?: string } | undefined;
-			return (
-				params?.panelType === "plugin" &&
-				params.pluginId === pick.pluginId &&
-				params.contributionId === pick.contributionId
-			);
-		});
-		if (existingPlugin) {
-			existingPlugin.api.setActive();
-			return;
-		}
-		// Stack into the cluster's secondary group when one exists, otherwise
-		// split right of the chat/narrator panel (mirrors openToolPanel).
-		const request = buildPluginDockPanelOpenRequest({
-			pick,
-			hostContext: pluginSurface
-				? { ...pluginSurface.hostContext, narratorId, chapterId, projectId }
-				: undefined,
-			panels: api.panels,
-		});
-		api.addPanel(request);
+			const api = dockApiRef?.current;
+			if (!api) return;
+			// A plugin contribution is a singleton per narrator surface: re-picking it
+			// from the picker must focus the existing panel, not stack a second
+			// instance (each addPanel gets a fresh panelInstanceId).
+			const existingPlugin = api.panels.find((panel) => {
+				const params = panel.params as
+					| { panelType?: string; pluginId?: string; contributionId?: string }
+					| undefined;
+				return (
+					params?.panelType === "plugin" &&
+					params.pluginId === pick.pluginId &&
+					params.contributionId === pick.contributionId
+				);
+			});
+			if (existingPlugin) {
+				existingPlugin.api.setActive();
+				return;
+			}
+			// Stack into the cluster's secondary group when one exists, otherwise
+			// split right of the chat/narrator panel (mirrors openToolPanel).
+			const request = buildPluginDockPanelOpenRequest({
+				pick,
+				hostContext: pluginSurface
+					? { ...pluginSurface.hostContext, narratorId, chapterId, projectId }
+					: undefined,
+				panels: api.panels,
+			});
+			api.addPanel(request);
 		},
 		[dockApiRef, pluginSurface, narratorId, chapterId, projectId],
 	);
@@ -7045,11 +7047,11 @@ export function NarratorPanel({
 
 									if (def.id === "plugins") {
 										return (
-																				<PluginContributionPicker
-																					key={def.id}
-																					onPick={openPluginPanel}
-																					surface="focus"
-																					trigger={
+											<PluginContributionPicker
+												key={def.id}
+												onPick={openPluginPanel}
+												surface="focus"
+												trigger={
 													<Tooltip label={label}>
 														<ActionIcon size="sm" variant="subtle" color="gray" aria-label={label}>
 															<Icon size={16} />
@@ -7099,7 +7101,7 @@ export function NarratorPanel({
 										</Tooltip>
 									);
 								})}
-							{/* TEMPORARY mock-stream harness entry — see ./mock/README-REMOVAL.md.
+								{/* TEMPORARY mock-stream harness entry — see ./mock/README-REMOVAL.md.
 								    Deliberately NOT in the registry: it is debug-only and due for
 								    removal, so it must not occupy a persisted layout id. */}
 								{dock && mockStreamEnabled && (

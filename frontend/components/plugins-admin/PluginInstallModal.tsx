@@ -17,8 +17,8 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useInstallPlugin, useInstallSources, useUploadPlugin } from "../../hooks/usePlugins";
 import { ApiError } from "../../lib/api";
-import { pluginsApi } from "../../lib/api/plugins";
 import type { PluginDetail, PluginPermissionSet } from "../../lib/api/plugins";
+import { pluginsApi } from "../../lib/api/plugins";
 import { localizePluginError } from "./errors";
 
 const SAFE_ARCHIVE_EXTENSIONS = [".nfplugin", ".zip"] as const;
@@ -188,22 +188,14 @@ export function PluginInstallModal({ opened, onClose }: { opened: boolean; onClo
 									checked={checked.has(capability)}
 									disabled={!granted || authorizing}
 									onChange={() => toggleCapability(capability)}
-									description={
-										granted
-											? undefined
-											: t("admin.installModal.authorizeNotGranted")
-									}
+									description={granted ? undefined : t("admin.installModal.authorizeNotGranted")}
 									size="sm"
 								/>
 							);
 						})}
 					</Stack>
 					<Group justify="flex-end" mt="xs">
-						<Button
-							variant="subtle"
-							onClick={close}
-							disabled={authorizing}
-						>
+						<Button variant="subtle" onClick={close} disabled={authorizing}>
 							{t("admin.installModal.authorizeSkip")}
 						</Button>
 						<Button onClick={() => void confirmAuthorization()} loading={authorizing}>

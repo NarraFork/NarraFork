@@ -683,9 +683,9 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	private async readStdout(): Promise<void> {
 		const reader = this.process.stdout.getReader();
 		try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) {
 					this.parser.end();
 					return;
 				}

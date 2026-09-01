@@ -357,7 +357,9 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 		// "working" status is stale — treating it as running would either buffer the
 		// message forever or reject the resume. Let the standalone start path
 		// below (which synthesizes an origin tool-use id) actually run it.
-		const neverStarted = !(await resolveSubagentOriginToolUseId(input.subagentId).catch(() => null));
+		const neverStarted = !(await resolveSubagentOriginToolUseId(input.subagentId).catch(
+			() => null,
+		));
 		if (
 			!manualOverride &&
 			!neverStarted &&

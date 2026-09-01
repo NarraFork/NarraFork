@@ -13,6 +13,7 @@ import { generateId } from "../../lib/id";
 import {
 	analyzeSpecWriteCandidate,
 	appendProtectedSpecTask,
+	appendSpecTaskForExternalActor,
 	clearSpecTasks,
 	deleteSpecFile,
 	forkSpecNamespace,
@@ -259,6 +260,72 @@ describe("appendProtectedSpecTask (/goal command)", () => {
 		const narratorId = `spec-goal-empty-${TAG}`;
 		await createNarrator(narratorId);
 		expect(appendProtectedSpecTask(narratorId, "   ")).rejects.toThrow(/must not be empty/);
+	});
+});
+
+describe("appendSpecTaskForExternalActor (plugin dispatch)", () => {
+	test("an agent-actor append defaults to an ordinary task with no protected lock", async () => {
+		const narratorId = `spec-plugin-plain-${TAG}`;
+		await createNarrator(narratorId);
+
+		const result = await appendSpecTaskForExternalActor(narratorId, "  Run the sweep  ", {
+			protected: false,
+			actor: "agent",
+		});
+		expect(result.added).toBe(true);
+		expect(result.protected).toBe(false);
+
+		const doc = JSON.parse(result.written.content);
+		const task = doc.tasks.find((t: { text: string }) => t.text === "Run the sweep");
+		// `protected` is omitted rather than written as false: the queue format treats a
+		// missing flag as unprotected, and an explicit false would read like a decision.
+		expect(task).toMatchObject({ text: "Run the sweep", status: "todo" });
+		expect(task.protected).toBeUndefined();
+
+		// The decisive assertion: no protected lock row exists, so nothing auto-continues
+		// the narrator and the narrator can close this task on its own.
+		const locks = await db.query.specProtectedTasks.findMany({
+			where: eq(specProtectedTasks.namespaceId, result.written.namespaceId),
+		});
+		expect(locks.some((lock) => lock.text === "Run the sweep")).toBe(false);
+	});
+
+	test("an agent-actor append can still opt in to a protected task, attributed to the agent", async () => {
+		const narratorId = `spec-plugin-protected-${TAG}`;
+		await createNarrator(narratorId);
+
+		const result = await appendSpecTaskForExternalActor(narratorId, "Hold the line", {
+			protected: true,
+			actor: "agent",
+		});
+		expect(result.protected).toBe(true);
+
+		const analysis = await analyzeSpecWriteCandidate(
+			narratorId,
+			"spec://tasks.json",
+			tasksContent({ tasks: [{ text: "Hold the line", status: "done", protected: true }] }),
+		);
+		// Attributed to the assistant, NOT the user. A plugin-dispatched commitment must not
+		// be indistinguishable from one the user made.
+		expect(analysis.protectedMutations[0]?.createdBy).toBe("assistant");
+	});
+
+	test("re-appending reports the existing task's protection rather than the request", async () => {
+		const narratorId = `spec-plugin-existing-${TAG}`;
+		await createNarrator(narratorId);
+
+		await appendSpecTaskForExternalActor(narratorId, "Already here", {
+			protected: false,
+			actor: "agent",
+		});
+		// Asking for protected on a task that already exists unprotected must not claim the
+		// task is now protected — nothing was written, so the report has to match reality.
+		const second = await appendSpecTaskForExternalActor(narratorId, "Already here", {
+			protected: true,
+			actor: "agent",
+		});
+		expect(second.added).toBe(false);
+		expect(second.protected).toBe(false);
 	});
 });
 

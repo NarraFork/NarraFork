@@ -31,7 +31,6 @@ import { shouldShowThinkingChars } from "@shared/progress-phase";
 import {
 	IconBan,
 	IconCheck,
-	IconLoader2,
 	IconPlayerStop,
 	IconShield,
 	IconX,

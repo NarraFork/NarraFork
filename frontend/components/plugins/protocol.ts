@@ -222,9 +222,7 @@ const bindingSchema = z.discriminatedUnion("kind", [
 			surface: z.enum(["focus", "workspace", "director", "settings", "provider-settings"]),
 		})
 		.strict(),
-	z
-		.object({ kind: z.literal("focus-current-narrator"), narratorId: idSchema.optional() })
-		.strict(),
+	z.object({ kind: z.literal("focus-current-narrator"), narratorId: idSchema.optional() }).strict(),
 	z.object({ kind: z.literal("workspace"), workspaceId: idSchema }).strict(),
 	z
 		.object({

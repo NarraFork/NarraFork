@@ -1324,10 +1324,12 @@ export interface NarratorCommandAdapter {
 	specTaskAdd(input: {
 		narratorId: string;
 		text: string;
+		/** Protected tasks are a user commitment; plugins must ask for one explicitly. */
+		protected?: boolean;
 		pluginId: string;
 		context: HostCallContext;
 		signal: AbortSignal;
-	}): Promise<{ added: boolean; taskText: string; revisionId: string | null }>;
+	}): Promise<{ added: boolean; taskText: string; protected: boolean; revisionId: string | null }>;
 	specBehaviorFenceUpdate(input: {
 		narratorId: string;
 		mode: "upsert" | "clear";
@@ -1459,6 +1461,14 @@ export const narratorSpecTaskAddInputSchema = z
 	.object({
 		narratorId: idSchema,
 		text: z.string().trim().min(1).max(1000),
+		/**
+		 * Opt in to a protected task. Defaults to false, and that default is the point:
+		 * a protected task is a *user commitment* — it drives auto-continuation and
+		 * taskReflection, and the narrator cannot retract it. Making it implicit let a
+		 * plugin conscript a narrator into working for it indefinitely without anyone
+		 * asking for that. A plugin that genuinely needs the guarantee must say so.
+		 */
+		protected: z.boolean().optional(),
 	})
 	.strict();
 export const narratorSpecBehaviorFenceUpdateInputSchema = z
@@ -2082,6 +2092,7 @@ export class PluginPublicApi {
 					const result = await adapter.specTaskAdd({
 						narratorId: input.narratorId,
 						text: input.text,
+						protected: input.protected ?? false,
 						pluginId: call.host.plugin.pluginId,
 						context: call.host,
 						signal: call.signal,
@@ -2151,7 +2162,9 @@ export class PluginPublicApi {
 						narratorId: input.narratorId,
 						...(input.title !== undefined ? { title: input.title } : {}),
 						...(input.model !== undefined ? { model: input.model } : {}),
-						...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
+						...(input.reasoningEffort !== undefined
+							? { reasoningEffort: input.reasoningEffort }
+							: {}),
 						...(input.planReflectionAutoApproveOverride !== undefined
 							? { planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride }
 							: {}),
@@ -3192,10 +3205,10 @@ export function createCorePluginPublicApiAdapters(options: {
 						type: narrators.type,
 						status: narrators.status,
 						substatus: narrators.substatus,
-					model: narrators.model,
-					permissionMode: narrators.permissionMode,
-					reasoningEffort: narrators.reasoningEffort,
-					messageCount: narrators.messageCount,
+						model: narrators.model,
+						permissionMode: narrators.permissionMode,
+						reasoningEffort: narrators.reasoningEffort,
+						messageCount: narrators.messageCount,
 						lastMessageAt: narrators.lastMessageAt,
 						createdAt: narrators.createdAt,
 						updatedAt: narrators.updatedAt,
@@ -3342,74 +3355,77 @@ export function createCorePluginPublicApiAdapters(options: {
 					throw mapNarratorCommandError(error);
 				}
 			},
-		async specTaskAdd(input) {
-			if (input.signal.aborted)
-				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
-			try {
-				const result = await session.specTaskAdd(input.narratorId, input.text);
-				return {
-					added: result.added,
-					taskText: result.taskText,
-					revisionId: result.revisionId,
-				};
-			} catch (error) {
-				throw mapNarratorCommandError(error);
-			}
-		},
-		async specBehaviorFenceUpdate(input) {
-			if (input.signal.aborted)
-				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
-			try {
-				const result = await session.specBehaviorFenceUpdate(
-					input.narratorId,
-					input.text ?? "",
-					input.mode,
-				);
-				return {
-					updated: result.updated,
-					revisionId: result.revisionId,
-				};
-			} catch (error) {
-				throw mapNarratorCommandError(error);
-			}
-		},
-		async updateProfile(input) {
-			if (input.signal.aborted)
-				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
-			try {
-				// Resolve existence first so the caller gets a stable NOT_FOUND.
-				await session.getById(input.narratorId);
-				const result = await session.updateProfile(input.narratorId, {
-					...(input.title !== undefined ? { title: input.title } : {}),
-					...(input.model !== undefined ? { model: input.model } : {}),
-					...(input.reasoningEffort !== undefined
-						? { reasoningEffort: input.reasoningEffort }
-						: {}),
-					...(input.planReflectionAutoApproveOverride !== undefined
-						? { planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride }
-						: {}),
-				});
-				return { updated: result.updated };
-			} catch (error) {
-				throw mapNarratorCommandError(error);
-			}
-		},
-		async specWrite(input) {
-			if (input.signal.aborted)
-				throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
-			try {
-				// Resolve existence first so the caller gets a stable NOT_FOUND.
-				await session.getById(input.narratorId);
-				const result = await session.specWrite(input.narratorId, input.uri, input.content);
-				return {
-					path: result.path,
-					uri: result.uri,
-					revisionId: result.revisionId,
-				};
-			} catch (error) {
-				throw mapNarratorCommandError(error);
-			}
-		},
+			async specTaskAdd(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const result = await session.specTaskAdd(input.narratorId, input.text, {
+						protected: input.protected === true,
+					});
+					return {
+						added: result.added,
+						taskText: result.taskText,
+						protected: result.protected,
+						revisionId: result.revisionId,
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async specBehaviorFenceUpdate(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const result = await session.specBehaviorFenceUpdate(
+						input.narratorId,
+						input.text ?? "",
+						input.mode,
+					);
+					return {
+						updated: result.updated,
+						revisionId: result.revisionId,
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async updateProfile(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					// Resolve existence first so the caller gets a stable NOT_FOUND.
+					await session.getById(input.narratorId);
+					const result = await session.updateProfile(input.narratorId, {
+						...(input.title !== undefined ? { title: input.title } : {}),
+						...(input.model !== undefined ? { model: input.model } : {}),
+						...(input.reasoningEffort !== undefined
+							? { reasoningEffort: input.reasoningEffort }
+							: {}),
+						...(input.planReflectionAutoApproveOverride !== undefined
+							? { planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride }
+							: {}),
+					});
+					return { updated: result.updated };
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async specWrite(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					// Resolve existence first so the caller gets a stable NOT_FOUND.
+					await session.getById(input.narratorId);
+					const result = await session.specWrite(input.narratorId, input.uri, input.content);
+					return {
+						path: result.path,
+						uri: result.uri,
+						revisionId: result.revisionId,
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
 			async interrupt(input) {
 				if (input.signal.aborted)
 					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");

@@ -153,23 +153,26 @@ describe("PluginPublicApi", () => {
 		const { api, broker } = buildApi();
 		expect(api.queries.listIds()).toEqual([
 			"narrafork.chapters.list",
+			"narrafork.narrator.messages.list",
 			"narrafork.narrators.list",
 			"narrafork.plugin.getOwn",
 			"narrafork.plugins.list",
 			"narrafork.projects.list",
 		]);
-	expect(api.commands.listIds()).toEqual([
-		"narrafork.narrator.create",
-		"narrafork.narrator.delete",
-		"narrafork.narrator.interrupt",
-		"narrafork.narrator.send_message",
-		"narrafork.narrator.send_subagent_message",
-		"narrafork.narrator.spec_behavior_fence_update",
-		"narrafork.narrator.spec_task_add",
-		"narrafork.narrator.spec_tasks_get",
-		"narrafork.plugins.disable",
-		"narrafork.plugins.enable",
-	]);
+		expect(api.commands.listIds()).toEqual([
+			"narrafork.narrator.create",
+			"narrafork.narrator.delete",
+			"narrafork.narrator.interrupt",
+			"narrafork.narrator.send_message",
+			"narrafork.narrator.send_subagent_message",
+			"narrafork.narrator.spec_behavior_fence_update",
+			"narrafork.narrator.spec_task_add",
+			"narrafork.narrator.spec_tasks_get",
+			"narrafork.narrator.spec_write",
+			"narrafork.narrator.update_profile",
+			"narrafork.plugins.disable",
+			"narrafork.plugins.enable",
+		]);
 
 		const queryContext = context();
 		const query = await api.query(

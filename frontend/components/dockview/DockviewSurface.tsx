@@ -24,7 +24,7 @@ import {
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import "./theme.css";
-import { createContext, type RefObject, useCallback, useContext, useEffect, useRef } from "react";
+import { createContext, type RefObject, useCallback, useContext, useRef } from "react";
 import type { PanelDragState } from "../../lib/panel-drag";
 import type { DropZoneThresholds } from "./drop-intent";
 import { swapPanels } from "./panel-swap";

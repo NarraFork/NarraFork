@@ -55,8 +55,6 @@ export interface PluginIntegrationAuthorityServiceOptions {
 export interface EnsurePluginInstallationOptions {
 	/** Explicit reinstall only: preserve the revoked tombstone and issue a fresh authority identity. */
 	replaceRevoked?: boolean;
-	/** Upgrade path: append newly declared capabilities without resurrecting revoked grants. */
-	mergeMissingCapabilities?: boolean;
 }
 
 function hash(value: string): string {
@@ -290,57 +288,14 @@ export class PluginIntegrationAuthorityService {
 						});
 					}
 				}
-				// Upgrade path: the caller's `legacySummary` already includes capabilities
-				// the new manifest declares that were never granted (seedGrantsFromManifest
-				// merge mode). The existing authority record short-circuits normal seeding,
-				// so without this merge the new capabilities would never reach the
-				// runtime authority record and every call against them would be denied.
-				// Append-only: existing grants are preserved verbatim (revocations stay
-				// revoked), only the missing declared capabilities are added.
-				if (options.mergeMissingCapabilities) {
-					const missing = (legacySummary.capabilities ?? []).filter((capability) => {
-						const adapted = adaptPluginCapability(capability);
-						const canonical = adapted?.id;
-						return !set.grants.some(
-							(grant) =>
-								grant.capability === capability ||
-								(canonical !== undefined && grant.capability === canonical),
-						);
-					});
-					if (missing.length > 0) {
-						logger.info("Merging newly-declared plugin capabilities into existing grant set", {
-							pluginId,
-							installationId: targetInstallationId,
-							added: missing,
-						});
-						// Append-only: existing grants are preserved VERBATIM (including
-						// constraints, expiry and the original grantor), only the missing
-						// declared capabilities are added. Dropping those fields would
-						// silently widen or rewrite old grants on every upgrade.
-						const merged = await this.replace(
-							pluginId,
-							targetInstallationId,
-							[
-								...set.grants.map(
-									(grant): PermissionGrantInput => ({
-										capability: grant.capability,
-										scope: grant.scope,
-										...(grant.constraints === undefined ? {} : { constraints: grant.constraints }),
-										...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }),
-										grantId: grant.grantId,
-										grantedBy: grant.grantedBy,
-									}),
-								),
-								...missing.map((capability) => ({
-									capability,
-									scope: { type: "global" } as const,
-								})),
-							],
-							{ expectedRevision: set.revision, grantedBy: "system" },
-						);
-						return merged.set;
-					}
-				}
+				// An existing authority record is authoritative and is returned untouched.
+				// In particular an UPGRADE must not extend it: a new package version
+				// inherits this record through the stable installation identity, so
+				// appending the capabilities its new manifest declares would widen access
+				// under an identity the admin approved for a narrower manifest. The
+				// install path withholds those capabilities and raises pending approval
+				// requests instead (plugin-manager
+				// `requestUndeclaredManifestCapabilities`).
 				return set;
 			}
 		}

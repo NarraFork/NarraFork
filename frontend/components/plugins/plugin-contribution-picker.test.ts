@@ -66,7 +66,10 @@ describe("buildPluginDockPanelOpenRequest", () => {
 		});
 		expect(request.component).toBe("plugin");
 		expect(request.title).toBe("Review");
-		expect(request.params.binding).toEqual({ kind: "focus-current-narrator", narratorId: "narrator-1" });
+		expect(request.params.binding).toEqual({
+			kind: "focus-current-narrator",
+			narratorId: "narrator-1",
+		});
 		expect(request.params.fallback?.packageHash).toBe("a".repeat(64));
 		expect(request.position).toEqual({ referenceGroup: "group-1" });
 		expect(parsePluginDockPanelParams(request.params)?.contributionId).toBe("dashboard");

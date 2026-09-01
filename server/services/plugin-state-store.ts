@@ -118,7 +118,7 @@ export type PluginProviderProxyMap = Record<string, ProxyOverride>;
 export interface PluginStateRecord {
 	pluginId: string;
 	current: PluginPackageReference | null;
-/** Internal authority generation; package hash remains the immutable package identity. */
+	/** Internal authority generation; package hash remains the immutable package identity. */
 	authorityInstallationId: string | null;
 	/**
 	 * Stable installation identity (UUID), independent of the package hash.

@@ -309,6 +309,20 @@ function staticExecutionContext(deviceId: string): ExecutionTargetContext {
 	};
 }
 
+/**
+ * An absolute path in the flavour the given device's backend actually parses.
+ *
+ * `localBackend` uses the HOST's path semantics, while the remote fake is always posix.
+ * A blacklist rule only matches when its path is absolute *in that flavour*, so a test
+ * that hardcodes one flavour silently stops testing anything on the other platform:
+ * `C:\etc` is not an absolute posix path, the rule never matches, and a "must deny"
+ * assertion turns into "allow" — which is the direction that hides a missing denial.
+ */
+function deviceAbsolutePath(deviceId: string, ...segments: string[]): string {
+	const useWindows = deviceId === "local" && process.platform === "win32";
+	return useWindows ? `C:\\${segments.join("\\")}` : `/${segments.join("/")}`;
+}
+
 async function waitFor(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!condition()) {
@@ -1623,8 +1637,8 @@ describe("subagent permission routing identity", () => {
 describe("device-scoped permission rules", () => {
 	test("unscoped blacklist (deviceScope null) denies on every device", () => {
 		for (const deviceId of ["local", "device-a", "device-b"]) {
-			const path = deviceId === "local" ? "C:\\secret" : "/secret";
-			const filePath = deviceId === "local" ? "C:\\secret\\file.ts" : "/secret/file.ts";
+			const path = deviceAbsolutePath(deviceId, "secret");
+			const filePath = deviceAbsolutePath(deviceId, "secret", "file.ts");
 			expect(
 				resolvePermissionDecision({
 					toolName: "Write",
@@ -1659,8 +1673,8 @@ describe("device-scoped permission rules", () => {
 
 	test("blacklist scoped to 'local' applies to the host but not remote devices", () => {
 		const opts = (deviceId: string) => {
-			const path = deviceId === "local" ? "C:\\etc" : "/etc";
-			const filePath = deviceId === "local" ? "C:\\etc\\hosts" : "/etc/hosts";
+			const path = deviceAbsolutePath(deviceId, "etc");
+			const filePath = deviceAbsolutePath(deviceId, "etc", "hosts");
 			return {
 				toolName: "Write",
 				input: { file_path: filePath, content: "x" },

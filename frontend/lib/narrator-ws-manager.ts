@@ -1464,12 +1464,9 @@ export class NarratorWSManager {
 						new CustomEvent("narrafork:plugin-event", {
 							detail: {
 								type: data.type,
-								pluginId:
-									typeof data.pluginId === "string" ? data.pluginId : undefined,
-								requestId:
-									typeof data.requestId === "string" ? data.requestId : undefined,
-								capability:
-									typeof data.capability === "string" ? data.capability : undefined,
+								pluginId: typeof data.pluginId === "string" ? data.pluginId : undefined,
+								requestId: typeof data.requestId === "string" ? data.requestId : undefined,
+								capability: typeof data.capability === "string" ? data.capability : undefined,
 								status: typeof data.status === "string" ? data.status : undefined,
 							},
 						}),

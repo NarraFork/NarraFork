@@ -1,5 +1,5 @@
-import { useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { pluginKeys } from "./usePlugins";
 
 /**
@@ -17,10 +17,12 @@ export function usePluginEventRefresh(): void {
 
 	useEffect(() => {
 		const handler = (event: Event) => {
-			const detail = (event as CustomEvent<{
-				type: string;
-				pluginId?: string;
-			}>).detail;
+			const detail = (
+				event as CustomEvent<{
+					type: string;
+					pluginId?: string;
+				}>
+			).detail;
 			if (!detail?.type) return;
 			void queryClient.invalidateQueries({ queryKey: pluginKeys.all });
 			if (detail.pluginId) {

@@ -636,7 +636,7 @@ describe("PluginManager", () => {
 		).toContain("query.read.projects");
 	});
 
-	test("merges newly-declared capabilities into an existing grant set on upgrade", async () => {
+	test("withholds newly-declared capabilities on upgrade and queues them for approval", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.upgrade-new-capability";
 		const manager = new PluginManager({
@@ -666,9 +666,10 @@ describe("PluginManager", () => {
 		const stableUuid = before.installationId;
 		expect(before.grants.map((g) => g.capability)).toEqual(["diagnostics.readOwnLogs"]);
 
-		// The new manifest declares an additional capability that was never
-		// granted. The install seeds it and the authority merge appends it to
-		// the existing grant set — no manual re-authorization needed.
+		// The new manifest declares a capability that was never granted. Because the
+		// installation identity is stable, the upgrade inherits the old grants — so the
+		// added capability must NOT ride in on that inheritance. It is withheld and
+		// queued for approval; the upgrade itself still succeeds.
 		const upgraded = await manager.install(
 			await makePackage(root, pluginId, (manifest) => {
 				manifest.version = "2.0.0";
@@ -679,19 +680,136 @@ describe("PluginManager", () => {
 			}),
 		);
 		if (!upgraded.current) throw new Error("Upgraded plugin has no current package");
+		expect(upgraded.current.version).toBe("2.0.0");
+
 		const after = await manager.getPermissions(pluginId);
 		expect(after.installationId).toBe(stableUuid);
-		expect(after.revision).toBe(3);
-		const capabilities = after.grants.map((g) => g.capability).sort();
-		expect(capabilities).toEqual(["diagnostics.readOwnLogs", "query.read.projects"]);
-		// The previously-granted capability keeps its grant identity.
+		// Only the previously approved capability is granted, with its grant identity
+		// intact — the upgrade neither widened nor rewrote it.
+		expect(after.grants.map((g) => g.capability)).toEqual(["diagnostics.readOwnLogs"]);
 		expect(after.grants.find((g) => g.capability === "diagnostics.readOwnLogs")?.grantId).toBe(
 			"grant-logs",
 		);
-		// The merged capability carries the system grant for auditability.
-		expect(after.grants.find((g) => g.capability === "query.read.projects")?.grantedBy).toBe(
-			"system",
+
+		const pending = await manager.listPendingPermissionRequests(pluginId);
+		expect(pending.map((req) => req.capability)).toEqual(["query.read.projects"]);
+		const request = pending[0];
+		if (!request) throw new Error("Upgrade did not queue an approval request");
+		expect(request.source).toBe("upgrade");
+		expect(request.requestedForVersion).toBe("2.0.0");
+		expect(request.status).toBe("pending");
+
+		// Approving the request is what finally grants it, attributed to the admin who
+		// decided — not to "system".
+		await manager.approvePermissionRequest(pluginId, request.requestId, "admin-user-1");
+		const approved = await manager.getPermissions(pluginId);
+		expect(approved.grants.map((g) => g.capability).sort()).toEqual([
+			"diagnostics.readOwnLogs",
+			"query.read.projects",
+		]);
+		expect(approved.grants.find((g) => g.capability === "query.read.projects")?.grantedBy).toBe(
+			"admin-user-1",
 		);
+		expect(await manager.listPendingPermissionRequests(pluginId)).toHaveLength(0);
+	});
+
+	test("denying an upgrade capability leaves the upgrade in place without the grant", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.upgrade-denied-capability";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+			}),
+		);
+		const upgraded = await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				manifest.version = "2.0.0";
+				(manifest.permissions as Record<string, unknown>).host = [
+					"diagnostics.readOwnLogs",
+					"query.read.projects",
+				];
+			}),
+		);
+		const pending = await manager.listPendingPermissionRequests(pluginId);
+		expect(pending).toHaveLength(1);
+		const request = pending[0];
+		if (!request) throw new Error("Upgrade did not queue an approval request");
+
+		expect(await manager.denyPermissionRequest(pluginId, request.requestId)).toBeTruthy();
+
+		// The chosen semantics: a denial costs the plugin one capability, not the whole
+		// update. The new version stays installed and everything previously approved
+		// keeps working.
+		expect((await manager.getStatus(pluginId))?.current?.version).toBe("2.0.0");
+		expect(upgraded.current?.version).toBe("2.0.0");
+		const after = await manager.getPermissions(pluginId);
+		expect(after.grants.map((g) => g.capability)).toEqual(["diagnostics.readOwnLogs"]);
+		expect(await manager.listPendingPermissionRequests(pluginId)).toHaveLength(0);
+	});
+
+	test("re-running the same upgrade does not stack duplicate approval requests", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.upgrade-idempotent-request";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+			}),
+		);
+		const upgradeManifest = (manifest: Record<string, unknown>) => {
+			manifest.version = "2.0.0";
+			(manifest.permissions as Record<string, unknown>).host = [
+				"diagnostics.readOwnLogs",
+				"query.read.projects",
+			];
+		};
+		await manager.install(await makePackage(root, pluginId, upgradeManifest));
+		const first = await manager.listPendingPermissionRequests(pluginId);
+		expect(first).toHaveLength(1);
+
+		// Reinstalling the same version must not queue a second row for the same
+		// (capability, scope): the pending list is the admin's to-do list, and a
+		// re-install is not a new decision.
+		await manager.install(await makePackage(root, pluginId, upgradeManifest));
+		const second = await manager.listPendingPermissionRequests(pluginId);
+		expect(second).toHaveLength(1);
+		expect(second[0]?.requestId).toBe(first[0]?.requestId);
+	});
+
+	test("a first install still auto-grants its declared capabilities", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.first-install-seeds";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		// Installing is the trust decision, so a FIRST install is unchanged: declared
+		// capabilities are granted and nothing waits for approval. Only upgrades are
+		// fail-closed.
+		await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				(manifest.permissions as Record<string, unknown>).host = [
+					"diagnostics.readOwnLogs",
+					"query.read.projects",
+				];
+			}),
+		);
+		const permissions = await manager.getPermissions(pluginId);
+		expect(permissions.grants.map((g) => g.capability).sort()).toEqual([
+			"diagnostics.readOwnLogs",
+			"query.read.projects",
+		]);
+		expect(await manager.listPendingPermissionRequests(pluginId)).toHaveLength(0);
 	});
 
 	test("rejects enabling an incompatible package", async () => {

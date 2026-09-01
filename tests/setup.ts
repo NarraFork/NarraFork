@@ -15,8 +15,8 @@ import { Database } from "bun:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
-import * as relations from "../server/db/relations";
 import { ensureColumns } from "../server/db/ensure-columns";
+import * as relations from "../server/db/relations";
 import * as schema from "../server/db/schema";
 
 const DRIZZLE_DIR = join(import.meta.dir, "..", "drizzle");

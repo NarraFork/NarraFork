@@ -294,7 +294,7 @@ export class PluginUiSession {
 				? {
 						runtimeUrl: PLUGIN_UI_RUNTIME_JS_URL,
 						runtimeStyleUrl: PLUGIN_UI_RUNTIME_CSS_URL,
-				}
+					}
 				: {}),
 			defaultTimeoutMs: this.options.defaultTimeoutMs,
 		});

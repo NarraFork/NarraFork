@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { PluginAgentToolBridge, PluginAgentToolBridgeError } from "../plugin-agent-tool-bridge";
-import { type PluginToolRegistry, PluginToolRegistryError } from "../plugin-tool-registry";
+import type { PluginToolRegistry } from "../plugin-tool-registry";
 
 /**
  * Guards for the "runtime not active / binding missing" diagnostics:

@@ -141,13 +141,35 @@ interface PermissionInstallationDocument {
 	updatedAt: string;
 }
 
-/** A capability grant request raised at call time when the capability is not granted. */
+/**
+ * Why a capability is awaiting approval.
+ *
+ * - `runtime`: the plugin called a capability it holds no grant for, and the broker
+ *   turned the denial into a prompt.
+ * - `upgrade`: a new package version *declares* a capability the previous version was
+ *   never granted. Nobody called it yet; the request exists so the upgrade cannot widen
+ *   the allow set on its own.
+ *
+ * The distinction is not cosmetic: an upgrade request must be presented as "this update
+ * wants more access than you approved before", which is a different decision from
+ * "a running plugin just tried something new".
+ */
+export type PluginPermissionRequestSource = "runtime" | "upgrade";
+
+/** A capability grant request awaiting admin resolution. */
 export interface PluginPermissionRequest {
 	requestId: string;
 	capability: string;
 	scope: PermissionScope;
 	requestedAt: string;
 	requestedByRuntimeId?: string;
+	/**
+	 * Absent in records written before the field existed; those are all runtime prompts,
+	 * so readers must treat a missing value as `"runtime"` rather than rejecting the row.
+	 */
+	source?: PluginPermissionRequestSource;
+	/** Package version that introduced the declaration. Only meaningful for `upgrade`. */
+	requestedForVersion?: string;
 	status: "pending" | "granted" | "denied";
 	resolvedAt?: string;
 }
@@ -330,6 +352,17 @@ function parsePendingRequest(value: unknown): PluginPermissionRequest {
 		throw new ValidationError("Pending permission request timestamp is invalid");
 	if (value.requestedByRuntimeId !== undefined && typeof value.requestedByRuntimeId !== "string")
 		throw new ValidationError("Pending permission request runtime id is invalid");
+	// Records written before `source` existed are runtime prompts by construction — the
+	// upgrade path did not raise requests at all back then. Defaulting instead of
+	// rejecting keeps an older permissions.json loadable (a throw here would take the
+	// whole file down, losing every grant in it).
+	if (value.source !== undefined && value.source !== "runtime" && value.source !== "upgrade")
+		throw new ValidationError("Pending permission request source is invalid");
+	if (
+		value.requestedForVersion !== undefined &&
+		(typeof value.requestedForVersion !== "string" || value.requestedForVersion.length > 128)
+	)
+		throw new ValidationError("Pending permission request version is invalid");
 	if (value.status !== "pending" && value.status !== "granted" && value.status !== "denied")
 		throw new ValidationError("Pending permission request status is invalid");
 	if (value.resolvedAt !== undefined) {
@@ -344,6 +377,8 @@ function parsePendingRequest(value: unknown): PluginPermissionRequest {
 		scope: scopeParsed.data,
 		requestedAt: value.requestedAt,
 		requestedByRuntimeId: value.requestedByRuntimeId,
+		source: value.source ?? "runtime",
+		requestedForVersion: value.requestedForVersion,
 		status: value.status,
 		resolvedAt: value.resolvedAt,
 	};
@@ -839,13 +874,21 @@ export class PluginPermissionStore {
 	async addPendingRequest(
 		pluginId: string,
 		installationId: string,
-		input: { capability: string; scope: PermissionScope; requestedByRuntimeId?: string },
+		input: {
+			capability: string;
+			scope: PermissionScope;
+			requestedByRuntimeId?: string;
+			source?: PluginPermissionRequestSource;
+			requestedForVersion?: string;
+		},
 	): Promise<PluginPermissionRequest> {
 		assertPluginIdentity(pluginId, installationId);
 		const capabilityResult = capabilitySchema.safeParse(input.capability);
 		if (!capabilityResult.success) throw new ValidationError("Invalid capability");
 		const scopeResult = permissionScopeSchema.safeParse(input.scope);
 		if (!scopeResult.success) throw new ValidationError("Invalid permission scope");
+		if (input.requestedForVersion !== undefined && input.requestedForVersion.length > 128)
+			throw new ValidationError("Invalid permission request version");
 
 		return this.mutex.acquire("permissions", async () => {
 			await this.ensureLoadedLocked();
@@ -853,7 +896,12 @@ export class PluginPermissionStore {
 			const doc = document.plugins[pluginId]?.[installationId];
 			const existingRequests: PluginPermissionRequest[] = doc?.pendingRequests ?? [];
 
-			// Idempotent: same capability + scope with pending status → return existing
+			// Idempotent: same capability + scope with pending status → return existing.
+			// This deliberately ignores `source`: one pending request per (capability, scope)
+			// is what the admin actually decides on, and approving it has the same effect
+			// whichever path raised it. Re-running an upgrade therefore does not stack
+			// duplicate rows, and a capability already queued by a runtime call is not
+			// queued twice because the new manifest also declares it.
 			const existing = existingRequests.find(
 				(r) =>
 					r.capability === input.capability &&
@@ -874,6 +922,8 @@ export class PluginPermissionStore {
 				scope: clone(input.scope),
 				requestedAt: this.timestamp(),
 				requestedByRuntimeId: input.requestedByRuntimeId,
+				source: input.source ?? "runtime",
+				requestedForVersion: input.requestedForVersion,
 				status: "pending",
 			};
 

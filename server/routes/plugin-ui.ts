@@ -1,6 +1,6 @@
 import { AppError, NotFoundError, ValidationError, zodValidationError } from "@server/lib/errors";
-import { requireNarratorAccess } from "@server/lib/narrator-access";
 import { logger } from "@server/lib/logger";
+import { requireNarratorAccess } from "@server/lib/narrator-access";
 import {
 	type Capability,
 	invocationScopeSchema,

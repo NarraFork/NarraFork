@@ -323,8 +323,7 @@ export function PluginDockPanelView({
 		</Box>
 	);
 	// A crashed/disposed session must show the error placeholder, not the iframe.
-	const sessionBroken =
-		snapshot && ["error", "crashed", "disposed"].includes(snapshot.status);
+	const sessionBroken = snapshot && ["error", "crashed", "disposed"].includes(snapshot.status);
 	if (controller && !sessionBroken) {
 		// Live session: render the iframe directly in the panel content. The
 		// handshake happens on iframe load (controller.attach), same as before.

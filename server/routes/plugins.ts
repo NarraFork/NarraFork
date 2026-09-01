@@ -3,7 +3,13 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { z } from "zod/v4";
-import { AppError, NotFoundError, ValidationError, zodValidationError } from "../lib/errors";
+import {
+	AppError,
+	formatZodError,
+	NotFoundError,
+	ValidationError,
+	zodValidationError,
+} from "../lib/errors";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { pluginIdSchema } from "../lib/plugins/manifest";
 import { permissionGrantSchema } from "../lib/plugins/permissions";

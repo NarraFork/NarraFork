@@ -111,6 +111,14 @@ export interface PluginPermissionRequestSummary {
 	scope: { type: string; id?: string };
 	requestedAt: string;
 	requestedByRuntimeId?: string;
+	/**
+	 * `upgrade` means a newer package version declares this capability and it was
+	 * withheld pending approval; `runtime` means the running plugin called it.
+	 * Older servers omit the field — treat a missing value as `runtime`.
+	 */
+	source?: "runtime" | "upgrade";
+	/** Package version that introduced the declaration (`upgrade` requests only). */
+	requestedForVersion?: string;
 	status: "pending" | "granted" | "denied";
 	resolvedAt?: string;
 }
@@ -365,8 +373,7 @@ export const pluginsApi = {
 			body: JSON.stringify({ providerInstanceId, proxy }),
 		}),
 	/** Full permission set for an installation (admin). */
-	getGrants: (pluginId: string) =>
-		request<PluginPermissionSet>(`${pluginPath(pluginId)}/grants`),
+	getGrants: (pluginId: string) => request<PluginPermissionSet>(`${pluginPath(pluginId)}/grants`),
 	/** Replace the full grant list (admin). */
 	replaceGrants: (
 		pluginId: string,
@@ -377,10 +384,7 @@ export const pluginsApi = {
 			body: JSON.stringify(body),
 		}),
 	/** Revoke specific grants by id (admin). */
-	revokeGrants: (
-		pluginId: string,
-		body: { expectedRevision: number; grantIds: string[] },
-	) =>
+	revokeGrants: (pluginId: string, body: { expectedRevision: number; grantIds: string[] }) =>
 		request<PluginPermissionMutationResponse>(`${pluginPath(pluginId)}/grants/revoke`, {
 			method: "POST",
 			body: JSON.stringify(body),

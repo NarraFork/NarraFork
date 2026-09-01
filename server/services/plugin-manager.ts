@@ -327,7 +327,6 @@ export function seedGrantsFromManifest(
 	summary: PluginGrantSummary,
 	manifestRequested: readonly string[],
 	context?: { pluginId?: string },
-	merge = false,
 ): PluginGrantSummary {
 	const declared = [...new Set(manifestRequested)];
 	if (declared.length === 0) return summary;
@@ -341,30 +340,12 @@ export function seedGrantsFromManifest(
 		});
 	}
 	if (capabilities.length === 0) return summary;
-	if (summary.count > 0 || summary.capabilities.length > 0) {
-		// Existing grants are preserved (revocation is expressed by removing a
-		// grant, never by re-seeding). In merge mode — used on UPGRADE, which is a
-		// fresh trust decision surfaced in the install confirmation dialog —
-		// capabilities the new manifest declares but that were never granted
-		// before are added, so an upgraded plugin does not silently lose access
-		// to capabilities its new manifest requires (e.g. a UI panel that starts
-		// subscribing to events). Non-merge callers (enable/restore) keep the
-		// previous behaviour so a revoked grant is not resurrected.
-		if (!merge) return summary;
-		const existing = new Set(summary.capabilities);
-		const missing = capabilities.filter((capability) => !existing.has(capability));
-		if (missing.length === 0) return summary;
-		logger.info("Upgraded plugin manifest declares new capabilities; extending grants", {
-			pluginId: context?.pluginId,
-			added: missing,
-		});
-		return {
-			...summary,
-			count: summary.count + missing.length,
-			capabilities: [...summary.capabilities, ...missing],
-			revision: Math.max(1, summary.revision),
-		};
-	}
+	// An existing grant list owns itself: later edits (including revocation) are
+	// authoritative, so seeding never touches it. This is also what keeps an UPGRADE
+	// from widening access — the new manifest may declare more, but those extras are
+	// withheld here and raised as pending approval requests
+	// (`requestUndeclaredManifestCapabilities`) instead of being granted silently.
+	if (summary.count > 0 || summary.capabilities.length > 0) return summary;
 	return {
 		...summary,
 		count: capabilities.length,
@@ -1683,10 +1664,15 @@ export class PluginManager {
 			// a first install (or a legacy state without one) allocates a fresh
 			// UUID right here, with the old hash's grants inherited through
 			// `sourceInstallationId` so upgrades never lose authorization.
-			// mergeMissingCapabilities appends any capabilities the new manifest
-			// declares but that were never granted (seedGrantsFromManifest merge
-			// mode), so an upgraded plugin never silently loses access to its new
-			// capabilities.
+			//
+			// A first install seeds the manifest's capabilities: installing IS the trust
+			// decision. An UPGRADE does not. Because the installation identity is now a
+			// stable UUID, the new package inherits the old grants automatically — so a
+			// new manifest declaring MORE capabilities would silently widen the allow set
+			// under an identity the admin approved for a narrower manifest. Newly declared
+			// capabilities are therefore withheld and raised as pending approval requests
+			// below (fail-closed): the upgrade itself succeeds and every previously granted
+			// capability keeps working, only the added ones wait for a decision.
 			const previousInstallationId = previousState?.installationId;
 			const installationId = previousInstallationId ?? randomUUID();
 			const permissions = await this.integrationAuthorityService.ensureInstallation(
@@ -1697,22 +1683,33 @@ export class PluginManager {
 						createPluginStateRecord(installed.pluginId, this.timestamp()).grants,
 					installed.manifest.permissions.host,
 					{ pluginId: installed.pluginId },
-					// An upgrade is a fresh trust decision (surfaced in the install
-					// confirmation dialog): capabilities the new manifest declares but
-					// that were never granted before must be seeded, otherwise the
-					// upgraded plugin silently loses access (e.g. a UI panel whose new
-					// version subscribes to events). Existing grants are preserved.
-					Boolean(previousState),
 				),
 				// Legacy states predate the stable UUID: inherit the old hash's
 				// grants. First installs have no legacy record at all.
 				previousState?.current?.hash,
-				{ replaceRevoked: true, mergeMissingCapabilities: true },
+				{ replaceRevoked: true },
 			);
 			if (!previousInstallationId) {
 				await this.stateStore.setInstallationId(installed.pluginId, installationId);
 			}
 			await this.syncPermissionSummary(installed.pluginId, permissions);
+			// Queue approval requests for capabilities this package declares but that the
+			// installation does not hold. Best-effort by design: a failure here must not
+			// fail an otherwise complete install, and withholding the grant already keeps
+			// the capability unusable, so the worst case is a missing prompt rather than
+			// unapproved access.
+			await this.requestUndeclaredManifestCapabilities(
+				installed.pluginId,
+				installationId,
+				installed.manifest.permissions.host,
+				installed.version,
+				permissions,
+			).catch((error) => {
+				logger.warn("Failed to raise upgrade capability approval requests", {
+					pluginId: installed.pluginId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 			await this.refreshCatalog("install");
 			await this.stateStore.updateOperation(journal.id, {
 				status: "succeeded",
@@ -2949,6 +2946,95 @@ export class PluginManager {
 
 	private catalogPlugin(pluginId: string): PluginCatalogPlugin | undefined {
 		return this.catalogSnapshot?.plugins.find((plugin) => plugin.pluginId === pluginId);
+	}
+
+	/**
+	 * Raise approval requests for capabilities the installed manifest declares but that the
+	 * installation holds no grant for.
+	 *
+	 * This is the fail-closed half of the upgrade path. A stable installation identity means
+	 * a new package version inherits the previous grants; if its manifest declares more, the
+	 * extra capabilities must not ride in on that inheritance. They are surfaced here as
+	 * pending requests instead, so an admin makes the same explicit decision they made at
+	 * first install.
+	 *
+	 * Only capabilities with a canonical adapter can produce a request — the manifest schema
+	 * accepts free-form tokens, but an unmappable one can never be granted (and the broker
+	 * denies it anyway), so prompting for it would be an undecidable question.
+	 *
+	 * Scope is `global`, matching what the manifest expresses: a declaration carries no
+	 * scope, and the install-time seeding grants global too. Narrowing belongs to the
+	 * grants panel, where the admin can replace a grant with a scoped one.
+	 *
+	 * Returns the capabilities that are now awaiting approval (including ones already
+	 * queued), so callers can report the outcome.
+	 */
+	private async requestUndeclaredManifestCapabilities(
+		pluginId: string,
+		installationId: string,
+		manifestRequested: readonly string[],
+		version: string,
+		permissions: PluginPermissionSet,
+	): Promise<string[]> {
+		const declared = [...new Set(manifestRequested)];
+		if (declared.length === 0) return [];
+		// A grant may be stored under the plugin-facing token or its canonical id, so both
+		// spellings count as "already granted" — otherwise every upgrade would re-prompt
+		// for capabilities the admin already approved.
+		const granted = new Set<string>();
+		for (const grant of permissions.grants) {
+			granted.add(grant.capability);
+			const adapted = adaptPluginCapability(grant.capability);
+			if (adapted) granted.add(adapted.id);
+		}
+		const missing = declared.filter((capability) => {
+			const adapted = adaptPluginCapability(capability);
+			if (!adapted) return false;
+			return !granted.has(capability) && !granted.has(adapted.id);
+		});
+		if (missing.length === 0) return [];
+
+		const queued: string[] = [];
+		for (const capability of missing) {
+			try {
+				const request = await this.permissionStore.addPendingRequest(pluginId, installationId, {
+					capability,
+					scope: { type: "global" },
+					source: "upgrade",
+					requestedForVersion: version,
+				});
+				queued.push(capability);
+				eventBus.emit({
+					type: "plugin:permission_request",
+					pluginId,
+					requestId: request.requestId,
+					capability,
+				} as NarraForkEvent);
+				await this.broadcastPluginEvent("plugin:permission_request", {
+					pluginId,
+					requestId: request.requestId,
+					capability,
+					source: "upgrade",
+				});
+			} catch (error) {
+				// A full pending queue (or any single rejected row) must not abort the rest:
+				// the capability stays ungranted either way, and the remaining ones still
+				// deserve a prompt.
+				logger.warn("Could not queue an upgrade capability approval request", {
+					pluginId,
+					capability,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		if (queued.length > 0) {
+			logger.info("Upgraded plugin declares new capabilities; awaiting approval", {
+				pluginId,
+				version,
+				awaitingApproval: queued,
+			});
+		}
+		return queued;
 	}
 
 	/**

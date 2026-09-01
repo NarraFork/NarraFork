@@ -1,5 +1,4 @@
 import { createSharedContext } from "@frontend/lib/shared-context";
-import { Box } from "@mantine/core";
 import {
 	useCallback,
 	useContext,
@@ -655,11 +654,7 @@ export function PluginUiRuntimeProvider({
 		[disposeRecord],
 	);
 
-	return (
-		<RuntimeContext.Provider value={value}>
-			{children}
-		</RuntimeContext.Provider>
-	);
+	return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }
 
 /**

@@ -180,6 +180,9 @@
 				"approve": "Allow",
 				"deny": "Deny",
 				"pendingHint": "Plugins request capabilities here when they are not yet granted",
+				"pendingUpgradeHint": "An update declares capabilities this installation was never granted. They stay unavailable until you approve them; everything you approved before keeps working.",
+				"pendingSourceUpgrade": "New in update",
+				"pendingSourceUpgradeVersion": "New in {{version}}",
 				"ungrantedTitle": "Not granted yet",
 				"ungrantedEmpty": "All declared capabilities are granted.",
 				"ungrantedGrant": "Grant"

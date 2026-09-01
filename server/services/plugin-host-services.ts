@@ -486,10 +486,7 @@ export class PluginHostServices {
 		// `effectiveCapabilities` reporting and to `capabilityDenialReason`. Filtering the
 		// grants by the manifest here would silently undo an approval — the plugin would
 		// keep getting CAPABILITY_NOT_GRANTED and keep re-raising the same pending request.
-		const manifestRequested = uniqueStrings([
-			...input.manifestRequested,
-			...capabilities,
-		]);
+		const manifestRequested = uniqueStrings([...input.manifestRequested, ...capabilities]);
 		const binding: PluginCapabilityBindingInput = {
 			plugin,
 			desiredState: input.desiredState,

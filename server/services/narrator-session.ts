@@ -5498,24 +5498,34 @@ export async function readSpecTasksForPlugin(narratorId: string) {
 }
 
 /**
- * Append a protected task to a narrator's spec://tasks.json (the same mechanism
- * the /goal command uses). Protected tasks auto-continue the narrator until
- * done, which is exactly the queue semantics a team needs: dispatching a task
- * enqueues it in the member's own task queue, and the member's loop picks it up.
+ * Append a task to a narrator's spec://tasks.json on a plugin's behalf: dispatching a
+ * task enqueues it in the member's own queue and the member's loop picks it up.
  * Idempotent: identical text is not appended twice (safe for redispatch).
+ *
+ * The task is ORDINARY unless the plugin explicitly asks for a protected one. It used to
+ * be protected unconditionally, and written as `actor: "user"` — so every dispatched
+ * task became a user commitment that auto-continues the narrator and that the narrator
+ * cannot retract. That let a plugin keep a narrator working for it indefinitely without
+ * anyone having asked for that guarantee. Plugins write as `"agent"`, which is what they
+ * are on the spec VFS policy axis.
  */
 export async function addSpecTaskForPlugin(
 	narratorId: string,
 	text: string,
-): Promise<{ added: boolean; taskText: string; revisionId: string | null }> {
-	const { appendProtectedSpecTask } = await import("./spec-vfs-service");
+	options: { protected?: boolean } = {},
+): Promise<{ added: boolean; taskText: string; protected: boolean; revisionId: string | null }> {
+	const { appendSpecTaskForExternalActor } = await import("./spec-vfs-service");
 	const objective = text.trim();
 	if (!objective) throw new ValidationError("task text is required");
-	const { added, written } = await appendProtectedSpecTask(narratorId, objective);
+	const result = await appendSpecTaskForExternalActor(narratorId, objective, {
+		protected: options.protected === true,
+		actor: "agent",
+	});
 	return {
-		added,
+		added: result.added,
 		taskText: objective,
-		revisionId: written.revisionId ?? null,
+		protected: result.protected,
+		revisionId: result.written.revisionId ?? null,
 	};
 }
 
@@ -5552,7 +5562,9 @@ export async function setSpecBehaviorFenceForPlugin(
 	}
 	const openTag = `<!-- ${TEAM_SOP_MARKER} -->`;
 	const closeTag = `<!-- /${TEAM_SOP_MARKER} -->`;
-	const sopPattern = new RegExp(`\\s*${escapeRegExp(openTag)}[\\s\\S]*?${escapeRegExp(closeTag)}\\s*`);
+	const sopPattern = new RegExp(
+		`\\s*${escapeRegExp(openTag)}[\\s\\S]*?${escapeRegExp(closeTag)}\\s*`,
+	);
 	const withoutSop = current.replace(sopPattern, "").trim();
 	const body = text.trim();
 	let next: string;
