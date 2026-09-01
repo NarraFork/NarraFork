@@ -21,6 +21,7 @@ import {
 	activeStepId,
 	isLessonComplete,
 	satisfiedStepIds,
+	TUTORIAL_FRAME_TYPES,
 	type TutorialObservations,
 	type TutorialObservedFrame,
 } from "../lib/tutorial-completion";
@@ -55,12 +56,14 @@ const MAX_OBSERVED_FRAMES = 500;
  */
 const SANDBOX_GRAPH_POLL_MS = 3000;
 
-const TUTORIAL_FRAME_TYPES = [
-	"status_change",
-	"tool_completed",
-	"permission_resolved",
-	"message",
-] as const;
+/**
+ * How often `spec://tasks.json` is re-read while the Dynamic Spec lesson is open.
+ *
+ * Faster than the graph poll because this one races the user's attention: the
+ * write lands mid-turn, and a step that ticks four seconds after the card appeared
+ * reads as broken rather than as delayed.
+ */
+const SANDBOX_SPEC_POLL_MS = 1500;
 
 function tutorialIndexKey() {
 	return ["tutorial", "index"] as const;
@@ -99,6 +102,26 @@ export function useSandboxEdgeKinds(projectId: string | undefined, active: boole
 			),
 		];
 	}, [data?.edges]);
+}
+
+/**
+ * How many tasks sit in the lesson narrator's `spec://tasks.json`.
+ *
+ * Polled for the same reason as the graph: the write happens inside a tool call,
+ * and the `spec_changed` frame it emits would still require a fetch to learn the
+ * count — so one poll is simpler than a frame plus a fetch. Disabled unless the
+ * open lesson actually has a Dynamic Spec step, which keeps every other lesson
+ * from querying an endpoint it has no use for.
+ */
+export function useSandboxSpecTaskCount(narratorId: string | undefined, active: boolean) {
+	const { data } = useQuery({
+		queryKey: ["narrators", narratorId, "spec", "tasks"],
+		queryFn: () => api.readSpecTasks(narratorId as string),
+		enabled: !!narratorId && active,
+		gcTime: TUTORIAL_GC_TIME_MS,
+		refetchInterval: active ? SANDBOX_SPEC_POLL_MS : false,
+	});
+	return data?.document.tasks.length ?? 0;
 }
 
 /** Catalog + progress + sandbox state for the overview page. */
@@ -204,6 +227,8 @@ export function useTutorialSteps(options: UseTutorialStepsOptions): UseTutorialS
 	const framesRef = useRef<TutorialObservedFrame[]>([]);
 	const userSentMessageRef = useRef(false);
 	const statusRef = useRef<string | undefined>(undefined);
+	/** True once a live `status_change` frame has been seen for the current narrator. */
+	const wsStatusSeenRef = useRef(false);
 	/** Steps already sent to the server, so a re-observation is not re-posted. */
 	const reportedRef = useRef<Set<string>>(new Set());
 	const [locallyDone, setLocallyDone] = useState<string[]>([]);
@@ -215,7 +240,18 @@ export function useTutorialSteps(options: UseTutorialStepsOptions): UseTutorialS
 		enabled: !!narratorId,
 		gcTime: TUTORIAL_GC_TIME_MS,
 	});
-	if (narrator?.status) statusRef.current = narrator.status;
+	// Status ownership is a handoff, not a one-way ratchet: the query owns the
+	// status UNTIL the first live `status_change` frame arrives, then the stream
+	// owns it. Assigning on every render would keep restoring the value fetched
+	// when the lesson opened — usually `idle`, which would report "the turn
+	// finished" while the narrator is still working. But seeding only once (the
+	// previous shape) had its own failure mode: this query does not refetch on a
+	// timer, yet React Query CAN refetch on window focus, and a focus-triggered
+	// `working` is more current than an `idle` seeded at mount. Following the query
+	// before the handoff keeps the ref at the freshest known value in both cases;
+	// after the handoff the WS frames are strictly fresher than any snapshot, so
+	// the query is ignored.
+	if (narrator?.status && !wsStatusSeenRef.current) statusRef.current = narrator.status;
 
 	// A lesson restart hands us a different narrator; carrying the previous one's
 	// frames over would satisfy steps with evidence from a session the user is no
@@ -229,29 +265,41 @@ export function useTutorialSteps(options: UseTutorialStepsOptions): UseTutorialS
 		framesRef.current = [];
 		userSentMessageRef.current = false;
 		statusRef.current = undefined;
+		// A new narrator restarts the ownership handoff: its first live frame must
+		// be able to take over from the query again.
+		wsStatusSeenRef.current = false;
 		reportedRef.current = new Set();
 		setLocallyDone([]);
 	}, [narratorId, lesson?.id]);
 
 	useEffect(() => {
 		if (!narratorId) return;
+		// A listener alone receives nothing: `addListener` only registers a local
+		// callback, while the server decides what to push based on `subscribe`. The
+		// rail used to rely on `NarratorPanel` having subscribed, which made step
+		// detection depend on another component's mount order — and silently stopped
+		// working whenever the panel was not up yet. Subscriptions are ref-counted, so
+		// asking for our own is cheap and independent.
+		const subscription = narratorWSManager.subscribe([narratorId], { kind: "panel" });
 		const handle = narratorWSManager.addListener(
 			{ narratorIds: [narratorId], types: [...TUTORIAL_FRAME_TYPES] },
 			(data) => {
 				const type = typeof data.type === "string" ? data.type : "";
 				if (type === "status_change" && typeof data.status === "string") {
 					statusRef.current = data.status;
+					// From here on the stream owns the status; see the seeding above.
+					wsStatusSeenRef.current = true;
 				}
-				if (type === "message") {
-					// A user-role message row is what "the user sent something" means; the
-					// composer's own optimistic state is not visible from here.
-					const message = data.message as { role?: unknown } | undefined;
-					if (message?.role === "user") userSentMessageRef.current = true;
-				}
+				// `user_message` IS the "user sent something" signal — the server emits it
+				// only for user turns, so its arrival is the evidence and no role check is
+				// possible (the frame carries no role field). `message` is kept in the
+				// subscription for its role in advancing the manager's epoch, but reading
+				// a role off it would never match: those rows are assistant output.
+				if (type === "user_message") userSentMessageRef.current = true;
 				framesRef.current.push({
 					type,
 					narratorId: typeof data.narratorId === "string" ? data.narratorId : undefined,
-					decision: data.decision as "allow" | "deny" | undefined,
+					decision: data.decision as "allow" | "deny" | "aborted" | undefined,
 					toolName: typeof data.toolName === "string" ? data.toolName : undefined,
 					status: typeof data.status === "string" ? data.status : undefined,
 					subagentNarratorId:
@@ -262,7 +310,10 @@ export function useTutorialSteps(options: UseTutorialStepsOptions): UseTutorialS
 				}
 			},
 		);
-		return () => narratorWSManager.removeListener(handle);
+		return () => {
+			narratorWSManager.removeListener(handle);
+			narratorWSManager.unsubscribe(subscription);
+		};
 	}, [narratorId]);
 
 	// Coarse tick instead of re-rendering per frame. Only runs while a lesson is

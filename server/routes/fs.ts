@@ -1,8 +1,26 @@
 import { execSync, spawn } from "node:child_process";
-import { type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+	type Dir,
+	type Dirent,
+	existsSync,
+	mkdirSync,
+	opendirSync,
+	readFileSync,
+	statSync,
+} from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, extname, join, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { Hono } from "hono";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import {
+	decodeFileBytesAs,
+	detectFileEncoding,
+	encodeFileBytesAs,
+	looksBinary,
+} from "../lib/agent/tools/encoding";
+import { wholeFileLineStats } from "../lib/agent/tools/file-diff-stats";
 import { buildAttachmentDisposition } from "../lib/content-disposition";
 import { AppError, ValidationError } from "../lib/errors";
 import {
@@ -10,34 +28,55 @@ import {
 	isSecretUserPath,
 	SECRET_PATH_REFUSAL,
 } from "../lib/fs-secret-paths";
+import { checkWriteBoundary, describeWriteRefusal } from "../lib/fs-write-boundary";
+import { generateShortId } from "../lib/id";
+import { logger } from "../lib/logger";
+import { requireNarratorAccess } from "../lib/narrator-access";
 import { IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { settings } from "../lib/settings";
+import { fsWriteSchema } from "../lib/validators/fs";
+import { recordAttribution } from "../services/file-attribution-service";
+import { closeClaim, openClaim, sealClaim } from "../services/worktree-write-claims";
 
 export const fsRoutes = new Hono();
 
 /**
- * GET /api/fs/browse?path=...&showHidden=1
+ * GET /api/fs/browse?path=...&showHidden=1&includeFiles=1
  *
  * List directories under the given path. If no path is provided, returns
  * the user's home directory contents. On Windows with no path, also
  * returns available drive letters as top-level entries.
  *
  * Pass showHidden=1 to include hidden directories (dotfiles on Unix).
+ *
+ * Pass includeFiles=1 to also list regular files (and symlinks resolving to
+ * files), each marked `isDirectory: false`. Opt-in rather than the default
+ * because this route's original and still-dominant caller is the directory
+ * PICKER, whose every entry must be selectable as a directory — returning files
+ * there would offer choices that fail on click. The file tree is the caller that
+ * needs both kinds, so it asks for both.
+ *
+ * The response carries `truncated: true` when some child of the directory is not
+ * in `entries` (see the caps in {@link listDirs}); `entries.length` is then a
+ * floor, not the directory's size. Both clients already slice long listings for
+ * display, so they must not read the returned count as complete.
  */
 fsRoutes.get("/browse", (c) => {
 	const rawPath = c.req.query("path");
 	const showHidden = c.req.query("showHidden") === "1";
+	const includeFiles = c.req.query("includeFiles") === "1";
 	const isWin = process.platform === "win32";
 	const drives = isWin ? getWindowsDrives() : [];
 
 	// No path: on Windows show drives only; on Unix show home contents
 	if (!rawPath) {
 		if (isWin) {
-			return c.json({ path: null, entries: [], drives, sep });
+			return c.json({ path: null, entries: [], drives, truncated: false, sep });
 		}
 		const home = homedir();
-		const entries = listDirs(home, showHidden);
+		const listing = listDirs(home, showHidden, includeFiles);
 		const parent = getParent(home, isWin);
-		return c.json({ path: home, entries, drives, parent, sep });
+		return c.json({ ...listing, path: home, drives, parent, sep });
 	}
 
 	const absPath = resolve(rawPath);
@@ -55,11 +94,11 @@ fsRoutes.get("/browse", (c) => {
 		throw new ValidationError(`Cannot access: ${absPath}`);
 	}
 
-	const entries = listDirs(absPath, showHidden);
+	const listing = listDirs(absPath, showHidden, includeFiles);
 	// Compute parent (null if at root)
 	const parent = getParent(absPath, isWin);
 
-	return c.json({ path: absPath, entries, drives, parent, sep });
+	return c.json({ ...listing, path: absPath, drives, parent, sep });
 });
 
 /**
@@ -290,6 +329,340 @@ fsRoutes.get("/preview", async (c) => {
 });
 
 /**
+ * Cap on the body of one human save.
+ *
+ * Matches `/preview`'s text cap: the editor can only open what preview serves, so a
+ * larger body could not have come from a file this API showed. Also bounds the
+ * whole-file diff computed for line stats, which runs on the server's only JS thread.
+ */
+const MAX_WRITE_BYTES = 1024 * 1024;
+
+/**
+ * `GET /api/fs/edit-source?path=...` — load a file FOR EDITING.
+ *
+ * ## Why the editor cannot just use `/preview`
+ *
+ * `/preview` decodes with `Bun.file().text()`, which is UTF-8 and only UTF-8. That is
+ * correct for a viewer: a GBK file renders with replacement characters, the reader
+ * sees it is garbled, and nothing is lost. It is destructive for an editor, because
+ * the next save writes those U+FFFD characters back — every un-decodable byte in the
+ * file is permanently replaced, including in the regions the user never touched.
+ * This repository already knows legacy encodings exist (`encoding.ts`,
+ * `originalEncoding` on file snapshots); the human save path has to know too.
+ *
+ * So this route sniffs the encoding, decodes with it, and reports the name for the
+ * client to echo back on save. It also answers the question `/preview` has no reason
+ * to ask: whether the file is editable AT ALL.
+ *
+ * ## What it refuses, and why refusing beats degrading
+ *
+ * Binary files are refused rather than opened read-only, because "text in, text out"
+ * cannot round-trip them — `looksBinary` is the same NUL-byte heuristic git uses, and
+ * the tool path consults it before persisting any content as text. Files above the
+ * text cap are refused for the reason the cap exists: a partially-loaded buffer that
+ * can be saved would truncate the file to whatever was shown.
+ *
+ * Both refusals are 4xx with a machine-readable `code`, so the UI can disable its
+ * edit affordance instead of presenting a save button that destroys data.
+ */
+fsRoutes.get("/edit-source", async (c) => {
+	const rawPath = c.req.query("path");
+	if (!rawPath) throw new ValidationError("path is required");
+
+	const absPath = resolve(rawPath);
+	// Before the existence probe, exactly as `/preview` and `/download` do it: the
+	// refusal is about the path, so it must not double as an existence oracle.
+	assertReadableThroughFileApi(absPath);
+
+	if (!existsSync(absPath)) throw new ValidationError(`File does not exist: ${absPath}`);
+	let stat: ReturnType<typeof statSync>;
+	try {
+		stat = statSync(absPath);
+	} catch {
+		throw new ValidationError(`Cannot access: ${absPath}`);
+	}
+	if (!stat.isFile()) throw new ValidationError(`Not a file: ${absPath}`);
+
+	if (stat.size > MAX_WRITE_BYTES) {
+		return c.json(
+			{ error: "File too large to edit", code: "TOO_LARGE_TO_EDIT", size: stat.size },
+			413,
+		);
+	}
+
+	const bytes = new Uint8Array(await Bun.file(absPath).arrayBuffer());
+	if (looksBinary(bytes)) {
+		return c.json({ error: "File is binary and cannot be edited as text", code: "BINARY" }, 415);
+	}
+
+	const encoding = detectFileEncoding(bytes);
+	const content = decodeFileBytesAs(bytes, encoding);
+	return c.json({
+		content,
+		encoding,
+		// The lock token, computed here so the client cannot disagree with the server
+		// about which bytes it loaded — and so a browser without WebCrypto (plain HTTP
+		// on a non-localhost origin) can still edit, where a client-side hash is
+		// unavailable and an absent hash would read as "create this file".
+		hash: sha256Hex(content),
+		size: stat.size,
+	});
+});
+
+/**
+ * `POST /api/fs/write` — save an edit a PERSON made in the browser.
+ *
+ * ## Why this is not simply the mirror of `/preview`
+ *
+ * Reading is guarded by a deny-list that is explicitly not a sandbox
+ * (`fs-secret-paths.ts`). That is defensible for reads and unacceptable for writes: a
+ * deny-list stops `settings.json` but not `~/.bashrc`, a git hook, or a systemd unit,
+ * any of which converts "save a text file" into "run code as the server's user". So
+ * this route is gated by an ALLOW-list (`checkWriteBoundary`) rooted at the narrator's
+ * own worktree.
+ *
+ * ## Three things this must do besides writing bytes
+ *
+ * 1. **Optimistic lock.** An agent and a person editing the same file is this
+ *    product's normal state, not an edge case. The client sends the hash it loaded;
+ *    a mismatch is refused with 409 rather than overwriting, because the alternative
+ *    silently destroys whatever the agent just wrote.
+ *
+ * 2. **A write claim.** `worktree-write-claims.ts` resolves "who owns this change" by
+ *    subtracting *declared* writes from a tree delta, and its module header states
+ *    that only shell commands produce undeclared writes. An unbracketed human save
+ *    therefore lands inside any concurrent Bash call's owned set — so reverting that
+ *    Bash call would also revert the person's save, looking entirely correct while
+ *    doing it. Declaring the path is what prevents that.
+ *
+ * 3. **A `human` attribution.** Otherwise the watcher classifies the save as
+ *    `external` on its next tick, and the user's own edit appears in the
+ *    modification view as an anonymous foreign change.
+ */
+fsRoutes.post("/write", async (c) => {
+	// Parsed through Zod rather than a hand-written `if` chain: a malformed body must
+	// name the offending field, and `c.req.json()` on invalid JSON throws a raw
+	// SyntaxError that bypasses the AppError serializer entirely.
+	const raw = await readJsonBody(c.req);
+	const parsed = fsWriteSchema.safeParse(raw);
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.issues[0]?.message ?? "Invalid request body");
+	}
+	const body = parsed.data;
+
+	const rawPath = body.path;
+	const narratorId = body.narratorId;
+	const encoding = body.encoding ?? "utf-8";
+
+	// The byte length is what the cap is about, and it is not the string's length: the
+	// same 1 MB of code units is up to 3 MB of UTF-8, and re-encoding to a legacy
+	// charset changes it again. Measured against the bytes actually written below.
+	const outputBytes = encodeFileBytesAs(body.content, encoding);
+	if (outputBytes.byteLength > MAX_WRITE_BYTES) {
+		throw new ValidationError("Content exceeds the maximum writable size");
+	}
+
+	// Access first: this both authorizes the caller and yields the row carrying `cwd`.
+	const narrator = await requireNarratorAccess(c, narratorId, "write");
+	const cwd = narrator.cwd?.trim();
+	if (!cwd) throw new ValidationError("This narrator has no workspace to write into");
+
+	// `?? []` rather than relying on the defaults merge: a settings object built by any
+	// path that skips `deepMerge` would otherwise spread `undefined` and throw here,
+	// turning a missing optional key into a 500 on every save.
+	const roots = [cwd, ...(settings.paths.extraWritableDirs ?? [])];
+	const decision = checkWriteBoundary(rawPath, roots);
+
+	if (!decision.allowed) {
+		// Only `outside-allowed-roots` may be overridden by user confirmation.
+		// Secret-path and symlink-escape are hard refusals: `confirmable` is never
+		// set on them because `checkWriteBoundary` runs those checks first.
+		if (decision.confirmable && !body.confirmOutsideRoots) {
+			// 409 rather than 403: the write IS possible, it just needs the user to
+			// see the real physical path and consciously agree. The physical path is
+			// included so the confirmation dialog can show WHERE the bytes will land.
+			return c.json(
+				{
+					error: describeWriteRefusal(decision.reason ?? "outside-allowed-roots"),
+					code: "NEEDS_CONFIRMATION",
+					physicalPath: decision.physicalPath,
+					reason: "outside-allowed-roots",
+				},
+				409,
+			);
+		}
+		if (decision.confirmable && body.confirmOutsideRoots) {
+			// User confirmed — fall through to the normal write path.
+		} else {
+			throw new WriteRefusedError(describeWriteRefusal(decision.reason ?? "unresolvable"));
+		}
+	}
+	// physicalPath is guaranteed here: either `allowed` is true (which always has it),
+	// or we fell through the confirmable+confirmOutsideRoots branch (which also has it).
+	const target = decision.physicalPath ?? resolve(rawPath);
+
+	// Optimistic lock. Compared against the file's CURRENT bytes, so any writer since
+	// the editor loaded it — agent, terminal, another person — is detected.
+	let previousContent: string | null = null;
+	if (existsSync(target)) {
+		const stat = statSync(target);
+		if (!stat.isFile()) throw new ValidationError("Target exists and is not a file");
+		if (stat.size > MAX_WRITE_BYTES) {
+			// Refused rather than truncated: the editor could not have loaded this file in
+			// full, so it cannot know what it would be discarding.
+			throw new ValidationError("Target file is too large to edit through this API");
+		}
+		const existingBytes = new Uint8Array(await Bun.file(target).arrayBuffer());
+		if (looksBinary(existingBytes)) {
+			// Text in, text out: this route re-encodes a decoded string, which does not
+			// round-trip binary bytes. Refused rather than mangled, and `/edit-source`
+			// already refuses to open such a file so a compliant client never gets here.
+			throw new ValidationError("This file is binary and cannot be edited as text");
+		}
+		// Decoded the same way `/edit-source` decoded it for the editor, so the
+		// optimistic-lock hash is computed over the same text the client hashed. Reading
+		// UTF-8 here while the editor was served GBK would make every save on a legacy
+		// file look like a conflict.
+		previousContent = decodeFileBytesAs(existingBytes, encoding);
+		const currentHash = sha256Hex(previousContent);
+		if (body.baseHash && body.baseHash !== currentHash) {
+			// 409 with both hashes plus the live content, so the client can show a diff
+			// instead of only reporting failure.
+			return c.json(
+				{
+					error: "The file changed since it was opened",
+					code: "STALE_WRITE",
+					currentHash,
+					expectedHash: body.baseHash,
+					currentContent: previousContent,
+				},
+				409,
+			);
+		}
+		if (!body.baseHash) {
+			// A missing hash means "I am creating this file". The file exists, so the
+			// editor's premise is already wrong and overwriting would be a silent clobber.
+			return c.json(
+				{
+					error: "The file already exists",
+					code: "STALE_WRITE",
+					currentHash,
+					currentContent: previousContent,
+				},
+				409,
+			);
+		}
+	}
+
+	const relPath = relative(cwd, target);
+	// A path inside an extra writable dir is not inside the worktree, so it has no
+	// worktree-relative form and takes no claim or attribution: those are workspace
+	// concepts, and the snapshot machinery only covers the worktree.
+	const insideWorktree = !!relPath && !relPath.startsWith("..");
+	const claimPath = insideWorktree ? relPath.split(sep).join("/") : null;
+	// A synthetic id: the claim registry is keyed by tool-use id, and a human save has
+	// none. Prefixed so it is recognisable in a log or a leaked-claim warning.
+	const claimId = `human-${generateShortId()}`;
+
+	if (claimPath) openClaim(cwd, narratorId, claimId, [claimPath]);
+	try {
+		await mkdir(dirname(target), { recursive: true });
+		// The bytes encoded above, not the string: writing the string would re-encode it
+		// as UTF-8 and convert a legacy-charset file on every save.
+		await writeFile(target, outputBytes);
+	} catch (err) {
+		// Sealed on the error path for the same reason the tool hooks do it: an unclosed
+		// claim is read as "still running" and would shadow every later window.
+		if (claimPath) sealClaim(cwd, claimId);
+		throw new AppError(
+			`Failed to write file: ${err instanceof Error ? err.message : String(err)}`,
+			500,
+			"WRITE_FAILED",
+		);
+	}
+	if (claimPath) closeClaim(cwd, claimId, [claimPath]);
+
+	if (claimPath) {
+		await recordAttribution({
+			deviceId: LOCAL_DEVICE_ID,
+			workspacePath: cwd,
+			filePath: claimPath,
+			// No narratorId: a person is not a session. The narrator only supplied the
+			// workspace, and claiming it here would present a human edit as agent work.
+			narratorId: null,
+			userId: c.get("user").sub,
+			action: "human",
+			lineStats: wholeFileLineStats(previousContent, body.content),
+		});
+	}
+
+	// ── Notify narrator (best-effort) ────────────────────────────────────
+	// Bytes are already on disk, so a notification failure must never surface as
+	// a save failure. Logged at debug so it does not alarm operators.
+	let notified: string | undefined;
+	if (body.notifyAgent) {
+		try {
+			const { interjectFileEditAsUserMessage } = await import("../services/file-edit-interject");
+			const lineStats = wholeFileLineStats(previousContent, body.content);
+			const result = await interjectFileEditAsUserMessage(narratorId, {
+				filePath: rawPath,
+				worktreePath: cwd,
+				lineStats,
+				locale: (c.req.header("accept-language")?.startsWith("zh") ? "zh-CN" : "en") as
+					| "en"
+					| "zh-CN",
+				userId: c.get("user").sub,
+			});
+			notified = result.delivered;
+		} catch (err) {
+			logger.debug("File-edit notification failed after successful save", {
+				narratorId,
+				path: rawPath,
+				error: String(err),
+			});
+		}
+	}
+
+	return c.json({
+		ok: true,
+		path: target,
+		hash: sha256Hex(body.content),
+		bytesWritten: outputBytes.byteLength,
+		// Echoed so a client can keep its round trip honest without having to remember
+		// what it sent — and so a save that fell back to UTF-8 for an unknown name says so.
+		encoding,
+		...(notified ? { notified } : {}),
+	});
+});
+
+/** 403 for a path the write allow-list refuses. */
+class WriteRefusedError extends AppError {
+	constructor(message: string) {
+		super(message, 403, "WRITE_REFUSED");
+	}
+}
+
+/**
+ * Parse a JSON body, reporting malformed input as a 400.
+ *
+ * `c.req.json()` throws a raw `SyntaxError` on invalid JSON, which is not an
+ * `AppError` and so reaches the global handler as an unhandled 500 — a client bug
+ * reported as a server fault, with the parse error in the response.
+ */
+async function readJsonBody(req: { json: () => Promise<unknown> }): Promise<unknown> {
+	try {
+		return await req.json();
+	} catch {
+		throw new ValidationError("Request body must be valid JSON");
+	}
+}
+
+/** Lowercase hex sha256 of a UTF-8 string, the editor's optimistic-lock token. */
+function sha256Hex(text: string): string {
+	return createHash("sha256").update(text, "utf-8").digest("hex");
+}
+
+/**
  * Cap for `GET /api/fs/download`.
  *
  * Deliberately far above the preview caps: preview limits exist because the
@@ -368,16 +741,81 @@ fsRoutes.get("/download", async (c) => {
  */
 const MAX_SYMLINK_PROBES = 1000;
 
+/**
+ * Ceiling on entries ONE listing may return.
+ *
+ * `MAX_SYMLINK_PROBES` bounds the cost of an entry whose kind is unknown, but until
+ * this cap existed nothing bounded the count itself: `includeFiles=1` over a
+ * `node_modules` or a build output directory returned every child, and the work grew
+ * with the directory. Measured on 50 000 plain files (warm cache, local disk): 23 ms
+ * to read the directory, 107 ms to stat them, 5.5 MB of JSON. All of it on the single
+ * JS thread that carries the agent loop, and every figure worse on a network mount.
+ *
+ * Set ABOVE both clients' own display caps (1 000 in `DirectoryPicker` and in
+ * `FileTreeContent`) on purpose. Those two already slice and render a "N more" row
+ * from `entries.length`; a server cap at or below theirs would drive that count to
+ * zero and turn a visible truncation into a silent one. `truncated` is what tells a
+ * caller the count it can compute is itself a floor.
+ */
+const MAX_BROWSE_ENTRIES = 5_000;
+
+/**
+ * Ceiling on raw directory entries EXAMINED, accepted or not.
+ *
+ * Separate from `MAX_BROWSE_ENTRIES` because filtering happens before accepting:
+ * without this, a directory of 200 000 dotfiles read with `showHidden=0` would be
+ * walked in full to produce an empty listing — the accepted-entry cap never trips,
+ * so it never stops anything.
+ */
+const MAX_BROWSE_SCAN = 50_000;
+
+/**
+ * Ceiling on `statSync` calls spent decorating files with a byte size.
+ *
+ * A size is the one field here that is pure decoration: `size` is already optional,
+ * and a listing without it is complete and usable. So it gets a budget well below
+ * `MAX_BROWSE_ENTRIES`, and past it entries are still listed, just without a size —
+ * on a network mount, thousands of round trips for a number is the wrong trade.
+ *
+ * Which files lose their size follows directory order, not the sorted order the
+ * client sees, so it is not "the last N alphabetically".
+ */
+const MAX_FILE_SIZE_PROBES = 1_000;
+
 /** A directory entry returned by `/browse`. */
 interface BrowseEntry {
 	name: string;
 	path: string;
-	/** The entry is a symbolic link that resolves to a directory. */
+	/** The entry is a symbolic link (to a directory, or to a file when files are listed). */
 	isSymlink: boolean;
+	/**
+	 * Whether this entry is a directory.
+	 *
+	 * Always present, and always `true` unless `includeFiles` was requested. Sent
+	 * even in directory-only mode so a client never has to infer the kind from the
+	 * flag's absence: a tree that guesses "no field means file" would render every
+	 * directory as a leaf the moment it talked to an older server.
+	 */
+	isDirectory: boolean;
+	/** Size in bytes. Only set for files (`isDirectory: false`). */
+	size?: number;
+}
+
+/** One directory level: the entries listed, and whether anything was left out. */
+interface BrowseListing {
+	entries: BrowseEntry[];
+	/**
+	 * Some child of this directory is NOT in `entries`.
+	 *
+	 * Set by any of the three caps below. A caller must then read
+	 * `entries.length` as a floor rather than as the directory's size — the
+	 * distinction the clients' own "N more entries" rows depend on.
+	 */
+	truncated: boolean;
 }
 
 /**
- * List immediate subdirectories of a path.
+ * List immediate children of a path — directories always, files when asked.
  *
  * Symlinks need a second `stat` because `withFileTypes` reports `Dirent` flags from
  * **lstat**: a link pointing at a directory answers `isDirectory() === false` and
@@ -385,50 +823,166 @@ interface BrowseEntry {
  * made every symlinked directory invisible in the picker — including the common
  * case of a project directory reached through a link.
  *
- * Links we deliberately do NOT list:
+ * Links we deliberately do NOT list, in either mode:
  *  - dangling (`ENOENT`) and self-referential/cyclic (`ELOOP`) links, plus anything
- *    else `stat` refuses: the only action the picker offers is "enter or select this
- *    directory", so an entry that cannot be entered just defers the error to the
- *    user's next click;
- *  - links to files, exactly like ordinary files.
+ *    else `stat` refuses: every action offered on an entry (enter it, select it,
+ *    open it in a viewer) needs the target to exist, so listing one just defers the
+ *    error to the user's next click;
+ *  - links to something that is neither a file nor a directory (sockets, devices):
+ *    nothing in the UI can act on them.
+ *
+ * `includeFiles` widens what counts as listable, NOT the per-entry cost for
+ * directories: a plain file is accepted from its `Dirent` alone, and only the
+ * *size* needs a stat. That size is best-effort — a file whose stat fails is still
+ * listed (it is really there and can still be opened), just without a size, since
+ * dropping a readable file over a missing byte count would be the worse trade.
+ *
+ * ## Bounded on three axes, all of them because this runs on the shared JS thread
+ *
+ * `MAX_BROWSE_SCAN` (children examined), `MAX_BROWSE_ENTRIES` (children returned)
+ * and `MAX_FILE_SIZE_PROBES` (sizes resolved) each bound a different cost, and each
+ * is reachable without the others tripping. Hitting either of the first two stops
+ * the walk and reports `truncated`; exhausting the size budget only drops the
+ * decoration, so the listing stays complete and `truncated` stays false.
+ *
+ * The directory is STREAMED (`opendirSync` + `readSync`) rather than read into an
+ * array first: `readdirSync` materializes every child before the caps can reject
+ * any, which is exactly the allocation a cap on a huge directory exists to avoid.
  */
-function listDirs(dir: string, showHidden = false): BrowseEntry[] {
-	let items: Dirent[];
+function listDirs(dir: string, showHidden = false, includeFiles = false): BrowseListing {
+	let handle: Dir;
 	try {
-		items = readdirSync(dir, { withFileTypes: true });
+		handle = opendirSync(dir);
 	} catch {
-		return [];
+		return { entries: [], truncated: false };
 	}
 
 	const entries: BrowseEntry[] = [];
-	let probesLeft = MAX_SYMLINK_PROBES;
+	let symlinkProbesLeft = MAX_SYMLINK_PROBES;
+	let sizeProbesLeft = MAX_FILE_SIZE_PROBES;
+	let scanned = 0;
+	let truncated = false;
 
-	for (const d of items) {
-		// Skip hidden dirs on Unix unless showHidden is true
-		if (!showHidden && d.name.startsWith(".")) continue;
-		// Always skip system dirs on Windows
-		if (d.name === "$RECYCLE.BIN" || d.name === "System Volume Information") continue;
-
-		const path = join(dir, d.name);
-		if (d.isDirectory()) {
-			entries.push({ name: d.name, path, isSymlink: false });
-			continue;
-		}
-		if (!d.isSymbolicLink()) continue;
-		if (probesLeft <= 0) continue;
-		probesLeft--;
-		try {
-			// statSync follows the link; a broken or cyclic link throws here and the
-			// entry is dropped rather than failing the whole listing.
-			if (statSync(path).isDirectory()) {
-				entries.push({ name: d.name, path, isSymlink: true });
+	try {
+		while (true) {
+			let d: Dirent | null;
+			try {
+				d = handle.readSync();
+			} catch {
+				// A directory that becomes unreadable mid-walk (removed, permissions
+				// changed): keep what was already collected instead of discarding it, and
+				// say so — the remaining children are unknown, not absent.
+				truncated = true;
+				break;
 			}
+			if (d === null) break;
+
+			if (scanned >= MAX_BROWSE_SCAN) {
+				truncated = true;
+				break;
+			}
+			scanned++;
+
+			// Skip hidden dirs on Unix unless showHidden is true
+			if (!showHidden && d.name.startsWith(".")) continue;
+			// Always skip system dirs on Windows
+			if (d.name === "$RECYCLE.BIN" || d.name === "System Volume Information") continue;
+
+			// Checked before accepting, so the cap is the number RETURNED. Placed after
+			// the filters for the same reason `MAX_BROWSE_SCAN` exists separately: a
+			// rejected child costs a name comparison, not an entry.
+			if (entries.length >= MAX_BROWSE_ENTRIES) {
+				truncated = true;
+				break;
+			}
+
+			const path = join(dir, d.name);
+			if (d.isDirectory()) {
+				entries.push({ name: d.name, path, isSymlink: false, isDirectory: true });
+				continue;
+			}
+			if (d.isSymbolicLink()) {
+				if (symlinkProbesLeft <= 0) {
+					// The kind of this link is unknowable within budget, so it is omitted
+					// rather than guessed — and that omission is a truncation.
+					truncated = true;
+					continue;
+				}
+				symlinkProbesLeft--;
+				try {
+					// statSync follows the link; a broken or cyclic link throws here and the
+					// entry is dropped rather than failing the whole listing.
+					const target = statSync(path);
+					if (target.isDirectory()) {
+						entries.push({ name: d.name, path, isSymlink: true, isDirectory: true });
+					} else if (includeFiles && target.isFile()) {
+						// The size came free with the stat the link's kind already required.
+						entries.push({
+							name: d.name,
+							path,
+							isSymlink: true,
+							isDirectory: false,
+							size: target.size,
+						});
+					}
+				} catch {
+					// ENOENT (dangling) / ELOOP (cycle) / EACCES — not a usable entry.
+				}
+				continue;
+			}
+			if (!includeFiles || !d.isFile()) continue;
+			let size: number | undefined;
+			if (sizeProbesLeft > 0) {
+				sizeProbesLeft--;
+				size = statSizeOrUndefined(path);
+			}
+			entries.push({
+				name: d.name,
+				path,
+				isSymlink: false,
+				isDirectory: false,
+				...(size === undefined ? {} : { size }),
+			});
+		}
+	} finally {
+		// The handle holds an OS file descriptor; leaking one per listing would
+		// exhaust the process's table under a client that browses freely.
+		try {
+			handle.closeSync();
 		} catch {
-			// ENOENT (dangling) / ELOOP (cycle) / EACCES — not a usable directory.
+			// Already closed or gone — nothing left to release.
 		}
 	}
 
-	return entries.sort((a, b) => a.name.localeCompare(b.name));
+	return { entries: entries.sort(compareEntries), truncated };
+}
+
+/**
+ * `statSync().size`, or undefined if the file cannot be stat'ed.
+ *
+ * Separate from `MAX_SYMLINK_PROBES`: that budget bounds links whose *kind* is
+ * unknown until probed (omitting one changes the listing), whereas this only
+ * decorates an entry already known to be a file. It has its own, smaller budget
+ * (`MAX_FILE_SIZE_PROBES`) rather than none at all — see that constant.
+ */
+function statSizeOrUndefined(path: string): number | undefined {
+	try {
+		return statSync(path).size;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Directories first, then files, each group alphabetical.
+ *
+ * Grouping matters more than it looks: the tree lazily loads a directory's
+ * children, so with a flat alphabetical sort the expandable rows would be
+ * scattered through a long list of leaves.
+ */
+function compareEntries(a: BrowseEntry, b: BrowseEntry): number {
+	if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+	return a.name.localeCompare(b.name);
 }
 
 /** Get parent directory, or null if at filesystem root. */

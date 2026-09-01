@@ -999,10 +999,13 @@ export const miscApi = {
 		}>(`/dependencies/${name}/install`, { method: "POST" }),
 
 	// Filesystem browsing
-	fsBrowse: (path?: string, opts?: { showHidden?: boolean }) => {
+	fsBrowse: (path?: string, opts?: { showHidden?: boolean; includeFiles?: boolean }) => {
 		const params = new URLSearchParams();
 		if (path) params.set("path", path);
 		if (opts?.showHidden) params.set("showHidden", "1");
+		// Opt-in: the directory picker needs every entry to be selectable as a
+		// directory, so only the file tree asks for files.
+		if (opts?.includeFiles) params.set("includeFiles", "1");
 		const qs = params.toString();
 		return request<{
 			path: string | null;
@@ -1010,8 +1013,31 @@ export const miscApi = {
 			 * Directories, including symlinks whose target is a directory (`isSymlink`).
 			 * `path` is the link's own path, not its target: the user is choosing the
 			 * path they navigated to.
+			 *
+			 * Files appear only when `includeFiles` was requested, marked
+			 * `isDirectory: false`. `isDirectory` is optional here purely for wire
+			 * compatibility with an older server; treat a missing value as `true`,
+			 * since directory-only was the previous behaviour.
+			 *
+			 * The server caps what one listing returns (see `MAX_BROWSE_ENTRIES` in
+			 * `server/routes/fs.ts`), so a length at that cap means the directory has
+			 * more children than this carries.
 			 */
-			entries: Array<{ name: string; path: string; isSymlink?: boolean }>;
+			entries: Array<{
+				name: string;
+				path: string;
+				isSymlink?: boolean;
+				isDirectory?: boolean;
+				size?: number;
+			}>;
+			/**
+			 * Some child of the directory is NOT in `entries` — the server hit a
+			 * scan/entry/probe cap (or the directory became unreadable mid-listing).
+			 * `entries.length` is then a floor, not the directory's size. Optional for
+			 * wire compatibility with an older server; treat a missing value as
+			 * `false`, since untruncated was the previous behaviour.
+			 */
+			truncated?: boolean;
 			drives?: Array<{ name: string; path: string }>;
 			parent?: string | null;
 			sep: string;
@@ -1041,6 +1067,63 @@ export const miscApi = {
 	 * The server's `Content-Disposition` name is preferred over deriving one from
 	 * the path, since it has already been sanitized for use as a filename.
 	 */
+	/**
+	 * Save a human edit.
+	 *
+	 * `baseHash` is the sha256 of the content the editor loaded — the optimistic lock.
+	 * Omit it only when creating a file that must not already exist; the server answers
+	 * 409 in both stale cases and includes the live content so the caller can show a
+	 * diff rather than only reporting failure.
+	 *
+	 * `narratorId` is not decoration: it is what defines the writable root, so a save
+	 * without one is refused.
+	 */
+	fsWrite: (input: {
+		path: string;
+		content: string;
+		narratorId: string;
+		baseHash?: string | null;
+		/**
+		 * The encoding `fsEditSource` reported, echoed back verbatim.
+		 *
+		 * Omitting it means UTF-8, which silently CONVERTS a legacy-charset file on
+		 * save. Always pass through what the load returned.
+		 */
+		encoding?: string;
+	}) =>
+		request<{
+			ok: true;
+			path: string;
+			hash: string;
+			bytesWritten: number;
+			encoding: string;
+		}>("/fs/write", {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+
+	/**
+	 * Load a file FOR EDITING — not the same thing as previewing it.
+	 *
+	 * `/fs/preview` decodes as UTF-8 unconditionally, which is fine for a viewer (the
+	 * reader sees the mojibake) and destructive for an editor: saving would write those
+	 * replacement characters back over every un-decodable byte in the file. This route
+	 * sniffs the encoding, returns its name for the save to echo, and refuses files
+	 * that cannot be edited as text at all.
+	 *
+	 * Throws `ApiError` with `status` 415 (`code: "BINARY"`) or 413
+	 * (`code: "TOO_LARGE_TO_EDIT"`) for those refusals, so the caller can explain why
+	 * editing is unavailable rather than offering a save that corrupts the file.
+	 *
+	 * `hash` is computed server-side deliberately: it makes the optimistic lock
+	 * independent of WebCrypto, which is absent over plain HTTP on a non-localhost
+	 * origin — precisely where a client-side hash would silently become `null` and read
+	 * as "create this file".
+	 */
+	fsEditSource: (path: string) =>
+		request<{ content: string; encoding: string; hash: string; size: number }>(
+			`/fs/edit-source?path=${encodeURIComponent(path)}`,
+		),
 	fsDownload: async (path: string) => {
 		const res = await authorizedFetch(`${apiBase()}/fs/download?path=${encodeURIComponent(path)}`);
 		if (!res.ok) {
