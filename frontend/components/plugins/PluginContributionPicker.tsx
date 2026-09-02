@@ -103,11 +103,8 @@ function statusColor(availability: PluginContributionRecord["availability"]): st
  */
 export function PluginContributionOptions({
 	onPick,
-	trigger,
-	disabled,
-	tooltip,
 	surface,
-}: PluginContributionPickerProps) {
+}: Pick<PluginContributionPickerProps, "onPick" | "surface">) {
 	const { t } = useTranslation("plugins");
 	const { contributions, synced, isFetching, invalidate } = usePluginContributions();
 
@@ -219,6 +216,7 @@ export function PluginContributionPicker({
 	trigger,
 	disabled,
 	tooltip,
+	surface,
 }: PluginContributionPickerProps) {
 	const { t } = useTranslation("plugins");
 
@@ -240,7 +238,7 @@ export function PluginContributionPicker({
 				)}
 			</Menu.Target>
 			<Menu.Dropdown>
-				<PluginContributionOptions onPick={onPick} />
+				<PluginContributionOptions onPick={onPick} surface={surface} />
 			</Menu.Dropdown>
 		</Menu>
 	);
