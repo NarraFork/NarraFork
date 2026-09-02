@@ -37,8 +37,32 @@ function flattenResources(
 		else output.set(prefix, value);
 		return;
 	}
-	if (!value || typeof value !== "object" || Array.isArray(value)) {
-		errors.push(`${location}: ${prefix || "<root>"} must be a string or object`);
+	if (!value || typeof value !== "object") {
+		errors.push(`${location}: ${prefix || "<root>"} must be a string, array or object`);
+		return;
+	}
+	// Arrays are a legitimate i18next resource shape, read back with
+	// `t(key, { returnObjects: true })` — the TLS trust guide's per-OS step lists are one.
+	// They were rejected outright here, which made the whole check RED and, worse, left
+	// those lists as the only resources nobody verified: a missing translation or a step
+	// dropped from one language raised nothing, because the comparison never saw them.
+	//
+	// Flattened to `key.0`, `key.1`, … so they fall through to the ordinary per-key
+	// comparison below. That gets three properties for free: a missing element is a
+	// "missing key", an extra one is an "extra key" (so the two languages cannot disagree
+	// on step COUNT), and interpolation variables are checked per element.
+	//
+	// The index is part of the key rather than the value being joined, because a step list
+	// is ordered and positional: "step 3 is missing" is the actionable message, whereas a
+	// joined blob would only report that something in the list differs.
+	if (Array.isArray(value)) {
+		if (!prefix) {
+			errors.push(`${location}: root value must be an object`);
+			return;
+		}
+		for (const [index, child] of value.entries()) {
+			flattenResources(child, `${prefix}.${index}`, output, errors, location);
+		}
 		return;
 	}
 	for (const [key, child] of Object.entries(value)) {

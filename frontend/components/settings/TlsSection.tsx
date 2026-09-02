@@ -11,6 +11,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import { formatLocaleDate } from "../../lib/intl-format";
 
 // Client-side pre-check only; the server (`parseSanEntries`) is the authority.
 // Entries are tested lowercased to match the server's DNS canonicalization —
@@ -20,8 +21,11 @@ const SAN_ENTRY_RE =
 
 function formatExpiry(iso: string | null): string | null {
 	if (!iso) return null;
-	const d = new Date(iso);
-	return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString();
+	// `formatLocaleDate` rather than the Date method with no locale argument: the bare
+	// method follows the SYSTEM locale, so this date rendered in English for a user running
+	// the app in Chinese. An unparseable value returns "", and the raw string is shown
+	// instead — a certificate's stated expiry is worth surfacing verbatim rather than blank.
+	return formatLocaleDate(iso) || iso;
 }
 
 export interface TlsSectionProps {

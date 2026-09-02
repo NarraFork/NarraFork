@@ -1,4 +1,5 @@
 import type { KimiUsageCache, KimiUsageWindow } from "../../lib/api/types";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 
 /** Minimal translation signature compatible with react-i18next's `t`. */
 export type KimiTFunction = (key: string, options?: Record<string, unknown>) => string;
@@ -33,9 +34,12 @@ export function isKimiProviderBaseUrl(baseUrl?: string): boolean {
 
 function formatResetTime(resetTime: string | null): string | null {
 	if (!resetTime) return null;
-	const date = new Date(resetTime);
-	if (Number.isNaN(date.getTime())) return null;
-	return date.toLocaleString();
+	// `formatLocaleDateTime` rather than the Date method with no locale argument: the bare
+	// method follows the SYSTEM locale, so a user running the app in Chinese on an English
+	// OS saw this one timestamp in English among translated text. It returns "" for an
+	// unparseable value, normalized back to null so callers keep their "no reset" branch.
+	const formatted = formatLocaleDateTime(resetTime);
+	return formatted || null;
 }
 
 function formatWindowLine(label: string, window: KimiUsageWindow, t: KimiTFunction): string {
